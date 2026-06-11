@@ -20,18 +20,29 @@
 - Docker（ARM64）
 - 一个运行中的 [Phanthy Motus Agent Core](https://github.com/4paradigm/phanthymotus) 实例
 
-### 部署驱动
+### 通过 Web Dashboard 部署（推荐）
+
+最简单的方式是通过 Agent Core 的 Web Dashboard 部署驱动。在顶部菜单进入 **部署** —— 可以浏览已审核发布的驱动版本，选择版本后一键部署，无需手动构建。
+
+### 构建和部署自定义驱动
+
+如果需要从源码构建或开发自定义驱动：
 
 ```bash
-cp .env.example .env  # 填写镜像仓库凭据和 Agent Core 地址
+cp .env.example .env  # 填写镜像仓库凭据
 
-# 构建驱动镜像
+# 构建指定驱动
 ./build.sh unitree/g1
-
-# 运行容器（会自动注册到 Agent Core）
 ```
 
-驱动启动后会自动向 Agent Core（`http://<agent-core>:15678/api/mcp`）发送注册请求。注册成功后即可在 Web Dashboard 中看到设备及其工具。
+不传参数时，`build.sh` 会显示交互式多选菜单，选择要构建的驱动。也可以直接传路径用于 CI：
+
+```bash
+# 构建多个驱动
+./build.sh unitree/g1 phanthy/remote_control
+```
+
+驱动容器启动后会自动向 Agent Core（`http://<agent-core>:15678/api/mcp`）发送注册请求。注册成功后即可在 Web Dashboard 中看到设备及其工具。
 
 ### 本地运行（无需 Docker）
 
@@ -51,7 +62,14 @@ python main.py
 
 ## 开发新驱动
 
-想要为新硬件添加驱动？请参阅 [驱动开发指南](README_dev.md) 获取完整规范，或参考现有驱动实现。
+想要为新硬件添加驱动？请参阅 **[驱动开发指南](README_dev.md)** 获取完整规范，包括：
+
+- MCP 协议实现（JSON-RPC 2.0 方法）
+- 工具定义规范（`inputSchema`、`configSchema`、`x-action-params`）
+- Plugin 生命周期（`__init__`、`get_tool`、`start`、`stop`、`dispatch`）
+- `driver.yaml` 和 `config.yaml` 元数据格式
+- 注册与心跳机制
+- 端口分配（15700–15799 范围）
 
 简要概述：
 - 每个驱动实现 MCP JSON-RPC 2.0 over HTTP（`initialize`、`tools/list`、`tools/call`）

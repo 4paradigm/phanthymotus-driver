@@ -20,18 +20,29 @@ Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server t
 - Docker (ARM64)
 - A running [Phanthy Motus Agent Core](https://github.com/4paradigm/phanthymotus) instance
 
-### Deploy a Driver
+### Deploy via Web Dashboard (Recommended)
+
+The easiest way to deploy a driver is through the Agent Core Web Dashboard. Navigate to **Deploy** in the top menu — you can browse reviewed and published driver versions, select a version, and deploy with one click. No manual build required.
+
+### Build & Deploy Your Own Driver
+
+If you need to build from source or develop a custom driver:
 
 ```bash
-cp .env.example .env  # Fill in registry credentials and Agent Core address
+cp .env.example .env  # Fill in registry credentials
 
-# Build a driver image
+# Build a specific driver
 ./build.sh unitree/g1
-
-# Run the container (it will auto-register with Agent Core)
 ```
 
-Once the driver starts, it registers itself with Agent Core at `http://<agent-core>:15678/api/mcp`. You can then see the device and its tools in the Web Dashboard.
+When run without arguments, `build.sh` shows an interactive multi-select menu to choose which drivers to build. You can also pass driver paths directly for CI usage:
+
+```bash
+# Build multiple drivers
+./build.sh unitree/g1 phanthy/remote_control
+```
+
+Once the driver container starts, it registers itself with Agent Core at `http://<agent-core>:15678/api/mcp`. You can then see the device and its tools in the Web Dashboard.
 
 ### Run Locally (without Docker)
 
@@ -51,7 +62,14 @@ python main.py
 
 ## Writing a New Driver
 
-Want to add support for new hardware? See the [Driver Development Guide](README_dev.md) for the full specification, or refer to existing drivers as examples.
+Want to add support for new hardware? See the **[Driver Development Guide](README_dev.md)** for the full specification, including:
+
+- MCP protocol implementation (JSON-RPC 2.0 methods)
+- Tool definition spec (`inputSchema`, `configSchema`, `x-action-params`)
+- Plugin lifecycle (`__init__`, `get_tool`, `start`, `stop`, `dispatch`)
+- `driver.yaml` and `config.yaml` metadata format
+- Registration and heartbeat with Agent Core
+- Port allocation (15700–15799 range)
 
 Quick overview:
 - Each driver implements MCP JSON-RPC 2.0 over HTTP (`initialize`, `tools/list`, `tools/call`)
