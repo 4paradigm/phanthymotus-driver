@@ -1,66 +1,66 @@
-# Driver 开发指南
+# Driver Development Guide
 
-硬件驱动层（Layer 1），以 MCP HTTP Server 形式暴露设备能力给 Agent Core。
+The hardware driver layer (Layer 1) exposes device capabilities to Agent Core as MCP HTTP Servers.
 
 ---
 
-## 目录结构
+## Directory Structure
 
-每个 driver 是一个独立的 Python 包：
+Each driver is an independent Python package:
 
 ```
 drivers/
 ├── <provider>/
 │   └── <model>/
-│       ├── main.py            # MCP HTTP Server 入口
-│       ├── device.py          # 设备插件实现
-│       ├── config.yaml        # 插件启用配置
-│       ├── driver.yaml        # 元数据（ID、端口、描述）
-│       ├── Dockerfile         # ARM64 容器构建
-│       └── requirements.txt   # Python 依赖
+│       ├── main.py            # MCP HTTP Server entry point
+│       ├── device.py          # Device plugin implementation
+│       ├── config.yaml        # Plugin enable/disable configuration
+│       ├── driver.yaml        # Metadata (ID, port, description)
+│       ├── Dockerfile         # ARM64 container build
+│       └── requirements.txt   # Python dependencies
 ```
 
-示例：`drivers/unitree/g1/`、`drivers/phanthy/remote_control/`
+Examples: `drivers/unitree/g1/`, `drivers/phanthy/remote_control/`
 
 ---
 
-## MCP 协议
+## MCP Protocol
 
-每个 driver 实现 [MCP](https://modelcontextprotocol.io) JSON-RPC 2.0 over HTTP，暴露三个方法：
+Each driver implements [MCP](https://modelcontextprotocol.io) JSON-RPC 2.0 over HTTP, exposing three methods:
 
-| Method | 说明 |
-|--------|------|
-| `initialize` | 握手，返回 `serverInfo.name` |
-| `tools/list` | 列出所有工具（含 schema） |
-| `tools/call` | 调用工具 `{name, arguments}` |
+| Method | Description |
+|--------|-------------|
+| `initialize` | Handshake, returns `serverInfo.name` |
+| `tools/list` | List all tools (with schema) |
+| `tools/call` | Call a tool `{name, arguments}` |
 
-HTTP endpoint 统一为 `/mcp`（POST）。
+The HTTP endpoint is uniformly `/mcp` (POST).
 
 ---
 
-## 工具定义规范
+## Tool Definition Specification
 
-每个工具返回一个 dict，包含以下字段：
+Each tool returns a dict containing the following fields:
 
-| 字段 | 类型 | 必需 | 说明 |
-|------|------|------|------|
-| `name` | string | 是 | 工具名（如 `loco`、`mic`），在同一 driver 内唯一 |
-| `type` | string | 是 | `sensor`（数据流）\| `actuator`（可执行）\| `processor`（数据处理）\| `resource`（静态资源） |
-| `description` | string | 是 | 工具描述，LLM 和前端都会使用 |
-| `inputSchema` | object | 是 | JSON Schema，定义调用参数 |
-| `configSchema` | object | 否 | 持久化配置 schema（如 API Key），前端渲染为配置表单 |
-| `topic_out` | array | 否 | 输出的 ROS2 DDS topic 列表 `[{topic, format}]` |
-| `topic_in` | array | 否 | 输入的 ROS2 DDS topic 列表 `[{format}]` |
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | Yes | Tool name (e.g. `loco`, `mic`), unique within the same driver |
+| `type` | string | Yes | `sensor` (data stream) \| `actuator` (executable) \| `processor` (data processing) \| `resource` (static resource) |
+| `description` | string | Yes | Tool description, used by both LLM and frontend |
+| `inputSchema` | object | Yes | JSON Schema defining call parameters |
+| `configSchema` | object | No | Persistent configuration schema (e.g. API Key), rendered as a config form in the frontend |
+| `topic_out` | array | No | List of output ROS2 DDS topics `[{topic, format}]` |
+| `topic_in` | array | No | List of input ROS2 DDS topics `[{format}]` |
 
-### 工具类型
+### Tool Types
 
-- **sensor**: 数据流工具，不可直接调用。通过 `start`/`stop` 系统 action 控制，数据通过 ROS2 topic 推送
-- **actuator**: 可执行动作的工具。通过 `action` 字段分发不同操作
-- **processor**: 数据处理工具。接收输入 topic 数据，处理后输出到 topic
+- **sensor**: Data stream tool, cannot be called directly. Controlled via `start`/`stop` system actions, data is pushed through ROS2 topics
+- **actuator**: Tool that performs executable actions. Different operations are dispatched via the `action` field
+- **processor**: Data processing tool. Receives input topic data, processes it, and outputs to a topic
 
 ### inputSchema
 
-标准 JSON Schema 格式。对于 actuator 工具，通常包含 `action` 字段（enum）来区分不同操作：
+Standard JSON Schema format. For actuator tools, it typically includes an `action` field (enum) to distinguish between different operations:
 
 ```python
 "inputSchema": {
@@ -79,7 +79,7 @@ HTTP endpoint 统一为 `/mcp`（POST）。
 
 ### configSchema
 
-可选。定义需要用户在前端配置的持久化参数（如 API Key、模型名）。前端自动渲染配置表单。
+Optional. Defines persistent parameters that users configure in the frontend (e.g. API Key, model name). The frontend automatically renders a configuration form.
 
 ```python
 "configSchema": {
@@ -94,20 +94,20 @@ HTTP endpoint 统一为 `/mcp`（POST）。
 
 ---
 
-## x-action-params 规范
+## x-action-params Specification
 
-### 问题
+### Problem
 
-当一个工具有多个 action 且不同 action 需要不同参数时（如 `loco` 的 `move` 需要速度参数，`stop` 不需要），所有参数被 union 到一个 flat schema 中，导致：
+When a tool has multiple actions and different actions require different parameters (e.g. `loco`'s `move` requires velocity parameters while `stop` does not), all parameters are unioned into a flat schema, causing:
 
-1. LLM 看到所有参数混在一起，无法区分哪些属于哪个 action
-2. 前端同时显示所有字段，用户体验差
+1. The LLM sees all parameters mixed together and cannot distinguish which belong to which action
+2. The frontend displays all fields simultaneously, resulting in poor user experience
 
-### 解决方案
+### Solution
 
-在 `inputSchema` 中声明 `x-action-params` 字段，为每个 action 指定对应的参数列表和独立描述。
+Declare the `x-action-params` field in `inputSchema` to specify the corresponding parameter list and independent description for each action.
 
-### 格式
+### Format
 
 ```python
 "inputSchema": {
@@ -126,28 +126,28 @@ HTTP endpoint 统一为 `/mcp`（POST）。
 }
 ```
 
-每个 action 条目：
+Each action entry:
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `params` | string[] | 该 action 使用的参数 key 列表（`action` 字段本身无需列入） |
-| `description` | string | 该 action 的独立描述，用于 LLM function description |
+| Field | Type | Description |
+|-------|------|-------------|
+| `params` | string[] | List of parameter keys used by this action (the `action` field itself does not need to be included) |
+| `description` | string | Independent description for this action, used as the LLM function description |
 
-### 效果
+### Effect
 
-Agent Core 会自动处理 `x-action-params`：
+Agent Core automatically processes `x-action-params`:
 
-- **LLM 侧**：自动拆分为多个独立 function（如 `mcp__unitree__loco__move`、`mcp__unitree__loco__stop`），每个只包含对应参数
-- **前端侧**：canvas 卡片中切换 action 下拉框时，只显示对应参数字段
-- **Driver 侧**：无需任何调度逻辑变化，Agent Core 调用时自动注入 `action` 到 args
+- **LLM side**: Automatically splits into multiple independent functions (e.g. `mcp__unitree__loco__move`, `mcp__unitree__loco__stop`), each containing only the corresponding parameters
+- **Frontend side**: When switching the action dropdown in canvas cards, only the corresponding parameter fields are displayed
+- **Driver side**: No changes to dispatch logic needed; Agent Core automatically injects `action` into args when calling
 
-### 何时使用
+### When to Use
 
-- 工具有多个 action，且**不同 action 需要不同参数**时必须使用
-- 所有 action 共用相同参数时不需要（如 `switch_mode` 的所有 mode 都只需 `mode` 字段）
-- 单 action 工具不需要
+- Must be used when a tool has multiple actions and **different actions require different parameters**
+- Not needed when all actions share the same parameters (e.g. `switch_mode` where all modes only need the `mode` field)
+- Not needed for single-action tools
 
-### 完整示例
+### Complete Example
 
 ```python
 def get_tool(self) -> dict:
@@ -184,66 +184,66 @@ def get_tool(self) -> dict:
 
 ---
 
-## Plugin 生命周期
+## Plugin Lifecycle
 
-每个设备功能封装为一个 Plugin 类，需实现：
+Each device capability is encapsulated as a Plugin class that must implement:
 
 ```python
 class MyPlugin:
-    PREFIX = "my_tool"  # 工具名前缀（用于多工具插件）
+    PREFIX = "my_tool"  # Tool name prefix (for multi-tool plugins)
 
     def __init__(self, plugin_config: dict, namespace: str, executor, ...):
-        """初始化。plugin_config 来自 config.yaml，namespace 是 ROS2 命名空间。"""
+        """Initialize. plugin_config comes from config.yaml, namespace is the ROS2 namespace."""
         pass
 
     def get_tool(self) -> dict:
-        """返回单个工具定义。"""
-        # 或 get_tools(self) -> list 返回多个
+        """Return a single tool definition."""
+        # Or get_tools(self) -> list to return multiple
 
     def start(self) -> None:
-        """启动插件（如开始采集数据）。"""
+        """Start the plugin (e.g. begin data acquisition)."""
         pass
 
     def stop(self) -> None:
-        """停止插件。"""
+        """Stop the plugin."""
         pass
 
     def dispatch(self, action: str, args: dict) -> dict | None:
-        """分发工具调用。action 从 args 中 pop 出来，args 包含剩余参数。"""
+        """Dispatch a tool call. action is popped from args, args contains the remaining parameters."""
         if action == "do_something":
             return {"result": "ok"}
         return None
 ```
 
-- 提供 `get_tool()` 返回单工具，或 `get_tools()` 返回多个
-- `dispatch()` 中 `action` 已从 args 中提取，若无 action 字段则等于 tool name
-- sensor 类型工具的 dispatch 通常返回 None（数据通过 topic 推送）
+- Provide `get_tool()` to return a single tool, or `get_tools()` to return multiple
+- In `dispatch()`, `action` has already been extracted from args; if there is no action field, it equals the tool name
+- Sensor-type tools typically return None from dispatch (data is pushed via topics)
 
 ---
 
-## driver.yaml 元数据
+## driver.yaml Metadata
 
 ```yaml
-id: g1-driver                   # 唯一 ID
-name: Unitree G1 Bundle          # 显示名
-category: driver                 # 固定 "driver"
-hardware_provider: unitree       # 硬件厂商
-hardware_model: "g1"             # 硬件型号
-image_name: g1                   # Docker 镜像名（不含 registry 前缀）
-port: 15701                      # MCP HTTP 端口
+id: g1-driver                   # Unique ID
+name: Unitree G1 Bundle          # Display name
+category: driver                 # Fixed as "driver"
+hardware_provider: unitree       # Hardware vendor
+hardware_model: "g1"             # Hardware model
+image_name: g1                   # Docker image name (without registry prefix)
+port: 15701                      # MCP HTTP port
 mcp_url: "http://localhost:15701/mcp"  # MCP endpoint
-description: "..."               # 设备描述
+description: "..."               # Device description
 ```
 
 ---
 
 ## config.yaml
 
-控制插件启用：
+Controls plugin enablement:
 
 ```yaml
 mcp_port: 15701
-ros_namespace: ""   # 留空自动使用 hostname
+ros_namespace: ""   # Leave empty to auto-use hostname
 
 plugins:
   mic:
@@ -262,13 +262,13 @@ plugins:
     enabled: true
 ```
 
-路径通过 `CONFIG_PATH` 环境变量指定（默认同目录下）。
+The path is specified via the `CONFIG_PATH` environment variable (defaults to the same directory).
 
 ---
 
-## 注册与心跳
+## Registration & Heartbeat
 
-Driver 启动后自动向 Agent Core（port 15678）注册：
+After startup, the driver automatically registers with Agent Core (port 15678):
 
 ```
 POST http://<agent-core>:15678/api/mcp
@@ -280,35 +280,35 @@ POST http://<agent-core>:15678/api/mcp
 }
 ```
 
-Agent Core 收到后执行 `initialize` → `tools/list`，注册工具到 registry。
+Upon receiving this, Agent Core executes `initialize` → `tools/list` and registers the tools into the registry.
 
 ---
 
-## 端口规范
+## Port Allocation
 
-Driver 端口分配在 **15700–15799** 范围：
+Driver ports are allocated in the **15700–15799** range:
 
 | Driver | Port |
 |--------|------|
 | Unitree G1 | 15701 |
 | Phanthy Remote Control | 15710 |
 
-新 driver 应选择未占用的端口，WebSocket 端口通常为 MCP 端口 +1。
+New drivers should choose an unoccupied port. The WebSocket port is typically the MCP port + 1.
 
 ---
 
-## 构建与部署
+## Build & Deploy
 
 ```bash
-# 从 drivers/ 根目录构建
+# Build from the drivers/ root directory
 ./build.sh <provider>/<model>   # e.g. ./build.sh unitree/g1
 
-# 或手动 Docker 构建
+# Or manual Docker build
 cd drivers/unitree/g1
 docker build -t g1-driver .
 ```
 
-- 所有 Dockerfile 基于 ARM64 架构
-- 使用 Tencent Cloud 镜像源加速
-- 镜像命名格式：`${REGISTRY}/${IMAGE_NAMESPACE}/${image_name}:${TAG}`
-- 环境变量配置见 `.env.example`
+- All Dockerfiles are based on ARM64 architecture
+- Tencent Cloud mirror sources are used for acceleration
+- Image naming format: `${REGISTRY}/${IMAGE_NAMESPACE}/${image_name}:${TAG}`
+- See `.env.example` for environment variable configuration
