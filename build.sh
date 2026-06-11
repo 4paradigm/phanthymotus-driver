@@ -228,7 +228,7 @@ for idx in "${SELECTED_INDICES[@]}"; do
         --platform linux/arm64 \
         --file "${dir}Dockerfile" \
         --tag "${FULL_IMAGE}" \
-        $(${PUSH_ENABLED} && echo "--push" || echo "--load") \
+        $(${PUSH_ENABLED} && echo "--push" || echo "--output=type=docker") \
         "${BUILD_CTX}"
 
     [ -n "${CLEANUP_CTX}" ] && rm -rf "${CLEANUP_CTX}"
