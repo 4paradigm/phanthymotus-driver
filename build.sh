@@ -13,15 +13,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${SCRIPT_DIR}/.env"
-MOTUS_ROOT="$(cd "${SCRIPT_DIR}/../phanthymotus" 2>/dev/null && pwd || echo "")"
-DRIVERS_YAML="${MOTUS_ROOT:+${MOTUS_ROOT}/deploy/core/config/drivers.yaml}"
 
 # ── 加载 .env ──────────────────────────────────────────────────────────────
-# Try local .env first, fall back to phanthymotus deploy/.env if available
 if [ -f "${ENV_FILE}" ]; then
     source "${ENV_FILE}"
-elif [ -n "${MOTUS_ROOT}" ] && [ -f "${MOTUS_ROOT}/deploy/.env" ]; then
-    source "${MOTUS_ROOT}/deploy/.env"
 fi
 
 # If registry not configured, build locally only
@@ -240,8 +235,8 @@ for idx in "${SELECTED_INDICES[@]}"; do
     echo "完成：${FULL_IMAGE}"
 done
 
-# ── 更新 drivers.yaml ─────────────────────────────────────────────────────
-if [ ${#BUILT_INDICES[@]} -gt 0 ] && [ -f "${DRIVERS_YAML}" ]; then
+# ── 更新 drivers.yaml（可选，通过 DRIVERS_YAML 环境变量指定路径）────────
+if [ ${#BUILT_INDICES[@]} -gt 0 ] && [ -n "${DRIVERS_YAML:-}" ] && [ -f "${DRIVERS_YAML}" ]; then
     echo ""
     echo "更新 ${DRIVERS_YAML} ..."
     python3 - "${DRIVERS_YAML}" "${REGISTRY}" "${IMAGE_NAMESPACE}" "${TAG}" \
