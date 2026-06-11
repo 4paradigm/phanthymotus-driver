@@ -1,0 +1,28 @@
+mcp_port: 15701
+ros_namespace: ""   # 留空则自动使用 hostname
+
+plugins:
+  mic:
+    enabled: true
+  tts:
+    enabled: true
+  speaker:
+    enabled: true
+  led:
+    enabled: true
+  loco:
+    enabled: true
+  arm:
+    enabled: true
+  state:
+    enabled: true
+  camera:
+    enabled: true
+  lidar:
+    enabled: true
+  slam:
+    enabled: true
+    map_dir: /opt/phanthy-motus/data/maps
+    db_path: /opt/phanthy-motus/data/spatial.db
+  motion_switcher:
+    enabled: true

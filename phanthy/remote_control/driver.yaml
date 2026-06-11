@@ -1,0 +1,9 @@
+id: phanthy-remote-control
+name: Phanthy Remote Control
+category: driver
+hardware_provider: phanthy
+hardware_model: "remote_control"
+image_name: remote_control
+port: 15710
+mcp_url: "http://localhost:15710/mcp"
+description: "远程控制 — 文本消息 + 音频文件 + 浏览器麦克风实时流"
