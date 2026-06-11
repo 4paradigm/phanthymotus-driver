@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 # build.sh — 构建硬件驱动镜像并推送到镜像仓库
 #
-# 用法：bash build.sh [driver_dir...]
+# 用法：bash build.sh [--mirror tuna|tencent|none] [driver_dir...]
 #   不传参数时显示交互式多选框
 #   直接传目录名时跳过选择（CI 用）
 #
 # 依赖：
 #   - 每个驱动目录下需有 driver.yaml 和 Dockerfile
 #   - python3（解析 YAML）或 yq（可选）
-#   - 镜像仓库配置从 ../phanthy-motus/deploy/.env 读取
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,6 +17,53 @@ ENV_FILE="${SCRIPT_DIR}/.env"
 if [ -f "${ENV_FILE}" ]; then
     source "${ENV_FILE}"
 fi
+
+# ── 解析 --mirror 参数 ────────────────────────────────────────────────────
+MIRROR="${MIRROR:-}"
+REMAINING_ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --mirror) MIRROR="$2"; shift 2 ;;
+        *) REMAINING_ARGS+=("$1"); shift ;;
+    esac
+done
+set -- "${REMAINING_ARGS[@]+"${REMAINING_ARGS[@]}"}"
+
+# ── 镜像源选择 ────────────────────────────────────────────────────────────
+select_mirror() {
+    if [ -z "${MIRROR}" ]; then
+        echo ""
+        echo "Select mirror / 选择镜像源:"
+        echo "  1) tencent  — 腾讯云（VPC 内网）"
+        echo "  2) tuna     — 清华 TUNA（公网）"
+        echo "  3) none     — 官方源（海外 / 裸连）"
+        printf "Choice [1/2/3] (default: 2): "
+        read -r choice </dev/tty || choice=""
+        case "${choice}" in
+            1) MIRROR="tencent" ;;
+            3) MIRROR="none" ;;
+            *) MIRROR="tuna" ;;
+        esac
+    fi
+
+    case "${MIRROR}" in
+        tencent)
+            PYPI_MIRROR="https://mirrors.tencentyun.com/pypi/simple/"
+            BINFMT_IMAGE="mirror.ccs.tencentyun.com/tonistiigi/binfmt"
+            ;;
+        tuna)
+            PYPI_MIRROR="https://pypi.tuna.tsinghua.edu.cn/simple/"
+            BINFMT_IMAGE="docker.io/tonistiigi/binfmt"
+            ;;
+        none|*)
+            PYPI_MIRROR="https://pypi.org/simple/"
+            BINFMT_IMAGE="docker.io/tonistiigi/binfmt"
+            ;;
+    esac
+
+    echo "Mirror: ${MIRROR} | PyPI: ${PYPI_MIRROR}"
+    echo ""
+}
 
 # If registry not configured, build locally only
 PUSH_ENABLED=true
@@ -181,7 +227,10 @@ echo ""
 if ${PUSH_ENABLED}; then
     echo "${REGISTRY_PASSWORD}" | docker login "${REGISTRY}" -u "${REGISTRY_USER}" --password-stdin
 fi
-docker run --privileged --rm mirror.ccs.tencentyun.com/tonistiigi/binfmt --install arm64
+
+select_mirror
+
+docker run --privileged --rm "${BINFMT_IMAGE}" --install arm64
 
 # ── 构建 ──────────────────────────────────────────────────────────────────
 declare -a BUILT_INDICES
@@ -224,6 +273,7 @@ for idx in "${SELECTED_INDICES[@]}"; do
     docker buildx build \
         --builder default \
         --platform linux/arm64 \
+        --build-arg "PYPI_MIRROR=${PYPI_MIRROR}" \
         --file "${dir}Dockerfile" \
         --tag "${FULL_IMAGE}" \
         $(${PUSH_ENABLED} && echo "--push" || echo "--output=type=docker") \
