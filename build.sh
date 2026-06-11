@@ -20,10 +20,15 @@ DRIVERS_YAML="${MOTUS_ROOT}/deploy/core/config/drivers.yaml"
 if [ -f "${ENV_FILE}" ]; then
     source "${ENV_FILE}"
 fi
-: "${REGISTRY:?REGISTRY not set. Copy ${MOTUS_ROOT}/deploy/.env.example to .env}"
-: "${REGISTRY_USER:?REGISTRY_USER not set}"
-: "${REGISTRY_PASSWORD:?REGISTRY_PASSWORD not set}"
-: "${IMAGE_NAMESPACE:?IMAGE_NAMESPACE not set}"
+
+# If registry not configured, build locally only
+PUSH_ENABLED=true
+if [ -z "${REGISTRY:-}" ] || [ -z "${REGISTRY_USER:-}" ] || [ -z "${REGISTRY_PASSWORD:-}" ] || [ -z "${IMAGE_NAMESPACE:-}" ]; then
+    echo "[info] Registry not configured — building locally only (no push)."
+    PUSH_ENABLED=false
+    REGISTRY="${REGISTRY:-local}"
+    IMAGE_NAMESPACE="${IMAGE_NAMESPACE:-phanthy-motus/drivers}"
+fi
 
 RESOURCE_CENTER_URL="${RESOURCE_CENTER_URL:-https://motus.phanthy.com}"
 
@@ -175,7 +180,9 @@ echo "目标仓库：${REGISTRY}/${IMAGE_NAMESPACE}/"
 echo ""
 
 # ── 登录 & QEMU ───────────────────────────────────────────────────────────
-echo "${REGISTRY_PASSWORD}" | docker login "${REGISTRY}" -u "${REGISTRY_USER}" --password-stdin
+if ${PUSH_ENABLED}; then
+    echo "${REGISTRY_PASSWORD}" | docker login "${REGISTRY}" -u "${REGISTRY_USER}" --password-stdin
+fi
 docker run --privileged --rm mirror.ccs.tencentyun.com/tonistiigi/binfmt --install arm64
 
 # ── 构建 ──────────────────────────────────────────────────────────────────
@@ -221,7 +228,7 @@ for idx in "${SELECTED_INDICES[@]}"; do
         --platform linux/arm64 \
         --file "${dir}Dockerfile" \
         --tag "${FULL_IMAGE}" \
-        --push \
+        $(${PUSH_ENABLED} && echo "--push" || echo "--load") \
         "${BUILD_CTX}"
 
     [ -n "${CLEANUP_CTX}" ] && rm -rf "${CLEANUP_CTX}"
@@ -321,7 +328,7 @@ echo ""
 echo "全部完成。"
 
 # ── 注册到 Resource Center ──────────────────────────────────────────────────
-if [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
+if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
     SYNC_CONFIRM="y"
     if [ -t 0 ] || [ -e /dev/tty ]; then
         printf "\nSync to resource-center (%s)? [Y/n]: " "${RESOURCE_CENTER_URL}" >/dev/tty
