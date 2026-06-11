@@ -20,14 +20,14 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     pyyaml netifaces opencv-python-headless numpy pyrealsense2
 
 # Build CycloneDDS 0.10.5 from source
-ARG CYCLONEDDS_URL=https://github.com/eclipse-cyclonedds/cyclonedds/archive/refs/tags/0.10.5.tar.gz
+ARG CYCLONEDDS_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/cyclonedds-0.10.5.tar.gz
 RUN curl -fsSL ${CYCLONEDDS_URL} \
     | tar xz -C /tmp && \
-    mkdir -p /tmp/cyclonedds-*/build && \
-    cd /tmp/cyclonedds-*/build && \
+    mkdir -p /tmp/cyclonedds-0.10.5/build && \
+    cd /tmp/cyclonedds-0.10.5/build && \
     cmake .. -DCMAKE_INSTALL_PREFIX=/opt/cyclonedds && \
     cmake --build . --config RelWithDebInfo --parallel --target install && \
-    rm -rf /tmp/cyclonedds-*
+    rm -rf /tmp/cyclonedds-0.10.5
 
 ENV CYCLONEDDS_HOME=/opt/cyclonedds
 ENV LD_LIBRARY_PATH=/opt/cyclonedds/lib:${LD_LIBRARY_PATH}
