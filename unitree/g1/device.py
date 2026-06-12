@@ -1461,27 +1461,44 @@ class _SlamInfoNode(Node):
         except Exception as e:
             self.get_logger().warn(f"SpatialNode: failed to subscribe rt/slam_key_info: {e}")
 
-        # Subscribe mapping point clouds via CycloneDDS (same domain as SLAM)
-        # Callback is ultra-fast (just queue put), processing in background thread
+        # Subscribe mapping point clouds via ROS2 FastDDS on domain 0 (where SLAM publishes)
+        # Uses a separate rclpy context + node to join domain 0 independently
+        self._domain0_context = None
+        self._domain0_node = None
         try:
-            from unitree_sdk2py.core.channel import ChannelSubscriber
-            from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_
-            map_cloud_sub = ChannelSubscriber("rt/unitree/slam_mapping/points", PointCloud2_)
-            map_cloud_sub.Init(self._on_mapping_cloud, 10)
-            self._dds_subs.append(map_cloud_sub)
-            self.get_logger().info("SpatialNode subscribed rt/unitree/slam_mapping/points")
-        except Exception as e:
-            self.get_logger().warn(f"SpatialNode: failed to subscribe mapping points: {e}")
+            import rclpy
+            from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+            from sensor_msgs.msg import PointCloud2 as RosPC2
 
-        try:
-            from unitree_sdk2py.core.channel import ChannelSubscriber
-            from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_
-            reloc_cloud_sub = ChannelSubscriber("rt/unitree/slam_relocation/points", PointCloud2_)
-            reloc_cloud_sub.Init(self._on_mapping_cloud, 10)
-            self._dds_subs.append(reloc_cloud_sub)
-            self.get_logger().info("SpatialNode subscribed rt/unitree/slam_relocation/points")
+            self._domain0_context = rclpy.Context()
+            self._domain0_context.init(args=[], domain_id=0)
+            self._domain0_node = rclpy.create_node(
+                "g1_spatial_slam_sub", context=self._domain0_context
+            )
+            qos = QoSProfile(
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=5,
+                durability=DurabilityPolicy.VOLATILE,
+            )
+            self._domain0_node.create_subscription(
+                RosPC2, '/unitree/slam_mapping/points',
+                self._on_mapping_cloud, qos
+            )
+            self._domain0_node.create_subscription(
+                RosPC2, '/unitree/slam_relocation/points',
+                self._on_mapping_cloud, qos
+            )
+            # Spin domain0 node in a dedicated thread
+            def _spin_domain0():
+                while rclpy.ok(context=self._domain0_context):
+                    rclpy.spin_once(self._domain0_node, timeout_sec=0.1)
+            threading.Thread(target=_spin_domain0, daemon=True, name="domain0_spin").start()
+            self.get_logger().info("SpatialNode subscribed SLAM points via FastDDS domain 0")
         except Exception as e:
-            self.get_logger().warn(f"SpatialNode: failed to subscribe relocation points: {e}")
+            self.get_logger().warn(f"SpatialNode: failed to setup domain 0 subscription: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _on_slam_info(self, msg) -> None:
         try:
