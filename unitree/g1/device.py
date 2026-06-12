@@ -1398,6 +1398,14 @@ class _SlamInfoNode(Node):
         self._map_buffer_lock = threading.Lock()
         self._map_buffer_dirty = False  # set True when new points added, False after save
 
+        # Cloud processing queue + background thread (decouples DDS callback from heavy processing)
+        self._cloud_queue = queue.Queue(maxsize=50)
+        self._cloud_processor_running = True
+        self._cloud_processor_thread = threading.Thread(
+            target=self._cloud_processor_loop, daemon=True, name="cloud_processor"
+        )
+        self._cloud_processor_thread.start()
+
         # Recent cloud ring buffer for discover_map fingerprinting
         self._recent_cloud = _SlamInfoNode.np.zeros((self.RECENT_CLOUD_MAX, 3), dtype=_SlamInfoNode.np.float32)
         self._recent_cloud_count = 0
@@ -1535,95 +1543,109 @@ class _SlamInfoNode(Node):
                     self._nav_target_name = None
 
     def _on_mapping_cloud(self, msg) -> None:
-        """Process SLAM mapping/relocation point cloud → merge into 3D voxel buffer.
-        Full map is published at 1Hz by _maybe_publish_full_map (called from here)."""
+        """DDS callback: fast enqueue only. Processing happens in separate thread."""
+        # Quick extract raw data and enqueue — don't block DDS thread
+        try:
+            data = bytes(msg.data)
+            if len(data) < msg.point_step:
+                return
+            self._cloud_queue.put_nowait((msg.fields, msg.point_step, msg.width * msg.height, data))
+        except Exception:
+            pass  # queue full, drop frame
+
+    def _cloud_processor_loop(self):
+        """Background thread: processes queued point clouds at its own pace."""
         np = _SlamInfoNode.np
-
-        # Parse PointCloud2 fields
-        field_map = {}
-        for f in msg.fields:
-            field_map[f.name] = (f.offset, f.datatype)
-
-        x_off = field_map.get("x", (0, 7))[0]
-        y_off = field_map.get("y", (4, 7))[0]
-        z_off = field_map.get("z", (8, 7))[0]
-
-        point_step = msg.point_step
-        total_points = msg.width * msg.height
-        data = bytes(msg.data)
-
-        if total_points == 0 or len(data) < point_step:
-            self.get_logger().debug(f"[mapping_cloud] empty frame: total_points={total_points} data_len={len(data)}")
-            return
-
-        # Parse all points into numpy array
-        points = []
-        for i in range(0, min(total_points, 20000) * point_step, point_step):
-            if i + point_step > len(data):
-                break
-            x = struct.unpack_from('<f', data, i + x_off)[0]
-            y = struct.unpack_from('<f', data, i + y_off)[0]
-            z = struct.unpack_from('<f', data, i + z_off)[0]
-            # Filter invalid (NaN or very far)
-            if x != x or y != y or z != z:
+        while self._cloud_processor_running:
+            try:
+                item = self._cloud_queue.get(timeout=1.0)
+            except Exception:
                 continue
-            if abs(x) > 50 or abs(y) > 50 or abs(z) > 20:
+
+            fields, point_step, total_points, data = item
+            if total_points == 0:
                 continue
-            points.append((x, y, z))
 
-        if not points:
-            self.get_logger().debug(f"[mapping_cloud] all {total_points} points filtered out")
-            return
+            # Parse fields
+            field_map = {}
+            for f in fields:
+                field_map[f.name] = (f.offset, f.datatype)
+            x_off = field_map.get("x", (0, 7))[0]
+            y_off = field_map.get("y", (4, 7))[0]
+            z_off = field_map.get("z", (8, 7))[0]
 
-        pts_arr = np.array(points, dtype=np.float32)
+            # Numpy vectorized parsing
+            num_points = min(total_points, 20000)
+            if len(data) < num_points * point_step:
+                num_points = len(data) // point_step
 
-        # Merge into voxel map buffer (deduplication)
-        voxel_size = self.VOXEL_SIZE
-        with self._map_buffer_lock:
-            prev_size = len(self._map_buffer)
-            for i in range(len(pts_arr)):
-                ix = int(pts_arr[i, 0] / voxel_size)
-                iy = int(pts_arr[i, 1] / voxel_size)
-                iz = int(pts_arr[i, 2] / voxel_size)
-                key = (ix, iy, iz)
-                if key not in self._map_buffer:
-                    self._map_buffer[key] = (pts_arr[i, 0], pts_arr[i, 1], pts_arr[i, 2])
-            new_size = len(self._map_buffer)
-            if new_size > prev_size:
-                self._map_buffer_dirty = True
+            # Build structured dtype for the point layout
+            # Extract x, y, z using byte offsets directly
+            raw = np.frombuffer(data, dtype=np.uint8, count=num_points * point_step)
+            raw = raw.reshape(num_points, point_step)
 
-        self._last_cloud_time = time.monotonic()
-        new_points = new_size - prev_size
-        self.get_logger().info(
-            f"[mapping_cloud] frame: {len(pts_arr)} pts parsed, "
-            f"+{new_points} new voxels, total={new_size}"
-        )
+            x = raw[:, x_off:x_off+4].view(np.float32).ravel()
+            y = raw[:, y_off:y_off+4].view(np.float32).ravel()
+            z = raw[:, z_off:z_off+4].view(np.float32).ravel()
 
-        # Update recent cloud ring buffer (for discover fingerprinting)
-        n = len(pts_arr)
-        start = self._recent_cloud_write_idx
-        cap = self.RECENT_CLOUD_MAX
-        if n <= cap:
-            end = start + n
-            if end <= cap:
-                self._recent_cloud[start:end] = pts_arr
+            # Filter invalid (NaN and out of range)
+            valid = (
+                np.isfinite(x) & np.isfinite(y) & np.isfinite(z) &
+                (np.abs(x) < 50) & (np.abs(y) < 50) & (np.abs(z) < 20)
+            )
+            x, y, z = x[valid], y[valid], z[valid]
+
+            if len(x) == 0:
+                continue
+
+            pts_arr = np.column_stack([x, y, z]).astype(np.float32)
+
+            # Merge into voxel map buffer (deduplication)
+            voxel_size = self.VOXEL_SIZE
+            # Vectorized voxel key computation
+            ix = (pts_arr[:, 0] / voxel_size).astype(np.int32)
+            iy = (pts_arr[:, 1] / voxel_size).astype(np.int32)
+            iz = (pts_arr[:, 2] / voxel_size).astype(np.int32)
+
+            with self._map_buffer_lock:
+                prev_size = len(self._map_buffer)
+                for j in range(len(pts_arr)):
+                    key = (int(ix[j]), int(iy[j]), int(iz[j]))
+                    if key not in self._map_buffer:
+                        self._map_buffer[key] = (float(pts_arr[j, 0]), float(pts_arr[j, 1]), float(pts_arr[j, 2]))
+                new_size = len(self._map_buffer)
+                if new_size > prev_size:
+                    self._map_buffer_dirty = True
+
+            self._last_cloud_time = time.monotonic()
+            new_points = new_size - prev_size
+            self.get_logger().info(
+                f"[mapping_cloud] frame: {len(pts_arr)} pts parsed, "
+                f"+{new_points} new voxels, total={new_size}"
+            )
+
+            # Update recent cloud ring buffer
+            n = len(pts_arr)
+            start = self._recent_cloud_write_idx
+            cap = self.RECENT_CLOUD_MAX
+            if n <= cap:
+                end = start + n
+                if end <= cap:
+                    self._recent_cloud[start:end] = pts_arr
+                else:
+                    first = cap - start
+                    self._recent_cloud[start:cap] = pts_arr[:first]
+                    self._recent_cloud[0:n - first] = pts_arr[first:]
+                self._recent_cloud_write_idx = (start + n) % cap
+                self._recent_cloud_count = min(self._recent_cloud_count + n, cap)
             else:
-                first = cap - start
-                self._recent_cloud[start:cap] = pts_arr[:first]
-                self._recent_cloud[0:n - first] = pts_arr[first:]
-            self._recent_cloud_write_idx = (start + n) % cap
-            self._recent_cloud_count = min(self._recent_cloud_count + n, cap)
-        else:
-            # More points than buffer — just take last `cap`
-            self._recent_cloud[:] = pts_arr[-cap:]
-            self._recent_cloud_write_idx = 0
-            self._recent_cloud_count = cap
+                self._recent_cloud[:] = pts_arr[-cap:]
+                self._recent_cloud_write_idx = 0
+                self._recent_cloud_count = cap
 
-        # Maybe generate keyframe for Scan Context
-        self._maybe_add_keyframe(pts_arr)
-
-        # Publish full map at 1Hz
-        self._maybe_publish_full_map()
+            # Keyframe + publish
+            self._maybe_add_keyframe(pts_arr)
+            self._maybe_publish_full_map()
 
     def _maybe_record_trajectory(self):
         with self._lock:
@@ -2116,12 +2138,23 @@ class SpatialPlugin:
 
     def _on_cloud_timeout(self):
         """Called by watchdog when no point cloud received for WATCHDOG_TIMEOUT seconds.
-        Re-trigger StartMapping to revive the SLAM point cloud stream."""
-        print("[SpatialPlugin] _on_cloud_timeout: re-triggering StartMapping", flush=True)
-        code, resp = self._client.StartMapping()
-        print(f"[SpatialPlugin] StartMapping (watchdog) → code={code}", flush=True)
-        if code == 0:
-            self._node.set_map_status("mapping")
+        Re-subscribe DDS topics (subscription may have been lost)."""
+        print("[SpatialPlugin] _on_cloud_timeout: re-subscribing DDS mapping topics", flush=True)
+        try:
+            from unitree_sdk2py.core.channel import ChannelSubscriber
+            from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_
+            # Re-create subscriptions
+            sub1 = ChannelSubscriber("rt/unitree/slam_mapping/points", PointCloud2_)
+            sub1.Init(self._node._on_mapping_cloud, 10)
+            sub2 = ChannelSubscriber("rt/unitree/slam_relocation/points", PointCloud2_)
+            sub2.Init(self._node._on_mapping_cloud, 10)
+            # Replace old refs
+            self._node._dds_subs = [s for s in self._node._dds_subs
+                                    if not hasattr(s, '_topic') or 'points' not in str(getattr(s, '_topic', ''))]
+            self._node._dds_subs.extend([sub1, sub2])
+            print("[SpatialPlugin] DDS re-subscribed successfully", flush=True)
+        except Exception as e:
+            print(f"[SpatialPlugin] DDS re-subscribe failed: {e}", flush=True)
 
     def start(self) -> None:
         """Auto-start mapping on plugin start. Always mapping, always observing."""
