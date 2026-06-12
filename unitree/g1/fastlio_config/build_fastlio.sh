@@ -10,6 +10,9 @@ INSTALL_DIR="/opt/fastlio"
 FAST_LIO_URL="${FAST_LIO_URL:-https://github.com/hku-mars/FAST_LIO.git}"
 FAST_LIO_BRANCH="${FAST_LIO_BRANCH:-main}"
 
+echo "[fastlio-build] Refreshing ROS GPG key..."
+curl -fsSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.asc | apt-key add -
+
 echo "[fastlio-build] Installing dependencies..."
 apt-get update
 apt-get install -y --no-install-recommends \
