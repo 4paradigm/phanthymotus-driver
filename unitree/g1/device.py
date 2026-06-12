@@ -2080,18 +2080,31 @@ class SpatialPlugin:
 
     def _do_auto_mapping(self) -> dict:
         """Auto-mapping logic based on current SLAM state:
-        - localized/mapping → SLAM already knows where it is, just StartMapping to extend
+        - mapping (code 3104 = already mapping) → just ensure active_map is set, don't interrupt
+        - localized → StartMapping to extend
         - idle → fingerprint match, then StartMapping
         """
         with self._node._lock:
             status = self._node._map_status
-        print(f"[SpatialPlugin] _do_auto_mapping: current status={status}")
+        print(f"[SpatialPlugin] _do_auto_mapping: current status={status}", flush=True)
 
-        if status in ("localized", "mapping"):
-            # SLAM already relocalized — just start/continue mapping on existing map
-            print("[SpatialPlugin] SLAM already localized, calling StartMapping to extend")
+        if status == "mapping":
+            # SLAM is already in mapping mode (started automatically by robot)
+            # Don't call StartMapping again (code 3104) — just ensure we track it
+            print("[SpatialPlugin] SLAM already mapping, just ensuring active_map is set", flush=True)
+            if not self._node._active_map:
+                map_name = f"map_{int(time.time())}"
+                pcd_path = f"{self._map_dir}/{map_name}.pcd"
+                self._node.set_active_map(map_name)
+                self._db.add_map(map_name, pcd_path)
+                print(f"[SpatialPlugin] Created map entry: {map_name}", flush=True)
+            return {"status": "already_mapping", "map_name": self._node._active_map}
+
+        if status == "localized":
+            # SLAM finished relocation but not mapping — start mapping to extend
+            print("[SpatialPlugin] SLAM localized, calling StartMapping to extend", flush=True)
             code, resp = self._client.StartMapping()
-            print(f"[SpatialPlugin] StartMapping() → code={code}")
+            print(f"[SpatialPlugin] StartMapping() → code={code}", flush=True)
             if code == 0:
                 self._node.set_map_status("mapping")
                 if not self._node._active_map:
@@ -2099,9 +2112,19 @@ class SpatialPlugin:
                     pcd_path = f"{self._map_dir}/{map_name}.pcd"
                     self._node.set_active_map(map_name)
                     self._db.add_map(map_name, pcd_path)
-                    print(f"[SpatialPlugin] Created map entry: {map_name}")
+                    print(f"[SpatialPlugin] Created map entry: {map_name}", flush=True)
                 return {"status": "continued", "map_name": self._node._active_map}
-            print(f"[SpatialPlugin] StartMapping failed: code={code}, trying fingerprint path")
+            # code 3104 = already mapping, treat as success
+            if code == 3104:
+                print("[SpatialPlugin] StartMapping returned 3104 (already mapping), ok", flush=True)
+                self._node.set_map_status("mapping")
+                if not self._node._active_map:
+                    map_name = f"map_{int(time.time())}"
+                    pcd_path = f"{self._map_dir}/{map_name}.pcd"
+                    self._node.set_active_map(map_name)
+                    self._db.add_map(map_name, pcd_path)
+                return {"status": "already_mapping", "map_name": self._node._active_map}
+            print(f"[SpatialPlugin] StartMapping failed: code={code}, trying fingerprint path", flush=True)
             # Fall through to fingerprint path if StartMapping fails
 
         # SLAM not localized (idle) — try fingerprint matching
