@@ -1359,17 +1359,24 @@ def _bearing_label(dx: float, dy: float) -> str:
 
 
 class _SlamInfoNode(Node):
-    """Subscribes to rt/slam_info, rt/slam_key_info, and mapping point clouds. Publishes pos_tag + mapping."""
+    """Subscribes to rt/slam_info, rt/slam_key_info, and mapping point clouds.
+    Maintains a 3D voxel map buffer and publishes full map at 1Hz."""
 
-    MAPPING_INTERVAL = 0.5   # 2 Hz for mapping viz (point cloud is heavy)
-    MAPPING_MAX_POINTS = 8000  # downsample mapping cloud
+    import numpy as np
 
-    def __init__(self, pos_tag_topic: str, mapping_topic: str, db: _SpatialDB):
+    VOXEL_SIZE = 0.05            # 5cm voxel grid for deduplication
+    MAP_PUBLISH_INTERVAL = 1.0   # 1 Hz full map publish
+    MAX_SEND_POINTS = 50000      # max points per publish (downsample if exceeded)
+    RECENT_CLOUD_MAX = 50000     # recent cloud ring buffer capacity
+    KF_DIST_THRESH = 2.0         # keyframe every 2m movement
+    KF_YAW_THRESH = 0.52         # or 30° rotation
+
+    def __init__(self, pos_tag_topic: str, mapping_topic: str, db: _SpatialDB, sc_mgr=None):
         super().__init__("g1_spatial")
         self._db = db
+        self._sc_mgr = sc_mgr  # ScanContextManager (optional)
         self._pos_tag_pub = self.create_publisher(String, pos_tag_topic, _LOW_LAT_QOS)
 
-        # Mapping viz: binary [robot_x, robot_y, robot_yaw, uint32 N, float32 x,y × N]
         from std_msgs.msg import UInt8MultiArray
         self._mapping_pub = self.create_publisher(UInt8MultiArray, mapping_topic, _LOW_LAT_QOS)
 
@@ -1383,7 +1390,21 @@ class _SlamInfoNode(Node):
         self._last_pub_time: float = 0.0
         self._last_traj_time: float = 0.0
         self._last_traj_pose: tuple = (0.0, 0.0)
-        self._last_mapping_time: float = 0.0
+
+        # 3D voxel map buffer: dict[(ix,iy,iz)] → (x, y, z)
+        self._map_buffer: dict[tuple, tuple] = {}
+        self._map_buffer_lock = threading.Lock()
+
+        # Recent cloud ring buffer for discover_map fingerprinting
+        self._recent_cloud = _SlamInfoNode.np.zeros((self.RECENT_CLOUD_MAX, 3), dtype=_SlamInfoNode.np.float32)
+        self._recent_cloud_count = 0
+        self._recent_cloud_write_idx = 0
+
+        # Keyframe tracking for Scan Context
+        self._last_kf_pose: tuple = (0.0, 0.0, 0.0)  # (x, y, yaw)
+
+        # 1Hz full map publish timer
+        self._last_map_publish_time: float = 0.0
 
         # Subscribe DDS topics
         try:
@@ -1483,19 +1504,9 @@ class _SlamInfoNode(Node):
                     self._nav_target_name = None
 
     def _on_mapping_cloud(self, msg) -> None:
-        """Process SLAM mapping/relocation point cloud → publish 2D top-down binary."""
-        now = time.monotonic()
-        if now - self._last_mapping_time < self.MAPPING_INTERVAL:
-            return
-        self._last_mapping_time = now
-
-        # Get current robot pose
-        with self._lock:
-            pose = self._current_pose
-
-        robot_x = pose["x"] if pose else 0.0
-        robot_y = pose["y"] if pose else 0.0
-        robot_yaw = pose["yaw"] if pose else 0.0
+        """Process SLAM mapping/relocation point cloud → merge into 3D voxel buffer.
+        Full map is published at 1Hz by _maybe_publish_full_map (called from here)."""
+        np = _SlamInfoNode.np
 
         # Parse PointCloud2 fields
         field_map = {}
@@ -1504,42 +1515,71 @@ class _SlamInfoNode(Node):
 
         x_off = field_map.get("x", (0, 7))[0]
         y_off = field_map.get("y", (4, 7))[0]
+        z_off = field_map.get("z", (8, 7))[0]
 
         point_step = msg.point_step
         total_points = msg.width * msg.height
         data = bytes(msg.data)
 
-        # Downsample
-        stride = max(1, total_points // self.MAPPING_MAX_POINTS)
-        num_out = min(total_points, self.MAPPING_MAX_POINTS)
+        if total_points == 0 or len(data) < point_step:
+            return
 
-        # Pack binary: [float32 robot_x, robot_y, robot_yaw][uint32 N][float32 x, y × N]
-        out = struct.pack('<fff', robot_x, robot_y, robot_yaw)
-        points_buf = b''
-        count = 0
-        for i in range(0, total_points * point_step, point_step * stride):
-            if count >= num_out:
-                break
+        # Parse all points into numpy array
+        points = []
+        for i in range(0, min(total_points, 20000) * point_step, point_step):
             if i + point_step > len(data):
                 break
             x = struct.unpack_from('<f', data, i + x_off)[0]
             y = struct.unpack_from('<f', data, i + y_off)[0]
-            # Filter out invalid points (NaN or very far)
-            if x != x or y != y:  # NaN check
+            z = struct.unpack_from('<f', data, i + z_off)[0]
+            # Filter invalid (NaN or very far)
+            if x != x or y != y or z != z:
                 continue
-            if abs(x) > 50 or abs(y) > 50:
+            if abs(x) > 50 or abs(y) > 50 or abs(z) > 20:
                 continue
-            points_buf += struct.pack('<ff', x, y)
-            count += 1
+            points.append((x, y, z))
 
-        out += struct.pack('<I', count)
-        out += points_buf
+        if not points:
+            return
 
-        # Publish as UInt8MultiArray
-        from std_msgs.msg import UInt8MultiArray
-        ros_msg = UInt8MultiArray()
-        ros_msg.data = list(out)
-        self._mapping_pub.publish(ros_msg)
+        pts_arr = np.array(points, dtype=np.float32)
+
+        # Merge into voxel map buffer (deduplication)
+        voxel_size = self.VOXEL_SIZE
+        with self._map_buffer_lock:
+            for i in range(len(pts_arr)):
+                ix = int(pts_arr[i, 0] / voxel_size)
+                iy = int(pts_arr[i, 1] / voxel_size)
+                iz = int(pts_arr[i, 2] / voxel_size)
+                key = (ix, iy, iz)
+                if key not in self._map_buffer:
+                    self._map_buffer[key] = (pts_arr[i, 0], pts_arr[i, 1], pts_arr[i, 2])
+
+        # Update recent cloud ring buffer (for discover fingerprinting)
+        n = len(pts_arr)
+        start = self._recent_cloud_write_idx
+        cap = self.RECENT_CLOUD_MAX
+        if n <= cap:
+            end = start + n
+            if end <= cap:
+                self._recent_cloud[start:end] = pts_arr
+            else:
+                first = cap - start
+                self._recent_cloud[start:cap] = pts_arr[:first]
+                self._recent_cloud[0:n - first] = pts_arr[first:]
+            self._recent_cloud_write_idx = (start + n) % cap
+            self._recent_cloud_count = min(self._recent_cloud_count + n, cap)
+        else:
+            # More points than buffer — just take last `cap`
+            self._recent_cloud[:] = pts_arr[-cap:]
+            self._recent_cloud_write_idx = 0
+            self._recent_cloud_count = cap
+
+        # Maybe generate keyframe for Scan Context
+        self._maybe_add_keyframe(pts_arr)
+
+        # Publish full map at 1Hz
+        self._maybe_publish_full_map()
 
     def _maybe_record_trajectory(self):
         with self._lock:
@@ -1557,6 +1597,196 @@ class _SlamInfoNode(Node):
             self._last_traj_time = now
             self._last_traj_pose = (x, y)
             self._db.add_trajectory(x, y, yaw, now)
+
+    def _maybe_add_keyframe(self, pts_arr) -> None:
+        """Generate Scan Context keyframe if robot moved/rotated enough."""
+        if self._sc_mgr is None:
+            return
+        with self._lock:
+            if self._current_pose is None or self._active_map is None:
+                return
+            x, y = self._current_pose["x"], self._current_pose["y"]
+            yaw = self._current_pose["yaw"]
+            active_map = self._active_map
+
+        lx, ly, lyaw = self._last_kf_pose
+        dx = x - lx
+        dy = y - ly
+        dist = math.sqrt(dx * dx + dy * dy)
+        dyaw = abs(yaw - lyaw)
+        if dyaw > math.pi:
+            dyaw = 2 * math.pi - dyaw
+
+        if dist >= self.KF_DIST_THRESH or dyaw >= self.KF_YAW_THRESH:
+            sc = self._sc_mgr.make_scan_context(pts_arr)
+            self._sc_mgr.add_keyframe(active_map, sc, (x, y, 0.0))
+            self._last_kf_pose = (x, y, yaw)
+
+    def _maybe_publish_full_map(self) -> None:
+        """Publish the full 3D voxel map at 1Hz."""
+        np = _SlamInfoNode.np
+        now = time.monotonic()
+        if now - self._last_map_publish_time < self.MAP_PUBLISH_INTERVAL:
+            return
+        self._last_map_publish_time = now
+
+        with self._lock:
+            pose = self._current_pose
+        robot_x = pose["x"] if pose else 0.0
+        robot_y = pose["y"] if pose else 0.0
+        robot_yaw = pose["yaw"] if pose else 0.0
+
+        # Extract points from voxel buffer
+        with self._map_buffer_lock:
+            if not self._map_buffer:
+                return
+            all_points = list(self._map_buffer.values())
+
+        pts = np.array(all_points, dtype=np.float32)
+        num_points = len(pts)
+
+        # Downsample if too many
+        if num_points > self.MAX_SEND_POINTS:
+            indices = np.random.choice(num_points, self.MAX_SEND_POINTS, replace=False)
+            pts = pts[indices]
+            num_points = self.MAX_SEND_POINTS
+
+        # Pack binary: [float32 robot_x, robot_y, robot_yaw][uint8 flags][uint32 N][float32 x,y,z × N]
+        # flags: bit0=full_map(1), bit1=has_z(1) → flags = 0x03
+        flags = 0x03
+        header = struct.pack('<fffBI', robot_x, robot_y, robot_yaw, flags, num_points)
+        body = pts.tobytes()
+
+        from std_msgs.msg import UInt8MultiArray
+        ros_msg = UInt8MultiArray()
+        ros_msg.data = list(header + body)
+        self._mapping_pub.publish(ros_msg)
+
+    def load_pcd_to_buffer(self, pcd_path: str) -> None:
+        """Load a PCD file into the voxel map buffer."""
+        np = _SlamInfoNode.np
+        if not os.path.exists(pcd_path):
+            self.get_logger().warn(f"PCD file not found: {pcd_path}")
+            return
+
+        points = self._parse_pcd(pcd_path)
+        if points is None or len(points) == 0:
+            return
+
+        voxel_size = self.VOXEL_SIZE
+        with self._map_buffer_lock:
+            for i in range(len(points)):
+                ix = int(points[i, 0] / voxel_size)
+                iy = int(points[i, 1] / voxel_size)
+                iz = int(points[i, 2] / voxel_size)
+                self._map_buffer[(ix, iy, iz)] = (points[i, 0], points[i, 1], points[i, 2])
+
+        self.get_logger().info(f"Loaded {len(points)} points from PCD, buffer size: {len(self._map_buffer)}")
+
+    def clear_map_buffer(self) -> None:
+        """Clear the voxel map buffer."""
+        with self._map_buffer_lock:
+            self._map_buffer.clear()
+
+    def get_recent_cloud(self):
+        """Return recent cloud points as Nx3 numpy array (for discover fingerprinting)."""
+        np = _SlamInfoNode.np
+        count = min(self._recent_cloud_count, self.RECENT_CLOUD_MAX)
+        if count == 0:
+            return None
+        return self._recent_cloud[:count].copy()
+
+    @staticmethod
+    def _parse_pcd(path: str):
+        """Parse ASCII/binary PCD file, extract x,y,z columns. Returns Nx3 numpy array."""
+        np = _SlamInfoNode.np
+        try:
+            with open(path, 'rb') as f:
+                header_lines = []
+                while True:
+                    line = f.readline()
+                    if not line:
+                        return None
+                    line_str = line.decode('ascii', errors='ignore').strip()
+                    header_lines.append(line_str)
+                    if line_str.startswith('DATA'):
+                        break
+
+                # Parse header
+                fields = []
+                num_points = 0
+                data_type = "ascii"
+                field_sizes = []
+                field_types = []
+                for hl in header_lines:
+                    parts = hl.split()
+                    if parts[0] == "FIELDS":
+                        fields = parts[1:]
+                    elif parts[0] == "SIZE":
+                        field_sizes = [int(s) for s in parts[1:]]
+                    elif parts[0] == "TYPE":
+                        field_types = parts[1:]
+                    elif parts[0] == "POINTS":
+                        num_points = int(parts[1])
+                    elif parts[0] == "DATA":
+                        data_type = parts[1].lower()
+
+                if num_points == 0:
+                    return None
+
+                # Find x, y, z field indices
+                try:
+                    xi = fields.index("x")
+                    yi = fields.index("y")
+                    zi = fields.index("z")
+                except ValueError:
+                    return None
+
+                if data_type == "ascii":
+                    points = []
+                    for _ in range(num_points):
+                        line = f.readline().decode('ascii', errors='ignore').strip()
+                        if not line:
+                            break
+                        vals = line.split()
+                        if len(vals) <= max(xi, yi, zi):
+                            continue
+                        x = float(vals[xi])
+                        y = float(vals[yi])
+                        z = float(vals[zi])
+                        if x != x or y != y or z != z:
+                            continue
+                        points.append((x, y, z))
+                    return np.array(points, dtype=np.float32) if points else None
+
+                elif data_type == "binary":
+                    point_size = sum(field_sizes)
+                    raw = f.read(num_points * point_size)
+                    if len(raw) < num_points * point_size:
+                        num_points = len(raw) // point_size
+
+                    # Compute byte offsets for x, y, z
+                    offsets = [0]
+                    for s in field_sizes[:-1]:
+                        offsets.append(offsets[-1] + s)
+
+                    x_off = offsets[xi]
+                    y_off = offsets[yi]
+                    z_off = offsets[zi]
+
+                    points = np.zeros((num_points, 3), dtype=np.float32)
+                    for i in range(num_points):
+                        base = i * point_size
+                        points[i, 0] = struct.unpack_from('<f', raw, base + x_off)[0]
+                        points[i, 1] = struct.unpack_from('<f', raw, base + y_off)[0]
+                        points[i, 2] = struct.unpack_from('<f', raw, base + z_off)[0]
+
+                    # Filter NaN
+                    valid = ~np.isnan(points).any(axis=1)
+                    return points[valid]
+
+        except Exception:
+            return None
 
     def _maybe_publish_pos_tag(self):
         now = time.monotonic()
@@ -1634,9 +1864,15 @@ class SpatialPlugin:
         os.makedirs(self._map_dir, exist_ok=True)
         db_path = plugin_config.get("db_path", os.path.join(os.path.dirname(__file__), "resource", "spatial.db"))
         self._db = _SpatialDB(db_path)
+
+        # Scan Context manager for auto-discover
+        sc_db_path = os.path.join(os.path.dirname(db_path), "scan_context.db")
+        from scan_context import ScanContextManager
+        self._sc_mgr = ScanContextManager(sc_db_path)
+
         self._pos_tag_topic = f"/{namespace}/spatial/pos_tag"
         self._mapping_topic = f"/{namespace}/spatial/mapping"
-        self._node = _SlamInfoNode(self._pos_tag_topic, self._mapping_topic, self._db)
+        self._node = _SlamInfoNode(self._pos_tag_topic, self._mapping_topic, self._db, self._sc_mgr)
         self._node.set_active_map(self._db.get_last_used_map())
         executor.add_node(self._node)
 
@@ -1656,7 +1892,7 @@ class SpatialPlugin:
         return {
             "name": "mapping",
             "type": "sensor",
-            "description": f"SLAM mapping visualization — 2D top-down point cloud map with robot position. Binary format: [float32 robot_x,y,yaw][uint32 N][float32 x,y × N]. 2Hz to {self._mapping_topic}",
+            "description": f"SLAM 3D mapping visualization — full 3D point cloud map with robot position. Binary format: [float32 robot_x,y,yaw][uint8 flags][uint32 N][float32 x,y,z × N]. 1Hz to {self._mapping_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._mapping_topic, "format": "sensor/mapping"}],
         }
@@ -1665,19 +1901,18 @@ class SpatialPlugin:
         return {
             "name": "spatial",
             "type": "actuator",
-            "description": "Spatial intelligence — map discovery, place tagging, relocalization, navigation. Use navigate_to_tag to go to tagged places.",
+            "description": "Spatial intelligence — autonomous map discovery (fingerprint matching), place tagging, navigation. discover_map auto-detects environment and loads/creates map.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["discover_map", "stop_discover", "relocalize", "list_maps",
+                        "enum": ["discover_map", "stop_discover",
                                  "tag_place", "untag_place", "list_tags",
                                  "navigate_to_tag", "navigate_to_pose",
                                  "pause_nav", "resume_nav", "stop_nav"],
                         "description": "Action to perform",
                     },
-                    "map_name":    {"type": "string", "description": "Map name for discover/relocalize"},
                     "name":        {"type": "string", "description": "POI tag name"},
                     "description": {"type": "string", "description": "POI description"},
                     "tag_name":    {"type": "string", "description": "Target tag name for navigation"},
@@ -1687,10 +1922,8 @@ class SpatialPlugin:
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "discover_map":     {"params": ["map_name"],           "description": "Start mapping and save with given name"},
+                    "discover_map":     {"params": [],                     "description": "Auto-discover environment: match against known maps via fingerprint, or create new map"},
                     "stop_discover":    {"params": [],                     "description": "Stop mapping and save current map"},
-                    "relocalize":       {"params": ["map_name"],           "description": "Load map and relocalize (default: last used map)"},
-                    "list_maps":        {"params": [],                     "description": "List all saved maps"},
                     "tag_place":        {"params": ["name", "description"], "description": "Tag current position with a name"},
                     "untag_place":      {"params": ["name"],               "description": "Remove a place tag"},
                     "list_tags":        {"params": [],                     "description": "List all tags with relative positions"},
@@ -1711,15 +1944,54 @@ class SpatialPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "discover_map":
-            map_name = args.get("map_name", "default")
+            # Autonomous map discovery: fingerprint match → load old map, or start new
+            recent_cloud = self._node.get_recent_cloud()
+            if recent_cloud is None or len(recent_cloud) < 100:
+                # No lidar data yet — just start mapping blind
+                code, resp = self._client.StartMapping()
+                if code == 0:
+                    map_name = f"map_{int(time.time())}"
+                    pcd_path = f"{self._map_dir}/{map_name}.pcd"
+                    self._node.clear_map_buffer()
+                    self._node.set_map_status("mapping")
+                    self._node.set_active_map(map_name)
+                    self._db.add_map(map_name, pcd_path)
+                    return {"status": "not_found", "map_name": map_name, "action": "new_map_started",
+                            "note": "No lidar data for fingerprint, started fresh"}
+                return {"error": f"StartMapping failed, code={code}", "response": resp}
+
+            # Generate fingerprint from current environment
+            current_sc = self._sc_mgr.make_scan_context(recent_cloud)
+            match = self._sc_mgr.query(current_sc)
+
+            if match:
+                # Found matching map → relocalize then continue mapping
+                map_name = match["map_name"]
+                map_info = self._db.get_map(map_name)
+                if map_info:
+                    pcd_path = map_info["pcd_path"]
+                    code, resp = self._client.InitPose(0, 0, 0, 0, 0, 0, 1.0, pcd_path)
+                    if code == 0:
+                        # Successfully relocated → start mapping to extend
+                        self._client.StartMapping()
+                        self._node.load_pcd_to_buffer(pcd_path)
+                        self._node.set_map_status("mapping")
+                        self._node.set_active_map(map_name)
+                        self._db.set_last_used_map(map_name)
+                        return {"status": "found", "map_name": map_name,
+                                "pose": match["pose"], "score": match["score"]}
+                    # InitPose failed — fall through to new map
+
+            # No match found → start new map
+            map_name = f"map_{int(time.time())}"
+            pcd_path = f"{self._map_dir}/{map_name}.pcd"
             code, resp = self._client.StartMapping()
             if code == 0:
+                self._node.clear_map_buffer()
                 self._node.set_map_status("mapping")
                 self._node.set_active_map(map_name)
-                # Pre-register map entry
-                pcd_path = f"{self._map_dir}/{map_name}.pcd"
                 self._db.add_map(map_name, pcd_path)
-                return {"status": "mapping_started", "map_name": map_name}
+                return {"status": "not_found", "map_name": map_name, "action": "new_map_started"}
             return {"error": f"StartMapping failed, code={code}", "response": resp}
 
         elif action == "stop_discover":
@@ -1733,31 +2005,6 @@ class SpatialPlugin:
                 self._node.set_map_status("idle")
                 return {"status": "map_saved", "map_name": active_map, "path": pcd_path}
             return {"error": f"StopMapping failed, code={code}", "response": resp}
-
-        elif action == "relocalize":
-            map_name = args.get("map_name") or self._db.get_last_used_map()
-            if not map_name:
-                maps = self._db.list_maps()
-                if maps:
-                    return {"error": "no_last_map", "available_maps": [m["name"] for m in maps]}
-                return {"error": "no_maps_available"}
-
-            map_info = self._db.get_map(map_name)
-            if not map_info:
-                return {"error": f"Map '{map_name}' not found", "available_maps": [m["name"] for m in self._db.list_maps()]}
-
-            pcd_path = map_info["pcd_path"]
-            code, resp = self._client.InitPose(0, 0, 0, 0, 0, 0, 1.0, pcd_path)
-            if code == 0:
-                self._db.set_last_used_map(map_name)
-                self._node.set_active_map(map_name)
-                self._node.set_map_status("localized")
-                return {"status": "relocalized", "map_name": map_name}
-            return {"error": f"InitPose failed, code={code}", "response": resp,
-                    "available_maps": [m["name"] for m in self._db.list_maps()]}
-
-        elif action == "list_maps":
-            return {"maps": self._db.list_maps()}
 
         elif action == "tag_place":
             name = args.get("name", "")
