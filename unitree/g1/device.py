@@ -2023,8 +2023,12 @@ class SpatialPlugin:
 
     def start(self) -> None:
         """Auto-start mapping on plugin start. Always mapping, always observing."""
+        if self._node._map_status == "mapping":
+            return  # already mapping, skip (handles multiple start() calls)
         def _auto_discover():
             time.sleep(3)  # wait for SLAM service and DDS to stabilize
+            if self._node._map_status == "mapping":
+                return  # race check
             try:
                 self._do_discover_map()
             except Exception as e:
