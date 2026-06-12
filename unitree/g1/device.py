@@ -1376,6 +1376,7 @@ class _SlamInfoNode(Node):
         super().__init__("g1_spatial")
         self._db = db
         self._sc_mgr = sc_mgr  # ScanContextManager (optional)
+        self._auto_mapping_cb = None  # set by SpatialPlugin: called once on first localization
         self._pos_tag_pub = self.create_publisher(String, pos_tag_topic, _LOW_LAT_QOS)
 
         from std_msgs.msg import UInt8MultiArray
@@ -1468,6 +1469,7 @@ class _SlamInfoNode(Node):
                     1 - 2 * pose_data.get("q_z", 0) ** 2
                 )
                 with self._lock:
+                    prev_status = self._map_status
                     self._current_pose = {
                         "x": pose_data["x"],
                         "y": pose_data["y"],
@@ -1477,6 +1479,15 @@ class _SlamInfoNode(Node):
                         self._map_status = "localized"
                     elif msg_type == "mapping_info":
                         self._map_status = "mapping"
+
+                # Auto-transition: localized → mapping (always be mapping)
+                # Only fire if transitioning TO localized from a non-mapping state
+                if msg_type == "pos_info" and prev_status != "mapping" and prev_status != "localized" and self._auto_mapping_cb:
+                    self.get_logger().info("[slam_info] Localized! Triggering auto StartMapping...")
+                    try:
+                        self._auto_mapping_cb()
+                    except Exception as e:
+                        self.get_logger().warn(f"[slam_info] auto-mapping callback failed: {e}")
 
             # Trajectory recording
             self._maybe_record_trajectory()
@@ -1973,6 +1984,7 @@ class SpatialPlugin:
         self._node = _SlamInfoNode(self._pos_tag_topic, self._mapping_topic, self._db, self._sc_mgr)
         self._node.set_active_map(self._db.get_last_used_map())
         self._node.set_pcd_save_dir(self._map_dir)
+        self._node._auto_mapping_cb = self._on_localized
         executor.add_node(self._node)
 
     def get_tools(self) -> list:
@@ -2031,6 +2043,24 @@ class SpatialPlugin:
                 },
             },
         }
+
+    def _on_localized(self):
+        """Called by _SlamInfoNode when SLAM reports localization success.
+        Automatically transitions to mapping mode to keep building the map."""
+        if self._node._map_status == "mapping":
+            return
+        print("[SpatialPlugin] _on_localized: SLAM localized, starting mapping to extend map")
+        code, resp = self._client.StartMapping()
+        print(f"[SpatialPlugin] StartMapping after localization → code={code}")
+        if code == 0:
+            self._node.set_map_status("mapping")
+            # If no active map set, create one
+            if not self._node._active_map:
+                map_name = f"map_{int(time.time())}"
+                pcd_path = f"{self._map_dir}/{map_name}.pcd"
+                self._node.set_active_map(map_name)
+                self._db.add_map(map_name, pcd_path)
+                print(f"[SpatialPlugin] Created new map for post-localization mapping: {map_name}")
 
     def start(self) -> None:
         """Auto-start mapping on plugin start. Always mapping, always observing."""
