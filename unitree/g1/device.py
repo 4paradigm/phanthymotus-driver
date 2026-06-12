@@ -1406,6 +1406,13 @@ class _SlamInfoNode(Node):
         # Keyframe tracking for Scan Context
         self._last_kf_pose: tuple = (0.0, 0.0, 0.0)  # (x, y, yaw)
 
+        # Watchdog: detect when point cloud stops arriving
+        self._last_cloud_time: float = 0.0
+        self._watchdog_cb = None  # set by SpatialPlugin: called when cloud stops
+        self._watchdog_timer: threading.Timer | None = None
+        self._watchdog_running = False
+        self.WATCHDOG_TIMEOUT = 3.0  # seconds without data before triggering restart
+
         # 1Hz full map publish timer
         self._last_map_publish_time: float = 0.0
 
@@ -1585,6 +1592,7 @@ class _SlamInfoNode(Node):
             if new_size > prev_size:
                 self._map_buffer_dirty = True
 
+        self._last_cloud_time = time.monotonic()
         new_points = new_size - prev_size
         self.get_logger().info(
             f"[mapping_cloud] frame: {len(pts_arr)} pts parsed, "
@@ -1770,6 +1778,44 @@ class _SlamInfoNode(Node):
         if self._save_timer:
             self._save_timer.cancel()
             self._save_timer = None
+        self._stop_watchdog()
+
+    def _start_watchdog(self):
+        """Start the cloud watchdog that detects when point cloud stops arriving."""
+        self._watchdog_running = True
+        self._last_cloud_time = time.monotonic()
+        self._schedule_watchdog()
+
+    def _stop_watchdog(self):
+        """Stop the cloud watchdog."""
+        self._watchdog_running = False
+        if self._watchdog_timer:
+            self._watchdog_timer.cancel()
+            self._watchdog_timer = None
+
+    def _schedule_watchdog(self):
+        if not self._watchdog_running:
+            return
+        self._watchdog_timer = threading.Timer(1.0, self._check_watchdog)
+        self._watchdog_timer.daemon = True
+        self._watchdog_timer.start()
+
+    def _check_watchdog(self):
+        """Check if point cloud has stopped arriving. If so, trigger restart."""
+        if not self._watchdog_running:
+            return
+        now = time.monotonic()
+        elapsed = now - self._last_cloud_time
+        if self._last_cloud_time > 0 and elapsed > self.WATCHDOG_TIMEOUT and self._watchdog_cb:
+            self.get_logger().warn(
+                f"[watchdog] No point cloud for {elapsed:.1f}s, triggering restart"
+            )
+            self._last_cloud_time = now  # reset to avoid repeated triggers
+            try:
+                self._watchdog_cb()
+            except Exception as e:
+                self.get_logger().warn(f"[watchdog] restart callback failed: {e}")
+        self._schedule_watchdog()
 
     def set_pcd_save_dir(self, path: str):
         """Set the directory for auto-saving PCD files and start the save timer."""
@@ -1990,6 +2036,8 @@ class SpatialPlugin:
         self._node.set_active_map(self._db.get_last_used_map())
         self._node.set_pcd_save_dir(self._map_dir)
         self._node._auto_mapping_cb = self._on_localized
+        self._node._watchdog_cb = self._on_cloud_timeout
+        self._node._start_watchdog()
         executor.add_node(self._node)
 
     def get_tools(self) -> list:
@@ -2054,18 +2102,26 @@ class SpatialPlugin:
         Automatically transitions to mapping mode to keep building the map."""
         if self._node._map_status == "mapping":
             return
-        print("[SpatialPlugin] _on_localized: SLAM localized, starting mapping to extend map")
+        print("[SpatialPlugin] _on_localized: SLAM localized, starting mapping to extend map", flush=True)
         code, resp = self._client.StartMapping()
-        print(f"[SpatialPlugin] StartMapping after localization → code={code}")
-        if code == 0:
+        print(f"[SpatialPlugin] StartMapping after localization → code={code}", flush=True)
+        if code == 0 or code == 3104:
             self._node.set_map_status("mapping")
-            # If no active map set, create one
             if not self._node._active_map:
                 map_name = f"map_{int(time.time())}"
                 pcd_path = f"{self._map_dir}/{map_name}.pcd"
                 self._node.set_active_map(map_name)
                 self._db.add_map(map_name, pcd_path)
-                print(f"[SpatialPlugin] Created new map for post-localization mapping: {map_name}")
+                print(f"[SpatialPlugin] Created new map for post-localization mapping: {map_name}", flush=True)
+
+    def _on_cloud_timeout(self):
+        """Called by watchdog when no point cloud received for WATCHDOG_TIMEOUT seconds.
+        Re-trigger StartMapping to revive the SLAM point cloud stream."""
+        print("[SpatialPlugin] _on_cloud_timeout: re-triggering StartMapping", flush=True)
+        code, resp = self._client.StartMapping()
+        print(f"[SpatialPlugin] StartMapping (watchdog) → code={code}", flush=True)
+        if code == 0:
+            self._node.set_map_status("mapping")
 
     def start(self) -> None:
         """Auto-start mapping on plugin start. Always mapping, always observing."""
