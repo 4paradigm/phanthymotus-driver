@@ -1531,11 +1531,14 @@ class _SlamInfoNode(Node):
             self.get_logger().warn(f"SpatialNode: failed to subscribe rt/slam_key_info: {e}")
 
         # Subscribe SLAM mapping point clouds via subprocess (CycloneDDS rmw, domain 0)
-        # Main process uses FastDDS on domain 42, which can't see CycloneDDS publishers.
-        # Subprocess runs rclpy with rmw_cyclonedds_cpp on domain 0, passes data via mp.Queue.
+        # Main process uses FastDDS on domain 42 with FASTDDS_BUILTIN_TRANSPORTS=UDPv4.
+        # SLAM points are published via ROS2 FastDDS on domain 0.
+        # Must use 'spawn' (not 'fork') so subprocess gets a clean process without
+        # the parent's FASTDDS_BUILTIN_TRANSPORTS restriction baked into memory.
         import multiprocessing as mp
-        self._slam_cloud_queue = mp.Queue(maxsize=50)
-        self._slam_sub_proc = mp.Process(
+        ctx = mp.get_context('spawn')
+        self._slam_cloud_queue = ctx.Queue(maxsize=50)
+        self._slam_sub_proc = ctx.Process(
             target=_slam_subscriber_process,
             args=(self._slam_cloud_queue,),
             daemon=True,
