@@ -1415,12 +1415,14 @@ class _SlamInfoNode(Node):
         self._save_timer: threading.Timer | None = None
         self._save_timer_running = False
 
-        # Subscribe DDS topics
+        # Subscribe DDS topics (store refs to prevent GC from killing subscriptions)
+        self._dds_subs = []
         try:
             from unitree_sdk2py.core.channel import ChannelSubscriber
             from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
             info_sub = ChannelSubscriber("rt/slam_info", String_)
             info_sub.Init(self._on_slam_info, 10)
+            self._dds_subs.append(info_sub)
             self.get_logger().info("SpatialNode subscribed rt/slam_info")
         except Exception as e:
             self.get_logger().warn(f"SpatialNode: failed to subscribe rt/slam_info: {e}")
@@ -1430,6 +1432,7 @@ class _SlamInfoNode(Node):
             from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
             key_sub = ChannelSubscriber("rt/slam_key_info", String_)
             key_sub.Init(self._on_slam_key_info, 10)
+            self._dds_subs.append(key_sub)
             self.get_logger().info("SpatialNode subscribed rt/slam_key_info")
         except Exception as e:
             self.get_logger().warn(f"SpatialNode: failed to subscribe rt/slam_key_info: {e}")
@@ -1440,6 +1443,7 @@ class _SlamInfoNode(Node):
             from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_
             map_cloud_sub = ChannelSubscriber("rt/unitree/slam_mapping/points", PointCloud2_)
             map_cloud_sub.Init(self._on_mapping_cloud, 10)
+            self._dds_subs.append(map_cloud_sub)
             self.get_logger().info("SpatialNode subscribed rt/unitree/slam_mapping/points")
         except Exception as e:
             self.get_logger().warn(f"SpatialNode: failed to subscribe mapping points: {e}")
@@ -1449,6 +1453,7 @@ class _SlamInfoNode(Node):
             from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_
             reloc_cloud_sub = ChannelSubscriber("rt/unitree/slam_relocation/points", PointCloud2_)
             reloc_cloud_sub.Init(self._on_mapping_cloud, 10)
+            self._dds_subs.append(reloc_cloud_sub)
             self.get_logger().info("SpatialNode subscribed rt/unitree/slam_relocation/points")
         except Exception as e:
             self.get_logger().warn(f"SpatialNode: failed to subscribe relocation points: {e}")
