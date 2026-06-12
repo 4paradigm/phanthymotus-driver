@@ -1410,6 +1410,8 @@ class _SlamInfoNode(Node):
         # Auto-save PCD timer
         self._last_map_save_time: float = 0.0
         self._pcd_save_dir: str | None = None  # set by SpatialPlugin when active map is set
+        self._save_timer: threading.Timer | None = None
+        self._save_timer_running = False
 
         # Subscribe DDS topics
         try:
@@ -1667,31 +1669,28 @@ class _SlamInfoNode(Node):
         ros_msg.data = list(header + body)
         self._mapping_pub.publish(ros_msg)
 
-        # Also auto-save PCD periodically
-        self._maybe_save_pcd()
-
     def _maybe_save_pcd(self) -> None:
-        """Auto-save map buffer to PCD file every MAP_SAVE_INTERVAL seconds."""
+        """Auto-save map buffer to PCD file. Called by a recurring timer thread."""
         np = _SlamInfoNode.np
-        now = time.monotonic()
-        if now - self._last_map_save_time < self.MAP_SAVE_INTERVAL:
-            return
-        self._last_map_save_time = now
 
         if not self._pcd_save_dir:
+            self._schedule_save_timer()
             return
 
         with self._lock:
             active_map = self._active_map
         if not active_map:
+            self._schedule_save_timer()
             return
 
         with self._map_buffer_lock:
             if not self._map_buffer:
+                self._schedule_save_timer()
                 return
             all_points = list(self._map_buffer.values())
 
         if len(all_points) < 10:
+            self._schedule_save_timer()
             return
 
         # Write PCD file (ASCII format for simplicity and compatibility)
@@ -1718,9 +1717,32 @@ class _SlamInfoNode(Node):
         except Exception as e:
             self.get_logger().warn(f"Failed to save PCD: {e}")
 
+        self._schedule_save_timer()
+
+    def _schedule_save_timer(self):
+        """Schedule the next PCD auto-save."""
+        if not self._save_timer_running:
+            return
+        self._save_timer = threading.Timer(self.MAP_SAVE_INTERVAL, self._maybe_save_pcd)
+        self._save_timer.daemon = True
+        self._save_timer.start()
+
+    def _start_save_timer(self):
+        """Start the recurring PCD save timer."""
+        self._save_timer_running = True
+        self._schedule_save_timer()
+
+    def _stop_save_timer(self):
+        """Stop the recurring PCD save timer."""
+        self._save_timer_running = False
+        if self._save_timer:
+            self._save_timer.cancel()
+            self._save_timer = None
+
     def set_pcd_save_dir(self, path: str):
-        """Set the directory for auto-saving PCD files."""
+        """Set the directory for auto-saving PCD files and start the save timer."""
         self._pcd_save_dir = path
+        self._start_save_timer()
 
     def load_pcd_to_buffer(self, pcd_path: str) -> None:
         """Load a PCD file into the voxel map buffer."""
