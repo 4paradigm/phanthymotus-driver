@@ -1395,6 +1395,7 @@ class _SlamInfoNode(Node):
         # 3D voxel map buffer: dict[(ix,iy,iz)] → (x, y, z)
         self._map_buffer: dict[tuple, tuple] = {}
         self._map_buffer_lock = threading.Lock()
+        self._map_buffer_dirty = False  # set True when new points added, False after save
 
         # Recent cloud ring buffer for discover_map fingerprinting
         self._recent_cloud = _SlamInfoNode.np.zeros((self.RECENT_CLOUD_MAX, 3), dtype=_SlamInfoNode.np.float32)
@@ -1554,6 +1555,7 @@ class _SlamInfoNode(Node):
         # Merge into voxel map buffer (deduplication)
         voxel_size = self.VOXEL_SIZE
         with self._map_buffer_lock:
+            prev_size = len(self._map_buffer)
             for i in range(len(pts_arr)):
                 ix = int(pts_arr[i, 0] / voxel_size)
                 iy = int(pts_arr[i, 1] / voxel_size)
@@ -1561,6 +1563,8 @@ class _SlamInfoNode(Node):
                 key = (ix, iy, iz)
                 if key not in self._map_buffer:
                     self._map_buffer[key] = (pts_arr[i, 0], pts_arr[i, 1], pts_arr[i, 2])
+            if len(self._map_buffer) > prev_size:
+                self._map_buffer_dirty = True
 
         # Update recent cloud ring buffer (for discover fingerprinting)
         n = len(pts_arr)
@@ -1684,10 +1688,11 @@ class _SlamInfoNode(Node):
             return
 
         with self._map_buffer_lock:
-            if not self._map_buffer:
+            if not self._map_buffer or not self._map_buffer_dirty:
                 self._schedule_save_timer()
                 return
             all_points = list(self._map_buffer.values())
+            self._map_buffer_dirty = False
 
         if len(all_points) < 10:
             self._schedule_save_timer()
