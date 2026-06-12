@@ -1989,14 +1989,13 @@ class SpatialPlugin:
         return {
             "name": "spatial",
             "type": "actuator",
-            "description": "Spatial intelligence — autonomous map discovery (fingerprint matching), place tagging, navigation. discover_map auto-detects environment and loads/creates map.",
+            "description": "Spatial intelligence — place tagging, navigation. Mapping is always active automatically.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["discover_map", "stop_discover",
-                                 "tag_place", "untag_place", "list_tags",
+                        "enum": ["tag_place", "untag_place", "list_tags",
                                  "navigate_to_tag", "navigate_to_pose",
                                  "pause_nav", "resume_nav", "stop_nav"],
                         "description": "Action to perform",
@@ -2010,8 +2009,6 @@ class SpatialPlugin:
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "discover_map":     {"params": [],                     "description": "Auto-discover environment: match against known maps via fingerprint, or create new map"},
-                    "stop_discover":    {"params": [],                     "description": "Stop mapping and save current map"},
                     "tag_place":        {"params": ["name", "description"], "description": "Tag current position with a name"},
                     "untag_place":      {"params": ["name"],               "description": "Remove a place tag"},
                     "list_tags":        {"params": [],                     "description": "List all tags with relative positions"},
@@ -2025,76 +2022,71 @@ class SpatialPlugin:
         }
 
     def start(self) -> None:
-        pass
+        """Auto-start mapping on plugin start. Always mapping, always observing."""
+        def _auto_discover():
+            time.sleep(3)  # wait for SLAM service and DDS to stabilize
+            try:
+                self._do_discover_map()
+            except Exception as e:
+                print(f"[SpatialPlugin] auto-discover failed: {e}")
+        threading.Thread(target=_auto_discover, daemon=True).start()
 
     def stop(self) -> None:
-        pass
+        self._node._stop_save_timer()
 
-    def dispatch(self, action: str, args: dict) -> dict | None:
-        if action == "discover_map":
-            # Autonomous map discovery: fingerprint match → load old map, or start new
-            recent_cloud = self._node.get_recent_cloud()
-            if recent_cloud is None or len(recent_cloud) < 100:
-                # No lidar data yet — just start mapping blind
-                code, resp = self._client.StartMapping()
-                if code == 0:
-                    map_name = f"map_{int(time.time())}"
-                    pcd_path = f"{self._map_dir}/{map_name}.pcd"
-                    self._node.clear_map_buffer()
-                    self._node.set_map_status("mapping")
-                    self._node.set_active_map(map_name)
-                    self._db.add_map(map_name, pcd_path)
-                    return {"status": "not_found", "map_name": map_name, "action": "new_map_started",
-                            "note": "No lidar data for fingerprint, started fresh"}
-                return {"error": f"StartMapping failed, code={code}", "response": resp}
-
-            # Generate fingerprint from current environment
-            current_sc = self._sc_mgr.make_scan_context(recent_cloud)
-            match = self._sc_mgr.query(current_sc)
-
-            if match:
-                # Found matching map → relocalize then continue mapping
-                map_name = match["map_name"]
-                map_info = self._db.get_map(map_name)
-                if map_info:
-                    pcd_path = map_info["pcd_path"]
-                    code, resp = self._client.InitPose(0, 0, 0, 0, 0, 0, 1.0, pcd_path)
-                    if code == 0:
-                        # Successfully relocated → start mapping to extend
-                        self._client.StartMapping()
-                        self._node.load_pcd_to_buffer(pcd_path)
-                        self._node.set_map_status("mapping")
-                        self._node.set_active_map(map_name)
-                        self._db.set_last_used_map(map_name)
-                        return {"status": "found", "map_name": map_name,
-                                "pose": match["pose"], "score": match["score"]}
-                    # InitPose failed — fall through to new map
-
-            # No match found → start new map
-            map_name = f"map_{int(time.time())}"
-            pcd_path = f"{self._map_dir}/{map_name}.pcd"
+    def _do_discover_map(self) -> dict:
+        """Core discover logic: fingerprint match → load old map, or start new."""
+        recent_cloud = self._node.get_recent_cloud()
+        if recent_cloud is None or len(recent_cloud) < 100:
+            # No lidar data yet — just start mapping blind
             code, resp = self._client.StartMapping()
             if code == 0:
+                map_name = f"map_{int(time.time())}"
+                pcd_path = f"{self._map_dir}/{map_name}.pcd"
                 self._node.clear_map_buffer()
                 self._node.set_map_status("mapping")
                 self._node.set_active_map(map_name)
                 self._db.add_map(map_name, pcd_path)
+                print(f"[SpatialPlugin] Started new map (no lidar data): {map_name}")
                 return {"status": "not_found", "map_name": map_name, "action": "new_map_started"}
             return {"error": f"StartMapping failed, code={code}", "response": resp}
 
-        elif action == "stop_discover":
-            active_map = self._node._active_map
-            if not active_map:
-                return {"error": "No active mapping session"}
-            pcd_path = f"{self._map_dir}/{active_map}.pcd"
-            code, resp = self._client.StopMapping(pcd_path)
-            if code == 0:
-                self._db.set_last_used_map(active_map)
-                self._node.set_map_status("idle")
-                return {"status": "map_saved", "map_name": active_map, "path": pcd_path}
-            return {"error": f"StopMapping failed, code={code}", "response": resp}
+        # Generate fingerprint from current environment
+        current_sc = self._sc_mgr.make_scan_context(recent_cloud)
+        match = self._sc_mgr.query(current_sc)
 
-        elif action == "tag_place":
+        if match:
+            # Found matching map → relocalize then continue mapping
+            map_name = match["map_name"]
+            map_info = self._db.get_map(map_name)
+            if map_info:
+                pcd_path = map_info["pcd_path"]
+                code, resp = self._client.InitPose(0, 0, 0, 0, 0, 0, 1.0, pcd_path)
+                if code == 0:
+                    self._client.StartMapping()
+                    self._node.load_pcd_to_buffer(pcd_path)
+                    self._node.set_map_status("mapping")
+                    self._node.set_active_map(map_name)
+                    self._db.set_last_used_map(map_name)
+                    print(f"[SpatialPlugin] Matched existing map: {map_name}")
+                    return {"status": "found", "map_name": map_name,
+                            "pose": match["pose"], "score": match["score"]}
+
+        # No match found → start new map
+        map_name = f"map_{int(time.time())}"
+        pcd_path = f"{self._map_dir}/{map_name}.pcd"
+        code, resp = self._client.StartMapping()
+        if code == 0:
+            self._node.clear_map_buffer()
+            self._node.set_map_status("mapping")
+            self._node.set_active_map(map_name)
+            self._db.add_map(map_name, pcd_path)
+            print(f"[SpatialPlugin] Started new map: {map_name}")
+            return {"status": "not_found", "map_name": map_name, "action": "new_map_started"}
+        return {"error": f"StartMapping failed, code={code}", "response": resp}
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "tag_place":
             name = args.get("name", "")
             if not name:
                 return {"error": "name is required"}
