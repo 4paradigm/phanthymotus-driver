@@ -37,7 +37,7 @@ RUN pip3 install --no-cache-dir --no-binary cyclonedds -i ${PYPI_MIRROR} cyclone
 
 # Build rmw_cyclonedds_cpp from source (needed for SLAM subscription on domain 0)
 ARG RMW_CYCLONE_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/rmw_cyclonedds-rolling.zip
-RUN . /opt/ros/humble/setup.sh && \
+RUN bash -c "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && \
     curl -fsSL ${RMW_CYCLONE_URL} -o /tmp/rmw_cyclonedds.zip && \
     mkdir -p /tmp/rmw_ws/src && \
     unzip -q /tmp/rmw_cyclonedds.zip -d /tmp/rmw_ws/src && \
@@ -46,7 +46,7 @@ RUN . /opt/ros/humble/setup.sh && \
         --cmake-args -DCMAKE_BUILD_TYPE=Release \
         -DCycloneDDS_DIR=/opt/cyclonedds/lib/cmake/CycloneDDS && \
     cp -r /tmp/rmw_ws/install/rmw_cyclonedds_cpp /opt/ros/humble/ && \
-    rm -rf /tmp/rmw_ws /tmp/rmw_cyclonedds.zip
+    rm -rf /tmp/rmw_ws /tmp/rmw_cyclonedds.zip"
 
 # Isolate rclpy topics (domain 42) from unitree_sdk2py's domain 0.
 # Force FastDDS to match agent-core (which has no CycloneDDS rmw installed).
