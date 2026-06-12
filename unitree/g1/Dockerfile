@@ -36,26 +36,10 @@ ENV LD_LIBRARY_PATH=/opt/cyclonedds/lib:${LD_LIBRARY_PATH}
 RUN pip3 install --no-cache-dir --no-binary cyclonedds -i ${PYPI_MIRROR} cyclonedds==0.10.5
 
 
-# Build FAST-LIO2 (LiDAR-Inertial Odometry)
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        libeigen3-dev \
-        libpcl-dev \
-        ros-humble-tf2-ros \
-        ros-humble-tf2-eigen && \
-    rm -rf /var/lib/apt/lists/*
 
-ARG FAST_LIO_URL=https://github.com/hku-mars/FAST_LIO.git
-ARG FAST_LIO_BRANCH=main
-RUN bash -c "source /opt/ros/humble/setup.bash && \
-    mkdir -p /tmp/fastlio_ws/src && \
-    cd /tmp/fastlio_ws/src && \
-    git clone --depth 1 -b ${FAST_LIO_BRANCH} ${FAST_LIO_URL} fast_lio && \
-    cd /tmp/fastlio_ws && \
-    colcon build --packages-select fast_lio \
-        --cmake-args -DCMAKE_BUILD_TYPE=Release && \
-    cp -r /tmp/fastlio_ws/install/fast_lio /opt/ros/humble/ && \
-    rm -rf /tmp/fastlio_ws"
+# FAST-LIO2: must be built natively on ARM64 (QEMU cannot handle libpcl-dev).
+# Build on target with: /work/fastlio_config/build_fastlio.sh
+# The built package is expected at /opt/fastlio/install/ (volume mount or baked into a derived image).
 
 # Isolate rclpy topics (domain 42) from unitree_sdk2py's domain 0.
 # Force FastDDS to match agent-core (which has no CycloneDDS rmw installed).

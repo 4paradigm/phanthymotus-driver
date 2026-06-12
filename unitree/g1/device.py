@@ -3117,7 +3117,7 @@ class FastLioPlugin:
         cmd = [
             "/bin/bash", "-c",
             f"source /opt/ros/humble/setup.bash && "
-            f"source /opt/ros/humble/fast_lio/setup.bash 2>/dev/null; "
+            f"source /opt/fastlio/install/setup.bash 2>/dev/null; "
             f"ros2 launch fast_lio mapping.launch.py config_file:={self._config_file}"
         ]
         try:
