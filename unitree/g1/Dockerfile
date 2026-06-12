@@ -13,22 +13,9 @@ RUN apt-get update && \
         build-essential \
         curl \
         git \
+        unzip \
         libusb-1.0-0 && \
     rm -rf /var/lib/apt/lists/*
-
-# Build rmw_cyclonedds_cpp from source (apt package unavailable on this platform)
-# Uses the CycloneDDS 0.10.5 already installed at /opt/cyclonedds
-ARG RMW_CYCLONE_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/rmw_cyclonedds-rolling.zip
-RUN . /opt/ros/humble/setup.sh && \
-    curl -fsSL ${RMW_CYCLONE_URL} -o /tmp/rmw_cyclonedds.zip && \
-    mkdir -p /tmp/rmw_ws/src && \
-    unzip -q /tmp/rmw_cyclonedds.zip -d /tmp/rmw_ws/src && \
-    cd /tmp/rmw_ws && \
-    colcon build --packages-select rmw_cyclonedds_cpp \
-        --cmake-args -DCMAKE_BUILD_TYPE=Release \
-        -DCycloneDDS_DIR=/opt/cyclonedds/lib/cmake/CycloneDDS && \
-    cp -r /tmp/rmw_ws/install/rmw_cyclonedds_cpp /opt/ros/humble/ && \
-    rm -rf /tmp/rmw_ws /tmp/rmw_cyclonedds.zip
 
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     pyyaml netifaces opencv-python-headless numpy pyrealsense2
@@ -48,12 +35,26 @@ ENV LD_LIBRARY_PATH=/opt/cyclonedds/lib:${LD_LIBRARY_PATH}
 
 RUN pip3 install --no-cache-dir --no-binary cyclonedds -i ${PYPI_MIRROR} cyclonedds==0.10.5
 
+# Build rmw_cyclonedds_cpp from source (needed for SLAM subscription on domain 0)
+ARG RMW_CYCLONE_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/rmw_cyclonedds-rolling.zip
+RUN . /opt/ros/humble/setup.sh && \
+    curl -fsSL ${RMW_CYCLONE_URL} -o /tmp/rmw_cyclonedds.zip && \
+    mkdir -p /tmp/rmw_ws/src && \
+    unzip -q /tmp/rmw_cyclonedds.zip -d /tmp/rmw_ws/src && \
+    cd /tmp/rmw_ws && \
+    colcon build --packages-select rmw_cyclonedds_cpp \
+        --cmake-args -DCMAKE_BUILD_TYPE=Release \
+        -DCycloneDDS_DIR=/opt/cyclonedds/lib/cmake/CycloneDDS && \
+    cp -r /tmp/rmw_ws/install/rmw_cyclonedds_cpp /opt/ros/humble/ && \
+    rm -rf /tmp/rmw_ws /tmp/rmw_cyclonedds.zip
+
 # Isolate rclpy topics (domain 42) from unitree_sdk2py's domain 0.
 # Force FastDDS to match agent-core (which has no CycloneDDS rmw installed).
 ENV ROS_DOMAIN_ID=42
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ENV FASTDDS_BUILTIN_TRANSPORTS=UDPv4
 
+# Copy source files last (most frequently changed → least cache invalidation)
 COPY unitree_sdk2py/ /work/unitree_sdk2py/
 COPY resource/       /work/resource/
 COPY main.py   /work/main.py
