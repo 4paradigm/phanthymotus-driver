@@ -48,6 +48,29 @@ RUN bash -c "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.b
     cp -r /tmp/rmw_ws/install/rmw_cyclonedds_cpp /opt/ros/humble/ && \
     rm -rf /tmp/rmw_ws /tmp/rmw_cyclonedds.zip"
 
+# Build FAST-LIO2 (LiDAR-Inertial Odometry)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        libeigen3-dev \
+        libpcl-dev \
+        ros-humble-pcl-conversions \
+        ros-humble-pcl-ros \
+        ros-humble-tf2-ros \
+        ros-humble-tf2-eigen && \
+    rm -rf /var/lib/apt/lists/*
+
+ARG FAST_LIO_URL=https://github.com/hku-mars/FAST_LIO.git
+ARG FAST_LIO_BRANCH=main
+RUN bash -c "source /opt/ros/humble/setup.bash && \
+    mkdir -p /tmp/fastlio_ws/src && \
+    cd /tmp/fastlio_ws/src && \
+    git clone --depth 1 -b ${FAST_LIO_BRANCH} ${FAST_LIO_URL} fast_lio && \
+    cd /tmp/fastlio_ws && \
+    colcon build --packages-select fast_lio \
+        --cmake-args -DCMAKE_BUILD_TYPE=Release && \
+    cp -r /tmp/fastlio_ws/install/fast_lio /opt/ros/humble/ && \
+    rm -rf /tmp/fastlio_ws"
+
 # Isolate rclpy topics (domain 42) from unitree_sdk2py's domain 0.
 # Force FastDDS to match agent-core (which has no CycloneDDS rmw installed).
 ENV ROS_DOMAIN_ID=42
@@ -61,6 +84,7 @@ COPY main.py   /work/main.py
 COPY device.py /work/device.py
 COPY scan_context.py /work/scan_context.py
 COPY config.yaml /work/config.yaml
+COPY fastlio_config/ /work/fastlio_config/
 
 ENV PYTHONPATH=/work
 ENV PYTHONUNBUFFERED=1
