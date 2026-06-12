@@ -1368,75 +1368,72 @@ def _bearing_label(dx: float, dy: float) -> str:
 
 
 def _slam_subscriber_process(cloud_queue):
-    """Subprocess: subscribes to SLAM point cloud topics using cyclonedds Python binding (domain 0).
+    """Subprocess: subscribes to SLAM point cloud topics via ROS2 FastDDS on domain 0.
+    The SLAM mapping/relocation points are published by a ROS2 node (FastDDS),
+    not by raw CycloneDDS. So we need rclpy + FastDDS + domain 0.
+
     Passes (field_offsets, point_step, total_points, data) tuples via multiprocessing Queue.
     """
     import os
-    import struct as _struct
-    import time as _time
+    import sys
 
+    # Force domain 0 + FastDDS (default rmw) without transport restrictions
+    os.environ['ROS_DOMAIN_ID'] = '0'
+    os.environ.pop('RMW_IMPLEMENTATION', None)  # let it default to FastDDS
     os.environ.pop('FASTDDS_BUILTIN_TRANSPORTS', None)
 
-    from cyclonedds.core import Listener, Qos, Policy
-    from cyclonedds.domain import DomainParticipant
-    from cyclonedds.sub import Subscriber, DataReader
-    from cyclonedds.topic import Topic
-    from cyclonedds.idl import IdlStruct
-    from cyclonedds.idl.types import sequence, uint8, uint32, float32
-    from dataclasses import dataclass
+    # Need ROS2 python path
+    setup_paths = [
+        '/opt/ros/humble/lib/python3.10/site-packages',
+        '/opt/ros/humble/local/lib/python3.10/dist-packages',
+        '/ros_ws/install/lib/python3.10/site-packages',
+        '/ros_ws/install/local/lib/python3.10/dist-packages',
+    ]
+    for p in setup_paths:
+        if p not in sys.path:
+            sys.path.insert(0, p)
 
-    # Minimal PointCloud2 IDL matching Unitree's DDS type
-    @dataclass
-    class PointField(IdlStruct):
-        name: str
-        offset: uint32
-        datatype: uint8
-        count: uint32
+    try:
+        import rclpy
+        from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+        from sensor_msgs.msg import PointCloud2
+    except ImportError as e:
+        print(f"[slam_cloud_sub] FATAL: cannot import rclpy/sensor_msgs: {e}", flush=True)
+        return
 
-    @dataclass
-    class PointCloud2(IdlStruct, typename="sensor_msgs::msg::dds_::PointCloud2_"):
-        sec: uint32
-        nanosec: uint32
-        frame_id: str
-        height: uint32
-        width: uint32
-        fields: sequence[PointField]
-        is_bigendian: bool
-        point_step: uint32
-        row_step: uint32
-        data: sequence[uint8]
-        is_dense: bool
+    rclpy.init()
+    node = rclpy.create_node('slam_cloud_sub')
 
-    dp = DomainParticipant(domain_id=0)
-    qos = Qos(Policy.Reliability.BestEffort, Policy.History.KeepLast(5))
+    qos = QoSProfile(
+        reliability=ReliabilityPolicy.BEST_EFFORT,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=5,
+        durability=DurabilityPolicy.VOLATILE,
+    )
 
-    topic_mapping = Topic(dp, "rt/unitree/slam_mapping/points", PointCloud2, qos=qos)
-    topic_reloc = Topic(dp, "rt/unitree/slam_relocation/points", PointCloud2, qos=qos)
+    def _cb(msg):
+        try:
+            total_points = msg.width * msg.height
+            if total_points == 0:
+                return
+            data = bytes(msg.data)
+            if len(data) < msg.point_step:
+                return
+            field_offsets = {f.name: f.offset for f in msg.fields}
+            cloud_queue.put_nowait((field_offsets, msg.point_step, total_points, data))
+        except Exception:
+            pass  # queue full, drop
 
-    sub = Subscriber(dp, qos=qos)
-    reader_mapping = DataReader(sub, topic_mapping, qos=qos)
-    reader_reloc = DataReader(sub, topic_reloc, qos=qos)
-
-    print("[slam_cloud_sub] subprocess started (cyclonedds native, domain 0)", flush=True)
-
-    while True:
-        for reader in (reader_mapping, reader_reloc):
-            try:
-                samples = reader.take(N=5)
-                for msg in samples:
-                    if msg is None:
-                        continue
-                    total_points = msg.width * msg.height
-                    if total_points == 0:
-                        continue
-                    data = bytes(msg.data)
-                    if len(data) < msg.point_step:
-                        continue
-                    field_offsets = {f.name: f.offset for f in msg.fields}
-                    cloud_queue.put_nowait((field_offsets, msg.point_step, total_points, data))
-            except Exception:
-                pass
-        _time.sleep(0.05)  # 20Hz poll rate
+    node.create_subscription(PointCloud2, '/unitree/slam_mapping/points', _cb, qos)
+    node.create_subscription(PointCloud2, '/unitree/slam_relocation/points', _cb, qos)
+    print("[slam_cloud_sub] subprocess started (rclpy FastDDS, domain 0)", flush=True)
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 class _SlamInfoNode(Node):
