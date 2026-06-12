@@ -13,7 +13,8 @@ RUN apt-get update && \
         build-essential \
         curl \
         git \
-        libusb-1.0-0 && \
+        libusb-1.0-0 \
+        ros-humble-rmw-cyclonedds-cpp && \
     rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \

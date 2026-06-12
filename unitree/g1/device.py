@@ -1368,18 +1368,17 @@ def _bearing_label(dx: float, dy: float) -> str:
 
 
 def _slam_subscriber_process(cloud_queue):
-    """Subprocess: subscribes to SLAM point cloud topics via ROS2 FastDDS on domain 0.
-    The SLAM mapping/relocation points are published by a ROS2 node (FastDDS),
-    not by raw CycloneDDS. So we need rclpy + FastDDS + domain 0.
+    """Subprocess: subscribes to SLAM point cloud topics via ROS2 with CycloneDDS rmw on domain 0.
+    Host SLAM uses rmw_cyclonedds_cpp, so we must match.
 
     Passes (field_offsets, point_step, total_points, data) tuples via multiprocessing Queue.
     """
     import os
     import sys
 
-    # Force domain 0 + FastDDS (default rmw) without transport restrictions
+    # Force CycloneDDS rmw on domain 0 (matching host SLAM publisher)
     os.environ['ROS_DOMAIN_ID'] = '0'
-    os.environ.pop('RMW_IMPLEMENTATION', None)  # let it default to FastDDS
+    os.environ['RMW_IMPLEMENTATION'] = 'rmw_cyclonedds_cpp'
     os.environ.pop('FASTDDS_BUILTIN_TRANSPORTS', None)
 
     # Need ROS2 python path
@@ -1426,7 +1425,7 @@ def _slam_subscriber_process(cloud_queue):
 
     node.create_subscription(PointCloud2, '/unitree/slam_mapping/points', _cb, qos)
     node.create_subscription(PointCloud2, '/unitree/slam_relocation/points', _cb, qos)
-    print("[slam_cloud_sub] subprocess started (rclpy FastDDS, domain 0)", flush=True)
+    print("[slam_cloud_sub] subprocess started (rmw_cyclonedds_cpp, domain 0)", flush=True)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
