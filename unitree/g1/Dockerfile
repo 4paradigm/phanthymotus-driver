@@ -35,18 +35,6 @@ ENV LD_LIBRARY_PATH=/opt/cyclonedds/lib:${LD_LIBRARY_PATH}
 
 RUN pip3 install --no-cache-dir --no-binary cyclonedds -i ${PYPI_MIRROR} cyclonedds==0.10.5
 
-# Build rmw_cyclonedds_cpp from source (needed for SLAM subscription on domain 0)
-ARG RMW_CYCLONE_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/rmw_cyclonedds-rolling.zip
-RUN bash -c "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && \
-    curl -fsSL ${RMW_CYCLONE_URL} -o /tmp/rmw_cyclonedds.zip && \
-    mkdir -p /tmp/rmw_ws/src && \
-    unzip -q /tmp/rmw_cyclonedds.zip -d /tmp/rmw_ws/src && \
-    cd /tmp/rmw_ws && \
-    colcon build --packages-select rmw_cyclonedds_cpp \
-        --cmake-args -DCMAKE_BUILD_TYPE=Release \
-        -DCycloneDDS_DIR=/opt/cyclonedds/lib/cmake/CycloneDDS && \
-    cp -r /tmp/rmw_ws/install/rmw_cyclonedds_cpp /opt/ros/humble/ && \
-    rm -rf /tmp/rmw_ws /tmp/rmw_cyclonedds.zip"
 
 # Build FAST-LIO2 (LiDAR-Inertial Odometry)
 RUN apt-get update && \
