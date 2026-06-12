@@ -1452,26 +1452,20 @@ class _SlamInfoNode(Node):
         except Exception as e:
             self.get_logger().warn(f"SpatialNode: failed to subscribe rt/slam_key_info: {e}")
 
-        # Subscribe mapping point clouds (both mapping and relocation modes)
-        try:
-            from unitree_sdk2py.core.channel import ChannelSubscriber
-            from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_
-            map_cloud_sub = ChannelSubscriber("rt/unitree/slam_mapping/points", PointCloud2_)
-            map_cloud_sub.Init(self._on_mapping_cloud, 10)
-            self._dds_subs.append(map_cloud_sub)
-            self.get_logger().info("SpatialNode subscribed rt/unitree/slam_mapping/points")
-        except Exception as e:
-            self.get_logger().warn(f"SpatialNode: failed to subscribe mapping points: {e}")
+        # Subscribe mapping point clouds via ROS2 (not CycloneDDS) for reliability
+        # ROS2 FastDDS has its own thread pool, won't be blocked by CycloneDDS dispatch
+        from sensor_msgs.msg import PointCloud2 as RosPointCloud2
+        self._mapping_sub = self.create_subscription(
+            RosPointCloud2, '/unitree/slam_mapping/points',
+            self._on_ros2_mapping_cloud, _LOW_LAT_QOS
+        )
+        self.get_logger().info("SpatialNode subscribed /unitree/slam_mapping/points (ROS2)")
 
-        try:
-            from unitree_sdk2py.core.channel import ChannelSubscriber
-            from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_
-            reloc_cloud_sub = ChannelSubscriber("rt/unitree/slam_relocation/points", PointCloud2_)
-            reloc_cloud_sub.Init(self._on_mapping_cloud, 10)
-            self._dds_subs.append(reloc_cloud_sub)
-            self.get_logger().info("SpatialNode subscribed rt/unitree/slam_relocation/points")
-        except Exception as e:
-            self.get_logger().warn(f"SpatialNode: failed to subscribe relocation points: {e}")
+        self._reloc_sub = self.create_subscription(
+            RosPointCloud2, '/unitree/slam_relocation/points',
+            self._on_ros2_mapping_cloud, _LOW_LAT_QOS
+        )
+        self.get_logger().info("SpatialNode subscribed /unitree/slam_relocation/points (ROS2)")
 
     def _on_slam_info(self, msg) -> None:
         try:
@@ -1542,22 +1536,35 @@ class _SlamInfoNode(Node):
                     self._nav_status = None
                     self._nav_target_name = None
 
-    def _on_mapping_cloud(self, msg) -> None:
-        """DDS callback: copy all needed data and enqueue. Don't keep references to msg."""
+    def _on_ros2_mapping_cloud(self, msg) -> None:
+        """ROS2 subscription callback for mapping/relocation point clouds. Fast enqueue."""
         try:
-            # Copy everything we need — msg memory may be freed after callback returns
             point_step = msg.point_step
             total_points = msg.width * msg.height
             data = bytes(msg.data)
             if total_points == 0 or len(data) < point_step:
                 return
-            # Copy field offsets (don't keep reference to msg.fields)
             field_offsets = {}
             for f in msg.fields:
                 field_offsets[f.name] = f.offset
             self._cloud_queue.put_nowait((field_offsets, point_step, total_points, data))
         except Exception:
             pass  # queue full, drop frame
+
+    def _on_mapping_cloud(self, msg) -> None:
+        """DDS callback (legacy/slam_info topics): fast enqueue."""
+        try:
+            point_step = msg.point_step
+            total_points = msg.width * msg.height
+            data = bytes(msg.data)
+            if total_points == 0 or len(data) < point_step:
+                return
+            field_offsets = {}
+            for f in msg.fields:
+                field_offsets[f.name] = f.offset
+            self._cloud_queue.put_nowait((field_offsets, point_step, total_points, data))
+        except Exception:
+            pass
 
     def _cloud_processor_loop(self):
         """Background thread: processes queued point clouds at its own pace."""
@@ -2144,23 +2151,8 @@ class SpatialPlugin:
 
     def _on_cloud_timeout(self):
         """Called by watchdog when no point cloud received for WATCHDOG_TIMEOUT seconds.
-        Re-subscribe DDS topics (subscription may have been lost)."""
-        print("[SpatialPlugin] _on_cloud_timeout: re-subscribing DDS mapping topics", flush=True)
-        try:
-            from unitree_sdk2py.core.channel import ChannelSubscriber
-            from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_
-            # Re-create subscriptions
-            sub1 = ChannelSubscriber("rt/unitree/slam_mapping/points", PointCloud2_)
-            sub1.Init(self._node._on_mapping_cloud, 10)
-            sub2 = ChannelSubscriber("rt/unitree/slam_relocation/points", PointCloud2_)
-            sub2.Init(self._node._on_mapping_cloud, 10)
-            # Replace old refs
-            self._node._dds_subs = [s for s in self._node._dds_subs
-                                    if not hasattr(s, '_topic') or 'points' not in str(getattr(s, '_topic', ''))]
-            self._node._dds_subs.extend([sub1, sub2])
-            print("[SpatialPlugin] DDS re-subscribed successfully", flush=True)
-        except Exception as e:
-            print(f"[SpatialPlugin] DDS re-subscribe failed: {e}", flush=True)
+        Just log — ROS2 subscriptions are managed by rclpy executor and don't need manual restart."""
+        print("[SpatialPlugin] _on_cloud_timeout: no data for 3s (SLAM may be idle or ROS2 topic unavailable)", flush=True)
 
     def start(self) -> None:
         """Auto-start mapping on plugin start. Always mapping, always observing."""
