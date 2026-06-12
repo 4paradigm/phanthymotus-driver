@@ -13,8 +13,14 @@ RUN apt-get update && \
         build-essential \
         curl \
         git \
-        libusb-1.0-0 \
-        ros-humble-rmw-cyclonedds-cpp && \
+        libusb-1.0-0 && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install rmw_cyclonedds_cpp (needed for SLAM point cloud subscription on domain 0)
+RUN echo "deb http://packages.ros.org/ros2/ubuntu jammy main" > /etc/apt/sources.list.d/ros2.list && \
+    curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key | apt-key add - && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends ros-humble-rmw-cyclonedds-cpp && \
     rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
