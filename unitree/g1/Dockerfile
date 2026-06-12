@@ -41,8 +41,6 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         libeigen3-dev \
         libpcl-dev \
-        ros-humble-pcl-conversions \
-        ros-humble-pcl-ros \
         ros-humble-tf2-ros \
         ros-humble-tf2-eigen && \
     rm -rf /var/lib/apt/lists/*
