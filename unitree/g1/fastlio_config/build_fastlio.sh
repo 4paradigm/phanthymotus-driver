@@ -27,7 +27,22 @@ git clone --depth 1 -b "${FAST_LIO_BRANCH}" "${FAST_LIO_URL}" fast_lio
 
 echo "[fastlio-build] Building..."
 cd /tmp/fastlio_ws
-source /opt/ros/humble/setup.bash
+
+# Find ROS2 setup.bash
+ROS_SETUP=""
+for p in /opt/ros/humble/setup.bash /opt/ros/foxy/setup.bash /ros_ws/install/setup.bash; do
+    if [ -f "$p" ]; then
+        ROS_SETUP="$p"
+        break
+    fi
+done
+
+if [ -z "${ROS_SETUP}" ]; then
+    echo "[fastlio-build] ERROR: No ROS2 setup.bash found. Install ROS2 first or run inside the G1 Docker container."
+    exit 1
+fi
+echo "[fastlio-build] Using ROS2: ${ROS_SETUP}"
+source "${ROS_SETUP}"
 colcon build --packages-select fast_lio \
     --cmake-args -DCMAKE_BUILD_TYPE=Release \
     --install-base "${INSTALL_DIR}/install"
