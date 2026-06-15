@@ -593,10 +593,24 @@ class LocoPlugin:
         self._client = loco_client
         self._slam_client = slam_client
         self._smart_motion = smart_motion
+        self._namespace = namespace
         self._move_timer: threading.Timer | None = None
 
     def get_tools(self) -> list:
-        return [self._loco_tool(), self._switch_mode_tool(), self._switch_mode_expert_tool()]
+        tools = [self._loco_tool(), self._switch_mode_tool(), self._switch_mode_expert_tool()]
+        if self._smart_motion:
+            tools.append(self._motion_events_tool())
+        return tools
+
+    def _motion_events_tool(self) -> dict:
+        topic = f"/{self._namespace}/safety/motion_events"
+        return {
+            "name": "motion_events",
+            "type": "sensor",
+            "description": f"SmartMotion safety harness events — motion_start/stop/decelerate/resume, nav_start/paused/resumed/stopped, safety_stop (tilt/foot_airborne/comm_timeout/overheat). Publishes to {topic}",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": topic, "format": "data/json"}],
+        }
 
     def _loco_tool(self) -> dict:
         return {
