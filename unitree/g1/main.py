@@ -329,13 +329,13 @@ def main():
     rclpy.init()
     executor = rclpy.executors.MultiThreadedExecutor()
 
-    # Safety Harness (SmartMotion)
+    # Safety Harness (SmartMotion) — independent subprocess
     smart_motion = None
     harness_cfg = cfg.get("safety_harness", {})
     if harness_cfg.get("enabled", True):
-        from safety_harness import SmartMotion
-        smart_motion = SmartMotion(loco_client, slam_client, namespace, executor, harness_cfg)
-        print("[bundle] SmartMotion safety harness active")
+        from safety_harness import SmartMotionProxy
+        smart_motion = SmartMotionProxy(namespace, harness_cfg, network_iface)
+        print("[bundle] SmartMotion safety harness active (subprocess)")
 
     _bundle = G1DeviceBundle(cfg, namespace, executor, audio_client, loco_client, arm_client, slam_client, msc_client, smart_motion=smart_motion)
     _bundle.start_all()
