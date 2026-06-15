@@ -607,7 +607,7 @@ class LocoPlugin:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["move", "stop", "set_stand_height", "wave_hand", "shake_hand"],
+                        "enum": ["move", "stop_move", "set_stand_height", "wave_hand", "shake_hand"],
                         "description": "Action to perform",
                     },
                     "vx":         {"type": "number", "description": "Forward velocity m/s [-1, 1]"},
@@ -621,7 +621,7 @@ class LocoPlugin:
                 "required": ["action"],
                 "x-action-params": {
                     "move":             {"params": ["vx", "vy", "vyaw", "duration"], "description": "Move with specified velocities. duration>0 for timed move, -1 for continuous until stop."},
-                    "stop":             {"params": [],                                 "description": "Stop all movement immediately"},
+                    "stop_move":        {"params": [],                                 "description": "Stop all movement immediately"},
                     "set_stand_height": {"params": ["height"],                         "description": "Set the robot's standing height (0.0-1.0)"},
                     "wave_hand":        {"params": ["turn"],                           "description": "Perform a waving hand gesture"},
                     "shake_hand":       {"params": [],                                 "description": "Perform a handshake gesture"},
@@ -699,7 +699,7 @@ class LocoPlugin:
                 self._move_timer.start()
 
             return {"ret": ret, "vx": vx, "vy": vy, "vyaw": vyaw, "duration": duration}
-        elif action == "stop":
+        elif action == "stop_move":
             # 取消定时停止
             if self._move_timer:
                 self._move_timer.cancel()
