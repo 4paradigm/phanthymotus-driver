@@ -2103,8 +2103,9 @@ class SpatialPlugin:
         self._node.set_active_map(self._db.get_last_used_map())
         self._node.set_pcd_save_dir(self._map_dir)
         self._node._auto_mapping_cb = self._on_localized
-        self._node._watchdog_cb = self._on_cloud_timeout
-        self._node._start_watchdog()
+        self._node._watchdog_cb = None
+        # Watchdog disabled — SLAM mapping cloud may not always be available
+        # self._node._start_watchdog()
         executor.add_node(self._node)
 
     def get_tools(self) -> list:
