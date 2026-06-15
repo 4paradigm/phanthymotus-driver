@@ -449,8 +449,9 @@ class SmartMotion:
         z_min = self._z_min
         z_max = self._z_max
         cone_half = self._cone_half_angle
-        lateral_half_min = math.radians(60)
-        lateral_half_max = math.radians(120)
+        # Lateral cross-traffic: narrower sector (45°-90° from heading), closer range
+        lateral_half_min = math.radians(45)
+        lateral_half_max = math.radians(90)
 
         count = 0
         for i in range(0, total_points * point_step, point_step * stride):
@@ -485,7 +486,7 @@ class SmartMotion:
 
             # Lateral cross-traffic check (side sectors, close range)
             if lateral_half_min <= angle_diff <= lateral_half_max:
-                if dist < self._lateral_threshold:
+                if dist < self._stop_threshold:
                     lateral_detected = True
 
         with self._obstacle_lock:
@@ -513,13 +514,13 @@ class SmartMotion:
 
     def _process_moving_obstacles(self, dist: float, lateral: bool) -> None:
         """Handle obstacles while in MOVING state (must hold _state_lock)."""
-        if dist <= self._stop_threshold or lateral:
-            # Emergency stop
+        if dist <= self._stop_threshold:
+            # Emergency stop — forward obstacle too close
             if self._speed_zone != SpeedZone.STOPPED:
                 self._speed_zone = SpeedZone.STOPPED
                 self._do_stop_locked(StopReason.OBSTACLE)
-        elif dist <= self._decel_threshold:
-            # Decelerate
+        elif dist <= self._decel_threshold or lateral:
+            # Decelerate — forward obstacle in warning zone OR lateral cross-traffic
             if self._speed_zone != SpeedZone.DECELERATED:
                 self._speed_zone = SpeedZone.DECELERATED
                 self._apply_deceleration()
