@@ -60,8 +60,10 @@ class G1DeviceBundle:
                  loco_client: LocoClient,
                  arm_client: G1ArmActionClient,
                  slam_client: SlamClient,
-                 msc_client: MotionSwitcherClient):
+                 msc_client: MotionSwitcherClient,
+                 smart_motion=None):
         self._plugins: list = []
+        self._smart_motion = smart_motion
         plugins_cfg = cfg.get("plugins", {})
 
         if plugins_cfg.get("mic", {}).get("enabled", False):
@@ -87,7 +89,7 @@ class G1DeviceBundle:
         if plugins_cfg.get("loco", {}).get("enabled", False):
             from device import LocoStatePlugin, LocoPlugin
             self._plugins.append(LocoStatePlugin(plugins_cfg["loco"], namespace, executor))
-            self._plugins.append(LocoPlugin(plugins_cfg["loco"], namespace, executor, loco_client, slam_client=slam_client))
+            self._plugins.append(LocoPlugin(plugins_cfg["loco"], namespace, executor, loco_client, slam_client=slam_client, smart_motion=smart_motion))
             print("[bundle] LocoStatePlugin + LocoPlugin loaded")
 
         if plugins_cfg.get("arm", {}).get("enabled", False):
@@ -117,7 +119,7 @@ class G1DeviceBundle:
 
         if plugins_cfg.get("slam", {}).get("enabled", False):
             from device import SpatialPlugin
-            self._plugins.append(SpatialPlugin(plugins_cfg["slam"], namespace, executor, slam_client))
+            self._plugins.append(SpatialPlugin(plugins_cfg["slam"], namespace, executor, slam_client, smart_motion=smart_motion))
             print("[bundle] SpatialPlugin loaded")
 
         if plugins_cfg.get("motion_switcher", {}).get("enabled", False):
@@ -327,7 +329,15 @@ def main():
     rclpy.init()
     executor = rclpy.executors.MultiThreadedExecutor()
 
-    _bundle = G1DeviceBundle(cfg, namespace, executor, audio_client, loco_client, arm_client, slam_client, msc_client)
+    # Safety Harness (SmartMotion)
+    smart_motion = None
+    harness_cfg = cfg.get("safety_harness", {})
+    if harness_cfg.get("enabled", True):
+        from safety_harness import SmartMotion
+        smart_motion = SmartMotion(loco_client, slam_client, namespace, executor, harness_cfg)
+        print("[bundle] SmartMotion safety harness active")
+
+    _bundle = G1DeviceBundle(cfg, namespace, executor, audio_client, loco_client, arm_client, slam_client, msc_client, smart_motion=smart_motion)
     _bundle.start_all()
 
     def _spin():
@@ -344,6 +354,8 @@ def main():
 
     def _shutdown(signum, frame):
         print(f"[bundle] signal {signum}, shutting down")
+        if smart_motion:
+            smart_motion.shutdown()
         _bundle.stop_all()
         threading.Thread(target=server.shutdown, daemon=True).start()
 

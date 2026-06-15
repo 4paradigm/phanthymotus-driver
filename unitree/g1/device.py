@@ -589,9 +589,10 @@ class LocoStatePlugin:
 class LocoPlugin:
     PREFIX = "loco"
 
-    def __init__(self, plugin_config: dict, namespace: str, executor, loco_client, slam_client=None):
+    def __init__(self, plugin_config: dict, namespace: str, executor, loco_client, slam_client=None, smart_motion=None):
         self._client = loco_client
         self._slam_client = slam_client
+        self._smart_motion = smart_motion
         self._move_timer: threading.Timer | None = None
 
     def get_tools(self) -> list:
@@ -682,30 +683,40 @@ class LocoPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "move":
-            vx   = max(-1.0, min(1.0,  float(args.get("vx",   0))))
-            vy   = max(-1.0, min(1.0,  float(args.get("vy",   0))))
-            vyaw = max(-2.0, min(2.0,  float(args.get("vyaw", 0))))
+            vx   = float(args.get("vx",   0))
+            vy   = float(args.get("vy",   0))
+            vyaw = float(args.get("vyaw", 0))
             duration = float(args.get("duration", -1))
 
-            # 取消之前的定时停止
+            # Route through SmartMotion safety harness
+            if self._smart_motion:
+                return self._smart_motion.move(vx, vy, vyaw, duration)
+
+            # Fallback: direct control (no safety harness)
+            vx   = max(-1.0, min(1.0, vx))
+            vy   = max(-1.0, min(1.0, vy))
+            vyaw = max(-2.0, min(2.0, vyaw))
+
             if self._move_timer:
                 self._move_timer.cancel()
                 self._move_timer = None
 
             ret = self._client.Move(vx, vy, vyaw, True)
 
-            # 设置定时停止
             if duration > 0:
                 self._move_timer = threading.Timer(duration, self._auto_stop)
                 self._move_timer.start()
 
             return {"ret": ret, "vx": vx, "vy": vy, "vyaw": vyaw, "duration": duration}
         elif action == "stop_move":
-            # 取消定时停止
+            # Route through SmartMotion safety harness
+            if self._smart_motion:
+                return self._smart_motion.stop()
+
+            # Fallback: direct control
             if self._move_timer:
                 self._move_timer.cancel()
                 self._move_timer = None
-            # 停止导航（如果有）
             if self._slam_client:
                 try:
                     self._slam_client.PauseNav()
@@ -2073,8 +2084,9 @@ class _SlamInfoNode(Node):
 class SpatialPlugin:
     PREFIX = "spatial"
 
-    def __init__(self, plugin_config: dict, namespace: str, executor, slam_client):
+    def __init__(self, plugin_config: dict, namespace: str, executor, slam_client, smart_motion=None):
         self._client = slam_client
+        self._smart_motion = smart_motion
         self._map_dir = plugin_config.get("map_dir", "/home/unitree")
         os.makedirs(self._map_dir, exist_ok=True)
         db_path = plugin_config.get("db_path", os.path.join(os.path.dirname(__file__), "resource", "spatial.db"))
@@ -2372,8 +2384,16 @@ class SpatialPlugin:
             poi = self._db.find_poi(tag_name, active_map)
             if not poi:
                 return {"error": f"Tag '{tag_name}' not found", "available": [p["name"] for p in self._db.list_pois(active_map)]}
-            # Convert yaw to quaternion (z-axis rotation)
             yaw = poi.get("yaw", 0)
+
+            # Route through SmartMotion safety harness
+            if self._smart_motion:
+                result = self._smart_motion.navigate_to(poi["x"], poi["y"], yaw, tag_name)
+                if "error" not in result:
+                    self._node.set_nav_target(tag_name)
+                return result
+
+            # Fallback: direct control
             q_z = math.sin(yaw / 2)
             q_w = math.cos(yaw / 2)
             code, resp = self._client.NavigateTo(poi["x"], poi["y"], 0, 0, 0, q_z, q_w)
@@ -2386,6 +2406,15 @@ class SpatialPlugin:
             x = float(args.get("x", 0))
             y = float(args.get("y", 0))
             yaw = float(args.get("yaw", 0))
+
+            # Route through SmartMotion safety harness
+            if self._smart_motion:
+                result = self._smart_motion.navigate_to(x, y, yaw)
+                if "error" not in result:
+                    self._node.set_nav_target(f"({x:.1f}, {y:.1f})")
+                return result
+
+            # Fallback: direct control
             q_z = math.sin(yaw / 2)
             q_w = math.cos(yaw / 2)
             code, resp = self._client.NavigateTo(x, y, 0, 0, 0, q_z, q_w)
@@ -2395,14 +2424,22 @@ class SpatialPlugin:
             return {"error": f"NavigateTo failed, code={code}", "response": resp}
 
         elif action == "pause_nav":
+            if self._smart_motion:
+                return self._smart_motion.pause_nav()
             code, resp = self._client.PauseNav()
             return {"status": "paused"} if code == 0 else {"error": f"PauseNav failed, code={code}"}
 
         elif action == "resume_nav":
+            if self._smart_motion:
+                return self._smart_motion.resume_nav()
             code, resp = self._client.ResumeNav()
             return {"status": "resumed"} if code == 0 else {"error": f"ResumeNav failed, code={code}"}
 
         elif action == "stop_nav":
+            if self._smart_motion:
+                result = self._smart_motion.stop_nav()
+                self._node.set_nav_target(None)
+                return result
             self._client.PauseNav()
             self._node.set_nav_target(None)
             return {"status": "stopped"}
