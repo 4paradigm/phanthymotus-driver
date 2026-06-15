@@ -419,9 +419,11 @@ class SmartMotion:
     def _on_cloud(self, msg) -> None:
         """DDS callback: parse point cloud and compute obstacle distances.
 
-        Strategy: process ALL points within forward 3m zone (no downsampling),
-        only downsample distant/lateral points for performance.
+        Uses numpy for fast vectorized processing. All points are evaluated —
+        no downsampling — to reliably detect small obstacles like human legs.
         """
+        import numpy as np
+
         # Determine current motion heading
         with self._state_lock:
             state = self._state
@@ -429,73 +431,72 @@ class SmartMotion:
                 heading = math.atan2(self._current_cmd.vy, self._current_cmd.vx) \
                     if (abs(self._current_cmd.vx) > 0.01 or abs(self._current_cmd.vy) > 0.01) else 0.0
             elif state in (MotionState.NAVIGATING, MotionState.NAV_PAUSED):
-                heading = 0.0  # forward direction for navigation
+                heading = 0.0
             else:
-                heading = 0.0  # default forward
+                heading = 0.0
 
-        # Parse PointCloud2 fields
+        # Parse PointCloud2 field offsets
         field_map = {}
         for f in msg.fields:
-            field_map[f.name] = (f.offset, f.datatype)
+            field_map[f.name] = f.offset
 
-        x_off = field_map.get("x", (0, 7))[0]
-        y_off = field_map.get("y", (4, 7))[0]
-        z_off = field_map.get("z", (8, 7))[0]
+        x_off = field_map.get("x", 0)
+        y_off = field_map.get("y", 4)
+        z_off = field_map.get("z", 8)
 
         point_step = msg.point_step
         total_points = msg.width * msg.height
         data = bytes(msg.data)
+        data_len = len(data)
 
+        n_valid = min(total_points, data_len // point_step)
+        if n_valid == 0:
+            return
+
+        # Reshape raw bytes into (n_valid, point_step) and extract float32 fields
+        buf = np.frombuffer(data, dtype=np.uint8, count=n_valid * point_step).reshape(n_valid, point_step)
+        px = buf[:, x_off:x_off+4].copy().view(dtype='<f4').flatten()
+        py = buf[:, y_off:y_off+4].copy().view(dtype='<f4').flatten()
+        pz = buf[:, z_off:z_off+4].copy().view(dtype='<f4').flatten()
+
+        # Vectorized filtering: height, distance
+        z_mask = (pz >= self._z_min) & (pz <= self._z_max)
+        dist_sq = px * px + py * py
+        range_mask = (dist_sq >= 0.04) & (dist_sq <= 6.25)  # 0.2m - 2.5m
+        valid = z_mask & range_mask
+
+        if not np.any(valid):
+            with self._obstacle_lock:
+                self._min_obstacle_dist = float("inf")
+                self._min_obstacle_angle = 0.0
+                self._lateral_obstacle = False
+            return
+
+        vx = px[valid]
+        vy = py[valid]
+        vdist = np.sqrt(dist_sq[valid])
+
+        # Angle relative to heading — vectorized
+        point_angles = np.arctan2(vy, vx)
+        angle_diffs = np.abs(np.mod(point_angles - heading + math.pi, 2 * math.pi) - math.pi)
+
+        # Forward cone detection
+        cone_half = self._cone_half_angle
+        forward_mask = angle_diffs <= cone_half
         min_forward_dist = float("inf")
         min_forward_angle = 0.0
-        lateral_detected = False
-        z_min = self._z_min
-        z_max = self._z_max
-        cone_half = self._cone_half_angle
-        # Lateral cross-traffic: narrower sector (45°-90° from heading), closer range
-        lateral_half_min = math.radians(45)
-        lateral_half_max = math.radians(90)
 
-        # Process every point — the critical safety zone is small so we need full coverage.
-        # Livox Mid-360 typically produces 10k-20k points/frame, parsing is fast with struct.
-        cos_h = math.cos(heading)
-        sin_h = math.sin(heading)
+        if np.any(forward_mask):
+            forward_dists = vdist[forward_mask]
+            min_idx = np.argmin(forward_dists)
+            min_forward_dist = float(forward_dists[min_idx])
+            min_forward_angle = float(point_angles[forward_mask][min_idx])
 
-        for i in range(0, total_points * point_step, point_step):
-            if i + z_off + 4 > len(data):
-                break
-
-            px = struct.unpack_from('<f', data, i + x_off)[0]
-            py = struct.unpack_from('<f', data, i + y_off)[0]
-            pz = struct.unpack_from('<f', data, i + z_off)[0]
-
-            # Filter ground and ceiling
-            if pz < z_min or pz > z_max:
-                continue
-
-            # Quick distance squared check — skip points beyond decel threshold + margin
-            dist_sq = px * px + py * py
-            if dist_sq > 6.25:  # > 2.5m, well beyond decel threshold
-                continue
-            if dist_sq < 0.04:  # < 0.2m, robot body
-                continue
-
-            dist = math.sqrt(dist_sq)
-
-            # Compute angle relative to motion heading
-            point_angle = math.atan2(py, px)
-            angle_diff = abs((point_angle - heading + math.pi) % (2 * math.pi) - math.pi)
-
-            # Forward cone check
-            if angle_diff <= cone_half:
-                if dist < min_forward_dist:
-                    min_forward_dist = dist
-                    min_forward_angle = point_angle
-
-            # Lateral cross-traffic check (side sectors, close range)
-            if lateral_half_min <= angle_diff <= lateral_half_max:
-                if dist < self._stop_threshold:
-                    lateral_detected = True
+        # Lateral cross-traffic (45°-90° from heading, within stop threshold)
+        lateral_mask = (angle_diffs >= math.radians(45)) & \
+                       (angle_diffs <= math.radians(90)) & \
+                       (vdist < self._stop_threshold)
+        lateral_detected = bool(np.any(lateral_mask))
 
         with self._obstacle_lock:
             self._min_obstacle_dist = min_forward_dist
