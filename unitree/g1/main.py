@@ -87,7 +87,7 @@ class G1DeviceBundle:
         if plugins_cfg.get("loco", {}).get("enabled", False):
             from device import LocoStatePlugin, LocoPlugin
             self._plugins.append(LocoStatePlugin(plugins_cfg["loco"], namespace, executor))
-            self._plugins.append(LocoPlugin(plugins_cfg["loco"], namespace, executor, loco_client))
+            self._plugins.append(LocoPlugin(plugins_cfg["loco"], namespace, executor, loco_client, slam_client=slam_client))
             print("[bundle] LocoStatePlugin + LocoPlugin loaded")
 
         if plugins_cfg.get("arm", {}).get("enabled", False):

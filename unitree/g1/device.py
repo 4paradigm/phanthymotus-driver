@@ -589,8 +589,10 @@ class LocoStatePlugin:
 class LocoPlugin:
     PREFIX = "loco"
 
-    def __init__(self, plugin_config: dict, namespace: str, executor, loco_client):
+    def __init__(self, plugin_config: dict, namespace: str, executor, loco_client, slam_client=None):
         self._client = loco_client
+        self._slam_client = slam_client
+        self._move_timer: threading.Timer | None = None
 
     def get_tools(self) -> list:
         return [self._loco_tool(), self._switch_mode_tool(), self._switch_mode_expert_tool()]
@@ -611,13 +613,14 @@ class LocoPlugin:
                     "vx":         {"type": "number", "description": "Forward velocity m/s [-1, 1]"},
                     "vy":         {"type": "number", "description": "Lateral velocity m/s [-1, 1]"},
                     "vyaw":       {"type": "number", "description": "Yaw rotation rad/s [-2, 2]"},
-                    "continuous": {"type": "boolean", "description": "Keep moving until stop (default false)"},
+                    "continuous": {"type": "boolean", "description": "Keep moving until stop (default false). Deprecated: use duration instead."},
+                    "duration":   {"type": "number", "description": "Move duration in seconds. -1 = move until explicit stop (default -1)"},
                     "height":     {"type": "number", "description": "Normalized height 0.0-1.0"},
                     "turn":       {"type": "boolean", "description": "Turn while waving (default false)"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "move":             {"params": ["vx", "vy", "vyaw", "continuous"], "description": "Move the robot with specified velocities"},
+                    "move":             {"params": ["vx", "vy", "vyaw", "duration"], "description": "Move with specified velocities. duration>0 for timed move, -1 for continuous until stop."},
                     "stop":             {"params": [],                                 "description": "Stop all movement immediately"},
                     "set_stand_height": {"params": ["height"],                         "description": "Set the robot's standing height (0.0-1.0)"},
                     "wave_hand":        {"params": ["turn"],                           "description": "Perform a waving hand gesture"},
@@ -667,17 +670,46 @@ class LocoPlugin:
         pass
 
     def stop(self) -> None:
-        pass
+        if self._move_timer:
+            self._move_timer.cancel()
+            self._move_timer = None
+
+    def _auto_stop(self):
+        """Timer 回调：自动停止运动"""
+        self._move_timer = None
+        self._client.StopMove()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "move":
             vx   = max(-1.0, min(1.0,  float(args.get("vx",   0))))
             vy   = max(-1.0, min(1.0,  float(args.get("vy",   0))))
             vyaw = max(-2.0, min(2.0,  float(args.get("vyaw", 0))))
-            continuous = bool(args.get("continuous", False))
-            ret  = self._client.Move(vx, vy, vyaw, continuous)
-            return {"ret": ret, "vx": vx, "vy": vy, "vyaw": vyaw, "continuous": continuous}
+            duration = float(args.get("duration", -1))
+
+            # 取消之前的定时停止
+            if self._move_timer:
+                self._move_timer.cancel()
+                self._move_timer = None
+
+            ret = self._client.Move(vx, vy, vyaw, True)
+
+            # 设置定时停止
+            if duration > 0:
+                self._move_timer = threading.Timer(duration, self._auto_stop)
+                self._move_timer.start()
+
+            return {"ret": ret, "vx": vx, "vy": vy, "vyaw": vyaw, "duration": duration}
         elif action == "stop":
+            # 取消定时停止
+            if self._move_timer:
+                self._move_timer.cancel()
+                self._move_timer = None
+            # 停止导航（如果有）
+            if self._slam_client:
+                try:
+                    self._slam_client.PauseNav()
+                except Exception:
+                    pass
             ret = self._client.StopMove()
             return {"ret": ret}
         elif action == "switch_mode":
