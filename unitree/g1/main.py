@@ -125,11 +125,6 @@ class G1DeviceBundle:
             self._plugins.append(MotionSwitcherPlugin(plugins_cfg["motion_switcher"], namespace, executor, msc_client))
             print("[bundle] MotionSwitcherPlugin loaded")
 
-        if plugins_cfg.get("fastlio", {}).get("enabled", False):
-            from device import FastLioPlugin
-            self._plugins.append(FastLioPlugin(plugins_cfg["fastlio"], namespace, executor))
-            print("[bundle] FastLioPlugin loaded")
-
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
             try:

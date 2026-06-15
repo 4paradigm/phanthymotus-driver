@@ -1088,10 +1088,6 @@ class _LidarNode(Node):
         self._last_cloud_time: float = 0.0
         self._last_imu_time:   float = 0.0
 
-        # Background thread for lidar processing (don't block DDS dispatch thread)
-        self._lidar_queue = queue.Queue(maxsize=10)
-        threading.Thread(target=self._lidar_process_loop, daemon=True, name="lidar_proc").start()
-
         # Subscribe DDS PointCloud2
         try:
             from unitree_sdk2py.core.channel import ChannelSubscriber
@@ -1113,60 +1109,55 @@ class _LidarNode(Node):
             self.get_logger().warn(f"LidarNode: failed to subscribe imu: {e}")
 
     def _on_cloud(self, msg) -> None:
-        """DDS callback — fast: just copy data and queue for background processing."""
         now = time.monotonic()
         if now - self._last_cloud_time < LIDAR_CLOUD_INTERVAL:
             return
         self._last_cloud_time = now
 
-        try:
-            data = bytes(msg.data)
-            point_step = msg.point_step
-            total_points = msg.width * msg.height
-            field_offsets = {}
-            for f in msg.fields:
-                field_offsets[f.name] = f.offset
-            self._lidar_queue.put_nowait((field_offsets, point_step, total_points, data))
-        except Exception:
-            pass  # queue full, drop
+        # Parse PointCloud2 fields to find x, y, z, intensity offsets
+        field_map = {}
+        for f in msg.fields:
+            field_map[f.name] = (f.offset, f.datatype)
 
-    def _lidar_process_loop(self):
-        """Background thread: processes lidar frames and publishes ROS2."""
-        while True:
-            try:
-                item = self._lidar_queue.get(timeout=1.0)
-            except Exception:
-                continue
-            try:
-                field_offsets, point_step, total_points, data = item
-                x_off = field_offsets.get("x", 0)
-                y_off = field_offsets.get("y", 4)
-                z_off = field_offsets.get("z", 8)
-                i_off = field_offsets.get("intensity") or field_offsets.get("reflectivity")
+        x_off = field_map.get("x", (0, 7))[0]
+        y_off = field_map.get("y", (4, 7))[0]
+        z_off = field_map.get("z", (8, 7))[0]
+        # intensity may be named "intensity" or "reflectivity"
+        i_off = None
+        for name in ("intensity", "reflectivity"):
+            if name in field_map:
+                i_off = field_map[name][0]
+                break
 
-                stride = max(1, total_points // LIDAR_MAX_POINTS)
-                num_out = min(total_points, LIDAR_MAX_POINTS)
+        point_step = msg.point_step
+        total_points = msg.width * msg.height
+        data = bytes(msg.data)
 
-                out = struct.pack('<I', num_out)
-                count = 0
-                for i in range(0, total_points * point_step, point_step * stride):
-                    if count >= num_out:
-                        break
-                    if i + point_step > len(data):
-                        break
-                    x = struct.unpack_from('<f', data, i + x_off)[0]
-                    y = struct.unpack_from('<f', data, i + y_off)[0]
-                    z = struct.unpack_from('<f', data, i + z_off)[0]
-                    intensity = struct.unpack_from('<f', data, i + i_off)[0] if i_off is not None else 0.0
-                    out += struct.pack('<ffff', x, y, z, intensity)
-                    count += 1
+        # Downsample if needed
+        stride = max(1, total_points // LIDAR_MAX_POINTS)
+        num_out = min(total_points, LIDAR_MAX_POINTS)
 
-                from std_msgs.msg import UInt8MultiArray
-                ros_msg = UInt8MultiArray()
-                ros_msg.data = list(out)
-                self._cloud_pub.publish(ros_msg)
-            except Exception:
-                pass
+        # Pack binary: [uint32 num_points][float32 x, y, z, intensity × N]
+        out = struct.pack('<I', num_out)
+        idx = 0
+        count = 0
+        for i in range(0, total_points * point_step, point_step * stride):
+            if count >= num_out:
+                break
+            if i + point_step > len(data):
+                break
+            x = struct.unpack_from('<f', data, i + x_off)[0]
+            y = struct.unpack_from('<f', data, i + y_off)[0]
+            z = struct.unpack_from('<f', data, i + z_off)[0]
+            intensity = struct.unpack_from('<f', data, i + i_off)[0] if i_off is not None else 0.0
+            out += struct.pack('<ffff', x, y, z, intensity)
+            count += 1
+
+        # Publish as UInt8MultiArray (binary passthrough)
+        from std_msgs.msg import UInt8MultiArray
+        ros_msg = UInt8MultiArray()
+        ros_msg.data = list(out)
+        self._cloud_pub.publish(ros_msg)
 
     def _on_imu(self, msg) -> None:
         now = time.monotonic()
@@ -1367,54 +1358,6 @@ def _bearing_label(dx: float, dy: float) -> str:
         return "behind"
 
 
-def _slam_subscriber_process(cloud_queue):
-    """Subprocess: subscribes to SLAM mapping/relocation point clouds via CycloneDDS ChannelSubscriber.
-    Runs until killed by parent (watchdog will kill+respawn when callback stops delivering).
-
-    Passes (field_offsets, point_step, total_points, data) tuples via multiprocessing Queue.
-    """
-    import os
-    import signal
-    os.environ.setdefault('CYCLONEDDS_URI',
-        '<CycloneDDS><Domain><General><Interfaces>'
-        '<NetworkInterface name="eth0"/></Interfaces>'
-        '<AllowMulticast>spdp</AllowMulticast>'
-        '</General></Domain></CycloneDDS>')
-
-    import sys
-    sys.path.insert(0, '/work')
-
-    from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscriber
-    from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_
-
-    ChannelFactoryInitialize(0, os.environ.get('NETWORK_INTERFACE', 'eth0'))
-
-    def _cb(msg):
-        try:
-            total_points = msg.width * msg.height
-            if total_points == 0:
-                return
-            data = bytes(msg.data)
-            if len(data) < msg.point_step:
-                return
-            field_offsets = {}
-            for f in msg.fields:
-                field_offsets[f.name] = f.offset
-            cloud_queue.put_nowait((field_offsets, msg.point_step, total_points, data))
-        except Exception:
-            pass
-
-    sub1 = ChannelSubscriber("rt/unitree/slam_mapping/points", PointCloud2_)
-    sub1.Init(_cb, 10)
-    sub2 = ChannelSubscriber("rt/unitree/slam_relocation/points", PointCloud2_)
-    sub2.Init(_cb, 10)
-
-    print("[slam_cloud_sub] subprocess started (CycloneDDS ChannelSubscriber)", flush=True)
-
-    # Keep alive until killed
-    signal.pause()
-
-
 class _SlamInfoNode(Node):
     """Subscribes to rt/slam_info, rt/slam_key_info, and mapping point clouds.
     Maintains a 3D voxel map buffer and publishes full map at 1Hz."""
@@ -1509,40 +1452,26 @@ class _SlamInfoNode(Node):
         except Exception as e:
             self.get_logger().warn(f"SpatialNode: failed to subscribe rt/slam_key_info: {e}")
 
-        # Subscribe SLAM mapping point clouds via a dedicated subprocess.
-        # ChannelSubscriber callback silently stops after ~60s (unitree_sdk2py bug).
-        # When watchdog detects no data, it kills+respawns the subprocess and
-        # calls StopMapping+StartMapping to restart the SLAM data stream.
-        import multiprocessing as mp
-        self._slam_cloud_queue = mp.Queue(maxsize=50)
-        self._slam_sub_proc = None
-        self._spawn_slam_subscriber()
+        # Subscribe mapping point clouds (both mapping and relocation modes)
+        try:
+            from unitree_sdk2py.core.channel import ChannelSubscriber
+            from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_
+            map_cloud_sub = ChannelSubscriber("rt/unitree/slam_mapping/points", PointCloud2_)
+            map_cloud_sub.Init(self._on_mapping_cloud, 10)
+            self._dds_subs.append(map_cloud_sub)
+            self.get_logger().info("SpatialNode subscribed rt/unitree/slam_mapping/points")
+        except Exception as e:
+            self.get_logger().warn(f"SpatialNode: failed to subscribe mapping points: {e}")
 
-        # Background thread to drain mp.Queue → self._cloud_queue (threading.Queue)
-        def _drain_slam_queue():
-            while True:
-                try:
-                    item = self._slam_cloud_queue.get(timeout=1.0)
-                    self._cloud_queue.put_nowait(item)
-                except Exception:
-                    pass
-        threading.Thread(target=_drain_slam_queue, daemon=True, name="slam_queue_drain").start()
-
-    def _spawn_slam_subscriber(self):
-        """Start (or restart) the SLAM point cloud subscriber subprocess."""
-        # Kill existing if alive
-        if self._slam_sub_proc and self._slam_sub_proc.is_alive():
-            self._slam_sub_proc.kill()
-            self._slam_sub_proc.join(timeout=2)
-        import multiprocessing as mp
-        self._slam_sub_proc = mp.Process(
-            target=_slam_subscriber_process,
-            args=(self._slam_cloud_queue,),
-            daemon=True,
-            name="slam_cloud_sub",
-        )
-        self._slam_sub_proc.start()
-        self.get_logger().info(f"SpatialNode (re)spawned SLAM subscriber (pid={self._slam_sub_proc.pid})")
+        try:
+            from unitree_sdk2py.core.channel import ChannelSubscriber
+            from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_
+            reloc_cloud_sub = ChannelSubscriber("rt/unitree/slam_relocation/points", PointCloud2_)
+            reloc_cloud_sub.Init(self._on_mapping_cloud, 10)
+            self._dds_subs.append(reloc_cloud_sub)
+            self.get_logger().info("SpatialNode subscribed rt/unitree/slam_relocation/points")
+        except Exception as e:
+            self.get_logger().warn(f"SpatialNode: failed to subscribe relocation points: {e}")
 
     def _on_slam_info(self, msg) -> None:
         try:
@@ -1613,21 +1542,16 @@ class _SlamInfoNode(Node):
                     self._nav_status = None
                     self._nav_target_name = None
 
-
     def _on_mapping_cloud(self, msg) -> None:
-        """DDS callback (legacy/slam_info topics): fast enqueue."""
+        """DDS callback: fast enqueue only. Processing happens in separate thread."""
+        # Quick extract raw data and enqueue — don't block DDS thread
         try:
-            point_step = msg.point_step
-            total_points = msg.width * msg.height
             data = bytes(msg.data)
-            if total_points == 0 or len(data) < point_step:
+            if len(data) < msg.point_step:
                 return
-            field_offsets = {}
-            for f in msg.fields:
-                field_offsets[f.name] = f.offset
-            self._cloud_queue.put_nowait((field_offsets, point_step, total_points, data))
+            self._cloud_queue.put_nowait((msg.fields, msg.point_step, msg.width * msg.height, data))
         except Exception:
-            pass
+            pass  # queue full, drop frame
 
     def _cloud_processor_loop(self):
         """Background thread: processes queued point clouds at its own pace."""
@@ -1638,90 +1562,90 @@ class _SlamInfoNode(Node):
             except Exception:
                 continue
 
-            try:
-                field_offsets, point_step, total_points, data = item
+            fields, point_step, total_points, data = item
+            if total_points == 0:
+                continue
 
-                x_off = field_offsets.get("x", 0)
-                y_off = field_offsets.get("y", 4)
-                z_off = field_offsets.get("z", 8)
+            # Parse fields
+            field_map = {}
+            for f in fields:
+                field_map[f.name] = (f.offset, f.datatype)
+            x_off = field_map.get("x", (0, 7))[0]
+            y_off = field_map.get("y", (4, 7))[0]
+            z_off = field_map.get("z", (8, 7))[0]
 
-                # Numpy vectorized parsing
-                num_points = min(total_points, 20000)
-                if len(data) < num_points * point_step:
-                    num_points = len(data) // point_step
-                if num_points == 0:
-                    continue
+            # Numpy vectorized parsing
+            num_points = min(total_points, 20000)
+            if len(data) < num_points * point_step:
+                num_points = len(data) // point_step
 
-                # Extract x, y, z using byte offsets
-                raw = np.frombuffer(data, dtype=np.uint8, count=num_points * point_step)
-                raw = raw.reshape(num_points, point_step)
+            # Build structured dtype for the point layout
+            # Extract x, y, z using byte offsets directly
+            raw = np.frombuffer(data, dtype=np.uint8, count=num_points * point_step)
+            raw = raw.reshape(num_points, point_step)
 
-                x = raw[:, x_off:x_off+4].copy().view(np.float32).ravel()
-                y = raw[:, y_off:y_off+4].copy().view(np.float32).ravel()
-                z = raw[:, z_off:z_off+4].copy().view(np.float32).ravel()
+            x = raw[:, x_off:x_off+4].view(np.float32).ravel()
+            y = raw[:, y_off:y_off+4].view(np.float32).ravel()
+            z = raw[:, z_off:z_off+4].view(np.float32).ravel()
 
-                # Filter invalid (NaN and out of range)
-                valid = (
-                    np.isfinite(x) & np.isfinite(y) & np.isfinite(z) &
-                    (np.abs(x) < 50) & (np.abs(y) < 50) & (np.abs(z) < 20)
-                )
-                x, y, z = x[valid], y[valid], z[valid]
+            # Filter invalid (NaN and out of range)
+            valid = (
+                np.isfinite(x) & np.isfinite(y) & np.isfinite(z) &
+                (np.abs(x) < 50) & (np.abs(y) < 50) & (np.abs(z) < 20)
+            )
+            x, y, z = x[valid], y[valid], z[valid]
 
-                if len(x) == 0:
-                    continue
+            if len(x) == 0:
+                continue
 
-                pts_arr = np.column_stack([x, y, z]).astype(np.float32)
+            pts_arr = np.column_stack([x, y, z]).astype(np.float32)
 
-                # Merge into voxel map buffer (deduplication)
-                voxel_size = self.VOXEL_SIZE
-                ix = (pts_arr[:, 0] / voxel_size).astype(np.int32)
-                iy = (pts_arr[:, 1] / voxel_size).astype(np.int32)
-                iz = (pts_arr[:, 2] / voxel_size).astype(np.int32)
+            # Merge into voxel map buffer (deduplication)
+            voxel_size = self.VOXEL_SIZE
+            # Vectorized voxel key computation
+            ix = (pts_arr[:, 0] / voxel_size).astype(np.int32)
+            iy = (pts_arr[:, 1] / voxel_size).astype(np.int32)
+            iz = (pts_arr[:, 2] / voxel_size).astype(np.int32)
 
-                with self._map_buffer_lock:
-                    prev_size = len(self._map_buffer)
-                    for j in range(len(pts_arr)):
-                        key = (int(ix[j]), int(iy[j]), int(iz[j]))
-                        if key not in self._map_buffer:
-                            self._map_buffer[key] = (float(pts_arr[j, 0]), float(pts_arr[j, 1]), float(pts_arr[j, 2]))
-                    new_size = len(self._map_buffer)
-                    if new_size > prev_size:
-                        self._map_buffer_dirty = True
+            with self._map_buffer_lock:
+                prev_size = len(self._map_buffer)
+                for j in range(len(pts_arr)):
+                    key = (int(ix[j]), int(iy[j]), int(iz[j]))
+                    if key not in self._map_buffer:
+                        self._map_buffer[key] = (float(pts_arr[j, 0]), float(pts_arr[j, 1]), float(pts_arr[j, 2]))
+                new_size = len(self._map_buffer)
+                if new_size > prev_size:
+                    self._map_buffer_dirty = True
 
-                self._last_cloud_time = time.monotonic()
-                new_points = new_size - prev_size
-                self.get_logger().info(
-                    f"[mapping_cloud] frame: {len(pts_arr)} pts parsed, "
-                    f"+{new_points} new voxels, total={new_size}"
-                )
+            self._last_cloud_time = time.monotonic()
+            new_points = new_size - prev_size
+            self.get_logger().info(
+                f"[mapping_cloud] frame: {len(pts_arr)} pts parsed, "
+                f"+{new_points} new voxels, total={new_size}"
+            )
 
-                # Update recent cloud ring buffer
-                n = len(pts_arr)
-                start = self._recent_cloud_write_idx
-                cap = self.RECENT_CLOUD_MAX
-                if n <= cap:
-                    end = start + n
-                    if end <= cap:
-                        self._recent_cloud[start:end] = pts_arr
-                    else:
-                        first = cap - start
-                        self._recent_cloud[start:cap] = pts_arr[:first]
-                        self._recent_cloud[0:n - first] = pts_arr[first:]
-                    self._recent_cloud_write_idx = (start + n) % cap
-                    self._recent_cloud_count = min(self._recent_cloud_count + n, cap)
+            # Update recent cloud ring buffer
+            n = len(pts_arr)
+            start = self._recent_cloud_write_idx
+            cap = self.RECENT_CLOUD_MAX
+            if n <= cap:
+                end = start + n
+                if end <= cap:
+                    self._recent_cloud[start:end] = pts_arr
                 else:
-                    self._recent_cloud[:] = pts_arr[-cap:]
-                    self._recent_cloud_write_idx = 0
-                    self._recent_cloud_count = cap
+                    first = cap - start
+                    self._recent_cloud[start:cap] = pts_arr[:first]
+                    self._recent_cloud[0:n - first] = pts_arr[first:]
+                self._recent_cloud_write_idx = (start + n) % cap
+                self._recent_cloud_count = min(self._recent_cloud_count + n, cap)
+            else:
+                self._recent_cloud[:] = pts_arr[-cap:]
+                self._recent_cloud_write_idx = 0
+                self._recent_cloud_count = cap
 
-                # Keyframe + publish
-                self._maybe_add_keyframe(pts_arr)
-                self._maybe_publish_full_map()
-
-            except Exception as e:
-                self.get_logger().warn(f"[cloud_processor] error: {e}")
-                import traceback
-                traceback.print_exc()
+            # Keyframe + publish
+            self._maybe_add_keyframe(pts_arr)
+            self._maybe_publish_full_map()
 
     def _maybe_record_trajectory(self):
         with self._lock:
@@ -2214,8 +2138,23 @@ class SpatialPlugin:
 
     def _on_cloud_timeout(self):
         """Called by watchdog when no point cloud received for WATCHDOG_TIMEOUT seconds.
-        Just log — ROS2 subscriptions are managed by rclpy executor and don't need manual restart."""
-        print("[SpatialPlugin] _on_cloud_timeout: no data for 3s (SLAM may be idle or ROS2 topic unavailable)", flush=True)
+        Re-subscribe DDS topics (subscription may have been lost)."""
+        print("[SpatialPlugin] _on_cloud_timeout: re-subscribing DDS mapping topics", flush=True)
+        try:
+            from unitree_sdk2py.core.channel import ChannelSubscriber
+            from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_
+            # Re-create subscriptions
+            sub1 = ChannelSubscriber("rt/unitree/slam_mapping/points", PointCloud2_)
+            sub1.Init(self._node._on_mapping_cloud, 10)
+            sub2 = ChannelSubscriber("rt/unitree/slam_relocation/points", PointCloud2_)
+            sub2.Init(self._node._on_mapping_cloud, 10)
+            # Replace old refs
+            self._node._dds_subs = [s for s in self._node._dds_subs
+                                    if not hasattr(s, '_topic') or 'points' not in str(getattr(s, '_topic', ''))]
+            self._node._dds_subs.extend([sub1, sub2])
+            print("[SpatialPlugin] DDS re-subscribed successfully", flush=True)
+        except Exception as e:
+            print(f"[SpatialPlugin] DDS re-subscribe failed: {e}", flush=True)
 
     def start(self) -> None:
         """Auto-start mapping on plugin start. Always mapping, always observing."""
@@ -2757,492 +2696,4 @@ def run_realsense_process(namespace: str) -> None:
         node.stop_capture()
         node.destroy_node()
         rclpy.shutdown()
-
-
-# ── FAST-LIO2 Plugin ──────────────────────────────────────────────────────────
-
-FASTLIO_ODOM_HZ = 10           # expected odometry rate from FAST-LIO2
-FASTLIO_MAP_PUBLISH_HZ = 1.0  # map publish to dashboard
-FASTLIO_MAP_SAVE_INTERVAL = 5.0
-FASTLIO_MAX_MAP_POINTS = 50000
-FASTLIO_VOXEL_SIZE = 0.05      # 5cm
-
-
-class _FastLioNode(Node):
-    """ROS2 node that subscribes to FAST-LIO2 output (odom + registered cloud)
-    and publishes dashboard-friendly formats on custom topics."""
-
-    import numpy as np
-
-    def __init__(self, pos_topic: str, map_topic: str, plugin_config: dict):
-        super().__init__("g1_fastlio")
-        self._pos_pub = self.create_publisher(String, pos_topic, _LOW_LAT_QOS)
-
-        from std_msgs.msg import UInt8MultiArray
-        self._map_pub = self.create_publisher(UInt8MultiArray, map_topic, _LOW_LAT_QOS)
-
-        self._map_dir = plugin_config.get("map_dir", "/opt/phanthy-motus/data/maps")
-        os.makedirs(self._map_dir, exist_ok=True)
-
-        # State
-        self._current_pose: dict | None = None
-        self._map_status: str = "idle"  # idle | mapping | localized
-        self._active_map: str | None = None
-        self._lock = threading.Lock()
-
-        # Voxel map buffer
-        self._map_buffer: dict[tuple, tuple] = {}
-        self._map_buffer_lock = threading.Lock()
-        self._map_buffer_dirty = False
-
-        # Timing
-        self._last_map_publish_time: float = 0.0
-        self._last_map_save_time: float = 0.0
-
-        # Subscribe to FAST-LIO2 output topics (Domain 42, same as this node)
-        from nav_msgs.msg import Odometry
-        from sensor_msgs.msg import PointCloud2
-        self._odom_sub = self.create_subscription(
-            Odometry, "/fastlio/odom", self._on_odom, _LOW_LAT_QOS)
-        self._cloud_sub = self.create_subscription(
-            PointCloud2, "/fastlio/cloud_registered", self._on_cloud, _LOW_LAT_QOS)
-
-        self.get_logger().info(f"FastLioNode ready — pos: {pos_topic}, map: {map_topic}")
-
-    def _on_odom(self, msg) -> None:
-        """Process nav_msgs/Odometry from FAST-LIO2."""
-        pos = msg.pose.pose.position
-        ori = msg.pose.pose.orientation
-        # Convert quaternion to yaw
-        yaw = math.atan2(2 * (ori.w * ori.z + ori.x * ori.y),
-                         1 - 2 * (ori.y ** 2 + ori.z ** 2))
-        with self._lock:
-            self._current_pose = {"x": pos.x, "y": pos.y, "z": pos.z, "yaw": round(yaw, 3)}
-
-        # Publish pos as JSON
-        pose_json = json.dumps({
-            "x": round(pos.x, 3),
-            "y": round(pos.y, 3),
-            "z": round(pos.z, 3),
-            "yaw": round(yaw, 3),
-            "status": self._map_status,
-            "map": self._active_map,
-        })
-        ros_msg = String()
-        ros_msg.data = pose_json
-        self._pos_pub.publish(ros_msg)
-
-    def _on_cloud(self, msg) -> None:
-        """Process sensor_msgs/PointCloud2 (registered cloud) from FAST-LIO2."""
-        np = _FastLioNode.np
-        if self._map_status != "mapping":
-            return
-
-        # Parse PointCloud2
-        point_step = msg.point_step
-        total_points = msg.width * msg.height
-        if total_points == 0:
-            return
-
-        data = bytes(msg.data)
-        # Find field offsets
-        field_offsets = {}
-        for f in msg.fields:
-            field_offsets[f.name] = f.offset
-
-        x_off = field_offsets.get("x", 0)
-        y_off = field_offsets.get("y", 4)
-        z_off = field_offsets.get("z", 8)
-
-        num_points = min(total_points, 20000)
-        if len(data) < num_points * point_step:
-            num_points = len(data) // point_step
-        if num_points == 0:
-            return
-
-        raw = np.frombuffer(data, dtype=np.uint8, count=num_points * point_step)
-        raw = raw.reshape(num_points, point_step)
-
-        x = raw[:, x_off:x_off+4].copy().view(np.float32).ravel()
-        y = raw[:, y_off:y_off+4].copy().view(np.float32).ravel()
-        z = raw[:, z_off:z_off+4].copy().view(np.float32).ravel()
-
-        valid = (np.isfinite(x) & np.isfinite(y) & np.isfinite(z) &
-                 (np.abs(x) < 50) & (np.abs(y) < 50) & (np.abs(z) < 20))
-        x, y, z = x[valid], y[valid], z[valid]
-        if len(x) == 0:
-            return
-
-        pts = np.column_stack([x, y, z]).astype(np.float32)
-
-        # Merge into voxel buffer
-        voxel_size = FASTLIO_VOXEL_SIZE
-        ix = (pts[:, 0] / voxel_size).astype(np.int32)
-        iy = (pts[:, 1] / voxel_size).astype(np.int32)
-        iz = (pts[:, 2] / voxel_size).astype(np.int32)
-
-        with self._map_buffer_lock:
-            for j in range(len(pts)):
-                key = (int(ix[j]), int(iy[j]), int(iz[j]))
-                if key not in self._map_buffer:
-                    self._map_buffer[key] = (float(pts[j, 0]), float(pts[j, 1]), float(pts[j, 2]))
-            self._map_buffer_dirty = True
-
-        self._maybe_publish_map()
-
-    def _maybe_publish_map(self) -> None:
-        """Publish full 3D voxel map at 1Hz in sensor/mapping format."""
-        np = _FastLioNode.np
-        now = time.monotonic()
-        if now - self._last_map_publish_time < (1.0 / FASTLIO_MAP_PUBLISH_HZ):
-            return
-        self._last_map_publish_time = now
-
-        with self._lock:
-            pose = self._current_pose
-        robot_x = pose["x"] if pose else 0.0
-        robot_y = pose["y"] if pose else 0.0
-        robot_yaw = pose["yaw"] if pose else 0.0
-
-        with self._map_buffer_lock:
-            if not self._map_buffer:
-                return
-            all_points = list(self._map_buffer.values())
-
-        pts = np.array(all_points, dtype=np.float32)
-        num_points = len(pts)
-        if num_points > FASTLIO_MAX_MAP_POINTS:
-            indices = np.random.choice(num_points, FASTLIO_MAX_MAP_POINTS, replace=False)
-            pts = pts[indices]
-            num_points = FASTLIO_MAX_MAP_POINTS
-
-        # Binary: [float32 robot_x, robot_y, robot_yaw][uint8 flags][uint32 N][float32 x,y,z × N]
-        flags = 0x03  # full_map=1, has_z=1
-        header = struct.pack('<fffBI', robot_x, robot_y, robot_yaw, flags, num_points)
-        body = pts.tobytes()
-
-        from std_msgs.msg import UInt8MultiArray
-        ros_msg = UInt8MultiArray()
-        ros_msg.data = list(header + body)
-        self._map_pub.publish(ros_msg)
-
-    def save_map(self, map_name: str) -> str:
-        """Save current map buffer to PCD file."""
-        np = _FastLioNode.np
-        with self._map_buffer_lock:
-            if not self._map_buffer:
-                return ""
-            all_points = list(self._map_buffer.values())
-
-        pts = np.array(all_points, dtype=np.float32)
-        pcd_path = os.path.join(self._map_dir, f"{map_name}.pcd")
-
-        # Write ASCII PCD
-        with open(pcd_path, "w") as f:
-            f.write("# .PCD v0.7 - Point Cloud Data file format\n")
-            f.write("VERSION 0.7\n")
-            f.write("FIELDS x y z\n")
-            f.write("SIZE 4 4 4\n")
-            f.write("TYPE F F F\n")
-            f.write("COUNT 1 1 1\n")
-            f.write(f"WIDTH {len(pts)}\n")
-            f.write("HEIGHT 1\n")
-            f.write("VIEWPOINT 0 0 0 1 0 0 0\n")
-            f.write(f"POINTS {len(pts)}\n")
-            f.write("DATA ascii\n")
-            for p in pts:
-                f.write(f"{p[0]:.6f} {p[1]:.6f} {p[2]:.6f}\n")
-
-        self.get_logger().info(f"[fastlio] Saved PCD: {pcd_path} ({len(pts)} points)")
-        return pcd_path
-
-    def clear_map(self) -> None:
-        """Clear the voxel map buffer."""
-        with self._map_buffer_lock:
-            self._map_buffer.clear()
-            self._map_buffer_dirty = False
-
-
-class FastLioPlugin:
-    """FAST-LIO2 LiDAR-Inertial Odometry plugin — runs FAST-LIO2 as a subprocess,
-    converts Unitree DDS data to standard ROS2, and exposes dashboard topics + actuator tools."""
-
-    PREFIX = "fastlio"
-
-    def __init__(self, plugin_config: dict, namespace: str, executor):
-        self._namespace = namespace
-        self._config = plugin_config
-        self._executor = executor
-        self._pos_topic = f"/{namespace}/fastlio/pos"
-        self._map_topic = f"/{namespace}/fastlio/map"
-
-        self._node = _FastLioNode(self._pos_topic, self._map_topic, plugin_config)
-        executor.add_node(self._node)
-
-        # FAST-LIO2 subprocess handle
-        self._fastlio_proc = None
-
-        # Converter: DDS Domain 0 → ROS2 Domain 42 (runs in background thread)
-        self._converter_running = False
-        self._converter_thread = None
-
-        # Config file for FAST-LIO2
-        self._config_file = plugin_config.get("config_file", "/work/fastlio_config/mid360.yaml")
-
-    def get_tools(self) -> list:
-        return [self._pos_tool(), self._map_tool(), self._actuator_tool()]
-
-    def _pos_tool(self) -> dict:
-        return {
-            "name": "fastlio_pos",
-            "type": "sensor",
-            "description": f"FAST-LIO2 odometry — real-time pose (x, y, z, yaw) at 10Hz. JSON to {self._pos_topic}",
-            "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._pos_topic, "format": "data/json"}],
-        }
-
-    def _map_tool(self) -> dict:
-        return {
-            "name": "fastlio_map",
-            "type": "sensor",
-            "description": f"FAST-LIO2 3D mapping — voxel point cloud with robot position. Binary format: [float32 robot_x,y,yaw][uint8 flags][uint32 N][float32 x,y,z × N]. 1Hz to {self._map_topic}",
-            "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._map_topic, "format": "sensor/mapping"}],
-        }
-
-    def _actuator_tool(self) -> dict:
-        return {
-            "name": "fastlio",
-            "type": "actuator",
-            "description": "FAST-LIO2 SLAM control — start/stop mapping, save maps, relocalize.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["start_mapping", "stop_mapping", "save_map",
-                                 "relocalize", "list_maps", "status"],
-                        "description": "Action to perform",
-                    },
-                    "map_name": {"type": "string", "description": "Map name (for save/relocalize)"},
-                },
-                "required": ["action"],
-                "x-action-params": {
-                    "start_mapping":  {"params": ["map_name"], "description": "Start FAST-LIO2 mapping (optional name)"},
-                    "stop_mapping":   {"params": [],           "description": "Stop mapping and save"},
-                    "save_map":       {"params": ["map_name"], "description": "Save current map to PCD"},
-                    "relocalize":     {"params": ["map_name"], "description": "Load map and relocalize"},
-                    "list_maps":      {"params": [],           "description": "List saved maps"},
-                    "status":         {"params": [],           "description": "Get FAST-LIO2 status"},
-                },
-            },
-        }
-
-    def start(self) -> None:
-        """Start the FAST-LIO2 subprocess and converter."""
-        self._start_converter()
-        self._start_fastlio()
-        print("[FastLioPlugin] started", flush=True)
-
-    def stop(self) -> None:
-        """Stop FAST-LIO2 and converter."""
-        self._stop_fastlio()
-        self._stop_converter()
-        print("[FastLioPlugin] stopped", flush=True)
-
-    def dispatch(self, action: str, args: dict) -> dict | None:
-        if action == "start_mapping":
-            map_name = args.get("map_name", f"fastlio_{int(time.time())}")
-            self._node._active_map = map_name
-            self._node._map_status = "mapping"
-            self._node.clear_map()
-            if not self._is_fastlio_running():
-                self._start_fastlio()
-            return {"status": "mapping", "map_name": map_name}
-
-        elif action == "stop_mapping":
-            if self._node._active_map and self._node._map_status == "mapping":
-                pcd_path = self._node.save_map(self._node._active_map)
-                result = {"status": "stopped", "map_name": self._node._active_map, "pcd_path": pcd_path}
-            else:
-                result = {"status": "not_mapping"}
-            self._node._map_status = "idle"
-            return result
-
-        elif action == "save_map":
-            map_name = args.get("map_name", self._node._active_map or f"fastlio_{int(time.time())}")
-            pcd_path = self._node.save_map(map_name)
-            if pcd_path:
-                return {"status": "saved", "map_name": map_name, "pcd_path": pcd_path}
-            return {"status": "error", "message": "No map data to save"}
-
-        elif action == "relocalize":
-            map_name = args.get("map_name", "")
-            if not map_name:
-                return {"status": "error", "message": "map_name required"}
-            pcd_path = os.path.join(self._node._map_dir, f"{map_name}.pcd")
-            if not os.path.exists(pcd_path):
-                return {"status": "error", "message": f"Map file not found: {pcd_path}"}
-            # TODO: Implement ICP-based relocalization via FAST-LIO2 service
-            # For now, mark as localized and load the map
-            self._node._active_map = map_name
-            self._node._map_status = "localized"
-            return {"status": "localized", "map_name": map_name, "pcd_path": pcd_path}
-
-        elif action == "list_maps":
-            map_dir = self._node._map_dir
-            maps = []
-            if os.path.isdir(map_dir):
-                for f in sorted(os.listdir(map_dir)):
-                    if f.endswith(".pcd") and f.startswith("fastlio_"):
-                        maps.append(f[:-4])  # strip .pcd
-            return {"maps": maps}
-
-        elif action == "status":
-            return {
-                "status": self._node._map_status,
-                "active_map": self._node._active_map,
-                "fastlio_running": self._is_fastlio_running(),
-                "converter_running": self._converter_running,
-                "map_points": len(self._node._map_buffer),
-            }
-
-        return None
-
-    def _start_fastlio(self) -> None:
-        """Launch FAST-LIO2 ROS2 node as subprocess."""
-        import subprocess
-        if self._is_fastlio_running():
-            return
-        cmd = [
-            "/bin/bash", "-c",
-            f"source /opt/ros/humble/setup.bash && "
-            f"source /opt/fastlio/install/setup.bash 2>/dev/null; "
-            f"ros2 launch fast_lio mapping.launch.py config_file:={self._config_file}"
-        ]
-        try:
-            self._fastlio_proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                env={**os.environ, "ROS_DOMAIN_ID": "42", "RMW_IMPLEMENTATION": "rmw_fastrtps_cpp"}
-            )
-            print(f"[FastLioPlugin] FAST-LIO2 subprocess started (pid={self._fastlio_proc.pid})", flush=True)
-        except Exception as e:
-            print(f"[FastLioPlugin] Failed to start FAST-LIO2: {e}", flush=True)
-
-    def _stop_fastlio(self) -> None:
-        if self._fastlio_proc and self._fastlio_proc.poll() is None:
-            self._fastlio_proc.terminate()
-            try:
-                self._fastlio_proc.wait(timeout=5)
-            except Exception:
-                self._fastlio_proc.kill()
-            print("[FastLioPlugin] FAST-LIO2 subprocess stopped", flush=True)
-        self._fastlio_proc = None
-
-    def _is_fastlio_running(self) -> bool:
-        return self._fastlio_proc is not None and self._fastlio_proc.poll() is None
-
-    def _start_converter(self) -> None:
-        """Start background thread that subscribes to Domain 0 LiDAR/IMU via CycloneDDS
-        and republishes as standard ROS2 messages on Domain 42 for FAST-LIO2."""
-        if self._converter_running:
-            return
-        self._converter_running = True
-        self._converter_thread = threading.Thread(
-            target=self._converter_loop, daemon=True, name="fastlio_converter")
-        self._converter_thread.start()
-
-    def _stop_converter(self) -> None:
-        self._converter_running = False
-
-    def _converter_loop(self) -> None:
-        """Convert Unitree DDS (Domain 0) IMUState_ and PointCloud2_ to standard ROS2 msgs."""
-        import numpy as np
-
-        # Create a separate ROS2 node for publishing converted data
-        converter_node = Node("fastlio_converter")
-        self._executor.add_node(converter_node)
-
-        from sensor_msgs.msg import Imu, PointCloud2, PointField
-        from std_msgs.msg import Header as RosHeader
-        from builtin_interfaces.msg import Time
-
-        imu_pub = converter_node.create_publisher(Imu, "/fastlio/imu", _LOW_LAT_QOS)
-        cloud_pub = converter_node.create_publisher(PointCloud2, "/fastlio/cloud", _LOW_LAT_QOS)
-
-        # Subscribe to DDS Domain 0
-        try:
-            from unitree_sdk2py.core.channel import ChannelSubscriber
-            from unitree_sdk2py.idl.unitree_go.msg.dds_ import IMUState_
-            from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_
-        except ImportError as e:
-            converter_node.get_logger().error(f"[fastlio_converter] Import failed: {e}")
-            return
-
-        seq = [0]  # mutable counter
-
-        def _on_imu(msg):
-            if not self._converter_running:
-                return
-            imu_msg = Imu()
-            now = converter_node.get_clock().now().to_msg()
-            imu_msg.header.stamp = now
-            imu_msg.header.frame_id = "imu_link"
-
-            # IMUState_: quaternion[4] (w,x,y,z), gyroscope[3], accelerometer[3]
-            imu_msg.orientation.w = float(msg.quaternion[0])
-            imu_msg.orientation.x = float(msg.quaternion[1])
-            imu_msg.orientation.y = float(msg.quaternion[2])
-            imu_msg.orientation.z = float(msg.quaternion[3])
-            imu_msg.angular_velocity.x = float(msg.gyroscope[0])
-            imu_msg.angular_velocity.y = float(msg.gyroscope[1])
-            imu_msg.angular_velocity.z = float(msg.gyroscope[2])
-            imu_msg.linear_acceleration.x = float(msg.accelerometer[0])
-            imu_msg.linear_acceleration.y = float(msg.accelerometer[1])
-            imu_msg.linear_acceleration.z = float(msg.accelerometer[2])
-
-            imu_pub.publish(imu_msg)
-
-        def _on_cloud(msg):
-            if not self._converter_running:
-                return
-            pc_msg = PointCloud2()
-            now = converter_node.get_clock().now().to_msg()
-            pc_msg.header.stamp = now
-            pc_msg.header.frame_id = "lidar_link"
-            pc_msg.height = msg.height
-            pc_msg.width = msg.width
-            pc_msg.is_bigendian = msg.is_bigendian
-            pc_msg.point_step = msg.point_step
-            pc_msg.row_step = msg.row_step
-            pc_msg.is_dense = msg.is_dense
-            pc_msg.data = bytes(msg.data)
-
-            # Convert fields
-            pc_msg.fields = []
-            for f in msg.fields:
-                pf = PointField()
-                pf.name = f.name
-                pf.offset = f.offset
-                pf.datatype = f.datatype
-                pf.count = f.count
-                pc_msg.fields.append(pf)
-
-            cloud_pub.publish(pc_msg)
-
-        # Init DDS subscriptions (Domain 0 was already initialized in main.py)
-        imu_sub = ChannelSubscriber("rt/utlidar/imu_livox_mid360", IMUState_)
-        imu_sub.Init(_on_imu, 10)
-        cloud_sub = ChannelSubscriber("rt/utlidar/cloud_livox_mid360", PointCloud2_)
-        cloud_sub.Init(_on_cloud, 10)
-
-        converter_node.get_logger().info("[fastlio_converter] DDS→ROS2 converter active "
-                                         "(imu@200Hz, cloud@10Hz → /fastlio/imu, /fastlio/cloud)")
-
-        # Keep thread alive
-        while self._converter_running:
-            time.sleep(0.5)
-
-        # Cleanup
-        converter_node.destroy_node()
         print("[realsense-proc] stopped", flush=True)

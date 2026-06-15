@@ -13,7 +13,6 @@ RUN apt-get update && \
         build-essential \
         curl \
         git \
-        unzip \
         libusb-1.0-0 && \
     rm -rf /var/lib/apt/lists/*
 
@@ -35,26 +34,18 @@ ENV LD_LIBRARY_PATH=/opt/cyclonedds/lib:${LD_LIBRARY_PATH}
 
 RUN pip3 install --no-cache-dir --no-binary cyclonedds -i ${PYPI_MIRROR} cyclonedds==0.10.5
 
-
-
-# FAST-LIO2: must be built natively on ARM64 (QEMU cannot handle libpcl-dev).
-# Build on target with: /work/fastlio_config/build_fastlio.sh
-# The built package is expected at /opt/fastlio/install/ (volume mount or baked into a derived image).
-
 # Isolate rclpy topics (domain 42) from unitree_sdk2py's domain 0.
 # Force FastDDS to match agent-core (which has no CycloneDDS rmw installed).
 ENV ROS_DOMAIN_ID=42
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ENV FASTDDS_BUILTIN_TRANSPORTS=UDPv4
 
-# Copy source files last (most frequently changed → least cache invalidation)
 COPY unitree_sdk2py/ /work/unitree_sdk2py/
 COPY resource/       /work/resource/
 COPY main.py   /work/main.py
 COPY device.py /work/device.py
 COPY scan_context.py /work/scan_context.py
 COPY config.yaml /work/config.yaml
-COPY fastlio_config/ /work/fastlio_config/
 
 ENV PYTHONPATH=/work
 ENV PYTHONUNBUFFERED=1

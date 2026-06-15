@@ -26,7 +26,3 @@ plugins:
     db_path: /opt/phanthy-motus/data/spatial.db
   motion_switcher:
     enabled: true
-  fastlio:
-    enabled: true
-    map_dir: /opt/phanthy-motus/data/maps
-    config_file: /work/fastlio_config/mid360.yaml
