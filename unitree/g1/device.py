@@ -673,6 +673,7 @@ class LocoPlugin:
         if self._move_timer:
             self._move_timer.cancel()
             self._move_timer = None
+        self._client.StopMove()
 
     def _auto_stop(self):
         """Timer 回调：自动停止运动"""
