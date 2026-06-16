@@ -227,7 +227,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
         print(f"[SmartMotion] event: {event_type} | {json.dumps(data)}", flush=True)
 
     def do_stop(reason_str):
-        nonlocal state, current_cmd, speed_zone, move_timer
+        nonlocal state, current_cmd, speed_zone, move_timer, stop_repeat_count
         if move_timer:
             move_timer.cancel()
             move_timer = None
@@ -236,6 +236,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
         state = MotionState.IDLE
         current_cmd = None
         speed_zone = SpeedZone.NORMAL
+        stop_repeat_count = 3  # repeat StopMove to ensure controller stops
         if was_moving:
             event_data = {"reason": reason_str}
             if reason_str == "obstacle":
