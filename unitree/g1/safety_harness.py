@@ -600,6 +600,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
             lateral = lateral_obstacle
 
         if state == MotionState.MOVING:
+            cmd = current_cmd  # snapshot to avoid race condition
             if dist <= stop_threshold:
                 if speed_zone != SpeedZone.STOPPED:
                     speed_zone = SpeedZone.STOPPED
@@ -607,8 +608,8 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
             elif dist <= decel_threshold or lateral:
                 if speed_zone != SpeedZone.DECELERATED:
                     speed_zone = SpeedZone.DECELERATED
-                    if current_cmd:
-                        dvx, dvy, dvyaw = clamp(current_cmd["vx"], current_cmd["vy"], current_cmd["vyaw"], SpeedZone.DECELERATED)
+                    if cmd:
+                        dvx, dvy, dvyaw = clamp(cmd["vx"], cmd["vy"], cmd["vyaw"], SpeedZone.DECELERATED)
                         loco_client.Move(dvx, dvy, dvyaw, True)
                         with obstacle_lock:
                             od = obstacle_dist
@@ -616,14 +617,14 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
                         publish_event("motion_decelerate", {
                             "obstacle_distance": round(od, 2),
                             "obstacle_angle_deg": round(math.degrees(oa), 1),
-                            "original_speed": {"vx": current_cmd["vx"], "vy": current_cmd["vy"], "vyaw": current_cmd["vyaw"]},
+                            "original_speed": {"vx": cmd["vx"], "vy": cmd["vy"], "vyaw": cmd["vyaw"]},
                             "new_speed": {"vx": dvx, "vy": dvy, "vyaw": dvyaw},
                         })
             else:
                 if speed_zone == SpeedZone.DECELERATED:
                     speed_zone = SpeedZone.NORMAL
-                    if current_cmd:
-                        cvx, cvy, cvyaw = clamp(current_cmd["vx"], current_cmd["vy"], current_cmd["vyaw"], SpeedZone.NORMAL)
+                    if cmd:
+                        cvx, cvy, cvyaw = clamp(cmd["vx"], cmd["vy"], cmd["vyaw"], SpeedZone.NORMAL)
                         loco_client.Move(cvx, cvy, cvyaw, True)
                         publish_event("motion_resume", {"speed": {"vx": cvx, "vy": cvy, "vyaw": cvyaw}})
 
