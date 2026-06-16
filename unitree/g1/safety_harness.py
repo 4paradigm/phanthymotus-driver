@@ -385,7 +385,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
         state = MotionState.IDLE
         current_cmd = None
         speed_zone = SpeedZone.NORMAL
-        stop_repeat_count = 5  # repeat StopMove in main loop to ensure it takes effect
+        stop_repeat_count = 3  # repeat StopMove in main loop to ensure it takes effect
         if was_active:
             event_data = {"reason": reason_str}
             if extra:
