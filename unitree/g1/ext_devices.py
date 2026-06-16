@@ -39,19 +39,55 @@ JPEG_QUALITY = 80
 # ── Device Enumeration ────────────────────────────────────────────────────────
 
 def _enumerate_ext_mics() -> list[dict]:
-    """List external USB microphone input devices (excluding RealSense mic)."""
+    """List external USB microphone input devices via arecord -l, fallback to sounddevice."""
+    devices = []
+
+    # Primary: parse arecord -l (works reliably in Docker with /dev/snd mapped)
+    try:
+        output = subprocess.check_output(['arecord', '-l'], text=True, timeout=5, stderr=subprocess.DEVNULL)
+        for line in output.splitlines():
+            if not line.startswith('card '):
+                continue
+            # Format: "card N: NAME [DESC], device M: ..."
+            name_lower = line.lower()
+            if 'realsense' in name_lower or 'intel' in name_lower:
+                continue
+            # Skip NVIDIA APE internal devices
+            if 'ape' in name_lower or 'tegra' in name_lower:
+                continue
+            try:
+                card_part = line.split(':')[0]  # "card N"
+                card_num = int(card_part.split()[1])
+                device_part = line.split('device')[1].split(':')[0].strip()
+                device_num = int(device_part)
+                # Extract description between [ ]
+                desc = line.split('[')[1].split(']')[0] if '[' in line else f"card{card_num}"
+                alsa_id = f"hw:{card_num},{device_num}"
+                devices.append({
+                    "index": card_num,
+                    "device_num": device_num,
+                    "alsa_id": alsa_id,
+                    "name": desc,
+                })
+            except (IndexError, ValueError):
+                continue
+    except Exception as e:
+        log.debug(f"[ext_mic] arecord -l failed: {e}")
+
+    if devices:
+        return devices
+
+    # Fallback: sounddevice
     try:
         import sounddevice as sd
     except ImportError:
-        log.warning("[ext_mic] sounddevice not installed, cannot enumerate mic devices")
+        log.warning("[ext_mic] sounddevice not installed and arecord unavailable")
         return []
 
-    devices = []
     for i, dev in enumerate(sd.query_devices()):
         if dev['max_input_channels'] < 1:
             continue
         name = dev['name'].lower()
-        # Exclude RealSense built-in mic
         if 'realsense' in name or 'intel' in name:
             continue
         devices.append({
@@ -301,16 +337,16 @@ class ExtMicPlugin:
 
     def get_tools(self) -> list:
         # Build dynamic configSchema with enumerated devices
-        device_options = [{"const": d["index"], "title": d["name"]} for d in self._available_devices]
+        device_options = [{"const": d.get("alsa_id", str(d["index"])), "title": d["name"]} for d in self._available_devices]
         tool = dict(TOOLS_EXT_MIC[0])
         tool["configSchema"] = {
             "type": "object",
             "properties": {
                 "device_index": {
-                    "type": "integer",
+                    "type": "string",
                     "description": "音频设备",
                     "scope": "instance",
-                    "oneOf": device_options if device_options else [{"const": 0, "title": "无可用设备"}],
+                    "oneOf": device_options if device_options else [{"const": "", "title": "无可用设备"}],
                 },
                 "device_name": {"type": "string", "description": "设备名称", "scope": "instance"},
             },
@@ -344,17 +380,22 @@ class ExtMicPlugin:
         elif action == "start":
             if not instance_id:
                 raise ValueError("instance_id is required for multiInstance tool")
-            device_index = args.get("device_index")
+            device_id = args.get("device_index")  # alsa_id string like "hw:0,0" or integer index
             device_name = args.get("device_name", "")
-            if device_index is None:
+            if not device_id:
                 # Try to pick first available device
                 if self._available_devices:
-                    device_index = self._available_devices[0]["index"]
+                    device_id = self._available_devices[0].get("alsa_id", self._available_devices[0]["index"])
                     device_name = self._available_devices[0]["name"]
                 else:
                     raise ValueError("No external mic device available")
+            # Try to convert to int for sounddevice numeric index, keep string for alsa_id
+            try:
+                device_id = int(device_id)
+            except (ValueError, TypeError):
+                pass  # keep as string (alsa_id like "hw:0,0")
             if instance_id not in self._nodes:
-                node = _ExtMicNode(device_index, device_name, self._namespace, instance_id)
+                node = _ExtMicNode(device_id, device_name, self._namespace, instance_id)
                 self._executor.add_node(node)
                 self._nodes[instance_id] = node
             return self._nodes[instance_id].start()
