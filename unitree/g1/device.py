@@ -1129,9 +1129,8 @@ class StatePlugin:
 
 # ── LidarPlugin (sensor) ─────────────────────────────────────────────────────
 
-LIDAR_MAX_POINTS     = 5000       # max points per frame for WebSocket
 LIDAR_CLOUD_INTERVAL = 0.1       # 10 Hz throttle (source is 10Hz anyway)
-LIDAR_IMU_INTERVAL   = 0.05      # 20 Hz throttle (source is 200Hz)
+LIDAR_IMU_INTERVAL   = 0.0      # no throttle — publish at full 200Hz for HTMSG
 
 
 class _LidarNode(Node):
@@ -1139,7 +1138,7 @@ class _LidarNode(Node):
 
     def __init__(self, cloud_topic: str, imu_topic: str):
         super().__init__("g1_lidar")
-        # cloud published as raw bytes: [uint32 N][float32 x,y,z,intensity × N]
+        # cloud published as raw passthrough: [uint32 point_step][uint32 total_points][raw PointCloud2 bytes]
         from std_msgs.msg import UInt8MultiArray
         self._cloud_pub = self.create_publisher(UInt8MultiArray, cloud_topic, _LOW_LAT_QOS)
         self._imu_pub   = self.create_publisher(String, imu_topic, _LOW_LAT_QOS)
@@ -1172,54 +1171,21 @@ class _LidarNode(Node):
             return
         self._last_cloud_time = now
 
-        # Parse PointCloud2 fields to find x, y, z, intensity offsets
-        field_map = {}
-        for f in msg.fields:
-            field_map[f.name] = (f.offset, f.datatype)
-
-        x_off = field_map.get("x", (0, 7))[0]
-        y_off = field_map.get("y", (4, 7))[0]
-        z_off = field_map.get("z", (8, 7))[0]
-        # intensity may be named "intensity" or "reflectivity"
-        i_off = None
-        for name in ("intensity", "reflectivity"):
-            if name in field_map:
-                i_off = field_map[name][0]
-                break
-
+        # Passthrough: forward full PointCloud2 data without downsampling
+        # Format: [uint32 point_step][uint32 total_points][raw bytes]
         point_step = msg.point_step
         total_points = msg.width * msg.height
         data = bytes(msg.data)
 
-        # Downsample if needed
-        stride = max(1, total_points // LIDAR_MAX_POINTS)
-        num_out = min(total_points, LIDAR_MAX_POINTS)
-
-        # Pack binary: [uint32 num_points][float32 x, y, z, intensity × N]
-        out = struct.pack('<I', num_out)
-        idx = 0
-        count = 0
-        for i in range(0, total_points * point_step, point_step * stride):
-            if count >= num_out:
-                break
-            if i + point_step > len(data):
-                break
-            x = struct.unpack_from('<f', data, i + x_off)[0]
-            y = struct.unpack_from('<f', data, i + y_off)[0]
-            z = struct.unpack_from('<f', data, i + z_off)[0]
-            intensity = struct.unpack_from('<f', data, i + i_off)[0] if i_off is not None else 0.0
-            out += struct.pack('<ffff', x, y, z, intensity)
-            count += 1
-
-        # Publish as UInt8MultiArray (binary passthrough)
+        header = struct.pack('<II', point_step, total_points)
         from std_msgs.msg import UInt8MultiArray
         ros_msg = UInt8MultiArray()
-        ros_msg.data = list(out)
+        ros_msg.data = list(header + data)
         self._cloud_pub.publish(ros_msg)
 
     def _on_imu(self, msg) -> None:
         now = time.monotonic()
-        if now - self._last_imu_time < LIDAR_IMU_INTERVAL:
+        if LIDAR_IMU_INTERVAL > 0 and now - self._last_imu_time < LIDAR_IMU_INTERVAL:
             return
         self._last_imu_time = now
 
@@ -1251,7 +1217,7 @@ class LidarPlugin:
         return {
             "name": "lidar_cloud",
             "type": "sensor",
-            "description": f"Livox Mid-360 point cloud — up to {LIDAR_MAX_POINTS} points per frame at 10Hz. Binary format: [uint32 N][float32 x,y,z,intensity × N]. Publishes to {self._cloud_topic}",
+            "description": f"Livox Mid-360 full point cloud passthrough at 10Hz. Binary format: [uint32 point_step][uint32 total_points][raw PointCloud2 bytes]. Publishes to {self._cloud_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._cloud_topic, "format": "sensor/pointcloud"}],
         }
@@ -1260,7 +1226,7 @@ class LidarPlugin:
         return {
             "name": "lidar_imu",
             "type": "sensor",
-            "description": f"Livox Mid-360 IMU — quaternion, gyroscope, accelerometer, rpy at 20Hz. Publishes to {self._imu_topic}",
+            "description": f"Livox Mid-360 IMU — quaternion, gyroscope, accelerometer, rpy at 200Hz. Publishes to {self._imu_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._imu_topic, "format": "data/json"}],
         }
