@@ -300,7 +300,22 @@ class ExtMicPlugin:
             log.info(f"  [{d['index']}] {d['name']}")
 
     def get_tools(self) -> list:
-        return TOOLS_EXT_MIC
+        # Build dynamic configSchema with enumerated devices
+        device_options = [{"const": d["index"], "title": d["name"]} for d in self._available_devices]
+        tool = dict(TOOLS_EXT_MIC[0])
+        tool["configSchema"] = {
+            "type": "object",
+            "properties": {
+                "device_index": {
+                    "type": "integer",
+                    "description": "音频设备",
+                    "scope": "instance",
+                    "oneOf": device_options if device_options else [{"const": 0, "title": "无可用设备"}],
+                },
+                "device_name": {"type": "string", "description": "设备名称", "scope": "instance"},
+            },
+        }
+        return [tool]
 
     def start(self) -> None:
         pass  # Don't auto-start — wait for canvas to start instances
@@ -375,7 +390,24 @@ class ExtCameraPlugin:
             log.info(f"  {d['path']} — {d['name']}")
 
     def get_tools(self) -> list:
-        return TOOLS_EXT_CAMERA
+        # Build dynamic configSchema with enumerated devices
+        device_options = [{"const": d["path"], "title": f"{d['name']} ({d['path']})"} for d in self._available_devices]
+        tool = dict(TOOLS_EXT_CAMERA[0])
+        tool["configSchema"] = {
+            "type": "object",
+            "properties": {
+                "device_path": {
+                    "type": "string",
+                    "description": "摄像头设备",
+                    "scope": "instance",
+                    "oneOf": device_options if device_options else [{"const": "", "title": "无可用设备"}],
+                },
+                "device_name": {"type": "string", "description": "设备名称", "scope": "instance"},
+                "fps": {"type": "integer", "description": "帧率", "default": 15, "scope": "instance"},
+                "resolution": {"type": "string", "description": "分辨率 (如 1920x1080)", "default": "1920x1080", "scope": "instance"},
+            },
+        }
+        return [tool]
 
     def start(self) -> None:
         pass  # Don't auto-start
