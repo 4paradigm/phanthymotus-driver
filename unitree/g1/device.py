@@ -1183,21 +1183,49 @@ class _LidarNode(Node):
             self.get_logger().warn(f"LidarNode: failed to subscribe imu: {e}")
 
     def _on_cloud(self, msg) -> None:
+        import numpy as np
+
         now = time.monotonic()
         if now - self._last_cloud_time < LIDAR_CLOUD_INTERVAL:
             return
         self._last_cloud_time = now
 
-        # Passthrough: forward full PointCloud2 data without downsampling
-        # Format: [uint32 point_step][uint32 total_points][raw bytes]
+        # Parse field offsets for y and z (inverted mount correction)
         point_step = msg.point_step
         total_points = msg.width * msg.height
-        data = bytes(msg.data)
+        data = bytearray(msg.data)
 
-        header = struct.pack('<II', point_step, total_points)
+        if total_points == 0 or len(data) < point_step:
+            return
+
+        # Get y, z offsets from PointCloud2 fields
+        y_off = 4  # default
+        z_off = 8  # default
+        for f in msg.fields:
+            if f.name == "y":
+                y_off = f.offset
+            elif f.name == "z":
+                z_off = f.offset
+
+        # Correct for inverted mount (rotate 180° around x-axis): negate y and z
+        num_points = min(total_points, len(data) // point_step)
+        buf = np.frombuffer(data, dtype=np.uint8, count=num_points * point_step).reshape(num_points, point_step).copy()
+
+        # Negate y values (float32 at y_off)
+        y_vals = buf[:, y_off:y_off+4].view(np.float32)
+        y_vals *= -1.0
+
+        # Negate z values (float32 at z_off)
+        z_vals = buf[:, z_off:z_off+4].view(np.float32)
+        z_vals *= -1.0
+
+        corrected_data = buf.tobytes()
+
+        # Format: [uint32 point_step][uint32 total_points][corrected raw bytes]
+        header = struct.pack('<II', point_step, num_points)
         from std_msgs.msg import UInt8MultiArray
         ros_msg = UInt8MultiArray()
-        ros_msg.data = list(header + data)
+        ros_msg.data = list(header + corrected_data)
         self._cloud_pub.publish(ros_msg)
 
     def _on_imu(self, msg) -> None:
