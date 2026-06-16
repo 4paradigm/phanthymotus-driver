@@ -26,6 +26,10 @@ plugins:
     db_path: /opt/phanthy-motus/data/spatial.db
   motion_switcher:
     enabled: true
+  ext_mic:
+    enabled: true
+  ext_camera:
+    enabled: true
 
 safety_harness:
   enabled: true
