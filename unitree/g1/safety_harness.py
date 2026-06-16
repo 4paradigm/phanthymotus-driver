@@ -359,12 +359,14 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
     last_lowstate_time = time.monotonic()
     tilt_triggered = False
     foot_airborne_start = 0.0
+    foot_force_seen_nonzero = False  # only enable airborne detection after seeing real force
     max_motor_temp = 0.0
     last_temp_check = 0.0
+    stop_repeat_count = 0  # counter for repeated StopMove after emergency
 
     def emergency_stop(reason_str, extra=None):
         """Emergency stop with optional damp mode for tilt."""
-        nonlocal state, current_cmd, speed_zone, move_timer
+        nonlocal state, current_cmd, speed_zone, move_timer, stop_repeat_count
         if move_timer:
             move_timer.cancel()
             move_timer = None
@@ -383,11 +385,13 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
         state = MotionState.IDLE
         current_cmd = None
         speed_zone = SpeedZone.NORMAL
+        stop_repeat_count = 5  # repeat StopMove in main loop to ensure it takes effect
         if was_active:
             event_data = {"reason": reason_str}
             if extra:
                 event_data.update(extra)
             publish_event("safety_stop", event_data)
+            print(f"[SmartMotion] emergency_stop({reason_str}): StopMove sent", flush=True)
 
     # ── LowState DDS Subscription (IMU tilt + joint temp) ──
     def on_lowstate(msg):
@@ -433,24 +437,35 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
 
     # ── OdomState DDS Subscription (foot force) ──
     def on_odom(msg):
-        nonlocal foot_airborne_start
+        nonlocal foot_airborne_start, foot_force_seen_nonzero
 
         if state != MotionState.MOVING:
             foot_airborne_start = 0.0
             return
 
         forces = list(msg.foot_force)
-        all_airborne = all(f < foot_force_min for f in forces[:4]) if len(forces) >= 4 else False
+        if len(forces) < 4:
+            return
+
+        all_airborne = all(f < foot_force_min for f in forces[:4])
+
+        # Only enable airborne detection after seeing at least one valid (non-zero) reading
+        if not foot_force_seen_nonzero:
+            if not all_airborne:
+                foot_force_seen_nonzero = True
+                print(f"[SmartMotion] foot_force sensor active: {[round(f,1) for f in forces[:4]]}", flush=True)
+            return  # skip detection until sensor is confirmed working
 
         if all_airborne:
             now = time.monotonic()
             if foot_airborne_start == 0.0:
                 foot_airborne_start = now
             elif now - foot_airborne_start > foot_airborne_timeout:
+                airborne_ms = round((now - foot_airborne_start) * 1000)
                 foot_airborne_start = 0.0
                 emergency_stop("foot_airborne", {
                     "foot_forces": [round(f, 1) for f in forces[:4]],
-                    "airborne_duration_ms": round((now - foot_airborne_start) * 1000),
+                    "airborne_duration_ms": airborne_ms,
                 })
         else:
             foot_airborne_start = 0.0
@@ -693,6 +708,11 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
         if now - last_obstacle_check >= 0.1:
             last_obstacle_check = now
             process_safety_checks()
+
+            # Repeat StopMove after emergency_stop to ensure controller receives it
+            if stop_repeat_count > 0 and state == MotionState.IDLE:
+                loco_client.StopMove()
+                stop_repeat_count -= 1
 
         # Spin ROS2 (non-blocking)
         executor.spin_once(timeout_sec=0)
