@@ -65,7 +65,8 @@ python main.py
 Want to add support for new hardware? See the **[Driver Development Guide](README_dev.md)** for the full specification, including:
 
 - MCP protocol implementation (JSON-RPC 2.0 methods)
-- Tool definition spec (`inputSchema`, `configSchema`, `x-action-params`)
+- Tool definition spec (`inputSchema`, `configSchema`, `multiInstance`, `x-action-params`)
+- Instance management (`multiInstance` flag, `scope` for config fields)
 - Plugin lifecycle (`__init__`, `get_tool`, `start`, `stop`, `dispatch`)
 - `driver.yaml` and `config.yaml` metadata format
 - Registration and heartbeat with Agent Core

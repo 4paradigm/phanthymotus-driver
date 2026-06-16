@@ -46,6 +46,7 @@ Each tool returns a dict containing the following fields:
 |-------|------|----------|-------------|
 | `name` | string | Yes | Tool name (e.g. `loco`, `mic`), unique within the same driver |
 | `type` | string | Yes | `sensor` (data stream) \| `actuator` (executable) \| `processor` (data processing) \| `resource` (static resource) |
+| `multiInstance` | boolean | No | Whether the tool can be added to the canvas multiple times. `true` = multiple instances allowed (e.g. ASR/TTS with different input topics), `false` (default) = single instance only |
 | `description` | string | Yes | Tool description, used by both LLM and frontend |
 | `inputSchema` | object | Yes | JSON Schema defining call parameters |
 | `configSchema` | object | No | Persistent configuration schema (e.g. API Key), rendered as a config form in the frontend |
@@ -81,12 +82,21 @@ Standard JSON Schema format. For actuator tools, it typically includes an `actio
 
 Optional. Defines persistent parameters that users configure in the frontend (e.g. API Key, model name). The frontend automatically renders a configuration form.
 
+Each property can declare a `"scope"` field:
+
+| Scope | Description |
+|-------|-------------|
+| `"shared"` (default) | Global config shared across all instances. Configured via the sidebar config button. |
+| `"instance"` | Per-instance config. Each canvas card instance can have its own value. Configured via the card's gear button. |
+
+For `multiInstance: true` tools, `scope` determines whether a config field is set once globally or independently per instance. For single-instance tools, all fields are effectively shared.
+
 ```python
 "configSchema": {
     "type": "object",
     "properties": {
-        "api_key": {"type": "string", "description": "API Key", "format": "password"},
-        "model":   {"type": "string", "description": "Model name"},
+        "api_key":  {"type": "string", "description": "API Key", "format": "password", "scope": "shared"},
+        "model":    {"type": "string", "description": "Model name", "scope": "instance"},
     },
     "required": ["api_key"],
 }

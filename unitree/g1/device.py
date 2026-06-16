@@ -151,6 +151,7 @@ class MicPlugin:
         return {
             "name": "mic",
             "type": "sensor",
+            "multiInstance": False,
             "description": f"G1 microphone — captures UDP multicast audio (PCM-16 16kHz mono) and publishes to ROS2 topic {self._topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}],
@@ -178,6 +179,7 @@ class NativeTtsPlugin:
         return {
             "name": "tts",
             "type": "actuator",
+            "multiInstance": False,
             "description": "G1 on-board TTS engine — synthesize text to robot speech, control volume",
             "inputSchema": {
                 "type": "object",
@@ -376,6 +378,7 @@ class SpeakerPlugin:
         return {
             "name": "speaker",
             "type": "actuator",
+            "multiInstance": False,
             "description": "G1 speaker — subscribes to ROS2 topic and streams PCM-16k audio to robot speaker",
             "inputSchema": {
                 "type": "object",
@@ -429,6 +432,7 @@ class LedPlugin:
         return {
             "name": "led",
             "type": "actuator",
+            "multiInstance": False,
             "description": "G1 LED strip control — set RGB color or turn off",
             "inputSchema": {
                 "type": "object",
@@ -560,6 +564,7 @@ class LocoStatePlugin:
         return {
             "name": "loco_state",
             "type": "sensor",
+            "multiInstance": False,
             "description": f"G1 locomotion state (always active) — mode, velocity, position, body_height, foot_force, IMU. Publishes at 10Hz to {self._odom_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._odom_topic, "format": "data/json"}],
@@ -569,6 +574,7 @@ class LocoStatePlugin:
         return {
             "name": "loco_motion_state",
             "type": "sensor",
+            "multiInstance": False,
             "description": f"G1 sport mode state (only active when standing/walking) — same fields as loco_state but from motion controller. Publishes to {self._motion_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._motion_topic, "format": "data/json"}],
@@ -607,6 +613,7 @@ class LocoPlugin:
         return {
             "name": "motion_events",
             "type": "sensor",
+            "multiInstance": False,
             "description": f"SmartMotion safety harness events — motion_start/stop/decelerate/resume, nav_start/paused/resumed/stopped, safety_stop (tilt/foot_airborne/comm_timeout/overheat). Publishes to {topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": topic, "format": "data/json"}],
@@ -616,6 +623,7 @@ class LocoPlugin:
         return {
             "name": "loco",
             "type": "actuator",
+            "multiInstance": False,
             "description": "G1 locomotion control — move, stop, set height, wave/shake hand",
             "inputSchema": {
                 "type": "object",
@@ -648,6 +656,7 @@ class LocoPlugin:
         return {
             "name": "switch_mode",
             "type": "actuator",
+            "multiInstance": False,
             "description": "G1 locomotion mode switch — change posture/locomotion mode by name. damp=阻尼, start=主运控, zero_torque=零力矩, squat=下蹲, stand_up=起立, lie_to_stand=躺起, sit=落座, balance_stand=平衡站立, continuous_gait=持续踏步, stop_gait=停止踏步, high_stand=最高站, low_stand=最低站",
             "inputSchema": {
                 "type": "object",
@@ -668,6 +677,7 @@ class LocoPlugin:
         return {
             "name": "switch_mode_expert",
             "type": "actuator",
+            "multiInstance": False,
             "description": "G1 locomotion mode switch — directly set FSM mode ID (expert use only). IDs: 0=zero_torque, 1=damp, 2=squat, 3=sit, 4=lock_stand, 500=normal_loco, 501=3dof_waist, 702=lie_to_stand, 706=balance_squat, 801=run_loco",
             "inputSchema": {
                 "type": "object",
@@ -825,6 +835,7 @@ class AsrPlugin:
         return {
             "name": "asr",
             "type": "sensor",
+            "multiInstance": False,
             "description": (
                 "G1 built-in ASR — offline speech recognition results "
                 "(text, angle, confidence, emotion). "
@@ -877,6 +888,7 @@ class ArmActionPlugin:
         return {
             "name": "arm",
             "type": "actuator",
+            "multiInstance": False,
             "description": f"G1 arm gestures — execute predefined actions. Available: {', '.join(_ARM_ACTION_MAP)}",
             "inputSchema": {
                 "type": "object",
@@ -1071,6 +1083,7 @@ class StatePlugin:
         return {
             "name": "imu",
             "type": "sensor",
+            "multiInstance": False,
             "description": f"G1 IMU sensor — quaternion, gyroscope, accelerometer, rpy, temperature. Publishes to {self._imu_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._imu_topic, "format": "data/json"}],
@@ -1080,6 +1093,7 @@ class StatePlugin:
         return {
             "name": "battery",
             "type": "sensor",
+            "multiInstance": False,
             "description": f"G1 BMS battery — SOC%, SOH%, current(mA), voltage, cell voltages, temperature, charge cycles. Publishes at 1Hz to {self._battery_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._battery_topic, "format": "data/json"}],
@@ -1089,6 +1103,7 @@ class StatePlugin:
         return {
             "name": "joints",
             "type": "sensor",
+            "multiInstance": False,
             "description": f"G1 joint states — 35 motors with position(q), velocity(dq), torque(tau), temperature. Publishes at 10Hz to {self._joints_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._joints_topic, "format": "sensor/skeleton"}],
@@ -1098,6 +1113,7 @@ class StatePlugin:
         return {
             "name": "mainboard",
             "type": "sensor",
+            "multiInstance": False,
             "description": f"G1 mainboard state — temperature, fan state, system values. Publishes at 0.5Hz to {self._mainboard_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._mainboard_topic, "format": "data/json"}],
@@ -1107,6 +1123,7 @@ class StatePlugin:
         return {
             "name": "model",
             "type": "resource",
+            "multiInstance": False,
             "description": "G1 robot URDF model for 3D visualization — kinematic chain with joint origins, axes, and limits",
             "inputSchema": {"type": "object", "properties": {}},
         }
@@ -1217,6 +1234,7 @@ class LidarPlugin:
         return {
             "name": "lidar_cloud",
             "type": "sensor",
+            "multiInstance": False,
             "description": f"Livox Mid-360 full point cloud passthrough at 10Hz. Binary format: [uint32 point_step][uint32 total_points][raw PointCloud2 bytes]. Publishes to {self._cloud_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._cloud_topic, "format": "sensor/pointcloud"}],
@@ -1226,6 +1244,7 @@ class LidarPlugin:
         return {
             "name": "lidar_imu",
             "type": "sensor",
+            "multiInstance": False,
             "description": f"Livox Mid-360 IMU — quaternion, gyroscope, accelerometer, rpy at 200Hz. Publishes to {self._imu_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._imu_topic, "format": "data/json"}],
@@ -2095,6 +2114,7 @@ class SpatialPlugin:
         return {
             "name": "pos_tag",
             "type": "sensor",
+            "multiInstance": False,
             "description": f"Spatial position + nearest tags — current pose, nearby POIs with distance/bearing, map/nav status. 10Hz to {self._pos_tag_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._pos_tag_topic, "format": "data/json"}],
@@ -2104,6 +2124,7 @@ class SpatialPlugin:
         return {
             "name": "mapping",
             "type": "sensor",
+            "multiInstance": False,
             "description": f"SLAM 3D mapping visualization — full 3D point cloud map with robot position. Binary format: [float32 robot_x,y,yaw][uint8 flags][uint32 N][float32 x,y,z × N]. 1Hz to {self._mapping_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._mapping_topic, "format": "sensor/mapping"}],
@@ -2113,6 +2134,7 @@ class SpatialPlugin:
         return {
             "name": "spatial",
             "type": "actuator",
+            "multiInstance": False,
             "description": "Spatial intelligence — place tagging, navigation. Mapping is always active automatically.",
             "inputSchema": {
                 "type": "object",
@@ -2440,6 +2462,7 @@ class MotionSwitcherPlugin:
         return {
             "name": "motion_switcher",
             "type": "actuator",
+            "multiInstance": False,
             "description": (
                 "G1 high-level motion mode switcher — check current mode, select mode "
                 "(ai/normal/advanced), or release mode for low-level control. "
@@ -2540,6 +2563,7 @@ class RealSensePlugin:
         return {
             "name": "camera_rgb",
             "type": "sensor",
+            "multiInstance": False,
             "description": f"RealSense color camera — {RS_COLOR_W}x{RS_COLOR_H} JPEG @ {RS_COLOR_FPS}fps. Publishes CompressedImage to {self._color_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._color_topic, "format": "image/jpeg"}],
@@ -2549,6 +2573,7 @@ class RealSensePlugin:
         return {
             "name": "camera_depth",
             "type": "sensor",
+            "multiInstance": False,
             "description": f"RealSense depth camera — {RS_DEPTH_W}x{RS_DEPTH_H} 16UC1 (z16, mm) @ {RS_DEPTH_FPS}fps. Publishes to {self._depth_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._depth_topic, "format": "image/depth-z16"}],
@@ -2558,6 +2583,7 @@ class RealSensePlugin:
         return {
             "name": "camera_distance",
             "type": "sensor",
+            "multiInstance": False,
             "description": f"RealSense center-point distance(m) + fps. Publishes at 10Hz to {self._dist_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._dist_topic, "format": "data/json"}],

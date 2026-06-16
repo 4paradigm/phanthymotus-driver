@@ -65,7 +65,8 @@ python main.py
 想要为新硬件添加驱动？请参阅 **[驱动开发指南](README_dev.md)** 获取完整规范，包括：
 
 - MCP 协议实现（JSON-RPC 2.0 方法）
-- 工具定义规范（`inputSchema`、`configSchema`、`x-action-params`）
+- 工具定义规范（`inputSchema`、`configSchema`、`multiInstance`、`x-action-params`）
+- 实例管理（`multiInstance` 标志、configSchema `scope` 字段）
 - Plugin 生命周期（`__init__`、`get_tool`、`start`、`stop`、`dispatch`）
 - `driver.yaml` 和 `config.yaml` 元数据格式
 - 注册与心跳机制
