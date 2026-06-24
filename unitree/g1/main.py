@@ -169,6 +169,7 @@ class G1DeviceBundle:
                     if tool_def["type"] == "resource":
                         return p.dispatch(tool_name, args)
                     action = args.pop("action", tool_name)
+                    args['_tool_name'] = tool_name  # let multi-tool plugins know which tool was called
                     return p.dispatch(action, args)
         return None
 

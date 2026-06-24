@@ -79,22 +79,30 @@ Quick overview:
 
 ### Topic Inference via `info` Action
 
-Drivers that produce ROS2 output topics must implement an `info` action capable of returning
-the inferred output topic **before the device is started**:
+**All** tools that produce or consume ROS2 topics must implement an `info` action. The Agent Core canvas calls `info(instance_id, input_topic)` immediately after a card is placed or wired, and uses the returned `topic_out`/`topic_in` as the **authoritative** topic path. Static definitions in `tool.topic_out` are used only as a fallback when `info()` is unavailable.
 
-- **multiInstance sensors** (e.g. `ext_mic`, `ext_camera`): accept `instance_id` in the
-  `info` call and return `topic_out` with the full topic path
-  (e.g. `/{namespace}/ext_mic/{instance_id}/audio`, where `-` in `instance_id` is replaced with `_` to comply with ROS2 topic naming rules).
-- **Processors** (e.g. `asr`, `tts`): accept `input_topic` in the `info` call and return
-  the inferred `topic_out` (e.g. `{input_topic}/asr`).
+**Rule: driver owns topic path logic; canvas only reads the result.**
 
-The Agent Core canvas calls this endpoint immediately after a card is placed or wired,
-so output port labels are populated without waiting for `start`.
-All topic naming rules live in the driver — the canvas only reads the result.
+| Tool type | `info()` input | `topic_out` computation |
+|-----------|---------------|------------------------|
+| Static sensor (mic, imu, camera…) | — | Return fixed `self._topic` |
+| multiInstance sensor (ext_mic, ext_camera) | `instance_id` | `/{namespace}/{tool}/{instance_id}/…` (replace `-` → `_`) |
+| Processor (asr, tts) | `input_topic` | `{input_topic}/{tool_name}` |
+
+Example for a static sensor:
+```python
+def dispatch(self, action: str, args: dict) -> dict | None:
+    if action == "info":
+        return {"state": self.state, "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}]}
+    return None
+```
 
 > **Note:** ROS2 topic names only allow alphanumerics, `_`, `~`, `{`, `}`. Canvas card IDs
 > contain hyphens (e.g. `card-abc123`), so drivers must sanitize `instance_id` before
 > embedding it in a topic path: `instance_id.replace('-', '_')`.
+
+The Agent Core canvas calls this endpoint immediately after a card is placed or wired,
+so output port labels are populated without waiting for `start`.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and PR guidelines.
 

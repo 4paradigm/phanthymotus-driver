@@ -164,7 +164,9 @@ class MicPlugin:
         self._node.stop_capture()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
-        return None  # sensor — no callable actions
+        if action == "info":
+            return {"state": "running", "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}]}
+        return None  # sensor — no other callable actions
 
 
 # ── NativeTtsPlugin (actuator) ───────────────────────────────────────────────
@@ -587,6 +589,11 @@ class LocoStatePlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "info":
+            tool_name = args.get('_tool_name', '')
+            if tool_name == 'loco_motion_state':
+                return {"state": "running", "topic_out": [{"topic": self._motion_topic, "format": "data/json"}]}
+            return {"state": "running", "topic_out": [{"topic": self._odom_topic, "format": "data/json"}]}
         return None  # sensor
 
 
@@ -1135,6 +1142,18 @@ class StatePlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "info":
+            tool_name = args.get('_tool_name', '')
+            topic_map = {
+                'imu':       (self._imu_topic,      'data/json'),
+                'battery':   (self._battery_topic,  'data/json'),
+                'joints':    (self._joints_topic,   'sensor/skeleton'),
+                'mainboard': (self._mainboard_topic,'data/json'),
+            }
+            if tool_name in topic_map:
+                topic, fmt = topic_map[tool_name]
+                return {"state": "running", "topic_out": [{"topic": topic, "format": fmt}]}
+            return {"state": "running"}
         if action == "model":
             from pathlib import Path
             urdf_path = Path(__file__).parent / "resource" / "g1_model.urdf"
@@ -1268,6 +1287,11 @@ class LidarPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "info":
+            tool_name = args.get('_tool_name', '')
+            if tool_name == 'lidar_imu':
+                return {"state": "running", "topic_out": [{"topic": self._imu_topic, "format": "data/json"}]}
+            return {"state": "running", "topic_out": [{"topic": self._cloud_topic, "format": "sensor/pointcloud"}]}
         return None  # sensor
 
 
@@ -2328,6 +2352,11 @@ class SpatialPlugin:
         return {"error": f"StartMapping failed, code={code}"}
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "info":
+            tool_name = args.get('_tool_name', '')
+            if tool_name == 'mapping':
+                return {"state": "running", "topic_out": [{"topic": self._mapping_topic, "format": "sensor/mapping"}]}
+            return {"state": "running", "topic_out": [{"topic": self._pos_tag_topic, "format": "data/json"}]}
         if action == "start_mapping":
             map_name = args.get("map_name", f"map_{int(time.time())}")
             code, resp = self._client.StartMapping()
@@ -2622,6 +2651,13 @@ class RealSensePlugin:
         self._proc = None
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "info":
+            tool_name = args.get('_tool_name', '')
+            if tool_name == 'camera_depth':
+                return {"state": "running", "topic_out": [{"topic": self._depth_topic, "format": "image/depth-z16"}]}
+            if tool_name == 'camera_distance':
+                return {"state": "running", "topic_out": [{"topic": self._dist_topic, "format": "data/json"}]}
+            return {"state": "running", "topic_out": [{"topic": self._color_topic, "format": "image/jpeg"}]}
         return None  # sensor
 
 
