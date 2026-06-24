@@ -104,6 +104,61 @@ def dispatch(self, action: str, args: dict) -> dict | None:
 The Agent Core canvas calls this endpoint immediately after a card is placed or wired,
 so output port labels are populated without waiting for `start`.
 
+---
+
+## Audio Requirements for ASR Compatibility
+
+Any driver that publishes audio for use with the Perception ASR plugin must meet the following requirements. Failure to comply will result in the ASR receiving audio but producing no output (the VAD silently discards non-conforming frames).
+
+### ROS2 Message Type
+
+```
+audio_msgs/AudioChunk
+  std_msgs/Header header
+  string format          # must be exactly "audio/pcm-16k"
+  uint8[] data           # raw PCM bytes
+```
+
+### PCM Format
+
+| Parameter | Required value |
+|-----------|---------------|
+| Encoding | 16-bit signed integer, little-endian (PCM_S16_LE) |
+| Sample rate | **16 000 Hz** |
+| Channels | **Mono (1 channel)** |
+| `format` field | `"audio/pcm-16k"` |
+
+### Chunk Size
+
+| Parameter | Constraint |
+|-----------|-----------|
+| Minimum | **1 024 bytes** (512 samples ≈ 32 ms) |
+| Recommended | 1 024 – 4 096 bytes (32 – 128 ms) |
+
+Chunks smaller than 1 024 bytes are **silently discarded** by the VAD. This is the most common cause of "ASR receives audio but never outputs text."
+
+### The 48 kHz USB Mic Pitfall
+
+Most USB audio interfaces capture at 48 000 Hz natively. After downsampling to 16 000 Hz, a 512-frame ALSA period yields only **170 samples (340 bytes)** — below the minimum. You must accumulate resampled output into a buffer and only publish when 512 samples are ready:
+
+```python
+TARGET = 1024  # bytes — 512 int16 samples @ 16 kHz
+_buf = bytearray()
+
+# Inside the capture loop, after resampling to 16 kHz:
+_buf += resampled_bytes
+while len(_buf) >= TARGET:
+    chunk, _buf = bytes(_buf[:TARGET]), _buf[TARGET:]
+    msg = AudioChunk()
+    msg.format = "audio/pcm-16k"
+    msg.data = list(chunk)
+    publisher.publish(msg)
+```
+
+This pattern is already applied to the `ext_mic` plugin in `unitree/g1/ext_devices.py`.
+
+See [perception/README.md](https://github.com/4paradigm/phanthymotus/blob/main/perception/README.md) in the main repository for full VAD tuning options.
+
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and PR guidelines.
 
 ## License
