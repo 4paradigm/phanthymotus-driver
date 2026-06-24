@@ -713,6 +713,12 @@ class LocoPlugin:
         self._client.StopMove()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "info":
+            tool_name = args.get("_tool_name", "motion_events")
+            if tool_name == "motion_events" and self._smart_motion:
+                topic = f"/{self._namespace}/safety/motion_events"
+                return {"state": "running", "topic_out": [{"topic": topic, "format": "data/json"}]}
+            return None
         if action == "move":
             vx   = float(args.get("vx",   0))
             vy   = float(args.get("vy",   0))
@@ -859,6 +865,8 @@ class AsrPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "info":
+            return {"state": "running", "topic_out": [{"topic": self._topic, "format": "data/json"}]}
         return None
 
 
