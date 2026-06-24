@@ -96,6 +96,7 @@ def _enumerate_ext_mics() -> list[dict]:
             continue
         devices.append({
             "index": i,
+            "alsa_id": i,
             "name": dev['name'],
             "channels": dev['max_input_channels'],
             "sample_rate": int(dev['default_samplerate']),
@@ -322,7 +323,12 @@ TOOLS_EXT_MIC = [
         "configSchema": {
             "type": "object",
             "properties": {
-                "device_index": {"type": "integer", "description": "音频设备索引", "scope": "instance"},
+                "device_index": {
+                    "type": "string",
+                    "description": "音频设备",
+                    "scope": "instance",
+                    "oneOf": device_options if device_options else [{"const": "", "title": "无可用设备"}],
+                },
                 "device_name":  {"type": "string", "description": "设备名称", "scope": "instance"},
             },
         },
