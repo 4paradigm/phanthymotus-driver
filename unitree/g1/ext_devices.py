@@ -242,20 +242,28 @@ class _ExtMicNode(Node):
             periodsize=512,
             cardindex=card_idx,
         )
-        # Init dynamic rate probe fields
+        # Init dynamic rate probe fields (timer starts on first real read in loop)
         self._alsa_native_rate = 16000
         self._alsa_rate_locked = False
         self._alsa_probe_samples = 0
-        self._alsa_probe_start = time.monotonic()
+        self._alsa_probe_start = 0.0
         self._running = True
         self._thread = threading.Thread(target=self._alsa_capture_loop, daemon=True)
         self._thread.start()
 
     def _alsa_capture_loop(self):
+        first_read = True
         while self._running:
             length, data = self._alsa_pcm.read()
             if length <= 0:
                 continue
+
+            # Start probe timer on first actual data (not before thread start,
+            # to avoid counting ALSA init latency as part of elapsed time)
+            if first_read:
+                self._alsa_probe_start = time.monotonic()
+                self._alsa_probe_samples = 0
+                first_read = False
 
             # Phase 1: accumulate samples to measure actual hardware rate
             if not self._alsa_rate_locked:
@@ -266,6 +274,7 @@ class _ExtMicNode(Node):
                     std_rates = [8000, 11025, 16000, 22050, 32000, 44100, 48000]
                     self._alsa_native_rate = min(std_rates, key=lambda r: abs(r - measured))
                     self._alsa_rate_locked = True
+                    print(f"[ext_mic] detected native_rate={self._alsa_native_rate} (measured={measured})", flush=True)
                     log.info(f"[ext_mic] detected native_rate={self._alsa_native_rate} (measured={measured})")
                 continue  # discard probe data, don't publish
 
