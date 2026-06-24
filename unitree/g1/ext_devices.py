@@ -200,6 +200,10 @@ class _ExtMicNode(Node):
         self._alsa_pcm = None   # used when device_index is an ALSA card name string
         self._thread: Optional[threading.Thread] = None
         self._running = False
+        self._alsa_native_rate: int = 16000
+        self._alsa_rate_locked: bool = False
+        self._alsa_probe_samples: int = 0
+        self._alsa_probe_start: float = 0.0
         self.state = "idle"
 
     def _is_alsa_id(self) -> bool:
@@ -238,6 +242,11 @@ class _ExtMicNode(Node):
             periodsize=512,
             cardindex=card_idx,
         )
+        # Init dynamic rate probe fields
+        self._alsa_native_rate = 16000
+        self._alsa_rate_locked = False
+        self._alsa_probe_samples = 0
+        self._alsa_probe_start = time.monotonic()
         self._running = True
         self._thread = threading.Thread(target=self._alsa_capture_loop, daemon=True)
         self._thread.start()
@@ -247,6 +256,28 @@ class _ExtMicNode(Node):
             length, data = self._alsa_pcm.read()
             if length <= 0:
                 continue
+
+            # Phase 1: accumulate samples to measure actual hardware rate
+            if not self._alsa_rate_locked:
+                self._alsa_probe_samples += length
+                elapsed = time.monotonic() - self._alsa_probe_start
+                if elapsed >= 0.5:
+                    measured = int(self._alsa_probe_samples / elapsed)
+                    std_rates = [8000, 11025, 16000, 22050, 32000, 44100, 48000]
+                    self._alsa_native_rate = min(std_rates, key=lambda r: abs(r - measured))
+                    self._alsa_rate_locked = True
+                    log.info(f"[ext_mic] detected native_rate={self._alsa_native_rate} (measured={measured})")
+                continue  # discard probe data, don't publish
+
+            # Phase 2: resample to 16000 Hz if device delivers a different rate
+            if self._alsa_native_rate != 16000:
+                samples = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+                n_out = int(len(samples) * 16000 / self._alsa_native_rate)
+                if n_out <= 0:
+                    continue
+                x_new = np.linspace(0, len(samples) - 1, n_out)
+                data = np.interp(x_new, np.arange(len(samples)), samples).astype(np.int16).tobytes()
+
             msg = AudioChunk()
             msg.header.stamp = self.get_clock().now().to_msg()
             msg.format = "audio/pcm-16k"
