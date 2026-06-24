@@ -791,13 +791,13 @@ class ExtCameraPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         instance_id = args.get("instance_id", "")
-        log.info(f"[ext_camera] dispatch: action={action!r} instance_id={instance_id!r} args_keys={list(args.keys())}")
+        print(f"[ext_camera] dispatch: action={action!r} instance_id={instance_id!r} args_keys={list(args.keys())}", flush=True)
 
         if action == 'config':
             if instance_id:
                 self._instance_configs[instance_id] = {k: v for k, v in args.items()
                                                         if k not in ('action', 'instance_id', '_tool_name')}
-                log.info(f"[ext_camera] config cached for instance {instance_id}: {self._instance_configs[instance_id]}")
+                print(f"[ext_camera] config cached for instance {instance_id}: {self._instance_configs[instance_id]}", flush=True)
             return {'ok': True}
 
         if action == "info":
@@ -868,22 +868,21 @@ class ExtCameraPlugin:
             value = args.get('value')
             if value is None:
                 raise ValueError(f"'value' is required for {action}")
-            log.info(f"[ext_camera] set_ctrl: device={device_path} ctrl={ctrl_name} value={value}")
-            try:
+            print(f"[ext_camera] set_ctrl: device={device_path} ctrl={ctrl_name} value={value}", flush=True)            try:
                 out = subprocess.check_output(
                     ['v4l2-ctl', '-d', device_path, f'--set-ctrl={ctrl_name}={value}'],
                     text=True, timeout=5, stderr=subprocess.PIPE,
                 )
-                log.info(f"[ext_camera] set_ctrl ok: {out.strip()!r}")
+                print(f"[ext_camera] set_ctrl ok: {out.strip()!r}", flush=True)
             except subprocess.CalledProcessError as e:
-                log.error(f"[ext_camera] set_ctrl failed: {e.stderr.strip()}")
+                print(f"[ext_camera] set_ctrl failed: {e.stderr.strip()}", flush=True)
                 raise RuntimeError(f'v4l2-ctl set failed: {e.stderr.strip()}')
             return {'ok': True, 'ctrl': ctrl_name, 'value': value}
 
         elif action.startswith('get_'):
             ctrl_name = action[4:]
             device_path = self._resolve_device_path(instance_id, args)
-            log.info(f"[ext_camera] get_ctrl: device={device_path} ctrl={ctrl_name}")
+            print(f"[ext_camera] get_ctrl: device={device_path} ctrl={ctrl_name}", flush=True)
             return self._ctrl_get_one(device_path, ctrl_name)
 
         return None
@@ -894,7 +893,7 @@ class ExtCameraPlugin:
         if instance_id and instance_id in self._instance_configs:
             dp = self._instance_configs[instance_id].get('device_path', '')
             if dp:
-                log.info(f"[ext_camera] _resolve_device_path: using cached config for {instance_id} → {dp}")
+                print(f"[ext_camera] _resolve_device_path: using cached config for {instance_id} → {dp}", flush=True)
                 return dp
         dp = args.get('device_path')
         if dp:
