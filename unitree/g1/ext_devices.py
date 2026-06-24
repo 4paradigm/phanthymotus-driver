@@ -327,7 +327,6 @@ TOOLS_EXT_MIC = [
                     "type": "string",
                     "description": "音频设备",
                     "scope": "instance",
-                    "oneOf": device_options if device_options else [{"const": "", "title": "无可用设备"}],
                 },
                 "device_name":  {"type": "string", "description": "设备名称", "scope": "instance"},
             },
