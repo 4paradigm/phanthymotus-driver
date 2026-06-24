@@ -253,6 +253,8 @@ class _ExtMicNode(Node):
 
     def _alsa_capture_loop(self):
         first_read = True
+        _pub_buf = bytearray()       # accumulate resampled bytes until we have a full 512-sample chunk
+        _TARGET = 1024               # 512 int16 samples @ 16 kHz = 1024 bytes
         while self._running:
             length, data = self._alsa_pcm.read()
             if length <= 0:
@@ -286,6 +288,18 @@ class _ExtMicNode(Node):
                     continue
                 x_new = np.linspace(0, len(samples) - 1, n_out)
                 data = np.interp(x_new, np.arange(len(samples)), samples).astype(np.int16).tobytes()
+                # After downsampling the chunk may be too small for the VAD (< 512 samples).
+                # Buffer until we have a full TARGET-byte chunk before publishing.
+                _pub_buf += data
+                while len(_pub_buf) >= _TARGET:
+                    chunk = bytes(_pub_buf[:_TARGET])
+                    _pub_buf = _pub_buf[_TARGET:]
+                    msg = AudioChunk()
+                    msg.header.stamp = self.get_clock().now().to_msg()
+                    msg.format = "audio/pcm-16k"
+                    msg.data = list(chunk)
+                    self._pub.publish(msg)
+                continue
 
             msg = AudioChunk()
             msg.header.stamp = self.get_clock().now().to_msg()
