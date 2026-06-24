@@ -868,7 +868,8 @@ class ExtCameraPlugin:
             value = args.get('value')
             if value is None:
                 raise ValueError(f"'value' is required for {action}")
-            print(f"[ext_camera] set_ctrl: device={device_path} ctrl={ctrl_name} value={value}", flush=True)            try:
+            print(f"[ext_camera] set_ctrl: device={device_path} ctrl={ctrl_name} value={value}", flush=True)
+            try:
                 out = subprocess.check_output(
                     ['v4l2-ctl', '-d', device_path, f'--set-ctrl={ctrl_name}={value}'],
                     text=True, timeout=5, stderr=subprocess.PIPE,
