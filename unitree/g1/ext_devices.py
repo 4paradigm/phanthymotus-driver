@@ -775,6 +775,13 @@ class ExtCameraPlugin:
                 "type": "integer",
                 "description": "设置目标值（仅 set_* 动作需要）",
             }
+            # Expose device_path in inputSchema so canvas can call set_*/get_* without a running instance
+            device_options = [{"const": d["path"], "title": f"{d['name']} ({d['path']})"} for d in self._available_devices]
+            input_props["device_path"] = {
+                "type": "string",
+                "description": "摄像头设备路径（无运行实例时需填写）",
+                "oneOf": device_options if device_options else [{"const": "", "title": "无可用设备"}],
+            }
             input_schema["properties"] = input_props
             tool["inputSchema"] = input_schema
         return [tool]
