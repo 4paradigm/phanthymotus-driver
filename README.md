@@ -84,13 +84,17 @@ the inferred output topic **before the device is started**:
 
 - **multiInstance sensors** (e.g. `ext_mic`, `ext_camera`): accept `instance_id` in the
   `info` call and return `topic_out` with the full topic path
-  (e.g. `/{namespace}/ext_mic/{instance_id}/audio`).
+  (e.g. `/{namespace}/ext_mic/{instance_id}/audio`, where `-` in `instance_id` is replaced with `_` to comply with ROS2 topic naming rules).
 - **Processors** (e.g. `asr`, `tts`): accept `input_topic` in the `info` call and return
   the inferred `topic_out` (e.g. `{input_topic}/asr`).
 
 The Agent Core canvas calls this endpoint immediately after a card is placed or wired,
 so output port labels are populated without waiting for `start`.
 All topic naming rules live in the driver — the canvas only reads the result.
+
+> **Note:** ROS2 topic names only allow alphanumerics, `_`, `~`, `{`, `}`. Canvas card IDs
+> contain hyphens (e.g. `card-abc123`), so drivers must sanitize `instance_id` before
+> embedding it in a topic path: `instance_id.replace('-', '_')`.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and PR guidelines.
 
