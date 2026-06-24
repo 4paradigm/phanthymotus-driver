@@ -133,9 +133,11 @@ class G1DeviceBundle:
             print("[bundle] ExtMicPlugin loaded")
 
         if plugins_cfg.get("ext_camera", {}).get("enabled", False):
-            from ext_devices import ExtCameraPlugin
-            self._plugins.append(ExtCameraPlugin(plugins_cfg["ext_camera"], namespace, executor))
-            print("[bundle] ExtCameraPlugin loaded")
+            from ext_devices import ExtCameraPlugin, ExtCameraCtrlPlugin
+            ext_camera_plugin = ExtCameraPlugin(plugins_cfg["ext_camera"], namespace, executor)
+            self._plugins.append(ext_camera_plugin)
+            self._plugins.append(ExtCameraCtrlPlugin(ext_camera_plugin._available_devices))
+            print("[bundle] ExtCameraPlugin + ExtCameraCtrlPlugin loaded")
 
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):

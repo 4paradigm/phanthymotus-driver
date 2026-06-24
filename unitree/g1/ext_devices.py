@@ -163,14 +163,18 @@ def _enumerate_ext_cameras() -> list[dict]:
                 name = line.split(':', 1)[-1].strip()
                 break
 
-        # Probe supported pixel formats and resolutions via v4l2-ctl --list-formats-ext
+        # Probe supported pixel formats and resolutions via v4l2-ctl --list-formats-ext.
+        # If the probe succeeds but returns no formats, the node is not a real capture device
+        # (e.g. secondary metadata interface) — skip it.
         formats: list[str] = []
         resolutions: list[str] = []
+        fmt_probe_ok = False
         try:
             fmt_out = subprocess.check_output(
                 ['v4l2-ctl', '-d', path, '--list-formats-ext'],
                 text=True, timeout=2, stderr=subprocess.DEVNULL
             )
+            fmt_probe_ok = True
             formats = re.findall(r"'\s*([A-Z0-9]{4})\s*'", fmt_out)
             for line in fmt_out.splitlines():
                 m = re.search(r'Size: Discrete (\d+x\d+)', line)
@@ -178,6 +182,10 @@ def _enumerate_ext_cameras() -> list[dict]:
                     resolutions.append(m.group(1))
         except Exception:
             pass
+
+        # Probe succeeded but no formats → secondary/metadata node, not usable for capture
+        if fmt_probe_ok and not formats:
+            continue
 
         devices.append({"path": path, "name": name, "formats": formats, "resolutions": resolutions})
     return devices
@@ -597,6 +605,208 @@ class ExtMicPlugin:
             return {"state": "idle"}
 
         return None
+
+
+# ---------------------------------------------------------------------------
+# V4L2 control helpers
+# ---------------------------------------------------------------------------
+
+def _parse_v4l2_controls(device_path: str) -> list[dict]:
+    """Run v4l2-ctl --list-ctrls-menus and parse into structured control defs."""
+    try:
+        out = subprocess.check_output(
+            ['v4l2-ctl', '-d', device_path, '--list-ctrls-menus'],
+            text=True, timeout=3, stderr=subprocess.DEVNULL
+        )
+    except Exception:
+        return []
+
+    controls: list[dict] = []
+    current: dict | None = None
+
+    for line in out.splitlines():
+        # Control line: "  brightness 0x00980900 (int) : min=0 max=100 ..."
+        ctrl_m = re.match(r'^\s+(\w+)\s+0x[0-9a-f]+\s+\((\w+)\)\s*:\s*(.*)$', line)
+        if ctrl_m:
+            name, ctype, attrs = ctrl_m.group(1), ctrl_m.group(2), ctrl_m.group(3)
+            current = {'name': name, 'type': ctype}
+            for key in ('min', 'max', 'default', 'step', 'value'):
+                m = re.search(rf'(?<!\w){key}=(-?\d+)', attrs)
+                if m:
+                    current[key] = int(m.group(1))
+            flags_m = re.search(r'flags=(\S+)', attrs)
+            if flags_m:
+                current['flags'] = flags_m.group(1)
+            controls.append(current)
+            continue
+
+        # Menu entry: "        0: Disabled"  (no hex address, digit-colon format)
+        if current and current['type'] == 'menu':
+            menu_m = re.match(r'^\s+(\d+):\s+(.+)$', line)
+            if menu_m:
+                current.setdefault('menu_options', []).append({
+                    'value': int(menu_m.group(1)),
+                    'label': menu_m.group(2).strip(),
+                })
+
+    return controls
+
+
+def _ctrl_to_schema_prop(ctrl: dict) -> dict:
+    """Convert a parsed V4L2 control dict to a JSON-Schema property dict."""
+    ctype = ctrl['type']
+    desc_parts = []
+
+    if ctrl.get('flags') == 'inactive':
+        desc_parts.append('自动模式开启时不可用')
+    if ctrl.get('step', 1) > 1:
+        desc_parts.append(f"步进 {ctrl['step']}")
+
+    prop: dict = {'description': '、'.join(desc_parts) if desc_parts else ctrl['name'].replace('_', ' ')}
+
+    if ctype == 'int':
+        prop['type'] = 'integer'
+        if 'min' in ctrl: prop['minimum'] = ctrl['min']
+        if 'max' in ctrl: prop['maximum'] = ctrl['max']
+        if 'default' in ctrl: prop['default'] = ctrl['default']
+    elif ctype == 'bool':
+        prop['type'] = 'boolean'
+        if 'default' in ctrl: prop['default'] = bool(ctrl['default'])
+    elif ctype == 'menu':
+        prop['type'] = 'integer'
+        options = ctrl.get('menu_options', [])
+        if options:
+            prop['oneOf'] = [{'const': o['value'], 'title': o['label']} for o in options]
+        if 'default' in ctrl: prop['default'] = ctrl['default']
+    else:
+        prop['type'] = 'string'
+
+    return prop
+
+
+class ExtCameraCtrlPlugin:
+    """Exposes V4L2 camera controls (brightness, PTZ, white balance…) as an MCP tool.
+
+    Non-multiInstance: the LLM calls it with device_path + one or more control params.
+    No start/stop — controls are applied immediately via v4l2-ctl.
+    """
+    PREFIX = "ext_camera_ctrl"
+
+    def __init__(self, available_devices: list[dict]):
+        # Parse controls for every available capture device
+        self._device_controls: dict[str, list[dict]] = {}
+        for dev in available_devices:
+            ctrls = _parse_v4l2_controls(dev['path'])
+            if ctrls:
+                self._device_controls[dev['path']] = ctrls
+                log.info(f"[ext_camera_ctrl] {dev['path']}: {len(ctrls)} controls discovered")
+
+    def get_tools(self) -> list:
+        if not self._device_controls:
+            return []
+
+        device_options = [
+            {'const': path, 'title': path}
+            for path in self._device_controls
+        ]
+
+        # Merge controls from all devices (first device's constraints win for duplicates)
+        merged: dict[str, dict] = {}
+        for ctrls in self._device_controls.values():
+            for ctrl in ctrls:
+                if ctrl['name'] not in merged:
+                    merged[ctrl['name']] = ctrl
+
+        ctrl_props = {name: _ctrl_to_schema_prop(ctrl) for name, ctrl in merged.items()}
+
+        input_props = {
+            'action': {
+                'type': 'string',
+                'enum': ['set', 'get'],
+                'description': 'set — 设置控制参数；get — 读取当前值',
+                'default': 'set',
+            },
+            'device_path': {'type': 'string', 'description': '摄像头设备路径'},
+            **ctrl_props,
+        }
+        config_props = {
+            'device_path': {
+                'type': 'string',
+                'description': '目标摄像头设备',
+                'oneOf': device_options,
+            },
+            **ctrl_props,
+        }
+
+        return [{
+            'name': 'ext_camera_ctrl',
+            'type': 'function',
+            'description': '调整摄像头 V4L2 控制参数（亮度/对比度/白平衡/PTZ/对焦/变焦等）',
+            'inputSchema': {
+                'type': 'object',
+                'properties': input_props,
+                'required': ['device_path'],
+            },
+            'configSchema': {
+                'type': 'object',
+                'properties': config_props,
+            },
+        }]
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        if action not in ('set', 'get', 'ext_camera_ctrl'):
+            return None
+
+        device_path = args.get('device_path')
+        if not device_path:
+            raise ValueError('device_path is required')
+
+        if action == 'get':
+            return self._read_all(device_path)
+
+        # set (or default call by tool name)
+        known = {c['name'] for c in self._device_controls.get(device_path, [])}
+        set_pairs: list[str] = []
+        for k, v in args.items():
+            if k in ('device_path', 'instance_id', 'action') or v is None:
+                continue
+            if k in known:
+                set_pairs.append(f'{k}={int(v) if isinstance(v, bool) else v}')
+
+        if not set_pairs:
+            # No controls provided — return current values
+            return self._read_all(device_path)
+
+        try:
+            subprocess.check_output(
+                ['v4l2-ctl', '-d', device_path, f'--set-ctrl={",".join(set_pairs)}'],
+                text=True, timeout=5, stderr=subprocess.PIPE,
+            )
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f'v4l2-ctl set failed: {e.stderr.strip()}')
+
+        return {'ok': True, 'applied': set_pairs}
+
+    def _read_all(self, device_path: str) -> dict:
+        try:
+            out = subprocess.check_output(
+                ['v4l2-ctl', '-d', device_path, '--list-ctrls'],
+                text=True, timeout=3, stderr=subprocess.DEVNULL,
+            )
+            values: dict[str, int] = {}
+            for line in out.splitlines():
+                m = re.match(r'^\s+(\w+).*value=(-?\d+)', line)
+                if m:
+                    values[m.group(1)] = int(m.group(2))
+            return {'device_path': device_path, 'controls': values}
+        except Exception as e:
+            return {'device_path': device_path, 'error': str(e)}
 
 
 class ExtCameraPlugin:
