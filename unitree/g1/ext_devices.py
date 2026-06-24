@@ -242,10 +242,6 @@ class _ExtCameraNode(Node):
     def start(self) -> dict:
         if self.state == "running":
             return self._status_dict()
-        # Check if device is already held by another process
-        busy_check = subprocess.run(['fuser', self._device_path], capture_output=True, text=True)
-        if busy_check.stdout.strip():
-            raise RuntimeError(f"Device {self._device_path} is busy (PID: {busy_check.stdout.strip()}). Stop the old instance first.")
         self._cap = cv2.VideoCapture(self._device_path)
         if not self._cap.isOpened():
             raise RuntimeError(f"Cannot open camera: {self._device_path}")
