@@ -85,6 +85,16 @@ def _enumerate_ext_mics() -> list[dict]:
     try:
         import alsaaudio
         capture_pcms = set(alsaaudio.pcms(alsaaudio.PCM_CAPTURE))
+        # Parse full names from /proc/asound/cards: "N [short]: driver - Full Name"
+        full_names: dict[int, str] = {}
+        try:
+            with open('/proc/asound/cards') as f:
+                for line in f:
+                    m = re.match(r'\s*(\d+)\s+\[\S+\s*\]:\s*\S+\s+-\s+(.+)', line)
+                    if m:
+                        full_names[int(m.group(1))] = m.group(2).strip()
+        except Exception:
+            pass
         for idx, card_name in enumerate(alsaaudio.cards()):
             name_lower = card_name.lower()
             if 'realsense' in name_lower or 'intel' in name_lower:
@@ -94,10 +104,11 @@ def _enumerate_ext_mics() -> list[dict]:
             alsa_id = f"hw:CARD={card_name},DEV=0"
             if alsa_id not in capture_pcms:
                 continue
+            display_name = full_names.get(idx, card_name)
             devices.append({
                 "index": idx,
                 "alsa_id": alsa_id,
-                "name": card_name,
+                "name": display_name,
             })
         if devices:
             return devices
