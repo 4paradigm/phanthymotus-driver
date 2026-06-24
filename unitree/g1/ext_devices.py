@@ -691,6 +691,7 @@ class ExtCameraPlugin:
         self._namespace = namespace
         self._executor = executor
         self._nodes: dict[str, _ExtCameraNode] = {}
+        self._instance_configs: dict[str, dict] = {}
         self._available_devices = _enumerate_ext_cameras()
         log.info(f"[ext_camera] found {len(self._available_devices)} external camera device(s)")
         for d in self._available_devices:
@@ -775,13 +776,6 @@ class ExtCameraPlugin:
                 "type": "integer",
                 "description": "设置目标值（仅 set_* 动作需要）",
             }
-            # Expose device_path in inputSchema so canvas can call set_*/get_* without a running instance
-            device_options = [{"const": d["path"], "title": f"{d['name']} ({d['path']})"} for d in self._available_devices]
-            input_props["device_path"] = {
-                "type": "string",
-                "description": "摄像头设备路径（无运行实例时需填写）",
-                "oneOf": device_options if device_options else [{"const": "", "title": "无可用设备"}],
-            }
             input_schema["properties"] = input_props
             tool["inputSchema"] = input_schema
         return [tool]
@@ -797,6 +791,14 @@ class ExtCameraPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         instance_id = args.get("instance_id", "")
+        log.info(f"[ext_camera] dispatch: action={action!r} instance_id={instance_id!r} args_keys={list(args.keys())}")
+
+        if action == 'config':
+            if instance_id:
+                self._instance_configs[instance_id] = {k: v for k, v in args.items()
+                                                        if k not in ('action', 'instance_id', '_tool_name')}
+                log.info(f"[ext_camera] config cached for instance {instance_id}: {self._instance_configs[instance_id]}")
+            return {'ok': True}
 
         if action == "info":
             if instance_id and instance_id in self._nodes:
@@ -866,18 +868,22 @@ class ExtCameraPlugin:
             value = args.get('value')
             if value is None:
                 raise ValueError(f"'value' is required for {action}")
+            log.info(f"[ext_camera] set_ctrl: device={device_path} ctrl={ctrl_name} value={value}")
             try:
-                subprocess.check_output(
+                out = subprocess.check_output(
                     ['v4l2-ctl', '-d', device_path, f'--set-ctrl={ctrl_name}={value}'],
                     text=True, timeout=5, stderr=subprocess.PIPE,
                 )
+                log.info(f"[ext_camera] set_ctrl ok: {out.strip()!r}")
             except subprocess.CalledProcessError as e:
+                log.error(f"[ext_camera] set_ctrl failed: {e.stderr.strip()}")
                 raise RuntimeError(f'v4l2-ctl set failed: {e.stderr.strip()}')
             return {'ok': True, 'ctrl': ctrl_name, 'value': value}
 
         elif action.startswith('get_'):
             ctrl_name = action[4:]
             device_path = self._resolve_device_path(instance_id, args)
+            log.info(f"[ext_camera] get_ctrl: device={device_path} ctrl={ctrl_name}")
             return self._ctrl_get_one(device_path, ctrl_name)
 
         return None
@@ -885,10 +891,15 @@ class ExtCameraPlugin:
     def _resolve_device_path(self, instance_id: str, args: dict) -> str:
         if instance_id and instance_id in self._nodes:
             return self._nodes[instance_id]._device_path
+        if instance_id and instance_id in self._instance_configs:
+            dp = self._instance_configs[instance_id].get('device_path', '')
+            if dp:
+                log.info(f"[ext_camera] _resolve_device_path: using cached config for {instance_id} → {dp}")
+                return dp
         dp = args.get('device_path')
         if dp:
             return dp
-        raise ValueError('device_path required (or start an instance first)')
+        raise ValueError('device_path required (configure instance first or start an instance)')
 
     def _ctrl_get_one(self, device_path: str, ctrl_name: str) -> dict:
         try:
