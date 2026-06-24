@@ -77,6 +77,21 @@ Quick overview:
 - Tool naming convention: `{device}_{action}` (e.g., `loco_move`, `mic_start`)
 - Driver port range: **15700–15799**
 
+### Topic Inference via `info` Action
+
+Drivers that produce ROS2 output topics must implement an `info` action capable of returning
+the inferred output topic **before the device is started**:
+
+- **multiInstance sensors** (e.g. `ext_mic`, `ext_camera`): accept `instance_id` in the
+  `info` call and return `topic_out` with the full topic path
+  (e.g. `/{namespace}/ext_mic/{instance_id}/audio`).
+- **Processors** (e.g. `asr`, `tts`): accept `input_topic` in the `info` call and return
+  the inferred `topic_out` (e.g. `{input_topic}/asr`).
+
+The Agent Core canvas calls this endpoint immediately after a card is placed or wired,
+so output port labels are populated without waiting for `start`.
+All topic naming rules live in the driver — the canvas only reads the result.
+
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and PR guidelines.
 
 ## License
