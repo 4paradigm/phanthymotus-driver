@@ -26,3 +26,22 @@ plugins:
     db_path: /opt/phanthy-motus/data/spatial.db
   motion_switcher:
     enabled: true
+  ext_mic:
+    enabled: true
+  ext_camera:
+    enabled: true
+
+safety_harness:
+  enabled: true
+  decel_threshold: 2.0
+  stop_threshold: 0.8
+  lateral_threshold: 0.8
+  cone_half_angle: 30
+  z_min: 0.1
+  z_max: 1.0
+  tilt_threshold_deg: 35
+  foot_force_min: 10
+  foot_airborne_timeout: 0.2
+  comm_timeout: 0.5
+  motor_temp_decel: 75
+  motor_temp_stop: 85

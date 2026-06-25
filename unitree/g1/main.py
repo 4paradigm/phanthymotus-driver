@@ -21,7 +21,7 @@ import signal
 import socket
 import sys
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import yaml
@@ -60,8 +60,10 @@ class G1DeviceBundle:
                  loco_client: LocoClient,
                  arm_client: G1ArmActionClient,
                  slam_client: SlamClient,
-                 msc_client: MotionSwitcherClient):
+                 msc_client: MotionSwitcherClient,
+                 smart_motion=None):
         self._plugins: list = []
+        self._smart_motion = smart_motion
         plugins_cfg = cfg.get("plugins", {})
 
         if plugins_cfg.get("mic", {}).get("enabled", False):
@@ -87,7 +89,7 @@ class G1DeviceBundle:
         if plugins_cfg.get("loco", {}).get("enabled", False):
             from device import LocoStatePlugin, LocoPlugin
             self._plugins.append(LocoStatePlugin(plugins_cfg["loco"], namespace, executor))
-            self._plugins.append(LocoPlugin(plugins_cfg["loco"], namespace, executor, loco_client))
+            self._plugins.append(LocoPlugin(plugins_cfg["loco"], namespace, executor, loco_client, slam_client=slam_client, smart_motion=smart_motion))
             print("[bundle] LocoStatePlugin + LocoPlugin loaded")
 
         if plugins_cfg.get("arm", {}).get("enabled", False):
@@ -117,7 +119,7 @@ class G1DeviceBundle:
 
         if plugins_cfg.get("slam", {}).get("enabled", False):
             from device import SpatialPlugin
-            self._plugins.append(SpatialPlugin(plugins_cfg["slam"], namespace, executor, slam_client))
+            self._plugins.append(SpatialPlugin(plugins_cfg["slam"], namespace, executor, slam_client, smart_motion=smart_motion))
             print("[bundle] SpatialPlugin loaded")
 
         if plugins_cfg.get("motion_switcher", {}).get("enabled", False):
@@ -125,10 +127,25 @@ class G1DeviceBundle:
             self._plugins.append(MotionSwitcherPlugin(plugins_cfg["motion_switcher"], namespace, executor, msc_client))
             print("[bundle] MotionSwitcherPlugin loaded")
 
+        if plugins_cfg.get("ext_mic", {}).get("enabled", False):
+            from ext_devices import ExtMicPlugin
+            self._plugins.append(ExtMicPlugin(plugins_cfg["ext_mic"], namespace, executor))
+            print("[bundle] ExtMicPlugin loaded")
+
+        if plugins_cfg.get("ext_camera", {}).get("enabled", False):
+            from ext_devices import ExtCameraPlugin
+            self._plugins.append(ExtCameraPlugin(plugins_cfg["ext_camera"], namespace, executor))
+            print("[bundle] ExtCameraPlugin loaded")
+
     def start_all(self) -> None:
-        for p in self._plugins:
-            p.start()
-        print(f"[bundle] All {len(self._plugins)} plugins started")
+        for i, p in enumerate(self._plugins):
+            try:
+                p.start()
+            except Exception as e:
+                print(f"[bundle] Plugin {i} ({type(p).__name__}) start() FAILED: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
+        print(f"[bundle] All {len(self._plugins)} plugins started", flush=True)
 
     def stop_all(self) -> None:
         for p in self._plugins:
@@ -149,11 +166,10 @@ class G1DeviceBundle:
             plugin_tools = p.get_tools() if hasattr(p, 'get_tools') else [p.get_tool()]
             for tool_def in plugin_tools:
                 if tool_def["name"] == tool_name:
-                    if tool_def["type"] == "sensor":
-                        return {"info": "Sensor is active, data flows via ROS2 topic. No callable actions."}
                     if tool_def["type"] == "resource":
                         return p.dispatch(tool_name, args)
                     action = args.pop("action", tool_name)
+                    args['_tool_name'] = tool_name  # let multi-tool plugins know which tool was called
                     return p.dispatch(action, args)
         return None
 
@@ -322,7 +338,15 @@ def main():
     rclpy.init()
     executor = rclpy.executors.MultiThreadedExecutor()
 
-    _bundle = G1DeviceBundle(cfg, namespace, executor, audio_client, loco_client, arm_client, slam_client, msc_client)
+    # Safety Harness (SmartMotion) — independent subprocess
+    smart_motion = None
+    harness_cfg = cfg.get("safety_harness", {})
+    if harness_cfg.get("enabled", True):
+        from safety_harness import SmartMotionProxy
+        smart_motion = SmartMotionProxy(namespace, harness_cfg, network_iface)
+        print("[bundle] SmartMotion safety harness active (subprocess)")
+
+    _bundle = G1DeviceBundle(cfg, namespace, executor, audio_client, loco_client, arm_client, slam_client, msc_client, smart_motion=smart_motion)
     _bundle.start_all()
 
     def _spin():
@@ -334,11 +358,13 @@ def main():
 
     _start_registration(mcp_port, cfg.get("name", "Unitree G1"), "driver")
 
-    server = HTTPServer(("", mcp_port), make_handler())
+    server = ThreadingHTTPServer(("", mcp_port), make_handler())
     print(f"[bundle] MCP server → http://localhost:{mcp_port}")
 
     def _shutdown(signum, frame):
         print(f"[bundle] signal {signum}, shutting down")
+        if smart_motion:
+            smart_motion.shutdown()
         _bundle.stop_all()
         threading.Thread(target=server.shutdown, daemon=True).start()
 

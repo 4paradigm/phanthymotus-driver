@@ -151,6 +151,7 @@ class MicPlugin:
         return {
             "name": "mic",
             "type": "sensor",
+            "multiInstance": False,
             "description": f"G1 microphone — captures UDP multicast audio (PCM-16 16kHz mono) and publishes to ROS2 topic {self._topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}],
@@ -163,7 +164,9 @@ class MicPlugin:
         self._node.stop_capture()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
-        return None  # sensor — no callable actions
+        if action == "info":
+            return {"state": "running", "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}]}
+        return None  # sensor — no other callable actions
 
 
 # ── NativeTtsPlugin (actuator) ───────────────────────────────────────────────
@@ -178,6 +181,7 @@ class NativeTtsPlugin:
         return {
             "name": "tts",
             "type": "actuator",
+            "multiInstance": False,
             "description": "G1 on-board TTS engine — synthesize text to robot speech, control volume",
             "inputSchema": {
                 "type": "object",
@@ -376,6 +380,7 @@ class SpeakerPlugin:
         return {
             "name": "speaker",
             "type": "actuator",
+            "multiInstance": False,
             "description": "G1 speaker — subscribes to ROS2 topic and streams PCM-16k audio to robot speaker",
             "inputSchema": {
                 "type": "object",
@@ -429,6 +434,7 @@ class LedPlugin:
         return {
             "name": "led",
             "type": "actuator",
+            "multiInstance": False,
             "description": "G1 LED strip control — set RGB color or turn off",
             "inputSchema": {
                 "type": "object",
@@ -560,6 +566,7 @@ class LocoStatePlugin:
         return {
             "name": "loco_state",
             "type": "sensor",
+            "multiInstance": False,
             "description": f"G1 locomotion state (always active) — mode, velocity, position, body_height, foot_force, IMU. Publishes at 10Hz to {self._odom_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._odom_topic, "format": "data/json"}],
@@ -569,6 +576,7 @@ class LocoStatePlugin:
         return {
             "name": "loco_motion_state",
             "type": "sensor",
+            "multiInstance": False,
             "description": f"G1 sport mode state (only active when standing/walking) — same fields as loco_state but from motion controller. Publishes to {self._motion_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._motion_topic, "format": "data/json"}],
@@ -581,6 +589,11 @@ class LocoStatePlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "info":
+            tool_name = args.get('_tool_name', '')
+            if tool_name == 'loco_motion_state':
+                return {"state": "running", "topic_out": [{"topic": self._motion_topic, "format": "data/json"}]}
+            return {"state": "running", "topic_out": [{"topic": self._odom_topic, "format": "data/json"}]}
         return None  # sensor
 
 
@@ -589,36 +602,56 @@ class LocoStatePlugin:
 class LocoPlugin:
     PREFIX = "loco"
 
-    def __init__(self, plugin_config: dict, namespace: str, executor, loco_client):
+    def __init__(self, plugin_config: dict, namespace: str, executor, loco_client, slam_client=None, smart_motion=None):
         self._client = loco_client
+        self._slam_client = slam_client
+        self._smart_motion = smart_motion
+        self._namespace = namespace
+        self._move_timer: threading.Timer | None = None
 
     def get_tools(self) -> list:
-        return [self._loco_tool(), self._switch_mode_tool(), self._switch_mode_expert_tool()]
+        tools = [self._loco_tool(), self._switch_mode_tool(), self._switch_mode_expert_tool()]
+        if self._smart_motion:
+            tools.append(self._motion_events_tool())
+        return tools
+
+    def _motion_events_tool(self) -> dict:
+        topic = f"/{self._namespace}/safety/motion_events"
+        return {
+            "name": "motion_events",
+            "type": "sensor",
+            "multiInstance": False,
+            "description": f"SmartMotion safety harness events — motion_start/stop/decelerate/resume, nav_start/paused/resumed/stopped, safety_stop (tilt/foot_airborne/comm_timeout/overheat). Publishes to {topic}",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": topic, "format": "data/json"}],
+        }
 
     def _loco_tool(self) -> dict:
         return {
             "name": "loco",
             "type": "actuator",
+            "multiInstance": False,
             "description": "G1 locomotion control — move, stop, set height, wave/shake hand",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["move", "stop", "set_stand_height", "wave_hand", "shake_hand"],
+                        "enum": ["move", "stop_move", "set_stand_height", "wave_hand", "shake_hand"],
                         "description": "Action to perform",
                     },
                     "vx":         {"type": "number", "description": "Forward velocity m/s [-1, 1]"},
                     "vy":         {"type": "number", "description": "Lateral velocity m/s [-1, 1]"},
                     "vyaw":       {"type": "number", "description": "Yaw rotation rad/s [-2, 2]"},
-                    "continuous": {"type": "boolean", "description": "Keep moving until stop (default false)"},
+                    "continuous": {"type": "boolean", "description": "Keep moving until stop (default false). Deprecated: use duration instead."},
+                    "duration":   {"type": "number", "description": "Move duration in seconds. -1 = move until explicit stop (default -1)"},
                     "height":     {"type": "number", "description": "Normalized height 0.0-1.0"},
                     "turn":       {"type": "boolean", "description": "Turn while waving (default false)"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "move":             {"params": ["vx", "vy", "vyaw", "continuous"], "description": "Move the robot with specified velocities"},
-                    "stop":             {"params": [],                                 "description": "Stop all movement immediately"},
+                    "move":             {"params": ["vx", "vy", "vyaw", "duration"], "description": "Move with specified velocities. duration>0 for timed move, -1 for continuous until stop."},
+                    "stop_move":        {"params": [],                                 "description": "Stop all movement immediately"},
                     "set_stand_height": {"params": ["height"],                         "description": "Set the robot's standing height (0.0-1.0)"},
                     "wave_hand":        {"params": ["turn"],                           "description": "Perform a waving hand gesture"},
                     "shake_hand":       {"params": [],                                 "description": "Perform a handshake gesture"},
@@ -630,6 +663,7 @@ class LocoPlugin:
         return {
             "name": "switch_mode",
             "type": "actuator",
+            "multiInstance": False,
             "description": "G1 locomotion mode switch — change posture/locomotion mode by name. damp=阻尼, start=主运控, zero_torque=零力矩, squat=下蹲, stand_up=起立, lie_to_stand=躺起, sit=落座, balance_stand=平衡站立, continuous_gait=持续踏步, stop_gait=停止踏步, high_stand=最高站, low_stand=最低站",
             "inputSchema": {
                 "type": "object",
@@ -650,6 +684,7 @@ class LocoPlugin:
         return {
             "name": "switch_mode_expert",
             "type": "actuator",
+            "multiInstance": False,
             "description": "G1 locomotion mode switch — directly set FSM mode ID (expert use only). IDs: 0=zero_torque, 1=damp, 2=squat, 3=sit, 4=lock_stand, 500=normal_loco, 501=3dof_waist, 702=lie_to_stand, 706=balance_squat, 801=run_loco",
             "inputSchema": {
                 "type": "object",
@@ -667,17 +702,63 @@ class LocoPlugin:
         pass
 
     def stop(self) -> None:
-        pass
+        if self._move_timer:
+            self._move_timer.cancel()
+            self._move_timer = None
+        self._client.StopMove()
+
+    def _auto_stop(self):
+        """Timer 回调：自动停止运动"""
+        self._move_timer = None
+        self._client.StopMove()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "info":
+            tool_name = args.get("_tool_name", "motion_events")
+            if tool_name == "motion_events" and self._smart_motion:
+                topic = f"/{self._namespace}/safety/motion_events"
+                return {"state": "running", "topic_out": [{"topic": topic, "format": "data/json"}]}
+            return None
         if action == "move":
-            vx   = max(-1.0, min(1.0,  float(args.get("vx",   0))))
-            vy   = max(-1.0, min(1.0,  float(args.get("vy",   0))))
-            vyaw = max(-2.0, min(2.0,  float(args.get("vyaw", 0))))
-            continuous = bool(args.get("continuous", False))
-            ret  = self._client.Move(vx, vy, vyaw, continuous)
-            return {"ret": ret, "vx": vx, "vy": vy, "vyaw": vyaw, "continuous": continuous}
-        elif action == "stop":
+            vx   = float(args.get("vx",   0))
+            vy   = float(args.get("vy",   0))
+            vyaw = float(args.get("vyaw", 0))
+            duration = float(args.get("duration", -1))
+
+            # Route through SmartMotion safety harness
+            if self._smart_motion:
+                return self._smart_motion.move(vx, vy, vyaw, duration)
+
+            # Fallback: direct control (no safety harness)
+            vx   = max(-1.0, min(1.0, vx))
+            vy   = max(-1.0, min(1.0, vy))
+            vyaw = max(-2.0, min(2.0, vyaw))
+
+            if self._move_timer:
+                self._move_timer.cancel()
+                self._move_timer = None
+
+            ret = self._client.Move(vx, vy, vyaw, True)
+
+            if duration > 0:
+                self._move_timer = threading.Timer(duration, self._auto_stop)
+                self._move_timer.start()
+
+            return {"ret": ret, "vx": vx, "vy": vy, "vyaw": vyaw, "duration": duration}
+        elif action == "stop_move":
+            # Route through SmartMotion safety harness
+            if self._smart_motion:
+                return self._smart_motion.stop()
+
+            # Fallback: direct control
+            if self._move_timer:
+                self._move_timer.cancel()
+                self._move_timer = None
+            if self._slam_client:
+                try:
+                    self._slam_client.PauseNav()
+                except Exception:
+                    pass
             ret = self._client.StopMove()
             return {"ret": ret}
         elif action == "switch_mode":
@@ -767,6 +848,7 @@ class AsrPlugin:
         return {
             "name": "asr",
             "type": "sensor",
+            "multiInstance": False,
             "description": (
                 "G1 built-in ASR — offline speech recognition results "
                 "(text, angle, confidence, emotion). "
@@ -783,6 +865,8 @@ class AsrPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "info":
+            return {"state": "running", "topic_out": [{"topic": self._topic, "format": "data/json"}]}
         return None
 
 
@@ -819,6 +903,7 @@ class ArmActionPlugin:
         return {
             "name": "arm",
             "type": "actuator",
+            "multiInstance": False,
             "description": f"G1 arm gestures — execute predefined actions. Available: {', '.join(_ARM_ACTION_MAP)}",
             "inputSchema": {
                 "type": "object",
@@ -1013,6 +1098,7 @@ class StatePlugin:
         return {
             "name": "imu",
             "type": "sensor",
+            "multiInstance": False,
             "description": f"G1 IMU sensor — quaternion, gyroscope, accelerometer, rpy, temperature. Publishes to {self._imu_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._imu_topic, "format": "data/json"}],
@@ -1022,6 +1108,7 @@ class StatePlugin:
         return {
             "name": "battery",
             "type": "sensor",
+            "multiInstance": False,
             "description": f"G1 BMS battery — SOC%, SOH%, current(mA), voltage, cell voltages, temperature, charge cycles. Publishes at 1Hz to {self._battery_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._battery_topic, "format": "data/json"}],
@@ -1031,6 +1118,7 @@ class StatePlugin:
         return {
             "name": "joints",
             "type": "sensor",
+            "multiInstance": False,
             "description": f"G1 joint states — 35 motors with position(q), velocity(dq), torque(tau), temperature. Publishes at 10Hz to {self._joints_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._joints_topic, "format": "sensor/skeleton"}],
@@ -1040,6 +1128,7 @@ class StatePlugin:
         return {
             "name": "mainboard",
             "type": "sensor",
+            "multiInstance": False,
             "description": f"G1 mainboard state — temperature, fan state, system values. Publishes at 0.5Hz to {self._mainboard_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._mainboard_topic, "format": "data/json"}],
@@ -1049,6 +1138,7 @@ class StatePlugin:
         return {
             "name": "model",
             "type": "resource",
+            "multiInstance": False,
             "description": "G1 robot URDF model for 3D visualization — kinematic chain with joint origins, axes, and limits",
             "inputSchema": {"type": "object", "properties": {}},
         }
@@ -1060,6 +1150,18 @@ class StatePlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "info":
+            tool_name = args.get('_tool_name', '')
+            topic_map = {
+                'imu':       (self._imu_topic,      'data/json'),
+                'battery':   (self._battery_topic,  'data/json'),
+                'joints':    (self._joints_topic,   'sensor/skeleton'),
+                'mainboard': (self._mainboard_topic,'data/json'),
+            }
+            if tool_name in topic_map:
+                topic, fmt = topic_map[tool_name]
+                return {"state": "running", "topic_out": [{"topic": topic, "format": fmt}]}
+            return {"state": "running"}
         if action == "model":
             from pathlib import Path
             urdf_path = Path(__file__).parent / "resource" / "g1_model.urdf"
@@ -1071,9 +1173,8 @@ class StatePlugin:
 
 # ── LidarPlugin (sensor) ─────────────────────────────────────────────────────
 
-LIDAR_MAX_POINTS     = 5000       # max points per frame for WebSocket
 LIDAR_CLOUD_INTERVAL = 0.1       # 10 Hz throttle (source is 10Hz anyway)
-LIDAR_IMU_INTERVAL   = 0.05      # 20 Hz throttle (source is 200Hz)
+LIDAR_IMU_INTERVAL   = 0.0      # no throttle — publish at full 200Hz for HTMSG
 
 
 class _LidarNode(Node):
@@ -1081,7 +1182,7 @@ class _LidarNode(Node):
 
     def __init__(self, cloud_topic: str, imu_topic: str):
         super().__init__("g1_lidar")
-        # cloud published as raw bytes: [uint32 N][float32 x,y,z,intensity × N]
+        # cloud published as raw passthrough: [uint32 point_step][uint32 total_points][raw PointCloud2 bytes]
         from std_msgs.msg import UInt8MultiArray
         self._cloud_pub = self.create_publisher(UInt8MultiArray, cloud_topic, _LOW_LAT_QOS)
         self._imu_pub   = self.create_publisher(String, imu_topic, _LOW_LAT_QOS)
@@ -1114,54 +1215,21 @@ class _LidarNode(Node):
             return
         self._last_cloud_time = now
 
-        # Parse PointCloud2 fields to find x, y, z, intensity offsets
-        field_map = {}
-        for f in msg.fields:
-            field_map[f.name] = (f.offset, f.datatype)
-
-        x_off = field_map.get("x", (0, 7))[0]
-        y_off = field_map.get("y", (4, 7))[0]
-        z_off = field_map.get("z", (8, 7))[0]
-        # intensity may be named "intensity" or "reflectivity"
-        i_off = None
-        for name in ("intensity", "reflectivity"):
-            if name in field_map:
-                i_off = field_map[name][0]
-                break
-
+        # Passthrough: forward full PointCloud2 data without modification
+        # Format: [uint32 point_step][uint32 total_points][raw bytes]
         point_step = msg.point_step
         total_points = msg.width * msg.height
         data = bytes(msg.data)
 
-        # Downsample if needed
-        stride = max(1, total_points // LIDAR_MAX_POINTS)
-        num_out = min(total_points, LIDAR_MAX_POINTS)
-
-        # Pack binary: [uint32 num_points][float32 x, y, z, intensity × N]
-        out = struct.pack('<I', num_out)
-        idx = 0
-        count = 0
-        for i in range(0, total_points * point_step, point_step * stride):
-            if count >= num_out:
-                break
-            if i + point_step > len(data):
-                break
-            x = struct.unpack_from('<f', data, i + x_off)[0]
-            y = struct.unpack_from('<f', data, i + y_off)[0]
-            z = struct.unpack_from('<f', data, i + z_off)[0]
-            intensity = struct.unpack_from('<f', data, i + i_off)[0] if i_off is not None else 0.0
-            out += struct.pack('<ffff', x, y, z, intensity)
-            count += 1
-
-        # Publish as UInt8MultiArray (binary passthrough)
+        header = struct.pack('<II', point_step, total_points)
         from std_msgs.msg import UInt8MultiArray
         ros_msg = UInt8MultiArray()
-        ros_msg.data = list(out)
+        ros_msg.data = list(header + data)
         self._cloud_pub.publish(ros_msg)
 
     def _on_imu(self, msg) -> None:
         now = time.monotonic()
-        if now - self._last_imu_time < LIDAR_IMU_INTERVAL:
+        if LIDAR_IMU_INTERVAL > 0 and now - self._last_imu_time < LIDAR_IMU_INTERVAL:
             return
         self._last_imu_time = now
 
@@ -1193,16 +1261,29 @@ class LidarPlugin:
         return {
             "name": "lidar_cloud",
             "type": "sensor",
-            "description": f"Livox Mid-360 point cloud — up to {LIDAR_MAX_POINTS} points per frame at 10Hz. Binary format: [uint32 N][float32 x,y,z,intensity × N]. Publishes to {self._cloud_topic}",
+            "multiInstance": False,
+            "description": f"Livox Mid-360 full point cloud passthrough at 10Hz. Binary format: [uint32 point_step][uint32 total_points][raw PointCloud2 bytes]. Publishes to {self._cloud_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._cloud_topic, "format": "sensor/pointcloud"}],
+            "configSchema": {
+                "type": "object",
+                "properties": {
+                    "axis_x_source": {"type": "string", "enum": ["x", "y", "z"], "default": "y", "title": "显示X轴(右) ← 雷达轴"},
+                    "axis_x_negate": {"type": "boolean", "default": False, "title": "取反X"},
+                    "axis_y_source": {"type": "string", "enum": ["x", "y", "z"], "default": "z", "title": "显示Y轴(上) ← 雷达轴"},
+                    "axis_y_negate": {"type": "boolean", "default": True, "title": "取反Y"},
+                    "axis_z_source": {"type": "string", "enum": ["x", "y", "z"], "default": "x", "title": "显示Z轴(前) ← 雷达轴"},
+                    "axis_z_negate": {"type": "boolean", "default": True, "title": "取反Z"},
+                },
+            },
         }
 
     def _imu_tool(self) -> dict:
         return {
             "name": "lidar_imu",
             "type": "sensor",
-            "description": f"Livox Mid-360 IMU — quaternion, gyroscope, accelerometer, rpy at 20Hz. Publishes to {self._imu_topic}",
+            "multiInstance": False,
+            "description": f"Livox Mid-360 IMU — quaternion, gyroscope, accelerometer, rpy at 200Hz. Publishes to {self._imu_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._imu_topic, "format": "data/json"}],
         }
@@ -1214,6 +1295,11 @@ class LidarPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "info":
+            tool_name = args.get('_tool_name', '')
+            if tool_name == 'lidar_imu':
+                return {"state": "running", "topic_out": [{"topic": self._imu_topic, "format": "data/json"}]}
+            return {"state": "running", "topic_out": [{"topic": self._cloud_topic, "format": "sensor/pointcloud"}]}
         return None  # sensor
 
 
@@ -1359,17 +1445,26 @@ def _bearing_label(dx: float, dy: float) -> str:
 
 
 class _SlamInfoNode(Node):
-    """Subscribes to rt/slam_info, rt/slam_key_info, and mapping point clouds. Publishes pos_tag + mapping."""
+    """Subscribes to rt/slam_info, rt/slam_key_info, and mapping point clouds.
+    Maintains a 3D voxel map buffer and publishes full map at 1Hz."""
 
-    MAPPING_INTERVAL = 0.5   # 2 Hz for mapping viz (point cloud is heavy)
-    MAPPING_MAX_POINTS = 8000  # downsample mapping cloud
+    import numpy as np
 
-    def __init__(self, pos_tag_topic: str, mapping_topic: str, db: _SpatialDB):
+    VOXEL_SIZE = 0.05            # 5cm voxel grid for deduplication
+    MAP_PUBLISH_INTERVAL = 1.0   # 1 Hz full map publish
+    MAP_SAVE_INTERVAL = 5.0      # auto-save PCD every 5s
+    MAX_SEND_POINTS = 50000      # max points per publish (downsample if exceeded)
+    RECENT_CLOUD_MAX = 50000     # recent cloud ring buffer capacity
+    KF_DIST_THRESH = 2.0         # keyframe every 2m movement
+    KF_YAW_THRESH = 0.52         # or 30° rotation
+
+    def __init__(self, pos_tag_topic: str, mapping_topic: str, db: _SpatialDB, sc_mgr=None):
         super().__init__("g1_spatial")
         self._db = db
+        self._sc_mgr = sc_mgr  # ScanContextManager (optional)
+        self._auto_mapping_cb = None  # set by SpatialPlugin: called once on first localization
         self._pos_tag_pub = self.create_publisher(String, pos_tag_topic, _LOW_LAT_QOS)
 
-        # Mapping viz: binary [robot_x, robot_y, robot_yaw, uint32 N, float32 x,y × N]
         from std_msgs.msg import UInt8MultiArray
         self._mapping_pub = self.create_publisher(UInt8MultiArray, mapping_topic, _LOW_LAT_QOS)
 
@@ -1383,14 +1478,52 @@ class _SlamInfoNode(Node):
         self._last_pub_time: float = 0.0
         self._last_traj_time: float = 0.0
         self._last_traj_pose: tuple = (0.0, 0.0)
-        self._last_mapping_time: float = 0.0
 
-        # Subscribe DDS topics
+        # 3D voxel map buffer: dict[(ix,iy,iz)] → (x, y, z)
+        self._map_buffer: dict[tuple, tuple] = {}
+        self._map_buffer_lock = threading.Lock()
+        self._map_buffer_dirty = False  # set True when new points added, False after save
+
+        # Cloud processing queue + background thread (decouples DDS callback from heavy processing)
+        self._cloud_queue = queue.Queue(maxsize=50)
+        self._cloud_processor_running = True
+        self._cloud_processor_thread = threading.Thread(
+            target=self._cloud_processor_loop, daemon=True, name="cloud_processor"
+        )
+        self._cloud_processor_thread.start()
+
+        # Recent cloud ring buffer for discover_map fingerprinting
+        self._recent_cloud = _SlamInfoNode.np.zeros((self.RECENT_CLOUD_MAX, 3), dtype=_SlamInfoNode.np.float32)
+        self._recent_cloud_count = 0
+        self._recent_cloud_write_idx = 0
+
+        # Keyframe tracking for Scan Context
+        self._last_kf_pose: tuple = (0.0, 0.0, 0.0)  # (x, y, yaw)
+
+        # Watchdog: detect when point cloud stops arriving
+        self._last_cloud_time: float = 0.0
+        self._watchdog_cb = None  # set by SpatialPlugin: called when cloud stops
+        self._watchdog_timer: threading.Timer | None = None
+        self._watchdog_running = False
+        self.WATCHDOG_TIMEOUT = 3.0  # seconds without data before triggering restart
+
+        # 1Hz full map publish timer
+        self._last_map_publish_time: float = 0.0
+
+        # Auto-save PCD timer
+        self._last_map_save_time: float = 0.0
+        self._pcd_save_dir: str | None = None  # set by SpatialPlugin when active map is set
+        self._save_timer: threading.Timer | None = None
+        self._save_timer_running = False
+
+        # Subscribe DDS topics (store refs to prevent GC from killing subscriptions)
+        self._dds_subs = []
         try:
             from unitree_sdk2py.core.channel import ChannelSubscriber
             from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
             info_sub = ChannelSubscriber("rt/slam_info", String_)
             info_sub.Init(self._on_slam_info, 10)
+            self._dds_subs.append(info_sub)
             self.get_logger().info("SpatialNode subscribed rt/slam_info")
         except Exception as e:
             self.get_logger().warn(f"SpatialNode: failed to subscribe rt/slam_info: {e}")
@@ -1400,6 +1533,7 @@ class _SlamInfoNode(Node):
             from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
             key_sub = ChannelSubscriber("rt/slam_key_info", String_)
             key_sub.Init(self._on_slam_key_info, 10)
+            self._dds_subs.append(key_sub)
             self.get_logger().info("SpatialNode subscribed rt/slam_key_info")
         except Exception as e:
             self.get_logger().warn(f"SpatialNode: failed to subscribe rt/slam_key_info: {e}")
@@ -1410,6 +1544,7 @@ class _SlamInfoNode(Node):
             from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_
             map_cloud_sub = ChannelSubscriber("rt/unitree/slam_mapping/points", PointCloud2_)
             map_cloud_sub.Init(self._on_mapping_cloud, 10)
+            self._dds_subs.append(map_cloud_sub)
             self.get_logger().info("SpatialNode subscribed rt/unitree/slam_mapping/points")
         except Exception as e:
             self.get_logger().warn(f"SpatialNode: failed to subscribe mapping points: {e}")
@@ -1419,6 +1554,7 @@ class _SlamInfoNode(Node):
             from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_
             reloc_cloud_sub = ChannelSubscriber("rt/unitree/slam_relocation/points", PointCloud2_)
             reloc_cloud_sub.Init(self._on_mapping_cloud, 10)
+            self._dds_subs.append(reloc_cloud_sub)
             self.get_logger().info("SpatialNode subscribed rt/unitree/slam_relocation/points")
         except Exception as e:
             self.get_logger().warn(f"SpatialNode: failed to subscribe relocation points: {e}")
@@ -1439,6 +1575,7 @@ class _SlamInfoNode(Node):
                     1 - 2 * pose_data.get("q_z", 0) ** 2
                 )
                 with self._lock:
+                    prev_status = self._map_status
                     self._current_pose = {
                         "x": pose_data["x"],
                         "y": pose_data["y"],
@@ -1448,6 +1585,15 @@ class _SlamInfoNode(Node):
                         self._map_status = "localized"
                     elif msg_type == "mapping_info":
                         self._map_status = "mapping"
+
+                # Auto-transition: localized → mapping (always be mapping)
+                # Only fire if transitioning TO localized from a non-mapping state
+                if msg_type == "pos_info" and prev_status != "mapping" and prev_status != "localized" and self._auto_mapping_cb:
+                    self.get_logger().info("[slam_info] Localized! Triggering auto StartMapping...")
+                    try:
+                        self._auto_mapping_cb()
+                    except Exception as e:
+                        self.get_logger().warn(f"[slam_info] auto-mapping callback failed: {e}")
 
             # Trajectory recording
             self._maybe_record_trajectory()
@@ -1483,63 +1629,109 @@ class _SlamInfoNode(Node):
                     self._nav_target_name = None
 
     def _on_mapping_cloud(self, msg) -> None:
-        """Process SLAM mapping/relocation point cloud → publish 2D top-down binary."""
-        now = time.monotonic()
-        if now - self._last_mapping_time < self.MAPPING_INTERVAL:
-            return
-        self._last_mapping_time = now
+        """DDS callback: fast enqueue only. Processing happens in separate thread."""
+        # Quick extract raw data and enqueue — don't block DDS thread
+        try:
+            data = bytes(msg.data)
+            if len(data) < msg.point_step:
+                return
+            self._cloud_queue.put_nowait((msg.fields, msg.point_step, msg.width * msg.height, data))
+        except Exception:
+            pass  # queue full, drop frame
 
-        # Get current robot pose
-        with self._lock:
-            pose = self._current_pose
-
-        robot_x = pose["x"] if pose else 0.0
-        robot_y = pose["y"] if pose else 0.0
-        robot_yaw = pose["yaw"] if pose else 0.0
-
-        # Parse PointCloud2 fields
-        field_map = {}
-        for f in msg.fields:
-            field_map[f.name] = (f.offset, f.datatype)
-
-        x_off = field_map.get("x", (0, 7))[0]
-        y_off = field_map.get("y", (4, 7))[0]
-
-        point_step = msg.point_step
-        total_points = msg.width * msg.height
-        data = bytes(msg.data)
-
-        # Downsample
-        stride = max(1, total_points // self.MAPPING_MAX_POINTS)
-        num_out = min(total_points, self.MAPPING_MAX_POINTS)
-
-        # Pack binary: [float32 robot_x, robot_y, robot_yaw][uint32 N][float32 x, y × N]
-        out = struct.pack('<fff', robot_x, robot_y, robot_yaw)
-        points_buf = b''
-        count = 0
-        for i in range(0, total_points * point_step, point_step * stride):
-            if count >= num_out:
-                break
-            if i + point_step > len(data):
-                break
-            x = struct.unpack_from('<f', data, i + x_off)[0]
-            y = struct.unpack_from('<f', data, i + y_off)[0]
-            # Filter out invalid points (NaN or very far)
-            if x != x or y != y:  # NaN check
+    def _cloud_processor_loop(self):
+        """Background thread: processes queued point clouds at its own pace."""
+        np = _SlamInfoNode.np
+        while self._cloud_processor_running:
+            try:
+                item = self._cloud_queue.get(timeout=1.0)
+            except Exception:
                 continue
-            if abs(x) > 50 or abs(y) > 50:
+
+            fields, point_step, total_points, data = item
+            if total_points == 0:
                 continue
-            points_buf += struct.pack('<ff', x, y)
-            count += 1
 
-        out += struct.pack('<I', count)
-        out += points_buf
+            # Parse fields
+            field_map = {}
+            for f in fields:
+                field_map[f.name] = (f.offset, f.datatype)
+            x_off = field_map.get("x", (0, 7))[0]
+            y_off = field_map.get("y", (4, 7))[0]
+            z_off = field_map.get("z", (8, 7))[0]
 
-        # Publish as UInt8MultiArray
-        from std_msgs.msg import UInt8MultiArray
-        ros_msg = UInt8MultiArray()
-        ros_msg.data = list(out)
-        self._mapping_pub.publish(ros_msg)
+            # Numpy vectorized parsing
+            num_points = min(total_points, 20000)
+            if len(data) < num_points * point_step:
+                num_points = len(data) // point_step
+
+            # Build structured dtype for the point layout
+            # Extract x, y, z using byte offsets directly
+            raw = np.frombuffer(data, dtype=np.uint8, count=num_points * point_step)
+            raw = raw.reshape(num_points, point_step)
+
+            x = raw[:, x_off:x_off+4].view(np.float32).ravel()
+            y = raw[:, y_off:y_off+4].view(np.float32).ravel()
+            z = raw[:, z_off:z_off+4].view(np.float32).ravel()
+
+            # Filter invalid (NaN and out of range)
+            valid = (
+                np.isfinite(x) & np.isfinite(y) & np.isfinite(z) &
+                (np.abs(x) < 50) & (np.abs(y) < 50) & (np.abs(z) < 20)
+            )
+            x, y, z = x[valid], y[valid], z[valid]
+
+            if len(x) == 0:
+                continue
+
+            pts_arr = np.column_stack([x, y, z]).astype(np.float32)
+
+            # Merge into voxel map buffer (deduplication)
+            voxel_size = self.VOXEL_SIZE
+            # Vectorized voxel key computation
+            ix = (pts_arr[:, 0] / voxel_size).astype(np.int32)
+            iy = (pts_arr[:, 1] / voxel_size).astype(np.int32)
+            iz = (pts_arr[:, 2] / voxel_size).astype(np.int32)
+
+            with self._map_buffer_lock:
+                prev_size = len(self._map_buffer)
+                for j in range(len(pts_arr)):
+                    key = (int(ix[j]), int(iy[j]), int(iz[j]))
+                    if key not in self._map_buffer:
+                        self._map_buffer[key] = (float(pts_arr[j, 0]), float(pts_arr[j, 1]), float(pts_arr[j, 2]))
+                new_size = len(self._map_buffer)
+                if new_size > prev_size:
+                    self._map_buffer_dirty = True
+
+            self._last_cloud_time = time.monotonic()
+            new_points = new_size - prev_size
+            self.get_logger().info(
+                f"[mapping_cloud] frame: {len(pts_arr)} pts parsed, "
+                f"+{new_points} new voxels, total={new_size}"
+            )
+
+            # Update recent cloud ring buffer
+            n = len(pts_arr)
+            start = self._recent_cloud_write_idx
+            cap = self.RECENT_CLOUD_MAX
+            if n <= cap:
+                end = start + n
+                if end <= cap:
+                    self._recent_cloud[start:end] = pts_arr
+                else:
+                    first = cap - start
+                    self._recent_cloud[start:cap] = pts_arr[:first]
+                    self._recent_cloud[0:n - first] = pts_arr[first:]
+                self._recent_cloud_write_idx = (start + n) % cap
+                self._recent_cloud_count = min(self._recent_cloud_count + n, cap)
+            else:
+                self._recent_cloud[:] = pts_arr[-cap:]
+                self._recent_cloud_write_idx = 0
+                self._recent_cloud_count = cap
+
+            # Keyframe + publish
+            self._maybe_add_keyframe(pts_arr)
+            self._maybe_publish_full_map()
 
     def _maybe_record_trajectory(self):
         with self._lock:
@@ -1557,6 +1749,312 @@ class _SlamInfoNode(Node):
             self._last_traj_time = now
             self._last_traj_pose = (x, y)
             self._db.add_trajectory(x, y, yaw, now)
+
+    def _maybe_add_keyframe(self, pts_arr) -> None:
+        """Generate Scan Context keyframe if robot moved/rotated enough."""
+        if self._sc_mgr is None:
+            return
+        with self._lock:
+            if self._current_pose is None or self._active_map is None:
+                return
+            x, y = self._current_pose["x"], self._current_pose["y"]
+            yaw = self._current_pose["yaw"]
+            active_map = self._active_map
+
+        lx, ly, lyaw = self._last_kf_pose
+        dx = x - lx
+        dy = y - ly
+        dist = math.sqrt(dx * dx + dy * dy)
+        dyaw = abs(yaw - lyaw)
+        if dyaw > math.pi:
+            dyaw = 2 * math.pi - dyaw
+
+        if dist >= self.KF_DIST_THRESH or dyaw >= self.KF_YAW_THRESH:
+            sc = self._sc_mgr.make_scan_context(pts_arr)
+            self._sc_mgr.add_keyframe(active_map, sc, (x, y, 0.0))
+            self._last_kf_pose = (x, y, yaw)
+
+    def _maybe_publish_full_map(self) -> None:
+        """Publish the full 3D voxel map at 1Hz."""
+        np = _SlamInfoNode.np
+        now = time.monotonic()
+        if now - self._last_map_publish_time < self.MAP_PUBLISH_INTERVAL:
+            return
+        self._last_map_publish_time = now
+
+        with self._lock:
+            pose = self._current_pose
+        robot_x = pose["x"] if pose else 0.0
+        robot_y = pose["y"] if pose else 0.0
+        robot_yaw = pose["yaw"] if pose else 0.0
+
+        # Extract points from voxel buffer
+        with self._map_buffer_lock:
+            if not self._map_buffer:
+                return
+            all_points = list(self._map_buffer.values())
+
+        pts = np.array(all_points, dtype=np.float32)
+        num_points = len(pts)
+
+        # Downsample if too many
+        if num_points > self.MAX_SEND_POINTS:
+            indices = np.random.choice(num_points, self.MAX_SEND_POINTS, replace=False)
+            pts = pts[indices]
+            num_points = self.MAX_SEND_POINTS
+
+        # Pack binary: [float32 robot_x, robot_y, robot_yaw][uint8 flags][uint32 N][float32 x,y,z × N]
+        # flags: bit0=full_map(1), bit1=has_z(1) → flags = 0x03
+        flags = 0x03
+        header = struct.pack('<fffBI', robot_x, robot_y, robot_yaw, flags, num_points)
+        body = pts.tobytes()
+
+        from std_msgs.msg import UInt8MultiArray
+        ros_msg = UInt8MultiArray()
+        ros_msg.data = list(header + body)
+        self._mapping_pub.publish(ros_msg)
+
+    def _maybe_save_pcd(self) -> None:
+        """Auto-save map buffer to PCD file. Called by a recurring timer thread."""
+        np = _SlamInfoNode.np
+
+        if not self._pcd_save_dir:
+            self.get_logger().debug("[save_pcd] no save dir set")
+            self._schedule_save_timer()
+            return
+
+        with self._lock:
+            active_map = self._active_map
+        if not active_map:
+            self.get_logger().debug("[save_pcd] no active map")
+            self._schedule_save_timer()
+            return
+
+        with self._map_buffer_lock:
+            if not self._map_buffer or not self._map_buffer_dirty:
+                self._schedule_save_timer()
+                return
+            all_points = list(self._map_buffer.values())
+            self._map_buffer_dirty = False
+
+        if len(all_points) < 10:
+            self._schedule_save_timer()
+            return
+
+        # Write PCD file (ASCII format for simplicity and compatibility)
+        pcd_path = os.path.join(self._pcd_save_dir, f"{active_map}.pcd")
+        os.makedirs(os.path.dirname(pcd_path), exist_ok=True)
+        try:
+            pts = np.array(all_points, dtype=np.float32)
+            num = len(pts)
+            with open(pcd_path, 'w') as f:
+                f.write("# .PCD v0.7 - Point Cloud Data\n")
+                f.write("VERSION 0.7\n")
+                f.write("FIELDS x y z\n")
+                f.write("SIZE 4 4 4\n")
+                f.write("TYPE F F F\n")
+                f.write("COUNT 1 1 1\n")
+                f.write(f"WIDTH {num}\n")
+                f.write("HEIGHT 1\n")
+                f.write("VIEWPOINT 0 0 0 1 0 0 0\n")
+                f.write(f"POINTS {num}\n")
+                f.write("DATA ascii\n")
+                for i in range(num):
+                    f.write(f"{pts[i,0]:.4f} {pts[i,1]:.4f} {pts[i,2]:.4f}\n")
+            self.get_logger().info(f"Auto-saved PCD: {pcd_path} ({num} points)")
+        except Exception as e:
+            self.get_logger().warn(f"Failed to save PCD: {e}")
+
+        self._schedule_save_timer()
+
+    def _schedule_save_timer(self):
+        """Schedule the next PCD auto-save."""
+        if not self._save_timer_running:
+            return
+        self._save_timer = threading.Timer(self.MAP_SAVE_INTERVAL, self._maybe_save_pcd)
+        self._save_timer.daemon = True
+        self._save_timer.start()
+
+    def _start_save_timer(self):
+        """Start the recurring PCD save timer."""
+        self._save_timer_running = True
+        self._schedule_save_timer()
+
+    def _stop_save_timer(self):
+        """Stop the recurring PCD save timer."""
+        self._save_timer_running = False
+        if self._save_timer:
+            self._save_timer.cancel()
+            self._save_timer = None
+        self._stop_watchdog()
+
+    def _start_watchdog(self):
+        """Start the cloud watchdog that detects when point cloud stops arriving."""
+        self._watchdog_running = True
+        self._last_cloud_time = time.monotonic()
+        self._schedule_watchdog()
+
+    def _stop_watchdog(self):
+        """Stop the cloud watchdog."""
+        self._watchdog_running = False
+        if self._watchdog_timer:
+            self._watchdog_timer.cancel()
+            self._watchdog_timer = None
+
+    def _schedule_watchdog(self):
+        if not self._watchdog_running:
+            return
+        self._watchdog_timer = threading.Timer(1.0, self._check_watchdog)
+        self._watchdog_timer.daemon = True
+        self._watchdog_timer.start()
+
+    def _check_watchdog(self):
+        """Check if point cloud has stopped arriving. If so, trigger restart."""
+        if not self._watchdog_running:
+            return
+        now = time.monotonic()
+        elapsed = now - self._last_cloud_time
+        if self._last_cloud_time > 0 and elapsed > self.WATCHDOG_TIMEOUT and self._watchdog_cb:
+            self.get_logger().warn(
+                f"[watchdog] No point cloud for {elapsed:.1f}s, triggering restart"
+            )
+            self._last_cloud_time = now  # reset to avoid repeated triggers
+            try:
+                self._watchdog_cb()
+            except Exception as e:
+                self.get_logger().warn(f"[watchdog] restart callback failed: {e}")
+        self._schedule_watchdog()
+
+    def set_pcd_save_dir(self, path: str):
+        """Set the directory for auto-saving PCD files and start the save timer."""
+        self._pcd_save_dir = path
+        self._start_save_timer()
+
+    def load_pcd_to_buffer(self, pcd_path: str) -> None:
+        """Load a PCD file into the voxel map buffer."""
+        np = _SlamInfoNode.np
+        if not os.path.exists(pcd_path):
+            self.get_logger().warn(f"PCD file not found: {pcd_path}")
+            return
+
+        points = self._parse_pcd(pcd_path)
+        if points is None or len(points) == 0:
+            return
+
+        voxel_size = self.VOXEL_SIZE
+        with self._map_buffer_lock:
+            for i in range(len(points)):
+                ix = int(points[i, 0] / voxel_size)
+                iy = int(points[i, 1] / voxel_size)
+                iz = int(points[i, 2] / voxel_size)
+                self._map_buffer[(ix, iy, iz)] = (points[i, 0], points[i, 1], points[i, 2])
+
+        self.get_logger().info(f"Loaded {len(points)} points from PCD, buffer size: {len(self._map_buffer)}")
+
+    def clear_map_buffer(self) -> None:
+        """Clear the voxel map buffer."""
+        with self._map_buffer_lock:
+            self._map_buffer.clear()
+
+    def get_recent_cloud(self):
+        """Return recent cloud points as Nx3 numpy array (for discover fingerprinting)."""
+        np = _SlamInfoNode.np
+        count = min(self._recent_cloud_count, self.RECENT_CLOUD_MAX)
+        if count == 0:
+            return None
+        return self._recent_cloud[:count].copy()
+
+    @staticmethod
+    def _parse_pcd(path: str):
+        """Parse ASCII/binary PCD file, extract x,y,z columns. Returns Nx3 numpy array."""
+        np = _SlamInfoNode.np
+        try:
+            with open(path, 'rb') as f:
+                header_lines = []
+                while True:
+                    line = f.readline()
+                    if not line:
+                        return None
+                    line_str = line.decode('ascii', errors='ignore').strip()
+                    header_lines.append(line_str)
+                    if line_str.startswith('DATA'):
+                        break
+
+                # Parse header
+                fields = []
+                num_points = 0
+                data_type = "ascii"
+                field_sizes = []
+                field_types = []
+                for hl in header_lines:
+                    parts = hl.split()
+                    if parts[0] == "FIELDS":
+                        fields = parts[1:]
+                    elif parts[0] == "SIZE":
+                        field_sizes = [int(s) for s in parts[1:]]
+                    elif parts[0] == "TYPE":
+                        field_types = parts[1:]
+                    elif parts[0] == "POINTS":
+                        num_points = int(parts[1])
+                    elif parts[0] == "DATA":
+                        data_type = parts[1].lower()
+
+                if num_points == 0:
+                    return None
+
+                # Find x, y, z field indices
+                try:
+                    xi = fields.index("x")
+                    yi = fields.index("y")
+                    zi = fields.index("z")
+                except ValueError:
+                    return None
+
+                if data_type == "ascii":
+                    points = []
+                    for _ in range(num_points):
+                        line = f.readline().decode('ascii', errors='ignore').strip()
+                        if not line:
+                            break
+                        vals = line.split()
+                        if len(vals) <= max(xi, yi, zi):
+                            continue
+                        x = float(vals[xi])
+                        y = float(vals[yi])
+                        z = float(vals[zi])
+                        if x != x or y != y or z != z:
+                            continue
+                        points.append((x, y, z))
+                    return np.array(points, dtype=np.float32) if points else None
+
+                elif data_type == "binary":
+                    point_size = sum(field_sizes)
+                    raw = f.read(num_points * point_size)
+                    if len(raw) < num_points * point_size:
+                        num_points = len(raw) // point_size
+
+                    # Compute byte offsets for x, y, z
+                    offsets = [0]
+                    for s in field_sizes[:-1]:
+                        offsets.append(offsets[-1] + s)
+
+                    x_off = offsets[xi]
+                    y_off = offsets[yi]
+                    z_off = offsets[zi]
+
+                    points = np.zeros((num_points, 3), dtype=np.float32)
+                    for i in range(num_points):
+                        base = i * point_size
+                        points[i, 0] = struct.unpack_from('<f', raw, base + x_off)[0]
+                        points[i, 1] = struct.unpack_from('<f', raw, base + y_off)[0]
+                        points[i, 2] = struct.unpack_from('<f', raw, base + z_off)[0]
+
+                    # Filter NaN
+                    valid = ~np.isnan(points).any(axis=1)
+                    return points[valid]
+
+        except Exception:
+            return None
 
     def _maybe_publish_pos_tag(self):
         now = time.monotonic()
@@ -1628,16 +2126,28 @@ class _SlamInfoNode(Node):
 class SpatialPlugin:
     PREFIX = "spatial"
 
-    def __init__(self, plugin_config: dict, namespace: str, executor, slam_client):
+    def __init__(self, plugin_config: dict, namespace: str, executor, slam_client, smart_motion=None):
         self._client = slam_client
+        self._smart_motion = smart_motion
         self._map_dir = plugin_config.get("map_dir", "/home/unitree")
         os.makedirs(self._map_dir, exist_ok=True)
         db_path = plugin_config.get("db_path", os.path.join(os.path.dirname(__file__), "resource", "spatial.db"))
         self._db = _SpatialDB(db_path)
+
+        # Scan Context manager for auto-discover
+        sc_db_path = os.path.join(os.path.dirname(db_path), "scan_context.db")
+        from scan_context import ScanContextManager
+        self._sc_mgr = ScanContextManager(sc_db_path)
+
         self._pos_tag_topic = f"/{namespace}/spatial/pos_tag"
         self._mapping_topic = f"/{namespace}/spatial/mapping"
-        self._node = _SlamInfoNode(self._pos_tag_topic, self._mapping_topic, self._db)
+        self._node = _SlamInfoNode(self._pos_tag_topic, self._mapping_topic, self._db, self._sc_mgr)
         self._node.set_active_map(self._db.get_last_used_map())
+        self._node.set_pcd_save_dir(self._map_dir)
+        self._node._auto_mapping_cb = self._on_localized
+        self._node._watchdog_cb = None
+        # Watchdog disabled — SLAM mapping cloud may not always be available
+        # self._node._start_watchdog()
         executor.add_node(self._node)
 
     def get_tools(self) -> list:
@@ -1647,6 +2157,7 @@ class SpatialPlugin:
         return {
             "name": "pos_tag",
             "type": "sensor",
+            "multiInstance": False,
             "description": f"Spatial position + nearest tags — current pose, nearby POIs with distance/bearing, map/nav status. 10Hz to {self._pos_tag_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._pos_tag_topic, "format": "data/json"}],
@@ -1656,7 +2167,8 @@ class SpatialPlugin:
         return {
             "name": "mapping",
             "type": "sensor",
-            "description": f"SLAM mapping visualization — 2D top-down point cloud map with robot position. Binary format: [float32 robot_x,y,yaw][uint32 N][float32 x,y × N]. 2Hz to {self._mapping_topic}",
+            "multiInstance": False,
+            "description": f"SLAM 3D mapping visualization — full 3D point cloud map with robot position. Binary format: [float32 robot_x,y,yaw][uint8 flags][uint32 N][float32 x,y,z × N]. 1Hz to {self._mapping_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._mapping_topic, "format": "sensor/mapping"}],
         }
@@ -1665,32 +2177,31 @@ class SpatialPlugin:
         return {
             "name": "spatial",
             "type": "actuator",
-            "description": "Spatial intelligence — map discovery, place tagging, relocalization, navigation. Use navigate_to_tag to go to tagged places.",
+            "multiInstance": False,
+            "description": "Spatial intelligence — place tagging, navigation. Mapping is always active automatically.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["discover_map", "stop_discover", "relocalize", "list_maps",
+                        "enum": ["start_mapping", "stop_mapping",
                                  "tag_place", "untag_place", "list_tags",
                                  "navigate_to_tag", "navigate_to_pose",
                                  "pause_nav", "resume_nav", "stop_nav"],
                         "description": "Action to perform",
                     },
-                    "map_name":    {"type": "string", "description": "Map name for discover/relocalize"},
                     "name":        {"type": "string", "description": "POI tag name"},
                     "description": {"type": "string", "description": "POI description"},
                     "tag_name":    {"type": "string", "description": "Target tag name for navigation"},
                     "x":           {"type": "number", "description": "Target X coordinate (meters)"},
                     "y":           {"type": "number", "description": "Target Y coordinate (meters)"},
                     "yaw":         {"type": "number", "description": "Target yaw (radians)"},
+                    "map_name":    {"type": "string", "description": "Map name (for start/stop mapping)"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "discover_map":     {"params": ["map_name"],           "description": "Start mapping and save with given name"},
-                    "stop_discover":    {"params": [],                     "description": "Stop mapping and save current map"},
-                    "relocalize":       {"params": ["map_name"],           "description": "Load map and relocalize (default: last used map)"},
-                    "list_maps":        {"params": [],                     "description": "List all saved maps"},
+                    "start_mapping":    {"params": ["map_name"],            "description": "Start SLAM mapping (optional map_name)"},
+                    "stop_mapping":     {"params": [],                      "description": "Stop mapping and save the map"},
                     "tag_place":        {"params": ["name", "description"], "description": "Tag current position with a name"},
                     "untag_place":      {"params": ["name"],               "description": "Remove a place tag"},
                     "list_tags":        {"params": [],                     "description": "List all tags with relative positions"},
@@ -1703,61 +2214,181 @@ class SpatialPlugin:
             },
         }
 
+    def _on_localized(self):
+        """Called by _SlamInfoNode when SLAM reports localization success.
+        Automatically transitions to mapping mode to keep building the map."""
+        if self._node._map_status == "mapping":
+            return
+        print("[SpatialPlugin] _on_localized: SLAM localized, starting mapping to extend map", flush=True)
+        code, resp = self._client.StartMapping()
+        print(f"[SpatialPlugin] StartMapping after localization → code={code}", flush=True)
+        if code == 0 or code == 3104:
+            self._node.set_map_status("mapping")
+            if not self._node._active_map:
+                map_name = f"map_{int(time.time())}"
+                pcd_path = f"{self._map_dir}/{map_name}.pcd"
+                self._node.set_active_map(map_name)
+                self._db.add_map(map_name, pcd_path)
+                print(f"[SpatialPlugin] Created new map for post-localization mapping: {map_name}", flush=True)
+
+    def _on_cloud_timeout(self):
+        """Called by watchdog when no point cloud received for WATCHDOG_TIMEOUT seconds.
+        Re-subscribe DDS topics (subscription may have been lost)."""
+        print("[SpatialPlugin] _on_cloud_timeout: re-subscribing DDS mapping topics", flush=True)
+        try:
+            from unitree_sdk2py.core.channel import ChannelSubscriber
+            from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_
+            # Re-create subscriptions
+            sub1 = ChannelSubscriber("rt/unitree/slam_mapping/points", PointCloud2_)
+            sub1.Init(self._node._on_mapping_cloud, 10)
+            sub2 = ChannelSubscriber("rt/unitree/slam_relocation/points", PointCloud2_)
+            sub2.Init(self._node._on_mapping_cloud, 10)
+            # Replace old refs
+            self._node._dds_subs = [s for s in self._node._dds_subs
+                                    if not hasattr(s, '_topic') or 'points' not in str(getattr(s, '_topic', ''))]
+            self._node._dds_subs.extend([sub1, sub2])
+            print("[SpatialPlugin] DDS re-subscribed successfully", flush=True)
+        except Exception as e:
+            print(f"[SpatialPlugin] DDS re-subscribe failed: {e}", flush=True)
+
     def start(self) -> None:
-        pass
+        """Auto-start mapping on plugin start. Always mapping, always observing."""
+        print("[SpatialPlugin] start() called, scheduling auto-mapping in 3s", flush=True)
+        def _auto_start():
+            time.sleep(3)
+            try:
+                self._do_auto_mapping()
+            except Exception as e:
+                print(f"[SpatialPlugin] auto-mapping failed: {e}")
+                import traceback
+                traceback.print_exc()
+        threading.Thread(target=_auto_start, daemon=True).start()
 
     def stop(self) -> None:
-        pass
+        self._node._stop_save_timer()
 
-    def dispatch(self, action: str, args: dict) -> dict | None:
-        if action == "discover_map":
-            map_name = args.get("map_name", "default")
+    def _do_auto_mapping(self) -> dict:
+        """Auto-mapping logic based on current SLAM state:
+        - mapping (code 3104 = already mapping) → just ensure active_map is set, don't interrupt
+        - localized → StartMapping to extend
+        - idle → fingerprint match, then StartMapping
+        """
+        with self._node._lock:
+            status = self._node._map_status
+        print(f"[SpatialPlugin] _do_auto_mapping: current status={status}", flush=True)
+
+        if status == "mapping":
+            # SLAM is already in mapping mode (started automatically by robot)
+            # Don't call StartMapping again (code 3104) — just ensure we track it
+            print("[SpatialPlugin] SLAM already mapping, just ensuring active_map is set", flush=True)
+            if not self._node._active_map:
+                map_name = f"map_{int(time.time())}"
+                pcd_path = f"{self._map_dir}/{map_name}.pcd"
+                self._node.set_active_map(map_name)
+                self._db.add_map(map_name, pcd_path)
+                print(f"[SpatialPlugin] Created map entry: {map_name}", flush=True)
+            return {"status": "already_mapping", "map_name": self._node._active_map}
+
+        if status == "localized":
+            # SLAM finished relocation but not mapping — start mapping to extend
+            print("[SpatialPlugin] SLAM localized, calling StartMapping to extend", flush=True)
             code, resp = self._client.StartMapping()
+            print(f"[SpatialPlugin] StartMapping() → code={code}", flush=True)
             if code == 0:
                 self._node.set_map_status("mapping")
-                self._node.set_active_map(map_name)
-                # Pre-register map entry
+                if not self._node._active_map:
+                    map_name = f"map_{int(time.time())}"
+                    pcd_path = f"{self._map_dir}/{map_name}.pcd"
+                    self._node.set_active_map(map_name)
+                    self._db.add_map(map_name, pcd_path)
+                    print(f"[SpatialPlugin] Created map entry: {map_name}", flush=True)
+                return {"status": "continued", "map_name": self._node._active_map}
+            # code 3104 = already mapping, treat as success
+            if code == 3104:
+                print("[SpatialPlugin] StartMapping returned 3104 (already mapping), ok", flush=True)
+                self._node.set_map_status("mapping")
+                if not self._node._active_map:
+                    map_name = f"map_{int(time.time())}"
+                    pcd_path = f"{self._map_dir}/{map_name}.pcd"
+                    self._node.set_active_map(map_name)
+                    self._db.add_map(map_name, pcd_path)
+                return {"status": "already_mapping", "map_name": self._node._active_map}
+            print(f"[SpatialPlugin] StartMapping failed: code={code}, trying fingerprint path", flush=True)
+            # Fall through to fingerprint path if StartMapping fails
+
+        # SLAM not localized (idle) — try fingerprint matching
+        recent_cloud = self._node.get_recent_cloud()
+        cloud_size = len(recent_cloud) if recent_cloud is not None else 0
+        print(f"[SpatialPlugin] Fingerprint path: recent_cloud={cloud_size} points")
+
+        if recent_cloud is not None and cloud_size >= 100:
+            current_sc = self._sc_mgr.make_scan_context(recent_cloud)
+            match = self._sc_mgr.query(current_sc)
+            print(f"[SpatialPlugin] Fingerprint query: {match}")
+
+            if match:
+                map_name = match["map_name"]
+                map_info = self._db.get_map(map_name)
+                if map_info:
+                    pcd_path = map_info["pcd_path"]
+                    print(f"[SpatialPlugin] Matched map '{map_name}', trying InitPose + StartMapping")
+                    code, resp = self._client.InitPose(0, 0, 0, 0, 0, 0, 1.0, pcd_path)
+                    print(f"[SpatialPlugin] InitPose → code={code}")
+                    if code == 0:
+                        code2, _ = self._client.StartMapping()
+                        print(f"[SpatialPlugin] StartMapping after InitPose → code={code2}")
+                        if code2 == 0:
+                            self._node.load_pcd_to_buffer(pcd_path)
+                            self._node.set_map_status("mapping")
+                            self._node.set_active_map(map_name)
+                            self._db.set_last_used_map(map_name)
+                            return {"status": "found", "map_name": map_name, "pose": match["pose"]}
+
+        # No match or no data — start fresh
+        print("[SpatialPlugin] No match, starting new map")
+        code, resp = self._client.StartMapping()
+        print(f"[SpatialPlugin] StartMapping() → code={code}")
+        if code == 0:
+            map_name = f"map_{int(time.time())}"
+            pcd_path = f"{self._map_dir}/{map_name}.pcd"
+            self._node.clear_map_buffer()
+            self._node.set_map_status("mapping")
+            self._node.set_active_map(map_name)
+            self._db.add_map(map_name, pcd_path)
+            print(f"[SpatialPlugin] Started new map: {map_name}")
+            return {"status": "new", "map_name": map_name}
+        return {"error": f"StartMapping failed, code={code}"}
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "info":
+            tool_name = args.get('_tool_name', '')
+            if tool_name == 'mapping':
+                return {"state": "running", "topic_out": [{"topic": self._mapping_topic, "format": "sensor/mapping"}]}
+            return {"state": "running", "topic_out": [{"topic": self._pos_tag_topic, "format": "data/json"}]}
+        if action == "start_mapping":
+            map_name = args.get("map_name", f"map_{int(time.time())}")
+            code, resp = self._client.StartMapping()
+            if code == 0 or code == 3104:
                 pcd_path = f"{self._map_dir}/{map_name}.pcd"
+                self._node.clear_map_buffer()
+                self._node.set_map_status("mapping")
+                self._node.set_active_map(map_name)
                 self._db.add_map(map_name, pcd_path)
-                return {"status": "mapping_started", "map_name": map_name}
+                return {"status": "mapping", "map_name": map_name}
             return {"error": f"StartMapping failed, code={code}", "response": resp}
 
-        elif action == "stop_discover":
+        elif action == "stop_mapping":
             active_map = self._node._active_map
             if not active_map:
-                return {"error": "No active mapping session"}
+                return {"error": "No active map"}
             pcd_path = f"{self._map_dir}/{active_map}.pcd"
+            # Save current buffer to PCD before stopping
+            self._node._maybe_save_pcd()
             code, resp = self._client.StopMapping(pcd_path)
+            self._node.set_map_status("idle")
             if code == 0:
-                self._db.set_last_used_map(active_map)
-                self._node.set_map_status("idle")
-                return {"status": "map_saved", "map_name": active_map, "path": pcd_path}
+                return {"status": "stopped", "map_name": active_map, "pcd_path": pcd_path}
             return {"error": f"StopMapping failed, code={code}", "response": resp}
-
-        elif action == "relocalize":
-            map_name = args.get("map_name") or self._db.get_last_used_map()
-            if not map_name:
-                maps = self._db.list_maps()
-                if maps:
-                    return {"error": "no_last_map", "available_maps": [m["name"] for m in maps]}
-                return {"error": "no_maps_available"}
-
-            map_info = self._db.get_map(map_name)
-            if not map_info:
-                return {"error": f"Map '{map_name}' not found", "available_maps": [m["name"] for m in self._db.list_maps()]}
-
-            pcd_path = map_info["pcd_path"]
-            code, resp = self._client.InitPose(0, 0, 0, 0, 0, 0, 1.0, pcd_path)
-            if code == 0:
-                self._db.set_last_used_map(map_name)
-                self._node.set_active_map(map_name)
-                self._node.set_map_status("localized")
-                return {"status": "relocalized", "map_name": map_name}
-            return {"error": f"InitPose failed, code={code}", "response": resp,
-                    "available_maps": [m["name"] for m in self._db.list_maps()]}
-
-        elif action == "list_maps":
-            return {"maps": self._db.list_maps()}
 
         elif action == "tag_place":
             name = args.get("name", "")
@@ -1804,8 +2435,16 @@ class SpatialPlugin:
             poi = self._db.find_poi(tag_name, active_map)
             if not poi:
                 return {"error": f"Tag '{tag_name}' not found", "available": [p["name"] for p in self._db.list_pois(active_map)]}
-            # Convert yaw to quaternion (z-axis rotation)
             yaw = poi.get("yaw", 0)
+
+            # Route through SmartMotion safety harness
+            if self._smart_motion:
+                result = self._smart_motion.navigate_to(poi["x"], poi["y"], yaw, tag_name)
+                if "error" not in result:
+                    self._node.set_nav_target(tag_name)
+                return result
+
+            # Fallback: direct control
             q_z = math.sin(yaw / 2)
             q_w = math.cos(yaw / 2)
             code, resp = self._client.NavigateTo(poi["x"], poi["y"], 0, 0, 0, q_z, q_w)
@@ -1818,6 +2457,15 @@ class SpatialPlugin:
             x = float(args.get("x", 0))
             y = float(args.get("y", 0))
             yaw = float(args.get("yaw", 0))
+
+            # Route through SmartMotion safety harness
+            if self._smart_motion:
+                result = self._smart_motion.navigate_to(x, y, yaw)
+                if "error" not in result:
+                    self._node.set_nav_target(f"({x:.1f}, {y:.1f})")
+                return result
+
+            # Fallback: direct control
             q_z = math.sin(yaw / 2)
             q_w = math.cos(yaw / 2)
             code, resp = self._client.NavigateTo(x, y, 0, 0, 0, q_z, q_w)
@@ -1827,14 +2475,22 @@ class SpatialPlugin:
             return {"error": f"NavigateTo failed, code={code}", "response": resp}
 
         elif action == "pause_nav":
+            if self._smart_motion:
+                return self._smart_motion.pause_nav()
             code, resp = self._client.PauseNav()
             return {"status": "paused"} if code == 0 else {"error": f"PauseNav failed, code={code}"}
 
         elif action == "resume_nav":
+            if self._smart_motion:
+                return self._smart_motion.resume_nav()
             code, resp = self._client.ResumeNav()
             return {"status": "resumed"} if code == 0 else {"error": f"ResumeNav failed, code={code}"}
 
         elif action == "stop_nav":
+            if self._smart_motion:
+                result = self._smart_motion.stop_nav()
+                self._node.set_nav_target(None)
+                return result
             self._client.PauseNav()
             self._node.set_nav_target(None)
             return {"status": "stopped"}
@@ -1854,6 +2510,7 @@ class MotionSwitcherPlugin:
         return {
             "name": "motion_switcher",
             "type": "actuator",
+            "multiInstance": False,
             "description": (
                 "G1 high-level motion mode switcher — check current mode, select mode "
                 "(ai/normal/advanced), or release mode for low-level control. "
@@ -1954,6 +2611,7 @@ class RealSensePlugin:
         return {
             "name": "camera_rgb",
             "type": "sensor",
+            "multiInstance": False,
             "description": f"RealSense color camera — {RS_COLOR_W}x{RS_COLOR_H} JPEG @ {RS_COLOR_FPS}fps. Publishes CompressedImage to {self._color_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._color_topic, "format": "image/jpeg"}],
@@ -1963,6 +2621,7 @@ class RealSensePlugin:
         return {
             "name": "camera_depth",
             "type": "sensor",
+            "multiInstance": False,
             "description": f"RealSense depth camera — {RS_DEPTH_W}x{RS_DEPTH_H} 16UC1 (z16, mm) @ {RS_DEPTH_FPS}fps. Publishes to {self._depth_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._depth_topic, "format": "image/depth-z16"}],
@@ -1972,6 +2631,7 @@ class RealSensePlugin:
         return {
             "name": "camera_distance",
             "type": "sensor",
+            "multiInstance": False,
             "description": f"RealSense center-point distance(m) + fps. Publishes at 10Hz to {self._dist_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._dist_topic, "format": "data/json"}],
@@ -1999,6 +2659,13 @@ class RealSensePlugin:
         self._proc = None
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "info":
+            tool_name = args.get('_tool_name', '')
+            if tool_name == 'camera_depth':
+                return {"state": "running", "topic_out": [{"topic": self._depth_topic, "format": "image/depth-z16"}]}
+            if tool_name == 'camera_distance':
+                return {"state": "running", "topic_out": [{"topic": self._dist_topic, "format": "data/json"}]}
+            return {"state": "running", "topic_out": [{"topic": self._color_topic, "format": "image/jpeg"}]}
         return None  # sensor
 
 

@@ -3,3 +3,4 @@ pyyaml>=6.0
 opencv-python-headless>=4.8
 numpy>=1.24
 pyrealsense2>=2.54
+sounddevice>=0.4.6

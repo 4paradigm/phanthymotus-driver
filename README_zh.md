@@ -65,7 +65,8 @@ python main.py
 想要为新硬件添加驱动？请参阅 **[驱动开发指南](README_dev.md)** 获取完整规范，包括：
 
 - MCP 协议实现（JSON-RPC 2.0 方法）
-- 工具定义规范（`inputSchema`、`configSchema`、`x-action-params`）
+- 工具定义规范（`inputSchema`、`configSchema`、`multiInstance`、`x-action-params`）
+- 实例管理（`multiInstance` 标志、configSchema `scope` 字段）
 - Plugin 生命周期（`__init__`、`get_tool`、`start`、`stop`、`dispatch`）
 - `driver.yaml` 和 `config.yaml` 元数据格式
 - 注册与心跳机制
@@ -77,6 +78,61 @@ python main.py
 - 驱动端口范围：**15700–15799**
 
 参见 [CONTRIBUTING.md](CONTRIBUTING.md) 了解开发环境搭建和 PR 指南。
+
+---
+
+## 音频驱动与 ASR 兼容性要求
+
+任何向感知层 ASR 插件发布音频的驱动，必须满足以下要求。不满足要求的驱动会导致 ASR 收到音频但始终无输出（VAD 静默丢弃不合规的帧）。
+
+### ROS2 消息类型
+
+```
+audio_msgs/AudioChunk
+  std_msgs/Header header
+  string format          # 必须为 "audio/pcm-16k"
+  uint8[] data           # 原始 PCM 字节
+```
+
+### PCM 格式
+
+| 参数 | 要求 |
+|------|------|
+| 编码 | 16-bit 有符号整数，小端序（PCM_S16_LE） |
+| 采样率 | **16 000 Hz** |
+| 声道数 | **单声道（1 channel）** |
+| `format` 字段 | `"audio/pcm-16k"` |
+
+### 帧大小
+
+| 参数 | 约束 |
+|------|------|
+| 最小值 | **1 024 字节**（512 个采样点 ≈ 32 ms） |
+| 推荐范围 | 1 024 – 4 096 字节（32 – 128 ms） |
+
+**小于 1 024 字节的帧会被 VAD 静默丢弃**，这是"ASR 有音频输入但没有文字输出"最常见的原因。
+
+### 48 kHz USB 麦克风的常见陷阱
+
+大多数 USB 音频设备的原生采样率为 48 000 Hz。降采样到 16 000 Hz 后，一个 512 帧的 ALSA period 只有 **170 个采样点（340 字节）**——低于最小值。必须将重采样输出积累到缓冲区，凑够 512 个采样点后再发布：
+
+```python
+TARGET = 1024  # 字节 — 512 个 int16 采样点 @ 16 kHz
+_buf = bytearray()
+
+# 在采集循环内，重采样到 16 kHz 之后：
+_buf += resampled_bytes
+while len(_buf) >= TARGET:
+    chunk, _buf = bytes(_buf[:TARGET]), _buf[TARGET:]
+    msg = AudioChunk()
+    msg.format = "audio/pcm-16k"
+    msg.data = list(chunk)
+    publisher.publish(msg)
+```
+
+`unitree/g1/ext_devices.py` 的 `ext_mic` 插件已应用此模式。
+
+完整的 VAD 调参选项参见主仓库 [perception/README.md](https://github.com/4paradigm/phanthymotus/blob/main/perception/README.md)。
 
 ## 许可证
 
