@@ -1180,7 +1180,7 @@ LIDAR_IMU_INTERVAL   = 0.0      # no throttle — publish at full 200Hz for HTMS
 class _LidarNode(Node):
     """Subscribes to DDS utlidar PointCloud2 + IMU and republishes as binary/JSON to ROS2."""
 
-    def __init__(self, cloud_topic: str, imu_topic: str):
+    def __init__(self, cloud_topic: str, imu_topic: str, state_imu_topic: str):
         super().__init__("g1_lidar")
         # cloud published as raw passthrough: [uint32 point_step][uint32 total_points][raw PointCloud2 bytes]
         from std_msgs.msg import UInt8MultiArray
@@ -1190,6 +1190,10 @@ class _LidarNode(Node):
         self._last_imu_time:   float = 0.0
         self._imu_roll:  float = 0.0
         self._imu_pitch: float = 0.0
+
+        # Subscribe body IMU via ROS2 for gravity alignment (Livox IMU may not be available)
+        self.create_subscription(String, state_imu_topic, self._on_body_imu, _LOW_LAT_QOS)
+        self.get_logger().info(f"LidarNode subscribed body IMU: {state_imu_topic}")
 
         # Subscribe DDS PointCloud2
         try:
@@ -1201,7 +1205,7 @@ class _LidarNode(Node):
         except Exception as e:
             self.get_logger().warn(f"LidarNode: failed to subscribe cloud: {e}")
 
-        # Subscribe DDS IMU
+        # Subscribe DDS IMU (for republishing to lidar/imu topic)
         try:
             from unitree_sdk2py.core.channel import ChannelSubscriber
             from unitree_sdk2py.idl.unitree_go.msg.dds_ import IMUState_
@@ -1254,6 +1258,16 @@ class _LidarNode(Node):
         out.data = json.dumps(imu_data)
         self._imu_pub.publish(out)
 
+    def _on_body_imu(self, msg) -> None:
+        """Update roll/pitch from body IMU (ROS2 String JSON) for gravity alignment."""
+        try:
+            data = json.loads(msg.data)
+            rpy = data.get('rpy', [0, 0, 0])
+            self._imu_roll = float(rpy[0])
+            self._imu_pitch = float(rpy[1])
+        except Exception:
+            pass
+
 
 class LidarPlugin:
     PREFIX = "lidar"
@@ -1261,7 +1275,8 @@ class LidarPlugin:
     def __init__(self, plugin_config: dict, namespace: str, executor):
         self._cloud_topic = f"/{namespace}/lidar/cloud"
         self._imu_topic   = f"/{namespace}/lidar/imu"
-        self._node = _LidarNode(self._cloud_topic, self._imu_topic)
+        state_imu_topic   = f"/{namespace}/state/imu"
+        self._node = _LidarNode(self._cloud_topic, self._imu_topic, state_imu_topic)
         executor.add_node(self._node)
 
     def get_tools(self) -> list:
@@ -1279,11 +1294,11 @@ class LidarPlugin:
                 "type": "object",
                 "properties": {
                     "axis_x_source": {"type": "string", "enum": ["x", "y", "z"], "default": "y", "title": "Display X (right) ← LiDAR axis"},
-                    "axis_x_negate": {"type": "boolean", "default": True, "title": "Negate X"},
+                    "axis_x_negate": {"type": "boolean", "default": False, "title": "Negate X"},
                     "axis_y_source": {"type": "string", "enum": ["x", "y", "z"], "default": "z", "title": "Display Y (up) ← LiDAR axis"},
-                    "axis_y_negate": {"type": "boolean", "default": False, "title": "Negate Y"},
+                    "axis_y_negate": {"type": "boolean", "default": True, "title": "Negate Y"},
                     "axis_z_source": {"type": "string", "enum": ["x", "y", "z"], "default": "x", "title": "Display Z (forward) ← LiDAR axis"},
-                    "axis_z_negate": {"type": "boolean", "default": False, "title": "Negate Z"},
+                    "axis_z_negate": {"type": "boolean", "default": True, "title": "Negate Z"},
                 },
             },
         }
