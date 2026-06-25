@@ -1188,6 +1188,8 @@ class _LidarNode(Node):
         self._imu_pub   = self.create_publisher(String, imu_topic, _LOW_LAT_QOS)
         self._last_cloud_time: float = 0.0
         self._last_imu_time:   float = 0.0
+        self._imu_roll:  float = 0.0
+        self._imu_pitch: float = 0.0
 
         # Subscribe DDS PointCloud2
         try:
@@ -1215,12 +1217,17 @@ class _LidarNode(Node):
             return
         self._last_cloud_time = now
 
-        # Passthrough: forward full PointCloud2 data without modification
-        # Format: [uint32 point_step][uint32 total_points][raw bytes]
+        # Passthrough: forward full PointCloud2 data with gravity alignment
         point_step = msg.point_step
         total_points = msg.width * msg.height
         data = bytes(msg.data)
 
+        # Apply IMU gravity alignment
+        from .pointcloud_utils import gravity_align_inplace
+        data = gravity_align_inplace(data, point_step, total_points,
+                                     self._imu_roll, self._imu_pitch)
+
+        # Format: [uint32 point_step][uint32 total_points][raw bytes]
         header = struct.pack('<II', point_step, total_points)
         from std_msgs.msg import UInt8MultiArray
         ros_msg = UInt8MultiArray()
@@ -1232,6 +1239,9 @@ class _LidarNode(Node):
         if LIDAR_IMU_INTERVAL > 0 and now - self._last_imu_time < LIDAR_IMU_INTERVAL:
             return
         self._last_imu_time = now
+
+        self._imu_roll = float(msg.rpy[0])
+        self._imu_pitch = float(msg.rpy[1])
 
         imu_data = {
             "quaternion":    list(msg.quaternion),
@@ -1271,10 +1281,9 @@ class LidarPlugin:
                     "axis_x_source": {"type": "string", "enum": ["x", "y", "z"], "default": "y", "title": "Display X (right) ← LiDAR axis"},
                     "axis_x_negate": {"type": "boolean", "default": True, "title": "Negate X"},
                     "axis_y_source": {"type": "string", "enum": ["x", "y", "z"], "default": "z", "title": "Display Y (up) ← LiDAR axis"},
-                    "axis_y_negate": {"type": "boolean", "default": True, "title": "Negate Y"},
+                    "axis_y_negate": {"type": "boolean", "default": False, "title": "Negate Y"},
                     "axis_z_source": {"type": "string", "enum": ["x", "y", "z"], "default": "x", "title": "Display Z (forward) ← LiDAR axis"},
                     "axis_z_negate": {"type": "boolean", "default": False, "title": "Negate Z"},
-                    "pitch_offset": {"type": "number", "default": 23, "title": "Pitch offset (degrees)", "description": "Tilt correction around X-axis to level the point cloud"},
                 },
             },
         }
