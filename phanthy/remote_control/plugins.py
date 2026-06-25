@@ -62,6 +62,7 @@ class RemoteMessagePlugin:
         return {
             "name": "remote_message",
             "type": "sensor",
+            "multiInstance": False,
             "description": "Send a text message via remote control. Publishes JSON to ROS2 topic.",
             "inputSchema": {
                 "type": "object",
@@ -131,6 +132,7 @@ class RemoteAudioPlugin:
         return {
             "name": "remote_audio",
             "type": "sensor",
+            "multiInstance": False,
             "description": "Send an audio file (converted to PCM-16k mono) via remote control.",
             "inputSchema": {
                 "type": "object",
@@ -234,6 +236,7 @@ class RemoteMicPlugin:
         return {
             "name": "remote_mic",
             "type": "sensor",
+            "multiInstance": False,
             "description": "Stream live microphone audio from browser to robot (PCM-16k mono via WebSocket). Use 'connect' to start, 'disconnect' to stop.",
             "inputSchema": {
                 "type": "object",

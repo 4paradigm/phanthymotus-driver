@@ -1,0 +1,37 @@
+common:
+    lid_topic: "/fastlio/cloud"
+    imu_topic: "/fastlio/imu"
+    time_sync_en: false
+    time_offset_lidar_to_imu: 0.0
+
+preprocess:
+    lidar_type: 1          # 1 = Livox
+    scan_line: 4           # Mid-360 has 4 scan lines
+    blind: 0.5             # ignore points closer than 0.5m
+    point_filter_num: 3    # keep every 3rd point
+    feature_enabled: 0     # 0 = use raw points
+    scan_rate: 10          # 10Hz
+
+mapping:
+    acc_cov: 0.1
+    gyr_cov: 0.1
+    b_acc_cov: 0.0001
+    b_gyr_cov: 0.0001
+    fov_degree: 360
+    det_range: 100.0
+    extrinsic_est_en: false
+    extrinsic_T: [0.0, 0.0, 0.0]
+    extrinsic_R: [1.0, 0.0, 0.0,
+                  0.0, 1.0, 0.0,
+                  0.0, 0.0, 1.0]
+
+publish:
+    path_en: true
+    scan_publish_en: true
+    dense_publish_en: false
+    scan_bodyframe_pub_en: false
+    map_publish_en: true
+
+pcd_save:
+    pcd_save_en: false
+    interval: -1

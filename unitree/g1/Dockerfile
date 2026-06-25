@@ -13,11 +13,14 @@ RUN apt-get update && \
         build-essential \
         curl \
         git \
-        libusb-1.0-0 && \
+        libusb-1.0-0 \
+        libportaudio2 \
+        libasound2-dev \
+        v4l-utils && \
     rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    pyyaml netifaces opencv-python-headless numpy pyrealsense2
+    pyyaml netifaces opencv-python-headless numpy pyrealsense2 sounddevice pyalsaaudio
 
 # Build CycloneDDS 0.10.5 from source
 ARG CYCLONEDDS_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/cyclonedds-0.10.5.tar.gz
@@ -44,9 +47,13 @@ COPY unitree_sdk2py/ /work/unitree_sdk2py/
 COPY resource/       /work/resource/
 COPY main.py   /work/main.py
 COPY device.py /work/device.py
+COPY ext_devices.py /work/ext_devices.py
+COPY safety_harness.py /work/safety_harness.py
+COPY scan_context.py /work/scan_context.py
 COPY config.yaml /work/config.yaml
 
 ENV PYTHONPATH=/work
+ENV PYTHONUNBUFFERED=1
 
 EXPOSE 15701
 
