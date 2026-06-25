@@ -2231,7 +2231,7 @@ class SpatialPlugin:
 
     def _mapping_tool(self) -> dict:
         return {
-            "name": "mapping",
+            "name": "slam_mapping",
             "type": "sensor",
             "multiInstance": False,
             "description": f"SLAM 3D mapping visualization — full 3D point cloud map with robot position. Binary format: [float32 robot_x,y,yaw][uint8 flags][uint32 N][float32 x,y,z × N]. 1Hz to {self._mapping_topic}",
