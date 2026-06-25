@@ -1274,7 +1274,7 @@ class LidarPlugin:
                     "axis_y_negate": {"type": "boolean", "default": True, "title": "Negate Y"},
                     "axis_z_source": {"type": "string", "enum": ["x", "y", "z"], "default": "x", "title": "Display Z (forward) ← LiDAR axis"},
                     "axis_z_negate": {"type": "boolean", "default": False, "title": "Negate Z"},
-                    "pitch_offset": {"type": "number", "default": 0, "title": "Pitch offset (degrees)", "description": "Tilt correction around X-axis to level the point cloud"},
+                    "pitch_offset": {"type": "number", "default": -2.3, "title": "Pitch offset (degrees)", "description": "Tilt correction around X-axis to level the point cloud"},
                 },
             },
         }
