@@ -143,8 +143,8 @@ class ControlledSpatialPlugin:
     def __init__(self, plugin_config: dict, namespace: str, executor, slam_client, smart_motion=None):
         self._client = slam_client
         self._smart_motion = smart_motion
-        self._pcd_dir = plugin_config.get("pcd_dir", "/home/unitree")  # SLAM 服务写 PCD 的机器人本机路径
-        db_path = plugin_config.get("db_path", "/opt/phanthy-motus/data/controlled_spatial.db")
+        self._pcd_dir = plugin_config.get("native_slam_pcd_dir", "/home/unitree")  # SLAM 服务写 PCD 的机器人本机路径
+        db_path = plugin_config.get("native_slam_db_path", "/opt/phanthy-motus/data/controlled_spatial.db")
         self._db = _ControlledSpatialDB(db_path)
 
         # State

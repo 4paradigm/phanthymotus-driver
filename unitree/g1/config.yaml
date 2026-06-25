@@ -26,8 +26,8 @@ plugins:
     db_path: /opt/phanthy-motus/data/spatial.db
   controlled_spatial:
     enabled: true
-    pcd_dir: /home/unitree
-    db_path: /opt/phanthy-motus/data/controlled_spatial.db
+    native_slam_pcd_dir: /home/unitree
+    native_slam_db_path: /opt/phanthy-motus/data/controlled_spatial.db
   motion_switcher:
     enabled: true
   ext_mic:
