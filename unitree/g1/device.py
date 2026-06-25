@@ -1174,20 +1174,16 @@ class StatePlugin:
 # ── LidarPlugin (sensor) ─────────────────────────────────────────────────────
 
 LIDAR_CLOUD_INTERVAL = 0.1       # 10 Hz throttle (source is 10Hz anyway)
-LIDAR_IMU_INTERVAL   = 0.0      # no throttle — publish at full 200Hz for HTMSG
 
 
 class _LidarNode(Node):
-    """Subscribes to DDS utlidar PointCloud2 + IMU and republishes as binary/JSON to ROS2."""
+    """Subscribes to DDS utlidar PointCloud2 and republishes with gravity alignment."""
 
-    def __init__(self, cloud_topic: str, imu_topic: str):
+    def __init__(self, cloud_topic: str):
         super().__init__("g1_lidar")
-        # cloud published as raw passthrough: [uint32 point_step][uint32 total_points][raw PointCloud2 bytes]
         from std_msgs.msg import UInt8MultiArray
         self._cloud_pub = self.create_publisher(UInt8MultiArray, cloud_topic, _LOW_LAT_QOS)
-        self._imu_pub   = self.create_publisher(String, imu_topic, _LOW_LAT_QOS)
         self._last_cloud_time: float = 0.0
-        self._last_imu_time:   float = 0.0
         self._imu_roll:  float = 0.0
         self._imu_pitch: float = 0.0
 
@@ -1210,16 +1206,6 @@ class _LidarNode(Node):
             self.get_logger().info("LidarNode subscribed rt/lowstate for gravity alignment")
         except Exception as e:
             self.get_logger().warn(f"LidarNode: failed to subscribe body IMU: {e}")
-
-        # Subscribe DDS Livox IMU (for republishing to lidar/imu topic)
-        try:
-            from unitree_sdk2py.core.channel import ChannelSubscriber
-            from unitree_sdk2py.idl.unitree_go.msg.dds_ import IMUState_
-            self._imu_sub = ChannelSubscriber("rt/utlidar/imu_livox_mid360", IMUState_)
-            self._imu_sub.Init(self._on_imu, 10)
-            self.get_logger().info(f"LidarNode subscribed rt/utlidar/imu_livox_mid360 → {imu_topic}")
-        except Exception as e:
-            self.get_logger().warn(f"LidarNode: failed to subscribe lidar imu: {e}")
 
     def _on_cloud(self, msg) -> None:
         now = time.monotonic()
@@ -1244,26 +1230,6 @@ class _LidarNode(Node):
         ros_msg.data = list(header + data)
         self._cloud_pub.publish(ros_msg)
 
-    def _on_imu(self, msg) -> None:
-        now = time.monotonic()
-        if LIDAR_IMU_INTERVAL > 0 and now - self._last_imu_time < LIDAR_IMU_INTERVAL:
-            return
-        self._last_imu_time = now
-
-        self._imu_roll = float(msg.rpy[0])
-        self._imu_pitch = float(msg.rpy[1])
-
-        imu_data = {
-            "quaternion":    list(msg.quaternion),
-            "gyroscope":     list(msg.gyroscope),
-            "accelerometer": list(msg.accelerometer),
-            "rpy":           list(msg.rpy),
-            "temperature":   float(msg.temperature),
-        }
-        out = String()
-        out.data = json.dumps(imu_data)
-        self._imu_pub.publish(out)
-
     def _on_body_imu(self, msg) -> None:
         """Update roll/pitch from body IMU (DDS LowState) for gravity alignment."""
         try:
@@ -1279,12 +1245,11 @@ class LidarPlugin:
 
     def __init__(self, plugin_config: dict, namespace: str, executor):
         self._cloud_topic = f"/{namespace}/lidar/cloud"
-        self._imu_topic   = f"/{namespace}/lidar/imu"
-        self._node = _LidarNode(self._cloud_topic, self._imu_topic)
+        self._node = _LidarNode(self._cloud_topic)
         executor.add_node(self._node)
 
     def get_tools(self) -> list:
-        return [self._cloud_tool(), self._imu_tool()]
+        return [self._cloud_tool()]
 
     def _cloud_tool(self) -> dict:
         return {
@@ -1307,16 +1272,6 @@ class LidarPlugin:
             },
         }
 
-    def _imu_tool(self) -> dict:
-        return {
-            "name": "lidar_imu",
-            "type": "sensor",
-            "multiInstance": False,
-            "description": f"Livox Mid-360 IMU — quaternion, gyroscope, accelerometer, rpy at 200Hz. Publishes to {self._imu_topic}",
-            "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._imu_topic, "format": "data/json"}],
-        }
-
     def start(self) -> None:
         pass  # DDS subscription starts in __init__
 
@@ -1325,9 +1280,6 @@ class LidarPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "info":
-            tool_name = args.get('_tool_name', '')
-            if tool_name == 'lidar_imu':
-                return {"state": "running", "topic_out": [{"topic": self._imu_topic, "format": "data/json"}]}
             return {"state": "running", "topic_out": [{"topic": self._cloud_topic, "format": "sensor/pointcloud"}]}
         return None  # sensor
 
