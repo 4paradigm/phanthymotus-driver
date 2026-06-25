@@ -9,6 +9,7 @@ tool instance on the canvas.
 
 import glob
 import logging
+import os
 import re
 import subprocess
 import threading
@@ -145,7 +146,8 @@ def _enumerate_ext_cameras() -> list[dict]:
         try:
             info = subprocess.check_output(
                 ['v4l2-ctl', '-d', path, '--info'],
-                text=True, timeout=2, stderr=subprocess.DEVNULL
+                text=True, timeout=2, stderr=subprocess.DEVNULL,
+                env={**os.environ, 'LC_ALL': 'C'},
             )
         except Exception:
             continue
@@ -172,7 +174,8 @@ def _enumerate_ext_cameras() -> list[dict]:
         try:
             fmt_out = subprocess.check_output(
                 ['v4l2-ctl', '-d', path, '--list-formats-ext'],
-                text=True, timeout=2, stderr=subprocess.DEVNULL
+                text=True, timeout=2, stderr=subprocess.DEVNULL,
+                env={**os.environ, 'LC_ALL': 'C'},
             )
             fmt_probe_ok = True
             formats = re.findall(r"'\s*([A-Z0-9]{4})\s*'", fmt_out)
@@ -616,7 +619,8 @@ def _parse_v4l2_controls(device_path: str) -> list[dict]:
     try:
         out = subprocess.check_output(
             ['v4l2-ctl', '-d', device_path, '--list-ctrls-menus'],
-            text=True, timeout=3, stderr=subprocess.DEVNULL
+            text=True, timeout=3, stderr=subprocess.DEVNULL,
+            env={**os.environ, 'LC_ALL': 'C'},
         )
     except Exception:
         return []
@@ -873,6 +877,7 @@ class ExtCameraPlugin:
                 out = subprocess.check_output(
                     ['v4l2-ctl', '-d', device_path, f'--set-ctrl={ctrl_name}={value}'],
                     text=True, timeout=5, stderr=subprocess.PIPE,
+                    env={**os.environ, 'LC_ALL': 'C'},
                 )
                 print(f"[ext_camera] set_ctrl ok: {out.strip()!r}", flush=True)
             except subprocess.CalledProcessError as e:
@@ -906,6 +911,7 @@ class ExtCameraPlugin:
             out = subprocess.check_output(
                 ['v4l2-ctl', '-d', device_path, f'--get-ctrl={ctrl_name}'],
                 text=True, timeout=3, stderr=subprocess.DEVNULL,
+                env={**os.environ, 'LC_ALL': 'C'},
             )
             m = re.search(r':\s*(-?\d+)', out)
             return {'ctrl': ctrl_name, 'value': int(m.group(1)) if m else None, 'raw': out.strip()}
