@@ -139,12 +139,11 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
     from rclpy.executors import SingleThreadedExecutor
-    from std_msgs.msg import String
+    from std_msgs.msg import String, UInt8MultiArray
 
     from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscriber
     from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
     from unitree_sdk2py.g1.slam.slam_client import SlamClient
-    from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_
 
     _QOS = QoSProfile(
         reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -278,26 +277,23 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
         else:
             heading = 0.0
 
-        # Parse fields
-        field_map = {}
-        for f in msg.fields:
-            field_map[f.name] = f.offset
-        x_off = field_map.get("x", 0)
-        y_off = field_map.get("y", 4)
-        z_off = field_map.get("z", 8)
+        # Parse UInt8MultiArray format: [uint32 point_step][uint32 total_points][raw bytes]
+        raw = bytes(msg.data)
+        if len(raw) < 8:
+            return
+        point_step = struct.unpack_from('<I', raw, 0)[0]
+        total_points = struct.unpack_from('<I', raw, 4)[0]
+        data = raw[8:]
 
-        point_step = msg.point_step
-        total_points = msg.width * msg.height
-        data = bytes(msg.data)
         n_valid = min(total_points, len(data) // point_step)
         if n_valid == 0:
             return
 
-        # Numpy batch extraction
+        # Numpy batch extraction (xyz at offsets 0, 4, 8 — already gravity-aligned)
         buf = np.frombuffer(data, dtype=np.uint8, count=n_valid * point_step).reshape(n_valid, point_step)
-        px = buf[:, x_off:x_off+4].copy().view(dtype='<f4').flatten()
-        py = buf[:, y_off:y_off+4].copy().view(dtype='<f4').flatten()
-        pz = buf[:, z_off:z_off+4].copy().view(dtype='<f4').flatten()
+        px = buf[:, 0:4].copy().view(dtype='<f4').flatten()
+        py = buf[:, 4:8].copy().view(dtype='<f4').flatten()
+        pz = buf[:, 8:12].copy().view(dtype='<f4').flatten()
 
         # Vectorized filter
         z_mask = (pz >= z_min) & (pz <= z_max)
@@ -353,9 +349,9 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
             lateral_obstacle = lat_detected
 
     try:
-        cloud_sub = ChannelSubscriber("rt/utlidar/cloud_livox_mid360", PointCloud2_)
-        cloud_sub.Init(on_cloud, 10)
-        print(f"[SmartMotion:pid={os.getpid()}] LiDAR subscribed")
+        event_node.create_subscription(
+            UInt8MultiArray, f"/{namespace}/lidar/cloud", on_cloud, _QOS)
+        print(f"[SmartMotion:pid={os.getpid()}] LiDAR subscribed (ROS2 /{namespace}/lidar/cloud)")
     except Exception as e:
         print(f"[SmartMotion:pid={os.getpid()}] WARNING: LiDAR subscribe failed: {e}")
 
