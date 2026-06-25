@@ -1180,7 +1180,7 @@ LIDAR_IMU_INTERVAL   = 0.0      # no throttle — publish at full 200Hz for HTMS
 class _LidarNode(Node):
     """Subscribes to DDS utlidar PointCloud2 + IMU and republishes as binary/JSON to ROS2."""
 
-    def __init__(self, cloud_topic: str, imu_topic: str, state_imu_topic: str):
+    def __init__(self, cloud_topic: str, imu_topic: str):
         super().__init__("g1_lidar")
         # cloud published as raw passthrough: [uint32 point_step][uint32 total_points][raw PointCloud2 bytes]
         from std_msgs.msg import UInt8MultiArray
@@ -1190,10 +1190,6 @@ class _LidarNode(Node):
         self._last_imu_time:   float = 0.0
         self._imu_roll:  float = 0.0
         self._imu_pitch: float = 0.0
-
-        # Subscribe body IMU via ROS2 for gravity alignment (Livox IMU may not be available)
-        self.create_subscription(String, state_imu_topic, self._on_body_imu, _LOW_LAT_QOS)
-        self.get_logger().info(f"LidarNode subscribed body IMU: {state_imu_topic}")
 
         # Subscribe DDS PointCloud2
         try:
@@ -1205,7 +1201,17 @@ class _LidarNode(Node):
         except Exception as e:
             self.get_logger().warn(f"LidarNode: failed to subscribe cloud: {e}")
 
-        # Subscribe DDS IMU (for republishing to lidar/imu topic)
+        # Subscribe DDS body IMU for gravity alignment
+        try:
+            from unitree_sdk2py.core.channel import ChannelSubscriber
+            from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
+            self._body_imu_sub = ChannelSubscriber("rt/lowstate", LowState_)
+            self._body_imu_sub.Init(self._on_body_imu, 10)
+            self.get_logger().info("LidarNode subscribed rt/lowstate for gravity alignment")
+        except Exception as e:
+            self.get_logger().warn(f"LidarNode: failed to subscribe body IMU: {e}")
+
+        # Subscribe DDS Livox IMU (for republishing to lidar/imu topic)
         try:
             from unitree_sdk2py.core.channel import ChannelSubscriber
             from unitree_sdk2py.idl.unitree_go.msg.dds_ import IMUState_
@@ -1213,7 +1219,7 @@ class _LidarNode(Node):
             self._imu_sub.Init(self._on_imu, 10)
             self.get_logger().info(f"LidarNode subscribed rt/utlidar/imu_livox_mid360 → {imu_topic}")
         except Exception as e:
-            self.get_logger().warn(f"LidarNode: failed to subscribe imu: {e}")
+            self.get_logger().warn(f"LidarNode: failed to subscribe lidar imu: {e}")
 
     def _on_cloud(self, msg) -> None:
         now = time.monotonic()
@@ -1259,12 +1265,11 @@ class _LidarNode(Node):
         self._imu_pub.publish(out)
 
     def _on_body_imu(self, msg) -> None:
-        """Update roll/pitch from body IMU (ROS2 String JSON) for gravity alignment."""
+        """Update roll/pitch from body IMU (DDS LowState) for gravity alignment."""
         try:
-            data = json.loads(msg.data)
-            rpy = data.get('rpy', [0, 0, 0])
-            self._imu_roll = float(rpy[0])
-            self._imu_pitch = float(rpy[1])
+            imu = msg.imu_state
+            self._imu_roll = float(imu.rpy[0])
+            self._imu_pitch = float(imu.rpy[1])
         except Exception:
             pass
 
@@ -1275,8 +1280,7 @@ class LidarPlugin:
     def __init__(self, plugin_config: dict, namespace: str, executor):
         self._cloud_topic = f"/{namespace}/lidar/cloud"
         self._imu_topic   = f"/{namespace}/lidar/imu"
-        state_imu_topic   = f"/{namespace}/state/imu"
-        self._node = _LidarNode(self._cloud_topic, self._imu_topic, state_imu_topic)
+        self._node = _LidarNode(self._cloud_topic, self._imu_topic)
         executor.add_node(self._node)
 
     def get_tools(self) -> list:
