@@ -1268,12 +1268,12 @@ class LidarPlugin:
             "configSchema": {
                 "type": "object",
                 "properties": {
-                    "axis_x_source": {"type": "string", "enum": ["x", "y", "z"], "default": "y", "title": "显示X轴(右) ← 雷达轴"},
-                    "axis_x_negate": {"type": "boolean", "default": False, "title": "取反X"},
-                    "axis_y_source": {"type": "string", "enum": ["x", "y", "z"], "default": "z", "title": "显示Y轴(上) ← 雷达轴"},
-                    "axis_y_negate": {"type": "boolean", "default": True, "title": "取反Y"},
-                    "axis_z_source": {"type": "string", "enum": ["x", "y", "z"], "default": "x", "title": "显示Z轴(前) ← 雷达轴"},
-                    "axis_z_negate": {"type": "boolean", "default": True, "title": "取反Z"},
+                    "axis_x_source": {"type": "string", "enum": ["x", "y", "z"], "default": "y", "title": "Display X (right) ← LiDAR axis"},
+                    "axis_x_negate": {"type": "boolean", "default": False, "title": "Negate X"},
+                    "axis_y_source": {"type": "string", "enum": ["x", "y", "z"], "default": "z", "title": "Display Y (up) ← LiDAR axis"},
+                    "axis_y_negate": {"type": "boolean", "default": False, "title": "Negate Y"},
+                    "axis_z_source": {"type": "string", "enum": ["x", "y", "z"], "default": "x", "title": "Display Z (forward) ← LiDAR axis"},
+                    "axis_z_negate": {"type": "boolean", "default": False, "title": "Negate Z"},
                 },
             },
         }
