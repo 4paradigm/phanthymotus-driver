@@ -25,7 +25,7 @@ plugins:
     map_dir: /opt/phanthy-motus/data/maps
     db_path: /opt/phanthy-motus/data/spatial.db
   controlled_spatial:
-    enabled: false
+    enabled: true
     map_dir: /opt/phanthy-motus/data/controlled_maps
     db_path: /opt/phanthy-motus/data/controlled_spatial.db
   motion_switcher:
