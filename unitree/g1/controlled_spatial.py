@@ -66,17 +66,16 @@ class _ControlledSpatialDB:
         return [dict(r) for r in rows]
 
     def delete_map(self, name: str) -> bool:
-        """Delete map record, associated POIs, and PCD file."""
+        """Delete map record and associated POIs. PCD deletion is best-effort."""
         map_info = self.get_map(name)
         if not map_info:
             return False
-        # Delete PCD file
+        # Try to delete PCD file (may fail if running in container)
         pcd_path = map_info["pcd_path"]
-        if os.path.exists(pcd_path):
-            try:
-                os.remove(pcd_path)
-            except OSError:
-                pass
+        try:
+            os.remove(pcd_path)
+        except OSError:
+            pass
         # Delete POIs and map record
         self._conn.execute("DELETE FROM poi WHERE map_name = ?", (name,))
         self._conn.execute("DELETE FROM maps WHERE name = ?", (name,))
@@ -144,9 +143,8 @@ class ControlledSpatialPlugin:
     def __init__(self, plugin_config: dict, namespace: str, executor, slam_client, smart_motion=None):
         self._client = slam_client
         self._smart_motion = smart_motion
-        self._map_dir = plugin_config.get("map_dir", "/opt/phanthy-motus/data/controlled_maps")
-        os.makedirs(self._map_dir, exist_ok=True)
-        db_path = plugin_config.get("db_path", os.path.join(self._map_dir, "controlled_spatial.db"))
+        self._pcd_dir = plugin_config.get("pcd_dir", "/home/unitree")  # SLAM 服务写 PCD 的机器人本机路径
+        db_path = plugin_config.get("db_path", "/opt/phanthy-motus/data/controlled_spatial.db")
         self._db = _ControlledSpatialDB(db_path)
 
         # State
@@ -271,7 +269,7 @@ class ControlledSpatialPlugin:
                 return {"error": "map_name is required"}
             code, resp = self._client.StartMapping()
             if code == 0 or code == 3104:
-                pcd_path = os.path.join(self._map_dir, f"{map_name}.pcd")
+                pcd_path = f"{self._pcd_dir}/controlled_{map_name}.pcd"
                 self._active_map = map_name
                 self._is_mapping = True
                 self._db.add_map(map_name, pcd_path)
@@ -281,7 +279,7 @@ class ControlledSpatialPlugin:
         elif action == "stop_mapping":
             if not self._active_map:
                 return {"error": "No active mapping session"}
-            pcd_path = os.path.join(self._map_dir, f"{self._active_map}.pcd")
+            pcd_path = f"{self._pcd_dir}/controlled_{self._active_map}.pcd"
             code, resp = self._client.StopMapping(pcd_path)
             map_name = self._active_map
             if code == 0:
@@ -362,8 +360,6 @@ class ControlledSpatialPlugin:
             if not map_info:
                 return {"error": f"Map '{map_name}' not found"}
             pcd_path = map_info["pcd_path"]
-            if not os.path.exists(pcd_path):
-                return {"error": f"PCD file not found: {pcd_path}"}
             # InitPose with origin (robot at map start point)
             code, resp = self._client.InitPose(0, 0, 0, 0, 0, 0, 1.0, pcd_path)
             if code == 0:
