@@ -1274,7 +1274,7 @@ class LidarPlugin:
                     "axis_y_negate": {"type": "boolean", "default": True, "title": "Negate Y"},
                     "axis_z_source": {"type": "string", "enum": ["x", "y", "z"], "default": "x", "title": "Display Z (forward) ← LiDAR axis"},
                     "axis_z_negate": {"type": "boolean", "default": False, "title": "Negate Z"},
-                    "pitch_offset": {"type": "number", "default": -2.3, "title": "Pitch offset (degrees)", "description": "Tilt correction around X-axis to level the point cloud"},
+                    "pitch_offset": {"type": "number", "default": 2.3, "title": "Pitch offset (degrees)", "description": "Tilt correction around X-axis to level the point cloud"},
                 },
             },
         }
@@ -1459,7 +1459,7 @@ class _SlamInfoNode(Node):
     KF_DIST_THRESH = 2.0         # keyframe every 2m movement
     KF_YAW_THRESH = 0.52         # or 30° rotation
 
-    def __init__(self, pos_tag_topic: str, mapping_topic: str, db: _SpatialDB, sc_mgr=None):
+    def __init__(self, pos_tag_topic: str, mapping_topic: str, db: _SpatialDB, sc_mgr=None, slam_cloud_topic: str | None = None):
         super().__init__("g1_spatial")
         self._db = db
         self._sc_mgr = sc_mgr  # ScanContextManager (optional)
@@ -1468,6 +1468,14 @@ class _SlamInfoNode(Node):
 
         from std_msgs.msg import UInt8MultiArray
         self._mapping_pub = self.create_publisher(UInt8MultiArray, mapping_topic, _LOW_LAT_QOS)
+
+        # slam_cloud: real-time SLAM point cloud passthrough (standard coordinate system)
+        self._slam_cloud_pub = None
+        self._last_slam_cloud_time: float = 0.0
+        SLAM_CLOUD_INTERVAL = 0.2  # 5Hz
+        self._slam_cloud_interval = SLAM_CLOUD_INTERVAL
+        if slam_cloud_topic:
+            self._slam_cloud_pub = self.create_publisher(UInt8MultiArray, slam_cloud_topic, _LOW_LAT_QOS)
 
         self._current_pose: dict | None = None
         self._map_status: str = "idle"    # idle | mapping | localized
@@ -1636,9 +1644,65 @@ class _SlamInfoNode(Node):
             data = bytes(msg.data)
             if len(data) < msg.point_step:
                 return
+
+            # Real-time slam_cloud passthrough (throttled)
+            if self._slam_cloud_pub is not None:
+                now = time.monotonic()
+                if now - self._last_slam_cloud_time >= self._slam_cloud_interval:
+                    self._last_slam_cloud_time = now
+                    self._publish_slam_cloud(msg.fields, msg.point_step, msg.width * msg.height, data)
+
             self._cloud_queue.put_nowait((msg.fields, msg.point_step, msg.width * msg.height, data))
         except Exception:
             pass  # queue full, drop frame
+
+    def _publish_slam_cloud(self, fields, point_step: int, total_points: int, data: bytes) -> None:
+        """Parse SLAM PointCloud2, transform to standard coords, publish as sensor/pointcloud binary."""
+        np = _SlamInfoNode.np
+        num_points = min(total_points, 20000)
+        if len(data) < num_points * point_step:
+            num_points = len(data) // point_step
+        if num_points == 0:
+            return
+
+        # Parse field offsets
+        field_map = {}
+        for f in fields:
+            field_map[f.name] = f.offset
+        x_off = field_map.get("x", 0)
+        y_off = field_map.get("y", 4)
+        z_off = field_map.get("z", 8)
+
+        # Extract x, y, z via numpy
+        raw = np.frombuffer(data, dtype=np.uint8, count=num_points * point_step)
+        raw = raw.reshape(num_points, point_step)
+        sx = raw[:, x_off:x_off+4].view(np.float32).ravel()
+        sy = raw[:, y_off:y_off+4].view(np.float32).ravel()
+        sz = raw[:, z_off:z_off+4].view(np.float32).ravel()
+
+        # Filter invalid
+        valid = (
+            np.isfinite(sx) & np.isfinite(sy) & np.isfinite(sz) &
+            (np.abs(sx) < 50) & (np.abs(sy) < 50) & (np.abs(sz) < 20)
+        )
+        sx, sy, sz = sx[valid], sy[valid], sz[valid]
+        n = len(sx)
+        if n == 0:
+            return
+
+        # Transform to standard display coordinates:
+        # display_x = slam_x, display_y = slam_z (height), display_z = -slam_y (forward)
+        out = np.empty((n, 3), dtype=np.float32)
+        out[:, 0] = sx
+        out[:, 1] = sz
+        out[:, 2] = -sy
+
+        # Pack binary: [uint32 point_step=12][uint32 total_points][float32 x,y,z × N]
+        header = struct.pack('<II', 12, n)
+        from std_msgs.msg import UInt8MultiArray
+        ros_msg = UInt8MultiArray()
+        ros_msg.data = list(header + out.tobytes())
+        self._slam_cloud_pub.publish(ros_msg)
 
     def _cloud_processor_loop(self):
         """Background thread: processes queued point clouds at its own pace."""
@@ -2142,7 +2206,8 @@ class SpatialPlugin:
 
         self._pos_tag_topic = f"/{namespace}/spatial/pos_tag"
         self._mapping_topic = f"/{namespace}/spatial/mapping"
-        self._node = _SlamInfoNode(self._pos_tag_topic, self._mapping_topic, self._db, self._sc_mgr)
+        self._slam_cloud_topic = f"/{namespace}/spatial/slam_cloud"
+        self._node = _SlamInfoNode(self._pos_tag_topic, self._mapping_topic, self._db, self._sc_mgr, slam_cloud_topic=self._slam_cloud_topic)
         self._node.set_active_map(self._db.get_last_used_map())
         self._node.set_pcd_save_dir(self._map_dir)
         self._node._auto_mapping_cb = self._on_localized
@@ -2152,7 +2217,7 @@ class SpatialPlugin:
         executor.add_node(self._node)
 
     def get_tools(self) -> list:
-        return [self._spatial_tool(), self._pos_tag_tool(), self._mapping_tool()]
+        return [self._spatial_tool(), self._pos_tag_tool(), self._mapping_tool(), self._slam_cloud_tool()]
 
     def _pos_tag_tool(self) -> dict:
         return {
@@ -2172,6 +2237,16 @@ class SpatialPlugin:
             "description": f"SLAM 3D mapping visualization — full 3D point cloud map with robot position. Binary format: [float32 robot_x,y,yaw][uint8 flags][uint32 N][float32 x,y,z × N]. 1Hz to {self._mapping_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._mapping_topic, "format": "sensor/mapping"}],
+        }
+
+    def _slam_cloud_tool(self) -> dict:
+        return {
+            "name": "slam_cloud",
+            "type": "sensor",
+            "multiInstance": False,
+            "description": f"Real-time SLAM point cloud at 5Hz in standard coordinate system. Binary format: [uint32 point_step=12][uint32 total_points][float32 x,y,z × N]. Subscribes rt/unitree/slam_mapping/points, transforms and publishes to {self._slam_cloud_topic}",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._slam_cloud_topic, "format": "sensor/pointcloud"}],
         }
 
     def _spatial_tool(self) -> dict:
