@@ -32,6 +32,7 @@ from std_msgs.msg import Header, String
 from audio_msgs.msg import AudioChunk
 
 from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
+from pointcloud_utils import gravity_align_inplace
 
 # ── 常量 ──────────────────────────────────────────────────────────────────────
 
@@ -1219,7 +1220,6 @@ class _LidarNode(Node):
         data = bytes(msg.data)
 
         # Apply IMU gravity alignment
-        from .pointcloud_utils import gravity_align_inplace
         data = gravity_align_inplace(data, point_step, total_points,
                                      self._imu_roll, self._imu_pitch)
 
