@@ -1240,14 +1240,22 @@ class _LidarNode(Node):
                 break
             point_step, total_points, data, roll, pitch = item
 
+            t0 = time.monotonic()
             # Apply gravity alignment
             data = gravity_align_inplace(data, point_step, total_points, roll, pitch)
+            t1 = time.monotonic()
 
             # Publish
             header = struct.pack('<II', point_step, total_points)
             ros_msg = UInt8MultiArray()
             ros_msg.data = header + data
+            t2 = time.monotonic()
             self._cloud_pub.publish(ros_msg)
+            t3 = time.monotonic()
+
+            self.get_logger().info(
+                f"[lidar_worker] pts={total_points} align={t1-t0:.3f}s assign={t2-t1:.3f}s pub={t3-t2:.3f}s total={t3-t0:.3f}s"
+            )
 
     def _on_livox_imu(self, msg) -> None:
         """Compute roll/pitch from Livox IMU accelerometer (co-located with lidar, inverted mount)."""
