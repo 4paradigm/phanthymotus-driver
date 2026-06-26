@@ -51,6 +51,7 @@ COPY ext_devices.py /work/ext_devices.py
 COPY safety_harness.py /work/safety_harness.py
 COPY scan_context.py /work/scan_context.py
 COPY controlled_spatial.py /work/controlled_spatial.py
+COPY pointcloud_utils.py /work/pointcloud_utils.py
 COPY config.yaml /work/config.yaml
 
 ENV PYTHONPATH=/work
