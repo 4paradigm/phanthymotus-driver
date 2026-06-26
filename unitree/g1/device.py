@@ -1220,16 +1220,27 @@ class _LidarNode(Node):
             return
         self._last_cloud_time = now
 
+        t0 = time.monotonic()
         point_step = msg.point_step
         total_points = msg.width * msg.height
         data = msg.data if isinstance(msg.data, (bytes, bytearray)) else bytes(msg.data)
+        t1 = time.monotonic()
+
+        data_size = len(data)
 
         # Non-blocking put; drop frame if worker is busy
         try:
             self._cloud_queue.put_nowait((point_step, total_points, data,
-                                         self._imu_roll, self._imu_pitch))
+                                         self._imu_roll, self._imu_pitch, t0))
+            queued = True
         except queue.Full:
-            pass
+            queued = False
+
+        self.get_logger().info(
+            f"[lidar:_on_cloud] pts={total_points} step={point_step} "
+            f"size={data_size}B bytes_conv={1000*(t1-t0):.1f}ms "
+            f"queued={queued} qsize={self._cloud_queue.qsize()}"
+        )
 
     def _process_loop(self) -> None:
         """Worker thread: gravity alignment + publish (off the ch_reader thread)."""
@@ -1239,19 +1250,37 @@ class _LidarNode(Node):
             item = self._cloud_queue.get()
             if item is None:
                 break
-            point_step, total_points, data, roll, pitch = item
+            point_step, total_points, data, roll, pitch, t_enqueue = item
+            t0 = time.monotonic()
+            queue_wait = t0 - t_enqueue
 
             # Apply gravity alignment (returns bytearray, avoids extra copy)
             data = gravity_align_inplace(data, point_step, total_points, roll, pitch)
+            t1 = time.monotonic()
 
             # Publish — pre-allocate buffer to avoid header + data concat copy
             header = struct.pack('<II', point_step, total_points)
             buf = bytearray(8 + len(data))
             buf[:8] = header
             buf[8:] = data
+            t2 = time.monotonic()
+
             ros_msg = UInt8MultiArray()
             ros_msg.data = _array.array('B', buf)
+            t3 = time.monotonic()
+
             self._cloud_pub.publish(ros_msg)
+            t4 = time.monotonic()
+
+            print(
+                f"[lidar:worker] queue_wait={1000*queue_wait:.1f}ms "
+                f"gravity={1000*(t1-t0):.1f}ms "
+                f"pack={1000*(t2-t1):.1f}ms "
+                f"array={1000*(t3-t2):.1f}ms "
+                f"publish={1000*(t4-t3):.1f}ms "
+                f"total={1000*(t4-t_enqueue):.1f}ms",
+                flush=True
+            )
 
     def _on_livox_imu(self, msg) -> None:
         """Compute roll/pitch from Livox IMU accelerometer (co-located with lidar, inverted mount)."""
