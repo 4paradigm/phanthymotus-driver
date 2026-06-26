@@ -1175,6 +1175,7 @@ class StatePlugin:
 # ── LidarPlugin (sensor) ─────────────────────────────────────────────────────
 
 LIDAR_CLOUD_INTERVAL = 0.1       # 10 Hz throttle (source is 10Hz anyway)
+LIDAR_MOUNT_PITCH = -2.3 * 3.14159265 / 180.0  # Livox Mid-360 mounting pitch on G1 (rad)
 
 
 class _LidarNode(Node):
@@ -1219,9 +1220,9 @@ class _LidarNode(Node):
         total_points = msg.width * msg.height
         data = bytes(msg.data)
 
-        # Apply mounting transform + IMU gravity alignment
+        # Apply gravity alignment with mounting pitch offset
         data = gravity_align_inplace(data, point_step, total_points,
-                                     self._imu_roll, self._imu_pitch)
+                                     self._imu_roll, self._imu_pitch + LIDAR_MOUNT_PITCH)
 
         # Format: [uint32 point_step][uint32 total_points][raw bytes]
         header = struct.pack('<II', point_step, total_points)
@@ -1262,12 +1263,12 @@ class LidarPlugin:
             "configSchema": {
                 "type": "object",
                 "properties": {
-                    "axis_x_source": {"type": "string", "enum": ["x", "y", "z"], "default": "y", "title": "Display X (right) ← Robot axis"},
-                    "axis_x_negate": {"type": "boolean", "default": True, "title": "Negate X"},
-                    "axis_y_source": {"type": "string", "enum": ["x", "y", "z"], "default": "z", "title": "Display Y (up) ← Robot axis"},
-                    "axis_y_negate": {"type": "boolean", "default": False, "title": "Negate Y"},
-                    "axis_z_source": {"type": "string", "enum": ["x", "y", "z"], "default": "x", "title": "Display Z (forward) ← Robot axis"},
-                    "axis_z_negate": {"type": "boolean", "default": False, "title": "Negate Z"},
+                    "axis_x_source": {"type": "string", "enum": ["x", "y", "z"], "default": "y", "title": "Display X (right) ← LiDAR axis"},
+                    "axis_x_negate": {"type": "boolean", "default": False, "title": "Negate X"},
+                    "axis_y_source": {"type": "string", "enum": ["x", "y", "z"], "default": "z", "title": "Display Y (up) ← LiDAR axis"},
+                    "axis_y_negate": {"type": "boolean", "default": True, "title": "Negate Y"},
+                    "axis_z_source": {"type": "string", "enum": ["x", "y", "z"], "default": "x", "title": "Display Z (forward) ← LiDAR axis"},
+                    "axis_z_negate": {"type": "boolean", "default": True, "title": "Negate Z"},
                 },
             },
         }
