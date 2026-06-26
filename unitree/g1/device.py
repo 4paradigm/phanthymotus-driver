@@ -1175,7 +1175,6 @@ class StatePlugin:
 # ── LidarPlugin (sensor) ─────────────────────────────────────────────────────
 
 LIDAR_CLOUD_INTERVAL = 0.1       # 10 Hz throttle (source is 10Hz anyway)
-LIDAR_MOUNT_PITCH = -2.3 * 3.14159265 / 180.0  # compensate Livox Mid-360 -2.3° mounting pitch on G1
 
 
 class _LidarNode(Node):
@@ -1199,15 +1198,15 @@ class _LidarNode(Node):
         except Exception as e:
             self.get_logger().warn(f"LidarNode: failed to subscribe cloud: {e}")
 
-        # Subscribe DDS body IMU for gravity alignment
+        # Subscribe DDS Livox IMU for gravity alignment (co-located with lidar)
         try:
             from unitree_sdk2py.core.channel import ChannelSubscriber
-            from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
-            self._body_imu_sub = ChannelSubscriber("rt/lowstate", LowState_)
-            self._body_imu_sub.Init(self._on_body_imu, 10)
-            self.get_logger().info("LidarNode subscribed rt/lowstate for gravity alignment")
+            from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import Imu_
+            self._livox_imu_sub = ChannelSubscriber("rt/utlidar/imu_livox_mid360", Imu_)
+            self._livox_imu_sub.Init(self._on_livox_imu, 10)
+            self.get_logger().info("LidarNode subscribed rt/utlidar/imu_livox_mid360 for gravity alignment")
         except Exception as e:
-            self.get_logger().warn(f"LidarNode: failed to subscribe body IMU: {e}")
+            self.get_logger().warn(f"LidarNode: failed to subscribe Livox IMU: {e}")
 
     def _on_cloud(self, msg) -> None:
         now = time.monotonic()
@@ -1220,23 +1219,25 @@ class _LidarNode(Node):
         total_points = msg.width * msg.height
         data = bytes(msg.data)
 
-        # Apply gravity alignment: compensate body tilt + mounting pitch
+        # Apply gravity alignment using Livox IMU accelerometer
         data = gravity_align_inplace(data, point_step, total_points,
-                                     self._imu_roll, self._imu_pitch + LIDAR_MOUNT_PITCH)
+                                     self._imu_roll, self._imu_pitch)
 
         # Format: [uint32 point_step][uint32 total_points][raw bytes]
         header = struct.pack('<II', point_step, total_points)
         from std_msgs.msg import UInt8MultiArray
         ros_msg = UInt8MultiArray()
-        ros_msg.data = list(header + data)
+        ros_msg.data = header + data
         self._cloud_pub.publish(ros_msg)
 
-    def _on_body_imu(self, msg) -> None:
-        """Update roll/pitch from body IMU (DDS LowState) for gravity alignment."""
+    def _on_livox_imu(self, msg) -> None:
+        """Compute roll/pitch from Livox IMU accelerometer (co-located with lidar)."""
+        import math
         try:
-            imu = msg.imu_state
-            self._imu_roll = float(imu.rpy[0])
-            self._imu_pitch = float(imu.rpy[1])
+            acc = msg.linear_acceleration
+            ax, ay, az = float(acc.x), float(acc.y), float(acc.z)
+            self._imu_roll = math.atan2(ay, az)
+            self._imu_pitch = math.atan2(-ax, math.sqrt(ay * ay + az * az))
         except Exception:
             pass
 
