@@ -15,6 +15,7 @@ ControlledSpatialPlugin — 人工控制建图与导航 actuator。
 import json
 import math
 import os
+import multiprocessing
 import sqlite3
 import threading
 import time
@@ -40,6 +41,105 @@ RPC_ERROR_DESCRIPTIONS = {
 def _rpc_error(action: str, code: int, resp=None) -> dict:
     desc = RPC_ERROR_DESCRIPTIONS.get(code, "unknown error")
     return {"error": f"{action} failed: {desc} (code={code})", "response": resp}
+
+
+# ── SLAM RPC Subprocess Proxy ────────────────────────────────────────────────
+# The driver process has ~50 threads causing severe GIL contention. CycloneDDS
+# listener callbacks (which need the GIL) get starved, so RPC responses arrive
+# >5s late. Running SLAM RPC calls in a subprocess with minimal threads avoids
+# this entirely — proven to work in <1s by standalone test.
+
+def _slam_rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.Queue,
+                     network_iface: str):
+    """Subprocess: holds a dedicated SlamClient, processes RPC commands."""
+    from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+    from unitree_sdk2py.g1.slam.slam_client import SlamClient
+
+    ChannelFactoryInitialize(0, network_iface)
+    client = SlamClient()
+    client.SetTimeout(10.0)
+    client.Init()
+    time.sleep(0.5)
+    print("[SlamRpcWorker] ready", flush=True)
+
+    while True:
+        try:
+            cmd = cmd_queue.get()
+        except Exception:
+            break
+        if cmd is None:
+            break
+
+        method = cmd.get("method")
+        args = cmd.get("args", {})
+        try:
+            if method == "StartMapping":
+                code, resp = client.StartMapping()
+            elif method == "StopMapping":
+                code, resp = client.StopMapping(args["address"])
+            elif method == "InitPose":
+                code, resp = client.InitPose(**args)
+            elif method == "NavigateTo":
+                code, resp = client.NavigateTo(**args)
+            elif method == "PauseNav":
+                code, resp = client.PauseNav()
+            elif method == "ResumeNav":
+                code, resp = client.ResumeNav()
+            else:
+                result_queue.put({"code": -1, "resp": f"unknown method: {method}"})
+                continue
+            result_queue.put({"code": code, "resp": resp})
+        except Exception as e:
+            result_queue.put({"code": -1, "resp": str(e)})
+
+
+class _SlamRpcProxy:
+    """Proxy that forwards SLAM RPC calls to a subprocess."""
+
+    def __init__(self, network_iface: str = "eth0"):
+        self._cmd_q = multiprocessing.Queue()
+        self._result_q = multiprocessing.Queue()
+        self._proc = multiprocessing.Process(
+            target=_slam_rpc_worker,
+            args=(self._cmd_q, self._result_q, network_iface),
+            daemon=True,
+        )
+        self._proc.start()
+        self._lock = threading.Lock()
+
+    def _call(self, method: str, args: dict | None = None, timeout: float = 15.0) -> tuple:
+        with self._lock:
+            self._cmd_q.put({"method": method, "args": args or {}})
+            try:
+                result = self._result_q.get(timeout=timeout)
+            except Exception:
+                return 3104, None
+            return result["code"], result["resp"]
+
+    def StartMapping(self) -> tuple:
+        return self._call("StartMapping")
+
+    def StopMapping(self, address: str) -> tuple:
+        return self._call("StopMapping", {"address": address})
+
+    def InitPose(self, x=0.0, y=0.0, z=0.0, q_x=0.0, q_y=0.0, q_z=0.0, q_w=1.0, address="") -> tuple:
+        return self._call("InitPose", {"x": x, "y": y, "z": z, "q_x": q_x, "q_y": q_y, "q_z": q_z, "q_w": q_w, "address": address})
+
+    def NavigateTo(self, x, y, z=0.0, q_x=0.0, q_y=0.0, q_z=0.0, q_w=1.0) -> tuple:
+        return self._call("NavigateTo", {"x": x, "y": y, "z": z, "q_x": q_x, "q_y": q_y, "q_z": q_z, "q_w": q_w})
+
+    def PauseNav(self) -> tuple:
+        return self._call("PauseNav")
+
+    def ResumeNav(self) -> tuple:
+        return self._call("ResumeNav")
+
+    def stop(self):
+        try:
+            self._cmd_q.put(None)
+            self._proc.join(timeout=3)
+        except Exception:
+            pass
 
 
 # ── Database ─────────────────────────────────────────────────────────────────
@@ -165,7 +265,9 @@ class ControlledSpatialPlugin:
     PREFIX = "controlled_spatial"
 
     def __init__(self, plugin_config: dict, namespace: str, executor, slam_client, smart_motion=None):
-        self._client = slam_client
+        # Use subprocess proxy to avoid GIL contention in the driver process (49 threads).
+        network_iface = plugin_config.get("network_iface", "eth0")
+        self._client = _SlamRpcProxy(network_iface)
         self._smart_motion = smart_motion
         self._pcd_dir = plugin_config.get("native_slam_pcd_dir", "/home/unitree")  # SLAM 服务写 PCD 的机器人本机路径
         db_path = plugin_config.get("native_slam_db_path", "/opt/phanthy-motus/data/controlled_spatial.db")
@@ -248,7 +350,8 @@ class ControlledSpatialPlugin:
         pass
 
     def stop(self) -> None:
-        pass
+        if hasattr(self._client, 'stop'):
+            self._client.stop()
 
     # ── DDS callback ─────────────────────────────────────────────────────────
 
@@ -298,21 +401,6 @@ class ControlledSpatialPlugin:
                 self._is_mapping = True
                 self._db.add_map(map_name, pcd_path)
                 return {"status": "mapping", "map_name": map_name}
-
-            # RPC timeout — check DDS state to see if mapping actually started
-            if code == 3104:
-                time.sleep(1)
-                with self._lock:
-                    actually_mapping = self._map_status == "mapping"
-                if actually_mapping:
-                    print(f"[ControlledSpatial] StartMapping RPC timeout but DDS confirms mapping started")
-                    pcd_path = f"{self._pcd_dir}/controlled_{map_name}.pcd"
-                    self._active_map = map_name
-                    self._is_mapping = True
-                    self._db.add_map(map_name, pcd_path)
-                    return {"status": "mapping", "map_name": map_name,
-                            "warning": "RPC timeout but mapping confirmed via DDS"}
-
             return _rpc_error("StartMapping", code, resp)
 
         elif action == "stop_mapping":
@@ -321,26 +409,11 @@ class ControlledSpatialPlugin:
             pcd_path = f"{self._pcd_dir}/controlled_{self._active_map}.pcd"
             map_name = self._active_map
 
-            # 尝试停止建图，超时则重试一次（保存 PCD 可能耗时较长）
             code, resp = self._client.StopMapping(pcd_path)
-            if code == 3104:
-                print(f"[ControlledSpatial] StopMapping timeout, retrying...")
-                code, resp = self._client.StopMapping(pcd_path)
-
             if code == 0:
                 self._is_mapping = False
                 self._active_map = None
                 return {"status": "stopped", "map_name": map_name, "pcd_path": pcd_path}
-
-            # 即使 RPC 超时，如果 DDS 回调显示已不在建图状态，视为成功
-            with self._lock:
-                actually_mapping = self._map_status == "mapping"
-            if not actually_mapping:
-                print(f"[ControlledSpatial] StopMapping RPC failed (code={code}) but DDS shows not mapping, treating as success")
-                self._is_mapping = False
-                self._active_map = None
-                return {"status": "stopped", "map_name": map_name, "pcd_path": pcd_path,
-                        "warning": f"RPC returned code={code} but SLAM already stopped"}
 
             return _rpc_error("StopMapping", code, resp)
 
