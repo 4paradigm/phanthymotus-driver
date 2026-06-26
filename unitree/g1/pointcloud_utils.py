@@ -23,28 +23,16 @@ def gravity_align_inplace(data: bytes, point_step: int, total_points: int,
         [-cr * sp, sr,   cr * cp],
     ], dtype=np.float32)
 
-    # Use numpy stride tricks for efficient xyz access without full reshape
+    # Extract xyz (3 x float32 = 12 bytes at start of each point)
     buf = bytearray(data)
-    raw = np.frombuffer(buf, dtype=np.uint8)
-
-    # Extract xyz: 3 float32 at offset 0 in each point_step-sized block
-    # Use as_strided to create a (total_points, 3) float32 view
-    xyz_bytes = np.lib.stride_tricks.as_strided(
-        np.frombuffer(buf, dtype=np.float32),
-        shape=(total_points, 3),
-        strides=(point_step, 4),
-    ).copy()
+    # View as uint8, reshape to (total_points, point_step), slice first 12 bytes
+    raw = np.frombuffer(buf, dtype=np.uint8).reshape(total_points, point_step)
+    xyz = raw[:, :12].copy().view(np.float32).reshape(total_points, 3)
 
     # Apply rotation
-    xyz_bytes = xyz_bytes @ R.T
+    xyz = xyz @ R.T
 
     # Write back
-    result = np.frombuffer(buf, dtype=np.float32)
-    out_view = np.lib.stride_tricks.as_strided(
-        result,
-        shape=(total_points, 3),
-        strides=(point_step, 4),
-    )
-    out_view[:] = xyz_bytes
+    raw[:, :12] = xyz.view(np.uint8).reshape(total_points, 12)
 
     return bytes(buf)
