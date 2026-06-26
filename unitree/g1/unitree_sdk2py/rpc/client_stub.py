@@ -59,11 +59,10 @@ class ClientStub:
 
     def __ResponseHandler(self, response: Response):
         id = response.header.identity.id
-        # apiId = response.header.identity.api_id
-        # print("[ClientStub] responseHandler recv response id:", id, ", apiId:", apiId)
+        apiId = response.header.identity.api_id
+        print(f"[ClientStub:{self.__serviceName}] recv response id={id}, apiId={apiId}", flush=True)
         future = self.__futureQueue.Get(id)
         if future is None:
-            # print("[ClientStub] get future from queue error. id:", id)
-            pass
+            print(f"[ClientStub:{self.__serviceName}] no matching future for id={id}", flush=True)
         elif not future.Ready(response):
             print("[ClientStub] set future ready error.")

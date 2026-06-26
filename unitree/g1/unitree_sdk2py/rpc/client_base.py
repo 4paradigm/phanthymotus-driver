@@ -25,22 +25,30 @@ class ClientBase:
         self.__timeout = timeout
 
     def _CallBase(self, apiId: int, parameter: str, proirity: int = 0, leaseId: int = 0):
-        # print("[CallBase] call apiId:", apiId, ", proirity:", proirity, ", leaseId:", leaseId)
         header = self.__SetHeader(apiId, leaseId, proirity, False)
         request = Request(header, parameter, [])
+        req_id = request.header.identity.id
 
+        print(f"[CallBase] sending apiId={apiId}, id={req_id}, timeout={self.__timeout}", flush=True)
+
+        t0 = time.monotonic()
         future = self.__stub.SendRequest(request, self.__timeout)
         if future is None:
+            print(f"[CallBase] SendRequest FAILED (send error), elapsed={time.monotonic()-t0:.3f}s", flush=True)
             return RPC_ERR_CLIENT_SEND, None
 
+        print(f"[CallBase] sent ok, waiting for response...", flush=True)
         result = future.GetResult(self.__timeout)
+        elapsed = time.monotonic() - t0
 
         if result.code != FutureResult.FUTURE_SUCC:
             self.__stub.RemoveFuture(request.header.identity.id)
             code = RPC_ERR_CLIENT_API_TIMEOUT if result.code == FutureResult.FUTUTE_ERR_TIMEOUT else RPC_ERR_UNKNOWN
+            print(f"[CallBase] FAILED: result.code={result.code}, rpc_code={code}, elapsed={elapsed:.3f}s", flush=True)
             return code, None
 
         response = result.value
+        print(f"[CallBase] SUCCESS: apiId={response.header.identity.api_id}, status={response.header.status.code}, elapsed={elapsed:.3f}s", flush=True)
 
         if response.header.identity.api_id != apiId:
             return RPC_ERR_CLIENT_API_NOT_MATCH, None
