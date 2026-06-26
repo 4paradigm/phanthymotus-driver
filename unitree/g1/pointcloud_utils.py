@@ -13,13 +13,13 @@ def gravity_align_inplace(data: bytes, point_step: int, total_points: int,
         data: Raw point cloud bytes (total_points * point_step bytes).
         point_step: Bytes per point.
         total_points: Number of points.
-        roll: Current roll angle in radians (from IMU).
-        pitch: Current pitch angle in radians (from IMU).
+        roll: Total roll to compensate in radians (IMU + mounting offset).
+        pitch: Total pitch to compensate in radians (IMU + mounting offset).
 
     Returns:
         Modified bytes with rotated xyz. Returns original data if rotation is negligible.
     """
-    if abs(roll) < 0.001 and abs(pitch) < 0.001:
+    if total_points == 0 or (abs(roll) < 0.001 and abs(pitch) < 0.001):
         return data
 
     buf = np.frombuffer(data, dtype=np.uint8).copy().reshape(total_points, point_step)
