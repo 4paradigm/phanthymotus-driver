@@ -1222,7 +1222,7 @@ class _LidarNode(Node):
 
         point_step = msg.point_step
         total_points = msg.width * msg.height
-        data = bytes(msg.data)
+        data = msg.data if isinstance(msg.data, (bytes, bytearray)) else bytes(msg.data)
 
         # Non-blocking put; drop frame if worker is busy
         try:
@@ -1241,13 +1241,16 @@ class _LidarNode(Node):
                 break
             point_step, total_points, data, roll, pitch = item
 
-            # Apply gravity alignment
+            # Apply gravity alignment (returns bytearray, avoids extra copy)
             data = gravity_align_inplace(data, point_step, total_points, roll, pitch)
 
-            # Publish — use array.array to avoid slow per-byte Python int conversion
+            # Publish — pre-allocate buffer to avoid header + data concat copy
             header = struct.pack('<II', point_step, total_points)
+            buf = bytearray(8 + len(data))
+            buf[:8] = header
+            buf[8:] = data
             ros_msg = UInt8MultiArray()
-            ros_msg.data = _array.array('B', header + data)
+            ros_msg.data = _array.array('B', buf)
             self._cloud_pub.publish(ros_msg)
 
     def _on_livox_imu(self, msg) -> None:
