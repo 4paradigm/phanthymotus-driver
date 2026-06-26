@@ -124,7 +124,9 @@ class G1DeviceBundle:
 
         if plugins_cfg.get("controlled_spatial", {}).get("enabled", False):
             from controlled_spatial import ControlledSpatialPlugin
-            self._plugins.append(ControlledSpatialPlugin(plugins_cfg["controlled_spatial"], namespace, executor, slam_client, smart_motion=smart_motion))
+            controlled_cfg = dict(plugins_cfg["controlled_spatial"])
+            controlled_cfg["network_iface"] = network_iface
+            self._plugins.append(ControlledSpatialPlugin(controlled_cfg, namespace, executor, slam_client, smart_motion=smart_motion))
             print("[bundle] ControlledSpatialPlugin loaded")
 
         if plugins_cfg.get("motion_switcher", {}).get("enabled", False):
