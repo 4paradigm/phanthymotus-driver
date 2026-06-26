@@ -20,6 +20,28 @@ import threading
 import time
 
 
+# ── RPC Error Codes ──────────────────────────────────────────────────────────
+
+RPC_ERROR_DESCRIPTIONS = {
+    3102: "发送指令错误",
+    3103: "API 未注册",
+    3104: "请求超时",
+    3105: "请求与响应数据不匹配",
+    3106: "响应数据无效",
+    3107: "租约无效",
+    3201: "服务端发送错误",
+    3202: "服务端内部错误",
+    3203: "服务端 API 未实现",
+    3204: "服务端 API 参数错误",
+    3205: "服务端租约被拒",
+}
+
+
+def _rpc_error(action: str, code: int, resp=None) -> dict:
+    desc = RPC_ERROR_DESCRIPTIONS.get(code, "未知错误")
+    return {"error": f"{action} failed: {desc} (code={code})", "response": resp}
+
+
 # ── Database ─────────────────────────────────────────────────────────────────
 
 class _ControlledSpatialDB:
@@ -268,25 +290,42 @@ class ControlledSpatialPlugin:
             if not map_name:
                 return {"error": "map_name is required"}
             code, resp = self._client.StartMapping()
-            if code == 0 or code == 3104:
+            if code == 0:
                 pcd_path = f"{self._pcd_dir}/controlled_{map_name}.pcd"
                 self._active_map = map_name
                 self._is_mapping = True
                 self._db.add_map(map_name, pcd_path)
                 return {"status": "mapping", "map_name": map_name}
-            return {"error": f"StartMapping failed, code={code}", "response": resp}
+            return _rpc_error("StartMapping", code, resp)
 
         elif action == "stop_mapping":
             if not self._active_map:
                 return {"error": "No active mapping session"}
             pcd_path = f"{self._pcd_dir}/controlled_{self._active_map}.pcd"
-            code, resp = self._client.StopMapping(pcd_path)
             map_name = self._active_map
+
+            # 尝试停止建图，超时则重试一次（保存 PCD 可能耗时较长）
+            code, resp = self._client.StopMapping(pcd_path)
+            if code == 3104:
+                print(f"[ControlledSpatial] StopMapping timeout, retrying...")
+                code, resp = self._client.StopMapping(pcd_path)
+
             if code == 0:
                 self._is_mapping = False
                 self._active_map = None
                 return {"status": "stopped", "map_name": map_name, "pcd_path": pcd_path}
-            return {"error": f"StopMapping failed, code={code}", "response": resp}
+
+            # 即使 RPC 超时，如果 DDS 回调显示已不在建图状态，视为成功
+            with self._lock:
+                actually_mapping = self._map_status == "mapping"
+            if not actually_mapping:
+                print(f"[ControlledSpatial] StopMapping RPC failed (code={code}) but DDS shows not mapping, treating as success")
+                self._is_mapping = False
+                self._active_map = None
+                return {"status": "stopped", "map_name": map_name, "pcd_path": pcd_path,
+                        "warning": f"RPC returned code={code} but SLAM already stopped"}
+
+            return _rpc_error("StopMapping", code, resp)
 
         elif action == "tag_place":
             name = args.get("name", "")
@@ -365,7 +404,7 @@ class ControlledSpatialPlugin:
             if code == 0:
                 self._active_map = map_name
                 return {"status": "loaded", "map_name": map_name, "pcd_path": pcd_path}
-            return {"error": f"InitPose (load map) failed, code={code}", "response": resp}
+            return _rpc_error("InitPose (load map)", code, resp)
 
         elif action == "navigate_to_tag":
             tag_name = args.get("tag_name", "")
@@ -389,7 +428,7 @@ class ControlledSpatialPlugin:
             code, resp = self._client.NavigateTo(poi["x"], poi["y"], 0, 0, 0, q_z, q_w)
             if code == 0:
                 return {"status": "navigating", "target": tag_name, "pose": {"x": poi["x"], "y": poi["y"], "yaw": yaw}}
-            return {"error": f"NavigateTo failed, code={code}", "response": resp}
+            return _rpc_error("NavigateTo", code, resp)
 
         elif action == "navigate_to_pose":
             x = float(args.get("x", 0))
@@ -404,19 +443,19 @@ class ControlledSpatialPlugin:
             code, resp = self._client.NavigateTo(x, y, 0, 0, 0, q_z, q_w)
             if code == 0:
                 return {"status": "navigating", "target_pose": {"x": x, "y": y, "yaw": yaw}}
-            return {"error": f"NavigateTo failed, code={code}", "response": resp}
+            return _rpc_error("NavigateTo", code, resp)
 
         elif action == "pause_nav":
             if self._smart_motion:
                 return self._smart_motion.pause_nav()
             code, resp = self._client.PauseNav()
-            return {"status": "paused"} if code == 0 else {"error": f"PauseNav failed, code={code}"}
+            return {"status": "paused"} if code == 0 else _rpc_error("PauseNav", code)
 
         elif action == "resume_nav":
             if self._smart_motion:
                 return self._smart_motion.resume_nav()
             code, resp = self._client.ResumeNav()
-            return {"status": "resumed"} if code == 0 else {"error": f"ResumeNav failed, code={code}"}
+            return {"status": "resumed"} if code == 0 else _rpc_error("ResumeNav", code)
 
         elif action == "stop_nav":
             if self._smart_motion:

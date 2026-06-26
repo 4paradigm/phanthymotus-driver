@@ -21,7 +21,7 @@ plugins:
   lidar:
     enabled: true
   slam:
-    enabled: true
+    enabled: false
     map_dir: /opt/phanthy-motus/data/maps
     db_path: /opt/phanthy-motus/data/spatial.db
   controlled_spatial:

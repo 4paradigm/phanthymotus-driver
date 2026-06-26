@@ -2325,7 +2325,7 @@ class SpatialPlugin:
         print("[SpatialPlugin] _on_localized: SLAM localized, starting mapping to extend map", flush=True)
         code, resp = self._client.StartMapping()
         print(f"[SpatialPlugin] StartMapping after localization → code={code}", flush=True)
-        if code == 0 or code == 3104:
+        if code == 0:
             self._node.set_map_status("mapping")
             if not self._node._active_map:
                 map_name = f"map_{int(time.time())}"
@@ -2333,6 +2333,8 @@ class SpatialPlugin:
                 self._node.set_active_map(map_name)
                 self._db.add_map(map_name, pcd_path)
                 print(f"[SpatialPlugin] Created new map for post-localization mapping: {map_name}", flush=True)
+        else:
+            print(f"[SpatialPlugin] StartMapping failed after localization: code={code}", flush=True)
 
     def _on_cloud_timeout(self):
         """Called by watchdog when no point cloud received for WATCHDOG_TIMEOUT seconds.
@@ -2406,16 +2408,6 @@ class SpatialPlugin:
                     self._db.add_map(map_name, pcd_path)
                     print(f"[SpatialPlugin] Created map entry: {map_name}", flush=True)
                 return {"status": "continued", "map_name": self._node._active_map}
-            # code 3104 = already mapping, treat as success
-            if code == 3104:
-                print("[SpatialPlugin] StartMapping returned 3104 (already mapping), ok", flush=True)
-                self._node.set_map_status("mapping")
-                if not self._node._active_map:
-                    map_name = f"map_{int(time.time())}"
-                    pcd_path = f"{self._map_dir}/{map_name}.pcd"
-                    self._node.set_active_map(map_name)
-                    self._db.add_map(map_name, pcd_path)
-                return {"status": "already_mapping", "map_name": self._node._active_map}
             print(f"[SpatialPlugin] StartMapping failed: code={code}, trying fingerprint path", flush=True)
             # Fall through to fingerprint path if StartMapping fails
 
@@ -2471,7 +2463,7 @@ class SpatialPlugin:
         if action == "start_mapping":
             map_name = args.get("map_name", f"map_{int(time.time())}")
             code, resp = self._client.StartMapping()
-            if code == 0 or code == 3104:
+            if code == 0:
                 pcd_path = f"{self._map_dir}/{map_name}.pcd"
                 self._node.clear_map_buffer()
                 self._node.set_map_status("mapping")
