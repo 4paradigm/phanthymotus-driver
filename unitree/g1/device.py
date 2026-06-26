@@ -1174,7 +1174,7 @@ class StatePlugin:
 
 # ── LidarPlugin (sensor) ─────────────────────────────────────────────────────
 
-LIDAR_CLOUD_INTERVAL = 0.0       # No throttle — let DDS source rate determine output
+LIDAR_CLOUD_INTERVAL = 0.05      # 20 Hz max (source is ~10Hz, allow headroom)
 
 
 class _LidarNode(Node):
@@ -1189,7 +1189,7 @@ class _LidarNode(Node):
         self._imu_pitch: float = 0.0
 
         # Worker thread for point cloud processing (keeps ch_reader unblocked)
-        self._cloud_queue: queue.Queue = queue.Queue(maxsize=2)
+        self._cloud_queue: queue.Queue = queue.Queue(maxsize=10)
         self._worker = threading.Thread(target=self._process_loop, daemon=True, name="lidar_worker")
         self._worker.start()
 
@@ -1220,11 +1220,9 @@ class _LidarNode(Node):
             return
         self._last_cloud_time = now
 
-        t0 = time.monotonic()
         point_step = msg.point_step
         total_points = msg.width * msg.height
         data = bytes(msg.data)
-        t1 = time.monotonic()
 
         # Non-blocking put; drop frame if worker is busy
         try:
@@ -1232,8 +1230,6 @@ class _LidarNode(Node):
                                          self._imu_roll, self._imu_pitch))
         except queue.Full:
             pass
-        t2 = time.monotonic()
-        self.get_logger().info(f"[_on_cloud] bytes={t1-t0:.3f}s put={t2-t1:.4f}s total={t2-t0:.3f}s pts={total_points}")
 
     def _process_loop(self) -> None:
         """Worker thread: gravity alignment + publish (off the ch_reader thread)."""
