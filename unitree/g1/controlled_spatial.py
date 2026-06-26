@@ -163,7 +163,14 @@ class ControlledSpatialPlugin:
     PREFIX = "controlled_spatial"
 
     def __init__(self, plugin_config: dict, namespace: str, executor, slam_client, smart_motion=None):
-        self._client = slam_client
+        # Create dedicated SlamClient instead of sharing the bundle's instance.
+        # The shared slam_client's DDS recv channel gets delayed by sport service
+        # response flooding (apiId=7001), causing RPC timeouts (>5s).
+        from unitree_sdk2py.g1.slam.slam_client import SlamClient
+        self._client = SlamClient()
+        self._client.SetTimeout(5.0)
+        self._client.Init()
+        print("[ControlledSpatial] dedicated SlamClient created", flush=True)
         self._smart_motion = smart_motion
         self._pcd_dir = plugin_config.get("native_slam_pcd_dir", "/home/unitree")  # SLAM 服务写 PCD 的机器人本机路径
         db_path = plugin_config.get("native_slam_db_path", "/opt/phanthy-motus/data/controlled_spatial.db")
