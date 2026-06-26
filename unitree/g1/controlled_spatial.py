@@ -23,22 +23,22 @@ import time
 # ── RPC Error Codes ──────────────────────────────────────────────────────────
 
 RPC_ERROR_DESCRIPTIONS = {
-    3102: "发送指令错误",
-    3103: "API 未注册",
-    3104: "请求超时",
-    3105: "请求与响应数据不匹配",
-    3106: "响应数据无效",
-    3107: "租约无效",
-    3201: "服务端发送错误",
-    3202: "服务端内部错误",
-    3203: "服务端 API 未实现",
-    3204: "服务端 API 参数错误",
-    3205: "服务端租约被拒",
+    3102: "send request failed",
+    3103: "API not registered",
+    3104: "request timeout",
+    3105: "request/response mismatch",
+    3106: "invalid response data",
+    3107: "invalid lease",
+    3201: "server send error",
+    3202: "server internal error",
+    3203: "server API not implemented",
+    3204: "server API parameter error",
+    3205: "server lease denied",
 }
 
 
 def _rpc_error(action: str, code: int, resp=None) -> dict:
-    desc = RPC_ERROR_DESCRIPTIONS.get(code, "未知错误")
+    desc = RPC_ERROR_DESCRIPTIONS.get(code, "unknown error")
     return {"error": f"{action} failed: {desc} (code={code})", "response": resp}
 
 
@@ -296,6 +296,21 @@ class ControlledSpatialPlugin:
                 self._is_mapping = True
                 self._db.add_map(map_name, pcd_path)
                 return {"status": "mapping", "map_name": map_name}
+
+            # RPC timeout — check DDS state to see if mapping actually started
+            if code == 3104:
+                time.sleep(1)
+                with self._lock:
+                    actually_mapping = self._map_status == "mapping"
+                if actually_mapping:
+                    print(f"[ControlledSpatial] StartMapping RPC timeout but DDS confirms mapping started")
+                    pcd_path = f"{self._pcd_dir}/controlled_{map_name}.pcd"
+                    self._active_map = map_name
+                    self._is_mapping = True
+                    self._db.add_map(map_name, pcd_path)
+                    return {"status": "mapping", "map_name": map_name,
+                            "warning": "RPC timeout but mapping confirmed via DDS"}
+
             return _rpc_error("StartMapping", code, resp)
 
         elif action == "stop_mapping":
