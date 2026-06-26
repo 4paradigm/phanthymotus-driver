@@ -1206,7 +1206,7 @@ class _LidarNode(Node):
             from unitree_sdk2py.core.channel import ChannelSubscriber
             from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_
             self._cloud_sub = ChannelSubscriber("rt/utlidar/cloud_livox_mid360", PointCloud2_)
-            self._cloud_sub.Init(self._on_cloud, 0)  # queueLen=0: run directly in DDS receive thread (avoid BQueue drop)
+            self._cloud_sub.Init(self._on_cloud, 1)  # queueLen=1: use BQueue to avoid blocking DDS receive thread (which delays RPC responses)
             self.get_logger().info(f"LidarNode subscribed rt/utlidar/cloud_livox_mid360 → {cloud_topic}")
         except Exception as e:
             self.get_logger().warn(f"LidarNode: failed to subscribe cloud: {e}")
