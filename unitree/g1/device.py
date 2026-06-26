@@ -1220,11 +1220,9 @@ class _LidarNode(Node):
         total_points = msg.width * msg.height
         data = bytes(msg.data)
 
-        # Apply only mounting pitch compensation (pure Ry rotation, no IMU gravity)
-        # IMU gravity alignment is disabled because the Rx*Ry matrix doesn't match
-        # the inverted Livox coordinate conventions.
+        # Apply gravity alignment (signs flipped for inverted Livox frame: y=right, z=down)
         data = gravity_align_inplace(data, point_step, total_points,
-                                     0.0, LIDAR_MOUNT_PITCH)
+                                     -self._imu_roll, -(self._imu_pitch + LIDAR_MOUNT_PITCH))
 
         # Format: [uint32 point_step][uint32 total_points][raw bytes]
         header = struct.pack('<II', point_step, total_points)
