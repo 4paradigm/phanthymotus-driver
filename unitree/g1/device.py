@@ -1220,9 +1220,11 @@ class _LidarNode(Node):
             return
         self._last_cloud_time = now
 
+        t0 = time.monotonic()
         point_step = msg.point_step
         total_points = msg.width * msg.height
         data = bytes(msg.data)
+        t1 = time.monotonic()
 
         # Non-blocking put; drop frame if worker is busy
         try:
@@ -1230,6 +1232,8 @@ class _LidarNode(Node):
                                          self._imu_roll, self._imu_pitch))
         except queue.Full:
             pass
+        t2 = time.monotonic()
+        self.get_logger().info(f"[_on_cloud] bytes={t1-t0:.3f}s put={t2-t1:.4f}s total={t2-t0:.3f}s pts={total_points}")
 
     def _process_loop(self) -> None:
         """Worker thread: gravity alignment + publish (off the ch_reader thread)."""
