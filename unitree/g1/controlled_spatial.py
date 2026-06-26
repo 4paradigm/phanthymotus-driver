@@ -74,6 +74,8 @@ class _ControlledSpatialDB:
         self._conn.commit()
 
     def add_map(self, name: str, pcd_path: str):
+        # Clear old POIs if map name already exists (re-mapping)
+        self._conn.execute("DELETE FROM poi WHERE map_name = ?", (name,))
         self._conn.execute(
             "INSERT OR REPLACE INTO maps (name, pcd_path) VALUES (?, ?)", (name, pcd_path)
         )
