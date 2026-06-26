@@ -1262,12 +1262,12 @@ class LidarPlugin:
             "configSchema": {
                 "type": "object",
                 "properties": {
-                    "axis_x_source": {"type": "string", "enum": ["x", "y", "z"], "default": "y", "title": "Display X (right) ← LiDAR axis"},
-                    "axis_x_negate": {"type": "boolean", "default": False, "title": "Negate X"},
-                    "axis_y_source": {"type": "string", "enum": ["x", "y", "z"], "default": "z", "title": "Display Y (up) ← LiDAR axis"},
-                    "axis_y_negate": {"type": "boolean", "default": True, "title": "Negate Y"},
-                    "axis_z_source": {"type": "string", "enum": ["x", "y", "z"], "default": "x", "title": "Display Z (forward) ← LiDAR axis"},
-                    "axis_z_negate": {"type": "boolean", "default": True, "title": "Negate Z"},
+                    "axis_x_source": {"type": "string", "enum": ["x", "y", "z"], "default": "y", "title": "Display X (right) ← Robot axis"},
+                    "axis_x_negate": {"type": "boolean", "default": True, "title": "Negate X"},
+                    "axis_y_source": {"type": "string", "enum": ["x", "y", "z"], "default": "z", "title": "Display Y (up) ← Robot axis"},
+                    "axis_y_negate": {"type": "boolean", "default": False, "title": "Negate Y"},
+                    "axis_z_source": {"type": "string", "enum": ["x", "y", "z"], "default": "x", "title": "Display Z (forward) ← Robot axis"},
+                    "axis_z_negate": {"type": "boolean", "default": False, "title": "Negate Z"},
                 },
             },
         }
