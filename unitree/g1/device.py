@@ -1175,7 +1175,7 @@ class StatePlugin:
 # ── LidarPlugin (sensor) ─────────────────────────────────────────────────────
 
 LIDAR_CLOUD_INTERVAL = 0.1       # 10 Hz throttle (source is 10Hz anyway)
-LIDAR_MOUNT_PITCH = 2.3 * 3.14159265 / 180.0  # compensate Livox Mid-360 -2.3° mounting pitch on G1
+LIDAR_MOUNT_PITCH = -2.3 * 3.14159265 / 180.0  # compensate Livox Mid-360 -2.3° mounting pitch on G1
 
 
 class _LidarNode(Node):
