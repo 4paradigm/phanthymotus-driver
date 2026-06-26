@@ -1188,7 +1188,15 @@ class _LidarNode(Node):
         self._imu_roll:  float = 0.0
         self._imu_pitch: float = 0.0
 
-        # Worker thread for point cloud processing (keeps ch_reader unblocked)
+        # Diagnostics (printed every N frames)
+        self._cb_count: int = 0         # total DDS callbacks received
+        self._cb_accepted: int = 0      # passed throttle
+        self._cb_dropped: int = 0       # queue full
+        self._cb_first_time: float = 0.0
+        self._worker_count: int = 0
+        self._worker_total_ms: float = 0.0
+
+        # Worker thread for point cloud processing (keeps DDS receive thread unblocked)
         self._cloud_queue: queue.Queue = queue.Queue(maxsize=10)
         self._worker = threading.Thread(target=self._process_loop, daemon=True, name="lidar_worker")
         self._worker.start()
@@ -1198,7 +1206,7 @@ class _LidarNode(Node):
             from unitree_sdk2py.core.channel import ChannelSubscriber
             from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_
             self._cloud_sub = ChannelSubscriber("rt/utlidar/cloud_livox_mid360", PointCloud2_)
-            self._cloud_sub.Init(self._on_cloud, 10)
+            self._cloud_sub.Init(self._on_cloud, 0)  # queueLen=0: run directly in DDS receive thread (avoid BQueue drop)
             self.get_logger().info(f"LidarNode subscribed rt/utlidar/cloud_livox_mid360 → {cloud_topic}")
         except Exception as e:
             self.get_logger().warn(f"LidarNode: failed to subscribe cloud: {e}")
@@ -1214,73 +1222,67 @@ class _LidarNode(Node):
             self.get_logger().warn(f"LidarNode: failed to subscribe Livox IMU: {e}")
 
     def _on_cloud(self, msg) -> None:
-        """DDS callback — throttle and enqueue for worker thread."""
+        """DDS callback — throttle and enqueue for worker thread.
+        Runs directly in CycloneDDS receive thread (queueLen=0).
+        """
+        self._cb_count += 1
         now = time.monotonic()
         if now - self._last_cloud_time < LIDAR_CLOUD_INTERVAL:
             return
         self._last_cloud_time = now
+        self._cb_accepted += 1
 
-        t0 = time.monotonic()
+        if self._cb_first_time == 0.0:
+            self._cb_first_time = now
+
         point_step = msg.point_step
         total_points = msg.width * msg.height
         data = msg.data if isinstance(msg.data, (bytes, bytearray)) else bytes(msg.data)
-        t1 = time.monotonic()
-
-        data_size = len(data)
 
         # Non-blocking put; drop frame if worker is busy
         try:
             self._cloud_queue.put_nowait((point_step, total_points, data,
-                                         self._imu_roll, self._imu_pitch, t0))
-            queued = True
+                                         self._imu_roll, self._imu_pitch))
         except queue.Full:
-            queued = False
+            self._cb_dropped += 1
 
-        self.get_logger().info(
-            f"[lidar:_on_cloud] pts={total_points} step={point_step} "
-            f"size={data_size}B bytes_conv={1000*(t1-t0):.1f}ms "
-            f"queued={queued} qsize={self._cloud_queue.qsize()}"
-        )
+        # Print stats every 20 accepted frames (~2s at 10Hz)
+        if self._cb_accepted % 20 == 0:
+            elapsed = now - self._cb_first_time
+            avg_hz = self._cb_accepted / elapsed if elapsed > 0 else 0
+            print(
+                f"[lidar:stats] received={self._cb_count} accepted={self._cb_accepted} "
+                f"dropped={self._cb_dropped} avg_hz={avg_hz:.1f} "
+                f"worker_avg={self._worker_total_ms/max(self._worker_count,1):.1f}ms",
+                flush=True
+            )
 
     def _process_loop(self) -> None:
-        """Worker thread: gravity alignment + publish (off the ch_reader thread)."""
+        """Worker thread: gravity alignment + publish (off the DDS receive thread)."""
         import array as _array
         from std_msgs.msg import UInt8MultiArray
         while True:
             item = self._cloud_queue.get()
             if item is None:
                 break
-            point_step, total_points, data, roll, pitch, t_enqueue = item
+            point_step, total_points, data, roll, pitch = item
             t0 = time.monotonic()
-            queue_wait = t0 - t_enqueue
 
             # Apply gravity alignment (returns bytearray, avoids extra copy)
             data = gravity_align_inplace(data, point_step, total_points, roll, pitch)
-            t1 = time.monotonic()
 
             # Publish — pre-allocate buffer to avoid header + data concat copy
             header = struct.pack('<II', point_step, total_points)
             buf = bytearray(8 + len(data))
             buf[:8] = header
             buf[8:] = data
-            t2 = time.monotonic()
-
             ros_msg = UInt8MultiArray()
             ros_msg.data = _array.array('B', buf)
-            t3 = time.monotonic()
-
             self._cloud_pub.publish(ros_msg)
-            t4 = time.monotonic()
 
-            print(
-                f"[lidar:worker] queue_wait={1000*queue_wait:.1f}ms "
-                f"gravity={1000*(t1-t0):.1f}ms "
-                f"pack={1000*(t2-t1):.1f}ms "
-                f"array={1000*(t3-t2):.1f}ms "
-                f"publish={1000*(t4-t3):.1f}ms "
-                f"total={1000*(t4-t_enqueue):.1f}ms",
-                flush=True
-            )
+            elapsed_ms = (time.monotonic() - t0) * 1000
+            self._worker_count += 1
+            self._worker_total_ms += elapsed_ms
 
     def _on_livox_imu(self, msg) -> None:
         """Compute roll/pitch from Livox IMU accelerometer (co-located with lidar, inverted mount)."""
