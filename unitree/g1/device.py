@@ -1175,7 +1175,7 @@ class StatePlugin:
 # ── LidarPlugin (sensor) ─────────────────────────────────────────────────────
 
 LIDAR_CLOUD_INTERVAL = 0.1       # 10 Hz throttle (source is 10Hz anyway)
-LIDAR_MOUNT_PITCH = -2.3 * 3.14159265 / 180.0  # Livox Mid-360 mounting pitch offset on G1 head (rad)
+LIDAR_MOUNT_PITCH = 2.3 * 3.14159265 / 180.0  # Livox Mid-360 mounting pitch offset on G1 head (rad)
 
 
 class _LidarNode(Node):
