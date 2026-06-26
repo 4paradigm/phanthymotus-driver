@@ -1188,6 +1188,11 @@ class _LidarNode(Node):
         self._imu_roll:  float = 0.0
         self._imu_pitch: float = 0.0
 
+        # Worker thread for point cloud processing (keeps ch_reader unblocked)
+        self._cloud_queue: queue.Queue = queue.Queue(maxsize=2)
+        self._worker = threading.Thread(target=self._process_loop, daemon=True, name="lidar_worker")
+        self._worker.start()
+
         # Subscribe DDS PointCloud2
         try:
             from unitree_sdk2py.core.channel import ChannelSubscriber
@@ -1209,26 +1214,40 @@ class _LidarNode(Node):
             self.get_logger().warn(f"LidarNode: failed to subscribe Livox IMU: {e}")
 
     def _on_cloud(self, msg) -> None:
+        """DDS callback — throttle and enqueue for worker thread."""
         now = time.monotonic()
         if now - self._last_cloud_time < LIDAR_CLOUD_INTERVAL:
             return
         self._last_cloud_time = now
 
-        # Passthrough: forward full PointCloud2 data with gravity alignment
         point_step = msg.point_step
         total_points = msg.width * msg.height
         data = bytes(msg.data)
 
-        # Apply gravity alignment using Livox IMU accelerometer
-        data = gravity_align_inplace(data, point_step, total_points,
-                                     self._imu_roll, self._imu_pitch)
+        # Non-blocking put; drop frame if worker is busy
+        try:
+            self._cloud_queue.put_nowait((point_step, total_points, data,
+                                         self._imu_roll, self._imu_pitch))
+        except queue.Full:
+            pass
 
-        # Format: [uint32 point_step][uint32 total_points][raw bytes]
-        header = struct.pack('<II', point_step, total_points)
+    def _process_loop(self) -> None:
+        """Worker thread: gravity alignment + publish (off the ch_reader thread)."""
         from std_msgs.msg import UInt8MultiArray
-        ros_msg = UInt8MultiArray()
-        ros_msg.data = header + data
-        self._cloud_pub.publish(ros_msg)
+        while True:
+            item = self._cloud_queue.get()
+            if item is None:
+                break
+            point_step, total_points, data, roll, pitch = item
+
+            # Apply gravity alignment
+            data = gravity_align_inplace(data, point_step, total_points, roll, pitch)
+
+            # Publish
+            header = struct.pack('<II', point_step, total_points)
+            ros_msg = UInt8MultiArray()
+            ros_msg.data = header + data
+            self._cloud_pub.publish(ros_msg)
 
     def _on_livox_imu(self, msg) -> None:
         """Compute roll/pitch from Livox IMU accelerometer (co-located with lidar, inverted mount)."""
