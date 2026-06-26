@@ -1231,12 +1231,13 @@ class _LidarNode(Node):
         self._cloud_pub.publish(ros_msg)
 
     def _on_livox_imu(self, msg) -> None:
-        """Compute roll/pitch from Livox IMU accelerometer (co-located with lidar)."""
+        """Compute roll/pitch from Livox IMU accelerometer (co-located with lidar, inverted mount)."""
         import math
         try:
             acc = msg.linear_acceleration
             ax, ay, az = float(acc.x), float(acc.y), float(acc.z)
-            self._imu_roll = math.atan2(ay, az)
+            # Livox is mounted inverted: flip y,z to get upright-equivalent frame
+            self._imu_roll = math.atan2(-ay, -az)
             self._imu_pitch = math.atan2(-ax, math.sqrt(ay * ay + az * az))
         except Exception:
             pass
