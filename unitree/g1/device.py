@@ -1220,9 +1220,9 @@ class _LidarNode(Node):
         total_points = msg.width * msg.height
         data = bytes(msg.data)
 
-        # Apply gravity alignment (signs flipped for inverted Livox frame: y=right, z=down)
+        # Apply gravity alignment: compensate body tilt + mounting pitch
         data = gravity_align_inplace(data, point_step, total_points,
-                                     -self._imu_roll, -(self._imu_pitch + LIDAR_MOUNT_PITCH))
+                                     self._imu_roll, self._imu_pitch + LIDAR_MOUNT_PITCH)
 
         # Format: [uint32 point_step][uint32 total_points][raw bytes]
         header = struct.pack('<II', point_step, total_points)
