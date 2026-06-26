@@ -1175,6 +1175,7 @@ class StatePlugin:
 # ── LidarPlugin (sensor) ─────────────────────────────────────────────────────
 
 LIDAR_CLOUD_INTERVAL = 0.1       # 10 Hz throttle (source is 10Hz anyway)
+LIDAR_MOUNT_PITCH = -2.3 * 3.14159265 / 180.0  # Livox Mid-360 mounting pitch offset on G1 head (rad)
 
 
 class _LidarNode(Node):
@@ -1219,9 +1220,9 @@ class _LidarNode(Node):
         total_points = msg.width * msg.height
         data = bytes(msg.data)
 
-        # Apply IMU gravity alignment
+        # Apply IMU gravity alignment + mounting pitch offset
         data = gravity_align_inplace(data, point_step, total_points,
-                                     self._imu_roll, self._imu_pitch)
+                                     self._imu_roll, self._imu_pitch + LIDAR_MOUNT_PITCH)
 
         # Format: [uint32 point_step][uint32 total_points][raw bytes]
         header = struct.pack('<II', point_step, total_points)
