@@ -1174,7 +1174,7 @@ class StatePlugin:
 
 # ── LidarPlugin (sensor) ─────────────────────────────────────────────────────
 
-LIDAR_CLOUD_INTERVAL = 0.1       # 10 Hz throttle (source is 10Hz anyway)
+LIDAR_CLOUD_INTERVAL = 0.0       # No throttle — let DDS source rate determine output
 
 
 class _LidarNode(Node):
