@@ -61,7 +61,8 @@ class G1DeviceBundle:
                  arm_client: G1ArmActionClient,
                  slam_client: SlamClient,
                  msc_client: MotionSwitcherClient,
-                 smart_motion=None):
+                 smart_motion=None,
+                 network_iface: str = "eth0"):
         self._plugins: list = []
         self._smart_motion = smart_motion
         plugins_cfg = cfg.get("plugins", {})
@@ -353,7 +354,7 @@ def main():
         smart_motion = SmartMotionProxy(namespace, harness_cfg, network_iface)
         print("[bundle] SmartMotion safety harness active (subprocess)")
 
-    _bundle = G1DeviceBundle(cfg, namespace, executor, audio_client, loco_client, arm_client, slam_client, msc_client, smart_motion=smart_motion)
+    _bundle = G1DeviceBundle(cfg, namespace, executor, audio_client, loco_client, arm_client, slam_client, msc_client, smart_motion=smart_motion, network_iface=network_iface)
     _bundle.start_all()
 
     def _spin():
