@@ -60,9 +60,8 @@ class ClientStub:
     def __ResponseHandler(self, response: Response):
         id = response.header.identity.id
         apiId = response.header.identity.api_id
-        print(f"[ClientStub:{self.__serviceName}] recv response id={id}, apiId={apiId}", flush=True)
         future = self.__futureQueue.Get(id)
         if future is None:
-            print(f"[ClientStub:{self.__serviceName}] no matching future for id={id}", flush=True)
+            pass  # expected for fire-and-forget sport commands
         elif not future.Ready(response):
             print("[ClientStub] set future ready error.")

@@ -190,7 +190,11 @@ _bundle: G1DeviceBundle | None = None
 def make_handler():
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
-            print(f"[mcp] {self.address_string()} {fmt % args}")
+            # Suppress routine request logs (info/heartbeat); only log errors and tool calls
+            msg = fmt % args
+            if '"POST /mcp' in msg and '200' in msg:
+                return
+            print(f"[mcp] {self.address_string()} {msg}")
 
         def _send(self, status: int, body: str):
             encoded = body.encode()
@@ -286,7 +290,7 @@ def _start_registration(mcp_port: int, name: str, category: str):
                     headers={"Content-Type": "application/json"}, method="POST",
                 )
                 with _urllib.urlopen(req, timeout=3):
-                    print(f"[register] heartbeat ok → {agent_core_url}")
+                    pass  # heartbeat ok, suppress log
                 _t.sleep(30)
             except Exception as e:
                 print(f"[register] failed: {e}, retrying in 5s")

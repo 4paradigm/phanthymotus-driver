@@ -408,7 +408,8 @@ class SpeakerPlugin:
         self._node.stop_play()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
-        self._node.get_logger().info(f"[speaker] dispatch action={action}, args={args}")
+        if action != "info":
+            self._node.get_logger().info(f"[speaker] dispatch action={action}, args={args}")
         if action in ("start", "play"):
             topic = args.get("input_topic", "")
             if not topic:
@@ -1246,8 +1247,8 @@ class _LidarNode(Node):
         except queue.Full:
             self._cb_dropped += 1
 
-        # Print stats every 20 accepted frames (~2s at 10Hz)
-        if self._cb_accepted % 20 == 0:
+        # Print stats every 200 accepted frames (~20s at 10Hz)
+        if self._cb_accepted % 200 == 0:
             elapsed = now - self._cb_first_time
             avg_hz = self._cb_accepted / elapsed if elapsed > 0 else 0
             print(
