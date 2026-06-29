@@ -5,8 +5,8 @@ ARG PYPI_MIRROR
 
 WORKDIR /work
 
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
+RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
+    apt-get install -y --no-install-recommends --allow-unauthenticated \
         python3-pip \
         python3-colcon-common-extensions \
         cmake \
