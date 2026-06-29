@@ -97,9 +97,10 @@ class _SlamRpcProxy:
     """Proxy that forwards SLAM RPC calls to a subprocess."""
 
     def __init__(self, network_iface: str = "eth0"):
-        self._cmd_q = multiprocessing.Queue()
-        self._result_q = multiprocessing.Queue()
-        self._proc = multiprocessing.Process(
+        ctx = multiprocessing.get_context("spawn")  # 'spawn' starts fresh process (no inherited DDS state)
+        self._cmd_q = ctx.Queue()
+        self._result_q = ctx.Queue()
+        self._proc = ctx.Process(
             target=_slam_rpc_worker,
             args=(self._cmd_q, self._result_q, network_iface),
             daemon=True,
