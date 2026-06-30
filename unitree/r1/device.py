@@ -984,17 +984,18 @@ class StatePlugin:
 class _CameraNode(Node):
     """Receives H.264 RTP video from R1 via GStreamer and publishes MJPEG frames to ROS2."""
 
-    def __init__(self, main_topic: str, left_topic: str, right_topic: str):
+    def __init__(self, main_topic: str, left_topic: str, right_topic: str, depth_topic: str):
         super().__init__("r1_camera")
         from sensor_msgs.msg import CompressedImage
         self._CompressedImage = CompressedImage
         self._main_pub  = self.create_publisher(CompressedImage, main_topic, _LOW_LAT_QOS)
         self._left_pub  = self.create_publisher(CompressedImage, left_topic, _LOW_LAT_QOS)
         self._right_pub = self.create_publisher(CompressedImage, right_topic, _LOW_LAT_QOS)
+        self._depth_pub = self.create_publisher(CompressedImage, depth_topic, _LOW_LAT_QOS)
         self._procs: list[subprocess.Popen] = []
         self._threads: list[threading.Thread] = []
         self.state = "idle"
-        self.get_logger().info(f"CameraNode ready — main:{main_topic} left:{left_topic} right:{right_topic}")
+        self.get_logger().info(f"CameraNode ready — main:{main_topic} left:{left_topic} right:{right_topic} depth:{depth_topic}")
 
     def start_capture(self) -> None:
         if self.state == "running":
@@ -1007,6 +1008,8 @@ class _CameraNode(Node):
         self._start_stream(5002, self._left_pub, "left")
         # Right stereo (port 5003, 544x448)
         self._start_stream(5003, self._right_pub, "right")
+        # Depth (port 5000, 544x448)
+        self._start_stream(5000, self._depth_pub, "depth")
 
         self.get_logger().info("Camera capture started (3 streams)")
 
@@ -1088,11 +1091,12 @@ class CameraPlugin:
         self._main_topic  = f"/{namespace}/camera/main"
         self._left_topic  = f"/{namespace}/camera/left"
         self._right_topic = f"/{namespace}/camera/right"
-        self._node = _CameraNode(self._main_topic, self._left_topic, self._right_topic)
+        self._depth_topic = f"/{namespace}/camera/depth"
+        self._node = _CameraNode(self._main_topic, self._left_topic, self._right_topic, self._depth_topic)
         executor.add_node(self._node)
 
     def get_tools(self) -> list:
-        return [self._main_tool(), self._left_tool(), self._right_tool()]
+        return [self._main_tool(), self._left_tool(), self._right_tool(), self._depth_tool()]
 
     def _main_tool(self) -> dict:
         return {
@@ -1119,9 +1123,19 @@ class CameraPlugin:
             "name": "camera_right",
             "type": "sensor",
             "multiInstance": False,
-            "description": f"R1 right stereo camera (544x448) — H.264 decoded to MJPEG. Publishes to {self._right_topic}",
+            "description": f"R1 right stereo camera (544x448) — H.264 decoded to JPEG. Publishes to {self._right_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._right_topic, "format": "image/jpeg"}],
+        }
+
+    def _depth_tool(self) -> dict:
+        return {
+            "name": "camera_depth",
+            "type": "sensor",
+            "multiInstance": False,
+            "description": f"R1 depth camera (544x448 @ 10fps) — H.264 decoded to JPEG. Publishes to {self._depth_topic}",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._depth_topic, "format": "image/jpeg"}],
         }
 
     def start(self) -> None:
@@ -1137,6 +1151,7 @@ class CameraPlugin:
                 'camera_main':  (self._main_topic,  'image/jpeg'),
                 'camera_left':  (self._left_topic,  'image/jpeg'),
                 'camera_right': (self._right_topic, 'image/jpeg'),
+                'camera_depth': (self._depth_topic, 'image/jpeg'),
             }
             if tool_name in topic_map:
                 topic, fmt = topic_map[tool_name]
