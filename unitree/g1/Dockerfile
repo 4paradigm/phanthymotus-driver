@@ -5,8 +5,8 @@ ARG PYPI_MIRROR
 
 WORKDIR /work
 
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
+RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
+    apt-get install -y --no-install-recommends --allow-unauthenticated \
         python3-pip \
         python3-colcon-common-extensions \
         cmake \
@@ -41,7 +41,7 @@ RUN pip3 install --no-cache-dir --no-binary cyclonedds -i ${PYPI_MIRROR} cyclone
 # Force FastDDS to match agent-core (which has no CycloneDDS rmw installed).
 ENV ROS_DOMAIN_ID=42
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-ENV FASTDDS_BUILTIN_TRANSPORTS=UDPv4
+ENV FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
 
 COPY unitree_sdk2py/ /work/unitree_sdk2py/
 COPY resource/       /work/resource/
@@ -50,10 +50,15 @@ COPY device.py /work/device.py
 COPY ext_devices.py /work/ext_devices.py
 COPY safety_harness.py /work/safety_harness.py
 COPY scan_context.py /work/scan_context.py
+COPY controlled_spatial.py /work/controlled_spatial.py
+COPY pointcloud_utils.py /work/pointcloud_utils.py
 COPY config.yaml /work/config.yaml
 
 ENV PYTHONPATH=/work
 ENV PYTHONUNBUFFERED=1
+
+# Suppress CycloneDDS tracing to stdout (prevent oversized log messages)
+ENV CYCLONEDDS_URI='<CycloneDDS><Domain><Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>'
 
 EXPOSE 15701
 

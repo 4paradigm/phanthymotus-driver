@@ -61,7 +61,8 @@ class G1DeviceBundle:
                  arm_client: G1ArmActionClient,
                  slam_client: SlamClient,
                  msc_client: MotionSwitcherClient,
-                 smart_motion=None):
+                 smart_motion=None,
+                 network_iface: str = "eth0"):
         self._plugins: list = []
         self._smart_motion = smart_motion
         plugins_cfg = cfg.get("plugins", {})
@@ -121,6 +122,13 @@ class G1DeviceBundle:
             from device import SpatialPlugin
             self._plugins.append(SpatialPlugin(plugins_cfg["slam"], namespace, executor, slam_client, smart_motion=smart_motion))
             print("[bundle] SpatialPlugin loaded")
+
+        if plugins_cfg.get("controlled_spatial", {}).get("enabled", False):
+            from controlled_spatial import ControlledSpatialPlugin
+            controlled_cfg = dict(plugins_cfg["controlled_spatial"])
+            controlled_cfg["network_iface"] = network_iface
+            self._plugins.append(ControlledSpatialPlugin(controlled_cfg, namespace, executor, slam_client, smart_motion=smart_motion))
+            print("[bundle] ControlledSpatialPlugin loaded")
 
         if plugins_cfg.get("motion_switcher", {}).get("enabled", False):
             from device import MotionSwitcherPlugin
@@ -182,7 +190,11 @@ _bundle: G1DeviceBundle | None = None
 def make_handler():
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
-            print(f"[mcp] {self.address_string()} {fmt % args}")
+            # Suppress routine request logs (info/heartbeat); only log errors and tool calls
+            msg = fmt % args
+            if '"POST /mcp' in msg and '200' in msg:
+                return
+            print(f"[mcp] {self.address_string()} {msg}")
 
         def _send(self, status: int, body: str):
             encoded = body.encode()
@@ -278,7 +290,7 @@ def _start_registration(mcp_port: int, name: str, category: str):
                     headers={"Content-Type": "application/json"}, method="POST",
                 )
                 with _urllib.urlopen(req, timeout=3):
-                    print(f"[register] heartbeat ok → {agent_core_url}")
+                    pass  # heartbeat ok, suppress log
                 _t.sleep(30)
             except Exception as e:
                 print(f"[register] failed: {e}, retrying in 5s")
@@ -346,7 +358,7 @@ def main():
         smart_motion = SmartMotionProxy(namespace, harness_cfg, network_iface)
         print("[bundle] SmartMotion safety harness active (subprocess)")
 
-    _bundle = G1DeviceBundle(cfg, namespace, executor, audio_client, loco_client, arm_client, slam_client, msc_client, smart_motion=smart_motion)
+    _bundle = G1DeviceBundle(cfg, namespace, executor, audio_client, loco_client, arm_client, slam_client, msc_client, smart_motion=smart_motion, network_iface=network_iface)
     _bundle.start_all()
 
     def _spin():
