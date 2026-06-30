@@ -986,10 +986,11 @@ class _CameraNode(Node):
 
     def __init__(self, main_topic: str, left_topic: str, right_topic: str):
         super().__init__("r1_camera")
-        from std_msgs.msg import UInt8MultiArray
-        self._main_pub  = self.create_publisher(UInt8MultiArray, main_topic, _LOW_LAT_QOS)
-        self._left_pub  = self.create_publisher(UInt8MultiArray, left_topic, _LOW_LAT_QOS)
-        self._right_pub = self.create_publisher(UInt8MultiArray, right_topic, _LOW_LAT_QOS)
+        from sensor_msgs.msg import CompressedImage
+        self._CompressedImage = CompressedImage
+        self._main_pub  = self.create_publisher(CompressedImage, main_topic, _LOW_LAT_QOS)
+        self._left_pub  = self.create_publisher(CompressedImage, left_topic, _LOW_LAT_QOS)
+        self._right_pub = self.create_publisher(CompressedImage, right_topic, _LOW_LAT_QOS)
         self._procs: list[subprocess.Popen] = []
         self._threads: list[threading.Thread] = []
         self.state = "idle"
@@ -1038,7 +1039,6 @@ class _CameraNode(Node):
         GStreamer jpegenc outputs a continuous stream of JPEG data.
         We detect JPEG boundaries via SOI (FFD8) and EOI (FFD9) markers.
         """
-        from std_msgs.msg import UInt8MultiArray
         buf = bytearray()
         CHUNK = 65536
         while self.state == "running" and proc.poll() is None:
@@ -1060,7 +1060,8 @@ class _CameraNode(Node):
                     break
                 frame = bytes(buf[soi:eoi + 2])
                 del buf[:eoi + 2]
-                msg = UInt8MultiArray()
+                msg = self._CompressedImage()
+                msg.format = "jpeg"
                 msg.data = list(frame)
                 publisher.publish(msg)
 
@@ -1100,7 +1101,7 @@ class CameraPlugin:
             "multiInstance": False,
             "description": f"R1 main camera (1280x720 @ 30fps) — H.264 decoded to MJPEG. Publishes to {self._main_topic}",
             "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._main_topic, "format": "video/mjpeg"}],
+            "topic_out": [{"topic": self._main_topic, "format": "image/jpeg"}],
         }
 
     def _left_tool(self) -> dict:
@@ -1110,7 +1111,7 @@ class CameraPlugin:
             "multiInstance": False,
             "description": f"R1 left stereo camera (544x448) — H.264 decoded to MJPEG. Publishes to {self._left_topic}",
             "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._left_topic, "format": "video/mjpeg"}],
+            "topic_out": [{"topic": self._left_topic, "format": "image/jpeg"}],
         }
 
     def _right_tool(self) -> dict:
@@ -1120,7 +1121,7 @@ class CameraPlugin:
             "multiInstance": False,
             "description": f"R1 right stereo camera (544x448) — H.264 decoded to MJPEG. Publishes to {self._right_topic}",
             "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._right_topic, "format": "video/mjpeg"}],
+            "topic_out": [{"topic": self._right_topic, "format": "image/jpeg"}],
         }
 
     def start(self) -> None:
@@ -1133,9 +1134,9 @@ class CameraPlugin:
         if action == "info":
             tool_name = args.get('_tool_name', '')
             topic_map = {
-                'camera_main':  (self._main_topic,  'video/mjpeg'),
-                'camera_left':  (self._left_topic,  'video/mjpeg'),
-                'camera_right': (self._right_topic, 'video/mjpeg'),
+                'camera_main':  (self._main_topic,  'image/jpeg'),
+                'camera_left':  (self._left_topic,  'image/jpeg'),
+                'camera_right': (self._right_topic, 'image/jpeg'),
             }
             if tool_name in topic_map:
                 topic, fmt = topic_map[tool_name]
