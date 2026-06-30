@@ -265,21 +265,38 @@ def main():
 
     print(f"[bundle] namespace={namespace} mcp_port={mcp_port}")
 
-    # DDS init
-    ChannelFactoryInitialize(0, network_iface)
-    print(f"[bundle] DDS initialized on interface: {network_iface}")
+    # DDS init — try specified interface, fallback to auto-detect
+    dds_ok = False
+    for iface in [network_iface, ""]:
+        try:
+            ChannelFactoryInitialize(0, iface)
+            print(f"[bundle] DDS initialized on interface: {iface or '(auto)'}")
+            dds_ok = True
+            break
+        except Exception as e:
+            print(f"[bundle] DDS init failed on '{iface}': {e}")
+    if not dds_ok:
+        print("[bundle] WARNING: DDS unavailable — robot communication disabled, MCP server still starting")
 
     # AudioClient (shared by tts + led + speaker)
     audio_client = AudioClient()
     audio_client.SetTimeout(10.0)
-    audio_client.Init()
-    print("[bundle] AudioClient ready")
+    if dds_ok:
+        try:
+            audio_client.Init()
+            print("[bundle] AudioClient ready")
+        except Exception as e:
+            print(f"[bundle] AudioClient init failed: {e}")
 
     # LocoClient (locomotion control via H2 RPC)
     loco_client = LocoClient()
     loco_client.SetTimeout(10.0)
-    loco_client.Init()
-    print("[bundle] LocoClient ready")
+    if dds_ok:
+        try:
+            loco_client.Init()
+            print("[bundle] LocoClient ready")
+        except Exception as e:
+            print(f"[bundle] LocoClient init failed: {e}")
 
     # ROS2
     rclpy.init()
