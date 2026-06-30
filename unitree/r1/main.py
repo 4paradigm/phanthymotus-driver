@@ -132,7 +132,16 @@ class R1DeviceBundle:
                         return p.dispatch(tool_name, args)
                     action = args.pop("action", tool_name)
                     args['_tool_name'] = tool_name
-                    return p.dispatch(action, args)
+                    # Sensors are always-on; start/stop are no-ops
+                    if tool_def["type"] == "sensor" and action in ("start", "stop"):
+                        return {"state": "running" if action == "start" else "idle"}
+                    result = p.dispatch(action, args)
+                    if result is not None:
+                        return result
+                    # Fallback for unhandled actions on sensors
+                    if tool_def["type"] == "sensor":
+                        return {"state": "running"}
+                    return result
         return None
 
 
