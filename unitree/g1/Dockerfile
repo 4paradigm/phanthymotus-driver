@@ -57,6 +57,9 @@ COPY config.yaml /work/config.yaml
 ENV PYTHONPATH=/work
 ENV PYTHONUNBUFFERED=1
 
+# Suppress CycloneDDS tracing to stdout (prevent oversized log messages)
+ENV CYCLONEDDS_URI='<CycloneDDS><Domain><Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>'
+
 EXPOSE 15701
 
 CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && python3 /work/main.py ${NETWORK_INTERFACE:-eth0}"]
