@@ -265,9 +265,23 @@ def main():
 
     print(f"[bundle] namespace={namespace} mcp_port={mcp_port}")
 
-    # DDS init — try specified interface, fallback to auto-detect
+    # DDS init — try specified interface, fallback to interface holding 192.168.123.164
     dds_ok = False
-    for iface in [network_iface, ""]:
+    ifaces_to_try = [network_iface]
+    # Detect interface for 192.168.123.x subnet as fallback
+    try:
+        import netifaces
+        for iface_name in netifaces.interfaces():
+            addrs = netifaces.ifaddresses(iface_name).get(netifaces.AF_INET, [])
+            for addr in addrs:
+                if addr["addr"].startswith("192.168.123."):
+                    if iface_name not in ifaces_to_try:
+                        ifaces_to_try.append(iface_name)
+    except ImportError:
+        pass
+    ifaces_to_try.append("")  # auto-detect as last resort
+
+    for iface in ifaces_to_try:
         try:
             ChannelFactoryInitialize(0, iface)
             print(f"[bundle] DDS initialized on interface: {iface or '(auto)'}")
