@@ -42,6 +42,7 @@ class SlamClient(Client):
         self._RegistApi(SLAM_API_PAUSE_NAV, 0)
         self._RegistApi(SLAM_API_RESUME_NAV, 0)
         self._RegistApi(SLAM_API_SHUTDOWN, 0)
+        self.SetTimeout(5.0)
 
     def StartMapping(self) -> tuple:
         """开始建图。返回 (code, response_json_str)。"""
@@ -49,9 +50,13 @@ class SlamClient(Client):
         return self._Call(SLAM_API_START_MAPPING, param)
 
     def StopMapping(self, address: str) -> tuple:
-        """结束建图并保存 pcd 到指定路径。"""
+        """结束建图并保存 pcd 到指定路径。超时设为 10 秒（保存 PCD 耗时较长）。"""
         param = json.dumps({"data": {"address": address}})
-        return self._Call(SLAM_API_STOP_MAPPING, param)
+        self.SetTimeout(10.0)
+        try:
+            return self._Call(SLAM_API_STOP_MAPPING, param)
+        finally:
+            self.SetTimeout(5.0)
 
     def InitPose(self, x: float = 0.0, y: float = 0.0, z: float = 0.0,
                  q_x: float = 0.0, q_y: float = 0.0, q_z: float = 0.0, q_w: float = 1.0,

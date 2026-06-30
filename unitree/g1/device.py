@@ -32,6 +32,7 @@ from std_msgs.msg import Header, String
 from audio_msgs.msg import AudioChunk
 
 from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
+from pointcloud_utils import gravity_align_inplace
 
 # ── 常量 ──────────────────────────────────────────────────────────────────────
 
@@ -407,7 +408,8 @@ class SpeakerPlugin:
         self._node.stop_play()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
-        self._node.get_logger().info(f"[speaker] dispatch action={action}, args={args}")
+        if action != "info":
+            self._node.get_logger().info(f"[speaker] dispatch action={action}, args={args}")
         if action in ("start", "play"):
             topic = args.get("input_topic", "")
             if not topic:
@@ -1173,76 +1175,127 @@ class StatePlugin:
 
 # ── LidarPlugin (sensor) ─────────────────────────────────────────────────────
 
-LIDAR_CLOUD_INTERVAL = 0.1       # 10 Hz throttle (source is 10Hz anyway)
-LIDAR_IMU_INTERVAL   = 0.0      # no throttle — publish at full 200Hz for HTMSG
+LIDAR_CLOUD_INTERVAL = 0.05      # 20 Hz max (source is ~10Hz, allow headroom)
 
 
 class _LidarNode(Node):
-    """Subscribes to DDS utlidar PointCloud2 + IMU and republishes as binary/JSON to ROS2."""
+    """Subscribes to DDS utlidar PointCloud2 and republishes with gravity alignment."""
 
-    def __init__(self, cloud_topic: str, imu_topic: str):
+    def __init__(self, cloud_topic: str):
         super().__init__("g1_lidar")
-        # cloud published as raw passthrough: [uint32 point_step][uint32 total_points][raw PointCloud2 bytes]
         from std_msgs.msg import UInt8MultiArray
         self._cloud_pub = self.create_publisher(UInt8MultiArray, cloud_topic, _LOW_LAT_QOS)
-        self._imu_pub   = self.create_publisher(String, imu_topic, _LOW_LAT_QOS)
         self._last_cloud_time: float = 0.0
-        self._last_imu_time:   float = 0.0
+        self._imu_roll:  float = 0.0
+        self._imu_pitch: float = 0.0
+
+        # Diagnostics (printed every N frames)
+        self._cb_count: int = 0         # total DDS callbacks received
+        self._cb_accepted: int = 0      # passed throttle
+        self._cb_dropped: int = 0       # queue full
+        self._cb_first_time: float = 0.0
+        self._worker_count: int = 0
+        self._worker_total_ms: float = 0.0
+
+        # Worker thread for point cloud processing (keeps DDS receive thread unblocked)
+        self._cloud_queue: queue.Queue = queue.Queue(maxsize=10)
+        self._worker = threading.Thread(target=self._process_loop, daemon=True, name="lidar_worker")
+        self._worker.start()
 
         # Subscribe DDS PointCloud2
         try:
             from unitree_sdk2py.core.channel import ChannelSubscriber
             from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_
             self._cloud_sub = ChannelSubscriber("rt/utlidar/cloud_livox_mid360", PointCloud2_)
-            self._cloud_sub.Init(self._on_cloud, 10)
+            self._cloud_sub.Init(self._on_cloud, 1)  # queueLen=1: use BQueue to avoid blocking DDS receive thread (which delays RPC responses)
             self.get_logger().info(f"LidarNode subscribed rt/utlidar/cloud_livox_mid360 → {cloud_topic}")
         except Exception as e:
             self.get_logger().warn(f"LidarNode: failed to subscribe cloud: {e}")
 
-        # Subscribe DDS IMU
+        # Subscribe DDS Livox IMU for gravity alignment (co-located with lidar)
         try:
             from unitree_sdk2py.core.channel import ChannelSubscriber
-            from unitree_sdk2py.idl.unitree_go.msg.dds_ import IMUState_
-            self._imu_sub = ChannelSubscriber("rt/utlidar/imu_livox_mid360", IMUState_)
-            self._imu_sub.Init(self._on_imu, 10)
-            self.get_logger().info(f"LidarNode subscribed rt/utlidar/imu_livox_mid360 → {imu_topic}")
+            from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import Imu_
+            self._livox_imu_sub = ChannelSubscriber("rt/utlidar/imu_livox_mid360", Imu_)
+            self._livox_imu_sub.Init(self._on_livox_imu, 10)
+            self.get_logger().info("LidarNode subscribed rt/utlidar/imu_livox_mid360 for gravity alignment")
         except Exception as e:
-            self.get_logger().warn(f"LidarNode: failed to subscribe imu: {e}")
+            self.get_logger().warn(f"LidarNode: failed to subscribe Livox IMU: {e}")
 
     def _on_cloud(self, msg) -> None:
+        """DDS callback — throttle and enqueue for worker thread.
+        Runs directly in CycloneDDS receive thread (queueLen=0).
+        """
+        self._cb_count += 1
         now = time.monotonic()
         if now - self._last_cloud_time < LIDAR_CLOUD_INTERVAL:
             return
         self._last_cloud_time = now
+        self._cb_accepted += 1
 
-        # Passthrough: forward full PointCloud2 data without modification
-        # Format: [uint32 point_step][uint32 total_points][raw bytes]
+        if self._cb_first_time == 0.0:
+            self._cb_first_time = now
+
         point_step = msg.point_step
         total_points = msg.width * msg.height
-        data = bytes(msg.data)
+        data = msg.data if isinstance(msg.data, (bytes, bytearray)) else bytes(msg.data)
 
-        header = struct.pack('<II', point_step, total_points)
+        # Non-blocking put; drop frame if worker is busy
+        try:
+            self._cloud_queue.put_nowait((point_step, total_points, data,
+                                         self._imu_roll, self._imu_pitch))
+        except queue.Full:
+            self._cb_dropped += 1
+
+        # Print stats every 200 accepted frames (~20s at 10Hz)
+        if self._cb_accepted % 200 == 0:
+            elapsed = now - self._cb_first_time
+            avg_hz = self._cb_accepted / elapsed if elapsed > 0 else 0
+            print(
+                f"[lidar:stats] received={self._cb_count} accepted={self._cb_accepted} "
+                f"dropped={self._cb_dropped} avg_hz={avg_hz:.1f} "
+                f"worker_avg={self._worker_total_ms/max(self._worker_count,1):.1f}ms",
+                flush=True
+            )
+
+    def _process_loop(self) -> None:
+        """Worker thread: gravity alignment + publish (off the DDS receive thread)."""
+        import array as _array
         from std_msgs.msg import UInt8MultiArray
-        ros_msg = UInt8MultiArray()
-        ros_msg.data = list(header + data)
-        self._cloud_pub.publish(ros_msg)
+        while True:
+            item = self._cloud_queue.get()
+            if item is None:
+                break
+            point_step, total_points, data, roll, pitch = item
+            t0 = time.monotonic()
 
-    def _on_imu(self, msg) -> None:
-        now = time.monotonic()
-        if LIDAR_IMU_INTERVAL > 0 and now - self._last_imu_time < LIDAR_IMU_INTERVAL:
-            return
-        self._last_imu_time = now
+            # Apply gravity alignment (returns bytearray, avoids extra copy)
+            data = gravity_align_inplace(data, point_step, total_points, roll, pitch)
 
-        imu_data = {
-            "quaternion":    list(msg.quaternion),
-            "gyroscope":     list(msg.gyroscope),
-            "accelerometer": list(msg.accelerometer),
-            "rpy":           list(msg.rpy),
-            "temperature":   float(msg.temperature),
-        }
-        out = String()
-        out.data = json.dumps(imu_data)
-        self._imu_pub.publish(out)
+            # Publish — pre-allocate buffer to avoid header + data concat copy
+            header = struct.pack('<II', point_step, total_points)
+            buf = bytearray(8 + len(data))
+            buf[:8] = header
+            buf[8:] = data
+            ros_msg = UInt8MultiArray()
+            ros_msg.data = _array.array('B', buf)
+            self._cloud_pub.publish(ros_msg)
+
+            elapsed_ms = (time.monotonic() - t0) * 1000
+            self._worker_count += 1
+            self._worker_total_ms += elapsed_ms
+
+    def _on_livox_imu(self, msg) -> None:
+        """Compute roll/pitch from Livox IMU accelerometer (co-located with lidar, inverted mount)."""
+        import math
+        try:
+            acc = msg.linear_acceleration
+            ax, ay, az = float(acc.x), float(acc.y), float(acc.z)
+            # Livox is mounted inverted: flip y,z to get upright-equivalent frame
+            self._imu_roll = math.atan2(-ay, -az)
+            self._imu_pitch = math.atan2(-ax, math.sqrt(ay * ay + az * az))
+        except Exception:
+            pass
 
 
 class LidarPlugin:
@@ -1250,12 +1303,11 @@ class LidarPlugin:
 
     def __init__(self, plugin_config: dict, namespace: str, executor):
         self._cloud_topic = f"/{namespace}/lidar/cloud"
-        self._imu_topic   = f"/{namespace}/lidar/imu"
-        self._node = _LidarNode(self._cloud_topic, self._imu_topic)
+        self._node = _LidarNode(self._cloud_topic)
         executor.add_node(self._node)
 
     def get_tools(self) -> list:
-        return [self._cloud_tool(), self._imu_tool()]
+        return [self._cloud_tool()]
 
     def _cloud_tool(self) -> dict:
         return {
@@ -1267,25 +1319,8 @@ class LidarPlugin:
             "topic_out": [{"topic": self._cloud_topic, "format": "sensor/pointcloud"}],
             "configSchema": {
                 "type": "object",
-                "properties": {
-                    "axis_x_source": {"type": "string", "enum": ["x", "y", "z"], "default": "y", "title": "显示X轴(右) ← 雷达轴"},
-                    "axis_x_negate": {"type": "boolean", "default": False, "title": "取反X"},
-                    "axis_y_source": {"type": "string", "enum": ["x", "y", "z"], "default": "z", "title": "显示Y轴(上) ← 雷达轴"},
-                    "axis_y_negate": {"type": "boolean", "default": True, "title": "取反Y"},
-                    "axis_z_source": {"type": "string", "enum": ["x", "y", "z"], "default": "x", "title": "显示Z轴(前) ← 雷达轴"},
-                    "axis_z_negate": {"type": "boolean", "default": True, "title": "取反Z"},
-                },
+                "properties": {},
             },
-        }
-
-    def _imu_tool(self) -> dict:
-        return {
-            "name": "lidar_imu",
-            "type": "sensor",
-            "multiInstance": False,
-            "description": f"Livox Mid-360 IMU — quaternion, gyroscope, accelerometer, rpy at 200Hz. Publishes to {self._imu_topic}",
-            "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._imu_topic, "format": "data/json"}],
         }
 
     def start(self) -> None:
@@ -1296,9 +1331,6 @@ class LidarPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "info":
-            tool_name = args.get('_tool_name', '')
-            if tool_name == 'lidar_imu':
-                return {"state": "running", "topic_out": [{"topic": self._imu_topic, "format": "data/json"}]}
             return {"state": "running", "topic_out": [{"topic": self._cloud_topic, "format": "sensor/pointcloud"}]}
         return None  # sensor
 
@@ -1458,7 +1490,7 @@ class _SlamInfoNode(Node):
     KF_DIST_THRESH = 2.0         # keyframe every 2m movement
     KF_YAW_THRESH = 0.52         # or 30° rotation
 
-    def __init__(self, pos_tag_topic: str, mapping_topic: str, db: _SpatialDB, sc_mgr=None):
+    def __init__(self, pos_tag_topic: str, mapping_topic: str, db: _SpatialDB, sc_mgr=None, slam_cloud_topic: str | None = None):
         super().__init__("g1_spatial")
         self._db = db
         self._sc_mgr = sc_mgr  # ScanContextManager (optional)
@@ -1467,6 +1499,14 @@ class _SlamInfoNode(Node):
 
         from std_msgs.msg import UInt8MultiArray
         self._mapping_pub = self.create_publisher(UInt8MultiArray, mapping_topic, _LOW_LAT_QOS)
+
+        # slam_cloud: real-time SLAM point cloud passthrough (standard coordinate system)
+        self._slam_cloud_pub = None
+        self._last_slam_cloud_time: float = 0.0
+        SLAM_CLOUD_INTERVAL = 0.2  # 5Hz
+        self._slam_cloud_interval = SLAM_CLOUD_INTERVAL
+        if slam_cloud_topic:
+            self._slam_cloud_pub = self.create_publisher(UInt8MultiArray, slam_cloud_topic, _LOW_LAT_QOS)
 
         self._current_pose: dict | None = None
         self._map_status: str = "idle"    # idle | mapping | localized
@@ -1635,9 +1675,62 @@ class _SlamInfoNode(Node):
             data = bytes(msg.data)
             if len(data) < msg.point_step:
                 return
+
+            # Real-time slam_cloud passthrough (throttled)
+            if self._slam_cloud_pub is not None:
+                now = time.monotonic()
+                if now - self._last_slam_cloud_time >= self._slam_cloud_interval:
+                    self._last_slam_cloud_time = now
+                    self._publish_slam_cloud(msg.fields, msg.point_step, msg.width * msg.height, data)
+
             self._cloud_queue.put_nowait((msg.fields, msg.point_step, msg.width * msg.height, data))
         except Exception:
             pass  # queue full, drop frame
+
+    def _publish_slam_cloud(self, fields, point_step: int, total_points: int, data: bytes) -> None:
+        """Parse SLAM PointCloud2, transform to standard coords, publish as sensor/pointcloud binary."""
+        np = _SlamInfoNode.np
+        num_points = min(total_points, 20000)
+        if len(data) < num_points * point_step:
+            num_points = len(data) // point_step
+        if num_points == 0:
+            return
+
+        # Parse field offsets
+        field_map = {}
+        for f in fields:
+            field_map[f.name] = f.offset
+        x_off = field_map.get("x", 0)
+        y_off = field_map.get("y", 4)
+        z_off = field_map.get("z", 8)
+
+        # Extract x, y, z via numpy
+        raw = np.frombuffer(data, dtype=np.uint8, count=num_points * point_step)
+        raw = raw.reshape(num_points, point_step)
+        sx = raw[:, x_off:x_off+4].view(np.float32).ravel()
+        sy = raw[:, y_off:y_off+4].view(np.float32).ravel()
+        sz = raw[:, z_off:z_off+4].view(np.float32).ravel()
+
+        # Filter invalid
+        valid = (
+            np.isfinite(sx) & np.isfinite(sy) & np.isfinite(sz) &
+            (np.abs(sx) < 50) & (np.abs(sy) < 50) & (np.abs(sz) < 20)
+        )
+        sx, sy, sz = sx[valid], sy[valid], sz[valid]
+        n = len(sx)
+        if n == 0:
+            return
+
+        # Transform to standard display coordinates:
+        # SLAM output is already in standard coordinate system, pass through directly
+        out = np.column_stack([sx, sy, sz]).astype(np.float32)
+
+        # Pack binary: [uint32 point_step=12][uint32 total_points][float32 x,y,z × N]
+        header = struct.pack('<II', 12, n)
+        from std_msgs.msg import UInt8MultiArray
+        ros_msg = UInt8MultiArray()
+        ros_msg.data = list(header + out.tobytes())
+        self._slam_cloud_pub.publish(ros_msg)
 
     def _cloud_processor_loop(self):
         """Background thread: processes queued point clouds at its own pace."""
@@ -2141,7 +2234,8 @@ class SpatialPlugin:
 
         self._pos_tag_topic = f"/{namespace}/spatial/pos_tag"
         self._mapping_topic = f"/{namespace}/spatial/mapping"
-        self._node = _SlamInfoNode(self._pos_tag_topic, self._mapping_topic, self._db, self._sc_mgr)
+        self._slam_cloud_topic = f"/{namespace}/spatial/slam_cloud"
+        self._node = _SlamInfoNode(self._pos_tag_topic, self._mapping_topic, self._db, self._sc_mgr, slam_cloud_topic=self._slam_cloud_topic)
         self._node.set_active_map(self._db.get_last_used_map())
         self._node.set_pcd_save_dir(self._map_dir)
         self._node._auto_mapping_cb = self._on_localized
@@ -2151,7 +2245,7 @@ class SpatialPlugin:
         executor.add_node(self._node)
 
     def get_tools(self) -> list:
-        return [self._spatial_tool(), self._pos_tag_tool(), self._mapping_tool()]
+        return [self._spatial_tool(), self._pos_tag_tool(), self._mapping_tool(), self._slam_cloud_tool()]
 
     def _pos_tag_tool(self) -> dict:
         return {
@@ -2165,12 +2259,22 @@ class SpatialPlugin:
 
     def _mapping_tool(self) -> dict:
         return {
-            "name": "mapping",
+            "name": "slam_mapping",
             "type": "sensor",
             "multiInstance": False,
             "description": f"SLAM 3D mapping visualization — full 3D point cloud map with robot position. Binary format: [float32 robot_x,y,yaw][uint8 flags][uint32 N][float32 x,y,z × N]. 1Hz to {self._mapping_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._mapping_topic, "format": "sensor/mapping"}],
+        }
+
+    def _slam_cloud_tool(self) -> dict:
+        return {
+            "name": "slam_cloud",
+            "type": "sensor",
+            "multiInstance": False,
+            "description": f"Real-time SLAM point cloud at 5Hz in standard coordinate system. Binary format: [uint32 point_step=12][uint32 total_points][float32 x,y,z × N]. Subscribes rt/unitree/slam_mapping/points, transforms and publishes to {self._slam_cloud_topic}",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._slam_cloud_topic, "format": "sensor/pointcloud"}],
         }
 
     def _spatial_tool(self) -> dict:
@@ -2222,7 +2326,7 @@ class SpatialPlugin:
         print("[SpatialPlugin] _on_localized: SLAM localized, starting mapping to extend map", flush=True)
         code, resp = self._client.StartMapping()
         print(f"[SpatialPlugin] StartMapping after localization → code={code}", flush=True)
-        if code == 0 or code == 3104:
+        if code == 0:
             self._node.set_map_status("mapping")
             if not self._node._active_map:
                 map_name = f"map_{int(time.time())}"
@@ -2230,6 +2334,8 @@ class SpatialPlugin:
                 self._node.set_active_map(map_name)
                 self._db.add_map(map_name, pcd_path)
                 print(f"[SpatialPlugin] Created new map for post-localization mapping: {map_name}", flush=True)
+        else:
+            print(f"[SpatialPlugin] StartMapping failed after localization: code={code}", flush=True)
 
     def _on_cloud_timeout(self):
         """Called by watchdog when no point cloud received for WATCHDOG_TIMEOUT seconds.
@@ -2303,16 +2409,6 @@ class SpatialPlugin:
                     self._db.add_map(map_name, pcd_path)
                     print(f"[SpatialPlugin] Created map entry: {map_name}", flush=True)
                 return {"status": "continued", "map_name": self._node._active_map}
-            # code 3104 = already mapping, treat as success
-            if code == 3104:
-                print("[SpatialPlugin] StartMapping returned 3104 (already mapping), ok", flush=True)
-                self._node.set_map_status("mapping")
-                if not self._node._active_map:
-                    map_name = f"map_{int(time.time())}"
-                    pcd_path = f"{self._map_dir}/{map_name}.pcd"
-                    self._node.set_active_map(map_name)
-                    self._db.add_map(map_name, pcd_path)
-                return {"status": "already_mapping", "map_name": self._node._active_map}
             print(f"[SpatialPlugin] StartMapping failed: code={code}, trying fingerprint path", flush=True)
             # Fall through to fingerprint path if StartMapping fails
 
@@ -2368,7 +2464,7 @@ class SpatialPlugin:
         if action == "start_mapping":
             map_name = args.get("map_name", f"map_{int(time.time())}")
             code, resp = self._client.StartMapping()
-            if code == 0 or code == 3104:
+            if code == 0:
                 pcd_path = f"{self._map_dir}/{map_name}.pcd"
                 self._node.clear_map_buffer()
                 self._node.set_map_status("mapping")
