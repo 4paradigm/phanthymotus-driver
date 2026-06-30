@@ -15,12 +15,17 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
         git \
         libusb-1.0-0 \
         libportaudio2 \
-        libasound2-dev \
+        libasound2-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# GStreamer runtime (separate layer to avoid QEMU libc-bin segfault)
+RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
+    apt-get install -y --no-install-recommends --allow-unauthenticated \
         gstreamer1.0-tools \
         gstreamer1.0-plugins-base \
         gstreamer1.0-plugins-good \
-        gstreamer1.0-libav \
-        libgstreamer1.0-dev && \
+        gstreamer1.0-libav || true && \
+    ldconfig && \
     rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
