@@ -472,8 +472,8 @@ class _LocoStateNode(Node):
         try:
             from unitree_sdk2py.core.channel import ChannelSubscriber
             from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_
-            odom_sub = ChannelSubscriber("rt/odommodestate", SportModeState_)
-            odom_sub.Init(self._on_odom, 10)
+            self._odom_sub = ChannelSubscriber("rt/odommodestate", SportModeState_)
+            self._odom_sub.Init(self._on_odom, 10)
             self.get_logger().info(f"LocoStateNode subscribed rt/odommodestate → {odom_topic}")
         except Exception as e:
             self.get_logger().warn(f"LocoStateNode: failed to subscribe rt/odommodestate: {e}")
@@ -720,8 +720,8 @@ class _AsrNode(Node):
         try:
             from unitree_sdk2py.core.channel import ChannelSubscriber
             from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
-            sub = ChannelSubscriber("rt/audio_msg", String_)
-            sub.Init(self._on_msg, 10)
+            self._asr_sub = ChannelSubscriber("rt/audio_msg", String_)
+            self._asr_sub.Init(self._on_msg, 10)
             self.get_logger().info(f"AsrNode subscribed rt/audio_msg → {topic}")
         except Exception as e:
             self.get_logger().warn(f"AsrNode: failed to subscribe rt/audio_msg: {e}")
@@ -802,8 +802,8 @@ class _LowStateNode(Node):
         try:
             from unitree_sdk2py.core.channel import ChannelSubscriber
             from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
-            sub = ChannelSubscriber("rt/lowstate", LowState_)
-            sub.Init(self._on_state, 10)
+            self._lowstate_sub = ChannelSubscriber("rt/lowstate", LowState_)
+            self._lowstate_sub.Init(self._on_state, 10)
             self.get_logger().info(f"LowStateNode subscribed rt/lowstate → {imu_topic}, {joints_topic}")
         except Exception as e:
             self.get_logger().warn(f"LowStateNode: failed to subscribe rt/lowstate: {e}")
@@ -811,8 +811,8 @@ class _LowStateNode(Node):
         try:
             from unitree_sdk2py.core.channel import ChannelSubscriber
             from unitree_sdk2py.idl.unitree_hg.msg.dds_ import BmsState_
-            bms_sub = ChannelSubscriber("rt/lf/bmsstate", BmsState_)
-            bms_sub.Init(self._on_bms, 10)
+            self._bms_sub = ChannelSubscriber("rt/lf/bmsstate", BmsState_)
+            self._bms_sub.Init(self._on_bms, 10)
             self.get_logger().info(f"LowStateNode subscribed rt/lf/bmsstate → {battery_topic}")
         except Exception as e:
             self.get_logger().warn(f"LowStateNode: failed to subscribe rt/lf/bmsstate: {e}")
@@ -820,8 +820,8 @@ class _LowStateNode(Node):
         try:
             from unitree_sdk2py.core.channel import ChannelSubscriber
             from unitree_sdk2py.idl.unitree_hg.msg.dds_ import MainBoardState_
-            mb_sub = ChannelSubscriber("rt/lf/mainboardstate", MainBoardState_)
-            mb_sub.Init(self._on_mainboard, 10)
+            self._mainboard_sub = ChannelSubscriber("rt/lf/mainboardstate", MainBoardState_)
+            self._mainboard_sub.Init(self._on_mainboard, 10)
             self.get_logger().info(f"LowStateNode subscribed rt/lf/mainboardstate → {mainboard_topic}")
         except Exception as e:
             self.get_logger().warn(f"LowStateNode: failed to subscribe rt/lf/mainboardstate: {e}")
