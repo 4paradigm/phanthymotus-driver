@@ -775,6 +775,34 @@ class AsrPlugin:
         return None
 
 
+# R1 motor index → URDF joint name mapping (26-DoF, mode_machine=1, PR mode)
+# Based on R1 documentation: joint_motor_sequence
+_R1_JOINT_NAMES = [
+    # 0-5: left leg
+    'left_hip_pitch_joint', 'left_hip_roll_joint', 'left_hip_yaw_joint',
+    'left_knee_joint', 'left_ankle_pitch_joint', 'left_ankle_roll_joint',
+    # 6-11: right leg
+    'right_hip_pitch_joint', 'right_hip_roll_joint', 'right_hip_yaw_joint',
+    'right_knee_joint', 'right_ankle_pitch_joint', 'right_ankle_roll_joint',
+    # 12-14: waist
+    'waist_roll_joint', 'waist_yaw_joint', None,
+    # 15-19: left arm
+    'left_shoulder_pitch_joint', 'left_shoulder_roll_joint', 'left_shoulder_yaw_joint',
+    'left_elbow_joint', 'left_wrist_roll_joint',
+    # 20-21: empty (no wrist pitch/yaw in 26-DoF PR mode)
+    None, None,
+    # 22-26: right arm
+    'right_shoulder_pitch_joint', 'right_shoulder_roll_joint', 'right_shoulder_yaw_joint',
+    'right_elbow_joint', 'right_wrist_roll_joint',
+    # 27-28: empty
+    None, None,
+    # 29-30: head
+    'head_pitch_joint', 'head_yaw_joint',
+    # 31-34: padding
+    None, None, None, None,
+]
+
+
 # ── StatePlugin (sensor) ─────────────────────────────────────────────────────
 
 class _LowStateNode(Node):
@@ -853,8 +881,12 @@ class _LowStateNode(Node):
             self._last_joints_time = now
             joints = []
             for i, m in enumerate(msg.motor_state):
+                name = _R1_JOINT_NAMES[i] if i < len(_R1_JOINT_NAMES) else None
+                if name is None:
+                    continue  # skip empty/unused motor slots
                 joints.append({
                     "idx": i,
+                    "name": name,
                     "q": round(float(m.q), 4),
                     "dq": round(float(m.dq), 4),
                     "tau": round(float(m.tau_est), 3),
@@ -915,7 +947,7 @@ class StatePlugin:
         executor.add_node(self._node)
 
     def get_tools(self) -> list:
-        return [self._imu_tool(), self._battery_tool(), self._joints_tool(), self._mainboard_tool()]
+        return [self._imu_tool(), self._battery_tool(), self._joints_tool(), self._mainboard_tool(), self._model_tool()]
 
     def _imu_tool(self) -> dict:
         return {
@@ -957,6 +989,15 @@ class StatePlugin:
             "topic_out": [{"topic": self._mainboard_topic, "format": "data/json"}],
         }
 
+    def _model_tool(self) -> dict:
+        return {
+            "name": "model",
+            "type": "resource",
+            "multiInstance": False,
+            "description": "R1 robot URDF model for 3D visualization — kinematic chain with joint origins, axes, and limits",
+            "inputSchema": {"type": "object", "properties": {}},
+        }
+
     def start(self) -> None:
         pass
 
@@ -976,6 +1017,12 @@ class StatePlugin:
                 topic, fmt = topic_map[tool_name]
                 return {"state": "running", "topic_out": [{"topic": topic, "format": fmt}]}
             return {"state": "running"}
+        if action == "model":
+            from pathlib import Path
+            urdf_path = Path(__file__).parent / "resource" / "r1_model.urdf"
+            if urdf_path.exists():
+                return {"urdf": urdf_path.read_text()}
+            return {"error": "URDF model file not found"}
         return None
 
 
@@ -1002,8 +1049,8 @@ class _CameraNode(Node):
             return
         self.state = "running"
 
-        # Main camera (port 5001, 1280x720)
-        self._start_stream(5001, self._main_pub, "main")
+        # Main camera (port 5001, 1280x720, rotated 90° clockwise)
+        self._start_stream(5001, self._main_pub, "main", rotate_cw=True)
         # Left stereo (port 5002, 544x448)
         self._start_stream(5002, self._left_pub, "left")
         # Right stereo (port 5003, 544x448)
@@ -1013,7 +1060,7 @@ class _CameraNode(Node):
 
         self.get_logger().info("Camera capture started (3 streams)")
 
-    def _start_stream(self, port: int, publisher, name: str) -> None:
+    def _start_stream(self, port: int, publisher, name: str, rotate_cw: bool = False) -> None:
         """Launch a GStreamer subprocess to decode H.264 RTP and output JPEG frames."""
         cmd = [
             "gst-launch-1.0", "-q",
@@ -1022,9 +1069,13 @@ class _CameraNode(Node):
             "rtph264depay", "!",
             "avdec_h264", "!",
             "videoconvert", "!",
+        ]
+        if rotate_cw:
+            cmd.extend(["videoflip", "method=clockwise", "!"])
+        cmd.extend([
             "jpegenc", "quality=75", "!",
             "fdsink", "fd=1",
-        ]
+        ])
         try:
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
