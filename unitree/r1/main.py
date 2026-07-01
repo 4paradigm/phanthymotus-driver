@@ -32,6 +32,7 @@ import rclpy.executors
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 from unitree_sdk2py.h2.loco.h2_loco_client import LocoClient
 from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
+from rpc_proxy import RpcProxy
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -53,8 +54,8 @@ def _resolve_namespace(cfg: dict) -> str:
 
 class R1DeviceBundle:
     def __init__(self, cfg: dict, namespace: str, executor,
-                 audio_client: AudioClient,
-                 loco_client: LocoClient):
+                 audio_client,
+                 loco_client):
         self._plugins: list = []
         plugins_cfg = cfg.get("plugins", {})
 
@@ -304,25 +305,17 @@ def main():
     if not dds_ok:
         print("[bundle] WARNING: DDS unavailable — robot communication disabled, MCP server still starting")
 
-    # AudioClient (shared by tts + led + speaker)
-    audio_client = AudioClient()
-    audio_client.SetTimeout(10.0)
-    if dds_ok:
-        try:
-            audio_client.Init()
-            print("[bundle] AudioClient ready")
-        except Exception as e:
-            print(f"[bundle] AudioClient init failed: {e}")
+    # RPC Proxy — runs LocoClient + AudioClient in a subprocess to avoid GIL contention.
+    # The main process has many threads (ROS2 executor, camera, mic) which starve
+    # CycloneDDS listener callbacks, causing RPC response timeouts (3104).
+    # Use the same interface that succeeded for main process DDS.
+    rpc_iface = iface if dds_ok else network_iface
+    rpc_proxy = RpcProxy(network_iface=rpc_iface)
+    print("[bundle] RpcProxy subprocess started")
 
-    # LocoClient (locomotion control via H2 RPC)
-    loco_client = LocoClient()
-    loco_client.SetTimeout(10.0)
-    if dds_ok:
-        try:
-            loco_client.Init()
-            print("[bundle] LocoClient ready")
-        except Exception as e:
-            print(f"[bundle] LocoClient init failed: {e}")
+    # Aliases for plugin compatibility
+    audio_client = rpc_proxy
+    loco_client = rpc_proxy
 
     # ROS2
     rclpy.init()

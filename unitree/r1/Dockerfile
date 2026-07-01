@@ -56,6 +56,7 @@ COPY unitree_sdk2py/ /work/unitree_sdk2py/
 COPY resource/ /work/resource/
 COPY main.py   /work/main.py
 COPY device.py /work/device.py
+COPY rpc_proxy.py /work/rpc_proxy.py
 COPY config.yaml /work/config.yaml
 
 ENV PYTHONPATH=/work
