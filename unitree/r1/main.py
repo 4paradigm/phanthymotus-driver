@@ -135,6 +135,9 @@ class R1DeviceBundle:
                     # Sensors are always-on; start/stop are no-ops
                     if tool_def["type"] == "sensor" and action in ("start", "stop"):
                         return {"state": "running" if action == "start" else "idle"}
+                    # Actuators: start/stop from canvas are no-ops (canvas lifecycle, not robot motion)
+                    if tool_def["type"] == "actuator" and action in ("start", "stop"):
+                        return {"state": "ready" if action == "start" else "idle"}
                     result = p.dispatch(action, args)
                     if result is not None:
                         return result

@@ -553,7 +553,6 @@ class LocoPlugin:
     def __init__(self, plugin_config: dict, namespace: str, executor, loco_client):
         self._client = loco_client
         self._namespace = namespace
-        self._move_timer: threading.Timer | None = None
 
     def get_tools(self) -> list:
         return [self._loco_tool(), self._switch_mode_tool(), self._switch_mode_expert_tool()]
@@ -563,27 +562,31 @@ class LocoPlugin:
             "name": "loco",
             "type": "actuator",
             "multiInstance": False,
-            "description": "R1 locomotion control — move, stop, set height, wave/shake hand via SetTaskId",
+            "description": "R1 locomotion control — move, stop, set height, set speed mode, wave/shake hand via SetTaskId",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["move", "stop_move", "set_stand_height", "wave_hand", "shake_hand"],
+                        "enum": ["move", "stop_move", "set_stand_height", "set_speed_mode", "get_fsm_id", "get_fsm_mode", "wave_hand", "shake_hand"],
                         "description": "Action to perform",
                     },
                     "vx":         {"type": "number", "description": "Forward velocity m/s [-1, 1]"},
                     "vy":         {"type": "number", "description": "Lateral velocity m/s [-1, 1]"},
                     "vyaw":       {"type": "number", "description": "Yaw rotation rad/s [-2, 2]"},
-                    "duration":   {"type": "number", "description": "Move duration in seconds. -1 = move until explicit stop (default -1)"},
+                    "duration":   {"type": "number", "description": "Move duration in seconds. 0 or negative = move until explicit stop (default 0)"},
                     "height":     {"type": "number", "description": "Normalized height 0.0-1.0"},
+                    "speed_mode": {"type": "integer", "description": "Speed mode index (0=normal, 1=fast, etc.)"},
                     "turn":       {"type": "boolean", "description": "Turn while waving (default false)"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "move":             {"params": ["vx", "vy", "vyaw", "duration"], "description": "Move with specified velocities. duration>0 for timed move, -1 for continuous until stop."},
+                    "move":             {"params": ["vx", "vy", "vyaw", "duration"], "description": "Move with specified velocities. duration>0 for timed move via SetVelocity, 0 or negative for continuous until stop."},
                     "stop_move":        {"params": [],                                 "description": "Stop all movement immediately"},
                     "set_stand_height": {"params": ["height"],                         "description": "Set the robot's standing height (0.0-1.0)"},
+                    "set_speed_mode":   {"params": ["speed_mode"],                     "description": "Set speed mode (0=normal, 1=fast)"},
+                    "get_fsm_id":       {"params": [],                                 "description": "Get current FSM state ID"},
+                    "get_fsm_mode":     {"params": [],                                 "description": "Get current FSM mode"},
                     "wave_hand":        {"params": ["turn"],                           "description": "Perform a waving hand gesture via SetTaskId"},
                     "shake_hand":       {"params": [],                                 "description": "Perform a handshake gesture via SetTaskId"},
                 },
@@ -595,13 +598,13 @@ class LocoPlugin:
             "name": "switch_mode",
             "type": "actuator",
             "multiInstance": False,
-            "description": "R1 locomotion mode switch — change posture/locomotion mode by name. damp=阻尼, start=主运控, zero_torque=零力矩, stand_up=起立, squat=下蹲, high_stand=最高站, low_stand=最低站, balance_stand=平衡站立, continuous_gait=持续踏步, stop_gait=停止踏步",
+            "description": "R1 locomotion mode switch — change posture/locomotion mode by name. damp=阻尼, start=主运控, zero_torque=零力矩, stand_up=起立(locked_stand), high_stand=最高站, low_stand=最低站, balance_stand=平衡站立, continuous_gait=持续踏步, stop_gait=停止踏步",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "mode": {
                         "type": "string",
-                        "enum": ["damp", "start", "zero_torque", "stand_up", "squat",
+                        "enum": ["damp", "start", "zero_torque", "stand_up",
                                  "balance_stand", "continuous_gait", "stop_gait",
                                  "high_stand", "low_stand"],
                         "description": "Target mode",
@@ -633,14 +636,6 @@ class LocoPlugin:
         pass
 
     def stop(self) -> None:
-        if self._move_timer:
-            self._move_timer.cancel()
-            self._move_timer = None
-        self._client.StopMove()
-
-    def _auto_stop(self):
-        """Timer 回调：自动停止运动"""
-        self._move_timer = None
         self._client.StopMove()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
@@ -650,23 +645,17 @@ class LocoPlugin:
             vx   = max(-1.0, min(1.0, float(args.get("vx",   0))))
             vy   = max(-1.0, min(1.0, float(args.get("vy",   0))))
             vyaw = max(-2.0, min(2.0, float(args.get("vyaw", 0))))
-            duration = float(args.get("duration", -1))
-
-            if self._move_timer:
-                self._move_timer.cancel()
-                self._move_timer = None
-
-            ret = self._client.Move(vx, vy, vyaw, True)
+            duration = float(args.get("duration", 0))
 
             if duration > 0:
-                self._move_timer = threading.Timer(duration, self._auto_stop)
-                self._move_timer.start()
+                # Use SetVelocity with hardware-enforced duration (more reliable than Timer)
+                ret = self._client.SetVelocity(vx, vy, vyaw, duration)
+            else:
+                # Continuous move until explicit stop
+                ret = self._client.Move(vx, vy, vyaw, True)
 
             return {"ret": ret, "vx": vx, "vy": vy, "vyaw": vyaw, "duration": duration}
         elif action == "stop_move":
-            if self._move_timer:
-                self._move_timer.cancel()
-                self._move_timer = None
             ret = self._client.StopMove()
             return {"ret": ret}
         elif action == "switch_mode":
@@ -676,10 +665,9 @@ class LocoPlugin:
                 "start":           lambda: self._client.Start(),
                 "zero_torque":     lambda: self._client.ZeroTorque(),
                 "stand_up":        lambda: self._client.StandUp(),
-                "squat":           lambda: self._client.Squat(),
                 "balance_stand":   lambda: self._client.BalanceStand(),
-                "continuous_gait": lambda: self._client.Move(0, 0, 0, True),
-                "stop_gait":       lambda: self._client.StopMove(),
+                "continuous_gait": lambda: self._client.ContinuousGait(True),
+                "stop_gait":       lambda: self._client.ContinuousGait(False),
                 "high_stand":      lambda: self._client.HighStand(),
                 "low_stand":       lambda: self._client.LowStand(),
             }
@@ -696,6 +684,16 @@ class LocoPlugin:
             h = max(0.0, min(1.0, float(args.get("height", 0.5))))
             ret = self._client.SetStandHeight(h)
             return {"ret": ret, "height": h}
+        elif action == "set_speed_mode":
+            mode = int(args.get("speed_mode", 0))
+            ret = self._client.SetSpeedMode(mode)
+            return {"ret": ret, "speed_mode": mode}
+        elif action == "get_fsm_id":
+            code, fsm_id = self._client.GetFsmId()
+            return {"ret": code, "fsm_id": fsm_id}
+        elif action == "get_fsm_mode":
+            code, fsm_mode = self._client.GetFsmMode()
+            return {"ret": code, "fsm_mode": fsm_mode}
         elif action == "wave_hand":
             turn = bool(args.get("turn", False))
             ret = self._client.WaveHand(turn)
