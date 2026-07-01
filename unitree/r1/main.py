@@ -101,11 +101,14 @@ class R1DeviceBundle:
             print("[bundle] CameraPlugin loaded")
 
         if plugins_cfg.get("controlled_spatial", {}).get("enabled", False):
-            from controlled_spatial import ControlledSpatialPlugin
-            controlled_cfg = dict(plugins_cfg["controlled_spatial"])
-            controlled_cfg["network_iface"] = network_iface
-            self._plugins.append(ControlledSpatialPlugin(controlled_cfg, namespace, executor))
-            print("[bundle] ControlledSpatialPlugin loaded")
+            try:
+                from controlled_spatial import ControlledSpatialPlugin
+                controlled_cfg = dict(plugins_cfg["controlled_spatial"])
+                controlled_cfg["network_iface"] = network_iface
+                self._plugins.append(ControlledSpatialPlugin(controlled_cfg, namespace, executor))
+                print("[bundle] ControlledSpatialPlugin loaded")
+            except ImportError:
+                print("[bundle] WARNING: controlled_spatial module not found, skipping")
 
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
