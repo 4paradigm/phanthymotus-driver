@@ -633,28 +633,33 @@ class LocoPlugin:
             "name": "loco",
             "type": "actuator",
             "multiInstance": False,
-            "description": "G1 locomotion control — move, stop, set height, wave/shake hand",
+            "description": "G1 locomotion control — move, stop, set height, get state, wave/shake hand",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["move", "stop_move", "set_stand_height", "wave_hand", "shake_hand"],
+                        "enum": ["move", "stop_move", "set_stand_height", "get_fsm_id", "get_fsm_mode", "get_balance_mode", "get_swing_height", "get_stand_height", "get_phase", "wave_hand", "shake_hand"],
                         "description": "Action to perform",
                     },
                     "vx":         {"type": "number", "description": "Forward velocity m/s [-1, 1]"},
                     "vy":         {"type": "number", "description": "Lateral velocity m/s [-1, 1]"},
                     "vyaw":       {"type": "number", "description": "Yaw rotation rad/s [-2, 2]"},
-                    "continuous": {"type": "boolean", "description": "Keep moving until stop (default false). Deprecated: use duration instead."},
-                    "duration":   {"type": "number", "description": "Move duration in seconds. -1 = move until explicit stop (default -1)"},
+                    "duration":   {"type": "number", "description": "Move duration in seconds. 0 or negative = move until explicit stop (default 0)"},
                     "height":     {"type": "number", "description": "Normalized height 0.0-1.0"},
                     "turn":       {"type": "boolean", "description": "Turn while waving (default false)"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "move":             {"params": ["vx", "vy", "vyaw", "duration"], "description": "Move with specified velocities. duration>0 for timed move, -1 for continuous until stop."},
+                    "move":             {"params": ["vx", "vy", "vyaw", "duration"], "description": "Move with specified velocities. duration>0 for timed move, 0 or negative for continuous until stop."},
                     "stop_move":        {"params": [],                                 "description": "Stop all movement immediately"},
                     "set_stand_height": {"params": ["height"],                         "description": "Set the robot's standing height (0.0-1.0)"},
+                    "get_fsm_id":       {"params": [],                                 "description": "Get current FSM state ID"},
+                    "get_fsm_mode":     {"params": [],                                 "description": "Get current FSM mode"},
+                    "get_balance_mode": {"params": [],                                 "description": "Get current balance mode"},
+                    "get_swing_height": {"params": [],                                 "description": "Get current swing height"},
+                    "get_stand_height": {"params": [],                                 "description": "Get current stand height"},
+                    "get_phase":        {"params": [],                                 "description": "Get current gait phase (deprecated)"},
                     "wave_hand":        {"params": ["turn"],                           "description": "Perform a waving hand gesture"},
                     "shake_hand":       {"params": [],                                 "description": "Perform a handshake gesture"},
                 },
@@ -725,7 +730,7 @@ class LocoPlugin:
             vx   = float(args.get("vx",   0))
             vy   = float(args.get("vy",   0))
             vyaw = float(args.get("vyaw", 0))
-            duration = float(args.get("duration", -1))
+            duration = float(args.get("duration", 0))
 
             # Route through SmartMotion safety harness
             if self._smart_motion:
@@ -740,11 +745,14 @@ class LocoPlugin:
                 self._move_timer.cancel()
                 self._move_timer = None
 
-            ret = self._client.Move(vx, vy, vyaw, True)
-
             if duration > 0:
+                # G1 SetVelocity duration has known bugs — use Timer fallback
+                ret = self._client.Move(vx, vy, vyaw, True)
                 self._move_timer = threading.Timer(duration, self._auto_stop)
                 self._move_timer.start()
+            else:
+                # Continuous move until explicit stop
+                ret = self._client.Move(vx, vy, vyaw, True)
 
             return {"ret": ret, "vx": vx, "vy": vy, "vyaw": vyaw, "duration": duration}
         elif action == "stop_move":
@@ -774,8 +782,8 @@ class LocoPlugin:
                 "lie_to_stand":    lambda: self._client.Lie2StandUp(),
                 "sit":             lambda: self._client.Sit(),
                 "balance_stand":   lambda: self._client.BalanceStand(1),
-                "continuous_gait": lambda: self._client.Move(0, 0, 0, True),
-                "stop_gait":       lambda: self._client.StopMove(),
+                "continuous_gait": lambda: self._client.ContinuousGait(True),
+                "stop_gait":       lambda: self._client.ContinuousGait(False),
                 "high_stand":      lambda: self._client.HighStand(),
                 "low_stand":       lambda: self._client.LowStand(),
             }
@@ -792,6 +800,24 @@ class LocoPlugin:
             h = max(0.0, min(1.0, float(args.get("height", 0.5))))
             ret = self._client.SetStandHeight(h)
             return {"ret": ret, "height": h}
+        elif action == "get_fsm_id":
+            code, fsm_id = self._client.GetFsmId()
+            return {"ret": code, "fsm_id": fsm_id}
+        elif action == "get_fsm_mode":
+            code, fsm_mode = self._client.GetFsmMode()
+            return {"ret": code, "fsm_mode": fsm_mode}
+        elif action == "get_balance_mode":
+            code, balance_mode = self._client.GetBalanceMode()
+            return {"ret": code, "balance_mode": balance_mode}
+        elif action == "get_swing_height":
+            code, swing_height = self._client.GetSwingHeight()
+            return {"ret": code, "swing_height": swing_height}
+        elif action == "get_stand_height":
+            code, stand_height = self._client.GetStandHeight()
+            return {"ret": code, "stand_height": stand_height}
+        elif action == "get_phase":
+            code, phase = self._client.GetPhase()
+            return {"ret": code, "phase": phase}
         elif action == "wave_hand":
             turn = bool(args.get("turn", False))
             ret  = self._client.WaveHand(turn)

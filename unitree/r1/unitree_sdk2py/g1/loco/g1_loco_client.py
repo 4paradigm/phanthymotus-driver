@@ -111,9 +111,6 @@ class LocoClient(Client):
     def BalanceStand(self, balance_mode: int):
         self.SetBalanceMode(balance_mode)
 
-    def ContinuousGait(self, flag: bool):
-        self.SetBalanceMode(1 if flag else 0)
-
     def WaveHand(self, turn_flag: bool = False):
         self.SetTaskId(1 if turn_flag else 0)
 
@@ -127,58 +124,4 @@ class LocoClient(Client):
         else:
             self.first_shake_hand_stage_ = not self.first_shake_hand_stage_
             return self.SetTaskId(3 if self.first_shake_hand_stage_ else 2)
-
-    def GetFsmId(self):
-        p = {}
-        parameter = json.dumps(p)
-        code, data = self._Call(ROBOT_API_ID_LOCO_GET_FSM_ID, parameter)
-        if code != 0:
-            return code, None
-        js = json.loads(data)
-        return code, js.get("data")
-
-    def GetFsmMode(self):
-        p = {}
-        parameter = json.dumps(p)
-        code, data = self._Call(ROBOT_API_ID_LOCO_GET_FSM_MODE, parameter)
-        if code != 0:
-            return code, None
-        js = json.loads(data)
-        return code, js.get("data")
-
-    def GetBalanceMode(self):
-        p = {}
-        parameter = json.dumps(p)
-        code, data = self._Call(ROBOT_API_ID_LOCO_GET_BALANCE_MODE, parameter)
-        if code != 0:
-            return code, None
-        js = json.loads(data)
-        return code, js.get("data")
-
-    def GetSwingHeight(self):
-        p = {}
-        parameter = json.dumps(p)
-        code, data = self._Call(ROBOT_API_ID_LOCO_GET_SWING_HEIGHT, parameter)
-        if code != 0:
-            return code, None
-        js = json.loads(data)
-        return code, js.get("data")
-
-    def GetStandHeight(self):
-        p = {}
-        parameter = json.dumps(p)
-        code, data = self._Call(ROBOT_API_ID_LOCO_GET_STAND_HEIGHT, parameter)
-        if code != 0:
-            return code, None
-        js = json.loads(data)
-        return code, js.get("data")
-
-    def GetPhase(self):
-        p = {}
-        parameter = json.dumps(p)
-        code, data = self._Call(ROBOT_API_ID_LOCO_GET_PHASE, parameter)
-        if code != 0:
-            return code, None
-        js = json.loads(data)
-        return code, js.get("data")
     

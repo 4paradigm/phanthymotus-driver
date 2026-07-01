@@ -1,0 +1,20 @@
+mcp_port: 15702
+ros_namespace: ""   # 留空则自动使用 hostname
+
+plugins:
+  mic:
+    enabled: true
+  tts:
+    enabled: true
+  speaker:
+    enabled: true
+  led:
+    enabled: true
+  loco:
+    enabled: true
+  state:
+    enabled: true
+  asr:
+    enabled: true
+  camera:
+    enabled: true
