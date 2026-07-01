@@ -1,0 +1,9 @@
+id: r1-driver
+name: Unitree R1 Bundle
+category: driver
+hardware_provider: unitree
+hardware_model: "r1"
+image_name: r1
+port: 15702
+mcp_url: "http://localhost:15702/mcp"
+description: "Unitree R1-EDU — 麦克风 + TTS + LED + 运动控制 + 双目摄像头 + 状态感知"
