@@ -56,7 +56,6 @@ COPY unitree_sdk2py/ /work/unitree_sdk2py/
 COPY resource/ /work/resource/
 COPY main.py   /work/main.py
 COPY device.py /work/device.py
-COPY controlled_spatial.py /work/controlled_spatial.py
 COPY config.yaml /work/config.yaml
 
 ENV PYTHONPATH=/work
