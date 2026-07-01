@@ -54,8 +54,7 @@ def _resolve_namespace(cfg: dict) -> str:
 class R1DeviceBundle:
     def __init__(self, cfg: dict, namespace: str, executor,
                  audio_client: AudioClient,
-                 loco_client: LocoClient,
-                 network_iface: str = "eth0"):
+                 loco_client: LocoClient):
         self._plugins: list = []
         plugins_cfg = cfg.get("plugins", {})
 
@@ -99,16 +98,6 @@ class R1DeviceBundle:
             from device import CameraPlugin
             self._plugins.append(CameraPlugin(plugins_cfg["camera"], namespace, executor))
             print("[bundle] CameraPlugin loaded")
-
-        if plugins_cfg.get("controlled_spatial", {}).get("enabled", False):
-            try:
-                from controlled_spatial import ControlledSpatialPlugin
-                controlled_cfg = dict(plugins_cfg["controlled_spatial"])
-                controlled_cfg["network_iface"] = network_iface
-                self._plugins.append(ControlledSpatialPlugin(controlled_cfg, namespace, executor))
-                print("[bundle] ControlledSpatialPlugin loaded")
-            except ImportError:
-                print("[bundle] WARNING: controlled_spatial module not found, skipping")
 
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
@@ -339,7 +328,7 @@ def main():
     rclpy.init()
     executor = rclpy.executors.MultiThreadedExecutor()
 
-    _bundle = R1DeviceBundle(cfg, namespace, executor, audio_client, loco_client, network_iface)
+    _bundle = R1DeviceBundle(cfg, namespace, executor, audio_client, loco_client)
     _bundle.start_all()
 
     def _spin():
