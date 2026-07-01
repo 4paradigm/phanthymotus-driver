@@ -568,7 +568,7 @@ class LocoPlugin:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["move", "stop_move", "set_stand_height", "set_speed_mode", "get_fsm_id", "get_fsm_mode", "wave_hand", "shake_hand"],
+                        "enum": ["move", "stop_move", "set_stand_height", "set_speed_mode", "get_fsm_id", "wave_hand", "shake_hand"],
                         "description": "Action to perform",
                     },
                     "vx":         {"type": "number", "description": "Forward velocity m/s [-1, 1]"},
@@ -586,7 +586,6 @@ class LocoPlugin:
                     "set_stand_height": {"params": ["height"],                         "description": "Set the robot's standing height (0.0-1.0)"},
                     "set_speed_mode":   {"params": ["speed_mode"],                     "description": "Set speed mode (0=normal, 1=fast)"},
                     "get_fsm_id":       {"params": [],                                 "description": "Get current FSM state ID"},
-                    "get_fsm_mode":     {"params": [],                                 "description": "Get current FSM mode"},
                     "wave_hand":        {"params": ["turn"],                           "description": "Perform a waving hand gesture via SetTaskId"},
                     "shake_hand":       {"params": [],                                 "description": "Perform a handshake gesture via SetTaskId"},
                 },
@@ -691,9 +690,6 @@ class LocoPlugin:
         elif action == "get_fsm_id":
             code, fsm_id = self._client.GetFsmId()
             return {"ret": code, "fsm_id": fsm_id}
-        elif action == "get_fsm_mode":
-            code, fsm_mode = self._client.GetFsmMode()
-            return {"ret": code, "fsm_mode": fsm_mode}
         elif action == "wave_hand":
             turn = bool(args.get("turn", False))
             ret = self._client.WaveHand(turn)
