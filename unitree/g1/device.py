@@ -1273,8 +1273,8 @@ class _LidarNode(Node):
         except queue.Full:
             self._cb_dropped += 1
 
-        # Print stats every 200 accepted frames (~20s at 10Hz)
-        if self._cb_accepted % 200 == 0:
+        # Print stats every 2000 accepted frames (~200s at 10Hz)
+        if self._cb_accepted % 2000 == 0:
             elapsed = now - self._cb_first_time
             avg_hz = self._cb_accepted / elapsed if elapsed > 0 else 0
             print(
