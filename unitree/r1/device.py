@@ -161,6 +161,10 @@ class MicPlugin:
         self._node.stop_capture()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
         if action == "info":
             return {"state": self._node.state, "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}]}
         return None
@@ -208,6 +212,10 @@ class NativeTtsPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
         if action == "speak":
             text  = args.get("text", "")
             voice = int(args.get("voice", 0))
@@ -443,6 +451,10 @@ class LedPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
         if action == "set":
             r   = int(args.get("r", 0))
             g   = int(args.get("g", 0))
@@ -536,6 +548,10 @@ class LocoStatePlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
         if action == "info":
             return {"state": "running", "topic_out": [{"topic": self._odom_topic, "format": "data/json"}]}
         return None
@@ -638,6 +654,10 @@ class LocoPlugin:
         self._client.StopMove()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
         if action == "info":
             return None
         if action == "move":
@@ -764,6 +784,10 @@ class AsrPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
         if action == "info":
             return {"state": "running", "topic_out": [{"topic": self._topic, "format": "data/json"}]}
         return None
@@ -999,6 +1023,10 @@ class StatePlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
         if action == "info":
             tool_name = args.get('_tool_name', '')
             topic_map = {
@@ -1190,6 +1218,10 @@ class CameraPlugin:
         self._node.stop_capture()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
         if action == "info":
             tool_name = args.get('_tool_name', '')
             topic_map = {
