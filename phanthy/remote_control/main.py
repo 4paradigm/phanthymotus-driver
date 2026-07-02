@@ -16,6 +16,8 @@ import asyncio
 import json
 import os
 import signal
+import ssl
+import subprocess
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -169,8 +171,24 @@ _ws_loop: asyncio.AbstractEventLoop | None = None
 
 
 def _start_ws_server(port: int):
-    """Run aiohttp WebSocket server for mic streaming in a separate thread."""
+    """Run aiohttp WebSocket server for mic streaming in a separate thread (with SSL)."""
     from aiohttp import web as _web
+
+    # Generate self-signed cert if not exists (for wss:// support)
+    cert_dir = "./certs"
+    cert_path = Path(cert_dir) / "cert.pem"
+    key_path = Path(cert_dir) / "key.pem"
+    if not cert_path.exists() or not key_path.exists():
+        Path(cert_dir).mkdir(parents=True, exist_ok=True)
+        subprocess.run([
+            "openssl", "req", "-x509", "-newkey", "rsa:2048",
+            "-keyout", str(key_path), "-out", str(cert_path),
+            "-days", "3650", "-nodes", "-subj", "/CN=phanthy-remote-control",
+        ], check=True, capture_output=True)
+        print(f"[ws/mic] Generated self-signed certificate: {cert_path}")
+
+    ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ssl_ctx.load_cert_chain(str(cert_path), str(key_path))
 
     async def handle_ws_mic(request):
         ws = _web.WebSocketResponse()
@@ -198,9 +216,9 @@ def _start_ws_server(port: int):
         app.router.add_get("/ws/mic", handle_ws_mic)
         runner = _web.AppRunner(app)
         await runner.setup()
-        site = _web.TCPSite(runner, "0.0.0.0", port + 1)  # WS on port+1 (15711)
+        site = _web.TCPSite(runner, "0.0.0.0", port + 1, ssl_context=ssl_ctx)  # WSS on port+1 (15711)
         await site.start()
-        print(f"[ws/mic] WebSocket server listening on ws://0.0.0.0:{port + 1}/ws/mic")
+        print(f"[ws/mic] WebSocket server listening on wss://0.0.0.0:{port + 1}/ws/mic")
         # Keep running forever
         await asyncio.Event().wait()
 
