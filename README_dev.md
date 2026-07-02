@@ -220,6 +220,12 @@ class MyPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         """Dispatch a tool call. action is popped from args, args contains the remaining parameters."""
+        if action == "start":
+            return {"state": "running"}  # or "ready" for actuators
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "running", "topic_out": [...]}
         if action == "do_something":
             return {"result": "ok"}
         return None
@@ -227,7 +233,46 @@ class MyPlugin:
 
 - Provide `get_tool()` to return a single tool, or `get_tools()` to return multiple
 - In `dispatch()`, `action` has already been extracted from args; if there is no action field, it equals the tool name
-- Sensor-type tools typically return None from dispatch (data is pushed via topics)
+
+### start/stop in dispatch (Required)
+
+**Every plugin must handle `start` and `stop` actions in its `dispatch()` method.** The MCP framework does NOT provide a default implementation — unhandled start/stop will return `None` to the caller, breaking the canvas lifecycle.
+
+| Tool type | `start` return | `stop` return |
+|-----------|---------------|---------------|
+| sensor | `{"state": "running"}` | `{"state": "idle"}` |
+| actuator | `{"state": "ready"}` | `{"state": "idle"}` |
+| multiInstance sensor | Actual start logic (create node, open device) | Actual stop logic (destroy node, release device) |
+
+**Rules:**
+
+1. Always-on sensors (mic, imu, camera…): `start`/`stop` are no-ops that simply return the expected state dict
+2. multiInstance sensors (ext_camera, ext_mic): `start` must create and activate the capture node; `stop` must destroy it and release resources
+3. Actuators: `start`/`stop` are lifecycle markers; return "ready"/"idle" immediately
+
+**Anti-pattern — do NOT do this:**
+
+```python
+# BAD: no start/stop handling, relies on framework magic
+def dispatch(self, action: str, args: dict) -> dict | None:
+    if action == "info":
+        return {"state": "running", ...}
+    return None  # start/stop will return None → broken!
+```
+
+**Correct pattern:**
+
+```python
+# GOOD: every plugin explicitly handles start/stop
+def dispatch(self, action: str, args: dict) -> dict | None:
+    if action == "start":
+        return {"state": "running"}
+    if action == "stop":
+        return {"state": "idle"}
+    if action == "info":
+        return {"state": "running", "topic_out": [...]}
+    return None
+```
 
 ---
 
@@ -322,3 +367,35 @@ docker build -t g1-driver .
 - Tencent Cloud mirror sources are used for acceleration
 - Image naming format: `${REGISTRY}/${IMAGE_NAMESPACE}/${image_name}:${TAG}`
 - See `.env.example` for environment variable configuration
+
+### Deployment via service.yml
+
+Each driver must include a `deploy/service.yml` file that defines its Docker Compose service fragment. When deploying via the Agent Core Web Dashboard, Agent Core extracts this file from the driver image and merges it into the host's unified `docker-compose.yml` at `/opt/phanthy-motus/`.
+
+**Required fields:**
+
+```yaml
+unitree-g1:                      # Service name (must be unique)
+  image: __IMAGE__               # Placeholder, replaced by Agent Core at deploy time
+  privileged: true               # Required: access to /dev and hardware
+  volumes:
+    - /dev:/dev                  # Required: device access for cameras, sensors, etc.
+  environment:
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
+    - PYTHONUNBUFFERED=1
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: unless-stopped
+```
+
+**Notes:**
+
+- `privileged: true` and `/dev:/dev` are mandatory for any driver that accesses hardware (cameras, USB devices, GPIO)
+- `network_mode`, `ipc`, `pid` are injected by Agent Core during deployment — do not specify them in service.yml
+- The `__IMAGE__` placeholder is automatically replaced with the actual image reference
+- Service name should follow the pattern `{provider}-{model}` (e.g. `unitree-g1`, `phanthy-remote-control`)

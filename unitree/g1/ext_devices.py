@@ -14,7 +14,7 @@ import re
 import subprocess
 import threading
 import time
-from typing import Optional
+from typing import Any, Optional
 
 import cv2
 import numpy as np
@@ -352,90 +352,54 @@ class _ExtMicNode(Node):
         }
 
 
-class _ExtCameraNode(Node):
-    """Captures video from a V4L2 device and publishes JPEG CompressedImage."""
+class _ExtCameraNode:
+    """Manages a subprocess that captures video from a V4L2 device and publishes JPEG."""
 
     def __init__(self, device_path: str, device_name: str, namespace: str, instance_id: str,
                  fps: int = 15, width: int = 1920, height: int = 1080,
                  pixel_format: str = "auto", available_formats: Optional[list] = None):
-        node_name = f"ext_camera_{instance_id.replace('-', '_')}"
-        super().__init__(node_name)
         self._device_path = device_path
         self._device_name = device_name
         self._instance_id = instance_id
+        self._namespace = namespace
         self._topic = f"/{namespace}/ext_camera/{instance_id.replace('-', '_')}/rgb"
-        self._pub = self.create_publisher(CompressedImage, self._topic, _LOW_LAT_QOS)
         self._fps = fps
         self._width = width
         self._height = height
         self._pixel_format = pixel_format
         self._available_formats: list = available_formats or []
-        self._cap: Optional[cv2.VideoCapture] = None
-        self._running = False
-        self._thread: Optional[threading.Thread] = None
+        self._proc: Optional[Any] = None
         self.state = "idle"
-
-    def _resolve_fourcc(self) -> Optional[int]:
-        if self._pixel_format == "auto":
-            for f in _FOURCC_PRIORITY:
-                if f in self._available_formats:
-                    return cv2.VideoWriter_fourcc(*f)
-            return None  # let OpenCV negotiate
-        try:
-            return cv2.VideoWriter_fourcc(*self._pixel_format)
-        except Exception:
-            return None
 
     def start(self) -> dict:
         if self.state == "running":
             return self._status_dict()
-        self._cap = cv2.VideoCapture(self._device_path)
-        if not self._cap.isOpened():
-            raise RuntimeError(f"Cannot open camera: {self._device_path}")
-        fourcc = self._resolve_fourcc()
-        if fourcc is not None:
-            self._cap.set(cv2.CAP_PROP_FOURCC, fourcc)
-        actual = int(self._cap.get(cv2.CAP_PROP_FOURCC))
-        actual_str = "".join([chr((actual >> 8 * i) & 0xFF) for i in range(4)])
-        log.info(f"[ext_camera] FOURCC requested={self._pixel_format} actual={actual_str}")
-        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._width)
-        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
-        self._cap.set(cv2.CAP_PROP_FPS, self._fps)
-        self._running = True
-        self._thread = threading.Thread(target=self._capture_loop, daemon=True)
-        self._thread.start()
+        import multiprocessing as mp
+        ctx = mp.get_context("spawn")
+        self._proc = ctx.Process(
+            target=_run_ext_camera_process,
+            args=(self._device_path, self._namespace, self._instance_id,
+                  self._fps, self._width, self._height,
+                  self._pixel_format, self._available_formats),
+            name=f"ext_camera_{self._instance_id}",
+            daemon=True,
+        )
+        self._proc.start()
         self.state = "running"
-        log.info(f"[ext_camera] started device={self._device_path} ({self._width}x{self._height}@{self._fps}) → {self._topic}")
+        print(f"[ext_camera] subprocess started → pid={self._proc.pid} device={self._device_path} "
+              f"({self._width}x{self._height}@{self._fps}) → {self._topic}", flush=True)
         return self._status_dict()
 
     def stop(self) -> dict:
-        self._running = False
-        if self._thread:
-            self._thread.join(timeout=3)
-            self._thread = None
-        if self._cap:
-            self._cap.release()
-            self._cap = None
+        if self._proc is not None and self._proc.is_alive():
+            self._proc.terminate()
+            self._proc.join(timeout=3.0)
+            if self._proc.is_alive():
+                self._proc.kill()
+                self._proc.join(timeout=2.0)
+        self._proc = None
         self.state = "idle"
         return self._status_dict()
-
-    def _capture_loop(self):
-        interval = 1.0 / self._fps
-        while self._running:
-            t0 = time.monotonic()
-            ret, frame = self._cap.read()
-            if not ret:
-                time.sleep(0.1)
-                continue
-            _, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-            msg = CompressedImage()
-            msg.header.stamp = self.get_clock().now().to_msg()
-            msg.format = "jpeg"
-            msg.data = jpeg.tobytes()
-            self._pub.publish(msg)
-            elapsed = time.monotonic() - t0
-            if elapsed < interval:
-                time.sleep(interval - elapsed)
 
     def _status_dict(self) -> dict:
         return {
@@ -445,6 +409,95 @@ class _ExtCameraNode(Node):
             "topic_in": [],
             "topic_out": [{"topic": self._topic, "format": "image/jpeg", "desc": ""}],
         }
+
+
+def _run_ext_camera_process(device_path: str, namespace: str, instance_id: str,
+                            fps: int, width: int, height: int,
+                            pixel_format: str, available_formats: list) -> None:
+    """Ext camera subprocess entry — independent GIL for full throughput."""
+    import cv2
+    import rclpy
+    from rclpy.node import Node as _Node
+    from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+    from sensor_msgs.msg import CompressedImage as _CompressedImage
+
+    _QOS = QoSProfile(
+        reliability=ReliabilityPolicy.BEST_EFFORT,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=1,
+        durability=DurabilityPolicy.VOLATILE,
+    )
+
+    _FOURCC_PRIO = ['MJPG', 'H264', 'YUYV']
+    _JPEG_Q = 80
+
+    rclpy.init()
+    node_name = f"ext_camera_{instance_id.replace('-', '_')}"
+    node = _Node(node_name)
+    topic = f"/{namespace}/ext_camera/{instance_id.replace('-', '_')}/rgb"
+    pub = node.create_publisher(_CompressedImage, topic, _QOS)
+
+    cap = cv2.VideoCapture(device_path)
+    if not cap.isOpened():
+        node.get_logger().error(f"[ext_camera] Cannot open device: {device_path}")
+        node.destroy_node()
+        rclpy.shutdown()
+        return
+
+    # Set FOURCC
+    fourcc = None
+    if pixel_format == "auto":
+        for f in _FOURCC_PRIO:
+            if f in available_formats:
+                fourcc = cv2.VideoWriter_fourcc(*f)
+                break
+    else:
+        try:
+            fourcc = cv2.VideoWriter_fourcc(*pixel_format)
+        except Exception:
+            pass
+    if fourcc is not None:
+        cap.set(cv2.CAP_PROP_FOURCC, fourcc)
+
+    actual = int(cap.get(cv2.CAP_PROP_FOURCC))
+    actual_str = "".join([chr((actual >> 8 * i) & 0xFF) for i in range(4)])
+    mjpg_passthrough = (actual_str == "MJPG")
+    if mjpg_passthrough:
+        cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    cap.set(cv2.CAP_PROP_FPS, fps)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    node.get_logger().info(
+        f"[ext_camera] capture started — {device_path} {width}x{height}@{fps} "
+        f"fourcc={actual_str} passthrough={mjpg_passthrough}"
+    )
+
+    try:
+        while rclpy.ok():
+            ret, frame = cap.read()
+            if not ret:
+                import time
+                time.sleep(0.1)
+                continue
+            if mjpg_passthrough:
+                jpeg_bytes = frame.tobytes()
+            else:
+                _, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, _JPEG_Q])
+                jpeg_bytes = jpeg.tobytes()
+            msg = _CompressedImage()
+            msg.header.stamp = node.get_clock().now().to_msg()
+            msg.format = "jpeg"
+            msg.data = jpeg_bytes
+            pub.publish(msg)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        cap.release()
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 # ── Plugins ───────────────────────────────────────────────────────────────────
@@ -790,7 +843,6 @@ class ExtCameraPlugin:
     def stop(self) -> None:
         for key in list(self._nodes.keys()):
             self._nodes[key].stop()
-            self._executor.remove_node(self._nodes[key])
             del self._nodes[key]
 
     def dispatch(self, action: str, args: dict) -> dict | None:
@@ -820,6 +872,10 @@ class ExtCameraPlugin:
         elif action == "start":
             if not instance_id:
                 raise ValueError("instance_id is required for multiInstance tool")
+            # Merge cached config into args (config is sent before start)
+            if instance_id in self._instance_configs:
+                merged = {**self._instance_configs[instance_id], **{k: v for k, v in args.items() if k not in ('action', 'instance_id', '_tool_name')}}
+                args.update(merged)
             device_path = args.get("device_path")
             device_name = args.get("device_name", "")
             if not device_path:
@@ -848,20 +904,17 @@ class ExtCameraPlugin:
                 node = _ExtCameraNode(device_path, device_name, self._namespace, instance_id,
                                       fps=fps, width=width, height=height,
                                       pixel_format=pixel_format, available_formats=available_formats)
-                self._executor.add_node(node)
                 self._nodes[instance_id] = node
             return self._nodes[instance_id].start()
 
         elif action == "stop":
             if instance_id and instance_id in self._nodes:
                 result = self._nodes[instance_id].stop()
-                self._executor.remove_node(self._nodes[instance_id])
                 del self._nodes[instance_id]
                 return result
             elif not instance_id:
                 for key in list(self._nodes.keys()):
                     self._nodes[key].stop()
-                    self._executor.remove_node(self._nodes[key])
                     del self._nodes[key]
                 return {"state": "idle"}
             return {"state": "idle"}
