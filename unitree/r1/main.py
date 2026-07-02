@@ -305,6 +305,13 @@ def main():
     if not dds_ok:
         print("[bundle] WARNING: DDS unavailable — robot communication disabled, MCP server still starting")
 
+    # Suppress C++ layer stdout (ClientStub recv/future logs) while keeping Python print working.
+    _orig_fd = os.dup(1)
+    _devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(_devnull, 1)
+    os.close(_devnull)
+    sys.stdout = os.fdopen(_orig_fd, 'w', buffering=1)
+
     # RPC Proxy — runs LocoClient + AudioClient in a subprocess to avoid GIL contention.
     # The main process has many threads (ROS2 executor, camera, mic) which starve
     # CycloneDDS listener callbacks, causing RPC response timeouts (3104).
