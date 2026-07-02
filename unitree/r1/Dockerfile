@@ -58,6 +58,7 @@ COPY main.py   /work/main.py
 COPY device.py /work/device.py
 COPY rpc_proxy.py /work/rpc_proxy.py
 COPY config.yaml /work/config.yaml
+COPY deploy/     /deploy/
 
 ENV PYTHONPATH=/work
 ENV PYTHONUNBUFFERED=1

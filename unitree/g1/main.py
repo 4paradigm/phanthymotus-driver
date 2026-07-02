@@ -178,7 +178,8 @@ class G1DeviceBundle:
                         return p.dispatch(tool_name, args)
                     action = args.pop("action", tool_name)
                     args['_tool_name'] = tool_name  # let multi-tool plugins know which tool was called
-                    return p.dispatch(action, args)
+                    result = p.dispatch(action, args)
+                    return result
         return None
 
 
@@ -315,6 +316,14 @@ def main():
     # DDS init
     ChannelFactoryInitialize(0, network_iface)
     print(f"[bundle] DDS initialized on interface: {network_iface}")
+
+    # Suppress C++ layer stdout (ClientStub recv/future logs) while keeping Python print working.
+    # C++ writes to fd 1 directly; we redirect fd 1 to /dev/null and give Python a dup of the original.
+    _orig_fd = os.dup(1)
+    _devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(_devnull, 1)
+    os.close(_devnull)
+    sys.stdout = os.fdopen(_orig_fd, 'w', buffering=1)
 
     # AudioClient (shared by tts + led)
     audio_client = AudioClient()

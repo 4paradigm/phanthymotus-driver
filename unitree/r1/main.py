@@ -133,18 +133,7 @@ class R1DeviceBundle:
                         return p.dispatch(tool_name, args)
                     action = args.pop("action", tool_name)
                     args['_tool_name'] = tool_name
-                    # Sensors are always-on; start/stop are no-ops
-                    if tool_def["type"] == "sensor" and action in ("start", "stop"):
-                        return {"state": "running" if action == "start" else "idle"}
-                    # Actuators: start/stop from canvas are no-ops (canvas lifecycle, not robot motion)
-                    if tool_def["type"] == "actuator" and action in ("start", "stop"):
-                        return {"state": "ready" if action == "start" else "idle"}
                     result = p.dispatch(action, args)
-                    if result is not None:
-                        return result
-                    # Fallback for unhandled actions on sensors
-                    if tool_def["type"] == "sensor":
-                        return {"state": "running"}
                     return result
         return None
 
@@ -304,6 +293,13 @@ def main():
             print(f"[bundle] DDS init failed on '{iface}': {e}")
     if not dds_ok:
         print("[bundle] WARNING: DDS unavailable — robot communication disabled, MCP server still starting")
+
+    # Suppress C++ layer stdout (ClientStub recv/future logs) while keeping Python print working.
+    _orig_fd = os.dup(1)
+    _devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(_devnull, 1)
+    os.close(_devnull)
+    sys.stdout = os.fdopen(_orig_fd, 'w', buffering=1)
 
     # RPC Proxy — runs LocoClient + AudioClient in a subprocess to avoid GIL contention.
     # The main process has many threads (ROS2 executor, camera, mic) which starve

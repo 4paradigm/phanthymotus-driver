@@ -165,9 +165,13 @@ class MicPlugin:
         self._node.stop_capture()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
         if action == "info":
             return {"state": "running", "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}]}
-        return None  # sensor — no other callable actions
+        return None
 
 
 # ── NativeTtsPlugin (actuator) ───────────────────────────────────────────────
@@ -212,6 +216,10 @@ class NativeTtsPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
         if action == "speak":
             text  = args.get("text", "")
             voice = int(args.get("voice", 0))
@@ -465,6 +473,10 @@ class LedPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
         if action == "set":
             r   = int(args.get("r", 0))
             g   = int(args.get("g", 0))
@@ -591,12 +603,16 @@ class LocoStatePlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
         if action == "info":
             tool_name = args.get('_tool_name', '')
             if tool_name == 'loco_motion_state':
                 return {"state": "running", "topic_out": [{"topic": self._motion_topic, "format": "data/json"}]}
             return {"state": "running", "topic_out": [{"topic": self._odom_topic, "format": "data/json"}]}
-        return None  # sensor
+        return None
 
 
 # ── LocoPlugin (actuator) ────────────────────────────────────────────────────
@@ -720,6 +736,10 @@ class LocoPlugin:
         self._client.StopMove()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
         if action == "info":
             tool_name = args.get("_tool_name", "motion_events")
             if tool_name == "motion_events" and self._smart_motion:
@@ -893,6 +913,10 @@ class AsrPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
         if action == "info":
             return {"state": "running", "topic_out": [{"topic": self._topic, "format": "data/json"}]}
         return None
@@ -960,6 +984,10 @@ class ArmActionPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
         if action == "list":
             return {"actions": [{"id": v, "name": k} for k, v in _ARM_ACTION_MAP.items()]}
         elif action == "execute":
@@ -1178,6 +1206,10 @@ class StatePlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
         if action == "info":
             tool_name = args.get('_tool_name', '')
             topic_map = {
@@ -1273,8 +1305,8 @@ class _LidarNode(Node):
         except queue.Full:
             self._cb_dropped += 1
 
-        # Print stats every 200 accepted frames (~20s at 10Hz)
-        if self._cb_accepted % 200 == 0:
+        # Print stats every 2000 accepted frames (~200s at 10Hz)
+        if self._cb_accepted % 2000 == 0:
             elapsed = now - self._cb_first_time
             avg_hz = self._cb_accepted / elapsed if elapsed > 0 else 0
             print(
@@ -1356,9 +1388,13 @@ class LidarPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
         if action == "info":
             return {"state": "running", "topic_out": [{"topic": self._cloud_topic, "format": "sensor/pointcloud"}]}
-        return None  # sensor
+        return None
 
 
 # ── SpatialPlugin (actuator + sensor) ────────────────────────────────────────
@@ -2482,6 +2518,10 @@ class SpatialPlugin:
         return {"error": f"StartMapping failed, code={code}"}
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
         if action == "info":
             tool_name = args.get('_tool_name', '')
             if tool_name == 'mapping':
@@ -2675,8 +2715,11 @@ class MotionSwitcherPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
         if action == "check":
-            code, result = self._client.CheckMode()
             if code != 0:
                 return {"error": f"CheckMode failed, code={code}"}
             return {"mode": result}
@@ -2781,6 +2824,10 @@ class RealSensePlugin:
         self._proc = None
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
         if action == "info":
             tool_name = args.get('_tool_name', '')
             if tool_name == 'camera_depth':
@@ -2788,7 +2835,7 @@ class RealSensePlugin:
             if tool_name == 'camera_distance':
                 return {"state": "running", "topic_out": [{"topic": self._dist_topic, "format": "data/json"}]}
             return {"state": "running", "topic_out": [{"topic": self._color_topic, "format": "image/jpeg"}]}
-        return None  # sensor
+        return None
 
 
 def run_realsense_process(namespace: str) -> None:
