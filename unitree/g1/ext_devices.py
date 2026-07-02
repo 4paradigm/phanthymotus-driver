@@ -404,6 +404,8 @@ class _ExtCameraNode(Node):
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._width)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
         self._cap.set(cv2.CAP_PROP_FPS, self._fps)
+        # Minimize buffer so read() blocks until next frame — natural frame-rate pacing
+        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self._running = True
         self._thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._thread.start()
@@ -423,9 +425,7 @@ class _ExtCameraNode(Node):
         return self._status_dict()
 
     def _capture_loop(self):
-        interval = 1.0 / self._fps
         while self._running:
-            t0 = time.monotonic()
             ret, frame = self._cap.read()
             if not ret:
                 time.sleep(0.1)
@@ -440,9 +440,6 @@ class _ExtCameraNode(Node):
             msg.format = "jpeg"
             msg.data = jpeg_bytes
             self._pub.publish(msg)
-            elapsed = time.monotonic() - t0
-            if elapsed < interval:
-                time.sleep(interval - elapsed)
 
     def _status_dict(self) -> dict:
         return {
