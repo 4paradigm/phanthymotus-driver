@@ -89,6 +89,10 @@ class RemoteMessagePlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict:
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
         if action == "send_message":
             text = args.get("text", "")
             if not text:
@@ -159,6 +163,10 @@ class RemoteAudioPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict:
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
         if action == "send_audio":
             audio_b64 = args.get("audio_base64", "")
             if not audio_b64:
@@ -259,6 +267,11 @@ class RemoteMicPlugin:
         self._active = False
 
     def dispatch(self, action: str, args: dict) -> dict:
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            self._active = False
+            return {"state": "idle"}
         if action == "connect":
             self._active = True
             return {
