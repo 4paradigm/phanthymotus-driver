@@ -245,17 +245,18 @@ class RemoteMicPlugin:
             "name": "remote_mic",
             "type": "sensor",
             "multiInstance": False,
-            "description": "Stream live microphone audio from browser to robot (PCM-16k mono via WebSocket). Use 'connect' to start, 'disconnect' to stop.",
-            "inputSchema": {
+            "description": "Stream live microphone audio from browser to robot (PCM-16k mono via WebSocket).",
+            "inputSchema": {"type": "object", "properties": {}},
+            "configSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {
+                    "device_id": {
                         "type": "string",
-                        "enum": ["connect", "disconnect", "status"],
-                        "description": "Action to perform",
+                        "description": "Browser audio input device",
+                        "format": "audio-input-device",
+                        "scope": "instance",
                     },
                 },
-                "required": ["action"],
             },
             "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}],
         }
@@ -268,27 +269,14 @@ class RemoteMicPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "start":
-            return {"state": "running"}
+            self._active = True
+            return {"state": "running", "ws_url": f"ws://localhost:{self._port + 1}/ws/mic", "topic": self._topic}
         if action == "stop":
             self._active = False
             return {"state": "idle"}
-        if action == "connect":
-            self._active = True
-            return {
-                "status": "listening",
-                "ws_url": f"ws://localhost:{self._port + 1}/ws/mic",
-                "topic": self._topic,
-            }
-        elif action == "disconnect":
-            self._active = False
-            return {"status": "disconnected"}
-        elif action == "status":
-            return {
-                "active": self._active,
-                "clients": len(self._ws_clients),
-                "topic": self._topic,
-            }
-        return {"error": f"Unknown action: {action}"}
+        if action == "info":
+            return {"state": "running" if self._active else "idle", "clients": len(self._ws_clients), "topic": self._topic}
+        return None
 
     def register_ws(self, ws):
         self._ws_clients.add(ws)
