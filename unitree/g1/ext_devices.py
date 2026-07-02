@@ -872,6 +872,10 @@ class ExtCameraPlugin:
         elif action == "start":
             if not instance_id:
                 raise ValueError("instance_id is required for multiInstance tool")
+            # Merge cached config into args (config is sent before start)
+            if instance_id in self._instance_configs:
+                merged = {**self._instance_configs[instance_id], **{k: v for k, v in args.items() if k not in ('action', 'instance_id', '_tool_name')}}
+                args.update(merged)
             device_path = args.get("device_path")
             device_name = args.get("device_name", "")
             if not device_path:
