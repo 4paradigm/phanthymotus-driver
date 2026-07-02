@@ -4,6 +4,9 @@ unitree-g1:
   network_mode: host
   ipc: host
   pid: host
+  privileged: true
+  volumes:
+    - /dev:/dev
   environment:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
