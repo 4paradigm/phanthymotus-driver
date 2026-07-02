@@ -388,6 +388,10 @@ class ControlledSpatialPlugin:
     # ── Dispatch ─────────────────────────────────────────────────────────────
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
         if action == "info":
             return {"state": "running"}
 
