@@ -12,12 +12,9 @@ drivers/phanthy/remote_control/main.py — Phanthy Remote Control MCP 驱动。
     AGENT_CORE_URL — Agent Core 地址（默认 http://localhost:15678）
 """
 
-import asyncio
 import json
 import os
 import signal
-import ssl
-import subprocess
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -28,7 +25,7 @@ import yaml
 import rclpy
 import rclpy.executors
 
-from plugins import RemoteMessagePlugin, RemoteAudioPlugin, RemoteMicPlugin
+from plugins import RemoteMessagePlugin, RemoteAudioPlugin
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -43,13 +40,11 @@ def _load_config() -> dict:
 
 
 class RemoteControlBundle:
-    def __init__(self, namespace: str, executor, port: int):
+    def __init__(self, namespace: str, executor):
         self._plugins = [
             RemoteMessagePlugin(namespace, executor),
             RemoteAudioPlugin(namespace, executor),
-            RemoteMicPlugin(namespace, executor, port),
         ]
-        self._mic_plugin: RemoteMicPlugin = self._plugins[2]
 
     def start_all(self):
         for p in self._plugins:
@@ -80,10 +75,6 @@ class RemoteControlBundle:
                         return {"error": "Missing required parameter: action"}
                     return p.dispatch(action, args)
         return None
-
-    @property
-    def mic_plugin(self) -> RemoteMicPlugin:
-        return self._mic_plugin
 
 
 # ── MCP HTTP server (sync, same pattern as Unitree) ──────────────────────────
@@ -167,65 +158,6 @@ def _make_handler():
 
 # ── WebSocket mic server (asyncio thread) ────────────────────────────────────
 
-_ws_loop: asyncio.AbstractEventLoop | None = None
-
-
-def _start_ws_server(port: int):
-    """Run aiohttp WebSocket server for mic streaming in a separate thread (with SSL)."""
-    from aiohttp import web as _web
-
-    # Generate self-signed cert if not exists (for wss:// support)
-    cert_dir = "./certs"
-    cert_path = Path(cert_dir) / "cert.pem"
-    key_path = Path(cert_dir) / "key.pem"
-    if not cert_path.exists() or not key_path.exists():
-        Path(cert_dir).mkdir(parents=True, exist_ok=True)
-        subprocess.run([
-            "openssl", "req", "-x509", "-newkey", "rsa:2048",
-            "-keyout", str(key_path), "-out", str(cert_path),
-            "-days", "3650", "-nodes", "-subj", "/CN=phanthy-remote-control",
-        ], check=True, capture_output=True)
-        print(f"[ws/mic] Generated self-signed certificate: {cert_path}")
-
-    ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ssl_ctx.load_cert_chain(str(cert_path), str(key_path))
-
-    async def handle_ws_mic(request):
-        ws = _web.WebSocketResponse()
-        await ws.prepare(request)
-
-        mic = _bundle.mic_plugin
-        mic.register_ws(ws)
-        print(f"[ws/mic] Client connected ({len(mic._ws_clients)} total)")
-
-        try:
-            async for msg in ws:
-                if msg.type == _web.WSMsgType.BINARY:
-                    mic.on_audio_frame(msg.data)
-                elif msg.type == _web.WSMsgType.ERROR:
-                    print(f"[ws/mic] Error: {ws.exception()}")
-        finally:
-            mic.unregister_ws(ws)
-            print(f"[ws/mic] Client disconnected ({len(mic._ws_clients)} total)")
-        return ws
-
-    async def _run():
-        global _ws_loop
-        _ws_loop = asyncio.get_event_loop()
-        app = _web.Application()
-        app.router.add_get("/ws/mic", handle_ws_mic)
-        runner = _web.AppRunner(app)
-        await runner.setup()
-        site = _web.TCPSite(runner, "0.0.0.0", port + 1, ssl_context=ssl_ctx)  # WSS on port+1 (15711)
-        await site.start()
-        print(f"[ws/mic] WebSocket server listening on wss://0.0.0.0:{port + 1}/ws/mic")
-        # Keep running forever
-        await asyncio.Event().wait()
-
-    def _thread():
-        asyncio.run(_run())
-
-    threading.Thread(target=_thread, daemon=True, name="ws_server").start()
 
 
 # ── Registration heartbeat ───────────────────────────────────────────────────
@@ -277,7 +209,7 @@ def main():
     executor = rclpy.executors.MultiThreadedExecutor()
 
     # Init bundle
-    _bundle = RemoteControlBundle(namespace, executor, mcp_port)
+    _bundle = RemoteControlBundle(namespace, executor)
     _bundle.start_all()
 
     # ROS2 spin thread (spin_once loop, same as Unitree driver)
@@ -287,9 +219,6 @@ def main():
 
     threading.Thread(target=_spin, daemon=True, name="ros2_spin").start()
 
-    # Start WebSocket server for mic streaming (separate port)
-    _start_ws_server(mcp_port)
-
     # Start registration heartbeat
     _start_registration(mcp_port, "Phanthy Remote Control", "driver")
 
@@ -297,7 +226,6 @@ def main():
     server = HTTPServer(("", mcp_port), _make_handler())
     print(f"[main] Phanthy Remote Control driver started")
     print(f"[main] MCP endpoint: http://localhost:{mcp_port}/mcp")
-    print(f"[main] WebSocket mic: ws://localhost:{mcp_port + 1}/ws/mic")
 
     def _shutdown(signum, frame):
         print(f"\n[main] signal {signum}, shutting down")
