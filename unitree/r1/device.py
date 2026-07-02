@@ -1050,40 +1050,71 @@ class StatePlugin:
 
 # ── CameraPlugin (sensor) ────────────────────────────────────────────────────
 
-class _CameraNode(Node):
-    """Receives H.264 RTP video from R1 via GStreamer and publishes MJPEG frames to ROS2."""
+class _CameraNode:
+    """Manages a subprocess that receives H.264 RTP video and publishes MJPEG frames."""
 
     def __init__(self, main_topic: str, left_topic: str, right_topic: str, depth_topic: str):
-        super().__init__("r1_camera")
-        from sensor_msgs.msg import CompressedImage
-        self._CompressedImage = CompressedImage
-        self._main_pub  = self.create_publisher(CompressedImage, main_topic, _LOW_LAT_QOS)
-        self._left_pub  = self.create_publisher(CompressedImage, left_topic, _LOW_LAT_QOS)
-        self._right_pub = self.create_publisher(CompressedImage, right_topic, _LOW_LAT_QOS)
-        self._depth_pub = self.create_publisher(CompressedImage, depth_topic, _LOW_LAT_QOS)
-        self._procs: list[subprocess.Popen] = []
-        self._threads: list[threading.Thread] = []
+        self._main_topic = main_topic
+        self._left_topic = left_topic
+        self._right_topic = right_topic
+        self._depth_topic = depth_topic
+        self._proc = None
         self.state = "idle"
-        self.get_logger().info(f"CameraNode ready — main:{main_topic} left:{left_topic} right:{right_topic} depth:{depth_topic}")
 
     def start_capture(self) -> None:
         if self.state == "running":
             return
+        import multiprocessing as mp
+        ctx = mp.get_context("spawn")
+        self._proc = ctx.Process(
+            target=_run_camera_process,
+            args=(self._main_topic, self._left_topic, self._right_topic, self._depth_topic),
+            name="r1_camera",
+            daemon=True,
+        )
+        self._proc.start()
         self.state = "running"
+        print(f"[camera] subprocess started → pid={self._proc.pid}", flush=True)
 
-        # Main camera (port 5001, 1280x720, rotated 90° clockwise)
-        self._start_stream(5001, self._main_pub, "main", rotate_cw=True)
-        # Left stereo (port 5002, 544x448)
-        self._start_stream(5002, self._left_pub, "left")
-        # Right stereo (port 5003, 544x448)
-        self._start_stream(5003, self._right_pub, "right")
-        # Depth (port 5000, 544x448)
-        self._start_stream(5000, self._depth_pub, "depth")
+    def stop_capture(self) -> None:
+        if self._proc is not None and self._proc.is_alive():
+            self._proc.terminate()
+            self._proc.join(timeout=3.0)
+            if self._proc.is_alive():
+                self._proc.kill()
+                self._proc.join(timeout=2.0)
+        self._proc = None
+        self.state = "idle"
+        print("[camera] subprocess stopped", flush=True)
 
-        self.get_logger().info("Camera capture started (3 streams)")
 
-    def _start_stream(self, port: int, publisher, name: str, rotate_cw: bool = False) -> None:
-        """Launch a GStreamer subprocess to decode H.264 RTP and output JPEG frames."""
+def _run_camera_process(main_topic: str, left_topic: str, right_topic: str, depth_topic: str) -> None:
+    """Camera subprocess entry — independent GIL for full throughput on all 4 streams."""
+    import subprocess as _subprocess
+    import threading as _threading
+    import rclpy
+    from rclpy.node import Node as _Node
+    from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+    from sensor_msgs.msg import CompressedImage as _CompressedImage
+
+    _QOS = QoSProfile(
+        reliability=ReliabilityPolicy.BEST_EFFORT,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=1,
+        durability=DurabilityPolicy.VOLATILE,
+    )
+
+    rclpy.init()
+    node = _Node("r1_camera")
+    main_pub  = node.create_publisher(_CompressedImage, main_topic, _QOS)
+    left_pub  = node.create_publisher(_CompressedImage, left_topic, _QOS)
+    right_pub = node.create_publisher(_CompressedImage, right_topic, _QOS)
+    depth_pub = node.create_publisher(_CompressedImage, depth_topic, _QOS)
+
+    procs = []
+    threads = []
+
+    def start_stream(port: int, publisher, name: str, rotate_cw: bool = False):
         cmd = [
             "gst-launch-1.0", "-q",
             "udpsrc", f"port={port}", "!",
@@ -1094,35 +1125,24 @@ class _CameraNode(Node):
         ]
         if rotate_cw:
             cmd.extend(["videoflip", "method=clockwise", "!"])
-        cmd.extend([
-            "jpegenc", "quality=75", "!",
-            "fdsink", "fd=1",
-        ])
+        cmd.extend(["jpegenc", "quality=75", "!", "fdsink", "fd=1"])
         try:
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            )
-            self._procs.append(proc)
-            t = threading.Thread(target=self._read_frames, args=(proc, publisher, name), daemon=True)
+            proc = _subprocess.Popen(cmd, stdout=_subprocess.PIPE, stderr=_subprocess.DEVNULL)
+            procs.append(proc)
+            t = _threading.Thread(target=read_frames, args=(proc, publisher, name), daemon=True)
             t.start()
-            self._threads.append(t)
+            threads.append(t)
         except FileNotFoundError:
-            self.get_logger().error(f"gst-launch-1.0 not found — camera stream {name} disabled")
+            node.get_logger().error(f"gst-launch-1.0 not found — stream {name} disabled")
 
-    def _read_frames(self, proc: subprocess.Popen, publisher, name: str) -> None:
-        """Read JPEG frames from GStreamer stdout and publish to ROS2.
-
-        GStreamer jpegenc outputs a continuous stream of JPEG data.
-        We detect JPEG boundaries via SOI (FFD8) and EOI (FFD9) markers.
-        """
+    def read_frames(proc, publisher, name: str):
         buf = bytearray()
         CHUNK = 65536
-        while self.state == "running" and proc.poll() is None:
+        while proc.poll() is None:
             data = proc.stdout.read(CHUNK)
             if not data:
                 break
             buf.extend(data)
-            # Extract complete JPEG frames
             while True:
                 soi = buf.find(b'\xff\xd8')
                 if soi == -1:
@@ -1130,31 +1150,43 @@ class _CameraNode(Node):
                     break
                 eoi = buf.find(b'\xff\xd9', soi + 2)
                 if eoi == -1:
-                    # Trim everything before SOI
                     if soi > 0:
                         del buf[:soi]
                     break
                 frame = bytes(buf[soi:eoi + 2])
                 del buf[:eoi + 2]
-                msg = self._CompressedImage()
+                msg = _CompressedImage()
+                msg.header.stamp = node.get_clock().now().to_msg()
                 msg.format = "jpeg"
-                msg.data = list(frame)
+                msg.data = frame
                 publisher.publish(msg)
 
-    def stop_capture(self) -> None:
-        self.state = "idle"
-        for proc in self._procs:
+    # Start all 4 streams
+    start_stream(5001, main_pub, "main", rotate_cw=True)
+    start_stream(5002, left_pub, "left")
+    start_stream(5003, right_pub, "right")
+    start_stream(5000, depth_pub, "depth")
+
+    node.get_logger().info("Camera capture started (4 streams in subprocess)")
+
+    try:
+        # Keep process alive until terminated
+        for t in threads:
+            t.join()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        for proc in procs:
             try:
                 proc.terminate()
-                proc.wait(timeout=3)
+                proc.wait(timeout=2)
             except Exception:
                 try:
                     proc.kill()
                 except Exception:
                     pass
-        self._procs.clear()
-        self._threads.clear()
-        self.get_logger().info("Camera capture stopped")
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 class CameraPlugin:
@@ -1166,7 +1198,6 @@ class CameraPlugin:
         self._right_topic = f"/{namespace}/camera/right"
         self._depth_topic = f"/{namespace}/camera/depth"
         self._node = _CameraNode(self._main_topic, self._left_topic, self._right_topic, self._depth_topic)
-        executor.add_node(self._node)
 
     def get_tools(self) -> list:
         return [self._main_tool(), self._left_tool(), self._right_tool(), self._depth_tool()]
