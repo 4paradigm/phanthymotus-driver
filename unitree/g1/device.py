@@ -989,6 +989,7 @@ class ArmActionPlugin:
         if action == "stop":
             return {"state": "idle"}
         if action == "list":
+            return {"actions": [{"id": v, "name": k} for k, v in _ARM_ACTION_MAP.items()]}
         elif action == "execute":
             action_id = None
             if "action_id" in args:
