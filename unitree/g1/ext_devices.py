@@ -397,7 +397,10 @@ class _ExtCameraNode(Node):
             self._cap.set(cv2.CAP_PROP_FOURCC, fourcc)
         actual = int(self._cap.get(cv2.CAP_PROP_FOURCC))
         actual_str = "".join([chr((actual >> 8 * i) & 0xFF) for i in range(4)])
-        log.info(f"[ext_camera] FOURCC requested={self._pixel_format} actual={actual_str}")
+        self._mjpg_passthrough = (actual_str == "MJPG")
+        if self._mjpg_passthrough:
+            self._cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
+        log.info(f"[ext_camera] FOURCC requested={self._pixel_format} actual={actual_str} passthrough={self._mjpg_passthrough}")
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._width)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
         self._cap.set(cv2.CAP_PROP_FPS, self._fps)
@@ -427,11 +430,15 @@ class _ExtCameraNode(Node):
             if not ret:
                 time.sleep(0.1)
                 continue
-            _, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+            if self._mjpg_passthrough:
+                jpeg_bytes = frame.tobytes()
+            else:
+                _, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+                jpeg_bytes = jpeg.tobytes()
             msg = CompressedImage()
             msg.header.stamp = self.get_clock().now().to_msg()
             msg.format = "jpeg"
-            msg.data = jpeg.tobytes()
+            msg.data = jpeg_bytes
             self._pub.publish(msg)
             elapsed = time.monotonic() - t0
             if elapsed < interval:
