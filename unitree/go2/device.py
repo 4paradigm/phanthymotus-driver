@@ -1076,10 +1076,10 @@ class CameraPlugin:
 
 # Go2 motor index → joint name mapping (12 motors: 3 per leg)
 _GO2_JOINT_NAMES = [
-    'FR_hip', 'FR_thigh', 'FR_calf',    # 0-2
-    'FL_hip', 'FL_thigh', 'FL_calf',    # 3-5
-    'RR_hip', 'RR_thigh', 'RR_calf',    # 6-8
-    'RL_hip', 'RL_thigh', 'RL_calf',    # 9-11
+    'FR_hip_joint', 'FR_thigh_joint', 'FR_calf_joint',    # 0-2
+    'FL_hip_joint', 'FL_thigh_joint', 'FL_calf_joint',    # 3-5
+    'RR_hip_joint', 'RR_thigh_joint', 'RR_calf_joint',    # 6-8
+    'RL_hip_joint', 'RL_thigh_joint', 'RL_calf_joint',    # 9-11
 ]
 
 

@@ -106,6 +106,42 @@ so output port labels are populated without waiting for `start`.
 
 ---
 
+## Data Rendering in Agent Core Dashboard
+
+The Agent Core Web Dashboard renders live data streams based on the `format` field declared in a tool's `topic_out`. Each format is matched to a specialized renderer:
+
+| Format | Renderer | Description |
+|--------|----------|-------------|
+| `audio/pcm-16k` | Audio waveform | PCM audio visualizer with playback |
+| `video/mjpeg` | Video stream | Motion JPEG video display |
+| `image/jpeg` | Image | Static JPEG image |
+| `image/depth-z16` | Depth colormap | 16-bit depth image with color mapping |
+| `data/json` | Text / KV panel | JSON key-value display |
+| `text/*` | Text | Plain text display |
+| `sensor/skeleton` | 3D Skeleton | URDF-based 3D skeleton with joint rotation |
+| `sensor/lidar*` | Lidar scan | 2D/3D lidar point visualization |
+| `sensor/pointcloud` | Point cloud | 3D point cloud renderer |
+| `sensor/mapping` | 2D Map | Occupancy grid / SLAM map |
+| `sensor/htmsg` | HT message | Custom structured message |
+
+### Skeleton Rendering (`sensor/skeleton`)
+
+For robot state monitoring, declare `"format": "sensor/skeleton"` in `topic_out`. The dashboard will:
+
+1. Call your driver's `model` tool (type: `resource`) to fetch the URDF
+2. Parse the URDF kinematic chain in the browser
+3. Render a 3D skeleton with joint positions from the URDF
+4. Apply real-time joint angles from `sensor/skeleton` topic data
+
+**Requirements for skeleton support:**
+
+- A `model` tool (type `resource`) that returns `{"urdf": "<URDF XML>"}` via MCP
+- A `joints` tool (type `sensor`) with `topic_out` format `sensor/skeleton`
+- Joint data published as `{"joints": [{"idx": 0, "name": "joint_name", "q": angle}, ...]}`
+- **Joint names in data must match URDF joint names exactly** (e.g., `FL_hip_joint` not `FL_hip`)
+
+---
+
 ## Audio Requirements for ASR Compatibility
 
 Any driver that publishes audio for use with the Perception ASR plugin must meet the following requirements. Failure to comply will result in the ASR receiving audio but producing no output (the VAD silently discards non-conforming frames).
