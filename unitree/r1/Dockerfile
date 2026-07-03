@@ -28,8 +28,13 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     ldconfig && \
     rm -rf /var/lib/apt/lists/*
 
+RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
+    apt-get install -y --no-install-recommends --allow-unauthenticated \
+        v4l-utils && \
+    rm -rf /var/lib/apt/lists/*
+
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    pyyaml netifaces numpy
+    pyyaml netifaces numpy opencv-python-headless pyalsaaudio sounddevice
 
 # Build CycloneDDS 0.10.5 from source
 ARG CYCLONEDDS_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/cyclonedds-0.10.5.tar.gz
@@ -57,6 +62,7 @@ COPY resource/ /work/resource/
 COPY main.py   /work/main.py
 COPY device.py /work/device.py
 COPY rpc_proxy.py /work/rpc_proxy.py
+COPY ext_devices.py /work/ext_devices.py
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
 
