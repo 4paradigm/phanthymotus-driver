@@ -352,6 +352,129 @@ New drivers should choose an unoccupied port. The WebSocket port is typically th
 
 ---
 
+## Data Format & Dashboard Rendering
+
+The Agent Core Web Dashboard automatically selects a renderer based on the `format` field declared in `topic_out`. Understanding this mapping is essential when implementing sensor plugins.
+
+### Format → Renderer Mapping
+
+| Format | Renderer | canRender logic |
+|--------|----------|----------------|
+| `audio/*` (e.g. `audio/pcm-16k`) | Audio waveform | `hint.startsWith('audio/')` |
+| `video/*` (e.g. `video/mjpeg`) | Video stream | `hint.startsWith('video/')` |
+| `image/jpeg` | Camera image | `hint === 'image/jpeg'` |
+| `image/depth-z16` | Depth colormap | `hint === 'image/depth-z16'` |
+| `image` | Generic image | `hint === 'image'` |
+| `data/json` | Text / KV panel | `hint === 'data/json'` |
+| `text/*` | Text display | `hint.startsWith('text/')` |
+| `sensor/skeleton` | 3D Skeleton (URDF) | `hint === 'sensor/skeleton'` |
+| `sensor/lidar*` | Lidar scan | `hint.startsWith('sensor/lidar')` |
+| `sensor/pointcloud` | 3D Point cloud | `hint === 'sensor/pointcloud'` |
+| `sensor/mapping` | 2D Occupancy map | `hint === 'sensor/mapping'` |
+| `sensor/htmsg` | HT structured message | `hint === 'sensor/htmsg'` |
+| (no hint) | Activity stream | Fallback when no format specified |
+
+### Skeleton Rendering (`sensor/skeleton`) — Full Spec
+
+The skeleton renderer provides real-time 3D visualization of robot joint states. It supports **any** robot morphology (humanoid, quadruped, etc.) as long as URDF is provided.
+
+#### Required Components
+
+**1. `model` tool (type: `resource`)**
+
+Provides the robot's URDF model to the dashboard. Must return the full URDF XML.
+
+```python
+def _model_tool(self) -> dict:
+    return {
+        "name": "model",
+        "type": "resource",
+        "description": "Robot URDF model for skeleton renderer",
+        "inputSchema": {"type": "object", "properties": {}},
+    }
+
+# In dispatch:
+if tool_name == "model":
+    urdf_path = Path(__file__).parent / "resource" / "my_robot.urdf"
+    return [{"type": "text", "text": json.dumps({"urdf": urdf_path.read_text()})}]
+```
+
+**2. `joints` tool (type: `sensor`)**
+
+Publishes real-time joint state data. Must declare format `sensor/skeleton`.
+
+```python
+def _joints_tool(self) -> dict:
+    return {
+        "name": "joints",
+        "type": "sensor",
+        "multiInstance": False,
+        "description": "Joint states at 10Hz",
+        "inputSchema": {"type": "object", "properties": {}},
+        "topic_out": [{"topic": self._joints_topic, "format": "sensor/skeleton"}],
+    }
+```
+
+**3. Joint data format (published on the topic)**
+
+```json
+{
+  "joints": [
+    {"idx": 0, "name": "FL_hip_joint", "q": 0.123, "dq": 0.45, "tau": 1.2},
+    {"idx": 1, "name": "FL_thigh_joint", "q": -0.5, "dq": 0.0, "tau": 0.8}
+  ],
+  "imu_quat": [1.0, 0.0, 0.0, 0.0]
+}
+```
+
+#### Critical: Joint Name Matching
+
+The renderer matches joint data to URDF joints by name. The matching logic is:
+
+```javascript
+const jointName = j.name || MOTOR_INDEX_MAP[j.idx];
+const obj = this._joints[jointName];
+```
+
+**The `name` field in joint data MUST exactly match the URDF `<joint name="...">` attribute.**
+
+| URDF joint name | Data `name` field | Result |
+|-----------------|-------------------|--------|
+| `FL_hip_joint` | `FL_hip_joint` | Matched |
+| `FL_hip_joint` | `FL_hip` | **NOT matched** |
+| `left_knee_joint` | `left_knee_joint` | Matched |
+
+#### Rendering Fallback Chain
+
+The skeleton renderer has a three-level fallback:
+
+1. **URDF provided** (`data.urdf` exists) → Parse kinematic chain, build accurate 3D model
+2. **Quadruped marker** (`data.type === 'quadruped'`) → Render generic quadruped stick figure
+3. **Neither** → Render humanoid fallback skeleton (G1 proportions)
+
+Always prefer returning full URDF (option 1) for accurate rendering. The humanoid fallback is a last resort and **will show a human figure regardless of your actual robot morphology**.
+
+#### URDF File Placement
+
+Store the URDF file in your driver's `resource/` directory:
+
+```
+drivers/unitree/go2/
+├── resource/
+│   └── go2_model.urdf    ← URDF file here
+├── main.py
+├── device.py
+└── ...
+```
+
+The URDF does not need mesh files (`.dae`/`.stl`) — the renderer only uses the kinematic chain (joint origins, axes, parent-child relationships) to build a stick-figure skeleton.
+
+#### IMU Orientation
+
+If `imu_quat` (quaternion `[w, x, y, z]`) is included in the joint data, the renderer applies it to the root body orientation for real-time tilt visualization.
+
+---
+
 ## Build & Deploy
 
 ```bash
