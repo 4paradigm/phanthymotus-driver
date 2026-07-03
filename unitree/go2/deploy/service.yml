@@ -1,0 +1,20 @@
+unitree-go2:
+  image: __IMAGE__
+  container_name: embodied-unitree-go2
+  network_mode: host
+  ipc: host
+  pid: host
+  privileged: true
+  volumes:
+    - /dev:/dev
+  environment:
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
+    - PYTHONUNBUFFERED=1
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: unless-stopped
