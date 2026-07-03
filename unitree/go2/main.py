@@ -125,7 +125,7 @@ class Go2DeviceBundle:
         print("[bundle] All plugins stopped")
 
     def get_all_tools(self) -> list:
-        tools = []
+        tools = [self._model_tool()]
         for p in self._plugins:
             if hasattr(p, 'get_tools'):
                 tools.extend(p.get_tools())
@@ -133,7 +133,22 @@ class Go2DeviceBundle:
                 tools.append(p.get_tool())
         return tools
 
+    def _model_tool(self) -> dict:
+        return {
+            "name": "model",
+            "type": "resource",
+            "description": "Go2 quadruped robot model descriptor for skeleton renderer",
+            "inputSchema": {"type": "object", "properties": {}},
+        }
+
     def dispatch(self, tool_name: str, args: dict) -> dict | None:
+        if tool_name == "model":
+            return [{"type": "text", "text": json.dumps({
+                "type": "quadruped",
+                "joints": 12,
+                "legs": ["FR", "FL", "RR", "RL"],
+                "joints_per_leg": ["hip", "thigh", "calf"],
+            })}]
         for p in self._plugins:
             plugin_tools = p.get_tools() if hasattr(p, 'get_tools') else [p.get_tool()]
             for tool_def in plugin_tools:
