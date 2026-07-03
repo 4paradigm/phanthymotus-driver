@@ -239,12 +239,17 @@ def make_handler():
 def _start_registration(mcp_port: int, name: str, category: str):
     """Register this driver with agent-core in a background thread, then heartbeat every 30s."""
     import urllib.request as _urllib
-    agent_core_url = os.environ.get("AGENT_CORE_URL", "http://localhost:15678")
+    import ssl as _ssl
+    agent_core_url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
     payload = json.dumps({
         "name": name,
         "url":  f"http://localhost:{mcp_port}/mcp",
         "category": category,
     }).encode()
+    # agent-core uses self-signed cert, skip verification for localhost
+    _ctx = _ssl.create_default_context()
+    _ctx.check_hostname = False
+    _ctx.verify_mode = _ssl.CERT_NONE
     def _run():
         import time as _t
         while True:
@@ -253,7 +258,7 @@ def _start_registration(mcp_port: int, name: str, category: str):
                     f"{agent_core_url}/api/mcp", data=payload,
                     headers={"Content-Type": "application/json"}, method="POST",
                 )
-                with _urllib.urlopen(req, timeout=3):
+                with _urllib.urlopen(req, timeout=3, context=_ctx):
                     pass
                 _t.sleep(30)
             except Exception as e:
