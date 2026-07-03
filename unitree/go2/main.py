@@ -144,9 +144,7 @@ class Go2DeviceBundle:
     def dispatch(self, tool_name: str, args: dict) -> dict | None:
         if tool_name == "model":
             urdf_path = Path(__file__).parent / "resource" / "go2_model.urdf"
-            return [{"type": "text", "text": json.dumps({
-                "urdf": urdf_path.read_text()
-            })}]
+            return {"urdf": urdf_path.read_text()}
         for p in self._plugins:
             plugin_tools = p.get_tools() if hasattr(p, 'get_tools') else [p.get_tool()]
             for tool_def in plugin_tools:
