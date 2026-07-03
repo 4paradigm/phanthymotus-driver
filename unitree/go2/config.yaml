@@ -27,3 +27,7 @@ plugins:
     native_slam_db_path: /opt/phanthy-motus/data/controlled_spatial.db
   asr:
     enabled: true
+  ext_mic:
+    enabled: true
+  ext_camera:
+    enabled: true

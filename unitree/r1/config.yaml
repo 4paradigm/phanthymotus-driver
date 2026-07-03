@@ -18,3 +18,7 @@ plugins:
     enabled: true
   camera:
     enabled: true
+  ext_mic:
+    enabled: true
+  ext_camera:
+    enabled: true

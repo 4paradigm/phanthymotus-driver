@@ -109,6 +109,16 @@ class Go2DeviceBundle:
             self._plugins.append(AsrPlugin(plugins_cfg["asr"], namespace, executor))
             print("[bundle] AsrPlugin loaded")
 
+        if plugins_cfg.get("ext_mic", {}).get("enabled", False):
+            from ext_devices import ExtMicPlugin
+            self._plugins.append(ExtMicPlugin(plugins_cfg["ext_mic"], namespace, executor))
+            print("[bundle] ExtMicPlugin loaded")
+
+        if plugins_cfg.get("ext_camera", {}).get("enabled", False):
+            from ext_devices import ExtCameraPlugin
+            self._plugins.append(ExtCameraPlugin(plugins_cfg["ext_camera"], namespace, executor))
+            print("[bundle] ExtCameraPlugin loaded")
+
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
             try:

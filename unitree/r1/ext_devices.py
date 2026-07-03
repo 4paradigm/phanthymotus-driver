@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-drivers/unitree/g1/ext_devices.py — External mic and camera plugins (multiInstance).
+drivers/unitree/r1/ext_devices.py — External mic and camera plugins (multiInstance).
 
-Enumerates system audio/video devices, excluding built-in G1 mic (UDP multicast)
+Enumerates system audio/video devices, excluding built-in mic
 and RealSense cameras. Each external device can be started as an independent
 tool instance on the canvas.
 """
