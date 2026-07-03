@@ -139,6 +139,7 @@ For robot state monitoring, declare `"format": "sensor/skeleton"` in `topic_out`
 - A `joints` tool (type `sensor`) with `topic_out` format `sensor/skeleton`
 - Joint data published as `{"joints": [{"idx": 0, "name": "joint_name", "q": angle}, ...]}`
 - **Joint names in data must match URDF joint names exactly** (e.g., `FL_hip_joint` not `FL_hip`)
+- **`dispatch()` must return a plain dict** (e.g. `{"urdf": "..."}`) — do NOT return pre-wrapped MCP content arrays (see README_dev.md § "dispatch() Return Value Format")
 
 ---
 

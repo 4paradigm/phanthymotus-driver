@@ -231,6 +231,29 @@ class MyPlugin:
         return None
 ```
 
+### dispatch() Return Value Format (CRITICAL)
+
+**`dispatch()` must return a plain Python dict (or `None`).** The MCP HTTP handler automatically wraps it:
+
+```python
+# Handler does this automatically:
+ok({"content": [{"type": "text", "text": json.dumps(result)}]})
+```
+
+**DO NOT** return pre-wrapped MCP content arrays from dispatch:
+
+```python
+# ❌ WRONG — causes double-wrapping, breaks frontend parsing
+def dispatch(self, action, args):
+    return [{"type": "text", "text": json.dumps({"urdf": data})}]
+
+# ✅ CORRECT — return plain dict, handler wraps it
+def dispatch(self, action, args):
+    return {"urdf": data}
+```
+
+If you return `[{"type": "text", ...}]`, the handler wraps it again into `{"content": [{"type": "text", "text": "[{\"type\":\"text\",...}]"}]}` — the frontend receives double-encoded JSON and fails to parse, falling back to defaults.
+
 - Provide `get_tool()` to return a single tool, or `get_tools()` to return multiple
 - In `dispatch()`, `action` has already been extracted from args; if there is no action field, it equals the tool name
 
