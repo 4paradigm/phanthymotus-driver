@@ -1,0 +1,9 @@
+id: go2-driver
+name: Unitree Go2 Bundle
+category: driver
+hardware_provider: unitree
+hardware_model: "go2"
+image_name: go2
+port: 15703
+mcp_url: "http://localhost:15703/mcp"
+description: "Unitree Go2 — 运动控制 + 避障 + 语音 + 视频 + 导航"
