@@ -22,6 +22,7 @@ def _rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.
     from unitree_sdk2py.go2.vui.vui_client import VuiClient
     from unitree_sdk2py.go2.video.video_client import VideoClient
     from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import MotionSwitcherClient
+    from unitree_sdk2py.a2.audio.audio_client import AudioClient
 
     ChannelFactoryInitialize(0, network_iface)
 
@@ -45,16 +46,21 @@ def _rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.
     motion_switcher.SetTimeout(5.0)
     motion_switcher.Init()
 
+    audio = AudioClient()
+    audio.SetTimeout(10.0)
+    audio.Init()
+
     clients = {
         "sport": sport,
         "obstacles_avoid": obstacles_avoid,
         "vui": vui,
         "video": video,
         "motion_switcher": motion_switcher,
+        "audio": audio,
     }
 
     time.sleep(0.5)
-    print("[RpcWorker] ready (Go2: sport, obstacles_avoid, vui, video, motion_switcher)", flush=True)
+    print("[RpcWorker] ready (Go2: sport, obstacles_avoid, vui, video, motion_switcher, audio)", flush=True)
 
     while True:
         try:
@@ -308,3 +314,11 @@ class RpcProxy:
 
     def MSC_ReleaseMode(self):
         return self._call_tuple("motion_switcher", "ReleaseMode")
+
+    # ── AudioClient interface ─────────────────────────────────────────────────
+
+    def Audio_PlayStream(self, app_name: str, stream_id: str, pcm_data: bytes):
+        return self._call("audio", "PlayStream", app_name, stream_id, pcm_data, timeout=5.0)
+
+    def Audio_PlayStop(self, app_name: str):
+        return self._call_code("audio", "PlayStop", app_name)

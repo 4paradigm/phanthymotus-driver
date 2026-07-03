@@ -63,7 +63,7 @@ class Go2DeviceBundle:
 
         if plugins_cfg.get("speaker", {}).get("enabled", False):
             from device import SpeakerPlugin
-            self._plugins.append(SpeakerPlugin(plugins_cfg["speaker"], namespace, executor))
+            self._plugins.append(SpeakerPlugin(plugins_cfg["speaker"], namespace, executor, rpc_proxy))
             print("[bundle] SpeakerPlugin loaded")
 
         if plugins_cfg.get("vui", {}).get("enabled", False):

@@ -172,11 +172,12 @@ class MicPlugin:
 # ── SpeakerPlugin (actuator) ─────────────────────────────────────────────────
 
 class _SpeakerNode(Node):
-    """Subscribes to ROS2 audio topic and publishes PCM data to DDS AudioData_ for Go2 speaker."""
+    """Subscribes to ROS2 audio topic and streams PCM via AudioClient.PlayStream RPC."""
     MERGE_BYTES = 64000  # merge into ~2s blocks
 
-    def __init__(self):
+    def __init__(self, rpc_proxy):
         super().__init__("go2_speaker")
+        self._rpc_proxy = rpc_proxy
         self._topic: str | None = None
         self._sub    = None
         self.state   = "idle"
@@ -185,19 +186,9 @@ class _SpeakerNode(Node):
         self._drain_thread: threading.Thread | None = None
         self._last_chunk_time = 0.0
         self._flush_timer = None
-        self._dds_pub = None
+        self._stream_id = "phanthy_stream"
 
-        try:
-            from unitree_sdk2py.core.channel import ChannelPublisher
-            from unitree_sdk2py.idl.unitree_go.msg.dds_ import AudioData_
-            self._AudioData_ = AudioData_
-            self._dds_pub = ChannelPublisher("rt/audio_play", AudioData_)
-            self._dds_pub.Init()
-            self.get_logger().info("SpeakerNode: DDS publisher rt/audio_play ready")
-        except Exception as e:
-            self.get_logger().warn(f"SpeakerNode: DDS publisher init failed: {e}")
-
-        self.get_logger().info("SpeakerNode ready")
+        self.get_logger().info("SpeakerNode ready (RPC mode)")
 
     def start_play(self, topic: str) -> str:
         if self._sub is not None:
@@ -229,6 +220,7 @@ class _SpeakerNode(Node):
                 self._buf.get_nowait()
             except queue.Empty:
                 break
+        self._rpc_proxy.Audio_PlayStop("phanthy")
         self.state = "idle"
 
     def _on_chunk(self, msg: AudioChunk) -> None:
@@ -280,17 +272,11 @@ class _SpeakerNode(Node):
         self._draining.clear()
 
     def _play_merged(self, pcm: bytes) -> None:
-        if self._dds_pub is None:
-            return
         duration = len(pcm) / 32000  # seconds (16kHz, 16-bit mono)
         try:
-            msg = self._AudioData_(
-                time_frame=int(time.time() * 1000),
-                data=list(pcm),
-            )
-            self._dds_pub.Write(msg)
+            self._rpc_proxy.Audio_PlayStream("phanthy", self._stream_id, pcm)
         except Exception as e:
-            self.get_logger().error(f"[speaker] DDS publish error: {e}")
+            self.get_logger().error(f"[speaker] RPC PlayStream error: {e}")
         # Pace playback
         if duration > 0:
             time.sleep(duration * 0.9)
@@ -299,8 +285,9 @@ class _SpeakerNode(Node):
 class SpeakerPlugin:
     PREFIX = "speaker"
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
-        self._node = _SpeakerNode()
+    def __init__(self, plugin_config: dict, namespace: str, executor, rpc_proxy):
+        self._rpc_proxy = rpc_proxy
+        self._node = _SpeakerNode(rpc_proxy)
         executor.add_node(self._node)
 
     def get_tool(self) -> dict:
@@ -308,7 +295,7 @@ class SpeakerPlugin:
             "name": "speaker",
             "type": "actuator",
             "multiInstance": False,
-            "description": "Go2 speaker — subscribes to ROS2 topic and streams PCM-16k audio to robot speaker via DDS",
+            "description": "Go2 speaker — subscribes to ROS2 topic and streams PCM-16k audio to robot speaker via RPC",
             "inputSchema": {
                 "type": "object",
                 "properties": {
