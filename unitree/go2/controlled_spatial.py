@@ -56,7 +56,19 @@ def _slam_rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiproces
                      network_iface: str):
     """Subprocess: holds a dedicated SlamClient, processes RPC commands."""
     from unitree_sdk2py.core.channel import ChannelFactoryInitialize
-    from unitree_sdk2py.g1.slam.slam_client import SlamClient
+    try:
+        from unitree_sdk2py.g1.slam.slam_client import SlamClient
+    except ImportError:
+        print("[SlamRpcWorker] SlamClient not available in SDK, worker disabled", flush=True)
+        while True:
+            try:
+                cmd = cmd_queue.get()
+            except Exception:
+                return
+            if cmd is None:
+                return
+            result_queue.put({"code": -1, "resp": "SlamClient not available in this SDK build"})
+        return
 
     ChannelFactoryInitialize(0, network_iface)
     client = SlamClient()
