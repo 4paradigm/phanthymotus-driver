@@ -50,6 +50,22 @@ def _rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.
     audio.SetTimeout(10.0)
     audio.Init()
 
+    # AudioHub megaphone publisher (in subprocess to avoid GIL issues in main process)
+    from unitree_sdk2py.idl.unitree_api.msg.dds_ import (
+        Request_, RequestHeader_, RequestIdentity_, RequestLease_, RequestPolicy_,
+    )
+    audiohub_pub = ChannelPublisher("rt/api/audiohub/request", Request_)
+    audiohub_pub.Init()
+
+    def _audiohub_send(api_id, parameter_dict):
+        import json as _json
+        identity = RequestIdentity_(id=int(time.time() * 1000) % 2147483648, api_id=api_id)
+        lease = RequestLease_(id=0)
+        policy = RequestPolicy_(priority=0, noreply=False)
+        header = RequestHeader_(identity=identity, lease=lease, policy=policy)
+        req = Request_(header=header, parameter=_json.dumps(parameter_dict), binary=[])
+        audiohub_pub.Write(req)
+
     clients = {
         "sport": sport,
         "obstacles_avoid": obstacles_avoid,
@@ -60,7 +76,7 @@ def _rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.
     }
 
     time.sleep(0.5)
-    print("[RpcWorker] ready (Go2: sport, obstacles_avoid, vui, video, motion_switcher, audio)", flush=True)
+    print("[RpcWorker] ready (Go2: sport, obstacles_avoid, vui, video, motion_switcher, audio, audiohub)", flush=True)
 
     while True:
         try:
@@ -76,6 +92,32 @@ def _rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.
         kwargs = cmd.get("kwargs", {})
 
         try:
+            # Special handling for audiohub commands
+            if client_name == "audiohub":
+                api_id = args[0] if args else kwargs.get("api_id", 0)
+                param = args[1] if len(args) > 1 else kwargs.get("param", {})
+                if api_id == 4003 and isinstance(param, bytes):
+                    # Megaphone upload: param is raw WAV data, handle chunking here
+                    import base64 as _b64
+                    wav_data = param
+                    b64_data = _b64.b64encode(wav_data).decode('utf-8')
+                    chunk_size = 4096
+                    chunks = [b64_data[i:i+chunk_size] for i in range(0, len(b64_data), chunk_size)]
+                    total = len(chunks)
+                    for i, chunk in enumerate(chunks, 1):
+                        _audiohub_send(4003, {
+                            "current_block_size": len(chunk),
+                            "block_content": chunk,
+                            "current_block_index": i,
+                            "total_block_number": total,
+                        })
+                        time.sleep(0.01)
+                    result_queue.put({"result": 0})
+                else:
+                    _audiohub_send(api_id, param)
+                    result_queue.put({"result": 0})
+                continue
+
             client = clients.get(client_name)
             if client is None:
                 result_queue.put({"error": f"unknown client: {client_name}"})
@@ -322,3 +364,11 @@ class RpcProxy:
 
     def Audio_PlayStop(self, app_name: str):
         return self._call_code("audio", "PlayStop", app_name)
+
+    # ── AudioHub interface (megaphone) ────────────────────────────────────────
+
+    def AudioHub_Send(self, api_id: int, param):
+        """Send an audiohub command via DDS Request_ in the subprocess.
+        For api_id=4003, param can be raw WAV bytes (subprocess handles chunking).
+        """
+        return self._call("audiohub", "_", api_id, param, timeout=10.0)

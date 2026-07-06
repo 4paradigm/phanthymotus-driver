@@ -172,11 +172,12 @@ class MicPlugin:
 # ── SpeakerPlugin (actuator) ─────────────────────────────────────────────────
 
 class _SpeakerNode(Node):
-    """Subscribes to ROS2 audio topic and plays via AudioHub megaphone mode (DDS Request_ IDL)."""
+    """Subscribes to ROS2 audio topic and plays via AudioHub megaphone mode (via RpcProxy subprocess)."""
     MERGE_BYTES = 64000  # merge into ~2s blocks
 
-    def __init__(self):
+    def __init__(self, rpc_proxy):
         super().__init__("go2_speaker")
+        self._rpc_proxy = rpc_proxy
         self._topic: str | None = None
         self._sub    = None
         self.state   = "idle"
@@ -185,41 +186,12 @@ class _SpeakerNode(Node):
         self._drain_thread: threading.Thread | None = None
         self._last_chunk_time = 0.0
         self._flush_timer = None
-        self._audiohub_pub = None
         self._megaphone_active = False
 
-        try:
-            from unitree_sdk2py.core.channel import ChannelPublisher
-            from unitree_sdk2py.idl.unitree_api.msg.dds_ import (
-                Request_, RequestHeader_, RequestIdentity_, RequestLease_, RequestPolicy_,
-            )
-            self._Request_ = Request_
-            self._RequestHeader_ = RequestHeader_
-            self._RequestIdentity_ = RequestIdentity_
-            self._RequestLease_ = RequestLease_
-            self._RequestPolicy_ = RequestPolicy_
-            self._audiohub_pub = ChannelPublisher("rt/api/audiohub/request", Request_)
-            self._audiohub_pub.Init()
-            self.get_logger().info("SpeakerNode: AudioHub publisher ready")
-        except Exception as e:
-            self.get_logger().warn(f"SpeakerNode: AudioHub publisher init failed: {e}")
-
-        self.get_logger().info("SpeakerNode ready (megaphone mode)")
+        self.get_logger().info("SpeakerNode ready (megaphone via RpcProxy)")
 
     def _send_audiohub_cmd(self, api_id: int, parameter: dict) -> None:
-        if self._audiohub_pub is None:
-            return
-        import json as _json
-        identity = self._RequestIdentity_(
-            id=int(time.time() * 1000) % 2147483648, api_id=api_id,
-        )
-        lease = self._RequestLease_(id=0)
-        policy = self._RequestPolicy_(priority=0, noreply=False)
-        header = self._RequestHeader_(identity=identity, lease=lease, policy=policy)
-        req = self._Request_(
-            header=header, parameter=_json.dumps(parameter), binary=[],
-        )
-        self._audiohub_pub.Write(req)
+        self._rpc_proxy.AudioHub_Send(api_id, parameter)
 
     def _enter_megaphone(self) -> None:
         if not self._megaphone_active:
@@ -315,8 +287,8 @@ class _SpeakerNode(Node):
         self._draining.clear()
 
     def _play_merged(self, pcm: bytes) -> None:
-        """Wrap PCM-16k in WAV and upload via megaphone (api_id 4003)."""
-        import io, wave, base64
+        """Wrap PCM-16k in WAV and send to RpcProxy for megaphone upload."""
+        import io, wave
         duration = len(pcm) / 32000  # seconds (16kHz, 16-bit mono)
 
         # Wrap PCM in WAV container at 16kHz
@@ -328,21 +300,9 @@ class _SpeakerNode(Node):
             wf.writeframes(pcm)
         wav_data = buf.getvalue()
 
-        # Base64 encode and chunk
-        b64_data = base64.b64encode(wav_data).decode('utf-8')
-        chunk_size = 4096
-        chunks = [b64_data[i:i+chunk_size] for i in range(0, len(b64_data), chunk_size)]
-        total = len(chunks)
-
         try:
-            for i, chunk in enumerate(chunks, 1):
-                self._send_audiohub_cmd(4003, {
-                    "current_block_size": len(chunk),
-                    "block_content": chunk,
-                    "current_block_index": i,
-                    "total_block_number": total,
-                })
-                time.sleep(0.01)
+            # Send WAV bytes to subprocess; it handles base64 chunking + DDS publish
+            self._rpc_proxy.AudioHub_Send(4003, wav_data)
         except Exception as e:
             self.get_logger().error(f"[speaker] megaphone upload error: {e}")
 
@@ -354,8 +314,8 @@ class _SpeakerNode(Node):
 class SpeakerPlugin:
     PREFIX = "speaker"
 
-    def __init__(self, plugin_config: dict, namespace: str, executor, rpc_proxy=None):
-        self._node = _SpeakerNode()
+    def __init__(self, plugin_config: dict, namespace: str, executor, rpc_proxy):
+        self._node = _SpeakerNode(rpc_proxy)
         executor.add_node(self._node)
 
     def get_tool(self) -> dict:
