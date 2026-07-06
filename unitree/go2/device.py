@@ -300,25 +300,20 @@ class _SpeakerNode(Node):
 
     def _play_merged(self, pcm: bytes) -> None:
         """Resample PCM-16k to 44.1kHz WAV and send via megaphone."""
-        import io, wave, struct
+        import io, wave
+        import numpy as np
 
         duration = len(pcm) / 32000  # original duration (16kHz, 16-bit mono)
 
-        # Resample 16kHz → 44100Hz (linear interpolation)
-        n_in = len(pcm) // 2
-        samples_in = struct.unpack(f'<{n_in}h', pcm)
+        # Resample 16kHz → 44100Hz (linear interpolation via numpy)
+        samples_in = np.frombuffer(pcm, dtype=np.int16)
+        n_in = len(samples_in)
         ratio = 44100.0 / 16000.0
         n_out = int(n_in * ratio)
-        samples_out = bytearray(n_out * 2)
-        for i in range(n_out):
-            src = i / ratio
-            idx = int(src)
-            frac = src - idx
-            if idx + 1 < n_in:
-                sample = int(samples_in[idx] * (1.0 - frac) + samples_in[idx + 1] * frac)
-            else:
-                sample = samples_in[-1]
-            struct.pack_into('<h', samples_out, i * 2, max(-32768, min(32767, sample)))
+        x_old = np.linspace(0, n_in - 1, n_in)
+        x_new = np.linspace(0, n_in - 1, n_out)
+        samples_out = np.interp(x_new, x_old, samples_in.astype(np.float64))
+        samples_out = np.clip(samples_out, -32768, 32767).astype(np.int16)
 
         # Wrap in WAV at 44100Hz
         buf = io.BytesIO()
@@ -326,7 +321,7 @@ class _SpeakerNode(Node):
             wf.setnchannels(1)
             wf.setsampwidth(2)
             wf.setframerate(44100)
-            wf.writeframes(bytes(samples_out))
+            wf.writeframes(samples_out.tobytes())
         wav_data = buf.getvalue()
 
         t0 = time.monotonic()
@@ -335,8 +330,9 @@ class _SpeakerNode(Node):
         except Exception as e:
             self.get_logger().error(f"[speaker] megaphone upload error: {e}")
         # Wait for playback to finish before sending next block
+        # Add 0.3s buffer for robot to process chunks and start playback
         elapsed = time.monotonic() - t0
-        remaining = duration - elapsed
+        remaining = duration + 0.3 - elapsed
         if remaining > 0:
             time.sleep(remaining)
 
