@@ -1,0 +1,33 @@
+mcp_port: 15703
+ros_namespace: ""   # 留空则自动使用 hostname
+name: "Unitree Go2"
+
+plugins:
+  mic:
+    enabled: true
+  speaker:
+    enabled: true
+  vui:
+    enabled: true
+  loco:
+    enabled: true
+  obstacles_avoid:
+    enabled: true
+  camera:
+    enabled: true
+    stream_addr: "230.1.1.1"
+    stream_port: 1720
+  state:
+    enabled: true
+  motion_switcher:
+    enabled: true
+  controlled_spatial:
+    enabled: true
+    native_slam_pcd_dir: /home/unitree
+    native_slam_db_path: /opt/phanthy-motus/data/controlled_spatial.db
+  asr:
+    enabled: true
+  ext_mic:
+    enabled: true
+  ext_camera:
+    enabled: true
