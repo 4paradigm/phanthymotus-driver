@@ -240,7 +240,7 @@ def make_handler():
 def _start_registration(mcp_port: int, name: str, category: str):
     """Register this driver with agent-core in a background thread, then heartbeat every 30s."""
     import urllib.request as _urllib
-    agent_core_url = os.environ.get("AGENT_CORE_URL", "http://localhost:15678")
+    agent_core_url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
     payload = json.dumps({
         "name": name,
         "url":  f"http://localhost:{mcp_port}/mcp",
