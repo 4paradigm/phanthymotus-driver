@@ -172,12 +172,11 @@ class MicPlugin:
 # ── SpeakerPlugin (actuator) ─────────────────────────────────────────────────
 
 class _SpeakerNode(Node):
-    """Subscribes to ROS2 audio topic and streams PCM via AudioClient.PlayStream RPC."""
+    """Subscribes to ROS2 audio topic and plays via AudioHub megaphone mode."""
     MERGE_BYTES = 64000  # merge into ~2s blocks
 
-    def __init__(self, rpc_proxy):
+    def __init__(self):
         super().__init__("go2_speaker")
-        self._rpc_proxy = rpc_proxy
         self._topic: str | None = None
         self._sub    = None
         self.state   = "idle"
@@ -186,15 +185,48 @@ class _SpeakerNode(Node):
         self._drain_thread: threading.Thread | None = None
         self._last_chunk_time = 0.0
         self._flush_timer = None
-        self._stream_id = "phanthy_stream"
+        self._audiohub_pub = None
+        self._megaphone_active = False
 
-        self.get_logger().info("SpeakerNode ready (RPC mode)")
+        try:
+            from unitree_sdk2py.core.channel import ChannelPublisher
+            from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
+            self._String_ = String_
+            self._audiohub_pub = ChannelPublisher("rt/api/audiohub/request", String_)
+            self._audiohub_pub.Init()
+            self.get_logger().info("SpeakerNode: AudioHub publisher ready")
+        except Exception as e:
+            self.get_logger().warn(f"SpeakerNode: AudioHub publisher init failed: {e}")
+
+        self.get_logger().info("SpeakerNode ready (megaphone mode)")
+
+    def _send_audiohub_cmd(self, api_id: int, parameter: dict) -> None:
+        if self._audiohub_pub is None:
+            return
+        import json as _json
+        msg = self._String_(data=_json.dumps({
+            "api_id": api_id,
+            "parameter": _json.dumps(parameter),
+        }))
+        self._audiohub_pub.Write(msg)
+
+    def _enter_megaphone(self) -> None:
+        if not self._megaphone_active:
+            self._send_audiohub_cmd(4001, {})
+            self._megaphone_active = True
+            time.sleep(0.3)
+
+    def _exit_megaphone(self) -> None:
+        if self._megaphone_active:
+            self._send_audiohub_cmd(4002, {})
+            self._megaphone_active = False
 
     def start_play(self, topic: str) -> str:
         if self._sub is not None:
             if self._topic == topic:
                 return self._topic
             self.stop_play()
+        self._enter_megaphone()
         self._topic = topic
         self._sub = self.create_subscription(
             AudioChunk, topic, self._on_chunk, _LOW_LAT_QOS,
@@ -220,7 +252,7 @@ class _SpeakerNode(Node):
                 self._buf.get_nowait()
             except queue.Empty:
                 break
-        self._rpc_proxy.Audio_PlayStop("phanthy")
+        self._exit_megaphone()
         self.state = "idle"
 
     def _on_chunk(self, msg: AudioChunk) -> None:
@@ -272,22 +304,47 @@ class _SpeakerNode(Node):
         self._draining.clear()
 
     def _play_merged(self, pcm: bytes) -> None:
+        """Convert PCM to WAV and upload via megaphone (api_id 4003)."""
+        import io, wave, base64
         duration = len(pcm) / 32000  # seconds (16kHz, 16-bit mono)
+
+        # Wrap PCM in WAV container
+        buf = io.BytesIO()
+        with wave.open(buf, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(pcm)
+        wav_data = buf.getvalue()
+
+        # Base64 encode and chunk
+        b64_data = base64.b64encode(wav_data).decode('utf-8')
+        chunk_size = 4096
+        chunks = [b64_data[i:i+chunk_size] for i in range(0, len(b64_data), chunk_size)]
+        total = len(chunks)
+
         try:
-            self._rpc_proxy.Audio_PlayStream("phanthy", self._stream_id, pcm)
+            for i, chunk in enumerate(chunks, 1):
+                self._send_audiohub_cmd(4003, {
+                    "current_block_size": len(chunk),
+                    "block_content": chunk,
+                    "current_block_index": i,
+                    "total_block_number": total,
+                })
+                time.sleep(0.01)
         except Exception as e:
-            self.get_logger().error(f"[speaker] RPC PlayStream error: {e}")
+            self.get_logger().error(f"[speaker] megaphone upload error: {e}")
+
         # Pace playback
         if duration > 0:
-            time.sleep(duration * 0.9)
+            time.sleep(duration * 0.8)
 
 
 class SpeakerPlugin:
     PREFIX = "speaker"
 
-    def __init__(self, plugin_config: dict, namespace: str, executor, rpc_proxy):
-        self._rpc_proxy = rpc_proxy
-        self._node = _SpeakerNode(rpc_proxy)
+    def __init__(self, plugin_config: dict, namespace: str, executor, rpc_proxy=None):
+        self._node = _SpeakerNode()
         executor.add_node(self._node)
 
     def get_tool(self) -> dict:
@@ -295,7 +352,7 @@ class SpeakerPlugin:
             "name": "speaker",
             "type": "actuator",
             "multiInstance": False,
-            "description": "Go2 speaker — subscribes to ROS2 topic and streams PCM-16k audio to robot speaker via RPC",
+            "description": "Go2 speaker — subscribes to ROS2 topic and streams PCM-16k audio to robot speaker via AudioHub megaphone",
             "inputSchema": {
                 "type": "object",
                 "properties": {
