@@ -172,7 +172,7 @@ class MicPlugin:
 # ── SpeakerPlugin (actuator) ─────────────────────────────────────────────────
 
 class _SpeakerNode(Node):
-    """Subscribes to ROS2 audio topic and plays via AudioHub megaphone mode."""
+    """Subscribes to ROS2 audio topic and plays via AudioHub megaphone mode (DDS Request_ IDL)."""
     MERGE_BYTES = 64000  # merge into ~2s blocks
 
     def __init__(self):
@@ -190,9 +190,15 @@ class _SpeakerNode(Node):
 
         try:
             from unitree_sdk2py.core.channel import ChannelPublisher
-            from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
-            self._String_ = String_
-            self._audiohub_pub = ChannelPublisher("rt/api/audiohub/request", String_)
+            from unitree_sdk2py.idl.unitree_api.msg.dds_ import (
+                Request_, RequestHeader_, RequestIdentity_, RequestLease_, RequestPolicy_,
+            )
+            self._Request_ = Request_
+            self._RequestHeader_ = RequestHeader_
+            self._RequestIdentity_ = RequestIdentity_
+            self._RequestLease_ = RequestLease_
+            self._RequestPolicy_ = RequestPolicy_
+            self._audiohub_pub = ChannelPublisher("rt/api/audiohub/request", Request_)
             self._audiohub_pub.Init()
             self.get_logger().info("SpeakerNode: AudioHub publisher ready")
         except Exception as e:
@@ -204,11 +210,16 @@ class _SpeakerNode(Node):
         if self._audiohub_pub is None:
             return
         import json as _json
-        msg = self._String_(data=_json.dumps({
-            "api_id": api_id,
-            "parameter": _json.dumps(parameter),
-        }))
-        self._audiohub_pub.Write(msg)
+        identity = self._RequestIdentity_(
+            id=int(time.time() * 1000) % 2147483648, api_id=api_id,
+        )
+        lease = self._RequestLease_(id=0)
+        policy = self._RequestPolicy_(priority=0, noreply=False)
+        header = self._RequestHeader_(identity=identity, lease=lease, policy=policy)
+        req = self._Request_(
+            header=header, parameter=_json.dumps(parameter), binary=[],
+        )
+        self._audiohub_pub.Write(req)
 
     def _enter_megaphone(self) -> None:
         if not self._megaphone_active:
@@ -304,11 +315,11 @@ class _SpeakerNode(Node):
         self._draining.clear()
 
     def _play_merged(self, pcm: bytes) -> None:
-        """Convert PCM to WAV and upload via megaphone (api_id 4003)."""
+        """Wrap PCM-16k in WAV and upload via megaphone (api_id 4003)."""
         import io, wave, base64
         duration = len(pcm) / 32000  # seconds (16kHz, 16-bit mono)
 
-        # Wrap PCM in WAV container
+        # Wrap PCM in WAV container at 16kHz
         buf = io.BytesIO()
         with wave.open(buf, 'wb') as wf:
             wf.setnchannels(1)
