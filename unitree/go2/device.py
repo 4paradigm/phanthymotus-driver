@@ -171,9 +171,13 @@ class MicPlugin:
 
 # ── SpeakerPlugin (actuator) ─────────────────────────────────────────────────
 
+APP_NAME = "go2_speaker"
+
+
 class _SpeakerNode(Node):
-    """Subscribes to ROS2 audio topic and plays via AudioHub megaphone mode (via RpcProxy subprocess)."""
-    MERGE_BYTES = 64000  # merge into ~2s blocks
+    """Subscribes to ROS2 audio topic and plays via AudioHub megaphone mode."""
+    PREFILL = 3           # start drain after 3 chunks (~300ms) to minimise latency
+    MERGE_BYTES = 64000   # merge into ~2s blocks at 16kHz before resampling + upload
 
     def __init__(self, rpc_proxy):
         super().__init__("go2_speaker")
@@ -190,18 +194,15 @@ class _SpeakerNode(Node):
 
         self.get_logger().info("SpeakerNode ready (megaphone via RpcProxy)")
 
-    def _send_audiohub_cmd(self, api_id: int, parameter: dict) -> None:
-        self._rpc_proxy.AudioHub_Send(api_id, parameter)
-
     def _enter_megaphone(self) -> None:
         if not self._megaphone_active:
-            self._send_audiohub_cmd(4001, {})
+            self._rpc_proxy.AudioHub_Send(4001, {})
             self._megaphone_active = True
             time.sleep(0.3)
 
     def _exit_megaphone(self) -> None:
         if self._megaphone_active:
-            self._send_audiohub_cmd(4002, {})
+            self._rpc_proxy.AudioHub_Send(4002, {})
             self._megaphone_active = False
 
     def start_play(self, topic: str) -> str:
@@ -242,10 +243,10 @@ class _SpeakerNode(Node):
         pcm = bytes(msg.data)
         self._buf.put(pcm)
         self._last_chunk_time = time.monotonic()
-        if not self._draining.is_set() and self._buf.qsize() >= 20:
+        if not self._draining.is_set() and self._buf.qsize() >= self.PREFILL:
             self._start_drain()
         elif not self._draining.is_set() and self._flush_timer is None:
-            self._flush_timer = self.create_timer(0.5, self._check_flush)
+            self._flush_timer = self.create_timer(0.3, self._check_flush)
 
     def _start_drain(self) -> None:
         if self._flush_timer is not None:
@@ -257,27 +258,38 @@ class _SpeakerNode(Node):
         self._drain_thread.start()
 
     def _check_flush(self) -> None:
-        if self._flush_timer is not None:
-            self._flush_timer.cancel()
-            self.destroy_timer(self._flush_timer)
-            self._flush_timer = None
         if not self._draining.is_set() and not self._buf.empty():
             idle = time.monotonic() - self._last_chunk_time
             if idle >= 0.3:
+                if self._flush_timer is not None:
+                    self._flush_timer.cancel()
+                    self.destroy_timer(self._flush_timer)
+                    self._flush_timer = None
                 self._start_drain()
+                return
+        if self._buf.empty() or self._draining.is_set():
+            if self._flush_timer is not None:
+                self._flush_timer.cancel()
+                self.destroy_timer(self._flush_timer)
+                self._flush_timer = None
 
     def _drain(self) -> None:
         merged = b''
+        consecutive_empty = 0
         while self._draining.is_set():
             try:
-                pcm = self._buf.get(timeout=0.3)
+                pcm = self._buf.get(timeout=0.15)
                 merged += pcm
+                consecutive_empty = 0
             except queue.Empty:
                 if merged:
                     self._play_merged(merged)
                     merged = b''
+                    consecutive_empty = 0
                 else:
-                    break
+                    consecutive_empty += 1
+                    if consecutive_empty >= 7:
+                        break
                 continue
             if len(merged) >= self.MERGE_BYTES:
                 self._play_merged(merged)
@@ -287,28 +299,46 @@ class _SpeakerNode(Node):
         self._draining.clear()
 
     def _play_merged(self, pcm: bytes) -> None:
-        """Wrap PCM-16k in WAV and send to RpcProxy for megaphone upload."""
-        import io, wave
-        duration = len(pcm) / 32000  # seconds (16kHz, 16-bit mono)
+        """Resample PCM-16k to 44.1kHz WAV and send via megaphone."""
+        import io, wave, struct
 
-        # Wrap PCM in WAV container at 16kHz
+        duration = len(pcm) / 32000  # original duration (16kHz, 16-bit mono)
+
+        # Resample 16kHz → 44100Hz (linear interpolation)
+        n_in = len(pcm) // 2
+        samples_in = struct.unpack(f'<{n_in}h', pcm)
+        ratio = 44100.0 / 16000.0
+        n_out = int(n_in * ratio)
+        samples_out = bytearray(n_out * 2)
+        for i in range(n_out):
+            src = i / ratio
+            idx = int(src)
+            frac = src - idx
+            if idx + 1 < n_in:
+                sample = int(samples_in[idx] * (1.0 - frac) + samples_in[idx + 1] * frac)
+            else:
+                sample = samples_in[-1]
+            struct.pack_into('<h', samples_out, i * 2, max(-32768, min(32767, sample)))
+
+        # Wrap in WAV at 44100Hz
         buf = io.BytesIO()
         with wave.open(buf, 'wb') as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
-            wf.setframerate(16000)
-            wf.writeframes(pcm)
+            wf.setframerate(44100)
+            wf.writeframes(bytes(samples_out))
         wav_data = buf.getvalue()
 
+        t0 = time.monotonic()
         try:
-            # Send WAV bytes to subprocess; it handles base64 chunking + DDS publish
             self._rpc_proxy.AudioHub_Send(4003, wav_data)
         except Exception as e:
             self.get_logger().error(f"[speaker] megaphone upload error: {e}")
-
-        # Pace playback
-        if duration > 0:
-            time.sleep(duration * 0.8)
+        # Wait for playback to finish before sending next block
+        elapsed = time.monotonic() - t0
+        remaining = duration - elapsed
+        if remaining > 0:
+            time.sleep(remaining)
 
 
 class SpeakerPlugin:
