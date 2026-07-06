@@ -135,6 +135,15 @@ class G1DeviceBundle:
             self._plugins.append(MotionSwitcherPlugin(plugins_cfg["motion_switcher"], namespace, executor, msc_client))
             print("[bundle] MotionSwitcherPlugin loaded")
 
+        if plugins_cfg.get("ext_mic", {}).get("enabled", False):
+            from ext_devices import ExtMicPlugin
+            self._plugins.append(ExtMicPlugin(plugins_cfg["ext_mic"], namespace, executor))
+            print("[bundle] ExtMicPlugin loaded")
+
+        if plugins_cfg.get("ext_camera", {}).get("enabled", False):
+            from ext_devices import ExtCameraPlugin
+            self._plugins.append(ExtCameraPlugin(plugins_cfg["ext_camera"], namespace, executor))
+            print("[bundle] ExtCameraPlugin loaded")
 
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
