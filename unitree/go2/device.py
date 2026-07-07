@@ -229,24 +229,24 @@ def _speaker_worker(pcm_queue: multiprocessing.Queue, network_iface: str):
     time.sleep(0.3)
     print("[SpeakerWorker] ready, megaphone active", flush=True)
 
+    # Pre-generate a short silence WAV to stop looping after audio ends
+    _silence_wav = _pcm_to_wav(b'\x00' * 320)  # 10ms silence at 16kHz/16bit/mono
+
     merge_bytes = int(16000 * 2 * _SPEAKER_MERGE_MS / 1000)  # bytes for MERGE_MS at 16kHz/16bit/mono
     merged = b''
-    megaphone_active = True
 
     while True:
         try:
             item = pcm_queue.get(timeout=0.2)
         except Exception:
-            # Timeout — flush any accumulated audio then exit megaphone to stop looping
+            # Timeout — flush any accumulated audio, then send silence to stop looping
             if merged:
                 duration = len(merged) / 32000
                 wav = _pcm_to_wav(merged)
                 _send_wav(wav)
                 merged = b''
                 time.sleep(duration)
-            if megaphone_active:
-                _send(4002, {})
-                megaphone_active = False
+            _send_wav(_silence_wav)
             continue
 
         if item is None:
@@ -256,13 +256,8 @@ def _speaker_worker(pcm_queue: multiprocessing.Queue, network_iface: str):
                 wav = _pcm_to_wav(merged)
                 _send_wav(wav)
                 time.sleep(duration)
+            _send_wav(_silence_wav)
             break
-
-        # Re-enter megaphone if we exited due to silence
-        if not megaphone_active:
-            _send(4001, {})
-            time.sleep(0.1)
-            megaphone_active = True
 
         merged += item
         if len(merged) >= merge_bytes:
