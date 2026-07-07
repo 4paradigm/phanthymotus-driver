@@ -271,11 +271,7 @@ def _start_registration(mcp_port: int, name: str, category: str):
 def main():
     global _bundle
 
-    if len(sys.argv) < 2:
-        print(f"Usage: python3 {sys.argv[0]} <networkInterface>")
-        sys.exit(1)
-
-    network_iface = sys.argv[1]
+    network_iface = sys.argv[1] if len(sys.argv) >= 2 else ""
     cfg           = _load_config()
     namespace     = _resolve_namespace(cfg)
     mcp_port      = int(cfg.get("mcp_port", 15702))
