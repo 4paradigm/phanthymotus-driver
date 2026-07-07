@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # build.sh — 构建硬件驱动镜像并推送到镜像仓库
 #
-# 用法：bash build.sh [--mirror tuna|tencent|none] [driver_dir...]
+# 用法：bash build.sh [--mirror tuna|tencent|none] [--no-cache] [driver_dir...]
 #   不传参数时显示交互式多选框
 #   直接传目录名时跳过选择（CI 用）
 #
@@ -18,12 +18,14 @@ if [ -f "${ENV_FILE}" ]; then
     source "${ENV_FILE}"
 fi
 
-# ── 解析 --mirror 参数 ────────────────────────────────────────────────────
+# ── 解析参数 ──────────────────────────────────────────────────────────────
 MIRROR="${MIRROR:-}"
+NO_CACHE=""
 REMAINING_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --mirror) MIRROR="$2"; shift 2 ;;
+        --no-cache) NO_CACHE="--no-cache"; shift ;;
         *) REMAINING_ARGS+=("$1"); shift ;;
     esac
 done
@@ -273,6 +275,7 @@ for idx in "${SELECTED_INDICES[@]}"; do
     docker buildx build \
         --builder default \
         --platform linux/arm64 \
+        ${NO_CACHE} \
         --build-arg "PYPI_MIRROR=${PYPI_MIRROR}" \
         --file "${dir}Dockerfile" \
         --tag "${FULL_IMAGE}" \

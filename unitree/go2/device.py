@@ -22,6 +22,7 @@ drivers/unitree/go2/device.py — Unitree Go2 四足机器狗设备插件。
 """
 
 import json
+import multiprocessing
 import queue
 import socket
 import struct
@@ -171,123 +172,166 @@ class MicPlugin:
 
 # ── SpeakerPlugin (actuator) ─────────────────────────────────────────────────
 
+APP_NAME = "go2_speaker"
+_SPEAKER_MERGE_MS = 2000  # flush timeout: send after 2s of silence
+
+
+def _speaker_worker(pcm_queue: multiprocessing.Queue, network_iface: str):
+    """Subprocess: accumulates PCM-16k, sends as single WAV via AudioHub megaphone on stream end."""
+    import base64
+    import io
+    import wave
+    import numpy as np
+    from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelPublisher
+    from unitree_sdk2py.idl.unitree_api.msg.dds_ import (
+        Request_, RequestHeader_, RequestIdentity_, RequestLease_, RequestPolicy_,
+    )
+
+    ChannelFactoryInitialize(0, network_iface)
+    pub = ChannelPublisher("rt/api/audiohub/request", Request_)
+    pub.Init()
+    time.sleep(0.3)
+
+    def _send(api_id, parameter_dict):
+        import json as _json
+        identity = RequestIdentity_(id=int(time.time() * 1000) % 2147483648, api_id=api_id)
+        lease = RequestLease_(id=0)
+        policy = RequestPolicy_(priority=0, noreply=False)
+        header = RequestHeader_(identity=identity, lease=lease, policy=policy)
+        req = Request_(header=header, parameter=_json.dumps(parameter_dict), binary=[])
+        pub.Write(req)
+
+    def _send_wav(wav_data: bytes):
+        b64_data = base64.b64encode(wav_data).decode('utf-8')
+        chunk_size = 4096
+        chunks = [b64_data[i:i+chunk_size] for i in range(0, len(b64_data), chunk_size)]
+        total = len(chunks)
+        for i, chunk in enumerate(chunks, 1):
+            _send(4003, {
+                "current_block_size": len(chunk),
+                "block_content": chunk,
+                "current_block_index": i,
+                "total_block_number": total,
+            })
+            time.sleep(0.05)
+
+    def _pcm_to_wav(pcm: bytes) -> bytes:
+        """Resample PCM-16k to 44.1kHz WAV (required by Go2 megaphone)."""
+        samples_in = np.frombuffer(pcm, dtype=np.int16)
+        n_in = len(samples_in)
+        n_out = int(n_in * 44100.0 / 16000.0)
+        x_old = np.linspace(0, n_in - 1, n_in)
+        x_new = np.linspace(0, n_in - 1, n_out)
+        samples_out = np.interp(x_new, x_old, samples_in.astype(np.float64))
+        samples_out = np.clip(samples_out, -32768, 32767).astype(np.int16)
+        buf = io.BytesIO()
+        with wave.open(buf, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(44100)
+            wf.writeframes(samples_out.tobytes())
+        return buf.getvalue()
+
+    def _play_buffer(pcm: bytes):
+        """Upload and play a complete PCM buffer."""
+        if not pcm:
+            return
+        duration = len(pcm) / 32000
+        _send(4001, {})  # enter megaphone
+        time.sleep(0.1)
+        wav = _pcm_to_wav(pcm)
+        _send_wav(wav)
+        # Megaphone auto-plays after upload; wait for playback to finish
+        time.sleep(duration)
+        _silence = _pcm_to_wav(b'\x00' * 320)
+        _send_wav(_silence)
+        _send(4002, {})  # exit megaphone
+
+    print("[SpeakerWorker] ready", flush=True)
+
+    merged = b''
+
+    while True:
+        try:
+            item = pcm_queue.get(timeout=0.15)
+        except Exception:
+            # Timeout — stream ended, play accumulated buffer
+            if merged:
+                _play_buffer(merged)
+                merged = b''
+            continue
+
+        if item is None:
+            # Exit signal — play remaining and quit
+            if merged:
+                _play_buffer(merged)
+            break
+
+        merged += item
+
+    print("[SpeakerWorker] exited", flush=True)
+
+
 class _SpeakerNode(Node):
-    """Subscribes to ROS2 audio topic and streams PCM via AudioClient.PlayStream RPC."""
-    MERGE_BYTES = 64000  # merge into ~2s blocks
+    """Subscribes to ROS2 audio topic and forwards PCM to speaker subprocess."""
 
-    def __init__(self, rpc_proxy):
+    def __init__(self, network_iface: str):
         super().__init__("go2_speaker")
-        self._rpc_proxy = rpc_proxy
+        self._network_iface = network_iface
         self._topic: str | None = None
-        self._sub    = None
-        self.state   = "idle"
-        self._buf = queue.Queue()
-        self._draining = threading.Event()
-        self._drain_thread: threading.Thread | None = None
-        self._last_chunk_time = 0.0
-        self._flush_timer = None
-        self._stream_id = "phanthy_stream"
+        self._sub = None
+        self.state = "idle"
+        self._pcm_q: multiprocessing.Queue | None = None
+        self._proc: multiprocessing.Process | None = None
 
-        self.get_logger().info("SpeakerNode ready (RPC mode)")
+        self.get_logger().info("SpeakerNode ready (independent subprocess)")
 
     def start_play(self, topic: str) -> str:
         if self._sub is not None:
             if self._topic == topic:
                 return self._topic
             self.stop_play()
+        # Start speaker subprocess
+        ctx = multiprocessing.get_context("spawn")
+        self._pcm_q = ctx.Queue()
+        self._proc = ctx.Process(
+            target=_speaker_worker,
+            args=(self._pcm_q, self._network_iface),
+            daemon=True,
+        )
+        self._proc.start()
         self._topic = topic
         self._sub = self.create_subscription(
             AudioChunk, topic, self._on_chunk, _LOW_LAT_QOS,
         )
         self.state = "playing"
-        self.get_logger().info(f"[speaker] subscribed to {topic}")
+        self.get_logger().info(f"[speaker] subscribed to {topic}, subprocess started")
         return topic
 
     def stop_play(self) -> None:
-        if self._flush_timer is not None:
-            self._flush_timer.cancel()
-            self.destroy_timer(self._flush_timer)
-            self._flush_timer = None
         if self._sub is not None:
             self.destroy_subscription(self._sub)
             self._sub = None
-        self._draining.clear()
-        if self._drain_thread is not None:
-            self._drain_thread.join(timeout=2)
-            self._drain_thread = None
-        while not self._buf.empty():
-            try:
-                self._buf.get_nowait()
-            except queue.Empty:
-                break
-        self._rpc_proxy.Audio_PlayStop("phanthy")
+        if self._pcm_q is not None:
+            self._pcm_q.put(None)  # signal subprocess to exit
+            self._pcm_q = None
+        if self._proc is not None:
+            self._proc.join(timeout=5)
+            if self._proc.is_alive():
+                self._proc.terminate()
+            self._proc = None
         self.state = "idle"
 
     def _on_chunk(self, msg: AudioChunk) -> None:
-        pcm = bytes(msg.data)
-        self._buf.put(pcm)
-        self._last_chunk_time = time.monotonic()
-        if not self._draining.is_set() and self._buf.qsize() >= 20:
-            self._start_drain()
-        elif not self._draining.is_set() and self._flush_timer is None:
-            self._flush_timer = self.create_timer(0.5, self._check_flush)
-
-    def _start_drain(self) -> None:
-        if self._flush_timer is not None:
-            self._flush_timer.cancel()
-            self.destroy_timer(self._flush_timer)
-            self._flush_timer = None
-        self._draining.set()
-        self._drain_thread = threading.Thread(target=self._drain, daemon=True)
-        self._drain_thread.start()
-
-    def _check_flush(self) -> None:
-        if self._flush_timer is not None:
-            self._flush_timer.cancel()
-            self.destroy_timer(self._flush_timer)
-            self._flush_timer = None
-        if not self._draining.is_set() and not self._buf.empty():
-            idle = time.monotonic() - self._last_chunk_time
-            if idle >= 0.3:
-                self._start_drain()
-
-    def _drain(self) -> None:
-        merged = b''
-        while self._draining.is_set():
-            try:
-                pcm = self._buf.get(timeout=0.3)
-                merged += pcm
-            except queue.Empty:
-                if merged:
-                    self._play_merged(merged)
-                    merged = b''
-                else:
-                    break
-                continue
-            if len(merged) >= self.MERGE_BYTES:
-                self._play_merged(merged)
-                merged = b''
-        if merged:
-            self._play_merged(merged)
-        self._draining.clear()
-
-    def _play_merged(self, pcm: bytes) -> None:
-        duration = len(pcm) / 32000  # seconds (16kHz, 16-bit mono)
-        try:
-            self._rpc_proxy.Audio_PlayStream("phanthy", self._stream_id, pcm)
-        except Exception as e:
-            self.get_logger().error(f"[speaker] RPC PlayStream error: {e}")
-        # Pace playback
-        if duration > 0:
-            time.sleep(duration * 0.9)
+        if self._pcm_q is not None:
+            self._pcm_q.put(bytes(msg.data))
 
 
 class SpeakerPlugin:
     PREFIX = "speaker"
 
-    def __init__(self, plugin_config: dict, namespace: str, executor, rpc_proxy):
-        self._rpc_proxy = rpc_proxy
-        self._node = _SpeakerNode(rpc_proxy)
+    def __init__(self, plugin_config: dict, namespace: str, executor, rpc_proxy, network_iface: str = "eth0"):
+        self._node = _SpeakerNode(network_iface)
         executor.add_node(self._node)
 
     def get_tool(self) -> dict:
@@ -295,7 +339,7 @@ class SpeakerPlugin:
             "name": "speaker",
             "type": "actuator",
             "multiInstance": False,
-            "description": "Go2 speaker — subscribes to ROS2 topic and streams PCM-16k audio to robot speaker via RPC",
+            "description": "Go2 speaker — subscribes to ROS2 topic and streams PCM-16k audio to robot speaker via AudioHub megaphone (independent subprocess)",
             "inputSchema": {
                 "type": "object",
                 "properties": {
