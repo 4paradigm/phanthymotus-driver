@@ -237,8 +237,8 @@ APP_NAME = "r1_speaker"
 
 
 class _SpeakerNode(Node):
-    PREFILL = 20      # buffer 20 chunks (~2s) before starting playback
-    MERGE_BYTES = 64000  # merge into ~2s blocks before calling PlayStream
+    PREFILL = 5       # buffer 5 chunks (~160ms) before starting playback
+    MERGE_BYTES = 9600  # merge into ~300ms blocks before calling PlayStream
 
     def __init__(self, audio_client: AudioClient):
         super().__init__("r1_speaker")
@@ -298,7 +298,7 @@ class _SpeakerNode(Node):
         if not self._draining.is_set() and self._buf.qsize() >= self.PREFILL:
             self._start_drain()
         elif not self._draining.is_set() and self._flush_timer is None:
-            self._flush_timer = self.create_timer(0.5, self._check_flush)
+            self._flush_timer = self.create_timer(0.2, self._check_flush)
 
     def _start_drain(self) -> None:
         if self._flush_timer is not None:
@@ -316,22 +316,25 @@ class _SpeakerNode(Node):
             self._flush_timer = None
         if not self._draining.is_set() and not self._buf.empty():
             idle = time.monotonic() - self._last_chunk_time
-            if idle >= 0.3:
+            if idle >= 0.15:
                 self._start_drain()
 
     def _drain(self) -> None:
         play_idx = 0
         merged = b''
+        empty_count = 0
         while self._draining.is_set():
             try:
-                pcm = self._buf.get(timeout=0.3)
+                pcm = self._buf.get(timeout=0.1)
                 merged += pcm
+                empty_count = 0
             except queue.Empty:
-                if merged:
+                empty_count += 1
+                if merged and empty_count >= 2:
                     play_idx += 1
                     self._play_merged(merged, play_idx)
                     merged = b''
-                else:
+                elif not merged and empty_count >= 3:
                     break
                 continue
             if len(merged) >= self.MERGE_BYTES:
@@ -344,16 +347,16 @@ class _SpeakerNode(Node):
         self._draining.clear()
 
     def _play_merged(self, pcm: bytes, idx: int) -> None:
-        duration = len(pcm) / 32000  # seconds (16kHz, 16-bit mono)
+        duration = len(pcm) / 32000
         t0 = time.monotonic()
         try:
-            code, data = self._client.PlayStream(APP_NAME, str(idx), pcm)
+            code, data = self._client.PlayStream(APP_NAME, "0", pcm)
             if code != 0:
                 self.get_logger().error(f"[speaker] PlayStream error code={code}")
         except Exception as e:
             self.get_logger().error(f"[speaker] PlayStream error: {e}")
         elapsed = time.monotonic() - t0
-        remaining = duration - elapsed
+        remaining = duration - elapsed - 0.08
         if remaining > 0:
             time.sleep(remaining)
 
