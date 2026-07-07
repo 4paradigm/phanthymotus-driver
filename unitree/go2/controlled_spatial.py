@@ -141,8 +141,8 @@ class _SlamRpcProxy:
     def InitPose(self, x=0.0, y=0.0, z=0.0, q_x=0.0, q_y=0.0, q_z=0.0, q_w=1.0, address="") -> tuple:
         return self._call("InitPose", {"x": x, "y": y, "z": z, "q_x": q_x, "q_y": q_y, "q_z": q_z, "q_w": q_w, "address": address})
 
-    def NavigateTo(self, x, y, z=0.0, q_x=0.0, q_y=0.0, q_z=0.0, q_w=1.0) -> tuple:
-        return self._call("NavigateTo", {"x": x, "y": y, "z": z, "q_x": q_x, "q_y": q_y, "q_z": q_z, "q_w": q_w})
+    def NavigateTo(self, x, y, z=0.0, q_x=0.0, q_y=0.0, q_z=0.0, q_w=1.0, speed=0.5, mode=1) -> tuple:
+        return self._call("NavigateTo", {"x": x, "y": y, "z": z, "q_x": q_x, "q_y": q_y, "q_z": q_z, "q_w": q_w, "speed": speed, "mode": mode})
 
     def PauseNav(self) -> tuple:
         return self._call("PauseNav")
@@ -338,6 +338,7 @@ class ControlledSpatialPlugin:
                     "x": {"type": "number", "description": "Target X coordinate (meters)"},
                     "y": {"type": "number", "description": "Target Y coordinate (meters)"},
                     "yaw": {"type": "number", "description": "Target yaw (radians)"},
+                    "speed": {"type": "number", "description": "Navigation speed 0.2-0.8 m/s (default 0.5)"},
                 },
                 "required": ["action"],
                 "x-action-params": {
@@ -349,8 +350,8 @@ class ControlledSpatialPlugin:
                     "list_maps": {"params": [], "description": "List all saved maps"},
                     "delete_map": {"params": ["map_name"], "description": "Delete a map and its associated data"},
                     "load_map": {"params": ["map_name"], "description": "Load a map (robot must be at map origin)"},
-                    "navigate_to_tag": {"params": ["tag_name"], "description": "Navigate to a tagged place"},
-                    "navigate_to_pose": {"params": ["x", "y", "yaw"], "description": "Navigate to coordinates"},
+                    "navigate_to_tag": {"params": ["tag_name", "speed"], "description": "Navigate to a tagged place"},
+                    "navigate_to_pose": {"params": ["x", "y", "yaw", "speed"], "description": "Navigate to coordinates"},
                     "pause_nav": {"params": [], "description": "Pause navigation"},
                     "resume_nav": {"params": [], "description": "Resume navigation"},
                     "stop_nav": {"params": [], "description": "Stop and cancel navigation"},
@@ -525,7 +526,8 @@ class ControlledSpatialPlugin:
             yaw = poi.get("yaw", 0)
             q_z = math.sin(yaw / 2)
             q_w = math.cos(yaw / 2)
-            code, resp = self._client.NavigateTo(poi["x"], poi["y"], 0, 0, 0, q_z, q_w)
+            speed = max(0.2, min(0.8, float(args.get("speed", 0.5))))
+            code, resp = self._client.NavigateTo(poi["x"], poi["y"], 0, 0, 0, q_z, q_w, speed=speed)
             if code == 0:
                 return {"status": "navigating", "target": tag_name, "pose": {"x": poi["x"], "y": poi["y"], "yaw": yaw}}
             return _rpc_error("NavigateTo", code, resp)
@@ -536,7 +538,8 @@ class ControlledSpatialPlugin:
             yaw = float(args.get("yaw", 0))
             q_z = math.sin(yaw / 2)
             q_w = math.cos(yaw / 2)
-            code, resp = self._client.NavigateTo(x, y, 0, 0, 0, q_z, q_w)
+            speed = max(0.2, min(0.8, float(args.get("speed", 0.5))))
+            code, resp = self._client.NavigateTo(x, y, 0, 0, 0, q_z, q_w, speed=speed)
             if code == 0:
                 return {"status": "navigating", "target_pose": {"x": x, "y": y, "yaw": yaw}}
             return _rpc_error("NavigateTo", code, resp)
