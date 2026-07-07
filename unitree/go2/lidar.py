@@ -56,9 +56,9 @@ class _LidarNode(Node):
         try:
             from unitree_sdk2py.core.channel import ChannelSubscriber
             from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_
-            self._cloud_sub = ChannelSubscriber("rt/utlidar/cloud", PointCloud2_)
+            self._cloud_sub = ChannelSubscriber("rt/utlidar/cloud_deskewed", PointCloud2_)
             self._cloud_sub.Init(self._on_cloud, 1)
-            self.get_logger().info(f"LidarNode subscribed rt/utlidar/cloud → {cloud_topic}")
+            self.get_logger().info(f"LidarNode subscribed rt/utlidar/cloud_deskewed → {cloud_topic}")
         except Exception as e:
             self.get_logger().warn(f"LidarNode: failed to subscribe cloud: {e}")
 
