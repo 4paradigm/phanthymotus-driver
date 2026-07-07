@@ -173,7 +173,7 @@ class MicPlugin:
 # ── SpeakerPlugin (actuator) ─────────────────────────────────────────────────
 
 APP_NAME = "go2_speaker"
-_SPEAKER_MERGE_MS = 500  # merge PCM to at least 500ms before sending
+_SPEAKER_MERGE_MS = 2000  # merge PCM to 2s blocks before sending (confirmed working)
 
 
 def _speaker_worker(pcm_queue: multiprocessing.Queue, network_iface: str):
@@ -213,7 +213,7 @@ def _speaker_worker(pcm_queue: multiprocessing.Queue, network_iface: str):
                 "current_block_index": i,
                 "total_block_number": total,
             })
-            time.sleep(0.01)
+            time.sleep(0.05)
 
     def _pcm_to_wav(pcm: bytes) -> bytes:
         """Resample PCM-16k to 44.1kHz WAV (required by Go2 megaphone)."""
@@ -245,7 +245,7 @@ def _speaker_worker(pcm_queue: multiprocessing.Queue, network_iface: str):
 
     while True:
         try:
-            item = pcm_queue.get(timeout=0.5)
+            item = pcm_queue.get(timeout=2.5)
         except Exception:
             # Timeout — flush any accumulated audio, then send silence to stop looping
             if merged:
@@ -253,7 +253,7 @@ def _speaker_worker(pcm_queue: multiprocessing.Queue, network_iface: str):
                 wav = _pcm_to_wav(merged)
                 _send_wav(wav)
                 merged = b''
-                time.sleep(duration)
+                time.sleep(duration + 0.3)
                 _send_wav(_silence_wav)
             continue
 
@@ -263,7 +263,7 @@ def _speaker_worker(pcm_queue: multiprocessing.Queue, network_iface: str):
                 duration = len(merged) / 32000
                 wav = _pcm_to_wav(merged)
                 _send_wav(wav)
-                time.sleep(duration)
+                time.sleep(duration + 0.3)
             _send_wav(_silence_wav)
             break
 
@@ -273,7 +273,7 @@ def _speaker_worker(pcm_queue: multiprocessing.Queue, network_iface: str):
             wav = _pcm_to_wav(merged)
             _send_wav(wav)
             merged = b''
-            time.sleep(duration)
+            time.sleep(duration + 0.3)
 
     # Exit megaphone mode
     _send(4002, {})
