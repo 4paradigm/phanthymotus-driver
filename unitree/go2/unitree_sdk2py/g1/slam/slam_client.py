@@ -1,5 +1,5 @@
 """
-Unitree G1 SLAM Navigate Client — DDS RPC wrapper for slam_operate service.
+Unitree SLAM Navigate Client — DDS RPC wrapper for slam_operate service.
 
 Service: slam_operate v1.0.0.1
 API IDs:
