@@ -265,9 +265,8 @@ def _speaker_worker(pcm_queue: multiprocessing.Queue, network_iface: str):
             wav = _pcm_to_wav(merged)
             _send_wav(wav)
             merged = b''
-            # Wait for playback, then immediately send silence to prevent looping
+            # Wait for playback before sending next block
             time.sleep(duration)
-            _send_wav(_silence_wav)
 
     # Exit megaphone mode
     _send(4002, {})
