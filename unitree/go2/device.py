@@ -245,7 +245,7 @@ def _speaker_worker(pcm_queue: multiprocessing.Queue, network_iface: str):
                 wav = _pcm_to_wav(merged)
                 _send_wav(wav)
                 merged = b''
-                time.sleep(duration * 0.85)
+                time.sleep(duration)
                 _send_wav(_silence_wav)
             continue
 
@@ -255,7 +255,7 @@ def _speaker_worker(pcm_queue: multiprocessing.Queue, network_iface: str):
                 duration = len(merged) / 32000
                 wav = _pcm_to_wav(merged)
                 _send_wav(wav)
-                time.sleep(duration * 0.85)
+                time.sleep(duration)
             _send_wav(_silence_wav)
             break
 
@@ -265,8 +265,7 @@ def _speaker_worker(pcm_queue: multiprocessing.Queue, network_iface: str):
             wav = _pcm_to_wav(merged)
             _send_wav(wav)
             merged = b''
-            # Sleep 85% of duration — leaves 15% margin for next upload
-            time.sleep(duration * 0.85)
+            time.sleep(duration)
 
     # Exit megaphone mode
     _send(4002, {})
