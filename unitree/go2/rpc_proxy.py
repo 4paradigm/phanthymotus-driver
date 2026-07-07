@@ -111,7 +111,7 @@ def _rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.
                             "current_block_index": i,
                             "total_block_number": total,
                         })
-                        time.sleep(0.05)
+                        time.sleep(0.01)
                     result_queue.put({"result": 0})
                 else:
                     _audiohub_send(api_id, param)
