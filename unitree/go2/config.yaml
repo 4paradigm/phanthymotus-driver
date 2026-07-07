@@ -17,6 +17,7 @@ plugins:
     enabled: true
     stream_addr: "230.1.1.1"
     stream_port: 1720
+    multicast_iface: "eth0"
   state:
     enabled: true
   motion_switcher:

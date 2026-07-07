@@ -936,10 +936,11 @@ class ObstaclesAvoidPlugin:
 class _CameraNode:
     """Manages a subprocess that receives Go2 H.264 UDP multicast video and publishes MJPEG frames."""
 
-    def __init__(self, topic: str, stream_addr: str, stream_port: int):
+    def __init__(self, topic: str, stream_addr: str, stream_port: int, multicast_iface: str = "eth0"):
         self._topic = topic
         self._stream_addr = stream_addr
         self._stream_port = stream_port
+        self._multicast_iface = multicast_iface
         self._proc = None
         self.state = "idle"
 
@@ -950,7 +951,7 @@ class _CameraNode:
         ctx = mp.get_context("spawn")
         self._proc = ctx.Process(
             target=_run_camera_process,
-            args=(self._topic, self._stream_addr, self._stream_port),
+            args=(self._topic, self._stream_addr, self._stream_port, self._multicast_iface),
             name="go2_camera",
             daemon=True,
         )
@@ -970,7 +971,7 @@ class _CameraNode:
         print("[camera] subprocess stopped", flush=True)
 
 
-def _run_camera_process(topic: str, stream_addr: str, stream_port: int) -> None:
+def _run_camera_process(topic: str, stream_addr: str, stream_port: int, multicast_iface: str = "eth0") -> None:
     """Camera subprocess — receives Go2 H264 UDP multicast, decodes to JPEG, publishes to ROS2."""
     import subprocess as _subprocess
     import threading as _threading
@@ -993,7 +994,7 @@ def _run_camera_process(topic: str, stream_addr: str, stream_port: int) -> None:
     # GStreamer pipeline for Go2 front camera (UDP multicast H264)
     cmd = [
         "gst-launch-1.0", "-q",
-        "udpsrc", f"address={stream_addr}", f"port={stream_port}", "!",
+        "udpsrc", f"address={stream_addr}", f"port={stream_port}", f"multicast-iface={multicast_iface}", "!",
         "application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96", "!",
         "rtph264depay", "!",
         "avdec_h264", "!",
@@ -1058,7 +1059,8 @@ class CameraPlugin:
         self._topic = f"/{namespace}/camera/front"
         self._stream_addr = plugin_config.get("stream_addr", "230.1.1.1")
         self._stream_port = int(plugin_config.get("stream_port", 1720))
-        self._node = _CameraNode(self._topic, self._stream_addr, self._stream_port)
+        self._multicast_iface = plugin_config.get("multicast_iface", "eth0")
+        self._node = _CameraNode(self._topic, self._stream_addr, self._stream_port, self._multicast_iface)
         self._proxy = rpc_proxy
 
     def get_tool(self) -> dict:
