@@ -173,11 +173,11 @@ class MicPlugin:
 # ── SpeakerPlugin (actuator) ─────────────────────────────────────────────────
 
 APP_NAME = "go2_speaker"
-_SPEAKER_MERGE_MS = 2000  # merge PCM to 2s blocks before sending (confirmed working)
+_SPEAKER_MERGE_MS = 2000  # flush timeout: send after 2s of silence
 
 
 def _speaker_worker(pcm_queue: multiprocessing.Queue, network_iface: str):
-    """Subprocess: receives PCM-16k chunks, resamples to 44.1k WAV, sends via AudioHub megaphone."""
+    """Subprocess: accumulates PCM-16k, sends as single WAV via AudioHub megaphone on stream end."""
     import base64
     import io
     import wave
@@ -232,51 +232,42 @@ def _speaker_worker(pcm_queue: multiprocessing.Queue, network_iface: str):
             wf.writeframes(samples_out.tobytes())
         return buf.getvalue()
 
-    # Enter megaphone mode
-    _send(4001, {})
-    time.sleep(0.3)
-    print("[SpeakerWorker] ready, megaphone active", flush=True)
+    def _play_buffer(pcm: bytes):
+        """Upload and play a complete PCM buffer."""
+        if not pcm:
+            return
+        duration = len(pcm) / 32000
+        _send(4001, {})  # enter megaphone
+        time.sleep(0.1)
+        wav = _pcm_to_wav(pcm)
+        _send_wav(wav)
+        time.sleep(duration)
+        _silence = _pcm_to_wav(b'\x00' * 320)
+        _send_wav(_silence)
+        _send(4002, {})  # exit megaphone
 
-    # Pre-generate a short silence WAV to stop looping after audio ends
-    _silence_wav = _pcm_to_wav(b'\x00' * 320)  # 10ms silence at 16kHz/16bit/mono
+    print("[SpeakerWorker] ready", flush=True)
 
-    merge_bytes = int(16000 * 2 * _SPEAKER_MERGE_MS / 1000)  # bytes for MERGE_MS at 16kHz/16bit/mono
     merged = b''
 
     while True:
         try:
-            item = pcm_queue.get(timeout=2.5)
+            item = pcm_queue.get(timeout=0.15)
         except Exception:
-            # Timeout — flush any accumulated audio, then send silence to stop looping
+            # Timeout — stream ended, play accumulated buffer
             if merged:
-                duration = len(merged) / 32000
-                wav = _pcm_to_wav(merged)
-                _send_wav(wav)
+                _play_buffer(merged)
                 merged = b''
-                time.sleep(duration + 0.3)
-                _send_wav(_silence_wav)
             continue
 
         if item is None:
-            # Flush remaining and exit
+            # Exit signal — play remaining and quit
             if merged:
-                duration = len(merged) / 32000
-                wav = _pcm_to_wav(merged)
-                _send_wav(wav)
-                time.sleep(duration + 0.3)
-            _send_wav(_silence_wav)
+                _play_buffer(merged)
             break
 
         merged += item
-        if len(merged) >= merge_bytes:
-            duration = len(merged) / 32000
-            wav = _pcm_to_wav(merged)
-            _send_wav(wav)
-            merged = b''
-            time.sleep(duration + 0.3)
 
-    # Exit megaphone mode
-    _send(4002, {})
     print("[SpeakerWorker] exited", flush=True)
 
 
