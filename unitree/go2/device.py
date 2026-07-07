@@ -1175,8 +1175,12 @@ class _LowStateNode(Node):
                     "tau": round(float(m.tau_est), 3),
                     "temperature": int(m.temperature) if hasattr(m, 'temperature') else 0,
                 })
+            imu = msg.imu_state
             joints_out = String()
-            joints_out.data = json.dumps({"joints": joints})
+            joints_out.data = json.dumps({
+                "joints": joints,
+                "imu_quat": [round(float(q), 5) for q in imu.quaternion],
+            })
             self._joints_pub.publish(joints_out)
 
         # Battery: throttle to 1 Hz (from bms_state field if available)

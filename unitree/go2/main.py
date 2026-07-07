@@ -97,6 +97,11 @@ class Go2DeviceBundle:
             self._plugins.append(MotionSwitcherPlugin(plugins_cfg["motion_switcher"], namespace, executor, rpc_proxy))
             print("[bundle] MotionSwitcherPlugin loaded")
 
+        if plugins_cfg.get("lidar", {}).get("enabled", False):
+            from lidar import LidarPlugin
+            self._plugins.append(LidarPlugin(plugins_cfg["lidar"], namespace, executor))
+            print("[bundle] LidarPlugin loaded")
+
         if plugins_cfg.get("controlled_spatial", {}).get("enabled", False):
             from controlled_spatial import ControlledSpatialPlugin
             controlled_cfg = dict(plugins_cfg["controlled_spatial"])

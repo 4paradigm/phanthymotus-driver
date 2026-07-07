@@ -22,6 +22,8 @@ plugins:
     enabled: true
   motion_switcher:
     enabled: true
+  lidar:
+    enabled: true
   controlled_spatial:
     enabled: true
     native_slam_pcd_dir: /home/unitree
