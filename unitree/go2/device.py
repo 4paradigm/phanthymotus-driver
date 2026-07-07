@@ -173,7 +173,7 @@ class MicPlugin:
 # ── SpeakerPlugin (actuator) ─────────────────────────────────────────────────
 
 APP_NAME = "go2_speaker"
-_SPEAKER_MERGE_MS = 200  # merge PCM to at least 200ms before sending
+_SPEAKER_MERGE_MS = 500  # merge PCM to at least 500ms before sending
 
 
 def _speaker_worker(pcm_queue: multiprocessing.Queue, network_iface: str):
@@ -237,18 +237,15 @@ def _speaker_worker(pcm_queue: multiprocessing.Queue, network_iface: str):
 
     while True:
         try:
-            item = pcm_queue.get(timeout=0.2)
+            item = pcm_queue.get(timeout=0.5)
         except Exception:
             # Timeout — flush any accumulated audio, then send silence to stop looping
             if merged:
                 duration = len(merged) / 32000
                 wav = _pcm_to_wav(merged)
-                t0 = time.monotonic()
                 _send_wav(wav)
                 merged = b''
-                remaining = duration - (time.monotonic() - t0)
-                if remaining > 0:
-                    time.sleep(remaining)
+                time.sleep(duration * 0.85)
                 _send_wav(_silence_wav)
             continue
 
@@ -257,11 +254,8 @@ def _speaker_worker(pcm_queue: multiprocessing.Queue, network_iface: str):
             if merged:
                 duration = len(merged) / 32000
                 wav = _pcm_to_wav(merged)
-                t0 = time.monotonic()
                 _send_wav(wav)
-                remaining = duration - (time.monotonic() - t0)
-                if remaining > 0:
-                    time.sleep(remaining)
+                time.sleep(duration * 0.85)
             _send_wav(_silence_wav)
             break
 
@@ -269,13 +263,10 @@ def _speaker_worker(pcm_queue: multiprocessing.Queue, network_iface: str):
         if len(merged) >= merge_bytes:
             duration = len(merged) / 32000
             wav = _pcm_to_wav(merged)
-            t0 = time.monotonic()
             _send_wav(wav)
             merged = b''
-            # Wait for remaining playback time (upload time already counted)
-            remaining = duration - (time.monotonic() - t0)
-            if remaining > 0:
-                time.sleep(remaining)
+            # Sleep 85% of duration — leaves 15% margin for next upload
+            time.sleep(duration * 0.85)
 
     # Exit megaphone mode
     _send(4002, {})
