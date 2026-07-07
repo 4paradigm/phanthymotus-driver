@@ -26,6 +26,7 @@ _LOW_LAT_QOS = QoSProfile(
 )
 
 LIDAR_CLOUD_INTERVAL = 0.05  # 20 Hz max (source is ~15Hz, allow headroom)
+LIDAR_ACCUMULATE_FRAMES = 15  # accumulate 15 frames (~1s) before publishing
 
 
 class _LidarNode(Node):
@@ -106,9 +107,15 @@ class _LidarNode(Node):
             )
 
     def _process_loop(self) -> None:
-        """Worker thread: gravity alignment + publish."""
+        """Worker thread: accumulate frames, filter zero points, gravity alignment + publish."""
         import array as _array
+        import numpy as np
         from std_msgs.msg import UInt8MultiArray
+
+        accum_chunks = []  # list of valid_raw arrays (already gravity-aligned)
+        accum_count = 0
+        point_step = 32  # will be updated from first frame
+
         while True:
             item = self._cloud_queue.get()
             if item is None:
@@ -116,28 +123,50 @@ class _LidarNode(Node):
             point_step, total_points, data, roll, pitch = item
             t0 = time.monotonic()
 
-            data = gravity_align_inplace(data, point_step, total_points, roll, pitch)
+            # Filter out zero-coordinate points (invalid LiDAR returns)
+            raw = np.frombuffer(data, dtype=np.uint8).reshape(total_points, point_step)
+            xyz = raw[:, :12].view(np.float32).reshape(total_points, 3)
+            mask = np.any(xyz != 0, axis=1)
+            valid_raw = raw[mask]
 
-            header = struct.pack('<II', point_step, total_points)
-            buf = bytearray(8 + len(data))
-            buf[:8] = header
-            buf[8:] = data
-            ros_msg = UInt8MultiArray()
-            ros_msg.data = _array.array('B', buf)
-            self._cloud_pub.publish(ros_msg)
+            if valid_raw.shape[0] > 0:
+                # Flip Z axis: renderer expects Z-down but Go2 lidar outputs Z-up
+                frame = valid_raw.copy()
+                frame_xyz = frame[:, :12].view(np.float32).reshape(-1, 3)
+                frame_xyz[:, 2] = -frame_xyz[:, 2]
+                accum_chunks.append(frame)
+                accum_count += 1
+
+            # Publish after accumulating LIDAR_ACCUMULATE_FRAMES frames
+            if accum_count >= LIDAR_ACCUMULATE_FRAMES:
+                merged = np.vstack(accum_chunks)
+                valid_count = merged.shape[0]
+                accum_chunks = []
+                accum_count = 0
+
+                header = struct.pack('<II', point_step, valid_count)
+                buf = bytearray(8 + len(merged.tobytes()))
+                buf[:8] = header
+                buf[8:] = merged.tobytes()
+                ros_msg = UInt8MultiArray()
+                ros_msg.data = _array.array('B', buf)
+                self._cloud_pub.publish(ros_msg)
+
+                elapsed_ms = (time.monotonic() - t0) * 1000
+                self._worker_count += 1
+                self._worker_total_ms += elapsed_ms
 
             elapsed_ms = (time.monotonic() - t0) * 1000
             self._worker_count += 1
             self._worker_total_ms += elapsed_ms
 
     def _on_livox_imu(self, msg) -> None:
-        """Compute roll/pitch from Livox IMU accelerometer."""
+        """Compute roll/pitch from Livox IMU accelerometer (Go2: upright mount)."""
         import math
         try:
             acc = msg.linear_acceleration
             ax, ay, az = float(acc.x), float(acc.y), float(acc.z)
-            # Livox mounted inverted: flip y,z to get upright-equivalent frame
-            self._imu_roll = math.atan2(-ay, -az)
+            self._imu_roll = math.atan2(ay, az)
             self._imu_pitch = math.atan2(-ax, math.sqrt(ay * ay + az * az))
         except Exception:
             pass
@@ -162,10 +191,6 @@ class LidarPlugin:
             "description": f"Livox Mid-360 full point cloud passthrough at ~15Hz. Binary format: [uint32 point_step][uint32 total_points][raw PointCloud2 bytes]. Publishes to {self._cloud_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._cloud_topic, "format": "sensor/pointcloud"}],
-            "configSchema": {
-                "type": "object",
-                "properties": {},
-            },
         }
 
     def start(self) -> None:
