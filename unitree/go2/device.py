@@ -213,6 +213,7 @@ def _speaker_worker(pcm_queue: multiprocessing.Queue, network_iface: str):
                 "current_block_index": i,
                 "total_block_number": total,
             })
+            time.sleep(0.002)
 
     def _pcm_to_wav(pcm: bytes) -> bytes:
         """Resample PCM-16k to 44.1kHz WAV (required by Go2 megaphone)."""
