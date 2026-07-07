@@ -181,7 +181,6 @@ def _speaker_worker(pcm_queue: multiprocessing.Queue, network_iface: str):
     import base64
     import io
     import wave
-    import numpy as np
     from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelPublisher
     from unitree_sdk2py.idl.unitree_api.msg.dds_ import (
         Request_, RequestHeader_, RequestIdentity_, RequestLease_, RequestPolicy_,
@@ -216,20 +215,13 @@ def _speaker_worker(pcm_queue: multiprocessing.Queue, network_iface: str):
             time.sleep(0.01)
 
     def _pcm_to_wav(pcm: bytes) -> bytes:
-        """Resample PCM-16k to 44.1kHz WAV."""
-        samples_in = np.frombuffer(pcm, dtype=np.int16)
-        n_in = len(samples_in)
-        n_out = int(n_in * 44100.0 / 16000.0)
-        x_old = np.linspace(0, n_in - 1, n_in)
-        x_new = np.linspace(0, n_in - 1, n_out)
-        samples_out = np.interp(x_new, x_old, samples_in.astype(np.float64))
-        samples_out = np.clip(samples_out, -32768, 32767).astype(np.int16)
+        """Wrap PCM-16k into WAV (no resampling — megaphone plays at 16kHz)."""
         buf = io.BytesIO()
         with wave.open(buf, 'wb') as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
-            wf.setframerate(44100)
-            wf.writeframes(samples_out.tobytes())
+            wf.setframerate(16000)
+            wf.writeframes(pcm)
         return buf.getvalue()
 
     # Enter megaphone mode
