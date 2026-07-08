@@ -1313,18 +1313,51 @@ class SpatialPlugin:
         self._node._maybe_save_pcd()
         code, _ = self._client.StopMapping(current_pcd)
         if code != 0:
-            print(f"[Spatial] Merge: StopMapping failed, aborting", flush=True)
-            # 恢复建图
+            print(f"[Spatial] Merge: StopMapping failed (code={code}), aborting", flush=True)
             self._client.StartMapping()
             return
 
-        time.sleep(1)
+        time.sleep(3)  # 等 SLAM 完成内部状态切换
 
-        # 2. InitPose 加载旧地图
+        # 2. ICP 精确定位：当前点云 vs 旧图 PCD
         old_pcd = old_map_info["pcd_path"]
-        code, _ = self._client.InitPose(0, 0, 0, 0, 0, 0, 1.0, old_pcd)
+        from icp import icp_2d
+        from path_planner import PathPlanner
+
+        target_cloud = PathPlanner._parse_pcd(old_pcd)
+        with self._node._map_buffer_lock:
+            source_cloud = np.array(list(self._node._map_buffer.values()), dtype=np.float32) if self._node._map_buffer else None
+
+        if target_cloud is None or source_cloud is None or len(source_cloud) < 100:
+            print(f"[Spatial] Merge: insufficient cloud data for ICP (src={len(source_cloud) if source_cloud is not None else 0}, tgt={len(target_cloud) if target_cloud is not None else 0})", flush=True)
+            # Fallback: 用 Scan Context 粗略位姿
+            init_x = match["pose"]["x"]
+            init_y = match["pose"]["y"]
+            init_yaw = 0.0
+            print(f"[Spatial] Merge: using Scan Context pose ({init_x:.2f}, {init_y:.2f})", flush=True)
+        else:
+            # ICP 对齐
+            init_x = match["pose"]["x"]
+            init_y = match["pose"]["y"]
+            icp_result = icp_2d(source_cloud, target_cloud, init_x=init_x, init_y=init_y,
+                                max_iterations=50, max_correspond_dist=3.0)
+            if icp_result and icp_result["score"] < 1.0:
+                init_x = icp_result["x"]
+                init_y = icp_result["y"]
+                init_yaw = icp_result["yaw"]
+                print(f"[Spatial] Merge ICP: x={init_x:.3f}, y={init_y:.3f}, yaw={init_yaw:.3f}, "
+                      f"score={icp_result['score']:.4f}, iters={icp_result['iterations']}", flush=True)
+            else:
+                init_yaw = 0.0
+                print(f"[Spatial] Merge ICP failed/diverged, using Scan Context pose ({init_x:.2f}, {init_y:.2f})", flush=True)
+
+        # 3. InitPose 加载旧地图（用精确位姿）
+        q_z = math.sin(init_yaw / 2)
+        q_w = math.cos(init_yaw / 2)
+        print(f"[Spatial] Merge InitPose: x={init_x:.3f}, y={init_y:.3f}, yaw={init_yaw:.3f}, pcd={old_pcd}", flush=True)
+        code, _ = self._client.InitPose(init_x, init_y, 0, 0, 0, q_z, q_w, old_pcd)
         if code != 0:
-            print(f"[Spatial] Merge: InitPose for old map failed, starting fresh", flush=True)
+            print(f"[Spatial] Merge: InitPose failed (code={code}), starting fresh", flush=True)
             self._client.StartMapping()
             return
 
