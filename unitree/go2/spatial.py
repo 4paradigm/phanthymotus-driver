@@ -337,7 +337,6 @@ class _SpatialNode(Node):
     SLAM_CLOUD_INTERVAL = 0.2    # 5Hz
 
     def __init__(self, pos_tag_topic: str, mapping_topic: str, slam_cloud_topic: str,
-                 nav_path_topic: str, grid_map_topic: str,
                  db: _SpatialDB, sc_mgr=None):
         super().__init__("go2_spatial")
         self._db = db
@@ -348,8 +347,10 @@ class _SpatialNode(Node):
         self._pos_tag_pub = self.create_publisher(String, pos_tag_topic, _LOW_LAT_QOS)
         self._mapping_pub = self.create_publisher(UInt8MultiArray, mapping_topic, _LOW_LAT_QOS)
         self._slam_cloud_pub = self.create_publisher(UInt8MultiArray, slam_cloud_topic, _LOW_LAT_QOS)
-        self._nav_path_pub = self.create_publisher(UInt8MultiArray, nav_path_topic, _LOW_LAT_QOS)
-        self._grid_map_pub = self.create_publisher(UInt8MultiArray, grid_map_topic, _LOW_LAT_QOS)
+
+        # Overlay data (merged into mapping publish)
+        self._nav_path_overlay: np.ndarray | None = None   # Nx3 path points (z=0.3)
+        self._grid_overlay: np.ndarray | None = None        # Nx3 obstacle points (z=0.5)
 
         # State
         self._current_pose: dict | None = None
@@ -754,6 +755,16 @@ class _SpatialNode(Node):
             pts = pts[indices]
             num_points = self.MAX_SEND_POINTS
 
+        # Merge overlay data (nav path + grid obstacles) into the point cloud
+        overlay_parts = [pts]
+        if self._grid_overlay is not None and len(self._grid_overlay) > 0:
+            overlay_parts.append(self._grid_overlay)
+        if self._nav_path_overlay is not None and len(self._nav_path_overlay) > 0:
+            overlay_parts.append(self._nav_path_overlay)
+        if len(overlay_parts) > 1:
+            pts = np.vstack(overlay_parts)
+            num_points = len(pts)
+
         # Binary format: [float32 robot_x, robot_y, robot_yaw][uint8 flags][uint32 N][float32 x,y,z × N]
         flags = 0x03  # bit0=full_map, bit1=has_z
         header = struct.pack('<fffBI', robot_x, robot_y, robot_yaw, flags, num_points)
@@ -1034,13 +1045,10 @@ class SpatialPlugin:
         self._pos_tag_topic = f"/{namespace}/spatial/pos_tag" if namespace else "/spatial/pos_tag"
         self._mapping_topic = f"/{namespace}/spatial/mapping" if namespace else "/spatial/mapping"
         self._slam_cloud_topic = f"/{namespace}/spatial/slam_cloud" if namespace else "/spatial/slam_cloud"
-        self._nav_path_topic = f"/{namespace}/spatial/nav_path" if namespace else "/spatial/nav_path"
-        self._grid_map_topic = f"/{namespace}/spatial/grid_map" if namespace else "/spatial/grid_map"
 
         # Create node
         self._node = _SpatialNode(
             self._pos_tag_topic, self._mapping_topic, self._slam_cloud_topic,
-            self._nav_path_topic, self._grid_map_topic,
             self._db, self._sc_mgr
         )
         self._node.set_active_map(self._db.get_last_used_map())
@@ -1049,8 +1057,7 @@ class SpatialPlugin:
         executor.add_node(self._node)
 
     def get_tools(self) -> list:
-        return [self._spatial_tool(), self._pos_tag_tool(), self._mapping_tool(),
-                self._slam_cloud_tool(), self._nav_path_tool(), self._grid_map_tool()]
+        return [self._spatial_tool(), self._pos_tag_tool(), self._mapping_tool(), self._slam_cloud_tool()]
 
     def _pos_tag_tool(self) -> dict:
         return {
@@ -1080,26 +1087,6 @@ class SpatialPlugin:
             "description": f"Real-time SLAM point cloud at 5Hz. Binary: [uint32 point_step=12][uint32 total_points][float32 x,y,z × N]. Publishes to {self._slam_cloud_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._slam_cloud_topic, "format": "sensor/pointcloud"}],
-        }
-
-    def _nav_path_tool(self) -> dict:
-        return {
-            "name": "nav_path",
-            "type": "sensor",
-            "multiInstance": False,
-            "description": f"Navigation path visualization — planned waypoints as 3D points overlaid on map. Published when navigation starts. {self._nav_path_topic}",
-            "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._nav_path_topic, "format": "sensor/mapping"}],
-        }
-
-    def _grid_map_tool(self) -> dict:
-        return {
-            "name": "grid_map",
-            "type": "sensor",
-            "multiInstance": False,
-            "description": f"2D occupancy grid visualization — obstacle cells from path planner. Published when path is planned. {self._grid_map_topic}",
-            "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._grid_map_topic, "format": "sensor/mapping"}],
         }
 
     def _spatial_tool(self) -> dict:
@@ -1268,10 +1255,6 @@ class SpatialPlugin:
                 return {"state": "running", "topic_out": [{"topic": self._mapping_topic, "format": "sensor/mapping"}]}
             if tool_name == 'slam_cloud':
                 return {"state": "running", "topic_out": [{"topic": self._slam_cloud_topic, "format": "sensor/pointcloud"}]}
-            if tool_name == 'nav_path':
-                return {"state": "running", "topic_out": [{"topic": self._nav_path_topic, "format": "sensor/mapping"}]}
-            if tool_name == 'grid_map':
-                return {"state": "running", "topic_out": [{"topic": self._grid_map_topic, "format": "sensor/mapping"}]}
             return {"state": "running", "topic_out": [{"topic": self._pos_tag_topic, "format": "data/json"}]}
 
         if action == "tag_place":
@@ -1423,13 +1406,32 @@ class SpatialPlugin:
         if not self._ensure_planner_loaded():
             return {"error": "Path planner: no map loaded"}
 
-        # 发布 2D 栅格地图可视化
-        self._publish_grid_map()
+        # 设置栅格障碍物 overlay（叠加到 mapping 可视化）
+        grid_pts = self._planner.get_grid_as_points()
+        if grid_pts is not None:
+            self._node._grid_overlay = grid_pts
+            print(f"[Spatial] Grid overlay set: {len(grid_pts)} obstacle cells", flush=True)
 
         # 规划路径
         waypoints = self._planner.plan((pose["x"], pose["y"]), (target_x, target_y))
         if not waypoints:
             return {"error": f"No path found from ({pose['x']:.1f},{pose['y']:.1f}) to ({target_x:.1f},{target_y:.1f})"}
+
+        # 生成路径点 overlay（在 waypoints 之间插值）
+        path_points = []
+        for i in range(len(waypoints) - 1):
+            x1, y1 = waypoints[i]
+            x2, y2 = waypoints[i + 1]
+            dist = math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+            steps = max(int(dist / 0.1), 1)
+            for s in range(steps):
+                t = s / steps
+                px = x1 + t * (x2 - x1)
+                py = y1 + t * (y2 - y1)
+                path_points.append((px, py, 0.3))
+        path_points.append((waypoints[-1][0], waypoints[-1][1], 0.3))
+        self._node._nav_path_overlay = np.array(path_points, dtype=np.float32)
+        print(f"[Spatial] Nav path overlay set: {len(path_points)} points, {len(waypoints)} waypoints", flush=True)
 
         # 设置导航状态
         self._nav_waypoints = waypoints
@@ -1440,14 +1442,11 @@ class SpatialPlugin:
         if tag_name:
             self._node.set_nav_target(tag_name)
 
-        # 发布路线可视化
-        self._publish_nav_path(waypoints, pose)
-
         # Debug 模式：后台等待 10s 后自动结束
         threading.Thread(target=self._execute_waypoints_debug, daemon=True).start()
 
         return {
-            "status": "navigating (DEBUG: no movement, visualization only)",
+            "status": "navigating (DEBUG: no movement, path overlaid on mapping)",
             "target": tag_name or f"({target_x:.1f},{target_y:.1f})",
             "waypoints": len(waypoints),
             "waypoint_coords": [(round(x, 2), round(y, 2)) for x, y in waypoints],
@@ -1455,68 +1454,10 @@ class SpatialPlugin:
         }
 
     def _execute_waypoints_debug(self):
-        """Debug 模式：不移动，10s 后自动结束。"""
+        """Debug 模式：不移动，10s 后自动结束，清除 overlay。"""
         print(f"[Spatial] DEBUG: path visualized with {len(self._nav_waypoints)} waypoints, waiting 10s...", flush=True)
         time.sleep(10)
         self._nav_executing = False
+        self._node._nav_path_overlay = None  # 清除路线
         self._node._nav_arrived.set()
-        print("[Spatial] DEBUG: navigation ended (no movement)", flush=True)
-
-    def _publish_nav_path(self, waypoints: list[tuple], pose: dict):
-        """发布导航路线到 nav_path topic (sensor/mapping 格式)。"""
-        if not waypoints:
-            return
-        # 在 waypoints 之间插值，生成密集路径点用于可视化
-        path_points = []
-        for i in range(len(waypoints) - 1):
-            x1, y1 = waypoints[i]
-            x2, y2 = waypoints[i + 1]
-            dist = math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
-            steps = max(int(dist / 0.1), 1)  # 每 10cm 一个点
-            for s in range(steps):
-                t = s / steps
-                px = x1 + t * (x2 - x1)
-                py = y1 + t * (y2 - y1)
-                path_points.append((px, py, 0.3))  # z=0.3 让路线悬浮在地面上方
-        # 添加最后一个点
-        path_points.append((waypoints[-1][0], waypoints[-1][1], 0.3))
-
-        pts = np.array(path_points, dtype=np.float32)
-        num_points = len(pts)
-
-        robot_x = pose["x"]
-        robot_y = pose["y"]
-        robot_yaw = pose["yaw"]
-        flags = 0x03
-        header = struct.pack('<fffBI', robot_x, robot_y, robot_yaw, flags, num_points)
-
-        ros_msg = UInt8MultiArray()
-        ros_msg.data = list(header + pts.tobytes())
-        self._node._nav_path_pub.publish(ros_msg)
-        print(f"[Spatial] Published nav_path: {num_points} points, {len(waypoints)} waypoints", flush=True)
-
-    def _publish_grid_map(self):
-        """发布 2D 栅格地图到 grid_map topic (sensor/mapping 格式)。"""
-        grid_pts = self._planner.get_grid_as_points()
-        if grid_pts is None or len(grid_pts) == 0:
-            return
-
-        pose = self._node.get_pose()
-        robot_x = pose["x"] if pose else 0.0
-        robot_y = pose["y"] if pose else 0.0
-        robot_yaw = pose["yaw"] if pose else 0.0
-
-        num_points = len(grid_pts)
-        # 限制点数
-        if num_points > 50000:
-            indices = np.random.choice(num_points, 50000, replace=False)
-            grid_pts = grid_pts[indices]
-            num_points = 50000
-
-        flags = 0x03
-        header = struct.pack('<fffBI', robot_x, robot_y, robot_yaw, flags, num_points)
-
-        ros_msg = UInt8MultiArray()
-        ros_msg.data = list(header + grid_pts.tobytes())
-        self._node._grid_map_pub.publish(ros_msg)
-        print(f"[Spatial] Published grid_map: {num_points} obstacle cells", flush=True)
+        print("[Spatial] DEBUG: navigation ended, path overlay cleared", flush=True)
