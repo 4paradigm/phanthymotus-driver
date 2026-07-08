@@ -1417,19 +1417,34 @@ class SpatialPlugin:
         if not waypoints:
             return {"error": f"No path found from ({pose['x']:.1f},{pose['y']:.1f}) to ({target_x:.1f},{target_y:.1f})"}
 
-        # 生成路径点 overlay（在 waypoints 之间插值）
+        # 生成路径点 overlay（带宽度的粗线，在路径两侧偏移生成多条线）
+        PATH_WIDTH = 0.15  # 路线半宽 (m)
+        PATH_Z = 0.3       # 路线悬浮高度
+        PATH_STEP = 0.05   # 沿路径每 5cm 一个点
+        OFFSETS = [0, -PATH_WIDTH, PATH_WIDTH, -PATH_WIDTH/2, PATH_WIDTH/2]  # 5条线
         path_points = []
         for i in range(len(waypoints) - 1):
             x1, y1 = waypoints[i]
             x2, y2 = waypoints[i + 1]
-            dist = math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
-            steps = max(int(dist / 0.1), 1)
+            dx = x2 - x1
+            dy = y2 - y1
+            seg_len = math.sqrt(dx * dx + dy * dy)
+            if seg_len < 1e-6:
+                continue
+            # 法线方向 (垂直于路径)
+            nx = -dy / seg_len
+            ny = dx / seg_len
+            steps = max(int(seg_len / PATH_STEP), 1)
             for s in range(steps):
                 t = s / steps
-                px = x1 + t * (x2 - x1)
-                py = y1 + t * (y2 - y1)
-                path_points.append((px, py, 0.3))
-        path_points.append((waypoints[-1][0], waypoints[-1][1], 0.3))
+                cx = x1 + t * dx
+                cy = y1 + t * dy
+                for offset in OFFSETS:
+                    path_points.append((cx + offset * nx, cy + offset * ny, PATH_Z))
+        # 终点
+        for offset in OFFSETS:
+            ex, ey = waypoints[-1]
+            path_points.append((ex, ey, PATH_Z))
         self._node._nav_path_overlay = np.array(path_points, dtype=np.float32)
         print(f"[Spatial] Nav path overlay set: {len(path_points)} points, {len(waypoints)} waypoints", flush=True)
 
