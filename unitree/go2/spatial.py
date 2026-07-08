@@ -1404,11 +1404,11 @@ class SpatialPlugin:
         if not waypoints:
             return {"error": f"No path found from ({pose['x']:.1f},{pose['y']:.1f}) to ({target_x:.1f},{target_y:.1f})"}
 
-        # 生成路径点 overlay（带宽度的粗线，在路径两侧偏移生成多条线）
-        PATH_WIDTH = 0.15  # 路线半宽 (m)
+        # 生成路径点 overlay（细线，3条平行线）
+        PATH_WIDTH = 0.05  # 路线半宽 (m)
         PATH_Z = 0.3       # 路线悬浮高度
         PATH_STEP = 0.05   # 沿路径每 5cm 一个点
-        OFFSETS = [0, -PATH_WIDTH, PATH_WIDTH, -PATH_WIDTH/2, PATH_WIDTH/2]  # 5条线
+        OFFSETS = [0, -PATH_WIDTH, PATH_WIDTH]  # 3条线
         path_points = []
         for i in range(len(waypoints) - 1):
             x1, y1 = waypoints[i]
@@ -1418,7 +1418,6 @@ class SpatialPlugin:
             seg_len = math.sqrt(dx * dx + dy * dy)
             if seg_len < 1e-6:
                 continue
-            # 法线方向 (垂直于路径)
             nx = -dy / seg_len
             ny = dx / seg_len
             steps = max(int(seg_len / PATH_STEP), 1)
@@ -1428,11 +1427,18 @@ class SpatialPlugin:
                 cy = y1 + t * dy
                 for offset in OFFSETS:
                     path_points.append((cx + offset * nx, cy + offset * ny, PATH_Z))
-        # 终点
+        ex, ey = waypoints[-1]
         for offset in OFFSETS:
-            ex, ey = waypoints[-1]
             path_points.append((ex, ey, PATH_Z))
-        self._node._nav_path_overlay = np.array(path_points, dtype=np.float32)
+        nav_path_arr = np.array(path_points, dtype=np.float32)
+        self._node._nav_path_overlay = nav_path_arr
+
+        # 也把路径加入 grid overlay（与障碍物一起显示）
+        if grid_pts is not None:
+            self._node._grid_overlay = np.vstack([grid_pts, nav_path_arr])
+        else:
+            self._node._grid_overlay = nav_path_arr
+
         print(f"[Spatial] Nav path overlay set: {len(path_points)} points, {len(waypoints)} waypoints", flush=True)
 
         # 设置导航状态
@@ -1456,14 +1462,14 @@ class SpatialPlugin:
         }
 
     def _execute_waypoints_debug(self):
-        """Debug 模式：不移动，30s 后自动结束，清除 overlay。"""
-        print(f"[Spatial] DEBUG: path visualized with {len(self._nav_waypoints)} waypoints, keeping for 30s...", flush=True)
-        # 保持 overlay 30s 让用户在 dashboard 上查看
-        for i in range(30):
+        """Debug 模式：不移动，10s 后清除 overlay。"""
+        print(f"[Spatial] DEBUG: path visualized with {len(self._nav_waypoints)} waypoints, keeping for 10s...", flush=True)
+        for i in range(10):
             time.sleep(1)
             if not self._nav_executing:
                 break  # 被 stop_nav 取消
         self._nav_executing = False
-        self._node._nav_path_overlay = None  # 清除路线
+        self._node._nav_path_overlay = None
+        self._node._grid_overlay = None
         self._node._nav_arrived.set()
-        print("[Spatial] DEBUG: navigation ended, path overlay cleared", flush=True)
+        print("[Spatial] DEBUG: navigation ended, overlays cleared", flush=True)
