@@ -762,10 +762,8 @@ class _SpatialNode(Node):
             pts = pts[indices]
             num_points = self.MAX_SEND_POINTS
 
-        # Merge overlay data (nav path + grid obstacles) into the point cloud
+        # Merge nav path overlay into the 3D mapping point cloud
         overlay_parts = [pts]
-        if self._grid_overlay is not None and len(self._grid_overlay) > 0:
-            overlay_parts.append(self._grid_overlay)
         if self._nav_path_overlay is not None and len(self._nav_path_overlay) > 0:
             overlay_parts.append(self._nav_path_overlay)
         if len(overlay_parts) > 1:
@@ -1464,11 +1462,10 @@ class SpatialPlugin:
         if not self._ensure_planner_loaded():
             return {"error": "Path planner: no map loaded"}
 
-        # 设置栅格障碍物 overlay（叠加到 mapping 可视化）
+        # 设置栅格障碍物（用于 grid_map 2D 显示，不叠加到 3D mapping）
         grid_pts = self._planner.get_grid_as_points()
         if grid_pts is not None:
-            self._node._grid_overlay = grid_pts
-            print(f"[Spatial] Grid overlay set: {len(grid_pts)} obstacle cells", flush=True)
+            print(f"[Spatial] Grid: {len(grid_pts)} obstacle cells", flush=True)
 
         # 规划路径
         waypoints = self._planner.plan((pose["x"], pose["y"]), (target_x, target_y))
@@ -1501,15 +1498,7 @@ class SpatialPlugin:
         ex, ey = waypoints[-1]
         for offset in OFFSETS:
             path_points.append((ex, ey, PATH_Z))
-        nav_path_arr = np.array(path_points, dtype=np.float32)
         self._node._nav_path_overlay = nav_path_arr
-
-        # 也把路径加入 grid overlay（与障碍物一起显示）
-        if grid_pts is not None:
-            self._node._grid_overlay = np.vstack([grid_pts, nav_path_arr])
-        else:
-            self._node._grid_overlay = nav_path_arr
-
         print(f"[Spatial] Nav path overlay set: {len(path_points)} points, {len(waypoints)} waypoints", flush=True)
 
         # 设置导航状态
@@ -1541,6 +1530,5 @@ class SpatialPlugin:
                 break  # 被 stop_nav 取消
         self._nav_executing = False
         self._node._nav_path_overlay = None
-        self._node._grid_overlay = None
         self._node._nav_arrived.set()
         print("[Spatial] DEBUG: navigation ended, overlays cleared", flush=True)
