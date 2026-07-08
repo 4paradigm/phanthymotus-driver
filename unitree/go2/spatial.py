@@ -1071,7 +1071,10 @@ class SpatialPlugin:
 
     def __init__(self, plugin_config: dict, namespace: str, executor, rpc_proxy=None):
         network_iface = plugin_config.get("network_iface", "eth0")
-        self._ensure_slam_service()
+        # Note: _ensure_slam_service() is NOT called here.
+        # ControlledSpatialPlugin (loaded first) already starts unitree_slam + mid360_driver.
+        # We just wait briefly for it to be ready.
+        time.sleep(2)
         self._client = _SlamRpcProxy(network_iface)
         self._rpc_proxy = rpc_proxy  # for obstacles_avoid calls
 
@@ -1268,21 +1271,18 @@ class SpatialPlugin:
             self._node.set_map_status("mapping")
             self._node.set_active_map(map_name)
             self._db.add_map(map_name, pcd_path)
-            # 启动 merge 检查循环
-            threading.Thread(target=self._merge_check_loop, daemon=True).start()
+            # 启动 5s 后做一次 merge 检查
+            threading.Thread(target=self._merge_check_once, daemon=True).start()
             return {"status": "new", "map_name": map_name}
         return {"error": f"StartMapping failed, code={code}"}
 
-    def _merge_check_loop(self):
-        """后台：30s 后开始，每 30s 检查当前地图是否可以合并到已有地图。"""
-        time.sleep(30)  # 等点云积累
-        while True:
-            if not self._nav_executing:  # 导航时不 merge
-                try:
-                    self._try_merge_current_map()
-                except Exception as e:
-                    print(f"[Spatial] Merge check error: {e}", flush=True)
-            time.sleep(30)
+    def _merge_check_once(self):
+        """启动 5s 后做一次 merge 检查：如果当前地图匹配已有旧图则合并。"""
+        time.sleep(5)
+        try:
+            self._try_merge_current_map()
+        except Exception as e:
+            print(f"[Spatial] Merge check error: {e}", flush=True)
 
     def _try_merge_current_map(self):
         """检查当前地图是否和已有旧图重叠，如果是则合并。"""
