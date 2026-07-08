@@ -484,6 +484,9 @@ class _SpatialNode(Node):
                     self._nav_status = None
                     self._nav_target_name = None
                     self._nav_arrived.set()
+                    # Auto-resume mapping after navigation completes
+                    if self._auto_mapping_cb:
+                        threading.Thread(target=self._auto_mapping_cb, daemon=True).start()
             obs = ctrl.get("obsInfo", {})
             if obs.get("state") and obs.get("time", 0) > 10:
                 self._nav_error = "blocked by obstacle for >10s"
@@ -1078,8 +1081,7 @@ class SpatialPlugin:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["start_mapping", "stop_mapping",
-                                 "tag_place", "untag_place", "list_tags",
+                        "enum": ["tag_place", "untag_place", "list_tags",
                                  "list_maps", "delete_map",
                                  "navigate_to_tag", "navigate_to_pose",
                                  "wait_navigation_done",
@@ -1092,15 +1094,13 @@ class SpatialPlugin:
                     "x":           {"type": "number", "description": "Target X coordinate (meters)"},
                     "y":           {"type": "number", "description": "Target Y coordinate (meters)"},
                     "yaw":         {"type": "number", "description": "Target yaw (radians)"},
-                    "map_name":    {"type": "string", "description": "Map name (for start/stop mapping)"},
+                    "map_name":    {"type": "string", "description": "Map name (for delete_map)"},
                     "speed":       {"type": "number", "description": "Navigation speed 0.2-0.8 m/s (default 0.5)"},
                     "mode":        {"type": "integer", "description": "Obstacle mode: 0=detour(default), 1=stop"},
                     "stall_timeout": {"type": "number", "description": "Seconds without movement before declaring timeout (default 60)"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "start_mapping":    {"params": ["map_name"],            "description": "Start SLAM mapping (optional map_name)"},
-                    "stop_mapping":     {"params": [],                      "description": "Stop mapping and save the map"},
                     "tag_place":        {"params": ["name", "description"], "description": "Tag current position with a name"},
                     "untag_place":      {"params": ["name"],               "description": "Remove a place tag"},
                     "list_tags":        {"params": [],                     "description": "List all tags with relative positions"},
@@ -1220,6 +1220,67 @@ class SpatialPlugin:
 
     # ── Dispatch ─────────────────────────────────────────────────────────────
 
+    def _ensure_localized(self) -> dict | None:
+        """If currently mapping, auto stop → InitPose to switch to localized mode for navigation."""
+        with self._node._lock:
+            status = self._node._map_status
+        if status == "localized":
+            return None  # already navigable
+
+        if status == "mapping":
+            active_map = self._node._active_map
+            if not active_map:
+                return {"error": "No active map to localize against"}
+            pcd_path = f"{self._map_dir}/{active_map}.pcd"
+            self._node._maybe_save_pcd()
+            code, resp = self._client.StopMapping(pcd_path)
+            if code != 0:
+                return _rpc_error("StopMapping (pre-nav)", code, resp)
+
+            # InitPose with current pose so navigation knows where we are
+            pose = self._node.get_pose()
+            if pose:
+                yaw = pose["yaw"]
+                q_z = math.sin(yaw / 2)
+                q_w = math.cos(yaw / 2)
+                code, resp = self._client.InitPose(
+                    pose["x"], pose["y"], 0, 0, 0, q_z, q_w, pcd_path
+                )
+            else:
+                code, resp = self._client.InitPose(0, 0, 0, 0, 0, 0, 1.0, pcd_path)
+
+            if code != 0:
+                return _rpc_error("InitPose (pre-nav)", code, resp)
+
+            self._node.set_map_status("localized")
+            self._db.set_last_used_map(active_map)
+            print(f"[Spatial] Switched to localized mode for navigation (map={active_map})", flush=True)
+            return None
+
+        # idle — try loading last map
+        last_map = self._db.get_last_used_map()
+        if last_map:
+            map_info = self._db.get_map(last_map)
+            if map_info:
+                code, resp = self._client.InitPose(0, 0, 0, 0, 0, 0, 1.0, map_info["pcd_path"])
+                if code == 0:
+                    self._node.set_map_status("localized")
+                    self._node.set_active_map(last_map)
+                    return None
+        return {"error": "Cannot navigate: no map available for localization"}
+
+    def _resume_mapping_after_nav(self):
+        """Resume continuous mapping after navigation completes."""
+        time.sleep(1)  # brief pause before resuming
+        with self._node._lock:
+            status = self._node._map_status
+        if status == "mapping":
+            return  # already mapping
+        print("[Spatial] Resuming mapping after navigation", flush=True)
+        code, _ = self._client.StartMapping()
+        if code == 0:
+            self._node.set_map_status("mapping")
+
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
             return {"state": "ready"}
@@ -1233,31 +1294,7 @@ class SpatialPlugin:
                 return {"state": "running", "topic_out": [{"topic": self._slam_cloud_topic, "format": "sensor/pointcloud"}]}
             return {"state": "running", "topic_out": [{"topic": self._pos_tag_topic, "format": "data/json"}]}
 
-        if action == "start_mapping":
-            map_name = args.get("map_name", f"map_{int(time.time())}")
-            code, resp = self._client.StartMapping()
-            if code == 0:
-                pcd_path = f"{self._map_dir}/{map_name}.pcd"
-                self._node.clear_map_buffer()
-                self._node.set_map_status("mapping")
-                self._node.set_active_map(map_name)
-                self._db.add_map(map_name, pcd_path)
-                return {"status": "mapping", "map_name": map_name}
-            return _rpc_error("StartMapping", code, resp)
-
-        elif action == "stop_mapping":
-            active_map = self._node._active_map
-            if not active_map:
-                return {"error": "No active map"}
-            pcd_path = f"{self._map_dir}/{active_map}.pcd"
-            self._node._maybe_save_pcd()
-            code, resp = self._client.StopMapping(pcd_path)
-            self._node.set_map_status("idle")
-            if code == 0:
-                return {"status": "stopped", "map_name": active_map, "pcd_path": pcd_path}
-            return _rpc_error("StopMapping", code, resp)
-
-        elif action == "tag_place":
+        if action == "tag_place":
             name = args.get("name", "")
             if not name:
                 return {"error": "name is required"}
@@ -1313,6 +1350,9 @@ class SpatialPlugin:
             return {"error": f"Map '{map_name}' not found"}
 
         elif action == "navigate_to_tag":
+            err = self._ensure_localized()
+            if err:
+                return err
             tag_name = args.get("tag_name", "")
             if not tag_name:
                 return {"error": "tag_name is required"}
@@ -1334,6 +1374,9 @@ class SpatialPlugin:
             return _rpc_error("NavigateTo", code, resp)
 
         elif action == "navigate_to_pose":
+            err = self._ensure_localized()
+            if err:
+                return err
             x = float(args.get("x", 0))
             y = float(args.get("y", 0))
             yaw = float(args.get("yaw", 0))
