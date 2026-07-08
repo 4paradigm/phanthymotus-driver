@@ -1169,6 +1169,7 @@ class SpatialPlugin:
                         "type": "string",
                         "enum": ["tag_place", "untag_place", "list_tags",
                                  "list_maps", "delete_map",
+                                 "relocalize_at_tag",
                                  "navigate_to_tag", "navigate_to_pose",
                                  "wait_navigation_done",
                                  "pause_nav", "resume_nav", "stop_nav"],
@@ -1192,6 +1193,7 @@ class SpatialPlugin:
                     "list_tags":        {"params": [],                     "description": "List all tags with relative positions"},
                     "list_maps":        {"params": [],                     "description": "List all saved maps"},
                     "delete_map":       {"params": ["map_name"],           "description": "Delete a map and its associated data"},
+                    "relocalize_at_tag": {"params": ["tag_name"],          "description": "Relocalize near a known tag using ICP point cloud matching"},
                     "navigate_to_tag":  {"params": ["tag_name"], "description": "Navigate to a tagged place (A* path planning + obstacle avoidance)"},
                     "navigate_to_pose": {"params": ["x", "y", "yaw"], "description": "Navigate to coordinates (A* path planning + obstacle avoidance)"},
                     "wait_navigation_done": {"params": ["stall_timeout"], "description": "Block until navigation completes or robot is stuck"},
@@ -1244,60 +1246,20 @@ class SpatialPlugin:
                 self._db.add_map(map_name, pcd_path)
 
     def _do_auto_mapping(self) -> dict:
-        """Auto-mapping logic: mapping→track, localized→extend, idle→fingerprint→new."""
+        """启动时直接建新图。30s 后启动 merge 检查循环。"""
         with self._node._lock:
             status = self._node._map_status
-        print(f"[Spatial] _do_auto_mapping: current status={status}", flush=True)
 
         if status == "mapping":
-            print("[Spatial] SLAM already mapping, ensuring active_map is set", flush=True)
             if not self._node._active_map:
                 map_name = f"map_{int(time.time())}"
                 pcd_path = f"{self._map_dir}/{map_name}.pcd"
                 self._node.set_active_map(map_name)
                 self._db.add_map(map_name, pcd_path)
-            return {"status": "already_mapping", "map_name": self._node._active_map}
+            return {"status": "already_mapping"}
 
-        if status == "localized":
-            print("[Spatial] SLAM localized, calling StartMapping to extend", flush=True)
-            code, resp = self._client.StartMapping()
-            if code == 0:
-                self._node.set_map_status("mapping")
-                if not self._node._active_map:
-                    map_name = f"map_{int(time.time())}"
-                    pcd_path = f"{self._map_dir}/{map_name}.pcd"
-                    self._node.set_active_map(map_name)
-                    self._db.add_map(map_name, pcd_path)
-                return {"status": "continued", "map_name": self._node._active_map}
-
-        # Idle — try fingerprint matching
-        recent_cloud = self._node.get_recent_cloud()
-        cloud_size = len(recent_cloud) if recent_cloud is not None else 0
-        print(f"[Spatial] Fingerprint path: recent_cloud={cloud_size} points")
-
-        if recent_cloud is not None and cloud_size >= 100:
-            current_sc = self._sc_mgr.make_scan_context(recent_cloud)
-            match = self._sc_mgr.query(current_sc)
-            print(f"[Spatial] Fingerprint query: {match}")
-
-            if match:
-                map_name = match["map_name"]
-                map_info = self._db.get_map(map_name)
-                if map_info:
-                    pcd_path = map_info["pcd_path"]
-                    print(f"[Spatial] Matched map '{map_name}', trying InitPose + StartMapping")
-                    code, resp = self._client.InitPose(0, 0, 0, 0, 0, 0, 1.0, pcd_path)
-                    if code == 0:
-                        code2, _ = self._client.StartMapping()
-                        if code2 == 0:
-                            self._node.load_pcd_to_buffer(pcd_path)
-                            self._node.set_map_status("mapping")
-                            self._node.set_active_map(map_name)
-                            self._db.set_last_used_map(map_name)
-                            return {"status": "found", "map_name": map_name, "pose": match["pose"]}
-
-        # No match — start fresh
-        print("[Spatial] No match, starting new map")
+        # 直接开始新地图
+        print("[Spatial] Starting new map", flush=True)
         code, resp = self._client.StartMapping()
         if code == 0:
             map_name = f"map_{int(time.time())}"
@@ -1306,8 +1268,83 @@ class SpatialPlugin:
             self._node.set_map_status("mapping")
             self._node.set_active_map(map_name)
             self._db.add_map(map_name, pcd_path)
+            # 启动 merge 检查循环
+            threading.Thread(target=self._merge_check_loop, daemon=True).start()
             return {"status": "new", "map_name": map_name}
         return {"error": f"StartMapping failed, code={code}"}
+
+    def _merge_check_loop(self):
+        """后台：30s 后开始，每 30s 检查当前地图是否可以合并到已有地图。"""
+        time.sleep(30)  # 等点云积累
+        while True:
+            if not self._nav_executing:  # 导航时不 merge
+                try:
+                    self._try_merge_current_map()
+                except Exception as e:
+                    print(f"[Spatial] Merge check error: {e}", flush=True)
+            time.sleep(30)
+
+    def _try_merge_current_map(self):
+        """检查当前地图是否和已有旧图重叠，如果是则合并。"""
+        current_map = self._node._active_map
+        if not current_map:
+            return
+
+        recent_cloud = self._node.get_recent_cloud()
+        if recent_cloud is None or len(recent_cloud) < 500:
+            return
+
+        # 生成指纹并查询
+        sc = self._sc_mgr.make_scan_context(recent_cloud)
+        match = self._sc_mgr.query(sc)
+
+        if not match or match["map_name"] == current_map:
+            return  # 没匹配到不同地图
+
+        old_map_name = match["map_name"]
+        old_map_info = self._db.get_map(old_map_name)
+        if not old_map_info:
+            return
+
+        print(f"[Spatial] Merge: current '{current_map}' matches old '{old_map_name}' (score={match['score']:.4f})", flush=True)
+
+        # 1. 停止当前建图，保存 PCD
+        current_pcd = f"{self._map_dir}/{current_map}.pcd"
+        self._node._maybe_save_pcd()
+        code, _ = self._client.StopMapping(current_pcd)
+        if code != 0:
+            print(f"[Spatial] Merge: StopMapping failed, aborting", flush=True)
+            # 恢复建图
+            self._client.StartMapping()
+            return
+
+        time.sleep(1)
+
+        # 2. InitPose 加载旧地图
+        old_pcd = old_map_info["pcd_path"]
+        code, _ = self._client.InitPose(0, 0, 0, 0, 0, 0, 1.0, old_pcd)
+        if code != 0:
+            print(f"[Spatial] Merge: InitPose for old map failed, starting fresh", flush=True)
+            self._client.StartMapping()
+            return
+
+        # 3. StartMapping 继续扩展旧地图
+        code, _ = self._client.StartMapping()
+        if code == 0:
+            self._node.load_pcd_to_buffer(old_pcd)
+            self._node.set_map_status("mapping")
+            self._node.set_active_map(old_map_name)
+            self._db.set_last_used_map(old_map_name)
+            # 4. 迁移 POI 从新图到旧图
+            pois = self._db.list_pois(current_map)
+            for poi in pois:
+                self._db.add_poi(poi["name"], poi["x"], poi["y"], poi["yaw"], old_map_name, poi.get("description", ""))
+            # 5. 删除临时新图
+            self._db.delete_map(current_map)
+            self._sc_mgr.clear_map(current_map)
+            print(f"[Spatial] Merged into '{old_map_name}', deleted temp '{current_map}'", flush=True)
+        else:
+            print(f"[Spatial] Merge: StartMapping on old map failed", flush=True)
 
     # ── Dispatch ─────────────────────────────────────────────────────────────
 
@@ -1381,6 +1418,12 @@ class SpatialPlugin:
                 return {"status": "deleted", "map_name": map_name}
             return {"error": f"Map '{map_name}' not found"}
 
+        elif action == "relocalize_at_tag":
+            tag_name = args.get("tag_name", "")
+            if not tag_name:
+                return {"error": "tag_name is required"}
+            return self._relocalize_at_tag(tag_name)
+
         elif action == "navigate_to_tag":
             tag_name = args.get("tag_name", "")
             if not tag_name:
@@ -1426,6 +1469,105 @@ class SpatialPlugin:
             return {"status": "stopped"}
 
         return None
+
+    # ── Relocalization ────────────────────────────────────────────────────────
+
+    def _relocalize_at_tag(self, tag_name: str) -> dict:
+        """用 ICP 在已知 tag 附近精确定位。"""
+        from icp import icp_2d
+
+        # 查找 tag 所在的地图
+        all_maps = self._db.list_maps()
+        tag_info = None
+        target_map = None
+        for m in all_maps:
+            poi = self._db.find_poi(tag_name, m["name"])
+            if poi:
+                tag_info = poi
+                target_map = m
+                break
+
+        if not tag_info or not target_map:
+            return {"error": f"Tag '{tag_name}' not found in any map"}
+
+        pcd_path = target_map["pcd_path"]
+        if not os.path.exists(pcd_path):
+            return {"error": f"PCD file not found: {pcd_path}"}
+
+        # 加载目标地图点云
+        from path_planner import PathPlanner
+        target_cloud = PathPlanner._parse_pcd(pcd_path)
+        if target_cloud is None or len(target_cloud) < 100:
+            return {"error": "Failed to load target map PCD"}
+
+        # 获取当前点云
+        with self._node._map_buffer_lock:
+            if not self._node._map_buffer or len(self._node._map_buffer) < 100:
+                return {"error": "Not enough current point cloud data (need at least 100 points, try again later)"}
+            source_cloud = np.array(list(self._node._map_buffer.values()), dtype=np.float32)
+
+        print(f"[Spatial] Relocalize: source={len(source_cloud)} pts, target={len(target_cloud)} pts, "
+              f"init=({tag_info['x']:.2f}, {tag_info['y']:.2f}, yaw={tag_info['yaw']:.2f})", flush=True)
+
+        # ICP 对齐
+        result = icp_2d(
+            source_cloud, target_cloud,
+            init_x=tag_info["x"], init_y=tag_info["y"], init_yaw=tag_info["yaw"],
+            max_iterations=50, tolerance=0.0005, max_correspond_dist=3.0
+        )
+
+        if result is None:
+            return {"error": "ICP failed to converge"}
+
+        print(f"[Spatial] ICP result: x={result['x']:.3f}, y={result['y']:.3f}, "
+              f"yaw={result['yaw']:.3f}, score={result['score']:.4f}, "
+              f"iters={result['iterations']}, matches={result['correspondences']}", flush=True)
+
+        # 如果误差太大，可能 ICP 发散了
+        if result["score"] > 1.0:
+            return {"error": f"ICP score too high ({result['score']:.3f}), possibly diverged", "icp_result": result}
+
+        # 停止当前建图
+        active_map = self._node._active_map
+        if active_map:
+            current_pcd = f"{self._map_dir}/{active_map}.pcd"
+            self._node._maybe_save_pcd()
+            self._client.StopMapping(current_pcd)
+            time.sleep(0.5)
+
+        # InitPose 到精确位姿
+        yaw = result["yaw"]
+        q_z = math.sin(yaw / 2)
+        q_w = math.cos(yaw / 2)
+        code, resp = self._client.InitPose(result["x"], result["y"], 0, 0, 0, q_z, q_w, pcd_path)
+        if code != 0:
+            return _rpc_error("InitPose", code, resp)
+
+        # 切换到目标地图
+        self._node.load_pcd_to_buffer(pcd_path)
+        self._node.set_map_status("localized")
+        self._node.set_active_map(target_map["name"])
+        self._db.set_last_used_map(target_map["name"])
+        self._last_localized_time = time.time()
+
+        # 继续建图扩展
+        time.sleep(0.5)
+        code, _ = self._client.StartMapping()
+        if code == 0:
+            self._node.set_map_status("mapping")
+
+        # 清理旧的临时地图
+        if active_map and active_map != target_map["name"]:
+            self._db.delete_map(active_map)
+            self._sc_mgr.clear_map(active_map)
+
+        return {
+            "status": "relocalized",
+            "map": target_map["name"],
+            "pose": {"x": result["x"], "y": result["y"], "yaw": result["yaw"]},
+            "icp_score": result["score"],
+            "icp_iterations": result["iterations"],
+        }
 
     # ── Path Planner Navigation ──────────────────────────────────────────────
 
