@@ -276,10 +276,51 @@ class ControlledSpatialPlugin:
 
     PREFIX = "controlled_spatial"
 
+    @staticmethod
+    def _ensure_slam_service():
+        """Ensure unitree_slam and mid360_driver are running.
+
+        Uses nsenter to run in host mount namespace (avoids library mismatch between
+        container Ubuntu 22.04 and host Ubuntu 20.04). Requires pid:host + privileged.
+        """
+        import subprocess as sp
+
+        slam_bin = "/unitree/module/unitree_slam/bin/unitree_slam"
+        lidar_bin = "/unitree/module/unitree_slam/bin/mid360_driver"
+        work_dir = "/unitree/module/unitree_slam/bin"
+        log_dir = "/opt/phanthy-motus/data"
+
+        if not os.path.exists(slam_bin):
+            print("[ControlledSpatial] unitree_slam binary not found (volume not mounted?), skipping auto-start")
+            return
+
+        os.makedirs(log_dir, exist_ok=True)
+
+        # Check if already running (pid:host means we see host processes)
+        if sp.run(["pgrep", "-f", "unitree_slam"], capture_output=True).returncode != 0:
+            print("[ControlledSpatial] Starting unitree_slam via nsenter...", flush=True)
+            sp.Popen(
+                ["nsenter", "-t", "1", "-m", "--", "bash", "-c",
+                 f"cd {work_dir} && export CYCLONEDDS_URI=file:///home/unitree/cyclonedds_ws/cyclonedds.xml && "
+                 f"nohup ./unitree_slam > {log_dir}/unitree_slam.log 2>&1 &"],
+            )
+
+        if sp.run(["pgrep", "-f", "mid360_driver"], capture_output=True).returncode != 0:
+            print("[ControlledSpatial] Starting mid360_driver via nsenter...", flush=True)
+            sp.Popen(
+                ["nsenter", "-t", "1", "-m", "--", "bash", "-c",
+                 f"cd {work_dir} && export CYCLONEDDS_URI=file:///home/unitree/cyclonedds_ws/cyclonedds.xml && "
+                 f"nohup ./mid360_driver > {log_dir}/mid360_driver.log 2>&1 &"],
+            )
+
+        time.sleep(5)  # Wait for SLAM RPC server to initialize
+
     def __init__(self, plugin_config: dict, namespace: str, executor):
         network_iface = plugin_config.get("network_iface", "eth0")
+        self._ensure_slam_service()
         self._client = _SlamRpcProxy(network_iface)
-        self._pcd_dir = plugin_config.get("native_slam_pcd_dir", "/home/unitree")
+        self._pcd_dir = plugin_config.get("native_slam_pcd_dir", "/opt/phanthy-motus/data/maps")
+        os.makedirs(self._pcd_dir, exist_ok=True)
         db_path = plugin_config.get("native_slam_db_path", "/opt/phanthy-motus/data/controlled_spatial.db")
         self._db = _ControlledSpatialDB(db_path)
 
