@@ -484,9 +484,6 @@ class _SpatialNode(Node):
                     self._nav_status = None
                     self._nav_target_name = None
                     self._nav_arrived.set()
-                    # Auto-resume mapping after navigation completes
-                    if self._auto_mapping_cb:
-                        threading.Thread(target=self._auto_mapping_cb, daemon=True).start()
             obs = ctrl.get("obsInfo", {})
             if obs.get("state") and obs.get("time", 0) > 10:
                 self._nav_error = "blocked by obstacle for >10s"
@@ -1004,10 +1001,11 @@ class SpatialPlugin:
 
         time.sleep(5)
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
+    def __init__(self, plugin_config: dict, namespace: str, executor, rpc_proxy=None):
         network_iface = plugin_config.get("network_iface", "eth0")
         self._ensure_slam_service()
         self._client = _SlamRpcProxy(network_iface)
+        self._rpc_proxy = rpc_proxy  # for obstacles_avoid calls
 
         self._map_dir = plugin_config.get("native_slam_pcd_dir", "/home/unitree/maps")
         import subprocess as _sp
@@ -1021,6 +1019,13 @@ class SpatialPlugin:
         sc_db_path = os.path.join(os.path.dirname(db_path), "scan_context.db")
         from scan_context import ScanContextManager
         self._sc_mgr = ScanContextManager(sc_db_path)
+
+        # Path planner (loaded lazily when first map is available)
+        from path_planner import PathPlanner
+        self._planner = PathPlanner()
+        self._nav_executing = False
+        self._nav_waypoints: list[tuple] = []
+        self._nav_target_yaw: float = 0.0
 
         # Topics
         self._pos_tag_topic = f"/{namespace}/spatial/pos_tag" if namespace else "/spatial/pos_tag"
@@ -1106,8 +1111,8 @@ class SpatialPlugin:
                     "list_tags":        {"params": [],                     "description": "List all tags with relative positions"},
                     "list_maps":        {"params": [],                     "description": "List all saved maps"},
                     "delete_map":       {"params": ["map_name"],           "description": "Delete a map and its associated data"},
-                    "navigate_to_tag":  {"params": ["tag_name", "speed", "mode"], "description": "Navigate to a tagged place (mode 0=detour, 1=stop)"},
-                    "navigate_to_pose": {"params": ["x", "y", "yaw", "speed", "mode"], "description": "Navigate to coordinates (mode 0=detour, 1=stop)"},
+                    "navigate_to_tag":  {"params": ["tag_name"], "description": "Navigate to a tagged place (A* path planning + obstacle avoidance)"},
+                    "navigate_to_pose": {"params": ["x", "y", "yaw"], "description": "Navigate to coordinates (A* path planning + obstacle avoidance)"},
                     "wait_navigation_done": {"params": ["stall_timeout"], "description": "Block until navigation completes or robot is stuck"},
                     "pause_nav":        {"params": [],                     "description": "Pause navigation"},
                     "resume_nav":       {"params": [],                     "description": "Resume navigation"},
@@ -1225,71 +1230,6 @@ class SpatialPlugin:
 
     # ── Dispatch ─────────────────────────────────────────────────────────────
 
-    def _ensure_localized(self) -> dict | None:
-        """If currently mapping, auto stop → InitPose to switch to localized mode for navigation.
-        Uses shorter RPC timeouts to avoid HTTP client timeout."""
-        with self._node._lock:
-            status = self._node._map_status
-        if status == "localized":
-            return None  # already navigable
-
-        if status == "mapping":
-            active_map = self._node._active_map
-            if not active_map:
-                return {"error": "No active map to localize against"}
-            pcd_path = f"{self._map_dir}/{active_map}.pcd"
-            self._node._maybe_save_pcd()
-            code, resp = self._client.StopMapping(pcd_path)
-            if code != 0:
-                return _rpc_error("StopMapping (pre-nav)", code, resp)
-
-            time.sleep(0.5)  # brief pause for SLAM state transition
-
-            # InitPose with current pose so navigation knows where we are
-            pose = self._node.get_pose()
-            if pose:
-                yaw = pose["yaw"]
-                q_z = math.sin(yaw / 2)
-                q_w = math.cos(yaw / 2)
-                code, resp = self._client.InitPose(
-                    pose["x"], pose["y"], 0, 0, 0, q_z, q_w, pcd_path
-                )
-            else:
-                code, resp = self._client.InitPose(0, 0, 0, 0, 0, 0, 1.0, pcd_path)
-
-            if code != 0:
-                return _rpc_error("InitPose (pre-nav)", code, resp)
-
-            self._node.set_map_status("localized")
-            self._db.set_last_used_map(active_map)
-            self._last_localized_time = time.time()  # suppress _on_localized debounce
-            print(f"[Spatial] Switched to localized mode for navigation (map={active_map})", flush=True)
-            return None
-
-        # idle — try loading last map
-        last_map = self._db.get_last_used_map()
-        if last_map:
-            map_info = self._db.get_map(last_map)
-            if map_info:
-                code, resp = self._client.InitPose(0, 0, 0, 0, 0, 0, 1.0, map_info["pcd_path"])
-                if code == 0:
-                    self._node.set_map_status("localized")
-                    self._node.set_active_map(last_map)
-                    return None
-        return {"error": "Cannot navigate: no map available for localization"}
-
-    def _resume_mapping_after_nav(self):
-        """Resume continuous mapping after navigation completes."""
-        time.sleep(1)  # brief pause before resuming
-        with self._node._lock:
-            status = self._node._map_status
-        if status == "mapping":
-            return  # already mapping
-        print("[Spatial] Resuming mapping after navigation", flush=True)
-        code, _ = self._client.StartMapping()
-        if code == 0:
-            self._node.set_map_status("mapping")
-
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
             return {"state": "ready"}
@@ -1359,9 +1299,6 @@ class SpatialPlugin:
             return {"error": f"Map '{map_name}' not found"}
 
         elif action == "navigate_to_tag":
-            err = self._ensure_localized()
-            if err:
-                return err
             tag_name = args.get("tag_name", "")
             if not tag_name:
                 return {"error": "tag_name is required"}
@@ -1370,35 +1307,13 @@ class SpatialPlugin:
             if not poi:
                 return {"error": f"Tag '{tag_name}' not found", "available": [p["name"] for p in self._db.list_pois(active_map)]}
             yaw = poi.get("yaw", 0)
-            q_z = math.sin(yaw / 2)
-            q_w = math.cos(yaw / 2)
-            speed = max(0.2, min(0.8, float(args.get("speed", 0.5))))
-            mode = int(args.get("mode", 0))
-            self._node._nav_arrived.clear()
-            self._node._nav_error = None
-            code, resp = self._client.NavigateTo(poi["x"], poi["y"], 0, 0, 0, q_z, q_w, speed=speed, mode=mode)
-            if code == 0:
-                self._node.set_nav_target(tag_name)
-                return {"status": "navigating", "target": tag_name, "pose": {"x": poi["x"], "y": poi["y"], "yaw": yaw}}
-            return _rpc_error("NavigateTo", code, resp)
+            return self._navigate_with_planner(poi["x"], poi["y"], yaw, tag_name=tag_name)
 
         elif action == "navigate_to_pose":
-            err = self._ensure_localized()
-            if err:
-                return err
             x = float(args.get("x", 0))
             y = float(args.get("y", 0))
             yaw = float(args.get("yaw", 0))
-            q_z = math.sin(yaw / 2)
-            q_w = math.cos(yaw / 2)
-            speed = max(0.2, min(0.8, float(args.get("speed", 0.5))))
-            mode = int(args.get("mode", 0))
-            self._node._nav_arrived.clear()
-            self._node._nav_error = None
-            code, resp = self._client.NavigateTo(x, y, 0, 0, 0, q_z, q_w, speed=speed, mode=mode)
-            if code == 0:
-                return {"status": "navigating", "target_pose": {"x": x, "y": y, "yaw": yaw}}
-            return _rpc_error("NavigateTo", code, resp)
+            return self._navigate_with_planner(x, y, yaw)
 
         elif action == "wait_navigation_done":
             stall_timeout = float(args.get("stall_timeout", 60))
@@ -1426,19 +1341,143 @@ class SpatialPlugin:
                         last_pose = current_pose
 
                 if time.time() - stall_start > stall_timeout:
-                    self._client.PauseNav()
+                    self._nav_executing = False
                     return {"status": "timeout", "error": f"No movement for {stall_timeout}s, navigation cancelled"}
 
         elif action == "pause_nav":
-            code, resp = self._client.PauseNav()
-            return {"status": "paused"} if code == 0 else _rpc_error("PauseNav", code)
+            self._nav_executing = False
+            return {"status": "paused"}
 
         elif action == "resume_nav":
-            code, resp = self._client.ResumeNav()
-            return {"status": "resumed"} if code == 0 else _rpc_error("ResumeNav", code)
+            return {"error": "resume not supported with path planner navigation"}
 
         elif action == "stop_nav":
-            self._client.PauseNav()
+            self._nav_executing = False
             return {"status": "stopped"}
 
         return None
+
+    # ── Path Planner Navigation ──────────────────────────────────────────────
+
+    def _ensure_planner_loaded(self) -> bool:
+        """确保路径规划器已加载当前地图。"""
+        if self._planner.is_loaded:
+            return True
+        # 尝试从当前地图的 voxel buffer 加载
+        with self._node._map_buffer_lock:
+            if self._node._map_buffer:
+                pts = np.array(list(self._node._map_buffer.values()), dtype=np.float32)
+                if self._planner.load_from_buffer(pts):
+                    print(f"[Spatial] PathPlanner loaded from buffer ({len(pts)} points)")
+                    return True
+        # 尝试从 PCD 文件加载
+        active_map = self._node._active_map
+        if active_map:
+            pcd_path = f"{self._map_dir}/{active_map}.pcd"
+            if os.path.exists(pcd_path):
+                if self._planner.load_pcd(pcd_path):
+                    return True
+        return False
+
+    def _navigate_with_planner(self, target_x: float, target_y: float, target_yaw: float,
+                               tag_name: str | None = None) -> dict:
+        """用路径规划器 + obstacles_avoid 执行导航（立即返回，后台执行）。"""
+        if not self._rpc_proxy:
+            return {"error": "obstacles_avoid RPC not available (no rpc_proxy)"}
+
+        pose = self._node.get_pose()
+        if not pose:
+            return {"error": "No current pose available"}
+
+        if not self._ensure_planner_loaded():
+            return {"error": "Path planner: no map loaded"}
+
+        # 规划路径
+        waypoints = self._planner.plan((pose["x"], pose["y"]), (target_x, target_y))
+        if not waypoints:
+            return {"error": f"No path found from ({pose['x']:.1f},{pose['y']:.1f}) to ({target_x:.1f},{target_y:.1f})"}
+
+        # 设置导航状态
+        self._nav_waypoints = waypoints
+        self._nav_target_yaw = target_yaw
+        self._nav_executing = True
+        self._node._nav_arrived.clear()
+        self._node._nav_error = None
+        if tag_name:
+            self._node.set_nav_target(tag_name)
+
+        # 后台执行
+        threading.Thread(target=self._execute_waypoints, daemon=True).start()
+
+        return {
+            "status": "navigating",
+            "target": tag_name or f"({target_x:.1f},{target_y:.1f})",
+            "waypoints": len(waypoints),
+            "method": "path_planner",
+        }
+
+    def _execute_waypoints(self):
+        """后台线程：逐个 waypoint 调用 obstacles_avoid.move_to_absolute。"""
+        try:
+            # Take control
+            self._rpc_proxy.OA_UseRemoteCommandFromApi(True)
+            self._rpc_proxy.OA_SwitchSet(True)
+            time.sleep(0.3)
+
+            for i, (wx, wy) in enumerate(self._nav_waypoints):
+                if not self._nav_executing:
+                    break
+
+                print(f"[Spatial] Waypoint {i+1}/{len(self._nav_waypoints)}: ({wx:.2f}, {wy:.2f})", flush=True)
+                self._rpc_proxy.OA_MoveToAbsolutePosition(wx, wy, 0)
+
+                # 等待到达当前 waypoint
+                stall_start = time.time()
+                last_pose = self._node.get_pose()
+                while self._nav_executing:
+                    time.sleep(0.5)
+                    current_pose = self._node.get_pose()
+                    if current_pose:
+                        dx = current_pose["x"] - wx
+                        dy = current_pose["y"] - wy
+                        dist = math.sqrt(dx * dx + dy * dy)
+                        if dist < 0.3:
+                            break  # waypoint reached
+                        # 检查是否在移动
+                        if last_pose:
+                            moved = math.sqrt(
+                                (current_pose["x"] - last_pose["x"])**2 +
+                                (current_pose["y"] - last_pose["y"])**2
+                            )
+                            if moved > 0.03:
+                                stall_start = time.time()
+                        last_pose = current_pose
+
+                    # 超时检测 (单个 waypoint 超时 30s)
+                    if time.time() - stall_start > 30:
+                        print(f"[Spatial] Waypoint {i+1} stalled, skipping", flush=True)
+                        break
+
+            # 最终调整朝向
+            if self._nav_executing and self._nav_waypoints:
+                final_x, final_y = self._nav_waypoints[-1]
+                self._rpc_proxy.OA_MoveToAbsolutePosition(final_x, final_y, self._nav_target_yaw)
+                time.sleep(2)
+
+            # 释放控制
+            self._rpc_proxy.OA_UseRemoteCommandFromApi(False)
+
+            if self._nav_executing:
+                self._nav_executing = False
+                self._node._nav_arrived.set()
+                print("[Spatial] Navigation complete (path planner)", flush=True)
+
+        except Exception as e:
+            print(f"[Spatial] Waypoint execution error: {e}", flush=True)
+            self._nav_executing = False
+            self._node._nav_error = str(e)
+            self._node._nav_arrived.set()
+            try:
+                self._rpc_proxy.OA_UseRemoteCommandFromApi(False)
+            except Exception:
+                pass
