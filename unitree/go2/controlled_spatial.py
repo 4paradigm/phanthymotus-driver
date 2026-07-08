@@ -319,8 +319,11 @@ class ControlledSpatialPlugin:
         network_iface = plugin_config.get("network_iface", "eth0")
         self._ensure_slam_service()
         self._client = _SlamRpcProxy(network_iface)
-        self._pcd_dir = plugin_config.get("native_slam_pcd_dir", "/opt/phanthy-motus/data/maps")
-        os.makedirs(self._pcd_dir, exist_ok=True)
+        self._pcd_dir = plugin_config.get("native_slam_pcd_dir", "/home/unitree/maps")
+        # Create dir on host via nsenter (unitree_slam runs in host namespace)
+        import subprocess as _sp
+        _sp.run(["nsenter", "-t", "1", "-m", "--", "mkdir", "-p", self._pcd_dir],
+                capture_output=True)
         db_path = plugin_config.get("native_slam_db_path", "/opt/phanthy-motus/data/controlled_spatial.db")
         self._db = _ControlledSpatialDB(db_path)
 

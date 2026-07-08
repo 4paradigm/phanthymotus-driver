@@ -26,7 +26,7 @@ plugins:
     enabled: true
   controlled_spatial:
     enabled: true
-    native_slam_pcd_dir: /home/unitree
+    native_slam_pcd_dir: /home/unitree/maps
     native_slam_db_path: /opt/phanthy-motus/data/controlled_spatial.db
   asr:
     enabled: true
