@@ -1498,7 +1498,7 @@ class SpatialPlugin:
         ex, ey = waypoints[-1]
         for offset in OFFSETS:
             path_points.append((ex, ey, PATH_Z))
-        self._node._nav_path_overlay = nav_path_arr
+        self._node._nav_path_overlay = np.array(path_points, dtype=np.float32)
         print(f"[Spatial] Nav path overlay set: {len(path_points)} points, {len(waypoints)} waypoints", flush=True)
 
         # 设置导航状态
