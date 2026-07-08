@@ -1562,43 +1562,52 @@ class SpatialPlugin:
         return a
 
     def _execute_waypoints(self):
-        """后台线程：逐个 waypoint，先转再走，SLAM 位姿闭环。"""
+        """后台线程：平滑导航 + 动态重规划。
+
+        - 首个 waypoint: 原地转向后前进
+        - 后续 waypoints: look-ahead 预瞄，边走边转不停顿
+        - 每 1s 检测路径障碍，自动重规划
+        """
+        final_goal = self._nav_waypoints[-1]  # 最终目标（重规划用）
+        last_replan_time = time.time()
+
         try:
-            for i, (wx, wy) in enumerate(self._nav_waypoints):
-                if not self._nav_executing:
-                    break
+            i = 0
+            while i < len(self._nav_waypoints) and self._nav_executing:
+                wx, wy = self._nav_waypoints[i]
+                is_first = (i == 0)
+                is_last = (i == len(self._nav_waypoints) - 1)
 
                 print(f"[Spatial] Waypoint {i+1}/{len(self._nav_waypoints)}: ({wx:.2f}, {wy:.2f})", flush=True)
 
-                # 更新 nav_path overlay（只显示剩余路段）
+                # 更新 nav_path overlay
                 overlay = self._build_path_overlay(self._nav_waypoints, i)
                 self._node._nav_path_overlay = overlay
 
-                stall_start = time.time()
-
-                # Phase 1: 转向目标
-                while self._nav_executing:
-                    pose = self._node.get_pose()
-                    if not pose:
+                # 首个 waypoint: 先原地转向
+                if is_first:
+                    turn_start = time.time()
+                    while self._nav_executing:
+                        pose = self._node.get_pose()
+                        if not pose:
+                            time.sleep(0.1)
+                            continue
+                        dx = wx - pose["x"]
+                        dy = wy - pose["y"]
+                        dist = math.sqrt(dx * dx + dy * dy)
+                        if dist < 0.3:
+                            break
+                        heading = math.atan2(dy, dx)
+                        err = self._normalize_angle(heading - pose["yaw"])
+                        if abs(err) < 0.2:
+                            break
+                        vyaw = max(-1.5, min(1.5, err * 1.5))
+                        self._rpc_proxy.Move(0, 0, vyaw)
                         time.sleep(0.1)
-                        continue
-                    dx = wx - pose["x"]
-                    dy = wy - pose["y"]
-                    dist = math.sqrt(dx * dx + dy * dy)
-                    if dist < 0.3:
-                        break  # 已经很近了，不用转
-                    target_heading = math.atan2(dy, dx)
-                    heading_err = self._normalize_angle(target_heading - pose["yaw"])
-                    if abs(heading_err) < 0.15:
-                        break  # 方向对了
-                    vyaw = max(-1.5, min(1.5, heading_err * 1.5))
-                    self._rpc_proxy.Move(0, 0, vyaw)
-                    time.sleep(0.1)
-                    if time.time() - stall_start > 10:
-                        print(f"[Spatial] Waypoint {i+1} turn timeout", flush=True)
-                        break
+                        if time.time() - turn_start > 8:
+                            break
 
-                # Phase 2: 直线前进（边走边微调方向）
+                # 前进到 waypoint（边走边转，look-ahead 预瞄）
                 stall_start = time.time()
                 last_pose = self._node.get_pose()
                 while self._nav_executing:
@@ -1606,27 +1615,58 @@ class SpatialPlugin:
                     if not pose:
                         time.sleep(0.1)
                         continue
+
                     dx = wx - pose["x"]
                     dy = wy - pose["y"]
                     dist = math.sqrt(dx * dx + dy * dy)
+
                     if dist < 0.3:
                         print(f"[Spatial] Waypoint {i+1} reached (dist={dist:.2f}m)", flush=True)
                         break
-                    target_heading = math.atan2(dy, dx)
+
+                    # 计算航向：look-ahead 预瞄下一个 waypoint
+                    current_heading = math.atan2(dy, dx)
+                    target_heading = current_heading
+
+                    if not is_last and dist < 1.0:
+                        next_wx, next_wy = self._nav_waypoints[i + 1]
+                        next_heading = math.atan2(next_wy - pose["y"], next_wx - pose["x"])
+                        blend = 1.0 - dist / 1.0  # 越近当前 wp，越偏向下一个
+                        # 角度混合（处理 -pi/pi 边界）
+                        diff = self._normalize_angle(next_heading - current_heading)
+                        target_heading = current_heading + blend * diff
+
                     heading_err = self._normalize_angle(target_heading - pose["yaw"])
 
-                    # 如果偏航太大，减速并加大转向
-                    if abs(heading_err) > 0.5:
-                        vx = 0.1
-                        vyaw = max(-1.5, min(1.5, heading_err * 2.0))
+                    # 速度控制
+                    if abs(heading_err) > 0.8:
+                        # 偏航很大：大幅减速转向
+                        vx = 0.05
+                        vyaw = max(-2.0, min(2.0, heading_err * 2.0))
+                    elif abs(heading_err) > 0.3:
+                        # 中等偏航：减速+转
+                        vx = max(0.1, min(0.3, dist * 0.5))
+                        vyaw = max(-1.5, min(1.5, heading_err * 1.5))
                     else:
-                        vx = max(0.1, min(0.5, dist * 0.8))
-                        vyaw = max(-0.5, min(0.5, heading_err * 1.0))
+                        # 方向正确：全速前进+微调
+                        vx = max(0.15, min(1.0, dist * 0.8))
+                        vyaw = max(-0.8, min(0.8, heading_err * 1.0))
 
                     self._rpc_proxy.Move(vx, 0, vyaw)
                     time.sleep(0.1)
 
-                    # 检测卡住
+                    # 动态重规划（每 1s）
+                    now = time.time()
+                    if now - last_replan_time > 1.0:
+                        last_replan_time = now
+                        if self._try_replan(i, final_goal):
+                            # 路径已更新，重置 waypoint 索引到 0（从新路径开始）
+                            i = 0
+                            overlay = self._build_path_overlay(self._nav_waypoints, 0)
+                            self._node._nav_path_overlay = overlay
+                            break  # 跳出内层循环，重新从 while i < len 开始
+
+                    # 卡住检测
                     if last_pose:
                         moved = math.sqrt(
                             (pose["x"] - last_pose["x"])**2 +
@@ -1635,19 +1675,19 @@ class SpatialPlugin:
                         if moved > 0.03:
                             stall_start = time.time()
                     last_pose = pose
-
-                    if time.time() - stall_start > 30:
+                    if now - stall_start > 30:
                         print(f"[Spatial] Waypoint {i+1} stalled, skipping", flush=True)
                         break
+                else:
+                    # while 正常退出（不是 break）→ 重规划触发了，继续外层循环
+                    continue
 
-                # 停一下再继续下一个 waypoint
-                self._rpc_proxy.Move(0, 0, 0)
-                time.sleep(0.3)
+                i += 1  # 下一个 waypoint（只有 break 到达时才递增）
 
             # 最终转到目标朝向
             if self._nav_executing and self._nav_target_yaw != 0:
                 print(f"[Spatial] Final yaw adjustment to {self._nav_target_yaw:.2f}", flush=True)
-                for _ in range(50):  # 最多 5s
+                for _ in range(50):
                     pose = self._node.get_pose()
                     if not pose:
                         time.sleep(0.1)
@@ -1659,7 +1699,6 @@ class SpatialPlugin:
                     self._rpc_proxy.Move(0, 0, vyaw)
                     time.sleep(0.1)
 
-            # 停止
             self._rpc_proxy.Move(0, 0, 0)
 
             if self._nav_executing:
@@ -1677,3 +1716,36 @@ class SpatialPlugin:
             self._node._nav_error = str(e)
             self._node._nav_path_overlay = None
             self._node._nav_arrived.set()
+
+    def _try_replan(self, current_wp_idx: int, final_goal: tuple) -> bool:
+        """检查剩余路径是否被阻挡，如果是则重新规划。返回 True 如果路径已更新。"""
+        remaining = self._nav_waypoints[current_wp_idx:]
+        if len(remaining) < 2:
+            return False
+
+        # 刷新 planner 地图数据
+        with self._node._map_buffer_lock:
+            if not self._node._map_buffer:
+                return False
+            pts = np.array(list(self._node._map_buffer.values()), dtype=np.float32)
+        self._planner.load_from_buffer(pts)
+
+        # 检查剩余 waypoints 是否有被新障碍阻挡的
+        blocked = False
+        for wx, wy in remaining:
+            if not self._planner.is_reachable(wx, wy):
+                blocked = True
+                break
+        if not blocked:
+            return False
+
+        # 重新规划
+        pose = self._node.get_pose()
+        if not pose:
+            return False
+        new_path = self._planner.plan((pose["x"], pose["y"]), final_goal)
+        if new_path and len(new_path) >= 2:
+            print(f"[Spatial] Replanned: {len(self._nav_waypoints)} → {len(new_path)} waypoints (obstacle detected)", flush=True)
+            self._nav_waypoints = new_path
+            return True
+        return False
