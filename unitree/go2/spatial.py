@@ -852,7 +852,7 @@ class _SpatialNode(Node):
             self._schedule_save_timer()
             return
 
-        pcd_path = os.path.join(self._pcd_save_dir, f"{active_map}.pcd")
+        pcd_path = os.path.join(self._pcd_save_dir, f"{active_map}_viz.pcd")
         os.makedirs(os.path.dirname(pcd_path), exist_ok=True)
         try:
             pts = np.array(all_points, dtype=np.float32)
