@@ -9,6 +9,7 @@ unitree-go2:
     - /dev:/dev
     - /unitree/module:/unitree/module
     - /home/unitree/cyclonedds_ws:/home/unitree/cyclonedds_ws:ro
+    - /home/unitree/maps:/home/unitree/maps
     - /opt/phanthy-motus/data:/opt/phanthy-motus/data
     - /usr/lib/aarch64-linux-gnu:/host_lib/aarch64-linux-gnu:ro
     - /usr/local/lib:/host_lib/local:ro
