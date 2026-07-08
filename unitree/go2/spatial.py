@@ -353,6 +353,11 @@ class _SpatialNode(Node):
         self._nav_path_overlay: np.ndarray | None = None   # Nx3 path points (z=0.3)
         self._grid_overlay: np.ndarray | None = None        # Nx3 obstacle points (z=0.5)
 
+        # Grid map 2D cache (refreshed periodically from planner)
+        self._planner_ref = None  # set by SpatialPlugin
+        self._grid_pts_cache: np.ndarray | None = None
+        self._planner_grid_pts_cache_valid = False
+
         # State
         self._current_pose: dict | None = None
         self._map_status: str = "idle"    # idle | mapping | localized
@@ -618,6 +623,7 @@ class _SpatialNode(Node):
                 new_size = len(self._map_buffer)
                 if new_size > prev_size:
                     self._map_buffer_dirty = True
+                    self._planner_grid_pts_cache_valid = False  # refresh grid_map
 
             # Update recent cloud ring buffer
             n = len(pts_arr)
@@ -779,28 +785,32 @@ class _SpatialNode(Node):
         self._publish_grid_map_2d(robot_x, robot_y, robot_yaw)
 
     def _publish_grid_map_2d(self, robot_x: float, robot_y: float, robot_yaw: float):
-        """发布 2D 占据栅格鸟瞰图（地图投影 + 障碍物 + 导航路线，全部 z=0）。"""
+        """发布 2D 占据栅格鸟瞰图（规划器的障碍物栅格 + 导航路线）。"""
         parts = []
 
-        # 将 3D voxel map 投影为 2D (取 z 在障碍物范围内的点，压平到 z=0)
-        with self._map_buffer_lock:
-            if self._map_buffer:
-                all_pts = np.array(list(self._map_buffer.values()), dtype=np.float32)
-                # 只保留低高度的点作为 2D 地图轮廓 (z < 1.0)
-                mask = all_pts[:, 2] < 1.0
-                if np.any(mask):
-                    map_2d = all_pts[mask].copy()
-                    map_2d[:, 2] = 0.0
-                    # 降采样（2D 不需要太密）
-                    if len(map_2d) > 30000:
-                        indices = np.random.choice(len(map_2d), 30000, replace=False)
-                        map_2d = map_2d[indices]
-                    parts.append(map_2d)
+        # 尝试加载/刷新规划器栅格（每次都用最新 voxel buffer）
+        if not self._planner_grid_pts_cache_valid:
+            with self._map_buffer_lock:
+                if self._map_buffer and len(self._map_buffer) > 100:
+                    pts_buf = np.array(list(self._map_buffer.values()), dtype=np.float32)
+                    # 使用 SpatialPlugin 设置的 planner 引用来刷新
+                    if self._planner_ref is not None:
+                        self._planner_ref.load_from_buffer(pts_buf)
+                        grid_pts = self._planner_ref.get_grid_as_points()
+                        if grid_pts is not None:
+                            # 压平到 z=0 用于 2D 显示
+                            grid_pts_2d = grid_pts.copy()
+                            grid_pts_2d[:, 2] = 0.0
+                            self._grid_pts_cache = grid_pts_2d
+                            self._planner_grid_pts_cache_valid = True
 
-        # 导航路线点 (z=0.01, 略高于地图以便区分)
+        if self._grid_pts_cache is not None:
+            parts.append(self._grid_pts_cache)
+
+        # 导航路线点 (z=0.3, 高于障碍物以便在2D视图中区分)
         if self._nav_path_overlay is not None and len(self._nav_path_overlay) > 0:
             path_2d = self._nav_path_overlay.copy()
-            path_2d[:, 2] = 0.01
+            path_2d[:, 2] = 0.3
             parts.append(path_2d)
 
         if not parts:
@@ -813,7 +823,7 @@ class _SpatialNode(Node):
             pts = pts[indices]
             num_points = 50000
 
-        flags = 0x01  # bit0=full_map, bit1=0 (2D)
+        flags = 0x03  # full_map + has_z
         header = struct.pack('<fffBI', robot_x, robot_y, robot_yaw, flags, num_points)
 
         ros_msg = UInt8MultiArray()
@@ -1101,6 +1111,7 @@ class SpatialPlugin:
         self._node.set_active_map(self._db.get_last_used_map())
         self._node.set_pcd_save_dir(self._map_dir)
         self._node._auto_mapping_cb = self._on_localized
+        self._node._planner_ref = self._planner  # for grid_map 2D publishing
         executor.add_node(self._node)
 
     def get_tools(self) -> list:
