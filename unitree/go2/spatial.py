@@ -1360,15 +1360,18 @@ class SpatialPlugin:
     # ── Path Planner Navigation ──────────────────────────────────────────────
 
     def _ensure_planner_loaded(self) -> bool:
-        """确保路径规划器已加载当前地图。"""
-        if self._planner.is_loaded:
-            return True
-        # 尝试从当前地图的 voxel buffer 加载
+        """加载/刷新路径规划器（每次导航重新加载，因为地图在持续增长）。"""
+        # 每次导航都重新加载最新地图数据
         with self._node._map_buffer_lock:
             if self._node._map_buffer:
                 pts = np.array(list(self._node._map_buffer.values()), dtype=np.float32)
                 if self._planner.load_from_buffer(pts):
-                    print(f"[Spatial] PathPlanner loaded from buffer ({len(pts)} points)")
+                    grid = self._planner._grid
+                    occupied = np.sum(grid > 0) if grid is not None else 0
+                    total = grid.size if grid is not None else 0
+                    print(f"[Spatial] PathPlanner refreshed: {len(pts)} pts, "
+                          f"grid {self._planner._width}x{self._planner._height}, "
+                          f"occupied={occupied}/{total} ({100*occupied/max(total,1):.1f}%)", flush=True)
                     return True
         # 尝试从 PCD 文件加载
         active_map = self._node._active_map
