@@ -130,10 +130,12 @@ class _LidarNode(Node):
             valid_raw = raw[mask]
 
             if valid_raw.shape[0] > 0:
-                # Flip Z axis: renderer expects Z-down but Go2 lidar outputs Z-up
+                # Transform Go2 lidar coords (X-front, Y-left, Z-up) to
+                # renderer expected coords (X-back, Y-left, Z-down) by negating X and Z
                 frame = valid_raw.copy()
                 frame_xyz = frame[:, :12].view(np.float32).reshape(-1, 3)
-                frame_xyz[:, 2] = -frame_xyz[:, 2]
+                frame_xyz[:, 0] = -frame_xyz[:, 0]  # flip X (front→back)
+                frame_xyz[:, 2] = -frame_xyz[:, 2]  # flip Z (up→down)
                 accum_chunks.append(frame)
                 accum_count += 1
 
