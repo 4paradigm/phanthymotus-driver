@@ -7,6 +7,11 @@ unitree-go2:
   privileged: true
   volumes:
     - /dev:/dev
+    - /unitree/module:/unitree/module
+    - /home/unitree/cyclonedds_ws:/home/unitree/cyclonedds_ws:ro
+    - /opt/phanthy-motus/data:/opt/phanthy-motus/data
+    - /usr/lib/aarch64-linux-gnu:/host_lib/aarch64-linux-gnu:ro
+    - /usr/local/lib:/host_lib/local:ro
   environment:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
