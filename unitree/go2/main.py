@@ -109,6 +109,13 @@ class Go2DeviceBundle:
             self._plugins.append(ControlledSpatialPlugin(controlled_cfg, namespace, executor))
             print("[bundle] ControlledSpatialPlugin loaded")
 
+        if plugins_cfg.get("spatial", {}).get("enabled", False):
+            from spatial import SpatialPlugin
+            spatial_cfg = dict(plugins_cfg["spatial"])
+            spatial_cfg["network_iface"] = network_iface
+            self._plugins.append(SpatialPlugin(spatial_cfg, namespace, executor))
+            print("[bundle] SpatialPlugin loaded")
+
         if plugins_cfg.get("asr", {}).get("enabled", False):
             from device import AsrPlugin
             self._plugins.append(AsrPlugin(plugins_cfg["asr"], namespace, executor))
