@@ -1141,6 +1141,11 @@ class SpatialPlugin:
         """Called when SLAM reports localization success. Start mapping to extend."""
         if self._node._map_status == "mapping":
             return
+        # Debounce: don't re-trigger within 5s of last call
+        now = time.time()
+        if hasattr(self, '_last_localized_time') and now - self._last_localized_time < 5.0:
+            return
+        self._last_localized_time = now
         print("[Spatial] _on_localized: starting mapping to extend map", flush=True)
         code, resp = self._client.StartMapping()
         print(f"[Spatial] StartMapping after localization → code={code}", flush=True)
@@ -1221,7 +1226,8 @@ class SpatialPlugin:
     # ── Dispatch ─────────────────────────────────────────────────────────────
 
     def _ensure_localized(self) -> dict | None:
-        """If currently mapping, auto stop → InitPose to switch to localized mode for navigation."""
+        """If currently mapping, auto stop → InitPose to switch to localized mode for navigation.
+        Uses shorter RPC timeouts to avoid HTTP client timeout."""
         with self._node._lock:
             status = self._node._map_status
         if status == "localized":
@@ -1236,6 +1242,8 @@ class SpatialPlugin:
             code, resp = self._client.StopMapping(pcd_path)
             if code != 0:
                 return _rpc_error("StopMapping (pre-nav)", code, resp)
+
+            time.sleep(0.5)  # brief pause for SLAM state transition
 
             # InitPose with current pose so navigation knows where we are
             pose = self._node.get_pose()
@@ -1254,6 +1262,7 @@ class SpatialPlugin:
 
             self._node.set_map_status("localized")
             self._db.set_last_used_map(active_map)
+            self._last_localized_time = time.time()  # suppress _on_localized debounce
             print(f"[Spatial] Switched to localized mode for navigation (map={active_map})", flush=True)
             return None
 
