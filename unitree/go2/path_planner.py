@@ -255,6 +255,18 @@ class PathPlanner:
             return False
         return self._grid[gy, gx] == 0
 
+    def get_grid_as_points(self) -> np.ndarray | None:
+        """返回障碍物栅格的世界坐标点云 (Nx3 float32, z=0.5)，用于可视化。"""
+        if self._grid is None:
+            return None
+        gy_arr, gx_arr = np.where(self._grid > 0)
+        if len(gx_arr) == 0:
+            return None
+        x = gx_arr * self._resolution + self._origin_x + self._resolution / 2
+        y = gy_arr * self._resolution + self._origin_y + self._resolution / 2
+        z = np.full_like(x, 0.5)
+        return np.column_stack([x, y, z]).astype(np.float32)
+
     # ── 内部方法 ──────────────────────────────────────────────────────────────
 
     def _world_to_grid(self, x: float, y: float) -> tuple:
