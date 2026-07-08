@@ -1271,113 +1271,107 @@ class SpatialPlugin:
             self._node.set_map_status("mapping")
             self._node.set_active_map(map_name)
             self._db.add_map(map_name, pcd_path)
-            # 启动 5s 后做一次 merge 检查
-            threading.Thread(target=self._merge_check_once, daemon=True).start()
+            # 5s 后检查是否有旧图可用
+            threading.Thread(target=self._try_recognize_existing_map, daemon=True).start()
             return {"status": "new", "map_name": map_name}
         return {"error": f"StartMapping failed, code={code}"}
 
-    def _merge_check_once(self):
-        """启动 5s 后做一次 merge 检查：如果当前地图匹配已有旧图则合并。"""
+    def _try_recognize_existing_map(self):
+        """启动 5s 后：用 Scan Context + ICP 检查是否在已知地图中，是则切换。"""
         time.sleep(5)
         try:
-            self._try_merge_current_map()
-        except Exception as e:
-            print(f"[Spatial] Merge check error: {e}", flush=True)
+            current_map = self._node._active_map
+            if not current_map:
+                return
 
-    def _try_merge_current_map(self):
-        """检查当前地图是否和已有旧图重叠，如果是则合并。"""
-        current_map = self._node._active_map
-        if not current_map:
-            return
+            # 1. 获取当前点云
+            recent_cloud = self._node.get_recent_cloud()
+            if recent_cloud is None or len(recent_cloud) < 500:
+                print("[Spatial] Recognize: not enough cloud data yet, staying on new map", flush=True)
+                return
 
-        recent_cloud = self._node.get_recent_cloud()
-        if recent_cloud is None or len(recent_cloud) < 500:
-            return
+            # 2. Scan Context 粗匹配
+            sc = self._sc_mgr.make_scan_context(recent_cloud)
+            match = self._sc_mgr.query(sc)
+            if not match or match["map_name"] == current_map:
+                print("[Spatial] Recognize: no matching old map found, staying on new map", flush=True)
+                return
 
-        # 生成指纹并查询
-        sc = self._sc_mgr.make_scan_context(recent_cloud)
-        match = self._sc_mgr.query(sc)
+            old_map_name = match["map_name"]
+            old_map_info = self._db.get_map(old_map_name)
+            if not old_map_info:
+                return
 
-        if not match or match["map_name"] == current_map:
-            return  # 没匹配到不同地图
+            old_pcd = old_map_info["pcd_path"]
+            print(f"[Spatial] Recognize: matched '{old_map_name}' (score={match['score']:.4f})", flush=True)
 
-        old_map_name = match["map_name"]
-        old_map_info = self._db.get_map(old_map_name)
-        if not old_map_info:
-            return
+            # 3. ICP 精确定位
+            from icp import icp_2d
+            from path_planner import PathPlanner
 
-        print(f"[Spatial] Merge: current '{current_map}' matches old '{old_map_name}' (score={match['score']:.4f})", flush=True)
+            target_cloud = PathPlanner._parse_pcd(old_pcd)
+            with self._node._map_buffer_lock:
+                source_cloud = np.array(list(self._node._map_buffer.values()), dtype=np.float32) if self._node._map_buffer else None
 
-        # 1. 停止当前建图，保存 PCD
-        current_pcd = f"{self._map_dir}/{current_map}.pcd"
-        self._node._maybe_save_pcd()
-        code, _ = self._client.StopMapping(current_pcd)
-        if code != 0:
-            print(f"[Spatial] Merge: StopMapping failed (code={code}), aborting", flush=True)
-            self._client.StartMapping()
-            return
-
-        time.sleep(3)  # 等 SLAM 完成内部状态切换
-
-        # 2. ICP 精确定位：当前点云 vs 旧图 PCD
-        old_pcd = old_map_info["pcd_path"]
-        from icp import icp_2d
-        from path_planner import PathPlanner
-
-        target_cloud = PathPlanner._parse_pcd(old_pcd)
-        with self._node._map_buffer_lock:
-            source_cloud = np.array(list(self._node._map_buffer.values()), dtype=np.float32) if self._node._map_buffer else None
-
-        if target_cloud is None or source_cloud is None or len(source_cloud) < 100:
-            print(f"[Spatial] Merge: insufficient cloud data for ICP (src={len(source_cloud) if source_cloud is not None else 0}, tgt={len(target_cloud) if target_cloud is not None else 0})", flush=True)
-            # Fallback: 用 Scan Context 粗略位姿
             init_x = match["pose"]["x"]
             init_y = match["pose"]["y"]
             init_yaw = 0.0
-            print(f"[Spatial] Merge: using Scan Context pose ({init_x:.2f}, {init_y:.2f})", flush=True)
-        else:
-            # ICP 对齐
-            init_x = match["pose"]["x"]
-            init_y = match["pose"]["y"]
-            icp_result = icp_2d(source_cloud, target_cloud, init_x=init_x, init_y=init_y,
-                                max_iterations=50, max_correspond_dist=3.0)
-            if icp_result and icp_result["score"] < 1.0:
-                init_x = icp_result["x"]
-                init_y = icp_result["y"]
-                init_yaw = icp_result["yaw"]
-                print(f"[Spatial] Merge ICP: x={init_x:.3f}, y={init_y:.3f}, yaw={init_yaw:.3f}, "
-                      f"score={icp_result['score']:.4f}, iters={icp_result['iterations']}", flush=True)
+
+            if target_cloud is not None and source_cloud is not None and len(source_cloud) >= 100 and len(target_cloud) >= 100:
+                icp_result = icp_2d(source_cloud, target_cloud, init_x=init_x, init_y=init_y,
+                                    max_iterations=50, max_correspond_dist=3.0)
+                if icp_result and icp_result["score"] < 1.0:
+                    init_x = icp_result["x"]
+                    init_y = icp_result["y"]
+                    init_yaw = icp_result["yaw"]
+                    print(f"[Spatial] Recognize ICP: x={init_x:.3f}, y={init_y:.3f}, yaw={init_yaw:.3f}, "
+                          f"score={icp_result['score']:.4f}", flush=True)
+                else:
+                    print(f"[Spatial] Recognize ICP failed, using Scan Context pose", flush=True)
             else:
-                init_yaw = 0.0
-                print(f"[Spatial] Merge ICP failed/diverged, using Scan Context pose ({init_x:.2f}, {init_y:.2f})", flush=True)
+                print(f"[Spatial] Recognize: can't run ICP (src={len(source_cloud) if source_cloud is not None else 0}, "
+                      f"tgt={len(target_cloud) if target_cloud is not None else 0}), using Scan Context pose", flush=True)
 
-        # 3. InitPose 加载旧地图（用精确位姿）
-        q_z = math.sin(init_yaw / 2)
-        q_w = math.cos(init_yaw / 2)
-        print(f"[Spatial] Merge InitPose: x={init_x:.3f}, y={init_y:.3f}, yaw={init_yaw:.3f}, pcd={old_pcd}", flush=True)
-        code, _ = self._client.InitPose(init_x, init_y, 0, 0, 0, q_z, q_w, old_pcd)
-        if code != 0:
-            print(f"[Spatial] Merge: InitPose failed (code={code}), starting fresh", flush=True)
-            self._client.StartMapping()
-            return
+            # 4. 切换到旧图：StopMapping → InitPose → StartMapping
+            current_pcd = f"{self._map_dir}/{current_map}.pcd"
+            code, _ = self._client.StopMapping(current_pcd)
+            if code != 0:
+                print(f"[Spatial] Recognize: StopMapping failed (code={code})", flush=True)
+                self._client.StartMapping()
+                return
 
-        # 3. StartMapping 继续扩展旧地图
-        code, _ = self._client.StartMapping()
-        if code == 0:
-            self._node.load_pcd_to_buffer(old_pcd)
-            self._node.set_map_status("mapping")
-            self._node.set_active_map(old_map_name)
-            self._db.set_last_used_map(old_map_name)
-            # 4. 迁移 POI 从新图到旧图
-            pois = self._db.list_pois(current_map)
-            for poi in pois:
-                self._db.add_poi(poi["name"], poi["x"], poi["y"], poi["yaw"], old_map_name, poi.get("description", ""))
-            # 5. 删除临时新图
-            self._db.delete_map(current_map)
-            self._sc_mgr.clear_map(current_map)
-            print(f"[Spatial] Merged into '{old_map_name}', deleted temp '{current_map}'", flush=True)
-        else:
-            print(f"[Spatial] Merge: StartMapping on old map failed", flush=True)
+            time.sleep(3)
+
+            q_z = math.sin(init_yaw / 2)
+            q_w = math.cos(init_yaw / 2)
+            print(f"[Spatial] Recognize InitPose: x={init_x:.3f}, y={init_y:.3f}, yaw={init_yaw:.3f}, pcd={old_pcd}", flush=True)
+            code, _ = self._client.InitPose(init_x, init_y, 0, 0, 0, q_z, q_w, old_pcd)
+            if code != 0:
+                print(f"[Spatial] Recognize: InitPose failed (code={code}), restarting fresh", flush=True)
+                self._client.StartMapping()
+                return
+
+            time.sleep(1)
+            code, _ = self._client.StartMapping()
+            if code == 0:
+                self._node.load_pcd_to_buffer(old_pcd)
+                self._node.set_map_status("mapping")
+                self._node.set_active_map(old_map_name)
+                self._db.set_last_used_map(old_map_name)
+                self._last_localized_time = time.time()
+                # 删除临时新图
+                self._db.delete_map(current_map)
+                self._sc_mgr.clear_map(current_map)
+                import subprocess as _sp
+                _sp.run(["rm", "-f", current_pcd, f"{self._map_dir}/{current_map}_viz.pcd"], capture_output=True)
+                print(f"[Spatial] Switched to old map '{old_map_name}', deleted temp '{current_map}'", flush=True)
+            else:
+                print(f"[Spatial] Recognize: StartMapping on old map failed (code={code})", flush=True)
+
+        except Exception as e:
+            print(f"[Spatial] Recognize error: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
 
     # ── Dispatch ─────────────────────────────────────────────────────────────
 
