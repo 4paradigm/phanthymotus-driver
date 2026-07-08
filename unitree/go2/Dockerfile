@@ -64,6 +64,8 @@ COPY device.py /work/device.py
 COPY rpc_proxy.py /work/rpc_proxy.py
 COPY controlled_spatial.py /work/controlled_spatial.py
 COPY ext_devices.py /work/ext_devices.py
+COPY lidar.py /work/lidar.py
+COPY pointcloud_utils.py /work/pointcloud_utils.py
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
 
