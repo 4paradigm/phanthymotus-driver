@@ -334,6 +334,7 @@ class _SpatialNode(Node):
     RECENT_CLOUD_MAX = 50000     # recent cloud ring buffer capacity
     KF_DIST_THRESH = 2.0         # keyframe every 2m movement
     KF_YAW_THRESH = 0.52         # or 30° rotation
+    KF_TIME_THRESH = 30.0        # or every 30s even if stationary
     SLAM_CLOUD_INTERVAL = 0.2    # 5Hz
 
     def __init__(self, pos_tag_topic: str, mapping_topic: str, slam_cloud_topic: str,
@@ -731,10 +732,12 @@ class _SpatialNode(Node):
         if dyaw > math.pi:
             dyaw = 2 * math.pi - dyaw
 
-        if dist >= self.KF_DIST_THRESH or dyaw >= self.KF_YAW_THRESH:
+        if dist >= self.KF_DIST_THRESH or dyaw >= self.KF_YAW_THRESH or \
+                (time.time() - getattr(self, '_last_kf_time', 0)) >= self.KF_TIME_THRESH:
             sc = self._sc_mgr.make_scan_context(pts_arr)
             self._sc_mgr.add_keyframe(active_map, sc, (x, y, 0.0))
             self._last_kf_pose = (x, y, yaw)
+            self._last_kf_time = time.time()
 
     def _maybe_publish_full_map(self) -> None:
         """Publish the full 3D voxel map at 1Hz."""
@@ -1303,6 +1306,15 @@ class SpatialPlugin:
                 return
 
             old_pcd = old_map_info["pcd_path"]
+            # 优先用 SLAM binary PCD，如果不存在则用 auto-save 的 _viz.pcd
+            if not os.path.exists(old_pcd):
+                viz_pcd = old_pcd.replace(".pcd", "_viz.pcd")
+                if os.path.exists(viz_pcd):
+                    old_pcd = viz_pcd
+                    print(f"[Spatial] Recognize: using viz PCD: {viz_pcd}", flush=True)
+                else:
+                    print(f"[Spatial] Recognize: PCD not found: {old_pcd}", flush=True)
+                    return
             print(f"[Spatial] Recognize: matched '{old_map_name}' (score={match['score']:.4f})", flush=True)
 
             # 3. ICP 精确定位
@@ -1519,7 +1531,11 @@ class SpatialPlugin:
 
         pcd_path = target_map["pcd_path"]
         if not os.path.exists(pcd_path):
-            return {"error": f"PCD file not found: {pcd_path}"}
+            viz_pcd = pcd_path.replace(".pcd", "_viz.pcd")
+            if os.path.exists(viz_pcd):
+                pcd_path = viz_pcd
+            else:
+                return {"error": f"PCD file not found: {pcd_path}"}
 
         # 加载目标地图点云
         from path_planner import PathPlanner
