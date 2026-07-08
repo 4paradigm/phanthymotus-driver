@@ -337,7 +337,7 @@ class _SpatialNode(Node):
     SLAM_CLOUD_INTERVAL = 0.2    # 5Hz
 
     def __init__(self, pos_tag_topic: str, mapping_topic: str, slam_cloud_topic: str,
-                 db: _SpatialDB, sc_mgr=None):
+                 grid_map_topic: str, db: _SpatialDB, sc_mgr=None):
         super().__init__("go2_spatial")
         self._db = db
         self._sc_mgr = sc_mgr
@@ -346,6 +346,7 @@ class _SpatialNode(Node):
         # Publishers
         self._pos_tag_pub = self.create_publisher(String, pos_tag_topic, _LOW_LAT_QOS)
         self._mapping_pub = self.create_publisher(UInt8MultiArray, mapping_topic, _LOW_LAT_QOS)
+        self._grid_map_pub = self.create_publisher(UInt8MultiArray, grid_map_topic, _LOW_LAT_QOS)
         self._slam_cloud_pub = self.create_publisher(UInt8MultiArray, slam_cloud_topic, _LOW_LAT_QOS)
 
         # Overlay data (merged into mapping publish)
@@ -774,6 +775,42 @@ class _SpatialNode(Node):
         ros_msg.data = list(header + body)
         self._mapping_pub.publish(ros_msg)
 
+        # Publish 2D grid map (occupancy grid + nav path, all at z=0)
+        self._publish_grid_map_2d(robot_x, robot_y, robot_yaw)
+
+    def _publish_grid_map_2d(self, robot_x: float, robot_y: float, robot_yaw: float):
+        """发布 2D 占据栅格鸟瞰图（grid 障碍 + 导航路线，全部 z=0）。"""
+        parts = []
+
+        # 障碍物栅格点 (z=0)
+        if self._grid_overlay is not None and len(self._grid_overlay) > 0:
+            grid_2d = self._grid_overlay.copy()
+            grid_2d[:, 2] = 0.0  # 全部压平到 z=0
+            parts.append(grid_2d)
+
+        # 导航路线点 (z=0.01, 略高于障碍以便区分)
+        if self._nav_path_overlay is not None and len(self._nav_path_overlay) > 0:
+            path_2d = self._nav_path_overlay.copy()
+            path_2d[:, 2] = 0.01
+            parts.append(path_2d)
+
+        if not parts:
+            return
+
+        pts = np.vstack(parts)
+        num_points = len(pts)
+        if num_points > 50000:
+            indices = np.random.choice(num_points, 50000, replace=False)
+            pts = pts[indices]
+            num_points = 50000
+
+        flags = 0x01  # bit0=full_map, bit1=0 (no z dimension → 2D)
+        header = struct.pack('<fffBI', robot_x, robot_y, robot_yaw, flags, num_points)
+
+        ros_msg = UInt8MultiArray()
+        ros_msg.data = list(header + pts.tobytes())
+        self._grid_map_pub.publish(ros_msg)
+
     # ── PCD Save ─────────────────────────────────────────────────────────────
 
     def _maybe_save_pcd(self) -> None:
@@ -1045,11 +1082,12 @@ class SpatialPlugin:
         self._pos_tag_topic = f"/{namespace}/spatial/pos_tag" if namespace else "/spatial/pos_tag"
         self._mapping_topic = f"/{namespace}/spatial/mapping" if namespace else "/spatial/mapping"
         self._slam_cloud_topic = f"/{namespace}/spatial/slam_cloud" if namespace else "/spatial/slam_cloud"
+        self._grid_map_topic = f"/{namespace}/spatial/grid_map" if namespace else "/spatial/grid_map"
 
         # Create node
         self._node = _SpatialNode(
             self._pos_tag_topic, self._mapping_topic, self._slam_cloud_topic,
-            self._db, self._sc_mgr
+            self._grid_map_topic, self._db, self._sc_mgr
         )
         self._node.set_active_map(self._db.get_last_used_map())
         self._node.set_pcd_save_dir(self._map_dir)
@@ -1057,7 +1095,8 @@ class SpatialPlugin:
         executor.add_node(self._node)
 
     def get_tools(self) -> list:
-        return [self._spatial_tool(), self._pos_tag_tool(), self._mapping_tool(), self._slam_cloud_tool()]
+        return [self._spatial_tool(), self._pos_tag_tool(), self._mapping_tool(),
+                self._slam_cloud_tool(), self._grid_map_tool()]
 
     def _pos_tag_tool(self) -> dict:
         return {
@@ -1087,6 +1126,16 @@ class SpatialPlugin:
             "description": f"Real-time SLAM point cloud at 5Hz. Binary: [uint32 point_step=12][uint32 total_points][float32 x,y,z × N]. Publishes to {self._slam_cloud_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._slam_cloud_topic, "format": "sensor/pointcloud"}],
+        }
+
+    def _grid_map_tool(self) -> dict:
+        return {
+            "name": "grid_map",
+            "type": "sensor",
+            "multiInstance": False,
+            "description": f"2D occupancy grid bird's-eye view — obstacle cells + navigation path. Continuous 1Hz. {self._grid_map_topic}",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._grid_map_topic, "format": "sensor/mapping"}],
         }
 
     def _spatial_tool(self) -> dict:
@@ -1255,6 +1304,8 @@ class SpatialPlugin:
                 return {"state": "running", "topic_out": [{"topic": self._mapping_topic, "format": "sensor/mapping"}]}
             if tool_name == 'slam_cloud':
                 return {"state": "running", "topic_out": [{"topic": self._slam_cloud_topic, "format": "sensor/pointcloud"}]}
+            if tool_name == 'grid_map':
+                return {"state": "running", "topic_out": [{"topic": self._grid_map_topic, "format": "sensor/mapping"}]}
             return {"state": "running", "topic_out": [{"topic": self._pos_tag_topic, "format": "data/json"}]}
 
         if action == "tag_place":
