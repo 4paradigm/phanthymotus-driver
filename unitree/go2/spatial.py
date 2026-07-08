@@ -779,16 +779,25 @@ class _SpatialNode(Node):
         self._publish_grid_map_2d(robot_x, robot_y, robot_yaw)
 
     def _publish_grid_map_2d(self, robot_x: float, robot_y: float, robot_yaw: float):
-        """发布 2D 占据栅格鸟瞰图（grid 障碍 + 导航路线，全部 z=0）。"""
+        """发布 2D 占据栅格鸟瞰图（地图投影 + 障碍物 + 导航路线，全部 z=0）。"""
         parts = []
 
-        # 障碍物栅格点 (z=0)
-        if self._grid_overlay is not None and len(self._grid_overlay) > 0:
-            grid_2d = self._grid_overlay.copy()
-            grid_2d[:, 2] = 0.0  # 全部压平到 z=0
-            parts.append(grid_2d)
+        # 将 3D voxel map 投影为 2D (取 z 在障碍物范围内的点，压平到 z=0)
+        with self._map_buffer_lock:
+            if self._map_buffer:
+                all_pts = np.array(list(self._map_buffer.values()), dtype=np.float32)
+                # 只保留低高度的点作为 2D 地图轮廓 (z < 1.0)
+                mask = all_pts[:, 2] < 1.0
+                if np.any(mask):
+                    map_2d = all_pts[mask].copy()
+                    map_2d[:, 2] = 0.0
+                    # 降采样（2D 不需要太密）
+                    if len(map_2d) > 30000:
+                        indices = np.random.choice(len(map_2d), 30000, replace=False)
+                        map_2d = map_2d[indices]
+                    parts.append(map_2d)
 
-        # 导航路线点 (z=0.01, 略高于障碍以便区分)
+        # 导航路线点 (z=0.01, 略高于地图以便区分)
         if self._nav_path_overlay is not None and len(self._nav_path_overlay) > 0:
             path_2d = self._nav_path_overlay.copy()
             path_2d[:, 2] = 0.01
@@ -804,7 +813,7 @@ class _SpatialNode(Node):
             pts = pts[indices]
             num_points = 50000
 
-        flags = 0x01  # bit0=full_map, bit1=0 (no z dimension → 2D)
+        flags = 0x01  # bit0=full_map, bit1=0 (2D)
         header = struct.pack('<fffBI', robot_x, robot_y, robot_yaw, flags, num_points)
 
         ros_msg = UInt8MultiArray()
