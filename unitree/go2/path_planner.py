@@ -41,19 +41,21 @@ def _numpy_dilation(grid: np.ndarray, radius: int) -> np.ndarray:
 class PathPlanner:
     """PCD → 2D occupancy grid → A* path planning."""
 
-    def __init__(self, resolution: float = 0.1, robot_radius: float = 0.3,
-                 z_min: float = 0.1, z_max: float = 1.5):
+    def __init__(self, resolution: float = 0.15, robot_radius: float = 0.25,
+                 z_min: float = 0.15, z_max: float = 0.8, min_hits: int = 3):
         """
         Args:
-            resolution: 栅格分辨率 (m/cell), 默认 10cm
+            resolution: 栅格分辨率 (m/cell), 默认 15cm
             robot_radius: 机器人安全半径 (m), 用于障碍物膨胀
-            z_min: 有效点最低高度 (过滤地面)
-            z_max: 有效点最高高度 (过滤天花板)
+            z_min: 有效点最低高度 (过滤地面), Go2 腿高约15cm
+            z_max: 有效点最高高度 (过滤高处), Go2 身高约40cm,取0.8m安全
+            min_hits: 一个栅格中至少有多少个点才算障碍 (过滤噪声)
         """
         self._resolution = resolution
         self._robot_radius = robot_radius
         self._z_min = z_min
         self._z_max = z_max
+        self._min_hits = min_hits
 
         self._grid: np.ndarray | None = None  # 2D array: 0=free, 1=occupied
         self._origin_x: float = 0.0  # 栅格 (0,0) 对应的世界 x 坐标
@@ -112,7 +114,7 @@ class PathPlanner:
         # 创建空栅格
         grid = np.zeros((self._height, self._width), dtype=np.uint8)
 
-        # 标记障碍物
+        # 标记障碍物 (需要 min_hits 个点才算障碍)
         if len(obstacle_points) >= 5:
             ox = obstacle_points[:, 0]
             oy = obstacle_points[:, 1]
@@ -123,7 +125,10 @@ class PathPlanner:
             valid = (gx >= 0) & (gx < self._width) & (gy >= 0) & (gy < self._height)
             gx, gy = gx[valid], gy[valid]
 
-            grid[gy, gx] = 1
+            # 统计每个栅格的命中数
+            hit_count = np.zeros((self._height, self._width), dtype=np.int32)
+            np.add.at(hit_count, (gy, gx), 1)
+            grid[hit_count >= self._min_hits] = 1
 
         # 膨胀障碍物 (机器人安全半径)
         inflate_cells = int(math.ceil(self._robot_radius / self._resolution))
@@ -143,7 +148,6 @@ class PathPlanner:
         """从内存中的点云数组加载（Nx3 float32）。"""
         if points is None or len(points) < 10:
             return False
-        # 复用 load_pcd 的逻辑但跳过文件解析
         z = points[:, 2]
         mask = (z >= self._z_min) & (z <= self._z_max)
         obstacle_points = points[mask]
@@ -176,7 +180,9 @@ class PathPlanner:
             gy = ((oy - self._origin_y) / self._resolution).astype(np.int32)
             valid = (gx >= 0) & (gx < self._width) & (gy >= 0) & (gy < self._height)
             gx, gy = gx[valid], gy[valid]
-            grid[gy, gx] = 1
+            hit_count = np.zeros((self._height, self._width), dtype=np.int32)
+            np.add.at(hit_count, (gy, gx), 1)
+            grid[hit_count >= self._min_hits] = 1
 
         inflate_cells = int(math.ceil(self._robot_radius / self._resolution))
         if inflate_cells > 0:
