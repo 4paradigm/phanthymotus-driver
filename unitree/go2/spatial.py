@@ -1510,25 +1510,170 @@ class SpatialPlugin:
         if tag_name:
             self._node.set_nav_target(tag_name)
 
-        # Debug 模式：后台等待 10s 后自动结束
-        threading.Thread(target=self._execute_waypoints_debug, daemon=True).start()
+        # 后台执行移动
+        threading.Thread(target=self._execute_waypoints, daemon=True).start()
 
         return {
-            "status": "navigating (DEBUG: no movement, path overlaid on mapping)",
+            "status": "navigating",
             "target": tag_name or f"({target_x:.1f},{target_y:.1f})",
             "waypoints": len(waypoints),
             "waypoint_coords": [(round(x, 2), round(y, 2)) for x, y in waypoints],
-            "method": "path_planner_debug",
+            "method": "velocity_control",
         }
 
-    def _execute_waypoints_debug(self):
-        """Debug 模式：不移动，10s 后清除 overlay。"""
-        print(f"[Spatial] DEBUG: path visualized with {len(self._nav_waypoints)} waypoints, keeping for 10s...", flush=True)
-        for i in range(10):
-            time.sleep(1)
-            if not self._nav_executing:
-                break  # 被 stop_nav 取消
-        self._nav_executing = False
-        self._node._nav_path_overlay = None
-        self._node._nav_arrived.set()
-        print("[Spatial] DEBUG: navigation ended, overlays cleared", flush=True)
+    def _build_path_overlay(self, waypoints: list[tuple], start_idx: int = 0) -> np.ndarray | None:
+        """生成剩余 waypoints 的路径点 overlay。"""
+        remaining = waypoints[start_idx:]
+        if len(remaining) < 2:
+            return None
+        PATH_WIDTH = 0.05
+        PATH_Z = 0.3
+        PATH_STEP = 0.05
+        OFFSETS = [0, -PATH_WIDTH, PATH_WIDTH]
+        path_points = []
+        for i in range(len(remaining) - 1):
+            x1, y1 = remaining[i]
+            x2, y2 = remaining[i + 1]
+            dx = x2 - x1
+            dy = y2 - y1
+            seg_len = math.sqrt(dx * dx + dy * dy)
+            if seg_len < 1e-6:
+                continue
+            nx = -dy / seg_len
+            ny = dx / seg_len
+            steps = max(int(seg_len / PATH_STEP), 1)
+            for s in range(steps):
+                t = s / steps
+                cx = x1 + t * dx
+                cy = y1 + t * dy
+                for offset in OFFSETS:
+                    path_points.append((cx + offset * nx, cy + offset * ny, PATH_Z))
+        if not path_points:
+            return None
+        return np.array(path_points, dtype=np.float32)
+
+    @staticmethod
+    def _normalize_angle(a: float) -> float:
+        """Normalize angle to [-pi, pi]."""
+        while a > math.pi:
+            a -= 2 * math.pi
+        while a < -math.pi:
+            a += 2 * math.pi
+        return a
+
+    def _execute_waypoints(self):
+        """后台线程：逐个 waypoint，先转再走，SLAM 位姿闭环。"""
+        try:
+            for i, (wx, wy) in enumerate(self._nav_waypoints):
+                if not self._nav_executing:
+                    break
+
+                print(f"[Spatial] Waypoint {i+1}/{len(self._nav_waypoints)}: ({wx:.2f}, {wy:.2f})", flush=True)
+
+                # 更新 nav_path overlay（只显示剩余路段）
+                overlay = self._build_path_overlay(self._nav_waypoints, i)
+                self._node._nav_path_overlay = overlay
+
+                stall_start = time.time()
+
+                # Phase 1: 转向目标
+                while self._nav_executing:
+                    pose = self._node.get_pose()
+                    if not pose:
+                        time.sleep(0.1)
+                        continue
+                    dx = wx - pose["x"]
+                    dy = wy - pose["y"]
+                    dist = math.sqrt(dx * dx + dy * dy)
+                    if dist < 0.3:
+                        break  # 已经很近了，不用转
+                    target_heading = math.atan2(dy, dx)
+                    heading_err = self._normalize_angle(target_heading - pose["yaw"])
+                    if abs(heading_err) < 0.15:
+                        break  # 方向对了
+                    vyaw = max(-1.5, min(1.5, heading_err * 1.5))
+                    self._rpc_proxy.Move(0, 0, vyaw)
+                    time.sleep(0.1)
+                    if time.time() - stall_start > 10:
+                        print(f"[Spatial] Waypoint {i+1} turn timeout", flush=True)
+                        break
+
+                # Phase 2: 直线前进（边走边微调方向）
+                stall_start = time.time()
+                last_pose = self._node.get_pose()
+                while self._nav_executing:
+                    pose = self._node.get_pose()
+                    if not pose:
+                        time.sleep(0.1)
+                        continue
+                    dx = wx - pose["x"]
+                    dy = wy - pose["y"]
+                    dist = math.sqrt(dx * dx + dy * dy)
+                    if dist < 0.3:
+                        print(f"[Spatial] Waypoint {i+1} reached (dist={dist:.2f}m)", flush=True)
+                        break
+                    target_heading = math.atan2(dy, dx)
+                    heading_err = self._normalize_angle(target_heading - pose["yaw"])
+
+                    # 如果偏航太大，减速并加大转向
+                    if abs(heading_err) > 0.5:
+                        vx = 0.1
+                        vyaw = max(-1.5, min(1.5, heading_err * 2.0))
+                    else:
+                        vx = max(0.1, min(0.5, dist * 0.8))
+                        vyaw = max(-0.5, min(0.5, heading_err * 1.0))
+
+                    self._rpc_proxy.Move(vx, 0, vyaw)
+                    time.sleep(0.1)
+
+                    # 检测卡住
+                    if last_pose:
+                        moved = math.sqrt(
+                            (pose["x"] - last_pose["x"])**2 +
+                            (pose["y"] - last_pose["y"])**2
+                        )
+                        if moved > 0.03:
+                            stall_start = time.time()
+                    last_pose = pose
+
+                    if time.time() - stall_start > 30:
+                        print(f"[Spatial] Waypoint {i+1} stalled, skipping", flush=True)
+                        break
+
+                # 停一下再继续下一个 waypoint
+                self._rpc_proxy.Move(0, 0, 0)
+                time.sleep(0.3)
+
+            # 最终转到目标朝向
+            if self._nav_executing and self._nav_target_yaw != 0:
+                print(f"[Spatial] Final yaw adjustment to {self._nav_target_yaw:.2f}", flush=True)
+                for _ in range(50):  # 最多 5s
+                    pose = self._node.get_pose()
+                    if not pose:
+                        time.sleep(0.1)
+                        continue
+                    yaw_err = self._normalize_angle(self._nav_target_yaw - pose["yaw"])
+                    if abs(yaw_err) < 0.15:
+                        break
+                    vyaw = max(-1.0, min(1.0, yaw_err * 1.5))
+                    self._rpc_proxy.Move(0, 0, vyaw)
+                    time.sleep(0.1)
+
+            # 停止
+            self._rpc_proxy.Move(0, 0, 0)
+
+            if self._nav_executing:
+                self._nav_executing = False
+                self._node._nav_path_overlay = None
+                self._node._nav_arrived.set()
+                print("[Spatial] Navigation complete", flush=True)
+
+        except Exception as e:
+            print(f"[Spatial] Navigation error: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            self._rpc_proxy.Move(0, 0, 0)
+            self._nav_executing = False
+            self._node._nav_error = str(e)
+            self._node._nav_path_overlay = None
+            self._node._nav_arrived.set()
