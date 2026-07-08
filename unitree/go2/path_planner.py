@@ -17,7 +17,25 @@ import os
 import struct
 
 import numpy as np
-from scipy.ndimage import binary_dilation
+
+try:
+    from scipy.ndimage import binary_dilation
+    _HAS_SCIPY = True
+except ImportError:
+    _HAS_SCIPY = False
+
+
+def _numpy_dilation(grid: np.ndarray, radius: int) -> np.ndarray:
+    """Pure numpy fallback for binary dilation (when scipy unavailable)."""
+    if radius <= 0:
+        return grid
+    kernel_size = 2 * radius + 1
+    padded = np.pad(grid, radius, mode='constant', constant_values=0)
+    result = np.zeros_like(grid)
+    for dy in range(kernel_size):
+        for dx in range(kernel_size):
+            result |= padded[dy:dy + grid.shape[0], dx:dx + grid.shape[1]]
+    return result
 
 
 class PathPlanner:
@@ -110,8 +128,11 @@ class PathPlanner:
         # 膨胀障碍物 (机器人安全半径)
         inflate_cells = int(math.ceil(self._robot_radius / self._resolution))
         if inflate_cells > 0:
-            struct_elem = np.ones((2 * inflate_cells + 1, 2 * inflate_cells + 1), dtype=np.uint8)
-            grid = binary_dilation(grid, structure=struct_elem).astype(np.uint8)
+            if _HAS_SCIPY:
+                struct_elem = np.ones((2 * inflate_cells + 1, 2 * inflate_cells + 1), dtype=np.uint8)
+                grid = binary_dilation(grid, structure=struct_elem).astype(np.uint8)
+            else:
+                grid = _numpy_dilation(grid, inflate_cells)
 
         self._grid = grid
         print(f"[PathPlanner] Loaded PCD: {len(points)} pts, grid {self._width}x{self._height}, "
@@ -159,8 +180,11 @@ class PathPlanner:
 
         inflate_cells = int(math.ceil(self._robot_radius / self._resolution))
         if inflate_cells > 0:
-            struct_elem = np.ones((2 * inflate_cells + 1, 2 * inflate_cells + 1), dtype=np.uint8)
-            grid = binary_dilation(grid, structure=struct_elem).astype(np.uint8)
+            if _HAS_SCIPY:
+                struct_elem = np.ones((2 * inflate_cells + 1, 2 * inflate_cells + 1), dtype=np.uint8)
+                grid = binary_dilation(grid, structure=struct_elem).astype(np.uint8)
+            else:
+                grid = _numpy_dilation(grid, inflate_cells)
 
         self._grid = grid
         return True
