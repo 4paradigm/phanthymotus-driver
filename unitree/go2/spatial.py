@@ -855,7 +855,7 @@ class _SpatialNode(Node):
             self._schedule_save_timer()
             return
 
-        pcd_path = os.path.join(self._pcd_save_dir, f"{active_map}_viz.pcd")
+        pcd_path = os.path.join(self._pcd_save_dir, f"{active_map}.pcd")
         os.makedirs(os.path.dirname(pcd_path), exist_ok=True)
         try:
             pts = np.array(all_points, dtype=np.float32)
@@ -1306,15 +1306,9 @@ class SpatialPlugin:
                 return
 
             old_pcd = old_map_info["pcd_path"]
-            # 优先用 SLAM binary PCD，如果不存在则用 auto-save 的 _viz.pcd
             if not os.path.exists(old_pcd):
-                viz_pcd = old_pcd.replace(".pcd", "_viz.pcd")
-                if os.path.exists(viz_pcd):
-                    old_pcd = viz_pcd
-                    print(f"[Spatial] Recognize: using viz PCD: {viz_pcd}", flush=True)
-                else:
-                    print(f"[Spatial] Recognize: PCD not found: {old_pcd}", flush=True)
-                    return
+                print(f"[Spatial] Recognize: PCD not found: {old_pcd}", flush=True)
+                return
             print(f"[Spatial] Recognize: matched '{old_map_name}' (score={match['score']:.4f})", flush=True)
 
             # 3. ICP 精确定位
@@ -1375,7 +1369,7 @@ class SpatialPlugin:
                 self._db.delete_map(current_map)
                 self._sc_mgr.clear_map(current_map)
                 import subprocess as _sp
-                _sp.run(["rm", "-f", current_pcd, f"{self._map_dir}/{current_map}_viz.pcd"], capture_output=True)
+                _sp.run(["rm", "-f", current_pcd], capture_output=True)
                 print(f"[Spatial] Switched to old map '{old_map_name}', deleted temp '{current_map}'", flush=True)
             else:
                 print(f"[Spatial] Recognize: StartMapping on old map failed (code={code})", flush=True)
@@ -1531,11 +1525,7 @@ class SpatialPlugin:
 
         pcd_path = target_map["pcd_path"]
         if not os.path.exists(pcd_path):
-            viz_pcd = pcd_path.replace(".pcd", "_viz.pcd")
-            if os.path.exists(viz_pcd):
-                pcd_path = viz_pcd
-            else:
-                return {"error": f"PCD file not found: {pcd_path}"}
+            return {"error": f"PCD file not found: {pcd_path}"}
 
         # 加载目标地图点云
         from path_planner import PathPlanner
