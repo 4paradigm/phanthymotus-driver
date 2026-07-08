@@ -337,6 +337,7 @@ class _SpatialNode(Node):
     SLAM_CLOUD_INTERVAL = 0.2    # 5Hz
 
     def __init__(self, pos_tag_topic: str, mapping_topic: str, slam_cloud_topic: str,
+                 nav_path_topic: str, grid_map_topic: str,
                  db: _SpatialDB, sc_mgr=None):
         super().__init__("go2_spatial")
         self._db = db
@@ -347,6 +348,8 @@ class _SpatialNode(Node):
         self._pos_tag_pub = self.create_publisher(String, pos_tag_topic, _LOW_LAT_QOS)
         self._mapping_pub = self.create_publisher(UInt8MultiArray, mapping_topic, _LOW_LAT_QOS)
         self._slam_cloud_pub = self.create_publisher(UInt8MultiArray, slam_cloud_topic, _LOW_LAT_QOS)
+        self._nav_path_pub = self.create_publisher(UInt8MultiArray, nav_path_topic, _LOW_LAT_QOS)
+        self._grid_map_pub = self.create_publisher(UInt8MultiArray, grid_map_topic, _LOW_LAT_QOS)
 
         # State
         self._current_pose: dict | None = None
@@ -1031,10 +1034,13 @@ class SpatialPlugin:
         self._pos_tag_topic = f"/{namespace}/spatial/pos_tag" if namespace else "/spatial/pos_tag"
         self._mapping_topic = f"/{namespace}/spatial/mapping" if namespace else "/spatial/mapping"
         self._slam_cloud_topic = f"/{namespace}/spatial/slam_cloud" if namespace else "/spatial/slam_cloud"
+        self._nav_path_topic = f"/{namespace}/spatial/nav_path" if namespace else "/spatial/nav_path"
+        self._grid_map_topic = f"/{namespace}/spatial/grid_map" if namespace else "/spatial/grid_map"
 
         # Create node
         self._node = _SpatialNode(
             self._pos_tag_topic, self._mapping_topic, self._slam_cloud_topic,
+            self._nav_path_topic, self._grid_map_topic,
             self._db, self._sc_mgr
         )
         self._node.set_active_map(self._db.get_last_used_map())
@@ -1043,7 +1049,8 @@ class SpatialPlugin:
         executor.add_node(self._node)
 
     def get_tools(self) -> list:
-        return [self._spatial_tool(), self._pos_tag_tool(), self._mapping_tool(), self._slam_cloud_tool()]
+        return [self._spatial_tool(), self._pos_tag_tool(), self._mapping_tool(),
+                self._slam_cloud_tool(), self._nav_path_tool(), self._grid_map_tool()]
 
     def _pos_tag_tool(self) -> dict:
         return {
@@ -1073,6 +1080,26 @@ class SpatialPlugin:
             "description": f"Real-time SLAM point cloud at 5Hz. Binary: [uint32 point_step=12][uint32 total_points][float32 x,y,z × N]. Publishes to {self._slam_cloud_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._slam_cloud_topic, "format": "sensor/pointcloud"}],
+        }
+
+    def _nav_path_tool(self) -> dict:
+        return {
+            "name": "nav_path",
+            "type": "sensor",
+            "multiInstance": False,
+            "description": f"Navigation path visualization — planned waypoints as 3D points overlaid on map. Published when navigation starts. {self._nav_path_topic}",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._nav_path_topic, "format": "sensor/mapping"}],
+        }
+
+    def _grid_map_tool(self) -> dict:
+        return {
+            "name": "grid_map",
+            "type": "sensor",
+            "multiInstance": False,
+            "description": f"2D occupancy grid visualization — obstacle cells from path planner. Published when path is planned. {self._grid_map_topic}",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._grid_map_topic, "format": "sensor/mapping"}],
         }
 
     def _spatial_tool(self) -> dict:
@@ -1241,6 +1268,10 @@ class SpatialPlugin:
                 return {"state": "running", "topic_out": [{"topic": self._mapping_topic, "format": "sensor/mapping"}]}
             if tool_name == 'slam_cloud':
                 return {"state": "running", "topic_out": [{"topic": self._slam_cloud_topic, "format": "sensor/pointcloud"}]}
+            if tool_name == 'nav_path':
+                return {"state": "running", "topic_out": [{"topic": self._nav_path_topic, "format": "sensor/mapping"}]}
+            if tool_name == 'grid_map':
+                return {"state": "running", "topic_out": [{"topic": self._grid_map_topic, "format": "sensor/mapping"}]}
             return {"state": "running", "topic_out": [{"topic": self._pos_tag_topic, "format": "data/json"}]}
 
         if action == "tag_place":
@@ -1384,16 +1415,16 @@ class SpatialPlugin:
 
     def _navigate_with_planner(self, target_x: float, target_y: float, target_yaw: float,
                                tag_name: str | None = None) -> dict:
-        """用路径规划器 + obstacles_avoid 执行导航（立即返回，后台执行）。"""
-        if not self._rpc_proxy:
-            return {"error": "obstacles_avoid RPC not available (no rpc_proxy)"}
-
+        """路径规划 + 可视化（debug 模式：不移动，只显示路线）。"""
         pose = self._node.get_pose()
         if not pose:
             return {"error": "No current pose available"}
 
         if not self._ensure_planner_loaded():
             return {"error": "Path planner: no map loaded"}
+
+        # 发布 2D 栅格地图可视化
+        self._publish_grid_map()
 
         # 规划路径
         waypoints = self._planner.plan((pose["x"], pose["y"]), (target_x, target_y))
@@ -1409,78 +1440,83 @@ class SpatialPlugin:
         if tag_name:
             self._node.set_nav_target(tag_name)
 
-        # 后台执行
-        threading.Thread(target=self._execute_waypoints, daemon=True).start()
+        # 发布路线可视化
+        self._publish_nav_path(waypoints, pose)
+
+        # Debug 模式：后台等待 10s 后自动结束
+        threading.Thread(target=self._execute_waypoints_debug, daemon=True).start()
 
         return {
-            "status": "navigating",
+            "status": "navigating (DEBUG: no movement, visualization only)",
             "target": tag_name or f"({target_x:.1f},{target_y:.1f})",
             "waypoints": len(waypoints),
-            "method": "path_planner",
+            "waypoint_coords": [(round(x, 2), round(y, 2)) for x, y in waypoints],
+            "method": "path_planner_debug",
         }
 
-    def _execute_waypoints(self):
-        """后台线程：逐个 waypoint 调用 obstacles_avoid.move_to_absolute。"""
-        try:
-            # Take control
-            self._rpc_proxy.OA_UseRemoteCommandFromApi(True)
-            self._rpc_proxy.OA_SwitchSet(True)
-            time.sleep(0.3)
+    def _execute_waypoints_debug(self):
+        """Debug 模式：不移动，10s 后自动结束。"""
+        print(f"[Spatial] DEBUG: path visualized with {len(self._nav_waypoints)} waypoints, waiting 10s...", flush=True)
+        time.sleep(10)
+        self._nav_executing = False
+        self._node._nav_arrived.set()
+        print("[Spatial] DEBUG: navigation ended (no movement)", flush=True)
 
-            for i, (wx, wy) in enumerate(self._nav_waypoints):
-                if not self._nav_executing:
-                    break
+    def _publish_nav_path(self, waypoints: list[tuple], pose: dict):
+        """发布导航路线到 nav_path topic (sensor/mapping 格式)。"""
+        if not waypoints:
+            return
+        # 在 waypoints 之间插值，生成密集路径点用于可视化
+        path_points = []
+        for i in range(len(waypoints) - 1):
+            x1, y1 = waypoints[i]
+            x2, y2 = waypoints[i + 1]
+            dist = math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+            steps = max(int(dist / 0.1), 1)  # 每 10cm 一个点
+            for s in range(steps):
+                t = s / steps
+                px = x1 + t * (x2 - x1)
+                py = y1 + t * (y2 - y1)
+                path_points.append((px, py, 0.3))  # z=0.3 让路线悬浮在地面上方
+        # 添加最后一个点
+        path_points.append((waypoints[-1][0], waypoints[-1][1], 0.3))
 
-                print(f"[Spatial] Waypoint {i+1}/{len(self._nav_waypoints)}: ({wx:.2f}, {wy:.2f})", flush=True)
-                self._rpc_proxy.OA_MoveToAbsolutePosition(wx, wy, 0)
+        pts = np.array(path_points, dtype=np.float32)
+        num_points = len(pts)
 
-                # 等待到达当前 waypoint
-                stall_start = time.time()
-                last_pose = self._node.get_pose()
-                while self._nav_executing:
-                    time.sleep(0.5)
-                    current_pose = self._node.get_pose()
-                    if current_pose:
-                        dx = current_pose["x"] - wx
-                        dy = current_pose["y"] - wy
-                        dist = math.sqrt(dx * dx + dy * dy)
-                        if dist < 0.3:
-                            break  # waypoint reached
-                        # 检查是否在移动
-                        if last_pose:
-                            moved = math.sqrt(
-                                (current_pose["x"] - last_pose["x"])**2 +
-                                (current_pose["y"] - last_pose["y"])**2
-                            )
-                            if moved > 0.03:
-                                stall_start = time.time()
-                        last_pose = current_pose
+        robot_x = pose["x"]
+        robot_y = pose["y"]
+        robot_yaw = pose["yaw"]
+        flags = 0x03
+        header = struct.pack('<fffBI', robot_x, robot_y, robot_yaw, flags, num_points)
 
-                    # 超时检测 (单个 waypoint 超时 30s)
-                    if time.time() - stall_start > 30:
-                        print(f"[Spatial] Waypoint {i+1} stalled, skipping", flush=True)
-                        break
+        ros_msg = UInt8MultiArray()
+        ros_msg.data = list(header + pts.tobytes())
+        self._node._nav_path_pub.publish(ros_msg)
+        print(f"[Spatial] Published nav_path: {num_points} points, {len(waypoints)} waypoints", flush=True)
 
-            # 最终调整朝向
-            if self._nav_executing and self._nav_waypoints:
-                final_x, final_y = self._nav_waypoints[-1]
-                self._rpc_proxy.OA_MoveToAbsolutePosition(final_x, final_y, self._nav_target_yaw)
-                time.sleep(2)
+    def _publish_grid_map(self):
+        """发布 2D 栅格地图到 grid_map topic (sensor/mapping 格式)。"""
+        grid_pts = self._planner.get_grid_as_points()
+        if grid_pts is None or len(grid_pts) == 0:
+            return
 
-            # 释放控制
-            self._rpc_proxy.OA_UseRemoteCommandFromApi(False)
+        pose = self._node.get_pose()
+        robot_x = pose["x"] if pose else 0.0
+        robot_y = pose["y"] if pose else 0.0
+        robot_yaw = pose["yaw"] if pose else 0.0
 
-            if self._nav_executing:
-                self._nav_executing = False
-                self._node._nav_arrived.set()
-                print("[Spatial] Navigation complete (path planner)", flush=True)
+        num_points = len(grid_pts)
+        # 限制点数
+        if num_points > 50000:
+            indices = np.random.choice(num_points, 50000, replace=False)
+            grid_pts = grid_pts[indices]
+            num_points = 50000
 
-        except Exception as e:
-            print(f"[Spatial] Waypoint execution error: {e}", flush=True)
-            self._nav_executing = False
-            self._node._nav_error = str(e)
-            self._node._nav_arrived.set()
-            try:
-                self._rpc_proxy.OA_UseRemoteCommandFromApi(False)
-            except Exception:
-                pass
+        flags = 0x03
+        header = struct.pack('<fffBI', robot_x, robot_y, robot_yaw, flags, num_points)
+
+        ros_msg = UInt8MultiArray()
+        ros_msg.data = list(header + grid_pts.tobytes())
+        self._node._grid_map_pub.publish(ros_msg)
+        print(f"[Spatial] Published grid_map: {num_points} obstacle cells", flush=True)
