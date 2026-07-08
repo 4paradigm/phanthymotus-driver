@@ -66,6 +66,7 @@ COPY controlled_spatial.py /work/controlled_spatial.py
 COPY spatial.py /work/spatial.py
 COPY scan_context.py /work/scan_context.py
 COPY path_planner.py /work/path_planner.py
+COPY icp.py /work/icp.py
 COPY ext_devices.py /work/ext_devices.py
 COPY lidar.py /work/lidar.py
 COPY pointcloud_utils.py /work/pointcloud_utils.py
