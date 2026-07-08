@@ -1331,32 +1331,19 @@ class SpatialPlugin:
 
         elif action == "wait_navigation_done":
             stall_timeout = float(args.get("stall_timeout", 60))
-            poll_interval = 1.0
-            last_pose = self._node.get_pose()
-            stall_start = time.time()
+            start_time = time.time()
 
-            while True:
-                if self._node._nav_arrived.is_set():
-                    if self._node._nav_error:
-                        error = self._node._nav_error
-                        self._node._nav_error = None
-                        return {"status": "error", "error": error}
-                    return {"status": "arrived", "pose": self._node.get_pose()}
-
-                time.sleep(poll_interval)
-                current_pose = self._node.get_pose()
-
-                if current_pose and last_pose:
-                    dx = current_pose["x"] - last_pose["x"]
-                    dy = current_pose["y"] - last_pose["y"]
-                    moved = math.sqrt(dx * dx + dy * dy)
-                    if moved > 0.05:
-                        stall_start = time.time()
-                        last_pose = current_pose
-
-                if time.time() - stall_start > stall_timeout:
+            while self._nav_executing:
+                time.sleep(1.0)
+                if time.time() - start_time > stall_timeout:
                     self._nav_executing = False
-                    return {"status": "timeout", "error": f"No movement for {stall_timeout}s, navigation cancelled"}
+                    return {"status": "timeout", "error": f"Navigation timeout after {stall_timeout}s"}
+
+            if self._node._nav_error:
+                error = self._node._nav_error
+                self._node._nav_error = None
+                return {"status": "error", "error": error}
+            return {"status": "arrived", "pose": self._node.get_pose()}
 
         elif action == "pause_nav":
             self._nav_executing = False
@@ -1469,9 +1456,13 @@ class SpatialPlugin:
         }
 
     def _execute_waypoints_debug(self):
-        """Debug 模式：不移动，10s 后自动结束，清除 overlay。"""
-        print(f"[Spatial] DEBUG: path visualized with {len(self._nav_waypoints)} waypoints, waiting 10s...", flush=True)
-        time.sleep(10)
+        """Debug 模式：不移动，30s 后自动结束，清除 overlay。"""
+        print(f"[Spatial] DEBUG: path visualized with {len(self._nav_waypoints)} waypoints, keeping for 30s...", flush=True)
+        # 保持 overlay 30s 让用户在 dashboard 上查看
+        for i in range(30):
+            time.sleep(1)
+            if not self._nav_executing:
+                break  # 被 stop_nav 取消
         self._nav_executing = False
         self._node._nav_path_overlay = None  # 清除路线
         self._node._nav_arrived.set()
