@@ -34,7 +34,7 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    pyyaml netifaces numpy opencv-python-headless pyalsaaudio sounddevice
+    pyyaml netifaces numpy opencv-python-headless pyalsaaudio sounddevice scipy
 
 # Build CycloneDDS 0.10.5 from source
 ARG CYCLONEDDS_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/cyclonedds-0.10.5.tar.gz
@@ -65,6 +65,7 @@ COPY rpc_proxy.py /work/rpc_proxy.py
 COPY controlled_spatial.py /work/controlled_spatial.py
 COPY spatial.py /work/spatial.py
 COPY scan_context.py /work/scan_context.py
+COPY path_planner.py /work/path_planner.py
 COPY ext_devices.py /work/ext_devices.py
 COPY lidar.py /work/lidar.py
 COPY pointcloud_utils.py /work/pointcloud_utils.py
