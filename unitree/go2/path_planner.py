@@ -41,7 +41,7 @@ def _numpy_dilation(grid: np.ndarray, radius: int) -> np.ndarray:
 class PathPlanner:
     """PCD → 2D occupancy grid → A* path planning."""
 
-    def __init__(self, resolution: float = 0.15, robot_radius: float = 0.25,
+    def __init__(self, resolution: float = 0.15, robot_radius: float = 0.10,
                  z_min: float = 0.25, z_max: float = 0.5, min_hits: int = 5):
         """
         Args:
