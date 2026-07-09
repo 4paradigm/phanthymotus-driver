@@ -563,20 +563,14 @@ class _SpatialNode(Node):
             if len(data) < num * point_step:
                 num = len(data) // point_step
 
-            field_map = {}
-            for f in msg.fields:
-                field_map[f.name] = f.offset
-            x_off = field_map.get("x", 0)
-            y_off = field_map.get("y", 4)
-            z_off = field_map.get("z", 8)
-
+            # xyz 在前 12 字节 (和 lidar.py 一致)
             raw = np.frombuffer(data, dtype=np.uint8, count=num * point_step).reshape(num, point_step)
-            x = raw[:, x_off:x_off+4].view(np.float32).ravel()
-            y = raw[:, y_off:y_off+4].view(np.float32).ravel()
-            z = raw[:, z_off:z_off+4].view(np.float32).ravel()
-
-            valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
-            self._latest_lidar_body = np.column_stack([x[valid], y[valid], z[valid]])
+            xyz = raw[:, :12].view(np.float32).reshape(num, 3)
+            # 过滤零点（无效 lidar 返回）
+            mask = np.any(xyz != 0, axis=1)
+            valid = xyz[mask]
+            if len(valid) > 0:
+                self._latest_lidar_body = valid
         except Exception:
             pass
 
