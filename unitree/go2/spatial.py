@@ -377,6 +377,7 @@ class _SpatialNode(Node):
         self._last_traj_time: float = 0.0
         self._last_traj_pose: tuple = (0.0, 0.0)
         self._last_slam_cloud_time: float = 0.0
+        self._last_slam_info_time: float = time.time()
 
         # 3D voxel map buffer
         self._map_buffer: dict[tuple, tuple] = {}
@@ -453,6 +454,7 @@ class _SpatialNode(Node):
         except Exception:
             return
 
+        self._last_slam_info_time = time.time()
         msg_type = data.get("type", "")
 
         if msg_type in ("pos_info", "mapping_info"):
@@ -974,23 +976,29 @@ class _SpatialNode(Node):
             return dict(self._current_pose) if self._current_pose else None
 
     def get_pose_nav(self) -> dict | None:
-        """返回 map 坐标系位姿（加 bias，yaw 取负匹配物理方向），用于导航。"""
+        """返回 map 坐标系位姿（加 bias，yaw 不取负），用于导航计算。
+        注意：SLAM yaw 方向和物理方向相反（正值=物理右转），但 Move(vyaw) 正值=物理左转，
+        所以 heading_err = target - slam_yaw 得到正确的 vyaw 符号。"""
         with self._lock:
             if not self._current_pose:
                 return None
             raw = self._current_pose
         if not self._bias_set:
-            return {"x": raw["x"], "y": raw["y"], "yaw": -raw["yaw"]}
+            return dict(raw)
         cos_b = math.cos(self._bias_yaw)
         sin_b = math.sin(self._bias_yaw)
         x = cos_b * raw["x"] - sin_b * raw["y"] + self._bias_x
         y = sin_b * raw["x"] + cos_b * raw["y"] + self._bias_y
-        yaw = -(raw["yaw"] + self._bias_yaw)
+        yaw = raw["yaw"] + self._bias_yaw
         while yaw > math.pi:
             yaw -= 2 * math.pi
         while yaw < -math.pi:
             yaw += 2 * math.pi
         return {"x": x, "y": y, "yaw": yaw}
+
+    def is_slam_alive(self, timeout: float = 10.0) -> bool:
+        """Check if SLAM service is still sending pose updates."""
+        return (time.time() - self._last_slam_info_time) < timeout
 
     def map_to_slam(self, x: float, y: float) -> tuple:
         """旧图坐标 → SLAM 坐标（逆 bias 变换）。"""
@@ -1477,6 +1485,7 @@ class SpatialPlugin:
             return {
                 "map_name": self._node._active_map,
                 "pose": pose,
+                "slam_alive": self._node.is_slam_alive(),
                 "bias_set": self._node._bias_set,
                 "bias": {"x": round(self._node._bias_x, 3), "y": round(self._node._bias_y, 3), "yaw": round(self._node._bias_yaw, 3)} if self._node._bias_set else None,
                 "map_status": self._node._map_status,
@@ -1691,6 +1700,9 @@ class SpatialPlugin:
     def _navigate_with_planner(self, target_x: float, target_y: float, target_yaw: float,
                                tag_name: str | None = None) -> dict:
         """路径规划 + 导航。Buffer/planner 在 map 坐标系（bias 已应用到点云）。"""
+        if not self._node.is_slam_alive():
+            return {"error": "SLAM service lost, cannot execute navigation"}
+
         pose = self._node.get_pose_nav()
         if not pose:
             return {"error": "No current pose available"}
@@ -1789,13 +1801,27 @@ class SpatialPlugin:
         - 首个 waypoint: 原地转向后前进
         - 后续 waypoints: look-ahead 预瞄，边走边转不停顿
         - 每 1s 检测路径障碍，自动重规划
+        - SLAM health check: abort if SLAM service dies
         """
-        final_goal = self._nav_waypoints[-1]  # 最终目标（重规划用）
+        final_goal = self._nav_waypoints[-1]
         last_replan_time = time.time()
+
+        def _check_slam():
+            if not self._node.is_slam_alive():
+                self._rpc_proxy.Move(0, 0, 0)
+                self._nav_executing = False
+                self._node._nav_error = "SLAM service lost, navigation aborted"
+                self._node._nav_path_overlay = None
+                self._node._nav_arrived.set()
+                print("[Spatial] Navigation aborted: SLAM service lost", flush=True)
+                return True
+            return False
 
         try:
             i = 0
             while i < len(self._nav_waypoints) and self._nav_executing:
+                if _check_slam():
+                    return
                 wx, wy = self._nav_waypoints[i]
                 is_first = (i == 0)
                 is_last = (i == len(self._nav_waypoints) - 1)
