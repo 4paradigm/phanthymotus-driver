@@ -619,8 +619,8 @@ class _SpatialNode(Node):
 
             # If bias is set, transform points to map (old map) coordinate system
             if self._bias_set:
-                cos_b = math.cos(self._bias_yaw)
-                sin_b = math.sin(self._bias_yaw)
+                cos_b = math.cos(-self._bias_yaw)
+                sin_b = math.sin(-self._bias_yaw)
                 px = pts_arr[:, 0]
                 py = pts_arr[:, 1]
                 pts_arr[:, 0] = cos_b * px - sin_b * py + self._bias_x
@@ -957,12 +957,12 @@ class _SpatialNode(Node):
             raw = self._current_pose
         if not self._bias_set:
             return {"x": raw["x"], "y": raw["y"], "yaw": round(-raw["yaw"], 3)}
-        # Apply bias: map = R_bias * slam + T_bias
-        cos_b = math.cos(self._bias_yaw)
-        sin_b = math.sin(self._bias_yaw)
+        # Apply bias (yaw negated for SLAM→display direction)
+        cos_b = math.cos(-self._bias_yaw)
+        sin_b = math.sin(-self._bias_yaw)
         x = cos_b * raw["x"] - sin_b * raw["y"] + self._bias_x
         y = sin_b * raw["x"] + cos_b * raw["y"] + self._bias_y
-        yaw = raw["yaw"] + self._bias_yaw
+        yaw = raw["yaw"] - self._bias_yaw
         # Normalize and negate for user display
         while yaw > math.pi:
             yaw -= 2 * math.pi
@@ -985,11 +985,11 @@ class _SpatialNode(Node):
             raw = self._current_pose
         if not self._bias_set:
             return dict(raw)
-        cos_b = math.cos(self._bias_yaw)
-        sin_b = math.sin(self._bias_yaw)
+        cos_b = math.cos(-self._bias_yaw)
+        sin_b = math.sin(-self._bias_yaw)
         x = cos_b * raw["x"] - sin_b * raw["y"] + self._bias_x
         y = sin_b * raw["x"] + cos_b * raw["y"] + self._bias_y
-        yaw = raw["yaw"] + self._bias_yaw
+        yaw = raw["yaw"] - self._bias_yaw
         while yaw > math.pi:
             yaw -= 2 * math.pi
         while yaw < -math.pi:
@@ -1414,8 +1414,9 @@ class SpatialPlugin:
                 self._node._bias_set = True
 
                 # 5. 变换当前 buffer 中的点到旧图坐标系
-                cos_b = math.cos(bias_yaw)
-                sin_b = math.sin(bias_yaw)
+                # 变换 yaw 取负（SLAM yaw 方向与显示/物理方向相反）
+                cos_b = math.cos(-bias_yaw)
+                sin_b = math.sin(-bias_yaw)
                 with self._node._map_buffer_lock:
                     new_buffer = {}
                     voxel_size = self._node.VOXEL_SIZE
