@@ -1361,6 +1361,11 @@ class SpatialPlugin:
         delays = [5, 15, 30]  # 三次尝试
         for attempt, delay in enumerate(delays, 1):
             time.sleep(delay)
+            if getattr(self, '_test_mode', False):
+                print("[Spatial] Recognize skipped (test mode)", flush=True)
+                return
+        for attempt, delay in enumerate(delays, 1):
+            time.sleep(delay)
             try:
                 current_map = self._node._active_map
                 if not current_map:
@@ -1695,6 +1700,7 @@ class SpatialPlugin:
 
     def _test_icp(self, args: dict) -> dict:
         """ICP 受控测试：step=1 采样A保存PCD，step=2 采样B保存PCD+记录ground truth。"""
+        self._test_mode = True  # 阻止 recognize 干扰
         step = int(args.get("step", 1))
 
         pose_raw = self._node.get_pose_raw()
