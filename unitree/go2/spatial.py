@@ -1951,7 +1951,7 @@ class SpatialPlugin:
 
         def _check_slam():
             if not self._node.is_slam_alive():
-                self._rpc_proxy.Move(0, 0, 0)
+                self._rpc_proxy.OA_Move(0, 0, 0)
                 self._nav_executing = False
                 self._node._nav_error = "SLAM service lost, navigation aborted"
                 self._node._nav_path_overlay = None
@@ -1993,7 +1993,7 @@ class SpatialPlugin:
                         if abs(err) < 0.2:
                             break
                         vyaw = max(-1.5, min(1.5, err * 1.5))
-                        self._rpc_proxy.Move(0, 0, vyaw)
+                        self._rpc_proxy.OA_Move(0, 0, vyaw)
                         time.sleep(0.1)
                         if time.time() - turn_start > 8:
                             break
@@ -2043,7 +2043,16 @@ class SpatialPlugin:
                         vx = max(0.15, min(1.0, dist * 0.8))
                         vyaw = max(-0.8, min(0.8, heading_err * 1.0))
 
-                    self._rpc_proxy.Move(vx, 0, vyaw)
+                    # 每 0.5s 打印一次导航状态
+                    if not hasattr(self, '_last_nav_log') or time.time() - self._last_nav_log > 0.5:
+                        self._last_nav_log = time.time()
+                        print(f"[NAV] wp={i+1}/{len(self._nav_waypoints)} "
+                              f"pos=({pose['x']:.2f},{pose['y']:.2f}) yaw={math.degrees(pose['yaw']):.0f}° "
+                              f"→ wp=({wx:.2f},{wy:.2f}) dist={dist:.2f}m "
+                              f"h_err={math.degrees(heading_err):.0f}° "
+                              f"cmd: vx={vx:.2f} vyaw={vyaw:.2f}", flush=True)
+
+                    self._rpc_proxy.OA_Move(vx, 0, vyaw)
                     time.sleep(0.1)
 
                     # 动态重规划（每 1s）
@@ -2087,10 +2096,10 @@ class SpatialPlugin:
                     if abs(yaw_err) < 0.15:
                         break
                     vyaw = max(-1.0, min(1.0, yaw_err * 1.5))
-                    self._rpc_proxy.Move(0, 0, vyaw)
+                    self._rpc_proxy.OA_Move(0, 0, vyaw)
                     time.sleep(0.1)
 
-            self._rpc_proxy.Move(0, 0, 0)
+            self._rpc_proxy.OA_Move(0, 0, 0)
 
             if self._nav_executing:
                 self._nav_executing = False
@@ -2104,7 +2113,7 @@ class SpatialPlugin:
             print(f"[Spatial] Navigation error: {e}", flush=True)
             import traceback
             traceback.print_exc()
-            self._rpc_proxy.Move(0, 0, 0)
+            self._rpc_proxy.OA_Move(0, 0, 0)
             self._nav_executing = False
             self._node._nav_error = str(e)
             self._node._nav_path_overlay = None
