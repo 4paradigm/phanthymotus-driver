@@ -1628,52 +1628,31 @@ class SpatialPlugin:
 
     def _navigate_with_planner(self, target_x: float, target_y: float, target_yaw: float,
                                tag_name: str | None = None) -> dict:
-        """路径规划 + 可视化（debug 模式：不移动，只显示路线）。"""
-        pose = self._node.get_pose()
-        if not pose:
+        """路径规划 + 导航执行。全程在 SLAM 坐标系下工作。"""
+        # 起点：SLAM 原始坐标（planner 栅格也是 SLAM 坐标系）
+        pose_raw = self._node.get_pose_raw()
+        if not pose_raw:
             return {"error": "No current pose available"}
 
         if not self._ensure_planner_loaded():
             return {"error": "Path planner: no map loaded"}
 
-        # 设置栅格障碍物（用于 grid_map 2D 显示，不叠加到 3D mapping）
+        # 目标：map 坐标 → SLAM 坐标
+        target_slam = self._node.map_to_slam(target_x, target_y)
+
+        # 设置栅格障碍物（用于 grid_map 2D 显示）
         grid_pts = self._planner.get_grid_as_points()
         if grid_pts is not None:
             print(f"[Spatial] Grid: {len(grid_pts)} obstacle cells", flush=True)
 
-        # 规划路径
-        waypoints = self._planner.plan((pose["x"], pose["y"]), (target_x, target_y))
+        # 规划路径（SLAM 坐标系）
+        waypoints = self._planner.plan((pose_raw["x"], pose_raw["y"]), target_slam)
         if not waypoints:
-            return {"error": f"No path found from ({pose['x']:.1f},{pose['y']:.1f}) to ({target_x:.1f},{target_y:.1f})"}
+            return {"error": f"No path found from ({pose_raw['x']:.1f},{pose_raw['y']:.1f}) to ({target_slam[0]:.1f},{target_slam[1]:.1f})"}
 
-        # 生成路径点 overlay（细线，3条平行线）
-        PATH_WIDTH = 0.05  # 路线半宽 (m)
-        PATH_Z = 0.3       # 路线悬浮高度
-        PATH_STEP = 0.05   # 沿路径每 5cm 一个点
-        OFFSETS = [0, -PATH_WIDTH, PATH_WIDTH]  # 3条线
-        path_points = []
-        for i in range(len(waypoints) - 1):
-            x1, y1 = waypoints[i]
-            x2, y2 = waypoints[i + 1]
-            dx = x2 - x1
-            dy = y2 - y1
-            seg_len = math.sqrt(dx * dx + dy * dy)
-            if seg_len < 1e-6:
-                continue
-            nx = -dy / seg_len
-            ny = dx / seg_len
-            steps = max(int(seg_len / PATH_STEP), 1)
-            for s in range(steps):
-                t = s / steps
-                cx = x1 + t * dx
-                cy = y1 + t * dy
-                for offset in OFFSETS:
-                    path_points.append((cx + offset * nx, cy + offset * ny, PATH_Z))
-        ex, ey = waypoints[-1]
-        for offset in OFFSETS:
-            path_points.append((ex, ey, PATH_Z))
-        self._node._nav_path_overlay = np.array(path_points, dtype=np.float32)
-        print(f"[Spatial] Nav path overlay set: {len(path_points)} points, {len(waypoints)} waypoints", flush=True)
+        # 生成路径 overlay（需要加 bias 才能在 mapping 视图中正确显示）
+        self._node._nav_path_overlay = self._build_path_overlay_with_bias(waypoints)
+        print(f"[Spatial] Nav path: {len(waypoints)} waypoints (SLAM coords)", flush=True)
 
         # 设置导航状态
         self._nav_waypoints = waypoints
@@ -1696,7 +1675,7 @@ class SpatialPlugin:
         }
 
     def _build_path_overlay(self, waypoints: list[tuple], start_idx: int = 0) -> np.ndarray | None:
-        """生成剩余 waypoints 的路径点 overlay。"""
+        """生成剩余 waypoints 的路径点 overlay（SLAM 坐标，直接用于 mapping 显示）。"""
         remaining = waypoints[start_idx:]
         if len(remaining) < 2:
             return None
@@ -1725,6 +1704,11 @@ class SpatialPlugin:
         if not path_points:
             return None
         return np.array(path_points, dtype=np.float32)
+
+    def _build_path_overlay_with_bias(self, waypoints: list[tuple]) -> np.ndarray | None:
+        """生成路径 overlay，waypoints 是 SLAM 坐标，不需要额外变换
+        （因为 mapping 显示的点云也是 SLAM 坐标）。"""
+        return self._build_path_overlay(waypoints, 0)
 
     @staticmethod
     def _normalize_angle(a: float) -> float:
@@ -1762,7 +1746,7 @@ class SpatialPlugin:
                 if is_first:
                     turn_start = time.time()
                     while self._nav_executing:
-                        pose = self._node.get_pose()
+                        pose = self._node.get_pose_raw()
                         if not pose:
                             time.sleep(0.1)
                             continue
@@ -1783,9 +1767,9 @@ class SpatialPlugin:
 
                 # 前进到 waypoint（边走边转，look-ahead 预瞄）
                 stall_start = time.time()
-                last_pose = self._node.get_pose()
+                last_pose = self._node.get_pose_raw()
                 while self._nav_executing:
-                    pose = self._node.get_pose()
+                    pose = self._node.get_pose_raw()
                     if not pose:
                         time.sleep(0.1)
                         continue
@@ -1862,8 +1846,7 @@ class SpatialPlugin:
             if self._nav_executing and self._nav_target_yaw != 0:
                 print(f"[Spatial] Final yaw adjustment to {self._nav_target_yaw:.2f}", flush=True)
                 for _ in range(50):
-                    pose = self._node.get_pose()
-                    if not pose:
+                    pose = self._node.get_pose_raw()                    if not pose:
                         time.sleep(0.1)
                         continue
                     yaw_err = self._normalize_angle(self._nav_target_yaw - pose["yaw"])
@@ -1914,7 +1897,7 @@ class SpatialPlugin:
             return False
 
         # 重新规划
-        pose = self._node.get_pose()
+        pose = self._node.get_pose_raw()
         if not pose:
             return False
         new_path = self._planner.plan((pose["x"], pose["y"]), final_goal)
