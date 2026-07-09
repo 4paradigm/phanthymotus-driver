@@ -1351,8 +1351,8 @@ class SpatialPlugin:
             self._node.set_map_status("mapping")
             self._node.set_active_map(map_name)
             self._db.add_map(map_name, pcd_path)
-            # 5s 后检查是否有旧图可用
-            threading.Thread(target=self._try_recognize_existing_map, daemon=True).start()
+            # Recognize disabled temporarily for clean testing
+            # threading.Thread(target=self._try_recognize_existing_map, daemon=True).start()
             return {"status": "new", "map_name": map_name}
         return {"error": f"StartMapping failed, code={code}"}
 
@@ -1718,17 +1718,38 @@ class SpatialPlugin:
         save_dir = "/opt/phanthy-motus/data"
 
         if step == 1:
-            # 保存快照 A
+            # 重置 SLAM + 清空 buffer，等待重建，然后保存 A
+            print("[Spatial] test_icp step=1: resetting SLAM for clean A...", flush=True)
+            self._client.StopMapping(f"{save_dir}/test_icp_temp.pcd")
+            time.sleep(1)
+            self._client.StartMapping()
+            with self._node._map_buffer_lock:
+                self._node._map_buffer.clear()
+                self._node._map_buffer_dirty = False
+            self._node._recent_cloud_count = 0
+            self._node._recent_cloud_write_idx = 0
+
+            # 等 5s 让新图积累
+            print("[Spatial] test_icp step=1: waiting 5s for map A...", flush=True)
+            time.sleep(5)
+
+            # 获取新数据
+            pose_raw = self._node.get_pose_raw()
+            with self._node._map_buffer_lock:
+                if not self._node._map_buffer or len(self._node._map_buffer) < 100:
+                    return {"error": "No points after reset for A"}
+                pts = np.array(list(self._node._map_buffer.values()), dtype=np.float32)
+
             self._test_icp_snapshot_a = dict(pose_raw)
             path_a = f"{save_dir}/test_icp_A.npy"
             np.save(path_a, pts)
             return {
                 "step": 1,
-                "status": "Snapshot A saved",
+                "status": "SLAM reset + Snapshot A saved",
                 "pose_a": pose_raw,
                 "points": len(pts),
                 "file": path_a,
-                "instruction": "Now move the robot (e.g. 1m forward + 30 deg turn), then call test_icp step=2",
+                "instruction": "Now move the robot (e.g. 0.5m + 20 deg turn), then call test_icp step=2",
             }
 
         elif step == 2:
