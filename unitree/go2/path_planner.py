@@ -42,7 +42,7 @@ class PathPlanner:
     """PCD → 2D occupancy grid → A* path planning."""
 
     def __init__(self, resolution: float = 0.15, robot_radius: float = 0.25,
-                 z_min: float = 0.15, z_max: float = 0.8, min_hits: int = 3):
+                 z_min: float = 0.25, z_max: float = 0.5, min_hits: int = 3):
         """
         Args:
             resolution: 栅格分辨率 (m/cell), 默认 15cm
