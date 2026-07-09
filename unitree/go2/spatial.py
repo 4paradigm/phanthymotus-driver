@@ -1382,8 +1382,10 @@ class SpatialPlugin:
                 all_maps = self._db.list_maps()
                 old_maps = [m for m in all_maps if m["name"] != current_map and os.path.exists(m["pcd_path"])]
                 if not old_maps:
-                    print(f"[Spatial] Recognize attempt {attempt}/3: no old maps available", flush=True)
-                    continue
+                    print(f"[Spatial] Recognize: no old maps available, skipping", flush=True)
+                    # 没有旧图就不用重试了
+                    self._node._start_save_timer()
+                    return
 
                 # 3. 对每个旧图尝试全局配准，选最佳
                 from global_registration import register_2d
