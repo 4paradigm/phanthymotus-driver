@@ -1426,6 +1426,10 @@ class SpatialPlugin:
                         new_buffer[new_key] = (nx, ny, pz)
                     self._node._map_buffer = new_buffer
 
+                # 加载旧图点云到 buffer（旧图已经在旧图坐标系，buffer 也已变换到旧图坐标系）
+                old_pcd = best_map["pcd_path"]
+                self._node.load_pcd_to_buffer(old_pcd)
+
                 self._node.set_active_map(old_map_name)
                 self._db.set_last_used_map(old_map_name)
 
