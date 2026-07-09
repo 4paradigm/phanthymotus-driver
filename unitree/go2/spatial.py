@@ -756,6 +756,34 @@ class _SpatialNode(Node):
             self._last_kf_pose = (x, y, yaw)
             self._last_kf_time = time.time()
 
+    def _make_origin_marker(self) -> np.ndarray:
+        """生成原点标记：十字圆圈 + X轴正方向箭头（指北），z=0.5 悬浮。"""
+        points = []
+        Z = 0.5
+        R = 0.3  # 圆圈半径
+
+        # 圆圈
+        for deg in range(0, 360, 5):
+            rad = math.radians(deg)
+            points.append((R * math.cos(rad), R * math.sin(rad), Z))
+
+        # 十字 (±0.4m)
+        for t in np.linspace(-0.4, 0.4, 20):
+            points.append((t, 0, Z))  # X 轴
+            points.append((0, t, Z))  # Y 轴
+
+        # X 正方向箭头（指北）
+        arrow_len = 0.6
+        arrow_head = 0.15
+        for t in np.linspace(0, arrow_len, 15):
+            points.append((t, 0, Z))
+        # 箭头头部
+        for t in np.linspace(0, arrow_head, 5):
+            points.append((arrow_len - t, t, Z))
+            points.append((arrow_len - t, -t, Z))
+
+        return np.array(points, dtype=np.float32)
+
     def _maybe_publish_full_map(self) -> None:
         """Publish the full 3D voxel map at 1Hz."""
         now = time.monotonic()
@@ -786,6 +814,11 @@ class _SpatialNode(Node):
         overlay_parts = [pts]
         if self._nav_path_overlay is not None and len(self._nav_path_overlay) > 0:
             overlay_parts.append(self._nav_path_overlay)
+
+        # 原点标记：十字 + 指北箭头（z=0.5 悬浮显示）
+        origin_marker = self._make_origin_marker()
+        overlay_parts.append(origin_marker)
+
         if len(overlay_parts) > 1:
             pts = np.vstack(overlay_parts)
             num_points = len(pts)
@@ -1942,10 +1975,11 @@ class SpatialPlugin:
         final_goal = self._nav_waypoints[-1]
         last_replan_time = time.time()
 
-        # 开启硬件避障
+        # 开启硬件避障 + 获取控制权
         try:
             self._rpc_proxy.OA_SwitchSet(True)
-            print("[Spatial] Obstacle avoidance enabled", flush=True)
+            self._rpc_proxy.OA_UseRemoteCommandFromApi(True)
+            print("[Spatial] Obstacle avoidance enabled, API control taken", flush=True)
         except Exception:
             pass
 
@@ -2100,6 +2134,7 @@ class SpatialPlugin:
                     time.sleep(0.1)
 
             self._rpc_proxy.OA_Move(0, 0, 0)
+            self._rpc_proxy.OA_UseRemoteCommandFromApi(False)
 
             if self._nav_executing:
                 self._nav_executing = False
