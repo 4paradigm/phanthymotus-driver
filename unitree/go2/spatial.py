@@ -1416,8 +1416,8 @@ class SpatialPlugin:
 
                 # 验证：bias 平移距离不应超过 2m
                 bias_dist = math.sqrt(bias_x ** 2 + bias_y ** 2)
-                if bias_dist > 2.0:
-                    print(f"[Spatial] Recognize REJECTED: bias_dist={bias_dist:.2f}m > 2.0m", flush=True)
+                if bias_dist > 1.5:
+                    print(f"[Spatial] Recognize REJECTED: bias_dist={bias_dist:.2f}m > 1.5m", flush=True)
                     continue
 
                 # 4. 设置 bias (直接存 ICP 结果，变换代码中已处理方向)
