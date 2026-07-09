@@ -1951,9 +1951,11 @@ class SpatialPlugin:
 
             if self._nav_executing:
                 self._nav_executing = False
-                self._node._nav_path_overlay = None
                 self._node._nav_arrived.set()
                 print("[Spatial] Navigation complete", flush=True)
+                # Keep path overlay visible for 5s after completion
+                time.sleep(5)
+                self._node._nav_path_overlay = None
 
         except Exception as e:
             print(f"[Spatial] Navigation error: {e}", flush=True)
