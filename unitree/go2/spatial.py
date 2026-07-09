@@ -446,6 +446,18 @@ class _SpatialNode(Node):
         except Exception as e:
             self.get_logger().warn(f"SpatialNode: failed to subscribe mapping points: {e}")
 
+        # 订阅原始 lidar（body frame）用于实时避障
+        self._latest_lidar_body: np.ndarray | None = None  # Nx3 body frame points
+        try:
+            from unitree_sdk2py.core.channel import ChannelSubscriber
+            from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_
+            lidar_sub = ChannelSubscriber("rt/utlidar/cloud_deskewed", PointCloud2_)
+            lidar_sub.Init(self._on_lidar_body, 1)
+            self._dds_subs.append(lidar_sub)
+            self.get_logger().info("SpatialNode subscribed rt/utlidar/cloud_deskewed (obstacle detect)")
+        except Exception as e:
+            self.get_logger().warn(f"SpatialNode: failed to subscribe lidar for obstacle detect: {e}")
+
     # ── DDS Callbacks ────────────────────────────────────────────────────────
 
     def _on_slam_info(self, msg) -> None:
@@ -537,6 +549,60 @@ class _SpatialNode(Node):
             self._cloud_queue.put_nowait((msg.fields, msg.point_step, msg.width * msg.height, data))
         except Exception:
             pass
+
+    def _on_lidar_body(self, msg) -> None:
+        """保存最近一帧原始 lidar 点云（body frame）用于避障检测。"""
+        try:
+            data = bytes(msg.data)
+            point_step = msg.point_step
+            total_points = msg.width * msg.height
+            if total_points == 0 or len(data) < point_step:
+                return
+
+            num = min(total_points, 5000)
+            if len(data) < num * point_step:
+                num = len(data) // point_step
+
+            field_map = {}
+            for f in msg.fields:
+                field_map[f.name] = f.offset
+            x_off = field_map.get("x", 0)
+            y_off = field_map.get("y", 4)
+            z_off = field_map.get("z", 8)
+
+            raw = np.frombuffer(data, dtype=np.uint8, count=num * point_step).reshape(num, point_step)
+            x = raw[:, x_off:x_off+4].view(np.float32).ravel()
+            y = raw[:, y_off:y_off+4].view(np.float32).ravel()
+            z = raw[:, z_off:z_off+4].view(np.float32).ravel()
+
+            valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
+            self._latest_lidar_body = np.column_stack([x[valid], y[valid], z[valid]])
+        except Exception:
+            pass
+
+    def check_front_obstacle(self, min_dist: float = 0.8, width: float = 0.3,
+                             z_min: float = 0.1, z_max: float = 0.6) -> bool:
+        """检测前方是否有障碍物（body frame）。
+
+        Args:
+            min_dist: 前方多远内检测 (m)
+            width: 检测区域半宽 (m)
+            z_min, z_max: 高度过滤
+
+        Returns:
+            True if obstacle detected in front.
+        """
+        pts = self._latest_lidar_body
+        if pts is None or len(pts) < 10:
+            return False
+        # 前方区域: x > 0.2 且 x < min_dist, |y| < width, z 在范围内
+        mask = (
+            (pts[:, 0] > 0.2) & (pts[:, 0] < min_dist) &
+            (np.abs(pts[:, 1]) < width) &
+            (pts[:, 2] > z_min) & (pts[:, 2] < z_max)
+        )
+        count = np.sum(mask)
+        return count > 5  # 至少 5 个点才认为有障碍
 
     # ── Cloud Processing ─────────────────────────────────────────────────────
 
@@ -1896,6 +1962,9 @@ class SpatialPlugin:
         print(f"[Spatial] Nav path: {len(waypoints)} waypoints, overlay={overlay_len} pts, "
               f"start=({start[0]:.2f},{start[1]:.2f}), target=({target[0]:.2f},{target[1]:.2f})", flush=True)
 
+        # 强制立即发布一帧（确保路径在 mapping 上可见）
+        self._node._last_map_publish_time = 0
+
         # 设置导航状态
         self._nav_waypoints = waypoints
         self._nav_target_yaw = target_yaw
@@ -2088,6 +2157,32 @@ class SpatialPlugin:
 
                     self._rpc_proxy.OA_Move(vx, 0, vyaw)
                     time.sleep(0.1)
+
+                    # 实时避障检测（每 0.5s）
+                    if not hasattr(self, '_last_obstacle_check') or time.time() - self._last_obstacle_check > 0.5:
+                        self._last_obstacle_check = time.time()
+                        if self._node.check_front_obstacle():
+                            # 前方有障碍，停车等待
+                            self._rpc_proxy.OA_Move(0, 0, 0)
+                            print(f"[NAV] OBSTACLE detected! Stopping and waiting...", flush=True)
+                            # 等待最多 5s 让障碍消失
+                            obstacle_clear = False
+                            for _ in range(10):
+                                time.sleep(0.5)
+                                if not self._nav_executing:
+                                    break
+                                if not self._node.check_front_obstacle():
+                                    obstacle_clear = True
+                                    print(f"[NAV] Obstacle cleared, resuming", flush=True)
+                                    break
+                            if not obstacle_clear and self._nav_executing:
+                                # 障碍持续，触发重规划
+                                print(f"[NAV] Obstacle persistent, replanning...", flush=True)
+                                if self._try_replan(i, final_goal):
+                                    i = 0
+                                    overlay = self._build_path_overlay(self._nav_waypoints, 0)
+                                    self._node._nav_path_overlay = overlay
+                                    break
 
                     # 动态重规划（每 1s）
                     now = time.time()
