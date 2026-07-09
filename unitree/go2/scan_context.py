@@ -146,10 +146,13 @@ class ScanContextManager:
             })
         return kf_id
 
-    def query(self, current_sc: np.ndarray) -> dict | None:
+    def query(self, current_sc: np.ndarray, exclude_map: str | None = None) -> dict | None:
         """查询最匹配的地图。
 
         返回 {"map_name": str, "pose": {"x","y","z"}, "score": float} 或 None。
+
+        Args:
+            exclude_map: 排除此地图的 keyframes（用于排除当前正在建的图）
 
         流程:
         1. Ring Key 余弦距离粗筛 top-K
@@ -157,7 +160,10 @@ class ScanContextManager:
         3. 最佳得分 < SC_DIST_THRES → 匹配成功
         """
         with self._lock:
-            cache = list(self._cache)
+            if exclude_map:
+                cache = [c for c in self._cache if c["map_name"] != exclude_map]
+            else:
+                cache = list(self._cache)
 
         if not cache:
             return None
