@@ -446,17 +446,15 @@ class _SpatialNode(Node):
         except Exception as e:
             self.get_logger().warn(f"SpatialNode: failed to subscribe mapping points: {e}")
 
-        # 订阅原始 lidar（body frame）用于实时避障
-        self._latest_lidar_body: np.ndarray | None = None  # Nx3 body frame points
-        try:
-            from unitree_sdk2py.core.channel import ChannelSubscriber
-            from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_
-            lidar_sub = ChannelSubscriber("rt/utlidar/cloud_deskewed", PointCloud2_)
-            lidar_sub.Init(self._on_lidar_body, 1)
-            self._dds_subs.append(lidar_sub)
-            self.get_logger().info("SpatialNode subscribed rt/utlidar/cloud_deskewed (obstacle detect)")
-        except Exception as e:
-            self.get_logger().warn(f"SpatialNode: failed to subscribe lidar for obstacle detect: {e}")
+        # 订阅 lidar body frame 用于实时避障
+        # 注意：不能用 DDS ChannelSubscriber（和 LidarPlugin 冲突）
+        # 改为订阅 LidarPlugin 发布的 ROS2 topic
+        self._latest_lidar_body: np.ndarray | None = None
+        from std_msgs.msg import UInt8MultiArray
+        lidar_topic = pos_tag_topic.rsplit("/", 2)[0] + "/lidar/cloud"  # /{ns}/lidar/cloud
+        self._lidar_sub = self.create_subscription(
+            UInt8MultiArray, lidar_topic, self._on_lidar_ros2, _LOW_LAT_QOS)
+        self.get_logger().info(f"SpatialNode subscribed ROS2 {lidar_topic} (obstacle detect)")
 
     # ── DDS Callbacks ────────────────────────────────────────────────────────
 
@@ -550,32 +548,33 @@ class _SpatialNode(Node):
         except Exception:
             pass
 
-    def _on_lidar_body(self, msg) -> None:
-        """保存最近一帧原始 lidar 点云（body frame）用于避障检测。"""
+    def _on_lidar_ros2(self, msg) -> None:
+        """ROS2 lidar callback: parse UInt8MultiArray from LidarPlugin."""
         try:
             data = bytes(msg.data)
-            point_step = msg.point_step
-            total_points = msg.width * msg.height
-            if total_points == 0 or len(data) < point_step:
+            if len(data) < 8:
                 return
-
+            import struct
+            point_step, total_points = struct.unpack_from('<II', data, 0)
+            if total_points == 0 or point_step == 0:
+                return
+            cloud_data = data[8:]
             num = min(total_points, 5000)
-            if len(data) < num * point_step:
-                num = len(data) // point_step
-
-            # xyz 在前 12 字节 (和 lidar.py 一致)
-            raw = np.frombuffer(data, dtype=np.uint8, count=num * point_step).reshape(num, point_step)
+            if len(cloud_data) < num * point_step:
+                num = len(cloud_data) // point_step
+            if num == 0:
+                return
+            raw = np.frombuffer(cloud_data, dtype=np.uint8, count=num * point_step).reshape(num, point_step)
             xyz = raw[:, :12].view(np.float32).reshape(num, 3)
-            # 过滤零点（无效 lidar 返回）
             mask = np.any(xyz != 0, axis=1)
             valid = xyz[mask]
             if len(valid) > 0:
                 self._latest_lidar_body = valid
                 if not hasattr(self, '_lidar_body_logged'):
                     self._lidar_body_logged = True
-                    print(f"[Spatial] Lidar body first frame: {len(valid)} valid pts", flush=True)
+                    self.get_logger().info(f"Lidar body first frame via ROS2: {len(valid)} valid pts")
         except Exception as e:
-            print(f"[Spatial] _on_lidar_body error: {e}", flush=True)
+            self.get_logger().warn(f"_on_lidar_ros2 error: {e}")
 
     def check_front_obstacle(self, min_dist: float = 0.8, width: float = 0.3,
                              z_min: float = -1.0, z_max: float = 1.0) -> bool:
