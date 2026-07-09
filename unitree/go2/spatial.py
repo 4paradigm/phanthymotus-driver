@@ -1407,7 +1407,7 @@ class SpatialPlugin:
                       f"bias=({bias_x:.3f}, {bias_y:.3f}, yaw={math.degrees(bias_yaw):.1f}°), "
                       f"score={best_result['score']:.4f}, fft_deg={best_result['fft_deg']}", flush=True)
 
-                # 4. 设置 bias（ICP 返回的是 new→old 的变换，直接用）
+                # 4. 设置 bias (直接存 ICP 结果，变换代码中已处理方向)
                 self._node._bias_x = bias_x
                 self._node._bias_y = bias_y
                 self._node._bias_yaw = bias_yaw
