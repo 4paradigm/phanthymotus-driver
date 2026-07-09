@@ -1336,10 +1336,10 @@ class SpatialPlugin:
                     print(f"[Spatial] Recognize attempt {attempt}/3: only {cloud_size} points, need 500+", flush=True)
                     continue
 
-                # 2. Scan Context 粗匹配
+                # 2. Scan Context 粗匹配（排除当前新图）
                 sc = self._sc_mgr.make_scan_context(recent_cloud)
-                match = self._sc_mgr.query(sc)
-                if not match or match["map_name"] == current_map:
+                match = self._sc_mgr.query(sc, exclude_map=current_map)
+                if not match:
                     print(f"[Spatial] Recognize attempt {attempt}/3: no matching old map found", flush=True)
                     continue
 
