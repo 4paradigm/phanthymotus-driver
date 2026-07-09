@@ -359,6 +359,12 @@ class _SpatialNode(Node):
         self._grid_pts_cache: np.ndarray | None = None
         self._planner_grid_pts_cache_valid = False
 
+        # Coordinate bias (SLAM frame → map frame transform)
+        self._bias_x: float = 0.0
+        self._bias_y: float = 0.0
+        self._bias_yaw: float = 0.0
+        self._bias_set: bool = False
+
         # State
         self._current_pose: dict | None = None
         self._map_status: str = "idle"    # idle | mapping | localized
@@ -860,21 +866,23 @@ class _SpatialNode(Node):
         try:
             pts = np.array(all_points, dtype=np.float32)
             num = len(pts)
-            with open(pcd_path, 'w') as f:
-                f.write("# .PCD v0.7 - Point Cloud Data\n")
-                f.write("VERSION 0.7\n")
-                f.write("FIELDS x y z\n")
-                f.write("SIZE 4 4 4\n")
-                f.write("TYPE F F F\n")
-                f.write("COUNT 1 1 1\n")
-                f.write(f"WIDTH {num}\n")
-                f.write("HEIGHT 1\n")
-                f.write("VIEWPOINT 0 0 0 1 0 0 0\n")
-                f.write(f"POINTS {num}\n")
-                f.write("DATA ascii\n")
-                for i in range(num):
-                    f.write(f"{pts[i,0]:.4f} {pts[i,1]:.4f} {pts[i,2]:.4f}\n")
-            self.get_logger().info(f"Auto-saved PCD: {pcd_path} ({num} points)")
+            with open(pcd_path, 'wb') as f:
+                header = (
+                    f"# .PCD v0.7 - Point Cloud Data\n"
+                    f"VERSION 0.7\n"
+                    f"FIELDS x y z\n"
+                    f"SIZE 4 4 4\n"
+                    f"TYPE F F F\n"
+                    f"COUNT 1 1 1\n"
+                    f"WIDTH {num}\n"
+                    f"HEIGHT 1\n"
+                    f"VIEWPOINT 0 0 0 1 0 0 0\n"
+                    f"POINTS {num}\n"
+                    f"DATA binary\n"
+                )
+                f.write(header.encode('ascii'))
+                f.write(pts.tobytes())
+            self.get_logger().info(f"Auto-saved PCD: {pcd_path} ({num} points, binary)")
         except Exception as e:
             self.get_logger().warn(f"Failed to save PCD: {e}")
 
@@ -931,8 +939,40 @@ class _SpatialNode(Node):
         return self._recent_cloud[:count].copy()
 
     def get_pose(self) -> dict | None:
+        """返回当前位姿（map 坐标系，已应用 bias）。"""
+        with self._lock:
+            if not self._current_pose:
+                return None
+            raw = self._current_pose
+        if not self._bias_set:
+            return dict(raw)
+        # Apply bias: map = R_bias * slam + T_bias
+        cos_b = math.cos(self._bias_yaw)
+        sin_b = math.sin(self._bias_yaw)
+        x = cos_b * raw["x"] - sin_b * raw["y"] + self._bias_x
+        y = sin_b * raw["x"] + cos_b * raw["y"] + self._bias_y
+        yaw = raw["yaw"] + self._bias_yaw
+        # Normalize yaw
+        while yaw > math.pi:
+            yaw -= 2 * math.pi
+        while yaw < -math.pi:
+            yaw += 2 * math.pi
+        return {"x": x, "y": y, "yaw": round(yaw, 3)}
+
+    def get_pose_raw(self) -> dict | None:
+        """返回 SLAM 原始位姿（不加 bias）。"""
         with self._lock:
             return dict(self._current_pose) if self._current_pose else None
+
+    def map_to_slam(self, x: float, y: float) -> tuple:
+        """旧图坐标 → SLAM 坐标（逆 bias 变换）。"""
+        if not self._bias_set:
+            return (x, y)
+        dx = x - self._bias_x
+        dy = y - self._bias_y
+        cos_b = math.cos(-self._bias_yaw)
+        sin_b = math.sin(-self._bias_yaw)
+        return (cos_b * dx - sin_b * dy, sin_b * dx + cos_b * dy)
 
     def set_active_map(self, name: str | None):
         with self._lock:
@@ -1280,7 +1320,7 @@ class SpatialPlugin:
         return {"error": f"StartMapping failed, code={code}"}
 
     def _try_recognize_existing_map(self):
-        """启动 5s 后：用 Scan Context + ICP 检查是否在已知地图中，是则切换。"""
+        """启动 5s 后：用 Scan Context + ICP 检查是否在已知地图中，设置 bias。"""
         time.sleep(5)
         try:
             current_map = self._node._active_map
@@ -1319,60 +1359,44 @@ class SpatialPlugin:
             with self._node._map_buffer_lock:
                 source_cloud = np.array(list(self._node._map_buffer.values()), dtype=np.float32) if self._node._map_buffer else None
 
-            init_x = match["pose"]["x"]
-            init_y = match["pose"]["y"]
-            init_yaw = 0.0
+            bias_x = match["pose"]["x"]
+            bias_y = match["pose"]["y"]
+            bias_yaw = 0.0
 
             if target_cloud is not None and source_cloud is not None and len(source_cloud) >= 100 and len(target_cloud) >= 100:
-                icp_result = icp_2d(source_cloud, target_cloud, init_x=init_x, init_y=init_y,
+                icp_result = icp_2d(source_cloud, target_cloud, init_x=bias_x, init_y=bias_y,
                                     max_iterations=50, max_correspond_dist=3.0)
                 if icp_result and icp_result["score"] < 1.0:
-                    init_x = icp_result["x"]
-                    init_y = icp_result["y"]
-                    init_yaw = icp_result["yaw"]
-                    print(f"[Spatial] Recognize ICP: x={init_x:.3f}, y={init_y:.3f}, yaw={init_yaw:.3f}, "
+                    bias_x = icp_result["x"]
+                    bias_y = icp_result["y"]
+                    bias_yaw = icp_result["yaw"]
+                    print(f"[Spatial] Recognize ICP: bias_x={bias_x:.3f}, bias_y={bias_y:.3f}, bias_yaw={bias_yaw:.3f}, "
                           f"score={icp_result['score']:.4f}", flush=True)
                 else:
-                    print(f"[Spatial] Recognize ICP failed, using Scan Context pose", flush=True)
+                    print(f"[Spatial] Recognize ICP failed, using Scan Context pose as bias", flush=True)
             else:
                 print(f"[Spatial] Recognize: can't run ICP (src={len(source_cloud) if source_cloud is not None else 0}, "
                       f"tgt={len(target_cloud) if target_cloud is not None else 0}), using Scan Context pose", flush=True)
 
-            # 4. 切换到旧图：StopMapping → InitPose → StartMapping
+            # 4. 设置 bias（不调 InitPose，SLAM 继续建图不受影响）
+            self._node._bias_x = bias_x
+            self._node._bias_y = bias_y
+            self._node._bias_yaw = bias_yaw
+            self._node._bias_set = True
+            print(f"[Spatial] Bias set: ({bias_x:.3f}, {bias_y:.3f}, yaw={bias_yaw:.3f})", flush=True)
+
+            # 5. 切换到旧图（复用 POI/tags），加载旧图点云到 buffer
+            self._node.load_pcd_to_buffer(old_pcd)
+            self._node.set_active_map(old_map_name)
+            self._db.set_last_used_map(old_map_name)
+
+            # 删除临时新图
             current_pcd = f"{self._map_dir}/{current_map}.pcd"
-            code, _ = self._client.StopMapping(current_pcd)
-            if code != 0:
-                print(f"[Spatial] Recognize: StopMapping failed (code={code})", flush=True)
-                self._client.StartMapping()
-                return
-
-            time.sleep(3)
-
-            q_z = math.sin(init_yaw / 2)
-            q_w = math.cos(init_yaw / 2)
-            print(f"[Spatial] Recognize InitPose: x={init_x:.3f}, y={init_y:.3f}, yaw={init_yaw:.3f}, pcd={old_pcd}", flush=True)
-            code, _ = self._client.InitPose(init_x, init_y, 0, 0, 0, q_z, q_w, old_pcd)
-            if code != 0:
-                print(f"[Spatial] Recognize: InitPose failed (code={code}), restarting fresh", flush=True)
-                self._client.StartMapping()
-                return
-
-            time.sleep(1)
-            code, _ = self._client.StartMapping()
-            if code == 0:
-                self._node.load_pcd_to_buffer(old_pcd)
-                self._node.set_map_status("mapping")
-                self._node.set_active_map(old_map_name)
-                self._db.set_last_used_map(old_map_name)
-                self._last_localized_time = time.time()
-                # 删除临时新图
-                self._db.delete_map(current_map)
-                self._sc_mgr.clear_map(current_map)
-                import subprocess as _sp
-                _sp.run(["rm", "-f", current_pcd], capture_output=True)
-                print(f"[Spatial] Switched to old map '{old_map_name}', deleted temp '{current_map}'", flush=True)
-            else:
-                print(f"[Spatial] Recognize: StartMapping on old map failed (code={code})", flush=True)
+            self._db.delete_map(current_map)
+            self._sc_mgr.clear_map(current_map)
+            import subprocess as _sp
+            _sp.run(["rm", "-f", current_pcd], capture_output=True)
+            print(f"[Spatial] Recognized old map '{old_map_name}', bias applied, deleted temp '{current_map}'", flush=True)
 
         except Exception as e:
             print(f"[Spatial] Recognize error: {e}", flush=True)
@@ -1506,7 +1530,7 @@ class SpatialPlugin:
     # ── Relocalization ────────────────────────────────────────────────────────
 
     def _relocalize_at_tag(self, tag_name: str) -> dict:
-        """用 ICP 在已知 tag 附近精确定位。"""
+        """用 ICP 在已知 tag 附近精确定位 → 设置 bias。"""
         from icp import icp_2d
 
         # 查找 tag 所在的地图
@@ -1552,52 +1576,27 @@ class SpatialPlugin:
         if result is None:
             return {"error": "ICP failed to converge"}
 
-        print(f"[Spatial] ICP result: x={result['x']:.3f}, y={result['y']:.3f}, "
-              f"yaw={result['yaw']:.3f}, score={result['score']:.4f}, "
-              f"iters={result['iterations']}, matches={result['correspondences']}", flush=True)
+        print(f"[Spatial] ICP result: bias=({result['x']:.3f}, {result['y']:.3f}, yaw={result['yaw']:.3f}), "
+              f"score={result['score']:.4f}, iters={result['iterations']}", flush=True)
 
-        # 如果误差太大，可能 ICP 发散了
         if result["score"] > 1.0:
             return {"error": f"ICP score too high ({result['score']:.3f}), possibly diverged", "icp_result": result}
 
-        # 停止当前建图
-        active_map = self._node._active_map
-        if active_map:
-            current_pcd = f"{self._map_dir}/{active_map}.pcd"
-            self._node._maybe_save_pcd()
-            self._client.StopMapping(current_pcd)
-            time.sleep(0.5)
-
-        # InitPose 到精确位姿
-        yaw = result["yaw"]
-        q_z = math.sin(yaw / 2)
-        q_w = math.cos(yaw / 2)
-        code, resp = self._client.InitPose(result["x"], result["y"], 0, 0, 0, q_z, q_w, pcd_path)
-        if code != 0:
-            return _rpc_error("InitPose", code, resp)
+        # 设置 bias（不调 InitPose）
+        self._node._bias_x = result["x"]
+        self._node._bias_y = result["y"]
+        self._node._bias_yaw = result["yaw"]
+        self._node._bias_set = True
 
         # 切换到目标地图
         self._node.load_pcd_to_buffer(pcd_path)
-        self._node.set_map_status("localized")
         self._node.set_active_map(target_map["name"])
         self._db.set_last_used_map(target_map["name"])
-        self._last_localized_time = time.time()
-
-        # 继续建图扩展
-        time.sleep(0.5)
-        code, _ = self._client.StartMapping()
-        if code == 0:
-            self._node.set_map_status("mapping")
-
-        # 清理旧的临时地图
-        if active_map and active_map != target_map["name"]:
-            self._db.delete_map(active_map)
-            self._sc_mgr.clear_map(active_map)
 
         return {
             "status": "relocalized",
             "map": target_map["name"],
-            "pose": {"x": result["x"], "y": result["y"], "yaw": result["yaw"]},
+            "bias": {"x": result["x"], "y": result["y"], "yaw": result["yaw"]},
             "icp_score": result["score"],
             "icp_iterations": result["iterations"],
         }
