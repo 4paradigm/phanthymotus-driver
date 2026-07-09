@@ -1703,7 +1703,7 @@ class SpatialPlugin:
     _test_icp_snapshot_a = None  # (pose_raw, points)
 
     def _test_icp(self, args: dict) -> dict:
-        """ICP 受控测试：step=1 采样A，step=2 采样B并对比。"""
+        """ICP 受控测试：step=1 采样A保存PCD，step=2 采样B保存PCD+记录ground truth。"""
         step = int(args.get("step", 1))
 
         pose_raw = self._node.get_pose_raw()
@@ -1715,13 +1715,19 @@ class SpatialPlugin:
                 return {"error": "Not enough points in buffer"}
             pts = np.array(list(self._node._map_buffer.values()), dtype=np.float32)
 
+        save_dir = "/opt/phanthy-motus/data"
+
         if step == 1:
-            self._test_icp_snapshot_a = (dict(pose_raw), pts.copy())
+            # 保存快照 A
+            self._test_icp_snapshot_a = dict(pose_raw)
+            path_a = f"{save_dir}/test_icp_A.npy"
+            np.save(path_a, pts)
             return {
                 "step": 1,
-                "status": "Snapshot A captured",
+                "status": "Snapshot A saved",
                 "pose_a": pose_raw,
                 "points": len(pts),
+                "file": path_a,
                 "instruction": "Now move the robot (e.g. 1m forward + 30 deg turn), then call test_icp step=2",
             }
 
@@ -1729,67 +1735,42 @@ class SpatialPlugin:
             if self._test_icp_snapshot_a is None:
                 return {"error": "No snapshot A. Call test_icp step=1 first."}
 
-            pose_a, pts_a = self._test_icp_snapshot_a
+            pose_a = self._test_icp_snapshot_a
             pose_b = dict(pose_raw)
-            pts_b = pts.copy()
 
-            # Ground truth: B relative to A (SLAM coords)
+            # 保存快照 B
+            path_b = f"{save_dir}/test_icp_B.npy"
+            np.save(path_b, pts)
+
+            # Ground truth
             gt_dx = pose_b["x"] - pose_a["x"]
             gt_dy = pose_b["y"] - pose_a["y"]
             gt_dyaw = pose_b["yaw"] - pose_a["yaw"]
             while gt_dyaw > math.pi: gt_dyaw -= 2 * math.pi
             while gt_dyaw < -math.pi: gt_dyaw += 2 * math.pi
 
-            # ICP: A=source, B=target. Should find transform A→B ≈ ground truth
-            from icp import icp_2d
-
-            results = []
-            for init_yaw_deg in range(0, 360, 45):
-                init_yaw = math.radians(init_yaw_deg)
-                r = icp_2d(pts_a, pts_b, init_x=gt_dx, init_y=gt_dy, init_yaw=init_yaw,
-                           max_iterations=50, max_correspond_dist=2.0)
-                if r:
-                    results.append({"init_yaw_deg": init_yaw_deg, **r})
-
-            # Also try with ground truth as init
-            r_gt = icp_2d(pts_a, pts_b, init_x=gt_dx, init_y=gt_dy, init_yaw=gt_dyaw,
-                          max_iterations=50, max_correspond_dist=2.0)
-            if r_gt:
-                results.append({"init_yaw_deg": "gt", **r_gt})
-
-            best = min(results, key=lambda r: r["score"]) if results else None
-
-            output = {
-                "step": 2,
-                "pose_a": pose_a,
-                "pose_b": pose_b,
-                "ground_truth": {"dx": round(gt_dx, 3), "dy": round(gt_dy, 3), "dyaw_rad": round(gt_dyaw, 3), "dyaw_deg": round(math.degrees(gt_dyaw), 1)},
-                "points_a": len(pts_a),
-                "points_b": len(pts_b),
-            }
-
-            if best:
-                err_x = best["x"] - gt_dx
-                err_y = best["y"] - gt_dy
-                err_yaw = best["yaw"] - gt_dyaw
-                while err_yaw > math.pi: err_yaw -= 2 * math.pi
-                while err_yaw < -math.pi: err_yaw += 2 * math.pi
-                output["icp_best"] = {
-                    "x": round(best["x"], 3), "y": round(best["y"], 3),
-                    "yaw_rad": round(best["yaw"], 3), "yaw_deg": round(math.degrees(best["yaw"]), 1),
-                    "score": round(best["score"], 4),
-                    "init_yaw_deg": best["init_yaw_deg"],
-                    "iterations": best["iterations"],
-                }
-                output["error"] = {"x": round(err_x, 3), "y": round(err_y, 3), "yaw_deg": round(math.degrees(err_yaw), 1)}
-            else:
-                output["icp_best"] = None
-                output["error_msg"] = "ICP failed for all init angles"
-
-            output["all_results"] = [{"init": r["init_yaw_deg"], "yaw_deg": round(math.degrees(r["yaw"]), 1), "score": round(r["score"], 4)} for r in sorted(results, key=lambda r: r["score"])[:5]]
+            # 保存 ground truth
+            import json as _json
+            gt_data = {"pose_a": pose_a, "pose_b": pose_b, "gt_dx": gt_dx, "gt_dy": gt_dy, "gt_dyaw": gt_dyaw}
+            gt_path = f"{save_dir}/test_icp_gt.json"
+            with open(gt_path, "w") as f:
+                _json.dump(gt_data, f, indent=2)
 
             self._test_icp_snapshot_a = None
-            return output
+
+            return {
+                "step": 2,
+                "status": "Snapshot B saved. Use files to debug ICP offline.",
+                "pose_a": pose_a,
+                "pose_b": pose_b,
+                "ground_truth": {
+                    "dx": round(gt_dx, 3), "dy": round(gt_dy, 3),
+                    "dyaw_rad": round(gt_dyaw, 3), "dyaw_deg": round(math.degrees(gt_dyaw), 1)
+                },
+                "points_a_file": f"{save_dir}/test_icp_A.npy",
+                "points_b_file": path_b,
+                "gt_file": gt_path,
+            }
 
         return {"error": f"Invalid step={step}, use 1 or 2"}
 
