@@ -576,39 +576,48 @@ class _SpatialNode(Node):
         except Exception as e:
             self.get_logger().warn(f"_on_lidar_ros2 error: {e}")
 
-    def check_front_obstacle(self, min_dist: float = 0.8, width: float = 0.3,
-                             z_min: float = -1.0, z_max: float = 1.0) -> bool:
-        """检测前方是否有障碍物（body frame）。
+    def get_front_obstacle_dist(self, width: float = 0.3,
+                                z_min: float = -1.0, z_max: float = 1.0) -> float:
+        """返回前方最近障碍物距离 (m)。无障碍返回 999.0。
 
         Args:
-            min_dist: 前方多远内检测 (m)
             width: 检测区域半宽 (m)
             z_min, z_max: 高度过滤
-
-        Returns:
-            True if obstacle detected in front.
         """
         pts = self._latest_lidar_body
         if pts is None or len(pts) < 10:
-            if not hasattr(self, '_no_lidar_warned') or not self._no_lidar_warned:
-                print(f"[OBSTACLE] No lidar data! _latest_lidar_body={'None' if pts is None else len(pts)}", flush=True)
-                self._no_lidar_warned = True
-            return False
-        self._no_lidar_warned = False
-        # 前方区域: x > 0.2 且 x < min_dist, |y| < width, z 在范围内
+            return 999.0
+        # 前方区域: x > 0.2, |y| < width, z 在范围内
         mask = (
-            (pts[:, 0] > 0.2) & (pts[:, 0] < min_dist) &
+            (pts[:, 0] > 0.2) &
             (np.abs(pts[:, 1]) < width) &
             (pts[:, 2] > z_min) & (pts[:, 2] < z_max)
         )
-        count = int(np.sum(mask))
-        # Debug: 每次调用打印一次 (由外部控制频率)
-        if not hasattr(self, '_obstacle_log_count'):
-            self._obstacle_log_count = 0
-        self._obstacle_log_count += 1
-        if self._obstacle_log_count % 5 == 1:  # 每5次打印一次
-            print(f"[OBSTACLE] lidar pts={len(pts)}, front_count={count}, threshold=5", flush=True)
-        return count > 5  # 至少 5 个点才认为有障碍
+        front_pts = pts[mask]
+        if len(front_pts) < 3:
+            return 999.0
+        return float(front_pts[:, 0].min())
+
+    def get_front_obstacle_points_map(self, pose: dict, max_dist: float = 1.5,
+                                      width: float = 0.5) -> np.ndarray | None:
+        """返回前方障碍物点转换到 map 坐标系（用于加入 planner 栅格）。"""
+        pts = self._latest_lidar_body
+        if pts is None or len(pts) < 10:
+            return None
+        # 前方区域
+        mask = (
+            (pts[:, 0] > 0.2) & (pts[:, 0] < max_dist) &
+            (np.abs(pts[:, 1]) < width)
+        )
+        front_pts = pts[mask]
+        if len(front_pts) < 3:
+            return None
+        # body frame → map frame
+        cos_y = math.cos(pose["yaw"])
+        sin_y = math.sin(pose["yaw"])
+        map_x = cos_y * front_pts[:, 0] - sin_y * front_pts[:, 1] + pose["x"]
+        map_y = sin_y * front_pts[:, 0] + cos_y * front_pts[:, 1] + pose["y"]
+        return np.column_stack([map_x, map_y, front_pts[:, 2]])
 
     # ── Cloud Processing ─────────────────────────────────────────────────────
 
@@ -2152,72 +2161,91 @@ class SpatialPlugin:
                         diff = self._normalize_angle(next_heading - current_heading)
                         target_heading = current_heading + blend * diff
 
-                    heading_err = self._normalize_angle(target_heading - pose["yaw"])
+                    # 速度控制 + lidar 避障
+                    front_dist = self._node.get_front_obstacle_dist()
 
-                    # 速度控制
-                    if abs(heading_err) > 0.8:
-                        # 偏航很大：大幅减速转向
-                        vx = 0.05
-                        vyaw = max(-2.0, min(2.0, heading_err * 2.0))
-                    elif abs(heading_err) > 0.3:
-                        # 中等偏航：减速+转
-                        vx = max(0.1, min(0.3, dist * 0.5))
-                        vyaw = max(-1.5, min(1.5, heading_err * 1.5))
+                    if front_dist < 0.3:
+                        # 完全停止
+                        vx = 0
+                        vyaw = 0
+                    elif front_dist < 1.5:
+                        # 速度衰减: vx = min(原始vx, nearest_dist * 0.6)
+                        max_vx = front_dist * 0.6
+                        if abs(heading_err) > 0.8:
+                            vx = 0.05
+                            vyaw = max(-2.0, min(2.0, heading_err * 2.0))
+                        elif abs(heading_err) > 0.3:
+                            vx = max(0.1, min(max_vx, dist * 0.5))
+                            vyaw = max(-1.5, min(1.5, heading_err * 1.5))
+                        else:
+                            vx = max(0.15, min(max_vx, dist * 0.8))
+                            vyaw = max(-0.8, min(0.8, heading_err * 1.0))
                     else:
-                        # 方向正确：全速前进+微调
-                        vx = max(0.15, min(1.0, dist * 0.8))
-                        vyaw = max(-0.8, min(0.8, heading_err * 1.0))
+                        # 无障碍：正常速度控制
+                        if abs(heading_err) > 0.8:
+                            vx = 0.05
+                            vyaw = max(-2.0, min(2.0, heading_err * 2.0))
+                        elif abs(heading_err) > 0.3:
+                            vx = max(0.1, min(0.3, dist * 0.5))
+                            vyaw = max(-1.5, min(1.5, heading_err * 1.5))
+                        else:
+                            vx = max(0.15, min(1.0, dist * 0.8))
+                            vyaw = max(-0.8, min(0.8, heading_err * 1.0))
 
                     # 每 0.5s 打印一次导航状态
                     if not hasattr(self, '_last_nav_log') or time.time() - self._last_nav_log > 0.5:
                         self._last_nav_log = time.time()
+                        obs_str = f" OBS={front_dist:.1f}m" if front_dist < 1.5 else ""
                         print(f"[NAV] wp={i+1}/{len(self._nav_waypoints)} "
                               f"pos=({pose['x']:.2f},{pose['y']:.2f}) yaw={math.degrees(pose['yaw']):.0f}° "
                               f"→ wp=({wx:.2f},{wy:.2f}) dist={dist:.2f}m "
                               f"h_err={math.degrees(heading_err):.0f}° "
-                              f"cmd: vx={vx:.2f} vyaw={vyaw:.2f}", flush=True)
+                              f"cmd: vx={vx:.2f} vyaw={vyaw:.2f}{obs_str}", flush=True)
 
                     self._rpc_proxy.OA_Move(vx, 0, vyaw)
                     time.sleep(0.1)
 
-                    # 实时避障检测（每 0.5s）
-                    if not hasattr(self, '_last_obstacle_check') or time.time() - self._last_obstacle_check > 0.5:
-                        self._last_obstacle_check = time.time()
-                        if self._node.check_front_obstacle():
-                            # 前方有障碍，停车等待
-                            self._rpc_proxy.OA_Move(0, 0, 0)
-                            print(f"[NAV] OBSTACLE detected! Stopping and waiting...", flush=True)
-                            # 等待最多 5s 让障碍消失
-                            obstacle_clear = False
-                            for _ in range(10):
-                                time.sleep(0.5)
-                                if not self._nav_executing:
-                                    break
-                                if not self._node.check_front_obstacle():
-                                    obstacle_clear = True
-                                    print(f"[NAV] Obstacle cleared, resuming", flush=True)
-                                    break
-                            if not obstacle_clear and self._nav_executing:
-                                # 障碍持续，触发重规划
-                                print(f"[NAV] Obstacle persistent, replanning...", flush=True)
-                                if self._try_replan(i, final_goal):
-                                    i = 0
-                                    overlay = self._build_path_overlay(self._nav_waypoints, 0)
-                                    self._node._nav_path_overlay = overlay
-                                    break
-
-                    # 动态重规划（每 1s）
+                    # 停止状态 3s → 重规划（lidar 障碍加入栅格）
                     now = time.time()
-                    if now - last_replan_time > 1.0:
-                        last_replan_time = now
-                        if self._try_replan(i, final_goal):
-                            # 路径已更新，重置 waypoint 索引到 0（从新路径开始）
-                            i = 0
-                            overlay = self._build_path_overlay(self._nav_waypoints, 0)
-                            self._node._nav_path_overlay = overlay
-                            break  # 跳出内层循环，重新从 while i < len 开始
+                    if front_dist < 0.3:
+                        if not hasattr(self, '_stop_start_time'):
+                            self._stop_start_time = now
+                        elif now - self._stop_start_time > 3.0:
+                            # 把前方障碍加入 planner 栅格 + 重规划
+                            obs_pts_map = self._node.get_front_obstacle_points_map(pose)
+                            if obs_pts_map is not None:
+                                # 临时加入 planner
+                                self._planner.load_from_buffer(
+                                    np.vstack([np.array(list(self._node._map_buffer.values()), dtype=np.float32), obs_pts_map])
+                                )
+                            print(f"[NAV] Replanning due to obstacle...", flush=True)
+                            new_path = self._planner.plan((pose["x"], pose["y"]), final_goal)
+                            if new_path and len(new_path) >= 2:
+                                self._nav_waypoints = new_path
+                                i = 0
+                                overlay = self._build_path_overlay(self._nav_waypoints, 0)
+                                self._node._nav_path_overlay = overlay
+                                self._node._maybe_publish_full_map()
+                                print(f"[NAV] Replanned: {len(new_path)} waypoints", flush=True)
+                                self._stop_start_time = now  # reset
+                                break
+                            else:
+                                if not hasattr(self, '_replan_fail_count'):
+                                    self._replan_fail_count = 0
+                                self._replan_fail_count += 1
+                                if self._replan_fail_count >= 3:
+                                    print(f"[NAV] Replan failed 3 times, aborting navigation", flush=True)
+                                    self._nav_executing = False
+                                    self._node._nav_error = "Navigation failed: no alternative path"
+                                    break
+                                self._stop_start_time = now  # retry in 3s
+                    else:
+                        if hasattr(self, '_stop_start_time'):
+                            del self._stop_start_time
+                        if hasattr(self, '_replan_fail_count'):
+                            del self._replan_fail_count
 
-                    # 卡住检测
+                    # 卡住检测: 30s 不变 → abort
                     if last_pose:
                         moved = math.sqrt(
                             (pose["x"] - last_pose["x"])**2 +
@@ -2226,8 +2254,10 @@ class SpatialPlugin:
                         if moved > 0.03:
                             stall_start = time.time()
                     last_pose = pose
-                    if now - stall_start > 30:
-                        print(f"[Spatial] Waypoint {i+1} stalled, skipping", flush=True)
+                    if time.time() - stall_start > 30:
+                        print(f"[NAV] Stuck for 30s, aborting navigation", flush=True)
+                        self._nav_executing = False
+                        self._node._nav_error = "Navigation failed: stuck"
                         break
                 else:
                     # while 正常退出（不是 break）→ 重规划触发了，继续外层循环
