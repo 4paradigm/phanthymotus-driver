@@ -1351,14 +1351,14 @@ class SpatialPlugin:
             self._node.set_map_status("mapping")
             self._node.set_active_map(map_name)
             self._db.add_map(map_name, pcd_path)
-            # Recognize disabled temporarily for clean testing
-            # threading.Thread(target=self._try_recognize_existing_map, daemon=True).start()
+            # 启动后台识别旧图
+            threading.Thread(target=self._try_recognize_existing_map, daemon=True).start()
             return {"status": "new", "map_name": map_name}
         return {"error": f"StartMapping failed, code={code}"}
 
     def _try_recognize_existing_map(self):
-        """启动后多次尝试：用 Scan Context + ICP 检查是否在已知地图中，设置 bias。"""
-        delays = [5, 15, 30]  # 三次尝试：5s、15s、30s
+        """启动后尝试用 FFT+ICP 全局配准识别旧图，设置 bias。"""
+        delays = [5, 15, 30]  # 三次尝试
         for attempt, delay in enumerate(delays, 1):
             time.sleep(delay)
             try:
@@ -1367,63 +1367,51 @@ class SpatialPlugin:
                     return
 
                 # 1. 获取当前点云
-                recent_cloud = self._node.get_recent_cloud()
-                cloud_size = len(recent_cloud) if recent_cloud is not None else 0
-                if cloud_size < 500:
-                    print(f"[Spatial] Recognize attempt {attempt}/3: only {cloud_size} points, need 500+", flush=True)
+                with self._node._map_buffer_lock:
+                    if not self._node._map_buffer or len(self._node._map_buffer) < 1000:
+                        print(f"[Spatial] Recognize attempt {attempt}/3: only {len(self._node._map_buffer) if self._node._map_buffer else 0} pts, need 1000+", flush=True)
+                        continue
+                    source_cloud = np.array(list(self._node._map_buffer.values()), dtype=np.float32)
+
+                # 2. 找旧图（遍历所有已保存的地图）
+                all_maps = self._db.list_maps()
+                old_maps = [m for m in all_maps if m["name"] != current_map and os.path.exists(m["pcd_path"])]
+                if not old_maps:
+                    print(f"[Spatial] Recognize attempt {attempt}/3: no old maps available", flush=True)
                     continue
 
-                # 2. Scan Context 粗匹配（排除当前新图）
-                sc = self._sc_mgr.make_scan_context(recent_cloud)
-                match = self._sc_mgr.query(sc, exclude_map=current_map)
-                if not match:
-                    print(f"[Spatial] Recognize attempt {attempt}/3: no matching old map found", flush=True)
-                    continue
-
-                old_map_name = match["map_name"]
-                old_map_info = self._db.get_map(old_map_name)
-                if not old_map_info:
-                    continue
-
-                old_pcd = old_map_info["pcd_path"]
-                if not os.path.exists(old_pcd):
-                    print(f"[Spatial] Recognize: PCD not found: {old_pcd}", flush=True)
-                    continue
-                print(f"[Spatial] Recognize attempt {attempt}/3: matched '{old_map_name}' (score={match['score']:.4f})", flush=True)
-
-                # 3. ICP 精确定位
-                from icp import icp_2d
+                # 3. 对每个旧图尝试全局配准，选最佳
+                from global_registration import register_2d
                 from path_planner import PathPlanner
 
-                target_cloud = PathPlanner._parse_pcd(old_pcd)
-                with self._node._map_buffer_lock:
-                    source_cloud = np.array(list(self._node._map_buffer.values()), dtype=np.float32) if self._node._map_buffer else None
+                best_result = None
+                best_map = None
+                for old_map in old_maps:
+                    target_cloud = PathPlanner._parse_pcd(old_map["pcd_path"])
+                    if target_cloud is None or len(target_cloud) < 100:
+                        continue
+                    result = register_2d(source_cloud, target_cloud)
+                    if result and (best_result is None or result["score"] < best_result["score"]):
+                        best_result = result
+                        best_map = old_map
 
-                bias_x = match["pose"]["x"]
-                bias_y = match["pose"]["y"]
-                bias_yaw = 0.0
+                if not best_result or best_result["score"] > 0.5:
+                    print(f"[Spatial] Recognize attempt {attempt}/3: no good match (best score={best_result['score']:.4f if best_result else 'N/A'})", flush=True)
+                    continue
 
-                if target_cloud is not None and source_cloud is not None and len(source_cloud) >= 100 and len(target_cloud) >= 100:
-                    icp_result = icp_2d(source_cloud, target_cloud, init_x=bias_x, init_y=bias_y,
-                                        max_iterations=50, max_correspond_dist=3.0)
-                    if icp_result and icp_result["score"] < 1.0:
-                        bias_x = icp_result["x"]
-                        bias_y = icp_result["y"]
-                        bias_yaw = icp_result["yaw"]
-                        print(f"[Spatial] Recognize ICP: bias_x={bias_x:.3f}, bias_y={bias_y:.3f}, bias_yaw={bias_yaw:.3f}, "
-                              f"score={icp_result['score']:.4f}", flush=True)
-                    else:
-                        print(f"[Spatial] Recognize ICP failed, using Scan Context pose as bias", flush=True)
-                else:
-                    print(f"[Spatial] Recognize: can't run ICP (src={len(source_cloud) if source_cloud is not None else 0}, "
-                          f"tgt={len(target_cloud) if target_cloud is not None else 0}), using Scan Context pose", flush=True)
+                old_map_name = best_map["name"]
+                bias_x = best_result["x"]
+                bias_y = best_result["y"]
+                bias_yaw = best_result["yaw"]
+                print(f"[Spatial] Recognize: matched '{old_map_name}' via FFT+ICP, "
+                      f"bias=({bias_x:.3f}, {bias_y:.3f}, yaw={math.degrees(bias_yaw):.1f}°), "
+                      f"score={best_result['score']:.4f}, fft_deg={best_result['fft_deg']}", flush=True)
 
                 # 4. 设置 bias
                 self._node._bias_x = bias_x
                 self._node._bias_y = bias_y
                 self._node._bias_yaw = bias_yaw
                 self._node._bias_set = True
-                print(f"[Spatial] Bias set: ({bias_x:.3f}, {bias_y:.3f}, yaw={bias_yaw:.3f})", flush=True)
 
                 # 5. 变换当前 buffer 中的点到旧图坐标系
                 cos_b = math.cos(bias_yaw)
@@ -1438,8 +1426,6 @@ class SpatialPlugin:
                         new_buffer[new_key] = (nx, ny, pz)
                     self._node._map_buffer = new_buffer
 
-                # 不加载旧图到 buffer（避免 PCD 被污染）
-                # 不启动 auto-save（旧图 PCD 只读）
                 self._node.set_active_map(old_map_name)
                 self._db.set_last_used_map(old_map_name)
 
@@ -1450,7 +1436,7 @@ class SpatialPlugin:
                 import subprocess as _sp
                 _sp.run(["rm", "-f", current_pcd], capture_output=True)
                 print(f"[Spatial] Recognized old map '{old_map_name}', bias applied, deleted temp '{current_map}'", flush=True)
-                return  # 成功，退出重试循环
+                return  # 成功
 
             except Exception as e:
                 print(f"[Spatial] Recognize attempt {attempt}/3 error: {e}", flush=True)
