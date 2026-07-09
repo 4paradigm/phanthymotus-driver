@@ -458,7 +458,7 @@ class _SpatialNode(Node):
         if msg_type in ("pos_info", "mapping_info"):
             pose_data = data.get("data", {}).get("currentPose")
             if pose_data:
-                yaw = math.atan2(
+                yaw = -math.atan2(
                     2 * (pose_data.get("q_w", 1) * pose_data.get("q_z", 0)),
                     1 - 2 * pose_data.get("q_z", 0) ** 2
                 )
