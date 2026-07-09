@@ -974,18 +974,18 @@ class _SpatialNode(Node):
             return dict(self._current_pose) if self._current_pose else None
 
     def get_pose_nav(self) -> dict | None:
-        """返回 map 坐标系位姿（加 bias，yaw 不取负），用于导航。"""
+        """返回 map 坐标系位姿（加 bias，yaw 取负匹配物理方向），用于导航。"""
         with self._lock:
             if not self._current_pose:
                 return None
             raw = self._current_pose
         if not self._bias_set:
-            return dict(raw)
+            return {"x": raw["x"], "y": raw["y"], "yaw": -raw["yaw"]}
         cos_b = math.cos(self._bias_yaw)
         sin_b = math.sin(self._bias_yaw)
         x = cos_b * raw["x"] - sin_b * raw["y"] + self._bias_x
         y = sin_b * raw["x"] + cos_b * raw["y"] + self._bias_y
-        yaw = raw["yaw"] + self._bias_yaw
+        yaw = -(raw["yaw"] + self._bias_yaw)
         while yaw > math.pi:
             yaw -= 2 * math.pi
         while yaw < -math.pi:
@@ -1241,7 +1241,8 @@ class SpatialPlugin:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["tag_place", "untag_place", "list_tags",
+                        "enum": ["get_status",
+                                 "tag_place", "untag_place", "list_tags",
                                  "list_maps", "delete_map",
                                  "relocalize_at_tag",
                                  "navigate_to_tag", "navigate_to_pose",
@@ -1262,6 +1263,7 @@ class SpatialPlugin:
                 },
                 "required": ["action"],
                 "x-action-params": {
+                    "get_status":       {"params": [],                     "description": "Get current map name, robot position, and bias info"},
                     "tag_place":        {"params": ["name", "description"], "description": "Tag current position with a name"},
                     "untag_place":      {"params": ["name"],               "description": "Remove a place tag"},
                     "list_tags":        {"params": [],                     "description": "List all tags with relative positions"},
@@ -1472,6 +1474,16 @@ class SpatialPlugin:
             if tool_name == 'grid_map':
                 return {"state": "running", "topic_out": [{"topic": self._grid_map_topic, "format": "sensor/mapping"}]}
             return {"state": "running", "topic_out": [{"topic": self._pos_tag_topic, "format": "data/json"}]}
+
+        if action == "get_status":
+            pose = self._node.get_pose()
+            return {
+                "map_name": self._node._active_map,
+                "pose": pose,
+                "bias_set": self._node._bias_set,
+                "bias": {"x": round(self._node._bias_x, 3), "y": round(self._node._bias_y, 3), "yaw": round(self._node._bias_yaw, 3)} if self._node._bias_set else None,
+                "map_status": self._node._map_status,
+            }
 
         if action == "tag_place":
             name = args.get("name", "")
