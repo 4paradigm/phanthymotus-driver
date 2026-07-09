@@ -1849,6 +1849,10 @@ class SpatialPlugin:
 
         # 规划路径（map 坐标系 = buffer 坐标系）
         start = (pose["x"], pose["y"])
+        start_reachable = self._planner.is_reachable(start[0], start[1])
+        target_reachable = self._planner.is_reachable(target[0], target[1])
+        print(f"[Spatial] Plan: start=({start[0]:.2f},{start[1]:.2f}) reachable={start_reachable}, "
+              f"target=({target[0]:.2f},{target[1]:.2f}) reachable={target_reachable}", flush=True)
         waypoints = self._planner.plan(start, target)
         if not waypoints:
             return {"error": f"No path found from ({start[0]:.1f},{start[1]:.1f}) to ({target[0]:.1f},{target[1]:.1f})"}
