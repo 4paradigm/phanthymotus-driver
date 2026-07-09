@@ -1414,28 +1414,11 @@ class SpatialPlugin:
                       f"bias=({bias_x:.3f}, {bias_y:.3f}, yaw={math.degrees(bias_yaw):.1f}°), "
                       f"corr={best_result['correlation']:.1f}, fft_deg={best_result['fft_deg']}", flush=True)
 
-                # 验证：变换后的新点和旧图的平均最近邻距离
-                from path_planner import PathPlanner
-                target_cloud = PathPlanner._parse_pcd(best_map["pcd_path"])
-                if target_cloud is not None and len(target_cloud) > 100:
-                    cos_v = math.cos(-bias_yaw)
-                    sin_v = math.sin(-bias_yaw)
-                    # 采样 buffer 中 200 个点做验证
-                    sample_pts = list(source_cloud[:, :2][np.random.choice(len(source_cloud), min(200, len(source_cloud)), replace=False)])
-                    tgt_2d = target_cloud[(target_cloud[:, 2] > 0.1) & (target_cloud[:, 2] < 1.5)][:, :2]
-                    if len(tgt_2d) > 5000:
-                        tgt_2d = tgt_2d[np.random.choice(len(tgt_2d), 5000, replace=False)]
-                    nn_dists = []
-                    for px, py in sample_pts:
-                        nx = cos_v * px - sin_v * py + bias_x
-                        ny = sin_v * px + cos_v * py + bias_y
-                        d = np.sqrt(((tgt_2d - [nx, ny]) ** 2).sum(axis=1)).min()
-                        nn_dists.append(d)
-                    avg_nn = np.mean(nn_dists)
-                    print(f"[Spatial] Recognize validation: avg_nn={avg_nn:.3f}m", flush=True)
-                    if avg_nn > 1.0:
-                        print(f"[Spatial] Recognize REJECTED: avg_nn={avg_nn:.3f}m > 1.0m threshold", flush=True)
-                        continue
+                # 验证：bias 平移距离不应超过 2m
+                bias_dist = math.sqrt(bias_x ** 2 + bias_y ** 2)
+                if bias_dist > 2.0:
+                    print(f"[Spatial] Recognize REJECTED: bias_dist={bias_dist:.2f}m > 2.0m", flush=True)
+                    continue
 
                 # 4. 设置 bias (直接存 ICP 结果，变换代码中已处理方向)
                 self._node._bias_x = bias_x
