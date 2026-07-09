@@ -1423,11 +1423,10 @@ class SpatialPlugin:
                 self._node._bias_set = True
                 print(f"[Spatial] Bias set: ({bias_x:.3f}, {bias_y:.3f}, yaw={bias_yaw:.3f})", flush=True)
 
-                # 5. 变换当前 buffer 中的点到旧图坐标系，然后加载旧图合并
+                # 5. 变换当前 buffer 中的点到旧图坐标系
                 cos_b = math.cos(bias_yaw)
                 sin_b = math.sin(bias_yaw)
                 with self._node._map_buffer_lock:
-                    # 变换已有的新点到旧图坐标系
                     new_buffer = {}
                     voxel_size = self._node.VOXEL_SIZE
                     for key, (px, py, pz) in self._node._map_buffer.items():
@@ -1437,9 +1436,8 @@ class SpatialPlugin:
                         new_buffer[new_key] = (nx, ny, pz)
                     self._node._map_buffer = new_buffer
 
-                # 加载旧图点云合并到 buffer
-                self._node.load_pcd_to_buffer(old_pcd)
-
+                # 不加载旧图到 buffer（避免 PCD 被污染）
+                # 不启动 auto-save（旧图 PCD 只读）
                 self._node.set_active_map(old_map_name)
                 self._db.set_last_used_map(old_map_name)
 
@@ -1450,8 +1448,6 @@ class SpatialPlugin:
                 import subprocess as _sp
                 _sp.run(["rm", "-f", current_pcd], capture_output=True)
                 print(f"[Spatial] Recognized old map '{old_map_name}', bias applied, deleted temp '{current_map}'", flush=True)
-                # 启动 auto-save（保存到旧图 PCD）
-                self._node._start_save_timer()
                 return  # 成功，退出重试循环
 
             except Exception as e:
