@@ -571,8 +571,11 @@ class _SpatialNode(Node):
             valid = xyz[mask]
             if len(valid) > 0:
                 self._latest_lidar_body = valid
-        except Exception:
-            pass
+                if not hasattr(self, '_lidar_body_logged'):
+                    self._lidar_body_logged = True
+                    print(f"[Spatial] Lidar body first frame: {len(valid)} valid pts", flush=True)
+        except Exception as e:
+            print(f"[Spatial] _on_lidar_body error: {e}", flush=True)
 
     def check_front_obstacle(self, min_dist: float = 0.8, width: float = 0.3,
                              z_min: float = -1.0, z_max: float = 1.0) -> bool:
