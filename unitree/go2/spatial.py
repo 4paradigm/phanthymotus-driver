@@ -1736,22 +1736,51 @@ class SpatialPlugin:
                 return {"error": "No snapshot A. Call test_icp step=1 first."}
 
             pose_a = self._test_icp_snapshot_a
-            pose_b = dict(pose_raw)
 
-            # 保存快照 B
-            path_b = f"{save_dir}/test_icp_B.npy"
-            np.save(path_b, pts)
-
-            # Ground truth
-            gt_dx = pose_b["x"] - pose_a["x"]
-            gt_dy = pose_b["y"] - pose_a["y"]
-            gt_dyaw = pose_b["yaw"] - pose_a["yaw"]
+            # Ground truth: 当前位姿在老图坐标系中的位置
+            # (step=1 时的位姿 vs step=2 时的位姿，都是同一次 SLAM 的坐标系)
+            pose_before_reset = dict(pose_raw)
+            gt_dx = pose_before_reset["x"] - pose_a["x"]
+            gt_dy = pose_before_reset["y"] - pose_a["y"]
+            gt_dyaw = pose_before_reset["yaw"] - pose_a["yaw"]
             while gt_dyaw > math.pi: gt_dyaw -= 2 * math.pi
             while gt_dyaw < -math.pi: gt_dyaw += 2 * math.pi
 
+            # 重置 SLAM：StopMapping + StartMapping（模拟重启，从 0,0 开始）
+            print("[Spatial] test_icp step=2: resetting SLAM...", flush=True)
+            self._client.StopMapping(f"{save_dir}/test_icp_temp.pcd")
+            time.sleep(1)
+            self._client.StartMapping()
+
+            # 清空 buffer
+            with self._node._map_buffer_lock:
+                self._node._map_buffer.clear()
+                self._node._map_buffer_dirty = False
+            self._node._recent_cloud_count = 0
+            self._node._recent_cloud_write_idx = 0
+
+            # 等 5s 让新图积累
+            print("[Spatial] test_icp step=2: waiting 5s for new map...", flush=True)
+            time.sleep(5)
+
+            # 保存新 buffer 为 B
+            with self._node._map_buffer_lock:
+                if not self._node._map_buffer:
+                    return {"error": "No points after SLAM reset. SLAM may have crashed."}
+                pts_b = np.array(list(self._node._map_buffer.values()), dtype=np.float32)
+
+            path_b = f"{save_dir}/test_icp_B.npy"
+            np.save(path_b, pts_b)
+
             # 保存 ground truth
+            # bias 含义: old_map_point = R(gt_dyaw) * new_slam_point + (gt_dx, gt_dy)
             import json as _json
-            gt_data = {"pose_a": pose_a, "pose_b": pose_b, "gt_dx": gt_dx, "gt_dy": gt_dy, "gt_dyaw": gt_dyaw}
+            gt_data = {
+                "pose_a": pose_a,
+                "pose_before_reset": pose_before_reset,
+                "gt_dx": gt_dx, "gt_dy": gt_dy, "gt_dyaw": gt_dyaw,
+                "note": "A is old map coords. B is new SLAM coords (reset to 0,0). bias = pose_before_reset - pose_a applied to new SLAM origin."
+            }
             gt_path = f"{save_dir}/test_icp_gt.json"
             with open(gt_path, "w") as f:
                 _json.dump(gt_data, f, indent=2)
@@ -1760,16 +1789,15 @@ class SpatialPlugin:
 
             return {
                 "step": 2,
-                "status": "Snapshot B saved. Use files to debug ICP offline.",
+                "status": "SLAM reset + B captured. A=old map, B=new independent map.",
                 "pose_a": pose_a,
-                "pose_b": pose_b,
+                "pose_before_reset": pose_before_reset,
                 "ground_truth": {
                     "dx": round(gt_dx, 3), "dy": round(gt_dy, 3),
                     "dyaw_rad": round(gt_dyaw, 3), "dyaw_deg": round(math.degrees(gt_dyaw), 1)
                 },
-                "points_a_file": f"{save_dir}/test_icp_A.npy",
-                "points_b_file": path_b,
-                "gt_file": gt_path,
+                "points_b": len(pts_b),
+                "files": {"A": f"{save_dir}/test_icp_A.npy", "B": path_b, "gt": gt_path},
             }
 
         return {"error": f"Invalid step={step}, use 1 or 2"}
