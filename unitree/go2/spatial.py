@@ -581,7 +581,7 @@ class _SpatialNode(Node):
             pass
 
     def check_front_obstacle(self, min_dist: float = 0.8, width: float = 0.3,
-                             z_min: float = 0.1, z_max: float = 0.6) -> bool:
+                             z_min: float = -1.0, z_max: float = 1.0) -> bool:
         """检测前方是否有障碍物（body frame）。
 
         Args:
