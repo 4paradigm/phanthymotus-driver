@@ -458,7 +458,7 @@ class _SpatialNode(Node):
         if msg_type in ("pos_info", "mapping_info"):
             pose_data = data.get("data", {}).get("currentPose")
             if pose_data:
-                yaw = -math.atan2(
+                yaw = math.atan2(
                     2 * (pose_data.get("q_w", 1) * pose_data.get("q_z", 0)),
                     1 - 2 * pose_data.get("q_z", 0) ** 2
                 )
@@ -615,6 +615,15 @@ class _SpatialNode(Node):
 
             pts_arr = np.column_stack([x, y, z]).astype(np.float32)
 
+            # If bias is set, transform points to map (old map) coordinate system
+            if self._bias_set:
+                cos_b = math.cos(self._bias_yaw)
+                sin_b = math.sin(self._bias_yaw)
+                px = pts_arr[:, 0]
+                py = pts_arr[:, 1]
+                pts_arr[:, 0] = cos_b * px - sin_b * py + self._bias_x
+                pts_arr[:, 1] = sin_b * px + cos_b * py + self._bias_y
+
             # Merge into voxel map buffer
             voxel_size = self.VOXEL_SIZE
             ix = (pts_arr[:, 0] / voxel_size).astype(np.int32)
@@ -756,7 +765,7 @@ class _SpatialNode(Node):
             pose = self._current_pose
         robot_x = pose["x"] if pose else 0.0
         robot_y = pose["y"] if pose else 0.0
-        robot_yaw = pose["yaw"] if pose else 0.0
+        robot_yaw = -pose["yaw"] if pose else 0.0  # 取负用于渲染显示
 
         with self._map_buffer_lock:
             if not self._map_buffer:
@@ -939,25 +948,25 @@ class _SpatialNode(Node):
         return self._recent_cloud[:count].copy()
 
     def get_pose(self) -> dict | None:
-        """返回当前位姿（map 坐标系，已应用 bias）。"""
+        """返回当前位姿（map 坐标系，已应用 bias，yaw 取负用于用户视角）。"""
         with self._lock:
             if not self._current_pose:
                 return None
             raw = self._current_pose
         if not self._bias_set:
-            return dict(raw)
+            return {"x": raw["x"], "y": raw["y"], "yaw": round(-raw["yaw"], 3)}
         # Apply bias: map = R_bias * slam + T_bias
         cos_b = math.cos(self._bias_yaw)
         sin_b = math.sin(self._bias_yaw)
         x = cos_b * raw["x"] - sin_b * raw["y"] + self._bias_x
         y = sin_b * raw["x"] + cos_b * raw["y"] + self._bias_y
         yaw = raw["yaw"] + self._bias_yaw
-        # Normalize yaw
+        # Normalize and negate for user display
         while yaw > math.pi:
             yaw -= 2 * math.pi
         while yaw < -math.pi:
             yaw += 2 * math.pi
-        return {"x": x, "y": y, "yaw": round(yaw, 3)}
+        return {"x": x, "y": y, "yaw": round(-yaw, 3)}
 
     def get_pose_raw(self) -> dict | None:
         """返回 SLAM 原始位姿（不加 bias）。"""
@@ -1153,7 +1162,7 @@ class SpatialPlugin:
             self._grid_map_topic, self._db, self._sc_mgr
         )
         self._node.set_active_map(self._db.get_last_used_map())
-        self._node.set_pcd_save_dir(self._map_dir)
+        self._node._pcd_save_dir = self._map_dir  # Set dir but don't start timer yet (wait for recognize)
         self._node._auto_mapping_cb = self._on_localized
         self._node._planner_ref = self._planner  # for grid_map 2D publishing
         executor.add_node(self._node)
@@ -1388,8 +1397,23 @@ class SpatialPlugin:
                 self._node._bias_set = True
                 print(f"[Spatial] Bias set: ({bias_x:.3f}, {bias_y:.3f}, yaw={bias_yaw:.3f})", flush=True)
 
-                # 5. 切换到旧图
+                # 5. 变换当前 buffer 中的点到旧图坐标系，然后加载旧图合并
+                cos_b = math.cos(bias_yaw)
+                sin_b = math.sin(bias_yaw)
+                with self._node._map_buffer_lock:
+                    # 变换已有的新点到旧图坐标系
+                    new_buffer = {}
+                    voxel_size = self._node.VOXEL_SIZE
+                    for key, (px, py, pz) in self._node._map_buffer.items():
+                        nx = cos_b * px - sin_b * py + bias_x
+                        ny = sin_b * px + cos_b * py + bias_y
+                        new_key = (int(nx / voxel_size), int(ny / voxel_size), int(pz / voxel_size))
+                        new_buffer[new_key] = (nx, ny, pz)
+                    self._node._map_buffer = new_buffer
+
+                # 加载旧图点云合并到 buffer
                 self._node.load_pcd_to_buffer(old_pcd)
+
                 self._node.set_active_map(old_map_name)
                 self._db.set_last_used_map(old_map_name)
 
@@ -1400,6 +1424,8 @@ class SpatialPlugin:
                 import subprocess as _sp
                 _sp.run(["rm", "-f", current_pcd], capture_output=True)
                 print(f"[Spatial] Recognized old map '{old_map_name}', bias applied, deleted temp '{current_map}'", flush=True)
+                # 启动 auto-save（保存到旧图 PCD）
+                self._node._start_save_timer()
                 return  # 成功，退出重试循环
 
             except Exception as e:
@@ -1408,6 +1434,8 @@ class SpatialPlugin:
                 traceback.print_exc()
 
         print("[Spatial] Recognize: all 3 attempts failed, staying on new map", flush=True)
+        # 没匹配到旧图，开始保存新图 PCD
+        self._node._start_save_timer()
 
     # ── Dispatch ─────────────────────────────────────────────────────────────
 
