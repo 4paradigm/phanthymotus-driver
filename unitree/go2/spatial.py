@@ -1937,9 +1937,17 @@ class SpatialPlugin:
         - 后续 waypoints: look-ahead 预瞄，边走边转不停顿
         - 每 1s 检测路径障碍，自动重规划
         - SLAM health check: abort if SLAM service dies
+        - 硬件避障开启
         """
         final_goal = self._nav_waypoints[-1]
         last_replan_time = time.time()
+
+        # 开启硬件避障
+        try:
+            self._rpc_proxy.OA_SwitchSet(True)
+            print("[Spatial] Obstacle avoidance enabled", flush=True)
+        except Exception:
+            pass
 
         def _check_slam():
             if not self._node.is_slam_alive():
