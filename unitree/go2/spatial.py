@@ -1885,17 +1885,27 @@ class SpatialPlugin:
         if tag_name:
             self._node.set_nav_target(tag_name)
 
-        # 后台执行移动
-        threading.Thread(target=self._execute_waypoints, daemon=True).start()
+        # Debug 模式：显示路径 10s 后消失，不实际移动
+        def _debug_nav():
+            print(f"[Spatial] DEBUG NAV: showing path for 10s ({len(waypoints)} waypoints)", flush=True)
+            time.sleep(10)
+            self._nav_executing = False
+            self._node._nav_path_overlay = None
+            self._node._nav_arrived.set()
+            print("[Spatial] DEBUG NAV: path cleared", flush=True)
+        threading.Thread(target=_debug_nav, daemon=True).start()
+
+        # # 后台执行移动（暂时注释）
+        # threading.Thread(target=self._execute_waypoints, daemon=True).start()
 
         return {
-            "status": "navigating",
+            "status": "navigating (DEBUG: path displayed 10s, no movement)",
             "target": tag_name or f"({target_x:.1f},{target_y:.1f})",
             "start": {"x": round(start[0], 2), "y": round(start[1], 2)},
             "target_coords": {"x": round(target[0], 2), "y": round(target[1], 2)},
             "waypoints": len(waypoints),
             "waypoint_coords": [(round(x, 2), round(y, 2)) for x, y in waypoints],
-            "method": "velocity_control",
+            "method": "debug_visual_only",
         }
 
     def _build_path_overlay(self, waypoints: list[tuple], start_idx: int = 0) -> np.ndarray | None:
