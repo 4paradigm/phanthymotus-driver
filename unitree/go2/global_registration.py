@@ -18,7 +18,7 @@ import numpy as np
 
 
 def register_2d(source_pts: np.ndarray, target_pts: np.ndarray,
-                resolution: float = 0.10, z_min: float = 0.1, z_max: float = 1.5,
+                resolution: float = 0.10, z_min: float = 0.25, z_max: float = 0.5,
                 angle_step: int = 1) -> dict | None:
     """全局 2D 配准：FFT 找角度 + FFT 找平移。
 
