@@ -1396,21 +1396,21 @@ class SpatialPlugin:
                     if target_cloud is None or len(target_cloud) < 100:
                         continue
                     result = register_2d(source_cloud, target_cloud)
-                    if result and (best_result is None or result["score"] < best_result["score"]):
+                    if result and (best_result is None or result["correlation"] > best_result["correlation"]):
                         best_result = result
                         best_map = old_map
 
-                if not best_result or best_result["score"] > 0.5:
-                    print(f"[Spatial] Recognize attempt {attempt}/3: no good match (best score={best_result['score']:.4f if best_result else 'N/A'})", flush=True)
+                if not best_result:
+                    print(f"[Spatial] Recognize attempt {attempt}/3: registration failed for all maps", flush=True)
                     continue
 
                 old_map_name = best_map["name"]
                 bias_x = best_result["x"]
                 bias_y = best_result["y"]
                 bias_yaw = best_result["yaw"]
-                print(f"[Spatial] Recognize: matched '{old_map_name}' via FFT+ICP, "
+                print(f"[Spatial] Recognize: matched '{old_map_name}' via FFT, "
                       f"bias=({bias_x:.3f}, {bias_y:.3f}, yaw={math.degrees(bias_yaw):.1f}°), "
-                      f"score={best_result['score']:.4f}, fft_deg={best_result['fft_deg']}", flush=True)
+                      f"corr={best_result['correlation']:.1f}, fft_deg={best_result['fft_deg']}", flush=True)
 
                 # 4. 设置 bias (直接存 ICP 结果，变换代码中已处理方向)
                 self._node._bias_x = bias_x
