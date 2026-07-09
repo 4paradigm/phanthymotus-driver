@@ -1142,10 +1142,7 @@ class SpatialPlugin:
 
     def __init__(self, plugin_config: dict, namespace: str, executor, rpc_proxy=None):
         network_iface = plugin_config.get("network_iface", "eth0")
-        # Note: _ensure_slam_service() is NOT called here.
-        # ControlledSpatialPlugin (loaded first) already starts unitree_slam + mid360_driver.
-        # We just wait briefly for it to be ready.
-        time.sleep(2)
+        self._ensure_slam_service()
         self._client = _SlamRpcProxy(network_iface)
         self._rpc_proxy = rpc_proxy  # for obstacles_avoid calls
 
