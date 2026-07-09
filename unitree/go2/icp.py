@@ -38,11 +38,11 @@ def icp_2d(source: np.ndarray, target: np.ndarray,
     tgt = target[:, :2].astype(np.float64).copy()
 
     # 降采样 (加速)
-    if len(src) > 5000:
-        idx = np.random.choice(len(src), 5000, replace=False)
+    if len(src) > 2000:
+        idx = np.random.choice(len(src), 2000, replace=False)
         src = src[idx]
-    if len(tgt) > 20000:
-        idx = np.random.choice(len(tgt), 20000, replace=False)
+    if len(tgt) > 5000:
+        idx = np.random.choice(len(tgt), 5000, replace=False)
         tgt = tgt[idx]
 
     # 应用初始变换
