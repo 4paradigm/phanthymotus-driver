@@ -594,14 +594,24 @@ class _SpatialNode(Node):
         """
         pts = self._latest_lidar_body
         if pts is None or len(pts) < 10:
+            if not hasattr(self, '_no_lidar_warned') or not self._no_lidar_warned:
+                print(f"[OBSTACLE] No lidar data! _latest_lidar_body={'None' if pts is None else len(pts)}", flush=True)
+                self._no_lidar_warned = True
             return False
+        self._no_lidar_warned = False
         # 前方区域: x > 0.2 且 x < min_dist, |y| < width, z 在范围内
         mask = (
             (pts[:, 0] > 0.2) & (pts[:, 0] < min_dist) &
             (np.abs(pts[:, 1]) < width) &
             (pts[:, 2] > z_min) & (pts[:, 2] < z_max)
         )
-        count = np.sum(mask)
+        count = int(np.sum(mask))
+        # Debug: 每次调用打印一次 (由外部控制频率)
+        if not hasattr(self, '_obstacle_log_count'):
+            self._obstacle_log_count = 0
+        self._obstacle_log_count += 1
+        if self._obstacle_log_count % 5 == 1:  # 每5次打印一次
+            print(f"[OBSTACLE] lidar pts={len(pts)}, front_count={count}, threshold=5", flush=True)
         return count > 5  # 至少 5 个点才认为有障碍
 
     # ── Cloud Processing ─────────────────────────────────────────────────────
