@@ -1650,9 +1650,13 @@ class SpatialPlugin:
         if not waypoints:
             return {"error": f"No path found from ({pose_raw['x']:.1f},{pose_raw['y']:.1f}) to ({target_slam[0]:.1f},{target_slam[1]:.1f})"}
 
-        # 生成路径 overlay（需要加 bias 才能在 mapping 视图中正确显示）
-        self._node._nav_path_overlay = self._build_path_overlay_with_bias(waypoints)
-        print(f"[Spatial] Nav path: {len(waypoints)} waypoints (SLAM coords)", flush=True)
+        # 生成路径 overlay（SLAM 坐标，因为 mapping 点云也是 SLAM 坐标）
+        overlay = self._build_path_overlay_with_bias(waypoints)
+        self._node._nav_path_overlay = overlay
+        overlay_len = len(overlay) if overlay is not None else 0
+        print(f"[Spatial] Nav path: {len(waypoints)} waypoints, overlay={overlay_len} pts, "
+              f"start=({pose_raw['x']:.2f},{pose_raw['y']:.2f}), "
+              f"target_slam=({target_slam[0]:.2f},{target_slam[1]:.2f})", flush=True)
 
         # 设置导航状态
         self._nav_waypoints = waypoints
@@ -1669,6 +1673,8 @@ class SpatialPlugin:
         return {
             "status": "navigating",
             "target": tag_name or f"({target_x:.1f},{target_y:.1f})",
+            "start_slam": {"x": round(pose_raw["x"], 2), "y": round(pose_raw["y"], 2)},
+            "target_slam": {"x": round(target_slam[0], 2), "y": round(target_slam[1], 2)},
             "waypoints": len(waypoints),
             "waypoint_coords": [(round(x, 2), round(y, 2)) for x, y in waypoints],
             "method": "velocity_control",
