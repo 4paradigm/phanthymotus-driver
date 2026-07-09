@@ -1984,6 +1984,7 @@ class SpatialPlugin:
 
         # 强制立即发布一帧（确保路径在 mapping 上可见）
         self._node._last_map_publish_time = 0
+        self._node._maybe_publish_full_map()
 
         # 设置导航状态
         self._nav_waypoints = waypoints
@@ -2097,6 +2098,7 @@ class SpatialPlugin:
                 # 更新 nav_path overlay
                 overlay = self._build_path_overlay(self._nav_waypoints, i)
                 self._node._nav_path_overlay = overlay
+                self._node._maybe_publish_full_map()  # 强制刷新显示
 
                 # 首个 waypoint: 先原地转向
                 if is_first:
