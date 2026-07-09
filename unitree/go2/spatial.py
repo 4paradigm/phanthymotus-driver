@@ -825,10 +825,10 @@ class _SpatialNode(Node):
         if self._grid_pts_cache is not None:
             parts.append(self._grid_pts_cache)
 
-        # 导航路线点 (z=0.3, 高于障碍物以便在2D视图中区分)
+        # 导航路线点 (z=0.0, 与栅格同平面)
         if self._nav_path_overlay is not None and len(self._nav_path_overlay) > 0:
             path_2d = self._nav_path_overlay.copy()
-            path_2d[:, 2] = 0.3
+            path_2d[:, 2] = 0.0
             parts.append(path_2d)
 
         if not parts:
