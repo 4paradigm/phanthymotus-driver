@@ -1350,6 +1350,7 @@ class SpatialPlugin:
                                  "list_maps", "delete_map",
                                  "relocalize_at_tag",
                                  "navigate_to_tag", "navigate_to_pose",
+                                 "navigate_to_relative_pose",
                                  "wait_navigation_done",
                                  "pause_nav", "resume_nav", "stop_nav"],
                         "description": "Action to perform",
@@ -1377,7 +1378,8 @@ class SpatialPlugin:
                     "delete_map":       {"params": ["map_name"],           "description": "Delete a map and its associated data"},
                     "relocalize_at_tag": {"params": ["tag_name"],          "description": "Relocalize near a known tag using ICP point cloud matching"},
                     "navigate_to_tag":  {"params": ["tag_name"], "description": "Navigate to a tagged place (A* path planning + obstacle avoidance)"},
-                    "navigate_to_pose": {"params": ["x", "y", "yaw"], "description": "Navigate to coordinates (A* path planning + obstacle avoidance)"},
+                    "navigate_to_pose": {"params": ["x", "y", "yaw"], "description": "Navigate to absolute map coordinates"},
+                    "navigate_to_relative_pose": {"params": ["x", "y", "yaw"], "description": "Navigate relative to current pose (x=forward, y=left in robot frame)"},
                     "wait_navigation_done": {"params": ["stall_timeout"], "description": "Block until navigation completes or robot is stuck"},
                     "pause_nav":        {"params": [],                     "description": "Pause navigation"},
                     "resume_nav":       {"params": [],                     "description": "Resume navigation"},
@@ -1456,25 +1458,23 @@ class SpatialPlugin:
         return {"error": f"StartMapping failed, code={code}"}
 
     def _try_recognize_existing_map(self):
-        """启动后尝试用 FFT+ICP 全局配准识别旧图，设置 bias。"""
-        delays = [5, 15, 30]  # 三次尝试
-        for attempt, delay in enumerate(delays, 1):
-            time.sleep(delay)
-            if getattr(self, '_test_mode', False):
-                print("[Spatial] Recognize skipped (test mode)", flush=True)
+        """启动后尝试识别旧图，一次不成功就用新图。"""
+        time.sleep(5)
+        if getattr(self, '_test_mode', False) or self._nav_executing:
+            print("[Spatial] Recognize skipped (test/nav mode)", flush=True)
+            self._node._start_save_timer()
+            return
+        try:
+            current_map = self._node._active_map
+            if not current_map:
+                self._node._start_save_timer()
                 return
-        for attempt, delay in enumerate(delays, 1):
-            time.sleep(delay)
-            try:
-                current_map = self._node._active_map
-                if not current_map:
-                    return
 
                 # 1. 获取当前点云
                 with self._node._map_buffer_lock:
                     if not self._node._map_buffer or len(self._node._map_buffer) < 1000:
-                        print(f"[Spatial] Recognize attempt {attempt}/3: only {len(self._node._map_buffer) if self._node._map_buffer else 0} pts, need 1000+", flush=True)
-                        continue
+                        print(f"[Spatial] Recognize Recognize: only {len(self._node._map_buffer) if self._node._map_buffer else 0} pts, need 1000+", flush=True)
+                        self._node._start_save_timer(); return
                     source_cloud = np.array(list(self._node._map_buffer.values()), dtype=np.float32)
 
                 # 2. 找旧图（遍历所有已保存的地图）
@@ -1495,15 +1495,15 @@ class SpatialPlugin:
                 for old_map in old_maps:
                     target_cloud = PathPlanner._parse_pcd(old_map["pcd_path"])
                     if target_cloud is None or len(target_cloud) < 100:
-                        continue
+                        self._node._start_save_timer(); return
                     result = register_2d(source_cloud, target_cloud)
                     if result and (best_result is None or result["correlation"] > best_result["correlation"]):
                         best_result = result
                         best_map = old_map
 
                 if not best_result:
-                    print(f"[Spatial] Recognize attempt {attempt}/3: registration failed for all maps", flush=True)
-                    continue
+                    print(f"[Spatial] Recognize Recognize: registration failed for all maps", flush=True)
+                    self._node._start_save_timer(); return
 
                 old_map_name = best_map["name"]
                 bias_x = best_result["x"]
@@ -1517,7 +1517,7 @@ class SpatialPlugin:
                 bias_dist = math.sqrt(bias_x ** 2 + bias_y ** 2)
                 if bias_dist > 1.5:
                     print(f"[Spatial] Recognize REJECTED: bias_dist={bias_dist:.2f}m > 1.5m", flush=True)
-                    continue
+                    self._node._start_save_timer(); return
 
                 # 4. 设置 bias (直接存 ICP 结果，变换代码中已处理方向)
                 self._node._bias_x = bias_x
@@ -1555,12 +1555,11 @@ class SpatialPlugin:
                 print(f"[Spatial] Recognized old map '{old_map_name}', bias applied, deleted temp '{current_map}'", flush=True)
                 return  # 成功
 
-            except Exception as e:
-                print(f"[Spatial] Recognize attempt {attempt}/3 error: {e}", flush=True)
-                import traceback
-                traceback.print_exc()
+        except Exception as e:
+            print(f"[Spatial] Recognize error: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
 
-        print("[Spatial] Recognize: all 3 attempts failed, staying on new map", flush=True)
         # 没匹配到旧图，开始保存新图 PCD
         self._node._start_save_timer()
 
@@ -1672,6 +1671,21 @@ class SpatialPlugin:
             y = float(args.get("y", 0))
             yaw = float(args.get("yaw", 0))
             return self._navigate_with_planner(x, y, yaw)
+
+        elif action == "navigate_to_relative_pose":
+            # 相对于当前位置的偏移
+            dx = float(args.get("x", 0))
+            dy = float(args.get("y", 0))
+            yaw = float(args.get("yaw", 0))
+            pose = self._node.get_pose_nav()
+            if not pose:
+                return {"error": "No current pose"}
+            # 将相对偏移转换为 map 绝对坐标（考虑当前朝向）
+            cos_y = math.cos(pose["yaw"])
+            sin_y = math.sin(pose["yaw"])
+            abs_x = pose["x"] + cos_y * dx - sin_y * dy
+            abs_y = pose["y"] + sin_y * dx + cos_y * dy
+            return self._navigate_with_planner(abs_x, abs_y, yaw)
 
         elif action == "wait_navigation_done":
             stall_timeout = float(args.get("stall_timeout", 60))
