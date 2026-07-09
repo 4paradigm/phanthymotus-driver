@@ -1433,8 +1433,8 @@ class SpatialPlugin:
                         nn_dists.append(d)
                     avg_nn = np.mean(nn_dists)
                     print(f"[Spatial] Recognize validation: avg_nn={avg_nn:.3f}m", flush=True)
-                    if avg_nn > 0.3:
-                        print(f"[Spatial] Recognize REJECTED: avg_nn={avg_nn:.3f}m > 0.3m threshold", flush=True)
+                    if avg_nn > 1.0:
+                        print(f"[Spatial] Recognize REJECTED: avg_nn={avg_nn:.3f}m > 1.0m threshold", flush=True)
                         continue
 
                 # 4. 设置 bias (直接存 ICP 结果，变换代码中已处理方向)
