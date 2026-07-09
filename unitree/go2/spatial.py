@@ -1349,7 +1349,7 @@ class SpatialPlugin:
                                  "tag_place", "untag_place", "list_tags",
                                  "list_maps", "delete_map",
                                  "relocalize_at_tag",
-                                 "navigate_to_tag", "navigate_to_pose",
+                                 "navigate_to_tag", "navigate_to_map_coordinate",
                                  "navigate_to_relative_pose",
                                  "wait_navigation_done",
                                  "pause_nav", "resume_nav", "stop_nav"],
@@ -1378,7 +1378,7 @@ class SpatialPlugin:
                     "delete_map":       {"params": ["map_name"],           "description": "Delete a map and its associated data"},
                     "relocalize_at_tag": {"params": ["tag_name"],          "description": "Relocalize near a known tag using ICP point cloud matching"},
                     "navigate_to_tag":  {"params": ["tag_name"], "description": "Navigate to a tagged place (A* path planning + obstacle avoidance)"},
-                    "navigate_to_pose": {"params": ["x", "y", "yaw"], "description": "Navigate to absolute map coordinates"},
+                    "navigate_to_map_coordinate": {"params": ["x", "y", "yaw"], "description": "Navigate to absolute map coordinates"},
                     "navigate_to_relative_pose": {"params": ["x", "y", "yaw"], "description": "Navigate relative to current pose (x=forward, y=left in robot frame)"},
                     "wait_navigation_done": {"params": ["stall_timeout"], "description": "Block until navigation completes or robot is stuck"},
                     "pause_nav":        {"params": [],                     "description": "Pause navigation"},
@@ -1666,7 +1666,7 @@ class SpatialPlugin:
             yaw = poi.get("yaw", 0)
             return self._navigate_with_planner(poi["x"], poi["y"], yaw, tag_name=tag_name)
 
-        elif action == "navigate_to_pose":
+        elif action == "navigate_to_map_coordinate":
             x = float(args.get("x", 0))
             y = float(args.get("y", 0))
             yaw = float(args.get("yaw", 0))
