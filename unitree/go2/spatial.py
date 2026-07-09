@@ -1846,7 +1846,8 @@ class SpatialPlugin:
             if self._nav_executing and self._nav_target_yaw != 0:
                 print(f"[Spatial] Final yaw adjustment to {self._nav_target_yaw:.2f}", flush=True)
                 for _ in range(50):
-                    pose = self._node.get_pose_raw()                    if not pose:
+                    pose = self._node.get_pose_raw()
+                    if not pose:
                         time.sleep(0.1)
                         continue
                     yaw_err = self._normalize_angle(self._nav_target_yaw - pose["yaw"])
