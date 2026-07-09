@@ -973,6 +973,25 @@ class _SpatialNode(Node):
         with self._lock:
             return dict(self._current_pose) if self._current_pose else None
 
+    def get_pose_nav(self) -> dict | None:
+        """返回 map 坐标系位姿（加 bias，yaw 不取负），用于导航。"""
+        with self._lock:
+            if not self._current_pose:
+                return None
+            raw = self._current_pose
+        if not self._bias_set:
+            return dict(raw)
+        cos_b = math.cos(self._bias_yaw)
+        sin_b = math.sin(self._bias_yaw)
+        x = cos_b * raw["x"] - sin_b * raw["y"] + self._bias_x
+        y = sin_b * raw["x"] + cos_b * raw["y"] + self._bias_y
+        yaw = raw["yaw"] + self._bias_yaw
+        while yaw > math.pi:
+            yaw -= 2 * math.pi
+        while yaw < -math.pi:
+            yaw += 2 * math.pi
+        return {"x": x, "y": y, "yaw": yaw}
+
     def map_to_slam(self, x: float, y: float) -> tuple:
         """旧图坐标 → SLAM 坐标（逆 bias 变换）。"""
         if not self._bias_set:
@@ -1662,35 +1681,31 @@ class SpatialPlugin:
 
     def _navigate_with_planner(self, target_x: float, target_y: float, target_yaw: float,
                                tag_name: str | None = None) -> dict:
-        """路径规划 + 导航执行。全程在 SLAM 坐标系下工作。"""
-        # 起点：SLAM 原始坐标（planner 栅格也是 SLAM 坐标系）
-        pose_raw = self._node.get_pose_raw()
-        if not pose_raw:
+        """路径规划 + 导航。Buffer/planner 在 map 坐标系（bias 已应用到点云）。"""
+        pose = self._node.get_pose_nav()
+        if not pose:
             return {"error": "No current pose available"}
 
         if not self._ensure_planner_loaded():
             return {"error": "Path planner: no map loaded"}
 
-        # 目标：map 坐标 → SLAM 坐标
-        target_slam = self._node.map_to_slam(target_x, target_y)
+        target = (target_x, target_y)
 
-        # 设置栅格障碍物（用于 grid_map 2D 显示）
         grid_pts = self._planner.get_grid_as_points()
         if grid_pts is not None:
             print(f"[Spatial] Grid: {len(grid_pts)} obstacle cells", flush=True)
 
-        # 规划路径（SLAM 坐标系）
-        waypoints = self._planner.plan((pose_raw["x"], pose_raw["y"]), target_slam)
+        # 规划路径（map 坐标系 = buffer 坐标系）
+        start = (pose["x"], pose["y"])
+        waypoints = self._planner.plan(start, target)
         if not waypoints:
-            return {"error": f"No path found from ({pose_raw['x']:.1f},{pose_raw['y']:.1f}) to ({target_slam[0]:.1f},{target_slam[1]:.1f})"}
+            return {"error": f"No path found from ({start[0]:.1f},{start[1]:.1f}) to ({target[0]:.1f},{target[1]:.1f})"}
 
-        # 生成路径 overlay（SLAM 坐标，因为 mapping 点云也是 SLAM 坐标）
         overlay = self._build_path_overlay_with_bias(waypoints)
         self._node._nav_path_overlay = overlay
         overlay_len = len(overlay) if overlay is not None else 0
         print(f"[Spatial] Nav path: {len(waypoints)} waypoints, overlay={overlay_len} pts, "
-              f"start=({pose_raw['x']:.2f},{pose_raw['y']:.2f}), "
-              f"target_slam=({target_slam[0]:.2f},{target_slam[1]:.2f})", flush=True)
+              f"start=({start[0]:.2f},{start[1]:.2f}), target=({target[0]:.2f},{target[1]:.2f})", flush=True)
 
         # 设置导航状态
         self._nav_waypoints = waypoints
@@ -1707,8 +1722,8 @@ class SpatialPlugin:
         return {
             "status": "navigating",
             "target": tag_name or f"({target_x:.1f},{target_y:.1f})",
-            "start_slam": {"x": round(pose_raw["x"], 2), "y": round(pose_raw["y"], 2)},
-            "target_slam": {"x": round(target_slam[0], 2), "y": round(target_slam[1], 2)},
+            "start": {"x": round(start[0], 2), "y": round(start[1], 2)},
+            "target_coords": {"x": round(target[0], 2), "y": round(target[1], 2)},
             "waypoints": len(waypoints),
             "waypoint_coords": [(round(x, 2), round(y, 2)) for x, y in waypoints],
             "method": "velocity_control",
@@ -1786,7 +1801,7 @@ class SpatialPlugin:
                 if is_first:
                     turn_start = time.time()
                     while self._nav_executing:
-                        pose = self._node.get_pose_raw()
+                        pose = self._node.get_pose_nav()
                         if not pose:
                             time.sleep(0.1)
                             continue
@@ -1807,9 +1822,9 @@ class SpatialPlugin:
 
                 # 前进到 waypoint（边走边转，look-ahead 预瞄）
                 stall_start = time.time()
-                last_pose = self._node.get_pose_raw()
+                last_pose = self._node.get_pose_nav()
                 while self._nav_executing:
-                    pose = self._node.get_pose_raw()
+                    pose = self._node.get_pose_nav()
                     if not pose:
                         time.sleep(0.1)
                         continue
@@ -1886,7 +1901,7 @@ class SpatialPlugin:
             if self._nav_executing and self._nav_target_yaw != 0:
                 print(f"[Spatial] Final yaw adjustment to {self._nav_target_yaw:.2f}", flush=True)
                 for _ in range(50):
-                    pose = self._node.get_pose_raw()
+                    pose = self._node.get_pose_nav()
                     if not pose:
                         time.sleep(0.1)
                         continue
@@ -1938,7 +1953,7 @@ class SpatialPlugin:
             return False
 
         # 重新规划
-        pose = self._node.get_pose_raw()
+        pose = self._node.get_pose_nav()
         if not pose:
             return False
         new_path = self._planner.plan((pose["x"], pose["y"]), final_goal)
