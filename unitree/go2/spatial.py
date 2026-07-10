@@ -720,63 +720,11 @@ class _SpatialNode(Node):
                 new_keys.add((int(ix[j]), int(iy[j]), int(iz[j])))
 
             with self._map_buffer_lock:
-                # 视野覆盖：用计数器跟踪视野内未确认的 voxel
-                pose = self._current_pose
-                if pose is not None:
-                    robot_x = pose["x"]
-                    robot_y = pose["y"]
-                    robot_yaw = pose["yaw"]
-                    if self._bias_set:
-                        cos_b = math.cos(-self._bias_yaw)
-                        sin_b = math.sin(-self._bias_yaw)
-                        robot_x = cos_b * pose["x"] - sin_b * pose["y"] + self._bias_x
-                        robot_y = sin_b * pose["x"] + cos_b * pose["y"] + self._bias_y
-                        robot_yaw = pose["yaw"] - self._bias_yaw
-
-                    cos_yaw = math.cos(robot_yaw)
-                    sin_yaw = math.sin(robot_yaw)
-                    keys_to_remove = []
-
-                    for key, (px, py, pz) in self._map_buffer.items():
-                        # 只处理障碍物高度
-                        if pz < 0.2 or pz > 0.6:
-                            continue
-                        dx = px - robot_x
-                        dy = py - robot_y
-                        dist = math.sqrt(dx * dx + dy * dy)
-                        if dist < 0.5 or dist > 5.0:
-                            continue
-                        # 视野内判断 (±60°)
-                        angle = math.atan2(
-                            -sin_yaw * dx + cos_yaw * dy,
-                            cos_yaw * dx + sin_yaw * dy
-                        )
-                        if abs(angle) > 1.05:
-                            continue
-
-                        # 视野内的 voxel
-                        if key in new_keys:
-                            # 新帧确认了这个 voxel → reset
-                            self._voxel_miss_count.pop(key, None)
-                        else:
-                            # 新帧没确认 → 增加 miss count
-                            self._voxel_miss_count[key] = self._voxel_miss_count.get(key, 0) + 1
-                            if self._voxel_miss_count[key] >= 5:
-                                keys_to_remove.append(key)
-
-                    for key in keys_to_remove:
-                        del self._map_buffer[key]
-                        self._voxel_miss_count.pop(key, None)
-                    if keys_to_remove:
-                        self._map_buffer_dirty = True
-                        self._planner_grid_pts_cache_valid = False
-
-                # 加入新点
+                # 加入新点（view-cone 暂时禁用）
                 prev_size = len(self._map_buffer)
                 for j in range(len(pts_arr)):
                     key = (int(ix[j]), int(iy[j]), int(iz[j]))
                     self._map_buffer[key] = (float(pts_arr[j, 0]), float(pts_arr[j, 1]), float(pts_arr[j, 2]))
-                    self._voxel_miss_count.pop(key, None)  # 新点 reset miss
                 new_size = len(self._map_buffer)
                 if new_size != prev_size:
                     self._map_buffer_dirty = True
