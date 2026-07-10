@@ -2168,35 +2168,29 @@ class SpatialPlugin:
 
                     # 速度控制 + lidar 避障
                     heading_err = self._normalize_angle(target_heading - pose["yaw"])
-                    front_dist = self._node.get_front_obstacle_dist()
 
-                    if front_dist < 0.3:
-                        # 完全停止
-                        vx = 0
-                        vyaw = 0
-                    elif front_dist < 1.5:
-                        # 速度衰减: vx = min(原始vx, nearest_dist * 0.6)
-                        max_vx = front_dist * 0.6
-                        if abs(heading_err) > 0.8:
-                            vx = 0.05
-                            vyaw = max(-2.0, min(2.0, heading_err * 2.0))
-                        elif abs(heading_err) > 0.3:
-                            vx = max(0.1, min(max_vx, dist * 0.5))
-                            vyaw = max(-1.5, min(1.5, heading_err * 1.5))
-                        else:
+                    if abs(heading_err) > 0.5:
+                        # 大角度转向：用 Move()（OA_Move 会被避障拦截转不动）
+                        vx = 0.05
+                        vyaw = max(-2.0, min(2.0, heading_err * 2.0))
+                        self._rpc_proxy.Move(vx, 0, vyaw)
+                        front_dist = 999.0  # 转向时不做避障检测
+                    else:
+                        # 基本面对方向：启用 lidar 避障 + OA_Move
+                        front_dist = self._node.get_front_obstacle_dist()
+
+                        if front_dist < 0.3:
+                            vx = 0
+                            vyaw = 0
+                        elif front_dist < 1.5:
+                            max_vx = front_dist * 0.6
                             vx = max(0.15, min(max_vx, dist * 0.8))
                             vyaw = max(-0.8, min(0.8, heading_err * 1.0))
-                    else:
-                        # 无障碍：正常速度控制
-                        if abs(heading_err) > 0.8:
-                            vx = 0.05
-                            vyaw = max(-2.0, min(2.0, heading_err * 2.0))
-                        elif abs(heading_err) > 0.3:
-                            vx = max(0.1, min(0.3, dist * 0.5))
-                            vyaw = max(-1.5, min(1.5, heading_err * 1.5))
                         else:
                             vx = max(0.15, min(1.0, dist * 0.8))
                             vyaw = max(-0.8, min(0.8, heading_err * 1.0))
+
+                        self._rpc_proxy.OA_Move(vx, 0, vyaw)
 
                     # 每 0.5s 打印一次导航状态
                     if not hasattr(self, '_last_nav_log') or time.time() - self._last_nav_log > 0.5:
@@ -2208,10 +2202,9 @@ class SpatialPlugin:
                               f"h_err={math.degrees(heading_err):.0f}° "
                               f"cmd: vx={vx:.2f} vyaw={vyaw:.2f}{obs_str}", flush=True)
 
-                    self._rpc_proxy.OA_Move(vx, 0, vyaw)
                     time.sleep(0.1)
 
-                    # 停止状态 3s → 重规划（lidar 障碍加入栅格）
+                    # 停止状态 3s → 重规划（只在面对方向时）
                     now = time.time()
                     if front_dist < 0.3:
                         if not hasattr(self, '_stop_start_time'):
