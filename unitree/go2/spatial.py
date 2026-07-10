@@ -2167,6 +2167,7 @@ class SpatialPlugin:
                         target_heading = current_heading + blend * diff
 
                     # 速度控制 + lidar 避障
+                    heading_err = self._normalize_angle(target_heading - pose["yaw"])
                     front_dist = self._node.get_front_obstacle_dist()
 
                     if front_dist < 0.3:
