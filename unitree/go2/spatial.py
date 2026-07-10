@@ -451,7 +451,6 @@ class _SpatialNode(Node):
         # 注意：不能用 DDS ChannelSubscriber（和 LidarPlugin 冲突）
         # 改为订阅 LidarPlugin 发布的 ROS2 topic
         self._latest_lidar_body: np.ndarray | None = None
-        from std_msgs.msg import UInt8MultiArray
         lidar_topic = pos_tag_topic.rsplit("/", 2)[0] + "/lidar/cloud"  # /{ns}/lidar/cloud
         self._lidar_sub = self.create_subscription(
             UInt8MultiArray, lidar_topic, self._on_lidar_ros2, _LOW_LAT_QOS)
