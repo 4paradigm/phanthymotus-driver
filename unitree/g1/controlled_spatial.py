@@ -126,8 +126,8 @@ class _SlamRpcProxy:
     def InitPose(self, x=0.0, y=0.0, z=0.0, q_x=0.0, q_y=0.0, q_z=0.0, q_w=1.0, address="") -> tuple:
         return self._call("InitPose", {"x": x, "y": y, "z": z, "q_x": q_x, "q_y": q_y, "q_z": q_z, "q_w": q_w, "address": address})
 
-    def NavigateTo(self, x, y, z=0.0, q_x=0.0, q_y=0.0, q_z=0.0, q_w=1.0) -> tuple:
-        return self._call("NavigateTo", {"x": x, "y": y, "z": z, "q_x": q_x, "q_y": q_y, "q_z": q_z, "q_w": q_w})
+    def NavigateTo(self, x, y, z=0.0, q_x=0.0, q_y=0.0, q_z=0.0, q_w=1.0, speed=0.5, mode=0) -> tuple:
+        return self._call("NavigateTo", {"x": x, "y": y, "z": z, "q_x": q_x, "q_y": q_y, "q_z": q_z, "q_w": q_w, "speed": speed, "mode": mode})
 
     def PauseNav(self) -> tuple:
         return self._call("PauseNav")
@@ -279,6 +279,8 @@ class ControlledSpatialPlugin:
         self._is_mapping: bool = False
         self._current_pose: dict | None = None
         self._map_status: str = "idle"  # idle | mapping | localized
+        self._nav_arrived = threading.Event()
+        self._nav_error: str | None = None
         self._lock = threading.Lock()
 
         # Subscribe DDS for pose updates
@@ -316,6 +318,7 @@ class ControlledSpatialPlugin:
                             "list_maps", "delete_map",
                             "load_map",
                             "navigate_to_tag", "navigate_to_pose",
+                            "wait_navigation_done",
                             "pause_nav", "resume_nav", "stop_nav",
                         ],
                         "description": "Action to perform",
@@ -327,6 +330,9 @@ class ControlledSpatialPlugin:
                     "x": {"type": "number", "description": "Target X coordinate (meters)"},
                     "y": {"type": "number", "description": "Target Y coordinate (meters)"},
                     "yaw": {"type": "number", "description": "Target yaw (radians)"},
+                    "speed": {"type": "number", "description": "Navigation speed 0.2-0.8 m/s (default 0.5)"},
+                    "mode": {"type": "integer", "description": "Obstacle mode: 0=detour(default), 1=stop"},
+                    "stall_timeout": {"type": "number", "description": "Seconds without movement before declaring timeout (default 60)"},
                 },
                 "required": ["action"],
                 "x-action-params": {
@@ -338,8 +344,9 @@ class ControlledSpatialPlugin:
                     "list_maps": {"params": [], "description": "List all saved maps"},
                     "delete_map": {"params": ["map_name"], "description": "Delete a map and its associated data"},
                     "load_map": {"params": ["map_name"], "description": "Load a map (robot must be at map origin)"},
-                    "navigate_to_tag": {"params": ["tag_name"], "description": "Navigate to a tagged place"},
-                    "navigate_to_pose": {"params": ["x", "y", "yaw"], "description": "Navigate to coordinates"},
+                    "navigate_to_tag": {"params": ["tag_name", "speed", "mode"], "description": "Navigate to a tagged place (mode 0=detour, 1=stop)"},
+                    "navigate_to_pose": {"params": ["x", "y", "yaw", "speed", "mode"], "description": "Navigate to coordinates (mode 0=detour, 1=stop)"},
+                    "wait_navigation_done": {"params": ["stall_timeout"], "description": "Block until navigation completes or robot is stuck (no movement for stall_timeout seconds)"},
                     "pause_nav": {"params": [], "description": "Pause navigation"},
                     "resume_nav": {"params": [], "description": "Resume navigation"},
                     "stop_nav": {"params": [], "description": "Stop and cancel navigation"},
@@ -380,6 +387,15 @@ class ControlledSpatialPlugin:
                         self._map_status = "localized"
                     elif msg_type == "mapping_info":
                         self._map_status = "mapping"
+
+        elif msg_type == "ctrl_info":
+            ctrl_data = data.get("data", {})
+            if ctrl_data.get("is_arrived"):
+                self._nav_arrived.set()
+            obs = ctrl_data.get("obsInfo", {})
+            if obs.get("state") and obs.get("time", 0) > 10:
+                self._nav_error = "blocked by obstacle for >10s"
+                self._nav_arrived.set()
 
     def _get_pose(self) -> dict | None:
         with self._lock:
@@ -515,12 +531,18 @@ class ControlledSpatialPlugin:
             yaw = poi.get("yaw", 0)
 
             if self._smart_motion:
+                self._nav_arrived.clear()
+                self._nav_error = None
                 return self._smart_motion.navigate_to(poi["x"], poi["y"], yaw, tag_name)
 
             # Fallback: direct SLAM navigation
             q_z = math.sin(yaw / 2)
             q_w = math.cos(yaw / 2)
-            code, resp = self._client.NavigateTo(poi["x"], poi["y"], 0, 0, 0, q_z, q_w)
+            speed = max(0.2, min(0.8, float(args.get("speed", 0.5))))
+            mode = int(args.get("mode", 0))
+            self._nav_arrived.clear()
+            self._nav_error = None
+            code, resp = self._client.NavigateTo(poi["x"], poi["y"], 0, 0, 0, q_z, q_w, speed=speed, mode=mode)
             if code == 0:
                 return {"status": "navigating", "target": tag_name, "pose": {"x": poi["x"], "y": poi["y"], "yaw": yaw}}
             return _rpc_error("NavigateTo", code, resp)
@@ -531,14 +553,49 @@ class ControlledSpatialPlugin:
             yaw = float(args.get("yaw", 0))
 
             if self._smart_motion:
+                self._nav_arrived.clear()
+                self._nav_error = None
                 return self._smart_motion.navigate_to(x, y, yaw)
 
             q_z = math.sin(yaw / 2)
             q_w = math.cos(yaw / 2)
-            code, resp = self._client.NavigateTo(x, y, 0, 0, 0, q_z, q_w)
+            speed = max(0.2, min(0.8, float(args.get("speed", 0.5))))
+            mode = int(args.get("mode", 0))
+            self._nav_arrived.clear()
+            self._nav_error = None
+            code, resp = self._client.NavigateTo(x, y, 0, 0, 0, q_z, q_w, speed=speed, mode=mode)
             if code == 0:
                 return {"status": "navigating", "target_pose": {"x": x, "y": y, "yaw": yaw}}
             return _rpc_error("NavigateTo", code, resp)
+
+        elif action == "wait_navigation_done":
+            stall_timeout = float(args.get("stall_timeout", 60))
+            poll_interval = 1.0
+            last_pose = self._get_pose()
+            stall_start = time.time()
+
+            while True:
+                if self._nav_arrived.is_set():
+                    if self._nav_error:
+                        error = self._nav_error
+                        self._nav_error = None
+                        return {"status": "error", "error": error}
+                    return {"status": "arrived", "pose": self._get_pose()}
+
+                time.sleep(poll_interval)
+                current_pose = self._get_pose()
+
+                if current_pose and last_pose:
+                    dx = current_pose["x"] - last_pose["x"]
+                    dy = current_pose["y"] - last_pose["y"]
+                    moved = math.sqrt(dx * dx + dy * dy)
+                    if moved > 0.05:
+                        stall_start = time.time()
+                        last_pose = current_pose
+
+                if time.time() - stall_start > stall_timeout:
+                    self._client.PauseNav()
+                    return {"status": "timeout", "error": f"No movement for {stall_timeout}s, navigation cancelled"}
 
         elif action == "pause_nav":
             if self._smart_motion:

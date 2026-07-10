@@ -25,9 +25,13 @@ plugins:
   lidar:
     enabled: true
   controlled_spatial:
-    enabled: true
+    enabled: false
     native_slam_pcd_dir: /home/unitree/maps
     native_slam_db_path: /opt/phanthy-motus/data/controlled_spatial.db
+  spatial:
+    enabled: true
+    native_slam_pcd_dir: /home/unitree/maps
+    db_path: /opt/phanthy-motus/data/spatial.db
   asr:
     enabled: true
   ext_mic:
