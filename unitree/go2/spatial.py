@@ -2067,6 +2067,19 @@ class SpatialPlugin:
             a += 2 * math.pi
         return a
 
+    @staticmethod
+    def _cross_track_distance(px, py, ax, ay, bx, by) -> float:
+        """点 (px,py) 到线段 (ax,ay)-(bx,by) 的最短距离。"""
+        abx = bx - ax
+        aby = by - ay
+        ab_sq = abx * abx + aby * aby
+        if ab_sq < 1e-6:
+            return math.sqrt((px - ax) ** 2 + (py - ay) ** 2)
+        t = max(0, min(1, ((px - ax) * abx + (py - ay) * aby) / ab_sq))
+        proj_x = ax + t * abx
+        proj_y = ay + t * aby
+        return math.sqrt((px - proj_x) ** 2 + (py - proj_y) ** 2)
+
     def _execute_waypoints(self):
         """后台线程：平滑导航 + 动态重规划。
 
@@ -2108,6 +2121,31 @@ class SpatialPlugin:
                 is_last = (i == len(self._nav_waypoints) - 1)
 
                 print(f"[Spatial] Waypoint {i+1}/{len(self._nav_waypoints)}: ({wx:.2f}, {wy:.2f})", flush=True)
+
+                # --- 层1: 每步开始时位姿校验 ---
+                if i > 0:
+                    pose_check = self._node.get_pose_nav()
+                    if pose_check:
+                        expected_x, expected_y = self._nav_waypoints[i - 1]
+                        pos_err = math.sqrt((pose_check["x"] - expected_x)**2 + (pose_check["y"] - expected_y)**2)
+                        if pos_err > 1.2:
+                            print(f"[NAV] Position drift at waypoint {i+1}: "
+                                  f"pos=({pose_check['x']:.2f},{pose_check['y']:.2f}) "
+                                  f"expected near ({expected_x:.2f},{expected_y:.2f}) "
+                                  f"err={pos_err:.2f}m, replanning...", flush=True)
+                            new_path = self._planner.plan((pose_check["x"], pose_check["y"]), final_goal)
+                            if new_path and len(new_path) >= 2:
+                                self._nav_waypoints = new_path
+                                i = 0
+                                overlay = self._build_path_overlay(self._nav_waypoints, 0)
+                                self._node._nav_path_overlay = overlay
+                                self._node._maybe_publish_full_map()
+                                print(f"[NAV] Replanned from drift: {len(new_path)} waypoints", flush=True)
+                                continue
+                            else:
+                                self._nav_executing = False
+                                self._node._nav_error = "Navigation failed: position drifted, replan failed"
+                                break
 
                 # 更新 nav_path overlay
                 overlay = self._build_path_overlay(self._nav_waypoints, i)
@@ -2170,12 +2208,16 @@ class SpatialPlugin:
                     heading_err = self._normalize_angle(target_heading - pose["yaw"])
 
                     if abs(heading_err) > 0.5:
-                        # 大角度转向：用 Move()（OA_Move 会被避障拦截转不动）
+                        # 大角度转向：锁定方向防止 ±π 边界噪声导致震荡
+                        if not hasattr(self, '_turn_dir') or abs(heading_err) > 2.5:
+                            self._turn_dir = 1.0 if heading_err > 0 else -1.0
+                        vyaw = self._turn_dir * min(2.0, abs(heading_err) * 2.0)
                         vx = 0.05
-                        vyaw = max(-2.0, min(2.0, heading_err * 2.0))
                         self._rpc_proxy.Move(vx, 0, vyaw)
                         front_dist = 999.0  # 转向时不做避障检测
                     else:
+                        if hasattr(self, '_turn_dir'):
+                            del self._turn_dir
                         # 基本面对方向：启用 lidar 避障 + OA_Move
                         front_dist = self._node.get_front_obstacle_dist()
 
@@ -2258,6 +2300,41 @@ class SpatialPlugin:
                         self._nav_executing = False
                         self._node._nav_error = "Navigation failed: stuck"
                         break
+
+                    # --- 层2: 持续路径偏离监控 ---
+                    if i > 0:
+                        seg_start = self._nav_waypoints[i - 1]
+                    else:
+                        seg_start = self._nav_waypoints[0]
+                    cross_track_err = self._cross_track_distance(
+                        pose["x"], pose["y"],
+                        seg_start[0], seg_start[1], wx, wy
+                    )
+                    if cross_track_err > 1.2:
+                        if not hasattr(self, '_cross_track_exceed_start'):
+                            self._cross_track_exceed_start = time.time()
+                        elif time.time() - self._cross_track_exceed_start > 3.0:
+                            print(f"[NAV] Cross-track error {cross_track_err:.2f}m > 1.2m for 3s, replanning...", flush=True)
+                            new_path = self._planner.plan((pose["x"], pose["y"]), final_goal)
+                            if new_path and len(new_path) >= 2:
+                                self._nav_waypoints = new_path
+                                i = 0
+                                if hasattr(self, '_cross_track_exceed_start'):
+                                    del self._cross_track_exceed_start
+                                overlay = self._build_path_overlay(self._nav_waypoints, 0)
+                                self._node._nav_path_overlay = overlay
+                                self._node._maybe_publish_full_map()
+                                print(f"[NAV] Replanned from cross-track: {len(new_path)} waypoints", flush=True)
+                                break
+                            else:
+                                self._nav_executing = False
+                                self._node._nav_error = "Navigation failed: off track, replan failed"
+                                if hasattr(self, '_cross_track_exceed_start'):
+                                    del self._cross_track_exceed_start
+                                break
+                    else:
+                        if hasattr(self, '_cross_track_exceed_start'):
+                            del self._cross_track_exceed_start
                 else:
                     # while 正常退出（不是 break）→ 重规划触发了，继续外层循环
                     continue
