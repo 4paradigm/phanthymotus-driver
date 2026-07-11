@@ -15,7 +15,9 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
         libusb-1.0-0-dev \
         libssl-dev \
         libopus-dev \
-        ffmpeg && \
+        ffmpeg \
+        udev \
+        usbutils && \
     rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
@@ -32,6 +34,9 @@ COPY bridge_client.py /work/bridge_client.py
 COPY config.yaml     /work/config.yaml
 COPY resource/       /work/resource/
 COPY deploy/         /deploy/
+
+# Install udev rule for E-Port device auto-permission
+COPY deploy/99-eport.rules /etc/udev/rules.d/99-eport.rules
 
 # Copy and build C bridge (stub mode unless PSDK_DIR is provided at build time)
 COPY psdk_bridge/ /work/psdk_bridge/

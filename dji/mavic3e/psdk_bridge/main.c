@@ -21,6 +21,9 @@
 #include <unistd.h>
 
 #include "ipc.h"
+#include "hal_uart.h"
+#include "hal_network.h"
+#include "osal_posix.h"
 #include "telemetry.h"
 #include "flight_ctrl.h"
 #include "camera_mgr.h"
@@ -309,6 +312,12 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, _signal_handler);
     signal(SIGTERM, _signal_handler);
 
+    /* Initialize HAL layer (platform abstraction) */
+    if (HalUart_Init(uart_dev, baud_rate) != 0) {
+        printf("[psdk_bridge] WARNING: UART init failed — hardware may not be connected\n");
+    }
+    HalNetwork_Init();  /* Non-fatal if no USB-Ethernet yet */
+
 #ifdef PSDK_ENABLED
     /* Initialize PSDK core */
     if (_psdk_core_init(app_id, app_key, app_license, app_name, uart_dev, baud_rate) != 0) {
@@ -357,6 +366,8 @@ int main(int argc, char *argv[]) {
     flight_ctrl_cleanup();
     telemetry_cleanup();
     ipc_cleanup();
+    HalUart_Close();
+    HalNetwork_Cleanup();
 
 #ifdef PSDK_ENABLED
     DjiCore_DeInit();
