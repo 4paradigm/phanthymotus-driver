@@ -1,6 +1,8 @@
 #ifndef TELEMETRY_H
 #define TELEMETRY_H
 
+#include <stddef.h>
+
 /* Initialize FC subscription module.
  * Subscribes to attitude, position, velocity, battery, GPS, obstacles, etc. */
 int telemetry_init(void);

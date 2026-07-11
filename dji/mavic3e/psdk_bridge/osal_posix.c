@@ -1,5 +1,6 @@
 #include "osal_posix.h"
 
+#define _GNU_SOURCE  /* for pthread_setname_np */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

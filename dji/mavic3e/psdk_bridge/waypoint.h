@@ -1,6 +1,8 @@
 #ifndef WAYPOINT_H
 #define WAYPOINT_H
 
+#include <stddef.h>
+
 int waypoint_init(void);
 int waypoint_upload(const char *kmz_path);
 int waypoint_start(void);

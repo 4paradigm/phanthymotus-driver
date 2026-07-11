@@ -1,6 +1,8 @@
 #ifndef CAMERA_MGR_H
 #define CAMERA_MGR_H
 
+#include <stddef.h>
+
 int camera_mgr_init(void);
 int camera_mgr_take_photo(const char *mode);
 int camera_mgr_start_video(void);
