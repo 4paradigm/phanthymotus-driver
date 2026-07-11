@@ -25,6 +25,9 @@ from pathlib import Path
 
 import yaml
 
+import rclpy
+import rclpy.executors
+
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
