@@ -7,7 +7,7 @@ dji-mavic3e:
   volumes:
     - /dev:/dev
     - /opt/phanthy-motus/data:/opt/phanthy-motus/data
-    - /tmp/psdk_bridge.sock:/tmp/psdk_bridge.sock
+    - /run/udev:/run/udev:ro
   environment:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp

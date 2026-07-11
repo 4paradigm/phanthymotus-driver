@@ -43,6 +43,9 @@ endif()
 set(SOURCES
     main.c
     ipc.c
+    hal_uart.c
+    hal_network.c
+    osal_posix.c
     telemetry.c
     flight_ctrl.c
     camera_mgr.c

@@ -252,6 +252,24 @@ def make_handler():
     return Handler
 
 
+# ── Device wait (container startup) ───────────────────────────────────────
+
+def _wait_for_device(device_path: str, timeout: int = 30):
+    """Wait for E-Port USB device to appear (handles container startup race condition)."""
+    import time as _t
+    start = _t.time()
+    while not os.path.exists(device_path):
+        elapsed = _t.time() - start
+        if elapsed > timeout:
+            print(f"[bundle] WARNING: {device_path} not found after {timeout}s — "
+                  "E-Port may not be connected")
+            return
+        if int(elapsed) % 5 == 0 and int(elapsed) > 0:
+            print(f"[bundle] waiting for {device_path}... ({int(elapsed)}s)")
+        _t.sleep(1)
+    print(f"[bundle] {device_path} detected")
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def _start_registration(mcp_port: int, name: str, category: str):
@@ -300,6 +318,12 @@ def main():
 
     # Bridge client — communicates with C psdk_bridge or runs in mock mode
     from bridge_client import BridgeClient
+
+    if not mock_mode:
+        # Wait for E-Port device to appear (USB hotplug in container)
+        uart_dev = psdk_cfg.get("uart_dev", "/dev/ttyACM0")
+        _wait_for_device(uart_dev)
+
     bridge = BridgeClient(mock_mode=mock_mode)
     print(f"[bundle] BridgeClient initialized (mock={mock_mode})")
 
