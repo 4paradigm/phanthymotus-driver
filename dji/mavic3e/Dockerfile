@@ -43,8 +43,8 @@ COPY psdk_bridge/ /work/psdk_bridge/
 RUN mkdir -p /work/psdk_bridge/build && \
     cd /work/psdk_bridge/build && \
     cmake .. -DCMAKE_BUILD_TYPE=Release && \
-    make -j$(nproc) || echo "[build] psdk_bridge build skipped (PSDK library not available)" && \
-    if [ -f psdk_bridge ]; then cp psdk_bridge /usr/local/bin/; fi
+    make -j$(nproc) && \
+    cp psdk_bridge /usr/local/bin/psdk_bridge
 
 ENV PYTHONPATH=/work
 ENV PYTHONUNBUFFERED=1
