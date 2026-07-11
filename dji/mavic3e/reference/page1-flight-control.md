@@ -1,0 +1,716 @@
+- generic [active] [ref=f6e1]:
+  - generic [ref=f6e3]:
+    - banner [ref=f6e4]:
+      - generic [ref=f6e5]:
+        - link [ref=f6e6] [cursor=pointer]:
+          - /url: https://developer.dji.com/cn
+          - img "Payload SDK" [ref=f6e7]
+        - link "Payload SDK" [ref=f6e8] [cursor=pointer]:
+          - /url: https://developer.dji.com/cn/payload-sdk/
+      - generic [ref=f6e9]:
+        - navigation [ref=f6e10]:
+          - link "文档" [ref=f6e12] [cursor=pointer]:
+            - /url: https://developer.dji.com/doc/payload-sdk-tutorial/cn/
+            - text: 文档
+            - generic [ref=f6e13]: open in new window
+          - link "下载" [ref=f6e19] [cursor=pointer]:
+            - /url: https://github.com/dji-sdk/Payload-SDK/tree/master
+            - text: 下载
+            - generic [ref=f6e20]: open in new window
+          - button "v3.9.2" [ref=f6e27] [cursor=pointer]
+          - button "Select language" [ref=f6e31] [cursor=pointer]: Languages
+        - button "Search" [ref=f6e34] [cursor=pointer]:
+          - generic [ref=f6e35]: 搜索
+          - generic [ref=f6e39]:
+            - generic [ref=f6e40]: ⌘
+            - generic [ref=f6e41]: K
+    - complementary [ref=f6e42]:
+      - list [ref=f6e43]:
+        - listitem [ref=f6e44]:
+          - link "PSDK API 概览" [ref=f6e45] [cursor=pointer]:
+            - /url: /doc/payload-sdk-api-reference/cn/index.html
+        - listitem [ref=f6e46]:
+          - paragraph [ref=f6e47] [cursor=pointer]: DJI CORE
+        - listitem [ref=f6e49]:
+          - paragraph [ref=f6e50] [cursor=pointer]: DJI 基础功能
+          - list [ref=f6e52]:
+            - listitem [ref=f6e53]:
+              - link "日志管理" [ref=f6e54] [cursor=pointer]:
+                - /url: /doc/payload-sdk-api-reference/cn/module/logger.html
+            - listitem [ref=f6e55]:
+              - link "信息管理" [ref=f6e56] [cursor=pointer]:
+                - /url: /doc/payload-sdk-api-reference/cn/module/aircraft-info.html
+            - listitem [ref=f6e57]:
+              - link "消息订阅" [ref=f6e58] [cursor=pointer]:
+                - /url: /doc/payload-sdk-api-reference/cn/module/fc-subscription.html
+              - list:
+                - listitem
+                - listitem:
+                  - list:
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                - listitem:
+                  - list:
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+            - listitem [ref=f6e59]:
+              - link "相机管理" [ref=f6e60] [cursor=pointer]:
+                - /url: /doc/payload-sdk-api-reference/cn/module/camera-manager.html
+            - listitem [ref=f6e61]:
+              - link "云台管理" [ref=f6e62] [cursor=pointer]:
+                - /url: /doc/payload-sdk-api-reference/cn/module/gimbal-manager.html
+            - listitem [ref=f6e63]:
+              - link "电源管理" [ref=f6e64] [cursor=pointer]:
+                - /url: /doc/payload-sdk-api-reference/cn/module/power-management.html
+            - listitem [ref=f6e65]:
+              - link "飞行控制" [ref=f6e66] [cursor=pointer]:
+                - /url: /doc/payload-sdk-api-reference/cn/module/flight-controller.html
+            - listitem [ref=f6e67]:
+              - link "自定义控件" [ref=f6e68] [cursor=pointer]:
+                - /url: /doc/payload-sdk-api-reference/cn/module/widget.html
+            - listitem [ref=f6e69]:
+              - link "HMS 管理" [ref=f6e70] [cursor=pointer]:
+                - /url: /doc/payload-sdk-api-reference/cn/module/hms-manager.html
+            - listitem [ref=f6e71]:
+              - link "HMS 信息表格" [ref=f6e72] [cursor=pointer]:
+                - /url: /doc/payload-sdk-api-reference/cn/module/hms-info-table.html
+            - listitem [ref=f6e73]:
+              - link "自定义 HMS 功能" [ref=f6e74] [cursor=pointer]:
+                - /url: /doc/payload-sdk-api-reference/cn/module/hms-customization.html
+            - listitem [ref=f6e75]:
+              - link "时间同步" [ref=f6e76] [cursor=pointer]:
+                - /url: /doc/payload-sdk-api-reference/cn/module/time-sync.html
+            - listitem [ref=f6e77]:
+              - link "低速数据通道" [ref=f6e78] [cursor=pointer]:
+                - /url: /doc/payload-sdk-api-reference/cn/module/low-speed-data-channel.html
+            - listitem [ref=f6e79]:
+              - link "高速数据通道" [ref=f6e80] [cursor=pointer]:
+                - /url: /doc/payload-sdk-api-reference/cn/module/high-speed-data-channel.html
+        - listitem [ref=f6e81]:
+          - paragraph [ref=f6e82] [cursor=pointer]: 移植
+        - listitem [ref=f6e84]:
+          - paragraph [ref=f6e85] [cursor=pointer]: 应用实践
+        - listitem [ref=f6e87]:
+          - paragraph [ref=f6e88] [cursor=pointer]: 标准负载
+    - main [ref=f6e90]:
+      - generic [ref=f6e91]:
+        - generic [ref=f6e92]:
+          - heading "消息订阅" [level=1] [ref=f6e93]
+          - generic [ref=f6e94]:
+            - generic [ref=f6e95]: 2023-06-15
+            - generic [ref=f6e99]:
+              - slider "rating" [ref=f6e100]:
+                - generic [ref=f6e1427]: 4.8 分
+              - generic [ref=f6e121]: 5 用户已评分
+            - link "Github Edit" [ref=f6e123] [cursor=pointer]:
+              - /url: https://github.com/dji-sdk/Payload-SDK-API-Reference-V3/blob/master/docs/cn/20.module/20.fc-subscription.md
+              - text: Github Edit
+              - generic [ref=f6e124]: open in new window
+        - generic [ref=f6e130]:
+          - paragraph [ref=f6e131]:
+            - text: 消息订阅相关功能的头文件为
+            - code [ref=f6e132]: dji_fc_subscription.h
+            - text: ，本文档描述了
+            - code [ref=f6e133]: dji_fc_subscription.h
+            - text: 文件中结构体和函数原型的关键信息和使用方法。
+          - paragraph [ref=f6e134]:
+            - text: 关于订阅项与它最大订阅频率，可以阅读 PSDK 教程文档的
+            - link "信息管理 open in new window" [ref=f6e135] [cursor=pointer]:
+              - /url: https://developer.dji.com/doc/payload-sdk-tutorial/cn/function-set/basic-function/info-management.html
+              - text: 信息管理
+              - generic [ref=f6e136]: open in new window
+            - text: 章节中的”订阅项“。
+          - heading "目录" [level=2] [ref=f6e141]:
+            - link [ref=f6e142] [cursor=pointer]:
+              - /url: "#目录"
+              - text: "#"
+            - text: 目录
+          - list [ref=f6e143]:
+            - listitem [ref=f6e144]:
+              - paragraph [ref=f6e145]:
+                - text: 宏定义、枚举与结构体
+                - link "E_DjiFcSubscriptionTopic" [ref=f6e146] [cursor=pointer]:
+                  - /url: "#1"
+                - link "E_DjiFcSubscriptionDataHealthFlag" [ref=f6e147] [cursor=pointer]:
+                  - /url: "#2"
+                - link "E_DjiFcSubscriptionPositionSolutionProperty" [ref=f6e148] [cursor=pointer]:
+                  - /url: "#3"
+                - link "E_DjiFcSubscriptionGpsFixState" [ref=f6e149] [cursor=pointer]:
+                  - /url: "#4"
+                - link "E_DjiFcSubscriptionFlightStatus" [ref=f6e150] [cursor=pointer]:
+                  - /url: "#5"
+                - link "E_DjiFcSubscriptionDisplayMode" [ref=f6e151] [cursor=pointer]:
+                  - /url: "#6"
+                - link "E_DjiFcSubscriptionHomePointSetStatus" [ref=f6e152] [cursor=pointer]:
+                  - /url: "#7"
+                - link "T_DjiFcSubscriptionQuaternion" [ref=f6e153] [cursor=pointer]:
+                  - /url: "#8"
+                - link "T_DjiFcSubscriptionAccelerationGround" [ref=f6e154] [cursor=pointer]:
+                  - /url: "#9"
+                - link "T_DjiFcSubscriptionAccelerationBody" [ref=f6e155] [cursor=pointer]:
+                  - /url: "#10"
+                - link "T_DjiFcSubscriptionVelocity" [ref=f6e156] [cursor=pointer]:
+                  - /url: "#11"
+                - link "T_DjiFcSubscriptionAngularRateFusioned" [ref=f6e157] [cursor=pointer]:
+                  - /url: "#12"
+                - link "T_DjiFcSubscriptionAngularRateRaw" [ref=f6e158] [cursor=pointer]:
+                  - /url: "#13"
+                - link "T_DjiFcSubscriptionPositionFused" [ref=f6e159] [cursor=pointer]:
+                  - /url: "#14"
+                - link "T_DjiFcSubscriptionGpsPosition" [ref=f6e160] [cursor=pointer]:
+                  - /url: "#15"
+                - link "T_DjiFcSubscriptionGpsVelocity" [ref=f6e161] [cursor=pointer]:
+                  - /url: "#40"
+                - link "T_DjiFcSubscriptionGpsDetails" [ref=f6e162] [cursor=pointer]:
+                  - /url: "#41"
+                - link "T_DjiFcSubscriptionRtkPosition" [ref=f6e163] [cursor=pointer]:
+                  - /url: "#42"
+                - link "T_DjiFcSubscriptionRtkVelocity" [ref=f6e164] [cursor=pointer]:
+                  - /url: "#43"
+                - link "T_DjiFcSubscriptionCompass" [ref=f6e165] [cursor=pointer]:
+                  - /url: "#16"
+                - link "T_DjiFcSubscriptionRC" [ref=f6e166] [cursor=pointer]:
+                  - /url: "#17"
+                - link "T_DjiFcSubscriptionGimbalAngles" [ref=f6e167] [cursor=pointer]:
+                  - /url: "#18"
+                - link "T_DjiFcSubscriptionGimbalStatus" [ref=f6e168] [cursor=pointer]:
+                  - /url: "#19"
+                - link "T_DjiFcSubscriptionSingleBatteryState" [ref=f6e169] [cursor=pointer]:
+                  - /url: "#20"
+                - link "T_DjiFcSubscriptionWholeBatteryInfo" [ref=f6e170] [cursor=pointer]:
+                  - /url: "#21"
+                - link "T_DjiFcSubscriptionSingleBatteryInfo" [ref=f6e171] [cursor=pointer]:
+                  - /url: "#22"
+                - link "T_DjiFcSubscriptionControlDevice" [ref=f6e172] [cursor=pointer]:
+                  - /url: "#23"
+                - link "SyncTimestamp" [ref=f6e173] [cursor=pointer]:
+                  - /url: "#24"
+                - link "T_DjiFcSubscriptionHardSync" [ref=f6e174] [cursor=pointer]:
+                  - /url: "#25"
+                - link "T_DjiFcSubscriptionRCWithFlagData" [ref=f6e175] [cursor=pointer]:
+                  - /url: "#26"
+                - link "ESCStatusIndividual" [ref=f6e176] [cursor=pointer]:
+                  - /url: "#27"
+                - link "T_DjiFcSubscriptionEscData" [ref=f6e177] [cursor=pointer]:
+                  - /url: "#28"
+                - link "T_DjiFcSubscriptionRTKConnectStatus" [ref=f6e178] [cursor=pointer]:
+                  - /url: "#29"
+                - link "T_DjiFcSubscriptionFlightAnomaly" [ref=f6e179] [cursor=pointer]:
+                  - /url: "#30"
+                - link "T_DjiFcSubscriptionPositionVO" [ref=f6e180] [cursor=pointer]:
+                  - /url: "#31"
+                - link "T_DjiFcSubscriptionAvoidData" [ref=f6e181] [cursor=pointer]:
+                  - /url: "#32"
+                - link "T_DjiFcSubscriptionHomePointInfo" [ref=f6e182] [cursor=pointer]:
+                  - /url: "#33"
+                - link "GimbalSingleData" [ref=f6e183] [cursor=pointer]:
+                  - /url: "#34"
+                - link "T_DjiFcSubscriptionThreeGimbalData" [ref=f6e184] [cursor=pointer]:
+                  - /url: "#35"
+            - listitem [ref=f6e185]:
+              - paragraph [ref=f6e186]:
+                - text: 函数原型
+                - link "DjiFcSubscription_Init" [ref=f6e187] [cursor=pointer]:
+                  - /url: "#36"
+                - link "DjiFcSubscription_DeInit" [ref=f6e188] [cursor=pointer]:
+                  - /url: "#37"
+                - link "DjiFcSubscription_SubscribeTopic" [ref=f6e189] [cursor=pointer]:
+                  - /url: "#38"
+                - link "DjiFcSubscription_GetLatestValueOfTopic" [ref=f6e190] [cursor=pointer]:
+                  - /url: "#39"
+          - heading "宏定义、枚举与结构体" [level=2] [ref=f6e191]:
+            - link [ref=f6e192] [cursor=pointer]:
+              - /url: "#宏定义、枚举与结构体"
+              - text: "#"
+            - text: 宏定义、枚举与结构体
+          - list [ref=f6e193]:
+            - listitem [ref=f6e194]: 数据结构
+          - generic [ref=f6e195]:
+            - text: c
+            - code [ref=f6e197]: typedef dji_f32_t T_DjiFcSubscriptionAltitudeFused; typedef dji_f32_t T_DjiFcSubscriptionAltitudeBarometer; typedef dji_f32_t T_DjiFcSubscriptionAltitudeOfHomePoint; typedef dji_f32_t T_DjiFcSubscriptionHeightFusion; typedef dji_f32_t T_DjiFcSubscriptionHeightRelative; typedef uint32_t T_DjiFcSubscriptionGpsDate; typedef uint32_t T_DjiFcSubscriptionGpsTime; typedef uint8_t T_DjiFcSubscriptionRtkPositionInfo; typedef uint8_t T_DjiFcSubscriptionRtkYawInfo; typedef uint8_t T_DjiFcSubscriptionFlightStatus; typedef uint8_t T_DjiFcSubscriptionDisplaymode; typedef uint8_t T_DjiFcSubscriptionLandinggear; typedef uint16_t T_DjiFcSubscriptionMotorStartError; typedef uint8_t T_DjiFcSubscriptionGpsControlLevel; typedef uint8_t T_DjiFcSubscriptionGimbalControlMode; typedef uint8_t T_DjiFcSubscriptionHomePointSetStatus; typedef uint8_t T_DjiFcSubscriptionGpsSignalLevel; typedef int16_t T_DjiFcSubscriptionRtkYaw; typedef uint8_t T_DjiFcSubscriptionRtkPositionInfo; typedef uint8_t T_DjiFcSubscriptionRtkYawInfo;
+          - heading "typedef enum E_DjiFcSubscriptionTopic" [level=3] [ref=f6e239]:
+            - link [ref=f6e240] [cursor=pointer]:
+              - /url: "#typedef-enum-e-djifcsubscriptiontopic"
+              - text: "#"
+            - text: typedef enum E_DjiFcSubscriptionTopic
+          - generic [ref=f6e241]:
+            - text: c
+            - code [ref=f6e243]: "typedef enum { /*! * Quaternion of aircraft topic name. Quaternion topic provides aircraft body frame (FRD) to ground frame * (NED) rotation. Please refer to ::T_DjiFcSubscriptionQuaternion for information about data structure. * @details The DJI quaternion follows Hamilton convention (q0 = w, q1 = x, q2 = y, q3 = z). * | Angle | Unit | Accuracy | Notes | |--------------|------|------------|-------------------------------------------------| | pitch, roll | deg | <1 | in NON-AHRS mode | | yaw | deg | <3 | in well-calibrated compass with fine aligned | | yaw with rtk | deg | around 1.2 | in RTK heading fixed mode with 1 meter baseline | * 数据结构： T_DjiFcSubscriptionQuaternion */ DJI_FC_SUBSCRIPTION_TOPIC_QUATERNION = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 0), /*! * @brief Provides aircraft's acceleration w.r.t a ground-fixed \\b NEU frame @ up to 200Hz * @warning Please note that this data is not in a conventional right-handed frame of reference. * @details This is a fusion output from the flight control system. The output is in a right-handed NED frame, but the * sign of the Z-axis acceleration is flipped before publishing to this topic. So if you are looking to get acceleration * in an NED frame, simply flip the sign of the z-axis value. Beyond that, you can convert using rotations to * any right-handed frame of reference. * @units m/s<SUP>2</SUP> * 数据结构： T_DjiFcSubscriptionAccelerationGround */ DJI_FC_SUBSCRIPTION_TOPIC_ACCELERATION_GROUND = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 1), /*! * @brief Provides aircraft's acceleration w.r.t a body-fixed \\b FRU frame @ up to 200Hz * @warning Please note that this data is not in a conventional right-handed frame of reference. * @details This is a fusion output from the flight control system. * @units m/s<SUP>2</SUP> * 数据结构： T_DjiFcSubscriptionAccelerationBody */ DJI_FC_SUBSCRIPTION_TOPIC_ACCELERATION_BODY = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 2), /*! * @brief Provides aircraft's acceleration in an IMU-centered, body-fixed \\b FRD frame @ up to 400Hz * @details This is a filtered output from the IMU on board the flight control system. * @sensors IMU * @units m/s<SUP>2</SUP> * 数据结构： T_DjiFcSubscriptionAccelerationRaw */ DJI_FC_SUBSCRIPTION_TOPIC_ACCELERATION_RAW = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 3), /*! * @brief Velocity of aircraft topic name. Velocity topic provides aircraft's velocity in a ground-fixed NEU frame. * Please refer to ::T_DjiFcSubscriptionVelocity for information about data structure. * @warning Please note that this data is not in a conventional right-handed frame of reference. * @details This velocity data is a fusion output from the aircraft. Original output is in a right-handed NED frame, but the * sign of the Z-axis velocity is flipped before publishing to this topic. So if you are looking to get velocity * in an NED frame, simply flip the sign of the z-axis value. Beyond that, you can convert using rotations to * any right-handed frame of reference. * | Axis | Unit | Accuracy | |----------|------|---------------------------------------------------------------------------------------------| | vgx, vgy | m/s | Around 5cm/s for GNSS navigation. Around 3cm/s with VO at 1 meter height | | vgz | m/s | 10cm/s only with barometer in steady air. 3cm/s with VO at 1 meter height with 8cm baseline | * 数据结构： T_DjiFcSubscriptionVelocity */ DJI_FC_SUBSCRIPTION_TOPIC_VELOCITY = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 4), /*! * @brief Provides aircraft's angular velocity in a ground-fixed \\b NED frame @ up to 200Hz * @details This is a fusion output from the flight control system. * @units rad/s * 数据结构： T_DjiFcSubscriptionAngularRateFusioned */ DJI_FC_SUBSCRIPTION_TOPIC_ANGULAR_RATE_FUSIONED = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 5), /*! * @brief Provides aircraft's angular velocity in an IMU-centered, body-fixed \\b FRD frame @ up to 400Hz * @details This is a filtered output from the IMU on board the flight control system. * @sensors IMU * @units rad/s * 数据结构： T_DjiFcSubscriptionAngularRateRaw */ DJI_FC_SUBSCRIPTION_TOPIC_ANGULAR_RATE_RAW = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 6), /*! * @brief Fused altitude of aircraft topic name. Fused altitude topic provides aircraft's fused altitude from sea * level. Please refer to ::T_DjiFcSubscriptionAltitudeFused for information about data structure. * @units m * 数据结构： T_DjiFcSubscriptionAltitudeFused */ DJI_FC_SUBSCRIPTION_TOPIC_ALTITUDE_FUSED = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 7), /*! * @brief Provides aircraft's pressure altitude from sea level using the ICAO model @ up to 200Hz * @details * This is a filetered output from the barometer without any further fusion. * * The ICAO model gives an MSL altitude of 1013.25mBar at 15&deg; C and a temperature lapse rate of -6.5&deg; C * per 1000m. In your case, it may be possible that the take off altitude of the aircraft is recording a higher pressure * than 1013.25mBar. Let's take an example - a weather station shows that SFO (San Francisco International Airport) had * recently recorded a pressure of 1027.1mBar. SFO is 4m above MSL, yet, if you calculate the Pressure Altitude using * the ICAO model, it relates to -114m. You can use an online calculator to similarly calculate the Pressure Altitude * in your area. * * Another factor that may affect your altitude reading is manufacturing differences in the barometer - it is not * uncommon to have a variation of &plusmn;30m readings at the same physical location with two different aircraft. For a given * aircraft, these readings will be consistent, so you will need to calibrate the offset of your system if your code * relies on the accuracy of the absolute value of altitude. * @sensors GPS, Barometer, IMU * @units m * 数据结构： T_DjiFcSubscriptionAltitudeBarometer */ DJI_FC_SUBSCRIPTION_TOPIC_ALTITUDE_BAROMETER = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 8), /*! * @brief Provides the altitude from sea level when the aircraft last took off. * @details * This is a fusion output from the flight control system, and also uses the ICAO model. * * The ICAO model gives an MSL altitude of 1013.25mBar at 15&deg; C and a temperature lapse rate of -6.5&deg; C * per 1000m. In your case, it may be possible that the take off altitude of the aircraft is recording a higher pressure * than 1013.25mBar. Let's take an example - a weather station shows that SFO (San Francisco International Airport) had * recently recorded a pressure of 1027.1mBar. SFO is 4m above MSL, yet, if you calculate the Pressure Altitude using * the ICAO model, it relates to -114m. You can use an online calculator to similarly calculate the Pressure Altitude * in your area. * * Another factor that may affect your altitude reading is manufacturing differences in the barometer - it is not * uncommon to have a variation of &plusmn;30m readings at the same physical location with two different aircraft. For a given * aircraft, these readings will be consistent, so you will need to calibrate the offset of your system if your code * relies on the accuracy of the absolute value of altitude. * * @note This value is updated each time the drone takes off. * * @sensors Visual Odometry (M210 only), Barometer, IMU * @units m * 数据结构： T_DjiFcSubscriptionAltitudeOfHomePoint */ DJI_FC_SUBSCRIPTION_TOPIC_ALTITUDE_OF_HOMEPOINT = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 9), /*! * @brief Provides the relative height above ground at up to 100Hz. * @details * This is a fusion output from the flight control system. The height is a direct estimate of the closest large object below the aircraft's ultrasonic sensors. * A large object is something that covers the ultrasonic sensor for an extended duration of time. * * @warning This topic does not come with a 'valid' flag - so if the aircraft is too far from an object for the * ultrasonic sensors/VO to provide any meaningful data, the values will latch and there is no way for user code to * determine if the data is valid or not. Use with caution. * @sensors Visual Odometry, Ultrasonic * @units m * 数据结构： T_DjiFcSubscriptionHeightFusion */ DJI_FC_SUBSCRIPTION_TOPIC_HEIGHT_FUSION = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 10), /*! * @brief Relative height above ground of aircraft topic name. Please refer to * ::T_DjiFcSubscriptionHeightRelative for information about data structure. * @details This data is a fusion output from aircraft. The height is a direct estimate of the closest large object * below the aircraft's ultrasonic sensors. * @warning This topic does not come with a 'valid' flag - so if the aircraft is too far from an object for the * ultrasonic sensors/VO to provide any meaningful data, the values will latch and there is no way for user to * determine if the data is valid or not. Please use with caution. * 数据结构： T_DjiFcSubscriptionHeightRelative */ DJI_FC_SUBSCRIPTION_TOPIC_HEIGHT_RELATIVE = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 11), /*! * Fused position of aircraft topic name. Please refer to ::T_DjiFcSubscriptionPositionFused for information * about data structure. * @warning Please note that if GPS signal is weak (low visibleSatelliteNumber, see below), the * latitude/longitude values won't be updated but the altitude might still be. There is currently no way to know if * the lat/lon update is healthy. * @details The most important component of this topic is the T_DjiFcSubscriptionPositionFused::visibleSatelliteNumber. * Use this to track your GPS satellite coverage and build some heuristics for when you might expect to lose GPS updates. * | Axis | Unit | Position Sensor | Accuracy | |------|------|-----------------|--------------------------------------------------| | x, y | m | GPS | <3m with open sky without multipath | | z | m | GPS | <5m with open sky without multipath | * 数据结构： T_DjiFcSubscriptionPositionFused */ DJI_FC_SUBSCRIPTION_TOPIC_POSITION_FUSED = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 12), /*! * @brief GPS date topic name. Please refer to ::T_DjiFcSubscriptionGpsDate for information about data structure. * 数据结构： T_DjiFcSubscriptionGpsDate */ DJI_FC_SUBSCRIPTION_TOPIC_GPS_DATE = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 13), /*! * @brief GPS time topic name. Please refer to ::T_DjiFcSubscriptionGpsTime for information about data structure. * 数据结构： T_DjiFcSubscriptionGpsTime */ DJI_FC_SUBSCRIPTION_TOPIC_GPS_TIME = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 14), /*! * @brief GPS position topic name. Please refer to ::T_DjiFcSubscriptionGpsPosition for information about data structure. * @details * | Axis | Accuracy | |------|--------------------------------------------------| | x, y | <3m with open sky without multipath | | z | <5m with open sky without multipath | * 数据结构： T_DjiFcSubscriptionGpsPosition */ DJI_FC_SUBSCRIPTION_TOPIC_GPS_POSITION = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 15), /*! * @brief GPS velocity topic name. Please refer to ::T_DjiFcSubscriptionGpsVelocity for information about data structure. * 数据结构： T_DjiFcSubscriptionGpsVelocity */ DJI_FC_SUBSCRIPTION_TOPIC_GPS_VELOCITY = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 16), /*! * @brief GPS details topic name. GPS details topic provides GPS state and other detail information. Please refer * to ::T_DjiFcSubscriptionGpsDetail for information about data structure. * 数据结构： T_DjiFcSubscriptionGpsDetails */ DJI_FC_SUBSCRIPTION_TOPIC_GPS_DETAILS = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 17), /*! * @brief GPS signal level topic name. This topic provides a measure of the quality of GPS signal. Please refer to * ::T_DjiFcSubscriptionGpsSignalLevel for information about data structure. * 数据结构： T_DjiFcSubscriptionGpsSignalLevel */ DJI_FC_SUBSCRIPTION_TOPIC_GPS_SIGNAL_LEVEL = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 18), /*! * @brief RTK position topic name. Please refer to ::T_DjiFcSubscriptionRtkPosition for information about data structure. * @details * | Axis | Accuracy | |------|--------------------------------------------------| | x, y | ~2cm with fine alignment and fix condition | | z | ~3cm with fine alignment and fix condition | * 数据结构： T_DjiFcSubscriptionRtkPosition */ DJI_FC_SUBSCRIPTION_TOPIC_RTK_POSITION = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 19), /*! * @brief RTK velocity topic name. Please refer to ::T_DjiFcSubscriptionRtkVelocity for information about data structure. * 数据结构： T_DjiFcSubscriptionRtkVelocity */ DJI_FC_SUBSCRIPTION_TOPIC_RTK_VELOCITY = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 20), /*! * @brief RTK yaw topic name. Please refer to ::T_DjiFcSubscriptionRtkYaw for information about data structure. * @details The RTK yaw will provide the vector from ANT1 to ANT2 as configured in DJI Assistant 2. This * means that the value of RTK yaw will be 90deg offset from the yaw of the aircraft. * 数据结构： T_DjiFcSubscriptionRtkYaw */ DJI_FC_SUBSCRIPTION_TOPIC_RTK_YAW = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 21), /*! * @brief RTK position information topic name. RTK position information topic provides a state of RTK position * solution. Please refer to ::T_DjiFcSubscriptionRtkPositionInfo for information about data structure. * 数据结构： T_DjiFcSubscriptionRtkPositionInfo */ DJI_FC_SUBSCRIPTION_TOPIC_RTK_POSITION_INFO = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 22), /*! * @brief RTK yaw topic name. RTK yaw information topic provides a state of RTK yaw solution. Please refer to * ::T_DjiFcSubscriptionRtkYawInfo for information about data structure. * 数据结构： T_DjiFcSubscriptionRtkYawInfo */ DJI_FC_SUBSCRIPTION_TOPIC_RTK_YAW_INFO = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 23), /*! * @brief Provides aircraft's magnetometer reading, fused with IMU and GPS @ up to 100Hz * @details This reading is the magnetic field recorded by the magnetometer in x,y,z axis, calibrated such that * 1000 < |m| < 2000, and fused with IMU and GPS for robustness * @sensors Magnetometer, IMU, GPS * @units N/A * 数据结构： T_DjiFcSubscriptionCompass */ DJI_FC_SUBSCRIPTION_TOPIC_COMPASS = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 24), /*! * @brief Provides remote controller stick inputs @ up to 100Hz * @details This topic will give you: * - Stick inputs (R,P,Y,Thr) * - Mode switch (P/A/F) * - Landing gear switch (Up/Down) * * 数据结构： T_DjiFcSubscriptionRC * @also \\ref TOPIC_RC_WITH_FLAG_DATA */ DJI_FC_SUBSCRIPTION_TOPIC_RC = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 25), /*! * @brief Provides gimbal pitch, roll, yaw @ up to 50Hz * @details * The reference frame for gimbal angles is a NED frame attached to the gimbal. * This topic uses a data structure, Vector3f, that is too generic for the topic. The order of angles is : * |Data Structure Element| Meaning| * |----------------------|--------| * |Vector3f.x |pitch | * |Vector3f.y |roll | * |Vector3f.z |yaw | * * @perf * 0.1 deg accuracy in all axes * * @sensors Gimbal Encoder, IMU, Magnetometer * @units deg * 数据结构： T_DjiFcSubscriptionGimbalAngles * @also \\ref TOPIC_GIMBAL_STATUS, \\ref TOPIC_GIMBAL_CONTROL_MODE */ DJI_FC_SUBSCRIPTION_TOPIC_GIMBAL_ANGLES = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 26), /*! * @brief Provides gimbal status and error codes @ up to 50Hz * @details Please see the \\ref GimbalStatus struct for the details on what data you can receive. * * 数据结构： T_DjiFcSubscriptionGimbalStatus * @also \\ref TOPIC_GIMBAL_ANGLES, \\ref TOPIC_GIMBAL_CONTROL_MODE */ DJI_FC_SUBSCRIPTION_TOPIC_GIMBAL_STATUS = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 27), /*! * @brief Flight status topic name. Please refer to ::T_DjiFcSubscriptionFlightStatus for information about data structure. * 数据结构： T_DjiFcSubscriptionFlightStatus */ DJI_FC_SUBSCRIPTION_TOPIC_STATUS_FLIGHT = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 28), /*! * @brief Provides a granular state representation for various tasks/flight modes @ up to 50Hz * @details Typically, use this topic together with \\ref TOPIC_STATUS_FLIGHT to get a * better understanding of the overall status of the aircraft. * * 数据结构： T_DjiFcSubscriptionDisplaymode * @also \\ref TOPIC_STATUS_FLIGHT */ DJI_FC_SUBSCRIPTION_TOPIC_STATUS_DISPLAYMODE = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 29), /*! * @brief Provides status for the landing gear state @ up to 50Hz * * 数据结构： T_DjiFcSubscriptionLandinggear */ DJI_FC_SUBSCRIPTION_TOPIC_STATUS_LANDINGGEAR = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 30), /*! * @brief If motors failed to start, this topic provides reasons why. Available @ up to 50Hz * 数据结构： T_DjiFcSubscriptionMotorStartError * \\note These enumerations show up in the ErrorCode class because they can also be returned as acknowledgements * for APIs that start the motors, such as \\ref Control::takeoff \"Takeoff\" or \\ref Control::armMotors \"Arm\" */ DJI_FC_SUBSCRIPTION_TOPIC_STATUS_MOTOR_START_ERROR = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 31), /*! * @brief Battery information topic name. Please refer to ::T_DjiFcSubscriptionWholeBatteryInfo for information about data structure. * 数据结构： T_DjiFcSubscriptionWholeBatteryInfo */ DJI_FC_SUBSCRIPTION_TOPIC_BATTERY_INFO = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 32), /*! * @brief Provides states of the aircraft related to SDK/RC control * @details The following information is available in this topic: * |Data Structure Element| Meaning| * |----------------------|--------| * |controlMode |The modes in which the aircraft is being controlled (control loops being applied on horizontal, vertical and yaw axes of the aircraft)| * |deviceStatus |Which device is controlling the motion of the aircraft: RC (Manual control), MSDK (Missions kicked off through mobile), OSDK (Missions kicked off through onboard/ low-level flight control) | * |flightStatus |Has the OSDK been granted control authority? Since MSDK and RC have precedence, it is possible that deviceStatus shows RC or MSDK actually controlling the aircraft but this value is 1. | * |vrcStatus |Deprecated| * 数据结构： T_DjiFcSubscriptionControlDevice */ DJI_FC_SUBSCRIPTION_TOPIC_CONTROL_DEVICE = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 33), /*! * @brief Provides IMU and quaternion data time-synced with a hardware clock signal @ up to 400Hz. * @details This is the only data which can be synchronized with external software or hardware systems. If you want to * fuse an external sensor's data with the aircraft's IMU, this data along with a hardware trigger from the A3/N3's * expansion ports is how you would do it. You can see detailed documentation on how this process works in the [Hardware * Sync Guide](https://developer.dji.com/onboard-sdk/documentation/guides/component-guide-hardware-sync.html). * @sensors IMU, sensor fusion output * @units * |Data Structure Element| Units| * |----------------------|--------| * |Timestamp |2.5ms, 1ns (See \\ref SyncTimestamp)| * |Quaternion |rad (after converting to rotation matrix)| * |Acceleration |g| * |Gyroscope |rad/sec| * 数据结构： T_DjiFcSubscriptionHardSync */ DJI_FC_SUBSCRIPTION_TOPIC_HARD_SYNC = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 34), /*! * @brief Provides a measure of the quality of GPS signal, with a mechanism for guarding against unset homepoint @ up to 50Hz * @details The level varies from 0 to 5, with 0 being the worst and 5 the best GPS signal. The key difference between * this and TOPIC_GPS_SIGNAL_LEVEL is that this topic always returns 0 if the homepoint is not set. Once the home point is * set, the behavior is exactly the same as TOPIC_GPS_SIGNAL_LEVEL. * @sensors GPS * 数据结构： T_DjiFcSubscriptionGpsControlLevel * @also \\ref TOPIC_GPS_SIGNAL_LEVEL */ DJI_FC_SUBSCRIPTION_TOPIC_GPS_CONTROL_LEVEL = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 35), /*! * @brief Provides normalized remote controller stick input data, along with connection status @ up to 50Hz * @note This topic was added in August 2018. Your aircraft may require a FW update to enable this feature. * @details This topic will give you: * - Stick inputs (R,P,Y,Thr) * - Mode switch (P/A/F) * - Landing gear switch (Up/Down) * - Connection status for air system, ground system and MSDK apps. The connection status also includes a * logicConnected element, which will change to false if either the air system or the ground system radios * are disconnected for >3s. * - Deadzones near the center of the stick positions are also handled in this topic. * * 数据结构： T_DjiFcSubscriptionRCWithFlagData * @also \\ref TOPIC_RC */ DJI_FC_SUBSCRIPTION_TOPIC_RC_WITH_FLAG_DATA = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 36), /*! * @brief Provides raw data from the ESCs @ up to 50Hz * @note This topic was added in August 2018. Your aircraft may require a FW update to enable this feature. * @details This topic supports reporting data for up to 8 ESCs; note that only DJI Intelligent ESCs are supported * for this reporting feature. Use this topic to get data on elements close to the hardware - e.g. motor speeds, * ESC current and voltage, error flags at the ESC level etc. * 数据结构： T_DjiFcSubscriptionEscData */ DJI_FC_SUBSCRIPTION_TOPIC_ESC_DATA = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 37), /*! * @brief Provides RTK connection status @ up to 50Hz * @note This topic was added in August 2018. Your aircraft may require a FW update to enable this feature. * @details This topic will update in real time whether the RTK GPS system is connected or not; typical uses * include app-level logic to switch between GPS and RTK sources of positioning based on this flag. * 数据结构： T_DjiFcSubscriptionRTKConnectStatus */ DJI_FC_SUBSCRIPTION_TOPIC_RTK_CONNECT_STATUS = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 38), /*! * @brief Provides the mode in which the gimbal will interpret control commands @ up to 50Hz * @note This topic was added in August 2018. Your aircraft may require a FW update to enable this feature. * @details This topic will report the current control mode which can be set in the * DJI Go app, MSDK apps, or through Onboard SDK gimbal control APIs (see \\ref Gimbal::AngleData \"AngleData\" struct * for more information) * 数据结构： T_DjiFcSubscriptionGimbalControlMode */ DJI_FC_SUBSCRIPTION_TOPIC_GIMBAL_CONTROL_MODE = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 39), /*! * @brief Provides a number of flags which report different errors the aircraft may encounter in flight @ up to 50Hz * @note This topic was added in August 2018. Your aircraft may require a FW update to enable this feature. * @warning Most of the errors reported by this topic are cases where immediate action is required; you can use these * as a baseline for implementing safety-related error-handling routines. * 数据结构： T_DjiFcSubscriptionFlightAnomaly */ DJI_FC_SUBSCRIPTION_TOPIC_FLIGHT_ANOMALY = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 40), /*! * @brief Provides aircraft's position in a Cartesian frame @ up to 50Hz, without the need for GPS * @warning This topic does not follow a standard co-ordinate convention. Please read the details below for usage. * @details This is the only topic which can provide positioning information without having a GPS fix; though this * can be a big enabler please note the caveats of using this topic: * - The topic will use an origin that does not have a global reference, and is not published to the SDK. * - The topic uses a combination of VO and compass heading to identify the X-Y axes of its reference frame. This means * that if your compass performance is not good in an environment, there is no guarantee the X-Y axes will point to * North and East. * - The actual directions of the X-Y axes are currently not published to the SDK. * - If during a flight the compass performance were to change dramatically, the orientation of the X-Y axes may change * to re-align with North-East. The aircraft's position in X and Y may exhibit discontinuities in these cases. * - The reference frame is referred to as the Navigation Frame - Cartesian X,Y axes aligned with N,E directions on a best-effort * basis, and Z aligned to D (down) direction. * - A health flag for each axis provides some granularity on whether this data is valid or not. * * The key takeaway from these details is that this topic provides a best-effort attempt at providing position * information in the absence of absolute references (GPS, compass etc.), without guarantees of consistency if * environmental conditions change. So if your application is confined to a stable environment, or if you will * have GPS and compass available at all times, this topic can still provide useful data that cannot be otherwise * had. If using for control, make sure to have guards checking for the continuity of data. * * @note Since this topic relies on visual features and/or GPS, if your environment does not provide any of these * sources of data, the quality of this topic will reduce significantly. VO data quality will reduce if you are too high * above the ground. Make sure that the Vision Positioning System is enabled in DJI Go 4 before using this topic * (by default it is enabled). * @sensors IMU, VO, GPS(if available), RTK (if available), ultrasonic, magnetometer, barometer * @units m * 数据结构： T_DjiFcSubscriptionPositionVO */ DJI_FC_SUBSCRIPTION_TOPIC_POSITION_VO = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 41), /*! * @brief Provides obstacle info around the vehicle @ up to 100Hz * 数据结构： T_DjiFcSubscriptionAvoidData */ DJI_FC_SUBSCRIPTION_TOPIC_AVOID_DATA = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 42), /*! * @brief Provides status of whether the home point was set or not * 数据结构： T_DjiFcSubscriptionHomePointSetStatus */ DJI_FC_SUBSCRIPTION_TOPIC_HOME_POINT_SET_STATUS = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 43), /*! * @brief Provides homepoint information, the valid of the home point infomation can ref to the * topic DJI_FC_SUBSCRIPTION_TOPIC_HOME_POINT_SET_STATUS * 数据结构： T_DjiFcSubscriptionHomePointInfo */ DJI_FC_SUBSCRIPTION_TOPIC_HOME_POINT_INFO = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 44), /*! * @brief Provides three gimbal information, used for M300 * 数据结构： T_DjiFcSubscriptionThreeGimbalData */ DJI_FC_SUBSCRIPTION_TOPIC_THREE_GIMBAL_DATA = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 45), /*! * @brief Battery information topic name. Please refer to ::T_DjiFcSubscriptionSingleBatteryInfo for information about data structure. * 数据结构： T_DjiFcSubscriptionSingleBatteryInfo */ DJI_FC_SUBSCRIPTION_TOPIC_BATTERY_SINGLE_INFO_INDEX1 = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 46), /*! * @brief Battery information topic name. Please refer to ::T_DjiFcSubscriptionSingleBatteryInfo for information about data structure. * 数据结构： T_DjiFcSubscriptionSingleBatteryInfo */ DJI_FC_SUBSCRIPTION_TOPIC_BATTERY_SINGLE_INFO_INDEX2 = DJI_DATA_SUBSCRIPTION_TOPIC(DJI_DATA_SUBSCRIPTION_MODULE_FC, 47), /*! Total number of topics that can be subscribed。 */ DJI_FC_SUBSCRIPTION_TOPIC_TOTAL_NUMBER, } E_DjiFcSubscriptionTopic;"
+          - heading "typedef enum E_DjiFcSubscriptionDataHealthFlag" [level=3] [ref=f6e729]:
+            - link [ref=f6e730] [cursor=pointer]:
+              - /url: "#typedef-enum-e-djifcsubscriptiondatahealthflag"
+              - text: "#"
+            - text: typedef enum E_DjiFcSubscriptionDataHealthFlag
+          - paragraph [ref=f6e731]: 订阅数据的健康状态
+          - generic [ref=f6e732]:
+            - text: c
+            - code [ref=f6e734]: "typedef enum { DJI_FC_SUBSCRIPTION_DATA_NOT_HEALTH = 0, 订阅数据是健康的，订阅数据可用 DJI_FC_SUBSCRIPTION_DATA_HEALTH = 1, 订阅数据是不健康的，订阅数据不可用 } E_DjiFcSubscriptionDataHealthFlag;"
+          - heading "typedef enum E_DjiFcSubscriptionPositionSolutionProperty" [level=3] [ref=f6e741]:
+            - link [ref=f6e742] [cursor=pointer]:
+              - /url: "#typedef-enum-e-djifcsubscriptionpositionsolutionproperty"
+              - text: "#"
+            - text: typedef enum E_DjiFcSubscriptionPositionSolutionProperty
+          - paragraph [ref=f6e743]: 位置解属性
+          - generic [ref=f6e744]:
+            - text: c
+            - code [ref=f6e746]: "typedef enum { DJI_FC_SUBSCRIPTION_POSITION_SOLUTION_PROPERTY_NOT_AVAILABLE = 0, 位置解数据不可用 DJI_FC_SUBSCRIPTION_POSITION_SOLUTION_PROPERTY_FIX_POSITION = 1, 位置由FIX POSITION命令指定 DJI_FC_SUBSCRIPTION_POSITION_SOLUTION_PROPERTY_FIX_HEIGHT_AUTO = 2, 位置由FIX HEIGHT / AUTO命令指定 DJI_FC_SUBSCRIPTION_POSITION_SOLUTION_PROPERTY_INSTANTANEOUS_DOPPLER_COMPUTE_VELOCITY = 8, 速度由即时多普勒信息导出 DJI_FC_SUBSCRIPTION_POSITION_SOLUTION_PROPERTY_SINGLE_PNT_SOLUTION = 16, 单点位置解 DJI_FC_SUBSCRIPTION_POSITION_SOLUTION_PROPERTY_PSEUDORANGE_DIFFERENTIAL_SOLUTION = 17, 伪距差分解 DJI_FC_SUBSCRIPTION_POSITION_SOLUTION_PROPERTY_SBAS_CORRECTION_CALCULATED = 18, SBAS定位 DJI_FC_SUBSCRIPTION_POSITION_SOLUTION_PROPERTY_KALMAN_FILTER_WITHOUT_OBSERVATION_PROPAGATED = 19, 由一个没有新观测值的卡尔曼滤波器输出 DJI_FC_SUBSCRIPTION_POSITION_SOLUTION_PROPERTY_OMNISTAR_VBS_POSITION = 20, OmniSTAR VBS 位置 (L1 sub-metre) DJI_FC_SUBSCRIPTION_POSITION_SOLUTION_PROPERTY_FLOAT_L1_AMBIGUITY = 32, L1浮点解 DJI_FC_SUBSCRIPTION_POSITION_SOLUTION_PROPERTY_FLOAT_IONOSPHERIC_FREE_AMBIGUITY = 33, 消电离层浮点解 DJI_FC_SUBSCRIPTION_POSITION_SOLUTION_PROPERTY_FLOAT_SOLUTION = 34, 窄巷浮点解 DJI_FC_SUBSCRIPTION_POSITION_SOLUTION_PROPERTY_L1_AMBIGUITY_INT = 48, L1固定解 DJI_FC_SUBSCRIPTION_POSITION_SOLUTION_PROPERTY_WIDE_LANE_AMBIGUITY_INT = 49, 宽巷固定解 DJI_FC_SUBSCRIPTION_POSITION_SOLUTION_PROPERTY_NARROW_INT = 50, 窄巷固定解 } E_DjiFcSubscriptionPositionSolutionProperty;"
+          - heading "typedef enum E_DjiFcSubscriptionGpsFixState" [level=3] [ref=f6e765]:
+            - link [ref=f6e766] [cursor=pointer]:
+              - /url: "#typedef-enum-e-djifcsubscriptiongpsfixstate"
+              - text: "#"
+            - text: typedef enum E_DjiFcSubscriptionGpsFixState
+          - paragraph [ref=f6e767]: GPS 定位状态
+          - generic [ref=f6e768]:
+            - text: c
+            - code [ref=f6e770]: "typedef enum { DJI_FC_SUBSCRIPTION_GPS_FIX_STATE_NO_FIX = 0, GPS 未获取到定位信息 DJI_FC_SUBSCRIPTION_GPS_FIX_STATE_DEAD_RECKONING_ONLY = 1, GPS推算得到 GPS 位置 DJI_FC_SUBSCRIPTION_GPS_FIX_STATE_2D_FIX = 2, 包含纬度/经度（或X / Y）的水平位置已定位 DJI_FC_SUBSCRIPTION_GPS_FIX_STATE_3D_FIX = 3, 包含纬度/经度/海拔（或X / Y / Z）的水平和垂直位置已定位 DJI_FC_SUBSCRIPTION_GPS_FIX_STATE_GPS_PLUS_DEAD_RECKONING = 4, GPS推测计算位置 DJI_FC_SUBSCRIPTION_GPS_FIX_STATE_TIME_ONLY_FIX = 5, 仅时间信息有效 } E_DjiFcSubscriptionGpsFixState;"
+          - heading "typedef enum E_DjiFcSubscriptionFlightStatus" [level=3] [ref=f6e780]:
+            - link [ref=f6e781] [cursor=pointer]:
+              - /url: "#typedef-enum-e-djifcsubscriptionflightstatus"
+              - text: "#"
+            - text: typedef enum E_DjiFcSubscriptionFlightStatus
+          - paragraph [ref=f6e782]: 无人机飞行状态
+          - generic [ref=f6e783]:
+            - text: c
+            - code [ref=f6e785]: "typedef enum { DJI_FC_SUBSCRIPTION_FLIGHT_STATUS_STOPED = 0, 无人机在地面上且电机静止 DJI_FC_SUBSCRIPTION_FLIGHT_STATUS_ON_GROUND = 1, 无人机在地面上，但电机仍在转动 DJI_FC_SUBSCRIPTION_FLIGHT_STATUS_IN_AIR = 2, 无人机在空中 } E_DjiFcSubscriptionFlightStatus;"
+          - heading "typedef enum E_DjiFcSubscriptionDisplayMode" [level=3] [ref=f6e792]:
+            - link [ref=f6e793] [cursor=pointer]:
+              - /url: "#typedef-enum-e-djifcsubscriptiondisplaymode"
+              - text: "#"
+            - text: typedef enum E_DjiFcSubscriptionDisplayMode
+          - generic [ref=f6e794]:
+            - text: c
+            - code [ref=f6e796]: "typedef enum { /*! 此模式需要用户手动控制飞行器在空中保持稳定。 */ DJI_FC_SUBSCRIPTION_DISPLAY_MODE_MANUAL_CTRL = 0, /*! 此模式，飞行器可以保持姿态稳定并仅使用气压计定位来控制姿态。飞行器不能自动定位和稳定悬停。*/ DJI_FC_SUBSCRIPTION_DISPLAY_MODE_ATTITUDE = 1, DJI_FC_SUBSCRIPTION_DISPLAY_MODE_RESERVED_2 = 2, DJI_FC_SUBSCRIPTION_DISPLAY_MODE_RESERVED_3 = 3, DJI_FC_SUBSCRIPTION_DISPLAY_MODE_RESERVED_4 = 4, DJI_FC_SUBSCRIPTION_DISPLAY_MODE_RESERVED_5 = 5, /*! 飞行器在普通GPS模式。在此模式，飞行器可以自动定位并稳定悬停。飞行器对于命令的反应速度中等。*/ DJI_FC_SUBSCRIPTION_DISPLAY_MODE_P_GPS = 6, DJI_FC_SUBSCRIPTION_DISPLAY_MODE_RESERVED_7 = 7, DJI_FC_SUBSCRIPTION_DISPLAY_MODE_RESERVED_8 = 8, /*! 在热点模式。 */ DJI_FC_SUBSCRIPTION_DISPLAY_MODE_HOTPOINT_MODE = 9, /*! 在此模式，用户可以推动油门杆以完成稳定降落。*/ DJI_FC_SUBSCRIPTION_DISPLAY_MODE_ASSISTED_TAKEOFF = 10, /*! 在此模式，飞行器可以自动启动电机，爬升并最终悬停。*/ DJI_FC_SUBSCRIPTION_DISPLAY_MODE_AUTO_TAKEOFF = 11, /*! 在此模式，飞行器可以自动降落。 */ DJI_FC_SUBSCRIPTION_DISPLAY_MODE_AUTO_LANDING = 12, DJI_FC_SUBSCRIPTION_DISPLAY_MODE_RESERVED_13 = 13, DJI_FC_SUBSCRIPTION_DISPLAY_MODE_RESERVED_14 = 14, /*! 在此模式，飞行器可以自动返回前一个返航点。有三种模式：智能返航、低电量返航以及故障返航。 */ DJI_FC_SUBSCRIPTION_DISPLAY_MODE_NAVI_GO_HOME = 15, DJI_FC_SUBSCRIPTION_DISPLAY_MODE_RESERVED_16 = 16, /*! 在此模式，飞行器由SDK API控制。用户可以直接定义水平方向和垂直方向的的控制模式并向飞行棋发送数据。*/ DJI_FC_SUBSCRIPTION_DISPLAY_MODE_NAVI_SDK_CTRL = 17, DJI_FC_SUBSCRIPTION_DISPLAY_MODE_RESERVED_18 = 18, DJI_FC_SUBSCRIPTION_DISPLAY_MODE_RESERVED_19 = 19, DJI_FC_SUBSCRIPTION_DISPLAY_MODE_RESERVED_20 = 20, DJI_FC_SUBSCRIPTION_DISPLAY_MODE_RESERVED_21 = 21, DJI_FC_SUBSCRIPTION_DISPLAY_MODE_RESERVED_22 = 22, DJI_FC_SUBSCRIPTION_DISPLAY_MODE_RESERVED_23 = 23, DJI_FC_SUBSCRIPTION_DISPLAY_MODE_RESERVED_24 = 24, DJI_FC_SUBSCRIPTION_DISPLAY_MODE_RESERVED_25 = 25, DJI_FC_SUBSCRIPTION_DISPLAY_MODE_RESERVED_26 = 26, DJI_FC_SUBSCRIPTION_DISPLAY_MODE_RESERVED_27 = 27, DJI_FC_SUBSCRIPTION_DISPLAY_MODE_RESERVED_28 = 28, DJI_FC_SUBSCRIPTION_DISPLAY_MODE_RESERVED_29 = 29, DJI_FC_SUBSCRIPTION_DISPLAY_MODE_RESERVED_30 = 30, DJI_FC_SUBSCRIPTION_DISPLAY_MODE_RESERVED_31 = 31, DJI_FC_SUBSCRIPTION_DISPLAY_MODE_RESERVED_32 = 32, /*! 飞行器迫降，可能是由于低电量。*/ DJI_FC_SUBSCRIPTION_DISPLAY_MODE_FORCE_AUTO_LANDING = 33, DJI_FC_SUBSCRIPTION_DISPLAY_MODE_RESERVED_34 = 34, DJI_FC_SUBSCRIPTION_DISPLAY_MODE_RESERVED_35 = 35, DJI_FC_SUBSCRIPTION_DISPLAY_MODE_RESERVED_36 = 36, DJI_FC_SUBSCRIPTION_DISPLAY_MODE_RESERVED_37 = 37, DJI_FC_SUBSCRIPTION_DISPLAY_MODE_RESERVED_38 = 38, DJI_FC_SUBSCRIPTION_DISPLAY_MODE_RESERVED_39 = 39, /*! 飞行器会搜寻当遥控器没有断连的前一个位置。*/ DJI_FC_SUBSCRIPTION_DISPLAY_MODE_SEARCH_MODE = 40, /*! 点击启动的模式。每当用户解锁电机，这将为第一个模式。 */ DJI_FC_SUBSCRIPTION_DISPLAY_MODE_ENGINE_START = 41, DJI_FC_SUBSCRIPTION_DISPLAY_MODE_RESERVED_42 = 42, DJI_FC_SUBSCRIPTION_DISPLAY_MODE_RESERVED_43 = 42, } E_DjiFcSubscriptionDisplayMode;"
+          - heading "typedef enum E_DjiFcSubscriptionHomePointSetStatus" [level=3] [ref=f6e856]:
+            - link [ref=f6e857] [cursor=pointer]:
+              - /url: "#typedef-enum-e-djifcsubscriptionhomepointsetstatus"
+              - text: "#"
+            - text: typedef enum E_DjiFcSubscriptionHomePointSetStatus
+          - paragraph [ref=f6e858]: 返航点设置状态
+          - generic [ref=f6e859]:
+            - text: c
+            - code [ref=f6e861]: "typedef enum { DJI_FC_SUBSCRIPTION_HOME_POINT_SET_STATUS_FAILED = 0, 未设置 DJI_FC_SUBSCRIPTION_HOME_POINT_SET_STATUS_SUCCESS = 1, 成功设置 } E_DjiFcSubscriptionHomePointSetStatus;"
+          - heading "typedef struct T_DjiFcSubscriptionQuaternion" [level=3] [ref=f6e867]:
+            - link [ref=f6e868] [cursor=pointer]:
+              - /url: "#typedef-struct-t-djifcsubscriptionquaternion"
+              - text: "#"
+            - text: typedef struct T_DjiFcSubscriptionQuaternion
+          - paragraph [ref=f6e869]: 四元数
+          - generic [ref=f6e870]:
+            - text: c
+            - code [ref=f6e872]: "typedef struct Quaternion { dji_f32_t q0; w,使用弧度制 (转换为旋转矩阵或欧拉角) dji_f32_t q1; x,使用弧度制 (转换为旋转矩阵或欧拉角) dji_f32_t q2; y,使用弧度制 (转换为旋转矩阵或欧拉角) dji_f32_t q3; z,使用弧度制 (转换为旋转矩阵或欧拉角) } T_DjiFcSubscriptionQuaternion;"
+          - heading "typedef struct T_DjiFcSubscriptionAccelerationGround" [level=3] [ref=f6e880]:
+            - link [ref=f6e881] [cursor=pointer]:
+              - /url: "#typedef-struct-t-djifcsubscriptionaccelerationground"
+              - text: "#"
+            - text: typedef struct T_DjiFcSubscriptionAccelerationGround
+          - generic [ref=f6e882]:
+            - text: c
+            - code [ref=f6e884]: typedef T_DjiVector3f T_DjiFcSubscriptionAccelerationGround;
+          - heading "typedef struct T_DjiFcSubscriptionAccelerationBody" [level=3] [ref=f6e887]:
+            - link [ref=f6e888] [cursor=pointer]:
+              - /url: "#typedef-struct-t-djifcsubscriptionaccelerationbody"
+              - text: "#"
+            - text: typedef struct T_DjiFcSubscriptionAccelerationBody
+          - generic [ref=f6e889]:
+            - text: c
+            - code [ref=f6e891]: typedef T_DjiVector3f T_DjiFcSubscriptionAccelerationBody;
+          - heading "typedef struct T_DjiFcSubscriptionAccelerationRaw" [level=3] [ref=f6e894]:
+            - link [ref=f6e895] [cursor=pointer]:
+              - /url: "#typedef-struct-t-djifcsubscriptionaccelerationraw"
+              - text: "#"
+            - text: typedef struct T_DjiFcSubscriptionAccelerationRaw
+          - generic [ref=f6e896]:
+            - text: c
+            - code [ref=f6e898]: typedef T_DjiVector3f T_DjiFcSubscriptionAccelerationRaw;
+          - heading "typedef struct T_DjiFcSubscriptionVelocity" [level=3] [ref=f6e901]:
+            - link [ref=f6e902] [cursor=pointer]:
+              - /url: "#typedef-struct-t-djifcsubscriptionvelocity"
+              - text: "#"
+            - text: typedef struct T_DjiFcSubscriptionVelocity
+          - generic [ref=f6e903]:
+            - text: c
+            - code [ref=f6e905]: "typedef struct Velocity { T_DjiVector3f data; 速度数值 uint8_t health : 1; 健康状态，该值可为：E_DjiFcSubscriptionDataHealthFlag 中的任意值 uint8_t reserve : 7; 保留 } T_DjiFcSubscriptionVelocity;"
+          - heading "typedef struct T_DjiFcSubscriptionAngularRateFusioned" [level=3] [ref=f6e912]:
+            - link [ref=f6e913] [cursor=pointer]:
+              - /url: "#typedef-struct-t-djifcsubscriptionangularratefusioned"
+              - text: "#"
+            - text: typedef struct T_DjiFcSubscriptionAngularRateFusioned
+          - generic [ref=f6e914]:
+            - text: c
+            - code [ref=f6e916]: typedef T_DjiVector3f T_DjiFcSubscriptionAngularRateFusioned;
+          - heading "typedef struct T_DjiFcSubscriptionAngularRateRaw" [level=3] [ref=f6e919]:
+            - link [ref=f6e920] [cursor=pointer]:
+              - /url: "#typedef-struct-t-djifcsubscriptionangularrateraw"
+              - text: "#"
+            - text: typedef struct T_DjiFcSubscriptionAngularRateRaw
+          - generic [ref=f6e921]:
+            - text: c
+            - code [ref=f6e923]: typedef T_DjiVector3f T_DjiFcSubscriptionAngularRateRaw;
+          - heading "typedef struct T_DjiFcSubscriptionPositionFused" [level=3] [ref=f6e926]:
+            - link [ref=f6e927] [cursor=pointer]:
+              - /url: "#typedef-struct-t-djifcsubscriptionpositionfused"
+              - text: "#"
+            - text: typedef struct T_DjiFcSubscriptionPositionFused
+          - generic [ref=f6e928]:
+            - text: c
+            - code [ref=f6e930]: "typedef struct PositionFused { dji_f64_t longitude; /*!< 经度, 单位: rad。 */ dji_f64_t latitude; /*!< 纬度, 单位: rad。 */ dji_f32_t altitude; /*!< 高度，WGS 84 参考椭球体，单位： m。*/ uint16_t visibleSatelliteNumber; /*!< 可视的卫星数量。 */ } T_DjiFcSubscriptionPositionFused;"
+          - heading "typedef struct T_DjiFcSubscriptionGpsPosition" [level=3] [ref=f6e938]:
+            - link [ref=f6e939] [cursor=pointer]:
+              - /url: "#typedef-struct-t-djifcsubscriptiongpsposition"
+              - text: "#"
+            - text: typedef struct T_DjiFcSubscriptionGpsPosition
+          - paragraph [ref=f6e940]: GPS位置
+          - generic [ref=f6e941]:
+            - text: c
+            - code [ref=f6e943]: typedef T_DjiVector3d T_DjiFcSubscriptionGpsPosition;
+          - heading "typedef struct T_DjiFcSubscriptionGpsVelocity" [level=3] [ref=f6e946]:
+            - link [ref=f6e947] [cursor=pointer]:
+              - /url: "#typedef-struct-t-djifcsubscriptiongpsvelocity"
+              - text: "#"
+            - text: typedef struct T_DjiFcSubscriptionGpsVelocity
+          - paragraph [ref=f6e948]: GPS速度
+          - generic [ref=f6e949]:
+            - text: c
+            - code [ref=f6e951]: typedef T_DjiVector3f T_DjiFcSubscriptionGpsVelocity;
+          - heading "typedef struct T_DjiFcSubscriptionGpsDetails" [level=3] [ref=f6e954]:
+            - link [ref=f6e955] [cursor=pointer]:
+              - /url: "#typedef-struct-t-djifcsubscriptiongpsdetails"
+              - text: "#"
+            - text: typedef struct T_DjiFcSubscriptionGpsDetails
+          - paragraph [ref=f6e956]: GPS详情
+          - generic [ref=f6e957]:
+            - text: c
+            - code [ref=f6e959]: "typedef struct GpsDetail { dji_f32_t hdop; /*!< 水平分量精度因子, <1: 理想, 1-2: 优秀, 2-5: 良好, 5-10: 中等, 10-20: 一般, >20: 弱。 */ dji_f32_t pdop; /*!< 位置精度因子, <1: 理想, 1-2: 优秀, 2-5: 良好, 5-10: 中等, 10-20: 一般, >20: 弱。 */ dji_f32_t fixState; /*!< GPS 修复状态, 可以为E_DjiFcSubscriptionGpsFixState中的任何状态，以外的值是无效的。*/ dji_f32_t vacc; /*!< 垂直位置准确性 (mm), 越小越好 。 */ dji_f32_t hacc; /*!< 水平位置准确性 (mm), 越小越好 。 */ dji_f32_t sacc; /*!< 速度准确性 (cm/s), 越小越好。 */ uint32_t gpsSatelliteNumberUsed; /*!< 用于修复定位的GPS卫星数量 */ uint32_t glonassSatelliteNumberUsed; /*!< 用于修复定位的GLONASS卫星数量 */ uint16_t totalSatelliteNumberUsed; /*!< 用于修复定位的卫星数量 */ uint16_t gpsCounter; /*!< 发送GPS数据的累计次数 */ } T_DjiFcSubscriptionGpsDetails;"
+          - heading "typedef struct T_DjiFcSubscriptionRtkPosition" [level=3] [ref=f6e973]:
+            - link [ref=f6e974] [cursor=pointer]:
+              - /url: "#typedef-struct-t-djifcsubscriptionrtkposition"
+              - text: "#"
+            - text: typedef struct T_DjiFcSubscriptionRtkPosition
+          - generic [ref=f6e975]:
+            - text: c
+            - code [ref=f6e977]: "typedef struct PositionData { dji_f64_t longitude; /*!< 精度，单位： deg。 */ dji_f64_t latitude; /*!< 纬度，单位： deg。 */ dji_f32_t hfsl; /*!< 高于海平面高度，单位： m。 */ } T_DjiFcSubscriptionRtkPosition;"
+          - heading "typedef struct T_DjiFcSubscriptionRtkVelocity" [level=3] [ref=f6e984]:
+            - link [ref=f6e985] [cursor=pointer]:
+              - /url: "#typedef-struct-t-djifcsubscriptionrtkvelocity"
+              - text: "#"
+            - text: typedef struct T_DjiFcSubscriptionRtkVelocity
+          - generic [ref=f6e986]:
+            - text: c
+            - code [ref=f6e988]: typedef T_DjiVector3f T_DjiFcSubscriptionRtkVelocity;
+          - heading "typedef struct T_DjiFcSubscriptionCompass" [level=3] [ref=f6e991]:
+            - link [ref=f6e992] [cursor=pointer]:
+              - /url: "#typedef-struct-t-djifcsubscriptioncompass"
+              - text: "#"
+            - text: typedef struct T_DjiFcSubscriptionCompass
+          - paragraph [ref=f6e993]: 用于数据广播的结构体，返回磁力计读数
+          - generic [ref=f6e994]:
+            - text: c
+            - code [ref=f6e996]: "typedef struct Mag { int16_t x; int16_t y; int16_t z; } T_DjiFcSubscriptionCompass;"
+          - heading "typedef struct T_DjiFcSubscriptionRC" [level=3] [ref=f6e1003]:
+            - link [ref=f6e1004] [cursor=pointer]:
+              - /url: "#typedef-struct-t-djifcsubscriptionrc"
+              - text: "#"
+            - text: typedef struct T_DjiFcSubscriptionRC
+          - paragraph [ref=f6e1005]: 数据广播和数据订阅的结构体，返回RC读数
+          - generic [ref=f6e1006]:
+            - text: c
+            - code [ref=f6e1008]: "typedef struct RC { int16_t roll; /*!< [-10000,10000] */ int16_t pitch; /*!< [-10000,10000] */ int16_t yaw; /*!< [-10000,10000] */ int16_t throttle; /*!< [-10000,10000] */ int16_t mode; /*!< [-10000,10000] */ /*!< M100 [P: -8000, A: 0, F: 8000] */ int16_t gear; /*!< [-10000,10000] */ /*!< M100 [Up: -10000, Down: -4545] */ } T_DjiFcSubscriptionRC;"
+          - heading "typedef struct T_DjiFcSubscriptionGimbalAngles" [level=3] [ref=f6e1020]:
+            - link [ref=f6e1021] [cursor=pointer]:
+              - /url: "#typedef-struct-t-djifcsubscriptiongimbalangles"
+              - text: "#"
+            - text: typedef struct T_DjiFcSubscriptionGimbalAngles
+          - generic [ref=f6e1022]:
+            - text: c
+            - code [ref=f6e1024]: typedef T_DjiVector3f T_DjiFcSubscriptionGimbalAngles;
+          - heading "typedef struct T_DjiFcSubscriptionGimbalStatus" [level=3] [ref=f6e1027]:
+            - link [ref=f6e1028] [cursor=pointer]:
+              - /url: "#typedef-struct-t-djifcsubscriptiongimbalstatus"
+              - text: "#"
+            - text: typedef struct T_DjiFcSubscriptionGimbalStatus
+          - paragraph [ref=f6e1029]: TOPIC_GIMBAL_STATUS的结构体
+          - generic [ref=f6e1030]:
+            - text: c
+            - code [ref=f6e1032]: "typedef struct GimbalStatus { uint32_t mountStatus: 1; /*!< 1 - 云台安装, 0 - 云台未安装*/ uint32_t isBusy: 1; uint32_t pitchLimited: 1; /*!< 1 - 轴达极限, 0 - 未达 */ uint32_t rollLimited: 1; /*!< 1 - 轴达极限, 0 - 未达 */ uint32_t yawLimited: 1; /*!< 1 - 轴达极限, 0 - 未达 */ uint32_t calibrating: 1; /*!< 1 - 校准中, 0 - 未校准 */ uint32_t prevCalibrationgResult: 1; /*!< 1 - 成功, 0 - 失败 */ uint32_t installedDirection: 1; /*!< 1 - 为OSMO反转, 0 - 普通 */ uint32_t disabled_mvo: 1; uint32_t gear_show_unable: 1; uint32_t gyroFalut: 1; /*!< 1 - 错误, 0 - 正常 */ uint32_t escPitchStatus: 1; /*!< 1 - Pitch数据是正常的, 0 - 错误 */ uint32_t escRollStatus: 1; /*!< 1 - Roll数据是正常的, 0 - 错误 */ uint32_t escYawStatus: 1; /*!< 1 - Yaw数据是正常的, 0 - 错误 */ uint32_t droneDataRecv: 1; /*!< 1 - 正常 , 0 - 错误 */ uint32_t initUnfinished: 1; /*!< 1 - 初始化完成, 0 - 未完成 */ uint32_t FWUpdating: 1; /*!< 1 - 更新中, 0 - 未更新 */ uint32_t reserved2: 15; } T_DjiFcSubscriptionGimbalStatus;"
+          - heading "typedef struct T_DjiFcSubscriptionSingleBatteryState" [level=3] [ref=f6e1054]:
+            - link [ref=f6e1055] [cursor=pointer]:
+              - /url: "#typedef-struct-t-djifcsubscriptionsinglebatterystate"
+              - text: "#"
+            - text: typedef struct T_DjiFcSubscriptionSingleBatteryState
+          - generic [ref=f6e1056]:
+            - text: c
+            - code [ref=f6e1058]: "typedef struct { uint32_t reserved: 12; uint32_t cellBreak: 5; /*! 0:normal;other:Undervoltage core index(0x01-0x1F)*/ uint32_t selfCheckError: 3; /*! enum-type: DJISmartBatterySelfCheck*/ uint32_t reserved1: 7; uint32_t batteryClosedReason: 5; /*! enum-type: DJI_BETTERY_CLOSED_REASON*/ uint8_t reserved2: 6; /*! [0]CHG state；[1]DSG state；[2]ORING state*/ uint8_t batSOHState: 2; /*! enum-type: DJISmartBatterySohState*/ uint8_t maxCycleLimit: 6; /*! APP:cycle_limit*10*/ uint8_t reserved3: 2; uint16_t lessBattery: 1; uint16_t batteryCommunicationAbnormal: 1; uint16_t reserved4: 3; uint16_t hasCellBreak: 1; uint16_t reserved5: 4; uint16_t isBatteryEmbed: 1; /*! 0:embed;1:unmebed*/ uint16_t heatState: 2; /*!enum-type: DJISmartBatteryHeatState*/ uint16_t socState: 3; /*!enum-type: DJISmartBatterySocWarning*/ } T_DjiFcSubscriptionSingleBatteryState;"
+          - heading "typedef struct T_DjiFcSubscriptionWholeBatteryInfo" [level=3] [ref=f6e1079]:
+            - link [ref=f6e1080] [cursor=pointer]:
+              - /url: "#typedef-struct-t-djifcsubscriptionwholebatteryinfo"
+              - text: "#"
+            - text: typedef struct T_DjiFcSubscriptionWholeBatteryInfo
+          - generic [ref=f6e1081]:
+            - text: c
+            - code [ref=f6e1083]: "typedef struct BatteryWholeInfo { uint32_t capacity; /*!< 电池 capacity，单位： mAh。 */ int32_t voltage; /*!< 电池 voltage，单位： mV。 */ int32_t current; /*!< 电池 current，单位： mA。 */ uint8_t percentage; /*!< 电池 capacity percentage，单位： 1%。 */ } T_DjiFcSubscriptionWholeBatteryInfo;"
+          - heading "typedef struct T_DjiFcSubscriptionSingleBatteryInfo" [level=3] [ref=f6e1091]:
+            - link [ref=f6e1092] [cursor=pointer]:
+              - /url: "#typedef-struct-t-djifcsubscriptionsinglebatteryinfo"
+              - text: "#"
+            - text: typedef struct T_DjiFcSubscriptionSingleBatteryInfo
+          - generic [ref=f6e1093]:
+            - text: c
+            - code [ref=f6e1095]: "typedef struct BatterySingleInfo { uint8_t reserve; uint8_t batteryIndex; int32_t currentVoltage; /*! uint:mV*/ int32_t currentElectric; /*!uint:mA*/ uint32_t fullCapacity; /*!uint:mAh*/ uint32_t remainedCapacity; /*!uint:mAh*/ int16_t batteryTemperature; /*!uint:℃*/ uint8_t cellCount; uint8_t batteryCapacityPercent; /*!uint:%*/ T_DjiFcSubscriptionSingleBatteryState batteryState; uint8_t reserve1; uint8_t reserve2; uint8_t SOP; /*!相对功率百分比*/ } T_DjiFcSubscriptionSingleBatteryInfo;"
+          - heading "typedef struct T_DjiFcSubscriptionControlDevice" [level=3] [ref=f6e1112]:
+            - link [ref=f6e1113] [cursor=pointer]:
+              - /url: "#typedef-struct-t-djifcsubscriptioncontroldevice"
+              - text: "#"
+            - text: typedef struct T_DjiFcSubscriptionControlDevice
+          - generic [ref=f6e1114]:
+            - text: c
+            - code [ref=f6e1116]: "typedef struct SDKCtrlInfo { uint8_t controlMode; /*!< See CtlrMode in dji_status.hpp*/ uint8_t deviceStatus: 3; /*!< For M300 and M210V2(firmware version V01.00.0690 and later):0->rc 1->app 4->serial; Other: 0->rc 1->app 2->serial*/ uint8_t flightStatus: 1; /*!< 1->opensd 0->close */ uint8_t vrcStatus: 1; uint8_t reserved: 3; } T_DjiFcSubscriptionControlDevice;"
+          - heading "typedef struct SyncTimestamp" [level=3] [ref=f6e1126]:
+            - link [ref=f6e1127] [cursor=pointer]:
+              - /url: "#typedef-struct-synctimestamp"
+              - text: "#"
+            - text: typedef struct SyncTimestamp
+          - generic [ref=f6e1128]:
+            - text: c
+            - code [ref=f6e1130]: "typedef struct SyncTimestamp { uint32_t time2p5ms; /*!< 时钟时间为 2.5ms 的倍数。 同步定时器以 400Hz 运行，该字段以整数步长递增 */ uint32_t time1ns; /*!< 2.5ms 脉冲的纳秒时间偏移 */ uint32_t resetTime2p5ms; /*!< 自硬件同步开始以来经过的时钟时间（以 2.5 毫秒的倍数计）*/ uint16_t index; /*!< 这是您在使用上面的 setSyncFreq API 时填写的标签字段； 使用它来识别具有同步数据的数据包。 这在您使用 freqInHz = 0 调用 setSyncFreq API 时很有用，因此您可以获得一个可以用标签唯一标识的单个脉冲 - 允许您创建自己的具有唯一可标识脉冲的脉冲序列。 */ uint8_t flag; /*!< 当数据包对应于硬件脉冲时为真，否则为假。用户可以请求以比硬件线路更高的频率发送软件数据包。*/ } SyncTimestamp;"
+          - heading "typedef struct T_DjiFcSubscriptionHardSync" [level=3] [ref=f6e1139]:
+            - link [ref=f6e1140] [cursor=pointer]:
+              - /url: "#typedef-struct-t-djifcsubscriptionhardsync"
+              - text: "#"
+            - text: typedef struct T_DjiFcSubscriptionHardSync
+          - generic [ref=f6e1141]:
+            - text: c
+            - code [ref=f6e1143]: "typedef struct HardSyncData { SyncTimestamp ts; /*!< 传入数据的时间戳 */ struct Quaternion q; /*!< 四元数 */ T_DjiVector3f a; /*!< 加速度计读数单元: g */ T_DjiVector3f w; /*!< 陀螺仪读数单元: rad/sec */ } T_DjiFcSubscriptionHardSync;"
+          - heading "typedef struct T_DjiFcSubscriptionRCWithFlagData" [level=3] [ref=f6e1151]:
+            - link [ref=f6e1152] [cursor=pointer]:
+              - /url: "#typedef-struct-t-djifcsubscriptionrcwithflagdata"
+              - text: "#"
+            - text: typedef struct T_DjiFcSubscriptionRCWithFlagData
+          - paragraph [ref=f6e1153]: 时间戳
+          - generic [ref=f6e1154]:
+            - text: c
+            - code [ref=f6e1156]: "typedef struct RCWithFlagData { dji_f32_t pitch; /*!< 上 = -0.999, 中 = 0.000, 上 =0.999 */ dji_f32_t roll; /*!< 左 = -0.999, 中 = 0.000, 右 =0.999 */ dji_f32_t yaw; /*!< 左 = -0.999, 中 = 0.000, 右 =0.999 */ dji_f32_t throttle; /*!< 下 = -0.999, 中 = 0.000, 上 =0.999 */ struct { uint8_t logicConnected: 1; /*!< 0 如果天空或地面侧断开 3 秒 */ uint8_t skyConnected: 1; /*!< 天空端连接，接收器与FC相连 */ uint8_t groundConnected: 1; /*!< 地面段连接，RC开启并与FC相连 */ uint8_t appConnected: 1; /*!< 移动设备App与RC相连 */ uint8_t reserved: 4; } flag; } T_DjiFcSubscriptionRCWithFlagData;"
+          - heading "typedef struct ESCStatusIndividual" [level=3] [ref=f6e1171]:
+            - link [ref=f6e1172] [cursor=pointer]:
+              - /url: "#typedef-struct-escstatusindividual"
+              - text: "#"
+            - text: typedef struct ESCStatusIndividual
+          - generic [ref=f6e1173]:
+            - text: c
+            - code [ref=f6e1175]: "typedef struct ESCStatusIndividual { int16_t current; /*!< ESC 电流，单位： mA */ int16_t speed; /*!< ESC 速度，单位： rpm */ uint16_t voltage; /*!< 从电池到ESC的输入电压，单位： mV */ int16_t temperature; /*!< ESC 温度，单位： degree C */ uint16_t stall: 1; /*!< 电机堵转 */ uint16_t empty: 1; /*!< 电机无负载 */ uint16_t unbalanced: 1; /*!< 电机速度不平衡 */ uint16_t escDisconnected: 1; /*!< ESC 断连 */ uint16_t temperatureHigh: 1; /*!< 温度较高 */ uint16_t reserved: 11; } ESCStatusIndividual;"
+          - heading "typedef struct T_DjiFcSubscriptionEscData" [level=3] [ref=f6e1189]:
+            - link [ref=f6e1190] [cursor=pointer]:
+              - /url: "#typedef-struct-t-djifcsubscriptionescdata"
+              - text: "#"
+            - text: typedef struct T_DjiFcSubscriptionEscData
+          - generic [ref=f6e1191]:
+            - text: c
+            - code [ref=f6e1193]: "typedef struct EscData { ESCStatusIndividual esc[8]; } T_DjiFcSubscriptionEscData;"
+          - heading "typedef struct T_DjiFcSubscriptionRTKConnectStatus" [level=3] [ref=f6e1198]:
+            - link [ref=f6e1199] [cursor=pointer]:
+              - /url: "#typedef-struct-t-djifcsubscriptionrtkconnectstatus"
+              - text: "#"
+            - text: typedef struct T_DjiFcSubscriptionRTKConnectStatus
+          - generic [ref=f6e1200]:
+            - text: c
+            - code [ref=f6e1202]: "typedef struct RTKConnectStatus { uint16_t rtkConnected: 1; uint16_t reserve: 15; } T_DjiFcSubscriptionRTKConnectStatus;"
+          - heading "typedef struct T_DjiFcSubscriptionFlightAnomaly" [level=3] [ref=f6e1208]:
+            - link [ref=f6e1209] [cursor=pointer]:
+              - /url: "#typedef-struct-t-djifcsubscriptionflightanomaly"
+              - text: "#"
+            - text: typedef struct T_DjiFcSubscriptionFlightAnomaly
+          - generic [ref=f6e1210]:
+            - text: c
+            - code [ref=f6e1212]: "typedef struct FlightAnomaly { uint32_t impactInAir: 1; /*!< 0: No impact, 1: Impact happens in Air */ uint32_t randomFly: 1; /*!< 0: Normal, 1: Randomly fly in GPS mode without stick input*/ uint32_t heightCtrlFail: 1; /*!< 0: Height control normal, 1: Height control failed */ uint32_t rollPitchCtrlFail: 1; /*!< 0: Tilt control normal, 1: Tilt control failed */ uint32_t yawCtrlFail: 1; /*!< 0: Yaw control normal, 1: Yaw control failed */ uint32_t aircraftIsFalling: 1; /*!< 0: Aircraft is not falling, 1: Aircraft is falling */ uint32_t strongWindLevel1: 1; /*!< 0: Wind is under big wind level 1, 1: wind is stronger than big wind level 1*/ uint32_t strongWindLevel2: 1; /*!< 0: Wind is under big wind level 2, 1: wind is stronger than big wind level 2*/ uint32_t compassInstallationError: 1; /*!< 0: Compass install right, 1: Compass install error */ uint32_t imuInstallationError: 1; /*!< 0: IMU install right, 1: IMU install error */ uint32_t escTemperatureHigh: 1; /*!< 0: ESC temperature is normal, 1: ESC temperature is high */ uint32_t atLeastOneEscDisconnected: 1; /*!< 0: No ESC disconnected, 1: At least one ESC is disconnected */ uint32_t gpsYawError: 1; /*!< 0: No GPS yaw error, 1: GPS yaw error */ uint32_t reserved: 19; } T_DjiFcSubscriptionFlightAnomaly;"
+          - heading "typedef struct T_DjiFcSubscriptionPositionVO" [level=3] [ref=f6e1230]:
+            - link [ref=f6e1231] [cursor=pointer]:
+              - /url: "#typedef-struct-t-djifcsubscriptionpositionvo"
+              - text: "#"
+            - text: typedef struct T_DjiFcSubscriptionPositionVO
+          - generic [ref=f6e1232]:
+            - text: c
+            - code [ref=f6e1234]: "typedef struct PositionVO { dji_f32_t x; /*!< 北 (best effort)，单位： m */ dji_f32_t y; /*!< 东 (best effort)，单位： m */ dji_f32_t z; /*!< 下， 单位： m */ uint8_t xHealth: 1; uint8_t yHealth: 1; uint8_t zHealth: 1; uint8_t reserved: 5; } T_DjiFcSubscriptionPositionVO;"
+          - heading "typedef struct T_DjiFcSubscriptionAvoidData" [level=3] [ref=f6e1245]:
+            - link [ref=f6e1246] [cursor=pointer]:
+              - /url: "#typedef-struct-t-djifcsubscriptionavoiddata"
+              - text: "#"
+            - text: typedef struct T_DjiFcSubscriptionAvoidData
+          - generic [ref=f6e1247]:
+            - text: c
+            - code [ref=f6e1249]: "typedef struct RelativePosition { dji_f32_t down; /*!< 距障碍物的距离 (m) */ dji_f32_t front; /*!< 距障碍物的距离 (m) */ dji_f32_t right; /*!< 距障碍物的距离 (m) */ dji_f32_t back; /*!< 距障碍物的距离 (m) */ dji_f32_t left; /*!< 距障碍物的距离 (m) */ dji_f32_t up; /*!< 距障碍物的距离 (m) */ uint8_t downHealth: 1; /*!< Down sensor flag: 0 - not working, 1 - working */ uint8_t frontHealth: 1; /*!< Front sensor flag: 0 - not working, 1 - working */ uint8_t rightHealth: 1; /*!< Right sensor flag: 0 - not working, 1 - working */ uint8_t backHealth: 1; /*!< Back sensor flag: 0 - not working, 1 - working */ uint8_t leftHealth: 1; /*!< Left sensor flag: 0 - not working, 1 - working */ uint8_t upHealth: 1; /*!< Up sensor health flag: 0 - not working, 1 - working */ uint8_t reserved: 2; /*!< Reserved sensor health flag*/ } T_DjiFcSubscriptionAvoidData;"
+          - heading "typedef struct T_DjiFcSubscriptionHomePointInfo" [level=3] [ref=f6e1266]:
+            - link [ref=f6e1267] [cursor=pointer]:
+              - /url: "#typedef-struct-t-djifcsubscriptionhomepointinfo"
+              - text: "#"
+            - text: typedef struct T_DjiFcSubscriptionHomePointInfo
+          - generic [ref=f6e1268]:
+            - text: c
+            - code [ref=f6e1270]: "typedef struct HomeLocationData { dji_f64_t latitude; /*!< 单位： rad */ dji_f64_t longitude; /*!< 单位： rad */ } T_DjiFcSubscriptionHomePointInfo;"
+          - heading "typedef struct GimbalSingleData" [level=3] [ref=f6e1276]:
+            - link [ref=f6e1277] [cursor=pointer]:
+              - /url: "#typedef-struct-gimbalsingledata"
+              - text: "#"
+            - text: typedef struct GimbalSingleData
+          - generic [ref=f6e1278]:
+            - text: c
+            - code [ref=f6e1280]: "typedef struct GimbalSingleData { dji_f32_t roll; dji_f32_t pitch; dji_f32_t yaw; } GimbalAnglesData;"
+          - heading "typedef struct T_DjiFcSubscriptionThreeGimbalData" [level=3] [ref=f6e1287]:
+            - link [ref=f6e1288] [cursor=pointer]:
+              - /url: "#typedef-struct-t-djifcsubscriptionthreegimbaldata"
+              - text: "#"
+            - text: typedef struct T_DjiFcSubscriptionThreeGimbalData
+          - generic [ref=f6e1289]:
+            - text: c
+            - code [ref=f6e1291]: "typedef struct GimbalThreeData { GimbalAnglesData anglesData[3]; } T_DjiFcSubscriptionThreeGimbalData;"
+          - heading "函数原型" [level=2] [ref=f6e1296]:
+            - link [ref=f6e1297] [cursor=pointer]:
+              - /url: "#函数原型"
+              - text: "#"
+            - text: 函数原型
+          - heading "function DjiFcSubscription_Init" [level=3] [ref=f6e1298]:
+            - link [ref=f6e1299] [cursor=pointer]:
+              - /url: "#function-djifcsubscription-init"
+              - text: "#"
+            - text: function DjiFcSubscription_Init
+          - table [ref=f6e1300]:
+            - rowgroup [ref=f6e1301]:
+              - row [ref=f6e1302]:
+                - cell "功能：消息订阅模块初始化" [ref=f6e1303]
+                - cell "product：all" [ref=f6e1304]
+          - paragraph [ref=f6e1305]: 消息订阅功能初始化，并开始执行消息订阅功能。
+          - blockquote [ref=f6e1306]:
+            - paragraph [ref=f6e1307]:
+              - strong [ref=f6e1308]: 说明
+            - list [ref=f6e1309]:
+              - listitem [ref=f6e1310]: 在使用消息订阅功能订阅无人机上的信息前，请先使用本接口初始化消息订阅功能。
+              - listitem [ref=f6e1311]: 请勿在main()函数中调用本接口，请在用户线程中调用本接口，启动调度器后，该接口将正常运行。
+              - listitem [ref=f6e1312]: 本接口执行时间可能会超过 500ms。
+          - generic [ref=f6e1313]:
+            - text: c
+            - code [ref=f6e1315]: T_DjiReturnCode DjiFcSubscription_Init(void);
+          - paragraph [ref=f6e1318]:
+            - text: 返回值根据程序执行的情况输出对应的返回值，详情请参见：
+            - link "DjiErrorCode" [ref=f6e1319] [cursor=pointer]:
+              - /url: ../core/dji-error.html
+          - heading "function DjiFcSubscription_DeInit" [level=3] [ref=f6e1320]:
+            - link [ref=f6e1321] [cursor=pointer]:
+              - /url: "#function-djifcsubscription-deinit"
+              - text: "#"
+            - text: function DjiFcSubscription_DeInit
+          - table [ref=f6e1322]:
+            - rowgroup [ref=f6e1323]:
+              - row [ref=f6e1324]:
+                - cell "功能：释放消息订阅功能" [ref=f6e1325]
+                - cell "product：all" [ref=f6e1326]
+          - paragraph [ref=f6e1327]: 释放消息订阅功能。在无需使用消息订阅功能时，可调用本接口释放消息订阅功能。
+          - blockquote [ref=f6e1328]:
+            - paragraph [ref=f6e1329]:
+              - strong [ref=f6e1330]: 说明：
+              - text: 释放消息订阅功能后，无人机中被占用的资源也将释放。
+          - generic [ref=f6e1331]:
+            - text: c
+            - code [ref=f6e1333]: T_DjiReturnCode DjiFcSubscription_DeInit(void);
+          - paragraph [ref=f6e1336]:
+            - text: 返回值根据程序执行的情况输出对应的返回值，详情请参见：
+            - link "DjiErrorCode" [ref=f6e1337] [cursor=pointer]:
+              - /url: ../core/dji-error.html
+          - heading "function DjiFcSubscription_SubscribeTopic" [level=3] [ref=f6e1338]:
+            - link [ref=f6e1339] [cursor=pointer]:
+              - /url: "#function-djifcsubscription-subscribetopic"
+              - text: "#"
+            - text: function DjiFcSubscription_SubscribeTopic
+          - table [ref=f6e1340]:
+            - rowgroup [ref=f6e1341]:
+              - row [ref=f6e1342]:
+                - cell "功能：以阻塞模式订阅。 在从飞机订阅任何数据之前，DjiFcSubscription_Init()函数必须被调用。" [ref=f6e1343]
+                - cell "product：all" [ref=f6e1344]
+          - generic [ref=f6e1345]:
+            - text: c
+            - code [ref=f6e1347]: T_DjiReturnCode DjiFcSubscription_SubscribeTopic(E_DjiFcSubscriptionTopic topic, E_DjiDataSubscriptionTopicFreq frequency, DjiReceiveDataOfTopicCallback callback);
+          - text: 参数topic：订阅名。 frequency：订阅的订阅频率。 订阅频率不能超过的最大频率限制，必须是枚举 E_DjiFcSubscriptionTopicFreq 的值。 并且，订阅频率必须大于0。用户可以在开发者网站（developer.dji.com）文档的数据订阅部分找到的最大频率。 callback：用于接收订阅数据的回调函数。 如果不需要回调函数，此项可以设置为NULL。 返回值根据程序执行的情况输出对应的返回值，详情请参见：
+          - link "DjiErrorCode" [ref=f6e1352] [cursor=pointer]:
+            - /url: ../core/dji-error.html
+          - heading "function DjiFcSubscription_GetLatestValueOfTopic" [level=3] [ref=f6e1353]:
+            - link [ref=f6e1354] [cursor=pointer]:
+              - /url: "#function-djifcsubscription-getlatestvalueoftopic"
+              - text: "#"
+            - text: function DjiFcSubscription_GetLatestValueOfTopic
+          - table [ref=f6e1355]:
+            - rowgroup [ref=f6e1356]:
+              - row [ref=f6e1357]:
+                - cell "功能：获取最新的数据和时间戳" [ref=f6e1358]
+                - cell "product：all" [ref=f6e1359]
+          - paragraph [ref=f6e1360]: 获取无人机上订阅项最新的数据和时间戳，订阅失败时，该接口将返回错误码。
+          - blockquote [ref=f6e1361]:
+            - paragraph [ref=f6e1362]:
+              - strong [ref=f6e1363]: 说明：
+              - text: 调用本接口时，请指定订阅项，以及相应的数据。
+          - generic [ref=f6e1364]:
+            - text: c
+            - code [ref=f6e1366]: T_DjiReturnCode DjiFcSubscription_GetLatestValueOfTopic(E_DjiFcSubscriptionTopic topic, uint8_t *data, uint16_t dataSizeOfTopic, T_DjiDataTimestamp *timestamp);
+          - text: 参数topicName：订阅项的名称。 data：请正确地指向用于存储订阅项数据的存储空间，否则，本接口将返回错误码。 dataSizeOfTopic：请正确地指向用于存储订阅项数据的存储空间，正常情况下，该数值与订阅项的长度相同，否则可能会导致内存溢出等问题。 timestamp：请正确地指向用于存储时间戳的内存空间，否则，本接口将返回错误码或出现内存溢出等问题，若无需获取时间戳，则该参数可为空。 返回值根据程序执行的情况输出对应的返回值，详情请参见：
+          - link "DjiErrorCode" [ref=f6e1371] [cursor=pointer]:
+            - /url: ../core/dji-error.html
+        - navigation [ref=f6e1372]:
+          - paragraph [ref=f6e1373]:
+            - link "信息管理" [ref=f6e1375] [cursor=pointer]:
+              - /url: /doc/payload-sdk-api-reference/cn/module/aircraft-info.html
+              - text: ← 信息管理
+            - link "相机管理" [ref=f6e1377] [cursor=pointer]:
+              - /url: /doc/payload-sdk-api-reference/cn/module/camera-manager.html
+              - text: 相机管理 →
+        - generic [ref=f6e1380]:
+          - generic [ref=f6e1381]: 请问您的文档阅读体验如何？
+          - slider "rating" [ref=f6e1382]
+      - list [ref=f6e1405]:
+        - listitem [ref=f6e1406]:
+          - link "目录" [ref=f6e1407] [cursor=pointer]:
+            - /url: /doc/payload-sdk-api-reference/cn/module/fc-subscription.html#目录
+        - listitem [ref=f6e1408]:
+          - link "宏定义、枚举与结构体" [ref=f6e1409] [cursor=pointer]:
+            - /url: /doc/payload-sdk-api-reference/cn/module/fc-subscription.html#宏定义、枚举与结构体
+        - listitem [ref=f6e1410]:
+          - link "函数原型" [ref=f6e1411] [cursor=pointer]:
+            - /url: /doc/payload-sdk-api-reference/cn/module/fc-subscription.html#函数原型
+  - generic [ref=f6e1419]:
+    - text: 若您对文档有意见或疑惑，点击可快速反馈，我们会与您联系。
+    - button "好的，我知道了" [ref=f6e1421] [cursor=pointer]
