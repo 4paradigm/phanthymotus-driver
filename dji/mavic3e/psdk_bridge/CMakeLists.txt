@@ -1,0 +1,68 @@
+cmake_minimum_required(VERSION 3.10)
+project(psdk_bridge C)
+
+set(CMAKE_C_STANDARD 11)
+
+# ── PSDK library path (set via -DPSDK_DIR=... or env) ─────────────────────
+set(PSDK_DIR "$ENV{PSDK_DIR}" CACHE PATH "Path to Payload-SDK root")
+if(NOT PSDK_DIR)
+    set(PSDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../Payload-SDK")
+endif()
+
+# ── PSDK headers & lib ────────────────────────────────────────────────────
+include_directories(
+    ${PSDK_DIR}/psdk_lib/include
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+# PSDK static library (built separately per PSDK docs)
+find_library(PSDK_LIB payloadsdk PATHS ${PSDK_DIR}/build/psdk_lib NO_DEFAULT_PATH)
+if(NOT PSDK_LIB)
+    message(WARNING "libpayloadsdk.a not found at ${PSDK_DIR}/build/psdk_lib — using stub")
+    # Create a stub so the project structure is valid even without PSDK built
+    set(PSDK_LIB "")
+endif()
+
+# ── System dependencies ──────────────────────────────────────────────────
+find_package(Threads REQUIRED)
+
+# libusb for E-Port USB communication
+find_library(LIBUSB_LIB usb-1.0)
+find_path(LIBUSB_INCLUDE libusb-1.0/libusb.h)
+if(LIBUSB_INCLUDE)
+    include_directories(${LIBUSB_INCLUDE})
+endif()
+
+# OpenSSL for PSDK auth
+find_package(OpenSSL)
+if(OPENSSL_FOUND)
+    include_directories(${OPENSSL_INCLUDE_DIR})
+endif()
+
+# ── Sources ──────────────────────────────────────────────────────────────
+set(SOURCES
+    main.c
+    ipc.c
+    telemetry.c
+    flight_ctrl.c
+    camera_mgr.c
+    gimbal_mgr.c
+    liveview.c
+    waypoint.c
+    perception.c
+    speaker.c
+    hms.c
+)
+
+add_executable(psdk_bridge ${SOURCES})
+
+target_link_libraries(psdk_bridge
+    ${PSDK_LIB}
+    Threads::Threads
+    ${LIBUSB_LIB}
+    ${OPENSSL_LIBRARIES}
+    m
+)
+
+# ── Install ──────────────────────────────────────────────────────────────
+install(TARGETS psdk_bridge DESTINATION bin)

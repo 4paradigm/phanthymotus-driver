@@ -1,0 +1,42 @@
+{
+  "name": "DJI Mavic 3 Enterprise",
+  "type": "drone",
+  "manufacturer": "DJI",
+  "model": "Mavic 3E",
+  "cameras": {
+    "wide": {
+      "sensor": "4/3 CMOS 20MP",
+      "fov": 84,
+      "focal_length": "24mm equiv",
+      "zoom": "1x fixed"
+    },
+    "zoom": {
+      "sensor": "1/2 inch CMOS 12MP",
+      "fov": 15,
+      "focal_length": "162mm equiv",
+      "zoom": "7x optical, up to 56x hybrid"
+    }
+  },
+  "gimbal_range": {
+    "pitch": [-90, 35],
+    "yaw": [-40, 40],
+    "roll": [-45, 45]
+  },
+  "max_speed_ms": 19,
+  "max_altitude_m": 6000,
+  "max_flight_time_min": 45,
+  "max_wind_resistance_ms": 12,
+  "weight_g": 920,
+  "psdk_interface": "E-Port",
+  "psdk_version": "v3.16.0",
+  "waypoint_version": "V3",
+  "perception_directions": ["front", "back", "left", "right", "up", "down"],
+  "perception_resolution": {
+    "up": [640, 480],
+    "down": [640, 480],
+    "front": [480, 480],
+    "back": [480, 480],
+    "left": [480, 480],
+    "right": [480, 480]
+  }
+}
