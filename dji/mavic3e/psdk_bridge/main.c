@@ -408,6 +408,8 @@ static int _psdk_core_init(const char *app_id, const char *app_key,
     rc = DjiPlatform_RegHalUsbBulkHandler(&g_usbBulkHandler);
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
         printf("[psdk] HAL USB Bulk registration failed: 0x%08llX (non-fatal)\n", (unsigned long long)rc);
+    } else {
+        printf("[psdk] HAL USB Bulk registered OK\n");
     }
 
     /* Init PSDK core */
