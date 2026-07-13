@@ -12,8 +12,6 @@ psdk_bridge:
   uart_dev: "auto"           # "auto" = scan /dev/ttyUSB* and /dev/ttyACM* for E-Port device
   usb_vid: ""                # Leave empty for auto-detect (supports FTDI 0403 and DJI 2ca3)
   network_iface: "usb0"  # E-Port USB-Ethernet interface
-  mock_mode: true        # true = simulated responses (no hardware needed)
-                         # Set env PSDK_MOCK=0 to override and connect to real psdk_bridge
 
 plugins:
   telemetry:
