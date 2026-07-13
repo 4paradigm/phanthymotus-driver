@@ -13,10 +13,12 @@
 
 /* DJI USB Vendor ID */
 #define DJI_USB_VID 0x2CA3
+/* FTDI Vendor ID (used on E-Port dev board) */
+#define FTDI_USB_VID 0x0403
 
 static int s_uart_fd = -1;
-static uint16_t s_vid = DJI_USB_VID;
-static uint16_t s_pid = 0x001F;  /* Default PID for Mavic 3E E-Port */
+static uint16_t s_vid = 0;
+static uint16_t s_pid = 0;
 
 /* ── Baud rate conversion ────────────────────────────────────────────── */
 
