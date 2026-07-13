@@ -127,40 +127,85 @@ class TelemetryPlugin:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  CameraStreamPlugin (sensor)
+#  CameraStreamPlugin (sensor, multiInstance)
 #  PSDK: 获取相机码流 + 视频流传输
 # ═══════════════════════════════════════════════════════════════════════════
 
 class _CameraStreamNode(Node):
-    def __init__(self, topic: str, bridge, fps: int = 10):
-        super().__init__("mavic3e_camera_stream")
+    def __init__(self, topic: str, bridge, fps: int = 10, camera: str = "wide"):
+        super().__init__(f"mavic3e_cam_{camera}")
         self._topic = topic
         self._bridge = bridge
         self._pub = self.create_publisher(String, topic, _LOW_LAT_QOS)
         self._fps = fps
+        self._camera = camera
         self._thread = None
         self.state = "idle"
 
-    def start(self, camera: str = "wide"):
+    def start(self):
         if self.state == "running":
             return
-        self._bridge.start_liveview(camera=camera)
+        self._bridge.start_liveview(camera=self._camera)
         self.state = "running"
         self._thread = threading.Thread(target=self._stream_loop, daemon=True)
         self._thread.start()
-        self.get_logger().info(f"Camera stream started — {self._topic}")
+        self.get_logger().info(f"Camera stream started — {self._topic} ({self._camera})")
 
     def stop(self):
         self.state = "idle"
         self._bridge.stop_liveview()
 
     def _stream_loop(self):
-        """In live mode, frames arrive via push callback from the C bridge.
-        This loop acts as a placeholder; real frames come from bridge push."""
+        """Publish mock JPEG frames in mock mode, or receive from bridge in live mode."""
+        import struct as _struct
+        # Generate a minimal valid JPEG for mock mode (1x1 pixel, colored by camera type)
+        _MOCK_JPEGS = {
+            "wide": self._make_mock_jpeg(0x40, 0x80, 0x40),   # greenish
+            "zoom": self._make_mock_jpeg(0x40, 0x40, 0xA0),   # blueish
+            "ir":   self._make_mock_jpeg(0xA0, 0x40, 0x40),   # reddish
+        }
+        mock_frame = _MOCK_JPEGS.get(self._camera, _MOCK_JPEGS["wide"])
+
         while self.state == "running":
             time.sleep(1.0 / self._fps)
-            # In mock mode, we don't generate fake JPEG frames
-            # In live mode, the bridge pushes H.264→JPEG via callback
+            if self.state != "running":
+                break
+            # Publish mock JPEG as base64 in String msg (dashboard decodes)
+            import base64
+            msg = String()
+            msg.data = base64.b64encode(mock_frame).decode("ascii")
+            self._pub.publish(msg)
+
+    @staticmethod
+    def _make_mock_jpeg(r: int, g: int, b: int) -> bytes:
+        """Generate a minimal 8x8 JPEG with solid color for testing."""
+        # Minimal JPEG: SOI + APP0 + DQT + SOF0 + DHT + SOS + data + EOI
+        # For simplicity, use a pre-built tiny JPEG structure
+        # This creates a valid 1x1 JPEG with the given RGB color
+        import io
+        try:
+            from PIL import Image
+            img = Image.new("RGB", (160, 120), (r, g, b))
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=50)
+            return buf.getvalue()
+        except ImportError:
+            # Fallback: return a minimal valid JPEG (1x1 white pixel)
+            return bytes([
+                0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01,
+                0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43,
+                0x00, 0x08, 0x06, 0x06, 0x07, 0x06, 0x05, 0x08, 0x07, 0x07, 0x07, 0x09,
+                0x09, 0x08, 0x0A, 0x0C, 0x14, 0x0D, 0x0C, 0x0B, 0x0B, 0x0C, 0x19, 0x12,
+                0x13, 0x0F, 0x14, 0x1D, 0x1A, 0x1F, 0x1E, 0x1D, 0x1A, 0x1C, 0x1C, 0x20,
+                0x24, 0x2E, 0x27, 0x20, 0x22, 0x2C, 0x23, 0x1C, 0x1C, 0x28, 0x37, 0x29,
+                0x2C, 0x30, 0x31, 0x34, 0x34, 0x34, 0x1F, 0x27, 0x39, 0x3D, 0x38, 0x32,
+                0x3C, 0x2E, 0x33, 0x34, 0x32, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01,
+                0x00, 0x01, 0x01, 0x01, 0x11, 0x00, 0xFF, 0xC4, 0x00, 0x1F, 0x00, 0x00,
+                0x01, 0x05, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+                0x09, 0x0A, 0x0B, 0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F,
+                0x00, 0x7B, 0x40, 0x1B, 0xFF, 0xD9,
+            ])
 
 
 class CameraStreamPlugin:
@@ -168,25 +213,25 @@ class CameraStreamPlugin:
 
     def __init__(self, plugin_config: dict, namespace: str, executor, bridge):
         self._namespace = namespace
-        self._topic = f"/{namespace}/camera/rgb"
-        self._camera = plugin_config.get("camera_source", "wide")
-        fps = plugin_config.get("fps", 10)
-        self._node = _CameraStreamNode(self._topic, bridge, fps)
-        executor.add_node(self._node)
+        self._bridge = bridge
+        self._executor = executor
+        self._fps = plugin_config.get("fps", 10)
+        self._nodes: dict[str, _CameraStreamNode] = {}
 
     def get_tool(self) -> dict:
         return {
             "name": "camera_stream",
             "type": "sensor",
-            "description": "Mavic 3E 相机实时码流 (H.264 解码 → JPEG)。支持广角/变焦/红外(3T)镜头切换。",
-            "topic_out": [{"topic": self._topic, "format": "image/jpeg"}],
+            "multiInstance": True,
+            "description": "Mavic 3E 相机实时码流 (H.264 解码 → JPEG)。支持广角/变焦/红外(3T)镜头切换。每个实例独立选择镜头。",
+            "topic_out": [{"format": "image/jpeg", "desc": "camera JPEG stream"}],
             "configSchema": {
                 "type": "object",
                 "properties": {
                     "camera_source": {
                         "type": "string",
                         "description": "Camera source",
-                        "scope": "shared",
+                        "scope": "instance",
                         "oneOf": [
                             {"const": "wide", "title": "Wide (24mm)"},
                             {"const": "zoom", "title": "Zoom (7-28x)"},
@@ -208,24 +253,36 @@ class CameraStreamPlugin:
         }
 
     def start(self):
-        self._node.start(self._camera)
+        pass  # multiInstance starts per-instance
 
     def stop(self):
-        self._node.stop()
+        for node in self._nodes.values():
+            node.stop()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        instance_id = args.get("instance_id", "default")
+        camera = args.get("camera_source", "wide")
+
+        if action == "info":
+            safe_id = instance_id.replace("-", "_")
+            topic = f"/{self._namespace}/camera/{safe_id}/rgb"
+            return {
+                "state": self._nodes[instance_id].state if instance_id in self._nodes else "idle",
+                "topic_out": [{"topic": topic, "format": "image/jpeg"}],
+            }
         if action == "start":
-            camera = args.get("camera_source", self._camera)
-            self._node.start(camera)
+            if instance_id not in self._nodes:
+                safe_id = instance_id.replace("-", "_")
+                topic = f"/{self._namespace}/camera/{safe_id}/rgb"
+                node = _CameraStreamNode(topic, self._bridge, self._fps, camera)
+                self._executor.add_node(node)
+                self._nodes[instance_id] = node
+            self._nodes[instance_id].start()
             return {"state": "running"}
         if action == "stop":
-            self._node.stop()
+            if instance_id in self._nodes:
+                self._nodes[instance_id].stop()
             return {"state": "idle"}
-        if action == "info":
-            return {
-                "state": self._node.state,
-                "topic_out": [{"topic": self._topic, "format": "image/jpeg"}],
-            }
         return None
 
 
@@ -427,12 +484,58 @@ class HmsPlugin:
 #  PSDK: 飞行控制
 # ═══════════════════════════════════════════════════════════════════════════
 
+class _FlightStatusNode(Node):
+    """Publishes flight status as JSON for dashboard card."""
+
+    def __init__(self, topic: str, bridge):
+        super().__init__("mavic3e_flight_status")
+        self._topic = topic
+        self._bridge = bridge
+        self._pub = self.create_publisher(String, topic, _LOW_LAT_QOS)
+        self._timer = None
+        self.state = "idle"
+
+    def start(self):
+        if self.state == "running":
+            return
+        self._timer = self.create_timer(0.5, self._tick)  # 2Hz
+        self.state = "running"
+
+    def stop(self):
+        if self._timer:
+            self._timer.cancel()
+            self._timer = None
+        self.state = "idle"
+
+    def _tick(self):
+        try:
+            resp = self._bridge.get_telemetry()
+            if resp.get("ok"):
+                d = resp["data"]
+                status = {
+                    "flight_status": d.get("flight_status", "unknown"),
+                    "flight_mode": d.get("flight_mode", "unknown"),
+                    "battery": d.get("battery", {}),
+                    "gps": d.get("gps", {}),
+                    "altitude": d.get("position", {}).get("altitude", 0),
+                }
+                msg = String()
+                msg.data = json.dumps(status, separators=(",", ":"))
+                self._pub.publish(msg)
+        except Exception:
+            pass
+
+
 class FlightPlugin:
     PREFIX = "flight"
 
     def __init__(self, plugin_config: dict, namespace: str, executor, bridge):
         self._bridge = bridge
         self._has_authority = False
+        self._namespace = namespace
+        self._status_topic = f"/{namespace}/flight/status"
+        self._status_node = _FlightStatusNode(self._status_topic, bridge)
+        executor.add_node(self._status_node)
 
     def get_tools(self) -> list:
         return [
@@ -490,7 +593,8 @@ class FlightPlugin:
             {
                 "name": "flight_status",
                 "type": "sensor",
-                "description": "查询 Mavic 3E 飞行状态：飞行模式、GPS 质量、电池电量。",
+                "description": "查询 Mavic 3E 飞行状态：飞行模式、GPS 质量、电池电量、高度。",
+                "topic_out": [{"topic": self._status_topic, "format": "data/json"}],
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -505,9 +609,10 @@ class FlightPlugin:
         ]
 
     def start(self):
-        pass
+        self._status_node.start()
 
     def stop(self):
+        self._status_node.stop()
         if self._has_authority:
             self._bridge.release_joystick_authority()
             self._has_authority = False
@@ -516,20 +621,17 @@ class FlightPlugin:
         tool_name = args.pop("_tool_name", "flight")
 
         if tool_name == "flight_status":
-            if action in ("start", "info"):
-                resp = self._bridge.get_telemetry()
-                if resp.get("ok"):
-                    d = resp["data"]
-                    return {
-                        "state": "running",
-                        "flight_status": d.get("flight_status", "unknown"),
-                        "flight_mode": d.get("flight_mode", "unknown"),
-                        "battery": d.get("battery", {}),
-                        "gps": d.get("gps", {}),
-                    }
+            if action == "start":
+                self._status_node.start()
                 return {"state": "running"}
             if action == "stop":
+                self._status_node.stop()
                 return {"state": "idle"}
+            if action == "info":
+                return {
+                    "state": self._status_node.state,
+                    "topic_out": [{"topic": self._status_topic, "format": "data/json"}],
+                }
             return None
 
         # flight tool

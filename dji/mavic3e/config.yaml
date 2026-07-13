@@ -13,7 +13,8 @@ psdk_bridge:
   usb_vid: "2ca3"        # DJI USB Vendor ID
   usb_pid: "001f"        # Mavic 3E E-Port Product ID
   network_iface: "usb0"  # E-Port USB-Ethernet interface
-  mock_mode: true        # true = no hardware, use mock responses
+  mock_mode: true        # true = simulated responses (no hardware needed)
+                         # Set env PSDK_MOCK=0 to override and connect to real psdk_bridge
 
 plugins:
   telemetry:
