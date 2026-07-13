@@ -475,10 +475,13 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
         return 0;
     }
 
-    /* Power */
+    /* Power — use real battery data from telemetry */
     if (strstr(raw_json, "\"get_power_state\"")) {
+        char telem[4096];
+        telemetry_get_json(telem, sizeof(telem));
+        /* Extract battery info from telemetry JSON and return as power state */
         snprintf(result, result_size,
-            "{\"ok\":true,\"data\":{\"battery_percent\":85,\"voltage\":22.8,\"current\":5.2,\"eport_power\":true}}");
+            "{\"ok\":true,\"data\":%s}", telem);
         return 0;
     }
 
