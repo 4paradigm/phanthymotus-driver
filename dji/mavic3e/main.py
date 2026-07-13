@@ -375,13 +375,40 @@ def main():
 
     print(f"[bundle] namespace={namespace} mcp_port={mcp_port} uart={detected_dev}")
 
+    # Start psdk_bridge C process as subprocess
+    import subprocess as _sp
+    bridge_bin = "/usr/local/bin/psdk_bridge"
+    if not os.path.exists(bridge_bin):
+        bridge_bin = "/work/psdk_bridge/build/psdk_bridge"
+    socket_path = "/tmp/psdk_bridge.sock"
+
+    bridge_proc = _sp.Popen(
+        [bridge_bin, socket_path,
+         psdk_cfg.get("app_id", ""),
+         psdk_cfg.get("app_key", ""),
+         psdk_cfg.get("app_license", ""),
+         detected_dev,
+         str(psdk_cfg.get("baud_rate", 921600))],
+        stdout=sys.stdout, stderr=sys.stderr,
+    )
+    print(f"[bundle] psdk_bridge started (pid={bridge_proc.pid})")
+
+    # Wait for socket to appear
+    import time as _t
+    for _ in range(50):  # 5 seconds max
+        if os.path.exists(socket_path):
+            break
+        _t.sleep(0.1)
+    else:
+        print("[bundle] WARNING: psdk_bridge socket not ready after 5s")
+
     # Bridge client — connects to psdk_bridge C process
     from bridge_client import BridgeClient
     bridge = BridgeClient(
-        socket_path="/tmp/psdk_bridge.sock",
+        socket_path=socket_path,
         mock_mode=False,
     )
-    print(f"[bundle] BridgeClient initialized (live mode, uart={detected_dev})")
+    print(f"[bundle] BridgeClient connected (uart={detected_dev})")
 
     # ROS2
     rclpy.init()
@@ -405,6 +432,7 @@ def main():
     def _shutdown(signum, frame):
         print(f"[bundle] signal {signum}, shutting down")
         _bundle.stop_all()
+        bridge_proc.terminate()
         threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGTERM, _shutdown)
@@ -414,6 +442,8 @@ def main():
         server.serve_forever()
     finally:
         _bundle.stop_all()
+        bridge_proc.terminate()
+        bridge_proc.wait(timeout=3)
         executor.shutdown()
         rclpy.shutdown()
 
