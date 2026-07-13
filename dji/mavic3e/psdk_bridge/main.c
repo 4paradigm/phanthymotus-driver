@@ -47,6 +47,7 @@ static void _signal_handler(int sig) {
 #include "dji_core.h"
 #include "dji_platform.h"
 #include "dji_payload_camera.h"
+#include "osal_socket.h"
 #include <pthread.h>
 #include <semaphore.h>
 #include <net/if.h>
@@ -406,6 +407,26 @@ static int _psdk_core_init(const char *app_id, const char *app_key,
     /* Register HAL USB Bulk only if FFS endpoints are available (host-side setup done) */
     extern T_DjiHalUsbBulkHandler g_usbBulkHandler;
     if (access("/dev/usb-ffs/bulk1/ep1", F_OK) == 0) {
+        /* Socket handler required for USB Bulk data channel */
+        T_DjiSocketHandler socketHandler = {
+            .Socket = Osal_Socket,
+            .Bind = Osal_Bind,
+            .Close = Osal_Close,
+            .UdpSendData = Osal_UdpSendData,
+            .UdpRecvData = Osal_UdpRecvData,
+            .TcpListen = Osal_TcpListen,
+            .TcpAccept = Osal_TcpAccept,
+            .TcpConnect = Osal_TcpConnect,
+            .TcpSendData = Osal_TcpSendData,
+            .TcpRecvData = Osal_TcpRecvData,
+        };
+        rc = DjiPlatform_RegSocketHandler(&socketHandler);
+        if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+            printf("[psdk] Socket handler registration failed: 0x%08llX\n", (unsigned long long)rc);
+        } else {
+            printf("[psdk] Socket handler registered OK\n");
+        }
+
         rc = DjiPlatform_RegHalUsbBulkHandler(&g_usbBulkHandler);
         if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
             printf("[psdk] HAL USB Bulk registration failed: 0x%08llX\n", (unsigned long long)rc);

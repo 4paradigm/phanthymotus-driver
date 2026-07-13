@@ -54,6 +54,7 @@ set(SOURCES
     hal_network.c
     hal_usb_bulk.c
     osal_posix.c
+    osal_socket.c
     telemetry.c
     flight_ctrl.c
     camera_mgr.c
