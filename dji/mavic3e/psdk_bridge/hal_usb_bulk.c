@@ -30,7 +30,12 @@ typedef struct {
 
 static T_DjiReturnCode _UsbBulk_Init(T_DjiHalUsbBulkInfo usbBulkInfo,
                                       T_DjiUsbBulkHandle *usbBulkHandle) {
-    int channel = usbBulkInfo.channelInfo.interfaceNum + 1;  /* interface 0→bulk1, 1→bulk2, 2→bulk3 */
+    /* Determine channel from endpoint address */
+    int channel;
+    if (usbBulkInfo.channelInfo.endPointIn == 0x81) channel = 1;
+    else if (usbBulkInfo.channelInfo.endPointIn == 0x82) channel = 2;
+    else if (usbBulkInfo.channelInfo.endPointIn == 0x83) channel = 3;
+    else channel = 1;  /* fallback */
     char ep_in[64], ep_out[64];
     snprintf(ep_in, sizeof(ep_in), USB_BULK_EP_IN_FMT, channel);
     snprintf(ep_out, sizeof(ep_out), USB_BULK_EP_OUT_FMT, channel);
@@ -87,14 +92,11 @@ static T_DjiReturnCode _UsbBulk_ReadData(T_DjiUsbBulkHandle usbBulkHandle,
 static T_DjiReturnCode _UsbBulk_GetDeviceInfo(T_DjiHalUsbBulkDeviceInfo *deviceInfo) {
     deviceInfo->vid = 0x2CA3;
     deviceInfo->pid = 0xF001;
-    /* Channel endpoint info */
-    deviceInfo->channelInfo[0].interfaceNum = 0;
+    /* Channel endpoint addresses */
     deviceInfo->channelInfo[0].endPointIn = 0x81;
     deviceInfo->channelInfo[0].endPointOut = 0x01;
-    deviceInfo->channelInfo[1].interfaceNum = 1;
     deviceInfo->channelInfo[1].endPointIn = 0x82;
     deviceInfo->channelInfo[1].endPointOut = 0x02;
-    deviceInfo->channelInfo[2].interfaceNum = 2;
     deviceInfo->channelInfo[2].endPointIn = 0x83;
     deviceInfo->channelInfo[2].endPointOut = 0x03;
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
