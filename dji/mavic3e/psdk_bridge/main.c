@@ -403,16 +403,11 @@ static int _psdk_core_init(const char *app_id, const char *app_key,
         return -1;
     }
 
-    /* Register HAL Network (for liveview/perception via RNDIS) */
-    T_DjiHalNetworkHandler networkHandler = {
-        .NetworkInit = _HalNetwork_Init,
-        .NetworkDeInit = _HalNetwork_DeInit,
-        .NetworkGetDeviceInfo = _HalNetwork_GetDeviceInfo,
-    };
-    rc = DjiPlatform_RegHalNetworkHandler(&networkHandler);
+    /* Register HAL USB Bulk (for liveview/perception via FunctionFS) */
+    extern T_DjiHalUsbBulkHandler g_usbBulkHandler;
+    rc = DjiPlatform_RegHalUsbBulkHandler(&g_usbBulkHandler);
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-        printf("[psdk] HAL Network registration failed: 0x%08llX (non-fatal)\n", (unsigned long long)rc);
-        /* Non-fatal: UART-only mode still works for telemetry/flight control */
+        printf("[psdk] HAL USB Bulk registration failed: 0x%08llX (non-fatal)\n", (unsigned long long)rc);
     }
 
     /* Init PSDK core */

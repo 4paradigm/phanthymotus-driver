@@ -52,6 +52,7 @@ set(SOURCES
     ipc.c
     hal_uart.c
     hal_network.c
+    hal_usb_bulk.c
     osal_posix.c
     telemetry.c
     flight_ctrl.c
@@ -77,5 +78,9 @@ if(OPENSSL_FOUND)
     target_link_libraries(psdk_bridge ${OPENSSL_LIBRARIES})
 endif()
 
+# startup_bulk — initializes FunctionFS endpoints
+add_executable(startup_bulk startup_bulk.c)
+target_link_libraries(startup_bulk)
+
 # ── Install ──────────────────────────────────────────────────────────────
-install(TARGETS psdk_bridge DESTINATION bin)
+install(TARGETS psdk_bridge startup_bulk DESTINATION bin)
