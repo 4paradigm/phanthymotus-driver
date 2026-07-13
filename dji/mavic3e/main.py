@@ -393,21 +393,39 @@ def main():
     )
     print(f"[bundle] psdk_bridge started (pid={bridge_proc.pid})")
 
-    # Wait for socket to appear
+    # Wait for socket to appear (PSDK handshake takes 10-20s)
     import time as _t
-    for _ in range(50):  # 5 seconds max
+    for i in range(300):  # 30 seconds max
         if os.path.exists(socket_path):
             break
+        if i % 50 == 0 and i > 0:
+            print(f"[bundle] waiting for psdk_bridge socket... ({i//10}s)")
         _t.sleep(0.1)
     else:
-        print("[bundle] WARNING: psdk_bridge socket not ready after 5s")
+        print("[bundle] ERROR: psdk_bridge socket not ready after 30s, exiting")
+        bridge_proc.terminate()
+        sys.exit(1)
 
-    # Bridge client — connects to psdk_bridge C process
+    # Give bridge a moment to accept connections
+    _t.sleep(1)
+
+    # Bridge client — connects to psdk_bridge C process (retry up to 5 times)
     from bridge_client import BridgeClient
-    bridge = BridgeClient(
-        socket_path=socket_path,
-        mock_mode=False,
-    )
+    bridge = None
+    for attempt in range(5):
+        try:
+            bridge = BridgeClient(
+                socket_path=socket_path,
+                mock_mode=False,
+            )
+            break
+        except Exception as e:
+            print(f"[bundle] BridgeClient connect attempt {attempt+1} failed: {e}")
+            _t.sleep(2)
+    if bridge is None:
+        print("[bundle] ERROR: cannot connect to psdk_bridge, exiting")
+        bridge_proc.terminate()
+        sys.exit(1)
     print(f"[bundle] BridgeClient connected (uart={detected_dev})")
 
     # ROS2
