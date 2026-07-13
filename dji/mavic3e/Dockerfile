@@ -1,33 +1,38 @@
-ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
+# ── DJI Mavic 3E Driver Image ───────────────────────────────────────
+# FROM psdk-base (pre-built PSDK library), adds:
+#   - psdk_bridge C binary (compiled with PSDK_ENABLED)
+#   - Python MCP server + plugins
+#
+# Build:
+#   ./build.sh dji/mavic3e
+# ────────────────────────────────────────────────────────────────────
+
+ARG PSDK_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/psdk-base:latest
 ARG PYPI_MIRROR=https://pypi.org/simple/
-FROM ${ROS_BASE_IMAGE}
+FROM ${PSDK_BASE_IMAGE}
 ARG PYPI_MIRROR
 
 WORKDIR /work
 
-RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
-    apt-get install -y --no-install-recommends --allow-unauthenticated \
-        python3-pip \
-        cmake \
-        build-essential \
-        curl \
-        git \
-        libusb-1.0-0-dev \
-        libssl-dev \
-        libopus-dev \
-        ffmpeg \
-        udev \
-        usbutils && \
-    rm -rf /var/lib/apt/lists/*
-
+# ── Python dependencies ─────────────────────────────────────────────
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     pyyaml netifaces
 
-# ROS2 environment
+# ── ROS2 environment ────────────────────────────────────────────────
 ENV ROS_DOMAIN_ID=42
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 
-# Copy Python driver
+# ── Build psdk_bridge (links against pre-built PSDK in base image) ──
+COPY psdk_bridge/ /work/psdk_bridge/
+RUN mkdir -p /work/psdk_bridge/build && \
+    cd /work/psdk_bridge/build && \
+    cmake .. -DCMAKE_BUILD_TYPE=Release \
+             -DPSDK_DIR=/opt/Payload-SDK \
+             -DCMAKE_C_FLAGS="-DPSDK_ENABLED" && \
+    make -j$(nproc) && \
+    cp psdk_bridge /usr/local/bin/psdk_bridge
+
+# ── Application code (changes frequently) ──────────────────────────
 COPY main.py         /work/main.py
 COPY device.py       /work/device.py
 COPY bridge_client.py /work/bridge_client.py
@@ -35,27 +40,8 @@ COPY config.yaml     /work/config.yaml
 COPY resource/       /work/resource/
 COPY deploy/         /deploy/
 
-# Install udev rule for E-Port device auto-permission
+# ── udev rules for E-Port device auto-permission ───────────────────
 COPY deploy/99-eport.rules /etc/udev/rules.d/99-eport.rules
-
-# Download and build DJI Payload SDK
-ARG PSDK_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/Payload-SDK-3.16.0.tar.gz
-RUN curl -fsSL ${PSDK_URL} | tar xz -C /work && \
-    mv /work/Payload-SDK-* /work/Payload-SDK && \
-    mkdir -p /work/Payload-SDK/build && \
-    cd /work/Payload-SDK/build && \
-    cmake ../psdk_lib -DCMAKE_BUILD_TYPE=Release && \
-    make -j$(nproc)
-
-# Copy and build C bridge with PSDK enabled
-COPY psdk_bridge/ /work/psdk_bridge/
-RUN mkdir -p /work/psdk_bridge/build && \
-    cd /work/psdk_bridge/build && \
-    cmake .. -DCMAKE_BUILD_TYPE=Release \
-             -DPSDK_DIR=/work/Payload-SDK \
-             -DCMAKE_C_FLAGS="-DPSDK_ENABLED" && \
-    make -j$(nproc) && \
-    cp psdk_bridge /usr/local/bin/psdk_bridge
 
 ENV PYTHONPATH=/work
 ENV PYTHONUNBUFFERED=1
