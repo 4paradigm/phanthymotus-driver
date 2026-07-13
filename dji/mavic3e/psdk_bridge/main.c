@@ -46,31 +46,254 @@ static void _signal_handler(int sig) {
 #ifdef PSDK_ENABLED
 #include "dji_core.h"
 #include "dji_platform.h"
+#include <pthread.h>
+#include <semaphore.h>
+#include <termios.h>
+#include <fcntl.h>
+#include <errno.h>
 
-/* HAL/OSAL implementations are in hal_uart.c, hal_network.c, osal_posix.c */
+/* ── UART HAL implementation matching T_DjiHalUartHandler ─────────────── */
+
+static int s_uart_fd = -1;
+static const char *s_uart_device = "/dev/ttyUSB0";
+static uint32_t s_uart_baud = 921600;
+
+static speed_t _to_speed(uint32_t baud) {
+    switch (baud) {
+        case 115200:  return B115200;
+        case 230400:  return B230400;
+        case 460800:  return B460800;
+        case 921600:  return B921600;
+        case 1000000: return B1000000;
+        default:      return B921600;
+    }
+}
+
+static T_DjiReturnCode _HalUart_Init(E_DjiHalUartNum uartNum, uint32_t baudRate,
+                                      T_DjiUartHandle *uartHandle) {
+    (void)uartNum;
+    struct termios tty;
+
+    s_uart_fd = open(s_uart_device, O_RDWR | O_NOCTTY);
+    if (s_uart_fd < 0) {
+        printf("[hal] uart open %s failed: %s\n", s_uart_device, strerror(errno));
+        return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
+    }
+
+    memset(&tty, 0, sizeof(tty));
+    tcgetattr(s_uart_fd, &tty);
+    speed_t speed = _to_speed(baudRate);
+    cfsetispeed(&tty, speed);
+    cfsetospeed(&tty, speed);
+    tty.c_cflag = CS8 | CLOCAL | CREAD;
+    tty.c_iflag = 0;
+    tty.c_oflag = 0;
+    tty.c_lflag = 0;
+    tty.c_cc[VMIN] = 0;
+    tty.c_cc[VTIME] = 1;
+    tcsetattr(s_uart_fd, TCSANOW, &tty);
+    tcflush(s_uart_fd, TCIOFLUSH);
+
+    *uartHandle = (T_DjiUartHandle)(intptr_t)s_uart_fd;
+    printf("[hal] uart %s opened @ %u baud (fd=%d)\n", s_uart_device, baudRate, s_uart_fd);
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
+static T_DjiReturnCode _HalUart_DeInit(T_DjiUartHandle uartHandle) {
+    int fd = (int)(intptr_t)uartHandle;
+    if (fd >= 0) close(fd);
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
+static T_DjiReturnCode _HalUart_WriteData(T_DjiUartHandle uartHandle,
+                                           const uint8_t *buf, uint32_t len, uint32_t *realLen) {
+    int fd = (int)(intptr_t)uartHandle;
+    ssize_t n = write(fd, buf, len);
+    *realLen = (n > 0) ? (uint32_t)n : 0;
+    return (n >= 0) ? DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS : DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
+}
+
+static T_DjiReturnCode _HalUart_ReadData(T_DjiUartHandle uartHandle,
+                                          uint8_t *buf, uint32_t len, uint32_t *realLen) {
+    int fd = (int)(intptr_t)uartHandle;
+    ssize_t n = read(fd, buf, len);
+    *realLen = (n > 0) ? (uint32_t)n : 0;
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
+static T_DjiReturnCode _HalUart_GetStatus(E_DjiHalUartNum uartNum, T_DjiUartStatus *status) {
+    (void)uartNum;
+    status->isConnect = (s_uart_fd >= 0);
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
+static T_DjiReturnCode _HalUart_GetDeviceInfo(T_DjiHalUartDeviceInfo *deviceInfo) {
+    /* FTDI FT232R on E-Port dev board */
+    deviceInfo->vid = 0x0403;
+    deviceInfo->pid = 0x6001;
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
+/* ── OSAL implementation matching T_DjiOsalHandler ────────────────────── */
+
+static T_DjiReturnCode _Osal_TaskCreate(const char *name, void *(*taskFunc)(void *),
+                                         uint32_t stackSize, void *arg, T_DjiTaskHandle *task) {
+    pthread_t *tid = (pthread_t *)malloc(sizeof(pthread_t));
+    if (!tid) return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    if (stackSize > 0 && stackSize >= 64*1024)
+        pthread_attr_setstacksize(&attr, stackSize);
+    if (pthread_create(tid, &attr, taskFunc, arg) != 0) {
+        free(tid);
+        pthread_attr_destroy(&attr);
+        return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
+    }
+    pthread_attr_destroy(&attr);
+    *task = (T_DjiTaskHandle)tid;
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
+static T_DjiReturnCode _Osal_TaskDestroy(T_DjiTaskHandle task) {
+    pthread_t *tid = (pthread_t *)task;
+    pthread_cancel(*tid);
+    pthread_join(*tid, NULL);
+    free(tid);
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
+static T_DjiReturnCode _Osal_TaskSleepMs(uint32_t timeMs) {
+    usleep((useconds_t)timeMs * 1000);
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
+static T_DjiReturnCode _Osal_MutexCreate(T_DjiMutexHandle *mutex) {
+    pthread_mutex_t *m = (pthread_mutex_t *)malloc(sizeof(pthread_mutex_t));
+    if (!m) return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
+    pthread_mutex_init(m, NULL);
+    *mutex = (T_DjiMutexHandle)m;
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
+static T_DjiReturnCode _Osal_MutexDestroy(T_DjiMutexHandle mutex) {
+    pthread_mutex_destroy((pthread_mutex_t *)mutex);
+    free(mutex);
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
+static T_DjiReturnCode _Osal_MutexLock(T_DjiMutexHandle mutex) {
+    pthread_mutex_lock((pthread_mutex_t *)mutex);
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
+static T_DjiReturnCode _Osal_MutexUnlock(T_DjiMutexHandle mutex) {
+    pthread_mutex_unlock((pthread_mutex_t *)mutex);
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
+static T_DjiReturnCode _Osal_SemCreate(uint32_t initValue, T_DjiSemaHandle *semaphore) {
+    sem_t *s = (sem_t *)malloc(sizeof(sem_t));
+    if (!s) return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
+    sem_init(s, 0, initValue);
+    *semaphore = (T_DjiSemaHandle)s;
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
+static T_DjiReturnCode _Osal_SemDestroy(T_DjiSemaHandle semaphore) {
+    sem_destroy((sem_t *)semaphore);
+    free(semaphore);
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
+static T_DjiReturnCode _Osal_SemWait(T_DjiSemaHandle semaphore) {
+    sem_wait((sem_t *)semaphore);
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
+static T_DjiReturnCode _Osal_SemTimedWait(T_DjiSemaHandle semaphore, uint32_t waitTimeMs) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += waitTimeMs / 1000;
+    ts.tv_nsec += (waitTimeMs % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    int ret = sem_timedwait((sem_t *)semaphore, &ts);
+    return (ret == 0) ? DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS : DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
+}
+
+static T_DjiReturnCode _Osal_SemPost(T_DjiSemaHandle semaphore) {
+    sem_post((sem_t *)semaphore);
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
+static T_DjiReturnCode _Osal_GetTimeMs(uint32_t *ms) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    *ms = (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
+static T_DjiReturnCode _Osal_GetTimeUs(uint64_t *us) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    *us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
+static T_DjiReturnCode _Osal_GetRandomNum(uint16_t *randomNum) {
+    *randomNum = (uint16_t)(rand() & 0xFFFF);
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
+static void *_Osal_Malloc(uint32_t size) { return malloc(size); }
+static void _Osal_Free(void *ptr) { free(ptr); }
+
+/* ── PSDK init ────────────────────────────────────────────────────────── */
 
 static int _psdk_core_init(const char *app_id, const char *app_key,
                            const char *app_license, const char *app_name,
                            const char *uart_dev, uint32_t baud_rate) {
     T_DjiReturnCode rc;
+    s_uart_device = uart_dev;
+    s_uart_baud = baud_rate;
 
-    /* Register HAL (UART, USB, network) */
-    T_DjiHalUartHandler uartHandler = {
-        /* Fill with platform-specific UART operations */
-    };
-    rc = DjiPlatform_RegHalUartHandler(&uartHandler);
-    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-        printf("[psdk] HAL UART registration failed\n");
-        return -1;
-    }
-
-    /* Register OSAL (thread, mutex, semaphore) */
+    /* Register OSAL first (PSDK needs threads before anything else) */
     T_DjiOsalHandler osalHandler = {
-        /* Fill with POSIX implementations */
+        .TaskCreate = _Osal_TaskCreate,
+        .TaskDestroy = _Osal_TaskDestroy,
+        .TaskSleepMs = _Osal_TaskSleepMs,
+        .MutexCreate = _Osal_MutexCreate,
+        .MutexDestroy = _Osal_MutexDestroy,
+        .MutexLock = _Osal_MutexLock,
+        .MutexUnlock = _Osal_MutexUnlock,
+        .SemaphoreCreate = _Osal_SemCreate,
+        .SemaphoreDestroy = _Osal_SemDestroy,
+        .SemaphoreWait = _Osal_SemWait,
+        .SemaphoreTimedWait = _Osal_SemTimedWait,
+        .SemaphorePost = _Osal_SemPost,
+        .GetTimeMs = _Osal_GetTimeMs,
+        .GetTimeUs = _Osal_GetTimeUs,
+        .GetRandomNum = _Osal_GetRandomNum,
+        .Malloc = _Osal_Malloc,
+        .Free = _Osal_Free,
     };
     rc = DjiPlatform_RegOsalHandler(&osalHandler);
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-        printf("[psdk] OSAL registration failed\n");
+        printf("[psdk] OSAL registration failed: 0x%08llX\n", (unsigned long long)rc);
+        return -1;
+    }
+
+    /* Register HAL UART */
+    T_DjiHalUartHandler uartHandler = {
+        .UartInit = _HalUart_Init,
+        .UartDeInit = _HalUart_DeInit,
+        .UartWriteData = _HalUart_WriteData,
+        .UartReadData = _HalUart_ReadData,
+        .UartGetStatus = _HalUart_GetStatus,
+        .UartGetDeviceInfo = _HalUart_GetDeviceInfo,
+    };
+    rc = DjiPlatform_RegHalUartHandler(&uartHandler);
+    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+        printf("[psdk] HAL UART registration failed: 0x%08llX\n", (unsigned long long)rc);
         return -1;
     }
 
@@ -82,6 +305,7 @@ static int _psdk_core_init(const char *app_id, const char *app_key,
     strncpy(userInfo.appLicense, app_license, sizeof(userInfo.appLicense) - 1);
     strncpy(userInfo.developerAccount, "phanthymotus@4paradigm.com",
             sizeof(userInfo.developerAccount) - 1);
+    userInfo.baudRate = baud_rate;
 
     rc = DjiCore_Init(&userInfo);
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
