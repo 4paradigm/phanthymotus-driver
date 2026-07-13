@@ -309,6 +309,28 @@ def _get_usb_ids(device_path: str) -> tuple[str, str]:
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+def _configure_usb_gadget():
+    """Configure USB gadget VID/PID to a DJI-recognized USB Ethernet adapter.
+    DJI Mavic 3E only establishes network channel with specific VID/PID values.
+    Uses RTL8152 (0x0bda:0x8152) which is on DJI's supported list."""
+    gadget_path = "/sys/kernel/config/usb_gadget/l4t"
+    try:
+        # Check if gadget exists
+        if not os.path.exists(gadget_path):
+            print("[usb] no USB gadget configfs found, skipping")
+            return
+        # Write DJI-compatible VID/PID
+        with open(f"{gadget_path}/idVendor", "w") as f:
+            f.write("0x0bda")
+        with open(f"{gadget_path}/idProduct", "w") as f:
+            f.write("0x8152")
+        print("[usb] gadget VID/PID set to 0x0bda:0x8152 (RTL8152)")
+    except PermissionError:
+        print("[usb] WARNING: cannot modify gadget VID/PID (need root/privileged)")
+    except Exception as e:
+        print(f"[usb] WARNING: gadget config failed: {e}")
+
+
 def _start_registration(mcp_port: int, name: str, category: str):
     """Register this driver with agent-core in a background thread, then heartbeat every 30s."""
     import urllib.request as _urllib
@@ -375,6 +397,10 @@ def main():
     if not os.path.exists(bridge_bin):
         bridge_bin = "/work/psdk_bridge/build/psdk_bridge"
     socket_path = "/tmp/psdk_bridge.sock"
+
+    # Configure USB gadget VID/PID for DJI compatibility (RTL8152)
+    # DJI Mavic 3E only recognizes specific USB network adapters
+    _configure_usb_gadget()
 
     bridge_proc = _sp.Popen(
         [bridge_bin, socket_path,

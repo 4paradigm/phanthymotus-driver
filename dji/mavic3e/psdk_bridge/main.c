@@ -280,12 +280,28 @@ static T_DjiReturnCode _HalNetwork_Init(const char *ipAddr, const char *netMask,
         struct ifreq br_ifr;
         memset(&br_ifr, 0, sizeof(br_ifr));
         strncpy(br_ifr.ifr_name, "l4tbr0", IFNAMSIZ - 1);
-        /* SIOCBRDELIF = 0x89a3 */
         ioctl(sock, SIOCGIFINDEX, &ifr);
         br_ifr.ifr_ifindex = ifr.ifr_ifindex;
-        ioctl(br_sock, 0x89a3, &br_ifr);  /* ignore error if not in bridge */
+        ioctl(br_sock, 0x89a3, &br_ifr);
         close(br_sock);
         printf("[net] removed %s from bridge\n", NETWORK_IFACE);
+    }
+
+    /* Also remove usb0 from bridge if present */
+    {
+        struct ifreq usb_ifr;
+        memset(&usb_ifr, 0, sizeof(usb_ifr));
+        strncpy(usb_ifr.ifr_name, "usb0", IFNAMSIZ - 1);
+        int usb_sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (usb_sock >= 0) {
+            struct ifreq br2;
+            memset(&br2, 0, sizeof(br2));
+            strncpy(br2.ifr_name, "l4tbr0", IFNAMSIZ - 1);
+            ioctl(usb_sock, SIOCGIFINDEX, &usb_ifr);
+            br2.ifr_ifindex = usb_ifr.ifr_ifindex;
+            ioctl(usb_sock, 0x89a3, &br2);
+            close(usb_sock);
+        }
     }
 
     /* Flush existing IP (bring down first) */
@@ -326,9 +342,19 @@ static T_DjiReturnCode _HalNetwork_DeInit(T_DjiNetworkHandle networkHandle) {
 }
 
 static T_DjiReturnCode _HalNetwork_GetDeviceInfo(T_DjiHalNetworkDeviceInfo *deviceInfo) {
-    /* Jetson Nano RNDIS gadget — use VID/PID that DJI recognizes */
-    deviceInfo->usbNetAdapter.vid = 0x0955;
-    deviceInfo->usbNetAdapter.pid = 0x7020;
+    /* Read actual VID/PID from USB gadget configfs */
+    FILE *f;
+    char buf[16];
+    uint16_t vid = 0x0955, pid = 0x7020;  /* default Jetson */
+
+    f = fopen("/sys/kernel/config/usb_gadget/l4t/idVendor", "r");
+    if (f) { if (fgets(buf, sizeof(buf), f)) vid = (uint16_t)strtol(buf, NULL, 16); fclose(f); }
+    f = fopen("/sys/kernel/config/usb_gadget/l4t/idProduct", "r");
+    if (f) { if (fgets(buf, sizeof(buf), f)) pid = (uint16_t)strtol(buf, NULL, 16); fclose(f); }
+
+    deviceInfo->usbNetAdapter.vid = vid;
+    deviceInfo->usbNetAdapter.pid = pid;
+    printf("[net] device info: vid=0x%04X pid=0x%04X\n", vid, pid);
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
 
