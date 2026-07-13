@@ -255,22 +255,68 @@ def make_handler():
     return Handler
 
 
-# ── Device wait (container startup) ───────────────────────────────────────
+# ── Device auto-detect (container startup) ────────────────────────────────
 
-def _wait_for_device(device_path: str, timeout: int = 30):
-    """Wait for E-Port USB device to appear (handles container startup race condition)."""
+# Known E-Port USB devices
+_EPORT_USB_IDS = [
+    ("0403", "6001"),  # FTDI FT232R (E-Port dev board)
+    ("0403", "6010"),  # FTDI FT2232 (dual-port variant)
+    ("0403", "6014"),  # FTDI FT232H
+    ("2ca3", None),    # DJI direct (any PID)
+]
+
+
+def _detect_uart_device(timeout: int = 30) -> str | None:
+    """Auto-detect E-Port serial device by scanning /dev/ttyUSB* and /dev/ttyACM*.
+    Matches by USB VID/PID from sysfs. Returns device path or None."""
+    import glob
     import time as _t
+
     start = _t.time()
-    while not os.path.exists(device_path):
+    while True:
+        candidates = sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*"))
+        for dev in candidates:
+            vid, pid = _get_usb_ids(dev)
+            if vid:
+                for known_vid, known_pid in _EPORT_USB_IDS:
+                    if vid == known_vid and (known_pid is None or pid == known_pid):
+                        print(f"[bundle] E-Port detected: {dev} (VID={vid} PID={pid})")
+                        return dev
+
+        # If no known device found but there are serial devices, use first one
+        if candidates:
+            vid, pid = _get_usb_ids(candidates[0])
+            print(f"[bundle] Using first serial device: {candidates[0]} "
+                  f"(VID={vid or '?'} PID={pid or '?'})")
+            return candidates[0]
+
         elapsed = _t.time() - start
         if elapsed > timeout:
-            print(f"[bundle] WARNING: {device_path} not found after {timeout}s — "
-                  "E-Port may not be connected")
-            return
+            print(f"[bundle] WARNING: no serial device found after {timeout}s")
+            return None
         if int(elapsed) % 5 == 0 and int(elapsed) > 0:
-            print(f"[bundle] waiting for {device_path}... ({int(elapsed)}s)")
+            print(f"[bundle] waiting for E-Port device... ({int(elapsed)}s)")
         _t.sleep(1)
-    print(f"[bundle] {device_path} detected")
+
+
+def _get_usb_ids(device_path: str) -> tuple[str, str]:
+    """Read USB VID/PID from sysfs for a tty device."""
+    dev_name = os.path.basename(device_path)
+    # Try /sys/class/tty/<dev>/device/../idVendor
+    for base in [f"/sys/class/tty/{dev_name}/device/..",
+                 f"/sys/class/tty/{dev_name}/device/../.."]:
+        vid_path = f"{base}/idVendor"
+        pid_path = f"{base}/idProduct"
+        try:
+            with open(vid_path) as f:
+                vid = f.read().strip()
+            with open(pid_path) as f:
+                pid = f.read().strip()
+            if vid:
+                return vid, pid
+        except (FileNotFoundError, PermissionError):
+            continue
+    return "", ""
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -323,9 +369,18 @@ def main():
     from bridge_client import BridgeClient
 
     if not mock_mode:
-        # Wait for E-Port device to appear (USB hotplug in container)
-        uart_dev = psdk_cfg.get("uart_dev", "/dev/ttyACM0")
-        _wait_for_device(uart_dev)
+        # Auto-detect or use configured UART device
+        uart_dev = psdk_cfg.get("uart_dev", "auto")
+        if uart_dev == "auto":
+            detected = _detect_uart_device(timeout=30)
+            if detected:
+                uart_dev = detected
+            else:
+                print("[bundle] No E-Port device found, falling back to mock mode")
+                mock_mode = True
+        elif not os.path.exists(uart_dev):
+            print(f"[bundle] {uart_dev} not found, falling back to mock mode")
+            mock_mode = True
 
     bridge = BridgeClient(mock_mode=mock_mode)
     print(f"[bundle] BridgeClient initialized (mock={mock_mode})")
