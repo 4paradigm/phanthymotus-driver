@@ -33,8 +33,8 @@ if(LIBUSB_INCLUDE)
     include_directories(${LIBUSB_INCLUDE})
 endif()
 
-# OpenSSL for PSDK auth
-find_package(OpenSSL)
+# OpenSSL for PSDK auth (optional in stub mode)
+find_package(OpenSSL QUIET)
 if(OPENSSL_FOUND)
     include_directories(${OPENSSL_INCLUDE_DIR})
 endif()
@@ -63,9 +63,12 @@ target_link_libraries(psdk_bridge
     ${PSDK_LIB}
     Threads::Threads
     ${LIBUSB_LIB}
-    ${OPENSSL_LIBRARIES}
     m
 )
+
+if(OPENSSL_FOUND)
+    target_link_libraries(psdk_bridge ${OPENSSL_LIBRARIES})
+endif()
 
 # ── Install ──────────────────────────────────────────────────────────────
 install(TARGETS psdk_bridge DESTINATION bin)
