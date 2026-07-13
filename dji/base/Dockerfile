@@ -27,7 +27,7 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     rm -rf /var/lib/apt/lists/*
 
 # ── Download Payload SDK (pre-built static library) ───────────────
-ARG PSDK_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/Payload-SDK-3.16.0.tar.gz
+ARG PSDK_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/psdk_lib-3.16.0.tar.gz
 RUN curl -fsSL ${PSDK_URL} | tar xz -C /opt && \
     mv /opt/Payload-SDK-* /opt/Payload-SDK
 
