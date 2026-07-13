@@ -362,16 +362,15 @@ def _configure_usb_gadget():
 
     # Step 3: Bind UDC (after startup_bulk has opened ep0)
     _t2.sleep(1)
-    try:
-        udc_name = open("/sys/class/udc/" + os.listdir("/sys/class/udc/")[0] + "/../../../UDC", "r")
-    except Exception:
-        pass
     gadget_udc = "/sys/kernel/config/usb_gadget/l4t/UDC"
     if os.path.exists(gadget_udc):
-        udc_name = os.listdir("/sys/class/udc/")[0]
-        with open(gadget_udc, "w") as f:
-            f.write(udc_name)
-        print(f"[usb] UDC bound: {udc_name}")
+        try:
+            udc_name = os.listdir("/sys/class/udc/")[0]
+            with open(gadget_udc, "w") as f:
+                f.write(udc_name)
+            print(f"[usb] UDC bound: {udc_name}")
+        except Exception as e:
+            print(f"[usb] WARNING: UDC bind failed: {e} (USB host may not be connected)")
     else:
         print("[usb] WARNING: cannot find gadget UDC file")
 

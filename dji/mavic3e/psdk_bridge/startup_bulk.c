@@ -123,15 +123,13 @@ int main(int argc, char *argv[]) {
     /* Write empty strings (required by FunctionFS) */
     struct {
         struct usb_functionfs_strings_head header;
-        uint16_t lang;
     } __attribute__((packed)) strings = {
         .header = {
             .magic = FUNCTIONFS_STRINGS_MAGIC,
             .length = sizeof(strings),
             .str_count = 0,
-            .lang_count = 1,
+            .lang_count = 0,
         },
-        .lang = 0x0409,
     };
 
     n = write(fd, &strings, sizeof(strings));
