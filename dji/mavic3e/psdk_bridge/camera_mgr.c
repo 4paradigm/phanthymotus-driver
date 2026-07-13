@@ -50,10 +50,9 @@ int camera_mgr_set_mode(const char *mode) {
 }
 
 int camera_mgr_set_zoom(float factor) {
-    T_DjiCameraManagerOpticalZoomParam param = {
-        .currentOpticalZoomFactor = factor,
-    };
-    return (DjiCameraManager_SetOpticalZoomParam(MOUNT_POS, param) == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) ? 0 : -1;
+    /* SetOpticalZoomParam takes (position, zoomDirection, factor) */
+    E_DjiCameraZoomDirection dir = DJI_CAMERA_ZOOM_DIRECTION_IN;
+    return (DjiCameraManager_SetOpticalZoomParam(MOUNT_POS, dir, factor) == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) ? 0 : -1;
 }
 
 int camera_mgr_set_focus(float x, float y) {

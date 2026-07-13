@@ -31,7 +31,7 @@
 static T_DjiFcSubscriptionQuaternion s_quaternion;
 static T_DjiFcSubscriptionVelocity s_velocity;
 static T_DjiFcSubscriptionGpsPosition s_gps_pos;
-static T_DjiFcSubscriptionGpsDetail s_gps_detail;
+static T_DjiFcSubscriptionGpsDetails s_gps_detail;
 static T_DjiFcSubscriptionAltitudeFused s_alt_fused;
 static T_DjiFcSubscriptionAltitudeOfHomePoint s_alt_home;
 static T_DjiFcSubscriptionFlightStatus s_flight_status;
@@ -170,13 +170,13 @@ int telemetry_get_json(char *buf, size_t buflen) {
         q0, q1, q2, q3, yaw, pitch, roll,
         (double)s_velocity.data.x, (double)s_velocity.data.y, (double)s_velocity.data.z,
         (int)s_battery.batteryCapacityPercent, (double)s_battery.currentVoltage / 1000.0,
-        (int)s_gps_detail.gpsSatelliteNumberUsed, (int)s_gps_detail.fix,
+        (int)s_gps_detail.gpsSatelliteNumberUsed, (int)s_gps_detail.fixState,
         (double)s_compass.x,
-        (double)s_avoid.down[0], (double)s_avoid.down[1],
-        (double)s_avoid.down[2], (double)s_avoid.down[3],
-        (double)s_avoid.up[0], (double)s_avoid.down[4],
-        s_rc.leftStickLeftRight, s_rc.leftStickUpDown,
-        s_rc.rightStickLeftRight, s_rc.rightStickUpDown,
+        (double)s_avoid.front, (double)s_avoid.back,
+        (double)s_avoid.left, (double)s_avoid.right,
+        (double)s_avoid.up, (double)s_avoid.down,
+        s_rc.roll, s_rc.pitch,
+        s_rc.yaw, s_rc.throttle,
         (int)s_flight_status, (int)s_display_mode
     );
     return 0;

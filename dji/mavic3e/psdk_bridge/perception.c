@@ -22,11 +22,11 @@
 
 static perception_image_cb_t s_image_cb = NULL;
 
-static T_DjiReturnCode _image_cb(T_DjiPerceptionImageInfo info,
-                                  const uint8_t *data, uint32_t len) {
+static void _image_cb(T_DjiPerceptionImageInfo info,
+                      uint8_t *data, uint32_t len) {
     if (s_image_cb) {
         const char *dir = "unknown";
-        switch (info.direction) {
+        switch (info.rawInfo.direction) {
             case DJI_PERCEPTION_RECTIFY_FRONT: dir = "front"; break;
             case DJI_PERCEPTION_RECTIFY_REAR:  dir = "back";  break;
             case DJI_PERCEPTION_RECTIFY_LEFT:  dir = "left";  break;
@@ -36,7 +36,6 @@ static T_DjiReturnCode _image_cb(T_DjiPerceptionImageInfo info,
         }
         s_image_cb(dir, data, info.rawInfo.width, info.rawInfo.height);
     }
-    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
 
 int perception_init(void) {
@@ -79,7 +78,7 @@ int perception_stop(const char *direction) {
 }
 
 void perception_cleanup(void) {
-    DjiPerception_DeInit();
+    DjiPerception_Deinit();
 }
 
 #else /* stub */

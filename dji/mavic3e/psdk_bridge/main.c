@@ -47,12 +47,7 @@ static void _signal_handler(int sig) {
 #include "dji_core.h"
 #include "dji_platform.h"
 
-/* HAL implementations needed by PSDK — platform-specific (Jetson NX) */
-/* These are typically provided by the PSDK sample's hal/ directory. */
-extern T_DjiReturnCode HalUart_Init(const char *device, uint32_t baudRate);
-extern T_DjiReturnCode Osal_TaskCreate(const char *name, void *(*taskFunc)(void *),
-                                        uint32_t stackSize, void *arg);
-/* ... other HAL/OSAL functions ... */
+/* HAL/OSAL implementations are in hal_uart.c, hal_network.c, osal_posix.c */
 
 static int _psdk_core_init(const char *app_id, const char *app_key,
                            const char *app_license, const char *app_name,

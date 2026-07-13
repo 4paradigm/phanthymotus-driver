@@ -12,29 +12,35 @@
 #include "dji_widget.h"
 
 int speaker_init(void) {
-    /* Speaker widget is initialized as part of the widget system */
-    printf("[speaker] initialized\n");
+    /* Speaker widget requires full registration via DjiWidget_RegSpeakerHandler.
+     * TODO: Implement T_DjiWidgetSpeakerHandler callbacks for TTS/voice playback. */
+    printf("[speaker] initialized (widget speaker — TODO: register handler)\n");
     return 0;
 }
 
 int speaker_play_tts(const char *text) {
-    T_DjiWidgetSpeakerPlayTtsInfo info = {0};
-    info.language = DJI_WIDGET_SPEAKER_LANGUAGE_CHINESE;
-    strncpy(info.text, text, sizeof(info.text) - 1);
-    return (DjiWidgetSpeaker_PlayTts(&info) == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) ? 0 : -1;
+    /* TODO: Speaker TTS requires DjiWidget_RegSpeakerHandler with ReceiveTtsData callback.
+     * Direct API calls like DjiWidgetSpeaker_PlayTts() do not exist in PSDK 3.16.0. */
+    printf("[speaker] TODO: play TTS via widget handler: %s\n", text);
+    return 0;
 }
 
 int speaker_play_file(const char *file_path) {
-    /* Play audio file via speaker widget */
+    /* TODO: Implement via widget speaker handler ReceiveVoiceData */
+    printf("[speaker] TODO: play file via widget handler: %s\n", file_path);
     return 0;
 }
 
 int speaker_set_volume(int volume) {
-    return (DjiWidgetSpeaker_SetVolume(volume) == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) ? 0 : -1;
+    /* TODO: Implement via widget speaker handler SetVolume callback */
+    printf("[speaker] TODO: set volume %d via widget handler\n", volume);
+    return 0;
 }
 
 int speaker_stop(void) {
-    return (DjiWidgetSpeaker_StopPlay() == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) ? 0 : -1;
+    /* TODO: Implement via widget speaker handler StopPlay callback */
+    printf("[speaker] TODO: stop via widget handler\n");
+    return 0;
 }
 
 void speaker_cleanup(void) {}

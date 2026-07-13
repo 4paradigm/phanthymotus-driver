@@ -1,5 +1,6 @@
 #include "flight_ctrl.h"
 #include <stdio.h>
+#include <string.h>
 
 /*
  * PSDK Flight Controller for Mavic 3E.
@@ -29,7 +30,10 @@
 static int s_has_authority = 0;
 
 int flight_ctrl_init(void) {
-    T_DjiReturnCode rc = DjiFlightController_Init();
+    /* DjiFlightController_Init requires RID info (latitude/longitude in rad, altitude) */
+    T_DjiFlightControllerRidInfo ridInfo = {0};
+    /* TODO: fill ridInfo with actual takeoff location for RID compliance */
+    T_DjiReturnCode rc = DjiFlightController_Init(ridInfo);
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
         printf("[flight] init failed: 0x%08llX\n", (unsigned long long)rc);
         return -1;
@@ -99,22 +103,24 @@ int flight_ctrl_set_home(double lat, double lon) {
         .latitude = lat,
         .longitude = lon,
     };
-    return (DjiFlightController_SetHomePointByGPSCoordinate(home) == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) ? 0 : -1;
+    return (DjiFlightController_SetHomeLocationUsingGPSCoordinates(home) == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) ? 0 : -1;
 }
 
 int flight_ctrl_set_obstacle_avoidance(int enabled, const char *direction) {
     /* Mavic 3E supports per-direction obstacle avoidance */
     T_DjiReturnCode rc;
-    /* For "all" — set all directions */
-    E_DjiFlightControllerObstacleAvoidanceDirection dir;
+    E_DjiFlightControllerObstacleAvoidanceEnableStatus status = enabled
+        ? DJI_FLIGHT_CONTROLLER_ENABLE_OBSTACLE_AVOIDANCE
+        : DJI_FLIGHT_CONTROLLER_DISABLE_OBSTACLE_AVOIDANCE;
+
     if (strcmp(direction, "up") == 0) {
-        rc = DjiFlightController_SetUpwardsAvoidanceEnabled(enabled ? DJI_FLIGHT_CONTROLLER_ENABLE : DJI_FLIGHT_CONTROLLER_DISABLE);
+        rc = DjiFlightController_SetUpwardsVisualObstacleAvoidanceEnableStatus(status);
     } else if (strcmp(direction, "down") == 0) {
-        rc = DjiFlightController_SetDownwardsVisualObstacleAvoidanceEnabled(enabled ? DJI_FLIGHT_CONTROLLER_ENABLE : DJI_FLIGHT_CONTROLLER_DISABLE);
+        rc = DjiFlightController_SetDownwardsVisualObstacleAvoidanceEnableStatus(status);
     } else {
-        rc = DjiFlightController_SetHorizontalVisualObstacleAvoidanceEnabled(enabled ? DJI_FLIGHT_CONTROLLER_ENABLE : DJI_FLIGHT_CONTROLLER_DISABLE);
-        DjiFlightController_SetUpwardsAvoidanceEnabled(enabled ? DJI_FLIGHT_CONTROLLER_ENABLE : DJI_FLIGHT_CONTROLLER_DISABLE);
-        DjiFlightController_SetDownwardsVisualObstacleAvoidanceEnabled(enabled ? DJI_FLIGHT_CONTROLLER_ENABLE : DJI_FLIGHT_CONTROLLER_DISABLE);
+        rc = DjiFlightController_SetHorizontalVisualObstacleAvoidanceEnableStatus(status);
+        DjiFlightController_SetUpwardsVisualObstacleAvoidanceEnableStatus(status);
+        DjiFlightController_SetDownwardsVisualObstacleAvoidanceEnableStatus(status);
     }
     return (rc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) ? 0 : -1;
 }
