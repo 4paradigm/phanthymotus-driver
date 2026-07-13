@@ -543,7 +543,7 @@ class FlightPlugin:
                     },
                 },
             },
-        }
+        }]
 
     def start(self):
         pass
@@ -844,6 +844,7 @@ class WaypointPlugin:
                     "cancel": {"params": [], "description": "取消/停止航点任务"},
                     "status": {"params": [], "description": "查询航点任务执行状态"},
                 },
+            },
         }
 
     def start(self):
