@@ -306,7 +306,7 @@ static int _psdk_core_init(const char *app_id, const char *app_key,
     strncpy(userInfo.appLicense, app_license, sizeof(userInfo.appLicense) - 1);
     strncpy(userInfo.developerAccount, "phanthymotus@4paradigm.com",
             sizeof(userInfo.developerAccount) - 1);
-    userInfo.baudRate = baud_rate;
+    snprintf(userInfo.baudRate, sizeof(userInfo.baudRate), "%u", baud_rate);
 
     rc = DjiCore_Init(&userInfo);
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
