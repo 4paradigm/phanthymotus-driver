@@ -356,27 +356,31 @@ def main():
     mcp_port = int(cfg.get("mcp_port", 15702))
     psdk_cfg = cfg.get("psdk_bridge", {})
     mock_mode = psdk_cfg.get("mock_mode", True)
+    # Allow env override: PSDK_MOCK=0 forces live, PSDK_MOCK=1 forces mock
+    env_mock = os.environ.get("PSDK_MOCK")
+    if env_mock is not None:
+        mock_mode = env_mock != "0"
 
-    print(f"[bundle] namespace={namespace} mcp_port={mcp_port} mock={mock_mode}")
+    # Auto-detect: if uart_dev is "auto", try to find device regardless of mock_mode setting
+    uart_dev = psdk_cfg.get("uart_dev", "auto")
+    detected_dev = None
+    if uart_dev == "auto":
+        detected_dev = _detect_uart_device(timeout=10)
+        if detected_dev:
+            mock_mode = False  # Device found — switch to live mode
+    elif os.path.exists(uart_dev):
+        detected_dev = uart_dev
+        mock_mode = False  # Explicit device exists — switch to live mode
+
+    print(f"[bundle] namespace={namespace} mcp_port={mcp_port} mock={mock_mode}"
+          f" uart={detected_dev or 'none'}")
 
     # Bridge client — communicates with C psdk_bridge or runs in mock mode
     from bridge_client import BridgeClient
-
-    if not mock_mode:
-        # Auto-detect or use configured UART device
-        uart_dev = psdk_cfg.get("uart_dev", "auto")
-        if uart_dev == "auto":
-            detected = _detect_uart_device(timeout=30)
-            if detected:
-                uart_dev = detected
-            else:
-                print("[bundle] No E-Port device found, falling back to mock mode")
-                mock_mode = True
-        elif not os.path.exists(uart_dev):
-            print(f"[bundle] {uart_dev} not found, falling back to mock mode")
-            mock_mode = True
-
-    bridge = BridgeClient(mock_mode=mock_mode)
+    bridge = BridgeClient(
+        socket_path="/tmp/psdk_bridge.sock",
+        mock_mode=mock_mode,
+    )
     print(f"[bundle] BridgeClient initialized (mock={mock_mode})")
 
     # ROS2
