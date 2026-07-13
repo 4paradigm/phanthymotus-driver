@@ -46,6 +46,7 @@ static void _signal_handler(int sig) {
 #ifdef PSDK_ENABLED
 #include "dji_core.h"
 #include "dji_platform.h"
+#include "dji_payload_camera.h"
 #include <pthread.h>
 #include <semaphore.h>
 #include <termios.h>
@@ -322,6 +323,12 @@ static int _psdk_core_init(const char *app_id, const char *app_key,
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
         printf("[psdk] application start failed: 0x%08llX\n", (unsigned long long)rc);
         return -1;
+    }
+
+    /* Camera init required even for non-camera payloads (Pilot won't detect otherwise) */
+    rc = DjiPayloadCamera_Init();
+    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+        printf("[psdk] payload camera init warning: 0x%08llX\n", (unsigned long long)rc);
     }
 
     printf("[psdk] core initialized (app=%s, id=%s)\n", app_name, app_id);
