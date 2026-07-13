@@ -274,9 +274,24 @@ static T_DjiReturnCode _HalNetwork_Init(const char *ipAddr, const char *netMask,
     memset(&ifr, 0, sizeof(ifr));
     strncpy(ifr.ifr_name, NETWORK_IFACE, IFNAMSIZ - 1);
 
-    /* Remove from bridge if attached */
-    /* (ignore errors — may not be in a bridge) */
-    ioctl(sock, SIOCGIFINDEX, &ifr);
+    /* Remove rndis0 from any bridge (l4tbr0) — critical for direct routing */
+    int br_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (br_sock >= 0) {
+        struct ifreq br_ifr;
+        memset(&br_ifr, 0, sizeof(br_ifr));
+        strncpy(br_ifr.ifr_name, "l4tbr0", IFNAMSIZ - 1);
+        /* SIOCBRDELIF = 0x89a3 */
+        ioctl(sock, SIOCGIFINDEX, &ifr);
+        br_ifr.ifr_ifindex = ifr.ifr_ifindex;
+        ioctl(br_sock, 0x89a3, &br_ifr);  /* ignore error if not in bridge */
+        close(br_sock);
+        printf("[net] removed %s from bridge\n", NETWORK_IFACE);
+    }
+
+    /* Flush existing IP (bring down first) */
+    ioctl(sock, SIOCGIFFLAGS, &ifr);
+    ifr.ifr_flags &= ~IFF_UP;
+    ioctl(sock, SIOCSIFFLAGS, &ifr);
 
     /* Set IP address */
     struct sockaddr_in *addr = (struct sockaddr_in *)&ifr.ifr_addr;
