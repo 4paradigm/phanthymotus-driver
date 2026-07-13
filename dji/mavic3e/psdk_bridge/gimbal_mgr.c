@@ -30,17 +30,17 @@ int gimbal_mgr_rotate(float pitch, float yaw, float roll, const char *mode, floa
     rotation.time = duration;
 
     if (strcmp(mode, "relative") == 0)
-        rotation.rotationMode = DJI_GIMBAL_MANAGER_ROTATION_MODE_RELATIVE_ANGLE;
+        rotation.rotationMode = DJI_GIMBAL_ROTATION_MODE_RELATIVE_ANGLE;
     else if (strcmp(mode, "speed") == 0)
-        rotation.rotationMode = DJI_GIMBAL_MANAGER_ROTATION_MODE_SPEED;
+        rotation.rotationMode = DJI_GIMBAL_ROTATION_MODE_SPEED;
     else
-        rotation.rotationMode = DJI_GIMBAL_MANAGER_ROTATION_MODE_ABSOLUTE_ANGLE;
+        rotation.rotationMode = DJI_GIMBAL_ROTATION_MODE_ABSOLUTE_ANGLE;
 
     return (DjiGimbalManager_Rotate(MOUNT_POS, rotation) == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) ? 0 : -1;
 }
 
 int gimbal_mgr_reset(void) {
-    return (DjiGimbalManager_Reset(MOUNT_POS) == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) ? 0 : -1;
+    return (DjiGimbalManager_Reset(MOUNT_POS, DJI_GIMBAL_RESET_MODE_PITCH_AND_YAW) == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) ? 0 : -1;
 }
 
 int gimbal_mgr_set_mode(const char *mode) {
@@ -57,7 +57,7 @@ int gimbal_mgr_get_angles(float *pitch, float *yaw, float *roll) {
 }
 
 void gimbal_mgr_cleanup(void) {
-    DjiGimbalManager_DeInit();
+    DjiGimbalManager_Deinit();
 }
 
 #else /* stub */
