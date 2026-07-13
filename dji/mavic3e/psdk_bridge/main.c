@@ -96,8 +96,8 @@ static T_DjiReturnCode _HalUart_Init(E_DjiHalUartNum uartNum, uint32_t baudRate,
     tty.c_iflag = 0;
     tty.c_oflag = 0;
     tty.c_lflag = 0;
-    tty.c_cc[VMIN] = 1;   /* Block until at least 1 byte */
-    tty.c_cc[VTIME] = 1;  /* 100ms inter-byte timeout */
+    tty.c_cc[VMIN] = 0;   /* Non-blocking: return immediately with available data */
+    tty.c_cc[VTIME] = 5;  /* 500ms timeout — enough for aircraft to respond */
     tcsetattr(s_uart_fd, TCSANOW, &tty);
     tcflush(s_uart_fd, TCIOFLUSH);
 
