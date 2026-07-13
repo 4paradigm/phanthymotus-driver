@@ -38,11 +38,22 @@ COPY deploy/         /deploy/
 # Install udev rule for E-Port device auto-permission
 COPY deploy/99-eport.rules /etc/udev/rules.d/99-eport.rules
 
-# Copy and build C bridge (stub mode unless PSDK_DIR is provided at build time)
+# Download and build DJI Payload SDK
+ARG PSDK_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/Payload-SDK-3.16.0.tar.gz
+RUN curl -fsSL ${PSDK_URL} | tar xz -C /work && \
+    mv /work/Payload-SDK-* /work/Payload-SDK && \
+    mkdir -p /work/Payload-SDK/build && \
+    cd /work/Payload-SDK/build && \
+    cmake ../psdk_lib -DCMAKE_BUILD_TYPE=Release && \
+    make -j$(nproc)
+
+# Copy and build C bridge with PSDK enabled
 COPY psdk_bridge/ /work/psdk_bridge/
 RUN mkdir -p /work/psdk_bridge/build && \
     cd /work/psdk_bridge/build && \
-    cmake .. -DCMAKE_BUILD_TYPE=Release && \
+    cmake .. -DCMAKE_BUILD_TYPE=Release \
+             -DPSDK_DIR=/work/Payload-SDK \
+             -DCMAKE_C_FLAGS="-DPSDK_ENABLED" && \
     make -j$(nproc) && \
     cp psdk_bridge /usr/local/bin/psdk_bridge
 
