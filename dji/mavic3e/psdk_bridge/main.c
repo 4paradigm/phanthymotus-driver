@@ -75,6 +75,12 @@ static T_DjiReturnCode _HalUart_Init(E_DjiHalUartNum uartNum, uint32_t baudRate,
     (void)uartNum;
     struct termios tty;
 
+    /* Close previous fd if PSDK re-inits with different baud */
+    if (s_uart_fd >= 0) {
+        close(s_uart_fd);
+        s_uart_fd = -1;
+    }
+
     s_uart_fd = open(s_uart_device, O_RDWR | O_NOCTTY);
     if (s_uart_fd < 0) {
         printf("[hal] uart open %s failed: %s\n", s_uart_device, strerror(errno));
@@ -90,8 +96,8 @@ static T_DjiReturnCode _HalUart_Init(E_DjiHalUartNum uartNum, uint32_t baudRate,
     tty.c_iflag = 0;
     tty.c_oflag = 0;
     tty.c_lflag = 0;
-    tty.c_cc[VMIN] = 0;
-    tty.c_cc[VTIME] = 1;
+    tty.c_cc[VMIN] = 1;   /* Block until at least 1 byte */
+    tty.c_cc[VTIME] = 1;  /* 100ms inter-byte timeout */
     tcsetattr(s_uart_fd, TCSANOW, &tty);
     tcflush(s_uart_fd, TCIOFLUSH);
 
