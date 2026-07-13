@@ -15,11 +15,18 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-# PSDK static library (built separately per PSDK docs)
-find_library(PSDK_LIB payloadsdk PATHS ${PSDK_DIR}/build/psdk_lib NO_DEFAULT_PATH)
+# PSDK pre-built static library
+# Search paths: platform-specific lib dirs in PSDK distribution
+find_library(PSDK_LIB payloadsdk
+    PATHS
+        ${PSDK_DIR}/psdk_lib/lib/aarch64-linux-gnu-gcc
+        ${PSDK_DIR}/psdk_lib/lib/x86_64-linux-gnu-gcc
+        ${PSDK_DIR}/psdk_lib/lib/arm-linux-gnueabihf-gcc
+        ${PSDK_DIR}/build/psdk_lib
+    NO_DEFAULT_PATH
+)
 if(NOT PSDK_LIB)
-    message(WARNING "libpayloadsdk.a not found at ${PSDK_DIR}/build/psdk_lib — using stub")
-    # Create a stub so the project structure is valid even without PSDK built
+    message(WARNING "libpayloadsdk.a not found in ${PSDK_DIR}/psdk_lib/lib/ — using stub")
     set(PSDK_LIB "")
 endif()
 

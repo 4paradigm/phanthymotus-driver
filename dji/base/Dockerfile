@@ -26,14 +26,12 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
         usbutils && \
     rm -rf /var/lib/apt/lists/*
 
-# ── Download and build Payload SDK ──────────────────────────────────
+# ── Download Payload SDK (pre-built static library) ───────────────
 ARG PSDK_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/Payload-SDK-3.16.0.tar.gz
 RUN curl -fsSL ${PSDK_URL} | tar xz -C /opt && \
-    mv /opt/Payload-SDK-* /opt/Payload-SDK && \
-    mkdir -p /opt/Payload-SDK/build && \
-    cd /opt/Payload-SDK/build && \
-    cmake ../psdk_lib -DCMAKE_BUILD_TYPE=Release && \
-    make -j$(nproc)
+    mv /opt/Payload-SDK-* /opt/Payload-SDK
 
 # PSDK install location for downstream images
+# Pre-built libs: /opt/Payload-SDK/psdk_lib/lib/aarch64-linux-gnu-gcc/libpayloadsdk.a
+# Headers:        /opt/Payload-SDK/psdk_lib/include/
 ENV PSDK_DIR=/opt/Payload-SDK
