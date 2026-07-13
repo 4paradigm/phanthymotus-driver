@@ -107,12 +107,6 @@ class Mavic3EDeviceBundle:
                 plugins_cfg["speaker"], namespace, executor, bridge))
             print("[bundle] SpeakerPlugin loaded")
 
-        if plugins_cfg.get("power", {}).get("enabled", False):
-            from device import PowerPlugin
-            self._plugins.append(PowerPlugin(
-                plugins_cfg["power"], namespace, executor, bridge))
-            print("[bundle] PowerPlugin loaded")
-
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
             try:

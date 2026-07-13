@@ -35,5 +35,3 @@ plugins:
     enabled: true
   speaker:
     enabled: true
-  power:
-    enabled: true
