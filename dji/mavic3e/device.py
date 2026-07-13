@@ -523,7 +523,6 @@ class FlightPlugin:
                         },
                     },
                     "required": ["action"],
-                },
                 "x-action-params": {
                     "takeoff": {"params": [], "description": "起飞 (自动悬停在1.2m)"},
                     "land": {"params": [], "description": "降落"},
@@ -544,7 +543,7 @@ class FlightPlugin:
                     },
                 },
             },
-        ]
+        }
 
     def start(self):
         pass
@@ -650,24 +649,24 @@ class CameraPlugin:
                     "point_y": {"type": "number", "description": "红外测温点 Y (0-1)"},
                 },
                 "required": ["action"],
-            },
-            "x-action-params": {
-                "take_photo": {"params": ["mode"], "description": "拍照 (支持单拍/连拍/定时)"},
-                "start_video": {"params": [], "description": "开始录像"},
-                "stop_video": {"params": [], "description": "停止录像"},
-                "set_mode": {"params": ["mode"], "description": "切换相机模式 (photo/video)"},
-                "set_zoom": {"params": ["zoom_factor"], "description": "设置变焦倍数"},
-                "set_focus": {"params": ["focus_x", "focus_y"], "description": "设置对焦点"},
-                "set_exposure": {
-                    "params": ["iso", "aperture", "shutter_speed", "ev"],
-                    "description": "设置曝光参数",
+                "x-action-params": {
+                    "take_photo": {"params": ["mode"], "description": "拍照 (支持单拍/连拍/定时)"},
+                    "start_video": {"params": [], "description": "开始录像"},
+                    "stop_video": {"params": [], "description": "停止录像"},
+                    "set_mode": {"params": ["mode"], "description": "切换相机模式 (photo/video)"},
+                    "set_zoom": {"params": ["zoom_factor"], "description": "设置变焦倍数"},
+                    "set_focus": {"params": ["focus_x", "focus_y"], "description": "设置对焦点"},
+                    "set_exposure": {
+                        "params": ["iso", "aperture", "shutter_speed", "ev"],
+                        "description": "设置曝光参数",
+                    },
+                    "get_storage": {"params": [], "description": "查询存储卡剩余容量"},
+                    "ir_temp_point": {
+                        "params": ["point_x", "point_y"],
+                        "description": "红外点测温 (仅3T型号)",
+                    },
+                    "ir_temp_area": {"params": [], "description": "红外区域测温 (仅3T型号)"},
                 },
-                "get_storage": {"params": [], "description": "查询存储卡剩余容量"},
-                "ir_temp_point": {
-                    "params": ["point_x", "point_y"],
-                    "description": "红外点测温 (仅3T型号)",
-                },
-                "ir_temp_area": {"params": [], "description": "红外区域测温 (仅3T型号)"},
             },
         }
 
@@ -762,15 +761,15 @@ class GimbalPlugin:
                     "duration": {"type": "number", "description": "旋转时长 (秒)"},
                 },
                 "required": ["action"],
-            },
-            "x-action-params": {
-                "rotate": {
-                    "params": ["pitch", "yaw", "roll", "mode", "duration"],
-                    "description": "旋转云台到指定角度",
+                "x-action-params": {
+                    "rotate": {
+                        "params": ["pitch", "yaw", "roll", "mode", "duration"],
+                        "description": "旋转云台到指定角度",
+                    },
+                    "reset": {"params": [], "description": "复位云台到初始位置"},
+                    "set_mode": {"params": ["mode"], "description": "设置云台模式 (free/fpv/yaw_follow)"},
+                    "get_angles": {"params": [], "description": "获取当前云台角度"},
                 },
-                "reset": {"params": [], "description": "复位云台到初始位置"},
-                "set_mode": {"params": ["mode"], "description": "设置云台模式 (free/fpv/yaw_follow)"},
-                "get_angles": {"params": [], "description": "获取当前云台角度"},
             },
         }
 
@@ -837,15 +836,14 @@ class WaypointPlugin:
                     "kmz_path": {"type": "string", "description": "KMZ 任务文件路径"},
                 },
                 "required": ["action"],
-            },
-            "x-action-params": {
-                "upload": {"params": ["kmz_path"], "description": "上传 KMZ 航点任务文件"},
-                "execute": {"params": [], "description": "开始执行已上传的航点任务"},
-                "pause": {"params": [], "description": "暂停当前航点任务"},
-                "resume": {"params": [], "description": "恢复暂停的航点任务"},
-                "cancel": {"params": [], "description": "取消/停止航点任务"},
-                "status": {"params": [], "description": "查询航点任务执行状态"},
-            },
+                "x-action-params": {
+                    "upload": {"params": ["kmz_path"], "description": "上传 KMZ 航点任务文件"},
+                    "execute": {"params": [], "description": "开始执行已上传的航点任务"},
+                    "pause": {"params": [], "description": "暂停当前航点任务"},
+                    "resume": {"params": [], "description": "恢复暂停的航点任务"},
+                    "cancel": {"params": [], "description": "取消/停止航点任务"},
+                    "status": {"params": [], "description": "查询航点任务执行状态"},
+                },
         }
 
     def start(self):
@@ -912,11 +910,11 @@ class SpeakerPlugin:
                     "volume": {"type": "integer", "description": "音量 (0-100)"},
                 },
                 "required": ["action"],
-            },
-            "x-action-params": {
-                "play": {"params": ["text", "file_path"], "description": "播放 TTS 文本或音频文件"},
-                "set_volume": {"params": ["volume"], "description": "设置喊话器音量 (0-100)"},
-                "stop_play": {"params": [], "description": "停止播放"},
+                "x-action-params": {
+                    "play": {"params": ["text", "file_path"], "description": "播放 TTS 文本或音频文件"},
+                    "set_volume": {"params": ["volume"], "description": "设置喊话器音量 (0-100)"},
+                    "stop_play": {"params": [], "description": "停止播放"},
+                },
             },
         }
 
