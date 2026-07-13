@@ -484,58 +484,12 @@ class HmsPlugin:
 #  PSDK: 飞行控制
 # ═══════════════════════════════════════════════════════════════════════════
 
-class _FlightStatusNode(Node):
-    """Publishes flight status as JSON for dashboard card."""
-
-    def __init__(self, topic: str, bridge):
-        super().__init__("mavic3e_flight_status")
-        self._topic = topic
-        self._bridge = bridge
-        self._pub = self.create_publisher(String, topic, _LOW_LAT_QOS)
-        self._timer = None
-        self.state = "idle"
-
-    def start(self):
-        if self.state == "running":
-            return
-        self._timer = self.create_timer(0.5, self._tick)  # 2Hz
-        self.state = "running"
-
-    def stop(self):
-        if self._timer:
-            self._timer.cancel()
-            self._timer = None
-        self.state = "idle"
-
-    def _tick(self):
-        try:
-            resp = self._bridge.get_telemetry()
-            if resp.get("ok"):
-                d = resp["data"]
-                status = {
-                    "flight_status": d.get("flight_status", "unknown"),
-                    "flight_mode": d.get("flight_mode", "unknown"),
-                    "battery": d.get("battery", {}),
-                    "gps": d.get("gps", {}),
-                    "altitude": d.get("position", {}).get("altitude", 0),
-                }
-                msg = String()
-                msg.data = json.dumps(status, separators=(",", ":"))
-                self._pub.publish(msg)
-        except Exception:
-            pass
-
-
 class FlightPlugin:
     PREFIX = "flight"
 
     def __init__(self, plugin_config: dict, namespace: str, executor, bridge):
         self._bridge = bridge
         self._has_authority = False
-        self._namespace = namespace
-        self._status_topic = f"/{namespace}/flight/status"
-        self._status_node = _FlightStatusNode(self._status_topic, bridge)
-        executor.add_node(self._status_node)
 
     def get_tools(self) -> list:
         return [
@@ -590,49 +544,18 @@ class FlightPlugin:
                     },
                 },
             },
-            {
-                "name": "flight_status",
-                "type": "sensor",
-                "description": "查询 Mavic 3E 飞行状态：飞行模式、GPS 质量、电池电量、高度。",
-                "topic_out": [{"topic": self._status_topic, "format": "data/json"}],
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "action": {
-                            "type": "string",
-                            "enum": ["start", "stop", "info"],
-                        },
-                    },
-                    "required": ["action"],
-                },
-            },
         ]
 
     def start(self):
-        self._status_node.start()
+        pass
 
     def stop(self):
-        self._status_node.stop()
         if self._has_authority:
             self._bridge.release_joystick_authority()
             self._has_authority = False
 
     def dispatch(self, action: str, args: dict) -> dict | None:
-        tool_name = args.pop("_tool_name", "flight")
-
-        if tool_name == "flight_status":
-            if action == "start":
-                self._status_node.start()
-                return {"state": "running"}
-            if action == "stop":
-                self._status_node.stop()
-                return {"state": "idle"}
-            if action == "info":
-                return {
-                    "state": self._status_node.state,
-                    "topic_out": [{"topic": self._status_topic, "format": "data/json"}],
-                }
-            return None
+        args.pop("_tool_name", None)
 
         # flight tool
         if action == "start":
@@ -1023,85 +946,4 @@ class SpeakerPlugin:
         return None
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  PowerPlugin (sensor)
-#  PSDK: 电源管理
-# ═══════════════════════════════════════════════════════════════════════════
 
-class _PowerNode(Node):
-    def __init__(self, topic: str, bridge):
-        super().__init__("mavic3e_power")
-        self._topic = topic
-        self._bridge = bridge
-        self._pub = self.create_publisher(String, topic, _LOW_LAT_QOS)
-        self._timer = None
-        self.state = "idle"
-
-    def start(self):
-        if self.state == "running":
-            return
-        self._timer = self.create_timer(5.0, self._tick)
-        self.state = "running"
-
-    def stop(self):
-        if self._timer:
-            self._timer.cancel()
-            self._timer = None
-        self.state = "idle"
-
-    def _tick(self):
-        try:
-            resp = self._bridge.get_power_state()
-            if resp.get("ok"):
-                msg = String()
-                msg.data = json.dumps(resp["data"], separators=(",", ":"))
-                self._pub.publish(msg)
-        except Exception as e:
-            self.get_logger().error(f"Power tick error: {e}")
-
-
-class PowerPlugin:
-    PREFIX = "power"
-
-    def __init__(self, plugin_config: dict, namespace: str, executor, bridge):
-        self._topic = f"/{namespace}/power/state"
-        self._node = _PowerNode(self._topic, bridge)
-        executor.add_node(self._node)
-
-    def get_tool(self) -> dict:
-        return {
-            "name": "power",
-            "type": "sensor",
-            "description": "Mavic 3E E-Port 电源状态：电池电量/电压/电流、E-Port 供电状态。",
-            "topic_out": [{"topic": self._topic, "format": "data/json"}],
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["start", "stop", "info"],
-                    },
-                },
-                "required": ["action"],
-            },
-        }
-
-    def start(self):
-        self._node.start()
-
-    def stop(self):
-        self._node.stop()
-
-    def dispatch(self, action: str, args: dict) -> dict | None:
-        if action == "start":
-            self._node.start()
-            return {"state": "running"}
-        if action == "stop":
-            self._node.stop()
-            return {"state": "idle"}
-        if action == "info":
-            return {
-                "state": self._node.state,
-                "topic_out": [{"topic": self._topic, "format": "data/json"}],
-            }
-        return None
