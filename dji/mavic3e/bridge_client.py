@@ -153,9 +153,9 @@ class BridgeClient:
     def _connect(self):
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._sock.connect(self._socket_path)
+        self._sock.settimeout(10.0)
         self._running = True
-        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
-        self._reader_thread.start()
+        # Note: no reader thread — _call() does synchronous send/recv
         print(f"[BridgeClient] connected to {self._socket_path}", flush=True)
 
     def _reader_loop(self):
@@ -190,13 +190,16 @@ class BridgeClient:
         with self._lock:
             self._request_id += 1
             req = {"id": self._request_id, "cmd": cmd, "args": args or {}}
-            _send_msg(self._sock, req)
-            # In live mode, response comes via the reader thread
-            # For simplicity, we use synchronous recv here (lock ensures serial access)
-            msg = _recv_msg(self._sock)
-            if msg is None:
-                return {"ok": False, "error": "bridge disconnected"}
-            return msg
+            try:
+                _send_msg(self._sock, req)
+                msg = _recv_msg(self._sock)
+                if msg is None:
+                    return {"ok": False, "error": "bridge disconnected"}
+                return msg
+            except socket.timeout:
+                return {"ok": False, "error": "bridge timeout"}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
 
     def stop(self):
         self._running = False
