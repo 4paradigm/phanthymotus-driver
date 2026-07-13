@@ -13,14 +13,12 @@
  * USB Bulk HAL for DJI PSDK — FunctionFS endpoints.
  *
  * Each bulk channel has:
- *   ep1 = IN  (device→host, i.e., Jetson→Aircraft)
- *   ep2 = OUT (host→device, i.e., Aircraft→Jetson)
+ *   ep1 = EP_IN  (read: data from aircraft to Jetson)
+ *   ep2 = EP_OUT (write: data from Jetson to aircraft)
  *
- * For liveview/perception, we READ from ep1 (data coming from aircraft).
+ * WriteData → write to ep_in (fd_in = ep1)
+ * ReadData  → read from ep_out (fd_out = ep2)
  */
-
-#define USB_BULK_EP_IN_FMT  "/dev/usb-ffs/bulk%d/ep1"
-#define USB_BULK_EP_OUT_FMT "/dev/usb-ffs/bulk%d/ep2"
 
 typedef struct {
     int fd_in;
@@ -35,10 +33,12 @@ static T_DjiReturnCode _UsbBulk_Init(T_DjiHalUsbBulkInfo usbBulkInfo,
     if (usbBulkInfo.channelInfo.endPointIn == 0x81) channel = 1;
     else if (usbBulkInfo.channelInfo.endPointIn == 0x82) channel = 2;
     else if (usbBulkInfo.channelInfo.endPointIn == 0x83) channel = 3;
-    else channel = 1;  /* fallback */
+    else channel = 1;
+
+    /* DJI convention: ep1 = EP_IN_FD, ep2 = EP_OUT_FD */
     char ep_in[64], ep_out[64];
-    snprintf(ep_in, sizeof(ep_in), USB_BULK_EP_IN_FMT, channel);
-    snprintf(ep_out, sizeof(ep_out), USB_BULK_EP_OUT_FMT, channel);
+    snprintf(ep_in, sizeof(ep_in), "/dev/usb-ffs/bulk%d/ep1", channel);
+    snprintf(ep_out, sizeof(ep_out), "/dev/usb-ffs/bulk%d/ep2", channel);
 
     BulkHandle_t *h = (BulkHandle_t *)malloc(sizeof(BulkHandle_t));
     if (!h) return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
@@ -59,7 +59,8 @@ static T_DjiReturnCode _UsbBulk_Init(T_DjiHalUsbBulkInfo usbBulkInfo,
     }
 
     *usbBulkHandle = (T_DjiUsbBulkHandle)h;
-    printf("[usb_bulk] channel %d opened (in=%s, out=%s)\n", channel, ep_in, ep_out);
+    printf("[usb_bulk] ch%d init (ep_in=%s ep_out=%s isHost=%d)\n",
+           channel, ep_in, ep_out, usbBulkInfo.isUsbHost);
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
 
@@ -76,7 +77,8 @@ static T_DjiReturnCode _UsbBulk_DeInit(T_DjiUsbBulkHandle usbBulkHandle) {
 static T_DjiReturnCode _UsbBulk_WriteData(T_DjiUsbBulkHandle usbBulkHandle,
                                            const uint8_t *buf, uint32_t len, uint32_t *realLen) {
     BulkHandle_t *h = (BulkHandle_t *)usbBulkHandle;
-    ssize_t n = write(h->fd_out, buf, len);
+    ssize_t n = write(h->fd_in, buf, len);  /* ep1 = IN direction (write to host) */
+    *realLen = (n > 0) ? (uint32_t)n : 0;
     *realLen = (n > 0) ? (uint32_t)n : 0;
     return (n >= 0) ? DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS : DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
 }
@@ -84,7 +86,7 @@ static T_DjiReturnCode _UsbBulk_WriteData(T_DjiUsbBulkHandle usbBulkHandle,
 static T_DjiReturnCode _UsbBulk_ReadData(T_DjiUsbBulkHandle usbBulkHandle,
                                           uint8_t *buf, uint32_t len, uint32_t *realLen) {
     BulkHandle_t *h = (BulkHandle_t *)usbBulkHandle;
-    ssize_t n = read(h->fd_in, buf, len);
+    ssize_t n = read(h->fd_out, buf, len);  /* ep2 = OUT direction (read from host) */
     *realLen = (n > 0) ? (uint32_t)n : 0;
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
