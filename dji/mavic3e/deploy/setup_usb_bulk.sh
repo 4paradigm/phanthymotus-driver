@@ -4,7 +4,7 @@
 # Reference: DJI PSDK Raspberry Pi demo (raspi-usb-device-start.sh)
 # Must run with root/privileged.
 
-set -e
+set -ex
 
 UDC_NAME=$(ls /sys/class/udc/ 2>/dev/null | head -1)
 if [ -z "$UDC_NAME" ]; then
