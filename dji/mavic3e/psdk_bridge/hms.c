@@ -41,9 +41,8 @@ static T_DjiReturnCode _hms_cb(T_DjiHmsInfoTable info) {
 
 /* Lookup error code in built-in hmsErrCodeInfoTbl (727 entries) */
 static const char *_lookup_msg(uint32_t code, int is_flying) {
-    extern const T_DjiHmsErrCodeInfo hmsErrCodeInfoTbl[];
-    extern const uint32_t hmsErrCodeInfoTblSize;
-    for (uint32_t i = 0; i < hmsErrCodeInfoTblSize; i++) {
+    size_t tbl_size = sizeof(hmsErrCodeInfoTbl) / sizeof(hmsErrCodeInfoTbl[0]);
+    for (size_t i = 0; i < tbl_size; i++) {
         if (hmsErrCodeInfoTbl[i].alarmId == code) {
             if (is_flying && hmsErrCodeInfoTbl[i].flyAlarmInfo && hmsErrCodeInfoTbl[i].flyAlarmInfo[0])
                 return hmsErrCodeInfoTbl[i].flyAlarmInfo;
