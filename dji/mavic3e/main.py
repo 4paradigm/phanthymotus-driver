@@ -257,25 +257,36 @@ def make_handler():
 
 # ── Device auto-detect (container startup) ────────────────────────────────
 
+# Known E-Port USB devices (VID, PID or None for any PID)
+_EPORT_USB_IDS = [
+    ("2ca3", None),    # DJI direct (any PID)
+    ("0403", "6001"),  # FTDI FT232R (E-Port dev board)
+    ("0403", "6010"),  # FTDI FT2232 (dual-port variant)
+    ("0403", "6014"),  # FTDI FT232H
+]
+
 
 def _detect_uart_device(timeout: int = 30) -> str | None:
-    """Auto-detect E-Port serial device by scanning all /dev/ttyUSB* and /dev/ttyACM*.
-    Returns the first available serial device path, or None after timeout."""
+    """Auto-detect E-Port serial device by scanning /dev/ttyUSB* and /dev/ttyACM*.
+    Matches by USB VID/PID whitelist from sysfs. Returns device path or None."""
     import glob
     import time as _t
 
     start = _t.time()
     while True:
         candidates = sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*"))
-        if candidates:
-            dev = candidates[0]
+        for dev in candidates:
             vid, pid = _get_usb_ids(dev)
-            print(f"[bundle] E-Port detected: {dev} (VID={vid or '?'} PID={pid or '?'})")
-            return dev
+            if not vid:
+                continue
+            for known_vid, known_pid in _EPORT_USB_IDS:
+                if vid == known_vid and (known_pid is None or pid == known_pid):
+                    print(f"[bundle] E-Port detected: {dev} (VID={vid} PID={pid})")
+                    return dev
 
         elapsed = _t.time() - start
         if elapsed > timeout:
-            print(f"[bundle] WARNING: no serial device found after {timeout}s")
+            print(f"[bundle] WARNING: no E-Port device found after {timeout}s")
             return None
         if int(elapsed) % 5 == 0 and int(elapsed) > 0:
             print(f"[bundle] waiting for E-Port device... ({int(elapsed)}s)")
