@@ -391,6 +391,18 @@ class BridgeClient:
     def emergency_brake(self):
         return self._call("emergency_brake")
 
+    def turn_on_motors(self):
+        return self._call("rotate_start")
+
+    def turn_off_motors(self):
+        return self._call("rotate_stop")
+
+    def slow_rotate_start(self):
+        return self._call("slow_rotate_start")
+
+    def slow_rotate_stop(self):
+        return self._call("slow_rotate_stop")
+
     def set_home_point(self, lat: float, lon: float):
         return self._call("set_home_point", {"lat": lat, "lon": lon})
 

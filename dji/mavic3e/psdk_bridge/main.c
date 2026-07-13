@@ -385,6 +385,26 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
         snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
         return 0;
     }
+    if (strstr(raw_json, "\"rotate_start\"") && !strstr(raw_json, "\"slow_rotate_start\"")) {
+        int r = flight_ctrl_turn_on_motors();
+        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        return 0;
+    }
+    if (strstr(raw_json, "\"rotate_stop\"") && !strstr(raw_json, "\"slow_rotate_stop\"")) {
+        int r = flight_ctrl_turn_off_motors();
+        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        return 0;
+    }
+    if (strstr(raw_json, "\"slow_rotate_start\"")) {
+        int r = flight_ctrl_slow_rotate_start();
+        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        return 0;
+    }
+    if (strstr(raw_json, "\"slow_rotate_stop\"")) {
+        int r = flight_ctrl_slow_rotate_stop();
+        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        return 0;
+    }
     if (strstr(raw_json, "\"obtain_joystick_authority\"")) {
         int r = flight_ctrl_obtain_authority();
         snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);

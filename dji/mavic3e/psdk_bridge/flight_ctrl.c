@@ -98,6 +98,22 @@ int flight_ctrl_emergency_brake(void) {
     return (DjiFlightController_ExecuteEmergencyBrakeAction() == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) ? 0 : -1;
 }
 
+int flight_ctrl_turn_on_motors(void) {
+    return (DjiFlightController_TurnOnMotors() == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) ? 0 : -1;
+}
+
+int flight_ctrl_turn_off_motors(void) {
+    return (DjiFlightController_TurnOffMotors() == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) ? 0 : -1;
+}
+
+int flight_ctrl_slow_rotate_start(void) {
+    return (DjiFlightController_StartSlowRotateMotor() == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) ? 0 : -1;
+}
+
+int flight_ctrl_slow_rotate_stop(void) {
+    return (DjiFlightController_StopSlowRotateMotor() == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) ? 0 : -1;
+}
+
 int flight_ctrl_set_home(double lat, double lon) {
     T_DjiFlightControllerHomeLocation home = {
         .latitude = lat,
@@ -142,6 +158,10 @@ int flight_ctrl_go_home(void) { return 0; }
 int flight_ctrl_cancel_go_home(void) { return 0; }
 int flight_ctrl_joystick_move(float vx, float vy, float vz, float vyaw) { return 0; }
 int flight_ctrl_emergency_brake(void) { return 0; }
+int flight_ctrl_turn_on_motors(void) { return 0; }
+int flight_ctrl_turn_off_motors(void) { return 0; }
+int flight_ctrl_slow_rotate_start(void) { return 0; }
+int flight_ctrl_slow_rotate_stop(void) { return 0; }
 int flight_ctrl_obtain_authority(void) { return 0; }
 int flight_ctrl_release_authority(void) { return 0; }
 int flight_ctrl_set_home(double lat, double lon) { return 0; }
