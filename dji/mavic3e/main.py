@@ -355,33 +355,33 @@ def main():
     namespace = _resolve_namespace(cfg)
     mcp_port = int(cfg.get("mcp_port", 15702))
     psdk_cfg = cfg.get("psdk_bridge", {})
-    mock_mode = psdk_cfg.get("mock_mode", True)
-    # Allow env override: PSDK_MOCK=0 forces live, PSDK_MOCK=1 forces mock
-    env_mock = os.environ.get("PSDK_MOCK")
-    if env_mock is not None:
-        mock_mode = env_mock != "0"
 
-    # Auto-detect: if uart_dev is "auto", try to find device regardless of mock_mode setting
+    # Auto-detect UART device
     uart_dev = psdk_cfg.get("uart_dev", "auto")
     detected_dev = None
     if uart_dev == "auto":
         detected_dev = _detect_uart_device(timeout=10)
-        if detected_dev:
-            mock_mode = False  # Device found — switch to live mode
     elif os.path.exists(uart_dev):
         detected_dev = uart_dev
-        mock_mode = False  # Explicit device exists — switch to live mode
 
-    print(f"[bundle] namespace={namespace} mcp_port={mcp_port} mock={mock_mode}"
-          f" uart={detected_dev or 'none'}")
+    # No device = don't start (avoid mock data misleading users)
+    if not detected_dev:
+        print(f"[bundle] ERROR: No E-Port device found. Driver will not start.")
+        print(f"[bundle] Connect E-Port dev board and restart container.")
+        # Keep process alive so container doesn't restart-loop, but don't serve
+        import time as _t
+        while True:
+            _t.sleep(60)
 
-    # Bridge client — communicates with C psdk_bridge or runs in mock mode
+    print(f"[bundle] namespace={namespace} mcp_port={mcp_port} uart={detected_dev}")
+
+    # Bridge client — connects to psdk_bridge C process
     from bridge_client import BridgeClient
     bridge = BridgeClient(
         socket_path="/tmp/psdk_bridge.sock",
-        mock_mode=mock_mode,
+        mock_mode=False,
     )
-    print(f"[bundle] BridgeClient initialized (mock={mock_mode})")
+    print(f"[bundle] BridgeClient initialized (live mode, uart={detected_dev})")
 
     # ROS2
     rclpy.init()
