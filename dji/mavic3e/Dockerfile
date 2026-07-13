@@ -22,13 +22,12 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
 ENV ROS_DOMAIN_ID=42
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 
-# ── Build psdk_bridge (links against pre-built PSDK in base image) ──
+# ── Build psdk_bridge (stub mode until PSDK API adaptation is complete) ──
 COPY psdk_bridge/ /work/psdk_bridge/
 RUN mkdir -p /work/psdk_bridge/build && \
     cd /work/psdk_bridge/build && \
     cmake .. -DCMAKE_BUILD_TYPE=Release \
-             -DPSDK_DIR=/opt/Payload-SDK \
-             -DCMAKE_C_FLAGS="-DPSDK_ENABLED" && \
+             -DPSDK_DIR=/opt/Payload-SDK && \
     make -j$(nproc) && \
     cp psdk_bridge /usr/local/bin/psdk_bridge
 
