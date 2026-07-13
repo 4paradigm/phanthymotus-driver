@@ -30,7 +30,7 @@ typedef struct {
 
 static T_DjiReturnCode _UsbBulk_Init(T_DjiHalUsbBulkInfo usbBulkInfo,
                                       T_DjiUsbBulkHandle *usbBulkHandle) {
-    int channel = usbBulkInfo.channelInfo + 1;  /* enum 0-based → 1-based path */
+    int channel = usbBulkInfo.channelInfo.interfaceNum + 1;  /* interface 0→bulk1, 1→bulk2, 2→bulk3 */
     char ep_in[64], ep_out[64];
     snprintf(ep_in, sizeof(ep_in), USB_BULK_EP_IN_FMT, channel);
     snprintf(ep_out, sizeof(ep_out), USB_BULK_EP_OUT_FMT, channel);
