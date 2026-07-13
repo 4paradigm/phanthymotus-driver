@@ -28,9 +28,10 @@ RUN mkdir -p /work/psdk_bridge/build && \
     cd /work/psdk_bridge/build && \
     cmake .. -DCMAKE_BUILD_TYPE=Release \
              -DPSDK_DIR=/opt/Payload-SDK \
-             -DCMAKE_C_FLAGS="-DPSDK_ENABLED -DPSDK_ARCH_SYS_LINUX=1 -DCONFIG_HARDWARE_CONNECTION=DJI_USE_UART_AND_NETWORK_DEVICE" && \
+             -DCMAKE_C_FLAGS="-DPSDK_ENABLED -DPSDK_ARCH_SYS_LINUX=1 -DCONFIG_HARDWARE_CONNECTION=DJI_USE_UART_AND_USB_BULK_DEVICE" && \
     make -j$(nproc) && \
-    cp psdk_bridge /usr/local/bin/psdk_bridge
+    cp psdk_bridge /usr/local/bin/psdk_bridge && \
+    cp startup_bulk /usr/local/bin/startup_bulk
 
 # ── Application code (changes frequently) ──────────────────────────
 COPY main.py         /work/main.py

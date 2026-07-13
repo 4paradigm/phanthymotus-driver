@@ -310,25 +310,24 @@ def _get_usb_ids(device_path: str) -> tuple[str, str]:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def _configure_usb_gadget():
-    """Configure USB gadget VID/PID to a DJI-recognized USB Ethernet adapter.
-    DJI Mavic 3E only establishes network channel with specific VID/PID values.
-    Uses RTL8152 (0x0bda:0x8152) which is on DJI's supported list."""
-    gadget_path = "/sys/kernel/config/usb_gadget/l4t"
-    try:
-        # Check if gadget exists
-        if not os.path.exists(gadget_path):
-            print("[usb] no USB gadget configfs found, skipping")
-            return
-        # Write DJI-compatible VID/PID
-        with open(f"{gadget_path}/idVendor", "w") as f:
-            f.write("0x0bda")
-        with open(f"{gadget_path}/idProduct", "w") as f:
-            f.write("0x8152")
-        print("[usb] gadget VID/PID set to 0x0bda:0x8152 (RTL8152)")
-    except PermissionError:
-        print("[usb] WARNING: cannot modify gadget VID/PID (need root/privileged)")
-    except Exception as e:
-        print(f"[usb] WARNING: gadget config failed: {e}")
+    """Configure USB gadget for DJI PSDK USB Bulk mode.
+    Sets up FunctionFS bulk endpoints required for liveview/perception."""
+    import subprocess as _sp2
+    setup_script = "/deploy/setup_usb_bulk.sh"
+    if not os.path.exists(setup_script):
+        setup_script = os.path.join(os.path.dirname(__file__), "deploy", "setup_usb_bulk.sh")
+    if os.path.exists(setup_script):
+        print("[usb] running setup_usb_bulk.sh...")
+        result = _sp2.run(["bash", setup_script], capture_output=True, text=True, timeout=30)
+        if result.stdout:
+            for line in result.stdout.strip().split("\n"):
+                print(f"[usb] {line}")
+        if result.returncode != 0:
+            print(f"[usb] WARNING: setup failed (rc={result.returncode})")
+            if result.stderr:
+                print(f"[usb] {result.stderr.strip()}")
+    else:
+        print("[usb] setup_usb_bulk.sh not found, skipping USB Bulk config")
 
 
 def _start_registration(mcp_port: int, name: str, category: str):
