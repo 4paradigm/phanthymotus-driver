@@ -506,6 +506,8 @@ class FlightPlugin:
                                 "start", "stop",
                                 "takeoff", "land", "go_home", "cancel_go_home",
                                 "move", "stop_move",
+                                "rotate_start", "rotate_stop",
+                                "slow_rotate_start", "slow_rotate_stop",
                                 "set_home", "set_obstacle_avoidance",
                             ],
                         },
@@ -537,6 +539,10 @@ class FlightPlugin:
                         "description": "摇杆控制 — 设置速度向量 (需先获取控制权)",
                     },
                     "stop_move": {"params": [], "description": "紧急刹车 (悬停)"},
+                    "rotate_start": {"params": [], "description": "启动电机旋转桨叶 (全速)"},
+                    "rotate_stop": {"params": [], "description": "停止电机 (仅地面可用)"},
+                    "slow_rotate_start": {"params": [], "description": "怠速慢旋桨叶 (预检查)"},
+                    "slow_rotate_stop": {"params": [], "description": "停止慢旋"},
                     "set_home": {
                         "params": ["lat", "lon"],
                         "description": "设置返航点 GPS 坐标",
@@ -595,6 +601,18 @@ class FlightPlugin:
         if action == "stop_move":
             resp = self._bridge.emergency_brake()
             return {"ret": 0 if resp.get("ok") else -1, "action": "brake"}
+        if action == "rotate_start":
+            resp = self._bridge.turn_on_motors()
+            return {"ret": 0 if resp.get("ok") else -1, "action": "rotate_start"}
+        if action == "rotate_stop":
+            resp = self._bridge.turn_off_motors()
+            return {"ret": 0 if resp.get("ok") else -1, "action": "rotate_stop"}
+        if action == "slow_rotate_start":
+            resp = self._bridge.slow_rotate_start()
+            return {"ret": 0 if resp.get("ok") else -1, "action": "slow_rotate_start"}
+        if action == "slow_rotate_stop":
+            resp = self._bridge.slow_rotate_stop()
+            return {"ret": 0 if resp.get("ok") else -1, "action": "slow_rotate_stop"}
         if action == "set_home":
             resp = self._bridge.set_home_point(
                 lat=args.get("lat", 0), lon=args.get("lon", 0),
