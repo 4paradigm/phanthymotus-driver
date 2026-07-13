@@ -515,7 +515,11 @@ class FlightPlugin:
                         "vyaw": {"type": "number", "description": "偏航角速度 (deg/s)，正=顺时针"},
                         "lat": {"type": "number", "description": "纬度 (返航点)"},
                         "lon": {"type": "number", "description": "经度 (返航点)"},
-                        "enabled": {"type": "boolean", "description": "避障开关"},
+                        "enabled": {
+                            "type": "string",
+                            "description": "避障开关",
+                            "enum": ["on", "off"],
+                        },
                         "direction": {
                             "type": "string",
                             "description": "避障方向",
@@ -597,8 +601,9 @@ class FlightPlugin:
             )
             return {"ret": 0 if resp.get("ok") else -1}
         if action == "set_obstacle_avoidance":
+            enabled_val = args.get("enabled", "on")
             resp = self._bridge.set_obstacle_avoidance(
-                enabled=args.get("enabled", True),
+                enabled=(enabled_val == "on" or enabled_val is True),
                 direction=args.get("direction", "all"),
             )
             return {"ret": 0 if resp.get("ok") else -1}
