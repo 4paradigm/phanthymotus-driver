@@ -28,7 +28,7 @@ RUN mkdir -p /work/psdk_bridge/build && \
     cd /work/psdk_bridge/build && \
     cmake .. -DCMAKE_BUILD_TYPE=Release \
              -DPSDK_DIR=/opt/Payload-SDK \
-             -DCMAKE_C_FLAGS="-DPSDK_ENABLED -DPSDK_ARCH_SYS_LINUX=1 -DCONFIG_HARDWARE_CONNECTION=DJI_USE_ONLY_UART" && \
+             -DCMAKE_C_FLAGS="-DPSDK_ENABLED -DPSDK_ARCH_SYS_LINUX=1 -DCONFIG_HARDWARE_CONNECTION=DJI_USE_UART_AND_NETWORK_DEVICE" && \
     make -j$(nproc) && \
     cp psdk_bridge /usr/local/bin/psdk_bridge
 

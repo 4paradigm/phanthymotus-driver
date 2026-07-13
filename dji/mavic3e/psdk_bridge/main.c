@@ -49,6 +49,10 @@ static void _signal_handler(int sig) {
 #include "dji_payload_camera.h"
 #include <pthread.h>
 #include <semaphore.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <termios.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -254,6 +258,65 @@ static T_DjiReturnCode _Osal_GetRandomNum(uint16_t *randomNum) {
 static void *_Osal_Malloc(uint32_t size) { return malloc(size); }
 static void _Osal_Free(void *ptr) { free(ptr); }
 
+/* ── Network HAL (configure RNDIS interface via ioctl) ────────────────── */
+
+#define NETWORK_IFACE "rndis0"
+
+static T_DjiReturnCode _HalNetwork_Init(const char *ipAddr, const char *netMask,
+                                         T_DjiNetworkHandle *networkHandle) {
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        printf("[net] socket failed: %s\n", strerror(errno));
+        return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
+    }
+
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, NETWORK_IFACE, IFNAMSIZ - 1);
+
+    /* Remove from bridge if attached */
+    /* (ignore errors — may not be in a bridge) */
+    ioctl(sock, SIOCGIFINDEX, &ifr);
+
+    /* Set IP address */
+    struct sockaddr_in *addr = (struct sockaddr_in *)&ifr.ifr_addr;
+    addr->sin_family = AF_INET;
+    inet_pton(AF_INET, ipAddr, &addr->sin_addr);
+    if (ioctl(sock, SIOCSIFADDR, &ifr) < 0) {
+        printf("[net] set IP %s failed: %s\n", ipAddr, strerror(errno));
+    }
+
+    /* Set netmask */
+    inet_pton(AF_INET, netMask, &addr->sin_addr);
+    if (ioctl(sock, SIOCSIFNETMASK, &ifr) < 0) {
+        printf("[net] set mask %s failed: %s\n", netMask, strerror(errno));
+    }
+
+    /* Bring interface up */
+    ioctl(sock, SIOCGIFFLAGS, &ifr);
+    ifr.ifr_flags |= IFF_UP | IFF_RUNNING;
+    if (ioctl(sock, SIOCSIFFLAGS, &ifr) < 0) {
+        printf("[net] bring up %s failed: %s\n", NETWORK_IFACE, strerror(errno));
+    }
+
+    close(sock);
+    *networkHandle = (T_DjiNetworkHandle)(intptr_t)1;
+    printf("[net] %s configured: %s/%s\n", NETWORK_IFACE, ipAddr, netMask);
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
+static T_DjiReturnCode _HalNetwork_DeInit(T_DjiNetworkHandle networkHandle) {
+    (void)networkHandle;
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
+static T_DjiReturnCode _HalNetwork_GetDeviceInfo(T_DjiHalNetworkDeviceInfo *deviceInfo) {
+    /* Jetson Nano RNDIS gadget — use VID/PID that DJI recognizes */
+    deviceInfo->usbNetAdapter.vid = 0x0955;
+    deviceInfo->usbNetAdapter.pid = 0x7020;
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
 /* ── PSDK init ────────────────────────────────────────────────────────── */
 
 static int _psdk_core_init(const char *app_id, const char *app_key,
@@ -302,6 +365,18 @@ static int _psdk_core_init(const char *app_id, const char *app_key,
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
         printf("[psdk] HAL UART registration failed: 0x%08llX\n", (unsigned long long)rc);
         return -1;
+    }
+
+    /* Register HAL Network (for liveview/perception via RNDIS) */
+    T_DjiHalNetworkHandler networkHandler = {
+        .NetworkInit = _HalNetwork_Init,
+        .NetworkDeInit = _HalNetwork_DeInit,
+        .NetworkGetDeviceInfo = _HalNetwork_GetDeviceInfo,
+    };
+    rc = DjiPlatform_RegHalNetworkHandler(&networkHandler);
+    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+        printf("[psdk] HAL Network registration failed: 0x%08llX (non-fatal)\n", (unsigned long long)rc);
+        /* Non-fatal: UART-only mode still works for telemetry/flight control */
     }
 
     /* Init PSDK core */
