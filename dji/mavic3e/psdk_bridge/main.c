@@ -304,12 +304,7 @@ static T_DjiReturnCode _HalNetwork_Init(const char *ipAddr, const char *netMask,
         }
     }
 
-    /* Flush existing IP (bring down first) */
-    ioctl(sock, SIOCGIFFLAGS, &ifr);
-    ifr.ifr_flags &= ~IFF_UP;
-    ioctl(sock, SIOCSIFFLAGS, &ifr);
-
-    /* Set IP address */
+    /* Set IP address (don't bring down — keep USB link alive) */
     struct sockaddr_in *addr = (struct sockaddr_in *)&ifr.ifr_addr;
     addr->sin_family = AF_INET;
     inet_pton(AF_INET, ipAddr, &addr->sin_addr);
