@@ -9,6 +9,7 @@ dji-mavic3e:
     - /opt/phanthy-motus/data:/opt/phanthy-motus/data
     - /run/udev:/run/udev:ro
     - /sys/kernel/config:/sys/kernel/config
+    - /dev/usb-ffs:/dev/usb-ffs
   environment:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
