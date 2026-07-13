@@ -522,6 +522,9 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
 /* ── Main ───────────────────────────────────────────────────────────────── */
 
 int main(int argc, char *argv[]) {
+    setbuf(stdout, NULL);
+    setbuf(stderr, NULL);
+
     const char *socket_path = "/tmp/psdk_bridge.sock";
     const char *app_id = "";
     const char *app_key = "";
