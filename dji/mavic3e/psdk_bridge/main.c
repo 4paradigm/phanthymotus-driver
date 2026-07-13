@@ -403,13 +403,17 @@ static int _psdk_core_init(const char *app_id, const char *app_key,
         return -1;
     }
 
-    /* Register HAL USB Bulk (for liveview/perception via FunctionFS) */
+    /* Register HAL USB Bulk only if FFS endpoints are available (host-side setup done) */
     extern T_DjiHalUsbBulkHandler g_usbBulkHandler;
-    rc = DjiPlatform_RegHalUsbBulkHandler(&g_usbBulkHandler);
-    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-        printf("[psdk] HAL USB Bulk registration failed: 0x%08llX (non-fatal)\n", (unsigned long long)rc);
+    if (access("/dev/usb-ffs/bulk1/ep1", F_OK) == 0) {
+        rc = DjiPlatform_RegHalUsbBulkHandler(&g_usbBulkHandler);
+        if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+            printf("[psdk] HAL USB Bulk registration failed: 0x%08llX\n", (unsigned long long)rc);
+        } else {
+            printf("[psdk] HAL USB Bulk registered OK\n");
+        }
     } else {
-        printf("[psdk] HAL USB Bulk registered OK\n");
+        printf("[psdk] USB Bulk endpoints not available, skipping (UART-only mode)\n");
     }
 
     /* Init PSDK core */
