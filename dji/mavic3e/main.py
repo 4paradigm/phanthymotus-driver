@@ -313,21 +313,67 @@ def _configure_usb_gadget():
     """Configure USB gadget for DJI PSDK USB Bulk mode.
     Sets up FunctionFS bulk endpoints required for liveview/perception."""
     import subprocess as _sp2
+    import time as _t2
+
     setup_script = "/deploy/setup_usb_bulk.sh"
     if not os.path.exists(setup_script):
         setup_script = os.path.join(os.path.dirname(__file__), "deploy", "setup_usb_bulk.sh")
-    if os.path.exists(setup_script):
-        print("[usb] running setup_usb_bulk.sh...")
-        result = _sp2.run(["bash", setup_script], capture_output=True, text=True, timeout=30)
+
+    if not os.path.exists(setup_script):
+        print("[usb] setup_usb_bulk.sh not found, skipping USB Bulk config")
+        return
+
+    # Step 1: Run gadget config script (creates FFS functions, mounts)
+    print("[usb] running setup_usb_bulk.sh...")
+    try:
+        result = _sp2.run(["bash", setup_script], capture_output=True, text=True, timeout=15)
         if result.stdout:
             for line in result.stdout.strip().split("\n"):
                 print(f"[usb] {line}")
         if result.returncode != 0:
             print(f"[usb] WARNING: setup failed (rc={result.returncode})")
             if result.stderr:
-                print(f"[usb] {result.stderr.strip()}")
+                for line in result.stderr.strip().split("\n")[-5:]:
+                    print(f"[usb] {line}")
+            return
+    except Exception as e:
+        print(f"[usb] WARNING: setup error: {e}")
+        return
+
+    # Step 2: Launch startup_bulk daemons (must stay alive — keep ep0 open)
+    startup_bin = "/usr/local/bin/startup_bulk"
+    if not os.path.exists(startup_bin):
+        print("[usb] startup_bulk not found, skipping")
+        return
+
+    # Kill old instances
+    _sp2.run(["pkill", "-f", "startup_bulk"], capture_output=True)
+    _t2.sleep(0.5)
+
+    bulk_procs = []
+    for i in range(1, 4):
+        proc = _sp2.Popen(
+            [startup_bin, f"/dev/usb-ffs/bulk{i}"],
+            stdout=sys.stdout, stderr=sys.stderr,
+        )
+        bulk_procs.append(proc)
+        _t2.sleep(1)
+    print(f"[usb] startup_bulk launched for bulk1/2/3 (pids: {[p.pid for p in bulk_procs]})")
+
+    # Step 3: Bind UDC (after startup_bulk has opened ep0)
+    _t2.sleep(1)
+    try:
+        udc_name = open("/sys/class/udc/" + os.listdir("/sys/class/udc/")[0] + "/../../../UDC", "r")
+    except Exception:
+        pass
+    gadget_udc = "/sys/kernel/config/usb_gadget/l4t/UDC"
+    if os.path.exists(gadget_udc):
+        udc_name = os.listdir("/sys/class/udc/")[0]
+        with open(gadget_udc, "w") as f:
+            f.write(udc_name)
+        print(f"[usb] UDC bound: {udc_name}")
     else:
-        print("[usb] setup_usb_bulk.sh not found, skipping USB Bulk config")
+        print("[usb] WARNING: cannot find gadget UDC file")
 
 
 def _start_registration(mcp_port: int, name: str, category: str):

@@ -63,22 +63,11 @@ done
 echo "[usb_bulk] FFS bulk functions created"
 
 # ── Step 6: Initialize endpoints with startup_bulk ───────────────────
-STARTUP_BULK="/usr/local/bin/startup_bulk"
-if [ -x "$STARTUP_BULK" ]; then
-    pkill -f startup_bulk 2>/dev/null || true
-    sleep 0.5
-    for i in 1 2 3; do
-        "$STARTUP_BULK" "/dev/usb-ffs/bulk${i}" &
-        sleep 1
-    done
-    echo "[usb_bulk] endpoints initialized"
-else
-    echo "[usb_bulk] ERROR: startup_bulk not found"
-    exit 1
-fi
+# NOTE: startup_bulk must be launched EXTERNALLY as a long-running daemon.
+# It keeps ep0 open — if it dies, the gadget stops working.
+# The calling process (main.py) handles this.
+echo "[usb_bulk] FFS ready — startup_bulk must be launched externally"
 
 # ── Step 7: Bind UDC ─────────────────────────────────────────────────
-udevadm settle -t 5 2>/dev/null || true
-echo "$UDC_NAME" > UDC
-echo "[usb_bulk] bound to UDC: $UDC_NAME"
-echo "[usb_bulk] done"
+# NOTE: UDC binding is also done externally AFTER startup_bulk opens ep0.
+echo "[usb_bulk] gadget configured — ready for startup_bulk + UDC bind"
