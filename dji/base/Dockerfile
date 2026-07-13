@@ -23,7 +23,8 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
         libopus-dev \
         ffmpeg \
         udev \
-        usbutils && \
+        usbutils \
+        iproute2 && \
     rm -rf /var/lib/apt/lists/*
 
 # ── Download Payload SDK (pre-built static library) ───────────────
