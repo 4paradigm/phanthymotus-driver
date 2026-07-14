@@ -571,6 +571,27 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
         snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
         return 0;
     }
+    if (strstr(raw_json, "\"set_zoom\"")) {
+        float factor = 1.0f;
+        const char *fp = strstr(raw_json, "\"factor\"");
+        if (fp) {
+            fp = strchr(fp, ':');
+            if (fp) factor = (float)atof(fp + 1);
+        }
+        int r = camera_mgr_set_zoom(factor);
+        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        return 0;
+    }
+    if (strstr(raw_json, "\"set_focus\"")) {
+        float x = 0.5f, y = 0.5f;
+        const char *xp = strstr(raw_json, "\"x\"");
+        const char *yp = strstr(raw_json, "\"y\"");
+        if (xp) { xp = strchr(xp, ':'); if (xp) x = (float)atof(xp + 1); }
+        if (yp) { yp = strchr(yp, ':'); if (yp) y = (float)atof(yp + 1); }
+        int r = camera_mgr_set_focus(x, y);
+        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        return 0;
+    }
 
     /* Gimbal */
     if (strstr(raw_json, "\"gimbal_reset\"")) {
