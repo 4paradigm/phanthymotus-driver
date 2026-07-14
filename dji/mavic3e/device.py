@@ -157,39 +157,92 @@ class _CameraStreamNode(Node):
         self._bridge.stop_liveview()
 
     def _stream_loop(self):
-        """Read JPEG frames from C bridge (FFmpeg decoded) and publish to ROS2."""
+        """Read JPEG frames from GStreamer GPU decoder subprocess."""
+        import subprocess
         import os
 
-        frame_path = "/tmp/dji_frame.jpg"
-        last_mtime = 0
-        pub_count = 0
+        fifo_path = "/tmp/dji_h264_fifo"
+        self.get_logger().info(f"stream_loop: waiting for FIFO {fifo_path}")
 
-        self.get_logger().info(f"stream_loop started, reading {frame_path}")
-
-        while self.state == "running":
-            time.sleep(1.0 / self._fps)
-            if self.state != "running":
+        # Wait for FIFO to be created by C bridge
+        for _ in range(50):
+            if os.path.exists(fifo_path):
                 break
-            try:
-                if not os.path.exists(frame_path):
-                    continue
-                mtime = os.path.getmtime(frame_path)
-                if mtime == last_mtime:
-                    continue  # No new frame
-                last_mtime = mtime
-                with open(frame_path, "rb") as f:
-                    jpeg_data = f.read()
-                if jpeg_data and len(jpeg_data) > 100:
-                    msg = CompressedImage()
-                    msg.header.stamp = self.get_clock().now().to_msg()
-                    msg.format = "jpeg"
-                    msg.data = jpeg_data
-                    self._pub.publish(msg)
-                    pub_count += 1
-                    if pub_count % 30 == 1:
-                        self.get_logger().info(f"published frame #{pub_count} ({len(jpeg_data)} bytes)")
-            except Exception as e:
-                self.get_logger().error(f"stream_loop error: {e}")
+            time.sleep(0.1)
+
+        if not os.path.exists(fifo_path):
+            self.get_logger().error("H.264 FIFO not created, aborting stream")
+            return
+
+        # GStreamer pipeline: read H.264 from FIFO → GPU decode → JPEG out
+        # Try nvv4l2decoder (Jetson GPU), fallback to avdec_h264 (CPU)
+        gst_cmd = (
+            f"gst-launch-1.0 -q filesrc location={fifo_path} "
+            "! h264parse "
+            "! nvv4l2decoder "
+            "! nvvidconv "
+            "! video/x-raw,format=I420 "
+            "! jpegenc quality=75 "
+            "! fdsink fd=1"
+        )
+        # Fallback for non-Jetson (no nvv4l2decoder)
+        gst_cmd_fallback = (
+            f"gst-launch-1.0 -q filesrc location={fifo_path} "
+            "! h264parse "
+            "! avdec_h264 "
+            "! videoconvert "
+            "! jpegenc quality=75 "
+            "! fdsink fd=1"
+        )
+
+        # Try GPU first
+        proc = subprocess.Popen(
+            gst_cmd, shell=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        time.sleep(1)
+        if proc.poll() is not None:
+            self.get_logger().warn("nvv4l2decoder not available, falling back to CPU decode")
+            proc = subprocess.Popen(
+                gst_cmd_fallback, shell=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+
+        self.get_logger().info("GStreamer decoder started")
+
+        # Read JPEG frames from stdout (SOI=0xFFD8, EOI=0xFFD9)
+        buf = bytearray()
+        pub_count = 0
+        while self.state == "running" and proc.poll() is None:
+            chunk = proc.stdout.read(65536)
+            if not chunk:
+                time.sleep(0.01)
+                continue
+            buf.extend(chunk)
+            while True:
+                soi = buf.find(b'\xff\xd8')
+                if soi == -1:
+                    buf.clear()
+                    break
+                eoi = buf.find(b'\xff\xd9', soi + 2)
+                if eoi == -1:
+                    if soi > 0:
+                        del buf[:soi]
+                    break
+                frame = bytes(buf[soi:eoi + 2])
+                del buf[:eoi + 2]
+                # Publish JPEG frame
+                msg = CompressedImage()
+                msg.header.stamp = self.get_clock().now().to_msg()
+                msg.format = "jpeg"
+                msg.data = frame
+                self._pub.publish(msg)
+                pub_count += 1
+                if pub_count % 30 == 1:
+                    self.get_logger().info(f"published frame #{pub_count} ({len(frame)} bytes)")
+
+        proc.terminate()
+        self.get_logger().info(f"stream_loop ended (published {pub_count} frames)")
 
 
 class CameraStreamPlugin:
