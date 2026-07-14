@@ -68,12 +68,51 @@ int time_sync_get_aircraft_time(char *buf, size_t buflen) {
     return 0;
 }
 
+int time_sync_sync_clock(char *buf, size_t buflen) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    uint64_t localTimeUs = (uint64_t)tv.tv_sec * 1000000 + tv.tv_usec;
+
+    T_DjiTimeSyncAircraftTime at = {0};
+    T_DjiReturnCode rc = DjiTimeSync_TransferToAircraftTime(localTimeUs, &at);
+    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+        snprintf(buf, buflen, "{\"error\":\"transfer_failed\",\"code\":\"0x%08llX\"}", (unsigned long long)rc);
+        return -1;
+    }
+
+    /* Convert aircraft time to epoch */
+    struct tm tm = {0};
+    tm.tm_year = at.year - 1900;
+    tm.tm_mon = at.month - 1;
+    tm.tm_mday = at.day;
+    tm.tm_hour = at.hour;
+    tm.tm_min = at.minute;
+    tm.tm_sec = at.second;
+    time_t epoch = timegm(&tm);
+
+    struct timeval new_tv = { .tv_sec = epoch, .tv_usec = at.microsecond };
+    if (settimeofday(&new_tv, NULL) != 0) {
+        snprintf(buf, buflen, "{\"error\":\"settimeofday_failed\"}");
+        return -1;
+    }
+
+    printf("[time_sync] clock synced to %04d-%02d-%02dT%02d:%02d:%02d.%06uZ\n",
+           at.year, at.month, at.day, at.hour, at.minute, at.second, at.microsecond);
+    snprintf(buf, buflen, "{\"synced\":\"%04d-%02d-%02dT%02d:%02d:%02d.%06uZ\"}",
+             at.year, at.month, at.day, at.hour, at.minute, at.second, at.microsecond);
+    return 0;
+}
+
 void time_sync_cleanup(void) {}
 
 #else /* stub */
 
 int time_sync_init(void) { printf("[time_sync] stub mode\n"); return 0; }
 int time_sync_get_aircraft_time(char *buf, size_t buflen) {
+    snprintf(buf, buflen, "{\"error\":\"stub\"}");
+    return -1;
+}
+int time_sync_sync_clock(char *buf, size_t buflen) {
     snprintf(buf, buflen, "{\"error\":\"stub\"}");
     return -1;
 }

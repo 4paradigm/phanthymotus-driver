@@ -961,7 +961,7 @@ class TimeSyncPlugin:
             resp = self._bridge.get_aircraft_info()
             return {"ret": 0 if resp.get("ok") else -1, "data": resp.get("data", {})}
         if action == "sync_time":
-            resp = self._bridge.get_aircraft_time()
+            resp = self._bridge.sync_clock()
             return {"ret": 0 if resp.get("ok") else -1, "data": resp.get("data", {})}
         return None
 
