@@ -174,41 +174,60 @@ class _CameraStreamNode(Node):
             self.get_logger().error("H.264 FIFO not created, aborting stream")
             return
 
-        # GStreamer pipeline: read H.264 from FIFO → GPU decode → JPEG out
+        # Open FIFO as reader (this will block until C bridge opens write end)
+        self.get_logger().info("Opening FIFO for reading...")
+        fifo_fd = os.open(fifo_path, os.O_RDONLY | os.O_NONBLOCK)
+        # Switch back to blocking after open
+        import fcntl
+        flags = fcntl.fcntl(fifo_fd, fcntl.F_GETFL)
+        fcntl.fcntl(fifo_fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
+
+        # GStreamer pipeline: read H.264 from stdin → GPU decode → JPEG out
         # Try nvv4l2decoder (Jetson GPU), fallback to avdec_h264 (CPU)
-        gst_cmd = (
-            f"gst-launch-1.0 -q filesrc location={fifo_path} "
-            "! h264parse "
-            "! nvv4l2decoder "
-            "! nvvidconv "
-            "! video/x-raw,format=I420 "
-            "! jpegenc quality=75 "
-            "! fdsink fd=1"
-        )
-        # Fallback for non-Jetson (no nvv4l2decoder)
-        gst_cmd_fallback = (
-            f"gst-launch-1.0 -q filesrc location={fifo_path} "
-            "! h264parse "
-            "! avdec_h264 "
-            "! videoconvert "
-            "! jpegenc quality=75 "
-            "! fdsink fd=1"
-        )
+        gst_cmd_gpu = [
+            "gst-launch-1.0", "-q",
+            "fdsrc", "fd=0",
+            "!", "h264parse",
+            "!", "nvv4l2decoder",
+            "!", "nvvidconv",
+            "!", "video/x-raw,format=I420",
+            "!", "jpegenc", "quality=75",
+            "!", "fdsink", "fd=1",
+        ]
+        gst_cmd_cpu = [
+            "gst-launch-1.0", "-q",
+            "fdsrc", "fd=0",
+            "!", "h264parse",
+            "!", "avdec_h264",
+            "!", "videoconvert",
+            "!", "jpegenc", "quality=75",
+            "!", "fdsink", "fd=1",
+        ]
 
         # Try GPU first
         proc = subprocess.Popen(
-            gst_cmd, shell=True,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            gst_cmd_gpu,
+            stdin=fifo_fd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
-        time.sleep(1)
+        time.sleep(2)
         if proc.poll() is not None:
-            self.get_logger().warn("nvv4l2decoder not available, falling back to CPU decode")
+            self.get_logger().warn("nvv4l2decoder failed, falling back to CPU decode")
+            # Reopen FIFO for fallback
+            os.close(fifo_fd)
+            fifo_fd = os.open(fifo_path, os.O_RDONLY)
             proc = subprocess.Popen(
-                gst_cmd_fallback, shell=True,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                gst_cmd_cpu,
+                stdin=fifo_fd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
+            time.sleep(1)
+            if proc.poll() is not None:
+                stderr = proc.stderr.read().decode() if proc.stderr else ""
+                self.get_logger().error(f"GStreamer CPU fallback also failed: {stderr[:200]}")
+                os.close(fifo_fd)
+                return
 
         self.get_logger().info("GStreamer decoder started")
+        os.close(fifo_fd)  # Python no longer needs the fd, GStreamer has it
 
         # Read JPEG frames from stdout (SOI=0xFFD8, EOI=0xFFD9)
         buf = bytearray()
