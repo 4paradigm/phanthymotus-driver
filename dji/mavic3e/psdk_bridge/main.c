@@ -809,6 +809,12 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
         snprintf(result, result_size, "{\"ok\":%s,\"data\":%s}", r == 0 ? "true" : "false", time_buf);
         return 0;
     }
+    if (strstr(raw_json, "\"sync_clock\"")) {
+        char time_buf[256];
+        int r = time_sync_sync_clock(time_buf, sizeof(time_buf));
+        snprintf(result, result_size, "{\"ok\":%s,\"data\":%s}", r == 0 ? "true" : "false", time_buf);
+        return 0;
+    }
 
     /* Unknown command */
     snprintf(result, result_size, "{\"ok\":false,\"error\":\"unknown command\"}");

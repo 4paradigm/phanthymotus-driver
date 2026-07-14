@@ -530,3 +530,6 @@ class BridgeClient:
 
     def get_aircraft_time(self):
         return self._call("get_aircraft_time")
+
+    def sync_clock(self):
+        return self._call("sync_clock")
