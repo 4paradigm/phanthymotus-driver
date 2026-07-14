@@ -182,6 +182,10 @@ int telemetry_get_json(char *buf, size_t buflen) {
     return 0;
 }
 
+int telemetry_get_gps_satellite_count(void) {
+    return (int)s_gps_detail.totalSatelliteNumberUsed;
+}
+
 void telemetry_cleanup(void) {
     DjiFcSubscription_DeInit();
     printf("[telemetry] cleaned up\n");
@@ -208,6 +212,7 @@ int telemetry_get_json(char *buf, size_t buflen) {
     return 0;
 }
 
+int telemetry_get_gps_satellite_count(void) { return 18; }
 void telemetry_cleanup(void) {}
 
 #endif

@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "time_sync.h"
+#include "telemetry.h"
 #include "error_code.h"
 #include <stdio.h>
 #include <string.h>
@@ -74,6 +75,13 @@ int time_sync_get_aircraft_time(char *buf, size_t buflen) {
 int time_sync_sync_clock(char *buf, size_t buflen) {
     if (s_gps_date == 0 || s_gps_time == 0) {
         snprintf(buf, buflen, "{\"error\":\"GPS time not yet available\",\"recovery\":\"Wait for GPS lock\"}");
+        return -1;
+    }
+
+    int sats = telemetry_get_gps_satellite_count();
+    if (sats < 4) {
+        snprintf(buf, buflen, "{\"error\":\"GPS signal too weak (%d satellites, need >= 4)\","
+                 "\"recovery\":\"Move to open area with clear sky view\"}", sats);
         return -1;
     }
 
