@@ -52,7 +52,7 @@ static int _encode_jpeg(const char *filename, uint8_t *rgb_data, int width, int 
     cinfo.input_components = 3;
     cinfo.in_color_space = JCS_RGB;
     jpeg_set_defaults(&cinfo);
-    jpeg_set_quality(&cinfo, 70, TRUE);
+    jpeg_set_quality(&cinfo, 50, TRUE);
     jpeg_start_compress(&cinfo, TRUE);
 
     int row_stride = width * 3;
@@ -122,11 +122,13 @@ static void _decode_h264(const uint8_t *data, uint32_t len) {
                           0, s_height,
                           s_frame_rgb->data, s_frame_rgb->linesize);
 
-                /* Encode JPEG every decoded frame */
+                /* Encode JPEG — throttle to ~10fps (every 3rd decoded frame) */
                 s_frame_count++;
-                _encode_jpeg("/tmp/dji_frame.jpg", s_rgb_buffer, s_width, s_height);
-                if (s_frame_count % 30 == 0) {
-                    printf("[liveview] wrote frame #%d (%dx%d)\n", s_frame_count, s_width, s_height);
+                if (s_frame_count % 3 == 0) {
+                    _encode_jpeg("/tmp/dji_frame.jpg", s_rgb_buffer, s_width, s_height);
+                }
+                if (s_frame_count % 90 == 0) {
+                    printf("[liveview] wrote frame #%d (%dx%d)\n", s_frame_count / 3, s_width, s_height);
                 }
             }
         }
