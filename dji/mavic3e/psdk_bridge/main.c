@@ -47,6 +47,7 @@ static void _signal_handler(int sig) {
 #include "dji_core.h"
 #include "dji_platform.h"
 #include "dji_payload_camera.h"
+#include "dji_aircraft_info.h"
 #include "osal_socket.h"
 #include <dirent.h>
 #include <pthread.h>
@@ -784,9 +785,19 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
 
     /* Aircraft info */
     if (strstr(raw_json, "\"get_aircraft_info\"")) {
+        T_DjiAircraftInfoBaseInfo baseInfo = {0};
+        T_DjiAircraftVersion version = {0};
+        bool connected = false;
+        DjiAircraftInfo_GetBaseInfo(&baseInfo);
+        DjiAircraftInfo_GetAircraftVersion(&version);
+        DjiAircraftInfo_GetConnectionStatus(&connected);
         snprintf(result, result_size,
-            "{\"ok\":true,\"data\":{\"product_name\":\"Mavic 3 Enterprise\","
-            "\"firmware_version\":\"07.01.20.01\",\"serial_number\":\"UNKNOWN\"}}");
+            "{\"ok\":true,\"data\":{\"aircraft_type\":%d,\"aircraft_series\":%d,"
+            "\"firmware_version\":\"%d.%d.%d.%d\","
+            "\"mount_position\":%d,\"connected\":%s}}",
+            baseInfo.aircraftType, baseInfo.aircraftSeries,
+            version.majorVersion, version.minorVersion, version.modifyVersion, version.debugVersion,
+            baseInfo.mountPosition, connected ? "true" : "false");
         return 0;
     }
 

@@ -1,20 +1,29 @@
 {
-  "name": "DJI Mavic 3 Enterprise",
+  "name": "DJI Mavic 3T",
   "type": "drone",
   "manufacturer": "DJI",
-  "model": "Mavic 3E",
+  "model": "Mavic 3T",
   "cameras": {
     "wide": {
-      "sensor": "4/3 CMOS 20MP",
+      "sensor": "4/3 CMOS 48MP",
+      "focal_length": "24mm equiv (12.29mm actual)",
       "fov": 84,
-      "focal_length": "24mm equiv",
-      "zoom": "1x fixed"
+      "resolution": "5280x3956"
     },
     "zoom": {
       "sensor": "1/2 inch CMOS 12MP",
+      "focal_length": "162mm equiv (30mm actual)",
       "fov": 15,
-      "focal_length": "162mm equiv",
-      "zoom": "7x optical, up to 56x hybrid"
+      "resolution": "4000x3000",
+      "zoom_range": "7x optical"
+    },
+    "ir": {
+      "sensor": "Uncooled VOx Microbolometer",
+      "resolution": "640x512",
+      "pixel_pitch": "12μm",
+      "dfov": 61,
+      "temperature_range": "-20°C to 150°C (high gain) / -20°C to 550°C (low gain)",
+      "accuracy": "±2°C or ±2%"
     }
   },
   "gimbal_range": {
@@ -30,13 +39,5 @@
   "psdk_interface": "E-Port",
   "psdk_version": "v3.16.0",
   "waypoint_version": "V3",
-  "perception_directions": ["front", "back", "left", "right", "up", "down"],
-  "perception_resolution": {
-    "up": [640, 480],
-    "down": [640, 480],
-    "front": [480, 480],
-    "back": [480, 480],
-    "left": [480, 480],
-    "right": [480, 480]
-  }
+  "perception_directions": ["front", "back", "left", "right", "up", "down"]
 }

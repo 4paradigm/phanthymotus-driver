@@ -146,7 +146,15 @@ class Mavic3EDeviceBundle:
     def dispatch(self, tool_name: str, args: dict) -> dict | None:
         if tool_name == "model":
             info_path = Path(__file__).parent / "resource" / "mavic3e_info.json"
-            return json.loads(info_path.read_text())
+            info = json.loads(info_path.read_text())
+            # Merge dynamic aircraft info from bridge
+            try:
+                resp = self._bridge.get_aircraft_info()
+                if resp and resp.get("ok"):
+                    info["aircraft_info"] = resp["data"]
+            except Exception:
+                pass
+            return info
         for p in self._plugins:
             plugin_tools = p.get_tools() if hasattr(p, "get_tools") else [p.get_tool()]
             for tool_def in plugin_tools:
