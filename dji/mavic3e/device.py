@@ -179,12 +179,14 @@ class _CameraStreamNode(Node):
         gst_gpu = (
             f"gst-launch-1.0 -q filesrc location={fifo_path} "
             "! h264parse ! nvv4l2decoder ! nvvidconv "
-            "! video/x-raw,format=I420 ! jpegenc quality=75 ! fdsink fd=1"
+            "! video/x-raw,width=720,height=540,format=I420 "
+            "! jpegenc quality=60 ! fdsink fd=1"
         )
         gst_cpu = (
             f"gst-launch-1.0 -q filesrc location={fifo_path} "
-            "! h264parse ! avdec_h264 ! videoconvert "
-            "! jpegenc quality=75 ! fdsink fd=1"
+            "! h264parse ! avdec_h264 max-threads=2 ! videoscale "
+            "! video/x-raw,width=720,height=540 ! videoconvert "
+            "! jpegenc quality=60 ! fdsink fd=1"
         )
 
         self.get_logger().info("Starting GStreamer decoder...")

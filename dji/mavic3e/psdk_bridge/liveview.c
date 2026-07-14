@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include <pthread.h>
 
@@ -34,6 +35,9 @@ static void *_fifo_open_thread(void *arg) {
     printf("[liveview] waiting for FIFO reader...\n");
     int fd = open(H264_FIFO_PATH, O_WRONLY);  /* Blocks until reader opens */
     if (fd >= 0) {
+        /* Set non-blocking so callback thread doesn't stall on full pipe */
+        int flags = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
         s_h264_pipe_fd = fd;
         s_fifo_ready = 1;
         printf("[liveview] FIFO writer connected (fd=%d)\n", fd);
@@ -51,7 +55,9 @@ static void _h264_cb(E_DjiLiveViewCameraPosition pos,
     s_frame_count++;
     if (s_h264_pipe_fd >= 0) {
         ssize_t n = write(s_h264_pipe_fd, data, len);
-        if (n < 0) {
+        if (n < 0 && errno == EAGAIN) {
+            /* Pipe full — drop this chunk (decoder will recover from next I-frame) */
+        } else if (n < 0) {
             close(s_h264_pipe_fd);
             s_h264_pipe_fd = -1;
             s_fifo_ready = 0;
