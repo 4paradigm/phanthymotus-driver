@@ -33,6 +33,7 @@
 #include "perception.h"
 #include "speaker.h"
 #include "hms.h"
+#include "time_sync.h"
 
 static volatile int s_running = 1;
 
@@ -801,6 +802,14 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
         return 0;
     }
 
+    /* Time sync */
+    if (strstr(raw_json, "\"get_aircraft_time\"")) {
+        char time_buf[256];
+        int r = time_sync_get_aircraft_time(time_buf, sizeof(time_buf));
+        snprintf(result, result_size, "{\"ok\":%s,\"data\":%s}", r == 0 ? "true" : "false", time_buf);
+        return 0;
+    }
+
     /* Unknown command */
     snprintf(result, result_size, "{\"ok\":false,\"error\":\"unknown command\"}");
     return -1;
@@ -860,6 +869,7 @@ int main(int argc, char *argv[]) {
     perception_init();
     speaker_init();
     hms_init();
+    time_sync_init();
 
     /* Start IPC server */
     if (ipc_init(socket_path) != 0) {
