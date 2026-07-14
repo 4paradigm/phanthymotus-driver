@@ -167,7 +167,7 @@ class _CameraStreamNode(Node):
         self.get_logger().info(f"stream_loop started, reading {frame_path}")
 
         while self.state == "running":
-            time.sleep(0.05)  # 20Hz check rate
+            time.sleep(0.033)  # ~30Hz check rate
             if self.state != "running":
                 break
             try:

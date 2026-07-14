@@ -127,13 +127,13 @@ static void _decode_h264(const uint8_t *data, uint32_t len) {
                           0, s_src_height,
                           s_frame_rgb->data, s_frame_rgb->linesize);
 
-                /* Encode JPEG every 3rd frame (~10fps from 30fps input) */
+                /* Encode JPEG every other frame (~15fps from 30fps input) */
                 s_frame_count++;
-                if (s_frame_count % 3 == 0) {
+                if (s_frame_count % 2 == 0) {
                     _encode_jpeg(FRAME_PATH, s_rgb_buffer, OUT_WIDTH, OUT_HEIGHT);
                 }
-                if (s_frame_count % 90 == 0) {
-                    printf("[liveview] frame #%d\n", s_frame_count / 3);
+                if (s_frame_count % 60 == 0) {
+                    printf("[liveview] frame #%d\n", s_frame_count / 2);
                 }
             }
         }
