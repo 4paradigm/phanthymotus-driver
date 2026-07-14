@@ -735,10 +735,16 @@ class CameraPlugin:
             resp = self._bridge.get_storage()
             return resp.get("data", {})
         if action == "ir_temp_point":
-            # 3T only — forward to bridge
-            return {"ret": 0, "note": "ir_temp_point: requires 3T hardware"}
+            resp = self._bridge.ir_temp_point(
+                x=args.get("x", 0.5), y=args.get("y", 0.5),
+            )
+            return {"ret": 0 if resp.get("ok") else -1, "data": resp.get("data", {})}
         if action == "ir_temp_area":
-            return {"ret": 0, "note": "ir_temp_area: requires 3T hardware"}
+            resp = self._bridge.ir_temp_area(
+                ltx=args.get("ltx", 0.25), lty=args.get("lty", 0.25),
+                rbx=args.get("rbx", 0.75), rby=args.get("rby", 0.75),
+            )
+            return {"ret": 0 if resp.get("ok") else -1, "data": resp.get("data", {})}
         return None
 
 
