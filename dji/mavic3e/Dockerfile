@@ -47,6 +47,10 @@ COPY deploy/99-eport.rules /etc/udev/rules.d/99-eport.rules
 ENV PYTHONPATH=/work
 ENV PYTHONUNBUFFERED=1
 
+# Pre-build GStreamer plugin registry (so avdec_h264 etc. are available at runtime)
+RUN rm -f /root/.cache/gstreamer-1.0/registry.aarch64.bin && \
+    gst-inspect-1.0 avdec_h264 > /dev/null 2>&1 || true
+
 EXPOSE 15702
 
 CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && python3 /work/main.py"]
