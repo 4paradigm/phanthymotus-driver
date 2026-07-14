@@ -24,21 +24,34 @@ static liveview_frame_cb_t s_frame_cb = NULL;
 static E_DjiLiveViewCameraSource s_camera_source = DJI_LIVEVIEW_CAMERA_SOURCE_DEFAULT;
 static int s_h264_pipe_fd = -1;  /* Write end of FIFO to GStreamer */
 static int s_frame_count = 0;
+static pthread_t s_fifo_thread;
+static int s_fifo_ready = 0;
 #define H264_FIFO_PATH "/tmp/dji_h264_fifo"
+
+/* Thread that opens FIFO write end (blocks until reader connects) */
+static void *_fifo_open_thread(void *arg) {
+    (void)arg;
+    printf("[liveview] waiting for FIFO reader...\n");
+    int fd = open(H264_FIFO_PATH, O_WRONLY);  /* Blocks until reader opens */
+    if (fd >= 0) {
+        s_h264_pipe_fd = fd;
+        s_fifo_ready = 1;
+        printf("[liveview] FIFO writer connected (fd=%d)\n", fd);
+    } else {
+        printf("[liveview] FIFO open failed\n");
+    }
+    return NULL;
+}
 
 static void _h264_cb(E_DjiLiveViewCameraPosition pos,
                      const uint8_t *data, uint32_t len) {
     s_frame_count++;
-    if (s_h264_pipe_fd < 0) {
-        /* Try to open FIFO (non-blocking, reader may not be ready yet) */
-        s_h264_pipe_fd = open(H264_FIFO_PATH, O_WRONLY | O_NONBLOCK);
-    }
     if (s_h264_pipe_fd >= 0) {
         ssize_t n = write(s_h264_pipe_fd, data, len);
         if (n < 0) {
-            /* Reader closed or pipe full — reopen next time */
             close(s_h264_pipe_fd);
             s_h264_pipe_fd = -1;
+            s_fifo_ready = 0;
         }
     }
     if (s_frame_count % 300 == 1) {
@@ -61,11 +74,15 @@ int liveview_start(const char *camera, liveview_frame_cb_t cb) {
     E_DjiLiveViewCameraPosition pos = DJI_LIVEVIEW_CAMERA_POSITION_NO_1;
     s_camera_source = DJI_LIVEVIEW_CAMERA_SOURCE_DEFAULT;
 
-    /* Create named FIFO for H.264 data (Python/GStreamer reads from this) */
+    /* Create named FIFO for H.264 data */
     unlink(H264_FIFO_PATH);
     if (mkfifo(H264_FIFO_PATH, 0666) < 0) {
-        printf("[liveview] mkfifo failed (may already exist)\n");
+        printf("[liveview] mkfifo failed\n");
     }
+
+    /* Start thread to open FIFO write end (blocks until Python reader connects) */
+    pthread_create(&s_fifo_thread, NULL, _fifo_open_thread, NULL);
+    pthread_detach(s_fifo_thread);
 
     T_DjiReturnCode rc = DjiLiveview_StartH264Stream(pos, s_camera_source, _h264_cb);
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
@@ -73,7 +90,6 @@ int liveview_start(const char *camera, liveview_frame_cb_t cb) {
         return -1;
     }
 
-    /* Request I-frame so decoder can initialize */
     DjiLiveview_RequestIntraframeFrameData(pos, s_camera_source);
 
     printf("[liveview] stream started (camera=%s), FIFO=%s\n", camera, H264_FIFO_PATH);
