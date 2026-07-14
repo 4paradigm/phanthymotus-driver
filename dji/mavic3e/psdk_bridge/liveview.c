@@ -29,23 +29,31 @@ static pthread_t s_fifo_thread;
 static int s_fifo_ready = 0;
 #define H264_FIFO_PATH "/tmp/dji_h264_fifo"
 
-/* Thread that opens FIFO write end (blocks until reader connects) */
+/* Thread that opens FIFO write end — reconnects if reader closes */
 static void *_fifo_open_thread(void *arg) {
     (void)arg;
-    printf("[liveview] waiting for FIFO reader...\n");
-    int fd = open(H264_FIFO_PATH, O_WRONLY);  /* Blocks until reader opens */
-    if (fd >= 0) {
-        /* Set non-blocking so callback thread doesn't stall on full pipe */
-        int flags = fcntl(fd, F_GETFL, 0);
-        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-        s_h264_pipe_fd = fd;
-        s_fifo_ready = 1;
-        printf("[liveview] FIFO writer connected (fd=%d)\n", fd);
-        /* Request new I-frame so decoder starts clean */
-        DjiLiveview_RequestIntraframeFrameData(DJI_LIVEVIEW_CAMERA_POSITION_NO_1, s_camera_source);
-        printf("[liveview] I-frame re-requested after FIFO connect\n");
-    } else {
-        printf("[liveview] FIFO open failed\n");
+    while (1) {
+        if (s_h264_pipe_fd >= 0) {
+            /* Already connected, wait */
+            sleep(1);
+            continue;
+        }
+        printf("[liveview] waiting for FIFO reader...\n");
+        int fd = open(H264_FIFO_PATH, O_WRONLY);  /* Blocks until reader opens */
+        if (fd >= 0) {
+            /* Set non-blocking so callback thread doesn't stall on full pipe */
+            int flags = fcntl(fd, F_GETFL, 0);
+            fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+            s_h264_pipe_fd = fd;
+            s_fifo_ready = 1;
+            printf("[liveview] FIFO writer connected (fd=%d)\n", fd);
+            /* Request new I-frame so decoder starts clean */
+            DjiLiveview_RequestIntraframeFrameData(DJI_LIVEVIEW_CAMERA_POSITION_NO_1, s_camera_source);
+            printf("[liveview] I-frame re-requested after FIFO connect\n");
+        } else {
+            printf("[liveview] FIFO open failed, retrying in 1s\n");
+            sleep(1);
+        }
     }
     return NULL;
 }
