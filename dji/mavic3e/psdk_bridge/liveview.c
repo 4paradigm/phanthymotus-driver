@@ -126,6 +126,9 @@ static void _decode_h264(const uint8_t *data, uint32_t len) {
                 s_frame_count++;
                 if (s_frame_count % 3 == 0) {
                     _encode_jpeg("/tmp/dji_frame.jpg", s_rgb_buffer, s_width, s_height);
+                    if (s_frame_count % 30 == 0) {
+                        printf("[liveview] wrote frame #%d (%dx%d)\n", s_frame_count, s_width, s_height);
+                    }
                 }
             }
         }
@@ -136,6 +139,11 @@ static void _decode_h264(const uint8_t *data, uint32_t len) {
 
 static void _h264_cb(E_DjiLiveViewCameraPosition pos,
                      const uint8_t *data, uint32_t len) {
+    static int cb_count = 0;
+    cb_count++;
+    if (cb_count % 100 == 1) {
+        printf("[liveview] h264_cb #%d len=%u decoded_frames=%d\n", cb_count, len, s_frame_count);
+    }
     _decode_h264(data, len);
 }
 
