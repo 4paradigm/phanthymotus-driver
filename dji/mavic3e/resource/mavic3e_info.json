@@ -1,0 +1,43 @@
+{
+  "name": "DJI Mavic 3T",
+  "type": "drone",
+  "manufacturer": "DJI",
+  "model": "Mavic 3T",
+  "cameras": {
+    "wide": {
+      "sensor": "4/3 CMOS 48MP",
+      "focal_length": "24mm equiv (12.29mm actual)",
+      "fov": 84,
+      "resolution": "5280x3956"
+    },
+    "zoom": {
+      "sensor": "1/2 inch CMOS 12MP",
+      "focal_length": "162mm equiv (30mm actual)",
+      "fov": 15,
+      "resolution": "4000x3000",
+      "zoom_range": "7x optical"
+    },
+    "ir": {
+      "sensor": "Uncooled VOx Microbolometer",
+      "resolution": "640x512",
+      "pixel_pitch": "12μm",
+      "dfov": 61,
+      "temperature_range": "-20°C to 150°C (high gain) / -20°C to 550°C (low gain)",
+      "accuracy": "±2°C or ±2%"
+    }
+  },
+  "gimbal_range": {
+    "pitch": [-90, 35],
+    "yaw": [-40, 40],
+    "roll": [-45, 45]
+  },
+  "max_speed_ms": 19,
+  "max_altitude_m": 6000,
+  "max_flight_time_min": 45,
+  "max_wind_resistance_ms": 12,
+  "weight_g": 920,
+  "psdk_interface": "E-Port",
+  "psdk_version": "v3.16.0",
+  "waypoint_version": "V3",
+  "perception_directions": ["front", "back", "left", "right", "up", "down"]
+}

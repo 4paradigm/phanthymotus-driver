@@ -1,0 +1,23 @@
+dji-mavic3e:
+  image: __IMAGE__
+  container_name: embodied-dji-mavic3e
+  network_mode: host
+  ipc: host
+  privileged: true
+  volumes:
+    - /dev:/dev
+    - /opt/phanthy-motus/data:/opt/phanthy-motus/data
+    - /run/udev:/run/udev:ro
+    - /sys/kernel/config:/sys/kernel/config
+    - /dev/usb-ffs:/dev/usb-ffs
+    - /usr/lib/aarch64-linux-gnu/tegra:/usr/lib/aarch64-linux-gnu/tegra:ro
+  environment:
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - PYTHONUNBUFFERED=1
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: unless-stopped
