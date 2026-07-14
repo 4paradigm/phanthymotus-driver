@@ -162,6 +162,9 @@ class _CameraStreamNode(Node):
 
         frame_path = "/tmp/dji_frame.jpg"
         last_mtime = 0
+        pub_count = 0
+
+        self.get_logger().info(f"stream_loop started, reading {frame_path}")
 
         while self.state == "running":
             time.sleep(1.0 / self._fps)
@@ -180,8 +183,11 @@ class _CameraStreamNode(Node):
                     msg = String()
                     msg.data = base64.b64encode(jpeg_data).decode("ascii")
                     self._pub.publish(msg)
-            except Exception:
-                pass
+                    pub_count += 1
+                    if pub_count % 30 == 1:
+                        self.get_logger().info(f"published frame #{pub_count} ({len(jpeg_data)} bytes)")
+            except Exception as e:
+                self.get_logger().error(f"stream_loop error: {e}")
 
 
 class CameraStreamPlugin:
