@@ -12,6 +12,7 @@
 
 #ifdef PSDK_ENABLED
 #include "dji_liveview.h"
+#include "dji_camera_manager.h"
 #include <libavcodec/avcodec.h>
 #include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
@@ -183,14 +184,19 @@ int liveview_start(const char *camera, liveview_frame_cb_t cb) {
     s_frame_cb = cb;
     E_DjiLiveViewCameraPosition pos = DJI_LIVEVIEW_CAMERA_POSITION_NO_1;
 
-    /* Map camera name to DJI source enum */
+    /* Switch camera stream source via CameraManager API */
+    E_DjiCameraManagerStreamSource stream_src = DJI_CAMERA_MANAGER_SOURCE_WIDE_CAM;
     if (strcmp(camera, "ir") == 0) {
-        s_camera_source = DJI_LIVEVIEW_CAMERA_SOURCE_M3T_IR;   /* 3T only */
+        stream_src = DJI_CAMERA_MANAGER_SOURCE_IR_CAM;
     } else if (strcmp(camera, "zoom") == 0) {
-        s_camera_source = DJI_LIVEVIEW_CAMERA_SOURCE_DEFAULT;  /* zoom lens */
-    } else {
-        s_camera_source = DJI_LIVEVIEW_CAMERA_SOURCE_M3E_VIS;  /* wide (default) */
+        stream_src = DJI_CAMERA_MANAGER_SOURCE_ZOOM_CAM;
     }
+    T_DjiReturnCode src_rc = DjiCameraManager_SetStreamSource(
+        DJI_MOUNT_POSITION_PAYLOAD_PORT_NO1, stream_src);
+    printf("[liveview] SetStreamSource(%d) → 0x%08llX\n", stream_src, (unsigned long long)src_rc);
+
+    /* Always use M3E_VIS as the liveview source (single H264 stream) */
+    s_camera_source = DJI_LIVEVIEW_CAMERA_SOURCE_M3E_VIS;
 
     /* Stop any existing stream first (idempotent) */
     DjiLiveview_StopH264Stream(pos, s_camera_source);
