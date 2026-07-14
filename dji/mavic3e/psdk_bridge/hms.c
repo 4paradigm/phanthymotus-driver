@@ -39,7 +39,8 @@ static T_DjiReturnCode _hms_cb(T_DjiHmsInfoTable info) {
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
 
-/* Lookup error code in built-in hmsErrCodeInfoTbl (727 entries) */
+/* Lookup error code in built-in hmsErrCodeInfoTbl */
+static char s_unknown_buf[64];
 static const char *_lookup_msg(uint32_t code, int is_flying) {
     size_t tbl_size = sizeof(hmsErrCodeInfoTbl) / sizeof(hmsErrCodeInfoTbl[0]);
     for (size_t i = 0; i < tbl_size; i++) {
@@ -48,10 +49,11 @@ static const char *_lookup_msg(uint32_t code, int is_flying) {
                 return hmsErrCodeInfoTbl[i].flyAlarmInfo;
             if (hmsErrCodeInfoTbl[i].groundAlarmInfo && hmsErrCodeInfoTbl[i].groundAlarmInfo[0])
                 return hmsErrCodeInfoTbl[i].groundAlarmInfo;
-            return hmsErrCodeInfoTbl[i].flyAlarmInfo ? hmsErrCodeInfoTbl[i].flyAlarmInfo : "";
+            return hmsErrCodeInfoTbl[i].flyAlarmInfo ? hmsErrCodeInfoTbl[i].flyAlarmInfo : "Unknown";
         }
     }
-    return "";
+    snprintf(s_unknown_buf, sizeof(s_unknown_buf), "Unknown error 0x%08X", code);
+    return s_unknown_buf;
 }
 
 int hms_init(void) {
