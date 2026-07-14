@@ -37,6 +37,9 @@ static void *_fifo_open_thread(void *arg) {
         s_h264_pipe_fd = fd;
         s_fifo_ready = 1;
         printf("[liveview] FIFO writer connected (fd=%d)\n", fd);
+        /* Request new I-frame so decoder starts clean */
+        DjiLiveview_RequestIntraframeFrameData(DJI_LIVEVIEW_CAMERA_POSITION_NO_1, s_camera_source);
+        printf("[liveview] I-frame re-requested after FIFO connect\n");
     } else {
         printf("[liveview] FIFO open failed\n");
     }
