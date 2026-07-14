@@ -122,13 +122,11 @@ static void _decode_h264(const uint8_t *data, uint32_t len) {
                           0, s_height,
                           s_frame_rgb->data, s_frame_rgb->linesize);
 
-                /* Encode JPEG (throttle to ~10fps: every 3rd frame at 30fps input) */
+                /* Encode JPEG every decoded frame */
                 s_frame_count++;
-                if (s_frame_count % 3 == 0) {
-                    _encode_jpeg("/tmp/dji_frame.jpg", s_rgb_buffer, s_width, s_height);
-                    if (s_frame_count % 30 == 0) {
-                        printf("[liveview] wrote frame #%d (%dx%d)\n", s_frame_count, s_width, s_height);
-                    }
+                _encode_jpeg("/tmp/dji_frame.jpg", s_rgb_buffer, s_width, s_height);
+                if (s_frame_count % 30 == 0) {
+                    printf("[liveview] wrote frame #%d (%dx%d)\n", s_frame_count, s_width, s_height);
                 }
             }
         }
@@ -156,7 +154,7 @@ int liveview_init(void) {
 
     /* Initialize FFmpeg decoder */
     avcodec_register_all();
-    av_log_set_level(AV_LOG_ERROR);  /* Suppress warnings (PPS/SPS errors normal until I-frame) */
+    av_log_set_level(AV_LOG_FATAL);  /* Suppress all warnings/errors (SEI truncated noise) */
     AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_H264);
     if (!codec) {
         printf("[liveview] H264 codec not found\n");
