@@ -933,19 +933,19 @@ class TimeSyncPlugin:
         return {
             "name": "aircraft_info",
             "type": "actuator",
-            "description": "飞机信息查询：机型、固件版本、连接状态、GPS 授时。",
+            "description": "飞机信息查询：机型、固件版本、连接状态、GPS 对时。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["info", "get_time"],
+                        "enum": ["get_info", "sync_time"],
                     },
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "info": {"params": [], "description": "获取机型/固件/连接状态"},
-                    "get_time": {"params": [], "description": "获取飞机 GPS 时间 (UTC)"},
+                    "get_info": {"params": [], "description": "获取机型/固件/连接状态"},
+                    "sync_time": {"params": [], "description": "从飞机 GPS 对时，返回 UTC 时间"},
                 },
             },
         }
@@ -957,10 +957,10 @@ class TimeSyncPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict | None:
-        if action == "info":
+        if action == "get_info":
             resp = self._bridge.get_aircraft_info()
             return {"ret": 0 if resp.get("ok") else -1, "data": resp.get("data", {})}
-        if action == "get_time":
+        if action == "sync_time":
             resp = self._bridge.get_aircraft_time()
             return {"ret": 0 if resp.get("ok") else -1, "data": resp.get("data", {})}
         return None
