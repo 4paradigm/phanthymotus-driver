@@ -1,0 +1,37 @@
+mcp_port: 15703
+ros_namespace: ""   # 留空则自动使用 hostname
+name: "DJI Mavic 4E/4T"
+
+# PSDK bridge settings
+psdk_bridge:
+  app_name: "PhanthyMotus"
+  app_id: "190076"
+  app_key: "26af38fb6126f58c195b5c8da0b481c"
+  app_license: "Y4wiW8E6tI2TmZoEkAt7jUM0Oqu3gJM1fNBoXKJO/fzlvYhPMUpxTP9qIB0w5KPrJ5XUkL8ImoxiVesgjEJ5FMe43KqbL8YrUQCK8i8xWVmEMQh0+ADPpfmBi7IAm43PzlJezFYSw6CfO1TjLuRNqLFs3y+LnAh95x5g7DCIaKGUSzPBjORgqRL/wbYngLBOedJtTOIq9T0zB1M922ffvubT2RoRCjhFWb9T6l3V3C2W15JlQ0hRCADyvvHhA2qI7ITq8YXTHktc8yAiRtTVC4+IOqQppkJfxvpE+n810/4vt1xfXKLtIuZxaUcMZY/Q3oEvbV4ZL2AKpiuFRwoz5g=="
+  baud_rate: 921600
+  uart_dev: "auto"           # "auto" = scan /dev/ttyUSB* and /dev/ttyACM* for E-Port device
+  usb_vid: ""                # Leave empty for auto-detect (supports FTDI 0403 and DJI 2ca3)
+  network_iface: "usb0"  # E-Port USB-Ethernet interface
+
+plugins:
+  telemetry:
+    enabled: true
+    publish_rate: 10   # Hz
+  camera_stream:
+    enabled: true
+    fps: 10
+    camera_source: "wide"   # wide / zoom / ir (4T only) / 4k
+  perception:
+    enabled: true
+  hms:
+    enabled: true
+  flight:
+    enabled: true
+  camera:
+    enabled: true
+  gimbal:
+    enabled: true
+  waypoint:
+    enabled: true
+  time_sync:
+    enabled: true

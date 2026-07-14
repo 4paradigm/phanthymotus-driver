@@ -1,0 +1,644 @@
+- generic [active] [ref=f1e1]:
+  - generic [ref=f1e3]:
+    - banner [ref=f1e4]:
+      - generic [ref=f1e5]:
+        - link [ref=f1e6] [cursor=pointer]:
+          - /url: https://developer.dji.com/cn
+          - img "Payload SDK" [ref=f1e7]
+        - link "Payload SDK" [ref=f1e8] [cursor=pointer]:
+          - /url: https://developer.dji.com/cn/payload-sdk/
+      - generic [ref=f1e9]:
+        - navigation [ref=f1e10]:
+          - link "API Reference" [ref=f1e12] [cursor=pointer]:
+            - /url: https://developer.dji.com/doc/payload-sdk-api-reference/cn/
+            - text: API Reference
+            - generic [ref=f1e13]: open in new window
+          - link "下载" [ref=f1e19] [cursor=pointer]:
+            - /url: https://github.com/dji-sdk/Payload-SDK/releases
+            - text: 下载
+            - generic [ref=f1e20]: open in new window
+          - link "v3.16.0" [ref=f1e26] [cursor=pointer]:
+            - /url: /doc/payload-sdk-tutorial/cn/payload-quick-start/configure-the-hardware-environment/device-connect.html
+          - button "Select language" [ref=f1e29] [cursor=pointer]: Languages
+        - button "Search" [ref=f1e32] [cursor=pointer]:
+          - generic [ref=f1e33]: 搜索
+          - generic [ref=f1e37]:
+            - generic [ref=f1e38]: ⌘
+            - generic [ref=f1e39]: K
+    - complementary [ref=f1e40]:
+      - list [ref=f1e41]:
+        - listitem [ref=f1e42]:
+          - link "版本发布记录" [ref=f1e43] [cursor=pointer]:
+            - /url: /doc/payload-sdk-tutorial/cn/index.html
+        - listitem [ref=f1e44]:
+          - paragraph [ref=f1e45] [cursor=pointer]: 产品简介
+        - listitem [ref=f1e47]:
+          - paragraph [ref=f1e48] [cursor=pointer]: 开发准备
+        - listitem [ref=f1e50]:
+          - paragraph [ref=f1e51] [cursor=pointer]: 负载开发入门
+          - list [ref=f1e53]:
+            - listitem [ref=f1e54]:
+              - paragraph [ref=f1e55]: 快速体验 Demo
+            - listitem [ref=f1e57]:
+              - paragraph [ref=f1e58]: 配置硬件环境
+              - list [ref=f1e60]:
+                - listitem [ref=f1e61]:
+                  - link "负载开发标准" [ref=f1e62] [cursor=pointer]:
+                    - /url: /doc/payload-sdk-tutorial/cn/payload-quick-start/configure-the-hardware-environment/payload-develop-criterion.html
+                - listitem [ref=f1e63]:
+                  - link "飞行器硬件接口" [ref=f1e64] [cursor=pointer]:
+                    - /url: /doc/payload-sdk-tutorial/cn/payload-quick-start/configure-the-hardware-environment/drone-port.html
+                - listitem [ref=f1e65]:
+                  - link "飞行器硬件连接" [ref=f1e66] [cursor=pointer]:
+                    - /url: /doc/payload-sdk-tutorial/cn/payload-quick-start/configure-the-hardware-environment/device-connect.html
+                  - list:
+                    - listitem:
+                      - list:
+                        - listitem
+                    - listitem:
+                      - list:
+                        - listitem
+                    - listitem:
+                      - list:
+                        - listitem
+                        - listitem
+                    - listitem:
+                      - list:
+                        - listitem
+                        - listitem
+                    - listitem:
+                      - list:
+                        - listitem
+                    - listitem:
+                      - list:
+                        - listitem
+                        - listitem
+                    - listitem:
+                      - list:
+                        - listitem
+                    - listitem:
+                      - list:
+                        - listitem
+                    - listitem:
+                      - list:
+                        - listitem
+                        - listitem
+                        - listitem
+                    - listitem
+                - listitem [ref=f1e67]:
+                  - link "集成认证芯片" [ref=f1e68] [cursor=pointer]:
+                    - /url: /doc/payload-sdk-tutorial/cn/payload-quick-start/configure-the-hardware-environment/sdk-cc.html
+            - listitem [ref=f1e69]:
+              - link "配置开发环境" [ref=f1e70] [cursor=pointer]:
+                - /url: /doc/payload-sdk-tutorial/cn/payload-quick-start/config-develop-environment.html
+            - listitem [ref=f1e71]:
+              - link "开始使用 PSDK" [ref=f1e72] [cursor=pointer]:
+                - /url: /doc/payload-sdk-tutorial/cn/payload-quick-start/getting-started-with-psdk.html
+            - listitem [ref=f1e73]:
+              - link "应用绑定" [ref=f1e74] [cursor=pointer]:
+                - /url: /doc/payload-sdk-tutorial/cn/payload-quick-start/bind-application.html
+        - listitem [ref=f1e75]:
+          - paragraph [ref=f1e76] [cursor=pointer]: 妙算开发入门
+        - listitem [ref=f1e78]:
+          - paragraph [ref=f1e79] [cursor=pointer]: 功能介绍
+        - listitem [ref=f1e81]:
+          - link "常见问题" [ref=f1e82] [cursor=pointer]:
+            - /url: /doc/payload-sdk-tutorial/cn/faq.html
+    - main [ref=f1e83]:
+      - generic [ref=f1e84]:
+        - generic [ref=f1e85]:
+          - heading "飞行器硬件连接" [level=1] [ref=f1e86]
+          - generic [ref=f1e87]:
+            - generic [ref=f1e88]: 2026-02-28
+            - generic [ref=f1e92]:
+              - slider "rating" [ref=f1e93]
+              - generic [ref=f1e114]: 暂无评分
+            - link "Github Edit" [ref=f1e116] [cursor=pointer]:
+              - /url: https://github.com/dji-sdk/Payload-SDK-Tutorial/blob/master/docs/cn/30.payload-quick-start/02.configure-the-hardware-environment/20.device-connect.md
+              - text: Github Edit
+              - generic [ref=f1e117]: open in new window
+        - generic [ref=f1e123]:
+          - heading "FlyCart 100 设备连接" [level=2] [ref=f1e124]:
+            - link [ref=f1e125] [cursor=pointer]:
+              - /url: "#flycart-100-设备连接"
+              - text: "#"
+            - text: FlyCart 100 设备连接
+          - paragraph [ref=f1e126]:
+            - text: 开始 FlyCart 100 的设备连接前，请先阅读
+            - link "FlyCart 100 用户手册 open in new window" [ref=f1e127] [cursor=pointer]:
+              - /url: https://dl.djicdn.com/downloads/DJI_FlyCart_100/20251127/DJI_FlyCart_100_User_Manual_v1.2_zh-cn_i.pdf
+              - text: FlyCart 100 用户手册
+              - generic [ref=f1e128]: open in new window
+            - text: 中的 “部件名称” 并关注飞行器组件的介绍。FlyCart 100 支持通过 E-Port Lite 接口连接飞行器与负载设备。
+          - heading "基于 E-Port Lite 接口连接设备" [level=3] [ref=f1e133]:
+            - link [ref=f1e134] [cursor=pointer]:
+              - /url: "#基于-e-port-lite-接口连接设备"
+              - text: "#"
+            - text: 基于 E-Port Lite 接口连接设备
+          - paragraph [ref=f1e139]: 图. 基于 E-Port Lite 接口连接
+          - list [ref=f1e140]:
+            - listitem [ref=f1e141]: 飞行器 E-Port Lite 接口连接 USB-C OTG 线公头。
+            - listitem [ref=f1e142]: USB-C OTG 线母头连接 USB 转 TTL 串口模块。
+            - listitem [ref=f1e143]: 通过 USB 转 TTL 串口模块连接 PSDK 设备。
+            - listitem [ref=f1e144]: 飞行器空吊系统接口连接供电线，将供电线连接至 PSDK 设备，如需由飞行器为负载设备供电，可通过该接口供电。
+          - heading "Matrice 400 设备连接" [level=2] [ref=f1e145]:
+            - link [ref=f1e146] [cursor=pointer]:
+              - /url: "#matrice-400-设备连接"
+              - text: "#"
+            - text: Matrice 400 设备连接
+          - paragraph [ref=f1e147]:
+            - text: 开始 Matrice 400 的设备连接前，请先阅读
+            - link "Matrice 400 用户手册 open in new window" [ref=f1e148] [cursor=pointer]:
+              - /url: https://dl.djicdn.com/downloads/Matrice_400/Matrice_400_User_Manual_v1.0_zh-cn.pdf
+              - text: Matrice 400 用户手册
+              - generic [ref=f1e149]: open in new window
+            - text: 中的 “部件名称” 并关注飞行器组件的介绍。
+          - paragraph [ref=f1e154]:
+            - text: Matrice 400说明书更新了 FOV 说明，具体可参考
+            - link "Matrice 400 用户手册 V1.02 open in new window" [ref=f1e155] [cursor=pointer]:
+              - /url: https://dl.djicdn.com/downloads/Matrice_400/UM/20250908/Matrice_400_User_Manual_v1.02_zh-cn.pdf
+              - text: Matrice 400 用户手册 V1.02
+              - generic [ref=f1e156]: open in new window
+            - text: 中的“FOV”部分。
+          - heading "基于 E-Port V2 接口连接设备" [level=3] [ref=f1e161]:
+            - link [ref=f1e162] [cursor=pointer]:
+              - /url: "#基于-e-port-v2-接口连接设备"
+              - text: "#"
+            - text: 基于 E-Port V2 接口连接设备
+          - paragraph [ref=f1e163]: Matrice 400 底部存在 4 个 E-Port V2 接口，如下图所示（可对照实物辨认）：
+          - paragraph [ref=f1e167]: 图. Matrice 400 E-Port V2 接口编号
+          - paragraph [ref=f1e168]: "通过 E-Port V2 端口连接 Matrice 400 共有三种方式:"
+          - list [ref=f1e169]:
+            - listitem [ref=f1e170]: X-Port 标准云台(使用 X-port 开发板与 E-port V2 连接，需要通过杜邦线连接开发板的 MCU 串口)。
+            - listitem [ref=f1e171]: Skyport V3 转接环和 Skyport V3 同轴线。
+            - listitem [ref=f1e172]: E-Port V2 同轴线。
+          - paragraph [ref=f1e173]: 连接示意图如下：
+          - paragraph [ref=f1e178]: 图. Matrice 400 E-Port V2 连接方法
+          - paragraph [ref=f1e179]:
+            - text: 按照上图完成连接后，用户可直接基于 E-Port V2 开发板上自带的 GD32进行 PSDK 开发，也可使用 E-Port V2开发板的 USB 接口外接三方开发板进行开发。 Matrice 400上的4号 E-Port V2接口支持通过连接 Hub 来进行扩展。参考
+            - link "E-Port V2 HUB 参考原理图 open in new window" [ref=f1e180] [cursor=pointer]:
+              - /url: https://terra-1-g.djicdn.com/71a7d383e71a4fb8887a310eb746b47f/psdk/M400/hub%E5%8F%82%E8%80%83%E5%8E%9F%E7%90%86%E5%9B%BE%E6%9B%B4%E6%96%B0.pdf
+              - text: E-Port V2 HUB 参考原理图
+              - generic [ref=f1e181]: open in new window
+            - text: 用户可以设计二级 Hub，从而通过 Hub 最多扩展出最多4个 E-Port V2接口，拓展出的 E-Port V2 接口接方法与原生接口一致。
+          - heading "Matrice 4E/4T 、Matrice 4D/4TD 设备连接" [level=2] [ref=f1e186]:
+            - link [ref=f1e187] [cursor=pointer]:
+              - /url: "#matrice-4e-4t-、matrice-4d-4td-设备连接"
+              - text: "#"
+            - text: Matrice 4E/4T 、Matrice 4D/4TD 设备连接
+          - paragraph [ref=f1e188]:
+            - text: 开始 Matrice 4E/4T、Matrice 4D/4TD 的设备连接前，请先阅读
+            - link "Matrice 4E/4T、Matrice 4D/4TD 用户手册 open in new window" [ref=f1e189] [cursor=pointer]:
+              - /url: https://www.dji.com/cn/products/enterprise?site=enterprise&from=nav
+              - text: Matrice 4E/4T、Matrice 4D/4TD 用户手册
+              - generic [ref=f1e190]: open in new window
+            - text: 中的 “部件名称” 并关注飞行器组件的介绍。Matrice 4E/4T、Matrice 4D/4TD 支持
+            - strong [ref=f1e195]: 搭配 E-Port 开发者套件
+            - text: 连接飞行器与负载设备。
+          - heading "基于 E-Port 接口连接设备" [level=3] [ref=f1e196]:
+            - link [ref=f1e197] [cursor=pointer]:
+              - /url: "#基于-e-port-接口连接设备"
+              - text: "#"
+            - text: 基于 E-Port 接口连接设备
+          - paragraph [ref=f1e202]: 图. Matrice 4D/4TD 设备连接方式
+          - list [ref=f1e203]:
+            - listitem [ref=f1e204]: 飞行器 E-Port 接口连接 E-Port 同轴线母头，注意引脚的对应。
+            - listitem [ref=f1e205]: 同轴线公头连接 E-Port 连接口，A 面朝向 E-Port 转接板底板（泡棉侧），B 面朝向 E-Port 正面（芯片器件侧）。
+          - generic [ref=f1e206]:
+            - paragraph [ref=f1e207]: 注意：
+            - paragraph [ref=f1e208]:
+              - text: E-Port 同轴线的 USB-C 连接线无防呆设计，A/B 可反接。但由于飞行器的 USB-C 有线序差异，如果 E-Port 同轴线反接，同轴线另一端的 A/B 也需要对应翻转后连接。
+              - strong [ref=f1e209]: 若同轴线另一端没有相应的翻转，E-Port 开发者套件将无法正常供电与通讯。
+          - list [ref=f1e210]:
+            - listitem [ref=f1e211]: USB ID 拨码开关切换至 “Host”。
+            - listitem [ref=f1e212]: 如果有通过 E-Port 开发者套件供电的需求，请关注每个端口提供的电压值，防止损坏负载设备。
+            - listitem [ref=f1e213]: 连接负载设备串口。
+            - listitem [ref=f1e214]: USB 2.0 接口连接负载设备 USB device/USB OTG/ 网口。
+          - generic [ref=f1e215]:
+            - paragraph [ref=f1e216]: 说明：
+            - paragraph [ref=f1e217]: 在连接负载设备网口的场景下，可通过 USB 转网卡线与网线连接 USB 2.0 接口。
+          - list [ref=f1e218]:
+            - listitem [ref=f1e219]: E-Port 拨码开关切换至 ON。
+          - heading "基于 E-Port Lite 接口连接设备" [level=3] [ref=f1e220]:
+            - link [ref=f1e221] [cursor=pointer]:
+              - /url: "#基于-e-port-lite-接口连接设备-1"
+              - text: "#"
+            - text: 基于 E-Port Lite 接口连接设备
+          - paragraph [ref=f1e222]: 通过 USB-C 连接线直接将飞行器与电脑进行连接，执行调参任务，或直接通过 USB-C OTG 线和 USB 转 TTL 串口模块连接 UART 负载设备，传输简单命令数据。
+          - paragraph [ref=f1e227]: 图. Matrice 4D/4TD 设备连接方式
+          - heading "Matrice 3D/3TD 设备连接" [level=2] [ref=f1e228]:
+            - link [ref=f1e229] [cursor=pointer]:
+              - /url: "#matrice-3d-3td-设备连接"
+              - text: "#"
+            - text: Matrice 3D/3TD 设备连接
+          - paragraph [ref=f1e230]:
+            - text: 开始 Matrice 3D/3TD 的设备连接前，请先阅读
+            - link "Matrice 3D/3TD 用户手册 open in new window" [ref=f1e231] [cursor=pointer]:
+              - /url: https://www.dji.com/cn/products/enterprise?site=enterprise&from=nav
+              - text: Matrice 3D/3TD 用户手册
+              - generic [ref=f1e232]: open in new window
+            - text: 中的 “部件名称” 并关注飞行器组件的介绍。Matrice 3D/3TD 支持
+            - strong [ref=f1e237]: 搭配 E-Port 开发者套件
+            - text: 连接飞行器与负载设备。
+          - paragraph [ref=f1e242]: 图. Matrice 3D/3TD 设备连接方式
+          - heading "基于 E-Port 接口连接设备" [level=3] [ref=f1e243]:
+            - link [ref=f1e244] [cursor=pointer]:
+              - /url: "#基于-e-port-接口连接设备-1"
+              - text: "#"
+            - text: 基于 E-Port 接口连接设备
+          - paragraph [ref=f1e249]: 图. 基于 E-Port 接口连接
+          - list [ref=f1e250]:
+            - listitem [ref=f1e251]: 飞行器 E-Port 接口连接 E-Port 同轴线母头，注意引脚的对应。
+            - listitem [ref=f1e252]: 同轴线公头连接 E-Port 连接口，A 面朝向 E-Port 转接板底板（泡棉侧），B 面朝向 E-Port 正面（芯片器件侧）。
+          - generic [ref=f1e253]:
+            - paragraph [ref=f1e254]: 注意：
+            - paragraph [ref=f1e255]:
+              - text: E-Port 同轴线的 USB-C 连接线无防呆设计，A/B 可反接。但由于飞行器的 USB-C 有线序差异，如果 E-Port 同轴线反接，同轴线另一端的 A/B 也需要对应翻转后连接。
+              - strong [ref=f1e256]: 若同轴线另一端没有相应的翻转，E-Port 开发者套件将无法正常供电与通讯。
+          - list [ref=f1e257]:
+            - listitem [ref=f1e258]: USB ID 拨码开关切换至 “Host”。
+            - listitem [ref=f1e259]: 如果有通过 E-Port 开发者套件供电的需求，请关注每个端口提供的电压值，防止损坏负载设备。
+            - listitem [ref=f1e260]: 连接负载设备串口。
+            - listitem [ref=f1e261]: USB 2.0 接口连接负载设备 USB device/USB OTG。
+            - listitem [ref=f1e262]: E-Port 拨码开关切换至 ON。
+          - heading "基于 E-Port Lite 接口连接设备" [level=3] [ref=f1e263]:
+            - link [ref=f1e264] [cursor=pointer]:
+              - /url: "#基于-e-port-lite-接口连接设备-2"
+              - text: "#"
+            - text: 基于 E-Port Lite 接口连接设备
+          - paragraph [ref=f1e265]: 通过 USB-C 连接线直接将飞行器与电脑进行连接，执行调参任务，或直接通过 USB-C OTG 线和 USB 转 TTL 串口模块连接 UART 负载设备，传输简单命令数据。
+          - paragraph [ref=f1e269]: 图. 基于 E-Port Lite 接口连接
+          - heading "FlyCart 30 设备连接" [level=2] [ref=f1e270]:
+            - link [ref=f1e271] [cursor=pointer]:
+              - /url: "#flycart-30-设备连接"
+              - text: "#"
+            - text: FlyCart 30 设备连接
+          - paragraph [ref=f1e272]:
+            - text: 开始 FlyCart 30 的设备连接前，请先阅读
+            - link "FlyCart 30 用户手册 open in new window" [ref=f1e273] [cursor=pointer]:
+              - /url: https://dl.djicdn.com/downloads/DJI_FlyCart_30/20230816/DJI_FlyCart_30%E7%94%A8%E6%88%B7%E6%89%8B%E5%86%8CV1.0.pdf
+              - text: FlyCart 30 用户手册
+              - generic [ref=f1e274]: open in new window
+            - text: 中的 “部件名称” 并关注飞行器组件的介绍。FlyCart 30 支持通过 E-Port Lite 接口连接飞行器与负载设备。
+          - heading "基于 E-Port Lite 接口连接设备" [level=3] [ref=f1e279]:
+            - link [ref=f1e280] [cursor=pointer]:
+              - /url: "#基于-e-port-lite-接口连接设备-3"
+              - text: "#"
+            - text: 基于 E-Port Lite 接口连接设备
+          - paragraph [ref=f1e285]: 图. 基于 E-Port Lite 接口连接
+          - list [ref=f1e286]:
+            - listitem [ref=f1e287]: 飞行器 E-Port Lite 接口连接 USB-C OTG 线公头。
+            - listitem [ref=f1e288]: USB-C OTG 线母头连接 USB 转 TTL 串口模块。
+            - listitem [ref=f1e289]: 通过 USB 转 TTL 串口模块连接 PSDK 设备。
+            - listitem [ref=f1e290]: 飞行器空吊系统接口连接供电线，将供电线连接至 PSDK 设备，如需由飞行器为负载设备供电，可通过该接口供电。
+          - heading "Matrice 350 RTK 设备连接" [level=2] [ref=f1e291]:
+            - link [ref=f1e292] [cursor=pointer]:
+              - /url: "#matrice-350-rtk-设备连接"
+              - text: "#"
+            - text: Matrice 350 RTK 设备连接
+          - paragraph [ref=f1e293]:
+            - text: 开始 Matrice 350 RTK 的设备连接前，请先阅读
+            - link "Matrice 350 RTK 用户手册 open in new window" [ref=f1e294] [cursor=pointer]:
+              - /url: https://dl.djicdn.com/downloads/matrice_350_rtk/Matrice_350_RTK_User_Manual_cn.pdf
+              - text: Matrice 350 RTK 用户手册
+              - generic [ref=f1e295]: open in new window
+            - text: 中的 “认识飞行器” 并关注飞行器组件的介绍。Matrice 350 RTK 有三种方式连接飞行器与负载设备：
+          - list [ref=f1e300]:
+            - listitem [ref=f1e301]: 搭配 E-Port 同轴线/SDK 同轴线、E-Port 开发者套件
+            - listitem [ref=f1e302]: 搭配上云台支架/下云台支架、X-Port
+            - listitem [ref=f1e303]: 搭配上云台支架/下云台支架、SkyPort V2
+          - paragraph [ref=f1e306]: 图. Matrice 350 RTK 设备连接方式
+          - heading "从 E-Port 接口连接" [level=3] [ref=f1e309]:
+            - link [ref=f1e310] [cursor=pointer]:
+              - /url: "#从-e-port-接口连接"
+              - text: "#"
+            - text: 从 E-Port 接口连接
+          - paragraph [ref=f1e313]: 图. 基于 E-Port 接口连接
+          - list [ref=f1e316]:
+            - listitem [ref=f1e317]:
+              - text: 机身 E-Port 接口连接同轴线母头，
+              - strong [ref=f1e318]: 注意引脚的对应
+              - text: 。
+            - listitem [ref=f1e319]: 同轴线公头连接 E-Port 连接口，A 面朝向 E-Port 转接板底板（泡棉侧），B 面朝向 E-Port 正面（芯片器件侧）。
+          - generic [ref=f1e320]:
+            - paragraph [ref=f1e321]: 注意：
+            - paragraph [ref=f1e322]:
+              - text: E-Port 同轴线的 USB-C 连接线无防呆设计，A/B 可反接。但由于飞行器的 USB-C 有线序差异，如果 E-Port 同轴线反接，同轴线另一端的 A/B 也需要对应翻转后连接。
+              - strong [ref=f1e323]: 若同轴线另一端没有相应的翻转，E-Port 开发者套件将无法正常供电与通讯。
+          - list [ref=f1e324]:
+            - listitem [ref=f1e325]: USB ID 拨码开关切换至 Host。
+            - listitem [ref=f1e326]: 如果有通过 E-Port 开发者套件供电的需求，请关注每个端口提供的电压值，防止损坏负载设备。
+            - listitem [ref=f1e327]: 连接负载设备串口。
+            - listitem [ref=f1e328]: USB 2.0 接口连接负载设备 USB device/USB OTG/ 网口。
+          - generic [ref=f1e329]:
+            - paragraph [ref=f1e330]: 说明：
+            - paragraph [ref=f1e331]: 在连接负载设备网口的场景下，可通过 USB 转网卡线与网线连接 USB 2.0 接口。
+          - list [ref=f1e332]:
+            - listitem [ref=f1e333]: E-Port 拨码开关切换至 ON。
+          - heading "从云台口连接" [level=3] [ref=f1e334]:
+            - link [ref=f1e335] [cursor=pointer]:
+              - /url: "#从云台口连接"
+              - text: "#"
+            - text: 从云台口连接
+          - heading "使用 SkyPort V2" [level=4] [ref=f1e336]:
+            - link [ref=f1e337] [cursor=pointer]:
+              - /url: "#使用-skyport-v2"
+              - text: "#"
+            - text: 使用 SkyPort V2
+          - paragraph [ref=f1e340]: 图. SkyportV2 连接
+          - list [ref=f1e343]:
+            - listitem [ref=f1e344]: SkyPort V2 安装到飞行器的上云台支架 / 下云台支架上。
+          - generic [ref=f1e345]:
+            - paragraph [ref=f1e346]: 注意：
+            - paragraph [ref=f1e347]: 下置云台架有单云台与双云台两种，图示为单云台支架。
+          - list [ref=f1e348]:
+            - listitem [ref=f1e349]:
+              - text: Port 1 通过排线连接拓展板 J2 处，或者 Port 2 通过同轴线连接拓展板 J3 处。
+              - strong [ref=f1e350]: 请勿同时使用 Port 1 与 Port 2。
+            - listitem [ref=f1e351]: 拓展板 J40 处可以提供网口通讯。
+            - listitem [ref=f1e352]: 拓展板 J10 处可以提供串口通讯。
+            - listitem [ref=f1e353]: 若有通过拓展板通电的需要，拓展板 J35、J36、J37 处为电源输出接口。注意接口输出电压，以防损坏设备。
+          - heading "使用 X-Port" [level=4] [ref=f1e354]:
+            - link [ref=f1e355] [cursor=pointer]:
+              - /url: "#使用-x-port"
+              - text: "#"
+            - text: 使用 X-Port
+          - paragraph [ref=f1e358]: 图. x-port 连接
+          - list [ref=f1e361]:
+            - listitem [ref=f1e362]: X-Port 安装到飞行器的上云台支架 / 下云台支架上。
+          - generic [ref=f1e363]:
+            - paragraph [ref=f1e364]: 注意：
+            - paragraph [ref=f1e365]: 下置云台架有单云台与双云台两种，图示为单云台支架。
+          - list [ref=f1e366]:
+            - listitem [ref=f1e367]: 通过排线连接 X-Port 与拓展板 J2 处。
+            - listitem [ref=f1e368]: 拓展板 J40 处可以提供网口通讯。
+            - listitem [ref=f1e369]: 拓展板 J10 处可以提供串口通讯。
+            - listitem [ref=f1e370]: 若有通过拓展板通电的需要，拓展板 J35、J36、J37 处为电源输出接口。注意接口输出电压，以防损坏设备。
+          - heading "Mavic 3E/3T 设备连接" [level=2] [ref=f1e371]:
+            - link [ref=f1e372] [cursor=pointer]:
+              - /url: "#mavic-3e-3t-设备连接"
+              - text: "#"
+            - text: Mavic 3E/3T 设备连接
+          - paragraph [ref=f1e373]:
+            - text: 开始 Mavic 3E/3T 的设备连接前，请先阅读
+            - link "Mavic 3E/3T 用户手册 open in new window" [ref=f1e374] [cursor=pointer]:
+              - /url: https://dl.djicdn.com/downloads/DJI_Mavic_3_Enterprise/20230303/DJI_Mavic_3E_3T_User_Manual_CHS.pdf
+              - text: Mavic 3E/3T 用户手册
+              - generic [ref=f1e375]: open in new window
+            - text: 中的 “部件名称” 并关注飞行器组件的介绍。Mavic 3E/3T 支持
+            - strong [ref=f1e380]: 搭配 E-Port 开发者套件
+            - text: 连接飞行器与负载设备。
+          - paragraph [ref=f1e385]: 图. Mavic 3E/3T 设备连接方式
+          - heading "基于 E-Port 接口连接设备" [level=3] [ref=f1e386]:
+            - link [ref=f1e387] [cursor=pointer]:
+              - /url: "#基于-e-port-接口连接设备-2"
+              - text: "#"
+            - text: 基于 E-Port 接口连接设备
+          - paragraph [ref=f1e392]: 图. 基于 E-Port 接口连接
+          - list [ref=f1e393]:
+            - listitem [ref=f1e394]: 飞行器 E-Port 接口连接 E-Port 同轴线母头，注意引脚的对应。
+            - listitem [ref=f1e395]: 同轴线公头连接 E-Port 连接口，A 面朝向 E-Port 转接板底板（泡棉侧），B 面朝向 E-Port 正面（芯片器件侧）。
+          - generic [ref=f1e396]:
+            - paragraph [ref=f1e397]: 注意：
+            - paragraph [ref=f1e398]:
+              - text: E-Port 同轴线的 USB-C 连接线无防呆设计，A/B 可反接。但由于飞行器的 USB-C 有线序差异，如果 E-Port 同轴线反接，同轴线另一端的 A/B 也需要对应翻转后连接。
+              - strong [ref=f1e399]: 若同轴线另一端没有相应的翻转，E-Port 开发者套件将无法正常供电与通讯。
+          - list [ref=f1e400]:
+            - listitem [ref=f1e401]: USB ID 拨码开关切换至 Host。
+            - listitem [ref=f1e402]: 如果有通过 E-Port 开发者套件供电的需求，请关注每个端口提供的电压值，防止损坏负载设备。
+            - listitem [ref=f1e403]: 连接负载设备串口。
+            - listitem [ref=f1e404]: USB 2.0 接口连接负载设备 USB device/USB OTG/ 网口。
+          - generic [ref=f1e405]:
+            - paragraph [ref=f1e406]: 说明：
+            - paragraph [ref=f1e407]: 在连接负载设备网口的场景下，可通过 USB 转网卡线与网线连接 USB 2.0 接口。
+          - list [ref=f1e408]:
+            - listitem [ref=f1e409]: E-Port 拨码开关切换至 ON。
+          - heading "Matrice 30/30T 设备连接" [level=2] [ref=f1e410]:
+            - link [ref=f1e411] [cursor=pointer]:
+              - /url: "#matrice-30-30t-设备连接"
+              - text: "#"
+            - text: Matrice 30/30T 设备连接
+          - paragraph [ref=f1e412]:
+            - text: 开始 Matrice 30/30T 的设备连接前，请先阅读
+            - link "Matrice 30/30T 用户手册 open in new window" [ref=f1e413] [cursor=pointer]:
+              - /url: https://dl.djicdn.com/downloads/matrice-30-series/20230223UM/Matrice30_Series_User_Manual_V1.2_CHS0223.pdf
+              - text: Matrice 30/30T 用户手册
+              - generic [ref=f1e414]: open in new window
+            - text: 中的 “飞行器部件名称” 并关注飞行器组件的介绍。Matrice 30/30T 支持搭配
+            - strong [ref=f1e419]: E-Port 同轴线 /SDK 同轴线、E-Port 开发者套件
+            - text: 连接飞行器与负载设备。
+          - paragraph [ref=f1e424]: 图. Matrice 30/30T 设备连接方式
+          - heading "基于 E-Port 接口连接设备" [level=3] [ref=f1e425]:
+            - link [ref=f1e426] [cursor=pointer]:
+              - /url: "#基于-e-port-接口连接设备-3"
+              - text: "#"
+            - text: 基于 E-Port 接口连接设备
+          - paragraph [ref=f1e431]: 图. 基于 E-Port 接口连接
+          - list [ref=f1e432]:
+            - listitem [ref=f1e433]: 飞行器 E-Port 接口连接 E-Port 同轴线母头，注意引脚的对应。
+            - listitem [ref=f1e434]: 同轴线公头连接 E-Port 连接口，A 面朝向 E-Port 转接板底板（泡棉侧），B 面朝向 E-Port 正面（芯片器件侧）。
+          - generic [ref=f1e435]:
+            - paragraph [ref=f1e436]: 注意：
+            - paragraph [ref=f1e437]:
+              - text: E-Port 同轴线的 USB-C 连接线无防呆设计，A/B 可反接。但由于飞行器的 USB-C 有线序差异，如果 E-Port 同轴线反接，同轴线另一端的 A/B 也需要对应翻转后连接。
+              - strong [ref=f1e438]: 若同轴线另一端没有相应的翻转，E-Port 开发者套件将无法正常供电与通讯。
+          - list [ref=f1e439]:
+            - listitem [ref=f1e440]: USB ID 拨码开关切换至 Host。
+            - listitem [ref=f1e441]: 如果有通过 E-Port 开发者套件供电的需求，请关注每个端口提供的电压值，防止损坏负载设备。
+            - listitem [ref=f1e442]: 连接负载设备串口。
+            - listitem [ref=f1e443]: USB 2.0 接口连接负载设备 USB device/USB OTG/ 网口。
+          - generic [ref=f1e444]:
+            - paragraph [ref=f1e445]: 说明：
+            - paragraph [ref=f1e446]: 在连接负载设备网口的场景下，可通过 USB 转网卡线与网线连接 USB 2.0 接口。
+          - list [ref=f1e447]:
+            - listitem [ref=f1e448]: E-Port 拨码开关切换至 ON。
+          - heading "Matrice 300 RTK 设备连接" [level=2] [ref=f1e449]:
+            - link [ref=f1e450] [cursor=pointer]:
+              - /url: "#matrice-300-rtk-设备连接"
+              - text: "#"
+            - text: Matrice 300 RTK 设备连接
+          - paragraph [ref=f1e451]:
+            - text: 开始 Matrice 300 RTK 的设备连接前，请先阅读
+            - link "Matrice 300 RTK 用户手册 open in new window" [ref=f1e452] [cursor=pointer]:
+              - /url: https://dl.djicdn.com/downloads/matrice-300/20221018/M300_RTK_User_Manual_CHS_v3.2%201018.pdf
+              - text: Matrice 300 RTK 用户手册
+              - generic [ref=f1e453]: open in new window
+            - text: 中的 “飞行器部件名称” 并关注飞行器组件的介绍。
+          - paragraph [ref=f1e458]: Matrice 300 RTK 有四种方式连接飞行器与负载设备：
+          - list [ref=f1e459]:
+            - listitem [ref=f1e460]: 搭配 E-Port 同轴线 /SDK 同轴线、E-Port 开发者套件
+            - listitem [ref=f1e461]: 搭配上云台支架 / 下云台支架、X-Port
+            - listitem [ref=f1e462]: 搭配上云台支架 / 下云台支架、SkyPort V2
+            - listitem [ref=f1e463]: 搭配 OSDK 拓展组件（即将停产，推荐使用 E-Port 开发者套件）
+          - paragraph [ref=f1e468]: 图. Matrice 300 RTK 设备连接方式
+          - heading "基于 OSDK 接口连接设备" [level=3] [ref=f1e469]:
+            - link [ref=f1e470] [cursor=pointer]:
+              - /url: "#基于-osdk-接口连接设备"
+              - text: "#"
+            - text: 基于 OSDK 接口连接设备
+          - paragraph [ref=f1e475]: 图. 基于 OSDK 接口连接
+          - list [ref=f1e476]:
+            - listitem [ref=f1e477]: 飞行器 OSDK 接口连接 E-Port 同轴线母头，注意引脚的对应。
+            - listitem [ref=f1e478]: 同轴线公头连接 E-Port 连接口，A 面朝向 E-Port 转接板底板（泡棉侧），B 面朝向 E-Port 正面（芯片器件侧）。
+          - generic [ref=f1e479]:
+            - paragraph [ref=f1e480]: 注意：
+            - paragraph [ref=f1e481]:
+              - text: E-Port 同轴线的 USB-C 连接线无防呆设计，A/B 可反接。但由于飞行器的 USB-C 有线序差异，如果 E-Port 同轴线反接，同轴线另一端的 A/B 也需要对应翻转后连接。
+              - strong [ref=f1e482]: 若同轴线另一端没有相应的翻转，E-Port 开发者套件将无法正常供电与通讯。
+          - list [ref=f1e483]:
+            - listitem [ref=f1e484]: USB ID 拨码开关切换至 Device。
+            - listitem [ref=f1e485]: 如果有通过 E-Port 开发者套件供电的需求，请关注每个端口提供的电压值，防止损坏负载设备。
+            - listitem [ref=f1e486]: 连接负载设备串口。
+            - listitem [ref=f1e487]: USB 2.0 接口连接负载设备 USB device/USB OTG/ 网口。
+          - generic [ref=f1e488]:
+            - paragraph [ref=f1e489]: 说明：
+            - paragraph [ref=f1e490]: 在连接负载设备网口的场景下，可通过 USB 转网卡线与网线连接 USB 2.0 接口。
+          - list [ref=f1e491]:
+            - listitem [ref=f1e492]: E-Port 拨码开关切换至 ON。
+          - heading "从云台口连接" [level=3] [ref=f1e493]:
+            - link [ref=f1e494] [cursor=pointer]:
+              - /url: "#从云台口连接-1"
+              - text: "#"
+            - text: 从云台口连接
+          - heading "使用 SkyPort V2" [level=4] [ref=f1e495]:
+            - link [ref=f1e496] [cursor=pointer]:
+              - /url: "#使用-skyport-v2-1"
+              - text: "#"
+            - text: 使用 SkyPort V2
+          - paragraph [ref=f1e501]: 图. SkyportV2 连接
+          - list [ref=f1e502]:
+            - listitem [ref=f1e503]: SkyPort V2 安装到飞行器的上云台支架 / 下云台支架上。
+          - blockquote [ref=f1e504]:
+            - paragraph [ref=f1e505]: 注意： 下置云台架有单云台与双云台两种，图示为单云台支架。
+          - list [ref=f1e506]:
+            - listitem [ref=f1e507]:
+              - text: Port 1 通过排线连接拓展板 J2 处，或者 Port 2 通过同轴线连接拓展板 J3 处。
+              - strong [ref=f1e508]: 请勿同时使用 Port 1 与 Port 2。
+            - listitem [ref=f1e509]: 拓展板 J40 处可以提供网口通讯。
+            - listitem [ref=f1e510]: 拓展板 J10 处可以提供串口通讯。
+            - listitem [ref=f1e511]: 若有通过拓展板通电的需要，拓展板 J35、J36、J37 处为电源输出接口。注意接口输出电压，以防损坏设备。
+          - heading "使用 X-Port" [level=4] [ref=f1e512]:
+            - link [ref=f1e513] [cursor=pointer]:
+              - /url: "#使用-x-port-1"
+              - text: "#"
+            - text: 使用 X-Port
+          - paragraph [ref=f1e516]: Figure. x-port Connection
+          - list [ref=f1e519]:
+            - listitem [ref=f1e520]: X-Port 安装到飞行器的上云台支架 / 下云台支架上。
+          - generic [ref=f1e521]:
+            - paragraph [ref=f1e522]: 注意：
+            - paragraph [ref=f1e523]: 下置云台架有单云台与双云台两种，图示为单云台支架。
+          - list [ref=f1e524]:
+            - listitem [ref=f1e525]: 通过排线连接 X-Port 与拓展板 J2 处。
+            - listitem [ref=f1e526]: 拓展板 J40 处可以提供网口通讯。
+            - listitem [ref=f1e527]: 拓展板 J10 处可以提供串口通讯。
+            - listitem [ref=f1e528]: 若有通过拓展板通电的需要，拓展板 J35、J36、J37 处为电源输出接口。注意接口输出电压，以防损坏设备。
+          - heading "使用 OSDK 拓展组件" [level=3] [ref=f1e529]:
+            - link [ref=f1e530] [cursor=pointer]:
+              - /url: "#使用-osdk-拓展组件"
+              - text: "#"
+            - text: 使用 OSDK 拓展组件
+          - paragraph [ref=f1e531]:
+            - text: OSDK 拓展组件即将停产，推荐使用 E-Port 开发者套件。若想了解 OSDK 拓展组件相关信息，可阅读飞行器硬件接口介绍中的
+            - link "OSDK 拓展组件" [ref=f1e532] [cursor=pointer]:
+              - /url: ./drone-port.html#使用-osdk-拓展组件
+            - text: 。
+          - heading "硬件参考设计" [level=2] [ref=f1e533]:
+            - link [ref=f1e534] [cursor=pointer]:
+              - /url: "#硬件参考设计"
+              - text: "#"
+            - text: 硬件参考设计
+          - paragraph [ref=f1e535]:
+            - link "硬件参考设计 open in new window" [ref=f1e536] [cursor=pointer]:
+              - /url: https://github.com/dji-sdk/Payload-SDK/blob/master/doc/reference_designs/E-Port%20Schematic%20Reference.pdf
+              - text: 硬件参考设计
+              - generic [ref=f1e537]: open in new window
+          - paragraph [ref=f1e542]: 上述硬件连接主要是基于 DJI 的开发配件搭建开发环境，方便开发者快速搭建硬件环境，开始 PSDK 软件开发。在设备完成开发时，可以根据无人机上的硬件引脚直接在设备硬件环境上集成，可不需要通过 DJI 拓展配件，如 OSDK 拓展转接板、E-Port 套件等。
+          - paragraph [ref=f1e543]: 方便开发者基于 OSDK/PSDK 接口集成硬件连接，DJI 提供了 Matrice 300 RTK OSDK 接口，Matrice 350 RTK E-Port 接口，Matrice 30/Matrice 30T 云台口端口的参考原理图，开发者可以参考并结合自己的硬件设备设计。
+        - navigation [ref=f1e544]:
+          - paragraph [ref=f1e545]:
+            - link "飞行器硬件接口" [ref=f1e547] [cursor=pointer]:
+              - /url: /doc/payload-sdk-tutorial/cn/payload-quick-start/configure-the-hardware-environment/drone-port.html
+              - text: ← 飞行器硬件接口
+            - link "集成认证芯片" [ref=f1e549] [cursor=pointer]:
+              - /url: /doc/payload-sdk-tutorial/cn/payload-quick-start/configure-the-hardware-environment/sdk-cc.html
+              - text: 集成认证芯片 →
+        - generic [ref=f1e552]:
+          - generic [ref=f1e553]: 请问您的文档阅读体验如何？
+          - slider "rating" [ref=f1e554]
+      - list [ref=f1e577]:
+        - listitem [ref=f1e578]:
+          - link "FlyCart 100 设备连接" [ref=f1e579] [cursor=pointer]:
+            - /url: "#flycart-100-设备连接"
+        - listitem [ref=f1e580]:
+          - link "基于 E-Port Lite 接口连接设备" [ref=f1e581] [cursor=pointer]:
+            - /url: "#基于-e-port-lite-接口连接设备"
+        - listitem [ref=f1e582]:
+          - link "Matrice 400 设备连接" [ref=f1e583] [cursor=pointer]:
+            - /url: "#matrice-400-设备连接"
+        - listitem [ref=f1e584]:
+          - link "基于 E-Port V2 接口连接设备" [ref=f1e585] [cursor=pointer]:
+            - /url: "#基于-e-port-v2-接口连接设备"
+        - listitem [ref=f1e586]:
+          - link "Matrice 4E/4T 、Matrice 4D/4TD 设备连接" [ref=f1e587] [cursor=pointer]:
+            - /url: "#matrice-4e-4t-、matrice-4d-4td-设备连接"
+        - listitem [ref=f1e588]:
+          - link "基于 E-Port 接口连接设备" [ref=f1e589] [cursor=pointer]:
+            - /url: "#基于-e-port-接口连接设备"
+        - listitem [ref=f1e590]:
+          - link "基于 E-Port Lite 接口连接设备" [ref=f1e591] [cursor=pointer]:
+            - /url: "#基于-e-port-lite-接口连接设备-1"
+        - listitem [ref=f1e592]:
+          - link "Matrice 3D/3TD 设备连接" [ref=f1e593] [cursor=pointer]:
+            - /url: "#matrice-3d-3td-设备连接"
+        - listitem [ref=f1e594]:
+          - link "基于 E-Port 接口连接设备" [ref=f1e595] [cursor=pointer]:
+            - /url: "#基于-e-port-接口连接设备-1"
+        - listitem [ref=f1e596]:
+          - link "基于 E-Port Lite 接口连接设备" [ref=f1e597] [cursor=pointer]:
+            - /url: "#基于-e-port-lite-接口连接设备-2"
+        - listitem [ref=f1e598]:
+          - link "FlyCart 30 设备连接" [ref=f1e599] [cursor=pointer]:
+            - /url: "#flycart-30-设备连接"
+        - listitem [ref=f1e600]:
+          - link "基于 E-Port Lite 接口连接设备" [ref=f1e601] [cursor=pointer]:
+            - /url: "#基于-e-port-lite-接口连接设备-3"
+        - listitem [ref=f1e602]:
+          - link "Matrice 350 RTK 设备连接" [ref=f1e603] [cursor=pointer]:
+            - /url: "#matrice-350-rtk-设备连接"
+        - listitem [ref=f1e604]:
+          - link "从 E-Port 接口连接" [ref=f1e605] [cursor=pointer]:
+            - /url: "#从-e-port-接口连接"
+        - listitem [ref=f1e606]:
+          - link "从云台口连接" [ref=f1e607] [cursor=pointer]:
+            - /url: "#从云台口连接"
+        - listitem [ref=f1e608]:
+          - link "Mavic 3E/3T 设备连接" [ref=f1e609] [cursor=pointer]:
+            - /url: "#mavic-3e-3t-设备连接"
+        - listitem [ref=f1e610]:
+          - link "基于 E-Port 接口连接设备" [ref=f1e611] [cursor=pointer]:
+            - /url: "#基于-e-port-接口连接设备-2"
+        - listitem [ref=f1e612]:
+          - link "Matrice 30/30T 设备连接" [ref=f1e613] [cursor=pointer]:
+            - /url: "#matrice-30-30t-设备连接"
+        - listitem [ref=f1e614]:
+          - link "基于 E-Port 接口连接设备" [ref=f1e615] [cursor=pointer]:
+            - /url: "#基于-e-port-接口连接设备-3"
+        - listitem [ref=f1e616]:
+          - link "Matrice 300 RTK 设备连接" [ref=f1e617] [cursor=pointer]:
+            - /url: "#matrice-300-rtk-设备连接"
+        - listitem [ref=f1e618]:
+          - link "基于 OSDK 接口连接设备" [ref=f1e619] [cursor=pointer]:
+            - /url: "#基于-osdk-接口连接设备"
+        - listitem [ref=f1e620]:
+          - link "从云台口连接" [ref=f1e621] [cursor=pointer]:
+            - /url: "#从云台口连接-1"
+        - listitem [ref=f1e622]:
+          - link "使用 OSDK 拓展组件" [ref=f1e623] [cursor=pointer]:
+            - /url: "#使用-osdk-拓展组件"
+        - listitem [ref=f1e624]:
+          - link "硬件参考设计" [ref=f1e625] [cursor=pointer]:
+            - /url: "#硬件参考设计"
+  - generic [ref=f1e633]:
+    - text: 若您对文档有意见或疑惑，点击可快速反馈，我们会与您联系。
+    - button "好的，我知道了" [ref=f1e635] [cursor=pointer]
