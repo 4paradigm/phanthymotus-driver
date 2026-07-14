@@ -80,6 +80,12 @@ int time_sync_sync_clock(char *buf, size_t buflen) {
         return -1;
     }
 
+    /* Sanity check: GPS time not available if year is 0 or < 2020 */
+    if (at.year < 2020) {
+        snprintf(buf, buflen, "{\"error\":\"no_gps_time\",\"year\":%d}", at.year);
+        return -1;
+    }
+
     /* Convert aircraft time to epoch */
     struct tm tm = {0};
     tm.tm_year = at.year - 1900;
