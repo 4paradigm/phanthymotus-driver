@@ -201,6 +201,7 @@ class CameraStreamPlugin:
         self._executor = executor
         self._fps = plugin_config.get("fps", 10)
         self._nodes: dict[str, _CameraStreamNode] = {}
+        self._instance_configs: dict[str, dict] = {}
 
     def get_tool(self) -> dict:
         return {
@@ -245,7 +246,23 @@ class CameraStreamPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         instance_id = args.get("instance_id", "default")
-        camera = args.get("camera_source", "wide")
+
+        if action == "config":
+            self._instance_configs[instance_id] = args
+            camera = args.get("camera_source", "wide")
+            # If stream is running and camera changed, restart it
+            if instance_id in self._nodes:
+                node = self._nodes[instance_id]
+                if node.state == "running" and node._camera != camera:
+                    node.stop()
+                    time.sleep(0.3)
+                    node._camera = camera
+                    node.start()
+            return {"ok": True, "camera": camera}
+
+        # Resolve camera from cached instance config
+        cfg = self._instance_configs.get(instance_id, {})
+        camera = args.get("camera_source") or cfg.get("camera_source", "wide")
 
         if action == "info":
             safe_id = instance_id.replace("-", "_")
