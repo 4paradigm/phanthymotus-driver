@@ -3,80 +3,153 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <sys/stat.h>
 #include <pthread.h>
 
 /*
- * PSDK Liveview for Mavic 3E — H.264 → pipe for GStreamer GPU decode.
- *
- * H.264 NALUs from DJI callback are written to a pipe fd.
- * Python side launches GStreamer subprocess reading from this pipe:
- *   fdsrc → h264parse → nvv4l2decoder → nvvidconv → jpegenc → fdsink
- *
- * This offloads decoding to Jetson's NVDEC hardware.
+ * PSDK Liveview for Mavic 3E — FFmpeg H.264 decode + scale to 720x540 + JPEG.
+ * Output to /dev/shm/dji_frame.jpg (shared memory, no disk IO).
  */
 
 #ifdef PSDK_ENABLED
 #include "dji_liveview.h"
+#include <libavcodec/avcodec.h>
+#include <libavutil/imgutils.h>
+#include <libswscale/swscale.h>
+#include <jpeglib.h>
 
 static liveview_frame_cb_t s_frame_cb = NULL;
 static E_DjiLiveViewCameraSource s_camera_source = DJI_LIVEVIEW_CAMERA_SOURCE_DEFAULT;
-static int s_h264_pipe_fd = -1;  /* Write end of FIFO to GStreamer */
-static int s_frame_count = 0;
-static pthread_t s_fifo_thread;
-static int s_fifo_ready = 0;
-#define H264_FIFO_PATH "/tmp/dji_h264_fifo"
 
-/* Thread that opens FIFO write end — reconnects if reader closes */
-static void *_fifo_open_thread(void *arg) {
-    (void)arg;
-    while (1) {
-        if (s_h264_pipe_fd >= 0) {
-            /* Already connected, wait */
-            sleep(1);
-            continue;
-        }
-        printf("[liveview] waiting for FIFO reader...\n");
-        int fd = open(H264_FIFO_PATH, O_WRONLY);  /* Blocks until reader opens */
-        if (fd >= 0) {
-            /* Set non-blocking so callback thread doesn't stall on full pipe */
-            int flags = fcntl(fd, F_GETFL, 0);
-            fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-            s_h264_pipe_fd = fd;
-            s_fifo_ready = 1;
-            printf("[liveview] FIFO writer connected (fd=%d)\n", fd);
-            /* Request new I-frame so decoder starts clean */
-            DjiLiveview_RequestIntraframeFrameData(DJI_LIVEVIEW_CAMERA_POSITION_NO_1, s_camera_source);
-            printf("[liveview] I-frame re-requested after FIFO connect\n");
-        } else {
-            printf("[liveview] FIFO open failed, retrying in 1s\n");
-            sleep(1);
+/* FFmpeg state */
+static AVCodecContext *s_codec_ctx = NULL;
+static AVCodecParserContext *s_parser_ctx = NULL;
+static struct SwsContext *s_sws_ctx = NULL;
+static AVFrame *s_frame_yuv = NULL;
+static AVFrame *s_frame_rgb = NULL;
+static uint8_t *s_rgb_buffer = NULL;
+static int s_src_width = 0, s_src_height = 0;
+static int s_frame_count = 0;
+static pthread_mutex_t s_decode_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Output resolution */
+#define OUT_WIDTH 720
+#define OUT_HEIGHT 540
+#define JPEG_QUALITY 60
+#define FRAME_PATH "/dev/shm/dji_frame.jpg"
+
+/* JPEG encode RGB frame to file (atomic write via rename) */
+static int _encode_jpeg(const char *filename, uint8_t *rgb_data, int width, int height) {
+    char tmp_path[128];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", filename);
+
+    FILE *fp = fopen(tmp_path, "wb");
+    if (!fp) return -1;
+
+    struct jpeg_compress_struct cinfo;
+    struct jpeg_error_mgr jerr;
+    cinfo.err = jpeg_std_error(&jerr);
+    jpeg_create_compress(&cinfo);
+    jpeg_stdio_dest(&cinfo, fp);
+
+    cinfo.image_width = width;
+    cinfo.image_height = height;
+    cinfo.input_components = 3;
+    cinfo.in_color_space = JCS_RGB;
+    jpeg_set_defaults(&cinfo);
+    jpeg_set_quality(&cinfo, JPEG_QUALITY, TRUE);
+    jpeg_start_compress(&cinfo, TRUE);
+
+    int row_stride = width * 3;
+    while (cinfo.next_scanline < (unsigned int)height) {
+        uint8_t *row = rgb_data + cinfo.next_scanline * row_stride;
+        jpeg_write_scanlines(&cinfo, &row, 1);
+    }
+
+    jpeg_finish_compress(&cinfo);
+    jpeg_destroy_compress(&cinfo);
+    fclose(fp);
+
+    rename(tmp_path, filename);
+    return 0;
+}
+
+/* FFmpeg decode + scale + JPEG encode */
+static void _decode_h264(const uint8_t *data, uint32_t len) {
+    pthread_mutex_lock(&s_decode_mutex);
+
+    const uint8_t *buf = data;
+    int remaining = (int)len;
+
+    while (remaining > 0) {
+        AVPacket pkt;
+        av_init_packet(&pkt);
+        pkt.data = NULL;
+        pkt.size = 0;
+
+        int parsed = av_parser_parse2(s_parser_ctx, s_codec_ctx,
+                                       &pkt.data, &pkt.size,
+                                       buf, remaining,
+                                       AV_NOPTS_VALUE, AV_NOPTS_VALUE, AV_NOPTS_VALUE);
+        if (parsed < 0) break;
+        buf += parsed;
+        remaining -= parsed;
+
+        if (pkt.size > 0) {
+            int got_picture = 0;
+            avcodec_decode_video2(s_codec_ctx, s_frame_yuv, &got_picture, &pkt);
+
+            if (got_picture) {
+                /* Setup sws_ctx on first frame or resolution change */
+                if (s_frame_yuv->width != s_src_width || s_frame_yuv->height != s_src_height) {
+                    s_src_width = s_frame_yuv->width;
+                    s_src_height = s_frame_yuv->height;
+
+                    if (s_sws_ctx) sws_freeContext(s_sws_ctx);
+                    /* Scale from source resolution to 720x540 */
+                    s_sws_ctx = sws_getContext(s_src_width, s_src_height, s_codec_ctx->pix_fmt,
+                                               OUT_WIDTH, OUT_HEIGHT, AV_PIX_FMT_RGB24,
+                                               SWS_FAST_BILINEAR, NULL, NULL, NULL);
+
+                    if (s_rgb_buffer) free(s_rgb_buffer);
+                    s_rgb_buffer = (uint8_t *)malloc(OUT_WIDTH * OUT_HEIGHT * 3);
+
+                    if (s_frame_rgb) av_frame_free(&s_frame_rgb);
+                    s_frame_rgb = av_frame_alloc();
+                    av_image_fill_arrays(s_frame_rgb->data, s_frame_rgb->linesize,
+                                         s_rgb_buffer, AV_PIX_FMT_RGB24, OUT_WIDTH, OUT_HEIGHT, 1);
+
+                    printf("[liveview] %dx%d → %dx%d\n", s_src_width, s_src_height, OUT_WIDTH, OUT_HEIGHT);
+                }
+
+                /* Scale YUV → RGB 720x540 */
+                sws_scale(s_sws_ctx,
+                          (const uint8_t *const *)s_frame_yuv->data, s_frame_yuv->linesize,
+                          0, s_src_height,
+                          s_frame_rgb->data, s_frame_rgb->linesize);
+
+                /* Encode JPEG every 3rd frame (~10fps from 30fps input) */
+                s_frame_count++;
+                if (s_frame_count % 3 == 0) {
+                    _encode_jpeg(FRAME_PATH, s_rgb_buffer, OUT_WIDTH, OUT_HEIGHT);
+                }
+                if (s_frame_count % 90 == 0) {
+                    printf("[liveview] frame #%d\n", s_frame_count / 3);
+                }
+            }
         }
     }
-    return NULL;
+
+    pthread_mutex_unlock(&s_decode_mutex);
 }
 
 static void _h264_cb(E_DjiLiveViewCameraPosition pos,
                      const uint8_t *data, uint32_t len) {
-    s_frame_count++;
-    if (s_h264_pipe_fd >= 0) {
-        ssize_t n = write(s_h264_pipe_fd, data, len);
-        if (n < 0 && errno == EAGAIN) {
-            /* Pipe full — drop this chunk (decoder will recover from next I-frame) */
-        } else if (n < 0) {
-            close(s_h264_pipe_fd);
-            s_h264_pipe_fd = -1;
-            s_fifo_ready = 0;
-        }
-    }
-    /* Periodically request I-frame to help decoder recover from artifacts */
-    if (s_frame_count % 60 == 0 && s_fifo_ready) {
+    _decode_h264(data, len);
+    /* Periodically request I-frame */
+    static int cb_count = 0;
+    cb_count++;
+    if (cb_count % 90 == 0) {
         DjiLiveview_RequestIntraframeFrameData(DJI_LIVEVIEW_CAMERA_POSITION_NO_1, s_camera_source);
-    }
-    if (s_frame_count % 300 == 1) {
-        printf("[liveview] h264_cb #%d len=%u pipe=%d\n", s_frame_count, len, s_h264_pipe_fd);
     }
 }
 
@@ -86,7 +159,25 @@ int liveview_init(void) {
         printf("[liveview] init failed: 0x%08llX\n", (unsigned long long)rc);
         return -1;
     }
-    printf("[liveview] initialized (GStreamer GPU decode mode)\n");
+
+    avcodec_register_all();
+    av_log_set_level(AV_LOG_FATAL);
+
+    AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_H264);
+    if (!codec) { printf("[liveview] H264 codec not found\n"); return -1; }
+
+    s_codec_ctx = avcodec_alloc_context3(codec);
+    s_codec_ctx->thread_count = 2;
+    s_codec_ctx->flags2 |= AV_CODEC_FLAG2_SHOW_ALL;
+
+    if (avcodec_open2(s_codec_ctx, codec, NULL) < 0) {
+        printf("[liveview] failed to open codec\n"); return -1;
+    }
+
+    s_parser_ctx = av_parser_init(AV_CODEC_ID_H264);
+    s_frame_yuv = av_frame_alloc();
+
+    printf("[liveview] initialized (FFmpeg %dx%d, shm)\n", OUT_WIDTH, OUT_HEIGHT);
     return 0;
 }
 
@@ -95,44 +186,35 @@ int liveview_start(const char *camera, liveview_frame_cb_t cb) {
     E_DjiLiveViewCameraPosition pos = DJI_LIVEVIEW_CAMERA_POSITION_NO_1;
     s_camera_source = DJI_LIVEVIEW_CAMERA_SOURCE_DEFAULT;
 
-    /* Create named FIFO for H.264 data */
-    unlink(H264_FIFO_PATH);
-    if (mkfifo(H264_FIFO_PATH, 0666) < 0) {
-        printf("[liveview] mkfifo failed\n");
-    }
-
-    /* Start thread to open FIFO write end (blocks until Python reader connects) */
-    pthread_create(&s_fifo_thread, NULL, _fifo_open_thread, NULL);
-    pthread_detach(s_fifo_thread);
-
     T_DjiReturnCode rc = DjiLiveview_StartH264Stream(pos, s_camera_source, _h264_cb);
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
         printf("[liveview] start failed: 0x%08llX\n", (unsigned long long)rc);
         return -1;
     }
-
     DjiLiveview_RequestIntraframeFrameData(pos, s_camera_source);
-
-    printf("[liveview] stream started (camera=%s), FIFO=%s\n", camera, H264_FIFO_PATH);
+    printf("[liveview] stream started (camera=%s)\n", camera);
     return 0;
 }
 
-/* Called by Python (via IPC) to set the pipe fd for H.264 data */
-void liveview_set_pipe_fd(int fd) {
-    s_h264_pipe_fd = fd;
-    printf("[liveview] pipe fd set to %d\n", fd);
-}
+void liveview_set_pipe_fd(int fd) { (void)fd; }
 
 int liveview_stop(void) {
     DjiLiveview_StopH264Stream(DJI_LIVEVIEW_CAMERA_POSITION_NO_1, s_camera_source);
     s_frame_cb = NULL;
-    s_h264_pipe_fd = -1;
     return 0;
 }
 
 void liveview_cleanup(void) {
     liveview_stop();
     DjiLiveview_Deinit();
+    pthread_mutex_lock(&s_decode_mutex);
+    if (s_parser_ctx) { av_parser_close(s_parser_ctx); s_parser_ctx = NULL; }
+    if (s_codec_ctx) { avcodec_close(s_codec_ctx); avcodec_free_context(&s_codec_ctx); }
+    if (s_frame_yuv) { av_frame_free(&s_frame_yuv); }
+    if (s_frame_rgb) { av_frame_free(&s_frame_rgb); }
+    if (s_sws_ctx) { sws_freeContext(s_sws_ctx); s_sws_ctx = NULL; }
+    if (s_rgb_buffer) { free(s_rgb_buffer); s_rgb_buffer = NULL; }
+    pthread_mutex_unlock(&s_decode_mutex);
 }
 
 #else /* stub */

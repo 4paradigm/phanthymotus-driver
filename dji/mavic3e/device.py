@@ -157,88 +157,39 @@ class _CameraStreamNode(Node):
         self._bridge.stop_liveview()
 
     def _stream_loop(self):
-        """Read JPEG frames from GStreamer decoder subprocess. Auto-restarts on failure."""
-        import subprocess
+        """Read JPEG frames from /dev/shm (FFmpeg decoded in C bridge)."""
         import os
 
-        fifo_path = "/tmp/dji_h264_fifo"
-
-        gst_gpu = (
-            f"gst-launch-1.0 -q filesrc location={fifo_path} "
-            "! h264parse ! nvv4l2decoder ! nvvidconv "
-            "! video/x-raw,width=720,height=540,format=I420 "
-            "! jpegenc quality=60 ! fdsink fd=1"
-        )
-        gst_cpu = (
-            f"gst-launch-1.0 -q filesrc location={fifo_path} "
-            "! h264parse ! avdec_h264 max-threads=2 ! videoscale "
-            "! video/x-raw,width=720,height=540 ! videoconvert "
-            "! jpegenc quality=60 ! fdsink fd=1"
-        )
-
+        frame_path = "/dev/shm/dji_frame.jpg"
+        last_mtime = 0
         pub_count = 0
+
+        self.get_logger().info(f"stream_loop started, reading {frame_path}")
+
         while self.state == "running":
-            # Wait for FIFO
-            for _ in range(100):
-                if os.path.exists(fifo_path):
-                    break
-                time.sleep(0.1)
-            if not os.path.exists(fifo_path):
-                self.get_logger().error("FIFO not found, retrying in 3s")
-                time.sleep(3)
-                continue
-
-            self.get_logger().info("Starting GStreamer decoder...")
-
-            # Try GPU then CPU
-            proc = subprocess.Popen(gst_gpu, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            time.sleep(3)
-            if proc.poll() is not None:
-                self.get_logger().warn("nvv4l2decoder failed, trying CPU")
-                proc = subprocess.Popen(gst_cpu, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                time.sleep(2)
-                if proc.poll() is not None:
-                    self.get_logger().error("GStreamer failed, retrying in 3s")
-                    time.sleep(3)
+            time.sleep(0.05)  # 20Hz check rate
+            if self.state != "running":
+                break
+            try:
+                if not os.path.exists(frame_path):
                     continue
-
-            self.get_logger().info(f"GStreamer running (pid={proc.pid})")
-
-            # Read JPEG frames (SOI=0xFFD8, EOI=0xFFD9)
-            buf = bytearray()
-            while self.state == "running" and proc.poll() is None:
-                chunk = proc.stdout.read(65536)
-                if not chunk:
-                    time.sleep(0.01)
+                mtime = os.path.getmtime(frame_path)
+                if mtime == last_mtime:
                     continue
-                buf.extend(chunk)
-                while True:
-                    soi = buf.find(b'\xff\xd8')
-                    if soi == -1:
-                        buf.clear()
-                        break
-                    eoi = buf.find(b'\xff\xd9', soi + 2)
-                    if eoi == -1:
-                        if soi > 0:
-                            del buf[:soi]
-                        break
-                    frame = bytes(buf[soi:eoi + 2])
-                    del buf[:eoi + 2]
+                last_mtime = mtime
+                with open(frame_path, "rb") as f:
+                    jpeg_data = f.read()
+                if jpeg_data and len(jpeg_data) > 100:
                     msg = CompressedImage()
                     msg.header.stamp = self.get_clock().now().to_msg()
                     msg.format = "jpeg"
-                    msg.data = frame
+                    msg.data = jpeg_data
                     self._pub.publish(msg)
                     pub_count += 1
                     if pub_count % 30 == 1:
-                        self.get_logger().info(f"published #{pub_count} ({len(frame)} bytes)")
-
-            proc.terminate()
-            if self.state == "running":
-                self.get_logger().warn("GStreamer exited, restarting in 2s...")
-                time.sleep(2)
-
-        self.get_logger().info(f"stream_loop stopped ({pub_count} total frames)")
+                        self.get_logger().info(f"published #{pub_count} ({len(jpeg_data)} bytes)")
+            except Exception:
+                pass
 
 
 class CameraStreamPlugin:
