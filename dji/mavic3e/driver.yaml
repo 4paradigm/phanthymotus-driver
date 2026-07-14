@@ -1,9 +1,9 @@
 id: dji-mavic3e
-name: DJI Mavic 3E Bundle
+name: DJI Mavic 3E/3T Bundle
 category: driver
 hardware_provider: dji
 hardware_model: "mavic3e"
 image_name: dji-mavic3e
 port: 15702
 mcp_url: "http://localhost:15702/mcp"
-description: "DJI Mavic 3E — 飞行控制 + 相机 + 云台 + 航点任务 + 遥测 + 感知"
+description: "DJI Mavic 3E/3T — 飞行控制 + 相机(广角/变焦/红外) + 云台 + 航点任务 + 遥测 + 感知 + 红外测温"
