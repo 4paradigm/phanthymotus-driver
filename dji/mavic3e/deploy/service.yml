@@ -10,6 +10,9 @@ dji-mavic3e:
     - /run/udev:/run/udev:ro
     - /sys/kernel/config:/sys/kernel/config
     - /dev/usb-ffs:/dev/usb-ffs
+    - /usr/lib/aarch64-linux-gnu/tegra:/usr/lib/aarch64-linux-gnu/tegra:ro
+    - /usr/lib/aarch64-linux-gnu/gstreamer-1.0:/usr/lib/aarch64-linux-gnu/gstreamer-1.0:ro
+    - /usr/local/lib:/usr/local/lib:ro
   environment:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp

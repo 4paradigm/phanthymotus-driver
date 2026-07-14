@@ -27,6 +27,10 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
         libavutil-dev \
         libswscale-dev \
         libjpeg-dev \
+        gstreamer1.0-tools \
+        gstreamer1.0-plugins-base \
+        gstreamer1.0-plugins-good \
+        gstreamer1.0-libav \
         udev \
         usbutils \
         iproute2 && \
