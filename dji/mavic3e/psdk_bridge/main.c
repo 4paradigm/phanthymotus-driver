@@ -793,13 +793,56 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
         DjiAircraftInfo_GetBaseInfo(&baseInfo);
         DjiAircraftInfo_GetAircraftVersion(&version);
         DjiAircraftInfo_GetConnectionStatus(&connected);
+
+        const char *type_name = "Unknown";
+        switch (baseInfo.aircraftType) {
+            case 44: type_name = "Matrice 200 V2"; break;
+            case 45: type_name = "Matrice 210 V2"; break;
+            case 46: type_name = "Matrice 210 RTK V2"; break;
+            case 60: type_name = "Matrice 300 RTK"; break;
+            case 67: type_name = "Matrice 30"; break;
+            case 68: type_name = "Matrice 30T"; break;
+            case 77: type_name = "Mavic 3E"; break;
+            case 78: type_name = "FlyCart 30"; break;
+            case 79: type_name = "Mavic 3T"; break;
+            case 80: type_name = "Mavic 3TA"; break;
+            case 89: type_name = "Matrice 350 RTK"; break;
+            case 91: type_name = "Matrice 3D"; break;
+            case 93: type_name = "Matrice 3TD"; break;
+            default: break;
+        }
+        const char *series_name = "Unknown";
+        switch (baseInfo.aircraftSeries) {
+            case 1: series_name = "M200 V2"; break;
+            case 2: series_name = "M300"; break;
+            case 3: series_name = "M30"; break;
+            case 4: series_name = "M3"; break;
+            case 5: series_name = "M350"; break;
+            case 6: series_name = "M3D"; break;
+            case 7: series_name = "FC30"; break;
+            default: break;
+        }
+        const char *mount_name = "Unknown";
+        switch (baseInfo.mountPosition) {
+            case 1: mount_name = "Payload Port No.1"; break;
+            case 2: mount_name = "Payload Port No.2"; break;
+            case 3: mount_name = "Payload Port No.3"; break;
+            case 4: mount_name = "Extension Port"; break;
+            case 5: mount_name = "Extension Lite Port"; break;
+            case 6: mount_name = "Extension Port V2 No.5 (USB Hub 1)"; break;
+            case 7: mount_name = "Extension Port V2 No.6 (USB Hub 2)"; break;
+            case 8: mount_name = "Extension Port V2 No.7 (USB Hub 3)"; break;
+            default: break;
+        }
+
         snprintf(result, result_size,
-            "{\"ok\":true,\"data\":{\"aircraft_type\":%d,\"aircraft_series\":%d,"
+            "{\"ok\":true,\"data\":{\"aircraft_type\":\"%s\","
+            "\"aircraft_series\":\"%s\","
             "\"firmware_version\":\"%d.%d.%d.%d\","
-            "\"mount_position\":%d,\"connected\":%s}}",
-            baseInfo.aircraftType, baseInfo.aircraftSeries,
+            "\"mount_position\":\"%s\",\"connected\":%s}}",
+            type_name, series_name,
             version.majorVersion, version.minorVersion, version.modifyVersion, version.debugVersion,
-            baseInfo.mountPosition, connected ? "true" : "false");
+            mount_name, connected ? "true" : "false");
         return 0;
     }
 
