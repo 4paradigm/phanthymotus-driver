@@ -84,8 +84,9 @@ int time_sync_sync_clock(char *buf, size_t buflen) {
     int minute = (s_gps_time / 100) % 100;
     int second = s_gps_time % 100;
 
-    if (year < 2020) {
-        snprintf(buf, buflen, "{\"error\":\"GPS time invalid\",\"recovery\":\"Wait for GPS lock\",\"year\":%d}", year);
+    if (year < 2024) {
+        snprintf(buf, buflen, "{\"error\":\"GPS time stale (cached from %04d-%02d-%02d, not current)\","
+                 "\"recovery\":\"Wait for GPS satellite lock (需要 GPS 信号锁定后才能对时)\"}", year, month, day);
         return -1;
     }
 
