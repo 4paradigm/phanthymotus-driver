@@ -71,6 +71,10 @@ static void _h264_cb(E_DjiLiveViewCameraPosition pos,
             s_fifo_ready = 0;
         }
     }
+    /* Periodically request I-frame to help decoder recover from artifacts */
+    if (s_frame_count % 60 == 0 && s_fifo_ready) {
+        DjiLiveview_RequestIntraframeFrameData(DJI_LIVEVIEW_CAMERA_POSITION_NO_1, s_camera_source);
+    }
     if (s_frame_count % 300 == 1) {
         printf("[liveview] h264_cb #%d len=%u pipe=%d\n", s_frame_count, len, s_h264_pipe_fd);
     }
