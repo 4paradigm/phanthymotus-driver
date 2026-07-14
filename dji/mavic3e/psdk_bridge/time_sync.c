@@ -1,6 +1,8 @@
+#define _GNU_SOURCE
 #include "time_sync.h"
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <sys/time.h>
 
 /*
