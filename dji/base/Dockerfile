@@ -22,6 +22,11 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
         libssl-dev \
         libopus-dev \
         ffmpeg \
+        libavcodec-dev \
+        libavformat-dev \
+        libavutil-dev \
+        libswscale-dev \
+        libjpeg-dev \
         udev \
         usbutils \
         iproute2 && \

@@ -72,6 +72,8 @@ target_link_libraries(psdk_bridge
     ${PSDK_LIB}
     Threads::Threads
     ${LIBUSB_LIB}
+    avcodec avformat avutil swscale
+    jpeg
     m
 )
 

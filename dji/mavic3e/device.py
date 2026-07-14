@@ -156,56 +156,32 @@ class _CameraStreamNode(Node):
         self._bridge.stop_liveview()
 
     def _stream_loop(self):
-        """Publish mock JPEG frames in mock mode, or receive from bridge in live mode."""
-        import struct as _struct
-        # Generate a minimal valid JPEG for mock mode (1x1 pixel, colored by camera type)
-        _MOCK_JPEGS = {
-            "wide": self._make_mock_jpeg(0x40, 0x80, 0x40),   # greenish
-            "zoom": self._make_mock_jpeg(0x40, 0x40, 0xA0),   # blueish
-            "ir":   self._make_mock_jpeg(0xA0, 0x40, 0x40),   # reddish
-        }
-        mock_frame = _MOCK_JPEGS.get(self._camera, _MOCK_JPEGS["wide"])
+        """Read JPEG frames from C bridge (FFmpeg decoded) and publish to ROS2."""
+        import base64
+        import os
+
+        frame_path = "/tmp/dji_frame.jpg"
+        last_mtime = 0
 
         while self.state == "running":
             time.sleep(1.0 / self._fps)
             if self.state != "running":
                 break
-            # Publish mock JPEG as base64 in String msg (dashboard decodes)
-            import base64
-            msg = String()
-            msg.data = base64.b64encode(mock_frame).decode("ascii")
-            self._pub.publish(msg)
-
-    @staticmethod
-    def _make_mock_jpeg(r: int, g: int, b: int) -> bytes:
-        """Generate a minimal 8x8 JPEG with solid color for testing."""
-        # Minimal JPEG: SOI + APP0 + DQT + SOF0 + DHT + SOS + data + EOI
-        # For simplicity, use a pre-built tiny JPEG structure
-        # This creates a valid 1x1 JPEG with the given RGB color
-        import io
-        try:
-            from PIL import Image
-            img = Image.new("RGB", (160, 120), (r, g, b))
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=50)
-            return buf.getvalue()
-        except ImportError:
-            # Fallback: return a minimal valid JPEG (1x1 white pixel)
-            return bytes([
-                0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01,
-                0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43,
-                0x00, 0x08, 0x06, 0x06, 0x07, 0x06, 0x05, 0x08, 0x07, 0x07, 0x07, 0x09,
-                0x09, 0x08, 0x0A, 0x0C, 0x14, 0x0D, 0x0C, 0x0B, 0x0B, 0x0C, 0x19, 0x12,
-                0x13, 0x0F, 0x14, 0x1D, 0x1A, 0x1F, 0x1E, 0x1D, 0x1A, 0x1C, 0x1C, 0x20,
-                0x24, 0x2E, 0x27, 0x20, 0x22, 0x2C, 0x23, 0x1C, 0x1C, 0x28, 0x37, 0x29,
-                0x2C, 0x30, 0x31, 0x34, 0x34, 0x34, 0x1F, 0x27, 0x39, 0x3D, 0x38, 0x32,
-                0x3C, 0x2E, 0x33, 0x34, 0x32, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01,
-                0x00, 0x01, 0x01, 0x01, 0x11, 0x00, 0xFF, 0xC4, 0x00, 0x1F, 0x00, 0x00,
-                0x01, 0x05, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-                0x09, 0x0A, 0x0B, 0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F,
-                0x00, 0x7B, 0x40, 0x1B, 0xFF, 0xD9,
-            ])
+            try:
+                if not os.path.exists(frame_path):
+                    continue
+                mtime = os.path.getmtime(frame_path)
+                if mtime == last_mtime:
+                    continue  # No new frame
+                last_mtime = mtime
+                with open(frame_path, "rb") as f:
+                    jpeg_data = f.read()
+                if jpeg_data and len(jpeg_data) > 100:  # Valid JPEG
+                    msg = String()
+                    msg.data = base64.b64encode(jpeg_data).decode("ascii")
+                    self._pub.publish(msg)
+            except Exception:
+                pass
 
 
 class CameraStreamPlugin:
