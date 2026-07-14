@@ -184,22 +184,26 @@ int liveview_start(const char *camera, liveview_frame_cb_t cb) {
     s_frame_cb = cb;
     E_DjiLiveViewCameraPosition pos = DJI_LIVEVIEW_CAMERA_POSITION_NO_1;
 
-    /* Switch camera stream source via CameraManager API */
-    E_DjiCameraManagerStreamSource stream_src = DJI_CAMERA_MANAGER_SOURCE_WIDE_CAM;
-    if (strcmp(camera, "ir") == 0) {
-        stream_src = DJI_CAMERA_MANAGER_SOURCE_IR_CAM;
-    } else if (strcmp(camera, "zoom") == 0) {
-        stream_src = DJI_CAMERA_MANAGER_SOURCE_ZOOM_CAM;
-    }
-    T_DjiReturnCode src_rc = DjiCameraManager_SetStreamSource(
-        DJI_MOUNT_POSITION_PAYLOAD_PORT_NO1, stream_src);
-    printf("[liveview] SetStreamSource(%d) → 0x%08llX\n", stream_src, (unsigned long long)src_rc);
-
-    /* Always use M3E_VIS as the liveview source (single H264 stream) */
-    s_camera_source = DJI_LIVEVIEW_CAMERA_SOURCE_M3E_VIS;
-
-    /* Stop any existing stream first (idempotent) */
+    /* Stop any existing stream first */
     DjiLiveview_StopH264Stream(pos, s_camera_source);
+
+    /* Determine liveview source and optionally switch stream source */
+    if (strcmp(camera, "ir") == 0) {
+        s_camera_source = DJI_LIVEVIEW_CAMERA_SOURCE_M3T_IR;
+    } else {
+        /* wide or zoom: both use VIS source, SetStreamSource selects lens */
+        s_camera_source = DJI_LIVEVIEW_CAMERA_SOURCE_M3T_VIS;
+        E_DjiCameraManagerStreamSource stream_src = DJI_CAMERA_MANAGER_SOURCE_WIDE_CAM;
+        if (strcmp(camera, "zoom") == 0) {
+            stream_src = DJI_CAMERA_MANAGER_SOURCE_ZOOM_CAM;
+        }
+        T_DjiReturnCode src_rc = DjiCameraManager_SetStreamSource(
+            DJI_MOUNT_POSITION_PAYLOAD_PORT_NO1, stream_src);
+        printf("[liveview] SetStreamSource(%d) → 0x%08llX\n",
+               stream_src, (unsigned long long)src_rc);
+        /* Give DJI time to switch lens internally */
+        usleep(500000);
+    }
 
     T_DjiReturnCode rc = DjiLiveview_StartH264Stream(pos, s_camera_source, _h264_cb);
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
@@ -207,7 +211,7 @@ int liveview_start(const char *camera, liveview_frame_cb_t cb) {
         return -1;
     }
     DjiLiveview_RequestIntraframeFrameData(pos, s_camera_source);
-    printf("[liveview] stream started (camera=%s)\n", camera);
+    printf("[liveview] stream started (camera=%s, source=%d)\n", camera, s_camera_source);
     return 0;
 }
 
