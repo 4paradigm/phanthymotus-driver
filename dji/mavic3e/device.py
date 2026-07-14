@@ -29,6 +29,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from std_msgs.msg import String
+from sensor_msgs.msg import CompressedImage
 
 _LOW_LAT_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -136,7 +137,7 @@ class _CameraStreamNode(Node):
         super().__init__(f"mavic3e_cam_{camera}")
         self._topic = topic
         self._bridge = bridge
-        self._pub = self.create_publisher(String, topic, _LOW_LAT_QOS)
+        self._pub = self.create_publisher(CompressedImage, topic, _LOW_LAT_QOS)
         self._fps = fps
         self._camera = camera
         self._thread = None
@@ -157,7 +158,6 @@ class _CameraStreamNode(Node):
 
     def _stream_loop(self):
         """Read JPEG frames from C bridge (FFmpeg decoded) and publish to ROS2."""
-        import base64
         import os
 
         frame_path = "/tmp/dji_frame.jpg"
@@ -179,9 +179,11 @@ class _CameraStreamNode(Node):
                 last_mtime = mtime
                 with open(frame_path, "rb") as f:
                     jpeg_data = f.read()
-                if jpeg_data and len(jpeg_data) > 100:  # Valid JPEG
-                    msg = String()
-                    msg.data = base64.b64encode(jpeg_data).decode("ascii")
+                if jpeg_data and len(jpeg_data) > 100:
+                    msg = CompressedImage()
+                    msg.header.stamp = self.get_clock().now().to_msg()
+                    msg.format = "jpeg"
+                    msg.data = jpeg_data
                     self._pub.publish(msg)
                     pub_count += 1
                     if pub_count % 30 == 1:
