@@ -646,8 +646,10 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
 
     /* Liveview */
     if (strstr(raw_json, "\"start_liveview\"")) {
-        liveview_start("wide", NULL);
-        snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        const char *cam = "wide";
+        if (strstr(raw_json, "\"ir\"")) cam = "ir";
+        liveview_start(cam, NULL);
+        snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0,\"camera\":\"%s\"}}", cam);
         return 0;
     }
     if (strstr(raw_json, "\"stop_liveview\"")) {

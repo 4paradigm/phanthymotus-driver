@@ -186,7 +186,7 @@ class _CameraStreamNode(Node):
                     msg.data = jpeg_data
                     self._pub.publish(msg)
                     pub_count += 1
-                    if pub_count % 30 == 1:
+                    if pub_count % 300 == 1:
                         self.get_logger().info(f"published #{pub_count} ({len(jpeg_data)} bytes)")
             except Exception:
                 pass
@@ -217,9 +217,8 @@ class CameraStreamPlugin:
                         "description": "Camera source",
                         "scope": "instance",
                         "oneOf": [
-                            {"const": "wide", "title": "Wide (24mm)"},
-                            {"const": "zoom", "title": "Zoom (7-28x)"},
-                            {"const": "ir", "title": "IR Thermal (3T only)"},
+                            {"const": "wide", "title": "Visual (广角/变焦)"},
+                            {"const": "ir", "title": "IR Thermal (仅3T)"},
                         ],
                     },
                 },

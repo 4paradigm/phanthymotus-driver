@@ -130,7 +130,7 @@ static void _decode_h264(const uint8_t *data, uint32_t len) {
                 /* Encode every decoded frame */
                 s_frame_count++;
                 _encode_jpeg(FRAME_PATH, s_rgb_buffer, OUT_WIDTH, OUT_HEIGHT);
-                if (s_frame_count % 60 == 0) {
+                if (s_frame_count % 300 == 0) {
                     printf("[liveview] frame #%d\n", s_frame_count);
                 }
             }
@@ -182,7 +182,13 @@ int liveview_init(void) {
 int liveview_start(const char *camera, liveview_frame_cb_t cb) {
     s_frame_cb = cb;
     E_DjiLiveViewCameraPosition pos = DJI_LIVEVIEW_CAMERA_POSITION_NO_1;
-    s_camera_source = DJI_LIVEVIEW_CAMERA_SOURCE_DEFAULT;
+
+    /* Map camera name to DJI source enum */
+    if (strcmp(camera, "ir") == 0) {
+        s_camera_source = DJI_LIVEVIEW_CAMERA_SOURCE_M3T_IR;  /* 3T only */
+    } else {
+        s_camera_source = DJI_LIVEVIEW_CAMERA_SOURCE_M3E_VIS;  /* wide (default) */
+    }
 
     T_DjiReturnCode rc = DjiLiveview_StartH264Stream(pos, s_camera_source, _h264_cb);
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
