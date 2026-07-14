@@ -185,7 +185,9 @@ int liveview_start(const char *camera, liveview_frame_cb_t cb) {
 
     /* Map camera name to DJI source enum */
     if (strcmp(camera, "ir") == 0) {
-        s_camera_source = DJI_LIVEVIEW_CAMERA_SOURCE_M3T_IR;  /* 3T only */
+        s_camera_source = DJI_LIVEVIEW_CAMERA_SOURCE_M3T_IR;   /* 3T only */
+    } else if (strcmp(camera, "zoom") == 0) {
+        s_camera_source = DJI_LIVEVIEW_CAMERA_SOURCE_DEFAULT;  /* zoom lens */
     } else {
         s_camera_source = DJI_LIVEVIEW_CAMERA_SOURCE_M3E_VIS;  /* wide (default) */
     }

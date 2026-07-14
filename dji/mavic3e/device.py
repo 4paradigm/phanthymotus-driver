@@ -217,8 +217,9 @@ class CameraStreamPlugin:
                         "description": "Camera source",
                         "scope": "instance",
                         "oneOf": [
-                            {"const": "wide", "title": "Visual (广角/变焦)"},
-                            {"const": "ir", "title": "IR Thermal (仅3T)"},
+                            {"const": "wide", "title": "Wide (广角 24mm)"},
+                            {"const": "zoom", "title": "Zoom (变焦 162mm)"},
+                            {"const": "ir", "title": "IR Thermal (红外，仅3T)"},
                         ],
                     },
                 },
