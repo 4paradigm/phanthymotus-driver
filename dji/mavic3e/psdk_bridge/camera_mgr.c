@@ -50,9 +50,17 @@ int camera_mgr_set_mode(const char *mode) {
 }
 
 int camera_mgr_set_zoom(float factor) {
-    /* SetOpticalZoomParam takes (position, zoomDirection, factor) */
-    E_DjiCameraZoomDirection dir = DJI_CAMERA_ZOOM_DIRECTION_IN;
-    return (DjiCameraManager_SetOpticalZoomParam(MOUNT_POS, dir, factor) == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) ? 0 : -1;
+    /* Ensure we're on the zoom lens before setting zoom factor */
+    T_DjiReturnCode rc;
+    rc = DjiCameraManager_SetStreamSource(MOUNT_POS, DJI_CAMERA_MANAGER_SOURCE_ZOOM_CAM);
+    printf("[camera] SetStreamSource(ZOOM) → 0x%08llX\n", (unsigned long long)rc);
+
+    /* SetOpticalZoomParam: factor is absolute zoom multiplier (e.g. 2.0 = 2x) */
+    E_DjiCameraZoomDirection dir = (factor >= 1.0f) ? DJI_CAMERA_ZOOM_DIRECTION_IN : DJI_CAMERA_ZOOM_DIRECTION_OUT;
+    rc = DjiCameraManager_SetOpticalZoomParam(MOUNT_POS, dir, factor);
+    printf("[camera] SetOpticalZoomParam(dir=%d, factor=%.1f) → 0x%08llX\n",
+           dir, factor, (unsigned long long)rc);
+    return (rc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) ? 0 : -1;
 }
 
 int camera_mgr_set_focus(float x, float y) {
