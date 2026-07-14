@@ -64,6 +64,7 @@ set(SOURCES
     perception.c
     speaker.c
     hms.c
+    time_sync.c
 )
 
 add_executable(psdk_bridge ${SOURCES})
