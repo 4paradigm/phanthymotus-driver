@@ -7,108 +7,107 @@
 #include <sys/time.h>
 
 /*
- * PSDK Time Synchronization for Mavic 3T.
+ * Time Sync for Mavic 3T — uses FC subscription GPS_DATE + GPS_TIME.
  *
- * Uses PPS callback (simplified: system clock as fallback) to sync
- * local time with aircraft GPS time.
+ * DjiTimeSync requires hardware PPS which is not available on Jetson Nano
+ * E-Port dev board. Instead, we subscribe to GPS date/time topics from FC
+ * and use settimeofday() to sync the local clock.
  */
 
 #ifdef PSDK_ENABLED
-#include "dji_time_sync.h"
-#include "dji_platform.h"
+#include "dji_fc_subscription.h"
 
-static uint64_t s_pps_local_time_us = 0;
+static uint32_t s_gps_date = 0;  /* yyyymmdd */
+static uint32_t s_gps_time = 0;  /* hhmmss */
 
-/* PPS trigger callback — records local time when PPS edge detected.
- * On Jetson Nano without hardware PPS GPIO, we use system clock. */
-static T_DjiReturnCode _get_newest_pps_trigger_time(uint64_t *localTimeUs) {
-    if (s_pps_local_time_us == 0) {
-        /* No hardware PPS — use current system time as approximation */
-        struct timeval tv;
-        gettimeofday(&tv, NULL);
-        *localTimeUs = (uint64_t)tv.tv_sec * 1000000 + tv.tv_usec;
-    } else {
-        *localTimeUs = s_pps_local_time_us;
-    }
+static T_DjiReturnCode _gps_date_cb(const uint8_t *data, uint16_t dataSize,
+                                     const T_DjiDataTimestamp *timestamp) {
+    (void)dataSize; (void)timestamp;
+    s_gps_date = *(const uint32_t *)data;
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
+static T_DjiReturnCode _gps_time_cb(const uint8_t *data, uint16_t dataSize,
+                                     const T_DjiDataTimestamp *timestamp) {
+    (void)dataSize; (void)timestamp;
+    s_gps_time = *(const uint32_t *)data;
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
 
 int time_sync_init(void) {
-    T_DjiReturnCode rc = DjiTimeSync_Init();
+    T_DjiReturnCode rc;
+    rc = DjiFcSubscription_SubscribeTopic(DJI_FC_SUBSCRIPTION_TOPIC_GPS_DATE,
+                                          DJI_DATA_SUBSCRIPTION_TOPIC_1_HZ, _gps_date_cb);
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-        printf("[time_sync] init failed: 0x%08llX\n", (unsigned long long)rc);
-        return -1;
+        printf("[time_sync] subscribe GPS_DATE failed: 0x%08llX\n", (unsigned long long)rc);
     }
-
-    rc = DjiTimeSync_RegGetNewestPpsTriggerTimeCallback(_get_newest_pps_trigger_time);
+    rc = DjiFcSubscription_SubscribeTopic(DJI_FC_SUBSCRIPTION_TOPIC_GPS_TIME,
+                                          DJI_DATA_SUBSCRIPTION_TOPIC_1_HZ, _gps_time_cb);
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-        printf("[time_sync] register PPS callback failed: 0x%08llX\n", (unsigned long long)rc);
-        return -1;
+        printf("[time_sync] subscribe GPS_TIME failed: 0x%08llX\n", (unsigned long long)rc);
     }
-
-    printf("[time_sync] initialized (software PPS fallback)\n");
+    printf("[time_sync] initialized (FC subscription GPS date/time)\n");
     return 0;
 }
 
 int time_sync_get_aircraft_time(char *buf, size_t buflen) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    uint64_t localTimeUs = (uint64_t)tv.tv_sec * 1000000 + tv.tv_usec;
-
-    T_DjiTimeSyncAircraftTime aircraftTime = {0};
-    T_DjiReturnCode rc = DjiTimeSync_TransferToAircraftTime(localTimeUs, &aircraftTime);
-    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-        error_code_to_json(rc, buf, buflen);
+    if (s_gps_date == 0 || s_gps_time == 0) {
+        snprintf(buf, buflen, "{\"error\":\"GPS time not yet available\",\"recovery\":\"Wait for GPS lock\"}");
         return -1;
     }
+    int year = s_gps_date / 10000;
+    int month = (s_gps_date / 100) % 100;
+    int day = s_gps_date % 100;
+    int hour = s_gps_time / 10000;
+    int minute = (s_gps_time / 100) % 100;
+    int second = s_gps_time % 100;
 
     snprintf(buf, buflen,
-        "{\"year\":%d,\"month\":%d,\"day\":%d,"
-        "\"hour\":%d,\"minute\":%d,\"second\":%d,\"microsecond\":%u}",
-        aircraftTime.year, aircraftTime.month, aircraftTime.day,
-        aircraftTime.hour, aircraftTime.minute, aircraftTime.second,
-        aircraftTime.microsecond);
+        "{\"time\":\"%04d-%02d-%02dT%02d:%02d:%02dZ\","
+        "\"year\":%d,\"month\":%d,\"day\":%d,"
+        "\"hour\":%d,\"minute\":%d,\"second\":%d}",
+        year, month, day, hour, minute, second,
+        year, month, day, hour, minute, second);
     return 0;
 }
 
 int time_sync_sync_clock(char *buf, size_t buflen) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    uint64_t localTimeUs = (uint64_t)tv.tv_sec * 1000000 + tv.tv_usec;
-
-    T_DjiTimeSyncAircraftTime at = {0};
-    T_DjiReturnCode rc = DjiTimeSync_TransferToAircraftTime(localTimeUs, &at);
-    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-        error_code_to_json(rc, buf, buflen);
+    if (s_gps_date == 0 || s_gps_time == 0) {
+        snprintf(buf, buflen, "{\"error\":\"GPS time not yet available\",\"recovery\":\"Wait for GPS lock\"}");
         return -1;
     }
 
-    /* Sanity check: GPS time not available if year is 0 or < 2020 */
-    if (at.year < 2020) {
-        snprintf(buf, buflen, "{\"error\":\"no_gps_time\",\"year\":%d}", at.year);
+    int year = s_gps_date / 10000;
+    int month = (s_gps_date / 100) % 100;
+    int day = s_gps_date % 100;
+    int hour = s_gps_time / 10000;
+    int minute = (s_gps_time / 100) % 100;
+    int second = s_gps_time % 100;
+
+    if (year < 2020) {
+        snprintf(buf, buflen, "{\"error\":\"GPS time invalid\",\"recovery\":\"Wait for GPS lock\",\"year\":%d}", year);
         return -1;
     }
 
-    /* Convert aircraft time to epoch */
     struct tm tm = {0};
-    tm.tm_year = at.year - 1900;
-    tm.tm_mon = at.month - 1;
-    tm.tm_mday = at.day;
-    tm.tm_hour = at.hour;
-    tm.tm_min = at.minute;
-    tm.tm_sec = at.second;
+    tm.tm_year = year - 1900;
+    tm.tm_mon = month - 1;
+    tm.tm_mday = day;
+    tm.tm_hour = hour;
+    tm.tm_min = minute;
+    tm.tm_sec = second;
     time_t epoch = timegm(&tm);
 
-    struct timeval new_tv = { .tv_sec = epoch, .tv_usec = at.microsecond };
+    struct timeval new_tv = { .tv_sec = epoch, .tv_usec = 0 };
     if (settimeofday(&new_tv, NULL) != 0) {
-        snprintf(buf, buflen, "{\"error\":\"settimeofday_failed\"}");
+        snprintf(buf, buflen, "{\"error\":\"Failed to set system clock\",\"recovery\":\"Check container privileges (needs privileged or SYS_TIME)\"}");
         return -1;
     }
 
-    printf("[time_sync] clock synced to %04d-%02d-%02dT%02d:%02d:%02d.%06uZ\n",
-           at.year, at.month, at.day, at.hour, at.minute, at.second, at.microsecond);
-    snprintf(buf, buflen, "{\"synced\":\"%04d-%02d-%02dT%02d:%02d:%02d.%06uZ\"}",
-             at.year, at.month, at.day, at.hour, at.minute, at.second, at.microsecond);
+    printf("[time_sync] clock synced to %04d-%02d-%02dT%02d:%02d:%02dZ\n",
+           year, month, day, hour, minute, second);
+    snprintf(buf, buflen, "{\"synced\":\"%04d-%02d-%02dT%02d:%02d:%02dZ\"}",
+             year, month, day, hour, minute, second);
     return 0;
 }
 
