@@ -255,14 +255,21 @@ class CameraStreamPlugin:
                 "topic_out": [{"topic": topic, "format": "image/jpeg"}],
             }
         if action == "start":
-            if instance_id not in self._nodes:
+            if instance_id in self._nodes:
+                node = self._nodes[instance_id]
+                if node._camera != camera:
+                    node.stop()
+                    time.sleep(0.3)
+                    node._camera = camera
+                node.start()
+            else:
                 safe_id = instance_id.replace("-", "_")
                 topic = f"/{self._namespace}/camera/{safe_id}/rgb"
                 node = _CameraStreamNode(topic, self._bridge, self._fps, camera)
                 self._executor.add_node(node)
                 self._nodes[instance_id] = node
-            self._nodes[instance_id].start()
-            return {"state": "running"}
+                node.start()
+            return {"state": "running", "camera": camera}
         if action == "stop":
             if instance_id in self._nodes:
                 self._nodes[instance_id].stop()
