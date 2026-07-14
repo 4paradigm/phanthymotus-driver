@@ -34,6 +34,7 @@
 #include "speaker.h"
 #include "hms.h"
 #include "time_sync.h"
+#include "error_code.h"
 
 static volatile int s_running = 1;
 

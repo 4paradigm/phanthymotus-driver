@@ -1,4 +1,5 @@
 #include "camera_mgr.h"
+#include "error_code.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -86,15 +87,13 @@ int camera_mgr_ir_temp_point(float x, float y, char *buf, size_t buflen) {
     T_DjiCameraManagerPointThermometryCoordinate coord = { .pointX = x, .pointY = y };
     T_DjiReturnCode rc = DjiCameraManager_SetPointThermometryCoordinate(MOUNT_POS, coord);
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-        printf("[camera] SetPointThermometryCoordinate → 0x%08llX\n", (unsigned long long)rc);
-        snprintf(buf, buflen, "{\"error\":\"set_coord_failed\",\"code\":\"0x%08llX\"}", (unsigned long long)rc);
+        error_code_to_json(rc, buf, buflen);
         return -1;
     }
     T_DjiCameraManagerPointThermometryData data;
     rc = DjiCameraManager_GetPointThermometryData(MOUNT_POS, &data);
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-        printf("[camera] GetPointThermometryData → 0x%08llX\n", (unsigned long long)rc);
-        snprintf(buf, buflen, "{\"error\":\"get_data_failed\",\"code\":\"0x%08llX\"}", (unsigned long long)rc);
+        error_code_to_json(rc, buf, buflen);
         return -1;
     }
     snprintf(buf, buflen, "{\"x\":%.3f,\"y\":%.3f,\"temperature\":%.1f}",
@@ -109,15 +108,13 @@ int camera_mgr_ir_temp_area(float ltx, float lty, float rbx, float rby, char *bu
     };
     T_DjiReturnCode rc = DjiCameraManager_SetAreaThermometryCoordinate(MOUNT_POS, coord);
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-        printf("[camera] SetAreaThermometryCoordinate → 0x%08llX\n", (unsigned long long)rc);
-        snprintf(buf, buflen, "{\"error\":\"set_coord_failed\",\"code\":\"0x%08llX\"}", (unsigned long long)rc);
+        error_code_to_json(rc, buf, buflen);
         return -1;
     }
     T_DjiCameraManagerAreaThermometryData data;
     rc = DjiCameraManager_GetAreaThermometryData(MOUNT_POS, &data);
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-        printf("[camera] GetAreaThermometryData → 0x%08llX\n", (unsigned long long)rc);
-        snprintf(buf, buflen, "{\"error\":\"get_data_failed\",\"code\":\"0x%08llX\"}", (unsigned long long)rc);
+        error_code_to_json(rc, buf, buflen);
         return -1;
     }
     snprintf(buf, buflen,

@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "time_sync.h"
+#include "error_code.h"
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -57,7 +58,7 @@ int time_sync_get_aircraft_time(char *buf, size_t buflen) {
     T_DjiTimeSyncAircraftTime aircraftTime = {0};
     T_DjiReturnCode rc = DjiTimeSync_TransferToAircraftTime(localTimeUs, &aircraftTime);
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-        snprintf(buf, buflen, "{\"error\":\"transfer_failed\",\"code\":\"0x%08llX\"}", (unsigned long long)rc);
+        error_code_to_json(rc, buf, buflen);
         return -1;
     }
 
@@ -78,7 +79,7 @@ int time_sync_sync_clock(char *buf, size_t buflen) {
     T_DjiTimeSyncAircraftTime at = {0};
     T_DjiReturnCode rc = DjiTimeSync_TransferToAircraftTime(localTimeUs, &at);
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-        snprintf(buf, buflen, "{\"error\":\"transfer_failed\",\"code\":\"0x%08llX\"}", (unsigned long long)rc);
+        error_code_to_json(rc, buf, buflen);
         return -1;
     }
 
