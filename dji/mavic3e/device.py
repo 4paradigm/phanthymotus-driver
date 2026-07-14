@@ -687,7 +687,10 @@ class CameraPlugin:
                         "params": ["point_x", "point_y"],
                         "description": "红外点测温 (仅3T型号)",
                     },
-                    "ir_temp_area": {"params": [], "description": "红外区域测温 (仅3T型号)"},
+                    "ir_temp_area": {
+                        "params": ["ltx", "lty", "rbx", "rby"],
+                        "description": "红外区域测温，坐标范围0-1 (左上角ltx,lty 右下角rbx,rby)",
+                    },
                 },
             },
         }
@@ -736,7 +739,7 @@ class CameraPlugin:
             return resp.get("data", {})
         if action == "ir_temp_point":
             resp = self._bridge.ir_temp_point(
-                x=args.get("x", 0.5), y=args.get("y", 0.5),
+                x=args.get("point_x", 0.5), y=args.get("point_y", 0.5),
             )
             return {"ret": 0 if resp.get("ok") else -1, "data": resp.get("data", {})}
         if action == "ir_temp_area":
