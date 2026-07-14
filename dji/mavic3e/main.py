@@ -310,14 +310,8 @@ def _get_usb_ids(device_path: str) -> tuple[str, str]:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def _configure_usb_gadget():
-    """Check if USB Bulk FFS endpoints are available (configured by host-side install script).
-    Container does NOT modify configfs — that causes kernel crashes on Jetson Nano."""
-    bulk1_ep1 = "/dev/usb-ffs/bulk1/ep1"
-    if os.path.exists(bulk1_ep1):
-        print("[usb] USB Bulk FFS endpoints available (host-side configured)")
-    else:
-        print("[usb] WARNING: /dev/usb-ffs/bulk1/ep1 not found. "
-              "Run install_usb_bulk.sh on host first for video/perception support.")
+    """Check USB network status for DJI video/perception support."""
+    pass  # Network HAL configured in C bridge based on UDC state
 
 
 def _start_registration(mcp_port: int, name: str, category: str):
