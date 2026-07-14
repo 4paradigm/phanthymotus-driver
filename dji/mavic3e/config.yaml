@@ -33,5 +33,5 @@ plugins:
     enabled: true
   waypoint:
     enabled: true
-  speaker:
+  time_sync:
     enabled: true

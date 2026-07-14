@@ -101,11 +101,11 @@ class Mavic3EDeviceBundle:
                 plugins_cfg["waypoint"], namespace, executor, bridge))
             print("[bundle] WaypointPlugin loaded")
 
-        if plugins_cfg.get("speaker", {}).get("enabled", False):
-            from device import SpeakerPlugin
-            self._plugins.append(SpeakerPlugin(
-                plugins_cfg["speaker"], namespace, executor, bridge))
-            print("[bundle] SpeakerPlugin loaded")
+        if plugins_cfg.get("time_sync", {}).get("enabled", False):
+            from device import TimeSyncPlugin
+            self._plugins.append(TimeSyncPlugin(
+                plugins_cfg["time_sync"], namespace, executor, bridge))
+            print("[bundle] TimeSyncPlugin loaded")
 
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):

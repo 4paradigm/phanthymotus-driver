@@ -918,34 +918,34 @@ class WaypointPlugin:
 #  PSDK: 喊话器控件
 # ═══════════════════════════════════════════════════════════════════════════
 
-class SpeakerPlugin:
-    PREFIX = "speaker"
+# ═══════════════════════════════════════════════════════════════════════════
+#  TimeSyncPlugin (sensor)
+#  PSDK: 时间同步 — 获取飞机 GPS 时间
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TimeSyncPlugin:
+    PREFIX = "time_sync"
 
     def __init__(self, plugin_config: dict, namespace: str, executor, bridge):
         self._bridge = bridge
 
     def get_tool(self) -> dict:
         return {
-            "name": "speaker",
-            "type": "actuator",
-            "description": "Mavic 3E 喊话器：播放 TTS 文本或音频文件，音量控制。",
-            "topic_in": [{"format": "audio/pcm-16k"}],
+            "name": "time_sync",
+            "type": "sensor",
+            "description": "Mavic 3T 时间同步：获取飞机 GPS 授时（UTC），以及机型/固件/连接状态等静态信息。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["start", "stop", "play", "set_volume", "stop_play"],
+                        "enum": ["start", "stop", "get_time", "get_info"],
                     },
-                    "text": {"type": "string", "description": "TTS 文本"},
-                    "file_path": {"type": "string", "description": "音频文件路径"},
-                    "volume": {"type": "integer", "description": "音量 (0-100)"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "play": {"params": ["text", "file_path"], "description": "播放 TTS 文本或音频文件"},
-                    "set_volume": {"params": ["volume"], "description": "设置喊话器音量 (0-100)"},
-                    "stop_play": {"params": [], "description": "停止播放"},
+                    "get_time": {"params": [], "description": "获取飞机 GPS 时间 (UTC)"},
+                    "get_info": {"params": [], "description": "获取机型/固件/连接状态"},
                 },
             },
         }
@@ -961,18 +961,12 @@ class SpeakerPlugin:
             return {"state": "ready"}
         if action == "stop":
             return {"state": "idle"}
-        if action == "play":
-            resp = self._bridge.speaker_play(
-                text=args.get("text", ""),
-                file_path=args.get("file_path", ""),
-            )
-            return {"ret": 0 if resp.get("ok") else -1}
-        if action == "set_volume":
-            resp = self._bridge.speaker_set_volume(volume=args.get("volume", 50))
-            return {"ret": 0 if resp.get("ok") else -1}
-        if action == "stop_play":
-            resp = self._bridge.speaker_stop()
-            return {"ret": 0 if resp.get("ok") else -1}
+        if action == "get_time":
+            resp = self._bridge.get_aircraft_time()
+            return {"ret": 0 if resp.get("ok") else -1, "data": resp.get("data", {})}
+        if action == "get_info":
+            resp = self._bridge.get_aircraft_info()
+            return {"ret": 0 if resp.get("ok") else -1, "data": resp.get("data", {})}
         return None
 
 

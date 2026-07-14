@@ -527,3 +527,6 @@ class BridgeClient:
     # Aircraft info
     def get_aircraft_info(self):
         return self._call("get_aircraft_info")
+
+    def get_aircraft_time(self):
+        return self._call("get_aircraft_time")
