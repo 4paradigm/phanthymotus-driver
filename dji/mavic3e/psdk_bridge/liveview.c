@@ -192,6 +192,9 @@ int liveview_start(const char *camera, liveview_frame_cb_t cb) {
         s_camera_source = DJI_LIVEVIEW_CAMERA_SOURCE_M3E_VIS;  /* wide (default) */
     }
 
+    /* Stop any existing stream first (idempotent) */
+    DjiLiveview_StopH264Stream(pos, s_camera_source);
+
     T_DjiReturnCode rc = DjiLiveview_StartH264Stream(pos, s_camera_source, _h264_cb);
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
         printf("[liveview] start failed: 0x%08llX\n", (unsigned long long)rc);
