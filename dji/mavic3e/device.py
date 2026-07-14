@@ -919,52 +919,36 @@ class WaypointPlugin:
 # ═══════════════════════════════════════════════════════════════════════════
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  TimeSyncPlugin (sensor)
-#  PSDK: 时间同步 + 机型信息
+#  TimeSyncPlugin (actuator)
+#  PSDK: 机型信息 + 时间同步
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TimeSyncPlugin:
-    PREFIX = "time_sync"
+    PREFIX = "aircraft_info"
 
     def __init__(self, plugin_config: dict, namespace: str, executor, bridge):
         self._bridge = bridge
 
-    def get_tools(self) -> list:
-        return [
-            {
-                "name": "time_sync",
-                "type": "sensor",
-                "description": "飞机 GPS 授时 (UTC)，可用于多传感器时间对齐。",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "action": {
-                            "type": "string",
-                            "enum": ["start", "stop", "get_time"],
-                        },
-                    },
-                    "required": ["action"],
-                    "x-action-params": {
-                        "get_time": {"params": [], "description": "获取飞机 GPS 时间 (UTC)"},
+    def get_tool(self) -> dict:
+        return {
+            "name": "aircraft_info",
+            "type": "actuator",
+            "description": "飞机信息查询：机型、固件版本、连接状态、GPS 授时。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["info", "get_time"],
                     },
                 },
-            },
-            {
-                "name": "aircraft_info",
-                "type": "sensor",
-                "description": "飞机静态信息：机型、固件版本、连接状态、挂载位置。",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "action": {
-                            "type": "string",
-                            "enum": ["start", "stop", "info"],
-                        },
-                    },
-                    "required": ["action"],
+                "required": ["action"],
+                "x-action-params": {
+                    "info": {"params": [], "description": "获取机型/固件/连接状态"},
+                    "get_time": {"params": [], "description": "获取飞机 GPS 时间 (UTC)"},
                 },
             },
-        ]
+        }
 
     def start(self):
         pass
@@ -973,16 +957,11 @@ class TimeSyncPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict | None:
-        tool_name = args.get("_tool_name", "")
-        if action == "start":
-            return {"state": "ready"}
-        if action == "stop":
-            return {"state": "idle"}
-        if action == "get_time" or (tool_name == "time_sync" and action == "info"):
-            resp = self._bridge.get_aircraft_time()
-            return {"ret": 0 if resp.get("ok") else -1, "data": resp.get("data", {})}
-        if action == "info" and tool_name == "aircraft_info":
+        if action == "info":
             resp = self._bridge.get_aircraft_info()
+            return {"ret": 0 if resp.get("ok") else -1, "data": resp.get("data", {})}
+        if action == "get_time":
+            resp = self._bridge.get_aircraft_time()
             return {"ret": 0 if resp.get("ok") else -1, "data": resp.get("data", {})}
         return None
 
