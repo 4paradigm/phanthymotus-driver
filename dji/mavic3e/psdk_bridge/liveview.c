@@ -156,6 +156,7 @@ int liveview_init(void) {
 
     /* Initialize FFmpeg decoder */
     avcodec_register_all();
+    av_log_set_level(AV_LOG_ERROR);  /* Suppress warnings (PPS/SPS errors normal until I-frame) */
     AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_H264);
     if (!codec) {
         printf("[liveview] H264 codec not found\n");
@@ -188,7 +189,11 @@ int liveview_start(const char *camera, liveview_frame_cb_t cb) {
         printf("[liveview] start failed: 0x%08llX\n", (unsigned long long)rc);
         return -1;
     }
-    printf("[liveview] stream started (camera=%s)\n", camera);
+
+    /* Request I-frame so decoder can initialize (without this, only P-frames arrive) */
+    DjiLiveview_RequestIntraframeFrameData(pos, s_camera_source);
+
+    printf("[liveview] stream started (camera=%s), I-frame requested\n", camera);
     return 0;
 }
 
