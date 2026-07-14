@@ -957,6 +957,8 @@ class TimeSyncPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action in ("start", "stop"):
+            return {"state": "ready"}
         if action == "get_info":
             resp = self._bridge.get_aircraft_info()
             return {"ret": 0 if resp.get("ok") else -1, "data": resp.get("data", {})}
