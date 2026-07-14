@@ -261,10 +261,11 @@ static void _Osal_Free(void *ptr) { free(ptr); }
 
 /* ── Network HAL (configure RNDIS interface via ioctl) ────────────────── */
 
-#define NETWORK_IFACE "rndis0"
+#define NETWORK_IFACE "l4tbr0"
 
 static T_DjiReturnCode _HalNetwork_Init(const char *ipAddr, const char *netMask,
                                          T_DjiNetworkHandle *networkHandle) {
+    /* Match DJI Jetson sample: configure l4tbr0 with given IP */
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
         printf("[net] socket failed: %s\n", strerror(errno));
@@ -275,55 +276,23 @@ static T_DjiReturnCode _HalNetwork_Init(const char *ipAddr, const char *netMask,
     memset(&ifr, 0, sizeof(ifr));
     strncpy(ifr.ifr_name, NETWORK_IFACE, IFNAMSIZ - 1);
 
-    /* Remove rndis0 from any bridge (l4tbr0) — critical for direct routing */
-    int br_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (br_sock >= 0) {
-        struct ifreq br_ifr;
-        memset(&br_ifr, 0, sizeof(br_ifr));
-        strncpy(br_ifr.ifr_name, "l4tbr0", IFNAMSIZ - 1);
-        ioctl(sock, SIOCGIFINDEX, &ifr);
-        br_ifr.ifr_ifindex = ifr.ifr_ifindex;
-        ioctl(br_sock, 0x89a3, &br_ifr);
-        close(br_sock);
-        printf("[net] removed %s from bridge\n", NETWORK_IFACE);
-    }
+    /* Bring interface up */
+    ioctl(sock, SIOCGIFFLAGS, &ifr);
+    ifr.ifr_flags |= IFF_UP | IFF_RUNNING;
+    ioctl(sock, SIOCSIFFLAGS, &ifr);
 
-    /* Also remove usb0 from bridge if present */
-    {
-        struct ifreq usb_ifr;
-        memset(&usb_ifr, 0, sizeof(usb_ifr));
-        strncpy(usb_ifr.ifr_name, "usb0", IFNAMSIZ - 1);
-        int usb_sock = socket(AF_INET, SOCK_STREAM, 0);
-        if (usb_sock >= 0) {
-            struct ifreq br2;
-            memset(&br2, 0, sizeof(br2));
-            strncpy(br2.ifr_name, "l4tbr0", IFNAMSIZ - 1);
-            ioctl(usb_sock, SIOCGIFINDEX, &usb_ifr);
-            br2.ifr_ifindex = usb_ifr.ifr_ifindex;
-            ioctl(usb_sock, 0x89a3, &br2);
-            close(usb_sock);
-        }
-    }
-
-    /* Set IP address (don't bring down — keep USB link alive) */
+    /* Set IP address */
     struct sockaddr_in *addr = (struct sockaddr_in *)&ifr.ifr_addr;
     addr->sin_family = AF_INET;
     inet_pton(AF_INET, ipAddr, &addr->sin_addr);
     if (ioctl(sock, SIOCSIFADDR, &ifr) < 0) {
-        printf("[net] set IP %s failed: %s\n", ipAddr, strerror(errno));
+        printf("[net] set IP %s on %s failed: %s\n", ipAddr, NETWORK_IFACE, strerror(errno));
     }
 
     /* Set netmask */
     inet_pton(AF_INET, netMask, &addr->sin_addr);
     if (ioctl(sock, SIOCSIFNETMASK, &ifr) < 0) {
         printf("[net] set mask %s failed: %s\n", netMask, strerror(errno));
-    }
-
-    /* Bring interface up */
-    ioctl(sock, SIOCGIFFLAGS, &ifr);
-    ifr.ifr_flags |= IFF_UP | IFF_RUNNING;
-    if (ioctl(sock, SIOCSIFFLAGS, &ifr) < 0) {
-        printf("[net] bring up %s failed: %s\n", NETWORK_IFACE, strerror(errno));
     }
 
     close(sock);
@@ -404,10 +373,9 @@ static int _psdk_core_init(const char *app_id, const char *app_key,
         return -1;
     }
 
-    /* Register HAL USB Bulk only if FFS endpoints are available (host-side setup done) */
-    extern T_DjiHalUsbBulkHandler g_usbBulkHandler;
-    if (access("/dev/usb-ffs/bulk1/ep1", F_OK) == 0) {
-        /* Socket handler required for USB Bulk data channel */
+    /* Register Network HAL + Socket handler (for liveview/perception via l4tbr0 RNDIS) */
+    /* DJI Jetson sample: LINUX_NETWORK_DEV="l4tbr0", VID=0x0955, PID=0x7020 */
+    {
         T_DjiSocketHandler socketHandler = {
             .Socket = Osal_Socket,
             .Bind = Osal_Bind,
@@ -427,14 +395,17 @@ static int _psdk_core_init(const char *app_id, const char *app_key,
             printf("[psdk] Socket handler registered OK\n");
         }
 
-        rc = DjiPlatform_RegHalUsbBulkHandler(&g_usbBulkHandler);
+        T_DjiHalNetworkHandler networkHandler = {
+            .NetworkInit = _HalNetwork_Init,
+            .NetworkDeInit = _HalNetwork_DeInit,
+            .NetworkGetDeviceInfo = _HalNetwork_GetDeviceInfo,
+        };
+        rc = DjiPlatform_RegHalNetworkHandler(&networkHandler);
         if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-            printf("[psdk] HAL USB Bulk registration failed: 0x%08llX\n", (unsigned long long)rc);
+            printf("[psdk] Network HAL registration failed: 0x%08llX\n", (unsigned long long)rc);
         } else {
-            printf("[psdk] HAL USB Bulk registered OK\n");
+            printf("[psdk] Network HAL registered OK\n");
         }
-    } else {
-        printf("[psdk] USB Bulk endpoints not available, skipping (UART-only mode)\n");
     }
 
     /* Init PSDK core */
