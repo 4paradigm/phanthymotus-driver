@@ -554,6 +554,36 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
         snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
         return 0;
     }
+    if (strstr(raw_json, "\"joystick_move\"")) {
+        float vx = 0, vy = 0, vz = 0, vyaw = 0;
+        const char *p;
+        if ((p = strstr(raw_json, "\"vx\""))) { p = strchr(p, ':'); if (p) vx = (float)atof(p+1); }
+        if ((p = strstr(raw_json, "\"vy\""))) { p = strchr(p, ':'); if (p) vy = (float)atof(p+1); }
+        if ((p = strstr(raw_json, "\"vz\""))) { p = strchr(p, ':'); if (p) vz = (float)atof(p+1); }
+        if ((p = strstr(raw_json, "\"vyaw\""))) { p = strchr(p, ':'); if (p) vyaw = (float)atof(p+1); }
+        int r = flight_ctrl_joystick_move(vx, vy, vz, vyaw);
+        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        return 0;
+    }
+    if (strstr(raw_json, "\"set_home\"")) {
+        double lat = 0, lon = 0;
+        const char *p;
+        if ((p = strstr(raw_json, "\"lat\""))) { p = strchr(p, ':'); if (p) lat = atof(p+1); }
+        if ((p = strstr(raw_json, "\"lon\""))) { p = strchr(p, ':'); if (p) lon = atof(p+1); }
+        int r = flight_ctrl_set_home(lat, lon);
+        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        return 0;
+    }
+    if (strstr(raw_json, "\"set_obstacle_avoidance\"")) {
+        int enabled = strstr(raw_json, "\"on\"") ? 1 : 0;
+        const char *dir = "all";
+        if (strstr(raw_json, "\"horizontal\"")) dir = "horizontal";
+        else if (strstr(raw_json, "\"upward\"")) dir = "upward";
+        else if (strstr(raw_json, "\"downward\"")) dir = "downward";
+        int r = flight_ctrl_set_obstacle_avoidance(enabled, dir);
+        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        return 0;
+    }
 
     /* Camera */
     if (strstr(raw_json, "\"take_photo\"")) {
@@ -592,8 +622,68 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
         snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
         return 0;
     }
+    if (strstr(raw_json, "\"set_exposure\"")) {
+        int iso = 0; float aperture = 0, shutter = 0, ev = 0;
+        const char *p;
+        if ((p = strstr(raw_json, "\"iso\""))) { p = strchr(p, ':'); if (p) iso = atoi(p+1); }
+        if ((p = strstr(raw_json, "\"aperture\""))) { p = strchr(p, ':'); if (p) aperture = (float)atof(p+1); }
+        if ((p = strstr(raw_json, "\"shutter_speed\""))) { p = strchr(p, ':'); if (p) shutter = (float)atof(p+1); }
+        if ((p = strstr(raw_json, "\"ev\""))) { p = strchr(p, ':'); if (p) ev = (float)atof(p+1); }
+        int r = camera_mgr_set_exposure(iso, aperture, shutter, ev);
+        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        return 0;
+    }
+    if (strstr(raw_json, "\"get_storage\"")) {
+        char storage[256];
+        camera_mgr_get_storage(storage, sizeof(storage));
+        snprintf(result, result_size, "{\"ok\":true,\"data\":%s}", storage);
+        return 0;
+    }
+    if (strstr(raw_json, "\"ir_temp_point\"")) {
+        float x = 0.5f, y = 0.5f;
+        const char *p;
+        if ((p = strstr(raw_json, "\"x\""))) { p = strchr(p, ':'); if (p) x = (float)atof(p+1); }
+        if ((p = strstr(raw_json, "\"y\""))) { p = strchr(p, ':'); if (p) y = (float)atof(p+1); }
+        char buf[256];
+        int r = camera_mgr_ir_temp_point(x, y, buf, sizeof(buf));
+        snprintf(result, result_size, "{\"ok\":%s,\"data\":%s}", r == 0 ? "true" : "false", buf);
+        return 0;
+    }
+    if (strstr(raw_json, "\"ir_temp_area\"")) {
+        float ltx = 0.25f, lty = 0.25f, rbx = 0.75f, rby = 0.75f;
+        const char *p;
+        if ((p = strstr(raw_json, "\"ltx\""))) { p = strchr(p, ':'); if (p) ltx = (float)atof(p+1); }
+        if ((p = strstr(raw_json, "\"lty\""))) { p = strchr(p, ':'); if (p) lty = (float)atof(p+1); }
+        if ((p = strstr(raw_json, "\"rbx\""))) { p = strchr(p, ':'); if (p) rbx = (float)atof(p+1); }
+        if ((p = strstr(raw_json, "\"rby\""))) { p = strchr(p, ':'); if (p) rby = (float)atof(p+1); }
+        char buf[256];
+        int r = camera_mgr_ir_temp_area(ltx, lty, rbx, rby, buf, sizeof(buf));
+        snprintf(result, result_size, "{\"ok\":%s,\"data\":%s}", r == 0 ? "true" : "false", buf);
+        return 0;
+    }
 
     /* Gimbal */
+    if (strstr(raw_json, "\"gimbal_rotate\"")) {
+        float pitch = 0, yaw = 0, roll = 0, duration = 1.0f;
+        const char *mode = "absolute";
+        const char *p;
+        if ((p = strstr(raw_json, "\"pitch\""))) { p = strchr(p, ':'); if (p) pitch = (float)atof(p+1); }
+        if ((p = strstr(raw_json, "\"yaw\""))) { p = strchr(p, ':'); if (p) yaw = (float)atof(p+1); }
+        if ((p = strstr(raw_json, "\"roll\""))) { p = strchr(p, ':'); if (p) roll = (float)atof(p+1); }
+        if ((p = strstr(raw_json, "\"duration\""))) { p = strchr(p, ':'); if (p) duration = (float)atof(p+1); }
+        if (strstr(raw_json, "\"relative\"")) mode = "relative";
+        int r = gimbal_mgr_rotate(pitch, yaw, roll, mode, duration);
+        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        return 0;
+    }
+    if (strstr(raw_json, "\"gimbal_set_mode\"")) {
+        const char *mode = "free";
+        if (strstr(raw_json, "\"follow\"")) mode = "follow";
+        else if (strstr(raw_json, "\"fpv\"")) mode = "fpv";
+        int r = gimbal_mgr_set_mode(mode);
+        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        return 0;
+    }
     if (strstr(raw_json, "\"gimbal_reset\"")) {
         int r = gimbal_mgr_reset();
         snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);

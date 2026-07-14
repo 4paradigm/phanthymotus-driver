@@ -82,6 +82,53 @@ int camera_mgr_get_storage(char *buf, size_t buflen) {
     return 0;
 }
 
+int camera_mgr_ir_temp_point(float x, float y, char *buf, size_t buflen) {
+    T_DjiCameraManagerPointThermometryCoordinate coord = { .pointX = x, .pointY = y };
+    T_DjiReturnCode rc = DjiCameraManager_SetPointThermometryCoordinate(MOUNT_POS, coord);
+    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+        printf("[camera] SetPointThermometryCoordinate → 0x%08llX\n", (unsigned long long)rc);
+        snprintf(buf, buflen, "{\"error\":\"set_coord_failed\",\"code\":\"0x%08llX\"}", (unsigned long long)rc);
+        return -1;
+    }
+    T_DjiCameraManagerPointThermometryData data;
+    rc = DjiCameraManager_GetPointThermometryData(MOUNT_POS, &data);
+    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+        printf("[camera] GetPointThermometryData → 0x%08llX\n", (unsigned long long)rc);
+        snprintf(buf, buflen, "{\"error\":\"get_data_failed\",\"code\":\"0x%08llX\"}", (unsigned long long)rc);
+        return -1;
+    }
+    snprintf(buf, buflen, "{\"x\":%.3f,\"y\":%.3f,\"temperature\":%.1f}",
+             data.pointX, data.pointY, data.pointTemperature);
+    return 0;
+}
+
+int camera_mgr_ir_temp_area(float ltx, float lty, float rbx, float rby, char *buf, size_t buflen) {
+    T_DjiCameraManagerAreaThermometryCoordinate coord = {
+        .areaTempLtX = ltx, .areaTempLtY = lty,
+        .areaTempRbX = rbx, .areaTempRbY = rby,
+    };
+    T_DjiReturnCode rc = DjiCameraManager_SetAreaThermometryCoordinate(MOUNT_POS, coord);
+    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+        printf("[camera] SetAreaThermometryCoordinate → 0x%08llX\n", (unsigned long long)rc);
+        snprintf(buf, buflen, "{\"error\":\"set_coord_failed\",\"code\":\"0x%08llX\"}", (unsigned long long)rc);
+        return -1;
+    }
+    T_DjiCameraManagerAreaThermometryData data;
+    rc = DjiCameraManager_GetAreaThermometryData(MOUNT_POS, &data);
+    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+        printf("[camera] GetAreaThermometryData → 0x%08llX\n", (unsigned long long)rc);
+        snprintf(buf, buflen, "{\"error\":\"get_data_failed\",\"code\":\"0x%08llX\"}", (unsigned long long)rc);
+        return -1;
+    }
+    snprintf(buf, buflen,
+        "{\"avg\":%.1f,\"min\":%.1f,\"max\":%.1f,"
+        "\"min_x\":%.3f,\"min_y\":%.3f,\"max_x\":%.3f,\"max_y\":%.3f}",
+        data.areaAveTemp, data.areaMinTemp, data.areaMaxTemp,
+        data.areaMinTempPointX, data.areaMinTempPointY,
+        data.areaMaxTempPointX, data.areaMaxTempPointY);
+    return 0;
+}
+
 void camera_mgr_cleanup(void) {
     DjiCameraManager_DeInit();
 }
@@ -98,6 +145,14 @@ int camera_mgr_set_focus(float x, float y) { return 0; }
 int camera_mgr_set_exposure(int iso, float aperture, float shutter, float ev) { return 0; }
 int camera_mgr_get_storage(char *buf, size_t buflen) {
     snprintf(buf, buflen, "{\"total_mb\":128000,\"free_mb\":95000}");
+    return 0;
+}
+int camera_mgr_ir_temp_point(float x, float y, char *buf, size_t buflen) {
+    snprintf(buf, buflen, "{\"x\":%.3f,\"y\":%.3f,\"temperature\":0.0}", x, y);
+    return 0;
+}
+int camera_mgr_ir_temp_area(float ltx, float lty, float rbx, float rby, char *buf, size_t buflen) {
+    snprintf(buf, buflen, "{\"avg\":0,\"min\":0,\"max\":0,\"min_x\":0,\"min_y\":0,\"max_x\":0,\"max_y\":0}");
     return 0;
 }
 void camera_mgr_cleanup(void) {}

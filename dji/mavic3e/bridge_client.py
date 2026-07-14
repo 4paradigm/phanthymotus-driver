@@ -445,6 +445,13 @@ class BridgeClient:
     def get_storage(self):
         return self._call("get_storage")
 
+    def ir_temp_point(self, x: float = 0.5, y: float = 0.5):
+        return self._call("ir_temp_point", {"x": x, "y": y})
+
+    def ir_temp_area(self, ltx: float = 0.25, lty: float = 0.25,
+                     rbx: float = 0.75, rby: float = 0.75):
+        return self._call("ir_temp_area", {"ltx": ltx, "lty": lty, "rbx": rbx, "rby": rby})
+
     # Gimbal
     def gimbal_rotate(self, pitch: float = 0, yaw: float = 0, roll: float = 0,
                       mode: str = "absolute", duration: float = 1.0):
