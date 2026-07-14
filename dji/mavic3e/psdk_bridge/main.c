@@ -48,6 +48,7 @@ static void _signal_handler(int sig) {
 #include "dji_platform.h"
 #include "dji_payload_camera.h"
 #include "osal_socket.h"
+#include <dirent.h>
 #include <pthread.h>
 #include <semaphore.h>
 #include <net/if.h>
@@ -373,9 +374,40 @@ static int _psdk_core_init(const char *app_id, const char *app_key,
         return -1;
     }
 
-    /* Register Network HAL + Socket handler (for liveview/perception via l4tbr0 RNDIS) */
-    /* DJI Jetson sample: LINUX_NETWORK_DEV="l4tbr0", VID=0x0955, PID=0x7020 */
+    /* Register Network HAL + Socket handler only if USB gadget is connected to host */
+    /* Check UDC state — must be "configured" (USB host has enumerated us) */
     {
+        int register_network = 0;
+        FILE *udc_f = fopen("/sys/class/udc/700d0000.xudc/state", "r");
+        if (!udc_f) {
+            /* Try generic UDC path */
+            char udc_path[128];
+            DIR *udc_dir = opendir("/sys/class/udc");
+            if (udc_dir) {
+                struct dirent *ent;
+                while ((ent = readdir(udc_dir)) != NULL) {
+                    if (ent->d_name[0] != '.') {
+                        snprintf(udc_path, sizeof(udc_path), "/sys/class/udc/%s/state", ent->d_name);
+                        udc_f = fopen(udc_path, "r");
+                        break;
+                    }
+                }
+                closedir(udc_dir);
+            }
+        }
+        if (udc_f) {
+            char state[32] = {0};
+            fgets(state, sizeof(state), udc_f);
+            fclose(udc_f);
+            /* Remove newline */
+            char *nl = strchr(state, '\n'); if (nl) *nl = 0;
+            printf("[psdk] UDC state: %s\n", state);
+            if (strcmp(state, "configured") == 0) {
+                register_network = 1;
+            }
+        }
+
+        if (register_network) {
         T_DjiSocketHandler socketHandler = {
             .Socket = Osal_Socket,
             .Bind = Osal_Bind,
@@ -405,6 +437,9 @@ static int _psdk_core_init(const char *app_id, const char *app_key,
             printf("[psdk] Network HAL registration failed: 0x%08llX\n", (unsigned long long)rc);
         } else {
             printf("[psdk] Network HAL registered OK\n");
+        }
+        } else {
+            printf("[psdk] UDC not configured — skipping Network HAL (UART-only mode, no video)\n");
         }
     }
 
