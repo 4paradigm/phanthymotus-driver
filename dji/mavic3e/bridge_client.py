@@ -375,8 +375,13 @@ class BridgeClient:
     def takeoff(self):
         return self._call("takeoff")
 
-    def land(self):
+    def land(self, auto_confirm: bool = False):
+        if auto_confirm:
+            return self._call("land", {"auto_confirm": True})
         return self._call("land")
+
+    def confirm_landing(self):
+        return self._call("confirm_landing")
 
     def go_home(self):
         return self._call("go_home")

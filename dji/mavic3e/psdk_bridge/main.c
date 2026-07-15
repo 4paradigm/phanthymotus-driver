@@ -508,9 +508,21 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
         else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
-    if (strstr(raw_json, "\"land\"")) {
-        int64_t r = flight_ctrl_land();
-        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+    if (strstr(raw_json, "\"land\"") && !strstr(raw_json, "\"confirm_land")) {
+        if (strstr(raw_json, "\"auto_confirm\"")) {
+            int64_t r = flight_ctrl_land_auto_confirm();
+            if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0,\"message\":\"Landing completed (auto-confirmed)\"}}");
+            else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
+        } else {
+            int64_t r = flight_ctrl_land();
+            if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0,\"message\":\"Landing initiated. Please confirm on RC when prompted.\"}}");
+            else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
+        }
+        return 0;
+    }
+    if (strstr(raw_json, "\"confirm_landing\"")) {
+        int64_t r = flight_ctrl_confirm_landing();
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0,\"message\":\"Landing confirmed\"}}");
         else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }

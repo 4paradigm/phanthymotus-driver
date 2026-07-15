@@ -6,6 +6,8 @@
 int flight_ctrl_init(void);
 int64_t flight_ctrl_takeoff(void);
 int64_t flight_ctrl_land(void);
+int64_t flight_ctrl_confirm_landing(void);
+int64_t flight_ctrl_land_auto_confirm(void);
 int64_t flight_ctrl_go_home(void);
 int64_t flight_ctrl_cancel_go_home(void);
 int64_t flight_ctrl_joystick_move(float vx, float vy, float vz, float vyaw);
