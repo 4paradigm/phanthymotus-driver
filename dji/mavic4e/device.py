@@ -208,7 +208,7 @@ class CameraStreamPlugin:
             "name": "camera_stream",
             "type": "sensor",
             "multiInstance": True,
-            "description": "Mavic 4E/4T 相机实时码流 (H.264 解码 → JPEG)。支持广角/变焦/红外(4T)/4K镜头切换。每个实例独立选择镜头。",
+            "description": "Mavic 4E/4T 相机实时码流 (H.264 解码 → JPEG)。支持广角/变焦/红外(3T)镜头切换。每个实例独立选择镜头。",
             "topic_out": [{"format": "image/jpeg", "desc": "camera JPEG stream"}],
             "configSchema": {
                 "type": "object",
@@ -218,7 +218,7 @@ class CameraStreamPlugin:
                         "description": "Camera source",
                         "scope": "instance",
                         "oneOf": [
-                            {"const": "wide", "title": "Wide (广角 24mm)"},
+                            {"const": "wide", "title": "Wide (广角)"},
                             {"const": "zoom", "title": "Zoom (变焦 70mm)"},
                             {"const": "ir", "title": "IR Thermal (红外，仅4T)"},
                             {"const": "4k", "title": "4K"},
@@ -505,7 +505,7 @@ class FlightPlugin:
             {
                 "name": "flight",
                 "type": "actuator",
-                "description": "Mavic 4E/4T 飞行控制：起飞、降落、返航、摇杆控制、紧急刹车、设置返航点、避障开关。",
+                "description": "Mavic 4E/4T 飞行控制。安全提示：SDK 控制期间遥控器摇杆无效，切换档位(T/P/S)可立即夺回控制权。",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -513,16 +513,22 @@ class FlightPlugin:
                             "type": "string",
                             "enum": [
                                 "start", "stop",
-                                "takeoff", "land", "go_home", "cancel_go_home",
+                                "takeoff", "land", "confirm_landing", "go_home", "cancel_go_home",
                                 "move", "stop_move",
                                 "rotate_start", "rotate_stop",
                                 "set_home", "set_obstacle_avoidance",
                             ],
                         },
-                        "vx": {"type": "number", "description": "前进速度 (m/s)，正=前"},
-                        "vy": {"type": "number", "description": "侧移速度 (m/s)，正=右"},
-                        "vz": {"type": "number", "description": "升降速度 (m/s)，正=上"},
-                        "vyaw": {"type": "number", "description": "偏航角速度 (deg/s)，正=顺时针"},
+                        "vx": {"type": "number", "description": "前进速度 (m/s)，正=前，范围 -15~15", "minimum": -15, "maximum": 15},
+                        "vy": {"type": "number", "description": "侧移速度 (m/s)，正=右，范围 -15~15", "minimum": -15, "maximum": 15},
+                        "vz": {"type": "number", "description": "升降速度 (m/s)，正=上，范围 -6~6", "minimum": -6, "maximum": 6},
+                        "vyaw": {"type": "number", "description": "偏航角速度 (deg/s)，正=顺时针，范围 -75~75", "minimum": -75, "maximum": 75},
+                        "duration": {"type": "number", "description": "持续时间(秒), -1=持续到stop_move", "default": 1},
+                        "require_rc_confirm": {
+                            "type": "boolean",
+                            "description": "降落是否需要遥控器确认 (true=需确认, false=自动确认)",
+                            "default": True,
+                        },
                         "lat": {"type": "number", "description": "纬度 (返航点)"},
                         "lon": {"type": "number", "description": "经度 (返航点)"},
                         "enabled": {
@@ -539,14 +545,18 @@ class FlightPlugin:
                     "required": ["action"],
                 "x-action-params": {
                     "takeoff": {"params": [], "description": "起飞 (自动悬停在1.2m)"},
-                    "land": {"params": [], "description": "降落"},
+                    "land": {
+                        "params": ["require_rc_confirm"],
+                        "description": "降落 (require_rc_confirm: true=需遥控器确认, false=自动确认)",
+                    },
+                    "confirm_landing": {"params": [], "description": "确认降落 (飞机悬停等待确认时调用)"},
                     "go_home": {"params": [], "description": "返航 (飞回返航点)"},
                     "cancel_go_home": {"params": [], "description": "取消返航"},
                     "move": {
-                        "params": ["vx", "vy", "vz", "vyaw"],
-                        "description": "摇杆控制 — 设置速度向量 (需先获取控制权)",
+                        "params": ["vx", "vy", "vz", "vyaw", "duration"],
+                        "description": "持续摇杆控制 — 设置速度向量 (duration秒后自动停止, -1=持续到stop_move)",
                     },
-                    "stop_move": {"params": [], "description": "紧急刹车 (悬停)"},
+                    "stop_move": {"params": [], "description": "停止运动并悬停"},
                     "rotate_start": {"params": [], "description": "启动电机旋转桨叶 (全速)"},
                     "rotate_stop": {"params": [], "description": "停止电机 (仅地面可用)"},
                     "set_home": {
@@ -582,8 +592,20 @@ class FlightPlugin:
             resp = self._bridge.takeoff()
             return {"ret": 0 if resp.get("ok") else -1, "action": "takeoff"}
         if action == "land":
-            resp = self._bridge.land()
-            return {"ret": 0 if resp.get("ok") else -1, "action": "land"}
+            require_rc = args.get("require_rc_confirm", True)
+            if isinstance(require_rc, str):
+                require_rc = require_rc.lower() not in ("false", "0", "no")
+            auto_confirm = not require_rc
+            resp = self._bridge.land(auto_confirm=auto_confirm)
+            if resp.get("ok"):
+                msg = resp.get("data", {}).get("message", "Landing initiated")
+                return {"ret": 0, "message": msg}
+            return {"ret": -1, "data": resp.get("data", {})}
+        if action == "confirm_landing":
+            resp = self._bridge.confirm_landing()
+            if resp.get("ok"):
+                return {"ret": 0, "message": "Landing confirmed"}
+            return {"ret": -1, "data": resp.get("data", {})}
         if action == "go_home":
             resp = self._bridge.go_home()
             return {"ret": 0 if resp.get("ok") else -1, "action": "go_home"}
@@ -591,22 +613,33 @@ class FlightPlugin:
             resp = self._bridge.cancel_go_home()
             return {"ret": 0 if resp.get("ok") else -1}
         if action == "move":
-            if not self._has_authority:
-                auth = self._bridge.obtain_joystick_authority()
-                if auth.get("ok"):
-                    self._has_authority = True
-                else:
-                    return {"ret": -1, "error": "Failed to obtain joystick authority"}
+            # Always obtain authority — C layer releases it after each move
+            auth = self._bridge.obtain_joystick_authority()
+            if not auth.get("ok"):
+                return {"ret": -1, "error": "Failed to obtain joystick authority", "data": auth.get("data", {})}
+            duration = args.get("duration", 1)
+            try:
+                duration = float(duration)
+            except (TypeError, ValueError):
+                duration = -1
+            # Clamp velocities to Mavic 4E/4T limits
+            vx = max(-15, min(15, float(args.get("vx", 0))))
+            vy = max(-15, min(15, float(args.get("vy", 0))))
+            vz = max(-6, min(6, float(args.get("vz", 0))))
+            vyaw = max(-75, min(75, float(args.get("vyaw", 0))))
             resp = self._bridge.joystick_move(
-                vx=args.get("vx", 0),
-                vy=args.get("vy", 0),
-                vz=args.get("vz", 0),
-                vyaw=args.get("vyaw", 0),
+                vx=vx, vy=vy, vz=vz, vyaw=vyaw,
+                duration=duration,
             )
-            return {"ret": 0 if resp.get("ok") else -1, "vx": args.get("vx", 0)}
+            if resp.get("ok"):
+                msg = resp.get("data", {}).get("message", "Moving")
+                return {"ret": 0, "message": msg}
+            return {"ret": -1, "data": resp.get("data", {})}
         if action == "stop_move":
-            resp = self._bridge.emergency_brake()
-            return {"ret": 0 if resp.get("ok") else -1, "action": "brake"}
+            resp = self._bridge.stop_move()
+            if resp.get("ok"):
+                return {"ret": 0, "message": "Stopped, hovering"}
+            return {"ret": -1, "data": resp.get("data", {})}
         if action == "rotate_start":
             resp = self._bridge.turn_on_motors()
             return {"ret": 0 if resp.get("ok") else -1, "action": "rotate_start"}
@@ -643,7 +676,7 @@ class CameraPlugin:
         return {
             "name": "camera",
             "type": "actuator",
-            "description": "Mavic 4E/4T 相机管理：拍照、录像、变焦、对焦、曝光、存储查询、红外测温(4T)。",
+            "description": "Mavic 4E/4T 相机管理：拍照、录像、变焦、对焦、曝光、存储查询、红外测温(3T)。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -686,7 +719,7 @@ class CameraPlugin:
                     "get_storage": {"params": [], "description": "查询存储卡剩余容量"},
                     "ir_temp_point": {
                         "params": ["point_x", "point_y"],
-                        "description": "红外点测温 (仅4T型号)",
+                        "description": "红外点测温 (仅3T型号)",
                     },
                     "ir_temp_area": {
                         "params": ["ltx", "lty", "rbx", "rby"],
@@ -760,7 +793,7 @@ class CameraPlugin:
 class GimbalPlugin:
     PREFIX = "gimbal"
 
-    # Mavic 4E gimbal range (narrower than M300/M350)
+    # Mavic 4E/4T gimbal range (narrower than M300/M350)
     PITCH_RANGE = (-90, 35)
     YAW_RANGE = (-40, 40)
 

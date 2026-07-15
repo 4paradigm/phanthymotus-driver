@@ -187,6 +187,14 @@ int liveview_start(const char *camera, liveview_frame_cb_t cb) {
     /* Stop any existing stream first */
     DjiLiveview_StopH264Stream(pos, s_camera_source);
 
+    /* Flush FFmpeg decoder state for clean switch */
+    pthread_mutex_lock(&s_decode_mutex);
+    if (s_codec_ctx) avcodec_flush_buffers(s_codec_ctx);
+    s_frame_count = 0;
+    s_src_width = 0;
+    s_src_height = 0;
+    pthread_mutex_unlock(&s_decode_mutex);
+
     /* Determine liveview source and optionally switch stream source */
     if (strcmp(camera, "ir") == 0) {
         s_camera_source = DJI_LIVEVIEW_CAMERA_SOURCE_M4T_IR;

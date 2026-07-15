@@ -503,69 +503,100 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
 
     /* Flight control */
     if (strstr(raw_json, "\"takeoff\"")) {
-        int r = flight_ctrl_takeoff();
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        int64_t r = flight_ctrl_takeoff();
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
-    if (strstr(raw_json, "\"land\"")) {
-        int r = flight_ctrl_land();
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+    if (strstr(raw_json, "\"land\"") && !strstr(raw_json, "\"confirm_land")) {
+        if (strstr(raw_json, "\"auto_confirm\"")) {
+            int64_t r = flight_ctrl_land_auto_confirm();
+            if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0,\"message\":\"Landing completed (auto-confirmed)\"}}");
+            else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
+        } else {
+            int64_t r = flight_ctrl_land();
+            if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0,\"message\":\"Landing initiated. Please confirm on RC when prompted.\"}}");
+            else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
+        }
+        return 0;
+    }
+    if (strstr(raw_json, "\"confirm_landing\"")) {
+        int64_t r = flight_ctrl_confirm_landing();
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0,\"message\":\"Landing confirmed\"}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"go_home\"") && !strstr(raw_json, "\"cancel_go_home\"")) {
-        int r = flight_ctrl_go_home();
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        int64_t r = flight_ctrl_go_home();
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"cancel_go_home\"")) {
-        int r = flight_ctrl_cancel_go_home();
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        int64_t r = flight_ctrl_cancel_go_home();
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"emergency_brake\"")) {
-        int r = flight_ctrl_emergency_brake();
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        int64_t r = flight_ctrl_emergency_brake();
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"rotate_start\"") && !strstr(raw_json, "\"slow_rotate_start\"")) {
-        int r = flight_ctrl_turn_on_motors();
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        int64_t r = flight_ctrl_turn_on_motors();
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"rotate_stop\"") && !strstr(raw_json, "\"slow_rotate_stop\"")) {
-        int r = flight_ctrl_turn_off_motors();
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        int64_t r = flight_ctrl_turn_off_motors();
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"slow_rotate_start\"")) {
-        int r = flight_ctrl_slow_rotate_start();
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        int64_t r = flight_ctrl_slow_rotate_start();
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"slow_rotate_stop\"")) {
-        int r = flight_ctrl_slow_rotate_stop();
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        int64_t r = flight_ctrl_slow_rotate_stop();
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"obtain_joystick_authority\"")) {
-        int r = flight_ctrl_obtain_authority();
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        int64_t r = flight_ctrl_obtain_authority();
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"release_joystick_authority\"")) {
-        int r = flight_ctrl_release_authority();
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        int64_t r = flight_ctrl_release_authority();
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"joystick_move\"")) {
-        float vx = 0, vy = 0, vz = 0, vyaw = 0;
+        float vx = 0, vy = 0, vz = 0, vyaw = 0, duration = 1;
         const char *p;
         if ((p = strstr(raw_json, "\"vx\""))) { p = strchr(p, ':'); if (p) vx = (float)atof(p+1); }
         if ((p = strstr(raw_json, "\"vy\""))) { p = strchr(p, ':'); if (p) vy = (float)atof(p+1); }
         if ((p = strstr(raw_json, "\"vz\""))) { p = strchr(p, ':'); if (p) vz = (float)atof(p+1); }
         if ((p = strstr(raw_json, "\"vyaw\""))) { p = strchr(p, ':'); if (p) vyaw = (float)atof(p+1); }
-        int r = flight_ctrl_joystick_move(vx, vy, vz, vyaw);
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        if ((p = strstr(raw_json, "\"duration\""))) { p = strchr(p, ':'); if (p) duration = (float)atof(p+1); }
+        int64_t r = flight_ctrl_joystick_move(vx, vy, vz, vyaw, duration);
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0,\"message\":\"Moving (duration=%.1fs)\"}}",  duration);
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
+        return 0;
+    }
+    if (strstr(raw_json, "\"stop_move\"")) {
+        int64_t r = flight_ctrl_stop_move();
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0,\"message\":\"Stopped, hovering\"}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"set_home\"")) {
@@ -573,8 +604,9 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
         const char *p;
         if ((p = strstr(raw_json, "\"lat\""))) { p = strchr(p, ':'); if (p) lat = atof(p+1); }
         if ((p = strstr(raw_json, "\"lon\""))) { p = strchr(p, ':'); if (p) lon = atof(p+1); }
-        int r = flight_ctrl_set_home(lat, lon);
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        int64_t r = flight_ctrl_set_home(lat, lon);
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"set_obstacle_avoidance\"")) {
@@ -583,25 +615,29 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
         if (strstr(raw_json, "\"horizontal\"")) dir = "horizontal";
         else if (strstr(raw_json, "\"upward\"")) dir = "upward";
         else if (strstr(raw_json, "\"downward\"")) dir = "downward";
-        int r = flight_ctrl_set_obstacle_avoidance(enabled, dir);
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        int64_t r = flight_ctrl_set_obstacle_avoidance(enabled, dir);
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
 
     /* Camera */
     if (strstr(raw_json, "\"take_photo\"")) {
         int r = camera_mgr_take_photo("single");
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"start_video\"")) {
         int r = camera_mgr_start_video();
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"stop_video\"")) {
         int r = camera_mgr_stop_video();
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"set_zoom\"")) {
@@ -612,7 +648,8 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
             if (fp) factor = (float)atof(fp + 1);
         }
         int r = camera_mgr_set_zoom(factor);
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"set_focus\"")) {
@@ -622,7 +659,8 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
         if (xp) { xp = strchr(xp, ':'); if (xp) x = (float)atof(xp + 1); }
         if (yp) { yp = strchr(yp, ':'); if (yp) y = (float)atof(yp + 1); }
         int r = camera_mgr_set_focus(x, y);
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"set_exposure\"")) {
@@ -633,7 +671,8 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
         if ((p = strstr(raw_json, "\"shutter_speed\""))) { p = strchr(p, ':'); if (p) shutter = (float)atof(p+1); }
         if ((p = strstr(raw_json, "\"ev\""))) { p = strchr(p, ':'); if (p) ev = (float)atof(p+1); }
         int r = camera_mgr_set_exposure(iso, aperture, shutter, ev);
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"get_storage\"")) {
@@ -676,7 +715,8 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
         if ((p = strstr(raw_json, "\"duration\""))) { p = strchr(p, ':'); if (p) duration = (float)atof(p+1); }
         if (strstr(raw_json, "\"relative\"")) mode = "relative";
         int r = gimbal_mgr_rotate(pitch, yaw, roll, mode, duration);
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"gimbal_set_mode\"")) {
@@ -684,12 +724,14 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
         if (strstr(raw_json, "\"follow\"")) mode = "follow";
         else if (strstr(raw_json, "\"fpv\"")) mode = "fpv";
         int r = gimbal_mgr_set_mode(mode);
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"gimbal_reset\"")) {
         int r = gimbal_mgr_reset();
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"gimbal_get_angles\"")) {
@@ -703,22 +745,26 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
     /* Waypoint */
     if (strstr(raw_json, "\"waypoint_start\"")) {
         int r = waypoint_start();
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"waypoint_pause\"")) {
         int r = waypoint_pause();
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"waypoint_resume\"")) {
         int r = waypoint_resume();
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"waypoint_stop\"")) {
         int r = waypoint_stop();
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"waypoint_status\"")) {
@@ -802,7 +848,7 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
             case 60: type_name = "Matrice 300 RTK"; break;
             case 67: type_name = "Matrice 30"; break;
             case 68: type_name = "Matrice 30T"; break;
-            case 77: type_name = "Mavic 3E"; break;
+            case 77: type_name = "Mavic 4E"; break;
             case 78: type_name = "FlyCart 30"; break;
             case 79: type_name = "Mavic 3T"; break;
             case 80: type_name = "Mavic 3TA"; break;
