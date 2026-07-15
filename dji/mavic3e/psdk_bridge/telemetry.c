@@ -165,7 +165,8 @@ int telemetry_get_json(char *buf, size_t buflen) {
         "\"right_stick_x\":%d,\"right_stick_y\":%d},"
         "\"flight_status\":%d,\"flight_mode\":%d"
         "}",
-        (double)s_gps_pos.x / 1e7, (double)s_gps_pos.y / 1e7,
+        /* GPS_POSITION: x=Longitude, y=Latitude, z=Altitude(mm) — per PSDK docs */
+        (double)s_gps_pos.y / 1e7, (double)s_gps_pos.x / 1e7,
         (double)s_gps_pos.z / 1000.0,
         (double)s_alt_fused, (double)s_alt_home,
         q0, q1, q2, q3, yaw, pitch, roll,
