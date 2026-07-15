@@ -375,13 +375,8 @@ class BridgeClient:
     def takeoff(self):
         return self._call("takeoff")
 
-    def land(self, auto_confirm: bool = False):
-        if auto_confirm:
-            return self._call("land", {"auto_confirm": True})
+    def land(self):
         return self._call("land")
-
-    def confirm_landing(self):
-        return self._call("confirm_landing")
 
     def go_home(self):
         return self._call("go_home")
@@ -390,8 +385,11 @@ class BridgeClient:
         return self._call("cancel_go_home")
 
     def joystick_move(self, vx: float = 0, vy: float = 0, vz: float = 0,
-                      vyaw: float = 0):
-        return self._call("joystick_move", {"vx": vx, "vy": vy, "vz": vz, "vyaw": vyaw})
+                      vyaw: float = 0, duration: float = -1):
+        return self._call("joystick_move", {"vx": vx, "vy": vy, "vz": vz, "vyaw": vyaw, "duration": duration})
+
+    def stop_move(self):
+        return self._call("stop_move")
 
     def emergency_brake(self):
         return self._call("emergency_brake")
