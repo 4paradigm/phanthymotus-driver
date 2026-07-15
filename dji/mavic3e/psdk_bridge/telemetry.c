@@ -158,7 +158,7 @@ int telemetry_get_json(char *buf, size_t buflen) {
     snprintf(buf, buflen,
         "{"
         "\"position\":{\"latitude\":%.8f,\"longitude\":%.8f,\"altitude\":%.2f,"
-        "\"altitude_fused\":%.2f,\"home_altitude\":%.2f},"
+        "\"altitude_fused\":%.2f,\"home_altitude\":%.2f,\"relative_height\":%.2f},"
         "\"attitude\":{\"quaternion\":[%.4f,%.4f,%.4f,%.4f],"
         "\"yaw\":%.2f,\"pitch\":%.2f,\"roll\":%.2f},"
         "\"velocity\":{\"vx\":%.3f,\"vy\":%.3f,\"vz\":%.3f},"
@@ -175,6 +175,7 @@ int telemetry_get_json(char *buf, size_t buflen) {
         (double)s_gps_pos.y / 1e7, (double)s_gps_pos.x / 1e7,
         (double)s_gps_pos.z / 1000.0,
         (double)s_alt_fused, (double)s_alt_home,
+        (double)(s_alt_fused - s_alt_home),
         q0, q1, q2, q3, yaw, pitch, roll,
         (double)s_velocity.data.x, (double)s_velocity.data.y, (double)s_velocity.data.z,
         (int)s_battery.batteryCapacityPercent, (double)s_battery.currentVoltage / 1000.0,
