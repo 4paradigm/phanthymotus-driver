@@ -612,12 +612,10 @@ class FlightPlugin:
             resp = self._bridge.cancel_go_home()
             return {"ret": 0 if resp.get("ok") else -1}
         if action == "move":
-            if not self._has_authority:
-                auth = self._bridge.obtain_joystick_authority()
-                if auth.get("ok"):
-                    self._has_authority = True
-                else:
-                    return {"ret": -1, "error": "Failed to obtain joystick authority"}
+            # Always obtain authority — C layer releases it after each move
+            auth = self._bridge.obtain_joystick_authority()
+            if not auth.get("ok"):
+                return {"ret": -1, "error": "Failed to obtain joystick authority", "data": auth.get("data", {})}
             duration = args.get("duration", 1)
             try:
                 duration = float(duration)
