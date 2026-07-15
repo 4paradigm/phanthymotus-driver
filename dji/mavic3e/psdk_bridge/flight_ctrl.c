@@ -27,6 +27,8 @@ static pthread_mutex_t s_move_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void *_move_loop(void *arg) {
     (void)arg;
+    printf("[flight] move thread started (vx=%.1f vy=%.1f vz=%.1f vyaw=%.1f dur=%.1f)\n",
+           s_move_vx, s_move_vy, s_move_vz, s_move_vyaw, s_move_duration);
     T_DjiFlightControllerJoystickMode mode = {
         .horizontalControlMode = DJI_FLIGHT_CONTROLLER_HORIZONTAL_VELOCITY_CONTROL_MODE,
         .verticalControlMode = DJI_FLIGHT_CONTROLLER_VERTICAL_VELOCITY_CONTROL_MODE,
@@ -59,20 +61,31 @@ static void *_move_loop(void *arg) {
             break;
         }
     }
+    printf("[flight] move thread exited (tick=%d)\n", tick);
     return NULL;
 }
 
 /* ── Authority event callback ─────────────────────────────────────── */
 
 static T_DjiReturnCode _authority_event_cb(T_DjiFlightControllerJoystickCtrlAuthorityEventInfo eventData) {
-    if (eventData.curJoystickCtrlAuthority != 4 /* OSDK/PSDK */) {
-        /* RC or other module took authority — stop move immediately */
+    const char *owner = "unknown";
+    switch (eventData.curJoystickCtrlAuthority) {
+        case 0: owner = "RC"; break;
+        case 1: owner = "MSDK"; break;
+        case 2: owner = "INTERNAL"; break;
+        case 4: owner = "PSDK"; break;
+    }
+    printf("[flight] authority changed → %s (event=%d)\n",
+           owner, eventData.joystickCtrlAuthoritySwitchEvent);
+
+    if (eventData.curJoystickCtrlAuthority != 4 /* PSDK */) {
         if (s_move_active) {
-            printf("[flight] authority lost (event=%d), stopping move\n",
-                   eventData.joystickCtrlAuthoritySwitchEvent);
+            printf("[flight] RC took authority, stopping move thread\n");
             s_move_active = 0;
         }
         s_has_authority = 0;
+    } else {
+        s_has_authority = 1;
     }
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
@@ -96,14 +109,17 @@ int64_t flight_ctrl_obtain_authority(void) {
     T_DjiReturnCode rc = DjiFlightController_ObtainJoystickCtrlAuthority();
     if (rc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
         s_has_authority = 1;
+        printf("[flight] joystick authority obtained\n");
         return 0;
     }
+    printf("[flight] obtain authority failed: 0x%08llX\n", (unsigned long long)rc);
     return (int64_t)rc;
 }
 
 int64_t flight_ctrl_release_authority(void) {
     T_DjiReturnCode rc = DjiFlightController_ReleaseJoystickCtrlAuthority();
     s_has_authority = 0;
+    printf("[flight] joystick authority released (rc=0x%08llX)\n", (unsigned long long)rc);
     return (rc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) ? 0 : (int64_t)rc;
 }
 
