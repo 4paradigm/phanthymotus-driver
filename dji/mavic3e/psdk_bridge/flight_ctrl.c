@@ -2,6 +2,7 @@
 #include "error_code.h"
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 /*
  * PSDK Flight Controller for Mavic 3E/3T.
@@ -48,6 +49,20 @@ int64_t flight_ctrl_takeoff(void) {
 
 int64_t flight_ctrl_land(void) {
     T_DjiReturnCode rc = DjiFlightController_StartLanding();
+    return (rc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) ? 0 : (int64_t)rc;
+}
+
+int64_t flight_ctrl_confirm_landing(void) {
+    T_DjiReturnCode rc = DjiFlightController_StartConfirmLanding();
+    return (rc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) ? 0 : (int64_t)rc;
+}
+
+int64_t flight_ctrl_land_auto_confirm(void) {
+    T_DjiReturnCode rc = DjiFlightController_StartLanding();
+    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) return (int64_t)rc;
+    /* Wait for aircraft to reach low altitude before confirming */
+    usleep(4000000);  /* 4 seconds */
+    rc = DjiFlightController_StartConfirmLanding();
     return (rc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) ? 0 : (int64_t)rc;
 }
 
@@ -142,6 +157,8 @@ void flight_ctrl_cleanup(void) {
 int flight_ctrl_init(void) { printf("[flight] stub mode\n"); return 0; }
 int64_t flight_ctrl_takeoff(void) { return 0; }
 int64_t flight_ctrl_land(void) { return 0; }
+int64_t flight_ctrl_confirm_landing(void) { return 0; }
+int64_t flight_ctrl_land_auto_confirm(void) { return 0; }
 int64_t flight_ctrl_go_home(void) { return 0; }
 int64_t flight_ctrl_cancel_go_home(void) { return 0; }
 int64_t flight_ctrl_joystick_move(float vx, float vy, float vz, float vyaw) { return 0; }

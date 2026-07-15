@@ -512,7 +512,7 @@ class FlightPlugin:
                             "type": "string",
                             "enum": [
                                 "start", "stop",
-                                "takeoff", "land", "go_home", "cancel_go_home",
+                                "takeoff", "land", "confirm_landing", "go_home", "cancel_go_home",
                                 "move", "stop_move",
                                 "rotate_start", "rotate_stop",
                                 "set_home", "set_obstacle_avoidance",
@@ -538,7 +538,11 @@ class FlightPlugin:
                     "required": ["action"],
                 "x-action-params": {
                     "takeoff": {"params": [], "description": "起飞 (自动悬停在1.2m)"},
-                    "land": {"params": [], "description": "降落"},
+                    "land": {
+                        "params": ["require_rc_confirm"],
+                        "description": "降落 (require_rc_confirm: true=需遥控器确认, false=自动确认)",
+                    },
+                    "confirm_landing": {"params": [], "description": "确认降落 (飞机悬停等待确认时调用)"},
                     "go_home": {"params": [], "description": "返航 (飞回返航点)"},
                     "cancel_go_home": {"params": [], "description": "取消返航"},
                     "move": {
@@ -581,8 +585,20 @@ class FlightPlugin:
             resp = self._bridge.takeoff()
             return {"ret": 0 if resp.get("ok") else -1, "action": "takeoff"}
         if action == "land":
-            resp = self._bridge.land()
-            return {"ret": 0 if resp.get("ok") else -1, "action": "land"}
+            require_rc = args.get("require_rc_confirm", True)
+            if isinstance(require_rc, str):
+                require_rc = require_rc.lower() not in ("false", "0", "no")
+            auto_confirm = not require_rc
+            resp = self._bridge.land(auto_confirm=auto_confirm)
+            if resp.get("ok"):
+                msg = resp.get("data", {}).get("message", "Landing initiated")
+                return {"ret": 0, "message": msg}
+            return {"ret": -1, "data": resp.get("data", {})}
+        if action == "confirm_landing":
+            resp = self._bridge.confirm_landing()
+            if resp.get("ok"):
+                return {"ret": 0, "message": "Landing confirmed"}
+            return {"ret": -1, "data": resp.get("data", {})}
         if action == "go_home":
             resp = self._bridge.go_home()
             return {"ret": 0 if resp.get("ok") else -1, "action": "go_home"}
