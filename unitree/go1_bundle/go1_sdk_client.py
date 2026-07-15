@@ -12,9 +12,11 @@ rclpy 可同进程共存 → 状态卡能发 ROS2 topic 在画布渲染。
 【降级 / STUB】导入不到 robot_interface（如开发机 Mac、无硬件）时进入 STUB：不收发、
 snapshot 为空（fresh=False）。MCP server 仍能起、注册、列 tool，方便无硬件时跑通链路。
 
-【要加“运控卡”的后来者看这里】本文件刻意**不含**任何下发命令的原语（move/set_mode/
-power_off 等）与低层 LowCmd/Safety —— 因为 go1_bundle 只读。若要新增控制卡，见 CONTRIBUTING.md
-“新增控制卡”一节：需要引入 HighCmd、加锁合成、并在 _loop() 里 SetSend(cmd)。
+【控制原语（后来者看这里）】本文件原为只读；为支持控制卡（spin），已按 CONTRIBUTING.md
+"新增控制卡"一节加入**最小高层下发能力**：`move(vx,vy,vyaw,gait)` / `stop_move()` 加锁写
+目标，`_loop()` 每周期 `_compose_cmd()` 合成 `HighCmd` 后 `SetSend`。默认无目标时仍发 idle
+心跳（mode=0），状态卡不受影响；move 带 0.5s 看门狗，停发即自动回 idle。低层 LowCmd/Safety
+（关节控制，目标 .10:8007，与高层互斥）仍未引入，需要时另起 LOWLEVEL client。
 """
 
 from __future__ import annotations
@@ -32,6 +34,13 @@ HIGH_TARGET_PORT = 8082
 HIGH_LOCAL_PORT = 8090
 
 LOOP_HZ = 500.0        # 后台收发频率（高层 2ms 亦可）
+
+# ── 控制原语量程（高层 HighCmd 运动；spin 等控制卡用）───────────────────────────
+#   量程取 Go1 高层安全值；控制卡应先自校验拒绝越界，client 再 clamp 作兜底。
+VX_MAX = 1.0            # 前后 m/s
+VY_MAX = 0.6            # 平移 m/s
+VYAW_MAX = 2.0          # 偏航 rad/s
+MOVE_WATCHDOG_S = 0.5   # 看门狗：超过此时长无新 move → 自动回 idle(mode=0) 停下（控制卡停发即自停）
 
 # HighState.mode（Go1 legacy comm.h）
 MODE_NAMES = {0: "idle", 1: "force_stand", 2: "walk", 5: "stand_down",
@@ -176,6 +185,9 @@ class Go1HighSdkClient:
         self._running = False
         self._thread = None
         self._snapshot: dict = {}
+        # 控制目标（move()/stop_move() 写，_loop 读并合成 HighCmd）；None=只发 idle 心跳。
+        self._move_cmd = None       # (vx, vy, vyaw, gait) 或 None
+        self._move_deadline = 0.0   # monotonic 截止；过期即回 idle
         self._init_sdk()
 
     def _init_sdk(self) -> None:
@@ -208,7 +220,8 @@ class Go1HighSdkClient:
             try:
                 self._udp.Recv()
                 self._udp.GetRecv(self._state)
-                self._udp.SetSend(self._cmd)   # 空闲心跳（mode=0）
+                self._compose_cmd()            # 合成 _cmd：默认 idle；有 move 目标且未过期则下发速度
+                self._udp.SetSend(self._cmd)
                 self._udp.Send()
                 self._parse_state(self._state)
             except Exception as e:
@@ -253,6 +266,54 @@ class Go1HighSdkClient:
                 self._snapshot = out
         except Exception as e:
             print(f"[Go1HighSdk] parse_state error: {e}", flush=True)
+
+    # ── 控制原语（CONTRIBUTING §4：让只读 client 具备下发能力，供 spin 等控制卡用）──
+    #   默认不动：无 move 目标时 _compose_cmd 发 idle(mode=0)，loco_state/battery 等状态卡不受影响。
+    @staticmethod
+    def _clamp(v, lim):
+        try:
+            return max(-lim, min(lim, float(v)))
+        except Exception:
+            return 0.0
+
+    def move(self, vx=0.0, vy=0.0, vyaw=0.0, gait=1):
+        """设置一次高层速度目标（mode=2）并刷新看门狗；后台 _loop 下发。
+        控制卡按节奏（如每 50ms）重发以持续运动，停发 0.5s 后自动回 idle 停下。"""
+        vx = self._clamp(vx, VX_MAX)
+        vy = self._clamp(vy, VY_MAX)
+        vyaw = self._clamp(vyaw, VYAW_MAX)
+        with self._lock:
+            self._move_cmd = (vx, vy, vyaw, int(gait))
+            self._move_deadline = time.monotonic() + MOVE_WATCHDOG_S
+        return {"vx": vx, "vy": vy, "vyaw": vyaw, "gait": int(gait)}
+
+    def stop_move(self):
+        """清除速度目标 → 下一循环回 idle(mode=0) 停下站稳。"""
+        with self._lock:
+            self._move_cmd = None
+            self._move_deadline = 0.0
+
+    def _compose_cmd(self) -> None:
+        """按当前 move 目标 + 看门狗合成 _cmd：默认 idle(mode=0)；目标有效则速度(mode=2)。"""
+        if self._cmd is None:
+            return
+        now = time.monotonic()
+        with self._lock:
+            mc = self._move_cmd if (self._move_cmd is not None and now < self._move_deadline) else None
+        try:
+            if mc is None:
+                self._cmd.mode = 0
+                self._cmd.gaitType = 0
+                self._cmd.velocity = [0.0, 0.0]
+                self._cmd.yawSpeed = 0.0
+            else:
+                vx, vy, vyaw, gait = mc
+                self._cmd.mode = 2
+                self._cmd.gaitType = int(gait)
+                self._cmd.velocity = [float(vx), float(vy)]
+                self._cmd.yawSpeed = float(vyaw)
+        except Exception as e:  # noqa: BLE001
+            print(f"[Go1HighSdk] compose_cmd error: {e}", flush=True)
 
     def snapshot(self) -> dict:
         with self._lock:
