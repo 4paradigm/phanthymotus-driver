@@ -26,6 +26,13 @@ plugins:
     enabled: true
   udp_diagnostics:              # UDP 通信健康：收发计数与 CRC/丢包/标志错误计数
     enabled: true
+  # ── li 移植（joints/remote_controller，已在实机 go1 验证）──
+  joints:                       # 12 腿关节 q/dq/tau/temp（骨架渲染，需 model 卡提供 URDF）
+    enabled: true
+  remote_controller:            # 无线遥控器 16 按键 + 5 摇杆轴（HighState.wirelessRemote[40]）
+    enabled: true
+  model:                        # (resource) 返回 go1 四足 URDF，供 joints 骨架渲染成狗
+    enabled: true
 
   # ── 控制卡（下发 HighCmd；须真机验证量程+安全后上架）──
   beep:                         # 头部扬声器 beep 动作卡 → Nano beep_adapter.py（:18082 /v1/beep/actions）
