@@ -1,5 +1,6 @@
 #include "telemetry.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 
@@ -194,6 +195,18 @@ float telemetry_get_altitude(void) {
     return (float)(s_alt_fused - s_alt_home);
 }
 
+int telemetry_get_rc_stick_max(void) {
+    int vals[4] = {
+        abs(s_rc.roll), abs(s_rc.pitch),
+        abs(s_rc.yaw), abs(s_rc.throttle)
+    };
+    int mx = 0;
+    for (int i = 0; i < 4; i++) {
+        if (vals[i] > mx) mx = vals[i];
+    }
+    return mx;
+}
+
 void telemetry_cleanup(void) {
     DjiFcSubscription_DeInit();
     printf("[telemetry] cleaned up\n");
@@ -223,6 +236,7 @@ int telemetry_get_json(char *buf, size_t buflen) {
 int telemetry_get_gps_satellite_count(void) { return 0; }
 int telemetry_get_display_mode(void) { return 0; }
 float telemetry_get_altitude(void) { return 0; }
+int telemetry_get_rc_stick_max(void) { return 0; }
 void telemetry_cleanup(void) {}
 
 #endif
