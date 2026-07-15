@@ -23,6 +23,10 @@ int telemetry_get_display_mode(void);
 /* Get current fused altitude above home point (meters) */
 float telemetry_get_altitude(void);
 
+/* Get max absolute value of RC stick channels (range 0-10000).
+ * Returns 0 if sticks centered. >500 means pilot is actively pushing. */
+int telemetry_get_rc_stick_max(void);
+
 /* Cleanup telemetry subscriptions. */
 void telemetry_cleanup(void);
 

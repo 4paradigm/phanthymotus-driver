@@ -51,6 +51,16 @@ static void *_move_loop(void *arg) {
         usleep(20000);  /* 50Hz */
         tick++;
 
+        /* Check RC stick input — pilot override */
+        int rc_max = telemetry_get_rc_stick_max();
+        if (rc_max > 500) {  /* 5% deadzone */
+            printf("[flight] RC stick input detected (%d), stopping move\n", rc_max);
+            s_move_active = 0;
+            DjiFlightController_ReleaseJoystickCtrlAuthority();
+            s_has_authority = 0;
+            break;
+        }
+
         /* Check duration limit */
         if (dur > 0 && (tick * 0.02f) >= dur) {
             printf("[flight] move duration %.1fs reached, releasing authority to RC\n", dur);
