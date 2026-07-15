@@ -23,9 +23,11 @@ plugins:
     receive_ip: "192.168.123.161"   # 接收端(本驱动所在 Pi)IP；Adapter 把图像帧定向发到这里，勿硬编码进代码
     probe_timeout_sec: 5.0          # 启动探测 front 控制口的超时；须 >相机开启耗时(SDK 初始化实测~3.4s)，
                                     # 太短会误判 front 不可达；无 adapter 的口是"连接被拒"即时返回，不吃满超时。
-    default_mode: "rectified_mono"  # raw_mono/raw_stereo/rectified_mono/rectified_stereo
+    default_mode: "raw_mono"        # raw_mono/raw_stereo/rectified_mono/rectified_stereo
+                                    # ★ 帧率关键：raw_mono 跳过 Nano CPU 立体校正 → 帧率高且稳；
+                                    #   rectified_* 会对左右目都做校正(只用一路)，在 Nano ARM 上把帧率压得很低。
     default_frame_size: "928x400"   # 官方支持：1856x800@30 或 928x400@30/60
-    default_fps: 30
+    default_fps: 60                 # 928x400 支持 60；start 时下发给 Nano adapter 重开相机（想更省带宽可改 30）
     # 位置→板卡映射。本卡只启用 front；control_port 约定 = image_port+100，须与 camera_adapter 启动参数一致。
     positions:
       front: {board_ip: "192.168.123.13", device_id: 1, image_port: 9201, control_port: 9301}
