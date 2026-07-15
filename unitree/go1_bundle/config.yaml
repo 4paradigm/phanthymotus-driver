@@ -34,6 +34,8 @@ plugins:
     enabled: true
   gesture:                      # 表演/表情:作揖/点头/摇头/歪头/环视/跳舞/俯卧撑/坐/昂首等(异步)
     enabled: true
+  switch_gait:                  # 步态切换：只设期望步态，实际运动由移动卡触发（trot_run/climb_stair/trot_obstacle 须 confirm）
+    enabled: true
 
   # ★ 新增卡：新建 <卡名>.py 后，在这里加一行 `<卡名>: { enabled: true }` 打开它。
   #   main.py 会按 config 里的 key 自动 import 同名模块（key == 模块名 == 文件名 == 卡名）。

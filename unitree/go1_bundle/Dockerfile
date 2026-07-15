@@ -38,6 +38,7 @@ COPY go1_sdk_client.py /work/go1_sdk_client.py
 COPY loco_state.py     /work/loco_state.py
 COPY battery.py        /work/battery.py
 COPY spin.py           /work/spin.py
+COPY switch_gait.py    /work/switch_gait.py
 COPY imu.py            /work/imu.py
 COPY feet.py           /work/feet.py
 COPY fall_alarm.py     /work/fall_alarm.py
