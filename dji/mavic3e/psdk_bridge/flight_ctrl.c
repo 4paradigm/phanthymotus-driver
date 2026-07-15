@@ -51,9 +51,10 @@ static void *_move_loop(void *arg) {
 
         /* Check duration limit */
         if (dur > 0 && (tick * 0.02f) >= dur) {
-            printf("[flight] move duration %.1fs reached, stopping\n", dur);
+            printf("[flight] move duration %.1fs reached, hovering\n", dur);
             s_move_active = 0;
-            DjiFlightController_ExecuteEmergencyBrakeAction();
+            /* Don't brake — just stop sending commands, aircraft will hover.
+             * EmergencyBrake releases joystick authority, breaking future moves. */
             break;
         }
     }
@@ -145,6 +146,12 @@ int64_t flight_ctrl_cancel_go_home(void) {
 /* ── Joystick move (continuous) ───────────────────────────────────── */
 
 int64_t flight_ctrl_joystick_move(float vx, float vy, float vz, float vyaw, float duration) {
+    /* Join previous thread if it finished */
+    if (!s_move_active && s_move_thread) {
+        pthread_join(s_move_thread, NULL);
+        s_move_thread = 0;
+    }
+
     pthread_mutex_lock(&s_move_mutex);
     s_move_vx = vx;
     s_move_vy = vy;
@@ -164,8 +171,11 @@ int64_t flight_ctrl_stop_move(void) {
     if (s_move_active) {
         s_move_active = 0;
         pthread_join(s_move_thread, NULL);
+        s_move_thread = 0;
     }
     T_DjiReturnCode rc = DjiFlightController_ExecuteEmergencyBrakeAction();
+    /* EmergencyBrake releases joystick authority — next move will re-obtain */
+    s_has_authority = 0;
     return (rc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) ? 0 : (int64_t)rc;
 }
 
@@ -174,8 +184,11 @@ int64_t flight_ctrl_emergency_brake(void) {
     if (s_move_active) {
         s_move_active = 0;
         pthread_join(s_move_thread, NULL);
+        s_move_thread = 0;
     }
     T_DjiReturnCode rc = DjiFlightController_ExecuteEmergencyBrakeAction();
+    /* EmergencyBrake releases joystick authority — next move will re-obtain */
+    s_has_authority = 0;
     return (rc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) ? 0 : (int64_t)rc;
 }
 
