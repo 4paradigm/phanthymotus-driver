@@ -1,0 +1,149 @@
+mcp_port: 15704
+ros_namespace: ""          # 留空则自动用主机名
+name: "Unitree Go1"
+
+# ── Go1 高层控制:三后端(auto 依次尝试 programming → subproc → legged_sdk) ─────────
+# backend = auto|programming|subproc|legged_sdk
+#   programming : robot_interface_high_level(Pi py3.7 直跑,已实机验证能驱动这条狗)。
+#   subproc     : ★卡片(容器 py3.10)用这个。py3.10 import 不了 py3.7 的 .so,故把运动隔离到
+#                 motion_worker.py(python3.7 子进程)跑同一个已验证 .so,主进程经 stdin/stdout 通信。
+#   legged_sdk  : 标准 unitree_legged_sdk 的 UDP HighCmd。⚠️实测被这条狗的 Legged_sport 静默丢弃
+#                 (Recv 恒 -1,协议/版本不匹配),暂不可用;保留待将来匹配固件 SDK 版本。
+robot:
+  backend: auto
+  # programming / subproc 共用:工厂 py3.7 绑定路径与模块名
+  sdk_build_path: "/home/pi/Unitree/autostart/programming/build"
+  sdk_module: "robot_interface_high_level"
+  modes: {idle: 0, stand: 1, walk: 2, stand_up: 6, stand_down: 5, damp: 7}
+  gaits: {trot: 1}
+  # subproc 后端参数(容器里 python3.7 可执行名 / worker 脚本路径,worker 默认取同目录)
+  py37_bin: "python3.7"
+  # worker_path: "/work/motion_worker.py"   # 默认 = go1_hl.py 同目录,一般不用填
+  # 容器里 worker 子进程的额外 LD 路径(挂载的 liblcm 等;宿主直跑留空,目录不存在会被忽略)
+  worker_ld_path: "/opt/go1_libs"
+  # legged_sdk 后端参数(暂不可用,见上)
+  legged_sdk_module: "robot_interface"
+  robot_ip: "192.168.123.161"
+  local_port: 8080
+  target_port: 8082
+  # 公共
+  rate_hz: 100
+  move_timeout: 1.0
+
+# ── MT 卡片(经典 SDK 14 卡)：与上面 robot(proprietary)互斥,同时只启一个核心 ──────
+# enabled: true 时改用 Go1Control(标准 unitree_legged_sdk v3.8.6:UDP HighCmd/LowCmd),
+# 提供 loco/switch_gait/body_pose/special_motion/joint_control/power_control + 8 状态卡。
+# 另含 6 张驱动增值卡(非 MT 14 卡,便于大模型自然语言指挥;实机只读已验证):
+#   perform      —— 表情/复合动作(点头/摇头/鞠躬/摇摆/伸懒腰/左顾右盼/打招呼/开心/抖/蹲/站高 + 转圈spin)
+#   robot_status —— 一键态势快照(后端/链路/站没站/在不在动/位置/宏进度/电量/能否运动+人话提示)
+#   fall_alarm   —— 跌倒/侧翻告警(IMU roll/pitch 幅度 → ok/tilted/fallen + 倾角)
+#   net          —— 网络健康(主机名/IPv4/Wi-Fi 信号;实机读到 wlan0 link 85)
+#   odometry     —— 里程计(position/yaw/累计路程/相对起点位移;reset_origin 重置)
+#   speed_gear   —— 速度档位(slow/normal/fast;闭环便捷动作 move_distance/turn_angle 缺省速度跟随)
+# ⚠️ 启用 MT 模式时,请把上面 plugins.* 里与之重复的 loco/state 关掉(enabled:false),避免重名工具。
+mt:
+  enabled: true                     # 开 MT 卡片
+  control_level: HIGHLEVEL          # HIGHLEVEL | LOWLEVEL(启动定,不运行时切)
+  # 数据源后端:auto|standard|factory|fake(见 go1_ctrl 注释)
+  #   本机实测:standard(标准UDP)Recv 恒 -1 不可用;factory(工厂高层.so)可读真实 HighState。
+  #   factory 只高层 → joints/obstacle_range/battery 残缺(卡片自动标 available:false)。
+  #   Mac 开发机:factory import 失败 → 自动降 fake(离线全绿)。
+  backend: factory
+  factory_module: robot_interface_high_level             # 工厂高层绑定真名(绕开坏软链 robot_interface)
+  factory_build_path: "/home/pi/Unitree/autostart/programming/build"
+  sdk_module: robot_interface       # standard 后端用(标准 SDK 绑定名;本机暂不可用)
+  sdk_build_path: ""                # standard 绑定 .so 所在目录(留空=系统路径)
+  robot_ip: "192.168.123.161"
+  local_port: 8080
+  target_port: 8082
+  send_period_s: 0.002              # 2ms 持续下发(MT §8)
+  move_timeout_s: 0.5               # 高层 move 看门狗
+  # 低层安全(LOWLEVEL)
+  power_protect_factor: 1           # 1~10(默认 1=10%)
+  position_protect_limit_rad: 0.087
+  joint_control:                    # 未配速度/力矩上限前不开放(MT §5.1)
+    allow_velocity: false
+    allow_torque: false
+  # ── 里程计闭环导航卡(nav;无需 LiDAR,航点用 sqlite 存;走位靠里程计+闭环运动宏) ──
+  nav:
+    db_path: "/tmp/go1_nav.db"      # 航点库(容器部署改 /opt/phanthy-motus/data/go1_nav.db)
+  # ── 媒体卡(buzzer/camera/mic,ANY 级;无设备自动降 fake、诚实 available:false) ──
+  buzzer:                           # 蜂鸣器/提示音:纯软件音调 → 扬声器 aplay
+    mode: auto                      # 无 aplay(开发机)自动降 fake;接扬声器即真
+    device: "default"               # ALSA 播放设备(aplay -D,按 aplay -l 填)
+  camera:                           # 摄像头:USB/V4L2
+    mode: auto                      # 无 cv2/相机自动降 fake;插 USB 相机后即真
+    device_index: 0                 # /dev/videoN 的 N(按 ls /dev/video* 填)
+    width: 640
+    height: 480
+    fps: 15
+  mic:                              # 麦克风:USB/ALSA 采集
+    mode: auto                      # 无 pyalsaaudio/麦自动降 fake;插麦+装库即真
+    device: "default"               # ALSA 采集设备(arecord -l)
+    sample_rate: 16000
+    channels: 1
+  led:                              # 胸口 RGB 灯:走标准 SDK HighCmd.led(经 deploy/set_led.sh 容器发)
+    mode: auto                      # auto/real=真发(需狗+docker+标准绑定);fake=不真发(开发机/离线测试)
+    set_led_sh: "/home/pi/go1-driver/go1/deploy/set_led.sh"
+  # battery/joints 经低层 SDK 复活:lowstate_reader(连主控板 192.168.123.10 读 LowState.bms/motorState)
+  # 写共享文件,卡片读它。起读取器:bash deploy/run_lowstate_reader.sh。无 reader 供数时卡自标 available:false。
+  battery:
+    lowstate_file: "/tmp/go1_lowstate.json"
+  joints:
+    lowstate_file: "/tmp/go1_lowstate.json"
+
+# ── 插件开关 ────────────────────────────────────────────────────────────────
+# mode: auto|real|fake。auto = 先试 real,失败自动降 fake(开发机无硬件时全降 fake)。
+# 标 TODO 的参数明天连硬件后按实机填。
+plugins:
+  # ⚠️ MT 模式(mt.enabled:true)下:loco/state 与 MT 卡重名、tricks 依赖 go1_hl(MT 模式不启)→ 全关。
+  # 运动 + 状态(已具备真实实现,经 go1_hl)
+  loco:
+    enabled: false
+  state:
+    enabled: false
+
+  # 组合动作库(点头/摇头/鞠躬/摇摆… 复合动作,只调 go1_hl 原语)
+  tricks:
+    enabled: false
+
+  # 避障:real 需机器人已连接;避障方式(固件模式?超声?)明天确认
+  obstacle:
+    enabled: false           # go2 模板遗留,非 MT 卡;MT 用 obstacle_range 状态卡
+
+  # 视频:外接 USB 相机(V4L2)。⚠️ 当前 Pi 上无 USB 相机(/dev/video10-23 是树莓派编解码,非采集)。
+  #      插上 USB 相机后把 mode 改回 auto,device_index 按 `ls /dev/video*` 填(通常 0)。
+  ext_camera:
+    enabled: false           # go2 模板遗留,非 MT 卡(MT 视觉卡=camera_rgb/depth/pointcloud,另做)
+    mode: fake               # 插 USB 相机后改 auto
+    device_index: 0
+    width: 640
+    height: 480
+    fps: 15
+
+  # 语音输入:外接 USB 麦(ALSA)。⚠️ 当前 Pi 上无麦(arecord 采集列表为空)且无 pyalsaaudio。
+  #      插上 USB 麦 + `pip3 install pyalsaaudio` 后改 auto,device 按 `arecord -l` 填。
+  ext_mic:
+    enabled: false           # go2 模板遗留,非 MT 卡(MT 麦克风卡=ext_mic MT规格版,另做)
+    mode: fake               # 插 USB 麦 + 装 pyalsaaudio 后改 auto
+    device: "default"
+    sample_rate: 16000
+    channels: 1
+
+  # 语音输出:扬声器(ALSA aplay)。⚠️ 当前 Pi 只有 HDMI 音频,无独立喇叭。
+  speaker:
+    enabled: false           # go2 模板遗留,非 MT 卡
+    mode: fake               # 插 USB 音箱后改 auto,device 按 `aplay -l` 填
+    device: "default"
+
+  # 音量/LED:amixer 'Master' 存在(控 HDMI 音量),可真调
+  vui:
+    enabled: false           # go2 模板遗留,非 MT 卡
+    mode: auto
+    mixer_control: "Master"
+
+  # 导航:本机无 LiDAR → stub(POI 增删查可用,建图/导航返回未装 LiDAR)
+  navigation:
+    enabled: false           # go2 模板遗留(lidar_cloud/controlled_spatial/model),非 MT 卡
+    mode: auto
+    db_path: "/tmp/go1_nav.db"     # 开发/直跑用 /tmp(容器部署改 /opt/phanthy-motus/data/go1_nav.db)

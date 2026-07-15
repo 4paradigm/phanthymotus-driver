@@ -1,0 +1,9 @@
+# Go1 驱动 Python 依赖(rclpy / std_msgs / sensor_msgs / audio_msgs 由 ROS base 镜像提供)。
+# robot_interface(unitree_legged_sdk 的 python 绑定)由 Dockerfile 编译并加入 PYTHONPATH。
+# 离线单元测试(tests/)只用标准库,无需安装任何依赖。
+pyyaml
+netifaces
+numpy                       # 音频重采样
+opencv-python-headless      # ext_camera(V4L2 抓帧)
+pyalsaaudio                 # ext_mic(ALSA 采集)
+sounddevice                 # ext_mic 回退枚举/采集

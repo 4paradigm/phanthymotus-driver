@@ -1,0 +1,115 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  go1_model.urdf — Unitree Go1 精简骨架模型,仅供 PhanthyMotus 骨骼渲染器画 stick figure。
+
+  渲染器只用运动学链(joint 的 origin/axis/parent-child),**不需要 mesh**。
+  关节名必须与 device.py 的 _GO1_JOINT_NAMES 精确一致(FR/FL/RR/RL × hip/thigh/calf)。
+
+  ⚠️ 这里的几何尺寸是 Go1 的近似值;要精确渲染可替换为 unitree_ros 的官方 go1_description。
+     腿序/关节名是对的,尺寸差一点只影响骨架比例,不影响功能。
+-->
+<robot name="go1_description">
+
+  <link name="base"/>
+
+  <!-- ============ FR(右前) ============ -->
+  <link name="FR_hip"/>
+  <link name="FR_thigh"/>
+  <link name="FR_calf"/>
+  <link name="FR_foot"/>
+  <joint name="FR_hip_joint" type="revolute">
+    <parent link="base"/><child link="FR_hip"/>
+    <origin xyz="0.1881 -0.04675 0" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/><limit lower="-1.0" upper="1.0" effort="33" velocity="20"/>
+  </joint>
+  <joint name="FR_thigh_joint" type="revolute">
+    <parent link="FR_hip"/><child link="FR_thigh"/>
+    <origin xyz="0 -0.08 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/><limit lower="-3" upper="3" effort="33" velocity="20"/>
+  </joint>
+  <joint name="FR_calf_joint" type="revolute">
+    <parent link="FR_thigh"/><child link="FR_calf"/>
+    <origin xyz="0 0 -0.213" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/><limit lower="-3" upper="3" effort="33" velocity="20"/>
+  </joint>
+  <joint name="FR_foot_joint" type="fixed">
+    <parent link="FR_calf"/><child link="FR_foot"/>
+    <origin xyz="0 0 -0.213" rpy="0 0 0"/>
+  </joint>
+
+  <!-- ============ FL(左前) ============ -->
+  <link name="FL_hip"/>
+  <link name="FL_thigh"/>
+  <link name="FL_calf"/>
+  <link name="FL_foot"/>
+  <joint name="FL_hip_joint" type="revolute">
+    <parent link="base"/><child link="FL_hip"/>
+    <origin xyz="0.1881 0.04675 0" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/><limit lower="-1.0" upper="1.0" effort="33" velocity="20"/>
+  </joint>
+  <joint name="FL_thigh_joint" type="revolute">
+    <parent link="FL_hip"/><child link="FL_thigh"/>
+    <origin xyz="0 0.08 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/><limit lower="-3" upper="3" effort="33" velocity="20"/>
+  </joint>
+  <joint name="FL_calf_joint" type="revolute">
+    <parent link="FL_thigh"/><child link="FL_calf"/>
+    <origin xyz="0 0 -0.213" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/><limit lower="-3" upper="3" effort="33" velocity="20"/>
+  </joint>
+  <joint name="FL_foot_joint" type="fixed">
+    <parent link="FL_calf"/><child link="FL_foot"/>
+    <origin xyz="0 0 -0.213" rpy="0 0 0"/>
+  </joint>
+
+  <!-- ============ RR(右后) ============ -->
+  <link name="RR_hip"/>
+  <link name="RR_thigh"/>
+  <link name="RR_calf"/>
+  <link name="RR_foot"/>
+  <joint name="RR_hip_joint" type="revolute">
+    <parent link="base"/><child link="RR_hip"/>
+    <origin xyz="-0.1881 -0.04675 0" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/><limit lower="-1.0" upper="1.0" effort="33" velocity="20"/>
+  </joint>
+  <joint name="RR_thigh_joint" type="revolute">
+    <parent link="RR_hip"/><child link="RR_thigh"/>
+    <origin xyz="0 -0.08 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/><limit lower="-3" upper="3" effort="33" velocity="20"/>
+  </joint>
+  <joint name="RR_calf_joint" type="revolute">
+    <parent link="RR_thigh"/><child link="RR_calf"/>
+    <origin xyz="0 0 -0.213" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/><limit lower="-3" upper="3" effort="33" velocity="20"/>
+  </joint>
+  <joint name="RR_foot_joint" type="fixed">
+    <parent link="RR_calf"/><child link="RR_foot"/>
+    <origin xyz="0 0 -0.213" rpy="0 0 0"/>
+  </joint>
+
+  <!-- ============ RL(左后) ============ -->
+  <link name="RL_hip"/>
+  <link name="RL_thigh"/>
+  <link name="RL_calf"/>
+  <link name="RL_foot"/>
+  <joint name="RL_hip_joint" type="revolute">
+    <parent link="base"/><child link="RL_hip"/>
+    <origin xyz="-0.1881 0.04675 0" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/><limit lower="-1.0" upper="1.0" effort="33" velocity="20"/>
+  </joint>
+  <joint name="RL_thigh_joint" type="revolute">
+    <parent link="RL_hip"/><child link="RL_thigh"/>
+    <origin xyz="0 0.08 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/><limit lower="-3" upper="3" effort="33" velocity="20"/>
+  </joint>
+  <joint name="RL_calf_joint" type="revolute">
+    <parent link="RL_thigh"/><child link="RL_calf"/>
+    <origin xyz="0 0 -0.213" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/><limit lower="-3" upper="3" effort="33" velocity="20"/>
+  </joint>
+  <joint name="RL_foot_joint" type="fixed">
+    <parent link="RL_calf"/><child link="RL_foot"/>
+    <origin xyz="0 0 -0.213" rpy="0 0 0"/>
+  </joint>
+
+</robot>

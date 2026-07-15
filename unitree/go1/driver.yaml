@@ -1,0 +1,9 @@
+id: go1-driver
+name: Unitree Go1 Bundle
+category: driver
+hardware_provider: unitree
+hardware_model: "go1"
+image_name: go1
+port: 15704
+mcp_url: "http://localhost:15704/mcp"
+description: "Unitree Go1 — 运动控制 + 避障 + 语音 + 视频 + 导航"
