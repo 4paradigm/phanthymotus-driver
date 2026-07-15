@@ -69,7 +69,8 @@ int64_t flight_ctrl_land_auto_confirm(void) {
         usleep(100000);
         int mode = telemetry_get_display_mode();
         float alt = telemetry_get_altitude();
-        if ((mode == 12 || mode == 33) && alt < 0.7f) {
+        if ((mode == 12 || mode == 33) && alt < 0.6f) {
+            usleep(1000000);  /* wait 1s for aircraft to fully stabilize */
             printf("[flight] auto-confirm landing at alt=%.2fm\n", alt);
             rc = DjiFlightController_StartConfirmLanding();
             return (rc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) ? 0 : (int64_t)rc;
