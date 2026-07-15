@@ -75,6 +75,9 @@ static void *_move_loop(void *arg) {
     return NULL;
 }
 
+/* Track if last move was terminated by system (boundary etc.) */
+static volatile int s_move_blocked = 0;
+
 /* ── Authority event callback ─────────────────────────────────────── */
 
 static T_DjiReturnCode _authority_event_cb(T_DjiFlightControllerJoystickCtrlAuthorityEventInfo eventData) {
@@ -85,17 +88,40 @@ static T_DjiReturnCode _authority_event_cb(T_DjiFlightControllerJoystickCtrlAuth
         case 2: owner = "INTERNAL"; break;
         case 4: owner = "PSDK"; break;
     }
-    printf("[flight] authority changed → %s (event=%d)\n",
-           owner, eventData.joystickCtrlAuthoritySwitchEvent);
+    const char *reason = "unknown";
+    switch (eventData.joystickCtrlAuthoritySwitchEvent) {
+        case 1: reason = "MSDK_GET"; break;
+        case 2: reason = "INTERNAL_GET"; break;
+        case 3: reason = "PSDK_GET"; break;
+        case 4: reason = "RC_LOST"; break;
+        case 5: reason = "RC_NOT_P_MODE"; break;
+        case 6: reason = "RC_SWITCH_MODE"; break;
+        case 7: reason = "RC_PAUSE"; break;
+        case 8: reason = "RC_GO_HOME"; break;
+        case 9: reason = "LOW_BATTERY_GO_HOME"; break;
+        case 10: reason = "LOW_BATTERY_LANDING"; break;
+        case 11: reason = "PSDK_LOST"; break;
+        case 12: reason = "NEAR_BOUNDARY"; break;
+        case 13: reason = "DOCK_REQUEST"; break;
+    }
+    printf("[flight] authority changed → %s (reason=%s)\n", owner, reason);
 
     if (eventData.curJoystickCtrlAuthority != 4 /* PSDK */) {
         if (s_move_active) {
-            printf("[flight] RC took authority, stopping move thread\n");
+            printf("[flight] authority lost, stopping move thread\n");
             s_move_active = 0;
         }
         s_has_authority = 0;
+        /* Mark blocked if system-initiated (boundary, low battery) */
+        if (eventData.joystickCtrlAuthoritySwitchEvent == 12 ||
+            eventData.joystickCtrlAuthoritySwitchEvent == 9 ||
+            eventData.joystickCtrlAuthoritySwitchEvent == 10) {
+            s_move_blocked = 1;
+            printf("[flight] move blocked by system safety event\n");
+        }
     } else {
         s_has_authority = 1;
+        s_move_blocked = 0;  /* clear blocked state when PSDK gets authority back */
     }
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
@@ -190,6 +216,13 @@ int64_t flight_ctrl_cancel_go_home(void) {
 /* ── Joystick move (continuous) ───────────────────────────────────── */
 
 int64_t flight_ctrl_joystick_move(float vx, float vy, float vz, float vyaw, float duration) {
+    /* Check if move is blocked by system safety */
+    if (s_move_blocked) {
+        printf("[flight] move blocked by system safety (boundary/low battery)\n");
+        /* Return a recognizable error — use NONSUPPORT_IN_CURRENT_STATE */
+        return (int64_t)0x00000000E4ULL;
+    }
+
     /* Join previous thread if it finished */
     if (!s_move_active && s_move_thread) {
         pthread_join(s_move_thread, NULL);
