@@ -522,7 +522,7 @@ class FlightPlugin:
                         "vy": {"type": "number", "description": "侧移速度 (m/s)，正=右"},
                         "vz": {"type": "number", "description": "升降速度 (m/s)，正=上"},
                         "vyaw": {"type": "number", "description": "偏航角速度 (deg/s)，正=顺时针"},
-                        "duration": {"type": "number", "description": "持续时间(秒), -1=持续到stop_move", "default": -1},
+                        "duration": {"type": "number", "description": "持续时间(秒), -1=持续到stop_move", "default": 1},
                         "lat": {"type": "number", "description": "纬度 (返航点)"},
                         "lon": {"type": "number", "description": "经度 (返航点)"},
                         "enabled": {
@@ -597,7 +597,7 @@ class FlightPlugin:
                     self._has_authority = True
                 else:
                     return {"ret": -1, "error": "Failed to obtain joystick authority"}
-            duration = args.get("duration", -1)
+            duration = args.get("duration", 1)
             try:
                 duration = float(duration)
             except (TypeError, ValueError):
