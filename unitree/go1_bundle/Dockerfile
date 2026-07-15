@@ -44,6 +44,7 @@ COPY fall_alarm.py     /work/fall_alarm.py
 COPY net.py            /work/net.py
 COPY odometry.py       /work/odometry.py
 COPY obstacle_range.py /work/obstacle_range.py
+COPY udp_diagnostics.py /work/udp_diagnostics.py
 COPY config.yaml       /work/config.yaml
 COPY deploy/           /deploy/
 # ★ 新增卡：加一行 `COPY <卡名>.py /work/<卡名>.py`（main.py 会按 config 里的卡名自动 import）。

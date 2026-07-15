@@ -188,6 +188,13 @@ class Go1HighSdkClient:
         # 控制目标（move()/stop_move() 写，_loop 读并合成 HighCmd）；None=只发 idle 心跳。
         self._move_cmd = None       # (vx, vy, vyaw, gait) 或 None
         self._move_deadline = 0.0   # monotonic 截止；过期即回 idle
+        # ── UDP 诊断计数（udp_diagnostics 卡读取；纯新增，不影响只读语义）──
+        self._diag_lock = threading.Lock()
+        self._diag = {
+            "total_count": 0, "send_count": 0, "recv_count": 0,
+            "send_error": 0, "flag_error": 0,
+            "recv_crc_error": 0, "recv_lose_error": 0, "accessible": False,
+        }
         self._init_sdk()
 
     def _init_sdk(self) -> None:
@@ -220,13 +227,51 @@ class Go1HighSdkClient:
             try:
                 self._udp.Recv()
                 self._udp.GetRecv(self._state)
+                self._bump("recv_count")
                 self._compose_cmd()            # 合成 _cmd：默认 idle；有 move 目标且未过期则下发速度
                 self._udp.SetSend(self._cmd)
                 self._udp.Send()
+                self._bump("send_count")
+                self._set_diag("accessible", True)
+                self._read_udp_state()         # 尽力拉底层 CRC/丢包/标志错误计数
                 self._parse_state(self._state)
             except Exception as e:
+                self._bump("send_error")
+                self._set_diag("accessible", False)
                 print(f"[Go1HighSdk] loop error: {e}", flush=True)
+            self._bump("total_count")
             time.sleep(period)
+
+    # ── UDP 诊断计数（纯新增，供 udp_diagnostics 卡读取）─────────────────────────
+
+    def _bump(self, key: str, n: int = 1) -> None:
+        with self._diag_lock:
+            self._diag[key] = self._diag.get(key, 0) + n
+
+    def _set_diag(self, key: str, value) -> None:
+        with self._diag_lock:
+            self._diag[key] = value
+
+    def _read_udp_state(self) -> None:
+        """若 robot_interface.UDP 暴露了 udpState，则把底层 CRC/丢包/标志错误计数填进诊断。
+        没暴露就静默跳过——绝不抛异常污染上面的 send_error 计数。"""
+        us = getattr(self._udp, "udpState", None)
+        if us is None:
+            return
+        for src, dst in (("FlagError", "flag_error"),
+                         ("RecvCRCError", "recv_crc_error"),
+                         ("RecvLoseError", "recv_lose_error")):
+            try:
+                v = getattr(us, src, None)
+                if v is not None:
+                    self._set_diag(dst, int(v))
+            except Exception:
+                pass
+
+    def diagnostics(self) -> dict:
+        """UDP 通信健康快照（线程安全拷贝）。STUB 下计数恒为 0、accessible=False。"""
+        with self._diag_lock:
+            return dict(self._diag)
 
     def _parse_state(self, s) -> None:
         """HighState → 一份完整 snapshot dict。
