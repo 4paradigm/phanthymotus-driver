@@ -189,6 +189,7 @@ class Go1HighSdkClient:
         self._move_cmd = None       # (vx, vy, vyaw, gait) 或 None
         self._move_deadline = 0.0   # monotonic 截止；过期即回 idle
         self._posture = None        # 【纯新增】dict: mode/euler/body_height/foot_raise/speed_level；持续保持(loco/gesture 用)
+        self._desired_gait = 1      # 常驻期望步态（switch_gait 卡写；move 未显式指定 gait 时用它）。默认 1=trot
         # ── UDP 诊断计数（udp_diagnostics 卡读取；纯新增，不影响只读语义）──
         self._diag_lock = threading.Lock()
         self._diag = {
@@ -322,17 +323,20 @@ class Go1HighSdkClient:
         except Exception:
             return 0.0
 
-    def move(self, vx=0.0, vy=0.0, vyaw=0.0, gait=1):
+    def move(self, vx=0.0, vy=0.0, vyaw=0.0, gait=None):
         """设置一次高层速度目标（mode=2）并刷新看门狗；后台 _loop 下发。
-        控制卡按节奏（如每 50ms）重发以持续运动，停发 0.5s 后自动回 idle 停下。"""
+        控制卡按节奏（如每 50ms）重发以持续运动，停发 0.5s 后自动回 idle 停下。
+        gait=None 时用常驻期望步态 self._desired_gait（由 switch_gait 卡设定）；
+        显式传 gait 则以传入为准（向后兼容，spin 等卡不受影响）。"""
         vx = self._clamp(vx, VX_MAX)
         vy = self._clamp(vy, VY_MAX)
         vyaw = self._clamp(vyaw, VYAW_MAX)
         with self._lock:
-            self._move_cmd = (vx, vy, vyaw, int(gait))
+            g = self._desired_gait if gait is None else int(gait)
+            self._move_cmd = (vx, vy, vyaw, g)
             self._move_deadline = time.monotonic() + MOVE_WATCHDOG_S
             self._posture = None   # 速度命令优先，清掉姿态
-        return {"vx": vx, "vy": vy, "vyaw": vyaw, "gait": int(gait)}
+        return {"vx": vx, "vy": vy, "vyaw": vyaw, "gait": g}
 
     def stop_move(self):
         """清除速度目标 → 下一循环回 idle(mode=0) 停下站稳。"""
@@ -355,6 +359,22 @@ class Go1HighSdkClient:
                              "foot_raise": float(foot_raise),
                              "speed_level": int(speed_level)}
         return dict(self._posture)
+
+    def set_gait(self, gait) -> int:
+        """设置常驻期望步态（switch_gait 卡用）；此后未显式指定 gait 的 move 都用它。
+        若当前正在移动，立即把进行中的 move 目标步态也换成新步态（走时切步态）。"""
+        g = int(gait)
+        with self._lock:
+            self._desired_gait = g
+            if self._move_cmd is not None:
+                vx, vy, vyaw, _ = self._move_cmd
+                self._move_cmd = (vx, vy, vyaw, g)
+        return g
+
+    def desired_gait(self) -> int:
+        """当前常驻期望步态（gaitType 整数）。"""
+        with self._lock:
+            return self._desired_gait
 
     def _compose_cmd(self) -> None:
         """按当前 move 目标 + 看门狗合成 _cmd：默认 idle(mode=0)；目标有效则速度(mode=2)。"""
