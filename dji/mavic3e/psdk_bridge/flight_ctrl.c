@@ -51,10 +51,11 @@ static void *_move_loop(void *arg) {
 
         /* Check duration limit */
         if (dur > 0 && (tick * 0.02f) >= dur) {
-            printf("[flight] move duration %.1fs reached, hovering\n", dur);
+            printf("[flight] move duration %.1fs reached, releasing authority to RC\n", dur);
             s_move_active = 0;
-            /* Don't brake — just stop sending commands, aircraft will hover.
-             * EmergencyBrake releases joystick authority, breaking future moves. */
+            /* Release joystick authority back to RC so pilot can control */
+            DjiFlightController_ReleaseJoystickCtrlAuthority();
+            s_has_authority = 0;
             break;
         }
     }
@@ -173,8 +174,8 @@ int64_t flight_ctrl_stop_move(void) {
         pthread_join(s_move_thread, NULL);
         s_move_thread = 0;
     }
-    T_DjiReturnCode rc = DjiFlightController_ExecuteEmergencyBrakeAction();
-    /* EmergencyBrake releases joystick authority — next move will re-obtain */
+    /* Release authority back to RC — pilot regains control */
+    T_DjiReturnCode rc = DjiFlightController_ReleaseJoystickCtrlAuthority();
     s_has_authority = 0;
     return (rc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) ? 0 : (int64_t)rc;
 }
