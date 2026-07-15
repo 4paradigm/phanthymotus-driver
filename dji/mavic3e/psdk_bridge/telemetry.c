@@ -54,9 +54,15 @@ static T_DjiReturnCode _velocity_cb(const uint8_t *data, uint16_t size, const T_
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
 
+static int s_gps_log_count = 0;
 static T_DjiReturnCode _gps_cb(const uint8_t *data, uint16_t size, const T_DjiDataTimestamp *ts) {
     if (size >= sizeof(s_gps_pos))
         memcpy(&s_gps_pos, data, sizeof(s_gps_pos));
+    if (s_gps_log_count++ % 100 == 0)
+        printf("[telemetry] GPS raw: x=%d y=%d z=%d (lon=%.7f lat=%.7f alt=%.1fm)\n",
+               s_gps_pos.x, s_gps_pos.y, s_gps_pos.z,
+               (double)s_gps_pos.x / 1e7, (double)s_gps_pos.y / 1e7,
+               (double)s_gps_pos.z / 1000.0);
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
 
@@ -172,7 +178,7 @@ int telemetry_get_json(char *buf, size_t buflen) {
         q0, q1, q2, q3, yaw, pitch, roll,
         (double)s_velocity.data.x, (double)s_velocity.data.y, (double)s_velocity.data.z,
         (int)s_battery.batteryCapacityPercent, (double)s_battery.currentVoltage / 1000.0,
-        (int)s_gps_detail.gpsSatelliteNumberUsed, (int)s_gps_detail.fixState,
+        (int)s_gps_detail.totalSatelliteNumberUsed, (int)s_gps_detail.fixState,
         (double)s_compass.x,
         (double)s_avoid.front, (double)s_avoid.back,
         (double)s_avoid.left, (double)s_avoid.right,
