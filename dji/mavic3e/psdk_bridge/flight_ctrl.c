@@ -1,5 +1,6 @@
 #include "flight_ctrl.h"
 #include "error_code.h"
+#include "telemetry.h"
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -60,8 +61,27 @@ int64_t flight_ctrl_confirm_landing(void) {
 int64_t flight_ctrl_land_auto_confirm(void) {
     T_DjiReturnCode rc = DjiFlightController_StartLanding();
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) return (int64_t)rc;
-    /* Wait for aircraft to reach low altitude before confirming */
-    usleep(4000000);  /* 4 seconds */
+
+    /* Poll until aircraft reaches low altitude in landing mode, then confirm.
+     * display_mode 12 = AUTO_LANDING, 33 = FORCE_AUTO_LANDING
+     * Timeout after 30 seconds to avoid blocking forever. */
+    for (int i = 0; i < 300; i++) {  /* 300 * 100ms = 30s */
+        usleep(100000);
+        int mode = telemetry_get_display_mode();
+        float alt = telemetry_get_altitude();
+        if ((mode == 12 || mode == 33) && alt < 0.7f) {
+            printf("[flight] auto-confirm landing at alt=%.2fm\n", alt);
+            rc = DjiFlightController_StartConfirmLanding();
+            return (rc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) ? 0 : (int64_t)rc;
+        }
+        /* If aircraft left landing mode (e.g. user cancelled), abort */
+        if (mode != 12 && mode != 33 && i > 20) {
+            printf("[flight] landing cancelled (mode=%d), aborting auto-confirm\n", mode);
+            return 0;  /* not an error, user cancelled */
+        }
+    }
+    printf("[flight] auto-confirm timeout (30s)\n");
+    /* Still try to confirm in case we missed the window */
     rc = DjiFlightController_StartConfirmLanding();
     return (rc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) ? 0 : (int64_t)rc;
 }
