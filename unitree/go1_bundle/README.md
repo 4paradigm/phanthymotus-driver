@@ -2,9 +2,9 @@
 
 > 一张“卡片” = Driver 暴露的一个 MCP 工具 = 平台画布上一个可拖拽、可被大模型单独调用的能力。
 >
-> 本 bundle 是从完整 Go1 驱动中**切出的最小可运行蓝本**，当前发布 2 张状态卡：`loco_state` 与 `battery`。
-> **一张卡 = 一个自包含的 `.py` 文件**（`loco_state.py` / `battery.py`），方便按卡评审、按卡提交、多人并行不撞车。
-> 目的有二：① 把这两张卡干净地上架；② 作为后来者新增其它卡片的开发起点 —— 怎么加卡见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+> 本 bundle 是从完整 Go1 驱动中**切出的最小可运行蓝本**，当前发布 3 张状态卡：`loco_state`、`battery` 与 `obstacle_range`。
+> **一张卡 = 一个自包含的 `.py` 文件**（`loco_state.py` / `battery.py` / `obstacle_range.py`），方便按卡评审、按卡提交、多人并行不撞车。
+> 目的有二：① 把这些卡干净地上架；② 作为后来者新增其它卡片的开发起点 —— 怎么加卡见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 实现基座
 
@@ -13,12 +13,13 @@
 - 无 `robot_interface` / 无真机时自动 **STUB**（不收发、`fresh=false`），MCP server 仍能起、注册、列 tool，方便无硬件时跑通链路。
 - 固定 **HIGHLEVEL 只读**，不下发任何控制命令。
 
-## 卡片总览（本 bundle 共 2 张，均为 sensor）
+## 卡片总览（本 bundle 共 3 张，均为 sensor）
 
 | 卡片（= 文件） | 类型 | 能力 | 输出（`action=info` 或 ROS2 topic） |
 |---|---|---|---|
 | `loco_state`（`loco_state.py`） | sensor | 运动状态 | `/{ns}/loco/state`：mode / gait / velocity_body_mps / yaw_speed_rad_s / body_height_m / position_m(里程计,漂移) |
 | `battery`（`battery.py`） | sensor | 电量(BMS) | `/{ns}/state/battery`：soc_percent / current_ma / cycle_count / temps / cell_voltage_mv |
+| `obstacle_range`（`obstacle_range.py`） | sensor | 超声波避障 | `/{ns}/state/obstacle_range`：range_raw[4]（仅 HIGHLEVEL；方向/单位官方未定义，原样输出） |
 
 `{ns}` 为 `config.yaml` 的 `ros_namespace`（默认 `bundle`；留空则取 hostname）。
 
@@ -46,6 +47,7 @@ go1_bundle/
 ├── go1_sdk_client.py  # 共享的只读 SDK client：UDP 收 HighState → snapshot()
 ├── loco_state.py      # 卡：运动状态（自包含：builder + MCP 插件 + 可选 ROS2 发布）
 ├── battery.py         # 卡：电池 BMS（自包含）
+├── obstacle_range.py  # 卡：超声波避障（自包含）
 ├── config.yaml        # 卡片开关 / 端口 / 命名空间
 ├── driver.yaml        # 驱动元数据（id / port / 描述）
 ├── requirements.txt   # 运行期 pip 依赖（pyyaml；rclpy/robot_interface 由镜像提供/构建）

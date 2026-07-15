@@ -38,6 +38,7 @@ COPY go1_sdk_client.py /work/go1_sdk_client.py
 COPY loco_state.py     /work/loco_state.py
 COPY battery.py        /work/battery.py
 COPY spin.py           /work/spin.py
+COPY obstacle_range.py /work/obstacle_range.py
 COPY config.yaml       /work/config.yaml
 COPY deploy/           /deploy/
 # ★ 新增卡：加一行 `COPY <卡名>.py /work/<卡名>.py`（main.py 会按 config 里的卡名自动 import）。
