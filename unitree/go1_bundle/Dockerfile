@@ -56,6 +56,9 @@ COPY loco.py           /work/loco.py
 COPY gesture.py        /work/gesture.py
 COPY beep.py           /work/beep.py
 COPY camera_rgb.py     /work/camera_rgb.py
+COPY face_light.py     /work/face_light.py
+COPY system_health.py  /work/system_health.py
+COPY camera_depth.py   /work/camera_depth.py
 COPY config.yaml       /work/config.yaml
 COPY deploy/           /deploy/
 # Nano 侧后端源码放进 /deploy/，供 nano_bootstrap.sh 首启时分发/编译到 Head Nano：

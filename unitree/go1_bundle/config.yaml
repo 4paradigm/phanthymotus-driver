@@ -10,6 +10,20 @@ plugins:
     enabled: true
   battery:                      # BMS：SOC%/电流/循环/温度/单体电压
     enabled: true
+
+  # ── xin 新增(扩展卡)──
+  face_light:                   # 面部灯带颜色(actuator,MQTT):set_color/preset/off
+    enabled: true
+    mqtt_host: "localhost"
+    mqtt_port: 1883
+  system_health:                # 诊断执行卡(actuator):主控板+子系统体检,自动判断哪里有问题
+    enabled: true
+    mqtt_host: "localhost"
+    mqtt_port: 1883
+  camera_depth:                 # 头部双目深度推流(sensor):连 NX depth_stream → ROS2 CompressedImage
+    enabled: true
+    nx_host: "192.168.123.15"
+    nx_port: 9101
   imu:                          # IMU：四元数/角速度/加速度/欧拉角/温度
     enabled: true
   feet:                         # 足端：足底力[4] + 高层时足端相对机身位置/速度
