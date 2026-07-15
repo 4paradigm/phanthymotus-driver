@@ -518,10 +518,10 @@ class FlightPlugin:
                                 "set_home", "set_obstacle_avoidance",
                             ],
                         },
-                        "vx": {"type": "number", "description": "前进速度 (m/s)，正=前，范围 -30~30", "minimum": -30, "maximum": 30},
-                        "vy": {"type": "number", "description": "侧移速度 (m/s)，正=右，范围 -30~30", "minimum": -30, "maximum": 30},
-                        "vz": {"type": "number", "description": "升降速度 (m/s)，正=上，范围 -5~5", "minimum": -5, "maximum": 5},
-                        "vyaw": {"type": "number", "description": "偏航角速度 (deg/s)，正=顺时针，范围 -150~150", "minimum": -150, "maximum": 150},
+                        "vx": {"type": "number", "description": "前进速度 (m/s)，正=前，范围 -15~15", "minimum": -15, "maximum": 15},
+                        "vy": {"type": "number", "description": "侧移速度 (m/s)，正=右，范围 -15~15", "minimum": -15, "maximum": 15},
+                        "vz": {"type": "number", "description": "升降速度 (m/s)，正=上，范围 -6~6", "minimum": -6, "maximum": 6},
+                        "vyaw": {"type": "number", "description": "偏航角速度 (deg/s)，正=顺时针，范围 -200~200", "minimum": -200, "maximum": 200},
                         "duration": {"type": "number", "description": "持续时间(秒), -1=持续到stop_move", "default": 1},
                         "require_rc_confirm": {
                             "type": "boolean",
@@ -621,11 +621,11 @@ class FlightPlugin:
                 duration = float(duration)
             except (TypeError, ValueError):
                 duration = -1
-            # Clamp velocities to PSDK limits
-            vx = max(-30, min(30, float(args.get("vx", 0))))
-            vy = max(-30, min(30, float(args.get("vy", 0))))
-            vz = max(-5, min(5, float(args.get("vz", 0))))
-            vyaw = max(-150, min(150, float(args.get("vyaw", 0))))
+            # Clamp velocities to Mavic 3T limits
+            vx = max(-15, min(15, float(args.get("vx", 0))))
+            vy = max(-15, min(15, float(args.get("vy", 0))))
+            vz = max(-6, min(6, float(args.get("vz", 0))))
+            vyaw = max(-200, min(200, float(args.get("vyaw", 0))))
             resp = self._bridge.joystick_move(
                 vx=vx, vy=vy, vz=vz, vyaw=vyaw,
                 duration=duration,
