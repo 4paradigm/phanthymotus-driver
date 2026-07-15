@@ -62,6 +62,21 @@ static void *_move_loop(void *arg) {
     return NULL;
 }
 
+/* ── Authority event callback ─────────────────────────────────────── */
+
+static T_DjiReturnCode _authority_event_cb(T_DjiFlightControllerJoystickCtrlAuthorityEventInfo eventData) {
+    if (eventData.curJoystickCtrlAuthority != 4 /* OSDK/PSDK */) {
+        /* RC or other module took authority — stop move immediately */
+        if (s_move_active) {
+            printf("[flight] authority lost (event=%d), stopping move\n",
+                   eventData.joystickCtrlAuthoritySwitchEvent);
+            s_move_active = 0;
+        }
+        s_has_authority = 0;
+    }
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
 /* ── Init / Authority ─────────────────────────────────────────────── */
 
 int flight_ctrl_init(void) {
@@ -71,6 +86,8 @@ int flight_ctrl_init(void) {
         printf("[flight] init failed: 0x%08llX\n", (unsigned long long)rc);
         return -1;
     }
+    /* Register authority switch callback so RC pause/mode-switch stops move */
+    DjiFlightController_RegJoystickCtrlAuthorityEventCallback(_authority_event_cb);
     printf("[flight] initialized\n");
     return 0;
 }
