@@ -32,6 +32,7 @@
 static T_DjiFcSubscriptionQuaternion s_quaternion;
 static T_DjiFcSubscriptionVelocity s_velocity;
 static T_DjiFcSubscriptionGpsPosition s_gps_pos;
+static T_DjiFcSubscriptionPositionFused s_pos_fused;
 static T_DjiFcSubscriptionGpsDetails s_gps_detail;
 static T_DjiFcSubscriptionAltitudeFused s_alt_fused;
 static T_DjiFcSubscriptionAltitudeOfHomePoint s_alt_home;
@@ -63,6 +64,19 @@ static T_DjiReturnCode _gps_cb(const uint8_t *data, uint16_t size, const T_DjiDa
                s_gps_pos.x, s_gps_pos.y, s_gps_pos.z,
                (double)s_gps_pos.x / 1e7, (double)s_gps_pos.y / 1e7,
                (double)s_gps_pos.z / 1000.0);
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
+static int s_pos_fused_log_count = 0;
+static T_DjiReturnCode _pos_fused_cb(const uint8_t *data, uint16_t size, const T_DjiDataTimestamp *ts) {
+    if (size >= sizeof(s_pos_fused))
+        memcpy(&s_pos_fused, data, sizeof(s_pos_fused));
+    if (s_pos_fused_log_count++ % 100 == 0)
+        printf("[telemetry] POS_FUSED: lat=%.8f lon=%.8f alt=%.2f sats=%d\n",
+               s_pos_fused.latitude * 180.0 / 3.14159265358979323846,
+               s_pos_fused.longitude * 180.0 / 3.14159265358979323846,
+               s_pos_fused.altitude,
+               s_pos_fused.visibleSatelliteNumber);
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
 
@@ -136,6 +150,8 @@ int telemetry_init(void) {
     printf("[telemetry] subscribe VELOCITY → 0x%08llX\n", (unsigned long long)rc);
     rc = DjiFcSubscription_SubscribeTopic(DJI_FC_SUBSCRIPTION_TOPIC_GPS_POSITION, DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, _gps_cb);
     printf("[telemetry] subscribe GPS_POSITION → 0x%08llX\n", (unsigned long long)rc);
+    rc = DjiFcSubscription_SubscribeTopic(DJI_FC_SUBSCRIPTION_TOPIC_POSITION_FUSED, DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, _pos_fused_cb);
+    printf("[telemetry] subscribe POSITION_FUSED → 0x%08llX\n", (unsigned long long)rc);
     rc = DjiFcSubscription_SubscribeTopic(DJI_FC_SUBSCRIPTION_TOPIC_GPS_DETAILS, DJI_DATA_SUBSCRIPTION_TOPIC_1_HZ, _gps_detail_cb);
     printf("[telemetry] subscribe GPS_DETAILS → 0x%08llX\n", (unsigned long long)rc);
     rc = DjiFcSubscription_SubscribeTopic(DJI_FC_SUBSCRIPTION_TOPIC_ALTITUDE_FUSED, DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, _alt_fused_cb);
@@ -161,6 +177,19 @@ int telemetry_get_json(char *buf, size_t buflen) {
     double pitch = asin(2.0*(q0*q2 - q3*q1)) * 180.0 / M_PI;
     double yaw   = atan2(2.0*(q0*q3 + q1*q2), 1.0 - 2.0*(q2*q2 + q3*q3)) * 180.0 / M_PI;
 
+    /* Use POSITION_FUSED as primary source (works in simulator),
+     * fall back to GPS_POSITION if fused is 0 */
+    double lat_deg, lon_deg, gps_alt;
+    if (s_pos_fused.latitude != 0 || s_pos_fused.longitude != 0) {
+        lat_deg = s_pos_fused.latitude * 180.0 / M_PI;
+        lon_deg = s_pos_fused.longitude * 180.0 / M_PI;
+        gps_alt = (double)s_pos_fused.altitude;
+    } else {
+        lat_deg = (double)s_gps_pos.y / 1e7;
+        lon_deg = (double)s_gps_pos.x / 1e7;
+        gps_alt = (double)s_gps_pos.z / 1000.0;
+    }
+
     snprintf(buf, buflen,
         "{"
         "\"position\":{\"latitude\":%.8f,\"longitude\":%.8f,\"altitude\":%.2f,"
@@ -178,8 +207,7 @@ int telemetry_get_json(char *buf, size_t buflen) {
         "\"flight_status\":%d,\"flight_mode\":%d"
         "}",
         /* GPS_POSITION: x=Longitude, y=Latitude, z=Altitude(mm) — per PSDK docs */
-        (double)s_gps_pos.y / 1e7, (double)s_gps_pos.x / 1e7,
-        (double)s_gps_pos.z / 1000.0,
+        lat_deg, lon_deg, gps_alt,
         (double)s_alt_fused, (double)s_alt_home,
         (double)(s_alt_fused - s_alt_home),
         q0, q1, q2, q3, yaw, pitch, roll,
