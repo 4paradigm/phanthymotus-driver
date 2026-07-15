@@ -1,9 +1,0 @@
-id: go1-bundle-driver
-name: Unitree Go1 Bundle (read-only state)
-category: driver
-hardware_provider: unitree
-hardware_model: "go1"
-image_name: go1_bundle
-port: 15717
-mcp_url: "http://localhost:15717/mcp"
-description: "Unitree Go1 (EDU) 只读状态驱动（原始 unitree_legged_sdk）— 状态卡：运动状态(loco_state) + 电池(battery)。可作为新增卡片的开发蓝本，见 CONTRIBUTING.md。"
