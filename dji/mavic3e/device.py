@@ -1054,7 +1054,8 @@ class WaypointPlugin:
 </kml>"""
 
         timestamp = int(time.time())
-        filename = f"{name}_{timestamp}.kmz"
+        safe_name = name.replace(" ", "_").replace("'", "").replace('"', '')
+        filename = f"{safe_name}_{timestamp}.kmz"
         filepath = os.path.join(self.WAYPOINT_DIR, filename)
 
         with zipfile.ZipFile(filepath, "w", zipfile.ZIP_DEFLATED) as zf:
