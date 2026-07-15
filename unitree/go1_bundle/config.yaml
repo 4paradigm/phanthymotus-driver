@@ -10,6 +10,18 @@ plugins:
     enabled: true
   battery:                      # BMS：SOC%/电流/循环/温度/单体电压
     enabled: true
+  imu:                          # IMU：四元数/角速度/加速度/欧拉角/温度
+    enabled: true
+  feet:                         # 足端：足底力[4] + 高层时足端相对机身位置/速度
+    enabled: true
+  fall_alarm:                   # 跌倒/侧翻告警：IMU roll/pitch → ok/tilted/fallen（阈值可配）
+    enabled: true
+    # tilt_warn_rad: 0.6        # 明显倾斜阈值（rad，≈34°）
+    # fall_rad: 1.2             # 跌倒判定阈值（rad，≈69°）
+  net:                          # 网络健康：主机名/IPv4/Wi-Fi 信号（联调掉线排查）
+    enabled: true
+  odometry:                     # 里程计：position/yaw + 相对起点位移（reset_origin 重置）
+    enabled: true
 
   # ── 控制卡（下发 HighCmd；须真机验证量程+安全后上架）──
   spin:                         # 原地转圈（闭环读 IMU yaw 转够自停）
