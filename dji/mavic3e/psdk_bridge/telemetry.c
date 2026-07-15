@@ -163,7 +163,7 @@ int telemetry_get_json(char *buf, size_t buflen) {
         "\"yaw\":%.2f,\"pitch\":%.2f,\"roll\":%.2f},"
         "\"velocity\":{\"vx\":%.3f,\"vy\":%.3f,\"vz\":%.3f},"
         "\"battery\":{\"percent\":%d,\"voltage\":%.1f},"
-        "\"gps\":{\"satellites\":%d,\"fix_type\":%d},"
+        "\"gps\":{\"satellites\":%d,\"gps_used\":%d,\"glonass_used\":%d,\"fix_type\":%d},"
         "\"compass\":{\"heading\":%.1f},"
         "\"obstacles\":{\"front\":%.1f,\"back\":%.1f,\"left\":%.1f,"
         "\"right\":%.1f,\"up\":%.1f,\"down\":%.1f},"
@@ -178,7 +178,10 @@ int telemetry_get_json(char *buf, size_t buflen) {
         q0, q1, q2, q3, yaw, pitch, roll,
         (double)s_velocity.data.x, (double)s_velocity.data.y, (double)s_velocity.data.z,
         (int)s_battery.batteryCapacityPercent, (double)s_battery.currentVoltage / 1000.0,
-        (int)s_gps_detail.totalSatelliteNumberUsed, (int)s_gps_detail.fixState,
+        (int)s_gps_detail.totalSatelliteNumberUsed,
+        (int)s_gps_detail.gpsSatelliteNumberUsed,
+        (int)s_gps_detail.glonassSatelliteNumberUsed,
+        (int)s_gps_detail.fixState,
         (double)s_compass.x,
         (double)s_avoid.front, (double)s_avoid.back,
         (double)s_avoid.left, (double)s_avoid.right,
