@@ -1066,14 +1066,13 @@ class WaypointPlugin:
     # ── Record mode ───────────────────────────────────────────────────
 
     def _record_loop(self):
-        """Background thread: sample GPS every 1s."""
+        """Background thread: sample GPS every 1s, skip if < 1m from last."""
         import math
         last_lat, last_lon = None, None
 
         while self._record_active:
             gps = self._get_current_gps()
             if gps:
-                # Skip if too close to last point (< 1m)
                 if last_lat is not None:
                     dlat = (gps["lat"] - last_lat) * 111320
                     dlon = (gps["lon"] - last_lon) * 111320 * math.cos(math.radians(gps["lat"]))
@@ -1083,6 +1082,8 @@ class WaypointPlugin:
                         continue
                 last_lat, last_lon = gps["lat"], gps["lon"]
                 self._record_points.append(gps)
+                if len(self._record_points) % 30 == 1:
+                    print(f"[waypoint] recording... {len(self._record_points)} points")
             time.sleep(1)
 
     # ── Dispatch ──────────────────────────────────────────────────────
@@ -1113,9 +1114,18 @@ class WaypointPlugin:
             self._record_active = False
             if self._record_thread:
                 self._record_thread.join(timeout=3)
+            # Always capture final position
+            gps = self._get_current_gps()
+            if gps:
+                self._record_points.append(gps)
             points = self._record_points
-            if len(points) < 2:
-                return {"ret": -1, "error": f"Too few points recorded ({len(points)}), need >= 2"}
+            if len(points) == 0:
+                return {"ret": -1, "error": "No GPS data captured"}
+            if len(points) == 1:
+                # Didn't move — duplicate with slight offset so KMZ is valid
+                p = dict(points[0])
+                p["lat"] += 0.00001  # ~1m offset
+                points.append(p)
             filepath = self._generate_kmz(points, self._record_name)
             return {"ret": 0, "message": f"Recorded {len(points)} points",
                     "file": filepath, "points": len(points)}
