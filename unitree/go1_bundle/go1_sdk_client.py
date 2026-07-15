@@ -188,6 +188,7 @@ class Go1HighSdkClient:
         # 控制目标（move()/stop_move() 写，_loop 读并合成 HighCmd）；None=只发 idle 心跳。
         self._move_cmd = None       # (vx, vy, vyaw, gait) 或 None
         self._move_deadline = 0.0   # monotonic 截止；过期即回 idle
+        self._posture = None        # 【纯新增】dict: mode/euler/body_height/foot_raise/speed_level；持续保持(loco/gesture 用)
         # ── UDP 诊断计数（udp_diagnostics 卡读取；纯新增，不影响只读语义）──
         self._diag_lock = threading.Lock()
         self._diag = {
@@ -330,6 +331,7 @@ class Go1HighSdkClient:
         with self._lock:
             self._move_cmd = (vx, vy, vyaw, int(gait))
             self._move_deadline = time.monotonic() + MOVE_WATCHDOG_S
+            self._posture = None   # 速度命令优先，清掉姿态
         return {"vx": vx, "vy": vy, "vyaw": vyaw, "gait": int(gait)}
 
     def stop_move(self):
@@ -337,6 +339,22 @@ class Go1HighSdkClient:
         with self._lock:
             self._move_cmd = None
             self._move_deadline = 0.0
+            self._posture = None
+
+    def set_posture(self, mode, euler=(0.0, 0.0, 0.0), body_height=0.0,
+                    foot_raise=0.0, speed_level=0):
+        """【纯新增】设置并持续保持一个姿态命令(供 loco 站起/姿态、gesture 用)。
+        mode: 0 idle / 1 force_stand(受 euler+bodyHeight 控) / 5 stand_down / 6 stand_up /
+              7 damp / 8 recovery。持续下发直到被 move()/stop_move()/新 set_posture 覆盖。
+        不影响任何现有 move/idle/状态读取逻辑。"""
+        with self._lock:
+            self._move_cmd = None
+            self._posture = {"mode": int(mode),
+                             "euler": [float(euler[0]), float(euler[1]), float(euler[2])],
+                             "body_height": float(body_height),
+                             "foot_raise": float(foot_raise),
+                             "speed_level": int(speed_level)}
+        return dict(self._posture)
 
     def _compose_cmd(self) -> None:
         """按当前 move 目标 + 看门狗合成 _cmd：默认 idle(mode=0)；目标有效则速度(mode=2)。"""
@@ -345,18 +363,28 @@ class Go1HighSdkClient:
         now = time.monotonic()
         with self._lock:
             mc = self._move_cmd if (self._move_cmd is not None and now < self._move_deadline) else None
+            pose = None if mc is not None else self._posture   # 【纯新增】move 优先,否则用 posture
         try:
-            if mc is None:
-                self._cmd.mode = 0
-                self._cmd.gaitType = 0
-                self._cmd.velocity = [0.0, 0.0]
-                self._cmd.yawSpeed = 0.0
-            else:
+            if mc is not None:
                 vx, vy, vyaw, gait = mc
                 self._cmd.mode = 2
                 self._cmd.gaitType = int(gait)
                 self._cmd.velocity = [float(vx), float(vy)]
                 self._cmd.yawSpeed = float(vyaw)
+            elif pose is not None:                             # 【纯新增分支】姿态命令(loco 站起/姿态、gesture)
+                self._cmd.mode = int(pose["mode"])
+                self._cmd.gaitType = 0
+                self._cmd.velocity = [0.0, 0.0]
+                self._cmd.yawSpeed = 0.0
+                self._cmd.euler = [pose["euler"][0], pose["euler"][1], pose["euler"][2]]
+                self._cmd.bodyHeight = pose["body_height"]
+                self._cmd.footRaiseHeight = pose["foot_raise"]
+                self._cmd.speedLevel = pose["speed_level"]
+            else:
+                self._cmd.mode = 0
+                self._cmd.gaitType = 0
+                self._cmd.velocity = [0.0, 0.0]
+                self._cmd.yawSpeed = 0.0
         except Exception as e:  # noqa: BLE001
             print(f"[Go1HighSdk] compose_cmd error: {e}", flush=True)
 

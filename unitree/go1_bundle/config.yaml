@@ -30,6 +30,10 @@ plugins:
   # ── 控制卡（下发 HighCmd；须真机验证量程+安全后上架）──
   spin:                         # 原地转圈（闭环读 IMU yaw 转够自停）
     enabled: true
+  loco:                         # 基础运动:三维速度 move + 站起/趴下/平衡/姿态/身高
+    enabled: true
+  gesture:                      # 表演/表情:作揖/点头/摇头/歪头/环视/跳舞/俯卧撑/坐/昂首等(异步)
+    enabled: true
 
   # ★ 新增卡：新建 <卡名>.py 后，在这里加一行 `<卡名>: { enabled: true }` 打开它。
   #   main.py 会按 config 里的 key 自动 import 同名模块（key == 模块名 == 文件名 == 卡名）。
