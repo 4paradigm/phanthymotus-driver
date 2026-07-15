@@ -522,6 +522,11 @@ class FlightPlugin:
                         "vy": {"type": "number", "description": "侧移速度 (m/s)，正=右"},
                         "vz": {"type": "number", "description": "升降速度 (m/s)，正=上"},
                         "vyaw": {"type": "number", "description": "偏航角速度 (deg/s)，正=顺时针"},
+                        "require_rc_confirm": {
+                            "type": "boolean",
+                            "description": "降落是否需要遥控器确认 (true=需确认, false=自动确认)",
+                            "default": True,
+                        },
                         "lat": {"type": "number", "description": "纬度 (返航点)"},
                         "lon": {"type": "number", "description": "经度 (返航点)"},
                         "enabled": {
