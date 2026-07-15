@@ -11,11 +11,12 @@ WORKDIR /work
 
 # ① 把不可达的腾讯内网 apt 源替换成可达源；② 只装 SDK 构建真正需要的包
 #    (unitree_legged_sdk python_wrapper 只需 cmake/g++/python3-dev + msgpack)；
-#    ③ sshpass 供 deploy/nano_bootstrap.sh 首启时自动 SSH 到 Nano 部署 beep/camera 后端。
+#    ③ sshpass + openssh-client 供 deploy/nano_bootstrap.sh 首启时自动 SSH 到 Nano 部署 beep/camera 后端
+#       （sshpass 只是包装器，真正连接要 openssh-client 提供的 ssh/scp；ROS base 默认不带，须显式装）。
 RUN find /etc/apt \( -name '*.list' -o -name '*.sources' \) -exec sed -i "s|mirrors.tencentyun.com|${APT_MIRROR_HOST}|g" {} + ; \
     apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
-        python3-pip python3-dev cmake build-essential git libmsgpack-dev sshpass && \
+        python3-pip python3-dev cmake build-essential git libmsgpack-dev sshpass openssh-client && \
     rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /work/requirements.txt
@@ -38,12 +39,9 @@ COPY main.py           /work/main.py
 COPY go1_sdk_client.py /work/go1_sdk_client.py
 COPY loco_state.py     /work/loco_state.py
 COPY battery.py        /work/battery.py
-<<<<<<< HEAD
 COPY spin.py           /work/spin.py
-=======
 COPY beep.py           /work/beep.py
 COPY camera_rgb.py     /work/camera_rgb.py
->>>>>>> b170068 (feat: 补充beep卡片和camera_rgb卡片)
 COPY config.yaml       /work/config.yaml
 COPY deploy/           /deploy/
 # Nano 侧后端源码放进 /deploy/，供 nano_bootstrap.sh 首启时分发/编译到 Head Nano：

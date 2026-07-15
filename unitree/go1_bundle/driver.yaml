@@ -6,9 +6,4 @@ hardware_model: "go1"
 image_name: go1_bundle
 port: 15717
 mcp_url: "http://localhost:15717/mcp"
-<<<<<<< HEAD
-description: "Unitree Go1 (EDU) 状态+基础控制驱动（原始 unitree_legged_sdk）— 状态卡：运动状态(loco_state) + 电池(battery)；控制卡：原地转圈(spin，闭环读 IMU yaw 自停)。可作为新增卡片的开发蓝本，见 CONTRIBUTING.md。"
-=======
-description: "Unitree Go1 (EDU) 只读状态驱动（原始 unitree_legged_sdk）— 状态卡：运动状态(loco_state) + 电池(battery)。可作为新增卡片的开发蓝本，见 CONTRIBUTING.md。"
-
->>>>>>> b170068 (feat: 补充beep卡片和camera_rgb卡片)
+description: "Unitree Go1 (EDU) 驱动 bundle — 状态卡：运动状态(loco_state)+电池(battery)；控制卡：原地转圈(spin，闭环读 IMU yaw 自停)；动作/传感卡：头部扬声器(beep)+前置RGB相机(camera_rgb)。beep/camera 的 Nano 后端由容器首启时的 deploy/nano_bootstrap.sh 自动部署，无需手动布 Nano。可作为新增卡片的开发蓝本，见 CONTRIBUTING.md。"

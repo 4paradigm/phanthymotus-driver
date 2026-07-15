@@ -292,9 +292,9 @@ class _CameraRgbInstance:
                 return _err("PRECONDITION_FAILED", f"instance {self._position} already running",
                             **self._status_running())
 
-            mode = req_cfg.get("mode", self._defaults.get("mode", "rectified_mono"))
+            mode = req_cfg.get("mode", self._defaults.get("mode", "raw_mono"))
             frame_size = req_cfg.get("frame_size", self._defaults.get("frame_size", "928x400"))
-            fps = int(req_cfg.get("fps", self._defaults.get("fps", 30)))
+            fps = int(req_cfg.get("fps", self._defaults.get("fps", 60)))
 
             # ── 参数校验（§7：越界拒绝，不静默截断）──
             if mode not in _VALID_MODES:
@@ -381,26 +381,6 @@ class _CameraRgbInstance:
             return {"ok": True, "card": "camera_rgb", "action": "stop",
                     "control_level": "CAMERA", "timestamp_ms": _now_ms(),
                     "applied": {"position": self._position}, "state": "idle"}
-
-    def snapshot(self, eye: str | None) -> dict:
-        with self._lock:
-            if self._state != "running":
-                return _err("PRECONDITION_FAILED", f"instance {self._position} not running; start it first")
-            eye = eye or "mono"
-            if eye not in ("mono", "left", "right"):
-                return _err("INVALID_ARGUMENT", "eye must be one of mono/left/right")
-            resp = self._client.request(
-                {"cmd": "snapshot", "device_id": self._device_id, "eye": eye}, timeout_sec=3.0)
-            if not resp.get("ok"):
-                return _err(resp.get("code", "COMMUNICATION_ERROR"),
-                            resp.get("message", "adapter snapshot failed"))
-            # 快照帧仍走图像 topic（§8.3：snapshot 返回 captured + topic + seq + timestamp）。
-            topic = next((s["topic"] for s in self._streams if eye in s["eye"] or s["eye"] == eye),
-                         self._streams[0]["topic"] if self._streams else "")
-            return {"ok": True, "card": "camera_rgb", "action": "snapshot",
-                    "control_level": "CAMERA", "timestamp_ms": _now_ms(),
-                    "captured": True, "eye": eye, "topic": topic,
-                    "seq": resp.get("seq"), "timestamp_us": resp.get("timestamp_us")}
 
     def info(self) -> dict:
         with self._lock:
@@ -490,9 +470,12 @@ class CameraRgbPlugin:
         self._receive_ip = self._cfg.get("receive_ip", os.environ.get("GO1_CAMERA_RECV_IP", "192.168.123.161"))
         self._probe_timeout = float(self._cfg.get("probe_timeout_sec", 0.5))
         self._defaults = {
-            "mode": self._cfg.get("default_mode", "rectified_mono"),
+            # 默认 raw_mono：跳过 Nano CPU 立体校正（rectified_* 会 getRectStereoFrame 对左右目都校正、
+            # 只用一路，在 Nano ARM 上把帧率压得很低）。raw_mono 直接取原始帧 → 帧率高且稳。
+            "mode": self._cfg.get("default_mode", "raw_mono"),
             "frame_size": self._cfg.get("default_frame_size", "928x400"),
-            "fps": int(self._cfg.get("default_fps", 30)),
+            # 60fps：928x400 官方支持 30/60。fps 由 start 时下发给 Nano adapter（它据此 setRawFrameRate 重开相机）。
+            "fps": int(self._cfg.get("default_fps", 60)),
         }
         positions_cfg = self._cfg.get("positions", _DEFAULT_POSITIONS)
 
@@ -537,24 +520,23 @@ class CameraRgbPlugin:
             "description": (
                 "Go1 front RGB camera via on-board UnitreecameraSDK adapter. "
                 + ("Front camera online. " if available else "Front camera NOT reachable. ")
-                + "Publishes one JPEG stream to /{ns}/vision/front/mono."
+                + "start opens the camera and streams JPEG (raw_mono 928x400@60) to /{ns}/vision/front/mono."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["info", "start", "stop", "snapshot"],
-                        "description": "Lifecycle / capture action (front camera)",
+                        "enum": ["info", "start", "stop"],
+                        "description": "Lifecycle action (front camera)",
                     },
-                    # 单相机(front)、无 instance_id；画质固定服务端默认 rectified_mono。
+                    # 单相机(front)、无 instance_id；画质固定服务端默认 raw_mono 928x400@60（config 可调）。
                 },
                 "required": ["action"],
                 "x-action-params": {
                     "info":     {"params": [], "description": "Status, resolution, fps, calibration, topic"},
                     "start":    {"params": [], "description": "Open the front camera and stream JPEG to /vision/front/mono"},
                     "stop":     {"params": [], "description": "Stop the front camera stream"},
-                    "snapshot": {"params": [], "description": "Request a single frame; delivered on the image topic"},
                 },
             },
             # 本卡只输出这一路 JPEG topic（用户选定：无 camera_info 等其它 topic）。
@@ -585,8 +567,6 @@ class CameraRgbPlugin:
             return inst.start(cfg)
         if action == "stop":
             return inst.stop()
-        if action == "snapshot":
-            return inst.snapshot(args.get("eye"))
         return _err("INVALID_ARGUMENT", f"unsupported action {action!r}")
 
 
