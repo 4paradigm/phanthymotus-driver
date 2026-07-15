@@ -38,6 +38,11 @@ COPY go1_sdk_client.py /work/go1_sdk_client.py
 COPY loco_state.py     /work/loco_state.py
 COPY battery.py        /work/battery.py
 COPY spin.py           /work/spin.py
+COPY imu.py            /work/imu.py
+COPY feet.py           /work/feet.py
+COPY fall_alarm.py     /work/fall_alarm.py
+COPY net.py            /work/net.py
+COPY odometry.py       /work/odometry.py
 COPY obstacle_range.py /work/obstacle_range.py
 COPY config.yaml       /work/config.yaml
 COPY deploy/           /deploy/
