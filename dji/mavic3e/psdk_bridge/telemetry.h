@@ -17,6 +17,12 @@ int telemetry_get_json(char *buf, size_t buflen);
  * @return number of satellites used (0 if no fix) */
 int telemetry_get_gps_satellite_count(void);
 
+/* Get current flight display mode (E_DjiFcSubscriptionDisplayMode) */
+int telemetry_get_display_mode(void);
+
+/* Get current fused altitude above home point (meters) */
+float telemetry_get_altitude(void);
+
 /* Cleanup telemetry subscriptions. */
 void telemetry_cleanup(void);
 

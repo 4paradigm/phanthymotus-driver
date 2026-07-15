@@ -186,6 +186,14 @@ int telemetry_get_gps_satellite_count(void) {
     return (int)s_gps_detail.totalSatelliteNumberUsed;
 }
 
+int telemetry_get_display_mode(void) {
+    return (int)s_display_mode;
+}
+
+float telemetry_get_altitude(void) {
+    return (float)(s_alt_fused - s_alt_home);
+}
+
 void telemetry_cleanup(void) {
     DjiFcSubscription_DeInit();
     printf("[telemetry] cleaned up\n");
@@ -213,6 +221,8 @@ int telemetry_get_json(char *buf, size_t buflen) {
 }
 
 int telemetry_get_gps_satellite_count(void) { return 0; }
+int telemetry_get_display_mode(void) { return 0; }
+float telemetry_get_altitude(void) { return 0; }
 void telemetry_cleanup(void) {}
 
 #endif
