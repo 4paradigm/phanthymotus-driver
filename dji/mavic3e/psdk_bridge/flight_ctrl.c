@@ -104,11 +104,16 @@ static T_DjiReturnCode _authority_event_cb(T_DjiFlightControllerJoystickCtrlAuth
         case 12: reason = "NEAR_BOUNDARY"; break;
         case 13: reason = "DOCK_REQUEST"; break;
     }
-    printf("[flight] authority changed → %s (reason=%s)\n", owner, reason);
+    printf("[flight] authority → %s (trigger: %s)\n", owner, reason);
 
     if (eventData.curJoystickCtrlAuthority != 4 /* PSDK */) {
         if (s_move_active) {
-            printf("[flight] authority lost, stopping move thread\n");
+            /* Distinguish: PSDK released voluntarily vs. RC/system took over */
+            if (eventData.joystickCtrlAuthoritySwitchEvent == 3) {
+                printf("[flight] PSDK released authority (RC stick or duration)\n");
+            } else {
+                printf("[flight] authority taken by external event, stopping move\n");
+            }
             s_move_active = 0;
         }
         s_has_authority = 0;
