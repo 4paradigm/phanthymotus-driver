@@ -32,6 +32,7 @@
 static T_DjiFcSubscriptionQuaternion s_quaternion;
 static T_DjiFcSubscriptionVelocity s_velocity;
 static T_DjiFcSubscriptionGpsPosition s_gps_pos;
+static T_DjiFcSubscriptionPositionFused s_pos_fused;
 static T_DjiFcSubscriptionGpsDetails s_gps_detail;
 static T_DjiFcSubscriptionAltitudeFused s_alt_fused;
 static T_DjiFcSubscriptionAltitudeOfHomePoint s_alt_home;
@@ -57,6 +58,12 @@ static T_DjiReturnCode _velocity_cb(const uint8_t *data, uint16_t size, const T_
 static T_DjiReturnCode _gps_cb(const uint8_t *data, uint16_t size, const T_DjiDataTimestamp *ts) {
     if (size >= sizeof(s_gps_pos))
         memcpy(&s_gps_pos, data, sizeof(s_gps_pos));
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
+static T_DjiReturnCode _pos_fused_cb(const uint8_t *data, uint16_t size, const T_DjiDataTimestamp *ts) {
+    if (size >= sizeof(s_pos_fused))
+        memcpy(&s_pos_fused, data, sizeof(s_pos_fused));
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
 
@@ -124,12 +131,13 @@ int telemetry_init(void) {
     }
 
     /* Subscribe at 10Hz (suitable topics) */
-    DjiFcSubscription_SubscribeTopic(DJI_FC_SUBSCRIPTION_TOPIC_QUATERNION, DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, _quaternion_cb);
-    DjiFcSubscription_SubscribeTopic(DJI_FC_SUBSCRIPTION_TOPIC_VELOCITY, DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, _velocity_cb);
+    rc = DjiFcSubscription_SubscribeTopic(DJI_FC_SUBSCRIPTION_TOPIC_QUATERNION, DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, _quaternion_cb);
+    rc = DjiFcSubscription_SubscribeTopic(DJI_FC_SUBSCRIPTION_TOPIC_VELOCITY, DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, _velocity_cb);
     DjiFcSubscription_SubscribeTopic(DJI_FC_SUBSCRIPTION_TOPIC_GPS_POSITION, DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, _gps_cb);
-    DjiFcSubscription_SubscribeTopic(DJI_FC_SUBSCRIPTION_TOPIC_GPS_DETAILS, DJI_DATA_SUBSCRIPTION_TOPIC_1_HZ, _gps_detail_cb);
-    DjiFcSubscription_SubscribeTopic(DJI_FC_SUBSCRIPTION_TOPIC_ALTITUDE_FUSED, DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, _alt_fused_cb);
-    DjiFcSubscription_SubscribeTopic(DJI_FC_SUBSCRIPTION_TOPIC_ALTITUDE_OF_HOMEPOINT, DJI_DATA_SUBSCRIPTION_TOPIC_1_HZ, _alt_home_cb);
+    rc = DjiFcSubscription_SubscribeTopic(DJI_FC_SUBSCRIPTION_TOPIC_POSITION_FUSED, DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, _pos_fused_cb);
+    rc = DjiFcSubscription_SubscribeTopic(DJI_FC_SUBSCRIPTION_TOPIC_GPS_DETAILS, DJI_DATA_SUBSCRIPTION_TOPIC_1_HZ, _gps_detail_cb);
+    rc = DjiFcSubscription_SubscribeTopic(DJI_FC_SUBSCRIPTION_TOPIC_ALTITUDE_FUSED, DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, _alt_fused_cb);
+    rc = DjiFcSubscription_SubscribeTopic(DJI_FC_SUBSCRIPTION_TOPIC_ALTITUDE_OF_HOMEPOINT, DJI_DATA_SUBSCRIPTION_TOPIC_1_HZ, _alt_home_cb);
     DjiFcSubscription_SubscribeTopic(DJI_FC_SUBSCRIPTION_TOPIC_STATUS_FLIGHT, DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, _flight_status_cb);
     DjiFcSubscription_SubscribeTopic(DJI_FC_SUBSCRIPTION_TOPIC_STATUS_DISPLAYMODE, DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, _display_mode_cb);
     DjiFcSubscription_SubscribeTopic(DJI_FC_SUBSCRIPTION_TOPIC_BATTERY_SINGLE_INFO_INDEX1, DJI_DATA_SUBSCRIPTION_TOPIC_1_HZ, _battery_cb);
@@ -149,6 +157,19 @@ int telemetry_get_json(char *buf, size_t buflen) {
     double pitch = asin(2.0*(q0*q2 - q3*q1)) * 180.0 / M_PI;
     double yaw   = atan2(2.0*(q0*q3 + q1*q2), 1.0 - 2.0*(q2*q2 + q3*q3)) * 180.0 / M_PI;
 
+    /* Use POSITION_FUSED as primary source (works in simulator),
+     * fall back to GPS_POSITION if fused is 0 */
+    double lat_deg, lon_deg, gps_alt;
+    if (s_pos_fused.latitude != 0 || s_pos_fused.longitude != 0) {
+        lat_deg = s_pos_fused.latitude * 180.0 / M_PI;
+        lon_deg = s_pos_fused.longitude * 180.0 / M_PI;
+        gps_alt = (double)s_pos_fused.altitude;
+    } else {
+        lat_deg = (double)s_gps_pos.y / 1e7;
+        lon_deg = (double)s_gps_pos.x / 1e7;
+        gps_alt = (double)s_gps_pos.z / 1000.0;
+    }
+
     snprintf(buf, buflen,
         "{"
         "\"position\":{\"latitude\":%.8f,\"longitude\":%.8f,\"altitude\":%.2f,"
@@ -157,7 +178,7 @@ int telemetry_get_json(char *buf, size_t buflen) {
         "\"yaw\":%.2f,\"pitch\":%.2f,\"roll\":%.2f},"
         "\"velocity\":{\"vx\":%.3f,\"vy\":%.3f,\"vz\":%.3f},"
         "\"battery\":{\"percent\":%d,\"voltage\":%.1f},"
-        "\"gps\":{\"satellites\":%d,\"fix_type\":%d},"
+        "\"gps\":{\"satellites\":%d,\"gps_used\":%d,\"glonass_used\":%d,\"fix_type\":%d},"
         "\"compass\":{\"heading\":%.1f},"
         "\"obstacles\":{\"front\":%.1f,\"back\":%.1f,\"left\":%.1f,"
         "\"right\":%.1f,\"up\":%.1f,\"down\":%.1f},"
@@ -165,13 +186,16 @@ int telemetry_get_json(char *buf, size_t buflen) {
         "\"right_stick_x\":%d,\"right_stick_y\":%d},"
         "\"flight_status\":%d,\"flight_mode\":%d"
         "}",
-        (double)s_gps_pos.x / 1e7, (double)s_gps_pos.y / 1e7,
-        (double)s_gps_pos.z / 1000.0,
+        /* GPS_POSITION: x=Longitude, y=Latitude, z=Altitude(mm) — per PSDK docs */
+        lat_deg, lon_deg, gps_alt,
         (double)s_alt_fused, (double)s_alt_home,
         q0, q1, q2, q3, yaw, pitch, roll,
         (double)s_velocity.data.x, (double)s_velocity.data.y, (double)s_velocity.data.z,
         (int)s_battery.batteryCapacityPercent, (double)s_battery.currentVoltage / 1000.0,
-        (int)s_gps_detail.gpsSatelliteNumberUsed, (int)s_gps_detail.fixState,
+        (int)s_gps_detail.totalSatelliteNumberUsed,
+        (int)s_gps_detail.gpsSatelliteNumberUsed,
+        (int)s_gps_detail.glonassSatelliteNumberUsed,
+        (int)s_gps_detail.fixState,
         (double)s_compass.x,
         (double)s_avoid.front, (double)s_avoid.back,
         (double)s_avoid.left, (double)s_avoid.right,

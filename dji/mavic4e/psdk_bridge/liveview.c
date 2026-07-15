@@ -6,7 +6,7 @@
 #include <pthread.h>
 
 /*
- * PSDK Liveview for Mavic 4E — FFmpeg H.264 decode + scale to 720x540 + JPEG.
+ * PSDK Liveview for Mavic 3E — FFmpeg H.264 decode + scale to 720x540 + JPEG.
  * Output to /dev/shm/dji_frame.jpg (shared memory, no disk IO).
  */
 

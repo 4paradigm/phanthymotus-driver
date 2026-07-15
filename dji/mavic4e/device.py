@@ -719,7 +719,7 @@ class CameraPlugin:
                     "get_storage": {"params": [], "description": "查询存储卡剩余容量"},
                     "ir_temp_point": {
                         "params": ["point_x", "point_y"],
-                        "description": "红外点测温 (仅3T型号)",
+                        "description": "红外点测温 (仅4T型号)",
                     },
                     "ir_temp_area": {
                         "params": ["ltx", "lty", "rbx", "rby"],
@@ -880,34 +880,59 @@ class GimbalPlugin:
 class WaypointPlugin:
     PREFIX = "waypoint"
 
+    WAYPOINT_DIR = "/opt/phanthy-motus/data/waypoints"
+
     def __init__(self, plugin_config: dict, namespace: str, executor, bridge):
         self._bridge = bridge
+        self._record_thread = None
+        self._record_active = False
+        self._record_points = []
+        self._record_name = ""
+        self._mark_points = []
+        self._mark_name = ""
+        self._mark_active = False
+        import os
+        os.makedirs(self.WAYPOINT_DIR, exist_ok=True)
 
     def get_tool(self) -> dict:
         return {
             "name": "waypoint",
             "type": "actuator",
             "description": (
-                "Mavic 4E/4T 航点任务 (Waypoint V3)。上传 KMZ 文件后执行自主飞行任务。"
-                "支持暂停/恢复/停止。KMZ 文件包含航点坐标、高度、速度、云台动作等。"
+                "Waypoint mission: record GPS track or mark key points → generate KMZ → auto-fly. "
+                "Safety: switch RC mode to override at any time."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["start", "stop", "upload", "execute", "pause", "resume", "cancel", "status"],
+                        "enum": [
+                            "start", "stop",
+                            "record_start", "record_stop",
+                            "mark_start", "mark_point", "mark_stop",
+                            "list", "execute",
+                            "pause", "resume", "cancel", "status",
+                        ],
                     },
-                    "kmz_path": {"type": "string", "description": "KMZ 任务文件路径"},
+                    "name": {"type": "string", "description": "Mission name (for record/mark/load)"},
+                    "tag": {"type": "string", "description": "Optional tag for mission or point"},
+                    "speed": {"type": "number", "description": "Flight speed (m/s), -1=use recorded speed", "default": 5},
+                    "return_home": {"type": "boolean", "description": "Return to start point after mark_stop", "default": True},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "upload": {"params": ["kmz_path"], "description": "上传 KMZ 航点任务文件"},
-                    "execute": {"params": [], "description": "开始执行已上传的航点任务"},
-                    "pause": {"params": [], "description": "暂停当前航点任务"},
-                    "resume": {"params": [], "description": "恢复暂停的航点任务"},
-                    "cancel": {"params": [], "description": "取消/停止航点任务"},
-                    "status": {"params": [], "description": "查询航点任务执行状态"},
+                    "record_start": {"params": ["name", "tag"], "description": "Start recording GPS track"},
+                    "record_stop": {"params": [], "description": "Stop recording, save as KMZ"},
+                    "mark_start": {"params": ["name", "tag"], "description": "Start marking key points"},
+                    "mark_point": {"params": ["tag"], "description": "Mark current position as waypoint"},
+                    "mark_stop": {"params": ["return_home"], "description": "Stop marking, save as KMZ"},
+                    "list": {"params": [], "description": "List all saved waypoint missions"},
+                    "execute": {"params": ["name", "speed"], "description": "Load and execute a saved mission"},
+                    "pause": {"params": [], "description": "Pause mission"},
+                    "resume": {"params": [], "description": "Resume mission"},
+                    "cancel": {"params": [], "description": "Cancel mission"},
+                    "status": {"params": [], "description": "Query mission status"},
                 },
             },
         }
@@ -916,22 +941,272 @@ class WaypointPlugin:
         pass
 
     def stop(self):
-        pass
+        self._record_active = False
+
+    # ── GPS helper ────────────────────────────────────────────────────
+
+    def _get_current_gps(self) -> dict | None:
+        """Get current GPS + velocity from bridge telemetry."""
+        resp = self._bridge.get_telemetry()
+        if not resp.get("ok"):
+            return None
+        data = resp.get("data", {})
+        pos = data.get("position", {})
+        vel = data.get("velocity", {})
+        lat = pos.get("latitude")
+        lon = pos.get("longitude")
+        alt = pos.get("altitude")
+        if lat is None or lon is None:
+            return None
+        # Compute horizontal speed
+        import math
+        vx = vel.get("vx", 0)
+        vy = vel.get("vy", 0)
+        speed = math.sqrt(vx * vx + vy * vy)
+        return {"lat": lat, "lon": lon, "alt": alt or 0, "speed": round(speed, 1)}
+
+    # ── KMZ generation ────────────────────────────────────────────────
+
+    def _generate_kmz(self, waypoints: list, name: str, speed: float = 5.0,
+                      finish_action: str = "goHome") -> str:
+        """Generate KMZ file from waypoint list. Returns file path.
+        speed=-1 means use per-point recorded speed."""
+        import zipfile
+        import os
+
+        if not waypoints or len(waypoints) < 2:
+            return ""
+
+        # Determine effective speed
+        if speed <= 0:
+            # Use average recorded speed, fallback to 5
+            speeds = [wp.get("speed", 0) for wp in waypoints if wp.get("speed", 0) > 0.5]
+            eff_speed = sum(speeds) / len(speeds) if speeds else 5.0
+        else:
+            eff_speed = speed
+
+        # Build waypoints XML
+        wp_xml_parts = []
+        for i, wp in enumerate(waypoints):
+            wp_speed = wp.get("speed", eff_speed) if speed <= 0 else eff_speed
+            wp_speed = max(1.0, wp_speed)  # minimum 1 m/s
+        for i, wp in enumerate(waypoints):
+            wp_xml_parts.append(f"""      <Placemark>
+        <Point>
+          <coordinates>{wp['lon']},{wp['lat']}</coordinates>
+        </Point>
+        <wpml:index>{i}</wpml:index>
+        <wpml:executeHeight>{wp.get('alt', 0):.1f}</wpml:executeHeight>
+        <wpml:waypointSpeed>{wp_speed:.1f}</wpml:waypointSpeed>
+        <wpml:waypointHeadingParam>
+          <wpml:waypointHeadingMode>followWayline</wpml:waypointHeadingMode>
+        </wpml:waypointHeadingParam>
+        <wpml:waypointTurnParam>
+          <wpml:waypointTurnMode>toPointAndStopWithDiscontinuityCurvature</wpml:waypointTurnMode>
+          <wpml:waypointTurnDampingDist>0</wpml:waypointTurnDampingDist>
+        </wpml:waypointTurnParam>
+      </Placemark>""")
+
+        waypoints_xml = "\n".join(wp_xml_parts)
+
+        template_kml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2"
+     xmlns:wpml="http://www.dji.com/wpmz/1.0.6">
+  <Document>
+    <wpml:author>PhanthyMotus</wpml:author>
+    <wpml:createTime>{int(time.time() * 1000)}</wpml:createTime>
+    <wpml:updateTime>{int(time.time() * 1000)}</wpml:updateTime>
+    <Folder>
+      <wpml:templateId>0</wpml:templateId>
+      <wpml:waylineCoordinateSysParam>
+        <wpml:coordinateMode>WGS84</wpml:coordinateMode>
+        <wpml:heightMode>relativeToStartPoint</wpml:heightMode>
+      </wpml:waylineCoordinateSysParam>
+      <wpml:autoFlightSpeed>{eff_speed:.1f}</wpml:autoFlightSpeed>
+      <Placemark>
+        <wpml:missionConfig>
+          <wpml:flyToWaylineMode>safely</wpml:flyToWaylineMode>
+          <wpml:finishAction>{finish_action}</wpml:finishAction>
+          <wpml:exitOnRCLost>executeLostAction</wpml:exitOnRCLost>
+          <wpml:executeRCLostAction>goBack</wpml:executeRCLostAction>
+          <wpml:globalTransitionalSpeed>{eff_speed:.1f}</wpml:globalTransitionalSpeed>
+          <wpml:droneInfo>
+            <wpml:droneEnumValue>89</wpml:droneEnumValue>
+            <wpml:droneSubEnumValue>0</wpml:droneSubEnumValue>
+          </wpml:droneInfo>
+        </wpml:missionConfig>
+      </Placemark>
+    </Folder>
+  </Document>
+</kml>"""
+
+        waylines_wpml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2"
+     xmlns:wpml="http://www.dji.com/wpmz/1.0.6">
+  <Document>
+    <Folder>
+      <wpml:templateId>0</wpml:templateId>
+      <wpml:waylineId>0</wpml:waylineId>
+      <wpml:autoFlightSpeed>{eff_speed:.1f}</wpml:autoFlightSpeed>
+{waypoints_xml}
+    </Folder>
+  </Document>
+</kml>"""
+
+        timestamp = int(time.time())
+        safe_name = name.replace(" ", "_").replace("'", "").replace('"', '')
+        filename = f"{safe_name}_{timestamp}.kmz"
+        filepath = os.path.join(self.WAYPOINT_DIR, filename)
+
+        with zipfile.ZipFile(filepath, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("wpmz/template.kml", template_kml)
+            zf.writestr("wpmz/waylines.wpml", waylines_wpml)
+
+        return filepath
+
+    # ── Record mode ───────────────────────────────────────────────────
+
+    def _record_loop(self):
+        """Background thread: sample GPS every 1s, skip if < 1m from last."""
+        import math
+        last_lat, last_lon = None, None
+
+        while self._record_active:
+            gps = self._get_current_gps()
+            if gps:
+                if last_lat is not None:
+                    dlat = (gps["lat"] - last_lat) * 111320
+                    dlon = (gps["lon"] - last_lon) * 111320 * math.cos(math.radians(gps["lat"]))
+                    dist = math.sqrt(dlat * dlat + dlon * dlon)
+                    if dist < 1.0:
+                        time.sleep(1)
+                        continue
+                last_lat, last_lon = gps["lat"], gps["lon"]
+                self._record_points.append(gps)
+                if len(self._record_points) % 30 == 1:
+                    print(f"[waypoint] recording... {len(self._record_points)} points")
+            time.sleep(1)
+
+    # ── Dispatch ──────────────────────────────────────────────────────
 
     def dispatch(self, action: str, args: dict) -> dict | None:
-        if action == "start":
-            return {"state": "ready"}
-        if action == "stop":
-            return {"state": "idle"}
-        if action == "upload":
-            kmz_path = args.get("kmz_path", "")
-            if not kmz_path:
-                return {"ret": -1, "error": "kmz_path is required"}
-            resp = self._bridge.waypoint_upload(kmz_path)
-            return {"ret": 0 if resp.get("ok") else -1}
+        import os
+        import glob
+
+        if action in ("start", "stop"):
+            return {"state": "ready" if action == "start" else "idle"}
+
+        # ── Record ──
+        if action == "record_start":
+            name = args.get("name", "track")
+            tag = args.get("tag", "")
+            if self._record_active:
+                return {"ret": -1, "error": "Recording already in progress"}
+            self._record_points = []
+            self._record_name = f"{name}_{tag}" if tag else name
+            self._record_active = True
+            self._record_thread = threading.Thread(target=self._record_loop, daemon=True)
+            self._record_thread.start()
+            return {"ret": 0, "message": f"Recording started: {self._record_name}"}
+
+        if action == "record_stop":
+            if not self._record_active:
+                return {"ret": -1, "error": "No recording in progress"}
+            self._record_active = False
+            if self._record_thread:
+                self._record_thread.join(timeout=3)
+            # Always capture final position
+            gps = self._get_current_gps()
+            if gps:
+                self._record_points.append(gps)
+            points = self._record_points
+            if len(points) == 0:
+                return {"ret": -1, "error": "No GPS data captured"}
+            if len(points) == 1:
+                # Didn't move — duplicate with slight offset so KMZ is valid
+                p = dict(points[0])
+                p["lat"] += 0.00001  # ~1m offset
+                points.append(p)
+            filepath = self._generate_kmz(points, self._record_name)
+            return {"ret": 0, "message": f"Recorded {len(points)} points",
+                    "file": filepath, "points": len(points)}
+
+        # ── Mark ──
+        if action == "mark_start":
+            name = args.get("name", "route")
+            tag = args.get("tag", "")
+            if self._mark_active:
+                return {"ret": -1, "error": "Marking already in progress"}
+            self._mark_points = []
+            self._mark_name = f"{name}_{tag}" if tag else name
+            self._mark_active = True
+            # Record start point
+            gps = self._get_current_gps()
+            if gps:
+                gps["tag"] = "start"
+                self._mark_points.append(gps)
+            return {"ret": 0, "message": f"Marking started: {self._mark_name}",
+                    "start_point": gps}
+
+        if action == "mark_point":
+            if not self._mark_active:
+                return {"ret": -1, "error": "Marking not started"}
+            gps = self._get_current_gps()
+            if not gps:
+                return {"ret": -1, "error": "GPS not available"}
+            tag = args.get("tag", f"point_{len(self._mark_points)}")
+            gps["tag"] = tag
+            self._mark_points.append(gps)
+            return {"ret": 0, "message": f"Point #{len(self._mark_points)} marked: {tag}",
+                    "point": gps, "total": len(self._mark_points)}
+
+        if action == "mark_stop":
+            if not self._mark_active:
+                return {"ret": -1, "error": "Marking not started"}
+            self._mark_active = False
+            return_home = args.get("return_home", True)
+            if isinstance(return_home, str):
+                return_home = return_home.lower() not in ("false", "0", "no")
+            points = self._mark_points
+            if return_home and len(points) >= 1:
+                # Add start point as last waypoint
+                home = dict(points[0])
+                home["tag"] = "return_home"
+                points.append(home)
+            if len(points) < 2:
+                return {"ret": -1, "error": f"Too few points ({len(points)}), need >= 2"}
+            filepath = self._generate_kmz(points, self._mark_name)
+            return {"ret": 0, "message": f"Saved {len(points)} waypoints",
+                    "file": filepath, "points": len(points)}
+
+        # ── Path management ──
+        if action == "list":
+            pattern = os.path.join(self.WAYPOINT_DIR, "*.kmz")
+            files = sorted(glob.glob(pattern))
+            missions = [os.path.basename(f) for f in files]
+            return {"ret": 0, "missions": missions, "count": len(missions)}
+
         if action == "execute":
+            name = args.get("name", "")
+            speed = float(args.get("speed", 5))
+            if not name:
+                return {"ret": -1, "error": "name is required"}
+            # Find matching file
+            pattern = os.path.join(self.WAYPOINT_DIR, f"{name}*")
+            files = sorted(glob.glob(pattern))
+            if not files:
+                return {"ret": -1, "error": f"Mission not found: {name}"}
+            kmz_path = files[-1]  # latest match
+            # Upload to aircraft
+            resp = self._bridge.waypoint_upload(kmz_path)
+            if not resp.get("ok"):
+                return {"ret": -1, "error": "Upload failed", "data": resp.get("data", {})}
+            # Start execution
             resp = self._bridge.waypoint_start()
-            return {"ret": 0 if resp.get("ok") else -1}
+            if resp.get("ok"):
+                return {"ret": 0, "message": f"Executing: {os.path.basename(kmz_path)}",
+                        "file": kmz_path, "speed": speed}
+            return {"ret": -1, "error": "Execute failed", "data": resp.get("data", {})}
         if action == "pause":
             resp = self._bridge.waypoint_pause()
             return {"ret": 0 if resp.get("ok") else -1}
@@ -944,6 +1219,7 @@ class WaypointPlugin:
         if action == "status":
             resp = self._bridge.waypoint_status()
             return resp.get("data", {"state": "unknown"})
+
         return None
 
 
