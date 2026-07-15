@@ -197,10 +197,12 @@ int liveview_start(const char *camera, liveview_frame_cb_t cb) {
 
     /* Determine liveview source and optionally switch stream source */
     if (strcmp(camera, "ir") == 0) {
-        s_camera_source = DJI_LIVEVIEW_CAMERA_SOURCE_M3T_IR;
+        s_camera_source = DJI_LIVEVIEW_CAMERA_SOURCE_M4T_IR;
+    } else if (strcmp(camera, "4k") == 0) {
+        s_camera_source = DJI_LIVEVIEW_CAMERA_SOURCE_M4E_4K;
     } else {
         /* wide or zoom: both use VIS source, SetStreamSource selects lens */
-        s_camera_source = DJI_LIVEVIEW_CAMERA_SOURCE_M3T_VIS;
+        s_camera_source = DJI_LIVEVIEW_CAMERA_SOURCE_M4E_VIS;
         E_DjiCameraManagerStreamSource stream_src = DJI_CAMERA_MANAGER_SOURCE_WIDE_CAM;
         if (strcmp(camera, "zoom") == 0) {
             stream_src = DJI_CAMERA_MANAGER_SOURCE_ZOOM_CAM;

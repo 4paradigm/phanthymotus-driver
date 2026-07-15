@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-dji/mavic3e/device.py — DJI Mavic 3E 无人机设备插件。
+dji/mavic4e/device.py — DJI Mavic 4E/4T 无人机设备插件。
 
 设计原则：
   - 一个设备 = 一个 tool，tool schema 含 type 字段（sensor / actuator）
@@ -46,7 +46,7 @@ _LOW_LAT_QOS = QoSProfile(
 
 class _TelemetryNode(Node):
     def __init__(self, topic: str, bridge, publish_rate: int = 10):
-        super().__init__("mavic3e_telemetry")
+        super().__init__("mavic4e_telemetry")
         self._topic = topic
         self._bridge = bridge
         self._pub = self.create_publisher(String, topic, _LOW_LAT_QOS)
@@ -92,7 +92,7 @@ class TelemetryPlugin:
         return {
             "name": "telemetry",
             "type": "sensor",
-            "description": "DJI Mavic 3E 遥测数据：GPS位置、姿态、速度、电池、卫星、避障距离、飞行状态。",
+            "description": "DJI Mavic 4E/4T 遥测数据：GPS位置、姿态、速度、电池、卫星、避障距离、飞行状态。",
             "topic_out": [{"topic": self._topic, "format": "data/json"}],
             "inputSchema": {
                 "type": "object",
@@ -134,7 +134,7 @@ class TelemetryPlugin:
 
 class _CameraStreamNode(Node):
     def __init__(self, topic: str, bridge, fps: int = 10, camera: str = "wide"):
-        super().__init__(f"mavic3e_cam_{camera}")
+        super().__init__(f"mavic4e_cam_{camera}")
         self._topic = topic
         self._bridge = bridge
         self._pub = self.create_publisher(CompressedImage, topic, _LOW_LAT_QOS)
@@ -208,7 +208,7 @@ class CameraStreamPlugin:
             "name": "camera_stream",
             "type": "sensor",
             "multiInstance": True,
-            "description": "Mavic 3E 相机实时码流 (H.264 解码 → JPEG)。支持广角/变焦/红外(3T)镜头切换。每个实例独立选择镜头。",
+            "description": "Mavic 4E/4T 相机实时码流 (H.264 解码 → JPEG)。支持广角/变焦/红外(3T)镜头切换。每个实例独立选择镜头。",
             "topic_out": [{"format": "image/jpeg", "desc": "camera JPEG stream"}],
             "configSchema": {
                 "type": "object",
@@ -218,9 +218,10 @@ class CameraStreamPlugin:
                         "description": "Camera source",
                         "scope": "instance",
                         "oneOf": [
-                            {"const": "wide", "title": "Wide (广角 24mm)"},
-                            {"const": "zoom", "title": "Zoom (变焦 162mm)"},
-                            {"const": "ir", "title": "IR Thermal (红外，仅3T)"},
+                            {"const": "wide", "title": "Wide (广角)"},
+                            {"const": "zoom", "title": "Zoom (变焦 70mm)"},
+                            {"const": "ir", "title": "IR Thermal (红外，仅4T)"},
+                            {"const": "4k", "title": "4K"},
                         ],
                     },
                 },
@@ -301,7 +302,7 @@ class CameraStreamPlugin:
 
 class _PerceptionNode(Node):
     def __init__(self, namespace: str, bridge):
-        super().__init__("mavic3e_perception")
+        super().__init__("mavic4e_perception")
         self._namespace = namespace
         self._bridge = bridge
         self._pubs: dict[str, object] = {}
@@ -343,7 +344,7 @@ class PerceptionPlugin:
             "name": "perception",
             "type": "sensor",
             "multiInstance": True,
-            "description": "Mavic 3E 感知避障图像。6个方向 (前/后/左/右/上/下) 灰度图，上下640x480，其余480x480，最多同时2路。",
+            "description": "Mavic 4E/4T 感知避障图像。6个方向 (前/后/左/右/上/下) 灰度图，上下640x480，其余480x480，最多同时2路。",
             "topic_out": [{"topic": f"/{self._namespace}/perception/{{direction}}", "format": "image/jpeg"}],
             "configSchema": {
                 "type": "object",
@@ -410,7 +411,7 @@ class PerceptionPlugin:
 
 class _HmsNode(Node):
     def __init__(self, topic: str, bridge):
-        super().__init__("mavic3e_hms")
+        super().__init__("mavic4e_hms")
         self._topic = topic
         self._bridge = bridge
         self._pub = self.create_publisher(String, topic, _LOW_LAT_QOS)
@@ -452,7 +453,7 @@ class HmsPlugin:
         return {
             "name": "hms",
             "type": "sensor",
-            "description": "Mavic 3E 健康管理系统 (HMS) 告警。监控飞行器/负载健康状态，输出告警事件。",
+            "description": "Mavic 4E/4T 健康管理系统 (HMS) 告警。监控飞行器/负载健康状态，输出告警事件。",
             "topic_out": [{"topic": self._topic, "format": "data/json"}],
             "inputSchema": {
                 "type": "object",
@@ -504,7 +505,7 @@ class FlightPlugin:
             {
                 "name": "flight",
                 "type": "actuator",
-                "description": "Mavic 3T 飞行控制。安全提示：SDK 控制期间遥控器摇杆无效，切换档位(T/P/S)可立即夺回控制权。",
+                "description": "Mavic 4E/4T 飞行控制。安全提示：SDK 控制期间遥控器摇杆无效，切换档位(T/P/S)可立即夺回控制权。",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -621,7 +622,7 @@ class FlightPlugin:
                 duration = float(duration)
             except (TypeError, ValueError):
                 duration = -1
-            # Clamp velocities to Mavic 3T limits
+            # Clamp velocities to Mavic 4E/4T limits
             vx = max(-15, min(15, float(args.get("vx", 0))))
             vy = max(-15, min(15, float(args.get("vy", 0))))
             vz = max(-6, min(6, float(args.get("vz", 0))))
@@ -675,7 +676,7 @@ class CameraPlugin:
         return {
             "name": "camera",
             "type": "actuator",
-            "description": "Mavic 3E 相机管理：拍照、录像、变焦、对焦、曝光、存储查询、红外测温(3T)。",
+            "description": "Mavic 4E/4T 相机管理：拍照、录像、变焦、对焦、曝光、存储查询、红外测温(3T)。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -718,7 +719,7 @@ class CameraPlugin:
                     "get_storage": {"params": [], "description": "查询存储卡剩余容量"},
                     "ir_temp_point": {
                         "params": ["point_x", "point_y"],
-                        "description": "红外点测温 (仅3T型号)",
+                        "description": "红外点测温 (仅4T型号)",
                     },
                     "ir_temp_area": {
                         "params": ["ltx", "lty", "rbx", "rby"],
@@ -792,7 +793,7 @@ class CameraPlugin:
 class GimbalPlugin:
     PREFIX = "gimbal"
 
-    # Mavic 3E gimbal range (narrower than M300/M350)
+    # Mavic 4E/4T gimbal range (narrower than M300/M350)
     PITCH_RANGE = (-90, 35)
     YAW_RANGE = (-40, 40)
 
@@ -804,7 +805,7 @@ class GimbalPlugin:
             "name": "gimbal",
             "type": "actuator",
             "description": (
-                "Mavic 3E 云台控制：旋转 (pitch -90°~+35°, yaw -40°~+40°)、复位、模式切换。"
+                "Mavic 4E/4T 云台控制：旋转 (pitch -90°~+35°, yaw -40°~+40°)、复位、模式切换。"
                 "支持绝对角度/相对角度/角速度三种控制模式。"
             ),
             "inputSchema": {

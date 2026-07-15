@@ -848,7 +848,7 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
             case 60: type_name = "Matrice 300 RTK"; break;
             case 67: type_name = "Matrice 30"; break;
             case 68: type_name = "Matrice 30T"; break;
-            case 77: type_name = "Mavic 3E"; break;
+            case 77: type_name = "Mavic 4E"; break;
             case 78: type_name = "FlyCart 30"; break;
             case 79: type_name = "Mavic 3T"; break;
             case 80: type_name = "Mavic 3TA"; break;
@@ -932,7 +932,7 @@ int main(int argc, char *argv[]) {
     if (argc >= 6) uart_dev = argv[5];
     if (argc >= 7) baud_rate = (uint32_t)atoi(argv[6]);
 
-    printf("=== DJI PSDK Bridge for Mavic 3E ===\n");
+    printf("=== DJI PSDK Bridge for Mavic 4E ===\n");
     printf("  Socket: %s\n", socket_path);
     printf("  UART:   %s @ %u\n", uart_dev, baud_rate);
 
