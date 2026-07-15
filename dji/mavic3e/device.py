@@ -910,7 +910,7 @@ class WaypointPlugin:
                             "start", "stop",
                             "record_start", "record_stop",
                             "mark_start", "mark_point", "mark_stop",
-                            "list", "load", "execute",
+                            "list", "execute",
                             "pause", "resume", "cancel", "status",
                         ],
                     },
@@ -927,8 +927,7 @@ class WaypointPlugin:
                     "mark_point": {"params": ["tag"], "description": "Mark current position as waypoint"},
                     "mark_stop": {"params": ["return_home"], "description": "Stop marking, save as KMZ"},
                     "list": {"params": [], "description": "List all saved waypoint missions"},
-                    "load": {"params": ["name", "speed"], "description": "Load mission and upload to aircraft"},
-                    "execute": {"params": [], "description": "Execute uploaded mission"},
+                    "execute": {"params": ["name", "speed"], "description": "Load and execute a saved mission"},
                     "pause": {"params": [], "description": "Pause mission"},
                     "resume": {"params": [], "description": "Resume mission"},
                     "cancel": {"params": [], "description": "Cancel mission"},
@@ -1186,7 +1185,7 @@ class WaypointPlugin:
             missions = [os.path.basename(f) for f in files]
             return {"ret": 0, "missions": missions, "count": len(missions)}
 
-        if action == "load":
+        if action == "execute":
             name = args.get("name", "")
             speed = float(args.get("speed", 5))
             if not name:
@@ -1197,17 +1196,16 @@ class WaypointPlugin:
             if not files:
                 return {"ret": -1, "error": f"Mission not found: {name}"}
             kmz_path = files[-1]  # latest match
+            # Upload to aircraft
             resp = self._bridge.waypoint_upload(kmz_path)
-            if resp.get("ok"):
-                return {"ret": 0, "message": f"Loaded: {os.path.basename(kmz_path)}",
-                        "file": kmz_path, "speed": speed}
-            return {"ret": -1, "error": "Upload failed", "data": resp.get("data", {})}
-
-        # ── Mission control ──
-        if action == "execute":
+            if not resp.get("ok"):
+                return {"ret": -1, "error": "Upload failed", "data": resp.get("data", {})}
+            # Start execution
             resp = self._bridge.waypoint_start()
-            return {"ret": 0 if resp.get("ok") else -1,
-                    "data": resp.get("data", {})}
+            if resp.get("ok"):
+                return {"ret": 0, "message": f"Executing: {os.path.basename(kmz_path)}",
+                        "file": kmz_path, "speed": speed}
+            return {"ret": -1, "error": "Execute failed", "data": resp.get("data", {})}
         if action == "pause":
             resp = self._bridge.waypoint_pause()
             return {"ret": 0 if resp.get("ok") else -1}
