@@ -504,7 +504,7 @@ class FlightPlugin:
             {
                 "name": "flight",
                 "type": "actuator",
-                "description": "Mavic 3E 飞行控制：起飞、降落、返航、摇杆控制、紧急刹车、设置返航点、避障开关。",
+                "description": "Mavic 3T 飞行控制。安全提示：SDK 控制期间遥控器摇杆无效，切换档位(T/P/S)可立即夺回控制权。",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
