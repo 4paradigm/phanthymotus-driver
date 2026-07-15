@@ -501,60 +501,71 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
         return 0;
     }
 
-    /* Flight control */
+    /* Flight control — all functions return 0 on success or PSDK error code */
     if (strstr(raw_json, "\"takeoff\"")) {
-        int r = flight_ctrl_takeoff();
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        int64_t r = flight_ctrl_takeoff();
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"land\"")) {
-        int r = flight_ctrl_land();
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        int64_t r = flight_ctrl_land();
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"go_home\"") && !strstr(raw_json, "\"cancel_go_home\"")) {
-        int r = flight_ctrl_go_home();
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        int64_t r = flight_ctrl_go_home();
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"cancel_go_home\"")) {
-        int r = flight_ctrl_cancel_go_home();
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        int64_t r = flight_ctrl_cancel_go_home();
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"emergency_brake\"")) {
-        int r = flight_ctrl_emergency_brake();
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        int64_t r = flight_ctrl_emergency_brake();
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"rotate_start\"") && !strstr(raw_json, "\"slow_rotate_start\"")) {
-        int r = flight_ctrl_turn_on_motors();
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        int64_t r = flight_ctrl_turn_on_motors();
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"rotate_stop\"") && !strstr(raw_json, "\"slow_rotate_stop\"")) {
-        int r = flight_ctrl_turn_off_motors();
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        int64_t r = flight_ctrl_turn_off_motors();
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"slow_rotate_start\"")) {
-        int r = flight_ctrl_slow_rotate_start();
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        int64_t r = flight_ctrl_slow_rotate_start();
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"slow_rotate_stop\"")) {
-        int r = flight_ctrl_slow_rotate_stop();
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        int64_t r = flight_ctrl_slow_rotate_stop();
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"obtain_joystick_authority\"")) {
-        int r = flight_ctrl_obtain_authority();
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        int64_t r = flight_ctrl_obtain_authority();
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"release_joystick_authority\"")) {
-        int r = flight_ctrl_release_authority();
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        int64_t r = flight_ctrl_release_authority();
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"joystick_move\"")) {
@@ -564,8 +575,9 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
         if ((p = strstr(raw_json, "\"vy\""))) { p = strchr(p, ':'); if (p) vy = (float)atof(p+1); }
         if ((p = strstr(raw_json, "\"vz\""))) { p = strchr(p, ':'); if (p) vz = (float)atof(p+1); }
         if ((p = strstr(raw_json, "\"vyaw\""))) { p = strchr(p, ':'); if (p) vyaw = (float)atof(p+1); }
-        int r = flight_ctrl_joystick_move(vx, vy, vz, vyaw);
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        int64_t r = flight_ctrl_joystick_move(vx, vy, vz, vyaw);
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"set_home\"")) {
@@ -573,8 +585,9 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
         const char *p;
         if ((p = strstr(raw_json, "\"lat\""))) { p = strchr(p, ':'); if (p) lat = atof(p+1); }
         if ((p = strstr(raw_json, "\"lon\""))) { p = strchr(p, ':'); if (p) lon = atof(p+1); }
-        int r = flight_ctrl_set_home(lat, lon);
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        int64_t r = flight_ctrl_set_home(lat, lon);
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"set_obstacle_avoidance\"")) {
@@ -583,8 +596,9 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
         if (strstr(raw_json, "\"horizontal\"")) dir = "horizontal";
         else if (strstr(raw_json, "\"upward\"")) dir = "upward";
         else if (strstr(raw_json, "\"downward\"")) dir = "downward";
-        int r = flight_ctrl_set_obstacle_avoidance(enabled, dir);
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d}}", r == 0 ? "true" : "false", r);
+        int64_t r = flight_ctrl_set_obstacle_avoidance(enabled, dir);
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
 
