@@ -46,6 +46,10 @@ COPY net.py            /work/net.py
 COPY odometry.py       /work/odometry.py
 COPY obstacle_range.py /work/obstacle_range.py
 COPY udp_diagnostics.py /work/udp_diagnostics.py
+COPY joints.py            /work/joints.py
+COPY remote_controller.py /work/remote_controller.py
+COPY model.py             /work/model.py
+COPY resource/            /work/resource/
 COPY loco.py           /work/loco.py
 COPY gesture.py        /work/gesture.py
 COPY config.yaml       /work/config.yaml
