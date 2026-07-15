@@ -1,0 +1,23 @@
+unitree-go1-bundle:              # 服务名遵循 {provider}-{model}-{bundle} 约定
+  image: __IMAGE__
+  container_name: embodied-unitree-go1-bundle
+  network_mode: host
+  ipc: host
+  pid: host
+  privileged: true
+  volumes:
+    - /dev:/dev
+    - /opt/phanthy-motus/data:/opt/phanthy-motus/data
+  environment:
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
+    - PYTHONUNBUFFERED=1
+    # Go1 EDU 控制目标（默认板载网段）；网口留空自动探测
+    - NETWORK_INTERFACE=
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: unless-stopped
