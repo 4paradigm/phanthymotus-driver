@@ -130,7 +130,6 @@ int telemetry_init(void) {
     }
 
     /* Subscribe at 10Hz (suitable topics) */
-    T_DjiReturnCode rc;
     rc = DjiFcSubscription_SubscribeTopic(DJI_FC_SUBSCRIPTION_TOPIC_QUATERNION, DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, _quaternion_cb);
     printf("[telemetry] subscribe QUATERNION → 0x%08llX\n", (unsigned long long)rc);
     rc = DjiFcSubscription_SubscribeTopic(DJI_FC_SUBSCRIPTION_TOPIC_VELOCITY, DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, _velocity_cb);
