@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-go1_bundle/main.py — Unitree Go1 (EDU) 只读状态驱动入口（原始 unitree_legged_sdk）。
+go1_bundle/main.py — Unitree Go1 (EDU) 状态 + 基础控制驱动入口（原始 unitree_legged_sdk）。
 
 一个驱动 = 一个 MCP server。本 bundle 是从完整 go1 驱动中**切出的最小蓝本**，当前聚合
-2 张状态卡：loco_state / battery。每张卡是一个**自包含的 .py 文件**（见 battery.py /
-loco_state.py），main.py 按 config.yaml 里启用的卡名**自动 import 同名模块**并装配
+3 张状态卡（loco_state / battery / obstacle_range）+ 1 张控制卡（spin）。每张卡是一个
+**自包含的 .py 文件**，main.py 按 config.yaml 里启用的卡名**自动 import 同名模块**并装配
 （约定：config key == 模块名 == 文件名 == 卡名）。因此新增一张卡 = 新建 `<卡名>.py` +
 在 config.yaml 打开它，**不用改本文件**。
 
-所有卡共享同一个只读 raw SDK client（唯一 UDP 收发线程 → snapshot()）；装了 rclpy 时状态卡
-发 ROS2 topic 在画布渲染，否则走 MCP action=info。只支持 HIGHLEVEL（读 HighState），不下发
-任何控制命令。无 robot_interface / 无硬件时自动 STUB（server 仍能起、注册、列 tool）。
+所有卡共享同一个 raw SDK client（唯一 UDP 收发线程 → snapshot()）；状态卡只读 snapshot 的
+不同切片，控制卡经该 client 的下发原语发 HighCmd。装了 rclpy 时状态卡发 ROS2 topic 在画布
+渲染，否则走 MCP action=info。固定 HIGHLEVEL（读 HighState / 下发 HighCmd）。
+无 robot_interface / 无硬件时自动 STUB（server 仍能起、注册、列 tool）。
 
 用法： python3 main.py [networkInterface]   环境变量： CONFIG_PATH / AGENT_CORE_URL
 详见同目录 CONTRIBUTING.md。
@@ -218,7 +219,7 @@ def main():
     namespace = _resolve_namespace(cfg)
     mcp_port = int(cfg.get("mcp_port", 15717))
 
-    print(f"[bundle] namespace={namespace} mcp_port={mcp_port} control_level=HIGHLEVEL (read-only)")
+    print(f"[bundle] namespace={namespace} mcp_port={mcp_port} control_level=HIGHLEVEL")
 
     from go1_sdk_client import Go1HighSdkClient
     client = Go1HighSdkClient(network_iface=network_iface)

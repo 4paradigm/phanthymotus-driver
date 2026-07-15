@@ -22,6 +22,8 @@ plugins:
     enabled: true
   odometry:                     # 里程计：position/yaw + 相对起点位移（reset_origin 重置）
     enabled: true
+  obstacle_range:               # 超声波避障：最近障碍物距离[4]（仅 HIGHLEVEL；方向/单位未定义）
+    enabled: true
 
   # ── 控制卡（下发 HighCmd；须真机验证量程+安全后上架）──
   spin:                         # 原地转圈（闭环读 IMU yaw 转够自停）
