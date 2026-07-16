@@ -47,7 +47,7 @@ COPY obstacle_range.py /work/obstacle_range.py
 COPY udp_diagnostics.py /work/udp_diagnostics.py
 COPY loco.py           /work/loco.py
 COPY gesture.py        /work/gesture.py
-COPY power_control.py  /work/power_control.py
+COPY test_power_control.py /work/test_power_control.py
 COPY config.yaml       /work/config.yaml
 COPY deploy/           /deploy/
 # ★ 新增卡：加一行 `COPY <卡名>.py /work/<卡名>.py`（main.py 会按 config 里的卡名自动 import）。

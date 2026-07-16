@@ -1,5 +1,8 @@
 """
-power_control.py — Go1 电源控制卡（关机，高风险不可逆）。
+test_power_control.py — Go1 电源控制卡（关机，高风险不可逆）。
+
+⚠️ 文件名 test_ 前缀 = **尚未真机验收**（团队约定：未验收卡片加 test 前缀，
+   验收通过后去掉前缀 → power_control）。故当前卡名/工具名亦为 test_power_control。
 
 自包含：一张卡 = 一个文件。main.py 按 config.yaml 自动 import 并 make_plugin()。
 下发经共享 client 的 request_power_off（HighCmd.bms.off=0xA5）。
@@ -13,7 +16,7 @@ from __future__ import annotations
 
 import time
 
-CARD = "power_control"
+CARD = "test_power_control"     # 未验收 → test 前缀；验收通过后改回 power_control（并同步 config/Dockerfile/文件名）
 TYPE = "actuator"
 CONTROL_LEVEL = "ANY"
 DESC = ("Go1 电源:power_off(BmsCmd.off=0xA5)。驱动侧【不可逆】,不能远程恢复;"
