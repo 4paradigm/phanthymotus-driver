@@ -24,8 +24,9 @@ DESC = ("Go1 基础运动 — 三维速度(vx 前后 m/s / vy 左右平移 m/s /
         "前置:狗须【已站立】。参数越界会被拒绝。(机身姿态角/高度/抬脚见 body_pose 卡)")
 
 TROT = 1
-# 速度上限 = Go1 EDU Sport Mode 出厂默认设计值(超此值固件会自行钳制到设计上限)。
-VX_MAX, VY_MAX = 1.5, 0.8            # 前后 / 左右平移 m/s
+# 速度上限:vx/vy 与共享 client 的实际裁剪值保持一致(client 把 vx 砍到 1.0、vy 砍到 0.6),
+# 标真实能跑到的值——避免"标 1.5 实跑 1.0、看不出区别"。若要真跑更快须先放宽共享 client 上限。
+VX_MAX, VY_MAX = 1.0, 0.6            # 前后 / 左右平移 m/s(受共享 client 裁剪限制)
 VYAW_MAX_DEG = 90.0                  # 偏航角速度 °/s(≈1.57 rad/s;卡片用角度制,下发前转弧度)
 DURATION_MAX = 300.0   # move 单次最长持续秒(前端可调执行时间;防误传超大值)
 # mode(Go1 HighCmd)
