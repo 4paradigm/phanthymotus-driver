@@ -410,12 +410,12 @@ class Go1HighSdkClient:
             if mc is not None:
                 vx, vy, vyaw, gait = mc
                 self._cmd.mode = 2
-                self._cmd.gaitType = int(gait)
+                self._cmd.gaitType = self._desired_gait
                 self._cmd.velocity = [float(vx), float(vy)]
                 self._cmd.yawSpeed = float(vyaw)
             elif pose is not None:                             # 【纯新增分支】姿态命令(loco 站起/姿态、gesture)
                 self._cmd.mode = int(pose["mode"])
-                self._cmd.gaitType = 0
+                self._cmd.gaitType = self._desired_gait
                 self._cmd.velocity = [0.0, 0.0]
                 self._cmd.yawSpeed = 0.0
                 self._cmd.euler = [pose["euler"][0], pose["euler"][1], pose["euler"][2]]
@@ -424,7 +424,7 @@ class Go1HighSdkClient:
                 self._cmd.speedLevel = pose["speed_level"]
             else:
                 self._cmd.mode = 0
-                self._cmd.gaitType = 0
+                self._cmd.gaitType = self._desired_gait
                 self._cmd.velocity = [0.0, 0.0]
                 self._cmd.yawSpeed = 0.0
         except Exception as e:  # noqa: BLE001
