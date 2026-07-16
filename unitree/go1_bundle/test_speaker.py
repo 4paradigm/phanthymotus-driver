@@ -8,26 +8,24 @@ main.py 会按 config 自动 import 本模块并调用 make_plugin()，无需改
 功能：订阅 agent core 发布的 remote_mic 音频流并在 Go1 头部扬声器播放。
 数据来源（实机核实）：浏览器麦克风 → WebSocket /ws/mic(agent core :15678) → agent core 逐块封成
 audio_msgs/msg/AudioChunk（format="pcm_16k_16bit_mono"、data=裸 PCM 字节）发布到 ROS2 topic
-`/remote_control/mic`（BEST_EFFORT）。本卡订阅该 topic，攒批后转发到 Go1 Head Nano 的 speaker_adapter 播放。
+`/remote_control/mic`（topic_out format = "audio/pcm-16k"）。本卡以 topic_in(audio/pcm-16k) 声明输入口，
+在 15678 画布上与 remote_mic 连线；play 时开始把收到的 PCM 攒批转发到 Head Nano 的 speaker_adapter 播放。
 
 架构：
   /remote_control/mic ──ROS2订阅──▶ test_speaker(驱动容器/Pi) ──HTTP攒批──▶ speaker_adapter(Nano:18083) ──aplay──▶ 扬声器
-  ┌─ Pi 驱动容器 ─────────────────────┐   HTTP/JSON     ┌─ Head Nano (192.168.123.13) ─────┐
-  │ test_speaker.py: Plugin           │ ── POST ──────▶ │ speaker_adapter.py  :18083        │
-  │  · 订阅 /remote_control/mic        │  /v1/speaker/   │  · 常驻流式 aplay(S16_LE 16k)     │
-  │  · 攒 ~batch_ms 的 PCM 批量转发    │    actions      │  · set/get 音量（amixer）         │
-  └────────────────────────────────────┘                 └───────────────────────────────────┘
 
-语义：start=开始订阅并播放（一直播到 stop）；stop=退订并停播。容器起来后 Plugin.start() 会自动订阅一次
-（best-effort），所以"启动新容器即生效"；仍可用 start/stop 手动开关。
+生命周期/线程安全（重要）：订阅在 __init__ **只建一次、运行期永不 destroy**——因为本卡的 node 挂在
+主进程的 MultiThreadedExecutor 上，运行期 destroy_subscription 会与 executor 的 spin 撞车报
+`InvalidHandle: cannot use Destroyable`（会连累整个驱动的 spin 线程崩掉）。故 play/pause 只翻
+`_playing` 标志：not playing 时回调直接丢帧、转发线程空转，绝不动 ROS 句柄。
 
 规范（与 beep.py 一致）：
-  - **无输出 topic**（本卡只订阅 topic_in，不发布任何 data/流 topic，get_tool 不含 topic_out）。
-  - 报警走共享的 device_alarms topic（adapter 不可达时发一条，恢复后清除）——与 beep 相同。
-  - dispatch 返回 plain dict；未知 action 返回 None。
+  - **无输出 topic**（只有 topic_in，不发布任何 data/流 topic）。
+  - 报警走共享的 device_alarms topic（adapter 不可达时发一条，恢复后清除）。
+  - 用户按钮用非保留名 play/pause（平台把 start/stop/info/config 当系统动作、不渲染成按钮）。
 
 部署前提：驱动容器须能 import audio_msgs（Dockerfile CMD 已 source /ros_ws/install/setup.bash）；
-与 agent core 同 ROS_DOMAIN_ID(=42)、同 rmw。缺 rclpy/audio_msgs 时优雅降级（start 返回 PRECONDITION_FAILED）。
+与 agent core 同 ROS_DOMAIN_ID(=42)、同 rmw。缺 rclpy/audio_msgs 时优雅降级（play 返回 PRECONDITION_FAILED）。
 """
 
 from __future__ import annotations
@@ -43,7 +41,6 @@ try:
     from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
     from std_msgs.msg import String
     _HAS_ROS2 = True
-    # 告警 topic QoS（与 beep 一致）。
     _ALARM_QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                             history=HistoryPolicy.KEEP_LAST, depth=200,
                             durability=DurabilityPolicy.VOLATILE)
@@ -97,7 +94,7 @@ class _SpeakerAdapterClient:
 
 
 class Plugin:
-    """test_speaker 卡：订阅 /remote_control/mic，攒批把 PCM 转发给 Nano speaker_adapter 播放。"""
+    """test_speaker 卡：订阅 /remote_control/mic，play 时把 PCM 攒批转发给 Nano speaker_adapter 播放。"""
 
     def __init__(self, plugin_config, namespace, executor):
         self._config = plugin_config or {}
@@ -109,17 +106,15 @@ class Plugin:
         # 转发跟不上时的缓冲上限（默认 ~2s@16k/16bit/mono），超出丢最旧的以保持准实时。
         self._max_buffer_bytes = int(self._config.get("max_buffer_bytes", 64000))
 
-        self._state = "idle"
-        self._lock = threading.Lock()      # 保护订阅/线程生命周期
+        self._playing = False              # play/pause 标志（不碰 ROS 句柄）
+        self._alive = True                 # 进程存活标志（Plugin.stop 置 False）
         self._buf = bytearray()
-        self._buf_lock = threading.Lock()  # 保护 PCM 缓冲
+        self._buf_lock = threading.Lock()
         self._sr, self._ch = 16000, 1
-        self._sub = None
-        self._forward_thread = None
-        self._running = False
 
-        # ROS2 节点（供订阅 + 告警）：无 rclpy / executor 时全程降级。
+        # ROS2 节点：订阅 mic + 发告警。**订阅只建一次，运行期永不 destroy**（见模块 docstring）。
         self._node = None
+        self._sub = None
         self._alarm_pub = None
         self._alarm_state = None
         if _HAS_ROS2 and executor is not None:
@@ -127,11 +122,25 @@ class Plugin:
                 self._node = Node("go1_%s" % CARD)
                 self._alarm_pub = self._node.create_publisher(
                     String, "/%s/state/device_alarms" % namespace, _ALARM_QOS)
+                try:
+                    from audio_msgs.msg import AudioChunk
+                    self._sub = self._node.create_subscription(
+                        AudioChunk, self._topic, self._on_audio, _MIC_QOS)
+                    print(f"[{CARD}] subscribed {self._topic} (idle until play)", flush=True)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[{CARD}] audio_msgs 不可用，无法订阅 {self._topic}: {e}"
+                          f"（需 source /ros_ws/install/setup.bash）", flush=True)
+                    self._sub = None
                 executor.add_node(self._node)
             except Exception as e:  # noqa: BLE001
                 print(f"[{CARD}] ROS2 不可用: {e}", flush=True)
                 self._node = None
                 self._alarm_pub = None
+                self._sub = None
+
+        # 转发线程常驻（进程生命周期）：not playing / 无数据时空转，绝不动 ROS 句柄。
+        self._fwd_thread = threading.Thread(target=self._forward_loop, name="go1_speaker_fwd", daemon=True)
+        self._fwd_thread.start()
 
     # ── 告警（best-effort；无 publisher 时静默）─────────────────────────────
     def _alarm(self, code, message, retryable):
@@ -153,63 +162,36 @@ class Plugin:
             "card": CARD, "code": code, "message": "condition recovered", "first_seen_ms": now,
             "last_seen_ms": now, "recovered_at_ms": now, "retryable": False, "details": {}})))
 
-    # ── 订阅生命周期 ─────────────────────────────────────────────────────────
-    def _start_sub(self) -> dict:
-        with self._lock:
-            if self._state == "running":
-                return {"ok": True, "card": CARD, "action": "start", "state": "running",
-                        "topic_in": self._topic, "timestamp_ms": _now_ms()}
-            if not _HAS_ROS2 or self._node is None:
-                return _failure("start", None, "PRECONDITION_FAILED",
-                                "ROS2 unavailable in driver (need rclpy + executor)")
-            try:
-                from audio_msgs.msg import AudioChunk
-            except Exception:
-                return _failure("start", None, "PRECONDITION_FAILED",
-                                "audio_msgs not importable — source /ros_ws/install/setup.bash in the driver image")
-            try:
-                self._sub = self._node.create_subscription(
-                    AudioChunk, self._topic, self._on_audio, _MIC_QOS)
-            except Exception as e:  # noqa: BLE001
-                return _failure("start", None, "INTERNAL_ERROR", "failed to subscribe %s: %s" % (self._topic, e))
-
-            with self._buf_lock:
-                self._buf = bytearray()
-            self._running = True
-            self._forward_thread = threading.Thread(target=self._forward_loop, name="go1_speaker_fwd", daemon=True)
-            self._forward_thread.start()
-            self._state = "running"
-            print(f"[{CARD}] subscribed {self._topic} → speaker_adapter", flush=True)
-            return {"ok": True, "card": CARD, "action": "start", "state": "running",
-                    "topic_in": self._topic, "timestamp_ms": _now_ms()}
-
-    def _stop_sub(self) -> dict:
-        with self._lock:
-            self._running = False
-            th = self._forward_thread
-            self._forward_thread = None
-        if th is not None:
-            th.join(timeout=2.0)
-        with self._lock:
-            if self._sub is not None and self._node is not None:
-                try:
-                    self._node.destroy_subscription(self._sub)
-                except Exception:
-                    pass
-            self._sub = None
-            self._state = "idle"
+    # ── 播放开关（只翻标志，不动订阅）─────────────────────────────────────────
+    def _play(self) -> dict:
+        if not _HAS_ROS2 or self._node is None:
+            return _failure("play", None, "PRECONDITION_FAILED",
+                            "ROS2 unavailable in driver (need rclpy + executor)")
+        if self._sub is None:
+            return _failure("play", None, "PRECONDITION_FAILED",
+                            "not subscribed — audio_msgs missing; source /ros_ws/install/setup.bash in the driver image")
         with self._buf_lock:
             self._buf = bytearray()
-        # 通知 Nano 停播（失败不阻塞）。
+        self._playing = True
+        print(f"[{CARD}] play → forwarding {self._topic} to speaker", flush=True)
+        return {"ok": True, "card": CARD, "action": "play", "state": "running",
+                "topic_in": self._topic, "timestamp_ms": _now_ms()}
+
+    def _pause(self) -> dict:
+        self._playing = False
+        with self._buf_lock:
+            self._buf = bytearray()
         try:
             self._client.request("/speaker/actions", {"action": "stop", "card": CARD})
         except Exception:
             pass
-        print(f"[{CARD}] unsubscribed {self._topic}", flush=True)
-        return {"ok": True, "card": CARD, "action": "stop", "state": "idle", "timestamp_ms": _now_ms()}
+        print(f"[{CARD}] pause", flush=True)
+        return {"ok": True, "card": CARD, "action": "pause", "state": "idle", "timestamp_ms": _now_ms()}
 
     def _on_audio(self, msg) -> None:
-        """ROS2 订阅回调（executor 线程）：把 AudioChunk 的 PCM 追加进缓冲，超上限丢最旧（保准实时）。"""
+        """ROS2 订阅回调（executor 线程）：仅在 playing 时缓冲 PCM，超上限丢最旧（保准实时）。"""
+        if not self._playing:
+            return
         try:
             data = bytes(msg.data)
         except Exception:
@@ -226,9 +208,11 @@ class Plugin:
                 del self._buf[:over]
 
     def _forward_loop(self) -> None:
-        """攒 batch_ms 的 PCM 一次性 base64 转发给 speaker_adapter，解耦 ROS 回调与 HTTP 延迟。"""
-        while self._running:
+        """常驻转发线程：playing 且有数据时，攒 batch_ms 的 PCM 一次性 base64 发给 speaker_adapter。"""
+        while self._alive:
             time.sleep(self._batch_ms / 1000.0)
+            if not self._playing:
+                continue
             with self._buf_lock:
                 if not self._buf:
                     continue
@@ -250,13 +234,14 @@ class Plugin:
 
     # ── 插件契约 ───────────────────────────────────────────────────────────
     def get_tool(self):
-        # 动作名避开平台保留的系统生命周期动作 {start,stop,info,config}（那些不会渲染成前端按钮）：
-        # 用 play/pause 作为用户可点的“开播/停播”。仍保留 start/stop 在 enum 里以兼容平台生命周期调用，
-        # 但 x-action-params（决定前端按钮）只暴露 play/pause/set_volume/get_volume。
+        # topic_in(audio/pcm-16k)：与 remote_mic 的 topic_out 同格式，供 15678 画布连线。无 topic_out。
+        # 用户按钮用非保留名 play/pause（平台把 start/stop/info/config 当系统动作、不渲染成按钮）；
+        # enum 仍含 start/stop 以兼容平台生命周期调用，但 x-action-params 只暴露 play/pause/音量。
         return {"name": CARD, "type": "actuator", "multiInstance": False,
           "description": ("Go1 head speaker — plays the operator's remote microphone stream "
-                          "(subscribes ROS2 /remote_control/mic, PCM-16k) on the on-board speaker "
-                          "(action card, no output topics). play begins playing the mic stream until pause."),
+                          "(audio/pcm-16k from remote_mic) on the on-board speaker. Wire remote_mic → "
+                          "this card, then play. No output topics."),
+          "topic_in": [{"format": "audio/pcm-16k"}],
           "inputSchema": {"type": "object",
             "properties": {
               "action": {"type": "string",
@@ -268,20 +253,17 @@ class Plugin:
             "required": ["action"],
             "x-action-params": {
               "play":       {"params": [], "description": "Start playing the remote mic stream on the speaker"},
-              "pause":      {"params": [], "description": "Stop playing the mic stream (unsubscribe)"},
+              "pause":      {"params": [], "description": "Stop playing the mic stream"},
               "set_volume": {"params": ["volume_percent"], "description": "Set speaker volume 0–100%"},
               "get_volume": {"params": [], "description": "Read current speaker volume"}}}}
 
     def start(self):
-        # 平台生命周期钩子：主进程装配时调用。这里不自动订阅——平台在注册后会把卡置为 idle（会调 stop），
-        # 由用户在 15678 点 play 开播。避免与平台生命周期打架。
-        pass
+        pass   # 由用户在 15678 点 play 开播；不自动订阅播放（订阅已在 __init__ 建好，此处不动）。
 
     def stop(self):
-        try:
-            self._stop_sub()
-        except Exception:
-            pass
+        # 主进程关闭钩子：停播 + 停转发线程。**不 destroy 订阅**（交给 rclpy.shutdown 统一回收，避免 spin 撞车）。
+        self._alive = False
+        self._playing = False
 
     def _call_adapter(self, action, args) -> dict:
         rid = args.get("request_id")
@@ -304,9 +286,9 @@ class Plugin:
         rid = args.get("request_id")
         # play(用户按钮) 与 start(平台生命周期) 都开播；pause 与 stop 都停播。
         if action in ("play", "start"):
-            return self._start_sub()
+            return self._play()
         if action in ("pause", "stop"):
-            return self._stop_sub()
+            return self._pause()
         if action == "set_volume":
             if type(args.get("volume_percent")) is not int or not 0 <= args["volume_percent"] <= 100:
                 return _failure(action, rid, "INVALID_ARGUMENT", "volume_percent must be an integer from 0 to 100")
