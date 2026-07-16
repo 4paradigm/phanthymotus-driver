@@ -113,19 +113,32 @@ bscp(){ sshpass -p "$PW" scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/
 PCL_DETECT='for d in $HOME/UnitreecameraSDK $HOME/Unitree/sdk/UnitreeCameraSdk $HOME/UnitreeCameraSDK; do [ -f "$d/include/UnitreeCameraSDK.hpp" ] && echo "$d" && break; done'
 
 if [ -f "$DEPLOY/camera/pointcloud_stream.cc" ]; then
+  PCL_DONE=""   # 本次已重编过的板(每板只编一次,但强制重编以匹配当前 .cc + 服务参数)
   for row in "${PCL_ROWS[@]}"; do
     set -- $row; POS="$1"; B="$2"; DEVID="$3"; PORT="$4"
     if ! bssh "$B" 'echo ok' >/dev/null 2>&1; then log "point cloud: 板 $B 不可达 → 跳过 $POS"; continue; fi
     SDK=$(bssh "$B" "$PCL_DETECT" 2>/dev/null | tr -d '\r' | head -1)
     if [ -z "$SDK" ]; then log "point cloud: $B 无 UnitreeCameraSDK → 跳过 $POS"; continue; fi
-    # 编译一次(该板二进制不存在才编;raw g++ 镜像 camera_adapter)
+    # 本板首次:删旧二进制→强制重编。按 SDK 布局选编法:有 CMake build 用 CMake(SDK 自处理 opencv,
+    # .14/.15 的 ~/Unitree/sdk/UnitreeCameraSdk 用这个),否则 raw g++(.13 的 ~/UnitreecameraSDK)。
+    # 编失败则无二进制→下方跳过,绝不用陈旧/不匹配的二进制。
+    case " $PCL_DONE " in
+      *" $B "*) : ;;
+      *)
+        log "point cloud: 在 $B 编 pointcloud_stream(SDK=$SDK)…"
+        bssh "$B" "rm -f $SDK/bins/pointcloud_stream" 2>/dev/null
+        if bssh "$B" "[ -d $SDK/build ] && [ -f $SDK/examples/CMakeLists.txt ]" 2>/dev/null; then
+          bscp "$B" "$DEPLOY/camera/pointcloud_stream.cc" "$SDK/examples/pointcloud_stream.cc" 2>/dev/null
+          bssh "$B" "cd $SDK/examples && grep -q 'add_executable(pointcloud_stream' CMakeLists.txt || printf '\nadd_executable(pointcloud_stream ./pointcloud_stream.cc)\ntarget_link_libraries(pointcloud_stream \${SDKLIBS})\n' >> CMakeLists.txt; cd $SDK/build && cmake .. >/dev/null 2>&1 && make pointcloud_stream 2>&1 | tail -4" 2>&1 | tail -4
+        else
+          bscp "$B" "$DEPLOY/camera/pointcloud_stream.cc" "$SDK/pointcloud_stream.cc" 2>/dev/null
+          bssh "$B" "cd $SDK && mkdir -p bins; OCV=\$(pkg-config --cflags --libs opencv4 2>/dev/null); [ -z \"\$OCV\" ] && OCV=\$(pkg-config --cflags --libs opencv 2>/dev/null); [ -z \"\$OCV\" ] && OCV=\"-I/usr/include/opencv4 -I/usr/local/include/opencv4 -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lopencv_calib3d -lopencv_features2d -lopencv_video\"; g++ -O2 -std=c++14 -pthread pointcloud_stream.cc -I$SDK/include -I$SDK/thirdparty -L$SDK/lib/arm64 -Wl,--start-group -lunitree_camera -ltstc_V4L2_xu_camera -lsystemlog -ludev -Wl,--end-group \$OCV -o bins/pointcloud_stream 2>&1 | tail -4" 2>&1 | tail -4
+        fi
+        PCL_DONE="$PCL_DONE $B"
+        ;;
+    esac
     if ! bssh "$B" "[ -x $SDK/bins/pointcloud_stream ]" 2>/dev/null; then
-      log "point cloud: 在 $B 编 pointcloud_stream(SDK=$SDK)…"
-      bscp "$B" "$DEPLOY/camera/pointcloud_stream.cc" "$SDK/pointcloud_stream.cc" 2>/dev/null
-      bssh "$B" "cd $SDK && mkdir -p bins && g++ -O2 -std=c++14 -pthread pointcloud_stream.cc -I$SDK/include -I$SDK/thirdparty -L$SDK/lib/arm64 -Wl,--start-group -lunitree_camera -ltstc_V4L2_xu_camera -lsystemlog -ludev -Wl,--end-group \$(pkg-config --cflags --libs opencv4) -o bins/pointcloud_stream 2>&1 | tail -3" 2>&1 | tail -3
-    fi
-    if ! bssh "$B" "[ -x $SDK/bins/pointcloud_stream ]" 2>/dev/null; then
-      log "point cloud: $POS@$B 编译失败/无二进制 → 跳过服务"; continue
+      log "point cloud: $POS@$B 无有效二进制(编译失败?)→ 跳过服务"; continue
     fi
     # 装 systemd 服务(空闲不占相机;连上才开 dev$DEVID;fuser 抢占由 pointcloud_stream 自己做)
     SVC="go1-pointcloud-$POS"
@@ -143,8 +156,8 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 EOF" 2>/dev/null
-    bssh "$B" "echo $PW | sudo -S cp /tmp/$SVC.service /etc/systemd/system/$SVC.service; echo $PW | sudo -S systemctl daemon-reload; echo $PW | sudo -S systemctl enable --now $SVC" 2>/dev/null
-    log "point cloud: $POS@$B → 服务 $SVC 已装/启用(dev$DEVID, 端口 $PORT, SDK $SDK)。"
+    bssh "$B" "echo $PW | sudo -S cp /tmp/$SVC.service /etc/systemd/system/$SVC.service; echo $PW | sudo -S systemctl daemon-reload; echo $PW | sudo -S systemctl enable $SVC >/dev/null 2>&1; echo $PW | sudo -S systemctl restart $SVC" 2>/dev/null
+    log "point cloud: $POS@$B → 服务 $SVC 已装/重启(dev$DEVID, 端口 $PORT, SDK $SDK)。"
   done
 else
   log "✗ /deploy/camera/pointcloud_stream.cc 不存在(Dockerfile 应 COPY camera/)→ point cloud 端跳过。"
