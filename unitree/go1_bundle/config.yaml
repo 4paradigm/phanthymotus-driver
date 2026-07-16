@@ -24,6 +24,16 @@ plugins:
     enabled: true
     nx_host: "192.168.123.15"
     nx_port: 9101
+  test_camera_pointcloud:       # 【未验收·test 前缀】双目点云推流(sensor,可选机位):连对应板 pointcloud_stream → ROS2 PointCloud2
+    enabled: true               # 画布用 position 配置选读哪一路;一次一路(立体计算吃 CPU+相机独占);头部(.13)与 camera_depth 互斥。验收后改名 camera_pointcloud
+    default_position: "front"   # front/chin/left/right/belly
+    # 机位→板卡/设备/点云端口(不填用内置默认;端口 94xx 与深度9101/RGB图传92xx/RGB控制93xx 错开)
+    positions:
+      front: {board_ip: "192.168.123.13", device_id: 1, pcl_port: 9401}
+      chin:  {board_ip: "192.168.123.13", device_id: 0, pcl_port: 9402}
+      left:  {board_ip: "192.168.123.14", device_id: 0, pcl_port: 9403}
+      right: {board_ip: "192.168.123.14", device_id: 1, pcl_port: 9404}
+      belly: {board_ip: "192.168.123.15", device_id: 0, pcl_port: 9405}
   imu:                          # IMU：四元数/角速度/加速度/欧拉角/温度
     enabled: true
   feet:                         # 足端：足底力[4] + 高层时足端相对机身位置/速度

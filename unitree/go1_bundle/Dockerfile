@@ -61,12 +61,15 @@ COPY camera_rgb.py     /work/camera_rgb.py
 COPY face_light.py     /work/face_light.py
 COPY system_health.py  /work/system_health.py
 COPY camera_depth.py   /work/camera_depth.py
+COPY test_camera_pointcloud.py /work/test_camera_pointcloud.py
 COPY config.yaml       /work/config.yaml
 COPY deploy/           /deploy/
 # Nano 侧后端源码放进 /deploy/，供 nano_bootstrap.sh 首启时分发/编译到 Head Nano：
 #   beep_adapter.py（beep，纯 Python 免编译）/ camera_adapter/（camera_rgb，Nano 上现编 C++）。
 COPY beep_adapter.py   /deploy/beep_adapter.py
 COPY camera_adapter/   /deploy/camera_adapter/
+# 点云:NX/Nano 侧 pointcloud_stream.cc 供 nano_bootstrap.sh 首启时分发+编译(镜像 depth_stream 的 SDK 路径)。
+COPY camera/           /deploy/camera/
 # ★ 新增卡：加一行 `COPY <卡名>.py /work/<卡名>.py`（main.py 会按 config 里的卡名自动 import）。
 
 ENV ROS_DOMAIN_ID=42
