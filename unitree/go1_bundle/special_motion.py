@@ -1,8 +1,7 @@
 """
-test_special_motion.py — Go1 官方特殊动作卡（jump_yaw_left / straight_hand）。
+special_motion.py — Go1 官方特殊动作卡（jump_yaw_left / straight_hand）。
 
-【未验收·test 前缀】本卡尚未在目标 Go1 实机固件上验证，故按 CONTRIBUTING.md §4 用 `test_`
-前缀命名，实机验收量程+安全后再改名 special_motion 上架。
+已通过真机实机验证（mode 10=jump_yaw / 11=straight_hand），test_ 前缀已去。
 
 自包含：一张卡 = 一个文件。main.py 按 config.yaml 里的卡名自动 import 并 make_plugin()。
 本卡把两个白名单特殊动作封装为**同步动作序列**（调用会阻塞至整套动作完成再返回完整结果）：
@@ -15,7 +14,6 @@ test_special_motion.py — Go1 官方特殊动作卡（jump_yaw_left / straight_
 前置：狗须【已站立】（高层无法从地面扶起，需遥控扶起）。高风险动作须 confirm=true。
 下发只用共享 client 已有的 set_posture()/snapshot() 原语（mode 10/11 见 go1_sdk_client
 的 MODE_NAMES），不改动 client。
-⚠️ 控制卡须上真机验证量程+安全后才能去掉 test_ 前缀上架（见 CONTRIBUTING.md §4）。
 """
 
 from __future__ import annotations
@@ -24,12 +22,12 @@ import threading
 import time
 
 # ── 卡片元数据 ────────────────────────────────────────────────────────────────
-CARD = "test_special_motion"     # 卡名 = MCP 工具名 = config.yaml key = 本文件名
+CARD = "special_motion"     # 卡名 = MCP 工具名 = config.yaml key = 本文件名
 TYPE = "actuator"
 CONTROL_LEVEL = "HIGHLEVEL"
-NODE = "go1_test_special_motion"  # 预留（本卡不发 topic）
+NODE = "go1_special_motion"  # 预留（本卡不发 topic）
 DESC = (
-    "Go1 官方特殊动作 (HIGHLEVEL·未验收) — jump_yaw_left / straight_hand。"
+    "Go1 官方特殊动作 (HIGHLEVEL) — jump_yaw_left / straight_hand。"
     "封装为同步动作序列：先进入 balance_stand(mode=1) 并确认站稳，再 set_posture(mode=10/11)，"
     "保持白名单时长后回到 mode=1。调用会阻塞整个动作过程并返回完整执行结果"
     "（是否站稳/是否进入特殊模式/progress 采样/是否安全回位）。动作时长由 config.yaml 白名单配置，"
