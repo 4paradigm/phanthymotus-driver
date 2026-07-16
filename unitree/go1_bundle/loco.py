@@ -11,6 +11,7 @@ loco.py — Go1 基础运动控制卡(三维速度 + 站立/姿态/身高)。
 
 from __future__ import annotations
 
+import threading
 import time
 
 CARD = "loco"
@@ -18,10 +19,13 @@ TYPE = "actuator"
 CONTROL_LEVEL = "HIGHLEVEL"
 DESC = ("Go1 基础运动 — 三维速度(vx 前后/vy 左右平移/vyaw 偏航,可组合)+ 停 + "
         "站起/趴下/平衡站立/恢复/阻尼 + 机身姿态角(roll/pitch/yaw)/身高/抬脚/复位。"
-        "move 为持续命令(停发约0.5s自停)。前置:狗须【已站立】。参数越界会被拒绝。")
+        "move 可选 duration 秒(前端指定执行时间,到点自动停);不填则持续~0.5s自停。"
+        "前置:狗须【已站立】。参数越界会被拒绝。")
 
 TROT = 1
-VX_MAX, VY_MAX, VYAW_MAX = 1.0, 0.6, 2.0
+# 速度上限 = Go1 EDU Sport Mode 出厂默认设计值(超此值固件会自行钳制到设计上限)。
+VX_MAX, VY_MAX, VYAW_MAX = 1.5, 0.8, 1.57
+DURATION_MAX = 300.0   # move 单次最长持续秒(前端可调执行时间;防误传超大值)
 ROLL_MAX = PITCH_MAX = 0.5
 YAW_MAX = 0.5
 DZ_MAX = 0.12
@@ -57,15 +61,48 @@ def _rng(v, name, lo, hi):
 class Plugin:
     def __init__(self, plugin_config, namespace, executor, client):
         self._client = client
+        self._cancel = threading.Event()   # duration 重发线程的中断标志
+        self._thread = None
+        self._tlock = threading.Lock()
 
     def start(self):
         pass
 
     def stop(self):
+        self._cancel_timed()
         try:
             self._client.stop_move()
         except Exception:  # noqa: BLE001
             pass
+
+    # ── duration:后台按节奏重发 move 刷 0.5s 看门狗,到点自动停 ──────────────────
+    def _cancel_timed(self):
+        """停掉正在跑的 duration 重发线程(新命令进来先清旧的,避免旧线程盖新动作)。"""
+        with self._tlock:
+            th = self._thread
+            self._thread = None
+        if th and th.is_alive():
+            self._cancel.set()
+            th.join(timeout=1.0)
+
+    def _timed_move(self, vx, vy, vyaw, duration):
+        """持续 duration 秒:每 ~0.1s 重发一次 move 刷看门狗,到点 stop_move。"""
+        end = time.monotonic() + duration
+        while time.monotonic() < end:
+            if self._cancel.is_set():
+                return                      # 被新命令/stop 打断;由对方接管状态
+            self._client.move(vx, vy, vyaw, gait=TROT)
+            time.sleep(0.1)
+        self._client.stop_move()
+
+    def _start_timed(self, vx, vy, vyaw, duration):
+        self._cancel_timed()
+        self._cancel.clear()
+        th = threading.Thread(target=self._timed_move, args=(vx, vy, vyaw, duration),
+                              daemon=True, name="go1_loco_timed_move")
+        with self._tlock:
+            self._thread = th
+        th.start()
 
     def get_tool(self):
         return {
@@ -80,7 +117,9 @@ class Plugin:
                                "description": "要执行的动作"},
                     "vx":   {"type": "number", "description": "前后速度 m/s [-%.1f,%.1f]" % (VX_MAX, VX_MAX)},
                     "vy":   {"type": "number", "description": "左右平移 m/s [-%.1f,%.1f]" % (VY_MAX, VY_MAX)},
-                    "vyaw": {"type": "number", "description": "偏航 rad/s [-%.1f,%.1f]" % (VYAW_MAX, VYAW_MAX)},
+                    "vyaw": {"type": "number", "description": "偏航 rad/s [-%.2f,%.2f]" % (VYAW_MAX, VYAW_MAX)},
+                    "duration": {"type": "number",
+                                 "description": "move 持续秒数(0,%.0f];前端指定执行时间,到点自动停;不填/≤0=持续~0.5s自停" % DURATION_MAX},
                     "roll":  {"type": "number", "description": "横滚角 rad [-%.1f,%.1f]" % (ROLL_MAX, ROLL_MAX)},
                     "pitch": {"type": "number", "description": "俯仰角 rad [-%.1f,%.1f]" % (PITCH_MAX, PITCH_MAX)},
                     "yaw":   {"type": "number", "description": "偏航角 rad [-%.1f,%.1f]" % (YAW_MAX, YAW_MAX)},
@@ -89,7 +128,7 @@ class Plugin:
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "move":           {"params": ["vx", "vy", "vyaw"], "description": "三维速度运动(可组合),持续~0.5s自停"},
+                    "move":           {"params": ["vx", "vy", "vyaw", "duration"], "description": "三维速度运动(可组合);给 duration 秒则到点自动停,不给则持续~0.5s自停"},
                     "stop":           {"params": [], "description": "立即停下站稳"},
                     "stand_up":       {"params": [], "description": "站起"},
                     "stand_down":     {"params": [], "description": "趴下"},
@@ -112,6 +151,9 @@ class Plugin:
                     "applied": {}, "timestamp_ms": _ms()}
         args = args or {}
         c = self._client
+        # 任何新的运动/姿态命令进来,先停掉上一条 move(duration) 的重发线程,
+        # 否则旧线程会继续刷 move 把新动作盖掉。move(duration) 分支会自己重开。
+        self._cancel_timed()
 
         def ok(applied):
             return {"ok": True, "card": CARD, "action": action, "control_level": CONTROL_LEVEL,
@@ -130,6 +172,12 @@ class Plugin:
             vyaw, e = _rng(args.get("vyaw", 0.0), "vyaw", -VYAW_MAX, VYAW_MAX)
             if e:
                 return e
+            duration, e = _rng(args.get("duration", 0.0) or 0.0, "duration", 0.0, DURATION_MAX)
+            if e:
+                return e
+            if duration > 0:
+                self._start_timed(vx, vy, vyaw, duration)   # 后台重发,到点自动停,不阻塞返回
+                return ok({"vx": vx, "vy": vy, "vyaw": vyaw, "gait": TROT, "duration": duration})
             return ok(c.move(vx, vy, vyaw, gait=TROT))
         if action == "stand_up":
             c.set_posture(M_STAND_UP)
