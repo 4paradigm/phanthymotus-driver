@@ -24,10 +24,11 @@ plugins:
     enabled: true
     nx_host: "192.168.123.15"
     nx_port: 9101
-  test_camera_pointcloud:       # 【未验收·test 前缀】双目点云推流(sensor,可选机位):连对应板 pointcloud_stream → ROS2 PointCloud2
-    enabled: true               # 画布用 position 配置选读哪一路;一次一路(立体计算吃 CPU+相机独占);头部(.13)与 camera_depth 互斥。验收后改名 camera_pointcloud
-    default_position: "front"   # front/chin/left/right/belly
-    # 机位→板卡/设备/点云端口(不填用内置默认;端口 94xx 与深度9101/RGB图传92xx/RGB控制93xx 错开)
+  test_camera_pointcloud:       # 【未验收·test 前缀】双目点云推流(sensor,multiInstance·可选机位):连对应板 pointcloud_stream → ROS2 PointCloud2
+    enabled: true               # 拖入后用卡的 position 下拉框选/热切机位;一次一路(立体计算吃 CPU+相机独占);头部/腹部与 depth 就同一相机互斥。验收后改名 camera_pointcloud
+    default_position: "front"   # 公共默认机位:front/chin/left/right/belly
+    # 机位→板卡IP/device/点云端口。Pi 侧只用 board_ip+pcl_port 连流;device_id 由 nano_bootstrap 传给 Nano 侧 pointcloud_stream 选相机。
+    # 端口 94xx 与深度9101/RGB图传92xx/RGB控制93xx 错开。SDK 路径每板不同,由 nano_bootstrap 自动探测。
     positions:
       front: {board_ip: "192.168.123.13", device_id: 1, pcl_port: 9401}
       chin:  {board_ip: "192.168.123.13", device_id: 0, pcl_port: 9402}

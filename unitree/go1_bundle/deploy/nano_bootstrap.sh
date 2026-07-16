@@ -95,61 +95,56 @@ $SSH $R 'CN=$HOME/Unitree/autostart/camerarosnode/cameraRosNode/startNode.sh; [ 
 $SSH $R 'echo '"$PW"' | sudo -S pkill -TERM -f example_putImagetrans 2>/dev/null; echo '"$PW"' | sudo -S pkill -TERM -f point_cloud_node 2>/dev/null; pkill -TERM -f wsaudio 2>/dev/null; true' 2>/dev/null
 
 # ── 5) point cloud 端:pointcloud_stream(每路一个常驻服务;连上才开相机 → 免重启热切)──────
-#   镜像 depth_stream 的已验证路径:同一 SDK 目录 ~/Unitree/sdk/UnitreeCameraSdk(CMake 构建)。
-#   config 命名约定:/dev/video0=stereo_camera_config.yaml,/dev/video1=stereo_camera_config1.yaml。
-#   逐块板:可达且有该 SDK 才编,每块只编一次;然后每路装一个 systemd 服务(空闲不占相机)。
+#   各板 SDK 路径不同(.13/.14=~/UnitreecameraSDK,.15=~/Unitree/sdk/UnitreeCameraSdk)→ 自动探测。
+#   用 raw g++ 编译(镜像 camera_adapter 的编法,已在 .13 验证),产物落 $SDK/bins/pointcloud_stream。
+#   pointcloud_stream 按 device_id 开相机(不依赖 per-device config)。每路装一个 systemd 服务(空闲不占相机)。
 #   板不就绪(不可达/无 SDK)则跳过,不阻塞主进程,也不影响已工作的 depth/RGB。
-PCL_SDK="/home/unitree/Unitree/sdk/UnitreeCameraSdk"
-# 每行: position board_ip config port  (与 Pi 侧 test_camera_pointcloud.positions 对齐)
+# 每行: position board_ip device_id port  (与 Pi 侧 test_camera_pointcloud.positions 对齐)
 PCL_ROWS=(
-  "front 192.168.123.13 stereo_camera_config1.yaml 9401"
-  "chin  192.168.123.13 stereo_camera_config.yaml  9402"
-  "left  192.168.123.14 stereo_camera_config.yaml  9403"
-  "right 192.168.123.14 stereo_camera_config1.yaml 9404"
-  "belly 192.168.123.15 stereo_camera_config.yaml  9405"
+  "front 192.168.123.13 1 9401"
+  "chin  192.168.123.13 0 9402"
+  "left  192.168.123.14 0 9403"
+  "right 192.168.123.14 1 9404"
+  "belly 192.168.123.15 0 9405"
 )
 bssh(){ sshpass -p "$PW" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 "unitree@$1" "$2"; }
 bscp(){ sshpass -p "$PW" scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 "$2" "unitree@$1:$3"; }
+# 板上探测 SDK 目录(含 include/UnitreeCameraSDK.hpp 的第一个候选);单引号 → $HOME 在板上求值。
+PCL_DETECT='for d in $HOME/UnitreecameraSDK $HOME/Unitree/sdk/UnitreeCameraSdk $HOME/UnitreeCameraSDK; do [ -f "$d/include/UnitreeCameraSDK.hpp" ] && echo "$d" && break; done'
 
 if [ -f "$DEPLOY/camera/pointcloud_stream.cc" ]; then
-  # 5a) 每块用到的板:编译一次(mirror depth_stream)+ 释放出厂点云节点
-  PCL_BOARDS=$(printf '%s\n' "${PCL_ROWS[@]}" | awk '{print $2}' | sort -u)
-  for B in $PCL_BOARDS; do
-    if ! bssh "$B" 'echo ok' >/dev/null 2>&1; then log "point cloud: 板 $B 不可达 → 跳过"; continue; fi
-    if bssh "$B" "[ -x $PCL_SDK/bins/pointcloud_stream ]" 2>/dev/null; then
-      log "point cloud: $B 上 pointcloud_stream 已存在(跳过编译)。"
-    elif bssh "$B" "[ -d $PCL_SDK/build ]" 2>/dev/null; then
-      log "point cloud: 在 $B 现编 pointcloud_stream(mirror depth_stream)…"
-      bscp "$B" "$DEPLOY/camera/pointcloud_stream.cc" "$PCL_SDK/examples/pointcloud_stream.cc" 2>/dev/null
-      bssh "$B" "cd $PCL_SDK/examples && grep -q 'add_executable(pointcloud_stream' CMakeLists.txt || printf '\nadd_executable(pointcloud_stream ./pointcloud_stream.cc)\ntarget_link_libraries(pointcloud_stream \${SDKLIBS})\n' >> CMakeLists.txt" 2>/dev/null
-      bssh "$B" "cd $PCL_SDK/build && cmake .. >/dev/null 2>&1 && make pointcloud_stream 2>&1 | tail -3" 2>&1 | tail -3
-    else
-      log "point cloud: $B 无 $PCL_SDK(depth 用的 SDK)→ 跳过该板(其上机位不可用)。"
-      continue
-    fi
-    bssh "$B" "echo $PW | sudo -S pkill -TERM -f point_cloud_node 2>/dev/null; true" 2>/dev/null
-  done
-  # 5b) 每路装 systemd 服务(空闲不占相机;Restart=always 常驻,等 Pi 卡连上才开相机)
   for row in "${PCL_ROWS[@]}"; do
-    set -- $row; POS="$1"; B="$2"; CFG="$3"; PORT="$4"
-    bssh "$B" "[ -x $PCL_SDK/bins/pointcloud_stream ]" 2>/dev/null || { log "point cloud: $POS@$B 无二进制 → 跳过服务"; continue; }
+    set -- $row; POS="$1"; B="$2"; DEVID="$3"; PORT="$4"
+    if ! bssh "$B" 'echo ok' >/dev/null 2>&1; then log "point cloud: 板 $B 不可达 → 跳过 $POS"; continue; fi
+    SDK=$(bssh "$B" "$PCL_DETECT" 2>/dev/null | tr -d '\r' | head -1)
+    if [ -z "$SDK" ]; then log "point cloud: $B 无 UnitreeCameraSDK → 跳过 $POS"; continue; fi
+    # 编译一次(该板二进制不存在才编;raw g++ 镜像 camera_adapter)
+    if ! bssh "$B" "[ -x $SDK/bins/pointcloud_stream ]" 2>/dev/null; then
+      log "point cloud: 在 $B 编 pointcloud_stream(SDK=$SDK)…"
+      bscp "$B" "$DEPLOY/camera/pointcloud_stream.cc" "$SDK/pointcloud_stream.cc" 2>/dev/null
+      bssh "$B" "cd $SDK && mkdir -p bins && g++ -O2 -std=c++14 -pthread pointcloud_stream.cc -I$SDK/include -I$SDK/thirdparty -L$SDK/lib/arm64 -Wl,--start-group -lunitree_camera -ltstc_V4L2_xu_camera -lsystemlog -ludev -Wl,--end-group \$(pkg-config --cflags --libs opencv4) -o bins/pointcloud_stream 2>&1 | tail -3" 2>&1 | tail -3
+    fi
+    if ! bssh "$B" "[ -x $SDK/bins/pointcloud_stream ]" 2>/dev/null; then
+      log "point cloud: $POS@$B 编译失败/无二进制 → 跳过服务"; continue
+    fi
+    # 装 systemd 服务(空闲不占相机;连上才开 dev$DEVID;fuser 抢占由 pointcloud_stream 自己做)
     SVC="go1-pointcloud-$POS"
-    bssh "$B" "cat > /tmp/$SVC.service <<'EOF'
+    bssh "$B" "cat > /tmp/$SVC.service <<EOF
 [Unit]
-Description=Go1 pointcloud_stream $POS (:$PORT)
+Description=Go1 pointcloud_stream $POS (dev$DEVID :$PORT)
 After=network.target
 [Service]
 Type=simple
 User=unitree
-WorkingDirectory=$PCL_SDK
-ExecStart=$PCL_SDK/bins/pointcloud_stream $CFG $PORT 4
+WorkingDirectory=$SDK
+ExecStart=$SDK/bins/pointcloud_stream $PORT $DEVID 4
 Restart=always
 RestartSec=3
 [Install]
 WantedBy=multi-user.target
 EOF" 2>/dev/null
     bssh "$B" "echo $PW | sudo -S cp /tmp/$SVC.service /etc/systemd/system/$SVC.service; echo $PW | sudo -S systemctl daemon-reload; echo $PW | sudo -S systemctl enable --now $SVC" 2>/dev/null
-    log "point cloud: $POS@$B → 服务 $SVC 已装/启用(端口 $PORT, config $CFG)。"
+    log "point cloud: $POS@$B → 服务 $SVC 已装/启用(dev$DEVID, 端口 $PORT, SDK $SDK)。"
   done
 else
   log "✗ /deploy/camera/pointcloud_stream.cc 不存在(Dockerfile 应 COPY camera/)→ point cloud 端跳过。"
