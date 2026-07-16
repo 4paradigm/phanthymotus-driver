@@ -73,6 +73,8 @@ plugins:
     enabled: true
   loco:                         # 基础运动:三维速度 move + 站起/趴下/平衡/姿态/身高
     enabled: true
+  body_pose:                    # 机身姿态/高度:set_attitude(roll/pitch/yaw)/set_body_height/set_foot_raise_height/reset(能力卡片§4.3)
+    enabled: true
   gesture:                      # 表演/表情:作揖/点头/摇头/歪头/环视/跳舞/俯卧撑/坐/昂首等(异步)
     enabled: true
   test_power_control:           # 【未验收·test 前缀】电源:关机 power_off(不可逆,需 confirm+reason+静止前置);真机验收后改回 power_control

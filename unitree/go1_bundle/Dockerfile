@@ -53,6 +53,7 @@ COPY remote_controller.py /work/remote_controller.py
 COPY model.py             /work/model.py
 COPY resource/            /work/resource/
 COPY loco.py           /work/loco.py
+COPY body_pose.py      /work/body_pose.py
 COPY gesture.py        /work/gesture.py
 COPY test_power_control.py /work/test_power_control.py
 COPY beep.py           /work/beep.py
