@@ -250,30 +250,32 @@ class Plugin:
 
     # ── 插件契约 ───────────────────────────────────────────────────────────
     def get_tool(self):
+        # 动作名避开平台保留的系统生命周期动作 {start,stop,info,config}（那些不会渲染成前端按钮）：
+        # 用 play/pause 作为用户可点的“开播/停播”。仍保留 start/stop 在 enum 里以兼容平台生命周期调用，
+        # 但 x-action-params（决定前端按钮）只暴露 play/pause/set_volume/get_volume。
         return {"name": CARD, "type": "actuator", "multiInstance": False,
           "description": ("Go1 head speaker — plays the operator's remote microphone stream "
                           "(subscribes ROS2 /remote_control/mic, PCM-16k) on the on-board speaker "
-                          "(action card, no output topics). start begins playing the mic stream until stop."),
+                          "(action card, no output topics). play begins playing the mic stream until pause."),
           "inputSchema": {"type": "object",
             "properties": {
-              "action": {"type": "string", "enum": ["start", "stop", "set_volume", "get_volume"],
+              "action": {"type": "string",
+                         "enum": ["play", "pause", "set_volume", "get_volume", "start", "stop"],
                          "description": "Speaker action to perform"},
               "request_id": {"type": "string"},
               "volume_percent": {"type": "integer", "minimum": 0, "maximum": 100,
                                  "description": "Volume 0–100% (set_volume)"}},
             "required": ["action"],
             "x-action-params": {
-              "start":      {"params": [], "description": "Start playing the remote mic stream on the speaker"},
-              "stop":       {"params": [], "description": "Stop playing and unsubscribe"},
+              "play":       {"params": [], "description": "Start playing the remote mic stream on the speaker"},
+              "pause":      {"params": [], "description": "Stop playing the mic stream (unsubscribe)"},
               "set_volume": {"params": ["volume_percent"], "description": "Set speaker volume 0–100%"},
               "get_volume": {"params": [], "description": "Read current speaker volume"}}}}
 
     def start(self):
-        # 容器起来即自动订阅播放（best-effort），实现"启动新容器即生效"。失败不阻塞主进程。
-        try:
-            self._start_sub()
-        except Exception as e:  # noqa: BLE001
-            print(f"[{CARD}] auto-start failed (可稍后手动 start): {e}", flush=True)
+        # 平台生命周期钩子：主进程装配时调用。这里不自动订阅——平台在注册后会把卡置为 idle（会调 stop），
+        # 由用户在 15678 点 play 开播。避免与平台生命周期打架。
+        pass
 
     def stop(self):
         try:
@@ -300,9 +302,10 @@ class Plugin:
 
     def dispatch(self, action, args):
         rid = args.get("request_id")
-        if action == "start":
+        # play(用户按钮) 与 start(平台生命周期) 都开播；pause 与 stop 都停播。
+        if action in ("play", "start"):
             return self._start_sub()
-        if action == "stop":
+        if action in ("pause", "stop"):
             return self._stop_sub()
         if action == "set_volume":
             if type(args.get("volume_percent")) is not int or not 0 <= args["volume_percent"] <= 100:
