@@ -74,7 +74,7 @@ COPY camera_adapter/   /deploy/camera_adapter/
 # 点云:NX/Nano 侧 pointcloud_stream.cc 供 nano_bootstrap.sh 首启时分发+编译(镜像 depth_stream 的 SDK 路径)。
 COPY camera/           /deploy/camera/
 # ★ 新增卡：加一行 `COPY <卡名>.py /work/<卡名>.py`（main.py 会按 config 里的卡名自动 import）。
-COPY test_special_motion.py /work/test_special_motion.py
+COPY special_motion.py /work/special_motion.py
 
 ENV ROS_DOMAIN_ID=42
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp

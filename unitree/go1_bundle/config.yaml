@@ -122,7 +122,7 @@ plugins:
     enabled: true
   # ★ 新增卡：新建 <卡名>.py 后，在这里加一行 `<卡名>: { enabled: true }` 打开它。
   #   main.py 会按 config 里的 key 自动 import 同名模块（key == 模块名 == 文件名 == 卡名）。
-  test_special_motion:          # 【未验收·test 前缀】官方特殊动作 jump_yaw_left/straight_hand(HIGHLEVEL,同步序列,须 confirm);真机验收后改名 special_motion
+  special_motion:               # 官方特殊动作 jump_yaw_left/straight_hand(HIGHLEVEL,同步序列,须 confirm,已验收)
     enabled: true
     # jump_yaw_left_duration_s: 3.0   # 开火后保持时长(秒,白名单)
     # straight_hand_duration_s: 4.0
