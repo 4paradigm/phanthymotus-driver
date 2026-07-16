@@ -1,9 +1,9 @@
-# Unitree Go1 · go1_bundle（状态 + 基础控制驱动 · 卡片开发蓝本）
+# Unitree Go1 · go1_bundle（状态 + 控制驱动 · 卡片开发蓝本）
 
 > 一张“卡片” = Driver 暴露的一个 MCP 工具 = 平台画布上一个可拖拽、可被大模型单独调用的能力。
 >
-> 本 bundle 是从完整 Go1 驱动中**切出的最小可运行蓝本**，当前发布 3 张状态卡（`loco_state`、`battery`、`obstacle_range`）+ 1 张控制卡（`spin`）。
-> **一张卡 = 一个自包含的 `.py` 文件**（`loco_state.py` / `battery.py` / `obstacle_range.py` / `spin.py`），方便按卡评审、按卡提交、多人并行不撞车。
+> 本 bundle 是从完整 Go1 驱动中**切出的可运行蓝本**，当前发布 22 张卡：13 张传感卡（sensor）+ 8 张控制卡（actuator）+ 1 张资源卡（resource）。
+> **一张卡 = 一个自包含的 `.py` 文件**（如 `loco_state.py` / `battery.py` / `spin.py` / `loco.py` …），方便按卡评审、按卡提交、多人并行不撞车。
 > 目的有二：① 把这些卡干净地上架；② 作为后来者新增其它卡片的开发起点 —— 怎么加卡见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 实现基座
@@ -13,14 +13,44 @@
 - 无 `robot_interface` / 无真机时自动 **STUB**（不收发、`fresh=false`），MCP server 仍能起、注册、列 tool，方便无硬件时跑通链路。
 - 固定 **HIGHLEVEL**（读 `HighState` / 下发 `HighCmd`）。控制卡须上真机验证量程+安全后才能上架（见 CONTRIBUTING.md §4）。
 
-## 卡片总览（本 bundle 共 4 张：3 状态卡 + 1 控制卡）
+## 卡片总览（本 bundle 共 22 张：13 sensor + 8 actuator + 1 resource）
 
-| 卡片（= 文件） | 类型 | 能力 | 输出 / 关键动作 |
-|---|---|---|---|
-| `loco_state`（`loco_state.py`） | sensor | 运动状态 | `/{ns}/loco/state`：mode / gait / velocity_body_mps / yaw_speed_rad_s / body_height_m / position_m(里程计,漂移) |
-| `battery`（`battery.py`） | sensor | 电量(BMS) | `/{ns}/state/battery`：soc_percent / current_ma / cycle_count / temps / cell_voltage_mv |
-| `obstacle_range`（`obstacle_range.py`） | sensor | 超声波避障 | `/{ns}/state/obstacle_range`：range_raw[4]（仅 HIGHLEVEL；方向/单位官方未定义，原样输出） |
-| `spin`（`spin.py`） | actuator | 原地转圈（闭环） | `action=spin`：转 degrees 度（direction left/right，闭环读 IMU yaw 自停，异步）；`action=stop`：立即停稳打断。前置：狗须已站立 |
+### 传感卡（sensor，读 `HighState` / 系统状态）
+
+| 卡片（= 文件） | 能力 | 输出（`action=info` / ROS2 topic） |
+|---|---|---|
+| `loco_state` | 运动状态 | `/{ns}/loco/state`：mode / gait / velocity_body_mps / yaw_speed_rad_s / body_height_m / position_m(里程计,漂移) |
+| `battery` | 电量(BMS) | `/{ns}/state/battery`：soc_percent / current_ma / cycle_count / temps / cell_voltage_mv |
+| `imu` | IMU | `/{ns}/state/imu`：四元数 / 角速度 / 加速度 / 欧拉角 / 温度 |
+| `feet` | 足端 | `/{ns}/state/feet`：足底力[4] + 高层时足端相对机身位置/速度 |
+| `fall_alarm` | 跌倒/侧翻告警 | `/{ns}/state/fall_alarm`：IMU roll/pitch → ok/tilted/fallen（阈值可配） |
+| `net` | 网络健康 | `/{ns}/state/net`：主机名 / IPv4 / Wi-Fi 信号（联调掉线排查） |
+| `odometry` | 里程计 | `/{ns}/state/odometry`：position/yaw + 相对起点位移（`reset_origin` 重置） |
+| `obstacle_range` | 超声波避障 | `/{ns}/state/obstacle_range`：range_raw[4]（仅 HIGHLEVEL；方向/单位官方未定义，原样输出） |
+| `udp_diagnostics` | UDP 通信健康 | `/{ns}/state/udp_diagnostics`：收发计数 + CRC/丢包/标志错误计数 |
+| `joints` | 12 腿关节 | `/{ns}/state/joints`：q/dq/tau/temp（骨架渲染，需 `model` 卡提供 URDF） |
+| `remote_controller` | 无线遥控器 | `/{ns}/state/remote_controller`：16 按键 + 5 摇杆轴（`HighState.wirelessRemote[40]`） |
+| `camera_depth` | 头部双目深度推流 | `/{ns}/camera/depth`：连 NX depth_stream → ROS2 CompressedImage |
+| `camera_rgb` | 前置 RGB 相机 | JPEG-over-UDP → Nano camera_adapter，画布渲染 |
+
+### 控制卡（actuator，下发 `HighCmd` / 外设动作；须真机验证量程+安全后上架）
+
+| 卡片（= 文件） | 能力 | 关键动作 |
+|---|---|---|
+| `loco` | 基础运动 | 三维速度 `move` + 站起/趴下/平衡/姿态/身高 |
+| `spin` | 原地转圈（闭环） | `action=spin`：转 degrees 度（闭环读 IMU yaw 自停，异步）；`action=stop`：立即停稳。前置：狗须已站立 |
+| `gesture` | 表演/表情 | 作揖/点头/摇头/歪头/环视/跳舞/俯卧撑/坐/昂首等（异步） |
+| `switch_gait` | 步态切换 | 只设期望步态（`trot_run`/`climb_stair`/`trot_obstacle` 须 confirm），实际运动由移动卡触发 |
+| `beep` | 头部扬声器 | beep 动作 → Nano `beep_adapter.py`（:18082 /v1/beep/actions） |
+| `face_light` | 面部灯带颜色 | `set_color`/`preset`/`off`（经 MQTT） |
+| `system_health` | 诊断执行 | 主控板 + 子系统体检，自动判断哪里有问题（经 MQTT） |
+| `test_power_control` | 电源（关机·不可逆） | `power_off`：关闭电池（`BmsCmd.off=0xA5`），**不可逆、不能远程恢复**；需 `confirm=true`+`reason`，前置：状态 fresh 且机器人静止。**`test` 前缀=未验收**，验收后改回 `power_control` |
+
+### 资源卡（resource）
+
+| 卡片（= 文件） | 能力 | 输出 |
+|---|---|---|
+| `model` | go1 四足 URDF | 返回 URDF，供 `joints` 骨架渲染成狗 |
 
 `{ns}` 为 `config.yaml` 的 `ros_namespace`（默认 `bundle`；留空则取 hostname）。
 
@@ -46,15 +76,37 @@
 go1_bundle/
 ├── main.py            # MCP server 入口 + 按 config 卡名自动装配（HIGHLEVEL）
 ├── go1_sdk_client.py  # 共享 raw SDK client：UDP 收 HighState → snapshot()；控制卡经其下发原语发 HighCmd
-├── loco_state.py      # 状态卡：运动状态（自包含：builder + MCP 插件 + 可选 ROS2 发布）
-├── battery.py         # 状态卡：电池 BMS（自包含）
-├── obstacle_range.py  # 状态卡：超声波避障（自包含）
-├── spin.py            # 控制卡：原地转圈（闭环，自包含）
+├── beep_adapter.py    # 非卡片：beep 卡在 Head Nano 侧的适配器（配合 beep 卡）
+│   ── 传感卡（sensor）──
+├── loco_state.py      # 运动状态
+├── battery.py         # 电池 BMS
+├── imu.py             # IMU
+├── feet.py            # 足端力/位置
+├── fall_alarm.py      # 跌倒/侧翻告警
+├── net.py             # 网络健康
+├── odometry.py        # 里程计
+├── obstacle_range.py  # 超声波避障
+├── udp_diagnostics.py # UDP 通信健康
+├── joints.py          # 12 腿关节（骨架渲染）
+├── remote_controller.py # 无线遥控器
+├── camera_depth.py    # 头部双目深度推流
+├── camera_rgb.py      # 前置 RGB 相机
+│   ── 控制卡（actuator）──
+├── loco.py            # 基础运动
+├── spin.py            # 原地转圈（闭环）
+├── gesture.py         # 表演/表情
+├── switch_gait.py     # 步态切换
+├── beep.py            # 头部扬声器 beep
+├── face_light.py      # 面部灯带颜色
+├── system_health.py   # 诊断执行
+├── test_power_control.py # 电源关机（不可逆，未验收=test 前缀）
+│   ── 资源卡（resource）──
+├── model.py           # go1 URDF（供 joints 骨架渲染）
 ├── config.yaml        # 卡片开关 / 端口 / 命名空间
 ├── driver.yaml        # 驱动元数据（id / port / 描述）
-├── requirements.txt   # 运行期 pip 依赖（pyyaml；rclpy/robot_interface 由镜像提供/构建）
+├── requirements.txt   # 运行期 pip 依赖（pyyaml / paho-mqtt；rclpy/robot_interface 由镜像提供/构建）
 ├── Dockerfile         # ARM64；镜像内构建 robot_interface.so
-├── deploy/service.yml # compose 服务片段
+├── deploy/            # compose 片段 + Nano 侧 beep/camera adapter 部署（nano_bootstrap.sh 等）
 ├── README.md          # 本文件
 └── CONTRIBUTING.md    # ★ 如何在此基础上新增卡片
 ```
@@ -62,8 +114,8 @@ go1_bundle/
 ## 本地运行（无硬件 STUB 亦可）
 
 ```bash
-cd go1_bundle
-pip install -r requirements.txt          # 仅 pyyaml；rclpy/robot_interface 缺失会自动降级
+cd unitree/go1_bundle
+pip install -r requirements.txt          # pyyaml / paho-mqtt；rclpy/robot_interface 缺失会自动降级
 python3 main.py                          # 默认读 config.yaml；CONFIG_PATH 可覆盖
 # 另开一个终端，列卡片：
 curl -s localhost:15717/mcp -H 'Content-Type: application/json' \
