@@ -92,6 +92,7 @@ class _MicNode(Node):
         local_ip = _get_local_ip()
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
         sock.bind(("", MIC_PORT))
         mreq = struct.pack(
             "4s4s",
@@ -132,7 +133,7 @@ class _MicNode(Node):
                 del buf[:CHUNK_BYTES]
                 msg = AudioChunk()
                 msg.format = "pcm_16k_16bit_mono"
-                msg.data = list(chunk)
+                msg.data = chunk
                 self._pub.publish(msg)
 
 
