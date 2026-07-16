@@ -1,0 +1,17 @@
+[Unit]
+Description=Go1 camera_adapter (front /dev/video1) — camera_rgb 板卡侧：JSON-TCP :9301 + JPEG-over-UDP
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=unitree
+WorkingDirectory=/home/unitree/camera_adapter
+# adapter 仅在 probe/start 时才打开相机；平时只监听 9301，故无需等相机空闲。
+# 前置：startNode.sh 已禁用 front autostart（否则 video1 被占，start 会 RESOURCE_BUSY）。
+ExecStart=/home/unitree/camera_adapter/camera_adapter --device-id 1 --device-node /dev/video1 --control-port 9301
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
