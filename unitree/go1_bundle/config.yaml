@@ -66,6 +66,13 @@ plugins:
   model:                        # (resource) 返回 go1 四足 URDF，供 joints 骨架渲染成狗
     enabled: true
 
+  # ── sdl 活动度状态卡（未验收·test 前缀）──
+  test_activity:                # 【未验收·test 前缀】活动度时序卡(actuator):后台滑窗采样 velocity/mode,
+    enabled: true               #   action=report 返回过去N秒 移动距离/运动占比/静止时长/均峰速度/模式切换。纯读不控制。验收后改名 activity
+    sample_hz: 5                # 采样频率(Hz)
+    window_sec: 60              # 滑动窗口时长(秒)
+    move_eps: 0.05              # 速度模长(m/s)低于此值算静止
+
   # ── 控制卡（下发 HighCmd；须真机验证量程+安全后上架）──
   beep:                         # 头部扬声器 beep 动作卡 → Nano beep_adapter.py（:18082 /v1/beep/actions）
     enabled: true
