@@ -41,6 +41,7 @@ VX_MAX = 1.0            # 前后 m/s
 VY_MAX = 0.6            # 平移 m/s
 VYAW_MAX = 2.0          # 偏航 rad/s
 MOVE_WATCHDOG_S = 0.5   # 看门狗：超过此时长无新 move → 自动回 idle(mode=0) 停下（控制卡停发即自停）
+POWER_OFF_CODE = 0xA5   # BmsCmd.off 关机命令字（power_control 卡用；终态、不可逆）
 
 # HighState.mode（Go1 legacy comm.h）
 MODE_NAMES = {0: "idle", 1: "force_stand", 2: "walk", 5: "stand_down",
@@ -189,6 +190,7 @@ class Go1HighSdkClient:
         self._move_cmd = None       # (vx, vy, vyaw, gait) 或 None
         self._move_deadline = 0.0   # monotonic 截止；过期即回 idle
         self._posture = None        # 【纯新增】dict: mode/euler/body_height/foot_raise/speed_level；持续保持(loco/gesture 用)
+        self._power_off = False     # 【power_control 卡】一次置位后持续下发 BmsCmd.off（终态，不复位）
         self._desired_gait = 1      # 常驻期望步态（switch_gait 卡写；move 未显式指定 gait 时用它）。默认 1=trot
         # ── UDP 诊断计数（udp_diagnostics 卡读取；纯新增，不影响只读语义）──
         self._diag_lock = threading.Lock()
@@ -360,6 +362,22 @@ class Go1HighSdkClient:
                              "speed_level": int(speed_level)}
         return dict(self._posture)
 
+    def request_power_off(self):
+        """【power_control 卡】置位关机：之后 _compose_cmd 持续写 BmsCmd.off=0xA5
+        （终态、不可逆、不复位）。一经置位不再清除，直到进程退出。"""
+        with self._lock:
+            self._power_off = True
+
+    @staticmethod
+    def _set_bms_off(c) -> None:
+        """尽力写 HighCmd.bms.off=0xA5（不同绑定字段名可能不同 → 防御式，绝不抛异常）。"""
+        try:
+            bms = getattr(c, "bms", None)
+            if bms is not None and hasattr(bms, "off"):
+                bms.off = POWER_OFF_CODE
+                c.bms = bms
+        except Exception:  # noqa: BLE001
+            pass
     def set_gait(self, gait) -> int:
         """设置常驻期望步态（switch_gait 卡用）；此后未显式指定 gait 的 move 都用它。
         若当前正在移动，立即把进行中的 move 目标步态也换成新步态（走时切步态）。"""
@@ -384,7 +402,11 @@ class Go1HighSdkClient:
         with self._lock:
             mc = self._move_cmd if (self._move_cmd is not None and now < self._move_deadline) else None
             pose = None if mc is not None else self._posture   # 【纯新增】move 优先,否则用 posture
+            power_off = self._power_off                        # 【power_control 卡】终态,优先级最高
         try:
+            if power_off:                                      # 【power_control 卡】一旦置位持续下发关机字
+                self._set_bms_off(self._cmd)
+                return
             if mc is not None:
                 vx, vy, vyaw, gait = mc
                 self._cmd.mode = 2
