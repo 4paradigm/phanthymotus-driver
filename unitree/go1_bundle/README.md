@@ -30,7 +30,7 @@
 | `udp_diagnostics` | UDP 通信健康 | `/{ns}/state/udp_diagnostics`：收发计数 + CRC/丢包/标志错误计数 |
 | `joints` | 12 腿关节 | `/{ns}/state/joints`：q/dq/tau/temp（骨架渲染，需 `model` 卡提供 URDF） |
 | `remote_controller` | 无线遥控器 | `/{ns}/state/remote_controller`：16 按键 + 5 摇杆轴（`HighState.wirelessRemote[40]`） |
-| `camera_depth` | 头部双目深度推流 | `/{ns}/camera/depth`：连 NX depth_stream → ROS2 CompressedImage |
+| `test_camera_depth` | 双目深度推流(5 机位·multiInstance;test=未验收) | `/{ns}/camera/<机位>/depth`:卡 start 才连对应板 depth_stream → ROS2 CompressedImage(jpeg);stop 断开释放相机 |
 | `camera_rgb` | 前置 RGB 相机 | JPEG-over-UDP → Nano camera_adapter，画布渲染 |
 
 ### 控制卡（actuator，下发 `HighCmd` / 外设动作；须真机验证量程+安全后上架）
@@ -89,7 +89,7 @@ go1_bundle/
 ├── udp_diagnostics.py # UDP 通信健康
 ├── joints.py          # 12 腿关节（骨架渲染）
 ├── remote_controller.py # 无线遥控器
-├── camera_depth.py    # 头部双目深度推流
+├── test_camera_depth.py # 双目深度推流(5 机位·multiInstance;test=未验收)
 ├── camera_rgb.py      # 前置 RGB 相机
 │   ── 控制卡（actuator）──
 ├── loco.py            # 基础运动

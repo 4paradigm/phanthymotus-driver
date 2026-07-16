@@ -60,7 +60,7 @@ COPY beep.py           /work/beep.py
 COPY camera_rgb.py     /work/camera_rgb.py
 COPY face_light.py     /work/face_light.py
 COPY system_health.py  /work/system_health.py
-COPY camera_depth.py   /work/camera_depth.py
+COPY test_camera_depth.py /work/test_camera_depth.py
 COPY test_camera_pointcloud.py /work/test_camera_pointcloud.py
 COPY speaker.py        /work/speaker.py
 COPY config.yaml       /work/config.yaml

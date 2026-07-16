@@ -163,6 +163,57 @@ else
   log "✗ /deploy/camera/pointcloud_stream.cc 不存在(Dockerfile 应 COPY camera/)→ point cloud 端跳过。"
 fi
 
+# ── 7) depth 端:depth_stream(5 路机位;连上才开相机、断开即释放 → 不常占)────────────────────
+#   与 pointcloud 同套路:每路一个常驻服务(空闲不占相机);自动探测 SDK 路径 + raw g++ 编译。
+#   depth_stream 按 device_id 现场生成 config 开相机(加载立体标定,同 pointcloud);Pi 侧 test_camera_depth 卡 start 才连、stop 就断。
+#   与点云指向同一相机 → 二者互斥(谁连上谁 fuser 顶掉对方),属预期。
+#   端口 91xx 与点云 94xx / RGB 92xx-93xx 错开。每行: position board_ip device_id port
+#   (与 config.yaml test_camera_depth.positions 及 Pi 侧 depth_port 对齐)
+DEPTH_ROWS=(
+  "front 192.168.123.13 1 9101"
+  "chin  192.168.123.13 0 9102"
+  "left  192.168.123.14 0 9103"
+  "right 192.168.123.14 1 9104"
+  "belly 192.168.123.15 0 9105"
+)
+if [ -f "$DEPLOY/camera/depth_stream.cc" ]; then
+  for row in "${DEPTH_ROWS[@]}"; do
+    set -- $row; POS="$1"; B="$2"; DEVID="$3"; PORT="$4"
+    if ! bssh "$B" 'echo ok' >/dev/null 2>&1; then log "depth: 板 $B 不可达 → 跳过 $POS"; continue; fi
+    SDK=$(bssh "$B" "$PCL_DETECT" 2>/dev/null | tr -d '\r' | head -1)
+    if [ -z "$SDK" ]; then log "depth: $B 无 UnitreeCameraSDK → 跳过 $POS"; continue; fi
+    # 编译一次(该板二进制不存在才编;raw g++ 镜像 pointcloud_stream)
+    if ! bssh "$B" "[ -x $SDK/bins/depth_stream ]" 2>/dev/null; then
+      log "depth: 在 $B 编 depth_stream(SDK=$SDK)…"
+      bscp "$B" "$DEPLOY/camera/depth_stream.cc" "$SDK/depth_stream.cc" 2>/dev/null
+      bssh "$B" "cd $SDK && mkdir -p bins && g++ -O2 -std=c++14 -pthread depth_stream.cc -I$SDK/include -I$SDK/thirdparty -L$SDK/lib/arm64 -Wl,--start-group -lunitree_camera -ltstc_V4L2_xu_camera -lsystemlog -ludev -Wl,--end-group \$(pkg-config --cflags --libs opencv4) -o bins/depth_stream 2>&1 | tail -3" 2>&1 | tail -3
+    fi
+    if ! bssh "$B" "[ -x $SDK/bins/depth_stream ]" 2>/dev/null; then
+      log "depth: $POS@$B 编译失败/无二进制 → 跳过服务"; continue
+    fi
+    # 装 systemd 服务(空闲不占相机;连上才开 dev$DEVID;fuser 抢占由 depth_stream 自己做)
+    SVC="go1-depth-$POS"
+    bssh "$B" "cat > /tmp/$SVC.service <<EOF
+[Unit]
+Description=Go1 depth_stream $POS (dev$DEVID :$PORT)
+After=network.target
+[Service]
+Type=simple
+User=unitree
+WorkingDirectory=$SDK
+ExecStart=$SDK/bins/depth_stream $PORT $DEVID
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
+EOF" 2>/dev/null
+    bssh "$B" "echo $PW | sudo -S cp /tmp/$SVC.service /etc/systemd/system/$SVC.service; echo $PW | sudo -S systemctl daemon-reload; echo $PW | sudo -S systemctl enable --now $SVC" 2>/dev/null
+    log "depth: $POS@$B → 服务 $SVC 已装/启用(dev$DEVID, 端口 $PORT, SDK $SDK)。"
+  done
+else
+  log "✗ /deploy/camera/depth_stream.cc 不存在(Dockerfile 应 COPY camera/)→ depth 端跳过。"
+fi
+
 log "=== provision 完成 ==="
 $SSH $R "echo -n '  cam_svc='; echo $PW|sudo -S systemctl is-active go1-camera-adapter 2>/dev/null; echo -n '  beep_svc='; echo $PW|sudo -S systemctl is-active go1-beep-adapter 2>/dev/null; echo -n '  speaker_svc='; echo $PW|sudo -S systemctl is-active go1-speaker-adapter 2>/dev/null" 2>/dev/null | grep -vE 'password|sudo'
 exit 0
