@@ -54,6 +54,7 @@ COPY model.py             /work/model.py
 COPY resource/            /work/resource/
 COPY loco.py           /work/loco.py
 COPY gesture.py        /work/gesture.py
+COPY test_power_control.py /work/test_power_control.py
 COPY beep.py           /work/beep.py
 COPY camera_rgb.py     /work/camera_rgb.py
 COPY face_light.py     /work/face_light.py

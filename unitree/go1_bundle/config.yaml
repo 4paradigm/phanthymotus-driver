@@ -75,6 +75,9 @@ plugins:
     enabled: true
   gesture:                      # 表演/表情:作揖/点头/摇头/歪头/环视/跳舞/俯卧撑/坐/昂首等(异步)
     enabled: true
+  test_power_control:           # 【未验收·test 前缀】电源:关机 power_off(不可逆,需 confirm+reason+静止前置);真机验收后改回 power_control
+    enabled: true
+
   switch_gait:                  # 步态切换：只设期望步态，实际运动由移动卡触发（trot_run/climb_stair/trot_obstacle 须 confirm）
     enabled: true
   # ★ 新增卡：新建 <卡名>.py 后，在这里加一行 `<卡名>: { enabled: true }` 打开它。
