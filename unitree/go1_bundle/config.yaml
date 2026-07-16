@@ -82,19 +82,23 @@ plugins:
     forward_batch_ms: 40             # 攒多少毫秒的 PCM 批量转发一次（越小越低延迟、HTTP 次数越多）
     max_buffer_bytes: 6400           # 转发跟不上时的缓冲上限(~200ms@16k)，超出丢最旧的 → 延迟钉在低位、保持新鲜
 
-  camera_rgb:                   # 前置 RGB 相机（JPEG-over-UDP）→ Nano camera_adapter（控制口 9301）
+  camera_rgb:                   # 五机位 RGB 相机（multiInstance，JPEG-over-UDP）→ 各板 Nano camera_adapter（控制口 9301~9305）
     enabled: true
     receive_ip: "192.168.123.161"   # 接收端(本驱动所在 Pi)IP；Adapter 把图像帧定向发到这里，勿硬编码进代码
-    probe_timeout_sec: 5.0          # 启动探测 front 控制口的超时；须 >相机开启耗时(SDK 初始化实测~3.4s)，
-                                    # 太短会误判 front 不可达；无 adapter 的口是"连接被拒"即时返回，不吃满超时。
-    default_mode: "raw_mono"        # raw_mono/raw_stereo/rectified_mono/rectified_stereo
-                                    # ★ 帧率关键：raw_mono 跳过 Nano CPU 立体校正 → 帧率高且稳；
-                                    #   rectified_* 会对左右目都做校正(只用一路)，在 Nano ARM 上把帧率压得很低。
+    default_position: "front"       # 前端实例未选 camera_source 时的缺省机位
+    default_mode: "undistort_mono"  # raw_mono/raw_stereo/rectified_mono/rectified_stereo/undistort_mono
+                                    # ★ undistort_mono：raw 快采 + 单目预计算 CMei remap 去畸变（缺标定机位自动降级鱼眼直通）；
+                                    #   rectified_* 走 getRectStereoFrame 双目校正、在 Nano ARM 上很慢。
     default_frame_size: "928x400"   # 官方支持：1856x800@30 或 928x400@30/60
-    default_fps: 60                 # 928x400 支持 60；start 时下发给 Nano adapter 重开相机（想更省带宽可改 30）
-    # 位置→板卡映射。本卡只启用 front；control_port 约定 = image_port+100，须与 camera_adapter 启动参数一致。
+    default_fps: 30                 # 多路默认 30（省 CPU/带宽）；单路想高帧率改 60。start 时下发给 adapter 重开相机
+    # 五机位→板卡映射。control_port 约定 = image_port+100，须与 nano_bootstrap 装的 camera_adapter 服务参数一致。
+    # 注意：left/right 所在 .14 无 opencv4，adapter 可能编不出→该两路暂不可用（见 nano_bootstrap 日志）。
     positions:
       front: {board_ip: "192.168.123.13", device_id: 1, image_port: 9201, control_port: 9301}
+      chin:  {board_ip: "192.168.123.13", device_id: 0, image_port: 9202, control_port: 9302}
+      left:  {board_ip: "192.168.123.14", device_id: 0, image_port: 9203, control_port: 9303}
+      right: {board_ip: "192.168.123.14", device_id: 1, image_port: 9204, control_port: 9304}
+      belly: {board_ip: "192.168.123.15", device_id: 0, image_port: 9205, control_port: 9305}
 
   spin:                         # 原地转圈（闭环读 IMU yaw 转够自停）
     enabled: true

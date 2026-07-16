@@ -22,6 +22,12 @@ R="unitree@$NANO"
 
 log(){ echo "[nano_bootstrap] $*"; }
 
+# 按板 IP 的 ssh/scp（camera/pointcloud 多板 provision 用；单行短连接）。
+bssh(){ sshpass -p "$PW" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 "unitree@$1" "$2"; }
+bscp(){ sshpass -p "$PW" scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 "$2" "unitree@$1:$3"; }
+# 板上探测 SDK 目录（含 include/UnitreeCameraSDK.hpp 的第一个候选）；单引号 → $HOME 在板上求值。
+CAM_DETECT='for d in $HOME/UnitreecameraSDK $HOME/Unitree/sdk/UnitreeCameraSdk; do [ -f "$d/include/UnitreeCameraSDK.hpp" ] && echo "$d" && break; done'
+
 command -v sshpass >/dev/null 2>&1 || { log "✗ 容器内无 sshpass（Dockerfile 应 apt 装）；跳过 provision。"; exit 0; }
 
 # 0) 可达性（连不上不阻塞主进程；主进程照常起，只是 beep/camera 暂不可用）
@@ -31,28 +37,65 @@ if ! $SSH $R 'echo ok' >/dev/null 2>&1; then
 fi
 log "Nano $NANO 可达，开始 provision camera_rgb + beep。"
 
-# ── 1) camera_rgb 端：camera_adapter（front / /dev/video1 / 控制口 9301）─────────────
-if $SSH $R '[ -x ~/camera_adapter/camera_adapter ]' 2>/dev/null; then
-  log "camera_adapter 已在 Nano 上（跳过编译）。"
-elif [ -f "$DEPLOY/camera_adapter/camera_adapter.cpp" ]; then
-  log "在 Nano 上现编 camera_adapter（需 opencv4 + UnitreecameraSDK，静态库在 lib/arm64）…"
-  $SSH $R 'mkdir -p ~/camera_adapter' 2>/dev/null
-  $SCP "$DEPLOY/camera_adapter/camera_adapter.cpp" "$R:~/camera_adapter/camera_adapter.cpp" 2>/dev/null
-  $SSH $R 'cd ~/camera_adapter; SDK=$HOME/UnitreecameraSDK; \
-    pkg-config --exists opencv4 || { echo NO_OPENCV4; exit 1; }; \
-    [ -d "$SDK/include" ] || { echo NO_SDK; exit 1; }; \
-    g++ -O2 -std=c++14 -pthread camera_adapter.cpp -I$SDK/include -I$SDK/thirdparty -L$SDK/lib/arm64 \
-      -Wl,--start-group -lunitree_camera -ltstc_V4L2_xu_camera -lsystemlog -ludev -Wl,--end-group \
-      $(pkg-config --cflags --libs opencv4) -o camera_adapter && echo BUILD_OK' 2>&1 | tail -4
+# ── 1) camera_rgb 端：camera_adapter × 五机位（三块板；SDK/编法/opencv fallback 同 point cloud 自动探测）──
+#   每行: position board_ip device_id device_node control_port  （与 Pi 侧 camera_rgb.positions 对齐）
+#   adapter 平时只监听控制口、probe/start 时才开相机（不占相机）→ 可与 pointcloud 服务共存，谁 start 谁抢设备。
+#   .14 若无 opencv/编译失败 → 该板跳过（left/right 暂不可用），不阻塞其它板。calib 尽力用 output_camCalibParams.yaml
+#   （front 匹配→去畸变；其它机位缺 per-device 标定→adapter 降级鱼眼直通，仍出图）。
+CAM_ROWS=(
+  "front 192.168.123.13 1 /dev/video1 9301"
+  "chin  192.168.123.13 0 /dev/video0 9302"
+  "left  192.168.123.14 0 /dev/video0 9303"
+  "right 192.168.123.14 1 /dev/video1 9304"
+  "belly 192.168.123.15 0 /dev/video0 9305"
+)
+if [ -f "$DEPLOY/camera_adapter/camera_adapter.cpp" ]; then
+  CAM_DONE=""   # 已处理过的板（每板只编译/禁 autostart/腾设备一次）
+  for row in "${CAM_ROWS[@]}"; do
+    set -- $row; POS="$1"; B="$2"; DEVID="$3"; NODE="$4"; CTRL="$5"
+    if ! bssh "$B" 'echo ok' >/dev/null 2>&1; then log "camera: 板 $B 不可达 → 跳过 $POS"; continue; fi
+    SDK=$(bssh "$B" "$CAM_DETECT" 2>/dev/null | tr -d '\r' | head -1)
+    if [ -z "$SDK" ]; then log "camera: $B 无 UnitreeCameraSDK → 跳过 $POS"; continue; fi
+    case " $CAM_DONE " in
+      *" $B "*) : ;;
+      *)
+        # 首见该板：① 持久禁出厂相机 autostart（point_cloud_node 独占相机）；② 当次腾设备；③ 编 camera_adapter
+        bssh "$B" 'SN=$HOME/Unitree/autostart/camerarosnode/cameraRosNode/startNode.sh; [ -f "$SN" ] && ! grep -q "camrgb-disabled" "$SN" && { cp "$SN" "$SN.bak-camrgb"; sed -i "/stereo_camera_config.*\.yaml/ s/^\([^#]\)/#camrgb-disabled \1/" "$SN"; echo autostart_disabled; }' 2>/dev/null
+        bssh "$B" "echo $PW | sudo -S pkill -TERM -f point_cloud_node 2>/dev/null; echo $PW | sudo -S pkill -TERM -f example_putImagetrans 2>/dev/null; true" 2>/dev/null
+        log "camera: 在 $B 编 camera_adapter(SDK=$SDK)…"
+        bssh "$B" "rm -f $SDK/bins/camera_adapter" 2>/dev/null
+        bscp "$B" "$DEPLOY/camera_adapter/camera_adapter.cpp" "/tmp/camera_adapter.cpp" 2>/dev/null
+        bssh "$B" "mkdir -p $SDK/bins; OCV=\$(pkg-config --cflags --libs opencv4 2>/dev/null); [ -z \"\$OCV\" ] && OCV=\$(pkg-config --cflags --libs opencv 2>/dev/null); [ -z \"\$OCV\" ] && OCV=\"-I/usr/include/opencv4 -I/usr/local/include/opencv4 -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lopencv_calib3d\"; g++ -O2 -std=c++14 -pthread /tmp/camera_adapter.cpp -I$SDK/include -I$SDK/thirdparty -L$SDK/lib/arm64 -Wl,--start-group -lunitree_camera -ltstc_V4L2_xu_camera -lsystemlog -ludev -Wl,--end-group \$OCV -o $SDK/bins/camera_adapter 2>&1 | tail -4" 2>&1 | tail -4
+        CAM_DONE="$CAM_DONE $B"
+        ;;
+    esac
+    if ! bssh "$B" "[ -x $SDK/bins/camera_adapter ]" 2>/dev/null; then
+      log "camera: $POS@$B 无有效二进制(编译失败?可能缺 opencv)→ 跳过服务"; continue
+    fi
+    # per-position 标定：有 output_camCalibParams.yaml 就作为该机位 --calib（front 匹配→去畸变；
+    # 其它机位用它是近似/或文件不存在→adapter 降级鱼眼）。TODO: 用 example_getCalibParamsFile 按 device 生成。
+    CAL="$SDK/calib_$POS.yaml"
+    bssh "$B" "[ -f $SDK/output_camCalibParams.yaml ] && cp -f $SDK/output_camCalibParams.yaml $CAL 2>/dev/null; true" 2>/dev/null
+    SVC="go1-camera-adapter-$POS"
+    bssh "$B" "cat > /tmp/$SVC.service <<EOF
+[Unit]
+Description=Go1 camera_adapter $POS (dev$DEVID $NODE :$CTRL)
+After=network.target
+[Service]
+Type=simple
+User=unitree
+WorkingDirectory=$SDK/bins
+ExecStart=$SDK/bins/camera_adapter --device-id $DEVID --device-node $NODE --control-port $CTRL --calib $CAL
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
+EOF" 2>/dev/null
+    bssh "$B" "echo $PW | sudo -S cp /tmp/$SVC.service /etc/systemd/system/$SVC.service; echo $PW | sudo -S systemctl daemon-reload; echo $PW | sudo -S systemctl enable $SVC >/dev/null 2>&1; echo $PW | sudo -S systemctl restart $SVC" 2>/dev/null
+    log "camera: $POS@$B → 服务 $SVC 已装/重启(dev$DEVID $NODE, 控制口 $CTRL, calib $CAL, SDK $SDK)。"
+  done
 else
   log "✗ /deploy 下无 camera_adapter/camera_adapter.cpp → camera 端跳过。"
-fi
-# 装/启用 camera 服务（front）
-if [ -f "$DEPLOY/go1-camera-adapter.service" ]; then
-  $SCP "$DEPLOY/go1-camera-adapter.service" "$R:/tmp/go1-camera-adapter.service" 2>/dev/null
-  $SSH $R "echo $PW | sudo -S cp /tmp/go1-camera-adapter.service /etc/systemd/system/go1-camera-adapter.service" 2>/dev/null
-  $SSH $R "echo $PW | sudo -S systemctl daemon-reload; echo $PW | sudo -S systemctl enable --now go1-camera-adapter" 2>/dev/null
-  log "camera 服务已装/启用（控制口 9301，JSON-TCP + JPEG-over-UDP）。"
 fi
 
 # ── 2) beep 端：beep_adapter（:18082 /v1/beep/actions，纯 Python 免编译）──────────────
@@ -215,5 +258,10 @@ else
 fi
 
 log "=== provision 完成 ==="
-$SSH $R "echo -n '  cam_svc='; echo $PW|sudo -S systemctl is-active go1-camera-adapter 2>/dev/null; echo -n '  beep_svc='; echo $PW|sudo -S systemctl is-active go1-beep-adapter 2>/dev/null; echo -n '  speaker_svc='; echo $PW|sudo -S systemctl is-active go1-speaker-adapter 2>/dev/null" 2>/dev/null | grep -vE 'password|sudo'
+for row in "${CAM_ROWS[@]}"; do
+  set -- $row; POS="$1"; B="$2"
+  st=$(bssh "$B" "echo $PW|sudo -S systemctl is-active go1-camera-adapter-$POS 2>/dev/null" 2>/dev/null | grep -vE 'password|sudo' | tr -d '\r')
+  log "  cam_$POS@$B=${st:-unknown}"
+done
+$SSH $R "echo -n '  beep_svc='; echo $PW|sudo -S systemctl is-active go1-beep-adapter 2>/dev/null; echo -n '  speaker_svc='; echo $PW|sudo -S systemctl is-active go1-speaker-adapter 2>/dev/null" 2>/dev/null | grep -vE 'password|sudo'
 exit 0
