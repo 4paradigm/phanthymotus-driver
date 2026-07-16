@@ -101,9 +101,10 @@ class Plugin:
         self._executor = executor
         self._client = _SpeakerAdapterClient(self._config)
         self._topic = self._config.get("mic_topic", "/remote_control/mic")
-        self._batch_ms = float(self._config.get("forward_batch_ms", 80))
-        # 转发跟不上时的缓冲上限（默认 ~2s@16k/16bit/mono），超出丢最旧的以保持准实时。
-        self._max_buffer_bytes = int(self._config.get("max_buffer_bytes", 64000))
+        # 低延迟：小批(40ms)转发 + 小缓冲上限(~200ms@16k)。积压超上限丢最旧 → 延迟被钉在低位
+        # （准实时对讲宁可丢一点也要新鲜）。想更稳/更低延迟可在 config 调 forward_batch_ms/max_buffer_bytes。
+        self._batch_ms = float(self._config.get("forward_batch_ms", 40))
+        self._max_buffer_bytes = int(self._config.get("max_buffer_bytes", 6400))
 
         self._playing = False              # play/pause 标志（不碰 ROS 句柄）
         self._alive = True                 # 进程存活标志（Plugin.stop 置 False）

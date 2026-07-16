@@ -3,5 +3,7 @@
   "port": 18083,
   "audio_device": "auto",
   "mixer_control": "Speaker",
-  "idle_timeout_sec": 5.0
+  "idle_timeout_sec": 5.0,
+  "aplay_buffer_us": 100000,
+  "aplay_period_us": 20000
 }
