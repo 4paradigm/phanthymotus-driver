@@ -25,7 +25,7 @@ DESC = ("Go1 基础运动 — 三维速度(vx 前后 m/s / vy 左右平移 m/s /
 
 TROT = 1
 # vx 上限对齐共享 client 实际裁剪值(client 砍到 1.0),标真实能跑到的值;vy 保持 0.8。
-VX_MAX, VY_MAX = 1.0, 0.8            # 前后 / 左右平移 m/s
+VX_MAX, VY_MAX = 1.5, 0.8            # 前后 / 左右平移 m/s
 VYAW_MAX_DEG = 90.0                  # 偏航角速度 °/s(≈1.57 rad/s;卡片用角度制,下发前转弧度)
 DURATION_MAX = 300.0   # move 单次最长持续秒(前端可调执行时间;防误传超大值)
 # mode(Go1 HighCmd)
