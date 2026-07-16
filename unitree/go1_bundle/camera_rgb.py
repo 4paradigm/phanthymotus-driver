@@ -493,11 +493,13 @@ class _CameraRgbInstance:
 # ── CameraRgbPlugin (multiInstance sensor) ────────────────────────────────────
 
 class CameraRgbPlugin:
-    """Go1 `camera_rgb` 视觉扩展卡（能力卡片 §8.3）——multiInstance，实例经 camera_source 选机位。
+    """Go1 `camera_rgb` 视觉扩展卡（能力卡片 §8.3）。
 
-    对齐 dji/mavic3e：multiInstance:True + configSchema.camera_source（下拉 front/chin/left/right/belly，
-    scope=instance）。前端可加多个实例、每个选一个机位 → 多个窗格同时看多路（各相机独立硬件、各发各 topic）。
-    每个机位 = 一个 _CameraRgbInstance（一条板载 adapter 会话 + 收流子进程 + topic /{ns}/vision/{position}/mono）。
+    ``camera_source`` 是驱动级共享配置：在 Agent Core 的全局配置中切换后，未显式指定
+    ``camera_source`` 的 info/start/stop 都操作该机位，且返回该机位的 topic_out。这样全局
+    预览不会再因没有画布实例的配置而回退到 front。
+    每个机位仍对应一个 _CameraRgbInstance（一条板载 adapter 会话 + 收流子进程 + topic
+    /{ns}/vision/{position}/mono）。
     """
     PREFIX = "camera_rgb"
 
@@ -526,8 +528,9 @@ class CameraRgbPlugin:
                     pos, pcfg, namespace, executor, self._receive_ip, self._defaults, {})
             except (KeyError, ValueError, TypeError) as e:
                 print(f"[camera_rgb] {pos}: 配置无效，跳过 {e}", flush=True)
-        # UI 实例 → 选定机位（camera_source）。前端 config/start 时记录。
-        self._instance_source: dict[str, str] = {}
+        # Agent Core 的全局配置会调用 config；将选中的机位保存为驱动级状态，而非绑定到
+        # 某一张画布卡的 instance_id。这样全局页和画布页的默认预览保持一致。
+        self._selected_source = self._default_position
         print(f"[camera_rgb] 机位就绪：{sorted(self._cameras.keys())}（default={self._default_position}）", flush=True)
 
     def _topic_for(self, position: str) -> str:
@@ -545,9 +548,9 @@ class CameraRgbPlugin:
             "type": "sensor",
             "multiInstance": True,
             "description": (
-                "Go1 RGB cameras via on-board UnitreecameraSDK adapters. Pick a camera position "
-                "(front/chin/left/right/belly) per instance; add multiple instances to view several at once. "
-                "start opens that camera and streams JPEG (undistort_mono, de-warped) to /{ns}/vision/{position}/mono."
+                "Go1 RGB cameras via on-board UnitreecameraSDK adapters. Select the active camera position "
+                "(front/chin/left/right/belly) in global configuration. start opens that camera and streams "
+                "JPEG (undistort_mono, de-warped) to /{ns}/vision/{position}/mono."
             ),
             "configSchema": {
                 "type": "object",
@@ -555,7 +558,7 @@ class CameraRgbPlugin:
                     "camera_source": {
                         "type": "string",
                         "description": "Camera position",
-                        "scope": "instance",
+                        "scope": "shared",
                         "oneOf": self._source_options(),
                     },
                 },
@@ -597,25 +600,27 @@ class CameraRgbPlugin:
                 print(f"[camera_rgb] stop {inst._position} error: {e}", flush=True)
 
     def _resolve_source(self, args: dict) -> str:
-        instance_id = args.get("instance_id", "default")
-        return (args.get("camera_source")
-                or self._instance_source.get(instance_id)
-                or self._default_position)
+        # ``camera_source`` may be included by a direct MCP call.  Otherwise all callers,
+        # including the global preview which has no instance_id, use the shared selection.
+        return args.get("camera_source") or self._selected_source
 
     def dispatch(self, action: str, args: dict) -> dict | None:
-        instance_id = args.get("instance_id", "default")
         source = self._resolve_source(args)
 
         if action == "config":
-            if source:
-                self._instance_source[instance_id] = source
+            if source not in self._cameras:
+                return _err("DEVICE_NOT_FOUND", f"camera position {source!r} not configured")
+            self._selected_source = source
             return {"ok": True, "card": "camera_rgb", "action": "config", "camera_source": source,
                     "topic_out": [{"topic": self._topic_for(source), "format": "image/jpeg"}]}
 
         inst = self._cameras.get(source)
         if inst is None:
             return _err("DEVICE_NOT_FOUND", f"camera position {source!r} not configured")
-        self._instance_source[instance_id] = source
+        # Direct MCP calls that specify a source should also become the global selection,
+        # so the next global info/start request and preview stay on the same camera.
+        if args.get("camera_source"):
+            self._selected_source = source
 
         if action == "info":
             return inst.info()

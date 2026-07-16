@@ -564,7 +564,7 @@ private:
                 if (out.type() != CV_8UC3) cv::cvtColor(out, out, cv::COLOR_GRAY2BGR);
                 // Go1 前置相机物理装反 → 原始/校正帧都是上下颠倒的。编码前旋转 180°
                 // （cv::flip flipCode=-1 = 同时翻 x/y 轴）翻正，免得下游订阅方全是倒像。
-                cv::flip(out, out, -1);
+                // cv::flip(out, out, -1);
                 // 每帧编成 JPEG，一个 UDP 数据报发出（464x400@q80 约 20-40KB < 65507）。
                 std::vector<uchar> jpg;
                 if (!cv::imencode(".jpg", out, jpg, jpg_params) || jpg.empty()) continue;
