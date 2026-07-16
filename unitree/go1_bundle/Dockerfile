@@ -62,7 +62,7 @@ COPY face_light.py     /work/face_light.py
 COPY system_health.py  /work/system_health.py
 COPY camera_depth.py   /work/camera_depth.py
 COPY test_camera_pointcloud.py /work/test_camera_pointcloud.py
-COPY test_speaker.py   /work/test_speaker.py
+COPY speaker.py        /work/speaker.py
 COPY config.yaml       /work/config.yaml
 COPY deploy/           /deploy/
 # Nano 侧后端源码放进 /deploy/，供 nano_bootstrap.sh 首启时分发/编译到 Head Nano：
@@ -88,6 +88,6 @@ EXPOSE 15717
 # 首启时后台自动 provision Nano（部署 beep_adapter/speaker_adapter + 编译部署 camera/pointcloud），失败不阻塞；
 # 随后前台起 MCP server。容器须 --network host 才够得到 Nano 内网（service.yml 已配）。
 # ⚠️ 先 source（用 ; 顺序执行，不放进后台），再把 bootstrap 丢后台，最后 exec 主进程——这样 main.py 才
-#    继承到 ROS 环境（rclpy + /ros_ws 下的 audio_msgs 等自定义消息，test_speaker 订阅要用）。
+#    继承到 ROS 环境（rclpy + /ros_ws 下的 audio_msgs 等自定义消息，speaker 卡订阅要用）。
 #    若把 source 和 & 连写（source && ... & python）会导致主进程未 source，audio_msgs/rclpy 都 import 不到。
 CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash; source /ros_ws/install/setup.bash; (bash /deploy/nano_bootstrap.sh || true) & exec python3 /work/main.py ${NETWORK_INTERFACE:-eth0}"]

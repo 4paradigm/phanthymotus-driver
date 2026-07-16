@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Go1 头部扬声器音频流播放适配器（跑在 Head Nano，不在驱动容器内）。
 
-服务 test_speaker / speaker 卡片的音频流播放：端点 /v1/speaker/actions，独立端口（默认 18083）。
+服务 speaker 卡片的音频流播放：端点 /v1/speaker/actions，独立端口（默认 18083）。
 与 beep 专属的 beep_adapter.py（:18082，正弦 beep）分离、互不影响——两者都「用时才起 aplay、
 放完释放」，不长占设备（真同时放时后到的拿 RESOURCE_BUSY）。
 

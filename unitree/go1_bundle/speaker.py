@@ -1,9 +1,8 @@
 """
-test_speaker.py — Go1 头部扬声器音频流播放卡（自包含，一卡一文件）。
+speaker.py — Go1 头部扬声器音频流播放卡（自包含，一卡一文件）。
 
-约定见 CONTRIBUTING.md：卡名 == 模块名 == 文件名 == config.yaml 里的 key == MCP 工具名 == "test_speaker"。
+约定见 CONTRIBUTING.md：卡名 == 模块名 == 文件名 == config.yaml 里的 key == MCP 工具名 == "speaker"。
 main.py 会按 config 自动 import 本模块并调用 make_plugin()，无需改 main.py。
-（文件名带 test_ 前缀：与将来正式的 speaker 卡区分，先作开发/验证用。）
 
 功能：订阅 agent core 发布的 remote_mic 音频流并在 Go1 头部扬声器播放。
 数据来源（实机核实）：浏览器麦克风 → WebSocket /ws/mic(agent core :15678) → agent core 逐块封成
@@ -12,7 +11,7 @@ audio_msgs/msg/AudioChunk（format="pcm_16k_16bit_mono"、data=裸 PCM 字节）
 在 15678 画布上与 remote_mic 连线；play 时开始把收到的 PCM 攒批转发到 Head Nano 的 speaker_adapter 播放。
 
 架构：
-  /remote_control/mic ──ROS2订阅──▶ test_speaker(驱动容器/Pi) ──HTTP攒批──▶ speaker_adapter(Nano:18083) ──aplay──▶ 扬声器
+  /remote_control/mic ──ROS2订阅──▶ speaker(驱动容器/Pi) ──HTTP攒批──▶ speaker_adapter(Nano:18083) ──aplay──▶ 扬声器
 
 生命周期/线程安全（重要）：订阅在 __init__ **只建一次、运行期永不 destroy**——因为本卡的 node 挂在
 主进程的 MultiThreadedExecutor 上，运行期 destroy_subscription 会与 executor 的 spin 撞车报
@@ -51,7 +50,7 @@ try:
 except Exception:
     _HAS_ROS2 = False
 
-CARD = "test_speaker"      # 卡名 = 模块名 = 文件名 = config key = MCP 工具名
+CARD = "speaker"      # 卡名 = 模块名 = 文件名 = config key = MCP 工具名
 
 
 def _now_ms() -> int:
@@ -94,7 +93,7 @@ class _SpeakerAdapterClient:
 
 
 class Plugin:
-    """test_speaker 卡：订阅 /remote_control/mic，play 时把 PCM 攒批转发给 Nano speaker_adapter 播放。"""
+    """speaker 卡：订阅 /remote_control/mic，play 时把 PCM 攒批转发给 Nano speaker_adapter 播放。"""
 
     def __init__(self, plugin_config, namespace, executor):
         self._config = plugin_config or {}
@@ -235,25 +234,23 @@ class Plugin:
     # ── 插件契约 ───────────────────────────────────────────────────────────
     def get_tool(self):
         # topic_in(audio/pcm-16k)：与 remote_mic 的 topic_out 同格式，供 15678 画布连线。无 topic_out。
-        # 用户按钮用非保留名 play/pause（平台把 start/stop/info/config 当系统动作、不渲染成按钮）；
-        # enum 仍含 start/stop 以兼容平台生命周期调用，但 x-action-params 只暴露 play/pause/音量。
+        # 播放不做成按钮：开启智能控制(project start)时平台会对本卡调 action=start(带连线解析出的 input_topic)
+        #   → dispatch 映射到开播；停止智能控制调 stop → 停播。用户卡片按钮只保留音量(set/get_volume)。
         return {"name": CARD, "type": "actuator", "multiInstance": False,
           "description": ("Go1 head speaker — plays the operator's remote microphone stream "
                           "(audio/pcm-16k from remote_mic) on the on-board speaker. Wire remote_mic → "
-                          "this card, then play. No output topics."),
+                          "this card and start the project; it plays until the project stops. No output topics."),
           "topic_in": [{"format": "audio/pcm-16k"}],
           "inputSchema": {"type": "object",
             "properties": {
               "action": {"type": "string",
-                         "enum": ["play", "pause", "set_volume", "get_volume", "start", "stop"],
+                         "enum": ["set_volume", "get_volume"],
                          "description": "Speaker action to perform"},
               "request_id": {"type": "string"},
               "volume_percent": {"type": "integer", "minimum": 0, "maximum": 100,
                                  "description": "Volume 0–100% (set_volume)"}},
             "required": ["action"],
             "x-action-params": {
-              "play":       {"params": [], "description": "Start playing the remote mic stream on the speaker"},
-              "pause":      {"params": [], "description": "Stop playing the mic stream"},
               "set_volume": {"params": ["volume_percent"], "description": "Set speaker volume 0–100%"},
               "get_volume": {"params": [], "description": "Read current speaker volume"}}}}
 
@@ -295,9 +292,9 @@ class Plugin:
             return self._call_adapter(action, args)
         if action == "get_volume":
             return self._call_adapter(action, args)
-        return _failure(action, rid, "INVALID_ARGUMENT", "unsupported test_speaker action")
+        return _failure(action, rid, "INVALID_ARGUMENT", "unsupported speaker action")
 
 
 def make_plugin(plugin_config, namespace, executor, client):
-    """main.py 装配入口。test_speaker 不用共享 SDK client（HighState），故忽略 client。"""
+    """main.py 装配入口。speaker 不用共享 SDK client（HighState），故忽略 client。"""
     return Plugin(plugin_config, namespace, executor)

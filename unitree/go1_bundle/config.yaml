@@ -66,7 +66,7 @@ plugins:
     adapter_port: 18082              # beep_adapter 独立端口（与 speaker 的 head_adapter:18080 分开）
     rpc_timeout_sec: 2
 
-  test_speaker:                 # 【未验收·test 前缀】头部扬声器：播放 remote_mic 音频流 → Nano speaker_adapter.py（:18083 /v1/speaker/actions）
+  speaker:                      # 头部扬声器：播放 remote_mic 音频流 → Nano speaker_adapter.py（:18083 /v1/speaker/actions）
     enabled: true
     adapter_host: "192.168.123.13"   # Head Nano IP
     adapter_port: 18083              # speaker_adapter 独立端口（与 beep:18082 分开）
