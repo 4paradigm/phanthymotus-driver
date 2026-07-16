@@ -47,6 +47,10 @@ class SpeakerAdapter:
         self.device, self.mixer_card = self._discover_device()
         self.volume = self._volume()
         self.idle_timeout = float(cfg.get('idle_timeout_sec', 5.0))
+        # 低延迟关键：给 aplay 设小 ALSA 缓冲/周期（默认 aplay 会用 ~500ms 大缓冲=固定高延迟）。
+        # buffer_us=100ms/period_us=20ms → 延迟大降；若在狗上听到卡顿/爆音(欠载)就把这两个调大点。
+        self.aplay_buffer_us = int(cfg.get('aplay_buffer_us', 100000))
+        self.aplay_period_us = int(cfg.get('aplay_period_us', 20000))
         self.proc = None                 # 常驻 aplay 进程（None=空闲）
         self.cur_sr = None
         self.cur_ch = None
@@ -135,9 +139,13 @@ class SpeakerAdapter:
             return False
         self._free_audio_device()   # 先腾扬声器 PCM（自愈：杀掉占用的 wsaudio 等）再放
         try:
-            p = subprocess.Popen(['aplay', '-q', '-D', self.device, '-f', 'S16_LE',
-                                  '-r', str(sr), '-c', str(ch)],
-                                 stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            cmd = ['aplay', '-q', '-D', self.device, '-f', 'S16_LE', '-r', str(sr), '-c', str(ch)]
+            # 小 ALSA 缓冲/周期 → 低延迟（0 表示不指定，用 aplay 默认大缓冲）。
+            if self.aplay_buffer_us > 0:
+                cmd += ['--buffer-time=%d' % self.aplay_buffer_us]
+            if self.aplay_period_us > 0:
+                cmd += ['--period-time=%d' % self.aplay_period_us]
+            p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
         except OSError:
             return False
         time.sleep(0.15)   # 让 aplay 尝试打开设备；已退出=打不开(被占/错误)

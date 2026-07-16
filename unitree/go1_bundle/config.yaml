@@ -72,8 +72,8 @@ plugins:
     adapter_port: 18083              # speaker_adapter 独立端口（与 beep:18082 分开）
     rpc_timeout_sec: 5               # 转发一批 PCM 到 aplay 可能被背压，超时给宽一点
     mic_topic: "/remote_control/mic" # 订阅的音频流 topic（agent core 从浏览器麦克风 /ws/mic 发布，AudioChunk pcm_16k）
-    forward_batch_ms: 80             # 攒多少毫秒的 PCM 批量转发一次（越小越低延迟、HTTP 次数越多）
-    max_buffer_bytes: 64000          # 转发跟不上时的缓冲上限(~2s@16k)，超出丢最旧的以保持准实时
+    forward_batch_ms: 40             # 攒多少毫秒的 PCM 批量转发一次（越小越低延迟、HTTP 次数越多）
+    max_buffer_bytes: 6400           # 转发跟不上时的缓冲上限(~200ms@16k)，超出丢最旧的 → 延迟钉在低位、保持新鲜
 
   camera_rgb:                   # 前置 RGB 相机（JPEG-over-UDP）→ Nano camera_adapter（控制口 9301）
     enabled: true
