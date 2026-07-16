@@ -70,6 +70,21 @@ if [ -f "$DEPLOY/beep_adapter.py" ]; then
   fi
 fi
 
+# ── 2b) speaker 端：speaker_adapter（:18083 /v1/speaker/actions，播放 remote_mic 音频流，纯 Python 免编译）──
+if [ -f "$DEPLOY/speaker_adapter.py" ]; then
+  $SCP "$DEPLOY/speaker_adapter.py" "$R:~/speaker_adapter.py" 2>/dev/null
+  # 首次没有配置就下发示例配置（audio_device=auto / mixer=Speaker / idle_timeout）。
+  if ! $SSH $R '[ -f ~/go1-speaker-adapter.json ]' 2>/dev/null && [ -f "$DEPLOY/go1-speaker-adapter.example.json" ]; then
+    $SCP "$DEPLOY/go1-speaker-adapter.example.json" "$R:~/go1-speaker-adapter.json" 2>/dev/null
+  fi
+  if [ -f "$DEPLOY/go1-speaker-adapter.service" ]; then
+    $SCP "$DEPLOY/go1-speaker-adapter.service" "$R:/tmp/go1-speaker-adapter.service" 2>/dev/null
+    $SSH $R "echo $PW | sudo -S cp /tmp/go1-speaker-adapter.service /etc/systemd/system/go1-speaker-adapter.service" 2>/dev/null
+    $SSH $R "echo $PW | sudo -S systemctl daemon-reload; echo $PW | sudo -S systemctl restart go1-speaker-adapter" 2>/dev/null
+    log "speaker_adapter 服务已装/启用（:18083 /v1/speaker/actions）。"
+  fi
+fi
+
 # ── 3) 持久禁用抢设备的 autostart（belt-and-suspenders；adapter 也能每次调用自愈腾设备）──
 # 音频：.startlist.sh 里注释 wsaudio（抢 USB 扬声器 → beep 打不开设备）。
 $SSH $R 'SL=$HOME/Unitree/autostart/.startlist.sh; [ -f "$SL" ] && grep -qE "^wsaudio" "$SL" && { cp "$SL" "$SL.bak-bootstrap"; sed -i "s/^wsaudio/#wsaudio/" "$SL"; echo wsaudio_disabled; }' 2>/dev/null
@@ -141,5 +156,5 @@ else
 fi
 
 log "=== provision 完成 ==="
-$SSH $R "echo -n '  cam_svc='; echo $PW|sudo -S systemctl is-active go1-camera-adapter 2>/dev/null; echo -n '  beep_svc='; echo $PW|sudo -S systemctl is-active go1-beep-adapter 2>/dev/null" 2>/dev/null | grep -vE 'password|sudo'
+$SSH $R "echo -n '  cam_svc='; echo $PW|sudo -S systemctl is-active go1-camera-adapter 2>/dev/null; echo -n '  beep_svc='; echo $PW|sudo -S systemctl is-active go1-beep-adapter 2>/dev/null; echo -n '  speaker_svc='; echo $PW|sudo -S systemctl is-active go1-speaker-adapter 2>/dev/null" 2>/dev/null | grep -vE 'password|sudo'
 exit 0
