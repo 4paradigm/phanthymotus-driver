@@ -10,11 +10,13 @@ ARG APT_MIRROR_HOST
 WORKDIR /work
 
 # ① 把不可达的腾讯内网 apt 源替换成可达源；② 只装 SDK 构建真正需要的包
-#    (unitree_legged_sdk python_wrapper 只需 cmake/g++/python3-dev + msgpack)
+#    (unitree_legged_sdk python_wrapper 只需 cmake/g++/python3-dev + msgpack)；
+#    ③ sshpass + openssh-client 供 deploy/nano_bootstrap.sh 首启时自动 SSH 到 Nano 部署 beep/camera 后端
+#       （sshpass 只是包装器，真正连接要 openssh-client 提供的 ssh/scp；ROS base 默认不带，须显式装）。
 RUN find /etc/apt \( -name '*.list' -o -name '*.sources' \) -exec sed -i "s|mirrors.tencentyun.com|${APT_MIRROR_HOST}|g" {} + ; \
     apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
-        python3-pip python3-dev cmake build-essential git libmsgpack-dev && \
+        python3-pip python3-dev cmake build-essential git libmsgpack-dev sshpass openssh-client && \
     rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /work/requirements.txt
@@ -38,6 +40,7 @@ COPY go1_sdk_client.py /work/go1_sdk_client.py
 COPY loco_state.py     /work/loco_state.py
 COPY battery.py        /work/battery.py
 COPY spin.py           /work/spin.py
+COPY switch_gait.py    /work/switch_gait.py
 COPY imu.py            /work/imu.py
 COPY feet.py           /work/feet.py
 COPY fall_alarm.py     /work/fall_alarm.py
@@ -45,11 +48,24 @@ COPY net.py            /work/net.py
 COPY odometry.py       /work/odometry.py
 COPY obstacle_range.py /work/obstacle_range.py
 COPY udp_diagnostics.py /work/udp_diagnostics.py
+COPY joints.py            /work/joints.py
+COPY remote_controller.py /work/remote_controller.py
+COPY model.py             /work/model.py
+COPY resource/            /work/resource/
 COPY loco.py           /work/loco.py
 COPY gesture.py        /work/gesture.py
 COPY test_power_control.py /work/test_power_control.py
+COPY beep.py           /work/beep.py
+COPY camera_rgb.py     /work/camera_rgb.py
+COPY face_light.py     /work/face_light.py
+COPY system_health.py  /work/system_health.py
+COPY camera_depth.py   /work/camera_depth.py
 COPY config.yaml       /work/config.yaml
 COPY deploy/           /deploy/
+# Nano 侧后端源码放进 /deploy/，供 nano_bootstrap.sh 首启时分发/编译到 Head Nano：
+#   beep_adapter.py（beep，纯 Python 免编译）/ camera_adapter/（camera_rgb，Nano 上现编 C++）。
+COPY beep_adapter.py   /deploy/beep_adapter.py
+COPY camera_adapter/   /deploy/camera_adapter/
 # ★ 新增卡：加一行 `COPY <卡名>.py /work/<卡名>.py`（main.py 会按 config 里的卡名自动 import）。
 
 ENV ROS_DOMAIN_ID=42
@@ -60,4 +76,6 @@ ENV PYTHONUNBUFFERED=1
 
 EXPOSE 15717
 
-CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && python3 /work/main.py ${NETWORK_INTERFACE:-eth0}"]
+# 首启时后台自动 provision Nano（部署 beep_adapter + 编译部署 camera_adapter），失败不阻塞驱动主进程；
+# 随后前台起 MCP server。容器须 --network host 才够得到 Nano 内网（service.yml 已配）。
+CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && (bash /deploy/nano_bootstrap.sh || true) & python3 /work/main.py ${NETWORK_INTERFACE:-eth0}"]

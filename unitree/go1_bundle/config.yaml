@@ -10,6 +10,20 @@ plugins:
     enabled: true
   battery:                      # BMS：SOC%/电流/循环/温度/单体电压
     enabled: true
+
+  # ── xin 新增(扩展卡)──
+  face_light:                   # 面部灯带颜色(actuator,MQTT):set_color/preset/off
+    enabled: true
+    mqtt_host: "localhost"
+    mqtt_port: 1883
+  system_health:                # 诊断执行卡(actuator):主控板+子系统体检,自动判断哪里有问题
+    enabled: true
+    mqtt_host: "localhost"
+    mqtt_port: 1883
+  camera_depth:                 # 头部双目深度推流(sensor):连 NX depth_stream → ROS2 CompressedImage
+    enabled: true
+    nx_host: "192.168.123.15"
+    nx_port: 9101
   imu:                          # IMU：四元数/角速度/加速度/欧拉角/温度
     enabled: true
   feet:                         # 足端：足底力[4] + 高层时足端相对机身位置/速度
@@ -26,8 +40,35 @@ plugins:
     enabled: true
   udp_diagnostics:              # UDP 通信健康：收发计数与 CRC/丢包/标志错误计数
     enabled: true
+  # ── li 移植（joints/remote_controller，已在实机 go1 验证）──
+  joints:                       # 12 腿关节 q/dq/tau/temp（骨架渲染，需 model 卡提供 URDF）
+    enabled: true
+  remote_controller:            # 无线遥控器 16 按键 + 5 摇杆轴（HighState.wirelessRemote[40]）
+    enabled: true
+  model:                        # (resource) 返回 go1 四足 URDF，供 joints 骨架渲染成狗
+    enabled: true
 
   # ── 控制卡（下发 HighCmd；须真机验证量程+安全后上架）──
+  beep:                         # 头部扬声器 beep 动作卡 → Nano beep_adapter.py（:18082 /v1/beep/actions）
+    enabled: true
+    adapter_host: "192.168.123.13"   # Head Nano IP
+    adapter_port: 18082              # beep_adapter 独立端口（与 speaker 的 head_adapter:18080 分开）
+    rpc_timeout_sec: 2
+
+  camera_rgb:                   # 前置 RGB 相机（JPEG-over-UDP）→ Nano camera_adapter（控制口 9301）
+    enabled: true
+    receive_ip: "192.168.123.161"   # 接收端(本驱动所在 Pi)IP；Adapter 把图像帧定向发到这里，勿硬编码进代码
+    probe_timeout_sec: 5.0          # 启动探测 front 控制口的超时；须 >相机开启耗时(SDK 初始化实测~3.4s)，
+                                    # 太短会误判 front 不可达；无 adapter 的口是"连接被拒"即时返回，不吃满超时。
+    default_mode: "raw_mono"        # raw_mono/raw_stereo/rectified_mono/rectified_stereo
+                                    # ★ 帧率关键：raw_mono 跳过 Nano CPU 立体校正 → 帧率高且稳；
+                                    #   rectified_* 会对左右目都做校正(只用一路)，在 Nano ARM 上把帧率压得很低。
+    default_frame_size: "928x400"   # 官方支持：1856x800@30 或 928x400@30/60
+    default_fps: 60                 # 928x400 支持 60；start 时下发给 Nano adapter 重开相机（想更省带宽可改 30）
+    # 位置→板卡映射。本卡只启用 front；control_port 约定 = image_port+100，须与 camera_adapter 启动参数一致。
+    positions:
+      front: {board_ip: "192.168.123.13", device_id: 1, image_port: 9201, control_port: 9301}
+
   spin:                         # 原地转圈（闭环读 IMU yaw 转够自停）
     enabled: true
   loco:                         # 基础运动:三维速度 move + 站起/趴下/平衡/姿态/身高
@@ -37,5 +78,7 @@ plugins:
   test_power_control:           # 【未验收·test 前缀】电源:关机 power_off(不可逆,需 confirm+reason+静止前置);真机验收后改回 power_control
     enabled: true
 
+  switch_gait:                  # 步态切换：只设期望步态，实际运动由移动卡触发（trot_run/climb_stair/trot_obstacle 须 confirm）
+    enabled: true
   # ★ 新增卡：新建 <卡名>.py 后，在这里加一行 `<卡名>: { enabled: true }` 打开它。
   #   main.py 会按 config 里的 key 自动 import 同名模块（key == 模块名 == 文件名 == 卡名）。
