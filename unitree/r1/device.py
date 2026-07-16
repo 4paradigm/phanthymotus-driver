@@ -122,7 +122,7 @@ class _MicNode(Node):
         buf = bytearray()
         while self._sock is not None:
             try:
-                data = self._sock.recv(4096)
+                data = self._sock.recv(65536)
                 buf.extend(data)
             except socket.timeout:
                 continue
