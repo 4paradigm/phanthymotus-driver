@@ -63,9 +63,11 @@ _FRAME_SIZE_FPS = {
     "928x400":  {30, 60},
 }
 
-_VALID_MODES = ["raw_mono", "raw_stereo", "rectified_mono", "rectified_stereo"]
+_VALID_MODES = ["raw_mono", "raw_stereo", "rectified_mono", "rectified_stereo", "undistort_mono"]
 
 # stereo（双目）模式产出左右两路；mono 模式产出单路。
+# undistort_mono：raw 采集(高帧率) + 板载单目预计算 CMei remap 去畸变——去畸变且不掉帧
+# （rectified_* 走 getRectStereoFrame 双目校正、在 Nano ARM 上很慢）。缺标定时 adapter 优雅降级为鱼眼直通。
 _STEREO_MODES = {"raw_stereo", "rectified_stereo"}
 
 # 收流看门狗：连续该时长收不到 JPEG 帧则判 STREAM_TIMEOUT（§3.1 / §8.6.5 新鲜度）。
@@ -159,7 +161,14 @@ def _run_rgb_receiver(topic: str, image_port: int, position: str, eye: str) -> N
     板载 Adapter 用 JPEG-over-UDP 发帧：每帧 = 一个完整 JPEG 的 UDP 数据报（驱动容器无
     gstreamer/ffmpeg，故不走 H.264/RTP 解码）。这里纯 socket 收数据报，校验 JPEG SOI 后
     直接发布 CompressedImage(format=jpeg)，附递增帧序号。
+
+    ROS2 生命周期隔离（修「publisher's context is invalid」冻结）：本子进程与驱动主进程同进程组，
+    若用全局默认 context + 默认信号处理器，进程组信号(Ctrl-C/docker stop/主进程 _shutdown)会连带
+    shutdown 掉本进程 context → 下一次 publish 抛异常、画面定格。故：私有 Context + 关 rclpy 信号处理器
+    + os.setpgrp 脱离进程组 + publish 包 try/except；父进程用 proc.terminate() 直发本 PID 停我们。
     """
+    import os
+    import signal as _signal
     import socket as _socket
     import rclpy
     from rclpy.node import Node as _Node
@@ -168,9 +177,23 @@ def _run_rgb_receiver(topic: str, image_port: int, position: str, eye: str) -> N
 
     _QOS = _QoSProfile(reliability=_R.BEST_EFFORT, history=_H.KEEP_LAST, depth=1, durability=_D.VOLATILE)
 
-    rclpy.init()
-    node = _Node(f"go1_cam_{position}_{eye}".replace("-", "_"))
+    try:
+        os.setpgrp()
+    except OSError:
+        pass
+
+    ctx = rclpy.Context()
+    try:
+        from rclpy.signals import SignalHandlerOptions as _SHO
+        rclpy.init(context=ctx, signal_handler_options=_SHO.NO)
+    except (ImportError, TypeError):
+        rclpy.init(context=ctx)
+
+    node = _Node(f"go1_cam_{position}_{eye}".replace("-", "_"), context=ctx)
     pub = node.create_publisher(_CompressedImage, topic, _QOS)
+
+    _running = {"on": True}
+    _signal.signal(_signal.SIGTERM, lambda *a: _running.update(on=False))
 
     sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
     sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
@@ -183,7 +206,8 @@ def _run_rgb_receiver(topic: str, image_port: int, position: str, eye: str) -> N
     except OSError as e:
         node.get_logger().error(f"rgb receiver bind :{image_port} failed: {e}")
         node.destroy_node()
-        rclpy.shutdown()
+        if ctx.ok():
+            rclpy.shutdown(context=ctx)
         return
     sock.settimeout(1.0)
 
@@ -191,7 +215,9 @@ def _run_rgb_receiver(topic: str, image_port: int, position: str, eye: str) -> N
 
     seq = 0
     try:
-        while rclpy.ok():
+        while _running["on"] and ctx.ok():
+            if os.getppid() == 1:   # 父进程没了（被 reparent 到 init）→ 退出，别留孤儿
+                break
             try:
                 data, _ = sock.recvfrom(65536)
             except _socket.timeout:
@@ -207,7 +233,10 @@ def _run_rgb_receiver(topic: str, image_port: int, position: str, eye: str) -> N
             msg.header.frame_id = f"{position}:{eye}:{seq}"
             msg.format = "jpeg"
             msg.data = data
-            pub.publish(msg)
+            try:
+                pub.publish(msg)
+            except Exception:
+                break   # context 正在关闭的竞态 → 安全退出
             seq += 1
     except KeyboardInterrupt:
         pass
@@ -216,8 +245,12 @@ def _run_rgb_receiver(topic: str, image_port: int, position: str, eye: str) -> N
             sock.close()
         except Exception:
             pass
-        node.destroy_node()
-        rclpy.shutdown()
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
+        if ctx.ok():
+            rclpy.shutdown(context=ctx)
 
 
 # ── camera_info 发布节点（in-process，~1Hz）───────────────────────────────────
@@ -460,7 +493,12 @@ class _CameraRgbInstance:
 # ── CameraRgbPlugin (multiInstance sensor) ────────────────────────────────────
 
 class CameraRgbPlugin:
-    """Go1 `camera_rgb` 视觉扩展卡（能力卡片 §8.3）——multiInstance，实例以 position 区分。"""
+    """Go1 `camera_rgb` 视觉扩展卡（能力卡片 §8.3）——multiInstance，实例经 camera_source 选机位。
+
+    对齐 dji/mavic3e：multiInstance:True + configSchema.camera_source（下拉 front/chin/left/right/belly，
+    scope=instance）。前端可加多个实例、每个选一个机位 → 多个窗格同时看多路（各相机独立硬件、各发各 topic）。
+    每个机位 = 一个 _CameraRgbInstance（一条板载 adapter 会话 + 收流子进程 + topic /{ns}/vision/{position}/mono）。
+    """
     PREFIX = "camera_rgb"
 
     def __init__(self, plugin_config: dict, namespace: str, executor):
@@ -468,102 +506,127 @@ class CameraRgbPlugin:
         self._executor = executor
         self._cfg = plugin_config or {}
         self._receive_ip = self._cfg.get("receive_ip", os.environ.get("GO1_CAMERA_RECV_IP", "192.168.123.161"))
-        self._probe_timeout = float(self._cfg.get("probe_timeout_sec", 0.5))
         self._defaults = {
-            # 默认 raw_mono：跳过 Nano CPU 立体校正（rectified_* 会 getRectStereoFrame 对左右目都校正、
-            # 只用一路，在 Nano ARM 上把帧率压得很低）。raw_mono 直接取原始帧 → 帧率高且稳。
-            "mode": self._cfg.get("default_mode", "raw_mono"),
+            # 默认 undistort_mono：raw 快采 + 单目预计算 CMei remap 去畸变（缺标定的机位自动降级为鱼眼直通）。
+            "mode": self._cfg.get("default_mode", "undistort_mono"),
             "frame_size": self._cfg.get("default_frame_size", "928x400"),
-            # 60fps：928x400 官方支持 30/60。fps 由 start 时下发给 Nano adapter（它据此 setRawFrameRate 重开相机）。
-            "fps": int(self._cfg.get("default_fps", 60)),
+            # 多路默认 30fps（省 CPU/带宽；单路想高帧率把 default_fps 调 60 或按机位 config）。928x400 支持 30/60。
+            "fps": int(self._cfg.get("default_fps", 30)),
         }
         positions_cfg = self._cfg.get("positions", _DEFAULT_POSITIONS)
+        self._positions_cfg = positions_cfg
+        self._default_position = self._cfg.get("default_position", "front")
 
-        # 本卡只支持 front 单相机（用户选定）：只探测/建 front 实例，忽略其它 position。
-        self._instances: dict[str, _CameraRgbInstance] = {}
-        front_cfg = positions_cfg.get("front")
-        if front_cfg is None:
-            print("[camera_rgb] config 未配置 front → 无可用相机", flush=True)
-        else:
-            probe = self._probe_position("front", front_cfg)
-            if probe is None:
-                print("[camera_rgb] front: 探测不到 Adapter/相机 → 不创建实例", flush=True)
-            else:
-                self._instances["front"] = _CameraRgbInstance(
-                    "front", front_cfg, namespace, executor,
-                    self._receive_ip, self._defaults, probe)
-                print(f"[camera_rgb] front: 相机在线(serial={probe.get('serial','?')}) → 实例已建", flush=True)
+        # 为每个 config 里配置的机位建一个实例（**不在 __init__ 探测**：探测会阻塞启动，
+        # 且 5 路都不可达时最长等 5×timeout。改为按需在 start() 连 adapter，不可达即报 DEVICE_NOT_FOUND）。
+        self._cameras: dict[str, _CameraRgbInstance] = {}
+        for pos, pcfg in positions_cfg.items():
+            try:
+                self._cameras[pos] = _CameraRgbInstance(
+                    pos, pcfg, namespace, executor, self._receive_ip, self._defaults, {})
+            except (KeyError, ValueError, TypeError) as e:
+                print(f"[camera_rgb] {pos}: 配置无效，跳过 {e}", flush=True)
+        # UI 实例 → 选定机位（camera_source）。前端 config/start 时记录。
+        self._instance_source: dict[str, str] = {}
+        print(f"[camera_rgb] 机位就绪：{sorted(self._cameras.keys())}（default={self._default_position}）", flush=True)
 
-        print(f"[camera_rgb] 探测完成：front {'可用' if self._instances else '不可用'}", flush=True)
+    def _topic_for(self, position: str) -> str:
+        return f"/{self._ns}/vision/{position}/mono"
 
-    def _probe_position(self, position: str, pos_cfg: dict) -> dict | None:
-        """连 Adapter 控制口 probe 一次；在线且未报错才返回相机信息，否则 None（该位置不建实例）。"""
-        try:
-            client = _AdapterClient(pos_cfg["board_ip"], int(pos_cfg["control_port"]), self._probe_timeout)
-        except (KeyError, ValueError, TypeError) as e:
-            print(f"[camera_rgb] {position}: 配置无效 {e}", flush=True)
-            return None
-        resp = client.request({"cmd": "probe", "device_id": int(pos_cfg.get("device_id", 0))},
-                              timeout_sec=self._probe_timeout)
-        if not resp.get("ok"):
-            return None
-        if not resp.get("online", True):
-            return None
-        return resp
+    def _source_options(self) -> list:
+        # 下拉选项：config 里配了的机位（保持 front/chin/left/right/belly 的固定顺序）。
+        order = [p for p in _VALID_POSITIONS if p in self._cameras]
+        return [{"const": p, "title": p} for p in order] or [{"const": self._default_position,
+                                                               "title": self._default_position}]
 
     def get_tools(self) -> list:
-        available = "front" in self._instances
         return [{
             "name": "camera_rgb",
             "type": "sensor",
-            "multiInstance": False,
+            "multiInstance": True,
             "description": (
-                "Go1 front RGB camera via on-board UnitreecameraSDK adapter. "
-                + ("Front camera online. " if available else "Front camera NOT reachable. ")
-                + "start opens the camera and streams JPEG (raw_mono 928x400@60) to /{ns}/vision/front/mono."
+                "Go1 RGB cameras via on-board UnitreecameraSDK adapters. Pick a camera position "
+                "(front/chin/left/right/belly) per instance; add multiple instances to view several at once. "
+                "start opens that camera and streams JPEG (undistort_mono, de-warped) to /{ns}/vision/{position}/mono."
             ),
+            "configSchema": {
+                "type": "object",
+                "properties": {
+                    "camera_source": {
+                        "type": "string",
+                        "description": "Camera position",
+                        "scope": "instance",
+                        "oneOf": self._source_options(),
+                    },
+                },
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
                         "enum": ["info", "start", "stop"],
-                        "description": "Lifecycle action (front camera)",
+                        "description": "Lifecycle action for the selected camera position",
                     },
-                    # 单相机(front)、无 instance_id；画质固定服务端默认 raw_mono 928x400@60（config 可调）。
+                    "camera_source": {
+                        "type": "string",
+                        "enum": [o["const"] for o in self._source_options()],
+                        "description": "Camera position (front/chin/left/right/belly)",
+                    },
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "info":     {"params": [], "description": "Status, resolution, fps, calibration, topic"},
-                    "start":    {"params": [], "description": "Open the front camera and stream JPEG to /vision/front/mono"},
-                    "stop":     {"params": [], "description": "Stop the front camera stream"},
+                    "info":  {"params": [], "description": "Status/resolution/fps/calibration/topic for the selected camera"},
+                    "start": {"params": [], "description": "Open the selected camera and stream JPEG to /vision/{position}/mono"},
+                    "stop":  {"params": [], "description": "Stop the selected camera stream"},
                 },
             },
-            # 本卡只输出这一路 JPEG topic（用户选定：无 camera_info 等其它 topic）。
             "topic_out": [
-                {"topic": f"/{self._ns}/vision/front/mono", "format": "image/jpeg"},
+                {"format": "image/jpeg", "desc": "per-position camera JPEG stream"},
             ],
         }]
 
     def start(self) -> None:
-        pass   # 视觉卡不自动开流（用户选定：启动探测 + 按需 start）
+        pass   # 视觉卡不自动开流：按需 start（前端选机位后触发）
 
     def stop(self) -> None:
-        for inst in self._instances.values():
+        for inst in self._cameras.values():
             try:
                 inst.stop()
             except Exception as e:
                 print(f"[camera_rgb] stop {inst._position} error: {e}", flush=True)
 
+    def _resolve_source(self, args: dict) -> str:
+        instance_id = args.get("instance_id", "default")
+        return (args.get("camera_source")
+                or self._instance_source.get(instance_id)
+                or self._default_position)
+
     def dispatch(self, action: str, args: dict) -> dict | None:
-        # 单相机(front)、无 instance_id：所有动作都作用于 front 实例。
-        inst = self._instances.get("front")
+        instance_id = args.get("instance_id", "default")
+        source = self._resolve_source(args)
+
+        if action == "config":
+            if source:
+                self._instance_source[instance_id] = source
+            return {"ok": True, "card": "camera_rgb", "action": "config", "camera_source": source,
+                    "topic_out": [{"topic": self._topic_for(source), "format": "image/jpeg"}]}
+
+        inst = self._cameras.get(source)
         if inst is None:
-            return _err("DEVICE_NOT_FOUND", "front camera not available (adapter/camera offline)")
+            return _err("DEVICE_NOT_FOUND", f"camera position {source!r} not configured")
+        self._instance_source[instance_id] = source
+
         if action == "info":
             return inst.info()
         if action == "start":
-            cfg = {k: v for k, v in args.items() if k not in ("action", "instance_id", "_tool_name")}
+            # 同机位已在推流 → 幂等返回运行态（允许多个 UI 实例订阅同一相机 topic）。
+            if getattr(inst, "_state", "idle") == "running":
+                return {"ok": True, "card": "camera_rgb", "action": "start",
+                        "camera_source": source, "timestamp_ms": _now_ms(),
+                        **inst._status_running()}
+            cfg = {k: v for k, v in args.items()
+                   if k not in ("action", "instance_id", "camera_source", "_tool_name")}
             return inst.start(cfg)
         if action == "stop":
             return inst.stop()

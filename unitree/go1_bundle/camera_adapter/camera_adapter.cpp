@@ -37,6 +37,7 @@
 #include <atomic>
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -48,6 +49,10 @@
 #include <vector>
 
 #include <opencv2/opencv.hpp>
+
+// Go1 相机为 CMei 全向模型（标定带 Xi），而板卡 opencv4(4.1.1) 无 ccalib/omnidir 头，
+// cv::fisheye 又是不同模型——故去畸变映射表在 build_undistort_maps() 里按 CMei 投影方程手算，
+// 不依赖 opencv_contrib。仅需 <cmath> 的 sqrt。
 
 // [SDK-API] 板载 UnitreecameraSDK 的伞形头。真机路径通常为
 //   /home/unitree/UnitreecameraSDK/include/UnitreeCameraSDK.hpp
@@ -171,6 +176,21 @@ public:
 
         cfg_ = c;
         streams_.clear();
+
+        // undistort_mono：raw 采集(快) + 单目预计算 remap 去畸变。标定缺失则优雅降级为原始鱼眼直通。
+        undistort_on_ = false;
+        und_state_ = "off";
+        if (c.mode == "undistort_mono") {
+            long fsp = mini::get_int(req, "focal_scale_pct", 25);      // 5~200(%)，默认 25=0.25
+            und_focal_scale_ = (fsp >= 5 && fsp <= 200) ? fsp / 100.0 : 0.25;
+            if (build_undistort_maps()) {
+                undistort_on_ = true;
+            } else {
+                und_state_ = "disabled_no_calib";
+                fprintf(stderr, "[adapter] undistort_mono: 无有效标定/建图失败 → 退回原始鱼眼直通\n");
+            }
+        }
+
         depth_on_ = (c.mode == "depth");
         // 一个 UDP socket 复用（JPEG 各路 + depth 分片共用）。
         udp_fd_ = socket(AF_INET, SOCK_DGRAM, 0);
@@ -219,7 +239,7 @@ public:
             o << ",\"depth_port\":" << depth_port_ << ",\"depth_fps\":" << (int)depth_fps_
               << ",\"encoding\":\"16UC1\"}" << ",\"calibration\":" << calibration_json_ << ",\"streams\":[]}";
         } else {
-            o << ",\"image_port\":" << c.image_port << "}"
+            o << ",\"image_port\":" << c.image_port << ",\"undistort\":\"" << und_state_ << "\"}"
               << ",\"calibration\":" << calibration_json_ << ",\"streams\":[";
             for (size_t i = 0; i < streams_.size(); ++i) {
                 o << "{\"eye\":\"" << streams_[i].eye << "\",\"port\":" << streams_[i].port << "}";
@@ -347,16 +367,118 @@ private:
         }
     }
 
-    // 读标定为 JSON 字符串（内参/畸变/Xi/旋转/平移/校正内参）。取不到则回空对象 {}。
+    // 读标定为 JSON 字符串，并把内参/畸变/xi 存入成员供 undistort_mono 建映射表用。
+    // 取不到则回退占位；calib_ok_=false 时 undistort 会优雅降级为原始鱼眼直通。
     std::string read_calibration() {
-        // [SDK-API] 官方 SDK 通常从相机内 flash / 标定 yaml 读参数。这里给出占位结构，
-        // 真机接通后按实际可取字段填充（能力卡片 §8.2 info 要求的完整标定项）。
-        if (!calib_file_.empty()) {
+        calib_ok_ = false;
+        calib_has_xi_ = false;
+        calib_K_.release();
+        calib_D_.release();
+        if (calib_file_.empty()) return "{\"status\":\"unverified\"}";
+        try {
+            cv::FileStorage fs(calib_file_, cv::FileStorage::READ);
+            if (!fs.isOpened()) {
+                std::ostringstream o;
+                o << "{\"status\":\"file_open_failed\",\"source\":\"" << mini::esc(calib_file_) << "\"}";
+                return o.str();
+            }
+            // 键名以 Go1 实机 output_camCalibParams.yaml 为准（front=左目那一路，用 Left*）：
+            //   内参 LeftIntrinsicMatrix / 畸变 LeftDistortionCoefficients(4) / 全向 LeftXi。
+            //   兼容其它常见命名作兜底。
+            cv::Mat K, D;
+            for (const char* k : {"LeftIntrinsicMatrix", "Kl", "K", "camera_matrix"}) { fs[k] >> K; if (!K.empty()) break; }
+            for (const char* d : {"LeftDistortionCoefficients", "Dl", "D", "distortion_coefficients"}) { fs[d] >> D; if (!D.empty()) break; }
+            cv::FileNode xin = fs["LeftXi"];
+            if (xin.empty()) xin = fs["xi"];
+            if (!xin.empty()) {
+                if (xin.isReal()) { calib_xi_ = (double)xin; calib_has_xi_ = true; }
+                else { cv::Mat m; xin >> m; if (!m.empty()) { calib_xi_ = m.at<double>(0, 0); calib_has_xi_ = true; } }
+            }
+            if (K.empty() || D.empty()) {
+                std::ostringstream o;
+                o << "{\"status\":\"incomplete\",\"source\":\"" << mini::esc(calib_file_) << "\"}";
+                return o.str();
+            }
+            if (K.type() != CV_64F) K.convertTo(K, CV_64F);
+            if (D.type() != CV_64F) D.convertTo(D, CV_64F);
+            calib_K_ = K.clone();
+            calib_D_ = D.reshape(1, 1).clone();   // 拍平成一行，便于取前 N 个系数
+            calib_ok_ = true;
+
             std::ostringstream o;
-            o << "{\"source\":\"" << mini::esc(calib_file_) << "\",\"status\":\"file\"}";
+            const char* model = calib_has_xi_ ? "cmei" : "radial";
+            o << "{\"status\":\"loaded\",\"model\":\"" << model << "\""
+              << ",\"source\":\"" << mini::esc(calib_file_) << "\""
+              << ",\"fx\":" << K.at<double>(0, 0) << ",\"fy\":" << K.at<double>(1, 1)
+              << ",\"cx\":" << K.at<double>(0, 2) << ",\"cy\":" << K.at<double>(1, 2)
+              << ",\"dist\":[";
+            for (int i = 0; i < calib_D_.cols; ++i) {
+                o << calib_D_.at<double>(0, i);
+                if (i + 1 < calib_D_.cols) o << ",";
+            }
+            o << "]";
+            if (calib_has_xi_) o << ",\"xi\":" << calib_xi_;
+            o << "}";
+            return o.str();
+        } catch (const cv::Exception& e) {
+            std::ostringstream o;
+            o << "{\"status\":\"parse_error\",\"source\":\"" << mini::esc(calib_file_)
+              << "\",\"message\":\"" << mini::esc(e.what()) << "\"}";
             return o.str();
         }
-        return "{\"status\":\"unverified\"}";
+    }
+
+    // 预计算单目去畸变映射表（start 时一次）：输出针孔透视图，稳态每帧只需一次 cv::remap，
+    // 避开 getRectStereoFrame 的双目全流程开销 → 去畸变 + 高帧率兼得。映射表用 CV_16SC2 定点最快。
+    //
+    // Go1 相机是 CMei 全向模型（标定带 Xi），而板卡 opencv4(4.1.1) 无 ccalib/omnidir 头，
+    // cv::fisheye 又是不同模型（等距，无 xi）套上会算错——故这里按 CMei 投影方程**手算**映射表，
+    // 零 contrib 依赖。对每个输出像素反投影成射线→投到单位球→加 xi→径向+切向畸变→内参得源鱼眼像素。
+    // 输入/输出均为单目 enc 尺寸(enc_w_×enc_h_)。und_focal_scale_ 控制输出 FOV（越小越广角）。
+    bool build_undistort_maps() {
+        if (!calib_ok_ || calib_K_.empty() || calib_D_.cols < 4) return false;
+        const double fx = calib_K_.at<double>(0, 0), fy = calib_K_.at<double>(1, 1);
+        const double cx = calib_K_.at<double>(0, 2), cy = calib_K_.at<double>(1, 2);
+        const double skew = calib_K_.at<double>(0, 1);
+        const double k1 = calib_D_.at<double>(0, 0), k2 = calib_D_.at<double>(0, 1);
+        const double p1 = calib_D_.at<double>(0, 2), p2 = calib_D_.at<double>(0, 3);
+        const double xi = calib_has_xi_ ? calib_xi_ : 0.0;
+        const int W = enc_w_, H = enc_h_;
+        // 输出针孔内参：焦距 = 尺寸 × focal_scale，主点居中。
+        const double fxn = W * und_focal_scale_, fyn = H * und_focal_scale_;
+        const double cxn = W * 0.5, cyn = H * 0.5;
+        try {
+            cv::Mat mapx(H, W, CV_32FC1), mapy(H, W, CV_32FC1);
+            for (int v = 0; v < H; ++v) {
+                float* mx = mapx.ptr<float>(v);
+                float* my = mapy.ptr<float>(v);
+                for (int u = 0; u < W; ++u) {
+                    // 1) 反投影输出像素 → 相机坐标射线（R=单位阵，去畸变到相机自身坐标系）
+                    double X = (u - cxn) / fxn, Y = (v - cyn) / fyn, Z = 1.0;
+                    // 2) 投到单位球
+                    double n = std::sqrt(X * X + Y * Y + Z * Z);
+                    double zs = Z / n;
+                    // 3) CMei：加 xi 投到归一化平面
+                    double denom = zs + xi;
+                    if (denom <= 1e-9) { mx[u] = -1.f; my[u] = -1.f; continue; }  // 球背面 → 黑边
+                    double xp = (X / n) / denom, yp = (Y / n) / denom;
+                    // 4) 径向 + 切向畸变
+                    double r2 = xp * xp + yp * yp;
+                    double rad = 1.0 + k1 * r2 + k2 * r2 * r2;
+                    double xpp = xp * rad + 2 * p1 * xp * yp + p2 * (r2 + 2 * xp * xp);
+                    double ypp = yp * rad + p1 * (r2 + 2 * yp * yp) + 2 * p2 * xp * yp;
+                    // 5) 内参（含 skew）→ 源鱼眼像素
+                    mx[u] = (float)(fx * xpp + skew * ypp + cx);
+                    my[u] = (float)(fy * ypp + cy);
+                }
+            }
+            cv::convertMaps(mapx, mapy, und_map1_, und_map2_, CV_16SC2);
+            und_state_ = calib_has_xi_ ? "cmei" : "radial";
+            return !und_map1_.empty();
+        } catch (const cv::Exception& e) {
+            fprintf(stderr, "[adapter] build_undistort_maps failed: %s\n", e.what());
+            return false;
+        }
     }
 
     // 拉起 gst-launch 编码器：读 stdin 的原始 BGR 帧 → x264enc → RTP/H.264 → udpsink.
@@ -427,10 +549,18 @@ private:
                 cv::Mat& src = (s.eye == "right") ? right : left;   // mono→left 目
                 if (src.empty()) continue;
                 cv::Mat out;
-                if (src.cols != enc_w_ || src.rows != enc_h_)
+                if (undistort_on_) {
+                    // 单目鱼眼去畸变：预计算映射表 → 一次 remap 出针孔透视图（输出即 enc 尺寸）。
+                    // 输入尺寸异常时先缩到 enc 再 remap（映射表按 enc 尺寸建）。
+                    cv::Mat in = src;
+                    if (in.cols != enc_w_ || in.rows != enc_h_)
+                        cv::resize(in, in, cv::Size(enc_w_, enc_h_));
+                    cv::remap(in, out, und_map1_, und_map2_, cv::INTER_LINEAR);
+                } else if (src.cols != enc_w_ || src.rows != enc_h_) {
                     cv::resize(src, out, cv::Size(enc_w_, enc_h_));
-                else
+                } else {
                     out = src;
+                }
                 if (out.type() != CV_8UC3) cv::cvtColor(out, out, cv::COLOR_GRAY2BGR);
                 // Go1 前置相机物理装反 → 原始/校正帧都是上下颠倒的。编码前旋转 180°
                 // （cv::flip flipCode=-1 = 同时翻 x/y 轴）翻正，免得下游订阅方全是倒像。
@@ -491,6 +621,16 @@ private:
 
     StreamCfg cfg_;
     std::vector<OutStream> streams_;
+
+    // ── undistort_mono：预计算鱼眼去畸变映射表（对单目 raw 帧 remap；避开 getRectStereoFrame）──
+    bool undistort_on_ = false;
+    cv::Mat und_map1_, und_map2_;        // CV_16SC2 定点映射表（start 时算一次）
+    cv::Mat calib_K_, calib_D_;          // 内参 / 畸变（read_calibration 从 yaml 解析）
+    double calib_xi_ = 0.0;              // 全向(CMei)模型的 xi
+    bool calib_has_xi_ = false;
+    bool calib_ok_ = false;             // 标定是否成功解析
+    double und_focal_scale_ = 0.25;     // 输出 FOV 旋钮（焦距=尺寸×该值，越小越广角）
+    std::string und_state_ = "off";     // off / cmei / radial / disabled_no_calib
     int udp_fd_ = -1;                 // JPEG-over-UDP 发送 socket（一路复用，per-stream dest）
     std::atomic<long> seq_{0};
     long long last_ts_us_ = 0;
