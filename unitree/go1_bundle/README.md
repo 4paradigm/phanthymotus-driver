@@ -3,13 +3,13 @@
 > 一张“卡片” = Driver 暴露的一个 MCP 工具 = 平台画布上一个可拖拽、可被大模型单独调用的能力。
 >
 > 本 bundle 是从完整 Go1 驱动中**切出的可运行蓝本**，当前发布 22 张卡：13 张传感卡（sensor）+ 8 张控制卡（actuator）+ 1 张资源卡（resource）。
-> **一张卡 = 一个自包含的 `.py` 文件**（如 `loco_state.py` / `battery.py` / `spin.py` / `loco.py` …），方便按卡评审、按卡提交、多人并行不撞车。
+> **一张卡 = 一个自包含的 `.py` 文件**（如 `loco_state.py` / `battery.py` / `loco.py` / `gesture.py` …），方便按卡评审、按卡提交、多人并行不撞车。
 > 目的有二：① 把这些卡干净地上架；② 作为后来者新增其它卡片的开发起点 —— 怎么加卡见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 实现基座
 
 - 官方原始 `unitree_legged_sdk`（Go1 分支 v3.8.6）的 pybind11 模块 `robot_interface`（`HighCmd`/`HighState`）。镜像内 `cmake -DPYTHON_BUILD=ON` 按容器 python 版本构建，**rclpy 可同进程共存** → 状态卡发 ROS2 topic 在画布渲染。
-- 所有卡共用**同一个** raw SDK client（`go1_sdk_client.py`）：唯一的 UDP 收发线程，把 `HighState` 解析成一份线程安全的 `snapshot()`；状态卡只读 `snapshot()` 的不同切片，控制卡（如 `spin`）经该 client 的下发原语（`move`/`stop_move`）发 `HighCmd`。
+- 所有卡共用**同一个** raw SDK client（`go1_sdk_client.py`）：唯一的 UDP 收发线程，把 `HighState` 解析成一份线程安全的 `snapshot()`；状态卡只读 `snapshot()` 的不同切片，控制卡（如 `loco`）经该 client 的下发原语（`move`/`stop_move`）发 `HighCmd`。
 - 无 `robot_interface` / 无真机时自动 **STUB**（不收发、`fresh=false`），MCP server 仍能起、注册、列 tool，方便无硬件时跑通链路。
 - 固定 **HIGHLEVEL**（读 `HighState` / 下发 `HighCmd`）。控制卡须上真机验证量程+安全后才能上架（见 CONTRIBUTING.md §4）。
 
@@ -24,8 +24,7 @@
 | `imu` | IMU | `/{ns}/state/imu`：四元数 / 角速度 / 加速度 / 欧拉角 / 温度 |
 | `feet` | 足端 | `/{ns}/state/feet`：足底力[4] + 高层时足端相对机身位置/速度 |
 | `fall_alarm` | 跌倒/侧翻告警 | `/{ns}/state/fall_alarm`：IMU roll/pitch → ok/tilted/fallen（阈值可配） |
-| `net` | 网络健康 | `/{ns}/state/net`：主机名 / IPv4 / Wi-Fi 信号（联调掉线排查） |
-| `odometry` | 里程计 | `/{ns}/state/odometry`：position/yaw + 相对起点位移（`reset_origin` 重置） |
+| `odometry` | 里程计 | `/{ns}/state/odometry`：position/yaw + 相对起点位移（只读） |
 | `obstacle_range` | 超声波避障 | `/{ns}/state/obstacle_range`：range_raw[4]（仅 HIGHLEVEL；方向/单位官方未定义，原样输出） |
 | `udp_diagnostics` | UDP 通信健康 | `/{ns}/state/udp_diagnostics`：收发计数 + CRC/丢包/标志错误计数 |
 | `joints` | 12 腿关节 | `/{ns}/state/joints`：q/dq/tau/temp（骨架渲染，需 `model` 卡提供 URDF） |
@@ -38,7 +37,6 @@
 | 卡片（= 文件） | 能力 | 关键动作 |
 |---|---|---|
 | `loco` | 基础运动 | 三维速度 `move` + 站起/趴下/平衡/姿态/身高 |
-| `spin` | 原地转圈（闭环） | `action=spin`：转 degrees 度（闭环读 IMU yaw 自停，异步）；`action=stop`：立即停稳。前置：狗须已站立 |
 | `gesture` | 表演/表情 | 作揖/点头/摇头/歪头/环视/跳舞/俯卧撑/坐/昂首等（异步） |
 | `switch_gait` | 步态切换 | 只设期望步态（`trot_run`/`climb_stair`/`trot_obstacle` 须 confirm），实际运动由移动卡触发 |
 | `beep` | 头部扬声器 | beep 动作 → Nano `beep_adapter.py`（:18082 /v1/beep/actions） |
@@ -84,7 +82,6 @@ go1_bundle/
 ├── imu.py             # IMU
 ├── feet.py            # 足端力/位置
 ├── fall_alarm.py      # 跌倒/侧翻告警
-├── net.py             # 网络健康
 ├── odometry.py        # 里程计
 ├── obstacle_range.py  # 超声波避障
 ├── udp_diagnostics.py # UDP 通信健康
@@ -94,7 +91,6 @@ go1_bundle/
 ├── camera_rgb.py      # 前置 RGB 相机
 │   ── 控制卡（actuator）──
 ├── loco.py            # 基础运动
-├── spin.py            # 原地转圈（闭环）
 ├── gesture.py         # 表演/表情
 ├── switch_gait.py     # 步态切换
 ├── beep.py            # 头部扬声器 beep
