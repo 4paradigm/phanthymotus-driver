@@ -104,14 +104,20 @@ static void serve_client(int cli, int device_id) {
         return;
     }
     cam.startCapture();
+    cam.startStereoCompute();   // 🔴 必须开立体计算管线,getRectStereoFrame 才出帧(同 depth_stream/pointcloud_stream)。只 startCapture 不够 → getRectStereoFrame 永远返回 false → 客户端超时。
     fprintf(stderr, "[rgb_stream] dev%d 相机已开,开始推流\n", device_id);
 
     std::vector<int> jpgparams = {cv::IMWRITE_JPEG_QUALITY, 80};
     while (cam.isOpened()) {
-        cv::Mat left, right;
-        std::chrono::microseconds t;
-        // getRectStereoFrame 返回校正后的左右目(去鱼眼),比原始 getRawFrame 更正。
-        if (!cam.getRectStereoFrame(left, right) || left.empty()) {
+        cv::Mat left, right, feim;
+        std::chrono::microseconds t(0);
+        // getRectStereoFrame 返回校正后的左右目(去鱼眼)。
+        // 🔴 两个 SDK 版本签名不同,必须用两版都有的重载:
+        //   ~/UnitreecameraSDK(.13): 有 2/3/4 参三种重载。
+        //   ~/Unitree/sdk/UnitreeCameraSdk(.14/.15, 2021-12): 只有 3 参/4 参重载,无 2 参版。
+        // 两版都有 4 参版 (left,right,feim,timeStamp) → 统一用它,feim 占位丢弃。
+        bool got = cam.getRectStereoFrame(left, right, feim, t);
+        if (!got || left.empty()) {
             usleep(2000);
             continue;
         }
