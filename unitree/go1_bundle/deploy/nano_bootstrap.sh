@@ -219,20 +219,28 @@ DEPTH_ROWS=(
   "right 192.168.123.14 1 9104"
   "belly 192.168.123.15 0 9105"
 )
+DEPTH_DONE=""
 if [ -f "$DEPLOY/camera/depth_stream.cc" ]; then
   for row in "${DEPTH_ROWS[@]}"; do
     set -- $row; POS="$1"; B="$2"; DEVID="$3"; PORT="$4"
     if ! bssh "$B" 'echo ok' >/dev/null 2>&1; then log "depth: 板 $B 不可达 → 跳过 $POS"; continue; fi
     SDK=$(bssh "$B" "$PCL_DETECT" 2>/dev/null | tr -d '\r' | head -1)
     if [ -z "$SDK" ]; then log "depth: $B 无 UnitreeCameraSDK → 跳过 $POS"; continue; fi
-    # 编译一次(该板二进制不存在才编;raw g++ 镜像 pointcloud_stream)
+    # 每块板首次:删旧二进制 → 强制重编(否则旧的崩溃版二进制会被沿用,修复装不上)。
+    # opencv 探测:pkg-config opencv4 → opencv → 回退 /usr/local 并链该目录下全部 opencv 模块
+    # (含 videoio,SDK 的 VideoWriter 需要;.14 无 opencv4.pc,靠这条兜底)。
+    case " $DEPTH_DONE " in
+      *" $B "*) : ;;
+      *)
+        log "depth: 在 $B 编 depth_stream(SDK=$SDK)…"
+        bssh "$B" "rm -f $SDK/bins/depth_stream" 2>/dev/null
+        bscp "$B" "$DEPLOY/camera/depth_stream.cc" "$SDK/depth_stream.cc" 2>/dev/null
+        bssh "$B" "cd $SDK && mkdir -p bins && OCV=\$(pkg-config --cflags --libs opencv4 2>/dev/null); [ -z \"\$OCV\" ] && OCV=\$(pkg-config --cflags --libs opencv 2>/dev/null); [ -z \"\$OCV\" ] && OCV=\"-I/usr/local/include/opencv4 -L/usr/local/lib \$(ls /usr/local/lib/libopencv_*.so 2>/dev/null | sed -E 's#.*/lib(opencv_[a-z0-9]+)\\.so#-l\\1#' | tr '\\n' ' ')\"; g++ -O2 -std=c++14 -pthread depth_stream.cc -I$SDK/include -I$SDK/thirdparty -L$SDK/lib/arm64 -Wl,--start-group -lunitree_camera -ltstc_V4L2_xu_camera -lsystemlog -ludev -Wl,--end-group \$OCV -o bins/depth_stream 2>&1 | tail -4" 2>&1 | tail -4
+        DEPTH_DONE="$DEPTH_DONE $B"
+        ;;
+    esac
     if ! bssh "$B" "[ -x $SDK/bins/depth_stream ]" 2>/dev/null; then
-      log "depth: 在 $B 编 depth_stream(SDK=$SDK)…"
-      bscp "$B" "$DEPLOY/camera/depth_stream.cc" "$SDK/depth_stream.cc" 2>/dev/null
-      bssh "$B" "cd $SDK && mkdir -p bins && g++ -O2 -std=c++14 -pthread depth_stream.cc -I$SDK/include -I$SDK/thirdparty -L$SDK/lib/arm64 -Wl,--start-group -lunitree_camera -ltstc_V4L2_xu_camera -lsystemlog -ludev -Wl,--end-group \$(pkg-config --cflags --libs opencv4) -o bins/depth_stream 2>&1 | tail -3" 2>&1 | tail -3
-    fi
-    if ! bssh "$B" "[ -x $SDK/bins/depth_stream ]" 2>/dev/null; then
-      log "depth: $POS@$B 编译失败/无二进制 → 跳过服务"; continue
+      log "depth: $POS@$B 无有效二进制(编译失败?)→ 跳过服务"; continue
     fi
     # 装 systemd 服务(空闲不占相机;连上才开 dev$DEVID;fuser 抢占由 depth_stream 自己做)
     SVC="go1-depth-$POS"
@@ -250,8 +258,8 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 EOF" 2>/dev/null
-    bssh "$B" "echo $PW | sudo -S cp /tmp/$SVC.service /etc/systemd/system/$SVC.service; echo $PW | sudo -S systemctl daemon-reload; echo $PW | sudo -S systemctl enable --now $SVC" 2>/dev/null
-    log "depth: $POS@$B → 服务 $SVC 已装/启用(dev$DEVID, 端口 $PORT, SDK $SDK)。"
+    bssh "$B" "echo $PW | sudo -S cp /tmp/$SVC.service /etc/systemd/system/$SVC.service; echo $PW | sudo -S systemctl daemon-reload; echo $PW | sudo -S systemctl enable $SVC >/dev/null 2>&1; echo $PW | sudo -S systemctl restart $SVC" 2>/dev/null
+    log "depth: $POS@$B → 服务 $SVC 已装/重启(dev$DEVID, 端口 $PORT, SDK $SDK)。"
   done
 else
   log "✗ /deploy/camera/depth_stream.cc 不存在(Dockerfile 应 COPY camera/)→ depth 端跳过。"

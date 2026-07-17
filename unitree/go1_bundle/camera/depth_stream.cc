@@ -6,7 +6,8 @@
  *    只能取原始帧,startStereoCompute/getDepthFrame 无标定 → 连上无帧。见 pointcloud_stream 同款修复。)
  *   本程序按 device_id **自动生成一份最小 config**(镜像 pointcloud_stream:只填 DeviceNode+尺寸,
  *   标定从相机 flash 加载)→ 免外部 config 文件,一份二进制服务任意一路相机。
- * ★ 热切/不常占:相机"客户端连上才开、断开就释放"。UnitreeCamera 作用域限单次连接,断开即析构释放。
+ * ★ 热切/不常占:相机"客户端连上才开、断开就释放"。客户端断开后本进程 _exit(0)(绕开 SDK 析构的
+ *   double-free 崩溃),进程退出即释放 /dev/videoN,由 systemd 重启回到空闲待命 → 仍是"断开就放相机"。
  *   于是本程序可常驻挂 systemd(空闲不占相机);画布拖入 test_camera_depth 卡 → Pi 卡连上 → 才开相机;
  *   卡 stop / 断开 → 相机立即释放。**无需常占、免重启热切。**
  * ★ 抢占:开相机前 fuser -k /dev/video<device_id> 释放占用者(出厂 point_cloud_node / pointcloud_stream 等)。
@@ -114,9 +115,11 @@ static void serve_client(int cli, int device_id) {
         if (!send_all(cli, buf.data(), buf.size())) break;
         usleep(50000);   // ~20Hz 上限(实际受深度计算限速)
     }
-    cam.stopStereoCompute();
-    cam.stopCapture();
-    fprintf(stderr, "[depth_stream] dev%d 客户端断开,已释放相机\n", device_id);
+    // 客户端断开:UnitreeCamera 析构有 SDK double-free bug(core dump)。用 _exit(0) 干净退出,
+    // 进程退出即释放 /dev/videoN(仍是"断开就放相机"),但绕开会崩的析构;由 systemd 重启回到空闲待命。
+    fprintf(stderr, "[depth_stream] dev%d 客户端断开,_exit(0) 退出(systemd 重启回到待命,规避 SDK 析构 double-free)\n", device_id);
+    fflush(stderr);
+    _exit(0);
 }
 
 int main(int argc, char *argv[]) {
