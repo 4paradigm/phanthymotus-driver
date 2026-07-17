@@ -221,10 +221,9 @@ def main():
 
     print(f"[bundle] namespace={namespace} mcp_port={mcp_port} control_level=HIGHLEVEL")
 
-    from go1_sdk_client import Go1HighSdkClient
-    client = Go1HighSdkClient(network_iface=network_iface)
-    client.start()
-    print(f"[bundle] raw SDK client started ({'live' if client.available else 'STUB'})")
+    from sdk_proxy import SdkProxy
+    client = SdkProxy(network_iface=network_iface)
+    print(f"[bundle] SdkProxy subprocess started ({'live' if client.available else 'STUB'})")
 
     executor = None
     if _HAS_ROS2:

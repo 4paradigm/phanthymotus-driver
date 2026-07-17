@@ -37,6 +37,7 @@ RUN git clone --depth 1 -b ${UNITREE_SDK_REF} ${UNITREE_SDK_REPO} /opt/unitree_l
 
 COPY main.py           /work/main.py
 COPY go1_sdk_client.py /work/go1_sdk_client.py
+COPY sdk_proxy.py      /work/sdk_proxy.py
 COPY loco_state.py     /work/loco_state.py
 COPY battery.py        /work/battery.py
 COPY switch_gait.py    /work/switch_gait.py
