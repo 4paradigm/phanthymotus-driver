@@ -199,8 +199,14 @@ class CameraRgbPlugin:
 
     def _resolve_pos(self, iid: str, args: dict) -> str:
         cfg = args.get("config") or {}
-        return (cfg.get("position") or args.get("position")
-                or self._cfg.get(iid, {}).get("position") or self._default_pos).lower()
+        # 兼容平台多种下发字段:新平台 config.position / 顶层 position / 旧 camera_source /
+        # instance_id 直接就是机位名(front/.../belly);都缺才回 default_position。
+        cand = (cfg.get("position") or args.get("position") or args.get("camera_source")
+                or self._cfg.get(iid, {}).get("position"))
+        if not cand:
+            cand = iid if iid in self._positions else self._default_pos
+        pos = str(cand).lower()
+        return pos if pos in self._positions else self._default_pos
 
     def _stream_for(self, iid: str) -> "_RgbStream":
         st = self._streams.get(iid)
