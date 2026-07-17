@@ -1,9 +1,9 @@
 """
-odometry.py — Go1 里程计卡（当前 position/yaw + 相对起点位移；reset_origin 重置起点）。
+odometry.py — Go1 里程计卡（当前 position/yaw + 相对起点位移）。
 
 自包含：一张卡 = 一个文件。main.py 按 config.yaml 里的卡名自动 import 并 make_plugin()。
 数据来源：共享只读 client 的 snapshot()["position"] 与 ["imu"]["rpy_rad"][2]（仅 HIGHLEVEL 有 position）。
-让高层规划知道「在哪 / 离起点多远」。origin 默认取首帧，可用 reset_origin 动作重置。
+让高层规划知道「在哪 / 离起点多远」。origin 取首帧（纯只读状态卡，无执行动作）。
 
 ⚠️ 不输出累计总路程 total_distance：本 bundle 的 client 不做逐帧累计（逐帧累加会把 IMU/位置
    噪声放大成虚高路程，不可靠）。相对起点的直线位移 displacement 才是可信量。
@@ -36,7 +36,7 @@ HZ = 5.0
 NODE = "go1_odometry"
 CONTROL_LEVEL = "HIGHLEVEL"
 DESC = ("Go1 odometry — position/yaw + displacement from origin; "
-        "action=read 读取, action=reset_origin 重置起点。HIGHLEVEL only.")
+        "action=read 读取。origin 取首帧。HIGHLEVEL only.")
 
 
 def _ms() -> int:
@@ -44,11 +44,11 @@ def _ms() -> int:
 
 
 class Plugin:
-    """状态卡插件：持起点 origin；装了 rclpy 就发 topic；支持 MCP read / reset_origin。"""
+    """状态卡插件：持起点 origin；装了 rclpy 就发 topic；支持 MCP read（纯只读，无执行动作）。"""
 
     def __init__(self, plugin_config, namespace, executor, client):
         self._client = client
-        self._origin = None            # [x, y] 起点；首帧或 reset_origin 时设
+        self._origin = None            # [x, y] 起点；首帧读取时设
         self._topic = TOPIC.format(ns=namespace)
         self._node = None
         if _HAS_ROS2 and executor is not None:
@@ -93,17 +93,7 @@ class Plugin:
     def get_tool(self):
         desc = DESC + (f" — → {self._topic}" if self._node else " — poll via MCP action=read")
         return {"name": CARD, "type": TYPE, "multiInstance": False, "description": desc,
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "action": {"type": "string", "enum": ["read", "reset_origin"],
-                                   "description": "read=读里程计（默认）；reset_origin=把当前位置设为新起点"},
-                    },
-                    "x-action-params": {
-                        "read": {"params": [], "description": "读取当前 position/yaw 与相对起点位移。"},
-                        "reset_origin": {"params": [], "description": "把当前位置设为新起点，位移归零。"},
-                    },
-                },
+                "inputSchema": {"type": "object", "properties": {}},
                 "topic_out": ([{"topic": self._topic, "format": FMT}] if self._node else [])}
 
     def start(self):
@@ -117,13 +107,6 @@ class Plugin:
             return {"state": "running"}
         if action == "stop":
             return {"state": "idle"}
-        if action == "reset_origin":
-            snap = self._client.snapshot()
-            pos = snap.get("position") or [0.0, 0.0, 0.0]
-            self._origin = [pos[0], pos[1]]
-            return {"ok": True, "card": CARD, "action": "reset_origin",
-                    "control_level": CONTROL_LEVEL,
-                    "applied": {"origin_m": list(self._origin)}, "timestamp_ms": _ms()}
         if action in ("info", "read", "get", CARD):
             return {"state": "running", "data": self._build(),
                     "topic_out": ([{"topic": self._topic, "format": FMT}] if self._node else [])}
