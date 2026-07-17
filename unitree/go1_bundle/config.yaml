@@ -137,3 +137,18 @@ plugins:
     # straight_hand_duration_s: 4.0
     # stabilize_timeout_s: 3.0        # 等待站到/回到 balance_stand 的超时
     # stabilize_settle_s: 0.5         # 确认站稳后、开火前的小停顿
+
+  # ── zjh 卡（loco_state_zjh 全传感器汇聚；test_ 前缀两张待验收）──
+  loco_state_zjh:               # 全传感器汇聚：运动+IMU+关节+足端力+电量+障碍+遥控（topic /{ns}/loco/state_zjh）
+    enabled: true
+  test_battery_guard_zjh:       # 低电量报警：LED(A通道,client无set_led则降级)+topic事件(B通道)
+    enabled: true
+    require_confirm: false
+    armed_on_start: true
+    low_soc_percent: 20
+    critical_soc_percent: 10
+  test_contact_check_zjh:       # 触地/悬空自检（待验收）
+    enabled: true
+    contact_force_threshold: 30.0
+    picked_up_hold_s: 0.6
+    publish_hz: 10.0
