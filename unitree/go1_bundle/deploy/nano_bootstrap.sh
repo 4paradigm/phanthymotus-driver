@@ -257,7 +257,7 @@ if [ "${DEPTH_ENABLE}" = "1" ] && [ -f "$DEPLOY/camera/depth_stream.cc" ]; then
         log "depth: 在 $B 编 depth_stream(SDK=$SDK)…"
         bssh "$B" "rm -f $SDK/bins/depth_stream" 2>/dev/null
         bscp "$B" "$DEPLOY/camera/depth_stream.cc" "$SDK/depth_stream.cc" 2>/dev/null
-        bssh "$B" "cd $SDK && mkdir -p bins && OCV=\$(pkg-config --cflags --libs opencv4 2>/dev/null); [ -z \"\$OCV\" ] && OCV=\$(pkg-config --cflags --libs opencv 2>/dev/null); [ -z \"\$OCV\" ] && OCV=\"-I/usr/local/include/opencv4 -L/usr/local/lib \$(ls /usr/local/lib/libopencv_*.so 2>/dev/null | sed -E 's#.*/lib(opencv_[a-z0-9]+)\\.so#-l\\1#' | tr '\\n' ' ')\"; g++ -O2 -std=c++14 -pthread depth_stream.cc -I$SDK/include -I$SDK/thirdparty -L$SDK/lib/arm64 -Wl,--start-group -lunitree_camera -ltstc_V4L2_xu_camera -lsystemlog -ludev -Wl,--end-group \$OCV -o bins/depth_stream 2>&1 | tail -4" 2>&1 | tail -4
+        bssh "$B" "cd $SDK && mkdir -p bins && OCV=\$(pkg-config --cflags --libs opencv4 2>/dev/null); [ -z \"\$OCV\" ] && OCV=\$(pkg-config --cflags --libs opencv 2>/dev/null); [ -z \"\$OCV\" ] && OCV=\"-I/usr/local/include/opencv4 -L/usr/local/lib -Wl,-rpath,/usr/local/lib \$(ls /usr/local/lib/libopencv_*.so 2>/dev/null | sed -E 's#.*/lib(opencv_[a-z0-9]+)\\.so#-l\\1#' | tr '\\n' ' ')\"; g++ -O2 -std=c++14 -pthread depth_stream.cc -I$SDK/include -I$SDK/thirdparty -L$SDK/lib/arm64 -Wl,-rpath,$SDK/lib/arm64 -Wl,--start-group -lunitree_camera -ltstc_V4L2_xu_camera -lsystemlog -ludev -Wl,--end-group \$OCV -o bins/depth_stream 2>&1 | tail -4" 2>&1 | tail -4
         DEPTH_DONE="$DEPTH_DONE $B"
         ;;
     esac
