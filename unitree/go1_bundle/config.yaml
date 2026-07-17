@@ -54,9 +54,7 @@ plugins:
     enabled: true
     # tilt_warn_rad: 0.6        # 明显倾斜阈值（rad，≈34°）
     # fall_rad: 1.2             # 跌倒判定阈值（rad，≈69°）
-  net:                          # 网络健康：主机名/IPv4/Wi-Fi 信号（联调掉线排查）
-    enabled: true
-  odometry:                     # 里程计：position/yaw + 相对起点位移（reset_origin 重置）
+  odometry:                     # 里程计：position/yaw + 相对起点位移（只读）
     enabled: true
   obstacle_range:               # 超声波避障：最近障碍物距离[4]（仅 HIGHLEVEL；方向/单位未定义）
     enabled: true
@@ -108,8 +106,6 @@ plugins:
       right: {board_ip: "192.168.123.14", image_port: 9204}
       belly: {board_ip: "192.168.123.15", image_port: 9205}
 
-  spin:                         # 原地转圈（闭环读 IMU yaw 转够自停）
-    enabled: true
   loco:                         # 基础运动:三维速度 move + 站起/趴下/平衡/姿态/身高
     enabled: true
   body_pose:                    # 机身姿态/高度:set_attitude(roll/pitch/yaw)/set_body_height/set_foot_raise_height/reset(能力卡片§4.3)
