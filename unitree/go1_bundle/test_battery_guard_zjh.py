@@ -6,7 +6,7 @@ snapshot()["battery"]（soc_percent + status），去抖后判定电量级别，
 
 灯光规则：
 1. SOC > 50% 常亮绿色
-2. 23% ＜ SOC ≤ 50% 灯熄灭无显示
+2. 20% ＜ SOC ≤ 50% 灯熄灭无显示
 3. 10% ＜ SOC ≤ 20% 红灯慢闪
 4. SOC ≤ 10% 红灯快闪
 5. 充电状态、无有效电量数据、数据未刷新：强制灭灯
@@ -85,7 +85,9 @@ class Plugin:
         cfg = plugin_config or {}
         self._low_soc = int(cfg.get("low_soc_percent", LOW_SOC))
         self._crit_soc = int(cfg.get("critical_soc_percent", CRIT_SOC))
+        self._green_soc = int(cfg.get("green_soc_percent", GREEN_SOC_THRESHOLD))
         self._debounce = int(cfg.get("debounce_samples", DEBOUNCE_N))
+        self._clear_n = int(cfg.get("clear_samples", CLEAR_N))
         # LED 只点灯不动狗 → 默认免 confirm、默认开机布防（当作常驻安全监测）
         self._require_confirm = bool(cfg.get("require_confirm", False))
 
@@ -103,6 +105,7 @@ class Plugin:
         self._blink_tick = 0           # 闪灯相位计数
         self._led_on = False           # 当前灯相位（红/灭）
         self._led_active = False       # 我方是否正在驱动 LED（用于收尾灭灯）
+        self._in_blink = False         # 是否处于告警闪烁模式（区分于绿灯常亮，用于切到告警时立即亮红灯）
         self._last = {"soc": None, "status": None, "charging": False, "fresh": False}
         self._last_event = None
         self._events = 0
@@ -129,8 +132,8 @@ class Plugin:
                 "type": "object",
                 "properties": {
                     "action": {"type": "string",
-                               "enum": ["arm", "disarm", "check", "info", "test"],
-                               "description": "arm 布防/disarm 撤防/check 查当前电量与级别/info 查配置与统计/test 红灯试亮2秒(验证灯可用)"},
+                               "enum": ["start", "stop", "arm", "disarm", "check", "info", "test"],
+                               "description": "start/stop 生命周期；arm 布防/disarm 撤防/check 查当前电量与级别/info 查配置与统计/test 红灯试亮2秒(验证灯可用)"},
                     "confirm": {"type": "boolean", "description": "require_confirm=true 时 arm 需传 true（默认免确认，仅点灯不动狗）"},
                 },
                 "required": ["action"],
@@ -186,12 +189,17 @@ class Plugin:
 
     @staticmethod
     def _read(s):
-        """从 snapshot 取 (fresh, soc, status, charging)。soc 为 None 表示无 BMS 数据。"""
+        """从 snapshot 取 (fresh, soc, status, charging)。soc 为 None 表示无 BMS 数据。
+        snapshot 的 battery 只有 status_code(数字) + status_name(字符串)，无 "status" 字段；
+        充电判定按 status_name 匹配 CHARGING_STATUS（值来自 BMS_STATUS_NAMES，已小写）。"""
         fresh = bool(s.get("fresh"))
         bat = s.get("battery") or {}
         soc = bat.get("soc_percent")
-        status = bat.get("status")
-        charging = str(status) in CHARGING_STATUS
+        status_name = bat.get("status_name")
+        status_code = bat.get("status_code")
+        # 上报用 status_name（更可读），fallback 到 status_code
+        status = status_name if status_name is not None else status_code
+        charging = bool(status_name and str(status_name).lower() in CHARGING_STATUS)
         return fresh, (int(soc) if soc is not None else None), status, charging
 
     def _tick(self):
@@ -209,6 +217,7 @@ class Plugin:
             # ========== 最高优先级：充电 / 无有效数据 直接关灯 ==========
             if not fresh or soc is None or charging:
                 self._low_count = self._crit_count = self._clear_count = 0
+                self._in_blink = False
                 if self._level != 0:
                     self._level = 0
                 if self._led_active:
@@ -217,8 +226,9 @@ class Plugin:
                     self._blink_tick = 0
                     led_cmd = "clear"
             else:
-                # ========== 第二优先级：电量大于50% 强制常亮绿灯 ==========
-                if soc > GREEN_SOC_THRESHOLD:
+                # ========== 第二优先级：电量大于绿阈 强制常亮绿灯 ==========
+                if soc > self._green_soc:
+                    self._in_blink = False
                     self._led_active = True
                     led_cmd = LED_GREEN
                 else:
@@ -236,7 +246,7 @@ class Plugin:
                         target = 2
                     elif self._low_count >= self._debounce:
                         target = 1
-                    elif self._clear_count >= CLEAR_N:
+                    elif self._clear_count >= self._clear_n:
                         target = 0
 
                     if target != self._level and self._armed:
@@ -246,7 +256,10 @@ class Plugin:
                     # 进入告警：红灯闪烁
                     if self._armed and self._level > 0:
                         step = BLINK_CRIT_TICKS if self._level == 2 else BLINK_LOW_TICKS
-                        if not self._led_active:
+                        if not self._in_blink:
+                            # 刚进入告警闪烁模式：立即亮红灯（不轮等翻转，
+                            # 解决从绿灯常亮切到告警时第一拍不亮的问题）
+                            self._in_blink = True
                             self._led_on = True
                             self._blink_tick = 0
                         else:
@@ -257,7 +270,8 @@ class Plugin:
                         self._led_active = True
                         led_cmd = LED_RED if self._led_on else LED_OFF
                     else:
-                        # 23%~50% 区间：熄灭灯光
+                        # 安全区（低阈~绿阈区间）：熄灭灯光
+                        self._in_blink = False
                         if self._led_active:
                             self._led_active = False
                             self._led_on = False
@@ -280,7 +294,7 @@ class Plugin:
         with self._lock:
             if level != "normal":
                 self._events += 1
-                self._last_event = ev
+            self._last_event = ev   # normal 也更新，让 info 能看到恢复时间
         tag = {"normal": "✓ 电量恢复", "low": "⚠ 低电量", "critical": "‼ 极低电量"}.get(level, level)
         print(f"[{CARD}] {tag} SOC={soc}% → {ev}", flush=True)
 
@@ -297,7 +311,7 @@ class Plugin:
                     "soc_percent": self._last.get("soc"),
                     "status": self._last.get("status"),
                     "charging": bool(self._last.get("charging")),
-                    "thresholds": {"low": self._low_soc, "critical": self._crit_soc, "green": GREEN_SOC_THRESHOLD},
+                    "thresholds": {"low": self._low_soc, "critical": self._crit_soc, "green": self._green_soc},
                 }
             m = String()
             m.data = json.dumps(payload)
@@ -311,6 +325,10 @@ class Plugin:
         args = args or {}
         now = int(time.time() * 1000)
 
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
         if action == "info":
             return self._status(now, "info")
         if action == "check":
@@ -327,6 +345,7 @@ class Plugin:
                 self._armed = True
                 self._level = 0
                 self._low_count = self._crit_count = self._clear_count = 0
+                self._in_blink = False
             return self._status(now, "arm")
 
         if action == "disarm":
@@ -334,6 +353,7 @@ class Plugin:
                 self._armed = False
                 self._led_active = False
                 self._led_on = False
+                self._in_blink = False
             self._led_clear()
             return self._status(now, "disarm")
 
@@ -366,9 +386,10 @@ class Plugin:
                     "require_confirm": self._require_confirm,
                     "thresholds": {"low_soc_percent": self._low_soc,
                                    "critical_soc_percent": self._crit_soc,
-                                   "green_threshold": GREEN_SOC_THRESHOLD,
+                                   "green_threshold": self._green_soc,
                                    "clear_margin": CLEAR_MARGIN,
-                                   "debounce_samples": self._debounce},
+                                   "debounce_samples": self._debounce,
+                                   "clear_samples": self._clear_n},
                     "battery": {"soc_percent": self._last.get("soc"),
                                 "status": self._last.get("status"),
                                 "charging": bool(self._last.get("charging"))},

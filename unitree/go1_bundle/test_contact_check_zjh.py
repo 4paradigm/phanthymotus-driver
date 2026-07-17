@@ -76,8 +76,9 @@ class Plugin:
         self._pub = None
         if _HAS_ROS2 and executor is not None:
             try:
-                self._node = Node(f"{NODE}_{namespace}")
+                self._node = Node(NODE)
                 self._pub = self._node.create_publisher(String, self._topic, _QOS)
+                executor.add_node(self._node)
                 self._node.get_logger().info(f"go1 state → {self._topic} @ {self._hz}Hz")
             except Exception as e:  # noqa: BLE001
                 print(f"[{CARD}] ROS2 发布不可用，退回 MCP 轮询: {e}", flush=True)
@@ -108,6 +109,14 @@ class Plugin:
         d["feet"] = feet
         d["contacts"] = contacts
         d["posture"] = _POSTURE.get(contacts, "unknown")
+        # gait 上下文：trot/trot_run 步态下两脚触地（对角）是正常步态相位，非异常支撑
+        gait_name = snap.get("gait_name", "unknown")
+        d["gait"] = gait_name
+        d["posture_note"] = ""
+        if contacts == 2 and gait_name in ("trot", "trot_run"):
+            # 检查是否对角两脚（FR+RL / FL+RR），trot 正常相位；同侧两脚仍属异常
+            pair = tuple(sorted(i for i, ft in enumerate(feet) if ft["contact"]))
+            d["posture_note"] = "normal_for_trot" if pair in ((0, 3), (1, 2)) else "lateral_two_feet"
         return d, contacts, (contacts == 0)
 
     def _evaluate(self, now):

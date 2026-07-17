@@ -19,10 +19,14 @@ import json
 import time
 
 try:
-    from go1_sdk_client import parse_wireless_remote
+    from go1_sdk_client import parse_wireless_remote, JOINT_NAMES as _RAW_JOINT_NAMES
+    # 用 client 的关节顺序定义（去 _joint 后缀做短名），避免硬编码与 client 顺序脱耦
+    _JOINT_NAMES = [n.replace("_joint", "") for n in _RAW_JOINT_NAMES]
 except Exception:
     def parse_wireless_remote(_raw):
         return {"buttons": {}, "axes": {}}
+    _JOINT_NAMES = ["FR_hip", "FR_thigh", "FR_calf", "FL_hip", "FL_thigh", "FL_calf",
+                    "RR_hip", "RR_thigh", "RR_calf", "RL_hip", "RL_thigh", "RL_calf"]
 
 try:
     from rclpy.node import Node
@@ -86,12 +90,10 @@ def build(snap: dict) -> dict:
         }
 
         # ── 关节(12 个) ────
-        # snapshot["joints"] 是 list[{"i","q",...}]（见 go1_sdk_client.parse_joints），取每个的 q 作为角度
+        # 关节名与顺序取自 client 的 JOINT_NAMES（见文件头 _JOINT_NAMES），不再硬编码
         joints_list = snap.get("joints") or []
-        joint_names = ["FR_hip", "FR_thigh", "FR_calf", "FL_hip", "FL_thigh", "FL_calf",
-                       "RR_hip", "RR_thigh", "RR_calf", "RL_hip", "RL_thigh", "RL_calf"]
         d["joints"] = {}
-        for i, name in enumerate(joint_names):
+        for i, name in enumerate(_JOINT_NAMES):
             m = joints_list[i] if i < len(joints_list) else None
             d["joints"][name] = float(m.get("q", 0.0)) if isinstance(m, dict) else 0.0
 
@@ -101,15 +103,20 @@ def build(snap: dict) -> dict:
                                for i, foot in enumerate(["FR", "FL", "RR", "RL"])}
 
         # ── 电池 ────
+        # snapshot["battery"] 字段为 status_code(数字) + status_name(字符串)，无 "status" 字段
         battery = snap.get("battery") or {}
         d["battery"] = {
             "soc_percent": battery.get("soc_percent"),
-            "status": battery.get("status"),
+            "status_code": battery.get("status_code"),
+            "status_name": battery.get("status_name"),
         }
 
         # ── 前向障碍(4 通道) ────
-        range_obstacle = snap.get("range_obstacle") or [0.0, 0.0, 0.0, 0.0]
-        d["range_obstacle_m"] = {f"ch{i}": float(range_obstacle[i]) if i < len(range_obstacle) else 0.0
+        # 无数据时为 None（0.0 会误读为"贴脸障碍"）
+        range_obstacle = snap.get("range_obstacle")
+        d["range_obstacle_m"] = {f"ch{i}": (float(range_obstacle[i])
+                                             if range_obstacle is not None and i < len(range_obstacle)
+                                             else None)
                                  for i in range(4)}
 
         # ── 遥控 ────
