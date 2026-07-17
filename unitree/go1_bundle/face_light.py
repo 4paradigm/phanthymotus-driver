@@ -19,7 +19,9 @@ except Exception:
 
 CARD = "face_light"
 TYPE = "actuator"
-DESC = "Go1 face LED strip color via MQTT — set RGB, pick a preset color, or turn off."
+DESC = ("Go1 face LED strip STATIC color via MQTT — set a persistent RGB/preset color and hold it "
+        "(steady-state indication; stays until changed or off). For blink/breathe/fade/timed effects, "
+        "use test_light_effect instead.")
 
 _PRESETS = {"red": (255, 0, 0), "green": (0, 255, 0), "blue": (0, 0, 255),
             "yellow": (255, 255, 0), "cyan": (0, 255, 255), "magenta": (255, 0, 255),

@@ -5,7 +5,7 @@ test_light_effect.py — Go1 面部灯带动效卡(actuator,经 MQTT)。【test 
 到同一 MQTT 主题 `face_light/color`(bytes([r,g,b])),做出动效。控同一条灯带 → 两卡同时用会互相覆盖。
 
 模式(每个可带 duration 秒,跑完自动关灯;duration=0/不填 → 常驻循环到下条指令或 off):
-  · solid          常亮某色
+  · solid          定时常亮(亮 N 秒后自动灭,默认3s;要"持续常亮不灭"用 face_light 卡)
   · blink          某色亮/灭交替(period_ms 控频率)         —— 实用:告警
   · breathe        某色亮度平滑一涨一落循环(period_ms)      —— 实用:处理中/思考
   · fade           从色 A 平滑过渡到色 B(需 duration)
@@ -32,8 +32,10 @@ except Exception:
 
 CARD = "test_light_effect"
 TYPE = "actuator"
-DESC = ("Go1 face LED strip animated effects via MQTT — solid/blink/breathe/fade/brightness_up/"
-        "brightness_down (each with optional duration secs) + a few semantic presets. 【test = 未验收】")
+DESC = ("Go1 face LED strip DYNAMIC/TIMED effects via MQTT — everything has a time dimension: "
+        "blink/breathe/fade/brightness_up/brightness_down, timed solid (hold N secs then auto-off), "
+        "plus a few semantic presets. 【test = 未验收】 For a persistent static color (hold indefinitely), "
+        "use face_light instead.")
 
 _PRESETS = {"red": (255, 0, 0), "green": (0, 255, 0), "blue": (0, 0, 255),
             "yellow": (255, 255, 0), "cyan": (0, 255, 255), "magenta": (255, 0, 255),
@@ -195,7 +197,7 @@ class Plugin:
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "solid": {"params": ["r", "g", "b", "color", "duration"], "description": "常亮某色"},
+                    "solid": {"params": ["r", "g", "b", "color", "duration"], "description": "定时常亮(亮 duration 秒后自动灭,默认3s;持续常亮不灭请用 face_light 卡)"},
                     "blink": {"params": ["r", "g", "b", "color", "duration", "period_ms"], "description": "闪烁"},
                     "breathe": {"params": ["r", "g", "b", "color", "duration", "period_ms"], "description": "呼吸"},
                     "fade": {"params": ["r", "g", "b", "color", "to_r", "to_g", "to_b", "to_color", "duration"], "description": "A→B 渐变"},
@@ -229,6 +231,9 @@ class Plugin:
 
         dur = float(args.get("duration", 0) or 0)
         dur = max(0.0, min(_MAX_DURATION, dur))
+        # solid=定时常亮(亮 N 秒后自动灭);默认 3 秒。要"持续常亮不灭"请用 face_light(职责区分)。
+        if action == "solid" and dur <= 0:
+            dur = 3.0
 
         if action == "preset":
             nm = str(args.get("name", "")).lower()
