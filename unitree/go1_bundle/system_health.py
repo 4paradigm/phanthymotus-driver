@@ -1,14 +1,14 @@
 """
-system_health.py — Go1 self-diagnostic card (actuator).
+system_health.py — Go1 robot status / self-check card (actuator).
 
-decision_core calls action=`diagnose` when the robot misbehaves; returns a one-shot health check
-with per-item OK/WARNING/CRITICAL and an overall verdict pointing at the problem.
-Covers the compute board (CPU temp/load, memory, disk, power throttle, network, key process)
-and robot subsystems (battery, comm link, motion state).
+action=`robot_info` returns a one-shot overall status of the whole robot — use it to answer
+"how is the robot / robot status / anything wrong?". Gives per-item OK/WARNING/CRITICAL + overall
+verdict pointing at any problem. Covers the compute board (CPU temp/load, memory, disk, power
+throttle, network, key process) and robot subsystems (battery, comm link, motion state).
 - OS metrics: read /proc, /sys, vcgencmd (visible to the container under --pid host --privileged).
 - Battery: subscribe MQTT bms/state (dog's on-board broker); does not rely on standard-SDK bms.
 - Comm/motion: read the shared client.snapshot() fresh / mode_name.
-Read-only, no control commands, no locomotion UDP — zero conflict.
+Read-only, no control commands, no locomotion UDP — zero conflict. (`diagnose` kept as alias.)
 """
 
 from __future__ import annotations
@@ -27,7 +27,8 @@ except Exception:
 
 CARD = "system_health"
 TYPE = "actuator"
-DESC = ("Run a full self-diagnostic when the robot misbehaves. Checks the compute board "
+DESC = ("Get the robot's overall status / health info in one call — use this to answer "
+        "'how is the robot / robot status / is anything wrong'. Checks the compute board "
         "(CPU temp/load, memory, disk, power throttle, network, key process) and robot subsystems "
         "(battery, comm link, motion state); returns per-item OK/WARNING/CRITICAL + overall verdict.")
 
@@ -80,8 +81,8 @@ class Plugin:
     def get_tool(self):
         return {"name": CARD, "type": TYPE, "multiInstance": False, "description": DESC,
                 "inputSchema": {"type": "object",
-                                "properties": {"action": {"type": "string", "enum": ["diagnose"],
-                                                           "description": "Run full diagnostic"}},
+                                "properties": {"action": {"type": "string", "enum": ["robot_info"],
+                                                           "description": "Get robot overall status / health info"}},
                                 "required": ["action"]}}
 
     def dispatch(self, action, args):
@@ -89,7 +90,7 @@ class Plugin:
             return {"state": "ready"}
         if action == "stop":
             return {"state": "idle"}
-        if action != "diagnose":
+        if action not in ("robot_info", "diagnose"):   # robot_info 主名;diagnose 保留为兼容别名
             return None
 
         report, problems, counts, worst = {}, [], {}, [0]
@@ -206,7 +207,7 @@ class Plugin:
 
         overall = ["OK", "WARNING", "CRITICAL"][worst[0]]
         return {
-            "ok": True, "action": "diagnose", "card": CARD,
+            "ok": True, "action": action, "card": CARD,
             "control_level": "HIGHLEVEL", "timestamp_ms": int(time.time() * 1000),
             "overall": overall,
             "summary": f"{sum(counts.values())} checks: {counts.get('OK', 0)} OK / "
