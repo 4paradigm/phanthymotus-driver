@@ -47,6 +47,14 @@ CARD = "camera_rgb"
 TYPE = "sensor"
 FMT = "image/jpeg"
 
+# 超时分三段：连接握手短、等第一帧长、稳态短。
+#   Nano 侧 rgb_stream 连上后要 startStereoCompute() 暖机,实测第一帧 ~5-6.5s 才出(去鱼眼立体管线固有)。
+#   旧代码用 create_connection(timeout=5) → 这个 5s 同时成了读超时 → 第一帧必然超时 → 断开 →
+#   Nano _exit(0) 重启 → 重连又卡在暖机 → 永远黑屏死循环。故读超时必须显著大于第一帧延迟。
+_CONNECT_TIMEOUT = 8.0      # TCP 建连
+_FIRST_FRAME_TIMEOUT = 20.0 # 等第一帧(含 Nano 立体管线暖机,留足余量)
+_STEADY_TIMEOUT = 8.0       # 稳态:出帧后 ~14fps,8s 收不到即判定流断
+
 # 机位 → 板卡 IP / 图传端口(与 nano_bootstrap.sh RGB_ROWS 对齐;device_id 在 Nano 侧服务里定)。
 # 端口 92xx 与深度 91xx、点云 94xx 错开。config.positions 可覆盖 board_ip/image_port。
 _DEFAULT_POSITIONS = {
@@ -119,14 +127,18 @@ class _RgbStream:
     def _loop(self, gen, position, host, port):
         while self._run and gen == self._gen:
             try:
-                s = socket.create_connection((host, port), timeout=5)
+                s = socket.create_connection((host, port), timeout=_CONNECT_TIMEOUT)
+                # create_connection 会把 timeout 留在 socket 上当读超时;第一帧要等 Nano 暖机 ~5-6.5s,
+                # 故显式放宽读超时到 _FIRST_FRAME_TIMEOUT,出帧后再收紧到 _STEADY_TIMEOUT。
+                s.settimeout(_FIRST_FRAME_TIMEOUT)
                 self.connected = True
-                self._node.get_logger().info(f"[{position}] 已连上 rgb_stream {host}:{port}")
+                self._node.get_logger().info(f"[{position}] 已连上 rgb_stream {host}:{port}(等第一帧,暖机中~5-6s)")
             except Exception:
                 self.connected = False
                 time.sleep(2)
                 continue
             try:
+                got_first = False
                 while self._run and gen == self._gen:
                     hdr = _recvall(s, 4)
                     if hdr is None:
@@ -137,6 +149,10 @@ class _RgbStream:
                     data = _recvall(s, n)
                     if data is None:
                         break
+                    if not got_first:
+                        got_first = True
+                        s.settimeout(_STEADY_TIMEOUT)   # 第一帧已到 → 收紧读超时以便快速发现流断
+                        self._node.get_logger().info(f"[{position}] 首帧到达,进入稳态推流")
                     if self._pub is not None:
                         msg = CompressedImage()
                         msg.header.stamp = self._node.get_clock().now().to_msg()
