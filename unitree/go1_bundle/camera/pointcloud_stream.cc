@@ -124,7 +124,10 @@ static void project_depth_to_xyz(const cv::Mat &depth_bgr, int stride,
         for (int v = 0; v < rows; v += stride) {
             for (int u = 0; u < cols; u += stride) {
                 float z = depth_bgr.at<float>(v, u);
-                if (z <= 0.0f || !std::isfinite(z) || z > 20.0f) continue;
+                if (z <= 0.0f || !std::isfinite(z)) continue;
+                // 单位未知:若值域在 0~20 视为米,若在 100~20000 视为 mm 转换
+                if (z > 100.0f) z /= 1000.0f;
+                if (z > 20.0f) continue;
                 xyz_out.push_back((u - cx) * z / fx);
                 xyz_out.push_back((v - cy) * z / fy);
                 xyz_out.push_back(z);
@@ -207,7 +210,7 @@ static void serve_client(int cli, int device_id, int stride) {
         // 用单输出重载(已知 .13 能出帧;color=false 期望灰度,但实测可能仍是 CV_8UC3 彩色可视化)
         cv::Mat depth_raw;
         std::chrono::microseconds t;
-        if (!cam.getDepthFrame(depth_raw, false, t) || depth_raw.empty()) {
+        if (!cam.getDepthFrame(depth_raw, true, t) || depth_raw.empty()) {
             empty_streak++;
             if (empty_streak % 200 == 1)
                 fprintf(stderr, "[pointcloud_stream] dev%d depth 帧为空(streak=%d),等待...\n",
