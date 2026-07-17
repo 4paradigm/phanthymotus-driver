@@ -119,6 +119,7 @@ class _PclStream:
         while self._run and gen == self._gen:
             try:
                 s = socket.create_connection((host, port), timeout=5)
+                s.settimeout(15)  # 相机 SDK 初始化需 5~7s 才出第一帧,给足等待时间
                 self.connected = True
                 self._node.get_logger().info(f"[{position}] 已连上 pointcloud_stream {host}:{port}")
             except Exception:
