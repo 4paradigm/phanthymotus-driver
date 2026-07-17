@@ -43,6 +43,7 @@
 | `switch_gait` | 步态切换 | 只设期望步态（`trot_run`/`climb_stair`/`trot_obstacle` 须 confirm），实际运动由移动卡触发 |
 | `beep` | 头部扬声器 | beep 动作 → Nano `beep_adapter.py`（:18082 /v1/beep/actions） |
 | `face_light` | 面部灯带颜色 | `set_color`/`preset`/`off`（经 MQTT） |
+| `test_light_effect` | 面部灯带动效(未验收) | `solid`/`blink`/`breathe`/`fade`/`brightness_up`/`brightness_down`/`preset`/`off`，各带 duration（经 MQTT） |
 | `system_health` | 诊断执行 | 主控板 + 子系统体检，自动判断哪里有问题（经 MQTT） |
 | `test_power_control` | 电源（关机·不可逆） | `power_off`：关闭电池（`BmsCmd.off=0xA5`），**不可逆、不能远程恢复**；需 `confirm=true`+`reason`，前置：状态 fresh 且机器人静止。**`test` 前缀=未验收**，验收后改回 `power_control` |
 
@@ -98,6 +99,7 @@ go1_bundle/
 ├── switch_gait.py     # 步态切换
 ├── beep.py            # 头部扬声器 beep
 ├── face_light.py      # 面部灯带颜色
+├── test_light_effect.py # 面部灯带动效(未验收)
 ├── system_health.py   # 诊断执行
 ├── test_power_control.py # 电源关机（不可逆，未验收=test 前缀）
 │   ── 资源卡（resource）──
