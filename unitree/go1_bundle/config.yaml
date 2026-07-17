@@ -16,6 +16,10 @@ plugins:
     enabled: true
     mqtt_host: "localhost"
     mqtt_port: 1883
+  test_light_effect:            # 【未验收·test 前缀】面部灯带动效(actuator,MQTT):solid/blink/breathe/fade/brightness_up/down + 语义预设,各带 duration。验收后改名 light_effect
+    enabled: true
+    mqtt_host: "localhost"
+    mqtt_port: 1883
   system_health:                # 诊断执行卡(actuator):主控板+子系统体检,自动判断哪里有问题
     enabled: true
     mqtt_host: "localhost"
