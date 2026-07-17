@@ -318,12 +318,27 @@ class _CameraRgbInstance:
         self._info_node = None
         self._info_topic = None
 
+        # 同设备互斥的 peer 服务（go1-pointcloud-<pos> / go1-depth-<pos>，可选 config.peer_services）。
+        # Go1 一台物理相机同时只能一个消费者。belly(.15) 只有 video0，常驻着 pointcloud/depth 服务；
+        # left/right(.14) 也各有 depth 服务。这里记录 peer 列表：start 前 SSH 停掉它们腾相机，
+        # stop 后 SSH 恢复（回 idle 监听，不抢设备），实现「调用 belly 才让位、不用就还回去」。
+        self._peer_services = [s for s in (pos_cfg.get("peer_services") or []) if s]
+        self._peer_host = pos_cfg.get("board_ip")
+        self._peer_user = "unitree"
+        self._peer_pw = os.environ.get("NANO_SSH_PW", "123")
+        self._stopped_peers: list = []   # 本次 start 实际停掉的 peer（供 stop 恢复）
+
     # ── 生命周期 ──
     def start(self, req_cfg: dict) -> dict:
         with self._lock:
             if self._state == "running":
                 return _err("PRECONDITION_FAILED", f"instance {self._position} already running",
                             **self._status_running())
+
+            # 先让位：停掉同设备的 peer 服务（go1-pointcloud-<pos>/go1-depth-<pos>），腾出相机。
+            # 失败不直接 abort——adapter 自己有 free_device_node() 兜底（fuser -k -TERM），
+            # 但那会硬杀进程、且 peer 的 Restart=always 会立即顶回来抢；所以这里优先 systemctl stop。
+            self._stop_peers()
 
             mode = req_cfg.get("mode", self._defaults.get("mode", "raw_mono"))
             frame_size = req_cfg.get("frame_size", self._defaults.get("frame_size", "928x400"))
@@ -355,6 +370,8 @@ class _CameraRgbInstance:
             }
             resp = self._client.request(start_payload, timeout_sec=5.0)
             if not resp.get("ok"):
+                # start 失败 → 把刚停掉的 peer 恢复回去，别让相机空着没人管。
+                self._start_peers()
                 # 透传 Adapter 的错误码（RESOURCE_BUSY / DEVICE_NOT_FOUND 等），默认 COMMUNICATION_ERROR。
                 return _err(resp.get("code", "COMMUNICATION_ERROR"),
                             resp.get("message", "adapter start failed"))
@@ -410,6 +427,8 @@ class _CameraRgbInstance:
             self._client.request({"cmd": "stop", "device_id": self._device_id}, timeout_sec=2.0)
             self._state = "idle"
             self._streams = []
+            # 还回去：把 start 时停掉的 peer 服务恢复（回 idle 监听，等下次按需用）。
+            self._start_peers()
             print(f"[camera_rgb] {self._position} stopped", flush=True)
             return {"ok": True, "card": "camera_rgb", "action": "stop",
                     "control_level": "CAMERA", "timestamp_ms": _now_ms(),
@@ -488,6 +507,68 @@ class _CameraRgbInstance:
             except Exception:
                 pass
         self._procs = []
+
+    # ── 同设备 peer 服务让位/归还（go1-pointcloud-<pos> / go1-depth-<pos>）──
+    # Go1 一台物理相机同时只能一个消费者。belly(.15) 只有 video0、常驻 pointcloud/depth 服务，
+    # left/right(.14) 各有 depth 服务。用户要的语义：调 camera_rgb belly 才停 peer 腾相机，
+    # stop 后把 peer 恢复回 idle 监听。用容器内的 sshpass 经 SSH 下 systemctl 命令（容器 --network host）。
+    def _ssh_peers(self, action: str) -> None:
+        if not self._peer_services or not self._peer_host:
+            return
+        try:
+            import subprocess
+        except Exception:
+            return
+        for svc in self._peer_services:
+            cmd = [
+                "sshpass", "-p", self._peer_pw,
+                "ssh", "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null",
+                "-o", "ConnectTimeout=4",
+                f"{self._peer_user}@{self._peer_host}",
+                f"echo {self._peer_pw} | sudo -S systemctl {action} {svc} 2>/dev/null; true",
+            ]
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+                if r.returncode == 0:
+                    print(f"[camera_rgb] peer {action} {svc}@{self._peer_host} ok", flush=True)
+                else:
+                    print(f"[camera_rgb] peer {action} {svc}@{self._peer_host} rc={r.returncode}", flush=True)
+            except Exception as e:
+                print(f"[camera_rgb] peer {action} {svc}@{self._peer_host} err: {e}", flush=True)
+
+    def _stop_peers(self) -> None:
+        if not self._peer_services:
+            return
+        before = list(self._stopped_peers)
+        self._ssh_peers("stop")
+        # 假定 stop 全部成功（无法逐个确认 is-active 时不回退状态），stop 时记录、start 时按此恢复。
+        self._stopped_peers = list(self._peer_services)
+
+    def _start_peers(self) -> None:
+        if not self._stopped_peers:
+            return
+        # 仅恢复本次 start 实际停掉的 peer。
+        saved = list(self._stopped_peers)
+        self._stopped_peers = []
+        try:
+            import subprocess
+            for svc in saved:
+                cmd = [
+                    "sshpass", "-p", self._peer_pw,
+                    "ssh", "-o", "StrictHostKeyChecking=no",
+                    "-o", "UserKnownHostsFile=/dev/null",
+                    "-o", "ConnectTimeout=4",
+                    f"{self._peer_user}@{self._peer_host}",
+                    f"echo {self._peer_pw} | sudo -S systemctl start {svc} 2>/dev/null; true",
+                ]
+                try:
+                    r = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+                    print(f"[camera_rgb] peer start {svc}@{self._peer_host} rc={r.returncode}", flush=True)
+                except Exception as e:
+                    print(f"[camera_rgb] peer start {svc}@{self._peer_host} err: {e}", flush=True)
+        except Exception:
+            pass
 
 
 # ── CameraRgbPlugin (multiInstance sensor) ────────────────────────────────────

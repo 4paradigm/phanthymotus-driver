@@ -37,11 +37,14 @@ if ! $SSH $R 'echo ok' >/dev/null 2>&1; then
 fi
 log "Nano $NANO 可达，开始 provision camera_rgb + beep。"
 
-# ── 1) camera_rgb 端：camera_adapter × 五机位（三块板；SDK/编法/opencv fallback 同 point cloud 自动探测）──
+# ── 1) camera_rgb 端：camera_adapter × 五机位（三块板；build_adapter.sh 自动适配 opencv4 布局）──
 #   每行: position board_ip device_id device_node control_port  （与 Pi 侧 camera_rgb.positions 对齐）
 #   adapter 平时只监听控制口、probe/start 时才开相机（不占相机）→ 可与 pointcloud 服务共存，谁 start 谁抢设备。
-#   .14 若无 opencv/编译失败 → 该板跳过（left/right 暂不可用），不阻塞其它板。calib 尽力用 output_camCalibParams.yaml
-#   （front 匹配→去畸变；其它机位缺 per-device 标定→adapter 降级鱼眼直通，仍出图）。
+#   opencv4：.13/.15 在 /usr/pkg-config；.14 装在 /usr/local（头 + 库 + rpath），build_adapter.sh 已覆盖。
+#   calib 尽力用 output_camCalibParams.yaml（front 匹配→去畸变；其它机位缺 per-device 标定→adapter 降级鱼眼直通，仍出图）。
+#   🔴 front/chin(.13) 若已有别人装的 go1-camera-adapter(-front/-chin).service，本段会先停旧服务
+#      再用新编二进制重装同名服务（避免抢 :9301/:9302）。front 旧服务常在 activating auto-restart，
+#      重装即接管，统一为镜像里的 adapter。如不想动 .13，把 CAM_ROWS 里的 front/chin 两行删掉即可。
 CAM_ROWS=(
   "front 192.168.123.13 1 /dev/video1 9301"
   "chin  192.168.123.13 0 /dev/video0 9302"
@@ -59,13 +62,24 @@ if [ -f "$DEPLOY/camera_adapter/camera_adapter.cpp" ]; then
     case " $CAM_DONE " in
       *" $B "*) : ;;
       *)
-        # 首见该板：① 持久禁出厂相机 autostart（point_cloud_node 独占相机）；② 当次腾设备；③ 编 camera_adapter
+        # 首见该板：① 持久禁出厂相机 autostart（point_cloud_node/example_point 独占相机）；
+        #   .14/.15 的 startNode.sh 探测实况：默认已是注释态（grep 到 camrgb-disabled 标记则跳过）。
+        #   .13 的 startNode.sh 历史上未统一注释 → 这里按 stereo_camera_config*.yaml 行统一注释。
         bssh "$B" 'SN=$HOME/Unitree/autostart/camerarosnode/cameraRosNode/startNode.sh; [ -f "$SN" ] && ! grep -q "camrgb-disabled" "$SN" && { cp "$SN" "$SN.bak-camrgb"; sed -i "/stereo_camera_config.*\.yaml/ s/^\([^#]\)/#camrgb-disabled \1/" "$SN"; echo autostart_disabled; }' 2>/dev/null
-        bssh "$B" "echo $PW | sudo -S pkill -TERM -f point_cloud_node 2>/dev/null; echo $PW | sudo -S pkill -TERM -f example_putImagetrans 2>/dev/null; true" 2>/dev/null
+        # 当次腾设备：杀掉正在独占 /dev/videoN 的出厂 autostart 进程 point_cloud_node / example_putImagetrans /
+        # example_point（graceful SIGTERM，不用 -9 避免 V4L2 卡死）。.14/.15 的 startNode.sh 默认已注释，通常无人占用。
+        bssh "$B" "echo $PW | sudo -S pkill -TERM -f point_cloud_node 2>/dev/null; echo $PW | sudo -S pkill -TERM -f example_putImagetrans 2>/dev/null; echo $PW | sudo -S pkill -TERM -f example_point 2>/dev/null; true" 2>/dev/null
+        # 🔴 同设备互斥的 go1-pointcloud-* / go1-depth-* 服务**不在 bootstrap 静态停/禁用**：
+        #   它们和 camera_adapter 一样是 idle 监听者（连上才开相机），平时不占 /dev/videoN，可共存。
+        #   真正的互斥在**调用时**由 Pi 侧 camera_rgb.py 处理：start belly/left/right 前 SSH `systemctl stop`
+        #   对应 peer 服务腾相机，stop 后再 `systemctl start` 恢复（见 config.yaml 的 peer_services）。
         log "camera: 在 $B 编 camera_adapter(SDK=$SDK)…"
-        bssh "$B" "rm -f $SDK/bins/camera_adapter" 2>/dev/null
-        bscp "$B" "$DEPLOY/camera_adapter/camera_adapter.cpp" "/tmp/camera_adapter.cpp" 2>/dev/null
-        bssh "$B" "mkdir -p $SDK/bins; OCV=\$(pkg-config --cflags --libs opencv4 2>/dev/null); [ -z \"\$OCV\" ] && OCV=\$(pkg-config --cflags --libs opencv 2>/dev/null); [ -z \"\$OCV\" ] && OCV=\"-I/usr/include/opencv4 -I/usr/local/include/opencv4 -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lopencv_calib3d\"; g++ -O2 -std=c++14 -pthread /tmp/camera_adapter.cpp -I$SDK/include -I$SDK/thirdparty -L$SDK/lib/arm64 -Wl,--start-group -lunitree_camera -ltstc_V4L2_xu_camera -lsystemlog -ludev -Wl,--end-group \$OCV -o $SDK/bins/camera_adapter 2>&1 | tail -4" 2>&1 | tail -4
+        # 用本机改好的 build_adapter.sh 编（它已处理三块板 opencv4 布局：.13/.15 pkg-config、.14 /usr/local）。
+        # 比 nano_bootstrap 内联 g++ 命令更稳：.14 的 opencv4 在 /usr/local，无 pkg-config，须 -I/-L + rpath。
+        bssh "$B" "rm -f $SDK/bins/camera_adapter; rm -rf /tmp/camrgb-build; mkdir -p /tmp/camrgb-build $SDK/bins" 2>/dev/null
+        bscp "$B" "$DEPLOY/camera_adapter/camera_adapter.cpp" "/tmp/camrgb-build/camera_adapter.cpp" 2>/dev/null
+        bscp "$B" "$DEPLOY/camera_adapter/build_adapter.sh"  "/tmp/camrgb-build/build_adapter.sh" 2>/dev/null
+        bssh "$B" "cd /tmp/camrgb-build && UNITREE_CAMERA_SDK=$SDK OUT=$SDK/bins/camera_adapter bash build_adapter.sh 2>&1 | tail -8" 2>&1 | tail -8
         CAM_DONE="$CAM_DONE $B"
         ;;
     esac
@@ -77,6 +91,13 @@ if [ -f "$DEPLOY/camera_adapter/camera_adapter.cpp" ]; then
     CAL="$SDK/calib_$POS.yaml"
     bssh "$B" "[ -f $SDK/output_camCalibParams.yaml ] && cp -f $SDK/output_camCalibParams.yaml $CAL 2>/dev/null; true" 2>/dev/null
     SVC="go1-camera-adapter-$POS"
+    # 若该机位已有同名/兼容旧服务在跑（如 .13 别人装的 go1-camera-adapter-front.service），先停掉
+    # 再用新编二进制重装，避免 ExecStart 路径不同 + 抢 :$CTRL 端口。旧服务名 go1-camera-adapter（无 -front）
+    # 也一并停（front 历史服务名）。
+    case "$POS" in
+      front) bssh "$B" "echo $PW | sudo -S systemctl stop go1-camera-adapter.service go1-camera-adapter-front.service 2>/dev/null; echo $PW | sudo -S systemctl disable go1-camera-adapter.service 2>/dev/null; true" 2>/dev/null ;;
+      *)     bssh "$B" "echo $PW | sudo -S systemctl stop $SVC.service 2>/dev/null; true" 2>/dev/null ;;
+    esac
     bssh "$B" "cat > /tmp/$SVC.service <<EOF
 [Unit]
 Description=Go1 camera_adapter $POS (dev$DEVID $NODE :$CTRL)
@@ -131,17 +152,26 @@ fi
 # ── 3) 持久禁用抢设备的 autostart（belt-and-suspenders；adapter 也能每次调用自愈腾设备）──
 # 音频：.startlist.sh 里注释 wsaudio（抢 USB 扬声器 → beep 打不开设备）。
 $SSH $R 'SL=$HOME/Unitree/autostart/.startlist.sh; [ -f "$SL" ] && grep -qE "^wsaudio" "$SL" && { cp "$SL" "$SL.bak-bootstrap"; sed -i "s/^wsaudio/#wsaudio/" "$SL"; echo wsaudio_disabled; }' 2>/dev/null
-# 相机 front：startNode.sh 里注释引用 stereo_camera_config1.yaml 的 rosrun（占 /dev/video1）。
-$SSH $R 'CN=$HOME/Unitree/autostart/camerarosnode/cameraRosNode/startNode.sh; [ -f "$CN" ] && ! grep -q "camera_rgb-disabled" "$CN" && { cp "$CN" "$CN.bak-bootstrap"; sed -i "/stereo_camera_config1.yaml/ s/^\\([^#]\\)/#camera_rgb-disabled \\1/" "$CN"; echo front_autostart_disabled; }' 2>/dev/null
+# 相机 autostart：三块板逐个注释 startNode.sh 里引用 stereo_camera_config*.yaml 的 rosrun（独占 /dev/videoN）。
+#   .13/.14/.15 的 startNode.sh 同一段脚本，单独注释其正则行（已带 camrgb-disabled 标记则跳过，幂等）。
+#   仅连 .13(R) 不够 → 这里对三块板各自 bssh 一遍，确保 left/right/belly 所在 .14/.15 也被持久放开。
+for B in 192.168.123.13 192.168.123.14 192.168.123.15; do
+  bssh "$B" 'CN=$HOME/Unitree/autostart/camerarosnode/cameraRosNode/startNode.sh; [ -f "$CN" ] && ! grep -q "camera_rgb-disabled" "$CN" && { cp "$CN" "$CN.bak-bootstrap"; sed -i "/stereo_camera_config.*\.yaml/ s/^\\([^#]\\)/#camera_rgb-disabled \\1/" "$CN"; echo front_autostart_disabled@$B; }' 2>/dev/null
+done
 
 # ── 4) 当次立刻腾设备（graceful，不用 -9）：让首次调用无需等下次重启 ─────────────────────
-$SSH $R 'echo '"$PW"' | sudo -S pkill -TERM -f example_putImagetrans 2>/dev/null; echo '"$PW"' | sudo -S pkill -TERM -f point_cloud_node 2>/dev/null; pkill -TERM -f wsaudio 2>/dev/null; true' 2>/dev/null
+# 三块板逐个腾（仅 .13 的 $R 不够）：杀 point_cloud_node / example_putImagetrans / example_point。
+for B in 192.168.123.13 192.168.123.14 192.168.123.15; do
+  bssh "$B" "echo $PW | sudo -S pkill -TERM -f example_putImagetrans 2>/dev/null; echo $PW | sudo -S pkill -TERM -f point_cloud_node 2>/dev/null; echo $PW | sudo -S pkill -TERM -f example_point 2>/dev/null; pkill -TERM -f wsaudio 2>/dev/null; true" 2>/dev/null
+done
 
 # ── 5) point cloud 端:pointcloud_stream(每路一个常驻服务;连上才开相机 → 免重启热切)──────
-#   各板 SDK 路径不同(.13/.14=~/UnitreecameraSDK,.15=~/Unitree/sdk/UnitreeCameraSdk)→ 自动探测。
-#   用 raw g++ 编译(镜像 camera_adapter 的编法,已在 .13 验证),产物落 $SDK/bins/pointcloud_stream。
-#   pointcloud_stream 按 device_id 开相机(不依赖 per-device config)。每路装一个 systemd 服务(空闲不占相机)。
-#   板不就绪(不可达/无 SDK)则跳过,不阻塞主进程,也不影响已工作的 depth/RGB。
+#   各板 SDK 路径不同(.13=~/UnitreecameraSDK,.14/.15=~/Unitree/sdk/UnitreeCameraSdk)→ 自动探测。
+#   ⚠ 与 camera_rgb 同设备互斥:同一机位的 pointcloud 服务和 camera_adapter 不能同时开相机,
+#   谁先 start 谁占设备(另一路 fuser 抢)。要 15678 五路 RGB 都出图,本段默认**不启用**
+#   pointcloud 服务(CAM 之外的点云由 test_camera_pointcloud 卡按需起,不靠这里常驻)。
+#   保留代码但用 ${PCL_ENABLE:-0} 开关;除非显式 PCL_ENABLE=1 否则跳过,避免和 belly(.15 dev0)等撞设备。
+PCL_ENABLE="${PCL_ENABLE:-0}"
 # 每行: position board_ip device_id port  (与 Pi 侧 test_camera_pointcloud.positions 对齐)
 PCL_ROWS=(
   "front 192.168.123.13 1 9401"
@@ -155,7 +185,7 @@ bscp(){ sshpass -p "$PW" scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/
 # 板上探测 SDK 目录(含 include/UnitreeCameraSDK.hpp 的第一个候选);单引号 → $HOME 在板上求值。
 PCL_DETECT='for d in $HOME/UnitreecameraSDK $HOME/Unitree/sdk/UnitreeCameraSdk $HOME/UnitreeCameraSDK; do [ -f "$d/include/UnitreeCameraSDK.hpp" ] && echo "$d" && break; done'
 
-if [ -f "$DEPLOY/camera/pointcloud_stream.cc" ]; then
+if [ "${PCL_ENABLE}" = "1" ] && [ -f "$DEPLOY/camera/pointcloud_stream.cc" ]; then
   PCL_DONE=""   # 本次已重编过的板(每板只编一次,但强制重编以匹配当前 .cc + 服务参数)
   for row in "${PCL_ROWS[@]}"; do
     set -- $row; POS="$1"; B="$2"; DEVID="$3"; PORT="$4"
@@ -203,15 +233,22 @@ EOF" 2>/dev/null
     log "point cloud: $POS@$B → 服务 $SVC 已装/重启(dev$DEVID, 端口 $PORT, SDK $SDK)。"
   done
 else
-  log "✗ /deploy/camera/pointcloud_stream.cc 不存在(Dockerfile 应 COPY camera/)→ point cloud 端跳过。"
+  if [ "${PCL_ENABLE}" != "1" ]; then
+    log "point cloud: PCL_ENABLE!=1 → 跳过(默认不与 camera_rgb 抢设备;按需 PCL_ENABLE=1 启用)。"
+  elif [ ! -f "$DEPLOY/camera/pointcloud_stream.cc" ]; then
+    log "✗ /deploy/camera/pointcloud_stream.cc 不存在(Dockerfile 应 COPY camera/)→ point cloud 端跳过。"
+  fi
 fi
 
 # ── 7) depth 端:depth_stream(5 路机位;连上才开相机、断开即释放 → 不常占)────────────────────
 #   与 pointcloud 同套路:每路一个常驻服务(空闲不占相机);自动探测 SDK 路径 + raw g++ 编译。
 #   depth_stream 按 device_id 现场生成 config 开相机(加载立体标定,同 pointcloud);Pi 侧 test_camera_depth 卡 start 才连、stop 就断。
-#   与点云指向同一相机 → 二者互斥(谁连上谁 fuser 顶掉对方),属预期。
+#   与点云/RGB 指向同一相机 → 三者互斥(谁连上谁 fuser 顶掉对方),属预期。
+#   ⚠ 与 camera_rgb 抢同一设备 → 默认**不启用**(DEPTH_ENABLE 默认 0),除非显式要常驻深度,
+#     否则交给 test_camera_depth 卡按需起,避免和 belly(.15 dev0)/left/right 等抢相机。
 #   端口 91xx 与点云 94xx / RGB 92xx-93xx 错开。每行: position board_ip device_id port
 #   (与 config.yaml test_camera_depth.positions 及 Pi 侧 depth_port 对齐)
+DEPTH_ENABLE="${DEPTH_ENABLE:-0}"
 DEPTH_ROWS=(
   "front 192.168.123.13 1 9101"
   "chin  192.168.123.13 0 9102"
@@ -220,7 +257,7 @@ DEPTH_ROWS=(
   "belly 192.168.123.15 0 9105"
 )
 DEPTH_DONE=""
-if [ -f "$DEPLOY/camera/depth_stream.cc" ]; then
+if [ "${DEPTH_ENABLE}" = "1" ] && [ -f "$DEPLOY/camera/depth_stream.cc" ]; then
   for row in "${DEPTH_ROWS[@]}"; do
     set -- $row; POS="$1"; B="$2"; DEVID="$3"; PORT="$4"
     if ! bssh "$B" 'echo ok' >/dev/null 2>&1; then log "depth: 板 $B 不可达 → 跳过 $POS"; continue; fi
@@ -262,7 +299,11 @@ EOF" 2>/dev/null
     log "depth: $POS@$B → 服务 $SVC 已装/重启(dev$DEVID, 端口 $PORT, SDK $SDK)。"
   done
 else
-  log "✗ /deploy/camera/depth_stream.cc 不存在(Dockerfile 应 COPY camera/)→ depth 端跳过。"
+  if [ "${DEPTH_ENABLE}" != "1" ]; then
+    log "depth: DEPTH_ENABLE!=1 → 跳过(默认不与 camera_rgb 抢设备;按需 DEPTH_ENABLE=1 启用)。"
+  elif [ ! -f "$DEPLOY/camera/depth_stream.cc" ]; then
+    log "✗ /deploy/camera/depth_stream.cc 不存在(Dockerfile 应 COPY camera/)→ depth 端跳过。"
+  fi
 fi
 
 log "=== provision 完成 ==="

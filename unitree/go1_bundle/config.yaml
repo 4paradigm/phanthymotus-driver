@@ -103,13 +103,18 @@ plugins:
     default_frame_size: "928x400"   # 官方支持：1856x800@30 或 928x400@30/60
     default_fps: 30                 # 多路默认 30（省 CPU/带宽）；单路想高帧率改 60。start 时下发给 adapter 重开相机
     # 五机位→板卡映射。control_port 约定 = image_port+100，须与 nano_bootstrap 装的 camera_adapter 服务参数一致。
-    # 注意：left/right 所在 .14 无 opencv4，adapter 可能编不出→该两路暂不可用（见 nano_bootstrap 日志）。
+    # 五路 camera_adapter 由 nano_bootstrap.sh 首启时自动在 .13/.14/.15 编译+装 systemd：
+    #   front/chin=.13；left/right=.14（opencv4 在 /usr/local，build_adapter.sh 已适配）；belly=.15。
+    # ★ peer_services：同一物理相机同时只能一个消费者。belly(.15) 只有 video0，常驻着 pointcloud/depth
+    #   服务；left/right(.14) 各有 depth 服务。camera_rgb start 该机位前会 SSH `systemctl stop` 这些 peer 腾相机，
+    #   stop 后再 `systemctl start` 恢复（回 idle 监听，不抢设备）→ 调哪路让哪路的位、不用就还回去。
+    #   front/chin(.13) 无常驻 peer，不配。SSH 用容器内 sshpass（容器须 --network host；NANO_SSH_PW 默认 123）。
     positions:
       front: {board_ip: "192.168.123.13", device_id: 1, image_port: 9201, control_port: 9301}
       chin:  {board_ip: "192.168.123.13", device_id: 0, image_port: 9202, control_port: 9302}
-      left:  {board_ip: "192.168.123.14", device_id: 0, image_port: 9203, control_port: 9303}
-      right: {board_ip: "192.168.123.14", device_id: 1, image_port: 9204, control_port: 9304}
-      belly: {board_ip: "192.168.123.15", device_id: 0, image_port: 9205, control_port: 9305}
+      left:  {board_ip: "192.168.123.14", device_id: 0, image_port: 9203, control_port: 9303, peer_services: ["go1-depth-left"]}
+      right: {board_ip: "192.168.123.14", device_id: 1, image_port: 9204, control_port: 9304, peer_services: ["go1-depth-right"]}
+      belly: {board_ip: "192.168.123.15", device_id: 0, image_port: 9205, control_port: 9305, peer_services: ["go1-pointcloud-belly", "go1-depth-belly"]}
 
   spin:                         # 原地转圈（闭环读 IMU yaw 转够自停）
     enabled: true
