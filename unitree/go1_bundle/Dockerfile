@@ -20,7 +20,8 @@ RUN find /etc/apt \( -name '*.list' -o -name '*.sources' \) -exec sed -i "s|mirr
     rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /work/requirements.txt
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r /work/requirements.txt
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r /work/requirements.txt && \
+    pip3 install --no-cache-dir -i ${PYPI_MIRROR} Pillow
 
 # ── unitree_legged_sdk (Go1 EDU) → robot_interface*.so ──────────────────────────
 #   1) 根 CMakeLists 里 PYTHON_BUILD 默认 OFF → 必须 -DPYTHON_BUILD=ON 才编 python wrapper；

@@ -3,7 +3,12 @@ test_camera_pointcloud.py — Go1 双目点云推流卡(sensor,可选机位·mul
 
 点云在对应 Nano 板用 UnitreeCameraSDK 的 getPointCloud 算出,由该板常驻的 pointcloud_stream(C++)
 按 device_id 开相机、循环出帧并 TCP 推送。本卡在 go1_bundle 容器(py3.10+rclpy)充当 ROS2 桥:
-连选定机位的 board_ip:port 收帧 → 组 sensor_msgs/PointCloud2 → 发布到实例专属 topic。
+连选定机位的 board_ip:port 收帧 → 同时发布两个 topic:
+  · /{ns}/camera/{iid}/pointcloud  (sensor_msgs/PointCloud2) — 原始点云,供 agent-core 空间计算
+  · /{ns}/camera/{iid}/pointcloud/preview (image/jpeg)       — XZ 平面俯视投影伪彩色图,供画布渲染
+
+俯视投影说明:将相机坐标系(x=右,y=下,z=前)的所有点投影到 XZ 水平面,z 值(前向距离)映射为
+  jet 伪彩色(蓝=近,红=远)。效果类似从正上方俯视看机器人前方地形/障碍分布。
 
 ★ 画布两层设置(对齐 dji camera_stream):
   · 公共(拖入前):config.yaml 的 default_position —— 驱动级默认机位。
@@ -20,15 +25,24 @@ test_camera_pointcloud.py — Go1 双目点云推流卡(sensor,可选机位·mul
 
 from __future__ import annotations
 
+import io
 import socket
 import struct
 import threading
 import time
 
+import numpy as np
+
+try:
+    from PIL import Image as _PILImage
+    _HAS_PIL = True
+except ImportError:
+    _HAS_PIL = False
+
 try:
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-    from sensor_msgs.msg import PointCloud2, PointField
+    from sensor_msgs.msg import PointCloud2, PointField, CompressedImage
     _HAS_ROS2 = True
     _QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                       history=HistoryPolicy.KEEP_LAST, depth=1,
@@ -38,7 +52,44 @@ except Exception:
 
 CARD = "test_camera_pointcloud"
 TYPE = "sensor"
-FMT = "sensor_msgs/PointCloud2"
+FMT_PCL = "sensor_msgs/PointCloud2"
+FMT_JPEG = "image/jpeg"
+
+# 俯视投影图分辨率和视野范围(米)
+_IMG_W = 480
+_IMG_H = 480
+_X_RANGE = 4.0   # 左右各 2m
+_Z_RANGE = 6.0   # 前方 0~6m
+
+
+def _jet_colormap(t: np.ndarray) -> np.ndarray:
+    """t: [0,1] float array → RGB uint8, jet 伪彩色(蓝=近/0, 红=远/1)。"""
+    r = np.clip(1.5 - np.abs(4 * t - 3), 0, 1)
+    g = np.clip(1.5 - np.abs(4 * t - 2), 0, 1)
+    b = np.clip(1.5 - np.abs(4 * t - 1), 0, 1)
+    return (np.stack([r, g, b], axis=-1) * 255).astype(np.uint8)
+
+
+def _pcl_to_jpeg(xyz_blob: bytes, num_points: int) -> bytes | None:
+    """XYZ 点云(相机系 float32 小端) → 俯视伪彩色 JPEG bytes。无 PIL 时返回 None。"""
+    if not _HAS_PIL or num_points == 0:
+        return None
+    pts = np.frombuffer(xyz_blob, dtype="<f4").reshape(num_points, 3)
+    x, z = pts[:, 0], pts[:, 2]
+    mask = (np.isfinite(x) & np.isfinite(z)
+            & (z > 0.1) & (z < _Z_RANGE)
+            & (np.abs(x) < _X_RANGE / 2))
+    x, z = x[mask], z[mask]
+
+    img = np.zeros((_IMG_H, _IMG_W, 3), dtype=np.uint8)
+    if x.size > 0:
+        px = np.clip(((x + _X_RANGE / 2) / _X_RANGE * (_IMG_W - 1)).astype(np.int32), 0, _IMG_W - 1)
+        py = np.clip(((1.0 - z / _Z_RANGE) * (_IMG_H - 1)).astype(np.int32), 0, _IMG_H - 1)
+        img[py, px] = _jet_colormap(np.clip(z / _Z_RANGE, 0, 1))
+
+    buf = io.BytesIO()
+    _PILImage.fromarray(img).save(buf, format="JPEG", quality=75)
+    return buf.getvalue()
 
 # 机位 → 板卡 IP / 点云端口(与 nano_bootstrap.sh PCL_ROWS 对齐;device_id 在 Nano 侧服务里定)。
 # 端口 94xx 与深度 9101、RGB 图传 92xx、RGB 控制 93xx 全部错开。config.positions 可覆盖 board_ip/pcl_port。
@@ -70,12 +121,14 @@ def _recvall(sock, n):
 
 
 class _PclStream:
-    """单实例点云桥:连某机位 board_ip:port 收帧 → 发布 PointCloud2 到实例专属 topic。"""
+    """单实例点云桥:连某机位 board_ip:port 收帧 → 同时发布 PointCloud2 和俯视预览 JPEG。"""
 
-    def __init__(self, node: "Node", topic: str):
+    def __init__(self, node: "Node", topic_pcl: str, topic_preview: str):
         self._node = node
-        self._topic = topic
-        self._pub = node.create_publisher(PointCloud2, topic, _QOS)
+        self._topic_pcl = topic_pcl
+        self._topic_preview = topic_preview
+        self._pub_pcl = node.create_publisher(PointCloud2, topic_pcl, _QOS)
+        self._pub_preview = node.create_publisher(CompressedImage, topic_preview, _QOS) if _HAS_PIL else None
         self._run = False
         self._gen = 0
         self.connected = False
@@ -97,7 +150,7 @@ class _PclStream:
         self._gen += 1
         self.connected = False
 
-    def _make_msg(self, num_points: int, xyz_blob: bytes):
+    def _make_pcl_msg(self, num_points: int, xyz_blob: bytes):
         msg = PointCloud2()
         msg.header.stamp = self._node.get_clock().now().to_msg()
         msg.header.frame_id = f"go1_{self.position}"
@@ -141,7 +194,15 @@ class _PclStream:
                     xyz_blob = payload[4:]
                     if len(xyz_blob) != num_points * 12:
                         continue
-                    self._pub.publish(self._make_msg(num_points, xyz_blob))
+                    self._pub_pcl.publish(self._make_pcl_msg(num_points, xyz_blob))
+                    jpeg = _pcl_to_jpeg(xyz_blob, num_points)
+                    if jpeg is not None and self._pub_preview is not None:
+                        preview_msg = CompressedImage()
+                        preview_msg.header.stamp = self._node.get_clock().now().to_msg()
+                        preview_msg.header.frame_id = f"go1_{self.position}_pcl_preview"
+                        preview_msg.format = "jpeg"
+                        preview_msg.data = jpeg
+                        self._pub_preview.publish(preview_msg)
                     self.frames += 1
                     self.last_points = num_points
             except Exception as e:  # noqa: BLE001
@@ -177,9 +238,13 @@ class Plugin:
                 print(f"[{CARD}] ROS2 不可用: {e}", flush=True)
                 self._node = None
 
-    def _topic(self, iid: str) -> str:
+    def _topic_pcl(self, iid: str) -> str:
         safe = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in iid)
         return f"/{self._ns}/camera/{safe}/pointcloud"
+
+    def _topic_preview(self, iid: str) -> str:
+        safe = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in iid)
+        return f"/{self._ns}/camera/{safe}/pointcloud/preview"
 
     def _resolve_pos(self, iid: str, args: dict) -> str:
         cfg = args.get("config") or {}
@@ -189,7 +254,7 @@ class Plugin:
     def _stream_for(self, iid: str) -> "_PclStream":
         st = self._streams.get(iid)
         if st is None:
-            st = _PclStream(self._node, self._topic(iid))
+            st = _PclStream(self._node, self._topic_pcl(iid), self._topic_preview(iid))
             self._streams[iid] = st
         return st
 
@@ -213,13 +278,15 @@ class Plugin:
         st = self._stream_for(iid)
         st.stop()
         st.start(position, p["board_ip"], int(p["pcl_port"]))
-        return {"state": "running", "position": position,
-                "topic_out": [{"topic": self._topic(iid), "format": FMT}]}
+        topic_out = [{"topic": self._topic_pcl(iid), "format": FMT_PCL}]
+        if _HAS_PIL:
+            topic_out.append({"topic": self._topic_preview(iid), "format": FMT_JPEG})
+        return {"state": "running", "position": position, "topic_out": topic_out}
 
     def get_tool(self):
         return {
             "name": CARD, "type": TYPE, "multiInstance": True,
-            "description": DESC + (" — ROS2 PointCloud2" if self._node else " — no rclpy, poll via MCP"),
+            "description": DESC + (" — ROS2 PointCloud2 + JPEG preview" if self._node else " — no rclpy, poll via MCP"),
             "configSchema": {
                 "type": "object",
                 "properties": {
@@ -236,6 +303,7 @@ class Plugin:
                 "properties": {"action": {"type": "string", "enum": ["start", "stop", "info"]}},
                 "required": ["action"],
             },
+            "topic_out": [],
         }
 
     def dispatch(self, action, args):
@@ -276,7 +344,9 @@ class Plugin:
                              "last_frame_points": st.last_points if st else 0,
                              "note": ("hot-switch via config.position; one at a time (stereo heavy); "
                                       "needs that position's pointcloud_stream service running")},
-                    "topic_out": ([{"topic": self._topic(iid), "format": FMT}] if self._node else [])}
+                    "topic_out": ([{"topic": self._topic_pcl(iid), "format": FMT_PCL},
+                                   {"topic": self._topic_preview(iid), "format": FMT_JPEG}]
+                                  if self._node else [])}
         return None
 
 
