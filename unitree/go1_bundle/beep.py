@@ -133,24 +133,24 @@ class Plugin:
     # ── 插件契约 ───────────────────────────────────────────────────────────
     def get_tool(self):
         return {"name": CARD, "type": "actuator", "multiInstance": False,
-          "description": "Go1 head speaker beep — play a beep tone and control volume (action card, no topics)",
+          "description": "Go1 头部扬声器蜂鸣控制：播放蜂鸣音、调节音量",
           "inputSchema": {"type": "object",
             "properties": {
               "action": {"type": "string", "enum": ["beep", "set_volume", "get_volume"],
-                         "description": "Beep action to perform"},
+                         "description": "要执行的蜂鸣操作"},
               "request_id": {"type": "string"},
               "duration_sec": {"type": "number", "minimum": 0.1, "maximum": 10,
-                               "description": "Beep length in seconds (0.1–10)"},
+                               "description": "蜂鸣时长（秒，0.1–10）"},
               "frequency_hz": {"type": "number", "minimum": 100, "maximum": 8000,
-                               "description": "Beep tone frequency in Hz (100–8000, default 1000)"},
+                               "description": "蜂鸣频率（Hz，100–8000，默认 1000）"},
               "volume_percent": {"type": "integer", "minimum": 0, "maximum": 100,
-                                 "description": "Volume 0–100% (set_volume)"}},
+                                 "description": "音量百分比 0–100（set_volume 用）"}},
             "required": ["action"],
             "x-action-params": {
               "beep":       {"params": ["duration_sec", "frequency_hz"],
-                             "description": "Play a beep tone of the given length (seconds) and frequency"},
-              "set_volume": {"params": ["volume_percent"], "description": "Set speaker volume 0–100%"},
-              "get_volume": {"params": [], "description": "Read current speaker volume"}}}}
+                             "description": "播放指定时长和频率的蜂鸣音"},
+              "set_volume": {"params": ["volume_percent"], "description": "设置扬声器音量 0–100%"},
+              "get_volume": {"params": [], "description": "读取当前扬声器音量"}}}}
 
     def start(self):
         pass

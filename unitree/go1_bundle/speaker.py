@@ -238,22 +238,20 @@ class Plugin:
         # 播放不做成按钮：开启智能控制(project start)时平台会对本卡调 action=start(带连线解析出的 input_topic)
         #   → dispatch 映射到开播；停止智能控制调 stop → 停播。用户卡片按钮只保留音量(set/get_volume)。
         return {"name": CARD, "type": "actuator", "multiInstance": False,
-          "description": ("Go1 head speaker — plays the operator's remote microphone stream "
-                          "(audio/pcm-16k from remote_mic) on the on-board speaker. Wire remote_mic → "
-                          "this card and start the project; it plays until the project stops. No output topics."),
+          "description": "Go1 头部扬声器：播放操作员远程麦克风音频流",
           "topic_in": [{"format": "audio/pcm-16k"}],
           "inputSchema": {"type": "object",
             "properties": {
               "action": {"type": "string",
                          "enum": ["set_volume", "get_volume"],
-                         "description": "Speaker action to perform"},
+                         "description": "要执行的扬声器操作"},
               "request_id": {"type": "string"},
               "volume_percent": {"type": "integer", "minimum": 0, "maximum": 100,
-                                 "description": "Volume 0–100% (set_volume)"}},
+                                 "description": "音量百分比 0–100（set_volume 用）"}},
             "required": ["action"],
             "x-action-params": {
-              "set_volume": {"params": ["volume_percent"], "description": "Set speaker volume 0–100%"},
-              "get_volume": {"params": [], "description": "Read current speaker volume"}}}}
+              "set_volume": {"params": ["volume_percent"], "description": "设置扬声器音量 0–100%"},
+              "get_volume": {"params": [], "description": "读取当前扬声器音量"}}}}
 
     def start(self):
         pass   # 由用户在 15678 点 play 开播；不自动订阅播放（订阅已在 __init__ 建好，此处不动）。

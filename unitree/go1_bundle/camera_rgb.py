@@ -68,11 +68,7 @@ _POS_TITLE = {"front": "Front (头部前 dev1)", "chin": "Chin (头部下 dev0)"
               "left": "Left (侧左 dev0)", "right": "Right (侧右 dev1)", "belly": "Belly (腹部 dev0)"}
 _VALID_POSITIONS = list(_DEFAULT_POSITIONS.keys())
 
-DESC = ("Go1 RGB cameras via on-board UnitreecameraSDK rgb_stream (rectified, de-warped, flip-corrected) → "
-        "JPEG @ ~20-30Hz. multiInstance, pick `position` per card. start → connect & stream to "
-        "/{ns}/vision/{position}/mono; stop → disconnect & release the camera. Change the position "
-        "dropdown to hot-switch source (~3-4s to first frame). One position at a time per camera "
-        "(shares each camera with depth/point cloud — mutually exclusive).")
+DESC = "Go1 五机位 RGB 相机：去畸变矫正推流，可热切机位，与深度/点云互斥"
 
 
 def _err(code: str, message: str, **extra) -> dict:
@@ -274,7 +270,7 @@ class CameraRgbPlugin:
             "inputSchema": {
                 "type": "object",
                 "properties": {"action": {"type": "string", "enum": ["info", "start", "stop"],
-                                          "description": "start=连并推流 / stop=断开并释放相机 / info=查状态"}},
+                                          "description": "start=连接并推流 / stop=断开并释放相机 / info=查询状态"}},
                 "required": ["action"],
             },
             "topic_out": [],
