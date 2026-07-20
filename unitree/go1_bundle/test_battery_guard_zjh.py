@@ -395,7 +395,7 @@ class Plugin:
                                 "charging": bool(self._last.get("charging"))},
                     "fresh": bool(self._last.get("fresh", False)),
                     "events": self._events, "last_event": self._last_event,
-                    "topic_out": ([self._topic] if self._node else []),
+                    "topic_out": ([{"topic": self._topic, "format": FMT}] if self._node else []),
                     "note": "SOC＞50常亮绿灯；20%以下红灯闪烁报警；充电/无数据强制灭灯；SDK无蜂鸣器，灯效+ROS话题双通道提示；"
                             "灯是否真亮先用 action=test 验证",
                     "timestamp_ms": now}
