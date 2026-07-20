@@ -47,7 +47,7 @@ class Plugin:
             print("[face_light] paho-mqtt 未安装,灯带不可用(模拟)", flush=True)
             return
         try:
-            self._client = mqtt.Client()
+            self._client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
             self._client.connect(self._host, self._port, 60)
             self._client.loop_start()
             print(f"[face_light] MQTT 已连接 → {self._host}:{self._port}", flush=True)
@@ -87,11 +87,13 @@ class Plugin:
                 },
                 "required": ["action"],
                 "x-action-params": {
+
                     "set_color": {"params": ["r", "g", "b"], "description": "Set RGB (0-255 each)"},
                     "preset": {"params": ["name"], "description": "Preset color by name"},
                     "off": {"params": [], "description": "Turn light off"},
                 },
             },
+            "topic_out": [],
         }
 
     def dispatch(self, action, args):
