@@ -61,6 +61,7 @@ COPY face_light.py     /work/face_light.py
 COPY test_light_effect.py /work/test_light_effect.py
 COPY system_health.py  /work/system_health.py
 COPY test_camera_depth.py /work/test_camera_depth.py
+COPY test_camera_depth_li.py /work/test_camera_depth_li.py
 COPY test_camera_pointcloud.py /work/test_camera_pointcloud.py
 COPY test_activity.py  /work/test_activity.py
 COPY speaker.py        /work/speaker.py
