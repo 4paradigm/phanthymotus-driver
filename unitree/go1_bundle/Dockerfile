@@ -75,9 +75,6 @@ COPY camera_adapter/   /deploy/camera_adapter/
 COPY camera/           /deploy/camera/
 # ★ 新增卡：加一行 `COPY <卡名>.py /work/<卡名>.py`（main.py 会按 config 里的卡名自动 import）。
 COPY special_motion.py /work/special_motion.py
-COPY loco_state_zjh.py         /work/loco_state_zjh.py
-COPY test_battery_guard_zjh.py /work/test_battery_guard_zjh.py
-COPY test_contact_check_zjh.py /work/test_contact_check_zjh.py
 
 ENV ROS_DOMAIN_ID=42
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
