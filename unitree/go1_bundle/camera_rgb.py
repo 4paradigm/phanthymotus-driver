@@ -276,7 +276,8 @@ class CameraRgbPlugin:
                                           "description": "start=连接并推流 / stop=断开并释放相机 / info=查询状态 / capture=抓取当前帧图像"}},
                 "required": ["action"],
             },
-            "topic_out": [],
+            "topic_out": ([{"topic": f"/{self._ns}/vision/{self._default_pos}/mono",
+                           "format": FMT}] if self._node else []),
         }]
 
     def dispatch(self, action, args) -> dict | None:
