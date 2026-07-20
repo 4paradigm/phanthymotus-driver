@@ -218,6 +218,7 @@ class Plugin:
                                           "description": "start=连并推流 / stop=断开并释放相机 / info=查状态"}},
                 "required": ["action"],
             },
+            "topic_out": [],
         }
 
     def dispatch(self, action, args):
