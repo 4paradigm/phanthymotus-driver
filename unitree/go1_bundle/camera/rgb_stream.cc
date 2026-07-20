@@ -33,8 +33,13 @@
  *   g++ -O2 -std=c++14 -pthread rgb_stream.cc -I$SDK/include -I$SDK/thirdparty -L$SDK/lib/arm64 \
  *     -Wl,--start-group -lunitree_camera -ltstc_V4L2_xu_camera -lsystemlog -ludev -Wl,--end-group \
  *     $(pkg-config --cflags --libs opencv4) -o bins/rgb_stream
- * 用法:rgb_stream <port> <device_id>
- *   例:./bins/rgb_stream 9203 0     # left(.14 dev0),端口 9203
+ *   若 Nano 上有 Jetson Multimedia API(JetPack 自带),nano_bootstrap 自动追加:
+ *     -DUSE_NVJPEG -I/usr/src/jetson_multimedia_api/include \
+ *     /usr/src/.../NvJpegEncoder.cpp /usr/src/.../NvElement.cpp /usr/src/.../NvLogging.cpp \
+ *     -L/usr/lib/aarch64-linux-gnu/tegra -lnvjpeg -Wl,-rpath,/usr/lib/aarch64-linux-gnu/tegra
+ * 用法:rgb_stream <port> <device_id> [target_fps]
+ *   例:./bins/rgb_stream 9203 0        # left(.14 dev0),端口 9203,默认30fps
+ *       ./bins/rgb_stream 9201 1 20    # front(.13 dev1),20fps
  */
 #include <UnitreeCameraSDK.hpp>
 #include <opencv2/opencv.hpp>
@@ -50,6 +55,15 @@
 #include <string>
 #include <vector>
 #include <cmath>
+#include <chrono>
+
+#ifdef USE_NVJPEG
+#include "NvJpegEncoder.h"
+#include "NvBuffer.h"
+#endif
+
+// ── 帧率节拍器(默认 30fps,可通过第三个参数覆盖) ───────────────────────────────────
+static int g_target_fps = 30;
 
 static bool send_all(int fd, const uint8_t *p, size_t n) {
     size_t sent = 0;
@@ -281,8 +295,23 @@ static void serve_client(int cli, int device_id) {
         fprintf(stderr, "[rgb_stream] dev%d fallback 到 stereo rectify 管线(getRectStereoFrame, ~5-6s 暖机)\n", device_id);
     }
 
+    // ── 初始化 JPEG 编码器 ──
+#ifdef USE_NVJPEG
+    NvJPEGEncoder *jpegenc = NvJPEGEncoder::createJPEGEncoder("rgb_enc");
+    if (!jpegenc) {
+        fprintf(stderr, "[rgb_stream] NvJPEGEncoder 创建失败,fallback 到 cv::imencode\n");
+    } else {
+        fprintf(stderr, "[rgb_stream] dev%d 使用硬件 JPEG 编码器(NvJpegEncoder, 恒定~1-2ms)\n", device_id);
+    }
+    unsigned long jpeg_buf_size = enc_w * enc_h * 3;
+    unsigned char *jpeg_buf = new unsigned char[jpeg_buf_size];
+#endif
+
     std::vector<int> jpgparams = {cv::IMWRITE_JPEG_QUALITY, 80};
+    const long frame_interval_us = (g_target_fps > 0) ? (1000000L / g_target_fps) : 0;
+
     while (cam.isOpened()) {
+        auto frame_start = std::chrono::steady_clock::now();
         cv::Mat out;
 
         if (use_undistort) {
@@ -316,11 +345,88 @@ static void serve_client(int cli, int device_id) {
         // 确保 BGR 三通道
         if (out.type() != CV_8UC3) cv::cvtColor(out, out, cv::COLOR_GRAY2BGR);
 
-        std::vector<uchar> buf;
-        if (!cv::imencode(".jpg", out, buf, jpgparams) || buf.empty()) continue;
-        uint32_t n = htonl((uint32_t)buf.size());
-        if (!send_all(cli, reinterpret_cast<uint8_t *>(&n), 4)) break;
-        if (!send_all(cli, buf.data(), buf.size())) break;
+        // ── JPEG 编码:优先硬件,fallback 软件 ──
+        const uint8_t *jpeg_data = nullptr;
+        size_t jpeg_size = 0;
+
+#ifdef USE_NVJPEG
+        bool hw_ok = false;
+        if (jpegenc) {
+            // BGR → YUV I420 供硬件编码器
+            cv::Mat yuv;
+            cv::cvtColor(out, yuv, cv::COLOR_BGR2YUV_I420);
+
+            // 创建 NvBuffer 并填充 I420 三平面
+            int w = out.cols, h = out.rows;
+            NvBuffer buffer(V4L2_PIX_FMT_YUV420M, w, h, 0);
+            buffer.allocateMemory();
+
+            // Y 平面
+            const uint8_t *src = yuv.data;
+            for (int row = 0; row < h; row++) {
+                memcpy(buffer.planes[0].data + row * buffer.planes[0].fmt.bytesperline,
+                       src + row * w, w);
+            }
+            buffer.planes[0].bytesused = buffer.planes[0].fmt.bytesperline * h;
+
+            // U 平面
+            src = yuv.data + w * h;
+            int hw2 = w / 2, hh = h / 2;
+            for (int row = 0; row < hh; row++) {
+                memcpy(buffer.planes[1].data + row * buffer.planes[1].fmt.bytesperline,
+                       src + row * hw2, hw2);
+            }
+            buffer.planes[1].bytesused = buffer.planes[1].fmt.bytesperline * hh;
+
+            // V 平面
+            src = yuv.data + w * h + hw2 * hh;
+            for (int row = 0; row < hh; row++) {
+                memcpy(buffer.planes[2].data + row * buffer.planes[2].fmt.bytesperline,
+                       src + row * hw2, hw2);
+            }
+            buffer.planes[2].bytesused = buffer.planes[2].fmt.bytesperline * hh;
+
+            // 硬件编码
+            unsigned long out_size = jpeg_buf_size;
+            int ret = jpegenc->encodeFromBuffer(buffer, JCS_YCbCr, &jpeg_buf, out_size, 80);
+            if (ret == 0 && out_size > 0) {
+                jpeg_data = jpeg_buf;
+                jpeg_size = (size_t)out_size;
+                hw_ok = true;
+            }
+        }
+        if (!hw_ok)
+#endif
+        {
+            // 软件 JPEG 编码(fallback 或无 NVJPEG 编译时的唯一路径)
+            std::vector<uchar> sw_buf;
+            if (!cv::imencode(".jpg", out, sw_buf, jpgparams) || sw_buf.empty()) continue;
+            jpeg_data = sw_buf.data();
+            jpeg_size = sw_buf.size();
+
+            // TCP 发送(在此作用域内,sw_buf 有效)
+            uint32_t n = htonl((uint32_t)jpeg_size);
+            if (!send_all(cli, reinterpret_cast<uint8_t *>(&n), 4)) break;
+            if (!send_all(cli, jpeg_data, jpeg_size)) break;
+            goto frame_done;  // 跳过下面的通用发送
+        }
+
+        // TCP 发送(硬件编码路径)
+        {
+            uint32_t n = htonl((uint32_t)jpeg_size);
+            if (!send_all(cli, reinterpret_cast<uint8_t *>(&n), 4)) break;
+            if (!send_all(cli, jpeg_data, jpeg_size)) break;
+        }
+
+frame_done:
+        // ── 30fps 帧率节拍器:不超过目标帧率,保证稳定输出 ──
+        if (frame_interval_us > 0) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - frame_start).count();
+            if (elapsed < frame_interval_us) {
+                usleep((useconds_t)(frame_interval_us - elapsed));
+            }
+        }
     }
 
     fprintf(stderr, "[rgb_stream] dev%d 客户端断开,_exit(0) 退出(systemd 重启回到待命,规避 SDK 析构 double-free)\n", device_id);
@@ -330,11 +436,16 @@ static void serve_client(int cli, int device_id) {
 
 int main(int argc, char *argv[]) {
     if (argc < 3) {
-        fprintf(stderr, "用法: %s <port> <device_id>\n", argv[0]);
+        fprintf(stderr, "用法: %s <port> <device_id> [target_fps]\n", argv[0]);
         _exit(1);
     }
     int port      = atoi(argv[1]);
     int device_id = atoi(argv[2]);
+    if (argc >= 4) {
+        int fps = atoi(argv[3]);
+        if (fps > 0 && fps <= 120) g_target_fps = fps;
+    }
+    fprintf(stderr, "[rgb_stream] 目标帧率: %d fps\n", g_target_fps);
     signal(SIGPIPE, SIG_IGN);
 
     int srv = socket(AF_INET, SOCK_STREAM, 0);
