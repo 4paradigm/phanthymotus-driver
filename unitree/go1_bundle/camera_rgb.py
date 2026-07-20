@@ -107,7 +107,6 @@ class _RgbStream:
         self.connected = False
         self.frames = 0
         self.position = None
-        self.last_frame: bytes | None = None  # 缓存最新一帧 JPEG，供 capture 使用
 
     def start(self, position: str, host: str, port: int):
         self._run = True
@@ -147,7 +146,6 @@ class _RgbStream:
                     data = _recvall(s, n)
                     if data is None:
                         break
-                    self.last_frame = data  # 缓存最新帧供 capture 读取
                     if not got_first:
                         got_first = True
                         s.settimeout(_STEADY_TIMEOUT)   # 第一帧已到 → 收紧读超时以便快速发现流断
@@ -272,8 +270,8 @@ class CameraRgbPlugin:
             },
             "inputSchema": {
                 "type": "object",
-                "properties": {"action": {"type": "string", "enum": ["info", "start", "stop", "capture"],
-                                          "description": "start=连接并推流 / stop=断开并释放相机 / info=查询状态 / capture=抓取当前帧图像"}},
+                "properties": {"action": {"type": "string", "enum": ["info", "start", "stop"],
+                                          "description": "start=连接并推流 / stop=断开并释放相机 / info=查询状态"}},
                 "required": ["action"],
             },
             "topic_out": ([{"topic": f"/{self._ns}/vision/{self._default_pos}/mono",
@@ -303,22 +301,6 @@ class CameraRgbPlugin:
                 st.stop()
             return {"ok": True, "card": CARD, "action": "stop", "timestamp_ms": _now_ms(),
                     "state": "idle", "position": self._cfg.get(iid, {}).get("position", self._default_pos)}
-
-        if action == "capture":
-            import base64
-            st = self._streams.get(iid)
-            if st is None or not st._run:
-                return _err("NOT_RUNNING", "stream not started, call start first")
-            if not st.connected:
-                return _err("NOT_CONNECTED", "stream connecting, wait for first frame")
-            frame = st.last_frame
-            if frame is None:
-                return _err("NO_FRAME", "no frame received yet, wait for first frame")
-            return {
-                "__mcp_content__": [
-                    {"type": "image", "data": base64.b64encode(frame).decode(), "mimeType": "image/jpeg"},
-                ],
-            }
 
         if action in ("info", "read", "get", CARD):
             pos = self._resolve_pos(iid, args)
