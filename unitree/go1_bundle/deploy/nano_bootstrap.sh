@@ -25,6 +25,8 @@ log(){ echo "[nano_bootstrap] $*"; }
 # 按板 IP 的 ssh/scp（camera/pointcloud 多板 provision 用；单行短连接）。
 bssh(){ sshpass -p "$PW" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 "unitree@$1" "$2"; }
 bscp(){ sshpass -p "$PW" scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 "$2" "unitree@$1:$3"; }
+# 反向 SCP：从 Nano → Pi 容器本地（MMAPI 采集用）。
+bscp_from(){ sshpass -p "$PW" scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 "unitree@$1:$2" "$3"; }
 # 板上探测 SDK 目录（含 include/UnitreeCameraSDK.hpp 的第一个候选）；单引号 → $HOME 在板上求值。
 CAM_DETECT='for d in $HOME/UnitreecameraSDK $HOME/Unitree/sdk/UnitreeCameraSdk; do [ -f "$d/include/UnitreeCameraSDK.hpp" ] && echo "$d" && break; done'
 
@@ -52,6 +54,46 @@ CAM_ROWS=(
   "belly 192.168.123.15 0 9205"
 )
 if [ -f "$DEPLOY/camera/rgb_stream.cc" ]; then
+  # ── MMAPI 采集：从有 Jetson Multimedia API 的板子缓存头文件+类源码，供无 MMAPI 的板编译用 ──
+  # NvJpegEncoder 编译需要 include/ 下的头文件 + samples/common/classes/ 下的 .cpp；
+  # 运行时 libnvjpeg.so 是 L4T 自带的，三块板都有，只缺编译材料。
+  # 策略：找一块有 MMAPI 的板(通常 .13) → tar 打包 → SCP 回 Pi 容器缓存 → 按需推送给没有的板。
+  MMAPI_CACHE="$DEPLOY/.mmapi_cache"
+  MMAPI_INC_R="/usr/src/jetson_multimedia_api/include"
+  MMAPI_CLS_R="/usr/src/jetson_multimedia_api/samples/common/classes"
+  MMAPI_DONOR=""
+
+  if [ ! -f "$MMAPI_CACHE/mmapi.tar.gz" ]; then
+    for B_PROBE in 192.168.123.13 192.168.123.14 192.168.123.15; do
+      if bssh "$B_PROBE" "[ -f $MMAPI_INC_R/NvJpegEncoder.h ]" 2>/dev/null; then
+        MMAPI_DONOR="$B_PROBE"
+        break
+      fi
+    done
+    if [ -n "$MMAPI_DONOR" ]; then
+      log "camera: 从 $MMAPI_DONOR 采集 MMAPI 编译材料…"
+      # 在 donor 上打包需要的头文件和类源码
+      bssh "$MMAPI_DONOR" "tar czf /tmp/mmapi_harvest.tar.gz \
+        -C /usr/src/jetson_multimedia_api \
+        include/NvJpegEncoder.h include/NvElement.h include/NvBuffer.h include/NvLogging.h \
+        samples/common/classes/NvJpegEncoder.cpp \
+        samples/common/classes/NvElement.cpp \
+        samples/common/classes/NvLogging.cpp \
+        2>/dev/null" 2>/dev/null
+      mkdir -p "$MMAPI_CACHE"
+      bscp_from "$MMAPI_DONOR" "/tmp/mmapi_harvest.tar.gz" "$MMAPI_CACHE/mmapi.tar.gz" 2>/dev/null
+      if [ -f "$MMAPI_CACHE/mmapi.tar.gz" ]; then
+        log "camera: MMAPI 缓存就绪(来源 $MMAPI_DONOR)"
+      else
+        log "camera: MMAPI 采集失败 → 无 MMAPI 的板将 fallback cv::imencode"
+      fi
+    else
+      log "camera: 三块板均无 MMAPI → 全部 fallback cv::imencode 软编码"
+    fi
+  else
+    log "camera: MMAPI 缓存已存在,跳过采集"
+  fi
+
   CAM_DONE=""   # 已处理过的板（每板只编译/禁 autostart/腾设备一次）
   for row in "${CAM_ROWS[@]}"; do
     set -- $row; POS="$1"; B="$2"; DEVID="$3"; PORT="$4"
@@ -75,7 +117,29 @@ if [ -f "$DEPLOY/camera/rgb_stream.cc" ]; then
         # 🔴 /usr/local 回退必须链全 opencv 模块:SDK 的 libunitree_camera.a(StereoCameraCommon) 内部用
         #   cv::VideoWriter(videoio)、cv::StereoSGBM/StereoBM(calib3d),只链 core/imgproc/imgcodecs 会
         #   undefined reference → .14 编不过(left/right inactive)。pkg-config opencv4 自带全模块不受影响。
-        bssh "$B" "cd $SDK && mkdir -p bins && OCV=\$(pkg-config --cflags --libs opencv4 2>/dev/null); if [ -z \"\$OCV\" ]; then OCV=\$(pkg-config --cflags --libs opencv 2>/dev/null); fi; if [ -z \"\$OCV\" ] && [ -f /usr/local/include/opencv4/opencv2/opencv.hpp ]; then OCV=\"-I/usr/local/include/opencv4 -L/usr/local/lib -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lopencv_calib3d -lopencv_videoio -lopencv_highgui -lopencv_features2d -lopencv_flann -Wl,-rpath,/usr/local/lib\"; fi; if [ -z \"\$OCV\" ] && [ -f /usr/include/opencv4/opencv2/opencv.hpp ]; then OCV=\"-I/usr/include/opencv4 -L/usr/lib/aarch64-linux-gnu -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lopencv_calib3d -lopencv_videoio -Wl,-rpath,/usr/lib/aarch64-linux-gnu\"; fi; g++ -O2 -std=c++14 -pthread rgb_stream.cc -I$SDK/include -I$SDK/thirdparty -L$SDK/lib/arm64 -Wl,--start-group -lunitree_camera -ltstc_V4L2_xu_camera -lsystemlog -ludev -Wl,--end-group \$OCV -o bins/rgb_stream 2>&1 | tail -6" 2>&1 | tail -6
+        # ── NVJPEG 探测+部署：优先板上已有 → 其次推送缓存 → 最后 fallback ──
+        MMAPI_INC="/usr/src/jetson_multimedia_api/include"
+        MMAPI_CLS="/usr/src/jetson_multimedia_api/samples/common/classes"
+        NVJPEG=""
+        if bssh "$B" "[ -f $MMAPI_INC/NvJpegEncoder.h ]" 2>/dev/null; then
+          # 板上已有完整 MMAPI
+          NVJPEG="-DUSE_NVJPEG -I$MMAPI_INC $MMAPI_CLS/NvJpegEncoder.cpp $MMAPI_CLS/NvElement.cpp $MMAPI_CLS/NvLogging.cpp -L/usr/lib/aarch64-linux-gnu/tegra -lnvjpeg -Wl,-rpath,/usr/lib/aarch64-linux-gnu/tegra"
+          log "camera: $B 板上已有 MMAPI → 启用硬件 JPEG 编码(-DUSE_NVJPEG)"
+        elif [ -f "$MMAPI_CACHE/mmapi.tar.gz" ] && bssh "$B" "[ -f /usr/lib/aarch64-linux-gnu/tegra/libnvjpeg.so ]" 2>/dev/null; then
+          # 板上无 MMAPI 头文件但有 libnvjpeg.so(L4T 运行时) → 推送缓存的编译材料
+          log "camera: $B 无 MMAPI 头文件,推送缓存 + 检测到 libnvjpeg.so…"
+          bscp "$B" "$MMAPI_CACHE/mmapi.tar.gz" "/tmp/mmapi_harvest.tar.gz" 2>/dev/null
+          bssh "$B" "mkdir -p /tmp/mmapi && tar xzf /tmp/mmapi_harvest.tar.gz -C /tmp/mmapi" 2>/dev/null
+          if bssh "$B" "[ -f /tmp/mmapi/include/NvJpegEncoder.h ]" 2>/dev/null; then
+            NVJPEG="-DUSE_NVJPEG -I/tmp/mmapi/include /tmp/mmapi/samples/common/classes/NvJpegEncoder.cpp /tmp/mmapi/samples/common/classes/NvElement.cpp /tmp/mmapi/samples/common/classes/NvLogging.cpp -L/usr/lib/aarch64-linux-gnu/tegra -lnvjpeg -Wl,-rpath,/usr/lib/aarch64-linux-gnu/tegra"
+            log "camera: $B MMAPI 缓存部署成功 → 启用硬件 JPEG 编码(-DUSE_NVJPEG)"
+          else
+            log "camera: $B MMAPI 缓存解压失败 → fallback cv::imencode 软编码"
+          fi
+        else
+          log "camera: $B 无 MMAPI 且无 libnvjpeg.so → fallback cv::imencode 软编码"
+        fi
+        bssh "$B" "cd $SDK && mkdir -p bins && OCV=\$(pkg-config --cflags --libs opencv4 2>/dev/null); if [ -z \"\$OCV\" ]; then OCV=\$(pkg-config --cflags --libs opencv 2>/dev/null); fi; if [ -z \"\$OCV\" ] && [ -f /usr/local/include/opencv4/opencv2/opencv.hpp ]; then OCV=\"-I/usr/local/include/opencv4 -L/usr/local/lib -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lopencv_calib3d -lopencv_videoio -lopencv_highgui -lopencv_features2d -lopencv_flann -Wl,-rpath,/usr/local/lib\"; fi; if [ -z \"\$OCV\" ] && [ -f /usr/include/opencv4/opencv2/opencv.hpp ]; then OCV=\"-I/usr/include/opencv4 -L/usr/lib/aarch64-linux-gnu -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lopencv_calib3d -lopencv_videoio -Wl,-rpath,/usr/lib/aarch64-linux-gnu\"; fi; g++ -O2 -std=c++14 -pthread rgb_stream.cc -I$SDK/include -I$SDK/thirdparty -L$SDK/lib/arm64 -Wl,--start-group -lunitree_camera -ltstc_V4L2_xu_camera -lsystemlog -ludev -Wl,--end-group \$OCV $NVJPEG -o bins/rgb_stream 2>&1 | tail -6" 2>&1 | tail -6
         CAM_DONE="$CAM_DONE $B"
         ;;
     esac
@@ -91,7 +155,7 @@ After=network.target
 Type=simple
 User=unitree
 WorkingDirectory=$SDK
-ExecStart=$SDK/bins/rgb_stream $PORT $DEVID
+ExecStart=$SDK/bins/rgb_stream $PORT $DEVID 30
 Restart=always
 RestartSec=3
 [Install]
