@@ -55,11 +55,14 @@ TYPE = "sensor"
 FMT_PCL = "sensor_msgs/PointCloud2"
 FMT_JPEG = "image/jpeg"
 
-# 俯视投影图分辨率和视野范围(米)
+# 投影参数（相机自身视角：x=左右, y=上下, z=前向距离→颜色）
 _IMG_W = 480
 _IMG_H = 480
+_DOT_R = 2       # 每个点绘制半径(像素)
 _X_RANGE = 4.0   # 左右各 2m
-_Z_RANGE = 6.0   # 前方 0~6m
+_Y_RANGE = 3.0   # 上下各 1.5m
+_Z_MIN   = 0.3   # 最近有效距离(m)
+_Z_MAX   = 5.0   # 最远有效距离(m)
 
 
 def _jet_colormap(t: np.ndarray) -> np.ndarray:
@@ -70,22 +73,39 @@ def _jet_colormap(t: np.ndarray) -> np.ndarray:
     return (np.stack([r, g, b], axis=-1) * 255).astype(np.uint8)
 
 
-def _pcl_to_jpeg(xyz_blob: bytes, num_points: int) -> bytes | None:
-    """XYZ 点云(相机系 float32 小端) → 俯视伪彩色 JPEG bytes。无 PIL 时返回 None。"""
+def _draw_dots(img: np.ndarray, px: np.ndarray, py: np.ndarray, colors: np.ndarray):
+    """在 img 上把每个点画成半径 _DOT_R 的小圆。"""
+    r = _DOT_R
+    h, w = img.shape[:2]
+    for i in range(len(px)):
+        x0, y0 = int(px[i]), int(py[i])
+        for dy in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                if dx * dx + dy * dy <= r * r:
+                    xi, yi = x0 + dx, y0 + dy
+                    if 0 <= xi < w and 0 <= yi < h:
+                        img[yi, xi] = colors[i]
+
+
+def _pcl_to_jpeg(xyz_blob: bytes, num_points: int, position: str) -> bytes | None:
+    """XYZ 点云 → 相机视角投影 JPEG（x=左右, y=上下, z→颜色，各机位统一）。"""
     if not _HAS_PIL or num_points == 0:
         return None
     pts = np.frombuffer(xyz_blob, dtype="<f4").reshape(num_points, 3)
-    x, z = pts[:, 0], pts[:, 2]
-    mask = (np.isfinite(x) & np.isfinite(z)
-            & (z > 0.1) & (z < _Z_RANGE)
-            & (np.abs(x) < _X_RANGE / 2))
-    x, z = x[mask], z[mask]
+    x, y, z = pts[:, 0], pts[:, 1], pts[:, 2]
+
+    mask = (np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
+            & (z > _Z_MIN) & (z < _Z_MAX)
+            & (np.abs(x) < _X_RANGE / 2)
+            & (np.abs(y) < _Y_RANGE / 2))
+    x, y, z = x[mask], y[mask], z[mask]
 
     img = np.zeros((_IMG_H, _IMG_W, 3), dtype=np.uint8)
     if x.size > 0:
         px = np.clip(((x + _X_RANGE / 2) / _X_RANGE * (_IMG_W - 1)).astype(np.int32), 0, _IMG_W - 1)
-        py = np.clip(((1.0 - z / _Z_RANGE) * (_IMG_H - 1)).astype(np.int32), 0, _IMG_H - 1)
-        img[py, px] = _jet_colormap(np.clip(z / _Z_RANGE, 0, 1))
+        py = np.clip(((y + _Y_RANGE / 2) / _Y_RANGE * (_IMG_H - 1)).astype(np.int32), 0, _IMG_H - 1)
+        t = np.clip((z - _Z_MIN) / (_Z_MAX - _Z_MIN), 0, 1)
+        _draw_dots(img, px, py, _jet_colormap(t))
 
     buf = io.BytesIO()
     _PILImage.fromarray(img).save(buf, format="JPEG", quality=75)
@@ -195,7 +215,7 @@ class _PclStream:
                     if len(xyz_blob) != num_points * 12:
                         continue
                     self._pub_pcl.publish(self._make_pcl_msg(num_points, xyz_blob))
-                    jpeg = _pcl_to_jpeg(xyz_blob, num_points)
+                    jpeg = _pcl_to_jpeg(xyz_blob, num_points, position)
                     if jpeg is not None and self._pub_preview is not None:
                         preview_msg = CompressedImage()
                         preview_msg.header.stamp = self._node.get_clock().now().to_msg()
