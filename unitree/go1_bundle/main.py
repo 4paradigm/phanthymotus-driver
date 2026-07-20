@@ -175,6 +175,9 @@ def make_handler():
                     result = _bundle.dispatch(name, args)
                     if result is None:
                         err(-32601, f"Unknown tool: {name}")
+                    elif isinstance(result, dict) and "__mcp_content__" in result:
+                        # 插件直接返回 MCP content（如图像），不包装为 text
+                        ok({"content": result["__mcp_content__"]})
                     else:
                         ok({"content": [{"type": "text", "text": json.dumps(result)}]})
                 else:

@@ -299,18 +299,10 @@ static void serve_client(int cli, int device_id) {
                 cv::resize(left, left, cv::Size(enc_w, enc_h));
             // CMei remap 去鱼眼
             cv::remap(left, out, und.map1, und.map2, cv::INTER_LINEAR, cv::BORDER_CONSTANT);
-            // Go1 相机物理装反 → 旋转 180°
-            cv::flip(out, out, -1);
-            // 自动裁切黑边(crop 也要翻转:翻转后的裁切框位置镜像)
-            // flip(-1) 把 (x,y) → (W-1-x, H-1-y),裁切框需要相应变换
-            int cw = und.crop.width, ch = und.crop.height;
-            int cx = out.cols - und.crop.x - cw;
-            int cy = out.rows - und.crop.y - ch;
-            cv::Rect flipped_crop(cx, cy, cw, ch);
-            // 边界保护
-            flipped_crop &= cv::Rect(0, 0, out.cols, out.rows);
-            if (flipped_crop.width > 10 && flipped_crop.height > 10)
-                out = out(flipped_crop).clone();
+            // 自动裁切黑边
+            cv::Rect crop_rect = und.crop & cv::Rect(0, 0, out.cols, out.rows);
+            if (crop_rect.width > 10 && crop_rect.height > 10)
+                out = out(crop_rect).clone();
         } else {
             // ── fallback:stereo rectify 管线(旧行为) ──
             cv::Mat left, right, feim;
@@ -319,7 +311,6 @@ static void serve_client(int cli, int device_id) {
             if (!got || left.empty()) { usleep(2000); continue; }
             out = left;
             if (out.type() != CV_8UC3) cv::cvtColor(out, out, cv::COLOR_GRAY2BGR);
-            cv::flip(out, out, -1);
         }
 
         // 确保 BGR 三通道
