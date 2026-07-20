@@ -43,7 +43,7 @@
 | `face_light` | 面部灯带颜色 | `set_color`/`preset`/`off`（经 MQTT） |
 | `test_light_effect` | 面部灯带动效(未验收) | `solid`/`blink`/`breathe`/`fade`/`brightness_up`/`brightness_down`/`preset`/`off`，各带 duration（经 MQTT） |
 | `system_health` | 机器人状态/健康信息 | `robot_info`：一次看主控板 + 子系统状态，OK/WARN/CRIT + 总判定（经 MQTT） |
-| `test_power_control` | 电源（关机·不可逆） | `power_off`：关闭电池（`BmsCmd.off=0xA5`），**不可逆、不能远程恢复**；需 `confirm=true`+`reason`，前置：状态 fresh 且机器人静止。**`test` 前缀=未验收**，验收后改回 `power_control` |
+| `test_battery_off` | 电池关断（不可逆） | `battery_off`：低层 `LowCmd.bms.off=0xA5`→主控板(.10:8007) **真断电池**（已真机验收：灯灭、电机断电，区别于只关 Pi 的 poweroff）；**不可逆、不能远程恢复**；需 `confirm=true`+`reason`，前置：状态 fresh 且机器人静止。保守留 `test` 前缀待复核 |
 
 ### 资源卡（resource）
 
@@ -97,7 +97,7 @@ go1_bundle/
 ├── face_light.py      # 面部灯带颜色
 ├── test_light_effect.py # 面部灯带动效(未验收)
 ├── system_health.py   # 机器人状态/健康信息(robot_info)
-├── test_power_control.py # 电源关机（不可逆，未验收=test 前缀）
+├── test_battery_off.py # 电池关断（低层真断电，已验收，不可逆）
 │   ── 资源卡（resource）──
 ├── model.py           # go1 URDF（供 joints 骨架渲染）
 ├── config.yaml        # 卡片开关 / 端口 / 命名空间
