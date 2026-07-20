@@ -24,17 +24,6 @@ plugins:
     enabled: true
     mqtt_host: "localhost"
     mqtt_port: 1883
-  test_camera_depth:            # 【未验收·test 前缀】双目深度推流(sensor,multiInstance·可选机位):卡 start 才连对应板 depth_stream → ROS2 CompressedImage(jpeg);stop 断开释放相机。验收后改名 camera_depth
-    enabled: true               # 拖入后用卡的 position 下拉框选/热切机位;一次一路(立体计算吃 CPU+相机独占);与点云指向同一相机时互斥
-    default_position: "belly"   # 公共默认机位:front/chin/left/right/belly
-    # 机位→板卡IP/深度端口。Pi 侧只用 board_ip+depth_port 连流;device_id 由 nano_bootstrap 传给 Nano 侧 depth_stream 选相机。
-    # 端口 91xx 与点云94xx/RGB图传92xx/RGB控制93xx 错开。SDK 路径每板不同,由 nano_bootstrap 自动探测。
-    positions:
-      front: {board_ip: "192.168.123.13", device_id: 1, depth_port: 9101}
-      chin:  {board_ip: "192.168.123.13", device_id: 0, depth_port: 9102}
-      left:  {board_ip: "192.168.123.14", device_id: 0, depth_port: 9103}
-      right: {board_ip: "192.168.123.14", device_id: 1, depth_port: 9104}
-      belly: {board_ip: "192.168.123.15", device_id: 0, depth_port: 9105}
   test_camera_depth_li:         # 【li 版·修复机位解析】双目深度推流(sensor,multiInstance·可选机位):修复 test_camera_depth 只认 belly 的问题,五机位均可选通。验收后可改名 camera_depth
     enabled: true               # _resolve_pos 照搬 camera_rgb 逻辑:instance_id==机位名时自动推断,不再退回 default
     default_position: "front"   # 公共默认机位:front/chin/left/right/belly
