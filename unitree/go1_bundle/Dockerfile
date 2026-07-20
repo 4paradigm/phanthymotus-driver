@@ -16,12 +16,12 @@ WORKDIR /work
 RUN find /etc/apt \( -name '*.list' -o -name '*.sources' \) -exec sed -i "s|mirrors.tencentyun.com|${APT_MIRROR_HOST}|g" {} + ; \
     apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
-        python3-pip python3-dev cmake build-essential git libmsgpack-dev sshpass openssh-client && \
+        python3-pip python3-dev cmake build-essential git libmsgpack-dev sshpass openssh-client \
+        python3-pil && \
     rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /work/requirements.txt
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r /work/requirements.txt && \
-    pip3 install --no-cache-dir -i ${PYPI_MIRROR} Pillow
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r /work/requirements.txt
 
 # ── unitree_legged_sdk (Go1 EDU) → robot_interface*.so ──────────────────────────
 #   1) 根 CMakeLists 里 PYTHON_BUILD 默认 OFF → 必须 -DPYTHON_BUILD=ON 才编 python wrapper；
