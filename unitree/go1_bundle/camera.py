@@ -70,7 +70,10 @@ _TYPE_DESC = {
     "pointcloud": "Go1 五机位点云（XYZ, 米, 相机系）— multiInstance, position 下拉框选机位",
 }
 _TYPE_FMT = {
-    "rgb": "sensor_msgs/CompressedImage (jpeg)",
+    # Agent Core 的网页相机渲染器按 MIME 类型选择 renderer；虽然 ROS2
+    # 载体是 CompressedImage，payload 本身是 JPEG，必须向画布声明为
+    # image/jpeg，避免二进制帧被当作普通传感器文本而显示为空白。
+    "rgb": "image/jpeg",
     "depth": "sensor_msgs/CompressedImage (jpeg, colorized depth)",
     "pointcloud": "sensor_msgs/PointCloud2 (XYZ, meters)",
 }
