@@ -46,6 +46,7 @@ COPY ext_devices.py    /work/ext_devices.py
 COPY camera.py         /work/camera.py
 COPY config.yaml       /work/config.yaml
 COPY deploy/           /deploy/
+COPY resource/         /work/resource/
 # Nano 侧后端源码放进 /deploy/，供 nano_bootstrap.sh 首启时分发/编译到 Head Nano：
 #   beep_adapter.py（beep，纯 Python 免编译）/ camera_adapter/（camera_rgb，Nano 上现编 C++）。
 COPY deploy/beep_adapter.py   /deploy/beep_adapter.py
