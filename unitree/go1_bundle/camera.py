@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-camera.py — Go1 五机位视觉卡（RGB / 深度 / 点云，三合一单文件）。
+camera.py — Go1 五机位视觉卡（RGB / 深度 / 点云，三卡合一单文件）。
 
-约定：config.yaml 里一个 key "camera"，type 字段选 rgb / depth / pointcloud。
-main.py import 本模块后，make_plugin() 根据 type 创建对应的 _Plugin 实例。
+约定：本文件提供 camera_rgb / camera_depth / camera_pointcloud 三张独立卡。
+main.py 按 config.yaml 的三个 key 分别调用对应 make_* 工厂函数；实现仍全部留在本文件。
 
 三张卡的功能共享同一文件的实现：
-  camera type=rgb      — RGB 去畸变翻正 JPEG      (TCP :9201~9205)
-  camera type=depth    — 彩色深度 JPEG            (TCP :9101~9105)
-  camera type=pointcloud — PointCloud2 + JPEG 俯视投影 (TCP :9401~9405)
+  camera_rgb        — RGB 去畸变翻正 JPEG      (TCP :9201~9205)
+  camera_depth      — 彩色深度 JPEG            (TCP :9101~9105)
+  camera_pointcloud — PointCloud2 + JPEG 俯视投影 (TCP :9401~9405)
 
 架构（与之前各自独立的三文件完全一致）：
   ┌─ Nano 板卡 (.13/.14/.15) ────────────────────┐     ┌─ Pi 驱动容器 (.161) ────────┐
@@ -43,8 +43,8 @@ except Exception:
     _HAS_ROS2 = False
     _QOS = None
 
-CARD = "camera"
 TYPE = "sensor"
+_CARD_BY_TYPE = {"rgb": "camera_rgb", "depth": "camera_depth", "pointcloud": "camera_pointcloud"}
 
 # ── 机位 + 端口配置 ────────────────────────────────
 
@@ -460,19 +460,15 @@ class _PclStream(_BaseStream):
 # ── Plugin 类 ──────────────────────────────────────
 
 class Plugin:
-    """Go1 视觉扩展卡（RGB / 深度 / 点云三合一）。
-
-    根据 config.camera.type 选择功能模式。
-    """
+    """一张固定类型的 Go1 视觉卡；三个实例共享本文件内的流实现。"""
 
     def __init__(self, plugin_config: dict | None, namespace: str,
-                 executor: Any | None, client: Any | None):
+                 executor: Any | None, client: Any | None, camera_type: str):
         c = plugin_config or {}
         self._ns = namespace
         self._executor = executor
-        self._type = str(c.get("type", "rgb")).lower()
-        if self._type not in _TYPE_PORT_KEY:
-            self._type = "rgb"
+        self._type = camera_type
+        self._card = _CARD_BY_TYPE[camera_type]
 
         self._port_key = _TYPE_PORT_KEY[self._type]
         self._default_port = _TYPE_DEFAULT_PORT[self._type]
@@ -499,12 +495,12 @@ class Plugin:
         self._cfg: dict[str, dict] = {}
         if _HAS_ROS2 and executor is not None:
             try:
-                self._node = Node(f"go1_camera_{self._type}")
+                self._node = Node(f"go1_{self._card}")
                 executor.add_node(self._node)
             except Exception as e:
-                print(f"[{CARD}] ROS2 不可用: {e}", flush=True)
+                print(f"[{self._card}] ROS2 不可用: {e}", flush=True)
                 self._node = None
-        print(f"[{CARD}][{self._type}] 机位就绪：{sorted(self._positions.keys())}（default={self._default_pos}）", flush=True)
+        print(f"[{self._card}] 机位就绪：{sorted(self._positions.keys())}（default={self._default_pos}）", flush=True)
 
     # ── topic 路由 ──
 
@@ -541,7 +537,7 @@ class Plugin:
 
     def start(self):
         if self._node is None:
-            print(f"[{CARD}] 无 rclpy/executor,推流不可用(仅登记 tool)", flush=True)
+            print(f"[{self._card}] 无 rclpy/executor,推流不可用(仅登记 tool)", flush=True)
 
     def stop(self):
         for st in self._streams.values():
@@ -562,17 +558,11 @@ class Plugin:
             if self._has_preview and _HAS_PIL:
                 topic_out.append({"topic": self._topic_preview("default"), "format": "image/jpeg"})
         return [{
-            "name": CARD, "type": TYPE, "multiInstance": True,
+            "name": self._card, "type": TYPE, "multiInstance": True,
             "description": self._desc + (" — ROS2" if self._node else " — no rclpy, poll via MCP"),
             "configSchema": {
                 "type": "object",
                 "properties": {
-                    "type": {
-                        "type": "string",
-                        "description": "相机模式：rgb / depth / pointcloud",
-                        "scope": "card",
-                        "oneOf": [{"const": t, "title": _TYPE_TITLE[t]} for t in _VALID_TYPES],
-                    },
                     "position": {
                         "type": "string",
                         "description": "读取哪一路相机（改此项即热切源）",
@@ -596,36 +586,6 @@ class Plugin:
         iid = args.get("instance_id") or "default"
 
         if action == "config":
-            config = args.get("config", {})
-
-            # 检查是否需要切换类型
-            new_type = config.get("type")
-            if new_type and new_type != self._type:
-                if new_type not in _TYPE_PORT_KEY:
-                    return _err("INVALID_ARGUMENT", f"unknown type {new_type!r}; valid: {_VALID_TYPES}")
-
-                # 更新类型相关配置
-                self._type = new_type
-                self._port_key = _TYPE_PORT_KEY[self._type]
-                self._default_port = _TYPE_DEFAULT_PORT[self._type]
-                self._topic_root = _TYPE_TOPIC_ROOT[self._type]
-                self._topic_suffix = _TYPE_TOPIC_SUFFIX[self._type]
-                self._frame_id_suffix = _TYPE_FRAME_ID_SUFFIX[self._type]
-                self._has_preview = _TYPE_HAS_PREVIEW[self._type]
-                self._desc = _TYPE_DESC[self._type]
-                self._fmt = _TYPE_FMT[self._type]
-
-                # 更新流类
-                self._stream_cls = {"rgb": _RgbStream, "depth": _DepthStream, "pointcloud": _PclStream}[self._type]
-
-                # 重启所有现有实例
-                for existing_iid in list(self._streams.keys()):
-                    st = self._streams.pop(existing_iid, None)
-                    if st is not None:
-                        st.stop()
-
-                print(f"[{CARD}] 切换到 {self._type} 模式", flush=True)
-
             # 更新位置配置
             pos = self._resolve_pos(iid, args)
             if pos not in self._positions:
@@ -637,7 +597,7 @@ class Plugin:
             if st is not None and st._run and st.position != pos:
                 self._start_instance(iid, pos)
 
-            return {"ok": True, "type": self._type, "position": pos}
+            return {"ok": True, "card": self._card, "type": self._type, "position": pos}
 
         if action == "start":
             return self._start_instance(iid, self._resolve_pos(iid, args))
@@ -646,10 +606,10 @@ class Plugin:
             st = self._streams.get(iid)
             if st is not None:
                 st.stop()
-            return {"ok": True, "card": CARD, "action": "stop", "timestamp_ms": _now_ms(),
+            return {"ok": True, "card": self._card, "action": "stop", "timestamp_ms": _now_ms(),
                     "state": "idle", "position": self._cfg.get(iid, {}).get("position", self._default_pos)}
 
-        if action in ("info", "read", "get", CARD):
+        if action in ("info", "read", "get", self._card):
             return self._do_info(iid)
         return None
 
@@ -697,10 +657,18 @@ class Plugin:
         topic_out = [{"topic": self._topic(iid), "format": self._fmt}]
         if self._has_preview and _HAS_PIL:
             topic_out.append({"topic": self._topic_preview(iid), "format": "image/jpeg"})
-        return {"ok": True, "card": CARD, "action": "start", "timestamp_ms": _now_ms(),
+        return {"ok": True, "card": self._card, "action": "start", "timestamp_ms": _now_ms(),
                 "state": "running", "position": position, "type": self._type,
                 "topic_out": topic_out}
 
 
-def make_plugin(plugin_config, namespace, executor, client):
-    return Plugin(plugin_config, namespace, executor, client)
+def make_camera_rgb(plugin_config, namespace, executor, client):
+    return Plugin(plugin_config, namespace, executor, client, "rgb")
+
+
+def make_camera_depth(plugin_config, namespace, executor, client):
+    return Plugin(plugin_config, namespace, executor, client, "depth")
+
+
+def make_camera_pointcloud(plugin_config, namespace, executor, client):
+    return Plugin(plugin_config, namespace, executor, client, "pointcloud")

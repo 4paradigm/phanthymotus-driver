@@ -2,8 +2,8 @@
 
 > 一张"卡片" = Driver 暴露的一个 MCP 工具 = 平台画布上一个可拖拽、可被大模型单独调用的能力。
 >
-> 本 bundle 当前发布 **22 张卡**：11 张传感卡（sensor）+ 9 张控制卡（actuator）+ 1 张资源卡（resource）+ 1 张视觉卡（camera）。
-> **4 个聚合文件**：`sensors.py`（11 张）/ `controllers.py`（5 张）/ `ext_devices.py`（4 张）/ `camera.py`（三合一 RGB/depth/pointcloud），每张卡仍然是自包含的类 + 工厂函数，方便按组评审、多人并行不撞车。
+> 本 bundle 当前发布 **24 张卡**：11 张传感卡（sensor）+ 9 张控制卡（actuator）+ 1 张资源卡（resource）+ 3 张独立视觉卡。
+> **4 个聚合文件**：`sensors.py`（11 张）/ `controllers.py`（5 张）/ `ext_devices.py`（4 张）/ `camera.py`（RGB/depth/pointcloud 三张卡），每张卡仍然是自包含的类 + 工厂函数，方便按组评审、多人并行不撞车。
 > 目的有二：① 把这些卡干净地上架；② 作为后来者新增其它卡片的开发起点 —— 怎么加卡见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 实现基座
@@ -30,7 +30,9 @@
 | `joints` | 12 腿关节 | `/{ns}/state/joints`：q/dq/tau/temp（骨架渲染，需 `model` 卡提供 URDF） |
 | `remote_controller` | 无线遥控器 | `/{ns}/state/remote_controller`：16 按键 + 5 摇杆轴（`HighState.wirelessRemote[40]`） |
 | `activity_monitor` | 活动度统计 | `/{ns}/state/activity`：后台采样速度/模式，action=report 返回 last_30s + since_start（距离/运动占比/平均速度/峰值/当前模式） |
-| `camera` | RGB / 深度 / 点云（三合一，type=rgb/depth/pointcloud，5 机位·multiInstance） | 卡 `start` 才连对应 Nano 板 → ROS2 CompressedImage / PointCloud2；`stop` 断开释放相机 |
+| `camera_rgb` | RGB 去畸变图像（5 机位·multiInstance） | `start` 才连对应 Nano → CompressedImage；`stop` 断开释放相机 |
+| `camera_depth` | 彩色深度图（5 机位·multiInstance） | `start` 才连对应 Nano → CompressedImage；`stop` 断开释放相机 |
+| `camera_pointcloud` | XYZ 点云与 JPEG 俯视预览（5 机位·multiInstance） | `start` 才连对应 Nano → PointCloud2；`stop` 断开释放相机 |
 
 ### 控制卡（actuator，下发 `HighCmd` / 外设动作；须真机验证量程+安全后上架）
 
@@ -60,9 +62,9 @@
 
 ```
 Nano 板 (.13/.14/.15)              Pi 驱动容器 (.161)
-┌─ rgb_stream (TCP :9201~9205) ──▶ camera.py (type=rgb)     → /{ns}/vision/{pos}/mono
-├─ depth_stream (TCP :9101~9105) ─▶ camera.py (type=depth)  → /{ns}/camera/{pos}/depth
-└─ pointcloud_stream (TCP :9401~9405) → camera.py (type=pointcloud) → /{ns}/camera/{pos}/pointcloud
+┌─ rgb_stream (TCP :9201~9205) ──▶ camera.py (camera_rgb)        → /{ns}/vision/{pos}/mono
+├─ depth_stream (TCP :9101~9105) ─▶ camera.py (camera_depth)     → /{ns}/camera/{pos}/depth
+└─ pointcloud_stream (TCP :9401~9405) → camera.py (camera_pointcloud) → /{ns}/camera/{pos}/pointcloud
 ```
 
 - 三路均为**按需开相机**：卡 `start` 才建 TCP 连接，Nano 侧才打开相机；`stop` 断开，Nano `_exit(0)` 释放相机（systemd `Restart=always` 重启待命）。
@@ -163,7 +165,7 @@ sudo docker run --rm --name go1_bundle \
   go1_bundle:test
 ```
 
-> ⚠ `DEPTH_ENABLE=1` / `PCL_ENABLE=1` 会在 Nano 板上装常驻 systemd 服务。camera 的 rgb / depth / pointcloud 三种模式指向同一物理相机，三者互斥，按需启用即可。
+> ⚠ `DEPTH_ENABLE=1` / `PCL_ENABLE=1` 会在 Nano 板上装常驻 systemd 服务。三张视觉卡指向同一物理相机时仍互斥，按需启动即可。
 
 ## 端口
 
