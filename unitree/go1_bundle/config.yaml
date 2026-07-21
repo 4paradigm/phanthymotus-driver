@@ -22,7 +22,7 @@ plugins:
   # 相机三卡共用同一 camera.py；每张卡均为 multiInstance，可各自选机位。
   # 同一物理机位的三种流仍互斥：谁先 start 谁占用相机。
   camera_rgb:
-    enabled: true
+    enabled: false
     default_position: "front"
     positions:
       front: {board_ip: "192.168.123.13", image_port: 9201, depth_port: 9101, pcl_port: 9401}
@@ -31,7 +31,7 @@ plugins:
       right: {board_ip: "192.168.123.14", image_port: 9204, depth_port: 9104, pcl_port: 9404}
       belly: {board_ip: "192.168.123.15", image_port: 9205, depth_port: 9105, pcl_port: 9405}
   camera_depth:
-    enabled: true              # Nano 侧需 DEPTH_ENABLE=1
+    enabled: false              # Nano 侧需 DEPTH_ENABLE=1
     default_position: "front"
     positions:
       front: {board_ip: "192.168.123.13", image_port: 9201, depth_port: 9101, pcl_port: 9401}
@@ -40,7 +40,7 @@ plugins:
       right: {board_ip: "192.168.123.14", image_port: 9204, depth_port: 9104, pcl_port: 9404}
       belly: {board_ip: "192.168.123.15", image_port: 9205, depth_port: 9105, pcl_port: 9405}
   camera_pointcloud:
-    enabled: true              # Nano 侧需 PCL_ENABLE=1
+    enabled: false              # Nano 侧需 PCL_ENABLE=1
     default_position: "front"
     positions:
       front: {board_ip: "192.168.123.13", image_port: 9201, depth_port: 9101, pcl_port: 9401}
