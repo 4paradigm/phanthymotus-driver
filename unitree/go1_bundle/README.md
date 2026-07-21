@@ -2,8 +2,8 @@
 
 > 一张"卡片" = Driver 暴露的一个 MCP 工具 = 平台画布上一个可拖拽、可被大模型单独调用的能力。
 >
-> 本 bundle 当前发布 **21 张卡**：10 张传感卡（sensor）+ 9 张控制卡（actuator）+ 1 张资源卡（resource）+ 1 张视觉卡（camera）。
-> **4 个聚合文件**：`sensors.py`（10 张）/ `controllers.py`（5 张）/ `ext_devices.py`（4 张）/ `camera.py`（三合一 RGB/depth/pointcloud），每张卡仍然是自包含的类 + 工厂函数，方便按组评审、多人并行不撞车。
+> 本 bundle 当前发布 **22 张卡**：11 张传感卡（sensor）+ 9 张控制卡（actuator）+ 1 张资源卡（resource）+ 1 张视觉卡（camera）。
+> **4 个聚合文件**：`sensors.py`（11 张）/ `controllers.py`（5 张）/ `ext_devices.py`（4 张）/ `camera.py`（三合一 RGB/depth/pointcloud），每张卡仍然是自包含的类 + 工厂函数，方便按组评审、多人并行不撞车。
 > 目的有二：① 把这些卡干净地上架；② 作为后来者新增其它卡片的开发起点 —— 怎么加卡见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 实现基座
@@ -29,6 +29,7 @@
 | `udp_diagnostics` | UDP 通信健康 | `/{ns}/state/udp_diagnostics`：收发计数 + CRC/丢包/标志错误计数 |
 | `joints` | 12 腿关节 | `/{ns}/state/joints`：q/dq/tau/temp（骨架渲染，需 `model` 卡提供 URDF） |
 | `remote_controller` | 无线遥控器 | `/{ns}/state/remote_controller`：16 按键 + 5 摇杆轴（`HighState.wirelessRemote[40]`） |
+| `activity_monitor` | 活动度统计 | `/{ns}/state/activity`：后台采样速度/模式，action=report 返回 last_30s + since_start（距离/运动占比/平均速度/峰值/当前模式） |
 | `camera` | RGB / 深度 / 点云（三合一，type=rgb/depth/pointcloud，5 机位·multiInstance） | 卡 `start` 才连对应 Nano 板 → ROS2 CompressedImage / PointCloud2；`stop` 断开释放相机 |
 
 ### 控制卡（actuator，下发 `HighCmd` / 外设动作；须真机验证量程+安全后上架）
@@ -94,9 +95,10 @@ go1_bundle/
 ├── main.py                 # MCP server 入口 + 按 config 卡名自动装配（HIGHLEVEL）
 ├── go1_sdk_client.py       # 共享 raw SDK client（已由 sdk_proxy.py 子进程承接）
 ├── sdk_proxy.py            # SDK 子进程代理：隔离 robot_interface 避免 GIL 冲突
-│   ── 聚合卡文件（sensors.py = 11 张）──
+│   ── 聚合卡文件（sensors.py = 12 张）──
 ├── sensors.py              # 状态卡合集：battery/imu/feet/fall_alarm/obstacle_range/
-│                           #   remote_controller/udp_diagnostics/loco_state/odometry/joints/model
+│                           #   remote_controller/udp_diagnostics/loco_state/odometry/joints/
+│                           #   activity_monitor/model
 │   ── 聚合卡文件（controllers.py = 5 张）──
 ├── controllers.py          # 运动控制合集：loco/body_pose/switch_gait/gesture/special_motion
 │   ── 聚合卡文件（ext_devices.py = 4 张）──
