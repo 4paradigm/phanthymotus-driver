@@ -75,7 +75,7 @@ _TYPE_FMT = {
     # image/jpeg，避免二进制帧被当作普通传感器文本而显示为空白。
     "rgb": "image/jpeg",
     "depth": "image/jpeg",
-    "pointcloud": "mage/jpeg",
+    "pointcloud": "image/jpeg",
 }
 _TYPE_FRAME_ID_SUFFIX = {"rgb": "_rgb", "depth": "_depth", "pointcloud": ""}
 _TYPE_HAS_PREVIEW = {"rgb": False, "depth": False, "pointcloud": True}
