@@ -60,7 +60,7 @@ ENV FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
 ENV PYTHONPATH=/work
 ENV PYTHONUNBUFFERED=1
 
-EXPOSE 15717
+EXPOSE 15704
 
 # 首启时后台自动 provision Nano（部署 beep_adapter + 编译部署 camera_adapter），失败不阻塞驱动主进程；
 # 随后前台起 MCP server。容器须 --network host 才够得到 Nano 内网（service.yml 已配）。
