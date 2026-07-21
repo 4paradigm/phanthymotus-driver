@@ -1,4 +1,4 @@
-mcp_port: 15704          # go1_bundle 用 15704（与 go1 完整驱动 15715 错开，避免同机撞端口）
+mcp_port: 15715          # go1_bundle 用 15715
 ros_namespace: "bundle"  # 多组隔离：topic 变 /bundle/...，避免与别组(默认 hostname)撞车；留空则用 hostname
 name: "Unitree Go1 (Bundle)"
 
