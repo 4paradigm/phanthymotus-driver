@@ -54,6 +54,13 @@ plugins:
     enabled: true
   model:                        # (resource) 返回 go1 四足 URDF，供 joints 骨架渲染成狗
     enabled: true
+  activity_monitor:             # 活动度统计：后台采样 velocity/mode，纯读不控制；action=report 返回 last_30s + since_start
+    enabled: true
+    sample_hz: 5
+    recent_window_sec: 30
+    history_sec: 86400
+    move_eps: 0.05
+    max_integration_dt: 2.0
 
 
   # ── 控制卡（下发 HighCmd；须真机验证量程+安全后上架）──

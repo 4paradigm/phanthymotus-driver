@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import json
 import math
+import threading
 import time
+from collections import deque
 from pathlib import Path
 
 from go1_sdk_client import JOINT_NAMES, parse_wireless_remote
@@ -799,3 +801,237 @@ class ModelPlugin:
 
 def make_model(plugin_config, namespace, executor, client):
     return ModelPlugin(plugin_config, namespace, executor, client)
+
+
+# ============================================================================
+# activity_monitor.py — Go1 活动度统计卡 (actuator, read-only)
+# ============================================================================
+
+_CARD_ACTIVITY = "activity_monitor"
+_TOPIC_ACTIVITY = "/{ns}/state/activity"
+_HZ_ACTIVITY_TOPIC = 0.2       # ROS2 发布频率 (5 秒一次)
+_NODE_ACTIVITY = "go1_activity_monitor"
+_DESC_ACTIVITY = (
+    "Go1 activity statistics. A background sampler records horizontal speed "
+    "and motion state from HighState. action=report returns both last_30s "
+    "and since_start snapshots. Read-only, no robot control commands."
+)
+
+_HZ = 5.0
+_RECENT_WINDOW_SEC = 30.0
+_HISTORY_SEC = 86400.0
+_MOVE_EPS = 0.05
+_MAX_INTEGRATION_DT = 2.0
+
+
+def _classify(moving_ratio):
+    if moving_ratio < 0.1:
+        return "idle"
+    if moving_ratio < 0.5:
+        return "light"
+    return "active"
+
+
+def _speed_mag(vel):
+    """Return horizontal speed magnitude from a velocity dict/list."""
+    if vel is None:
+        return None
+    try:
+        if isinstance(vel, dict):
+            vx = float(vel.get("vx", vel.get("x", 0.0)) or 0.0)
+            vy = float(vel.get("vy", vel.get("y", 0.0)) or 0.0)
+        elif isinstance(vel, (list, tuple)) and len(vel) >= 2:
+            vx, vy = float(vel[0] or 0.0), float(vel[1] or 0.0)
+        else:
+            return None
+        return math.hypot(vx, vy)
+    except (TypeError, ValueError):
+        return None
+
+
+class ActivityMonitorPlugin:
+    def __init__(self, plugin_config, namespace, executor, client):
+        self._client = client
+        c = plugin_config or {}
+        self._hz = float(c.get("sample_hz", _HZ))
+        self._recent_window_sec = float(c.get("recent_window_sec", _RECENT_WINDOW_SEC))
+        self._history_sec = float(c.get("history_sec", _HISTORY_SEC))
+        self._move_eps = float(c.get("move_eps", _MOVE_EPS))
+        self._max_integration_dt = float(c.get("max_integration_dt", _MAX_INTEGRATION_DT))
+
+        maxlen = max(2, int(self._hz * self._history_sec))
+        self._buf = deque(maxlen=maxlen)
+        self._lock = threading.Lock()
+        self._running = False
+        self._thread = None
+        self._started_at = time.time()
+
+        self._topic = _TOPIC_ACTIVITY.format(ns=namespace)
+        self._node = None
+        if _HAS_ROS2 and executor is not None:
+            try:
+                self._node = Node(_NODE_ACTIVITY)
+                self._pub = self._node.create_publisher(String, self._topic, _QOS)
+                self._node.create_timer(1.0 / _HZ_ACTIVITY_TOPIC, self._tick)
+                executor.add_node(self._node)
+                self._node.get_logger().info(
+                    f"go1 activity_monitor → {self._topic} @ {_HZ_ACTIVITY_TOPIC}Hz")
+            except Exception as e:  # noqa: BLE001
+                print(f"[{_CARD_ACTIVITY}] ROS2 发布不可用，退回 MCP 轮询: {e}", flush=True)
+                self._node = None
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._started_at = time.time()
+        self._thread = threading.Thread(target=self._sample_loop, daemon=True)
+        self._thread.start()
+        print(f"[activity_monitor] sampler started ({self._hz}Hz, "
+              f"recent_window={self._recent_window_sec}s, history={self._history_sec}s)",
+              flush=True)
+
+    def stop(self):
+        self._running = False
+        t = self._thread
+        if t and t.is_alive():
+            t.join(timeout=2.0)
+        self._thread = None
+
+    def _sample_loop(self):
+        period = 1.0 / self._hz if self._hz > 0 else 0.2
+        while self._running:
+            ts = time.time()
+            try:
+                snap = self._client.snapshot() if self._client else None
+            except Exception:  # noqa: BLE001
+                snap = None
+
+            speed, effective_speed, moving, mode = None, 0.0, False, "unknown"
+            if snap and snap.get("fresh", False):
+                speed = _speed_mag(snap.get("velocity"))
+                mode = str(snap.get("mode_name", "unknown"))
+                if speed is not None:
+                    moving = speed >= self._move_eps
+                    effective_speed = speed if moving else 0.0
+
+            if speed is not None:
+                with self._lock:
+                    self._buf.append((ts, speed, effective_speed, moving, mode))
+
+            dt = time.time() - ts
+            time.sleep(max(0.0, period - dt))
+
+    def _select_samples(self, window_sec):
+        now = time.time()
+        with self._lock:
+            samples = list(self._buf)
+        if window_sec is None:
+            return samples
+        cutoff = now - window_sec
+        return [s for s in samples if s[0] >= cutoff]
+
+    def _compute_stats(self, samples, label):
+        if len(samples) < 2:
+            return {
+                "range": label, "verdict": "no_data", "window_sec": 0.0,
+                "sample_count": len(samples), "distance_m": 0.0,
+                "moving_ratio": 0.0, "idle_sec": 0.0, "avg_speed": 0.0,
+                "peak_speed": 0.0,
+                "summary": "not enough fresh HighState samples yet",
+            }
+
+        t0, tN = samples[0][0], samples[-1][0]
+        actual_window_sec = max(0.0, tN - t0)
+
+        distance = 0.0
+        moving_cnt = 0
+        peak = 0.0
+
+        for i, (ts, raw_speed, effective_speed, moving, mode) in enumerate(samples):
+            peak = max(peak, raw_speed)
+            if moving:
+                moving_cnt += 1
+            if i > 0:
+                prev_ts, _pr, prev_eff, _pm, _pmd = samples[i - 1]
+                dt = ts - prev_ts
+                if 0 < dt <= self._max_integration_dt:
+                    distance += 0.5 * (prev_eff + effective_speed) * dt
+
+        n = len(samples)
+        moving_ratio = moving_cnt / n
+        idle_sec = round((1.0 - moving_ratio) * actual_window_sec, 1)
+        avg_speed = distance / actual_window_sec if actual_window_sec > 0 else 0.0
+        verdict = _classify(moving_ratio)
+
+        return {
+            "range": label, "verdict": verdict,
+            "window_sec": round(actual_window_sec, 1), "sample_count": n,
+            "distance_m": round(distance, 2),
+            "moving_ratio": round(moving_ratio, 2), "idle_sec": idle_sec,
+            "avg_speed": round(avg_speed, 3), "peak_speed": round(peak, 3),
+            "summary": (f"{label}: {verdict}, moved ~{round(distance, 2)}m, "
+                        f"{int(moving_ratio * 100)}% of time moving, "
+                        f"idle {idle_sec}s, peak {round(peak, 2)}m/s"),
+        }
+
+    def _report(self):
+        now_samples = self._select_samples(None)
+        recent_samples = self._select_samples(self._recent_window_sec)
+        current_mode = now_samples[-1][4] if now_samples else "unknown"
+        return {
+            "ok": True, "action": "report", "card": _CARD_ACTIVITY,
+            "control_level": "HIGHLEVEL",
+            "timestamp_ms": int(time.time() * 1000),
+            "current_mode": current_mode, "move_eps": self._move_eps,
+            "last_30s": self._compute_stats(recent_samples, "last_30s"),
+            "since_start": self._compute_stats(now_samples, "since_start"),
+        }
+
+    def _build_for_topic(self):
+        return self._report()
+
+    def _tick(self):
+        try:
+            m = String()
+            m.data = json.dumps(self._build_for_topic())
+            self._pub.publish(m)
+        except Exception as e:  # noqa: BLE001
+            self._node.get_logger().error(f"publish {self._topic} error: {e}")
+
+    def get_tool(self):
+        desc = _DESC_ACTIVITY + (
+            f" — → {self._topic}" if self._node else " — poll via MCP action=report")
+        return {
+            "name": _CARD_ACTIVITY, "type": "actuator",
+            "multiInstance": False, "description": desc,
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["report"],
+                        "description": "report = returns both last_30s and since_start activity stats",
+                    }
+                },
+                "required": ["action"],
+            },
+            "topic_out": (
+                [{"topic": self._topic, "format": "data/json"}] if self._node else []),
+        }
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action in ("info", "read", "get", _CARD_ACTIVITY):
+            return {"state": "running", "data": self._report(),
+                    "topic_out": ([{"topic": self._topic, "format": "data/json"}] if self._node else [])}
+        if action == "report":
+            return self._report()
+        return None
+
+
+def make_activity_monitor(plugin_config, namespace, executor, client):
+    return ActivityMonitorPlugin(plugin_config, namespace, executor, client)
