@@ -111,7 +111,7 @@ go1_bundle/
 ├── requirements.txt        # 运行期 pip 依赖（pyyaml / paho-mqtt；rclpy/robot_interface 由镜像构建）
 ├── Dockerfile              # ARM64；镜像内构建 robot_interface.so
 ├── deploy/                 # Nano 侧服务部署（nano_bootstrap.sh 等）
-├── camera/                 # Nano 侧 C++ 流媒体源码（rgb_stream.cc / depth_stream.cc / pointcloud_stream.cc）
+├── deploy/camera/          # Nano 侧 C++ 流媒体源码（含 rgb_stream.cc / nvjpeg_worker.cc / depth_stream.cc / pointcloud_stream.cc）
 ├── README.md               # 本文件
 └── CONTRIBUTING.md         # ★ 如何在此基础上新增卡片
 ```
@@ -161,7 +161,7 @@ sudo docker run --rm --name go1_bundle \
   go1_bundle:test
 ```
 
-> ⚠ `DEPTH_ENABLE=1` / `PCL_ENABLE=1` 会在 Nano 板上装常驻 systemd 服务。depth / pointcloud / camera_rgb 指向同一物理相机，三者互斥，按需启用即可。
+> ⚠ `DEPTH_ENABLE=1` / `PCL_ENABLE=1` 会在 Nano 板上装常驻 systemd 服务。camera 的 rgb / depth / pointcloud 三种模式指向同一物理相机，三者互斥，按需启用即可。
 
 ## 端口
 

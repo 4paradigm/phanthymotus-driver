@@ -47,12 +47,10 @@ COPY camera.py         /work/camera.py
 COPY config.yaml       /work/config.yaml
 COPY deploy/           /deploy/
 COPY resource/         /work/resource/
-# Nano 侧后端源码放进 /deploy/，供 nano_bootstrap.sh 首启时分发/编译到 Head Nano：
-#   beep_adapter.py（beep，纯 Python 免编译）/ camera_adapter/（camera_rgb，Nano 上现编 C++）。
+# Nano 侧后端源码放进 /deploy/，供 nano_bootstrap.sh 首启时分发/编译到 Nano：
+#   beep/speaker adapter（纯 Python）与 camera/（RGB、深度、点云流）。
 COPY deploy/beep_adapter.py   /deploy/beep_adapter.py
 COPY deploy/speaker_adapter.py /deploy/speaker_adapter.py
-COPY deploy/camera_adapter/   /deploy/camera_adapter/
-# 点云:NX/Nano 侧 pointcloud_stream.cc 供 nano_bootstrap.sh 首启时分发+编译(镜像 depth_stream 的 SDK 路径)。
 COPY deploy/camera/           /deploy/camera/
 
 ENV ROS_DOMAIN_ID=42
@@ -65,8 +63,6 @@ ENV DEPTH_ENABLE=1
 
 EXPOSE 15704
 
-# 首启时后台自动 provision Nano（部署 beep_adapter + 编译部署 camera_adapter），失败不阻塞驱动主进程；
-# 随后前台起 MCP server。容器须 --network host 才够得到 Nano 内网（service.yml 已配）。
 # 首启时后台自动 provision Nano（部署 beep_adapter/speaker_adapter + 编译部署 camera/pointcloud），失败不阻塞；
 # 随后前台起 MCP server。容器须 --network host 才够得到 Nano 内网（service.yml 已配）。
 # ⚠️ 先 source（用 ; 顺序执行，不放进后台），再把 bootstrap 丢后台，最后 exec 主进程——这样 main.py 才

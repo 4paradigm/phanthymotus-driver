@@ -1,16 +1,16 @@
 #!/bin/bash
-# nano_bootstrap.sh —— 容器首启时由 Dockerfile CMD 自动后台跑一次，把 camera_rgb / beep 的
+# nano_bootstrap.sh —— 容器首启时由 Dockerfile CMD 自动后台跑一次，把 camera / beep 的
 # Nano 端自动布好。目标：Pi 上 clone → build → run 镜像后，无需任何手动步骤，
-# 就能在 15678 上直接调用 beep / camera_rgb。
+# 就能在 15678 上直接调用 beep / camera。
 #
 # 在容器里跑（容器须 --network host 才够得到 Nano 内网 192.168.123.x）：
 #   bash /deploy/nano_bootstrap.sh
 # CMD 里以后台方式点火：  bash /deploy/nano_bootstrap.sh & python3 /work/main.py
 #
 # 幂等：已装好（服务 active + 二进制在）则跳过重装；每次都确保占用自启被禁 + 设备当前空闲。
-# 依赖：容器内有 sshpass；/deploy/ 下有 camera_adapter/camera_adapter.cpp、beep_adapter.py、
-#       go1-camera-adapter.service、go1-beep-adapter.service、go1-beep-adapter.example.json。
-# Nano 前置（本狗都已具备）：~/UnitreecameraSDK + g++ + opencv4（编 camera_adapter）；alsa-utils（beep 出声）。
+# 依赖：容器内有 sshpass；/deploy/camera/ 下有 rgb_stream.cc、nvjpeg_worker.cc、
+# depth_stream.cc、pointcloud_stream.cc，以及 beep/speaker adapter。
+# Nano 前置：UnitreeCameraSDK、g++、OpenCV；RGB 硬件 JPEG 还需要 GStreamer 的 nvjpegenc。
 set +e
 
 NANO="${NANO_IP:-192.168.123.13}"
@@ -25,8 +25,6 @@ log(){ echo "[nano_bootstrap] $*"; }
 # 按板 IP 的 ssh/scp（camera/pointcloud 多板 provision 用；单行短连接）。
 bssh(){ sshpass -p "$PW" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 "unitree@$1" "$2"; }
 bscp(){ sshpass -p "$PW" scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 "$2" "unitree@$1:$3"; }
-# 反向 SCP：从 Nano → Pi 容器本地（MMAPI 采集用）。
-bscp_from(){ sshpass -p "$PW" scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 "unitree@$1:$2" "$3"; }
 # 板上探测 SDK 目录（含 include/UnitreeCameraSDK.hpp 的第一个候选）；单引号 → $HOME 在板上求值。
 CAM_DETECT='for d in $HOME/UnitreecameraSDK $HOME/Unitree/sdk/UnitreeCameraSdk; do [ -f "$d/include/UnitreeCameraSDK.hpp" ] && echo "$d" && break; done'
 
@@ -37,15 +35,15 @@ if ! $SSH $R 'echo ok' >/dev/null 2>&1; then
   log "✗ 连不上 Nano $NANO（容器需 --network host + Nano 在线 + ssh unitree/123）；跳过 provision。"
   exit 0
 fi
-log "Nano $NANO 可达，开始 provision camera_rgb + beep。"
+log "Nano $NANO 可达，开始 provision camera + beep。"
 
-# ── 1) camera_rgb 端：rgb_stream × 五机位（三块板；镜像 depth_stream 编法，每路一个常驻 TCP 服务）──
-#   每行: position board_ip device_id image_port  （与 Pi 侧 camera_rgb.positions 对齐）
-#   rgb_stream 空闲时只监听 image_port(9201~9205)、不占相机；Pi 侧 camera_rgb 卡 start 连上才开相机，
+# ── 1) camera(type=rgb) 端：rgb_stream × 五机位（三块板；每路一个常驻 TCP 服务）──
+#   每行: position board_ip device_id image_port  （与 Pi 侧 camera.positions 对齐）
+#   rgb_stream 空闲时只监听 image_port(9201~9205)、不占相机；Pi 侧 camera 卡 start 连上才开相机，
 #   断开即 _exit(0) 释放相机(systemd 重启回待命) → 与同机位的 pointcloud/depth 互斥(谁连上谁占,属预期)。
 #   opencv4：.13/.15 在 /usr/pkg-config；.14 装在 /usr/local(头+库+rpath)。下面 OCV 探测全覆盖。
-#   ★ 放弃旧 camera_adapter(JSON 控制口 + UDP 图传)路线:那条 .14/.15 没装服务就没流、且发原始鱼眼+不翻正。
-#     rgb_stream 用配置文件构造(加载标定)→ getRectStereoFrame 取去鱼眼左目 → cv::flip(-1) 翻正 → TCP 推 JPEG。
+#   rgb_stream 使用 CMei 去鱼眼、翻正与自动裁黑边；JPEG 由独立 nvjpeg_worker 进程硬件编码，
+#   避免 Unitree SDK/OpenCV 与 GStreamer nvjpegenc 的 libjpeg ABI 冲突。
 CAM_ROWS=(
   "front 192.168.123.13 1 9201"
   "chin  192.168.123.13 0 9202"
@@ -53,47 +51,7 @@ CAM_ROWS=(
   "right 192.168.123.14 1 9204"
   "belly 192.168.123.15 0 9205"
 )
-if [ -f "$DEPLOY/camera/rgb_stream.cc" ]; then
-  # ── MMAPI 采集：从有 Jetson Multimedia API 的板子缓存头文件+类源码，供无 MMAPI 的板编译用 ──
-  # NvJpegEncoder 编译需要 include/ 下的头文件 + samples/common/classes/ 下的 .cpp；
-  # 运行时 libnvjpeg.so 是 L4T 自带的，三块板都有，只缺编译材料。
-  # 策略：找一块有 MMAPI 的板(通常 .13) → tar 打包 → SCP 回 Pi 容器缓存 → 按需推送给没有的板。
-  MMAPI_CACHE="$DEPLOY/.mmapi_cache"
-  MMAPI_INC_R="/usr/src/jetson_multimedia_api/include"
-  MMAPI_CLS_R="/usr/src/jetson_multimedia_api/samples/common/classes"
-  MMAPI_DONOR=""
-
-  if [ ! -f "$MMAPI_CACHE/mmapi.tar.gz" ]; then
-    for B_PROBE in 192.168.123.13 192.168.123.14 192.168.123.15; do
-      if bssh "$B_PROBE" "[ -f $MMAPI_INC_R/NvJpegEncoder.h ]" 2>/dev/null; then
-        MMAPI_DONOR="$B_PROBE"
-        break
-      fi
-    done
-    if [ -n "$MMAPI_DONOR" ]; then
-      log "camera: 从 $MMAPI_DONOR 采集 MMAPI 编译材料…"
-      # 在 donor 上打包需要的头文件和类源码
-      bssh "$MMAPI_DONOR" "tar czf /tmp/mmapi_harvest.tar.gz \
-        -C /usr/src/jetson_multimedia_api \
-        include/NvJpegEncoder.h include/NvElement.h include/NvBuffer.h include/NvLogging.h \
-        samples/common/classes/NvJpegEncoder.cpp \
-        samples/common/classes/NvElement.cpp \
-        samples/common/classes/NvLogging.cpp \
-        2>/dev/null" 2>/dev/null
-      mkdir -p "$MMAPI_CACHE"
-      bscp_from "$MMAPI_DONOR" "/tmp/mmapi_harvest.tar.gz" "$MMAPI_CACHE/mmapi.tar.gz" 2>/dev/null
-      if [ -f "$MMAPI_CACHE/mmapi.tar.gz" ]; then
-        log "camera: MMAPI 缓存就绪(来源 $MMAPI_DONOR)"
-      else
-        log "camera: MMAPI 采集失败 → 无 MMAPI 的板将 fallback cv::imencode"
-      fi
-    else
-      log "camera: 三块板均无 MMAPI → 全部 fallback cv::imencode 软编码"
-    fi
-  else
-    log "camera: MMAPI 缓存已存在,跳过采集"
-  fi
-
+if [ -f "$DEPLOY/camera/rgb_stream.cc" ] && [ -f "$DEPLOY/camera/nvjpeg_worker.cc" ]; then
   CAM_DONE=""   # 已处理过的板（每板只编译/禁 autostart/腾设备一次）
   for row in "${CAM_ROWS[@]}"; do
     set -- $row; POS="$1"; B="$2"; DEVID="$3"; PORT="$4"
@@ -110,41 +68,21 @@ if [ -f "$DEPLOY/camera/rgb_stream.cc" ]; then
         # ③ 停掉旧 camera_adapter 路线的服务（若之前装过 go1-camera-adapter-*，避免抢 9201~9205 没用、
         #   但抢相机/端口）。新路线服务名是 go1-rgb-<pos>，与旧名不冲突，这里只清旧的。
         bssh "$B" "echo $PW | sudo -S systemctl stop go1-camera-adapter.service go1-camera-adapter-front go1-camera-adapter-chin go1-camera-adapter-left go1-camera-adapter-right go1-camera-adapter-belly 2>/dev/null; echo $PW | sudo -S systemctl disable go1-camera-adapter.service go1-camera-adapter-front go1-camera-adapter-chin go1-camera-adapter-left go1-camera-adapter-right go1-camera-adapter-belly 2>/dev/null; true" 2>/dev/null
-        log "camera: 在 $B 编 rgb_stream(SDK=$SDK)…"
-        bssh "$B" "rm -f $SDK/bins/rgb_stream" 2>/dev/null
+        log "camera: 在 $B 编 rgb_stream + 隔离 nvjpeg_worker(SDK=$SDK)…"
+        bssh "$B" "rm -f $SDK/bins/rgb_stream $SDK/bins/nvjpeg_worker" 2>/dev/null
         bscp "$B" "$DEPLOY/camera/rgb_stream.cc" "$SDK/rgb_stream.cc" 2>/dev/null
+        bscp "$B" "$DEPLOY/camera/nvjpeg_worker.cc" "$SDK/nvjpeg_worker.cc" 2>/dev/null
         # 编法镜像 depth_stream：opencv4 用 pkg-config；.14 无 pkg-config → 显式 /usr/local + rpath。
         # 🔴 /usr/local 回退必须链全 opencv 模块:SDK 的 libunitree_camera.a(StereoCameraCommon) 内部用
         #   cv::VideoWriter(videoio)、cv::StereoSGBM/StereoBM(calib3d),只链 core/imgproc/imgcodecs 会
         #   undefined reference → .14 编不过(left/right inactive)。pkg-config opencv4 自带全模块不受影响。
-        # ── NVJPEG 探测+部署：优先板上已有 → 其次推送缓存 → 最后 fallback ──
-        MMAPI_INC="/usr/src/jetson_multimedia_api/include"
-        MMAPI_CLS="/usr/src/jetson_multimedia_api/samples/common/classes"
-        NVJPEG=""
-        if bssh "$B" "[ -f $MMAPI_INC/NvJpegEncoder.h ]" 2>/dev/null; then
-          # 板上已有完整 MMAPI
-          NVJPEG="-DUSE_NVJPEG -I$MMAPI_INC $MMAPI_CLS/NvJpegEncoder.cpp $MMAPI_CLS/NvElement.cpp $MMAPI_CLS/NvLogging.cpp -L/usr/lib/aarch64-linux-gnu/tegra -lnvjpeg -Wl,-rpath,/usr/lib/aarch64-linux-gnu/tegra"
-          log "camera: $B 板上已有 MMAPI → 启用硬件 JPEG 编码(-DUSE_NVJPEG)"
-        elif [ -f "$MMAPI_CACHE/mmapi.tar.gz" ] && bssh "$B" "[ -f /usr/lib/aarch64-linux-gnu/tegra/libnvjpeg.so ]" 2>/dev/null; then
-          # 板上无 MMAPI 头文件但有 libnvjpeg.so(L4T 运行时) → 推送缓存的编译材料
-          log "camera: $B 无 MMAPI 头文件,推送缓存 + 检测到 libnvjpeg.so…"
-          bscp "$B" "$MMAPI_CACHE/mmapi.tar.gz" "/tmp/mmapi_harvest.tar.gz" 2>/dev/null
-          bssh "$B" "mkdir -p /tmp/mmapi && tar xzf /tmp/mmapi_harvest.tar.gz -C /tmp/mmapi" 2>/dev/null
-          if bssh "$B" "[ -f /tmp/mmapi/include/NvJpegEncoder.h ]" 2>/dev/null; then
-            NVJPEG="-DUSE_NVJPEG -I/tmp/mmapi/include /tmp/mmapi/samples/common/classes/NvJpegEncoder.cpp /tmp/mmapi/samples/common/classes/NvElement.cpp /tmp/mmapi/samples/common/classes/NvLogging.cpp -L/usr/lib/aarch64-linux-gnu/tegra -lnvjpeg -Wl,-rpath,/usr/lib/aarch64-linux-gnu/tegra"
-            log "camera: $B MMAPI 缓存部署成功 → 启用硬件 JPEG 编码(-DUSE_NVJPEG)"
-          else
-            log "camera: $B MMAPI 缓存解压失败 → fallback cv::imencode 软编码"
-          fi
-        else
-          log "camera: $B 无 MMAPI 且无 libnvjpeg.so → fallback cv::imencode 软编码"
-        fi
-        bssh "$B" "cd $SDK && mkdir -p bins && OCV=\$(pkg-config --cflags --libs opencv4 2>/dev/null); if [ -z \"\$OCV\" ]; then OCV=\$(pkg-config --cflags --libs opencv 2>/dev/null); fi; if [ -z \"\$OCV\" ] && [ -f /usr/local/include/opencv4/opencv2/opencv.hpp ]; then OCV=\"-I/usr/local/include/opencv4 -L/usr/local/lib -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lopencv_calib3d -lopencv_videoio -lopencv_highgui -lopencv_features2d -lopencv_flann -Wl,-rpath,/usr/local/lib\"; fi; if [ -z \"\$OCV\" ] && [ -f /usr/include/opencv4/opencv2/opencv.hpp ]; then OCV=\"-I/usr/include/opencv4 -L/usr/lib/aarch64-linux-gnu -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lopencv_calib3d -lopencv_videoio -Wl,-rpath,/usr/lib/aarch64-linux-gnu\"; fi; g++ -O2 -std=c++14 -pthread rgb_stream.cc -I$SDK/include -I$SDK/thirdparty -L$SDK/lib/arm64 -Wl,--start-group -lunitree_camera -ltstc_V4L2_xu_camera -lsystemlog -ludev -Wl,--end-group \$OCV $NVJPEG -o bins/rgb_stream 2>&1 | tail -6" 2>&1 | tail -6
+        # rgb_stream 不链接 GStreamer，避免与 Unitree SDK 的 libjpeg ABI 冲突；独立 worker 才链接 nvjpegenc。
+        bssh "$B" "cd $SDK && mkdir -p bins && OCV=\$(pkg-config --cflags --libs opencv4 2>/dev/null); if [ -z \"\$OCV\" ]; then OCV=\$(pkg-config --cflags --libs opencv 2>/dev/null); fi; if [ -z \"\$OCV\" ] && [ -f /usr/local/include/opencv4/opencv2/opencv.hpp ]; then OCV=\"-I/usr/local/include/opencv4 -L/usr/local/lib -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lopencv_calib3d -lopencv_videoio -lopencv_highgui -lopencv_features2d -lopencv_flann -Wl,-rpath,/usr/local/lib\"; fi; if [ -z \"\$OCV\" ] && [ -f /usr/include/opencv4/opencv2/opencv.hpp ]; then OCV=\"-I/usr/include/opencv4 -L/usr/lib/aarch64-linux-gnu -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lopencv_calib3d -lopencv_videoio -Wl,-rpath,/usr/lib/aarch64-linux-gnu\"; fi; GST=\$(pkg-config --cflags --libs gstreamer-1.0 gstreamer-app-1.0 2>/dev/null); if [ -z \"\$GST\" ]; then echo missing-gstreamer-dev; exit 1; fi; g++ -O2 -std=c++14 -pthread rgb_stream.cc -I$SDK/include -I$SDK/thirdparty -L$SDK/lib/arm64 -Wl,--start-group -lunitree_camera -ltstc_V4L2_xu_camera -lsystemlog -ludev -Wl,--end-group \$OCV -o bins/rgb_stream && g++ -O2 -std=c++14 -pthread nvjpeg_worker.cc \$GST -o bins/nvjpeg_worker 2>&1 | tail -8" 2>&1 | tail -8
         CAM_DONE="$CAM_DONE $B"
         ;;
     esac
-    if ! bssh "$B" "[ -x $SDK/bins/rgb_stream ]" 2>/dev/null; then
-      log "camera: $POS@$B 无有效二进制(编译失败?可能缺 opencv)→ 跳过服务"; continue
+    if ! bssh "$B" "[ -x $SDK/bins/rgb_stream ] && [ -x $SDK/bins/nvjpeg_worker ]" 2>/dev/null; then
+      log "camera: $POS@$B 无有效 rgb_stream/nvjpeg_worker(编译失败?可能缺依赖)→ 跳过服务"; continue
     fi
     SVC="go1-rgb-$POS"
     bssh "$B" "cat > /tmp/$SVC.service <<EOF
@@ -155,7 +93,7 @@ After=network.target
 Type=simple
 User=unitree
 WorkingDirectory=$SDK
-ExecStart=$SDK/bins/rgb_stream $PORT $DEVID 30
+ExecStart=$SDK/bins/rgb_stream $PORT $DEVID
 Restart=always
 RestartSec=3
 [Install]
@@ -165,7 +103,7 @@ EOF" 2>/dev/null
     log "camera: $POS@$B → 服务 $SVC 已装/重启(dev$DEVID, 端口 $PORT, SDK $SDK)。"
   done
 else
-  log "✗ /deploy 下无 camera/rgb_stream.cc → camera 端跳过。"
+  log "✗ /deploy 下无 camera/rgb_stream.cc 或 nvjpeg_worker.cc → camera 端跳过。"
 fi
 
 # ── 2) beep 端：beep_adapter（:18082 /v1/beep/actions，纯 Python 免编译）──────────────
@@ -216,7 +154,7 @@ done
 
 # ── 5) point cloud 端:pointcloud_stream(每路一个常驻服务;连上才开相机 → 免重启热切)──────
 #   各板 SDK 路径不同(.13=~/UnitreecameraSDK,.14/.15=~/Unitree/sdk/UnitreeCameraSdk)→ 自动探测。
-#   ⚠ 与 camera_rgb 同设备互斥:同一机位的 pointcloud 服务和 camera_adapter 不能同时开相机,
+#   ⚠ 与 camera(type=rgb) 同设备互斥:同一机位的 pointcloud 与 RGB 服务不能同时开相机,
 #   谁先 start 谁占设备(另一路 fuser 抢)。要 15678 五路 RGB 都出图,本段默认**不启用**
 #   pointcloud 服务(CAM 之外的点云由 test_camera_pointcloud 卡按需起,不靠这里常驻)。
 #   保留代码但用 ${PCL_ENABLE:-0} 开关;除非显式 PCL_ENABLE=1 否则跳过,避免和 belly(.15 dev0)等撞设备。
@@ -283,7 +221,7 @@ EOF" 2>/dev/null
   done
 else
   if [ "${PCL_ENABLE}" != "1" ]; then
-    log "point cloud: PCL_ENABLE!=1 → 跳过(默认不与 camera_rgb 抢设备;按需 PCL_ENABLE=1 启用)。"
+    log "point cloud: PCL_ENABLE!=1 → 跳过(默认不与 camera RGB 抢设备;按需 PCL_ENABLE=1 启用)。"
   elif [ ! -f "$DEPLOY/camera/pointcloud_stream.cc" ]; then
     log "✗ /deploy/camera/pointcloud_stream.cc 不存在(Dockerfile 应 COPY camera/)→ point cloud 端跳过。"
   fi
@@ -293,7 +231,7 @@ fi
 #   与 pointcloud 同套路:每路一个常驻服务(空闲不占相机);自动探测 SDK 路径 + raw g++ 编译。
 #   depth_stream 按 device_id 现场生成 config 开相机(加载立体标定,同 pointcloud);Pi 侧 test_camera_depth 卡 start 才连、stop 就断。
 #   与点云/RGB 指向同一相机 → 三者互斥(谁连上谁 fuser 顶掉对方),属预期。
-#   ⚠ 与 camera_rgb 抢同一设备 → 默认**不启用**(DEPTH_ENABLE 默认 0),除非显式要常驻深度,
+#   ⚠ 与 camera RGB 抢同一设备 → 默认**不启用**(DEPTH_ENABLE 默认 0),除非显式要常驻深度,
 #     否则交给 test_camera_depth 卡按需起,避免和 belly(.15 dev0)/left/right 等抢相机。
 #   端口 91xx 与点云 94xx / RGB 92xx-93xx 错开。每行: position board_ip device_id port
 #   (与 config.yaml test_camera_depth.positions 及 Pi 侧 depth_port 对齐)
@@ -349,7 +287,7 @@ EOF" 2>/dev/null
   done
 else
   if [ "${DEPTH_ENABLE}" != "1" ]; then
-    log "depth: DEPTH_ENABLE!=1 → 跳过(默认不与 camera_rgb 抢设备;按需 DEPTH_ENABLE=1 启用)。"
+    log "depth: DEPTH_ENABLE!=1 → 跳过(默认不与 camera RGB 抢设备;按需 DEPTH_ENABLE=1 启用)。"
   elif [ ! -f "$DEPLOY/camera/depth_stream.cc" ]; then
     log "✗ /deploy/camera/depth_stream.cc 不存在(Dockerfile 应 COPY camera/)→ depth 端跳过。"
   fi

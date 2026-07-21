@@ -13,7 +13,7 @@
  * ★ 抢占:开相机前 fuser -k /dev/video<device_id> 释放占用者(出厂 point_cloud_node / pointcloud_stream 等)。
  *
  * 协议:每帧 = [4字节大端长度 N][N 字节 JPEG 数据](与 test_camera_depth.py 桥接约定一致)
- *   ★ 用 JPEG(不是 PNG):画布只渲染 image/jpeg 的 CompressedImage(对齐 camera_rgb);
+ *   ★ 用 JPEG(不是 PNG):画布只渲染 image/jpeg 的 CompressedImage(对齐 camera 的 RGB 模式);
  *     彩色深度图是 3 通道 BGR 可视化(给人看,非原始深度值),JPEG 有损无妨。
  *
  * 编译(nano_bootstrap 自动做):
