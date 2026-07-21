@@ -1,8 +1,8 @@
 # Go1 Nano camera streams
 
-`camera.py` is the Pi-side three-in-one visual card. Set its `type` to
-`rgb`, `depth`, or `pointcloud`; each instance selects one of the five
-positions below.
+`camera.py` is the Pi-side visual-card aggregation file. It registers the
+independent `camera_rgb`, `camera_depth`, and `camera_pointcloud` cards; each
+instance selects one of the five positions below.
 
 | Position | Nano | device_id | RGB | depth | point cloud |
 |---|---:|---:|---:|---:|---:|

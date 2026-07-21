@@ -2,9 +2,9 @@
 """
 go1_bundle/main.py — Unitree Go1 (EDU) 状态 + 基础控制驱动入口（原始 unitree_legged_sdk）。
 
-一个驱动 = 一个 MCP server。本 bundle 聚合 21 张卡片到 4 个聚合文件：
+一个驱动 = 一个 MCP server。卡片聚合在 4 个文件：
 `sensors.py`（11 张状态/资源卡）/ `controllers.py`（5 张控制卡）/
-`ext_devices.py`（4 张外部设备卡）/ `camera.py`（视觉卡，三合一）。
+`ext_devices.py`（4 张外部设备卡）/ `camera.py`（独立注册 RGB、深度、点云三张视觉卡）。
 main.py 按 config.yaml 里启用的卡名**显式导入对应模块**并装配
 （约定：config key == 模块内的 make_* 函数名）。
 因此新增一张卡 = 在对应聚合文件中追加 `Plugin` + `make_<卡名>` +
@@ -57,7 +57,7 @@ def _resolve_namespace(cfg: dict) -> str:
 class Go1Bundle:
     """按 config 装配启用的卡片；对外提供 tools 列表与 dispatch。
 
-    装配规则：遍历 config.plugins 里 enabled 的每个卡名 → 从对应模块导入并调用 make_plugin。
+    装配规则：按 config.plugins 中 enabled 的卡名，从对应聚合模块调用 make_<卡名> 工厂函数。
     """
 
     def __init__(self, cfg, namespace, executor, client):
@@ -172,12 +172,21 @@ class Go1Bundle:
             self._plugins.append(ext_devices.make_system_health(pc["system_health"], namespace, executor, client))
             print("[bundle] system_health loaded")
 
-        # 相机 - 从 camera.py 导入（返回单个插件，但插件内部有多个工具）
-        if pc.get("camera", {}).get("enabled", False):
+        # 相机 - 三张独立卡仍由同一个 camera.py 聚合文件提供。
+        if pc.get("camera_rgb", {}).get("enabled", False):
             import camera
-            camera_plugin = camera.make_plugin(pc["camera"], namespace, executor, client)
-            self._plugins.append(camera_plugin)
-            print("[bundle] camera loaded")
+            self._plugins.append(camera.make_camera_rgb(pc["camera_rgb"], namespace, executor, client))
+            print("[bundle] camera_rgb loaded")
+
+        if pc.get("camera_depth", {}).get("enabled", False):
+            import camera
+            self._plugins.append(camera.make_camera_depth(pc["camera_depth"], namespace, executor, client))
+            print("[bundle] camera_depth loaded")
+
+        if pc.get("camera_pointcloud", {}).get("enabled", False):
+            import camera
+            self._plugins.append(camera.make_camera_pointcloud(pc["camera_pointcloud"], namespace, executor, client))
+            print("[bundle] camera_pointcloud loaded")
 
         print(f"[bundle] {len(self._plugins)} plugins loaded", flush=True)
 

@@ -19,14 +19,29 @@ plugins:
     enabled: true
     mqtt_host: "localhost"
     mqtt_port: 1883
-  camera:                    # 三合一：RGB / 深度 / 点云（multiInstance）
+  # 相机三卡共用同一 camera.py；每张卡均为 multiInstance，可各自选机位。
+  # 同一物理机位的三种流仍互斥：谁先 start 谁占用相机。
+  camera_rgb:
     enabled: true
-    type: rgb                # 功能模式：rgb / depth / pointcloud
     default_position: "front"
-    # 机位→板卡映射。三路流端口均列出，插件按 type 选取对应端口。
-    # rgb_stream 由 nano_bootstrap.sh 首启时自动在 .13/.14/.15 编译+装 systemd。
-    # 同一物理相机三路互斥(谁连上谁占,断开 _exit 释放)。
-    # depth / pointcloud 需在 Dockerfile 传 DEPTH_ENABLE=1 / PCL_ENABLE=1。
+    positions:
+      front: {board_ip: "192.168.123.13", image_port: 9201, depth_port: 9101, pcl_port: 9401}
+      chin:  {board_ip: "192.168.123.13", image_port: 9202, depth_port: 9102, pcl_port: 9402}
+      left:  {board_ip: "192.168.123.14", image_port: 9203, depth_port: 9103, pcl_port: 9403}
+      right: {board_ip: "192.168.123.14", image_port: 9204, depth_port: 9104, pcl_port: 9404}
+      belly: {board_ip: "192.168.123.15", image_port: 9205, depth_port: 9105, pcl_port: 9405}
+  camera_depth:
+    enabled: true              # Nano 侧需 DEPTH_ENABLE=1
+    default_position: "front"
+    positions:
+      front: {board_ip: "192.168.123.13", image_port: 9201, depth_port: 9101, pcl_port: 9401}
+      chin:  {board_ip: "192.168.123.13", image_port: 9202, depth_port: 9102, pcl_port: 9402}
+      left:  {board_ip: "192.168.123.14", image_port: 9203, depth_port: 9103, pcl_port: 9403}
+      right: {board_ip: "192.168.123.14", image_port: 9204, depth_port: 9104, pcl_port: 9404}
+      belly: {board_ip: "192.168.123.15", image_port: 9205, depth_port: 9105, pcl_port: 9405}
+  camera_pointcloud:
+    enabled: true              # Nano 侧需 PCL_ENABLE=1
+    default_position: "front"
     positions:
       front: {board_ip: "192.168.123.13", image_port: 9201, depth_port: 9101, pcl_port: 9401}
       chin:  {board_ip: "192.168.123.13", image_port: 9202, depth_port: 9102, pcl_port: 9402}
@@ -98,4 +113,3 @@ plugins:
     # straight_hand_duration_s: 4.0
     # stabilize_timeout_s: 3.0        # 等待站到/回到 balance_stand 的超时
     # stabilize_settle_s: 0.5         # 确认站稳后、开火前的小停顿
-
