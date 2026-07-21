@@ -74,8 +74,8 @@ _TYPE_FMT = {
     # 载体是 CompressedImage，payload 本身是 JPEG，必须向画布声明为
     # image/jpeg，避免二进制帧被当作普通传感器文本而显示为空白。
     "rgb": "image/jpeg",
-    "depth": "sensor_msgs/CompressedImage (jpeg, colorized depth)",
-    "pointcloud": "sensor_msgs/PointCloud2 (XYZ, meters)",
+    "depth": "image/jpeg",
+    "pointcloud": "mage/jpeg",
 }
 _TYPE_FRAME_ID_SUFFIX = {"rgb": "_rgb", "depth": "_depth", "pointcloud": ""}
 _TYPE_HAS_PREVIEW = {"rgb": False, "depth": False, "pointcloud": True}
