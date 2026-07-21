@@ -120,6 +120,11 @@ class Go1Bundle:
             self._plugins.append(sensors.make_model(pc["model"], namespace, executor, client))
             print("[bundle] model loaded")
 
+        if pc.get("activity_monitor", {}).get("enabled", False):
+            import sensors
+            self._plugins.append(sensors.make_activity_monitor(pc["activity_monitor"], namespace, executor, client))
+            print("[bundle] activity_monitor loaded")
+
         # 控制卡 - 从 controllers.py 导入
         if pc.get("loco", {}).get("enabled", False):
             import controllers
