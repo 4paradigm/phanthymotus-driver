@@ -11,7 +11,6 @@ plugins:
   battery:                      # BMS：SOC%/电流/循环/温度/单体电压
     enabled: true
 
-  # ── xin 新增(扩展卡)──
   face_light:                   # 面部灯带颜色(actuator,MQTT):set_color/preset/off
     enabled: true
     mqtt_host: "localhost"

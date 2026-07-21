@@ -532,14 +532,48 @@ class Plugin:
         iid = args.get("instance_id") or "default"
 
         if action == "config":
+            config = args.get("config", {})
+
+            # 检查是否需要切换类型
+            new_type = config.get("type")
+            if new_type and new_type != self._type:
+                if new_type not in _TYPE_PORT_KEY:
+                    return _err("INVALID_ARGUMENT", f"unknown type {new_type!r}; valid: {_VALID_TYPES}")
+
+                # 更新类型相关配置
+                self._type = new_type
+                self._port_key = _TYPE_PORT_KEY[self._type]
+                self._default_port = _TYPE_DEFAULT_PORT[self._type]
+                self._topic_root = _TYPE_TOPIC_ROOT[self._type]
+                self._topic_suffix = _TYPE_TOPIC_SUFFIX[self._type]
+                self._frame_id_suffix = _TYPE_FRAME_ID_SUFFIX[self._type]
+                self._has_preview = _TYPE_HAS_PREVIEW[self._type]
+                self._desc = _TYPE_DESC[self._type]
+                self._fmt = _TYPE_FMT[self._type]
+
+                # 更新流类
+                self._stream_cls = {"rgb": _RgbStream, "depth": _DepthStream, "pointcloud": _PclStream}[self._type]
+
+                # 重启所有现有实例
+                for existing_iid in list(self._streams.keys()):
+                    st = self._streams.pop(existing_iid, None)
+                    if st is not None:
+                        st.stop()
+
+                print(f"[{CARD}] 切换到 {self._type} 模式", flush=True)
+
+            # 更新位置配置
             pos = self._resolve_pos(iid, args)
             if pos not in self._positions:
                 return _err("INVALID_ARGUMENT", f"unknown position {pos!r}; valid: {_VALID_POSITIONS}")
             self._cfg[iid] = {"position": pos}
+
+            # 如果实例正在运行，重启它
             st = self._streams.get(iid)
             if st is not None and st._run and st.position != pos:
                 self._start_instance(iid, pos)
-            return {"ok": True, "position": pos}
+
+            return {"ok": True, "type": self._type, "position": pos}
 
         if action == "start":
             return self._start_instance(iid, self._resolve_pos(iid, args))
