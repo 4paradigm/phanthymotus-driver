@@ -61,7 +61,7 @@ ENV PYTHONUNBUFFERED=1
 ENV PCL_ENABLE=1
 ENV DEPTH_ENABLE=1
 
-EXPOSE 15704
+EXPOSE 15715
 
 # 首启时后台自动 provision Nano（部署 beep_adapter/speaker_adapter + 编译部署 camera/pointcloud），失败不阻塞；
 # 随后前台起 MCP server。容器须 --network host 才够得到 Nano 内网（service.yml 已配）。
