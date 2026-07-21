@@ -39,43 +39,20 @@ RUN git clone --depth 1 -b ${UNITREE_SDK_REF} ${UNITREE_SDK_REPO} /opt/unitree_l
 COPY main.py           /work/main.py
 COPY go1_sdk_client.py /work/go1_sdk_client.py
 COPY sdk_proxy.py      /work/sdk_proxy.py
-COPY loco_state.py     /work/loco_state.py
-COPY battery.py        /work/battery.py
-COPY switch_gait.py    /work/switch_gait.py
-COPY imu.py            /work/imu.py
-COPY feet.py           /work/feet.py
-COPY fall_alarm.py     /work/fall_alarm.py
-COPY odometry.py       /work/odometry.py
-COPY obstacle_range.py /work/obstacle_range.py
-COPY udp_diagnostics.py /work/udp_diagnostics.py
-COPY joints.py            /work/joints.py
-COPY remote_controller.py /work/remote_controller.py
-COPY model.py             /work/model.py
-COPY resource/            /work/resource/
-COPY loco.py           /work/loco.py
-COPY body_pose.py      /work/body_pose.py
-COPY gesture.py        /work/gesture.py
-COPY test_battery_off.py   /work/test_battery_off.py
-COPY beep.py           /work/beep.py
-COPY camera_rgb.py     /work/camera_rgb.py
-COPY face_light.py     /work/face_light.py
-COPY test_light_effect.py /work/test_light_effect.py
-COPY system_health.py  /work/system_health.py
-COPY test_camera_depth_li.py /work/test_camera_depth_li.py
-COPY test_camera_pointcloud.py /work/test_camera_pointcloud.py
-COPY test_activity.py  /work/test_activity.py
-COPY speaker.py        /work/speaker.py
+# 聚合卡文件（4 个）
+COPY sensors.py        /work/sensors.py
+COPY controllers.py    /work/controllers.py
+COPY ext_devices.py    /work/ext_devices.py
+COPY camera.py         /work/camera.py
 COPY config.yaml       /work/config.yaml
 COPY deploy/           /deploy/
 # Nano 侧后端源码放进 /deploy/，供 nano_bootstrap.sh 首启时分发/编译到 Head Nano：
 #   beep_adapter.py（beep，纯 Python 免编译）/ camera_adapter/（camera_rgb，Nano 上现编 C++）。
-COPY beep_adapter.py   /deploy/beep_adapter.py
-COPY speaker_adapter.py /deploy/speaker_adapter.py
-COPY camera_adapter/   /deploy/camera_adapter/
+COPY deploy/beep_adapter.py   /deploy/beep_adapter.py
+COPY deploy/speaker_adapter.py /deploy/speaker_adapter.py
+COPY deploy/camera_adapter/   /deploy/camera_adapter/
 # 点云:NX/Nano 侧 pointcloud_stream.cc 供 nano_bootstrap.sh 首启时分发+编译(镜像 depth_stream 的 SDK 路径)。
-COPY camera/           /deploy/camera/
-# ★ 新增卡：加一行 `COPY <卡名>.py /work/<卡名>.py`（main.py 会按 config 里的卡名自动 import）。
-COPY special_motion.py /work/special_motion.py
+COPY deploy/camera/           /deploy/camera/
 
 ENV ROS_DOMAIN_ID=42
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp

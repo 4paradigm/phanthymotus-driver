@@ -2,8 +2,8 @@
 
 > 一张"卡片" = Driver 暴露的一个 MCP 工具 = 平台画布上一个可拖拽、可被大模型单独调用的能力。
 >
-> 本 bundle 当前发布 **26 张卡**：14 张传感卡（sensor）+ 10 张控制卡（actuator）+ 1 张资源卡（resource）+ 1 张视觉卡（camera）。
-> **一张卡 = 一个自包含的 `.py` 文件**（如 `loco_state.py` / `battery.py` / `loco.py` / `gesture.py` …），方便按卡评审、按卡提交、多人并行不撞车。
+> 本 bundle 当前发布 **21 张卡**：10 张传感卡（sensor）+ 9 张控制卡（actuator）+ 1 张资源卡（resource）+ 1 张视觉卡（camera）。
+> **4 个聚合文件**：`sensors.py`（10 张）/ `controllers.py`（5 张）/ `ext_devices.py`（4 张）/ `camera.py`（三合一 RGB/depth/pointcloud），每张卡仍然是自包含的类 + 工厂函数，方便按组评审、多人并行不撞车。
 > 目的有二：① 把这些卡干净地上架；② 作为后来者新增其它卡片的开发起点 —— 怎么加卡见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 实现基座
@@ -29,10 +29,7 @@
 | `udp_diagnostics` | UDP 通信健康 | `/{ns}/state/udp_diagnostics`：收发计数 + CRC/丢包/标志错误计数 |
 | `joints` | 12 腿关节 | `/{ns}/state/joints`：q/dq/tau/temp（骨架渲染，需 `model` 卡提供 URDF） |
 | `remote_controller` | 无线遥控器 | `/{ns}/state/remote_controller`：16 按键 + 5 摇杆轴（`HighState.wirelessRemote[40]`） |
-| `test_camera_depth` | 双目深度推流（5 机位·multiInstance；test=未验收） | 卡 `start` 才连对应 Nano 板 `depth_stream` → ROS2 CompressedImage（jpeg）；`stop` 断开释放相机 |
-| `test_camera_pointcloud` | 双目点云推流（5 机位·multiInstance；test=未验收） | 卡 `start` 才连对应 Nano 板 `pointcloud_stream` → ROS2 PointCloud2；`stop` 断开释放相机 |
-| `camera_rgb` | RGB 相机推流（5 机位·multiInstance） | 卡 `start` 才连对应 Nano 板 `rgb_stream`（TCP :9201~9205）→ ROS2 CompressedImage（jpeg）；`stop` 断开释放相机 |
-| `test_activity` | 活跃度检测（test=未验收） | 检测机器人是否静止/活跃 |
+| `camera` | RGB / 深度 / 点云（三合一，type=rgb/depth/pointcloud，5 机位·multiInstance） | 卡 `start` 才连对应 Nano 板 → ROS2 CompressedImage / PointCloud2；`stop` 断开释放相机 |
 
 ### 控制卡（actuator，下发 `HighCmd` / 外设动作；须真机验证量程+安全后上架）
 
@@ -46,8 +43,7 @@
 | `beep` | 头部扬声器 beep | Nano `beep_adapter.py`（:18082 /v1/beep/actions） |
 | `speaker` | 头部扬声器播放 | Nano `speaker_adapter.py`（:18083 /v1/speaker/actions）→ 播放远端音频流 |
 | `face_light` | 面部灯带颜色 | `set_color` / `preset` / `off`（经 MQTT） |
-| `test_light_effect` | 面部灯带动效（test=未验收） | `solid` / `blink` / `breathe` / `fade` / `brightness_up` / `brightness_down` / `preset` / `off`（经 MQTT） |
-| `test_battery_off` | 电池关断（不可逆，test=保守留前缀） | `battery_off`：低层 `LowCmd.bms.off=0xA5` → 主控板（.10:8007）**真断电池**，区别于只关 Pi 的 `poweroff`；**不可逆、不能远程恢复**；须 `confirm=true` + `reason`，前置：状态 fresh 且机器人静止 |
+| `system_health` | 整体健康检查 | `robot_info`：CPU/内存/磁盘/电池/MQTT 体检 |
 
 ### 资源卡（resource）
 
@@ -57,15 +53,15 @@
 
 `{ns}` 为 `config.yaml` 的 `ros_namespace`（默认 `bundle`；留空则取 hostname）。
 
-## 相机架构（camera_rgb / depth / pointcloud 三路共用）
+## 相机架构（camera.py 三合一）
 
 五路相机（front/chin/left/right/belly）分布在三块 Nano 板（.13/.14/.15）：
 
 ```
 Nano 板 (.13/.14/.15)              Pi 驱动容器 (.161)
-┌─ rgb_stream (TCP :9201~9205) ──▶ camera_rgb.py       → /{ns}/vision/{pos}/mono
-├─ depth_stream (TCP :9101~9105) ─▶ test_camera_depth.py → /{ns}/camera/{pos}/depth
-└─ pointcloud_stream (TCP :9401~9405) → test_camera_pointcloud.py → /{ns}/camera/{pos}/pointcloud
+┌─ rgb_stream (TCP :9201~9205) ──▶ camera.py (type=rgb)     → /{ns}/vision/{pos}/mono
+├─ depth_stream (TCP :9101~9105) ─▶ camera.py (type=depth)  → /{ns}/camera/{pos}/depth
+└─ pointcloud_stream (TCP :9401~9405) → camera.py (type=pointcloud) → /{ns}/camera/{pos}/pointcloud
 ```
 
 - 三路均为**按需开相机**：卡 `start` 才建 TCP 连接，Nano 侧才打开相机；`stop` 断开，Nano `_exit(0)` 释放相机（systemd `Restart=always` 重启待命）。
@@ -74,10 +70,14 @@ Nano 板 (.13/.14/.15)              Pi 驱动容器 (.161)
 
 ## 卡片装配约定（关键）
 
-**卡名 == 模块名 == 文件名 == config.yaml 里的 key。** `main.py` 遍历 `config.yaml` 中
-`enabled: true` 的卡名，`import_module(卡名)` 并调用其 `make_plugin(...)` 装配。所以：
+**卡名 == 模块名 == config.yaml 里的 key。** `main.py` 遍历 `config.yaml` 中
+`enabled: true` 的卡名，`import_module(卡名)` 并调用其 `make_plugin(...)` 装配。
+聚合文件（`sensors.py`/`controllers.py`/`ext_devices.py`）各自 `import_module` 后，
+通过同名 `make_*` 函数（如 `make_battery`/`make_loco`/`make_beep`）找到卡片类。所以：
 
-> **新增一张卡 = 新建 `<卡名>.py` + 在 `config.yaml` 打开它。不用改 `main.py`。**
+> **新增一张卡**：若属于传感类，在 `sensors.py` 末尾追加 `Plugin` + `make_<卡名>`；
+> 控制类加到 `controllers.py`；外部设备加到 `ext_devices.py`。
+> 然后在 `config.yaml` 打开它。不用改 `main.py`。
 
 ## 接口约定（与平台其它驱动一致）
 
@@ -94,34 +94,15 @@ go1_bundle/
 ├── main.py                 # MCP server 入口 + 按 config 卡名自动装配（HIGHLEVEL）
 ├── go1_sdk_client.py       # 共享 raw SDK client（已由 sdk_proxy.py 子进程承接）
 ├── sdk_proxy.py            # SDK 子进程代理：隔离 robot_interface 避免 GIL 冲突
-│   ── 传感卡（sensor）──
-├── loco_state.py           # 运动状态
-├── battery.py              # 电池 BMS
-├── imu.py                  # IMU
-├── feet.py                 # 足端力/位置
-├── fall_alarm.py           # 跌倒/侧翻告警
-├── odometry.py             # 里程计
-├── obstacle_range.py       # 超声波避障
-├── udp_diagnostics.py      # UDP 通信健康
-├── joints.py               # 12 腿关节（骨架渲染）
-├── remote_controller.py    # 无线遥控器
-├── test_camera_depth.py    # 双目深度推流（5 机位·multiInstance；test=未验收）
-├── test_camera_pointcloud.py # 双目点云推流（5 机位·multiInstance；test=未验收）
-├── camera_rgb.py           # RGB 相机推流（5 机位·multiInstance）
-├── test_activity.py        # 活跃度检测（test=未验收）
-│   ── 控制卡（actuator）──
-├── loco.py                 # 基础运动（move/stop_move/stand 等）
-├── body_pose.py            # 机身姿态与高度
-├── switch_gait.py          # 步态切换
-├── special_motion.py       # 特殊动作（jump/straight_hand）
-├── gesture.py              # 表演/表情（异步）
-├── beep.py                 # 头部扬声器 beep
-├── speaker.py              # 头部扬声器播放
-├── face_light.py           # 面部灯带颜色（经 MQTT）
-├── test_light_effect.py    # 面部灯带动效（test=未验收，经 MQTT）
-├── test_battery_off.py     # 电池关断（低层真断电，不可逆）
-│   ── 资源卡（resource）──
-├── model.py                # Go1 URDF（供 joints 骨架渲染）
+│   ── 聚合卡文件（sensors.py = 11 张）──
+├── sensors.py              # 状态卡合集：battery/imu/feet/fall_alarm/obstacle_range/
+│                           #   remote_controller/udp_diagnostics/loco_state/odometry/joints/model
+│   ── 聚合卡文件（controllers.py = 5 张）──
+├── controllers.py          # 运动控制合集：loco/body_pose/switch_gait/gesture/special_motion
+│   ── 聚合卡文件（ext_devices.py = 4 张）──
+├── ext_devices.py          # 外部设备合集：beep/speaker/face_light/system_health
+│   ── 视觉卡（三合一）──
+├── camera.py               # RGB / 深度 / 点云 三合一（multiInstance）
 │   ── 外设适配器（非卡片，Nano 侧服务）──
 ├── beep_adapter.py         # beep 卡的 Nano 侧适配器（:18082）
 ├── speaker_adapter.py      # speaker 卡的 Nano 侧适配器（:18083）

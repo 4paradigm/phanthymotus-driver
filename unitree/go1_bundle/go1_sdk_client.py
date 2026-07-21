@@ -13,9 +13,9 @@ rclpy 可同进程共存 → 状态卡能发 ROS2 topic 在画布渲染。
 snapshot 为空（fresh=False）。MCP server 仍能起、注册、列 tool，方便无硬件时跑通链路。
 
 【控制原语（后来者看这里）】本文件原为只读；为支持控制卡（spin），已按 CONTRIBUTING.md
-"新增控制卡"一节加入**最小高层下发能力**：`move(vx,vy,vyaw,gait)` / `stop_move()` 加锁写
-目标，`_loop()` 每周期 `_compose_cmd()` 合成 `HighCmd` 后 `SetSend`。默认无目标时仍发 idle
-心跳（mode=0），状态卡不受影响；move 带 0.5s 看门狗，停发即自动回 idle。低层 LowCmd/Safety
+"新增控制卡"一节加入**高层下发能力**：`move(vx,vy,vyaw,gait)` / `stop_move()` / `set_posture()` /
+`set_gait()` / `desired_gait()`，加锁写目标，`_loop()` 每周期 `_compose_cmd()` 合成 `HighCmd`
+后 `SetSend`。默认无目标时仍发 idle 心跳（mode=0），状态卡不受影响；move 带 0.5s 看门狗，停发即自动回 idle。低层 LowCmd/Safety
 （关节控制，目标 .10:8007，与高层互斥）仍未引入，需要时另起 LOWLEVEL client。
 """
 

@@ -16,35 +16,24 @@ plugins:
     enabled: true
     mqtt_host: "localhost"
     mqtt_port: 1883
-  test_light_effect:            # 【未验收·test 前缀】面部灯带动效(actuator,MQTT):solid/blink/breathe/fade/brightness_up/down + 语义预设,各带 duration。验收后改名 light_effect
+    system_health:                # 诊断执行卡(actuator):主控板+子系统体检,自动判断哪里有问题
     enabled: true
     mqtt_host: "localhost"
     mqtt_port: 1883
-  system_health:                # 诊断执行卡(actuator):主控板+子系统体检,自动判断哪里有问题
+  camera:                    # 三合一：RGB / 深度 / 点云（multiInstance）
     enabled: true
-    mqtt_host: "localhost"
-    mqtt_port: 1883
-  test_camera_depth_li:         # 【li 版·修复机位解析】双目深度推流(sensor,multiInstance·可选机位):修复 test_camera_depth 只认 belly 的问题,五机位均可选通。验收后可改名 camera_depth
-    enabled: true               # _resolve_pos 照搬 camera_rgb 逻辑:instance_id==机位名时自动推断,不再退回 default
-    default_position: "front"   # 公共默认机位:front/chin/left/right/belly
+    type: rgb                # 功能模式：rgb / depth / pointcloud
+    default_position: "front"
+    # 机位→板卡映射。三路流端口均列出，插件按 type 选取对应端口。
+    # rgb_stream 由 nano_bootstrap.sh 首启时自动在 .13/.14/.15 编译+装 systemd。
+    # 同一物理相机三路互斥(谁连上谁占,断开 _exit 释放)。
+    # depth / pointcloud 需在 Dockerfile 传 DEPTH_ENABLE=1 / PCL_ENABLE=1。
     positions:
-      front: {board_ip: "192.168.123.13", depth_port: 9101}
-      chin:  {board_ip: "192.168.123.13", depth_port: 9102}
-      left:  {board_ip: "192.168.123.14", depth_port: 9103}
-      right: {board_ip: "192.168.123.14", depth_port: 9104}
-      belly: {board_ip: "192.168.123.15", depth_port: 9105}
-
-  test_camera_pointcloud:       # 【未验收·test 前缀】双目点云推流(sensor,multiInstance·可选机位):连对应板 pointcloud_stream → ROS2 PointCloud2
-    enabled: true               # 拖入后用卡的 position 下拉框选/热切机位;一次一路(立体计算吃 CPU+相机独占);头部/腹部与 depth 就同一相机互斥。验收后改名 camera_pointcloud
-    default_position: "front"   # 公共默认机位:front/chin/left/right/belly
-    # 机位→板卡IP/device/点云端口。Pi 侧只用 board_ip+pcl_port 连流;device_id 由 nano_bootstrap 传给 Nano 侧 pointcloud_stream 选相机。
-    # 端口 94xx 与深度9101/RGB图传92xx/RGB控制93xx 错开。SDK 路径每板不同,由 nano_bootstrap 自动探测。
-    positions:
-      front: {board_ip: "192.168.123.13", device_id: 1, pcl_port: 9401}
-      chin:  {board_ip: "192.168.123.13", device_id: 0, pcl_port: 9402}
-      left:  {board_ip: "192.168.123.14", device_id: 0, pcl_port: 9403}
-      right: {board_ip: "192.168.123.14", device_id: 1, pcl_port: 9404}
-      belly: {board_ip: "192.168.123.15", device_id: 0, pcl_port: 9405}
+      front: {board_ip: "192.168.123.13", image_port: 9201, depth_port: 9101, pcl_port: 9401}
+      chin:  {board_ip: "192.168.123.13", image_port: 9202, depth_port: 9102, pcl_port: 9402}
+      left:  {board_ip: "192.168.123.14", image_port: 9203, depth_port: 9103, pcl_port: 9403}
+      right: {board_ip: "192.168.123.14", image_port: 9204, depth_port: 9104, pcl_port: 9404}
+      belly: {board_ip: "192.168.123.15", image_port: 9205, depth_port: 9105, pcl_port: 9405}
   imu:                          # IMU：四元数/角速度/加速度/欧拉角/温度
     enabled: true
   feet:                         # 足端：足底力[4] + 高层时足端相对机身位置/速度
@@ -67,12 +56,6 @@ plugins:
   model:                        # (resource) 返回 go1 四足 URDF，供 joints 骨架渲染成狗
     enabled: true
 
-  # ── sdl 活动度状态卡（未验收·test 前缀）──
-  test_activity:                # 【未验收·test 前缀】活动度时序卡(actuator):后台滑窗采样 velocity/mode,
-    enabled: true               #   action=report 返回过去N秒 移动距离/运动占比/静止时长/均峰速度/模式切换。纯读不控制。验收后改名 activity
-    sample_hz: 5                # 采样频率(Hz)
-    window_sec: 60              # 滑动窗口时长(秒)
-    move_eps: 0.05              # 速度模长(m/s)低于此值算静止
 
   # ── 控制卡（下发 HighCmd；须真机验证量程+安全后上架）──
   beep:                         # 头部扬声器 beep 动作卡 → Nano beep_adapter.py（:18082 /v1/beep/actions）
@@ -91,28 +74,12 @@ plugins:
     max_buffer_bytes: 3200           # 转发跟不上时的缓冲上限(~100ms@16k)，超出丢最旧的 → 延迟钉在低位、保持新鲜
     # forward_batch_ms 已废弃：v2 改用 Event 驱动推式转发，ROS2 回调即刻唤醒 writer 线程，无需攒批
 
-  camera_rgb:                   # 五机位 RGB 相机(multiInstance)→ 各板 Nano rgb_stream(TCP :9201~9205,按需开相机)
-    enabled: true
-    default_position: "front"   # 拖入画布前/未选 position 时的缺省机位
-    # 五机位→板卡映射。image_port 9201~9205 须与 nano_bootstrap 装的 go1-rgb-<pos> 服务参数一致。
-    # 五路 rgb_stream 由 nano_bootstrap.sh 首启时自动在 .13/.14/.15 编译+装 systemd:
-    #   front/chin=.13；left/right=.14(opencv4 在 /usr/local，编译脚本已适配)；belly=.15。
-    # rgb_stream 用配置文件构造(加载标定)→ getRectStereoFrame 取去鱼眼左目 → flip 翻正 → TCP 推 JPEG。
-    # 同一物理相机与 depth/pointcloud 互斥(谁连上谁占,断开 _exit 释放);无需 receive_ip/peer_services。
-    positions:
-      front: {board_ip: "192.168.123.13", image_port: 9201}
-      chin:  {board_ip: "192.168.123.13", image_port: 9202}
-      left:  {board_ip: "192.168.123.14", image_port: 9203}
-      right: {board_ip: "192.168.123.14", image_port: 9204}
-      belly: {board_ip: "192.168.123.15", image_port: 9205}
 
   loco:                         # 基础运动:三维速度 move + 站起/趴下/平衡/姿态/身高
     enabled: true
   body_pose:                    # 机身姿态/高度:set_attitude(roll/pitch/yaw)/set_body_height/set_foot_raise_height/reset(能力卡片§4.3)
     enabled: true
   gesture:                      # 表演/表情:作揖/点头/摇头/歪头/环视/跳舞/俯卧撑/坐/昂首等(异步)
-    enabled: true
-  test_battery_off:             # 【已真机验收·保守留 test 前缀】低层 BmsCmd.off=0xA5→主控板.10:8007 真断电池(灯灭,区别于只关Pi的poweroff);不可逆,需 confirm+reason+静止前置
     enabled: true
 
   switch_gait:                  # 步态切换：只设期望步态，实际运动由移动卡触发（trot_run/climb_stair/trot_obstacle 须 confirm）
