@@ -2,11 +2,13 @@
 """
 go1_bundle/main.py — Unitree Go1 (EDU) 状态 + 基础控制驱动入口（原始 unitree_legged_sdk）。
 
-一个驱动 = 一个 MCP server。本 bundle 是从完整 go1 驱动中**切出的最小蓝本**，当前聚合
-3 张状态卡（loco_state / battery / obstacle_range）+ 1 张控制卡（spin）。每张卡是一个
-**自包含的 .py 文件**，main.py 按 config.yaml 里启用的卡名**自动 import 同名模块**并装配
-（约定：config key == 模块名 == 文件名 == 卡名）。因此新增一张卡 = 新建 `<卡名>.py` +
-在 config.yaml 打开它，**不用改本文件**。
+一个驱动 = 一个 MCP server。本 bundle 聚合 21 张卡片到 4 个聚合文件：
+`sensors.py`（11 张状态/资源卡）/ `controllers.py`（5 张控制卡）/
+`ext_devices.py`（4 张外部设备卡）/ `camera.py`（视觉卡，三合一）。
+main.py 按 config.yaml 里启用的卡名**显式导入对应模块**并装配
+（约定：config key == 模块内的 make_* 函数名）。
+因此新增一张卡 = 在对应聚合文件中追加 `Plugin` + `make_<卡名>` +
+在 config.yaml 打开它，**同时需在本文件的 `Go1Bundle.__init__` 中添加对应导入和创建逻辑**。
 
 所有卡共享同一个 raw SDK client（唯一 UDP 收发线程 → snapshot()）；状态卡只读 snapshot 的
 不同切片，控制卡经该 client 的下发原语发 HighCmd。装了 rclpy 时状态卡发 ROS2 topic 在画布
@@ -19,7 +21,6 @@ go1_bundle/main.py — Unitree Go1 (EDU) 状态 + 基础控制驱动入口（原
 
 from __future__ import annotations
 
-import importlib
 import json
 import os
 import re
@@ -56,22 +57,124 @@ def _resolve_namespace(cfg: dict) -> str:
 class Go1Bundle:
     """按 config 装配启用的卡片；对外提供 tools 列表与 dispatch。
 
-    装配规则：遍历 config.plugins 里 enabled 的每个卡名 → import_module(卡名) →
-    调用其 make_plugin(plugin_config, namespace, executor, client)。卡名即模块名。
+    装配规则：遍历 config.plugins 里 enabled 的每个卡名 → 从对应模块导入并调用 make_plugin。
     """
 
     def __init__(self, cfg, namespace, executor, client):
         self._plugins = []
         pc = cfg.get("plugins", {}) or {}
-        for card, conf in pc.items():
-            if not (isinstance(conf, dict) and conf.get("enabled")):
-                continue
-            try:
-                mod = importlib.import_module(card)
-                self._plugins.append(mod.make_plugin(conf, namespace, executor, client))
-            except Exception as e:
-                print(f"[bundle] 卡 '{card}' 加载失败，跳过: {e}", flush=True)
-        print(f"[bundle] {len(self._plugins)} plugins: {[type(p).__module__ for p in self._plugins]}", flush=True)
+
+        # 传感卡 - 从 sensors.py 导入
+        if pc.get("loco_state", {}).get("enabled", False):
+            import sensors
+            self._plugins.append(sensors.make_loco_state(pc["loco_state"], namespace, executor, client))
+            print("[bundle] loco_state loaded")
+
+        if pc.get("battery", {}).get("enabled", False):
+            import sensors
+            self._plugins.append(sensors.make_battery(pc["battery"], namespace, executor, client))
+            print("[bundle] battery loaded")
+
+        if pc.get("imu", {}).get("enabled", False):
+            import sensors
+            self._plugins.append(sensors.make_imu(pc["imu"], namespace, executor, client))
+            print("[bundle] imu loaded")
+
+        if pc.get("feet", {}).get("enabled", False):
+            import sensors
+            self._plugins.append(sensors.make_feet(pc["feet"], namespace, executor, client))
+            print("[bundle] feet loaded")
+
+        if pc.get("fall_alarm", {}).get("enabled", False):
+            import sensors
+            self._plugins.append(sensors.make_fall_alarm(pc["fall_alarm"], namespace, executor, client))
+            print("[bundle] fall_alarm loaded")
+
+        if pc.get("odometry", {}).get("enabled", False):
+            import sensors
+            self._plugins.append(sensors.make_odometry(pc["odometry"], namespace, executor, client))
+            print("[bundle] odometry loaded")
+
+        if pc.get("obstacle_range", {}).get("enabled", False):
+            import sensors
+            self._plugins.append(sensors.make_obstacle_range(pc["obstacle_range"], namespace, executor, client))
+            print("[bundle] obstacle_range loaded")
+
+        if pc.get("udp_diagnostics", {}).get("enabled", False):
+            import sensors
+            self._plugins.append(sensors.make_udp_diagnostics(pc["udp_diagnostics"], namespace, executor, client))
+            print("[bundle] udp_diagnostics loaded")
+
+        if pc.get("joints", {}).get("enabled", False):
+            import sensors
+            self._plugins.append(sensors.make_joints(pc["joints"], namespace, executor, client))
+            print("[bundle] joints loaded")
+
+        if pc.get("remote_controller", {}).get("enabled", False):
+            import sensors
+            self._plugins.append(sensors.make_remote_controller(pc["remote_controller"], namespace, executor, client))
+            print("[bundle] remote_controller loaded")
+
+        if pc.get("model", {}).get("enabled", False):
+            import sensors
+            self._plugins.append(sensors.make_model(pc["model"], namespace, executor, client))
+            print("[bundle] model loaded")
+
+        # 控制卡 - 从 controllers.py 导入
+        if pc.get("loco", {}).get("enabled", False):
+            import controllers
+            self._plugins.append(controllers.make_loco(pc["loco"], namespace, executor, client))
+            print("[bundle] loco loaded")
+
+        if pc.get("body_pose", {}).get("enabled", False):
+            import controllers
+            self._plugins.append(controllers.make_body_pose(pc["body_pose"], namespace, executor, client))
+            print("[bundle] body_pose loaded")
+
+        if pc.get("switch_gait", {}).get("enabled", False):
+            import controllers
+            self._plugins.append(controllers.make_switch_gait(pc["switch_gait"], namespace, executor, client))
+            print("[bundle] switch_gait loaded")
+
+        if pc.get("gesture", {}).get("enabled", False):
+            import controllers
+            self._plugins.append(controllers.make_gesture(pc["gesture"], namespace, executor, client))
+            print("[bundle] gesture loaded")
+
+        if pc.get("special_motion", {}).get("enabled", False):
+            import controllers
+            self._plugins.append(controllers.make_special_motion(pc["special_motion"], namespace, executor, client))
+            print("[bundle] special_motion loaded")
+
+        # 外部设备 - 从 ext_devices.py 导入
+        if pc.get("beep", {}).get("enabled", False):
+            import ext_devices
+            self._plugins.append(ext_devices.make_beep(pc["beep"], namespace, executor, client))
+            print("[bundle] beep loaded")
+
+        if pc.get("speaker", {}).get("enabled", False):
+            import ext_devices
+            self._plugins.append(ext_devices.make_speaker(pc["speaker"], namespace, executor, client))
+            print("[bundle] speaker loaded")
+
+        if pc.get("face_light", {}).get("enabled", False):
+            import ext_devices
+            self._plugins.append(ext_devices.make_face_light(pc["face_light"], namespace, executor, client))
+            print("[bundle] face_light loaded")
+
+        if pc.get("system_health", {}).get("enabled", False):
+            import ext_devices
+            self._plugins.append(ext_devices.make_system_health(pc["system_health"], namespace, executor, client))
+            print("[bundle] system_health loaded")
+
+        # 相机 - 从 camera.py 导入（返回单个插件，但插件内部有多个工具）
+        if pc.get("camera", {}).get("enabled", False):
+            import camera
+            camera_plugin = camera.make_plugin(pc["camera"], namespace, executor, client)
+            self._plugins.append(camera_plugin)
+            print("[bundle] camera loaded")
+
+        print(f"[bundle] {len(self._plugins)} plugins loaded", flush=True)
 
     def start_all(self):
         for i, p in enumerate(self._plugins):
@@ -79,6 +182,8 @@ class Go1Bundle:
                 p.start()
             except Exception as e:
                 print(f"[bundle] Plugin {i} ({type(p).__module__}) start() FAILED: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
         print(f"[bundle] All {len(self._plugins)} plugins started", flush=True)
 
     def stop_all(self):
@@ -92,12 +197,16 @@ class Go1Bundle:
     def get_all_tools(self):
         tools = []
         for p in self._plugins:
-            tools.extend(p.get_tools() if hasattr(p, "get_tools") else [p.get_tool()])
+            if hasattr(p, "get_tools"):
+                tools.extend(p.get_tools())
+            else:
+                tools.append(p.get_tool())
         return tools
 
     def dispatch(self, tool_name, args):
         for p in self._plugins:
-            for tool_def in (p.get_tools() if hasattr(p, "get_tools") else [p.get_tool()]):
+            plugin_tools = p.get_tools() if hasattr(p, "get_tools") else [p.get_tool()]
+            for tool_def in plugin_tools:
                 if tool_def["name"] == tool_name:
                     if tool_def["type"] == "resource":
                         return p.dispatch(tool_name, args)

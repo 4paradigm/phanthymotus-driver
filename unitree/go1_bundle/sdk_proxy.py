@@ -6,7 +6,7 @@ robot_interface C 扩展的 50Hz UDP 收发循环持续争 GIL，导致其他线
 把 Go1HighSdkClient 整体搬到独立 spawn 子进程，主进程通过两个 Queue 与之通信，
 彻底消除 robot_interface 对主进程 GIL 的影响。
 
-对外接口与 Go1HighSdkClient 完全相同，所有卡片文件零改动。
+对外接口与 Go1HighSdkClient 基本相同，卡片文件零改动。
 """
 
 import multiprocessing

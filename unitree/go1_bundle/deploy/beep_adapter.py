@@ -87,7 +87,7 @@ class BeepAdapter:
     return reply(action,rid,'idle',{'volume_percent':pct if pct is not None else self.volume,'mixer_raw':raw,'mixer_raw_min':rmin,'mixer_raw_max':rmax})
    if action=='info':return reply(action,rid,'idle',{'device':self.device,'mixer_available':self.volume is not None,'volume_percent':self.volume})
    if action=='beep':
-    # 生成 duration_sec 秒、frequency_hz 的正弦音，异步喂给独立 aplay（不阻塞控制 RPC）。
+    # 生成 duration_sec 秒、frequency_hz 的正弦音，喂给独立 aplay（会短暂阻塞控制 RPC）。
     try:dur=float(p.get('duration_sec',0.3));freq=float(p.get('frequency_hz',1000))
     except (TypeError,ValueError):return fail(action,rid,'INVALID_ARGUMENT','duration_sec/frequency_hz must be numbers')
     if not 0<dur<=10 or not 100<=freq<=8000:return fail(action,rid,'INVALID_ARGUMENT','duration_sec in (0,10], frequency_hz in [100,8000]')

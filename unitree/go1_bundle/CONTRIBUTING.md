@@ -1,9 +1,9 @@
 # 在 go1_bundle 上新增卡片 · 开发指南
 
-本文件教你在这个最小蓝本上**新增一张能力卡片**。核心约定只有一句：
+本文件教你在这个最小蓝本上**新增一张能力卡片**。核心约定：
 
-> **一张卡 = 一个自包含的 `.py` 文件。卡名 == 模块名 == 文件名 == `config.yaml` 里的 key。**
-> 新增一张卡 = 新建 `<卡名>.py` + 在 `config.yaml` 打开它。**不用改 `main.py`。**
+> **每张卡是一个自包含的 `class Plugin` + `make_plugin()`。** 聚合文件（`sensors.py`/`controllers.py`/`ext_devices.py`）内按卡分隔，**卡名 == config.yaml 里的 key == make_plugin 的 make_ 前缀**。
+> 新增一张卡 = 在对应聚合文件中追加一个 `Plugin` 类 + `make_<卡名>` + 在 `config.yaml` 打开它，**同时需要在 `main.py` 的 `Go1Bundle.__init__` 方法中添加对应导入和创建逻辑**。
 
 先读完“心智模型”和“插件契约”，再照“新增状态卡 / 新增控制卡”步骤照做。
 
@@ -27,15 +27,28 @@ robot_interface     │  遍历 config.plugins 中 enabled 的卡名：    │
 
 关键点：
 
-- **一卡一文件、自动装配**：`main.py` 不写死卡名，而是按 `config.yaml` 里 `enabled` 的 key 去
-  `import <key>` 并调用该模块的 `make_plugin()`。所以卡与卡之间零耦合，各自一个文件，多人提交不撞车。
+- **按组聚合、装配**：`main.py` 按以下规则装配卡片：
+  1. 读取 `config.yaml` 中 `enabled` 的卡名
+  2. 根据卡类型从对应模块导入：传感器卡从 `sensors`、控制卡从 `controllers`、外设卡从 `ext_devices`
+  3. 使用 `getattr(module, f"make_{card_name}")` 调用对应工厂函数
+  4. 要求模块中必须存在 `make_<卡名>` 函数
+  传感卡都在 `sensors.py`（导出 `make_battery`/`make_imu`/`make_joints`…），
+  控制卡都在 `controllers.py`（导出 `make_loco`/`make_gesture`…），
+  外部设备都在 `ext_devices.py`（导出 `make_beep`/`make_speaker`…）。
+  因此卡与卡之间零耦合，每人改不同文件，提交不撞车。
 - **共享快照**：`Go1HighSdkClient.snapshot()` 已把整帧 `HighState` 解析成 dict（不止两张卡用到的字段，
   `imu`/`joints`/`foot_*`/`range_obstacle`/`wireless_remote` 都在里头）。**新增状态卡通常不用碰
   `go1_sdk_client.py`**，直接从 `snapshot()` 取字段即可。
 - **STUB 优先**：没有真机 / 没有 `robot_interface` 时一切照跑，只是数据为空、`fresh=false`。开发全程可在开发机上做。
 
-> 注：目前 `loco_state.py` 与 `battery.py` 各自带了一份几乎相同的插件样板（ROS2 发布 + `dispatch`）。
-> 这是“一卡一文件、方便提交”的刻意取舍；等卡稳定后可把公共部分抽成一个 `card_base.py` 再合并，不影响对外契约。
+> 注：`sensors.py` 内的 `battery` 和 `imu` 各带了一份几乎相同的插件样板（ROS2 发布 + `dispatch`）。
+> 这是"每张卡行为独立"的刻意取舍；等卡稳定后可把公共部分抽成一个 `card_base.py` 再合并，不影响对外契约。
+>
+> **STUB 模式行为**：没有真机 / 没有 `robot_interface` 时：
+> - 所有数值字段返回 0 或合理的默认值
+> - `fresh: false`，`timestamp_ms` 为当前时间
+> - 控制卡返回 `{ok: false, code: "STUB_MODE", message: "Running in STUB mode"}`
+> - 可以通过环境变量 `STUB_DATA_PATTERN` 指定模拟数据文件
 
 ---
 
@@ -47,6 +60,12 @@ robot_interface     │  遍历 config.plugins 中 enabled 的卡名：    │
 def make_plugin(plugin_config, namespace, executor, client):
     return Plugin(plugin_config, namespace, executor, client)
 ```
+
+**文件结构约定**：
+- `sensors.py`：包含所有传感器卡片（battery, imu, joints, model 等）
+- `controllers.py`：包含所有控制卡片（loco, body_pose, gesture 等）  
+- `ext_devices.py`：包含所有外部设备卡片（beep, speaker, face_light 等）
+- `camera.py`：包含相机相关卡片
 
 `main.py` 只对返回的 plugin 对象调用这几个方法：
 
@@ -70,21 +89,19 @@ def make_plugin(plugin_config, namespace, executor, client):
 
 ## 3. 新增一张**状态卡**（最常见，2 步）
 
-以加一张 `imu` 卡为例——`snapshot()["imu"]` 已经有数据。
+状态卡都在 `sensors.py` 内。以加一张 `imu` 卡为例——`snapshot()["imu"]` 已经有数据。
 
-**① 复制 `battery.py` → `imu.py`，改元数据与 `build()`：**
+**① 打开 `sensors.py`，在 `model.py` 块后面追加 `imu` 的 Plugin + `make_imu`（参照同文件内 `battery.py` 块的样板）：**
 
 ```python
-# imu.py（其余样板照抄 battery.py：ROS2 import、Plugin 类、make_plugin）
-CARD = "imu"                      # ← 卡名 = 文件名 = config key，务必一致
-TYPE = "sensor"
-TOPIC = "/{ns}/state/imu"
-FMT = "data/json"
-HZ = 20.0
-NODE = "go1_imu"                  # ← ROS2 node 名须全局唯一
-DESC = "Go1 IMU — quaternion(wxyz)/gyro/accel/rpy/temp; attitude_may_drift on acceleration"
+# 追加到 sensors.py 末尾（其余样板照抄同文件内的 battery 插件：ROS2 import、Plugin 类、make_plugin）
+_CARD_IMU = "imu"
+_TOPIC_IMU = "/{ns}/state/imu"
+_HZ_IMU = 20.0
+_NODE_IMU = "go1_imu"
+_DESC_IMU = "Go1 IMU — quaternion(wxyz)/gyro/accel/rpy/temp; attitude_may_drift on acceleration"
 
-def build(snap):
+def _build_imu(snap):
     d = {"timestamp_ms": int(time.time() * 1000),
          "control_level": snap.get("control_level", "HIGHLEVEL"),
          "fresh": bool(snap.get("fresh", False))}
@@ -104,7 +121,14 @@ def build(snap):
     enabled: true
 ```
 
-完成——`main.py` 会自动 `import imu` 并装配。构建镜像时记得在 `Dockerfile` 加一行 `COPY imu.py /work/imu.py`（见 §5）。
+完成——**需要在 `main.py` 的 `Go1Bundle.__init__` 中添加：**
+```python
+if pc.get("imu", {}).get("enabled", False):
+    import sensors
+    self._plugins.append(sensors.make_imu(pc["imu"], namespace, executor, client))
+    print("[bundle] imu loaded")
+```
+构建镜像时会自动包含整个 `sensors.py` 文件，无需为每个卡单独复制。
 
 `fmt` 常用 `data/json`（画布当 JSON 渲染）；需要特殊渲染器时用对应格式（如骨骼 `sensor/skeleton`，那种卡还需附带 URDF `model` 资源工具，超出本蓝本范围）。
 
@@ -127,13 +151,14 @@ def move(self, vx, vy, vyaw, gait=1):
 ```
 > ⚠️ 高层运控走 `HighCmd`（目标 `.161:8082`）；低层关节控制走 `LowCmd`+`Safety`（目标 `.10:8007`），二者**互斥**、不能同实例同时用。若做低层卡需另起一个 LOWLEVEL client 并引入 `control_level` 开关。
 
-**② 写 `<卡名>.py`**（同样实现 §2 的 `make_plugin` + 契约）。控制卡的 `inputSchema` 含 `action`(enum)；多参数动作建议用 `x-action-params` 拆分，平台会把每个动作拆成可单独调用的函数。返回约定：
+**② 在 `controllers.py` 或 `ext_devices.py` 末尾追加控制卡的 `Plugin` + `make_<卡名>`（参照同文件内已有卡块的样板）**。控制卡的 `inputSchema` 含 `action`(enum)；多参数动作建议用 `x-action-params` 拆分，平台会把每个动作拆成可单独调用的函数。返回约定：
 
 - 成功：`{ok: true, card, action, control_level, applied, timestamp_ms}`
 - 失败：`{ok: false, code, message}`，`code` ∈ `INVALID_ARGUMENT` / `PRECONDITION_FAILED` / `SAFETY_LIMIT` / `RESOURCE_BUSY` 等。
-- **越界 / 缺 confirm 一律拒绝，不静默截断**。危险动作（关电、特殊动作、低层）必须要 `confirm`。
+- **越界 / 缺 confirm 一律拒绝，不静默截断**。
+- **安全控制**：危险动作（关电、特殊动作、低层）必须在 `inputSchema` 中标记 `x-is-dangerous: true`，并要求用户通过 `confirm` 参数确认（传 `true` 才执行）。
 
-**③ 在 `config.yaml` 打开它**（`main.py` 自动装配，无需改）。控制卡必须**上真机验证量程与安全**后才能上架。
+**③ 在 `config.yaml` 打开它**，**同时在 `main.py` 的 `Go1Bundle.__init__` 中添加对应导入和创建逻辑**。控制卡必须**上真机验证量程与安全**后才能上架。
 
 ---
 
@@ -141,11 +166,11 @@ def move(self, vx, vy, vyaw, gait=1):
 
 新增卡后按需更新：
 
-- `config.yaml`：加该卡的 `enabled` 开关（及卡自己的参数）。**卡名/key 必须和 `.py` 文件名一致。**
+- `config.yaml`：加该卡的 `enabled` 开关（及卡自己的参数）。
 - `driver.yaml`：`description` 补上新卡能力（评审/上架看这里）。
-- `Dockerfile`：**每个卡文件都要有一行** `COPY <卡名>.py /work/<卡名>.py`；用到新系统包（如音频 `alsa-utils`）在 `apt-get install` 里补上；新增 pip 依赖写进 `requirements.txt`。
+- `Dockerfile`：**新增聚合文件时添加 `COPY <文件名> /work/<文件名>`**（目前 4 个聚合文件 `sensors.py`/`controllers.py`/`ext_devices.py`/`camera.py` 各一行）；用到新系统包（如音频 `alsa-utils`）在 `apt-get install` 里补上；新增 pip 依赖写进 `requirements.txt`（注意版本约束，如 `numpy>=1.20.0`）。
 - `deploy/service.yml`：一般不用改，除非新卡需要额外挂载 / 端口 / 环境变量。
-- `main.py`：**不用改**（按 config 卡名自动 import）。
+- `main.py`：**需在 `Go1Bundle.__init__` 中添加对应导入和创建逻辑**。
 
 ---
 
@@ -166,7 +191,7 @@ curl -s localhost:15717/mcp -H 'Content-Type: application/json' \
 
 ## 7. 提交前检查清单
 
-- [ ] 新卡是一个自包含 `<卡名>.py`，导出 `make_plugin(...)`，遵守 §2 契约。
+- [ ] 新卡在对应聚合文件（`sensors.py`/`controllers.py`/`ext_devices.py`）末尾，导出 `make_plugin(...)`，遵守 §2 契约。
 - [ ] 卡名/key/文件名/`NODE` 一致且唯一；`config.yaml` 已 `enabled: true`。
 - [ ] `Dockerfile` 已加 `COPY <卡名>.py`；`driver.yaml` 描述已更新；新 pip 依赖进 `requirements.txt`。
 - [ ] `dispatch` 返回 plain dict；未知 action 返回 `None`；数据带 `timestamp_ms`/`control_level`/`fresh`。

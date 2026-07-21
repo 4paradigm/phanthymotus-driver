@@ -6,7 +6,7 @@
   - HTTP JSON（:18083，控制命令 volume/stop/info + 兼容 v1 base64 play）
 
 与 beep 专属的 beep_adapter.py（:18082，正弦 beep）分离、互不影响——两者都「用时才起 aplay、
-放完释放」，不长占设备（真同时放时后到的拿 RESOURCE_BUSY）。
+放完保留一段时间不长占设备」（真同时放时后到的拿 RESOURCE_BUSY）。
 
 播放模型（连续「音频流」）：维持一个常驻 aplay 会话（S16_LE / sample_rate / channels），
 每次 play 把 PCM **同步写进 aplay 的 stdin**（管道满则自然背压，等播够再收下一段
