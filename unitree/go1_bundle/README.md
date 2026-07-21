@@ -32,7 +32,7 @@
 | `test_camera_depth` | 双目深度推流（5 机位·multiInstance；test=未验收） | 卡 `start` 才连对应 Nano 板 `depth_stream` → ROS2 CompressedImage（jpeg）；`stop` 断开释放相机 |
 | `test_camera_pointcloud` | 双目点云推流（5 机位·multiInstance；test=未验收） | 卡 `start` 才连对应 Nano 板 `pointcloud_stream` → ROS2 PointCloud2；`stop` 断开释放相机 |
 | `camera_rgb` | RGB 相机推流（5 机位·multiInstance） | 卡 `start` 才连对应 Nano 板 `rgb_stream`（TCP :9201~9205）→ ROS2 CompressedImage（jpeg）；`stop` 断开释放相机 |
-| `test_activity` | 活跃度检测（test=未验收） | 检测机器人是否静止/活跃 |
+| `activity_monitor` | 活动度统计 | 两个按钮：统计过去30秒 / 从卡片启动到目前的活动度、距离、运动占比、速度等 |
 
 ### 控制卡（actuator，下发 `HighCmd` / 外设动作；须真机验证量程+安全后上架）
 
@@ -108,7 +108,7 @@ go1_bundle/
 ├── test_camera_depth.py    # 双目深度推流（5 机位·multiInstance；test=未验收）
 ├── test_camera_pointcloud.py # 双目点云推流（5 机位·multiInstance；test=未验收）
 ├── camera_rgb.py           # RGB 相机推流（5 机位·multiInstance）
-├── test_activity.py        # 活跃度检测（test=未验收）
+├── activity_monitor.py     # 活动度统计：过去30秒 / 启动以来
 │   ── 控制卡（actuator）──
 ├── loco.py                 # 基础运动（move/stop_move/stand 等）
 ├── body_pose.py            # 机身姿态与高度

@@ -63,7 +63,7 @@ COPY test_light_effect.py /work/test_light_effect.py
 COPY system_health.py  /work/system_health.py
 COPY test_camera_depth_li.py /work/test_camera_depth_li.py
 COPY test_camera_pointcloud.py /work/test_camera_pointcloud.py
-COPY test_activity.py  /work/test_activity.py
+COPY activity_monitor.py /work/activity_monitor.py
 COPY speaker.py        /work/speaker.py
 COPY config.yaml       /work/config.yaml
 COPY deploy/           /deploy/
