@@ -1,0 +1,6 @@
+{
+  "bind_host": "192.168.123.13",
+  "port": 18082,
+  "audio_device": "auto",
+  "mixer_control": "Speaker"
+}
