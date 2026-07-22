@@ -28,11 +28,9 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r /work/requirements.txt
 #   2) python_wrapper/python_interface.cpp #include <msgpack.hpp> → 需 libmsgpack-dev；
 #   3) wrapper 用自带 third-party/pybind11，按容器 python 版本编出匹配的 .so；
 #   4) 产物落在 lib/python/${ARCH}/robot_interface*.so。
-# 构建失败不阻断镜像（运行期靠 STUB 兜底），但正常应成功。
-ARG UNITREE_SDK_REPO=https://github.com/unitreerobotics/unitree_legged_sdk.git
-ARG UNITREE_SDK_REF=go1
-RUN git clone --depth 1 -b ${UNITREE_SDK_REF} ${UNITREE_SDK_REPO} /opt/unitree_legged_sdk && \
-    cd /opt/unitree_legged_sdk && mkdir -p build && cd build && \
+# SDK 源码存放在 unitree_legged_sdk，避免构建时访问 GitHub。
+COPY unitree_legged_sdk /opt/unitree_legged_sdk
+RUN cd /opt/unitree_legged_sdk && mkdir -p build && cd build && \
     cmake -DPYTHON_BUILD=ON .. && make -j"$(nproc)" && \
     find /opt/unitree_legged_sdk/lib/python -name 'robot_interface*.so' -exec cp -v {} /work/ \; || true
 
