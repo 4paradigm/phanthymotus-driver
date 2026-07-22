@@ -1,9 +1,9 @@
-id: go1-bundle-driver
-name: Unitree Go1 Bundle (state + control)
+id: go1-driver
+name: Unitree Go1 Bundle
 category: driver
 hardware_provider: unitree
 hardware_model: "go1"
-image_name: go1_bundle
+image_name: go1
 port: 15715
 mcp_url: "http://localhost:15715/mcp"
 description: "Unitree Go1 (EDU) 状态+控制驱动（原始 unitree_legged_sdk）。卡片实现聚合在 sensors.py、controllers.py、ext_devices.py 与 camera.py 四个文件中；camera.py 向 AgentCore 独立注册 camera_rgb、camera_depth、camera_pointcloud 三张五机位视觉卡，分别输出 RGB、彩色深度、XYZ 点云（点云保留 JPEG 俯视预览）。三种流在同一物理机位互斥。其余卡提供 Go1 状态、运动控制、外设和 URDF 资源；beep/speaker 与视觉 Nano 后端由容器首启自动部署。"
