@@ -1,0 +1,16 @@
+[Unit]
+Description=Go1 Speaker Adapter (head speaker PCM audio stream) — serves :18083 /v1/speaker/actions
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=unitree
+# 绑 192.168.123.13:18083；开机 IP 未就绪时由 Restart 反复重试。speaker 音频流专属，
+# 与 beep 的 go1-beep-adapter(:18082) 分离——只做 play/stop/set_volume/get_volume/info。
+ExecStart=/usr/bin/python3 /home/unitree/speaker_adapter.py --config /home/unitree/go1-speaker-adapter.json
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

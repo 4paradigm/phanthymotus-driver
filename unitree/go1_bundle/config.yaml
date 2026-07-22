@@ -1,0 +1,115 @@
+mcp_port: 15715          # go1_bundle 用 15715
+ros_namespace: "bundle"  # 多组隔离：topic 变 /bundle/...，避免与别组(默认 hostname)撞车；留空则用 hostname
+name: "Unitree Go1 (Bundle)"
+
+# 本 bundle 只读 HighState，固定 HIGHLEVEL，不提供控制等级切换。
+
+plugins:
+  # ── 状态卡（读同一 client 的 HighState）──
+  loco_state:                   # 运动状态：mode/gait/velocity/body_height/odometry
+    enabled: true
+  battery:                      # BMS：SOC%/电流/循环/温度/单体电压
+    enabled: true
+
+  face_light:                   # 面部灯带颜色(actuator,MQTT):set_color/preset/off
+    enabled: true
+    mqtt_host: "localhost"
+    mqtt_port: 1883
+    system_health:                # 诊断执行卡(actuator):主控板+子系统体检,自动判断哪里有问题
+    enabled: true
+    mqtt_host: "localhost"
+    mqtt_port: 1883
+  # 相机三卡共用同一 camera.py；每张卡均为 multiInstance，可各自选机位。
+  # 同一物理机位的三种流仍互斥：谁先 start 谁占用相机。
+  camera_rgb:
+    enabled: true
+    default_position: "front"
+    positions:
+      front: {board_ip: "192.168.123.13", image_port: 9201, depth_port: 9101, pcl_port: 9401}
+      chin:  {board_ip: "192.168.123.13", image_port: 9202, depth_port: 9102, pcl_port: 9402}
+      left:  {board_ip: "192.168.123.14", image_port: 9203, depth_port: 9103, pcl_port: 9403}
+      right: {board_ip: "192.168.123.14", image_port: 9204, depth_port: 9104, pcl_port: 9404}
+      belly: {board_ip: "192.168.123.15", image_port: 9205, depth_port: 9105, pcl_port: 9405}
+  camera_depth:
+    enabled: false              # Nano 侧需 DEPTH_ENABLE=1
+    default_position: "front"
+    positions:
+      front: {board_ip: "192.168.123.13", image_port: 9201, depth_port: 9101, pcl_port: 9401}
+      chin:  {board_ip: "192.168.123.13", image_port: 9202, depth_port: 9102, pcl_port: 9402}
+      left:  {board_ip: "192.168.123.14", image_port: 9203, depth_port: 9103, pcl_port: 9403}
+      right: {board_ip: "192.168.123.14", image_port: 9204, depth_port: 9104, pcl_port: 9404}
+      belly: {board_ip: "192.168.123.15", image_port: 9205, depth_port: 9105, pcl_port: 9405}
+  camera_pointcloud:
+    enabled: false              # Nano 侧需 PCL_ENABLE=1
+    default_position: "front"
+    positions:
+      front: {board_ip: "192.168.123.13", image_port: 9201, depth_port: 9101, pcl_port: 9401}
+      chin:  {board_ip: "192.168.123.13", image_port: 9202, depth_port: 9102, pcl_port: 9402}
+      left:  {board_ip: "192.168.123.14", image_port: 9203, depth_port: 9103, pcl_port: 9403}
+      right: {board_ip: "192.168.123.14", image_port: 9204, depth_port: 9104, pcl_port: 9404}
+      belly: {board_ip: "192.168.123.15", image_port: 9205, depth_port: 9105, pcl_port: 9405}
+  imu:                          # IMU：四元数/角速度/加速度/欧拉角/温度
+    enabled: true
+  feet:                         # 足端：足底力[4] + 高层时足端相对机身位置/速度
+    enabled: true
+  fall_alarm:                   # 跌倒/侧翻告警：IMU roll/pitch → ok/tilted/fallen（阈值可配）
+    enabled: true
+    # tilt_warn_rad: 0.6        # 明显倾斜阈值（rad，≈34°）
+    # fall_rad: 1.2             # 跌倒判定阈值（rad，≈69°）
+  odometry:                     # 里程计：position/yaw + 相对起点位移（只读）
+    enabled: true
+  obstacle_range:               # 超声波避障：最近障碍物距离[4]（仅 HIGHLEVEL；方向/单位未定义）
+    enabled: true
+  udp_diagnostics:              # UDP 通信健康：收发计数与 CRC/丢包/标志错误计数
+    enabled: true
+  # ── li 移植（joints/remote_controller，已在实机 go1 验证）──
+  joints:                       # 12 腿关节 q/dq/tau/temp（骨架渲染，需 model 卡提供 URDF）
+    enabled: true
+  remote_controller:            # 无线遥控器 16 按键 + 5 摇杆轴（HighState.wirelessRemote[40]）
+    enabled: true
+  model:                        # (resource) 返回 go1 四足 URDF，供 joints 骨架渲染成狗
+    enabled: true
+  activity_monitor:             # 活动度统计：后台采样 velocity/mode，纯读不控制；action=report 返回 last_30s + since_start
+    enabled: true
+    sample_hz: 5
+    recent_window_sec: 30
+    history_sec: 86400
+    move_eps: 0.05
+    max_integration_dt: 2.0
+
+
+  # ── 控制卡（下发 HighCmd；须真机验证量程+安全后上架）──
+  beep:                         # 头部扬声器 beep 动作卡 → Nano beep_adapter.py（:18082 /v1/beep/actions）
+    enabled: true
+    adapter_host: "192.168.123.13"   # Head Nano IP
+    adapter_port: 18082              # beep_adapter 独立端口（与 speaker 的 head_adapter:18080 分开）
+    rpc_timeout_sec: 2
+
+  speaker:                      # 头部扬声器：播放 remote_mic 音频流 → Nano speaker_adapter.py
+    enabled: true
+    adapter_host: "192.168.123.13"   # Head Nano IP
+    adapter_port: 18083              # speaker_adapter HTTP 控制端口（set_volume/get_volume/stop；与 beep:18082 分开）
+    stream_port: 18084               # speaker_adapter TCP 裸 PCM 流端口（低延迟二进制帧，无 base64/JSON 开销）
+    rpc_timeout_sec: 5               # HTTP 控制命令超时（音量等）
+    mic_topic: "/remote_control/mic" # 订阅的音频流 topic（agent core 从浏览器麦克风 /ws/mic 发布，AudioChunk pcm_16k）
+    max_buffer_bytes: 3200           # 转发跟不上时的缓冲上限(~100ms@16k)，超出丢最旧的 → 延迟钉在低位、保持新鲜
+    # forward_batch_ms 已废弃：v2 改用 Event 驱动推式转发，ROS2 回调即刻唤醒 writer 线程，无需攒批
+
+
+  loco:                         # 基础运动:三维速度 move + 站起/趴下/平衡/姿态/身高
+    enabled: true
+  body_pose:                    # 机身姿态/高度:set_attitude(roll/pitch/yaw)/set_body_height/set_foot_raise_height/reset(能力卡片§4.3)
+    enabled: true
+  gesture:                      # 表演/表情:作揖/点头/摇头/歪头/环视/跳舞/俯卧撑/坐/昂首等(异步)
+    enabled: true
+
+  switch_gait:                  # 步态切换：只设期望步态，实际运动由移动卡触发（trot_run/climb_stair/trot_obstacle 须 confirm）
+    enabled: true
+  # ★ 新增卡：新建 <卡名>.py 后，在这里加一行 `<卡名>: { enabled: true }` 打开它。
+  #   main.py 会按 config 里的 key 自动 import 同名模块（key == 模块名 == 文件名 == 卡名）。
+  special_motion:               # 官方特殊动作 jump_yaw_left/straight_hand(HIGHLEVEL,同步序列,须 confirm,已验收)
+    enabled: true
+    # jump_yaw_left_duration_s: 3.0   # 开火后保持时长(秒,白名单)
+    # straight_hand_duration_s: 4.0
+    # stabilize_timeout_s: 3.0        # 等待站到/回到 balance_stand 的超时
+    # stabilize_settle_s: 0.5         # 确认站稳后、开火前的小停顿
