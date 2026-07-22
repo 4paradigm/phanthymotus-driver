@@ -1,6 +1,6 @@
-mcp_port: 15715          # go1_bundle 用 15715
-ros_namespace: "bundle"  # 多组隔离：topic 变 /bundle/...，避免与别组(默认 hostname)撞车；留空则用 hostname
-name: "Unitree Go1 (Bundle)"
+mcp_port: 15715          # go1 用 15715
+ros_namespace: ""
+name: "Unitree Go1"
 
 # 本 bundle 只读 HighState，固定 HIGHLEVEL，不提供控制等级切换。
 
