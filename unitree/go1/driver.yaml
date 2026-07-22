@@ -1,5 +1,5 @@
 id: go1-bundle-driver
-name: Unitree Go1 Bundle (state + control)
+name: Unitree Go1 Bundle
 category: driver
 hardware_provider: unitree
 hardware_model: "go1"
