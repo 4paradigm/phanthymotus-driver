@@ -564,50 +564,69 @@ class LocoStatePlugin:
 # ── LocoPlugin (actuator) ────────────────────────────────────────────────────
 
 class LocoPlugin:
-    """R1 locomotion control via H2 LocoClient RPC.
+    """R1 locomotion control via LocoClient RPC (sport service) + ArmClient (arm service).
 
-    FSM IDs: 0=zero_torque, 1=damp, 4=locked_stand, 811=walk/run
+    FSM IDs: 0=zero_torque, 1=damp, 4=stance(locked_stand), 701=lie2standup, 702=standup2lie, 811=start(walk/run)
     """
     PREFIX = "loco"
+
+    # All available arm actions from arm service (id → name)
+    ARM_ACTIONS = {
+        11: "blow_kiss_with_both_hands",
+        12: "blow_kiss_with_left_hand",
+        13: "blow_kiss_with_right_hand",
+        15: "both_hands_up",
+        17: "clamp",
+        18: "high_five",
+        19: "hug",
+        22: "refuse",
+        23: "right_hand_up",
+        24: "ultraman_ray",
+        25: "wave_under_head",
+        26: "wave_above_head",
+        27: "shake_hand",
+        28: "box_left_hand_win",
+        29: "box_right_hand_win",
+        30: "box_both_hand_win",
+        31: "extend_right_arm_forward",
+        33: "right_hand_on_heart",
+        34: "both_hands_up_deviate_right",
+        35: "emphasize",
+        36: "forward_push",
+    }
+    ARM_NAME_TO_ID = {v: k for k, v in ARM_ACTIONS.items()}
 
     def __init__(self, plugin_config: dict, namespace: str, executor, loco_client):
         self._client = loco_client
         self._namespace = namespace
 
     def get_tools(self) -> list:
-        return [self._loco_tool(), self._switch_mode_tool(), self._switch_mode_expert_tool()]
+        return [self._loco_tool(), self._switch_mode_tool(), self._arm_tool()]
 
     def _loco_tool(self) -> dict:
         return {
             "name": "loco",
             "type": "actuator",
             "multiInstance": False,
-            "description": "R1 locomotion control — move, stop, set height, set speed mode, wave/shake hand via SetTaskId",
+            "description": "R1 locomotion control — move, stop, get state",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["move", "stop_move", "set_stand_height", "set_speed_mode", "get_fsm_id", "wave_hand", "shake_hand"],
+                        "enum": ["move", "stop_move", "get_fsm_id"],
                         "description": "Action to perform",
                     },
                     "vx":         {"type": "number", "description": "Forward velocity m/s [-1, 1]"},
                     "vy":         {"type": "number", "description": "Lateral velocity m/s [-1, 1]"},
                     "vyaw":       {"type": "number", "description": "Yaw rotation rad/s [-2, 2]"},
                     "duration":   {"type": "number", "description": "Move duration in seconds. 0 or negative = move until explicit stop (default 0)"},
-                    "height":     {"type": "number", "description": "Normalized height 0.0-1.0"},
-                    "speed_mode": {"type": "integer", "description": "Speed mode index (0=normal, 1=fast, etc.)"},
-                    "turn":       {"type": "boolean", "description": "Turn while waving (default false)"},
                 },
                 "required": ["action"],
                 "x-action-params": {
                     "move":             {"params": ["vx", "vy", "vyaw", "duration"], "description": "Move with specified velocities. duration>0 for timed move via SetVelocity, 0 or negative for continuous until stop."},
                     "stop_move":        {"params": [],                                 "description": "Stop all movement immediately"},
-                    "set_stand_height": {"params": ["height"],                         "description": "Set the robot's standing height (0.0-1.0)"},
-                    "set_speed_mode":   {"params": ["speed_mode"],                     "description": "Set speed mode (0=normal, 1=fast)"},
                     "get_fsm_id":       {"params": [],                                 "description": "Get current FSM state ID"},
-                    "wave_hand":        {"params": ["turn"],                           "description": "Perform a waving hand gesture via SetTaskId"},
-                    "shake_hand":       {"params": [],                                 "description": "Perform a handshake gesture via SetTaskId"},
                 },
             },
         }
@@ -617,15 +636,14 @@ class LocoPlugin:
             "name": "switch_mode",
             "type": "actuator",
             "multiInstance": False,
-            "description": "R1 locomotion mode switch — change posture/locomotion mode by name. damp=阻尼, start=主运控, zero_torque=零力矩, stand_up=起立(locked_stand), high_stand=最高站, low_stand=最低站, balance_stand=平衡站立, continuous_gait=持续踏步, stop_gait=停止踏步",
+            "description": "R1 locomotion mode switch — change posture/locomotion mode by name. damp=阻尼, stance=站立(locked_stand), start=主运控(walk/run), zero_torque=零力矩, lie2standup=躺→站, standup2lie=站→躺",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "mode": {
                         "type": "string",
-                        "enum": ["damp", "start", "zero_torque", "stand_up",
-                                 "balance_stand", "continuous_gait", "stop_gait",
-                                 "high_stand", "low_stand"],
+                        "enum": ["damp", "stance", "start", "zero_torque",
+                                 "lie2standup", "standup2lie"],
                         "description": "Target mode",
                     },
                 },
@@ -633,21 +651,27 @@ class LocoPlugin:
             },
         }
 
-    def _switch_mode_expert_tool(self) -> dict:
+    def _arm_tool(self) -> dict:
+        action_names = sorted(self.ARM_NAME_TO_ID.keys())
         return {
-            "name": "switch_mode_expert",
+            "name": "arm",
             "type": "actuator",
             "multiInstance": False,
-            "description": "R1 locomotion mode switch — directly set FSM mode ID (expert use only). IDs: 0=zero_torque, 1=damp, 4=locked_stand, 811=walk/run",
+            "description": "R1 arm/hand gesture control — directly execute predefined arm actions. Auto-enables arm SDK before executing. By default releases arm SDK 4s after execution.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "fsm_id": {
-                        "type": "integer",
-                        "description": "FSM mode ID",
+                    "action": {
+                        "type": "string",
+                        "enum": action_names + ["stop", "release"],
+                        "description": "Arm gesture to perform, 'stop' to interrupt, or 'release' to release arm SDK control",
+                    },
+                    "release_after_done": {
+                        "type": "boolean",
+                        "description": "Auto-release arm SDK 4s after action completes (default true)",
                     },
                 },
-                "required": ["fsm_id"],
+                "required": ["action"],
             },
         }
 
@@ -661,6 +685,9 @@ class LocoPlugin:
         if action == "start":
             return {"state": "ready"}
         if action == "stop":
+            if args.get("_tool_name") == "arm":
+                code, data = self._client.ArmStop()
+                return {"ret": code, "data": data}
             return {"state": "idle"}
         if action == "info":
             return None
@@ -671,10 +698,8 @@ class LocoPlugin:
             duration = float(args.get("duration", 0))
 
             if duration > 0:
-                # Use SetVelocity with hardware-enforced duration (more reliable than Timer)
                 ret = self._client.SetVelocity(vx, vy, vyaw, duration)
             else:
-                # Continuous move until explicit stop
                 ret = self._client.Move(vx, vy, vyaw, True)
 
             return {"ret": ret, "vx": vx, "vy": vy, "vyaw": vyaw, "duration": duration}
@@ -684,44 +709,56 @@ class LocoPlugin:
         elif action == "switch_mode":
             mode = args.get("mode", "")
             mode_dispatch = {
-                "damp":            lambda: self._client.Damp(),
-                "start":           lambda: self._client.Start(),
-                "zero_torque":     lambda: self._client.ZeroTorque(),
-                "stand_up":        lambda: self._client.StandUp(),
-                "balance_stand":   lambda: self._client.BalanceStand(),
-                "continuous_gait": lambda: self._client.ContinuousGait(True),
-                "stop_gait":       lambda: self._client.ContinuousGait(False),
-                "high_stand":      lambda: self._client.HighStand(),
-                "low_stand":       lambda: self._client.LowStand(),
+                "damp":         lambda: self._client.Damp(),
+                "stance":       lambda: self._client.Stance(),
+                "start":        lambda: self._client.Start(),
+                "zero_torque":  lambda: self._client.ZeroTorque(),
+                "lie2standup":  lambda: self._client.Lie2StandUp(),
+                "standup2lie":  lambda: self._client.StandUp2Lie(),
             }
             fn = mode_dispatch.get(mode)
             if fn is None:
                 return {"error": f"Unknown mode: {mode}. Available: {list(mode_dispatch.keys())}"}
             ret = fn()
             return {"ret": ret, "mode": mode}
-        elif action == "switch_mode_expert":
-            fid = int(args.get("fsm_id", 0))
-            ret = self._client.SetFsmId(fid)
-            return {"ret": ret, "fsm_id": fid}
-        elif action == "set_stand_height":
-            h = max(0.0, min(1.0, float(args.get("height", 0.5))))
-            ret = self._client.SetStandHeight(h)
-            return {"ret": ret, "height": h}
-        elif action == "set_speed_mode":
-            mode = int(args.get("speed_mode", 0))
-            ret = self._client.SetSpeedMode(mode)
-            return {"ret": ret, "speed_mode": mode}
         elif action == "get_fsm_id":
             code, fsm_id = self._client.GetFsmId()
             return {"ret": code, "fsm_id": fsm_id}
-        elif action == "wave_hand":
-            turn = bool(args.get("turn", False))
-            ret = self._client.WaveHand(turn)
-            return {"ret": ret, "turn": turn}
-        elif action == "shake_hand":
-            ret = self._client.ShakeHand()
-            return {"ret": ret}
+        # ── Arm actions (tool_name="arm", action = gesture name) ────────────────
+        elif action == "release":
+            # release_arm (id=99) puts hands down
+            self._client.ArmEnable()
+            code, data = self._client.ArmExecuteById(99)
+            return {"ret": code, "data": data}
+        elif action in self.ARM_NAME_TO_ID:
+            # Auto-enable arm SDK, then execute
+            self._client.ArmEnable()
+            action_id = self.ARM_NAME_TO_ID[action]
+            code, data = self._client.ArmExecuteById(action_id)
+            # Schedule auto-release after 4s unless opted out
+            release_after = args.get("release_after_done", True)
+            if release_after and code == 0:
+                self._schedule_arm_release()
+            return {"ret": code, "action": action, "action_id": action_id, "data": data}
         return None
+
+    def _schedule_arm_release(self):
+        """Schedule arm SDK release after 4 seconds."""
+        import threading
+        # Cancel any pending release timer
+        if hasattr(self, '_arm_release_timer') and self._arm_release_timer is not None:
+            self._arm_release_timer.cancel()
+        self._arm_release_timer = threading.Timer(6.0, self._do_arm_release)
+        self._arm_release_timer.daemon = True
+        self._arm_release_timer.start()
+
+    def _do_arm_release(self):
+        """Execute release_arm action (id=99) to put hands down, then release SDK."""
+        try:
+            code, data = self._client.ArmExecuteById(99)  # release_arm
+            print(f"[arm] auto-release_arm: code={code}", flush=True)
+        except Exception as e:
+            print(f"[arm] auto-release error: {e}", flush=True)
 
 
 # ── AsrPlugin (sensor) ───────────────────────────────────────────────────────
