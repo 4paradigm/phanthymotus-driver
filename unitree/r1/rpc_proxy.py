@@ -109,38 +109,8 @@ class RpcProxy:
     def GetFsmId(self):
         return self._call_tuple("loco", "GetFsmId")
 
-    def GetFsmMode(self):
-        return self._call_tuple("loco", "GetFsmMode")
-
-    def GetBalanceMode(self):
-        return self._call_tuple("loco", "GetBalanceMode")
-
-    def GetSwingHeight(self):
-        return self._call_tuple("loco", "GetSwingHeight")
-
-    def GetStandHeight(self):
-        return self._call_tuple("loco", "GetStandHeight")
-
-    def GetArmSdkStatus(self):
-        return self._call_tuple("loco", "GetArmSdkStatus")
-
-    def GetAvailableFsmIds(self):
-        result = self._call("loco", "GetAvailableFsmIds")
-        if result is None:
-            return 3104, None, None
-        return result
-
     def SetFsmId(self, fsm_id: int):
         return self._call_code("loco", "SetFsmId", fsm_id)
-
-    def SetBalanceMode(self, balance_mode: int):
-        return self._call_code("loco", "SetBalanceMode", balance_mode)
-
-    def SetSwingHeight(self, swing_height: float):
-        return self._call_code("loco", "SetSwingHeight", swing_height)
-
-    def SetStandHeight(self, stand_height: float):
-        return self._call_code("loco", "SetStandHeight", stand_height)
 
     def SetVelocity(self, vx: float, vy: float, omega: float, duration: float = 1.0):
         return self._call_code("loco", "SetVelocity", vx, vy, omega, duration)
@@ -148,26 +118,20 @@ class RpcProxy:
     def SetTaskId(self, task_id: float):
         return self._call_code("loco", "SetTaskId", task_id)
 
-    def SetSpeedMode(self, speed_mode: int):
-        return self._call_code("loco", "SetSpeedMode", speed_mode)
-
-    def SetArmSdkStatus(self, arm_sdk_status: bool):
-        return self._call_code("loco", "SetArmSdkStatus", arm_sdk_status)
-
     def Damp(self):
         return self._call_code("loco", "Damp")
+
+    def Stance(self):
+        return self._call_code("loco", "Stance")
 
     def Start(self):
         return self._call_code("loco", "Start")
 
-    def Squat(self):
-        return self._call_code("loco", "Squat")
+    def Lie2StandUp(self):
+        return self._call_code("loco", "Lie2StandUp")
 
-    def Sit(self):
-        return self._call_code("loco", "Sit")
-
-    def StandUp(self):
-        return self._call_code("loco", "StandUp")
+    def StandUp2Lie(self):
+        return self._call_code("loco", "StandUp2Lie")
 
     def ZeroTorque(self):
         return self._call_code("loco", "ZeroTorque")
@@ -175,35 +139,14 @@ class RpcProxy:
     def StopMove(self):
         return self._call_code("loco", "StopMove")
 
-    def HighStand(self):
-        return self._call_code("loco", "HighStand")
-
-    def LowStand(self):
-        return self._call_code("loco", "LowStand")
-
-    def Move(self, vx: float, vy: float, vyaw: float, continous_move: bool = None):
+    def Move(self, vx: float, vy: float, vyaw: float, continous_move: bool = False):
         return self._call_code("loco", "Move", vx, vy, vyaw, continous_move)
-
-    def BalanceStand(self):
-        return self._call_code("loco", "BalanceStand")
-
-    def ContinuousGait(self, flag: bool):
-        return self._call_code("loco", "ContinuousGait", flag)
-
-    def SwitchMoveMode(self, flag: bool):
-        return self._call_code("loco", "SwitchMoveMode", flag)
 
     def WaveHand(self, turn_flag: bool = False):
         return self._call_code("loco", "WaveHand", turn_flag)
 
     def ShakeHand(self, stage: int = -1):
         return self._call_code("loco", "ShakeHand", stage)
-
-    def EnableArmSDK(self):
-        return self._call_code("loco", "EnableArmSDK")
-
-    def DisableArmSDK(self):
-        return self._call_code("loco", "DisableArmSDK")
 
     # ── AudioClient interface ─────────────────────────────────────────────────
 
