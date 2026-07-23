@@ -34,7 +34,7 @@ from typing import Any
 try:
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-    from sensor_msgs.msg import PointCloud2, PointField, CompressedImage
+    from sensor_msgs.msg import PointCloud2, PointField, CompressedImage, Image
     _HAS_ROS2 = True
     _QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                       history=HistoryPolicy.KEEP_LAST, depth=1,
@@ -57,6 +57,7 @@ _DEFAULT_POSITIONS = {
 }
 _POS_TITLE = {"front": "Front (头部前)", "chin": "Chin (头部下)",
               "left": "Left (侧左)", "right": "Right (侧右)", "belly": "Belly (腹部)"}
+_RAW_PORT_OFFSET = 200  # RAW 端口偏移: JPEG深度端口 + 200 = 原始16UC1深度端口
 _VALID_POSITIONS = list(_DEFAULT_POSITIONS.keys())
 
 # 各 type 的默认端口
@@ -312,58 +313,221 @@ class _RgbStream:
                     pass
 
 class _DepthStream(_BaseStream):
-    """深度流：[4B 长度大端][JPEG payload] → CompressedImage。"""
+    """双路深度流：JPEG路用于画布显示(91xx端口)，RAW路按需发布16UC1原始深度(93xx端口)用于避障。
 
-    def __init__(self, node: Node, topic: str):
+    enable_raw=True 时同时启动独立RAW线程连接93xx端口，不影响JPEG画布显示。
+    """
+
+    def __init__(self, node: Node, topic: str, topic_raw: str | None = None):
         super().__init__(node, topic)
         self._pub = node.create_publisher(CompressedImage, topic, _QOS) if _HAS_ROS2 else None
+        self._pub_raw = None  # RAW发布器按需创建
+        self._topic_raw = topic_raw
+        self.connected_raw = False
+        self.frames_raw = 0
+        self.enable_raw = False
+        self._last_publish_ms = 0
+        self._MIN_INTERVAL_MS = 30
+        self._MAX_DRAIN_BYTES = 1_048_576
 
-    def _loop(self, gen, position, host, port):
-        t_connect, t_first, t_steady = 8.0, 15.0, 8.0
+    def start(self, position: str, host: str, port: int, enable_raw: bool = False):
+        self._run = True
+        self._gen += 1
+        gen = self._gen
+        self.position = position
+        self.enable_raw = enable_raw
+        self.connected = False
+        self.connected_raw = False
+
+        # 按需创建RAW发布器
+        if enable_raw and self._topic_raw and _HAS_ROS2 and self._pub_raw is None:
+            self._pub_raw = self._node.create_publisher(Image, self._topic_raw, _QOS)
+
+        # 启动JPEG流线程
+        threading.Thread(target=self._jpeg_loop, args=(gen, position, host, port), daemon=True).start()
+        # 按需启动RAW流线程
+        if enable_raw:
+            port_raw = port + _RAW_PORT_OFFSET
+            threading.Thread(target=self._raw_loop, args=(gen, position, host, port_raw), daemon=True).start()
+
+    def stop(self):
+        self._run = False
+        self._gen += 1
+        self.connected = False
+        self.connected_raw = False
+
+    def _jpeg_loop(self, gen, position, host, port):
+        """JPEG流循环：连接91xx端口接收彩色深度JPEG，兼容画布显示"""
         while self._run and gen == self._gen:
             try:
-                s = socket.create_connection((host, port), timeout=t_connect)
-                s.settimeout(t_first)
+                s = socket.create_connection((host, port), timeout=_CONNECT_TIMEOUT)
+                s.setblocking(False)
                 self.connected = True
                 if self._node:
-                    self._node.get_logger().info(f"[{position}] 已连 depth_stream {host}:{port}")
+                    self._node.get_logger().info(f"[{position}] JPEG路已连 depth_stream {host}:{port}")
             except Exception:
                 self.connected = False
                 time.sleep(2)
                 continue
             try:
                 got_first = False
+                rx = bytearray()
                 while self._run and gen == self._gen:
-                    hdr = _recvall(s, 4)
-                    if hdr is None:
+                    timeout = _STEADY_TIMEOUT if got_first else _FIRST_FRAME_TIMEOUT
+                    readable, _, _ = select.select([s], [], [], timeout)
+                    if not readable:
+                        raise TimeoutError("depth jpeg timed out")
+
+                    received = 0
+                    peer_closed = False
+                    while received < self._MAX_DRAIN_BYTES:
+                        try:
+                            chunk = s.recv(min(65_536, self._MAX_DRAIN_BYTES - received))
+                        except BlockingIOError:
+                            break
+                        if not chunk:
+                            peer_closed = True
+                            break
+                        rx.extend(chunk)
+                        received += len(chunk)
+                    if peer_closed:
                         break
-                    n = struct.unpack(">I", hdr)[0]
-                    if n <= 0 or n > 5_000_000:
-                        break
-                    data = _recvall(s, n)
-                    if data is None:
-                        break
+
+                    latest = None
+                    complete_frames = 0
+                    while len(rx) >= 4:
+                        n = struct.unpack(">I", rx[:4])[0]
+                        if n <= 0 or n > 5_000_000:
+                            raise ValueError(f"invalid JPEG length: {n}")
+                        end = 4 + n
+                        if len(rx) < end:
+                            break
+                        latest = bytes(rx[4:end])
+                        del rx[:end]
+                        complete_frames += 1
+                    self.frames += complete_frames
+                    if latest is None:
+                        continue
+
                     if not got_first:
                         got_first = True
-                        s.settimeout(t_steady)
                         if self._node:
-                            self._node.get_logger().info(f"[{position}] 首帧到达")
+                            self._node.get_logger().info(f"[{position}] JPEG首帧到达")
+
+                    now_ms = int(time.time() * 1000)
+                    if now_ms - self._last_publish_ms < self._MIN_INTERVAL_MS:
+                        continue
+
                     if self._pub is not None:
                         msg = CompressedImage()
                         msg.header.stamp = self._node.get_clock().now().to_msg()
                         msg.header.frame_id = f"go1_{position}_depth"
                         msg.format = "jpeg"
-                        msg.data = data
+                        msg.data = latest
                         try:
                             self._pub.publish(msg)
+                            self._last_publish_ms = now_ms
                         except Exception:
                             break
-                    self.frames += 1
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 if self._node:
-                    self._node.get_logger().warn(f"[{position}] depth stream 中断: {e}")
+                    self._node.get_logger().warn(f"[{position}] JPEG深度流中断: {e}")
             finally:
                 self.connected = False
+                try:
+                    s.close()
+                except Exception:
+                    pass
+
+    def _raw_loop(self, gen, position, host, port):
+        """RAW原始深度流循环：连接93xx端口接收16UC1原始深度数据(毫米单位)，用于避障算法"""
+        while self._run and gen == self._gen and self.enable_raw:
+            try:
+                s = socket.create_connection((host, port), timeout=_CONNECT_TIMEOUT)
+                s.setblocking(False)
+                self.connected_raw = True
+                if self._node:
+                    self._node.get_logger().info(f"[{position}] RAW原始深度路已连 {host}:{port}")
+            except Exception:
+                self.connected_raw = False
+                time.sleep(2)
+                continue
+            try:
+                got_first = False
+                rx = bytearray()
+                while self._run and gen == self._gen and self.enable_raw:
+                    timeout = _STEADY_TIMEOUT if got_first else _FIRST_FRAME_TIMEOUT
+                    readable, _, _ = select.select([s], [], [], timeout)
+                    if not readable:
+                        raise TimeoutError("raw timed out")
+
+                    received = 0
+                    peer_closed = False
+                    while received < self._MAX_DRAIN_BYTES:
+                        try:
+                            chunk = s.recv(min(65_536, self._MAX_DRAIN_BYTES - received))
+                        except BlockingIOError:
+                            break
+                        if not chunk:
+                            peer_closed = True
+                            break
+                        rx.extend(chunk)
+                        received += len(chunk)
+                    if peer_closed:
+                        break
+
+                    latest = None
+                    latest_w = 0
+                    latest_h = 0
+                    complete_frames = 0
+                    while len(rx) >= 8:
+                        w = struct.unpack(">I", rx[:4])[0]
+                        h = struct.unpack(">I", rx[4:8])[0]
+                        data_size = w * h * 2
+                        if data_size <= 0 or data_size > 5_000_000:
+                            raise ValueError(f"invalid raw size: {w}x{h}")
+                        end = 8 + data_size
+                        if len(rx) < end:
+                            break
+                        latest = bytes(rx[8:end])
+                        latest_w = w
+                        latest_h = h
+                        del rx[:end]
+                        complete_frames += 1
+                    self.frames_raw += complete_frames
+                    if latest is None:
+                        continue
+
+                    if not got_first:
+                        got_first = True
+                        if self._node:
+                            self._node.get_logger().info(f"[{position}] RAW首帧到达 {latest_w}x{latest_h} 16UC1(mm)")
+                            if latest_w not in (464, 640) or latest_h not in (400, 480):
+                                self._node.get_logger().warn(f"[{position}] RAW帧尺寸异常 {latest_w}x{latest_h}，期望~464x400")
+
+                    now_ms = int(time.time() * 1000)
+                    if now_ms - self._last_publish_ms < self._MIN_INTERVAL_MS:
+                        continue
+
+                    if self._pub_raw is not None:
+                        msg = Image()
+                        msg.header.stamp = self._node.get_clock().now().to_msg()
+                        msg.header.frame_id = f"go1_{position}_depth_raw"
+                        msg.encoding = "16UC1"
+                        msg.height = latest_h
+                        msg.width = latest_w
+                        msg.is_bigendian = 0
+                        msg.step = latest_w * 2
+                        msg.data = list(latest)
+                        try:
+                            self._pub_raw.publish(msg)
+                        except Exception:
+                            break
+            except Exception as e:
+                if self._node:
+                    self._node.get_logger().warn(f"[{position}] RAW深度流中断: {e}")
+            finally:
+                self.connected_raw = False
                 try:
                     s.close()
                 except Exception:
@@ -493,6 +657,7 @@ class Plugin:
         self._default_pos = str(c.get("default_position", "front")).lower()
         if self._default_pos not in self._positions:
             self._default_pos = "front"
+        self._enable_raw_default = bool(c.get("enable_raw_default", False))  # 仅 depth 类型使用
         self._node = None
         self._streams: dict[str, _BaseStream] = {}
         self._cfg: dict[str, dict] = {}
@@ -517,6 +682,19 @@ class Plugin:
 
     # ── 机位解析 ──
 
+    def _topic_raw(self, iid: str) -> str:
+        safe = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in iid)
+        return f"/{self._ns}/{self._topic_root}/{safe}/{self._topic_suffix}_raw"
+
+    def _resolve_enable_raw(self, iid: str, args: dict) -> bool:
+        """解析 enable_raw 配置：实例级 > 全局默认。仅 depth 类型有效。"""
+        cfg = args.get("config") or {}
+        if "enable_raw" in cfg:
+            return bool(cfg.get("enable_raw"))
+        if iid in self._cfg and "enable_raw" in self._cfg[iid]:
+            return bool(self._cfg[iid]["enable_raw"])
+        return self._enable_raw_default
+
     def _resolve_pos(self, iid: str, args: dict) -> str:
         cfg = args.get("config") or {}
         cand = (cfg.get("position") or args.get("position") or args.get("camera_source")
@@ -532,6 +710,8 @@ class Plugin:
         if iid not in self._streams:
             if self._has_preview:
                 self._streams[iid] = _PclStream(self._node, self._topic(iid), self._topic_preview(iid))
+            elif self._type == "depth":
+                self._streams[iid] = self._stream_cls(self._node, self._topic(iid), self._topic_raw(iid))
             else:
                 self._streams[iid] = self._stream_cls(self._node, self._topic(iid))
         return self._streams[iid]
@@ -560,19 +740,28 @@ class Plugin:
             topic_out.append({"topic": self._topic("default"), "format": self._fmt})
             if self._has_preview and _HAS_PIL:
                 topic_out.append({"topic": self._topic_preview("default"), "format": "image/jpeg"})
+        # 构建 configSchema 的 properties
+        schema_props: dict[str, Any] = {
+            "position": {
+                "type": "string",
+                "description": "读取哪一路相机（改此项即热切源）",
+                "scope": "instance",
+                "oneOf": [{"const": p, "title": _POS_TITLE[p]} for p in _VALID_POSITIONS],
+            },
+        }
+        if self._type == "depth":
+            schema_props["enable_raw"] = {
+                "type": "boolean",
+                "description": "是否同时发布原始16UC1深度数据到depth_raw话题（用于避障算法，毫米单位）",
+                "scope": "instance",
+                "default": False,
+            }
         return [{
             "name": self._card, "type": TYPE, "multiInstance": True,
             "description": self._desc + (" — ROS2" if self._node else " — no rclpy, poll via MCP"),
             "configSchema": {
                 "type": "object",
-                "properties": {
-                    "position": {
-                        "type": "string",
-                        "description": "读取哪一路相机（改此项即热切源）",
-                        "scope": "instance",
-                        "oneOf": [{"const": p, "title": _POS_TITLE[p]} for p in _VALID_POSITIONS],
-                    },
-                },
+                "properties": schema_props,
             },
             "inputSchema": {
                 "type": "object",
@@ -589,20 +778,45 @@ class Plugin:
         iid = args.get("instance_id") or "default"
 
         if action == "config":
-            # 更新位置配置
+            # 更新位置 + (depth 类型) enable_raw 配置
             pos = self._resolve_pos(iid, args)
             if pos not in self._positions:
                 return _err("INVALID_ARGUMENT", f"unknown position {pos!r}; valid: {_VALID_POSITIONS}")
-            self._cfg[iid] = {"position": pos}
+            cfg_entry: dict = {"position": pos}
+            need_restart = False
+            if self._type == "depth":
+                enable_raw = self._resolve_enable_raw(iid, args)
+                cfg_entry["enable_raw"] = enable_raw
+                st = self._streams.get(iid)
+                if st is not None and st._run:
+                    if st.position != pos or st.enable_raw != enable_raw:
+                        need_restart = True
+            else:
+                st = self._streams.get(iid)
+                if st is not None and st._run and st.position != pos:
+                    need_restart = True
+            self._cfg[iid] = cfg_entry
 
-            # 如果实例正在运行，重启它
-            st = self._streams.get(iid)
-            if st is not None and st._run and st.position != pos:
-                self._start_instance(iid, pos)
+            if need_restart:
+                if self._type == "depth":
+                    self._start_instance(iid, pos, enable_raw)
+                else:
+                    self._start_instance(iid, pos)
 
-            return {"ok": True, "card": self._card, "type": self._type, "position": pos}
+            topic_out = [{"topic": self._topic(iid), "format": self._fmt}]
+            result: dict = {"ok": True, "card": self._card, "type": self._type, "position": pos}
+            if self._type == "depth":
+                result["enable_raw"] = self._resolve_enable_raw(iid, args)
+                if result["enable_raw"]:
+                    topic_out.append({"topic": self._topic_raw(iid), "format": "image/depth-z16"})
+            result["topic_out"] = topic_out
+            return result
 
         if action == "start":
+            if self._type == "depth":
+                pos = self._resolve_pos(iid, args)
+                enable_raw = self._resolve_enable_raw(iid, args)
+                return self._start_instance(iid, pos, enable_raw)
             return self._start_instance(iid, self._resolve_pos(iid, args))
 
         if action == "stop":
@@ -626,7 +840,9 @@ class Plugin:
             topic_out.append({"topic": self._topic(iid), "format": self._fmt})
             if self._has_preview and _HAS_PIL:
                 topic_out.append({"topic": self._topic_preview(iid), "format": "image/jpeg"})
-        base = {
+            if self._type == "depth" and self._resolve_enable_raw(iid, args):
+                topic_out.append({"topic": self._topic_raw(iid), "format": "image/depth-z16"})
+        base: dict = {
             "state": state, "position": pos,
             "positions_available": _VALID_POSITIONS,
             "type": self._type,
@@ -638,10 +854,15 @@ class Plugin:
         }
         if self._has_preview:
             base["last_frame_points"] = st.last_points if st else 0
+        if self._type == "depth":
+            base["enable_raw"] = self._resolve_enable_raw(iid, args)
+            base["connected_raw"] = bool(st and st.connected_raw) if st else False
+            base["frames_raw"] = st.frames_raw if st else 0
+            base["source_raw"] = f"{pos} @ {p.get('board_ip')}:{p.get(self._port_key, self._default_port) + _RAW_PORT_OFFSET}"
         base["note"] = "streaming; stop to release camera" if state == "running" else "start to connect; stop releases it"
         return base
 
-    def _start_instance(self, iid: str, position: str) -> dict:
+    def _start_instance(self, iid: str, position: str, enable_raw: bool | None = None) -> dict:
         if position not in self._positions:
             return _err("INVALID_ARGUMENT", f"unknown position {position!r}; valid: {_VALID_POSITIONS}")
         if self._node is None:
@@ -653,16 +874,28 @@ class Plugin:
         # 创建新实例
         if self._has_preview:
             st = _PclStream(self._node, self._topic(iid), self._topic_preview(iid))
+        elif self._type == "depth":
+            st = _DepthStream(self._node, self._topic(iid), self._topic_raw(iid))
         else:
             st = self._stream_cls(self._node, self._topic(iid))
         self._streams[iid] = st
-        st.start(position, p["board_ip"], int(p.get(self._port_key, self._default_port)))
+        # 仅 depth 类型传递 enable_raw
+        if self._type == "depth":
+            raw = enable_raw if enable_raw is not None else self._enable_raw_default
+            st.start(position, p["board_ip"], int(p.get(self._port_key, self._default_port)), raw)
+        else:
+            st.start(position, p["board_ip"], int(p.get(self._port_key, self._default_port)))
         topic_out = [{"topic": self._topic(iid), "format": self._fmt}]
         if self._has_preview and _HAS_PIL:
             topic_out.append({"topic": self._topic_preview(iid), "format": "image/jpeg"})
-        return {"ok": True, "card": self._card, "action": "start", "timestamp_ms": _now_ms(),
+        if self._type == "depth" and raw:
+            topic_out.append({"topic": self._topic_raw(iid), "format": "image/depth-z16"})
+        result = {"ok": True, "card": self._card, "action": "start", "timestamp_ms": _now_ms(),
                 "state": "running", "position": position, "type": self._type,
                 "topic_out": topic_out}
+        if self._type == "depth":
+            result["enable_raw"] = raw
+        return result
 
 
 def make_camera_rgb(plugin_config, namespace, executor, client):
