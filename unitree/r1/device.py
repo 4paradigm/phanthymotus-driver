@@ -748,7 +748,7 @@ class LocoPlugin:
         # Cancel any pending release timer
         if hasattr(self, '_arm_release_timer') and self._arm_release_timer is not None:
             self._arm_release_timer.cancel()
-        self._arm_release_timer = threading.Timer(4.0, self._do_arm_release)
+        self._arm_release_timer = threading.Timer(6.0, self._do_arm_release)
         self._arm_release_timer.daemon = True
         self._arm_release_timer.start()
 
