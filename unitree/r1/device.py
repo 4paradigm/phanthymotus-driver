@@ -731,27 +731,27 @@ class LocoPlugin:
         elif action == "get_fsm_id":
             code, fsm_id = self._client.GetFsmId()
             return {"ret": code, "fsm_id": fsm_id}
-        # ── Arm actions ───────────────────────────────────────────────────────
-        elif action == "arm_enable":
+        # ── Arm actions (tool_name="arm", action from args) ─────────────────────
+        elif action == "enable":
             code, data = self._client.ArmEnable()
             return {"ret": code, "data": data}
-        elif action == "arm_release":
+        elif action == "release":
             code, data = self._client.ArmRelease()
             return {"ret": code, "data": data}
-        elif action == "arm_execute":
+        elif action == "execute":
             name = args.get("name", "")
             action_id = self.ARM_NAME_TO_ID.get(name)
             if action_id is None:
                 return {"error": f"Unknown arm action: {name}. Available: {list(self.ARM_NAME_TO_ID.keys())}"}
             code, data = self._client.ArmExecuteById(action_id)
             return {"ret": code, "action": name, "action_id": action_id, "data": data}
-        elif action == "arm_stop":
+        elif action == "stop":
             code, data = self._client.ArmStop()
             return {"ret": code, "data": data}
-        elif action == "arm_list":
+        elif action == "list":
             code, actions = self._client.ArmListActions()
             return {"ret": code, "actions": actions}
-        elif action == "arm_status":
+        elif action == "status":
             code, data = self._client.ArmGetStatus()
             return {"ret": code, "data": data}
         return None
