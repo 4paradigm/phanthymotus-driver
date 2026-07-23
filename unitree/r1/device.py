@@ -658,30 +658,17 @@ class LocoPlugin:
             "name": "arm",
             "type": "actuator",
             "multiInstance": False,
-            "description": "R1 arm/hand gesture control — execute predefined arm actions like wave, shake hand, hug, etc. Must enable arm SDK first, then execute action, then release.",
+            "description": "R1 arm/hand gesture control — directly execute predefined arm actions. Auto-enables arm SDK before executing.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["enable", "release", "execute", "stop", "list", "status"],
-                        "description": "Action to perform",
-                    },
-                    "name": {
-                        "type": "string",
-                        "enum": action_names,
-                        "description": "Arm action name to execute",
+                        "enum": action_names + ["stop"],
+                        "description": "Arm gesture to perform, or 'stop' to interrupt current gesture",
                     },
                 },
                 "required": ["action"],
-                "x-action-params": {
-                    "enable":   {"params": [],       "description": "Acquire arm SDK control (required before execute)"},
-                    "release":  {"params": [],       "description": "Release arm SDK control back to system"},
-                    "execute":  {"params": ["name"], "description": "Execute an arm action by name"},
-                    "stop":     {"params": [],       "description": "Stop current arm action"},
-                    "list":     {"params": [],       "description": "List all available arm actions"},
-                    "status":   {"params": [],       "description": "Get arm SDK status"},
-                },
             },
         }
 
@@ -695,6 +682,9 @@ class LocoPlugin:
         if action == "start":
             return {"state": "ready"}
         if action == "stop":
+            if args.get("_tool_name") == "arm":
+                code, data = self._client.ArmStop()
+                return {"ret": code, "data": data}
             return {"state": "idle"}
         if action == "info":
             return None
@@ -731,29 +721,13 @@ class LocoPlugin:
         elif action == "get_fsm_id":
             code, fsm_id = self._client.GetFsmId()
             return {"ret": code, "fsm_id": fsm_id}
-        # ── Arm actions (tool_name="arm", action from args) ─────────────────────
-        elif action == "enable":
-            code, data = self._client.ArmEnable()
-            return {"ret": code, "data": data}
-        elif action == "release":
-            code, data = self._client.ArmRelease()
-            return {"ret": code, "data": data}
-        elif action == "execute":
-            name = args.get("name", "")
-            action_id = self.ARM_NAME_TO_ID.get(name)
-            if action_id is None:
-                return {"error": f"Unknown arm action: {name}. Available: {list(self.ARM_NAME_TO_ID.keys())}"}
+        # ── Arm actions (tool_name="arm", action = gesture name) ────────────────
+        elif action in self.ARM_NAME_TO_ID:
+            # Auto-enable arm SDK, then execute
+            self._client.ArmEnable()
+            action_id = self.ARM_NAME_TO_ID[action]
             code, data = self._client.ArmExecuteById(action_id)
-            return {"ret": code, "action": name, "action_id": action_id, "data": data}
-        elif action == "stop":
-            code, data = self._client.ArmStop()
-            return {"ret": code, "data": data}
-        elif action == "list":
-            code, actions = self._client.ArmListActions()
-            return {"ret": code, "actions": actions}
-        elif action == "status":
-            code, data = self._client.ArmGetStatus()
-            return {"ret": code, "data": data}
+            return {"ret": code, "action": action, "action_id": action_id, "data": data}
         return None
 
 
