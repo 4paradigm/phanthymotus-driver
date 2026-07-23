@@ -742,12 +742,12 @@ class LocoPlugin:
         return None
 
     def _schedule_arm_release(self):
-        """Schedule arm SDK release after 20 seconds (enough for longest gestures)."""
+        """Schedule arm SDK release after 4 seconds."""
         import threading
         # Cancel any pending release timer
         if hasattr(self, '_arm_release_timer') and self._arm_release_timer is not None:
             self._arm_release_timer.cancel()
-        self._arm_release_timer = threading.Timer(20.0, self._do_arm_release)
+        self._arm_release_timer = threading.Timer(4.0, self._do_arm_release)
         self._arm_release_timer.daemon = True
         self._arm_release_timer.start()
 
