@@ -572,7 +572,6 @@ class LocoPlugin:
 
     # All available arm actions from arm service (id → name)
     ARM_ACTIONS = {
-        99: "release_arm",
         11: "blow_kiss_with_both_hands",
         12: "blow_kiss_with_left_hand",
         13: "blow_kiss_with_right_hand",
@@ -727,7 +726,9 @@ class LocoPlugin:
             return {"ret": code, "fsm_id": fsm_id}
         # ── Arm actions (tool_name="arm", action = gesture name) ────────────────
         elif action == "release":
-            code, data = self._client.ArmRelease()
+            # release_arm (id=99) puts hands down
+            self._client.ArmEnable()
+            code, data = self._client.ArmExecuteById(99)
             return {"ret": code, "data": data}
         elif action in self.ARM_NAME_TO_ID:
             # Auto-enable arm SDK, then execute
@@ -752,10 +753,12 @@ class LocoPlugin:
         self._arm_release_timer.start()
 
     def _do_arm_release(self):
+        """Execute release_arm action (id=99) to put hands down, then release SDK."""
         try:
-            self._client.ArmRelease()
-        except Exception:
-            pass
+            code, data = self._client.ArmExecuteById(99)  # release_arm
+            print(f"[arm] auto-release_arm: code={code}", flush=True)
+        except Exception as e:
+            print(f"[arm] auto-release error: {e}", flush=True)
 
 
 # ── AsrPlugin (sensor) ───────────────────────────────────────────────────────
