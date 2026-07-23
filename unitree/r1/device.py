@@ -564,46 +564,70 @@ class LocoStatePlugin:
 # ── LocoPlugin (actuator) ────────────────────────────────────────────────────
 
 class LocoPlugin:
-    """R1 locomotion control via LocoClient RPC (sport service).
+    """R1 locomotion control via LocoClient RPC (sport service) + ArmClient (arm service).
 
     FSM IDs: 0=zero_torque, 1=damp, 4=stance(locked_stand), 701=lie2standup, 702=standup2lie, 811=start(walk/run)
     """
     PREFIX = "loco"
+
+    # All available arm actions from arm service (id → name)
+    ARM_ACTIONS = {
+        99: "release_arm",
+        11: "blow_kiss_with_both_hands",
+        12: "blow_kiss_with_left_hand",
+        13: "blow_kiss_with_right_hand",
+        15: "both_hands_up",
+        17: "clamp",
+        18: "high_five",
+        19: "hug",
+        22: "refuse",
+        23: "right_hand_up",
+        24: "ultraman_ray",
+        25: "wave_under_head",
+        26: "wave_above_head",
+        27: "shake_hand",
+        28: "box_left_hand_win",
+        29: "box_right_hand_win",
+        30: "box_both_hand_win",
+        31: "extend_right_arm_forward",
+        33: "right_hand_on_heart",
+        34: "both_hands_up_deviate_right",
+        35: "emphasize",
+        36: "forward_push",
+    }
+    ARM_NAME_TO_ID = {v: k for k, v in ARM_ACTIONS.items()}
 
     def __init__(self, plugin_config: dict, namespace: str, executor, loco_client):
         self._client = loco_client
         self._namespace = namespace
 
     def get_tools(self) -> list:
-        return [self._loco_tool(), self._switch_mode_tool()]
+        return [self._loco_tool(), self._switch_mode_tool(), self._arm_tool()]
 
     def _loco_tool(self) -> dict:
         return {
             "name": "loco",
             "type": "actuator",
             "multiInstance": False,
-            "description": "R1 locomotion control — move, stop, wave/shake hand via SetTaskId",
+            "description": "R1 locomotion control — move, stop, get state",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["move", "stop_move", "get_fsm_id", "wave_hand", "shake_hand"],
+                        "enum": ["move", "stop_move", "get_fsm_id"],
                         "description": "Action to perform",
                     },
                     "vx":         {"type": "number", "description": "Forward velocity m/s [-1, 1]"},
                     "vy":         {"type": "number", "description": "Lateral velocity m/s [-1, 1]"},
                     "vyaw":       {"type": "number", "description": "Yaw rotation rad/s [-2, 2]"},
                     "duration":   {"type": "number", "description": "Move duration in seconds. 0 or negative = move until explicit stop (default 0)"},
-                    "turn":       {"type": "boolean", "description": "Turn while waving (default false)"},
                 },
                 "required": ["action"],
                 "x-action-params": {
                     "move":             {"params": ["vx", "vy", "vyaw", "duration"], "description": "Move with specified velocities. duration>0 for timed move via SetVelocity, 0 or negative for continuous until stop."},
                     "stop_move":        {"params": [],                                 "description": "Stop all movement immediately"},
                     "get_fsm_id":       {"params": [],                                 "description": "Get current FSM state ID"},
-                    "wave_hand":        {"params": ["turn"],                           "description": "Perform a waving hand gesture via SetTaskId"},
-                    "shake_hand":       {"params": [],                                 "description": "Perform a handshake gesture via SetTaskId"},
                 },
             },
         }
@@ -625,6 +649,39 @@ class LocoPlugin:
                     },
                 },
                 "required": ["mode"],
+            },
+        }
+
+    def _arm_tool(self) -> dict:
+        action_names = sorted(self.ARM_NAME_TO_ID.keys())
+        return {
+            "name": "arm",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "R1 arm/hand gesture control — execute predefined arm actions like wave, shake hand, hug, etc. Must enable arm SDK first, then execute action, then release.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["enable", "release", "execute", "stop", "list", "status"],
+                        "description": "Action to perform",
+                    },
+                    "name": {
+                        "type": "string",
+                        "enum": action_names,
+                        "description": "Arm action name to execute",
+                    },
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "enable":   {"params": [],       "description": "Acquire arm SDK control (required before execute)"},
+                    "release":  {"params": [],       "description": "Release arm SDK control back to system"},
+                    "execute":  {"params": ["name"], "description": "Execute an arm action by name"},
+                    "stop":     {"params": [],       "description": "Stop current arm action"},
+                    "list":     {"params": [],       "description": "List all available arm actions"},
+                    "status":   {"params": [],       "description": "Get arm SDK status"},
+                },
             },
         }
 
@@ -674,13 +731,29 @@ class LocoPlugin:
         elif action == "get_fsm_id":
             code, fsm_id = self._client.GetFsmId()
             return {"ret": code, "fsm_id": fsm_id}
-        elif action == "wave_hand":
-            turn = bool(args.get("turn", False))
-            ret = self._client.WaveHand(turn)
-            return {"ret": ret, "turn": turn}
-        elif action == "shake_hand":
-            ret = self._client.ShakeHand()
-            return {"ret": ret}
+        # ── Arm actions ───────────────────────────────────────────────────────
+        elif action == "arm_enable":
+            code, data = self._client.ArmEnable()
+            return {"ret": code, "data": data}
+        elif action == "arm_release":
+            code, data = self._client.ArmRelease()
+            return {"ret": code, "data": data}
+        elif action == "arm_execute":
+            name = args.get("name", "")
+            action_id = self.ARM_NAME_TO_ID.get(name)
+            if action_id is None:
+                return {"error": f"Unknown arm action: {name}. Available: {list(self.ARM_NAME_TO_ID.keys())}"}
+            code, data = self._client.ArmExecuteById(action_id)
+            return {"ret": code, "action": name, "action_id": action_id, "data": data}
+        elif action == "arm_stop":
+            code, data = self._client.ArmStop()
+            return {"ret": code, "data": data}
+        elif action == "arm_list":
+            code, actions = self._client.ArmListActions()
+            return {"ret": code, "actions": actions}
+        elif action == "arm_status":
+            code, data = self._client.ArmGetStatus()
+            return {"ret": code, "data": data}
         return None
 
 
