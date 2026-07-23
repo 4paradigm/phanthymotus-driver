@@ -658,14 +658,18 @@ class LocoPlugin:
             "name": "arm",
             "type": "actuator",
             "multiInstance": False,
-            "description": "R1 arm/hand gesture control — directly execute predefined arm actions. Auto-enables arm SDK before executing.",
+            "description": "R1 arm/hand gesture control — directly execute predefined arm actions. Auto-enables arm SDK before executing. By default releases arm SDK 4s after execution.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": action_names + ["stop"],
-                        "description": "Arm gesture to perform, or 'stop' to interrupt current gesture",
+                        "enum": action_names + ["stop", "release"],
+                        "description": "Arm gesture to perform, 'stop' to interrupt, or 'release' to release arm SDK control",
+                    },
+                    "release_after_done": {
+                        "type": "boolean",
+                        "description": "Auto-release arm SDK 4s after action completes (default true)",
                     },
                 },
                 "required": ["action"],
@@ -722,13 +726,36 @@ class LocoPlugin:
             code, fsm_id = self._client.GetFsmId()
             return {"ret": code, "fsm_id": fsm_id}
         # ── Arm actions (tool_name="arm", action = gesture name) ────────────────
+        elif action == "release":
+            code, data = self._client.ArmRelease()
+            return {"ret": code, "data": data}
         elif action in self.ARM_NAME_TO_ID:
             # Auto-enable arm SDK, then execute
             self._client.ArmEnable()
             action_id = self.ARM_NAME_TO_ID[action]
             code, data = self._client.ArmExecuteById(action_id)
+            # Schedule auto-release after 4s unless opted out
+            release_after = args.get("release_after_done", True)
+            if release_after and code == 0:
+                self._schedule_arm_release()
             return {"ret": code, "action": action, "action_id": action_id, "data": data}
         return None
+
+    def _schedule_arm_release(self):
+        """Schedule arm SDK release after 20 seconds (enough for longest gestures)."""
+        import threading
+        # Cancel any pending release timer
+        if hasattr(self, '_arm_release_timer') and self._arm_release_timer is not None:
+            self._arm_release_timer.cancel()
+        self._arm_release_timer = threading.Timer(20.0, self._do_arm_release)
+        self._arm_release_timer.daemon = True
+        self._arm_release_timer.start()
+
+    def _do_arm_release(self):
+        try:
+            self._client.ArmRelease()
+        except Exception:
+            pass
 
 
 # ── AsrPlugin (sensor) ───────────────────────────────────────────────────────
