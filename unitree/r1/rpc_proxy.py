@@ -19,6 +19,7 @@ def _rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.
     """Subprocess: holds dedicated RPC clients, processes commands sequentially."""
     from unitree_sdk2py.core.channel import ChannelFactoryInitialize
     from unitree_sdk2py.h2.loco.h2_loco_client import LocoClient
+    from unitree_sdk2py.r1.arm.r1_arm_client import ArmClient
     from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
 
     ChannelFactoryInitialize(0, network_iface)
@@ -27,12 +28,18 @@ def _rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.
     loco.SetTimeout(10.0)
     loco.Init()
 
+    arm = ArmClient()
+    arm.SetTimeout(10.0)
+    arm.Init()
+
     audio = AudioClient()
     audio.SetTimeout(10.0)
     audio.Init()
 
     time.sleep(0.5)
     print("[RpcWorker] ready", flush=True)
+
+    clients = {"loco": loco, "arm": arm, "audio": audio}
 
     while True:
         try:
@@ -42,13 +49,13 @@ def _rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.
         if cmd is None:
             break
 
-        client_name = cmd.get("client")  # "loco" or "audio"
+        client_name = cmd.get("client")  # "loco", "arm", or "audio"
         method = cmd.get("method")
         args = cmd.get("args", [])
         kwargs = cmd.get("kwargs", {})
 
         try:
-            client = loco if client_name == "loco" else audio
+            client = clients.get(client_name, loco)
             fn = getattr(client, method)
             result = fn(*args, **kwargs)
             result_queue.put({"result": result})
@@ -104,70 +111,31 @@ class RpcProxy:
         except Exception:
             pass
 
-    # ── LocoClient interface ──────────────────────────────────────────────────
+    # ── LocoClient interface (sport service — legs) ───────────────────────────
 
     def GetFsmId(self):
         return self._call_tuple("loco", "GetFsmId")
 
-    def GetFsmMode(self):
-        return self._call_tuple("loco", "GetFsmMode")
-
-    def GetBalanceMode(self):
-        return self._call_tuple("loco", "GetBalanceMode")
-
-    def GetSwingHeight(self):
-        return self._call_tuple("loco", "GetSwingHeight")
-
-    def GetStandHeight(self):
-        return self._call_tuple("loco", "GetStandHeight")
-
-    def GetArmSdkStatus(self):
-        return self._call_tuple("loco", "GetArmSdkStatus")
-
-    def GetAvailableFsmIds(self):
-        result = self._call("loco", "GetAvailableFsmIds")
-        if result is None:
-            return 3104, None, None
-        return result
-
     def SetFsmId(self, fsm_id: int):
         return self._call_code("loco", "SetFsmId", fsm_id)
-
-    def SetBalanceMode(self, balance_mode: int):
-        return self._call_code("loco", "SetBalanceMode", balance_mode)
-
-    def SetSwingHeight(self, swing_height: float):
-        return self._call_code("loco", "SetSwingHeight", swing_height)
-
-    def SetStandHeight(self, stand_height: float):
-        return self._call_code("loco", "SetStandHeight", stand_height)
 
     def SetVelocity(self, vx: float, vy: float, omega: float, duration: float = 1.0):
         return self._call_code("loco", "SetVelocity", vx, vy, omega, duration)
 
-    def SetTaskId(self, task_id: float):
-        return self._call_code("loco", "SetTaskId", task_id)
-
-    def SetSpeedMode(self, speed_mode: int):
-        return self._call_code("loco", "SetSpeedMode", speed_mode)
-
-    def SetArmSdkStatus(self, arm_sdk_status: bool):
-        return self._call_code("loco", "SetArmSdkStatus", arm_sdk_status)
-
     def Damp(self):
         return self._call_code("loco", "Damp")
+
+    def Stance(self):
+        return self._call_code("loco", "Stance")
 
     def Start(self):
         return self._call_code("loco", "Start")
 
-    def Squat(self):
-        return self._call_code("loco", "Squat")
+    def Lie2StandUp(self):
+        return self._call_code("loco", "Lie2StandUp")
 
-    def Sit(self):
-        return self._call_code("loco", "Sit")
-
-    def StandUp(self):
-        return self._call_code("loco", "StandUp")
+    def StandUp2Lie(self):
+        return self._call_code("loco", "StandUp2Lie")
 
     def ZeroTorque(self):
         return self._call_code("loco", "ZeroTorque")
@@ -175,35 +143,31 @@ class RpcProxy:
     def StopMove(self):
         return self._call_code("loco", "StopMove")
 
-    def HighStand(self):
-        return self._call_code("loco", "HighStand")
-
-    def LowStand(self):
-        return self._call_code("loco", "LowStand")
-
-    def Move(self, vx: float, vy: float, vyaw: float, continous_move: bool = None):
+    def Move(self, vx: float, vy: float, vyaw: float, continous_move: bool = False):
         return self._call_code("loco", "Move", vx, vy, vyaw, continous_move)
 
-    def BalanceStand(self):
-        return self._call_code("loco", "BalanceStand")
+    # ── ArmClient interface (arm service — hands) ─────────────────────────────
 
-    def ContinuousGait(self, flag: bool):
-        return self._call_code("loco", "ContinuousGait", flag)
+    def ArmEnable(self):
+        return self._call_tuple("arm", "Enable")
 
-    def SwitchMoveMode(self, flag: bool):
-        return self._call_code("loco", "SwitchMoveMode", flag)
+    def ArmRelease(self):
+        return self._call_tuple("arm", "Release")
 
-    def WaveHand(self, turn_flag: bool = False):
-        return self._call_code("loco", "WaveHand", turn_flag)
+    def ArmListActions(self):
+        return self._call_tuple("arm", "ListActions")
 
-    def ShakeHand(self, stage: int = -1):
-        return self._call_code("loco", "ShakeHand", stage)
+    def ArmExecuteById(self, action_id: int):
+        return self._call_tuple("arm", "ExecuteById", action_id)
 
-    def EnableArmSDK(self):
-        return self._call_code("loco", "EnableArmSDK")
+    def ArmExecuteByName(self, action_name: str):
+        return self._call_tuple("arm", "ExecuteByName", action_name)
 
-    def DisableArmSDK(self):
-        return self._call_code("loco", "DisableArmSDK")
+    def ArmStop(self):
+        return self._call_tuple("arm", "Stop")
+
+    def ArmGetStatus(self):
+        return self._call_tuple("arm", "GetStatus")
 
     # ── AudioClient interface ─────────────────────────────────────────────────
 
