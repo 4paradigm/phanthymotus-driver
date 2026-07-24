@@ -56,6 +56,40 @@ def _rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.
 
         try:
             client = clients.get(client_name, loco)
+
+            # Special: FSM sequence execution (runs entirely in subprocess, no GIL)
+            if method == "__run_fsm_sequence":
+                steps_spec, interval, step_timeout = args
+                completed = []
+                for method_name, target_fsm, step_name in steps_spec:
+                    fn = getattr(client, method_name)
+                    ret = fn()
+                    if ret != 0:
+                        result_queue.put({"result": {
+                            "error": f"Step '{step_name}' failed: code={ret}",
+                            "step": step_name, "completed": completed}})
+                        continue  # next cmd — sequence done
+                    # Poll FSM until target reached or timeout
+                    elapsed = 0.0
+                    ok = False
+                    while elapsed < step_timeout:
+                        time.sleep(interval)
+                        elapsed += interval
+                        code, fsm_id = client.GetFsmId()
+                        if code == 0 and fsm_id == target_fsm:
+                            ok = True
+                            break
+                    if not ok:
+                        _, current = client.GetFsmId()
+                        result_queue.put({"result": {
+                            "error": f"Timeout '{step_name}' (expected={target_fsm}, got={current})",
+                            "step": step_name, "fsm_id": current, "completed": completed}})
+                        continue  # next cmd — sequence done
+                    completed.append(step_name)
+                result_queue.put({"result": {"ret": 0, "steps": completed,
+                                             "fsm_id": steps_spec[-1][1]}})
+                continue  # next cmd
+
             fn = getattr(client, method)
             result = fn(*args, **kwargs)
             result_queue.put({"result": result})
@@ -112,6 +146,14 @@ class RpcProxy:
             pass
 
     # ── LocoClient interface (sport service — legs) ───────────────────────────
+
+    def RunFsmSequence(self, steps: list, interval: float = 1.0, step_timeout: float = 15.0):
+        """Run FSM sequence entirely in subprocess (no GIL contention in main process).
+        steps = [(method_name, target_fsm_id, step_name), ...]
+        Returns dict with {ret, steps, fsm_id} on success or {error, step} on failure."""
+        outer_timeout = len(steps) * (step_timeout + 5) + 10
+        return self._call("loco", "__run_fsm_sequence", steps, interval, step_timeout,
+                          timeout=outer_timeout)
 
     def GetFsmId(self):
         return self._call_tuple("loco", "GetFsmId")
