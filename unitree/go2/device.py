@@ -538,6 +538,18 @@ _GO2_STATE_CODES = {
     2016: "cross_step", 2017: "upright",
 }
 
+_LOCO_DEFAULT_COMMAND_HZ = 5.0
+_LOCO_MAX_COMMAND_HZ = 10.0
+_LOCO_MAX_MOVE_DURATION_SEC = 15.0
+_LOCO_MAX_SEQUENCE_DURATION_SEC = 60.0
+_LOCO_MAX_SEGMENTS = 12
+_LOCO_DEFAULT_SPEED_MPS = 0.2
+_LOCO_DEFAULT_YAW_SPEED_RPS = 0.2
+_LOCO_MAX_SEMANTIC_SPEED_MPS = 0.5
+_LOCO_MAX_SEMANTIC_YAW_SPEED_RPS = 0.6
+_LOCO_MAX_DISTANCE_M = 3.0
+_LOCO_MAX_ANGLE_RAD = 6.2832
+
 
 class LocoPlugin:
     """Go2 locomotion control via SportClient RPC — exposes 4 tools."""
@@ -545,6 +557,9 @@ class LocoPlugin:
 
     def __init__(self, plugin_config: dict, namespace: str, executor, rpc_proxy):
         self._proxy = rpc_proxy
+        self._motion_lock = threading.Lock()
+        self._motion_active = False
+        self._motion_cancel = None
 
     def get_tools(self) -> list:
         return [self._loco_tool(), self._switch_gait_tool(), self._gesture_tool(), self._acrobatics_tool()]
@@ -554,13 +569,13 @@ class LocoPlugin:
             "name": "loco",
             "type": "actuator",
             "multiInstance": False,
-            "description": "Go2 basic locomotion control — move, stop, stand, euler, speed level, auto recovery. Move command persists ~1 second and must be re-issued for continuous motion.",
+            "description": "Go2 basic locomotion control — move, timed move, move_sequence, stop, stand, euler, speed level, auto recovery. Use duration or move_sequence for continuous motion in one MCP request.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["move", "stop_move", "balance_stand", "stand_up", "stand_down",
+                        "enum": ["move", "move_sequence", "cancel_motion", "stop_move", "balance_stand", "stand_up", "stand_down",
                                  "recovery_stand", "damp", "euler", "speed_level",
                                  "switch_joystick", "auto_recovery_set", "auto_recovery_get"],
                         "description": "Action to perform",
@@ -568,6 +583,33 @@ class LocoPlugin:
                     "vx":      {"type": "number", "description": "Forward velocity m/s [-2.5, 3.8]"},
                     "vy":      {"type": "number", "description": "Lateral velocity m/s [-1.0, 1.0]"},
                     "vyaw":    {"type": "number", "description": "Yaw rotation rad/s [-4.0, 4.0]"},
+                    "duration": {"type": "number", "description": "Optional duration for action=move. Omitted sends one pulse; 0 stops; -1 keeps moving until stop_move/cancel_motion; positive values are clamped to 0.05-15s."},
+                    "command_hz": {"type": "number", "description": "Command repeat rate for timed motion, default 5Hz, max 10Hz."},
+                    "stop_at_end": {"type": "boolean", "description": "Whether to call StopMove after timed motion; default true."},
+                    "stop_between_segments": {"type": "boolean", "description": "For move_sequence, call StopMove between segments; default true."},
+                    "segments": {
+                        "type": "array",
+                        "description": "For action=move_sequence. Each segment can be velocity-based or semantic.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "kind": {
+                                    "type": "string",
+                                    "enum": ["velocity", "forward", "backward", "strafe_left", "strafe_right", "turn_left", "turn_right", "stop"],
+                                    "description": "Segment type. velocity uses vx/vy/vyaw + duration. Semantic segments use distance_m or angle_rad.",
+                                },
+                                "vx": {"type": "number", "description": "Velocity segment forward velocity m/s"},
+                                "vy": {"type": "number", "description": "Velocity segment lateral velocity m/s"},
+                                "vyaw": {"type": "number", "description": "Velocity segment yaw velocity rad/s"},
+                                "duration": {"type": "number", "description": "Segment duration in seconds"},
+                                "distance_m": {"type": "number", "description": "Distance for forward/backward/strafe segments"},
+                                "angle_rad": {"type": "number", "description": "Angle for turn_left/turn_right segments"},
+                                "speed_mps": {"type": "number", "description": "Speed for distance segment, default 0.2 m/s"},
+                                "yaw_speed_rps": {"type": "number", "description": "Yaw speed for turn segment, default 0.2 rad/s"},
+                            },
+                            "additionalProperties": False,
+                        },
+                    },
                     "roll":    {"type": "number", "description": "Roll angle rad [-0.75, 0.75]"},
                     "pitch":   {"type": "number", "description": "Pitch angle rad [-0.75, 0.75]"},
                     "yaw":     {"type": "number", "description": "Yaw angle rad [-0.6, 0.6]"},
@@ -576,7 +618,9 @@ class LocoPlugin:
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "move":              {"params": ["vx", "vy", "vyaw"],    "description": "Move with velocity (persists ~1s, re-issue for continuous)"},
+                    "move":              {"params": ["vx", "vy", "vyaw", "duration"], "description": "Move with velocity. Omit duration for one pulse; duration=0 stops; duration=-1 keeps moving until stop_move/cancel_motion; duration>0 repeats commands until complete."},
+                    "move_sequence":     {"params": ["segments"],             "description": "Run a continuous multi-segment route in one MCP request. Supports forward/backward/turn_left/turn_right and raw velocity segments."},
+                    "cancel_motion":     {"params": [],                       "description": "Cancel the currently running timed move or move_sequence"},
                     "stop_move":         {"params": [],                       "description": "Stop all movement immediately"},
                     "balance_stand":     {"params": [],                       "description": "Enter balance stand mode"},
                     "stand_up":          {"params": [],                       "description": "Stand up tall (0.33m)"},
@@ -693,7 +737,183 @@ class LocoPlugin:
         pass
 
     def stop(self) -> None:
+        self._cancel_active_motion()
         self._proxy.StopMove()
+
+    @staticmethod
+    def _clamp(value: float, lo: float, hi: float) -> float:
+        return max(lo, min(hi, value))
+
+    def _motion_velocities(self, args: dict) -> tuple[float, float, float]:
+        vx = self._clamp(float(args.get("vx", 0)), -2.5, 3.8)
+        vy = self._clamp(float(args.get("vy", 0)), -1.0, 1.0)
+        vyaw = self._clamp(float(args.get("vyaw", 0)), -4.0, 4.0)
+        return vx, vy, vyaw
+
+    def _command_period(self, args: dict) -> float:
+        hz = self._clamp(float(args.get("command_hz", _LOCO_DEFAULT_COMMAND_HZ)), 1.0, _LOCO_MAX_COMMAND_HZ)
+        return 1.0 / hz
+
+    def _begin_motion(self) -> threading.Event | None:
+        with self._motion_lock:
+            if self._motion_active:
+                return None
+            event = threading.Event()
+            self._motion_active = True
+            self._motion_cancel = event
+            return event
+
+    def _finish_motion(self, event: threading.Event) -> None:
+        with self._motion_lock:
+            if self._motion_cancel is event:
+                self._motion_active = False
+                self._motion_cancel = None
+
+    def _cancel_active_motion(self) -> bool:
+        with self._motion_lock:
+            event = self._motion_cancel
+            active = self._motion_active
+        if active and event is not None:
+            event.set()
+        return active
+
+    def _run_velocity_for(self, vx: float, vy: float, vyaw: float, duration: float,
+                          period_sec: float, cancel_event: threading.Event) -> dict:
+        deadline = time.monotonic() + duration
+        sent = 0
+        last_ret = 0
+
+        while True:
+            if cancel_event.is_set():
+                return {"status": "cancelled", "ret": last_ret, "commands_sent": sent}
+            now = time.monotonic()
+            if now >= deadline:
+                break
+            last_ret = self._proxy.Move(vx, vy, vyaw)
+            sent += 1
+            if last_ret != 0:
+                return {"status": "failed", "ret": last_ret, "commands_sent": sent}
+            time.sleep(min(period_sec, max(0.0, deadline - now)))
+
+        return {"status": "completed", "ret": last_ret, "commands_sent": sent}
+
+    def _run_velocity_until_cancel(self, vx: float, vy: float, vyaw: float,
+                                   period_sec: float, cancel_event: threading.Event) -> dict:
+        sent = 0
+        last_ret = 0
+
+        while not cancel_event.is_set():
+            last_ret = self._proxy.Move(vx, vy, vyaw)
+            sent += 1
+            if last_ret != 0:
+                return {"status": "failed", "ret": last_ret, "commands_sent": sent}
+            time.sleep(period_sec)
+
+        return {"status": "cancelled", "ret": last_ret, "commands_sent": sent}
+
+    def _timed_move(self, vx: float, vy: float, vyaw: float, duration: float,
+                    period_sec: float, stop_at_end: bool) -> dict:
+        duration = self._clamp(float(duration), 0.05, _LOCO_MAX_MOVE_DURATION_SEC)
+        event = self._begin_motion()
+        if event is None:
+            return {"ret": -1, "status": "busy", "message": "another timed motion is already running"}
+        try:
+            result = self._run_velocity_for(vx, vy, vyaw, duration, period_sec, event)
+            result.update({"vx": vx, "vy": vy, "vyaw": vyaw, "duration": duration})
+            return result
+        finally:
+            if stop_at_end:
+                self._proxy.StopMove()
+            self._finish_motion(event)
+
+    def _start_continuous_move(self, vx: float, vy: float, vyaw: float, period_sec: float) -> dict:
+        event = self._begin_motion()
+        if event is None:
+            return {"ret": -1, "status": "busy", "message": "another timed motion is already running"}
+
+        def _worker() -> None:
+            try:
+                result = self._run_velocity_until_cancel(vx, vy, vyaw, period_sec, event)
+                if result["status"] != "cancelled":
+                    print(f"[loco] continuous move ended: {result}", flush=True)
+            except Exception as e:
+                print(f"[loco] continuous move error: {e}", flush=True)
+            finally:
+                self._proxy.StopMove()
+                self._finish_motion(event)
+
+        threading.Thread(target=_worker, daemon=True, name="go2_loco_continuous_move").start()
+        return {"ret": 0, "status": "running", "vx": vx, "vy": vy, "vyaw": vyaw, "duration": -1}
+
+    def _semantic_segment(self, segment: dict) -> dict:
+        kind = segment.get("kind", "velocity")
+        if kind == "velocity":
+            vx, vy, vyaw = self._motion_velocities(segment)
+            duration = self._clamp(float(segment.get("duration", segment.get("duration_sec", 0))),
+                                   0.05, _LOCO_MAX_MOVE_DURATION_SEC)
+            return {"kind": kind, "vx": vx, "vy": vy, "vyaw": vyaw, "duration": duration}
+
+        if kind == "stop":
+            duration = self._clamp(float(segment.get("duration", segment.get("duration_sec", 0.2))), 0.05, 2.0)
+            return {"kind": kind, "vx": 0.0, "vy": 0.0, "vyaw": 0.0, "duration": duration}
+
+        if kind in ("forward", "backward", "strafe_left", "strafe_right"):
+            distance = self._clamp(abs(float(segment.get("distance_m", 0))), 0.0, _LOCO_MAX_DISTANCE_M)
+            speed = self._clamp(abs(float(segment.get("speed_mps", _LOCO_DEFAULT_SPEED_MPS))), 0.05, _LOCO_MAX_SEMANTIC_SPEED_MPS)
+            duration = self._clamp(distance / speed, 0.05, _LOCO_MAX_MOVE_DURATION_SEC)
+            vx = speed if kind == "forward" else -speed if kind == "backward" else 0.0
+            vy = speed if kind == "strafe_left" else -speed if kind == "strafe_right" else 0.0
+            return {"kind": kind, "vx": vx, "vy": vy, "vyaw": 0.0, "duration": duration,
+                    "distance_m": distance, "speed_mps": speed}
+
+        if kind in ("turn_left", "turn_right"):
+            angle = self._clamp(abs(float(segment.get("angle_rad", 0))), 0.0, _LOCO_MAX_ANGLE_RAD)
+            yaw_speed = self._clamp(abs(float(segment.get("yaw_speed_rps", _LOCO_DEFAULT_YAW_SPEED_RPS))),
+                                    0.05, _LOCO_MAX_SEMANTIC_YAW_SPEED_RPS)
+            duration = self._clamp(angle / yaw_speed, 0.05, _LOCO_MAX_MOVE_DURATION_SEC)
+            vyaw = yaw_speed if kind == "turn_left" else -yaw_speed
+            return {"kind": kind, "vx": 0.0, "vy": 0.0, "vyaw": vyaw, "duration": duration,
+                    "angle_rad": angle, "yaw_speed_rps": yaw_speed}
+
+        raise ValueError(f"unsupported move_sequence segment kind: {kind}")
+
+    def _move_sequence(self, args: dict) -> dict:
+        raw_segments = args.get("segments") or []
+        if not isinstance(raw_segments, list) or not raw_segments:
+            return {"ret": -1, "status": "invalid", "message": "segments must be a non-empty array"}
+        if len(raw_segments) > _LOCO_MAX_SEGMENTS:
+            return {"ret": -1, "status": "invalid", "message": f"too many segments, max {_LOCO_MAX_SEGMENTS}"}
+
+        segments = [self._semantic_segment(s) for s in raw_segments]
+        total_duration = sum(s["duration"] for s in segments)
+        if total_duration > _LOCO_MAX_SEQUENCE_DURATION_SEC:
+            return {"ret": -1, "status": "invalid",
+                    "message": f"sequence too long: {total_duration:.2f}s > {_LOCO_MAX_SEQUENCE_DURATION_SEC:.2f}s"}
+
+        period_sec = self._command_period(args)
+        stop_at_end = bool(args.get("stop_at_end", True))
+        stop_between = bool(args.get("stop_between_segments", True))
+        event = self._begin_motion()
+        if event is None:
+            return {"ret": -1, "status": "busy", "message": "another timed motion is already running"}
+
+        results = []
+        try:
+            for idx, segment in enumerate(segments):
+                result = self._run_velocity_for(segment["vx"], segment["vy"], segment["vyaw"],
+                                                segment["duration"], period_sec, event)
+                result.update({"index": idx, **segment})
+                results.append(result)
+                if result["status"] != "completed":
+                    return {"ret": result["ret"], "status": result["status"], "segments": results}
+                if stop_between and idx < len(segments) - 1:
+                    self._proxy.StopMove()
+                    time.sleep(0.1)
+            return {"ret": 0, "status": "completed", "duration": total_duration, "segments": results}
+        finally:
+            if stop_at_end:
+                self._proxy.StopMove()
+            self._finish_motion(event)
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
@@ -703,12 +923,31 @@ class LocoPlugin:
 
         # ── loco tool actions ──
         if action == "move":
-            vx   = max(-2.5, min(3.8, float(args.get("vx",   0))))
-            vy   = max(-1.0, min(1.0, float(args.get("vy",   0))))
-            vyaw = max(-4.0, min(4.0, float(args.get("vyaw", 0))))
+            vx, vy, vyaw = self._motion_velocities(args)
+            duration = args.get("duration", args.get("duration_sec"))
+            if duration is not None:
+                duration = float(duration)
+                if duration == 0:
+                    active = self._cancel_active_motion()
+                    ret = self._proxy.StopMove()
+                    return {"ret": ret, "status": "stopped", "cancelled": active, "duration": 0}
+                if duration == -1:
+                    return self._start_continuous_move(vx, vy, vyaw, self._command_period(args))
+                if duration < 0:
+                    return {"ret": -1, "status": "invalid",
+                            "message": "duration must be -1, 0, a positive number, or omitted"}
+                return self._timed_move(vx, vy, vyaw, duration, self._command_period(args),
+                                        bool(args.get("stop_at_end", True)))
             ret = self._proxy.Move(vx, vy, vyaw)
             return {"ret": ret, "vx": vx, "vy": vy, "vyaw": vyaw}
+        elif action == "move_sequence":
+            return self._move_sequence(args)
+        elif action == "cancel_motion":
+            active = self._cancel_active_motion()
+            ret = self._proxy.StopMove()
+            return {"ret": ret, "cancelled": active}
         elif action == "stop_move":
+            self._cancel_active_motion()
             ret = self._proxy.StopMove()
             return {"ret": ret}
         elif action == "balance_stand":
