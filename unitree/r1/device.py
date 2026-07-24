@@ -729,10 +729,10 @@ class LocoPlugin:
                     return {"info": "Robot is already in loco mode (standing)", "fsm_id": 811}
                 # Full sequence: zero_torque(0) → damp(1) → stance(4) → start(811)
                 all_steps = [
-                    ("ZeroTorque", 0, "zero_torque"),
-                    ("Damp",       1, "damp"),
-                    ("Stance",     4, "stance"),
-                    ("Start",    811, "start"),
+                    ("ZeroTorque",  0, "zero_torque"),
+                    ("Damp",        1, "damp"),
+                    ("Stance",      4, "stance"),
+                    ("Lie2StandUp", 811, "lie2standup"),
                 ]
                 # Skip completed steps based on current FSM
                 fsm_to_start = {0: 1, 1: 2, 4: 3}
