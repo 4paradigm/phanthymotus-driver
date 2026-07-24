@@ -614,7 +614,7 @@ class LocoPlugin:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["move", "stop_move", "get_fsm_id"],
+                        "enum": ["move", "stop_move"],
                         "description": "Action to perform",
                     },
                     "vx":         {"type": "number", "description": "Forward velocity m/s [-1, 1]"},
@@ -626,7 +626,6 @@ class LocoPlugin:
                 "x-action-params": {
                     "move":             {"params": ["vx", "vy", "vyaw", "duration"], "description": "Move with specified velocities. duration>0 for timed move via SetVelocity, 0 or negative for continuous until stop."},
                     "stop_move":        {"params": [],                                 "description": "Stop all movement immediately"},
-                    "get_fsm_id":       {"params": [],                                 "description": "Get current FSM state ID"},
                 },
             },
         }
@@ -652,8 +651,8 @@ class LocoPlugin:
                         "type": "string",
                         "enum": ["damp", "zero_torque",
                                  "lie2standup", "standup2lie",
-                                 "emergency_stop"],
-                        "description": "Target mode. lie2standup/standup2lie are safe multi-step sequences with FSM polling.",
+                                 "emergency_stop", "get_current_mode"],
+                        "description": "Target mode, or get_current_mode to query current state.",
                     },
                 },
                 "required": ["mode"],
@@ -759,12 +758,20 @@ class LocoPlugin:
                 ret = fn()
                 return {"ret": ret, "mode": mode}
 
+            elif mode == "get_current_mode":
+                code, fsm_id = self._client.GetFsmId()
+                FSM_DESCRIPTIONS = {
+                    0: "lying down, zero torque mode",
+                    1: "lying down, damping mode",
+                    4: "locked standing (intermediate, unstable)",
+                    811: "standing, locomotion mode",
+                }
+                desc = FSM_DESCRIPTIONS.get(fsm_id, f"unknown state")
+                return {"fsm_id": fsm_id, "description": desc}
+
             else:
                 return {"error": f"Unknown mode: {mode}. "
-                                 f"Available: damp, zero_torque, lie2standup, standup2lie, emergency_stop"}
-        elif action == "get_fsm_id":
-            code, fsm_id = self._client.GetFsmId()
-            return {"ret": code, "fsm_id": fsm_id}
+                                 f"Available: damp, zero_torque, lie2standup, standup2lie, emergency_stop, get_current_mode"}
         # ── Arm actions (tool_name="arm", action = gesture name) ────────────────
         elif action == "release":
             # release_arm (id=99) puts hands down
