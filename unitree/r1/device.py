@@ -631,20 +631,28 @@ class LocoPlugin:
             },
         }
 
+    # FSM state groups for safety checks
+    _GROUND_STATES = {0, 1}       # zero_torque, damp — robot is on the ground
+    _STANDING_STATES = {4, 811}   # stance, loco_mode — robot is upright
+
     def _switch_mode_tool(self) -> dict:
         return {
             "name": "switch_mode",
             "type": "actuator",
             "multiInstance": False,
-            "description": "R1 locomotion mode switch — change posture/locomotion mode by name. damp=阻尼, stance=站立(locked_stand), start=主运控(walk/run), zero_torque=零力矩, lie2standup=躺→站, standup2lie=站→躺",
+            "description": "R1 locomotion mode switch (safe). "
+                           "damp=阻尼(ground only), zero_torque=零力矩(ground only), "
+                           "lie2standup=安全起立序列(ground→运控), standup2lie=安全躺下序列(standing→阻尼), "
+                           "emergency_stop=紧急阻尼(any state, accepts fall risk)",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "mode": {
                         "type": "string",
-                        "enum": ["damp", "stance", "start", "zero_torque",
-                                 "lie2standup", "standup2lie"],
-                        "description": "Target mode",
+                        "enum": ["damp", "zero_torque",
+                                 "lie2standup", "standup2lie",
+                                 "emergency_stop"],
+                        "description": "Target mode. lie2standup/standup2lie are safe multi-step sequences with FSM polling.",
                     },
                 },
                 "required": ["mode"],
@@ -708,19 +716,56 @@ class LocoPlugin:
             return {"ret": ret}
         elif action == "switch_mode":
             mode = args.get("mode", "")
-            mode_dispatch = {
-                "damp":         lambda: self._client.Damp(),
-                "stance":       lambda: self._client.Stance(),
-                "start":        lambda: self._client.Start(),
-                "zero_torque":  lambda: self._client.ZeroTorque(),
-                "lie2standup":  lambda: self._client.Lie2StandUp(),
-                "standup2lie":  lambda: self._client.StandUp2Lie(),
-            }
-            fn = mode_dispatch.get(mode)
-            if fn is None:
-                return {"error": f"Unknown mode: {mode}. Available: {list(mode_dispatch.keys())}"}
-            ret = fn()
-            return {"ret": ret, "mode": mode}
+            code, current_fsm = self._client.GetFsmId()
+
+            if mode == "emergency_stop":
+                ret = self._client.Damp()
+                return {"ret": ret, "mode": "emergency_stop",
+                        "warning": "Emergency damp executed regardless of state"}
+
+            elif mode == "lie2standup":
+                if current_fsm in self._STANDING_STATES:
+                    return {"info": "Robot is already standing", "fsm_id": current_fsm}
+                # Full sequence: zero_torque(0) → damp(1) → stance(4) → start(811)
+                # Skip steps already completed based on current FSM
+                all_steps = [
+                    (self._client.ZeroTorque, 0, "zero_torque"),
+                    (self._client.Damp,       1, "damp"),
+                    (self._client.Stance,     4, "stance"),
+                    (self._client.Start,    811, "start"),
+                ]
+                # Determine start index: skip past current state
+                fsm_to_start = {0: 1, 1: 2, 4: 3}  # at 0→start from damp, at 1→stance, at 4→start
+                start_idx = fsm_to_start.get(current_fsm, 0)
+                return self._run_fsm_sequence(all_steps[start_idx:])
+
+            elif mode == "standup2lie":
+                if current_fsm in self._GROUND_STATES:
+                    return {"info": "Robot is already lying down", "fsm_id": current_fsm}
+                # If stuck in stance(4), go to start first so StandUp2Lie works
+                if current_fsm == 4:
+                    ret = self._client.Start()
+                    ok, fsm = self._poll_fsm(811)
+                    if not ok:
+                        return {"error": f"Failed entering loco mode before lie-down, fsm={fsm}"}
+                ret = self._client.StandUp2Lie()
+                ok, fsm = self._poll_fsm(1)  # StandUp2Lie ends in damp
+                if not ok:
+                    return {"error": f"Timeout during standup2lie, fsm={fsm}"}
+                return {"ret": 0, "mode": "standup2lie", "fsm_id": 1}
+
+            elif mode in ("zero_torque", "damp"):
+                if current_fsm in self._STANDING_STATES:
+                    return {"error": f"Cannot enter {mode} from standing/walking state "
+                                     f"(FSM={current_fsm}). Robot will collapse. "
+                                     f"Use standup2lie first."}
+                fn = self._client.ZeroTorque if mode == "zero_torque" else self._client.Damp
+                ret = fn()
+                return {"ret": ret, "mode": mode}
+
+            else:
+                return {"error": f"Unknown mode: {mode}. "
+                                 f"Available: damp, zero_torque, lie2standup, standup2lie, emergency_stop"}
         elif action == "get_fsm_id":
             code, fsm_id = self._client.GetFsmId()
             return {"ret": code, "fsm_id": fsm_id}
@@ -741,6 +786,38 @@ class LocoPlugin:
                 self._schedule_arm_release()
             return {"ret": code, "action": action, "action_id": action_id, "data": data}
         return None
+
+    # ── FSM sequence helpers ──────────────────────────────────────────────────
+
+    def _poll_fsm(self, target_id: int, interval: float = 1.0, timeout: float = 10.0) -> tuple:
+        """Poll GetFsmId until target reached or timeout. Returns (success, current_fsm_id)."""
+        import time
+        elapsed = 0.0
+        while elapsed < timeout:
+            code, fsm_id = self._client.GetFsmId()
+            if code == 0 and fsm_id == target_id:
+                return (True, fsm_id)
+            time.sleep(interval)
+            elapsed += interval
+        # Final check
+        code, fsm_id = self._client.GetFsmId()
+        return (fsm_id == target_id, fsm_id)
+
+    def _run_fsm_sequence(self, steps: list) -> dict:
+        """Execute [(fn, target_fsm, step_name), ...] sequentially with FSM polling.
+        Aborts on RPC failure or timeout."""
+        for fn, target_fsm, name in steps:
+            ret = fn()
+            if ret != 0:
+                return {"error": f"Step '{name}' RPC failed with code {ret}", "step": name}
+            ok, current = self._poll_fsm(target_fsm)
+            if not ok:
+                return {"error": f"Timeout waiting for '{name}' "
+                                 f"(expected FSM={target_fsm}, got {current})",
+                        "step": name, "fsm_id": current}
+        return {"ret": 0, "mode": steps[-1][2], "fsm_id": steps[-1][1]}
+
+    # ── Arm helpers ───────────────────────────────────────────────────────────
 
     def _schedule_arm_release(self):
         """Schedule arm SDK release after 4 seconds."""
