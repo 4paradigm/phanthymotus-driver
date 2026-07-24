@@ -554,7 +554,7 @@ class LocoPlugin:
             "name": "loco",
             "type": "actuator",
             "multiInstance": False,
-            "description": "Go2 basic locomotion control — move, stop, stand, euler, speed level, auto recovery. Move command persists ~1 second and must be re-issued for continuous motion.",
+            "description": "Go2 basic locomotion control — move, timed move, stop, stand, euler, speed level, auto recovery.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -568,6 +568,7 @@ class LocoPlugin:
                     "vx":      {"type": "number", "description": "Forward velocity m/s [-2.5, 3.8]"},
                     "vy":      {"type": "number", "description": "Lateral velocity m/s [-1.0, 1.0]"},
                     "vyaw":    {"type": "number", "description": "Yaw rotation rad/s [-4.0, 4.0]"},
+                    "duration": {"type": "number", "description": "For action=move: positive values stop the robot after that many seconds; 0 stops immediately; -1 moves until stop_move. Omit to send a raw Move command."},
                     "roll":    {"type": "number", "description": "Roll angle rad [-0.75, 0.75]"},
                     "pitch":   {"type": "number", "description": "Pitch angle rad [-0.75, 0.75]"},
                     "yaw":     {"type": "number", "description": "Yaw angle rad [-0.6, 0.6]"},
@@ -576,7 +577,7 @@ class LocoPlugin:
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "move":              {"params": ["vx", "vy", "vyaw"],    "description": "Move with velocity (persists ~1s, re-issue for continuous)"},
+                    "move":              {"params": ["vx", "vy", "vyaw", "duration"], "description": "Move with velocity. duration>0 stops after the specified seconds; duration=0 stops; duration=-1 continues until stop_move."},
                     "stop_move":         {"params": [],                       "description": "Stop all movement immediately"},
                     "balance_stand":     {"params": [],                       "description": "Enter balance stand mode"},
                     "stand_up":          {"params": [],                       "description": "Stand up tall (0.33m)"},
@@ -706,8 +707,33 @@ class LocoPlugin:
             vx   = max(-2.5, min(3.8, float(args.get("vx",   0))))
             vy   = max(-1.0, min(1.0, float(args.get("vy",   0))))
             vyaw = max(-4.0, min(4.0, float(args.get("vyaw", 0))))
+            duration = args.get("duration")
+            if duration is None:
+                ret = self._proxy.Move(vx, vy, vyaw)
+                return {"ret": ret, "vx": vx, "vy": vy, "vyaw": vyaw}
+
+            duration = float(duration)
+            if duration == 0:
+                ret = self._proxy.StopMove()
+                return {"ret": ret, "status": "stopped", "duration": 0}
+            if duration < -1:
+                return {"ret": -1, "message": "duration must be -1, 0, or a positive number"}
+
             ret = self._proxy.Move(vx, vy, vyaw)
-            return {"ret": ret, "vx": vx, "vy": vy, "vyaw": vyaw}
+            if ret != 0 or duration == -1:
+                return {"ret": ret, "vx": vx, "vy": vy, "vyaw": vyaw, "duration": duration}
+
+            try:
+                deadline = time.monotonic() + duration
+                while time.monotonic() < deadline:
+                    time.sleep(min(0.1, deadline - time.monotonic()))
+                    if time.monotonic() < deadline:
+                        ret = self._proxy.Move(vx, vy, vyaw)
+                        if ret != 0:
+                            return {"ret": ret, "vx": vx, "vy": vy, "vyaw": vyaw, "duration": duration}
+            finally:
+                self._proxy.StopMove()
+            return {"ret": ret, "vx": vx, "vy": vy, "vyaw": vyaw, "duration": duration}
         elif action == "stop_move":
             ret = self._proxy.StopMove()
             return {"ret": ret}
