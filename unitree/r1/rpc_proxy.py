@@ -68,7 +68,7 @@ def _rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.
                         result_queue.put({"result": {
                             "error": f"Step '{step_name}' failed: code={ret}",
                             "step": step_name, "completed": completed}})
-                        continue  # next cmd — sequence done
+                        break  # abort sequence on failure
                     # Poll FSM until target reached or timeout
                     elapsed = 0.0
                     ok = False
@@ -84,12 +84,14 @@ def _rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.
                         result_queue.put({"result": {
                             "error": f"Timeout '{step_name}' (expected={target_fsm}, got={current})",
                             "step": step_name, "fsm_id": current, "completed": completed}})
-                        continue  # next cmd — sequence done
+                        break  # abort sequence on timeout
                     completed.append(step_name)
                     # Wait for physical motion to settle before next step
                     time.sleep(settle_delay)
-                result_queue.put({"result": {"ret": 0, "steps": completed,
-                                             "fsm_id": steps_spec[-1][1]}})
+                else:
+                    # Only reached if loop completed without break (all steps succeeded)
+                    result_queue.put({"result": {"ret": 0, "steps": completed,
+                                                 "fsm_id": steps_spec[-1][1]}})
                 continue  # next cmd
 
             fn = getattr(client, method)
