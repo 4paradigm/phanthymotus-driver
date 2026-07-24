@@ -745,7 +745,9 @@ class LocoPlugin:
                     # From stance: enter loco first, then lie down
                     steps = [("Start", 811, "start"), ("StandUp2Lie", 1, "standup2lie")]
                 else:
-                    # From 811 (loco mode): lie down directly
+                    # From 811 (loco mode): stop movement first, then lie down safely
+                    self._client.StopMove()
+                    import time as _time; _time.sleep(1.0)
                     steps = [("StandUp2Lie", 1, "standup2lie")]
                 return self._run_fsm_sequence(steps)
 
