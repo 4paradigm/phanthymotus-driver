@@ -22,6 +22,7 @@ drivers/unitree/go2/device.py — Unitree Go2 四足机器狗设备插件。
 """
 
 import json
+import math
 import multiprocessing
 import queue
 import socket
@@ -545,6 +546,8 @@ class LocoPlugin:
 
     def __init__(self, plugin_config: dict, namespace: str, executor, rpc_proxy):
         self._proxy = rpc_proxy
+        self._continuous_move_lock = threading.Lock()
+        self._continuous_move_stop: threading.Event | None = None
 
     def get_tools(self) -> list:
         return [self._loco_tool(), self._switch_gait_tool(), self._gesture_tool(), self._acrobatics_tool()]
@@ -554,7 +557,7 @@ class LocoPlugin:
             "name": "loco",
             "type": "actuator",
             "multiInstance": False,
-            "description": "Go2 basic locomotion control — move, stop, stand, euler, speed level, auto recovery. Move command persists ~1 second and must be re-issued for continuous motion.",
+            "description": "Go2 basic locomotion control — move, timed move, stop, stand, euler, speed level, auto recovery.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -567,23 +570,24 @@ class LocoPlugin:
                     },
                     "vx":      {"type": "number", "description": "Forward velocity m/s [-2.5, 3.8]"},
                     "vy":      {"type": "number", "description": "Lateral velocity m/s [-1.0, 1.0]"},
-                    "vyaw":    {"type": "number", "description": "Yaw rotation rad/s [-4.0, 4.0]"},
-                    "roll":    {"type": "number", "description": "Roll angle rad [-0.75, 0.75]"},
-                    "pitch":   {"type": "number", "description": "Pitch angle rad [-0.75, 0.75]"},
-                    "yaw":     {"type": "number", "description": "Yaw angle rad [-0.6, 0.6]"},
+                    "vyaw":    {"type": "number", "description": "Yaw rotation deg/s [-180, 180]"},
+                    "duration": {"type": "number", "description": "For action=move: positive values stop the robot after that many seconds; 0 stops immediately; -1 moves until stop_move. Omit to send a raw Move command."},
+                    "roll":    {"type": "number", "description": "Roll angle deg [-42.97, 42.97]"},
+                    "pitch":   {"type": "number", "description": "Pitch angle deg [-42.97, 42.97]"},
+                    "yaw":     {"type": "number", "description": "Yaw angle deg [-34.38, 34.38]"},
                     "level":   {"type": "integer", "description": "Speed level: -1=slow, 0=normal, 1=fast"},
                     "flag":    {"type": "boolean", "description": "Enable/disable flag"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "move":              {"params": ["vx", "vy", "vyaw"],    "description": "Move with velocity (persists ~1s, re-issue for continuous)"},
+                    "move":              {"params": ["vx", "vy", "vyaw", "duration"], "description": "Move with velocity. duration>0 stops after the specified seconds; duration=0 stops; duration=-1 continues until stop_move."},
                     "stop_move":         {"params": [],                       "description": "Stop all movement immediately"},
                     "balance_stand":     {"params": [],                       "description": "Enter balance stand mode"},
                     "stand_up":          {"params": [],                       "description": "Stand up tall (0.33m)"},
                     "stand_down":        {"params": [],                       "description": "Lie down"},
                     "recovery_stand":    {"params": [],                       "description": "Recover from fallen state to standing"},
                     "damp":              {"params": [],                       "description": "Emergency stop — all motors enter damping state"},
-                    "euler":             {"params": ["roll", "pitch", "yaw"], "description": "Set body attitude (radians)"},
+                    "euler":             {"params": ["roll", "pitch", "yaw"], "description": "Set body attitude (degrees)"},
                     "speed_level":       {"params": ["level"],                "description": "Set speed gear: -1=slow, 0=normal, 1=fast"},
                     "switch_joystick":   {"params": ["flag"],                 "description": "Enable/disable native remote control"},
                     "auto_recovery_set": {"params": ["flag"],                 "description": "Enable/disable auto-flip recovery (disable when carrying payload)"},
@@ -693,7 +697,42 @@ class LocoPlugin:
         pass
 
     def stop(self) -> None:
+        self._stop_continuous_move()
         self._proxy.StopMove()
+
+    def _stop_continuous_move(self) -> bool:
+        with self._continuous_move_lock:
+            stop_event = self._continuous_move_stop
+            self._continuous_move_stop = None
+        if stop_event is None:
+            return False
+        stop_event.set()
+        return True
+
+    def _start_continuous_move(self, vx: float, vy: float, vyaw_rps: float,
+                               vyaw_dps: float) -> dict:
+        self._stop_continuous_move()
+        stop_event = threading.Event()
+        with self._continuous_move_lock:
+            self._continuous_move_stop = stop_event
+
+        def run() -> None:
+            failed = False
+            try:
+                while not stop_event.is_set():
+                    if self._proxy.Move(vx, vy, vyaw_rps) != 0:
+                        failed = True
+                        break
+                    stop_event.wait(0.1)
+            finally:
+                if failed:
+                    self._proxy.StopMove()
+                with self._continuous_move_lock:
+                    if self._continuous_move_stop is stop_event:
+                        self._continuous_move_stop = None
+
+        threading.Thread(target=run, daemon=True, name="go2_loco_continuous_move").start()
+        return {"ret": 0, "status": "running", "vx": vx, "vy": vy, "vyaw": vyaw_dps, "duration": -1}
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
@@ -705,10 +744,44 @@ class LocoPlugin:
         if action == "move":
             vx   = max(-2.5, min(3.8, float(args.get("vx",   0))))
             vy   = max(-1.0, min(1.0, float(args.get("vy",   0))))
-            vyaw = max(-4.0, min(4.0, float(args.get("vyaw", 0))))
-            ret = self._proxy.Move(vx, vy, vyaw)
-            return {"ret": ret, "vx": vx, "vy": vy, "vyaw": vyaw}
+            vyaw_dps = max(-180.0, min(180.0, float(args.get("vyaw", 0))))
+            vyaw_rps = math.radians(vyaw_dps)
+            duration = args.get("duration")
+            if duration is None:
+                if self._stop_continuous_move():
+                    self._proxy.StopMove()
+                ret = self._proxy.Move(vx, vy, vyaw_rps)
+                return {"ret": ret, "vx": vx, "vy": vy, "vyaw": vyaw_dps}
+
+            duration = float(duration)
+            if duration == 0:
+                self._stop_continuous_move()
+                ret = self._proxy.StopMove()
+                return {"ret": ret, "status": "stopped", "duration": 0}
+            if duration < -1:
+                return {"ret": -1, "message": "duration must be -1, 0, or a positive number"}
+            if duration == -1:
+                return self._start_continuous_move(vx, vy, vyaw_rps, vyaw_dps)
+
+            if self._stop_continuous_move():
+                self._proxy.StopMove()
+            ret = self._proxy.Move(vx, vy, vyaw_rps)
+            if ret != 0:
+                return {"ret": ret, "vx": vx, "vy": vy, "vyaw": vyaw_dps, "duration": duration}
+
+            try:
+                deadline = time.monotonic() + duration
+                while time.monotonic() < deadline:
+                    time.sleep(min(0.1, deadline - time.monotonic()))
+                    if time.monotonic() < deadline:
+                        ret = self._proxy.Move(vx, vy, vyaw_rps)
+                        if ret != 0:
+                            return {"ret": ret, "vx": vx, "vy": vy, "vyaw": vyaw_dps, "duration": duration}
+            finally:
+                self._proxy.StopMove()
+            return {"ret": ret, "vx": vx, "vy": vy, "vyaw": vyaw_dps, "duration": duration}
         elif action == "stop_move":
+            self._stop_continuous_move()
             ret = self._proxy.StopMove()
             return {"ret": ret}
         elif action == "balance_stand":
@@ -727,10 +800,10 @@ class LocoPlugin:
             ret = self._proxy.Damp()
             return {"ret": ret}
         elif action == "euler":
-            roll  = max(-0.75, min(0.75, float(args.get("roll",  0))))
-            pitch = max(-0.75, min(0.75, float(args.get("pitch", 0))))
-            yaw   = max(-0.6,  min(0.6,  float(args.get("yaw",   0))))
-            ret = self._proxy.Euler(roll, pitch, yaw)
+            roll = max(-math.degrees(0.75), min(math.degrees(0.75), float(args.get("roll", 0))))
+            pitch = max(-math.degrees(0.75), min(math.degrees(0.75), float(args.get("pitch", 0))))
+            yaw = max(-math.degrees(0.6), min(math.degrees(0.6), float(args.get("yaw", 0))))
+            ret = self._proxy.Euler(math.radians(roll), math.radians(pitch), math.radians(yaw))
             return {"ret": ret, "roll": roll, "pitch": pitch, "yaw": yaw}
         elif action == "speed_level":
             level = max(-1, min(1, int(args.get("level", 0))))
