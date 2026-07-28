@@ -545,6 +545,8 @@ class LocoPlugin:
 
     def __init__(self, plugin_config: dict, namespace: str, executor, rpc_proxy):
         self._proxy = rpc_proxy
+        self._continuous_move_lock = threading.Lock()
+        self._continuous_move_stop: threading.Event | None = None
 
     def get_tools(self) -> list:
         return [self._loco_tool(), self._switch_gait_tool(), self._gesture_tool(), self._acrobatics_tool()]
@@ -694,7 +696,41 @@ class LocoPlugin:
         pass
 
     def stop(self) -> None:
+        self._stop_continuous_move()
         self._proxy.StopMove()
+
+    def _stop_continuous_move(self) -> bool:
+        with self._continuous_move_lock:
+            stop_event = self._continuous_move_stop
+            self._continuous_move_stop = None
+        if stop_event is None:
+            return False
+        stop_event.set()
+        return True
+
+    def _start_continuous_move(self, vx: float, vy: float, vyaw: float) -> dict:
+        self._stop_continuous_move()
+        stop_event = threading.Event()
+        with self._continuous_move_lock:
+            self._continuous_move_stop = stop_event
+
+        def run() -> None:
+            failed = False
+            try:
+                while not stop_event.is_set():
+                    if self._proxy.Move(vx, vy, vyaw) != 0:
+                        failed = True
+                        break
+                    stop_event.wait(0.1)
+            finally:
+                if failed:
+                    self._proxy.StopMove()
+                with self._continuous_move_lock:
+                    if self._continuous_move_stop is stop_event:
+                        self._continuous_move_stop = None
+
+        threading.Thread(target=run, daemon=True, name="go2_loco_continuous_move").start()
+        return {"ret": 0, "status": "running", "vx": vx, "vy": vy, "vyaw": vyaw, "duration": -1}
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
@@ -709,18 +745,25 @@ class LocoPlugin:
             vyaw = max(-4.0, min(4.0, float(args.get("vyaw", 0))))
             duration = args.get("duration")
             if duration is None:
+                if self._stop_continuous_move():
+                    self._proxy.StopMove()
                 ret = self._proxy.Move(vx, vy, vyaw)
                 return {"ret": ret, "vx": vx, "vy": vy, "vyaw": vyaw}
 
             duration = float(duration)
             if duration == 0:
+                self._stop_continuous_move()
                 ret = self._proxy.StopMove()
                 return {"ret": ret, "status": "stopped", "duration": 0}
             if duration < -1:
                 return {"ret": -1, "message": "duration must be -1, 0, or a positive number"}
+            if duration == -1:
+                return self._start_continuous_move(vx, vy, vyaw)
 
+            if self._stop_continuous_move():
+                self._proxy.StopMove()
             ret = self._proxy.Move(vx, vy, vyaw)
-            if ret != 0 or duration == -1:
+            if ret != 0:
                 return {"ret": ret, "vx": vx, "vy": vy, "vyaw": vyaw, "duration": duration}
 
             try:
@@ -735,6 +778,7 @@ class LocoPlugin:
                 self._proxy.StopMove()
             return {"ret": ret, "vx": vx, "vy": vy, "vyaw": vyaw, "duration": duration}
         elif action == "stop_move":
+            self._stop_continuous_move()
             ret = self._proxy.StopMove()
             return {"ret": ret}
         elif action == "balance_stand":
