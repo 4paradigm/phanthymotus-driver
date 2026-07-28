@@ -1,0 +1,8 @@
+float32 force0_ratio
+float32 force1_ratio
+float32 force2_ratio
+float32 force3_ratio
+float32 force4_ratio
+float32 force5_ratio
+---
+bool force_accepted

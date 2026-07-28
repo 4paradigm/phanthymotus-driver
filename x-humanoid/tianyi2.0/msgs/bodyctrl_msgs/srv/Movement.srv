@@ -1,0 +1,5 @@
+int32 name
+float32 value
+---
+bool action_completed
+

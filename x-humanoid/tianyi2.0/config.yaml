@@ -1,0 +1,30 @@
+mcp_port: 15707
+ros_namespace: ""   # 留空则自动使用 hostname
+name: "Tianyi 2.0 Pro"
+
+slamtec:
+  base_url: "http://192.168.11.1:1448"
+
+plugins:
+  state:
+    enabled: true
+  camera:
+    enabled: true
+  asr:
+    enabled: true
+  nav_state:
+    enabled: true
+  head:
+    enabled: true
+  arm:
+    enabled: true
+  waist:
+    enabled: true
+  hand:
+    enabled: true
+  tts:
+    enabled: true
+  nav:
+    enabled: true
+  chat:
+    enabled: true
