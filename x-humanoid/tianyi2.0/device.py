@@ -792,6 +792,7 @@ class DepthCameraPlugin:
     """Forward the newest Orbbec Z16 frame with no buffering or re-encoding."""
     def __init__(self, plugin_config, namespace, ros2):
         self._running = False; self._topic = f"/{namespace}/camera/head/depth"
+        self._forwarded_frames = 0
         self._sub_node = Node("tianyi2_depth_sub", context=ros2.ctx_tianyi)
         self._pub_node = Node("tianyi2_depth_pub", context=ros2.ctx_core)
         ros2.executor_tianyi.add_node(self._sub_node); ros2.executor_core.add_node(self._pub_node)
@@ -811,7 +812,18 @@ class DepthCameraPlugin:
     def stop(self): self._running = False
     def _on_image(self, msg):
         if not self._running or msg.encoding not in ("16UC1", "mono16"): return
-        self._pub.publish(msg)
+        # The input belongs to the domain-0 executor.  Rebuild the ROS message
+        # for the domain-42 publisher rather than sharing the callback object
+        # across contexts; this is still a raw Z16 copy, not a conversion.
+        from sensor_msgs.msg import Image
+        out = Image()
+        out.header = msg.header
+        out.height, out.width, out.encoding = msg.height, msg.width, msg.encoding
+        out.is_bigendian, out.step, out.data = msg.is_bigendian, msg.step, msg.data
+        self._pub.publish(out)
+        self._forwarded_frames += 1
+        if self._forwarded_frames % 30 == 1:
+            print(f"[DepthCameraPlugin] forwarded {self._forwarded_frames} latest Z16 frames")
     def dispatch(self, action, args):
         return {"state": "running" if self._running else "idle", "topic_out": [{"topic": self._topic, "format": "image/depth-z16"}]}
 
