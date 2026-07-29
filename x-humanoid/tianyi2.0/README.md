@@ -42,23 +42,6 @@ not invent descriptions without an authoritative error-code table.
 Both cards are read-only. They do not command joints, stop the robot, trigger an
 emergency stop, or modify any robot-side configuration.
 
-## Status light card
-
-`status_light` publishes the official `PowerLightCtrl` events to
-`/power/light/ctrl`. The vendor message contains only an integer `cmd`; RGB,
-brightness and blink-frequency controls are intentionally not invented.
-
-| Item | Value |
-|---|---|
-| Tool name | `status_light` |
-| Tool type | `actuator` |
-| Robot-side output | `/power/light/ctrl` |
-| Message type | `bodyctrl_msgs/msg/PowerLightCtrl` |
-| Action | `set_event` |
-
-Supported events match `PowerLightCtrl.msg`, including power-on, service,
-self-check, fault, warning, voice, running and power-off state transitions.
-
 ## Head gesture card
 
 `head_gesture` turns safe, bounded head-position commands into cancellable

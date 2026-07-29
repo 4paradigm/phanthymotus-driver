@@ -20,7 +20,6 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   CameraPlugin     (sensor)             — Orbbec 头部相机
   AsrPlugin        (sensor)             — 语音识别结果
   NavStatePlugin   (sensor)             — 底盘导航状态
-  StatusLightPlugin (actuator)          — 机器人状态灯事件
   HeadPlugin       (actuator)           — 头部3DOF控制
   HeadGesturePlugin (actuator)          — 点头/摇头/左右观察等语义动作
   ArmPlugin        (actuator)           — 双臂14DOF控制
@@ -892,104 +891,6 @@ class NavStatePlugin:
             return {"state": "running" if self._running else "idle",
                     "topic_out": [{"topic": self._topic, "format": "data/json"}]}
         return {"state": "running"}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# StatusLightPlugin (actuator)
-# ══════════════════════════════════════════════════════════════════════════════
-
-class StatusLightPlugin:
-    """发布电源板定义的状态灯事件。
-
-    PowerLightCtrl 消息只包含 cmd，灯效由电源板根据事件编号决定；
-    因此这里不暴露硬件未定义的 RGB、亮度或闪烁频率参数。
-    """
-
-    _EVENTS = {
-        "battery_supply": 1,
-        "power_on_start": 2,
-        "power_on_finish": 3,
-        "service_start": 4,
-        "service_finish": 5,
-        "self_check_start": 6,
-        "self_check_failed": 7,
-        "self_check_success": 8,
-        "fault_occur": 9,
-        "fault_clear": 10,
-        "voice_wakeup": 11,
-        "voice_response": 12,
-        "voice_exit": 13,
-        "running_start": 14,
-        "running_finish": 15,
-        "power_off": 16,
-        "warn_occur": 17,
-        "warn_clear": 18,
-    }
-
-    def __init__(self, plugin_config: dict, namespace: str, ros2):
-        self._pub_node = Node("tianyi2_status_light_pub", context=ros2.ctx_tianyi)
-        ros2.executor_tianyi.add_node(self._pub_node)
-        self._publisher = None
-
-    def get_tool(self) -> dict:
-        return {
-            "name": "status_light",
-            "type": "actuator",
-            "description": "天轶2.0 状态灯控制 — 向电源板发送官方定义的灯光状态事件",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string", "enum": ["set_event"],
-                        "description": "发送状态灯事件",
-                    },
-                    "event": {
-                        "type": "string", "enum": list(self._EVENTS),
-                        "description": "PowerLightCtrl.msg 定义的状态事件",
-                    },
-                },
-                "required": ["action"],
-                "x-action-params": {
-                    "set_event": {
-                        "params": ["event"],
-                        "description": "设置状态灯事件",
-                    },
-                },
-            },
-        }
-
-    def start(self):
-        try:
-            from bodyctrl_msgs.msg import PowerLightCtrl
-            self._publisher = self._pub_node.create_publisher(
-                PowerLightCtrl, "/power/light/ctrl", _RELIABLE_QOS)
-            print("[StatusLightPlugin] publisher created")
-        except ImportError as e:
-            print(f"[StatusLightPlugin] WARNING: msg import failed ({e})")
-
-    def stop(self):
-        pass
-
-    def dispatch(self, action: str, args: dict) -> dict:
-        if action == "set_event":
-            event = str(args.get("event", "")).strip()
-            if event not in self._EVENTS:
-                return {"error": "event must be one of the documented PowerLightCtrl events"}
-            if not self._publisher:
-                return {"error": "publisher not initialized"}
-            try:
-                from bodyctrl_msgs.msg import PowerLightCtrl
-                msg = PowerLightCtrl()
-                msg.cmd = self._EVENTS[event]
-                self._publisher.publish(msg)
-                return {"state": "sent", "event": event, "cmd": msg.cmd}
-            except Exception as e:
-                return {"error": str(e)}
-        if action in ("start", "info"):
-            return {"state": "ready" if self._publisher else "idle"}
-        if action == "stop":
-            return {"state": "idle"}
-        return {"error": f"unknown action: {action}"}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

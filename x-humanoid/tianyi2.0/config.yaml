@@ -26,8 +26,6 @@ plugins:
     enabled: true
   nav_state:
     enabled: true
-  status_light:
-    enabled: true
   head:
     enabled: true
   head_gesture:
