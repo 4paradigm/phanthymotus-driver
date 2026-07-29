@@ -1,0 +1,16 @@
+# lyre_msgs/srv/LlmAsk.srv
+# 向 LLM 大模型提出一个问题。
+
+string SERVICE_NAME = /audio_llm/ask
+
+string  id     # optional. An identifier responds to the IAT ID.
+string  text   # required.
+---
+
+int8 CODE_OK = 0
+int8 CODE_INVALID_PARAMS = 1
+int8 CODE_FAILED = -1
+
+string sid      # Stream identifier (unique per llm question).
+int8   code     # Status code.
+string message  # Human-readable status message.

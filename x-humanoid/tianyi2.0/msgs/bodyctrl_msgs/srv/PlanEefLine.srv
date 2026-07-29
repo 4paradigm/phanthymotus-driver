@@ -1,0 +1,8 @@
+string arm_name # left/right
+geometry_msgs/Pose eef_pose
+float64 vel_percent
+float64 acc_percent
+---
+bool success
+string message
+

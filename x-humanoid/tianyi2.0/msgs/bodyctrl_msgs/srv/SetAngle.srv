@@ -1,0 +1,8 @@
+float32 angle0_ratio
+float32 angle1_ratio
+float32 angle2_ratio
+float32 angle3_ratio
+float32 angle4_ratio
+float32 angle5_ratio
+---
+bool angle_accepted

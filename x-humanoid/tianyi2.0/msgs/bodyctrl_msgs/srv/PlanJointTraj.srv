@@ -1,0 +1,11 @@
+string arm_name # left/right
+float64[] joint_pos
+float64[] joint_vel
+float64 vel_percent
+float64 acc_percent
+float64 jerk_percent
+int32 mode # 0: position, 1: velocity, 2: acceleration, 3: jerk
+---
+bool success
+string message
+
