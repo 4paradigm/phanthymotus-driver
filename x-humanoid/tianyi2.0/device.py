@@ -473,7 +473,9 @@ class CameraPlugin:
                 img = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
                 if msg.encoding == "rgb8":
                     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-                _, jpeg = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 30])
+                # Resize to 768p width, maintain aspect ratio
+                img = cv2.resize(img, (768, 432), interpolation=cv2.INTER_AREA)
+                _, jpeg = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 50])
                 out = CompressedImage()
                 out.format = "jpeg"
                 out.data = bytes(jpeg)
