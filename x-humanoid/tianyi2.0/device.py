@@ -20,8 +20,11 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   CameraPlugin     (sensor)             — Orbbec 头部相机
   AsrPlugin        (sensor)             — 语音识别结果
   NavStatePlugin   (sensor)             — 底盘导航状态
+  StatusLightPlugin (actuator)          — 机器人状态灯事件
   HeadPlugin       (actuator)           — 头部3DOF控制
+  HeadGesturePlugin (actuator)          — 点头/摇头/左右观察等语义动作
   ArmPlugin        (actuator)           — 双臂14DOF控制
+  ArmGesturePlugin (actuator)           — 挥手/敬礼/欢迎等语义动作
   WaistPlugin      (actuator)           — 腰部2DOF控制
   HandPlugin       (actuator)           — 灵巧手控制
   TtsPlugin        (actuator)           — 语音合成
@@ -113,6 +116,58 @@ def _stamp_to_ms(stamp) -> int | None:
         return int(stamp.sec * 1000 + stamp.nanosec / 1_000_000)
     except (AttributeError, TypeError, ValueError):
         return None
+
+
+def _clamp(value: float, lower: float, upper: float) -> float:
+    """Clamp a numeric input to a safe, documented range."""
+    return max(lower, min(upper, float(value)))
+
+
+class _ActionSequence:
+    """Run one cancellable actuator sequence at a time."""
+
+    def __init__(self, name: str):
+        self._name = name
+        self._lock = threading.Lock()
+        self._cancel_event: threading.Event | None = None
+        self._thread: threading.Thread | None = None
+
+    def start(self, worker) -> None:
+        self.cancel()
+        cancel_event = threading.Event()
+
+        def _run():
+            try:
+                worker(cancel_event)
+            except Exception as e:
+                print(f"[{self._name}] sequence failed: {e}")
+            finally:
+                with self._lock:
+                    if self._cancel_event is cancel_event:
+                        self._cancel_event = None
+                        self._thread = None
+
+        thread = threading.Thread(
+            target=_run, name=f"{self._name}_sequence", daemon=True)
+        with self._lock:
+            self._cancel_event = cancel_event
+            self._thread = thread
+        thread.start()
+
+    def cancel(self) -> bool:
+        with self._lock:
+            cancel_event = self._cancel_event
+            thread = self._thread
+        if cancel_event is None:
+            return False
+        cancel_event.set()
+        if thread and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+        with self._lock:
+            if self._cancel_event is cancel_event:
+                self._cancel_event = None
+                self._thread = None
+        return True
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -840,8 +895,106 @@ class NavStatePlugin:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# HeadPlugin (actuator)
+# StatusLightPlugin (actuator)
 # ══════════════════════════════════════════════════════════════════════════════
+
+class StatusLightPlugin:
+    """发布电源板定义的状态灯事件。
+
+    PowerLightCtrl 消息只包含 cmd，灯效由电源板根据事件编号决定；
+    因此这里不暴露硬件未定义的 RGB、亮度或闪烁频率参数。
+    """
+
+    _EVENTS = {
+        "battery_supply": 1,
+        "power_on_start": 2,
+        "power_on_finish": 3,
+        "service_start": 4,
+        "service_finish": 5,
+        "self_check_start": 6,
+        "self_check_failed": 7,
+        "self_check_success": 8,
+        "fault_occur": 9,
+        "fault_clear": 10,
+        "voice_wakeup": 11,
+        "voice_response": 12,
+        "voice_exit": 13,
+        "running_start": 14,
+        "running_finish": 15,
+        "power_off": 16,
+        "warn_occur": 17,
+        "warn_clear": 18,
+    }
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._pub_node = Node("tianyi2_status_light_pub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._pub_node)
+        self._publisher = None
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "status_light",
+            "type": "actuator",
+            "description": "天轶2.0 状态灯控制 — 向电源板发送官方定义的灯光状态事件",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string", "enum": ["set_event"],
+                        "description": "发送状态灯事件",
+                    },
+                    "event": {
+                        "type": "string", "enum": list(self._EVENTS),
+                        "description": "PowerLightCtrl.msg 定义的状态事件",
+                    },
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "set_event": {
+                        "params": ["event"],
+                        "description": "设置状态灯事件",
+                    },
+                },
+            },
+        }
+
+    def start(self):
+        try:
+            from bodyctrl_msgs.msg import PowerLightCtrl
+            self._publisher = self._pub_node.create_publisher(
+                PowerLightCtrl, "/power/light/ctrl", _RELIABLE_QOS)
+            print("[StatusLightPlugin] publisher created")
+        except ImportError as e:
+            print(f"[StatusLightPlugin] WARNING: msg import failed ({e})")
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "set_event":
+            event = str(args.get("event", "")).strip()
+            if event not in self._EVENTS:
+                return {"error": "event must be one of the documented PowerLightCtrl events"}
+            if not self._publisher:
+                return {"error": "publisher not initialized"}
+            try:
+                from bodyctrl_msgs.msg import PowerLightCtrl
+                msg = PowerLightCtrl()
+                msg.cmd = self._EVENTS[event]
+                self._publisher.publish(msg)
+                return {"state": "sent", "event": event, "cmd": msg.cmd}
+            except Exception as e:
+                return {"error": str(e)}
+        if action in ("start", "info"):
+            return {"state": "ready" if self._publisher else "idle"}
+        if action == "stop":
+            return {"state": "idle"}
+        return {"error": f"unknown action: {action}"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HeadPlugin (actuator)
+# ═════════════════════════════════════════════════════════════════════════════════
 
 class HeadPlugin:
     """头部3DOF位置控制 (roll/pitch/yaw)"""
@@ -936,8 +1089,161 @@ class HeadPlugin:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ArmPlugin (actuator)
+# HeadGesturePlugin (actuator)
 # ══════════════════════════════════════════════════════════════════════════════
+
+class HeadGesturePlugin:
+    """可取消的头部语义动作序列。"""
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._pub_node = Node("tianyi2_head_gesture_pub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._pub_node)
+        self._publisher = None
+        self._sequence = _ActionSequence("HeadGesturePlugin")
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "head_gesture",
+            "type": "actuator",
+            "description": "天轶2.0 头部语义动作 — 点头、摇头、左右观察、歪头和回正",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["nod", "shake", "scan", "tilt", "reset", "stop"],
+                        "description": "头部动作",
+                    },
+                    "cycles": {
+                        "type": "integer", "minimum": 1, "maximum": 5,
+                        "default": 2, "description": "循环次数",
+                    },
+                    "amplitude": {
+                        "type": "number", "minimum": 5, "maximum": 45,
+                        "description": "动作幅度(度)，会再按各关节极限限幅",
+                    },
+                    "speed": {
+                        "type": "number", "minimum": 5, "maximum": 60,
+                        "default": 30, "description": "动作速度(度/秒)",
+                    },
+                    "side": {
+                        "type": "string", "enum": ["left", "right"],
+                        "default": "left", "description": "歪头方向",
+                    },
+                    "hold": {
+                        "type": "number", "minimum": 0.2, "maximum": 3.0,
+                        "default": 0.8, "description": "歪头保持时间(秒)",
+                    },
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "nod": {"params": ["cycles", "amplitude", "speed"], "description": "连续点头后回正"},
+                    "shake": {"params": ["cycles", "amplitude", "speed"], "description": "连续摇头后回正"},
+                    "scan": {"params": ["cycles", "amplitude", "speed"], "description": "左右观察后回正"},
+                    "tilt": {"params": ["side", "amplitude", "speed", "hold"], "description": "向指定方向歪头后回正"},
+                    "reset": {"params": ["speed"], "description": "取消序列并将头部回正"},
+                    "stop": {"params": [], "description": "取消尚未发送的后续动作帧"},
+                },
+            },
+        }
+
+    def start(self):
+        try:
+            from bodyctrl_msgs.msg import CmdSetMotorPosition
+            self._publisher = self._pub_node.create_publisher(
+                CmdSetMotorPosition, "/head/cmd_pos", _RELIABLE_QOS)
+            print("[HeadGesturePlugin] publisher created")
+        except ImportError as e:
+            print(f"[HeadGesturePlugin] WARNING: msg import failed ({e})")
+
+    def stop(self):
+        self._sequence.cancel()
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "info"):
+            return {"state": "ready" if self._publisher else "idle"}
+        if action == "stop":
+            return {"state": "stopped", "cancelled": self._sequence.cancel()}
+        if action == "reset":
+            self._sequence.cancel()
+            return self._publish_pose(0, 0, 0, args.get("speed", 30))
+        if action not in ("nod", "shake", "scan", "tilt"):
+            return {"error": f"unknown action: {action}"}
+        if not self._publisher:
+            return {"error": "publisher not initialized"}
+
+        cycles = int(_clamp(args.get("cycles", 2), 1, 5))
+        speed = _clamp(args.get("speed", 30), 5, 60)
+        amplitude_default = 12 if action in ("nod", "tilt") else 25
+        amplitude = _clamp(args.get("amplitude", amplitude_default), 5, 45)
+
+        frames: list[tuple[float, float, float, float]] = []
+        if action == "nod":
+            amplitude = min(amplitude, 20)
+            for _ in range(cycles):
+                frames.extend([(0, amplitude, 0, amplitude / speed),
+                               (0, -amplitude, 0, 2 * amplitude / speed)])
+        elif action == "shake":
+            amplitude = min(amplitude, 45)
+            for _ in range(cycles):
+                frames.extend([(amplitude, 0, 0, amplitude / speed),
+                               (-amplitude, 0, 0, 2 * amplitude / speed)])
+        elif action == "scan":
+            amplitude = min(amplitude, 45)
+            for _ in range(cycles):
+                frames.extend([(amplitude, 0, 0, amplitude / speed),
+                               (0, 0, 0, amplitude / speed),
+                               (-amplitude, 0, 0, amplitude / speed),
+                               (0, 0, 0, amplitude / speed)])
+        else:
+            amplitude = min(amplitude, 20)
+            roll = amplitude if args.get("side", "left") == "left" else -amplitude
+            hold = _clamp(args.get("hold", 0.8), 0.2, 3.0)
+            frames.append((0, 0, roll, amplitude / speed + hold))
+        frames.append((0, 0, 0, max(0.15, amplitude / speed)))
+
+        def _worker(cancel_event: threading.Event):
+            for yaw, pitch, roll, delay in frames:
+                if cancel_event.is_set():
+                    return
+                result = self._publish_pose(yaw, pitch, roll, speed)
+                if "error" in result or cancel_event.wait(max(0.15, delay)):
+                    return
+
+        self._sequence.start(_worker)
+        return {
+            "state": "running", "gesture": action, "cycles": cycles,
+            "amplitude": amplitude, "speed": speed,
+        }
+
+    def _publish_pose(self, yaw_deg: float, pitch_deg: float,
+                      roll_deg: float, speed_deg: float) -> dict:
+        if not self._publisher:
+            return {"error": "publisher not initialized"}
+        try:
+            from bodyctrl_msgs.msg import CmdSetMotorPosition, SetMotorPosition
+            yaw_deg = _clamp(yaw_deg, -90, 90)
+            pitch_deg = _clamp(pitch_deg, -25, 25)
+            roll_deg = _clamp(roll_deg, -26, 26)
+            speed_rad = _deg2rad(_clamp(speed_deg, 5, 60))
+            msg = CmdSetMotorPosition()
+            msg.cmds = []
+            for motor_id, deg in [(1, roll_deg), (2, pitch_deg), (3, yaw_deg)]:
+                cmd = SetMotorPosition()
+                cmd.name = motor_id
+                cmd.pos = _deg2rad(deg)
+                cmd.spd = speed_rad
+                cmd.cur = 3.0
+                msg.cmds.append(cmd)
+            self._publisher.publish(msg)
+            return {"state": "moving", "yaw": yaw_deg, "pitch": pitch_deg, "roll": roll_deg}
+        except Exception as e:
+            return {"error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ArmPlugin (actuator)
+# ════════════════════════════════════════════════════════════════════════════════
 
 class ArmPlugin:
     """双臂14DOF控制 (位置模式 / 力位混合)"""
@@ -1076,8 +1382,158 @@ class ArmPlugin:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# WaistPlugin (actuator)
+# ArmGesturePlugin (actuator)
 # ══════════════════════════════════════════════════════════════════════════════
+
+class ArmGesturePlugin:
+    """可取消的挥手、敬礼和欢迎手势序列。"""
+
+    _NEUTRAL = [0, 0, 0, 0, 0, 0, 0]
+    # 角度顺序：肩 pitch、肩 roll、肩 yaw、肘 pitch、腕 yaw、腕 pitch、腕 roll。
+    _GESTURES = {
+        "wave": [0, 55, 0, -85, 0, 0, 0],
+        "salute": [-20, 45, -15, -100, 0, 15, 0],
+        "welcome": [-20, 50, 0, -45, 0, 0, 0],
+        "raise": [0, 45, 0, -20, 0, 0, 0],
+    }
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._pub_node = Node("tianyi2_arm_gesture_pub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._pub_node)
+        self._publisher = None
+        self._sequence = _ActionSequence("ArmGesturePlugin")
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "arm_gesture",
+            "type": "actuator",
+            "description": "天轶2.0 手臂语义动作 — 挥手、敬礼、欢迎、举手和回正",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["wave", "salute", "welcome", "raise", "reset", "stop"],
+                        "description": "手臂动作",
+                    },
+                    "side": {
+                        "type": "string", "enum": ["left", "right", "both"],
+                        "default": "right", "description": "执行手臂",
+                    },
+                    "cycles": {
+                        "type": "integer", "minimum": 1, "maximum": 5,
+                        "default": 2, "description": "挥手循环次数",
+                    },
+                    "speed": {
+                        "type": "number", "minimum": 0.2, "maximum": 1.5,
+                        "default": 0.5, "description": "关节速度(rad/s)",
+                    },
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "wave": {"params": ["side", "cycles", "speed"], "description": "举手后挥手并回到中性姿态"},
+                    "salute": {"params": ["side", "speed"], "description": "执行敬礼姿态并回正"},
+                    "welcome": {"params": ["side", "speed"], "description": "执行欢迎展示姿态并回正"},
+                    "raise": {"params": ["side", "speed"], "description": "举手并回正"},
+                    "reset": {"params": ["side", "speed"], "description": "取消序列并回到中性姿态"},
+                    "stop": {"params": [], "description": "取消尚未发送的后续动作帧"},
+                },
+            },
+        }
+
+    def start(self):
+        try:
+            from bodyctrl_msgs.msg import CmdSetMotorPosition
+            self._publisher = self._pub_node.create_publisher(
+                CmdSetMotorPosition, "/arm/cmd_pos", _RELIABLE_QOS)
+            print("[ArmGesturePlugin] publisher created")
+        except ImportError as e:
+            print(f"[ArmGesturePlugin] WARNING: msg import failed ({e})")
+
+    def stop(self):
+        self._sequence.cancel()
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "info"):
+            return {"state": "ready" if self._publisher else "idle"}
+        if action == "stop":
+            return {"state": "stopped", "cancelled": self._sequence.cancel()}
+        side = args.get("side", "right")
+        if side not in ("left", "right", "both"):
+            return {"error": "side must be left, right or both"}
+        speed = _clamp(args.get("speed", 0.5), 0.2, 1.5)
+        if action == "reset":
+            self._sequence.cancel()
+            return self._publish_pose(side, self._NEUTRAL, speed)
+        if action not in self._GESTURES:
+            return {"error": f"unknown action: {action}"}
+        if not self._publisher:
+            return {"error": "publisher not initialized"}
+
+        pose = self._GESTURES[action]
+        cycles = int(_clamp(args.get("cycles", 2), 1, 5))
+        frames = [(pose, 0.8)]
+        if action == "wave":
+            for i in range(cycles * 2):
+                wave_pose = list(pose)
+                wave_pose[4] = 30 if i % 2 == 0 else -30
+                frames.append((wave_pose, 0.6))
+        frames.append((self._NEUTRAL, 1.0))
+
+        def _worker(cancel_event: threading.Event):
+            previous = self._NEUTRAL
+            for frame, hold in frames:
+                if cancel_event.is_set():
+                    return
+                result = self._publish_pose(side, frame, speed)
+                max_delta_rad = max(
+                    abs(_deg2rad(float(current) - float(old)))
+                    for current, old in zip(frame, previous)
+                )
+                transition = max_delta_rad / speed if speed > 0 else 0
+                previous = frame
+                if "error" in result or cancel_event.wait(transition + hold):
+                    return
+
+        self._sequence.start(_worker)
+        return {"state": "running", "gesture": action, "side": side,
+                "cycles": cycles, "speed": speed}
+
+    def _publish_pose(self, side: str, left_pose: list[float], speed: float) -> dict:
+        if not self._publisher:
+            return {"error": "publisher not initialized"}
+        if len(left_pose) != 7:
+            return {"error": "internal pose must have 7 values"}
+        try:
+            from bodyctrl_msgs.msg import CmdSetMotorPosition, SetMotorPosition
+            # Mirror the lateral axes for the right arm. All values remain within
+            # the URDF limits used by the existing arm card.
+            right_pose = [left_pose[0], -left_pose[1], -left_pose[2],
+                          left_pose[3], -left_pose[4], left_pose[5], -left_pose[6]]
+            selected = []
+            if side in ("left", "both"):
+                selected.append((11, left_pose))
+            if side in ("right", "both"):
+                selected.append((21, right_pose))
+            msg = CmdSetMotorPosition()
+            msg.cmds = []
+            for base_id, pose in selected:
+                for index, deg in enumerate(pose):
+                    cmd = SetMotorPosition()
+                    cmd.name = base_id + index
+                    cmd.pos = _deg2rad(float(deg))
+                    cmd.spd = speed
+                    cmd.cur = 5.0
+                    msg.cmds.append(cmd)
+            self._publisher.publish(msg)
+            return {"state": "moving", "side": side, "joints": len(msg.cmds)}
+        except Exception as e:
+            return {"error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════
+# WaistPlugin (actuator)
+# ══════════════════════════════════════════════════════════════════════════
 
 class WaistPlugin:
     """腰部2DOF控制 (yaw/pitch)"""

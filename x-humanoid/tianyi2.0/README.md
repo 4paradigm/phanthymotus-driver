@@ -41,3 +41,56 @@ not invent descriptions without an authoritative error-code table.
 
 Both cards are read-only. They do not command joints, stop the robot, trigger an
 emergency stop, or modify any robot-side configuration.
+
+## Status light card
+
+`status_light` publishes the official `PowerLightCtrl` events to
+`/power/light/ctrl`. The vendor message contains only an integer `cmd`; RGB,
+brightness and blink-frequency controls are intentionally not invented.
+
+| Item | Value |
+|---|---|
+| Tool name | `status_light` |
+| Tool type | `actuator` |
+| Robot-side output | `/power/light/ctrl` |
+| Message type | `bodyctrl_msgs/msg/PowerLightCtrl` |
+| Action | `set_event` |
+
+Supported events match `PowerLightCtrl.msg`, including power-on, service,
+self-check, fault, warning, voice, running and power-off state transitions.
+
+## Head gesture card
+
+`head_gesture` turns safe, bounded head-position commands into cancellable
+semantic sequences.
+
+| Item | Value |
+|---|---|
+| Tool name | `head_gesture` |
+| Tool type | `actuator` |
+| Robot-side output | `/head/cmd_pos` |
+| Message type | `bodyctrl_msgs/msg/CmdSetMotorPosition` |
+| Actions | `nod`, `shake`, `scan`, `tilt`, `reset`, `stop` |
+
+Yaw, pitch and roll are clamped to the limits already documented by the raw
+`head` card. Starting a new gesture cancels the remaining frames of the previous
+gesture; `stop` cancels future frames without issuing an additional pose.
+
+## Arm gesture card
+
+`arm_gesture` provides semantic arm motions on top of the existing joint-level
+`arm` card.
+
+| Item | Value |
+|---|---|
+| Tool name | `arm_gesture` |
+| Tool type | `actuator` |
+| Robot-side output | `/arm/cmd_pos` |
+| Message type | `bodyctrl_msgs/msg/CmdSetMotorPosition` |
+| Actions | `wave`, `salute`, `welcome`, `raise`, `reset`, `stop` |
+
+The right-arm poses are mirrored from the left-arm definitions and remain
+inside the checked-in URDF limits. The preset poses still require low-speed,
+clear-area calibration on the target robot before production use. Do not run
+the raw `arm` card and `arm_gesture` concurrently because both publish to the
+same controller topic.
