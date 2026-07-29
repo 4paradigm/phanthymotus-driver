@@ -441,6 +441,11 @@ class CameraPlugin:
     def _on_image(self, msg):
         if not self._running:
             return
+        # Throttle to 10fps max
+        now = time.time()
+        if now - getattr(self, '_last_frame_time', 0) < 0.1:
+            return
+        self._last_frame_time = now
         try:
             np = self._np
             cv2 = self._cv2
@@ -452,7 +457,9 @@ class CameraPlugin:
                 img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
             else:
                 return
-            _, jpeg = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            # Resize to 640x360 for lower latency
+            img = cv2.resize(img, (640, 360), interpolation=cv2.INTER_NEAREST)
+            _, jpeg = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 50])
             from sensor_msgs.msg import CompressedImage
             out = CompressedImage()
             out.format = "jpeg"
