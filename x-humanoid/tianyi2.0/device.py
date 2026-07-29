@@ -789,10 +789,9 @@ class HandStatePlugin(_JsonSensor):
 
 
 class DepthCameraPlugin:
-    """Forward only the latest Orbbec Z16 depth image without re-encoding."""
+    """Forward the newest Orbbec Z16 frame with no buffering or re-encoding."""
     def __init__(self, plugin_config, namespace, ros2):
         self._running = False; self._topic = f"/{namespace}/camera/head/depth"
-        self._latest_frame = None; self._frame_lock = threading.Lock()
         self._sub_node = Node("tianyi2_depth_sub", context=ros2.ctx_tianyi)
         self._pub_node = Node("tianyi2_depth_pub", context=ros2.ctx_core)
         ros2.executor_tianyi.add_node(self._sub_node); ros2.executor_core.add_node(self._pub_node)
@@ -801,23 +800,18 @@ class DepthCameraPlugin:
                 "inputSchema": {"type": "object", "properties": {}}, "topic_out": [{"topic": self._topic, "format": "image/depth-z16"}]}
     def start(self):
         from sensor_msgs.msg import Image
-        self._running = True; self._pub = self._pub_node.create_publisher(Image, self._topic, _LOW_LAT_QOS)
-        self._sub_node.create_subscription(Image, "/ob_camera_head/depth/image_raw", self._on_image, _LOW_LAT_QOS)
-        # Publish from the domain-42 executor itself.  A timer is safer than a
-        # free-running Python thread for rclpy publishers and bounds latency to
-        # one tick while retaining only the newest camera frame.
-        self._pub_node.create_timer(1.0 / 15.0, self._publish_latest)
+        # Depth needs no conversion.  A direct, depth-one BEST_EFFORT bridge
+        # is lower-latency than a worker queue: a slow receiver can only retain
+        # the newest frame, never a backlog of old depth images.
+        latest_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                                history=HistoryPolicy.KEEP_LAST, depth=1,
+                                durability=DurabilityPolicy.VOLATILE)
+        self._running = True; self._pub = self._pub_node.create_publisher(Image, self._topic, latest_qos)
+        self._sub_node.create_subscription(Image, "/ob_camera_head/depth/image_raw", self._on_image, latest_qos)
     def stop(self): self._running = False
     def _on_image(self, msg):
         if not self._running or msg.encoding not in ("16UC1", "mono16"): return
-        # The ROS callback must never queue stale depth frames behind a slow
-        # domain-42 publisher.  Retain one newest frame, like CameraPlugin.
-        with self._frame_lock: self._latest_frame = msg
-    def _publish_latest(self):
-        if not self._running: return
-        with self._frame_lock:
-            msg, self._latest_frame = self._latest_frame, None
-        if msg is not None: self._pub.publish(msg)
+        self._pub.publish(msg)
     def dispatch(self, action, args):
         return {"state": "running" if self._running else "idle", "topic_out": [{"topic": self._topic, "format": "image/depth-z16"}]}
 
