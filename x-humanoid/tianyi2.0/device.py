@@ -398,16 +398,15 @@ class CameraPlugin:
         self._ensure_orbbec_service()
 
         try:
-            from sensor_msgs.msg import Image
-            from std_msgs.msg import UInt8MultiArray
+            from sensor_msgs.msg import Image, CompressedImage
             import numpy as np
             import cv2
 
             self._np = np
             self._cv2 = cv2
 
-            # Publish JPEG as raw bytes in UInt8MultiArray
-            self._pub = self._pub_node.create_publisher(UInt8MultiArray, self._topic, _LOW_LAT_QOS)
+            # Publish JPEG as CompressedImage (dashboard IMAGE renderer expects this)
+            self._pub = self._pub_node.create_publisher(CompressedImage, self._topic, _LOW_LAT_QOS)
 
             self._sub_node.create_subscription(
                 Image, "/ob_camera_head/color/image_raw", self._on_image, _RELIABLE_QOS)
@@ -443,10 +442,9 @@ class CameraPlugin:
         if not self._running:
             return
         try:
-            # Convert ROS Image to numpy
             np = self._np
             cv2 = self._cv2
-            raw = bytes(msg.data)  # msg.data is array.array, convert to bytes
+            raw = bytes(msg.data)
             if msg.encoding == "bgr8":
                 img = np.frombuffer(raw, dtype=np.uint8).reshape(msg.height, msg.width, 3)
             elif msg.encoding == "rgb8":
@@ -454,11 +452,11 @@ class CameraPlugin:
                 img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
             else:
                 return
-            # Encode to JPEG
             _, jpeg = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 70])
-            from std_msgs.msg import UInt8MultiArray
-            out = UInt8MultiArray()
-            out.data = list(jpeg.tobytes())
+            from sensor_msgs.msg import CompressedImage
+            out = CompressedImage()
+            out.format = "jpeg"
+            out.data = bytes(jpeg)
             self._pub.publish(out)
         except Exception as e:
             print(f"[CameraPlugin] _on_image error: {e}", flush=True)
