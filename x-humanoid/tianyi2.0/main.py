@@ -102,15 +102,38 @@ class TianyiDeviceBundle:
             self._plugins.append(StatePlugin(plugins_cfg["state"], namespace, ros2))
             print("[bundle] StatePlugin loaded")
 
+        if plugins_cfg.get("hand_state", {}).get("enabled", False):
+            from hand_state import HandStatePlugin
+            self._plugins.append(
+                HandStatePlugin(plugins_cfg["hand_state"], namespace, ros2)
+            )
+            print("[bundle] HandStatePlugin loaded")
+
         if plugins_cfg.get("camera", {}).get("enabled", False):
             from device import CameraPlugin
             self._plugins.append(CameraPlugin(plugins_cfg["camera"], namespace, ros2))
             print("[bundle] CameraPlugin loaded")
 
+        if plugins_cfg.get("camera_depth", {}).get("enabled", False):
+            from camera_depth import CameraDepthPlugin
+            self._plugins.append(
+                CameraDepthPlugin(plugins_cfg["camera_depth"], namespace, ros2)
+            )
+            print("[bundle] CameraDepthPlugin loaded")
+
         if plugins_cfg.get("asr", {}).get("enabled", False):
             from device import AsrPlugin
             self._plugins.append(AsrPlugin(plugins_cfg["asr"], namespace, ros2))
             print("[bundle] AsrPlugin loaded")
+
+        if plugins_cfg.get("remote_controller", {}).get("enabled", False):
+            from remote_controller import RemoteControllerPlugin
+            self._plugins.append(
+                RemoteControllerPlugin(
+                    plugins_cfg["remote_controller"], namespace, ros2
+                )
+            )
+            print("[bundle] RemoteControllerPlugin loaded")
 
         if plugins_cfg.get("nav_state", {}).get("enabled", False):
             from device import NavStatePlugin

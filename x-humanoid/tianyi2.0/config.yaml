@@ -8,9 +8,15 @@ slamtec:
 plugins:
   state:
     enabled: true
+  hand_state:
+    enabled: true
   camera:
     enabled: true
+  camera_depth:
+    enabled: true
   asr:
+    enabled: true
+  remote_controller:
     enabled: true
   nav_state:
     enabled: true
