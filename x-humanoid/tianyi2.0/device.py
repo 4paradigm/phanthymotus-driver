@@ -190,21 +190,21 @@ class StatePlugin:
             # Subscribe to motor status topics
             for topic in ["/head/status", "/arm/status", "/waist/status", "/leg/status"]:
                 self._sub_node.create_subscription(
-                    MotorStatusMsg, topic, self._on_motor_status, _LOW_LAT_QOS)
+                    MotorStatusMsg, topic, self._on_motor_status, _RELIABLE_QOS)
 
             # Battery
             self._sub_node.create_subscription(
-                PowerBatteryStatus, "/power/battery/status", self._on_battery, _LOW_LAT_QOS)
+                PowerBatteryStatus, "/power/battery/status", self._on_battery, _RELIABLE_QOS)
 
             # E-stop
             self._sub_node.create_subscription(
-                PowerBoardKeyStatus, "/power/board/key_status", self._on_estop, _LOW_LAT_QOS)
+                PowerBoardKeyStatus, "/power/board/key_status", self._on_estop, _RELIABLE_QOS)
 
             # Force sensors (100Hz, throttle to 5Hz in callback)
             self._sub_node.create_subscription(
-                WrenchStamped, "/arm_6dof_left", self._on_force_left, _LOW_LAT_QOS)
+                WrenchStamped, "/arm_6dof_left", self._on_force_left, _RELIABLE_QOS)
             self._sub_node.create_subscription(
-                WrenchStamped, "/arm_6dof_right", self._on_force_right, _LOW_LAT_QOS)
+                WrenchStamped, "/arm_6dof_right", self._on_force_right, _RELIABLE_QOS)
 
             print("[StatePlugin] subscriptions created")
         except ImportError as e:
@@ -406,7 +406,7 @@ class CameraPlugin:
             self._pub = self._pub_node.create_publisher(UInt8MultiArray, self._topic, _LOW_LAT_QOS)
 
             self._sub_node.create_subscription(
-                Image, "/ob_camera_head/color/image_raw", self._on_image, _LOW_LAT_QOS)
+                Image, "/ob_camera_head/color/image_raw", self._on_image, _RELIABLE_QOS)
             print("[CameraPlugin] subscription created")
         except ImportError as e:
             print(f"[CameraPlugin] WARNING: import failed ({e})")
