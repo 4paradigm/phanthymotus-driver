@@ -393,6 +393,10 @@ class CameraPlugin:
 
     def start(self):
         self._running = True
+
+        # Ensure Orbbec camera service is running on Orin (192.168.41.2)
+        self._ensure_orbbec_service()
+
         try:
             from sensor_msgs.msg import Image
             from std_msgs.msg import UInt8MultiArray
@@ -410,6 +414,30 @@ class CameraPlugin:
             print("[CameraPlugin] subscription created")
         except ImportError as e:
             print(f"[CameraPlugin] WARNING: import failed ({e})")
+
+    def _ensure_orbbec_service(self):
+        """Try to start orbbec_head.service on Orin via SSH."""
+        import subprocess
+        orin_ip = "192.168.41.2"
+        try:
+            result = subprocess.run(
+                ["ssh", "-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no",
+                 "-o", "BatchMode=yes", f"nvidia@{orin_ip}",
+                 "systemctl is-active orbbec_head.service"],
+                capture_output=True, text=True, timeout=5)
+            if result.stdout.strip() == "active":
+                print("[CameraPlugin] orbbec_head.service already active")
+                return
+            # Try to start it
+            subprocess.run(
+                ["ssh", "-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no",
+                 "-o", "BatchMode=yes", f"nvidia@{orin_ip}",
+                 "sudo systemctl start orbbec_head.service"],
+                capture_output=True, text=True, timeout=10)
+            print("[CameraPlugin] orbbec_head.service started on Orin")
+        except Exception as e:
+            print(f"[CameraPlugin] WARNING: could not start orbbec service ({e}), "
+                  f"ensure 'sudo systemctl enable orbbec_head.service' on Orin")
 
     def stop(self):
         self._running = False
