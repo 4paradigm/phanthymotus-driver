@@ -492,6 +492,253 @@ class CameraPlugin:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Additional sensors / indicators
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _JsonSensor:
+    """Small base class for a domain-0 subscription bridged as JSON on domain 42."""
+    _format = "data/json"
+
+    def _tool(self, name, description):
+        return {"name": name, "type": "sensor", "description": description,
+                "inputSchema": {"type": "object", "properties": {}},
+                "topic_out": [{"topic": self._topic, "format": self._format}]}
+
+    def dispatch(self, action, args):
+        if action == "info":
+            return {"state": "running" if self._running else "idle",
+                    "topic_out": [{"topic": self._topic, "format": self._format}]}
+        return {"state": "running" if self._running else "idle"}
+
+
+class ImuPlugin(_JsonSensor):
+    """Bridge Tianyi's vendor and standard ROS IMU streams to Agent Core."""
+    def __init__(self, plugin_config, namespace, ros2):
+        self._running = False
+        self._topic = f"/{namespace}/state/imu"
+        self._last_pub = 0.0
+        self._latest = {
+            "available": False,
+            "timestamp_ms": int(time.time() * 1000),
+            "source": None,
+        }
+        self._subscriptions = []  # Keep rclpy subscriptions alive for the plugin lifetime.
+        self._sub_node = Node("tianyi2_imu_sub", context=ros2.ctx_tianyi)
+        self._pub_node = Node("tianyi2_imu_pub", context=ros2.ctx_core)
+        ros2.executor_tianyi.add_node(self._sub_node)
+        ros2.executor_core.add_node(self._pub_node)
+        self._pub = self._pub_node.create_publisher(String, self._topic, _LOW_LAT_QOS)
+
+    def get_tool(self):
+        tool = self._tool("imu", "天轶2.0 IMU — 姿态、欧拉角、角速度、线加速度与错误码")
+        tool["multiInstance"] = False
+        return tool
+
+    def start(self):
+        """Subscribe to both IMU interfaces used by Tianyi deployments.
+
+        The body controller publishes ``bodyctrl_msgs/Imu`` on ``/imu/status``
+        on some images, while other images expose the standard
+        ``sensor_msgs/Imu`` stream on ``/imu/data``.  Sensor publishers are
+        normally BEST_EFFORT, so a reliable subscription silently receives no
+        samples.  The low-latency QoS matches either sensor stream.
+        """
+        from bodyctrl_msgs.msg import Imu
+        from sensor_msgs.msg import Imu as RosImu
+        self._running = True
+        self._subscriptions = [
+            self._sub_node.create_subscription(
+                Imu, "/imu/status", self._on_vendor_imu, _LOW_LAT_QOS),
+            self._sub_node.create_subscription(
+                RosImu, "/imu/data", self._on_ros_imu, _LOW_LAT_QOS),
+        ]
+        print("[ImuPlugin] subscribed: /imu/status (bodyctrl_msgs/Imu), /imu/data (sensor_msgs/Imu)")
+
+    def stop(self):
+        self._running = False
+
+    def _publish(self, orientation, angular_velocity, linear_acceleration, euler, error=0, source=None):
+        # The dashboard only needs the latest state.  Bound forwarding to 30 Hz
+        # so a high-rate IMU cannot congest the domain-42 bridge.
+        now = time.monotonic()
+        if not self._running or now - self._last_pub < 1.0 / 30.0:
+            return
+        self._last_pub = now
+        self._latest = {
+            "available": True,
+            "timestamp_ms": int(time.time() * 1000),
+            "source": source,
+            "orientation": orientation,
+            "euler": euler,
+            "angular_velocity": angular_velocity,
+            "linear_acceleration": linear_acceleration,
+            "error": error,
+        }
+        out = String()
+        out.data = json.dumps(self._latest)
+        self._pub.publish(out)
+
+    def _on_vendor_imu(self, msg):
+        self._publish(
+            {"x": msg.orientation.x, "y": msg.orientation.y, "z": msg.orientation.z, "w": msg.orientation.w},
+            {"x": msg.angular_velocity.x, "y": msg.angular_velocity.y, "z": msg.angular_velocity.z},
+            {"x": msg.linear_acceleration.x, "y": msg.linear_acceleration.y, "z": msg.linear_acceleration.z},
+            {"roll": msg.euler.roll, "pitch": msg.euler.pitch, "yaw": msg.euler.yaw},
+            msg.error,
+            source="/imu/status",
+        )
+
+    def _on_ros_imu(self, msg):
+        q = msg.orientation
+        # Standard sensor_msgs/Imu has no Euler field; derive it from its
+        # quaternion so both source topics produce the same card payload.
+        sinr_cosp = 2.0 * (q.w * q.x + q.y * q.z)
+        cosr_cosp = 1.0 - 2.0 * (q.x * q.x + q.y * q.y)
+        sinp = 2.0 * (q.w * q.y - q.z * q.x)
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        self._publish(
+            {"x": q.x, "y": q.y, "z": q.z, "w": q.w},
+            {"x": msg.angular_velocity.x, "y": msg.angular_velocity.y, "z": msg.angular_velocity.z},
+            {"x": msg.linear_acceleration.x, "y": msg.linear_acceleration.y, "z": msg.linear_acceleration.z},
+            {"roll": math.atan2(sinr_cosp, cosr_cosp),
+             "pitch": math.asin(max(-1.0, min(1.0, sinp))),
+             "yaw": math.atan2(siny_cosp, cosy_cosp)},
+            source="/imu/data",
+        )
+
+    def dispatch(self, action, args):
+        if action in ("info", "read", "get", "imu"):
+            return {
+                "state": "running" if self._running else "idle",
+                "data": self._latest,
+                "topic_out": [{"topic": self._topic, "format": self._format}],
+            }
+        return {"state": "running" if self._running else "idle"}
+
+
+class HandStatePlugin(_JsonSensor):
+    """Bridge both Inspire hands' feedback and error arrays."""
+    def __init__(self, plugin_config, namespace, ros2):
+        self._running, self._lock = False, threading.Lock()
+        self._state = {"left": {}, "right": {}}
+        self._topic = f"/{namespace}/state/hand"
+        self._sub_node = Node("tianyi2_hand_state_sub", context=ros2.ctx_tianyi)
+        self._pub_node = Node("tianyi2_hand_state_pub", context=ros2.ctx_core)
+        ros2.executor_tianyi.add_node(self._sub_node); ros2.executor_core.add_node(self._pub_node)
+        self._pub = self._pub_node.create_publisher(String, self._topic, _LOW_LAT_QOS)
+
+    def get_tool(self): return self._tool("hand_state", "天轶2.0 灵巧手状态 — 双手六指位置、速度、电流与错误码")
+    def start(self):
+        from sensor_msgs.msg import JointState
+        from std_msgs.msg import UInt32MultiArray
+        self._running = True
+        for side in ("left", "right"):
+            self._sub_node.create_subscription(JointState, f"/inspire_hand/state/{side}_hand", lambda m, s=side: self._on_state(s, m), _RELIABLE_QOS)
+            self._sub_node.create_subscription(UInt32MultiArray, f"/inspire_hand/error/{side}_hand", lambda m, s=side: self._on_error(s, m), _RELIABLE_QOS)
+    def stop(self): self._running = False
+    def _on_state(self, side, msg):
+        with self._lock:
+            self._state[side].update({"name": list(msg.name), "position": list(msg.position), "velocity": list(msg.velocity), "effort": list(msg.effort)})
+        self._publish()
+    def _on_error(self, side, msg):
+        with self._lock: self._state[side]["errors"] = list(msg.data)
+        self._publish()
+    def _publish(self):
+        if not self._running: return
+        with self._lock: data = json.dumps(self._state)
+        out = String(); out.data = data; self._pub.publish(out)
+
+
+class DepthCameraPlugin:
+    """Forward the Orbbec Z16 depth image without conversion or re-encoding."""
+    def __init__(self, plugin_config, namespace, ros2):
+        self._running = False; self._topic = f"/{namespace}/camera/head/depth"
+        self._sub_node = Node("tianyi2_depth_sub", context=ros2.ctx_tianyi)
+        self._pub_node = Node("tianyi2_depth_pub", context=ros2.ctx_core)
+        ros2.executor_tianyi.add_node(self._sub_node); ros2.executor_core.add_node(self._pub_node)
+    def get_tool(self):
+        return {"name": "camera_depth", "type": "sensor", "description": "天轶2.0 Orbbec 头部深度图（Z16）",
+                "inputSchema": {"type": "object", "properties": {}}, "topic_out": [{"topic": self._topic, "format": "image/depth-z16"}]}
+    def start(self):
+        from sensor_msgs.msg import Image
+        self._running = True; self._pub = self._pub_node.create_publisher(Image, self._topic, _LOW_LAT_QOS)
+        self._sub_node.create_subscription(Image, "/ob_camera_head/depth/image_raw", self._on_image, _RELIABLE_QOS)
+    def stop(self): self._running = False
+    def _on_image(self, msg):
+        if self._running and msg.encoding in ("16UC1", "mono16"): self._pub.publish(msg)
+    def dispatch(self, action, args):
+        return {"state": "running" if self._running else "idle", "topic_out": [{"topic": self._topic, "format": "image/depth-z16"}]}
+
+
+class PointCloudPlugin:
+    """Pack native PointCloud2, or derive XYZ from the active depth stream."""
+    _format = "sensor/pointcloud"
+    def __init__(self, plugin_config, namespace, ros2):
+        self._running = False; self._topic = f"/{namespace}/camera/head/points"; self._last = 0.0; self._intrinsics = None
+        self._sub_node = Node("tianyi2_points_sub", context=ros2.ctx_tianyi); self._pub_node = Node("tianyi2_points_pub", context=ros2.ctx_core)
+        ros2.executor_tianyi.add_node(self._sub_node); ros2.executor_core.add_node(self._pub_node)
+    def get_tool(self):
+        return {"name": "camera_pointcloud", "type": "sensor", "description": "天轶2.0 Orbbec 头部彩色点云（限频、限点）", "inputSchema": {"type": "object", "properties": {}}, "topic_out": [{"topic": self._topic, "format": self._format}]}
+    def start(self):
+        from sensor_msgs.msg import PointCloud2, Image, CameraInfo
+        from std_msgs.msg import UInt8MultiArray
+        self._running = True; self._pub = self._pub_node.create_publisher(UInt8MultiArray, self._topic, _LOW_LAT_QOS)
+        self._sub_node.create_subscription(PointCloud2, "/ob_camera_head/depth/points", self._on_cloud, _LOW_LAT_QOS)
+        # Gemini 336 currently has its depth image enabled even when the vendor
+        # point-cloud stream is disabled.  This fallback keeps the card live.
+        self._sub_node.create_subscription(CameraInfo, "/ob_camera_head/depth/camera_info", self._on_info, _RELIABLE_QOS)
+        self._sub_node.create_subscription(Image, "/ob_camera_head/depth/image_raw", self._on_depth, _LOW_LAT_QOS)
+    def stop(self): self._running = False
+    def _on_cloud(self, msg):
+        if not self._running or time.monotonic() - self._last < 0.5: return
+        fields = {f.name: f.offset for f in msg.fields}
+        if not all(k in fields for k in ("x", "y", "z")): return
+        self._last = time.monotonic(); raw = bytes(msg.data); count = min(msg.width * msg.height, 10000)
+        packed = bytearray(struct.pack("<II", 12, count))
+        for i in range(count):
+            base = i * msg.point_step
+            packed.extend(raw[base + fields["x"]:base + fields["x"] + 4]); packed.extend(raw[base + fields["y"]:base + fields["y"] + 4]); packed.extend(raw[base + fields["z"]:base + fields["z"] + 4])
+        from std_msgs.msg import UInt8MultiArray
+        out = UInt8MultiArray(); out.data = list(packed); self._pub.publish(out)
+    def _on_info(self, msg): self._intrinsics = (msg.k[0], msg.k[4], msg.k[2], msg.k[5])
+    def _on_depth(self, msg):
+        if not self._running or self._intrinsics is None or time.monotonic() - self._last < 0.5: return
+        if msg.encoding not in ("16UC1", "mono16"): return
+        fx, fy, cx, cy = self._intrinsics
+        if fx <= 0 or fy <= 0: return
+        self._last = time.monotonic(); raw = bytes(msg.data); step = max(1, int(math.sqrt((msg.width * msg.height) / 10000)))
+        packed = bytearray(); count = 0
+        for v in range(0, msg.height, step):
+            for u in range(0, msg.width, step):
+                d = struct.unpack_from("<H", raw, v * msg.step + u * 2)[0]
+                if d == 0: continue
+                z = d / 1000.0; packed.extend(struct.pack("<fff", (u - cx) * z / fx, (v - cy) * z / fy, z)); count += 1
+        if not count: return
+        from std_msgs.msg import UInt8MultiArray
+        out = UInt8MultiArray(); out.data = list(struct.pack("<II", 12, count) + packed); self._pub.publish(out)
+    def dispatch(self, action, args): return {"state": "running" if self._running else "idle", "topic_out": [{"topic": self._topic, "format": self._format}]}
+
+
+class LightPlugin:
+    """Safe semantic system-light control; no raw vendor command is exposed."""
+    _commands = {"standby": 99, "service_wait": 20, "service_ready": 22, "warning": 12, "warning_clear": 13, "error": 10, "error_clear": 11}
+    def __init__(self, plugin_config, namespace, ros2):
+        self._pub_node = Node("tianyi2_light_pub", context=ros2.ctx_tianyi); ros2.executor_tianyi.add_node(self._pub_node); self._pub = None
+    def get_tool(self):
+        return {"name": "light", "type": "actuator", "description": "天轶2.0 系统状态灯效", "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": list(self._commands)}}, "required": ["action"], "x-action-params": {k: {"params": [], "description": k} for k in self._commands}}}
+    def start(self):
+        from bodyctrl_msgs.msg import LightCtrl
+        self._pub = self._pub_node.create_publisher(LightCtrl, "/xsys/light/ctrl", _RELIABLE_QOS)
+    def stop(self): pass
+    def dispatch(self, action, args):
+        if action not in self._commands: return {"error": f"unknown action: {action}"}
+        from bodyctrl_msgs.msg import LightCtrl
+        msg = LightCtrl(); msg.cmd = self._commands[action]; msg.caller_id = "phanthy-motus"; msg.caller_msg = f"Agent Core: {action}"; self._pub.publish(msg)
+        return {"state": action}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # AsrPlugin (sensor)
 # ══════════════════════════════════════════════════════════════════════════════
 
