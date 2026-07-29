@@ -368,13 +368,14 @@ class StatePlugin:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class CameraPlugin:
-    """Orbbec 头部 RGB 相机"""
+    """Orbbec 头部 RGB 相机 — 独立编码线程避免阻塞executor"""
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._ns = namespace
         self._ros2 = ros2
         self._topic = f"/{namespace}/camera/head"
         self._running = False
+        self._frame_queue = None  # Will hold latest frame only
 
         self._sub_node = Node("tianyi2_camera_sub", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._sub_node)
@@ -394,7 +395,7 @@ class CameraPlugin:
     def start(self):
         self._running = True
 
-        # Ensure Orbbec camera service is running on Orin (192.168.41.2)
+        # Ensure Orbbec camera service is running
         self._ensure_orbbec_service()
 
         try:
@@ -404,13 +405,21 @@ class CameraPlugin:
 
             self._np = np
             self._cv2 = cv2
+            self._latest_frame = None  # Only keep latest frame
+            self._frame_lock = threading.Lock()
 
-            # Publish JPEG as CompressedImage (dashboard IMAGE renderer expects this)
+            # Publish JPEG as CompressedImage
             self._pub = self._pub_node.create_publisher(CompressedImage, self._topic, _LOW_LAT_QOS)
 
+            # Subscribe - callback just grabs the frame, doesn't encode
             self._sub_node.create_subscription(
-                Image, "/ob_camera_head/color/image_raw", self._on_image, _RELIABLE_QOS)
-            print("[CameraPlugin] subscription created")
+                Image, "/ob_camera_head/color/image_raw", self._on_image_grab, _RELIABLE_QOS)
+
+            # Separate encoding thread - avoids blocking executor
+            self._encode_thread = threading.Thread(target=self._encode_loop, daemon=True)
+            self._encode_thread.start()
+
+            print("[CameraPlugin] subscription + encode thread created")
         except ImportError as e:
             print(f"[CameraPlugin] WARNING: import failed ({e})")
 
@@ -438,35 +447,43 @@ class CameraPlugin:
     def stop(self):
         self._running = False
 
-    def _on_image(self, msg):
+    def _on_image_grab(self, msg):
+        """Callback: just grab the latest frame, don't encode here (non-blocking)."""
         if not self._running:
             return
-        # Throttle to 10fps max
-        now = time.time()
-        if now - getattr(self, '_last_frame_time', 0) < 0.1:
-            return
-        self._last_frame_time = now
-        try:
-            np = self._np
-            cv2 = self._cv2
-            raw = bytes(msg.data)
-            if msg.encoding == "bgr8":
-                img = np.frombuffer(raw, dtype=np.uint8).reshape(msg.height, msg.width, 3)
-            elif msg.encoding == "rgb8":
-                img = np.frombuffer(raw, dtype=np.uint8).reshape(msg.height, msg.width, 3)
-                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-            else:
-                return
-            # Resize to 640x360 for lower latency
-            img = cv2.resize(img, (640, 360), interpolation=cv2.INTER_NEAREST)
-            _, jpeg = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 50])
-            from sensor_msgs.msg import CompressedImage
-            out = CompressedImage()
-            out.format = "jpeg"
-            out.data = bytes(jpeg)
-            self._pub.publish(out)
-        except Exception as e:
-            print(f"[CameraPlugin] _on_image error: {e}", flush=True)
+        with self._frame_lock:
+            self._latest_frame = msg
+
+    def _encode_loop(self):
+        """Separate thread: encode and publish the latest frame. Always processes newest, skips stale."""
+        np = self._np
+        cv2 = self._cv2
+        from sensor_msgs.msg import CompressedImage
+
+        while self._running:
+            # Grab latest frame atomically
+            with self._frame_lock:
+                msg = self._latest_frame
+                self._latest_frame = None  # Mark as consumed
+            if msg is None:
+                time.sleep(0.005)  # 5ms poll
+                continue
+            try:
+                raw = bytes(msg.data)
+                if msg.encoding == "rgb8":
+                    img = np.frombuffer(raw, dtype=np.uint8).reshape(msg.height, msg.width, 3)
+                    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                elif msg.encoding == "bgr8":
+                    img = np.frombuffer(raw, dtype=np.uint8).reshape(msg.height, msg.width, 3)
+                else:
+                    continue
+                _, jpeg = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 50])
+                out = CompressedImage()
+                out.format = "jpeg"
+                out.data = bytes(jpeg)
+                self._pub.publish(out)
+            except Exception as e:
+                print(f"[CameraPlugin] encode error: {e}", flush=True)
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "start":
