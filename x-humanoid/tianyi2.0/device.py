@@ -771,25 +771,78 @@ class CameraPlugin:
             print(f"[CameraPlugin] WARNING: import failed ({e})")
 
     def _ensure_orbbec_service(self):
-        """Ensure orbbec_head.service is running. Use nsenter to access host systemd."""
+        """Configure and start the host's Orbbec service through ``nsenter``.
+
+        The camera runs on the host because it owns the USB device.  Each
+        container start therefore makes the vendor startup script idempotently
+        request PointCloud2, accelerometer, and gyroscope streams before
+        ensuring the service is active.  This is deliberately runtime setup,
+        not a Docker build step: a Dockerfile cannot alter a new machine's
+        systemd service or access its camera.
+        """
         import subprocess
         try:
+            changed = self._configure_orbbec_startup()
             # Use nsenter to run systemctl on host PID 1's namespace
             result = subprocess.run(
                 ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--",
                  "systemctl", "is-active", "orbbec_head.service"],
                 capture_output=True, text=True, timeout=5)
-            if result.stdout.strip() == "active":
+            if result.stdout.strip() == "active" and not changed:
                 print("[CameraPlugin] orbbec_head.service already active")
                 return
-            # Start it
+            # Restart applies a changed host startup script; start handles an
+            # inactive service without unnecessarily interrupting a live one.
+            action = "restart" if result.stdout.strip() == "active" else "start"
             subprocess.run(
                 ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--",
-                 "systemctl", "start", "orbbec_head.service"],
-                capture_output=True, text=True, timeout=10)
-            print("[CameraPlugin] orbbec_head.service started via nsenter")
+                 "systemctl", action, "orbbec_head.service"],
+                check=True, capture_output=True, text=True, timeout=15)
+            print(f"[CameraPlugin] orbbec_head.service {action}ed via nsenter")
         except Exception as e:
             print(f"[CameraPlugin] WARNING: could not start orbbec service ({e})")
+
+    @staticmethod
+    def _configure_orbbec_startup():
+        """Enable the Orbbec streams in the host vendor startup script.
+
+        This only changes the ``headty`` launch command and is idempotent, so
+        it is safe to execute every time a freshly-created driver container
+        starts.  The host path matches Tianyi's factory service definition.
+        """
+        import subprocess
+
+        script = "/home/nvidia/data/scripts/start_orbbec_camera.sh"
+        launch = "ros2 launch orbbec_camera head_330_ty.launch.py"
+        desired = (f"{launch} enable_point_cloud:=true "
+                   "enable_accel:=true enable_gyro:=true")
+        updater = (
+            "from pathlib import Path\n"
+            f"path = Path({script!r})\n"
+            "lines = path.read_text().splitlines(keepends=True)\n"
+            f"launch = {launch!r}\n"
+            f"desired = {desired!r}\n"
+            "for index, line in enumerate(lines):\n"
+            "    if line.lstrip().startswith(launch):\n"
+            "        updated = line[:len(line) - len(line.lstrip())] + desired + '\\n'\n"
+            "        if line == updated:\n"
+            "            print('unchanged')\n"
+            "        else:\n"
+            "            lines[index] = updated\n"
+            "            path.write_text(''.join(lines))\n"
+            "            print('changed')\n"
+            "        break\n"
+            "else:\n"
+            "    raise SystemExit('headty Orbbec launch command not found')\n"
+        )
+        result = subprocess.run(
+            ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--",
+             "python3", "-c", updater],
+            check=True, capture_output=True, text=True, timeout=10)
+        changed = result.stdout.strip() == "changed"
+        if changed:
+            print("[CameraPlugin] enabled Orbbec point cloud, accel, and gyro streams")
+        return changed
 
     def stop(self):
         self._running = False
@@ -859,7 +912,7 @@ class _JsonSensor:
 
 
 class ImuPlugin(_JsonSensor):
-    """Bridge Tianyi's vendor and standard ROS IMU streams to Agent Core."""
+    """Bridge the head Orbbec camera's accelerometer and gyroscope to Agent Core."""
     def __init__(self, plugin_config, namespace, ros2):
         self._running = False
         self._topic = f"/{namespace}/state/imu"
@@ -868,8 +921,13 @@ class ImuPlugin(_JsonSensor):
             "available": False,
             "timestamp_ms": int(time.time() * 1000),
             "source": None,
+            "reason": "waiting_for_upstream_imu",
         }
         self._subscriptions = []  # Keep rclpy subscriptions alive for the plugin lifetime.
+        self._camera_acceleration = None
+        self._camera_acceleration_timestamp_ms = None
+        self._camera_angular_velocity = None
+        self._camera_angular_velocity_timestamp_ms = None
         self._sub_node = Node("tianyi2_imu_sub", context=ros2.ctx_tianyi)
         self._pub_node = Node("tianyi2_imu_pub", context=ros2.ctx_core)
         ros2.executor_tianyi.add_node(self._sub_node)
@@ -877,90 +935,102 @@ class ImuPlugin(_JsonSensor):
         self._pub = self._pub_node.create_publisher(String, self._topic, _LOW_LAT_QOS)
 
     def get_tool(self):
-        tool = self._tool("imu", "天轶2.0 IMU — 姿态、欧拉角、角速度、线加速度与错误码")
+        tool = self._tool("imu", "天轶2.0 头部 Orbbec IMU — 相机实际加速度与角速度")
         tool["multiInstance"] = False
         return tool
 
     def start(self):
-        """Subscribe to both IMU interfaces used by Tianyi deployments.
+        """Subscribe to the Orbbec streams enabled by ``orbbec_head.service``.
 
-        The body controller publishes ``bodyctrl_msgs/Imu`` on ``/imu/status``
-        on some images, while other images expose the standard
-        ``sensor_msgs/Imu`` stream on ``/imu/data``.  Sensor publishers are
-        normally BEST_EFFORT, so a reliable subscription silently receives no
-        samples.  The low-latency QoS matches either sensor stream.
+        Orbbec publishes acceleration and angular velocity separately as
+        ``sensor_msgs/Imu``.  These sensor publishers use BEST_EFFORT QoS, so
+        the domain-0 subscription must use the matching low-latency profile.
+        Only fields physically supplied by either stream are forwarded to the
+        Agent Core card; no synthetic orientation, Euler angle, or zero values
+        are emitted.
         """
-        from bodyctrl_msgs.msg import Imu
         from sensor_msgs.msg import Imu as RosImu
         self._running = True
         self._subscriptions = [
             self._sub_node.create_subscription(
-                Imu, "/imu/status", self._on_vendor_imu, _LOW_LAT_QOS),
+                RosImu, "/ob_camera_head/accel/sample", self._on_camera_accel, _LOW_LAT_QOS),
             self._sub_node.create_subscription(
-                RosImu, "/imu/data", self._on_ros_imu, _LOW_LAT_QOS),
+                RosImu, "/ob_camera_head/gyro/sample", self._on_camera_gyro, _LOW_LAT_QOS),
         ]
-        print("[ImuPlugin] subscribed: /imu/status (bodyctrl_msgs/Imu), /imu/data (sensor_msgs/Imu)")
+        # Match StatePlugin/force_sensor behaviour: publish a snapshot even
+        # while the vendor IMU stream is unavailable, so Agent Core renders a
+        # useful card state instead of an empty panel.
+        self._pub_thread = threading.Thread(target=self._publish_snapshot_loop, daemon=True)
+        self._pub_thread.start()
+        print("[ImuPlugin] subscribed: /ob_camera_head/accel/sample, /ob_camera_head/gyro/sample")
 
     def stop(self):
         self._running = False
 
-    def _publish(self, orientation, angular_velocity, linear_acceleration, euler, error=0, source=None):
-        # The dashboard only needs the latest state.  Bound forwarding to 30 Hz
+    def _publish_camera_imu(self):
+        """Publish only the samples actually received from the camera."""
+        if not self._running:
+            return
+        timestamps = [ts for ts in (
+            self._camera_acceleration_timestamp_ms,
+            self._camera_angular_velocity_timestamp_ms,
+        ) if ts is not None]
+        if not timestamps:
+            return
+        payload = {"available": True, "timestamp_ms": max(timestamps)}
+        if self._camera_acceleration is not None:
+            payload["linear_acceleration"] = self._camera_acceleration
+        if self._camera_angular_velocity is not None:
+            payload["angular_velocity"] = self._camera_angular_velocity
+        self._latest = payload
+
+        # The dashboard only needs the latest state.  Bound transport to 30 Hz
         # so a high-rate IMU cannot congest the domain-42 bridge.
         now = time.monotonic()
-        if not self._running or now - self._last_pub < 1.0 / 30.0:
+        if now - self._last_pub < 1.0 / 30.0:
             return
         self._last_pub = now
-        self._latest = {
-            "available": True,
-            "timestamp_ms": int(time.time() * 1000),
-            "source": source,
-            "orientation": orientation,
-            "euler": euler,
-            "angular_velocity": angular_velocity,
-            "linear_acceleration": linear_acceleration,
-            "error": error,
-        }
         out = String()
         out.data = json.dumps(self._latest)
         self._pub.publish(out)
 
-    def _on_vendor_imu(self, msg):
-        self._publish(
-            {"x": msg.orientation.x, "y": msg.orientation.y, "z": msg.orientation.z, "w": msg.orientation.w},
-            {"x": msg.angular_velocity.x, "y": msg.angular_velocity.y, "z": msg.angular_velocity.z},
-            {"x": msg.linear_acceleration.x, "y": msg.linear_acceleration.y, "z": msg.linear_acceleration.z},
-            {"roll": msg.euler.roll, "pitch": msg.euler.pitch, "yaw": msg.euler.yaw},
-            msg.error,
-            source="/imu/status",
-        )
+    def _publish_snapshot_loop(self):
+        while self._running:
+            snapshot = dict(self._latest)
+            snapshot["timestamp_ms"] = int(time.time() * 1000)
+            out = String()
+            out.data = json.dumps(snapshot)
+            self._pub.publish(out)
+            time.sleep(0.5)
 
-    def _on_ros_imu(self, msg):
-        q = msg.orientation
-        # Standard sensor_msgs/Imu has no Euler field; derive it from its
-        # quaternion so both source topics produce the same card payload.
-        sinr_cosp = 2.0 * (q.w * q.x + q.y * q.z)
-        cosr_cosp = 1.0 - 2.0 * (q.x * q.x + q.y * q.y)
-        sinp = 2.0 * (q.w * q.y - q.z * q.x)
-        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
-        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-        self._publish(
-            {"x": q.x, "y": q.y, "z": q.z, "w": q.w},
-            {"x": msg.angular_velocity.x, "y": msg.angular_velocity.y, "z": msg.angular_velocity.z},
-            {"x": msg.linear_acceleration.x, "y": msg.linear_acceleration.y, "z": msg.linear_acceleration.z},
-            {"roll": math.atan2(sinr_cosp, cosr_cosp),
-             "pitch": math.asin(max(-1.0, min(1.0, sinp))),
-             "yaw": math.atan2(siny_cosp, cosy_cosp)},
-            source="/imu/data",
-        )
+    def _on_camera_accel(self, msg):
+        self._camera_acceleration = {
+            "x": msg.linear_acceleration.x,
+            "y": msg.linear_acceleration.y,
+            "z": msg.linear_acceleration.z,
+        }
+        self._camera_acceleration_timestamp_ms = (
+            msg.header.stamp.sec * 1000 + msg.header.stamp.nanosec // 1_000_000)
+        self._publish_camera_imu()
+
+    def _on_camera_gyro(self, msg):
+        self._camera_angular_velocity = {
+            "x": msg.angular_velocity.x,
+            "y": msg.angular_velocity.y,
+            "z": msg.angular_velocity.z,
+        }
+        self._camera_angular_velocity_timestamp_ms = (
+            msg.header.stamp.sec * 1000 + msg.header.stamp.nanosec // 1_000_000)
+        self._publish_camera_imu()
 
     def dispatch(self, action, args):
-        if action in ("info", "read", "get", "imu"):
-            return {
-                "state": "running" if self._running else "idle",
-                "data": self._latest,
-                "topic_out": [{"topic": self._topic, "format": self._format}],
-            }
+        if action in ("read", "get", "imu"):
+            # Keep sensor values at the top level like StatePlugin's
+            # force_sensor, which Agent Core renders directly.
+            return dict(self._latest)
+        if action == "info":
+            return {"state": "running" if self._running else "idle",
+                    "topic_out": [{"topic": self._topic, "format": self._format}]}
         return {"state": "running" if self._running else "idle"}
 
 
