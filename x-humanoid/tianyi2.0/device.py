@@ -469,15 +469,11 @@ class CameraPlugin:
                 time.sleep(0.005)  # 5ms poll
                 continue
             try:
-                raw = bytes(msg.data)
+                # Zero-copy: np.frombuffer on array.array directly (no bytes() copy)
+                img = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
                 if msg.encoding == "rgb8":
-                    img = np.frombuffer(raw, dtype=np.uint8).reshape(msg.height, msg.width, 3)
                     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-                elif msg.encoding == "bgr8":
-                    img = np.frombuffer(raw, dtype=np.uint8).reshape(msg.height, msg.width, 3)
-                else:
-                    continue
-                _, jpeg = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 50])
+                _, jpeg = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 30])
                 out = CompressedImage()
                 out.format = "jpeg"
                 out.data = bytes(jpeg)
