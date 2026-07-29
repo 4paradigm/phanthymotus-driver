@@ -1019,7 +1019,7 @@ class DepthCameraPlugin:
 
 
 class PointCloudPlugin:
-    """Pack native PointCloud2, or derive XYZ from the active depth stream."""
+    """Pack Orbbec optical-frame points in Agent Core's renderer convention."""
     _format = "sensor/pointcloud"
     def __init__(self, plugin_config, namespace, ros2):
         self._running = False; self._topic = f"/{namespace}/camera/head/points"; self._last = 0.0; self._intrinsics = None
@@ -1037,6 +1037,15 @@ class PointCloudPlugin:
         self._sub_node.create_subscription(CameraInfo, "/ob_camera_head/depth/camera_info", self._on_info, _RELIABLE_QOS)
         self._sub_node.create_subscription(Image, "/ob_camera_head/depth/image_raw", self._on_depth, _LOW_LAT_QOS)
     def stop(self): self._running = False
+    @staticmethod
+    def _to_renderer_frame(x, y, z):
+        """Map optical (right, down, forward) to Agent Core's LiDAR input frame.
+
+        The dashboard renders input as (display_x, display_y, display_z) =
+        (input_y, -input_z, -input_x).  Packing (z, x, y) therefore yields
+        (x, -y, -z): right, up, forward in the dashboard's XZ ground plane.
+        """
+        return z, x, y
     def _on_cloud(self, msg):
         if not self._running or time.monotonic() - self._last < 0.5: return
         fields = {f.name: f.offset for f in msg.fields}
@@ -1045,7 +1054,10 @@ class PointCloudPlugin:
         packed = bytearray(struct.pack("<II", 12, count))
         for i in range(count):
             base = i * msg.point_step
-            packed.extend(raw[base + fields["x"]:base + fields["x"] + 4]); packed.extend(raw[base + fields["y"]:base + fields["y"] + 4]); packed.extend(raw[base + fields["z"]:base + fields["z"] + 4])
+            x = struct.unpack_from("<f", raw, base + fields["x"])[0]
+            y = struct.unpack_from("<f", raw, base + fields["y"])[0]
+            z = struct.unpack_from("<f", raw, base + fields["z"])[0]
+            packed.extend(struct.pack("<fff", *self._to_renderer_frame(x, y, z)))
         from std_msgs.msg import UInt8MultiArray
         out = UInt8MultiArray(); out.data = list(packed); self._pub.publish(out)
     def _on_info(self, msg): self._intrinsics = (msg.k[0], msg.k[4], msg.k[2], msg.k[5])
@@ -1060,7 +1072,9 @@ class PointCloudPlugin:
             for u in range(0, msg.width, step):
                 d = struct.unpack_from("<H", raw, v * msg.step + u * 2)[0]
                 if d == 0: continue
-                z = d / 1000.0; packed.extend(struct.pack("<fff", (u - cx) * z / fx, (v - cy) * z / fy, z)); count += 1
+                z = d / 1000.0
+                x, y = (u - cx) * z / fx, (v - cy) * z / fy
+                packed.extend(struct.pack("<fff", *self._to_renderer_frame(x, y, z))); count += 1
         if not count: return
         from std_msgs.msg import UInt8MultiArray
         out = UInt8MultiArray(); out.data = list(struct.pack("<II", 12, count) + packed); self._pub.publish(out)
