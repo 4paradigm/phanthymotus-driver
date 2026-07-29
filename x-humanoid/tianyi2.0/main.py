@@ -102,6 +102,18 @@ class TianyiDeviceBundle:
             self._plugins.append(StatePlugin(plugins_cfg["state"], namespace, ros2))
             print("[bundle] StatePlugin loaded")
 
+        if plugins_cfg.get("service_state", {}).get("enabled", False):
+            from device import ServiceStatePlugin
+            self._plugins.append(ServiceStatePlugin(
+                plugins_cfg["service_state"], namespace, ros2))
+            print("[bundle] ServiceStatePlugin loaded")
+
+        if plugins_cfg.get("motor_faults", {}).get("enabled", False):
+            from device import MotorFaultsPlugin
+            self._plugins.append(MotorFaultsPlugin(
+                plugins_cfg["motor_faults"], namespace, ros2))
+            print("[bundle] MotorFaultsPlugin loaded")
+
         if plugins_cfg.get("camera", {}).get("enabled", False):
             from device import CameraPlugin
             self._plugins.append(CameraPlugin(plugins_cfg["camera"], namespace, ros2))

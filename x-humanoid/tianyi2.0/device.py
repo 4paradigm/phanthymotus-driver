@@ -15,6 +15,8 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
 
 插件列表：
   StatePlugin      (sensor, multi-tool) — 关节/电池/急停/力传感器/URDF
+  ServiceStatePlugin (sensor)           — ROS2 服务节点运行状态
+  MotorFaultsPlugin (sensor)            — 电机错误码汇总
   CameraPlugin     (sensor)             — Orbbec 头部相机
   AsrPlugin        (sensor)             — 语音识别结果
   NavStatePlugin   (sensor)             — 底盘导航状态
@@ -26,6 +28,8 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   NavPlugin        (actuator)           — 底盘导航控制
   ChatPlugin       (actuator)           — 语音交互开关
 """
+
+from __future__ import annotations
 
 import json
 import math
@@ -99,6 +103,16 @@ def _deg2rad(deg: float) -> float:
 
 def _rad2deg(rad: float) -> float:
     return rad * 180.0 / math.pi
+
+
+def _stamp_to_ms(stamp) -> int | None:
+    """Convert a ROS2 builtin_interfaces/Time-like object to milliseconds."""
+    if stamp is None:
+        return None
+    try:
+        return int(stamp.sec * 1000 + stamp.nanosec / 1_000_000)
+    except (AttributeError, TypeError, ValueError):
+        return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -361,6 +375,220 @@ class StatePlugin:
             fmt = "sensor/skeleton" if tool_name == "joints" else "data/json"
             return {"state": "running", "topic_out": [{"topic": topic, "format": fmt}]}
         return {"error": f"unknown action: {action_or_tool}"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════════
+# ServiceStatePlugin (sensor)
+# ══════════════════════════════════════════════════════════════════════════════════
+
+class ServiceStatePlugin:
+    """Track the latest running/idle state for robot services or topics."""
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        configured_topics = plugin_config.get("source_topics")
+        if configured_topics is None:
+            configured_topics = [plugin_config.get("source_topic", "")]
+        self._source_topics = [
+            str(topic).strip() for topic in configured_topics
+            if str(topic).strip()
+        ]
+        self._topic = f"/{namespace}/state/service_state"
+        self._running = False
+        self._services = {}
+        self._last_update_ms = None
+        self._lock = threading.Lock()
+
+        self._sub_node = Node(
+            "tianyi2_service_state_sub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._sub_node)
+        self._pub_node = Node(
+            "tianyi2_service_state_pub", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._pub_node)
+        self._publisher = self._pub_node.create_publisher(
+            String, self._topic, _RELIABLE_QOS)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "service_state",
+            "type": "sensor",
+            "description": "天轶2.0 内部服务状态 — 按Topic汇总节点 running/idle 状态",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._topic, "format": "data/json"}],
+        }
+
+    def start(self):
+        self._running = True
+        if not self._source_topics:
+            print("[ServiceStatePlugin] source topics not configured")
+            return
+        try:
+            from bodyctrl_msgs.msg import NodeState
+            for source_topic in self._source_topics:
+                self._sub_node.create_subscription(
+                    NodeState, source_topic,
+                    lambda msg, topic=source_topic: self._on_state(msg, topic),
+                    _RELIABLE_QOS,
+                )
+        except ImportError as e:
+            print(f"[ServiceStatePlugin] WARNING: msg import failed ({e}), running in stub mode")
+
+    def stop(self):
+        self._running = False
+
+    def _on_state(self, msg, source_topic: str = ""):
+        state_code = int(msg.state)
+        state = {0: "idle", 1: "running"}.get(state_code, "unknown")
+        now_ms = int(time.time() * 1000)
+        service_key = f"{source_topic}:{msg.topic}" if source_topic else msg.topic
+        with self._lock:
+            self._services[service_key] = {
+                "topic": msg.topic,
+                "source_topic": source_topic,
+                "state": state,
+                "state_code": state_code,
+                "timestamp_ms": _stamp_to_ms(msg.header.stamp) or now_ms,
+            }
+            self._last_update_ms = now_ms
+            payload = self._build_payload_locked()
+        if self._running:
+            self._publisher.publish(String(data=json.dumps(payload)))
+
+    def _build_payload_locked(self) -> dict:
+        services = sorted(self._services.values(), key=lambda x: x["topic"])
+        return {
+            "available": self._last_update_ms is not None,
+            "timestamp_ms": int(time.time() * 1000),
+            "last_update_ms": self._last_update_ms,
+            "service_count": len(services),
+            "running_count": sum(s["state"] == "running" for s in services),
+            "idle_count": sum(s["state"] == "idle" for s in services),
+            "unknown_count": sum(s["state"] == "unknown" for s in services),
+            "services": services,
+        }
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "service_state":
+            with self._lock:
+                return self._build_payload_locked()
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {
+                "state": "running",
+                "source_topics": self._source_topics,
+                "topic_out": [{"topic": self._topic, "format": "data/json"}],
+            }
+        return None
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# MotorFaultsPlugin (sensor)
+# ═════════════════════════════════════════════════════════════════════════════════
+
+class MotorFaultsPlugin:
+    """Expose non-zero motor error codes without duplicating joint telemetry."""
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        default_topics = [
+            "/head/status", "/arm/status", "/waist/status", "/leg/status"]
+        self._source_topics = plugin_config.get(
+            "motor_status_topics", default_topics)
+        self._topic = f"/{namespace}/state/motor_faults"
+        self._running = False
+        self._faults = {}
+        self._last_update_ms = None
+        self._lock = threading.Lock()
+
+        self._sub_node = Node(
+            "tianyi2_motor_faults_sub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._sub_node)
+        self._pub_node = Node(
+            "tianyi2_motor_faults_pub", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._pub_node)
+        self._publisher = self._pub_node.create_publisher(
+            String, self._topic, _RELIABLE_QOS)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "motor_faults",
+            "type": "sensor",
+            "description": "天轶2.0 电机故障汇总 — 仅输出非零电机错误码及关节名",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._topic, "format": "data/json"}],
+        }
+
+    def start(self):
+        self._running = True
+        try:
+            from bodyctrl_msgs.msg import MotorStatusMsg
+            for source_topic in self._source_topics:
+                self._sub_node.create_subscription(
+                    MotorStatusMsg, source_topic,
+                    lambda msg, topic=source_topic: self._on_status(msg, topic),
+                    _RELIABLE_QOS,
+                )
+        except ImportError as e:
+            print(f"[MotorFaultsPlugin] WARNING: msg import failed ({e}), running in stub mode")
+
+    def stop(self):
+        self._running = False
+
+    def _on_status(self, msg, source_topic: str):
+        now_ms = int(time.time() * 1000)
+        with self._lock:
+            for motor in msg.status:
+                motor_id = int(motor.name)
+                if int(motor.error) == 0:
+                    self._faults.pop(motor_id, None)
+                    continue
+                self._faults[motor_id] = {
+                    "motor_id": motor_id,
+                    "joint_name": _ALL_JOINTS.get(
+                        motor_id, f"motor_{motor_id}"),
+                    "error_code": int(motor.error),
+                    "source_topic": source_topic,
+                    "timestamp_ms": _stamp_to_ms(msg.header.stamp) or now_ms,
+                }
+            self._last_update_ms = now_ms
+            payload = self._build_payload_locked()
+        if self._running:
+            self._publisher.publish(String(data=json.dumps(payload)))
+
+    def _build_payload_locked(self) -> dict:
+        faults = sorted(
+            self._faults.values(), key=lambda item: item["motor_id"])
+        return {
+            "available": self._last_update_ms is not None,
+            "timestamp_ms": int(time.time() * 1000),
+            "last_update_ms": self._last_update_ms,
+            "healthy": self._last_update_ms is not None and not faults,
+            "fault_count": len(faults),
+            "summary": (
+                "尚未收到电机状态数据"
+                if self._last_update_ms is None
+                else (f"检测到{len(faults)}个电机故障" if faults
+                      else "当前没有非零电机错误码")
+            ),
+            "faults": faults,
+        }
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "motor_faults":
+            with self._lock:
+                return self._build_payload_locked()
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {
+                "state": "running",
+                "source_topics": self._source_topics,
+                "topic_out": [{"topic": self._topic, "format": "data/json"}],
+            }
+        return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════

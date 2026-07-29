@@ -8,6 +8,18 @@ slamtec:
 plugins:
   state:
     enabled: true
+  service_state:
+    enabled: true
+    source_topics:
+      - "/bodycontrol_state"
+      - "/node/status"
+  motor_faults:
+    enabled: true
+    motor_status_topics:
+      - "/head/status"
+      - "/arm/status"
+      - "/waist/status"
+      - "/leg/status"
   camera:
     enabled: true
   asr:
