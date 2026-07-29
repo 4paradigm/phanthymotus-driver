@@ -54,6 +54,7 @@ from __future__ import annotations
 import json
 import math
 import subprocess
+import struct
 import threading
 import time
 from pathlib import Path
@@ -4924,5 +4925,4 @@ class ChassisRawPlugin:
     @staticmethod
     def _clamp(value: float, low: float, high: float) -> float:
         return max(low, min(high, value))
-
 
