@@ -1082,21 +1082,21 @@ class DepthCameraPlugin:
         from sensor_msgs.msg import Image
         self._running = True; self._pub = self._pub_node.create_publisher(Image, self._topic, _LOW_LAT_QOS)
         self._sub_node.create_subscription(Image, "/ob_camera_head/depth/image_raw", self._on_image, _LOW_LAT_QOS)
-        self._publish_thread = threading.Thread(target=self._publish_loop, daemon=True)
-        self._publish_thread.start()
+        # Publish from the domain-42 executor itself.  A timer is safer than a
+        # free-running Python thread for rclpy publishers and bounds latency to
+        # one tick while retaining only the newest camera frame.
+        self._pub_node.create_timer(1.0 / 15.0, self._publish_latest)
     def stop(self): self._running = False
     def _on_image(self, msg):
         if not self._running or msg.encoding not in ("16UC1", "mono16"): return
         # The ROS callback must never queue stale depth frames behind a slow
         # domain-42 publisher.  Retain one newest frame, like CameraPlugin.
         with self._frame_lock: self._latest_frame = msg
-    def _publish_loop(self):
-        while self._running:
-            with self._frame_lock:
-                msg, self._latest_frame = self._latest_frame, None
-            if msg is None:
-                time.sleep(0.005); continue
-            self._pub.publish(msg)
+    def _publish_latest(self):
+        if not self._running: return
+        with self._frame_lock:
+            msg, self._latest_frame = self._latest_frame, None
+        if msg is not None: self._pub.publish(msg)
     def dispatch(self, action, args):
         return {"state": "running" if self._running else "idle", "topic_out": [{"topic": self._topic, "format": "image/depth-z16"}]}
 
