@@ -416,28 +416,22 @@ class CameraPlugin:
             print(f"[CameraPlugin] WARNING: import failed ({e})")
 
     def _ensure_orbbec_service(self):
-        """Try to start orbbec_head.service on Orin via SSH."""
+        """Ensure orbbec_head.service is running. Container runs privileged+host, can control systemd directly."""
         import subprocess
-        orin_ip = "192.168.41.2"
         try:
             result = subprocess.run(
-                ["ssh", "-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no",
-                 "-o", "BatchMode=yes", f"nvidia@{orin_ip}",
-                 "systemctl is-active orbbec_head.service"],
-                capture_output=True, text=True, timeout=5)
+                ["systemctl", "is-active", "orbbec_head.service"],
+                capture_output=True, text=True, timeout=3)
             if result.stdout.strip() == "active":
                 print("[CameraPlugin] orbbec_head.service already active")
                 return
-            # Try to start it
+            # Start it
             subprocess.run(
-                ["ssh", "-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no",
-                 "-o", "BatchMode=yes", f"nvidia@{orin_ip}",
-                 "sudo systemctl start orbbec_head.service"],
+                ["systemctl", "start", "orbbec_head.service"],
                 capture_output=True, text=True, timeout=10)
-            print("[CameraPlugin] orbbec_head.service started on Orin")
+            print("[CameraPlugin] orbbec_head.service started")
         except Exception as e:
-            print(f"[CameraPlugin] WARNING: could not start orbbec service ({e}), "
-                  f"ensure 'sudo systemctl enable orbbec_head.service' on Orin")
+            print(f"[CameraPlugin] WARNING: could not start orbbec service ({e})")
 
     def stop(self):
         self._running = False
