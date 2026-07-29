@@ -27,6 +27,11 @@ RUN cd /tianyi_ws && \
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ENV PYTHONUNBUFFERED=1
 
+# Ensure tianyi msg packages are on PYTHONPATH (base image entrypoint won't source them)
+ENV PYTHONPATH=/tianyi_ws/install/lyre_msgs/local/lib/python3.10/dist-packages:/tianyi_ws/install/bodyctrl_msgs/local/lib/python3.10/dist-packages:${PYTHONPATH}
+ENV AMENT_PREFIX_PATH=/tianyi_ws/install/bodyctrl_msgs:/tianyi_ws/install/lyre_msgs:${AMENT_PREFIX_PATH}
+ENV LD_LIBRARY_PATH=/tianyi_ws/install/bodyctrl_msgs/lib:/tianyi_ws/install/lyre_msgs/lib:${LD_LIBRARY_PATH}
+
 COPY resource/ /work/resource/
 COPY main.py device.py nav_client.py config.yaml driver.yaml /work/
 
