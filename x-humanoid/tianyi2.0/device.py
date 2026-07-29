@@ -740,7 +740,9 @@ class DepthCameraPlugin:
                                 history=HistoryPolicy.KEEP_LAST, depth=1,
                                 durability=DurabilityPolicy.VOLATILE)
         self._running = True; self._pub = self._pub_node.create_publisher(Image, self._topic, latest_qos)
-        self._sub_node.create_subscription(Image, "/ob_camera_head/depth/image_raw", self._on_image, latest_qos)
+        # The Orbbec depth publisher is RELIABLE; request the same policy at
+        # ingress, then use depth-one BEST_EFFORT only for the outbound bridge.
+        self._sub_node.create_subscription(Image, "/ob_camera_head/depth/image_raw", self._on_image, _RELIABLE_QOS)
     def stop(self): self._running = False
     def _on_image(self, msg):
         if not self._running or msg.encoding not in ("16UC1", "mono16"): return
