@@ -1580,7 +1580,7 @@ class ArmPlugin:
 # ══════════════════════════════════════════════════════════════════════════
 
 class WaistPlugin:
-    """腰部2DOF控制 (yaw/pitch)"""
+    """腰部2DOF位置控制；set_zero 等价于回到零位。"""
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._ns = namespace
@@ -1593,19 +1593,22 @@ class WaistPlugin:
         return {
             "name": "waist",
             "type": "actuator",
-            "description": "天轶2.0 腰部控制 — 2DOF (yaw±160°, pitch -45°~120°)",
+            "description": "天轶2.0 腰部控制 — 2DOF位置控制及归零",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["move_pos"],
+                    "action": {"type": "string", "enum": ["move_pos", "set_zero"],
                                "description": "控制动作"},
                     "yaw": {"type": "number", "description": "偏航角(度), 范围[-160, 180]"},
                     "pitch": {"type": "number", "description": "俯仰角(度), 范围[-45, 120]"},
+                    "speed": {"type": "number", "description": "运动速度(rad/s), 默认0.5"},
+                    "current": {"type": "number", "description": "最大电流(A), 默认10.0"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "move_pos": {"params": ["yaw", "pitch"],
+                    "move_pos": {"params": ["yaw", "pitch", "speed", "current"],
                                  "description": "移动腰部到指定角度"},
+                    "set_zero": {"params": [], "description": "回到 yaw=0、pitch=0"},
                 },
             },
         }
@@ -1626,30 +1629,37 @@ class WaistPlugin:
         if action == "move_pos":
             yaw = args.get("yaw", 0)
             pitch = args.get("pitch", 0)
-            return self._send_pos(yaw, pitch)
+            return self._send_pos(yaw, pitch, args.get("speed", 0.5), args.get("current", 10.0))
+        elif action == "set_zero":
+            return self._send_pos(0, 0)
         elif action in ("start", "info"):
             return {"state": "ready"}
         elif action == "stop":
             return {"state": "idle"}
         return {"error": f"unknown action: {action}"}
 
-    def _send_pos(self, yaw_deg: float, pitch_deg: float) -> dict:
+    def _send_pos(self, yaw_deg: float, pitch_deg: float, speed_rad_s: float = 0.5, current_a: float = 10.0) -> dict:
         if not self._publisher:
             return {"error": "publisher not initialized"}
         try:
             from bodyctrl_msgs.msg import CmdSetMotorPosition, SetMotorPosition
             msg = CmdSetMotorPosition()
             cmds = []
+            limits = {31: (-160.0, 180.0), 32: (-45.0, 120.0)}
             for motor_id, deg in [(31, yaw_deg), (32, pitch_deg)]:
+                lower, upper = limits[motor_id]
+                if not lower <= deg <= upper:
+                    return {"error": f"waist joint {motor_id} angle out of range [{lower}, {upper}]"}
                 cmd = SetMotorPosition()
                 cmd.name = motor_id
                 cmd.pos = _deg2rad(deg)
-                cmd.spd = 0.5  # rad/s
-                cmd.cur = 10.0  # A
+                cmd.spd = max(0.0, speed_rad_s)
+                cmd.cur = max(0.0, current_a)
                 cmds.append(cmd)
             msg.cmds = cmds
             self._publisher.publish(msg)
-            return {"state": "moving", "yaw": yaw_deg, "pitch": pitch_deg}
+            return {"state": "moving", "yaw": yaw_deg, "pitch": pitch_deg,
+                    "speed_rad_s": max(0.0, speed_rad_s), "current_a": max(0.0, current_a)}
         except Exception as e:
             return {"error": str(e)}
 
