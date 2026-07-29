@@ -416,20 +416,23 @@ class CameraPlugin:
             print(f"[CameraPlugin] WARNING: import failed ({e})")
 
     def _ensure_orbbec_service(self):
-        """Ensure orbbec_head.service is running. Container runs privileged+host, can control systemd directly."""
+        """Ensure orbbec_head.service is running. Use nsenter to access host systemd."""
         import subprocess
         try:
+            # Use nsenter to run systemctl on host PID 1's namespace
             result = subprocess.run(
-                ["systemctl", "is-active", "orbbec_head.service"],
-                capture_output=True, text=True, timeout=3)
+                ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--",
+                 "systemctl", "is-active", "orbbec_head.service"],
+                capture_output=True, text=True, timeout=5)
             if result.stdout.strip() == "active":
                 print("[CameraPlugin] orbbec_head.service already active")
                 return
             # Start it
             subprocess.run(
-                ["systemctl", "start", "orbbec_head.service"],
+                ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--",
+                 "systemctl", "start", "orbbec_head.service"],
                 capture_output=True, text=True, timeout=10)
-            print("[CameraPlugin] orbbec_head.service started")
+            print("[CameraPlugin] orbbec_head.service started via nsenter")
         except Exception as e:
             print(f"[CameraPlugin] WARNING: could not start orbbec service ({e})")
 
@@ -443,10 +446,11 @@ class CameraPlugin:
             # Convert ROS Image to numpy
             np = self._np
             cv2 = self._cv2
+            raw = bytes(msg.data)  # msg.data is array.array, convert to bytes
             if msg.encoding == "bgr8":
-                img = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
+                img = np.frombuffer(raw, dtype=np.uint8).reshape(msg.height, msg.width, 3)
             elif msg.encoding == "rgb8":
-                img = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
+                img = np.frombuffer(raw, dtype=np.uint8).reshape(msg.height, msg.width, 3)
                 img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
             else:
                 return
@@ -454,10 +458,10 @@ class CameraPlugin:
             _, jpeg = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 70])
             from std_msgs.msg import UInt8MultiArray
             out = UInt8MultiArray()
-            out.data = jpeg.tobytes()
+            out.data = list(jpeg.tobytes())
             self._pub.publish(out)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[CameraPlugin] _on_image error: {e}", flush=True)
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "start":
