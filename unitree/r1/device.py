@@ -238,7 +238,7 @@ APP_NAME = "r1_speaker"
 
 
 class _SpeakerNode(Node):
-    PREFILL = 5       # buffer 5 chunks (~160ms) before starting playback
+    PREFILL = 3       # buffer 3 chunks (~300ms) before starting playback
     MERGE_BYTES = 9600  # merge into ~300ms blocks before calling PlayStream
 
     def __init__(self, audio_client: AudioClient):

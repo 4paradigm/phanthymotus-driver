@@ -241,8 +241,8 @@ APP_NAME = "g1_speaker"
 
 
 class _SpeakerNode(Node):
-    PREFILL = 5       # buffer 5 chunks (~160ms) before starting playback
-    MERGE_BYTES = 9600  # merge into ~300ms blocks before calling PlayStream
+    PREFILL = 1       # start playback immediately after first chunk
+    MERGE_BYTES = 6400  # merge into ~200ms blocks before calling PlayStream
 
     def __init__(self, audio_client: AudioClient):
         super().__init__("g1_speaker")
