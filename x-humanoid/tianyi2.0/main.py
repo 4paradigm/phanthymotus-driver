@@ -107,10 +107,10 @@ class TianyiDeviceBundle:
             self._plugins.append(CameraPlugin(plugins_cfg["camera"], namespace, ros2))
             print("[bundle] CameraPlugin loaded")
 
-        if plugins_cfg.get("asr", {}).get("enabled", False):
-            from device import AsrPlugin
-            self._plugins.append(AsrPlugin(plugins_cfg["asr"], namespace, ros2))
-            print("[bundle] AsrPlugin loaded")
+        if plugins_cfg.get("voice", {}).get("enabled", False):
+            from device import VoiceStatePlugin
+            self._plugins.append(VoiceStatePlugin(plugins_cfg["voice"], namespace, ros2))
+            print("[bundle] VoiceStatePlugin loaded")
 
         if plugins_cfg.get("nav_state", {}).get("enabled", False):
             from device import NavStatePlugin
@@ -143,20 +143,20 @@ class TianyiDeviceBundle:
             self._plugins.append(HandPlugin(plugins_cfg["hand"], namespace, ros2))
             print("[bundle] HandPlugin loaded")
 
-        if plugins_cfg.get("tts", {}).get("enabled", False):
-            from device import TtsPlugin
-            self._plugins.append(TtsPlugin(plugins_cfg["tts"], namespace, ros2))
-            print("[bundle] TtsPlugin loaded")
+        if plugins_cfg.get("voice_play", {}).get("enabled", False):
+            from device import VoicePlayActuatorPlugin
+            self._plugins.append(VoicePlayActuatorPlugin(plugins_cfg["voice_play"], namespace, ros2))
+            print("[bundle] VoicePlayActuatorPlugin loaded")
 
         if plugins_cfg.get("nav", {}).get("enabled", False):
             from device import NavPlugin
             self._plugins.append(NavPlugin(plugins_cfg["nav"], namespace, ros2, slamtec_client))
             print("[bundle] NavPlugin loaded")
 
-        if plugins_cfg.get("chat", {}).get("enabled", False):
-            from device import ChatPlugin
-            self._plugins.append(ChatPlugin(plugins_cfg["chat"], namespace, ros2))
-            print("[bundle] ChatPlugin loaded")
+        if plugins_cfg.get("voice_chat", {}).get("enabled", False):
+            from device import VoiceChatActuatorPlugin
+            self._plugins.append(VoiceChatActuatorPlugin(plugins_cfg["voice_chat"], namespace, ros2))
+            print("[bundle] VoiceChatActuatorPlugin loaded")
 
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):

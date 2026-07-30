@@ -10,7 +10,7 @@ plugins:
     enabled: true
   camera:
     enabled: true
-  asr:
+  voice:
     enabled: true
   nav_state:
     enabled: true
@@ -24,9 +24,9 @@ plugins:
     enabled: true
   hand:
     enabled: true
-  tts:
+  voice_play:
     enabled: true
   nav:
     enabled: true
-  chat:
+  voice_chat:
     enabled: true

@@ -16,16 +16,16 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
 插件列表：
   StatePlugin      (sensor, multi-tool) — 关节/电池/急停/力传感器/URDF
   CameraPlugin     (sensor)             — Orbbec 头部相机
-  AsrPlugin        (sensor)             — 语音识别结果
+  VoiceStatePlugin (sensor)             — 语音交互状态 (ASR/Play/Chat 聚合)
   NavStatePlugin   (sensor)             — 底盘导航状态
   HeadPlugin       (actuator)           — 头部3DOF控制
   HeadGesturePlugin (actuator)          — 点头/摇头/左右观察等语义动作
   ArmPlugin        (actuator)           — 双臂14DOF控制
   WaistPlugin      (actuator)           — 腰部2DOF控制
   HandPlugin       (actuator)           — 灵巧手控制
-  TtsPlugin        (actuator)           — 语音合成
+  VoicePlayActuatorPlugin (actuator)    — 音频播放控制 (play_file/play_url/play_text/stop/pause/resume)
   NavPlugin        (actuator)           — 底盘导航控制
-  ChatPlugin       (actuator)           — 语音交互开关
+  VoiceChatActuatorPlugin (actuator)    — 语音对话开关 (enable/disable)
 """
 
 from __future__ import annotations
@@ -560,30 +560,51 @@ class CameraPlugin:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# AsrPlugin (sensor)
+# VoicePlugin (sensor) — 卡名: voice
 # ══════════════════════════════════════════════════════════════════════════════
 
-class AsrPlugin:
-    """语音识别结果 (lyre ASR)"""
+class VoiceStatePlugin:
+    """语音交互状态 (lyre ASR + Play + Chat)
+
+    聚合 6 路 topic 的最新字段,10Hz 周期发布到 /{ns}/state/voice (domain 42):
+      /audio_asr/keyword   → AsrKeyword  (keyword, angle)
+      /audio_asr/iat       → AsrIat      (id, text)
+      /audio_asr/event     → AsrEvent   (event, arg1)
+      /audio_play/event    → PlayEvent   (sid, seq, event, message)
+      /audio_play/progress → PlayProgress (sid, seq, position, duration)
+      /audio_chat/enable   → Bool        (data)
+    事件驱动 topic 空闲时无数据,producer 在无任何数据时返回 None(不发布)。
+    """
+
+    HZ = 10.0
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._ns = namespace
         self._ros2 = ros2
-        self._topic = f"/{namespace}/asr/text"
+        self._topic = f"/{namespace}/state/voice"
         self._running = False
+        self._lock = threading.Lock()
+        self._latest = {
+            "keyword": None,    # AsrKeyword
+            "iat": None,        # AsrIat
+            "event": None,      # AsrEvent
+            "play_event": None,     # PlayEvent
+            "play_progress": None,  # PlayProgress
+            "chat_enable": None,    # Bool
+        }
 
-        self._sub_node = Node("tianyi2_asr_sub", context=ros2.ctx_tianyi)
+        self._sub_node = Node("tianyi2_voice_sub", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._sub_node)
 
-        self._pub_node = Node("tianyi2_asr_pub", context=ros2.ctx_core)
+        self._pub_node = Node("tianyi2_voice_pub", context=ros2.ctx_core)
         ros2.executor_core.add_node(self._pub_node)
-        self._pub = self._pub_node.create_publisher(String, self._topic, _RELIABLE_QOS)
+        self._pub = self._pub_node.create_publisher(String, self._topic, _LOW_LAT_QOS)
 
     def get_tool(self) -> dict:
         return {
-            "name": "asr",
+            "name": "voice",
             "type": "sensor",
-            "description": "天轶2.0 语音识别 (lyre ASR) — 实时语音转文字",
+            "description": "天轶2.0 Pro 语音交互状态(lyre包),唤醒/识别/事件+播放事件/进度+对话开关。",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._topic, "format": "data/json"}],
         }
@@ -591,36 +612,123 @@ class AsrPlugin:
     def start(self):
         self._running = True
         try:
-            from lyre_msgs.msg import AsrIat
+            from lyre_msgs.msg import (
+                AsrKeyword, AsrIat, AsrEvent, PlayEvent, PlayProgress)
             self._sub_node.create_subscription(
-                AsrIat, "/audio_asr/iat", self._on_asr, _RELIABLE_QOS)
-            print("[AsrPlugin] subscription created")
-        except ImportError:
-            # Fallback: subscribe as String
+                AsrKeyword, "/audio_asr/keyword", self._on_keyword, _RELIABLE_QOS)
             self._sub_node.create_subscription(
-                String, "/audio_asr/iat", self._on_asr_string, _RELIABLE_QOS)
-            print("[AsrPlugin] fallback to String subscription")
+                AsrIat, "/audio_asr/iat", self._on_iat, _RELIABLE_QOS)
+            self._sub_node.create_subscription(
+                AsrEvent, "/audio_asr/event", self._on_asr_event, _RELIABLE_QOS)
+            self._sub_node.create_subscription(
+                PlayEvent, "/audio_play/event", self._on_play_event, _RELIABLE_QOS)
+            self._sub_node.create_subscription(
+                PlayProgress, "/audio_play/progress", self._on_play_progress, _RELIABLE_QOS)
+            self._sub_node.create_subscription(
+                Bool, "/audio_chat/enable", self._on_chat_enable, _RELIABLE_QOS)
+            print("[VoiceStatePlugin] subscriptions created (lyre_msgs)")
+        except ImportError as e:
+            print(f"[VoiceStatePlugin] WARNING: lyre_msgs import failed ({e}), voice card offline")
+
+        # 周期发布聚合 state
+        self._pub_thread = threading.Thread(target=self._publish_loop, daemon=True)
+        self._pub_thread.start()
 
     def stop(self):
         self._running = False
 
-    def _on_asr(self, msg):
-        if not self._running:
-            return
-        out = String()
-        out.data = json.dumps({"id": msg.id, "text": msg.text})
-        self._pub.publish(out)
+    # ── topic 回调(只更新缓存,不直接发布) ──────────────────────────────
+    def _on_keyword(self, msg):
+        with self._lock:
+            self._latest["keyword"] = {
+                "keyword": str(getattr(msg, "keyword", "")),
+                "angle": float(getattr(msg, "angle", 0.0)),
+            }
 
-    def _on_asr_string(self, msg):
-        if not self._running:
-            return
-        self._pub.publish(msg)
+    def _on_iat(self, msg):
+        with self._lock:
+            self._latest["iat"] = {
+                "id": str(getattr(msg, "id", "")),
+                "text": str(getattr(msg, "text", "")),
+            }
+
+    def _on_asr_event(self, msg):
+        with self._lock:
+            self._latest["event"] = {
+                "event": int(getattr(msg, "event", 0)),
+                "arg1": int(getattr(msg, "arg1", 0)),
+            }
+
+    def _on_play_event(self, msg):
+        with self._lock:
+            self._latest["play_event"] = {
+                "sid": str(getattr(msg, "sid", "")),
+                "seq": int(getattr(msg, "seq", 0)),
+                "event": int(getattr(msg, "event", -1)),
+                "message": str(getattr(msg, "message", "")),
+            }
+
+    def _on_play_progress(self, msg):
+        with self._lock:
+            self._latest["play_progress"] = {
+                "sid": str(getattr(msg, "sid", "")),
+                "seq": int(getattr(msg, "seq", 0)),
+                "position": float(getattr(msg, "position", 0.0)),
+                "duration": float(getattr(msg, "duration", 0.0)),
+            }
+
+    def _on_chat_enable(self, msg):
+        with self._lock:
+            self._latest["chat_enable"] = {"enable": bool(getattr(msg, "data", False))}
+
+    # ── 10Hz 周期发布 ────────────────────────────────────────────────────
+    def _publish_loop(self):
+        while self._running:
+            time.sleep(1.0 / self.HZ)
+            with self._lock:
+                snapshot = {
+                    "keyword": self._latest["keyword"],
+                    "iat": self._latest["iat"],
+                    "event": self._latest["event"],
+                    "play_event": self._latest["play_event"],
+                    "play_progress": self._latest["play_progress"],
+                    "chat_enable": self._latest["chat_enable"],
+                }
+            # 全 None 时不发布(空闲态)
+            if not any(v is not None for v in snapshot.values()):
+                continue
+            payload = {
+                "asr": {
+                    "keyword": snapshot["keyword"]["keyword"] if snapshot["keyword"] else "",
+                    "angle": snapshot["keyword"]["angle"] if snapshot["keyword"] else 0,
+                    "iat_id": snapshot["iat"]["id"] if snapshot["iat"] else "",
+                    "iat_text": snapshot["iat"]["text"] if snapshot["iat"] else "",
+                    "event": snapshot["event"]["event"] if snapshot["event"] else -1,
+                    "event_arg1": snapshot["event"]["arg1"] if snapshot["event"] else 0,
+                },
+                "play": {
+                    "sid": (snapshot["play_event"] or {}).get("sid", "") or (snapshot["play_progress"] or {}).get("sid", ""),
+                    "seq": (snapshot["play_event"] or {}).get("seq", 0),
+                    "event": (snapshot["play_event"] or {}).get("event", -1),
+                    "message": (snapshot["play_event"] or {}).get("message", ""),
+                    "position": (snapshot["play_progress"] or {}).get("position", 0.0),
+                    "duration": (snapshot["play_progress"] or {}).get("duration", 0.0),
+                },
+                "chat_enable": (snapshot["chat_enable"] or {}).get("enable", False),
+                "timestamp_ms": int(time.time() * 1000),
+                "control_level": "ANY",
+            }
+            out = String()
+            out.data = json.dumps(payload, ensure_ascii=False)
+            self._pub.publish(out)
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action in ("start", "stop", "info"):
-            return {"state": "running" if self._running else "idle",
-                    "topic_out": [{"topic": self._topic, "format": "data/json"}]}
-        return {"state": "running"}
+            return {
+                "state": "running" if self._running else "idle",
+                "topic_out": [{"topic": self._topic, "format": "data/json"}],
+            }
+        return {"state": "running" if self._running else "idle"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1527,100 +1635,141 @@ class HandPlugin:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TtsPlugin (actuator)
+# VoicePlayActuatorPlugin (actuator) — 卡名: voice_play
 # ══════════════════════════════════════════════════════════════════════════════
 
-class TtsPlugin:
-    """语音合成 (lyre TTS)"""
+class VoicePlayActuatorPlugin:
+    """音频播放控制 (lyre_msgs service) — 卡名: voice_play
+
+    Actions:
+      play_file  → /audio_play/play_file  (PlayFile)
+      play_url   → /audio_play/play_url   (PlayUrl)
+      play_text  → /audio_play/play_text  (PlayText)
+      stop       → /audio_play/stop       (PlayStop)
+      pause      → /audio_play/pause      (PlayPause)
+      resume     → /audio_play/resume     (PlayResume)
+    """
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._ns = namespace
         self._ros2 = ros2
-        self._srv_node = Node("tianyi2_tts", context=ros2.ctx_tianyi)
+        self._srv_node = Node("tianyi2_voice_play", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._srv_node)
-        self._play_client = None
-        self._stop_client = None
-        self._pause_client = None
-        self._resume_client = None
+        self._clients = {}
+        self._types = {}
 
     def get_tool(self) -> dict:
         return {
-            "name": "tts",
+            "name": "voice_play",
             "type": "actuator",
-            "description": "天轶2.0 语音合成 (TTS) — 文字转语音播放",
+            "description": "天轶2.0 Pro 音频播放控制(本地文件/URL/TTS/停止/暂停/恢复),HIGHLEVEL,lyre_msgs service。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["speak", "stop", "pause", "resume"],
-                               "description": "控制动作"},
-                    "text": {"type": "string", "description": "要播放的文本"},
-                    "force": {"type": "boolean", "description": "是否强制播放(打断当前播放)", "default": False},
+                    "action": {
+                        "type": "string",
+                        "enum": ["play_file", "play_url", "play_text", "stop", "pause", "resume"],
+                        "description": "控制模式",
+                    },
+                    "path": {"type": "string", "description": "本地音频文件绝对路径(play_file)"},
+                    "url":  {"type": "string", "description": "远程音频文件URL(play_url)"},
+                    "text": {"type": "string", "description": "TTS文本(play_text)"},
+                    "sid":  {"type": "string", "description": "流标识符(可选,唯一标识音频流)"},
+                    "force": {"type": "boolean", "description": "强制播放(停止当前任务立即播放,可选)"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "speak": {"params": ["text", "force"], "description": "合成并播放文本"},
-                    "stop": {"params": [], "description": "停止播放"},
-                    "pause": {"params": [], "description": "暂停播放"},
-                    "resume": {"params": [], "description": "恢复播放"},
+                    "play_file": {"params": ["path", "sid", "force"], "description": "播放本地音频文件"},
+                    "play_url":  {"params": ["url", "sid", "force"],  "description": "播放远程URL音频"},
+                    "play_text": {"params": ["text", "sid", "force"], "description": "TTS合成并播放文本"},
+                    "stop":      {"params": [],                       "description": "停止播放(不可恢复)"},
+                    "pause":     {"params": [],                       "description": "暂停播放(可恢复)"},
+                    "resume":    {"params": [],                       "description": "恢复暂停的播放"},
                 },
             },
         }
 
     def start(self):
         try:
-            from lyre_msgs.srv import PlayText, PlayStop, PlayPause, PlayResume
-            self._play_client = self._srv_node.create_client(PlayText, "/audio_play/play_text")
-            self._stop_client = self._srv_node.create_client(PlayStop, "/audio_play/stop")
-            self._pause_client = self._srv_node.create_client(PlayPause, "/audio_play/pause")
-            self._resume_client = self._srv_node.create_client(PlayResume, "/audio_play/resume")
-            print("[TtsPlugin] service clients created")
+            from lyre_msgs.srv import PlayFile, PlayUrl, PlayText, PlayStop, PlayPause, PlayResume
+            self._types = {
+                "play_file": ("/audio_play/play_file", PlayFile),
+                "play_url":  ("/audio_play/play_url",  PlayUrl),
+                "play_text": ("/audio_play/play_text", PlayText),
+                "stop":      ("/audio_play/stop",      PlayStop),
+                "pause":     ("/audio_play/pause",     PlayPause),
+                "resume":    ("/audio_play/resume",   PlayResume),
+            }
+            for key, (svc_name, _svc_type) in self._types.items():
+                self._clients[key] = self._srv_node.create_client(self._types[key][1], svc_name)
+            print(f"[VoicePlayActuatorPlugin] {len(self._clients)} service clients created")
         except ImportError as e:
-            print(f"[TtsPlugin] WARNING: msg import failed ({e})")
+            print(f"[VoicePlayActuatorPlugin] WARNING: lyre_msgs.srv import failed ({e})")
 
     def stop(self):
         pass
 
     def dispatch(self, action: str, args: dict) -> dict:
-        if action == "speak":
-            text = args.get("text", "")
-            force = args.get("force", False)
-            if not text:
-                return {"error": "text is required"}
-            return self._speak(text, force)
-        elif action == "stop":
-            return self._call_empty_service(self._stop_client, "stop")
-        elif action == "pause":
-            return self._call_empty_service(self._pause_client, "pause")
-        elif action == "resume":
-            return self._call_empty_service(self._resume_client, "resume")
-        elif action in ("start", "info"):
-            return {"state": "ready"}
-        return {"error": f"unknown action: {action}"}
+        if action in ("start", "info"):
+            return {"state": "ready", "control_level": "HIGHLEVEL"}
+        if action not in self._types:
+            return {"ok": False, "code": "INVALID_ARGUMENT",
+                    "message": f"unknown action: {action}"}
+        client = self._clients.get(action)
+        if client is None:
+            return {"ok": False, "code": "PRECONDITION_FAILED",
+                    "message": f"{action} service client not initialized"}
 
-    def _speak(self, text: str, force: bool) -> dict:
-        if not self._play_client:
-            return {"error": "service client not initialized"}
-        try:
-            from lyre_msgs.srv import PlayText
-            req = PlayText.Request()
-            req.text = text
-            req.force = force
+        _, svc_type = self._types[action]
+        req = svc_type.Request()
+        sid = str(args.get("sid", ""))
+        force = bool(args.get("force", False))
+        if hasattr(req, "sid"):
+            req.sid = sid
+        if hasattr(req, "seq"):
+            req.seq = 0
+        if hasattr(req, "last"):
             req.last = True
-            future = self._play_client.call_async(req)
-            # Non-blocking, just return immediately
-            return {"state": "speaking", "text": text[:50]}
-        except Exception as e:
-            return {"error": str(e)}
+        if hasattr(req, "force"):
+            req.force = force
+        if action == "play_file":
+            path = str(args.get("path", ""))
+            if not path:
+                return {"ok": False, "code": "INVALID_ARGUMENT", "message": "path is required"}
+            req.path = path
+        elif action == "play_url":
+            url = str(args.get("url", ""))
+            if not url:
+                return {"ok": False, "code": "INVALID_ARGUMENT", "message": "url is required"}
+            req.url = url
+        elif action == "play_text":
+            text = str(args.get("text", ""))
+            if not text:
+                return {"ok": False, "code": "INVALID_ARGUMENT", "message": "text is required"}
+            req.text = text
+        # stop/pause/resume 无额外字段
 
-    def _call_empty_service(self, client, action_name: str) -> dict:
-        if not client:
-            return {"error": f"{action_name} service client not initialized"}
         try:
-            req = type(client.srv_type.Request)()
-            client.call_async(req)
-            return {"state": action_name}
+            future = client.call_async(req)
+            # 等待 service 完成(5s 超时)
+            rclpy.spin_until_future_complete(self._srv_node, future, timeout_sec=5.0)
+            result = future.result()
+            if result is None:
+                return {"ok": False, "code": "CALL_TIMEOUT",
+                        "message": f"{action} service call timeout"}
+            code = int(getattr(result, "code", 0))
+            return {
+                "ok": code == 0,
+                "code": code,
+                "message": str(getattr(result, "message", "")),
+                "sid": str(getattr(result, "sid", "")) or sid,
+                "action": action,
+                "control_level": "HIGHLEVEL",
+                "timestamp_ms": int(time.time() * 1000),
+            }
         except Exception as e:
-            return {"error": str(e)}
+            return {"ok": False, "code": "COMMUNICATION_ERROR",
+                    "message": str(e), "action": action}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1745,55 +1894,65 @@ class NavPlugin:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ChatPlugin (actuator)
+# VoiceChatActuatorPlugin (actuator) — 卡名: voice_chat
 # ══════════════════════════════════════════════════════════════════════════════
 
-class ChatPlugin:
-    """语音交互开关"""
+class VoiceChatActuatorPlugin:
+    """语音对话开关 (/audio_chat/enable std_msgs/Bool)"""
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._ns = namespace
         self._ros2 = ros2
-        self._pub_node = Node("tianyi2_chat_pub", context=ros2.ctx_tianyi)
+        self._pub_node = Node("tianyi2_voice_chat_pub", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._pub_node)
         self._publisher = None
 
     def get_tool(self) -> dict:
         return {
-            "name": "chat",
+            "name": "voice_chat",
             "type": "actuator",
-            "description": "天轶2.0 语音交互模式 — 开启/关闭内置语音对话功能",
+            "description": "天轶2.0 Pro 语音对话开关(enable/disable),HIGHLEVEL,topic /audio_chat/enable std_msgs/Bool。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": ["enable", "disable"],
-                               "description": "开启或关闭"},
+                               "description": "开启/关闭语音对话"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "enable": {"params": [], "description": "开启语音交互"},
-                    "disable": {"params": [], "description": "关闭语音交互"},
+                    "enable":  {"params": [], "description": "开启语音对话"},
+                    "disable": {"params": [], "description": "关闭语音对话"},
                 },
             },
         }
 
     def start(self):
         self._publisher = self._pub_node.create_publisher(Bool, "/audio_chat/enable", _RELIABLE_QOS)
-        print("[ChatPlugin] publisher created")
+        print("[VoiceChatActuatorPlugin] publisher created")
 
     def stop(self):
         pass
 
     def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "info"):
+            return {"state": "ready", "control_level": "HIGHLEVEL"}
         if action in ("enable", "disable"):
-            if self._publisher:
-                msg = Bool()
-                msg.data = (action == "enable")
-                self._publisher.publish(msg)
-                return {"state": action + "d"}
-            return {"error": "publisher not initialized"}
-        elif action in ("start", "info"):
-            return {"state": "ready"}
-        elif action == "stop":
+            if not self._publisher:
+                return {"ok": False, "code": "PRECONDITION_FAILED",
+                        "message": "publisher not initialized"}
+            msg = Bool()
+            msg.data = (action == "enable")
+            self._publisher.publish(msg)
+            return {
+                "ok": True,
+                "code": 0,
+                "message": "",
+                "action": action,
+                "value": msg.data,
+                "control_level": "HIGHLEVEL",
+                "timestamp_ms": int(time.time() * 1000),
+            }
+        if action == "stop":
             return {"state": "idle"}
-        return {"error": f"unknown action: {action}"}
+        return {"ok": False, "code": "INVALID_ARGUMENT",
+                "message": f"unknown action: {action}"}
