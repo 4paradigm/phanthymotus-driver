@@ -1566,17 +1566,21 @@ class ArmGesturePlugin:
     # 沿前臂轴线的旋转。右臂由 _publish_pose 按横向关节自动镜像。
     _GESTURES = {
         "wave": [-10, 60, -10, -100, 0, 10, 0],
-        "salute": [-35, 65, -40, -125, 0, 30, 15],
+        "salute": [-10, 82, 0, -100, 0, 25, 12],
         "welcome": [-15, 40, -5, -75, 0, 35, 55],
         "raise": [-10, 110, -5, -35, 0, 10, 0],
     }
     _PREPARE_POSES = {
         "wave": [-5, 35, -5, -60, 0, 5, 0],
-        "salute": [-15, 40, -10, -70, 0, 10, 0],
+        # Salute stage 1: shoulder lifts the upper arm close to horizontal.
+        "salute": [-10, 82, 0, 0, 0, 0, 0],
         "welcome": [-10, 25, 0, -45, 0, 20, 30],
         "raise": [-5, 60, 0, -45, 0, 5, 0],
     }
-    _SALUTE_APPROACH = [-25, 55, -25, -105, 0, 20, 10]
+    # Salute stage 2: keep the shoulder stable and flex only the elbow so the
+    # forearm becomes nearly vertical. Stage 3 (_GESTURES["salute"]) then
+    # adjusts only wrist pitch/roll into the final salute orientation.
+    _SALUTE_ELBOW = [-10, 82, 0, -100, 0, 0, 0]
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._pub_node = Node("tianyi2_arm_gesture_pub", context=ros2.ctx_tianyi)
@@ -1691,19 +1695,20 @@ class ArmGesturePlugin:
 
         pose = self._GESTURES[action]
         cycles = int(_clamp(args.get("cycles", 2), 1, 5))
-        # Every gesture first bends the elbow in a moderate preparation pose.
-        # This prevents the old "upper arm lifts while the forearm stays down"
-        # appearance and makes the final pose easier to recognize.
-        frames = [(self._PREPARE_POSES[action], 0.35)]
+        # Frame entries are (pose, hold_seconds, transition_ratio). A ratio
+        # below 1 starts the next frame before the current target fully settles,
+        # allowing the controller to blend adjacent salute stages.
         if action == "salute":
-            # Approach the forehead gradually to avoid a sudden close-to-head
-            # motion, then hold the recognizable salute pose.
-            frames.extend([
-                (self._SALUTE_APPROACH, 0.35),
-                (pose, 1.1),
-            ])
+            frames = [
+                (self._PREPARE_POSES[action], 0.0, 0.90),
+                (self._SALUTE_ELBOW, 0.0, 0.90),
+                (pose, 1.1, 1.0),
+            ]
         else:
-            frames.append((pose, 0.8))
+            frames = [
+                (self._PREPARE_POSES[action], 0.35, 1.0),
+                (pose, 0.8, 1.0),
+            ]
         if action == "wave":
             for i in range(cycles * 2):
                 wave_pose = list(pose)
@@ -1716,7 +1721,7 @@ class ArmGesturePlugin:
                 else:
                     wave_pose[2] = 5
                     wave_pose[6] = 20
-                frames.append((wave_pose, 0.6))
+                frames.append((wave_pose, 0.6, 1.0))
         elif action == "welcome":
             # Keep wrist roll fixed so the palm stays upright and faces
             # forward, then use wrist pitch alone for a gentle welcoming wave.
@@ -1726,12 +1731,12 @@ class ArmGesturePlugin:
                     welcome_pose[5] = 20
                 else:
                     welcome_pose[5] = 50
-                frames.append((welcome_pose, 0.55))
-        frames.append((self._NEUTRAL, 1.0))
+                frames.append((welcome_pose, 0.55, 1.0))
+        frames.append((self._NEUTRAL, 1.0, 1.0))
 
         def _worker(cancel_event: threading.Event):
             previous = self._NEUTRAL
-            for frame, hold in frames:
+            for frame, hold, transition_ratio in frames:
                 if cancel_event.is_set():
                     return
                 result = self._publish_pose(side, frame, speed)
@@ -1741,13 +1746,14 @@ class ArmGesturePlugin:
                 )
                 transition = max_delta_rad / speed if speed > 0 else 0
                 previous = frame
-                if "error" in result or cancel_event.wait(transition + hold):
+                delay = max(0.12, transition * transition_ratio) + hold
+                if "error" in result or cancel_event.wait(delay):
                     return
 
         baseline_seq, baseline = self._feedback_snapshot(side)
         self._sequence.start(_worker)
         feedback = self._wait_for_arm_feedback(
-            side, self._PREPARE_POSES[action], baseline_seq, baseline)
+            side, frames[0][0], baseline_seq, baseline)
         if feedback.get("state") == "error":
             self._sequence.cancel()
             return feedback

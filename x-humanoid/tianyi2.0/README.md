@@ -86,9 +86,12 @@ The semantic poses use a preparation frame before the final gesture so the
 elbow visibly flexes and raises the forearm. `wave` keeps the elbow flexed and
 combines a small shoulder-yaw sweep with wrist roll; wrist yaw remains neutral
 because it primarily twists the forearm around its own axis. `salute` uses
-separate preparation and approach frames before a deeper elbow bend brings the
-hand close to the forehead; it is intentionally limited to one arm at a time
-to avoid interference near the head. `welcome` fixes wrist roll at a
+three blended stages: shoulder lift until the upper arm is nearly horizontal,
+elbow flexion until the forearm is nearly vertical, then wrist pitch/roll
+alignment into the final salute. Intermediate stages have no dwell and hand
+off at 90% of their calculated transition time to avoid stop-start motion.
+The action is intentionally limited to one arm at a time to avoid interference
+near the head. `welcome` fixes wrist roll at a
 conservative angle to keep the palm upright and facing forward, then moves only
 wrist pitch through a bounded range for the welcoming motion.
 `raise` lifts the upper arm close to overhead while keeping only a moderate
