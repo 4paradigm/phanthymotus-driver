@@ -1333,33 +1333,58 @@ class ArmPlugin:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ArmGesturePlugin:
-    """可取消的挥手、敬礼和欢迎手势序列。"""
+    """可取消、带状态反馈和 URDF 限位检查的手臂语义动作序列。"""
 
     _STATUS_MAX_AGE = 2.0
     _FEEDBACK_TIMEOUT = 2.0
     _MOVE_THRESHOLD_RAD = _deg2rad(0.5)
     _TARGET_TOLERANCE_RAD = _deg2rad(3.0)
     _NEUTRAL = [0, 0, 0, 0, 0, 0, 0]
+    _JOINT_NAMES = [
+        "shoulder_pitch", "shoulder_roll", "shoulder_yaw",
+        "elbow_pitch", "wrist_yaw", "wrist_pitch", "wrist_roll",
+    ]
+    # Limits in degrees, copied from resource/tianyi2_model.urdf. Keeping the
+    # limits here makes a bad semantic pose fail before a motor command is sent.
+    _LEFT_POSE_LIMITS = [
+        (-170, 170), (-15, 150), (-170, 170), (-150, 15),
+        (-170, 170), (-45, 60), (-95, 75),
+    ]
+    _RIGHT_POSE_LIMITS = [
+        (-170, 170), (-150, 15), (-170, 170), (-150, 15),
+        (-170, 170), (-45, 60), (-75, 95),
+    ]
     # 角度顺序：肩 pitch、肩 roll、肩 yaw、肘 pitch、腕 yaw、腕 pitch、腕 roll。
     # 肘 pitch 使用负角度屈肘；腕 yaw 不再用于挥手往复，因为它主要产生
     # 沿前臂轴线的旋转。右臂由 _publish_pose 按横向关节自动镜像。
     _GESTURES = {
-        "wave": [-10, 60, -10, -100, 0, 10, 0],
-        "salute": [-10, 82, 0, -90, -25, 25, 12],
-        "welcome": [-15, 40, -5, -75, 0, 35, 55],
-        "raise": [-10, 110, -5, -35, 0, 10, 0],
+        # Shoulder roll/yaw place the elbow to the side and turn the flexion
+        # plane upward; elbow pitch then raises the forearm instead of merely
+        # rolling it in front of the torso.
+        "wave": [0, 75, 90, -110, 0, 10, 0],
+        "salute": [0, 90, 90, -120, -25, 25, 12],
+        "welcome": [-10, 65, 75, -100, 0, 35, 45],
+        "raise": [0, 130, 0, -15, 0, 5, 0],
+        "reach_forward": [-80, 10, 0, -10, 0, 0, 0],
+        "present": [-45, 40, 55, -75, 0, 35, 35],
+        "high_five": [0, 75, 90, -105, 0, 30, 55],
+        "cheer": [0, 125, 0, -25, 0, 5, 0],
     }
     _PREPARE_POSES = {
-        "wave": [-5, 35, -5, -60, 0, 5, 0],
+        "wave": [0, 45, 45, -60, 0, 5, 0],
         # Salute stage 1: shoulder lifts the upper arm close to horizontal.
-        "salute": [-10, 82, 0, 0, 0, 0, 0],
-        "welcome": [-10, 25, 0, -45, 0, 20, 30],
-        "raise": [-5, 60, 0, -45, 0, 5, 0],
+        "salute": [0, 90, 90, 0, 0, 0, 0],
+        "welcome": [-10, 45, 45, -60, 0, 20, 25],
+        "raise": [0, 75, 0, -30, 0, 5, 0],
+        "reach_forward": [-45, 10, 0, -20, 0, 0, 0],
+        "present": [-25, 25, 30, -45, 0, 20, 20],
+        "high_five": [0, 45, 45, -60, 0, 15, 25],
+        "cheer": [0, 75, 0, -35, 0, 5, 0],
     }
     # Salute stage 2: keep the shoulder stable and flex only the elbow so the
     # forearm becomes nearly vertical. Stage 3 (_GESTURES["salute"]) then
     # adjusts wrist yaw/pitch/roll into the final salute orientation.
-    _SALUTE_ELBOW = [-10, 82, 0, -90, 0, 0, 0]
+    _SALUTE_ELBOW = [0, 90, 90, -120, 0, 0, 0]
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._pub_node = Node("tianyi2_arm_gesture_pub", context=ros2.ctx_tianyi)
@@ -1377,15 +1402,19 @@ class ArmGesturePlugin:
         return {
             "name": "arm_gesture",
             "type": "actuator",
-            "description": "天轶2.0 手臂语义动作 — 挥手、敬礼、欢迎、举手和回正",
+            "description": "天轶2.0 手臂语义动作 — 挥手、敬礼、欢迎、举手、前伸、展示、击掌、欢呼和回正",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["wave", "salute", "welcome", "raise", "reset", "stop"],
+                        "enum": [
+                            "wave", "salute", "welcome", "raise",
+                            "reach_forward", "present", "high_five", "cheer",
+                            "reset", "stop",
+                        ],
                         "default": "wave",
-                        "description": "手臂动作，可选[wave, salute, welcome, raise, reset, stop]",
+                        "description": "手臂动作，可选[wave, salute, welcome, raise, reach_forward, present, high_five, cheer, reset, stop]",
                     },
                     "side": {
                         "type": "string", "enum": ["left", "right", "both"],
@@ -1409,6 +1438,10 @@ class ArmGesturePlugin:
                     "salute": {"params": ["side", "speed"], "description": "抬起小臂、将手靠近额侧、停留后回正"},
                     "welcome": {"params": ["side", "cycles", "speed"], "description": "胸前抬起手掌并左右摆动后回正"},
                     "raise": {"params": ["side", "speed"], "description": "将手臂高举到头部上方后回正"},
+                    "reach_forward": {"params": ["side", "speed"], "description": "向前伸臂，适合指引或递接物品前的准备动作"},
+                    "present": {"params": ["side", "speed"], "description": "屈肘托手，展示身体侧前方的目标"},
+                    "high_five": {"params": ["side", "speed"], "description": "抬起前臂并立掌，做出击掌等待姿势"},
+                    "cheer": {"params": ["side", "speed"], "description": "将手臂高举并轻微屈肘，做出欢呼姿势"},
                     "reset": {"params": ["side", "speed"], "description": "取消序列并回到中性姿态"},
                     "stop": {"params": [], "description": "取消尚未发送的后续动作帧"},
                 },
@@ -1452,6 +1485,12 @@ class ArmGesturePlugin:
                 "error": "salute only supports one arm at a time to avoid head/arm interference",
                 "code": "unsafe_bilateral_salute",
             }
+        if action == "high_five" and side == "both":
+            return {
+                "state": "error",
+                "error": "high_five only supports one arm at a time to keep both arms clear of the head",
+                "code": "unsafe_bilateral_high_five",
+            }
         speed = _clamp(args.get("speed", 0.5), 0.2, 1.5)
         if action == "reset":
             self._sequence.cancel()
@@ -1485,8 +1524,8 @@ class ArmGesturePlugin:
             ]
         else:
             frames = [
-                (self._PREPARE_POSES[action], 0.35, 1.0),
-                (pose, 0.8, 1.0),
+                (self._PREPARE_POSES[action], 0.25, 0.90),
+                (pose, 0.8, 0.90),
             ]
         if action == "wave":
             for i in range(cycles * 2):
@@ -1495,12 +1534,12 @@ class ArmGesturePlugin:
                 # flexed. Wrist yaw (index 4) stays neutral because changing it
                 # only twists the forearm around its own axis.
                 if i % 2 == 0:
-                    wave_pose[2] = -25
-                    wave_pose[6] = -20
+                    wave_pose[2] = 80
+                    wave_pose[6] = -18
                 else:
-                    wave_pose[2] = 5
-                    wave_pose[6] = 20
-                frames.append((wave_pose, 0.6, 1.0))
+                    wave_pose[2] = 100
+                    wave_pose[6] = 18
+                frames.append((wave_pose, 0.35, 0.85))
         elif action == "welcome":
             # Keep wrist roll fixed so the palm stays upright and faces
             # forward, then use wrist pitch alone for a gentle welcoming wave.
@@ -1510,8 +1549,17 @@ class ArmGesturePlugin:
                     welcome_pose[5] = 20
                 else:
                     welcome_pose[5] = 50
-                frames.append((welcome_pose, 0.55, 1.0))
+                frames.append((welcome_pose, 0.35, 0.85))
         frames.append((self._NEUTRAL, 1.0, 1.0))
+        for frame, _, _ in frames:
+            violations = self._pose_violations(side, frame)
+            if violations:
+                return self._error_result(
+                    "arm_pose_out_of_range",
+                    "Semantic arm pose exceeds URDF joint limits",
+                    gesture=action,
+                    violations=violations,
+                )
 
         def _worker(cancel_event: threading.Event):
             previous = self._NEUTRAL
@@ -1581,11 +1629,41 @@ class ArmGesturePlugin:
         return motor_ids
 
     @staticmethod
-    def _target_positions(side: str, left_pose: list[float]) -> dict[int, float]:
-        right_pose = [
+    def _mirror_pose(left_pose: list[float]) -> list[float]:
+        return [
             left_pose[0], -left_pose[1], -left_pose[2],
             left_pose[3], -left_pose[4], left_pose[5], -left_pose[6],
         ]
+
+    @classmethod
+    def _pose_violations(
+            cls, side: str, left_pose: list[float]) -> list[dict]:
+        if len(left_pose) != 7:
+            return [{"side": side, "error": "pose_length", "actual": len(left_pose)}]
+        selected = []
+        if side in ("left", "both"):
+            selected.append(("left", left_pose, cls._LEFT_POSE_LIMITS))
+        if side in ("right", "both"):
+            selected.append((
+                "right", cls._mirror_pose(left_pose), cls._RIGHT_POSE_LIMITS))
+        violations = []
+        for arm_side, pose, limits in selected:
+            for index, (value, bounds) in enumerate(zip(pose, limits)):
+                lower, upper = bounds
+                if float(value) < lower or float(value) > upper:
+                    violations.append({
+                        "side": arm_side,
+                        "joint": cls._JOINT_NAMES[index],
+                        "value_deg": float(value),
+                        "minimum_deg": lower,
+                        "maximum_deg": upper,
+                    })
+        return violations
+
+    @classmethod
+    def _target_positions(
+            cls, side: str, left_pose: list[float]) -> dict[int, float]:
+        right_pose = cls._mirror_pose(left_pose)
         targets = {}
         if side in ("left", "both"):
             targets.update({
@@ -1761,12 +1839,18 @@ class ArmGesturePlugin:
             return {"error": "publisher not initialized"}
         if len(left_pose) != 7:
             return {"error": "internal pose must have 7 values"}
+        violations = self._pose_violations(side, left_pose)
+        if violations:
+            return self._error_result(
+                "arm_pose_out_of_range",
+                "Arm pose exceeds URDF joint limits",
+                violations=violations,
+            )
         try:
             from bodyctrl_msgs.msg import CmdSetMotorPosition, SetMotorPosition
             # Mirror the lateral axes for the right arm. All values remain within
             # the URDF limits used by the existing arm card.
-            right_pose = [left_pose[0], -left_pose[1], -left_pose[2],
-                          left_pose[3], -left_pose[4], left_pose[5], -left_pose[6]]
+            right_pose = self._mirror_pose(left_pose)
             selected = []
             if side in ("left", "both"):
                 selected.append((11, left_pose))
