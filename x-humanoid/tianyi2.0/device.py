@@ -21,6 +21,7 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   HeadPlugin       (actuator)           — 头部3DOF控制
   ArmPlugin        (actuator)           — 双臂14DOF控制
   WaistPlugin      (actuator)           — 腰部2DOF控制
+  LegPlugin        (actuator)           — 腿部2DOF控制
   HandPlugin       (actuator)           — 灵巧手控制
   TtsPlugin        (actuator)           — 语音合成
   NavPlugin        (actuator)           — 底盘导航控制
@@ -29,6 +30,7 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
 
 import json
 import math
+import struct
 import threading
 import time
 from pathlib import Path
@@ -91,6 +93,63 @@ _LEG_JOINTS = {
 }
 
 _ALL_JOINTS = {**_HEAD_JOINTS, **_ARM_LEFT_JOINTS, **_ARM_RIGHT_JOINTS, **_WAIST_JOINTS, **_LEG_JOINTS}
+
+# ── 关节限位 (deg, rpm, A): motor_id → (min_deg, max_deg, max_spd_rpm, rated_current_a) ─
+
+_JOINT_LIMITS = {
+    # 头部
+    1:  (-26,    26,    64,  5.0),
+    2:  (-25,    25,    64,  5.0),
+    3:  (-90,    90,    64,  5.0),
+    # 左臂
+    11: (-170,   170,   88,  35.0),
+    12: (-15,    150,   120, 23.0),
+    13: (-170,   170,   73,  8.0),
+    14: (-150,   15,    73,  8.0),
+    15: (-170,   170,   146, 8.0),
+    16: (-45,    60,    72,  5.0),
+    17: (-95,    75,    72,  5.0),
+    # 右臂
+    21: (-170,   170,   88,  35.0),
+    22: (-150,   15,    120, 23.0),
+    23: (-170,   170,   73,  8.0),
+    24: (-150,   15,    73,  8.0),
+    25: (-170,   170,   146, 8.0),
+    26: (-45,    60,    72,  5.0),
+    27: (-75,    95,    72,  5.0),
+    # 腰部
+    31: (-160,   180,   30,  31.0),
+    32: (-45,    120,   37.5, 82.0),
+    # 左腿
+    51: (-40,    5,     37.5, 5.0),
+    52: (-23,    20,    37.5, 5.0),
+}
+
+
+def _rpm2rads(rpm: float) -> float:
+    return rpm * 2.0 * math.pi / 60.0
+
+
+def _clamp(val: float, lo: float, hi: float) -> tuple:
+    """Clamp value to [lo, hi]; returns (clamped_value, was_clamped)."""
+    if val < lo:
+        return lo, True
+    if val > hi:
+        return hi, True
+    return val, False
+
+
+def _resolve_motor_id(identifier, valid_ids: list) -> int | None:
+    """将关节标识符（int ID 或 str 名称）解析为 motor ID。"""
+    if isinstance(identifier, int):
+        return identifier if identifier in valid_ids else None
+    if isinstance(identifier, str):
+        s = identifier.strip().lower()
+        for mid in valid_ids:
+            name = _ALL_JOINTS.get(mid, "")
+            if s == name or s == str(mid):
+                return mid
+    return None
 
 
 def _deg2rad(deg: float) -> float:
@@ -424,25 +483,79 @@ class CameraPlugin:
             print(f"[CameraPlugin] WARNING: import failed ({e})")
 
     def _ensure_orbbec_service(self):
-        """Ensure orbbec_head.service is running. Use nsenter to access host systemd."""
+        """Configure and start the host's Orbbec service through ``nsenter``.
+
+        The camera runs on the host because it owns the USB device.  Each
+        container start therefore makes the vendor startup script idempotently
+        request PointCloud2, accelerometer, gyroscope, and a 640x480 depth
+        profile before ensuring the service is active. This is deliberately
+        runtime setup, not a Docker build step: a Dockerfile cannot alter a
+        new machine's systemd service or access its camera.
+        """
         import subprocess
         try:
+            changed = self._configure_orbbec_startup()
             # Use nsenter to run systemctl on host PID 1's namespace
             result = subprocess.run(
                 ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--",
                  "systemctl", "is-active", "orbbec_head.service"],
                 capture_output=True, text=True, timeout=5)
-            if result.stdout.strip() == "active":
+            if result.stdout.strip() == "active" and not changed:
                 print("[CameraPlugin] orbbec_head.service already active")
                 return
-            # Start it
+            # Restart applies a changed host startup script; start handles an
+            # inactive service without unnecessarily interrupting a live one.
+            action = "restart" if result.stdout.strip() == "active" else "start"
             subprocess.run(
                 ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--",
-                 "systemctl", "start", "orbbec_head.service"],
-                capture_output=True, text=True, timeout=10)
-            print("[CameraPlugin] orbbec_head.service started via nsenter")
+                 "systemctl", action, "orbbec_head.service"],
+                check=True, capture_output=True, text=True, timeout=15)
+            print(f"[CameraPlugin] orbbec_head.service {action}ed via nsenter")
         except Exception as e:
             print(f"[CameraPlugin] WARNING: could not start orbbec service ({e})")
+
+    @staticmethod
+    def _configure_orbbec_startup():
+        """Enable the Orbbec streams in the host vendor startup script.
+
+        This only changes the ``headty`` launch command and is idempotent, so
+        it is safe to execute every time a freshly-created driver container
+        starts.  The host path matches Tianyi's factory service definition.
+        """
+        import subprocess
+
+        script = "/home/nvidia/data/scripts/start_orbbec_camera.sh"
+        launch = "ros2 launch orbbec_camera head_330_ty.launch.py"
+        desired = (f"{launch} enable_point_cloud:=true "
+                   "enable_accel:=true enable_gyro:=true "
+                   "depth_width:=640 depth_height:=480 depth_fps:=30")
+        updater = (
+            "from pathlib import Path\n"
+            f"path = Path({script!r})\n"
+            "lines = path.read_text().splitlines(keepends=True)\n"
+            f"launch = {launch!r}\n"
+            f"desired = {desired!r}\n"
+            "for index, line in enumerate(lines):\n"
+            "    if line.lstrip().startswith(launch):\n"
+            "        updated = line[:len(line) - len(line.lstrip())] + desired + '\\n'\n"
+            "        if line == updated:\n"
+            "            print('unchanged')\n"
+            "        else:\n"
+            "            lines[index] = updated\n"
+            "            path.write_text(''.join(lines))\n"
+            "            print('changed')\n"
+            "        break\n"
+            "else:\n"
+            "    raise SystemExit('headty Orbbec launch command not found')\n"
+        )
+        result = subprocess.run(
+            ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--",
+             "python3", "-c", updater],
+            check=True, capture_output=True, text=True, timeout=10)
+        changed = result.stdout.strip() == "changed"
+        if changed:
+            print("[CameraPlugin] enabled Orbbec point cloud, IMU, and 640x480 depth stream")
+        return changed
 
     def stop(self):
         self._running = False
@@ -489,6 +602,432 @@ class CameraPlugin:
         if action == "info":
             return {"state": "running", "topic_out": [{"topic": self._topic, "format": "image/jpeg"}]}
         return {"state": "running"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Additional sensors / indicators
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _JsonSensor:
+    """Small base class for a domain-0 subscription bridged as JSON on domain 42."""
+    _format = "data/json"
+
+    def _tool(self, name, description):
+        return {"name": name, "type": "sensor", "description": description,
+                "inputSchema": {"type": "object", "properties": {}},
+                "topic_out": [{"topic": self._topic, "format": self._format}]}
+
+    def dispatch(self, action, args):
+        if action == "info":
+            return {"state": "running" if self._running else "idle",
+                    "topic_out": [{"topic": self._topic, "format": self._format}]}
+        return {"state": "running" if self._running else "idle"}
+
+
+class ImuPlugin(_JsonSensor):
+    """Bridge the head Orbbec camera's accelerometer and gyroscope to Agent Core."""
+    def __init__(self, plugin_config, namespace, ros2):
+        self._running = False
+        self._topic = f"/{namespace}/state/imu"
+        self._last_pub = 0.0
+        self._latest = {
+            "available": False,
+            "timestamp_ms": int(time.time() * 1000),
+            "source": None,
+            "reason": "waiting_for_upstream_imu",
+        }
+        self._subscriptions = []  # Keep rclpy subscriptions alive for the plugin lifetime.
+        self._camera_acceleration = None
+        self._camera_acceleration_timestamp_ms = None
+        self._camera_angular_velocity = None
+        self._camera_angular_velocity_timestamp_ms = None
+        self._sub_node = Node("tianyi2_imu_sub", context=ros2.ctx_tianyi)
+        self._pub_node = Node("tianyi2_imu_pub", context=ros2.ctx_core)
+        ros2.executor_tianyi.add_node(self._sub_node)
+        ros2.executor_core.add_node(self._pub_node)
+        self._pub = self._pub_node.create_publisher(String, self._topic, _LOW_LAT_QOS)
+
+    def get_tool(self):
+        tool = self._tool("imu", "天轶2.0 头部 Orbbec IMU — 相机实际加速度与角速度")
+        tool["multiInstance"] = False
+        return tool
+
+    def start(self):
+        """Subscribe to the Orbbec streams enabled by ``orbbec_head.service``.
+
+        Orbbec publishes acceleration and angular velocity separately as
+        ``sensor_msgs/Imu``.  These sensor publishers use BEST_EFFORT QoS, so
+        the domain-0 subscription must use the matching low-latency profile.
+        Only fields physically supplied by either stream are forwarded to the
+        Agent Core card; no synthetic orientation, Euler angle, or zero values
+        are emitted.
+        """
+        from sensor_msgs.msg import Imu as RosImu
+        self._running = True
+        self._subscriptions = [
+            self._sub_node.create_subscription(
+                RosImu, "/ob_camera_head/accel/sample", self._on_camera_accel, _LOW_LAT_QOS),
+            self._sub_node.create_subscription(
+                RosImu, "/ob_camera_head/gyro/sample", self._on_camera_gyro, _LOW_LAT_QOS),
+        ]
+        # Match StatePlugin/force_sensor behaviour: publish a snapshot even
+        # while the vendor IMU stream is unavailable, so Agent Core renders a
+        # useful card state instead of an empty panel.
+        self._pub_thread = threading.Thread(target=self._publish_snapshot_loop, daemon=True)
+        self._pub_thread.start()
+        print("[ImuPlugin] subscribed: /ob_camera_head/accel/sample, /ob_camera_head/gyro/sample")
+
+    def stop(self):
+        self._running = False
+
+    def _publish_camera_imu(self):
+        """Publish only the samples actually received from the camera."""
+        if not self._running:
+            return
+        timestamps = [ts for ts in (
+            self._camera_acceleration_timestamp_ms,
+            self._camera_angular_velocity_timestamp_ms,
+        ) if ts is not None]
+        if not timestamps:
+            return
+        payload = {"available": True, "timestamp_ms": max(timestamps)}
+        if self._camera_acceleration is not None:
+            payload["linear_acceleration"] = self._camera_acceleration
+        if self._camera_angular_velocity is not None:
+            payload["angular_velocity"] = self._camera_angular_velocity
+        self._latest = payload
+
+        # The dashboard only needs the latest state.  Bound transport to 30 Hz
+        # so a high-rate IMU cannot congest the domain-42 bridge.
+        now = time.monotonic()
+        if now - self._last_pub < 1.0 / 30.0:
+            return
+        self._last_pub = now
+        out = String()
+        out.data = json.dumps(self._latest)
+        self._pub.publish(out)
+
+    def _publish_snapshot_loop(self):
+        while self._running:
+            snapshot = dict(self._latest)
+            snapshot["timestamp_ms"] = int(time.time() * 1000)
+            out = String()
+            out.data = json.dumps(snapshot)
+            self._pub.publish(out)
+            time.sleep(0.5)
+
+    def _on_camera_accel(self, msg):
+        self._camera_acceleration = {
+            "x": msg.linear_acceleration.x,
+            "y": msg.linear_acceleration.y,
+            "z": msg.linear_acceleration.z,
+        }
+        self._camera_acceleration_timestamp_ms = (
+            msg.header.stamp.sec * 1000 + msg.header.stamp.nanosec // 1_000_000)
+        self._publish_camera_imu()
+
+    def _on_camera_gyro(self, msg):
+        self._camera_angular_velocity = {
+            "x": msg.angular_velocity.x,
+            "y": msg.angular_velocity.y,
+            "z": msg.angular_velocity.z,
+        }
+        self._camera_angular_velocity_timestamp_ms = (
+            msg.header.stamp.sec * 1000 + msg.header.stamp.nanosec // 1_000_000)
+        self._publish_camera_imu()
+
+    def dispatch(self, action, args):
+        if action in ("read", "get", "imu"):
+            # Keep sensor values at the top level like StatePlugin's
+            # force_sensor, which Agent Core renders directly.
+            return dict(self._latest)
+        if action == "info":
+            return {"state": "running" if self._running else "idle",
+                    "topic_out": [{"topic": self._topic, "format": self._format}]}
+        return {"state": "running" if self._running else "idle"}
+
+
+class HandStatePlugin(_JsonSensor):
+    """Bridge both Inspire hands' feedback and error arrays."""
+    def __init__(self, plugin_config, namespace, ros2):
+        self._running, self._lock = False, threading.Lock()
+        self._state = {"left": {}, "right": {}}
+        self._topic = f"/{namespace}/state/hand"
+        self._sub_node = Node("tianyi2_hand_state_sub", context=ros2.ctx_tianyi)
+        self._pub_node = Node("tianyi2_hand_state_pub", context=ros2.ctx_core)
+        ros2.executor_tianyi.add_node(self._sub_node); ros2.executor_core.add_node(self._pub_node)
+        self._pub = self._pub_node.create_publisher(String, self._topic, _LOW_LAT_QOS)
+
+    def get_tool(self): return self._tool("hand_state", "天轶2.0 灵巧手状态 — 双手六指位置、速度、电流与错误码")
+    def start(self):
+        from sensor_msgs.msg import JointState
+        from std_msgs.msg import UInt32MultiArray
+        self._running = True
+        for side in ("left", "right"):
+            self._sub_node.create_subscription(JointState, f"/inspire_hand/state/{side}_hand", lambda m, s=side: self._on_state(s, m), _RELIABLE_QOS)
+            self._sub_node.create_subscription(UInt32MultiArray, f"/inspire_hand/error/{side}_hand", lambda m, s=side: self._on_error(s, m), _RELIABLE_QOS)
+    def stop(self): self._running = False
+    def _on_state(self, side, msg):
+        with self._lock:
+            self._state[side].update({"name": list(msg.name), "position": list(msg.position), "velocity": list(msg.velocity), "effort": list(msg.effort)})
+        self._publish()
+    def _on_error(self, side, msg):
+        with self._lock: self._state[side]["errors"] = list(msg.data)
+        self._publish()
+    def _publish(self):
+        if not self._running: return
+        with self._lock: data = json.dumps(self._state)
+        out = String(); out.data = data; self._pub.publish(out)
+
+
+class DepthCameraPlugin:
+    """Bridge only the newest Orbbec Z16 frame to Agent Core.
+
+    Depth frames are large and the dashboard only needs the current image.  The
+    domain-0 callback therefore never serializes or publishes a frame: it only
+    replaces the pending frame.  A domain-42 timer publishes that newest frame,
+    so a slow DDS consumer cannot make the input executor drain stale images.
+    """
+    def __init__(self, plugin_config, namespace, ros2):
+        self._running = False; self._topic = f"/{namespace}/camera/head/depth"
+        # A 640x480 Z16 frame is 614 KiB. The dashboard's DDS → WebSocket
+        # path is intentionally latest-frame-only, but it still must not be
+        # fed faster than the browser can decode and paint it.
+        self._max_hz = max(1.0, min(float(plugin_config.get("hz", 8)), 15.0))
+        self._last_published_at = 0.0
+        self._forwarded_frames = 0
+        self._latest_image = None
+        self._latest_image_lock = threading.Lock()
+        self._subscription = None
+        self._publish_timer = None
+        self._sub_node = Node("tianyi2_depth_sub", context=ros2.ctx_tianyi)
+        self._pub_node = Node("tianyi2_depth_pub", context=ros2.ctx_core)
+        ros2.executor_tianyi.add_node(self._sub_node); ros2.executor_core.add_node(self._pub_node)
+    def get_tool(self):
+        return {"name": "camera_depth", "type": "sensor", "description": "天轶2.0 Orbbec 头部深度图（Z16）",
+                "inputSchema": {"type": "object", "properties": {}}, "topic_out": [{"topic": self._topic, "format": "image/depth-z16"}]}
+    def start(self):
+        from sensor_msgs.msg import Image
+        import cv2
+        import numpy as np
+        self._cv2, self._np = cv2, np
+        latest_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        # The vendor publisher is RELIABLE.  Keep that compatible policy at
+        # ingress, but retain only one unread sample instead of the generic
+        # ten-message sensor queue.
+        ingress_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self._running = True
+        self._pub = self._pub_node.create_publisher(Image, self._topic, latest_qos)
+        self._subscription = self._sub_node.create_subscription(
+            Image, "/ob_camera_head/depth/image_raw", self._on_image, ingress_qos)
+        # Poll separately from the output limit. When rate-limited the pending
+        # slot is retained and overwritten by new input, so the next output is
+        # always the freshest source frame rather than the oldest queued one.
+        self._publish_timer = self._pub_node.create_timer(1.0 / 30.0, self._publish_latest)
+        print(f"[DepthCameraPlugin] forwarding newest Z16 frame at <= {self._max_hz:g} Hz")
+    def stop(self):
+        self._running = False
+        with self._latest_image_lock:
+            self._latest_image = None
+
+    def _on_image(self, msg):
+        if not self._running or msg.encoding not in ("16UC1", "mono16"): return
+        # Never block the domain-0 executor on serialization or a slow
+        # domain-42 consumer.  Replacing this reference deliberately drops any
+        # stale frame that has not yet been published.
+        with self._latest_image_lock:
+            self._latest_image = msg
+
+    def _publish_latest(self):
+        if not self._running:
+            return
+        with self._latest_image_lock:
+            if time.monotonic() - self._last_published_at < 1.0 / self._max_hz:
+                return
+            msg, self._latest_image = self._latest_image, None
+        if msg is None:
+            return
+        # Agent Core consumes a raw 640x480 Z16 payload. The camera is now
+        # requested to produce that profile directly, avoiding an upstream
+        # 1280x720 DDS transfer and any local crop/resize work. Keep the
+        # 1280x720 conversion as a compatibility fallback for old profiles.
+        dashboard = self._to_dashboard_depth(msg)
+        if dashboard is None:
+            return
+
+        # Rebuild the message for the independent domain-42 context.
+        from sensor_msgs.msg import Image
+        out = Image()
+        out.header = msg.header
+        out.height, out.width, out.encoding = 480, 640, "16UC1"
+        out.is_bigendian, out.step, out.data = 0, 1280, dashboard.tobytes()
+        self._pub.publish(out)
+        self._last_published_at = time.monotonic()
+        self._forwarded_frames += 1
+
+    def _to_dashboard_depth(self, msg):
+        """Return a 640x480 uint16 depth image, or None for malformed input."""
+        if msg.encoding not in ("16UC1", "mono16") or msg.is_bigendian:
+            return None
+        width, height, step = int(msg.width), int(msg.height), int(msg.step)
+        if width <= 0 or height <= 0 or step < width * 2:
+            return None
+        raw = self._np.frombuffer(msg.data, dtype=self._np.uint8)
+        needed = height * step
+        if raw.size < needed:
+            return None
+        # Respect source row stride before interpreting its pixels as uint16.
+        depth = raw[:needed].reshape(height, step)[:, :width * 2].view(self._np.uint16).reshape(height, width)
+        if width == 640 and height == 480:
+            return depth
+        if width * 3 > height * 4:  # 16:9 → centered 4:3 crop
+            crop_width = height * 4 // 3
+            left = (width - crop_width) // 2
+            depth = depth[:, left:left + crop_width]
+        elif width * 3 < height * 4:  # portrait input → centered 4:3 crop
+            crop_height = width * 3 // 4
+            top = (height - crop_height) // 2
+            depth = depth[top:top + crop_height, :]
+        return self._cv2.resize(depth, (640, 480), interpolation=self._cv2.INTER_NEAREST)
+    def dispatch(self, action, args):
+        return {"state": "running" if self._running else "idle", "topic_out": [{"topic": self._topic, "format": "image/depth-z16"}]}
+
+
+class PointCloudPlugin:
+    """Pack gravity-levelled, floor-referenced Orbbec points for Agent Core."""
+    _format = "sensor/pointcloud"
+    def __init__(self, plugin_config, namespace, ros2):
+        self._running = False; self._topic = f"/{namespace}/camera/head/points"; self._last = 0.0; self._intrinsics = None
+        # The renderer's horizontal grid is Y=0. Gravity alignment fixes the
+        # orientation but leaves the camera as the origin; shift upward by the
+        # head camera's floor height so the physical floor is at Y=0.
+        self._floor_offset_m = max(-3.0, min(float(plugin_config.get("floor_offset_m", 1.50)), 3.0))
+        self._gravity_world = None; self._gravity_lock = threading.Lock()
+        self._sub_node = Node("tianyi2_points_sub", context=ros2.ctx_tianyi); self._pub_node = Node("tianyi2_points_pub", context=ros2.ctx_core)
+        ros2.executor_tianyi.add_node(self._sub_node); ros2.executor_core.add_node(self._pub_node)
+    def get_tool(self):
+        return {"name": "camera_pointcloud", "type": "sensor", "description": "天轶2.0 Orbbec 头部彩色点云（限频、限点）", "inputSchema": {"type": "object", "properties": {}}, "topic_out": [{"topic": self._topic, "format": self._format}]}
+    def start(self):
+        from sensor_msgs.msg import PointCloud2, Image, CameraInfo, Imu
+        from std_msgs.msg import UInt8MultiArray
+        self._running = True; self._pub = self._pub_node.create_publisher(UInt8MultiArray, self._topic, _LOW_LAT_QOS)
+        self._sub_node.create_subscription(PointCloud2, "/ob_camera_head/depth/points", self._on_cloud, _LOW_LAT_QOS)
+        # Gemini 336 currently has its depth image enabled even when the vendor
+        # point-cloud stream is disabled.  This fallback keeps the card live.
+        self._sub_node.create_subscription(CameraInfo, "/ob_camera_head/depth/camera_info", self._on_info, _RELIABLE_QOS)
+        self._sub_node.create_subscription(Image, "/ob_camera_head/depth/image_raw", self._on_depth, _LOW_LAT_QOS)
+        self._sub_node.create_subscription(Imu, "/ob_camera_head/accel/sample", self._on_accel, _LOW_LAT_QOS)
+    def stop(self): self._running = False
+    def _on_accel(self, msg):
+        """Estimate display-frame up from the camera's stationary IMU vector."""
+        # Optical raw coordinates are (right, down, forward); the renderer's
+        # world coordinates are (right, up, backward) before leveling.
+        g = (msg.linear_acceleration.x, -msg.linear_acceleration.y, -msg.linear_acceleration.z)
+        magnitude = math.sqrt(sum(v * v for v in g))
+        if not 8.0 <= magnitude <= 11.5: return  # reject dynamic acceleration
+        g = tuple(v / magnitude for v in g)
+        with self._gravity_lock:
+            previous = self._gravity_world
+            if previous is None:
+                self._gravity_world = g
+            else:
+                # Low-pass the gravity direction to avoid point-cloud wobble.
+                mixed = tuple(0.95 * old + 0.05 * new for old, new in zip(previous, g))
+                norm = math.sqrt(sum(v * v for v in mixed))
+                self._gravity_world = tuple(v / norm for v in mixed)
+
+    def _gravity_snapshot(self):
+        with self._gravity_lock: return self._gravity_world
+
+    @staticmethod
+    def _to_renderer_frame(x, y, z, gravity=None, floor_offset_m=0.0):
+        """Map optical points to a gravity-levelled, floor-referenced renderer frame."""
+        # Renderer map is (input_y, -input_z, -input_x), so this packed form
+        # yields world (x, -y, -z): right, up, backward from optical raw XYZ.
+        wx, wy, wz = x, -y, -z
+        if gravity is not None:
+            gx, gy, gz = gravity
+            # Rodrigues rotation taking measured up/gravity to world +Y.
+            vx, vy, vz = -gz, 0.0, gx  # gravity × (0, 1, 0)
+            sine_sq = vx * vx + vy * vy + vz * vz
+            cosine = gy
+            if sine_sq > 1e-8:
+                cross_x = vy * wz - vz * wy
+                cross_y = vz * wx - vx * wz
+                cross_z = vx * wy - vy * wx
+                cross2_x = vy * cross_z - vz * cross_y
+                cross2_y = vz * cross_x - vx * cross_z
+                cross2_z = vx * cross_y - vy * cross_x
+                factor = (1.0 - cosine) / sine_sq
+                wx += cross_x + factor * cross2_x
+                wy += cross_y + factor * cross2_y
+                wz += cross_z + factor * cross2_z
+        wy += floor_offset_m
+        # Invert the renderer map above to pack the leveled world point.
+        return -wz, wx, -wy
+    def _on_cloud(self, msg):
+        if not self._running or time.monotonic() - self._last < 0.5: return
+        fields = {f.name: f.offset for f in msg.fields}
+        if not all(k in fields for k in ("x", "y", "z")): return
+        self._last = time.monotonic(); raw = bytes(msg.data); count = min(msg.width * msg.height, 10000); gravity = self._gravity_snapshot()
+        packed = bytearray(struct.pack("<II", 12, count))
+        for i in range(count):
+            base = i * msg.point_step
+            x = struct.unpack_from("<f", raw, base + fields["x"])[0]
+            y = struct.unpack_from("<f", raw, base + fields["y"])[0]
+            z = struct.unpack_from("<f", raw, base + fields["z"])[0]
+            packed.extend(struct.pack("<fff", *self._to_renderer_frame(
+                x, y, z, gravity, self._floor_offset_m)))
+        from std_msgs.msg import UInt8MultiArray
+        out = UInt8MultiArray(); out.data = list(packed); self._pub.publish(out)
+    def _on_info(self, msg): self._intrinsics = (msg.k[0], msg.k[4], msg.k[2], msg.k[5])
+    def _on_depth(self, msg):
+        if not self._running or self._intrinsics is None or time.monotonic() - self._last < 0.5: return
+        if msg.encoding not in ("16UC1", "mono16"): return
+        fx, fy, cx, cy = self._intrinsics
+        if fx <= 0 or fy <= 0: return
+        self._last = time.monotonic(); raw = bytes(msg.data); step = max(1, int(math.sqrt((msg.width * msg.height) / 10000))); gravity = self._gravity_snapshot()
+        packed = bytearray(); count = 0
+        for v in range(0, msg.height, step):
+            for u in range(0, msg.width, step):
+                d = struct.unpack_from("<H", raw, v * msg.step + u * 2)[0]
+                if d == 0: continue
+                z = d / 1000.0
+                x, y = (u - cx) * z / fx, (v - cy) * z / fy
+                packed.extend(struct.pack("<fff", *self._to_renderer_frame(
+                    x, y, z, gravity, self._floor_offset_m))); count += 1
+        if not count: return
+        from std_msgs.msg import UInt8MultiArray
+        out = UInt8MultiArray(); out.data = list(struct.pack("<II", 12, count) + packed); self._pub.publish(out)
+    def dispatch(self, action, args): return {"state": "running" if self._running else "idle", "topic_out": [{"topic": self._topic, "format": self._format}]}
+
+
+class LightPlugin:
+    """Safe semantic system-light control; no raw vendor command is exposed."""
+    _commands = {"standby": 99, "service_wait": 20, "service_ready": 22, "warning": 12, "warning_clear": 13, "error": 10, "error_clear": 11}
+    def __init__(self, plugin_config, namespace, ros2):
+        self._pub_node = Node("tianyi2_light_pub", context=ros2.ctx_tianyi); ros2.executor_tianyi.add_node(self._pub_node); self._pub = None
+    def get_tool(self):
+        return {"name": "light", "type": "actuator", "description": "天轶2.0 系统状态灯效", "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": list(self._commands)}}, "required": ["action"], "x-action-params": {k: {"params": [], "description": k} for k in self._commands}}}
+    def start(self):
+        from bodyctrl_msgs.msg import LightCtrl
+        self._pub = self._pub_node.create_publisher(LightCtrl, "/xsys/light/ctrl", _RELIABLE_QOS)
+    def stop(self): pass
+    def dispatch(self, action, args):
+        if action not in self._commands: return {"error": f"unknown action: {action}"}
+        from bodyctrl_msgs.msg import LightCtrl
+        msg = LightCtrl(); msg.cmd = self._commands[action]; msg.caller_id = "phanthy-motus"; msg.caller_msg = f"Agent Core: {action}"; self._pub.publish(msg)
+        return {"state": action}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -552,6 +1091,134 @@ class AsrPlugin:
         if action in ("start", "stop", "info"):
             return {"state": "running" if self._running else "idle",
                     "topic_out": [{"topic": self._topic, "format": "data/json"}]}
+        return {"state": "running"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LyreEventPlugin (sensor) — lyre 语音包事件/状态采集
+# ══════════════════════════════════════════════════════════════════════════════
+
+class LyreEventPlugin:
+    """lyre 语音包事件采集 — 唤醒词/ASR事件/播放事件/播放进度/TTS事件"""
+
+    _ASR_EVENT_NAMES = {2: "error", 3: "state", 4: "wakeup", 5: "sleep",
+                        6: "vad", 10: "pre_sleep", 13: "connected", 14: "disconnected"}
+    _PLAY_EVENT_NAMES = {0: "started", 1: "completed", 2: "stopped", 3: "cancelled", 4: "failed"}
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._running = False
+
+        self._sub_node = Node("tianyi2_lyre_event_sub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._sub_node)
+
+        self._pub_node = Node("tianyi2_lyre_event_pub", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._pub_node)
+
+        self._topics = {
+            "lyre_keyword": f"/{namespace}/lyre/keyword",
+            "lyre_asr_event": f"/{namespace}/lyre/asr_event",
+            "lyre_play_event": f"/{namespace}/lyre/play_event",
+            "lyre_play_progress": f"/{namespace}/lyre/play_progress",
+            "lyre_tts_event": f"/{namespace}/lyre/tts_event",
+        }
+        self._pubs = {}
+
+    def get_tools(self) -> list:
+        return [
+            {"name": "lyre_keyword", "type": "sensor",
+             "description": "天轶2.0 语音唤醒关键词 — 检测到的唤醒词及声源角度",
+             "inputSchema": {"type": "object", "properties": {}},
+             "topic_out": [{"topic": self._topics["lyre_keyword"], "format": "data/json"}]},
+            {"name": "lyre_asr_event", "type": "sensor",
+             "description": "天轶2.0 ASR 状态事件 — 唤醒/休眠/VAD/连接状态",
+             "inputSchema": {"type": "object", "properties": {}},
+             "topic_out": [{"topic": self._topics["lyre_asr_event"], "format": "data/json"}]},
+            {"name": "lyre_play_event", "type": "sensor",
+             "description": "天轶2.0 音频播放事件 — 开始/完成/停止/取消/失败",
+             "inputSchema": {"type": "object", "properties": {}},
+             "topic_out": [{"topic": self._topics["lyre_play_event"], "format": "data/json"}]},
+            {"name": "lyre_play_progress", "type": "sensor",
+             "description": "天轶2.0 音频播放进度 — 当前位置和总时长(秒)",
+             "inputSchema": {"type": "object", "properties": {}},
+             "topic_out": [{"topic": self._topics["lyre_play_progress"], "format": "data/json"}]},
+            {"name": "lyre_tts_event", "type": "sensor",
+             "description": "天轶2.0 TTS 合成事件 — 合成开始/完成/停止/取消/失败",
+             "inputSchema": {"type": "object", "properties": {}},
+             "topic_out": [{"topic": self._topics["lyre_tts_event"], "format": "data/json"}]},
+        ]
+
+    def start(self):
+        self._running = True
+        for key, topic in self._topics.items():
+            self._pubs[key] = self._pub_node.create_publisher(String, topic, _RELIABLE_QOS)
+
+        try:
+            from lyre_msgs.msg import AsrKeyword, AsrEvent, PlayEvent, PlayProgress, TtsEvent
+            self._sub_node.create_subscription(
+                AsrKeyword, "/audio_asr/keyword", self._on_keyword, _RELIABLE_QOS)
+            self._sub_node.create_subscription(
+                AsrEvent, "/audio_asr/event", self._on_asr_event, _RELIABLE_QOS)
+            self._sub_node.create_subscription(
+                PlayEvent, "/audio_play/event", self._on_play_event, _RELIABLE_QOS)
+            self._sub_node.create_subscription(
+                PlayProgress, "/audio_play/progress", self._on_play_progress, _RELIABLE_QOS)
+            self._sub_node.create_subscription(
+                TtsEvent, "/audio_tts/event", self._on_tts_event, _RELIABLE_QOS)
+            print("[LyreEventPlugin] 5 subscriptions created")
+        except ImportError:
+            print("[LyreEventPlugin] WARNING: lyre_msgs not available, no subscriptions created")
+
+    def stop(self):
+        self._running = False
+
+    def _publish(self, key: str, data: dict):
+        if not self._running:
+            return
+        out = String()
+        out.data = json.dumps(data)
+        self._pubs[key].publish(out)
+
+    def _on_keyword(self, msg):
+        self._publish("lyre_keyword", {"keyword": msg.keyword, "angle": msg.angle})
+
+    def _on_asr_event(self, msg):
+        self._publish("lyre_asr_event", {
+            "event": msg.event,
+            "event_name": self._ASR_EVENT_NAMES.get(msg.event, f"unknown_{msg.event}"),
+            "arg1": msg.arg1, "arg2": msg.arg2,
+        })
+
+    def _on_play_event(self, msg):
+        self._publish("lyre_play_event", {
+            "sid": msg.sid, "seq": msg.seq,
+            "event": msg.event,
+            "event_name": self._PLAY_EVENT_NAMES.get(msg.event, f"unknown_{msg.event}"),
+            "message": msg.message,
+        })
+
+    def _on_play_progress(self, msg):
+        self._publish("lyre_play_progress", {
+            "sid": msg.sid, "seq": msg.seq,
+            "position": msg.position, "duration": msg.duration,
+        })
+
+    def _on_tts_event(self, msg):
+        self._publish("lyre_tts_event", {
+            "sid": msg.sid, "seq": msg.seq,
+            "event": msg.event,
+            "event_name": self._PLAY_EVENT_NAMES.get(msg.event, f"unknown_{msg.event}"),
+            "message": msg.message,
+        })
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        tool_name = args.get("_tool_name", "lyre_keyword")
+        if tool_name not in self._topics:
+            return {"error": f"unknown tool: {tool_name}"}
+        if action in ("start", "stop", "info"):
+            return {"state": "running" if self._running else "idle",
+                    "topic_out": [{"topic": self._topics[tool_name], "format": "data/json"}]}
         return {"state": "running"}
 
 
@@ -852,32 +1519,39 @@ class ArmPlugin:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class WaistPlugin:
-    """腰部2DOF控制 (yaw/pitch)"""
+    """腰部偏航控制 (仅yaw, 俯仰角已禁用)
+
+    调用格式:
+      - 位置控制: {"action": "move_pos", "yaw": 30, "speed": 0.5}
+      - 标零:   {"action": "set_zero"}  (等价于 move_pos yaw=0)
+    """
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._ns = namespace
         self._ros2 = ros2
-        self._pub_node = Node("tianyi2_waist_pub", context=ros2.ctx_tianyi)
+        self._pub_node = Node("tianyi2_waist_cmd", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._pub_node)
-        self._publisher = None
+        self._pub_pos = None
 
     def get_tool(self) -> dict:
         return {
             "name": "waist",
             "type": "actuator",
-            "description": "天轶2.0 腰部控制 — 2DOF (yaw±160°, pitch -45°~120°)",
+            "description": "天轶2.0 腰部偏航控制 — 仅yaw (-160°~180°), 俯仰角已禁用",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["move_pos"],
-                               "description": "控制动作"},
-                    "yaw": {"type": "number", "description": "偏航角(度), 范围[-160, 180]"},
-                    "pitch": {"type": "number", "description": "俯仰角(度), 范围[-45, 120]"},
+                    "action": {"type": "string", "enum": ["move_pos", "set_zero"],
+                               "description": "控制模式"},
+                    "yaw": {"type": "number", "description": "偏航角(度), 范围[-160, 180], 默认0"},
+                    "speed": {"type": "number", "description": "运动速度(rad/s), 默认0.5"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "move_pos": {"params": ["yaw", "pitch"],
-                                 "description": "移动腰部到指定角度"},
+                    "move_pos": {"params": ["yaw", "speed"],
+                                 "description": "偏航模式: 移动腰部yaw到指定角度(度), 俯仰角已禁用"},
+                    "set_zero": {"params": [],
+                                 "description": "标零: 等价于 move_pos yaw=0"},
                 },
             },
         }
@@ -885,45 +1559,169 @@ class WaistPlugin:
     def start(self):
         try:
             from bodyctrl_msgs.msg import CmdSetMotorPosition
-            self._publisher = self._pub_node.create_publisher(
-                CmdSetMotorPosition, "/waist/cmd_pos", _RELIABLE_QOS)
-            print("[WaistPlugin] publisher created")
+            self._pub_pos  = self._pub_node.create_publisher(CmdSetMotorPosition, "/waist/cmd_pos", _RELIABLE_QOS)
+            print("[WaistPlugin] publisher created (/waist/cmd_pos)")
         except ImportError as e:
-            print(f"[WaistPlugin] WARNING: msg import failed ({e})")
+            print(f"[WaistPlugin] WARNING: {e}")
 
     def stop(self):
         pass
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "move_pos":
-            yaw = args.get("yaw", 0)
-            pitch = args.get("pitch", 0)
-            return self._send_pos(yaw, pitch)
-        elif action in ("start", "info"):
+            return self._send_pos(args.get("yaw", 0), args.get("speed", 0.5))
+        if action == "set_zero":
+            return self._send_pos(0)
+        if action in ("start", "info"):
             return {"state": "ready"}
-        elif action == "stop":
+        if action == "stop":
             return {"state": "idle"}
-        return {"error": f"unknown action: {action}"}
+        return {"ok": False, "code": "INVALID_ARGUMENT", "message": f"unknown action: {action}"}
 
-    def _send_pos(self, yaw_deg: float, pitch_deg: float) -> dict:
-        if not self._publisher:
-            return {"error": "publisher not initialized"}
+    def _send_pos(self, yaw_deg: float, speed_rad_s: float = 0.5) -> dict:
+        if not self._pub_pos:
+            return {"ok": False, "code": "COMMUNICATION_ERROR", "message": "publisher not ready"}
         try:
             from bodyctrl_msgs.msg import CmdSetMotorPosition, SetMotorPosition
             msg = CmdSetMotorPosition()
-            cmds = []
-            for motor_id, deg in [(31, yaw_deg), (32, pitch_deg)]:
-                cmd = SetMotorPosition()
-                cmd.name = motor_id
-                cmd.pos = _deg2rad(deg)
-                cmd.spd = 0.5  # rad/s
-                cmd.cur = 10.0  # A
-                cmds.append(cmd)
-            msg.cmds = cmds
-            self._publisher.publish(msg)
-            return {"state": "moving", "yaw": yaw_deg, "pitch": pitch_deg}
+            mid = 31  # waist_yaw_joint (俯仰角 motor 32 已禁用)
+            lim = _JOINT_LIMITS[mid]
+            pos_deg, clamped = _clamp(yaw_deg, lim[0], lim[1])
+            max_spd_rads = _rpm2rads(lim[2])
+            spd, _ = _clamp(speed_rad_s, 0, max_spd_rads)
+            cmd = SetMotorPosition()
+            cmd.name = mid
+            cmd.pos = _deg2rad(pos_deg)
+            cmd.spd = spd
+            msg.cmds.append(cmd)
+            if clamped:
+                return {"ok": False, "code": "JOINT_LIMIT_VIOLATION",
+                        "message": f"waist joint {mid} ({_ALL_JOINTS[mid]}) pos_deg out of range [{lim[0]}°, {lim[1]}°]"}
+            self._pub_pos.publish(msg)
+            return {"ok": True, "card": "waist", "action": "move_pos",
+                    "applied": [{"name": _ALL_JOINTS[mid], "pos_deg": pos_deg, "spd_rad_s": spd}]}
         except Exception as e:
-            return {"error": str(e)}
+            return {"ok": False, "code": "COMMUNICATION_ERROR", "message": str(e)}
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LegPlugin (actuator)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class LegPlugin:
+    """腿部2DOF — move_pos / set_zero (不支持 KP/KD)
+
+    调用格式:
+      - 位置控制: {"action": "move_pos", "hip": 30, "knee": 60, "speed": 0.5, "current": 10.0}
+      - 标零:   {"action": "set_zero"}  (回到归零位姿 hip=5°, knee=-20°)
+    """
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._pub_node = Node("tianyi2_leg_cmd", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._pub_node)
+        self._pub_pos = None
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "leg",
+            "type": "actuator",
+            "description": "天轶2.0 腿部控制 — 2DOF (hip: -40°~5°, knee: -23°~20°), 位置控制/标零",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["move_pos", "set_zero", "set_height"],
+                               "description": "控制模式"},
+                    "hip": {"type": "number", "description": "髋关节俯仰角(度), 范围[-40, 5], 默认0"},
+                    "knee": {"type": "number", "description": "膝关节俯仰角(度), 范围[-23, 20], 默认0"},
+                    "height": {"type": "number", "description": "腿高度(0-100), 0=归零最低, 100=最高"},
+                    "speed": {"type": "number", "description": "运动速度(rad/s), 默认0.5"},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "move_pos": {"params": ["hip", "knee", "speed"],
+                                 "description": "位置模式: 移动腿部到指定角度(度)"},
+                    "set_zero": {"params": [],
+                                 "description": "标零: 回到归零位姿 (hip=5°, knee=-20°)"},
+                    "set_height": {"params": ["height", "speed"],
+                                   "description": "高度模式: 0=归零最低, 100=最高, 线性插值hip/knee"},
+                },
+            },
+        }
+
+    def start(self):
+        try:
+            from bodyctrl_msgs.msg import CmdSetMotorPosition
+            self._pub_pos = self._pub_node.create_publisher(CmdSetMotorPosition, "/leg/cmd_pos", _RELIABLE_QOS)
+            print("[LegPlugin] publisher created (/leg/cmd_pos)")
+        except ImportError as e:
+            print(f"[LegPlugin] WARNING: {e}")
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "move_pos":
+            return self._send_pos(
+                args.get("hip", 0), args.get("knee", 0),
+                args.get("speed", 0.5), args.get("current", 5.0))
+        if action == "set_zero":
+            return self._send_pos(5.0, -20.0)
+        if action == "set_height":
+            return self._send_height(
+                args.get("height", 0),
+                args.get("speed", 0.5), args.get("current", 5.0))
+        if action in ("start", "info"):
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        return {"ok": False, "code": "INVALID_ARGUMENT", "message": f"unknown action: {action}"}
+
+    # 高度→关节角度映射（实测四点线性插值）
+    # height 0 (归零):  hip=5°,  knee=-20°
+    # height 100 (最高): hip=-40°, knee=20°
+    @staticmethod
+    def _height_to_angles(height: float) -> tuple:
+        h = max(0.0, min(100.0, height)) / 100.0  # clamp to [0,1]
+        hip_deg = 5.0 - 45.0 * h    # 5 → -40
+        knee_deg = -20.0 + 40.0 * h  # -20 → 20
+        return hip_deg, knee_deg
+
+    def _send_height(self, height: float, speed_rad_s: float = 0.5, current_a: float = 5.0) -> dict:
+        hip_deg, knee_deg = self._height_to_angles(height)
+        result = self._send_pos(hip_deg, knee_deg, speed_rad_s, current_a)
+        result["height"] = max(0.0, min(100.0, height))
+        return result
+
+    def _send_pos(self, hip_deg: float, knee_deg: float, speed_rad_s: float = 0.5, current_a: float = 5.0) -> dict:
+        if not self._pub_pos:
+            return {"ok": False, "code": "COMMUNICATION_ERROR", "message": "publisher not ready"}
+        try:
+            from bodyctrl_msgs.msg import CmdSetMotorPosition, SetMotorPosition
+            msg = CmdSetMotorPosition()
+            results = []
+            for mid, deg in [(51, hip_deg), (52, knee_deg)]:
+                lim = _JOINT_LIMITS[mid]
+                pos_deg, clamped = _clamp(deg, lim[0], lim[1])
+                max_spd_rads = _rpm2rads(lim[2])
+                spd, _ = _clamp(speed_rad_s, 0, max_spd_rads)
+                cur, _ = _clamp(current_a, 0, lim[3])
+                cmd = SetMotorPosition()
+                cmd.name = mid
+                cmd.pos = _deg2rad(pos_deg)
+                cmd.spd = spd
+                cmd.cur = cur
+                msg.cmds.append(cmd)
+                results.append({"name": _ALL_JOINTS[mid], "pos_deg": pos_deg, "spd_rad_s": spd, "cur_a": cur})
+                if clamped:
+                    return {"ok": False, "code": "JOINT_LIMIT_VIOLATION",
+                            "message": f"leg joint {mid} ({_ALL_JOINTS[mid]}) pos_deg out of range [{lim[0]}°, {lim[1]}°]"}
+            self._pub_pos.publish(msg)
+            return {"ok": True, "card": "leg", "action": "move_pos", "applied": results}
+        except Exception as e:
+            return {"ok": False, "code": "COMMUNICATION_ERROR", "message": str(e)}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1316,3 +2114,138 @@ class ChatPlugin:
         elif action == "stop":
             return {"state": "idle"}
         return {"error": f"unknown action: {action}"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LlmPlugin (actuator + sensor) — LLM 语音对话
+# ══════════════════════════════════════════════════════════════════════════════
+
+class LlmPlugin:
+    """LLM 语音对话 — 向大模型提问并获取回复"""
+
+    _LLM_EVENT_NAMES = {0: "started", 1: "completed", 2: "stopped", 3: "cancelled", 4: "failed"}
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._running = False
+
+        self._srv_node = Node("tianyi2_llm_srv", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._srv_node)
+        self._ask_client = None
+
+        self._sub_node = Node("tianyi2_llm_sub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._sub_node)
+        self._pub_node = Node("tianyi2_llm_pub", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._pub_node)
+
+        self._topic_rst = f"/{namespace}/lyre/llm_rst"
+        self._topic_event = f"/{namespace}/lyre/llm_event"
+        self._pub_rst = None
+        self._pub_event = None
+
+    def get_tools(self) -> list:
+        return [
+            {"name": "llm_ask", "type": "actuator",
+             "description": "天轶2.0 LLM 语音对话 — 向大模型发送文本问题",
+             "inputSchema": {
+                 "type": "object",
+                 "properties": {
+                     "action": {"type": "string", "enum": ["ask"], "description": "发送问题"},
+                     "text": {"type": "string", "description": "要发送的问题文本"},
+                     "id": {"type": "string", "description": "可选标识符，关联 ASR 识别 ID"},
+                 },
+                 "required": ["action", "text"],
+                 "x-action-params": {
+                     "ask": {"params": ["text", "id"], "description": "向 LLM 提问"},
+                 },
+             }},
+            {"name": "llm_rst", "type": "sensor",
+             "description": "天轶2.0 LLM 语音对话结果 — 大模型返回的文本回复",
+             "inputSchema": {"type": "object", "properties": {}},
+             "topic_out": [{"topic": self._topic_rst, "format": "data/json"}]},
+            {"name": "llm_event", "type": "sensor",
+             "description": "天轶2.0 LLM 语音对话事件 — 开始/完成/停止/取消/失败",
+             "inputSchema": {"type": "object", "properties": {}},
+             "topic_out": [{"topic": self._topic_event, "format": "data/json"}]},
+        ]
+
+    def start(self):
+        self._running = True
+        self._pub_rst = self._pub_node.create_publisher(String, self._topic_rst, _RELIABLE_QOS)
+        self._pub_event = self._pub_node.create_publisher(String, self._topic_event, _RELIABLE_QOS)
+
+        try:
+            from lyre_msgs.srv import LlmAsk
+            from lyre_msgs.msg import LlmRst, LlmEvent
+            self._ask_client = self._srv_node.create_client(LlmAsk, "/audio_llm/ask")
+            self._sub_node.create_subscription(
+                LlmRst, "/audio_llm/rst", self._on_llm_rst, _RELIABLE_QOS)
+            self._sub_node.create_subscription(
+                LlmEvent, "/audio_llm/event", self._on_llm_event, _RELIABLE_QOS)
+            print("[LlmPlugin] service client + 2 subscriptions created")
+        except ImportError as e:
+            print(f"[LlmPlugin] WARNING: lyre_msgs import failed ({e})")
+
+    def stop(self):
+        self._running = False
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        tool_name = args.get("_tool_name", "llm_ask")
+
+        if tool_name == "llm_ask":
+            if action == "ask":
+                text = args.get("text", "")
+                qid = args.get("id", "")
+                if not text:
+                    return {"error": "text is required"}
+                return self._ask(text, qid)
+            elif action in ("start", "info"):
+                return {"state": "ready"}
+            return {"error": f"unknown action: {action}"}
+
+        elif tool_name == "llm_rst":
+            if action in ("start", "stop", "info"):
+                return {"state": "running" if self._running else "idle",
+                        "topic_out": [{"topic": self._topic_rst, "format": "data/json"}]}
+            return {"state": "running"}
+
+        elif tool_name == "llm_event":
+            if action in ("start", "stop", "info"):
+                return {"state": "running" if self._running else "idle",
+                        "topic_out": [{"topic": self._topic_event, "format": "data/json"}]}
+            return {"state": "running"}
+
+        return {"error": f"unknown tool: {tool_name}"}
+
+    def _ask(self, text: str, qid: str) -> dict:
+        if not self._ask_client:
+            return {"error": "llm_ask service client not initialized"}
+        try:
+            from lyre_msgs.srv import LlmAsk
+            req = LlmAsk.Request()
+            req.text = text
+            req.id = qid
+            future = self._ask_client.call_async(req)
+            return {"state": "asking", "text": text[:100]}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _on_llm_rst(self, msg):
+        if not self._running:
+            return
+        out = String()
+        out.data = json.dumps({"sid": msg.sid, "seq": msg.seq, "last": msg.last, "text": msg.text})
+        self._pub_rst.publish(out)
+
+    def _on_llm_event(self, msg):
+        if not self._running:
+            return
+        out = String()
+        out.data = json.dumps({
+            "sid": msg.sid, "seq": msg.seq,
+            "event": msg.event,
+            "event_name": self._LLM_EVENT_NAMES.get(msg.event, f"unknown_{msg.event}"),
+            "message": msg.message,
+        })
+        self._pub_event.publish(out)
