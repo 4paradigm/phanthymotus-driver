@@ -19,6 +19,7 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   AsrPlugin        (sensor)             — 语音识别结果
   NavStatePlugin   (sensor)             — 底盘导航状态
   HeadPlugin       (actuator)           — 头部3DOF控制
+  HeadGesturePlugin (actuator)          — 点头/摇头/左右观察等语义动作
   ArmPlugin        (actuator)           — 双臂14DOF控制
   WaistPlugin      (actuator)           — 腰部2DOF控制
   HandPlugin       (actuator)           — 灵巧手控制
@@ -26,6 +27,8 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   NavPlugin        (actuator)           — 底盘导航控制
   ChatPlugin       (actuator)           — 语音交互开关
 """
+
+from __future__ import annotations
 
 import json
 import math
@@ -92,6 +95,19 @@ _LEG_JOINTS = {
 
 _ALL_JOINTS = {**_HEAD_JOINTS, **_ARM_LEFT_JOINTS, **_ARM_RIGHT_JOINTS, **_WAIST_JOINTS, **_LEG_JOINTS}
 
+_MOTOR_ERROR_DESCRIPTIONS = {
+    1: "motor_over_temperature",
+    2: "motor_over_current",
+    3: "motor_under_voltage",
+    4: "mos_over_temperature",
+    5: "motor_stall",
+    6: "motor_over_voltage",
+    7: "motor_phase_loss",
+    8: "encoder_error",
+    33072: "device_offline",
+    33073: "joint_position_out_of_range",
+}
+
 
 def _deg2rad(deg: float) -> float:
     return deg * math.pi / 180.0
@@ -99,6 +115,58 @@ def _deg2rad(deg: float) -> float:
 
 def _rad2deg(rad: float) -> float:
     return rad * 180.0 / math.pi
+
+
+def _clamp(value: float, lower: float, upper: float) -> float:
+    """Clamp a numeric input to a safe, documented range."""
+    return max(lower, min(upper, float(value)))
+
+
+class _ActionSequence:
+    """Run one cancellable actuator sequence at a time."""
+
+    def __init__(self, name: str):
+        self._name = name
+        self._lock = threading.Lock()
+        self._cancel_event: threading.Event | None = None
+        self._thread: threading.Thread | None = None
+
+    def start(self, worker) -> None:
+        self.cancel()
+        cancel_event = threading.Event()
+
+        def _run():
+            try:
+                worker(cancel_event)
+            except Exception as e:
+                print(f"[{self._name}] sequence failed: {e}")
+            finally:
+                with self._lock:
+                    if self._cancel_event is cancel_event:
+                        self._cancel_event = None
+                        self._thread = None
+
+        thread = threading.Thread(
+            target=_run, name=f"{self._name}_sequence", daemon=True)
+        with self._lock:
+            self._cancel_event = cancel_event
+            self._thread = thread
+        thread.start()
+
+    def cancel(self) -> bool:
+        with self._lock:
+            cancel_event = self._cancel_event
+            thread = self._thread
+        if cancel_event is None:
+            return False
+        cancel_event.set()
+        if thread and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+        with self._lock:
+            if self._cancel_event is cancel_event:
+                self._cancel_event = None
+                self._thread = None
+        return True
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -611,9 +679,9 @@ class NavStatePlugin:
         return {"state": "running"}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 # HeadPlugin (actuator)
-# ══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════════
 
 class HeadPlugin:
     """头部3DOF位置控制 (roll/pitch/yaw)"""
@@ -708,8 +776,420 @@ class HeadPlugin:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ArmPlugin (actuator)
+# HeadGesturePlugin (actuator)
 # ══════════════════════════════════════════════════════════════════════════════
+
+class HeadGesturePlugin:
+    """可取消的头部语义动作序列。"""
+
+    _STATUS_MAX_AGE = 2.0
+    _FEEDBACK_TIMEOUT = 2.0
+    _MOVE_THRESHOLD_RAD = _deg2rad(0.5)
+    _TARGET_TOLERANCE_RAD = _deg2rad(3.0)
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._pub_node = Node("tianyi2_head_gesture_pub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._pub_node)
+        self._publisher = None
+        self._sequence = _ActionSequence("HeadGesturePlugin")
+        self._feedback_condition = threading.Condition()
+        self._head_status = {}
+        self._head_status_seq = 0
+        self._head_status_time = None
+        self._power_status = {}
+        self._power_status_time = None
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "head_gesture",
+            "type": "actuator",
+            "description": "天轶2.0 头部语义动作 — 点头、摇头、左右观察、歪头和回正",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["nod", "shake", "scan", "tilt", "reset", "stop"],
+                        "default": "nod",
+                        "description": "头部动作，可选[nod, shake, scan, tilt, reset, stop]",
+                    },
+                    "cycles": {
+                        "type": "integer", "minimum": 1, "maximum": 5,
+                        "default": 2, "description": "循环次数，范围[1, 5]，默认2",
+                    },
+                    "nod_amplitude": {
+                        "type": "number", "minimum": 5, "maximum": 20,
+                        "default": 12,
+                        "description": "点头向下幅度(度)，范围[5, 20]，默认12",
+                    },
+                    "shake_amplitude": {
+                        "type": "number", "minimum": 5, "maximum": 45,
+                        "default": 25,
+                        "description": "摇头左右幅度(度)，范围[5, 45]，默认25",
+                    },
+                    "scan_amplitude": {
+                        "type": "number", "minimum": 5, "maximum": 45,
+                        "default": 25,
+                        "description": "左右观察幅度(度)，范围[5, 45]，默认25",
+                    },
+                    "scan_hold": {
+                        "type": "number", "minimum": 0.2, "maximum": 3.0,
+                        "default": 1.0,
+                        "description": "左右观察时每侧停留时间(秒)，范围[0.2, 3.0]，默认1.0",
+                    },
+                    "tilt_amplitude": {
+                        "type": "number", "minimum": 5, "maximum": 20,
+                        "default": 12,
+                        "description": "歪头幅度(度)，范围[5, 20]，默认12",
+                    },
+                    "speed": {
+                        "type": "number", "minimum": 5, "maximum": 60,
+                        "default": 30,
+                        "description": "动作速度(度/秒)，范围[5, 60]，默认30",
+                    },
+                    "side": {
+                        "type": "string", "enum": ["left", "right"],
+                        "default": "left",
+                        "description": "歪头方向，可选[left, right]，默认left",
+                    },
+                    "hold": {
+                        "type": "number", "minimum": 0.2, "maximum": 3.0,
+                        "default": 0.8,
+                        "description": "歪头保持时间(秒)，范围[0.2, 3.0]，默认0.8",
+                    },
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "nod": {"params": ["cycles", "nod_amplitude", "speed"], "description": "向下点头后回正，不经过抬头姿态"},
+                    "shake": {"params": ["cycles", "shake_amplitude", "speed"], "description": "在左右方向之间连续摇头后回正"},
+                    "scan": {"params": ["cycles", "scan_amplitude", "speed", "scan_hold"], "description": "依次观察左侧并停留、回中、观察右侧并停留、回中"},
+                    "tilt": {"params": ["side", "tilt_amplitude", "speed", "hold"], "description": "向指定方向歪头、保持后回正"},
+                    "reset": {"params": ["speed"], "description": "取消序列并将头部回正"},
+                    "stop": {"params": [], "description": "取消尚未发送的后续动作帧"},
+                },
+            },
+        }
+
+    def start(self):
+        try:
+            from bodyctrl_msgs.msg import (
+                CmdSetMotorPosition, MotorStatusMsg, PowerBoardKeyStatus)
+            self._publisher = self._pub_node.create_publisher(
+                CmdSetMotorPosition, "/head/cmd_pos", _RELIABLE_QOS)
+            self._pub_node.create_subscription(
+                MotorStatusMsg, "/head/status",
+                self._on_head_status, _RELIABLE_QOS)
+            self._pub_node.create_subscription(
+                PowerBoardKeyStatus, "/power/board/key_status",
+                self._on_power_status, _RELIABLE_QOS)
+            print("[HeadGesturePlugin] publisher and feedback subscriptions created")
+        except ImportError as e:
+            print(f"[HeadGesturePlugin] WARNING: msg import failed ({e})")
+
+    def stop(self):
+        self._sequence.cancel()
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "info"):
+            return {
+                "state": "ready" if self._publisher else "idle",
+                "feedback_supported": True,
+                "feedback_topic": "/head/status",
+            }
+        if action == "stop":
+            return {"state": "stopped", "cancelled": self._sequence.cancel()}
+        if action == "reset":
+            self._sequence.cancel()
+            check = self._preflight()
+            if check is not None:
+                return check
+            baseline_seq, baseline = self._feedback_snapshot()
+            result = self._publish_pose(0, 0, 0, args.get("speed", 30))
+            if "error" in result:
+                return result
+            return self._wait_for_head_feedback(
+                (0, 0, 0), baseline_seq, baseline)
+        if action not in ("nod", "shake", "scan", "tilt"):
+            return {"error": f"unknown action: {action}"}
+        if not self._publisher:
+            return {"error": "publisher not initialized"}
+        check = self._preflight()
+        if check is not None:
+            return check
+
+        cycles = int(_clamp(args.get("cycles", 2), 1, 5))
+        speed = _clamp(args.get("speed", 30), 5, 60)
+        amplitude_specs = {
+            "nod": ("nod_amplitude", 12, 20),
+            "shake": ("shake_amplitude", 25, 45),
+            "scan": ("scan_amplitude", 25, 45),
+            "tilt": ("tilt_amplitude", 12, 20),
+        }
+        amplitude_key, amplitude_default, amplitude_max = amplitude_specs[action]
+        amplitude = _clamp(
+            args.get(amplitude_key, amplitude_default), 5, amplitude_max)
+
+        frames: list[tuple[float, float, float, float]] = []
+        if action == "nod":
+            for _ in range(cycles):
+                frames.extend([(0, amplitude, 0, amplitude / speed),
+                               (0, 0, 0, amplitude / speed)])
+        elif action == "shake":
+            for _ in range(cycles):
+                frames.extend([(amplitude, 0, 0, amplitude / speed),
+                               (-amplitude, 0, 0, 2 * amplitude / speed)])
+        elif action == "scan":
+            scan_hold = _clamp(args.get("scan_hold", 1.0), 0.2, 3.0)
+            for _ in range(cycles):
+                frames.extend([(amplitude, 0, 0, amplitude / speed + scan_hold),
+                               (0, 0, 0, amplitude / speed),
+                               (-amplitude, 0, 0, amplitude / speed + scan_hold),
+                               (0, 0, 0, amplitude / speed)])
+        else:
+            roll = amplitude if args.get("side", "left") == "left" else -amplitude
+            hold = _clamp(args.get("hold", 0.8), 0.2, 3.0)
+            frames.append((0, 0, roll, amplitude / speed + hold))
+        frames.append((0, 0, 0, max(0.15, amplitude / speed)))
+
+        def _worker(cancel_event: threading.Event):
+            for yaw, pitch, roll, delay in frames:
+                if cancel_event.is_set():
+                    return
+                result = self._publish_pose(yaw, pitch, roll, speed)
+                if "error" in result or cancel_event.wait(max(0.15, delay)):
+                    return
+
+        baseline_seq, baseline = self._feedback_snapshot()
+        self._sequence.start(_worker)
+        first_target = frames[0][:3]
+        feedback = self._wait_for_head_feedback(
+            first_target, baseline_seq, baseline)
+        if feedback.get("state") == "error":
+            self._sequence.cancel()
+            return feedback
+        return {
+            "state": "running", "gesture": action, "cycles": cycles,
+            "amplitude": amplitude, "speed": speed,
+            "feedback_verified": True,
+            "feedback": feedback,
+        }
+
+    def _on_head_status(self, msg):
+        now = time.monotonic()
+        with self._feedback_condition:
+            self._head_status = {
+                int(motor.name): {
+                    "pos": float(motor.pos),
+                    "speed": float(motor.speed),
+                    "current": float(motor.current),
+                    "temperature": float(motor.temperature),
+                    "error": int(motor.error),
+                }
+                for motor in msg.status
+            }
+            self._head_status_seq += 1
+            self._head_status_time = now
+            self._feedback_condition.notify_all()
+
+    def _on_power_status(self, msg):
+        now = time.monotonic()
+        with self._feedback_condition:
+            self._power_status = {
+                "is_estop": bool(msg.is_estop.data),
+                "is_remote_estop": bool(msg.is_remote_estop.data),
+                "is_power_on": bool(msg.is_power_on.data),
+            }
+            self._power_status_time = now
+            self._feedback_condition.notify_all()
+
+    def _error_result(self, code: str, message: str, **details) -> dict:
+        result = {
+            "state": "error",
+            "error": message,
+            "code": code,
+        }
+        result.update(details)
+        return result
+
+    def _active_motor_faults(self) -> list[dict]:
+        faults = []
+        for motor_id in _HEAD_JOINTS:
+            status = self._head_status.get(motor_id)
+            if status is None or status["error"] == 0:
+                continue
+            error_code = status["error"]
+            faults.append({
+                "motor_id": motor_id,
+                "joint": _HEAD_JOINTS[motor_id],
+                "error_code": error_code,
+                "description": _MOTOR_ERROR_DESCRIPTIONS.get(
+                    error_code, "unknown_vendor_error"),
+            })
+        return faults
+
+    def _preflight(self) -> dict | None:
+        if not self._publisher:
+            return self._error_result(
+                "publisher_not_initialized",
+                "head command publisher is not initialized")
+        now = time.monotonic()
+        with self._feedback_condition:
+            if self._head_status_time is None:
+                return self._error_result(
+                    "head_status_unavailable",
+                    "No /head/status received; head controller may not be running",
+                    diagnosis=[
+                        "check robot body-control program",
+                        "complete robot self-check and confirm Ready state",
+                        "check ROS_DOMAIN_ID and /head/status",
+                    ],
+                )
+            status_age = now - self._head_status_time
+            if status_age > self._STATUS_MAX_AGE:
+                return self._error_result(
+                    "head_status_stale",
+                    f"/head/status is stale ({status_age:.2f}s)",
+                    diagnosis=[
+                        "check robot body-control program",
+                        "check ROS communication",
+                    ],
+                )
+            missing = [
+                motor_id for motor_id in _HEAD_JOINTS
+                if motor_id not in self._head_status
+            ]
+            if missing:
+                return self._error_result(
+                    "head_motors_missing",
+                    "Head motors are missing from /head/status",
+                    missing_motor_ids=missing,
+                )
+            faults = self._active_motor_faults()
+            if faults:
+                return self._error_result(
+                    "head_motor_fault", "Head has active motor faults",
+                    faults=faults,
+                )
+            if (self._power_status_time is not None
+                    and now - self._power_status_time <= self._STATUS_MAX_AGE):
+                if (self._power_status.get("is_estop")
+                        or self._power_status.get("is_remote_estop")):
+                    return self._error_result(
+                        "emergency_stop_active",
+                        "Physical or remote emergency stop is active",
+                        power_status=dict(self._power_status),
+                    )
+                if not self._power_status.get("is_power_on", True):
+                    return self._error_result(
+                        "robot_power_off", "Robot power board reports power off",
+                        power_status=dict(self._power_status),
+                    )
+        return None
+
+    def _feedback_snapshot(self) -> tuple[int, dict[int, float]]:
+        with self._feedback_condition:
+            return self._head_status_seq, {
+                motor_id: self._head_status[motor_id]["pos"]
+                for motor_id in _HEAD_JOINTS
+                if motor_id in self._head_status
+            }
+
+    def _wait_for_head_feedback(
+            self, target: tuple[float, float, float],
+            baseline_seq: int, baseline: dict[int, float]) -> dict:
+        yaw, pitch, roll = target
+        targets = {
+            1: _deg2rad(float(roll)),
+            2: _deg2rad(float(pitch)),
+            3: _deg2rad(float(yaw)),
+        }
+        deadline = time.monotonic() + self._FEEDBACK_TIMEOUT
+        received_new_status = False
+        with self._feedback_condition:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                if self._head_status_seq <= baseline_seq:
+                    self._feedback_condition.wait(remaining)
+                    continue
+                received_new_status = True
+                faults = self._active_motor_faults()
+                if faults:
+                    return self._error_result(
+                        "head_motor_fault_after_command",
+                        "Head motor fault appeared after command",
+                        faults=faults,
+                    )
+                positions = {
+                    motor_id: self._head_status[motor_id]["pos"]
+                    for motor_id in _HEAD_JOINTS
+                }
+                moved = max(
+                    abs(positions[motor_id] - baseline[motor_id])
+                    for motor_id in _HEAD_JOINTS
+                )
+                target_error = max(
+                    abs(positions[motor_id] - targets[motor_id])
+                    for motor_id in _HEAD_JOINTS
+                )
+                if (moved >= self._MOVE_THRESHOLD_RAD
+                        or target_error <= self._TARGET_TOLERANCE_RAD):
+                    return {
+                        "state": "moving",
+                        "status_topic": "/head/status",
+                        "max_movement_deg": round(_rad2deg(moved), 2),
+                        "max_target_error_deg": round(
+                            _rad2deg(target_error), 2),
+                    }
+                self._feedback_condition.wait(0.05)
+        if not received_new_status:
+            return self._error_result(
+                "head_feedback_timeout",
+                "Command was published but no new /head/status was received",
+                diagnosis=[
+                    "check head controller and ROS communication",
+                    "confirm robot self-check completed and robot is Ready",
+                ],
+            )
+        return self._error_result(
+            "head_no_motion",
+            "Command was published and head status updated, but no joint moved",
+            diagnosis=[
+                "robot may not be Ready or self-check may be incomplete",
+                "head controller may be disabled or rejecting commands",
+                "another node may be publishing competing /head/cmd_pos commands",
+            ],
+        )
+
+    def _publish_pose(self, yaw_deg: float, pitch_deg: float,
+                      roll_deg: float, speed_deg: float) -> dict:
+        if not self._publisher:
+            return {"error": "publisher not initialized"}
+        try:
+            from bodyctrl_msgs.msg import CmdSetMotorPosition, SetMotorPosition
+            yaw_deg = _clamp(yaw_deg, -90, 90)
+            pitch_deg = _clamp(pitch_deg, -25, 25)
+            roll_deg = _clamp(roll_deg, -26, 26)
+            speed_rad = _deg2rad(_clamp(speed_deg, 5, 60))
+            msg = CmdSetMotorPosition()
+            msg.cmds = []
+            for motor_id, deg in [(1, roll_deg), (2, pitch_deg), (3, yaw_deg)]:
+                cmd = SetMotorPosition()
+                cmd.name = motor_id
+                cmd.pos = _deg2rad(deg)
+                cmd.spd = speed_rad
+                cmd.cur = 3.0
+                msg.cmds.append(cmd)
+            self._publisher.publish(msg)
+            return {"state": "moving", "yaw": yaw_deg, "pitch": pitch_deg, "roll": roll_deg}
+        except Exception as e:
+            return {"error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ArmPlugin (actuator)
+# ════════════════════════════════════════════════════════════════════════════════
 
 class ArmPlugin:
     """双臂14DOF控制 (位置模式 / 力位混合)"""
@@ -847,9 +1327,10 @@ class ArmPlugin:
             return {"error": str(e)}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════
 # WaistPlugin (actuator)
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 
 class WaistPlugin:
     """腰部2DOF控制 (yaw/pitch)"""

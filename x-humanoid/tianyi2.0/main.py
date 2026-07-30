@@ -122,6 +122,12 @@ class TianyiDeviceBundle:
             self._plugins.append(HeadPlugin(plugins_cfg["head"], namespace, ros2))
             print("[bundle] HeadPlugin loaded")
 
+        if plugins_cfg.get("head_gesture", {}).get("enabled", False):
+            from device import HeadGesturePlugin
+            self._plugins.append(HeadGesturePlugin(
+                plugins_cfg["head_gesture"], namespace, ros2))
+            print("[bundle] HeadGesturePlugin loaded")
+
         if plugins_cfg.get("arm", {}).get("enabled", False):
             from device import ArmPlugin
             self._plugins.append(ArmPlugin(plugins_cfg["arm"], namespace, ros2))
@@ -270,7 +276,17 @@ def make_handler():
                     if result is None:
                         err(-32601, f"Unknown tool: {name}")
                     else:
-                        ok({"content": [{"type": "text", "text": json.dumps(result)}]})
+                        tool_result = {
+                            "content": [{
+                                "type": "text",
+                                "text": json.dumps(result),
+                            }],
+                        }
+                        if (isinstance(result, dict)
+                                and (result.get("state") == "error"
+                                     or "error" in result)):
+                            tool_result["isError"] = True
+                        ok(tool_result)
                 else:
                     err(-32601, f"Method not found: {method}")
             except Exception as e:
