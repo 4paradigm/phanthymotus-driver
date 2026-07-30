@@ -1,0 +1,1005 @@
+- generic [active] [ref=f2e1]:
+  - generic [ref=f2e3]:
+    - banner [ref=f2e4]:
+      - generic [ref=f2e5]:
+        - link [ref=f2e6] [cursor=pointer]:
+          - /url: https://developer.dji.com/cn
+          - img "Payload SDK" [ref=f2e7]
+        - link "Payload SDK" [ref=f2e8] [cursor=pointer]:
+          - /url: https://developer.dji.com/cn/payload-sdk/
+      - generic [ref=f2e9]:
+        - navigation [ref=f2e10]:
+          - link "API Reference" [ref=f2e12] [cursor=pointer]:
+            - /url: https://developer.dji.com/doc/payload-sdk-api-reference/cn/
+            - text: API Reference
+            - generic [ref=f2e13]: open in new window
+          - link "下载" [ref=f2e19] [cursor=pointer]:
+            - /url: https://github.com/dji-sdk/Payload-SDK/releases
+            - text: 下载
+            - generic [ref=f2e20]: open in new window
+          - link "v3.16.0" [ref=f2e26] [cursor=pointer]:
+            - /url: /doc/payload-sdk-tutorial/cn/payload-quick-start/getting-started-with-psdk.html
+          - button "Select language" [ref=f2e29] [cursor=pointer]: Languages
+        - button "Search" [ref=f2e32] [cursor=pointer]:
+          - generic [ref=f2e33]: 搜索
+          - generic [ref=f2e37]:
+            - generic [ref=f2e38]: ⌘
+            - generic [ref=f2e39]: K
+    - complementary [ref=f2e40]:
+      - list [ref=f2e41]:
+        - listitem [ref=f2e42]:
+          - link "版本发布记录" [ref=f2e43] [cursor=pointer]:
+            - /url: /doc/payload-sdk-tutorial/cn/index.html
+        - listitem [ref=f2e44]:
+          - paragraph [ref=f2e45] [cursor=pointer]: 产品简介
+        - listitem [ref=f2e47]:
+          - paragraph [ref=f2e48] [cursor=pointer]: 开发准备
+        - listitem [ref=f2e50]:
+          - paragraph [ref=f2e51] [cursor=pointer]: 负载开发入门
+          - list [ref=f2e53]:
+            - listitem [ref=f2e54]:
+              - paragraph [ref=f2e55]: 快速体验 Demo
+            - listitem [ref=f2e57]:
+              - paragraph [ref=f2e58]: 配置硬件环境
+            - listitem [ref=f2e60]:
+              - link "配置开发环境" [ref=f2e61] [cursor=pointer]:
+                - /url: /doc/payload-sdk-tutorial/cn/payload-quick-start/config-develop-environment.html
+            - listitem [ref=f2e62]:
+              - link "开始使用 PSDK" [ref=f2e63] [cursor=pointer]:
+                - /url: /doc/payload-sdk-tutorial/cn/payload-quick-start/getting-started-with-psdk.html
+              - list:
+                - listitem
+                - listitem
+                - listitem
+                - listitem
+                - listitem:
+                  - list:
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+                - listitem:
+                  - list:
+                    - listitem
+                    - listitem
+                    - listitem
+                    - listitem
+            - listitem [ref=f2e64]:
+              - link "应用绑定" [ref=f2e65] [cursor=pointer]:
+                - /url: /doc/payload-sdk-tutorial/cn/payload-quick-start/bind-application.html
+        - listitem [ref=f2e66]:
+          - paragraph [ref=f2e67] [cursor=pointer]: 妙算开发入门
+        - listitem [ref=f2e69]:
+          - paragraph [ref=f2e70] [cursor=pointer]: 功能介绍
+        - listitem [ref=f2e72]:
+          - link "常见问题" [ref=f2e73] [cursor=pointer]:
+            - /url: /doc/payload-sdk-tutorial/cn/faq.html
+    - main [ref=f2e74]:
+      - generic [ref=f2e75]:
+        - generic [ref=f2e76]:
+          - heading "开始使用 PSDK" [level=1] [ref=f2e77]
+          - generic [ref=f2e78]:
+            - generic [ref=f2e79]: 2026-03-05
+            - generic [ref=f2e83]:
+              - slider "rating" [ref=f2e84]
+              - generic [ref=f2e105]: 暂无评分
+            - link "Github Edit" [ref=f2e107] [cursor=pointer]:
+              - /url: https://github.com/dji-sdk/Payload-SDK-Tutorial/blob/master/docs/cn/30.payload-quick-start/04.getting-started-with-psdk.md
+              - text: Github Edit
+              - generic [ref=f2e108]: open in new window
+        - generic [ref=f2e114]:
+          - heading "PSDK 开发包目录结构" [level=2] [ref=f2e115]:
+            - link [ref=f2e116] [cursor=pointer]:
+              - /url: "#psdk-开发包目录结构"
+              - text: "#"
+            - text: PSDK 开发包目录结构
+          - paragraph [ref=f2e117]: PSDK 开发包主要由文档、库文件、示例程序及工具组成，目录结构说明如下：
+          - list [ref=f2e118]:
+            - listitem [ref=f2e119]:
+              - paragraph [ref=f2e120]:
+                - strong [ref=f2e121]: doc
+                - text: ：文档目录，包含与无人机和负载设备相关的说明文件。
+              - list [ref=f2e122]:
+                - listitem [ref=f2e123]:
+                  - strong [ref=f2e124]: simple_model
+                  - text: ：无人机与负载设备相关的模型文件。
+                - listitem [ref=f2e125]:
+                  - strong [ref=f2e126]: psdk_other_docs
+                  - text: ：其他辅助文档，如编码规范说明等 。
+            - listitem [ref=f2e127]:
+              - paragraph [ref=f2e128]:
+                - strong [ref=f2e129]: psdk_lib
+                - text: ：PSDK 提供的功能接口及对应实现。
+              - list [ref=f2e130]:
+                - listitem [ref=f2e131]:
+                  - strong [ref=f2e132]: include
+                  - text: ：各功能模块对应的头文件。
+                - listitem [ref=f2e133]:
+                  - strong [ref=f2e134]: lib
+                  - text: ：不同平台对应的静态库文件。
+            - listitem [ref=f2e135]:
+              - paragraph [ref=f2e136]:
+                - strong [ref=f2e137]: sample
+                - text: ：PSDK 官方示例代码，用于功能验证与二次开发参考。
+              - list [ref=f2e138]:
+                - listitem [ref=f2e139]:
+                  - strong [ref=f2e140]: module_sample
+                  - text: ：包含 PSDK 各功能模块的示例代码及可调用 API。
+                - listitem [ref=f2e141]:
+                  - strong [ref=f2e142]: platform
+                  - text: ：Sample 工程目录，包含编译文件、初始化文件、用户信息配置等。
+            - listitem [ref=f2e143]:
+              - paragraph [ref=f2e144]:
+                - strong [ref=f2e145]: tools
+                - text: ：二进制文件转头文件工具 file2c
+            - listitem [ref=f2e146]:
+              - paragraph [ref=f2e147]:
+                - strong [ref=f2e148]: CMakeLists.txt
+                - text: ：项目构建配置文件，用于定义 PSDK 工程的编译方式和构建流程。
+          - heading "引入静态库" [level=2] [ref=f2e149]:
+            - link [ref=f2e150] [cursor=pointer]:
+              - /url: "#引入静态库"
+              - text: "#"
+            - text: 引入静态库
+          - paragraph [ref=f2e151]: 开发者需根据所使用的开发平台，在 PSDK 开发包 psdk_lib/lib 目录下选择对应平台的静态库。
+          - list [ref=f2e152]:
+            - listitem [ref=f2e153]: Linux： 在 Linux 平台上开发负载设备时，需通过修改 CMakeLists.txt 中的信息，引入静态库 libpayloadsdk.a。
+          - generic [ref=f2e154]:
+            - code [ref=f2e156]: "link_directories(${CMAKE_CURRENT_LIST_DIR}/../../../../../psdk_lib/lib/aarch64-linu x-gnu-gcc) /*指定静态库的路径 */link_libraries(${CMAKE_CURRENT_LIST_DIR}/../../../../../psdk_lib/lib/aarch64-linux -gnu-gcc/libpayloadsdk.a) /*调用静态库*/"
+            - button "Copy code" [ref=f2e975] [cursor=pointer]
+          - list [ref=f2e160]:
+            - listitem [ref=f2e161]: RTOS 在 MDK 的工程中，将静态库 payloadsdk.lib 添加到工程文件所在的目录下。
+          - heading "引入头文件" [level=2] [ref=f2e162]:
+            - link [ref=f2e163] [cursor=pointer]:
+              - /url: "#引入头文件"
+              - text: "#"
+            - text: 引入头文件
+          - paragraph [ref=f2e164]:
+            - text: 开发者在开发负载设备前，需要引用所需功能的头文件，引用该头文件后，开发者即可调用该头文件中的接口开发所需的功能。 每个头文件对应 PSDK 中的一个功能模块，如
+            - code [ref=f2e165]: "#include \"psdk_payload_camera.h\""
+            - text: 对应 PSDK 的相机功能。 可以引入的头文件位于
+            - code [ref=f2e166]: . \psdk_lib\include
+            - text: 路径下。
+          - list [ref=f2e167]:
+            - listitem [ref=f2e168]:
+              - text: Linux 在 CMakeLists.txt 中添加头文件的引用路径
+              - code [ref=f2e169]: include_directories(../../../../../psdk_lib/api_headers)
+              - text: 后，开发者即可在代码文件中以如下方式引用头文件。
+          - generic [ref=f2e170]:
+            - code [ref=f2e172]: "#include <dji_platform.h> #include <dji_logger.h> #include <dji_core.h>"
+            - button "Copy code" [ref=f2e976] [cursor=pointer]
+          - list [ref=f2e177]:
+            - listitem [ref=f2e178]: RTOS 在 MDK 的工程配置中添加头文件路径，开发者在添加头文件的路径后，开发者即可在代码文件中以如下方式引用头文件。
+          - generic [ref=f2e179]:
+            - code [ref=f2e181]: "#include \"dji_sdk_app_info.h\" #include \"dji_sdk_config.h\" #include \"dji_core.h\" #include \"dji_aircraft_info.h\" #include \"dji_logger.h\""
+            - button "Copy code" [ref=f2e977] [cursor=pointer]
+          - heading "引入编译宏" [level=2] [ref=f2e188]:
+            - link [ref=f2e189] [cursor=pointer]:
+              - /url: "#引入编译宏"
+              - text: "#"
+            - text: 引入编译宏
+          - paragraph [ref=f2e190]: 说明： 请务必在代码开发前添加编译宏。 Linux 和 RTOS 需通过对应的编译宏使能对应平台所特有的功能，使能：1；关闭：0；
+          - list [ref=f2e191]:
+            - listitem [ref=f2e192]: Linux ：PSDK_ARCH_SYS_LINUX = 1
+            - listitem [ref=f2e193]: RTOS ：PSDK_ARCH_SYS_RTOS = 1
+          - heading "PSDK 初始化" [level=2] [ref=f2e194]:
+            - link [ref=f2e195] [cursor=pointer]:
+              - /url: "#psdk-初始化"
+              - text: "#"
+            - text: PSDK 初始化
+          - paragraph [ref=f2e196]: 使用 PSDK 开发负载设备时，必须先注册 Platform 模块，再初始化 PSDK 模块。
+          - heading "注册 Platform 模块" [level=3] [ref=f2e197]:
+            - link [ref=f2e198] [cursor=pointer]:
+              - /url: "#注册-platform-模块"
+              - text: "#"
+            - text: 注册 Platform 模块
+          - paragraph [ref=f2e199]:
+            - text: 通过注册 Hal 和 Osal 层处理函数，使基于 PSDK 开发的负载设备控制程序可移植到其他软硬件平台上，详细介绍参考
+            - link "跨平台移植" [ref=f2e200] [cursor=pointer]:
+              - /url: "#跨平台移植"
+            - text: 。
+          - generic [ref=f2e201]:
+            - paragraph [ref=f2e202]: 注意：
+            - paragraph [ref=f2e203]: 在 RTOS 系统上开发负载设备时，须在 RTOS 操作系统的线程中注册 Hal 层和 Osal 层函数，确保在调度器工作时可被线程正常调用。
+          - paragraph [ref=f2e204]: 用户可根据所用的硬件条件，确定需要注册的接口：
+          - heading "1. 注册 Hal 层网口函数" [level=4] [ref=f2e205]:
+            - link [ref=f2e206] [cursor=pointer]:
+              - /url: "#_1-注册-hal-层网口函数"
+              - text: "#"
+            - text: 1. 注册 Hal 层网口函数
+          - paragraph [ref=f2e207]:
+            - text: 通过注册
+            - strong [ref=f2e208]: Hal 层网口函数
+            - text: ，负载设备控制程序可通过
+            - strong [ref=f2e209]: 网络接口
+            - text: 与无人机进行通信。 网口属于
+            - strong [ref=f2e210]: 可选通信接口
+            - text: ，如需使用以下功能，请确保负载设备的硬件设计支持网口能力。
+            - strong [ref=f2e211]: 依赖网口的相关功能如下：
+          - list [ref=f2e212]:
+            - listitem [ref=f2e213]: Linux：自定义控件功能、回放下载功能、高速数据通道传输功能、MOP 功能
+            - listitem [ref=f2e214]: RTOS：高速数据通道传输功能
+          - generic [ref=f2e215]:
+            - text: c
+            - code [ref=f2e217]: "T_DjiReturnCode HalNetWork_Init(const char *ipAddr, const char *netMask, T_DjiNetworkHandle *halObj) { int32_t ret; char cmdStr[LINUX_CMD_STR_MAX_SIZE]; if (ipAddr == NULL || netMask == NULL) { USER_LOG_ERROR(\"hal network config param error\"); return DJI_ERROR_SYSTEM_MODULE_CODE_INVALID_PARAMETER; } //Attention: need root permission to config ip addr and netmask. memset(cmdStr, 0, sizeof(cmdStr)); snprintf(cmdStr, sizeof(cmdStr), \"ifconfig %s up\", LINUX_NETWORK_DEV); ret = system(cmdStr); if (ret != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) { USER_LOG_ERROR(\"Can't open the network.\" \"Probably the program not execute with root permission.\" \"Please use the root permission to execute the program.\"); return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR; } snprintf(cmdStr, sizeof(cmdStr), \"ifconfig %s %s netmask %s\", LINUX_NETWORK_DEV, ipAddr, netMask); ret = system(cmdStr); if (ret != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) { USER_LOG_ERROR(\"Can't config the ip address of network.\" \"Probably the program not execute with root permission.\" \"Please use the root permission to execute the program.\"); return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR; } return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS; }"
+            - button "Copy code" [ref=f2e978] [cursor=pointer]
+          - list [ref=f2e252]:
+            - listitem [ref=f2e253]:
+              - text: 如需以自动的方式配置负载设备的网络信息，请使用
+              - code [ref=f2e254]: DjiPlatform_RegHalNetworkHandler ()
+              - text: 函数适配 Hal 层。
+            - listitem [ref=f2e255]:
+              - text: 仅基于 Linux 开发的负载设备支持开发者使用网口与无人机通信，开发者需通过 ifconfig 命令配置或传输配置信息，详情请参见
+              - code [ref=f2e256]: sample/platform/linux/manifold2/hal/hal_network.c
+          - heading "2. 注册 Hal 层串口函数" [level=4] [ref=f2e257]:
+            - link [ref=f2e258] [cursor=pointer]:
+              - /url: "#_2-注册-hal-层串口函数"
+              - text: "#"
+            - text: 2. 注册 Hal 层串口函数
+          - paragraph [ref=f2e259]: 通过注册 Hal 层串口设备的函数，负载设备控制程序能够通过开发平台的串口与无人机通信，实现负载设备控制程序在不同硬件平台上的移植。
+          - generic [ref=f2e260]:
+            - text: c
+            - code [ref=f2e262]: "returnCode = DjiPlatform_RegHalUartHandler(&uartHandler); if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) { printf(\"register hal uart handler error\"); return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR; }"
+            - button "Copy code" [ref=f2e979] [cursor=pointer]
+          - heading "3. 注册 USB bulk 层函数" [level=4] [ref=f2e269]:
+            - link [ref=f2e270] [cursor=pointer]:
+              - /url: "#_3-注册-usb-bulk-层函数"
+              - text: "#"
+            - text: 3. 注册 USB bulk 层函数
+          - paragraph [ref=f2e271]: 采用 USB bulk 链路接入，需要注册 USB bulk 层函数用于建立 USB bulk 通信回调机制，使系统能够通过 USB bulk 通道与外部设备进行数据收发，并将通信事件交由用户实现的业务逻辑处理。
+          - generic [ref=f2e272]:
+            - text: c
+            - code [ref=f2e274]: "returnCode = DjiPlatform_RegHalUsbBulkHandler(&usbBulkHandler); if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) { printf(\"register hal usb bulk handler error\"); return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR; }"
+            - button "Copy code" [ref=f2e980] [cursor=pointer]
+          - heading "4. 注册 Osal 层函数" [level=4] [ref=f2e281]:
+            - link [ref=f2e282] [cursor=pointer]:
+              - /url: "#_4-注册-osal-层函数"
+              - text: "#"
+            - text: 4. 注册 Osal 层函数
+          - paragraph [ref=f2e283]: 通过注册 Osal 层的函数，负载设备控制程序能够访问不同操作系统的内核和资源，实现负载设备控制程序在不同操作系统上的移植。
+          - generic [ref=f2e284]:
+            - text: c
+            - code [ref=f2e286]: "returnCode = DjiPlatform_RegOsalHandler(&osalHandler); if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) { printf(\"register osal handler error\"); return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR; }"
+            - button "Copy code" [ref=f2e981] [cursor=pointer]
+          - paragraph [ref=f2e293]:
+            - text: 示例 sample 中将 osal 的注册封装进函数里
+            - code [ref=f2e294]: static T_DjiReturnCode DjiUser_PrepareSystemEnvironment(void)
+            - text: ，然后在主函数 main 调用
+            - code [ref=f2e295]: DjiUser_PrepareSystemEnvironment
+          - heading "5. 选择宏开关" [level=4] [ref=f2e296]:
+            - link [ref=f2e297] [cursor=pointer]:
+              - /url: "#_5-选择宏开关"
+              - text: "#"
+            - text: 5. 选择宏开关
+          - paragraph [ref=f2e298]: 开发者需根据飞行平台与负载设备支持的接口类型，选择并配置对应的 CONFIG_HARDWARE_CONNECTION 宏，以确定 PSDK 使用的硬件通信方式。 当前支持的硬件连接方式宏定义如下：
+          - list [ref=f2e299]:
+            - listitem [ref=f2e300]: DJI_USE_ONLY_UART
+            - listitem [ref=f2e301]: DJI_USE_UART_AND_USB_BULK_DEVICE
+            - listitem [ref=f2e302]: DJI_USE_UART_AND_NETWORK_DEVICE
+            - listitem [ref=f2e303]: DJI_USE_ONLY_USB_BULK_DEVICE
+            - listitem [ref=f2e304]: DJI_USE_ONLY_NETWORK_DEVICE
+          - paragraph [ref=f2e305]: 开发时，通过配置宏 CONFIG_HARDWARE_CONNECTION 指定实际使用的连接方式。例如，当需要同时使用 UART + 网络接口时，宏配置如下：
+          - generic [ref=f2e306]:
+            - text: c
+            - code [ref=f2e308]:
+              - generic [ref=f2e309]: "#define CONFIG_HARDWARE_CONNECTION DJI_USE_UART_AND_NETWORK_DEVICE"
+            - button "Copy code" [ref=f2e982] [cursor=pointer]
+          - paragraph [ref=f2e312]: 由于硬件接口能力存在差异，不同机型支持的连接方式如下。 除 Matrice 400机型外，其余机型支持以下连接方式：
+          - list [ref=f2e313]:
+            - listitem [ref=f2e314]: DJI_USE_ONLY_UART
+            - listitem [ref=f2e315]: DJI_USE_UART_AND_USB_BULK_DEVICE
+            - listitem [ref=f2e316]: DJI_USE_UART_AND_NETWORK_DEVICE
+          - paragraph [ref=f2e317]: Matrice 400机型支持以下连接方式：
+          - list [ref=f2e318]:
+            - listitem [ref=f2e319]: DJI_USE_ONLY_UART
+            - listitem [ref=f2e320]: DJI_USE_ONLY_USB_BULK_DEVICE
+            - listitem [ref=f2e321]: DJI_USE_ONLY_NETWORK_DEVICE
+          - paragraph [ref=f2e322]: 当 Matrice 400 搭载老款负载（X-Port、SkyPort V2）时，支持的连接方式为：
+          - list [ref=f2e323]:
+            - listitem [ref=f2e324]: DJI_USE_ONLY_UART
+            - listitem [ref=f2e325]: DJI_USE_UART_AND_NETWORK_DEVICE
+          - heading "PSDK 初始化" [level=3] [ref=f2e326]:
+            - link [ref=f2e327] [cursor=pointer]:
+              - /url: "#psdk-初始化-1"
+              - text: "#"
+            - text: PSDK 初始化
+          - paragraph [ref=f2e328]: 使用 PSDK 开发负载设备时，必须调用 DjiCore_Init 接口实现 PSDK 的初始化，同时请确保操作系统调度器已经运行，否则 PSDK 的主线程将无法正常工作。
+          - generic [ref=f2e329]:
+            - paragraph [ref=f2e330]: 说明：
+            - paragraph [ref=f2e331]: 开发者需要向 DjiCore_Init 接口传入负载设备的信息，详细内容请参见补充应用信息的详细说明。
+          - generic [ref=f2e332]:
+            - text: c
+            - code [ref=f2e334]: "returnCode = DjiCore_Init(&userInfo); if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) { USER_LOG_ERROR(\"Core init error\"); return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR; }"
+            - button "Copy code" [ref=f2e983] [cursor=pointer]
+          - paragraph [ref=f2e341]:
+            - strong [ref=f2e342]: 补充应用信息
+            - text: 您需要将创建应用后生成的 Payload SDK-妙算3应用信息，填入下方文件中，否则应用程序将无法正常运行。
+          - list [ref=f2e343]:
+            - listitem [ref=f2e344]: samples/sample_c/platform/linux/manifold3/application/dji_sdk_app_info.h
+            - listitem [ref=f2e345]: samples/sample_c++/platform/linux/manifold3/application/dji_sdk_app_info.h
+          - generic [ref=f2e346]:
+            - text: c
+            - code [ref=f2e348]:
+              - generic [ref=f2e349]: "#define USER_APP_NAME \"your_app_name\""
+              - generic [ref=f2e350]: "#define USER_APP_ID \"your_app_id\""
+              - generic [ref=f2e351]: "#define USER_APP_KEY \"your_app_key\""
+              - generic [ref=f2e352]: "#define USER_APP_LICENSE \"your_app_license\""
+              - generic [ref=f2e353]: "#define USER_DEVELOPER_ACCOUNT \"your_developer_account\""
+              - generic [ref=f2e354]: "#define USER_BAUD_RATE \"460800\""
+            - button "Copy code" [ref=f2e984] [cursor=pointer]
+          - paragraph [ref=f2e362]: 完成 PSDK 系统初始化后，开发者可根据使用需求，初始化所需使用的功能。若 PSDK 初始化失败，请根据初始化失败的返回码检查负载设备初始化的顺序和对应接口的配置信息。
+          - heading "PSDK 功能初始化" [level=3] [ref=f2e363]:
+            - link [ref=f2e364] [cursor=pointer]:
+              - /url: "#psdk-功能初始化"
+              - text: "#"
+            - text: PSDK 功能初始化
+          - paragraph [ref=f2e365]: PSDK 功能初始化须在调用 DjiCore_Init()之后。用户根据实际需求初始化 PSDK 功能模块，如相机功能、数据订阅功能。
+          - generic [ref=f2e366]:
+            - paragraph [ref=f2e367]: 说明：
+            - paragraph [ref=f2e368]: 非相机类负载也需要初始化相机功能，否则 Pilot 无法识别出 PSDK 负载。
+          - list [ref=f2e369]:
+            - listitem [ref=f2e370]: 相机功能 在使用任何相机相关功能之前，必须首先调用相机模块的总初始化接口 DjiPayloadCamera_Init，以完成相机功能模块的初始化并确保其处于可用状态。 示例如下：
+          - generic [ref=f2e371]:
+            - text: c
+            - code [ref=f2e373]: "returnCode = DjiPayloadCamera_Init(); if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) { USER_LOG_ERROR(\"init payload camera error:0x%08llX\", returnCode); return returnCode; }"
+            - button "Copy code" [ref=f2e985] [cursor=pointer]
+          - list [ref=f2e380]:
+            - listitem [ref=f2e381]: 数据订阅功能 用于初始化飞行控制数据订阅模块，是进行任何飞控数据订阅操作前的必要步骤。该接口确保数据订阅模块已正确初始化并处于可用状态，从而能够正常接收来自飞行控制器的数据。示例如下：
+          - generic [ref=f2e382]:
+            - text: c
+            - code [ref=f2e384]: "T_DjiReturnCode DjiFcSubscription_Init(void); djiStat = DjiFcSubscription_Init(); if (djiStat != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) { USER_LOG_ERROR(\"init data subscription module error.\"); return DJI_ERROR_SYSTEM_MODULE_CODE_UNKNOWN; }"
+            - button "Copy code" [ref=f2e986] [cursor=pointer]
+          - heading "启动应用程序" [level=3] [ref=f2e392]:
+            - link [ref=f2e393] [cursor=pointer]:
+              - /url: "#启动应用程序"
+              - text: "#"
+            - text: 启动应用程序
+          - paragraph [ref=f2e394]:
+            - text: 在完成所有功能模块的初始化与注册后，需调用
+            - code [ref=f2e395]: T_DjiReturnCode DjiCore_ApplicationStart(void);
+            - text: 启动 PSDK 应用程序。该接口用于通知 DJI Payload SDK 应用已准备就绪，使应用进入正常运行状态，并支持移动端 App 对负载设备进行控制。若未调用该接口，应用将无法正常运行，移动端 App 也无法控制负载设备。
+          - generic [ref=f2e396]:
+            - text: c
+            - code [ref=f2e398]: "returnCode = DjiCore_ApplicationStart(); if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) { USER_LOG_ERROR(\"start sdk application error\"); }"
+            - button "Copy code" [ref=f2e987] [cursor=pointer]
+          - heading "跨平台移植" [level=2] [ref=f2e404]:
+            - link [ref=f2e405] [cursor=pointer]:
+              - /url: "#跨平台移植"
+              - text: "#"
+            - text: 跨平台移植
+          - generic [ref=f2e406]:
+            - paragraph [ref=f2e407]: 说明：
+            - paragraph [ref=f2e408]: 以下内容仅适用于需要进行跨平台迁移的场景；如无跨平台迁移需求，可跳过本节。
+          - paragraph [ref=f2e409]: 将基于 PSDK 开发的负载设备控制程序移植到不同版本的软硬件平台上时，需要先初始化 Hal 和 Osal 层，注册关键的配置信息。通过加载静态库、引用指定的资源文件并声明结构体，设置负载设备控制程序跨平台移植所需的配置信息。最后使用指定的接口将 Platform 模块注册到负载设备的控制程序中，获取硬件资源和操作系统资源，实现负载设备控制程序的跨平台移植。
+          - heading "示例代码" [level=3] [ref=f2e410]:
+            - link [ref=f2e411] [cursor=pointer]:
+              - /url: "#示例代码"
+              - text: "#"
+            - text: 示例代码
+          - list [ref=f2e412]:
+            - listitem [ref=f2e413]:
+              - text: Linux
+              - list [ref=f2e414]:
+                - listitem [ref=f2e415]:
+                  - text: Hal 层适配：
+                  - code [ref=f2e416]: samples/sample_c/platform/linux/manifold2/hal
+                - listitem [ref=f2e417]:
+                  - text: Osal 层适配：
+                  - code [ref=f2e418]: samples/sample_c/platform/linux/common/osal/
+            - listitem [ref=f2e419]:
+              - text: FreeRTOS
+              - list [ref=f2e420]:
+                - listitem [ref=f2e421]:
+                  - text: Hal 层适配：
+                  - code [ref=f2e422]: samples/sample_c/platform/rtos_freertos/stm32f4_discovery/hal
+                - listitem [ref=f2e423]:
+                  - text: Osal 层适配：
+                  - code [ref=f2e424]: samples/sample_c/platform/rtos_freertos/common/osal/
+          - generic [ref=f2e425]:
+            - paragraph [ref=f2e426]: 说明：
+            - paragraph [ref=f2e427]:
+              - text: PSDK Platform 模块的 API 接口，在
+              - code [ref=f2e428]: psdk_lib/include/dji_platform.h
+              - text: 文件中。
+          - heading "概述" [level=3] [ref=f2e429]:
+            - link [ref=f2e430] [cursor=pointer]:
+              - /url: "#概述"
+              - text: "#"
+            - text: 概述
+          - paragraph [ref=f2e431]: 为能使基于 PSDK 开发的负载设备控制程序移植到不同的软硬件平台，需要通过 Hal（Hardware Abstraction Layer，硬件接口层）适配不同的硬件平台，通过 Osal（Operating System Abstraction Layer，操作系统抽象层）实现与不同操作系统的兼容，如 图1.代码移植 所示。
+          - generic [ref=f2e432]:
+            - paragraph [ref=f2e434]: 图1.代码移植
+            - paragraph [ref=f2e436]
+          - heading "基础概念" [level=3] [ref=f2e438]:
+            - link [ref=f2e439] [cursor=pointer]:
+              - /url: "#基础概念"
+              - text: "#"
+            - text: 基础概念
+          - heading "Hal 层" [level=4] [ref=f2e440]:
+            - link [ref=f2e441] [cursor=pointer]:
+              - /url: "#hal-层"
+              - text: "#"
+            - text: Hal 层
+          - paragraph [ref=f2e442]:
+            - text: Hal（Hardware Abstraction Layer，硬件接口层）是 PSDK 硬件接口抽象层，位于操作系统、负载设备控制程序和硬件接口间。开发者需要按照
+            - code [ref=f2e443]: DjiPlatform_RegHalUartHandler()
+            - text: ","
+            - code [ref=f2e444]: DjiPlatform_RegHalUsbBulkHandler
+            - text: 与
+            - code [ref=f2e445]: DjiPlatform_RegHalNetworkHandler()
+            - text: 接口中的函数原型，实现并将适配 Hal 层的函数注册到负载设备控制程序中，使基于 PSDK 开发的负载设备控制程序，通过 Hal 层即可直接访问负载设备硬件的底层资源，控制负载设备执行相应的动作，使负载设备控制程序能够适配不同的硬件平台，如 STM32F407IGH6-EVAL 或 Manifold 2-C 等。
+          - heading "网口设备" [level=5] [ref=f2e446]:
+            - link [ref=f2e447] [cursor=pointer]:
+              - /url: "#网口设备"
+              - text: "#"
+            - text: 网口设备
+          - paragraph [ref=f2e448]: 需要使用网口的设备适配 Hal 层函数需要执行如下操作：
+          - list [ref=f2e449]:
+            - listitem [ref=f2e450]:
+              - paragraph [ref=f2e451]: 实现适配 Hal 层网口操作函数
+              - list [ref=f2e452]:
+                - listitem [ref=f2e453]:
+                  - text: 本地网卡初始化：
+                  - code [ref=f2e454]: T_DjiReturnCode (*NetworkInit)(const char *ipAddr, const char *netMask, T_DjiNetworkHandle *networkHandle)
+                - listitem [ref=f2e455]:
+                  - text: 本地网卡反初始化：
+                  - code [ref=f2e456]: T_DjiReturnCode (*NetworkDeInit)(T_DjiNetworkHandle networkHandle)
+                - listitem [ref=f2e457]:
+                  - text: 获取网卡信息：
+                  - code [ref=f2e458]: T_DjiReturnCode (*NetworkGetDeviceInfo)(T_DjiHalNetworkDeviceInfo *deviceInfo)
+            - listitem [ref=f2e459]:
+              - paragraph [ref=f2e460]:
+                - text: 使用
+                - code [ref=f2e461]: DjiPlatform_RegHalNetworkHandler()
+                - text: 接口注册网口操作函数
+          - heading "串口设备" [level=5] [ref=f2e462]:
+            - link [ref=f2e463] [cursor=pointer]:
+              - /url: "#串口设备"
+              - text: "#"
+            - text: 串口设备
+          - paragraph [ref=f2e464]: 使用串口通信的设备适配 Hal 层函数需要执行如下操作：
+          - list [ref=f2e465]:
+            - listitem [ref=f2e466]:
+              - text: 实现适配 Hal 层 UART 操作函数
+              - list [ref=f2e467]:
+                - listitem [ref=f2e468]:
+                  - text: 串口初始化：
+                  - code [ref=f2e469]: T_DjiReturnCode (*UartInit)(E_DjiHalUartNum uartNum, uint32_t baudRate, T_DjiUartHandle *uartHandle)
+                - listitem [ref=f2e470]:
+                  - text: 串口反初始化：
+                  - code [ref=f2e471]: T_DjiReturnCode (*UartDeInit)(T_DjiUartHandle uartHandle)
+                - listitem [ref=f2e472]:
+                  - text: 发送数据：
+                  - code [ref=f2e473]: T_DjiReturnCode (*UartWriteData)(T_DjiUartHandle uartHandle, const uint8_t *buf, uint32_t len, uint32_t *realLen)
+                - listitem [ref=f2e474]:
+                  - text: 接收数据：
+                  - code [ref=f2e475]: T_DjiReturnCode (*UartReadData)(T_DjiUartHandle uartHandle, uint8_t *buf, uint32_t len, uint32_t *realLen)
+                - listitem [ref=f2e476]:
+                  - text: 获取串口状态：
+                  - code [ref=f2e477]: T_DjiReturnCode (*UartGetStatus)(E_DjiHalUartNum uartNum, T_DjiUartStatus *status)
+                - listitem [ref=f2e478]:
+                  - text: 获取串口设备信息：
+                  - code [ref=f2e479]: T_DjiReturnCode HalUart_GetDeviceInfo(T_DjiHalUartDeviceInfo *deviceInfo)
+            - listitem [ref=f2e480]:
+              - text: 使用
+              - code [ref=f2e481]: DjiPlatform_RegHalUartHandler()
+              - text: 接口注册串口操作函数
+          - paragraph [ref=f2e482]: HalUart_GetDeviceInfo 接口的增加来源于 E-Port V2的支持，若应用程序不使用 E-Port V2方式接入飞机，该接口可以不注册。PSDK 库使用 HalUart_GetDeviceInfo 接口获取连接到飞机的 USB 串口的 VID、PID 信息，可以参考以下实现。
+          - generic [ref=f2e483]:
+            - text: c
+            - code [ref=f2e485]: "T_DjiReturnCode HalUart_GetDeviceInfo(T_DjiHalUartDeviceInfo *deviceInfo) { if (deviceInfo == NULL) { return DJI_ERROR_SYSTEM_MODULE_CODE_INVALID_PARAMETER; } deviceInfo->vid = USB_UART_CONNECTED_TO_UAV_VID; deviceInfo->pid = USB_UART_CONNECTED_TO_UAV_PID; return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS; }"
+            - button "Copy code" [ref=f2e988] [cursor=pointer]
+          - generic [ref=f2e498]:
+            - paragraph [ref=f2e499]: 说明：
+            - list [ref=f2e500]:
+              - listitem [ref=f2e501]:
+                - text: 负载设备串口的参数
+                - list [ref=f2e502]:
+                  - listitem [ref=f2e503]: 波特率：460800(SkyPort V2/X-Port 固件版本低于且包含 V01.01.0100)或者 DJI Assistant 2 软件设置值(SkyPort V2/X-Port 固件版本高于 V01.01.0100)
+                  - listitem [ref=f2e504]: 停止位：1
+                  - listitem [ref=f2e505]: 数据位：8
+                  - listitem [ref=f2e506]: 奇偶校验：无
+              - listitem [ref=f2e507]: 可通过 DJI Assistant 2 软件设置 SkyPort V2/X-Port 与 PSDK 负载设备的通信波特率（PSDK 设备通信参数须与 SkyPort V2/X-Port 保持一致），完美适配不同的硬件平台（某些硬件平台不支持默认通信参数或存在功能缺陷）且适应不同的应用场景（例如订阅大量数据时需适当提高通信波特率）。
+          - paragraph [ref=f2e510]: 图２. 设置通信波特率
+          - heading "USB 设备" [level=5] [ref=f2e513]:
+            - link [ref=f2e514] [cursor=pointer]:
+              - /url: "#usb-设备"
+              - text: "#"
+            - text: USB 设备
+          - paragraph [ref=f2e515]: 使用 USB Bulk 通信的设备适配 Hal 层函数需要执行如下操作：
+          - list [ref=f2e516]:
+            - listitem [ref=f2e517]:
+              - paragraph [ref=f2e518]: 实现适配 Hal 层 USB Bulk 操作函数
+              - list [ref=f2e519]:
+                - listitem [ref=f2e520]:
+                  - text: USB Bulk 初始化：
+                  - code [ref=f2e521]: T_DjiReturnCode (*UsbBulkInit)(T_DjiHalUsbBulkInfo usbBulkInfo, T_DjiUsbBulkHandle *usbBulkHandle)
+                - listitem [ref=f2e522]:
+                  - text: USB Bulk 反初始化：
+                  - code [ref=f2e523]: T_DjiReturnCode (*UsbBulkDeInit)(T_DjiUsbBulkHandle usbBulkHandle)
+                - listitem [ref=f2e524]:
+                  - text: USB Bulk 写数据：
+                  - code [ref=f2e525]: T_DjiReturnCode (*UsbBulkWriteData)(T_DjiUsbBulkHandle usbBulkHandle, const uint8_t *buf, uint32_t len, uint32_t *realLen)
+                - listitem [ref=f2e526]:
+                  - text: USB Bulk 读数据：
+                  - code [ref=f2e527]: T_DjiReturnCode (*UsbBulkReadData)(T_DjiUsbBulkHandle usbBulkHandle, uint8_t *buf, uint32_t len, uint32_t *realLen)
+                - listitem [ref=f2e528]:
+                  - text: 获取 USB Bulk 信息(仅针对 SDK 设备端作为 USB Device 的情况)：
+                  - code [ref=f2e529]: T_DjiReturnCode (*UsbBulkGetDeviceInfo)(T_DjiHalUsbBulkDeviceInfo *deviceInfo)
+            - listitem [ref=f2e530]:
+              - paragraph [ref=f2e531]:
+                - text: 使用
+                - code [ref=f2e532]: DjiPlatform_RegHalUsbBulkHandler()
+                - text: 接口注册 USB Bulk 操作函数
+          - paragraph [ref=f2e533]: 在 Matrice 300 RTK, Matrice 30/Matrice 30T, Mavic 3E/Mavic 3T 上，Matrice 400，USB 的主从模式存在差异：
+          - list [ref=f2e534]:
+            - listitem [ref=f2e535]: Matrice 300 RTK：SDK 设备端为 USB Host，飞机端为 USB Device
+            - listitem [ref=f2e536]: Matrice 30/Matrice 30T：SDK 设备端为 USB Device，飞机端为 USB Host
+            - listitem [ref=f2e537]: Mavic 3E/Mavic 3T：SDK 设备端为 USB Device，飞机端为 USB Host
+            - listitem [ref=f2e538]: Matrice 400：SDK 设备端为 USDB Device，飞机端为 USB Host
+          - heading "Matrice 300 RTK" [level=6] [ref=f2e539]:
+            - link [ref=f2e540] [cursor=pointer]:
+              - /url: "#matrice-300-rtk"
+              - text: "#"
+            - text: Matrice 300 RTK
+          - paragraph [ref=f2e541]: USB 功能限制如下表所示：
+          - table [ref=f2e542]:
+            - rowgroup [ref=f2e543]:
+              - row [ref=f2e544]:
+                - columnheader "USB 功能" [ref=f2e545]
+                - columnheader "功能限制" [ref=f2e546]
+            - rowgroup [ref=f2e547]:
+              - row [ref=f2e548]:
+                - cell "虚拟串口" [ref=f2e549]
+                - cell "云台管理、相机管理、部分基础通信" [ref=f2e550]
+              - row [ref=f2e551]:
+                - cell "USB Bulk" [ref=f2e552]
+                - cell "获取码流、获取感知灰度图、MOP 功能、媒体文件管理" [ref=f2e553]
+          - paragraph [ref=f2e554]: 虚拟串口：
+          - list [ref=f2e555]:
+            - listitem [ref=f2e556]:
+              - text: Linux 平台：无需额外配置，驱动默认支持。可以通过
+              - code [ref=f2e557]: ls /dev/ttyACMx
+              - text: 查询到，当作标准串口设备进行操作。
+            - listitem [ref=f2e558]: RTOS 平台：需要移植 USB Host 的库进行读写操作，详情请参考 samples/sample_c/platform/rtos_freertos/stm32f4_discovery/middlewares/ST/STM32_USB_Host_Library/中的 USB_Host 移植实现。
+          - paragraph [ref=f2e559]: USB-Bulk：
+          - list [ref=f2e560]:
+            - listitem [ref=f2e561]:
+              - paragraph [ref=f2e562]: Linux 平台：用户在 Type-C 拓展口开发程序，可以通过安装并调用 libusb 静态库的方式进行开发。
+              - paragraph [ref=f2e563]:
+                - text: 安装方法如下：
+                - code [ref=f2e564]: sudo apt-get install libusb-1.0-0-dev
+            - listitem [ref=f2e565]:
+              - paragraph [ref=f2e566]: RTOS 平台：不支持 USB Bulk 相关驱动。
+          - heading "Matrice 30/Matrice 30T" [level=6] [ref=f2e567]:
+            - link [ref=f2e568] [cursor=pointer]:
+              - /url: "#matrice-30-matrice-30t"
+              - text: "#"
+            - text: Matrice 30/Matrice 30T
+          - paragraph [ref=f2e569]: USB 功能限制如下表所示：
+          - table [ref=f2e570]:
+            - rowgroup [ref=f2e571]:
+              - row [ref=f2e572]:
+                - columnheader "USB 功能" [ref=f2e573]
+                - columnheader "功能限制" [ref=f2e574]
+            - rowgroup [ref=f2e575]:
+              - row [ref=f2e576]:
+                - cell "RNDIS 虚拟网卡/USB 转以太网卡" [ref=f2e577]
+                - cell "推送相机码流、订阅 FPV/主相机码流" [ref=f2e578]
+              - row [ref=f2e579]:
+                - cell "USB Bulk 通道1" [ref=f2e580]
+                - cell "推送第三方相机码流、获取码流" [ref=f2e581]
+              - row [ref=f2e582]:
+                - cell "USB Bulk 通道2" [ref=f2e583]
+                - cell "获取感知灰度图、媒体文件管理" [ref=f2e584]
+          - generic [ref=f2e585]:
+            - paragraph [ref=f2e586]: 说明：
+            - paragraph [ref=f2e587]:
+              - text: 当 SDK 设备端作为 USB Device 时，可以使用推荐型号的 USB 网卡进行连接，如 AX88179A、RTL8152等网卡型号, 同时需要通过注册
+              - code [ref=f2e588]: NetworkGetDeviceInfo
+              - text: 接口传入对应网卡的 VID/PID 信息, 保证飞机端可以正常识别 USB 网卡。
+          - heading "Mavic 3E/Mavic 3T" [level=6] [ref=f2e589]:
+            - link [ref=f2e590] [cursor=pointer]:
+              - /url: "#mavic-3e-mavic-3t"
+              - text: "#"
+            - text: Mavic 3E/Mavic 3T
+          - paragraph [ref=f2e591]: USB 功能限制如下表所示：
+          - table [ref=f2e592]:
+            - rowgroup [ref=f2e593]:
+              - row [ref=f2e594]:
+                - columnheader "USB 功能" [ref=f2e595]
+                - columnheader "功能限制" [ref=f2e596]
+            - rowgroup [ref=f2e597]:
+              - row [ref=f2e598]:
+                - cell "RNDIS 虚拟网卡/USB 转以太网卡" [ref=f2e599]
+                - cell "推送相机码流、订阅主相机码流" [ref=f2e600]
+              - row [ref=f2e601]:
+                - cell "USB Bulk 通道1" [ref=f2e602]
+                - cell "推送第三方相机码流、获取码流" [ref=f2e603]
+              - row [ref=f2e604]:
+                - cell "USB Bulk 通道2" [ref=f2e605]
+                - cell "获取感知灰度图" [ref=f2e606]
+          - heading "Matrice 400" [level=6] [ref=f2e607]:
+            - link [ref=f2e608] [cursor=pointer]:
+              - /url: "#matrice-400"
+              - text: "#"
+            - text: Matrice 400
+          - paragraph [ref=f2e609]: USB 功能限制如下表所示：
+          - table [ref=f2e610]:
+            - rowgroup [ref=f2e611]:
+              - row [ref=f2e612]:
+                - columnheader "USB 功能" [ref=f2e613]
+                - columnheader "功能限制" [ref=f2e614]
+            - rowgroup [ref=f2e615]:
+              - row [ref=f2e616]:
+                - cell "RNDIS 虚拟网卡" [ref=f2e617]
+                - cell "基础通信、第三方相机推流、获取感知灰度图、SDK 互联互通、相机媒体文件下载" [ref=f2e618]
+              - row [ref=f2e619]:
+                - cell "USB Bulk 通道1" [ref=f2e620]
+                - cell "基础通信" [ref=f2e621]
+              - row [ref=f2e622]:
+                - cell "USB Bulk 通道2" [ref=f2e623]
+                - cell "第三方相机推流" [ref=f2e624]
+              - row [ref=f2e625]:
+                - cell "USB Bulk 通道3" [ref=f2e626]
+                - cell "获取感知灰度图、SDK 互联互通、相机媒体文件下载" [ref=f2e627]
+          - heading "将开发平台的 USB 配置为从模式" [level=6] [ref=f2e628]:
+            - link [ref=f2e629] [cursor=pointer]:
+              - /url: "#将开发平台的-usb-配置为从模式"
+              - text: "#"
+            - text: 将开发平台的 USB 配置为从模式
+          - list [ref=f2e630]:
+            - listitem [ref=f2e631]:
+              - paragraph [ref=f2e632]:
+                - text: 配置 USB 为从模式（USB-Device）：配置开发平台的 USB 管脚复用，并且设置为 USB-OTG 或者 USB-Device 模式。当配置成功后，可以将 USB 口接到另外一个设备的 USB Host 上，可以查询对应的 vid 和 pid 信息，并确认是否符合预期。如我们将 DJI Manifold 2-G 的 vid 和 pid 配置为0x0955和0x7020，将 USB 接到另外一台 Ubuntu 上，通过
+                - code [ref=f2e633]: lsusb
+                - text: 命令方便地查询到。
+                - img "1" [ref=f2e634]
+            - listitem [ref=f2e635]:
+              - paragraph [ref=f2e636]:
+                - text: 配置 RNDIS 网卡：首先确认平台是否支持并且打开 USB Gadget 驱动，详细请参考
+                - link "链接 open in new window" [ref=f2e637] [cursor=pointer]:
+                  - /url: https://www.elinux.org/images/e/ef/USB_Gadget_Configfs_API_0.pdf
+                  - text: 链接
+                  - generic [ref=f2e638]: open in new window
+                - text: 。编写 RNDIS 的配置，以管理员身份运行后，可以将 USB 口接到另外一个设备的 USB Host 上，通过
+                - code [ref=f2e643]: ifconfig
+                - text: 命令查询到对应的网卡是否枚举出来，并确认是否符合预期，并且可以通过
+                - code [ref=f2e644]: ping
+                - text: 命令来检查是否通信成功。
+                - img "2" [ref=f2e645]
+                - img "3" [ref=f2e646]
+            - listitem [ref=f2e647]:
+              - paragraph [ref=f2e648]:
+                - text: 配置 USB Bulk：首先确认是否平台是否支持并且打开 USB Gadget 驱动，详细请参考
+                - link "链接 open in new window" [ref=f2e649] [cursor=pointer]:
+                  - /url: https://www.elinux.org/images/e/ef/USB_Gadget_Configfs_API_0.pdf
+                  - text: 链接
+                  - generic [ref=f2e650]: open in new window
+                - text: 。编写 USB Bulk 的配置配置并运行 Bulk 初始化程序，以管理员身份运行后，可以将 USB 口接到另外一个设备的 USB Host 上，先使用
+                - code [ref=f2e655]: sudo su
+                - text: 切换 root 账户再通过
+                - code [ref=f2e656]: cat /sys/kernel/debug/usb/devices
+                - text: 命令查询到对应的 Bulk 端口，并确认是否符合预期。对 bulk 设备的读写操作详情请参考 hal_usb_bulk.c 中的接口实现。
+                - img "4" [ref=f2e657]
+          - heading "I2C 设备" [level=5] [ref=f2e658]:
+            - link [ref=f2e659] [cursor=pointer]:
+              - /url: "#i2c-设备"
+              - text: "#"
+            - text: I2C 设备
+          - paragraph [ref=f2e660]: 使用 I2C 认证芯片的设备适配 Hal 层函数需要执行如下操作：
+          - list [ref=f2e661]:
+            - listitem [ref=f2e662]:
+              - paragraph [ref=f2e663]: 实现适配 Hal 层 I2C 设备操作函数
+              - list [ref=f2e664]:
+                - listitem [ref=f2e665]:
+                  - text: I2C 设备初始化：
+                  - code [ref=f2e666]: T_DjiReturnCode (*I2cInit)(T_DjiHalI2cConfig i2cConfig, T_DjiI2cHandle *i2cHandle)
+                - listitem [ref=f2e667]:
+                  - text: I2C 设备反初始化：
+                  - code [ref=f2e668]: T_DjiReturnCode (*I2cDeInit)(T_DjiI2cHandle i2cHandle)
+                - listitem [ref=f2e669]:
+                  - text: I2C 设备写数据：
+                  - code [ref=f2e670]: T_DjiReturnCode (*I2cWriteData)(T_DjiI2cHandle i2cHandle, uint16_t devAddress, const uint8_t *buf, uint32_t len, uint32_t *realLen)
+                - listitem [ref=f2e671]:
+                  - text: I2C 设备读数据：
+                  - code [ref=f2e672]: T_DjiReturnCode (*I2cReadData)(T_DjiI2cHandle i2cHandle, uint16_t devAddress, uint8_t *buf, uint32_t len, uint32_t *realLen)
+            - listitem [ref=f2e673]:
+              - paragraph [ref=f2e674]:
+                - text: 使用
+                - code [ref=f2e675]: DjiPlatform_RegHalI2cHandler()
+                - text: 接口注册 I2C 设备操作函数。
+          - heading "Osal 层" [level=4] [ref=f2e676]:
+            - link [ref=f2e677] [cursor=pointer]:
+              - /url: "#osal-层"
+              - text: "#"
+            - text: Osal 层
+          - paragraph [ref=f2e678]:
+            - text: Osal（Operating System Abstraction Layer，操作系统抽象层）是 PSDK 的操作系统抽象层，位于负载设备控制程序和操作系统间。开发者需要按照
+            - code [ref=f2e679]: DjiPlatform_RegOsalHandler()
+            - text: 接口中的函数原型，实现并将适配不同操作系统的函数注册到负载设备控制程序中，使用 PSDK 开发的负载设备控制程序即可直接访问操作系统以及操作系统内核的资源，将负载设备控制程序移植到不同的操作系统上。
+          - heading "线程函数" [level=5] [ref=f2e680]:
+            - link [ref=f2e681] [cursor=pointer]:
+              - /url: "#线程函数"
+              - text: "#"
+            - text: 线程函数
+          - paragraph [ref=f2e682]: 使用线程机制管理负载设备控制程序执行相应的任务，开发者需要实现创建线程、销毁线程和线程睡眠的函数。
+          - list [ref=f2e683]:
+            - listitem [ref=f2e684]:
+              - text: 创建线程：
+              - code [ref=f2e685]: T_DjiReturnCode (*TaskCreate)(const char *name, void *(*taskFunc)(void *), uint32_t stackSize, void *arg, T_DjiTaskHandle *task)
+            - listitem [ref=f2e686]:
+              - text: 销毁线程：
+              - code [ref=f2e687]: T_DjiReturnCode (*TaskDestroy)(T_DjiTaskHandle task)
+            - listitem [ref=f2e688]:
+              - text: 线程睡眠：
+              - code [ref=f2e689]: T_DjiReturnCode (*TaskSleepMs)(uint32_t timeMs)
+          - heading "互斥锁" [level=5] [ref=f2e690]:
+            - link [ref=f2e691] [cursor=pointer]:
+              - /url: "#互斥锁"
+              - text: "#"
+            - text: 互斥锁
+          - paragraph [ref=f2e692]: 互斥锁是一种用于防止多个线程同时对同一队列、计数器和中断处理程序等公共资源（如共享内存等）执行读写操作的机制，能够有效避免进程死锁或长时间的等待。使用互斥锁机制，需要开发者实现创建互斥锁、销毁互斥锁、互斥锁上锁和互斥锁解锁。
+          - list [ref=f2e693]:
+            - listitem [ref=f2e694]:
+              - paragraph [ref=f2e695]:
+                - text: 创建互斥锁：
+                - code [ref=f2e696]: T_DjiReturnCode (*MutexCreate)(T_DjiMutexHandle *mutex)
+            - listitem [ref=f2e697]:
+              - paragraph [ref=f2e698]:
+                - text: 销毁互斥锁：
+                - code [ref=f2e699]: T_DjiReturnCode (*MutexDestroy)(T_DjiMutexHandle mutex)
+            - listitem [ref=f2e700]:
+              - paragraph [ref=f2e701]:
+                - text: 互斥锁上锁：
+                - code [ref=f2e702]: T_DjiReturnCode (*MutexLock)(T_DjiMutexHandle mutex)
+            - listitem [ref=f2e703]:
+              - paragraph [ref=f2e704]:
+                - text: 互斥锁解锁：
+                - code [ref=f2e705]: T_DjiReturnCode (*MutexUnlock)(T_DjiMutexHandle mutex)
+          - heading "信号量" [level=5] [ref=f2e706]:
+            - link [ref=f2e707] [cursor=pointer]:
+              - /url: "#信号量"
+              - text: "#"
+            - text: 信号量
+          - paragraph [ref=f2e708]: 信号量是一种用于防止多线程同时操作相同代码段的机制。开发者使用该机制时，需要实现创建信号量、销毁信号量、等待信号量、释放信号量和等待超时信号量函数。
+          - list [ref=f2e709]:
+            - listitem [ref=f2e710]:
+              - text: 创建信号量：
+              - code [ref=f2e711]: T_DjiReturnCode (*SemaphoreCreate)(uint32_t initValue, T_DjiSemaHandle *semaphore)
+          - generic [ref=f2e712]:
+            - paragraph [ref=f2e713]: 说明：
+            - paragraph [ref=f2e714]:
+              - text: 使用该接口时，请设置
+              - code [ref=f2e715]: initValue
+              - text: 信号量的初始值。
+          - list [ref=f2e716]:
+            - listitem [ref=f2e717]:
+              - text: 销毁信号量：
+              - code [ref=f2e718]: T_DjiReturnCode (*SemaphoreDestroy)(T_DjiSemaHandle semaphore)
+            - listitem [ref=f2e719]:
+              - text: 等待信号量：
+              - code [ref=f2e720]: T_DjiReturnCode (*SemaphoreWait)(T_DjiSemaHandle semaphore)
+          - generic [ref=f2e721]:
+            - paragraph [ref=f2e722]: 说明：
+            - paragraph [ref=f2e723]:
+              - text: 等待信号量接口等待时间的
+              - strong [ref=f2e724]: 最大值
+              - text: 为
+              - strong [ref=f2e725]: 32767 ms
+              - text: 。
+          - list [ref=f2e726]:
+            - listitem [ref=f2e727]:
+              - text: 等待超时信号量：
+              - code [ref=f2e728]: T_DjiReturnCode (*SemaphoreTimedWait)(T_DjiSemaHandle semaphore, uint32_t waitTimeMs)
+            - listitem [ref=f2e729]:
+              - text: 释放信号量：
+              - code [ref=f2e730]: T_DjiReturnCode (*SemaphorePost)(T_DjiSemaHandle semaphore)
+          - heading "时间接口" [level=5] [ref=f2e731]:
+            - link [ref=f2e732] [cursor=pointer]:
+              - /url: "#时间接口"
+              - text: "#"
+            - text: 时间接口
+          - list [ref=f2e733]:
+            - listitem [ref=f2e734]:
+              - text: 获取当前系统的时间（ms）：
+              - code [ref=f2e735]: T_DjiReturnCode (*GetTimeMs)(uint32_t *ms)
+            - listitem [ref=f2e736]:
+              - text: 获取当前系统的时间（us）：
+              - code [ref=f2e737]: T_DjiReturnCode (*GetTimeUs)(uint64_t *us)
+          - heading "内存管理接口" [level=5] [ref=f2e738]:
+            - link [ref=f2e739] [cursor=pointer]:
+              - /url: "#内存管理接口"
+              - text: "#"
+            - text: 内存管理接口
+          - list [ref=f2e740]:
+            - listitem [ref=f2e741]:
+              - text: 申请内存：
+              - code [ref=f2e742]: void *(*Malloc)(uint32_t size)
+            - listitem [ref=f2e743]:
+              - text: 释放内存：
+              - code [ref=f2e744]: void (*Free)(void *ptr)
+          - heading "实现跨平台移植" [level=3] [ref=f2e745]:
+            - link [ref=f2e746] [cursor=pointer]:
+              - /url: "#实现跨平台移植"
+              - text: "#"
+            - text: 实现跨平台移植
+          - heading "1. 跨平台接口适配" [level=4] [ref=f2e747]:
+            - link [ref=f2e748] [cursor=pointer]:
+              - /url: "#_1-跨平台接口适配"
+              - text: "#"
+            - text: 1. 跨平台接口适配
+          - table [ref=f2e749]:
+            - rowgroup [ref=f2e750]:
+              - row [ref=f2e751]:
+                - columnheader "跨平台接口适配" [ref=f2e752]
+                - columnheader "适配方案" [ref=f2e753]
+            - rowgroup [ref=f2e754]:
+              - row [ref=f2e755]:
+                - cell "Hal 层适配" [ref=f2e756]
+                - cell "串口" [ref=f2e757]
+                - cell "Linux" [ref=f2e758]
+                - 'cell "请根据硬件连接，配置对应的串口设备名称，如`ttyUSB0`, 并实现串口初始化、串口读数据和串口写数据的回调函数。详细实现方法请参见：/samples/sample_c/platform/linux/manifold2/hal/hal_uart.c" [ref=f2e759]'
+              - row [ref=f2e760]:
+                - cell "RTOS" [ref=f2e761]
+                - cell "请根据 MCU 的型号配置对应的串口管脚，并实现串口初始化、串口读数据和串口写数据的回调函数。 详细实现方法请参见：samples/sample_c/platform/rtos_freertos/stm32f4_discovery/hal/hal_uart.c" [ref=f2e762]: 请根据 MCU 的型号配置对应的串口管脚，并实现串口初始化、串口读数据和串口写数据的回调函数。详细实现方法请参见：samples/sample_c/platform/rtos_freertos/stm32f4_discovery/hal/hal_uart.c
+              - row [ref=f2e763]:
+                - cell "网口" [ref=f2e764]
+                - cell "Linux" [ref=f2e765]
+                - cell "使用网口将第三方开发平台连接至 DJI 无人机后，需要实现并注册配置网络的回调函数，当系统初始化时，会自动完成负载网络参数的配置，配置完成后，可以使用网口相关的功能。 详细实现方法请参见：/samples/sample_c/platform/linux/manifold2/hal/hal_network.c" [ref=f2e766]
+              - row [ref=f2e767]:
+                - cell "RTOS" [ref=f2e768]
+                - cell "对于 RTOS 系统，可以通过注册配置网络参数的回调函数，获取到当前负载应配置的网络参数，根据实际需要告知其他子系统模块，完成网口相关的功能。 详细实现方法请参见：/samples/sample_c/platform/rtos_freertos/stm32f4_discovery/application/main.c" [ref=f2e769]
+              - row [ref=f2e770]:
+                - cell "I2C 设备" [ref=f2e771]
+                - cell "Linux" [ref=f2e772]
+                - cell "使用 I2C 将 DJI SDK 认证芯片（DJI SDK CC）连接至第三方开发平台后，需要实现并注册配置 I2C 的回调函数，当系统初始化时，会自动完成 I2C 器件的配置，配置完成后，可以和 SDK 认证芯片（DJI SDK CC）正常通讯。 详细实现方法请参见：/samples/sample_c/platform/linux/raspberry_pi/hal/hal_i2c.c" [ref=f2e773]
+              - row [ref=f2e774]:
+                - cell "RTOS" [ref=f2e775]
+                - cell "对于 RTOS 系统，使用 I2C 将 SDK 认证芯片（DJI SDK CC）连接至第三方开发平台后，需要实现并注册配置 I2C 的回调函数，当系统初始化时，会自动完成 I2C 器件的配置，配置完成后，可以和 SDK 认证芯片（DJI SDK CC）正常通讯。 详细实现方法请参见：/samples/sample_c/platform/rtos_freertos/stm32f4_discovery/hal/hal_i2c.c" [ref=f2e776]
+              - row [ref=f2e777]:
+                - cell "Osal 层适配" [ref=f2e778]
+                - cell "Linux" [ref=f2e779]
+                - 'cell "使用标准库 `pthread` 封装 `T_DjiOsalHandler`中的线程函数、互斥锁、信号量以及时间接口等接口。详细实现方法请参见：samples/sample_c/platform/linux/common/osal/osal.c" [ref=f2e780]'
+              - row [ref=f2e781]:
+                - cell "RTOS" [ref=f2e782]
+                - 'cell "使用 CMSIS 封装的`thread`接口，封装 `T_DjiOsalHandler`中的线程函数、互斥锁、信号量以及时间接口等接口。 详细实现方法请参见：samples/sample_c/platform/rtos_freertos/common/osal/osal.c" [ref=f2e783]'
+          - heading "2. 注册跨平台适配接口" [level=4] [ref=f2e784]:
+            - link [ref=f2e785] [cursor=pointer]:
+              - /url: "#_2-注册跨平台适配接口"
+              - text: "#"
+            - text: 2. 注册跨平台适配接口
+          - heading "结构体声明" [level=5] [ref=f2e786]:
+            - link [ref=f2e787] [cursor=pointer]:
+              - /url: "#结构体声明"
+              - text: "#"
+            - text: 结构体声明
+          - paragraph [ref=f2e788]:
+            - text: 请完整地填充
+            - code [ref=f2e789]: T_DjiHalUartHandler
+            - text: 、
+            - code [ref=f2e790]: T_DjiHalNetworkHandler
+            - text: 、
+            - code [ref=f2e791]: T_DjiHalUsbBulkHandler
+            - text: 和
+            - code [ref=f2e792]: T_DjiOsalHandler
+            - text: 中的接口内容，确保所注册的接口能够正常使用。
+          - paragraph [ref=f2e793]:
+            - text: 若对应的机型有使用 SDK 认证芯片（SDK CC），需要额外填充
+            - code [ref=f2e794]: T_DjiHalI2cHandler
+            - text: 中的接口内容，确保所注册的接口能够正常使用。
+          - list [ref=f2e795]:
+            - listitem [ref=f2e796]: T_DjiHalUartHandler uartHandler
+          - generic [ref=f2e797]:
+            - text: c
+            - code [ref=f2e799]: "T_DjiHalUartHandler uartHandler = { .UartInit = HalUart_Init, .UartDeInit = HalUart_DeInit, .UartWriteData = HalUart_WriteData, .UartReadData = HalUart_ReadData, .UartGetStatus = HalUart_GetStatus, };"
+            - button "Copy code" [ref=f2e989] [cursor=pointer]
+          - list [ref=f2e808]:
+            - listitem [ref=f2e809]: T_DjiHalNetworkHandler networkHandler
+          - generic [ref=f2e810]:
+            - text: c
+            - code [ref=f2e812]: "T_DjiHalNetworkHandler networkHandler = { .NetworkInit = HalNetWork_Init, .NetworkDeInit = HalNetWork_DeInit, .NetworkGetDeviceInfo = HalNetWork_GetDeviceInfo, };"
+            - button "Copy code" [ref=f2e990] [cursor=pointer]
+          - list [ref=f2e819]:
+            - listitem [ref=f2e820]: T_DjiOsalHandler osalHandler
+          - generic [ref=f2e821]:
+            - text: c
+            - code [ref=f2e823]: "T_DjiOsalHandler osalHandler = { .TaskCreate = Osal_TaskCreate, .TaskDestroy = Osal_TaskDestroy, .TaskSleepMs = Osal_TaskSleepMs, .MutexCreate= Osal_MutexCreate, .MutexDestroy = Osal_MutexDestroy, .MutexLock = Osal_MutexLock, .MutexUnlock = Osal_MutexUnlock, .SemaphoreCreate = Osal_SemaphoreCreate, .SemaphoreDestroy = Osal_SemaphoreDestroy, .SemaphoreWait = Osal_SemaphoreWait, .SemaphoreTimedWait = Osal_SemaphoreTimedWait, .SemaphorePost = Osal_SemaphorePost, .Malloc = Osal_Malloc, .Free = Osal_Free, .GetTimeMs = Osal_GetTimeMs, .GetTimeUs = Osal_GetTimeUs, };"
+            - button "Copy code" [ref=f2e991] [cursor=pointer]
+          - list [ref=f2e843]:
+            - listitem [ref=f2e844]: T_DjiHalI2cHandler i2CHandler
+          - generic [ref=f2e845]:
+            - text: c
+            - code [ref=f2e847]: "T_DjiHalI2cHandler i2CHandler = { .I2cInit = HalI2c_Init, .I2cDeInit = HalI2c_DeInit, .I2cWriteData = HalI2c_WriteData, .I2cReadData = HalI2c_ReadData, };"
+            - button "Copy code" [ref=f2e992] [cursor=pointer]
+          - paragraph [ref=f2e855]:
+            - text: 请依次调用
+            - code [ref=f2e856]: DjiPlatform_RegOsalHandler()
+            - text: 、
+            - code [ref=f2e857]: DjiPlatform_RegHalUartHandler()
+            - text: 函数注册基础 Hal 层和 Osal 层，若接口注册不成功，请根据返回码和日志信息排查错误问题。若使用依赖 USB 或者网卡的功能，还需要根据实际情况调用
+            - code [ref=f2e858]: DjiPlatform_RegHalUsbBulkHandler
+            - text: 函数注册 USB Bulk 设备的相关方法或者调用
+            - code [ref=f2e859]: DjiPlatform_RegHalNetworkHandler
+            - text: 函数注册网卡的相关方法。若对应的机型有使用 SDK 认证芯片（SDK CC），需要调用
+            - code [ref=f2e860]: DjiPlatform_RegHalI2cHandler
+            - text: 中的接口内容，确保所注册的接口能够正常使用。
+          - generic [ref=f2e861]:
+            - paragraph [ref=f2e862]: 说明：
+            - paragraph [ref=f2e863]: 跨平台移植模块必须在其他 PSDK 功能模块前被注册，若 Platform 模块注册失败或未注册，开发者将无法使用基于 PSDK 开发的负载设备。
+          - generic [ref=f2e864]:
+            - text: c
+            - code [ref=f2e866]:
+              - text: "returnCode = DjiPlatform_RegOsalHandler(&osalHandler); if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) { printf(\"register osal handler error\"); return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR; } returnCode = DjiPlatform_RegHalUartHandler(&uartHandler); if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) { printf(\"register hal uart handler error\"); return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR; }"
+              - generic [ref=f2e867]:
+                - text: "#if"
+                - generic [ref=f2e868]: (CONFIG_HARDWARE_CONNECTION == DJI_USE_UART_AND_USB_BULK_DEVICE)
+              - text: "returnCode = DjiPlatform_RegHalUsbBulkHandler(&usbBulkHandler); if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) { printf(\"register hal usb bulk handler error\"); return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR; }"
+              - generic [ref=f2e869]:
+                - text: "#elif"
+                - generic [ref=f2e870]: (CONFIG_HARDWARE_CONNECTION == DJI_USE_UART_AND_NETWORK_DEVICE)
+              - text: "returnCode = DjiPlatform_RegHalNetworkHandler(&networkHandler); if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) { printf(\"register hal network handler error\"); return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR; } //Attention: if you want to use camera stream view function, please uncomment it. returnCode = DjiPlatform_RegSocketHandler(&socketHandler); if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) { printf(\"register osal socket handler error\"); return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR; }"
+              - generic [ref=f2e871]:
+                - text: "#elif"
+                - generic [ref=f2e872]: (CONFIG_HARDWARE_CONNECTION == DJI_USE_ONLY_UART)
+              - text: "/*!< Attention: Only use uart hardware connection. */"
+              - generic [ref=f2e873]: "#endif"
+              - text: "//Optional: it is necessary to call this interface when using the encryption chip. returnCode = DjiPlatform_RegHalI2cHandler(&i2CHandler); if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) { printf(\"register hal i2c handler error\"); return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR; }"
+            - button "Copy code" [ref=f2e993] [cursor=pointer]
+        - navigation [ref=f2e917]:
+          - paragraph [ref=f2e918]:
+            - link "配置开发环境" [ref=f2e920] [cursor=pointer]:
+              - /url: /doc/payload-sdk-tutorial/cn/payload-quick-start/config-develop-environment.html
+              - text: ← 配置开发环境
+            - link "应用绑定" [ref=f2e922] [cursor=pointer]:
+              - /url: /doc/payload-sdk-tutorial/cn/payload-quick-start/bind-application.html
+              - text: 应用绑定 →
+        - generic [ref=f2e925]:
+          - generic [ref=f2e926]: 请问您的文档阅读体验如何？
+          - slider "rating" [ref=f2e927]
+      - list [ref=f2e995]:
+        - listitem [ref=f2e996]:
+          - link "PSDK 开发包目录结构" [ref=f2e997] [cursor=pointer]:
+            - /url: "#psdk-开发包目录结构"
+        - listitem [ref=f2e998]:
+          - link "引入静态库" [ref=f2e999] [cursor=pointer]:
+            - /url: "#引入静态库"
+        - listitem [ref=f2e1000]:
+          - link "引入头文件" [ref=f2e1001] [cursor=pointer]:
+            - /url: "#引入头文件"
+        - listitem [ref=f2e1002]:
+          - link "引入编译宏" [ref=f2e1003] [cursor=pointer]:
+            - /url: "#引入编译宏"
+        - listitem [ref=f2e1004]:
+          - link "PSDK 初始化" [ref=f2e1005] [cursor=pointer]:
+            - /url: "#psdk-初始化"
+        - listitem [ref=f2e1006]:
+          - link "注册 Platform 模块" [ref=f2e1007] [cursor=pointer]:
+            - /url: "#注册-platform-模块"
+        - listitem [ref=f2e1008]:
+          - link "PSDK 初始化" [ref=f2e1009] [cursor=pointer]:
+            - /url: "#psdk-初始化-1"
+        - listitem [ref=f2e1010]:
+          - link "PSDK 功能初始化" [ref=f2e1011] [cursor=pointer]:
+            - /url: "#psdk-功能初始化"
+        - listitem [ref=f2e1012]:
+          - link "启动应用程序" [ref=f2e1013] [cursor=pointer]:
+            - /url: "#启动应用程序"
+        - listitem [ref=f2e1014]:
+          - link "跨平台移植" [ref=f2e1015] [cursor=pointer]:
+            - /url: "#跨平台移植"
+        - listitem [ref=f2e1016]:
+          - link "示例代码" [ref=f2e1017] [cursor=pointer]:
+            - /url: "#示例代码"
+        - listitem [ref=f2e1018]:
+          - link "概述" [ref=f2e1019] [cursor=pointer]:
+            - /url: "#概述"
+        - listitem [ref=f2e1020]:
+          - link "基础概念" [ref=f2e1021] [cursor=pointer]:
+            - /url: "#基础概念"
+        - listitem [ref=f2e1022]:
+          - link "实现跨平台移植" [ref=f2e1023] [cursor=pointer]:
+            - /url: "#实现跨平台移植"
+  - generic [ref=f2e970]:
+    - text: 若您对文档有意见或疑惑，点击可快速反馈，我们会与您联系。
+    - button "好的，我知道了" [ref=f2e972] [cursor=pointer]

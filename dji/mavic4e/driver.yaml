@@ -1,0 +1,9 @@
+id: dji-mavic4e
+name: DJI Mavic 4E/4T Bundle
+category: driver
+hardware_provider: dji
+hardware_model: "mavic4e"
+image_name: dji-mavic4e
+port: 15703
+mcp_url: "http://localhost:15703/mcp"
+description: "DJI Mavic 4E/4T — 飞行控制 + 相机 + 云台 + 航点任务 + 遥测 + 感知"

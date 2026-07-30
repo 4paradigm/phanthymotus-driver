@@ -1,0 +1,209 @@
+<?xml version="1.0" ?>
+<robot name="Tianyi2Pro">
+  <material name="dark">
+    <color rgba="0.3 0.3 0.35 1"/>
+  </material>
+  <material name="light">
+    <color rgba="0.8 0.8 0.82 1"/>
+  </material>
+  <material name="blue">
+    <color rgba="0.2 0.4 0.8 1"/>
+  </material>
+
+  <!-- Root: chassis (wheeled base) -->
+  <link name="chassis_link">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="15.0"/>
+      <inertia ixx="0.5" ixy="0" ixz="0" iyy="0.5" iyz="0" izz="0.3"/>
+    </inertial>
+  </link>
+
+  <!-- Pelvis (fixed to chassis top) -->
+  <link name="pelvis_link"><inertial><mass value="3.0"/></inertial></link>
+  <joint name="chassis_to_pelvis" type="fixed">
+    <origin xyz="0 0 0.45" rpy="0 0 0"/>
+    <parent link="chassis_link"/><child link="pelvis_link"/>
+  </joint>
+
+  <!-- ═══ Left Leg (2 DOF: hip pitch + knee pitch) ═══ -->
+  <link name="left_hip_pitch_link"><inertial><mass value="2.0"/></inertial></link>
+  <joint name="left_hip_pitch_joint" type="revolute">
+    <origin xyz="0.0 0.1 -0.05" rpy="0 0 0"/>
+    <parent link="pelvis_link"/><child link="left_hip_pitch_link"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-0.227" upper="1.396" effort="332" velocity="3.93"/>
+  </joint>
+
+  <link name="left_knee_pitch_link"><inertial><mass value="1.5"/></inertial></link>
+  <joint name="left_knee_pitch_joint" type="revolute">
+    <origin xyz="0 0 -0.25" rpy="0 0 0"/>
+    <parent link="left_hip_pitch_link"/><child link="left_knee_pitch_link"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-0.454" upper="2.793" effort="332" velocity="3.93"/>
+  </joint>
+
+  <!-- ═══ Waist (2 DOF: yaw + pitch) ═══ -->
+  <link name="waist_yaw_link"><inertial><mass value="3.0"/></inertial></link>
+  <joint name="waist_yaw_joint" type="revolute">
+    <origin xyz="0 0 0.1" rpy="0 0 0"/>
+    <parent link="pelvis_link"/><child link="waist_yaw_link"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.793" upper="3.142" effort="143" velocity="3.14"/>
+  </joint>
+
+  <link name="waist_pitch_link"><inertial><mass value="2.5"/></inertial></link>
+  <joint name="waist_pitch_joint" type="revolute">
+    <origin xyz="0 0 0.05" rpy="0 0 0"/>
+    <parent link="waist_yaw_link"/><child link="waist_pitch_link"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-0.785" upper="2.094" effort="332" velocity="3.93"/>
+  </joint>
+
+  <!-- Torso (from waist) -->
+  <link name="torso_link"><inertial><mass value="5.0"/></inertial></link>
+  <joint name="waist_to_torso" type="fixed">
+    <origin xyz="0 0 0.3" rpy="0 0 0"/>
+    <parent link="waist_pitch_link"/><child link="torso_link"/>
+  </joint>
+
+  <!-- ═══ Head (3 DOF: yaw + pitch + roll) ═══ -->
+  <link name="head_yaw_link"><inertial><mass value="0.3"/></inertial></link>
+  <joint name="head_yaw_joint" type="revolute">
+    <origin xyz="0 0 0.15" rpy="0 0 0"/>
+    <parent link="torso_link"/><child link="head_yaw_link"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-1.571" upper="1.571" effort="9" velocity="6.7"/>
+  </joint>
+
+  <link name="head_pitch_link"><inertial><mass value="0.3"/></inertial></link>
+  <joint name="head_pitch_joint" type="revolute">
+    <origin xyz="0 0 0.05" rpy="0 0 0"/>
+    <parent link="head_yaw_link"/><child link="head_pitch_link"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-0.436" upper="0.436" effort="9" velocity="6.7"/>
+  </joint>
+
+  <link name="head_roll_link"><inertial><mass value="0.8"/></inertial></link>
+  <joint name="head_roll_joint" type="revolute">
+    <origin xyz="0 0 0.05" rpy="0 0 0"/>
+    <parent link="head_pitch_link"/><child link="head_roll_link"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-0.454" upper="0.454" effort="9" velocity="6.7"/>
+  </joint>
+
+  <!-- ═══ Left Arm (7 DOF) ═══ -->
+  <link name="left_shoulder_pitch_link"><inertial><mass value="1.0"/></inertial></link>
+  <joint name="left_shoulder_pitch_joint" type="revolute">
+    <origin xyz="0 0.18 0.05" rpy="0 0 0"/>
+    <parent link="torso_link"/><child link="left_shoulder_pitch_link"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.967" upper="2.967" effort="91" velocity="9.2"/>
+  </joint>
+
+  <link name="left_shoulder_roll_link"><inertial><mass value="0.8"/></inertial></link>
+  <joint name="left_shoulder_roll_joint" type="revolute">
+    <origin xyz="0 0.05 0" rpy="0 0 0"/>
+    <parent link="left_shoulder_pitch_link"/><child link="left_shoulder_roll_link"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-0.262" upper="2.618" effort="60" velocity="12.6"/>
+  </joint>
+
+  <link name="left_shoulder_yaw_link"><inertial><mass value="0.6"/></inertial></link>
+  <joint name="left_shoulder_yaw_joint" type="revolute">
+    <origin xyz="0 0.05 0" rpy="0 0 0"/>
+    <parent link="left_shoulder_roll_link"/><child link="left_shoulder_yaw_link"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.967" upper="2.967" effort="30" velocity="7.6"/>
+  </joint>
+
+  <link name="left_elbow_pitch_link"><inertial><mass value="0.5"/></inertial></link>
+  <joint name="left_elbow_pitch_joint" type="revolute">
+    <origin xyz="0 0 -0.22" rpy="0 0 0"/>
+    <parent link="left_shoulder_yaw_link"/><child link="left_elbow_pitch_link"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.618" upper="0.262" effort="30" velocity="7.6"/>
+  </joint>
+
+  <link name="left_wrist_yaw_link"><inertial><mass value="0.3"/></inertial></link>
+  <joint name="left_wrist_yaw_joint" type="revolute">
+    <origin xyz="0 0 -0.2" rpy="0 0 0"/>
+    <parent link="left_elbow_pitch_link"/><child link="left_wrist_yaw_link"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.967" upper="2.967" effort="15" velocity="15.3"/>
+  </joint>
+
+  <link name="left_wrist_pitch_link"><inertial><mass value="0.2"/></inertial></link>
+  <joint name="left_wrist_pitch_joint" type="revolute">
+    <origin xyz="0 0 -0.05" rpy="0 0 0"/>
+    <parent link="left_wrist_yaw_link"/><child link="left_wrist_pitch_link"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-0.785" upper="1.047" effort="9" velocity="7.5"/>
+  </joint>
+
+  <link name="left_wrist_roll_link"><inertial><mass value="0.4"/></inertial></link>
+  <joint name="left_wrist_roll_joint" type="revolute">
+    <origin xyz="0 0 -0.05" rpy="0 0 0"/>
+    <parent link="left_wrist_pitch_link"/><child link="left_wrist_roll_link"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-1.658" upper="1.309" effort="9" velocity="7.5"/>
+  </joint>
+
+  <!-- ═══ Right Arm (7 DOF) ═══ -->
+  <link name="right_shoulder_pitch_link"><inertial><mass value="1.0"/></inertial></link>
+  <joint name="right_shoulder_pitch_joint" type="revolute">
+    <origin xyz="0 -0.18 0.05" rpy="0 0 0"/>
+    <parent link="torso_link"/><child link="right_shoulder_pitch_link"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.967" upper="2.967" effort="91" velocity="9.2"/>
+  </joint>
+
+  <link name="right_shoulder_roll_link"><inertial><mass value="0.8"/></inertial></link>
+  <joint name="right_shoulder_roll_joint" type="revolute">
+    <origin xyz="0 -0.05 0" rpy="0 0 0"/>
+    <parent link="right_shoulder_pitch_link"/><child link="right_shoulder_roll_link"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-2.618" upper="0.262" effort="60" velocity="12.6"/>
+  </joint>
+
+  <link name="right_shoulder_yaw_link"><inertial><mass value="0.6"/></inertial></link>
+  <joint name="right_shoulder_yaw_joint" type="revolute">
+    <origin xyz="0 -0.05 0" rpy="0 0 0"/>
+    <parent link="right_shoulder_roll_link"/><child link="right_shoulder_yaw_link"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.967" upper="2.967" effort="30" velocity="7.6"/>
+  </joint>
+
+  <link name="right_elbow_pitch_link"><inertial><mass value="0.5"/></inertial></link>
+  <joint name="right_elbow_pitch_joint" type="revolute">
+    <origin xyz="0 0 -0.22" rpy="0 0 0"/>
+    <parent link="right_shoulder_yaw_link"/><child link="right_elbow_pitch_link"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.618" upper="0.262" effort="30" velocity="7.6"/>
+  </joint>
+
+  <link name="right_wrist_yaw_link"><inertial><mass value="0.3"/></inertial></link>
+  <joint name="right_wrist_yaw_joint" type="revolute">
+    <origin xyz="0 0 -0.2" rpy="0 0 0"/>
+    <parent link="right_elbow_pitch_link"/><child link="right_wrist_yaw_link"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.967" upper="2.967" effort="15" velocity="15.3"/>
+  </joint>
+
+  <link name="right_wrist_pitch_link"><inertial><mass value="0.2"/></inertial></link>
+  <joint name="right_wrist_pitch_joint" type="revolute">
+    <origin xyz="0 0 -0.05" rpy="0 0 0"/>
+    <parent link="right_wrist_yaw_link"/><child link="right_wrist_pitch_link"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-0.785" upper="1.047" effort="9" velocity="7.5"/>
+  </joint>
+
+  <link name="right_wrist_roll_link"><inertial><mass value="0.4"/></inertial></link>
+  <joint name="right_wrist_roll_joint" type="revolute">
+    <origin xyz="0 0 -0.05" rpy="0 0 0"/>
+    <parent link="right_wrist_pitch_link"/><child link="right_wrist_roll_link"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-1.309" upper="1.658" effort="9" velocity="7.5"/>
+  </joint>
+
+</robot>

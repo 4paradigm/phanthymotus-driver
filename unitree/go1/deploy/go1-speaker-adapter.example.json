@@ -1,0 +1,10 @@
+{
+  "bind_host": "192.168.123.13",
+  "port": 18083,
+  "stream_port": 18084,
+  "audio_device": "auto",
+  "mixer_control": "Speaker",
+  "idle_timeout_sec": 15.0,
+  "aplay_buffer_us": 75000,
+  "aplay_period_us": 10000
+}

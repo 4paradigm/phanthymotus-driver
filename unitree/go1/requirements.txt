@@ -1,0 +1,6 @@
+# go1_bundle 只读状态驱动运行期依赖。
+# rclpy 由 ROS base 镜像提供（可选；容器内可用 → 状态卡发 topic 在画布渲染）。
+# robot_interface 由 unitree_legged_sdk 源码在镜像内构建（-DPYTHON_BUILD=ON），不通过 pip。
+pyyaml
+paho-mqtt          # face_light / system_health 经狗自带 MQTT broker(灯带、bms/state)
+# numpy 基础镜像已自带(1.21.5)，本 bundle 也不直接用。

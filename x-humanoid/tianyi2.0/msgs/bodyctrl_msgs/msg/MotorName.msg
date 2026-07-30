@@ -1,0 +1,45 @@
+# head 00 + id
+uint16 MOTOR_HEAD_1 = 1
+uint16 MOTOR_HEAD_2 = 2
+uint16 MOTOR_HEAD_3 = 3
+
+# arm-left 10 + id
+uint16 MOTOR_ARM_LEFT_1 = 11
+uint16 MOTOR_ARM_LEFT_2 = 12
+uint16 MOTOR_ARM_LEFT_3 = 13
+uint16 MOTOR_ARM_LEFT_4 = 14
+uint16 MOTOR_ARM_LEFT_5 = 15
+uint16 MOTOR_ARM_LEFT_6 = 16
+uint16 MOTOR_ARM_LEFT_7 = 17
+
+# arm-right 20 + id
+uint16 MOTOR_ARM_RIGHT_1 = 21
+uint16 MOTOR_ARM_RIGHT_2 = 22
+uint16 MOTOR_ARM_RIGHT_3 = 23
+uint16 MOTOR_ARM_RIGHT_4 = 24
+uint16 MOTOR_ARM_RIGHT_5 = 25
+uint16 MOTOR_ARM_RIGHT_6 = 26
+uint16 MOTOR_ARM_RIGHT_7 = 27
+
+# body (including waist) 30 + id
+uint16 MOTOR_WAIST_1 = 31
+uint16 MOTOR_WAIST_2 = 32
+uint16 MOTOR_WAIST_3 = 33
+
+# 40 rfu
+
+# leg-left 50 + id
+uint16 MOTOR_LEG_LEFT_1 = 51
+uint16 MOTOR_LEG_LEFT_2 = 52
+uint16 MOTOR_LEG_LEFT_3 = 53
+uint16 MOTOR_LEG_LEFT_4 = 54
+uint16 MOTOR_LEG_LEFT_5 = 55
+uint16 MOTOR_LEG_LEFT_6 = 56
+
+# leg-right 60 + id
+uint16 MOTOR_LEG_RIGHT_1 = 61
+uint16 MOTOR_LEG_RIGHT_2 = 62
+uint16 MOTOR_LEG_RIGHT_3 = 63
+uint16 MOTOR_LEG_RIGHT_4 = 64
+uint16 MOTOR_LEG_RIGHT_5 = 65
+uint16 MOTOR_LEG_RIGHT_6 = 66
