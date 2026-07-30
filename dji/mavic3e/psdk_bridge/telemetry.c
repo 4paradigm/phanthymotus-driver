@@ -54,12 +54,6 @@ static T_DjiReturnCode _velocity_cb(const uint8_t *data, uint16_t size, const T_
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
 
-static T_DjiReturnCode _gps_cb(const uint8_t *data, uint16_t size, const T_DjiDataTimestamp *ts) {
-    if (size >= sizeof(s_gps_pos))
-        memcpy(&s_gps_pos, data, sizeof(s_gps_pos));
-    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
-}
-
 static T_DjiReturnCode _gps_detail_cb(const uint8_t *data, uint16_t size, const T_DjiDataTimestamp *ts) {
     if (size >= sizeof(s_gps_detail))
         memcpy(&s_gps_detail, data, sizeof(s_gps_detail));
@@ -127,7 +121,10 @@ int telemetry_init(void) {
      * POSITION_FUSED: that topic is not supported on this aircraft family. */
     rc = DjiFcSubscription_SubscribeTopic(DJI_FC_SUBSCRIPTION_TOPIC_QUATERNION, DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, _quaternion_cb);
     rc = DjiFcSubscription_SubscribeTopic(DJI_FC_SUBSCRIPTION_TOPIC_VELOCITY, DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, _velocity_cb);
-    rc = DjiFcSubscription_SubscribeTopic(DJI_FC_SUBSCRIPTION_TOPIC_GPS_POSITION, DJI_DATA_SUBSCRIPTION_TOPIC_5_HZ, _gps_cb);
+    /* GPS_POSITION is pulled with GetLatestValueOfTopic below.  This mirrors
+     * DJI's sample and avoids relying on a callback that is not delivered for
+     * this topic on the M3T E-Port path. */
+    rc = DjiFcSubscription_SubscribeTopic(DJI_FC_SUBSCRIPTION_TOPIC_GPS_POSITION, DJI_DATA_SUBSCRIPTION_TOPIC_5_HZ, NULL);
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
         printf("[telemetry] GPS_POSITION subscription failed: 0x%08llX\n", (unsigned long long)rc);
         return -1;
@@ -156,6 +153,14 @@ int telemetry_get_json(char *buf, size_t buflen) {
 
     /* GPS_POSITION uses x=longitude, y=latitude (degrees * 1e7), z=altitude
      * (millimetres).  On M3E/M3T this is the supported position source. */
+    T_DjiDataTimestamp gps_timestamp;
+    T_DjiReturnCode gps_rc = DjiFcSubscription_GetLatestValueOfTopic(
+        DJI_FC_SUBSCRIPTION_TOPIC_GPS_POSITION,
+        (uint8_t *)&s_gps_pos, sizeof(s_gps_pos), &gps_timestamp);
+    if (gps_rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+        printf("[telemetry] GPS_POSITION read failed: 0x%08llX\n",
+               (unsigned long long)gps_rc);
+    }
     double lat_deg = (double)s_gps_pos.y / 1e7;
     double lon_deg = (double)s_gps_pos.x / 1e7;
     double gps_alt = (double)s_gps_pos.z / 1000.0;
