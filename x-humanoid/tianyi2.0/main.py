@@ -117,35 +117,10 @@ class TianyiDeviceBundle:
             self._plugins.append(NavStatePlugin(plugins_cfg["nav_state"], namespace, ros2, slamtec_client))
             print("[bundle] NavStatePlugin loaded")
 
-        if plugins_cfg.get("motor", {}).get("enabled", False):
-            from device import MotorStatePlugin
-            self._plugins.append(MotorStatePlugin(plugins_cfg["motor"], namespace, ros2))
-            print("[bundle] MotorStatePlugin loaded")
-
-        if plugins_cfg.get("hand_state", {}).get("enabled", False):
-            from device import HandStatePlugin
-            self._plugins.append(HandStatePlugin(plugins_cfg["hand_state"], namespace, ros2))
-            print("[bundle] HandStatePlugin loaded")
-
-        if plugins_cfg.get("force_torque", {}).get("enabled", False):
-            from device import ForceTorqueStatePlugin
-            self._plugins.append(ForceTorqueStatePlugin(plugins_cfg["force_torque"], namespace, ros2))
-            print("[bundle] ForceTorqueStatePlugin loaded")
-
         if plugins_cfg.get("power_board", {}).get("enabled", False):
             from device import PowerBoardStatePlugin
             self._plugins.append(PowerBoardStatePlugin(plugins_cfg["power_board"], namespace, ros2))
             print("[bundle] PowerBoardStatePlugin loaded")
-
-        if plugins_cfg.get("remote", {}).get("enabled", False):
-            from device import RemoteStatePlugin
-            self._plugins.append(RemoteStatePlugin(plugins_cfg["remote"], namespace, ros2))
-            print("[bundle] RemoteStatePlugin loaded")
-
-        if plugins_cfg.get("voice", {}).get("enabled", False):
-            from device import VoiceStatePlugin
-            self._plugins.append(VoiceStatePlugin(plugins_cfg["voice"], namespace, ros2))
-            print("[bundle] VoiceStatePlugin loaded")
 
         if plugins_cfg.get("head", {}).get("enabled", False):
             from device import HeadPlugin

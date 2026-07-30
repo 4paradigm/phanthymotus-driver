@@ -14,17 +14,7 @@ plugins:
     enabled: true
   nav_state:
     enabled: true
-  motor:
-    enabled: true
-  hand_state:
-    enabled: true
-  force_torque:
-    enabled: true
   power_board:
-    enabled: true
-  remote:
-    enabled: true
-  voice:
     enabled: true
   head:
     enabled: true
