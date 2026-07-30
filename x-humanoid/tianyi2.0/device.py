@@ -1358,13 +1358,13 @@ class ArmGesturePlugin:
     # 肘 pitch 使用负角度屈肘；右臂由 _publish_pose 按横向关节自动镜像。
     _GESTURES = {
         # In the URDF chain shoulder yaw rotates the elbow-pitch plane. The
-        # shoulder and elbow angles place the wrist; wrist pitch/roll are used
+        # shoulder and elbow angles place the wrist; wrist yaw/roll are used
         # only where the final palm orientation needs calibration.
-        "salute": [-10, 90, 60, -130, 0, 50, 0],
+        "salute": [-10, 90, 60, -130, 50, 0, 0],
         "welcome": [-10, 65, 75, -100, 0, 0, 0],
         "raise": [0, 130, 0, -15, 0, 0, 0],
         "shake_hands": [-55, 15, 5, -35, 0, 0, 0],
-        "high_five": [-40, 40, -20, -80, 0, 0, -20],
+        "high_five": [-40, 40, -20, -80, 0, 0, 30],
     }
     _PREPARE_POSES = {
         # Flex the elbow while establishing the lifting plane instead of first
@@ -1373,11 +1373,11 @@ class ArmGesturePlugin:
         "welcome": [-10, 45, 45, -60, 0, 0, 0],
         "raise": [0, 75, 0, -30, 0, 0, 0],
         "shake_hands": [-30, 10, 0, -20, 0, 0, 0],
-        "high_five": [-25, 25, -10, -45, 0, 0, -10],
+        "high_five": [-25, 25, -10, -45, 0, 0, 10],
     }
     # Salute stage 2: raise the upper arm laterally and fold the forearm inward,
     # placing the wrist near the side of the head. Stage 3
-    # (_GESTURES["salute"]) adjusts only wrist pitch into the final orientation.
+    # (_GESTURES["salute"]) adjusts only wrist yaw into the final orientation.
     _SALUTE_ELBOW = [-10, 90, 60, -130, 0, 0, 0]
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):

@@ -64,7 +64,7 @@ establish the elbow-flexion plane; elbow pitch can then raise the forearm
 instead of leaving it horizontal in front of the torso. `salute` uses three
 blended stages: the preparation frame bends the elbow, the second frame raises
 the upper arm laterally and flexes the elbow to approximately 130 degrees to
-draw the wrist inward beside the head, then 50 degrees of wrist pitch completes
+draw the wrist inward beside the head, then 50 degrees of wrist yaw completes
 the final salute. In this URDF chain, shoulder yaw rotates the downstream
 elbow-pitch axis: positive left-arm yaw (mirrored negative on the right) makes
 negative elbow pitch lift and fold the forearm inward, while the opposite yaw
@@ -86,10 +86,11 @@ forward-reach pose and uses a small elbow sweep for the handshake.
 `high_five` places the wrist approximately 0.37 m in front of the torso plane
 and at approximately the shoulder-joint height in the checked-in URDF.
 
-Wrist pitch stays neutral except for the final `salute` frame, where it moves
-to 50 degrees to orient the hand. `welcome` keeps all wrist joints at zero for
-the entire sequence. Wrist roll is retained only for `high_five` palm-facing
-calibration.
+Wrist pitch stays neutral in every semantic frame. The final `salute` frame
+moves wrist yaw to 50 degrees to orient the hand. `welcome` keeps all wrist
+joints at zero for the entire sequence. For the left-arm `high_five`, wrist
+roll moves from 10 degrees in the preparation frame to 30 degrees in the final
+frame; the right arm uses the mirrored negative angles.
 
 The URDF defines joint axes and limits but contains no hand palm frame and no
 arm visual/collision geometry. Palm-facing wrist values are therefore
