@@ -14,6 +14,18 @@ plugins:
     enabled: true
   nav_state:
     enabled: true
+  motor:
+    enabled: true
+  hand_state:
+    enabled: true
+  force_torque:
+    enabled: true
+  power_board:
+    enabled: true
+  remote:
+    enabled: true
+  voice:
+    enabled: true
   head:
     enabled: true
   head_gesture:
@@ -26,7 +38,11 @@ plugins:
     enabled: true
   tts:
     enabled: true
+  voice_play:
+    enabled: true
   nav:
     enabled: true
   chat:
+    enabled: true
+  voice_chat:
     enabled: true

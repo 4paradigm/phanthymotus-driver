@@ -14,18 +14,26 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   - domain 42 (ros2.ctx_core): 发布传感器数据给 Agent Core
 
 插件列表：
-  StatePlugin      (sensor, multi-tool) — 关节/电池/急停/力传感器/URDF
-  CameraPlugin     (sensor)             — Orbbec 头部相机
-  AsrPlugin        (sensor)             — 语音识别结果
-  NavStatePlugin   (sensor)             — 底盘导航状态
-  HeadPlugin       (actuator)           — 头部3DOF控制
-  HeadGesturePlugin (actuator)          — 点头/摇头/左右观察等语义动作
-  ArmPlugin        (actuator)           — 双臂14DOF控制
-  WaistPlugin      (actuator)           — 腰部2DOF控制
-  HandPlugin       (actuator)           — 灵巧手控制
-  TtsPlugin        (actuator)           — 语音合成
-  NavPlugin        (actuator)           — 底盘导航控制
-  ChatPlugin       (actuator)           — 语音交互开关
+  StatePlugin         (sensor, multi-tool) — 关节/电池/急停/力传感器/URDF
+  CameraPlugin        (sensor)             — Orbbec 头部相机
+  AsrPlugin           (sensor)             — 语音识别结果
+  NavStatePlugin      (sensor)             — 底盘导航状态
+  MotorStatePlugin    (sensor)             — 全身21电机状态(按部位聚合,含错误码)
+  HandStatePlugin     (sensor)             — 灵巧手状态(左右各6 DOF)
+  ForceTorqueStatePlugin (sensor)         — 双臂六维力/力矩(100Hz)
+  PowerBoardStatePlugin (sensor)          — 电源板MOS温度/电流/电压
+  RemoteStatePlugin   (sensor)             — 遥控器SBUS事件与摇杆
+  VoiceStatePlugin    (sensor)             — 语音交互状态(lyre ASR+Play+Chat)
+  HeadPlugin          (actuator)           — 头部3DOF控制
+  HeadGesturePlugin   (actuator)           — 点头/摇头/左右观察等语义动作
+  ArmPlugin           (actuator)           — 双臂14DOF控制
+  WaistPlugin         (actuator)           — 腰部2DOF控制
+  HandPlugin          (actuator)           — 灵巧手控制
+  TtsPlugin           (actuator)           — 语音合成
+  VoicePlayActuatorPlugin (actuator)      — 音频播放控制(文件/URL/TTS)
+  NavPlugin           (actuator)           — 底盘导航控制
+  ChatPlugin          (actuator)           — 语音交互开关
+  VoiceChatActuatorPlugin (actuator)      — 语音对话开关
 """
 
 from __future__ import annotations
@@ -94,6 +102,41 @@ _LEG_JOINTS = {
 }
 
 _ALL_JOINTS = {**_HEAD_JOINTS, **_ARM_LEFT_JOINTS, **_ARM_RIGHT_JOINTS, **_WAIST_JOINTS, **_LEG_JOINTS}
+
+# ── Motor ID → (part, name) mapping for MotorStatePlugin ─────────────────────
+
+_JOINT_NAME_MAP = {}
+for _id, _name in _HEAD_JOINTS.items():
+    _JOINT_NAME_MAP[_id] = ("head", _name)
+for _id, _name in _ARM_LEFT_JOINTS.items():
+    _JOINT_NAME_MAP[_id] = ("arm", _name)
+for _id, _name in _ARM_RIGHT_JOINTS.items():
+    _JOINT_NAME_MAP[_id] = ("arm", _name)
+for _id, _name in _WAIST_JOINTS.items():
+    _JOINT_NAME_MAP[_id] = ("waist", _name)
+for _id, _name in _LEG_JOINTS.items():
+    _JOINT_NAME_MAP[_id] = ("leg", _name)
+
+# ── Inspire hand finger names (id → name) ────────────────────────────────────
+
+_FINGER_NAMES = {1: "little", 2: "ring", 3: "middle", 4: "index",
+                 5: "thumb_bend", 6: "thumb_rotation"}
+
+# ── Shared motor data cache (read by StatePlugin, consumed by MotorStatePlugin) ─
+
+_motor_cache_lock = threading.Lock()
+_motor_cache_data = {}  # motor_id → {pos, speed, current, temp, error}
+
+
+def _cache_motor_status(msg):
+    """Populate shared motor cache from MotorStatusMsg (called by StatePlugin)."""
+    with _motor_cache_lock:
+        for s in msg.status:
+            _motor_cache_data[s.name] = {
+                "pos": s.pos, "speed": s.speed, "current": s.current,
+                "temp": s.temperature, "error": s.error,
+            }
+
 
 _MOTOR_ERROR_DESCRIPTIONS = {
     1: "motor_over_temperature",
@@ -255,10 +298,10 @@ class StatePlugin:
             from bodyctrl_msgs.msg import MotorStatusMsg, PowerBatteryStatus, PowerBoardKeyStatus
             from geometry_msgs.msg import WrenchStamped
 
-            # Subscribe to motor status topics
+            # Subscribe to motor status topics (populates shared cache for MotorStatePlugin)
             for topic in ["/head/status", "/arm/status", "/waist/status", "/leg/status"]:
                 self._sub_node.create_subscription(
-                    MotorStatusMsg, topic, self._on_motor_status, _RELIABLE_QOS)
+                    MotorStatusMsg, topic, _cache_motor_status, _RELIABLE_QOS)
 
             # Battery
             self._sub_node.create_subscription(
@@ -621,6 +664,671 @@ class AsrPlugin:
             return {"state": "running" if self._running else "idle",
                     "topic_out": [{"topic": self._topic, "format": "data/json"}]}
         return {"state": "running"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MotorStatePlugin (sensor) — 全身21电机状态卡
+# ══════════════════════════════════════════════════════════════════════════════
+
+class MotorStatePlugin:
+    """天轶2.0 Pro 全身21电机状态: 位置/速度/电流/温度/错误, 按部位聚合."""
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._topic = f"/{namespace}/state/motor"
+        self._running = False
+
+        self._pub_node = Node("tianyi2_motor_pub", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._pub_node)
+        self._pub = self._pub_node.create_publisher(String, self._topic, _LOW_LAT_QOS)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "motor",
+            "type": "sensor",
+            "multiInstance": False,
+            "readOnly": True,
+            "description": "天轶2.0 Pro 全身21电机状态(头部3+左臂7+右臂7+腰2+腿2):位置/速度/电流/温度/错误,按部位聚合。",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._topic, "format": "data/json"}],
+        }
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._publish_loop, daemon=True)
+        self._thread.start()
+        print("[MotorStatePlugin] publish started")
+
+    def stop(self):
+        self._running = False
+
+    def _publish_loop(self):
+        while self._running:
+            time.sleep(0.01)  # ~100Hz publish, matching arm/leg rate
+            with _motor_cache_lock:
+                data = dict(_motor_cache_data)
+            if not data:
+                continue
+
+            parts = {"head": [], "waist": [], "arm": [], "leg": []}
+            for motor_id, d in data.items():
+                part, name = _JOINT_NAME_MAP.get(motor_id, (None, f"motor_{motor_id}"))
+                if part is None:
+                    continue
+                parts[part].append({
+                    "name": name,
+                    "pos": d["pos"],
+                    "speed": d["speed"],
+                    "current": d["current"],
+                    "temperature": d["temp"],
+                    "error": d["error"],
+                })
+
+            payload = {
+                "parts": parts,
+                "timestamp_ms": int(time.time() * 1000),
+                "control_level": "ANY",
+            }
+            msg = String()
+            msg.data = json.dumps(payload)
+            self._pub.publish(msg)
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "stop", "info"):
+            return {"state": "running" if self._running else "idle",
+                    "topic_out": [{"topic": self._topic, "format": "data/json"}]}
+        return {"state": "running"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HandStatePlugin (sensor) — 仿生手状态卡
+# ══════════════════════════════════════════════════════════════════════════════
+
+class HandStatePlugin:
+    """天轶2.0 Pro 仿生手状态: 左右手各6 DOF, 位置/速度/力, 均为百分比0-1."""
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._topic = f"/{namespace}/state/hand"
+        self._running = False
+        self._left_fingers = []
+        self._right_fingers = []
+        self._lock = threading.Lock()
+
+        self._sub_node = Node("tianyi2_hand_sub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._sub_node)
+
+        self._pub_node = Node("tianyi2_hand_pub", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._pub_node)
+        self._pub = self._pub_node.create_publisher(String, self._topic, _LOW_LAT_QOS)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "hand",
+            "type": "sensor",
+            "multiInstance": False,
+            "readOnly": True,
+            "description": "天轶2.0 Pro 仿生手状态(左右手各6 DOF:位置/速度/力,均为百分比0-1)。",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._topic, "format": "data/json"}],
+        }
+
+    def start(self):
+        self._running = True
+        try:
+            from sensor_msgs.msg import JointState
+            self._sub_node.create_subscription(
+                JointState, "/inspire_hand/state/left_hand", self._on_left, _RELIABLE_QOS)
+            self._sub_node.create_subscription(
+                JointState, "/inspire_hand/state/right_hand", self._on_right, _RELIABLE_QOS)
+            print("[HandStatePlugin] subscriptions created")
+        except ImportError as e:
+            print(f"[HandStatePlugin] WARNING: import failed ({e}), running in stub mode")
+
+        self._thread = threading.Thread(target=self._publish_loop, daemon=True)
+        self._thread.start()
+        print("[HandStatePlugin] publish started")
+
+    def stop(self):
+        self._running = False
+
+    def _on_left(self, msg):
+        with self._lock:
+            self._left_fingers = self._parse_fingers(msg)
+
+    def _on_right(self, msg):
+        with self._lock:
+            self._right_fingers = self._parse_fingers(msg)
+
+    def _parse_fingers(self, msg):
+        fingers = []
+        n = min(len(msg.name), len(msg.position), len(msg.velocity), len(msg.effort))
+        for i in range(n):
+            nid = int(msg.name[i]) if msg.name[i].isdigit() else 0
+            fingers.append({
+                "id": nid,
+                "name": _FINGER_NAMES.get(nid, f"finger_{nid}"),
+                "position": msg.position[i],
+                "velocity": msg.velocity[i],
+                "effort": msg.effort[i],
+            })
+        return fingers
+
+    def _publish_loop(self):
+        while self._running:
+            time.sleep(1.0 / 24.8)  # ~24.8Hz
+            with self._lock:
+                payload = {
+                    "left": {"fingers": list(self._left_fingers)},
+                    "right": {"fingers": list(self._right_fingers)},
+                    "timestamp_ms": int(time.time() * 1000),
+                    "control_level": "ANY",
+                }
+            msg = String()
+            msg.data = json.dumps(payload)
+            self._pub.publish(msg)
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "stop", "info"):
+            return {"state": "running" if self._running else "idle",
+                    "topic_out": [{"topic": self._topic, "format": "data/json"}]}
+        return {"state": "running"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ForceTorqueStatePlugin (sensor) — 双臂六维力/力矩卡
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ForceTorqueStatePlugin:
+    """天轶2.0 Pro 双臂六维力/力矩: 100Hz, 坐标系: X前/Y左/Z上."""
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._topic = f"/{namespace}/state/force_torque"
+        self._running = False
+        self._left = {}
+        self._right = {}
+        self._lock = threading.Lock()
+        self._last_pub = 0
+
+        self._sub_node = Node("tianyi2_force_sub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._sub_node)
+
+        self._pub_node = Node("tianyi2_force_pub", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._pub_node)
+        self._pub = self._pub_node.create_publisher(String, self._topic, _LOW_LAT_QOS)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "force_torque",
+            "type": "sensor",
+            "multiInstance": False,
+            "readOnly": True,
+            "description": "天轶2.0 Pro 双臂六维力/力矩(100Hz,坐标系:X前/Y左/Z上)。",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._topic, "format": "data/json"}],
+        }
+
+    def start(self):
+        self._running = True
+        try:
+            from geometry_msgs.msg import WrenchStamped
+            self._sub_node.create_subscription(
+                WrenchStamped, "/arm_6dof_left", self._on_left, _RELIABLE_QOS)
+            self._sub_node.create_subscription(
+                WrenchStamped, "/arm_6dof_right", self._on_right, _RELIABLE_QOS)
+            print("[ForceTorqueStatePlugin] subscriptions created")
+        except ImportError as e:
+            print(f"[ForceTorqueStatePlugin] WARNING: import failed ({e}), running in stub mode")
+
+        self._thread = threading.Thread(target=self._publish_loop, daemon=True)
+        self._thread.start()
+        print("[ForceTorqueStatePlugin] publish started")
+
+    def stop(self):
+        self._running = False
+
+    def _on_left(self, msg):
+        with self._lock:
+            self._left = {
+                "force": {"x": msg.wrench.force.x, "y": msg.wrench.force.y, "z": msg.wrench.force.z},
+                "torque": {"x": msg.wrench.torque.x, "y": msg.wrench.torque.y, "z": msg.wrench.torque.z},
+            }
+
+    def _on_right(self, msg):
+        with self._lock:
+            self._right = {
+                "force": {"x": msg.wrench.force.x, "y": msg.wrench.force.y, "z": msg.wrench.force.z},
+                "torque": {"x": msg.wrench.torque.x, "y": msg.wrench.torque.y, "z": msg.wrench.torque.z},
+            }
+
+    def _publish_loop(self):
+        while self._running:
+            time.sleep(0.01)  # 100Hz
+            now = time.time()
+            if now - self._last_pub < 0.01:
+                continue
+            self._last_pub = now
+            with self._lock:
+                payload = {
+                    "left": dict(self._left) if self._left else {},
+                    "right": dict(self._right) if self._right else {},
+                    "timestamp_ms": int(time.time() * 1000),
+                    "control_level": "ANY",
+                }
+            msg = String()
+            msg.data = json.dumps(payload)
+            self._pub.publish(msg)
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "stop", "info"):
+            return {"state": "running" if self._running else "idle",
+                    "topic_out": [{"topic": self._topic, "format": "data/json"}]}
+        return {"state": "running"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PowerBoardStatePlugin (sensor) — 电源板状态卡
+# ══════════════════════════════════════════════════════════════════════════════
+
+class PowerBoardStatePlugin:
+    """天轶2.0 Pro 电源板状态: 1Hz, 各部位MOS温度/电流/电压含极值, 母线电压, 软硬版本, 电池汇总."""
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._topic = f"/{namespace}/state/power_board"
+        self._running = False
+        self._data = {}
+        self._lock = threading.Lock()
+
+        self._sub_node = Node("tianyi2_power_sub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._sub_node)
+
+        self._pub_node = Node("tianyi2_power_pub", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._pub_node)
+        self._pub = self._pub_node.create_publisher(String, self._topic, _LOW_LAT_QOS)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "power_board",
+            "type": "sensor",
+            "multiInstance": False,
+            "readOnly": True,
+            "description": "天轶2.0 Pro 电源板状态(1Hz,各部位MOS温度/电流/电压含极值,母线电压,软硬版本,电池汇总)。",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._topic, "format": "data/json"}],
+        }
+
+    def start(self):
+        self._running = True
+        try:
+            from bodyctrl_msgs.msg import PowerStatus
+            self._sub_node.create_subscription(
+                PowerStatus, "/power/board/status", self._on_power, _RELIABLE_QOS)
+            print("[PowerBoardStatePlugin] subscription created")
+        except ImportError as e:
+            print(f"[PowerBoardStatePlugin] WARNING: import failed ({e}), running in stub mode")
+
+        self._thread = threading.Thread(target=self._publish_loop, daemon=True)
+        self._thread.start()
+        print("[PowerBoardStatePlugin] publish started")
+
+    def stop(self):
+        self._running = False
+
+    def _on_power(self, msg):
+        with self._lock:
+            # Build temp dict with min/max
+            temp_parts = ["waist", "arm_a", "arm_b", "leg_a", "leg_b"]
+            temp = {}
+            temp_max = {}
+            temp_min = {}
+            for p in temp_parts:
+                base = p.replace("_", "")
+                temp[p] = getattr(msg, f"{base}_temp", 0)
+                temp_max[p] = getattr(msg, f"{base}_temp_max", 0)
+                temp_min[p] = getattr(msg, f"{base}_temp_min", 0)
+
+            current_parts = ["arm_a", "arm_b", "leg_a", "leg_b", "waist", "head"]
+            current = {}
+            current_max = {}
+            current_min = {}
+            for p in current_parts:
+                base = p.replace("_", "")
+                current[p] = getattr(msg, f"{base}_curr", 0)
+                current_max[p] = getattr(msg, f"{base}_curr_max", 0)
+                current_min[p] = getattr(msg, f"{base}_curr_min", 0)
+
+            voltage_parts = ["arm_a", "arm_b", "leg_a", "leg_b", "waist"]
+            voltage = {}
+            voltage_max = {}
+            voltage_min = {}
+            for p in voltage_parts:
+                base = p.replace("_", "")
+                voltage[p] = getattr(msg, f"{base}_volt", 0)
+                voltage_max[p] = getattr(msg, f"{base}_volt_max", 0)
+                voltage_min[p] = getattr(msg, f"{base}_volt_min", 0)
+            voltage["bus"] = getattr(msg, "bus_volt", 0)
+            voltage_max["bus"] = voltage["bus"]
+            voltage_min["bus"] = voltage["bus"]
+
+            self._data = {
+                "temp": {"waist": temp["waist"], "arm_a": temp["arm_a"], "arm_b": temp["arm_b"],
+                         "leg_a": temp["leg_a"], "leg_b": temp["leg_b"],
+                         "max": temp_max, "min": temp_min},
+                "current": {**current, "max": current_max, "min": current_min},
+                "voltage": {**voltage, "max": voltage_max, "min": voltage_min},
+                "version": {
+                    "software": getattr(msg, "software_version", ""),
+                    "hardware": getattr(msg, "hardware_version", ""),
+                },
+                "battery": {
+                    "voltage": getattr(msg, "battery_voltage", 0),
+                    "current": getattr(msg, "battery_current", 0),
+                    "power": getattr(msg, "battery_power", 0),
+                },
+            }
+
+    def _publish_loop(self):
+        while self._running:
+            time.sleep(1.0)  # 1Hz
+            with self._lock:
+                if not self._data:
+                    continue
+                payload = json.loads(json.dumps(self._data))  # deep copy
+                payload["timestamp_ms"] = int(time.time() * 1000)
+                payload["control_level"] = "ANY"
+            msg = String()
+            msg.data = json.dumps(payload)
+            self._pub.publish(msg)
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "stop", "info"):
+            return {"state": "running" if self._running else "idle",
+                    "topic_out": [{"topic": self._topic, "format": "data/json"}]}
+        return {"state": "running"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RemoteStatePlugin (sensor) — 遥控器SBUS卡
+# ══════════════════════════════════════════════════════════════════════════════
+
+class RemoteStatePlugin:
+    """天轶2.0 Pro 遥控器SBUS事件与摇杆数据: 8按键+双摇杆四轴, 43.3Hz."""
+
+    # Key event constants
+    KEY_NONE = 0
+    KEY_A_UP = 1; KEY_A_DOWN = 2
+    KEY_B_UP = 3; KEY_B_DOWN = 4
+    KEY_C_UP = 5; KEY_C_DOWN = 6
+    KEY_D_UP = 7; KEY_D_DOWN = 8
+    KEY_E_UP = 9; KEY_E_MID = 10; KEY_E_DOWN = 11
+    KEY_F_UP = 12; KEY_F_MID = 13; KEY_F_DOWN = 14
+    KEY_G_LEFT = 15; KEY_G_MID = 16; KEY_G_RIGHT = 17
+    KEY_H_LEFT = 18; KEY_H_MID = 19; KEY_H_RIGHT = 20
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._topic = f"/{namespace}/state/remote"
+        self._running = False
+        self._data = {}
+        self._lock = threading.Lock()
+
+        self._sub_node = Node("tianyi2_remote_sub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._sub_node)
+
+        self._pub_node = Node("tianyi2_remote_pub", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._pub_node)
+        self._pub = self._pub_node.create_publisher(String, self._topic, _LOW_LAT_QOS)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "remote",
+            "type": "sensor",
+            "multiInstance": False,
+            "readOnly": True,
+            "description": "天轶2.0 Pro 遥控器SBUS事件与摇杆数据(8按键+双摇杆四轴,43.3Hz)。",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._topic, "format": "data/json"}],
+        }
+
+    def start(self):
+        self._running = True
+        try:
+            from bodyctrl_msgs.msg import SbusData
+            self._sub_node.create_subscription(
+                SbusData, "/sbus_data", self._on_sbus, _RELIABLE_QOS)
+            print("[RemoteStatePlugin] subscription created")
+        except ImportError as e:
+            print(f"[RemoteStatePlugin] WARNING: import failed ({e}), running in stub mode")
+
+        self._thread = threading.Thread(target=self._publish_loop, daemon=True)
+        self._thread.start()
+        print("[RemoteStatePlugin] publish started")
+
+    def stop(self):
+        self._running = False
+
+    def _on_sbus(self, msg):
+        with self._lock:
+            self._data = {
+                "key_event": {
+                    "new": msg.key_event_new,
+                    "old": msg.key_event_old,
+                },
+                "buttons": {
+                    "a": msg.button_a,
+                    "b": msg.button_b,
+                    "c": msg.button_c,
+                    "d": msg.button_d,
+                    "e": msg.button_e,
+                    "f": msg.button_f,
+                    "g": msg.button_g,
+                    "h": msg.button_h,
+                },
+                "sticks": {
+                    "x1": msg.x1,
+                    "y1": msg.y1,
+                    "x2": msg.x2,
+                    "y2": msg.y2,
+                },
+            }
+
+    def _publish_loop(self):
+        while self._running:
+            time.sleep(1.0 / 43.3)  # ~43.3Hz
+            with self._lock:
+                if not self._data:
+                    continue
+                payload = json.loads(json.dumps(self._data))  # deep copy
+                payload["timestamp_ms"] = int(time.time() * 1000)
+                payload["control_level"] = "ANY"
+            msg = String()
+            msg.data = json.dumps(payload)
+            self._pub.publish(msg)
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "stop", "info"):
+            return {"state": "running" if self._running else "idle",
+                    "topic_out": [{"topic": self._topic, "format": "data/json"}]}
+        return {"state": "running"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VoiceStatePlugin (sensor) — 语音交互状态卡
+# ══════════════════════════════════════════════════════════════════════════════
+
+class VoiceStatePlugin:
+    """语音交互状态 (lyre ASR + Play + Chat)
+
+    聚合 6 路 topic 的最新字段,10Hz 周期发布到 /{ns}/state/voice (domain 42):
+      /audio_asr/keyword   → AsrKeyword  (keyword, angle)
+      /audio_asr/iat       → AsrIat      (id, text)
+      /audio_asr/event     → AsrEvent   (event, arg1)
+      /audio_play/event    → PlayEvent   (sid, seq, event, message)
+      /audio_play/progress → PlayProgress (sid, seq, position, duration)
+      /audio_chat/enable   → Bool        (data)
+    事件驱动 topic 空闲时无数据,producer 在无任何数据时返回 None(不发布)。
+    """
+
+    HZ = 10.0
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._topic = f"/{namespace}/state/voice"
+        self._running = False
+        self._lock = threading.Lock()
+        self._latest = {
+            "keyword": None,    # AsrKeyword
+            "iat": None,        # AsrIat
+            "event": None,      # AsrEvent
+            "play_event": None,     # PlayEvent
+            "play_progress": None,  # PlayProgress
+            "chat_enable": None,    # Bool
+        }
+
+        self._sub_node = Node("tianyi2_voice_sub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._sub_node)
+
+        self._pub_node = Node("tianyi2_voice_pub", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._pub_node)
+        self._pub = self._pub_node.create_publisher(String, self._topic, _LOW_LAT_QOS)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "voice",
+            "type": "sensor",
+            "description": "天轶2.0 Pro 语音交互状态(lyre包),唤醒/识别/事件+播放事件/进度+对话开关。",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._topic, "format": "data/json"}],
+        }
+
+    def start(self):
+        self._running = True
+        try:
+            from lyre_msgs.msg import (
+                AsrKeyword, AsrIat, AsrEvent, PlayEvent, PlayProgress)
+            self._sub_node.create_subscription(
+                AsrKeyword, "/audio_asr/keyword", self._on_keyword, _RELIABLE_QOS)
+            self._sub_node.create_subscription(
+                AsrIat, "/audio_asr/iat", self._on_iat, _RELIABLE_QOS)
+            self._sub_node.create_subscription(
+                AsrEvent, "/audio_asr/event", self._on_asr_event, _RELIABLE_QOS)
+            self._sub_node.create_subscription(
+                PlayEvent, "/audio_play/event", self._on_play_event, _RELIABLE_QOS)
+            self._sub_node.create_subscription(
+                PlayProgress, "/audio_play/progress", self._on_play_progress, _RELIABLE_QOS)
+            self._sub_node.create_subscription(
+                Bool, "/audio_chat/enable", self._on_chat_enable, _RELIABLE_QOS)
+            print("[VoiceStatePlugin] subscriptions created (lyre_msgs)")
+        except ImportError as e:
+            print(f"[VoiceStatePlugin] WARNING: lyre_msgs import failed ({e}), voice card offline")
+
+        # 周期发布聚合 state
+        self._pub_thread = threading.Thread(target=self._publish_loop, daemon=True)
+        self._pub_thread.start()
+
+    def stop(self):
+        self._running = False
+
+    # ── topic 回调(只更新缓存,不直接发布) ──────────────────────────────
+    def _on_keyword(self, msg):
+        with self._lock:
+            self._latest["keyword"] = {
+                "keyword": str(getattr(msg, "keyword", "")),
+                "angle": float(getattr(msg, "angle", 0.0)),
+            }
+
+    def _on_iat(self, msg):
+        with self._lock:
+            self._latest["iat"] = {
+                "id": str(getattr(msg, "id", "")),
+                "text": str(getattr(msg, "text", "")),
+            }
+
+    def _on_asr_event(self, msg):
+        with self._lock:
+            self._latest["event"] = {
+                "event": int(getattr(msg, "event", 0)),
+                "arg1": int(getattr(msg, "arg1", 0)),
+            }
+
+    def _on_play_event(self, msg):
+        with self._lock:
+            self._latest["play_event"] = {
+                "sid": str(getattr(msg, "sid", "")),
+                "seq": int(getattr(msg, "seq", 0)),
+                "event": int(getattr(msg, "event", -1)),
+                "message": str(getattr(msg, "message", "")),
+            }
+
+    def _on_play_progress(self, msg):
+        with self._lock:
+            self._latest["play_progress"] = {
+                "sid": str(getattr(msg, "sid", "")),
+                "seq": int(getattr(msg, "seq", 0)),
+                "position": float(getattr(msg, "position", 0.0)),
+                "duration": float(getattr(msg, "duration", 0.0)),
+            }
+
+    def _on_chat_enable(self, msg):
+        with self._lock:
+            self._latest["chat_enable"] = {"enable": bool(getattr(msg, "data", False))}
+
+    # ── 10Hz 周期发布 ────────────────────────────────────────────────────
+    def _publish_loop(self):
+        while self._running:
+            time.sleep(1.0 / self.HZ)
+            with self._lock:
+                snapshot = {
+                    "keyword": self._latest["keyword"],
+                    "iat": self._latest["iat"],
+                    "event": self._latest["event"],
+                    "play_event": self._latest["play_event"],
+                    "play_progress": self._latest["play_progress"],
+                    "chat_enable": self._latest["chat_enable"],
+                }
+            # 全 None 时不发布(空闲态)
+            if not any(v is not None for v in snapshot.values()):
+                continue
+            payload = {
+                "asr": {
+                    "keyword": snapshot["keyword"]["keyword"] if snapshot["keyword"] else "",
+                    "angle": snapshot["keyword"]["angle"] if snapshot["keyword"] else 0,
+                    "iat_id": snapshot["iat"]["id"] if snapshot["iat"] else "",
+                    "iat_text": snapshot["iat"]["text"] if snapshot["iat"] else "",
+                    "event": snapshot["event"]["event"] if snapshot["event"] else -1,
+                    "event_arg1": snapshot["event"]["arg1"] if snapshot["event"] else 0,
+                },
+                "play": {
+                    "sid": (snapshot["play_event"] or {}).get("sid", "") or (snapshot["play_progress"] or {}).get("sid", ""),
+                    "seq": (snapshot["play_event"] or {}).get("seq", 0),
+                    "event": (snapshot["play_event"] or {}).get("event", -1),
+                    "message": (snapshot["play_event"] or {}).get("message", ""),
+                    "position": (snapshot["play_progress"] or {}).get("position", 0.0),
+                    "duration": (snapshot["play_progress"] or {}).get("duration", 0.0),
+                },
+                "chat_enable": (snapshot["chat_enable"] or {}).get("enable", False),
+                "timestamp_ms": int(time.time() * 1000),
+                "control_level": "ANY",
+            }
+            out = String()
+            out.data = json.dumps(payload, ensure_ascii=False)
+            self._pub.publish(out)
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "stop", "info"):
+            return {
+                "state": "running" if self._running else "idle",
+                "topic_out": [{"topic": self._topic, "format": "data/json"}],
+            }
+        return {"state": "running" if self._running else "idle"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1624,6 +2332,144 @@ class TtsPlugin:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# VoicePlayActuatorPlugin (actuator) — 卡名: voice_play
+# ══════════════════════════════════════════════════════════════════════════════
+
+class VoicePlayActuatorPlugin:
+    """音频播放控制 (lyre_msgs service) — 卡名: voice_play
+
+    Actions:
+      play_file  → /audio_play/play_file  (PlayFile)
+      play_url   → /audio_play/play_url   (PlayUrl)
+      play_text  → /audio_play/play_text  (PlayText)
+      stop       → /audio_play/stop       (PlayStop)
+      pause      → /audio_play/pause      (PlayPause)
+      resume     → /audio_play/resume     (PlayResume)
+    """
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._srv_node = Node("tianyi2_voice_play", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._srv_node)
+        self._clients = {}
+        self._types = {}
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "voice_play",
+            "type": "actuator",
+            "description": "天轶2.0 Pro 音频播放控制(本地文件/URL/TTS/停止/暂停/恢复),HIGHLEVEL,lyre_msgs service。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["play_file", "play_url", "play_text", "stop", "pause", "resume"],
+                        "description": "控制模式",
+                    },
+                    "path": {"type": "string", "description": "本地音频文件绝对路径(play_file)"},
+                    "url":  {"type": "string", "description": "远程音频文件URL(play_url)"},
+                    "text": {"type": "string", "description": "TTS文本(play_text)"},
+                    "sid":  {"type": "string", "description": "流标识符(可选,唯一标识音频流)"},
+                    "force": {"type": "boolean", "description": "强制播放(停止当前任务立即播放,可选)"},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "play_file": {"params": ["path", "sid", "force"], "description": "播放本地音频文件"},
+                    "play_url":  {"params": ["url", "sid", "force"],  "description": "播放远程URL音频"},
+                    "play_text": {"params": ["text", "sid", "force"], "description": "TTS合成并播放文本"},
+                    "stop":      {"params": [],                       "description": "停止播放(不可恢复)"},
+                    "pause":     {"params": [],                       "description": "暂停播放(可恢复)"},
+                    "resume":    {"params": [],                       "description": "恢复暂停的播放"},
+                },
+            },
+        }
+
+    def start(self):
+        try:
+            from lyre_msgs.srv import PlayFile, PlayUrl, PlayText, PlayStop, PlayPause, PlayResume
+            self._types = {
+                "play_file": ("/audio_play/play_file", PlayFile),
+                "play_url":  ("/audio_play/play_url",  PlayUrl),
+                "play_text": ("/audio_play/play_text", PlayText),
+                "stop":      ("/audio_play/stop",      PlayStop),
+                "pause":     ("/audio_play/pause",     PlayPause),
+                "resume":    ("/audio_play/resume",   PlayResume),
+            }
+            for key, (svc_name, _svc_type) in self._types.items():
+                self._clients[key] = self._srv_node.create_client(self._types[key][1], svc_name)
+            print(f"[VoicePlayActuatorPlugin] {len(self._clients)} service clients created")
+        except ImportError as e:
+            print(f"[VoicePlayActuatorPlugin] WARNING: lyre_msgs.srv import failed ({e})")
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "info"):
+            return {"state": "ready", "control_level": "HIGHLEVEL"}
+        if action not in self._types:
+            return {"ok": False, "code": "INVALID_ARGUMENT",
+                    "message": f"unknown action: {action}"}
+        client = self._clients.get(action)
+        if client is None:
+            return {"ok": False, "code": "PRECONDITION_FAILED",
+                    "message": f"{action} service client not initialized"}
+
+        _, svc_type = self._types[action]
+        req = svc_type.Request()
+        sid = str(args.get("sid", ""))
+        force = bool(args.get("force", False))
+        if hasattr(req, "sid"):
+            req.sid = sid
+        if hasattr(req, "seq"):
+            req.seq = 0
+        if hasattr(req, "last"):
+            req.last = True
+        if hasattr(req, "force"):
+            req.force = force
+        if action == "play_file":
+            path = str(args.get("path", ""))
+            if not path:
+                return {"ok": False, "code": "INVALID_ARGUMENT", "message": "path is required"}
+            req.path = path
+        elif action == "play_url":
+            url = str(args.get("url", ""))
+            if not url:
+                return {"ok": False, "code": "INVALID_ARGUMENT", "message": "url is required"}
+            req.url = url
+        elif action == "play_text":
+            text = str(args.get("text", ""))
+            if not text:
+                return {"ok": False, "code": "INVALID_ARGUMENT", "message": "text is required"}
+            req.text = text
+        # stop/pause/resume 无额外字段
+
+        try:
+            future = client.call_async(req)
+            # 等待 service 完成(5s 超时)
+            rclpy.spin_until_future_complete(self._srv_node, future, timeout_sec=5.0)
+            result = future.result()
+            if result is None:
+                return {"ok": False, "code": "CALL_TIMEOUT",
+                        "message": f"{action} service call timeout"}
+            code = int(getattr(result, "code", 0))
+            return {
+                "ok": code == 0,
+                "code": code,
+                "message": str(getattr(result, "message", "")),
+                "sid": str(getattr(result, "sid", "")) or sid,
+                "action": action,
+                "control_level": "HIGHLEVEL",
+                "timestamp_ms": int(time.time() * 1000),
+            }
+        except Exception as e:
+            return {"ok": False, "code": "COMMUNICATION_ERROR",
+                    "message": str(e), "action": action}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # NavPlugin (actuator)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1797,3 +2643,68 @@ class ChatPlugin:
         elif action == "stop":
             return {"state": "idle"}
         return {"error": f"unknown action: {action}"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VoiceChatActuatorPlugin (actuator) — 卡名: voice_chat
+# ══════════════════════════════════════════════════════════════════════════════
+
+class VoiceChatActuatorPlugin:
+    """语音对话开关 (/audio_chat/enable std_msgs/Bool)"""
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._pub_node = Node("tianyi2_voice_chat_pub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._pub_node)
+        self._publisher = None
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "voice_chat",
+            "type": "actuator",
+            "description": "天轶2.0 Pro 语音对话开关(enable/disable),HIGHLEVEL,topic /audio_chat/enable std_msgs/Bool。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["enable", "disable"],
+                               "description": "开启/关闭语音对话"},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "enable":  {"params": [], "description": "开启语音对话"},
+                    "disable": {"params": [], "description": "关闭语音对话"},
+                },
+            },
+        }
+
+    def start(self):
+        self._publisher = self._pub_node.create_publisher(Bool, "/audio_chat/enable", _RELIABLE_QOS)
+        print("[VoiceChatActuatorPlugin] publisher created")
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "info"):
+            return {"state": "ready", "control_level": "HIGHLEVEL"}
+        if action in ("enable", "disable"):
+            if not self._publisher:
+                return {"ok": False, "code": "PRECONDITION_FAILED",
+                        "message": "publisher not initialized"}
+            msg = Bool()
+            msg.data = (action == "enable")
+            self._publisher.publish(msg)
+            return {
+                "ok": True,
+                "code": 0,
+                "message": "",
+                "action": action,
+                "value": msg.data,
+                "control_level": "HIGHLEVEL",
+                "timestamp_ms": int(time.time() * 1000),
+            }
+        if action == "stop":
+            return {"state": "idle"}
+        return {"ok": False, "code": "INVALID_ARGUMENT",
+                "message": f"unknown action: {action}"}
