@@ -958,7 +958,9 @@ class WaypointPlugin:
         lat = pos.get("latitude")
         lon = pos.get("longitude")
         alt = pos.get("altitude")
-        if lat is None or lon is None or not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        if (lat is None or lon is None or
+                not (-90 <= lat <= 90 and -180 <= lon <= 180) or
+                (abs(lat) < 1e-7 and abs(lon) < 1e-7)):
             return None
         # Compute horizontal speed
         import math
