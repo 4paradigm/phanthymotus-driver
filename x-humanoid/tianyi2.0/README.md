@@ -87,8 +87,10 @@ elbow visibly flexes and raises the forearm. `wave` keeps the elbow flexed and
 combines a small shoulder-yaw sweep with wrist roll; wrist yaw remains neutral
 because it primarily twists the forearm around its own axis. `salute` uses
 three blended stages: shoulder lift until the upper arm is nearly horizontal,
-elbow flexion until the forearm is nearly vertical, then wrist pitch/roll
-alignment into the final salute. Intermediate stages have no dwell and hand
+elbow flexion to approximately 90 degrees so the forearm is nearly vertical,
+then wrist yaw/pitch/roll alignment into the final salute. Wrist yaw orients
+the palm around the forearm axis; it does not determine whether the forearm
+itself is vertical. Intermediate stages have no dwell and hand
 off at 90% of their calculated transition time to avoid stop-start motion.
 The action is intentionally limited to one arm at a time to avoid interference
 near the head. `welcome` fixes wrist roll at a

@@ -1566,7 +1566,7 @@ class ArmGesturePlugin:
     # 沿前臂轴线的旋转。右臂由 _publish_pose 按横向关节自动镜像。
     _GESTURES = {
         "wave": [-10, 60, -10, -100, 0, 10, 0],
-        "salute": [-10, 82, 0, -100, 0, 25, 12],
+        "salute": [-10, 82, 0, -90, -25, 25, 12],
         "welcome": [-15, 40, -5, -75, 0, 35, 55],
         "raise": [-10, 110, -5, -35, 0, 10, 0],
     }
@@ -1579,8 +1579,8 @@ class ArmGesturePlugin:
     }
     # Salute stage 2: keep the shoulder stable and flex only the elbow so the
     # forearm becomes nearly vertical. Stage 3 (_GESTURES["salute"]) then
-    # adjusts only wrist pitch/roll into the final salute orientation.
-    _SALUTE_ELBOW = [-10, 82, 0, -100, 0, 0, 0]
+    # adjusts wrist yaw/pitch/roll into the final salute orientation.
+    _SALUTE_ELBOW = [-10, 82, 0, -90, 0, 0, 0]
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._pub_node = Node("tianyi2_arm_gesture_pub", context=ros2.ctx_tianyi)
