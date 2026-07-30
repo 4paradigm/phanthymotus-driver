@@ -1357,30 +1357,31 @@ class ArmGesturePlugin:
     # 角度顺序：肩 pitch、肩 roll、肩 yaw、肘 pitch、腕 yaw、腕 pitch、腕 roll。
     # 肘 pitch 使用负角度屈肘；右臂由 _publish_pose 按横向关节自动镜像。
     _GESTURES = {
-        # Shoulder roll/yaw place the elbow to the side and turn the flexion
-        # plane upward; elbow pitch then raises the forearm instead of merely
-        # rolling it in front of the torso.
-        "salute": [-5, 75, -75, -105, -20, 20, 8],
-        "welcome": [-10, 65, 75, -100, 0, 35, -35],
-        "raise": [0, 130, 0, -15, 0, 5, 0],
-        "shake_hands": [-55, 15, 5, -35, 0, 5, 0],
-        "present": [-45, 40, 55, -75, 0, 35, 0],
-        "high_five": [-25, 65, 75, -85, 0, 25, -30],
+        # In the URDF chain shoulder yaw rotates the elbow-pitch plane. Positive
+        # left-arm yaw makes negative elbow pitch lift the forearm; negative yaw
+        # sends it downward. Wrist pitch stays neutral in every preset because
+        # it bends the hand without helping place the elbow or wrist.
+        "salute": [-10, 70, 70, -100, 0, 0, -20],
+        "welcome": [-10, 65, 75, -100, 0, 0, -30],
+        "raise": [0, 130, 0, -15, 0, 0, 0],
+        "shake_hands": [-55, 15, 5, -35, 0, 0, 0],
+        "present": [-45, 40, 55, -75, 0, 0, 0],
+        "high_five": [-40, 55, 35, -80, 0, 0, -20],
     }
     _PREPARE_POSES = {
-        # Salute remains outside the head envelope: less shoulder roll and
-        # elbow flexion than the previous pose, with reversed shoulder yaw.
-        "salute": [-5, 75, -75, 0, 0, 0, 0],
-        "welcome": [-10, 45, 45, -60, 0, 20, -20],
-        "raise": [0, 75, 0, -30, 0, 5, 0],
+        # Flex the elbow while establishing the lifting plane instead of first
+        # rotating a fully extended arm near the head.
+        "salute": [-10, 40, 35, -45, 0, 0, 0],
+        "welcome": [-10, 45, 45, -60, 0, 0, -15],
+        "raise": [0, 75, 0, -30, 0, 0, 0],
         "shake_hands": [-30, 10, 0, -20, 0, 0, 0],
-        "present": [-25, 25, 30, -45, 0, 20, 0],
-        "high_five": [-15, 40, 40, -50, 0, 15, -15],
+        "present": [-25, 25, 30, -45, 0, 0, 0],
+        "high_five": [-25, 35, 20, -45, 0, 0, -10],
     }
-    # Salute stage 2: keep the shoulder stable and flex only the elbow so the
-    # forearm becomes nearly vertical. Stage 3 (_GESTURES["salute"]) then
-    # adjusts wrist yaw/pitch/roll into the final salute orientation.
-    _SALUTE_ELBOW = [-5, 75, -75, -105, 0, 0, 0]
+    # Salute stage 2: complete the shoulder plane and elbow flexion so the
+    # forearm becomes nearly vertical. Stage 3 (_GESTURES["salute"]) adjusts
+    # only wrist roll into the final salute orientation.
+    _SALUTE_ELBOW = [-10, 70, 70, -100, 0, 0, 0]
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._pub_node = Node("tianyi2_arm_gesture_pub", context=ros2.ctx_tianyi)
@@ -1531,14 +1532,15 @@ class ArmGesturePlugin:
                     handshake_pose[3] = -42
                 frames.append((handshake_pose, 0.30, 0.85))
         elif action == "welcome":
-            # Keep wrist roll fixed so the palm stays upright and faces
-            # forward, then use wrist pitch alone for a gentle welcoming wave.
+            # Keep the wrist fixed and sweep shoulder yaw around the final pose.
+            # This moves the whole raised hand laterally without bending it
+            # backward at the wrist.
             for i in range(cycles * 2):
                 welcome_pose = list(pose)
                 if i % 2 == 0:
-                    welcome_pose[5] = 20
+                    welcome_pose[2] = 65
                 else:
-                    welcome_pose[5] = 50
+                    welcome_pose[2] = 85
                 frames.append((welcome_pose, 0.35, 0.85))
         frames.append((self._NEUTRAL, 1.0, 1.0))
         for frame, _, _ in frames:

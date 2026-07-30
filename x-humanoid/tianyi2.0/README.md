@@ -63,24 +63,31 @@ The semantic poses use a preparation frame before the final gesture. For
 establish the elbow-flexion plane; elbow pitch can then raise the forearm
 instead of leaving it horizontal in front of the torso. `salute` uses three
 blended stages: shoulder lift until the upper arm is nearly horizontal,
-elbow flexion to approximately 105 degrees so the forearm is nearly vertical,
-then wrist yaw/pitch/roll alignment into the final salute. Wrist yaw orients
-the palm around the forearm axis; it does not determine whether the forearm
-itself is vertical. Intermediate stages have no dwell and hand
+elbow flexion to approximately 100 degrees so the forearm is nearly vertical,
+then wrist-roll alignment into the final salute. In this URDF chain, shoulder
+yaw rotates the downstream elbow-pitch axis: positive left-arm yaw (mirrored
+negative on the right) makes negative elbow pitch lift the forearm, while the
+opposite yaw direction drives the forearm downward. Intermediate stages
+have no dwell and hand
 off at 90% of their calculated transition time to avoid stop-start motion.
 The action is intentionally limited to one arm at a time to avoid interference
-near the head. Its shoulder yaw direction is reversed and its shoulder
-roll/elbow flexion reduced from the earlier pose to move the hand away from the
-head and turn the palm closer to downward. `welcome` reverses wrist roll to
-correct the observed backward wrist orientation, then moves wrist pitch
-through a bounded range for the welcoming motion.
+near the head. The preparation frame bends the elbow before completing the
+shoulder rotation, avoiding a fully extended sweep near the head. `welcome`
+keeps all wrist axes fixed and performs its visible sweep with a bounded
+shoulder-yaw motion.
 `raise` lifts the upper arm close to overhead while keeping only a moderate
 elbow bend, making its silhouette distinct from `welcome`.
 `shake_hands` extends one arm with a smaller shoulder-pitch angle than the old
 forward-reach pose and uses a small elbow sweep for the handshake.
 `present` uses a bent-elbow display pose with neutral wrist roll and means
-"please look left/right/both" according to `side`. `high_five` extends farther
-forward and uses a reversed, smaller wrist-roll angle.
+"please look left/right/both" according to `side`. `high_five` uses additional
+shoulder pitch and less elbow flexion to place the hand farther forward.
+
+All semantic presets and preparation frames keep wrist pitch at zero. In the
+URDF it is a local Y-axis joint near the end of the chain: changing it has
+almost no effect on elbow/wrist placement and mainly leaves the hand visibly
+bent relative to the forearm. Wrist roll is retained only where palm-facing
+calibration is required (`salute`, `welcome`, and `high_five`).
 
 The URDF defines joint axes and limits but contains no hand palm frame and no
 arm visual/collision geometry. Palm-facing wrist values are therefore
