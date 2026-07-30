@@ -50,7 +50,7 @@ result, and protocol-level `isError: true`.
 | Tool type | `actuator` |
 | Robot-side output | `/arm/cmd_pos` |
 | Message type | `bodyctrl_msgs/msg/CmdSetMotorPosition` |
-| Actions | `salute`, `welcome`, `raise`, `shake_hands`, `present`, `high_five`, `reset`, `stop` |
+| Actions | `salute`, `welcome`, `raise`, `shake_hands`, `high_five`, `reset`, `stop` |
 
 The right-arm poses are mirrored from the left-arm definitions and remain
 inside the checked-in URDF limits. The preset poses still require low-speed,
@@ -64,8 +64,8 @@ establish the elbow-flexion plane; elbow pitch can then raise the forearm
 instead of leaving it horizontal in front of the torso. `salute` uses three
 blended stages: the preparation frame bends the elbow, the second frame raises
 the upper arm laterally and flexes the elbow to approximately 130 degrees to
-draw the wrist inward beside the head, then wrist-roll alignment completes the
-final salute. In this URDF chain, shoulder yaw rotates the downstream
+draw the wrist inward beside the head, then 50 degrees of wrist pitch completes
+the final salute. In this URDF chain, shoulder yaw rotates the downstream
 elbow-pitch axis: positive left-arm yaw (mirrored negative on the right) makes
 negative elbow pitch lift and fold the forearm inward, while the opposite yaw
 direction drives the forearm downward. Intermediate stages have no dwell and
@@ -74,28 +74,27 @@ The action is intentionally limited to one arm at a time to avoid interference
 near the head. The preparation frame bends the elbow before completing the
 shoulder rotation, avoiding a fully extended sweep near the head. `welcome`
 raises the hand beside and above the torso rather than in front of the chest.
-It keeps shoulder yaw and all wrist axes fixed and sweeps elbow pitch between
--110 and -90 degrees, which the checked-in URDF places mainly along the
+It keeps shoulder yaw and all wrist axes fixed at their selected values, with
+all three wrist angles remaining neutral throughout. It sweeps elbow pitch
+between -110 and -90 degrees, which the checked-in URDF places mainly along the
 lateral axis; changing shoulder yaw here would instead move the hand mainly
 forward and backward.
 `raise` lifts the upper arm close to overhead while keeping only a moderate
 elbow bend, making its silhouette distinct from `welcome`.
 `shake_hands` extends one arm with a smaller shoulder-pitch angle than the old
 forward-reach pose and uses a small elbow sweep for the handshake.
-`present` uses a bent-elbow display pose with neutral wrist roll and means
-"please look left/right/both" according to `side`. `high_five` uses additional
-shoulder pitch and less elbow flexion to place the hand farther forward.
+`high_five` places the wrist approximately 0.37 m in front of the torso plane
+and at approximately the shoulder-joint height in the checked-in URDF.
 
-All semantic presets and preparation frames keep wrist pitch at zero. In the
-URDF it is a local Y-axis joint near the end of the chain: changing it has
-almost no effect on elbow/wrist placement and mainly leaves the hand visibly
-bent relative to the forearm. Wrist roll is retained only where palm-facing
-calibration is required (`salute`, `welcome`, and `high_five`).
+Wrist pitch stays neutral except for the final `salute` frame, where it moves
+to 50 degrees to orient the hand. `welcome` keeps all wrist joints at zero for
+the entire sequence. Wrist roll is retained only for `high_five` palm-facing
+calibration.
 
 The URDF defines joint axes and limits but contains no hand palm frame and no
 arm visual/collision geometry. Palm-facing wrist values are therefore
 conservative starting points, not geometrically proven orientations. Calibrate
-`welcome`, `salute`, `present`, and `high_five` one arm at a time at low speed
+`welcome`, `salute`, and `high_five` one arm at a time at low speed
 with a clear workspace. Bilateral `salute` and `high_five` are blocked; actions
 such as clapping, hugging, and crossing arms are intentionally not provided
 until collision geometry or a separate collision checker is available.
@@ -124,7 +123,6 @@ light indicates Ready before running arm actions.
 | `welcome` | right arm, cycles 2, speed 0.5rad/s | side left/right/both, cycles 1–5, speed 0.2–1.5rad/s |
 | `raise` | right arm, speed 0.5rad/s | side left/right/both, speed 0.2–1.5rad/s |
 | `shake_hands` | right arm, cycles 2, speed 0.5rad/s | side left/right/both, cycles 1–5, speed 0.2–1.5rad/s |
-| `present` | right arm, speed 0.5rad/s | side left/right/both, speed 0.2–1.5rad/s |
 | `high_five` | right arm, speed 0.5rad/s | side left/right, speed 0.2–1.5rad/s |
 | `reset` | right arm, speed 0.5rad/s | side left/right/both, speed 0.2–1.5rad/s |
 | `stop` | no parameters | no parameters |

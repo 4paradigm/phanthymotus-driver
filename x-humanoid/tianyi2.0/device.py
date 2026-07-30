@@ -1357,30 +1357,27 @@ class ArmGesturePlugin:
     # 角度顺序：肩 pitch、肩 roll、肩 yaw、肘 pitch、腕 yaw、腕 pitch、腕 roll。
     # 肘 pitch 使用负角度屈肘；右臂由 _publish_pose 按横向关节自动镜像。
     _GESTURES = {
-        # In the URDF chain shoulder yaw rotates the elbow-pitch plane. Positive
-        # left-arm yaw makes negative elbow pitch lift the forearm; negative yaw
-        # sends it downward. Wrist pitch stays neutral in every preset because
-        # it bends the hand without helping place the elbow or wrist.
-        "salute": [-10, 90, 60, -130, 0, 0, -20],
-        "welcome": [-10, 65, 75, -100, 0, 0, -30],
+        # In the URDF chain shoulder yaw rotates the elbow-pitch plane. The
+        # shoulder and elbow angles place the wrist; wrist pitch/roll are used
+        # only where the final palm orientation needs calibration.
+        "salute": [-10, 90, 60, -130, 0, 50, 0],
+        "welcome": [-10, 65, 75, -100, 0, 0, 0],
         "raise": [0, 130, 0, -15, 0, 0, 0],
         "shake_hands": [-55, 15, 5, -35, 0, 0, 0],
-        "present": [-45, 40, 55, -75, 0, 0, 0],
-        "high_five": [-40, 55, 35, -80, 0, 0, -20],
+        "high_five": [-40, 40, -20, -80, 0, 0, -20],
     }
     _PREPARE_POSES = {
         # Flex the elbow while establishing the lifting plane instead of first
         # rotating a fully extended arm near the head.
         "salute": [-10, 40, 35, -45, 0, 0, 0],
-        "welcome": [-10, 45, 45, -60, 0, 0, -15],
+        "welcome": [-10, 45, 45, -60, 0, 0, 0],
         "raise": [0, 75, 0, -30, 0, 0, 0],
         "shake_hands": [-30, 10, 0, -20, 0, 0, 0],
-        "present": [-25, 25, 30, -45, 0, 0, 0],
-        "high_five": [-25, 35, 20, -45, 0, 0, -10],
+        "high_five": [-25, 25, -10, -45, 0, 0, -10],
     }
     # Salute stage 2: raise the upper arm laterally and fold the forearm inward,
     # placing the wrist near the side of the head. Stage 3
-    # (_GESTURES["salute"]) adjusts only wrist roll into the final orientation.
+    # (_GESTURES["salute"]) adjusts only wrist pitch into the final orientation.
     _SALUTE_ELBOW = [-10, 90, 60, -130, 0, 0, 0]
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
@@ -1399,7 +1396,7 @@ class ArmGesturePlugin:
         return {
             "name": "arm_gesture",
             "type": "actuator",
-            "description": "天轶2.0 手臂语义动作 — 敬礼、欢迎、举手、握手、展示、击掌和回正",
+            "description": "天轶2.0 手臂语义动作 — 敬礼、欢迎、举手、握手、击掌和回正",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1407,10 +1404,10 @@ class ArmGesturePlugin:
                         "type": "string",
                         "enum": [
                             "salute", "welcome", "raise", "shake_hands",
-                            "present", "high_five", "reset", "stop",
+                            "high_five", "reset", "stop",
                         ],
                         "default": "welcome",
-                        "description": "手臂动作，可选[salute, welcome, raise, shake_hands, present, high_five, reset, stop]",
+                        "description": "手臂动作，可选[salute, welcome, raise, shake_hands, high_five, reset, stop]",
                     },
                     "side": {
                         "type": "string", "enum": ["left", "right", "both"],
@@ -1434,8 +1431,7 @@ class ArmGesturePlugin:
                     "welcome": {"params": ["side", "cycles", "speed"], "description": "在身体侧上方抬起手掌并左右摆动后回正"},
                     "raise": {"params": ["side", "speed"], "description": "将手臂高举到头部上方后回正"},
                     "shake_hands": {"params": ["side", "cycles", "speed"], "description": "向前伸手并轻柔上下摆动，做出握手动作"},
-                    "present": {"params": ["side", "speed"], "description": "展示 - 请看左方/右方/两边"},
-                    "high_five": {"params": ["side", "speed"], "description": "抬起前臂并立掌，做出击掌等待姿势"},
+                    "high_five": {"params": ["side", "speed"], "description": "将手掌伸到身体前方并保持在肩部附近，做出击掌等待姿势"},
                     "reset": {"params": ["side", "speed"], "description": "取消序列并回到中性姿态"},
                     "stop": {"params": [], "description": "取消尚未发送的后续动作帧"},
                 },
