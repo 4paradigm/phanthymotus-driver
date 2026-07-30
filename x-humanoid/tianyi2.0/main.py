@@ -227,7 +227,6 @@ class TianyiDeviceBundle:
 # ── MCP HTTP server ───────────────────────────────────────────────────────────
 
 _bundle: TianyiDeviceBundle | None = None
-_server_name = "tianyi2-device-bundle"
 
 
 def make_handler():
@@ -291,7 +290,7 @@ def make_handler():
                     ok({
                         "protocolVersion": "2024-11-05",
                         "capabilities": {"tools": {}},
-                        "serverInfo": {"name": _server_name, "version": "1.0.0"},
+                        "serverInfo": {"name": “tianyi2-driver-bundle”, "version": "1.0.0"},
                     })
                 elif method == "tools/list":
                     ok({"tools": _bundle.get_all_tools()})
@@ -358,12 +357,11 @@ def _start_registration(mcp_port: int, name: str, category: str):
 
 
 def main():
-    global _bundle, _server_name
+    global _bundle
 
     cfg       = _load_config()
     namespace = _resolve_namespace(cfg)
-    mcp_port  = int(cfg.get("mcp_port", 15708))
-    _server_name = cfg.get("mcp_server_name", "tianyi2-device-bundle")
+    mcp_port  = int(cfg.get("mcp_port", 15707))
 
     print(f"[bundle] namespace={namespace} mcp_port={mcp_port}")
 
