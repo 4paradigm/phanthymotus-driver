@@ -1355,36 +1355,32 @@ class ArmGesturePlugin:
         (-170, 170), (-45, 60), (-75, 95),
     ]
     # 角度顺序：肩 pitch、肩 roll、肩 yaw、肘 pitch、腕 yaw、腕 pitch、腕 roll。
-    # 肘 pitch 使用负角度屈肘；腕 yaw 不再用于挥手往复，因为它主要产生
-    # 沿前臂轴线的旋转。右臂由 _publish_pose 按横向关节自动镜像。
+    # 肘 pitch 使用负角度屈肘；右臂由 _publish_pose 按横向关节自动镜像。
     _GESTURES = {
         # Shoulder roll/yaw place the elbow to the side and turn the flexion
         # plane upward; elbow pitch then raises the forearm instead of merely
         # rolling it in front of the torso.
-        "wave": [0, 75, 90, -110, 0, 10, 0],
-        "salute": [0, 90, 90, -120, -25, 25, 12],
-        "welcome": [-10, 65, 75, -100, 0, 35, 45],
+        "salute": [-5, 75, -75, -105, -20, 20, 8],
+        "welcome": [-10, 65, 75, -100, 0, 35, -35],
         "raise": [0, 130, 0, -15, 0, 5, 0],
-        "reach_forward": [-80, 10, 0, -10, 0, 0, 0],
-        "present": [-45, 40, 55, -75, 0, 35, 35],
-        "high_five": [0, 75, 90, -105, 0, 30, 55],
-        "cheer": [0, 125, 0, -25, 0, 5, 0],
+        "shake_hands": [-55, 15, 5, -35, 0, 5, 0],
+        "present": [-45, 40, 55, -75, 0, 35, 0],
+        "high_five": [-25, 65, 75, -85, 0, 25, -30],
     }
     _PREPARE_POSES = {
-        "wave": [0, 45, 45, -60, 0, 5, 0],
-        # Salute stage 1: shoulder lifts the upper arm close to horizontal.
-        "salute": [0, 90, 90, 0, 0, 0, 0],
-        "welcome": [-10, 45, 45, -60, 0, 20, 25],
+        # Salute remains outside the head envelope: less shoulder roll and
+        # elbow flexion than the previous pose, with reversed shoulder yaw.
+        "salute": [-5, 75, -75, 0, 0, 0, 0],
+        "welcome": [-10, 45, 45, -60, 0, 20, -20],
         "raise": [0, 75, 0, -30, 0, 5, 0],
-        "reach_forward": [-45, 10, 0, -20, 0, 0, 0],
-        "present": [-25, 25, 30, -45, 0, 20, 20],
-        "high_five": [0, 45, 45, -60, 0, 15, 25],
-        "cheer": [0, 75, 0, -35, 0, 5, 0],
+        "shake_hands": [-30, 10, 0, -20, 0, 0, 0],
+        "present": [-25, 25, 30, -45, 0, 20, 0],
+        "high_five": [-15, 40, 40, -50, 0, 15, -15],
     }
     # Salute stage 2: keep the shoulder stable and flex only the elbow so the
     # forearm becomes nearly vertical. Stage 3 (_GESTURES["salute"]) then
     # adjusts wrist yaw/pitch/roll into the final salute orientation.
-    _SALUTE_ELBOW = [0, 90, 90, -120, 0, 0, 0]
+    _SALUTE_ELBOW = [-5, 75, -75, -105, 0, 0, 0]
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._pub_node = Node("tianyi2_arm_gesture_pub", context=ros2.ctx_tianyi)
@@ -1402,19 +1398,18 @@ class ArmGesturePlugin:
         return {
             "name": "arm_gesture",
             "type": "actuator",
-            "description": "天轶2.0 手臂语义动作 — 挥手、敬礼、欢迎、举手、前伸、展示、击掌、欢呼和回正",
+            "description": "天轶2.0 手臂语义动作 — 敬礼、欢迎、举手、握手、展示、击掌和回正",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
                         "enum": [
-                            "wave", "salute", "welcome", "raise",
-                            "reach_forward", "present", "high_five", "cheer",
-                            "reset", "stop",
+                            "salute", "welcome", "raise", "shake_hands",
+                            "present", "high_five", "reset", "stop",
                         ],
-                        "default": "wave",
-                        "description": "手臂动作，可选[wave, salute, welcome, raise, reach_forward, present, high_five, cheer, reset, stop]",
+                        "default": "welcome",
+                        "description": "手臂动作，可选[salute, welcome, raise, shake_hands, present, high_five, reset, stop]",
                     },
                     "side": {
                         "type": "string", "enum": ["left", "right", "both"],
@@ -1424,7 +1419,7 @@ class ArmGesturePlugin:
                     "cycles": {
                         "type": "integer", "minimum": 1, "maximum": 5,
                         "default": 2,
-                        "description": "挥手/欢迎摆动循环次数，范围[1, 5]，默认2",
+                        "description": "欢迎/握手摆动循环次数，范围[1, 5]，默认2",
                     },
                     "speed": {
                         "type": "number", "minimum": 0.2, "maximum": 1.5,
@@ -1434,14 +1429,12 @@ class ArmGesturePlugin:
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "wave": {"params": ["side", "cycles", "speed"], "description": "举手后挥手并回到中性姿态"},
                     "salute": {"params": ["side", "speed"], "description": "抬起小臂、将手靠近额侧、停留后回正"},
                     "welcome": {"params": ["side", "cycles", "speed"], "description": "胸前抬起手掌并左右摆动后回正"},
                     "raise": {"params": ["side", "speed"], "description": "将手臂高举到头部上方后回正"},
-                    "reach_forward": {"params": ["side", "speed"], "description": "向前伸臂，适合指引或递接物品前的准备动作"},
-                    "present": {"params": ["side", "speed"], "description": "屈肘托手，展示身体侧前方的目标"},
+                    "shake_hands": {"params": ["side", "cycles", "speed"], "description": "向前伸手并轻柔上下摆动，做出握手动作"},
+                    "present": {"params": ["side", "speed"], "description": "展示 - 请看左方/右方/两边"},
                     "high_five": {"params": ["side", "speed"], "description": "抬起前臂并立掌，做出击掌等待姿势"},
-                    "cheer": {"params": ["side", "speed"], "description": "将手臂高举并轻微屈肘，做出欢呼姿势"},
                     "reset": {"params": ["side", "speed"], "description": "取消序列并回到中性姿态"},
                     "stop": {"params": [], "description": "取消尚未发送的后续动作帧"},
                 },
@@ -1527,19 +1520,16 @@ class ArmGesturePlugin:
                 (self._PREPARE_POSES[action], 0.25, 0.90),
                 (pose, 0.8, 0.90),
             ]
-        if action == "wave":
+        if action == "shake_hands":
             for i in range(cycles * 2):
-                wave_pose = list(pose)
-                # Wave with shoulder yaw + wrist roll while keeping the elbow
-                # flexed. Wrist yaw (index 4) stays neutral because changing it
-                # only twists the forearm around its own axis.
+                handshake_pose = list(pose)
+                # A small elbow sweep produces the handshake motion while the
+                # wrist stays neutral and the arm remains extended forward.
                 if i % 2 == 0:
-                    wave_pose[2] = 80
-                    wave_pose[6] = -18
+                    handshake_pose[3] = -28
                 else:
-                    wave_pose[2] = 100
-                    wave_pose[6] = 18
-                frames.append((wave_pose, 0.35, 0.85))
+                    handshake_pose[3] = -42
+                frames.append((handshake_pose, 0.30, 0.85))
         elif action == "welcome":
             # Keep wrist roll fixed so the palm stays upright and faces
             # forward, then use wrist pitch alone for a gentle welcoming wave.

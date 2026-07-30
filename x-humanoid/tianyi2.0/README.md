@@ -50,7 +50,7 @@ result, and protocol-level `isError: true`.
 | Tool type | `actuator` |
 | Robot-side output | `/arm/cmd_pos` |
 | Message type | `bodyctrl_msgs/msg/CmdSetMotorPosition` |
-| Actions | `wave`, `salute`, `welcome`, `raise`, `reach_forward`, `present`, `high_five`, `cheer`, `reset`, `stop` |
+| Actions | `salute`, `welcome`, `raise`, `shake_hands`, `present`, `high_five`, `reset`, `stop` |
 
 The right-arm poses are mirrored from the left-arm definitions and remain
 inside the checked-in URDF limits. The preset poses still require low-speed,
@@ -59,27 +59,28 @@ the raw `arm` card and `arm_gesture` concurrently because both publish to the
 same controller topic.
 
 The semantic poses use a preparation frame before the final gesture. For
-`wave`, `welcome`, `salute`, and `high_five`, shoulder roll and shoulder yaw
-first establish an upward elbow-flexion plane; elbow pitch can then raise the
-forearm instead of leaving it horizontal in front of the torso. `wave` keeps
-the elbow flexed and combines a small shoulder-yaw sweep with wrist roll; wrist
-yaw remains neutral because it primarily twists the forearm around its own
-axis. `salute` uses
-three blended stages: shoulder lift until the upper arm is nearly horizontal,
-elbow flexion to approximately 120 degrees so the forearm is nearly vertical,
+`welcome`, `salute`, and `high_five`, shoulder roll and shoulder yaw first
+establish the elbow-flexion plane; elbow pitch can then raise the forearm
+instead of leaving it horizontal in front of the torso. `salute` uses three
+blended stages: shoulder lift until the upper arm is nearly horizontal,
+elbow flexion to approximately 105 degrees so the forearm is nearly vertical,
 then wrist yaw/pitch/roll alignment into the final salute. Wrist yaw orients
 the palm around the forearm axis; it does not determine whether the forearm
 itself is vertical. Intermediate stages have no dwell and hand
 off at 90% of their calculated transition time to avoid stop-start motion.
 The action is intentionally limited to one arm at a time to avoid interference
-near the head. `welcome` fixes wrist roll at a
-conservative angle to keep the palm upright and facing forward, then moves only
-wrist pitch through a bounded range for the welcoming motion.
+near the head. Its shoulder yaw direction is reversed and its shoulder
+roll/elbow flexion reduced from the earlier pose to move the hand away from the
+head and turn the palm closer to downward. `welcome` reverses wrist roll to
+correct the observed backward wrist orientation, then moves wrist pitch
+through a bounded range for the welcoming motion.
 `raise` lifts the upper arm close to overhead while keeping only a moderate
 elbow bend, making its silhouette distinct from `welcome`.
-`reach_forward` extends one arm toward a target; `present` uses a bent-elbow,
-open display pose; `high_five` holds one raised palm forward; and `cheer`
-provides a second overhead silhouette with a slightly flexed elbow.
+`shake_hands` extends one arm with a smaller shoulder-pitch angle than the old
+forward-reach pose and uses a small elbow sweep for the handshake.
+`present` uses a bent-elbow display pose with neutral wrist roll and means
+"please look left/right/both" according to `side`. `high_five` extends farther
+forward and uses a reversed, smaller wrist-roll angle.
 
 The URDF defines joint axes and limits but contains no hand palm frame and no
 arm visual/collision geometry. Palm-facing wrist values are therefore
@@ -109,13 +110,11 @@ light indicates Ready before running arm actions.
 
 | Action | Dashboard defaults | Allowed range |
 |---|---|---|
-| `wave` | right arm, cycles 2, speed 0.5rad/s | side left/right/both, cycles 1–5, speed 0.2–1.5rad/s |
 | `salute` | right arm, speed 0.5rad/s | side left/right, speed 0.2–1.5rad/s |
 | `welcome` | right arm, cycles 2, speed 0.5rad/s | side left/right/both, cycles 1–5, speed 0.2–1.5rad/s |
 | `raise` | right arm, speed 0.5rad/s | side left/right/both, speed 0.2–1.5rad/s |
-| `reach_forward` | right arm, speed 0.5rad/s | side left/right/both, speed 0.2–1.5rad/s |
+| `shake_hands` | right arm, cycles 2, speed 0.5rad/s | side left/right/both, cycles 1–5, speed 0.2–1.5rad/s |
 | `present` | right arm, speed 0.5rad/s | side left/right/both, speed 0.2–1.5rad/s |
 | `high_five` | right arm, speed 0.5rad/s | side left/right, speed 0.2–1.5rad/s |
-| `cheer` | right arm, speed 0.5rad/s | side left/right/both, speed 0.2–1.5rad/s |
 | `reset` | right arm, speed 0.5rad/s | side left/right/both, speed 0.2–1.5rad/s |
 | `stop` | no parameters | no parameters |
