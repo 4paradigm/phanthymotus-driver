@@ -102,10 +102,17 @@ verify_pr() {
   info "PR #$PR_NUMBER exists (ref found)."
 }
 
-# Fetch the pre-merge ref and checkout
+# Fetch PR head, merge with origin/main, abort on conflict
 fetch_and_checkout() {
   local local_branch="${BRANCH_PREFIX}-${PR_NUMBER}"
-  local merge_ref="refs/pull/${PR_NUMBER}/merge"
+  local head_ref="refs/pull/${PR_NUMBER}/head"
+
+  # Remember current branch/commit so we can restore on failure
+  local original_branch
+  original_branch=$(git branch --show-current 2>/dev/null)
+  if [[ -z "$original_branch" ]]; then
+    original_branch=$(git rev-parse HEAD)  # detached HEAD
+  fi
 
   # Check if local branch already exists
   if git show-ref --verify --quiet "refs/heads/$local_branch"; then
@@ -122,9 +129,7 @@ fetch_and_checkout() {
           if ! git diff-index --quiet HEAD -- 2>/dev/null; then
             die "Cannot update: you have uncommitted changes on '$local_branch'. Commit or stash first."
           fi
-          local default_branch
-          default_branch=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@') || default_branch="main"
-          git checkout "$default_branch" --quiet || die "Failed to switch away from '$local_branch'. Stash your changes first."
+          git checkout "$original_branch" --quiet 2>/dev/null || git checkout main --quiet
         fi
         git branch -D "$local_branch"
         info "Deleted old branch '$local_branch'."
@@ -143,40 +148,42 @@ fetch_and_checkout() {
     esac
   fi
 
+  # Ensure we have latest origin/main
+  local main_branch
+  main_branch=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@') || main_branch="main"
+  info "Fetching latest origin/$main_branch..."
+  git fetch "$REMOTE" "$main_branch" --quiet || die "Failed to fetch origin/$main_branch."
+
+  # Fetch PR head into a temporary local ref (avoid FETCH_HEAD ambiguity)
   echo ""
-  info "Fetching merge ref for PR #$PR_NUMBER..."
-  if ! git fetch "$REMOTE" "$merge_ref:$local_branch" 2>/dev/null; then
-    # GitHub may not have a merge ref if there are conflicts
-    warn "Failed to fetch merge ref. The PR may have merge conflicts."
-    info "Trying to fetch the PR head branch instead..."
-    local head_ref="refs/pull/${PR_NUMBER}/head"
-    local_branch="pr-head-${PR_NUMBER}"
+  info "Fetching PR #$PR_NUMBER head..."
+  local tmp_pr_ref="refs/tmp/pr-${PR_NUMBER}-head"
+  git fetch "$REMOTE" "$head_ref:$tmp_pr_ref" || \
+    die "Failed to fetch PR #$PR_NUMBER. Check that the PR exists and you have access."
 
-    if git show-ref --verify --quiet "refs/heads/$local_branch"; then
-      warn "Branch '$local_branch' already exists."
-      read -rp "Delete and re-fetch? [y/N] " ans
-      if [[ "$ans" =~ ^[Yy]$ ]]; then
-        if [[ "$(git branch --show-current)" == "$local_branch" ]]; then
-          if ! git diff-index --quiet HEAD -- 2>/dev/null; then
-            die "Cannot update: uncommitted changes on '$local_branch'. Commit or stash first."
-          fi
-          git checkout main --quiet || die "Failed to switch away. Stash your changes first."
-        fi
-        git branch -D "$local_branch"
-      else
-        exit 0
-      fi
-    fi
+  # Create branch from origin/main, then merge PR into it
+  info "Creating branch '$local_branch' from origin/$main_branch and merging PR #$PR_NUMBER..."
+  git checkout -b "$local_branch" "refs/remotes/origin/$main_branch" --quiet || {
+    git update-ref -d "$tmp_pr_ref" 2>/dev/null
+    die "Failed to create branch '$local_branch'."
+  }
 
-    git fetch "$REMOTE" "$head_ref:$local_branch" || \
-      die "Failed to fetch PR #$PR_NUMBER. Check that the PR exists and you have access."
-    warn "Note: This is the PR head (not pre-merged). You may need to rebase/merge manually."
+  if ! git merge "$tmp_pr_ref" --no-edit --quiet 2>/dev/null; then
+    # Conflict — abort merge, restore original state, clean up
+    git merge --abort 2>/dev/null
+    git checkout "$original_branch" --quiet 2>/dev/null
+    git branch -D "$local_branch" 2>/dev/null
+    git update-ref -d "$tmp_pr_ref" 2>/dev/null
+    die "PR #$PR_NUMBER has merge conflicts with origin/$main_branch. Resolve conflicts in the PR first."
   fi
 
-  git checkout "$local_branch" --quiet
+  # Clean up temp ref
+  git update-ref -d "$tmp_pr_ref" 2>/dev/null
+
   echo ""
   info "Done! You are now on: $(git branch --show-current)"
-  info "Tip: When finished, run 'git checkout main' to go back."
+  info "This branch = origin/$main_branch + PR #$PR_NUMBER (merged locally)."
+  info "Tip: When finished, run 'git checkout $original_branch' to go back."
 }
 
 # --- Main ---
