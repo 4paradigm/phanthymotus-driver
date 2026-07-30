@@ -82,6 +82,13 @@ clear-area calibration on the target robot before production use. Do not run
 the raw `arm` card and `arm_gesture` concurrently because both publish to the
 same controller topic.
 
+The semantic poses use a preparation frame before the final gesture so the
+elbow visibly flexes and raises the forearm. `wave` keeps the elbow flexed and
+combines a small shoulder-yaw sweep with wrist roll; wrist yaw remains neutral
+because it primarily twists the forearm around its own axis. `salute` uses a
+deeper elbow bend plus shoulder/wrist alignment toward the forehead, while
+`welcome` opens the arm forward and outward with a relaxed elbow bend.
+
 Before publishing an action, the card checks fresh `/arm/status` data, all
 selected motor IDs, motor error codes, the physical/remote emergency stop and
 power state. After publishing, it waits up to two seconds for a newer

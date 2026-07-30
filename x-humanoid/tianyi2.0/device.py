@@ -1562,11 +1562,19 @@ class ArmGesturePlugin:
     _TARGET_TOLERANCE_RAD = _deg2rad(3.0)
     _NEUTRAL = [0, 0, 0, 0, 0, 0, 0]
     # 角度顺序：肩 pitch、肩 roll、肩 yaw、肘 pitch、腕 yaw、腕 pitch、腕 roll。
+    # 肘 pitch 使用负角度屈肘；腕 yaw 不再用于挥手往复，因为它主要产生
+    # 沿前臂轴线的旋转。右臂由 _publish_pose 按横向关节自动镜像。
     _GESTURES = {
-        "wave": [0, 55, 0, -85, 0, 0, 0],
-        "salute": [-20, 45, -15, -100, 0, 15, 0],
-        "welcome": [-20, 50, 0, -45, 0, 0, 0],
-        "raise": [0, 45, 0, -20, 0, 0, 0],
+        "wave": [-10, 60, -10, -100, 0, 10, 0],
+        "salute": [-30, 45, -25, -115, 0, 25, 10],
+        "welcome": [-25, 50, -20, -50, 0, 15, 15],
+        "raise": [-10, 60, -5, -95, 0, 10, 0],
+    }
+    _PREPARE_POSES = {
+        "wave": [-5, 35, -5, -60, 0, 5, 0],
+        "salute": [-15, 30, -10, -70, 0, 10, 0],
+        "welcome": [-10, 25, -5, -25, 0, 5, 5],
+        "raise": [-5, 35, 0, -55, 0, 5, 0],
     }
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
@@ -1676,11 +1684,22 @@ class ArmGesturePlugin:
 
         pose = self._GESTURES[action]
         cycles = int(_clamp(args.get("cycles", 2), 1, 5))
-        frames = [(pose, 0.8)]
+        # Every gesture first bends the elbow in a moderate preparation pose.
+        # This prevents the old "upper arm lifts while the forearm stays down"
+        # appearance and makes the final pose easier to recognize.
+        frames = [(self._PREPARE_POSES[action], 0.35), (pose, 0.8)]
         if action == "wave":
             for i in range(cycles * 2):
                 wave_pose = list(pose)
-                wave_pose[4] = 30 if i % 2 == 0 else -30
+                # Wave with shoulder yaw + wrist roll while keeping the elbow
+                # flexed. Wrist yaw (index 4) stays neutral because changing it
+                # only twists the forearm around its own axis.
+                if i % 2 == 0:
+                    wave_pose[2] = -25
+                    wave_pose[6] = -20
+                else:
+                    wave_pose[2] = 5
+                    wave_pose[6] = 20
                 frames.append((wave_pose, 0.6))
         frames.append((self._NEUTRAL, 1.0))
 
@@ -1702,7 +1721,7 @@ class ArmGesturePlugin:
         baseline_seq, baseline = self._feedback_snapshot(side)
         self._sequence.start(_worker)
         feedback = self._wait_for_arm_feedback(
-            side, pose, baseline_seq, baseline)
+            side, self._PREPARE_POSES[action], baseline_seq, baseline)
         if feedback.get("state") == "error":
             self._sequence.cancel()
             return feedback
