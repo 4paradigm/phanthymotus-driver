@@ -14,6 +14,7 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   - domain 42 (ros2.ctx_core): 发布传感器数据给 Agent Core
 
 插件列表：
+  SystemPlugin     (resource)           — 整机软件版本清单
   StatePlugin      (sensor, multi-tool) — 关节/电池/急停/力传感器/URDF
   CameraPlugin     (sensor)             — Orbbec 头部相机
   AsrPlugin        (sensor)             — 语音识别结果
@@ -54,6 +55,12 @@ _RELIABLE_QOS = QoSProfile(
     depth=10,
     durability=DurabilityPolicy.VOLATILE,
 )
+
+_SOFTWARE_MANIFEST_HOST_PATH = "/home/ubuntu/ros2ws/version_info.json"
+_DEFAULT_SOFTWARE_MANIFEST_PATH = (
+    f"/proc/1/root{_SOFTWARE_MANIFEST_HOST_PATH}"
+)
+_SOFTWARE_MANIFEST_MAX_BYTES = 1024 * 1024
 
 # ── Motor ID → Joint Name 映射 ───────────────────────────────────────────────
 
@@ -122,6 +129,11 @@ def _clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, float(value)))
 
 
+def _reject_nonstandard_json_constant(value: str):
+    """Reject NaN and infinities, which are not valid JSON values."""
+    raise ValueError(f"invalid JSON constant: {value}")
+
+
 class _ActionSequence:
     """Run one cancellable actuator sequence at a time."""
 
@@ -167,6 +179,126 @@ class _ActionSequence:
                 self._cancel_event = None
                 self._thread = None
         return True
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SystemPlugin (resource, multi-tool)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SystemPlugin:
+    """Read-only host resources shared by Tianyi system-level cards."""
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        config = plugin_config or {}
+        self._software_manifest_path = Path(config.get(
+            "software_manifest_path", _DEFAULT_SOFTWARE_MANIFEST_PATH))
+        self._running = False
+
+    def get_tools(self) -> list:
+        return [
+            {
+                "name": "software_manifest",
+                "type": "resource",
+                "multiInstance": False,
+                "readOnly": True,
+                "description": (
+                    "天轶2.0 整机软件清单 — 完整返回 x86、Orin、固件"
+                    "模块的版本、提交和发布信息"
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+            },
+        ]
+
+    def start(self):
+        self._running = True
+
+    def stop(self):
+        self._running = False
+
+    def dispatch(self, action_or_tool: str, args: dict) -> dict:
+        if action_or_tool == "software_manifest":
+            return self._read_software_manifest()
+        if action_or_tool == "start":
+            self.start()
+            return self._lifecycle_info()
+        if action_or_tool == "stop":
+            self.stop()
+            return self._lifecycle_info()
+        if action_or_tool == "info":
+            return self._lifecycle_info()
+        return {
+            "state": "error",
+            "error": f"Unknown system action: {action_or_tool}",
+            "code": "unknown_action",
+        }
+
+    def _lifecycle_info(self) -> dict:
+        return {
+            "state": "running" if self._running else "idle",
+            "tools": ["software_manifest"],
+        }
+
+    def _manifest_error(self, code: str, message: str) -> dict:
+        return {
+            "source": str(self._software_manifest_path),
+            "state": "error",
+            "error": message,
+            "code": code,
+        }
+
+    def _read_software_manifest(self) -> dict:
+        try:
+            with self._software_manifest_path.open("rb") as manifest_file:
+                raw = manifest_file.read(_SOFTWARE_MANIFEST_MAX_BYTES + 1)
+        except FileNotFoundError:
+            return self._manifest_error(
+                "manifest_not_found", "Software manifest was not found")
+        except PermissionError:
+            return self._manifest_error(
+                "manifest_permission_denied",
+                "Permission denied while reading software manifest",
+            )
+        except OSError:
+            return self._manifest_error(
+                "manifest_read_failed", "Software manifest could not be read")
+
+        if len(raw) > _SOFTWARE_MANIFEST_MAX_BYTES:
+            return self._manifest_error(
+                "manifest_too_large",
+                "Software manifest exceeds the 1048576-byte limit",
+            )
+
+        try:
+            text = raw.decode("utf-8-sig")
+            manifest = json.loads(
+                text,
+                parse_constant=_reject_nonstandard_json_constant,
+            )
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            ValueError,
+            RecursionError,
+        ):
+            return self._manifest_error(
+                "manifest_invalid_json",
+                "Software manifest is not valid JSON",
+            )
+
+        if not isinstance(manifest, dict):
+            return self._manifest_error(
+                "manifest_not_object",
+                "Software manifest root must be a JSON object",
+            )
+
+        return {
+            "source": str(self._software_manifest_path),
+            "manifest": manifest,
+        }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
