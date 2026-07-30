@@ -102,12 +102,7 @@ def _install_ros_stubs():
 
 def _load_device_module():
     _install_ros_stubs()
-    device_path = (
-        Path(__file__).resolve().parents[1]
-        / "x-humanoid"
-        / "tianyi2.0"
-        / "device.py"
-    )
+    device_path = Path(__file__).resolve().parents[1] / "device.py"
     spec = importlib.util.spec_from_file_location("tianyi2_device_geometry_test", device_path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -275,11 +270,9 @@ class CameraGeometryTests(unittest.TestCase):
         )
 
     def test_vendored_extrinsics_interface_matches_orbbec_contract(self):
-        root = Path(__file__).resolve().parents[1]
+        tianyi_dir = Path(__file__).resolve().parents[1]
         definition = (
-            root
-            / "x-humanoid"
-            / "tianyi2.0"
+            tianyi_dir
             / "msgs"
             / "orbbec_camera_msgs"
             / "msg"

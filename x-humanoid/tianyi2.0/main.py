@@ -97,6 +97,12 @@ class TianyiDeviceBundle:
         self._plugins: list = []
         plugins_cfg = cfg.get("plugins", {})
 
+        if plugins_cfg.get("system", {}).get("enabled", False):
+            from device import SystemPlugin
+            self._plugins.append(
+                SystemPlugin(plugins_cfg["system"], namespace, ros2))
+            print("[bundle] SystemPlugin loaded")
+
         if plugins_cfg.get("state", {}).get("enabled", False):
             from device import StatePlugin
             self._plugins.append(StatePlugin(plugins_cfg["state"], namespace, ros2))

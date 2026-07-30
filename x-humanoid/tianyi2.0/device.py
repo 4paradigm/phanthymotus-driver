@@ -14,7 +14,7 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   - domain 42 (ros2.ctx_core): 发布传感器数据给 Agent Core
 
 插件列表：
-  SystemPlugin     (resource)           — 整机软件版本清单
+  SystemPlugin     (resource/actuator)  — 软件版本清单与 ROS bag 录制
   StatePlugin      (sensor, multi-tool) — 关节/电池/急停/力传感器/URDF
   CameraPlugin     (sensor/resource)    — Orbbec 头部相机与几何标定
   AsrPlugin        (sensor)             — 语音识别结果
@@ -34,9 +34,13 @@ from __future__ import annotations
 import copy
 import json
 import math
+import os
+import signal
+import subprocess
 import threading
 import time
-from pathlib import Path
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
 
 import rclpy
 from rclpy.node import Node
@@ -58,10 +62,12 @@ _RELIABLE_QOS = QoSProfile(
 )
 
 _SOFTWARE_MANIFEST_HOST_PATH = "/home/ubuntu/ros2ws/version_info.json"
-_DEFAULT_SOFTWARE_MANIFEST_PATH = (
-    f"/proc/1/root{_SOFTWARE_MANIFEST_HOST_PATH}"
-)
 _SOFTWARE_MANIFEST_MAX_BYTES = 1024 * 1024
+_DEFAULT_HOST_ROOT = "/proc/1/root"
+_DEFAULT_BAG_HOST_PATH = "/home/ubuntu/bags"
+_DEFAULT_ROS_SETUP_HOST_PATH = "/home/ubuntu/ros2ws/install/setup.bash"
+_BAG_FILE_SUFFIXES = {".bag", ".db3", ".mcap"}
+_MAX_BAG_SESSIONS = 50
 
 _CAMERA_EXTRINSICS_QOS = QoSProfile(
     reliability=ReliabilityPolicy.RELIABLE,
@@ -194,13 +200,67 @@ class _ActionSequence:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class SystemPlugin:
-    """Read-only host resources shared by Tianyi system-level cards."""
+    """Host-side system capabilities behind one bounded interface."""
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         config = plugin_config or {}
-        self._software_manifest_path = Path(config.get(
-            "software_manifest_path", _DEFAULT_SOFTWARE_MANIFEST_PATH))
         self._running = False
+        self._recorder_lock = threading.RLock()
+        self._recorder_process = None
+        self._recorder_started_at: float | None = None
+        self._last_recorder_exit_code: int | None = None
+
+        self._host_root = Path(config.get("host_root", _DEFAULT_HOST_ROOT))
+        if not self._host_root.is_absolute():
+            raise ValueError("host_root must be an absolute path")
+
+        self._bag_host_path = self._validate_host_path(
+            config.get("bag_dir", _DEFAULT_BAG_HOST_PATH), "bag_dir")
+        self._setup_host_path = self._validate_host_path(
+            config.get("setup", _DEFAULT_ROS_SETUP_HOST_PATH), "setup")
+        self._visible_bag_dir = self._resolve_host_path(self._bag_host_path)
+        self._visible_setup_path = self._resolve_host_path(
+            self._setup_host_path)
+
+        configured_manifest = config.get("software_manifest_path")
+        if configured_manifest is None:
+            self._software_manifest_source = _SOFTWARE_MANIFEST_HOST_PATH
+            self._software_manifest_path = self._resolve_host_path(
+                _SOFTWARE_MANIFEST_HOST_PATH)
+        else:
+            # An explicit visible path is an internal test/deployment seam.
+            # It is never accepted from MCP arguments.
+            self._software_manifest_path = Path(configured_manifest)
+            if not self._software_manifest_path.is_absolute():
+                raise ValueError(
+                    "software_manifest_path must be an absolute path")
+            self._software_manifest_source = str(
+                self._software_manifest_path)
+
+        self._stop_timeout_s = self._bounded_timeout(
+            config.get("stop_timeout_s", 5.0))
+        self._terminate_timeout_s = self._bounded_timeout(
+            config.get("terminate_timeout_s", 2.0))
+        self._kill_timeout_s = self._bounded_timeout(
+            config.get("kill_timeout_s", 1.0))
+
+    @staticmethod
+    def _validate_host_path(value, field_name: str) -> str:
+        path = PurePosixPath(str(value))
+        if not path.is_absolute() or ".." in path.parts:
+            raise ValueError(f"{field_name} must be an absolute host path")
+        return str(path)
+
+    @staticmethod
+    def _bounded_timeout(value) -> float:
+        try:
+            return max(0.001, min(30.0, float(value)))
+        except (TypeError, ValueError):
+            return 5.0
+
+    def _resolve_host_path(self, host_path: str) -> Path:
+        path = PurePosixPath(host_path)
+        return self._host_root.joinpath(*path.parts[1:])
 
     def get_tools(self) -> list:
         return [
@@ -208,7 +268,6 @@ class SystemPlugin:
                 "name": "software_manifest",
                 "type": "resource",
                 "multiInstance": False,
-                "readOnly": True,
                 "description": (
                     "天轶2.0 整机软件清单 — 完整返回 x86、Orin、固件"
                     "模块的版本、提交和发布信息"
@@ -219,17 +278,70 @@ class SystemPlugin:
                     "additionalProperties": False,
                 },
             },
+            {
+                "name": "bag_recorder",
+                "type": "actuator",
+                "multiInstance": False,
+                "description": (
+                    "天轶2.0 ROS bag 录制管理 — 安全启停官方录包程序、"
+                    "查看状态和历史会话"
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": [
+                                "start_recording",
+                                "stop_recording",
+                                "status",
+                                "list_sessions",
+                            ],
+                            "description": "录包管理动作",
+                        },
+                    },
+                    "required": ["action"],
+                    "additionalProperties": False,
+                    "x-action-params": {
+                        "start_recording": {
+                            "params": [],
+                            "description": "启动官方循环 ROS bag 录制",
+                        },
+                        "stop_recording": {
+                            "params": [],
+                            "description": "优雅停止当前录制",
+                        },
+                        "status": {
+                            "params": [],
+                            "description": "查询录制进程状态",
+                        },
+                        "list_sessions": {
+                            "params": [],
+                            "description": "列出最近的录包会话",
+                        },
+                    },
+                },
+            },
         ]
 
     def start(self):
         self._running = True
 
     def stop(self):
+        self._stop_recording()
         self._running = False
 
     def dispatch(self, action_or_tool: str, args: dict) -> dict:
         if action_or_tool == "software_manifest":
             return self._read_software_manifest()
+        if action_or_tool == "start_recording":
+            return self._start_recording()
+        if action_or_tool == "stop_recording":
+            return self._stop_recording()
+        if action_or_tool == "status":
+            return self._recorder_status()
+        if action_or_tool == "list_sessions":
+            return self._list_bag_sessions()
         if action_or_tool == "start":
             self.start()
             return self._lifecycle_info()
@@ -238,25 +350,32 @@ class SystemPlugin:
             return self._lifecycle_info()
         if action_or_tool == "info":
             return self._lifecycle_info()
-        return {
-            "state": "error",
-            "error": f"Unknown system action: {action_or_tool}",
-            "code": "unknown_action",
-        }
+        return self._error(
+            "unknown_action", f"Unknown system action: {action_or_tool}")
 
-    def _lifecycle_info(self) -> dict:
-        return {
-            "state": "running" if self._running else "idle",
-            "tools": ["software_manifest"],
-        }
-
-    def _manifest_error(self, code: str, message: str) -> dict:
-        return {
-            "source": str(self._software_manifest_path),
+    @staticmethod
+    def _error(code: str, message: str, **details) -> dict:
+        result = {
+            "ok": False,
             "state": "error",
             "error": message,
             "code": code,
         }
+        result.update(details)
+        return result
+
+    def _lifecycle_info(self) -> dict:
+        status = self._recorder_status()
+        return {
+            "state": status["state"],
+            "plugin_state": "running" if self._running else "idle",
+            "tools": ["software_manifest", "bag_recorder"],
+            "pid": status.get("pid"),
+        }
+
+    def _manifest_error(self, code: str, message: str) -> dict:
+        return self._error(
+            code, message, source=self._software_manifest_source)
 
     def _read_software_manifest(self) -> dict:
         try:
@@ -304,9 +423,224 @@ class SystemPlugin:
             )
 
         return {
-            "source": str(self._software_manifest_path),
+            "ok": True,
+            "state": "ready",
+            "source": self._software_manifest_source,
             "manifest": manifest,
         }
+
+    def _start_recording(self) -> dict:
+        with self._recorder_lock:
+            status = self._recorder_status_locked()
+            if status["state"] == "recording":
+                return self._error(
+                    "already_recording",
+                    "A bag recording session is already running",
+                    pid=status["pid"],
+                )
+            if not self._visible_setup_path.is_file():
+                return self._error(
+                    "recorder_setup_not_found",
+                    "Tianyi ROS setup file was not found on the host",
+                    setup=self._setup_host_path,
+                )
+
+            command = [
+                "nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--",
+                "bash", "-lc",
+                'source "$1" && exec ros2 launch utils record_trigger.py',
+                "bash", self._setup_host_path,
+            ]
+            try:
+                process = subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+            except FileNotFoundError:
+                return self._error(
+                    "recorder_runtime_unavailable",
+                    "nsenter or bash is unavailable in the driver image",
+                )
+            except OSError:
+                return self._error(
+                    "recorder_start_failed",
+                    "The host bag recorder process could not be started",
+                )
+
+            self._recorder_process = process
+            self._recorder_started_at = time.time()
+            self._last_recorder_exit_code = None
+            return {
+                "ok": True,
+                "state": "recording",
+                "pid": process.pid,
+                "bag_directory": self._bag_host_path,
+                "started_at": self._format_time(self._recorder_started_at),
+            }
+
+    def _recorder_status(self) -> dict:
+        with self._recorder_lock:
+            return self._recorder_status_locked()
+
+    def _recorder_status_locked(self) -> dict:
+        process = self._recorder_process
+        if process is None:
+            return {
+                "ok": True,
+                "state": "idle",
+                "bag_directory": self._bag_host_path,
+                "last_exit_code": self._last_recorder_exit_code,
+            }
+
+        exit_code = process.poll()
+        if exit_code is not None:
+            self._last_recorder_exit_code = exit_code
+            self._recorder_process = None
+            self._recorder_started_at = None
+            return {
+                "ok": True,
+                "state": "idle",
+                "bag_directory": self._bag_host_path,
+                "last_exit_code": exit_code,
+            }
+
+        return {
+            "ok": True,
+            "state": "recording",
+            "pid": process.pid,
+            "bag_directory": self._bag_host_path,
+            "started_at": self._format_time(self._recorder_started_at),
+            "uptime_s": round(
+                max(0.0, time.time() - self._recorder_started_at), 3),
+        }
+
+    def _stop_recording(self) -> dict:
+        with self._recorder_lock:
+            status = self._recorder_status_locked()
+            if status["state"] == "idle":
+                return status
+
+            process = self._recorder_process
+            try:
+                process_group = os.getpgid(process.pid)
+            except ProcessLookupError:
+                self._recorder_process = None
+                self._recorder_started_at = None
+                return {
+                    "ok": True,
+                    "state": "idle",
+                    "bag_directory": self._bag_host_path,
+                }
+
+            stages = [
+                ("sigint", signal.SIGINT, self._stop_timeout_s),
+                ("sigterm", signal.SIGTERM, self._terminate_timeout_s),
+                ("sigkill", signal.SIGKILL, self._kill_timeout_s),
+            ]
+            for stage, stop_signal, timeout_s in stages:
+                try:
+                    os.killpg(process_group, stop_signal)
+                except ProcessLookupError:
+                    exit_code = process.poll()
+                    self._finish_recording(exit_code)
+                    return {
+                        "ok": True,
+                        "state": "idle",
+                        "stop_stage": stage,
+                        "exit_code": exit_code,
+                        "bag_directory": self._bag_host_path,
+                    }
+                try:
+                    exit_code = process.wait(timeout=timeout_s)
+                except subprocess.TimeoutExpired:
+                    continue
+
+                self._finish_recording(exit_code)
+                return {
+                    "ok": True,
+                    "state": "idle",
+                    "stop_stage": stage,
+                    "exit_code": exit_code,
+                    "bag_directory": self._bag_host_path,
+                }
+
+            return self._error(
+                "recorder_stop_failed",
+                "The bag recorder did not stop after SIGKILL",
+                pid=process.pid,
+            )
+
+    def _finish_recording(self, exit_code) -> None:
+        self._last_recorder_exit_code = exit_code
+        self._recorder_process = None
+        self._recorder_started_at = None
+
+    def _list_bag_sessions(self) -> dict:
+        try:
+            if not self._visible_bag_dir.exists():
+                return {
+                    "ok": True,
+                    "state": "ready",
+                    "directory": self._bag_host_path,
+                    "directory_exists": False,
+                    "sessions": [],
+                }
+
+            sessions = []
+            for entry in self._visible_bag_dir.iterdir():
+                if entry.is_symlink():
+                    continue
+                if not entry.is_dir() and entry.suffix.lower() not in (
+                        _BAG_FILE_SUFFIXES):
+                    continue
+                stat = entry.stat()
+                sessions.append({
+                    "name": entry.name,
+                    "path": str(
+                        PurePosixPath(self._bag_host_path) / entry.name),
+                    "kind": "directory" if entry.is_dir() else "file",
+                    "size_bytes": stat.st_size if entry.is_file() else None,
+                    "modified_at": self._format_time(stat.st_mtime),
+                    "_mtime": stat.st_mtime,
+                })
+        except PermissionError:
+            return self._error(
+                "bag_directory_permission_denied",
+                "Permission denied while listing bag sessions",
+                directory=self._bag_host_path,
+            )
+        except OSError:
+            return self._error(
+                "bag_directory_read_failed",
+                "Bag sessions could not be listed",
+                directory=self._bag_host_path,
+            )
+
+        sessions.sort(key=lambda item: item["_mtime"], reverse=True)
+        total = len(sessions)
+        sessions = sessions[:_MAX_BAG_SESSIONS]
+        for session in sessions:
+            session.pop("_mtime", None)
+        return {
+            "ok": True,
+            "state": "ready",
+            "directory": self._bag_host_path,
+            "directory_exists": True,
+            "sessions": sessions,
+            "total": total,
+            "truncated": total > len(sessions),
+        }
+
+    @staticmethod
+    def _format_time(timestamp: float | None) -> str | None:
+        if timestamp is None:
+            return None
+        return datetime.fromtimestamp(
+            timestamp, tz=timezone.utc).isoformat()
 
 
 # ══════════════════════════════════════════════════════════════════════════════

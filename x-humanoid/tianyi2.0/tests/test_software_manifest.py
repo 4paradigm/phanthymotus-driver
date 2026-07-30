@@ -24,6 +24,7 @@ def _install_ros_stubs():
         RELIABLE = "reliable"
         KEEP_LAST = "keep_last"
         VOLATILE = "volatile"
+        TRANSIENT_LOCAL = "transient_local"
 
     rclpy_module = types.ModuleType("rclpy")
     rclpy_node_module = types.ModuleType("rclpy.node")
@@ -70,22 +71,23 @@ class SoftwareManifestTests(unittest.TestCase):
     def test_tool_schema_is_a_pathless_read_only_resource(self):
         plugin = self._plugin("/tmp/version_info.json")
 
+        tool = next(
+            item for item in plugin.get_tools()
+            if item["name"] == "software_manifest"
+        )
         self.assertEqual(
-            [
-                {
-                    "name": "software_manifest",
-                    "type": "resource",
-                    "multiInstance": False,
-                    "readOnly": True,
-                    "description": mock.ANY,
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {},
-                        "additionalProperties": False,
-                    },
-                }
-            ],
-            plugin.get_tools(),
+            {
+                "name": "software_manifest",
+                "type": "resource",
+                "multiInstance": False,
+                "description": mock.ANY,
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+            },
+            tool,
         )
 
     def test_default_path_targets_the_host_file_through_proc(self):
@@ -202,19 +204,39 @@ class SoftwareManifestTests(unittest.TestCase):
         plugin = self._plugin("/tmp/version_info.json")
 
         self.assertEqual(
-            {"state": "idle", "tools": ["software_manifest"]},
+            {
+                "state": "idle",
+                "plugin_state": "idle",
+                "tools": ["software_manifest", "bag_recorder"],
+                "pid": None,
+            },
             plugin.dispatch("info", {}),
         )
         self.assertEqual(
-            {"state": "running", "tools": ["software_manifest"]},
+            {
+                "state": "idle",
+                "plugin_state": "running",
+                "tools": ["software_manifest", "bag_recorder"],
+                "pid": None,
+            },
             plugin.dispatch("start", {}),
         )
         self.assertEqual(
-            {"state": "running", "tools": ["software_manifest"]},
+            {
+                "state": "idle",
+                "plugin_state": "running",
+                "tools": ["software_manifest", "bag_recorder"],
+                "pid": None,
+            },
             plugin.dispatch("start", {}),
         )
         self.assertEqual(
-            {"state": "idle", "tools": ["software_manifest"]},
+            {
+                "state": "idle",
+                "plugin_state": "idle",
+                "tools": ["software_manifest", "bag_recorder"],
+                "pid": None,
+            },
             plugin.dispatch("stop", {}),
         )
 

@@ -6,6 +6,13 @@ slamtec:
   base_url: "http://192.168.11.1:1448"
 
 plugins:
+  # Host-side system cards share one plugin instead of one Python module each.
+  # Requires the documented --pid host + --privileged deployment settings.
+  system:
+    enabled: true
+    host_root: "/proc/1/root"
+    bag_dir: "/home/ubuntu/bags"
+    setup: "/home/ubuntu/ros2ws/install/setup.bash"
   state:
     enabled: true
   camera:

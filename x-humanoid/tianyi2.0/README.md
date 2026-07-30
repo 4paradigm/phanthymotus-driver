@@ -4,6 +4,66 @@ Phanthy Motus driver bundle for the Tianyi 2.0 Pro humanoid robot. The driver
 bridges robot-side ROS2 topics on domain 0 to Agent Core topics on domain 42 and
 exposes the capabilities as MCP tools.
 
+## System and camera utility cards
+
+The three cards are grouped into the existing runtime modules rather than
+implemented as one Python file per capability:
+
+| Tool | Type | Runtime module | Purpose |
+|---|---|---|---|
+| `bag_recorder` | `actuator` | `SystemPlugin` | Start/stop the official rolling ROS bag recorder and inspect sessions |
+| `software_manifest` | `resource` | `SystemPlugin` | Read the complete robot software and firmware version inventory |
+| `camera_geometry` | `resource` | `CameraPlugin` | Read RGB/depth intrinsics and depth-to-color extrinsics |
+
+### Bag recorder
+
+`bag_recorder` exposes four bounded actions: `start_recording`,
+`stop_recording`, `status`, and `list_sessions`. It always launches the fixed
+official command `ros2 launch utils record_trigger.py`; MCP callers cannot
+inject a shell command, topic list, setup path, or output path. The process runs
+inside the host namespaces through `nsenter`, rejects duplicate starts, and is
+stopped with `SIGINT` before bounded `SIGTERM`/`SIGKILL` fallbacks.
+
+The official recorder reads its topic configuration from
+`/home/ubuntu/ros2ws/install/utils/lib/utils/bag_record/config/record.json` and
+writes rolling sessions under `/home/ubuntu/bags`. The Tianyi documentation
+defines 100 MB segments and a 4 GB rolling limit; those retention settings stay
+owned by the official recorder rather than being duplicated in this driver.
+
+### Software manifest
+
+`software_manifest` reads
+`/home/ubuntu/ros2ws/version_info.json` through the host mount namespace. The
+resource preserves the complete JSON object, including current x86, Orin and
+firmware fields plus future unknown fields. Reads are limited to 1 MiB and
+invalid UTF-8, non-standard JSON constants, non-object roots and filesystem
+errors return stable error codes. MCP arguments cannot override the configured
+path.
+
+### Camera geometry
+
+`camera_geometry` caches:
+
+- `/ob_camera_head/color/camera_info`
+- `/ob_camera_head/depth/camera_info`
+- `/ob_camera_head/depth_to_color`
+
+Each camera stream returns resolution, `fx/fy/cx/cy`, distortion coefficients,
+K/R/P matrices, ROI, frame ID and source timestamp. The optional
+depth-to-color transform returns a 3×3 rotation matrix and translation in
+metres. The driver builds the minimal official-compatible
+`orbbec_camera_msgs/Extrinsics` interface and subscribes with transient-local
+QoS so it can receive the one-shot calibration message after the camera service
+has already started.
+
+Missing streams are reported through `availability`, `missing` and
+`optional_missing`; RGB streaming remains usable when geometry is partial.
+Depth-to-color calibration does not include a camera-to-robot-base transform,
+which still requires TF or a separate hand-eye calibration.
+
+`SystemPlugin` requires the same `--pid host` and `--privileged` deployment
+settings already used by `CameraPlugin` to reach the host system and filesystem.
+
 ## Head gesture card
 
 `head_gesture` turns safe, bounded head-position commands into cancellable
