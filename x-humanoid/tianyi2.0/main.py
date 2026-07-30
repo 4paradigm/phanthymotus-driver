@@ -102,12 +102,6 @@ class TianyiDeviceBundle:
             self._plugins.append(StatePlugin(plugins_cfg["state"], namespace, ros2))
             print("[bundle] StatePlugin loaded")
 
-        if plugins_cfg.get("robot_faults", {}).get("enabled", False):
-            from device import RobotFaultsPlugin
-            self._plugins.append(RobotFaultsPlugin(
-                plugins_cfg["robot_faults"], namespace, ros2))
-            print("[bundle] RobotFaultsPlugin loaded")
-
         if plugins_cfg.get("camera", {}).get("enabled", False):
             from device import CameraPlugin
             self._plugins.append(CameraPlugin(plugins_cfg["camera"], namespace, ros2))

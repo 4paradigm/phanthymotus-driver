@@ -8,17 +8,6 @@ slamtec:
 plugins:
   state:
     enabled: true
-  robot_faults:
-    enabled: true
-    motor_status_topics:
-      - "/head/status"
-      - "/arm/status"
-      - "/waist/status"
-      - "/leg/status"
-    hand_error_topics:
-      left: "/inspire_hand/error/left_hand"
-      right: "/inspire_hand/error/right_hand"
-    estop_topic: "/power/board/key_status"
   camera:
     enabled: true
   asr:

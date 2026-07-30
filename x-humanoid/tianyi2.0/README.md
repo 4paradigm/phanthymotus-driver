@@ -4,30 +4,6 @@ Phanthy Motus driver bundle for the Tianyi 2.0 Pro humanoid robot. The driver
 bridges robot-side ROS2 topics on domain 0 to Agent Core topics on domain 42 and
 exposes the capabilities as MCP tools.
 
-## Robot faults card
-
-`robot_faults` aggregates verified fault signals from the robot's motors, both
-Inspire hands, and the physical/remote emergency-stop state. Input callbacks
-only update an in-memory snapshot; the Agent Core output is published at 1Hz.
-
-| Item | Value |
-|---|---|
-| Tool name | `robot_faults` |
-| Tool type | `sensor` |
-| Robot-side inputs | `/head/status`, `/arm/status`, `/waist/status`, `/leg/status`, `/inspire_hand/error/left_hand`, `/inspire_hand/error/right_hand`, `/power/board/key_status` |
-| Agent Core output | `/{namespace}/state/robot_faults` |
-| Output format | `data/json` |
-| Output rate | 1Hz |
-
-When an input error code returns to zero, it is removed from the active fault
-list. Error codes are preserved as vendor-provided integers; this driver does
-not invent descriptions without an authoritative error-code table. Power
-voltage, current and temperature are not classified as faults because the SDK
-does not provide authoritative alarm thresholds.
-
-The card is read-only. It does not command joints, stop the robot, trigger an
-emergency stop, or modify any robot-side configuration.
-
 ## Head gesture card
 
 `head_gesture` turns safe, bounded head-position commands into cancellable
