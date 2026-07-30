@@ -14,8 +14,6 @@ plugins:
     enabled: true
   camera_depth:
     enabled: true
-  camera_pointcloud:
-    enabled: true
   asr:
     enabled: true
   nav_state:
