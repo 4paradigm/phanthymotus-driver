@@ -108,11 +108,13 @@ class TianyiDeviceBundle:
             print("[bundle] CameraPlugin loaded")
 
         for config_name, class_name in (("imu", "ImuPlugin"),
-                                        ("camera_depth", "DepthCameraPlugin")):
+                                        ("camera_depth", "DepthCameraPlugin"),
+                                        ("camera_pointcloud", "PointCloudPlugin")):
             if plugins_cfg.get(config_name, {}).get("enabled", False):
-                from device import ImuPlugin, DepthCameraPlugin
-                plugin_class = {"ImuPlugin": ImuPlugin, "DepthCameraPlugin": DepthCameraPlugin}
-                self._plugins.append(plugin_class[class_name](plugins_cfg[config_name], namespace, ros2))
+                from device import ImuPlugin, DepthCameraPlugin, PointCloudPlugin
+                plugin_class = {"ImuPlugin": ImuPlugin, "DepthCameraPlugin": DepthCameraPlugin,
+                                "PointCloudPlugin": PointCloudPlugin}[class_name]
+                self._plugins.append(plugin_class(plugins_cfg[config_name], namespace, ros2))
                 print(f"[bundle] {class_name} loaded")
 
         if plugins_cfg.get("asr", {}).get("enabled", False):
