@@ -428,7 +428,7 @@ class CameraPlugin:
 
         The camera runs on the host because it owns the USB device.  Each
         container start therefore makes the vendor startup script idempotently
-        request PointCloud2, accelerometer, and gyroscope streams before
+        request accelerometer and gyroscope streams before
         ensuring the service is active.  This is deliberately runtime setup,
         not a Docker build step: a Dockerfile cannot alter a new machine's
         systemd service or access its camera.
@@ -467,8 +467,7 @@ class CameraPlugin:
 
         script = "/home/nvidia/data/scripts/start_orbbec_camera.sh"
         launch = "ros2 launch orbbec_camera head_330_ty.launch.py"
-        desired = (f"{launch} enable_point_cloud:=true "
-                   "enable_accel:=true enable_gyro:=true")
+        desired = f"{launch} enable_accel:=true enable_gyro:=true"
         updater = (
             "from pathlib import Path\n"
             f"path = Path({script!r})\n"
@@ -494,7 +493,7 @@ class CameraPlugin:
             check=True, capture_output=True, text=True, timeout=10)
         changed = result.stdout.strip() == "changed"
         if changed:
-            print("[CameraPlugin] enabled Orbbec point cloud, accel, and gyro streams")
+            print("[CameraPlugin] enabled Orbbec accel and gyro streams")
         return changed
 
     def stop(self):
@@ -727,108 +726,6 @@ class DepthCameraPlugin:
             print(f"[DepthCameraPlugin] forwarded {self._forwarded_frames} latest Z16 frames")
     def dispatch(self, action, args):
         return {"state": "running" if self._running else "idle", "topic_out": [{"topic": self._topic, "format": "image/depth-z16"}]}
-
-
-class PointCloudPlugin:
-    """Pack and gravity-level Orbbec optical-frame points for Agent Core."""
-    _format = "sensor/pointcloud"
-    def __init__(self, plugin_config, namespace, ros2):
-        self._running = False; self._topic = f"/{namespace}/camera/head/points"; self._last = 0.0; self._intrinsics = None
-        self._gravity_world = None; self._gravity_lock = threading.Lock()
-        self._sub_node = Node("tianyi2_points_sub", context=ros2.ctx_tianyi); self._pub_node = Node("tianyi2_points_pub", context=ros2.ctx_core)
-        ros2.executor_tianyi.add_node(self._sub_node); ros2.executor_core.add_node(self._pub_node)
-    def get_tool(self):
-        return {"name": "camera_pointcloud", "type": "sensor", "description": "天轶2.0 Orbbec 头部彩色点云（限频、限点）", "inputSchema": {"type": "object", "properties": {}}, "topic_out": [{"topic": self._topic, "format": self._format}]}
-    def start(self):
-        from sensor_msgs.msg import PointCloud2, Image, CameraInfo, Imu
-        from std_msgs.msg import UInt8MultiArray
-        self._running = True; self._pub = self._pub_node.create_publisher(UInt8MultiArray, self._topic, _LOW_LAT_QOS)
-        self._sub_node.create_subscription(PointCloud2, "/ob_camera_head/depth/points", self._on_cloud, _LOW_LAT_QOS)
-        # Gemini 336 currently has its depth image enabled even when the vendor
-        # point-cloud stream is disabled.  This fallback keeps the card live.
-        self._sub_node.create_subscription(CameraInfo, "/ob_camera_head/depth/camera_info", self._on_info, _RELIABLE_QOS)
-        self._sub_node.create_subscription(Image, "/ob_camera_head/depth/image_raw", self._on_depth, _LOW_LAT_QOS)
-        self._sub_node.create_subscription(Imu, "/ob_camera_head/accel/sample", self._on_accel, _LOW_LAT_QOS)
-    def stop(self): self._running = False
-    def _on_accel(self, msg):
-        """Estimate display-frame up from the camera's stationary IMU vector."""
-        # Optical raw coordinates are (right, down, forward); the renderer's
-        # world coordinates are (right, up, backward) before leveling.
-        g = (msg.linear_acceleration.x, -msg.linear_acceleration.y, -msg.linear_acceleration.z)
-        magnitude = math.sqrt(sum(v * v for v in g))
-        if not 8.0 <= magnitude <= 11.5: return  # reject dynamic acceleration
-        g = tuple(v / magnitude for v in g)
-        with self._gravity_lock:
-            previous = self._gravity_world
-            if previous is None:
-                self._gravity_world = g
-            else:
-                # Low-pass the gravity direction to avoid point-cloud wobble.
-                mixed = tuple(0.95 * old + 0.05 * new for old, new in zip(previous, g))
-                norm = math.sqrt(sum(v * v for v in mixed))
-                self._gravity_world = tuple(v / norm for v in mixed)
-
-    def _gravity_snapshot(self):
-        with self._gravity_lock: return self._gravity_world
-
-    @staticmethod
-    def _to_renderer_frame(x, y, z, gravity=None):
-        """Map optical points to the renderer and align camera up with world up."""
-        # Renderer map is (input_y, -input_z, -input_x), so this packed form
-        # yields world (x, -y, -z): right, up, backward from optical raw XYZ.
-        wx, wy, wz = x, -y, -z
-        if gravity is not None:
-            gx, gy, gz = gravity
-            # Rodrigues rotation taking measured up/gravity to world +Y.
-            vx, vy, vz = -gz, 0.0, gx  # gravity × (0, 1, 0)
-            sine_sq = vx * vx + vy * vy + vz * vz
-            cosine = gy
-            if sine_sq > 1e-8:
-                cross_x = vy * wz - vz * wy
-                cross_y = vz * wx - vx * wz
-                cross_z = vx * wy - vy * wx
-                cross2_x = vy * cross_z - vz * cross_y
-                cross2_y = vz * cross_x - vx * cross_z
-                cross2_z = vx * cross_y - vy * cross_x
-                factor = (1.0 - cosine) / sine_sq
-                wx += cross_x + factor * cross2_x
-                wy += cross_y + factor * cross2_y
-                wz += cross_z + factor * cross2_z
-        # Invert the renderer map above to pack the leveled world point.
-        return -wz, wx, -wy
-    def _on_cloud(self, msg):
-        if not self._running or time.monotonic() - self._last < 0.5: return
-        fields = {f.name: f.offset for f in msg.fields}
-        if not all(k in fields for k in ("x", "y", "z")): return
-        self._last = time.monotonic(); raw = bytes(msg.data); count = min(msg.width * msg.height, 10000); gravity = self._gravity_snapshot()
-        packed = bytearray(struct.pack("<II", 12, count))
-        for i in range(count):
-            base = i * msg.point_step
-            x = struct.unpack_from("<f", raw, base + fields["x"])[0]
-            y = struct.unpack_from("<f", raw, base + fields["y"])[0]
-            z = struct.unpack_from("<f", raw, base + fields["z"])[0]
-            packed.extend(struct.pack("<fff", *self._to_renderer_frame(x, y, z, gravity)))
-        from std_msgs.msg import UInt8MultiArray
-        out = UInt8MultiArray(); out.data = list(packed); self._pub.publish(out)
-    def _on_info(self, msg): self._intrinsics = (msg.k[0], msg.k[4], msg.k[2], msg.k[5])
-    def _on_depth(self, msg):
-        if not self._running or self._intrinsics is None or time.monotonic() - self._last < 0.5: return
-        if msg.encoding not in ("16UC1", "mono16"): return
-        fx, fy, cx, cy = self._intrinsics
-        if fx <= 0 or fy <= 0: return
-        self._last = time.monotonic(); raw = bytes(msg.data); step = max(1, int(math.sqrt((msg.width * msg.height) / 10000))); gravity = self._gravity_snapshot()
-        packed = bytearray(); count = 0
-        for v in range(0, msg.height, step):
-            for u in range(0, msg.width, step):
-                d = struct.unpack_from("<H", raw, v * msg.step + u * 2)[0]
-                if d == 0: continue
-                z = d / 1000.0
-                x, y = (u - cx) * z / fx, (v - cy) * z / fy
-                packed.extend(struct.pack("<fff", *self._to_renderer_frame(x, y, z, gravity))); count += 1
-        if not count: return
-        from std_msgs.msg import UInt8MultiArray
-        out = UInt8MultiArray(); out.data = list(struct.pack("<II", 12, count) + packed); self._pub.publish(out)
-    def dispatch(self, action, args): return {"state": "running" if self._running else "idle", "topic_out": [{"topic": self._topic, "format": self._format}]}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
