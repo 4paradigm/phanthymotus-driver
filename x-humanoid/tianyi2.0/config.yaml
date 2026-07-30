@@ -1,8 +1,6 @@
-mcp_port: 15708
+mcp_port: 15707
 ros_namespace: ""   # 留空则自动使用 hostname
-name: "Tianyi 2.0 FQY Test"
-# Must be unique: Agent Core uses MCP serverInfo.name as a deduplication key.
-mcp_server_name: "fl-bundle"
+name: "Tianyi 2.0 Pro"
 
 slamtec:
   base_url: "http://192.168.11.1:1448"
