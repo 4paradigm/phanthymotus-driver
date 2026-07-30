@@ -1360,7 +1360,7 @@ class ArmGesturePlugin:
         # In the URDF chain shoulder yaw rotates the elbow-pitch plane. The
         # shoulder and elbow angles place the wrist; wrist yaw/roll are used
         # only where the final palm orientation needs calibration.
-        "salute": [-10, 90, 60, -130, 50, 0, 0],
+        "salute": [-10, 90, 60, -120, 50, 0, 0],
         "welcome": [-10, 65, 75, -100, 0, 0, 0],
         "raise": [0, 130, 0, -15, 0, 0, 0],
         "shake_hands": [-55, 15, 5, -35, 0, 0, 0],
@@ -1369,17 +1369,12 @@ class ArmGesturePlugin:
     _PREPARE_POSES = {
         # Flex the elbow while establishing the lifting plane instead of first
         # rotating a fully extended arm near the head.
-        "salute": [-10, 40, 35, -45, 0, 0, 0],
+        "salute": [-10, 40, 35, -45, 25, 0, 0],
         "welcome": [-10, 45, 45, -60, 0, 0, 0],
         "raise": [0, 75, 0, -30, 0, 0, 0],
         "shake_hands": [-30, 10, 0, -20, 0, 0, 0],
         "high_five": [-25, 25, -10, -45, 0, 0, 10],
     }
-    # Salute stage 2: raise the upper arm laterally and fold the forearm inward,
-    # placing the wrist near the side of the head. Stage 3
-    # (_GESTURES["salute"]) adjusts only wrist yaw into the final orientation.
-    _SALUTE_ELBOW = [-10, 90, 60, -130, 0, 0, 0]
-
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._pub_node = Node("tianyi2_arm_gesture_pub", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._pub_node)
@@ -1509,7 +1504,6 @@ class ArmGesturePlugin:
         if action == "salute":
             frames = [
                 (self._PREPARE_POSES[action], 0.0, 0.90),
-                (self._SALUTE_ELBOW, 0.0, 0.90),
                 (pose, 1.1, 1.0),
             ]
         else:
