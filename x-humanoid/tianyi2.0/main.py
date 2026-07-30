@@ -107,6 +107,16 @@ class TianyiDeviceBundle:
             self._plugins.append(CameraPlugin(plugins_cfg["camera"], namespace, ros2))
             print("[bundle] CameraPlugin loaded")
 
+        for config_name, class_name in (("imu", "ImuPlugin"),
+                                        ("camera_depth", "DepthCameraPlugin"),
+                                        ("camera_pointcloud", "PointCloudPlugin")):
+            if plugins_cfg.get(config_name, {}).get("enabled", False):
+                from device import ImuPlugin, DepthCameraPlugin, PointCloudPlugin
+                plugin_class = {"ImuPlugin": ImuPlugin, "DepthCameraPlugin": DepthCameraPlugin,
+                                "PointCloudPlugin": PointCloudPlugin}[class_name]
+                self._plugins.append(plugin_class(plugins_cfg[config_name], namespace, ros2))
+                print(f"[bundle] {class_name} loaded")
+
         if plugins_cfg.get("asr", {}).get("enabled", False):
             from device import AsrPlugin
             self._plugins.append(AsrPlugin(plugins_cfg["asr"], namespace, ros2))
@@ -138,6 +148,11 @@ class TianyiDeviceBundle:
             self._plugins.append(WaistPlugin(plugins_cfg["waist"], namespace, ros2))
             print("[bundle] WaistPlugin loaded")
 
+        if plugins_cfg.get("leg", {}).get("enabled", False):
+            from device import LegPlugin
+            self._plugins.append(LegPlugin(plugins_cfg["leg"], namespace, ros2))
+            print("[bundle] LegPlugin loaded")
+
         if plugins_cfg.get("hand", {}).get("enabled", False):
             from device import HandPlugin
             self._plugins.append(HandPlugin(plugins_cfg["hand"], namespace, ros2))
@@ -157,6 +172,16 @@ class TianyiDeviceBundle:
             from device import ChatPlugin
             self._plugins.append(ChatPlugin(plugins_cfg["chat"], namespace, ros2))
             print("[bundle] ChatPlugin loaded")
+
+        if plugins_cfg.get("lyre_event", {}).get("enabled", False):
+            from device import LyreEventPlugin
+            self._plugins.append(LyreEventPlugin(plugins_cfg["lyre_event"], namespace, ros2))
+            print("[bundle] LyreEventPlugin loaded")
+
+        if plugins_cfg.get("llm", {}).get("enabled", False):
+            from device import LlmPlugin
+            self._plugins.append(LlmPlugin(plugins_cfg["llm"], namespace, ros2))
+            print("[bundle] LlmPlugin loaded")
 
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
@@ -202,6 +227,7 @@ class TianyiDeviceBundle:
 # ── MCP HTTP server ───────────────────────────────────────────────────────────
 
 _bundle: TianyiDeviceBundle | None = None
+_server_name = "tianyi2-device-bundle"
 
 
 def make_handler():
@@ -265,7 +291,7 @@ def make_handler():
                     ok({
                         "protocolVersion": "2024-11-05",
                         "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "tianyi2-device-bundle", "version": "1.0.0"},
+                        "serverInfo": {"name": _server_name, "version": "1.0.0"},
                     })
                 elif method == "tools/list":
                     ok({"tools": _bundle.get_all_tools()})
@@ -332,11 +358,12 @@ def _start_registration(mcp_port: int, name: str, category: str):
 
 
 def main():
-    global _bundle
+    global _bundle, _server_name
 
     cfg       = _load_config()
     namespace = _resolve_namespace(cfg)
-    mcp_port  = int(cfg.get("mcp_port", 15707))
+    mcp_port  = int(cfg.get("mcp_port", 15708))
+    _server_name = cfg.get("mcp_server_name", "tianyi2-device-bundle")
 
     print(f"[bundle] namespace={namespace} mcp_port={mcp_port}")
 
