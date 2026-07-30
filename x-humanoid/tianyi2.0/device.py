@@ -1034,39 +1034,6 @@ class ImuPlugin(_JsonSensor):
         return {"state": "running" if self._running else "idle"}
 
 
-class HandStatePlugin(_JsonSensor):
-    """Bridge both Inspire hands' feedback and error arrays."""
-    def __init__(self, plugin_config, namespace, ros2):
-        self._running, self._lock = False, threading.Lock()
-        self._state = {"left": {}, "right": {}}
-        self._topic = f"/{namespace}/state/hand"
-        self._sub_node = Node("tianyi2_hand_state_sub", context=ros2.ctx_tianyi)
-        self._pub_node = Node("tianyi2_hand_state_pub", context=ros2.ctx_core)
-        ros2.executor_tianyi.add_node(self._sub_node); ros2.executor_core.add_node(self._pub_node)
-        self._pub = self._pub_node.create_publisher(String, self._topic, _LOW_LAT_QOS)
-
-    def get_tool(self): return self._tool("hand_state", "天轶2.0 灵巧手状态 — 双手六指位置、速度、电流与错误码")
-    def start(self):
-        from sensor_msgs.msg import JointState
-        from std_msgs.msg import UInt32MultiArray
-        self._running = True
-        for side in ("left", "right"):
-            self._sub_node.create_subscription(JointState, f"/inspire_hand/state/{side}_hand", lambda m, s=side: self._on_state(s, m), _RELIABLE_QOS)
-            self._sub_node.create_subscription(UInt32MultiArray, f"/inspire_hand/error/{side}_hand", lambda m, s=side: self._on_error(s, m), _RELIABLE_QOS)
-    def stop(self): self._running = False
-    def _on_state(self, side, msg):
-        with self._lock:
-            self._state[side].update({"name": list(msg.name), "position": list(msg.position), "velocity": list(msg.velocity), "effort": list(msg.effort)})
-        self._publish()
-    def _on_error(self, side, msg):
-        with self._lock: self._state[side]["errors"] = list(msg.data)
-        self._publish()
-    def _publish(self):
-        if not self._running: return
-        with self._lock: data = json.dumps(self._state)
-        out = String(); out.data = data; self._pub.publish(out)
-
-
 class DepthCameraPlugin:
     """Forward the newest Orbbec Z16 frame with no buffering or re-encoding."""
     def __init__(self, plugin_config, namespace, ros2):
@@ -1209,24 +1176,6 @@ class PointCloudPlugin:
         from std_msgs.msg import UInt8MultiArray
         out = UInt8MultiArray(); out.data = list(struct.pack("<II", 12, count) + packed); self._pub.publish(out)
     def dispatch(self, action, args): return {"state": "running" if self._running else "idle", "topic_out": [{"topic": self._topic, "format": self._format}]}
-
-
-class LightPlugin:
-    """Safe semantic system-light control; no raw vendor command is exposed."""
-    _commands = {"standby": 99, "service_wait": 20, "service_ready": 22, "warning": 12, "warning_clear": 13, "error": 10, "error_clear": 11}
-    def __init__(self, plugin_config, namespace, ros2):
-        self._pub_node = Node("tianyi2_light_pub", context=ros2.ctx_tianyi); ros2.executor_tianyi.add_node(self._pub_node); self._pub = None
-    def get_tool(self):
-        return {"name": "light", "type": "actuator", "description": "天轶2.0 系统状态灯效", "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": list(self._commands)}}, "required": ["action"], "x-action-params": {k: {"params": [], "description": k} for k in self._commands}}}
-    def start(self):
-        from bodyctrl_msgs.msg import LightCtrl
-        self._pub = self._pub_node.create_publisher(LightCtrl, "/xsys/light/ctrl", _RELIABLE_QOS)
-    def stop(self): pass
-    def dispatch(self, action, args):
-        if action not in self._commands: return {"error": f"unknown action: {action}"}
-        from bodyctrl_msgs.msg import LightCtrl
-        msg = LightCtrl(); msg.cmd = self._commands[action]; msg.caller_id = "phanthy-motus"; msg.caller_msg = f"Agent Core: {action}"; self._pub.publish(msg)
-        return {"state": action}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
