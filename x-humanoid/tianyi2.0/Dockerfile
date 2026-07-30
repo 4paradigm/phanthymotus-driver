@@ -12,7 +12,6 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
         cmake \
         build-essential \
         curl \
-        util-linux && \
     rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
