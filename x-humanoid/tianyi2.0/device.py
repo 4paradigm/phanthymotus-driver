@@ -554,10 +554,10 @@ class CameraPlugin:
 
         The camera runs on the host because it owns the USB device.  Each
         container start therefore makes the vendor startup script idempotently
-        request PointCloud2, accelerometer, and gyroscope streams before
-        ensuring the service is active.  This is deliberately runtime setup,
-        not a Docker build step: a Dockerfile cannot alter a new machine's
-        systemd service or access its camera.
+        request PointCloud2, accelerometer, gyroscope, and a 640x480 depth
+        profile before ensuring the service is active. This is deliberately
+        runtime setup, not a Docker build step: a Dockerfile cannot alter a
+        new machine's systemd service or access its camera.
         """
         import subprocess
         try:
@@ -594,7 +594,8 @@ class CameraPlugin:
         script = "/home/nvidia/data/scripts/start_orbbec_camera.sh"
         launch = "ros2 launch orbbec_camera head_330_ty.launch.py"
         desired = (f"{launch} enable_point_cloud:=true "
-                   "enable_accel:=true enable_gyro:=true")
+                   "enable_accel:=true enable_gyro:=true "
+                   "depth_width:=640 depth_height:=480 depth_fps:=30")
         updater = (
             "from pathlib import Path\n"
             f"path = Path({script!r})\n"
@@ -620,7 +621,7 @@ class CameraPlugin:
             check=True, capture_output=True, text=True, timeout=10)
         changed = result.stdout.strip() == "changed"
         if changed:
-            print("[CameraPlugin] enabled Orbbec point cloud, accel, and gyro streams")
+            print("[CameraPlugin] enabled Orbbec point cloud, IMU, and 640x480 depth stream")
         return changed
 
     def stop(self):
@@ -856,6 +857,11 @@ class DepthCameraPlugin:
     """
     def __init__(self, plugin_config, namespace, ros2):
         self._running = False; self._topic = f"/{namespace}/camera/head/depth"
+        # A 640x480 Z16 frame is 614 KiB. The dashboard's DDS → WebSocket
+        # path is intentionally latest-frame-only, but it still must not be
+        # fed faster than the browser can decode and paint it.
+        self._max_hz = max(1.0, min(float(plugin_config.get("hz", 8)), 15.0))
+        self._last_published_at = 0.0
         self._forwarded_frames = 0
         self._latest_image = None
         self._latest_image_lock = threading.Lock()
@@ -891,9 +897,11 @@ class DepthCameraPlugin:
         self._pub = self._pub_node.create_publisher(Image, self._topic, latest_qos)
         self._subscription = self._sub_node.create_subscription(
             Image, "/ob_camera_head/depth/image_raw", self._on_image, ingress_qos)
-        # Publish on the domain-42 executor.  30 Hz is a ceiling, not a frame
-        # rate target: the timer sends nothing until a newer source frame arrives.
+        # Poll separately from the output limit. When rate-limited the pending
+        # slot is retained and overwritten by new input, so the next output is
+        # always the freshest source frame rather than the oldest queued one.
         self._publish_timer = self._pub_node.create_timer(1.0 / 30.0, self._publish_latest)
+        print(f"[DepthCameraPlugin] forwarding newest Z16 frame at <= {self._max_hz:g} Hz")
     def stop(self):
         self._running = False
         with self._latest_image_lock:
@@ -911,15 +919,15 @@ class DepthCameraPlugin:
         if not self._running:
             return
         with self._latest_image_lock:
-            msg = self._latest_image
-            self._latest_image = None
+            if time.monotonic() - self._last_published_at < 1.0 / self._max_hz:
+                return
+            msg, self._latest_image = self._latest_image, None
         if msg is None:
             return
-        # Agent Core's current depth renderer consumes a raw, headerless
-        # 640x480 Z16 payload.  The Orbbec provides 1280x720, so center-crop
-        # it to 4:3 and resize with nearest-neighbour interpolation.  This
-        # preserves depth values (unlike linear interpolation) and keeps the
-        # ROS Image metadata exactly aligned with the byte payload.
+        # Agent Core consumes a raw 640x480 Z16 payload. The camera is now
+        # requested to produce that profile directly, avoiding an upstream
+        # 1280x720 DDS transfer and any local crop/resize work. Keep the
+        # 1280x720 conversion as a compatibility fallback for old profiles.
         dashboard = self._to_dashboard_depth(msg)
         if dashboard is None:
             return
@@ -931,6 +939,7 @@ class DepthCameraPlugin:
         out.height, out.width, out.encoding = 480, 640, "16UC1"
         out.is_bigendian, out.step, out.data = 0, 1280, dashboard.tobytes()
         self._pub.publish(out)
+        self._last_published_at = time.monotonic()
         self._forwarded_frames += 1
 
     def _to_dashboard_depth(self, msg):
@@ -946,6 +955,8 @@ class DepthCameraPlugin:
             return None
         # Respect source row stride before interpreting its pixels as uint16.
         depth = raw[:needed].reshape(height, step)[:, :width * 2].view(self._np.uint16).reshape(height, width)
+        if width == 640 and height == 480:
+            return depth
         if width * 3 > height * 4:  # 16:9 → centered 4:3 crop
             crop_width = height * 4 // 3
             left = (width - crop_width) // 2
@@ -960,10 +971,14 @@ class DepthCameraPlugin:
 
 
 class PointCloudPlugin:
-    """Pack and gravity-level Orbbec optical-frame points for Agent Core."""
+    """Pack gravity-levelled, floor-referenced Orbbec points for Agent Core."""
     _format = "sensor/pointcloud"
     def __init__(self, plugin_config, namespace, ros2):
         self._running = False; self._topic = f"/{namespace}/camera/head/points"; self._last = 0.0; self._intrinsics = None
+        # The renderer's horizontal grid is Y=0. Gravity alignment fixes the
+        # orientation but leaves the camera as the origin; shift upward by the
+        # head camera's floor height so the physical floor is at Y=0.
+        self._floor_offset_m = max(-3.0, min(float(plugin_config.get("floor_offset_m", 1.50)), 3.0))
         self._gravity_world = None; self._gravity_lock = threading.Lock()
         self._sub_node = Node("tianyi2_points_sub", context=ros2.ctx_tianyi); self._pub_node = Node("tianyi2_points_pub", context=ros2.ctx_core)
         ros2.executor_tianyi.add_node(self._sub_node); ros2.executor_core.add_node(self._pub_node)
@@ -1002,8 +1017,8 @@ class PointCloudPlugin:
         with self._gravity_lock: return self._gravity_world
 
     @staticmethod
-    def _to_renderer_frame(x, y, z, gravity=None):
-        """Map optical points to the renderer and align camera up with world up."""
+    def _to_renderer_frame(x, y, z, gravity=None, floor_offset_m=0.0):
+        """Map optical points to a gravity-levelled, floor-referenced renderer frame."""
         # Renderer map is (input_y, -input_z, -input_x), so this packed form
         # yields world (x, -y, -z): right, up, backward from optical raw XYZ.
         wx, wy, wz = x, -y, -z
@@ -1024,6 +1039,7 @@ class PointCloudPlugin:
                 wx += cross_x + factor * cross2_x
                 wy += cross_y + factor * cross2_y
                 wz += cross_z + factor * cross2_z
+        wy += floor_offset_m
         # Invert the renderer map above to pack the leveled world point.
         return -wz, wx, -wy
     def _on_cloud(self, msg):
@@ -1037,7 +1053,8 @@ class PointCloudPlugin:
             x = struct.unpack_from("<f", raw, base + fields["x"])[0]
             y = struct.unpack_from("<f", raw, base + fields["y"])[0]
             z = struct.unpack_from("<f", raw, base + fields["z"])[0]
-            packed.extend(struct.pack("<fff", *self._to_renderer_frame(x, y, z, gravity)))
+            packed.extend(struct.pack("<fff", *self._to_renderer_frame(
+                x, y, z, gravity, self._floor_offset_m)))
         from std_msgs.msg import UInt8MultiArray
         out = UInt8MultiArray(); out.data = list(packed); self._pub.publish(out)
     def _on_info(self, msg): self._intrinsics = (msg.k[0], msg.k[4], msg.k[2], msg.k[5])
@@ -1054,7 +1071,8 @@ class PointCloudPlugin:
                 if d == 0: continue
                 z = d / 1000.0
                 x, y = (u - cx) * z / fx, (v - cy) * z / fy
-                packed.extend(struct.pack("<fff", *self._to_renderer_frame(x, y, z, gravity))); count += 1
+                packed.extend(struct.pack("<fff", *self._to_renderer_frame(
+                    x, y, z, gravity, self._floor_offset_m))); count += 1
         if not count: return
         from std_msgs.msg import UInt8MultiArray
         out = UInt8MultiArray(); out.data = list(struct.pack("<II", 12, count) + packed); self._pub.publish(out)
@@ -1324,117 +1342,6 @@ class NavStatePlugin:
         if action in ("start", "stop", "info"):
             return {"state": "running" if self._running else "idle",
                     "topic_out": [{"topic": self._topic, "format": "data/json"}]}
-        return {"state": "running"}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Lidar2DPlugin (sensor)
-# ══════════════════════════════════════════════════════════════════════════════
-
-class Lidar2DPlugin:
-    """Slamtec 2D laser-scan card.
-
-    The chassis REST endpoint returns polar points as ``angle`` (radians),
-    ``distance`` (metres), and ``valid``.  Agent Core's lidar card consumes a
-    JSON String topic, therefore this plugin turns them into robot-frame x/y
-    metres before publishing into the Domain 42 data bus.
-    """
-
-    def __init__(self, plugin_config: dict, namespace: str, ros2, slamtec_client):
-        self._slamtec = slamtec_client
-        self._topic = f"/{namespace}/sensor/lidar_2d"
-        self._hz = max(1.0, min(float(plugin_config.get("hz", 10)), 15.0))
-        self._max_points = max(100, min(int(plugin_config.get("max_points", 1440)), 3000))
-        self._running = False
-        self._last_frame: dict = {"timestamp_ms": 0, "points": [], "point_count": 0}
-
-        self._pub_node = Node("tianyi2_lidar_2d_pub", context=ros2.ctx_core)
-        ros2.executor_core.add_node(self._pub_node)
-        self._pub = self._pub_node.create_publisher(String, self._topic, _LOW_LAT_QOS)
-
-    def get_tool(self) -> dict:
-        return {
-            "name": "lidar_2d",
-            "type": "sensor",
-            "description": "思岚底盘二维激光雷达：实时极坐标扫描转换为底盘坐标系 x/y 点云",
-            "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._topic, "format": "sensor/lidar-2d"}],
-        }
-
-    def start(self):
-        if self._running:
-            return
-        self._running = True
-        self._thread = threading.Thread(target=self._poll_loop, daemon=True, name="tianyi-lidar-2d")
-        self._thread.start()
-        print(f"[Lidar2DPlugin] polling {self._topic} at {self._hz:g}Hz")
-
-    def stop(self):
-        self._running = False
-
-    def _to_frame(self, scan: dict) -> dict:
-        raw_points = scan.get("laser_points", []) if isinstance(scan, dict) else []
-        valid_points = []
-        for point in raw_points:
-            if not isinstance(point, dict) or not point.get("valid", False):
-                continue
-            try:
-                angle = float(point["angle"])
-                distance = float(point["distance"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            if not (math.isfinite(angle) and math.isfinite(distance) and distance > 0.0):
-                continue
-            valid_points.append({"x": round(distance * math.cos(angle), 4),
-                                 "y": round(distance * math.sin(angle), 4)})
-
-        # Preserve the complete angular field-of-view while bounding payload and UI work.
-        if len(valid_points) > self._max_points:
-            stride = math.ceil(len(valid_points) / self._max_points)
-            valid_points = valid_points[::stride]
-
-        return {
-            "timestamp_ms": int(time.time() * 1000),
-            "frame_id": "laser",
-            "source": "slamtec_rest:/api/core/system/v1/laserscan",
-            "points": valid_points,
-            "point_count": len(valid_points),
-            "raw_point_count": len(raw_points),
-        }
-
-    def _poll_loop(self):
-        interval = 1.0 / self._hz
-        while self._running:
-            started = time.monotonic()
-            try:
-                frame = self._to_frame(self._slamtec.get_laser_scan())
-                self._last_frame = frame
-                msg = String()
-                msg.data = json.dumps(frame, separators=(",", ":"))
-                self._pub.publish(msg)
-            except Exception as e:
-                print(f"[Lidar2DPlugin] scan read failed: {e}")
-            time.sleep(max(0.0, interval - (time.monotonic() - started)))
-
-    def dispatch(self, action: str, args: dict):
-        if action == "info":
-            # Older Agent Core releases discover and register topic streams
-            # exclusively from the result of an ``info`` call. Do not return
-            # the bare point list here, otherwise the topic is invisible to
-            # the dashboard's DDS/WebSocket bridge.
-            return {
-                "state": "running" if self._running else "idle",
-                "data": self._last_frame,
-                "topic_out": [{"topic": self._topic, "format": "sensor/lidar-2d"}],
-            }
-        if action in ("start", "read", "get", "lidar_2d"):
-            # The deployed Agent Core lidar renderer only consumes
-            # ``mcp_result.payload.result`` when it is a bare [{x, y}, ...]
-            # array. Keep the richer metadata on the DDS topic, but return
-            # the renderer-compatible snapshot for the card's MCP action.
-            return list(self._last_frame["points"])
-        if action == "stop":
-            return {"state": "idle"}
         return {"state": "running"}
 
 
