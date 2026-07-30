@@ -14,18 +14,19 @@ plugins:
     enabled: true
   camera_depth:
     enabled: true
+    # Raw 640x480 Z16 is 614 KiB/frame. Keep the dashboard stream below the
+    # browser/DDS forwarding budget and always display the newest frame.
+    hz: 8
   camera_pointcloud:
     enabled: true
+    # Head camera height above the floor. The point-cloud renderer uses Y=0
+    # as its grid plane, so raise the gravity-levelled cloud by this amount
+    # to place the physical floor on that plane.
+    floor_offset_m: 1.50
   asr:
     enabled: true
   nav_state:
     enabled: true
-  lidar_2d:
-    enabled: true
-    # Slamtec REST laser scan defaults to 10 Hz. Keep the visual card bounded
-    # so it remains responsive over the DDS → Agent Core WebSocket path.
-    hz: 10
-    max_points: 1440
   head:
     enabled: true
   arm:
