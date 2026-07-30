@@ -1566,17 +1566,17 @@ class ArmGesturePlugin:
     # 沿前臂轴线的旋转。右臂由 _publish_pose 按横向关节自动镜像。
     _GESTURES = {
         "wave": [-10, 60, -10, -100, 0, 10, 0],
-        "salute": [-35, 38, -32, -125, 0, 30, 15],
-        "welcome": [-15, 40, -5, -75, 0, 35, 0],
+        "salute": [-35, 65, -40, -125, 0, 30, 15],
+        "welcome": [-15, 40, -5, -75, 0, 35, 55],
         "raise": [-10, 110, -5, -35, 0, 10, 0],
     }
     _PREPARE_POSES = {
         "wave": [-5, 35, -5, -60, 0, 5, 0],
-        "salute": [-15, 30, -10, -70, 0, 10, 0],
-        "welcome": [-10, 25, 0, -45, 0, 20, 0],
+        "salute": [-15, 40, -10, -70, 0, 10, 0],
+        "welcome": [-10, 25, 0, -45, 0, 20, 30],
         "raise": [-5, 60, 0, -45, 0, 5, 0],
     }
-    _SALUTE_APPROACH = [-25, 42, -20, -105, 0, 20, 8]
+    _SALUTE_APPROACH = [-25, 55, -25, -105, 0, 20, 10]
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._pub_node = Node("tianyi2_arm_gesture_pub", context=ros2.ctx_tianyi)
@@ -1663,6 +1663,12 @@ class ArmGesturePlugin:
         side = args.get("side", "right")
         if side not in ("left", "right", "both"):
             return {"error": "side must be left, right or both"}
+        if action == "salute" and side == "both":
+            return {
+                "state": "error",
+                "error": "salute only supports one arm at a time to avoid head/arm interference",
+                "code": "unsafe_bilateral_salute",
+            }
         speed = _clamp(args.get("speed", 0.5), 0.2, 1.5)
         if action == "reset":
             self._sequence.cancel()
@@ -1712,16 +1718,14 @@ class ArmGesturePlugin:
                     wave_pose[6] = 20
                 frames.append((wave_pose, 0.6))
         elif action == "welcome":
-            # Keep the palm lifted with wrist pitch, and wave it at chest
-            # height using a smaller shoulder-yaw/wrist-roll sweep than wave.
+            # Keep wrist roll fixed so the palm stays upright and faces
+            # forward, then use wrist pitch alone for a gentle welcoming wave.
             for i in range(cycles * 2):
                 welcome_pose = list(pose)
                 if i % 2 == 0:
-                    welcome_pose[2] = -15
-                    welcome_pose[6] = -25
+                    welcome_pose[5] = 20
                 else:
-                    welcome_pose[2] = 5
-                    welcome_pose[6] = 25
+                    welcome_pose[5] = 50
                 frames.append((welcome_pose, 0.55))
         frames.append((self._NEUTRAL, 1.0))
 
