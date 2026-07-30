@@ -21,6 +21,7 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   HeadPlugin       (actuator)           — 头部3DOF控制
   ArmPlugin        (actuator)           — 双臂14DOF控制
   WaistPlugin      (actuator)           — 腰部2DOF控制
+  LegPlugin        (actuator)           — 腿部2DOF控制
   HandPlugin       (actuator)           — 灵巧手控制
   TtsPlugin        (actuator)           — 语音合成
   NavPlugin        (actuator)           — 底盘导航控制
@@ -120,8 +121,8 @@ _JOINT_LIMITS = {
     31: (-160,   180,   30,  31.0),
     32: (-45,    120,   37.5, 82.0),
     # 左腿
-    51: (-13,    80,    37.5, 35.0),
-    52: (-26,    160,   37.5, 35.0),
+    51: (-40,    5,     37.5, 5.0),
+    52: (-23,    20,    37.5, 5.0),
 }
 
 
@@ -482,25 +483,78 @@ class CameraPlugin:
             print(f"[CameraPlugin] WARNING: import failed ({e})")
 
     def _ensure_orbbec_service(self):
-        """Ensure orbbec_head.service is running. Use nsenter to access host systemd."""
+        """Configure and start the host's Orbbec service through ``nsenter``.
+
+        The camera runs on the host because it owns the USB device.  Each
+        container start therefore makes the vendor startup script idempotently
+        request PointCloud2, accelerometer, and gyroscope streams before
+        ensuring the service is active.  This is deliberately runtime setup,
+        not a Docker build step: a Dockerfile cannot alter a new machine's
+        systemd service or access its camera.
+        """
         import subprocess
         try:
+            changed = self._configure_orbbec_startup()
             # Use nsenter to run systemctl on host PID 1's namespace
             result = subprocess.run(
                 ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--",
                  "systemctl", "is-active", "orbbec_head.service"],
                 capture_output=True, text=True, timeout=5)
-            if result.stdout.strip() == "active":
+            if result.stdout.strip() == "active" and not changed:
                 print("[CameraPlugin] orbbec_head.service already active")
                 return
-            # Start it
+            # Restart applies a changed host startup script; start handles an
+            # inactive service without unnecessarily interrupting a live one.
+            action = "restart" if result.stdout.strip() == "active" else "start"
             subprocess.run(
                 ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--",
-                 "systemctl", "start", "orbbec_head.service"],
-                capture_output=True, text=True, timeout=10)
-            print("[CameraPlugin] orbbec_head.service started via nsenter")
+                 "systemctl", action, "orbbec_head.service"],
+                check=True, capture_output=True, text=True, timeout=15)
+            print(f"[CameraPlugin] orbbec_head.service {action}ed via nsenter")
         except Exception as e:
             print(f"[CameraPlugin] WARNING: could not start orbbec service ({e})")
+
+    @staticmethod
+    def _configure_orbbec_startup():
+        """Enable the Orbbec streams in the host vendor startup script.
+
+        This only changes the ``headty`` launch command and is idempotent, so
+        it is safe to execute every time a freshly-created driver container
+        starts.  The host path matches Tianyi's factory service definition.
+        """
+        import subprocess
+
+        script = "/home/nvidia/data/scripts/start_orbbec_camera.sh"
+        launch = "ros2 launch orbbec_camera head_330_ty.launch.py"
+        desired = (f"{launch} enable_point_cloud:=true "
+                   "enable_accel:=true enable_gyro:=true")
+        updater = (
+            "from pathlib import Path\n"
+            f"path = Path({script!r})\n"
+            "lines = path.read_text().splitlines(keepends=True)\n"
+            f"launch = {launch!r}\n"
+            f"desired = {desired!r}\n"
+            "for index, line in enumerate(lines):\n"
+            "    if line.lstrip().startswith(launch):\n"
+            "        updated = line[:len(line) - len(line.lstrip())] + desired + '\\n'\n"
+            "        if line == updated:\n"
+            "            print('unchanged')\n"
+            "        else:\n"
+            "            lines[index] = updated\n"
+            "            path.write_text(''.join(lines))\n"
+            "            print('changed')\n"
+            "        break\n"
+            "else:\n"
+            "    raise SystemExit('headty Orbbec launch command not found')\n"
+        )
+        result = subprocess.run(
+            ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--",
+             "python3", "-c", updater],
+            check=True, capture_output=True, text=True, timeout=10)
+        changed = result.stdout.strip() == "changed"
+        if changed:
+            print("[CameraPlugin] enabled Orbbec point cloud, accel, and gyro streams")
+        return changed
 
     def stop(self):
         self._running = False
@@ -570,7 +624,7 @@ class _JsonSensor:
 
 
 class ImuPlugin(_JsonSensor):
-    """Bridge Tianyi's vendor and standard ROS IMU streams to Agent Core."""
+    """Bridge the head Orbbec camera's accelerometer and gyroscope to Agent Core."""
     def __init__(self, plugin_config, namespace, ros2):
         self._running = False
         self._topic = f"/{namespace}/state/imu"
@@ -579,8 +633,13 @@ class ImuPlugin(_JsonSensor):
             "available": False,
             "timestamp_ms": int(time.time() * 1000),
             "source": None,
+            "reason": "waiting_for_upstream_imu",
         }
         self._subscriptions = []  # Keep rclpy subscriptions alive for the plugin lifetime.
+        self._camera_acceleration = None
+        self._camera_acceleration_timestamp_ms = None
+        self._camera_angular_velocity = None
+        self._camera_angular_velocity_timestamp_ms = None
         self._sub_node = Node("tianyi2_imu_sub", context=ros2.ctx_tianyi)
         self._pub_node = Node("tianyi2_imu_pub", context=ros2.ctx_core)
         ros2.executor_tianyi.add_node(self._sub_node)
@@ -588,90 +647,102 @@ class ImuPlugin(_JsonSensor):
         self._pub = self._pub_node.create_publisher(String, self._topic, _LOW_LAT_QOS)
 
     def get_tool(self):
-        tool = self._tool("imu", "天轶2.0 IMU — 姿态、欧拉角、角速度、线加速度与错误码")
+        tool = self._tool("imu", "天轶2.0 头部 Orbbec IMU — 相机实际加速度与角速度")
         tool["multiInstance"] = False
         return tool
 
     def start(self):
-        """Subscribe to both IMU interfaces used by Tianyi deployments.
+        """Subscribe to the Orbbec streams enabled by ``orbbec_head.service``.
 
-        The body controller publishes ``bodyctrl_msgs/Imu`` on ``/imu/status``
-        on some images, while other images expose the standard
-        ``sensor_msgs/Imu`` stream on ``/imu/data``.  Sensor publishers are
-        normally BEST_EFFORT, so a reliable subscription silently receives no
-        samples.  The low-latency QoS matches either sensor stream.
+        Orbbec publishes acceleration and angular velocity separately as
+        ``sensor_msgs/Imu``.  These sensor publishers use BEST_EFFORT QoS, so
+        the domain-0 subscription must use the matching low-latency profile.
+        Only fields physically supplied by either stream are forwarded to the
+        Agent Core card; no synthetic orientation, Euler angle, or zero values
+        are emitted.
         """
-        from bodyctrl_msgs.msg import Imu
         from sensor_msgs.msg import Imu as RosImu
         self._running = True
         self._subscriptions = [
             self._sub_node.create_subscription(
-                Imu, "/imu/status", self._on_vendor_imu, _LOW_LAT_QOS),
+                RosImu, "/ob_camera_head/accel/sample", self._on_camera_accel, _LOW_LAT_QOS),
             self._sub_node.create_subscription(
-                RosImu, "/imu/data", self._on_ros_imu, _LOW_LAT_QOS),
+                RosImu, "/ob_camera_head/gyro/sample", self._on_camera_gyro, _LOW_LAT_QOS),
         ]
-        print("[ImuPlugin] subscribed: /imu/status (bodyctrl_msgs/Imu), /imu/data (sensor_msgs/Imu)")
+        # Match StatePlugin/force_sensor behaviour: publish a snapshot even
+        # while the vendor IMU stream is unavailable, so Agent Core renders a
+        # useful card state instead of an empty panel.
+        self._pub_thread = threading.Thread(target=self._publish_snapshot_loop, daemon=True)
+        self._pub_thread.start()
+        print("[ImuPlugin] subscribed: /ob_camera_head/accel/sample, /ob_camera_head/gyro/sample")
 
     def stop(self):
         self._running = False
 
-    def _publish(self, orientation, angular_velocity, linear_acceleration, euler, error=0, source=None):
-        # The dashboard only needs the latest state.  Bound forwarding to 30 Hz
+    def _publish_camera_imu(self):
+        """Publish only the samples actually received from the camera."""
+        if not self._running:
+            return
+        timestamps = [ts for ts in (
+            self._camera_acceleration_timestamp_ms,
+            self._camera_angular_velocity_timestamp_ms,
+        ) if ts is not None]
+        if not timestamps:
+            return
+        payload = {"available": True, "timestamp_ms": max(timestamps)}
+        if self._camera_acceleration is not None:
+            payload["linear_acceleration"] = self._camera_acceleration
+        if self._camera_angular_velocity is not None:
+            payload["angular_velocity"] = self._camera_angular_velocity
+        self._latest = payload
+
+        # The dashboard only needs the latest state.  Bound transport to 30 Hz
         # so a high-rate IMU cannot congest the domain-42 bridge.
         now = time.monotonic()
-        if not self._running or now - self._last_pub < 1.0 / 30.0:
+        if now - self._last_pub < 1.0 / 30.0:
             return
         self._last_pub = now
-        self._latest = {
-            "available": True,
-            "timestamp_ms": int(time.time() * 1000),
-            "source": source,
-            "orientation": orientation,
-            "euler": euler,
-            "angular_velocity": angular_velocity,
-            "linear_acceleration": linear_acceleration,
-            "error": error,
-        }
         out = String()
         out.data = json.dumps(self._latest)
         self._pub.publish(out)
 
-    def _on_vendor_imu(self, msg):
-        self._publish(
-            {"x": msg.orientation.x, "y": msg.orientation.y, "z": msg.orientation.z, "w": msg.orientation.w},
-            {"x": msg.angular_velocity.x, "y": msg.angular_velocity.y, "z": msg.angular_velocity.z},
-            {"x": msg.linear_acceleration.x, "y": msg.linear_acceleration.y, "z": msg.linear_acceleration.z},
-            {"roll": msg.euler.roll, "pitch": msg.euler.pitch, "yaw": msg.euler.yaw},
-            msg.error,
-            source="/imu/status",
-        )
+    def _publish_snapshot_loop(self):
+        while self._running:
+            snapshot = dict(self._latest)
+            snapshot["timestamp_ms"] = int(time.time() * 1000)
+            out = String()
+            out.data = json.dumps(snapshot)
+            self._pub.publish(out)
+            time.sleep(0.5)
 
-    def _on_ros_imu(self, msg):
-        q = msg.orientation
-        # Standard sensor_msgs/Imu has no Euler field; derive it from its
-        # quaternion so both source topics produce the same card payload.
-        sinr_cosp = 2.0 * (q.w * q.x + q.y * q.z)
-        cosr_cosp = 1.0 - 2.0 * (q.x * q.x + q.y * q.y)
-        sinp = 2.0 * (q.w * q.y - q.z * q.x)
-        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
-        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-        self._publish(
-            {"x": q.x, "y": q.y, "z": q.z, "w": q.w},
-            {"x": msg.angular_velocity.x, "y": msg.angular_velocity.y, "z": msg.angular_velocity.z},
-            {"x": msg.linear_acceleration.x, "y": msg.linear_acceleration.y, "z": msg.linear_acceleration.z},
-            {"roll": math.atan2(sinr_cosp, cosr_cosp),
-             "pitch": math.asin(max(-1.0, min(1.0, sinp))),
-             "yaw": math.atan2(siny_cosp, cosy_cosp)},
-            source="/imu/data",
-        )
+    def _on_camera_accel(self, msg):
+        self._camera_acceleration = {
+            "x": msg.linear_acceleration.x,
+            "y": msg.linear_acceleration.y,
+            "z": msg.linear_acceleration.z,
+        }
+        self._camera_acceleration_timestamp_ms = (
+            msg.header.stamp.sec * 1000 + msg.header.stamp.nanosec // 1_000_000)
+        self._publish_camera_imu()
+
+    def _on_camera_gyro(self, msg):
+        self._camera_angular_velocity = {
+            "x": msg.angular_velocity.x,
+            "y": msg.angular_velocity.y,
+            "z": msg.angular_velocity.z,
+        }
+        self._camera_angular_velocity_timestamp_ms = (
+            msg.header.stamp.sec * 1000 + msg.header.stamp.nanosec // 1_000_000)
+        self._publish_camera_imu()
 
     def dispatch(self, action, args):
-        if action in ("info", "read", "get", "imu"):
-            return {
-                "state": "running" if self._running else "idle",
-                "data": self._latest,
-                "topic_out": [{"topic": self._topic, "format": self._format}],
-            }
+        if action in ("read", "get", "imu"):
+            # Keep sensor values at the top level like StatePlugin's
+            # force_sensor, which Agent Core renders directly.
+            return dict(self._latest)
+        if action == "info":
+            return {"state": "running" if self._running else "idle",
+                    "topic_out": [{"topic": self._topic, "format": self._format}]}
         return {"state": "running" if self._running else "idle"}
 
 
@@ -709,9 +780,20 @@ class HandStatePlugin(_JsonSensor):
 
 
 class DepthCameraPlugin:
-    """Forward the Orbbec Z16 depth image without conversion or re-encoding."""
+    """Bridge only the newest Orbbec Z16 frame to Agent Core.
+
+    Depth frames are large and the dashboard only needs the current image.  The
+    domain-0 callback therefore never serializes or publishes a frame: it only
+    replaces the pending frame.  A domain-42 timer publishes that newest frame,
+    so a slow DDS consumer cannot make the input executor drain stale images.
+    """
     def __init__(self, plugin_config, namespace, ros2):
         self._running = False; self._topic = f"/{namespace}/camera/head/depth"
+        self._forwarded_frames = 0
+        self._latest_image = None
+        self._latest_image_lock = threading.Lock()
+        self._subscription = None
+        self._publish_timer = None
         self._sub_node = Node("tianyi2_depth_sub", context=ros2.ctx_tianyi)
         self._pub_node = Node("tianyi2_depth_pub", context=ros2.ctx_core)
         ros2.executor_tianyi.add_node(self._sub_node); ros2.executor_core.add_node(self._pub_node)
@@ -720,26 +802,76 @@ class DepthCameraPlugin:
                 "inputSchema": {"type": "object", "properties": {}}, "topic_out": [{"topic": self._topic, "format": "image/depth-z16"}]}
     def start(self):
         from sensor_msgs.msg import Image
-        self._running = True; self._pub = self._pub_node.create_publisher(Image, self._topic, _LOW_LAT_QOS)
-        self._sub_node.create_subscription(Image, "/ob_camera_head/depth/image_raw", self._on_image, _RELIABLE_QOS)
-    def stop(self): self._running = False
+        latest_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        # The vendor publisher is RELIABLE.  Keep that compatible policy at
+        # ingress, but retain only one unread sample instead of the generic
+        # ten-message sensor queue.
+        ingress_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self._running = True
+        self._pub = self._pub_node.create_publisher(Image, self._topic, latest_qos)
+        self._subscription = self._sub_node.create_subscription(
+            Image, "/ob_camera_head/depth/image_raw", self._on_image, ingress_qos)
+        # Publish on the domain-42 executor.  30 Hz is a ceiling, not a frame
+        # rate target: the timer sends nothing until a newer source frame arrives.
+        self._publish_timer = self._pub_node.create_timer(1.0 / 30.0, self._publish_latest)
+    def stop(self):
+        self._running = False
+        with self._latest_image_lock:
+            self._latest_image = None
+
     def _on_image(self, msg):
-        if self._running and msg.encoding in ("16UC1", "mono16"): self._pub.publish(msg)
+        if not self._running or msg.encoding not in ("16UC1", "mono16"): return
+        # Never block the domain-0 executor on serialization or a slow
+        # domain-42 consumer.  Replacing this reference deliberately drops any
+        # stale frame that has not yet been published.
+        with self._latest_image_lock:
+            self._latest_image = msg
+
+    def _publish_latest(self):
+        if not self._running:
+            return
+        with self._latest_image_lock:
+            msg = self._latest_image
+            self._latest_image = None
+        if msg is None:
+            return
+        # Rebuild the message for the independent domain-42 context.  This is
+        # a raw Z16 copy; it does not convert or re-encode the depth image.
+        from sensor_msgs.msg import Image
+        out = Image()
+        out.header = msg.header
+        out.height, out.width, out.encoding = msg.height, msg.width, msg.encoding
+        out.is_bigendian, out.step, out.data = msg.is_bigendian, msg.step, msg.data
+        self._pub.publish(out)
+        self._forwarded_frames += 1
+        if self._forwarded_frames % 30 == 1:
+            print(f"[DepthCameraPlugin] forwarded {self._forwarded_frames} latest Z16 frames")
     def dispatch(self, action, args):
         return {"state": "running" if self._running else "idle", "topic_out": [{"topic": self._topic, "format": "image/depth-z16"}]}
 
 
 class PointCloudPlugin:
-    """Pack Orbbec optical-frame points in Agent Core's renderer convention."""
+    """Pack and gravity-level Orbbec optical-frame points for Agent Core."""
     _format = "sensor/pointcloud"
     def __init__(self, plugin_config, namespace, ros2):
         self._running = False; self._topic = f"/{namespace}/camera/head/points"; self._last = 0.0; self._intrinsics = None
+        self._gravity_world = None; self._gravity_lock = threading.Lock()
         self._sub_node = Node("tianyi2_points_sub", context=ros2.ctx_tianyi); self._pub_node = Node("tianyi2_points_pub", context=ros2.ctx_core)
         ros2.executor_tianyi.add_node(self._sub_node); ros2.executor_core.add_node(self._pub_node)
     def get_tool(self):
         return {"name": "camera_pointcloud", "type": "sensor", "description": "天轶2.0 Orbbec 头部彩色点云（限频、限点）", "inputSchema": {"type": "object", "properties": {}}, "topic_out": [{"topic": self._topic, "format": self._format}]}
     def start(self):
-        from sensor_msgs.msg import PointCloud2, Image, CameraInfo
+        from sensor_msgs.msg import PointCloud2, Image, CameraInfo, Imu
         from std_msgs.msg import UInt8MultiArray
         self._running = True; self._pub = self._pub_node.create_publisher(UInt8MultiArray, self._topic, _LOW_LAT_QOS)
         self._sub_node.create_subscription(PointCloud2, "/ob_camera_head/depth/points", self._on_cloud, _LOW_LAT_QOS)
@@ -747,28 +879,66 @@ class PointCloudPlugin:
         # point-cloud stream is disabled.  This fallback keeps the card live.
         self._sub_node.create_subscription(CameraInfo, "/ob_camera_head/depth/camera_info", self._on_info, _RELIABLE_QOS)
         self._sub_node.create_subscription(Image, "/ob_camera_head/depth/image_raw", self._on_depth, _LOW_LAT_QOS)
+        self._sub_node.create_subscription(Imu, "/ob_camera_head/accel/sample", self._on_accel, _LOW_LAT_QOS)
     def stop(self): self._running = False
-    @staticmethod
-    def _to_renderer_frame(x, y, z):
-        """Map optical (right, down, forward) to Agent Core's LiDAR input frame.
+    def _on_accel(self, msg):
+        """Estimate display-frame up from the camera's stationary IMU vector."""
+        # Optical raw coordinates are (right, down, forward); the renderer's
+        # world coordinates are (right, up, backward) before leveling.
+        g = (msg.linear_acceleration.x, -msg.linear_acceleration.y, -msg.linear_acceleration.z)
+        magnitude = math.sqrt(sum(v * v for v in g))
+        if not 8.0 <= magnitude <= 11.5: return  # reject dynamic acceleration
+        g = tuple(v / magnitude for v in g)
+        with self._gravity_lock:
+            previous = self._gravity_world
+            if previous is None:
+                self._gravity_world = g
+            else:
+                # Low-pass the gravity direction to avoid point-cloud wobble.
+                mixed = tuple(0.95 * old + 0.05 * new for old, new in zip(previous, g))
+                norm = math.sqrt(sum(v * v for v in mixed))
+                self._gravity_world = tuple(v / norm for v in mixed)
 
-        The dashboard renders input as (display_x, display_y, display_z) =
-        (input_y, -input_z, -input_x).  Packing (z, x, y) therefore yields
-        (x, -y, -z): right, up, forward in the dashboard's XZ ground plane.
-        """
-        return z, x, y
+    def _gravity_snapshot(self):
+        with self._gravity_lock: return self._gravity_world
+
+    @staticmethod
+    def _to_renderer_frame(x, y, z, gravity=None):
+        """Map optical points to the renderer and align camera up with world up."""
+        # Renderer map is (input_y, -input_z, -input_x), so this packed form
+        # yields world (x, -y, -z): right, up, backward from optical raw XYZ.
+        wx, wy, wz = x, -y, -z
+        if gravity is not None:
+            gx, gy, gz = gravity
+            # Rodrigues rotation taking measured up/gravity to world +Y.
+            vx, vy, vz = -gz, 0.0, gx  # gravity × (0, 1, 0)
+            sine_sq = vx * vx + vy * vy + vz * vz
+            cosine = gy
+            if sine_sq > 1e-8:
+                cross_x = vy * wz - vz * wy
+                cross_y = vz * wx - vx * wz
+                cross_z = vx * wy - vy * wx
+                cross2_x = vy * cross_z - vz * cross_y
+                cross2_y = vz * cross_x - vx * cross_z
+                cross2_z = vx * cross_y - vy * cross_x
+                factor = (1.0 - cosine) / sine_sq
+                wx += cross_x + factor * cross2_x
+                wy += cross_y + factor * cross2_y
+                wz += cross_z + factor * cross2_z
+        # Invert the renderer map above to pack the leveled world point.
+        return -wz, wx, -wy
     def _on_cloud(self, msg):
         if not self._running or time.monotonic() - self._last < 0.5: return
         fields = {f.name: f.offset for f in msg.fields}
         if not all(k in fields for k in ("x", "y", "z")): return
-        self._last = time.monotonic(); raw = bytes(msg.data); count = min(msg.width * msg.height, 10000)
+        self._last = time.monotonic(); raw = bytes(msg.data); count = min(msg.width * msg.height, 10000); gravity = self._gravity_snapshot()
         packed = bytearray(struct.pack("<II", 12, count))
         for i in range(count):
             base = i * msg.point_step
             x = struct.unpack_from("<f", raw, base + fields["x"])[0]
             y = struct.unpack_from("<f", raw, base + fields["y"])[0]
             z = struct.unpack_from("<f", raw, base + fields["z"])[0]
-            packed.extend(struct.pack("<fff", *self._to_renderer_frame(x, y, z)))
+            packed.extend(struct.pack("<fff", *self._to_renderer_frame(x, y, z, gravity)))
         from std_msgs.msg import UInt8MultiArray
         out = UInt8MultiArray(); out.data = list(packed); self._pub.publish(out)
     def _on_info(self, msg): self._intrinsics = (msg.k[0], msg.k[4], msg.k[2], msg.k[5])
@@ -777,7 +947,7 @@ class PointCloudPlugin:
         if msg.encoding not in ("16UC1", "mono16"): return
         fx, fy, cx, cy = self._intrinsics
         if fx <= 0 or fy <= 0: return
-        self._last = time.monotonic(); raw = bytes(msg.data); step = max(1, int(math.sqrt((msg.width * msg.height) / 10000)))
+        self._last = time.monotonic(); raw = bytes(msg.data); step = max(1, int(math.sqrt((msg.width * msg.height) / 10000))); gravity = self._gravity_snapshot()
         packed = bytearray(); count = 0
         for v in range(0, msg.height, step):
             for u in range(0, msg.width, step):
@@ -785,7 +955,7 @@ class PointCloudPlugin:
                 if d == 0: continue
                 z = d / 1000.0
                 x, y = (u - cx) * z / fx, (v - cy) * z / fy
-                packed.extend(struct.pack("<fff", *self._to_renderer_frame(x, y, z))); count += 1
+                packed.extend(struct.pack("<fff", *self._to_renderer_frame(x, y, z, gravity))); count += 1
         if not count: return
         from std_msgs.msg import UInt8MultiArray
         out = UInt8MultiArray(); out.data = list(struct.pack("<II", 12, count) + packed); self._pub.publish(out)
@@ -1299,11 +1469,11 @@ class ArmPlugin:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class WaistPlugin:
-    """腰部2DOF — move_pos / set_vel / set_zero (不支持 KP/KD)
+    """腰部2DOF — move_pos / set_zero (不支持 KP/KD)
 
-    兼容两种调用格式:
-      - 简化: {"action": "move_pos", "yaw": 30, "pitch": 10, "speed": 0.5, "current": 10.0}
-      - 标零: {"action": "set_zero", "joint_id": 31} 或 {"action": "set_zero", "joint_ids": [31, 32]}
+    调用格式:
+      - 位置控制: {"action": "move_pos", "yaw": 30, "pitch": 10, "speed": 0.5, "current": 10.0}
+      - 标零:   {"action": "set_zero"}  (等价于 move_pos yaw=0, pitch=0)
     """
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
@@ -1312,50 +1482,37 @@ class WaistPlugin:
         self._pub_node = Node("tianyi2_waist_cmd", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._pub_node)
         self._pub_pos = None
-        self._pub_vel = None
-        self._pub_zero = None
 
     def get_tool(self) -> dict:
         return {
             "name": "waist",
             "type": "actuator",
-            "description": "天轶2.0 腰部控制 — 2DOF (yaw: -160°~180°, pitch: -45°~120°), 位置/速度/标零",
+            "description": "天轶2.0 腰部控制 — 2DOF (yaw: -160°~180°, pitch: -45°~120°), 位置控制/标零",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["move_pos", "set_vel", "set_zero"],
+                    "action": {"type": "string", "enum": ["move_pos", "set_zero"],
                                "description": "控制模式"},
-                    "yaw": {"type": "number", "description": "偏航角(度), 范围[-160, 180]"},
-                    "pitch": {"type": "number", "description": "俯仰角(度), 范围[-45, 120]"},
+                    "yaw": {"type": "number", "description": "偏航角(度), 范围[-160, 180], 默认0"},
+                    "pitch": {"type": "number", "description": "俯仰角(度), 范围[-45, 120], 默认0"},
                     "speed": {"type": "number", "description": "运动速度(rad/s), 默认0.5"},
                     "current": {"type": "number", "description": "最大电流(A), 默认10.0"},
-                    "joints": {"type": "array", "items": {"type": "object"},
-                               "description": "set_vel 关节命令: [{name:31|32, spd_rad_s, cur_a?}]"},
-                    "joint_id": {"type": "integer", "enum": [31, 32],
-                                 "description": "标零单个关节ID (31=waist_yaw, 32=waist_pitch)"},
-                    "joint_ids": {"type": "array", "items": {"type": "integer"},
-                                  "description": "标零多个关节ID, e.g. [31, 32]"},
                 },
                 "required": ["action"],
                 "x-action-params": {
                     "move_pos": {"params": ["yaw", "pitch", "speed", "current"],
                                  "description": "位置模式: 移动腰部到指定角度(度)"},
-                    "set_vel":  {"params": ["joints"],
-                                 "description": "速度模式: joints=[{name, spd_rad_s, cur_a?}]"},
-                    "set_zero": {"params": ["joint_id", "joint_ids"],
-                                 "description": "标零: 支持单个 joint_id 或数组 joint_ids"},
+                    "set_zero": {"params": [],
+                                 "description": "标零: 等价于 move_pos yaw=0, pitch=0"},
                 },
             },
         }
 
     def start(self):
         try:
-            from bodyctrl_msgs.msg import CmdSetMotorPosition, CmdSetMotorSpeed
-            from std_msgs.msg import String as StdString
+            from bodyctrl_msgs.msg import CmdSetMotorPosition
             self._pub_pos  = self._pub_node.create_publisher(CmdSetMotorPosition, "/waist/cmd_pos", _RELIABLE_QOS)
-            self._pub_vel  = self._pub_node.create_publisher(CmdSetMotorSpeed, "/waist/cmd_vel", _RELIABLE_QOS)
-            self._pub_zero = self._pub_node.create_publisher(StdString, "/waist/cmd_set_zero", _RELIABLE_QOS)
-            print("[WaistPlugin] publishers created (/waist/cmd_pos, /waist/cmd_vel, /waist/cmd_set_zero)")
+            print("[WaistPlugin] publisher created (/waist/cmd_pos)")
         except ImportError as e:
             print(f"[WaistPlugin] WARNING: {e}")
 
@@ -1367,18 +1524,8 @@ class WaistPlugin:
             return self._send_pos(
                 args.get("yaw", 0), args.get("pitch", 0),
                 args.get("speed", 0.5), args.get("current", 10.0))
-        if action == "set_vel":
-            return self._send_vel(args.get("joints", []))
         if action == "set_zero":
-            # 兼容 joint_id (单值) 和 joint_ids (数组)
-            jid = args.get("joint_id", None)
-            jids = args.get("joint_ids", None)
-            if jids is not None:
-                return self._send_zero(jids)
-            elif jid is not None:
-                return self._send_zero([jid])
-            else:
-                return self._send_zero([31, 32])  # 默认标零两个关节
+            return self._send_pos(0, 0)
         if action in ("start", "info"):
             return {"state": "ready"}
         if action == "stop":
@@ -1414,46 +1561,126 @@ class WaistPlugin:
         except Exception as e:
             return {"ok": False, "code": "COMMUNICATION_ERROR", "message": str(e)}
 
-    def _send_vel(self, joints: list) -> dict:
-        """速度模式: 发布到 /waist/cmd_vel"""
-        if not self._pub_vel:
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LegPlugin (actuator)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class LegPlugin:
+    """腿部2DOF — move_pos / set_zero (不支持 KP/KD)
+
+    调用格式:
+      - 位置控制: {"action": "move_pos", "hip": 30, "knee": 60, "speed": 0.5, "current": 10.0}
+      - 标零:   {"action": "set_zero"}  (回到归零位姿 hip=5°, knee=-20°)
+    """
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._pub_node = Node("tianyi2_leg_cmd", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._pub_node)
+        self._pub_pos = None
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "leg",
+            "type": "actuator",
+            "description": "天轶2.0 腿部控制 — 2DOF (hip: -40°~5°, knee: -23°~20°), 位置控制/标零",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["move_pos", "set_zero", "set_height"],
+                               "description": "控制模式"},
+                    "hip": {"type": "number", "description": "髋关节俯仰角(度), 范围[-40, 5], 默认0"},
+                    "knee": {"type": "number", "description": "膝关节俯仰角(度), 范围[-23, 20], 默认0"},
+                    "height": {"type": "number", "description": "腿高度(0-100), 0=归零最低, 100=最高"},
+                    "speed": {"type": "number", "description": "运动速度(rad/s), 默认0.5"},
+                    "current": {"type": "number", "description": "最大电流(A), 默认5.0"},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "move_pos": {"params": ["hip", "knee", "speed"],
+                                 "description": "位置模式: 移动腿部到指定角度(度)"},
+                    "set_zero": {"params": [],
+                                 "description": "标零: 回到归零位姿 (hip=5°, knee=-20°)"},
+                    "set_height": {"params": ["height", "speed", "current"],
+                                   "description": "高度模式: 0=归零最低, 100=最高, 线性插值hip/knee"},
+                },
+            },
+        }
+
+    def start(self):
+        try:
+            from bodyctrl_msgs.msg import CmdSetMotorPosition
+            self._pub_pos = self._pub_node.create_publisher(CmdSetMotorPosition, "/leg/cmd_pos", _RELIABLE_QOS)
+            print("[LegPlugin] publisher created (/leg/cmd_pos)")
+        except ImportError as e:
+            print(f"[LegPlugin] WARNING: {e}")
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "move_pos":
+            return self._send_pos(
+                args.get("hip", 0), args.get("knee", 0),
+                args.get("speed", 0.5), args.get("current", 5.0))
+        if action == "set_zero":
+            return self._send_pos(5.0, -20.0)
+        if action == "set_height":
+            return self._send_height(
+                args.get("height", 0),
+                args.get("speed", 0.5), args.get("current", 5.0))
+        if action in ("start", "info"):
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        return {"ok": False, "code": "INVALID_ARGUMENT", "message": f"unknown action: {action}"}
+
+    # 高度→关节角度映射（实测四点线性插值）
+    # height 0 (归零):  hip=5°,  knee=-20°
+    # height 100 (最高): hip=-40°, knee=20°
+    @staticmethod
+    def _height_to_angles(height: float) -> tuple:
+        h = max(0.0, min(100.0, height)) / 100.0  # clamp to [0,1]
+        hip_deg = 5.0 - 45.0 * h    # 5 → -40
+        knee_deg = -20.0 + 40.0 * h  # -20 → 20
+        return hip_deg, knee_deg
+
+    def _send_height(self, height: float, speed_rad_s: float = 0.5, current_a: float = 5.0) -> dict:
+        hip_deg, knee_deg = self._height_to_angles(height)
+        result = self._send_pos(hip_deg, knee_deg, speed_rad_s, current_a)
+        result["height"] = max(0.0, min(100.0, height))
+        return result
+
+    def _send_pos(self, hip_deg: float, knee_deg: float, speed_rad_s: float = 0.5, current_a: float = 5.0) -> dict:
+        if not self._pub_pos:
             return {"ok": False, "code": "COMMUNICATION_ERROR", "message": "publisher not ready"}
         try:
-            from bodyctrl_msgs.msg import CmdSetMotorSpeed, SetMotorSpeed
-            msg = CmdSetMotorSpeed()
-            for j in joints:
-                mid = j.get("name")
-                if isinstance(mid, str):
-                    mid = 31 if "yaw" in mid.lower() else (32 if "pitch" in mid.lower() else int(mid))
-                if mid not in [31, 32]:
-                    return {"ok": False, "code": "INVALID_ARGUMENT",
-                            "message": f"unknown waist joint: {j.get('name')} (valid: 31/waist_yaw, 32/waist_pitch)"}
+            from bodyctrl_msgs.msg import CmdSetMotorPosition, SetMotorPosition
+            msg = CmdSetMotorPosition()
+            results = []
+            for mid, deg in [(51, hip_deg), (52, knee_deg)]:
                 lim = _JOINT_LIMITS[mid]
-                max_spd = _rpm2rads(lim[2])
-                spd, _ = _clamp(j.get("spd_rad_s", 0), -max_spd, max_spd)
-                cur, _ = _clamp(j.get("cur_a", 10.0), 0, lim[3])
-                cmd = SetMotorSpeed(); cmd.name = mid; cmd.spd = spd; cmd.cur = cur
+                pos_deg, clamped = _clamp(deg, lim[0], lim[1])
+                max_spd_rads = _rpm2rads(lim[2])
+                spd, _ = _clamp(speed_rad_s, 0, max_spd_rads)
+                cur, _ = _clamp(current_a, 0, lim[3])
+                cmd = SetMotorPosition()
+                cmd.name = mid
+                cmd.pos = _deg2rad(pos_deg)
+                cmd.spd = spd
+                cmd.cur = cur
                 msg.cmds.append(cmd)
-            self._pub_vel.publish(msg)
-            return {"ok": True, "card": "waist", "action": "set_vel",
-                    "applied": [{"name": _ALL_JOINTS.get(c.name, str(c.name)),
-                                  "spd_rad_s": c.spd} for c in msg.cmds]}
+                results.append({"name": _ALL_JOINTS[mid], "pos_deg": pos_deg, "spd_rad_s": spd, "cur_a": cur})
+                if clamped:
+                    return {"ok": False, "code": "JOINT_LIMIT_VIOLATION",
+                            "message": f"leg joint {mid} ({_ALL_JOINTS[mid]}) pos_deg out of range [{lim[0]}°, {lim[1]}°]"}
+            self._pub_pos.publish(msg)
+            return {"ok": True, "card": "leg", "action": "move_pos", "applied": results}
         except Exception as e:
             return {"ok": False, "code": "COMMUNICATION_ERROR", "message": str(e)}
-
-    def _send_zero(self, joint_ids: list) -> dict:
-        if not self._pub_zero:
-            return {"ok": False, "code": "COMMUNICATION_ERROR", "message": "publisher not ready"}
-        # 修复: 支持关节 31 和 32（之前只支持31）
-        valid = [jid for jid in joint_ids if jid in [31, 32]]
-        if not valid:
-            return {"ok": False, "code": "INVALID_ARGUMENT",
-                    "message": f"No valid waist joint IDs (valid: [31, 32]), got: {joint_ids}"}
-        from std_msgs.msg import String as StdString
-        msg = StdString(); msg.data = ",".join(str(j) for j in valid)
-        self._pub_zero.publish(msg)
-        return {"ok": True, "card": "waist", "action": "set_zero",
-                "applied": [{"id": j, "name": _ALL_JOINTS[j]} for j in valid]}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
