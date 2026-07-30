@@ -97,6 +97,19 @@ _LEG_JOINTS = {
 
 _ALL_JOINTS = {**_HEAD_JOINTS, **_ARM_LEFT_JOINTS, **_ARM_RIGHT_JOINTS, **_WAIST_JOINTS, **_LEG_JOINTS}
 
+_MOTOR_ERROR_DESCRIPTIONS = {
+    1: "motor_over_temperature",
+    2: "motor_over_current",
+    3: "motor_under_voltage",
+    4: "mos_over_temperature",
+    5: "motor_stall",
+    6: "motor_over_voltage",
+    7: "motor_phase_loss",
+    8: "encoder_error",
+    33072: "device_offline",
+    33073: "joint_position_out_of_range",
+}
+
 
 def _deg2rad(deg: float) -> float:
     return deg * math.pi / 180.0
@@ -991,11 +1004,22 @@ class HeadPlugin:
 class HeadGesturePlugin:
     """可取消的头部语义动作序列。"""
 
+    _STATUS_MAX_AGE = 2.0
+    _FEEDBACK_TIMEOUT = 2.0
+    _MOVE_THRESHOLD_RAD = _deg2rad(0.5)
+    _TARGET_TOLERANCE_RAD = _deg2rad(3.0)
+
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._pub_node = Node("tianyi2_head_gesture_pub", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._pub_node)
         self._publisher = None
         self._sequence = _ActionSequence("HeadGesturePlugin")
+        self._feedback_condition = threading.Condition()
+        self._head_status = {}
+        self._head_status_seq = 0
+        self._head_status_time = None
+        self._power_status = {}
+        self._power_status_time = None
 
     def get_tool(self) -> dict:
         return {
@@ -1070,10 +1094,17 @@ class HeadGesturePlugin:
 
     def start(self):
         try:
-            from bodyctrl_msgs.msg import CmdSetMotorPosition
+            from bodyctrl_msgs.msg import (
+                CmdSetMotorPosition, MotorStatusMsg, PowerBoardKeyStatus)
             self._publisher = self._pub_node.create_publisher(
                 CmdSetMotorPosition, "/head/cmd_pos", _RELIABLE_QOS)
-            print("[HeadGesturePlugin] publisher created")
+            self._pub_node.create_subscription(
+                MotorStatusMsg, "/head/status",
+                self._on_head_status, _RELIABLE_QOS)
+            self._pub_node.create_subscription(
+                PowerBoardKeyStatus, "/power/board/key_status",
+                self._on_power_status, _RELIABLE_QOS)
+            print("[HeadGesturePlugin] publisher and feedback subscriptions created")
         except ImportError as e:
             print(f"[HeadGesturePlugin] WARNING: msg import failed ({e})")
 
@@ -1082,16 +1113,31 @@ class HeadGesturePlugin:
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action in ("start", "info"):
-            return {"state": "ready" if self._publisher else "idle"}
+            return {
+                "state": "ready" if self._publisher else "idle",
+                "feedback_supported": True,
+                "feedback_topic": "/head/status",
+            }
         if action == "stop":
             return {"state": "stopped", "cancelled": self._sequence.cancel()}
         if action == "reset":
             self._sequence.cancel()
-            return self._publish_pose(0, 0, 0, args.get("speed", 30))
+            check = self._preflight()
+            if check is not None:
+                return check
+            baseline_seq, baseline = self._feedback_snapshot()
+            result = self._publish_pose(0, 0, 0, args.get("speed", 30))
+            if "error" in result:
+                return result
+            return self._wait_for_head_feedback(
+                (0, 0, 0), baseline_seq, baseline)
         if action not in ("nod", "shake", "scan", "tilt"):
             return {"error": f"unknown action: {action}"}
         if not self._publisher:
             return {"error": "publisher not initialized"}
+        check = self._preflight()
+        if check is not None:
+            return check
 
         cycles = int(_clamp(args.get("cycles", 2), 1, 5))
         speed = _clamp(args.get("speed", 30), 5, 60)
@@ -1135,11 +1181,208 @@ class HeadGesturePlugin:
                 if "error" in result or cancel_event.wait(max(0.15, delay)):
                     return
 
+        baseline_seq, baseline = self._feedback_snapshot()
         self._sequence.start(_worker)
+        first_target = frames[0][:3]
+        feedback = self._wait_for_head_feedback(
+            first_target, baseline_seq, baseline)
+        if feedback.get("state") == "error":
+            self._sequence.cancel()
+            return feedback
         return {
             "state": "running", "gesture": action, "cycles": cycles,
             "amplitude": amplitude, "speed": speed,
+            "feedback_verified": True,
+            "feedback": feedback,
         }
+
+    def _on_head_status(self, msg):
+        now = time.monotonic()
+        with self._feedback_condition:
+            self._head_status = {
+                int(motor.name): {
+                    "pos": float(motor.pos),
+                    "speed": float(motor.speed),
+                    "current": float(motor.current),
+                    "temperature": float(motor.temperature),
+                    "error": int(motor.error),
+                }
+                for motor in msg.status
+            }
+            self._head_status_seq += 1
+            self._head_status_time = now
+            self._feedback_condition.notify_all()
+
+    def _on_power_status(self, msg):
+        now = time.monotonic()
+        with self._feedback_condition:
+            self._power_status = {
+                "is_estop": bool(msg.is_estop.data),
+                "is_remote_estop": bool(msg.is_remote_estop.data),
+                "is_power_on": bool(msg.is_power_on.data),
+            }
+            self._power_status_time = now
+            self._feedback_condition.notify_all()
+
+    def _error_result(self, code: str, message: str, **details) -> dict:
+        result = {
+            "state": "error",
+            "error": message,
+            "code": code,
+        }
+        result.update(details)
+        return result
+
+    def _active_motor_faults(self) -> list[dict]:
+        faults = []
+        for motor_id in _HEAD_JOINTS:
+            status = self._head_status.get(motor_id)
+            if status is None or status["error"] == 0:
+                continue
+            error_code = status["error"]
+            faults.append({
+                "motor_id": motor_id,
+                "joint": _HEAD_JOINTS[motor_id],
+                "error_code": error_code,
+                "description": _MOTOR_ERROR_DESCRIPTIONS.get(
+                    error_code, "unknown_vendor_error"),
+            })
+        return faults
+
+    def _preflight(self) -> dict | None:
+        if not self._publisher:
+            return self._error_result(
+                "publisher_not_initialized",
+                "head command publisher is not initialized")
+        now = time.monotonic()
+        with self._feedback_condition:
+            if self._head_status_time is None:
+                return self._error_result(
+                    "head_status_unavailable",
+                    "No /head/status received; head controller may not be running",
+                    diagnosis=[
+                        "check robot body-control program",
+                        "complete robot self-check and confirm Ready state",
+                        "check ROS_DOMAIN_ID and /head/status",
+                    ],
+                )
+            status_age = now - self._head_status_time
+            if status_age > self._STATUS_MAX_AGE:
+                return self._error_result(
+                    "head_status_stale",
+                    f"/head/status is stale ({status_age:.2f}s)",
+                    diagnosis=[
+                        "check robot body-control program",
+                        "check ROS communication",
+                    ],
+                )
+            missing = [
+                motor_id for motor_id in _HEAD_JOINTS
+                if motor_id not in self._head_status
+            ]
+            if missing:
+                return self._error_result(
+                    "head_motors_missing",
+                    "Head motors are missing from /head/status",
+                    missing_motor_ids=missing,
+                )
+            faults = self._active_motor_faults()
+            if faults:
+                return self._error_result(
+                    "head_motor_fault", "Head has active motor faults",
+                    faults=faults,
+                )
+            if (self._power_status_time is not None
+                    and now - self._power_status_time <= self._STATUS_MAX_AGE):
+                if (self._power_status.get("is_estop")
+                        or self._power_status.get("is_remote_estop")):
+                    return self._error_result(
+                        "emergency_stop_active",
+                        "Physical or remote emergency stop is active",
+                        power_status=dict(self._power_status),
+                    )
+                if not self._power_status.get("is_power_on", True):
+                    return self._error_result(
+                        "robot_power_off", "Robot power board reports power off",
+                        power_status=dict(self._power_status),
+                    )
+        return None
+
+    def _feedback_snapshot(self) -> tuple[int, dict[int, float]]:
+        with self._feedback_condition:
+            return self._head_status_seq, {
+                motor_id: self._head_status[motor_id]["pos"]
+                for motor_id in _HEAD_JOINTS
+                if motor_id in self._head_status
+            }
+
+    def _wait_for_head_feedback(
+            self, target: tuple[float, float, float],
+            baseline_seq: int, baseline: dict[int, float]) -> dict:
+        yaw, pitch, roll = target
+        targets = {
+            1: _deg2rad(float(roll)),
+            2: _deg2rad(float(pitch)),
+            3: _deg2rad(float(yaw)),
+        }
+        deadline = time.monotonic() + self._FEEDBACK_TIMEOUT
+        received_new_status = False
+        with self._feedback_condition:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                if self._head_status_seq <= baseline_seq:
+                    self._feedback_condition.wait(remaining)
+                    continue
+                received_new_status = True
+                faults = self._active_motor_faults()
+                if faults:
+                    return self._error_result(
+                        "head_motor_fault_after_command",
+                        "Head motor fault appeared after command",
+                        faults=faults,
+                    )
+                positions = {
+                    motor_id: self._head_status[motor_id]["pos"]
+                    for motor_id in _HEAD_JOINTS
+                }
+                moved = max(
+                    abs(positions[motor_id] - baseline[motor_id])
+                    for motor_id in _HEAD_JOINTS
+                )
+                target_error = max(
+                    abs(positions[motor_id] - targets[motor_id])
+                    for motor_id in _HEAD_JOINTS
+                )
+                if (moved >= self._MOVE_THRESHOLD_RAD
+                        or target_error <= self._TARGET_TOLERANCE_RAD):
+                    return {
+                        "state": "moving",
+                        "status_topic": "/head/status",
+                        "max_movement_deg": round(_rad2deg(moved), 2),
+                        "max_target_error_deg": round(
+                            _rad2deg(target_error), 2),
+                    }
+                self._feedback_condition.wait(0.05)
+        if not received_new_status:
+            return self._error_result(
+                "head_feedback_timeout",
+                "Command was published but no new /head/status was received",
+                diagnosis=[
+                    "check head controller and ROS communication",
+                    "confirm robot self-check completed and robot is Ready",
+                ],
+            )
+        return self._error_result(
+            "head_no_motion",
+            "Command was published and head status updated, but no joint moved",
+            diagnosis=[
+                "robot may not be Ready or self-check may be incomplete",
+                "head controller may be disabled or rejecting commands",
+                "another node may be publishing competing /head/cmd_pos commands",
+            ],
+        )
 
     def _publish_pose(self, yaw_deg: float, pitch_deg: float,
                       roll_deg: float, speed_deg: float) -> dict:
@@ -1313,6 +1556,10 @@ class ArmPlugin:
 class ArmGesturePlugin:
     """可取消的挥手、敬礼和欢迎手势序列。"""
 
+    _STATUS_MAX_AGE = 2.0
+    _FEEDBACK_TIMEOUT = 2.0
+    _MOVE_THRESHOLD_RAD = _deg2rad(0.5)
+    _TARGET_TOLERANCE_RAD = _deg2rad(3.0)
     _NEUTRAL = [0, 0, 0, 0, 0, 0, 0]
     # 角度顺序：肩 pitch、肩 roll、肩 yaw、肘 pitch、腕 yaw、腕 pitch、腕 roll。
     _GESTURES = {
@@ -1327,6 +1574,12 @@ class ArmGesturePlugin:
         ros2.executor_tianyi.add_node(self._pub_node)
         self._publisher = None
         self._sequence = _ActionSequence("ArmGesturePlugin")
+        self._feedback_condition = threading.Condition()
+        self._arm_status = {}
+        self._arm_status_seq = 0
+        self._arm_status_time = None
+        self._power_status = {}
+        self._power_status_time = None
 
     def get_tool(self) -> dict:
         return {
@@ -1372,10 +1625,17 @@ class ArmGesturePlugin:
 
     def start(self):
         try:
-            from bodyctrl_msgs.msg import CmdSetMotorPosition
+            from bodyctrl_msgs.msg import (
+                CmdSetMotorPosition, MotorStatusMsg, PowerBoardKeyStatus)
             self._publisher = self._pub_node.create_publisher(
                 CmdSetMotorPosition, "/arm/cmd_pos", _RELIABLE_QOS)
-            print("[ArmGesturePlugin] publisher created")
+            self._pub_node.create_subscription(
+                MotorStatusMsg, "/arm/status",
+                self._on_arm_status, _RELIABLE_QOS)
+            self._pub_node.create_subscription(
+                PowerBoardKeyStatus, "/power/board/key_status",
+                self._on_power_status, _RELIABLE_QOS)
+            print("[ArmGesturePlugin] publisher and feedback subscriptions created")
         except ImportError as e:
             print(f"[ArmGesturePlugin] WARNING: msg import failed ({e})")
 
@@ -1384,7 +1644,11 @@ class ArmGesturePlugin:
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action in ("start", "info"):
-            return {"state": "ready" if self._publisher else "idle"}
+            return {
+                "state": "ready" if self._publisher else "idle",
+                "feedback_supported": True,
+                "feedback_topic": "/arm/status",
+            }
         if action == "stop":
             return {"state": "stopped", "cancelled": self._sequence.cancel()}
         side = args.get("side", "right")
@@ -1393,11 +1657,22 @@ class ArmGesturePlugin:
         speed = _clamp(args.get("speed", 0.5), 0.2, 1.5)
         if action == "reset":
             self._sequence.cancel()
-            return self._publish_pose(side, self._NEUTRAL, speed)
+            check = self._preflight(side)
+            if check is not None:
+                return check
+            baseline_seq, baseline = self._feedback_snapshot(side)
+            result = self._publish_pose(side, self._NEUTRAL, speed)
+            if "error" in result:
+                return result
+            return self._wait_for_arm_feedback(
+                side, self._NEUTRAL, baseline_seq, baseline)
         if action not in self._GESTURES:
             return {"error": f"unknown action: {action}"}
         if not self._publisher:
             return {"error": "publisher not initialized"}
+        check = self._preflight(side)
+        if check is not None:
+            return check
 
         pose = self._GESTURES[action]
         cycles = int(_clamp(args.get("cycles", 2), 1, 5))
@@ -1424,9 +1699,232 @@ class ArmGesturePlugin:
                 if "error" in result or cancel_event.wait(transition + hold):
                     return
 
+        baseline_seq, baseline = self._feedback_snapshot(side)
         self._sequence.start(_worker)
-        return {"state": "running", "gesture": action, "side": side,
-                "cycles": cycles, "speed": speed}
+        feedback = self._wait_for_arm_feedback(
+            side, pose, baseline_seq, baseline)
+        if feedback.get("state") == "error":
+            self._sequence.cancel()
+            return feedback
+        return {
+            "state": "running", "gesture": action, "side": side,
+            "cycles": cycles, "speed": speed,
+            "feedback_verified": True,
+            "feedback": feedback,
+        }
+
+    def _on_arm_status(self, msg):
+        now = time.monotonic()
+        with self._feedback_condition:
+            self._arm_status = {
+                int(motor.name): {
+                    "pos": float(motor.pos),
+                    "speed": float(motor.speed),
+                    "current": float(motor.current),
+                    "temperature": float(motor.temperature),
+                    "error": int(motor.error),
+                }
+                for motor in msg.status
+            }
+            self._arm_status_seq += 1
+            self._arm_status_time = now
+            self._feedback_condition.notify_all()
+
+    def _on_power_status(self, msg):
+        now = time.monotonic()
+        with self._feedback_condition:
+            self._power_status = {
+                "is_estop": bool(msg.is_estop.data),
+                "is_remote_estop": bool(msg.is_remote_estop.data),
+                "is_power_on": bool(msg.is_power_on.data),
+            }
+            self._power_status_time = now
+            self._feedback_condition.notify_all()
+
+    @staticmethod
+    def _motor_ids(side: str) -> list[int]:
+        motor_ids = []
+        if side in ("left", "both"):
+            motor_ids.extend(range(11, 18))
+        if side in ("right", "both"):
+            motor_ids.extend(range(21, 28))
+        return motor_ids
+
+    @staticmethod
+    def _target_positions(side: str, left_pose: list[float]) -> dict[int, float]:
+        right_pose = [
+            left_pose[0], -left_pose[1], -left_pose[2],
+            left_pose[3], -left_pose[4], left_pose[5], -left_pose[6],
+        ]
+        targets = {}
+        if side in ("left", "both"):
+            targets.update({
+                11 + index: _deg2rad(float(deg))
+                for index, deg in enumerate(left_pose)
+            })
+        if side in ("right", "both"):
+            targets.update({
+                21 + index: _deg2rad(float(deg))
+                for index, deg in enumerate(right_pose)
+            })
+        return targets
+
+    def _error_result(self, code: str, message: str, **details) -> dict:
+        result = {
+            "state": "error",
+            "error": message,
+            "code": code,
+        }
+        result.update(details)
+        return result
+
+    def _active_motor_faults(self, motor_ids: list[int]) -> list[dict]:
+        faults = []
+        for motor_id in motor_ids:
+            status = self._arm_status.get(motor_id)
+            if status is None or status["error"] == 0:
+                continue
+            error_code = status["error"]
+            faults.append({
+                "motor_id": motor_id,
+                "joint": _ALL_JOINTS.get(motor_id, f"motor_{motor_id}"),
+                "error_code": error_code,
+                "description": _MOTOR_ERROR_DESCRIPTIONS.get(
+                    error_code, "unknown_vendor_error"),
+            })
+        return faults
+
+    def _preflight(self, side: str) -> dict | None:
+        if not self._publisher:
+            return self._error_result(
+                "publisher_not_initialized", "arm command publisher is not initialized")
+        now = time.monotonic()
+        motor_ids = self._motor_ids(side)
+        with self._feedback_condition:
+            if self._arm_status_time is None:
+                return self._error_result(
+                    "arm_status_unavailable",
+                    "No /arm/status received; arm controller may not be running",
+                    diagnosis=[
+                        "check robot body-control program",
+                        "complete robot self-check and confirm Ready state",
+                        "check ROS_DOMAIN_ID and /arm/status",
+                    ],
+                )
+            status_age = now - self._arm_status_time
+            if status_age > self._STATUS_MAX_AGE:
+                return self._error_result(
+                    "arm_status_stale",
+                    f"/arm/status is stale ({status_age:.2f}s)",
+                    diagnosis=[
+                        "check robot body-control program",
+                        "check ROS communication",
+                    ],
+                )
+            missing = [
+                motor_id for motor_id in motor_ids
+                if motor_id not in self._arm_status
+            ]
+            if missing:
+                return self._error_result(
+                    "arm_motors_missing",
+                    "Selected arm motors are missing from /arm/status",
+                    missing_motor_ids=missing,
+                )
+            faults = self._active_motor_faults(motor_ids)
+            if faults:
+                return self._error_result(
+                    "arm_motor_fault", "Selected arm has active motor faults",
+                    faults=faults,
+                )
+            if (self._power_status_time is not None
+                    and now - self._power_status_time <= self._STATUS_MAX_AGE):
+                if (self._power_status.get("is_estop")
+                        or self._power_status.get("is_remote_estop")):
+                    return self._error_result(
+                        "emergency_stop_active",
+                        "Physical or remote emergency stop is active",
+                        power_status=dict(self._power_status),
+                    )
+                if not self._power_status.get("is_power_on", True):
+                    return self._error_result(
+                        "robot_power_off", "Robot power board reports power off",
+                        power_status=dict(self._power_status),
+                    )
+        return None
+
+    def _feedback_snapshot(self, side: str) -> tuple[int, dict[int, float]]:
+        with self._feedback_condition:
+            return self._arm_status_seq, {
+                motor_id: self._arm_status[motor_id]["pos"]
+                for motor_id in self._motor_ids(side)
+                if motor_id in self._arm_status
+            }
+
+    def _wait_for_arm_feedback(
+            self, side: str, target_pose: list[float],
+            baseline_seq: int, baseline: dict[int, float]) -> dict:
+        motor_ids = self._motor_ids(side)
+        targets = self._target_positions(side, target_pose)
+        deadline = time.monotonic() + self._FEEDBACK_TIMEOUT
+        received_new_status = False
+        with self._feedback_condition:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                if self._arm_status_seq <= baseline_seq:
+                    self._feedback_condition.wait(remaining)
+                    continue
+                received_new_status = True
+                faults = self._active_motor_faults(motor_ids)
+                if faults:
+                    return self._error_result(
+                        "arm_motor_fault_after_command",
+                        "Arm motor fault appeared after command",
+                        faults=faults,
+                    )
+                positions = {
+                    motor_id: self._arm_status[motor_id]["pos"]
+                    for motor_id in motor_ids
+                }
+                moved = max(
+                    abs(positions[motor_id] - baseline[motor_id])
+                    for motor_id in motor_ids
+                )
+                target_error = max(
+                    abs(positions[motor_id] - targets[motor_id])
+                    for motor_id in motor_ids
+                )
+                if (moved >= self._MOVE_THRESHOLD_RAD
+                        or target_error <= self._TARGET_TOLERANCE_RAD):
+                    return {
+                        "state": "moving",
+                        "status_topic": "/arm/status",
+                        "max_movement_deg": round(_rad2deg(moved), 2),
+                        "max_target_error_deg": round(
+                            _rad2deg(target_error), 2),
+                    }
+                self._feedback_condition.wait(0.05)
+        if not received_new_status:
+            return self._error_result(
+                "arm_feedback_timeout",
+                "Command was published but no new /arm/status was received",
+                diagnosis=[
+                    "check arm controller and ROS communication",
+                    "confirm robot self-check completed and robot is Ready",
+                ],
+            )
+        return self._error_result(
+            "arm_no_motion",
+            "Command was published and arm status updated, but no joint moved",
+            diagnosis=[
+                "robot may not be Ready or self-check may be incomplete",
+                "arm controller may be disabled or rejecting commands",
+                "another node may be publishing competing /arm/cmd_pos commands",
+                "the configured 5A maximum current may be insufficient; verify with the robot vendor before increasing it",
+            ],
+        )
 
     def _publish_pose(self, side: str, left_pose: list[float], speed: float) -> dict:
         if not self._publisher:

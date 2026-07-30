@@ -47,6 +47,13 @@ gesture; `stop` cancels future frames without issuing an additional pose. A nod
 moves from neutral to positive pitch (down) and back to neutral; it never passes
 through negative pitch (up).
 
+Before publishing, the card checks fresh `/head/status` data, all three head
+motors, motor error codes, emergency-stop state and power state. It then waits
+up to two seconds for newer status and verifies that the head moved or was
+already at the target. A verified call returns `feedback_verified: true`;
+failures return `state: error`, a stable diagnostic `code`, details in the MCP
+result, and protocol-level `isError: true`.
+
 | Action | Dashboard defaults | Allowed range |
 |---|---|---|
 | `nod` | cycles 2, amplitude 12°, speed 30°/s | cycles 1–5, amplitude 5–20°, speed 5–60°/s |
@@ -74,6 +81,24 @@ inside the checked-in URDF limits. The preset poses still require low-speed,
 clear-area calibration on the target robot before production use. Do not run
 the raw `arm` card and `arm_gesture` concurrently because both publish to the
 same controller topic.
+
+Before publishing an action, the card checks fresh `/arm/status` data, all
+selected motor IDs, motor error codes, the physical/remote emergency stop and
+power state. After publishing, it waits up to two seconds for a newer
+`/arm/status` sample and verifies that a selected joint moved (or was already
+at the requested target). The MCP result therefore distinguishes a scheduled
+action from controller feedback with `feedback_verified: true`. Failures return
+`state: error`, a stable `code`, the human-readable `error`, and relevant
+diagnostic details.
+MCP tool failures are also marked with the protocol-level `isError: true`, so
+the dashboard/agent can distinguish them from successful results without
+parsing the text payload first.
+
+The SDK does not expose a dedicated "self-check completed" field in the message
+types used here. A no-motion result can therefore identify an incomplete
+self-check/Not Ready state as a likely cause, but cannot claim it conclusively.
+Complete the documented startup self-check and confirm the whole-body status
+light indicates Ready before running arm actions.
 
 | Action | Dashboard defaults | Allowed range |
 |---|---|---|

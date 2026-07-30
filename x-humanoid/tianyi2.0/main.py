@@ -288,7 +288,17 @@ def make_handler():
                     if result is None:
                         err(-32601, f"Unknown tool: {name}")
                     else:
-                        ok({"content": [{"type": "text", "text": json.dumps(result)}]})
+                        tool_result = {
+                            "content": [{
+                                "type": "text",
+                                "text": json.dumps(result),
+                            }],
+                        }
+                        if (isinstance(result, dict)
+                                and (result.get("state") == "error"
+                                     or "error" in result)):
+                            tool_result["isError"] = True
+                        ok(tool_result)
                 else:
                     err(-32601, f"Method not found: {method}")
             except Exception as e:
