@@ -171,7 +171,3 @@ class SlamtecClient:
     def get_robot_info(self) -> dict:
         """获取底盘设备信息"""
         return self._get("/api/core/system/v1/robot/info")
-
-    def get_laser_scan(self) -> dict:
-        """获取当前激光观测帧"""
-        return self._get("/api/core/system/v1/laserscan")
