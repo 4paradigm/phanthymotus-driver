@@ -1,6 +1,8 @@
-mcp_port: 15707
+mcp_port: 15708
 ros_namespace: ""   # 留空则自动使用 hostname
-name: "Tianyi 2.0 Pro"
+name: "Tianyi 2.0 FQY Test"
+# Must be unique: Agent Core uses MCP serverInfo.name as a deduplication key.
+mcp_server_name: "fl-bundle"
 
 slamtec:
   base_url: "http://192.168.11.1:1448"
@@ -9,6 +11,12 @@ plugins:
   state:
     enabled: true
   camera:
+    enabled: true
+  imu:
+    enabled: true
+  camera_depth:
+    enabled: true
+  camera_pointcloud:
     enabled: true
   asr:
     enabled: true
@@ -20,6 +28,8 @@ plugins:
     enabled: true
   waist:
     enabled: true
+  leg:
+    enabled: true
   hand:
     enabled: true
   tts:
@@ -27,4 +37,8 @@ plugins:
   nav:
     enabled: true
   chat:
+    enabled: true
+  lyre_event:
+    enabled: true
+  llm:
     enabled: true
