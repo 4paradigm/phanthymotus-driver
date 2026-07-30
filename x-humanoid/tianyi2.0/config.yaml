@@ -10,6 +10,19 @@ plugins:
     enabled: true
   camera:
     enabled: true
+  imu:
+    enabled: true
+  camera_depth:
+    enabled: true
+    # Raw 640x480 Z16 is 614 KiB/frame. Keep the dashboard stream below the
+    # browser/DDS forwarding budget and always display the newest frame.
+    hz: 8
+  camera_pointcloud:
+    enabled: true
+    # Head camera height above the floor. The point-cloud renderer uses Y=0
+    # as its grid plane, so raise the gravity-levelled cloud by this amount
+    # to place the physical floor on that plane.
+    floor_offset_m: 1.50
   asr:
     enabled: true
   nav_state:
