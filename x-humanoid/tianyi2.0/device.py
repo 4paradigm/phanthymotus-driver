@@ -1416,13 +1416,25 @@ class Lidar2DPlugin:
                 print(f"[Lidar2DPlugin] scan read failed: {e}")
             time.sleep(max(0.0, interval - (time.monotonic() - started)))
 
-    def dispatch(self, action: str, args: dict) -> dict:
-        if action in ("start", "stop", "info", "read", "get", "lidar_2d"):
+    def dispatch(self, action: str, args: dict):
+        if action == "info":
+            # Older Agent Core releases discover and register topic streams
+            # exclusively from the result of an ``info`` call. Do not return
+            # the bare point list here, otherwise the topic is invisible to
+            # the dashboard's DDS/WebSocket bridge.
             return {
                 "state": "running" if self._running else "idle",
                 "data": self._last_frame,
                 "topic_out": [{"topic": self._topic, "format": "sensor/lidar-2d"}],
             }
+        if action in ("start", "read", "get", "lidar_2d"):
+            # The deployed Agent Core lidar renderer only consumes
+            # ``mcp_result.payload.result`` when it is a bare [{x, y}, ...]
+            # array. Keep the richer metadata on the DDS topic, but return
+            # the renderer-compatible snapshot for the card's MCP action.
+            return list(self._last_frame["points"])
+        if action == "stop":
+            return {"state": "idle"}
         return {"state": "running"}
 
 

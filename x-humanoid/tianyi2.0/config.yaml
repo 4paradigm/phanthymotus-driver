@@ -20,6 +20,12 @@ plugins:
     enabled: true
   nav_state:
     enabled: true
+  lidar_2d:
+    enabled: true
+    # Slamtec REST laser scan defaults to 10 Hz. Keep the visual card bounded
+    # so it remains responsive over the DDS → Agent Core WebSocket path.
+    hz: 10
+    max_points: 1440
   head:
     enabled: true
   head_gesture:

@@ -127,6 +127,11 @@ class TianyiDeviceBundle:
             self._plugins.append(NavStatePlugin(plugins_cfg["nav_state"], namespace, ros2, slamtec_client))
             print("[bundle] NavStatePlugin loaded")
 
+        if plugins_cfg.get("lidar_2d", {}).get("enabled", False):
+            from device import Lidar2DPlugin
+            self._plugins.append(Lidar2DPlugin(plugins_cfg["lidar_2d"], namespace, ros2, slamtec_client))
+            print("[bundle] Lidar2DPlugin loaded")
+
         if plugins_cfg.get("head", {}).get("enabled", False):
             from device import HeadPlugin
             self._plugins.append(HeadPlugin(plugins_cfg["head"], namespace, ros2))
