@@ -3,8 +3,8 @@
 # Usage: ./enter_pr_branch.sh [PR_NUMBER]
 #   If PR_NUMBER is omitted, lists open PRs for interactive selection.
 #
-# Dependencies: git, curl, (optional) jq
-# For private repos, set GITHUB_TOKEN environment variable.
+# Dependencies: git
+# Note: Uses git ls-remote instead of GitHub API (no rate limit, no token needed).
 
 set -euo pipefail
 
@@ -31,49 +31,9 @@ detect_repo() {
   fi
 }
 
-# GitHub API call via curl
-github_api() {
-  local endpoint="$1"
-  local args=(-s -f -L)
-  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
-    args+=(-H "Authorization: token $GITHUB_TOKEN")
-  fi
-  args+=(-H "Accept: application/vnd.github+json")
-  curl "${args[@]}" "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}${endpoint}"
-}
-
-# Parse JSON value — uses jq if available, otherwise basic grep/sed fallback
-json_val() {
-  local json="$1" key="$2"
-  if command -v jq &>/dev/null; then
-    echo "$json" | jq -r ".$key"
-  else
-    # Fallback: works for simple flat string/number fields
-    echo "$json" | grep -o "\"$key\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | head -1 | sed 's/.*: *"//;s/"$//' ||
-    echo "$json" | grep -o "\"$key\"[[:space:]]*:[[:space:]]*[0-9]*" | head -1 | sed 's/.*: *//'
-  fi
-}
-
-# Parse JSON array of PRs (minimal parser for listing)
-parse_pr_list() {
-  local json="$1"
-  if command -v jq &>/dev/null; then
-    echo "$json" | jq -r '.[] | "#\(.number)  \(.title)  (\(.user.login), \(.head.ref))"'
-  else
-    # Fallback: extract number and title pairs
-    echo "$json" | grep -oP '"number"\s*:\s*\K[0-9]+' | while read -r num; do
-      echo "#$num"
-    done
-    warn "(Install jq for better PR listing with titles)"
-  fi
-}
-
 check_deps() {
   if ! git rev-parse --is-inside-work-tree &>/dev/null 2>&1; then
     die "Not inside a git repository."
-  fi
-  if ! command -v curl &>/dev/null; then
-    die "'curl' not found."
   fi
 }
 
@@ -86,29 +46,43 @@ check_dirty() {
   fi
 }
 
-# List open PRs and let user pick one
+# List unmerged PRs using git ls-remote (no API needed)
 select_pr() {
-  info "Fetching open PRs from ${REPO_OWNER}/${REPO_NAME}..."
-  local response
-  response=$(github_api "/pulls?state=open&per_page=20") || \
-    die "Failed to fetch PRs. For private repos, set GITHUB_TOKEN."
+  info "Fetching PRs from ${REPO_OWNER}/${REPO_NAME} (via git)..."
 
-  if [[ "$response" == "[]" || -z "$response" ]]; then
-    die "No open PRs found."
+  # Fetch all PR head refs with their SHAs
+  local pr_data
+  pr_data=$(git ls-remote "$REMOTE" 'refs/pull/*/head' 2>/dev/null) || \
+    die "Failed to list PRs via git ls-remote."
+
+  if [[ -z "$pr_data" ]]; then
+    die "No PRs found."
   fi
 
-  local pr_list
-  pr_list=$(parse_pr_list "$response")
-
-  if [[ -z "$pr_list" ]]; then
-    die "No open PRs found (or failed to parse response)."
-  fi
+  # Get commits already in main to filter out merged PRs
+  git fetch "$REMOTE" --quiet 2>/dev/null
+  local main_branch
+  main_branch=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@') || main_branch="main"
 
   echo ""
-  echo "Open PRs:"
+  echo "Unmerged PRs:"
   echo "─────────────────────────────────────────"
-  echo "$pr_list"
+  local found=0
+  while IFS=$'\t' read -r sha ref; do
+    local num="${ref#refs/pull/}"
+    num="${num%/head}"
+    # Skip if this commit is already in main (i.e., PR was merged)
+    if ! git merge-base --is-ancestor "$sha" "refs/remotes/origin/$main_branch" 2>/dev/null; then
+      echo "  #$num"
+      found=1
+    fi
+  done <<< "$pr_data"
   echo "─────────────────────────────────────────"
+
+  if [[ "$found" -eq 0 ]]; then
+    die "No unmerged PRs found."
+  fi
+
   echo ""
   read -rp "Enter PR number: #" pr_num
 
@@ -118,42 +92,14 @@ select_pr() {
   PR_NUMBER="$pr_num"
 }
 
-# Verify PR exists via API
+# Verify PR exists via git ls-remote (no API needed)
 verify_pr() {
   info "Checking PR #$PR_NUMBER..."
-  local response
-  response=$(github_api "/pulls/$PR_NUMBER" 2>/dev/null) || \
-    die "PR #$PR_NUMBER not found or not accessible. For private repos, set GITHUB_TOKEN."
-
-  local title state head_branch
-  title=$(json_val "$response" "title")
-  state=$(json_val "$response" "state")
-  head_branch=$(json_val "$response" "ref")  # nested under head, try fallback
-
-  # For head.ref we need nested parsing
-  if command -v jq &>/dev/null; then
-    head_branch=$(echo "$response" | jq -r '.head.ref')
-    local merged
-    merged=$(echo "$response" | jq -r '.merged')
-  else
-    head_branch=$(echo "$response" | grep -o '"ref"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"ref"[[:space:]]*:[[:space:]]*"//;s/"$//')
-    local merged="false"
-    echo "$response" | grep -q '"merged"[[:space:]]*:[[:space:]]*true' && merged="true"
+  local head_ref="refs/pull/${PR_NUMBER}/head"
+  if ! git ls-remote "$REMOTE" "$head_ref" 2>/dev/null | grep -q "$head_ref"; then
+    die "PR #$PR_NUMBER not found. Check that the PR exists."
   fi
-
-  echo ""
-  info "PR #$PR_NUMBER: $title"
-  info "Branch: $head_branch | State: $state"
-
-  if [[ "${merged:-false}" == "true" ]]; then
-    warn "This PR is already merged."
-    read -rp "Still want to fetch the merge ref? [y/N] " ans
-    [[ "$ans" =~ ^[Yy]$ ]] || exit 0
-  elif [[ "$state" == "closed" ]]; then
-    warn "This PR is closed (not merged)."
-    read -rp "Still want to fetch the merge ref? [y/N] " ans
-    [[ "$ans" =~ ^[Yy]$ ]] || exit 0
-  fi
+  info "PR #$PR_NUMBER exists (ref found)."
 }
 
 # Fetch the pre-merge ref and checkout
