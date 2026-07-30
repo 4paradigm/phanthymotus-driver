@@ -16,7 +16,7 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
 插件列表：
   SystemPlugin     (resource)           — 整机软件版本清单
   StatePlugin      (sensor, multi-tool) — 关节/电池/急停/力传感器/URDF
-  CameraPlugin     (sensor)             — Orbbec 头部相机
+  CameraPlugin     (sensor/resource)    — Orbbec 头部相机与几何标定
   AsrPlugin        (sensor)             — 语音识别结果
   NavStatePlugin   (sensor)             — 底盘导航状态
   HeadPlugin       (actuator)           — 头部3DOF控制
@@ -31,6 +31,7 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import threading
@@ -61,6 +62,13 @@ _DEFAULT_SOFTWARE_MANIFEST_PATH = (
     f"/proc/1/root{_SOFTWARE_MANIFEST_HOST_PATH}"
 )
 _SOFTWARE_MANIFEST_MAX_BYTES = 1024 * 1024
+
+_CAMERA_EXTRINSICS_QOS = QoSProfile(
+    reliability=ReliabilityPolicy.RELIABLE,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=1,
+    durability=DurabilityPolicy.TRANSIENT_LOCAL,
+)
 
 # ── Motor ID → Joint Name 映射 ───────────────────────────────────────────────
 
@@ -564,18 +572,29 @@ class StatePlugin:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CameraPlugin (sensor)
+# CameraPlugin (sensor/resource, multi-tool)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class CameraPlugin:
-    """Orbbec 头部 RGB 相机 — 独立编码线程避免阻塞executor"""
+    """Orbbec RGB stream plus color/depth calibration geometry."""
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._ns = namespace
         self._ros2 = ros2
         self._topic = f"/{namespace}/camera/head"
         self._running = False
-        self._frame_queue = None  # Will hold latest frame only
+        self._latest_frame = None
+        self._frame_lock = threading.Lock()
+        self._subscriptions = []
+
+        # Geometry resources are populated independently by color/depth
+        # CameraInfo.  Extrinsics are optional because older Tianyi images do
+        # not install orbbec_camera_msgs in the driver container.
+        self._geometry_lock = threading.Lock()
+        self._camera_geometry = {"color": None, "depth": None}
+        self._depth_to_color = None
+        self._extrinsics_supported = None
+        self._extrinsics_reason = "plugin_not_started"
 
         self._sub_node = Node("tianyi2_camera_sub", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._sub_node)
@@ -583,20 +602,58 @@ class CameraPlugin:
         self._pub_node = Node("tianyi2_camera_pub", context=ros2.ctx_core)
         ros2.executor_core.add_node(self._pub_node)
 
-    def get_tool(self) -> dict:
-        return {
-            "name": "camera_head",
-            "type": "sensor",
-            "description": "天轶2.0 头部相机 (Orbbec RGB) — 彩色图像流",
-            "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._topic, "format": "image/jpeg"}],
-        }
+    def get_tools(self) -> list:
+        return [
+            {
+                "name": "camera_head",
+                "type": "sensor",
+                "description": "天轶2.0 头部相机 (Orbbec RGB) — 彩色图像流",
+                "inputSchema": {"type": "object", "properties": {}},
+                "topic_out": [{"topic": self._topic, "format": "image/jpeg"}],
+            },
+            {
+                "name": "camera_geometry",
+                "type": "resource",
+                "description": (
+                    "天轶2.0 Orbbec 相机几何标定 — 彩色/深度内参与"
+                    "可选深度到彩色外参"
+                ),
+                "inputSchema": {"type": "object", "properties": {}},
+            },
+        ]
 
     def start(self):
         self._running = True
 
         # Ensure Orbbec camera service is running
         self._ensure_orbbec_service()
+
+        # Camera geometry remains available even if OpenCV or NumPy is absent
+        # and the RGB encoder cannot start.
+        try:
+            from sensor_msgs.msg import CameraInfo
+
+            self._subscriptions.extend([
+                self._sub_node.create_subscription(
+                    CameraInfo,
+                    "/ob_camera_head/color/camera_info",
+                    lambda msg: self._on_camera_info("color", msg),
+                    _RELIABLE_QOS,
+                ),
+                self._sub_node.create_subscription(
+                    CameraInfo,
+                    "/ob_camera_head/depth/camera_info",
+                    lambda msg: self._on_camera_info("depth", msg),
+                    _RELIABLE_QOS,
+                ),
+            ])
+            print("[CameraPlugin] color/depth CameraInfo subscriptions created")
+        except ImportError as e:
+            print(f"[CameraPlugin] WARNING: CameraInfo import failed ({e})")
+        except Exception as e:
+            print(f"[CameraPlugin] WARNING: CameraInfo subscriptions failed ({e})")
+
+        self._subscribe_depth_to_color()
 
         try:
             from sensor_msgs.msg import Image, CompressedImage
@@ -605,15 +662,19 @@ class CameraPlugin:
 
             self._np = np
             self._cv2 = cv2
-            self._latest_frame = None  # Only keep latest frame
-            self._frame_lock = threading.Lock()
+            with self._frame_lock:
+                self._latest_frame = None
 
             # Publish JPEG as CompressedImage
             self._pub = self._pub_node.create_publisher(CompressedImage, self._topic, _LOW_LAT_QOS)
 
             # Subscribe - callback just grabs the frame, doesn't encode
-            self._sub_node.create_subscription(
-                Image, "/ob_camera_head/color/image_raw", self._on_image_grab, _RELIABLE_QOS)
+            self._subscriptions.append(self._sub_node.create_subscription(
+                Image,
+                "/ob_camera_head/color/image_raw",
+                self._on_image_grab,
+                _RELIABLE_QOS,
+            ))
 
             # Separate encoding thread - avoids blocking executor
             self._encode_thread = threading.Thread(target=self._encode_loop, daemon=True)
@@ -622,6 +683,153 @@ class CameraPlugin:
             print("[CameraPlugin] subscription + encode thread created")
         except ImportError as e:
             print(f"[CameraPlugin] WARNING: import failed ({e})")
+
+    def _subscribe_depth_to_color(self):
+        try:
+            from orbbec_camera_msgs.msg import Extrinsics
+        except ImportError:
+            reason = "orbbec_camera_msgs.msg.Extrinsics is unavailable"
+            self._set_extrinsics_unavailable(reason)
+            print(f"[CameraPlugin] WARNING: {reason}; depth_to_color omitted")
+            return
+
+        try:
+            subscription = self._sub_node.create_subscription(
+                Extrinsics,
+                "/ob_camera_head/depth_to_color",
+                self._on_depth_to_color,
+                _CAMERA_EXTRINSICS_QOS,
+            )
+            self._subscriptions.append(subscription)
+            with self._geometry_lock:
+                self._extrinsics_supported = True
+                self._extrinsics_reason = "waiting_for_depth_to_color"
+            print("[CameraPlugin] depth_to_color extrinsics subscription created")
+        except Exception as e:
+            with self._geometry_lock:
+                self._extrinsics_supported = True
+                self._extrinsics_reason = f"subscription_failed: {e}"
+            print(f"[CameraPlugin] WARNING: depth_to_color subscription failed ({e})")
+
+    @staticmethod
+    def _header_fields(msg) -> tuple:
+        header = getattr(msg, "header", None)
+        frame_id = str(getattr(header, "frame_id", ""))
+        stamp = getattr(header, "stamp", None)
+        if stamp is None:
+            return frame_id, None, None
+        sec = int(getattr(stamp, "sec", 0))
+        nanosec = int(getattr(stamp, "nanosec", 0))
+        timestamp = {"sec": sec, "nanosec": nanosec}
+        timestamp_ms = sec * 1000 + nanosec // 1_000_000
+        return frame_id, timestamp, timestamp_ms
+
+    @classmethod
+    def _camera_info_to_dict(cls, msg) -> dict:
+        frame_id, timestamp, timestamp_ms = cls._header_fields(msg)
+        k = [float(value) for value in getattr(msg, "k", ())]
+        roi = getattr(msg, "roi", None)
+        return {
+            "width": int(getattr(msg, "width", 0)),
+            "height": int(getattr(msg, "height", 0)),
+            "intrinsics": {
+                "fx": k[0] if len(k) > 0 else None,
+                "fy": k[4] if len(k) > 4 else None,
+                "cx": k[2] if len(k) > 2 else None,
+                "cy": k[5] if len(k) > 5 else None,
+            },
+            "distortion_model": str(getattr(msg, "distortion_model", "")),
+            "d": [float(value) for value in getattr(msg, "d", ())],
+            "k": k,
+            "r": [float(value) for value in getattr(msg, "r", ())],
+            "p": [float(value) for value in getattr(msg, "p", ())],
+            "binning": {
+                "x": int(getattr(msg, "binning_x", 0)),
+                "y": int(getattr(msg, "binning_y", 0)),
+            },
+            "roi": {
+                "x_offset": int(getattr(roi, "x_offset", 0)),
+                "y_offset": int(getattr(roi, "y_offset", 0)),
+                "height": int(getattr(roi, "height", 0)),
+                "width": int(getattr(roi, "width", 0)),
+                "do_rectify": bool(getattr(roi, "do_rectify", False)),
+            },
+            "frame_id": frame_id,
+            "timestamp": timestamp,
+            "timestamp_ms": timestamp_ms,
+        }
+
+    @classmethod
+    def _extrinsics_to_dict(cls, msg) -> dict:
+        frame_id, timestamp, timestamp_ms = cls._header_fields(msg)
+        return {
+            "supported": True,
+            "available": True,
+            "rotation": [float(value) for value in getattr(msg, "rotation", ())],
+            # orbbec_camera's wrapper converts SDK millimetres to metres
+            # before publishing Extrinsics.
+            "translation_m": [
+                float(value) for value in getattr(msg, "translation", ())
+            ],
+            "frame_id": frame_id,
+            "timestamp": timestamp,
+            "timestamp_ms": timestamp_ms,
+        }
+
+    def _on_camera_info(self, stream: str, msg):
+        if stream not in self._camera_geometry:
+            return
+        geometry = self._camera_info_to_dict(msg)
+        with self._geometry_lock:
+            self._camera_geometry[stream] = geometry
+
+    def _on_depth_to_color(self, msg):
+        extrinsics = self._extrinsics_to_dict(msg)
+        with self._geometry_lock:
+            self._depth_to_color = extrinsics
+            self._extrinsics_supported = True
+            self._extrinsics_reason = None
+
+    def _set_extrinsics_unavailable(self, reason: str):
+        with self._geometry_lock:
+            self._depth_to_color = None
+            self._extrinsics_supported = False
+            self._extrinsics_reason = reason
+
+    def _geometry_snapshot(self) -> dict:
+        with self._geometry_lock:
+            color = copy.deepcopy(self._camera_geometry["color"])
+            depth = copy.deepcopy(self._camera_geometry["depth"])
+            depth_to_color = copy.deepcopy(self._depth_to_color)
+            extrinsics_supported = self._extrinsics_supported
+            extrinsics_reason = self._extrinsics_reason
+
+        missing = [
+            stream for stream, value in (("color", color), ("depth", depth))
+            if value is None
+        ]
+        if depth_to_color is None:
+            depth_to_color = {
+                "supported": extrinsics_supported,
+                "available": False,
+                "reason": extrinsics_reason,
+            }
+        availability = {
+            "color": color is not None,
+            "depth": depth is not None,
+            "depth_to_color": depth_to_color["available"],
+        }
+        return {
+            "available": not missing,
+            "availability": availability,
+            "missing": missing,
+            "optional_missing": (
+                [] if depth_to_color["available"] else ["depth_to_color"]
+            ),
+            "color": color,
+            "depth": depth,
+            "depth_to_color": depth_to_color,
+        }
 
     def _ensure_orbbec_service(self):
         """Ensure orbbec_head.service is running. Use nsenter to access host systemd."""
@@ -681,12 +889,14 @@ class CameraPlugin:
             except Exception as e:
                 print(f"[CameraPlugin] encode error: {e}", flush=True)
 
-    def dispatch(self, action: str, args: dict) -> dict:
-        if action == "start":
+    def dispatch(self, action_or_tool: str, args: dict) -> dict:
+        if action_or_tool == "camera_geometry":
+            return self._geometry_snapshot()
+        if action_or_tool == "start":
             return {"state": "running"}
-        if action == "stop":
+        if action_or_tool == "stop":
             return {"state": "idle"}
-        if action == "info":
+        if action_or_tool == "info":
             return {"state": "running", "topic_out": [{"topic": self._topic, "format": "image/jpeg"}]}
         return {"state": "running"}
 
