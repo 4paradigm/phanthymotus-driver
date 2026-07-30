@@ -85,9 +85,12 @@ same controller topic.
 The semantic poses use a preparation frame before the final gesture so the
 elbow visibly flexes and raises the forearm. `wave` keeps the elbow flexed and
 combines a small shoulder-yaw sweep with wrist roll; wrist yaw remains neutral
-because it primarily twists the forearm around its own axis. `salute` uses a
-deeper elbow bend plus shoulder/wrist alignment toward the forehead, while
-`welcome` opens the arm forward and outward with a relaxed elbow bend.
+because it primarily twists the forearm around its own axis. `salute` uses
+separate preparation and approach frames before a deeper elbow bend brings the
+hand close to the forehead. `welcome` raises the palm at chest height and uses
+a smaller shoulder-yaw/wrist-roll sweep for a friendly left-right motion.
+`raise` lifts the upper arm close to overhead while keeping only a moderate
+elbow bend, making its silhouette distinct from `welcome`.
 
 Before publishing an action, the card checks fresh `/arm/status` data, all
 selected motor IDs, motor error codes, the physical/remote emergency stop and
@@ -111,7 +114,7 @@ light indicates Ready before running arm actions.
 |---|---|---|
 | `wave` | right arm, cycles 2, speed 0.5rad/s | side left/right/both, cycles 1–5, speed 0.2–1.5rad/s |
 | `salute` | right arm, speed 0.5rad/s | side left/right/both, speed 0.2–1.5rad/s |
-| `welcome` | right arm, speed 0.5rad/s | side left/right/both, speed 0.2–1.5rad/s |
+| `welcome` | right arm, cycles 2, speed 0.5rad/s | side left/right/both, cycles 1–5, speed 0.2–1.5rad/s |
 | `raise` | right arm, speed 0.5rad/s | side left/right/both, speed 0.2–1.5rad/s |
 | `reset` | right arm, speed 0.5rad/s | side left/right/both, speed 0.2–1.5rad/s |
 | `stop` | no parameters | no parameters |

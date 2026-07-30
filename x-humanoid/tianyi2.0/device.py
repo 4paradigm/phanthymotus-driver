@@ -1566,16 +1566,17 @@ class ArmGesturePlugin:
     # 沿前臂轴线的旋转。右臂由 _publish_pose 按横向关节自动镜像。
     _GESTURES = {
         "wave": [-10, 60, -10, -100, 0, 10, 0],
-        "salute": [-30, 45, -25, -115, 0, 25, 10],
-        "welcome": [-25, 50, -20, -50, 0, 15, 15],
-        "raise": [-10, 60, -5, -95, 0, 10, 0],
+        "salute": [-35, 38, -32, -125, 0, 30, 15],
+        "welcome": [-15, 40, -5, -75, 0, 35, 0],
+        "raise": [-10, 110, -5, -35, 0, 10, 0],
     }
     _PREPARE_POSES = {
         "wave": [-5, 35, -5, -60, 0, 5, 0],
         "salute": [-15, 30, -10, -70, 0, 10, 0],
-        "welcome": [-10, 25, -5, -25, 0, 5, 5],
-        "raise": [-5, 35, 0, -55, 0, 5, 0],
+        "welcome": [-10, 25, 0, -45, 0, 20, 0],
+        "raise": [-5, 60, 0, -45, 0, 5, 0],
     }
+    _SALUTE_APPROACH = [-25, 42, -20, -105, 0, 20, 8]
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._pub_node = Node("tianyi2_arm_gesture_pub", context=ros2.ctx_tianyi)
@@ -1611,7 +1612,7 @@ class ArmGesturePlugin:
                     "cycles": {
                         "type": "integer", "minimum": 1, "maximum": 5,
                         "default": 2,
-                        "description": "挥手循环次数，范围[1, 5]，默认2",
+                        "description": "挥手/欢迎摆动循环次数，范围[1, 5]，默认2",
                     },
                     "speed": {
                         "type": "number", "minimum": 0.2, "maximum": 1.5,
@@ -1622,9 +1623,9 @@ class ArmGesturePlugin:
                 "required": ["action"],
                 "x-action-params": {
                     "wave": {"params": ["side", "cycles", "speed"], "description": "举手后挥手并回到中性姿态"},
-                    "salute": {"params": ["side", "speed"], "description": "执行敬礼姿态并回正"},
-                    "welcome": {"params": ["side", "speed"], "description": "执行欢迎展示姿态并回正"},
-                    "raise": {"params": ["side", "speed"], "description": "举手并回正"},
+                    "salute": {"params": ["side", "speed"], "description": "抬起小臂、将手靠近额侧、停留后回正"},
+                    "welcome": {"params": ["side", "cycles", "speed"], "description": "胸前抬起手掌并左右摆动后回正"},
+                    "raise": {"params": ["side", "speed"], "description": "将手臂高举到头部上方后回正"},
                     "reset": {"params": ["side", "speed"], "description": "取消序列并回到中性姿态"},
                     "stop": {"params": [], "description": "取消尚未发送的后续动作帧"},
                 },
@@ -1687,7 +1688,16 @@ class ArmGesturePlugin:
         # Every gesture first bends the elbow in a moderate preparation pose.
         # This prevents the old "upper arm lifts while the forearm stays down"
         # appearance and makes the final pose easier to recognize.
-        frames = [(self._PREPARE_POSES[action], 0.35), (pose, 0.8)]
+        frames = [(self._PREPARE_POSES[action], 0.35)]
+        if action == "salute":
+            # Approach the forehead gradually to avoid a sudden close-to-head
+            # motion, then hold the recognizable salute pose.
+            frames.extend([
+                (self._SALUTE_APPROACH, 0.35),
+                (pose, 1.1),
+            ])
+        else:
+            frames.append((pose, 0.8))
         if action == "wave":
             for i in range(cycles * 2):
                 wave_pose = list(pose)
@@ -1701,6 +1711,18 @@ class ArmGesturePlugin:
                     wave_pose[2] = 5
                     wave_pose[6] = 20
                 frames.append((wave_pose, 0.6))
+        elif action == "welcome":
+            # Keep the palm lifted with wrist pitch, and wave it at chest
+            # height using a smaller shoulder-yaw/wrist-roll sweep than wave.
+            for i in range(cycles * 2):
+                welcome_pose = list(pose)
+                if i % 2 == 0:
+                    welcome_pose[2] = -15
+                    welcome_pose[6] = -25
+                else:
+                    welcome_pose[2] = 5
+                    welcome_pose[6] = 25
+                frames.append((welcome_pose, 0.55))
         frames.append((self._NEUTRAL, 1.0))
 
         def _worker(cancel_event: threading.Event):
