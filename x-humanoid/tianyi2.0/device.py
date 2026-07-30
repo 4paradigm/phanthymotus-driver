@@ -1361,7 +1361,7 @@ class ArmGesturePlugin:
         # left-arm yaw makes negative elbow pitch lift the forearm; negative yaw
         # sends it downward. Wrist pitch stays neutral in every preset because
         # it bends the hand without helping place the elbow or wrist.
-        "salute": [-10, 70, 70, -100, 0, 0, -20],
+        "salute": [-10, 90, 60, -130, 0, 0, -20],
         "welcome": [-10, 65, 75, -100, 0, 0, -30],
         "raise": [0, 130, 0, -15, 0, 0, 0],
         "shake_hands": [-55, 15, 5, -35, 0, 0, 0],
@@ -1378,10 +1378,10 @@ class ArmGesturePlugin:
         "present": [-25, 25, 30, -45, 0, 0, 0],
         "high_five": [-25, 35, 20, -45, 0, 0, -10],
     }
-    # Salute stage 2: complete the shoulder plane and elbow flexion so the
-    # forearm becomes nearly vertical. Stage 3 (_GESTURES["salute"]) adjusts
-    # only wrist roll into the final salute orientation.
-    _SALUTE_ELBOW = [-10, 70, 70, -100, 0, 0, 0]
+    # Salute stage 2: raise the upper arm laterally and fold the forearm inward,
+    # placing the wrist near the side of the head. Stage 3
+    # (_GESTURES["salute"]) adjusts only wrist roll into the final orientation.
+    _SALUTE_ELBOW = [-10, 90, 60, -130, 0, 0, 0]
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._pub_node = Node("tianyi2_arm_gesture_pub", context=ros2.ctx_tianyi)
@@ -1431,7 +1431,7 @@ class ArmGesturePlugin:
                 "required": ["action"],
                 "x-action-params": {
                     "salute": {"params": ["side", "speed"], "description": "抬起小臂、将手靠近额侧、停留后回正"},
-                    "welcome": {"params": ["side", "cycles", "speed"], "description": "胸前抬起手掌并左右摆动后回正"},
+                    "welcome": {"params": ["side", "cycles", "speed"], "description": "在身体侧上方抬起手掌并左右摆动后回正"},
                     "raise": {"params": ["side", "speed"], "description": "将手臂高举到头部上方后回正"},
                     "shake_hands": {"params": ["side", "cycles", "speed"], "description": "向前伸手并轻柔上下摆动，做出握手动作"},
                     "present": {"params": ["side", "speed"], "description": "展示 - 请看左方/右方/两边"},
@@ -1532,15 +1532,16 @@ class ArmGesturePlugin:
                     handshake_pose[3] = -42
                 frames.append((handshake_pose, 0.30, 0.85))
         elif action == "welcome":
-            # Keep the wrist fixed and sweep shoulder yaw around the final pose.
-            # This moves the whole raised hand laterally without bending it
-            # backward at the wrist.
+            # Keep shoulder yaw and the wrist fixed. In this URDF pose, changing
+            # shoulder yaw moves the hand mostly forward/backward. A small elbow
+            # pitch sweep instead produces about 10 cm of lateral hand travel
+            # with little forward/backward or vertical displacement.
             for i in range(cycles * 2):
                 welcome_pose = list(pose)
                 if i % 2 == 0:
-                    welcome_pose[2] = 65
+                    welcome_pose[3] = -110
                 else:
-                    welcome_pose[2] = 85
+                    welcome_pose[3] = -90
                 frames.append((welcome_pose, 0.35, 0.85))
         frames.append((self._NEUTRAL, 1.0, 1.0))
         for frame, _, _ in frames:

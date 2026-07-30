@@ -62,19 +62,22 @@ The semantic poses use a preparation frame before the final gesture. For
 `welcome`, `salute`, and `high_five`, shoulder roll and shoulder yaw first
 establish the elbow-flexion plane; elbow pitch can then raise the forearm
 instead of leaving it horizontal in front of the torso. `salute` uses three
-blended stages: shoulder lift until the upper arm is nearly horizontal,
-elbow flexion to approximately 100 degrees so the forearm is nearly vertical,
-then wrist-roll alignment into the final salute. In this URDF chain, shoulder
-yaw rotates the downstream elbow-pitch axis: positive left-arm yaw (mirrored
-negative on the right) makes negative elbow pitch lift the forearm, while the
-opposite yaw direction drives the forearm downward. Intermediate stages
-have no dwell and hand
-off at 90% of their calculated transition time to avoid stop-start motion.
+blended stages: the preparation frame bends the elbow, the second frame raises
+the upper arm laterally and flexes the elbow to approximately 130 degrees to
+draw the wrist inward beside the head, then wrist-roll alignment completes the
+final salute. In this URDF chain, shoulder yaw rotates the downstream
+elbow-pitch axis: positive left-arm yaw (mirrored negative on the right) makes
+negative elbow pitch lift and fold the forearm inward, while the opposite yaw
+direction drives the forearm downward. Intermediate stages have no dwell and
+hand off at 90% of their calculated transition time to avoid stop-start motion.
 The action is intentionally limited to one arm at a time to avoid interference
 near the head. The preparation frame bends the elbow before completing the
 shoulder rotation, avoiding a fully extended sweep near the head. `welcome`
-keeps all wrist axes fixed and performs its visible sweep with a bounded
-shoulder-yaw motion.
+raises the hand beside and above the torso rather than in front of the chest.
+It keeps shoulder yaw and all wrist axes fixed and sweeps elbow pitch between
+-110 and -90 degrees, which the checked-in URDF places mainly along the
+lateral axis; changing shoulder yaw here would instead move the hand mainly
+forward and backward.
 `raise` lifts the upper arm close to overhead while keeping only a moderate
 elbow bend, making its silhouette distinct from `welcome`.
 `shake_hands` extends one arm with a smaller shoulder-pitch angle than the old
