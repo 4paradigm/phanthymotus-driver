@@ -24,8 +24,6 @@ plugins:
     enabled: true
   waist:
     enabled: true
-  leg:
-    enabled: true
   hand:
     enabled: true
   tts:
@@ -33,8 +31,4 @@ plugins:
   nav:
     enabled: true
   chat:
-    enabled: true
-  lyre_event:
-    enabled: true
-  llm:
     enabled: true
