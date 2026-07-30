@@ -4,42 +4,28 @@ Phanthy Motus driver bundle for the Tianyi 2.0 Pro humanoid robot. The driver
 bridges robot-side ROS2 topics on domain 0 to Agent Core topics on domain 42 and
 exposes the capabilities as MCP tools.
 
-## Service state card
+## Robot faults card
 
-`service_state` aggregates the robot's internal `NodeState` messages and reports
-the latest running/idle state for each service topic.
-
-| Item | Value |
-|---|---|
-| Tool name | `service_state` |
-| Tool type | `sensor` |
-| Robot-side inputs | `/bodycontrol_state`, `/node/status` |
-| Agent Core output | `/{namespace}/state/service_state` |
-| Output format | `data/json` |
-
-The target robot confirms both inputs as `bodyctrl_msgs/msg/NodeState` with
-RELIABLE publishers. `/node/status` continuously reports the process manager;
-`/bodycontrol_state` is an event-oriented stream published by components such as
-the power board and Bluetooth server.
-
-## Motor faults card
-
-`motor_faults` reports only motors whose vendor error code is non-zero. It does
-not duplicate the joint position, velocity, current, or temperature stream.
+`robot_faults` aggregates verified fault signals from the robot's motors, both
+Inspire hands, and the physical/remote emergency-stop state. Input callbacks
+only update an in-memory snapshot; the Agent Core output is published at 1Hz.
 
 | Item | Value |
 |---|---|
-| Tool name | `motor_faults` |
+| Tool name | `robot_faults` |
 | Tool type | `sensor` |
-| Robot-side inputs | `/head/status`, `/arm/status`, `/waist/status`, `/leg/status` |
-| Agent Core output | `/{namespace}/state/motor_faults` |
+| Robot-side inputs | `/head/status`, `/arm/status`, `/waist/status`, `/leg/status`, `/inspire_hand/error/left_hand`, `/inspire_hand/error/right_hand`, `/power/board/key_status` |
+| Agent Core output | `/{namespace}/state/robot_faults` |
 | Output format | `data/json` |
+| Output rate | 1Hz |
 
-When a motor's error code returns to zero, it is removed from the active fault
+When an input error code returns to zero, it is removed from the active fault
 list. Error codes are preserved as vendor-provided integers; this driver does
-not invent descriptions without an authoritative error-code table.
+not invent descriptions without an authoritative error-code table. Power
+voltage, current and temperature are not classified as faults because the SDK
+does not provide authoritative alarm thresholds.
 
-Both cards are read-only. They do not command joints, stop the robot, trigger an
+The card is read-only. It does not command joints, stop the robot, trigger an
 emergency stop, or modify any robot-side configuration.
 
 ## Head gesture card
@@ -57,7 +43,18 @@ semantic sequences.
 
 Yaw, pitch and roll are clamped to the limits already documented by the raw
 `head` card. Starting a new gesture cancels the remaining frames of the previous
-gesture; `stop` cancels future frames without issuing an additional pose.
+gesture; `stop` cancels future frames without issuing an additional pose. A nod
+moves from neutral to positive pitch (down) and back to neutral; it never passes
+through negative pitch (up).
+
+| Action | Dashboard defaults | Allowed range |
+|---|---|---|
+| `nod` | cycles 2, amplitude 12°, speed 30°/s | cycles 1–5, amplitude 5–20°, speed 5–60°/s |
+| `shake` | cycles 2, amplitude 25°, speed 30°/s | cycles 1–5, amplitude 5–45°, speed 5–60°/s |
+| `scan` | cycles 2, amplitude 25°, speed 30°/s, hold 1.0s/side | cycles 1–5, amplitude 5–45°, speed 5–60°/s, hold 0.2–3.0s/side |
+| `tilt` | left, amplitude 12°, speed 30°/s, hold 0.8s | side left/right, amplitude 5–20°, speed 5–60°/s, hold 0.2–3.0s |
+| `reset` | speed 30°/s | speed 5–60°/s |
+| `stop` | no parameters | no parameters |
 
 ## Arm gesture card
 
@@ -77,3 +74,12 @@ inside the checked-in URDF limits. The preset poses still require low-speed,
 clear-area calibration on the target robot before production use. Do not run
 the raw `arm` card and `arm_gesture` concurrently because both publish to the
 same controller topic.
+
+| Action | Dashboard defaults | Allowed range |
+|---|---|---|
+| `wave` | right arm, cycles 2, speed 0.5rad/s | side left/right/both, cycles 1–5, speed 0.2–1.5rad/s |
+| `salute` | right arm, speed 0.5rad/s | side left/right/both, speed 0.2–1.5rad/s |
+| `welcome` | right arm, speed 0.5rad/s | side left/right/both, speed 0.2–1.5rad/s |
+| `raise` | right arm, speed 0.5rad/s | side left/right/both, speed 0.2–1.5rad/s |
+| `reset` | right arm, speed 0.5rad/s | side left/right/both, speed 0.2–1.5rad/s |
+| `stop` | no parameters | no parameters |

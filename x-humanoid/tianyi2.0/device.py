@@ -15,8 +15,7 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
 
 插件列表：
   StatePlugin      (sensor, multi-tool) — 关节/电池/急停/力传感器/URDF
-  ServiceStatePlugin (sensor)           — ROS2 服务节点运行状态
-  MotorFaultsPlugin (sensor)            — 电机错误码汇总
+  RobotFaultsPlugin (sensor)            — 全机故障汇总
   CameraPlugin     (sensor)             — Orbbec 头部相机
   AsrPlugin        (sensor)             — 语音识别结果
   NavStatePlugin   (sensor)             — 底盘导航状态
@@ -431,144 +430,45 @@ class StatePlugin:
         return {"error": f"unknown action: {action_or_tool}"}
 
 
-# ══════════════════════════════════════════════════════════════════════════════════
-# ServiceStatePlugin (sensor)
-# ══════════════════════════════════════════════════════════════════════════════════
-
-class ServiceStatePlugin:
-    """Track the latest running/idle state for robot services or topics."""
-
-    def __init__(self, plugin_config: dict, namespace: str, ros2):
-        configured_topics = plugin_config.get("source_topics")
-        if configured_topics is None:
-            configured_topics = [plugin_config.get("source_topic", "")]
-        self._source_topics = [
-            str(topic).strip() for topic in configured_topics
-            if str(topic).strip()
-        ]
-        self._topic = f"/{namespace}/state/service_state"
-        self._running = False
-        self._services = {}
-        self._last_update_ms = None
-        self._lock = threading.Lock()
-
-        self._sub_node = Node(
-            "tianyi2_service_state_sub", context=ros2.ctx_tianyi)
-        ros2.executor_tianyi.add_node(self._sub_node)
-        self._pub_node = Node(
-            "tianyi2_service_state_pub", context=ros2.ctx_core)
-        ros2.executor_core.add_node(self._pub_node)
-        self._publisher = self._pub_node.create_publisher(
-            String, self._topic, _RELIABLE_QOS)
-
-    def get_tool(self) -> dict:
-        return {
-            "name": "service_state",
-            "type": "sensor",
-            "description": "天轶2.0 内部服务状态 — 按Topic汇总节点 running/idle 状态",
-            "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._topic, "format": "data/json"}],
-        }
-
-    def start(self):
-        self._running = True
-        if not self._source_topics:
-            print("[ServiceStatePlugin] source topics not configured")
-            return
-        try:
-            from bodyctrl_msgs.msg import NodeState
-            for source_topic in self._source_topics:
-                self._sub_node.create_subscription(
-                    NodeState, source_topic,
-                    lambda msg, topic=source_topic: self._on_state(msg, topic),
-                    _RELIABLE_QOS,
-                )
-        except ImportError as e:
-            print(f"[ServiceStatePlugin] WARNING: msg import failed ({e}), running in stub mode")
-
-    def stop(self):
-        self._running = False
-
-    def _on_state(self, msg, source_topic: str = ""):
-        state_code = int(msg.state)
-        state = {0: "idle", 1: "running"}.get(state_code, "unknown")
-        now_ms = int(time.time() * 1000)
-        service_key = f"{source_topic}:{msg.topic}" if source_topic else msg.topic
-        with self._lock:
-            self._services[service_key] = {
-                "topic": msg.topic,
-                "source_topic": source_topic,
-                "state": state,
-                "state_code": state_code,
-                "timestamp_ms": _stamp_to_ms(msg.header.stamp) or now_ms,
-            }
-            self._last_update_ms = now_ms
-            payload = self._build_payload_locked()
-        if self._running:
-            self._publisher.publish(String(data=json.dumps(payload)))
-
-    def _build_payload_locked(self) -> dict:
-        services = sorted(self._services.values(), key=lambda x: x["topic"])
-        return {
-            "available": self._last_update_ms is not None,
-            "timestamp_ms": int(time.time() * 1000),
-            "last_update_ms": self._last_update_ms,
-            "service_count": len(services),
-            "running_count": sum(s["state"] == "running" for s in services),
-            "idle_count": sum(s["state"] == "idle" for s in services),
-            "unknown_count": sum(s["state"] == "unknown" for s in services),
-            "services": services,
-        }
-
-    def dispatch(self, action: str, args: dict) -> dict | None:
-        if action == "service_state":
-            with self._lock:
-                return self._build_payload_locked()
-        if action == "start":
-            return {"state": "running"}
-        if action == "stop":
-            return {"state": "idle"}
-        if action == "info":
-            return {
-                "state": "running",
-                "source_topics": self._source_topics,
-                "topic_out": [{"topic": self._topic, "format": "data/json"}],
-            }
-        return None
-
-
 # ════════════════════════════════════════════════════════════════════════════════
-# MotorFaultsPlugin (sensor)
+# RobotFaultsPlugin (sensor)
 # ═════════════════════════════════════════════════════════════════════════════════
 
-class MotorFaultsPlugin:
-    """Expose non-zero motor error codes without duplicating joint telemetry."""
+class RobotFaultsPlugin:
+    """Aggregate verified motor, hand and emergency-stop fault sources."""
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         default_topics = [
             "/head/status", "/arm/status", "/waist/status", "/leg/status"]
-        self._source_topics = plugin_config.get(
+        self._motor_topics = plugin_config.get(
             "motor_status_topics", default_topics)
-        self._topic = f"/{namespace}/state/motor_faults"
+        self._hand_topics = plugin_config.get("hand_error_topics", {
+            "left": "/inspire_hand/error/left_hand",
+            "right": "/inspire_hand/error/right_hand",
+        })
+        self._estop_topic = plugin_config.get(
+            "estop_topic", "/power/board/key_status")
+        self._topic = f"/{namespace}/state/robot_faults"
         self._running = False
         self._faults = {}
         self._last_update_ms = None
+        self._source_updates = {}
         self._lock = threading.Lock()
 
         self._sub_node = Node(
-            "tianyi2_motor_faults_sub", context=ros2.ctx_tianyi)
+            "tianyi2_robot_faults_sub", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._sub_node)
         self._pub_node = Node(
-            "tianyi2_motor_faults_pub", context=ros2.ctx_core)
+            "tianyi2_robot_faults_pub", context=ros2.ctx_core)
         ros2.executor_core.add_node(self._pub_node)
         self._publisher = self._pub_node.create_publisher(
             String, self._topic, _RELIABLE_QOS)
 
     def get_tool(self) -> dict:
         return {
-            "name": "motor_faults",
+            "name": "robot_faults",
             "type": "sensor",
-            "description": "天轶2.0 电机故障汇总 — 仅输出非零电机错误码及关节名",
+            "description": "天轶2.0 全机故障汇总 — 电机、左右灵巧手及急停状态，固定1Hz",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._topic, "format": "data/json"}],
         }
@@ -576,43 +476,132 @@ class MotorFaultsPlugin:
     def start(self):
         self._running = True
         try:
-            from bodyctrl_msgs.msg import MotorStatusMsg
-            for source_topic in self._source_topics:
+            from bodyctrl_msgs.msg import MotorStatusMsg, PowerBoardKeyStatus
+            from std_msgs.msg import UInt32MultiArray
+            for source_topic in self._motor_topics:
                 self._sub_node.create_subscription(
                     MotorStatusMsg, source_topic,
-                    lambda msg, topic=source_topic: self._on_status(msg, topic),
+                    lambda msg, topic=source_topic: self._on_motor_status(
+                        msg, topic),
                     _RELIABLE_QOS,
                 )
+            for side, source_topic in self._hand_topics.items():
+                self._sub_node.create_subscription(
+                    UInt32MultiArray, source_topic,
+                    lambda msg, hand=side, topic=source_topic:
+                    self._on_hand_error(msg, hand, topic),
+                    _RELIABLE_QOS,
+                )
+            self._sub_node.create_subscription(
+                PowerBoardKeyStatus, self._estop_topic,
+                self._on_estop, _RELIABLE_QOS)
         except ImportError as e:
-            print(f"[MotorFaultsPlugin] WARNING: msg import failed ({e}), running in stub mode")
+            print(f"[RobotFaultsPlugin] WARNING: msg import failed ({e}), running in stub mode")
+        self._pub_thread = threading.Thread(
+            target=self._publish_loop,
+            name="tianyi2_robot_faults_1hz",
+            daemon=True,
+        )
+        self._pub_thread.start()
 
     def stop(self):
         self._running = False
 
-    def _on_status(self, msg, source_topic: str):
+    def _on_motor_status(self, msg, source_topic: str):
         now_ms = int(time.time() * 1000)
         with self._lock:
             for motor in msg.status:
                 motor_id = int(motor.name)
+                fault_id = f"motor:{motor_id}"
                 if int(motor.error) == 0:
-                    self._faults.pop(motor_id, None)
+                    self._faults.pop(fault_id, None)
                     continue
-                self._faults[motor_id] = {
+                self._faults[fault_id] = {
+                    "fault_id": fault_id,
+                    "category": "motor",
                     "motor_id": motor_id,
-                    "joint_name": _ALL_JOINTS.get(
+                    "component": _ALL_JOINTS.get(
                         motor_id, f"motor_{motor_id}"),
                     "error_code": int(motor.error),
+                    "severity": "error",
                     "source_topic": source_topic,
                     "timestamp_ms": _stamp_to_ms(msg.header.stamp) or now_ms,
                 }
-            self._last_update_ms = now_ms
-            payload = self._build_payload_locked()
-        if self._running:
+            self._mark_source_updated_locked(source_topic, now_ms)
+
+    def _on_hand_error(self, msg, side: str, source_topic: str):
+        now_ms = int(time.time() * 1000)
+        prefix = f"hand:{side}:"
+        with self._lock:
+            for fault_id in [
+                    key for key in self._faults if key.startswith(prefix)]:
+                self._faults.pop(fault_id, None)
+            for index, error_code in enumerate(msg.data, start=1):
+                error_code = int(error_code)
+                if error_code == 0:
+                    continue
+                fault_id = f"{prefix}{index}"
+                self._faults[fault_id] = {
+                    "fault_id": fault_id,
+                    "category": "hand",
+                    "component": f"{side}_hand_error_channel_{index}",
+                    "error_code": error_code,
+                    "severity": "error",
+                    "source_topic": source_topic,
+                    "timestamp_ms": now_ms,
+                }
+            self._mark_source_updated_locked(source_topic, now_ms)
+
+    def _on_estop(self, msg):
+        now_ms = int(time.time() * 1000)
+        states = {
+            "physical": bool(msg.is_estop.data),
+            "remote": bool(msg.is_remote_estop.data),
+        }
+        with self._lock:
+            for kind, active in states.items():
+                fault_id = f"estop:{kind}"
+                if not active:
+                    self._faults.pop(fault_id, None)
+                    continue
+                self._faults[fault_id] = {
+                    "fault_id": fault_id,
+                    "category": "estop",
+                    "component": f"{kind}_estop",
+                    "error_code": 1,
+                    "severity": "fatal",
+                    "source_topic": self._estop_topic,
+                    "timestamp_ms": _stamp_to_ms(msg.header.stamp) or now_ms,
+                }
+            self._mark_source_updated_locked(self._estop_topic, now_ms)
+
+    def _mark_source_updated_locked(
+            self, source_topic: str, timestamp_ms: int) -> None:
+        self._source_updates[source_topic] = timestamp_ms
+        self._last_update_ms = timestamp_ms
+
+    def _publish_loop(self):
+        while self._running:
+            with self._lock:
+                payload = self._build_payload_locked()
             self._publisher.publish(String(data=json.dumps(payload)))
+            time.sleep(1.0)
 
     def _build_payload_locked(self) -> dict:
         faults = sorted(
-            self._faults.values(), key=lambda item: item["motor_id"])
+            self._faults.values(), key=lambda item: item["fault_id"])
+        expected_sources = (
+            list(self._motor_topics)
+            + list(self._hand_topics.values())
+            + [self._estop_topic]
+        )
+        sources = {
+            topic: {
+                "available": topic in self._source_updates,
+                "last_update_ms": self._source_updates.get(topic),
+            }
+            for topic in expected_sources
+        }
         return {
             "available": self._last_update_ms is not None,
             "timestamp_ms": int(time.time() * 1000),
@@ -620,16 +609,17 @@ class MotorFaultsPlugin:
             "healthy": self._last_update_ms is not None and not faults,
             "fault_count": len(faults),
             "summary": (
-                "尚未收到电机状态数据"
+                "尚未收到全机故障源数据"
                 if self._last_update_ms is None
-                else (f"检测到{len(faults)}个电机故障" if faults
-                      else "当前没有非零电机错误码")
+                else (f"检测到{len(faults)}个全机故障" if faults
+                      else "当前没有已知故障")
             ),
+            "sources": sources,
             "faults": faults,
         }
 
     def dispatch(self, action: str, args: dict) -> dict | None:
-        if action == "motor_faults":
+        if action == "robot_faults":
             with self._lock:
                 return self._build_payload_locked()
         if action == "start":
@@ -639,7 +629,12 @@ class MotorFaultsPlugin:
         if action == "info":
             return {
                 "state": "running",
-                "source_topics": self._source_topics,
+                "source_topics": (
+                    list(self._motor_topics)
+                    + list(self._hand_topics.values())
+                    + [self._estop_topic]
+                ),
+                "publish_rate_hz": 1,
                 "topic_out": [{"topic": self._topic, "format": "data/json"}],
             }
         return None
@@ -1013,35 +1008,60 @@ class HeadGesturePlugin:
                     "action": {
                         "type": "string",
                         "enum": ["nod", "shake", "scan", "tilt", "reset", "stop"],
-                        "description": "头部动作",
+                        "default": "nod",
+                        "description": "头部动作，可选[nod, shake, scan, tilt, reset, stop]",
                     },
                     "cycles": {
                         "type": "integer", "minimum": 1, "maximum": 5,
-                        "default": 2, "description": "循环次数",
+                        "default": 2, "description": "循环次数，范围[1, 5]，默认2",
                     },
-                    "amplitude": {
+                    "nod_amplitude": {
+                        "type": "number", "minimum": 5, "maximum": 20,
+                        "default": 12,
+                        "description": "点头向下幅度(度)，范围[5, 20]，默认12",
+                    },
+                    "shake_amplitude": {
                         "type": "number", "minimum": 5, "maximum": 45,
-                        "description": "动作幅度(度)，会再按各关节极限限幅",
+                        "default": 25,
+                        "description": "摇头左右幅度(度)，范围[5, 45]，默认25",
+                    },
+                    "scan_amplitude": {
+                        "type": "number", "minimum": 5, "maximum": 45,
+                        "default": 25,
+                        "description": "左右观察幅度(度)，范围[5, 45]，默认25",
+                    },
+                    "scan_hold": {
+                        "type": "number", "minimum": 0.2, "maximum": 3.0,
+                        "default": 1.0,
+                        "description": "左右观察时每侧停留时间(秒)，范围[0.2, 3.0]，默认1.0",
+                    },
+                    "tilt_amplitude": {
+                        "type": "number", "minimum": 5, "maximum": 20,
+                        "default": 12,
+                        "description": "歪头幅度(度)，范围[5, 20]，默认12",
                     },
                     "speed": {
                         "type": "number", "minimum": 5, "maximum": 60,
-                        "default": 30, "description": "动作速度(度/秒)",
+                        "default": 30,
+                        "description": "动作速度(度/秒)，范围[5, 60]，默认30",
                     },
                     "side": {
                         "type": "string", "enum": ["left", "right"],
-                        "default": "left", "description": "歪头方向",
+                        "default": "left",
+                        "description": "歪头方向，可选[left, right]，默认left",
                     },
                     "hold": {
                         "type": "number", "minimum": 0.2, "maximum": 3.0,
-                        "default": 0.8, "description": "歪头保持时间(秒)",
+                        "default": 0.8,
+                        "description": "歪头保持时间(秒)，范围[0.2, 3.0]，默认0.8",
                     },
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "nod": {"params": ["cycles", "amplitude", "speed"], "description": "连续点头后回正"},
-                    "shake": {"params": ["cycles", "amplitude", "speed"], "description": "连续摇头后回正"},
-                    "scan": {"params": ["cycles", "amplitude", "speed"], "description": "左右观察后回正"},
-                    "tilt": {"params": ["side", "amplitude", "speed", "hold"], "description": "向指定方向歪头后回正"},
+                    "nod": {"params": ["cycles", "nod_amplitude", "speed"], "description": "向下点头后回正，不经过抬头姿态"},
+                    "shake": {"params": ["cycles", "shake_amplitude", "speed"], "description": "在左右方向之间连续摇头后回正"},
+                    "scan": {"params": ["cycles", "scan_amplitude", "speed", "scan_hold"], "description": "依次观察左侧并停留、回中、观察右侧并停留、回中"},
+                    "tilt": {"params": ["side", "tilt_amplitude", "speed", "hold"], "description": "向指定方向歪头、保持后回正"},
                     "reset": {"params": ["speed"], "description": "取消序列并将头部回正"},
                     "stop": {"params": [], "description": "取消尚未发送的后续动作帧"},
                 },
@@ -1075,29 +1095,33 @@ class HeadGesturePlugin:
 
         cycles = int(_clamp(args.get("cycles", 2), 1, 5))
         speed = _clamp(args.get("speed", 30), 5, 60)
-        amplitude_default = 12 if action in ("nod", "tilt") else 25
-        amplitude = _clamp(args.get("amplitude", amplitude_default), 5, 45)
+        amplitude_specs = {
+            "nod": ("nod_amplitude", 12, 20),
+            "shake": ("shake_amplitude", 25, 45),
+            "scan": ("scan_amplitude", 25, 45),
+            "tilt": ("tilt_amplitude", 12, 20),
+        }
+        amplitude_key, amplitude_default, amplitude_max = amplitude_specs[action]
+        amplitude = _clamp(
+            args.get(amplitude_key, amplitude_default), 5, amplitude_max)
 
         frames: list[tuple[float, float, float, float]] = []
         if action == "nod":
-            amplitude = min(amplitude, 20)
             for _ in range(cycles):
                 frames.extend([(0, amplitude, 0, amplitude / speed),
-                               (0, -amplitude, 0, 2 * amplitude / speed)])
+                               (0, 0, 0, amplitude / speed)])
         elif action == "shake":
-            amplitude = min(amplitude, 45)
             for _ in range(cycles):
                 frames.extend([(amplitude, 0, 0, amplitude / speed),
                                (-amplitude, 0, 0, 2 * amplitude / speed)])
         elif action == "scan":
-            amplitude = min(amplitude, 45)
+            scan_hold = _clamp(args.get("scan_hold", 1.0), 0.2, 3.0)
             for _ in range(cycles):
-                frames.extend([(amplitude, 0, 0, amplitude / speed),
+                frames.extend([(amplitude, 0, 0, amplitude / speed + scan_hold),
                                (0, 0, 0, amplitude / speed),
-                               (-amplitude, 0, 0, amplitude / speed),
+                               (-amplitude, 0, 0, amplitude / speed + scan_hold),
                                (0, 0, 0, amplitude / speed)])
         else:
-            amplitude = min(amplitude, 20)
             roll = amplitude if args.get("side", "left") == "left" else -amplitude
             hold = _clamp(args.get("hold", 0.8), 0.2, 3.0)
             frames.append((0, 0, roll, amplitude / speed + hold))
@@ -1315,19 +1339,23 @@ class ArmGesturePlugin:
                     "action": {
                         "type": "string",
                         "enum": ["wave", "salute", "welcome", "raise", "reset", "stop"],
-                        "description": "手臂动作",
+                        "default": "wave",
+                        "description": "手臂动作，可选[wave, salute, welcome, raise, reset, stop]",
                     },
                     "side": {
                         "type": "string", "enum": ["left", "right", "both"],
-                        "default": "right", "description": "执行手臂",
+                        "default": "right",
+                        "description": "执行手臂，可选[left, right, both]，默认right",
                     },
                     "cycles": {
                         "type": "integer", "minimum": 1, "maximum": 5,
-                        "default": 2, "description": "挥手循环次数",
+                        "default": 2,
+                        "description": "挥手循环次数，范围[1, 5]，默认2",
                     },
                     "speed": {
                         "type": "number", "minimum": 0.2, "maximum": 1.5,
-                        "default": 0.5, "description": "关节速度(rad/s)",
+                        "default": 0.5,
+                        "description": "关节速度(rad/s)，范围[0.2, 1.5]，默认0.5",
                     },
                 },
                 "required": ["action"],
