@@ -82,6 +82,8 @@ class _MicNode(Node):
         self._sock:   socket.socket | None = None
         self._thread: threading.Thread | None = None
         self.state   = "idle"
+        self._packet_count = 0
+        self._last_packet_ts = 0.0
         self.get_logger().info(f"MicNode ready — topic: {topic}")
 
     def start_capture(self) -> str:
@@ -99,10 +101,20 @@ class _MicNode(Node):
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
         sock.settimeout(0.5)
         self._sock   = sock
-        self.state   = "running"
+        self._packet_count = 0
         self._thread = threading.Thread(target=self._pump, daemon=True)
         self._thread.start()
-        self.get_logger().info(f"Capture started — multicast {MIC_GROUP_IP}:{MIC_PORT}")
+        # Wait up to 3s for first packet to verify multicast is working
+        import time as _t
+        deadline = _t.monotonic() + 3.0
+        while _t.monotonic() < deadline and self._packet_count == 0:
+            _t.sleep(0.1)
+        if self._packet_count > 0:
+            self.state = "running"
+            self.get_logger().info(f"Capture started — multicast {MIC_GROUP_IP}:{MIC_PORT} (verified: {self._packet_count} packets)")
+        else:
+            self.state = "degraded"
+            self.get_logger().warn(f"Capture started but NO packets received in 3s — multicast may not be available")
         return self._topic
 
     def stop_capture(self) -> None:
@@ -124,6 +136,8 @@ class _MicNode(Node):
                 continue
             except OSError:
                 break
+            self._packet_count += 1
+            self._last_packet_ts = time.monotonic()
             buf.extend(data)
             while len(buf) >= CHUNK_BYTES:
                 chunk = bytes(buf[:CHUNK_BYTES])
@@ -166,11 +180,18 @@ class MicPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
-            return {"state": "running"}
+            self._node.start_capture()
+            return {"state": self._node.state}
         if action == "stop":
             return {"state": "idle"}
         if action == "info":
-            return {"state": "running", "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}]}
+            last_ago = int((time.monotonic() - self._node._last_packet_ts) * 1000) if self._node._last_packet_ts > 0 else -1
+            return {
+                "state": self._node.state,
+                "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}],
+                "packets": self._node._packet_count,
+                "last_packet_ago_ms": last_ago,
+            }
         return None
 
 
@@ -411,7 +432,32 @@ class SpeakerPlugin:
         }
 
     def start(self) -> None:
-        pass  # no-op until canvas sends input_topic via play action
+        # Play startup beep to confirm speaker hardware is working
+        self._play_startup_beep()
+
+    def _play_startup_beep(self) -> None:
+        """Play a short ascending beep (like DJI drone startup) to confirm speaker works."""
+        import math, struct
+        sample_rate = 16000
+        # Two short beeps: 880Hz 100ms + 1320Hz 100ms (ascending)
+        pcm = b''
+        for freq, duration_ms in [(880, 100), (1320, 100)]:
+            samples = int(sample_rate * duration_ms / 1000)
+            for i in range(samples):
+                # Fade in/out envelope to avoid clicks
+                env = min(i / 100, 1.0, (samples - i) / 100)
+                val = int(12000 * env * math.sin(2 * math.pi * freq * i / sample_rate))
+                pcm += struct.pack('<h', val)
+            # 30ms silence between beeps
+            pcm += b'\x00\x00' * int(sample_rate * 0.03)
+        try:
+            code, _ = self._node._client.PlayStream(APP_NAME, "0", pcm)
+            if code == 0:
+                self._node.get_logger().info("[speaker] startup beep OK")
+            else:
+                self._node.get_logger().warn(f"[speaker] startup beep failed: code={code}")
+        except Exception as e:
+            self._node.get_logger().warn(f"[speaker] startup beep error: {e}")
 
     def stop(self) -> None:
         self._node.stop_play()
