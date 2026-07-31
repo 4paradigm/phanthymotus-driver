@@ -214,7 +214,7 @@ class SoftwareManifestTests(unittest.TestCase):
         )
         self.assertEqual(
             {
-                "state": "idle",
+                "state": "ready",
                 "plugin_state": "running",
                 "tools": ["software_manifest", "bag_recorder"],
                 "pid": None,
@@ -223,7 +223,7 @@ class SoftwareManifestTests(unittest.TestCase):
         )
         self.assertEqual(
             {
-                "state": "idle",
+                "state": "ready",
                 "plugin_state": "running",
                 "tools": ["software_manifest", "bag_recorder"],
                 "pid": None,

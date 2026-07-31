@@ -21,8 +21,8 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
 COPY msgs/ /tianyi_ws/src/
 RUN cd /tianyi_ws && \
     . /opt/ros/humble/setup.sh && \
-    colcon build --packages-select bodyctrl_msgs lyre_msgs orbbec_camera_msgs || \
-    echo "WARNING: msg build failed, will run in stub mode"
+    colcon build --packages-select \
+        bodyctrl_msgs lyre_msgs orbbec_camera_msgs
 
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ENV PYTHONUNBUFFERED=1

@@ -21,14 +21,20 @@ implemented as one Python file per capability:
 `stop_recording`, `status`, and `list_sessions`. It always launches the fixed
 official command `ros2 launch utils record_trigger.py`; MCP callers cannot
 inject a shell command, topic list, setup path, or output path. The process runs
-inside the host namespaces through `nsenter`, rejects duplicate starts, and is
-stopped with `SIGINT` before bounded `SIGTERM`/`SIGKILL` fallbacks.
+inside the host namespaces through `nsenter`. A host process scan plus a
+host-wide `flock` reject duplicate starts across driver restarts and concurrent
+instances. Managed recordings are stopped with `SIGINT` before bounded
+`SIGTERM`/`SIGKILL` fallbacks; a recorder started outside this driver is
+reported but never signalled automatically.
 
 The official recorder reads its topic configuration from
 `/home/ubuntu/ros2ws/install/utils/lib/utils/bag_record/config/record.json` and
 writes rolling sessions under `/home/ubuntu/bags`. The Tianyi documentation
 defines 100 MB segments and a 4 GB rolling limit; those retention settings stay
 owned by the official recorder rather than being duplicated in this driver.
+Before launch, the card validates that the setup and recorder JSON exist and
+that the JSON is structurally valid, then probes the child process for an
+immediate startup failure.
 
 ### Software manifest
 

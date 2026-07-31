@@ -66,8 +66,16 @@ _SOFTWARE_MANIFEST_MAX_BYTES = 1024 * 1024
 _DEFAULT_HOST_ROOT = "/proc/1/root"
 _DEFAULT_BAG_HOST_PATH = "/home/ubuntu/bags"
 _DEFAULT_ROS_SETUP_HOST_PATH = "/home/ubuntu/ros2ws/install/setup.bash"
+_DEFAULT_BAG_CONFIG_HOST_PATH = (
+    "/home/ubuntu/ros2ws/install/utils/lib/utils/"
+    "bag_record/config/record.json"
+)
+_BAG_RECORDER_LOCK_HOST_PATH = (
+    "/run/phanthymotus-tianyi2-bag-recorder.lock"
+)
 _BAG_FILE_SUFFIXES = {".bag", ".db3", ".mcap"}
 _MAX_BAG_SESSIONS = 50
+_BAG_CONFIG_MAX_BYTES = 1024 * 1024
 
 _CAMERA_EXTRINSICS_QOS = QoSProfile(
     reliability=ReliabilityPolicy.RELIABLE,
@@ -218,9 +226,15 @@ class SystemPlugin:
             config.get("bag_dir", _DEFAULT_BAG_HOST_PATH), "bag_dir")
         self._setup_host_path = self._validate_host_path(
             config.get("setup", _DEFAULT_ROS_SETUP_HOST_PATH), "setup")
+        self._bag_config_host_path = self._validate_host_path(
+            config.get("record_config", _DEFAULT_BAG_CONFIG_HOST_PATH),
+            "record_config",
+        )
         self._visible_bag_dir = self._resolve_host_path(self._bag_host_path)
         self._visible_setup_path = self._resolve_host_path(
             self._setup_host_path)
+        self._visible_bag_config_path = self._resolve_host_path(
+            self._bag_config_host_path)
 
         configured_manifest = config.get("software_manifest_path")
         if configured_manifest is None:
@@ -243,6 +257,8 @@ class SystemPlugin:
             config.get("terminate_timeout_s", 2.0))
         self._kill_timeout_s = self._bounded_timeout(
             config.get("kill_timeout_s", 1.0))
+        self._start_probe_s = self._bounded_probe(
+            config.get("start_probe_s", 0.25))
 
     @staticmethod
     def _validate_host_path(value, field_name: str) -> str:
@@ -257,6 +273,13 @@ class SystemPlugin:
             return max(0.001, min(30.0, float(value)))
         except (TypeError, ValueError):
             return 5.0
+
+    @staticmethod
+    def _bounded_probe(value) -> float:
+        try:
+            return max(0.0, min(2.0, float(value)))
+        except (TypeError, ValueError):
+            return 0.25
 
     def _resolve_host_path(self, host_path: str) -> Path:
         path = PurePosixPath(host_path)
@@ -328,7 +351,7 @@ class SystemPlugin:
         self._running = True
 
     def stop(self):
-        self._stop_recording()
+        self._stop_recording(check_external=False)
         self._running = False
 
     def dispatch(self, action_or_tool: str, args: dict) -> dict:
@@ -344,10 +367,12 @@ class SystemPlugin:
             return self._list_bag_sessions()
         if action_or_tool == "start":
             self.start()
-            return self._lifecycle_info()
+            return self._lifecycle_info("ready")
         if action_or_tool == "stop":
-            self.stop()
-            return self._lifecycle_info()
+            # Actuator lifecycle stop is an immediate marker. Recording is
+            # stopped only by stop_recording or bundle teardown.
+            self._running = False
+            return self._lifecycle_info("idle")
         if action_or_tool == "info":
             return self._lifecycle_info()
         return self._error(
@@ -364,10 +389,14 @@ class SystemPlugin:
         result.update(details)
         return result
 
-    def _lifecycle_info(self) -> dict:
-        status = self._recorder_status()
+    def _lifecycle_info(self, state_override: str | None = None) -> dict:
+        with self._recorder_lock:
+            status = self._recorder_status_locked()
+        state = state_override or status["state"]
+        if state_override is None and state == "idle" and self._running:
+            state = "ready"
         return {
-            "state": status["state"],
+            "state": state,
             "plugin_state": "running" if self._running else "idle",
             "tools": ["software_manifest", "bag_recorder"],
             "pid": status.get("pid"),
@@ -438,15 +467,28 @@ class SystemPlugin:
                     "A bag recording session is already running",
                     pid=status["pid"],
                 )
-            if not self._visible_setup_path.is_file():
+
+            preflight_error = self._recorder_preflight()
+            if preflight_error is not None:
+                return preflight_error
+
+            process_scan = self._find_host_recorders()
+            if not process_scan["ok"]:
                 return self._error(
-                    "recorder_setup_not_found",
-                    "Tianyi ROS setup file was not found on the host",
-                    setup=self._setup_host_path,
+                    "recorder_process_check_failed",
+                    "Could not verify whether a host recorder is running",
+                )
+            if process_scan["pids"]:
+                return self._error(
+                    "already_recording",
+                    "A host bag recording session is already running",
+                    external_pids=process_scan["pids"],
                 )
 
             command = [
                 "nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--",
+                "flock", "-n", "-E", "73",
+                _BAG_RECORDER_LOCK_HOST_PATH,
                 "bash", "-lc",
                 'source "$1" && exec ros2 launch utils record_trigger.py',
                 "bash", self._setup_host_path,
@@ -474,43 +516,67 @@ class SystemPlugin:
             self._recorder_process = process
             self._recorder_started_at = time.time()
             self._last_recorder_exit_code = None
+            if self._start_probe_s:
+                time.sleep(self._start_probe_s)
+            exit_code = process.poll()
+            if exit_code is not None:
+                self._finish_recording(exit_code)
+                if exit_code == 73:
+                    return self._error(
+                        "already_recording",
+                        "The host-wide recorder lock is already held",
+                    )
+                return self._error(
+                    "recorder_start_failed",
+                    "The host bag recorder exited during startup",
+                    exit_code=exit_code,
+                )
+
             return {
                 "ok": True,
                 "state": "recording",
+                "managed": True,
                 "pid": process.pid,
                 "bag_directory": self._bag_host_path,
+                "record_config": self._bag_config_host_path,
                 "started_at": self._format_time(self._recorder_started_at),
             }
 
     def _recorder_status(self) -> dict:
         with self._recorder_lock:
-            return self._recorder_status_locked()
+            status = self._recorder_status_locked()
+            if status["state"] == "recording":
+                return status
+
+            process_scan = self._find_host_recorders()
+            if not process_scan["ok"]:
+                status["external_check"] = "unavailable"
+                return status
+            if process_scan["pids"]:
+                return {
+                    "ok": True,
+                    "state": "recording",
+                    "managed": False,
+                    "external_pids": process_scan["pids"],
+                    "bag_directory": self._bag_host_path,
+                }
+            status["external_check"] = "clear"
+            return status
 
     def _recorder_status_locked(self) -> dict:
         process = self._recorder_process
         if process is None:
-            return {
-                "ok": True,
-                "state": "idle",
-                "bag_directory": self._bag_host_path,
-                "last_exit_code": self._last_recorder_exit_code,
-            }
+            return self._idle_recorder_result()
 
         exit_code = process.poll()
         if exit_code is not None:
-            self._last_recorder_exit_code = exit_code
-            self._recorder_process = None
-            self._recorder_started_at = None
-            return {
-                "ok": True,
-                "state": "idle",
-                "bag_directory": self._bag_host_path,
-                "last_exit_code": exit_code,
-            }
+            self._finish_recording(exit_code)
+            return self._idle_recorder_result()
 
         return {
             "ok": True,
             "state": "recording",
+            "managed": True,
             "pid": process.pid,
             "bag_directory": self._bag_host_path,
             "started_at": self._format_time(self._recorder_started_at),
@@ -518,23 +584,39 @@ class SystemPlugin:
                 max(0.0, time.time() - self._recorder_started_at), 3),
         }
 
-    def _stop_recording(self) -> dict:
+    def _stop_recording(self, check_external: bool = True) -> dict:
         with self._recorder_lock:
             status = self._recorder_status_locked()
             if status["state"] == "idle":
+                if not check_external:
+                    return status
+                process_scan = self._find_host_recorders()
+                if not process_scan["ok"]:
+                    return self._error(
+                        "recorder_process_check_failed",
+                        "Could not verify whether a host recorder is running",
+                    )
+                if process_scan["pids"]:
+                    return self._error(
+                        "recorder_not_managed",
+                        "A host recorder exists but was not started by this "
+                        "driver instance; it will not be signalled",
+                        external_pids=process_scan["pids"],
+                    )
                 return status
 
             process = self._recorder_process
             try:
                 process_group = os.getpgid(process.pid)
             except ProcessLookupError:
-                self._recorder_process = None
-                self._recorder_started_at = None
-                return {
-                    "ok": True,
-                    "state": "idle",
-                    "bag_directory": self._bag_host_path,
-                }
+                self._finish_recording(process.poll())
+                return self._idle_recorder_result()
+            except OSError as error:
+                return self._error(
+                    "recorder_signal_failed",
+                    "Could not resolve the recorder process group",
+                    errno=error.errno,
+                )
 
             stages = [
                 ("sigint", signal.SIGINT, self._stop_timeout_s),
@@ -547,26 +629,23 @@ class SystemPlugin:
                 except ProcessLookupError:
                     exit_code = process.poll()
                     self._finish_recording(exit_code)
-                    return {
-                        "ok": True,
-                        "state": "idle",
-                        "stop_stage": stage,
-                        "exit_code": exit_code,
-                        "bag_directory": self._bag_host_path,
-                    }
+                    return self._idle_recorder_result(
+                        stop_stage=stage, exit_code=exit_code)
+                except OSError as error:
+                    return self._error(
+                        "recorder_signal_failed",
+                        "Could not signal the recorder process group",
+                        errno=error.errno,
+                        stop_stage=stage,
+                    )
                 try:
                     exit_code = process.wait(timeout=timeout_s)
                 except subprocess.TimeoutExpired:
                     continue
 
                 self._finish_recording(exit_code)
-                return {
-                    "ok": True,
-                    "state": "idle",
-                    "stop_stage": stage,
-                    "exit_code": exit_code,
-                    "bag_directory": self._bag_host_path,
-                }
+                return self._idle_recorder_result(
+                    stop_stage=stage, exit_code=exit_code)
 
             return self._error(
                 "recorder_stop_failed",
@@ -578,6 +657,107 @@ class SystemPlugin:
         self._last_recorder_exit_code = exit_code
         self._recorder_process = None
         self._recorder_started_at = None
+
+    def _idle_recorder_result(self, **details) -> dict:
+        result = {
+            "ok": True,
+            "state": "idle",
+            "managed": True,
+            "bag_directory": self._bag_host_path,
+            "last_exit_code": self._last_recorder_exit_code,
+        }
+        result.update(details)
+        return result
+
+    def _recorder_preflight(self) -> dict | None:
+        if not self._visible_setup_path.is_file():
+            return self._error(
+                "recorder_setup_not_found",
+                "Tianyi ROS setup file was not found on the host",
+                setup=self._setup_host_path,
+            )
+        try:
+            with self._visible_bag_config_path.open("rb") as config_file:
+                raw = config_file.read(_BAG_CONFIG_MAX_BYTES + 1)
+        except FileNotFoundError:
+            return self._error(
+                "recorder_config_not_found",
+                "The official bag recorder configuration was not found",
+                record_config=self._bag_config_host_path,
+            )
+        except PermissionError:
+            return self._error(
+                "recorder_config_permission_denied",
+                "Permission denied while reading recorder configuration",
+                record_config=self._bag_config_host_path,
+            )
+        except OSError:
+            return self._error(
+                "recorder_config_read_failed",
+                "Recorder configuration could not be read",
+                record_config=self._bag_config_host_path,
+            )
+
+        if len(raw) > _BAG_CONFIG_MAX_BYTES:
+            return self._error(
+                "recorder_config_too_large",
+                "Recorder configuration exceeds the 1048576-byte limit",
+                record_config=self._bag_config_host_path,
+            )
+        try:
+            config = json.loads(
+                raw.decode("utf-8-sig"),
+                parse_constant=_reject_nonstandard_json_constant,
+            )
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            ValueError,
+            RecursionError,
+        ):
+            return self._error(
+                "recorder_config_invalid",
+                "Recorder configuration is not valid JSON",
+                record_config=self._bag_config_host_path,
+            )
+        if not isinstance(config, (dict, list)):
+            return self._error(
+                "recorder_config_invalid",
+                "Recorder configuration root must be an object or array",
+                record_config=self._bag_config_host_path,
+            )
+        return None
+
+    @staticmethod
+    def _find_host_recorders() -> dict:
+        command = [
+            "nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--",
+            "ps", "-eo", "pid=,args=",
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=3.0,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return {"ok": False, "pids": []}
+        if result.returncode != 0:
+            return {"ok": False, "pids": []}
+
+        pids = []
+        signature = "ros2 launch utils record_trigger.py"
+        for line in result.stdout.splitlines():
+            fields = line.strip().split(maxsplit=1)
+            if len(fields) != 2 or signature not in fields[1]:
+                continue
+            try:
+                pids.append(int(fields[0]))
+            except ValueError:
+                continue
+        return {"ok": True, "pids": sorted(set(pids))}
 
     def _list_bag_sessions(self) -> dict:
         try:

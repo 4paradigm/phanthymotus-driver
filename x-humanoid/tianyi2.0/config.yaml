@@ -13,6 +13,7 @@ plugins:
     host_root: "/proc/1/root"
     bag_dir: "/home/ubuntu/bags"
     setup: "/home/ubuntu/ros2ws/install/setup.bash"
+    record_config: "/home/ubuntu/ros2ws/install/utils/lib/utils/bag_record/config/record.json"
   state:
     enabled: true
   camera:

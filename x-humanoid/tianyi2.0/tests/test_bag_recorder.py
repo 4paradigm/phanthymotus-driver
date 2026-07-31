@@ -98,9 +98,27 @@ class BagRecorderTests(unittest.TestCase):
             / "install"
             / "setup.bash"
         )
+        self.record_config = (
+            self.host_root
+            / "home"
+            / "ubuntu"
+            / "ros2ws"
+            / "install"
+            / "utils"
+            / "lib"
+            / "utils"
+            / "bag_record"
+            / "config"
+            / "record.json"
+        )
         self.bag_dir.mkdir(parents=True)
         self.setup.parent.mkdir(parents=True)
         self.setup.write_text("# test setup\n", encoding="utf-8")
+        self.record_config.parent.mkdir(parents=True)
+        self.record_config.write_text(
+            '{"segment_size_mb": 100, "max_size_gb": 4}',
+            encoding="utf-8",
+        )
         self.plugin = device.SystemPlugin(
             {
                 "host_root": str(self.host_root),
@@ -109,11 +127,14 @@ class BagRecorderTests(unittest.TestCase):
                 "stop_timeout_s": 0.01,
                 "terminate_timeout_s": 0.01,
                 "kill_timeout_s": 0.01,
+                "start_probe_s": 0,
             },
             "test_robot",
             None,
         )
         self.plugin.start()
+        self.plugin._find_host_recorders = mock.Mock(
+            return_value={"ok": True, "pids": []})
 
     def tearDown(self):
         self._temp_dir.cleanup()
@@ -154,7 +175,9 @@ class BagRecorderTests(unittest.TestCase):
         self.assertEqual(
             [
                 "nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p",
-                "--", "bash", "-lc",
+                "--", "flock", "-n", "-E", "73",
+                "/run/phanthymotus-tianyi2-bag-recorder.lock",
+                "bash", "-lc",
                 'source "$1" && exec ros2 launch utils record_trigger.py',
                 "bash", "/home/ubuntu/ros2ws/install/setup.bash",
             ],
@@ -179,6 +202,56 @@ class BagRecorderTests(unittest.TestCase):
 
         self.assertEqual("recorder_setup_not_found", result["code"])
         popen.assert_not_called()
+
+    def test_missing_or_invalid_record_config_is_rejected(self):
+        self.record_config.unlink()
+        missing = self.plugin.dispatch("start_recording", {})
+        self.assertEqual("recorder_config_not_found", missing["code"])
+
+        self.record_config.write_text("{invalid", encoding="utf-8")
+        invalid = self.plugin.dispatch("start_recording", {})
+        self.assertEqual("recorder_config_invalid", invalid["code"])
+
+    def test_external_recorder_is_rejected_without_spawning(self):
+        self.plugin._find_host_recorders.return_value = {
+            "ok": True,
+            "pids": [1234],
+        }
+
+        with mock.patch.object(device.subprocess, "Popen") as popen:
+            result = self.plugin.dispatch("start_recording", {})
+
+        self.assertEqual("already_recording", result["code"])
+        self.assertEqual([1234], result["external_pids"])
+        popen.assert_not_called()
+
+    def test_host_process_scan_matches_only_the_official_launch(self):
+        process_list = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=(
+                "  123 python3 /opt/ros/humble/bin/ros2 launch "
+                "utils record_trigger.py\n"
+                "  456 python3 unrelated.py\n"
+            ),
+            stderr="",
+        )
+        with mock.patch.object(
+                device.subprocess, "run", return_value=process_list):
+            result = device.SystemPlugin._find_host_recorders()
+
+        self.assertEqual({"ok": True, "pids": [123]}, result)
+
+    def test_immediate_launch_failure_is_not_reported_as_recording(self):
+        process = _FakeProcess()
+        process.returncode = 2
+
+        with mock.patch.object(
+                device.subprocess, "Popen", return_value=process):
+            result = self.plugin.dispatch("start_recording", {})
+
+        self.assertEqual("recorder_start_failed", result["code"])
+        self.assertEqual(2, result["exit_code"])
 
     def test_stop_sends_sigint_to_the_managed_process_group(self):
         process = _FakeProcess()
@@ -266,6 +339,22 @@ class BagRecorderTests(unittest.TestCase):
         info = self.plugin.dispatch("info", {})
         self.assertEqual("idle", info["plugin_state"])
         self.assertEqual("idle", info["state"])
+
+    def test_actuator_lifecycle_stop_is_an_immediate_marker(self):
+        process = _FakeProcess()
+        with mock.patch.object(
+                device.subprocess, "Popen", return_value=process):
+            self.plugin.dispatch("start_recording", {})
+
+        with mock.patch.object(device.os, "killpg") as killpg:
+            result = self.plugin.dispatch("stop", {})
+
+        self.assertEqual("idle", result["state"])
+        killpg.assert_not_called()
+        self.assertEqual(
+            "recording",
+            self.plugin._recorder_status_locked()["state"],
+        )
 
     def test_invalid_host_paths_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "absolute host path"):
