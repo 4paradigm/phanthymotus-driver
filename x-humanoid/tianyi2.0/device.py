@@ -14,24 +14,28 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   - domain 42 (ros2.ctx_core): 发布传感器数据给 Agent Core
 
 插件列表：
-  StatePlugin      (sensor, multi-tool) — 关节/电池/急停/力传感器/URDF
-  CameraPlugin     (sensor)             — Orbbec 头部相机
-  AsrPlugin        (sensor)             — 语音识别结果
-  NavStatePlugin   (sensor)             — 底盘导航状态
-  HeadPlugin       (actuator)           — 头部3DOF控制
-  HeadGesturePlugin (actuator)          — 点头/摇头/左右观察等语义动作
-  ArmPlugin        (actuator)           — 双臂14DOF控制
-  WaistPlugin      (actuator)           — 腰部2DOF控制
-  HandPlugin       (actuator)           — 灵巧手控制
-  TtsPlugin        (actuator)           — 语音合成
-  NavPlugin        (actuator)           — 底盘导航控制
-  ChatPlugin       (actuator)           — 语音交互开关
+  StatePlugin         (sensor, multi-tool) — 关节/电池/急停/力传感器/URDF
+  CameraPlugin        (sensor)             — Orbbec 头部相机
+  AsrPlugin           (sensor)             — 语音识别结果
+  NavStatePlugin      (sensor)             — 底盘导航状态
+  PowerBoardStatePlugin (sensor)          — 电源板MOS温度/电流/电压
+  HeadPlugin          (actuator)           — 头部3DOF控制
+  HeadGesturePlugin   (actuator)           — 点头/摇头/左右观察等语义动作
+  ArmPlugin           (actuator)           — 双臂14DOF控制
+  WaistPlugin         (actuator)           — 腰部2DOF控制
+  HandPlugin          (actuator)           — 灵巧手控制
+  TtsPlugin           (actuator)           — 语音合成
+  VoicePlayActuatorPlugin (actuator)      — 音频播放控制(文件/URL/TTS)
+  NavPlugin           (actuator)           — 底盘导航控制
+  ChatPlugin          (actuator)           — 语音交互开关
+  VoiceChatActuatorPlugin (actuator)      — 语音对话开关
 """
 
 from __future__ import annotations
 
 import json
 import math
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -615,6 +619,129 @@ class AsrPlugin:
         if not self._running:
             return
         self._pub.publish(msg)
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "stop", "info"):
+            return {"state": "running" if self._running else "idle",
+                    "topic_out": [{"topic": self._topic, "format": "data/json"}]}
+        return {"state": "running"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PowerBoardStatePlugin (sensor) — 电源板状态卡
+# ══════════════════════════════════════════════════════════════════════════════
+
+class PowerBoardStatePlugin:
+    """天轶2.0 Pro 电源板状态: 1Hz, 各部位MOS温度/电流/电压含极值, 母线电压, 软硬版本, 电池汇总."""
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._topic = f"/{namespace}/state/power_board"
+        self._running = False
+        self._data = {}
+        self._lock = threading.Lock()
+
+        self._sub_node = Node("tianyi2_power_sub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._sub_node)
+
+        self._pub_node = Node("tianyi2_power_pub", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._pub_node)
+        self._pub = self._pub_node.create_publisher(String, self._topic, _LOW_LAT_QOS)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "power_board",
+            "type": "sensor",
+            "multiInstance": False,
+            "readOnly": True,
+            "description": "天轶2.0 Pro 电源板状态(1Hz,各部位MOS温度/电流/电压含极值,母线电压,软硬版本,电池汇总)。",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._topic, "format": "data/json"}],
+        }
+
+    def start(self):
+        self._running = True
+        try:
+            from bodyctrl_msgs.msg import PowerStatus
+            self._sub_node.create_subscription(
+                PowerStatus, "/power/board/status", self._on_power, _RELIABLE_QOS)
+            print("[PowerBoardStatePlugin] subscription created")
+        except ImportError as e:
+            print(f"[PowerBoardStatePlugin] WARNING: import failed ({e}), running in stub mode")
+
+        self._thread = threading.Thread(target=self._publish_loop, daemon=True)
+        self._thread.start()
+        print("[PowerBoardStatePlugin] publish started")
+
+    def stop(self):
+        self._running = False
+
+    def _on_power(self, msg):
+        with self._lock:
+            # Build temp dict with min/max
+            temp_parts = ["waist", "arm_a", "arm_b", "leg_a", "leg_b"]
+            temp = {}
+            temp_max = {}
+            temp_min = {}
+            for p in temp_parts:
+                base = p.replace("_", "")
+                temp[p] = getattr(msg, f"{base}_temp", 0)
+                temp_max[p] = getattr(msg, f"{base}_temp_max", 0)
+                temp_min[p] = getattr(msg, f"{base}_temp_min", 0)
+
+            current_parts = ["arm_a", "arm_b", "leg_a", "leg_b", "waist", "head"]
+            current = {}
+            current_max = {}
+            current_min = {}
+            for p in current_parts:
+                base = p.replace("_", "")
+                current[p] = getattr(msg, f"{base}_curr", 0)
+                current_max[p] = getattr(msg, f"{base}_curr_max", 0)
+                current_min[p] = getattr(msg, f"{base}_curr_min", 0)
+
+            voltage_parts = ["arm_a", "arm_b", "leg_a", "leg_b", "waist"]
+            voltage = {}
+            voltage_max = {}
+            voltage_min = {}
+            for p in voltage_parts:
+                base = p.replace("_", "")
+                voltage[p] = getattr(msg, f"{base}_volt", 0)
+                voltage_max[p] = getattr(msg, f"{base}_volt_max", 0)
+                voltage_min[p] = getattr(msg, f"{base}_volt_min", 0)
+            voltage["bus"] = getattr(msg, "bus_volt", 0)
+            voltage_max["bus"] = voltage["bus"]
+            voltage_min["bus"] = voltage["bus"]
+
+            self._data = {
+                "temp": {"waist": temp["waist"], "arm_a": temp["arm_a"], "arm_b": temp["arm_b"],
+                         "leg_a": temp["leg_a"], "leg_b": temp["leg_b"],
+                         "max": temp_max, "min": temp_min},
+                "current": {**current, "max": current_max, "min": current_min},
+                "voltage": {**voltage, "max": voltage_max, "min": voltage_min},
+                "version": {
+                    "software": getattr(msg, "software_version", ""),
+                    "hardware": getattr(msg, "hardware_version", ""),
+                },
+                "battery": {
+                    "voltage": getattr(msg, "battery_voltage", 0),
+                    "current": getattr(msg, "battery_current", 0),
+                    "power": getattr(msg, "battery_power", 0),
+                },
+            }
+
+    def _publish_loop(self):
+        while self._running:
+            time.sleep(1.0)  # 1Hz
+            with self._lock:
+                if not self._data:
+                    continue
+                payload = json.loads(json.dumps(self._data))  # deep copy
+                payload["timestamp_ms"] = int(time.time() * 1000)
+                payload["control_level"] = "ANY"
+            msg = String()
+            msg.data = json.dumps(payload)
+            self._pub.publish(msg)
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action in ("start", "stop", "info"):
@@ -1624,6 +1751,193 @@ class TtsPlugin:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# VoicePlayActuatorPlugin (actuator) — 卡名: voice_play
+# ══════════════════════════════════════════════════════════════════════════════
+
+_URL_PRECHECK_TIMEOUT = 1.5
+
+
+def _check_url_reachable(url: str) -> tuple[bool, str]:
+    """对远端音频 URL 做 HEAD 预检。返回 (reachable, reason)。"""
+    if not url:
+        return False, "empty url"
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return False, "url must start with http:// or https://"
+    try:
+        # -I = HEAD, -L 跟随重定向, --max-time 总超时, -sS 静默但显示错误
+        r = subprocess.run(
+            ["curl", "-I", "-L", "-sS", "--max-time", str(_URL_PRECHECK_TIMEOUT),
+             "-o", "/dev/null", "-w", "%{http_code}", url],
+            capture_output=True, text=True, timeout=_URL_PRECHECK_TIMEOUT + 0.5,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"precheck timeout > {_URL_PRECHECK_TIMEOUT}s"
+    except Exception as e:  # noqa: BLE001
+        return False, f"precheck error: {e}"
+    code = (r.stdout or "").strip()
+    if code == "200":
+        return True, "ok"
+    return False, f"HTTP {code}" if code else "no response"
+
+
+class VoicePlayActuatorPlugin:
+    """音频播放控制 (lyre_msgs service) — 卡名: voice_play
+
+    Actions:
+      play_file  → /audio_play/play_file  (PlayFile)
+      play_url   → /audio_play/play_url   (PlayUrl)
+      play_text  → /audio_play/play_text  (PlayText)
+      stop       → /audio_play/stop       (PlayStop)
+      pause      → /audio_play/pause      (PlayPause)
+      resume     → /audio_play/resume     (PlayResume)
+
+    play_url 前会先做 1.5s HTTP HEAD 预检,不可达直接返回 URL_UNREACHABLE,
+    不进入 service call 阶段,避免浪费 5s service 超时。
+    """
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._srv_node = Node("tianyi2_voice_play", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._srv_node)
+        self._clients = {}
+        self._types = {}
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "voice_play",
+            "type": "actuator",
+            "description": (
+                "天轶2.0 Pro 音频播放控制(本地文件/URL/TTS/停止/暂停/恢复),HIGHLEVEL,lyre_msgs service。"
+                "play_url 前会先做 1.5s HTTP HEAD 预检, 不可达直接返回 URL_UNREACHABLE 不浪费 service 超时。"
+                "stop/pause/resume 为快速控制(无参数), 服务超时 3s。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["play_file", "play_url", "play_text", "stop", "pause", "resume"],
+                        "description": "控制模式",
+                    },
+                    "path": {"type": "string", "description": "本地音频文件绝对路径(play_file)"},
+                    "url":  {"type": "string", "description": "远程音频文件URL(play_url, http(s)://)"},
+                    "text": {"type": "string", "description": "TTS文本(play_text)"},
+                    "force": {"type": "boolean", "description": "强制播放(停止当前任务立即播放,可选)"},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "play_file": {"params": ["path", "force"], "description": "播放本地音频文件"},
+                    "play_url":  {"params": ["url", "force"],  "description": "播放远程URL音频"},
+                    "play_text": {"params": ["text", "force"], "description": "TTS合成并播放文本"},
+                    "stop":      {"params": [],                 "description": "停止播放(不可恢复)"},
+                    "pause":     {"params": [],                 "description": "暂停播放(可恢复)"},
+                    "resume":    {"params": [],                 "description": "恢复暂停的播放"},
+                },
+            },
+        }
+
+    def start(self):
+        try:
+            from lyre_msgs.srv import PlayFile, PlayUrl, PlayText, PlayStop, PlayPause, PlayResume
+            self._types = {
+                "play_file": ("/audio_play/play_file", PlayFile),
+                "play_url":  ("/audio_play/play_url",  PlayUrl),
+                "play_text": ("/audio_play/play_text", PlayText),
+                "stop":      ("/audio_play/stop",      PlayStop),
+                "pause":     ("/audio_play/pause",     PlayPause),
+                "resume":    ("/audio_play/resume",   PlayResume),
+            }
+            for key, (svc_name, _svc_type) in self._types.items():
+                self._clients[key] = self._srv_node.create_client(self._types[key][1], svc_name)
+            print(f"[VoicePlayActuatorPlugin] {len(self._clients)} service clients created")
+        except ImportError as e:
+            print(f"[VoicePlayActuatorPlugin] WARNING: lyre_msgs.srv import failed ({e})")
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "info"):
+            return {"state": "ready", "control_level": "HIGHLEVEL"}
+        if action not in self._types:
+            return {"ok": False, "code": "INVALID_ARGUMENT",
+                    "message": f"unknown action: {action}",
+                    "action": action, "timestamp_ms": int(time.time() * 1000)}
+        client = self._clients.get(action)
+        if client is None:
+            return {"ok": False, "code": "NO_SERVICE",
+                    "message": f"{action} service client not initialized",
+                    "action": action, "timestamp_ms": int(time.time() * 1000)}
+
+        # play_url 先做可达性预检,不可达直接返回,不进入 service call 阶段
+        if action == "play_url":
+            url = str(args.get("url", "") or "")
+            reachable, reason = _check_url_reachable(url)
+            if not reachable:
+                return {"ok": False, "code": "URL_UNREACHABLE",
+                        "message": f"url precheck failed: {reason}",
+                        "url": url, "action": action,
+                        "timestamp_ms": int(time.time() * 1000)}
+
+        _, svc_type = self._types[action]
+        req = svc_type.Request()
+        # 公共字段:seq/last/force(不再传 sid — 讯飞服务端自动生成)
+        force = bool(args.get("force", False))
+        if hasattr(req, "seq"):
+            req.seq = 0
+        if hasattr(req, "last"):
+            req.last = True
+        if hasattr(req, "force"):
+            req.force = force
+        if action == "play_file":
+            path = str(args.get("path", "") or "")
+            if not path:
+                return {"ok": False, "code": "INVALID_ARGUMENT",
+                        "message": "path is required",
+                        "action": action, "timestamp_ms": int(time.time() * 1000)}
+            req.path = path
+        elif action == "play_url":
+            url = str(args.get("url", "") or "")
+            if not url:
+                return {"ok": False, "code": "INVALID_ARGUMENT",
+                        "message": "url is required",
+                        "action": action, "timestamp_ms": int(time.time() * 1000)}
+            req.url = url
+        elif action == "play_text":
+            text = str(args.get("text", "") or "")
+            if not text:
+                return {"ok": False, "code": "INVALID_ARGUMENT",
+                        "message": "text is required",
+                        "action": action, "timestamp_ms": int(time.time() * 1000)}
+            req.text = text
+        # stop/pause/resume 无额外字段
+
+        try:
+            future = client.call_async(req)
+            # 等待 service 完成(3s 超时,本地调用,5s 太长)
+            rclpy.spin_until_future_complete(self._srv_node, future, timeout_sec=3.0)
+            result = future.result()
+            if result is None:
+                return {"ok": False, "code": "CALL_FAILED",
+                        "message": f"{action} service call returned empty (timeout 3s)",
+                        "action": action, "timestamp_ms": int(time.time() * 1000)}
+            code = int(getattr(result, "code", 0))
+            return {
+                "ok": code == 0,
+                "code": code,
+                "message": str(getattr(result, "message", "")),
+                "action": action,
+                "control_level": "HIGHLEVEL",
+                "timestamp_ms": int(time.time() * 1000),
+            }
+        except Exception as e:
+            return {"ok": False, "code": "COMMUNICATION_ERROR",
+                    "message": str(e), "action": action,
+                    "timestamp_ms": int(time.time() * 1000)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # NavPlugin (actuator)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1797,3 +2111,68 @@ class ChatPlugin:
         elif action == "stop":
             return {"state": "idle"}
         return {"error": f"unknown action: {action}"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VoiceChatActuatorPlugin (actuator) — 卡名: voice_chat
+# ══════════════════════════════════════════════════════════════════════════════
+
+class VoiceChatActuatorPlugin:
+    """语音对话开关 (/audio_chat/enable std_msgs/Bool)"""
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._pub_node = Node("tianyi2_voice_chat_pub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._pub_node)
+        self._publisher = None
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "voice_chat",
+            "type": "actuator",
+            "description": "天轶2.0 Pro 语音对话开关(enable/disable),HIGHLEVEL,topic /audio_chat/enable std_msgs/Bool。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["enable", "disable"],
+                               "description": "开启/关闭语音对话"},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "enable":  {"params": [], "description": "开启语音对话"},
+                    "disable": {"params": [], "description": "关闭语音对话"},
+                },
+            },
+        }
+
+    def start(self):
+        self._publisher = self._pub_node.create_publisher(Bool, "/audio_chat/enable", _RELIABLE_QOS)
+        print("[VoiceChatActuatorPlugin] publisher created")
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "info"):
+            return {"state": "ready", "control_level": "HIGHLEVEL"}
+        if action in ("enable", "disable"):
+            if not self._publisher:
+                return {"ok": False, "code": "PRECONDITION_FAILED",
+                        "message": "publisher not initialized"}
+            msg = Bool()
+            msg.data = (action == "enable")
+            self._publisher.publish(msg)
+            return {
+                "ok": True,
+                "code": 0,
+                "message": "",
+                "action": action,
+                "value": msg.data,
+                "control_level": "HIGHLEVEL",
+                "timestamp_ms": int(time.time() * 1000),
+            }
+        if action == "stop":
+            return {"state": "idle"}
+        return {"ok": False, "code": "INVALID_ARGUMENT",
+                "message": f"unknown action: {action}"}

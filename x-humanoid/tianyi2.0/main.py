@@ -117,6 +117,11 @@ class TianyiDeviceBundle:
             self._plugins.append(NavStatePlugin(plugins_cfg["nav_state"], namespace, ros2, slamtec_client))
             print("[bundle] NavStatePlugin loaded")
 
+        if plugins_cfg.get("power_board", {}).get("enabled", False):
+            from device import PowerBoardStatePlugin
+            self._plugins.append(PowerBoardStatePlugin(plugins_cfg["power_board"], namespace, ros2))
+            print("[bundle] PowerBoardStatePlugin loaded")
+
         if plugins_cfg.get("head", {}).get("enabled", False):
             from device import HeadPlugin
             self._plugins.append(HeadPlugin(plugins_cfg["head"], namespace, ros2))
@@ -148,6 +153,11 @@ class TianyiDeviceBundle:
             self._plugins.append(TtsPlugin(plugins_cfg["tts"], namespace, ros2))
             print("[bundle] TtsPlugin loaded")
 
+        if plugins_cfg.get("voice_play", {}).get("enabled", False):
+            from device import VoicePlayActuatorPlugin
+            self._plugins.append(VoicePlayActuatorPlugin(plugins_cfg["voice_play"], namespace, ros2))
+            print("[bundle] VoicePlayActuatorPlugin loaded")
+
         if plugins_cfg.get("nav", {}).get("enabled", False):
             from device import NavPlugin
             self._plugins.append(NavPlugin(plugins_cfg["nav"], namespace, ros2, slamtec_client))
@@ -157,6 +167,11 @@ class TianyiDeviceBundle:
             from device import ChatPlugin
             self._plugins.append(ChatPlugin(plugins_cfg["chat"], namespace, ros2))
             print("[bundle] ChatPlugin loaded")
+
+        if plugins_cfg.get("voice_chat", {}).get("enabled", False):
+            from device import VoiceChatActuatorPlugin
+            self._plugins.append(VoiceChatActuatorPlugin(plugins_cfg["voice_chat"], namespace, ros2))
+            print("[bundle] VoiceChatActuatorPlugin loaded")
 
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
