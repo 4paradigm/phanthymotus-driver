@@ -22,6 +22,11 @@ plugins:
     enabled: true
   hand:
     enabled: true
+  hand_state:
+    enabled: true
+    left_topic: "/inspire_hand/state/left_hand"
+    right_topic: "/inspire_hand/state/right_hand"
+    stale_after_sec: 1.0
   tts:
     enabled: true
   nav:

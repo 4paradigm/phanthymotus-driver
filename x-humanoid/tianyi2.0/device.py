@@ -22,6 +22,7 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   ArmPlugin        (actuator)           — 双臂14DOF控制
   WaistPlugin      (actuator)           — 腰部2DOF控制
   HandPlugin       (actuator)           — 灵巧手控制
+  HandStatePlugin  (sensor)             — 灵巧手状态
   TtsPlugin        (actuator)           — 语音合成
   NavPlugin        (actuator)           — 底盘导航控制
   ChatPlugin       (actuator)           — 语音交互开关
@@ -1043,6 +1044,207 @@ class HandPlugin:
             return {"state": "moving", "side": side, "angles": angles}
         except Exception as e:
             return {"error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HandStatePlugin (sensor)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class HandStatePlugin:
+    """Inspire灵巧手状态 — 订阅左右手 JointState，输出手指弯曲和拇指旋转状态"""
+
+    _FINGER_ORDER = ["little", "ring", "middle", "index", "thumb_bend", "thumb_rotation"]
+    _BEND_OUTPUT_ORDER = ["thumb", "index", "middle", "ring", "little"]
+    _NAME_ALIASES = {
+        "1": "little",
+        "little": "little",
+        "pinky": "little",
+        "little_finger": "little",
+        "2": "ring",
+        "ring": "ring",
+        "ring_finger": "ring",
+        "3": "middle",
+        "middle": "middle",
+        "middle_finger": "middle",
+        "4": "index",
+        "index": "index",
+        "fore": "index",
+        "forefinger": "index",
+        "index_finger": "index",
+        "5": "thumb_bend",
+        "thumb": "thumb_bend",
+        "thumb_bend": "thumb_bend",
+        "thumb_flex": "thumb_bend",
+        "6": "thumb_rotation",
+        "thumb_rotation": "thumb_rotation",
+        "thumb_rotate": "thumb_rotation",
+        "thumb_roll": "thumb_rotation",
+    }
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._running = False
+        self._left_topic = plugin_config.get("left_topic", "/inspire_hand/state/left_hand")
+        self._right_topic = plugin_config.get("right_topic", "/inspire_hand/state/right_hand")
+        self._stale_after_sec = float(plugin_config.get("stale_after_sec", 1.0))
+        self._publish_hz = float(plugin_config.get("publish_hz", 10.0))
+        self._topic = f"/{namespace}/state/hand"
+        self._hands = {
+            "left": None,
+            "right": None,
+        }
+        self._lock = threading.Lock()
+
+        self._sub_node = Node("tianyi2_hand_state_sub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._sub_node)
+
+        self._pub_node = Node("tianyi2_hand_state_pub", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._pub_node)
+        self._pub_state = self._pub_node.create_publisher(String, self._topic, _LOW_LAT_QOS)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "hand_state",
+            "type": "sensor",
+            "description": "天轶2.0 Inspire灵巧手状态 — 左/右手每根手指弯曲状态和拇指旋转状态",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._topic, "format": "data/json"}],
+        }
+
+    def start(self):
+        self._running = True
+        try:
+            from sensor_msgs.msg import JointState
+            self._sub_node.create_subscription(
+                JointState, self._left_topic, lambda msg: self._on_hand("left", msg), _LOW_LAT_QOS)
+            self._sub_node.create_subscription(
+                JointState, self._right_topic, lambda msg: self._on_hand("right", msg), _LOW_LAT_QOS)
+            print(f"[HandStatePlugin] subscribed to {self._left_topic} and {self._right_topic}")
+        except ImportError as e:
+            print(f"[HandStatePlugin] WARNING: msg import failed ({e}), running in stub mode")
+
+        self._pub_thread = threading.Thread(target=self._publish_loop, daemon=True)
+        self._pub_thread.start()
+
+    def stop(self):
+        self._running = False
+
+    def _on_hand(self, side: str, msg):
+        with self._lock:
+            self._hands[side] = self._parse_joint_state(msg)
+
+    def _parse_joint_state(self, msg) -> dict:
+        values = {name: None for name in self._FINGER_ORDER}
+        positions = list(msg.position or [])
+        joint_names = list(msg.name or [])
+
+        for idx, raw in enumerate(positions[:len(self._FINGER_ORDER)]):
+            mapped = None
+            if idx < len(joint_names):
+                mapped = self._map_joint_name(joint_names[idx])
+            if mapped is None:
+                mapped = self._FINGER_ORDER[idx]
+            values[mapped] = float(raw)
+
+        fingers = {name: self._format_value(values[name]) for name in self._FINGER_ORDER}
+        bend_by_finger = {
+            "thumb": fingers["thumb_bend"],
+            "index": fingers["index"],
+            "middle": fingers["middle"],
+            "ring": fingers["ring"],
+            "little": fingers["little"],
+        }
+
+        return {
+            "received_timestamp_ms": int(time.time() * 1000),
+            "message_timestamp_ms": self._stamp_ms(msg.header.stamp),
+            "source_joint_names": joint_names,
+            "source_order": list(self._FINGER_ORDER),
+            "fingers": fingers,
+            "bend": bend_by_finger,
+            "thumb_rotation": fingers["thumb_rotation"],
+        }
+
+    def _map_joint_name(self, name: str):
+        key = str(name).strip().lower().replace("-", "_").replace(" ", "_")
+        return self._NAME_ALIASES.get(key)
+
+    def _format_value(self, raw):
+        if raw is None:
+            return {"raw": None, "percent": None, "angle_deg_estimate": None}
+        percent = None
+        angle_deg_estimate = None
+        if -0.05 <= raw <= 1.05:
+            percent = max(0.0, min(100.0, raw * 100.0))
+            angle_deg_estimate = max(0.0, min(90.0, raw * 90.0))
+        return {
+            "raw": round(raw, 4),
+            "percent": round(percent, 2) if percent is not None else None,
+            "angle_deg_estimate": round(angle_deg_estimate, 2) if angle_deg_estimate is not None else None,
+        }
+
+    def _stamp_ms(self, stamp) -> int | None:
+        sec = getattr(stamp, "sec", 0)
+        nanosec = getattr(stamp, "nanosec", 0)
+        if not sec and not nanosec:
+            return None
+        return int(sec * 1000 + nanosec / 1_000_000)
+
+    def _build_payload(self) -> dict:
+        now_ms = int(time.time() * 1000)
+        stale_ms = int(self._stale_after_sec * 1000)
+        with self._lock:
+            hands = {side: (dict(data) if data else None) for side, data in self._hands.items()}
+
+        payload_hands = {}
+        fresh_any = False
+        for side, data in hands.items():
+            if not data:
+                payload_hands[side] = {"available": False, "fresh": False}
+                continue
+            age_ms = now_ms - data["received_timestamp_ms"]
+            fresh = age_ms <= stale_ms
+            fresh_any = fresh_any or fresh
+            item = dict(data)
+            item.update({
+                "available": True,
+                "fresh": fresh,
+                "age_ms": age_ms,
+            })
+            payload_hands[side] = item
+
+        return {
+            "card": "hand_state",
+            "source_type": "sensor_msgs/JointState",
+            "source_topics": {
+                "left": self._left_topic,
+                "right": self._right_topic,
+            },
+            "timestamp_ms": now_ms,
+            "fresh": fresh_any,
+            "stale_after_sec": self._stale_after_sec,
+            "unit_note": "JointState.position is preserved as raw. percent and angle_deg_estimate are derived only when raw looks normalized to 0..1.",
+            "hands": payload_hands,
+        }
+
+    def _publish_loop(self):
+        interval = 1.0 / self._publish_hz if self._publish_hz > 0 else 0.1
+        while self._running:
+            time.sleep(interval)
+            payload = self._build_payload()
+            msg = String()
+            msg.data = json.dumps(payload)
+            self._pub_state.publish(msg)
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action in ("info", "read", "get", "hand_state"):
+            return self._build_payload()
+        return {"error": f"unknown action: {action}"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
