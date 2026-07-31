@@ -33,8 +33,9 @@ ENV AMENT_PREFIX_PATH=/tianyi_ws/install/bodyctrl_msgs:/tianyi_ws/install/lyre_m
 ENV LD_LIBRARY_PATH=/tianyi_ws/install/bodyctrl_msgs/lib:/tianyi_ws/install/lyre_msgs/lib:${LD_LIBRARY_PATH}
 
 COPY resource/ /work/resource/
-COPY main.py device.py nav_client.py config.yaml driver.yaml /work/
+COPY main.py device.py nav_client.py config.yaml driver.yaml controlled_spatial.py /work/
+RUN mkdir -p /work/maps
 
-EXPOSE 15707
+EXPOSE 15790
 
 CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && (source /tianyi_ws/install/setup.bash 2>/dev/null || true) && python3 /work/main.py"]

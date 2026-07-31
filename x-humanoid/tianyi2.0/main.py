@@ -158,6 +158,11 @@ class TianyiDeviceBundle:
             self._plugins.append(ChatPlugin(plugins_cfg["chat"], namespace, ros2))
             print("[bundle] ChatPlugin loaded")
 
+        if plugins_cfg.get("controlled_spatial", {}).get("enabled", False):
+            from controlled_spatial import ControlledSpatialPlugin
+            self._plugins.append(ControlledSpatialPlugin(plugins_cfg["controlled_spatial"], namespace, ros2, slamtec_client))
+            print("[bundle] ControlledSpatialPlugin loaded")
+
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
             try:
@@ -265,7 +270,7 @@ def make_handler():
                     ok({
                         "protocolVersion": "2024-11-05",
                         "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "tianyi2-device-bundle", "version": "1.0.0"},
+                        "serverInfo": {"name": "tianyi2-device-bundle-zhang", "version": "1.0.0"},
                     })
                 elif method == "tools/list":
                     ok({"tools": _bundle.get_all_tools()})
@@ -336,7 +341,7 @@ def main():
 
     cfg       = _load_config()
     namespace = _resolve_namespace(cfg)
-    mcp_port  = int(cfg.get("mcp_port", 15707))
+    mcp_port  = int(cfg.get("mcp_port", 15790))
 
     print(f"[bundle] namespace={namespace} mcp_port={mcp_port}")
 
