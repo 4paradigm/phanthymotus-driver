@@ -36,6 +36,6 @@ COPY resource/ /work/resource/
 COPY main.py device.py nav_client.py config.yaml driver.yaml controlled_spatial.py /work/
 RUN mkdir -p /work/maps
 
-EXPOSE 15790
+EXPOSE 15707
 
 CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && (source /tianyi_ws/install/setup.bash 2>/dev/null || true) && python3 /work/main.py"]
