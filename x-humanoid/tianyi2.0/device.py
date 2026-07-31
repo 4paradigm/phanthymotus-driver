@@ -1999,11 +1999,15 @@ class MotorStatePlugin:
     def dispatch(self, action: str, args: dict) -> dict:
         if action in ("read", "get_motors", "get_motor_state"):
             d = self._produce()
-            return d if d is not None else {"error": "NO_FEEDBACK", "message": "no fresh motor state"}
+            if d is None:
+                return {"state": "error", "error": "NO_FEEDBACK",
+                        "message": "no fresh motor state"}
+            return d
         if action in ("start", "stop", "info"):
             return {"state": "running" if self._running else "idle",
                     "topic_out": [{"topic": self._topic, "format": "data/json"}]}
-        return {"error": f"unknown action: {action}"}
+        return {"state": "error", "error": "INVALID_ARGUMENT",
+                "message": f"unknown action: {action}"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2161,11 +2165,15 @@ class HandStatePlugin:
     def dispatch(self, action: str, args: dict) -> dict:
         if action in ("read", "get_hand_state"):
             d = self._produce()
-            return d if d is not None else {"error": "NO_FEEDBACK", "message": "no fresh hand state"}
+            if d is None:
+                return {"state": "error", "error": "NO_FEEDBACK",
+                        "message": "no fresh hand state"}
+            return d
         if action in ("start", "stop", "info"):
             return {"state": "running" if self._running else "idle",
                     "topic_out": [{"topic": self._topic, "format": "data/json"}]}
-        return {"error": f"unknown action: {action}"}
+        return {"state": "error", "error": "INVALID_ARGUMENT",
+                "message": f"unknown action: {action}"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2335,8 +2343,13 @@ class RemoteStatePlugin:
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action in ("read", "get_remote_event", "get_remote"):
-            return self._produce()
+            d = self._produce()
+            if d is None:
+                return {"state": "error", "error": "NO_FEEDBACK",
+                        "message": "no fresh remote state"}
+            return d
         if action in ("start", "stop", "info"):
             return {"state": "running" if self._running else "idle",
                     "topic_out": [{"topic": self._topic, "format": "data/json"}]}
-        return {"error": f"unknown action: {action}"}
+        return {"state": "error", "error": "INVALID_ARGUMENT",
+                "message": f"unknown action: {action}"}
