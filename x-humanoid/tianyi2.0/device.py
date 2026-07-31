@@ -1360,7 +1360,7 @@ class ArmGesturePlugin:
         # In the URDF chain shoulder yaw rotates the elbow-pitch plane. The
         # shoulder and elbow angles place the wrist; wrist yaw/roll are used
         # only where the final palm orientation needs calibration.
-        "salute": [-10, 90, 60, -120, 50, 0, 0],
+        "salute": [-10, 90, 60, -110, 50, 0, 0],
         "welcome": [-10, 65, 75, -100, 0, 0, 0],
         "raise": [0, 130, 0, -15, 0, 0, 0],
         "shake_hands": [-55, 15, 5, -35, 0, 0, 0],
@@ -1479,12 +1479,6 @@ class ArmGesturePlugin:
                 "state": "error",
                 "error": "salute only supports one arm at a time to avoid head/arm interference",
                 "code": "unsafe_bilateral_salute",
-            }
-        if action == "high_five" and side == "both":
-            return {
-                "state": "error",
-                "error": "high_five only supports one arm at a time to keep both arms clear of the head",
-                "code": "unsafe_bilateral_high_five",
             }
         speed = _clamp(args.get("speed", 0.5), 0.2, 1.5)
         if action == "reset":

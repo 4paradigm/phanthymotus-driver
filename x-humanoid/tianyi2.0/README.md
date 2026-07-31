@@ -64,7 +64,7 @@ establish the elbow-flexion plane; elbow pitch can then raise the forearm
 instead of leaving it horizontal in front of the torso. `salute` uses two
 blended stages: the preparation frame bends the elbow and moves wrist yaw to
 25 degrees; the second frame raises the upper arm laterally, flexes the elbow
-to approximately 120 degrees, and completes wrist yaw at 50 degrees. In this
+to approximately 110 degrees, and completes wrist yaw at 50 degrees. In this
 URDF chain, shoulder yaw rotates the downstream
 elbow-pitch axis: positive left-arm yaw (mirrored negative on the right) makes
 negative elbow pitch lift and fold the forearm inward, while the opposite yaw
@@ -97,9 +97,11 @@ The URDF defines joint axes and limits but contains no hand palm frame and no
 arm visual/collision geometry. Palm-facing wrist values are therefore
 conservative starting points, not geometrically proven orientations. Calibrate
 `welcome`, `salute`, and `high_five` one arm at a time at low speed
-with a clear workspace. Bilateral `salute` and `high_five` are blocked; actions
-such as clapping, hugging, and crossing arms are intentionally not provided
-until collision geometry or a separate collision checker is available.
+with a clear workspace. Bilateral `salute` remains blocked because the hands
+move near the head. Bilateral `high_five` is allowed because its mirrored paths
+remain separated in front of the shoulders. Actions such as clapping, hugging,
+and crossing arms are intentionally not provided until collision geometry or a
+separate collision checker is available.
 
 Before publishing an action, the card checks fresh `/arm/status` data, all
 selected motor IDs, motor error codes, the physical/remote emergency stop and
@@ -125,6 +127,6 @@ light indicates Ready before running arm actions.
 | `welcome` | right arm, cycles 2, speed 0.5rad/s | side left/right/both, cycles 1–5, speed 0.2–1.5rad/s |
 | `raise` | right arm, speed 0.5rad/s | side left/right/both, speed 0.2–1.5rad/s |
 | `shake_hands` | right arm, cycles 2, speed 0.5rad/s | side left/right/both, cycles 1–5, speed 0.2–1.5rad/s |
-| `high_five` | right arm, speed 0.5rad/s | side left/right, speed 0.2–1.5rad/s |
+| `high_five` | right arm, speed 0.5rad/s | side left/right/both, speed 0.2–1.5rad/s |
 | `reset` | right arm, speed 0.5rad/s | side left/right/both, speed 0.2–1.5rad/s |
 | `stop` | no parameters | no parameters |
