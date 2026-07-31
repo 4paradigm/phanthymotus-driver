@@ -14,18 +14,21 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   - domain 42 (ros2.ctx_core): 发布传感器数据给 Agent Core
 
 插件列表：
-  StatePlugin      (sensor, multi-tool) — 关节/电池/急停/力传感器/URDF
-  CameraPlugin     (sensor)             — Orbbec 头部相机
-  AsrPlugin        (sensor)             — 语音识别结果
-  NavStatePlugin   (sensor)             — 底盘导航状态
-  HeadPlugin       (actuator)           — 头部3DOF控制
-  HeadGesturePlugin (actuator)          — 点头/摇头/左右观察等语义动作
-  ArmPlugin        (actuator)           — 双臂14DOF控制
-  WaistPlugin      (actuator)           — 腰部2DOF控制
-  HandPlugin       (actuator)           — 灵巧手控制
-  TtsPlugin        (actuator)           — 语音合成
-  NavPlugin        (actuator)           — 底盘导航控制
-  ChatPlugin       (actuator)           — 语音交互开关
+  StatePlugin         (sensor, multi-tool) — 关节/电池/急停/力传感器/URDF
+  CameraPlugin        (sensor)             — Orbbec 头部相机
+  AsrPlugin           (sensor)             — 语音识别结果
+  NavStatePlugin      (sensor)             — 底盘导航状态
+  HeadPlugin          (actuator)           — 头部3DOF控制
+  HeadGesturePlugin   (actuator)           — 点头/摇头/左右观察等语义动作
+  ArmPlugin           (actuator)           — 双臂14DOF控制
+  WaistPlugin         (actuator)           — 腰部2DOF控制
+  HandPlugin          (actuator)           — 灵巧手控制
+  TtsPlugin           (actuator)           — 语音合成
+  NavPlugin           (actuator)           — 底盘导航控制
+  ChatPlugin          (actuator)           — 语音交互开关
+  MotorStatePlugin    (sensor)             — 全身21电机状态(2Hz)
+  HandStatePlugin     (sensor)             — 灵巧手状态(10Hz, tool name=hand_state)
+  RemoteStatePlugin   (sensor)             — 遥控器SBUS事件(5Hz)
 """
 
 from __future__ import annotations
@@ -1796,4 +1799,544 @@ class ChatPlugin:
             return {"state": "ready"}
         elif action == "stop":
             return {"state": "idle"}
+        return {"error": f"unknown action: {action}"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MotorStatePlugin (sensor) — 全身21电机状态按部位聚合 (2Hz)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_MOTOR_ERROR_DESCRIPTIONS = {
+    0: "ok",
+    1: "over_current",
+    2: "over_temperature",
+    3: "communication_lost",
+    4: "encoder_error",
+    5: "over_voltage",
+    6: "under_voltage",
+    7: "motor_stall",
+    8: "phase_error",
+}
+
+
+def _describe_motor_error(code: int) -> str:
+    return _MOTOR_ERROR_DESCRIPTIONS.get(int(code), f"code#{code}")
+
+
+# 关节 ID → 语义化名称 (对齐 bodyctrl_msgs/MotorName 枚举)
+_MOTOR_IDX_TO_NAME = {
+    1: "head_roll", 2: "head_pitch", 3: "head_yaw",
+    11: "left_shoulder_roll", 12: "left_shoulder_pitch", 13: "left_shoulder_yaw",
+    14: "left_elbow", 15: "left_elbow_flex", 16: "left_wrist_angle", 17: "left_wrist_rotate",
+    21: "right_shoulder_roll", 22: "right_shoulder_pitch", 23: "right_shoulder_yaw",
+    24: "right_elbow", 25: "right_elbow_flex", 26: "right_wrist_angle", 27: "right_wrist_rotate",
+    31: "waist_yaw", 32: "waist_roll", 33: "waist_extra",
+    51: "left_hip", 52: "left_knee", 53: "left_ankle",
+    54: "left_foot_roll", 55: "left_foot_pitch", 56: "left_foot_yaw",
+    61: "right_hip", 62: "right_knee", 63: "right_ankle",
+    64: "right_foot_roll", 65: "right_foot_pitch", 66: "right_foot_yaw",
+}
+
+
+def _split_arm(motors: list) -> tuple[list, list]:
+    """按关节 ID 拆左右臂: 11-17 左, 21-27 右。"""
+    left, right = [], []
+    for m in motors:
+        idx = m.get("idx", 0)
+        if 11 <= idx <= 17:
+            left.append(m)
+        elif 21 <= idx <= 27:
+            right.append(m)
+    return left, right
+
+
+class MotorStatePlugin:
+    """天轶2.0 全身21电机状态 — 按部位聚合 (2Hz)。
+
+    数据源 (domain 0):
+      /head/status  → MotorStatusMsg (关节 1-3)
+      /waist/status → MotorStatusMsg (关节 31-33)
+      /arm/status   → MotorStatusMsg (关节 11-17 左 / 21-27 右)
+      /leg/status   → MotorStatusMsg (关节 51-66)
+    发布到 (domain 42): /{ns}/state/motors (std_msgs/String JSON)
+    """
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._topic = f"/{namespace}/state/motors"
+        self._running = False
+        self._lock = threading.Lock()
+        self._latest = {"head": None, "waist": None, "arm": None, "leg": None}
+
+        self._sub_node = Node("tianyi2_motors_sub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._sub_node)
+
+        self._pub_node = Node("tianyi2_motors_pub", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._pub_node)
+        self._pub = self._pub_node.create_publisher(String, self._topic, _LOW_LAT_QOS)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "motors",
+            "type": "sensor",
+            "multiInstance": False,
+            "readOnly": True,
+            "description": (
+                "天轶2.0 全身21电机状态(按部位聚合, 2Hz)。"
+                "部位: head(3DOF)/arm_left(7DOF)/arm_right(7DOF)/waist(2DOF)/leg(2DOF)。"
+                "每关节: name=语义名, q=角度(rad), dq=速度(rad/s), current=电流(A), temp=温度(°C)。"
+                "bodyctrl 不上报腰腿的 current/temp/dq → 标 unknown 或不出现。"
+                "error=0 正常, 非0故障(此时额外输出 error_description)。"
+            ),
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._topic, "format": "data/json"}],
+        }
+
+    def start(self):
+        self._running = True
+        try:
+            from bodyctrl_msgs.msg import MotorStatusMsg
+            topics = {
+                "head": "/head/status",
+                "waist": "/waist/status",
+                "arm": "/arm/status",
+                "leg": "/leg/status",
+            }
+            for key, topic in topics.items():
+                self._sub_node.create_subscription(
+                    MotorStatusMsg, topic,
+                    lambda m, k=key: self._on_motor(k, m), _RELIABLE_QOS)
+            print("[MotorStatePlugin] subscriptions created")
+        except ImportError as e:
+            print(f"[MotorStatePlugin] WARNING: import failed ({e}), stub mode")
+
+        self._thread = threading.Thread(target=self._publish_loop, daemon=True)
+        self._thread.start()
+        print("[MotorStatePlugin] publish started")
+
+    def stop(self):
+        self._running = False
+
+    def _on_motor(self, road: str, msg):
+        try:
+            status_list = getattr(msg, "status", [])
+            motors = []
+            for m in status_list:
+                idx = int(getattr(m, "name", 0) or 0)
+                err = int(getattr(m, "error", 0))
+                pos_raw = float(getattr(m, "pos", 0))
+                spd_raw = float(getattr(m, "speed", 0))
+                cur_raw = float(getattr(m, "current", 0))
+                tmp_raw = float(getattr(m, "temperature", 0))
+
+                item = {
+                    "idx": idx,
+                    "name": _MOTOR_IDX_TO_NAME.get(idx, f"joint_{idx}"),
+                    "q": round(pos_raw, 6),
+                }
+                if abs(spd_raw) > 0:
+                    item["dq"] = round(spd_raw, 6)
+                if abs(cur_raw) > 0:
+                    item["current"] = round(cur_raw, 6)
+                else:
+                    item["current"] = "unknown"
+                if tmp_raw > 0:
+                    item["temp"] = tmp_raw
+                else:
+                    item["temp"] = "unknown"
+                if err != 0:
+                    item["error"] = err
+                    item["error_description"] = _describe_motor_error(err)
+                motors.append(item)
+            with self._lock:
+                self._latest[road] = motors
+        except Exception as e:  # noqa: BLE001
+            print(f"[MotorStatePlugin] callback error on {road}: {e}")
+
+    @staticmethod
+    def _part(joints, label: str = "") -> dict:
+        block = {"count": len(joints) if joints else 0, "joints": joints or []}
+        if label:
+            block["label"] = label
+        return block
+
+    def _produce(self) -> dict | None:
+        with self._lock:
+            data = dict(self._latest)
+        if not any(data.values()):
+            return None
+        arm_left, arm_right = _split_arm(data.get("arm") or [])
+        return {
+            "parts": {
+                "head":      self._part(data.get("head"),   "头部(3DOF)"),
+                "arm_left":  self._part(arm_left,          "左臂(7DOF)"),
+                "arm_right": self._part(arm_right,         "右臂(7DOF)"),
+                "waist":     self._part(data.get("waist"), "腰部(2DOF)"),
+                "leg":       self._part(data.get("leg"),   "腿部(2DOF)"),
+            },
+            "units": {
+                "q": "关节角度(rad)",
+                "dq": "关节速度(rad/s), 未上报则不出现",
+                "current": "电流(A), unknown=未上报",
+                "temp": "温度(°C), unknown=未上报",
+                "error": "故障码, 0=正常, 仅故障时出现",
+            },
+            "timestamp_ms": int(time.time() * 1000),
+            "control_level": "ANY",
+        }
+
+    def _publish_loop(self):
+        while self._running:
+            time.sleep(0.5)  # 2Hz
+            payload = self._produce()
+            if payload is None:
+                continue
+            msg = String()
+            msg.data = json.dumps(payload)
+            self._pub.publish(msg)
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("read", "get_motors", "get_motor_state"):
+            d = self._produce()
+            return d if d is not None else {"error": "NO_FEEDBACK", "message": "no fresh motor state"}
+        if action in ("start", "stop", "info"):
+            return {"state": "running" if self._running else "idle",
+                    "topic_out": [{"topic": self._topic, "format": "data/json"}]}
+        return {"error": f"unknown action: {action}"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HandStatePlugin (sensor) — Inspire 灵巧手状态 (10Hz), tool name="hand_state"
+# 注意: 上游已有 HandPlugin (actuator, tool name="hand"), 故此处用 hand_state 避免冲突
+# ══════════════════════════════════════════════════════════════════════════════
+
+_HAND_FINGER_NAMES = {
+    1: "pinky", 2: "ring", 3: "middle",
+    4: "index", 5: "thumb_flex", 6: "thumb_rotate",
+}
+_HAND_FINGER_LABELS = {
+    1: "小指", 2: "无名指", 3: "中指",
+    4: "食指", 5: "拇指弯曲", 6: "拇指旋转",
+}
+
+
+def _hand_position_label(p: float) -> str:
+    if p >= 0.95:
+        return "fully_closed"
+    if p >= 0.75:
+        return "almost_closed"
+    if p >= 0.25:
+        return "half_closed"
+    if p >= 0.05:
+        return "almost_open"
+    return "fully_open"
+
+
+class HandStatePlugin:
+    """天轶2.0 Pro Inspire 灵巧手状态 — 左右手各6指 (10Hz)。
+
+    数据源 (domain 0):
+      /inspire_hand/state/left_hand  → sensor_msgs/JointState
+      /inspire_hand/state/right_hand → sensor_msgs/JointState
+    发布到 (domain 42): /{ns}/state/hand
+    """
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._topic = f"/{namespace}/state/hand"
+        self._running = False
+        self._lock = threading.Lock()
+        self._latest = {"left": None, "right": None}
+
+        self._sub_node = Node("tianyi2_hand_sub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._sub_node)
+
+        self._pub_node = Node("tianyi2_hand_pub2", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._pub_node)
+        self._pub = self._pub_node.create_publisher(String, self._topic, _LOW_LAT_QOS)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "hand_state",
+            "type": "sensor",
+            "multiInstance": False,
+            "readOnly": True,
+            "description": (
+                "天轶2.0 Pro Inspire 灵巧手状态(左右手各6指, 10Hz)。"
+                "手指顺序: 1=小指 2=无名指 3=中指 4=食指 5=拇指弯曲 6=拇指旋转。"
+                "position: 0=张开 1=握紧(归一化), effort: 电流(A), velocity: 归一化速度。"
+                "每指含 position_label 状态标签(fully_open/almost_open/half_closed/almost_closed/fully_closed)。"
+            ),
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._topic, "format": "data/json"}],
+        }
+
+    def start(self):
+        self._running = True
+        try:
+            from sensor_msgs.msg import JointState
+            topics = {
+                "left": "/inspire_hand/state/left_hand",
+                "right": "/inspire_hand/state/right_hand",
+            }
+            for key, topic in topics.items():
+                self._sub_node.create_subscription(
+                    JointState, topic,
+                    lambda m, k=key: self._on_hand(k, m), _RELIABLE_QOS)
+            print("[HandStatePlugin] subscriptions created")
+        except ImportError as e:
+            print(f"[HandStatePlugin] WARNING: import failed ({e}), stub mode")
+
+        self._thread = threading.Thread(target=self._publish_loop, daemon=True)
+        self._thread.start()
+        print("[HandStatePlugin] publish started")
+
+    def stop(self):
+        self._running = False
+
+    def _on_hand(self, side: str, msg):
+        try:
+            names = getattr(msg, "name", [])
+            positions = getattr(msg, "position", [])
+            velocities = getattr(msg, "velocity", [])
+            efforts = getattr(msg, "effort", [])
+            fingers = []
+            for i, raw_name in enumerate(names):
+                try:
+                    fid = int(raw_name)
+                except (TypeError, ValueError):
+                    fid = i + 1
+                item = {
+                    "id": fid,
+                    "name": _HAND_FINGER_NAMES.get(fid, f"finger_{fid}"),
+                    "label": _HAND_FINGER_LABELS.get(fid, f"指{fid}"),
+                    "position": round(float(positions[i]), 4) if i < len(positions) else 0.0,
+                    "velocity": round(float(velocities[i]), 4) if i < len(velocities) else 0.0,
+                    "effort": round(float(efforts[i]), 4) if i < len(efforts) else 0.0,
+                }
+                item["position_label"] = _hand_position_label(item["position"])
+                fingers.append(item)
+            with self._lock:
+                self._latest[side] = fingers
+        except Exception as e:  # noqa: BLE001
+            print(f"[HandStatePlugin] callback error on {side}: {e}")
+
+    @staticmethod
+    def _hand_block(fingers) -> dict:
+        if not fingers:
+            return {"count": 0, "fingers": []}
+        return {"count": len(fingers), "fingers": fingers}
+
+    def _produce(self) -> dict | None:
+        with self._lock:
+            data = dict(self._latest)
+        if not any(data.values()):
+            return None
+        return {
+            "hands": {
+                "left":  self._hand_block(data.get("left")),
+                "right": self._hand_block(data.get("right")),
+            },
+            "units": {
+                "position": "0=张开, 1=握紧(归一化)",
+                "velocity": "归一化速度, 0=静止",
+                "effort": "电流(A)",
+            },
+            "timestamp_ms": int(time.time() * 1000),
+            "control_level": "ANY",
+        }
+
+    def _publish_loop(self):
+        while self._running:
+            time.sleep(0.1)  # 10Hz
+            payload = self._produce()
+            if payload is None:
+                continue
+            msg = String()
+            msg.data = json.dumps(payload)
+            self._pub.publish(msg)
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("read", "get_hand_state"):
+            d = self._produce()
+            return d if d is not None else {"error": "NO_FEEDBACK", "message": "no fresh hand state"}
+        if action in ("start", "stop", "info"):
+            return {"state": "running" if self._running else "idle",
+                    "topic_out": [{"topic": self._topic, "format": "data/json"}]}
+        return {"error": f"unknown action: {action}"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RemoteStatePlugin (sensor) — 遥控器SBUS事件 (5Hz)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_REMOTE_KEY_NAMES = {
+    1: ("a_up", 1), 2: ("a_down", 2),
+    3: ("b_up", 3), 4: ("b_down", 4),
+    5: ("c_up", 5), 6: ("c_down", 6),
+    7: ("d_up", 7), 8: ("d_down", 8),
+    9: ("e_up", 9), 10: ("e_mid", 10), 11: ("e_down", 11),
+    12: ("f_up", 12), 13: ("f_mid", 13), 14: ("f_down", 14),
+    15: ("g_left", 15), 16: ("g_mid", 16), 17: ("g_right", 17),
+    18: ("h_left", 18), 19: ("h_mid", 19), 20: ("h_right", 20),
+}
+
+_REMOTE_KEY_LABELS = {
+    "a_up": "A键按下", "a_down": "A键回弹",
+    "b_up": "B键按下", "b_down": "B键回弹",
+    "c_up": "C键按下", "c_down": "C键回弹",
+    "d_up": "D键按下", "d_down": "D键回弹",
+    "e_up": "E键上拨", "e_mid": "E键中位", "e_down": "E键下拨",
+    "f_up": "F键上拨", "f_mid": "F键中位", "f_down": "F键下拨",
+    "g_left": "G键左拨", "g_mid": "G键中位", "g_right": "G键右拨",
+    "h_left": "H键左拨", "h_mid": "H键中位", "h_right": "H键右拨",
+}
+
+
+def _stick_pos(x: float, y: float) -> str:
+    """摇杆方向标签 (|x|+|y| < 0.1 视为居中)。"""
+    if abs(x) < 0.1 and abs(y) < 0.1:
+        return "center"
+    if abs(x) >= abs(y):
+        return "right" if x > 0 else "left"
+    return "forward" if y > 0 else "back"
+
+
+class RemoteStatePlugin:
+    """天轶2.0 遥控器SBUS事件 — 8按键 + 2摇杆 (5Hz)。
+
+    数据源 (domain 0):
+      /sbus_data       → sensor_msgs/Joy (12 轴摇杆)
+      /sbus_data/event → bodyctrl_msgs/SbusData (按键事件)
+    发布到 (domain 42): /{ns}/state/remote_event
+    """
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._topic = f"/{namespace}/state/remote_event"
+        self._running = False
+        self._lock = threading.Lock()
+        self._latest_event = None
+        self._prev_key_new = 0
+        self._joy = {"x1": 0.0, "y1": 0.0, "x2": 0.0, "y2": 0.0}
+        self._buttons = {k: 0 for k in ("a", "b", "c", "d", "e", "f", "g", "h")}
+
+        self._sub_node = Node("tianyi2_remote_sub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._sub_node)
+
+        self._pub_node = Node("tianyi2_remote_pub", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._pub_node)
+        self._pub = self._pub_node.create_publisher(String, self._topic, _LOW_LAT_QOS)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "remote_event",
+            "type": "sensor",
+            "multiInstance": False,
+            "readOnly": True,
+            "description": (
+                "天轶2.0 遥控器SBUS事件(43Hz 采样, 5Hz 心跳发布)。"
+                "8 按键 A-H + 2 摇杆(左/右, 归一化 -1~+1)。"
+                "buttons 字段每帧更新当前按键状态(button_a~button_h 0/1)。"
+                "按键边沿事件在 event 字段附 button(如 a_up)+ button_id(1-20)+ label(中文); 摇杆在 joystick 字段。"
+                "遥控器静止时 buttons 全 0, joystick 全 0, event 不出现(正常 idle 态)。"
+            ),
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._topic, "format": "data/json"}],
+        }
+
+    def start(self):
+        self._running = True
+        try:
+            from sensor_msgs.msg import Joy
+            from bodyctrl_msgs.msg import SbusData
+            self._sub_node.create_subscription(Joy, "/sbus_data", self._on_joy, _RELIABLE_QOS)
+            self._sub_node.create_subscription(SbusData, "/sbus_data/event", self._on_event, _RELIABLE_QOS)
+            print("[RemoteStatePlugin] subscriptions created")
+        except ImportError as e:
+            print(f"[RemoteStatePlugin] WARNING: import failed ({e}), stub mode")
+
+        self._thread = threading.Thread(target=self._publish_loop, daemon=True)
+        self._thread.start()
+        print("[RemoteStatePlugin] publish started")
+
+    def stop(self):
+        self._running = False
+
+    def _on_joy(self, msg):
+        try:
+            axes = list(getattr(msg, "axes", []))
+            def _g(i):
+                return round(float(axes[i]), 4) if len(axes) > i else 0.0
+            with self._lock:
+                self._joy = {"x1": _g(0), "y1": _g(1), "x2": _g(2), "y2": _g(3)}
+        except Exception as e:  # noqa: BLE001
+            print(f"[RemoteStatePlugin] joy callback error: {e}")
+
+    def _on_event(self, msg):
+        try:
+            key_new = int(getattr(msg, "key_event_new", 0))
+            with self._lock:
+                for k in ("a", "b", "c", "d", "e", "f", "g", "h"):
+                    self._buttons[k] = int(getattr(msg, f"button_{k}", 0))
+            if key_new == self._prev_key_new or key_new == 0:
+                return
+            name_id = _REMOTE_KEY_NAMES.get(key_new)
+            if not name_id:
+                return
+            button_name, button_id = name_id
+            evt = {
+                "event": "button",
+                "button": button_name,
+                "button_id": button_id,
+                "label": _REMOTE_KEY_LABELS.get(button_name, button_name),
+                "timestamp_ms": int(time.time() * 1000),
+            }
+            with self._lock:
+                self._latest_event = evt
+            self._prev_key_new = key_new
+        except Exception as e:  # noqa: BLE001
+            print(f"[RemoteStatePlugin] event callback error: {e}")
+
+    def _produce(self) -> dict:
+        with self._lock:
+            evt = self._latest_event
+            self._latest_event = None
+            joy = dict(self._joy)
+            btns = dict(self._buttons)
+        out = {
+            "state": "idle" if evt is None else "active",
+            "joystick": {
+                "left":  {"x": joy["x1"], "y": joy["y1"], "position": _stick_pos(joy["x1"], joy["y1"])},
+                "right": {"x": joy["x2"], "y": joy["y2"], "position": _stick_pos(joy["x2"], joy["y2"])},
+            },
+            "buttons": btns,
+            "timestamp_ms": int(time.time() * 1000),
+            "control_level": "ANY",
+        }
+        if evt is not None:
+            out["event"] = evt
+        out["units"] = {
+            "joystick": "归一化 -1.0 ~ +1.0 (position: center/left/right/forward/back)",
+            "buttons": "A-H 8 按键状态值: -1=回弹/下拨, 0=中位, 1=按下/上拨",
+        }
+        return out
+
+    def _publish_loop(self):
+        while self._running:
+            time.sleep(0.2)  # 5Hz
+            payload = self._produce()
+            msg = String()
+            msg.data = json.dumps(payload)
+            self._pub.publish(msg)
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("read", "get_remote_event", "get_remote"):
+            return self._produce()
+        if action in ("start", "stop", "info"):
+            return {"state": "running" if self._running else "idle",
+                    "topic_out": [{"topic": self._topic, "format": "data/json"}]}
         return {"error": f"unknown action: {action}"}

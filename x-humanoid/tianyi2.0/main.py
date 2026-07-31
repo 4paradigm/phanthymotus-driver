@@ -117,6 +117,21 @@ class TianyiDeviceBundle:
             self._plugins.append(NavStatePlugin(plugins_cfg["nav_state"], namespace, ros2, slamtec_client))
             print("[bundle] NavStatePlugin loaded")
 
+        if plugins_cfg.get("motors", {}).get("enabled", False):
+            from device import MotorStatePlugin
+            self._plugins.append(MotorStatePlugin(plugins_cfg["motors"], namespace, ros2))
+            print("[bundle] MotorStatePlugin loaded")
+
+        if plugins_cfg.get("hand_state", {}).get("enabled", False):
+            from device import HandStatePlugin
+            self._plugins.append(HandStatePlugin(plugins_cfg["hand_state"], namespace, ros2))
+            print("[bundle] HandStatePlugin loaded")
+
+        if plugins_cfg.get("remote_event", {}).get("enabled", False):
+            from device import RemoteStatePlugin
+            self._plugins.append(RemoteStatePlugin(plugins_cfg["remote_event"], namespace, ros2))
+            print("[bundle] RemoteStatePlugin loaded")
+
         if plugins_cfg.get("head", {}).get("enabled", False):
             from device import HeadPlugin
             self._plugins.append(HeadPlugin(plugins_cfg["head"], namespace, ros2))
