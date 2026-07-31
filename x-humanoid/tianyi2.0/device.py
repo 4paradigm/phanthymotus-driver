@@ -631,8 +631,35 @@ class AsrPlugin:
 # PowerBoardStatePlugin (sensor) — 电源板状态卡
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _temp_status(t_max: float) -> str:
+    if t_max >= 75:
+        return "critical"
+    if t_max >= 65:
+        return "hot"
+    if t_max >= 55:
+        return "warm"
+    return "normal"
+
+
+def _battery_status(power: float) -> str:
+    if power < 10:
+        return "critical"
+    if power < 25:
+        return "low"
+    return "normal"
+
+
 class PowerBoardStatePlugin:
-    """天轶2.0 Pro 电源板状态: 1Hz, 各部位MOS温度/电流/电压含极值, 母线电压, 软硬版本, 电池汇总."""
+    """天轶2.0 Pro 电源板状态: 1Hz。
+
+    数据源: /power/board/status → bodyctrl_msgs/PowerStatus
+    输出策略(与 plugins/power_board.py 老框架保持一致):
+      - temp/current/voltage 的 max/min = 实时所有部位的聚合标量(不是历史值)
+      - temp.status: normal(<55) / warm(55-65) / hot(65-75) / critical(>75)
+      - battery.status: critical(<10) / low(<25) / normal(>=25)
+      - 电流 0A 合法(无负载),电压 0V 异常标 unknown
+      - units 字段附加单位说明
+    """
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._ns = namespace
@@ -655,7 +682,14 @@ class PowerBoardStatePlugin:
             "type": "sensor",
             "multiInstance": False,
             "readOnly": True,
-            "description": "天轶2.0 Pro 电源板状态(1Hz,各部位MOS温度/电流/电压含极值,母线电压,软硬版本,电池汇总)。",
+            "description": (
+                "天轶2.0 Pro 电源板状态(1Hz)。"
+                "部位:waist/arm_a/arm_b/leg_a/leg_b(温度电压电流)+head(仅电流)+bus(母线电压)。"
+                "temp.max/min = 当前所有部位 MOS 温度的实时最大/最小, temp.status: normal(<55)/warm/hot(>65)/critical(>75)。"
+                "current 0A 合法(部位无负载);voltage 0V 标 unknown(未上报)。"
+                "battery.power=电量%, battery.status: critical(<10)/low(<25)/normal(>=25), current 负值=放电。"
+                "version.software/hardware 为字符串版本号。"
+            ),
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._topic, "format": "data/json"}],
         }
@@ -678,57 +712,73 @@ class PowerBoardStatePlugin:
         self._running = False
 
     def _on_power(self, msg):
-        with self._lock:
-            # Build temp dict with min/max
-            temp_parts = ["waist", "arm_a", "arm_b", "leg_a", "leg_b"]
-            temp = {}
-            temp_max = {}
-            temp_min = {}
-            for p in temp_parts:
-                base = p.replace("_", "")
-                temp[p] = getattr(msg, f"{base}_temp", 0)
-                temp_max[p] = getattr(msg, f"{base}_temp_max", 0)
-                temp_min[p] = getattr(msg, f"{base}_temp_min", 0)
+        try:
+            def _num(field):
+                v = getattr(msg, field, None)
+                return float(v) if v is not None else None
 
-            current_parts = ["arm_a", "arm_b", "leg_a", "leg_b", "waist", "head"]
-            current = {}
-            current_max = {}
-            current_min = {}
-            for p in current_parts:
-                base = p.replace("_", "")
-                current[p] = getattr(msg, f"{base}_curr", 0)
-                current_max[p] = getattr(msg, f"{base}_curr_max", 0)
-                current_min[p] = getattr(msg, f"{base}_curr_min", 0)
+            def _str(field):
+                v = getattr(msg, field, None)
+                return str(v) if v is not None else None
 
-            voltage_parts = ["arm_a", "arm_b", "leg_a", "leg_b", "waist"]
-            voltage = {}
-            voltage_max = {}
-            voltage_min = {}
-            for p in voltage_parts:
-                base = p.replace("_", "")
-                voltage[p] = getattr(msg, f"{base}_volt", 0)
-                voltage_max[p] = getattr(msg, f"{base}_volt_max", 0)
-                voltage_min[p] = getattr(msg, f"{base}_volt_min", 0)
-            voltage["bus"] = getattr(msg, "bus_volt", 0)
-            voltage_max["bus"] = voltage["bus"]
-            voltage_min["bus"] = voltage["bus"]
-
-            self._data = {
-                "temp": {"waist": temp["waist"], "arm_a": temp["arm_a"], "arm_b": temp["arm_b"],
-                         "leg_a": temp["leg_a"], "leg_b": temp["leg_b"],
-                         "max": temp_max, "min": temp_min},
-                "current": {**current, "max": current_max, "min": current_min},
-                "voltage": {**voltage, "max": voltage_max, "min": voltage_min},
-                "version": {
-                    "software": getattr(msg, "software_version", ""),
-                    "hardware": getattr(msg, "hardware_version", ""),
-                },
-                "battery": {
-                    "voltage": getattr(msg, "battery_voltage", 0),
-                    "current": getattr(msg, "battery_current", 0),
-                    "power": getattr(msg, "battery_power", 0),
-                },
+            temps = {
+                "waist": _num("waist_temp"),
+                "arm_a": _num("arm_a_temp"),
+                "arm_b": _num("arm_b_temp"),
+                "leg_a": _num("leg_a_temp"),
+                "leg_b": _num("leg_b_temp"),
             }
+            currents = {
+                "waist": _num("waist_curr"),
+                "arm_a": _num("arm_a_curr"),
+                "arm_b": _num("arm_b_curr"),
+                "leg_a": _num("leg_a_curr"),
+                "leg_b": _num("leg_b_curr"),
+                "head":  _num("head_curr"),
+            }
+            voltages = {
+                "waist": _num("waist_volt"),
+                "arm_a": _num("arm_a_volt"),
+                "arm_b": _num("arm_b_volt"),
+                "leg_a": _num("leg_a_volt"),
+                "leg_b": _num("leg_b_volt"),
+                "bus":   _num("bus_volt"),
+            }
+
+            def _aggregate(d: dict, keep_zero: bool):
+                """实时聚合 max/min;keep_zero=False 时 0 视为未上报剔除。"""
+                vals = [v for v in d.values() if v is not None and (keep_zero or v > 0)]
+                return (max(vals) if vals else None, min(vals) if vals else None)
+
+            t_max, t_min = _aggregate(temps, keep_zero=True)
+            c_max, c_min = _aggregate(currents, keep_zero=True)
+            v_max, v_min = _aggregate(voltages, keep_zero=False)
+
+            # 电流 0A 合法(无负载)保留原值;电压 0V 异常标 unknown
+            volt_out = {k: (v if v and v > 0 else "unknown") for k, v in voltages.items()}
+
+            battery = {
+                "voltage": _num("battery_voltage"),
+                "current": _num("battery_current"),
+                "power":   _num("battery_power"),
+            }
+            p = battery["power"]
+            battery["status"] = _battery_status(p) if p is not None else "unknown"
+
+            with self._lock:
+                self._data = {
+                    "temp": {**temps, "max": t_max, "min": t_min,
+                             "status": _temp_status(t_max) if t_max is not None else "unknown"},
+                    "current": {**currents, "max": c_max, "min": c_min},
+                    "voltage": {**volt_out, "max": v_max, "min": v_min},
+                    "version": {
+                        "software": _str("software_version"),
+                        "hardware": _str("hardware_version"),
+                    },
+                    "battery": battery,
+                }
+        except Exception as e:  # noqa: BLE001
+            print(f"[PowerBoardStatePlugin] callback error: {e}")
 
     def _publish_loop(self):
         while self._running:
@@ -737,13 +787,27 @@ class PowerBoardStatePlugin:
                 if not self._data:
                     continue
                 payload = json.loads(json.dumps(self._data))  # deep copy
-                payload["timestamp_ms"] = int(time.time() * 1000)
-                payload["control_level"] = "ANY"
+            payload["units"] = {
+                "temp": "°C (MOS 管温度)",
+                "current": "A (0=无负载, 合法)",
+                "voltage": "V (unknown=未上报/异常)",
+                "battery.power": "% (电量)",
+                "battery.current": "A (负值=放电)",
+            }
+            payload["timestamp_ms"] = int(time.time() * 1000)
+            payload["control_level"] = "ANY"
             msg = String()
             msg.data = json.dumps(payload)
             self._pub.publish(msg)
 
     def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("read", "get_power_board"):
+            with self._lock:
+                data = dict(self._data) if self._data else None
+            if data is None:
+                return {"state": "error", "error": "NO_FEEDBACK",
+                        "message": "no fresh power_board state"}
+            return data
         if action in ("start", "stop", "info"):
             return {"state": "running" if self._running else "idle",
                     "topic_out": [{"topic": self._topic, "format": "data/json"}]}
