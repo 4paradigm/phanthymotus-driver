@@ -14,6 +14,8 @@ MCP 工具命名规则：直接使用 tool name（mic, tts, led, loco, loco_stat
     CONFIG_PATH — config.yaml 路径（默认同目录下）
 """
 
+from __future__ import annotations
+
 import json
 import os
 import re
@@ -129,6 +131,17 @@ class G1DeviceBundle:
             controlled_cfg["network_iface"] = network_iface
             self._plugins.append(ControlledSpatialPlugin(controlled_cfg, namespace, executor, slam_client, smart_motion=smart_motion))
             print("[bundle] ControlledSpatialPlugin loaded")
+
+        if plugins_cfg.get("controlled_spatial_map", {}).get("enabled", False):
+            try:
+                from controlled_spatial_map import ControlledSpatialMapPlugin
+                map_cfg = dict(plugins_cfg["controlled_spatial_map"])
+                self._plugins.append(ControlledSpatialMapPlugin(map_cfg, namespace, executor))
+                print("[bundle] ControlledSpatialMapPlugin loaded")
+            except Exception as e:
+                print(f"[bundle] ControlledSpatialMapPlugin load skipped: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
 
         if plugins_cfg.get("motion_switcher", {}).get("enabled", False):
             from device import MotionSwitcherPlugin

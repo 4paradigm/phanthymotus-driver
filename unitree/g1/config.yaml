@@ -28,6 +28,9 @@ plugins:
     enabled: true
     native_slam_pcd_dir: /home/unitree
     native_slam_db_path: /opt/phanthy-motus/data/controlled_spatial.db
+  controlled_spatial_map:
+    enabled: true
+    native_slam_db_path: /opt/phanthy-motus/data/controlled_spatial.db
   motion_switcher:
     enabled: true
   ext_mic:
@@ -38,7 +41,7 @@ plugins:
 safety_harness:
   enabled: true
   decel_threshold: 2.0
-  stop_threshold: 0.8
+  stop_threshold: 0.6
   lateral_threshold: 0.8
   cone_half_angle: 30
   z_min: 0.1

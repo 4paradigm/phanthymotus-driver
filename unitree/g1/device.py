@@ -82,6 +82,8 @@ class _MicNode(Node):
         self._sock:   socket.socket | None = None
         self._thread: threading.Thread | None = None
         self.state   = "idle"
+        self._packet_count = 0
+        self._last_packet_ts = 0.0
         self.get_logger().info(f"MicNode ready — topic: {topic}")
 
     def start_capture(self) -> str:
@@ -99,7 +101,7 @@ class _MicNode(Node):
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
         sock.settimeout(0.5)
         self._sock   = sock
-        self.state   = "running"
+        self._packet_count = 0
         self._thread = threading.Thread(target=self._pump, daemon=True)
         self._thread.start()
         self.get_logger().info(f"Capture started — multicast {MIC_GROUP_IP}:{MIC_PORT}")
@@ -124,6 +126,8 @@ class _MicNode(Node):
                 continue
             except OSError:
                 break
+            self._packet_count += 1
+            self._last_packet_ts = time.monotonic()
             buf.extend(data)
             while len(buf) >= CHUNK_BYTES:
                 chunk = bytes(buf[:CHUNK_BYTES])
@@ -159,19 +163,59 @@ class MicPlugin:
         }
 
     def start(self) -> None:
-        self._node.start_capture()
+        self._node.start_capture()  # start capture early but no self-check here
 
     def stop(self) -> None:
         self._node.stop_capture()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
-            return {"state": "running"}
+            # Start capture if not already running
+            self._node.start_capture()
+            # Self-check: verify full pipeline (multicast → ROS2 publish → subscribable)
+            state, message = self._self_check()
+            return {"state": state, "message": message} if message else {"state": state}
         if action == "stop":
             return {"state": "idle"}
         if action == "info":
-            return {"state": "running", "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}]}
+            last_ago = int((time.monotonic() - self._node._last_packet_ts) * 1000) if self._node._last_packet_ts > 0 else -1
+            return {
+                "state": self._node.state,
+                "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}],
+                "packets": self._node._packet_count,
+                "last_packet_ago_ms": last_ago,
+            }
         return None
+
+    def _self_check(self) -> tuple[str, str]:
+        """Verify mic pipeline: multicast receiving + ROS2 topic subscribable."""
+        import time as _t
+
+        # Check 1: multicast receiving
+        if self._node._packet_count == 0:
+            deadline = _t.monotonic() + 3.0
+            while _t.monotonic() < deadline and self._node._packet_count == 0:
+                _t.sleep(0.1)
+        if self._node._packet_count == 0:
+            self._node.state = "error"
+            return "error", "no multicast packets received in 3s"
+
+        # Check 2: ROS2 topic loopback — subscribe to own topic and verify data arrives
+        received = [False]
+        def _cb(msg):
+            received[0] = True
+        test_sub = self._node.create_subscription(AudioChunk, self._topic, _cb, _LOW_LAT_QOS)
+        deadline = _t.monotonic() + 2.0
+        while _t.monotonic() < deadline and not received[0]:
+            _t.sleep(0.1)
+        self._node.destroy_subscription(test_sub)
+
+        if not received[0]:
+            self._node.state = "error"
+            return "error", "topic published but not receivable via ROS2"
+
+        self._node.state = "running"
+        return "running", ""
 
 
 # ── NativeTtsPlugin (actuator) ───────────────────────────────────────────────
@@ -241,7 +285,7 @@ APP_NAME = "g1_speaker"
 
 
 class _SpeakerNode(Node):
-    PREFILL = 5       # buffer 5 chunks (~160ms) before starting playback
+    PREFILL = 5       # buffer 5 chunks (~500ms) before starting playback
     MERGE_BYTES = 9600  # merge into ~300ms blocks before calling PlayStream
 
     def __init__(self, audio_client: AudioClient):
@@ -411,7 +455,28 @@ class SpeakerPlugin:
         }
 
     def start(self) -> None:
-        pass  # no-op until canvas sends input_topic via play action
+        pass  # startup sound is played on first dispatch(start) when project starts
+
+    def _play_startup_sound(self) -> None:
+        """Play startup PCM by directly calling PlayStream in small blocks with pacing."""
+        import pathlib
+        pcm_path = pathlib.Path(__file__).parent / 'resource' / 'startup_beep.pcm'
+        try:
+            pcm = pcm_path.read_bytes()
+            block_size = 9600  # ~300ms per block
+            for offset in range(0, len(pcm), block_size):
+                block = pcm[offset:offset + block_size]
+                code, _ = self._node._client.PlayStream(APP_NAME, "0", block)
+                if code != 0:
+                    self._node.get_logger().warn(f"[speaker] startup sound stopped at offset {offset}: code={code}")
+                    return
+                duration = len(block) / 32000
+                remaining = duration - 0.08
+                if remaining > 0:
+                    time.sleep(remaining)
+            self._node.get_logger().info(f"[speaker] startup sound OK ({len(pcm)} bytes)")
+        except Exception as e:
+            self._node.get_logger().warn(f"[speaker] startup sound error: {e}")
 
     def stop(self) -> None:
         self._node.stop_play()
@@ -423,6 +488,8 @@ class SpeakerPlugin:
             topic = args.get("input_topic", "")
             if not topic:
                 return {"error": "Missing input_topic"}
+            # Play startup sound in background
+            threading.Thread(target=self._play_startup_sound, daemon=True).start()
             topic = self._node.start_play(topic)
             return {"state": "playing", "topic": topic}
         elif action == "stop":

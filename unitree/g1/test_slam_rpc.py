@@ -19,8 +19,8 @@ def main():
 
     print("[test] Creating SlamClient...")
     client = SlamClient()
-    client.SetTimeout(5.0)
     client.Init()
+    client.SetTimeout(5.0)
     print("[test] SlamClient ready, timeout=5s")
 
     # Wait for DDS discovery
