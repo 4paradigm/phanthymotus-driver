@@ -415,29 +415,22 @@ class SpeakerPlugin:
         }
 
     def start(self) -> None:
-        # Play startup beep to confirm speaker hardware is working
-        self._play_startup_beep()
+        # Play startup sound to confirm speaker hardware is working
+        self._play_startup_sound()
 
-    def _play_startup_beep(self) -> None:
-        """Play a short ascending beep to confirm speaker works."""
-        import math, struct
-        sample_rate = 16000
-        pcm = b''
-        for freq, duration_ms in [(880, 100), (1320, 100)]:
-            samples = int(sample_rate * duration_ms / 1000)
-            for i in range(samples):
-                env = min(i / 100, 1.0, (samples - i) / 100)
-                val = int(12000 * env * math.sin(2 * math.pi * freq * i / sample_rate))
-                pcm += struct.pack('<h', val)
-            pcm += b'\x00\x00' * int(sample_rate * 0.03)
+    def _play_startup_sound(self) -> None:
+        """Play startup PCM file to confirm speaker works."""
+        import pathlib
+        pcm_path = pathlib.Path(__file__).parent / 'resource' / 'startup_beep.pcm'
         try:
+            pcm = pcm_path.read_bytes()
             code, _ = self._node._client.PlayStream(APP_NAME, "0", pcm)
             if code == 0:
-                self._node.get_logger().info("[speaker] startup beep OK")
+                self._node.get_logger().info(f"[speaker] startup sound OK ({len(pcm)} bytes)")
             else:
-                self._node.get_logger().warn(f"[speaker] startup beep failed: code={code}")
+                self._node.get_logger().warn(f"[speaker] startup sound failed: code={code}")
         except Exception as e:
-            self._node.get_logger().warn(f"[speaker] startup beep error: {e}")
+            self._node.get_logger().warn(f"[speaker] startup sound error: {e}")
 
     def stop(self) -> None:
         self._node.stop_play()
