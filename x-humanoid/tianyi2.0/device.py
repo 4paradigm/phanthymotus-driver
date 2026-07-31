@@ -1198,68 +1198,159 @@ class CameraPlugin:
         return {"state": "running"}
 
 
+# ── ASR event 常量 (取自 lyre_msgs/msg/AsrEvent.msg) ────────────────────────────
+
+_ASR_EVENT_NAMES = {
+    2:  ("EVENT_ERROR",               "识别错误"),
+    3:  ("EVENT_STATE",               "状态变化"),
+    4:  ("EVENT_WAKEUP",              "唤醒"),
+    5:  ("EVENT_SLEEP",               "休眠"),
+    6:  ("EVENT_VAD",                  "语音活动检测"),
+    10: ("EVENT_PRE_SLEEP",           "预休眠"),
+    13: ("EVENT_CONNECTED_TO_SERVER", "已连接服务器"),
+    14: ("EVENT_SERVER_DISCONNECTED", "服务器断开"),
+}
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # AsrPlugin (sensor)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class AsrPlugin:
-    """语音识别结果 (lyre ASR)"""
+    """语音识别结果 (lyre ASR)。
+
+    数据源 (domain 42): /state/voice (std_msgs/String JSON, BEST_EFFORT)
+      - 由 phanthy_bus_bridge 聚合 host 上 lyre /audio_asr/{iat,event,keyword} 而成
+      - payload 形如:
+        {"asr": {"event": 4, "keyword": "嗨天轶", "angle": 90,
+                 "iat_id": "wgw000b1f7f", "iat_text": "现在是正面",
+                 "vad_state": 0},
+         "timestamp_ms": ...}
+    发到 (domain 42): /{ns}/asr/text (std_msgs/String JSON)
+      - 同一 iat_id 重复发送只转发一次
+    """
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._ns = namespace
         self._ros2 = ros2
         self._topic = f"/{namespace}/asr/text"
         self._running = False
+        self._last_iat_id = None   # 按 iat_id 去重
+        self._last_event = None    # 无 iat 时按 event 去重
+        self._last_state = None    # 最近一次 /state/voice 解析结果
 
-        self._sub_node = Node("tianyi2_asr_sub", context=ros2.ctx_tianyi)
-        ros2.executor_tianyi.add_node(self._sub_node)
+        # /state/voice 在 domain 42 上由 phanthy_bus_bridge 发布,容器内可见
+        self._sub_node = Node("tianyi2_asr_sub", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._sub_node)
 
         self._pub_node = Node("tianyi2_asr_pub", context=ros2.ctx_core)
         ros2.executor_core.add_node(self._pub_node)
-        self._pub = self._pub_node.create_publisher(String, self._topic, _RELIABLE_QOS)
+        # 用 RELIABLE + TRANSIENT_LOCAL 让后加入的订阅者能收到最近一帧
+        _asr_pub_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self._pub = self._pub_node.create_publisher(String, self._topic, _asr_pub_qos)
 
     def get_tool(self) -> dict:
         return {
             "name": "asr",
             "type": "sensor",
-            "description": "天轶2.0 语音识别 (lyre ASR) — 实时语音转文字",
+            "multiInstance": False,
+            "readOnly": True,
+            "description": (
+                "天轶2.0 语音识别 (lyre ASR)。"
+                "订阅 phanthy_bus_bridge 聚合的 /state/voice,解析 asr 子对象。"
+                "iat_id 去重后转发到 /{ns}/asr/text。"
+                "字段: keyword(唤醒词)、angle(声源方位角,度, 0=正前, 正值=右, 负值=左 —— "
+                "具体刻度语义待真机标定)、iat_id/iat_text(识别结果)、"
+                "event/event_name/event_label(事件)。"
+            ),
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._topic, "format": "data/json"}],
         }
 
     def start(self):
         self._running = True
-        try:
-            from lyre_msgs.msg import AsrIat
-            self._sub_node.create_subscription(
-                AsrIat, "/audio_asr/iat", self._on_asr, _RELIABLE_QOS)
-            print("[AsrPlugin] subscription created")
-        except ImportError:
-            # Fallback: subscribe as String
-            self._sub_node.create_subscription(
-                String, "/audio_asr/iat", self._on_asr_string, _RELIABLE_QOS)
-            print("[AsrPlugin] fallback to String subscription")
+        self._sub_node.create_subscription(
+            String, "/state/voice", self._on_state_voice, _LOW_LAT_QOS)
+        print("[AsrPlugin] subscribed /state/voice (domain 42, BEST_EFFORT)")
 
     def stop(self):
         self._running = False
 
-    def _on_asr(self, msg):
+    def _on_state_voice(self, msg):
         if not self._running:
             return
+        try:
+            payload = json.loads(msg.data)
+        except Exception as e:
+            print(f"[AsrPlugin] JSON parse error: {e}", flush=True)
+            return
+        asr = payload.get("asr") if isinstance(payload, dict) else None
+        if not asr:
+            return
+
+        iat_id = asr.get("iat_id") or ""
+        iat_text = asr.get("iat_text") or ""
+        event = asr.get("event")
+        # 优先用 payload 自带的 event_name/event_label (小写, 来自 phanthy_bus_bridge)
+        event_name = asr.get("event_name") or ""
+        event_label = asr.get("event_label") or ""
+        # 若 payload 没带, 则从本地常量表补
+        if not event_name:
+            ev_name, ev_label = _ASR_EVENT_NAMES.get(event, ("", ""))
+            event_name = ev_name
+            if not event_label:
+                event_label = ev_label
+
+        # 缓存最近状态(不论是否转发,read 动作会用)
+        self._last_state = {
+            "state": "active",
+            "keyword":     asr.get("keyword", ""),
+            "angle":       asr.get("angle"),
+            "iat_id":      iat_id,
+            "iat_text":    iat_text,
+            "event":       event,
+            "event_name":  event_name,
+            "event_label": event_label,
+            "timestamp_ms": payload.get("timestamp_ms") or int(time.time() * 1000),
+        }
+
+        # 无 iat 识别结果的帧 (只有 keyword/event):只在 event 变化时转发一次
+        if not iat_text:
+            if event in (None, 3):  # STATE 事件每帧都发,会刷屏;无 iat 时跳过
+                return
+            if event == self._last_event:
+                return
+            self._last_event = event
+        else:
+            # 有 iat 识别结果:按 iat_id 去重
+            if iat_id and iat_id == self._last_iat_id:
+                return
+            if iat_id:
+                self._last_iat_id = iat_id
+            self._last_event = event
+
         out = String()
-        out.data = json.dumps({"id": msg.id, "text": msg.text})
+        out.data = json.dumps(self._last_state, ensure_ascii=False)
         self._pub.publish(out)
 
-    def _on_asr_string(self, msg):
-        if not self._running:
-            return
-        self._pub.publish(msg)
-
     def dispatch(self, action: str, args: dict) -> dict:
-        if action in ("start", "stop", "info"):
+        if action in ("read", "get_asr"):
+            if self._last_state is None:
+                return {"state": "error", "error": "NO_FEEDBACK",
+                        "message": "no ASR state received yet"}
+            return dict(self._last_state)
+        if action == "info":
             return {"state": "running" if self._running else "idle",
                     "topic_out": [{"topic": self._topic, "format": "data/json"}]}
-        return {"state": "running"}
+        if action in ("start", "stop"):
+            return {"state": "running" if action == "start" else "idle"}
+        return {"state": "error", "error": "INVALID_ARGUMENT",
+                "message": f"unknown action: {action}"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
