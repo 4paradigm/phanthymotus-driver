@@ -1,9 +1,9 @@
-id: tianyi2-driver-zhang
-name: Tianyi 2.0 Pro Bundle-zhang
+id: tianyi2-driver
+name: Tianyi 2.0 Pro Bundle
 category: driver
 hardware_provider: x-humanoid
 hardware_model: "tianyi2.0"
 image_name: tianyi2
-port: 15790
-mcp_url: "http://localhost:15790/mcp"
+port: 15707
+mcp_url: "http://localhost:15707/mcp"
 description: "天轶2.0 Pro — 35DOF 人形机器人 (轮式底盘 + 双臂 + 灵巧手 + 头部 + 导航)"
