@@ -17,21 +17,20 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     pyyaml numpy opencv-python-headless
 
-# Build Tianyi and Orbbec ROS2 message packages.
+# Build tianyi ROS2 message packages (bodyctrl_msgs + lyre_msgs)
 COPY msgs/ /tianyi_ws/src/
 RUN cd /tianyi_ws && \
     . /opt/ros/humble/setup.sh && \
-    colcon build --packages-select bodyctrl_msgs lyre_msgs orbbec_camera_msgs || \
+    colcon build --packages-select bodyctrl_msgs lyre_msgs || \
     echo "WARNING: msg build failed, will run in stub mode"
 
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ENV PYTHONUNBUFFERED=1
 
-# Ensure bundled message packages are available even when the base entrypoint
-# does not source the overlay.
-ENV PYTHONPATH=/tianyi_ws/install/orbbec_camera_msgs/local/lib/python3.10/dist-packages:/tianyi_ws/install/lyre_msgs/local/lib/python3.10/dist-packages:/tianyi_ws/install/bodyctrl_msgs/local/lib/python3.10/dist-packages:${PYTHONPATH}
-ENV AMENT_PREFIX_PATH=/tianyi_ws/install/orbbec_camera_msgs:/tianyi_ws/install/bodyctrl_msgs:/tianyi_ws/install/lyre_msgs:${AMENT_PREFIX_PATH}
-ENV LD_LIBRARY_PATH=/tianyi_ws/install/orbbec_camera_msgs/lib:/tianyi_ws/install/bodyctrl_msgs/lib:/tianyi_ws/install/lyre_msgs/lib:${LD_LIBRARY_PATH}
+# Ensure tianyi msg packages are on PYTHONPATH (base image entrypoint won't source them)
+ENV PYTHONPATH=/tianyi_ws/install/lyre_msgs/local/lib/python3.10/dist-packages:/tianyi_ws/install/bodyctrl_msgs/local/lib/python3.10/dist-packages:${PYTHONPATH}
+ENV AMENT_PREFIX_PATH=/tianyi_ws/install/bodyctrl_msgs:/tianyi_ws/install/lyre_msgs:${AMENT_PREFIX_PATH}
+ENV LD_LIBRARY_PATH=/tianyi_ws/install/bodyctrl_msgs/lib:/tianyi_ws/install/lyre_msgs/lib:${LD_LIBRARY_PATH}
 
 COPY resource/ /work/resource/
 COPY main.py device.py nav_client.py config.yaml driver.yaml /work/
