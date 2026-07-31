@@ -215,6 +215,7 @@ class SystemPlugin:
         self._running = False
         self._recorder_lock = threading.RLock()
         self._recorder_process = None
+        self._recorder_process_group: int | None = None
         self._recorder_started_at: float | None = None
         self._last_recorder_exit_code: int | None = None
 
@@ -486,8 +487,9 @@ class SystemPlugin:
                 )
 
             command = [
-                "nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--",
-                "flock", "-n", "-E", "73",
+                "nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p",
+                "--no-fork", "--",
+                "flock", "-n", "-E", "73", "--no-fork",
                 _BAG_RECORDER_LOCK_HOST_PATH,
                 "bash", "-lc",
                 'source "$1" && exec ros2 launch utils record_trigger.py',
@@ -514,12 +516,24 @@ class SystemPlugin:
                 )
 
             self._recorder_process = process
+            # start_new_session makes the child PID the process-group ID.
+            # Both wrappers use --no-fork, so this group remains anchored to
+            # the ros2 launch process instead of a short-lived wrapper.
+            self._recorder_process_group = process.pid
             self._recorder_started_at = time.time()
             self._last_recorder_exit_code = None
             if self._start_probe_s:
                 time.sleep(self._start_probe_s)
             exit_code = process.poll()
             if exit_code is not None:
+                if self._process_group_exists(process.pid):
+                    return self._error(
+                        "recorder_start_failed",
+                        "The recorder launcher exited during startup while "
+                        "child processes remain",
+                        exit_code=exit_code,
+                        process_group=process.pid,
+                    )
                 self._finish_recording(exit_code)
                 if exit_code == 73:
                     return self._error(
@@ -570,6 +584,30 @@ class SystemPlugin:
 
         exit_code = process.poll()
         if exit_code is not None:
+            process_group = self._recorder_process_group
+            if (
+                process_group is not None
+                and self._process_group_exists(process_group)
+            ):
+                return {
+                    "ok": True,
+                    "state": "recording",
+                    "managed": True,
+                    "pid": process.pid,
+                    "process_group": process_group,
+                    "launcher_running": False,
+                    "launcher_exit_code": exit_code,
+                    "bag_directory": self._bag_host_path,
+                    "started_at": self._format_time(
+                        self._recorder_started_at),
+                    "uptime_s": round(
+                        max(
+                            0.0,
+                            time.time() - self._recorder_started_at,
+                        ),
+                        3,
+                    ),
+                }
             self._finish_recording(exit_code)
             return self._idle_recorder_result()
 
@@ -578,6 +616,8 @@ class SystemPlugin:
             "state": "recording",
             "managed": True,
             "pid": process.pid,
+            "process_group": self._recorder_process_group,
+            "launcher_running": True,
             "bag_directory": self._bag_host_path,
             "started_at": self._format_time(self._recorder_started_at),
             "uptime_s": round(
@@ -606,16 +646,11 @@ class SystemPlugin:
                 return status
 
             process = self._recorder_process
-            try:
-                process_group = os.getpgid(process.pid)
-            except ProcessLookupError:
-                self._finish_recording(process.poll())
-                return self._idle_recorder_result()
-            except OSError as error:
+            process_group = self._recorder_process_group
+            if process_group is None:
                 return self._error(
                     "recorder_signal_failed",
-                    "Could not resolve the recorder process group",
-                    errno=error.errno,
+                    "The managed recorder process group is unavailable",
                 )
 
             stages = [
@@ -638,24 +673,53 @@ class SystemPlugin:
                         errno=error.errno,
                         stop_stage=stage,
                     )
-                try:
-                    exit_code = process.wait(timeout=timeout_s)
-                except subprocess.TimeoutExpired:
-                    continue
-
-                self._finish_recording(exit_code)
-                return self._idle_recorder_result(
-                    stop_stage=stage, exit_code=exit_code)
+                stopped, exit_code = self._wait_for_recorder_group_exit(
+                    process, process_group, timeout_s)
+                if stopped:
+                    self._finish_recording(exit_code)
+                    return self._idle_recorder_result(
+                        stop_stage=stage, exit_code=exit_code)
 
             return self._error(
                 "recorder_stop_failed",
                 "The bag recorder did not stop after SIGKILL",
                 pid=process.pid,
+                process_group=process_group,
             )
+
+    @staticmethod
+    def _process_group_exists(process_group: int) -> bool:
+        try:
+            os.killpg(process_group, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            # A signal error other than ESRCH does not prove the group exited.
+            return True
+        return True
+
+    def _wait_for_recorder_group_exit(
+        self,
+        process,
+        process_group: int,
+        timeout_s: float,
+    ) -> tuple[bool, int | None]:
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        while True:
+            exit_code = process.poll()
+            if not self._process_group_exists(process_group):
+                return True, exit_code
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False, exit_code
+            time.sleep(min(0.05, remaining))
 
     def _finish_recording(self, exit_code) -> None:
         self._last_recorder_exit_code = exit_code
         self._recorder_process = None
+        self._recorder_process_group = None
         self._recorder_started_at = None
 
     def _idle_recorder_result(self, **details) -> dict:

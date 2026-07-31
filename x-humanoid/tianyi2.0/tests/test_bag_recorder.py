@@ -69,20 +69,12 @@ device = _load_device_module()
 
 
 class _FakeProcess:
-    def __init__(self, pid=4242, wait_results=None):
+    def __init__(self, pid=4242):
         self.pid = pid
         self.returncode = None
-        self._wait_results = list(wait_results or [0])
 
     def poll(self):
         return self.returncode
-
-    def wait(self, timeout=None):
-        result = self._wait_results.pop(0)
-        if isinstance(result, BaseException):
-            raise result
-        self.returncode = result
-        return result
 
 
 class BagRecorderTests(unittest.TestCase):
@@ -175,7 +167,8 @@ class BagRecorderTests(unittest.TestCase):
         self.assertEqual(
             [
                 "nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p",
-                "--", "flock", "-n", "-E", "73",
+                "--no-fork", "--",
+                "flock", "-n", "-E", "73", "--no-fork",
                 "/run/phanthymotus-tianyi2-bag-recorder.lock",
                 "bash", "-lc",
                 'source "$1" && exec ros2 launch utils record_trigger.py',
@@ -260,9 +253,12 @@ class BagRecorderTests(unittest.TestCase):
             self.plugin.dispatch("start_recording", {})
 
         with (
-            mock.patch.object(
-                device.os, "getpgid", return_value=process.pid),
             mock.patch.object(device.os, "killpg") as killpg,
+            mock.patch.object(
+                self.plugin,
+                "_wait_for_recorder_group_exit",
+                return_value=(True, -signal.SIGINT),
+            ),
         ):
             stopped = self.plugin.dispatch("stop_recording", {})
 
@@ -273,20 +269,23 @@ class BagRecorderTests(unittest.TestCase):
         self.assertEqual(
             "idle", self.plugin.dispatch("status", {})["state"])
 
-    def test_stop_escalates_to_sigterm_then_sigkill(self):
-        process = _FakeProcess(wait_results=[
-            subprocess.TimeoutExpired("record_trigger", 0.01),
-            subprocess.TimeoutExpired("record_trigger", 0.01),
-            -signal.SIGKILL,
-        ])
+    def test_stop_escalates_while_recorder_group_remains_alive(self):
+        process = _FakeProcess()
         with mock.patch.object(
                 device.subprocess, "Popen", return_value=process):
             self.plugin.dispatch("start_recording", {})
 
         with (
-            mock.patch.object(
-                device.os, "getpgid", return_value=process.pid),
             mock.patch.object(device.os, "killpg") as killpg,
+            mock.patch.object(
+                self.plugin,
+                "_wait_for_recorder_group_exit",
+                side_effect=[
+                    (False, -signal.SIGINT),
+                    (False, -signal.SIGINT),
+                    (True, -signal.SIGKILL),
+                ],
+            ),
         ):
             stopped = self.plugin.dispatch("stop_recording", {})
 
@@ -295,6 +294,58 @@ class BagRecorderTests(unittest.TestCase):
             [signal.SIGINT, signal.SIGTERM, signal.SIGKILL],
             [call.args[1] for call in killpg.call_args_list],
         )
+
+    def test_launcher_exit_does_not_hide_a_live_recorder_group(self):
+        process = _FakeProcess()
+        with mock.patch.object(
+                device.subprocess, "Popen", return_value=process):
+            self.plugin.dispatch("start_recording", {})
+        process.returncode = -signal.SIGINT
+
+        with mock.patch.object(
+                self.plugin, "_process_group_exists", return_value=True):
+            status = self.plugin._recorder_status_locked()
+
+        self.assertEqual("recording", status["state"])
+        self.assertTrue(status["managed"])
+        self.assertFalse(status["launcher_running"])
+        self.assertEqual(-signal.SIGINT, status["launcher_exit_code"])
+        self.assertEqual(process.pid, status["process_group"])
+
+    def test_group_wait_rejects_launcher_only_exit(self):
+        process = _FakeProcess()
+        process.returncode = -signal.SIGINT
+
+        with mock.patch.object(
+                self.plugin, "_process_group_exists", return_value=True):
+            stopped, exit_code = self.plugin._wait_for_recorder_group_exit(
+                process, process.pid, 0)
+
+        self.assertFalse(stopped)
+        self.assertEqual(-signal.SIGINT, exit_code)
+
+    def test_failed_stop_keeps_live_group_under_management(self):
+        process = _FakeProcess()
+        with mock.patch.object(
+                device.subprocess, "Popen", return_value=process):
+            self.plugin.dispatch("start_recording", {})
+        process.returncode = -signal.SIGINT
+
+        with (
+            mock.patch.object(device.os, "killpg"),
+            mock.patch.object(
+                self.plugin,
+                "_wait_for_recorder_group_exit",
+                return_value=(False, -signal.SIGINT),
+            ),
+            mock.patch.object(
+                self.plugin, "_process_group_exists", return_value=True),
+        ):
+            stopped = self.plugin.dispatch("stop_recording", {})
+            status = self.plugin._recorder_status_locked()
+
+        self.assertEqual("recorder_stop_failed", stopped["code"])
+        self.assertEqual("recording", status["state"])
 
     def test_list_sessions_is_filtered_read_only_and_newest_first(self):
         old_session = self.bag_dir / "session-old"
@@ -330,9 +381,12 @@ class BagRecorderTests(unittest.TestCase):
             self.plugin.dispatch("start_recording", {})
 
         with (
-            mock.patch.object(
-                device.os, "getpgid", return_value=process.pid),
             mock.patch.object(device.os, "killpg"),
+            mock.patch.object(
+                self.plugin,
+                "_wait_for_recorder_group_exit",
+                return_value=(True, -signal.SIGINT),
+            ),
         ):
             self.plugin.stop()
 
