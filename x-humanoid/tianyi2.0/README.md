@@ -90,7 +90,7 @@ Wrist pitch stays neutral in every semantic frame. `salute` moves wrist yaw
 progressively from 25 degrees in the preparation frame to 50 degrees in the
 final frame. `welcome` keeps all wrist joints at zero for the entire sequence.
 For the left-arm `high_five`, wrist roll moves from 10 degrees in the
-preparation frame to 30 degrees in the final frame; the right arm uses the
+preparation frame to 50 degrees in the final frame; the right arm uses the
 mirrored negative angles.
 
 The URDF defines joint axes and limits but contains no hand palm frame and no

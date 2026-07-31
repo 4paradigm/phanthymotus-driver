@@ -1364,7 +1364,7 @@ class ArmGesturePlugin:
         "welcome": [-10, 65, 75, -100, 0, 0, 0],
         "raise": [0, 130, 0, -15, 0, 0, 0],
         "shake_hands": [-55, 15, 5, -35, 0, 0, 0],
-        "high_five": [-40, 40, -20, -80, 0, 0, 30],
+        "high_five": [-40, 40, -20, -80, 0, 0, 50],
     }
     _PREPARE_POSES = {
         # Flex the elbow while establishing the lifting plane instead of first
@@ -1409,6 +1409,11 @@ class ArmGesturePlugin:
                         "default": "right",
                         "description": "执行手臂，可选[left, right, both]，默认right",
                     },
+                    "salute_side": {
+                        "type": "string", "enum": ["left", "right"],
+                        "default": "right",
+                        "description": "敬礼手臂，可选[left, right]，默认right",
+                    },
                     "cycles": {
                         "type": "integer", "minimum": 1, "maximum": 5,
                         "default": 2,
@@ -1422,7 +1427,7 @@ class ArmGesturePlugin:
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "salute": {"params": ["side", "speed"], "description": "抬起小臂、将手靠近额侧、停留后回正"},
+                    "salute": {"params": ["salute_side", "speed"], "description": "抬起小臂、将手靠近额侧、停留后回正"},
                     "welcome": {"params": ["side", "cycles", "speed"], "description": "在身体侧上方抬起手掌并左右摆动后回正"},
                     "raise": {"params": ["side", "speed"], "description": "将手臂高举到头部上方后回正"},
                     "shake_hands": {"params": ["side", "cycles", "speed"], "description": "向前伸手并轻柔上下摆动，做出握手动作"},
@@ -1461,7 +1466,12 @@ class ArmGesturePlugin:
             }
         if action == "stop":
             return {"state": "stopped", "cancelled": self._sequence.cancel()}
-        side = args.get("side", "right")
+        if action == "salute":
+            # The salute card exposes a dedicated left/right-only selector.
+            # Keep accepting the old `side` argument for direct MCP callers.
+            side = args.get("salute_side", args.get("side", "right"))
+        else:
+            side = args.get("side", "right")
         if side not in ("left", "right", "both"):
             return {"error": "side must be left, right or both"}
         if action == "salute" and side == "both":
