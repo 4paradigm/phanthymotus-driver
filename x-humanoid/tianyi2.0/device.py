@@ -693,7 +693,6 @@ class PowerBoardStatePlugin:
       - temp.status: normal(<55) / warm(55-65) / hot(65-75) / critical(>75)
       - battery.status: critical(<10) / low(<25) / normal(>=25)
       - 电流 0A 合法(无负载),电压 0V 异常标 unknown
-      - units 字段附加单位说明
     """
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
@@ -822,15 +821,7 @@ class PowerBoardStatePlugin:
                 if not self._data:
                     continue
                 payload = json.loads(json.dumps(self._data))  # deep copy
-            payload["units"] = {
-                "temp": "°C (MOS 管温度)",
-                "current": "A (0=无负载, 合法)",
-                "voltage": "V (unknown=未上报/异常)",
-                "battery.power": "% (电量)",
-                "battery.current": "A (负值=放电)",
-            }
             payload["timestamp_ms"] = int(time.time() * 1000)
-            payload["control_level"] = "ANY"
             msg = String()
             msg.data = json.dumps(payload)
             self._pub.publish(msg)
@@ -2265,7 +2256,7 @@ class HandPlugin:
         先清除指定手所有手指关节错误锁，再执行力控校准（手指会自动运动）。
     """
 
-    # 手指ID: 1=小指, 2=无名指, 3=中指, 4=食指, 5=拇指弯曲, 6=拇指旋转
+    # Finger ID: 1=little, 2=ring, 3=middle, 4=index, 5=thumb_bend, 6=thumb_rotation
     _FINGER_NAMES = ["little", "ring", "middle", "index", "thumb_bend", "thumb_rotation"]
 
     # 0 表示张开，100 表示弯曲到握紧。顺序见 _FINGER_NAMES。
@@ -2317,17 +2308,17 @@ class HandPlugin:
                     "side": {"type": "string", "enum": ["left", "right", "both"],
                              "description": "控制哪只手"},
                     "little": {"type": "number",
-                               "description": "小指 (0=张开, 100=握紧)"},
+                               "description": "little finger (0=open, 100=closed)"},
                     "ring": {"type": "number",
-                             "description": "无名指 (0=张开, 100=握紧)"},
+                             "description": "ring finger (0=open, 100=closed)"},
                     "middle": {"type": "number",
-                               "description": "中指 (0=张开, 100=握紧)"},
+                               "description": "middle finger (0=open, 100=closed)"},
                     "index": {"type": "number",
-                              "description": "食指 (0=张开, 100=握紧)"},
+                              "description": "index finger (0=open, 100=closed)"},
                     "thumb_bend": {"type": "number",
-                                   "description": "拇指弯曲 (0=张开, 100=握紧)"},
+                                   "description": "thumb bend (0=open, 100=closed)"},
                     "thumb_rotation": {"type": "number",
-                                       "description": "拇指旋转"},
+                                       "description": "thumb rotation"},
                 },
                 "required": ["action"],
                 "x-action-params": {
@@ -2710,7 +2701,7 @@ class VoicePlayActuatorPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action in ("start", "info"):
-            return {"state": "ready", "control_level": "HIGHLEVEL"}
+            return {"state": "ready"}
         if action not in self._types:
             return {"ok": False, "code": "INVALID_ARGUMENT",
                     "message": f"unknown action: {action}",
@@ -2779,7 +2770,6 @@ class VoicePlayActuatorPlugin:
                 "code": code,
                 "message": str(getattr(result, "message", "")),
                 "action": action,
-                "control_level": "HIGHLEVEL",
                 "timestamp_ms": int(time.time() * 1000),
             }
         except Exception as e:
@@ -3006,7 +2996,7 @@ class VoiceChatActuatorPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action in ("start", "info"):
-            return {"state": "ready", "control_level": "HIGHLEVEL"}
+            return {"state": "ready"}
         if action in ("enable", "disable"):
             if not self._publisher:
                 return {"ok": False, "code": "PRECONDITION_FAILED",
@@ -3020,7 +3010,6 @@ class VoiceChatActuatorPlugin:
                 "message": "",
                 "action": action,
                 "value": msg.data,
-                "control_level": "HIGHLEVEL",
                 "timestamp_ms": int(time.time() * 1000),
             }
         if action == "stop":
@@ -3196,21 +3185,13 @@ class MotorStatePlugin:
         arm_left, arm_right = _split_arm(data.get("arm") or [])
         return {
             "parts": {
-                "head":      self._part(data.get("head"),   "头部(3DOF)"),
-                "arm_left":  self._part(arm_left,          "左臂(7DOF)"),
-                "arm_right": self._part(arm_right,         "右臂(7DOF)"),
-                "waist":     self._part(data.get("waist"), "腰部(2DOF)"),
-                "leg":       self._part(data.get("leg"),   "腿部(2DOF)"),
-            },
-            "units": {
-                "q": "关节角度(rad)",
-                "dq": "关节速度(rad/s), 未上报则不出现",
-                "current": "电流(A), unknown=未上报",
-                "temp": "温度(°C), unknown=未上报",
-                "error": "故障码, 0=正常, 仅故障时出现",
+                "head":      self._part(data.get("head"),   "head (3DOF)"),
+                "arm_left":  self._part(arm_left,          "left arm (7DOF)"),
+                "arm_right": self._part(arm_right,         "right arm (7DOF)"),
+                "waist":     self._part(data.get("waist"), "waist (2DOF)"),
+                "leg":       self._part(data.get("leg"),   "leg (2DOF)"),
             },
             "timestamp_ms": int(time.time() * 1000),
-            "control_level": "ANY",
         }
 
     def _publish_loop(self):
@@ -3247,8 +3228,8 @@ _HAND_FINGER_NAMES = {
     4: "index", 5: "thumb_flex", 6: "thumb_rotate",
 }
 _HAND_FINGER_LABELS = {
-    1: "小指", 2: "无名指", 3: "中指",
-    4: "食指", 5: "拇指弯曲", 6: "拇指旋转",
+    1: "pinky", 2: "ring", 3: "middle",
+    4: "index", 5: "thumb flexion", 6: "thumb rotation",
 }
 
 
@@ -3295,10 +3276,10 @@ class HandStatePlugin:
             "multiInstance": False,
             "readOnly": True,
             "description": (
-                "天轶2.0 Pro Inspire 灵巧手状态(左右手各6指, 10Hz)。"
-                "手指顺序: 1=小指 2=无名指 3=中指 4=食指 5=拇指弯曲 6=拇指旋转。"
-                "position: 0=张开 1=握紧(归一化), effort: 电流(A), velocity: 归一化速度。"
-                "每指含 position_label 状态标签(fully_open/almost_open/half_closed/almost_closed/fully_closed)。"
+                "Tianyi 2.0 Pro Inspire dexterous hand state (6 fingers per hand, 10Hz)."
+                "Finger order: 1=pinky 2=ring 3=middle 4=index 5=thumb_flex 6=thumb_rotate."
+                "position: 0=open 1=closed (normalized), effort: current (A), velocity: normalized speed."
+                "Each finger has a position_label tag (fully_open/almost_open/half_closed/almost_closed/fully_closed)."
             ),
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._topic, "format": "data/json"}],
@@ -3342,7 +3323,7 @@ class HandStatePlugin:
                 item = {
                     "id": fid,
                     "name": _HAND_FINGER_NAMES.get(fid, f"finger_{fid}"),
-                    "label": _HAND_FINGER_LABELS.get(fid, f"指{fid}"),
+                    "label": _HAND_FINGER_LABELS.get(fid, f"finger_{fid}"),
                     "position": round(float(positions[i]), 4) if i < len(positions) else 0.0,
                     "velocity": round(float(velocities[i]), 4) if i < len(velocities) else 0.0,
                     "effort": round(float(efforts[i]), 4) if i < len(efforts) else 0.0,
@@ -3370,13 +3351,7 @@ class HandStatePlugin:
                 "left":  self._hand_block(data.get("left")),
                 "right": self._hand_block(data.get("right")),
             },
-            "units": {
-                "position": "0=张开, 1=握紧(归一化)",
-                "velocity": "归一化速度, 0=静止",
-                "effort": "电流(A)",
-            },
             "timestamp_ms": int(time.time() * 1000),
-            "control_level": "ANY",
         }
 
     def _publish_loop(self):
@@ -3550,14 +3525,9 @@ class RemoteStatePlugin:
             },
             "buttons": btns,
             "timestamp_ms": int(time.time() * 1000),
-            "control_level": "ANY",
         }
         if evt is not None:
             out["event"] = evt
-        out["units"] = {
-            "joystick": "归一化 -1.0 ~ +1.0 (position: center/left/right/forward/back)",
-            "buttons": "A-H 8 按键状态值: -1=回弹/下拨, 0=中位, 1=按下/上拨",
-        }
         return out
 
     def _publish_loop(self):
