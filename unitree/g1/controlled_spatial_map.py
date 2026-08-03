@@ -117,11 +117,15 @@ class ControlledSpatialMapNode:
     np = None
 
     VOXEL_SIZE = 0.06
-    MAP_PUBLISH_INTERVAL = 0.35
+    # Full-map packets are intentionally capped: the stock mapping renderer
+    # redraws the whole cloud for each packet, so a compact 5 Hz stream feels
+    # more immediate than a larger stream that accumulates in transit.
+    MAP_PUBLISH_INTERVAL = 0.20
+    META_PUBLISH_INTERVAL = 1.0
     CLOUD_SAVE_INTERVAL = 5.0
-    MAX_SEND_POINTS = 40000
+    MAX_SEND_POINTS = 30000
     DYNAMIC_MIN_HITS = 2
-    VIEW_GUARD_EXTENT = 55.0
+    VIEW_GUARD_EXTENT = 300.0
 
     def __init__(self, topic: str, db, cloud_dir: str):
         import numpy as np
@@ -149,11 +153,16 @@ class ControlledSpatialMapNode:
         self._pending_voxel_hits: dict[tuple, int] = {}
         self._map_buffer_lock = threading.Lock()
         self._map_buffer_dirty = False
-        self._cloud_queue = queue.Queue(maxsize=8)
+        # Mapping frames arrive faster than we can voxelize them. Retaining a
+        # backlog makes the displayed map lag behind the robot, while the most
+        # recent frames contain all data needed for the visual accumulation.
+        self._cloud_queue = queue.Queue(maxsize=2)
         self._running = True
         self._last_map_publish_time = 0.0
+        self._last_meta_publish_time = 0.0
         self._last_cloud_save_time = 0.0
         self._last_fallback_log_time = 0.0
+        self._cached_maps: list[dict] = []
         self._cloud_source = "unknown"  # "mapping" or "relocation" — tracks which DDS topic fed the buffer
         self._MAX_BUFFER_SIZE = 200000  # cap voxel buffer to prevent unbounded growth
         self._MAX_PENDING_VOXELS = 300000
@@ -179,9 +188,9 @@ class ControlledSpatialMapNode:
         except Exception as e:
             print(f"[ControlledSpatialMap] failed to subscribe point clouds: {e}")
 
-        # Periodic publish: ensures frontend always gets fresh map metadata,
-        # tags, and pose even when no DDS events are arriving.
-        self._publish_timer = self._node.create_timer(1.0, self._periodic_publish)
+        # Fallback heartbeat. Normal pose/cloud callbacks publish at the
+        # higher rate above, while this also keeps an idle view connected.
+        self._publish_timer = self._node.create_timer(0.5, self._periodic_publish)
 
     @property
     def node(self):
@@ -590,10 +599,19 @@ class ControlledSpatialMapNode:
         if now - self._last_map_publish_time < self.MAP_PUBLISH_INTERVAL:
             return
         self._last_map_publish_time = now
-        self.publish_now()
+        with self._map_buffer_lock:
+            has_cloud_points = bool(self._map_buffer)
+        # publish_now normally skips an empty cloud. Force the fallback
+        # skeleton through so its robot pose stays live as well.
+        self.publish_now(force=not has_cloud_points, force_meta=False)
 
-    def publish_now(self, force: bool = False):
+    def publish_now(self, force: bool = False, force_meta: bool | None = None):
         np = ControlledSpatialMapNode.np
+        now = time.monotonic()
+        include_meta = (
+            (force if force_meta is None else force_meta) or
+            now - self._last_meta_publish_time >= self.META_PUBLISH_INTERVAL
+        )
         with self._lock:
             pose = dict(self._current_pose) if self._current_pose else None
             active_map = self._active_map
@@ -607,11 +625,16 @@ class ControlledSpatialMapNode:
         if not all_points and not force:
             return
 
-        try:
-            maps = self._db.list_maps_with_pois()
-        except Exception as e:
-            print(f"[ControlledSpatialMap] failed to read map metadata: {e}", flush=True)
-            maps = []
+        if include_meta:
+            try:
+                maps = self._db.list_maps_with_pois()
+                self._cached_maps = maps
+                self._last_meta_publish_time = now
+            except Exception as e:
+                print(f"[ControlledSpatialMap] failed to read map metadata: {e}", flush=True)
+                maps = self._cached_maps
+        else:
+            maps = self._cached_maps
         active_tags = []
         if active_map:
             active_tags = next((m.get("tags", []) for m in maps if m.get("name") == active_map), [])
@@ -642,9 +665,13 @@ class ControlledSpatialMapNode:
         map_point_count = len(map_pts)
         overlay_point_count = len(overlay_pts)
         max_map_points = max(0, self.MAX_SEND_POINTS - overlay_point_count - len(guard_pts))
-        if len(map_pts) > max_map_points:
-            indices = np.random.choice(len(map_pts), max_map_points, replace=False)
-            map_pts = map_pts[indices]
+        if max_map_points == 0:
+            map_pts = np.zeros((0, 3), dtype=np.float32)
+        elif len(map_pts) > max_map_points:
+            # Stable stride sampling avoids allocating a random index array on
+            # every refresh, and prevents the cloud from visually shimmering.
+            step = max(1, math.ceil(len(map_pts) / max_map_points))
+            map_pts = map_pts[::step][:max_map_points]
         publish_parts = [map_pts]
         if overlay_point_count:
             publish_parts.append(overlay_pts)
@@ -656,30 +683,32 @@ class ControlledSpatialMapNode:
         robot_y = float(pose["y"]) if pose else 0.0
         robot_yaw = float(pose["yaw"]) if pose else 0.0
 
-        meta = {
-            "version": 3,
-            "active_map": active_map,
-            "map_status": map_status,
-            "native_pcd_path": native_pcd_path,
-            "local_pcd_available": local_pcd_available,
-            "point_source": point_source,
-            "robot": {"x": robot_x, "y": robot_y, "yaw": robot_yaw, "pose_available": pose is not None},
-            "maps": maps,
-            "tags": active_tags,
-            "map_points": map_point_count,
-            "tag_overlay_points": overlay_point_count,
-            "view_guard_points": len(guard_pts),
-        }
-        meta_bytes = json.dumps(meta, ensure_ascii=False).encode("utf-8")
+        meta_bytes = b""
+        if include_meta:
+            meta = {
+                "version": 3,
+                "active_map": active_map,
+                "map_status": map_status,
+                "native_pcd_path": native_pcd_path,
+                "local_pcd_available": local_pcd_available,
+                "point_source": point_source,
+                "robot": {"x": robot_x, "y": robot_y, "yaw": robot_yaw, "pose_available": pose is not None},
+                "maps": maps,
+                "tags": active_tags,
+                "map_points": map_point_count,
+                "tag_overlay_points": overlay_point_count,
+                "view_guard_points": len(guard_pts),
+            }
+            meta_bytes = json.dumps(meta, ensure_ascii=False).encode("utf-8")
 
-        # v3: v2 mapping packet plus trailing metadata JSON.
-        flags = 0x07  # bit0=full_map, bit1=has_z, bit2=has_meta
+        # v3: v2 mapping packet plus optional trailing metadata JSON.
+        flags = 0x03 | (0x04 if include_meta else 0)
         payload = (
             struct.pack('<fffBI', robot_x, robot_y, robot_yaw, flags, num_points) +
-            pts.tobytes() +
-            struct.pack('<I', len(meta_bytes)) +
-            meta_bytes
+            pts.tobytes()
         )
+        if include_meta:
+            payload += struct.pack('<I', len(meta_bytes)) + meta_bytes
 
         from std_msgs.msg import UInt8MultiArray
         ros_msg = UInt8MultiArray()
@@ -767,8 +796,10 @@ class ControlledSpatialMapNode:
     def _build_view_guard_points(self) -> list[tuple]:
         extent = self.VIEW_GUARD_EXTENT
         z = -0.02
-        # Keeps the unchanged Three.js mapping renderer's cached frustum bounds
-        # large enough so the cloud is not culled while users rotate/zoom/pan.
+        # The stock renderer caches the first geometry bounding sphere and
+        # does not recalculate it after position updates. These remote points
+        # make that sphere cover the practical pan/zoom area, so the real map
+        # is not incorrectly frustum-culled while browsing it.
         return [
             (-extent, -extent, z),
             (-extent, extent, z),
@@ -782,7 +813,7 @@ class ControlledSpatialMapNode:
 
     def _periodic_publish(self):
         """Timer callback: always publish so frontend stays in sync even without DDS events."""
-        self.publish_now(force=True)
+        self._maybe_publish_full_map()
 
     def _on_relocation_cloud(self, msg) -> None:
         """Queue relocation clouds; they are accumulated like mapping clouds for visualization."""
