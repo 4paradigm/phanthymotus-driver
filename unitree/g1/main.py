@@ -57,7 +57,7 @@ def _resolve_namespace(cfg: dict) -> str:
 class G1DeviceBundle:
     def __init__(self, cfg: dict, namespace: str, executor,
                  audio_client: AudioClient,
-                 loco_client: LocoClient,
+                 loco_client: RpcProxy,
                  arm_client: G1ArmActionClient,
                  slam_client: SlamClient,
                  msc_client: MotionSwitcherClient,
