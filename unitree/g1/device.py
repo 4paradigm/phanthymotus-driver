@@ -322,6 +322,8 @@ class _SpeakerNode(Node):
         self._drain_thread: threading.Thread | None = None
         self._last_chunk_time = 0.0
         self._flush_timer = None
+        # Clear stale PlayStream session from previous container run (MCU keeps state across reboot)
+        self._client.PlayStop(APP_NAME)
         self.get_logger().info("SpeakerNode ready")
 
     def start_play(self, topic: str) -> str:
@@ -505,10 +507,10 @@ class SpeakerPlugin:
             topic = args.get("input_topic", "")
             if not topic:
                 return {"error": "Missing input_topic"}
-            # Always stop first to ensure clean restart and startup sound plays
+            # Always stop first to ensure clean restart
             self._node.stop_play()
-            # Play startup sound in background
-            threading.Thread(target=self._play_startup_sound, daemon=True).start()
+            # Play startup sound synchronously before starting subscription
+            self._play_startup_sound()
             topic = self._node.start_play(topic)
             return {"state": "playing", "topic": topic}
         elif action == "stop":
