@@ -133,6 +133,12 @@ class TianyiDeviceBundle:
             self._plugins.append(ArmPlugin(plugins_cfg["arm"], namespace, ros2))
             print("[bundle] ArmPlugin loaded")
 
+        if plugins_cfg.get("arm_gesture", {}).get("enabled", False):
+            from device import ArmGesturePlugin
+            self._plugins.append(ArmGesturePlugin(
+                plugins_cfg["arm_gesture"], namespace, ros2))
+            print("[bundle] ArmGesturePlugin loaded")
+
         if plugins_cfg.get("waist", {}).get("enabled", False):
             from device import WaistPlugin
             self._plugins.append(WaistPlugin(plugins_cfg["waist"], namespace, ros2))

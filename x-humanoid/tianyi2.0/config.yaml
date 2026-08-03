@@ -20,6 +20,8 @@ plugins:
     enabled: true
   arm:
     enabled: true
+  arm_gesture:
+    enabled: true
   waist:
     enabled: true
   hand:

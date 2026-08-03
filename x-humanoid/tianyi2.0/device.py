@@ -21,6 +21,7 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   HeadPlugin       (actuator)           — 头部3DOF控制
   HeadGesturePlugin (actuator)          — 点头/摇头/左右观察等语义动作
   ArmPlugin        (actuator)           — 双臂14DOF控制
+  ArmGesturePlugin (actuator)           — 挥手/敬礼/欢迎等语义动作
   WaistPlugin      (actuator)           — 腰部2DOF控制
   HandPlugin       (actuator)           — 灵巧手控制
   TtsPlugin        (actuator)           — 语音合成
@@ -1326,6 +1327,537 @@ class ArmPlugin:
         except Exception as e:
             return {"error": str(e)}
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ArmGesturePlugin (actuator)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ArmGesturePlugin:
+    """可取消、带状态反馈和 URDF 限位检查的手臂语义动作序列。"""
+
+    _STATUS_MAX_AGE = 2.0
+    _FEEDBACK_TIMEOUT = 2.0
+    _MOVE_THRESHOLD_RAD = _deg2rad(0.5)
+    _TARGET_TOLERANCE_RAD = _deg2rad(3.0)
+    _NEUTRAL = [0, 0, 0, 0, 0, 0, 0]
+    _JOINT_NAMES = [
+        "shoulder_pitch", "shoulder_roll", "shoulder_yaw",
+        "elbow_pitch", "wrist_yaw", "wrist_pitch", "wrist_roll",
+    ]
+    # Limits in degrees, copied from resource/tianyi2_model.urdf. Keeping the
+    # limits here makes a bad semantic pose fail before a motor command is sent.
+    _LEFT_POSE_LIMITS = [
+        (-170, 170), (-15, 150), (-170, 170), (-150, 15),
+        (-170, 170), (-45, 60), (-95, 75),
+    ]
+    _RIGHT_POSE_LIMITS = [
+        (-170, 170), (-150, 15), (-170, 170), (-150, 15),
+        (-170, 170), (-45, 60), (-75, 95),
+    ]
+    # 角度顺序：肩 pitch、肩 roll、肩 yaw、肘 pitch、腕 yaw、腕 pitch、腕 roll。
+    # 肘 pitch 使用负角度屈肘；右臂由 _publish_pose 按横向关节自动镜像。
+    _GESTURES = {
+        # In the URDF chain shoulder yaw rotates the elbow-pitch plane. The
+        # shoulder and elbow angles place the wrist; wrist yaw/roll are used
+        # only where the final palm orientation needs calibration.
+        "salute": [-10, 90, 60, -110, 50, 0, 0],
+        "welcome": [-10, 65, 75, -100, 0, 0, 0],
+        "raise": [0, 130, 0, -15, 0, 0, 0],
+        "shake_hands": [-55, 15, 5, -35, 0, 0, 0],
+        "high_five": [-40, 40, -20, -80, 0, 0, 50],
+    }
+    _PREPARE_POSES = {
+        # Flex the elbow while establishing the lifting plane instead of first
+        # rotating a fully extended arm near the head.
+        "salute": [-10, 40, 35, -45, 25, 0, 0],
+        "welcome": [-10, 45, 45, -60, 0, 0, 0],
+        "raise": [0, 75, 0, -30, 0, 0, 0],
+        "shake_hands": [-30, 10, 0, -20, 0, 0, 0],
+        "high_five": [-25, 25, -10, -45, 0, 0, 10],
+    }
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._pub_node = Node("tianyi2_arm_gesture_pub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._pub_node)
+        self._publisher = None
+        self._sequence = _ActionSequence("ArmGesturePlugin")
+        self._feedback_condition = threading.Condition()
+        self._arm_status = {}
+        self._arm_status_seq = 0
+        self._arm_status_time = None
+        self._power_status = {}
+        self._power_status_time = None
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "arm_gesture",
+            "type": "actuator",
+            "description": "天轶2.0 手臂语义动作 — 敬礼、欢迎、举手、握手、击掌和回正",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "salute", "welcome", "raise", "shake_hands",
+                            "high_five", "reset", "stop",
+                        ],
+                        "default": "welcome",
+                        "description": "手臂动作，可选[salute, welcome, raise, shake_hands, high_five, reset, stop]",
+                    },
+                    "side": {
+                        "type": "string", "enum": ["left", "right", "both"],
+                        "default": "right",
+                        "description": "执行手臂，可选[left, right, both]，默认right",
+                    },
+                    "salute_side": {
+                        "type": "string", "enum": ["left", "right"],
+                        "default": "right",
+                        "description": "敬礼手臂，可选[left, right]，默认right",
+                    },
+                    "cycles": {
+                        "type": "integer", "minimum": 1, "maximum": 5,
+                        "default": 2,
+                        "description": "欢迎/握手摆动循环次数，范围[1, 5]，默认2",
+                    },
+                    "speed": {
+                        "type": "number", "minimum": 0.2, "maximum": 1.5,
+                        "default": 0.5,
+                        "description": "关节速度(rad/s)，范围[0.2, 1.5]，默认0.5",
+                    },
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "salute": {"params": ["salute_side", "speed"], "description": "抬起小臂、将手靠近额侧、停留后回正"},
+                    "welcome": {"params": ["side", "cycles", "speed"], "description": "在身体侧上方抬起手掌并左右摆动后回正"},
+                    "raise": {"params": ["side", "speed"], "description": "将手臂高举到头部上方后回正"},
+                    "shake_hands": {"params": ["side", "cycles", "speed"], "description": "向前伸手并轻柔上下摆动，做出握手动作"},
+                    "high_five": {"params": ["side", "speed"], "description": "将手掌伸到身体前方并保持在肩部附近，做出击掌等待姿势"},
+                    "reset": {"params": ["side", "speed"], "description": "取消序列并回到中性姿态"},
+                    "stop": {"params": [], "description": "取消尚未发送的后续动作帧"},
+                },
+            },
+        }
+
+    def start(self):
+        try:
+            from bodyctrl_msgs.msg import (
+                CmdSetMotorPosition, MotorStatusMsg, PowerBoardKeyStatus)
+            self._publisher = self._pub_node.create_publisher(
+                CmdSetMotorPosition, "/arm/cmd_pos", _RELIABLE_QOS)
+            self._pub_node.create_subscription(
+                MotorStatusMsg, "/arm/status",
+                self._on_arm_status, _RELIABLE_QOS)
+            self._pub_node.create_subscription(
+                PowerBoardKeyStatus, "/power/board/key_status",
+                self._on_power_status, _RELIABLE_QOS)
+            print("[ArmGesturePlugin] publisher and feedback subscriptions created")
+        except ImportError as e:
+            print(f"[ArmGesturePlugin] WARNING: msg import failed ({e})")
+
+    def stop(self):
+        self._sequence.cancel()
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "info"):
+            return {
+                "state": "ready" if self._publisher else "idle",
+                "feedback_supported": True,
+                "feedback_topic": "/arm/status",
+            }
+        if action == "stop":
+            return {"state": "stopped", "cancelled": self._sequence.cancel()}
+        if action == "salute":
+            # The salute card exposes a dedicated left/right-only selector.
+            # Keep accepting the old `side` argument for direct MCP callers.
+            side = args.get("salute_side", args.get("side", "right"))
+        else:
+            side = args.get("side", "right")
+        if side not in ("left", "right", "both"):
+            return {"error": "side must be left, right or both"}
+        if action == "salute" and side == "both":
+            return {
+                "state": "error",
+                "error": "salute only supports one arm at a time to avoid head/arm interference",
+                "code": "unsafe_bilateral_salute",
+            }
+        speed = _clamp(args.get("speed", 0.5), 0.2, 1.5)
+        if action == "reset":
+            self._sequence.cancel()
+            check = self._preflight(side)
+            if check is not None:
+                return check
+            baseline_seq, baseline = self._feedback_snapshot(side)
+            result = self._publish_pose(side, self._NEUTRAL, speed)
+            if "error" in result:
+                return result
+            return self._wait_for_arm_feedback(
+                side, self._NEUTRAL, baseline_seq, baseline)
+        if action not in self._GESTURES:
+            return {"error": f"unknown action: {action}"}
+        if not self._publisher:
+            return {"error": "publisher not initialized"}
+        check = self._preflight(side)
+        if check is not None:
+            return check
+
+        pose = self._GESTURES[action]
+        cycles = int(_clamp(args.get("cycles", 2), 1, 5))
+        # Frame entries are (pose, hold_seconds, transition_ratio). A ratio
+        # below 1 starts the next frame before the current target fully settles,
+        # allowing the controller to blend adjacent salute stages.
+        if action == "salute":
+            frames = [
+                (self._PREPARE_POSES[action], 0.0, 0.90),
+                (pose, 1.1, 1.0),
+            ]
+        else:
+            frames = [
+                (self._PREPARE_POSES[action], 0.25, 0.90),
+                (pose, 0.8, 0.90),
+            ]
+        if action == "shake_hands":
+            for i in range(cycles * 2):
+                handshake_pose = list(pose)
+                # A small elbow sweep produces the handshake motion while the
+                # wrist stays neutral and the arm remains extended forward.
+                if i % 2 == 0:
+                    handshake_pose[3] = -28
+                else:
+                    handshake_pose[3] = -42
+                frames.append((handshake_pose, 0.30, 0.85))
+        elif action == "welcome":
+            # Keep shoulder yaw and the wrist fixed. In this URDF pose, changing
+            # shoulder yaw moves the hand mostly forward/backward. A small elbow
+            # pitch sweep instead produces about 10 cm of lateral hand travel
+            # with little forward/backward or vertical displacement.
+            for i in range(cycles * 2):
+                welcome_pose = list(pose)
+                if i % 2 == 0:
+                    welcome_pose[3] = -110
+                else:
+                    welcome_pose[3] = -90
+                frames.append((welcome_pose, 0.35, 0.85))
+        frames.append((self._NEUTRAL, 1.0, 1.0))
+        for frame, _, _ in frames:
+            violations = self._pose_violations(side, frame)
+            if violations:
+                return self._error_result(
+                    "arm_pose_out_of_range",
+                    "Semantic arm pose exceeds URDF joint limits",
+                    gesture=action,
+                    violations=violations,
+                )
+
+        def _worker(cancel_event: threading.Event):
+            previous = self._NEUTRAL
+            for frame, hold, transition_ratio in frames:
+                if cancel_event.is_set():
+                    return
+                result = self._publish_pose(side, frame, speed)
+                max_delta_rad = max(
+                    abs(_deg2rad(float(current) - float(old)))
+                    for current, old in zip(frame, previous)
+                )
+                transition = max_delta_rad / speed if speed > 0 else 0
+                previous = frame
+                delay = max(0.12, transition * transition_ratio) + hold
+                if "error" in result or cancel_event.wait(delay):
+                    return
+
+        baseline_seq, baseline = self._feedback_snapshot(side)
+        self._sequence.start(_worker)
+        feedback = self._wait_for_arm_feedback(
+            side, frames[0][0], baseline_seq, baseline)
+        if feedback.get("state") == "error":
+            self._sequence.cancel()
+            return feedback
+        return {
+            "state": "running", "gesture": action, "side": side,
+            "cycles": cycles, "speed": speed,
+            "feedback_verified": True,
+            "feedback": feedback,
+        }
+
+    def _on_arm_status(self, msg):
+        now = time.monotonic()
+        with self._feedback_condition:
+            self._arm_status = {
+                int(motor.name): {
+                    "pos": float(motor.pos),
+                    "speed": float(motor.speed),
+                    "current": float(motor.current),
+                    "temperature": float(motor.temperature),
+                    "error": int(motor.error),
+                }
+                for motor in msg.status
+            }
+            self._arm_status_seq += 1
+            self._arm_status_time = now
+            self._feedback_condition.notify_all()
+
+    def _on_power_status(self, msg):
+        now = time.monotonic()
+        with self._feedback_condition:
+            self._power_status = {
+                "is_estop": bool(msg.is_estop.data),
+                "is_remote_estop": bool(msg.is_remote_estop.data),
+                "is_power_on": bool(msg.is_power_on.data),
+            }
+            self._power_status_time = now
+            self._feedback_condition.notify_all()
+
+    @staticmethod
+    def _motor_ids(side: str) -> list[int]:
+        motor_ids = []
+        if side in ("left", "both"):
+            motor_ids.extend(range(11, 18))
+        if side in ("right", "both"):
+            motor_ids.extend(range(21, 28))
+        return motor_ids
+
+    @staticmethod
+    def _mirror_pose(left_pose: list[float]) -> list[float]:
+        return [
+            left_pose[0], -left_pose[1], -left_pose[2],
+            left_pose[3], -left_pose[4], left_pose[5], -left_pose[6],
+        ]
+
+    @classmethod
+    def _pose_violations(
+            cls, side: str, left_pose: list[float]) -> list[dict]:
+        if len(left_pose) != 7:
+            return [{"side": side, "error": "pose_length", "actual": len(left_pose)}]
+        selected = []
+        if side in ("left", "both"):
+            selected.append(("left", left_pose, cls._LEFT_POSE_LIMITS))
+        if side in ("right", "both"):
+            selected.append((
+                "right", cls._mirror_pose(left_pose), cls._RIGHT_POSE_LIMITS))
+        violations = []
+        for arm_side, pose, limits in selected:
+            for index, (value, bounds) in enumerate(zip(pose, limits)):
+                lower, upper = bounds
+                if float(value) < lower or float(value) > upper:
+                    violations.append({
+                        "side": arm_side,
+                        "joint": cls._JOINT_NAMES[index],
+                        "value_deg": float(value),
+                        "minimum_deg": lower,
+                        "maximum_deg": upper,
+                    })
+        return violations
+
+    @classmethod
+    def _target_positions(
+            cls, side: str, left_pose: list[float]) -> dict[int, float]:
+        right_pose = cls._mirror_pose(left_pose)
+        targets = {}
+        if side in ("left", "both"):
+            targets.update({
+                11 + index: _deg2rad(float(deg))
+                for index, deg in enumerate(left_pose)
+            })
+        if side in ("right", "both"):
+            targets.update({
+                21 + index: _deg2rad(float(deg))
+                for index, deg in enumerate(right_pose)
+            })
+        return targets
+
+    def _error_result(self, code: str, message: str, **details) -> dict:
+        result = {
+            "state": "error",
+            "error": message,
+            "code": code,
+        }
+        result.update(details)
+        return result
+
+    def _active_motor_faults(self, motor_ids: list[int]) -> list[dict]:
+        faults = []
+        for motor_id in motor_ids:
+            status = self._arm_status.get(motor_id)
+            if status is None or status["error"] == 0:
+                continue
+            error_code = status["error"]
+            faults.append({
+                "motor_id": motor_id,
+                "joint": _ALL_JOINTS.get(motor_id, f"motor_{motor_id}"),
+                "error_code": error_code,
+                "description": _MOTOR_ERROR_DESCRIPTIONS.get(
+                    error_code, "unknown_vendor_error"),
+            })
+        return faults
+
+    def _preflight(self, side: str) -> dict | None:
+        if not self._publisher:
+            return self._error_result(
+                "publisher_not_initialized", "arm command publisher is not initialized")
+        now = time.monotonic()
+        motor_ids = self._motor_ids(side)
+        with self._feedback_condition:
+            if self._arm_status_time is None:
+                return self._error_result(
+                    "arm_status_unavailable",
+                    "No /arm/status received; arm controller may not be running",
+                    diagnosis=[
+                        "check robot body-control program",
+                        "complete robot self-check and confirm Ready state",
+                        "check ROS_DOMAIN_ID and /arm/status",
+                    ],
+                )
+            status_age = now - self._arm_status_time
+            if status_age > self._STATUS_MAX_AGE:
+                return self._error_result(
+                    "arm_status_stale",
+                    f"/arm/status is stale ({status_age:.2f}s)",
+                    diagnosis=[
+                        "check robot body-control program",
+                        "check ROS communication",
+                    ],
+                )
+            missing = [
+                motor_id for motor_id in motor_ids
+                if motor_id not in self._arm_status
+            ]
+            if missing:
+                return self._error_result(
+                    "arm_motors_missing",
+                    "Selected arm motors are missing from /arm/status",
+                    missing_motor_ids=missing,
+                )
+            faults = self._active_motor_faults(motor_ids)
+            if faults:
+                return self._error_result(
+                    "arm_motor_fault", "Selected arm has active motor faults",
+                    faults=faults,
+                )
+            if (self._power_status_time is not None
+                    and now - self._power_status_time <= self._STATUS_MAX_AGE):
+                if (self._power_status.get("is_estop")
+                        or self._power_status.get("is_remote_estop")):
+                    return self._error_result(
+                        "emergency_stop_active",
+                        "Physical or remote emergency stop is active",
+                        power_status=dict(self._power_status),
+                    )
+                if not self._power_status.get("is_power_on", True):
+                    return self._error_result(
+                        "robot_power_off", "Robot power board reports power off",
+                        power_status=dict(self._power_status),
+                    )
+        return None
+
+    def _feedback_snapshot(self, side: str) -> tuple[int, dict[int, float]]:
+        with self._feedback_condition:
+            return self._arm_status_seq, {
+                motor_id: self._arm_status[motor_id]["pos"]
+                for motor_id in self._motor_ids(side)
+                if motor_id in self._arm_status
+            }
+
+    def _wait_for_arm_feedback(
+            self, side: str, target_pose: list[float],
+            baseline_seq: int, baseline: dict[int, float]) -> dict:
+        motor_ids = self._motor_ids(side)
+        targets = self._target_positions(side, target_pose)
+        deadline = time.monotonic() + self._FEEDBACK_TIMEOUT
+        received_new_status = False
+        with self._feedback_condition:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                if self._arm_status_seq <= baseline_seq:
+                    self._feedback_condition.wait(remaining)
+                    continue
+                received_new_status = True
+                faults = self._active_motor_faults(motor_ids)
+                if faults:
+                    return self._error_result(
+                        "arm_motor_fault_after_command",
+                        "Arm motor fault appeared after command",
+                        faults=faults,
+                    )
+                positions = {
+                    motor_id: self._arm_status[motor_id]["pos"]
+                    for motor_id in motor_ids
+                }
+                moved = max(
+                    abs(positions[motor_id] - baseline[motor_id])
+                    for motor_id in motor_ids
+                )
+                target_error = max(
+                    abs(positions[motor_id] - targets[motor_id])
+                    for motor_id in motor_ids
+                )
+                if (moved >= self._MOVE_THRESHOLD_RAD
+                        or target_error <= self._TARGET_TOLERANCE_RAD):
+                    return {
+                        "state": "moving",
+                        "status_topic": "/arm/status",
+                        "max_movement_deg": round(_rad2deg(moved), 2),
+                        "max_target_error_deg": round(
+                            _rad2deg(target_error), 2),
+                    }
+                self._feedback_condition.wait(0.05)
+        if not received_new_status:
+            return self._error_result(
+                "arm_feedback_timeout",
+                "Command was published but no new /arm/status was received",
+                diagnosis=[
+                    "check arm controller and ROS communication",
+                    "confirm robot self-check completed and robot is Ready",
+                ],
+            )
+        return self._error_result(
+            "arm_no_motion",
+            "Command was published and arm status updated, but no joint moved",
+            diagnosis=[
+                "robot may not be Ready or self-check may be incomplete",
+                "arm controller may be disabled or rejecting commands",
+                "another node may be publishing competing /arm/cmd_pos commands",
+                "the configured 5A maximum current may be insufficient; verify with the robot vendor before increasing it",
+            ],
+        )
+
+    def _publish_pose(self, side: str, left_pose: list[float], speed: float) -> dict:
+        if not self._publisher:
+            return {"error": "publisher not initialized"}
+        if len(left_pose) != 7:
+            return {"error": "internal pose must have 7 values"}
+        violations = self._pose_violations(side, left_pose)
+        if violations:
+            return self._error_result(
+                "arm_pose_out_of_range",
+                "Arm pose exceeds URDF joint limits",
+                violations=violations,
+            )
+        try:
+            from bodyctrl_msgs.msg import CmdSetMotorPosition, SetMotorPosition
+            # Mirror the lateral axes for the right arm. All values remain within
+            # the URDF limits used by the existing arm card.
+            right_pose = self._mirror_pose(left_pose)
+            selected = []
+            if side in ("left", "both"):
+                selected.append((11, left_pose))
+            if side in ("right", "both"):
+                selected.append((21, right_pose))
+            msg = CmdSetMotorPosition()
+            msg.cmds = []
+            for base_id, pose in selected:
+                for index, deg in enumerate(pose):
+                    cmd = SetMotorPosition()
+                    cmd.name = base_id + index
+                    cmd.pos = _deg2rad(float(deg))
+                    cmd.spd = speed
+                    cmd.cur = 5.0
+                    msg.cmds.append(cmd)
+            self._publisher.publish(msg)
+            return {"state": "moving", "side": side, "joints": len(msg.cmds)}
+        except Exception as e:
+            return {"error": str(e)}
 
 
 # ══════════════════════════════════════════════════════════
