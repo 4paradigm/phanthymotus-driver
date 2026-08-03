@@ -20,9 +20,11 @@ input is never mirrored automatically. To create a mirrored right-arm pose manua
 shoulder roll, shoulder yaw, wrist yaw, and wrist roll (indices 1, 2, 4, and 6)
 from the left pose. Right-arm motor IDs are 21-27 and left-arm IDs are 11-17.
 `move_pos` accepts speed [0.2, 1.5] rad/s. `move_ctrl` accepts seven-element
-`kp` [0, 2000] and `kd` [0, 300] arrays shared by both arms. The original raw
-control defaults are `kp=200` and `kd=20` for every joint; these are not
-vendor-certified gains.
+`kp` [10, 200] and `kd` [5, 50] arrays shared by both arms. Raw-control defaults
+are `kp=50` and `kd=20` for every joint. The bounded tuning range includes the
+tested lower-gain and original-default combinations while excluding zero
+position stiffness and the previous unverified extreme upper bounds. These are
+still not vendor-certified gains.
 
 `move_ctrl` sends a position step with target speed and feed-forward torque set
 to zero. The vendor-side controller applies `kp` and `kd`; this driver does not
