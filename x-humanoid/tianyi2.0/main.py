@@ -164,11 +164,6 @@ class TianyiDeviceBundle:
             self._plugins.append(ControlledSpatialPlugin(plugins_cfg["controlled_spatial"], namespace, ros2, slamtec_client))
             print("[bundle] ControlledSpatialPlugin loaded")
 
-        if plugins_cfg.get("diagnostic", {}).get("enabled", False):
-            from device import DiagnosticPlugin
-            self._plugins.append(DiagnosticPlugin(plugins_cfg["diagnostic"], namespace, ros2))
-            print("[bundle] DiagnosticPlugin loaded")
-
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
             try:
