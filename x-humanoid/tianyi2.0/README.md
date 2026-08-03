@@ -4,6 +4,45 @@ Phanthy Motus driver bundle for the Tianyi 2.0 Pro humanoid robot. The driver
 bridges robot-side ROS2 topics on domain 0 to Agent Core topics on domain 42 and
 exposes the capabilities as MCP tools.
 
+## Raw head joint card
+
+`head` directly commands the three head joints in degrees on `/head/cmd_pos`.
+The motor order is roll (ID 1), pitch (ID 2), and yaw (ID 3), while dashboard
+parameters are named `yaw`, `pitch`, and `roll`. `move_pos` accepts yaw
+[-90, 90], pitch [-25, 25], roll [-26, 26], and speed [5, 60] degrees/second.
+`look_at` provides forward, left, right, up, and down presets using the same
+speed range.
+
+Before publishing, the card rejects non-numeric, non-finite, or out-of-range
+inputs and checks fresh `/head/status`, all head motor fault codes, emergency
+stop, and power state. It waits up to two seconds for newer status and reports
+`feedback_verified: true` only after observing motion or confirming that the
+head was already at the target. Controller/status failures are returned as
+stable error codes instead of incorrectly reporting `moving` immediately.
+
+## Raw arm joint card
+
+`arm` directly commands seven joints per selected arm in this canonical order:
+
+```text
+[shoulder_pitch, shoulder_roll, shoulder_yaw,
+ elbow_pitch, wrist_yaw, wrist_pitch, wrist_roll]
+```
+
+The input pose is a left-arm canonical pose in degrees. Selecting `right` or
+`both` mirrors shoulder roll, shoulder yaw, wrist yaw, and wrist roll before
+publishing to right-arm motor IDs 21-27; left-arm IDs are 11-17. This makes a
+single pose produce symmetric bilateral motion and keeps right-arm lateral
+axes consistent with the semantic arm card. `move_pos` accepts speed
+[0.2, 1.5] rad/s. `move_ctrl` accepts seven-element `kp` [0, 2000] and `kd`
+[0, 300] arrays.
+
+Both modes reject malformed arrays and poses outside the checked-in URDF
+limits. They check fresh `/arm/status`, selected motor faults, emergency stop,
+and power state before publishing, then wait for newer feedback. Do not command
+the raw `arm` and `arm_gesture` cards concurrently because both can publish to
+`/arm/cmd_pos`.
+
 ## Head gesture card
 
 `head_gesture` turns safe, bounded head-position commands into cancellable

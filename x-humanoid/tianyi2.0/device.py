@@ -170,6 +170,222 @@ class _ActionSequence:
         return True
 
 
+class _JointCommandFeedback:
+    """Shared status, safety preflight, and motion feedback for raw joint cards."""
+
+    _STATUS_MAX_AGE = 2.0
+    _FEEDBACK_TIMEOUT = 2.0
+    _MOVE_THRESHOLD_RAD = _deg2rad(0.5)
+    _TARGET_TOLERANCE_RAD = _deg2rad(3.0)
+
+    def __init__(self, subsystem: str, status_topic: str):
+        self._subsystem = subsystem
+        self._status_topic = status_topic
+        self._condition = threading.Condition()
+        self._status: dict[int, dict] = {}
+        self._status_seq = 0
+        self._status_time: float | None = None
+        self._power_status: dict = {}
+        self._power_status_time: float | None = None
+
+    def create_subscriptions(self, node: Node) -> None:
+        from bodyctrl_msgs.msg import MotorStatusMsg, PowerBoardKeyStatus
+        node.create_subscription(
+            MotorStatusMsg, self._status_topic,
+            self._on_motor_status, _RELIABLE_QOS)
+        node.create_subscription(
+            PowerBoardKeyStatus, "/power/board/key_status",
+            self._on_power_status, _RELIABLE_QOS)
+
+    def _on_motor_status(self, msg) -> None:
+        now = time.monotonic()
+        with self._condition:
+            self._status = {
+                int(motor.name): {
+                    "pos": float(motor.pos),
+                    "speed": float(motor.speed),
+                    "current": float(motor.current),
+                    "temperature": float(motor.temperature),
+                    "error": int(motor.error),
+                }
+                for motor in msg.status
+            }
+            self._status_seq += 1
+            self._status_time = now
+            self._condition.notify_all()
+
+    def _on_power_status(self, msg) -> None:
+        now = time.monotonic()
+        with self._condition:
+            self._power_status = {
+                "is_estop": bool(msg.is_estop.data),
+                "is_remote_estop": bool(msg.is_remote_estop.data),
+                "is_power_on": bool(msg.is_power_on.data),
+            }
+            self._power_status_time = now
+            self._condition.notify_all()
+
+    @staticmethod
+    def _error(code: str, message: str, **details) -> dict:
+        result = {"state": "error", "error": message, "code": code}
+        result.update(details)
+        return result
+
+    def _faults(self, motor_ids: list[int]) -> list[dict]:
+        faults = []
+        for motor_id in motor_ids:
+            status = self._status.get(motor_id)
+            if status is None or status["error"] == 0:
+                continue
+            error_code = status["error"]
+            faults.append({
+                "motor_id": motor_id,
+                "joint": _ALL_JOINTS.get(motor_id, f"motor_{motor_id}"),
+                "error_code": error_code,
+                "description": _MOTOR_ERROR_DESCRIPTIONS.get(
+                    error_code, "unknown_vendor_error"),
+            })
+        return faults
+
+    def preflight(self, publisher, motor_ids: list[int]) -> dict | None:
+        if not publisher:
+            return self._error(
+                "publisher_not_initialized",
+                f"{self._subsystem} command publisher is not initialized")
+        now = time.monotonic()
+        with self._condition:
+            if self._status_time is None:
+                return self._error(
+                    f"{self._subsystem}_status_unavailable",
+                    f"No {self._status_topic} received; "
+                    f"{self._subsystem} controller may not be running",
+                    diagnosis=[
+                        "check robot body-control program",
+                        "complete robot self-check and confirm Ready state",
+                        f"check ROS_DOMAIN_ID and {self._status_topic}",
+                    ],
+                )
+            status_age = now - self._status_time
+            if status_age > self._STATUS_MAX_AGE:
+                return self._error(
+                    f"{self._subsystem}_status_stale",
+                    f"{self._status_topic} is stale ({status_age:.2f}s)",
+                    diagnosis=[
+                        "check robot body-control program",
+                        "check ROS communication",
+                    ],
+                )
+            missing = [
+                motor_id for motor_id in motor_ids
+                if motor_id not in self._status
+            ]
+            if missing:
+                return self._error(
+                    f"{self._subsystem}_motors_missing",
+                    f"Selected {self._subsystem} motors are missing from "
+                    f"{self._status_topic}",
+                    missing_motor_ids=missing,
+                )
+            faults = self._faults(motor_ids)
+            if faults:
+                return self._error(
+                    f"{self._subsystem}_motor_fault",
+                    f"Selected {self._subsystem} has active motor faults",
+                    faults=faults,
+                )
+            if (self._power_status_time is not None
+                    and now - self._power_status_time <= self._STATUS_MAX_AGE):
+                if (self._power_status.get("is_estop")
+                        or self._power_status.get("is_remote_estop")):
+                    return self._error(
+                        "emergency_stop_active",
+                        "Physical or remote emergency stop is active",
+                        power_status=dict(self._power_status),
+                    )
+                if not self._power_status.get("is_power_on", True):
+                    return self._error(
+                        "robot_power_off",
+                        "Robot power board reports power off",
+                        power_status=dict(self._power_status),
+                    )
+        return None
+
+    def snapshot(self, motor_ids: list[int]) -> tuple[int, dict[int, float]]:
+        with self._condition:
+            return self._status_seq, {
+                motor_id: self._status[motor_id]["pos"]
+                for motor_id in motor_ids
+                if motor_id in self._status
+            }
+
+    def wait_for_motion(
+            self, targets: dict[int, float], baseline_seq: int,
+            baseline: dict[int, float]) -> dict:
+        motor_ids = list(targets)
+        deadline = time.monotonic() + self._FEEDBACK_TIMEOUT
+        received_new_status = False
+        with self._condition:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                if self._status_seq <= baseline_seq:
+                    self._condition.wait(remaining)
+                    continue
+                received_new_status = True
+                faults = self._faults(motor_ids)
+                if faults:
+                    return self._error(
+                        f"{self._subsystem}_motor_fault_after_command",
+                        f"{self._subsystem.capitalize()} motor fault appeared "
+                        "after command",
+                        faults=faults,
+                    )
+                positions = {
+                    motor_id: self._status[motor_id]["pos"]
+                    for motor_id in motor_ids
+                }
+                moved = max(
+                    abs(positions[motor_id] - baseline[motor_id])
+                    for motor_id in motor_ids
+                )
+                target_error = max(
+                    abs(positions[motor_id] - targets[motor_id])
+                    for motor_id in motor_ids
+                )
+                if (moved >= self._MOVE_THRESHOLD_RAD
+                        or target_error <= self._TARGET_TOLERANCE_RAD):
+                    return {
+                        "state": "moving",
+                        "status_topic": self._status_topic,
+                        "max_movement_deg": round(_rad2deg(moved), 2),
+                        "max_target_error_deg": round(
+                            _rad2deg(target_error), 2),
+                    }
+                self._condition.wait(0.05)
+        if not received_new_status:
+            return self._error(
+                f"{self._subsystem}_feedback_timeout",
+                f"Command was published but no new {self._status_topic} "
+                "was received",
+                diagnosis=[
+                    f"check {self._subsystem} controller and ROS communication",
+                    "confirm robot self-check completed and robot is Ready",
+                ],
+            )
+        return self._error(
+            f"{self._subsystem}_no_motion",
+            f"Command was published and {self._subsystem} status updated, "
+            "but no selected joint moved",
+            diagnosis=[
+                "robot may not be Ready or self-check may be incomplete",
+                f"{self._subsystem} controller may be disabled or rejecting commands",
+                f"another node may be publishing competing "
+                f"/{self._subsystem}/cmd_pos commands",
+            ],
+        )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # StatePlugin (sensor, multi-tool)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -692,7 +908,8 @@ class HeadPlugin:
         self._ros2 = ros2
         self._pub_node = Node("tianyi2_head_pub", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._pub_node)
-        self._publisher = None  # Lazy init
+        self._publisher = None
+        self._feedback = _JointCommandFeedback("head", "/head/status")
 
     def get_tool(self) -> dict:
         return {
@@ -703,18 +920,26 @@ class HeadPlugin:
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": ["move_pos", "look_at"],
+                               "default": "move_pos",
                                "description": "控制动作"},
-                    "yaw": {"type": "number", "description": "偏航角(度), 左正右负, 范围[-90, 90]"},
-                    "pitch": {"type": "number", "description": "俯仰角(度), 下正上负, 范围[-25, 25]"},
-                    "roll": {"type": "number", "description": "翻滚角(度), 范围[-26, 26]"},
+                    "yaw": {"type": "number", "minimum": -90, "maximum": 90,
+                            "default": 0, "description": "偏航角(度), 左正右负, 范围[-90, 90]"},
+                    "pitch": {"type": "number", "minimum": -25, "maximum": 25,
+                              "default": 0, "description": "俯仰角(度), 下正上负, 范围[-25, 25]"},
+                    "roll": {"type": "number", "minimum": -26, "maximum": 26,
+                             "default": 0, "description": "翻滚角(度), 范围[-26, 26]"},
+                    "speed": {"type": "number", "minimum": 5, "maximum": 60,
+                              "default": 30,
+                              "description": "头部运动速度(度/秒), 范围[5, 60], 默认30"},
                     "target": {"type": "string", "enum": ["forward", "left", "right", "up", "down"],
+                               "default": "forward",
                                "description": "预设方向"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "move_pos": {"params": ["yaw", "pitch", "roll"],
+                    "move_pos": {"params": ["yaw", "pitch", "roll", "speed"],
                                  "description": "移动头部到指定角度(度)"},
-                    "look_at": {"params": ["target"],
+                    "look_at": {"params": ["target", "speed"],
                                 "description": "看向预设方向"},
                 },
             },
@@ -725,7 +950,8 @@ class HeadPlugin:
             from bodyctrl_msgs.msg import CmdSetMotorPosition
             self._publisher = self._pub_node.create_publisher(
                 CmdSetMotorPosition, "/head/cmd_pos", _RELIABLE_QOS)
-            print("[HeadPlugin] publisher created")
+            self._feedback.create_subscriptions(self._pub_node)
+            print("[HeadPlugin] publisher and feedback subscriptions created")
         except ImportError as e:
             print(f"[HeadPlugin] WARNING: msg import failed ({e})")
 
@@ -734,10 +960,9 @@ class HeadPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "move_pos":
-            yaw = args.get("yaw", 0)
-            pitch = args.get("pitch", 0)
-            roll = args.get("roll", 0)
-            return self._send_head_pos(roll, pitch, yaw)
+            return self._move_to(
+                args.get("yaw", 0), args.get("pitch", 0),
+                args.get("roll", 0), args.get("speed", 30))
         elif action == "look_at":
             target = args.get("target", "forward")
             presets = {
@@ -747,15 +972,68 @@ class HeadPlugin:
                 "up": (0, -20, 0),
                 "down": (0, 20, 0),
             }
-            yaw, pitch, roll = presets.get(target, (0, 0, 0))
-            return self._send_head_pos(roll, pitch, yaw)
+            if target not in presets:
+                return {"state": "error", "error": "unknown head target",
+                        "code": "invalid_head_target", "target": target}
+            yaw, pitch, roll = presets[target]
+            return self._move_to(
+                yaw, pitch, roll, args.get("speed", 30))
         elif action in ("start", "info"):
-            return {"state": "ready"}
+            return {
+                "state": "ready" if self._publisher else "idle",
+                "feedback_supported": True,
+                "feedback_topic": "/head/status",
+            }
         elif action == "stop":
             return {"state": "idle"}
         return {"error": f"unknown action: {action}"}
 
-    def _send_head_pos(self, roll_deg: float, pitch_deg: float, yaw_deg: float) -> dict:
+    def _move_to(self, yaw, pitch, roll, speed) -> dict:
+        try:
+            yaw = float(yaw)
+            pitch = float(pitch)
+            roll = float(roll)
+            speed = float(speed)
+        except (TypeError, ValueError):
+            return {"state": "error", "error": "head angles and speed must be numeric",
+                    "code": "invalid_head_parameters"}
+        if not all(math.isfinite(value) for value in (yaw, pitch, roll, speed)):
+            return {"state": "error", "error": "head angles and speed must be finite",
+                    "code": "invalid_head_parameters"}
+        limits = {
+            "yaw": (yaw, -90, 90),
+            "pitch": (pitch, -25, 25),
+            "roll": (roll, -26, 26),
+            "speed": (speed, 5, 60),
+        }
+        violations = [
+            {"parameter": name, "value": value, "minimum": lower, "maximum": upper}
+            for name, (value, lower, upper) in limits.items()
+            if value < lower or value > upper
+        ]
+        if violations:
+            return {"state": "error", "error": "Head command exceeds allowed range",
+                    "code": "head_command_out_of_range", "violations": violations}
+        motor_ids = [1, 2, 3]
+        check = self._feedback.preflight(self._publisher, motor_ids)
+        if check is not None:
+            return check
+        baseline_seq, baseline = self._feedback.snapshot(motor_ids)
+        result = self._send_head_pos(roll, pitch, yaw, speed)
+        if "error" in result:
+            return result
+        targets = {1: _deg2rad(roll), 2: _deg2rad(pitch), 3: _deg2rad(yaw)}
+        feedback = self._feedback.wait_for_motion(
+            targets, baseline_seq, baseline)
+        if feedback.get("state") == "error":
+            return feedback
+        result["feedback_verified"] = True
+        result["feedback"] = feedback
+        return result
+
+    def _send_head_pos(
+            self, roll_deg: float, pitch_deg: float,
+            yaw_deg: float, speed_deg: float) -> dict:
         if not self._publisher:
             return {"error": "publisher not initialized"}
         try:
@@ -766,7 +1044,7 @@ class HeadPlugin:
                 cmd = SetMotorPosition()
                 cmd.name = motor_id
                 cmd.pos = _deg2rad(deg)
-                cmd.spd = 1.0  # rad/s
+                cmd.spd = _deg2rad(speed_deg)
                 cmd.cur = 3.0  # A (max current)
                 cmds.append(cmd)
             msg.cmds = cmds
@@ -1195,6 +1473,19 @@ class HeadGesturePlugin:
 class ArmPlugin:
     """双臂14DOF控制 (位置模式 / 力位混合)"""
 
+    _JOINT_NAMES = [
+        "shoulder_pitch", "shoulder_roll", "shoulder_yaw",
+        "elbow_pitch", "wrist_yaw", "wrist_pitch", "wrist_roll",
+    ]
+    _LEFT_POSE_LIMITS = [
+        (-170, 170), (-15, 150), (-170, 170), (-150, 15),
+        (-170, 170), (-45, 60), (-95, 75),
+    ]
+    _RIGHT_POSE_LIMITS = [
+        (-170, 170), (-150, 15), (-170, 170), (-150, 15),
+        (-170, 170), (-45, 60), (-75, 95),
+    ]
+
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._ns = namespace
         self._ros2 = ros2
@@ -1202,6 +1493,7 @@ class ArmPlugin:
         ros2.executor_tianyi.add_node(self._pub_node)
         self._pos_publisher = None
         self._ctrl_publisher = None
+        self._feedback = _JointCommandFeedback("arm", "/arm/status")
 
     def get_tool(self) -> dict:
         return {
@@ -1212,15 +1504,27 @@ class ArmPlugin:
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": ["move_pos", "move_ctrl"],
+                               "default": "move_pos",
                                "description": "控制模式"},
                     "side": {"type": "string", "enum": ["left", "right", "both"],
-                             "description": "控制哪只手臂"},
-                    "positions": {"type": "array", "items": {"type": "number"},
-                                  "description": "7个关节角度(度): [肩pitch, 肩roll, 肩yaw, 肘pitch, 腕yaw, 腕pitch, 腕roll]"},
-                    "speed": {"type": "number", "description": "运动速度(rad/s), 默认1.0"},
-                    "kp": {"type": "array", "items": {"type": "number"},
+                             "default": "left",
+                             "description": "控制哪只手臂；right/both会自动镜像横向关节"},
+                    "positions": {
+                        "type": "array", "items": {"type": "number", "minimum": -170, "maximum": 170},
+                        "minItems": 7, "maxItems": 7,
+                        "default": [0, 0, 0, 0, 0, 0, 0],
+                        "description": "左臂基准的7个关节角度(度): [肩pitch, 肩roll, 肩yaw, 肘pitch, 腕yaw, 腕pitch, 腕roll]；right/both自动镜像roll/yaw轴"
+                    },
+                    "speed": {"type": "number", "minimum": 0.2, "maximum": 1.5,
+                              "default": 0.5,
+                              "description": "运动速度(rad/s), 范围[0.2, 1.5], 默认0.5"},
+                    "kp": {"type": "array", "items": {"type": "number", "minimum": 0, "maximum": 2000},
+                           "minItems": 7, "maxItems": 7,
+                           "default": [200, 200, 200, 200, 200, 200, 200],
                            "description": "位置增益(7个), 范围[0,2000]"},
-                    "kd": {"type": "array", "items": {"type": "number"},
+                    "kd": {"type": "array", "items": {"type": "number", "minimum": 0, "maximum": 300},
+                           "minItems": 7, "maxItems": 7,
+                           "default": [20, 20, 20, 20, 20, 20, 20],
                            "description": "速度增益(7个), 范围[0,300]"},
                 },
                 "required": ["action"],
@@ -1240,7 +1544,8 @@ class ArmPlugin:
                 CmdSetMotorPosition, "/arm/cmd_pos", _RELIABLE_QOS)
             self._ctrl_publisher = self._pub_node.create_publisher(
                 CmdMotorCtrl, "/arm/cmd_ctrl", _RELIABLE_QOS)
-            print("[ArmPlugin] publishers created")
+            self._feedback.create_subscriptions(self._pub_node)
+            print("[ArmPlugin] publishers and feedback subscriptions created")
         except ImportError as e:
             print(f"[ArmPlugin] WARNING: msg import failed ({e})")
 
@@ -1250,24 +1555,177 @@ class ArmPlugin:
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "move_pos":
             side = args.get("side", "left")
-            positions = args.get("positions", [])
-            speed = args.get("speed", 1.0)
-            if len(positions) != 7:
-                return {"error": "positions must have exactly 7 values (degrees)"}
-            return self._send_pos(side, positions, speed)
+            positions = args.get("positions", [0] * 7)
+            speed = args.get("speed", 0.5)
+            validated = self._validate_command(side, positions, speed=speed)
+            if isinstance(validated, dict):
+                return validated
+            canonical_pose, speed = validated
+            motor_ids = self._motor_ids(side)
+            check = self._feedback.preflight(self._pos_publisher, motor_ids)
+            if check is not None:
+                return check
+            baseline_seq, baseline = self._feedback.snapshot(motor_ids)
+            result = self._send_pos(side, canonical_pose, speed)
+            if "error" in result:
+                return result
+            feedback = self._feedback.wait_for_motion(
+                self._target_positions(side, canonical_pose),
+                baseline_seq, baseline)
+            if feedback.get("state") == "error":
+                return feedback
+            result["feedback_verified"] = True
+            result["feedback"] = feedback
+            return result
         elif action == "move_ctrl":
             side = args.get("side", "left")
-            positions = args.get("positions", [])
+            positions = args.get("positions", [0] * 7)
             kp = args.get("kp", [200] * 7)
             kd = args.get("kd", [20] * 7)
-            if len(positions) != 7:
-                return {"error": "positions must have exactly 7 values (degrees)"}
-            return self._send_ctrl(side, positions, kp, kd)
+            validated = self._validate_command(
+                side, positions, kp=kp, kd=kd)
+            if isinstance(validated, dict):
+                return validated
+            canonical_pose, kp, kd = validated
+            motor_ids = self._motor_ids(side)
+            check = self._feedback.preflight(self._ctrl_publisher, motor_ids)
+            if check is not None:
+                return check
+            baseline_seq, baseline = self._feedback.snapshot(motor_ids)
+            result = self._send_ctrl(side, canonical_pose, kp, kd)
+            if "error" in result:
+                return result
+            feedback = self._feedback.wait_for_motion(
+                self._target_positions(side, canonical_pose),
+                baseline_seq, baseline)
+            if feedback.get("state") == "error":
+                return feedback
+            result["feedback_verified"] = True
+            result["feedback"] = feedback
+            return result
         elif action in ("start", "info"):
-            return {"state": "ready"}
+            return {
+                "state": "ready" if self._pos_publisher else "idle",
+                "feedback_supported": True,
+                "feedback_topic": "/arm/status",
+                "right_arm_mirrored": True,
+            }
         elif action == "stop":
             return {"state": "idle"}
         return {"error": f"unknown action: {action}"}
+
+    @staticmethod
+    def _mirror_pose(left_pose: list[float]) -> list[float]:
+        return [
+            left_pose[0], -left_pose[1], -left_pose[2],
+            left_pose[3], -left_pose[4], left_pose[5], -left_pose[6],
+        ]
+
+    @staticmethod
+    def _motor_ids(side: str) -> list[int]:
+        motor_ids = []
+        if side in ("left", "both"):
+            motor_ids.extend(range(11, 18))
+        if side in ("right", "both"):
+            motor_ids.extend(range(21, 28))
+        return motor_ids
+
+    @classmethod
+    def _pose_violations(cls, side: str, left_pose: list[float]) -> list[dict]:
+        selected = []
+        if side in ("left", "both"):
+            selected.append(("left", left_pose, cls._LEFT_POSE_LIMITS))
+        if side in ("right", "both"):
+            selected.append((
+                "right", cls._mirror_pose(left_pose), cls._RIGHT_POSE_LIMITS))
+        violations = []
+        for arm_side, pose, limits in selected:
+            for index, (value, bounds) in enumerate(zip(pose, limits)):
+                lower, upper = bounds
+                if value < lower or value > upper:
+                    violations.append({
+                        "side": arm_side,
+                        "joint": cls._JOINT_NAMES[index],
+                        "value_deg": value,
+                        "minimum_deg": lower,
+                        "maximum_deg": upper,
+                    })
+        return violations
+
+    @classmethod
+    def _target_positions(
+            cls, side: str, left_pose: list[float]) -> dict[int, float]:
+        right_pose = cls._mirror_pose(left_pose)
+        targets = {}
+        if side in ("left", "both"):
+            targets.update({
+                11 + index: _deg2rad(deg)
+                for index, deg in enumerate(left_pose)
+            })
+        if side in ("right", "both"):
+            targets.update({
+                21 + index: _deg2rad(deg)
+                for index, deg in enumerate(right_pose)
+            })
+        return targets
+
+    @classmethod
+    def _validate_command(
+            cls, side, positions, speed=None, kp=None, kd=None):
+        if side not in ("left", "right", "both"):
+            return {"state": "error", "error": "side must be left, right or both",
+                    "code": "invalid_arm_side"}
+        if not isinstance(positions, (list, tuple)) or len(positions) != 7:
+            return {"state": "error",
+                    "error": "positions must have exactly 7 values (degrees)",
+                    "code": "invalid_arm_positions"}
+        try:
+            pose = [float(value) for value in positions]
+        except (TypeError, ValueError):
+            return {"state": "error", "error": "positions must be numeric",
+                    "code": "invalid_arm_positions"}
+        if not all(math.isfinite(value) for value in pose):
+            return {"state": "error", "error": "positions must be finite",
+                    "code": "invalid_arm_positions"}
+        violations = cls._pose_violations(side, pose)
+        if violations:
+            return {"state": "error", "error": "Arm pose exceeds URDF joint limits",
+                    "code": "arm_pose_out_of_range", "violations": violations}
+        if speed is not None:
+            try:
+                speed = float(speed)
+            except (TypeError, ValueError):
+                return {"state": "error", "error": "speed must be numeric",
+                        "code": "invalid_arm_speed"}
+            if not math.isfinite(speed):
+                return {"state": "error", "error": "speed must be finite",
+                        "code": "invalid_arm_speed"}
+            if speed < 0.2 or speed > 1.5:
+                return {"state": "error", "error": "speed must be in [0.2, 1.5] rad/s",
+                        "code": "arm_speed_out_of_range", "speed": speed}
+            return pose, speed
+        for name, values, lower, upper in (
+                ("kp", kp, 0, 2000), ("kd", kd, 0, 300)):
+            if not isinstance(values, (list, tuple)) or len(values) != 7:
+                return {"state": "error", "error": f"{name} must have exactly 7 values",
+                        "code": f"invalid_arm_{name}"}
+            try:
+                converted = [float(value) for value in values]
+            except (TypeError, ValueError):
+                return {"state": "error", "error": f"{name} must be numeric",
+                        "code": f"invalid_arm_{name}"}
+            if not all(math.isfinite(value) for value in converted):
+                return {"state": "error", "error": f"{name} must be finite",
+                        "code": f"invalid_arm_{name}"}
+            bad = [value for value in converted if value < lower or value > upper]
+            if bad:
+                return {"state": "error", "error": f"{name} values must be in [{lower}, {upper}]",
+                        "code": f"arm_{name}_out_of_range", "values": bad}
+            if name == "kp":
+                kp = converted
+            else:
+                kd = converted
+        return pose, kp, kd
 
     def _send_pos(self, side: str, positions_deg: list, speed: float) -> dict:
         if not self._pos_publisher:
@@ -1278,12 +1736,12 @@ class ArmPlugin:
             cmds = []
             sides = []
             if side in ("left", "both"):
-                sides.append(("left", 11))
+                sides.append((11, positions_deg))
             if side in ("right", "both"):
-                sides.append(("right", 21))
+                sides.append((21, self._mirror_pose(positions_deg)))
 
-            for side_name, base_id in sides:
-                for i, deg in enumerate(positions_deg):
+            for base_id, pose in sides:
+                for i, deg in enumerate(pose):
                     cmd = SetMotorPosition()
                     cmd.name = base_id + i
                     cmd.pos = _deg2rad(deg)
@@ -1306,12 +1764,12 @@ class ArmPlugin:
             cmds = []
             sides = []
             if side in ("left", "both"):
-                sides.append(("left", 11))
+                sides.append((11, positions_deg))
             if side in ("right", "both"):
-                sides.append(("right", 21))
+                sides.append((21, self._mirror_pose(positions_deg)))
 
-            for side_name, base_id in sides:
-                for i, deg in enumerate(positions_deg):
+            for base_id, pose in sides:
+                for i, deg in enumerate(pose):
                     cmd = MotorCtrl()
                     cmd.name = base_id + i
                     cmd.pos = _deg2rad(deg)
