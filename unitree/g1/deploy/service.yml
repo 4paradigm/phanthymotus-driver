@@ -7,6 +7,10 @@ unitree-g1:
   privileged: true
   volumes:
     - /dev:/dev
+    - /opt/phanthy-motus/data/maps:/opt/phanthy-motus/data/maps
+    - /opt/phanthy-motus/data/spatial.db:/opt/phanthy-motus/data/spatial.db
+    - /opt/phanthy-motus/data/scan_context.db:/opt/phanthy-motus/data/scan_context.db
+    - /opt/phanthy-motus/data/controlled_spatial.db:/opt/phanthy-motus/data/controlled_spatial.db
   environment:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
