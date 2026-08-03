@@ -36,6 +36,10 @@
 #include "error_code.h"
 
 static volatile int s_running = 1;
+/* 0 = PSDK initialising, 1 = modules ready, -1 = initialisation failed.
+ * Keep the IPC server independent from the (potentially slow) PSDK UART
+ * handshake so callers never silently fall back to simulated data. */
+static volatile int s_psdk_state = 0;
 
 static void _signal_handler(int sig) {
     printf("[psdk_bridge] signal %d, shutting down\n", sig);
@@ -568,6 +572,44 @@ static int _psdk_core_init(const char *app_id, const char *app_key,
 }
 #endif
 
+static void _init_modules(void) {
+    telemetry_init();
+    flight_ctrl_init();
+    camera_mgr_init();
+    gimbal_mgr_init();
+    liveview_init();
+    waypoint_init();
+    perception_init();
+    speaker_init();
+    hms_init();
+    time_sync_init();
+}
+
+#ifdef PSDK_ENABLED
+typedef struct {
+    const char *app_id;
+    const char *app_key;
+    const char *app_license;
+    const char *app_name;
+    const char *uart_dev;
+    uint32_t baud_rate;
+} T_PsdkStartArgs;
+
+static void *_psdk_start_thread(void *arg) {
+    T_PsdkStartArgs *args = (T_PsdkStartArgs *)arg;
+    if (_psdk_core_init(args->app_id, args->app_key, args->app_license,
+                        args->app_name, args->uart_dev, args->baud_rate) != 0) {
+        s_psdk_state = -1;
+        printf("[psdk_bridge] PSDK core init failed; IPC remains available for status/errors\n");
+        return NULL;
+    }
+    _init_modules();
+    s_psdk_state = 1;
+    printf("[psdk_bridge] PSDK modules ready\n");
+    return NULL;
+}
+#endif
+
 /* ── IPC Command Dispatcher ─────────────────────────────────────────────── */
 
 static int _dispatch_cmd(const char *raw_json, const char *unused,
@@ -576,6 +618,15 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
      * Simple JSON command dispatch. In production, use cJSON for proper parsing.
      * For now, use strstr-based matching for the common commands.
      */
+
+    /* Do not run any PSDK API before its asynchronous UART handshake has
+     * completed.  This is a live bridge response, not a mock fallback. */
+    if (s_psdk_state != 1) {
+        snprintf(result, result_size,
+                 "{\"ok\":false,\"error\":\"PSDK %s\"}",
+                 s_psdk_state < 0 ? "initialization failed" : "initializing");
+        return -1;
+    }
 
     /* Telemetry */
     if (strstr(raw_json, "\"get_telemetry\"")) {
@@ -1029,36 +1080,38 @@ int main(int argc, char *argv[]) {
      * differently configured descriptor for its registration handshake. */
     HalNetwork_Init();  /* Non-fatal if no USB-Ethernet yet */
 
-#ifdef PSDK_ENABLED
-    /* Initialize PSDK core */
-    if (_psdk_core_init(app_id, app_key, app_license, app_name, uart_dev, baud_rate) != 0) {
-        printf("[psdk_bridge] PSDK core init failed, exiting\n");
-        return 1;
-    }
-#else
-    printf("[psdk_bridge] Running in STUB mode (no PSDK)\n");
-#endif
-
-    /* Initialize all modules */
-    telemetry_init();
-    flight_ctrl_init();
-    camera_mgr_init();
-    gimbal_mgr_init();
-    liveview_init();
-    waypoint_init();
-    perception_init();
-    speaker_init();
-    hms_init();
-    time_sync_init();
-
-    /* Start IPC server */
+    /* The Unix socket is the driver control plane.  Start it before PSDK:
+     * DjiCore_Init may spend minutes probing UART baud rates while waiting for
+     * an aircraft, but Python must still connect to the real bridge. */
     if (ipc_init(socket_path) != 0) {
         printf("[psdk_bridge] IPC init failed, exiting\n");
         return 1;
     }
     ipc_set_handler(_dispatch_cmd);
 
-    printf("[psdk_bridge] Ready, entering main loop\n");
+#ifdef PSDK_ENABLED
+    T_PsdkStartArgs start_args = {
+        .app_id = app_id,
+        .app_key = app_key,
+        .app_license = app_license,
+        .app_name = app_name,
+        .uart_dev = uart_dev,
+        .baud_rate = baud_rate,
+    };
+    pthread_t psdk_thread;
+    if (pthread_create(&psdk_thread, NULL, _psdk_start_thread, &start_args) != 0) {
+        printf("[psdk_bridge] failed to start PSDK initialization thread\n");
+        ipc_cleanup();
+        return 1;
+    }
+    pthread_detach(psdk_thread);
+#else
+    printf("[psdk_bridge] Running in STUB mode (no PSDK)\n");
+    _init_modules();
+    s_psdk_state = 1;
+#endif
+
+    printf("[psdk_bridge] IPC ready, entering main loop\n");
 
     /* Main event loop */
     while (s_running) {
@@ -1068,20 +1121,23 @@ int main(int argc, char *argv[]) {
 
     /* Cleanup */
     printf("[psdk_bridge] Shutting down...\n");
-    hms_cleanup();
-    speaker_cleanup();
-    perception_cleanup();
-    waypoint_cleanup();
-    liveview_cleanup();
-    gimbal_mgr_cleanup();
-    camera_mgr_cleanup();
-    flight_ctrl_cleanup();
-    telemetry_cleanup();
+    if (s_psdk_state == 1) {
+        hms_cleanup();
+        speaker_cleanup();
+        perception_cleanup();
+        waypoint_cleanup();
+        liveview_cleanup();
+        gimbal_mgr_cleanup();
+        camera_mgr_cleanup();
+        flight_ctrl_cleanup();
+        telemetry_cleanup();
+    }
     ipc_cleanup();
     HalNetwork_Cleanup();
 
 #ifdef PSDK_ENABLED
-    DjiCore_DeInit();
+    if (s_psdk_state == 1)
+        DjiCore_DeInit();
 #endif
 
     printf("[psdk_bridge] Done.\n");
