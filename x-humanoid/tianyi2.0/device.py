@@ -123,6 +123,37 @@ def _clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, float(value)))
 
 
+def _rpm2rads(rpm: float) -> float:
+    return rpm * 2.0 * math.pi / 60.0
+
+
+# ── 关节限位 (deg, rpm, A): motor_id → (min_deg, max_deg, max_spd_rpm, rated_current_a) ─
+
+_JOINT_LIMITS = {
+    # 腰部
+    31: (-160,   180,   30,  31.0),
+    32: (-45,    120,   37.5, 82.0),
+    # 左腿
+    51: (-40,    5,     37.5, 5.0),
+    52: (-23,    20,    37.5, 5.0),
+}
+
+# ── 腿部升降标定点位 (实测, rad) ──
+# 51(hip) + 52(knee) ≈ -0.35, 32(pitch) ≈ -51, 三电机联动保证平稳升降
+_LEG_LEVELS = [
+    {},  # 占位, level 从 1 开始
+    {"level": 1, 51:  0.08709, 52: -0.35002, 32: -0.08704},   # 归零位
+    {"level": 2, 51: -0.08720, 52: -0.26279, 32:  0.08728},
+    {"level": 3, 51: -0.17443, 52: -0.17557, 32:  0.17449},
+    {"level": 4, 51: -0.26170, 52: -0.08832, 32:  0.26174},
+    {"level": 5, 51: -0.34893, 52: -0.00107, 32:  0.34897},
+    {"level": 6, 51: -0.43613, 52:  0.08618, 32:  0.43620},
+    {"level": 7, 51: -0.52336, 52:  0.17335, 32:  0.52342},
+    {"level": 8, 51: -0.61061, 52:  0.26061, 32:  0.61062},
+    {"level": 9, 51: -0.69785, 52:  0.34785, 32:  0.69785},   # 最高位
+]
+
+
 class _ActionSequence:
     """Run one cancellable actuator sequence at a time."""
 
@@ -1865,32 +1896,49 @@ class ArmGesturePlugin:
 # ══════════════════════════════════════════════════════════════════════════
 
 class WaistPlugin:
-    """腰部2DOF控制 (yaw/pitch)"""
+    """腰部偏航 + 腿部升降 (三电机联动: hip+knee+pitch)
+
+    调用格式:
+      - 腰偏航: {"action": "move_waist", "yaw": 30, "speed": 0.5}
+      - 腿升降: {"action": "move_leg", "height": 50, "speed": 0.5}
+      - 腰归零: {"action": "set_zero_waist"}
+      - 腿归零: {"action": "set_zero_leg"}
+
+    height: 0=最低(归零位), 100=最高, 三电机线性插值联动
+    """
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._ns = namespace
         self._ros2 = ros2
-        self._pub_node = Node("tianyi2_waist_pub", context=ros2.ctx_tianyi)
+        self._pub_node = Node("tianyi2_waist_cmd", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._pub_node)
-        self._publisher = None
+        self._pub_waist = None
+        self._pub_leg = None
 
     def get_tool(self) -> dict:
         return {
             "name": "waist",
             "type": "actuator",
-            "description": "天轶2.0 腰部控制 — 2DOF (yaw±160°, pitch -45°~120°)",
+            "description": "天轶2.0 腰部偏航+腿部升降 — yaw (-120°~120°), height (0-100), 俯仰角已禁用",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["move_pos"],
-                               "description": "控制动作"},
-                    "yaw": {"type": "number", "description": "偏航角(度), 范围[-160, 180]"},
-                    "pitch": {"type": "number", "description": "俯仰角(度), 范围[-45, 120]"},
+                    "action": {"type": "string", "enum": ["move_waist", "move_leg", "set_zero_waist", "set_zero_leg"],
+                               "description": "控制模式"},
+                    "yaw": {"type": "number", "description": "腰偏航角(度), 范围[-120, 120], 默认0"},
+                    "height": {"type": "number", "description": "腿部升降高度(0-100), 0=最低(归零位), 100=最高, 默认0"},
+                    "speed": {"type": "number", "description": "运动速度(rad/s), 默认0.5"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "move_pos": {"params": ["yaw", "pitch"],
-                                 "description": "移动腰部到指定角度"},
+                    "move_waist": {"params": ["yaw", "speed"],
+                                 "description": "腰部偏航: 控制yaw角度(-120°~120°)"},
+                    "move_leg": {"params": ["height", "speed"],
+                                  "description": "腿部升降: 三电机联动, 线性插值, height 0-100"},
+                    "set_zero_waist": {"params": [],
+                                 "description": "腰部归零: yaw=0°"},
+                    "set_zero_leg": {"params": [],
+                                 "description": "腿部归零: height=0 (回到归零位)"},
                 },
             },
         }
@@ -1898,45 +1946,114 @@ class WaistPlugin:
     def start(self):
         try:
             from bodyctrl_msgs.msg import CmdSetMotorPosition
-            self._publisher = self._pub_node.create_publisher(
-                CmdSetMotorPosition, "/waist/cmd_pos", _RELIABLE_QOS)
-            print("[WaistPlugin] publisher created")
+            self._pub_waist = self._pub_node.create_publisher(CmdSetMotorPosition, "/waist/cmd_pos", _RELIABLE_QOS)
+            self._pub_leg   = self._pub_node.create_publisher(CmdSetMotorPosition, "/leg/cmd_pos", _RELIABLE_QOS)
+            print("[WaistPlugin] publishers created (/waist/cmd_pos, /leg/cmd_pos)")
         except ImportError as e:
-            print(f"[WaistPlugin] WARNING: msg import failed ({e})")
+            print(f"[WaistPlugin] WARNING: {e}")
 
     def stop(self):
         pass
 
     def dispatch(self, action: str, args: dict) -> dict:
-        if action == "move_pos":
-            yaw = args.get("yaw", 0)
-            pitch = args.get("pitch", 0)
-            return self._send_pos(yaw, pitch)
-        elif action in ("start", "info"):
+        if action == "move_waist":
+            return self._send_yaw(args.get("yaw", 0), args.get("speed", 0.5))
+        if action == "move_leg":
+            return self._send_leg_height(args.get("height", 0), args.get("speed", 0.5))
+        if action == "set_zero_waist":
+            return self._send_yaw(0)
+        if action == "set_zero_leg":
+            return self._send_leg_height(0)
+        if action in ("start", "info"):
             return {"state": "ready"}
-        elif action == "stop":
+        if action == "stop":
             return {"state": "idle"}
-        return {"error": f"unknown action: {action}"}
+        return {"ok": False, "code": "INVALID_ARGUMENT", "message": f"unknown action: {action}"}
 
-    def _send_pos(self, yaw_deg: float, pitch_deg: float) -> dict:
-        if not self._publisher:
-            return {"error": "publisher not initialized"}
+    def _send_yaw(self, yaw_deg: float, speed_rad_s: float = 0.5) -> dict:
+        if not self._pub_waist:
+            return {"ok": False, "code": "COMMUNICATION_ERROR", "message": "publisher not ready"}
         try:
             from bodyctrl_msgs.msg import CmdSetMotorPosition, SetMotorPosition
             msg = CmdSetMotorPosition()
-            cmds = []
-            for motor_id, deg in [(31, yaw_deg), (32, pitch_deg)]:
-                cmd = SetMotorPosition()
-                cmd.name = motor_id
-                cmd.pos = _deg2rad(deg)
-                cmd.spd = 0.5  # rad/s
-                cmd.cur = 10.0  # A
-                cmds.append(cmd)
-            msg.cmds = cmds
-            self._publisher.publish(msg)
-            return {"state": "moving", "yaw": yaw_deg, "pitch": pitch_deg}
+            mid = 31
+            lim = _JOINT_LIMITS[mid]
+            pos_deg = _clamp(yaw_deg, lim[0], lim[1])
+            clamped = (pos_deg != yaw_deg)
+            spd = _clamp(speed_rad_s, 0, _rpm2rads(lim[2]))
+            cmd = SetMotorPosition()
+            cmd.name = mid; cmd.pos = _deg2rad(pos_deg); cmd.spd = spd; cmd.cur = 5.0
+            msg.cmds.append(cmd)
+            if clamped:
+                return {"ok": False, "code": "JOINT_LIMIT_VIOLATION",
+                        "message": f"waist yaw out of range [{lim[0]}°, {lim[1]}°]"}
+            self._pub_waist.publish(msg)
+            return {"ok": True, "card": "waist", "action": "move_waist",
+                    "applied": [{"name": _ALL_JOINTS[mid], "pos_deg": pos_deg, "spd_rad_s": spd}]}
         except Exception as e:
-            return {"error": str(e)}
+            return {"ok": False, "code": "COMMUNICATION_ERROR", "message": str(e)}
+
+    def _send_leg_height(self, height: float, speed_rad_s: float = 0.5) -> dict:
+        """三电机联动升降: height 0-100 线性插值, 基于实测端点。
+        51(hip)+52(knee) → /leg/cmd_pos, 32(pitch) → /waist/cmd_pos.
+
+        height=0   → 51= 0.087, 52=-0.350, 32=-0.087 (归零位)
+        height=50  → 51=-0.305, 52=-0.001, 32= 0.305 (中间位)
+        height=100 → 51=-0.698, 52= 0.348, 32= 0.698 (最高位)
+
+        约束: pos51+pos52≈-0.35, pos32≈-pos51
+        """
+        if not self._pub_leg or not self._pub_waist:
+            return {"ok": False, "code": "COMMUNICATION_ERROR", "message": "publisher not ready"}
+        try:
+            from bodyctrl_msgs.msg import CmdSetMotorPosition, SetMotorPosition
+
+            # 线性插值: t ∈ [0, 1], 基于实测端点 (level 1 ↔ level 9)
+            t = height / 100.0
+            zero = _LEG_LEVELS[1]   # height=0
+            maxv = _LEG_LEVELS[9]   # height=100
+
+            # leg: 51(hip) + 52(knee) → /leg/cmd_pos
+            msg_leg = CmdSetMotorPosition()
+            results = []
+            for mid in (51, 52):
+                target_rad = zero[mid] + t * (maxv[mid] - zero[mid])
+                lim = _JOINT_LIMITS[mid]
+                lo_rad, hi_rad = _deg2rad(lim[0]), _deg2rad(lim[1])
+                pos_rad = _clamp(target_rad, lo_rad, hi_rad)
+                clamped = (pos_rad != target_rad)
+                spd = _clamp(speed_rad_s, 0, _rpm2rads(lim[2]))
+                cmd = SetMotorPosition()
+                cmd.name = mid; cmd.pos = pos_rad; cmd.spd = spd; cmd.cur = 5.0
+                msg_leg.cmds.append(cmd)
+                results.append({"name": _ALL_JOINTS[mid], "pos_rad": round(pos_rad, 5)})
+                if clamped:
+                    return {"ok": False, "code": "JOINT_LIMIT_VIOLATION",
+                            "message": f"leg {mid} target {target_rad:.5f} rad out of range"}
+            self._pub_leg.publish(msg_leg)
+
+            # waist: 32(pitch) → /waist/cmd_pos
+            mid = 32
+            target_rad = zero[mid] + t * (maxv[mid] - zero[mid])
+            lim = _JOINT_LIMITS[mid]
+            lo_rad, hi_rad = _deg2rad(lim[0]), _deg2rad(lim[1])
+            pos_rad = _clamp(target_rad, lo_rad, hi_rad)
+            clamped = (pos_rad != target_rad)
+            spd = _clamp(speed_rad_s, 0, _rpm2rads(lim[2]))
+            msg_waist = CmdSetMotorPosition()
+            cmd = SetMotorPosition()
+            cmd.name = mid; cmd.pos = pos_rad; cmd.spd = spd; cmd.cur = 5.0
+            msg_waist.cmds.append(cmd)
+            results.append({"name": _ALL_JOINTS[mid], "pos_rad": round(pos_rad, 5)})
+            if clamped:
+                return {"ok": False, "code": "JOINT_LIMIT_VIOLATION",
+                        "message": f"waist {mid} target {target_rad:.5f} rad out of range"}
+            self._pub_waist.publish(msg_waist)
+
+            return {"ok": True, "card": "waist", "action": "move_leg", "height": height,
+                    "applied": results}
+        except Exception as e:
+            return {"ok": False, "code": "COMMUNICATION_ERROR", "message": str(e)}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1944,17 +2061,38 @@ class WaistPlugin:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class HandPlugin:
-    """Inspire灵巧手控制 — 6指位置/力/速度控制"""
+    """Inspire 灵巧手控制.
+
+    预设手势 (action = thumbs_up / fist / victory / handshake / point / ok / open_palm):
+        选择 side (left/right/both) 直接执行对应手势。
+    set_fingers_raw (底层全量控指):
+        选择 side 后逐指输入 0-100 百分比，全量下发（未填默认0=张开）。
+    reset:
+        先清除指定手所有手指关节错误锁，再执行力控校准（手指会自动运动）。
+    """
 
     # 手指ID: 1=小指, 2=无名指, 3=中指, 4=食指, 5=拇指弯曲, 6=拇指旋转
     _FINGER_NAMES = ["little", "ring", "middle", "index", "thumb_bend", "thumb_rotation"]
 
-    _GRASP_PRESETS = {
-        "power": [100, 100, 100, 100, 100, 50],
-        "pinch": [0, 0, 0, 80, 80, 60],
-        "lateral": [100, 100, 100, 100, 0, 80],
-        "tripod": [0, 0, 80, 80, 80, 50],
-        "point": [0, 0, 0, 0, 100, 50],
+    # 0 表示张开，100 表示弯曲到握紧。顺序见 _FINGER_NAMES。
+    _GESTURE_PRESETS = {
+        "thumbs_up": [100, 100, 100, 100, 0, 0],
+        "fist": [100, 100, 100, 100, 92, 0],
+        "victory": [100, 100, 0, 0, 100, 0],
+        "handshake": [50, 50, 50, 50, 0, 30],
+        "point": [100, 100, 100, 0, 92, 0],
+        "ok": [0, 0, 0, 60, 50, 50],
+        "open_palm": [0, 0, 0, 0, 0, 0],
+    }
+
+    _GESTURE_LABELS = {
+        "thumbs_up": "点赞",
+        "fist": "握拳",
+        "victory": "比耶",
+        "handshake": "握手",
+        "point": "指向",
+        "ok": "ok",
+        "open_palm": "张开手掌",
     }
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
@@ -1964,36 +2102,52 @@ class HandPlugin:
         ros2.executor_tianyi.add_node(self._pub_node)
         self._left_pub = None
         self._right_pub = None
+        self._left_clear_error = None
+        self._right_clear_error = None
+        self._left_calibrate = None
+        self._right_calibrate = None
+        self._srv_timeout = plugin_config.get("call_timeout", 3.0)
 
     def get_tool(self) -> dict:
+        _GESTURE_ACTIONS = list(self._GESTURE_PRESETS.keys())
         return {
             "name": "hand",
             "type": "actuator",
-            "description": "天轶2.0 Inspire灵巧手 — 每手6指, 位置控制(0-100%: 0=张开, 100=握紧)",
+            "description": "天轶2.0 Inspire 灵巧手 — 预设手势 + 底层全量控指 + 重置",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string",
-                               "enum": ["set_angle", "open", "close", "grasp"],
-                               "description": "控制动作"},
+                               "enum": _GESTURE_ACTIONS + ["set_fingers_raw", "reset"],
+                               "description": "控制模式: 预设手势(thumbs_up/fist/victory/handshake/point/ok/open_palm) | set_fingers_raw=底层全量控指 | reset=清除错误+力控校准"},
                     "side": {"type": "string", "enum": ["left", "right", "both"],
                              "description": "控制哪只手"},
-                    "angles": {"type": "array", "items": {"type": "number"},
-                               "description": "6个手指位置(0-100%): [小指, 无名指, 中指, 食指, 拇指弯曲, 拇指旋转]"},
-                    "grasp_type": {"type": "string",
-                                   "enum": ["power", "pinch", "lateral", "tripod", "point"],
-                                   "description": "预设抓取模式"},
+                    "little": {"type": "number",
+                               "description": "小指 (0=张开, 100=握紧)"},
+                    "ring": {"type": "number",
+                             "description": "无名指 (0=张开, 100=握紧)"},
+                    "middle": {"type": "number",
+                               "description": "中指 (0=张开, 100=握紧)"},
+                    "index": {"type": "number",
+                              "description": "食指 (0=张开, 100=握紧)"},
+                    "thumb_bend": {"type": "number",
+                                   "description": "拇指弯曲 (0=张开, 100=握紧)"},
+                    "thumb_rotation": {"type": "number",
+                                       "description": "拇指旋转"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "set_angle": {"params": ["side", "angles"],
-                                  "description": "设置手指角度(6个值, 0-100%)"},
-                    "open": {"params": ["side"],
-                             "description": "完全张开手"},
-                    "close": {"params": ["side"],
-                              "description": "完全握紧手"},
-                    "grasp": {"params": ["side", "grasp_type"],
-                              "description": "执行预设抓取动作"},
+                    **{g: {"params": ["side"],
+                           "description": f"预设手势: {self._GESTURE_LABELS[g]}"}
+                       for g in _GESTURE_ACTIONS},
+                    "set_fingers_raw": {
+                        "params": ["side", "little", "ring", "middle", "index", "thumb_bend", "thumb_rotation"],
+                        "description": "底层全量控指: 逐指输入角度(0=张开,100=握紧), 不填默认0, 直接下发硬件",
+                    },
+                    "reset": {
+                        "params": ["side"],
+                        "description": "先清除手指关节错误锁，再执行力控校准零点（手指会自动运动）",
+                    },
                 },
             },
         }
@@ -2009,24 +2163,72 @@ class HandPlugin:
         except ImportError as e:
             print(f"[HandPlugin] WARNING: msg import failed ({e})")
 
+        try:
+            from bodyctrl_msgs.srv import SetClearError
+            self._left_clear_error = self._pub_node.create_client(
+                SetClearError, "/inspire_hand/set_clear_error/left_hand")
+            self._right_clear_error = self._pub_node.create_client(
+                SetClearError, "/inspire_hand/set_clear_error/right_hand")
+            print("[HandPlugin] clear_error clients created")
+        except ImportError as e:
+            print(f"[HandPlugin] WARNING: clear_error service import failed ({e})")
+
+        try:
+            from bodyctrl_msgs.srv import SetGestureForceCalibration
+            self._left_calibrate = self._pub_node.create_client(
+                SetGestureForceCalibration, "/inspire_hand/set_gesture_force_calibration/left_hand")
+            self._right_calibrate = self._pub_node.create_client(
+                SetGestureForceCalibration, "/inspire_hand/set_gesture_force_calibration/right_hand")
+            print("[HandPlugin] calibrate clients created")
+        except ImportError as e:
+            print(f"[HandPlugin] WARNING: calibrate service import failed ({e})")
+
     def stop(self):
         pass
 
     def dispatch(self, action: str, args: dict) -> dict:
-        side = args.get("side", "both")
-        if action == "set_angle":
-            angles = args.get("angles", [])
-            if len(angles) != 6:
-                return {"error": "angles must have exactly 6 values (0-100%)"}
-            return self._send_angles(side, angles)
-        elif action == "open":
-            return self._send_angles(side, [0, 0, 0, 0, 0, 0])
-        elif action == "close":
-            return self._send_angles(side, [100, 100, 100, 100, 100, 50])
-        elif action == "grasp":
-            grasp_type = args.get("grasp_type", "power")
-            angles = self._GRASP_PRESETS.get(grasp_type, self._GRASP_PRESETS["power"])
-            return self._send_angles(side, angles)
+        # ── 预设手势 (thumbs_up / fist / victory / handshake / point / ok / open_palm) ──
+        if action in self._GESTURE_PRESETS:
+            side = args.get("side", "both")
+            if side not in ("left", "right", "both"):
+                return {"error": "side must be left, right, or both"}
+            result = self._send_angles(side, self._GESTURE_PRESETS[action])
+            if "error" not in result:
+                result["mode"] = "gesture"
+                result["gesture"] = action
+                result["gesture_label"] = self._GESTURE_LABELS[action]
+            return result
+
+        # ── 底层全量控指 ──
+        elif action == "set_fingers_raw":
+            side = args.get("side", "both")
+            if side not in ("left", "right", "both"):
+                return {"error": "side must be left, right, or both"}
+            keys = ["little", "ring", "middle", "index", "thumb_bend", "thumb_rotation"]
+            angles = []
+            for k in keys:
+                v = args.get(k)
+                if v is None:
+                    angles.append(0)
+                else:
+                    angles.append(max(0, min(100, int(v))))
+            result = self._send_angles(side, angles)
+            if "error" not in result:
+                result["mode"] = "set_fingers_raw"
+                result["angles"] = {k: a for k, a in zip(keys, angles)}
+            return result
+
+        # ── 重置: 先清除错误锁，再力控校准 ──
+        elif action == "reset":
+            side = args.get("side", "both")
+            if side not in ("left", "right", "both"):
+                return {"error": "side must be left, right, or both"}
+            clear_result = self._clear_error(side)
+            calib_result = self._calibrate(side)
+            ok = clear_result.get("ok", False) and calib_result.get("ok", False)
+            return {"ok": ok, "card": "hand", "action": "reset",
+                    "clear_error": clear_result, "calibrate": calib_result}
+
         elif action in ("start", "info"):
             return {"state": "ready"}
         elif action == "stop":
@@ -2038,8 +2240,9 @@ class HandPlugin:
             return {"error": "publishers not initialized"}
         try:
             from sensor_msgs.msg import JointState
-            # Angles are in percentage (0-100), position field is percentage/100
-            positions = [a / 100.0 for a in angles]
+            # Angles are in percentage (0=open, 100=closed).
+            # Hardware maps position 1.0 → open, 0.0 → closed, so invert.
+            positions = [(100 - a) / 100.0 for a in angles]
 
             pubs = []
             if side in ("left", "both"):
@@ -2056,6 +2259,55 @@ class HandPlugin:
             return {"state": "moving", "side": side, "angles": angles}
         except Exception as e:
             return {"error": str(e)}
+
+    def _clear_error(self, side: str) -> dict:
+        """清除指定手的所有手指关节错误锁（文档 5.7.7）。"""
+        sides = ["left", "right"] if side == "both" else [side]
+        results = {}
+        ok = True
+        for s in sides:
+            client = self._left_clear_error if s == "left" else self._right_clear_error
+            if not client:
+                results[s] = {"ok": False, "message": "client not initialized"}
+                ok = False
+                continue
+            try:
+                if not client.wait_for_service(timeout_sec=self._srv_timeout):
+                    results[s] = {"ok": False, "message": "service not available"}
+                    ok = False
+                    continue
+                req = client.srv_type.Request()
+                resp = client.call(req)
+                results[s] = {"ok": True, "accepted": resp.setclear_error_accepted}
+            except Exception as e:
+                results[s] = {"ok": False, "message": str(e)}
+                ok = False
+        return {"ok": ok, "card": "hand", "action": "clear_error", "results": results}
+
+
+    def _calibrate(self, side: str) -> dict:
+        """力控校准：手指自动运动以重新标定零点，修复编码器漂移。"""
+        sides = ["left", "right"] if side == "both" else [side]
+        results = {}
+        ok = True
+        for s in sides:
+            client = self._left_calibrate if s == "left" else self._right_calibrate
+            if not client:
+                results[s] = {"ok": False, "message": "client not initialized"}
+                ok = False
+                continue
+            try:
+                if not client.wait_for_service(timeout_sec=self._srv_timeout):
+                    results[s] = {"ok": False, "message": "service not available"}
+                    ok = False
+                    continue
+                req = client.srv_type.Request()
+                resp = client.call(req)
+                results[s] = {"ok": True, "accepted": resp.calibration_accepted}
+            except Exception as e:
+                results[s] = {"ok": False, "message": str(e)}
+                ok = False
+        return {"ok": ok, "card": "hand", "action": "calibrate", "results": results}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
