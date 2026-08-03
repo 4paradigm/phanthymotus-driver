@@ -50,7 +50,6 @@ endif()
 set(SOURCES
     main.c
     ipc.c
-    hal_uart.c
     hal_network.c
     hal_usb_bulk.c
     osal_posix.c
