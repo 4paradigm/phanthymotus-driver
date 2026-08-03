@@ -1411,12 +1411,12 @@ class HeadGesturePlugin:
 class ArmPlugin:
     """双臂14DOF控制 (位置模式 / 力位混合)"""
 
-    # Conservative raw-control starting gains. The vendor-side controller
-    # applies these gains; this driver does not rate-limit the position step.
-    _DEFAULT_KP = 10.0
-    _DEFAULT_KD = 8.0
-    _KP_RANGE = (5.0, 100.0)
-    _KD_RANGE = (5.0, 30.0)
+    # Original raw-control gains and accepted ranges. The vendor-side
+    # controller applies them; this driver does not rate-limit the position step.
+    _DEFAULT_KP = 200.0
+    _DEFAULT_KD = 20.0
+    _KP_RANGE = (0.0, 2000.0)
+    _KD_RANGE = (0.0, 300.0)
 
     _JOINT_NAMES = [
         "shoulder_pitch", "shoulder_roll", "shoulder_yaw",
@@ -1466,14 +1466,14 @@ class ArmPlugin:
                     "speed": {"type": "number", "minimum": 0.2, "maximum": 1.5,
                               "default": 0.5,
                               "description": "运动速度(rad/s), 范围[0.2, 1.5], 默认0.5"},
-                    "kp": {"type": "array", "items": {"type": "number", "minimum": 5, "maximum": 100},
+                    "kp": {"type": "array", "items": {"type": "number", "minimum": 0, "maximum": 2000},
                            "minItems": 7, "maxItems": 7,
-                           "default": [10, 10, 10, 10, 10, 10, 10],
-                           "description": "位置增益(7个), 范围[5,100], 默认10；move_ctrl无速度限制，仅建议小角度低增益调试"},
-                    "kd": {"type": "array", "items": {"type": "number", "minimum": 5, "maximum": 30},
+                           "default": [200, 200, 200, 200, 200, 200, 200],
+                           "description": "位置增益(7个), 范围[0,2000], 默认200；move_ctrl无速度限制，仅建议小角度目标调试"},
+                    "kd": {"type": "array", "items": {"type": "number", "minimum": 0, "maximum": 300},
                            "minItems": 7, "maxItems": 7,
-                           "default": [8, 8, 8, 8, 8, 8, 8],
-                           "description": "速度阻尼增益(7个), 范围[5,30], 默认8"},
+                           "default": [20, 20, 20, 20, 20, 20, 20],
+                           "description": "速度阻尼增益(7个), 范围[0,300], 默认20"},
                 },
                 "required": ["action"],
                 "x-action-params": {
