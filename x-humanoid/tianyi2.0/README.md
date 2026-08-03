@@ -13,13 +13,15 @@ exposes the capabilities as MCP tools.
  elbow_pitch, wrist_yaw, wrist_pitch, wrist_roll]
 ```
 
-The input pose is a left-arm canonical pose in degrees. Selecting `right` or
-`both` mirrors shoulder roll, shoulder yaw, wrist yaw, and wrist roll before
-publishing to right-arm motor IDs 21-27; left-arm IDs are 11-17. This makes a
-single pose produce symmetric bilateral motion and keeps right-arm lateral
-axes consistent with the semantic arm card. `move_pos` accepts speed
-[0.2, 1.5] rad/s. `move_ctrl` accepts seven-element `kp` [0, 2000] and `kd`
-[0, 300] arrays.
+The card exposes separate `left_positions` and `right_positions` arrays in
+degrees. Selecting `left` reads only the left array, selecting `right` reads
+only the right array, and selecting `both` publishes both arrays in one command
+so the arms can move to different poses simultaneously. Raw arm input is never
+mirrored automatically. To create a mirrored right-arm pose manually, negate
+shoulder roll, shoulder yaw, wrist yaw, and wrist roll (indices 1, 2, 4, and 6)
+from the left pose. Right-arm motor IDs are 21-27 and left-arm IDs are 11-17.
+`move_pos` accepts speed [0.2, 1.5] rad/s. `move_ctrl` accepts seven-element
+`kp` [0, 2000] and `kd` [0, 300] arrays shared by the selected arms.
 
 Both modes reject malformed arrays and poses outside the checked-in URDF
 limits. They check fresh `/arm/status`, selected motor faults, emergency stop,
@@ -27,9 +29,12 @@ and power state before publishing, then wait for newer feedback. Do not command
 the raw `arm` and `arm_gesture` cards concurrently because both can publish to
 `/arm/cmd_pos`.
 
-For compatibility with dashboard array fields, `positions`, `kp`, and `kd`
-accept either native JSON arrays or strings containing a JSON array. Both forms
-are decoded into seven numeric values before the same range and URDF checks run.
+For compatibility with dashboard array fields, `left_positions`,
+`right_positions`, `kp`, and `kd` accept either native JSON arrays or strings
+containing a JSON array. Both forms are decoded into seven numeric values before
+the same range and URDF checks run. Direct callers using the former `positions`
+field remain supported as a fallback, but its values are sent unchanged to each
+selected arm and are no longer mirrored.
 
 ## Head gesture card
 
