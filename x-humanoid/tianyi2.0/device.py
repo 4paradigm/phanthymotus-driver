@@ -465,7 +465,6 @@ class MotorStatePlugin:
             payload = {
                 "parts": parts,
                 "timestamp_ms": int(time.time() * 1000),
-                "control_level": "ANY",
             }
             msg = String()
             msg.data = json.dumps(payload)
@@ -561,7 +560,6 @@ class HandStatePlugin:
                     "left": {"fingers": list(self._left_fingers)},
                     "right": {"fingers": list(self._right_fingers)},
                     "timestamp_ms": int(time.time() * 1000),
-                    "control_level": "ANY",
                 }
             msg = String()
             msg.data = json.dumps(payload)
@@ -654,7 +652,6 @@ class ForceTorqueStatePlugin:
                     "left": dict(self._left) if self._left else {},
                     "right": dict(self._right) if self._right else {},
                     "timestamp_ms": int(time.time() * 1000),
-                    "control_level": "ANY",
                 }
             msg = String()
             msg.data = json.dumps(payload)
@@ -750,7 +747,6 @@ class BatteryStatePlugin:
                     continue
                 payload = dict(self._data)
                 payload["timestamp_ms"] = int(time.time() * 1000)
-                payload["control_level"] = "ANY"
             msg = String()
             msg.data = json.dumps(payload)
             self._pub.publish(msg)
@@ -873,7 +869,6 @@ class PowerBoardStatePlugin:
                     continue
                 payload = json.loads(json.dumps(self._data))  # deep copy
                 payload["timestamp_ms"] = int(time.time() * 1000)
-                payload["control_level"] = "ANY"
             msg = String()
             msg.data = json.dumps(payload)
             self._pub.publish(msg)
@@ -979,7 +974,6 @@ class RemoteStatePlugin:
                     continue
                 payload = json.loads(json.dumps(self._data))  # deep copy
                 payload["timestamp_ms"] = int(time.time() * 1000)
-                payload["control_level"] = "ANY"
             msg = String()
             msg.data = json.dumps(payload)
             self._pub.publish(msg)
@@ -1058,7 +1052,6 @@ class EstopStatePlugin:
                     continue
                 payload = dict(self._data)
                 payload["timestamp_ms"] = int(time.time() * 1000)
-                payload["control_level"] = "ANY"
             msg = String()
             msg.data = json.dumps(payload)
             self._pub.publish(msg)
@@ -1201,14 +1194,14 @@ class CameraPlugin:
 # ── ASR event 常量 (取自 lyre_msgs/msg/AsrEvent.msg) ────────────────────────────
 
 _ASR_EVENT_NAMES = {
-    2:  ("EVENT_ERROR",               "识别错误"),
-    3:  ("EVENT_STATE",               "状态变化"),
-    4:  ("EVENT_WAKEUP",              "唤醒"),
-    5:  ("EVENT_SLEEP",               "休眠"),
-    6:  ("EVENT_VAD",                  "语音活动检测"),
-    10: ("EVENT_PRE_SLEEP",           "预休眠"),
-    13: ("EVENT_CONNECTED_TO_SERVER", "已连接服务器"),
-    14: ("EVENT_SERVER_DISCONNECTED", "服务器断开"),
+    2:  ("EVENT_ERROR",               "recognition error"),
+    3:  ("EVENT_STATE",               "state change"),
+    4:  ("EVENT_WAKEUP",              "wakeup"),
+    5:  ("EVENT_SLEEP",               "sleep"),
+    6:  ("EVENT_VAD",                  "voice activity detection"),
+    10: ("EVENT_PRE_SLEEP",           "pre-sleep"),
+    13: ("EVENT_CONNECTED_TO_SERVER", "connected to server"),
+    14: ("EVENT_SERVER_DISCONNECTED", "server disconnected"),
 }
 
 
@@ -1731,7 +1724,7 @@ class WaistPlugin:
 class HandPlugin:
     """Inspire灵巧手控制 — 6指位置/力/速度控制"""
 
-    # 手指ID: 1=小指, 2=无名指, 3=中指, 4=食指, 5=拇指弯曲, 6=拇指旋转
+    # Finger ID: 1=little, 2=ring, 3=middle, 4=index, 5=thumb_bend, 6=thumb_rotation
     _FINGER_NAMES = ["little", "ring", "middle", "index", "thumb_bend", "thumb_rotation"]
 
     _GRASP_PRESETS = {
@@ -1764,7 +1757,7 @@ class HandPlugin:
                     "side": {"type": "string", "enum": ["left", "right", "both"],
                              "description": "控制哪只手"},
                     "angles": {"type": "array", "items": {"type": "number"},
-                               "description": "6个手指位置(0-100%): [小指, 无名指, 中指, 食指, 拇指弯曲, 拇指旋转]"},
+                               "description": "6 finger positions (0-100%): [little, ring, middle, index, thumb_bend, thumb_rotation]"},
                     "grasp_type": {"type": "string",
                                    "enum": ["power", "pinch", "lateral", "tripod", "point"],
                                    "description": "预设抓取模式"},
