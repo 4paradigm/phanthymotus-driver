@@ -908,8 +908,7 @@ class HeadPlugin:
         self._ros2 = ros2
         self._pub_node = Node("tianyi2_head_pub", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._pub_node)
-        self._publisher = None
-        self._feedback = _JointCommandFeedback("head", "/head/status")
+        self._publisher = None  # Lazy init
 
     def get_tool(self) -> dict:
         return {
@@ -920,26 +919,18 @@ class HeadPlugin:
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": ["move_pos", "look_at"],
-                               "default": "move_pos",
                                "description": "控制动作"},
-                    "yaw": {"type": "number", "minimum": -90, "maximum": 90,
-                            "default": 0, "description": "偏航角(度), 左正右负, 范围[-90, 90]"},
-                    "pitch": {"type": "number", "minimum": -25, "maximum": 25,
-                              "default": 0, "description": "俯仰角(度), 下正上负, 范围[-25, 25]"},
-                    "roll": {"type": "number", "minimum": -26, "maximum": 26,
-                             "default": 0, "description": "翻滚角(度), 范围[-26, 26]"},
-                    "speed": {"type": "number", "minimum": 5, "maximum": 60,
-                              "default": 30,
-                              "description": "头部运动速度(度/秒), 范围[5, 60], 默认30"},
+                    "yaw": {"type": "number", "description": "偏航角(度), 左正右负, 范围[-90, 90]"},
+                    "pitch": {"type": "number", "description": "俯仰角(度), 下正上负, 范围[-25, 25]"},
+                    "roll": {"type": "number", "description": "翻滚角(度), 范围[-26, 26]"},
                     "target": {"type": "string", "enum": ["forward", "left", "right", "up", "down"],
-                               "default": "forward",
                                "description": "预设方向"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "move_pos": {"params": ["yaw", "pitch", "roll", "speed"],
+                    "move_pos": {"params": ["yaw", "pitch", "roll"],
                                  "description": "移动头部到指定角度(度)"},
-                    "look_at": {"params": ["target", "speed"],
+                    "look_at": {"params": ["target"],
                                 "description": "看向预设方向"},
                 },
             },
@@ -950,8 +941,7 @@ class HeadPlugin:
             from bodyctrl_msgs.msg import CmdSetMotorPosition
             self._publisher = self._pub_node.create_publisher(
                 CmdSetMotorPosition, "/head/cmd_pos", _RELIABLE_QOS)
-            self._feedback.create_subscriptions(self._pub_node)
-            print("[HeadPlugin] publisher and feedback subscriptions created")
+            print("[HeadPlugin] publisher created")
         except ImportError as e:
             print(f"[HeadPlugin] WARNING: msg import failed ({e})")
 
@@ -960,9 +950,10 @@ class HeadPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "move_pos":
-            return self._move_to(
-                args.get("yaw", 0), args.get("pitch", 0),
-                args.get("roll", 0), args.get("speed", 30))
+            yaw = args.get("yaw", 0)
+            pitch = args.get("pitch", 0)
+            roll = args.get("roll", 0)
+            return self._send_head_pos(roll, pitch, yaw)
         elif action == "look_at":
             target = args.get("target", "forward")
             presets = {
@@ -972,68 +963,15 @@ class HeadPlugin:
                 "up": (0, -20, 0),
                 "down": (0, 20, 0),
             }
-            if target not in presets:
-                return {"state": "error", "error": "unknown head target",
-                        "code": "invalid_head_target", "target": target}
-            yaw, pitch, roll = presets[target]
-            return self._move_to(
-                yaw, pitch, roll, args.get("speed", 30))
+            yaw, pitch, roll = presets.get(target, (0, 0, 0))
+            return self._send_head_pos(roll, pitch, yaw)
         elif action in ("start", "info"):
-            return {
-                "state": "ready" if self._publisher else "idle",
-                "feedback_supported": True,
-                "feedback_topic": "/head/status",
-            }
+            return {"state": "ready"}
         elif action == "stop":
             return {"state": "idle"}
         return {"error": f"unknown action: {action}"}
 
-    def _move_to(self, yaw, pitch, roll, speed) -> dict:
-        try:
-            yaw = float(yaw)
-            pitch = float(pitch)
-            roll = float(roll)
-            speed = float(speed)
-        except (TypeError, ValueError):
-            return {"state": "error", "error": "head angles and speed must be numeric",
-                    "code": "invalid_head_parameters"}
-        if not all(math.isfinite(value) for value in (yaw, pitch, roll, speed)):
-            return {"state": "error", "error": "head angles and speed must be finite",
-                    "code": "invalid_head_parameters"}
-        limits = {
-            "yaw": (yaw, -90, 90),
-            "pitch": (pitch, -25, 25),
-            "roll": (roll, -26, 26),
-            "speed": (speed, 5, 60),
-        }
-        violations = [
-            {"parameter": name, "value": value, "minimum": lower, "maximum": upper}
-            for name, (value, lower, upper) in limits.items()
-            if value < lower or value > upper
-        ]
-        if violations:
-            return {"state": "error", "error": "Head command exceeds allowed range",
-                    "code": "head_command_out_of_range", "violations": violations}
-        motor_ids = [1, 2, 3]
-        check = self._feedback.preflight(self._publisher, motor_ids)
-        if check is not None:
-            return check
-        baseline_seq, baseline = self._feedback.snapshot(motor_ids)
-        result = self._send_head_pos(roll, pitch, yaw, speed)
-        if "error" in result:
-            return result
-        targets = {1: _deg2rad(roll), 2: _deg2rad(pitch), 3: _deg2rad(yaw)}
-        feedback = self._feedback.wait_for_motion(
-            targets, baseline_seq, baseline)
-        if feedback.get("state") == "error":
-            return feedback
-        result["feedback_verified"] = True
-        result["feedback"] = feedback
-        return result
-
-    def _send_head_pos(
-            self, roll_deg: float, pitch_deg: float,
-            yaw_deg: float, speed_deg: float) -> dict:
+    def _send_head_pos(self, roll_deg: float, pitch_deg: float, yaw_deg: float) -> dict:
         if not self._publisher:
             return {"error": "publisher not initialized"}
         try:
@@ -1044,7 +982,7 @@ class HeadPlugin:
                 cmd = SetMotorPosition()
                 cmd.name = motor_id
                 cmd.pos = _deg2rad(deg)
-                cmd.spd = _deg2rad(speed_deg)
+                cmd.spd = 1.0  # rad/s
                 cmd.cur = 3.0  # A (max current)
                 cmds.append(cmd)
             msg.cmds = cmds

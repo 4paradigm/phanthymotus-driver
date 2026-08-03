@@ -4,22 +4,6 @@ Phanthy Motus driver bundle for the Tianyi 2.0 Pro humanoid robot. The driver
 bridges robot-side ROS2 topics on domain 0 to Agent Core topics on domain 42 and
 exposes the capabilities as MCP tools.
 
-## Raw head joint card
-
-`head` directly commands the three head joints in degrees on `/head/cmd_pos`.
-The motor order is roll (ID 1), pitch (ID 2), and yaw (ID 3), while dashboard
-parameters are named `yaw`, `pitch`, and `roll`. `move_pos` accepts yaw
-[-90, 90], pitch [-25, 25], roll [-26, 26], and speed [5, 60] degrees/second.
-`look_at` provides forward, left, right, up, and down presets using the same
-speed range.
-
-Before publishing, the card rejects non-numeric, non-finite, or out-of-range
-inputs and checks fresh `/head/status`, all head motor fault codes, emergency
-stop, and power state. It waits up to two seconds for newer status and reports
-`feedback_verified: true` only after observing motion or confirming that the
-head was already at the target. Controller/status failures are returned as
-stable error codes instead of incorrectly reporting `moving` immediately.
-
 ## Raw arm joint card
 
 `arm` directly commands seven joints per selected arm in this canonical order:
