@@ -593,7 +593,6 @@ class ExtMicPlugin:
                     "scope": "instance",
                     "oneOf": device_options if device_options else [{"const": "", "title": "无可用设备"}],
                 },
-                "device_name": {"type": "string", "description": "设备名称", "scope": "instance"},
             },
         }
         return [tool]
@@ -639,6 +638,12 @@ class ExtMicPlugin:
                     device_name = self._available_devices[0]["name"]
                 else:
                     raise ValueError("No external mic device available")
+            # Auto-resolve device_name from available devices if not provided
+            if not device_name:
+                for d in self._available_devices:
+                    if d.get("alsa_id") == device_id or str(d.get("index")) == str(device_id):
+                        device_name = d["name"]
+                        break
             # Try to convert to int for sounddevice numeric index, keep string for alsa_id
             try:
                 device_id = int(device_id)
