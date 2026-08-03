@@ -13,11 +13,10 @@ exposes the capabilities as MCP tools.
  elbow_pitch, wrist_yaw, wrist_pitch, wrist_roll]
 ```
 
-The card exposes separate `left_positions` and `right_positions` arrays in
-degrees. Selecting `left` reads only the left array, selecting `right` reads
-only the right array, and selecting `both` publishes both arrays in one command
-so the arms can move to different poses simultaneously. Raw arm input is never
-mirrored automatically. To create a mirrored right-arm pose manually, negate
+The card always exposes separate `left_positions` and `right_positions` arrays
+in degrees and publishes both arrays in one 14-joint command, so the arms can
+move to different poses simultaneously. There is no `side` selector. Raw arm
+input is never mirrored automatically. To create a mirrored right-arm pose manually, negate
 shoulder roll, shoulder yaw, wrist yaw, and wrist roll (indices 1, 2, 4, and 6)
 from the left pose. Right-arm motor IDs are 21-27 and left-arm IDs are 11-17.
 `move_pos` accepts speed [0.2, 1.5] rad/s. `move_ctrl` accepts seven-element
@@ -33,8 +32,8 @@ For compatibility with dashboard array fields, `left_positions`,
 `right_positions`, `kp`, and `kd` accept either native JSON arrays or strings
 containing a JSON array. Both forms are decoded into seven numeric values before
 the same range and URDF checks run. Direct callers using the former `positions`
-field remain supported as a fallback, but its values are sent unchanged to each
-selected arm and are no longer mirrored.
+field remain supported as a fallback, but its values are sent unchanged to both
+arms and are no longer mirrored.
 
 ## Head gesture card
 

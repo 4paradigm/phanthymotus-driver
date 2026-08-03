@@ -1444,20 +1444,17 @@ class ArmPlugin:
                     "action": {"type": "string", "enum": ["move_pos", "move_ctrl"],
                                "default": "move_pos",
                                "description": "控制模式"},
-                    "side": {"type": "string", "enum": ["left", "right", "both"],
-                             "default": "left",
-                             "description": "控制哪只手臂；角度均按所选手臂的实际关节方向输入，不自动镜像"},
                     "left_positions": {
                         "type": "array", "items": {"type": "number", "minimum": -170, "maximum": 170},
                         "minItems": 7, "maxItems": 7,
                         "default": [0, 0, 0, 0, 0, 0, 0],
-                        "description": "左臂实际7关节角度(度)，用于left/both: [肩pitch, 肩roll, 肩yaw, 肘pitch, 腕yaw, 腕pitch, 腕roll]"
+                        "description": "左臂实际7关节角度(度): [肩pitch, 肩roll, 肩yaw, 肘pitch, 腕yaw, 腕pitch, 腕roll]"
                     },
                     "right_positions": {
                         "type": "array", "items": {"type": "number", "minimum": -170, "maximum": 170},
                         "minItems": 7, "maxItems": 7,
                         "default": [0, 0, 0, 0, 0, 0, 0],
-                        "description": "右臂实际7关节角度(度)，用于right/both，顺序同左臂；若要镜像左臂姿态，请将肩roll、肩yaw、腕yaw、腕roll（索引1/2/4/6）取反"
+                        "description": "右臂实际7关节角度(度)，顺序同左臂；若要镜像左臂姿态，请将肩roll、肩yaw、腕yaw、腕roll（索引1/2/4/6）取反"
                     },
                     "speed": {"type": "number", "minimum": 0.2, "maximum": 1.5,
                               "default": 0.5,
@@ -1465,18 +1462,18 @@ class ArmPlugin:
                     "kp": {"type": "array", "items": {"type": "number", "minimum": 0, "maximum": 2000},
                            "minItems": 7, "maxItems": 7,
                            "default": [200, 200, 200, 200, 200, 200, 200],
-                           "description": "位置增益(7个), 范围[0,2000]"},
+                           "description": "位置增益(7个), 范围[0,2000], 默认值200"},
                     "kd": {"type": "array", "items": {"type": "number", "minimum": 0, "maximum": 300},
                            "minItems": 7, "maxItems": 7,
                            "default": [20, 20, 20, 20, 20, 20, 20],
-                           "description": "速度增益(7个), 范围[0,300]"},
+                           "description": "速度增益(7个), 范围[0,300], 默认值20"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "move_pos": {"params": ["side", "left_positions", "right_positions", "speed"],
-                                 "description": "位置模式: 分别输入左右臂实际关节角度；both可同时执行两组不同姿态"},
-                    "move_ctrl": {"params": ["side", "left_positions", "right_positions", "kp", "kd"],
-                                  "description": "力位混合模式: 分别输入左右臂实际位置和共用增益；both可同时执行两组不同姿态"},
+                    "move_pos": {"params": ["left_positions", "right_positions", "speed"],
+                                 "description": "位置模式: 同时输入并执行左右臂两组实际关节角度"},
+                    "move_ctrl": {"params": ["left_positions", "right_positions", "kp", "kd"],
+                                  "description": "力位混合模式: 同时输入并执行左右臂实际位置和共用增益"},
                 },
             },
         }
@@ -1498,14 +1495,13 @@ class ArmPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "move_pos":
-            side = args.get("side", "left")
-            poses = self._requested_poses(side, args)
+            poses = self._requested_poses(args)
             speed = args.get("speed", 0.5)
-            validated = self._validate_command(side, poses, speed=speed)
+            validated = self._validate_command(poses, speed=speed)
             if isinstance(validated, dict):
                 return validated
             poses, speed = validated
-            motor_ids = self._motor_ids(side)
+            motor_ids = self._motor_ids()
             check = self._feedback.preflight(self._pos_publisher, motor_ids)
             if check is not None:
                 return check
@@ -1522,16 +1518,15 @@ class ArmPlugin:
             result["feedback"] = feedback
             return result
         elif action == "move_ctrl":
-            side = args.get("side", "left")
-            poses = self._requested_poses(side, args)
+            poses = self._requested_poses(args)
             kp = args.get("kp", [200] * 7)
             kd = args.get("kd", [20] * 7)
             validated = self._validate_command(
-                side, poses, kp=kp, kd=kd)
+                poses, kp=kp, kd=kd)
             if isinstance(validated, dict):
                 return validated
             poses, kp, kd = validated
-            motor_ids = self._motor_ids(side)
+            motor_ids = self._motor_ids()
             check = self._feedback.preflight(self._ctrl_publisher, motor_ids)
             if check is not None:
                 return check
@@ -1560,24 +1555,17 @@ class ArmPlugin:
         return {"error": f"unknown action: {action}"}
 
     @staticmethod
-    def _requested_poses(side: str, args: dict) -> dict[str, object]:
+    def _requested_poses(args: dict) -> dict[str, object]:
         """Resolve visible per-arm fields, with legacy `positions` fallback."""
         legacy = args.get("positions", [0] * 7)
-        poses = {}
-        if side in ("left", "both"):
-            poses["left"] = args.get("left_positions", legacy)
-        if side in ("right", "both"):
-            poses["right"] = args.get("right_positions", legacy)
-        return poses
+        return {
+            "left": args.get("left_positions", legacy),
+            "right": args.get("right_positions", legacy),
+        }
 
     @staticmethod
-    def _motor_ids(side: str) -> list[int]:
-        motor_ids = []
-        if side in ("left", "both"):
-            motor_ids.extend(range(11, 18))
-        if side in ("right", "both"):
-            motor_ids.extend(range(21, 28))
-        return motor_ids
+    def _motor_ids() -> list[int]:
+        return [*range(11, 18), *range(21, 28)]
 
     @classmethod
     def _pose_violations(cls, poses: dict[str, list[float]]) -> list[dict]:
@@ -1640,10 +1628,7 @@ class ArmPlugin:
 
     @classmethod
     def _validate_command(
-            cls, side, poses, speed=None, kp=None, kd=None):
-        if side not in ("left", "right", "both"):
-            return {"state": "error", "error": "side must be left, right or both",
-                    "code": "invalid_arm_side"}
+            cls, poses, speed=None, kp=None, kd=None):
         converted_poses = {}
         for arm_side, values in poses.items():
             name = f"{arm_side}_positions"
@@ -1727,8 +1712,7 @@ class ArmPlugin:
 
             msg.cmds = cmds
             self._pos_publisher.publish(msg)
-            return {"state": "moving", "side": self._side_from_poses(poses),
-                    "joints": len(cmds)}
+            return {"state": "moving", "side": "both", "joints": len(cmds)}
         except Exception as e:
             return {"error": str(e)}
 
@@ -1755,14 +1739,10 @@ class ArmPlugin:
 
             msg.cmds = cmds
             self._ctrl_publisher.publish(msg)
-            return {"state": "moving", "side": self._side_from_poses(poses),
+            return {"state": "moving", "side": "both",
                     "mode": "force_position"}
         except Exception as e:
             return {"error": str(e)}
-
-    @staticmethod
-    def _side_from_poses(poses: dict[str, list[float]]) -> str:
-        return "both" if len(poses) == 2 else next(iter(poses))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
