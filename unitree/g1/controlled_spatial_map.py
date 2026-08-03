@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import multiprocessing as mp
 import os
 import queue
 import re
@@ -117,13 +118,13 @@ class ControlledSpatialMapNode:
     np = None
 
     VOXEL_SIZE = 0.06
-    # Full-map packets are intentionally capped: the stock mapping renderer
-    # redraws the whole cloud for each packet, so a compact 5 Hz stream feels
-    # more immediate than a larger stream that accumulates in transit.
-    MAP_PUBLISH_INTERVAL = 0.20
+    # The renderer receives complete snapshots, so prioritise a small latest
+    # snapshot over a large stream that can queue behind the live robot pose.
+    MAP_PUBLISH_INTERVAL = 0.15
+    CLOUD_SNAPSHOT_INTERVAL = 0.50
     META_PUBLISH_INTERVAL = 1.0
     CLOUD_SAVE_INTERVAL = 5.0
-    MAX_SEND_POINTS = 30000
+    MAX_SEND_POINTS = 16000
     DYNAMIC_MIN_HITS = 2
     VIEW_GUARD_EXTENT = 300.0
 
@@ -153,11 +154,20 @@ class ControlledSpatialMapNode:
         self._pending_voxel_hits: dict[tuple, int] = {}
         self._map_buffer_lock = threading.Lock()
         self._map_buffer_dirty = False
+        self._map_buffer_revision = 0
+        self._render_cloud_points = np.zeros((0, 3), dtype=np.float32)
+        self._render_cloud_revision = -1
+        self._last_cloud_snapshot_time = 0.0
         # Mapping frames arrive faster than we can voxelize them. Retaining a
         # backlog makes the displayed map lag behind the robot, while the most
         # recent frames contain all data needed for the visual accumulation.
-        self._cloud_queue = queue.Queue(maxsize=2)
+        self._cloud_queue = queue.Queue(maxsize=1)
         self._running = True
+        # DDS callbacks can arrive while the driver is shutting down. Keep
+        # publishing serialized with node destruction so no callback touches
+        # a publisher whose underlying ROS handle is already gone.
+        self._closing = threading.Event()
+        self._publish_lock = threading.Lock()
         self._last_map_publish_time = 0.0
         self._last_meta_publish_time = 0.0
         self._last_cloud_save_time = 0.0
@@ -197,14 +207,23 @@ class ControlledSpatialMapNode:
         return self._node
 
     def stop(self):
-        self.save_active_map_cache(force=True)
+        if self._closing.is_set():
+            return
+        self._closing.set()
         self._running = False
+        try:
+            self._publish_timer.cancel()
+        except Exception:
+            pass
+        self.save_active_map_cache(force=True)
         try:
             self._worker.join(timeout=2)
         except Exception:
             pass
         try:
-            self._node.destroy_node()
+            # Wait for an already-running publish before destroying the node.
+            with self._publish_lock:
+                self._node.destroy_node()
         except Exception:
             pass
 
@@ -339,6 +358,9 @@ class ControlledSpatialMapNode:
             self._map_buffer.clear()
             self._pending_voxel_hits.clear()
             self._map_buffer_dirty = False
+            self._map_buffer_revision += 1
+            self._render_cloud_points = ControlledSpatialMapNode.np.zeros((0, 3), dtype=ControlledSpatialMapNode.np.float32)
+            self._render_cloud_revision = self._map_buffer_revision
         with self._lock:
             self._point_source = "none"
         if publish:
@@ -375,6 +397,9 @@ class ControlledSpatialMapNode:
         with self._map_buffer_lock:
             self._map_buffer.clear()
             self._pending_voxel_hits.clear()
+            self._map_buffer_revision += 1
+            self._render_cloud_points = ControlledSpatialMapNode.np.zeros((0, 3), dtype=ControlledSpatialMapNode.np.float32)
+            self._render_cloud_revision = self._map_buffer_revision
 
         points = self._parse_pcd(pcd_path)
         if points is None or len(points) == 0:
@@ -510,6 +535,10 @@ class ControlledSpatialMapNode:
                         del self._map_buffer[k]
                     new_size = len(self._map_buffer)
                     self._map_buffer_dirty = True
+                # Existing voxels are refreshed too: SLAM loop closure can
+                # move their coordinates even when the voxel count is stable.
+                if frame_voxels:
+                    self._map_buffer_revision += 1
             with self._lock:
                 self._cloud_source = source
                 self._point_source = "dds"
@@ -536,6 +565,9 @@ class ControlledSpatialMapNode:
                     float(points[i, 0]), float(points[i, 1]), float(points[i, 2])
                 )
             self._map_buffer_dirty = False
+            self._map_buffer_revision += 1
+            self._render_cloud_points = ControlledSpatialMapNode.np.zeros((0, 3), dtype=ControlledSpatialMapNode.np.float32)
+            self._render_cloud_revision = -1
 
     def save_active_map_cache(self, force: bool = False):
         np = ControlledSpatialMapNode.np
@@ -605,7 +637,35 @@ class ControlledSpatialMapNode:
         # skeleton through so its robot pose stays live as well.
         self.publish_now(force=not has_cloud_points, force_meta=False)
 
+    def _get_render_cloud_points(self):
+        """Return a bounded cloud snapshot without rebuilding it for every pose update."""
+        np = ControlledSpatialMapNode.np
+        now = time.monotonic()
+        with self._map_buffer_lock:
+            revision = self._map_buffer_revision
+            refresh_due = now - self._last_cloud_snapshot_time >= self.CLOUD_SNAPSHOT_INTERVAL
+            needs_snapshot = (
+                revision != self._render_cloud_revision and
+                (refresh_due or len(self._render_cloud_points) == 0)
+            )
+            if not needs_snapshot:
+                return self._render_cloud_points
+            values = list(self._map_buffer.values())
+
+        points = np.array(values, dtype=np.float32) if values else np.zeros((0, 3), dtype=np.float32)
+        if len(points) > self.MAX_SEND_POINTS:
+            step = max(1, math.ceil(len(points) / self.MAX_SEND_POINTS))
+            points = points[::step][:self.MAX_SEND_POINTS]
+
+        with self._map_buffer_lock:
+            self._render_cloud_points = points
+            self._render_cloud_revision = revision
+            self._last_cloud_snapshot_time = now
+        return points
+
     def publish_now(self, force: bool = False, force_meta: bool | None = None):
+        if self._closing.is_set():
+            return
         np = ControlledSpatialMapNode.np
         now = time.monotonic()
         include_meta = (
@@ -620,9 +680,8 @@ class ControlledSpatialMapNode:
             local_pcd_available = self._local_pcd_available
             point_source = self._point_source
 
-        with self._map_buffer_lock:
-            all_points = list(self._map_buffer.values())
-        if not all_points and not force:
+        map_pts = self._get_render_cloud_points()
+        if len(map_pts) == 0 and not force:
             return
 
         if include_meta:
@@ -641,9 +700,9 @@ class ControlledSpatialMapNode:
 
         overlay_points = self._build_tag_overlay_points(active_tags)
         guard_points = self._build_view_guard_points()
-        has_cloud_points = bool(all_points)
+        has_cloud_points = bool(len(map_pts))
         if not has_cloud_points:
-            all_points = self._build_fallback_points(maps, active_map, pose)
+            fallback_points = self._build_fallback_points(maps, active_map, pose)
             if point_source == "none":
                 point_source = "fallback"
             now = time.monotonic()
@@ -651,11 +710,10 @@ class ControlledSpatialMapNode:
                 self._last_fallback_log_time = now
                 print(
                     f"[ControlledSpatialMap] publishing fallback map skeleton: "
-                    f"points={len(all_points)} tags={len(active_tags)} active_map={active_map}",
+                    f"points={len(fallback_points)} tags={len(active_tags)} active_map={active_map}",
                     flush=True,
                 )
-
-        map_pts = np.array(all_points, dtype=np.float32) if all_points else np.zeros((0, 3), dtype=np.float32)
+            map_pts = np.array(fallback_points, dtype=np.float32)
         overlay_pts = (
             np.array(overlay_points, dtype=np.float32)
             if has_cloud_points and overlay_points
@@ -681,7 +739,11 @@ class ControlledSpatialMapNode:
 
         robot_x = float(pose["x"]) if pose else 0.0
         robot_y = float(pose["y"]) if pose else 0.0
-        robot_yaw = float(pose["yaw"]) if pose else 0.0
+        slam_yaw = float(pose["yaw"]) if pose else 0.0
+        # The stock renderer maps SLAM +Y to Three.js -Z and then applies a
+        # second negative rotation. Send the display-frame yaw here, while
+        # metadata retains the original SLAM value for map/tag semantics.
+        robot_yaw = -slam_yaw
 
         meta_bytes = b""
         if include_meta:
@@ -692,7 +754,7 @@ class ControlledSpatialMapNode:
                 "native_pcd_path": native_pcd_path,
                 "local_pcd_available": local_pcd_available,
                 "point_source": point_source,
-                "robot": {"x": robot_x, "y": robot_y, "yaw": robot_yaw, "pose_available": pose is not None},
+                "robot": {"x": robot_x, "y": robot_y, "yaw": slam_yaw, "pose_available": pose is not None},
                 "maps": maps,
                 "tags": active_tags,
                 "map_points": map_point_count,
@@ -710,13 +772,22 @@ class ControlledSpatialMapNode:
         if include_meta:
             payload += struct.pack('<I', len(meta_bytes)) + meta_bytes
 
-        from std_msgs.msg import UInt8MultiArray
-        ros_msg = UInt8MultiArray()
-        try:
-            ros_msg.data = array('B', payload)
-        except TypeError:
-            ros_msg.data = list(payload)
-        self._pub.publish(ros_msg)
+        # The stop path takes this same lock before node destruction. Check
+        # _closing again after waiting so late DDS callbacks become no-ops.
+        with self._publish_lock:
+            if self._closing.is_set():
+                return
+            from std_msgs.msg import UInt8MultiArray
+            ros_msg = UInt8MultiArray()
+            try:
+                ros_msg.data = array('B', payload)
+            except TypeError:
+                ros_msg.data = list(payload)
+            try:
+                self._pub.publish(ros_msg)
+            except Exception as e:
+                if not self._closing.is_set():
+                    print(f"[ControlledSpatialMap] map publish skipped: {e}", flush=True)
 
     def _build_fallback_points(self, maps: list[dict], active_map: str | None, pose: dict | None) -> list[tuple]:
         """Build a visible map skeleton for the stock mapping renderer when PCD/DDS points are unavailable."""
@@ -904,6 +975,20 @@ class ControlledSpatialMapPlugin:
     PREFIX = "controlled_spatial_map"
 
     def __init__(self, plugin_config: dict, namespace: str, executor, *_, **__):
+        self._isolated = _as_bool(plugin_config.get("isolated_process", True))
+        self._proc = None
+        self._command_queue = None
+        self._result_queue = None
+        self._ipc_lock = threading.Lock()
+        self._request_id = 0
+
+        # Point-cloud decoding, voxelization, compression, and packet creation
+        # are CPU-heavy Python work. Run the complete map runtime in a fresh
+        # process so it cannot starve the driver process and other cards.
+        if self._isolated:
+            self._start_isolated_process(plugin_config, namespace)
+            return
+
         self._map_topic = f"/{namespace}/controlled_spatial/map"
         self._db_path = plugin_config.get(
             "native_slam_db_path",
@@ -947,6 +1032,50 @@ class ControlledSpatialMapPlugin:
 
         print(f"[ControlledSpatialMap] standalone plugin ready, topic: {self._map_topic}", flush=True)
 
+    def _start_isolated_process(self, plugin_config: dict, namespace: str):
+        self._map_topic = f"/{namespace}/controlled_spatial/map"
+        self._cloud_dir = plugin_config.get(
+            "controlled_cloud_dir",
+            "/opt/phanthy-motus/data/controlled_spatial_clouds",
+        )
+        self._startup_error = None
+        ctx = mp.get_context("spawn")
+        self._command_queue = ctx.Queue()
+        self._result_queue = ctx.Queue()
+        child_config = dict(plugin_config)
+        child_config["isolated_process"] = False
+        self._proc = ctx.Process(
+            target=_controlled_spatial_map_process,
+            args=(child_config, namespace, self._command_queue, self._result_queue),
+            daemon=True,
+            name="controlled_spatial_map",
+        )
+        self._proc.start()
+        try:
+            result = self._result_queue.get(timeout=20.0)
+        except queue.Empty:
+            self._startup_error = "map process startup timed out"
+            return
+        if not result.get("ready"):
+            self._startup_error = result.get("error", "map process failed to start")
+            return
+        print(f"[ControlledSpatialMap] isolated process ready, topic: {self._map_topic}", flush=True)
+
+    def _call_process(self, action: str, args: dict, timeout: float = 15.0):
+        if not self._proc or not self._proc.is_alive() or not self._command_queue or not self._result_queue:
+            return {"error": self._startup_error or "map process is not running"}
+        with self._ipc_lock:
+            self._request_id += 1
+            request_id = self._request_id
+            self._command_queue.put({"id": request_id, "action": action, "args": dict(args)})
+            try:
+                while True:
+                    result = self._result_queue.get(timeout=timeout)
+                    if result.get("id") == request_id:
+                        return result.get("result")
+            except queue.Empty:
+                return {"error": f"map process action '{action}' timed out"}
+
     def get_tools(self) -> list:
         return [self.get_tool()]
 
@@ -978,16 +1107,32 @@ class ControlledSpatialMapPlugin:
         }
 
     def start(self) -> None:
+        if self._isolated:
+            self._call_process("start", {}, timeout=20.0)
+            return
         if not self._map_node:
             return
         self._sync_from_db(force=True)
         self._map_node.publish_now(force=True)
 
     def stop(self) -> None:
+        if self._isolated:
+            if self._proc and self._proc.is_alive() and self._command_queue:
+                try:
+                    self._command_queue.put({"action": "__shutdown__"})
+                    self._proc.join(timeout=5.0)
+                except Exception:
+                    pass
+            if self._proc and self._proc.is_alive():
+                self._proc.terminate()
+                self._proc.join(timeout=2.0)
+            return
         if self._map_node:
             self._map_node.stop()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if self._isolated:
+            return self._call_process(action, args)
         if action in (self.PREFIX, "start", "refresh"):
             if self._map_node:
                 self._sync_from_db(force=True)
@@ -1143,9 +1288,13 @@ class ControlledSpatialMapPlugin:
         if not pose_data or not self._map_node:
             return
 
+        q_x = float(pose_data.get("q_x", 0.0))
+        q_y = float(pose_data.get("q_y", 0.0))
+        q_z = float(pose_data.get("q_z", 0.0))
+        q_w = float(pose_data.get("q_w", 1.0))
         yaw = math.atan2(
-            2 * (pose_data.get("q_w", 1) * pose_data.get("q_z", 0)),
-            1 - 2 * pose_data.get("q_z", 0) ** 2,
+            2 * (q_w * q_z + q_x * q_y),
+            1 - 2 * (q_y * q_y + q_z * q_z),
         )
         pose = {
             "x": pose_data["x"],
@@ -1162,6 +1311,60 @@ class ControlledSpatialMapPlugin:
             map_status = "localized"
         self._map_node.update_pose(pose, map_status)
         self._sync_from_db(force=False)
+
+
+def _controlled_spatial_map_process(plugin_config: dict, namespace: str, command_queue, result_queue):
+    """Own the heavy mapping runtime outside the main driver process."""
+    plugin = None
+    executor = None
+    try:
+        import rclpy
+        from rclpy.executors import MultiThreadedExecutor
+        from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+
+        ChannelFactoryInitialize(0, plugin_config.get("network_iface", "eth0"))
+        rclpy.init(args=None)
+        executor = MultiThreadedExecutor(num_threads=2)
+        plugin = ControlledSpatialMapPlugin(plugin_config, namespace, executor)
+        if plugin._startup_error:
+            result_queue.put({"ready": False, "error": plugin._startup_error})
+            return
+
+        spin_thread = threading.Thread(target=executor.spin, daemon=True, name="controlled_spatial_map_ros")
+        spin_thread.start()
+        result_queue.put({"ready": True})
+
+        while True:
+            command = command_queue.get()
+            if command.get("action") == "__shutdown__":
+                break
+            request_id = command.get("id")
+            try:
+                result = plugin.dispatch(command.get("action", ""), command.get("args", {}))
+            except Exception as e:
+                result = {"error": f"map process action failed: {e}"}
+            result_queue.put({"id": request_id, "result": result})
+    except Exception as e:
+        try:
+            result_queue.put({"ready": False, "error": str(e)})
+        except Exception:
+            pass
+    finally:
+        try:
+            if plugin:
+                plugin.stop()
+        except Exception:
+            pass
+        try:
+            if executor:
+                executor.shutdown()
+        except Exception:
+            pass
+        try:
+            if 'rclpy' in locals() and rclpy.ok():
+                rclpy.shutdown()
+        except Exception:
+            pass
 
 
 def make_plugin(plugin_config, namespace, executor, client=None):

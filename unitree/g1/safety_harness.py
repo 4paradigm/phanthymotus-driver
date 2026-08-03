@@ -529,9 +529,13 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
             slam_info_pos_count += 1
             pose_data = data.get("data", {}).get("currentPose")
             if pose_data:
+                q_x = float(pose_data.get("q_x", 0.0))
+                q_y = float(pose_data.get("q_y", 0.0))
+                q_z = float(pose_data.get("q_z", 0.0))
+                q_w = float(pose_data.get("q_w", 1.0))
                 yaw = math.atan2(
-                    2 * (pose_data.get("q_w", 1) * pose_data.get("q_z", 0)),
-                    1 - 2 * pose_data.get("q_z", 0) ** 2
+                    2 * (q_w * q_z + q_x * q_y),
+                    1 - 2 * (q_y * q_y + q_z * q_z),
                 )
                 with slam_info_lock:
                     nav_current_pose = {
