@@ -769,20 +769,29 @@ class LocoPlugin:
             },
         }
 
+    # ── FSM state groups for safety checks ──────────────────────────────────────
+    _GROUND_STATES = {0, 1}            # zero_torque, damp — lying on ground
+    _LOW_STATES = {2, 702}             # squat, prep — stable low stance
+    _STANDING_STATES = {500, 501, 801} # normal_loco, 3dof_waist, run — active balance
+    _UNSAFE_STATES = {3, 706}          # sit, balance_stand — not directly switchable
+
     def _switch_mode_tool(self) -> dict:
         return {
             "name": "switch_mode",
             "type": "actuator",
             "multiInstance": False,
-            "description": "G1 locomotion mode switch — change posture/locomotion mode by name. damp=阻尼, start=主运控, zero_torque=零力矩, squat=下蹲, stand_up=起立, lie_to_stand=躺起, sit=落座, balance_stand=平衡站立, continuous_gait=持续踏步, stop_gait=停止踏步, high_stand=最高站, low_stand=最低站",
+            "description": "G1 safe locomotion mode switch. "
+                           "lie2standup=安全起立(ground→主运控), standup2lie=安全躺下(standing→阻尼), "
+                           "standup2squat=站到蹲(standing→下蹲), squat2standup=蹲到站(下蹲→主运控), "
+                           "damp=阻尼(ground only), zero_torque=零力矩(ground only), "
+                           "emergency_stop=紧急阻尼(any state), get_current_mode=查询当前状态",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "mode": {
                         "type": "string",
-                        "enum": ["damp", "start", "zero_torque", "squat", "stand_up",
-                                 "lie_to_stand", "sit", "balance_stand",
-                                 "continuous_gait", "stop_gait", "high_stand", "low_stand"],
+                        "enum": ["lie2standup", "standup2lie", "standup2squat", "squat2standup",
+                                 "damp", "zero_torque", "emergency_stop", "get_current_mode"],
                         "description": "Target mode",
                     },
                 },
@@ -795,7 +804,7 @@ class LocoPlugin:
             "name": "switch_mode_expert",
             "type": "actuator",
             "multiInstance": False,
-            "description": "G1 locomotion mode switch — directly set FSM mode ID (expert use only). IDs: 0=zero_torque, 1=damp, 2=squat, 3=sit, 4=lock_stand, 500=normal_loco, 501=3dof_waist, 702=lie_to_stand, 706=balance_squat, 801=run_loco",
+            "description": "G1 locomotion mode switch — directly set FSM mode ID (EXPERT ONLY, bypasses safety checks, robot may fall!). IDs: 0=zero_torque, 1=damp, 2=squat, 3=sit, 4=lock_stand, 500=normal_loco, 501=3dof_waist, 702=lie_to_stand, 706=balance_squat, 801=run_loco",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -880,25 +889,98 @@ class LocoPlugin:
             return {"ret": ret}
         elif action == "switch_mode":
             mode = args.get("mode", "")
-            mode_dispatch = {
-                "damp":            lambda: self._client.Damp(),
-                "start":           lambda: self._client.Start(),
-                "zero_torque":     lambda: self._client.ZeroTorque(),
-                "squat":           lambda: self._client.StandUp2Squat(),
-                "stand_up":        lambda: self._client.Squat2StandUp(),
-                "lie_to_stand":    lambda: self._client.Lie2StandUp(),
-                "sit":             lambda: self._client.Sit(),
-                "balance_stand":   lambda: self._client.BalanceStand(1),
-                "continuous_gait": lambda: self._client.ContinuousGait(True),
-                "stop_gait":       lambda: self._client.ContinuousGait(False),
-                "high_stand":      lambda: self._client.HighStand(),
-                "low_stand":       lambda: self._client.LowStand(),
-            }
-            fn = mode_dispatch.get(mode)
-            if fn is None:
-                return {"error": f"Unknown mode: {mode}. Available: {list(mode_dispatch.keys())}"}
-            ret = fn()
-            return {"ret": ret, "mode": mode}
+            code, current_fsm = self._client.GetFsmId()
+
+            if code != 0:
+                return {"error": f"Cannot read current FSM state (code={code}). Aborting for safety."}
+
+            if mode == "emergency_stop":
+                ret = self._client.Damp()
+                return {"ret": ret, "mode": "emergency_stop",
+                        "warning": "Emergency damp executed regardless of state"}
+
+            elif mode == "get_current_mode":
+                FSM_DESCRIPTIONS = {
+                    0: "lying down, zero torque (零力矩, no resistance)",
+                    1: "lying down, damping (阻尼, resists movement)",
+                    2: "squatting (下蹲, position hold, stable)",
+                    3: "sitting (落座, needs external support, unstable)",
+                    500: "standing, normal locomotion (主运控, balanced)",
+                    501: "standing, 3DOF waist locomotion (balanced)",
+                    702: "prep stance (预备模式, stable low stance)",
+                    706: "balance stand (过渡态, intermediate)",
+                    801: "standing, running gait (跑步运控, balanced)",
+                }
+                desc = FSM_DESCRIPTIONS.get(current_fsm, f"unknown state")
+                return {"fsm_id": current_fsm, "description": desc}
+
+            elif mode == "lie2standup":
+                if current_fsm in self._STANDING_STATES:
+                    return {"info": "Robot is already standing", "fsm_id": current_fsm}
+                if current_fsm in self._UNSAFE_STATES:
+                    return {"error": f"Robot is in unsafe state (FSM={current_fsm}). Use emergency_stop first."}
+                # From ground: damp → lie2stand(702) → auto到500
+                if current_fsm in self._GROUND_STATES:
+                    steps = []
+                    if current_fsm == 0:
+                        steps.append(("Damp", 1, "damp"))
+                    steps.append(("Lie2StandUp", 500, "lie2standup"))
+                    return self._run_fsm_sequence(steps)
+                # From low states (squat/prep): start(500)
+                if current_fsm in self._LOW_STATES:
+                    steps = [("Start", 500, "start")]
+                    return self._run_fsm_sequence(steps)
+                return {"error": f"Cannot stand up from FSM={current_fsm}"}
+
+            elif mode == "standup2lie":
+                if current_fsm in self._GROUND_STATES:
+                    return {"info": "Robot is already on the ground", "fsm_id": current_fsm}
+                if current_fsm in self._STANDING_STATES:
+                    # Stop movement first, wait for stabilization
+                    self._client.StopMove()
+                    import time as _time; _time.sleep(1.0)
+                    steps = [("StandUp2Squat", 2, "standup2squat"), ("Damp", 1, "damp")]
+                    return self._run_fsm_sequence(steps)
+                if current_fsm in self._LOW_STATES:
+                    steps = [("Damp", 1, "damp")]
+                    return self._run_fsm_sequence(steps)
+                return {"error": f"Cannot lie down from FSM={current_fsm}. Use emergency_stop if needed."}
+
+            elif mode == "standup2squat":
+                if current_fsm in self._GROUND_STATES or current_fsm in self._LOW_STATES:
+                    return {"info": "Robot is already in low/ground state", "fsm_id": current_fsm}
+                if current_fsm in self._STANDING_STATES:
+                    self._client.StopMove()
+                    import time as _time; _time.sleep(1.0)
+                    steps = [("StandUp2Squat", 2, "standup2squat")]
+                    return self._run_fsm_sequence(steps)
+                return {"error": f"Cannot squat from FSM={current_fsm}. Use emergency_stop if needed."}
+
+            elif mode == "squat2standup":
+                if current_fsm in self._STANDING_STATES:
+                    return {"info": "Robot is already standing", "fsm_id": current_fsm}
+                if current_fsm in self._LOW_STATES:
+                    steps = [("Start", 500, "start")]
+                    return self._run_fsm_sequence(steps)
+                if current_fsm in self._GROUND_STATES:
+                    return {"error": f"Robot is on ground (FSM={current_fsm}). Use lie2standup instead."}
+                return {"error": f"Cannot stand from FSM={current_fsm}"}
+
+            elif mode in ("damp", "zero_torque"):
+                if current_fsm in self._STANDING_STATES or current_fsm in self._LOW_STATES:
+                    return {"error": f"Cannot enter {mode} from upright/low state (FSM={current_fsm}). "
+                                     f"Robot will collapse. Use standup2lie first."}
+                if current_fsm in self._UNSAFE_STATES:
+                    return {"error": f"Cannot enter {mode} from unsafe state (FSM={current_fsm}). "
+                                     f"Use emergency_stop first."}
+                fn = self._client.ZeroTorque if mode == "zero_torque" else self._client.Damp
+                ret = fn()
+                return {"ret": ret, "mode": mode}
+
+            else:
+                return {"error": f"Unknown mode: {mode}. Available: lie2standup, standup2lie, "
+                                 f"standup2squat, squat2standup, damp, zero_torque, "
+                                 f"emergency_stop, get_current_mode"}
         elif action == "switch_mode_expert":
             fid = int(args.get("fsm_id", 0))
             ret = self._client.SetFsmId(fid)
@@ -933,6 +1015,16 @@ class LocoPlugin:
             ret = self._client.ShakeHand()
             return {"ret": ret}
         return None
+
+    # ── FSM sequence helper ───────────────────────────────────────────────────
+
+    def _run_fsm_sequence(self, steps: list) -> dict:
+        """Execute FSM sequence in subprocess (no GIL contention).
+        steps = [(method_name, target_fsm_id_to_poll, step_name), ...]"""
+        result = self._client.RunFsmSequence(steps, interval=1.0, step_timeout=15.0)
+        if result is None:
+            return {"error": "RPC timeout during sequence execution"}
+        return result
 
 
 # ── AsrPlugin (sensor) ───────────────────────────────────────────────────────

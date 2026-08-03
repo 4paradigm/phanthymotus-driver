@@ -31,7 +31,7 @@ import rclpy.executors
 
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
-from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
+from rpc_proxy import RpcProxy
 from unitree_sdk2py.g1.arm.g1_arm_action_client import G1ArmActionClient
 from unitree_sdk2py.g1.slam.slam_client import SlamClient
 from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import MotionSwitcherClient
@@ -336,11 +336,9 @@ def main():
     audio_client.Init()
     print("[bundle] AudioClient ready")
 
-    # LocoClient (locomotion control)
-    loco_client = LocoClient()
-    loco_client.SetTimeout(10.0)
-    loco_client.Init()
-    print("[bundle] LocoClient ready")
+    # LocoClient (locomotion control) — via subprocess proxy to avoid GIL contention
+    loco_client = RpcProxy(network_iface)
+    print("[bundle] LocoClient ready (subprocess proxy)")
 
     # G1ArmActionClient (arm gestures)
     arm_client = G1ArmActionClient()
@@ -392,6 +390,7 @@ def main():
         if smart_motion:
             smart_motion.shutdown()
         _bundle.stop_all()
+        loco_client.stop()
         threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGTERM, _shutdown)
