@@ -84,6 +84,16 @@ _ARM_RIGHT_JOINTS = {
     27: "right_wrist_roll_joint",
 }
 
+# Rated motor currents from the Tianyi 2.0 joint specification table. These
+# values are used as the current limits in CmdSetMotorPosition commands.
+_RATED_MOTOR_CURRENT_A = {
+    1: 5.0, 2: 5.0, 3: 5.0,
+    11: 35.0, 12: 23.0, 13: 8.0, 14: 8.0,
+    15: 8.0, 16: 5.0, 17: 5.0,
+    21: 35.0, 22: 23.0, 23: 8.0, 24: 8.0,
+    25: 8.0, 26: 5.0, 27: 5.0,
+}
+
 _WAIST_JOINTS = {
     31: "waist_yaw_joint",
     32: "waist_pitch_joint",
@@ -983,7 +993,7 @@ class HeadPlugin:
                 cmd.name = motor_id
                 cmd.pos = _deg2rad(deg)
                 cmd.spd = 1.0  # rad/s
-                cmd.cur = 3.0  # A (max current)
+                cmd.cur = _RATED_MOTOR_CURRENT_A[motor_id]
                 cmds.append(cmd)
             msg.cmds = cmds
             self._publisher.publish(msg)
@@ -1396,7 +1406,7 @@ class HeadGesturePlugin:
                 cmd.name = motor_id
                 cmd.pos = _deg2rad(deg)
                 cmd.spd = speed_rad
-                cmd.cur = 3.0
+                cmd.cur = _RATED_MOTOR_CURRENT_A[motor_id]
                 msg.cmds.append(cmd)
             self._publisher.publish(msg)
             return {"state": "moving", "yaw": yaw_deg, "pitch": pitch_deg, "roll": roll_deg}
@@ -1713,10 +1723,11 @@ class ArmPlugin:
             for base_id, pose in sides:
                 for i, deg in enumerate(pose):
                     cmd = SetMotorPosition()
-                    cmd.name = base_id + i
+                    motor_id = base_id + i
+                    cmd.name = motor_id
                     cmd.pos = _deg2rad(deg)
                     cmd.spd = speed
-                    cmd.cur = 5.0
+                    cmd.cur = _RATED_MOTOR_CURRENT_A[motor_id]
                     cmds.append(cmd)
 
             msg.cmds = cmds
@@ -2244,7 +2255,7 @@ class ArmGesturePlugin:
                 "robot may not be Ready or self-check may be incomplete",
                 "arm controller may be disabled or rejecting commands",
                 "another node may be publishing competing /arm/cmd_pos commands",
-                "the configured 5A maximum current may be insufficient; verify with the robot vendor before increasing it",
+                "check joint load and mechanical interference; do not exceed the mapped vendor-rated current",
             ],
         )
 
@@ -2275,10 +2286,11 @@ class ArmGesturePlugin:
             for base_id, pose in selected:
                 for index, deg in enumerate(pose):
                     cmd = SetMotorPosition()
-                    cmd.name = base_id + index
+                    motor_id = base_id + index
+                    cmd.name = motor_id
                     cmd.pos = _deg2rad(float(deg))
                     cmd.spd = speed
-                    cmd.cur = 5.0
+                    cmd.cur = _RATED_MOTOR_CURRENT_A[motor_id]
                     msg.cmds.append(cmd)
             self._publisher.publish(msg)
             return {"state": "moving", "side": side, "joints": len(msg.cmds)}

@@ -26,6 +26,16 @@ tested lower-gain and original-default combinations while excluding zero
 position stiffness and the previous unverified extreme upper bounds. These are
 still not vendor-certified gains.
 
+`move_pos` uses the rated-current limits from the Tianyi joint specification
+table instead of one fixed current for every arm motor. In joint order, each
+arm uses `[35, 23, 8, 8, 8, 5, 5]` A for shoulder pitch, shoulder roll,
+shoulder yaw, elbow pitch, wrist yaw, wrist pitch, and wrist roll. The same
+limits apply to left motor IDs 11-17 and right motor IDs 21-27. Raw and semantic
+head position commands use 5 A for motor IDs 1-3. `move_ctrl` has no current
+field and is unaffected by this mapping. Do not increase these values beyond
+the specification; clear the workspace and keep the emergency stop available
+when validating the higher-current shoulder joints.
+
 `move_ctrl` sends a position step with target speed and feed-forward torque set
 to zero. The vendor-side controller applies `kp` and `kd`; this driver does not
 calculate the PD output or impose a trajectory speed limit. Use small target
