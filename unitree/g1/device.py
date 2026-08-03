@@ -22,6 +22,7 @@ import json
 import queue
 import socket
 import struct
+import subprocess
 import threading
 import time
 
@@ -188,7 +189,12 @@ class MicPlugin:
         return None
 
     def _self_check(self) -> tuple[str, str]:
-        """Verify mic pipeline: multicast receiving + ROS2 topic subscribable."""
+        """Verify mic pipeline: multicast receiving + ROS2 topic subscribable.
+
+        Check 1: multicast packets arriving (in-process).
+        Check 2: ROS2 topic receivable from a subprocess (avoids same-process
+                 FastDDS intra-participant matching issues).
+        """
         import time as _t
 
         # Check 1: multicast receiving
@@ -200,19 +206,35 @@ class MicPlugin:
             self._node.state = "error"
             return "error", "no multicast packets received in 3s"
 
-        # Check 2: ROS2 topic loopback — subscribe to own topic and verify data arrives
-        received = [False]
-        def _cb(msg):
-            received[0] = True
-        test_sub = self._node.create_subscription(AudioChunk, self._topic, _cb, _LOW_LAT_QOS)
-        deadline = _t.monotonic() + 2.0
-        while _t.monotonic() < deadline and not received[0]:
-            _t.sleep(0.1)
-        self._node.destroy_subscription(test_sub)
-
-        if not received[0]:
+        # Check 2: ROS2 topic receivable — use subprocess to avoid same-process DDS issues
+        check_script = (
+            "import sys, rclpy, time;"
+            "from rclpy.node import Node;"
+            "from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy;"
+            "from audio_msgs.msg import AudioChunk;"
+            "rclpy.init();"
+            "n = Node('_mic_check');"
+            "qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,"
+            "history=HistoryPolicy.KEEP_LAST, depth=10, durability=DurabilityPolicy.VOLATILE);"
+            "ok = [False];"
+            "n.create_subscription(AudioChunk, sys.argv[1], lambda m: ok.__setitem__(0, True), qos);"
+            "dl = time.monotonic() + 3.0;"
+            "\nwhile time.monotonic() < dl and not ok[0]: rclpy.spin_once(n, timeout_sec=0.1)\n"
+            "rclpy.shutdown();"
+            "sys.exit(0 if ok[0] else 1)"
+        )
+        try:
+            result = subprocess.run(
+                ["python3", "-c", check_script, self._topic],
+                timeout=5,
+                capture_output=True,
+            )
+            if result.returncode != 0:
+                self._node.state = "error"
+                return "error", "topic published but not receivable via ROS2"
+        except (subprocess.TimeoutExpired, Exception) as e:
             self._node.state = "error"
-            return "error", "topic published but not receivable via ROS2"
+            return "error", f"ROS2 subscribe check failed: {e}"
 
         self._node.state = "running"
         return "running", ""
@@ -285,7 +307,7 @@ APP_NAME = "g1_speaker"
 
 
 class _SpeakerNode(Node):
-    PREFILL = 5       # buffer 5 chunks (~500ms) before starting playback
+    PREFILL = 3       # buffer 3 chunks (~300ms) before starting playback
     MERGE_BYTES = 9600  # merge into ~300ms blocks before calling PlayStream
 
     def __init__(self, audio_client: AudioClient):
@@ -347,9 +369,6 @@ class _SpeakerNode(Node):
     def _on_chunk(self, msg: AudioChunk) -> None:
         pcm = bytes(msg.data)
         self._idx += 1
-        self.get_logger().info(
-            f"[speaker] chunk #{self._idx}: {len(pcm)} bytes, format={msg.format}"
-        )
         self._buf.put(pcm)
         self._last_chunk_time = time.monotonic()
         if not self._draining.is_set() and self._buf.qsize() >= self.PREFILL:
@@ -376,11 +395,9 @@ class _SpeakerNode(Node):
         if not self._draining.is_set() and not self._buf.empty():
             idle = time.monotonic() - self._last_chunk_time
             if idle >= 0.15:
-                self.get_logger().info(f"[speaker] flush timer triggered, {self._buf.qsize()} chunks buffered")
                 self._start_drain()
 
     def _drain(self) -> None:
-        self.get_logger().info(f"[speaker] drain started, buffered {self._buf.qsize()} chunks")
         play_idx = 0
         merged = b''
         empty_count = 0
@@ -488,6 +505,8 @@ class SpeakerPlugin:
             topic = args.get("input_topic", "")
             if not topic:
                 return {"error": "Missing input_topic"}
+            # Always stop first to ensure clean restart and startup sound plays
+            self._node.stop_play()
             # Play startup sound in background
             threading.Thread(target=self._play_startup_sound, daemon=True).start()
             topic = self._node.start_play(topic)

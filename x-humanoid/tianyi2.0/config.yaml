@@ -16,7 +16,11 @@ plugins:
     enabled: true
   head:
     enabled: true
+  head_gesture:
+    enabled: true
   arm:
+    enabled: true
+  arm_gesture:
     enabled: true
   waist:
     enabled: true
