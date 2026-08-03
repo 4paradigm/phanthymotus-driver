@@ -574,6 +574,7 @@ class ExtMicPlugin:
         self._namespace = namespace
         self._executor = executor
         self._nodes: dict[str, _ExtMicNode] = {}
+        self._instance_configs: dict[str, dict] = {}  # instance_id → saved config params
         self._available_devices = _enumerate_ext_mics()
         log.info(f"[ext_mic] found {len(self._available_devices)} external mic device(s)")
         for d in self._available_devices:
@@ -627,6 +628,10 @@ class ExtMicPlugin:
                 raise ValueError("instance_id is required for multiInstance tool")
             device_id = args.get("device_index")  # alsa_id string like "hw:0,0" or integer index
             device_name = args.get("device_name", "")
+            # Fallback to saved config from prior 'config' action
+            if not device_id and instance_id in self._instance_configs:
+                device_id = self._instance_configs[instance_id].get("device_index")
+                device_name = device_name or self._instance_configs[instance_id].get("device_name", "")
             if not device_id:
                 # Try to pick first available device
                 if self._available_devices:
@@ -659,6 +664,14 @@ class ExtMicPlugin:
                     del self._nodes[key]
                 return {"state": "idle"}
             return {"state": "idle"}
+
+        elif action == "config":
+            # Save instance config params for later use during start
+            if instance_id:
+                self._instance_configs[instance_id] = {
+                    k: v for k, v in args.items() if k not in ('action', 'instance_id')
+                }
+            return {"configured": True, "instance_id": instance_id}
 
         return None
 
