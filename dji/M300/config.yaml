@@ -1,0 +1,43 @@
+mcp_port: 15702
+ros_namespace: ""   # 留空则自动使用 hostname
+name: "DJI Matrice 300 RTK"
+
+# PSDK bridge settings
+psdk_bridge:
+  app_name: "PhanthyMotus"
+  app_id: "190076"
+  app_key: "26af38fb6126f58c195b5c8da0b481c"
+  app_license: "Y4wiW8E6tI2TmZoEkAt7jUM0Oqu3gJM1fNBoXKJO/fzlvYhPMUpxTP9qIB0w5KPrJ5XUkL8ImoxiVesgjEJ5FMe43KqbL8YrUQCK8i8xWVmEMQh0+ADPpfmBi7IAm43PzlJezFYSw6CfO1TjLuRNqLFs3y+LnAh95x5g7DCIaKGUSzPBjORgqRL/wbYngLBOedJtTOIq9T0zB1M922ffvubT2RoRCjhFWb9T6l3V3C2W15JlQ0hRCADyvvHhA2qI7ITq8YXTHktc8yAiRtTVC4+IOqQppkJfxvpE+n810/4vt1xfXKLtIuZxaUcMZY/Q3oEvbV4ZL2AKpiuFRwoz5g=="
+  baud_rate: 921600
+  # The connected Nano exposes the M300 PSDK link as this FTDI UART.
+  # Keep this explicit: automatic selection can pick an unrelated USB serial device.
+  uart_dev: "/dev/ttyUSB0"
+  usb_vid: "0403"
+  network_iface: "usb0"
+
+plugins:
+  telemetry:
+    enabled: true
+    publish_rate: 10   # Hz
+  camera_stream:
+    enabled: true
+    fps: 10
+    # M300 uses the currently mounted payload on port 1 (for example H20/H20T).
+    camera_source: "default"
+  perception:
+    enabled: true
+  hms:
+    enabled: true
+  flight:
+    enabled: true
+  camera:
+    enabled: true
+  gimbal:
+    enabled: true
+  waypoint:
+    # The migrated Mavic implementation emits Waypoint V3/KMZ, which DJI only
+    # supports on M30/Mavic 3-series. M300 requires a native Waypoint V2
+    # mission builder, so do not expose an unsafe, incompatible card.
+    enabled: false
+  time_sync:
+    enabled: true
