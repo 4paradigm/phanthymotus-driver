@@ -510,6 +510,8 @@ class SpeakerPlugin:
             topic = args.get("input_topic", "")
             if not topic:
                 return {"error": "Missing input_topic"}
+            # Always stop first to ensure clean restart and startup sound plays
+            self._node.stop_play()
             # Play startup sound in background
             threading.Thread(target=self._play_startup_sound, daemon=True).start()
             topic = self._node.start_play(topic)
