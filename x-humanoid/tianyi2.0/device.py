@@ -1411,6 +1411,13 @@ class HeadGesturePlugin:
 class ArmPlugin:
     """双臂14DOF控制 (位置模式 / 力位混合)"""
 
+    # Conservative raw-control starting gains. The vendor-side controller
+    # applies these gains; this driver does not rate-limit the position step.
+    _DEFAULT_KP = 10.0
+    _DEFAULT_KD = 8.0
+    _KP_RANGE = (5.0, 100.0)
+    _KD_RANGE = (5.0, 30.0)
+
     _JOINT_NAMES = [
         "shoulder_pitch", "shoulder_roll", "shoulder_yaw",
         "elbow_pitch", "wrist_yaw", "wrist_pitch", "wrist_roll",
@@ -1459,14 +1466,14 @@ class ArmPlugin:
                     "speed": {"type": "number", "minimum": 0.2, "maximum": 1.5,
                               "default": 0.5,
                               "description": "运动速度(rad/s), 范围[0.2, 1.5], 默认0.5"},
-                    "kp": {"type": "array", "items": {"type": "number", "minimum": 0, "maximum": 2000},
+                    "kp": {"type": "array", "items": {"type": "number", "minimum": 5, "maximum": 100},
                            "minItems": 7, "maxItems": 7,
-                           "default": [200, 200, 200, 200, 200, 200, 200],
-                           "description": "位置增益(7个), 范围[0,2000], 默认值200"},
-                    "kd": {"type": "array", "items": {"type": "number", "minimum": 0, "maximum": 300},
+                           "default": [10, 10, 10, 10, 10, 10, 10],
+                           "description": "位置增益(7个), 范围[5,100], 默认10；move_ctrl无速度限制，仅建议小角度低增益调试"},
+                    "kd": {"type": "array", "items": {"type": "number", "minimum": 5, "maximum": 30},
                            "minItems": 7, "maxItems": 7,
-                           "default": [20, 20, 20, 20, 20, 20, 20],
-                           "description": "速度增益(7个), 范围[0,300], 默认值20"},
+                           "default": [8, 8, 8, 8, 8, 8, 8],
+                           "description": "速度阻尼增益(7个), 范围[5,30], 默认8"},
                 },
                 "required": ["action"],
                 "x-action-params": {
@@ -1519,8 +1526,8 @@ class ArmPlugin:
             return result
         elif action == "move_ctrl":
             poses = self._requested_poses(args)
-            kp = args.get("kp", [200] * 7)
-            kd = args.get("kd", [20] * 7)
+            kp = args.get("kp", [self._DEFAULT_KP] * 7)
+            kd = args.get("kd", [self._DEFAULT_KD] * 7)
             validated = self._validate_command(
                 poses, kp=kp, kd=kd)
             if isinstance(validated, dict):
@@ -1666,7 +1673,8 @@ class ArmPlugin:
                         "code": "arm_speed_out_of_range", "speed": speed}
             return converted_poses, speed
         for name, values, lower, upper in (
-                ("kp", kp, 0, 2000), ("kd", kd, 0, 300)):
+                ("kp", kp, *cls._KP_RANGE),
+                ("kd", kd, *cls._KD_RANGE)):
             values, error = cls._decode_array_argument(values, name)
             if error is not None:
                 return error
@@ -1733,8 +1741,8 @@ class ArmPlugin:
                     cmd.pos = _deg2rad(deg)
                     cmd.spd = 0.0
                     cmd.tor = 0.0
-                    cmd.kp = kp[i] if i < len(kp) else 200.0
-                    cmd.kd = kd[i] if i < len(kd) else 20.0
+                    cmd.kp = kp[i] if i < len(kp) else self._DEFAULT_KP
+                    cmd.kd = kd[i] if i < len(kd) else self._DEFAULT_KD
                     cmds.append(cmd)
 
             msg.cmds = cmds

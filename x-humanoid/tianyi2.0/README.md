@@ -20,7 +20,15 @@ input is never mirrored automatically. To create a mirrored right-arm pose manua
 shoulder roll, shoulder yaw, wrist yaw, and wrist roll (indices 1, 2, 4, and 6)
 from the left pose. Right-arm motor IDs are 21-27 and left-arm IDs are 11-17.
 `move_pos` accepts speed [0.2, 1.5] rad/s. `move_ctrl` accepts seven-element
-`kp` [0, 2000] and `kd` [0, 300] arrays shared by the selected arms.
+`kp` [5, 100] and `kd` [5, 30] arrays shared by both arms. Conservative raw
+control defaults are `kp=10` and `kd=8` for every joint; these are test
+starting points, not vendor-certified gains.
+
+`move_ctrl` sends a position step with target speed and feed-forward torque set
+to zero. The vendor-side controller applies `kp` and `kd`; this driver does not
+calculate the PD output or impose a trajectory speed limit. Use small target
+changes, begin with low gains, keep the emergency stop available, and use
+`move_pos` when bounded motion speed is required.
 
 Both modes reject malformed arrays and poses outside the checked-in URDF
 limits. They check fresh `/arm/status`, selected motor faults, emergency stop,
