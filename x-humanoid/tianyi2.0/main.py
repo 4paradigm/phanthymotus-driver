@@ -94,6 +94,7 @@ class DualDomainROS2:
 
 class TianyiDeviceBundle:
     def __init__(self, cfg: dict, namespace: str, ros2: DualDomainROS2, slamtec_client):
+        self._cfg = cfg
         self._plugins: list = []
         plugins_cfg = cfg.get("plugins", {})
 
@@ -162,6 +163,11 @@ class TianyiDeviceBundle:
             from controlled_spatial import ControlledSpatialPlugin
             self._plugins.append(ControlledSpatialPlugin(plugins_cfg["controlled_spatial"], namespace, ros2, slamtec_client))
             print("[bundle] ControlledSpatialPlugin loaded")
+
+        if plugins_cfg.get("diagnostic", {}).get("enabled", False):
+            from device import DiagnosticPlugin
+            self._plugins.append(DiagnosticPlugin(plugins_cfg["diagnostic"], namespace, ros2))
+            print("[bundle] DiagnosticPlugin loaded")
 
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
@@ -270,7 +276,7 @@ def make_handler():
                     ok({
                         "protocolVersion": "2024-11-05",
                         "capabilities": {"tools": {}},
-                        "serverInfo": {"name": cfg.get("name", "tianyi2-device-bundle"), "version": "1.0.0"},
+                        "serverInfo": {"name": _bundle._cfg.get("name", "tianyi2-device-bundle"), "version": "1.0.0"},
                     })
                 elif method == "tools/list":
                     ok({"tools": _bundle.get_all_tools()})
