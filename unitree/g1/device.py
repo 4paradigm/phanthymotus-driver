@@ -307,7 +307,7 @@ APP_NAME = "g1_speaker"
 
 
 class _SpeakerNode(Node):
-    PREFILL = 5       # buffer 5 chunks (~500ms) before starting playback
+    PREFILL = 3       # buffer 3 chunks (~300ms) before starting playback
     MERGE_BYTES = 9600  # merge into ~300ms blocks before calling PlayStream
 
     def __init__(self, audio_client: AudioClient):
@@ -369,9 +369,6 @@ class _SpeakerNode(Node):
     def _on_chunk(self, msg: AudioChunk) -> None:
         pcm = bytes(msg.data)
         self._idx += 1
-        self.get_logger().info(
-            f"[speaker] chunk #{self._idx}: {len(pcm)} bytes, format={msg.format}"
-        )
         self._buf.put(pcm)
         self._last_chunk_time = time.monotonic()
         if not self._draining.is_set() and self._buf.qsize() >= self.PREFILL:
@@ -398,11 +395,9 @@ class _SpeakerNode(Node):
         if not self._draining.is_set() and not self._buf.empty():
             idle = time.monotonic() - self._last_chunk_time
             if idle >= 0.15:
-                self.get_logger().info(f"[speaker] flush timer triggered, {self._buf.qsize()} chunks buffered")
                 self._start_drain()
 
     def _drain(self) -> None:
-        self.get_logger().info(f"[speaker] drain started, buffered {self._buf.qsize()} chunks")
         play_idx = 0
         merged = b''
         empty_count = 0
