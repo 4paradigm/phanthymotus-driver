@@ -248,7 +248,7 @@ class CameraStreamPlugin:
 
         if action == "config":
             self._instance_configs[instance_id] = args
-            camera = args.get("camera_source", "default")
+            camera = "default"
             # If stream is running and camera changed, restart it
             if instance_id in self._nodes:
                 node = self._nodes[instance_id]
@@ -260,8 +260,7 @@ class CameraStreamPlugin:
             return {"ok": True, "camera": camera}
 
         # Resolve camera from cached instance config
-        cfg = self._instance_configs.get(instance_id, {})
-        camera = args.get("camera_source") or cfg.get("camera_source", "default")
+        camera = "default"
 
         if action == "info":
             safe_id = instance_id.replace("-", "_")
@@ -431,7 +430,7 @@ class _HmsNode(Node):
     def _tick(self):
         try:
             resp = self._bridge.get_hms_info()
-            if resp.get("ok") and resp["data"].get("alerts"):
+            if resp.get("ok"):
                 msg = String()
                 msg.data = json.dumps(resp["data"], separators=(",", ":"))
                 self._pub.publish(msg)

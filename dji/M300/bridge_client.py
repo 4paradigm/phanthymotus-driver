@@ -366,8 +366,8 @@ class BridgeClient:
 
     def _mock_get_aircraft_info(self, args: dict) -> dict:
         return {"ok": True, "data": {
-            "product_name": "Mavic 3 Enterprise",
-            "firmware_version": "07.01.20.01",
+            "product_name": "Matrice 300 RTK",
+            "firmware_version": "M300-PSDK",
             "serial_number": "MOCK0000000001",
         }}
 
