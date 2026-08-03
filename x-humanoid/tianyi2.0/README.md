@@ -27,6 +27,10 @@ and power state before publishing, then wait for newer feedback. Do not command
 the raw `arm` and `arm_gesture` cards concurrently because both can publish to
 `/arm/cmd_pos`.
 
+For compatibility with dashboard array fields, `positions`, `kp`, and `kd`
+accept either native JSON arrays or strings containing a JSON array. Both forms
+are decoded into seven numeric values before the same range and URDF checks run.
+
 ## Head gesture card
 
 `head_gesture` turns safe, bounded head-position commands into cancellable

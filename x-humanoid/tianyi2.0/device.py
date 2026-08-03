@@ -1607,12 +1607,37 @@ class ArmPlugin:
             })
         return targets
 
+    @staticmethod
+    def _decode_array_argument(value, name: str):
+        """Accept native arrays and JSON-array strings emitted by the dashboard."""
+        if not isinstance(value, str):
+            return value, None
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError as exc:
+            return None, {
+                "state": "error",
+                "error": f"{name} must be a valid JSON array",
+                "code": f"invalid_arm_{name}",
+                "parse_error": str(exc),
+            }
+        if not isinstance(decoded, list):
+            return None, {
+                "state": "error",
+                "error": f"{name} JSON value must be an array",
+                "code": f"invalid_arm_{name}",
+            }
+        return decoded, None
+
     @classmethod
     def _validate_command(
             cls, side, positions, speed=None, kp=None, kd=None):
         if side not in ("left", "right", "both"):
             return {"state": "error", "error": "side must be left, right or both",
                     "code": "invalid_arm_side"}
+        positions, error = cls._decode_array_argument(positions, "positions")
+        if error is not None:
+            return error
         if not isinstance(positions, (list, tuple)) or len(positions) != 7:
             return {"state": "error",
                     "error": "positions must have exactly 7 values (degrees)",
@@ -1644,6 +1669,9 @@ class ArmPlugin:
             return pose, speed
         for name, values, lower, upper in (
                 ("kp", kp, 0, 2000), ("kd", kd, 0, 300)):
+            values, error = cls._decode_array_argument(values, name)
+            if error is not None:
+                return error
             if not isinstance(values, (list, tuple)) or len(values) != 7:
                 return {"state": "error", "error": f"{name} must have exactly 7 values",
                         "code": f"invalid_arm_{name}"}
