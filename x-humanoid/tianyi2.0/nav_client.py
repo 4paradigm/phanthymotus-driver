@@ -28,25 +28,36 @@ class SlamtecClient:
         req = urllib.request.Request(url, method="GET")
         try:
             with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
-                result = json.loads(resp.read())
+                resp_body = resp.read()
+                if not resp_body:
+                    return {}
+                result = json.loads(resp_body)
                 if isinstance(result, dict):
                     return result
+                if isinstance(result, list):
+                    return {"raw": result}
+                # BooleanResponse / IntegerResponse: raw boolean or integer
                 return {"raw": result}
         except urllib.error.URLError as e:
             return {"error": str(e)}
         except Exception as e:
             return {"error": str(e)}
 
-    def _post(self, path: str, body: dict) -> dict:
+    def _post(self, path: str, body) -> dict:
         url = f"{self._base}{path}"
         data = json.dumps(body).encode()
         req = urllib.request.Request(url, data=data, method="POST",
                                      headers={"Content-Type": "application/json"})
         try:
             with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
-                result = json.loads(resp.read())
+                resp_body = resp.read()
+                if not resp_body:
+                    return {}
+                result = json.loads(resp_body)
                 if isinstance(result, dict):
                     return result
+                if isinstance(result, list):
+                    return {"raw": result}
                 return {"raw": result}
         except urllib.error.HTTPError as e:
             # Extract response body for detailed error info (e.g. 400 Bad Request)
@@ -61,16 +72,21 @@ class SlamtecClient:
         except Exception as e:
             return {"error": str(e)}
 
-    def _put(self, path: str, body: dict) -> dict:
+    def _put(self, path: str, body) -> dict:
         url = f"{self._base}{path}"
         data = json.dumps(body).encode()
         req = urllib.request.Request(url, data=data, method="PUT",
                                      headers={"Content-Type": "application/json"})
         try:
             with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
-                result = json.loads(resp.read())
+                resp_body = resp.read()
+                if not resp_body:
+                    return {}
+                result = json.loads(resp_body)
                 if isinstance(result, dict):
                     return result
+                if isinstance(result, list):
+                    return {"raw": result}
                 return {"raw": result}
         except urllib.error.HTTPError as e:
             detail = ""
@@ -95,6 +111,8 @@ class SlamtecClient:
                 result = json.loads(body)
                 if isinstance(result, dict):
                     return result
+                if isinstance(result, list):
+                    return {"raw": result}
                 return {"raw": result}
         except urllib.error.HTTPError as e:
             detail = ""
@@ -359,3 +377,91 @@ class SlamtecClient:
     def cancel_action(self) -> dict:
         """取消当前导航/运动动作"""
         return self._delete("/api/core/motion/v1/actions/:current")
+
+    # ── Artifacts (虚拟墙/轨道/区域) ────────────────────────────────────────────
+
+    def get_lines(self, usage: str) -> dict:
+        """获取虚拟线段。usage: 'tracks' 虚拟轨道, 'walls' 虚拟墙"""
+        return self._get(f"/api/core/artifact/v1/lines/{usage}")
+
+    def add_lines(self, usage: str, lines: list[dict]) -> dict:
+        """添加虚拟线段。usage: 'tracks'/'walls', lines: [{start:{x,y}, end:{x,y}, metadata:{}}]"""
+        return self._post(f"/api/core/artifact/v1/lines/{usage}", lines)
+
+    def modify_lines(self, usage: str, lines: list[dict]) -> dict:
+        """修改虚拟线段。lines 需包含有效 id"""
+        return self._put(f"/api/core/artifact/v1/lines/{usage}", lines)
+
+    def clear_lines(self, usage: str) -> dict:
+        """清空某一类虚拟线段"""
+        return self._delete(f"/api/core/artifact/v1/lines/{usage}")
+
+    def remove_line(self, usage: str, line_id: int) -> dict:
+        """删除指定虚拟线段"""
+        return self._delete(f"/api/core/artifact/v1/lines/{usage}/{line_id}")
+
+    def get_rectangle_areas(self, usage: str) -> dict:
+        """获取矩形区域。usage: forbidden_area/elevator_area/dangerous_area/coverage_area/maintenance_area/sensor_disable_area/restricted_area"""
+        return self._get(f"/api/core/artifact/v1/rectangle-areas/{usage}")
+
+    def add_rectangle_area(self, usage: str, area: dict, metadata: dict | None = None) -> dict:
+        """添加矩形区域。area: {start:{x,y}, end:{x,y}, half_width:float}
+        metadata: 区域元数据，API要求必须提供（可为空对象{}）"""
+        body: dict = {"area": area, "metadata": metadata if metadata is not None else {}}
+        return self._post(f"/api/core/artifact/v1/rectangle-areas/{usage}", body)
+
+    def edit_rectangle_area(self, usage: str, area_id: int, area: dict | None = None, metadata: dict | None = None) -> dict:
+        """编辑矩形区域"""
+        body: dict = {}
+        if area is not None:
+            body["area"] = area
+        if metadata is not None:
+            body["metadata"] = metadata
+        return self._put(f"/api/core/artifact/v1/rectangle-areas/{usage}/{area_id}", body)
+
+    def clear_rectangle_areas(self, usage: str) -> dict:
+        """清空某一类矩形区域"""
+        return self._delete(f"/api/core/artifact/v1/rectangle-areas/{usage}")
+
+    def remove_rectangle_area(self, usage: str, area_id: int) -> dict:
+        """删除指定矩形区域"""
+        return self._delete(f"/api/core/artifact/v1/rectangle-areas/{usage}/{area_id}")
+
+    # ── Artifacts — POI (地图兴趣点) ────────────────────────────────────────────
+
+    def get_pois(self) -> dict:
+        """获取当前地图中的所有POI"""
+        return self._get("/api/core/artifact/v1/pois")
+
+    def add_poi(self, poi: dict) -> dict:
+        """添加POI。poi: {id: uuid, pose?: {x,y,yaw}, metadata: {display_name, type, ...}}
+        建图时建议不包含pose，底盘会用机器人当前位置创建POI并记录传感器观测信息，闭环后自动调整位姿。"""
+        return self._post("/api/core/artifact/v1/pois", poi)
+
+    def adjust_pois(self) -> dict:
+        """优化POI位姿（建图闭环后调用，减少位姿调整误差）"""
+        return self._post("/api/core/artifact/v1/pois/:adjust", {})
+
+    def get_poi(self, poi_id: str) -> dict:
+        """根据ID查找POI"""
+        return self._get(f"/api/core/artifact/v1/pois/{poi_id}")
+
+    def modify_poi(self, poi_id: str, pose: dict | None = None, metadata: dict | None = None) -> dict:
+        """修改POI。pose使用Pose3D格式(x,y,z,yaw,pitch,roll)，z/pitch/roll默认0。"""
+        body: dict = {}
+        if pose is not None:
+            # API requires Pose3D (x,y,z,yaw,pitch,roll); fill defaults for 2D input
+            p3d = {"x": pose.get("x", 0), "y": pose.get("y", 0), "z": pose.get("z", 0),
+                    "yaw": pose.get("yaw", 0), "pitch": pose.get("pitch", 0), "roll": pose.get("roll", 0)}
+            body["pose"] = p3d
+        if metadata is not None:
+            body["metadata"] = metadata
+        return self._put(f"/api/core/artifact/v1/pois/{poi_id}", body)
+
+    def delete_poi(self, poi_id: str) -> dict:
+        """删除POI"""
+        return self._delete(f"/api/core/artifact/v1/pois/{poi_id}")
+
+    def clear_pois(self) -> dict:
+        """清空所有POI"""
+        return self._delete("/api/core/artifact/v1/pois")

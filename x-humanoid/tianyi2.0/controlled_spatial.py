@@ -11,6 +11,12 @@ controlled_spatial — 天轶2.0 人工控制建图与导航插件。
 7. load_map(map_name) → 载入地图
 8. navigate_to_tag(tag_name) → 导航到指定 tag
 
+Artifact 功能（地图语义元素）：
+9. list_walls / add_wall / remove_wall / clear_walls — 虚拟墙管理
+10. list_tracks / add_track / remove_track / clear_tracks — 虚拟轨道管理
+11. list_areas / add_area / edit_area / remove_area / clear_areas — 矩形区域管理
+12. list_artifact_pois / add_artifact_poi / remove_artifact_poi / clear_artifact_pois — 地图POI管理
+
 差异：G1 使用 DDS RPC (unitree_sdk2py.SlamClient)，tianyi2.0 使用 HTTP REST API。
 """
 
@@ -20,6 +26,7 @@ import os
 import threading
 import time
 import sqlite3
+import uuid
 from typing import Optional
 
 
@@ -183,7 +190,8 @@ class ControlledSpatialPlugin:
             "multiInstance": False,
             "description": (
                 "Controlled mapping & navigation via Slamtec底盘 HTTP REST API — "
-                "start/stop mapping, tag places, list/delete maps, load map, navigate between tags."
+                "start/stop mapping, tag places, list/delete maps, load map, navigate between tags, "
+                "manage virtual walls/tracks/areas (artifacts)."
             ),
             "inputSchema": {
                 "type": "object",
@@ -198,6 +206,15 @@ class ControlledSpatialPlugin:
                             "navigate_to_tag", "navigate_to_pose",
                             "wait_navigation_done",
                             "pause_nav", "stop_nav",
+                            # Artifact — 虚拟墙
+                            "list_walls", "add_wall", "remove_wall", "clear_walls",
+                            # Artifact — 虚拟轨道
+                            "list_tracks", "add_track", "remove_track", "clear_tracks",
+                            # Artifact — 矩形区域
+                            "list_areas", "add_area", "edit_area", "remove_area", "clear_areas",
+                            # Artifact — 地图POI
+                            "list_artifact_pois", "add_artifact_poi", "remove_artifact_poi", "clear_artifact_pois",
+                            "get_pose", "get_localization_quality",
                         ],
                         "description": "Action to perform",
                     },
@@ -216,6 +233,38 @@ class ControlledSpatialPlugin:
                     "strategy": {"type": "string", "description": "Motion strategy: default, depot, inventory, delivery, low_speed"},
                     "ignore_dynamic_obstacles": {"type": "boolean", "description": "Ignore dynamic obstacles during path planning (default true)"},
                     "precise": {"type": "boolean", "description": "Enable precise navigation mode (default false)"},
+                    # Artifact params
+                    "artifact_id": {"type": "integer", "description": "Artifact element ID (for remove/edit)"},
+                    "start_x": {"type": "number", "description": "Line/area start X coordinate (meters)"},
+                    "start_y": {"type": "number", "description": "Line/area start Y coordinate (meters)"},
+                    "end_x": {"type": "number", "description": "Line/area end X coordinate (meters)"},
+                    "end_y": {"type": "number", "description": "Line/area end Y coordinate (meters)"},
+                    "half_width": {"type": "number", "description": "Rectangle area half-width (meters)"},
+                    "area_usage": {
+                        "type": "string",
+                        "enum": ["forbidden_area", "elevator_area", "dangerous_area", "coverage_area", "maintenance_area", "sensor_disable_area", "restricted_area"],
+                        "description": "Rectangle area usage type",
+                    },
+                    "metadata": {"type": "object", "description": "Artifact metadata (key-value pairs, values as strings). For rectangle areas, auto-built if omitted — see area-specific params below."},
+                    "lines": {
+                        "type": "array",
+                        "description": "Array of line objects for batch add/modify: [{id, start:{x,y}, end:{x,y}, metadata:{}}]",
+                        "items": {"type": "object"},
+                    },
+                    "poi_id": {"type": "string", "description": "Artifact POI UUID"},
+                    "display_name": {"type": "string", "description": "Artifact POI display name (in metadata)"},
+                    "poi_type": {"type": "string", "description": "Artifact POI type (in metadata)"},
+                    # Area-specific metadata params (used when metadata is not explicitly provided)
+                    "escape_distance": {"type": "number", "description": "Forbidden area: escape distance in meters (default 0.4)"},
+                    "dangerous_area_type": {"type": "string", "enum": ["0", "1"], "description": "Dangerous area type: 0=slope, 1=narrow corridor"},
+                    "max_line_speed": {"type": "number", "description": "Dangerous area: max line speed in m/s"},
+                    "elevator_id": {"type": "string", "description": "Elevator area: elevator device serial (UUID)"},
+                    "elevator_sill_width": {"type": "number", "description": "Elevator area: sill width in meters (default 0.4)"},
+                    "elevator_scheduling_point_dist": {"type": "number", "description": "Elevator area: scheduling point distance from door in meters (default 1)"},
+                    "elevator_door_type": {"type": "string", "enum": ["0", "1", "2"], "description": "Elevator area: door direction 0=front, 1=back, 2=both"},
+                    "sensor_type": {"type": "string", "description": "Sensor disable area: sensor types e.g. '[0,3]' (0=bump,1=fall,2=ultrasonic,3=depth)"},
+                    "restricted_robots_number_limit": {"type": "integer", "description": "Restricted area: max simultaneous robots"},
+                    "restricted_scheduling_points": {"type": "string", "description": "Restricted area: scheduling points JSON string"},
                 },
                 "required": ["action"],
                 "x-action-params": {
@@ -232,6 +281,30 @@ class ControlledSpatialPlugin:
                     "wait_navigation_done": {"params": ["stall_timeout"], "description": "Block until navigation completes or robot is stuck (no movement for stall_timeout seconds). Must be called after navigate_to_tag or navigate_to_pose."},
                     "pause_nav": {"params": [], "description": "Pause navigation"},
                     "stop_nav": {"params": [], "description": "Stop and cancel navigation"},
+                    # Artifact — 虚拟墙
+                    "list_walls": {"params": [], "description": "List all virtual walls on current map"},
+                    "add_wall": {"params": ["start_x", "start_y", "end_x", "end_y"], "description": "Add a virtual wall (forbidden line segment on the map)"},
+                    "remove_wall": {"params": ["artifact_id"], "description": "Remove a virtual wall by ID"},
+                    "clear_walls": {"params": [], "description": "Remove all virtual walls"},
+                    # Artifact — 虚拟轨道
+                    "list_tracks": {"params": [], "description": "List all virtual tracks on current map"},
+                    "add_track": {"params": ["start_x", "start_y", "end_x", "end_y"], "description": "Add a virtual track (path constraint line segment)"},
+                    "remove_track": {"params": ["artifact_id"], "description": "Remove a virtual track by ID"},
+                    "clear_tracks": {"params": [], "description": "Remove all virtual tracks"},
+                    # Artifact — 矩形区域
+                    "list_areas": {"params": ["area_usage"], "description": "List rectangle areas of given type (forbidden_area/elevator_area/dangerous_area/coverage_area/maintenance_area/sensor_disable_area/restricted_area)"},
+                    "add_area": {"params": ["area_usage", "start_x", "start_y", "end_x", "end_y", "half_width", "metadata", "escape_distance", "dangerous_area_type", "max_line_speed", "elevator_id", "sensor_type", "restricted_robots_number_limit"], "description": "Add a rectangle area. Metadata auto-built from area-specific params if not provided explicitly."},
+                    "edit_area": {"params": ["area_usage", "artifact_id", "start_x", "start_y", "end_x", "end_y", "half_width", "metadata"], "description": "Edit a rectangle area by ID"},
+                    "remove_area": {"params": ["area_usage", "artifact_id"], "description": "Remove a rectangle area by ID"},
+                    "clear_areas": {"params": ["area_usage"], "description": "Remove all rectangle areas of given type"},
+                    # Artifact — 地图POI
+                    "list_artifact_pois": {"params": [], "description": "List all POIs on current map (Slamtec artifact POIs, separate from local tag_place tags)"},
+                    "add_artifact_poi": {"params": ["display_name", "poi_type", "x", "y", "yaw"], "description": "Add a POI to the map. If x/y/yaw omitted, chassis uses current robot pose and records sensor data for loop-closure adjustment (recommended during mapping)."},
+                    "remove_artifact_poi": {"params": ["poi_id"], "description": "Remove a POI by UUID"},
+                    "clear_artifact_pois": {"params": [], "description": "Remove all POIs from current map"},
+                    # Pose & Localization
+                    "get_pose": {"params": [], "description": "Get current robot pose (x, y, yaw) from Slamtec chassis"},
+                    "get_localization_quality": {"params": [], "description": "Get current localization quality (0-100) from Slamtec chassis"},
                 },
             },
         }
@@ -390,7 +463,13 @@ class ControlledSpatialPlugin:
     def _get_localization_quality(self) -> int:
         """Get current localization quality from chassis (0-100)."""
         quality = self._slamtec.get_localization_quality()
-        q = quality.get("raw", quality) if isinstance(quality, dict) else quality
+        # API returns raw integer (IntegerResponse), but _get() wraps non-dict as {"raw": value}
+        if isinstance(quality, dict):
+            if "error" in quality:
+                return 0
+            q = quality.get("raw", quality)
+        else:
+            q = quality
         try:
             q = int(q)
         except (TypeError, ValueError):
@@ -857,5 +936,268 @@ class ControlledSpatialPlugin:
             self._nav_active = False
             self._nav_action_id = None
             return {"status": "stopped", "api_result": result}
+
+        # ── Artifact — 虚拟墙 ──────────────────────────────────────────────
+
+        elif action == "list_walls":
+            result = self._slamtec.get_lines("walls")
+            if result.get("error"):
+                return {"error": f"List walls failed: {result.get('error')}"}
+            walls = result if isinstance(result, list) else result.get("raw", [])
+            return {"walls": walls}
+
+        elif action == "add_wall":
+            sx = args.get("start_x")
+            sy = args.get("start_y")
+            ex = args.get("end_x")
+            ey = args.get("end_y")
+            if sx is None or sy is None or ex is None or ey is None:
+                return {"error": "start_x, start_y, end_x, end_y are required"}
+            line = {
+                "start": {"x": float(sx), "y": float(sy)},
+                "end": {"x": float(ex), "y": float(ey)},
+                "metadata": args.get("metadata", {}),
+            }
+            result = self._slamtec.add_lines("walls", [line])
+            if result.get("error"):
+                return {"error": f"Add wall failed: {result.get('error')}", "api_result": result}
+            return {"status": "added", "wall": line}
+
+        elif action == "remove_wall":
+            wall_id = args.get("artifact_id")
+            if wall_id is None:
+                return {"error": "artifact_id is required"}
+            result = self._slamtec.remove_line("walls", int(wall_id))
+            if result.get("error"):
+                return {"error": f"Remove wall failed: {result.get('error')}", "api_result": result}
+            return {"status": "removed", "id": wall_id}
+
+        elif action == "clear_walls":
+            result = self._slamtec.clear_lines("walls")
+            if result.get("error"):
+                return {"error": f"Clear walls failed: {result.get('error')}", "api_result": result}
+            return {"status": "cleared"}
+
+        # ── Artifact — 虚拟轨道 ────────────────────────────────────────────
+
+        elif action == "list_tracks":
+            result = self._slamtec.get_lines("tracks")
+            if result.get("error"):
+                return {"error": f"List tracks failed: {result.get('error')}"}
+            tracks = result if isinstance(result, list) else result.get("raw", [])
+            return {"tracks": tracks}
+
+        elif action == "add_track":
+            sx = args.get("start_x")
+            sy = args.get("start_y")
+            ex = args.get("end_x")
+            ey = args.get("end_y")
+            if sx is None or sy is None or ex is None or ey is None:
+                return {"error": "start_x, start_y, end_x, end_y are required"}
+            line = {
+                "start": {"x": float(sx), "y": float(sy)},
+                "end": {"x": float(ex), "y": float(ey)},
+                "metadata": args.get("metadata", {}),
+            }
+            result = self._slamtec.add_lines("tracks", [line])
+            if result.get("error"):
+                return {"error": f"Add track failed: {result.get('error')}", "api_result": result}
+            return {"status": "added", "track": line}
+
+        elif action == "remove_track":
+            track_id = args.get("artifact_id")
+            if track_id is None:
+                return {"error": "artifact_id is required"}
+            result = self._slamtec.remove_line("tracks", int(track_id))
+            if result.get("error"):
+                return {"error": f"Remove track failed: {result.get('error')}", "api_result": result}
+            return {"status": "removed", "id": track_id}
+
+        elif action == "clear_tracks":
+            result = self._slamtec.clear_lines("tracks")
+            if result.get("error"):
+                return {"error": f"Clear tracks failed: {result.get('error')}", "api_result": result}
+            return {"status": "cleared"}
+
+        # ── Artifact — 矩形区域 ────────────────────────────────────────────
+
+        elif action == "list_areas":
+            area_usage = args.get("area_usage", "")
+            if not area_usage:
+                return {"error": "area_usage is required (forbidden_area/elevator_area/dangerous_area/coverage_area/maintenance_area/sensor_disable_area/restricted_area)"}
+            result = self._slamtec.get_rectangle_areas(area_usage)
+            if result.get("error"):
+                return {"error": f"List areas failed: {result.get('error')}"}
+            areas = result if isinstance(result, list) else result.get("raw", [])
+            return {"areas": areas, "usage": area_usage}
+
+        elif action == "add_area":
+            area_usage = args.get("area_usage", "")
+            if not area_usage:
+                return {"error": "area_usage is required"}
+            sx = args.get("start_x")
+            sy = args.get("start_y")
+            ex = args.get("end_x")
+            ey = args.get("end_y")
+            if sx is None or sy is None or ex is None or ey is None:
+                return {"error": "start_x, start_y, end_x, end_y are required"}
+            area = {
+                "start": {"x": float(sx), "y": float(sy)},
+                "end": {"x": float(ex), "y": float(ey)},
+            }
+            hw = args.get("half_width")
+            if hw is not None:
+                area["half_width"] = float(hw)
+            metadata = args.get("metadata")
+            # Auto-build required metadata for specific area types if not provided
+            if metadata is None:
+                if area_usage == "forbidden_area":
+                    metadata = {"escape_distance": str(args.get("escape_distance", "0.4"))}
+                elif area_usage == "dangerous_area":
+                    metadata = {"dangerous_area_type": str(args.get("dangerous_area_type", "0"))}
+                    if args.get("max_line_speed"):
+                        metadata["max_line_speed"] = str(args["max_line_speed"])
+                elif area_usage == "elevator_area":
+                    if not args.get("elevator_id"):
+                        return {"error": "elevator_id is required for elevator_area metadata"}
+                    metadata = {
+                        "elevator_id": str(args["elevator_id"]),
+                        "elevator_sill_width": str(args.get("elevator_sill_width", "0.4")),
+                        "elevator_scheduling_point_dist": str(args.get("elevator_scheduling_point_dist", "1")),
+                    }
+                    if args.get("elevator_door_type") is not None:
+                        metadata["elevator_door_type"] = str(args["elevator_door_type"])
+                elif area_usage == "coverage_area":
+                    metadata = {}
+                elif area_usage == "maintenance_area":
+                    metadata = {}
+                elif area_usage == "sensor_disable_area":
+                    if args.get("sensor_type"):
+                        metadata = {"sensor_type": str(args["sensor_type"])}
+                    else:
+                        metadata = {}
+                elif area_usage == "restricted_area":
+                    metadata = {}
+                    if args.get("restricted_robots_number_limit"):
+                        metadata["restricted_robots_number_limit"] = str(args["restricted_robots_number_limit"])
+                    if args.get("restricted_scheduling_points"):
+                        metadata["restricted_scheduling_points"] = str(args["restricted_scheduling_points"])
+            result = self._slamtec.add_rectangle_area(area_usage, area, metadata)
+            if result.get("error"):
+                return {"error": f"Add area failed: {result.get('error')}", "api_result": result}
+            return {"status": "added", "usage": area_usage, "area": area, "metadata": metadata}
+
+        elif action == "edit_area":
+            area_usage = args.get("area_usage", "")
+            if not area_usage:
+                return {"error": "area_usage is required"}
+            area_id = args.get("artifact_id")
+            if area_id is None:
+                return {"error": "artifact_id is required"}
+            area = None
+            sx = args.get("start_x")
+            sy = args.get("start_y")
+            ex = args.get("end_x")
+            ey = args.get("end_y")
+            if sx is not None and sy is not None and ex is not None and ey is not None:
+                area = {
+                    "start": {"x": float(sx), "y": float(sy)},
+                    "end": {"x": float(ex), "y": float(ey)},
+                }
+                hw = args.get("half_width")
+                if hw is not None:
+                    area["half_width"] = float(hw)
+            metadata = args.get("metadata")
+            result = self._slamtec.edit_rectangle_area(area_usage, int(area_id), area, metadata)
+            if result.get("error"):
+                return {"error": f"Edit area failed: {result.get('error')}", "api_result": result}
+            return {"status": "edited", "usage": area_usage, "id": area_id}
+
+        elif action == "remove_area":
+            area_usage = args.get("area_usage", "")
+            if not area_usage:
+                return {"error": "area_usage is required"}
+            area_id = args.get("artifact_id")
+            if area_id is None:
+                return {"error": "artifact_id is required"}
+            result = self._slamtec.remove_rectangle_area(area_usage, int(area_id))
+            if result.get("error"):
+                return {"error": f"Remove area failed: {result.get('error')}", "api_result": result}
+            return {"status": "removed", "usage": area_usage, "id": area_id}
+
+        elif action == "clear_areas":
+            area_usage = args.get("area_usage", "")
+            if not area_usage:
+                return {"error": "area_usage is required"}
+            result = self._slamtec.clear_rectangle_areas(area_usage)
+            if result.get("error"):
+                return {"error": f"Clear areas failed: {result.get('error')}", "api_result": result}
+            return {"status": "cleared", "usage": area_usage}
+
+        # ── Artifact — 地图POI ─────────────────────────────────────────────
+
+        elif action == "list_artifact_pois":
+            result = self._slamtec.get_pois()
+            if result.get("error"):
+                return {"error": f"List POIs failed: {result.get('error')}"}
+            pois = result if isinstance(result, list) else result.get("raw", [])
+            return {"pois": pois}
+
+        elif action == "add_artifact_poi":
+            display_name = args.get("display_name", "")
+            poi_type = args.get("poi_type", "")
+            # If x/y/yaw provided, use them; otherwise omit pose entirely.
+            # API recommends omitting pose during mapping so the chassis records
+            # sensor observations and adjusts POI position after loop closure.
+            px = args.get("x")
+            py = args.get("y")
+            pyaw = args.get("yaw")
+            poi = {
+                "id": str(uuid.uuid4()),
+                "metadata": {},
+            }
+            if px is not None and py is not None:
+                poi["pose"] = {"x": float(px), "y": float(py), "yaw": float(pyaw or 0)}
+            # If x/y not provided, omit pose — chassis uses current robot position
+            # and records sensor observations for loop-closure adjustment
+            if display_name:
+                poi["metadata"]["display_name"] = display_name
+            if poi_type:
+                poi["metadata"]["type"] = poi_type
+            # Merge any extra metadata
+            extra_meta = args.get("metadata")
+            if isinstance(extra_meta, dict):
+                poi["metadata"].update(extra_meta)
+            result = self._slamtec.add_poi(poi)
+            if result.get("error"):
+                return {"error": f"Add POI failed: {result.get('error')}", "api_result": result}
+            return {"status": "added", "poi": poi}
+
+        elif action == "remove_artifact_poi":
+            poi_id = args.get("poi_id", "")
+            if not poi_id:
+                return {"error": "poi_id is required"}
+            result = self._slamtec.delete_poi(poi_id)
+            if result.get("error"):
+                return {"error": f"Remove POI failed: {result.get('error')}", "api_result": result}
+            return {"status": "removed", "poi_id": poi_id}
+
+        elif action == "clear_artifact_pois":
+            result = self._slamtec.clear_pois()
+            if result.get("error"):
+                return {"error": f"Clear POIs failed: {result.get('error')}", "api_result": result}
+            return {"status": "cleared"}
+
+        # ── Pose & Localization ─────────────────────────────────────────────
+
+        elif action == "get_pose":
+            pose = self._get_pose()
+            if not pose:
+                return {"error": "No current pose available (SLAM not running?)"}
+            return {"pose": pose, "map": self._active_map, "map_status": self._map_status}
+
+        elif action == "get_localization_quality":
+            q = self._get_localization_quality()
+            return {"quality": q, "map_status": self._map_status}
 
         return None
