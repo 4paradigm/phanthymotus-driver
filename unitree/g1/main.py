@@ -136,6 +136,7 @@ class G1DeviceBundle:
             try:
                 from controlled_spatial_map import ControlledSpatialMapPlugin
                 map_cfg = dict(plugins_cfg["controlled_spatial_map"])
+                map_cfg["network_iface"] = network_iface
                 self._plugins.append(ControlledSpatialMapPlugin(map_cfg, namespace, executor))
                 print("[bundle] ControlledSpatialMapPlugin loaded")
             except Exception as e:

@@ -409,9 +409,15 @@ class ControlledSpatialPlugin:
         if msg_type in ("pos_info", "mapping_info"):
             pose_data = data.get("data", {}).get("currentPose")
             if pose_data:
+                q_x = float(pose_data.get("q_x", 0.0))
+                q_y = float(pose_data.get("q_y", 0.0))
+                q_z = float(pose_data.get("q_z", 0.0))
+                q_w = float(pose_data.get("q_w", 1.0))
+                # G1 reports a full attitude quaternion. Ignoring q_x/q_y
+                # produces a visibly wrong heading while the body is tilted.
                 yaw = math.atan2(
-                    2 * (pose_data.get("q_w", 1) * pose_data.get("q_z", 0)),
-                    1 - 2 * pose_data.get("q_z", 0) ** 2
+                    2 * (q_w * q_z + q_x * q_y),
+                    1 - 2 * (q_y * q_y + q_z * q_z),
                 )
                 with self._lock:
                     self._current_pose = {

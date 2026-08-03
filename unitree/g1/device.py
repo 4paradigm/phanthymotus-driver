@@ -1759,9 +1759,13 @@ class _SlamInfoNode(Node):
         if msg_type == "pos_info" or msg_type == "mapping_info":
             pose_data = data.get("data", {}).get("currentPose")
             if pose_data:
+                q_x = float(pose_data.get("q_x", 0.0))
+                q_y = float(pose_data.get("q_y", 0.0))
+                q_z = float(pose_data.get("q_z", 0.0))
+                q_w = float(pose_data.get("q_w", 1.0))
                 yaw = math.atan2(
-                    2 * (pose_data.get("q_w", 1) * pose_data.get("q_z", 0)),
-                    1 - 2 * pose_data.get("q_z", 0) ** 2
+                    2 * (q_w * q_z + q_x * q_y),
+                    1 - 2 * (q_y * q_y + q_z * q_z),
                 )
                 with self._lock:
                     prev_status = self._map_status
@@ -2028,7 +2032,9 @@ class _SlamInfoNode(Node):
             pose = self._current_pose
         robot_x = pose["x"] if pose else 0.0
         robot_y = pose["y"] if pose else 0.0
-        robot_yaw = pose["yaw"] if pose else 0.0
+        # The mapping renderer already negates the packet yaw after mapping
+        # SLAM +Y to Three.js -Z, so publish the display-frame value.
+        robot_yaw = -pose["yaw"] if pose else 0.0
 
         # Extract points from voxel buffer
         with self._map_buffer_lock:
@@ -3109,8 +3115,20 @@ def run_realsense_process(namespace: str) -> None:
         executor.spin()
     except KeyboardInterrupt:
         pass
+    except Exception as e:
+        # SIGTERM shuts rclpy down asynchronously. Its executor reports that
+        # expected exit as ExternalShutdownException on Humble.
+        if rclpy.ok():
+            print(f"[realsense-proc] executor stopped: {e}", flush=True)
     finally:
         node.stop_capture()
-        node.destroy_node()
-        rclpy.shutdown()
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
+        if rclpy.ok():
+            try:
+                rclpy.shutdown()
+            except Exception:
+                pass
         print("[realsense-proc] stopped", flush=True)
