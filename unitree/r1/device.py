@@ -184,7 +184,6 @@ class MicPlugin:
         return None
 
     def _self_check(self) -> tuple[str, str]:
-    def _self_check(self) -> tuple[str, str]:
         """Verify mic pipeline: multicast receiving + ROS2 topic subscribable.
 
         Check 1: multicast packets arriving (in-process).
