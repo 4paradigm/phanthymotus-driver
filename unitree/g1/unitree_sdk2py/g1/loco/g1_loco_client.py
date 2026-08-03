@@ -73,36 +73,36 @@ class LocoClient(Client):
         return code
 
     def Damp(self):
-        self.SetFsmId(1)
-    
+        return self.SetFsmId(1)
+
     def Start(self):
-        self.SetFsmId(500)
+        return self.SetFsmId(500)
 
     def Squat2StandUp(self):
-        self.SetFsmId(706)
+        return self.SetFsmId(706)
 
     def Lie2StandUp(self):
-        self.SetFsmId(702)
+        return self.SetFsmId(702)
 
     def Sit(self):
-        self.SetFsmId(3)
+        return self.SetFsmId(3)
 
     def StandUp2Squat(self):
-        self.SetFsmId(706)
+        return self.SetFsmId(706)
 
     def ZeroTorque(self):
-        self.SetFsmId(0)
+        return self.SetFsmId(0)
 
     def StopMove(self):
-        self.SetVelocity(0., 0., 0.)
+        return self.SetVelocity(0., 0., 0.)
 
     def HighStand(self):
         UINT32_MAX = (1 << 32) - 1
-        self.SetStandHeight(UINT32_MAX)
+        return self.SetStandHeight(UINT32_MAX)
 
     def LowStand(self):
         UINT32_MIN = 0
-        self.SetStandHeight(UINT32_MIN)
+        return self.SetStandHeight(UINT32_MIN)
 
     def Move(self, vx: float, vy: float, vyaw: float, continous_move: bool = False):
         duration = 864000.0 if continous_move else 1
