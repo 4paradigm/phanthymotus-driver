@@ -21,7 +21,6 @@
 #include <unistd.h>
 
 #include "ipc.h"
-#include "hal_uart.h"
 #include "hal_network.h"
 #include "osal_posix.h"
 #include "telemetry.h"
@@ -61,12 +60,62 @@ static void _signal_handler(int sig) {
 #include <termios.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <limits.h>
 
 /* ── UART HAL implementation matching T_DjiHalUartHandler ─────────────── */
 
 static int s_uart_fd = -1;
 static const char *s_uart_device = "/dev/ttyUSB0";
 static uint32_t s_uart_baud = 921600;
+static uint16_t s_uart_vid;
+static uint16_t s_uart_pid;
+
+/* PSDK uses this information to identify the USB-to-UART device attached to
+ * the aircraft.  Do not hard-code a particular FTDI product ID: FT232R,
+ * FT231X and FT2232 adapters all expose different PIDs. */
+static void _HalUart_DetectDeviceInfo(void) {
+    char path[PATH_MAX], current[PATH_MAX], value[16];
+    const char *name = strrchr(s_uart_device, '/');
+    FILE *f;
+
+    name = name ? name + 1 : s_uart_device;
+    s_uart_vid = 0;
+    s_uart_pid = 0;
+
+    snprintf(path, sizeof(path), "/sys/class/tty/%s/device", name);
+    if (realpath(path, current)) {
+        /* ttyUSB points at a tty node below a USB interface.  Find the first
+         * ancestor that has both USB descriptors rather than assuming a
+         * fixed number of parent directories. */
+        while (current[0] != '\0') {
+            snprintf(path, sizeof(path), "%s/idVendor", current);
+            f = fopen(path, "r");
+            if (f) {
+                if (fgets(value, sizeof(value), f))
+                    s_uart_vid = (uint16_t)strtoul(value, NULL, 16);
+                fclose(f);
+
+                snprintf(path, sizeof(path), "%s/idProduct", current);
+                f = fopen(path, "r");
+                if (f) {
+                    if (fgets(value, sizeof(value), f))
+                        s_uart_pid = (uint16_t)strtoul(value, NULL, 16);
+                    fclose(f);
+                }
+                if (s_uart_vid != 0 && s_uart_pid != 0)
+                    break;
+            }
+
+            char *slash = strrchr(current, '/');
+            if (!slash || slash == current)
+                break;
+            *slash = '\0';
+        }
+    }
+
+    printf("[psdk][uart] %s VID:PID=%04X:%04X\n", s_uart_device,
+           s_uart_vid, s_uart_pid);
+}
 
 static speed_t _to_speed(uint32_t baud) {
     switch (baud) {
@@ -96,19 +145,30 @@ static T_DjiReturnCode _HalUart_Init(E_DjiHalUartNum uartNum, uint32_t baudRate,
         return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
     }
 
-    memset(&tty, 0, sizeof(tty));
-    tcgetattr(s_uart_fd, &tty);
+    if (tcgetattr(s_uart_fd, &tty) != 0) {
+        printf("[psdk][uart] tcgetattr %s failed: %s\n", s_uart_device, strerror(errno));
+        close(s_uart_fd);
+        s_uart_fd = -1;
+        return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
+    }
     speed_t speed = _to_speed(baudRate);
     cfsetispeed(&tty, speed);
     cfsetospeed(&tty, speed);
-    tty.c_cflag = CS8 | CLOCAL | CREAD;
+    tty.c_cflag &= ~(PARENB | PARODD | CSTOPB | CSIZE | CRTSCTS);
+    tty.c_cflag |= CS8 | CLOCAL | CREAD;
     tty.c_iflag = 0;
     tty.c_oflag = 0;
     tty.c_lflag = 0;
     tty.c_cc[VMIN] = 0;   /* Non-blocking: return immediately with available data */
     tty.c_cc[VTIME] = 5;  /* 500ms timeout — enough for aircraft to respond */
-    tcsetattr(s_uart_fd, TCSANOW, &tty);
+    if (tcsetattr(s_uart_fd, TCSANOW, &tty) != 0) {
+        printf("[psdk][uart] tcsetattr %s failed: %s\n", s_uart_device, strerror(errno));
+        close(s_uart_fd);
+        s_uart_fd = -1;
+        return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
+    }
     tcflush(s_uart_fd, TCIOFLUSH);
+    _HalUart_DetectDeviceInfo();
 
     *uartHandle = (T_DjiUartHandle)(intptr_t)s_uart_fd;
     printf("[hal] uart %s opened @ %u baud (fd=%d)\n", s_uart_device, baudRate, s_uart_fd);
@@ -124,16 +184,37 @@ static T_DjiReturnCode _HalUart_DeInit(T_DjiUartHandle uartHandle) {
 static T_DjiReturnCode _HalUart_WriteData(T_DjiUartHandle uartHandle,
                                            const uint8_t *buf, uint32_t len, uint32_t *realLen) {
     int fd = (int)(intptr_t)uartHandle;
-    ssize_t n = write(fd, buf, len);
-    *realLen = (n > 0) ? (uint32_t)n : 0;
-    return (n >= 0) ? DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS : DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
+    uint32_t total = 0;
+    while (total < len) {
+        ssize_t n = write(fd, buf + total, len - total);
+        if (n > 0) {
+            total += (uint32_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR)
+            continue;
+        printf("[psdk][uart] write failed after %u/%u bytes: %s\n", total, len,
+               n < 0 ? strerror(errno) : "zero-byte write");
+        *realLen = total;
+        return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
+    }
+    *realLen = total;
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
 
 static T_DjiReturnCode _HalUart_ReadData(T_DjiUartHandle uartHandle,
                                           uint8_t *buf, uint32_t len, uint32_t *realLen) {
     int fd = (int)(intptr_t)uartHandle;
-    ssize_t n = read(fd, buf, len);
-    *realLen = (n > 0) ? (uint32_t)n : 0;
+    ssize_t n;
+    do {
+        n = read(fd, buf, len);
+    } while (n < 0 && errno == EINTR);
+    if (n < 0) {
+        *realLen = 0;
+        printf("[psdk][uart] read failed: %s\n", strerror(errno));
+        return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
+    }
+    *realLen = (uint32_t)n;
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
 
@@ -144,9 +225,12 @@ static T_DjiReturnCode _HalUart_GetStatus(E_DjiHalUartNum uartNum, T_DjiUartStat
 }
 
 static T_DjiReturnCode _HalUart_GetDeviceInfo(T_DjiHalUartDeviceInfo *deviceInfo) {
-    /* FTDI FT232R on E-Port dev board */
-    deviceInfo->vid = 0x0403;
-    deviceInfo->pid = 0x6001;
+    if (!deviceInfo || s_uart_vid == 0 || s_uart_pid == 0) {
+        printf("[psdk][uart] cannot report USB UART VID/PID\n");
+        return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
+    }
+    deviceInfo->vid = s_uart_vid;
+    deviceInfo->pid = s_uart_pid;
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
 
@@ -939,10 +1023,10 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, _signal_handler);
     signal(SIGTERM, _signal_handler);
 
-    /* Initialize HAL layer (platform abstraction) */
-    if (HalUart_Init(uart_dev, baud_rate) != 0) {
-        printf("[psdk_bridge] WARNING: UART init failed — hardware may not be connected\n");
-    }
+    /* PSDK owns the UART through the callbacks registered in _psdk_core_init.
+     * Opening it here as well used to create a second, unrelated file handle:
+     * the preflight log could show incoming bytes even while PSDK used a
+     * differently configured descriptor for its registration handshake. */
     HalNetwork_Init();  /* Non-fatal if no USB-Ethernet yet */
 
 #ifdef PSDK_ENABLED
@@ -994,7 +1078,6 @@ int main(int argc, char *argv[]) {
     flight_ctrl_cleanup();
     telemetry_cleanup();
     ipc_cleanup();
-    HalUart_Close();
     HalNetwork_Cleanup();
 
 #ifdef PSDK_ENABLED
