@@ -245,17 +245,50 @@ class _ExtMicNode(Node):
         # alsa_id format: "hw:CARD=Pro,DEV=0"
         card_part = self._device_index.split("hw:CARD=", 1)[1].split(",DEV=")[0]
         card_idx = alsaaudio.cards().index(card_part)
-        self._alsa_pcm = alsaaudio.PCM(
-            type=alsaaudio.PCM_CAPTURE,
-            mode=alsaaudio.PCM_NORMAL,
-            rate=16000, channels=1,
-            format=alsaaudio.PCM_FORMAT_S16_LE,
-            periodsize=512,
-            cardindex=card_idx,
-        )
-        # Init dynamic rate probe fields (timer starts on first real read in loop)
-        self._alsa_native_rate = 16000
-        self._alsa_rate_locked = False
+
+        # Probe native format: try S24_3LE stereo first (DJI Wireless Mic etc.),
+        # fallback to S16_LE mono for standard USB mics.
+        self._alsa_native_fmt = None
+        for fmt, channels, fmt_name in [
+            (alsaaudio.PCM_FORMAT_S24_3LE, 2, "S24_3LE_stereo"),
+            (alsaaudio.PCM_FORMAT_S16_LE, 1, "S16_LE_mono"),
+        ]:
+            try:
+                test_pcm = alsaaudio.PCM(
+                    type=alsaaudio.PCM_CAPTURE, mode=alsaaudio.PCM_NORMAL,
+                    rate=48000, channels=channels, format=fmt,
+                    periodsize=1024, cardindex=card_idx,
+                )
+                # Quick read to verify it actually works
+                length, _ = test_pcm.read()
+                test_pcm.close()
+                if length > 0:
+                    self._alsa_native_fmt = fmt_name
+                    break
+            except Exception:
+                continue
+
+        if self._alsa_native_fmt == "S24_3LE_stereo":
+            self._alsa_pcm = alsaaudio.PCM(
+                type=alsaaudio.PCM_CAPTURE, mode=alsaaudio.PCM_NORMAL,
+                rate=48000, channels=2, format=alsaaudio.PCM_FORMAT_S24_3LE,
+                periodsize=1024, cardindex=card_idx,
+            )
+            self._alsa_native_rate = 48000
+            self._alsa_rate_locked = True
+            print(f"[ext_mic] opened {self._device_name} as S24_3LE stereo 48kHz", flush=True)
+        else:
+            # Standard USB mic: S16_LE mono, rate will be probed
+            self._alsa_pcm = alsaaudio.PCM(
+                type=alsaaudio.PCM_CAPTURE, mode=alsaaudio.PCM_NORMAL,
+                rate=16000, channels=1, format=alsaaudio.PCM_FORMAT_S16_LE,
+                periodsize=512, cardindex=card_idx,
+            )
+            self._alsa_native_fmt = "S16_LE_mono"
+            self._alsa_native_rate = 16000
+            self._alsa_rate_locked = False
+            print(f"[ext_mic] opened {self._device_name} as S16_LE mono 16kHz (will probe rate)", flush=True)
+
         self._alsa_probe_samples = 0
         self._alsa_probe_start = 0.0
         self._running = True
@@ -270,6 +303,20 @@ class _ExtMicNode(Node):
             length, data = self._alsa_pcm.read()
             if length <= 0:
                 continue
+
+            # Convert S24_3LE stereo to S16_LE mono if needed
+            if self._alsa_native_fmt == "S24_3LE_stereo":
+                raw = np.frombuffer(data, dtype=np.uint8)
+                n_frames = len(raw) // 6  # 6 bytes per stereo frame (3 bytes × 2 channels)
+                if n_frames == 0:
+                    continue
+                raw = raw[:n_frames * 6].reshape(n_frames, 2, 3)
+                # Take high 2 bytes of each 24-bit sample as int16 (effectively >>8)
+                left = raw[:, 0, 1:].copy().view(np.int16).flatten()
+                right = raw[:, 1, 1:].copy().view(np.int16).flatten()
+                mono = ((left.astype(np.int32) + right.astype(np.int32)) // 2).astype(np.int16)
+                data = mono.tobytes()
+                length = n_frames
 
             # Start probe timer on first actual data (not before thread start,
             # to avoid counting ALSA init latency as part of elapsed time)
