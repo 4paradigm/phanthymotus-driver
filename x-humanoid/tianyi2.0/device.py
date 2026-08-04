@@ -105,6 +105,16 @@ _ARM_RIGHT_JOINTS = {
     27: "right_wrist_roll_joint",
 }
 
+# Rated motor currents from the Tianyi 2.0 joint specification table. These
+# values are used as the current limits in CmdSetMotorPosition commands.
+_RATED_MOTOR_CURRENT_A = {
+    1: 5.0, 2: 5.0, 3: 5.0,
+    11: 35.0, 12: 23.0, 13: 8.0, 14: 8.0,
+    15: 8.0, 16: 5.0, 17: 5.0,
+    21: 35.0, 22: 23.0, 23: 8.0, 24: 8.0,
+    25: 8.0, 26: 5.0, 27: 5.0,
+}
+
 _WAIST_JOINTS = {
     31: "waist_yaw_joint",
     32: "waist_pitch_joint",
@@ -220,6 +230,222 @@ class _ActionSequence:
                 self._cancel_event = None
                 self._thread = None
         return True
+
+
+class _JointCommandFeedback:
+    """Shared status, safety preflight, and motion feedback for raw joint cards."""
+
+    _STATUS_MAX_AGE = 2.0
+    _FEEDBACK_TIMEOUT = 2.0
+    _MOVE_THRESHOLD_RAD = _deg2rad(0.5)
+    _TARGET_TOLERANCE_RAD = _deg2rad(3.0)
+
+    def __init__(self, subsystem: str, status_topic: str):
+        self._subsystem = subsystem
+        self._status_topic = status_topic
+        self._condition = threading.Condition()
+        self._status: dict[int, dict] = {}
+        self._status_seq = 0
+        self._status_time: float | None = None
+        self._power_status: dict = {}
+        self._power_status_time: float | None = None
+
+    def create_subscriptions(self, node: Node) -> None:
+        from bodyctrl_msgs.msg import MotorStatusMsg, PowerBoardKeyStatus
+        node.create_subscription(
+            MotorStatusMsg, self._status_topic,
+            self._on_motor_status, _RELIABLE_QOS)
+        node.create_subscription(
+            PowerBoardKeyStatus, "/power/board/key_status",
+            self._on_power_status, _RELIABLE_QOS)
+
+    def _on_motor_status(self, msg) -> None:
+        now = time.monotonic()
+        with self._condition:
+            self._status = {
+                int(motor.name): {
+                    "pos": float(motor.pos),
+                    "speed": float(motor.speed),
+                    "current": float(motor.current),
+                    "temperature": float(motor.temperature),
+                    "error": int(motor.error),
+                }
+                for motor in msg.status
+            }
+            self._status_seq += 1
+            self._status_time = now
+            self._condition.notify_all()
+
+    def _on_power_status(self, msg) -> None:
+        now = time.monotonic()
+        with self._condition:
+            self._power_status = {
+                "is_estop": bool(msg.is_estop.data),
+                "is_remote_estop": bool(msg.is_remote_estop.data),
+                "is_power_on": bool(msg.is_power_on.data),
+            }
+            self._power_status_time = now
+            self._condition.notify_all()
+
+    @staticmethod
+    def _error(code: str, message: str, **details) -> dict:
+        result = {"state": "error", "error": message, "code": code}
+        result.update(details)
+        return result
+
+    def _faults(self, motor_ids: list[int]) -> list[dict]:
+        faults = []
+        for motor_id in motor_ids:
+            status = self._status.get(motor_id)
+            if status is None or status["error"] == 0:
+                continue
+            error_code = status["error"]
+            faults.append({
+                "motor_id": motor_id,
+                "joint": _ALL_JOINTS.get(motor_id, f"motor_{motor_id}"),
+                "error_code": error_code,
+                "description": _MOTOR_ERROR_DESCRIPTIONS.get(
+                    error_code, "unknown_vendor_error"),
+            })
+        return faults
+
+    def preflight(self, publisher, motor_ids: list[int]) -> dict | None:
+        if not publisher:
+            return self._error(
+                "publisher_not_initialized",
+                f"{self._subsystem} command publisher is not initialized")
+        now = time.monotonic()
+        with self._condition:
+            if self._status_time is None:
+                return self._error(
+                    f"{self._subsystem}_status_unavailable",
+                    f"No {self._status_topic} received; "
+                    f"{self._subsystem} controller may not be running",
+                    diagnosis=[
+                        "check robot body-control program",
+                        "complete robot self-check and confirm Ready state",
+                        f"check ROS_DOMAIN_ID and {self._status_topic}",
+                    ],
+                )
+            status_age = now - self._status_time
+            if status_age > self._STATUS_MAX_AGE:
+                return self._error(
+                    f"{self._subsystem}_status_stale",
+                    f"{self._status_topic} is stale ({status_age:.2f}s)",
+                    diagnosis=[
+                        "check robot body-control program",
+                        "check ROS communication",
+                    ],
+                )
+            missing = [
+                motor_id for motor_id in motor_ids
+                if motor_id not in self._status
+            ]
+            if missing:
+                return self._error(
+                    f"{self._subsystem}_motors_missing",
+                    f"Selected {self._subsystem} motors are missing from "
+                    f"{self._status_topic}",
+                    missing_motor_ids=missing,
+                )
+            faults = self._faults(motor_ids)
+            if faults:
+                return self._error(
+                    f"{self._subsystem}_motor_fault",
+                    f"Selected {self._subsystem} has active motor faults",
+                    faults=faults,
+                )
+            if (self._power_status_time is not None
+                    and now - self._power_status_time <= self._STATUS_MAX_AGE):
+                if (self._power_status.get("is_estop")
+                        or self._power_status.get("is_remote_estop")):
+                    return self._error(
+                        "emergency_stop_active",
+                        "Physical or remote emergency stop is active",
+                        power_status=dict(self._power_status),
+                    )
+                if not self._power_status.get("is_power_on", True):
+                    return self._error(
+                        "robot_power_off",
+                        "Robot power board reports power off",
+                        power_status=dict(self._power_status),
+                    )
+        return None
+
+    def snapshot(self, motor_ids: list[int]) -> tuple[int, dict[int, float]]:
+        with self._condition:
+            return self._status_seq, {
+                motor_id: self._status[motor_id]["pos"]
+                for motor_id in motor_ids
+                if motor_id in self._status
+            }
+
+    def wait_for_motion(
+            self, targets: dict[int, float], baseline_seq: int,
+            baseline: dict[int, float]) -> dict:
+        motor_ids = list(targets)
+        deadline = time.monotonic() + self._FEEDBACK_TIMEOUT
+        received_new_status = False
+        with self._condition:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                if self._status_seq <= baseline_seq:
+                    self._condition.wait(remaining)
+                    continue
+                received_new_status = True
+                faults = self._faults(motor_ids)
+                if faults:
+                    return self._error(
+                        f"{self._subsystem}_motor_fault_after_command",
+                        f"{self._subsystem.capitalize()} motor fault appeared "
+                        "after command",
+                        faults=faults,
+                    )
+                positions = {
+                    motor_id: self._status[motor_id]["pos"]
+                    for motor_id in motor_ids
+                }
+                moved = max(
+                    abs(positions[motor_id] - baseline[motor_id])
+                    for motor_id in motor_ids
+                )
+                target_error = max(
+                    abs(positions[motor_id] - targets[motor_id])
+                    for motor_id in motor_ids
+                )
+                if (moved >= self._MOVE_THRESHOLD_RAD
+                        or target_error <= self._TARGET_TOLERANCE_RAD):
+                    return {
+                        "state": "moving",
+                        "status_topic": self._status_topic,
+                        "max_movement_deg": round(_rad2deg(moved), 2),
+                        "max_target_error_deg": round(
+                            _rad2deg(target_error), 2),
+                    }
+                self._condition.wait(0.05)
+        if not received_new_status:
+            return self._error(
+                f"{self._subsystem}_feedback_timeout",
+                f"Command was published but no new {self._status_topic} "
+                "was received",
+                diagnosis=[
+                    f"check {self._subsystem} controller and ROS communication",
+                    "confirm robot self-check completed and robot is Ready",
+                ],
+            )
+        return self._error(
+            f"{self._subsystem}_no_motion",
+            f"Command was published and {self._subsystem} status updated, "
+            "but no selected joint moved",
+            diagnosis=[
+                "robot may not be Ready or self-check may be incomplete",
+                f"{self._subsystem} controller may be disabled or rejecting commands",
+                f"another node may be publishing competing "
+                f"/{self._subsystem}/cmd_pos commands",
+            ],
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -997,7 +1223,7 @@ class HeadPlugin:
                 cmd.name = motor_id
                 cmd.pos = _deg2rad(deg)
                 cmd.spd = 1.0  # rad/s
-                cmd.cur = 3.0  # A (max current)
+                cmd.cur = _RATED_MOTOR_CURRENT_A[motor_id]
                 cmds.append(cmd)
             msg.cmds = cmds
             self._publisher.publish(msg)
@@ -1410,7 +1636,7 @@ class HeadGesturePlugin:
                 cmd.name = motor_id
                 cmd.pos = _deg2rad(deg)
                 cmd.spd = speed_rad
-                cmd.cur = 3.0
+                cmd.cur = _RATED_MOTOR_CURRENT_A[motor_id]
                 msg.cmds.append(cmd)
             self._publisher.publish(msg)
             return {"state": "moving", "yaw": yaw_deg, "pitch": pitch_deg, "roll": roll_deg}
@@ -1425,6 +1651,27 @@ class HeadGesturePlugin:
 class ArmPlugin:
     """双臂14DOF控制 (位置模式 / 力位混合)"""
 
+    # Raw-control defaults and a deliberately bounded tuning range. The
+    # vendor-side controller applies them; this driver does not rate-limit the
+    # position step.
+    _DEFAULT_KP = 50.0
+    _DEFAULT_KD = 20.0
+    _KP_RANGE = (10.0, 200.0)
+    _KD_RANGE = (5.0, 50.0)
+
+    _JOINT_NAMES = [
+        "shoulder_pitch", "shoulder_roll", "shoulder_yaw",
+        "elbow_pitch", "wrist_yaw", "wrist_pitch", "wrist_roll",
+    ]
+    _LEFT_POSE_LIMITS = [
+        (-170, 170), (-15, 150), (-170, 170), (-150, 15),
+        (-170, 170), (-45, 60), (-95, 75),
+    ]
+    _RIGHT_POSE_LIMITS = [
+        (-170, 170), (-150, 15), (-170, 170), (-150, 15),
+        (-170, 170), (-45, 60), (-75, 95),
+    ]
+
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._ns = namespace
         self._ros2 = ros2
@@ -1432,33 +1679,77 @@ class ArmPlugin:
         ros2.executor_tianyi.add_node(self._pub_node)
         self._pos_publisher = None
         self._ctrl_publisher = None
+        self._feedback = _JointCommandFeedback("arm", "/arm/status")
 
     def get_tool(self) -> dict:
         return {
             "name": "arm",
             "type": "actuator",
-            "description": "天轶2.0 双臂控制 — 每臂7DOF (肩3+肘1+腕3), 位置/力位混合模式",
+            "description": (
+                "控制左右手臂的各关节角度。不确定选哪个模式时，请使用move_pos："
+                "它适合抬手、弯肘、摆姿势和回到初始位置。move_ctrl是高级调试模式，"
+                "用于调整手臂保持姿势时有多用力、到位后是否容易晃动，以及已确认安全的"
+                "轻推柔顺实验；它不是慢速模式，不适合普通动作或大幅移动。"
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": ["move_pos", "move_ctrl"],
-                               "description": "控制模式"},
-                    "side": {"type": "string", "enum": ["left", "right", "both"],
-                             "description": "控制哪只手臂"},
-                    "positions": {"type": "array", "items": {"type": "number"},
-                                  "description": "7个关节角度(度): [肩pitch, 肩roll, 肩yaw, 肘pitch, 腕yaw, 腕pitch, 腕roll]"},
-                    "speed": {"type": "number", "description": "运动速度(rad/s), 默认1.0"},
-                    "kp": {"type": "array", "items": {"type": "number"},
-                           "description": "位置增益(7个), 范围[0,2000]"},
-                    "kd": {"type": "array", "items": {"type": "number"},
-                           "description": "速度增益(7个), 范围[0,300]"},
+                               "default": "move_pos",
+                               "description": (
+                                   "模式选择：抬手、弯肘、摆姿势、回零等普通操作选move_pos；"
+                                   "只有需要调节手臂保持力度或减少晃动时才选move_ctrl"
+                               )},
+                    "left_positions": {
+                        "type": "array", "items": {"type": "number", "minimum": -170, "maximum": 170},
+                        "minItems": 7, "maxItems": 7,
+                        "default": [0, 0, 0, 0, 0, 0, 0],
+                        "description": "左臂实际7关节角度(度): [肩pitch, 肩roll, 肩yaw, 肘pitch, 腕yaw, 腕pitch, 腕roll]"
+                    },
+                    "right_positions": {
+                        "type": "array", "items": {"type": "number", "minimum": -170, "maximum": 170},
+                        "minItems": 7, "maxItems": 7,
+                        "default": [0, 0, 0, 0, 0, 0, 0],
+                        "description": "右臂实际7关节角度(度)，顺序同左臂；若要镜像左臂姿态，请将肩roll、肩yaw、腕yaw、腕roll（索引1/2/4/6）取反"
+                    },
+                    "speed": {"type": "number", "minimum": 0.2, "maximum": 1.5,
+                              "default": 0.5,
+                              "description": (
+                                  "仅move_pos使用：决定手臂移动到目标姿势时有多快。"
+                                  "范围[0.2,1.5]rad/s，默认0.5。move_ctrl不能用它来减速"
+                              )},
+                    "kp": {"type": "array", "items": {"type": "number", "minimum": 10, "maximum": 200},
+                           "minItems": 7, "maxItems": 7,
+                           "default": [50, 50, 50, 50, 50, 50, 50],
+                           "description": (
+                               "仅move_ctrl使用，可理解为关节偏离目标后“拉回去的力度”。"
+                               "按[肩pitch,肩roll,肩yaw,肘pitch,腕yaw,腕pitch,腕roll]填写7项，"
+                               "范围[10,200]，默认50，左右臂共用。调高会保持得更硬、更有力，"
+                               "但可能动作突然或冲过目标；调低会更柔和，但手臂可能被负载压偏"
+                           )},
+                    "kd": {"type": "array", "items": {"type": "number", "minimum": 5, "maximum": 50},
+                           "minItems": 7, "maxItems": 7,
+                           "default": [20, 20, 20, 20, 20, 20, 20],
+                           "description": (
+                               "仅move_ctrl使用，可理解为关节的“减震力度”。关节顺序同KP，"
+                               "共7项，范围[5,50]，默认20，左右臂共用。调高通常更不容易晃，"
+                               "但反应可能变慢；调得太低，手臂到位后可能来回抖动"
+                           )},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "move_pos": {"params": ["side", "positions", "speed"],
-                                 "description": "位置模式: 移动手臂关节到指定角度(度)"},
-                    "move_ctrl": {"params": ["side", "positions", "kp", "kd"],
-                                  "description": "力位混合模式: 指定位置+增益"},
+                    "move_pos": {"params": ["left_positions", "right_positions", "speed"],
+                                 "description": (
+                                     "普通动作首选：填写左右臂目标角度和移动速度。适合抬手、弯肘、"
+                                     "摆出指定姿势、回到初始位置，以及其他希望控制移动快慢的场景"
+                                 )},
+                    "move_ctrl": {"params": ["left_positions", "right_positions", "kp", "kd"],
+                                  "description": (
+                                      "高级调试模式：目标角度决定手臂想停在哪里，KP决定偏离后拉回的"
+                                      "力度，KD决定减少晃动的力度。适用于手臂被负载压偏、到位后晃动，"
+                                      "或已确认安全的轻推柔顺实验。它没有可设置的移动速度，同一角度在"
+                                      "不同KP/KD下也可能停在不同位置；普通摆姿势或大幅移动请用move_pos"
+                                  )},
                 },
             },
         }
@@ -1470,7 +1761,8 @@ class ArmPlugin:
                 CmdSetMotorPosition, "/arm/cmd_pos", _RELIABLE_QOS)
             self._ctrl_publisher = self._pub_node.create_publisher(
                 CmdMotorCtrl, "/arm/cmd_ctrl", _RELIABLE_QOS)
-            print("[ArmPlugin] publishers created")
+            self._feedback.create_subscriptions(self._pub_node)
+            print("[ArmPlugin] publishers and feedback subscriptions created")
         except ImportError as e:
             print(f"[ArmPlugin] WARNING: msg import failed ({e})")
 
@@ -1479,81 +1771,254 @@ class ArmPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "move_pos":
-            side = args.get("side", "left")
-            positions = args.get("positions", [])
-            speed = args.get("speed", 1.0)
-            if len(positions) != 7:
-                return {"error": "positions must have exactly 7 values (degrees)"}
-            return self._send_pos(side, positions, speed)
+            poses = self._requested_poses(args)
+            speed = args.get("speed", 0.5)
+            validated = self._validate_command(poses, speed=speed)
+            if isinstance(validated, dict):
+                return validated
+            poses, speed = validated
+            motor_ids = self._motor_ids()
+            check = self._feedback.preflight(self._pos_publisher, motor_ids)
+            if check is not None:
+                return check
+            baseline_seq, baseline = self._feedback.snapshot(motor_ids)
+            result = self._send_pos(poses, speed)
+            if "error" in result:
+                return result
+            feedback = self._feedback.wait_for_motion(
+                self._target_positions(poses),
+                baseline_seq, baseline)
+            if feedback.get("state") == "error":
+                return feedback
+            result["feedback_verified"] = True
+            result["feedback"] = feedback
+            return result
         elif action == "move_ctrl":
-            side = args.get("side", "left")
-            positions = args.get("positions", [])
-            kp = args.get("kp", [200] * 7)
-            kd = args.get("kd", [20] * 7)
-            if len(positions) != 7:
-                return {"error": "positions must have exactly 7 values (degrees)"}
-            return self._send_ctrl(side, positions, kp, kd)
+            poses = self._requested_poses(args)
+            kp = args.get("kp", [self._DEFAULT_KP] * 7)
+            kd = args.get("kd", [self._DEFAULT_KD] * 7)
+            validated = self._validate_command(
+                poses, kp=kp, kd=kd)
+            if isinstance(validated, dict):
+                return validated
+            poses, kp, kd = validated
+            motor_ids = self._motor_ids()
+            check = self._feedback.preflight(self._ctrl_publisher, motor_ids)
+            if check is not None:
+                return check
+            baseline_seq, baseline = self._feedback.snapshot(motor_ids)
+            result = self._send_ctrl(poses, kp, kd)
+            if "error" in result:
+                return result
+            feedback = self._feedback.wait_for_motion(
+                self._target_positions(poses),
+                baseline_seq, baseline)
+            if feedback.get("state") == "error":
+                return feedback
+            result["feedback_verified"] = True
+            result["feedback"] = feedback
+            return result
         elif action in ("start", "info"):
-            return {"state": "ready"}
+            return {
+                "state": "ready" if self._pos_publisher else "idle",
+                "feedback_supported": True,
+                "feedback_topic": "/arm/status",
+                "right_arm_mirrored": False,
+                "independent_bilateral_positions": True,
+            }
         elif action == "stop":
             return {"state": "idle"}
         return {"error": f"unknown action: {action}"}
 
-    def _send_pos(self, side: str, positions_deg: list, speed: float) -> dict:
+    @staticmethod
+    def _requested_poses(args: dict) -> dict[str, object]:
+        """Resolve visible per-arm fields, with legacy `positions` fallback."""
+        legacy = args.get("positions", [0] * 7)
+        return {
+            "left": args.get("left_positions", legacy),
+            "right": args.get("right_positions", legacy),
+        }
+
+    @staticmethod
+    def _motor_ids() -> list[int]:
+        return [*range(11, 18), *range(21, 28)]
+
+    @classmethod
+    def _pose_violations(cls, poses: dict[str, list[float]]) -> list[dict]:
+        selected = [
+            (arm_side, pose,
+             cls._LEFT_POSE_LIMITS if arm_side == "left" else cls._RIGHT_POSE_LIMITS)
+            for arm_side, pose in poses.items()
+        ]
+        violations = []
+        for arm_side, pose, limits in selected:
+            for index, (value, bounds) in enumerate(zip(pose, limits)):
+                lower, upper = bounds
+                if value < lower or value > upper:
+                    violations.append({
+                        "side": arm_side,
+                        "joint": cls._JOINT_NAMES[index],
+                        "value_deg": value,
+                        "minimum_deg": lower,
+                        "maximum_deg": upper,
+                    })
+        return violations
+
+    @classmethod
+    def _target_positions(
+            cls, poses: dict[str, list[float]]) -> dict[int, float]:
+        targets = {}
+        if "left" in poses:
+            targets.update({
+                11 + index: _deg2rad(deg)
+                for index, deg in enumerate(poses["left"])
+            })
+        if "right" in poses:
+            targets.update({
+                21 + index: _deg2rad(deg)
+                for index, deg in enumerate(poses["right"])
+            })
+        return targets
+
+    @staticmethod
+    def _decode_array_argument(value, name: str):
+        """Accept native arrays and JSON-array strings emitted by the dashboard."""
+        if not isinstance(value, str):
+            return value, None
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError as exc:
+            return None, {
+                "state": "error",
+                "error": f"{name} must be a valid JSON array",
+                "code": f"invalid_arm_{name}",
+                "parse_error": str(exc),
+            }
+        if not isinstance(decoded, list):
+            return None, {
+                "state": "error",
+                "error": f"{name} JSON value must be an array",
+                "code": f"invalid_arm_{name}",
+            }
+        return decoded, None
+
+    @classmethod
+    def _validate_command(
+            cls, poses, speed=None, kp=None, kd=None):
+        converted_poses = {}
+        for arm_side, values in poses.items():
+            name = f"{arm_side}_positions"
+            values, error = cls._decode_array_argument(values, name)
+            if error is not None:
+                return error
+            if not isinstance(values, (list, tuple)) or len(values) != 7:
+                return {"state": "error",
+                        "error": f"{name} must have exactly 7 values (degrees)",
+                        "code": f"invalid_arm_{name}"}
+            try:
+                pose = [float(value) for value in values]
+            except (TypeError, ValueError):
+                return {"state": "error", "error": f"{name} must be numeric",
+                        "code": f"invalid_arm_{name}"}
+            if not all(math.isfinite(value) for value in pose):
+                return {"state": "error", "error": f"{name} must be finite",
+                        "code": f"invalid_arm_{name}"}
+            converted_poses[arm_side] = pose
+        violations = cls._pose_violations(converted_poses)
+        if violations:
+            return {"state": "error", "error": "Arm pose exceeds URDF joint limits",
+                    "code": "arm_pose_out_of_range", "violations": violations}
+        if speed is not None:
+            try:
+                speed = float(speed)
+            except (TypeError, ValueError):
+                return {"state": "error", "error": "speed must be numeric",
+                        "code": "invalid_arm_speed"}
+            if not math.isfinite(speed):
+                return {"state": "error", "error": "speed must be finite",
+                        "code": "invalid_arm_speed"}
+            if speed < 0.2 or speed > 1.5:
+                return {"state": "error", "error": "speed must be in [0.2, 1.5] rad/s",
+                        "code": "arm_speed_out_of_range", "speed": speed}
+            return converted_poses, speed
+        for name, values, lower, upper in (
+                ("kp", kp, *cls._KP_RANGE),
+                ("kd", kd, *cls._KD_RANGE)):
+            values, error = cls._decode_array_argument(values, name)
+            if error is not None:
+                return error
+            if not isinstance(values, (list, tuple)) or len(values) != 7:
+                return {"state": "error", "error": f"{name} must have exactly 7 values",
+                        "code": f"invalid_arm_{name}"}
+            try:
+                converted = [float(value) for value in values]
+            except (TypeError, ValueError):
+                return {"state": "error", "error": f"{name} must be numeric",
+                        "code": f"invalid_arm_{name}"}
+            if not all(math.isfinite(value) for value in converted):
+                return {"state": "error", "error": f"{name} must be finite",
+                        "code": f"invalid_arm_{name}"}
+            bad = [value for value in converted if value < lower or value > upper]
+            if bad:
+                return {"state": "error", "error": f"{name} values must be in [{lower}, {upper}]",
+                        "code": f"arm_{name}_out_of_range", "values": bad}
+            if name == "kp":
+                kp = converted
+            else:
+                kd = converted
+        return converted_poses, kp, kd
+
+    def _send_pos(self, poses: dict[str, list[float]], speed: float) -> dict:
         if not self._pos_publisher:
             return {"error": "publisher not initialized"}
         try:
             from bodyctrl_msgs.msg import CmdSetMotorPosition, SetMotorPosition
             msg = CmdSetMotorPosition()
             cmds = []
-            sides = []
-            if side in ("left", "both"):
-                sides.append(("left", 11))
-            if side in ("right", "both"):
-                sides.append(("right", 21))
+            sides = [(11 if arm_side == "left" else 21, pose)
+                     for arm_side, pose in poses.items()]
 
-            for side_name, base_id in sides:
-                for i, deg in enumerate(positions_deg):
+            for base_id, pose in sides:
+                for i, deg in enumerate(pose):
                     cmd = SetMotorPosition()
-                    cmd.name = base_id + i
+                    motor_id = base_id + i
+                    cmd.name = motor_id
                     cmd.pos = _deg2rad(deg)
                     cmd.spd = speed
-                    cmd.cur = 5.0
+                    cmd.cur = _RATED_MOTOR_CURRENT_A[motor_id]
                     cmds.append(cmd)
 
             msg.cmds = cmds
             self._pos_publisher.publish(msg)
-            return {"state": "moving", "side": side, "joints": len(cmds)}
+            return {"state": "moving", "side": "both", "joints": len(cmds)}
         except Exception as e:
             return {"error": str(e)}
 
-    def _send_ctrl(self, side: str, positions_deg: list, kp: list, kd: list) -> dict:
+    def _send_ctrl(self, poses: dict[str, list[float]], kp: list, kd: list) -> dict:
         if not self._ctrl_publisher:
             return {"error": "publisher not initialized"}
         try:
             from bodyctrl_msgs.msg import CmdMotorCtrl, MotorCtrl
             msg = CmdMotorCtrl()
             cmds = []
-            sides = []
-            if side in ("left", "both"):
-                sides.append(("left", 11))
-            if side in ("right", "both"):
-                sides.append(("right", 21))
+            sides = [(11 if arm_side == "left" else 21, pose)
+                     for arm_side, pose in poses.items()]
 
-            for side_name, base_id in sides:
-                for i, deg in enumerate(positions_deg):
+            for base_id, pose in sides:
+                for i, deg in enumerate(pose):
                     cmd = MotorCtrl()
                     cmd.name = base_id + i
                     cmd.pos = _deg2rad(deg)
                     cmd.spd = 0.0
                     cmd.tor = 0.0
-                    cmd.kp = kp[i] if i < len(kp) else 200.0
-                    cmd.kd = kd[i] if i < len(kd) else 20.0
+                    cmd.kp = kp[i] if i < len(kp) else self._DEFAULT_KP
+                    cmd.kd = kd[i] if i < len(kd) else self._DEFAULT_KD
                     cmds.append(cmd)
 
             msg.cmds = cmds
             self._ctrl_publisher.publish(msg)
-            return {"state": "moving", "side": side, "mode": "force_position"}
+            return {"state": "moving", "side": "both",
+                    "mode": "force_position"}
         except Exception as e:
             return {"error": str(e)}
 
@@ -2048,7 +2513,7 @@ class ArmGesturePlugin:
                 "robot may not be Ready or self-check may be incomplete",
                 "arm controller may be disabled or rejecting commands",
                 "another node may be publishing competing /arm/cmd_pos commands",
-                "the configured 5A maximum current may be insufficient; verify with the robot vendor before increasing it",
+                "check joint load and mechanical interference; do not exceed the mapped vendor-rated current",
             ],
         )
 
@@ -2079,10 +2544,11 @@ class ArmGesturePlugin:
             for base_id, pose in selected:
                 for index, deg in enumerate(pose):
                     cmd = SetMotorPosition()
-                    cmd.name = base_id + index
+                    motor_id = base_id + index
+                    cmd.name = motor_id
                     cmd.pos = _deg2rad(float(deg))
                     cmd.spd = speed
-                    cmd.cur = 5.0
+                    cmd.cur = _RATED_MOTOR_CURRENT_A[motor_id]
                     msg.cmds.append(cmd)
             self._publisher.publish(msg)
             return {"state": "moving", "side": side, "joints": len(msg.cmds)}
