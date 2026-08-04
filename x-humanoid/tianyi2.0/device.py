@@ -4454,7 +4454,7 @@ class ChassisRawPlugin:
                                  "enum": ["left", "right"],
                                  "description": "旋转方向"},
                     "angle": {"type": "number",
-                              "description": "旋转角度(度), 使用 Slamtec RotateAction 编码器闭环, 精确到度"},
+                              "description": "旋转角度(度), 负数为反向旋转, 编码器闭环精确到度"},
                     "duration": {"type": "number",
                                  "description": "持续时间(秒), -1=持续运动 (不填 angle 时生效)"},
                 },
@@ -4502,15 +4502,15 @@ class ChassisRawPlugin:
 
             if angle is not None:
                 # 精确旋转: 使用 Slamtec RotateAction (编码器闭环, 角度精确)
+                # 负数角度 = 反向旋转: left -90° → 实际右转 90°
                 try:
-                    angle_deg = abs(float(angle))
+                    angle_deg = float(angle)
                 except (TypeError, ValueError):
                     return {"error": "angle must be a number (degrees)"}
                 angle_rad = math.radians(angle_deg)
-                if rot == "left":
-                    angle_rad = +angle_rad   # 正=逆时针=左转
-                else:
-                    angle_rad = -angle_rad   # 负=顺时针=右转
+                if rot == "right":
+                    angle_rad = -angle_rad  # right 方向: +→顺时针(CW), -→逆时针(CCW)
+                # left 方向: +→逆时针(CCW), -→顺时针(CW) — angle_rad 符号不变
                 self._slamtec.rotate(angle_rad)
                 return {"rotation": rot, "angle": angle_deg, "unit": "degree",
                         "rad": round(angle_rad, 4)}
