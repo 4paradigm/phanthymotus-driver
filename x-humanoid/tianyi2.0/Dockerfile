@@ -11,11 +11,12 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
         python3-colcon-common-extensions \
         cmake \
         build-essential \
-        curl && \
+        curl \
+        espeak-ng && \
     rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    pyyaml numpy opencv-python-headless
+    pyyaml numpy opencv-python-headless phonemizer
 
 # Build tianyi ROS2 message packages (bodyctrl_msgs + lyre_msgs)
 COPY msgs/ /tianyi_ws/src/

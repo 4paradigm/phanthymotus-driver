@@ -1,3 +1,4 @@
 pyyaml
 numpy
 opencv-python-headless
+phonemizer

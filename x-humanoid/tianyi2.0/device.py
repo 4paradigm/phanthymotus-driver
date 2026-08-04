@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import json
 import math
+import re as _re
 import subprocess
 import struct
 import threading
@@ -1235,6 +1236,158 @@ class PointCloudPlugin:
 # AsrPlugin (sensor)
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════════════════
+# IPA phoneme matching for ASR KWS (ported from perception/plugins/asr.py)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_ESPEAK_BACKENDS = {}  # lang -> EspeakBackend instance
+_ESPEAK_SEP = None
+
+
+def _get_espeak_backend(lang):
+    global _ESPEAK_SEP
+    if _ESPEAK_SEP is None:
+        from phonemizer.separator import Separator
+        _ESPEAK_SEP = Separator(phone=' ', word='  ', syllable='')
+    if lang not in _ESPEAK_BACKENDS:
+        from phonemizer.backend import EspeakBackend
+        _ESPEAK_BACKENDS[lang] = EspeakBackend(lang, with_stress=False)
+    return _ESPEAK_BACKENDS[lang]
+
+
+def _phonemize_safe(text: str, lang: str) -> str:
+    """Phonemize with persistent backend; auto-rebuild on failure."""
+    backend = _get_espeak_backend(lang)
+    try:
+        return backend.phonemize([text], separator=_ESPEAK_SEP, strip=True)[0]
+    except Exception:
+        _ESPEAK_BACKENDS.pop(lang, None)
+        backend = _get_espeak_backend(lang)
+        return backend.phonemize([text], separator=_ESPEAK_SEP, strip=True)[0]
+
+
+def _text_to_ipa(text: str) -> list:
+    """Convert text to IPA phoneme sequence using persistent espeak-ng backend."""
+    segments = []
+    current = ''
+    current_is_cjk = None
+    for char in text:
+        is_cjk = '\u4e00' <= char <= '\u9fff'
+        if current_is_cjk is None:
+            current_is_cjk = is_cjk
+        if is_cjk != current_is_cjk:
+            if current.strip():
+                segments.append((current.strip(), current_is_cjk))
+            current = ''
+            current_is_cjk = is_cjk
+        current += char
+    if current.strip():
+        segments.append((current.strip(), current_is_cjk))
+
+    ipa_seq = []
+    for seg_text, is_cjk in segments:
+        lang = 'cmn' if is_cjk else 'en-us'
+        try:
+            ipa = _phonemize_safe(seg_text, lang)
+            ipa = _re.sub(r'[0-9˥˦˧˨˩¹²³⁴⁵]', '', ipa)
+            phones = [p for p in ipa.split() if p]
+            ipa_seq.extend(phones)
+        except Exception:
+            ipa_seq.extend(list(seg_text))
+    return ipa_seq
+
+
+_SIMILAR_GROUPS = [
+    {'t', 'd'},           # alveolar stops
+    {'p', 'b'},           # bilabial stops
+    {'k', 'g'},           # velar stops
+    {'f', 'v'},           # labiodental fricatives
+    {'s', 'z'},           # alveolar fricatives
+    {'s.', 'z.'},         # retroflex fricatives
+    {'ɕ', 'ʃ', 'ʂ'},     # postalveolar/retroflex sibilants
+    {'tsh', 'dz'},        # affricates
+    {'n', 'ŋ'},           # nasals
+    {'l', 'r', 'ɹ'},      # liquids
+    {'t', 'tsh'},         # stop ~ affricate
+    {'f', 't'},           # common confusion in noisy env
+    {'x', 'h'},           # velar/glottal fricatives
+    {'ɑu', 'au', 'ɑo', 'ao'},  # diphthong variants
+    {'ou', 'uo'},         # vowel variants
+    {'i', 'i.'},          # apical vowel variant
+    {'a', 'ɑ'},           # open vowels
+    {'an', 'ɑn'},         # front nasal variants
+    {'f', 'kh'},          # 范/康 confusion in noisy env
+    {'f', 'x'},           # 范/欢 confusion
+    {'ts.', 'tɕh'},       # retroflex/palatal affricate confusion
+    {'ɑ', 'ɑu'},          # vowel truncation
+    {'ai', 'a'},          # diphthong simplification
+    {'aiɜ', 'ai', 'a'},   # diphthong variants
+    {'iɜ', 'i'},          # rhotacized vowel
+    {'əɜ', 'ə', 'e'},     # schwa variants
+]
+
+
+def _phoneme_sub_cost(a: str, b: str) -> float:
+    """Substitution cost: 0 if same, 0.3 if similar, 1.0 otherwise."""
+    if a == b:
+        return 0
+    for group in _SIMILAR_GROUPS:
+        if a in group and b in group:
+            return 0.3
+    return 1.0
+
+
+def _phoneme_edit_distance(seq1: list, seq2: list) -> float:
+    """Normalized edit distance with phoneme similarity (0=match, 1=different)."""
+    m, n = len(seq1), len(seq2)
+    if m == 0 or n == 0:
+        return 1.0
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+    for i in range(m + 1):
+        dp[i][0] = i
+    for j in range(n + 1):
+        dp[0][j] = j
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            cost = _phoneme_sub_cost(seq1[i - 1], seq2[j - 1])
+            dp[i][j] = min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost)
+    return dp[m][n] / max(m, n)
+
+
+def _find_keyword_in_ipa(text_ipa: list, keyword_ipa: list, threshold: float):
+    """Sliding window search for keyword in text IPA. Returns (matched, end_position)."""
+    kw_len = len(keyword_ipa)
+    if kw_len == 0 or len(text_ipa) < kw_len:
+        return False, -1
+    best_dist = float('inf')
+    best_end = -1
+    for i in range(len(text_ipa) - kw_len + 1):
+        window = text_ipa[i:i + kw_len]
+        dist = _phoneme_edit_distance(window, keyword_ipa)
+        if dist < best_dist:
+            best_dist = dist
+            best_end = i + kw_len
+    return best_dist <= threshold, best_end
+
+
+def _extract_after_keyword(text: str, keyword_text: str, end_pos: int) -> str:
+    """Extract text after the matched keyword."""
+    kw_chars = len([c for c in keyword_text if '\u4e00' <= c <= '\u9fff' or c.isalpha()])
+    skipped = 0
+    cut_idx = 0
+    for i, char in enumerate(text):
+        if '\u4e00' <= char <= '\u9fff' or char.isalpha():
+            skipped += 1
+        if skipped >= kw_chars:
+            cut_idx = i + 1
+            break
+    if cut_idx == 0:
+        return ''
+    remaining = text[cut_idx:]
+    remaining = remaining.lstrip('，。！？、；：,.!?;: ')
+    return remaining
+
+
 class AsrPlugin:
     """语音识别结果 (lyre ASR)"""
 
@@ -1243,6 +1396,12 @@ class AsrPlugin:
         self._ros2 = ros2
         self._topic = f"/{namespace}/asr/text"
         self._running = False
+
+        # KWS config (defaults: enabled, keyword=小范小范)
+        self._kws_enabled = True
+        self._kws_keyword = '小范小范'
+        self._kws_keyword_ipa = None  # lazy init on first ASR callback
+        self._kws_threshold = 0.3
 
         self._sub_node = Node("tianyi2_asr_sub", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._sub_node)
@@ -1257,6 +1416,31 @@ class AsrPlugin:
             "type": "sensor",
             "description": "天轶2.0 语音识别 (lyre ASR) — 实时语音转文字",
             "inputSchema": {"type": "object", "properties": {}},
+            "configSchema": {
+                "type": "object",
+                "properties": {
+                    "kws_enabled": {
+                        "type": "boolean",
+                        "description": "启用关键词唤醒（启用后仅包含唤醒词的语音会被转发）",
+                        "default": True,
+                        "scope": "shared",
+                    },
+                    "kws_keyword": {
+                        "type": "string",
+                        "description": "唤醒词文本（如'小范小范'、'hello robot'）",
+                        "default": "小范小范",
+                        "scope": "shared",
+                        "x-show-when": {"kws_enabled": True},
+                    },
+                    "kws_threshold": {
+                        "type": "number",
+                        "description": "音素匹配阈值（0-1，越小越严格，推荐0.3）",
+                        "default": 0.3,
+                        "scope": "shared",
+                        "x-show-when": {"kws_enabled": True},
+                    },
+                },
+            },
             "topic_out": [{"topic": self._topic, "format": "data/json"}],
         }
 
@@ -1276,19 +1460,80 @@ class AsrPlugin:
     def stop(self):
         self._running = False
 
+    def _ensure_keyword_ipa(self):
+        """Lazy-init keyword IPA on first use (phonemizer import is slow)."""
+        if self._kws_keyword_ipa is None and self._kws_keyword:
+            try:
+                self._kws_keyword_ipa = _text_to_ipa(self._kws_keyword)
+                print(f"[AsrPlugin] KWS keyword='{self._kws_keyword}' ipa={self._kws_keyword_ipa}")
+            except Exception as e:
+                print(f"[AsrPlugin] KWS ipa init failed: {e}")
+
+    def _kws_filter(self, text: str) -> str | None:
+        """Apply KWS filtering. Returns filtered text or None if rejected."""
+        if not self._kws_enabled:
+            return text
+        self._ensure_keyword_ipa()
+        if not self._kws_keyword_ipa:
+            return text
+        text_ipa = _text_to_ipa(text)
+        matched, end_pos = _find_keyword_in_ipa(text_ipa, self._kws_keyword_ipa, self._kws_threshold)
+        if not matched:
+            return None
+        remaining = _extract_after_keyword(text, self._kws_keyword, end_pos)
+        if not remaining.strip():
+            return None
+        return remaining
+
     def _on_asr(self, msg):
         if not self._running:
             return
+        text = msg.text
+        if not text or not text.strip():
+            return
+        text = self._kws_filter(text)
+        if text is None:
+            return
         out = String()
-        out.data = json.dumps({"id": msg.id, "text": msg.text})
+        out.data = json.dumps({"id": msg.id, "text": text})
         self._pub.publish(out)
 
     def _on_asr_string(self, msg):
         if not self._running:
             return
-        self._pub.publish(msg)
+        try:
+            data = json.loads(msg.data)
+            text = data.get("text", "")
+        except (json.JSONDecodeError, AttributeError):
+            text = msg.data if hasattr(msg, 'data') else str(msg)
+            data = None
+        if not text or not text.strip():
+            return
+        filtered = self._kws_filter(text)
+        if filtered is None:
+            return
+        if data is not None:
+            data["text"] = filtered
+            out = String()
+            out.data = json.dumps(data, ensure_ascii=False)
+            self._pub.publish(out)
+        else:
+            out = String()
+            out.data = filtered
+            self._pub.publish(out)
 
     def dispatch(self, action: str, args: dict) -> dict:
+        if action == "config":
+            if 'kws_enabled' in args:
+                self._kws_enabled = bool(args['kws_enabled'])
+            if 'kws_keyword' in args:
+                self._kws_keyword = args['kws_keyword']
+                self._kws_keyword_ipa = _text_to_ipa(args['kws_keyword']) if args['kws_keyword'] else None
+                print(f"[AsrPlugin] KWS keyword updated: '{self._kws_keyword}' ipa={self._kws_keyword_ipa}")
+            if 'kws_threshold' in args:
+                self._kws_threshold = float(args['kws_threshold'])
+            return {"status": "configured", "kws_enabled": self._kws_enabled,
+                    "kws_keyword": self._kws_keyword, "kws_threshold": self._kws_threshold}
         if action in ("start", "stop", "info"):
             return {"state": "running" if self._running else "idle",
                     "topic_out": [{"topic": self._topic, "format": "data/json"}]}
