@@ -322,6 +322,11 @@ class _SpeakerNode(Node):
         self._drain_thread: threading.Thread | None = None
         self._last_chunk_time = 0.0
         self._flush_timer = None
+        # 打断/暂停控制
+        self._lock = threading.Lock()
+        self._interrupt_flag = threading.Event()
+        self._pause_event = threading.Event()
+        self._pause_event.set()  # 初始为非暂停状态
         # Clear stale PlayStream session from previous container run (MCU keeps state across reboot)
         self._client.PlayStop(APP_NAME)
         self.get_logger().info("SpeakerNode ready")
@@ -339,7 +344,7 @@ class _SpeakerNode(Node):
         self._sub = self.create_subscription(
             AudioChunk, topic, self._on_chunk, _LOW_LAT_QOS,
         )
-        self.state = "playing"
+        self.state = "ready"
         self.get_logger().info(f"[speaker] subscription created, waiting for chunks on {topic}")
         return topic
 
@@ -352,9 +357,12 @@ class _SpeakerNode(Node):
             self.destroy_subscription(self._sub)
             self._sub = None
         self._draining.clear()
+        self._pause_event.set()  # 确保 drain thread 不会卡在 pause wait
+        self._interrupt_flag.set()  # 确保 drain thread 退出
         if self._drain_thread is not None:
             self._drain_thread.join(timeout=2)
             self._drain_thread = None
+        self._interrupt_flag.clear()
         # flush remaining buffer
         while not self._buf.empty():
             try:
@@ -368,14 +376,71 @@ class _SpeakerNode(Node):
         self.state = "idle"
         self.get_logger().info("Speaker stopped")
 
+    def interrupt(self) -> dict:
+        """立即中止播放：清空 buffer，停止 SDK，保持 subscription。"""
+        with self._lock:
+            self._interrupt_flag.set()
+            # 清空 buffer
+            while not self._buf.empty():
+                try:
+                    self._buf.get_nowait()
+                except queue.Empty:
+                    break
+            # 停止 SDK 播放
+            try:
+                self._client.PlayStop(APP_NAME)
+            except Exception as e:
+                self.get_logger().warn(f"[speaker] interrupt PlayStop error: {e}")
+            # 等 drain thread 退出
+            if self._drain_thread is not None and self._drain_thread.is_alive():
+                self._drain_thread.join(timeout=1)
+                self._drain_thread = None
+            self._interrupt_flag.clear()
+            self._pause_event.set()
+            self._draining.clear()
+            self.state = "ready"
+        self.get_logger().info("[speaker] interrupted — buffer cleared, subscription kept")
+        return {"state": "ready", "action": "interrupted"}
+
+    def pause(self) -> dict:
+        """暂停播放：停止 SDK，保留 buffer 中未播放的内容。"""
+        with self._lock:
+            if self.state not in ("playing", "ready"):
+                return {"state": self.state, "error": "not playing"}
+            self._pause_event.clear()  # drain thread 将阻塞在 wait()
+            try:
+                self._client.PlayStop(APP_NAME)
+            except Exception as e:
+                self.get_logger().warn(f"[speaker] pause PlayStop error: {e}")
+            self.state = "paused"
+        self.get_logger().info(f"[speaker] paused — buffer size={self._buf.qsize()}")
+        return {"state": "paused", "buffer_chunks": self._buf.qsize()}
+
+    def resume(self) -> dict:
+        """恢复播放：从 buffer 中剩余内容继续。"""
+        with self._lock:
+            if self.state != "paused":
+                return {"state": self.state, "error": "not paused"}
+            self.state = "playing"
+            self._pause_event.set()  # 唤醒 drain thread
+            # 如果 drain thread 已经退出了（pause 时退出），重新启动
+            if self._drain_thread is None or not self._drain_thread.is_alive():
+                if not self._buf.empty():
+                    self._start_drain()
+        self.get_logger().info("[speaker] resumed")
+        return {"state": "playing"}
+
     def _on_chunk(self, msg: AudioChunk) -> None:
         pcm = bytes(msg.data)
         self._idx += 1
         self._buf.put(pcm)
         self._last_chunk_time = time.monotonic()
-        if not self._draining.is_set() and self._buf.qsize() >= self.PREFILL:
+        # 更新状态：收到 chunk 时如果是 ready，变为 playing
+        if self.state == "ready":
+            self.state = "playing"
+        if not self._draining.is_set() and self.state == "playing" and self._buf.qsize() >= self.PREFILL:
             self._start_drain()
-        elif not self._draining.is_set() and self._flush_timer is None:
+        elif not self._draining.is_set() and self.state == "playing" and self._flush_timer is None:
             # start a flush timer — if no more chunks arrive, drain what we have
             self._flush_timer = self.create_timer(0.2, self._check_flush)
 
@@ -394,7 +459,7 @@ class _SpeakerNode(Node):
             self._flush_timer.cancel()
             self.destroy_timer(self._flush_timer)
             self._flush_timer = None
-        if not self._draining.is_set() and not self._buf.empty():
+        if not self._draining.is_set() and not self._buf.empty() and self.state == "playing":
             idle = time.monotonic() - self._last_chunk_time
             if idle >= 0.15:
                 self._start_drain()
@@ -404,6 +469,13 @@ class _SpeakerNode(Node):
         merged = b''
         empty_count = 0
         while self._draining.is_set():
+            # 检查 interrupt
+            if self._interrupt_flag.is_set():
+                return
+            # 检查 pause（阻塞等待 resume 或 interrupt）
+            if not self._pause_event.wait(timeout=0.1):
+                continue  # 还在 paused，循环检查 interrupt
+
             try:
                 pcm = self._buf.get(timeout=0.1)
                 merged += pcm
@@ -421,13 +493,19 @@ class _SpeakerNode(Node):
                 play_idx += 1
                 self._play_merged(merged, play_idx)
                 merged = b''
-        if merged:
+        if merged and not self._interrupt_flag.is_set():
             play_idx += 1
             self._play_merged(merged, play_idx)
         self._draining.clear()
+        # 播放完毕，回到 ready（如果没有被 interrupt/stop）
+        if self.state == "playing":
+            self.state = "ready"
         self.get_logger().info("[speaker] drain finished")
 
     def _play_merged(self, pcm: bytes, idx: int) -> None:
+        # 播放前再次检查 interrupt
+        if self._interrupt_flag.is_set():
+            return
         duration = len(pcm) / 32000
         t0 = time.monotonic()
         try:
@@ -438,7 +516,7 @@ class _SpeakerNode(Node):
             self.get_logger().error(f"[speaker] PlayStream error: {e}")
         elapsed = time.monotonic() - t0
         remaining = duration - elapsed - 0.08
-        if remaining > 0:
+        if remaining > 0 and not self._interrupt_flag.is_set():
             time.sleep(remaining)
 
 
@@ -512,13 +590,101 @@ class SpeakerPlugin:
             # Play startup sound synchronously before starting subscription
             self._play_startup_sound()
             topic = self._node.start_play(topic)
-            return {"state": "playing", "topic": topic}
+            return {"state": "ready", "topic": topic}
         elif action == "stop":
             self._node.stop_play()
             return {"state": "idle"}
         elif action == "info":
-            return {"state": self._node.state, "topic": self._node._topic}
+            return {
+                "state": self._node.state,
+                "topic": self._node._topic,
+                "buffer_chunks": self._node._buf.qsize(),
+            }
         return None
+
+
+# ── SmartMotionPlugin (controller) ─────────────────────────────────────────
+
+class SmartMotionPlugin:
+    """统一打断/暂停控制卡片。协调 speaker + loco 的中止和暂停。"""
+    PREFIX = "smart_motion"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor,
+                 speaker_plugin=None, loco_plugin=None):
+        self._speaker = speaker_plugin
+        self._loco = loco_plugin
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "smart_motion",
+            "type": "controller",
+            "multiInstance": False,
+            "description": "SmartMotion — 统一运动/输出控制，提供打断、暂停、恢复能力",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["interrupt_all", "interrupt_speak", "interrupt_motion",
+                                 "pause_speak", "resume_speak", "status"],
+                        "description": "Action to perform",
+                    },
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "interrupt_all":    {"params": [], "description": "中止所有输出（语音+动作同时停止）"},
+                    "interrupt_speak":  {"params": [], "description": "中止语音播放，清空待播队列"},
+                    "interrupt_motion": {"params": [], "description": "停止机器人当前运动"},
+                    "pause_speak":      {"params": [], "description": "暂停语音播放（保留未播内容，可恢复）"},
+                    "resume_speak":     {"params": [], "description": "恢复之前暂停的语音播放"},
+                    "status":           {"params": [], "description": "查询当前输出状态（语音/运动）"},
+                },
+            },
+        }
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "interrupt_all":
+            r1 = self._do_interrupt_speak()
+            r2 = self._do_interrupt_motion()
+            return {"speak": r1, "motion": r2}
+        elif action == "interrupt_speak":
+            return self._do_interrupt_speak()
+        elif action == "interrupt_motion":
+            return self._do_interrupt_motion()
+        elif action == "pause_speak":
+            if self._speaker:
+                return self._speaker._node.pause()
+            return {"error": "no speaker plugin"}
+        elif action == "resume_speak":
+            if self._speaker:
+                return self._speaker._node.resume()
+            return {"error": "no speaker plugin"}
+        elif action == "status":
+            return {
+                "speak": self._speaker.dispatch("info", {}) if self._speaker else None,
+                "motion": self._loco.dispatch("info", {}) if self._loco else None,
+            }
+        return None
+
+    def _do_interrupt_speak(self) -> dict | None:
+        if self._speaker:
+            return self._speaker._node.interrupt()
+        return {"error": "no speaker plugin"}
+
+    def _do_interrupt_motion(self) -> dict | None:
+        if self._loco:
+            return self._loco.dispatch("stop_move", {})
+        return {"error": "no loco plugin"}
 
 
 # ── LedPlugin (actuator) ─────────────────────────────────────────────────────
