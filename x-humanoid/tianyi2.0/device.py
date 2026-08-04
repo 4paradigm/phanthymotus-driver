@@ -1487,10 +1487,10 @@ class ArmPlugin:
             "name": "arm",
             "type": "actuator",
             "description": (
-                "天轶2.0 双臂14关节控制。move_pos按给定速度执行常规位置运动，"
-                "适合日常调姿；move_ctrl把目标角度和KP/KD下发给机器人侧控制器，"
-                "用于调节关节刚度、阻尼及经过验证的柔顺/保持实验。move_ctrl没有"
-                "轨迹速度限制，不适合直接执行大角度动作或普通语义手势。"
+                "控制左右手臂的各关节角度。不确定选哪个模式时，请使用move_pos："
+                "它适合抬手、弯肘、摆姿势和回到初始位置。move_ctrl是高级调试模式，"
+                "用于调整手臂保持姿势时有多用力、到位后是否容易晃动，以及已确认安全的"
+                "轻推柔顺实验；它不是慢速模式，不适合普通动作或大幅移动。"
             ),
             "inputSchema": {
                 "type": "object",
@@ -1498,8 +1498,8 @@ class ArmPlugin:
                     "action": {"type": "string", "enum": ["move_pos", "move_ctrl"],
                                "default": "move_pos",
                                "description": (
-                                   "控制模式：日常移动和大角度调姿选择move_pos；"
-                                   "只有需要调整PD刚度/阻尼并理解增益风险时才选择move_ctrl"
+                                   "模式选择：抬手、弯肘、摆姿势、回零等普通操作选move_pos；"
+                                   "只有需要调节手臂保持力度或减少晃动时才选move_ctrl"
                                )},
                     "left_positions": {
                         "type": "array", "items": {"type": "number", "minimum": -170, "maximum": 170},
@@ -1516,41 +1516,40 @@ class ArmPlugin:
                     "speed": {"type": "number", "minimum": 0.2, "maximum": 1.5,
                               "default": 0.5,
                               "description": (
-                                  "仅move_pos使用的关节运动速度(rad/s)，范围[0.2,1.5]，"
-                                  "默认0.5；move_ctrl不读取此参数，也没有等效速度限制"
+                                  "仅move_pos使用：决定手臂移动到目标姿势时有多快。"
+                                  "范围[0.2,1.5]rad/s，默认0.5。move_ctrl不能用它来减速"
                               )},
                     "kp": {"type": "array", "items": {"type": "number", "minimum": 10, "maximum": 200},
                            "minItems": 7, "maxItems": 7,
                            "default": [50, 50, 50, 50, 50, 50, 50],
                            "description": (
-                               "仅move_ctrl使用的位置增益，按[肩pitch,肩roll,肩yaw,肘pitch,"
-                               "腕yaw,腕pitch,腕roll]填写7项，范围[10,200]，默认50；同一数组"
-                               "分别用于左右臂对应关节。KP越高通常响应和保持刚度越强，但冲击、"
-                               "超调风险越大；KP较低更柔顺，也可能因负载而达不到目标角度"
+                               "仅move_ctrl使用，可理解为关节偏离目标后“拉回去的力度”。"
+                               "按[肩pitch,肩roll,肩yaw,肘pitch,腕yaw,腕pitch,腕roll]填写7项，"
+                               "范围[10,200]，默认50，左右臂共用。调高会保持得更硬、更有力，"
+                               "但可能动作突然或冲过目标；调低会更柔和，但手臂可能被负载压偏"
                            )},
                     "kd": {"type": "array", "items": {"type": "number", "minimum": 5, "maximum": 50},
                            "minItems": 7, "maxItems": 7,
                            "default": [20, 20, 20, 20, 20, 20, 20],
                            "description": (
-                               "仅move_ctrl使用的速度阻尼增益，关节顺序同KP，共7项，"
-                               "范围[5,50]，默认20；同一数组分别用于左右臂对应关节。"
-                               "KD越高通常抑制振荡更强但动作更迟钝，KD过低可能产生超调或抖动"
+                               "仅move_ctrl使用，可理解为关节的“减震力度”。关节顺序同KP，"
+                               "共7项，范围[5,50]，默认20，左右臂共用。调高通常更不容易晃，"
+                               "但反应可能变慢；调得太低，手臂到位后可能来回抖动"
                            )},
                 },
                 "required": ["action"],
                 "x-action-params": {
                     "move_pos": {"params": ["left_positions", "right_positions", "speed"],
                                  "description": (
-                                     "常规位置模式：按speed限制运动速度，同时执行左右臂目标角度。"
-                                     "适用于日常调姿、大角度运动和需要可控速度的场景，通常优先选择此模式"
+                                     "普通动作首选：填写左右臂目标角度和移动速度。适合抬手、弯肘、"
+                                     "摆出指定姿势、回到初始位置，以及其他希望控制移动快慢的场景"
                                  )},
                     "move_ctrl": {"params": ["left_positions", "right_positions", "kp", "kd"],
                                   "description": (
-                                      "PD力位控制模式：将左右臂目标角度和一组共用KP/KD发布到"
-                                      "/arm/cmd_ctrl，由机器人侧控制器计算控制输出；驱动固定目标速度"
-                                      "和前馈力矩为0，不计算PD，也不限制轨迹速度。用于小角度、低风险的"
-                                      "刚度/阻尼调试、姿态保持或已验证的柔顺交互；最终角度会受增益、"
-                                      "负载和摩擦影响。普通动作或大幅移动请使用move_pos"
+                                      "高级调试模式：目标角度决定手臂想停在哪里，KP决定偏离后拉回的"
+                                      "力度，KD决定减少晃动的力度。适用于手臂被负载压偏、到位后晃动，"
+                                      "或已确认安全的轻推柔顺实验。它没有可设置的移动速度，同一角度在"
+                                      "不同KP/KD下也可能停在不同位置；普通摆姿势或大幅移动请用move_pos"
                                   )},
                 },
             },
