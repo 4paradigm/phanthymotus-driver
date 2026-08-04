@@ -266,6 +266,15 @@ class TianyiDeviceBundle:
             self._plugins.append(LightPlugin(plugins_cfg["light"], namespace, ros2))
             print("[bundle] LightPlugin loaded")
 
+        if plugins_cfg.get("smart_motion", {}).get("enabled", False):
+            from device import SmartMotionPlugin
+            tts_p = next((p for p in self._plugins if type(p).__name__ == "TtsPlugin"), None)
+            vp_p = next((p for p in self._plugins if type(p).__name__ == "VoicePlayActuatorPlugin"), None)
+            self._plugins.append(SmartMotionPlugin(
+                plugins_cfg["smart_motion"], namespace, ros2,
+                tts_plugin=tts_p, voice_play_plugin=vp_p))
+            print("[bundle] SmartMotionPlugin loaded")
+
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
             try:

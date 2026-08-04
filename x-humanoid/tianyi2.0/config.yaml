@@ -73,3 +73,5 @@ plugins:
         url: "tcp://192.168.41.1:9800"
   light:
     enabled: true
+  smart_motion:
+    enabled: true

@@ -5285,3 +5285,82 @@ class ChassisRawPlugin:
     @staticmethod
     def _clamp(value: float, low: float, high: float) -> float:
         return max(low, min(high, value))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SmartMotionPlugin (actuator) — 卡名: smart_motion
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SmartMotionPlugin:
+    """统一打断/暂停控制卡片。协调语音的中止、暂停和恢复。"""
+    PREFIX = "smart_motion"
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2,
+                 tts_plugin=None, voice_play_plugin=None):
+        self._tts = tts_plugin
+        self._voice_play = voice_play_plugin
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "smart_motion",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "SmartMotion — 统一语音输出控制，提供打断、暂停、恢复能力",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["interrupt_speak", "pause_speak", "resume_speak", "status"],
+                        "description": "控制动作",
+                    },
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "interrupt_speak": {"params": [], "description": "中止语音播放（不可恢复当前播放，可发新指令）"},
+                    "pause_speak":     {"params": [], "description": "暂停语音播放（保留未播内容，可恢复）"},
+                    "resume_speak":    {"params": [], "description": "恢复之前暂停的语音播放"},
+                    "status":          {"params": [], "description": "查询当前语音输出状态"},
+                },
+            },
+        }
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "interrupt_speak":
+            r1 = self._do_tts("stop")
+            r2 = self._do_voice_play("stop")
+            return {"tts": r1, "voice_play": r2}
+        elif action == "pause_speak":
+            r1 = self._do_tts("pause")
+            r2 = self._do_voice_play("pause")
+            return {"tts": r1, "voice_play": r2}
+        elif action == "resume_speak":
+            r1 = self._do_tts("resume")
+            r2 = self._do_voice_play("resume")
+            return {"tts": r1, "voice_play": r2}
+        elif action == "status":
+            return {
+                "tts": self._tts.dispatch("info", {}) if self._tts else None,
+                "voice_play": self._voice_play.dispatch("info", {}) if self._voice_play else None,
+            }
+        return None
+
+    def _do_tts(self, action: str) -> dict | None:
+        if self._tts:
+            return self._tts.dispatch(action, {})
+        return {"error": "no tts plugin"}
+
+    def _do_voice_play(self, action: str) -> dict | None:
+        if self._voice_play:
+            return self._voice_play.dispatch(action, {})
+        return {"error": "no voice_play plugin"}
