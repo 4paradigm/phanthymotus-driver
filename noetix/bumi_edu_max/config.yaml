@@ -1,0 +1,16 @@
+mcp_port: 15713
+ros_namespace: ""
+name: "Noetix BumiEDU Max"
+ros:
+  robot_domain_id: 0
+  core_domain_id: 42
+  robot_interface: "eth0"
+  cyclonedds_uri: "file:///opt/noetix-bumi-sdk/config/dds.xml"
+sdk:
+  path: "/opt/noetix-bumi-sdk"
+  dds_config: "/opt/noetix-bumi-sdk/config/dds.xml"
+  enable_low_level: true
+state_rate_hz: 20.0
+control:
+  high_rate_hz: 100.0
+  joint_count: 21

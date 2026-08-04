@@ -1,0 +1,11 @@
+id: noetix-bumi-edu-max-driver
+name: Noetix BumiEDU Max Bundle
+category: driver
+hardware_provider: noetix
+hardware_model: "bumi-edu-max"
+image_name: noetix-bumi-edu-max
+port: 15713
+mcp_url: "http://localhost:15713/mcp"
+description: "BumiEDU Max — 官方 Native DDS SDK 行走/跑步、舞蹈、示教、跌倒恢复、21 电机底层控制与状态"
+build_context_extras:
+  - ../../common

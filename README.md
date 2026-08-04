@@ -11,6 +11,7 @@ Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server t
 | Driver | Hardware | Port | Description |
 |--------|----------|------|-------------|
 | `unitree/g1` | Unitree G1 Humanoid | 15701 | Locomotion, arm control, mic, speaker, LED, state monitoring |
+| `noetix/bumi_edu_max` | Noetix BumiEDU Max | 15713 | Official native DDS motion, dance, teaching, recovery, telemetry and low-level motor control |
 | `phanthy/remote_control` | Remote Control Bridge | 15710 | Remote control relay |
 
 ## Quick Start
