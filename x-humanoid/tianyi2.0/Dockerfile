@@ -33,7 +33,7 @@ ENV AMENT_PREFIX_PATH=/tianyi_ws/install/bodyctrl_msgs:/tianyi_ws/install/lyre_m
 ENV LD_LIBRARY_PATH=/tianyi_ws/install/bodyctrl_msgs/lib:/tianyi_ws/install/lyre_msgs/lib:${LD_LIBRARY_PATH}
 
 COPY resource/ /work/resource/
-COPY main.py device.py nav_client.py config.yaml driver.yaml /work/
+COPY main.py device.py light.py nav_client.py config.yaml driver.yaml /work/
 
 EXPOSE 15707
 

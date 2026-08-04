@@ -1012,24 +1012,6 @@ class PointCloudPlugin:
     def dispatch(self, action, args): return {"state": "running" if self._running else "idle", "topic_out": [{"topic": self._topic, "format": self._format}]}
 
 
-class LightPlugin:
-    """Safe semantic system-light control; no raw vendor command is exposed."""
-    _commands = {"standby": 99, "service_wait": 20, "service_ready": 22, "warning": 12, "warning_clear": 13, "error": 10, "error_clear": 11}
-    def __init__(self, plugin_config, namespace, ros2):
-        self._pub_node = Node("tianyi2_light_pub", context=ros2.ctx_tianyi); ros2.executor_tianyi.add_node(self._pub_node); self._pub = None
-    def get_tool(self):
-        return {"name": "light", "type": "actuator", "description": "天轶2.0 系统状态灯效", "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": list(self._commands)}}, "required": ["action"], "x-action-params": {k: {"params": [], "description": k} for k in self._commands}}}
-    def start(self):
-        from bodyctrl_msgs.msg import LightCtrl
-        self._pub = self._pub_node.create_publisher(LightCtrl, "/xsys/light/ctrl", _RELIABLE_QOS)
-    def stop(self): pass
-    def dispatch(self, action, args):
-        if action not in self._commands: return {"error": f"unknown action: {action}"}
-        from bodyctrl_msgs.msg import LightCtrl
-        msg = LightCtrl(); msg.cmd = self._commands[action]; msg.caller_id = "phanthy-motus"; msg.caller_msg = f"Agent Core: {action}"; self._pub.publish(msg)
-        return {"state": action}
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # AsrPlugin (sensor)
 # ══════════════════════════════════════════════════════════════════════════════
