@@ -218,7 +218,7 @@ class _ExtMicNode(Node):
         self.state = "idle"
 
     def _is_alsa_id(self) -> bool:
-        return isinstance(self._device_index, str) and self._device_index.startswith("hw:CARD=")
+        return isinstance(self._device_index, str) and self._device_index.startswith("hw:")
 
     def start(self) -> dict:
         if self.state == "running":
@@ -242,9 +242,13 @@ class _ExtMicNode(Node):
 
     def _start_alsaaudio(self):
         import alsaaudio
-        # alsa_id format: "hw:CARD=Pro,DEV=0"
-        card_part = self._device_index.split("hw:CARD=", 1)[1].split(",DEV=")[0]
-        card_idx = alsaaudio.cards().index(card_part)
+        # alsa_id format: "hw:CARD=Pro,DEV=0" or "hw:N,M"
+        if "CARD=" in self._device_index:
+            card_part = self._device_index.split("hw:CARD=", 1)[1].split(",DEV=")[0]
+            card_idx = alsaaudio.cards().index(card_part)
+        else:
+            # "hw:N,M" format — card number is N
+            card_idx = int(self._device_index.split("hw:", 1)[1].split(",")[0])
 
         # Probe native format: try S24_3LE stereo first (DJI Wireless Mic etc.),
         # fallback to S16_LE mono for standard USB mics.
