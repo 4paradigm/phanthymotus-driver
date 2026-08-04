@@ -378,7 +378,7 @@ def main():
         print("[bundle] ERROR: cannot connect to psdk_bridge, exiting")
         bridge_proc.terminate()
         sys.exit(1)
-    print(f"[bundle] BridgeClient connected (uart={detected_dev})")
+    print(f"[bundle] BridgeClient connected (uart0={uart0_dev} uart1={uart1_dev})")
 
     # ROS2
     rclpy.init()
