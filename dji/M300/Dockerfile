@@ -8,9 +8,16 @@
 # ────────────────────────────────────────────────────────────────────
 
 ARG PSDK_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/psdk-base:latest
+# Nano keeps the verified PSDK 3.11.0 test image locally. Copying only the
+# SDK tree keeps the runtime base unchanged while pinning M300 to 3.11.0.
+ARG PSDK_311_IMAGE=dji-m300:psdk-3.11-test
 ARG PYPI_MIRROR=https://pypi.org/simple/
+FROM ${PSDK_311_IMAGE} AS psdk311
 FROM ${PSDK_BASE_IMAGE}
 ARG PYPI_MIRROR
+
+# Do not inherit psdk-base:latest's PSDK 3.16.x.
+COPY --from=psdk311 /opt/Payload-SDK/ /opt/Payload-SDK/
 
 WORKDIR /work
 
@@ -28,10 +35,9 @@ RUN mkdir -p /work/psdk_bridge/build && \
     cd /work/psdk_bridge/build && \
     cmake .. -DCMAKE_BUILD_TYPE=Release \
              -DPSDK_DIR=/opt/Payload-SDK \
-             -DCMAKE_C_FLAGS="-DPSDK_ENABLED -DPSDK_ARCH_SYS_LINUX=1 -DCONFIG_HARDWARE_CONNECTION=DJI_USE_UART_AND_NETWORK_DEVICE" && \
+             -DCMAKE_C_FLAGS="-DPSDK_ENABLED -DPSDK_ARCH_SYS_LINUX=1 -DCONFIG_HARDWARE_CONNECTION=DJI_USE_ONLY_UART" && \
     make -j$(nproc) && \
-    cp psdk_bridge /usr/local/bin/psdk_bridge && \
-    cp startup_bulk /usr/local/bin/startup_bulk
+    cp psdk_bridge /usr/local/bin/psdk_bridge
 
 # ── Application code (changes frequently) ──────────────────────────
 COPY main.py         /work/main.py

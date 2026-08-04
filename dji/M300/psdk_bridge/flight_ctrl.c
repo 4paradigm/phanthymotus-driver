@@ -15,6 +15,7 @@
 
 #ifdef PSDK_ENABLED
 #include "dji_flight_controller.h"
+#include "dji_version.h"
 
 static int s_has_authority = 0;
 
@@ -287,13 +288,21 @@ int64_t flight_ctrl_turn_off_motors(void) {
 }
 
 int64_t flight_ctrl_slow_rotate_start(void) {
+#if DJI_VERSION_MINOR >= 16
     T_DjiReturnCode rc = DjiFlightController_StartSlowRotateMotor();
     return (rc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) ? 0 : (int64_t)rc;
+#else
+    return (int64_t)DJI_ERROR_SYSTEM_MODULE_CODE_NONSUPPORT;
+#endif
 }
 
 int64_t flight_ctrl_slow_rotate_stop(void) {
+#if DJI_VERSION_MINOR >= 16
     T_DjiReturnCode rc = DjiFlightController_StopSlowRotateMotor();
     return (rc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) ? 0 : (int64_t)rc;
+#else
+    return (int64_t)DJI_ERROR_SYSTEM_MODULE_CODE_NONSUPPORT;
+#endif
 }
 
 /* ── Settings ─────────────────────────────────────────────────────── */
