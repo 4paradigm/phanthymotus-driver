@@ -199,6 +199,21 @@ class TianyiDeviceBundle:
             self._plugins.append(ControlledSpatialPlugin(plugins_cfg["controlled_spatial"], namespace, ros2, slamtec_client))
             print("[bundle] ControlledSpatialPlugin loaded")
 
+        if plugins_cfg.get("robot_faults", {}).get("enabled", False):
+            from device import RobotFaultsPlugin
+            self._plugins.append(RobotFaultsPlugin(plugins_cfg["robot_faults"], namespace, ros2, slamtec_client))
+            print("[bundle] RobotFaultsPlugin loaded")
+
+        if plugins_cfg.get("laser_scan", {}).get("enabled", False):
+            from device import LaserScanPlugin
+            self._plugins.append(LaserScanPlugin(plugins_cfg["laser_scan"], namespace, ros2, slamtec_client))
+            print("[bundle] LaserScanPlugin loaded")
+
+        if plugins_cfg.get("chassis_raw", {}).get("enabled", False):
+            from device import ChassisRawPlugin
+            self._plugins.append(ChassisRawPlugin(plugins_cfg["chassis_raw"], namespace, ros2, slamtec_client))
+            print("[bundle] ChassisRawPlugin loaded")
+
         if plugins_cfg.get("light", {}).get("enabled", False):
             from light import LightPlugin
             self._plugins.append(LightPlugin(plugins_cfg["light"], namespace, ros2))
@@ -238,7 +253,8 @@ class TianyiDeviceBundle:
                 if tool_def["name"] == tool_name:
                     if tool_def["type"] == "resource":
                         return p.dispatch(tool_name, args)
-                    action = args.pop("action", tool_name)
+                    default_action = tool_def.get("default_action", "start")
+                    action = args.pop("action", default_action)
                     args['_tool_name'] = tool_name
                     result = p.dispatch(action, args)
                     return result
@@ -325,7 +341,7 @@ def make_handler():
                         tool_result = {
                             "content": [{
                                 "type": "text",
-                                "text": json.dumps(result),
+                                "text": json.dumps(result, ensure_ascii=False),
                             }],
                         }
                         if (isinstance(result, dict)
