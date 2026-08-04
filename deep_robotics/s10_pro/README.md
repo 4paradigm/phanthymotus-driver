@@ -9,3 +9,8 @@ follow and docking commands use the correlated JSON bridge described in
 The adapter reports publication separately from physical acknowledgement. Once
 the supplier delivers the S10Pro message/action package, bind those commands in
 `device.py` while keeping the MCP contract unchanged.
+
+The robot has not arrived yet. Standard message wiring and acknowledgement
+semantics are contract-tested, but the actual S10Pro topic names, supplier IDL,
+gait/action catalog, safety limits and every physical workflow still require
+supplier confirmation and real-hardware validation.
