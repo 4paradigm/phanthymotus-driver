@@ -14,7 +14,9 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
         curl \
         espeak-ng \
         alsa-utils \
-        libasound2-dev && \
+        libasound2-dev \
+        sshpass \
+        openssh-client && \
     rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \

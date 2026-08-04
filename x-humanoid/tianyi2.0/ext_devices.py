@@ -395,6 +395,216 @@ class _ExtMicNode(Node):
         }
 
 
+class _NetworkMicNode(Node):
+    """Captures audio from a remote host via SSH + arecord and publishes AudioChunk."""
+
+    def __init__(self, url: str, device_name: str, namespace: str, instance_id: str, context=None):
+        node_name = f"ext_mic_{instance_id.replace('-', '_')}"
+        super().__init__(node_name, context=context)
+        self._url = url  # "ssh://user:pass@host/hw:card,dev" or "tcp://host:port"
+        self._device_name = device_name
+        self._instance_id = instance_id
+        self._topic = f"/{namespace}/ext_mic/{instance_id.replace('-', '_')}/audio"
+        self._pub = self.create_publisher(AudioChunk, self._topic, _LOW_LAT_QOS)
+        self._thread: Optional[threading.Thread] = None
+        self._running = False
+        self.state = "idle"
+
+    def start(self) -> dict:
+        if self.state == "running":
+            return self._status_dict()
+        self._running = True
+        self._thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._thread.start()
+        self.state = "running"
+        log.info(f"[ext_mic/net] started {self._device_name} ({self._url}) → {self._topic}")
+        return self._status_dict()
+
+    def _capture_loop(self):
+        """Capture via SSH arecord or TCP socket depending on URL scheme."""
+        if self._url.startswith("ssh://"):
+            self._ssh_capture()
+        else:
+            self._tcp_capture()
+
+    def _ssh_capture(self):
+        """ssh://user:pass@host/hw:card,dev — remote arecord via SSH pipe."""
+        # Parse: ssh://ubuntu:123@192.168.41.1/hw:1,0
+        parts = self._url.replace("ssh://", "")
+        user_pass, rest = parts.split("@", 1)
+        host, alsa_dev = rest.split("/", 1)
+        user, password = user_pass.split(":", 1) if ":" in user_pass else (user_pass, "")
+
+        # Probe remote device capabilities
+        rate = 48000
+        fmt = "S16_LE"
+        channels = 1
+        try:
+            probe_cmd = ["sshpass", "-p", password, "ssh", "-o", "StrictHostKeyChecking=no",
+                         f"{user}@{host}",
+                         f"arecord -D {alsa_dev} --dump-hw-params -d 1 /dev/null 2>&1"]
+            probe = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
+            output = probe.stdout + probe.stderr
+            for line in output.splitlines():
+                if 'RATE:' in line:
+                    rates = [int(x) for x in re.findall(r'\d+', line.split('RATE:')[1])]
+                    if rates:
+                        rate = min(rates)
+                elif 'FORMAT:' in line:
+                    fmts = line.split('FORMAT:')[1].strip().split()
+                    if 'S24_3LE' in fmts and 'S16_LE' not in fmts:
+                        fmt = "S24_3LE"
+                    elif 'S16_LE' in fmts:
+                        fmt = "S16_LE"
+                elif 'CHANNELS:' in line:
+                    ch = line.split('CHANNELS:')[1].strip()
+                    if '2' in ch and '1' not in ch:
+                        channels = 2
+            print(f"[ext_mic/ssh] remote device: fmt={fmt} ch={channels} rate={rate}", flush=True)
+        except Exception as e:
+            print(f"[ext_mic/ssh] probe failed: {e}, using defaults", flush=True)
+
+        target_rate = 16000
+        CHUNK_SIZE = 1024  # 512 int16 samples
+        is_s24_stereo = (fmt == "S24_3LE" and channels == 2)
+        if fmt == "S24_3LE" and channels == 1:
+            channels = 2  # S24_3LE usually paired with stereo
+
+        while self._running:
+            proc = None
+            try:
+                arecord_fmt = fmt
+                cmd = [
+                    "sshpass", "-p", password,
+                    "ssh", "-o", "StrictHostKeyChecking=no", "-o", "ServerAliveInterval=10",
+                    f"{user}@{host}",
+                    f"arecord -D {alsa_dev} -f {arecord_fmt} -r {rate} -c {channels} -t raw -q -"
+                ]
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                print(f"[ext_mic/ssh] connected to {user}@{host}, {alsa_dev} {arecord_fmt} {channels}ch {rate}Hz", flush=True)
+
+                pub_buf = bytearray()
+                first_publish = True
+                while self._running:
+                    data = proc.stdout.read(4096)
+                    if not data:
+                        break
+
+                    # Convert S24_3LE stereo → S16_LE mono
+                    if fmt == "S24_3LE":
+                        raw = np.frombuffer(data, dtype=np.uint8)
+                        bytes_per_frame = 3 * channels
+                        n_frames = len(raw) // bytes_per_frame
+                        if n_frames == 0:
+                            continue
+                        raw = raw[:n_frames * bytes_per_frame]
+                        if channels == 2:
+                            raw = raw.reshape(n_frames, 2, 3)
+                            left = raw[:, 0, 1:].copy().view(np.int16).flatten()
+                            right = raw[:, 1, 1:].copy().view(np.int16).flatten()
+                            samples = ((left.astype(np.int32) + right.astype(np.int32)) // 2).astype(np.int16)
+                        else:
+                            raw = raw.reshape(n_frames, 3)
+                            samples = raw[:, 1:].copy().view(np.int16).flatten()
+                    else:
+                        samples = np.frombuffer(data, dtype=np.int16)
+                        if channels == 2:
+                            samples = samples.reshape(-1, 2).mean(axis=1).astype(np.int16)
+
+                    # Resample to 16kHz
+                    if rate != target_rate:
+                        n_out = int(len(samples) * target_rate / rate)
+                        if n_out <= 0:
+                            continue
+                        x_new = np.linspace(0, len(samples) - 1, n_out)
+                        samples = np.interp(x_new, np.arange(len(samples)), samples.astype(np.float32)).astype(np.int16)
+
+                    pub_buf += samples.tobytes()
+                    while len(pub_buf) >= CHUNK_SIZE:
+                        chunk = bytes(pub_buf[:CHUNK_SIZE])
+                        pub_buf = pub_buf[CHUNK_SIZE:]
+                        msg = AudioChunk()
+                        msg.header.stamp = self.get_clock().now().to_msg()
+                        msg.format = "audio/pcm-16k"
+                        msg.data = list(chunk)
+                        self._pub.publish(msg)
+                        if first_publish:
+                            print(f"[ext_mic/ssh] first publish on {self._topic}", flush=True)
+                            first_publish = False
+            except Exception as e:
+                if self._running:
+                    print(f"[ext_mic/ssh] error: {e}, reconnecting in 3s", flush=True)
+            finally:
+                if proc:
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=2)
+                    except Exception:
+                        pass
+            if self._running:
+                time.sleep(3)
+
+    def _tcp_capture(self):
+        """tcp://host:port — connect to audio_sender TCP server."""
+        import socket as _socket
+        addr_str = self._url.replace("tcp://", "")
+        host, port = addr_str.rsplit(":", 1)
+        port = int(port)
+        CHUNK_SIZE = 1024
+
+        while self._running:
+            sock = None
+            try:
+                sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+                sock.settimeout(5.0)
+                sock.connect((host, port))
+                sock.settimeout(None)
+                print(f"[ext_mic/tcp] connected to {host}:{port}", flush=True)
+
+                buf = bytearray()
+                while self._running:
+                    data = sock.recv(4096)
+                    if not data:
+                        break
+                    buf += data
+                    while len(buf) >= CHUNK_SIZE:
+                        chunk = bytes(buf[:CHUNK_SIZE])
+                        buf = buf[CHUNK_SIZE:]
+                        msg = AudioChunk()
+                        msg.header.stamp = self.get_clock().now().to_msg()
+                        msg.format = "audio/pcm-16k"
+                        msg.data = list(chunk)
+                        self._pub.publish(msg)
+            except Exception as e:
+                if self._running:
+                    print(f"[ext_mic/tcp] error: {e}, reconnecting in 2s", flush=True)
+            finally:
+                if sock:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+            if self._running:
+                time.sleep(2)
+
+    def stop(self) -> dict:
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=3)
+            self._thread = None
+        self.state = "idle"
+        return self._status_dict()
+
+    def _status_dict(self) -> dict:
+        return {
+            "state": self.state,
+            "device_name": self._device_name,
+            "device_index": self._url,
+            "topic_in": [],
+            "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k", "desc": ""}],
+        }
+
+
 class _ExtCameraNode:
     """Manages a subprocess that captures video from a V4L2 device and publishes JPEG."""
 
@@ -619,6 +829,14 @@ class ExtMicPlugin:
         self._nodes: dict[str, _ExtMicNode] = {}
         self._instance_configs: dict[str, dict] = {}  # instance_id → saved config params
         self._available_devices = _enumerate_ext_mics()
+        # Add network sources from config
+        for ns in plugin_cfg.get("network_sources", []):
+            self._available_devices.append({
+                "index": ns["url"],
+                "alsa_id": ns["url"],
+                "name": ns.get("name", ns["url"]),
+                "network": True,
+            })
         log.info(f"[ext_mic] found {len(self._available_devices)} external mic device(s)")
         for d in self._available_devices:
             log.info(f"  [{d['index']}] {d['name']}")
@@ -691,10 +909,14 @@ class ExtMicPlugin:
             try:
                 device_id = int(device_id)
             except (ValueError, TypeError):
-                pass  # keep as string (alsa_id like "hw:0,0")
+                pass  # keep as string (alsa_id like "hw:0,0" or "tcp://...")
             if instance_id not in self._nodes:
-                node = _ExtMicNode(device_id, device_name, self._namespace, instance_id,
-                                   context=self._executor.context)
+                if isinstance(device_id, str) and (device_id.startswith("tcp://") or device_id.startswith("ssh://")):
+                    node = _NetworkMicNode(device_id, device_name, self._namespace, instance_id,
+                                           context=self._executor.context)
+                else:
+                    node = _ExtMicNode(device_id, device_name, self._namespace, instance_id,
+                                       context=self._executor.context)
                 self._executor.add_node(node)
                 self._nodes[instance_id] = node
             return self._nodes[instance_id].start()

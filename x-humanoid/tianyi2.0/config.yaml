@@ -68,5 +68,8 @@ plugins:
     enabled: true
   ext_mic:
     enabled: true
+    network_sources:
+      - name: "DJI Wireless Mic"
+        url: "ssh://ubuntu:123@192.168.41.1/hw:1,0"
   light:
     enabled: true
