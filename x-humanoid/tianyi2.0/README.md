@@ -42,6 +42,18 @@ calculate the PD output or impose a trajectory speed limit. Use small target
 changes, begin with low gains, keep the emergency stop available, and use
 `move_pos` when bounded motion speed is required.
 
+In practical terms, `move_ctrl` is intended for controller commissioning,
+pose holding and already-validated compliant interaction where the operator
+needs to tune joint stiffness and damping. Higher `kp` generally increases
+position response and holding stiffness but can increase impact and overshoot;
+lower `kp` is more compliant but can leave a larger load-dependent position
+error. Higher `kd` generally adds damping, while insufficient `kd` can allow
+overshoot or oscillation. The exact control law runs in the vendor controller,
+so these effects are guidance rather than a driver-side torque calculation.
+The same seven-element gain arrays are applied to corresponding joints on both
+arms. Do not use `move_ctrl` as a substitute for `move_pos` for routine poses,
+large position steps or semantic gestures.
+
 Both modes reject malformed arrays and poses outside the checked-in URDF
 limits. They check fresh `/arm/status`, selected motor faults, emergency stop,
 and power state before publishing, then wait for newer feedback. Do not command
