@@ -303,9 +303,13 @@ class _ExtMicNode(Node):
                 if n_frames == 0:
                     continue
                 raw = raw[:n_frames * 6].reshape(n_frames, 2, 3)
-                # Take high 2 bytes of each 24-bit sample as int16 (effectively >>8)
-                left = raw[:, 0, 1:].copy().view(np.int16).flatten()
-                right = raw[:, 1, 1:].copy().view(np.int16).flatten()
+                # Reconstruct 24-bit signed int, then >> 8 to 16-bit
+                def _s24_to_s16_local(ch):
+                    val = (ch[:, 0].astype(np.int32) | (ch[:, 1].astype(np.int32) << 8) | (ch[:, 2].astype(np.int32) << 16))
+                    val[val >= 0x800000] -= 0x1000000
+                    return (val >> 8).astype(np.int16)
+                left = _s24_to_s16_local(raw[:, 0, :])
+                right = _s24_to_s16_local(raw[:, 1, :])
                 mono = ((left.astype(np.int32) + right.astype(np.int32)) // 2).astype(np.int16)
                 data = mono.tobytes()
                 length = n_frames
@@ -490,7 +494,7 @@ class _NetworkMicNode(Node):
                     if not data:
                         break
 
-                    # Convert S24_3LE stereo → S16_LE mono
+                    # Convert S24_3LE → S16_LE mono
                     if fmt == "S24_3LE":
                         raw = np.frombuffer(data, dtype=np.uint8)
                         bytes_per_frame = 3 * channels
@@ -498,14 +502,23 @@ class _NetworkMicNode(Node):
                         if n_frames == 0:
                             continue
                         raw = raw[:n_frames * bytes_per_frame]
+
+                        def _s24_to_s16(ch_bytes):
+                            """Reconstruct 24-bit signed int, then >> 8 to 16-bit."""
+                            val = (ch_bytes[:, 0].astype(np.int32) |
+                                   (ch_bytes[:, 1].astype(np.int32) << 8) |
+                                   (ch_bytes[:, 2].astype(np.int32) << 16))
+                            val[val >= 0x800000] -= 0x1000000
+                            return (val >> 8).astype(np.int16)
+
                         if channels == 2:
                             raw = raw.reshape(n_frames, 2, 3)
-                            left = raw[:, 0, 1:].copy().view(np.int16).flatten()
-                            right = raw[:, 1, 1:].copy().view(np.int16).flatten()
+                            left = _s24_to_s16(raw[:, 0, :])
+                            right = _s24_to_s16(raw[:, 1, :])
                             samples = ((left.astype(np.int32) + right.astype(np.int32)) // 2).astype(np.int16)
                         else:
                             raw = raw.reshape(n_frames, 3)
-                            samples = raw[:, 1:].copy().view(np.int16).flatten()
+                            samples = _s24_to_s16(raw)
                     else:
                         samples = np.frombuffer(data, dtype=np.int16)
                         if channels == 2:
