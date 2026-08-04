@@ -94,6 +94,7 @@ class DualDomainROS2:
 
 class TianyiDeviceBundle:
     def __init__(self, cfg: dict, namespace: str, ros2: DualDomainROS2, slamtec_client):
+        self._cfg = cfg
         self._plugins: list = []
         plugins_cfg = cfg.get("plugins", {})
 
@@ -116,6 +117,26 @@ class TianyiDeviceBundle:
             from device import NavStatePlugin
             self._plugins.append(NavStatePlugin(plugins_cfg["nav_state"], namespace, ros2, slamtec_client))
             print("[bundle] NavStatePlugin loaded")
+
+        if plugins_cfg.get("power_board", {}).get("enabled", False):
+            from device import PowerBoardStatePlugin
+            self._plugins.append(PowerBoardStatePlugin(plugins_cfg["power_board"], namespace, ros2))
+            print("[bundle] PowerBoardStatePlugin loaded")
+
+        if plugins_cfg.get("motors", {}).get("enabled", False):
+            from device import MotorStatePlugin
+            self._plugins.append(MotorStatePlugin(plugins_cfg["motors"], namespace, ros2))
+            print("[bundle] MotorStatePlugin loaded")
+
+        if plugins_cfg.get("hand_state", {}).get("enabled", False):
+            from device import HandStatePlugin
+            self._plugins.append(HandStatePlugin(plugins_cfg["hand_state"], namespace, ros2))
+            print("[bundle] HandStatePlugin loaded")
+
+        if plugins_cfg.get("remote_event", {}).get("enabled", False):
+            from device import RemoteStatePlugin
+            self._plugins.append(RemoteStatePlugin(plugins_cfg["remote_event"], namespace, ros2))
+            print("[bundle] RemoteStatePlugin loaded")
 
         if plugins_cfg.get("head", {}).get("enabled", False):
             from device import HeadPlugin
@@ -154,6 +175,11 @@ class TianyiDeviceBundle:
             self._plugins.append(TtsPlugin(plugins_cfg["tts"], namespace, ros2))
             print("[bundle] TtsPlugin loaded")
 
+        if plugins_cfg.get("voice_play", {}).get("enabled", False):
+            from device import VoicePlayActuatorPlugin
+            self._plugins.append(VoicePlayActuatorPlugin(plugins_cfg["voice_play"], namespace, ros2))
+            print("[bundle] VoicePlayActuatorPlugin loaded")
+
         if plugins_cfg.get("nav", {}).get("enabled", False):
             from device import NavPlugin
             self._plugins.append(NavPlugin(plugins_cfg["nav"], namespace, ros2, slamtec_client))
@@ -163,6 +189,15 @@ class TianyiDeviceBundle:
             from device import ChatPlugin
             self._plugins.append(ChatPlugin(plugins_cfg["chat"], namespace, ros2))
             print("[bundle] ChatPlugin loaded")
+
+        if plugins_cfg.get("voice_chat", {}).get("enabled", False):
+            from device import VoiceChatActuatorPlugin
+            self._plugins.append(VoiceChatActuatorPlugin(plugins_cfg["voice_chat"], namespace, ros2))
+            print("[bundle] VoiceChatActuatorPlugin loaded")
+        if plugins_cfg.get("controlled_spatial", {}).get("enabled", False):
+            from controlled_spatial import ControlledSpatialPlugin
+            self._plugins.append(ControlledSpatialPlugin(plugins_cfg["controlled_spatial"], namespace, ros2, slamtec_client))
+            print("[bundle] ControlledSpatialPlugin loaded")
 
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
@@ -271,7 +306,7 @@ def make_handler():
                     ok({
                         "protocolVersion": "2024-11-05",
                         "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "tianyi2-device-bundle", "version": "1.0.0"},
+                        "serverInfo": {"name": _bundle._cfg.get("name", "tianyi2-device-bundle"), "version": "1.0.0"},
                     })
                 elif method == "tools/list":
                     ok({"tools": _bundle.get_all_tools()})
