@@ -8,6 +8,7 @@ tianyi2:
   volumes:
     - /dev:/dev
     - /opt/phanthy-motus/data:/opt/phanthy-motus/data
+    - /home/nvidia/data/param/dds_profile.xml:/work/dds_profile.xml:ro
   environment:
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - PYTHONUNBUFFERED=1

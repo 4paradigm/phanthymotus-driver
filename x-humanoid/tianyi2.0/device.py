@@ -1491,9 +1491,12 @@ class AsrPlugin:
         text = msg.text
         if not text or not text.strip():
             return
+        print(f"[AsrPlugin] IN: {text!r}", flush=True)
         text = self._kws_filter(text)
         if text is None:
+            print(f"[AsrPlugin] KWS rejected", flush=True)
             return
+        print(f"[AsrPlugin] OUT: {text!r}", flush=True)
         out = String()
         out.data = json.dumps({"id": msg.id, "text": text})
         self._pub.publish(out)
@@ -1509,9 +1512,12 @@ class AsrPlugin:
             data = None
         if not text or not text.strip():
             return
+        print(f"[AsrPlugin] IN(str): {text!r}", flush=True)
         filtered = self._kws_filter(text)
         if filtered is None:
+            print(f"[AsrPlugin] KWS rejected", flush=True)
             return
+        print(f"[AsrPlugin] OUT: {filtered!r}", flush=True)
         if data is not None:
             data["text"] = filtered
             out = String()

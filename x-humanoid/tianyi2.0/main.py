@@ -56,11 +56,17 @@ class DualDomainROS2:
 
     def __init__(self):
         # Domain 0: connect to tianyi body controller
+        # Use lyre's DDS profile so we can discover topics on 192.168.41.x / 127.0.0.1
+        dds_profile = "/work/dds_profile.xml"
+        if os.path.exists(dds_profile):
+            os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = dds_profile
+            print(f"[ros2] domain0: using DDS profile {dds_profile}")
         self.ctx_tianyi = Context()
         rclpy.init(context=self.ctx_tianyi, domain_id=0)
         self.executor_tianyi = rclpy.executors.MultiThreadedExecutor(context=self.ctx_tianyi)
 
-        # Domain 42: publish to agent-core
+        # Domain 42: publish to agent-core (no DDS profile — use all interfaces)
+        os.environ.pop("FASTRTPS_DEFAULT_PROFILES_FILE", None)
         self.ctx_core = Context()
         rclpy.init(context=self.ctx_core, domain_id=42)
         self.executor_core = rclpy.executors.MultiThreadedExecutor(context=self.ctx_core)
