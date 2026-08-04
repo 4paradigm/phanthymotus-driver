@@ -1,0 +1,11 @@
+id: pndbotics-adam-pro-driver
+name: PNDbotics Adam Pro Bundle
+category: driver
+hardware_provider: pndbotics
+hardware_model: "adam-pro"
+image_name: pndbotics-adam-pro
+port: 15712
+mcp_url: "http://localhost:15712/mcp"
+description: "Adam Pro — 31 电机/12 手指、400Hz ROS2 底层控制、相机、状态、全身轨迹与动作编排"
+build_context_extras:
+  - ../../common

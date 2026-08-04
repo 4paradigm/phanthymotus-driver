@@ -1,0 +1,14 @@
+mcp_port: 15712
+ros_namespace: ""
+name: "PNDbotics Adam Pro"
+ros:
+  robot_domain_id: 1
+  core_domain_id: 42
+  robot_interface: "eth0"
+topics:
+  low_state: "/lowstate"
+  low_command: "/lowcmd"
+  hand_command: "/handcmd"
+  camera: "/zed/zed_node/rgb/image_rect_color"
+control:
+  rate_hz: 400.0
