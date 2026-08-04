@@ -567,12 +567,28 @@ class _NetworkMicNode(Node):
                 time.sleep(3)
 
     def _tcp_capture(self):
-        """tcp://host:port — connect to audio_sender TCP server."""
+        """tcp://host:port[/format] — connect to raw audio TCP server.
+
+        Default format: S24_3LE stereo 48kHz (DJI Wireless Mic).
+        Append /pcm16k for pre-converted 16kHz mono streams.
+        """
         import socket as _socket
-        addr_str = self._url.replace("tcp://", "")
-        host, port = addr_str.rsplit(":", 1)
+        url_body = self._url.replace("tcp://", "")
+
+        # Parse optional format suffix: tcp://host:port/pcm16k
+        pre_converted = False
+        if "/pcm16k" in url_body:
+            url_body = url_body.replace("/pcm16k", "")
+            pre_converted = True
+
+        host, port = url_body.rsplit(":", 1)
         port = int(port)
-        CHUNK_SIZE = 1024
+
+        # S24_3LE stereo 48kHz params
+        FRAME_SIZE = 6  # 3 bytes * 2 channels
+        NATIVE_RATE = 48000
+        TARGET_RATE = 16000
+        PUB_CHUNK = 1024  # 512 int16 samples = 1024 bytes
 
         while self._running:
             sock = None
@@ -581,22 +597,60 @@ class _NetworkMicNode(Node):
                 sock.settimeout(5.0)
                 sock.connect((host, port))
                 sock.settimeout(None)
-                print(f"[ext_mic/tcp] connected to {host}:{port}", flush=True)
+                sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
+                print(f"[ext_mic/tcp] connected to {host}:{port} (pre_converted={pre_converted})", flush=True)
 
-                buf = bytearray()
+                raw_buf = bytearray()
+                pub_buf = bytearray()
+                first_publish = True
+
                 while self._running:
-                    data = sock.recv(4096)
+                    data = sock.recv(8192)
                     if not data:
                         break
-                    buf += data
-                    while len(buf) >= CHUNK_SIZE:
-                        chunk = bytes(buf[:CHUNK_SIZE])
-                        buf = buf[CHUNK_SIZE:]
+
+                    if pre_converted:
+                        # Already PCM-16k mono
+                        pub_buf += data
+                    else:
+                        # S24_3LE stereo 48kHz → S16_LE mono 16kHz
+                        raw_buf += data
+                        n_frames = len(raw_buf) // FRAME_SIZE
+                        if n_frames == 0:
+                            continue
+                        frame_bytes = n_frames * FRAME_SIZE
+                        chunk = bytes(raw_buf[:frame_bytes])
+                        raw_buf = raw_buf[frame_bytes:]
+
+                        arr = np.frombuffer(chunk, dtype=np.uint8).reshape(n_frames, 2, 3)
+                        # S24_3LE decode
+                        def _s24(ch):
+                            v = (ch[:, 0].astype(np.int32) | (ch[:, 1].astype(np.int32) << 8) | (ch[:, 2].astype(np.int32) << 16))
+                            v[v >= 0x800000] -= 0x1000000
+                            return (v >> 8).astype(np.int16)
+                        left = _s24(arr[:, 0, :])
+                        right = _s24(arr[:, 1, :])
+                        mono = ((left.astype(np.int32) + right.astype(np.int32)) // 2).astype(np.int16)
+
+                        # Resample 48k → 16k
+                        n_out = int(len(mono) * TARGET_RATE / NATIVE_RATE)
+                        if n_out > 0:
+                            x_new = np.linspace(0, len(mono) - 1, n_out)
+                            resampled = np.interp(x_new, np.arange(len(mono)), mono.astype(np.float32)).astype(np.int16)
+                            pub_buf += resampled.tobytes()
+
+                    # Publish in fixed chunks
+                    while len(pub_buf) >= PUB_CHUNK:
+                        chunk = bytes(pub_buf[:PUB_CHUNK])
+                        pub_buf = pub_buf[PUB_CHUNK:]
                         msg = AudioChunk()
                         msg.header.stamp = self.get_clock().now().to_msg()
                         msg.format = "audio/pcm-16k"
                         msg.data = list(chunk)
                         self._pub.publish(msg)
+                        if first_publish:
+                            print(f"[ext_mic/tcp] first publish on {self._topic}", flush=True)
+                            first_publish = False
             except Exception as e:
                 if self._running:
                     print(f"[ext_mic/tcp] error: {e}, reconnecting in 2s", flush=True)
