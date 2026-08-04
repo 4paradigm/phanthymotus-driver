@@ -4452,18 +4452,18 @@ class ChassisRawPlugin:
                                   "description": "移动方向 (固定速率 0.3 m/s)"},
                     "rotation": {"type": "string",
                                  "enum": ["left", "right"],
-                                 "description": "旋转方向 (固定角速度 1.0 rad/s ≈ 57°/s)"},
+                                 "description": "旋转方向"},
                     "angle": {"type": "number",
-                              "description": "旋转角度(度), 自动换算时间, 与 duration 二选一"},
+                              "description": "旋转角度(度), 使用 Slamtec RotateAction 编码器闭环, 精确到度"},
                     "duration": {"type": "number",
-                                 "description": "持续时间(秒), -1=持续运动"},
+                                 "description": "持续时间(秒), -1=持续运动 (不填 angle 时生效)"},
                 },
                 "required": ["action"],
                 "x-action-params": {
                     "move":   {"params": ["direction", "duration"],
                                "description": "前进/后退, 固定速率 0.3 m/s, duration=-1 持续运动"},
                     "rotate": {"params": ["rotation", "angle", "duration"],
-                               "description": "原地旋转, angle(度)或duration(秒), duration=-1 持续旋转, 固定角速度 1.0 rad/s ≈ 57°/s"},
+                               "description": "精确旋转: angle(度) 用 Slamtec RotateAction 闭环; duration 为持续旋转"},
                     "stop":   {"params": [],
                                "description": "立即停止移动"},
                 },
@@ -4496,24 +4496,33 @@ class ChassisRawPlugin:
             rot = args.get("rotation", "left")
             if rot not in ("left", "right"):
                 return {"error": "rotation must be 'left' or 'right'"}
-            direction = 3 if rot == "left" else 2
 
-            # angle(度) 优先于 duration, 按固定角速度换算
             angle = args.get("angle")
             dur = args.get("duration")
+
             if angle is not None:
+                # 精确旋转: 使用 Slamtec RotateAction (编码器闭环, 角度精确)
                 try:
                     angle_deg = abs(float(angle))
-                    dur = angle_deg / (self._FIXED_W * 180 / math.pi)
                 except (TypeError, ValueError):
                     return {"error": "angle must be a number (degrees)"}
+                angle_rad = math.radians(angle_deg)
+                if rot == "left":
+                    angle_rad = +angle_rad   # 正=逆时针=左转
+                else:
+                    angle_rad = -angle_rad   # 负=顺时针=右转
+                self._slamtec.rotate(angle_rad)
+                return {"rotation": rot, "angle": angle_deg, "unit": "degree",
+                        "rad": round(angle_rad, 4)}
+
+            # 非精确模式: duration 或 -1 持续旋转 (fallback move_by)
+            direction = 3 if rot == "left" else 2
             if dur is None:
                 dur = 3.0
             try:
                 dur = float(dur)
             except (TypeError, ValueError):
                 return {"error": "duration must be a number"}
-
             return self._start(direction, dur)
         elif action == "stop":
             return self._do_stop()
