@@ -11,7 +11,7 @@ Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server t
 | Driver | Hardware | Port | Description |
 |--------|----------|------|-------------|
 | `unitree/g1` | Unitree G1 Humanoid | 15701 | Locomotion, arm control, mic, speaker, LED, state monitoring |
-| `robotera/q5` | RobotEra Q5 | 15711 | Official ROS2 lifecycle, wheel base, MPC, XHand, mapping/navigation and choreography |
+| `robotera/q5` | RobotEra Q5 | 15711 | ROS2 lifecycle/trajectories, base/body, MPC, XHand, gestures, audio, battery, RGB-D, navigation and choreography |
 | `phanthy/remote_control` | Remote Control Bridge | 15710 | Remote control relay |
 
 ## Quick Start

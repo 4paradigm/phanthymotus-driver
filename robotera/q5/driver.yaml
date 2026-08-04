@@ -6,6 +6,6 @@ hardware_model: "q5"
 image_name: robotera-q5
 port: 15711
 mcp_url: "http://localhost:15711/mcp"
-description: "星动纪元 Q5 — 轮式底盘、双臂/头部 MPC、XHand、关节轨迹、LiDAR 建图、拓扑导航与自定义动作编排"
+description: "星动纪元 Q5 — 生命周期与预置轨迹、轮式底盘、双臂/头部 MPC、XHand、动作/音频播放、电池、RGB-D、LiDAR 建图导航与自定义编排"
 build_context_extras:
   - ../../common

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import math
 import threading
@@ -29,10 +30,10 @@ class Q5NodeSet:
         from geometry_msgs.msg import TwistStamped
         from rclpy.action import ActionClient
         from rclpy.node import Node
-        from sensor_msgs.msg import JointState
+        from sensor_msgs.msg import BatteryState, Image, JointState
         from std_msgs.msg import String
         from std_srvs.srv import Trigger
-        from xbot_common_interfaces.action import SimpleActions
+        from xbot_common_interfaces.action import AudioPlay, SimpleActions, SimpleTrajectory
         from xbot_common_interfaces.msg import HybridJointCommand, ServoPose
         from xbot_common_interfaces.srv import DynamicLaunch, StringMessage
 
@@ -43,9 +44,16 @@ class Q5NodeSet:
         ros2.executor_core.add_node(self.core)
         topics = config["topics"]
         self.joint_state = None
+        self.battery_state = None
+        self.mpc_pose = None
+        self.camera_frames: dict[str, Any] = {}
         self.joint_lock = threading.Lock()
         self.state_pub = self.core.create_publisher(String, f"/{namespace}/q5/state", 10)
         self.robot.create_subscription(JointState, topics["joint_state"], self._on_joint_state, 10)
+        self.robot.create_subscription(BatteryState, topics["battery_state"], self._on_battery_state, 10)
+        self.robot.create_subscription(ServoPose, topics["mpc_pose"], self._on_mpc_pose, 10)
+        self.robot.create_subscription(Image, topics["camera_color"], lambda msg: self._on_camera("color", msg), 1)
+        self.robot.create_subscription(Image, topics["camera_depth"], lambda msg: self._on_camera("depth", msg), 1)
         self.body_pub = self.robot.create_publisher(HybridJointCommand, topics["body_command"], 1)
         self.hand_pub = self.robot.create_publisher(HybridJointCommand, topics["hand_command"], 10)
         self.base_pub = self.robot.create_publisher(TwistStamped, topics["base_command"], 10)
@@ -54,10 +62,29 @@ class Q5NodeSet:
         self.ready = self.robot.create_client(Trigger, "/ready_service")
         self.activate = self.robot.create_client(Trigger, "/activate_service")
         self.deactivate = self.robot.create_client(Trigger, "/deactivate_service")
+        self.stop_launch = self.robot.create_client(Trigger, "/stop_launch")
         self.teleop = self.robot.create_client(StringMessage, "/teleoperation/service")
         self.simple_action = ActionClient(self.robot, SimpleActions, "/simple_actions")
+        self.simple_trajectory = ActionClient(self.robot, SimpleTrajectory, "/simple_trajectory")
+        self.gesture_pub = self.robot.create_publisher(String, "/gesture/upper_limb_play", 10)
+        self.gesture_status = self.robot.create_client(Trigger, "/gesture/is_play")
+        self.gesture_stop = self.robot.create_client(Trigger, "/gesture/stop_play")
+        self.audio_play = ActionClient(self.robot, AudioPlay, "/audio_player/play")
+        self.audio_status = self.robot.create_client(Trigger, "/audio_player/is_play")
+        self.audio_stop = self.robot.create_client(Trigger, "/audio_player/stop_play")
+        from xbot_common_interfaces.srv import SetVolume
+        self.audio_volume = self.robot.create_client(SetVolume, "/audio_player/set_volume")
         self.last_mpc_state: int | None = None
         self.closed = False
+
+    def _on_battery_state(self, msg):
+        self.battery_state = msg
+
+    def _on_mpc_pose(self, msg):
+        self.mpc_pose = msg
+
+    def _on_camera(self, stream: str, msg):
+        self.camera_frames[stream] = msg
 
     def _on_joint_state(self, msg):
         from std_msgs.msg import String
@@ -115,6 +142,20 @@ class Q5NodeSet:
         result = wrapped.result
         return {"action": name, "result": int(result.result), "message": result.message}
 
+    def trajectory(self, traj_type: int, duration: float):
+        from xbot_common_interfaces.action import SimpleTrajectory
+
+        if not self.simple_trajectory.wait_for_server(timeout_sec=2.0):
+            raise RuntimeError("ROS2 action unavailable: /simple_trajectory")
+        goal = SimpleTrajectory.Goal()
+        goal.traj_type = int(traj_type)
+        goal.duration = float(duration)
+        handle = _wait_future(self.simple_trajectory.send_goal_async(goal), 5.0)
+        if not handle.accepted:
+            raise RuntimeError(f"Q5 trajectory rejected: {traj_type}")
+        result = _wait_future(handle.get_result_async(), duration + 10.0).result
+        return {"traj_type": traj_type, "result": int(result.result), "message": result.message}
+
     def close(self):
         if self.closed:
             return
@@ -127,6 +168,7 @@ class Q5StatePlugin:
     CAPABILITIES = [
         "joint_state", "body_trajectory", "dual_arm_mpc", "xhand", "wheel_base",
         "lidar_mapping", "topological_navigation", "teleoperation", "choreography",
+        "vendor_trajectory", "recorded_gesture", "audio_playback", "battery", "rgbd_camera",
     ]
 
     def __init__(self, nodes: Q5NodeSet, namespace: str):
@@ -136,6 +178,7 @@ class Q5StatePlugin:
     def get_tools(self):
         return [
             tool("joints", "sensor", "Q5 joint position, velocity and effort", topic_out=[{"topic": self.topic, "format": "data/json"}]),
+            tool("battery", "sensor", "Q5 voltage, current, temperature, capacity and charge state"),
             tool("capabilities", "sensor", "Q5 driver capability discovery"),
             tool("ros_graph", "sensor", "Live Q5 ROS2 topic/service/action discovery"),
         ]
@@ -155,6 +198,8 @@ class Q5StatePlugin:
             return {"state": "idle"}
         if name == "joints":
             return {"state": "connected" if self.nodes.joint_state is not None else "waiting", "joints": self.nodes.joint_snapshot(), "topic": self.topic}
+        if name == "battery":
+            return {"state": "connected" if self.nodes.battery_state is not None else "waiting", "battery": jsonable(self.nodes.battery_state)}
         if name == "capabilities":
             return {"model": "RobotEra Q5", "capabilities": self.CAPABILITIES, "source": "roboterax/xbot_sdk_api + era_nav_msgs"}
         if name == "ros_graph":
@@ -177,13 +222,16 @@ class Q5LifecyclePlugin:
                 "initialize": (["timeout"], "Initialize all Q5 joints"),
                 "activate": ([], "Activate algorithm control"),
                 "deactivate": ([], "Deactivate algorithm control"),
-                "zero": (["duration"], "Move Q5 to zero pose"),
+                "stop_joint_service": ([], "Stop the Q5 joint service"),
+                "init_pose": (["duration"], "Move Q5 to the documented hands-down initial pose"),
+                "zero": (["duration"], "Compatibility alias for the hands-down initial pose"),
                 "lift_up": (["duration"], "Move Q5 to lift-up pose"),
+                "trajectory": (["traj_type", "duration"], "Run a vendor SimpleTrajectory program"),
             },
             {
                 "app_name": {"type": "string"}, "sync_control": {"type": "boolean"},
-                "launch_mode": {"type": "string", "enum": ["pos", "pd", "no_hand_pd"]},
-                "timeout": {"type": "number"}, "duration": {"type": "number"},
+                "launch_mode": {"type": "string", "enum": ["pos", "no_hand_pos"]},
+                "timeout": {"type": "number"}, "duration": {"type": "number"}, "traj_type": {"type": "integer"},
             },
         ))
 
@@ -198,15 +246,18 @@ class Q5LifecyclePlugin:
         if action == "stop": return {"state": "idle"}
         if action == "start_joint_service":
             req = DynamicLaunch.Request()
-            req.app_name = str(args.get("app_name", "phanthy_motus"))
+            req.app_name = str(args.get("app_name", ""))
             req.sync_control = bool(args.get("sync_control", False))
             req.launch_mode = str(args.get("launch_mode", "pos"))
             return jsonable(self.nodes.call(self.nodes.dynamic_launch, req, 10.0))
-        if action in ("initialize", "activate", "deactivate"):
-            client = {"initialize": self.nodes.ready, "activate": self.nodes.activate, "deactivate": self.nodes.deactivate}[action]
+        if action in ("initialize", "activate", "deactivate", "stop_joint_service"):
+            client = {"initialize": self.nodes.ready, "activate": self.nodes.activate, "deactivate": self.nodes.deactivate, "stop_joint_service": self.nodes.stop_launch}[action]
             return jsonable(self.nodes.call(client, Trigger.Request(), float(args.get("timeout", 25.0))))
-        if action in ("zero", "lift_up"):
-            return self.nodes.simple_pose(action, float(args.get("duration", 4.0)))
+        if action in ("zero", "init_pose", "lift_up"):
+            pose_name = "initpose_handsdown" if action in ("zero", "init_pose") else "lift_up"
+            return self.nodes.simple_pose(pose_name, float(args.get("duration", 4.0)))
+        if action == "trajectory":
+            return self.nodes.trajectory(int(args.get("traj_type", 8)), float(args.get("duration", 4.0)))
         return None
 
 
@@ -369,15 +420,15 @@ class Q5MpcPlugin:
     def get_tool(self):
         pose = {"type": "array", "items": {"type": "number"}, "minItems": 7, "maxItems": 7, "description": "[x,y,z,qx,qy,qz,qw]"}
         return tool("mpc", "actuator", "Q5 dual-arm/head MPC servo control", action_schema(
-            {"start_mpc": ([], "Start Q5 MPC"), "stop_mpc": ([], "Stop Q5 MPC"), "query": ([], "Query Q5 MPC"), "servo_pose": (["left_pose", "right_pose", "head_pose", "frame_id", "duration", "rate_hz"], "Publish dual-arm/head targets")},
-            {"left_pose": pose, "right_pose": pose, "head_pose": pose, "frame_id": {"type": "string"}, "duration": {"type": "number"}, "rate_hz": {"type": "number"}},
+            {"start_mpc": ([], "Start Q5 MPC"), "stop_mpc": ([], "Stop Q5 MPC"), "query": ([], "Query Q5 MPC"), "reset": (["mode"], "Reset MPC with hands raised (0) or lowered (1)"), "get_pose": ([], "Read the latest MPC end-effector poses"), "servo_pose": (["left_pose", "right_pose", "head_pose", "frame_id", "duration", "rate_hz"], "Publish dual-arm/head targets")},
+            {"left_pose": pose, "right_pose": pose, "head_pose": pose, "frame_id": {"type": "string"}, "duration": {"type": "number"}, "rate_hz": {"type": "number"}, "mode": {"type": "integer", "enum": [0, 1]}},
         ))
     def start(self): pass
     def stop(self): pass
 
-    def _teleop(self, command):
+    def _teleop(self, command, **payload):
         from xbot_common_interfaces.srv import StringMessage
-        req = StringMessage.Request(); req.data = json.dumps({"type": "mpc", "message": json.dumps({"command": command})})
+        req = StringMessage.Request(); req.data = json.dumps({"type": "mpc", "message": json.dumps({"command": command, **payload})})
         result = self.nodes.call(self.nodes.teleop, req, 10.0)
         if command == "query":
             try: self.nodes.last_mpc_state = int(json.loads(result.message).get("status"))
@@ -388,6 +439,8 @@ class Q5MpcPlugin:
         if action == "start": return {"state": "ready"}
         if action == "stop": return {"state": "idle"}
         if action in ("start_mpc", "stop_mpc", "query"): return self._teleop(action.replace("_mpc", ""))
+        if action == "reset": return self._teleop("reset", mode=int(args.get("mode", 0)))
+        if action == "get_pose": return {"state": "connected" if self.nodes.mpc_pose is not None else "waiting", "pose": jsonable(self.nodes.mpc_pose)}
         if action == "servo_pose":
             from geometry_msgs.msg import PoseStamped
             from xbot_common_interfaces.msg import ServoPose
@@ -410,6 +463,75 @@ class Q5MpcPlugin:
             threading.Thread(target=run, daemon=True).start()
             return {"state": "publishing", "duration": duration, "rate_hz": rate}
         return None
+
+
+class Q5GesturePlugin:
+    def __init__(self, nodes): self.nodes = nodes
+    def get_tool(self):
+        return tool("gesture", "actuator", "Play recorded Q5 upper-limb actions uploaded through XOS", action_schema(
+            {"play": (["name"], "Play a recorded gesture by name"), "status": ([], "Query gesture playback"), "stop": ([], "Stop gesture playback")},
+            {"name": {"type": "string"}},
+        ))
+    def start(self): pass
+    def stop(self): pass
+    def dispatch(self, action, args):
+        from std_msgs.msg import String
+        from std_srvs.srv import Trigger
+        if action == "start": return {"state": "ready"}
+        if action == "play":
+            name = str(args.get("name", "")).strip()
+            if not name: raise ValueError("name cannot be empty")
+            msg = String(); msg.data = name; self.nodes.gesture_pub.publish(msg)
+            return {"state": "submitted", "name": name}
+        if action == "status": return jsonable(self.nodes.call(self.nodes.gesture_status, Trigger.Request()))
+        if action == "stop": return jsonable(self.nodes.call(self.nodes.gesture_stop, Trigger.Request()))
+        return None
+
+
+class Q5AudioPlugin:
+    MODES = {"id": 0, "path": 1, "item": 2, "file_name": 3}
+    def __init__(self, nodes): self.nodes = nodes
+    def get_tool(self):
+        return tool("audio", "actuator", "Play XOS audio assets and control Q5 speaker volume", action_schema(
+            {"play": (["mode", "id", "path", "item", "file_name", "force_play", "timeout", "channel", "version"], "Play an audio asset"), "set_volume": (["volume"], "Set speaker volume from 0 to 100"), "status": ([], "Query audio playback"), "stop": ([], "Stop audio playback")},
+            {"mode": {"type": "string", "enum": list(self.MODES)}, "id": {"type": "integer"}, "path": {"type": "string"}, "item": {"type": "string"}, "file_name": {"type": "string"}, "force_play": {"type": "boolean"}, "timeout": {"type": "integer"}, "channel": {"type": "string"}, "version": {"type": "string"}, "volume": {"type": "integer", "minimum": 0, "maximum": 100}},
+        ))
+    def start(self): pass
+    def stop(self): pass
+    def dispatch(self, action, args):
+        from std_srvs.srv import Trigger
+        from xbot_common_interfaces.action import AudioPlay
+        from xbot_common_interfaces.srv import SetVolume
+        if action == "start": return {"state": "ready"}
+        if action == "status": return jsonable(self.nodes.call(self.nodes.audio_status, Trigger.Request()))
+        if action == "stop": return jsonable(self.nodes.call(self.nodes.audio_stop, Trigger.Request()))
+        if action == "set_volume":
+            volume = int(args.get("volume", 50))
+            if not 0 <= volume <= 100: raise ValueError("volume must be between 0 and 100")
+            req = SetVolume.Request(); req.volume = volume
+            return jsonable(self.nodes.call(self.nodes.audio_volume, req))
+        if action == "play":
+            if not self.nodes.audio_play.wait_for_server(timeout_sec=2.0): raise RuntimeError("ROS2 action unavailable: /audio_player/play")
+            goal = AudioPlay.Goal(); goal.mode = self.MODES[str(args.get("mode", "file_name"))]
+            goal.force_play = bool(args.get("force_play", False)); goal.id = int(args.get("id", 0)); goal.path = str(args.get("path", "")); goal.item = str(args.get("item", "")); goal.file_name = str(args.get("file_name", "")); goal.timeout = int(args.get("timeout", 0)); goal.channel = str(args.get("channel", "channel1")); goal.version = str(args.get("version", "v1"))
+            handle = _wait_future(self.nodes.audio_play.send_goal_async(goal), 5.0)
+            if not handle.accepted: raise RuntimeError("Q5 audio request rejected")
+            return {"state": "playing", "mode": args.get("mode", "file_name")}
+        return None
+
+
+class Q5CameraPlugin:
+    def __init__(self, nodes, config): self.nodes = nodes; self.topics = config["topics"]
+    def get_tools(self):
+        return [tool("camera_color", "sensor", "Latest Q5 RealSense RGB frame"), tool("camera_depth", "sensor", "Latest Q5 RealSense rectified depth frame")]
+    def start(self): pass
+    def stop(self): pass
+    def dispatch(self, action, args):
+        stream = "depth" if args.get("_tool_name") == "camera_depth" else "color"
+        if action in ("start", "stop"): return {"state": "ready" if action == "start" else "idle"}
+        msg = self.nodes.camera_frames.get(stream)
+        if msg is None: return {"state": "waiting", "topic": self.topics[f"camera_{stream}"]}
+        return {"state": "connected", "topic": self.topics[f"camera_{stream}"], "stamp": {"sec": msg.header.stamp.sec, "nanosec": msg.header.stamp.nanosec}, "frame_id": msg.header.frame_id, "height": msg.height, "width": msg.width, "encoding": msg.encoding, "is_bigendian": msg.is_bigendian, "step": msg.step, "data_base64": base64.b64encode(bytes(msg.data)).decode("ascii")}
 
 
 class Q5NavigationPlugin:
@@ -541,6 +663,9 @@ def build_plugins(config: dict, namespace: str, ros2):
     if plugins.get("base", {}).get("enabled", True): result.append(Q5BasePlugin(nodes, config))
     if plugins.get("hand", {}).get("enabled", True): result.append(Q5HandPlugin(nodes))
     if plugins.get("mpc", {}).get("enabled", True): result.append(Q5MpcPlugin(nodes))
+    if plugins.get("gesture", {}).get("enabled", True): result.append(Q5GesturePlugin(nodes))
+    if plugins.get("audio", {}).get("enabled", True): result.append(Q5AudioPlugin(nodes))
+    if plugins.get("camera", {}).get("enabled", True): result.append(Q5CameraPlugin(nodes, config))
     if plugins.get("navigation", {}).get("enabled", True): result.append(Q5NavigationPlugin(nodes))
     if plugins.get("choreography", {}).get("enabled", True): result.append(Q5ChoreographyPlugin(nodes, body))
     return result

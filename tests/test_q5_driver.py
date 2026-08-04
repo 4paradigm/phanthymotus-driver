@@ -30,6 +30,9 @@ class FakeRobot:
 class FakeNodes:
     robot = FakeRobot()
     joint_state = None
+    battery_state = None
+    mpc_pose = None
+    camera_frames = {}
     def joint_snapshot(self): return []
     def close(self): pass
 
@@ -49,6 +52,9 @@ class Q5ToolContractTests(unittest.TestCase):
             q5.Q5BasePlugin(self.nodes, {"control": {}}),
             q5.Q5HandPlugin(self.nodes),
             q5.Q5MpcPlugin(self.nodes),
+            q5.Q5GesturePlugin(self.nodes),
+            q5.Q5AudioPlugin(self.nodes),
+            q5.Q5CameraPlugin(self.nodes, {"topics": {"camera_color": "/color", "camera_depth": "/depth"}}),
             q5.Q5ChoreographyPlugin(self.nodes, self.body),
         ]
 
@@ -56,7 +62,7 @@ class Q5ToolContractTests(unittest.TestCase):
         tools = [item for plugin in self.plugins for item in definitions(plugin)]
         names = [item["name"] for item in tools]
         self.assertEqual(len(names), len(set(names)))
-        self.assertEqual({"joints", "capabilities", "ros_graph", "lifecycle", "body", "base", "hand", "mpc", "choreography"}, set(names))
+        self.assertEqual({"joints", "battery", "capabilities", "ros_graph", "lifecycle", "body", "base", "hand", "mpc", "gesture", "audio", "camera_color", "camera_depth", "choreography"}, set(names))
         for item in tools:
             if item["type"] != "actuator":
                 continue
@@ -72,6 +78,13 @@ class Q5ToolContractTests(unittest.TestCase):
         actions = q5.Q5ChoreographyPlugin(self.nodes, self.body).get_tool()["inputSchema"]["properties"]["action"]["enum"]
         self.assertIn("custom", actions)
         self.assertIn("vendor_action", actions)
+
+    def test_manual_lifecycle_and_media_contracts_are_exposed(self):
+        lifecycle = q5.Q5LifecyclePlugin(self.nodes).get_tool()["inputSchema"]
+        self.assertEqual(["pos", "no_hand_pos"], lifecycle["properties"]["launch_mode"]["enum"])
+        self.assertIn("stop_joint_service", lifecycle["properties"]["action"]["enum"])
+        self.assertIn("trajectory", lifecycle["properties"]["action"]["enum"])
+        self.assertEqual({"id": 0, "path": 1, "item": 2, "file_name": 3}, q5.Q5AudioPlugin.MODES)
 
 
 class Q5VendorContractTests(unittest.TestCase):
@@ -91,7 +104,7 @@ class Q5VendorContractTests(unittest.TestCase):
         config = (ROOT / "robotera/q5/config.yaml").read_text()
         self.assertIn("578353e11a9b46a87356fb994982f726051ba6ce", dockerfile)
         self.assertIn("86a415493d34af309e1c8c007fdea467d33d51e4", dockerfile)
-        for contract in ("/dynamic_launch", "/simple_actions", "/servo_poses", "/slam/start_map", "/era_nav/nav_act"):
+        for contract in ("/dynamic_launch", "/stop_launch", "/simple_actions", "/simple_trajectory", "/servo_poses", "/get_pose", "/gesture/upper_limb_play", "/audio_player/play", "/battery_state", "/camera/camera/color/image_raw", "/slam/start_map", "/era_nav/nav_act"):
             self.assertIn(contract, source + config)
 
 
