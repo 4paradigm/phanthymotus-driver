@@ -3934,8 +3934,10 @@ class VoicePlayActuatorPlugin:
 
         try:
             future = client.call_async(req)
-            # 等待 service 完成(3s 超时,本地调用,5s 太长)
-            rclpy.spin_until_future_complete(self._srv_node, future, timeout_sec=3.0)
+            # executor_tianyi is already spinning this node in background
+            start = time.time()
+            while not future.done() and time.time() - start < 3.0:
+                time.sleep(0.05)
             result = future.result()
             if result is None:
                 return {"ok": False, "code": "CALL_FAILED",
