@@ -449,6 +449,7 @@ class _NetworkMicNode(Node):
                          f"arecord -D {alsa_dev} --dump-hw-params -d 1 /dev/null 2>&1"]
             probe = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
             output = probe.stdout + probe.stderr
+            print(f"[ext_mic/ssh] probe output ({len(output)} chars): {output[:200]}", flush=True)
             for line in output.splitlines():
                 if 'RATE:' in line:
                     rates = [int(x) for x in re.findall(r'\d+', line.split('RATE:')[1])]
@@ -488,20 +489,28 @@ class _NetworkMicNode(Node):
                 print(f"[ext_mic/ssh] connected to {user}@{host}, {alsa_dev} {arecord_fmt} {channels}ch {rate}Hz", flush=True)
 
                 pub_buf = bytearray()
+                raw_buf = bytearray()  # buffer for frame-alignment
                 first_publish = True
+                bytes_per_frame = (3 * channels) if fmt == "S24_3LE" else (2 * channels)
+
                 while self._running:
                     data = proc.stdout.read(4096)
                     if not data:
                         break
 
+                    raw_buf += data
+
+                    # Process only complete frames
+                    n_frames = len(raw_buf) // bytes_per_frame
+                    if n_frames == 0:
+                        continue
+                    frame_bytes = n_frames * bytes_per_frame
+                    chunk_data = bytes(raw_buf[:frame_bytes])
+                    raw_buf = raw_buf[frame_bytes:]
+
                     # Convert S24_3LE → S16_LE mono
                     if fmt == "S24_3LE":
-                        raw = np.frombuffer(data, dtype=np.uint8)
-                        bytes_per_frame = 3 * channels
-                        n_frames = len(raw) // bytes_per_frame
-                        if n_frames == 0:
-                            continue
-                        raw = raw[:n_frames * bytes_per_frame]
+                        raw = np.frombuffer(chunk_data, dtype=np.uint8)
 
                         def _s24_to_s16(ch_bytes):
                             """Reconstruct 24-bit signed int, then >> 8 to 16-bit."""
@@ -520,7 +529,7 @@ class _NetworkMicNode(Node):
                             raw = raw.reshape(n_frames, 3)
                             samples = _s24_to_s16(raw)
                     else:
-                        samples = np.frombuffer(data, dtype=np.int16)
+                        samples = np.frombuffer(chunk_data, dtype=np.int16)
                         if channels == 2:
                             samples = samples.reshape(-1, 2).mean(axis=1).astype(np.int16)
 
