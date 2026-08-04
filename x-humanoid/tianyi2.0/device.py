@@ -1036,10 +1036,16 @@ class ImuPlugin(_JsonSensor):
 
 
 class DepthCameraPlugin:
-    """Forward the newest Orbbec Z16 frame with no buffering or re-encoding."""
+    """Bridge only the newest Orbbec Z16 frame to Agent Core."""
     def __init__(self, plugin_config, namespace, ros2):
         self._running = False; self._topic = f"/{namespace}/camera/head/depth"
+        self._max_hz = max(1.0, min(float(plugin_config.get("hz", 8)), 15.0))
+        self._last_published_at = 0.0
         self._forwarded_frames = 0
+        self._latest_image = None
+        self._latest_image_lock = threading.Lock()
+        self._subscription = None
+        self._publish_timer = None
         self._sub_node = Node("tianyi2_depth_sub", context=ros2.ctx_tianyi)
         self._pub_node = Node("tianyi2_depth_pub", context=ros2.ctx_core)
         ros2.executor_tianyi.add_node(self._sub_node); ros2.executor_core.add_node(self._pub_node)
@@ -1048,40 +1054,83 @@ class DepthCameraPlugin:
                 "inputSchema": {"type": "object", "properties": {}}, "topic_out": [{"topic": self._topic, "format": "image/depth-z16"}]}
     def start(self):
         from sensor_msgs.msg import Image
-        # Depth needs no conversion.  A direct, depth-one BEST_EFFORT bridge
-        # is lower-latency than a worker queue: a slow receiver can only retain
-        # the newest frame, never a backlog of old depth images.
+        import cv2
+        import numpy as np
+        self._cv2, self._np = cv2, np
         latest_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                                 history=HistoryPolicy.KEEP_LAST, depth=1,
                                 durability=DurabilityPolicy.VOLATILE)
-        self._running = True; self._pub = self._pub_node.create_publisher(Image, self._topic, latest_qos)
-        # The Orbbec depth publisher is RELIABLE; request the same policy at
-        # ingress, then use depth-one BEST_EFFORT only for the outbound bridge.
-        self._sub_node.create_subscription(Image, "/ob_camera_head/depth/image_raw", self._on_image, _RELIABLE_QOS)
-    def stop(self): self._running = False
+        ingress_qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
+                                 history=HistoryPolicy.KEEP_LAST, depth=1,
+                                 durability=DurabilityPolicy.VOLATILE)
+        self._running = True
+        self._pub = self._pub_node.create_publisher(Image, self._topic, latest_qos)
+        self._subscription = self._sub_node.create_subscription(
+            Image, "/ob_camera_head/depth/image_raw", self._on_image, ingress_qos)
+        self._publish_timer = self._pub_node.create_timer(1.0 / 30.0, self._publish_latest)
+        print(f"[DepthCameraPlugin] forwarding newest Z16 frame at <= {self._max_hz:g} Hz")
+    def stop(self):
+        self._running = False
+        with self._latest_image_lock:
+            self._latest_image = None
     def _on_image(self, msg):
         if not self._running or msg.encoding not in ("16UC1", "mono16"): return
-        # The input belongs to the domain-0 executor.  Rebuild the ROS message
-        # for the domain-42 publisher rather than sharing the callback object
-        # across contexts; this is still a raw Z16 copy, not a conversion.
+        with self._latest_image_lock:
+            self._latest_image = msg
+
+    def _publish_latest(self):
+        if not self._running:
+            return
+        with self._latest_image_lock:
+            if time.monotonic() - self._last_published_at < 1.0 / self._max_hz:
+                return
+            msg, self._latest_image = self._latest_image, None
+        if msg is None:
+            return
+        dashboard = self._to_dashboard_depth(msg)
+        if dashboard is None:
+            return
         from sensor_msgs.msg import Image
         out = Image()
         out.header = msg.header
-        out.height, out.width, out.encoding = msg.height, msg.width, msg.encoding
-        out.is_bigendian, out.step, out.data = msg.is_bigendian, msg.step, msg.data
+        out.height, out.width, out.encoding = 480, 640, "16UC1"
+        out.is_bigendian, out.step, out.data = 0, 1280, dashboard.tobytes()
         self._pub.publish(out)
+        self._last_published_at = time.monotonic()
         self._forwarded_frames += 1
-        if self._forwarded_frames % 30 == 1:
-            print(f"[DepthCameraPlugin] forwarded {self._forwarded_frames} latest Z16 frames")
+
+    def _to_dashboard_depth(self, msg):
+        if msg.encoding not in ("16UC1", "mono16") or msg.is_bigendian:
+            return None
+        width, height, step = int(msg.width), int(msg.height), int(msg.step)
+        if width <= 0 or height <= 0 or step < width * 2:
+            return None
+        raw = self._np.frombuffer(msg.data, dtype=self._np.uint8)
+        needed = height * step
+        if raw.size < needed:
+            return None
+        depth = raw[:needed].reshape(height, step)[:, :width * 2].view(self._np.uint16).reshape(height, width)
+        if width == 640 and height == 480:
+            return depth
+        if width * 3 > height * 4:
+            crop_width = height * 4 // 3
+            left = (width - crop_width) // 2
+            depth = depth[:, left:left + crop_width]
+        elif width * 3 < height * 4:
+            crop_height = width * 3 // 4
+            top = (height - crop_height) // 2
+            depth = depth[top:top + crop_height, :]
+        return self._cv2.resize(depth, (640, 480), interpolation=self._cv2.INTER_NEAREST)
     def dispatch(self, action, args):
         return {"state": "running" if self._running else "idle", "topic_out": [{"topic": self._topic, "format": "image/depth-z16"}]}
 
 
 class PointCloudPlugin:
-    """Pack and gravity-level Orbbec optical-frame points for Agent Core."""
+    """Pack gravity-levelled, floor-referenced Orbbec points for Agent Core."""
     _format = "sensor/pointcloud"
     def __init__(self, plugin_config, namespace, ros2):
         self._running = False; self._topic = f"/{namespace}/camera/head/points"; self._last = 0.0; self._intrinsics = None
+        self._floor_offset_m = max(-3.0, min(float(plugin_config.get("floor_offset_m", 1.50)), 3.0))
         self._gravity_world = None; self._gravity_lock = threading.Lock()
         self._sub_node = Node("tianyi2_points_sub", context=ros2.ctx_tianyi); self._pub_node = Node("tianyi2_points_pub", context=ros2.ctx_core)
         ros2.executor_tianyi.add_node(self._sub_node); ros2.executor_core.add_node(self._pub_node)
@@ -1120,7 +1169,7 @@ class PointCloudPlugin:
         with self._gravity_lock: return self._gravity_world
 
     @staticmethod
-    def _to_renderer_frame(x, y, z, gravity=None):
+    def _to_renderer_frame(x, y, z, gravity=None, floor_offset_m=0.0):
         """Map optical points to the renderer and align camera up with world up."""
         # Renderer map is (input_y, -input_z, -input_x), so this packed form
         # yields world (x, -y, -z): right, up, backward from optical raw XYZ.
@@ -1142,6 +1191,7 @@ class PointCloudPlugin:
                 wx += cross_x + factor * cross2_x
                 wy += cross_y + factor * cross2_y
                 wz += cross_z + factor * cross2_z
+        wy += floor_offset_m
         # Invert the renderer map above to pack the leveled world point.
         return -wz, wx, -wy
     def _on_cloud(self, msg):
@@ -1155,7 +1205,8 @@ class PointCloudPlugin:
             x = struct.unpack_from("<f", raw, base + fields["x"])[0]
             y = struct.unpack_from("<f", raw, base + fields["y"])[0]
             z = struct.unpack_from("<f", raw, base + fields["z"])[0]
-            packed.extend(struct.pack("<fff", *self._to_renderer_frame(x, y, z, gravity)))
+            packed.extend(struct.pack("<fff", *self._to_renderer_frame(
+                x, y, z, gravity, self._floor_offset_m)))
         from std_msgs.msg import UInt8MultiArray
         out = UInt8MultiArray(); out.data = list(packed); self._pub.publish(out)
     def _on_info(self, msg): self._intrinsics = (msg.k[0], msg.k[4], msg.k[2], msg.k[5])
@@ -1172,7 +1223,8 @@ class PointCloudPlugin:
                 if d == 0: continue
                 z = d / 1000.0
                 x, y = (u - cx) * z / fx, (v - cy) * z / fy
-                packed.extend(struct.pack("<fff", *self._to_renderer_frame(x, y, z, gravity))); count += 1
+                packed.extend(struct.pack("<fff", *self._to_renderer_frame(
+                    x, y, z, gravity, self._floor_offset_m))); count += 1
         if not count: return
         from std_msgs.msg import UInt8MultiArray
         out = UInt8MultiArray(); out.data = list(struct.pack("<II", 12, count) + packed); self._pub.publish(out)
@@ -4925,4 +4977,3 @@ class ChassisRawPlugin:
     @staticmethod
     def _clamp(value: float, low: float, high: float) -> float:
         return max(low, min(high, value))
-
