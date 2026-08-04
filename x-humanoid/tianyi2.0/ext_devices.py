@@ -590,6 +590,9 @@ class _NetworkMicNode(Node):
         TARGET_RATE = 16000
         PUB_CHUNK = 1024  # 512 int16 samples = 1024 bytes
 
+        connect_failures = 0
+        MAX_CONNECT_RETRIES = 3
+
         while self._running:
             sock = None
             try:
@@ -598,6 +601,7 @@ class _NetworkMicNode(Node):
                 sock.connect((host, port))
                 sock.settimeout(None)
                 sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
+                connect_failures = 0  # reset on successful connect
                 print(f"[ext_mic/tcp] connected to {host}:{port} (pre_converted={pre_converted})", flush=True)
 
                 raw_buf = bytearray()
@@ -653,7 +657,12 @@ class _NetworkMicNode(Node):
                             first_publish = False
             except Exception as e:
                 if self._running:
-                    print(f"[ext_mic/tcp] error: {e}, reconnecting in 2s", flush=True)
+                    connect_failures += 1
+                    if connect_failures >= MAX_CONNECT_RETRIES:
+                        print(f"[ext_mic/tcp] failed to connect to {host}:{port} after {MAX_CONNECT_RETRIES} attempts, giving up", flush=True)
+                        self.state = "error"
+                        return
+                    print(f"[ext_mic/tcp] error: {e}, retrying ({connect_failures}/{MAX_CONNECT_RETRIES}) in 2s", flush=True)
             finally:
                 if sock:
                     try:
