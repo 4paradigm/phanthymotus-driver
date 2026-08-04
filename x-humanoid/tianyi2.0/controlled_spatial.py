@@ -742,6 +742,11 @@ class ControlledSpatialPlugin:
 
             self._slamtec.set_motion_strategy(strategy)
 
+            # Disable poll thread's nav monitoring BEFORE cancel, to prevent
+            # race where poll sees action_state=-1 and sets _nav_arrived.
+            self._nav_active = False
+            self._nav_action_id = None
+
             # Cancel any existing action (e.g. RecoverLocalizationAction from load_map)
             # before creating a new MoveToAction, to avoid monitoring the wrong action.
             cancel_result = self._slamtec.cancel_current_action()
@@ -816,6 +821,10 @@ class ControlledSpatialPlugin:
             precise = bool(args.get("precise", False))
 
             self._slamtec.set_motion_strategy(strategy)
+
+            # Disable poll thread's nav monitoring BEFORE cancel
+            self._nav_active = False
+            self._nav_action_id = None
 
             # Cancel any existing action before creating a new MoveToAction
             cancel_result = self._slamtec.cancel_current_action()

@@ -22,8 +22,10 @@ import os
 import re
 import signal
 import socket
+import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -42,6 +44,30 @@ def _load_config() -> dict:
         return yaml.safe_load(f)
 
 
+def _ensure_lyre_audio_mode():
+    """Switch host lyre service to audio mode (ASR + TTS, no dialogue) if not already."""
+    _nsenter = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--"]
+    target = "audio"
+    try:
+        result = subprocess.run(
+            _nsenter + ["cat", "/home/nvidia/data/param/lyre_launch_mode"],
+            capture_output=True, text=True, timeout=5)
+        current = result.stdout.strip()
+        if current == target:
+            print(f"[lyre] already in {target} mode")
+            return
+        subprocess.run(
+            _nsenter + ["bash", "-c", f"echo {target} > /home/nvidia/data/param/lyre_launch_mode"],
+            check=True, timeout=5)
+        subprocess.run(
+            _nsenter + ["systemctl", "restart", "lyre"],
+            check=True, timeout=15)
+        print(f"[lyre] switched from {current!r} to {target} mode, restarted")
+        time.sleep(3)
+    except Exception as e:
+        print(f"[lyre] WARNING: could not switch to {target} mode: {e}")
+
+
 def _resolve_namespace(cfg: dict) -> str:
     ns = cfg.get("ros_namespace", "").strip()
     if ns:
@@ -56,11 +82,17 @@ class DualDomainROS2:
 
     def __init__(self):
         # Domain 0: connect to tianyi body controller
+        # Use lyre's DDS profile so we can discover topics on 192.168.41.x / 127.0.0.1
+        dds_profile = "/work/dds_profile.xml"
+        if os.path.exists(dds_profile):
+            os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = dds_profile
+            print(f"[ros2] domain0: using DDS profile {dds_profile}")
         self.ctx_tianyi = Context()
         rclpy.init(context=self.ctx_tianyi, domain_id=0)
         self.executor_tianyi = rclpy.executors.MultiThreadedExecutor(context=self.ctx_tianyi)
 
-        # Domain 42: publish to agent-core
+        # Domain 42: publish to agent-core (no DDS profile — use all interfaces)
+        os.environ.pop("FASTRTPS_DEFAULT_PROFILES_FILE", None)
         self.ctx_core = Context()
         rclpy.init(context=self.ctx_core, domain_id=42)
         self.executor_core = rclpy.executors.MultiThreadedExecutor(context=self.ctx_core)
@@ -223,6 +255,11 @@ class TianyiDeviceBundle:
             from device import ChassisRawPlugin
             self._plugins.append(ChassisRawPlugin(plugins_cfg["chassis_raw"], namespace, ros2, slamtec_client))
             print("[bundle] ChassisRawPlugin loaded")
+
+        if plugins_cfg.get("ext_mic", {}).get("enabled", False):
+            from ext_devices import ExtMicPlugin
+            self._plugins.append(ExtMicPlugin(plugins_cfg["ext_mic"], namespace, ros2.executor_core))
+            print("[bundle] ExtMicPlugin loaded")
 
         if plugins_cfg.get("light", {}).get("enabled", False):
             from light import LightPlugin
@@ -417,6 +454,9 @@ def main():
     from nav_client import SlamtecClient
     slamtec_client = SlamtecClient(slamtec_url)
     print(f"[bundle] Slamtec client → {slamtec_url}")
+
+    # Ensure host lyre service is in audio mode (ASR + TTS, no built-in dialogue)
+    _ensure_lyre_audio_mode()
 
     # Dual-domain ROS2
     ros2 = DualDomainROS2()

@@ -66,5 +66,10 @@ plugins:
     enabled: true
   chassis_raw:
     enabled: true
+  ext_mic:
+    enabled: true
+    network_sources:
+      - name: "DJI Wireless Mic"
+        url: "tcp://192.168.41.1:9800"
   light:
     enabled: true
