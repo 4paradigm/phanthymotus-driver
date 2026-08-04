@@ -530,13 +530,13 @@ class SpeakerPlugin:
             "name": "speaker",
             "type": "actuator",
             "multiInstance": False,
-            "description": "G1 speaker — subscribes to ROS2 topic and streams PCM-16k audio to robot speaker. Supports interrupt/pause/resume.",
+            "description": "G1 speaker — subscribes to ROS2 topic and streams PCM-16k audio to robot speaker",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["start", "stop", "info", "interrupt", "pause", "resume"],
+                        "enum": ["start", "stop", "info"],
                         "description": "Action to perform",
                     },
                     "input_topic": {
@@ -545,14 +545,6 @@ class SpeakerPlugin:
                     },
                 },
                 "required": ["action"],
-                "x-action-params": {
-                    "start":     {"params": ["input_topic"], "description": "订阅 topic 开始接收音频"},
-                    "stop":      {"params": [], "description": "停止并销毁订阅"},
-                    "info":      {"params": [], "description": "查询当前状态"},
-                    "interrupt": {"params": [], "description": "立即中止播放，清空 buffer，保持订阅"},
-                    "pause":     {"params": [], "description": "暂停播放，保留 buffer"},
-                    "resume":    {"params": [], "description": "恢复播放"},
-                },
             },
             "topic_in": [{"format": "audio/pcm-16k"}],
         }
@@ -600,12 +592,6 @@ class SpeakerPlugin:
         elif action == "stop":
             self._node.stop_play()
             return {"state": "idle"}
-        elif action == "interrupt":
-            return self._node.interrupt()
-        elif action == "pause":
-            return self._node.pause()
-        elif action == "resume":
-            return self._node.resume()
         elif action == "info":
             return {
                 "state": self._node.state,
@@ -613,6 +599,90 @@ class SpeakerPlugin:
                 "buffer_chunks": self._node._buf.qsize(),
             }
         return None
+
+
+# ── SmartMotionPlugin (controller) ─────────────────────────────────────────
+
+class SmartMotionPlugin:
+    """统一打断/暂停控制卡片。协调 speaker + loco 的中止和暂停。"""
+    PREFIX = "smart_motion"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor,
+                 speaker_plugin=None, loco_plugin=None):
+        self._speaker = speaker_plugin
+        self._loco = loco_plugin
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "smart_motion",
+            "type": "controller",
+            "multiInstance": False,
+            "description": "SmartMotion — 统一运动/输出控制，提供打断、暂停、恢复能力",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["interrupt_all", "interrupt_speak", "interrupt_motion",
+                                 "pause_speak", "resume_speak", "status"],
+                        "description": "Action to perform",
+                    },
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "interrupt_all":    {"params": [], "description": "中止所有输出（语音+动作同时停止）"},
+                    "interrupt_speak":  {"params": [], "description": "中止语音播放，清空待播队列"},
+                    "interrupt_motion": {"params": [], "description": "停止机器人当前运动"},
+                    "pause_speak":      {"params": [], "description": "暂停语音播放（保留未播内容，可恢复）"},
+                    "resume_speak":     {"params": [], "description": "恢复之前暂停的语音播放"},
+                    "status":           {"params": [], "description": "查询当前输出状态（语音/运动）"},
+                },
+            },
+        }
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "interrupt_all":
+            r1 = self._do_interrupt_speak()
+            r2 = self._do_interrupt_motion()
+            return {"speak": r1, "motion": r2}
+        elif action == "interrupt_speak":
+            return self._do_interrupt_speak()
+        elif action == "interrupt_motion":
+            return self._do_interrupt_motion()
+        elif action == "pause_speak":
+            if self._speaker:
+                return self._speaker._node.pause()
+            return {"error": "no speaker plugin"}
+        elif action == "resume_speak":
+            if self._speaker:
+                return self._speaker._node.resume()
+            return {"error": "no speaker plugin"}
+        elif action == "status":
+            return {
+                "speak": self._speaker.dispatch("info", {}) if self._speaker else None,
+                "motion": self._loco.dispatch("info", {}) if self._loco else None,
+            }
+        return None
+
+    def _do_interrupt_speak(self) -> dict | None:
+        if self._speaker:
+            return self._speaker._node.interrupt()
+        return {"error": "no speaker plugin"}
+
+    def _do_interrupt_motion(self) -> dict | None:
+        if self._loco:
+            return self._loco.dispatch("stop_move", {})
+        return {"error": "no loco plugin"}
 
 
 # ── LedPlugin (actuator) ─────────────────────────────────────────────────────
