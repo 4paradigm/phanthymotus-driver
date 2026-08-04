@@ -327,6 +327,7 @@ class _SpeakerNode(Node):
         self._interrupt_flag = threading.Event()
         self._pause_event = threading.Event()
         self._pause_event.set()  # 初始为非暂停状态
+        self._muted = False  # interrupt 后静默，丢弃后续 chunks 直到新 utterance
         # Clear stale PlayStream session from previous container run (MCU keeps state across reboot)
         self._client.PlayStop(APP_NAME)
         self.get_logger().info("SpeakerNode ready")
@@ -340,6 +341,7 @@ class _SpeakerNode(Node):
             self.get_logger().info(f"[speaker] topic changed {self._topic} → {topic}, re-subscribing")
             self.stop_play()
         self._topic = topic
+        self._muted = False  # 新 start 时清除静默
         self.get_logger().info(f"[speaker] creating subscription: topic={topic}, msg_type=AudioChunk, qos=LOW_LAT")
         self._sub = self.create_subscription(
             AudioChunk, topic, self._on_chunk, _LOW_LAT_QOS,
@@ -398,8 +400,9 @@ class _SpeakerNode(Node):
             self._interrupt_flag.clear()
             self._pause_event.set()
             self._draining.clear()
+            self._muted = True  # 静默：丢弃后续 TTS chunks 直到新 utterance
             self.state = "ready"
-        self.get_logger().info("[speaker] interrupted — buffer cleared, subscription kept")
+        self.get_logger().info("[speaker] interrupted — buffer cleared, muted until new utterance")
         return {"state": "ready", "action": "interrupted"}
 
     def pause(self) -> dict:
@@ -430,11 +433,28 @@ class _SpeakerNode(Node):
         self.get_logger().info("[speaker] resumed")
         return {"state": "playing"}
 
+    # EOF magic: 8 bytes (4 samples [1,-1,1,-1])，标记 utterance 结束
+    AUDIO_EOF_MAGIC = b'\x01\x00\xff\xff\x01\x00\xff\xff'
+
     def _on_chunk(self, msg: AudioChunk) -> None:
         pcm = bytes(msg.data)
+        now = time.monotonic()
         self._idx += 1
+
+        # 检测 EOF magic：utterance 结束标记
+        if len(pcm) == 8 and pcm == self.AUDIO_EOF_MAGIC:
+            if self._muted:
+                self._muted = False
+                self.get_logger().info("[speaker] unmuted — received EOF marker")
+            return  # EOF 不入 buffer、不播放
+
+        # Muted 状态：interrupt 后丢弃来自旧 utterance 的 chunks
+        if self._muted:
+            self._last_chunk_time = now
+            return  # 丢弃，等 EOF 到达
+
         self._buf.put(pcm)
-        self._last_chunk_time = time.monotonic()
+        self._last_chunk_time = now
         # 更新状态：收到 chunk 时如果是 ready，变为 playing
         if self.state == "ready":
             self.state = "playing"
@@ -617,7 +637,7 @@ class SmartMotionPlugin:
     def get_tool(self) -> dict:
         return {
             "name": "smart_motion",
-            "type": "controller",
+            "type": "actuator",
             "multiInstance": False,
             "description": "SmartMotion — 统一运动/输出控制，提供打断、暂停、恢复能力",
             "inputSchema": {
