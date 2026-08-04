@@ -1371,21 +1371,74 @@ def _find_keyword_in_ipa(text_ipa: list, keyword_ipa: list, threshold: float):
 
 
 def _extract_after_keyword(text: str, keyword_text: str, end_pos: int) -> str:
-    """Extract text after the matched keyword."""
-    kw_chars = len([c for c in keyword_text if '\u4e00' <= c <= '\u9fff' or c.isalpha()])
-    skipped = 0
-    cut_idx = 0
-    for i, char in enumerate(text):
-        if '\u4e00' <= char <= '\u9fff' or char.isalpha():
-            skipped += 1
-        if skipped >= kw_chars:
-            cut_idx = i + 1
-            break
-    if cut_idx == 0:
-        return ''
-    remaining = text[cut_idx:]
-    remaining = remaining.lstrip('，。！？、；：,.!?;: ')
-    return remaining
+    """Extract text after the matched keyword using IPA end_pos to locate cut point.
+
+    end_pos is the IPA phoneme index where the keyword match ends.
+    We map this back to the original text by counting phoneme-producing
+    characters (CJK chars each produce ~3 phonemes, alpha chars ~1-2).
+    """
+    # Build a mapping: for each phoneme-producing character, how many IPA tokens it generates
+    segments = []
+    current = ''
+    current_is_cjk = None
+    for char in text:
+        is_cjk = '\u4e00' <= char <= '\u9fff'
+        is_alpha = char.isalpha()
+        if not is_cjk and not is_alpha:
+            continue  # skip punctuation/numbers for phoneme counting
+        if current_is_cjk is None:
+            current_is_cjk = is_cjk
+        if is_cjk != current_is_cjk:
+            if current.strip():
+                segments.append((current.strip(), current_is_cjk))
+            current = ''
+            current_is_cjk = is_cjk
+        current += char
+    if current.strip():
+        segments.append((current.strip(), current_is_cjk))
+
+    # Count IPA tokens per character to find the text position for end_pos
+    ipa_idx = 0
+    char_idx = 0  # index into original text (counting all chars)
+    phoneme_char_pos = 0  # index into phoneme-producing chars
+
+    for seg_text, is_cjk in segments:
+        lang = 'cmn' if is_cjk else 'en-us'
+        try:
+            ipa = _phonemize_safe(seg_text, lang)
+            ipa = _re.sub(r'[0-9˥˦˧˨˩¹²³⁴⁵]', '', ipa)
+            phones = [p for p in ipa.split() if p]
+        except Exception:
+            phones = list(seg_text)
+
+        seg_ipa_count = len(phones)
+        if ipa_idx + seg_ipa_count >= end_pos:
+            # end_pos falls within this segment
+            # Estimate character position within segment proportionally
+            offset_in_seg = end_pos - ipa_idx
+            chars_in_seg = len(seg_text)
+            # For CJK, each char ≈ equal IPA tokens; for alpha, approximate
+            if seg_ipa_count > 0:
+                cut_chars = round(offset_in_seg * chars_in_seg / seg_ipa_count)
+            else:
+                cut_chars = chars_in_seg
+            cut_chars = min(cut_chars, chars_in_seg)
+
+            # Find the actual position in original text
+            found = 0
+            for i, c in enumerate(text):
+                if '\u4e00' <= c <= '\u9fff' or c.isalpha():
+                    found += 1
+                if found >= phoneme_char_pos + cut_chars:
+                    cut_idx = i + 1
+                    remaining = text[cut_idx:]
+                    remaining = remaining.lstrip('，。！？、；：,.!?;: ')
+                    return remaining
+            return ''
+        ipa_idx += seg_ipa_count
+        phoneme_char_pos += len(seg_text)
+
+    return ''
 
 
 class AsrPlugin:
