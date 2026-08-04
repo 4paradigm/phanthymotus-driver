@@ -33,6 +33,20 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   MotorStatePlugin    (sensor)             — 全身21电机状态(2Hz)
   HandStatePlugin     (sensor)             — 灵巧手状态(10Hz, tool name=hand_state)
   RemoteStatePlugin   (sensor)             — 遥控器SBUS事件(5Hz)
+  StatePlugin      (sensor, multi-tool) — 关节/电池/急停/力传感器/URDF
+  CameraPlugin     (sensor)             — Orbbec 头部相机
+  AsrPlugin        (sensor)             — 语音识别结果
+  NavStatePlugin   (sensor)             — 底盘导航状态
+  HeadPlugin       (actuator)           — 头部3DOF控制
+  HeadGesturePlugin (actuator)          — 点头/摇头/左右观察等语义动作
+  ArmPlugin        (actuator)           — 双臂14DOF控制
+  ArmGesturePlugin (actuator)           — 挥手/敬礼/欢迎等语义动作
+  WaistPlugin      (actuator)           — 腰部2DOF控制
+  HandPlugin       (actuator)           — 灵巧手控制
+  TtsPlugin        (actuator)           — 语音合成
+  NavPlugin        (actuator)           — 底盘导航控制
+  ChatPlugin       (actuator)           — 语音交互开关
+  ControlledSpatialPlugin (actuator)    — 人工控制建图与导航 (Slamtec REST API)
 """
 
 from __future__ import annotations

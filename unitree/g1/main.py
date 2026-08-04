@@ -14,6 +14,8 @@ MCP 工具命名规则：直接使用 tool name（mic, tts, led, loco, loco_stat
     CONFIG_PATH — config.yaml 路径（默认同目录下）
 """
 
+from __future__ import annotations
+
 import json
 import os
 import re
@@ -31,7 +33,7 @@ import rclpy.executors
 
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
-from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
+from rpc_proxy import RpcProxy
 from unitree_sdk2py.g1.arm.g1_arm_action_client import G1ArmActionClient
 from unitree_sdk2py.g1.slam.slam_client import SlamClient
 from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import MotionSwitcherClient
@@ -57,7 +59,7 @@ def _resolve_namespace(cfg: dict) -> str:
 class G1DeviceBundle:
     def __init__(self, cfg: dict, namespace: str, executor,
                  audio_client: AudioClient,
-                 loco_client: LocoClient,
+                 loco_client: RpcProxy,
                  arm_client: G1ArmActionClient,
                  slam_client: SlamClient,
                  msc_client: MotionSwitcherClient,
@@ -129,6 +131,18 @@ class G1DeviceBundle:
             controlled_cfg["network_iface"] = network_iface
             self._plugins.append(ControlledSpatialPlugin(controlled_cfg, namespace, executor, slam_client, smart_motion=smart_motion))
             print("[bundle] ControlledSpatialPlugin loaded")
+
+        if plugins_cfg.get("controlled_spatial_map", {}).get("enabled", False):
+            try:
+                from controlled_spatial_map import ControlledSpatialMapPlugin
+                map_cfg = dict(plugins_cfg["controlled_spatial_map"])
+                map_cfg["network_iface"] = network_iface
+                self._plugins.append(ControlledSpatialMapPlugin(map_cfg, namespace, executor))
+                print("[bundle] ControlledSpatialMapPlugin loaded")
+            except Exception as e:
+                print(f"[bundle] ControlledSpatialMapPlugin load skipped: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
 
         if plugins_cfg.get("motion_switcher", {}).get("enabled", False):
             from device import MotionSwitcherPlugin
@@ -336,11 +350,9 @@ def main():
     audio_client.Init()
     print("[bundle] AudioClient ready")
 
-    # LocoClient (locomotion control)
-    loco_client = LocoClient()
-    loco_client.SetTimeout(10.0)
-    loco_client.Init()
-    print("[bundle] LocoClient ready")
+    # LocoClient (locomotion control) — via subprocess proxy to avoid GIL contention
+    loco_client = RpcProxy(network_iface)
+    print("[bundle] LocoClient ready (subprocess proxy)")
 
     # G1ArmActionClient (arm gestures)
     arm_client = G1ArmActionClient()
@@ -392,6 +404,7 @@ def main():
         if smart_motion:
             smart_motion.shutdown()
         _bundle.stop_all()
+        loco_client.stop()
         threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGTERM, _shutdown)
