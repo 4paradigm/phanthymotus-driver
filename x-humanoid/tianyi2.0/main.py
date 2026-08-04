@@ -112,6 +112,12 @@ class TianyiDeviceBundle:
             self._plugins.append(AsrPlugin(plugins_cfg["asr"], namespace, ros2))
             print("[bundle] AsrPlugin loaded")
 
+        if plugins_cfg.get("force_event", {}).get("enabled", False):
+            from device import ForceTorqueStatePlugin
+            self._plugins.append(ForceTorqueStatePlugin(
+                plugins_cfg["force_event"], namespace, ros2))
+            print("[bundle] ForceTorqueStatePlugin loaded")
+
         if plugins_cfg.get("nav_state", {}).get("enabled", False):
             from device import NavStatePlugin
             self._plugins.append(NavStatePlugin(plugins_cfg["nav_state"], namespace, ros2, slamtec_client))

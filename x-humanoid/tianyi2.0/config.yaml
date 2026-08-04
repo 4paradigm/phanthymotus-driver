@@ -12,6 +12,8 @@ plugins:
     enabled: true
   asr:
     enabled: true
+  force_event:
+    enabled: true
   nav_state:
     enabled: true
   power_board:

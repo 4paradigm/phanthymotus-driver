@@ -59,6 +59,17 @@ _RELIABLE_QOS = QoSProfile(
     durability=DurabilityPolicy.VOLATILE,
 )
 
+_ASR_EVENT_NAMES = {
+    2: ("EVENT_ERROR", "识别错误"),
+    3: ("EVENT_STATE", "状态变化"),
+    4: ("EVENT_WAKEUP", "唤醒"),
+    5: ("EVENT_SLEEP", "休眠"),
+    6: ("EVENT_VAD", "语音活动检测"),
+    10: ("EVENT_PRE_SLEEP", "预休眠"),
+    13: ("EVENT_CONNECTED_TO_SERVER", "已连接服务器"),
+    14: ("EVENT_SERVER_DISCONNECTED", "服务器断开"),
+}
+
 # ── Motor ID → Joint Name 映射 ───────────────────────────────────────────────
 
 _HEAD_JOINTS = {
@@ -568,26 +579,144 @@ class CameraPlugin:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class AsrPlugin:
-    """语音识别结果 (lyre ASR)"""
+    """从 /state/voice 聚合帧转发去重后的 ASR 结果。"""
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._ns = namespace
         self._ros2 = ros2
         self._topic = f"/{namespace}/asr/text"
         self._running = False
+        self._last_iat_id = None
+        self._last_event = None
+        self._last_state = None
 
-        self._sub_node = Node("tianyi2_asr_sub", context=ros2.ctx_tianyi)
-        ros2.executor_tianyi.add_node(self._sub_node)
-
+        self._sub_node = Node("tianyi2_asr_sub", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._sub_node)
         self._pub_node = Node("tianyi2_asr_pub", context=ros2.ctx_core)
         ros2.executor_core.add_node(self._pub_node)
-        self._pub = self._pub_node.create_publisher(String, self._topic, _RELIABLE_QOS)
+        asr_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self._pub = self._pub_node.create_publisher(String, self._topic, asr_qos)
 
     def get_tool(self) -> dict:
         return {
-            "name": "asr",
+            "name": "voice",
             "type": "sensor",
-            "description": "天轶2.0 语音识别 (lyre ASR) — 实时语音转文字",
+            "multiInstance": False,
+            "readOnly": True,
+            "description": "天轶2.0 语音识别状态 — 订阅 /state/voice 聚合帧并按 iat_id 去重",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._topic, "format": "data/json"}],
+        }
+
+    def start(self):
+        self._running = True
+        self._sub_node.create_subscription(String, "/state/voice", self._on_state_voice, _LOW_LAT_QOS)
+        print("[AsrPlugin] subscribed /state/voice")
+
+    def stop(self):
+        self._running = False
+
+    def _on_state_voice(self, msg):
+        if not self._running:
+            return
+        try:
+            payload = json.loads(msg.data)
+        except (TypeError, ValueError):
+            return
+        asr = payload.get("asr") if isinstance(payload, dict) else None
+        if not asr:
+            return
+
+        iat_id = asr.get("iat_id") or ""
+        iat_text = asr.get("iat_text") or ""
+        event = asr.get("event")
+        event_name = asr.get("event_name") or ""
+        event_label = asr.get("event_label") or ""
+        if not event_name:
+            event_name, fallback_label = _ASR_EVENT_NAMES.get(event, ("", ""))
+            event_label = event_label or fallback_label
+
+        self._last_state = {
+            "state": "active",
+            "keyword": asr.get("keyword", ""),
+            "angle": asr.get("angle"),
+            "iat_id": iat_id,
+            "iat_text": iat_text,
+            "event": event,
+            "event_name": event_name,
+            "event_label": event_label,
+            "timestamp_ms": payload.get("timestamp_ms") or int(time.time() * 1000),
+        }
+
+        if not iat_text:
+            if event in (None, 3) or event == self._last_event:
+                return
+            self._last_event = event
+        else:
+            if iat_id and iat_id == self._last_iat_id:
+                return
+            if iat_id:
+                self._last_iat_id = iat_id
+            self._last_event = event
+
+        out = String()
+        out.data = json.dumps(self._last_state, ensure_ascii=False)
+        self._pub.publish(out)
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("read", "get_asr"):
+            return (dict(self._last_state) if self._last_state is not None else
+                    {"state": "error", "error": "NO_FEEDBACK", "message": "no ASR state received yet"})
+        if action == "info":
+            return {"state": "running" if self._running else "idle",
+                    "topic_out": [{"topic": self._topic, "format": "data/json"}]}
+        if action in ("start", "stop"):
+            return {"state": "running" if action == "start" else "idle"}
+        return {"state": "error", "error": "INVALID_ARGUMENT",
+                "message": f"unknown action: {action}"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ForceTorqueStatePlugin (sensor) — 六维力事件卡
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ForceTorqueStatePlugin:
+    """双臂六维力传感器事件化: baseline + 接触/释放状态变化。"""
+
+    _FORCE_THRESHOLD = 3.0
+    _BASELINE_FRAMES = 20
+    _EVENT_DEBOUNCE = 0.3
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._topic = f"/{namespace}/state/force_event"
+        self._running = False
+        self._lock = threading.Lock()
+        self._baseline = {"left": None, "right": None}
+        self._baseline_buf = {"left": [], "right": []}
+        self._baseline_ready = {"left": False, "right": False}
+        self._contact_state = {"left": False, "right": False}
+        self._last_event_time = {"left": 0.0, "right": 0.0}
+
+        self._sub_node = Node("tianyi2_force_sub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._sub_node)
+        self._pub_node = Node("tianyi2_force_pub", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._pub_node)
+        self._pub = self._pub_node.create_publisher(String, self._topic, _LOW_LAT_QOS)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "force_event",
+            "type": "sensor",
+            "multiInstance": False,
+            "readOnly": True,
+            "description": "天轶2.0 双臂六维力事件 — 接触/释放/推拉方向, 仅状态变化时发布",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._topic, "format": "data/json"}],
         }
@@ -595,36 +724,99 @@ class AsrPlugin:
     def start(self):
         self._running = True
         try:
-            from lyre_msgs.msg import AsrIat
+            from geometry_msgs.msg import WrenchStamped
             self._sub_node.create_subscription(
-                AsrIat, "/audio_asr/iat", self._on_asr, _RELIABLE_QOS)
-            print("[AsrPlugin] subscription created")
-        except ImportError:
-            # Fallback: subscribe as String
+                WrenchStamped, "/arm_6dof_left", self._on_force_left, _RELIABLE_QOS)
             self._sub_node.create_subscription(
-                String, "/audio_asr/iat", self._on_asr_string, _RELIABLE_QOS)
-            print("[AsrPlugin] fallback to String subscription")
+                WrenchStamped, "/arm_6dof_right", self._on_force_right, _RELIABLE_QOS)
+            print("[ForceTorqueStatePlugin] subscriptions created")
+        except ImportError as e:
+            print(f"[ForceTorqueStatePlugin] WARNING: import failed ({e})")
 
     def stop(self):
         self._running = False
 
-    def _on_asr(self, msg):
-        if not self._running:
-            return
-        out = String()
-        out.data = json.dumps({"id": msg.id, "text": msg.text})
-        self._pub.publish(out)
+    def _on_force_left(self, msg):
+        self._on_force("left", msg)
 
-    def _on_asr_string(self, msg):
+    def _on_force_right(self, msg):
+        self._on_force("right", msg)
+
+    def _on_force(self, side: str, msg):
         if not self._running:
             return
-        self._pub.publish(msg)
+        with self._lock:
+            force = msg.wrench.force
+            torque = msg.wrench.torque
+            sample = [float(force.x), float(force.y), float(force.z),
+                      float(torque.x), float(torque.y), float(torque.z)]
+            if not self._baseline_ready[side]:
+                self._baseline_buf[side].append(sample)
+                if len(self._baseline_buf[side]) >= self._BASELINE_FRAMES:
+                    samples = self._baseline_buf[side]
+                    self._baseline[side] = [
+                        sum(sample[i] for sample in samples) / len(samples)
+                        for i in range(6)
+                    ]
+                    self._baseline_ready[side] = True
+                    print(f"[ForceTorqueStatePlugin] {side} baseline ready")
+                return
+
+            delta = [sample[i] - self._baseline[side][i] for i in range(3)]
+            magnitude = sum(value * value for value in delta) ** 0.5
+            now = time.monotonic()
+            is_contact = magnitude >= self._FORCE_THRESHOLD
+            was_contact = self._contact_state[side]
+            if now - self._last_event_time[side] < self._EVENT_DEBOUNCE:
+                return
+
+            event = None
+            if is_contact and not was_contact:
+                event = {
+                    "event": f"contact_{side}",
+                    "side": side,
+                    "direction": self._direction(delta),
+                    "magnitude": round(magnitude, 3),
+                    "delta_force": [round(value, 3) for value in delta],
+                }
+                self._contact_state[side] = True
+            elif not is_contact and was_contact:
+                event = {
+                    "event": f"release_{side}",
+                    "side": side,
+                    "direction": "release",
+                    "magnitude": round(magnitude, 3),
+                    "delta_force": [round(value, 3) for value in delta],
+                }
+                self._contact_state[side] = False
+
+            if event is not None:
+                event["timestamp_ms"] = int(time.time() * 1000)
+                output = String()
+                output.data = json.dumps(event, ensure_ascii=False)
+                self._pub.publish(output)
+                self._last_event_time[side] = now
+
+    @staticmethod
+    def _direction(delta: list) -> str:
+        fx, fy, fz = delta
+        if abs(fx) >= abs(fy) and abs(fx) >= abs(fz):
+            return "push_forward" if fx > 0 else "push_back"
+        if abs(fy) >= abs(fx) and abs(fy) >= abs(fz):
+            return "push_left" if fy > 0 else "push_right"
+        return "push_up" if fz > 0 else "push_down"
 
     def dispatch(self, action: str, args: dict) -> dict:
-        if action in ("start", "stop", "info"):
-            return {"state": "running" if self._running else "idle",
-                    "topic_out": [{"topic": self._topic, "format": "data/json"}]}
-        return {"state": "running"}
+        if action in ("read", "get_force_event", "info"):
+            return {
+                "state": "running" if self._running else "idle",
+                "baseline_ready": dict(self._baseline_ready),
+                "topic_out": [{"topic": self._topic, "format": "data/json"}],
+            }
+        if action in ("start", "stop"):
+            return {"state": "running" if action == "start" else "idle"}
+        return {"state": "error", "error": "INVALID_ARGUMENT",
+                "message": f"unknown action: {action}"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
