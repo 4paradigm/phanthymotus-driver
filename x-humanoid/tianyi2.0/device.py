@@ -3934,9 +3934,16 @@ class VoicePlayActuatorPlugin:
 
         try:
             future = client.call_async(req)
-            # executor_tianyi is already spinning this node in background
-            # play_text may block until TTS synthesis completes — allow up to 60s
-            timeout = 60.0 if action == "play_text" else 3.0
+            # play_file/play_url/play_text: fire-and-forget, 不等合成完成
+            if action in ("play_file", "play_url", "play_text"):
+                return {
+                    "ok": True, "code": 0,
+                    "message": "submitted",
+                    "action": action,
+                    "timestamp_ms": int(time.time() * 1000),
+                }
+            # interrupt/pause/resume: 短超时等待确认
+            timeout = 3.0
             start = time.time()
             while not future.done() and time.time() - start < timeout:
                 time.sleep(0.05)
