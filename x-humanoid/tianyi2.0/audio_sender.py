@@ -32,7 +32,7 @@ def _detect_card(card_idx: int) -> dict:
         )
         output = result.stdout + result.stderr
         for line in output.splitlines():
-            if 'FORMAT:' in line:
+            if line.strip().startswith('FORMAT:'):
                 fmts = line.split('FORMAT:')[1].strip().split()
                 if 'S24_3LE' in fmts:
                     info["format"] = "S24_3LE"

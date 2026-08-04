@@ -70,7 +70,7 @@ plugins:
     enabled: true
     network_sources:
       - name: "DJI Wireless Mic"
-        url: "tcp://192.168.41.1:9800"
+        url: "tcp://192.168.41.1:9800/pcm16k"
         # audio_sender auto-start: SSH to the host where the mic is plugged in
         ssh_host: "192.168.41.1"
         ssh_user: "ubuntu"
