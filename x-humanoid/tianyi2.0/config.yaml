@@ -12,23 +12,17 @@ plugins:
     enabled: true
   asr:
     enabled: true
+  force_event:
+    enabled: true
   nav_state:
     enabled: true
   power_board:
-    enabled: true
-  motors:
-    enabled: true
-  hand_state:
-    enabled: true
-  remote_event:
     enabled: true
   head:
     enabled: true
   head_gesture:
     enabled: true
   arm:
-    enabled: true
-  arm_gesture:
     enabled: true
   waist:
     enabled: true
@@ -44,7 +38,3 @@ plugins:
     enabled: true
   voice_chat:
     enabled: true
-  controlled_spatial:
-    enabled: true
-    native_slam_pcd_dir: "/opt/phanthy-motus/data/maps"
-    native_slam_db_path: "/opt/phanthy-motus/data/controlled_spatial.db"
