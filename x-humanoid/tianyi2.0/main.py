@@ -256,6 +256,11 @@ class TianyiDeviceBundle:
             self._plugins.append(ChassisRawPlugin(plugins_cfg["chassis_raw"], namespace, ros2, slamtec_client))
             print("[bundle] ChassisRawPlugin loaded")
 
+        if plugins_cfg.get("ext_mic", {}).get("enabled", False):
+            from ext_devices import ExtMicPlugin
+            self._plugins.append(ExtMicPlugin(plugins_cfg["ext_mic"], namespace, ros2.executor_core))
+            print("[bundle] ExtMicPlugin loaded")
+
         if plugins_cfg.get("light", {}).get("enabled", False):
             from light import LightPlugin
             self._plugins.append(LightPlugin(plugins_cfg["light"], namespace, ros2))

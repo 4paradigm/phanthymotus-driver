@@ -12,11 +12,13 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
         cmake \
         build-essential \
         curl \
-        espeak-ng && \
+        espeak-ng \
+        alsa-utils \
+        libasound2-dev && \
     rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    pyyaml numpy opencv-python-headless phonemizer
+    pyyaml numpy opencv-python-headless phonemizer pyalsaaudio sounddevice
 
 # Build tianyi ROS2 message packages (bodyctrl_msgs + lyre_msgs)
 COPY msgs/ /tianyi_ws/src/
@@ -34,7 +36,7 @@ ENV AMENT_PREFIX_PATH=/tianyi_ws/install/bodyctrl_msgs:/tianyi_ws/install/lyre_m
 ENV LD_LIBRARY_PATH=/tianyi_ws/install/bodyctrl_msgs/lib:/tianyi_ws/install/lyre_msgs/lib:${LD_LIBRARY_PATH}
 
 COPY resource/ /work/resource/
-COPY main.py device.py light.py nav_client.py config.yaml driver.yaml controlled_spatial.py /work/
+COPY main.py device.py light.py nav_client.py ext_devices.py config.yaml driver.yaml controlled_spatial.py /work/
 COPY deploy/     /deploy/
 RUN mkdir -p /opt/phanthy-motus/data/maps
 

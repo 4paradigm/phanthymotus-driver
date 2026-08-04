@@ -66,5 +66,7 @@ plugins:
     enabled: true
   chassis_raw:
     enabled: true
+  ext_mic:
+    enabled: true
   light:
     enabled: true
