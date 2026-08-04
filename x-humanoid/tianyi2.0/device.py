@@ -27,12 +27,14 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   TtsPlugin        (actuator)           — 语音合成
   NavPlugin        (actuator)           — 底盘导航控制
   ChatPlugin       (actuator)           — 语音交互开关
+  ControlledSpatialPlugin (actuator)    — 人工控制建图与导航 (Slamtec REST API)
 """
 
 from __future__ import annotations
 
 import json
 import math
+import subprocess
 import threading
 import time
 from pathlib import Path
