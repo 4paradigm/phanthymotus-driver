@@ -1,0 +1,21 @@
+# 预编译产物目录
+#
+# 将在一块 Nano 板上编译好的二进制放到此目录，nano_bootstrap.sh 会优先使用预编译产物
+# 直接 SCP 分发到各板，跳过耗时的远程编译。
+#
+# 支持的预编译二进制：
+#   - rgb_stream
+#   - nvjpeg_worker
+#   - pointcloud_stream
+#   - depth_stream
+#
+# 使用方法：
+#   1. 在一块 Nano 板上让 nano_bootstrap.sh 正常编译一次
+#   2. 从板上拷贝编译产物：
+#        scp unitree@192.168.123.13:~/Unitree/sdk/UnitreeCameraSdk/bins/rgb_stream .
+#        scp unitree@192.168.123.13:~/Unitree/sdk/UnitreeCameraSdk/bins/nvjpeg_worker .
+#        scp unitree@192.168.123.13:~/Unitree/sdk/UnitreeCameraSdk/bins/pointcloud_stream .
+#        scp unitree@192.168.123.13:~/Unitree/sdk/UnitreeCameraSdk/bins/depth_stream .
+#   3. 放到此目录后重新构建镜像即可
+#
+# 若需强制重新编译（忽略预编译产物），设置环境变量 FORCE_REBUILD=1
