@@ -4,6 +4,31 @@ Phanthy Motus driver bundle for the Tianyi 2.0 Pro humanoid robot. The driver
 bridges robot-side ROS2 topics on domain 0 to Agent Core topics on domain 42 and
 exposes the capabilities as MCP tools.
 
+## Pre-task system inspection skill
+
+`system_inspection` is a read-only, scene-facing MCP skill that turns the
+bundle's individual status cards into one motion-readiness decision. The
+`inspect` action composes `robot_faults`, `estop`, `battery`, `power_board`, and
+`motors`; `hand_state` and `force_sensor` are checked as optional capabilities.
+It returns:
+
+- `ready_for_motion`: whether the shared whole-body motion prerequisites pass;
+- `status`: `healthy`, `warning`, or `critical`;
+- `blockers`: stable machine-readable reasons that prevent motion;
+- `checks`: the normalized result from each source card.
+
+The skill fails closed when a required source card is missing, its feedback is
+unavailable, emergency stop/power interlocks are active, battery or power-board
+state is unsafe, chassis faults are active, or any of the 21 whole-body motor
+channels is missing or faulty. Missing dexterous-hand or wrist-force feedback
+produces a warning without claiming those specialized capabilities are ready.
+
+This tool sends no robot command and does not add duplicate ROS2 subscribers.
+It reads the existing plugin instances in the same bundle, so later scene code
+can gate `nav`, `arm`, `hand`, or other motion cards on a single
+`ready_for_motion` result. A passing snapshot does not replace continuous
+emergency-stop, collision, and controller-feedback monitoring during motion.
+
 ## Raw arm joint card
 
 `arm` directly commands seven joints per selected arm in this canonical order:

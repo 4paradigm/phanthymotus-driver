@@ -62,6 +62,10 @@ plugins:
     native_slam_db_path: "/opt/phanthy-motus/data/controlled_spatial.db"
   robot_faults:
     enabled: true
+  # Read-only scene skill composed from the existing fault, power, motor,
+  # dexterous-hand and wrist-force cards. The bundle loads it after all sources.
+  system_inspection:
+    enabled: true
   laser_scan:
     enabled: true
   chassis_raw:

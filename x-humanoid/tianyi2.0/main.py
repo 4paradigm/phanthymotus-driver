@@ -229,6 +229,15 @@ class TianyiDeviceBundle:
             self._plugins.append(LightPlugin(plugins_cfg["light"], namespace, ros2))
             print("[bundle] LightPlugin loaded")
 
+        # Skills are loaded after their source cards so they can compose the
+        # existing plugin instances without opening a second MCP connection or
+        # duplicating ROS2 subscriptions.
+        if plugins_cfg.get("system_inspection", {}).get("enabled", False):
+            from device import SystemInspectionSkillPlugin
+            self._plugins.append(SystemInspectionSkillPlugin(
+                plugins_cfg["system_inspection"], self._plugins))
+            print("[bundle] SystemInspectionSkillPlugin loaded")
+
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
             try:

@@ -33,6 +33,7 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   MotorStatePlugin    (sensor)             — 全身21电机状态(2Hz)
   HandStatePlugin     (sensor)             — 灵巧手状态(10Hz, tool name=hand_state)
   RemoteStatePlugin   (sensor)             — 遥控器SBUS事件(5Hz)
+  SystemInspectionSkillPlugin (actuator)   — 作业前全机自检组合 Skill
   StatePlugin      (sensor, multi-tool) — 关节/电池/急停/力传感器/URDF
   CameraPlugin     (sensor)             — Orbbec 头部相机
   AsrPlugin        (sensor)             — 语音识别结果
@@ -4679,6 +4680,357 @@ class RobotFaultsPlugin:
             return {"state": "running" if self._running else "idle"}
         with self._lock:
             return self._build_summary_locked()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SystemInspectionSkillPlugin — compose existing cards into one safety decision
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SystemInspectionSkillPlugin:
+    """作业前全机自检 Skill。
+
+    该插件不重复订阅 ROS2 话题，而是直接读取同一 bundle 中已有插件的最新快照，
+    将多个原子卡片归一化为 ready_for_motion、blockers 和逐项 checks。
+    """
+
+    _VERSION = "1.0.0"
+    _STATUS_RANK = {"healthy": 0, "warning": 1, "critical": 2}
+    _EXPECTED_MOTOR_COUNTS = {
+        "head": 3,
+        "arm_left": 7,
+        "arm_right": 7,
+        "waist": 2,
+        "leg": 2,
+    }
+    _PROBES = (
+        ("robot_faults", "summary", True, "_check_robot_faults"),
+        ("estop", "estop", True, "_check_estop"),
+        ("battery", "battery", True, "_check_battery"),
+        ("power_board", "read", True, "_check_power_board"),
+        ("motors", "read", True, "_check_motors"),
+        ("hand_state", "read", False, "_check_hand_state"),
+        ("force_sensor", "force_sensor", False, "_check_force_sensor"),
+    )
+
+    def __init__(self, plugin_config: dict, source_plugins: list):
+        self._running = False
+        self._sources = {}
+        wanted = {probe[0] for probe in self._PROBES}
+        for plugin in source_plugins:
+            try:
+                tools = plugin.get_tools() if hasattr(plugin, "get_tools") else [plugin.get_tool()]
+            except Exception as e:
+                print(f"[SystemInspectionSkillPlugin] skip invalid plugin: {e}")
+                continue
+            for tool in tools:
+                name = tool.get("name") if isinstance(tool, dict) else None
+                if name in wanted:
+                    self._sources[name] = plugin
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "system_inspection",
+            "type": "actuator",
+            "readOnly": True,
+            "description": (
+                "天轶2.0 Pro 作业前全机自检 Skill。组合 robot_faults、estop、battery、"
+                "power_board、motors，并检查可选 hand_state/force_sensor；返回"
+                "ready_for_motion、阻断原因和逐项结果。本 Skill 只读，不发送运动指令。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["inspect"],
+                        "description": "inspect=执行一次作业前全机自检",
+                    },
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "inspect": {
+                        "params": [],
+                        "description": "汇总安全、电源、电机、灵巧手和力反馈并判断是否允许运动",
+                    },
+                },
+            },
+        }
+
+    def start(self):
+        self._running = True
+
+    def stop(self):
+        self._running = False
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "inspect":
+            return self._inspect()
+        if action in ("start", "info"):
+            return {
+                "state": "running" if self._running else "idle",
+                "skill": "tianyi2_pro_system_inspection",
+                "version": self._VERSION,
+                "sources": sorted(self._sources),
+            }
+        if action == "stop":
+            return {"state": "idle"}
+        return {
+            "state": "error",
+            "error": "INVALID_ARGUMENT",
+            "message": f"unknown action: {action}",
+        }
+
+    def _inspect(self) -> dict:
+        checks = []
+        for name, source_action, required, evaluator_name in self._PROBES:
+            source = self._sources.get(name)
+            if source is None:
+                checks.append(self._check(
+                    name,
+                    "critical" if required else "warning",
+                    "required MCP card is missing" if required else "optional MCP card is unavailable",
+                    blockers=[f"required_tool_missing:{name}"] if required else [],
+                ))
+                continue
+            try:
+                data = source.dispatch(source_action, {"_tool_name": name})
+                if not isinstance(data, dict):
+                    raise ValueError("card result is not an object")
+                if data.get("state") == "error" or "error" in data:
+                    raise ValueError(str(data.get("message") or data.get("error")))
+                evaluator = getattr(self, evaluator_name)
+                checks.append(evaluator(data))
+            except (KeyError, TypeError, ValueError, RuntimeError) as e:
+                checks.append(self._check(
+                    name,
+                    "critical" if required else "warning",
+                    "MCP card read failed",
+                    details={"error": str(e)},
+                    blockers=[f"required_tool_failed:{name}"] if required else [],
+                ))
+            except Exception as e:
+                checks.append(self._check(
+                    name,
+                    "critical" if required else "warning",
+                    "MCP card raised an unexpected error",
+                    details={"error": str(e)},
+                    blockers=[f"required_tool_failed:{name}"] if required else [],
+                ))
+        return self._report(checks)
+
+    def _report(self, checks: list) -> dict:
+        blockers = list(dict.fromkeys(
+            blocker
+            for check in checks
+            for blocker in check.get("blockers", [])
+        ))
+        status = max(
+            (check["status"] for check in checks),
+            key=lambda value: self._STATUS_RANK[value],
+            default="critical",
+        )
+        counts = {
+            level: sum(check["status"] == level for check in checks)
+            for level in self._STATUS_RANK
+        }
+        return {
+            "skill": "tianyi2_pro_system_inspection",
+            "version": self._VERSION,
+            "status": status,
+            "ready_for_motion": not blockers,
+            "summary": {
+                "healthy": counts["healthy"],
+                "warning": counts["warning"],
+                "critical": counts["critical"],
+            },
+            "blockers": blockers,
+            "checks": checks,
+            "timestamp_ms": int(time.time() * 1000),
+        }
+
+    @staticmethod
+    def _check(source: str, status: str, message: str,
+               details: dict | None = None, blockers: list | None = None) -> dict:
+        return {
+            "source": source,
+            "status": status,
+            "message": message,
+            "details": details or {},
+            "blockers": blockers or [],
+        }
+
+    @staticmethod
+    def _number(value):
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _check_robot_faults(self, data: dict) -> dict:
+        chassis = data.get("chassis") or {}
+        body = data.get("body") or {}
+        unavailable = []
+        if chassis.get("available") is not True:
+            unavailable.append("chassis_fault_feedback_unavailable")
+        if body.get("available") is not True:
+            unavailable.append("body_fault_feedback_unavailable")
+        if unavailable:
+            return self._check(
+                "robot_faults", "critical", "whole-robot fault summary is partially unavailable",
+                {"chassis": chassis, "body": body}, unavailable)
+        faults = body.get("faults") or []
+        if chassis.get("emergency_stop"):
+            return self._check(
+                "robot_faults", "critical", "chassis emergency stop is active",
+                {"faults": faults}, ["chassis_emergency_stop", "robot_fault"])
+        if faults:
+            return self._check(
+                "robot_faults", "critical", "whole-robot fault summary contains active faults",
+                {"fault_count": len(faults), "faults": faults}, ["robot_fault"])
+        if chassis.get("healthy") is False:
+            return self._check(
+                "robot_faults", "critical", "chassis reports an active safety fault",
+                {"chassis": chassis}, ["chassis_fault", "robot_fault"])
+        if data.get("healthy") is True:
+            return self._check(
+                "robot_faults", "healthy", "whole-robot fault summary is clear")
+        return self._check(
+            "robot_faults", "critical",
+            str(data.get("summary_text") or "fault summary is not healthy"),
+            blockers=["robot_fault"])
+
+    def _check_estop(self, data: dict) -> dict:
+        fields = ("is_estop", "is_remote_estop", "is_power_on")
+        if (data.get("state") == "no_data"
+                or any(field not in data for field in fields)
+                or any(not isinstance(data[field], bool) for field in fields)):
+            return self._check(
+                "estop", "critical", "emergency-stop state has no feedback",
+                blockers=["estop_feedback_unavailable"])
+        blockers = []
+        if data.get("is_estop"):
+            blockers.append("physical_estop_active")
+        if data.get("is_remote_estop"):
+            blockers.append("remote_estop_active")
+        if data.get("is_power_on") is False:
+            blockers.append("robot_power_off")
+        if blockers:
+            return self._check(
+                "estop", "critical", "emergency-stop or power interlock blocks motion",
+                {"state": data}, blockers)
+        return self._check(
+            "estop", "healthy", "emergency stops are released and power is on")
+
+    def _check_battery(self, data: dict) -> dict:
+        power = self._number(data.get("master_power", data.get("master_battery_power")))
+        if power is None:
+            return self._check(
+                "battery", "critical", "main battery percentage is unavailable",
+                blockers=["battery_feedback_unavailable"])
+        if power < 0 or power > 100:
+            return self._check(
+                "battery", "critical", "main battery percentage is outside the valid range",
+                {"power_percent": power}, ["battery_feedback_invalid"])
+        if power < 10:
+            return self._check(
+                "battery", "critical", "main battery is critically low",
+                {"power_percent": power}, ["battery_critical"])
+        if power < 25:
+            return self._check(
+                "battery", "warning", "main battery is low", {"power_percent": power})
+        return self._check(
+            "battery", "healthy", "main battery level is sufficient", {"power_percent": power})
+
+    def _check_power_board(self, data: dict) -> dict:
+        temp = data.get("temp") or {}
+        battery = data.get("battery") or {}
+        temp_status = temp.get("status", "unknown")
+        battery_status = battery.get("status", "unknown")
+        details = {
+            "max_temp_c": temp.get("max"),
+            "temp_status": temp_status,
+            "battery_status": battery_status,
+        }
+        if (temp_status not in {"normal", "warm", "hot", "critical"}
+                or battery_status not in {"normal", "low", "critical"}):
+            return self._check(
+                "power_board", "critical", "power-board safety feedback is incomplete",
+                details, ["power_board_feedback_unavailable"])
+        if temp_status in ("hot", "critical"):
+            return self._check(
+                "power_board", "critical", "power-board temperature blocks motion",
+                details, ["power_board_overtemperature"])
+        if battery_status == "critical":
+            return self._check(
+                "power_board", "critical", "power-board battery state is critical",
+                details, ["battery_critical"])
+        if temp_status == "warm" or battery_status == "low":
+            return self._check(
+                "power_board", "warning", "power board needs attention", details)
+        return self._check(
+            "power_board", "healthy", "power board is within safe limits", details)
+
+    def _check_motors(self, data: dict) -> dict:
+        parts = data.get("parts") or {}
+        joints = [
+            joint
+            for part in parts.values()
+            if isinstance(part, dict)
+            for joint in (part.get("joints") or [])
+            if isinstance(joint, dict)
+        ]
+        if not joints:
+            return self._check(
+                "motors", "critical", "motor state has no joint feedback",
+                blockers=["motor_feedback_unavailable"])
+        counts = {
+            name: len((parts.get(name) or {}).get("joints") or [])
+            for name in self._EXPECTED_MOTOR_COUNTS
+        }
+        incomplete = {
+            name: {"expected": expected, "actual": counts[name]}
+            for name, expected in self._EXPECTED_MOTOR_COUNTS.items()
+            if counts[name] != expected
+        }
+        if incomplete:
+            return self._check(
+                "motors", "critical", "whole-body motor feedback is incomplete",
+                {"joint_count": len(joints), "incomplete_parts": incomplete},
+                ["motor_feedback_incomplete"])
+        faults = [joint for joint in joints if int(joint.get("error") or 0) != 0]
+        if faults:
+            return self._check(
+                "motors", "critical", "one or more motors report active faults",
+                {"fault_count": len(faults), "faults": faults}, ["motor_fault"])
+        return self._check(
+            "motors", "healthy", "all 21 motor feedback channels are fault-free",
+            {"joint_count": len(joints)})
+
+    def _check_hand_state(self, data: dict) -> dict:
+        hands = data.get("hands") or {}
+        counts = {
+            side: int((hands.get(side) or {}).get("count") or 0)
+            for side in ("left", "right")
+        }
+        if counts["left"] < 6 or counts["right"] < 6:
+            return self._check(
+                "hand_state", "warning", "dexterous-hand feedback is incomplete",
+                {"finger_counts": counts})
+        return self._check(
+            "hand_state", "healthy", "both dexterous hands report all fingers",
+            {"finger_counts": counts})
+
+    def _check_force_sensor(self, data: dict) -> dict:
+        available = {side: bool(data.get(side)) for side in ("left", "right")}
+        if not all(available.values()):
+            return self._check(
+                "force_sensor", "warning", "wrist force feedback is incomplete",
+                {"available": available})
+        return self._check(
+            "force_sensor", "healthy", "both wrist force sensors provide feedback",
+            {"available": available})
 
 
 # ══════════════════════════════════════════════════════════════════════════════
