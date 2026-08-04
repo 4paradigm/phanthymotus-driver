@@ -250,60 +250,35 @@ class _ExtMicNode(Node):
             # "hw:N,M" format — card number is N
             card_idx = int(self._device_index.split("hw:", 1)[1].split(",")[0])
 
-        # Probe native format using arecord --dump-hw-params for reliable detection,
-        # then open with alsaaudio accordingly.
-        self._alsa_native_fmt = None
-        hw_formats = set()
-        hw_channels = 1
-        hw_rate = 48000
+        # Query device capabilities via arecord --dump-hw-params, then open
+        # at the device's native rate and resample to 16kHz in software.
+        hw_rate = 44100  # safe default
         try:
-            hw_info = subprocess.check_output(
-                ['arecord', '-D', f'hw:{card_idx},0', '--dump-hw-params', '-d', '0', '/dev/null'],
-                text=True, timeout=3, stderr=subprocess.STDOUT,
+            hw_info = subprocess.run(
+                ['arecord', '-D', f'hw:{card_idx},0', '--dump-hw-params', '-d', '1', '/dev/null'],
+                capture_output=True, text=True, timeout=5,
             )
-            # Parse FORMAT line: "FORMAT:  S16_LE" or "FORMAT:  S16_LE S24_3LE"
-            for line in hw_info.splitlines():
-                if 'FORMAT:' in line:
-                    parts = line.split('FORMAT:')[1].strip().split()
-                    hw_formats = set(parts)
-                elif 'CHANNELS:' in line:
-                    ch_part = line.split('CHANNELS:')[1].strip()
-                    # Could be "1" or "2" or a range "[1 2]"
-                    if '2' in ch_part:
-                        hw_channels = 2
-                elif 'RATE:' in line:
-                    rate_part = line.split('RATE:')[1].strip()
-                    # e.g. "[44100 48000]" or "48000"
-                    import re as _re
-                    rates = [int(x) for x in _re.findall(r'\d+', rate_part)]
+            # hw params are printed to stderr
+            output = hw_info.stdout + hw_info.stderr
+            for line in output.splitlines():
+                if 'RATE:' in line:
+                    rates = [int(x) for x in re.findall(r'\d+', line.split('RATE:')[1])]
                     if rates:
-                        hw_rate = max(rates)  # use highest supported
-            print(f"[ext_mic] hw probe: formats={hw_formats} channels={hw_channels} rate={hw_rate}", flush=True)
+                        hw_rate = min(rates)  # prefer lowest supported rate
+                    break
+            print(f"[ext_mic] hw probe: rate={hw_rate}", flush=True)
         except Exception as e:
-            print(f"[ext_mic] hw probe failed ({e}), using defaults", flush=True)
+            print(f"[ext_mic] hw probe failed ({e}), using rate={hw_rate}", flush=True)
 
-        # Decide format based on hardware capabilities
-        if 'S24_3LE' in hw_formats and hw_channels >= 2:
-            self._alsa_native_fmt = "S24_3LE_stereo"
-            self._alsa_pcm = alsaaudio.PCM(
-                type=alsaaudio.PCM_CAPTURE, mode=alsaaudio.PCM_NORMAL,
-                rate=hw_rate, channels=2, format=alsaaudio.PCM_FORMAT_S24_3LE,
-                periodsize=1024, cardindex=card_idx,
-            )
-            self._alsa_native_rate = hw_rate
-            self._alsa_rate_locked = True
-            print(f"[ext_mic] opened {self._device_name} as S24_3LE stereo {hw_rate}Hz", flush=True)
-        else:
-            # Standard USB mic: S16_LE mono at device's native rate
-            self._alsa_native_fmt = "S16_LE_mono"
-            self._alsa_pcm = alsaaudio.PCM(
-                type=alsaaudio.PCM_CAPTURE, mode=alsaaudio.PCM_NORMAL,
-                rate=hw_rate, channels=1, format=alsaaudio.PCM_FORMAT_S16_LE,
-                periodsize=1024, cardindex=card_idx,
-            )
-            self._alsa_native_rate = hw_rate
-            self._alsa_rate_locked = True
-            print(f"[ext_mic] opened {self._device_name} as S16_LE mono {hw_rate}Hz", flush=True)
+        self._alsa_native_fmt = "S16_LE_mono"
+        self._alsa_pcm = alsaaudio.PCM(
+            type=alsaaudio.PCM_CAPTURE, mode=alsaaudio.PCM_NORMAL,
+            rate=hw_rate, channels=1, format=alsaaudio.PCM_FORMAT_S16_LE,
+            periodsize=1024, cardindex=card_idx,
+        )
+        self._alsa_native_rate = hw_rate
+        self._alsa_rate_locked = True
+        print(f"[ext_mic] opened {self._device_name} as S16_LE mono {hw_rate}Hz", flush=True)
 
         self._alsa_probe_samples = 0
         self._alsa_probe_start = 0.0
