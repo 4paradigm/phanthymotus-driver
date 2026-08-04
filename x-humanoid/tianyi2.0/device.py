@@ -3935,13 +3935,15 @@ class VoicePlayActuatorPlugin:
         try:
             future = client.call_async(req)
             # executor_tianyi is already spinning this node in background
+            # play_text may block until TTS synthesis completes — allow up to 60s
+            timeout = 60.0 if action == "play_text" else 3.0
             start = time.time()
-            while not future.done() and time.time() - start < 3.0:
+            while not future.done() and time.time() - start < timeout:
                 time.sleep(0.05)
             result = future.result()
             if result is None:
                 return {"ok": False, "code": "CALL_FAILED",
-                        "message": f"{action} service call returned empty (timeout 3s)",
+                        "message": f"{action} service call returned empty (timeout {timeout:.0f}s)",
                         "action": action, "timestamp_ms": int(time.time() * 1000)}
             code = int(getattr(result, "code", 0))
             return {
