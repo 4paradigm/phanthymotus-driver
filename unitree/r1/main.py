@@ -110,6 +110,18 @@ class R1DeviceBundle:
             self._plugins.append(ExtCameraPlugin(plugins_cfg["ext_camera"], namespace, executor))
             print("[bundle] ExtCameraPlugin loaded")
 
+        # SmartMotion 统一打断控制（放在最后，需要引用其他 plugin）
+        if plugins_cfg.get("smart_motion", {}).get("enabled", True):
+            from device import SmartMotionPlugin
+            speaker_plugin = next((p for p in self._plugins if getattr(p, 'PREFIX', '') == 'speaker'), None)
+            loco_plugin = next((p for p in self._plugins if getattr(p, 'PREFIX', '') == 'loco'), None)
+            self._plugins.append(SmartMotionPlugin(
+                plugins_cfg.get("smart_motion", {}), namespace, executor,
+                speaker_plugin=speaker_plugin,
+                loco_plugin=loco_plugin,
+            ))
+            print(f"[bundle] SmartMotionPlugin loaded (speaker={'yes' if speaker_plugin else 'no'}, loco={'yes' if loco_plugin else 'no'})")
+
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
             try:
