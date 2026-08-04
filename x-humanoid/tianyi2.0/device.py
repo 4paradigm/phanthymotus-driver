@@ -5332,10 +5332,6 @@ class SmartMotionPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict | None:
-        if action == "start":
-            return {"state": "ready"}
-        if action == "stop":
-            return {"state": "idle"}
         if action == "interrupt_speak":
             r1 = self._do_tts("stop")
             r2 = self._do_voice_play("stop")
