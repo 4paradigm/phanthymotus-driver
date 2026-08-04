@@ -1,6 +1,9 @@
 dji-m300:
   image: __IMAGE__
-  container_name: embodied-dji-m300
+  # Runtime privileges and device mounts belong in this deployment manifest,
+  # not Dockerfile. Every service deployment therefore exposes both M300
+  # serial links (/dev/ttyUSB0 and /dev/ttyACM0) to the container.
+  container_name: dji-m300
   network_mode: host
   ipc: host
   privileged: true

@@ -8,16 +8,18 @@
 # ────────────────────────────────────────────────────────────────────
 
 ARG PSDK_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/psdk-base:latest
-# Nano keeps the verified PSDK 3.11.0 test image locally. Copying only the
-# SDK tree keeps the runtime base unchanged while pinning M300 to 3.11.0.
-ARG PSDK_311_IMAGE=dji-m300:psdk-3.11-test
 ARG PYPI_MIRROR=https://pypi.org/simple/
-FROM ${PSDK_311_IMAGE} AS psdk311
 FROM ${PSDK_BASE_IMAGE}
 ARG PYPI_MIRROR
 
-# Do not inherit psdk-base:latest's PSDK 3.16.x.
-COPY --from=psdk311 /opt/Payload-SDK/ /opt/Payload-SDK/
+# M300 is pinned to PSDK 3.11.0.  The minimal vendor package contains only
+# psdk_lib headers and prebuilt libraries (no samples or media), so a new
+# machine can build this image without a pre-existing PSDK helper image.
+COPY third_party/psdk_lib-3.11.0.tar.gz /tmp/
+RUN echo "4972b8833069cadb26103a54212f8b4dfc44125882dca3151eca77ed14deb880  /tmp/psdk_lib-3.11.0.tar.gz" | sha256sum -c - && \
+    rm -rf /opt/Payload-SDK && mkdir -p /opt/Payload-SDK && \
+    tar -xzf /tmp/psdk_lib-3.11.0.tar.gz -C /opt/Payload-SDK && \
+    rm -f /tmp/psdk_lib-3.11.0.tar.gz
 
 WORKDIR /work
 
