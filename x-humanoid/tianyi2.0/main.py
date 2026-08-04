@@ -68,6 +68,76 @@ def _ensure_lyre_audio_mode():
         print(f"[lyre] WARNING: could not switch to {target} mode: {e}")
 
 
+def _ensure_audio_sender(cfg: dict):
+    """Ensure audio_sender.py TCP server is running on remote hosts for network mic sources."""
+    ext_mic_cfg = cfg.get("plugins", {}).get("ext_mic", {})
+    if not ext_mic_cfg.get("enabled", False):
+        return
+    sources = ext_mic_cfg.get("network_sources", [])
+
+    for src in sources:
+        url = src.get("url", "")
+        if not url.startswith("tcp://"):
+            continue
+        ssh_host = src.get("ssh_host")
+        if not ssh_host:
+            continue
+
+        ssh_user = src.get("ssh_user", "ubuntu")
+        ssh_pass = src.get("ssh_password", "")
+        card = src.get("card", 1)
+        sender_path = src.get("sender_path", "/home/ubuntu/audio_sender.py")
+        port = url.rsplit(":", 1)[-1].split("/")[0] if ":" in url else "9800"
+        name = src.get("name", ssh_host)
+
+        def _ssh(cmd: str, timeout: int = 10) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                ["sshpass", "-p", ssh_pass, "ssh",
+                 "-o", "StrictHostKeyChecking=no", "-o", f"ConnectTimeout=3",
+                 f"{ssh_user}@{ssh_host}", cmd],
+                capture_output=True, text=True, timeout=timeout)
+
+        # Check if already running
+        try:
+            result = _ssh("pgrep -f audio_sender.py")
+            if result.returncode == 0 and result.stdout.strip():
+                pid = result.stdout.strip().splitlines()[0]
+                print(f"[audio_sender] {name}: already running on {ssh_host} (pid={pid})")
+                continue
+        except Exception as e:
+            print(f"[audio_sender] {name}: WARNING: SSH check failed: {e}")
+            continue
+
+        # Deploy audio_sender.py if not present
+        try:
+            result = _ssh(f"test -f {sender_path} && echo EXISTS")
+            if "EXISTS" not in (result.stdout or ""):
+                local_src = str(Path(__file__).parent / "audio_sender.py")
+                subprocess.run(
+                    ["sshpass", "-p", ssh_pass, "scp",
+                     "-o", "StrictHostKeyChecking=no",
+                     local_src, f"{ssh_user}@{ssh_host}:{sender_path}"],
+                    check=True, timeout=15)
+                print(f"[audio_sender] {name}: deployed to {ssh_host}:{sender_path}")
+        except Exception as e:
+            print(f"[audio_sender] {name}: WARNING: deploy failed: {e}")
+            continue
+
+        # Start in background
+        try:
+            _ssh(f"nohup python3 {sender_path} --port {port} --card {card} "
+                 f"> /tmp/audio_sender.log 2>&1 &")
+            time.sleep(1)
+            result = _ssh("pgrep -f audio_sender.py")
+            if result.returncode == 0 and result.stdout.strip():
+                pid = result.stdout.strip().splitlines()[0]
+                print(f"[audio_sender] {name}: started on {ssh_host} (pid={pid}, port={port}, card={card})")
+            else:
+                print(f"[audio_sender] {name}: WARNING: did not start, check {ssh_host}:/tmp/audio_sender.log")
+        except Exception as e:
+            print(f"[audio_sender] {name}: WARNING: start failed: {e}")
+
+
 def _resolve_namespace(cfg: dict) -> str:
     ns = cfg.get("ros_namespace", "").strip()
     if ns:
@@ -457,6 +527,9 @@ def main():
 
     # Ensure host lyre service is in audio mode (ASR + TTS, no built-in dialogue)
     _ensure_lyre_audio_mode()
+
+    # Ensure TCP audio sender is running on host for DJI wireless mic
+    _ensure_audio_sender(cfg)
 
     # Dual-domain ROS2
     ros2 = DualDomainROS2()

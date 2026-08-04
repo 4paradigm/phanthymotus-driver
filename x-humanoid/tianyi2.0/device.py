@@ -1963,9 +1963,9 @@ class HeadGesturePlugin:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["nod", "shake", "scan", "tilt", "reset", "stop"],
+                        "enum": ["nod", "shake", "scan", "tilt", "reset", "cancel"],
                         "default": "nod",
-                        "description": "头部动作，可选[nod, shake, scan, tilt, reset, stop]",
+                        "description": "头部动作，可选[nod, shake, scan, tilt, reset, cancel]",
                     },
                     "cycles": {
                         "type": "integer", "minimum": 1, "maximum": 5,
@@ -2019,7 +2019,7 @@ class HeadGesturePlugin:
                     "scan": {"params": ["cycles", "scan_amplitude", "speed", "scan_hold"], "description": "依次观察左侧并停留、回中、观察右侧并停留、回中"},
                     "tilt": {"params": ["side", "tilt_amplitude", "speed", "hold"], "description": "向指定方向歪头、保持后回正"},
                     "reset": {"params": ["speed"], "description": "取消序列并将头部回正"},
-                    "stop": {"params": [], "description": "取消尚未发送的后续动作帧"},
+                    "cancel": {"params": [], "description": "取消尚未发送的后续动作帧"},
                 },
             },
         }
@@ -2050,8 +2050,8 @@ class HeadGesturePlugin:
                 "feedback_supported": True,
                 "feedback_topic": "/head/status",
             }
-        if action == "stop":
-            return {"state": "stopped", "cancelled": self._sequence.cancel()}
+        if action == "cancel":
+            return {"state": "cancelled", "cancelled": self._sequence.cancel()}
         if action == "reset":
             self._sequence.cancel()
             check = self._preflight()
@@ -2792,10 +2792,10 @@ class ArmGesturePlugin:
                         "type": "string",
                         "enum": [
                             "salute", "welcome", "raise", "shake_hands",
-                            "high_five", "reset", "stop",
+                            "high_five", "reset", "cancel",
                         ],
                         "default": "welcome",
-                        "description": "手臂动作，可选[salute, welcome, raise, shake_hands, high_five, reset, stop]",
+                        "description": "手臂动作，可选[salute, welcome, raise, shake_hands, high_five, reset, cancel]",
                     },
                     "side": {
                         "type": "string", "enum": ["left", "right", "both"],
@@ -2826,7 +2826,7 @@ class ArmGesturePlugin:
                     "shake_hands": {"params": ["side", "cycles", "speed"], "description": "向前伸手并轻柔上下摆动，做出握手动作"},
                     "high_five": {"params": ["side", "speed"], "description": "将手掌伸到身体前方并保持在肩部附近，做出击掌等待姿势"},
                     "reset": {"params": ["side", "speed"], "description": "取消序列并回到中性姿态"},
-                    "stop": {"params": [], "description": "取消尚未发送的后续动作帧"},
+                    "cancel": {"params": [], "description": "取消尚未发送的后续动作帧"},
                 },
             },
         }
@@ -2857,8 +2857,8 @@ class ArmGesturePlugin:
                 "feedback_supported": True,
                 "feedback_topic": "/arm/status",
             }
-        if action == "stop":
-            return {"state": "stopped", "cancelled": self._sequence.cancel()}
+        if action == "cancel":
+            return {"state": "cancelled", "cancelled": self._sequence.cancel()}
         if action == "salute":
             # The salute card exposes a dedicated left/right-only selector.
             # Keep accepting the old `side` argument for direct MCP callers.
@@ -3697,7 +3697,7 @@ class TtsPlugin:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["speak", "stop", "pause", "resume"],
+                    "action": {"type": "string", "enum": ["speak", "interrupt", "pause", "resume"],
                                "description": "控制动作"},
                     "text": {"type": "string", "description": "要播放的文本"},
                     "force": {"type": "boolean", "description": "是否强制播放(打断当前播放)", "default": False},
@@ -3705,7 +3705,7 @@ class TtsPlugin:
                 "required": ["action"],
                 "x-action-params": {
                     "speak": {"params": ["text", "force"], "description": "合成并播放文本"},
-                    "stop": {"params": [], "description": "停止播放"},
+                    "interrupt": {"params": [], "description": "中止播放（不可恢复）"},
                     "pause": {"params": [], "description": "暂停播放"},
                     "resume": {"params": [], "description": "恢复播放"},
                 },
@@ -3733,8 +3733,8 @@ class TtsPlugin:
             if not text:
                 return {"error": "text is required"}
             return self._speak(text, force)
-        elif action == "stop":
-            return self._call_empty_service(self._stop_client, "stop")
+        elif action == "interrupt":
+            return self._call_empty_service(self._stop_client, "interrupt")
         elif action == "pause":
             return self._call_empty_service(self._pause_client, "pause")
         elif action == "resume":
@@ -3836,7 +3836,7 @@ class VoicePlayActuatorPlugin:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["play_file", "play_url", "play_text", "stop", "pause", "resume"],
+                        "enum": ["play_file", "play_url", "play_text", "interrupt", "pause", "resume"],
                         "description": "控制模式",
                     },
                     "path": {"type": "string", "description": "本地音频文件绝对路径(play_file)"},
@@ -3849,7 +3849,7 @@ class VoicePlayActuatorPlugin:
                     "play_file": {"params": ["path", "force"], "description": "播放本地音频文件"},
                     "play_url":  {"params": ["url", "force"],  "description": "播放远程URL音频"},
                     "play_text": {"params": ["text", "force"], "description": "TTS合成并播放文本"},
-                    "stop":      {"params": [],                 "description": "停止播放(不可恢复)"},
+                    "interrupt":  {"params": [],                 "description": "中止播放(不可恢复)"},
                     "pause":     {"params": [],                 "description": "暂停播放(可恢复)"},
                     "resume":    {"params": [],                 "description": "恢复暂停的播放"},
                 },
@@ -3863,7 +3863,7 @@ class VoicePlayActuatorPlugin:
                 "play_file": ("/audio_play/play_file", PlayFile),
                 "play_url":  ("/audio_play/play_url",  PlayUrl),
                 "play_text": ("/audio_play/play_text", PlayText),
-                "stop":      ("/audio_play/stop",      PlayStop),
+                "interrupt":  ("/audio_play/stop",      PlayStop),
                 "pause":     ("/audio_play/pause",     PlayPause),
                 "resume":    ("/audio_play/resume",   PlayResume),
             }
@@ -3934,9 +3934,16 @@ class VoicePlayActuatorPlugin:
 
         try:
             future = client.call_async(req)
-            # executor_tianyi is already spinning this node in background
-            # play_text may block until TTS synthesis completes — allow up to 60s
-            timeout = 60.0 if action == "play_text" else 3.0
+            # play_file/play_url/play_text: fire-and-forget, 不等合成完成
+            if action in ("play_file", "play_url", "play_text"):
+                return {
+                    "ok": True, "code": 0,
+                    "message": "submitted",
+                    "action": action,
+                    "timestamp_ms": int(time.time() * 1000),
+                }
+            # interrupt/pause/resume: 短超时等待确认
+            timeout = 3.0
             start = time.time()
             while not future.done() and time.time() - start < timeout:
                 time.sleep(0.05)
@@ -3985,7 +3992,7 @@ class NavPlugin:
                 "type": "object",
                 "properties": {
                     "action": {"type": "string",
-                               "enum": ["move_to", "move_by", "rotate", "rotate_to", "go_home", "stop", "get_pose"],
+                               "enum": ["move_to", "move_by", "rotate", "rotate_to", "go_home", "cancel", "get_pose"],
                                "description": "导航动作"},
                     "x": {"type": "number", "description": "目标x坐标(米)"},
                     "y": {"type": "number", "description": "目标y坐标(米)"},
@@ -4010,8 +4017,8 @@ class NavPlugin:
                                   "description": "原地旋转到绝对角度(度)"},
                     "go_home": {"params": [],
                                 "description": "自主导航回充电桩"},
-                    "stop": {"params": [],
-                             "description": "停止当前导航动作"},
+                    "cancel": {"params": [],
+                             "description": "取消当前导航动作"},
                     "get_pose": {"params": [],
                                  "description": "获取当前位姿(x, y, yaw)"},
                 },
@@ -4060,7 +4067,7 @@ class NavPlugin:
             result = self._slamtec.go_home()
             return {"state": "going_home", "api_result": result}
 
-        elif action == "stop":
+        elif action == "cancel":
             result = self._slamtec.cancel_current_action()
             # Also stop cmd_vel
             if self._vel_pub:
@@ -5146,7 +5153,7 @@ class ChassisRawPlugin:
                 "type": "object",
                 "properties": {
                     "action": {"type": "string",
-                               "enum": ["move", "rotate", "stop"],
+                               "enum": ["move", "rotate", "brake"],
                                "description": "控制动作"},
                     "direction": {"type": "string",
                                   "enum": ["forward", "backward"],
@@ -5165,7 +5172,7 @@ class ChassisRawPlugin:
                                "description": "前进/后退, 固定速率 0.3 m/s, duration=-1 持续运动"},
                     "rotate": {"params": ["rotation", "angle", "duration"],
                                "description": "精确旋转: angle(度) 用 Slamtec RotateAction 闭环; duration 为持续旋转"},
-                    "stop":   {"params": [],
+                    "brake":  {"params": [],
                                "description": "立即停止移动"},
                 },
             },
@@ -5225,7 +5232,7 @@ class ChassisRawPlugin:
             except (TypeError, ValueError):
                 return {"error": "duration must be a number"}
             return self._start(direction, dur)
-        elif action == "stop":
+        elif action == "brake":
             return self._do_stop()
         elif action in ("start", "info"):
             return {"state": "ready"}
