@@ -11,6 +11,7 @@ Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server t
 | Driver | Hardware | Port | Description |
 |--------|----------|------|-------------|
 | `unitree/g1` | Unitree G1 Humanoid | 15701 | Locomotion, arm control, mic, speaker, LED, state monitoring |
+| `ubtech/u1_pro` | UBTECH U1 Pro | 15714 | Correlated supplier adapter for system, locomotion, body, hands, speech and interaction capabilities |
 | `phanthy/remote_control` | Remote Control Bridge | 15710 | Remote control relay |
 
 ## Quick Start
