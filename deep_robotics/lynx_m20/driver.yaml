@@ -1,0 +1,11 @@
+id: deep-robotics-lynx-m20-driver
+name: 云深处山猫 M20 Driver
+category: driver
+hardware_provider: deep-robotics
+hardware_model: "lynx-m20"
+image_name: deep-robotics-lynx-m20
+port: 15716
+mcp_url: "http://localhost:15716/mcp"
+description: "山猫 M20 — 官方 ROS 2/Fast DDS 运动与感知接口、basic_server TCP/UDP 原生控制，以及标准版/Pro 能力隔离"
+build_context_extras:
+  - ../../common
