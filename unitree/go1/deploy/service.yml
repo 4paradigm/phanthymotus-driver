@@ -1,6 +1,6 @@
-unitree-go1-bundle:              # 服务名遵循 {provider}-{model}-{bundle} 约定
+unitree-go1:              # 服务名遵循 {provider}-{model}-{bundle} 约定
   image: __IMAGE__
-  container_name: embodied-unitree-go1-bundle
+  container_name: embodied-unitree-go1
   network_mode: host
   ipc: host
   pid: host
