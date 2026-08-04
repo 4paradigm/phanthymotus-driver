@@ -22,8 +22,10 @@ import os
 import re
 import signal
 import socket
+import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -40,6 +42,29 @@ def _load_config() -> dict:
     config_path = os.environ.get("CONFIG_PATH", str(Path(__file__).parent / "config.yaml"))
     with open(config_path) as f:
         return yaml.safe_load(f)
+
+
+def _ensure_lyre_asr_mode():
+    """Switch host lyre service to asr mode if not already."""
+    _nsenter = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--"]
+    try:
+        result = subprocess.run(
+            _nsenter + ["cat", "/home/nvidia/data/param/lyre_launch_mode"],
+            capture_output=True, text=True, timeout=5)
+        current = result.stdout.strip()
+        if current == "asr":
+            print("[lyre] already in asr mode")
+            return
+        subprocess.run(
+            _nsenter + ["bash", "-c", "echo asr > /home/nvidia/data/param/lyre_launch_mode"],
+            check=True, timeout=5)
+        subprocess.run(
+            _nsenter + ["systemctl", "restart", "lyre"],
+            check=True, timeout=15)
+        print(f"[lyre] switched from {current!r} to asr mode, restarted")
+        time.sleep(3)
+    except Exception as e:
+        print(f"[lyre] WARNING: could not switch to asr mode: {e}")
 
 
 def _resolve_namespace(cfg: dict) -> str:
@@ -423,6 +448,9 @@ def main():
     from nav_client import SlamtecClient
     slamtec_client = SlamtecClient(slamtec_url)
     print(f"[bundle] Slamtec client → {slamtec_url}")
+
+    # Ensure host lyre service is in asr mode (no built-in dialogue/TTS)
+    _ensure_lyre_asr_mode()
 
     # Dual-domain ROS2
     ros2 = DualDomainROS2()
