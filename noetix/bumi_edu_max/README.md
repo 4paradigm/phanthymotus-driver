@@ -14,3 +14,7 @@ or `BUMI_SDK_PATH` as required by the deployment.
 Before hardware validation, obtain the EDU Max joint names/limits and confirm
 the supplied `dds.xml`, firmware command table, action durations and safety
 state machine against the robot firmware version.
+
+The robot has not arrived yet. The pinned SDK API and examples have been
+contract-checked, but the ARM64 build, DDS connection and every physical command
+still require validation on the delivered EDU Max.
