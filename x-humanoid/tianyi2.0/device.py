@@ -61,7 +61,7 @@ from pathlib import Path
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from std_msgs.msg import String, Bool
+from std_msgs.msg import String, Bool, UInt32MultiArray
 
 _LOW_LAT_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -4030,3 +4030,550 @@ class RemoteStatePlugin:
                     "topic_out": [{"topic": self._topic, "format": "data/json"}]}
         return {"state": "error", "error": "INVALID_ARGUMENT",
                 "message": f"unknown action: {action}"}
+class RobotFaultsPlugin:
+    """全机故障汇总 — 底盘 (Slamtec HTTP) + 身体电机/灵巧手/急停 (ROS2 订阅), 1Hz 发布。
+    bodyctrl_msgs 不可用时身体部分自动降级为 unavailable。"""
+
+    @staticmethod
+    def _default_config() -> dict:
+        return {
+            "motor_status_topics": ["/head/status", "/arm/status", "/waist/status", "/leg/status"],
+            "hand_error_topics": {
+                "left": "/inspire_hand/error/left_hand",
+                "right": "/inspire_hand/error/right_hand",
+            },
+            "estop_topic": "/power/board/key_status",
+        }
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2, slamtec_client):
+        cfg = self._default_config()
+        cfg.update(plugin_config)
+        self._ns = namespace
+        self._ros2 = ros2
+        self._slamtec = slamtec_client
+        self._running = False
+
+        # 身体故障源配置
+        self._motor_topics = cfg["motor_status_topics"]
+        self._hand_topics = cfg["hand_error_topics"]
+        self._estop_topic = cfg["estop_topic"]
+
+        # 状态
+        self._chassis_data = None
+        self._body_faults = {}
+        self._body_sources = {}
+        self._body_available = False
+        self._last_update_ms = None
+        self._lock = threading.Lock()
+
+        # 订阅节点 (domain 0) — 接收身体故障
+        self._sub_node = Node("tianyi2_robot_faults_sub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._sub_node)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "robot_faults",
+            "type": "actuator",
+            "description": "天轶2.0 全机故障检查 — 底盘安全 + 身体电机/灵巧手/急停",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["summary"],
+                               "description": "summary=关键摘要"},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "summary": {"params": [], "description": "返回关键摘要: 底盘状态/急停/身体故障数"},
+                },
+            },
+        }
+
+    # ── start / stop ──────────────────────────────────────────────────────
+
+    def start(self):
+        self._running = True
+
+        # 底盘采集线程 (HTTP, 5Hz)
+        threading.Thread(target=self._chassis_poll_loop, daemon=True).start()
+
+        # 身体 ROS2 订阅 (失败则降级)
+        try:
+            from bodyctrl_msgs.msg import MotorStatusMsg, PowerBoardKeyStatus
+            for src_topic in self._motor_topics:
+                self._sub_node.create_subscription(
+                    MotorStatusMsg, src_topic,
+                    lambda msg, t=src_topic: self._on_motor_status(msg, t),
+                    _RELIABLE_QOS)
+            for side, src_topic in self._hand_topics.items():
+                self._sub_node.create_subscription(
+                    UInt32MultiArray, src_topic,
+                    lambda msg, h=side, t=src_topic: self._on_hand_error(msg, h, t),
+                    _RELIABLE_QOS)
+            self._sub_node.create_subscription(
+                PowerBoardKeyStatus, self._estop_topic,
+                self._on_estop, _RELIABLE_QOS)
+            self._body_available = True
+            print("[RobotFaultsPlugin] body subscriptions created")
+        except ImportError as e:
+            print(f"[RobotFaultsPlugin] bodyctrl_msgs not available ({e}), body disabled")
+
+        # 完整数据发布线程 (1Hz → topic)
+        print("[RobotFaultsPlugin] started")
+
+    def stop(self):
+        self._running = False
+
+    # ── 底盘 HTTP 轮询 (5Hz) ──────────────────────────────────────────────
+
+    def _chassis_poll_loop(self):
+        while self._running:
+            try:
+                data = self._slamtec.get_safety_status()
+                if data:
+                    with self._lock:
+                        self._chassis_data = data
+                        self._last_update_ms = int(time.time() * 1000)
+            except Exception:
+                pass
+            time.sleep(0.2)  # 5Hz
+
+    # ── 身体 ROS2 回调 ────────────────────────────────────────────────────
+
+    def _on_motor_status(self, msg, source_topic: str):
+        now_ms = int(time.time() * 1000)
+        with self._lock:
+            for motor in msg.status:
+                motor_id = int(motor.name)
+                fault_id = f"motor:{motor_id}"
+                if int(motor.error) == 0:
+                    self._body_faults.pop(fault_id, None)
+                    continue
+                self._body_faults[fault_id] = {
+                    "fault_id": fault_id,
+                    "category": "motor",
+                    "motor_id": motor_id,
+                    "component": _ALL_JOINTS.get(motor_id, f"motor_{motor_id}"),
+                    "error_code": int(motor.error),
+                    "error_desc": _MOTOR_ERROR_DESCRIPTIONS.get(int(motor.error), "unknown"),
+                    "severity": "error",
+                    "source_topic": source_topic,
+                }
+            self._body_sources[source_topic] = now_ms
+            self._last_update_ms = now_ms
+
+    def _on_hand_error(self, msg, side: str, source_topic: str):
+        now_ms = int(time.time() * 1000)
+        prefix = f"hand:{side}:"
+        with self._lock:
+            for key in [k for k in self._body_faults if k.startswith(prefix)]:
+                self._body_faults.pop(key, None)
+            for idx, code in enumerate(msg.data, start=1):
+                code = int(code)
+                if code == 0:
+                    continue
+                fid = f"{prefix}{idx}"
+                self._body_faults[fid] = {
+                    "fault_id": fid,
+                    "category": "hand",
+                    "component": f"{side}_hand_error_channel_{idx}",
+                    "error_code": code,
+                    "severity": "error",
+                    "source_topic": source_topic,
+                }
+            self._body_sources[source_topic] = now_ms
+            self._last_update_ms = now_ms
+
+    def _on_estop(self, msg):
+        now_ms = int(time.time() * 1000)
+        states = {
+            "physical": bool(msg.is_estop.data),
+            "remote": bool(msg.is_remote_estop.data),
+        }
+        with self._lock:
+            for kind, active in states.items():
+                fid = f"estop:{kind}"
+                if not active:
+                    self._body_faults.pop(fid, None)
+                    continue
+                self._body_faults[fid] = {
+                    "fault_id": fid,
+                    "category": "estop",
+                    "component": f"{kind}_estop",
+                    "error_code": 1,
+                    "severity": "fatal",
+                    "source_topic": self._estop_topic,
+                }
+            self._body_sources[self._estop_topic] = now_ms
+            self._last_update_ms = now_ms
+
+    # ── 按需查询执行器 ─────────────────────────────────────────────────────
+
+    def _build_summary_locked(self) -> dict:
+        """生成关键摘要，每次 dispatch 调用时读取最新快照。"""
+
+        # 底盘
+        chassis_available = self._chassis_data is not None
+        chassis_healthy = chassis_available and not self._chassis_data.get("has_error") \
+                          and not self._chassis_data.get("has_fatal")
+        chassis_lines = []
+        if not chassis_available:
+            chassis_lines.append("离线")
+        elif not chassis_healthy:
+            chassis_lines.append("异常")
+        else:
+            chassis_lines.append("正常")
+        if chassis_available:
+            d = self._chassis_data
+            if d.get("emergency_stop"):
+                chassis_lines.append("急停!")
+            if d.get("lidar_disconnected"):
+                chassis_lines.append("雷达离线")
+
+        # 身体
+        body_faults = sorted(self._body_faults.values(), key=lambda f: f["fault_id"])
+        body_lines = []
+        if not self._body_available:
+            body_lines.append("离线")
+        elif not body_faults:
+            body_lines.append("正常")
+        else:
+            for f in body_faults:
+                body_lines.append(f"{f['component']}({f.get('error_desc', f['error_code'])})")
+
+        # 生成人类可读总结段落
+        body_fault_count = len(body_faults)
+        if chassis_healthy and self._body_available and body_fault_count == 0:
+            summary_text = "机器人状态良好，底盘运动系统正常，身体各关节无故障。"
+        else:
+            parts = []
+            if not chassis_healthy:
+                parts.append("底盘系统异常")
+            elif chassis_available:
+                parts.append("底盘正常")
+            if not self._body_available:
+                parts.append("身体关节数据无法获取")
+            elif body_fault_count > 0:
+                fault_desc = "，".join(
+                    f"{f['component']}({f.get('error_desc', f['error_code'])})"
+                    for f in body_faults[:3])
+                if body_fault_count > 3:
+                    fault_desc += f" 等{body_fault_count}个故障"
+                parts.append(f"检测到身体故障: {fault_desc}")
+            else:
+                parts.append("身体关节正常")
+            summary_text = "；".join(parts) + "。"
+
+        return {
+            "healthy": chassis_healthy and self._body_available and not body_faults,
+            "summary_text": summary_text,
+            "summary": ", ".join(chassis_lines + body_lines),
+            "chassis": {
+                "available": chassis_available,
+                "healthy": chassis_healthy,
+                "emergency_stop": self._chassis_data.get("emergency_stop", False) if chassis_available else None,
+                "detail": ", ".join(chassis_lines),
+            },
+            "body": {
+                "available": self._body_available,
+                "fault_count": len(body_faults),
+                "faults": body_faults if body_faults else [],
+                "detail": ", ".join(body_lines),
+            },
+        }
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "stop", "info"):
+            return {"state": "running" if self._running else "idle"}
+        with self._lock:
+            return self._build_summary_locked()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LaserScanPlugin (sensor)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class LaserScanPlugin:
+    """激光雷达原始数据 — 轮询 Slamtec 底盘 laserscan 端点 (5Hz)"""
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2, slamtec_client):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._slamtec = slamtec_client
+        self._topic = f"/{namespace}/state/laser_scan"
+        self._topic_viz = f"/{namespace}/state/laser_scan_viz"
+        self._running = False
+        self._latest_raw = None
+
+        self._pub_node = Node("tianyi2_laserscan_pub", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._pub_node)
+        self._pub = self._pub_node.create_publisher(String, self._topic, _LOW_LAT_QOS)
+        # 可视化图片发布
+        try:
+            from sensor_msgs.msg import CompressedImage
+            self._pub_viz = self._pub_node.create_publisher(
+                CompressedImage, self._topic_viz, _LOW_LAT_QOS)
+        except ImportError:
+            self._pub_viz = None
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "laser_scan",
+            "type": "sensor",
+            "description": "天轶2.0 激光雷达 — 5Hz 原始点云 + 1Hz 俯视点云图, 后台自动运行",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+            },
+            "topic_out": [{"topic": self._topic, "format": "data/json"},
+                          {"topic": self._topic_viz, "format": "image/jpeg"}],
+        }
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self._thread.start()
+        print("[LaserScanPlugin] polling started")
+
+    def stop(self):
+        self._running = False
+
+    def _poll_loop(self):
+        tick = 0
+        while self._running:
+            try:
+                data = self._slamtec.get_laser_scan()
+                if data and "error" not in data:
+                    # 始终发布完整原始数据到 topic
+                    msg = String()
+                    msg.data = json.dumps(data)
+                    self._pub.publish(msg)
+
+                    # 缓存点云供可视化
+                    laser_points = data.get("laser_points", data.get("data", []))
+                    self._latest_raw = laser_points
+            except Exception:
+                pass
+            # 每 1 秒生成一张可视化图片发到 viz topic
+            if self._pub_viz and self._latest_raw and tick % 5 == 0:
+                self._publish_viz()
+            tick += 1
+            time.sleep(0.2)
+
+    def _publish_viz(self):
+        """生成俯视图 JPEG 发到 viz topic."""
+        try:
+            import cv2, numpy as np
+            from sensor_msgs.msg import CompressedImage
+        except ImportError:
+            return
+        pts = self._latest_raw
+        if not pts:
+            return
+        size = 400
+        scale = (size // 2) / 6.0
+        img = np.full((size, size, 3), (20, 20, 20), dtype=np.uint8)
+        for p in pts:
+            if not p.get("valid"):
+                continue
+            dist = p["distance"]
+            if dist > 6.0:
+                continue
+            angle = p["angle"]
+            px = int(size // 2 + dist * np.sin(angle) * scale)
+            py = int(size // 2 - dist * np.cos(angle) * scale)
+            if 0 <= px < size and 0 <= py < size:
+                ratio = min(dist / 3.0, 1.0)
+                r = int(255 * (1.0 - ratio))
+                b = int(255 * ratio)
+                cv2.circle(img, (px, py), 1, (b, 0, r), -1)
+        cv2.circle(img, (size // 2, size // 2), 6, (0, 255, 0), -1)
+        cv2.line(img, (size // 2, size // 2), (size // 2, 10), (0, 255, 0), 1)
+        for label, a_range, color in [
+            ("F", (-0.52, 0.52), (255, 255, 0)),
+            ("L", (1.04, 2.09), (0, 255, 255)),
+            ("R", (-2.09, -1.04), (255, 0, 255)),
+        ]:
+            mid = (a_range[0] + a_range[1]) / 2
+            lx = int(size // 2 + 3.5 * scale * np.sin(mid))
+            ly = int(size // 2 - 3.5 * scale * np.cos(mid))
+            cv2.putText(img, label, (lx - 8, ly + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        for r in [2, 4, 6]:
+            cv2.circle(img, (size // 2, size // 2), int(r * scale), (50, 50, 50), 1)
+            cv2.putText(img, f"{r}m", (size // 2 + 5, size // 2 - int(r * scale) + 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (80, 80, 80), 1)
+        _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        viz_msg = CompressedImage()
+        viz_msg.format = "jpeg"
+        viz_msg.data = buf.tobytes()
+        self._pub_viz.publish(viz_msg)
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        return {"state": "running" if self._running else "idle",
+                "topic_out": [{"topic": self._topic, "format": "data/json"},
+                              {"topic": self._topic_viz, "format": "image/jpeg"}]}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ChassisRawPlugin (actuator)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ChassisRawPlugin:
+    """底盘速度控制 — 固定速率 0.3 m/s, 200ms 刷新保持连续运动。
+    duration=-1 持续运动。"""
+
+    DIR_NAMES = ["forward", "backward", "right", "left"]
+    _FIXED_V = 0.3          # m/s
+    _FIXED_W = 1.0          # rad/s (≈ 57.3 °/s)
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2, slamtec_client):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._slamtec = slamtec_client
+        self._max_vx = float(plugin_config.get("max_vx", 0.5))
+        self._max_vyaw = float(plugin_config.get("max_vyaw", 1.0))
+        self._max_duration = float(plugin_config.get("max_duration", 5.0))
+        self._running = False
+        self._gen = 0  # 世代计数器, 防止新旧线程并发
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "chassis_raw",
+            "type": "actuator",
+            "description": "天轶2.0 底盘速度控制 — 固定速率 0.3 m/s, 前进/后退/左转/右转, duration=-1 持续运动",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string",
+                               "enum": ["move", "rotate", "stop"],
+                               "description": "控制动作"},
+                    "direction": {"type": "string",
+                                  "enum": ["forward", "backward"],
+                                  "description": "移动方向 (固定速率 0.3 m/s)"},
+                    "rotation": {"type": "string",
+                                 "enum": ["left", "right"],
+                                 "description": "旋转方向 (固定角速度 1.0 rad/s ≈ 57°/s)"},
+                    "angle": {"type": "number",
+                              "description": "旋转角度(度), 自动换算时间, 与 duration 二选一"},
+                    "duration": {"type": "number",
+                                 "description": "持续时间(秒), -1=持续运动"},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "move":   {"params": ["direction", "duration"],
+                               "description": "前进/后退, 固定速率 0.3 m/s, duration=-1 持续运动"},
+                    "rotate": {"params": ["rotation", "angle", "duration"],
+                               "description": "原地旋转, angle(度)或duration(秒), duration=-1 持续旋转, 固定角速度 1.0 rad/s ≈ 57°/s"},
+                    "stop":   {"params": [],
+                               "description": "立即停止移动"},
+                },
+            },
+        }
+
+    def start(self):
+        print("[ChassisRawPlugin] started (Slamtec MoveByAction mode)")
+
+    def stop(self):
+        self._running = False
+        try:
+            self._slamtec.cancel_current_action()
+        except Exception:
+            pass
+        print("[ChassisRawPlugin] stopped")
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "move":
+            direction_str = args.get("direction", "forward")
+            if direction_str not in ("forward", "backward"):
+                return {"error": "direction must be 'forward' or 'backward'"}
+            d = 0 if direction_str == "forward" else 1
+            try:
+                dur = float(args.get("duration", 3.0))
+            except (TypeError, ValueError):
+                return {"error": "duration must be a number"}
+            return self._start(d, dur)
+        elif action == "rotate":
+            rot = args.get("rotation", "left")
+            if rot not in ("left", "right"):
+                return {"error": "rotation must be 'left' or 'right'"}
+            direction = 3 if rot == "left" else 2
+
+            # angle(度) 优先于 duration, 按固定角速度换算
+            angle = args.get("angle")
+            dur = args.get("duration")
+            if angle is not None:
+                try:
+                    angle_deg = abs(float(angle))
+                    dur = angle_deg / (self._FIXED_W * 180 / math.pi)
+                except (TypeError, ValueError):
+                    return {"error": "angle must be a number (degrees)"}
+            if dur is None:
+                dur = 3.0
+            try:
+                dur = float(dur)
+            except (TypeError, ValueError):
+                return {"error": "duration must be a number"}
+
+            return self._start(direction, dur)
+        elif action == "stop":
+            return self._do_stop()
+        elif action in ("start", "info"):
+            return {"state": "ready"}
+        return {"error": f"unknown action: {action}"}
+
+    def _start(self, direction: int, duration: float) -> dict:
+        self._running = False
+        self._gen += 1
+        time.sleep(0.05)
+        self._do_stop()
+        time.sleep(0.05)
+
+        continuous = (duration < 0)
+        self._running = True
+        gen = self._gen
+        threading.Thread(
+            target=self._move_loop, args=(direction, duration, continuous, gen), daemon=True
+        ).start()
+
+        return {"direction": self.DIR_NAMES[direction],
+                "duration": duration, "continuous": continuous,
+                "speed": "0.3 m/s (fixed)" if direction < 2 else "1.0 rad/s (fixed)"}
+
+    def _move_loop(self, direction: int, total_duration: float, continuous: bool, gen: int):
+        """运动控制 — 非持续模式发单次精确定时 move_by; 持续模式每 200ms 刷新。"""
+        if not continuous:
+            # 单次精确运动: move_by duration 单位是毫秒
+            try:
+                self._slamtec.move_by(direction, int(total_duration * 1000))
+            except Exception as e:
+                print(f"[ChassisRawPlugin] move_by error: {e}")
+            time.sleep(total_duration + 0.3)  # 等运动完成+缓冲
+            if self._running and self._gen == gen:
+                self._do_stop()
+            return
+
+        # 持续模式: 每 200ms 刷新 300ms 运动指令保持连续
+        step = 0.2
+        while self._running and self._gen == gen:
+            try:
+                self._slamtec.move_by(direction, 300)
+            except Exception as e:
+                print(f"[ChassisRawPlugin] move_by error: {e}")
+                break
+            time.sleep(step)
+        if self._running and self._gen == gen:
+            self._do_stop()
+
+    def _do_stop(self) -> dict:
+        self._running = False
+        try:
+            self._slamtec.cancel_current_action()
+        except Exception:
+            pass
+        return {"vx": 0.0, "vyaw": 0.0, "state": "stopped"}
+
+    @staticmethod
+    def _clamp(value: float, low: float, high: float) -> float:
+        return max(low, min(high, value))
+
+

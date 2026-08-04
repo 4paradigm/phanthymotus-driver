@@ -186,6 +186,18 @@ class SlamtecClient:
         """获取当前运动速度"""
         return self._get("/api/core/motion/v1/speed")
 
+    def set_max_moving_speed(self, speed: float) -> dict:
+        """设置最大移动速度 (m/s)"""
+        return self._post("/api/core/motion/v1/max_moving_speed", {"speed": speed})
+
+    def set_max_angular_speed(self, speed: float) -> dict:
+        """设置最大旋转速度 (rad/s)"""
+        return self._post("/api/core/motion/v1/max_angular_speed", {"speed": speed})
+
+    def get_safety_status(self) -> dict:
+        """获取安全状态 (碰撞/跌落/虚拟墙/急停)"""
+        return self._get("/api/core/safety/v1/status")
+
     def get_action_status(self, action_id: str) -> dict:
         """查询Action状态 {status: 0-4, result: 0/-1/-2}"""
         return self._get(f"/api/core/motion/v1/actions/{action_id}")
