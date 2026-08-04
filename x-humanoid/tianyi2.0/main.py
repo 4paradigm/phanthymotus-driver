@@ -68,6 +68,69 @@ def _ensure_lyre_audio_mode():
         print(f"[lyre] WARNING: could not switch to {target} mode: {e}")
 
 
+def _ensure_audio_sender(cfg: dict):
+    """Ensure audio_sender.py TCP server is running on the host for DJI wireless mic streaming."""
+    ext_mic_cfg = cfg.get("plugins", {}).get("ext_mic", {})
+    if not ext_mic_cfg.get("enabled", False):
+        return
+    sources = ext_mic_cfg.get("network_sources", [])
+    tcp_sources = [s for s in sources if s.get("url", "").startswith("tcp://")]
+    if not tcp_sources:
+        return
+
+    _nsenter = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--"]
+
+    # Check if already running
+    try:
+        result = subprocess.run(
+            _nsenter + ["pgrep", "-f", "audio_sender.py"],
+            capture_output=True, text=True, timeout=5)
+        if result.returncode == 0 and result.stdout.strip():
+            pid = result.stdout.strip().splitlines()[0]
+            print(f"[audio_sender] already running (pid={pid})")
+            return
+    except Exception:
+        pass
+
+    # Deploy audio_sender.py to host
+    sender_src = str(Path(__file__).parent / "audio_sender.py")
+    host_dir = "/opt/phanthy-motus"
+    host_path = f"{host_dir}/audio_sender.py"
+    try:
+        subprocess.run(_nsenter + ["mkdir", "-p", host_dir], timeout=5)
+        with open(sender_src) as f:
+            content = f.read()
+        subprocess.run(
+            _nsenter + ["bash", "-c", f"cat > {host_path}"],
+            input=content, text=True, check=True, timeout=5)
+        print(f"[audio_sender] deployed to host:{host_path}")
+    except Exception as e:
+        print(f"[audio_sender] WARNING: could not deploy to host: {e}")
+        return
+
+    # Start in background
+    # Extract port from first TCP source URL (e.g. tcp://192.168.41.1:9800)
+    url = tcp_sources[0]["url"]
+    port = url.rsplit(":", 1)[-1].split("/")[0] if ":" in url else "9800"
+    try:
+        subprocess.run(
+            _nsenter + ["bash", "-c",
+                         f"nohup python3 {host_path} --port {port} "
+                         f"> /tmp/audio_sender.log 2>&1 &"],
+            timeout=5)
+        time.sleep(1)
+        result = subprocess.run(
+            _nsenter + ["pgrep", "-f", "audio_sender.py"],
+            capture_output=True, text=True, timeout=5)
+        if result.returncode == 0 and result.stdout.strip():
+            pid = result.stdout.strip().splitlines()[0]
+            print(f"[audio_sender] started on host (pid={pid}, port={port})")
+        else:
+            print(f"[audio_sender] WARNING: process did not start, check /tmp/audio_sender.log on host")
+    except Exception as e:
+        print(f"[audio_sender] WARNING: could not start: {e}")
+
+
 def _resolve_namespace(cfg: dict) -> str:
     ns = cfg.get("ros_namespace", "").strip()
     if ns:
@@ -457,6 +520,9 @@ def main():
 
     # Ensure host lyre service is in audio mode (ASR + TTS, no built-in dialogue)
     _ensure_lyre_audio_mode()
+
+    # Ensure TCP audio sender is running on host for DJI wireless mic
+    _ensure_audio_sender(cfg)
 
     # Dual-domain ROS2
     ros2 = DualDomainROS2()
