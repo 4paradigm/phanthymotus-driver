@@ -47,17 +47,18 @@ class LightPlugin:
         return {
             "name": "light",
             "type": "actuator",
-            "description": "天轶2.0 系统状态灯效。duration 必填，-1 表示常亮。",
+            "description": "天轶2.0 系统状态灯效。duration 未填写时默认持续 5 秒，-1 表示常亮。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": list(self._commands)},
                     "duration": {
                         "type": "number",
-                        "description": "灯效持续时间（秒）。-1 表示常亮；正数到期后发送对应结束命令。",
+                        "default": 5,
+                        "description": "灯效持续时间（秒）。未填写默认 5 秒；-1 表示常亮；正数到期后发送对应结束命令。",
                     },
                 },
-                "required": ["action", "duration"],
+                "required": ["action"],
                 "x-action-params": {
                     action: {"params": ["duration"], "description": action}
                     for action in self._commands
@@ -105,13 +106,12 @@ class LightPlugin:
     def dispatch(self, action, args):
         if action not in self._commands:
             return {"error": f"unknown action: {action}"}
-        if "duration" not in args:
-            return {"error": "duration is required; use -1 for a persistent light effect"}
+        raw_duration = args.get("duration", 5)
         try:
-            duration = float(args["duration"])
+            duration = float(raw_duration)
         except (TypeError, ValueError):
             return {"error": "duration must be -1 or a positive number of seconds"}
-        if isinstance(args["duration"], bool) or not math.isfinite(duration) or (duration != -1 and duration <= 0):
+        if isinstance(raw_duration, bool) or not math.isfinite(duration) or (duration != -1 and duration <= 0):
             return {"error": "duration must be -1 or a positive number of seconds"}
 
         with self._timer_lock:
