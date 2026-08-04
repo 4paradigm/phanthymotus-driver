@@ -312,53 +312,91 @@ class _RgbStream:
                     pass
 
 class _DepthStream(_BaseStream):
-    """深度流：[4B 长度大端][JPEG payload] → CompressedImage。"""
+    """深度流：[4B 长度大端][JPEG payload] → CompressedImage。
+
+    使用非阻塞批量读取：连上才开相机（Nano 侧），断开即释放（同 _RgbStream 路线）。
+    """
 
     def __init__(self, node: Node, topic: str):
         super().__init__(node, topic)
         self._pub = node.create_publisher(CompressedImage, topic, _QOS) if _HAS_ROS2 else None
+        self._last_publish_ms = 0
+        self._MIN_INTERVAL_MS = 30       # 最多发布约 30fps
+        self._MAX_DRAIN_BYTES = 1_048_576
 
     def _loop(self, gen, position, host, port):
-        t_connect, t_first, t_steady = 8.0, 15.0, 8.0
         while self._run and gen == self._gen:
             try:
-                s = socket.create_connection((host, port), timeout=t_connect)
-                s.settimeout(t_first)
+                s = socket.create_connection((host, port), timeout=_CONNECT_TIMEOUT)
+                s.setblocking(False)
                 self.connected = True
                 if self._node:
-                    self._node.get_logger().info(f"[{position}] 已连 depth_stream {host}:{port}")
+                    self._node.get_logger().info(f"[{position}] 已连 depth_stream {host}:{port}（等首帧，SDK 初始化~3-4s）")
             except Exception:
                 self.connected = False
                 time.sleep(2)
                 continue
             try:
                 got_first = False
+                rx = bytearray()
                 while self._run and gen == self._gen:
-                    hdr = _recvall(s, 4)
-                    if hdr is None:
+                    timeout = _STEADY_TIMEOUT if got_first else _FIRST_FRAME_TIMEOUT
+                    readable, _, _ = select.select([s], [], [], timeout)
+                    if not readable:
+                        raise TimeoutError("timed out")
+
+                    received = 0
+                    peer_closed = False
+                    while received < self._MAX_DRAIN_BYTES:
+                        try:
+                            chunk = s.recv(min(65_536, self._MAX_DRAIN_BYTES - received))
+                        except BlockingIOError:
+                            break
+                        if not chunk:
+                            peer_closed = True
+                            break
+                        rx.extend(chunk)
+                        received += len(chunk)
+                    if peer_closed:
                         break
-                    n = struct.unpack(">I", hdr)[0]
-                    if n <= 0 or n > 5_000_000:
-                        break
-                    data = _recvall(s, n)
-                    if data is None:
-                        break
+
+                    # 丢弃已过期完整帧，仅留最新一帧；不完整尾帧保留到下次 recv
+                    latest = None
+                    complete_frames = 0
+                    while len(rx) >= 4:
+                        n = struct.unpack(">I", rx[:4])[0]
+                        if n <= 0 or n > 5_000_000:
+                            raise ValueError(f"invalid JPEG frame length: {n}")
+                        end = 4 + n
+                        if len(rx) < end:
+                            break
+                        latest = bytes(rx[4:end])
+                        del rx[:end]
+                        complete_frames += 1
+                    self.frames += complete_frames
+                    if latest is None:
+                        continue
+
                     if not got_first:
                         got_first = True
-                        s.settimeout(t_steady)
                         if self._node:
-                            self._node.get_logger().info(f"[{position}] 首帧到达")
+                            self._node.get_logger().info(f"[{position}] 首帧到达，进入稳态推流")
+
+                    now_ms = int(time.time() * 1000)
+                    if now_ms - self._last_publish_ms < self._MIN_INTERVAL_MS:
+                        continue
+
                     if self._pub is not None:
                         msg = CompressedImage()
                         msg.header.stamp = self._node.get_clock().now().to_msg()
                         msg.header.frame_id = f"go1_{position}_depth"
                         msg.format = "jpeg"
-                        msg.data = data
+                        msg.data = latest
                         try:
                             self._pub.publish(msg)
+                            self._last_publish_ms = now_ms
                         except Exception:
                             break
-                    self.frames += 1
             except Exception as e:  # noqa: BLE001
                 if self._node:
                     self._node.get_logger().warn(f"[{position}] depth stream 中断: {e}")
