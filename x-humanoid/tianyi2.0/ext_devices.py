@@ -199,9 +199,9 @@ def _enumerate_ext_cameras() -> list[dict]:
 class _ExtMicNode(Node):
     """Captures audio from a system input device and publishes AudioChunk."""
 
-    def __init__(self, device_index, device_name: str, namespace: str, instance_id: str):
+    def __init__(self, device_index, device_name: str, namespace: str, instance_id: str, context=None):
         node_name = f"ext_mic_{instance_id.replace('-', '_')}"
-        super().__init__(node_name)
+        super().__init__(node_name, context=context)
         self._device_index = device_index  # alsa_id string (hw:CARD=...) or numeric index
         self._device_name = device_name
         self._instance_id = instance_id
@@ -697,7 +697,8 @@ class ExtMicPlugin:
             except (ValueError, TypeError):
                 pass  # keep as string (alsa_id like "hw:0,0")
             if instance_id not in self._nodes:
-                node = _ExtMicNode(device_id, device_name, self._namespace, instance_id)
+                node = _ExtMicNode(device_id, device_name, self._namespace, instance_id,
+                                   context=self._executor.context)
                 self._executor.add_node(node)
                 self._nodes[instance_id] = node
             return self._nodes[instance_id].start()
