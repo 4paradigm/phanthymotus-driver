@@ -1,0 +1,20 @@
+mcp_port: 15716
+ros_namespace: ""
+name: "Deep Robotics S10Pro"
+ros:
+  robot_domain_id: 0
+  core_domain_id: 42
+  robot_interface: "eth0"
+topics:
+  command: "/s10_pro/driver/command"
+  state: "/s10_pro/driver/state"
+  ack: "/s10_pro/driver/ack"
+  cmd_vel: "/cmd_vel"
+  goal_pose: "/goal_pose"
+  joint_states: "/joint_states"
+  imu: "/imu/data"
+  odometry: "/odom"
+  battery: "/battery_state"
+  camera: "/camera/color/image_raw"
+  depth: "/camera/depth/image_raw"
+  lidar: "/lidar/points"
