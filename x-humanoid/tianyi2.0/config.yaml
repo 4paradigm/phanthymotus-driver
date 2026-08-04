@@ -54,3 +54,5 @@ plugins:
     enabled: true
   chassis_raw:
     enabled: true
+  light:
+    enabled: true

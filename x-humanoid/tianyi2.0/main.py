@@ -214,6 +214,11 @@ class TianyiDeviceBundle:
             self._plugins.append(ChassisRawPlugin(plugins_cfg["chassis_raw"], namespace, ros2, slamtec_client))
             print("[bundle] ChassisRawPlugin loaded")
 
+        if plugins_cfg.get("light", {}).get("enabled", False):
+            from light import LightPlugin
+            self._plugins.append(LightPlugin(plugins_cfg["light"], namespace, ros2))
+            print("[bundle] LightPlugin loaded")
+
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
             try:
