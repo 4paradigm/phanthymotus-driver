@@ -1,0 +1,11 @@
+mcp_port: 15714
+ros_namespace: ""
+name: "UBTECH U1 Pro"
+ros:
+  robot_domain_id: 0
+  core_domain_id: 42
+  robot_interface: "eth0"
+topics:
+  command: "/u1_pro/driver/command"
+  state: "/u1_pro/driver/state"
+  ack: "/u1_pro/driver/ack"

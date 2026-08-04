@@ -1,0 +1,11 @@
+id: ubtech-u1-pro-driver
+name: UBTECH U1 Pro Bundle
+category: driver
+hardware_provider: ubtech
+hardware_model: "u1-pro"
+image_name: ubtech-u1-pro
+port: 15714
+mcp_url: "http://localhost:15714/mcp"
+description: "U1 Pro — 运动、全身、手势、头部注视、语音、视觉交互与舞蹈的可配置 ROS2 供应商协议适配层"
+build_context_extras:
+  - ../../common
