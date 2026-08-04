@@ -11,7 +11,8 @@
  * Without PSDK_ENABLED, builds in stub mode for development/testing.
  *
  * Usage:
- *   ./psdk_bridge [socket_path] [app_id] [app_key] [app_license] [uart_dev] [baud_rate]
+ *   ./psdk_bridge [socket_path] [app_id] [app_key] [app_license]
+ *                 [uart0_dev] [uart0_baud] [uart1_dev]
  */
 
 #include <stdio.h>
@@ -21,7 +22,6 @@
 #include <unistd.h>
 
 #include "ipc.h"
-#include "hal_network.h"
 #include "osal_posix.h"
 #include "telemetry.h"
 #include "flight_ctrl.h"
@@ -51,16 +51,12 @@ static void _signal_handler(int sig) {
 #ifdef PSDK_ENABLED
 #include "dji_core.h"
 #include "dji_platform.h"
+#include "dji_version.h"
+#include "dji_logger.h"
 #include "dji_payload_camera.h"
 #include "dji_aircraft_info.h"
-#include "osal_socket.h"
-#include <dirent.h>
 #include <pthread.h>
 #include <semaphore.h>
-#include <net/if.h>
-#include <sys/ioctl.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 #include <termios.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -68,23 +64,68 @@ static void _signal_handler(int sig) {
 
 /* ── UART HAL implementation matching T_DjiHalUartHandler ─────────────── */
 
-static int s_uart_fd = -1;
-static const char *s_uart_device = "/dev/ttyUSB0";
-static uint32_t s_uart_baud = 921600;
-static uint16_t s_uart_vid;
-static uint16_t s_uart_pid;
+/* M300 Extension Port has two distinct PSDK serial links.  UART0 is the
+ * E-Port UART routed through the FTDI adapter.  UART1 is the E-Port USB CDC
+ * virtual serial port.  Never collapse these into one descriptor: the SDK
+ * selects the UART number according to the aircraft and mount type. */
+#define M300_UART_COUNT 2
+typedef struct {
+    const char *device;
+    uint16_t vid;
+    uint16_t pid;
+    uint32_t open_handles;
+} T_M300Uart;
+
+static T_M300Uart s_uart[M300_UART_COUNT] = {
+    [DJI_HAL_UART_NUM_0] = {.device = "/dev/ttyUSB0"},
+    [DJI_HAL_UART_NUM_1] = {.device = "/dev/ttyACM0"},
+};
+
+typedef struct {
+    int fd;
+    T_M300Uart *uart;
+    bool closed;
+} T_M300UartHandle;
+
+static volatile uint64_t s_uart_tx_bytes;
+static volatile uint64_t s_uart_rx_bytes;
+static volatile uint32_t s_uart_write_errors;
+static volatile uint32_t s_uart_read_errors;
+
+static T_DjiReturnCode _PsdkLogConsole(const uint8_t *data, uint16_t dataLen) {
+    if (data == NULL)
+        return DJI_ERROR_SYSTEM_MODULE_CODE_INVALID_PARAMETER;
+    fwrite(data, 1, dataLen, stdout);
+    fflush(stdout);
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
+static T_DjiLoggerConsole s_psdk_debug_console = {
+    .func = _PsdkLogConsole,
+    .consoleLevel = DJI_LOGGER_CONSOLE_LOG_LEVEL_DEBUG,
+    .isSupportColor = false,
+};
+static T_M300Uart *_HalUart_Get(E_DjiHalUartNum uartNum) {
+    if (uartNum < DJI_HAL_UART_NUM_0 || uartNum >= M300_UART_COUNT)
+        return NULL;
+    return &s_uart[uartNum];
+}
+
+static T_M300UartHandle *_HalUart_Handle(T_DjiUartHandle handle) {
+    return (T_M300UartHandle *)(intptr_t)handle;
+}
 
 /* PSDK uses this information to identify the USB-to-UART device attached to
  * the aircraft.  Do not hard-code a particular FTDI product ID: FT232R,
  * FT231X and FT2232 adapters all expose different PIDs. */
-static void _HalUart_DetectDeviceInfo(void) {
+static void _HalUart_DetectDeviceInfo(T_M300Uart *uart) {
     char path[PATH_MAX], current[PATH_MAX], value[16];
-    const char *name = strrchr(s_uart_device, '/');
+    const char *name = strrchr(uart->device, '/');
     FILE *f;
 
-    name = name ? name + 1 : s_uart_device;
-    s_uart_vid = 0;
-    s_uart_pid = 0;
+    name = name ? name + 1 : uart->device;
+    uart->vid = 0;
+    uart->pid = 0;
 
     snprintf(path, sizeof(path), "/sys/class/tty/%s/device", name);
     if (realpath(path, current)) {
@@ -96,17 +137,17 @@ static void _HalUart_DetectDeviceInfo(void) {
             f = fopen(path, "r");
             if (f) {
                 if (fgets(value, sizeof(value), f))
-                    s_uart_vid = (uint16_t)strtoul(value, NULL, 16);
+                    uart->vid = (uint16_t)strtoul(value, NULL, 16);
                 fclose(f);
 
                 snprintf(path, sizeof(path), "%s/idProduct", current);
                 f = fopen(path, "r");
                 if (f) {
                     if (fgets(value, sizeof(value), f))
-                        s_uart_pid = (uint16_t)strtoul(value, NULL, 16);
+                        uart->pid = (uint16_t)strtoul(value, NULL, 16);
                     fclose(f);
                 }
-                if (s_uart_vid != 0 && s_uart_pid != 0)
+                if (uart->vid != 0 && uart->pid != 0)
                     break;
             }
 
@@ -117,8 +158,8 @@ static void _HalUart_DetectDeviceInfo(void) {
         }
     }
 
-    printf("[psdk][uart] %s VID:PID=%04X:%04X\n", s_uart_device,
-           s_uart_vid, s_uart_pid);
+    printf("[psdk][uart] %s VID:PID=%04X:%04X\n", uart->device,
+           uart->vid, uart->pid);
 }
 
 static speed_t _to_speed(uint32_t baud) {
@@ -134,25 +175,30 @@ static speed_t _to_speed(uint32_t baud) {
 
 static T_DjiReturnCode _HalUart_Init(E_DjiHalUartNum uartNum, uint32_t baudRate,
                                       T_DjiUartHandle *uartHandle) {
-    (void)uartNum;
+    T_M300Uart *uart = _HalUart_Get(uartNum);
     struct termios tty;
 
-    /* Close previous fd if PSDK re-inits with different baud */
-    if (s_uart_fd >= 0) {
-        close(s_uart_fd);
-        s_uart_fd = -1;
+    if (!uart || !uartHandle) {
+        printf("[hal] unsupported UART number %d\n", uartNum);
+        return DJI_ERROR_SYSTEM_MODULE_CODE_INVALID_PARAMETER;
     }
 
-    s_uart_fd = open(s_uart_device, O_RDWR | O_NOCTTY);
-    if (s_uart_fd < 0) {
-        printf("[hal] uart open %s failed: %s\n", s_uart_device, strerror(errno));
+    /* Each auto-baud probe owns its handle. Closing a previous probe here can
+     * close a descriptor which the SDK still deinitializes later. */
+    T_M300UartHandle *handle = calloc(1, sizeof(*handle));
+    if (handle == NULL)
+        return DJI_ERROR_SYSTEM_MODULE_CODE_MEMORY_ALLOC_FAILED;
+    handle->fd = open(uart->device, O_RDWR | O_NOCTTY);
+    if (handle->fd < 0) {
+        printf("[hal] uart%d open %s failed: %s\n", uartNum, uart->device, strerror(errno));
+        free(handle);
         return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
     }
 
-    if (tcgetattr(s_uart_fd, &tty) != 0) {
-        printf("[psdk][uart] tcgetattr %s failed: %s\n", s_uart_device, strerror(errno));
-        close(s_uart_fd);
-        s_uart_fd = -1;
+    if (tcgetattr(handle->fd, &tty) != 0) {
+        printf("[psdk][uart] tcgetattr %s failed: %s\n", uart->device, strerror(errno));
+        close(handle->fd);
+        free(handle);
         return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
     }
     speed_t speed = _to_speed(baudRate);
@@ -165,40 +211,54 @@ static T_DjiReturnCode _HalUart_Init(E_DjiHalUartNum uartNum, uint32_t baudRate,
     tty.c_lflag = 0;
     tty.c_cc[VMIN] = 0;   /* Non-blocking: return immediately with available data */
     tty.c_cc[VTIME] = 5;  /* 500ms timeout — enough for aircraft to respond */
-    if (tcsetattr(s_uart_fd, TCSANOW, &tty) != 0) {
-        printf("[psdk][uart] tcsetattr %s failed: %s\n", s_uart_device, strerror(errno));
-        close(s_uart_fd);
-        s_uart_fd = -1;
+    if (tcsetattr(handle->fd, TCSANOW, &tty) != 0) {
+        printf("[psdk][uart] tcsetattr %s failed: %s\n", uart->device, strerror(errno));
+        close(handle->fd);
+        free(handle);
         return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
     }
-    tcflush(s_uart_fd, TCIOFLUSH);
-    _HalUart_DetectDeviceInfo();
+    tcflush(handle->fd, TCIOFLUSH);
+    _HalUart_DetectDeviceInfo(uart);
 
-    *uartHandle = (T_DjiUartHandle)(intptr_t)s_uart_fd;
-    printf("[hal] uart %s opened @ %u baud (fd=%d)\n", s_uart_device, baudRate, s_uart_fd);
+    handle->uart = uart;
+    uart->open_handles++;
+    *uartHandle = (T_DjiUartHandle)(intptr_t)handle;
+    printf("[hal] uart%d %s opened @ %u baud (fd=%d)\n",
+           uartNum, uart->device, baudRate, handle->fd);
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
 
 static T_DjiReturnCode _HalUart_DeInit(T_DjiUartHandle uartHandle) {
-    int fd = (int)(intptr_t)uartHandle;
-    if (fd >= 0) close(fd);
+    T_M300UartHandle *handle = _HalUart_Handle(uartHandle);
+    if (handle != NULL && !handle->closed) {
+        if (close(handle->fd) != 0)
+            printf("[psdk][uart] close fd=%d failed: %s\n", handle->fd, strerror(errno));
+        if (handle->uart != NULL && handle->uart->open_handles > 0)
+            handle->uart->open_handles--;
+        handle->closed = true;
+    }
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
 
 static T_DjiReturnCode _HalUart_WriteData(T_DjiUartHandle uartHandle,
                                            const uint8_t *buf, uint32_t len, uint32_t *realLen) {
-    int fd = (int)(intptr_t)uartHandle;
+    T_M300UartHandle *handle = _HalUart_Handle(uartHandle);
+    if (handle == NULL || handle->closed || realLen == NULL)
+        return DJI_ERROR_SYSTEM_MODULE_CODE_INVALID_PARAMETER;
+    int fd = handle->fd;
     uint32_t total = 0;
     while (total < len) {
         ssize_t n = write(fd, buf + total, len - total);
         if (n > 0) {
             total += (uint32_t)n;
+            s_uart_tx_bytes += (uint32_t)n;
             continue;
         }
         if (n < 0 && errno == EINTR)
             continue;
         printf("[psdk][uart] write failed after %u/%u bytes: %s\n", total, len,
                n < 0 ? strerror(errno) : "zero-byte write");
+        s_uart_write_errors++;
         *realLen = total;
         return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
     }
@@ -208,7 +268,10 @@ static T_DjiReturnCode _HalUart_WriteData(T_DjiUartHandle uartHandle,
 
 static T_DjiReturnCode _HalUart_ReadData(T_DjiUartHandle uartHandle,
                                           uint8_t *buf, uint32_t len, uint32_t *realLen) {
-    int fd = (int)(intptr_t)uartHandle;
+    T_M300UartHandle *handle = _HalUart_Handle(uartHandle);
+    if (handle == NULL || handle->closed || realLen == NULL)
+        return DJI_ERROR_SYSTEM_MODULE_CODE_INVALID_PARAMETER;
+    int fd = handle->fd;
     ssize_t n;
     do {
         n = read(fd, buf, len);
@@ -216,26 +279,41 @@ static T_DjiReturnCode _HalUart_ReadData(T_DjiUartHandle uartHandle,
     if (n < 0) {
         *realLen = 0;
         printf("[psdk][uart] read failed: %s\n", strerror(errno));
+        s_uart_read_errors++;
         return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
     }
     *realLen = (uint32_t)n;
+    if (n > 0)
+        s_uart_rx_bytes += (uint32_t)n;
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
 
 static T_DjiReturnCode _HalUart_GetStatus(E_DjiHalUartNum uartNum, T_DjiUartStatus *status) {
-    (void)uartNum;
-    status->isConnect = (s_uart_fd >= 0);
+    T_M300Uart *uart = _HalUart_Get(uartNum);
+    if (!uart || !status)
+        return DJI_ERROR_SYSTEM_MODULE_CODE_INVALID_PARAMETER;
+    status->isConnect = (uart->open_handles > 0);
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
 
+#if DJI_VERSION_MINOR >= 16
 static T_DjiReturnCode _HalUart_GetDeviceInfo(T_DjiHalUartDeviceInfo *deviceInfo) {
-    if (!deviceInfo || s_uart_vid == 0 || s_uart_pid == 0) {
+    /* E-Port V2 asks for the VID/PID of the USB-to-UART adapter on UART0. */
+    T_M300Uart *uart = &s_uart[DJI_HAL_UART_NUM_0];
+    if (!deviceInfo || uart->vid == 0 || uart->pid == 0) {
         printf("[psdk][uart] cannot report USB UART VID/PID\n");
         return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
     }
-    deviceInfo->vid = s_uart_vid;
-    deviceInfo->pid = s_uart_pid;
+    deviceInfo->vid = uart->vid;
+    deviceInfo->pid = uart->pid;
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+#endif
+
+static void _HalUart_LogHandshakeStats(void) {
+    printf("[psdk][uart] handshake I/O: tx=%llu bytes rx=%llu bytes write_errors=%u read_errors=%u\n",
+           (unsigned long long)s_uart_tx_bytes, (unsigned long long)s_uart_rx_bytes,
+           s_uart_write_errors, s_uart_read_errors);
 }
 
 /* ── OSAL implementation matching T_DjiOsalHandler ────────────────────── */
@@ -351,78 +429,15 @@ static T_DjiReturnCode _Osal_GetRandomNum(uint16_t *randomNum) {
 static void *_Osal_Malloc(uint32_t size) { return malloc(size); }
 static void _Osal_Free(void *ptr) { free(ptr); }
 
-/* ── Network HAL (configure RNDIS interface via ioctl) ────────────────── */
-
-#define NETWORK_IFACE "l4tbr0"
-
-static T_DjiReturnCode _HalNetwork_Init(const char *ipAddr, const char *netMask,
-                                         T_DjiNetworkHandle *networkHandle) {
-    /* Match DJI Jetson sample: configure l4tbr0 with given IP */
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) {
-        printf("[net] socket failed: %s\n", strerror(errno));
-        return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
-    }
-
-    struct ifreq ifr;
-    memset(&ifr, 0, sizeof(ifr));
-    strncpy(ifr.ifr_name, NETWORK_IFACE, IFNAMSIZ - 1);
-
-    /* Bring interface up */
-    ioctl(sock, SIOCGIFFLAGS, &ifr);
-    ifr.ifr_flags |= IFF_UP | IFF_RUNNING;
-    ioctl(sock, SIOCSIFFLAGS, &ifr);
-
-    /* Set IP address */
-    struct sockaddr_in *addr = (struct sockaddr_in *)&ifr.ifr_addr;
-    addr->sin_family = AF_INET;
-    inet_pton(AF_INET, ipAddr, &addr->sin_addr);
-    if (ioctl(sock, SIOCSIFADDR, &ifr) < 0) {
-        printf("[net] set IP %s on %s failed: %s\n", ipAddr, NETWORK_IFACE, strerror(errno));
-    }
-
-    /* Set netmask */
-    inet_pton(AF_INET, netMask, &addr->sin_addr);
-    if (ioctl(sock, SIOCSIFNETMASK, &ifr) < 0) {
-        printf("[net] set mask %s failed: %s\n", netMask, strerror(errno));
-    }
-
-    close(sock);
-    *networkHandle = (T_DjiNetworkHandle)(intptr_t)1;
-    printf("[net] %s configured: %s/%s\n", NETWORK_IFACE, ipAddr, netMask);
-    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
-}
-
-static T_DjiReturnCode _HalNetwork_DeInit(T_DjiNetworkHandle networkHandle) {
-    (void)networkHandle;
-    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
-}
-
-static T_DjiReturnCode _HalNetwork_GetDeviceInfo(T_DjiHalNetworkDeviceInfo *deviceInfo) {
-    /* Read actual VID/PID from USB gadget configfs */
-    FILE *f;
-    char buf[16];
-    uint16_t vid = 0x0955, pid = 0x7020;  /* default Jetson */
-
-    f = fopen("/sys/kernel/config/usb_gadget/l4t/idVendor", "r");
-    if (f) { if (fgets(buf, sizeof(buf), f)) vid = (uint16_t)strtol(buf, NULL, 16); fclose(f); }
-    f = fopen("/sys/kernel/config/usb_gadget/l4t/idProduct", "r");
-    if (f) { if (fgets(buf, sizeof(buf), f)) pid = (uint16_t)strtol(buf, NULL, 16); fclose(f); }
-
-    deviceInfo->usbNetAdapter.vid = vid;
-    deviceInfo->usbNetAdapter.pid = pid;
-    printf("[net] device info: vid=0x%04X pid=0x%04X\n", vid, pid);
-    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
-}
-
 /* ── PSDK init ────────────────────────────────────────────────────────── */
 
 static int _psdk_core_init(const char *app_id, const char *app_key,
                            const char *app_license, const char *app_name,
-                           const char *uart_dev, uint32_t baud_rate) {
+                           const char *uart0_dev, uint32_t uart0_baud,
+                           const char *uart1_dev) {
     T_DjiReturnCode rc;
-    s_uart_device = uart_dev;
-    s_uart_baud = baud_rate;
+    s_uart[DJI_HAL_UART_NUM_0].device = uart0_dev;
+    s_uart[DJI_HAL_UART_NUM_1].device = uart1_dev;
 
     /* Register OSAL first (PSDK needs threads before anything else) */
     T_DjiOsalHandler osalHandler = {
@@ -457,7 +472,9 @@ static int _psdk_core_init(const char *app_id, const char *app_key,
         .UartWriteData = _HalUart_WriteData,
         .UartReadData = _HalUart_ReadData,
         .UartGetStatus = _HalUart_GetStatus,
+#if DJI_VERSION_MINOR >= 16
         .UartGetDeviceInfo = _HalUart_GetDeviceInfo,
+#endif
     };
     rc = DjiPlatform_RegHalUartHandler(&uartHandler);
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
@@ -465,74 +482,9 @@ static int _psdk_core_init(const char *app_id, const char *app_key,
         return -1;
     }
 
-    /* Register Network HAL + Socket handler only if USB gadget is connected to host */
-    /* Check UDC state — must be "configured" (USB host has enumerated us) */
-    {
-        int register_network = 0;
-        FILE *udc_f = fopen("/sys/class/udc/700d0000.xudc/state", "r");
-        if (!udc_f) {
-            /* Try generic UDC path */
-            char udc_path[128];
-            DIR *udc_dir = opendir("/sys/class/udc");
-            if (udc_dir) {
-                struct dirent *ent;
-                while ((ent = readdir(udc_dir)) != NULL) {
-                    if (ent->d_name[0] != '.') {
-                        snprintf(udc_path, sizeof(udc_path), "/sys/class/udc/%s/state", ent->d_name);
-                        udc_f = fopen(udc_path, "r");
-                        break;
-                    }
-                }
-                closedir(udc_dir);
-            }
-        }
-        if (udc_f) {
-            char state[32] = {0};
-            fgets(state, sizeof(state), udc_f);
-            fclose(udc_f);
-            /* Remove newline */
-            char *nl = strchr(state, '\n'); if (nl) *nl = 0;
-            printf("[psdk] UDC state: %s\n", state);
-            if (strcmp(state, "configured") == 0) {
-                register_network = 1;
-            }
-        }
-
-        if (register_network) {
-        T_DjiSocketHandler socketHandler = {
-            .Socket = Osal_Socket,
-            .Bind = Osal_Bind,
-            .Close = Osal_Close,
-            .UdpSendData = Osal_UdpSendData,
-            .UdpRecvData = Osal_UdpRecvData,
-            .TcpListen = Osal_TcpListen,
-            .TcpAccept = Osal_TcpAccept,
-            .TcpConnect = Osal_TcpConnect,
-            .TcpSendData = Osal_TcpSendData,
-            .TcpRecvData = Osal_TcpRecvData,
-        };
-        rc = DjiPlatform_RegSocketHandler(&socketHandler);
-        if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-            printf("[psdk] Socket handler registration failed: 0x%08llX\n", (unsigned long long)rc);
-        } else {
-            printf("[psdk] Socket handler registered OK\n");
-        }
-
-        T_DjiHalNetworkHandler networkHandler = {
-            .NetworkInit = _HalNetwork_Init,
-            .NetworkDeInit = _HalNetwork_DeInit,
-            .NetworkGetDeviceInfo = _HalNetwork_GetDeviceInfo,
-        };
-        rc = DjiPlatform_RegHalNetworkHandler(&networkHandler);
-        if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-            printf("[psdk] Network HAL registration failed: 0x%08llX\n", (unsigned long long)rc);
-        } else {
-            printf("[psdk] Network HAL registered OK\n");
-        }
-        } else {
-            printf("[psdk] UDC not configured — skipping Network HAL (UART-only mode, no video)\n");
-        }
-    }
+    rc = DjiLogger_AddConsole(&s_psdk_debug_console);
+    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS)
+        printf("[psdk] debug logger registration failed: 0x%08llX\n", (unsigned long long)rc);
 
     /* Init PSDK core */
     T_DjiUserInfo userInfo = {0};
@@ -542,11 +494,12 @@ static int _psdk_core_init(const char *app_id, const char *app_key,
     strncpy(userInfo.appLicense, app_license, sizeof(userInfo.appLicense) - 1);
     strncpy(userInfo.developerAccount, "phanthymotus@4paradigm.com",
             sizeof(userInfo.developerAccount) - 1);
-    snprintf(userInfo.baudRate, sizeof(userInfo.baudRate), "%u", baud_rate);
+    snprintf(userInfo.baudRate, sizeof(userInfo.baudRate), "%u", uart0_baud);
 
     rc = DjiCore_Init(&userInfo);
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
         printf("[psdk] core init failed: 0x%08llX\n", (unsigned long long)rc);
+        _HalUart_LogHandshakeStats();
         return -1;
     }
 
@@ -591,14 +544,16 @@ typedef struct {
     const char *app_key;
     const char *app_license;
     const char *app_name;
-    const char *uart_dev;
-    uint32_t baud_rate;
+    const char *uart0_dev;
+    uint32_t uart0_baud;
+    const char *uart1_dev;
 } T_PsdkStartArgs;
 
 static void *_psdk_start_thread(void *arg) {
     T_PsdkStartArgs *args = (T_PsdkStartArgs *)arg;
     if (_psdk_core_init(args->app_id, args->app_key, args->app_license,
-                        args->app_name, args->uart_dev, args->baud_rate) != 0) {
+                        args->app_name, args->uart0_dev, args->uart0_baud,
+                        args->uart1_dev) != 0) {
         s_psdk_state = -1;
         printf("[psdk_bridge] PSDK core init failed; IPC remains available for status/errors\n");
         return NULL;
@@ -1057,19 +1012,22 @@ int main(int argc, char *argv[]) {
     const char *app_key = "";
     const char *app_license = "";
     const char *app_name = "PhanthyMotus";
-    const char *uart_dev = "/dev/ttyACM0";
-    uint32_t baud_rate = 921600;
+    const char *uart0_dev = "/dev/ttyUSB0";
+    uint32_t uart0_baud = 460800;
+    const char *uart1_dev = "/dev/ttyACM0";
 
     if (argc >= 2) socket_path = argv[1];
     if (argc >= 3) app_id = argv[2];
     if (argc >= 4) app_key = argv[3];
     if (argc >= 5) app_license = argv[4];
-    if (argc >= 6) uart_dev = argv[5];
-    if (argc >= 7) baud_rate = (uint32_t)atoi(argv[6]);
+    if (argc >= 6) uart0_dev = argv[5];
+    if (argc >= 7) uart0_baud = (uint32_t)atoi(argv[6]);
+    if (argc >= 8) uart1_dev = argv[7];
 
     printf("=== DJI PSDK Bridge for Matrice 300 RTK ===\n");
     printf("  Socket: %s\n", socket_path);
-    printf("  UART:   %s @ %u\n", uart_dev, baud_rate);
+    printf("  UART0:  %s @ %u baud\n", uart0_dev, uart0_baud);
+    printf("  UART1:  %s @ 921600 baud\n", uart1_dev);
 
     signal(SIGINT, _signal_handler);
     signal(SIGTERM, _signal_handler);
@@ -1078,8 +1036,6 @@ int main(int argc, char *argv[]) {
      * Opening it here as well used to create a second, unrelated file handle:
      * the preflight log could show incoming bytes even while PSDK used a
      * differently configured descriptor for its registration handshake. */
-    HalNetwork_Init();  /* Non-fatal if no USB-Ethernet yet */
-
     /* The Unix socket is the driver control plane.  Start it before PSDK:
      * DjiCore_Init may spend minutes probing UART baud rates while waiting for
      * an aircraft, but Python must still connect to the real bridge. */
@@ -1095,8 +1051,9 @@ int main(int argc, char *argv[]) {
         .app_key = app_key,
         .app_license = app_license,
         .app_name = app_name,
-        .uart_dev = uart_dev,
-        .baud_rate = baud_rate,
+        .uart0_dev = uart0_dev,
+        .uart0_baud = uart0_baud,
+        .uart1_dev = uart1_dev,
     };
     pthread_t psdk_thread;
     if (pthread_create(&psdk_thread, NULL, _psdk_start_thread, &start_args) != 0) {
@@ -1133,8 +1090,6 @@ int main(int argc, char *argv[]) {
         telemetry_cleanup();
     }
     ipc_cleanup();
-    HalNetwork_Cleanup();
-
 #ifdef PSDK_ENABLED
     if (s_psdk_state == 1)
         DjiCore_DeInit();

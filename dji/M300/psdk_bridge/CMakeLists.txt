@@ -33,13 +33,6 @@ endif()
 # ── System dependencies ──────────────────────────────────────────────────
 find_package(Threads REQUIRED)
 
-# libusb for E-Port USB communication
-find_library(LIBUSB_LIB usb-1.0)
-find_path(LIBUSB_INCLUDE libusb-1.0/libusb.h)
-if(LIBUSB_INCLUDE)
-    include_directories(${LIBUSB_INCLUDE})
-endif()
-
 # OpenSSL for PSDK auth (optional in stub mode)
 find_package(OpenSSL QUIET)
 if(OPENSSL_FOUND)
@@ -50,10 +43,7 @@ endif()
 set(SOURCES
     main.c
     ipc.c
-    hal_network.c
-    hal_usb_bulk.c
     osal_posix.c
-    osal_socket.c
     telemetry.c
     flight_ctrl.c
     camera_mgr.c
@@ -72,7 +62,6 @@ add_executable(psdk_bridge ${SOURCES})
 target_link_libraries(psdk_bridge
     ${PSDK_LIB}
     Threads::Threads
-    ${LIBUSB_LIB}
     avcodec avformat avutil swscale
     jpeg
     m
@@ -82,9 +71,5 @@ if(OPENSSL_FOUND)
     target_link_libraries(psdk_bridge ${OPENSSL_LIBRARIES})
 endif()
 
-# startup_bulk — initializes FunctionFS endpoints
-add_executable(startup_bulk startup_bulk.c)
-target_link_libraries(startup_bulk)
-
 # ── Install ──────────────────────────────────────────────────────────────
-install(TARGETS psdk_bridge startup_bulk DESTINATION bin)
+install(TARGETS psdk_bridge DESTINATION bin)
