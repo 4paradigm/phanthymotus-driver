@@ -66,6 +66,22 @@ plugins:
   # dexterous-hand and wrist-force cards. The bundle loads it after all sources.
   system_inspection:
     enabled: true
+  # Fixed scene skills share one runtime and reuse the existing cards above.
+  # Only one routine may own the head/arm/hand/TTS/light resources at a time.
+  stage_greeting:
+    enabled: true
+    default_text: "您好，欢迎光临。"
+    default_side: "right"
+    default_cycles: 2
+    default_speed: 0.5
+    timeout: 30
+  photo_pose:
+    enabled: true
+    default_side: "right"
+    countdown_text: "准备拍照，三、二、一。"
+    default_speed: 0.4
+    light_duration: 8
+    timeout: 20
   laser_scan:
     enabled: true
   chassis_raw:

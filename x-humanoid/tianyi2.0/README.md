@@ -29,6 +29,58 @@ can gate `nav`, `arm`, `hand`, or other motion cards on a single
 `ready_for_motion` result. A passing snapshot does not replace continuous
 emergency-stop, collision, and controller-feedback monitoring during motion.
 
+## Fixed scene skills
+
+`stage_greeting` and `photo_pose` are scene-facing MCP skills implemented by a
+single shared routine plugin in `device.py`. They reuse the existing cards in
+the same Tianyi bundle, so they add neither duplicate ROS2 nodes nor another
+device connection. Both expose the same lifecycle:
+
+- `run` validates input, acquires exclusive routine resources, performs
+  `system_inspection`, and starts the sequence in a background thread;
+- `status` returns the run ID, phase, progress, completed steps, and terminal
+  result without starting another action;
+- `cancel` stops unsent arm/head frames and TTS, then restores the standby
+  light. Cancellation deliberately does not command a new reset pose.
+
+Only one of these routines can run at a time because they share the robot's
+head, arms, hands, speech, and system light. A second `run` is rejected with
+`RESOURCE_BUSY`. The routines check `system_inspection` before motion and every
+0.5 seconds while a semantic motion sequence is active. If the inspection
+blocks motion, or if arm/head feedback reports a failure or timeout, remaining
+motion frames are cancelled and the skill returns a stable error code.
+
+### Stage greeting
+
+`stage_greeting` provides a reusable entrance, exhibition, reception, or host
+greeting sequence:
+
+1. verify whole-robot motion readiness;
+2. start the blue breathing light and open both hands;
+3. speak the configurable greeting;
+4. perform one head nod and a configurable left/right/bilateral welcome wave;
+5. wait for both feedback-aware motion sequences and restore the standby light.
+
+The `text`, `side`, `cycles`, and `speed` inputs let an agent adapt one fixed,
+reviewable routine without generating raw joint trajectories.
+
+### Photo pose
+
+`photo_pose` prepares a recognizable pose for group photos or event check-in:
+
+1. verify whole-robot motion readiness and switch on the white scene light;
+2. center the head and form a left/right/bilateral Victory hand gesture;
+3. speak the configurable countdown and perform the matching high-five pose;
+4. wait for head and arm sequence feedback, reopen the selected hand, and
+   restore the standby light.
+
+This skill does **not** capture, store, or upload an image. A camera card,
+external shutter, or upstream workflow should trigger the actual photograph.
+The TTS and hand cards currently confirm command acceptance but expose no
+completion feedback; successful routine results state this explicitly, while
+head and arm sequence completion is monitored through their feedback-aware
+lifecycle seam.
+
 ## Raw arm joint card
 
 `arm` directly commands seven joints per selected arm in this canonical order:

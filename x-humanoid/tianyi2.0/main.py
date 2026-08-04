@@ -238,6 +238,16 @@ class TianyiDeviceBundle:
                 plugins_cfg["system_inspection"], self._plugins))
             print("[bundle] SystemInspectionSkillPlugin loaded")
 
+        routine_cfg = {
+            name: plugins_cfg.get(name, {})
+            for name in ("stage_greeting", "photo_pose")
+        }
+        if any(config.get("enabled", False) for config in routine_cfg.values()):
+            from device import RoutineSkillsPlugin
+            self._plugins.append(RoutineSkillsPlugin(
+                routine_cfg, self._plugins))
+            print("[bundle] RoutineSkillsPlugin loaded")
+
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
             try:

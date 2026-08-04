@@ -34,6 +34,7 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   HandStatePlugin     (sensor)             — 灵巧手状态(10Hz, tool name=hand_state)
   RemoteStatePlugin   (sensor)             — 遥控器SBUS事件(5Hz)
   SystemInspectionSkillPlugin (actuator)   — 作业前全机自检组合 Skill
+  RoutineSkillsPlugin (actuator, multi-tool) — 舞台迎宾与合影姿态场景 Skill
   StatePlugin      (sensor, multi-tool) — 关节/电池/急停/力传感器/URDF
   CameraPlugin     (sensor)             — Orbbec 头部相机
   AsrPlugin        (sensor)             — 语音识别结果
@@ -58,6 +59,7 @@ import subprocess
 import struct
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import rclpy
@@ -195,6 +197,7 @@ class _ActionSequence:
         self._lock = threading.Lock()
         self._cancel_event: threading.Event | None = None
         self._thread: threading.Thread | None = None
+        self._last_error: str | None = None
 
     def start(self, worker) -> None:
         self.cancel()
@@ -204,6 +207,9 @@ class _ActionSequence:
             try:
                 worker(cancel_event)
             except Exception as e:
+                with self._lock:
+                    if self._cancel_event is cancel_event:
+                        self._last_error = str(e)
                 print(f"[{self._name}] sequence failed: {e}")
             finally:
                 with self._lock:
@@ -216,7 +222,17 @@ class _ActionSequence:
         with self._lock:
             self._cancel_event = cancel_event
             self._thread = thread
+            self._last_error = None
         thread.start()
+
+    def snapshot(self) -> dict:
+        """Return lifecycle state without exposing the worker thread."""
+        with self._lock:
+            thread = self._thread
+            return {
+                "running": bool(thread and thread.is_alive()),
+                "error": self._last_error,
+            }
 
     def cancel(self) -> bool:
         with self._lock:
@@ -1740,6 +1756,10 @@ class HeadGesturePlugin:
     def stop(self):
         self._sequence.cancel()
 
+    def sequence_status(self) -> dict:
+        """Internal lifecycle seam used by composed routine skills."""
+        return self._sequence.snapshot()
+
     def dispatch(self, action: str, args: dict) -> dict:
         if action in ("start", "info"):
             return {
@@ -1807,7 +1827,9 @@ class HeadGesturePlugin:
                 if cancel_event.is_set():
                     return
                 result = self._publish_pose(yaw, pitch, roll, speed)
-                if "error" in result or cancel_event.wait(max(0.15, delay)):
+                if "error" in result:
+                    raise RuntimeError(str(result["error"]))
+                if cancel_event.wait(max(0.15, delay)):
                     return
 
         baseline_seq, baseline = self._feedback_snapshot()
@@ -2547,6 +2569,10 @@ class ArmGesturePlugin:
     def stop(self):
         self._sequence.cancel()
 
+    def sequence_status(self) -> dict:
+        """Internal lifecycle seam used by composed routine skills."""
+        return self._sequence.snapshot()
+
     def dispatch(self, action: str, args: dict) -> dict:
         if action in ("start", "info"):
             return {
@@ -2644,6 +2670,8 @@ class ArmGesturePlugin:
                 if cancel_event.is_set():
                     return
                 result = self._publish_pose(side, frame, speed)
+                if "error" in result:
+                    raise RuntimeError(str(result["error"]))
                 max_delta_rad = max(
                     abs(_deg2rad(float(current) - float(old)))
                     for current, old in zip(frame, previous)
@@ -2651,7 +2679,7 @@ class ArmGesturePlugin:
                 transition = max_delta_rad / speed if speed > 0 else 0
                 previous = frame
                 delay = max(0.12, transition * transition_ratio) + hold
-                if "error" in result or cancel_event.wait(delay):
+                if cancel_event.wait(delay):
                     return
 
         baseline_seq, baseline = self._feedback_snapshot(side)
@@ -5031,6 +5059,561 @@ class SystemInspectionSkillPlugin:
         return self._check(
             "force_sensor", "healthy", "both wrist force sensors provide feedback",
             {"available": available})
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RoutineSkillsPlugin — shared lifecycle for short, fixed scene skills
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _RoutineFailure(RuntimeError):
+    def __init__(self, code: str, message: str, details: dict | None = None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.details = details or {}
+
+
+class _RoutineCancelled(RuntimeError):
+    pass
+
+
+class RoutineSkillsPlugin:
+    """Expose multiple fixed routines through one shared lifecycle module.
+
+    The external interface is intentionally small (run/status/cancel). The
+    implementation hides card lookup, safety checks, resource exclusion,
+    sequence completion, cancellation fan-out, and result normalization.
+    """
+
+    _VERSION = "1.0.0"
+    _SKILL_NAMES = ("stage_greeting", "photo_pose")
+    _SOURCE_TOOLS = {
+        "system_inspection", "light", "hand", "tts",
+        "head_gesture", "arm_gesture",
+    }
+    _OUTPUT_TOOLS = {"light", "hand", "tts", "head_gesture", "arm_gesture"}
+    _TERMINAL_STATES = {"succeeded", "failed", "cancelled"}
+
+    def __init__(self, plugin_config: dict, source_plugins: list):
+        self._config = {
+            name: dict(plugin_config.get(name) or {})
+            for name in self._SKILL_NAMES
+        }
+        self._enabled = {
+            name for name in self._SKILL_NAMES
+            if self._config[name].get("enabled", False)
+        }
+        self._sources = {}
+        for plugin in source_plugins:
+            try:
+                tools = plugin.get_tools() if hasattr(plugin, "get_tools") else [plugin.get_tool()]
+            except Exception as e:
+                print(f"[RoutineSkillsPlugin] skip invalid plugin: {e}")
+                continue
+            for tool in tools:
+                name = tool.get("name") if isinstance(tool, dict) else None
+                if name in self._SOURCE_TOOLS:
+                    self._sources[name] = plugin
+
+        self._running = False
+        self._state_lock = threading.Lock()
+        self._output_lock = threading.RLock()
+        self._active = None
+        self._last_results = {}
+
+    def get_tools(self) -> list:
+        tools = []
+        if "stage_greeting" in self._enabled:
+            tools.append(self._stage_greeting_tool())
+        if "photo_pose" in self._enabled:
+            tools.append(self._photo_pose_tool())
+        return tools
+
+    @staticmethod
+    def _lifecycle_property() -> dict:
+        return {
+            "type": "string",
+            "enum": ["run", "status", "cancel"],
+            "description": "run=启动，status=查询阶段/结果，cancel=取消尚未执行的动作",
+        }
+
+    def _stage_greeting_tool(self) -> dict:
+        cfg = self._config["stage_greeting"]
+        return {
+            "name": "stage_greeting",
+            "type": "actuator",
+            "description": (
+                "天轶2.0 Pro 舞台迎宾 Skill。安全自检后组合呼吸灯、张开手掌、"
+                "欢迎语、点头和欢迎挥手，并提供 run/status/cancel 生命周期。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": self._lifecycle_property(),
+                    "text": {
+                        "type": "string", "maxLength": 200,
+                        "default": cfg.get("default_text", "您好，欢迎光临。"),
+                        "description": "迎宾播报文字",
+                    },
+                    "side": {
+                        "type": "string", "enum": ["left", "right", "both"],
+                        "default": cfg.get("default_side", "right"),
+                        "description": "执行欢迎动作的手臂",
+                    },
+                    "cycles": {
+                        "type": "integer", "minimum": 1, "maximum": 3,
+                        "default": cfg.get("default_cycles", 2),
+                        "description": "欢迎挥手次数",
+                    },
+                    "speed": {
+                        "type": "number", "minimum": 0.2, "maximum": 0.8,
+                        "default": cfg.get("default_speed", 0.5),
+                        "description": "欢迎手臂动作速度(rad/s)",
+                    },
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "run": {"params": ["text", "side", "cycles", "speed"],
+                            "description": "执行一次迎宾编排"},
+                    "status": {"params": [], "description": "查询当前或最近一次迎宾结果"},
+                    "cancel": {"params": [], "description": "取消迎宾后续动作，不强制回零"},
+                },
+            },
+        }
+
+    def _photo_pose_tool(self) -> dict:
+        cfg = self._config["photo_pose"]
+        return {
+            "name": "photo_pose",
+            "type": "actuator",
+            "description": (
+                "天轶2.0 Pro 合影姿态 Skill。安全自检后组合白色灯光、语音倒计时、"
+                "头部回正、Victory 手势和高举击掌姿态，完成后恢复手掌与待机灯。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": self._lifecycle_property(),
+                    "side": {
+                        "type": "string", "enum": ["left", "right", "both"],
+                        "default": cfg.get("default_side", "right"),
+                        "description": "执行合影姿态的一侧或双侧",
+                    },
+                    "countdown_text": {
+                        "type": "string", "maxLength": 200,
+                        "default": cfg.get("countdown_text", "准备拍照，三、二、一。"),
+                        "description": "合影倒计时播报文字",
+                    },
+                    "speed": {
+                        "type": "number", "minimum": 0.2, "maximum": 0.8,
+                        "default": cfg.get("default_speed", 0.4),
+                        "description": "合影手臂动作速度(rad/s)",
+                    },
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "run": {"params": ["side", "countdown_text", "speed"],
+                            "description": "执行一次合影姿态编排"},
+                    "status": {"params": [], "description": "查询当前或最近一次合影结果"},
+                    "cancel": {"params": [], "description": "取消合影后续动作，不强制回零"},
+                },
+            },
+        }
+
+    def start(self):
+        self._running = True
+
+    def stop(self):
+        self._running = False
+        active = self._active_snapshot(include_private=True)
+        if active and active["state"] not in self._TERMINAL_STATES:
+            active["cancel_event"].set()
+            self._cancel_outputs(active["run_id"])
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        tool_name = args.get("_tool_name")
+        if tool_name not in self._enabled:
+            return self._error("UNKNOWN_SKILL", f"unknown or disabled skill: {tool_name}")
+        if action in ("start", "info"):
+            return {
+                "state": "ready" if self._running else "idle",
+                "skills": sorted(self._enabled),
+                "version": self._VERSION,
+            }
+        if action == "stop":
+            self._cancel(tool_name)
+            return {"state": "idle"}
+        if action == "run":
+            return self._start_run(tool_name, args)
+        if action == "status":
+            return self._status(tool_name)
+        if action == "cancel":
+            return self._cancel(tool_name)
+        return self._error("INVALID_ARGUMENT", f"unknown action: {action}")
+
+    @staticmethod
+    def _error(code: str, message: str, **details) -> dict:
+        result = {"state": "error", "code": code, "error": message}
+        if details:
+            result["details"] = details
+        return result
+
+    def _start_run(self, skill_name: str, raw_args: dict) -> dict:
+        try:
+            inputs = self._validate_inputs(skill_name, raw_args)
+        except _RoutineFailure as e:
+            return self._error(e.code, e.message, **e.details)
+
+        with self._state_lock:
+            if self._active and self._active["state"] not in self._TERMINAL_STATES:
+                return self._error(
+                    "RESOURCE_BUSY",
+                    f"{self._active['skill']} already owns the routine resources",
+                    active_run_id=self._active["run_id"],
+                    active_skill=self._active["skill"],
+                )
+            now_ms = int(time.time() * 1000)
+            state = {
+                "skill": skill_name,
+                "version": self._VERSION,
+                "run_id": f"{skill_name}-{uuid.uuid4().hex[:12]}",
+                "state": "running",
+                "phase": "accepted",
+                "progress": 0.0,
+                "started_at_ms": now_ms,
+                "finished_at_ms": None,
+                "completed_steps": [],
+                "claimed_sources": [],
+                "error": None,
+                "result": None,
+                "inputs": inputs,
+                "cancel_event": threading.Event(),
+                "thread": None,
+            }
+            thread = threading.Thread(
+                target=self._execute,
+                args=(state["run_id"],),
+                name=f"{skill_name}_routine",
+                daemon=True,
+            )
+            state["thread"] = thread
+            self._active = state
+            self._last_results[skill_name] = state
+            accepted = self._public_state(state)
+            thread.start()
+            return accepted
+
+    def _validate_inputs(self, skill_name: str, args: dict) -> dict:
+        cfg = self._config[skill_name]
+        side = args.get("side", cfg.get("default_side", "right"))
+        if side not in ("left", "right", "both"):
+            raise _RoutineFailure("INVALID_ARGUMENT", "side must be left, right, or both")
+        raw_speed = args.get("speed", cfg.get("default_speed", 0.5 if skill_name == "stage_greeting" else 0.4))
+        if isinstance(raw_speed, bool):
+            raise _RoutineFailure("INVALID_ARGUMENT", "speed must be numeric")
+        try:
+            speed = float(raw_speed)
+        except (TypeError, ValueError) as e:
+            raise _RoutineFailure("INVALID_ARGUMENT", "speed must be numeric") from e
+        if not math.isfinite(speed) or speed < 0.2 or speed > 0.8:
+            raise _RoutineFailure("INVALID_ARGUMENT", "speed must be in [0.2, 0.8] rad/s")
+
+        if skill_name == "stage_greeting":
+            text = args.get("text", cfg.get("default_text", "您好，欢迎光临。"))
+            cycles = args.get("cycles", cfg.get("default_cycles", 2))
+            if not isinstance(text, str) or not text.strip() or len(text) > 200:
+                raise _RoutineFailure("INVALID_ARGUMENT", "text must be 1-200 characters")
+            if isinstance(cycles, bool) or not isinstance(cycles, int) or not 1 <= cycles <= 3:
+                raise _RoutineFailure("INVALID_ARGUMENT", "cycles must be an integer in [1, 3]")
+            return {"text": text.strip(), "side": side, "cycles": cycles, "speed": speed}
+
+        countdown = args.get(
+            "countdown_text", cfg.get("countdown_text", "准备拍照，三、二、一。"))
+        if not isinstance(countdown, str) or not countdown.strip() or len(countdown) > 200:
+            raise _RoutineFailure(
+                "INVALID_ARGUMENT", "countdown_text must be 1-200 characters")
+        return {"side": side, "countdown_text": countdown.strip(), "speed": speed}
+
+    def _execute(self, run_id: str) -> None:
+        state = self._active_for_run(run_id)
+        if state is None:
+            return
+        try:
+            if state["skill"] == "stage_greeting":
+                self._run_stage_greeting(state)
+            else:
+                self._run_photo_pose(state)
+            if state["cancel_event"].is_set():
+                raise _RoutineCancelled()
+            self._finish(run_id, "succeeded", "completed", 1.0, result={
+                "motion_sequence_completed": True,
+                "motion_feedback_checked": True,
+                "tts_completion_verified": False,
+                "hand_completion_verified": False,
+            })
+        except _RoutineCancelled:
+            self._finish(run_id, "cancelled", "cancelled", state.get("progress", 0.0))
+        except _RoutineFailure as e:
+            self._cancel_outputs(run_id)
+            self._finish(run_id, "failed", "failed", state.get("progress", 0.0), error={
+                "code": e.code,
+                "message": e.message,
+                "details": e.details,
+            })
+        except Exception as e:
+            self._cancel_outputs(run_id)
+            self._finish(run_id, "failed", "failed", state.get("progress", 0.0), error={
+                "code": "INTERNAL_ERROR", "message": str(e), "details": {},
+            })
+
+    def _run_stage_greeting(self, state: dict) -> None:
+        inputs = state["inputs"]
+        cancel_event = state["cancel_event"]
+        self._set_phase(state["run_id"], "preflight", 0.05)
+        self._require_safe(cancel_event)
+        self._set_phase(state["run_id"], "scene_setup", 0.20)
+        self._invoke("light", "blue_breathing", {"duration": -1}, cancel_event)
+        self._invoke("hand", "open_palm", {"side": "both"}, cancel_event)
+        self._invoke("tts", "speak", {"text": inputs["text"], "force": True}, cancel_event)
+        self._set_phase(state["run_id"], "performing", 0.45)
+        self._invoke("head_gesture", "nod", {
+            "cycles": 1, "nod_amplitude": 12, "speed": 30,
+        }, cancel_event)
+        self._invoke("arm_gesture", "welcome", {
+            "side": inputs["side"], "cycles": inputs["cycles"], "speed": inputs["speed"],
+        }, cancel_event)
+        timeout = float(self._config["stage_greeting"].get("timeout", 30.0))
+        self._wait_sequences(
+            ("head_gesture", "arm_gesture"), timeout, cancel_event)
+        self._set_phase(state["run_id"], "cleanup", 0.90)
+        self._invoke("light", "blue_standby", {"duration": -1}, cancel_event)
+
+    def _run_photo_pose(self, state: dict) -> None:
+        inputs = state["inputs"]
+        cancel_event = state["cancel_event"]
+        self._set_phase(state["run_id"], "preflight", 0.05)
+        self._require_safe(cancel_event)
+        self._set_phase(state["run_id"], "scene_setup", 0.20)
+        light_duration = float(self._config["photo_pose"].get("light_duration", 8.0))
+        self._invoke("light", "white", {"duration": light_duration}, cancel_event)
+        self._invoke("head_gesture", "reset", {"speed": 25}, cancel_event)
+        self._invoke("hand", "victory", {"side": inputs["side"]}, cancel_event)
+        self._invoke("tts", "speak", {
+            "text": inputs["countdown_text"], "force": True,
+        }, cancel_event)
+        self._set_phase(state["run_id"], "performing", 0.50)
+        self._invoke("arm_gesture", "high_five", {
+            "side": inputs["side"], "speed": inputs["speed"],
+        }, cancel_event)
+        timeout = float(self._config["photo_pose"].get("timeout", 20.0))
+        self._wait_sequences(
+            ("head_gesture", "arm_gesture"), timeout, cancel_event)
+        self._set_phase(state["run_id"], "cleanup", 0.90)
+        self._invoke("hand", "open_palm", {"side": inputs["side"]}, cancel_event)
+        self._invoke("light", "blue_standby", {"duration": -1}, cancel_event)
+
+    def _require_safe(self, cancel_event: threading.Event) -> dict:
+        report = self._invoke("system_inspection", "inspect", {}, cancel_event)
+        if report.get("ready_for_motion") is not True:
+            raise _RoutineFailure(
+                "PRECHECK_FAILED",
+                "system inspection does not allow motion",
+                {"blockers": report.get("blockers", []), "report": report},
+            )
+        return report
+
+    def _wait_sequences(
+            self, source_names: tuple[str, ...], timeout: float,
+            cancel_event: threading.Event) -> None:
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise _RoutineFailure("INVALID_CONFIGURATION", "routine timeout must be positive")
+        deadline = time.monotonic() + timeout
+        next_safety_check = 0.0
+        while True:
+            if cancel_event.is_set():
+                raise _RoutineCancelled()
+            now = time.monotonic()
+            if now >= next_safety_check:
+                report = self._invoke("system_inspection", "inspect", {}, cancel_event)
+                if report.get("ready_for_motion") is not True:
+                    raise _RoutineFailure(
+                        "SAFETY_STOP",
+                        "system inspection blocked motion during the routine",
+                        {"blockers": report.get("blockers", [])},
+                    )
+                next_safety_check = now + 0.5
+
+            statuses = []
+            for name in source_names:
+                source = self._sources.get(name)
+                if source is None or not hasattr(source, "sequence_status"):
+                    raise _RoutineFailure(
+                        "DEPENDENCY_UNAVAILABLE",
+                        f"{name} does not expose sequence completion status",
+                    )
+                status = source.sequence_status()
+                if status.get("error"):
+                    raise _RoutineFailure(
+                        "STEP_FAILED", f"{name} sequence failed",
+                        {"source": name, "error": status["error"]})
+                statuses.append(status)
+            if statuses and all(not status.get("running") for status in statuses):
+                return
+            if now >= deadline:
+                raise _RoutineFailure(
+                    "STEP_TIMEOUT", "motion sequence did not finish before timeout",
+                    {"sources": list(source_names), "timeout": timeout})
+            cancel_event.wait(0.1)
+
+    def _invoke(
+            self, source_name: str, action: str, args: dict,
+            cancel_event: threading.Event) -> dict:
+        if cancel_event.is_set():
+            raise _RoutineCancelled()
+        source = self._sources.get(source_name)
+        if source is None:
+            raise _RoutineFailure(
+                "DEPENDENCY_UNAVAILABLE", f"required card is unavailable: {source_name}")
+        if source_name in self._OUTPUT_TOOLS:
+            # Serialize the cancellation boundary with actuator dispatch. If a
+            # cancel request wins the lock, no later output can be emitted; if
+            # dispatch wins, cancellation immediately stops its claimed card.
+            with self._output_lock:
+                if cancel_event.is_set():
+                    raise _RoutineCancelled()
+                self._claim_source(source_name)
+                result = source.dispatch(
+                    action, {**args, "_tool_name": source_name})
+        else:
+            result = source.dispatch(
+                action, {**args, "_tool_name": source_name})
+        if not isinstance(result, dict):
+            raise _RoutineFailure(
+                "STEP_FAILED", f"{source_name}.{action} returned a non-object result")
+        if (result.get("state") == "error"
+                or "error" in result
+                or result.get("ok") is False):
+            raise _RoutineFailure(
+                str(result.get("code") or "STEP_REJECTED"),
+                str(result.get("message") or result.get("error") or "card rejected the action"),
+                {"source": source_name, "action": action, "result": result},
+            )
+        self._append_step(f"{source_name}.{action}")
+        return result
+
+    def _safe_dispatch(self, source_name: str, action: str, args: dict) -> bool:
+        source = self._sources.get(source_name)
+        if source is None:
+            return False
+        try:
+            result = source.dispatch(action, {**args, "_tool_name": source_name})
+            return isinstance(result, dict) and "error" not in result
+        except Exception as e:
+            print(f"[RoutineSkillsPlugin] cleanup {source_name}.{action} failed: {e}")
+            return False
+
+    def _cancel_outputs(self, run_id: str) -> None:
+        # Cancellation never commands arm/head reset or any other new pose.
+        with self._output_lock:
+            claimed = self._claimed_sources_for_run(run_id)
+            if "arm_gesture" in claimed:
+                self._safe_dispatch("arm_gesture", "stop", {})
+            if "head_gesture" in claimed:
+                self._safe_dispatch("head_gesture", "stop", {})
+            if "tts" in claimed:
+                self._safe_dispatch("tts", "stop", {})
+            if "light" in claimed:
+                self._safe_dispatch("light", "blue_standby", {"duration": -1})
+
+    def _status(self, skill_name: str) -> dict:
+        with self._state_lock:
+            if self._active and self._active["skill"] == skill_name:
+                return self._public_state(self._active)
+            previous = self._last_results.get(skill_name)
+            if previous:
+                return self._public_state(previous)
+        return {
+            "skill": skill_name, "version": self._VERSION,
+            "state": "idle", "phase": "idle", "progress": 0.0,
+        }
+
+    def _cancel(self, skill_name: str) -> dict:
+        with self._state_lock:
+            active = self._active
+            if (active is None or active["skill"] != skill_name
+                    or active["state"] in self._TERMINAL_STATES):
+                return {
+                    "skill": skill_name, "version": self._VERSION,
+                    "state": "idle", "phase": "idle", "cancel_requested": False,
+                }
+            active["cancel_event"].set()
+            run_id = active["run_id"]
+        self._cancel_outputs(run_id)
+        return {
+            "skill": skill_name, "version": self._VERSION,
+            "run_id": run_id, "state": "running", "phase": "cancelling",
+            "cancel_requested": True,
+        }
+
+    def _active_for_run(self, run_id: str) -> dict | None:
+        with self._state_lock:
+            if self._active and self._active["run_id"] == run_id:
+                return self._active
+        return None
+
+    def _active_snapshot(self, include_private: bool = False) -> dict | None:
+        with self._state_lock:
+            if self._active is None:
+                return None
+            return self._active if include_private else self._public_state(self._active)
+
+    def _set_phase(self, run_id: str, phase: str, progress: float) -> None:
+        with self._state_lock:
+            if self._active and self._active["run_id"] == run_id:
+                self._active["phase"] = phase
+                self._active["progress"] = progress
+
+    def _append_step(self, step: str) -> None:
+        with self._state_lock:
+            if self._active and self._active["state"] == "running":
+                self._active["completed_steps"].append(step)
+
+    def _claim_source(self, source_name: str) -> None:
+        with self._state_lock:
+            if (self._active and self._active["state"] == "running"
+                    and source_name not in self._active["claimed_sources"]):
+                self._active["claimed_sources"].append(source_name)
+
+    def _claimed_sources_for_run(self, run_id: str) -> set[str]:
+        with self._state_lock:
+            if self._active is None or self._active["run_id"] != run_id:
+                return set()
+            return set(self._active["claimed_sources"])
+
+    def _finish(
+            self, run_id: str, state_name: str, phase: str, progress: float,
+            result: dict | None = None, error: dict | None = None) -> None:
+        with self._state_lock:
+            if self._active is None or self._active["run_id"] != run_id:
+                return
+            self._active["state"] = state_name
+            self._active["phase"] = phase
+            self._active["progress"] = progress
+            self._active["finished_at_ms"] = int(time.time() * 1000)
+            self._active["result"] = result
+            self._active["error"] = error
+            self._last_results[self._active["skill"]] = self._active
+
+    @staticmethod
+    def _public_state(state: dict) -> dict:
+        return {
+            key: json.loads(json.dumps(value))
+            for key, value in state.items()
+            if key not in {
+                "cancel_event", "thread", "inputs", "claimed_sources",
+            }
+            and not (key == "error" and value is None)
+        }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
