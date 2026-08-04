@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""S10Pro standard ROS2 controls plus a correlated supplier command bridge."""
+"""山猫 S10 标准 ROS2 控制与带回执的供应商命令适配层。"""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ class S10Nodes:
         from nav_msgs.msg import Odometry
         from sensor_msgs.msg import BatteryState, Image, Imu, JointState, PointCloud2
 
-        self.bridge = JsonCommandBridge(config, namespace, ros2, "s10_pro")
+        self.bridge = JsonCommandBridge(config, namespace, ros2, "lynx_s10")
         self.robot = self.bridge.robot; self.core = self.bridge.core
         topics = config.get("topics", {})
         self.cmd_vel_pub = self.robot.create_publisher(Twist, topics.get("cmd_vel", "/cmd_vel"), 10)
@@ -33,7 +33,7 @@ class S10Nodes:
             ("lidar", PointCloud2, "/lidar/points", "pointcloud/ros2"),
         ):
             robot_topic = topics.get(key, default)
-            core_topic = f"/{namespace}/s10_pro/{key}"
+            core_topic = f"/{namespace}/lynx_s10/{key}"
             publisher = self.core.create_publisher(msg_type, core_topic, 2 if key in ("camera", "depth", "lidar") else 10)
             self.robot.create_subscription(msg_type, robot_topic, self._callback(key, publisher), 2 if key in ("camera", "depth", "lidar") else 10)
             self.streams[key] = {"robot_topic": robot_topic, "topic": core_topic, "format": fmt}
@@ -59,11 +59,11 @@ class S10StatePlugin:
     def __init__(self, nodes): self.nodes = nodes
     def get_tools(self):
         return [
-            tool("state", "sensor", "S10Pro joints, IMU, odometry, battery and supplier state", topic_out=[{"topic": self.nodes.bridge.state_topic, "format": "data/json"}]),
-            *[tool(key, "sensor", f"S10Pro {key} ROS2 stream", topic_out=[{"topic": item["topic"], "format": item["format"]}]) for key, item in self.nodes.streams.items()],
-            tool("command_ack", "sensor", "Query S10Pro supplier acknowledgement", {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}),
-            tool("capabilities", "sensor", "S10Pro capability and binding discovery"),
-            tool("ros_graph", "sensor", "Live S10Pro ROS2 graph"),
+            tool("state", "sensor", "山猫 S10 关节、IMU、里程计、电池和供应商状态", topic_out=[{"topic": self.nodes.bridge.state_topic, "format": "data/json"}]),
+            *[tool(key, "sensor", f"山猫 S10 {key} ROS2 数据流", topic_out=[{"topic": item["topic"], "format": item["format"]}]) for key, item in self.nodes.streams.items()],
+            tool("command_ack", "sensor", "查询山猫 S10 供应商命令回执", {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}),
+            tool("capabilities", "sensor", "发现山猫 S10 Driver 能力与绑定状态"),
+            tool("ros_graph", "sensor", "查看山猫 S10 实时 ROS2 图"),
         ]
     def start(self): pass
     def stop(self): self.nodes.bridge.close()
@@ -81,7 +81,8 @@ class S10StatePlugin:
         if name == "command_ack": return self.nodes.bridge.acknowledgement(args["id"])
         if name == "ros_graph": return self.nodes.bridge.graph()
         if name == "capabilities": return {
-            "model": "Deep Robotics S10Pro", "standard_ros2_connected": True, "supplier_idl_connected": False,
+            "model": "DEEPRobotics Lynx S10", "standard_ros2_connected": True,
+            "official_drdds_interfaces_built": True, "supplier_topic_mapping_confirmed": False,
             "capabilities": ["velocity", "stop", "goal_pose", "gait", "height", "posture", "stand", "sit", "lie", "self_recovery", "stairs", "slope", "dance", "custom_action", "mapping", "navigation", "patrol", "follow", "dock", "camera", "depth", "lidar", "imu", "odometry", "joints", "battery"],
         }
         return None
@@ -90,7 +91,7 @@ class S10StatePlugin:
 class S10BasePlugin:
     def __init__(self, nodes): self.nodes = nodes
     def get_tool(self):
-        return tool("base", "actuator", "S10Pro standard ROS2 velocity control", action_schema(
+        return tool("base", "actuator", "山猫 S10 标准 ROS2 速度控制", action_schema(
             {"velocity": (["linear_x", "linear_y", "angular_z"], "Publish geometry_msgs/Twist"), "stop": ([], "Publish zero velocity")},
             {"linear_x": {"type": "number"}, "linear_y": {"type": "number"}, "angular_z": {"type": "number"}},
         ))
@@ -109,7 +110,7 @@ class S10BasePlugin:
 class S10NavigationPlugin:
     def __init__(self, nodes): self.nodes = nodes
     def get_tool(self):
-        return tool("navigation", "actuator", "S10Pro standard goal pose and supplier autonomy commands", action_schema(
+        return tool("navigation", "actuator", "山猫 S10 标准目标点与供应商自主导航命令", action_schema(
             {"goal": (["x", "y", "yaw", "frame"], "Publish geometry_msgs/PoseStamped goal"), "cancel": ([], "Cancel supplier navigation"),
              "map_start": (["name"], "Start mapping"), "map_save": (["name"], "Save map"), "map_load": (["name"], "Load map"),
              "patrol": (["waypoints", "repeat"], "Start waypoint patrol"), "follow": (["target"], "Start target following"), "dock": ([], "Return to dock")},
@@ -138,7 +139,7 @@ class S10MotionPlugin:
     }
     def __init__(self, bridge): self.bridge = bridge
     def get_tool(self):
-        return tool("motion", "actuator", "S10Pro gait, posture, balance and stunt command bridge", action_schema(self.ACTIONS, {
+        return tool("motion", "actuator", "山猫 S10 步态、姿态、平衡与特技命令适配层", action_schema(self.ACTIONS, {
             "name": {"type": "string"}, "value": {"type": "number"}, "roll": {"type": "number"}, "pitch": {"type": "number"}, "yaw": {"type": "number"}, "params": {"type": "object"},
         }))
     def start(self): pass
@@ -151,7 +152,7 @@ class S10MotionPlugin:
 class S10DancePlugin:
     def __init__(self, bridge): self.bridge = bridge
     def get_tool(self):
-        return tool("choreography", "actuator", "S10Pro dances and custom motion sequences", action_schema(
+        return tool("choreography", "actuator", "山猫 S10 舞蹈与自定义动作序列", action_schema(
             {"list": ([], "Request the firmware action catalog"), "play": (["name", "repeat"], "Play a firmware dance/action"), "custom": (["timeline", "repeat"], "Play a custom action timeline"), "stop": ([], "Stop choreography")},
             {"name": {"type": "string"}, "repeat": {"type": "integer"}, "timeline": {"type": "array", "items": {"type": "object"}}},
         ))

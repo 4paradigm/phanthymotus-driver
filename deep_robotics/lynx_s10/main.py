@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deep Robotics S10Pro MCP driver entrypoint."""
+"""云深处山猫 S10 MCP Driver 入口。"""
 
 import sys
 from pathlib import Path
@@ -11,4 +11,4 @@ from common.vendor_runtime import run_driver
 from device import build_plugins
 
 if __name__ == "__main__":
-    run_driver(__file__, "deep-robotics-s10-pro-driver", "deep-robotics-s10-pro-device-bundle", build_plugins)
+    run_driver(__file__, "deep-robotics-lynx-s10-driver", "deep-robotics-lynx-s10-device-bundle", build_plugins)

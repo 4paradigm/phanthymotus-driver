@@ -1,0 +1,11 @@
+id: deep-robotics-lynx-s10-driver
+name: DEEPRobotics Lynx S10 Bundle
+category: driver
+hardware_provider: deep-robotics
+hardware_model: "lynx-s10"
+image_name: deep-robotics-lynx-s10
+port: 15716
+mcp_url: "http://localhost:15716/mcp"
+description: "山猫 S10 — 标准 ROS2 运动/目标点/感知、官方 drdds 接口包，以及步态、特技、舞蹈、建图导航和巡检供应商适配层"
+build_context_extras:
+  - ../../common
