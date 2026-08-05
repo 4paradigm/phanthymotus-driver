@@ -262,6 +262,31 @@ def issue_stop_and_confirm(
     return result
 
 
+def resolve_proposal_stop_timeouts(proposal_config):
+    """Keep StopMove acknowledgement bounded within the odometry budget."""
+    confirmation_timeout = min(
+        1.0,
+        max(
+            0.1,
+            float(
+                proposal_config.get(
+                    "velocity_proposal_stop_confirm_timeout",
+                    0.5,
+                )
+            ),
+        ),
+    )
+    requested_rpc_timeout = float(
+        proposal_config.get("velocity_proposal_stop_rpc_timeout", 0.2)
+    )
+    # G1 cfb8efe hardware returned StopMove in about 111 ms.  A 100 ms
+    # client timeout therefore produced SDK code 3104 even while fresh zero
+    # odometry continued to arrive.  Preserve a bounded margin without ever
+    # extending beyond the physical-stop confirmation budget.
+    rpc_timeout = min(confirmation_timeout, max(0.2, requested_rpc_timeout))
+    return rpc_timeout, confirmation_timeout
+
+
 # ── SmartMotionProxy (main process) ─────────────────────────────────────────
 
 class SmartMotionProxy:
@@ -482,8 +507,8 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
     proposal_rpc_timeout = min(
         0.2, max(0.02, float(proposal_config.get("velocity_proposal_rpc_timeout", 0.1)))
     )
-    stop_rpc_timeout = min(
-        0.2, max(0.02, float(proposal_config.get("velocity_proposal_stop_rpc_timeout", 0.1)))
+    stop_rpc_timeout, proposal_stop_confirm_timeout = (
+        resolve_proposal_stop_timeouts(proposal_config)
     )
     fsm_rpc_timeout = min(
         0.5, max(0.05, float(proposal_config.get("velocity_proposal_fsm_rpc_timeout", 0.2)))
@@ -589,10 +614,6 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
     )
     proposal_watchdog_hz = max(
         20.0, float(proposal_config.get("velocity_proposal_watchdog_hz", 40.0))
-    )
-    proposal_stop_confirm_timeout = min(
-        1.0,
-        max(0.1, float(proposal_config.get("velocity_proposal_stop_confirm_timeout", 0.5))),
     )
     proposal_stop_linear_epsilon = max(
         0.0, float(proposal_config.get("velocity_proposal_stop_linear_epsilon", 0.03))

@@ -1447,7 +1447,15 @@ class LocoPlugin:
         if result.get("error") or not (
             result.get("connected") and result.get("armed")
         ):
-            self._client.StopMove()
+            result = dict(result)
+            fallback_stop_ret = None
+            fallback_stop_error = None
+            try:
+                fallback_stop_ret = self._client.StopMove()
+            except Exception as exc:
+                fallback_stop_error = str(exc)
+            result["fallback_stop_ret"] = fallback_stop_ret
+            result["fallback_stop_error"] = fallback_stop_error
         return {
             **result,
             "state": "ready" if (

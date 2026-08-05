@@ -4,7 +4,11 @@ import threading
 import time
 import unittest
 
-from safety_harness import OdomStopMonitor, issue_stop_and_confirm
+from safety_harness import (
+    OdomStopMonitor,
+    issue_stop_and_confirm,
+    resolve_proposal_stop_timeouts,
+)
 
 
 class StopMoveConfirmationIntegrationTest(unittest.TestCase):
@@ -111,6 +115,24 @@ class StopMoveConfirmationIntegrationTest(unittest.TestCase):
             result["stop_confirmation"]["stop_move_error"],
             "rpc unavailable",
         )
+
+    def test_stop_rpc_timeout_has_margin_within_confirmation_budget(self):
+        rpc_timeout, confirmation_timeout = resolve_proposal_stop_timeouts({
+            "velocity_proposal_stop_rpc_timeout": 0.1,
+            "velocity_proposal_stop_confirm_timeout": 0.5,
+        })
+
+        self.assertEqual(rpc_timeout, 0.2)
+        self.assertEqual(confirmation_timeout, 0.5)
+
+    def test_stop_rpc_timeout_never_exceeds_confirmation_budget(self):
+        rpc_timeout, confirmation_timeout = resolve_proposal_stop_timeouts({
+            "velocity_proposal_stop_rpc_timeout": 10.0,
+            "velocity_proposal_stop_confirm_timeout": 0.4,
+        })
+
+        self.assertEqual(rpc_timeout, 0.4)
+        self.assertEqual(confirmation_timeout, 0.4)
 
 
 if __name__ == "__main__":
