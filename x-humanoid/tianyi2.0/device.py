@@ -3763,8 +3763,8 @@ class TtsPlugin:
                 while not fut.done() and _t.time() - start < 60:
                     _t.sleep(0.1)
                 try:
-                    import urllib.request, ssl, json as _json
-                    url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+                    import urllib.request, ssl, json as _json, os as _os
+                    url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
                     ctx = ssl.create_default_context()
                     ctx.check_hostname = False
                     ctx.verify_mode = ssl.CERT_NONE
@@ -5364,7 +5364,8 @@ class ChassisRawPlugin:
         try:
             import urllib.request as _urllib
             import ssl as _ssl
-            agent_core_url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+            import os as _os
+            agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
             ctx = _ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = _ssl.CERT_NONE
