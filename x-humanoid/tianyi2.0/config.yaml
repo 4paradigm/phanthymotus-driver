@@ -60,8 +60,12 @@ plugins:
     enabled: true
     native_slam_pcd_dir: "/opt/phanthy-motus/data/maps"
     native_slam_db_path: "/opt/phanthy-motus/data/controlled_spatial.db"
-  robot_faults:
+  health_check:
     enabled: true
+  auto_brake:
+    enabled: true
+    distance_threshold: 0.5
+    angle_range_deg: 30.0
   laser_scan:
     enabled: true
   chassis_raw:
