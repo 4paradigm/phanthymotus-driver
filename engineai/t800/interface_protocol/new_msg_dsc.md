@@ -1,0 +1,13 @@
+Topic名称	消息文件	通信方式	概述	参考示例文件
+/motion/joint_override_command	interface_protocol/msg/JointOverrideCommand	发布	覆盖特定关节的控制指令，支持五次多项式插值的平滑轨迹生成	upper_joint_override_example.py
+/motion/set_motion_state	interface_protocol/msg/MotionStateRequest	发布	请求切换机器人的运动状态（如切换到地形行走步态）	switch_to_terrain_walking_gait_example.py
+/motion/motion_state	interface_protocol/msg/MotionState	订阅	接收当前机器人的运动状态信息，包括当前状态和可用转换	switch_to_terrain_walking_gait_example.py
+/hardware/led_control	LedControl.msg	发布	控制机器人的LED灯光模式，支持多种颜色和灯效	led_control_example.py
+/motion/joint_motion_plan/request	interface_protocol/msg/JointMotionPlanRequest	发布	请求关节运动规划任务，支持轨迹规划和重置到默认姿态	joint_mutiple_motion_plan_example.py
+/motion/joint_motion_plan/state	interface_protocol/msg/JointMotionPlanState	订阅	接收关节运动规划器的状态信息和执行进度	joint_mutiple_motion_plan_example.py
+/hardware/joint_state	interface_protocol/msg/JointState	订阅	接收所有关节的当前状态信息（位置、速度、力矩）	joint_bridge_example.py
+/hardware/joint_command	interface_protocol/msg/JointCommand	发布	发送关节控制命令，控制所有关节的运动	joint_bridge_example.py
+/motion/body_vel_cmd	interface_protocol/msg/BodyVelCmd	发布	控制机器人机体的速度命令（线速度和偏航角速度）	body_velocity_control_example.py
+/hardware/joint_command	interface_protocol/msg/JointCommand	发布	通过关节桥接器控制机器人全身关节	joint_test_example.cc
+/hardware/gamepad_keys	interface_protocol/msg/GamepadKeys	订阅	手柄数据	rl_basic_example.cc
+/hardware/imu_info	interface_protocol/msg/ImuInfo		IMU数据	rl_basic_example.cc

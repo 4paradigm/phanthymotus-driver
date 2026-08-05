@@ -369,6 +369,7 @@ Driver ports are allocated in the **15700–15799** range:
 | Driver | Port |
 |--------|------|
 | Unitree G1 | 15701 |
+| EngineAI T800 | 15708 |
 | Phanthy Remote Control | 15710 |
 
 New drivers should choose an unoccupied port. The WebSocket port is typically the MCP port + 1.

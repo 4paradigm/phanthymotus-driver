@@ -1,0 +1,9 @@
+id: t800-driver
+name: EngineAI T800 Bundle
+category: driver
+hardware_provider: engineai
+hardware_model: "t800"
+image_name: t800
+port: 15708
+mcp_url: "http://localhost:15708/mcp"
+description: "众擎 T800 开发版 — 运动状态机 + 机体速度控制 + 上肢运动规划 + 关节状态/IMU/电源/手柄传感器 + LED + 麦克风/扬声器 + 关节透传(默认关闭)"

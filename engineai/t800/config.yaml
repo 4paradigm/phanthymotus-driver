@@ -1,0 +1,34 @@
+mcp_port: 15708
+ros_namespace: ""   # 留空则自动使用 hostname
+name: "EngineAI T800 Bundle"
+id: t800-driver
+
+plugins:
+  # ── 运动控制 ──
+  motion_state:
+    enabled: true
+  motion_switcher:
+    enabled: true
+  loco:
+    enabled: true
+  arm:
+    enabled: true
+  joint_bridge:
+    enabled: false    # 危险：500Hz 全身 PD 直通，默认关闭；需先切换到 joint_bridge 模式
+  # ── 传感器 ──
+  joints:
+    enabled: true
+  imu:
+    enabled: true
+  power:
+    enabled: true
+  gamepad:
+    enabled: true
+  # ── 外设 ──
+  led:
+    enabled: true
+  mic:
+    enabled: true
+    device_index: null   # 采集设备索引，null = 自动选择默认声卡
+  speaker:
+    enabled: true
