@@ -26,6 +26,7 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   TtsPlugin        (actuator)           — 语音合成
   NavPlugin        (actuator)           — 底盘导航控制
   ChatPlugin       (actuator)           — 语音交互开关
+  LightPlugin      (actuator)           — 灯光控制
 """
 
 import json
@@ -88,8 +89,8 @@ _WAIST_JOINTS = {
 }
 
 _LEG_JOINTS = {
-    51: "left_hip_pitch_joint",
-    52: "left_knee_pitch_joint",
+    51: "hip_pitch_joint",
+    52: "knee_pitch_joint",
 }
 
 _ALL_JOINTS = {**_HEAD_JOINTS, **_ARM_LEFT_JOINTS, **_ARM_RIGHT_JOINTS, **_WAIST_JOINTS, **_LEG_JOINTS}
@@ -151,6 +152,81 @@ def _resolve_motor_id(identifier, valid_ids: list) -> int | None:
                 return mid
     return None
 
+_HAND_SOURCE_ORDER = ["little", "ring", "middle", "index", "thumb_bend", "thumb_rotation"]
+_HAND_NAME_ALIASES = {
+    "1": "little",
+    "little": "little",
+    "pinky": "little",
+    "little_finger": "little",
+    "2": "ring",
+    "ring": "ring",
+    "ring_finger": "ring",
+    "3": "middle",
+    "middle": "middle",
+    "middle_finger": "middle",
+    "4": "index",
+    "index": "index",
+    "fore": "index",
+    "forefinger": "index",
+    "index_finger": "index",
+    "5": "thumb_bend",
+    "thumb": "thumb_bend",
+    "thumb_bend": "thumb_bend",
+    "thumb_flex": "thumb_bend",
+    "6": "thumb_rotation",
+    "thumb_rotation": "thumb_rotation",
+    "thumb_rotate": "thumb_rotation",
+    "thumb_roll": "thumb_rotation",
+}
+_HAND_URDF_JOINTS = {
+    "left": {
+        "little": "left_hand_little_joint",
+        "ring": "left_hand_ring_joint",
+        "middle": "left_hand_middle_joint",
+        "index": "left_hand_index_joint",
+        "thumb_bend": "left_hand_thumb_bend_joint",
+        "thumb_rotation": "left_hand_thumb_rotation_joint",
+    },
+    "right": {
+        "little": "right_hand_little_joint",
+        "ring": "right_hand_ring_joint",
+        "middle": "right_hand_middle_joint",
+        "index": "right_hand_index_joint",
+        "thumb_bend": "right_hand_thumb_bend_joint",
+        "thumb_rotation": "right_hand_thumb_rotation_joint",
+    },
+}
+# Calibration on the physical robot confirmed this for both hands and all six
+# channels: 1.0 is the open/outward endpoint and 0.0 is the closed/inward one.
+# A single Inspire measurement drives two visible phalanges. At fully closed,
+# both joints flex 90 degrees: their accumulated orientation turns the distal
+# phalanx back toward the forearm, as on the physical Inspire hand.
+_HAND_SEGMENT_GAIN = {"proximal": 1.0, "distal": 1.0}
+_HAND_MAX_BEND_RAD = math.pi / 2.0
+# The right thumb's open mechanical stop is reported at roughly 0.48, unlike
+# the other five channels and the left thumb rotation channel.
+_RIGHT_THUMB_ROTATION_OPEN_RAW = 0.48
+_JOINT_Q_SIGN = {
+    "waist_pitch_joint": -1.0,
+}
+_JOINT_Q_OFFSET = {
+    # Measured Tianyi full-height pose. This must remain stable across
+    # restarts so the lowest and highest poses render consistently.
+    "waist_pitch_joint": 0.70,
+    "hip_pitch_joint": -0.70,
+    "knee_pitch_joint": 0.35,
+}
+# Do not dynamically zero the lift chain at process startup: a restart at a
+# mid-height pose would otherwise make that pose look fully extended.
+_JOINT_AUTO_ZERO_NAMES = set()
+_JOINT_VISUAL_GAIN = {
+    # Endpoint-calibrated virtual linkage. The high pose keeps a 120 deg hip
+    # angle rather than a perfectly straight chain. At the measured low stop,
+    # the hip closes to about 10 deg while waist compensation keeps the torso
+    # upright. At full height all motor-relative angles are near zero.
+    "hip_pitch_joint": 2.44,
+    "knee_pitch_joint": 1.37,
+}
 
 def _deg2rad(deg: float) -> float:
     return deg * math.pi / 180.0
@@ -158,6 +234,25 @@ def _deg2rad(deg: float) -> float:
 
 def _rad2deg(rad: float) -> float:
     return rad * 180.0 / math.pi
+
+
+def _hand_open_ratio_to_bend_rad(raw: float, side: str, finger: str) -> float:
+    """Convert measured Inspire open ratio to a skeleton bend angle.
+
+    The real hands report 1.0 when open and 0.0 when flexed toward the palm.
+    Right thumb rotation is the only calibrated exception: its open stop is
+    reported near 0.48.
+    """
+    if -0.05 <= raw <= 1.05:
+        open_ratio = max(0.0, min(1.0, raw))
+    else:
+        open_ratio = max(0.0, min(100.0, raw)) / 100.0
+    if side == "right" and finger == "thumb_rotation":
+        open_ratio = open_ratio / _RIGHT_THUMB_ROTATION_OPEN_RAW
+        open_ratio = max(0.0, min(1.0, open_ratio))
+    # A closed physical finger curls through both phalanges. Each visual joint
+    # receives the measured bend so the distal segment folds back to the arm.
+    return (1.0 - open_ratio) * _HAND_MAX_BEND_RAD
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -174,11 +269,18 @@ class StatePlugin:
 
         # Cached state
         self._joint_data = {}  # motor_id → {pos, speed, current, temp, error}
+        self._joint_visual_zero = {}
+        self._hand_data = {"left": None, "right": None}
         self._battery = {}
         self._estop = {}
         self._force_left = {}
         self._force_right = {}
         self._lock = threading.Lock()
+
+        # Inspire hand state is folded into the joints skeleton card.
+        self._hand_left_topic = plugin_config.get("hand_left_topic", "/inspire_hand/state/left_hand")
+        self._hand_right_topic = plugin_config.get("hand_right_topic", "/inspire_hand/state/right_hand")
+        self._hand_stale_after_sec = float(plugin_config.get("hand_stale_after_sec", 1.0))
 
         # Topics for Agent Core (domain 42)
         self._topic_joints = f"/{namespace}/state/joints"
@@ -207,7 +309,7 @@ class StatePlugin:
             {
                 "name": "joints",
                 "type": "sensor",
-                "description": "天轶2.0 全身关节状态 — 位置/速度/电流/温度 (头/臂/腰/腿 共21个关节)",
+                "description": "天轶2.0 全身关节状态 — 身体关节 + Inspire灵巧手手指状态 skeleton 渲染",
                 "inputSchema": {"type": "object", "properties": {}},
                 "topic_out": [{"topic": self._topic_joints, "format": "sensor/skeleton"}],
             },
@@ -269,6 +371,16 @@ class StatePlugin:
         except ImportError as e:
             print(f"[StatePlugin] WARNING: msg import failed ({e}), running in stub mode")
 
+        try:
+            from sensor_msgs.msg import JointState
+            self._sub_node.create_subscription(
+                JointState, self._hand_left_topic, lambda msg: self._on_hand_state("left", msg), _LOW_LAT_QOS)
+            self._sub_node.create_subscription(
+                JointState, self._hand_right_topic, lambda msg: self._on_hand_state("right", msg), _LOW_LAT_QOS)
+            print(f"[StatePlugin] hand subscriptions created: {self._hand_left_topic}, {self._hand_right_topic}")
+        except ImportError as e:
+            print(f"[StatePlugin] WARNING: hand msg import failed ({e}), hand skeleton disabled")
+
         # Publish timer
         self._pub_thread = threading.Thread(target=self._publish_loop, daemon=True)
         self._pub_thread.start()
@@ -279,6 +391,9 @@ class StatePlugin:
     def _on_motor_status(self, msg):
         with self._lock:
             for s in msg.status:
+                name = _ALL_JOINTS.get(s.name, f"motor_{s.name}")
+                if name in _JOINT_AUTO_ZERO_NAMES and name not in self._joint_visual_zero:
+                    self._joint_visual_zero[name] = s.pos
                 self._joint_data[s.name] = {
                     "pos": s.pos,
                     "speed": s.speed,
@@ -286,6 +401,38 @@ class StatePlugin:
                     "temp": s.temperature,
                     "error": s.error,
                 }
+
+    def _on_hand_state(self, side: str, msg):
+        values = {name: None for name in _HAND_SOURCE_ORDER}
+        velocities = {name: None for name in _HAND_SOURCE_ORDER}
+        efforts = {name: None for name in _HAND_SOURCE_ORDER}
+        positions = list(msg.position or [])
+        velocity_values = list(msg.velocity or [])
+        effort_values = list(msg.effort or [])
+        joint_names = list(msg.name or [])
+
+        for idx in range(min(len(_HAND_SOURCE_ORDER), max(len(positions), len(velocity_values), len(effort_values)))):
+            mapped = None
+            if idx < len(joint_names):
+                key = str(joint_names[idx]).strip().lower().replace("-", "_").replace(" ", "_")
+                mapped = _HAND_NAME_ALIASES.get(key)
+            if mapped is None:
+                mapped = _HAND_SOURCE_ORDER[idx]
+            if idx < len(positions):
+                values[mapped] = float(positions[idx])
+            if idx < len(velocity_values):
+                velocities[mapped] = float(velocity_values[idx])
+            if idx < len(effort_values):
+                efforts[mapped] = float(effort_values[idx])
+
+        with self._lock:
+            self._hand_data[side] = {
+                "received_timestamp_ms": int(time.time() * 1000),
+                "source_joint_names": joint_names,
+                "values": values,
+                "velocities": velocities,
+                "efforts": efforts,
+            }
 
     def _on_battery(self, msg):
         with self._lock:
@@ -345,19 +492,9 @@ class StatePlugin:
 
             # Publish joints
             with self._lock:
-                if self._joint_data:
-                    joints = []
-                    for motor_id, data in self._joint_data.items():
-                        name = _ALL_JOINTS.get(motor_id, f"motor_{motor_id}")
-                        joints.append({
-                            "idx": motor_id,
-                            "name": name,
-                            "q": data["pos"],
-                            "dq": data["speed"],
-                            "current": data["current"],
-                            "temp": data["temp"],
-                        })
-                    payload = json.dumps({"joints": joints})
+                payload_data = self._build_joints_payload_locked()
+                if payload_data["joints"]:
+                    payload = json.dumps(payload_data)
                     msg = String()
                     msg.data = payload
                     self._pub_joints.publish(msg)
@@ -382,6 +519,91 @@ class StatePlugin:
                         msg.data = json.dumps({"left": self._force_left, "right": self._force_right})
                         self._pub_force.publish(msg)
 
+    def _build_joints_payload_locked(self) -> dict:
+        now_ms = int(time.time() * 1000)
+        joints = []
+        body_entries = []
+        visual_q_by_name = {}
+        for motor_id, data in self._joint_data.items():
+            name = _ALL_JOINTS.get(motor_id, f"motor_{motor_id}")
+            raw_q = data["pos"]
+            zero_q = self._joint_visual_zero.get(name, _JOINT_Q_OFFSET.get(name, 0.0))
+            q = (raw_q - zero_q) * _JOINT_Q_SIGN.get(name, 1.0) * _JOINT_VISUAL_GAIN.get(name, 1.0)
+            visual_q_by_name[name] = q
+            body_entries.append({
+                "idx": motor_id,
+                "name": name,
+                "q": q,
+                "raw_q": raw_q,
+                "visual_zero_q": zero_q if name in _JOINT_AUTO_ZERO_NAMES else None,
+                "dq": data["speed"],
+                "current": data["current"],
+                "temp": data["temp"],
+            })
+
+        lower_body_compensation_q = -(
+            visual_q_by_name.get("hip_pitch_joint", 0.0)
+            + visual_q_by_name.get("knee_pitch_joint", 0.0)
+        )
+        for entry in body_entries:
+            if entry["name"] == "waist_pitch_joint":
+                entry["q"] = lower_body_compensation_q
+                entry["source"] = "visual_compensation"
+            joints.append(entry)
+
+        hand_meta = {}
+        stale_ms = int(self._hand_stale_after_sec * 1000)
+        for side, data in self._hand_data.items():
+            if not data:
+                hand_meta[side] = {"available": False, "fresh": False}
+                continue
+
+            age_ms = now_ms - data["received_timestamp_ms"]
+            fresh = age_ms <= stale_ms
+            hand_meta[side] = {
+                "available": True,
+                "fresh": fresh,
+                "age_ms": age_ms,
+                "source_joint_names": data["source_joint_names"],
+            }
+            for finger, raw in data["values"].items():
+                if raw is None:
+                    continue
+                bend_q = _hand_open_ratio_to_bend_rad(raw, side, finger)
+                base_name = _HAND_URDF_JOINTS[side][finger]
+                shared = {
+                    "raw": round(raw, 4),
+                    "velocity_raw": data.get("velocities", {}).get(finger),
+                    "effort_raw": data.get("efforts", {}).get(finger),
+                    "source": "inspire_hand",
+                    "fresh": fresh,
+                }
+                joints.append({
+                    "idx": f"{side}_hand_{finger}",
+                    "name": base_name,
+                    # In this URDF, positive Y flexion points out of the palm.
+                    # Negate the four finger joints so both phalanges curl in.
+                    "q": (
+                        -bend_q * _HAND_SEGMENT_GAIN["proximal"]
+                        if finger in {"little", "ring", "middle", "index"}
+                        else bend_q
+                    ),
+                    **shared,
+                })
+                if finger in {"little", "ring", "middle", "index"}:
+                    joints.append({
+                        "idx": f"{side}_hand_{finger}_distal",
+                        "name": base_name.replace("_joint", "_distal_joint"),
+                        "q": -bend_q * _HAND_SEGMENT_GAIN["distal"],
+                        **shared,
+                    })
+
+        return {
+            "joints": joints,
+            "timestamp_ms": now_ms,
+            "hands": hand_meta,
+        }
+
     def dispatch(self, action_or_tool: str, args: dict) -> dict:
         # Resource tool: model
         if action_or_tool == "model":
@@ -391,9 +613,9 @@ class StatePlugin:
             except FileNotFoundError:
                 return {"error": "URDF file not found"}
         # Sensor tools return state
-        if action_or_tool == "joints":
+        if action_or_tool == "joints" or (action_or_tool in ("read", "get") and args.get("_tool_name") == "joints"):
             with self._lock:
-                return {"joints": list(self._joint_data.values())}
+                return self._build_joints_payload_locked()
         if action_or_tool == "battery":
             with self._lock:
                 return self._battery or {"state": "no_data"}
@@ -746,40 +968,6 @@ class ImuPlugin(_JsonSensor):
                     "topic_out": [{"topic": self._topic, "format": self._format}]}
         return {"state": "running" if self._running else "idle"}
 
-
-class HandStatePlugin(_JsonSensor):
-    """Bridge both Inspire hands' feedback and error arrays."""
-    def __init__(self, plugin_config, namespace, ros2):
-        self._running, self._lock = False, threading.Lock()
-        self._state = {"left": {}, "right": {}}
-        self._topic = f"/{namespace}/state/hand"
-        self._sub_node = Node("tianyi2_hand_state_sub", context=ros2.ctx_tianyi)
-        self._pub_node = Node("tianyi2_hand_state_pub", context=ros2.ctx_core)
-        ros2.executor_tianyi.add_node(self._sub_node); ros2.executor_core.add_node(self._pub_node)
-        self._pub = self._pub_node.create_publisher(String, self._topic, _LOW_LAT_QOS)
-
-    def get_tool(self): return self._tool("hand_state", "天轶2.0 灵巧手状态 — 双手六指位置、速度、电流与错误码")
-    def start(self):
-        from sensor_msgs.msg import JointState
-        from std_msgs.msg import UInt32MultiArray
-        self._running = True
-        for side in ("left", "right"):
-            self._sub_node.create_subscription(JointState, f"/inspire_hand/state/{side}_hand", lambda m, s=side: self._on_state(s, m), _RELIABLE_QOS)
-            self._sub_node.create_subscription(UInt32MultiArray, f"/inspire_hand/error/{side}_hand", lambda m, s=side: self._on_error(s, m), _RELIABLE_QOS)
-    def stop(self): self._running = False
-    def _on_state(self, side, msg):
-        with self._lock:
-            self._state[side].update({"name": list(msg.name), "position": list(msg.position), "velocity": list(msg.velocity), "effort": list(msg.effort)})
-        self._publish()
-    def _on_error(self, side, msg):
-        with self._lock: self._state[side]["errors"] = list(msg.data)
-        self._publish()
-    def _publish(self):
-        if not self._running: return
-        with self._lock: data = json.dumps(self._state)
-        out = String(); out.data = data; self._pub.publish(out)
-
-
 class DepthCameraPlugin:
     """Bridge only the newest Orbbec Z16 frame to Agent Core.
 
@@ -1014,20 +1202,130 @@ class PointCloudPlugin:
 
 class LightPlugin:
     """Safe semantic system-light control; no raw vendor command is exposed."""
-    _commands = {"standby": 99, "service_wait": 20, "service_ready": 22, "warning": 12, "warning_clear": 13, "error": 10, "error_clear": 11}
+    _commands = {
+        "blue_standby": 99,
+        "blue_breathing": 20,
+        "white": 310,
+        "rainbow": 312,
+        "warning": 12,
+        "error": 10,
+    }
+    # Each controller domain has its own exit command. Sending standby alone
+    # does not clear a previously active power or chat light effect.
+    _exit_actions = {
+        "blue_breathing": "service_ready",
+        "warning": "warning_clear",
+        "error": "error_clear",
+        "white": "chat_quit",
+        "rainbow": "chat_quit",
+    }
+    _internal_commands = {
+        "service_ready": 22,
+        "warning_clear": 13,
+        "error_clear": 11,
+        "chat_quit": 300,
+    }
+    _clear_actions = {"blue_standby"}
+
     def __init__(self, plugin_config, namespace, ros2):
-        self._pub_node = Node("tianyi2_light_pub", context=ros2.ctx_tianyi); ros2.executor_tianyi.add_node(self._pub_node); self._pub = None
+        self._pub_node = Node("tianyi2_light_pub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._pub_node)
+        self._pub = None
+        self._timer = None
+        self._timer_lock = threading.Lock()
+        self._timer_generation = 0
+        self._active_action = None
+
     def get_tool(self):
-        return {"name": "light", "type": "actuator", "description": "天轶2.0 系统状态灯效", "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": list(self._commands)}}, "required": ["action"], "x-action-params": {k: {"params": [], "description": k} for k in self._commands}}}
+        return {
+            "name": "light",
+            "type": "actuator",
+            "description": "天轶2.0 系统状态灯效，含蓝灯呼吸、白灯、炫彩、告警和故障。duration 必填，-1 表示常亮，正数表示亮灯秒数。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": list(self._commands)},
+                    "duration": {
+                        "type": "number",
+                        "description": "灯效持续时间（秒）。-1 表示常亮；正数到期后发送该灯效对应的结束命令。",
+                    },
+                },
+                "required": ["action", "duration"],
+                "x-action-params": {
+                    k: {"params": ["duration"], "description": k}
+                    for k in self._commands
+                },
+            },
+        }
+
     def start(self):
         from bodyctrl_msgs.msg import LightCtrl
         self._pub = self._pub_node.create_publisher(LightCtrl, "/xsys/light/ctrl", _RELIABLE_QOS)
-    def stop(self): pass
-    def dispatch(self, action, args):
-        if action not in self._commands: return {"error": f"unknown action: {action}"}
+
+    def stop(self):
+        with self._timer_lock:
+            self._timer_generation += 1
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+
+    def _publish(self, action):
         from bodyctrl_msgs.msg import LightCtrl
-        msg = LightCtrl(); msg.cmd = self._commands[action]; msg.caller_id = "phanthy-motus"; msg.caller_msg = f"Agent Core: {action}"; self._pub.publish(msg)
-        return {"state": action}
+        command = self._commands.get(action)
+        if command is None:
+            command = self._internal_commands.get(action)
+        if command is None:
+            raise ValueError(f"no command defined for light action: {action}")
+        msg = LightCtrl()
+        msg.cmd = int(command)
+        msg.caller_id = "phanthy-motus"
+        msg.caller_msg = f"Agent Core: {action}"
+        self._pub.publish(msg)
+
+    def _clear_active_effect(self):
+        if self._active_action is None:
+            return
+        exit_action = self._exit_actions.get(self._active_action)
+        if exit_action is not None:
+            self._publish(exit_action)
+        self._active_action = None
+
+    def _finish_timed_effect(self, generation):
+        with self._timer_lock:
+            if generation != self._timer_generation:
+                return
+            self._timer = None
+            # Do not append standby here: the controller domains use their
+            # own completion commands and some ignore standby while active.
+            self._clear_active_effect()
+
+    def dispatch(self, action, args):
+        if action not in self._commands:
+            return {"error": f"unknown action: {action}"}
+        if "duration" not in args:
+            return {"error": "duration is required; use -1 for a persistent light effect"}
+        try:
+            duration = float(args["duration"])
+        except (TypeError, ValueError):
+            return {"error": "duration must be -1 or a positive number of seconds"}
+        if isinstance(args["duration"], bool) or not math.isfinite(duration) or (duration != -1 and duration <= 0):
+            return {"error": "duration must be -1 or a positive number of seconds"}
+
+        with self._timer_lock:
+            self._timer_generation += 1
+            generation = self._timer_generation
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+            self._clear_active_effect()
+            self._publish(action)
+            self._active_action = None if action in self._clear_actions else action
+            if duration != -1:
+                self._timer = threading.Timer(duration, self._finish_timed_effect, args=(generation,))
+                self._timer.daemon = True
+                self._timer.start()
+
+        return {"state": action, "duration": -1 if duration == -1 else duration}
 
 
 # ══════════════════════════════════════════════════════════════════════════════

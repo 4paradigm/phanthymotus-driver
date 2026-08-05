@@ -41,3 +41,5 @@ plugins:
     enabled: true
   chat:
     enabled: true
+  light:
+    enabled: true
