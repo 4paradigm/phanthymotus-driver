@@ -564,6 +564,23 @@ class SpeakerLifecycleTests(unittest.TestCase):
             time.sleep(0.001)
         self.fail(message)
 
+    def _speaker_plugin(self, node=None):
+        plugin = object.__new__(DEVICE.SpeakerPlugin)
+        plugin._node = node or self.node
+        return plugin
+
+    def _observe_receipt_wait(self, node=None):
+        node = node or self.node
+        wait_entered = threading.Event()
+        original_wait = node._receipt_cv.wait
+
+        def observed_wait(timeout=None):
+            wait_entered.set()
+            return original_wait(timeout=timeout)
+
+        node._receipt_cv.wait = observed_wait
+        return wait_entered
+
     def test_eof_forces_short_utterance_drain(self):
         pcm = b'\x11\x22' * 1600
         self.node._on_chunk(_chunk('utt:short', pcm))
@@ -1757,6 +1774,277 @@ class SpeakerLifecycleTests(unittest.TestCase):
         self.assertEqual(info['receipt_recovery'],
                          'transient_local_then_info_poll')
         self.assertEqual(info['topic_out'][0]['qos']['reliability'], 'reliable')
+
+    def test_wait_playback_blocks_until_matching_completion(self):
+        plugin = self._speaker_plugin()
+        session_id = self.node._session_id
+        utterance_id = 'utt:wait-completed'
+        wait_entered = self._observe_receipt_wait()
+        result_holder = {}
+
+        def wait_for_terminal():
+            result_holder['value'] = plugin.dispatch('wait_playback', {
+                'session_id': session_id,
+                'utterance_id': utterance_id,
+                'timeout_sec': 1,
+            })
+
+        wait_thread = threading.Thread(target=wait_for_terminal)
+        wait_thread.start()
+        self.assertTrue(wait_entered.wait(timeout=1))
+        self.assertTrue(wait_thread.is_alive())
+
+        pcm = b'W' * 3200
+        self.node._on_chunk(_chunk(utterance_id, pcm))
+        self.node._on_chunk(self._eof(utterance_id))
+        self._join_drain()
+        wait_thread.join(timeout=1)
+
+        self.assertFalse(wait_thread.is_alive())
+        result = result_holder['value']
+        self.assertEqual(result['state'], 'completed')
+        self.assertTrue(result['terminal'])
+        self.assertEqual(result['session_id'], session_id)
+        self.assertEqual(result['utterance_id'], utterance_id)
+        self.assertEqual(result['completion_basis'],
+                         'driver_drained_estimated')
+        self.assertEqual(result['audio_bytes'], len(pcm))
+
+    def test_wait_playback_returns_terminal_history_immediately(self):
+        plugin = self._speaker_plugin()
+        session_id = self.node._session_id
+        utterance_id = 'utt:history'
+        pcm = b'HISTORY'
+        self.node._on_chunk(_chunk(utterance_id, pcm))
+        self.node._on_chunk(self._eof(utterance_id))
+        self._join_drain()
+
+        result = plugin.dispatch('wait_playback', {
+            'session_id': session_id,
+            'utterance_id': utterance_id,
+            'timeout_sec': 0,
+        })
+
+        terminal = self.node._terminal_ids[(session_id, utterance_id)]
+        self.assertEqual(
+            {key: result[key] for key in terminal}, terminal,
+        )
+        self.assertTrue(result['terminal'])
+
+    def test_wait_playback_started_and_unseen_time_out_without_terminal(self):
+        plugin = self._speaker_plugin()
+        session_id = self.node._session_id
+        started_id = 'utt:started-only'
+        unseen_id = 'utt:unseen'
+        self.node._emit_receipt(started_id, 'started')
+
+        started = plugin.dispatch('wait_playback', {
+            'session_id': session_id,
+            'utterance_id': started_id,
+            'timeout_sec': 0,
+        })
+        unseen = plugin.dispatch('wait_playback', {
+            'session_id': session_id,
+            'utterance_id': unseen_id,
+            'timeout_sec': 0,
+        })
+
+        self.assertEqual(started['state'], 'timeout')
+        self.assertFalse(started['terminal'])
+        self.assertEqual(started['reason'], 'playback_not_terminal')
+        self.assertTrue(started['retryable'])
+        self.assertEqual(unseen['state'], 'unknown')
+        self.assertFalse(unseen['terminal'])
+        self.assertEqual(
+            unseen['reason'], 'utterance_not_observed_before_timeout',
+        )
+        self.assertTrue(unseen['retryable'])
+        self.assertNotIn((session_id, started_id), self.node._terminal_ids)
+        self.assertNotIn((session_id, unseen_id), self.node._terminal_ids)
+
+    def test_wait_playback_returns_cancelled_after_interrupt(self):
+        plugin = self._speaker_plugin()
+        session_id = self.node._session_id
+        utterance_id = 'utt:wait-interrupt'
+        self.node._on_chunk(_chunk(utterance_id, b'I' * 3200))
+        wait_entered = self._observe_receipt_wait()
+        result_holder = {}
+        wait_thread = threading.Thread(
+            target=lambda: result_holder.setdefault(
+                'value', plugin.dispatch('wait_playback', {
+                    'session_id': session_id,
+                    'utterance_id': utterance_id,
+                    'timeout_sec': 1,
+                }),
+            ),
+        )
+        wait_thread.start()
+        self.assertTrue(wait_entered.wait(timeout=1))
+        self.assertTrue(wait_thread.is_alive())
+
+        interrupt_result = self.node.interrupt()
+        wait_thread.join(timeout=1)
+
+        self.assertFalse(wait_thread.is_alive())
+        self.assertEqual(
+            interrupt_result['cancelled_utterance_ids'], [utterance_id],
+        )
+        result = result_holder['value']
+        self.assertEqual(result['state'], 'cancelled')
+        self.assertTrue(result['terminal'])
+        self.assertEqual(result['reason'], 'interrupted')
+        self.assertEqual(result['completion_basis'], 'driver_control')
+        self.assertEqual(result['session_id'], session_id)
+        self.assertEqual(result['utterance_id'], utterance_id)
+
+    def test_wait_playback_returns_recorded_playback_error(self):
+        plugin = self._speaker_plugin()
+        session_id = self.node._session_id
+        utterance_id = 'utt:wait-error'
+        self.client.stream_code = 17
+        self.node._on_chunk(_chunk(utterance_id, b'E' * 3200))
+        self.node._on_chunk(self._eof(utterance_id))
+        self._join_drain()
+
+        result = plugin.dispatch('wait_playback', {
+            'session_id': session_id,
+            'utterance_id': utterance_id,
+            'timeout_sec': 0,
+        })
+
+        self.assertEqual(result['state'], 'error')
+        self.assertTrue(result['terminal'])
+        self.assertEqual(result['reason'], 'play_stream_failed:17')
+        self.assertEqual(result['session_id'], session_id)
+        self.assertEqual(result['utterance_id'], utterance_id)
+
+    def test_wait_playback_validates_identity_timeout_and_session(self):
+        plugin = self._speaker_plugin()
+        session_id = self.node._session_id
+        valid_identity = {
+            'session_id': session_id,
+            'utterance_id': 'utt:validation',
+        }
+        cases = [
+            ({}, 'missing_session_id'),
+            ({'session_id': 'not-a-session'}, 'invalid_session_id'),
+            ({'session_id': 'speaker:'}, 'invalid_session_id'),
+            ({'session_id': session_id}, 'missing_utterance_id'),
+            ({
+                'session_id': session_id,
+                'utterance_id': 'utt:',
+            }, 'invalid_utterance_id'),
+            ({**valid_identity, 'timeout_sec': True}, 'invalid_timeout_sec'),
+            ({**valid_identity, 'timeout_sec': 'later'},
+             'invalid_timeout_sec'),
+            ({**valid_identity, 'timeout_sec': -0.1},
+             'timeout_out_of_range'),
+            ({
+                **valid_identity,
+                'timeout_sec': self.node.MAX_PLAYBACK_WAIT_SEC + 0.1,
+            }, 'timeout_out_of_range'),
+        ]
+
+        for args, expected_error in cases:
+            with self.subTest(error=expected_error, args=args):
+                result = plugin.dispatch('wait_playback', args)
+                self.assertEqual(result['state'], 'error')
+                self.assertFalse(result['terminal'])
+                self.assertEqual(result['error'], expected_error)
+
+        mismatch = plugin.dispatch('wait_playback', {
+            'session_id': 'speaker:not-current',
+            'utterance_id': 'utt:validation',
+            'timeout_sec': 0,
+        })
+        self.assertEqual(mismatch['state'], 'error')
+        self.assertFalse(mismatch['terminal'])
+        self.assertEqual(mismatch['error'], 'session_mismatch')
+        self.assertEqual(mismatch['active_session_id'], session_id)
+        self.assertFalse(mismatch['retryable'])
+
+    def test_wait_playback_old_history_wins_without_crossing_sessions(self):
+        plugin = self._speaker_plugin()
+        utterance_id = 'utt:reused-wait-id'
+        old_session_id = self.node._session_id
+        self.node._on_chunk(_chunk(utterance_id, b'OLD'))
+        self.node._on_chunk(self._eof(utterance_id))
+        self._join_drain()
+        self.assertEqual(self.node.stop_play()['state'], 'idle')
+        self.node.start_play('/perception/new-wait-session')
+        new_session_id = self.node._session_id
+
+        old_result = plugin.dispatch('wait_playback', {
+            'session_id': old_session_id,
+            'utterance_id': utterance_id,
+            'timeout_sec': 0,
+        })
+        before_new_audio = plugin.dispatch('wait_playback', {
+            'session_id': new_session_id,
+            'utterance_id': utterance_id,
+            'timeout_sec': 0,
+        })
+
+        self.assertEqual(old_result['state'], 'completed')
+        self.assertTrue(old_result['terminal'])
+        self.assertEqual(old_result['session_id'], old_session_id)
+        self.assertEqual(before_new_audio['state'], 'unknown')
+        self.assertFalse(before_new_audio['terminal'])
+        self.assertEqual(before_new_audio['session_id'], new_session_id)
+
+        self.node._on_chunk(_chunk(utterance_id, b'NEW'))
+        self.node._on_chunk(self._eof(utterance_id))
+        self._join_drain()
+        new_result = plugin.dispatch('wait_playback', {
+            'session_id': new_session_id,
+            'utterance_id': utterance_id,
+            'timeout_sec': 0,
+        })
+
+        self.assertEqual(new_result['state'], 'completed')
+        self.assertTrue(new_result['terminal'])
+        self.assertEqual(new_result['session_id'], new_session_id)
+        self.assertNotEqual(old_session_id, new_session_id)
+        self.assertEqual(
+            [call[2] for call in self.client.stream_calls], [b'OLD', b'NEW'],
+        )
+
+    def test_speaker_tool_advertises_and_dispatches_wait_playback(self):
+        plugin = self._speaker_plugin()
+        tool = plugin.get_tool()
+        schema = tool['inputSchema']
+        properties = schema['properties']
+
+        self.assertIn('wait_playback', properties['action']['enum'])
+        self.assertEqual(properties['session_id']['type'], 'string')
+        self.assertEqual(properties['session_id']['pattern'], '^speaker:.+')
+        self.assertEqual(properties['utterance_id']['type'], 'string')
+        self.assertEqual(properties['utterance_id']['pattern'], '^utt:.+')
+        self.assertEqual(properties['timeout_sec']['minimum'], 0)
+        self.assertEqual(
+            properties['timeout_sec']['maximum'],
+            self.node.MAX_PLAYBACK_WAIT_SEC,
+        )
+        self.assertEqual(
+            properties['timeout_sec']['default'],
+            self.node.DEFAULT_PLAYBACK_WAIT_SEC,
+        )
+
+        result = plugin.dispatch('wait_playback', {
+            'session_id': self.node._session_id,
+            'utterance_id': 'utt:schema-dispatch',
+            'timeout_sec': 0,
+        })
+        info = plugin.dispatch('info', {})
+
+        self.assertEqual(result['state'], 'unknown')
+        self.assertFalse(result['terminal'])
+        self.assertEqual(info['playback_wait'], {
+            'action': 'wait_playback',
+            'identity': ['session_id', 'utterance_id'],
+            'default_timeout_sec': self.node.DEFAULT_PLAYBACK_WAIT_SEC,
+            'max_timeout_sec': self.node.MAX_PLAYBACK_WAIT_SEC,
+        })
 
     def test_native_tts_speak_can_be_hidden_for_strict_speaker_ownership(self):
         plugin = DEVICE.NativeTtsPlugin(

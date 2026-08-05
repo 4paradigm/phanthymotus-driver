@@ -161,14 +161,20 @@ class HardwareSmokeContractTests(unittest.TestCase):
         node.publisher.subscription_count = 0
         self.assertIsNone(node.wait_for_graph(0.001))
 
-    def test_mcp_call_decodes_speaker_result(self):
+    def test_mcp_wait_call_sends_correlated_identity_and_timeout(self):
+        wait_result = {
+            'session_id': 'speaker:test',
+            'utterance_id': 'utt:review-smoke',
+            'state': 'completed',
+            'terminal': True,
+        }
         response_body = json.dumps({
             'jsonrpc': '2.0',
             'id': 'test',
             'result': {
                 'content': [{
                     'type': 'text',
-                    'text': json.dumps({'state': 'ready'}),
+                    'text': json.dumps(wait_result),
                 }],
             },
         }).encode()
@@ -187,18 +193,23 @@ class HardwareSmokeContractTests(unittest.TestCase):
             self.smoke.urllib.request, 'urlopen', return_value=_Response(),
         ) as urlopen:
             result = self.smoke._speaker_call(
-                'http://127.0.0.1:15701/mcp', 'start', timeout=3,
-                input_topic='/review/smoke',
+                'http://127.0.0.1:15701/mcp', 'wait_playback', timeout=15,
+                session_id='speaker:test',
+                utterance_id='utt:review-smoke',
+                timeout_sec=10,
             )
 
-        self.assertEqual(result, {'state': 'ready'})
+        self.assertEqual(result, wait_result)
         request = urlopen.call_args.args[0]
         body = json.loads(request.data.decode())
         self.assertEqual(body['params']['name'], 'speaker')
         self.assertEqual(body['params']['arguments'], {
-            'action': 'start',
-            'input_topic': '/review/smoke',
+            'action': 'wait_playback',
+            'session_id': 'speaker:test',
+            'utterance_id': 'utt:review-smoke',
+            'timeout_sec': 10,
         })
+        self.assertEqual(urlopen.call_args.kwargs['timeout'], 15)
 
     def _main_args(self):
         return argparse.Namespace(
@@ -228,7 +239,85 @@ class HardwareSmokeContractTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertEqual(calls, ['start', 'stop'])
 
+    def test_success_reports_mcp_and_ros_terminal_evidence(self):
+        calls = []
+        smoke = self.smoke
+
+        class _HappyNode:
+            def __init__(self, input_topic):
+                self.input_topic = input_topic
+
+            def spin_for(self, _seconds):
+                pass
+
+            def wait_for_graph(self, _timeout):
+                return {
+                    'speaker_input_subscriptions': 1,
+                    'receipt_publishers': 1,
+                }
+
+            def publish(self, _utterance_id, _payload):
+                pass
+
+            def wait_for_terminal(self, session_id, utterance_id, _timeout):
+                return {
+                    'session_id': session_id,
+                    'utterance_id': utterance_id,
+                    'state': 'completed',
+                    'completion_basis': 'g1_play_state_observed',
+                    'audio_bytes': 5 * len(smoke.PCM_BLOCK),
+                }
+
+            def destroy_node(self):
+                pass
+
+        def speaker_call(_url, action, **kwargs):
+            calls.append((action, kwargs))
+            if action == 'start':
+                return {
+                    'state': 'ready',
+                    'completion_mode': 'hardware_state',
+                    'play_state': {'ready': True, 'matched_publishers': 1},
+                    'session_id': 'speaker:test',
+                }
+            if action == 'wait_playback':
+                return {
+                    'session_id': kwargs['session_id'],
+                    'utterance_id': kwargs['utterance_id'],
+                    'state': 'completed',
+                    'terminal': True,
+                    'completion_basis': 'g1_play_state_observed',
+                    'audio_bytes': 5 * len(smoke.PCM_BLOCK),
+                }
+            if action == 'stop':
+                return {'state': 'idle'}
+            self.fail(f'unexpected speaker action: {action}')
+
+        with mock.patch.object(smoke, '_parse_args', self._main_args), \
+                mock.patch.object(smoke, '_SmokeNode', _HappyNode), \
+                mock.patch.object(smoke, '_speaker_call', speaker_call), \
+                mock.patch('builtins.print') as print_output:
+            result = smoke.main()
+
+        self.assertEqual(result, 0)
+        self.assertEqual([action for action, _kwargs in calls], [
+            'start', 'wait_playback', 'stop',
+        ])
+        evidence = json.loads(print_output.call_args.args[0])
+        self.assertEqual(evidence['result'], 'passed')
+        self.assertTrue(evidence['mcp_wait_result']['terminal'])
+        self.assertEqual(
+            evidence['mcp_wait_result']['utterance_id'],
+            evidence['terminal_receipt']['utterance_id'],
+        )
+        self.assertEqual(
+            evidence['mcp_wait_result']['completion_basis'],
+            evidence['terminal_receipt']['completion_basis'],
+        )
+
     def test_cleanup_failure_turns_success_into_failure(self):
+        calls = []
+
         class _HappyNode:
             def __init__(self, input_topic):
                 self.input_topic = input_topic
@@ -262,12 +351,22 @@ class HardwareSmokeContractTests(unittest.TestCase):
         _HappyNode.smoke = smoke
 
         def speaker_call(_url, action, **_kwargs):
+            calls.append((action, _kwargs))
             if action == 'start':
                 return {
                     'state': 'ready',
                     'completion_mode': 'hardware_state',
                     'play_state': {'ready': True, 'matched_publishers': 1},
                     'session_id': 'speaker:test',
+                }
+            if action == 'wait_playback':
+                return {
+                    'session_id': _kwargs['session_id'],
+                    'utterance_id': _kwargs['utterance_id'],
+                    'state': 'completed',
+                    'terminal': True,
+                    'completion_basis': 'g1_play_state_observed',
+                    'audio_bytes': 5 * len(smoke.PCM_BLOCK),
                 }
             raise TimeoutError('stop response timed out')
 
@@ -278,6 +377,18 @@ class HardwareSmokeContractTests(unittest.TestCase):
             result = smoke.main()
 
         self.assertEqual(result, 1)
+        self.assertEqual([action for action, _kwargs in calls], [
+            'start', 'wait_playback', 'stop',
+        ])
+        wait_args = calls[1][1]
+        self.assertEqual(wait_args['session_id'], 'speaker:test')
+        self.assertTrue(wait_args['utterance_id'].startswith('utt:hardware-smoke-'))
+        self.assertEqual(wait_args['timeout_sec'], self._main_args().timeout)
+        self.assertEqual(
+            wait_args['timeout'],
+            self._main_args().timeout
+            + smoke.MCP_WAIT_TRANSPORT_MARGIN_SEC,
+        )
 
 
 if __name__ == '__main__':

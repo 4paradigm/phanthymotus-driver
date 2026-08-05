@@ -19,6 +19,7 @@ drivers/unitree/g1/device.py — Unitree G1 设备插件（重构版）。
 """
 
 import json
+import math
 import queue
 import socket
 import struct
@@ -348,6 +349,8 @@ class _SpeakerNode(Node):
     STREAM_RPC_TIMEOUT_SEC = 1.0
     CONTROL_RPC_TIMEOUT_SEC = 1.0
     TERMINAL_HISTORY_LIMIT = 256
+    DEFAULT_PLAYBACK_WAIT_SEC = 20.0
+    MAX_PLAYBACK_WAIT_SEC = 25.0
     COMPLETION_MODE_ESTIMATED = 'estimated'
     COMPLETION_MODE_HARDWARE_STATE = 'hardware_state'
 
@@ -393,6 +396,7 @@ class _SpeakerNode(Node):
         self._lock = threading.RLock()
         self._sdk_lock = threading.Lock()
         self._receipt_lock = threading.RLock()
+        self._receipt_cv = threading.Condition(self._receipt_lock)
         self._receipt_publish_lock = threading.Lock()
         self._control_in_progress = False
         self._accept_chunks = False
@@ -408,6 +412,7 @@ class _SpeakerNode(Node):
         self._legacy_counter = 0
         self._active_utterance_id: str | None = None
         self._session_id = ''
+        self._open_receipt_session_id = ''
         self._started_ids: dict[tuple[str, str], bool] = {}
         self._terminal_ids: dict[tuple[str, str], dict] = {}
         self._cancelled_ids: dict[str, bool] = {}
@@ -534,8 +539,9 @@ class _SpeakerNode(Node):
             self._cancelled_ids.clear()
             self._session_id = f"speaker:{uuid.uuid4()}"
             receipt_topic = f"{topic.rstrip('/')}/speaker_receipts"
-            with self._receipt_lock:
+            with self._receipt_cv:
                 self._started_ids.clear()
+                self._open_receipt_session_id = self._session_id
                 if (self._receipt_pub is not None
                         and self._receipt_topic != receipt_topic):
                     self.destroy_publisher(self._receipt_pub)
@@ -550,6 +556,7 @@ class _SpeakerNode(Node):
                     for pending in self._pending_receipts.values()
                 ):
                     self._ensure_receipt_retry_timer_locked()
+                self._receipt_cv.notify_all()
             self.get_logger().info(f"[speaker] creating subscription: topic={topic}, msg_type=AudioChunk, qos=LOW_LAT")
             self._sub = self.create_subscription(
                 AudioChunk, topic, self._on_chunk, _LOW_LAT_QOS,
@@ -607,7 +614,8 @@ class _SpeakerNode(Node):
         if not utterance_id:
             return None
         terminal = state in ('completed', 'cancelled', 'error')
-        with self._receipt_lock:
+        notify_waiters = False
+        with self._receipt_cv:
             session_key = (self._session_id, utterance_id)
             if session_key in self._terminal_ids:
                 # A terminal receipt is final for this session/utterance pair.
@@ -639,6 +647,7 @@ class _SpeakerNode(Node):
                 }
                 if state == 'started':
                     self._remember_bounded(self._started_ids, session_key, True)
+                    notify_waiters = True
                 if terminal:
                     started_pending_key = (
                         self._session_id, utterance_id, 'started',
@@ -647,13 +656,115 @@ class _SpeakerNode(Node):
                     self._receipt_publish_errors.pop(started_pending_key, None)
                     self._remember_bounded(self._terminal_ids, session_key, receipt)
                     self._last_terminal_receipt = receipt
+                    notify_waiters = True
                 pending_key = (self._session_id, utterance_id, state)
                 self._pending_receipts[pending_key] = receipt
                 while len(self._pending_receipts) > self.TERMINAL_HISTORY_LIMIT:
                     expired_key = next(iter(self._pending_receipts))
                     self._pending_receipts.pop(expired_key)
                     self._receipt_publish_errors.pop(expired_key, None)
+            if notify_waiters:
+                self._receipt_cv.notify_all()
         return receipt
+
+    def wait_for_playback(self, session_id, utterance_id,
+                          timeout_sec=DEFAULT_PLAYBACK_WAIT_SEC) -> dict:
+        """Wait for one exact playback receipt without blocking speaker work."""
+        if not isinstance(session_id, str) or not session_id:
+            return {
+                'state': 'error',
+                'terminal': False,
+                'error': 'missing_session_id',
+            }
+        if not session_id.startswith('speaker:') or len(session_id) == 8:
+            return {
+                'state': 'error',
+                'terminal': False,
+                'error': 'invalid_session_id',
+                'session_id': session_id,
+            }
+        if not isinstance(utterance_id, str) or not utterance_id:
+            return {
+                'state': 'error',
+                'terminal': False,
+                'error': 'missing_utterance_id',
+                'session_id': session_id,
+            }
+        if not utterance_id.startswith('utt:') or len(utterance_id) == 4:
+            return {
+                'state': 'error',
+                'terminal': False,
+                'error': 'invalid_utterance_id',
+                'session_id': session_id,
+                'utterance_id': utterance_id,
+            }
+        try:
+            if isinstance(timeout_sec, bool):
+                raise ValueError
+            timeout = float(timeout_sec)
+        except (TypeError, ValueError):
+            return {
+                'state': 'error',
+                'terminal': False,
+                'error': 'invalid_timeout_sec',
+                'session_id': session_id,
+                'utterance_id': utterance_id,
+                'max_timeout_sec': self.MAX_PLAYBACK_WAIT_SEC,
+            }
+        if (not math.isfinite(timeout) or timeout < 0
+                or timeout > self.MAX_PLAYBACK_WAIT_SEC):
+            return {
+                'state': 'error',
+                'terminal': False,
+                'error': 'timeout_out_of_range',
+                'session_id': session_id,
+                'utterance_id': utterance_id,
+                'max_timeout_sec': self.MAX_PLAYBACK_WAIT_SEC,
+            }
+
+        key = (session_id, utterance_id)
+        deadline = time.monotonic() + timeout
+        with self._receipt_cv:
+            while True:
+                receipt = self._terminal_ids.get(key)
+                if receipt is not None:
+                    result = dict(receipt)
+                    result['terminal'] = True
+                    return result
+
+                active_session_id = self._open_receipt_session_id
+                if session_id != active_session_id:
+                    error = (
+                        'session_mismatch' if active_session_id
+                        else 'speaker_session_not_active'
+                    )
+                    return {
+                        'state': 'error',
+                        'terminal': False,
+                        'error': error,
+                        'session_id': session_id,
+                        'utterance_id': utterance_id,
+                        'active_session_id': active_session_id or None,
+                        'last_session_id': self._session_id or None,
+                        'retryable': False,
+                    }
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    observed = key in self._started_ids
+                    return {
+                        'state': 'timeout' if observed else 'unknown',
+                        'terminal': False,
+                        'session_id': session_id,
+                        'utterance_id': utterance_id,
+                        'reason': (
+                            'playback_not_terminal' if observed else
+                            'utterance_not_observed_before_timeout'
+                        ),
+                        'retryable': True,
+                        'timeout_sec': timeout,
+                    }
+                self._receipt_cv.wait(timeout=remaining)
 
     def _publish_and_log_receipt(self, receipt: dict | None) -> None:
         if receipt is None:
@@ -858,8 +969,11 @@ class _SpeakerNode(Node):
             self._legacy_mute_deadline = 0.0
             self._cancelled_ids.clear()
             self._topic = None
-        with self._receipt_lock:
+        with self._receipt_cv:
             self._started_ids.clear()
+            if self._open_receipt_session_id == self._session_id:
+                self._open_receipt_session_id = ''
+            self._receipt_cv.notify_all()
         self.get_logger().info(f"Speaker stopped: state={self.state} code={stop_code}")
         return {
             'state': self.state,
@@ -1556,12 +1670,29 @@ class SpeakerPlugin:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["start", "stop", "info"],
+                        "enum": ["start", "stop", "info", "wait_playback"],
                         "description": "Action to perform",
                     },
                     "input_topic": {
                         "type": "string",
                         "description": "ROS2 topic to subscribe for PCM audio (provided by canvas connection)",
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "pattern": "^speaker:.+",
+                        "description": "Exact session_id returned by speaker start",
+                    },
+                    "utterance_id": {
+                        "type": "string",
+                        "pattern": "^utt:.+",
+                        "description": "Exact utterance ID carried by every AudioChunk and EOF frame",
+                    },
+                    "timeout_sec": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": _SpeakerNode.MAX_PLAYBACK_WAIT_SEC,
+                        "default": _SpeakerNode.DEFAULT_PLAYBACK_WAIT_SEC,
+                        "description": "Seconds to wait; 0 performs an immediate correlated lookup",
                     },
                 },
                 "required": ["action"],
@@ -1735,6 +1866,12 @@ class SpeakerPlugin:
                 "completion_basis": self._node._completion_basis(),
                 "play_state": self._node._play_state_status(),
                 "receipt_recovery": "transient_local_then_info_poll",
+                "playback_wait": {
+                    "action": "wait_playback",
+                    "identity": ["session_id", "utterance_id"],
+                    "default_timeout_sec": self._node.DEFAULT_PLAYBACK_WAIT_SEC,
+                    "max_timeout_sec": self._node.MAX_PLAYBACK_WAIT_SEC,
+                },
                 "startup_warning": startup_error,
                 "topic_out": [{
                     "topic": self._node._receipt_topic,
@@ -1750,6 +1887,15 @@ class SpeakerPlugin:
             }
         elif action == "stop":
             return self._node.stop_play()
+        elif action == "wait_playback":
+            return self._node.wait_for_playback(
+                args.get('session_id'),
+                args.get('utterance_id'),
+                args.get(
+                    'timeout_sec',
+                    self._node.DEFAULT_PLAYBACK_WAIT_SEC,
+                ),
+            )
         elif action == "info":
             play_state_status = self._node._play_state_status()
             with self._node._lock:
@@ -1767,6 +1913,16 @@ class SpeakerPlugin:
                         "completion_basis": self._node._completion_basis(),
                         "play_state": play_state_status,
                         "receipt_recovery": "transient_local_then_info_poll",
+                        "playback_wait": {
+                            "action": "wait_playback",
+                            "identity": ["session_id", "utterance_id"],
+                            "default_timeout_sec": (
+                                self._node.DEFAULT_PLAYBACK_WAIT_SEC
+                            ),
+                            "max_timeout_sec": (
+                                self._node.MAX_PLAYBACK_WAIT_SEC
+                            ),
+                        },
                         "active_utterance_id": self._node._active_utterance_id,
                         "last_terminal_receipt": (
                             dict(last_terminal) if last_terminal else None
@@ -2964,7 +3120,6 @@ class LidarPlugin:
 
 # ── SpatialPlugin (actuator + sensor) ────────────────────────────────────────
 
-import math
 import os
 import sqlite3
 

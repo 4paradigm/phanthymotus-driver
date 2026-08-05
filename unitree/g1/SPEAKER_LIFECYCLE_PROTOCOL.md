@@ -47,6 +47,60 @@ terminal. Terminal identity is `(session_id, utterance_id)`, and consumers must
 deduplicate it. A terminal receipt may arrive without `started` when delivery of
 the earlier event failed; consumers must accept that transition.
 
+## Direct MCP status and wait
+
+The `speaker` MCP tool exposes the same terminal state directly, so callers do
+not need to subscribe to ROS or repeatedly inspect the latest global status:
+
+```json
+{
+  "action": "wait_playback",
+  "session_id": "speaker:<value returned by speaker start>",
+  "utterance_id": "utt:<value carried by every PCM and EOF frame>",
+  "timeout_sec": 20
+}
+```
+
+For example, a direct JSON-RPC call is:
+
+```bash
+curl -sS http://127.0.0.1:15701/mcp \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "jsonrpc":"2.0",
+    "id":"speaker-wait",
+    "method":"tools/call",
+    "params":{
+      "name":"speaker",
+      "arguments":{
+        "action":"wait_playback",
+        "session_id":"speaker:REPLACE_ME",
+        "utterance_id":"utt:REPLACE_ME",
+        "timeout_sec":20
+      }
+    }
+  }'
+```
+
+The terminal receipt is returned directly. In strict G1 mode,
+`state: completed`, `terminal: true`, and
+`completion_basis: g1_play_state_observed` mean the firmware player was
+observed returning to idle for that exact utterance. `cancelled` and `error`
+are also terminal. `timeout` means the utterance was observed but has not yet
+reached a terminal state; `unknown` means its `started` frame was not observed
+before the timeout. Both are non-terminal and retryable with the same identity.
+
+The default wait is 20 seconds and one call is capped at 25 seconds, below
+Core's 30-second MCP request timeout. Use the same identity in a later call for
+long audio; a terminal result retained in bounded history returns immediately.
+`timeout_sec: 0` performs an immediate correlated lookup. A stale or incorrect
+session returns a non-retryable session error instead of matching another
+utterance with the same ID.
+
+This action shape is suitable as a common Speaker contract for other robots,
+but this PR implements it only for the G1 plugin. Each other driver still needs
+to connect its own hardware/player acknowledgement to the terminal receipt.
+
 With `completion_mode: hardware_state`, the driver also subscribes to the G1
 controller's `rt/audio_msg` DDS topic. The body-speaker service publishes
 `{"play_state":1}` when its player starts and `{"play_state":0}` when it
@@ -92,8 +146,9 @@ cannot be resumed safely; callers should use interrupt/cancel instead.
 
 Run this only against a dedicated G1 test deployment. It replaces the active
 Speaker input topic, plays the normal startup beep, sends 1.5 seconds of
-near-silent non-zero PCM, validates a hardware-state `completed` receipt, and
-stops Speaker during cleanup:
+near-silent non-zero PCM, waits through the MCP `wait_playback` action, then
+cross-checks the matching ROS hardware-state receipt and stops Speaker during
+cleanup:
 
 ```bash
 docker exec -it embodied-unitree-g1 bash -lc '
@@ -105,11 +160,12 @@ docker exec -it embodied-unitree-g1 bash -lc '
 ```
 
 Success prints JSON containing `result: passed`, `play_state.ready: true`, at
-least one matched publisher, and a terminal receipt whose basis is
+least one matched publisher, an `mcp_wait_result`, and a matching
+`terminal_receipt`; both terminal results must use
 `g1_play_state_observed`. Missing DDS discovery, missing transitions, receipt
-timeout, non-hardware completion, and incomplete PCM delivery all fail with a
-non-zero exit code. The command is intentionally opt-in because it interrupts
-any existing Speaker session.
+timeout, non-hardware completion, inconsistent MCP/ROS results, and incomplete
+PCM delivery all fail with a non-zero exit code. The command is intentionally
+opt-in because it interrupts any existing Speaker session.
 
 ## Delivery and recovery
 
@@ -118,14 +174,14 @@ late-join replay must request compatible transient-local QoS. The driver keeps a
 bounded retry outbox for local publish exceptions and leaves the receipt
 publisher alive after `stop`.
 
-Consumers should still implement this recovery sequence:
+Consumers should implement this sequence:
 
-1. subscribe before submitting the utterance;
-2. wait for a matching terminal `(session_id, utterance_id)`;
-3. deduplicate retries;
-4. on timeout, call speaker `info` and reconcile against
-   `recent_terminal_receipts` and `pending_receipts`;
-5. treat a remaining timeout as unknown/error rather than assuming completion.
+1. use the `session_id` returned by speaker `start`;
+2. assign one `utt:` ID and carry it on every PCM frame and EOF;
+3. call `wait_playback` with that exact pair;
+4. retry the same pair after a non-terminal timeout/unknown result;
+5. use speaker `info` or the ROS receipt topic for diagnostics and recovery;
+6. never assume completion from elapsed audio duration alone.
 
 ## Rollout compatibility
 
@@ -137,6 +193,7 @@ Consumers should still implement this recovery sequence:
 | new | new | Correlated lifecycle receipts |
 
 The safe rollout order is speaker driver first, then a producer that assigns IDs
-and repeats them on EOF, then a Core receipt waiter with timeout-to-`info`
-reconciliation. Until the latter two changes ship, this driver PR is protocol
-foundation rather than an end-to-end fix for Core interaction ordering.
+and repeats them on EOF. At that point Core or any MCP client can invoke the
+Driver's `wait_playback` action directly; no separate ROS subscriber is needed
+in Core. Interaction logic must still call the wait action before advancing to
+the next dependent step.

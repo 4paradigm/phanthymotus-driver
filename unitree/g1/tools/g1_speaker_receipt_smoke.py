@@ -30,6 +30,7 @@ from std_msgs.msg import String
 AUDIO_EOF_MAGIC = b'\x01\x00\xff\xff\x01\x00\xff\xff'
 PCM_BLOCK = b'\x01\x00\xff\xff' * 2400  # 9600 bytes, samples +1/-1
 TERMINAL_STATES = {'completed', 'cancelled', 'error'}
+MCP_WAIT_TRANSPORT_MARGIN_SEC = 5.0
 
 INPUT_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -159,7 +160,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         '--timeout', type=float, default=10.0,
-        help='seconds to wait for the terminal receipt',
+        help='seconds to wait for MCP playback completion and the ROS receipt (max 25)',
     )
     parser.add_argument(
         '--start-timeout', type=float, default=30.0,
@@ -228,6 +229,42 @@ def main() -> int:
             node.spin_for(0.3)
         node.publish(utterance_id, AUDIO_EOF_MAGIC)
 
+        # Use the public MCP contract as the primary completion signal. Keep the
+        # HTTP timeout slightly above the requested server-side wait so response
+        # serialization and transport do not race the client deadline.
+        mcp_wait_result = _speaker_call(
+            args.mcp_url,
+            'wait_playback',
+            timeout=max(0.1, args.timeout + MCP_WAIT_TRANSPORT_MARGIN_SEC),
+            session_id=session_id,
+            utterance_id=utterance_id,
+            timeout_sec=args.timeout,
+        )
+        if not mcp_wait_result.get('terminal'):
+            raise RuntimeError(
+                f'MCP wait_playback did not return a terminal result: '
+                f'{mcp_wait_result}'
+            )
+        if mcp_wait_result.get('state') != 'completed':
+            raise RuntimeError(
+                f'MCP wait_playback returned non-success terminal: '
+                f'{mcp_wait_result}'
+            )
+        if (mcp_wait_result.get('completion_basis')
+                != 'g1_play_state_observed'):
+            raise RuntimeError(
+                f'MCP wait_playback returned non-hardware completion: '
+                f'{mcp_wait_result}'
+            )
+        if mcp_wait_result.get('audio_bytes') != 5 * len(PCM_BLOCK):
+            raise RuntimeError(
+                f'MCP wait_playback returned unexpected audio byte count: '
+                f'{mcp_wait_result}'
+            )
+
+        # Cross-check the push path independently. The MCP request blocks this
+        # process's ROS executor, so spin after it returns; TRANSIENT_LOCAL keeps
+        # the terminal receipt available for this reconciliation.
         terminal = node.wait_for_terminal(
             session_id, utterance_id, args.timeout,
         )
@@ -242,6 +279,14 @@ def main() -> int:
             raise RuntimeError(f'non-hardware completion basis: {terminal}')
         if terminal.get('audio_bytes') != 5 * len(PCM_BLOCK):
             raise RuntimeError(f'unexpected audio byte count: {terminal}')
+        for field in (
+                'session_id', 'utterance_id', 'state',
+                'completion_basis', 'audio_bytes'):
+            if mcp_wait_result.get(field) != terminal.get(field):
+                raise RuntimeError(
+                    f'MCP/ROS terminal mismatch for {field}: '
+                    f'mcp={mcp_wait_result}, ros={terminal}'
+                )
 
         evidence = {
             'result': 'passed',
@@ -249,6 +294,7 @@ def main() -> int:
             'utterance_id': utterance_id,
             'play_state': play_state,
             'ros_graph': graph,
+            'mcp_wait_result': mcp_wait_result,
             'terminal_receipt': terminal,
         }
     except Exception as exc:
