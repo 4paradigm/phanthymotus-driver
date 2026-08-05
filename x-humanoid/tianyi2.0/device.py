@@ -3961,7 +3961,8 @@ class VoicePlayActuatorPlugin:
                     try:
                         import urllib.request as _urllib
                         import ssl as _ssl
-                        agent_core_url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+                        import os as _os
+                        agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
                         ctx = _ssl.create_default_context()
                         ctx.check_hostname = False
                         ctx.verify_mode = _ssl.CERT_NONE
