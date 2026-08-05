@@ -18,6 +18,8 @@ drivers/unitree/g1/device.py — Unitree G1 设备插件（重构版）。
   StatePlugin        (sensor)    — DDS LowState → IMU/battery ROS2 topic
 """
 
+from __future__ import annotations
+
 import json
 import queue
 import socket
@@ -33,6 +35,7 @@ from std_msgs.msg import Header, String
 from audio_msgs.msg import AudioChunk
 
 from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
+from playback_state import G1PlaybackStateMonitor
 from pointcloud_utils import gravity_align_inplace
 
 # ── 常量 ──────────────────────────────────────────────────────────────────────
@@ -48,6 +51,13 @@ _LOW_LAT_QOS = QoSProfile(
     depth=200,
     durability=DurabilityPolicy.VOLATILE,
 )
+
+# rt/audio_msg reports one global G1 audio-player state without app/stream ID.
+# When the PCM Speaker plugin is enabled, native TTS must stay disabled for the
+# process lifetime; otherwise a TtsMaker RPC can return while its audio keeps
+# playing and forge the PCM stream's finish events.  If Speaker is disabled in
+# config, NativeTtsPlugin retains its original behavior.
+_G1_PCM_COMPLETION_MODE_ENABLED = threading.Event()
 
 
 # ── 工具函数 ──────────────────────────────────────────────────────────────────
@@ -289,7 +299,15 @@ class NativeTtsPlugin:
         if action == "speak":
             text  = args.get("text", "")
             voice = int(args.get("voice", 0))
-            ret   = self._client.TtsMaker(text, voice)
+            if _G1_PCM_COMPLETION_MODE_ENABLED.is_set():
+                return {
+                    "ret": -1,
+                    "state": "error",
+                    "reason": "native_tts_disabled_for_pcm_completion",
+                    "message": "disable the Speaker plugin to use native TTS",
+                    "text": text,
+                }
+            ret = self._client.TtsMaker(text, voice)
             return {"ret": ret, "text": text}
         elif action == "get_volume":
             ret = self._client.GetVolume()
@@ -309,115 +327,460 @@ APP_NAME = "g1_speaker"
 class _SpeakerNode(Node):
     PREFILL = 3       # buffer 3 chunks (~300ms) before starting playback
     MERGE_BYTES = 9600  # merge into ~300ms blocks before calling PlayStream
+    NATURAL_IDLE_TIMEOUT = 3.0
+    STOP_IDLE_TIMEOUT = 2.0
+    PLAYBACK_HISTORY_LIMIT = 32
+    TERMINAL_STATES = frozenset(("completed", "cancelled", "error"))
 
-    def __init__(self, audio_client: AudioClient):
+    # EOF magic: 8 bytes (4 samples [1,-1,1,-1])，标记 utterance 结束
+    AUDIO_EOF_MAGIC = b'\x01\x00\xff\xff\x01\x00\xff\xff'
+
+    def __init__(self, audio_client: AudioClient, playback_monitor=None):
         super().__init__("g1_speaker")
         self._client = audio_client
+        _G1_PCM_COMPLETION_MODE_ENABLED.set()
+        self._playback_monitor = (
+            playback_monitor or G1PlaybackStateMonitor.connect_dds()
+        )
         self._topic: str | None = None
         self._sub    = None
         self._idx    = 0
         self.state   = "idle"
         self._buf = queue.Queue()
         self._draining = threading.Event()
+        self._drain_guard = threading.Lock()
         self._drain_thread: threading.Thread | None = None
         self._last_chunk_time = 0.0
         self._flush_timer = None
         # 打断/暂停控制
-        self._lock = threading.Lock()
+        # All public speaker lifecycle operations share this lock.  SmartMotion
+        # calls the node directly, while the speaker MCP calls through the
+        # plugin, so a node-owned re-entrant lock is the only common boundary.
+        self._lifecycle_lock = threading.RLock()
+        self._lock = self._lifecycle_lock
         self._interrupt_flag = threading.Event()
+        self._startup_cancel = threading.Event()
         self._pause_event = threading.Event()
         self._pause_event.set()  # 初始为非暂停状态
         self._muted = False  # interrupt 后静默，丢弃后续 chunks 直到新 utterance
+        # Playback records back the reviewer-facing wait_playback MCP action.
+        self._playback_cv = threading.Condition(threading.RLock())
+        self._playback_sequence = 0
+        self._playbacks: dict[int, dict] = {}
+        self._current_input_id: int | None = None
+        self._failed_playback_ids: set[int] = set()
+        self._stream_prefix = f"{int(time.time() * 1000):x}"
+        # ROS may already be executing a callback when its subscription is
+        # destroyed.  A generation captured by each callback prevents that
+        # stale callback from writing into a stopped or restarted session.
+        self._subscription_generation = 0
+        self._active_subscription_generation: int | None = None
+        self._fail_closed_reason: str | None = None
         # Clear stale PlayStream session from previous container run (MCU keeps state across reboot)
-        self._client.PlayStop(APP_NAME)
+        stop_code = self._safe_play_stop()
+        if stop_code != 0:
+            self.get_logger().warn(
+                f"[speaker] initial PlayStop failed: code={stop_code}"
+            )
         self.get_logger().info("SpeakerNode ready")
 
-    def start_play(self, topic: str) -> str:
-        if self._sub is not None:
-            if self._topic == topic:
-                self.get_logger().info(f"[speaker] already subscribing {topic}, skip")
-                return self._topic
-            # topic changed — stop old subscription first
-            self.get_logger().info(f"[speaker] topic changed {self._topic} → {topic}, re-subscribing")
-            self.stop_play()
-        self._topic = topic
-        self._muted = False  # 新 start 时清除静默
-        self.get_logger().info(f"[speaker] creating subscription: topic={topic}, msg_type=AudioChunk, qos=LOW_LAT")
-        self._sub = self.create_subscription(
-            AudioChunk, topic, self._on_chunk, _LOW_LAT_QOS,
-        )
-        self.state = "ready"
-        self.get_logger().info(f"[speaker] subscription created, waiting for chunks on {topic}")
-        return topic
-
-    def stop_play(self) -> None:
-        if self._flush_timer is not None:
-            self._flush_timer.cancel()
-            self.destroy_timer(self._flush_timer)
-            self._flush_timer = None
-        if self._sub is not None:
-            self.destroy_subscription(self._sub)
-            self._sub = None
-        self._draining.clear()
-        self._pause_event.set()  # 确保 drain thread 不会卡在 pause wait
-        self._interrupt_flag.set()  # 确保 drain thread 退出
-        if self._drain_thread is not None:
-            self._drain_thread.join(timeout=2)
-            self._drain_thread = None
-        self._interrupt_flag.clear()
-        # flush remaining buffer
-        while not self._buf.empty():
-            try:
-                self._buf.get_nowait()
-            except queue.Empty:
-                break
+    def _safe_play_stop(self) -> int:
         try:
-            self._client.PlayStop(APP_NAME)
-        except Exception as e:
-            self.get_logger().warn(f"PlayStop error: {e}")
-        self.state = "idle"
-        self.get_logger().info("Speaker stopped")
+            result = self._client.PlayStop(APP_NAME)
+            if isinstance(result, tuple):
+                result = result[0]
+            return int(result)
+        except Exception as exc:
+            self.get_logger().warn(f"[speaker] PlayStop error: {exc}")
+            return -1
 
-    def interrupt(self) -> dict:
-        """立即中止播放：清空 buffer，停止 SDK，保持 subscription。"""
-        with self._lock:
-            self._interrupt_flag.set()
-            # 清空 buffer
+    def _new_playback(self) -> int:
+        with self._playback_cv:
+            self._playback_sequence += 1
+            playback_id = self._playback_sequence
+            self._playbacks[playback_id] = {
+                "playback_id": playback_id,
+                "stream_id": f"{self._stream_prefix}-{playback_id}",
+                "state": "receiving",
+                "reason": "",
+                "audio_bytes": 0,
+                "submitted_blocks": 0,
+                "eof_received": False,
+                "created_monotonic": time.monotonic(),
+                "start_event_seq": None,
+                "final_submit_seq": None,
+                "final_pcm_deadline": None,
+                "completion_basis": "",
+                "forced_stream_close": False,
+            }
+            self._current_input_id = playback_id
+            self._prune_playbacks_locked()
+            self._playback_cv.notify_all()
+            return playback_id
+
+    def _prune_playbacks_locked(self) -> None:
+        if len(self._playbacks) <= self.PLAYBACK_HISTORY_LIMIT:
+            return
+        for playback_id in list(self._playbacks):
+            if len(self._playbacks) <= self.PLAYBACK_HISTORY_LIMIT:
+                break
+            record = self._playbacks[playback_id]
+            if record["state"] in self.TERMINAL_STATES:
+                self._playbacks.pop(playback_id, None)
+
+    def _playback_snapshot_locked(self, playback_id: int) -> dict | None:
+        record = self._playbacks.get(playback_id)
+        return dict(record) if record is not None else None
+
+    def _set_terminal(self, playback_id: int, state: str, reason: str = "",
+                      **details) -> None:
+        with self._playback_cv:
+            record = self._playbacks.get(playback_id)
+            if record is None or record["state"] in self.TERMINAL_STATES:
+                return
+            record.update(details)
+            record["state"] = state
+            record["reason"] = reason
+            record["finished_monotonic"] = time.monotonic()
+            self._failed_playback_ids.discard(playback_id)
+            self._prune_playbacks_locked()
+            self._playback_cv.notify_all()
+
+    def _cancel_open_playbacks(self, reason: str) -> None:
+        with self._playback_cv:
+            for playback_id, record in self._playbacks.items():
+                if record["state"] not in self.TERMINAL_STATES:
+                    record["state"] = "cancelled"
+                    record["reason"] = reason
+                    record["finished_monotonic"] = time.monotonic()
+            self._current_input_id = None
+            self._failed_playback_ids.clear()
+            self._playback_cv.notify_all()
+
+    def _enter_fail_closed(self, reason: str) -> None:
+        """Block all further PCM after hardware ownership becomes uncertain."""
+        self._interrupt_flag.set()
+        with self._playback_cv:
             while not self._buf.empty():
                 try:
                     self._buf.get_nowait()
                 except queue.Empty:
                     break
-            # 停止 SDK 播放
+            self._cancel_open_playbacks(reason)
+            self._fail_closed_reason = reason
+            self.state = "error"
+            self._playback_cv.notify_all()
+        self.get_logger().error(
+            f"[speaker] hardware completion unknown; reuse blocked: {reason}"
+        )
+
+    def _latch_fail_closed(self, reason: str) -> None:
+        """Quarantine immediately; unlike interrupt, only stop may clear it."""
+        with self._playback_cv:
+            if self._fail_closed_reason is None:
+                self._fail_closed_reason = reason
+            self.state = "error"
+            self._playback_cv.notify_all()
+
+    def wait_for_playback(self, *, playback_id=None, after_playback_id=None,
+                          timeout: float = 30.0) -> dict:
+        """Wait for one local utterance to reach a terminal state."""
+        if playback_id is None and after_playback_id is None:
+            return {
+                "state": "error",
+                "reason": "playback_id_or_after_playback_id_required",
+            }
+        if playback_id is not None and after_playback_id is not None:
+            return {
+                "state": "error",
+                "reason": "choose_playback_id_or_after_playback_id",
+            }
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        target_id = int(playback_id) if playback_id is not None else None
+        after_id = (
+            int(after_playback_id)
+            if after_playback_id is not None else None
+        )
+
+        with self._playback_cv:
+            while True:
+                if target_id is None:
+                    if after_id is not None:
+                        candidates = [
+                            item for item in self._playbacks if item > after_id
+                        ]
+                        if candidates:
+                            target_id = min(candidates)
+                if target_id is not None:
+                    record = self._playbacks.get(target_id)
+                    if record is not None:
+                        if record["state"] in self.TERMINAL_STATES:
+                            result = dict(record)
+                            result["hardware_playback"] = (
+                                self._playback_monitor.status()
+                            )
+                            return result
+                    elif playback_id is not None and target_id <= self._playback_sequence:
+                        return {
+                            "state": "error",
+                            "reason": "playback_id_not_found",
+                            "playback_id": target_id,
+                        }
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return {
+                        "state": "timeout",
+                        "reason": (
+                            "playback_not_finished"
+                            if target_id is not None
+                            else "playback_not_started"
+                        ),
+                        "playback_id": target_id,
+                        "after_playback_id": after_id,
+                        "last_playback_id": self._playback_sequence,
+                        "hardware_playback": self._playback_monitor.status(),
+                    }
+                self._playback_cv.wait(timeout=min(0.1, remaining))
+
+    def start_play(self, topic: str) -> str:
+        with self._lifecycle_lock:
+            if self._interrupt_flag.is_set():
+                raise RuntimeError("speaker worker is still stopping")
+            if self._drain_thread is not None and self._drain_thread.is_alive():
+                raise RuntimeError("speaker worker is already active")
+            if self._sub is not None:
+                if self._topic == topic:
+                    self.get_logger().info(
+                        f"[speaker] already subscribing {topic}, skip"
+                    )
+                    return self._topic
+                # topic changed — stop old subscription first
+                self.get_logger().info(
+                    f"[speaker] topic changed {self._topic} → {topic}, "
+                    "re-subscribing"
+                )
+                stopped = self.stop_play()
+                if stopped["state"] == "error":
+                    raise RuntimeError(stopped["reason"])
+
+            with self._playback_cv:
+                self._subscription_generation += 1
+                generation = self._subscription_generation
+                self._active_subscription_generation = generation
+                self._topic = topic
+                self._muted = False  # 新 start 时清除静默
+                self.state = "ready"
+
+            def on_chunk(msg, subscription_generation=generation):
+                self._on_chunk(msg, subscription_generation)
+
+            self.get_logger().info(
+                f"[speaker] creating subscription: topic={topic}, "
+                "msg_type=AudioChunk, qos=LOW_LAT"
+            )
             try:
-                self._client.PlayStop(APP_NAME)
-            except Exception as e:
-                self.get_logger().warn(f"[speaker] interrupt PlayStop error: {e}")
+                subscription = self.create_subscription(
+                    AudioChunk, topic, on_chunk, _LOW_LAT_QOS,
+                )
+            except Exception:
+                with self._playback_cv:
+                    if self._active_subscription_generation == generation:
+                        self._active_subscription_generation = None
+                        self._topic = None
+                        self.state = "error"
+                raise
+            with self._playback_cv:
+                if self._active_subscription_generation != generation:
+                    # Defensive only: lifecycle operations are serialized, but
+                    # never publish a handle for an invalidated generation.
+                    self.destroy_subscription(subscription)
+                    raise RuntimeError("speaker subscription was cancelled")
+                self._sub = subscription
+            self.get_logger().info(
+                f"[speaker] subscription created, waiting for chunks on {topic}"
+            )
+            return topic
+
+    def stop_play(self, *, cancel_startup: bool = True) -> dict:
+        if cancel_startup:
+            self._startup_cancel.set()
+        with self._lifecycle_lock:
+            self._interrupt_flag.set()  # 先阻止 worker 和 callback 接收新数据
+            with self._playback_cv:
+                # Invalidate the callback generation before destroying the ROS
+                # subscription.  A callback already inside bytes(msg.data)
+                # will be rejected when it reaches the lifecycle check.
+                self._subscription_generation += 1
+                self._active_subscription_generation = None
+                subscription = self._sub
+                self._sub = None
+                self._topic = None
+                self.state = "stopping"
+            if self._flush_timer is not None:
+                self._flush_timer.cancel()
+                self.destroy_timer(self._flush_timer)
+                self._flush_timer = None
+            if subscription is not None:
+                self.destroy_subscription(subscription)
+            with self._drain_guard:
+                self._draining.clear()
+            self._pause_event.set()  # 确保 drain thread 不会卡在 pause wait
+            stop_code = self._safe_play_stop()
+            if self._drain_thread is not None:
+                self._drain_thread.join(timeout=3)
+            worker_alive = (
+                self._drain_thread is not None
+                and self._drain_thread.is_alive()
+            )
+            with self._playback_cv:
+                # Serialize queue clearing with _on_chunk lifecycle updates.
+                while not self._buf.empty():
+                    try:
+                        self._buf.get_nowait()
+                    except queue.Empty:
+                        break
+                self._cancel_open_playbacks("speaker_stopped")
+                if worker_alive or stop_code != 0:
+                    # PlayStream may still be inside its SDK timeout. Keep this
+                    # generation cancelled and retain audio ownership until a
+                    # later PlayStop succeeds.
+                    self._fail_closed_reason = (
+                        "speaker_worker_stop_timeout"
+                        if worker_alive else f"play_stop_failed:{stop_code}"
+                    )
+                    self.state = "error"
+                else:
+                    self._drain_thread = None
+                    # Publish idle before clearing cancellation.  Even a
+                    # callback without a generation can never observe an
+                    # accepting state after this subscription was stopped.
+                    self._fail_closed_reason = None
+                    self.state = "idle"
+                    self._interrupt_flag.clear()
+                self._playback_cv.notify_all()
+            if worker_alive or stop_code != 0:
+                self.get_logger().error(
+                    f"[speaker] stop failed: worker_alive={worker_alive}, "
+                    f"PlayStop={stop_code}; reuse blocked"
+                )
+                return {
+                    "state": "error",
+                    "reason": (
+                        "speaker_worker_stop_timeout"
+                        if worker_alive else f"play_stop_failed:{stop_code}"
+                    ),
+                    "play_stop_code": stop_code,
+                }
+            self.get_logger().info(
+                f"Speaker stopped (PlayStop code={stop_code})"
+            )
+            return {"state": "idle", "play_stop_code": stop_code}
+
+    def interrupt(self) -> dict:
+        """立即中止播放：清空 buffer，停止 SDK，保持 subscription。"""
+        self._startup_cancel.set()
+        with self._lifecycle_lock:
+            self._startup_cancel.set()
+            self._interrupt_flag.set()
+            with self._playback_cv:
+                fail_closed_reason = self._fail_closed_reason
+                had_open_input = self._current_input_id is not None
+                # Serialize this transition with EOF handling.  If EOF wins,
+                # current_input_id is already None; if interrupt wins, that
+                # same EOF observes _muted and opens the next generation.
+                self._muted = had_open_input
+                self._cancel_open_playbacks("interrupted")
+                # 清空 buffer；与 _on_chunk 的 queue.put 使用同一把锁。
+                while not self._buf.empty():
+                    try:
+                        self._buf.get_nowait()
+                    except queue.Empty:
+                        break
+            # 停止 SDK 播放
+            stop_code = self._safe_play_stop()
+            with self._drain_guard:
+                self._draining.clear()
             # 等 drain thread 退出
             if self._drain_thread is not None and self._drain_thread.is_alive():
                 self._drain_thread.join(timeout=1)
-                self._drain_thread = None
-            self._interrupt_flag.clear()
+            worker_alive = (
+                self._drain_thread is not None
+                and self._drain_thread.is_alive()
+            )
+            if worker_alive or stop_code != 0:
+                reason = (
+                    "speaker_worker_stop_timeout"
+                    if worker_alive else f"play_stop_failed:{stop_code}"
+                )
+                with self._playback_cv:
+                    self._fail_closed_reason = (
+                        self._fail_closed_reason
+                        or fail_closed_reason
+                        or reason
+                    )
+                    self.state = "error"
+                    self._playback_cv.notify_all()
+                return {
+                    "state": "error",
+                    "reason": reason,
+                    "play_stop_code": stop_code,
+                }
+            self._drain_thread = None
             self._pause_event.set()
-            self._draining.clear()
-            self._muted = True  # 静默：丢弃后续 TTS chunks 直到新 utterance
-            self.state = "ready"
-        self.get_logger().info("[speaker] interrupted — buffer cleared, muted until new utterance")
-        return {"state": "ready", "action": "interrupted"}
+            with self._playback_cv:
+                current_fail_closed_reason = (
+                    self._fail_closed_reason or fail_closed_reason
+                )
+                if current_fail_closed_reason is not None:
+                    # SmartMotion interrupt may issue a defensive PlayStop, but
+                    # it cannot recover a quarantined session.  Only the
+                    # speaker stop/start lifecycle boundary may do that.
+                    self._fail_closed_reason = current_fail_closed_reason
+                    self.state = "error"
+                    self._playback_cv.notify_all()
+                    return {
+                        "state": "error",
+                        "reason": "speaker_stop_required",
+                        "fail_closed_reason": current_fail_closed_reason,
+                        "play_stop_code": stop_code,
+                    }
+                # stop_play may have run immediately before this interrupt.
+                # An unsubscribed node must never advertise a false ready state.
+                has_subscription = (
+                    self._sub is not None
+                    and self._active_subscription_generation is not None
+                )
+                self.state = "ready" if has_subscription else "idle"
+                self._interrupt_flag.clear()
+                self._playback_cv.notify_all()
+        self.get_logger().info(
+            f"[speaker] interrupted — buffer cleared, muted={self._muted}"
+        )
+        return {
+            "state": self.state,
+            "action": "interrupted",
+            "play_stop_code": stop_code,
+        }
 
     def pause(self) -> dict:
-        """暂停播放：停止 SDK，保留 buffer 中未播放的内容。"""
+        """Pause before playback starts; active PCM cannot be resumed losslessly."""
         with self._lock:
-            if self.state not in ("playing", "ready"):
+            if self.state == "playing":
+                return {
+                    "state": "error",
+                    "reason": "active_pcm_pause_unsupported",
+                    "message": "interrupt the utterance or let it finish",
+                }
+            if self.state != "ready":
                 return {"state": self.state, "error": "not playing"}
-            self._pause_event.clear()  # drain thread 将阻塞在 wait()
-            try:
-                self._client.PlayStop(APP_NAME)
-            except Exception as e:
-                self.get_logger().warn(f"[speaker] pause PlayStop error: {e}")
+            self._pause_event.clear()
             self.state = "paused"
         self.get_logger().info(f"[speaker] paused — buffer size={self._buf.qsize()}")
-        return {"state": "paused", "buffer_chunks": self._buf.qsize()}
+        return {
+            "state": "paused",
+            "buffer_chunks": self._buf.qsize(),
+        }
 
     def resume(self) -> dict:
         """恢复播放：从 buffer 中剩余内容继续。"""
@@ -433,45 +796,110 @@ class _SpeakerNode(Node):
         self.get_logger().info("[speaker] resumed")
         return {"state": "playing"}
 
-    # EOF magic: 8 bytes (4 samples [1,-1,1,-1])，标记 utterance 结束
-    AUDIO_EOF_MAGIC = b'\x01\x00\xff\xff\x01\x00\xff\xff'
-
-    def _on_chunk(self, msg: AudioChunk) -> None:
+    def _on_chunk(self, msg: AudioChunk,
+                  subscription_generation: int | None = None) -> None:
         pcm = bytes(msg.data)
         now = time.monotonic()
-        self._idx += 1
+        is_eof = len(pcm) == 8 and pcm == self.AUDIO_EOF_MAGIC
+        with self._playback_cv:
+            active_generation = self._active_subscription_generation
+            if subscription_generation is None:
+                # Direct calls are retained for tests; production callbacks
+                # always carry the generation captured by start_play().
+                subscription_generation = active_generation
+            if (active_generation is None
+                    or subscription_generation != active_generation
+                    or self.state in ("idle", "stopping", "error")):
+                return
+            self._idx += 1
 
-        # 检测 EOF magic：utterance 结束标记
-        if len(pcm) == 8 and pcm == self.AUDIO_EOF_MAGIC:
-            if self._muted:
-                self._muted = False
-                self.get_logger().info("[speaker] unmuted — received EOF marker")
-            return  # EOF 不入 buffer、不播放
+            # 检测 EOF magic：utterance 结束标记
+            if is_eof:
+                if self._muted:
+                    self._muted = False
+                    self._playback_cv.notify_all()
+                    unmuted = True
+                    playback_id = None
+                elif self._interrupt_flag.is_set():
+                    unmuted = False
+                    playback_id = None
+                else:
+                    unmuted = False
+                    playback_id = self._current_input_id
+                    if playback_id is not None:
+                        record = self._playbacks[playback_id]
+                        record["eof_received"] = True
+                        record["eof_monotonic"] = now
+                        self._current_input_id = None
+                        # Queue the boundary under the same lifecycle lock so
+                        # interrupt cannot miss it between state and queue.
+                        self._buf.put(("eof", playback_id, b""))
+                        self._playback_cv.notify_all()
+            elif not pcm:
+                return
+            else:
+                # Muted 状态：interrupt 后丢弃来自旧 utterance 的 chunks
+                if self._muted:
+                    self._last_chunk_time = now
+                    return  # 丢弃，等 EOF 到达
+                if self._interrupt_flag.is_set():
+                    return
+                playback_id = self._current_input_id
+                if playback_id is None:
+                    playback_id = self._new_playback()
+                record = self._playbacks[playback_id]
+                record["audio_bytes"] += len(pcm)
+                self._buf.put(("audio", playback_id, pcm))
+                self._last_chunk_time = now
+                # 更新状态：收到 chunk 时如果是 ready，变为 playing
+                if self.state == "ready":
+                    self.state = "playing"
+                self._playback_cv.notify_all()
 
-        # Muted 状态：interrupt 后丢弃来自旧 utterance 的 chunks
-        if self._muted:
-            self._last_chunk_time = now
-            return  # 丢弃，等 EOF 到达
+        if is_eof:
+            if unmuted:
+                self.get_logger().info(
+                    "[speaker] unmuted — received EOF marker"
+                )
+                return
+            if playback_id is None:
+                self.get_logger().warn("[speaker] ignored EOF without audio")
+                return
+            if not self._draining.is_set():
+                self._start_drain()
+            return
 
-        self._buf.put(pcm)
-        self._last_chunk_time = now
-        # 更新状态：收到 chunk 时如果是 ready，变为 playing
-        if self.state == "ready":
-            self.state = "playing"
-        if not self._draining.is_set() and self.state == "playing" and self._buf.qsize() >= self.PREFILL:
+        if (not self._draining.is_set() and self.state == "playing"
+                and self._buf.qsize() >= self.PREFILL):
             self._start_drain()
-        elif not self._draining.is_set() and self.state == "playing" and self._flush_timer is None:
+        elif (not self._draining.is_set() and self.state == "playing"
+              and self._flush_timer is None):
             # start a flush timer — if no more chunks arrive, drain what we have
             self._flush_timer = self.create_timer(0.2, self._check_flush)
 
-    def _start_drain(self) -> None:
-        if self._flush_timer is not None:
-            self._flush_timer.cancel()
-            self.destroy_timer(self._flush_timer)
-            self._flush_timer = None
-        self._draining.set()
-        self._drain_thread = threading.Thread(target=self._drain, daemon=True)
-        self._drain_thread.start()
+    def _start_drain(self) -> bool:
+        with self._drain_guard:
+            if (self._interrupt_flag.is_set()
+                    or self.state != "playing"
+                    or self._active_subscription_generation is None
+                    or self._buf.empty()):
+                return False
+            if (self._draining.is_set()
+                    or (self._drain_thread is not None
+                        and self._drain_thread.is_alive())):
+                return False
+            if self._flush_timer is not None:
+                self._flush_timer.cancel()
+                self.destroy_timer(self._flush_timer)
+                self._flush_timer = None
+            self._draining.set()
+            self._drain_thread = threading.Thread(
+                target=self._drain,
+                daemon=True,
+                name="g1_speaker_drain",
+            )
+            self._drain_thread.start()
+            return True
 
     def _check_flush(self) -> None:
         """Timer callback: if no new chunks for 300ms and buffer non-empty, start drain."""
@@ -487,57 +915,285 @@ class _SpeakerNode(Node):
     def _drain(self) -> None:
         play_idx = 0
         merged = b''
+        current_id = None
         empty_count = 0
-        while self._draining.is_set():
-            # 检查 interrupt
-            if self._interrupt_flag.is_set():
-                return
-            # 检查 pause（阻塞等待 resume 或 interrupt）
-            if not self._pause_event.wait(timeout=0.1):
-                continue  # 还在 paused，循环检查 interrupt
+        try:
+            while self._draining.is_set():
+                if self._interrupt_flag.is_set():
+                    return
+                if not self._pause_event.wait(timeout=0.1):
+                    continue
 
-            try:
-                pcm = self._buf.get(timeout=0.1)
-                merged += pcm
-                empty_count = 0
-            except queue.Empty:
-                empty_count += 1
-                if merged and empty_count >= 2:
-                    play_idx += 1
-                    self._play_merged(merged, play_idx)
-                    merged = b''
-                elif not merged and empty_count >= 3:
-                    break
-                continue
-            if len(merged) >= self.MERGE_BYTES:
+                try:
+                    kind, playback_id, pcm = self._buf.get(timeout=0.1)
+                    empty_count = 0
+                except queue.Empty:
+                    empty_count += 1
+                    if merged and empty_count >= 2:
+                        play_idx += 1
+                        if not self._play_merged(merged, play_idx, current_id):
+                            if self._interrupt_flag.is_set():
+                                return
+                            self._failed_playback_ids.add(current_id)
+                        merged = b''
+                        empty_count = 0
+                    elif not merged and empty_count >= 3:
+                        break
+                    continue
+
+                if current_id is None:
+                    current_id = playback_id
+                elif playback_id != current_id:
+                    if merged:
+                        play_idx += 1
+                        if not self._play_merged(merged, play_idx, current_id):
+                            if self._interrupt_flag.is_set():
+                                return
+                            self._failed_playback_ids.add(current_id)
+                        merged = b''
+                    self._set_terminal(
+                        current_id, "error", "utterance_boundary_missing_eof",
+                    )
+                    current_id = playback_id
+
+                if kind == "audio":
+                    merged += pcm
+                    if len(merged) >= self.MERGE_BYTES:
+                        play_idx += 1
+                        if not self._play_merged(merged, play_idx, current_id):
+                            if self._interrupt_flag.is_set():
+                                return
+                            self._failed_playback_ids.add(current_id)
+                        merged = b''
+                elif kind == "eof":
+                    if merged:
+                        play_idx += 1
+                        if not self._play_merged(merged, play_idx, current_id):
+                            if self._interrupt_flag.is_set():
+                                return
+                            self._failed_playback_ids.add(current_id)
+                        merged = b''
+                    if current_id in self._failed_playback_ids:
+                        self._set_terminal(
+                            current_id, "error", "play_stream_failed",
+                        )
+                    else:
+                        self._finish_playback(current_id)
+                    current_id = None
+                    play_idx = 0
+        finally:
+            if merged and current_id is not None and not self._interrupt_flag.is_set():
                 play_idx += 1
-                self._play_merged(merged, play_idx)
-                merged = b''
-        if merged and not self._interrupt_flag.is_set():
-            play_idx += 1
-            self._play_merged(merged, play_idx)
-        self._draining.clear()
-        # 播放完毕，回到 ready（如果没有被 interrupt/stop）
-        if self.state == "playing":
-            self.state = "ready"
-        self.get_logger().info("[speaker] drain finished")
+                if not self._play_merged(merged, play_idx, current_id):
+                    if not self._interrupt_flag.is_set():
+                        self._failed_playback_ids.add(current_id)
+            interrupted = self._interrupt_flag.is_set()
+            with self._drain_guard:
+                self._draining.clear()
+                if self._drain_thread is threading.current_thread():
+                    self._drain_thread = None
+                should_restart = (
+                    not interrupted
+                    and not self._buf.empty()
+                    and self.state == "playing"
+                )
+            if interrupted:
+                return
+            with self._playback_cv:
+                has_open_input = self._current_input_id is not None
+            if self.state == "playing" and not has_open_input and self._buf.empty():
+                self.state = "ready"
+            self.get_logger().info("[speaker] drain finished")
+            # Worker start/idle transitions are serialized and the queue is
+            # rechecked after clearing _draining, closing the last-item race.
+            if should_restart:
+                self._start_drain()
 
-    def _play_merged(self, pcm: bytes, idx: int) -> None:
+    def _play_merged(self, pcm: bytes, idx: int,
+                     playback_id: int | None) -> bool:
         # 播放前再次检查 interrupt
-        if self._interrupt_flag.is_set():
-            return
+        if self._interrupt_flag.is_set() or playback_id is None:
+            return False
         duration = len(pcm) / 32000
+        submission_checkpoint = self._playback_monitor.checkpoint()
+        with self._playback_cv:
+            record = self._playbacks.get(playback_id)
+            if record is None or record["state"] in self.TERMINAL_STATES:
+                return False
+            if record["start_event_seq"] is None:
+                record["start_event_seq"] = submission_checkpoint
+                record["state"] = "playing"
+            stream_id = record["stream_id"]
         t0 = time.monotonic()
         try:
-            code, data = self._client.PlayStream(APP_NAME, "0", pcm)
+            code, data = self._client.PlayStream(APP_NAME, stream_id, pcm)
             if code != 0:
                 self.get_logger().error(f"[speaker] PlayStream error code={code}, data={data}")
-        except Exception as e:
-            self.get_logger().error(f"[speaker] PlayStream error: {e}")
+                self._handle_play_stream_failure(
+                    playback_id, f"rpc_code:{code}",
+                )
+                return False
+        except Exception as exc:
+            self.get_logger().error(f"[speaker] PlayStream error: {exc}")
+            self._handle_play_stream_failure(
+                playback_id,
+                f"{type(exc).__name__}:{exc}",
+            )
+            return False
         elapsed = time.monotonic() - t0
-        remaining = duration - elapsed - 0.08
+        remaining = duration - elapsed
         if remaining > 0 and not self._interrupt_flag.is_set():
-            time.sleep(remaining)
+            self._interrupt_flag.wait(timeout=remaining)
+        pcm_deadline = max(t0 + duration, time.monotonic())
+        with self._playback_cv:
+            record = self._playbacks.get(playback_id)
+            if record is not None and record["state"] not in self.TERMINAL_STATES:
+                record["submitted_blocks"] += 1
+                record["final_submit_seq"] = submission_checkpoint
+                record["final_pcm_deadline"] = pcm_deadline
+                self._playback_cv.notify_all()
+        return not self._interrupt_flag.is_set()
+
+    def _handle_play_stream_failure(self, playback_id: int,
+                                    stream_error: str) -> None:
+        """Stop and quarantine the session after an ambiguous stream RPC."""
+        # Latch before any cleanup call/wait.  SmartMotion interrupt can cancel
+        # the wait below, but it must never erase the ambiguous RPC failure.
+        self._latch_fail_closed("play_stream_failed")
+        if self._interrupt_flag.is_set():
+            return
+        with self._playback_cv:
+            record = self._playbacks.get(playback_id)
+            if record is None or record["state"] in self.TERMINAL_STATES:
+                return
+            after_seq = record["start_event_seq"]
+
+        stop_checkpoint = self._playback_monitor.checkpoint()
+        stop_started = time.monotonic()
+        stop_code = self._safe_play_stop()
+        cleanup_result = {
+            "state": "error",
+            "reason": f"play_stop_failed:{stop_code}",
+        }
+        if stop_code == 0 and after_seq is not None:
+            cleanup_result = self._playback_monitor.wait_for_stable_idle(
+                after_seq=after_seq,
+                idle_after_seq=stop_checkpoint,
+                not_before=stop_started,
+                timeout=self.STOP_IDLE_TIMEOUT,
+                cancelled=self._interrupt_flag.is_set,
+            )
+        if cleanup_result["state"] == "interrupted":
+            # The explicit interrupt/stop owns cancellation and recovery.
+            return
+
+        self._set_terminal(
+            playback_id,
+            "error",
+            "play_stream_failed",
+            stream_error=stream_error,
+            forced_stream_close=True,
+            play_stop_code=stop_code,
+            cleanup_state=cleanup_result.get("state"),
+            cleanup_reason=cleanup_result.get("reason", ""),
+            firmware_playing_seq=cleanup_result.get("playing_seq"),
+            firmware_idle_seq=cleanup_result.get("idle_seq"),
+        )
+        # Even a confirmed Stop cannot prove whether the failed RPC was
+        # accepted before its ACK was lost.  Require an explicit stop/restart
+        # boundary instead of ever sending a later utterance in this session.
+        self._enter_fail_closed("play_stream_failed")
+
+    def _finish_playback(self, playback_id: int) -> None:
+        with self._playback_cv:
+            record = self._playbacks.get(playback_id)
+            if record is None or record["state"] in self.TERMINAL_STATES:
+                return
+            after_seq = record["start_event_seq"]
+            idle_after_seq = record["final_submit_seq"]
+            pcm_deadline = record["final_pcm_deadline"]
+            if (after_seq is None or idle_after_seq is None
+                    or pcm_deadline is None):
+                self._set_terminal(
+                    playback_id, "error", "no_successful_pcm_submission",
+                )
+                return
+            record["state"] = "finishing"
+            self._playback_cv.notify_all()
+
+        result = self._playback_monitor.wait_for_stable_idle(
+            after_seq=after_seq,
+            idle_after_seq=idle_after_seq,
+            not_before=pcm_deadline,
+            timeout=self.NATURAL_IDLE_TIMEOUT,
+            cancelled=self._interrupt_flag.is_set,
+        )
+        if result["state"] == "interrupted":
+            self._set_terminal(playback_id, "cancelled", "interrupted")
+            return
+
+        if result["state"] == "completed":
+            basis = "g1_audio_service_stable_idle"
+            self._set_terminal(
+                playback_id,
+                "completed",
+                completion_basis=basis,
+                forced_stream_close=False,
+                firmware_playing_seq=result.get("playing_seq"),
+                firmware_idle_seq=result.get("idle_seq"),
+                firmware_playing_ts=result.get("playing_ts"),
+                firmware_idle_ts=result.get("idle_ts"),
+            )
+            self.get_logger().info(
+                f"[speaker] playback {playback_id} completed ({basis})"
+            )
+            return
+
+        natural_failure = result
+        stop_code = self._safe_play_stop()
+        if stop_code != 0:
+            self._set_terminal(
+                playback_id,
+                "error",
+                f"play_stop_failed:{stop_code}",
+                forced_stream_close=True,
+            )
+            self._enter_fail_closed(f"play_stop_failed:{stop_code}")
+            return
+
+        cleanup_result = self._playback_monitor.wait_for_stable_idle(
+            after_seq=after_seq,
+            idle_after_seq=idle_after_seq,
+            not_before=pcm_deadline,
+            timeout=self.STOP_IDLE_TIMEOUT,
+            cancelled=self._interrupt_flag.is_set,
+        )
+        if cleanup_result["state"] == "interrupted":
+            self._set_terminal(
+                playback_id,
+                "cancelled",
+                "interrupted_during_forced_close",
+                forced_stream_close=True,
+                play_stop_code=stop_code,
+            )
+            return
+
+        self._set_terminal(
+            playback_id,
+            "error",
+            "playback_not_complete_before_forced_close",
+            forced_stream_close=True,
+            play_stop_code=stop_code,
+            natural_wait_reason=natural_failure.get("reason", ""),
+            cleanup_state=cleanup_result.get("state"),
+            cleanup_reason=cleanup_result.get("reason", ""),
+            firmware_playing_seq=cleanup_result.get("playing_seq"),
+            firmware_idle_seq=cleanup_result.get("idle_seq"),
+        )
+        if cleanup_result["state"] != "completed":
+            self._enter_fail_closed(
+                "hardware_idle_unconfirmed_after_forced_close"
+            )
 
 
 class SpeakerPlugin:
@@ -545,6 +1201,7 @@ class SpeakerPlugin:
 
     def __init__(self, plugin_config: dict, namespace: str, executor, audio_client: AudioClient):
         self._node = _SpeakerNode(audio_client)
+        self._lifecycle_lock = self._node._lifecycle_lock
         executor.add_node(self._node)
 
     def get_tool(self) -> dict:
@@ -558,15 +1215,40 @@ class SpeakerPlugin:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["start", "stop", "info"],
+                        "enum": ["start", "stop", "info", "wait_playback"],
                         "description": "Action to perform",
                     },
                     "input_topic": {
                         "type": "string",
                         "description": "ROS2 topic to subscribe for PCM audio (provided by canvas connection)",
                     },
+                    "playback_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Wait for this exact playback ID",
+                    },
+                    "after_playback_id": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Baseline from speaker info.last_playback_id; wait for the first newer playback",
+                    },
+                    "timeout_sec": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 120,
+                        "default": 30,
+                    },
                 },
                 "required": ["action"],
+                "x-action-params": {
+                    "start": {"params": ["input_topic"]},
+                    "stop": {"params": []},
+                    "info": {"params": []},
+                    "wait_playback": {
+                        "params": ["after_playback_id", "timeout_sec"],
+                        "description": "Call speaker info first, then wait until G1 firmware reports stable idle for the first PCM utterance after that last_playback_id",
+                    },
+                },
             },
             "topic_in": [{"format": "audio/pcm-16k"}],
         }
@@ -574,29 +1256,77 @@ class SpeakerPlugin:
     def start(self) -> None:
         pass  # startup sound is played on first dispatch(start) when project starts
 
-    def _play_startup_sound(self) -> None:
-        """Play startup PCM by directly calling PlayStream in small blocks with pacing."""
+    def _play_startup_sound(self) -> dict:
+        """Play startup audio and leave the global service stably idle."""
         import pathlib
         pcm_path = pathlib.Path(__file__).parent / 'resource' / 'startup_beep.pcm'
         try:
             pcm = pcm_path.read_bytes()
             block_size = 9600  # ~300ms per block
+            stream_id = f"{self._node._stream_prefix}-startup-{time.time_ns()}"
+            after_seq = self._node._playback_monitor.checkpoint()
+            final_submit_seq = after_seq
+            pcm_deadline = time.monotonic()
             for offset in range(0, len(pcm), block_size):
+                if self._node._startup_cancel.is_set():
+                    self._node._safe_play_stop()
+                    return {"state": "cancelled", "reason": "startup_cancelled"}
                 block = pcm[offset:offset + block_size]
-                code, _ = self._node._client.PlayStream(APP_NAME, "0", block)
+                submit_seq = self._node._playback_monitor.checkpoint()
+                sent = time.monotonic()
+                code, _ = self._node._client.PlayStream(
+                    APP_NAME, stream_id, block,
+                )
                 if code != 0:
+                    self._node._safe_play_stop()
                     self._node.get_logger().warn(f"[speaker] startup sound stopped at offset {offset}: code={code}")
-                    return
+                    return {
+                        "state": "error",
+                        "reason": f"startup_play_stream_failed:{code}",
+                    }
+                final_submit_seq = submit_seq
                 duration = len(block) / 32000
-                remaining = duration - 0.08
-                if remaining > 0:
-                    time.sleep(remaining)
-            self._node.get_logger().info(f"[speaker] startup sound OK ({len(pcm)} bytes)")
+                remaining = duration - (time.monotonic() - sent)
+                if (remaining > 0
+                        and self._node._startup_cancel.wait(remaining)):
+                    self._node._safe_play_stop()
+                    return {"state": "cancelled", "reason": "startup_cancelled"}
+                pcm_deadline = max(sent + duration, time.monotonic())
+            completion = self._node._playback_monitor.wait_for_stable_idle(
+                after_seq=after_seq,
+                idle_after_seq=final_submit_seq,
+                not_before=pcm_deadline,
+                timeout=self._node.NATURAL_IDLE_TIMEOUT,
+                cancelled=self._node._startup_cancel.is_set,
+            )
+            stop_code = None
+            if completion["state"] != "completed":
+                stop_code = self._node._safe_play_stop()
+                if stop_code == 0:
+                    completion = self._node._playback_monitor.wait_for_stable_idle(
+                        after_seq=after_seq,
+                        idle_after_seq=final_submit_seq,
+                        not_before=pcm_deadline,
+                        timeout=self._node.STOP_IDLE_TIMEOUT,
+                        cancelled=self._node._startup_cancel.is_set,
+                    )
+            self._node.get_logger().info(
+                f"[speaker] startup sound closed ({len(pcm)} bytes, "
+                f"state={completion['state']}, PlayStop={stop_code})"
+            )
+            return completion
         except Exception as e:
             self._node.get_logger().warn(f"[speaker] startup sound error: {e}")
+            self._node._safe_play_stop()
+            return {
+                "state": "error",
+                "reason": f"startup_exception:{type(e).__name__}:{e}",
+            }
 
     def stop(self) -> None:
-        self._node.stop_play()
+        self._node._startup_cancel.set()
+        with self._lifecycle_lock:
+            self._node.stop_play()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action != "info":
@@ -605,21 +1335,67 @@ class SpeakerPlugin:
             topic = args.get("input_topic", "")
             if not topic:
                 return {"error": "Missing input_topic"}
-            # Always stop first to ensure clean restart
-            self._node.stop_play()
-            # Play startup sound synchronously before starting subscription
-            self._play_startup_sound()
-            topic = self._node.start_play(topic)
-            return {"state": "ready", "topic": topic}
+            with self._lifecycle_lock:
+                # Clear only once, before internal cleanup.  Any concurrent
+                # stop request after this point sets the event permanently for
+                # this startup generation and cannot be overwritten.
+                self._node._startup_cancel.clear()
+                # Always stop first to ensure clean restart.
+                stopped = self._node.stop_play(cancel_startup=False)
+                if stopped["state"] == "error":
+                    return stopped
+                startup = self._play_startup_sound()
+                if startup["state"] != "completed":
+                    self._node.stop_play()
+                    return {
+                        "state": "error",
+                        "reason": "startup_audio_not_settled",
+                        "startup": startup,
+                    }
+                topic = self._node.start_play(topic)
+                return {"state": "ready", "topic": topic}
         elif action == "stop":
-            self._node.stop_play()
-            return {"state": "idle"}
+            self._node._startup_cancel.set()
+            with self._lifecycle_lock:
+                return self._node.stop_play()
         elif action == "info":
+            with self._node._playback_cv:
+                last_id = self._node._playback_sequence
+                latest = (
+                    self._node._playback_snapshot_locked(last_id)
+                    if last_id else None
+                )
+                fail_closed_reason = self._node._fail_closed_reason
             return {
                 "state": self._node.state,
                 "topic": self._node._topic,
                 "buffer_chunks": self._node._buf.qsize(),
+                "last_playback_id": last_id,
+                "latest_playback": latest,
+                "hardware_playback": self._node._playback_monitor.status(),
+                "completion_scope": "driver_serialized_pcm_speaker_session",
+                "native_tts_blocked": (
+                    _G1_PCM_COMPLETION_MODE_ENABLED.is_set()
+                ),
+                "recovery_required": (
+                    fail_closed_reason is not None
+                ),
+                "fail_closed_reason": fail_closed_reason,
             }
+        elif action == "wait_playback":
+            timeout = min(120.0, max(0.0, float(args.get("timeout_sec", 30))))
+            playback_id = args.get("playback_id")
+            after_playback_id = args.get("after_playback_id")
+            if playback_id is not None and after_playback_id is not None:
+                return {
+                    "state": "error",
+                    "reason": "choose_playback_id_or_after_playback_id",
+                }
+            return self._node.wait_for_playback(
+                playback_id=playback_id,
+                after_playback_id=after_playback_id,
+                timeout=timeout,
+            )
         return None
 
 
