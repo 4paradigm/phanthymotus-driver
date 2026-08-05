@@ -550,27 +550,36 @@ unitree-g1:                      # Service name (must be unique)
 
 ## Action Completion Protocol (ACP)
 
-When a tool performs a long-running physical action (TTS playback, navigation, arm movement), the LLM agent needs to know when the action finishes. ACP solves this at the **harness level** — the Agent Core transparently tracks async actions and exposes a `sync()` tool for the LLM to wait on.
+When a tool performs a long-running physical action (TTS playback, navigation, arm gesture), the LLM agent needs to know when it finishes. ACP solves this at the **harness level** — Agent Core transparently tracks async actions via an automatic barrier. The LLM is unaware of the async machinery.
 
 ### How It Works
 
 ```
-LLM calls speak("hello")
-  → Driver dispatch() returns {"status":"running", "action_id":"speak-a7f3c"}
-  → Agent Core registers pending action
-  → LLM sees the immediate result, can continue reasoning
+LLM calls speak("hello world")
+  → Driver dispatch() returns {"state":"speaking", "action_id":"tts_speak_a7f3c"}
+  → Agent Core registers pending action (from x-completion + action_id in result)
+  → LLM sees immediate result, continues reasoning
 
-...speech plays...
+LLM calls navigate_to_tag("P3")
+  → Agent Core BARRIER: waits until speak-a7f3c completes before dispatching
+  → ...TTS finishes, driver POSTs /api/acp/complete → pending cleared...
+  → BARRIER releases, navigate dispatched
+  → Driver returns {"state":"navigating", "action_id":"nav_b2e8d"}
+  → LLM continues reasoning (can pre-plan next speech)
 
-Driver worker finishes
-  → POST /api/acp/complete to Agent Core
-     body: {"action_id":"speak-a7f3c", "status":"completed"}
-  → Agent Core resolves the pending action
-  → Completion notification injected into LLM turn (via steering)
-
-LLM calls sync(["speak-a7f3c"])   (or waits for steering notification)
-  → Blocks until action completes → returns results
+LLM calls speak("welcome to P3")
+  → BARRIER: waits until nav_b2e8d completes
+  → ...navigation arrives, driver POSTs completion...
+  → speak dispatched
 ```
+
+**Key**: The barrier is automatic and transparent. No `sync()` tool needed. The LLM just calls tools normally — the harness ensures physical actions execute sequentially.
+
+### Barrier Scope
+
+The barrier blocks **actuator** and **processor** type tools while pending actions exist. It does NOT block:
+- **sensor** tools (camera, lidar, battery queries) — always instant
+- **resource** tools (list_tags, list_maps, get_status) — read-only
 
 ### Driver Implementation Guide
 
@@ -585,74 +594,153 @@ Add to your tool's `inputSchema`:
     "required": ["action"],
     "x-completion": {
         "actions": ["speak", "navigate_to_tag"],  # which actions are async
-        "timeout": 120                             # max wait seconds
+        "timeout": 120                             # max wait seconds (fallback)
     }
 }
 ```
+
+Only declare actions that are genuinely long-running (>3s). Short blocking calls (1-2s service calls) should remain synchronous.
 
 #### 2. Return `action_id` in async action responses
 
 When an async action is dispatched, include `action_id` in the return dict:
 
 ```python
+from uuid import uuid4
+
 def dispatch(self, action, args):
     if action == "speak":
-        action_id = f"speak-{uuid4().hex[:8]}"
-        self.queue.put((args["text"], action_id))
-        return {"status": "running", "action_id": action_id}
+        action_id = f"tts_speak_{uuid4().hex[:8]}"
+        threading.Thread(target=self._do_speak, args=(args["text"], action_id), daemon=True).start()
+        return {"state": "speaking", "action_id": action_id}
 ```
 
-The `action_id` must be unique and stable — it's the correlation key for completion.
+The `action_id` must be unique — it's the correlation key for completion.
 
 #### 3. POST completion to Agent Core
 
 When the action finishes, POST to Agent Core's ACP endpoint:
 
 ```python
-import urllib.request, ssl, json, os
-
-def _acp_callback(action_id: str, status: str, result: dict):
+def _acp_callback(self, action_id: str, status: str, result: dict):
     """POST action completion to Agent Core."""
-    agent_core_url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
-    ctx = ssl.create_default_context()
+    import urllib.request as _urllib
+    import ssl as _ssl
+    import json
+    import os as _os
+
+    agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+    ctx = _ssl.create_default_context()
     ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
+    ctx.verify_mode = _ssl.CERT_NONE
     payload = json.dumps({
         "action_id": action_id,
         "status": status,       # "completed" | "error" | "cancelled"
-        "result": result,       # optional result data
+        "result": result,       # task-specific data
+        "tool": self.PREFIX,    # tool name for logging
+        "ts": __import__('time').time(),
     }).encode()
-    req = urllib.request.Request(
-        f"{agent_core_url}/api/acp/complete",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    urllib.request.urlopen(req, timeout=3, context=ctx)
+    try:
+        req = _urllib.Request(
+            f"{agent_core_url}/api/acp/complete",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        _urllib.urlopen(req, timeout=5, context=ctx)
+    except Exception as e:
+        import sys
+        print(f"[ACP] callback failed for {action_id}: {e}", file=sys.stderr)
 ```
 
-Call this from your worker thread when the action finishes. `AGENT_CORE_URL` env var is already set in all driver containers (same one used for registration heartbeat).
+**Important**: Use `import os as _os` inside the callback function — nested functions and threads may not see module-level `os` in some contexts.
+
+Call this from your worker thread when the action finishes. `AGENT_CORE_URL` env var is set in all driver containers.
 
 #### 4. No SSE endpoint needed
 
-Unlike earlier designs, drivers do NOT need to implement an `/sse` endpoint. The completion notification is a simple HTTP POST — fire and forget.
+Drivers do NOT need to implement an `/sse` endpoint. The completion notification is a simple HTTP POST.
 
-### LLM-Side Usage (handled by Agent Core)
+### Advanced Patterns
 
-The LLM sees a `sync()` system tool:
+#### Dynamic Timeout (TTS)
 
+For text-to-speech, timeout should scale with text length:
+
+```python
+timeout = len(text) / 3.0 + 10  # ~3 chars/sec + buffer
 ```
-sync(action_ids="speak-a7f3c,nav-001", timeout=120)
-→ Blocks until all specified actions complete
-→ Returns {"status": "completed", "results": {...}}
+
+If actual playback duration is known (e.g. from a progress callback):
+
+```python
+timeout = reported_duration + 5.0  # actual duration + small buffer
 ```
 
-If no `action_ids` specified, waits for ALL pending actions.
+#### Race Condition Buffer (Event-Based Completion)
 
-Completion notifications also arrive as **steering messages** between tool calls, so the LLM can react to completions without explicitly calling `sync()`.
+When completion depends on an external event (e.g. ROS2 PlayEvent topic), the event may arrive BEFORE your pending wait is registered. Use a buffer:
+
+```python
+class TtsPlugin:
+    def __init__(self):
+        self._play_event_buffer: dict[str, int] = {}   # sid → event_code
+        self._pending_play: dict[str, threading.Event] = {}
+
+    def _on_play_event(self, msg):
+        """ROS2 callback — may fire before _pending_play[sid] exists."""
+        sid = msg.sid
+        event_code = msg.event_code
+        # Always buffer
+        self._play_event_buffer[sid] = event_code
+        # Also signal if pending exists
+        if sid in self._pending_play:
+            self._pending_play[sid].set()
+
+    def _wait_for_completion(self, sid, action_id, timeout):
+        # Check buffer first (event already arrived)
+        buffered = self._play_event_buffer.pop(sid, None)
+        if buffered is not None:
+            status = "completed" if buffered == 1 else "error"
+            self._acp_callback(action_id, status, {})
+            return
+        # Not buffered yet — register and wait
+        ev = threading.Event()
+        self._pending_play[sid] = ev
+        ev.wait(timeout=timeout)
+        self._pending_play.pop(sid, None)
+        buffered = self._play_event_buffer.pop(sid, None)
+        status = "completed" if buffered == 1 else "error"
+        self._acp_callback(action_id, status, {})
+```
+
+#### Stall Detection (Navigation)
+
+For navigation actions, detect when the robot stops moving but hasn't arrived:
+
+```python
+def _nav_poll_thread(self, action_id, target, stall_timeout=60):
+    last_pose = self._get_current_pose()
+    last_move_time = time.time()
+
+    while True:
+        time.sleep(1.0)
+        pose = self._get_current_pose()
+
+        if self._has_arrived(pose, target):
+            self._acp_callback(action_id, "completed", {"pose": pose})
+            return
+
+        if self._distance(pose, last_pose) > 0.05:  # moved
+            last_pose = pose
+            last_move_time = time.time()
+        elif time.time() - last_move_time > stall_timeout:
+            self._acp_callback(action_id, "error", {"error": "stall timeout"})
+            return
+```
 
 ### Backward Compatibility
 
 - Tools without `x-completion` → unchanged behavior (sync return)
-- Tools that don't return `action_id` → no pending registered, no waiting
-- Drivers that don't POST completion → sync() will timeout gracefully
+- Tools that don't return `action_id` → no pending registered, barrier passes through
+- Drivers that don't POST completion → barrier will timeout gracefully (uses `x-completion.timeout`)

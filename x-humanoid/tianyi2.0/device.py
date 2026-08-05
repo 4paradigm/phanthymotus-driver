@@ -187,6 +187,36 @@ _LEG_LEVELS = [
 ]
 
 
+def _acp_notify(action_id: str, status: str, result: dict, tool: str = ""):
+    """POST action completion to Agent Core (module-level ACP helper)."""
+    import urllib.request as _urllib
+    import ssl as _ssl
+    import os as _os
+
+    agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+    ctx = _ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = _ssl.CERT_NONE
+    payload = json.dumps({
+        "action_id": action_id,
+        "status": status,
+        "result": result,
+        "tool": tool,
+        "ts": time.time(),
+    }).encode()
+    try:
+        req = _urllib.Request(
+            f"{agent_core_url}/api/acp/complete",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        _urllib.urlopen(req, timeout=5, context=ctx)
+    except Exception as e:
+        import sys
+        print(f"[ACP] callback failed for {action_id}: {e}", file=sys.stderr)
+
+
 class _ActionSequence:
     """Run one cancellable actuator sequence at a time."""
 
@@ -196,7 +226,8 @@ class _ActionSequence:
         self._cancel_event: threading.Event | None = None
         self._thread: threading.Thread | None = None
 
-    def start(self, worker) -> None:
+    def start(self, worker, on_done=None) -> None:
+        """Start a worker sequence. on_done(cancelled: bool) called when finished."""
         self.cancel()
         cancel_event = threading.Event()
 
@@ -206,10 +237,16 @@ class _ActionSequence:
             except Exception as e:
                 print(f"[{self._name}] sequence failed: {e}")
             finally:
+                cancelled = cancel_event.is_set()
                 with self._lock:
                     if self._cancel_event is cancel_event:
                         self._cancel_event = None
                         self._thread = None
+                if on_done:
+                    try:
+                        on_done(cancelled)
+                    except Exception as e:
+                        print(f"[{self._name}] on_done callback failed: {e}")
 
         thread = threading.Thread(
             target=_run, name=f"{self._name}_sequence", daemon=True)
@@ -2013,10 +2050,11 @@ class HeadGesturePlugin:
                     },
                 },
                 "required": ["action"],
+                "x-completion": {
+                    "actions": ["scan", "shake"],
+                    "timeout": 30,
+                },
                 "x-action-params": {
-                    "nod": {"params": ["cycles", "nod_amplitude", "speed"], "description": "向下点头后回正，不经过抬头姿态"},
-                    "shake": {"params": ["cycles", "shake_amplitude", "speed"], "description": "在左右方向之间连续摇头后回正"},
-                    "scan": {"params": ["cycles", "scan_amplitude", "speed", "scan_hold"], "description": "依次观察左侧并停留、回中、观察右侧并停留、回中"},
                     "tilt": {"params": ["side", "tilt_amplitude", "speed", "hold"], "description": "向指定方向歪头、保持后回正"},
                     "reset": {"params": ["speed"], "description": "取消序列并将头部回正"},
                     "cancel": {"params": [], "description": "取消尚未发送的后续动作帧"},
@@ -2114,19 +2152,35 @@ class HeadGesturePlugin:
                     return
 
         baseline_seq, baseline = self._feedback_snapshot()
-        self._sequence.start(_worker)
+        # ACP: for long actions (scan, shake), return action_id and callback on done
+        action_id = None
+        on_done = None
+        if action in ("scan", "shake"):
+            from uuid import uuid4
+            action_id = f"head_gesture_{action}_{uuid4().hex[:8]}"
+
+            def on_done(cancelled):
+                if cancelled:
+                    _acp_notify(action_id, "cancelled", {"gesture": action}, "head_gesture")
+                else:
+                    _acp_notify(action_id, "completed", {"gesture": action, "cycles": cycles}, "head_gesture")
+
+        self._sequence.start(_worker, on_done=on_done)
         first_target = frames[0][:3]
         feedback = self._wait_for_head_feedback(
             first_target, baseline_seq, baseline)
         if feedback.get("state") == "error":
             self._sequence.cancel()
             return feedback
-        return {
+        result = {
             "state": "running", "gesture": action, "cycles": cycles,
             "amplitude": amplitude, "speed": speed,
             "feedback_verified": True,
             "feedback": feedback,
         }
+        if action_id:
+            result["action_id"] = action_id
+        return result
 
     def _on_head_status(self, msg):
         now = time.monotonic()
@@ -2819,6 +2873,10 @@ class ArmGesturePlugin:
                     },
                 },
                 "required": ["action"],
+                "x-completion": {
+                    "actions": ["salute", "welcome", "shake_hands"],
+                    "timeout": 30,
+                },
                 "x-action-params": {
                     "salute": {"params": ["salute_side", "speed"], "description": "抬起小臂、将手靠近额侧、停留后回正"},
                     "welcome": {"params": ["side", "cycles", "speed"], "description": "在身体侧上方抬起手掌并左右摆动后回正"},
@@ -2958,18 +3016,34 @@ class ArmGesturePlugin:
                     return
 
         baseline_seq, baseline = self._feedback_snapshot(side)
-        self._sequence.start(_worker)
+        # ACP: for long gestures, return action_id and callback on done
+        action_id = None
+        on_done = None
+        if action in ("salute", "welcome", "shake_hands"):
+            from uuid import uuid4
+            action_id = f"arm_gesture_{action}_{uuid4().hex[:8]}"
+
+            def on_done(cancelled):
+                if cancelled:
+                    _acp_notify(action_id, "cancelled", {"gesture": action, "side": side}, "arm_gesture")
+                else:
+                    _acp_notify(action_id, "completed", {"gesture": action, "side": side}, "arm_gesture")
+
+        self._sequence.start(_worker, on_done=on_done)
         feedback = self._wait_for_arm_feedback(
             side, frames[0][0], baseline_seq, baseline)
         if feedback.get("state") == "error":
             self._sequence.cancel()
             return feedback
-        return {
+        result = {
             "state": "running", "gesture": action, "side": side,
             "cycles": cycles, "speed": speed,
             "feedback_verified": True,
             "feedback": feedback,
         }
+        if action_id:
+            result["action_id"] = action_id
+        return result
 
     def _on_arm_status(self, msg):
         now = time.monotonic()
@@ -4126,6 +4200,10 @@ class VoicePlayActuatorPlugin:
 class NavPlugin:
     """底盘导航控制 — 自主导航/遥控/旋转/回桩"""
 
+    _ACP_ACTIONS = frozenset(("move_to", "rotate", "rotate_to", "go_home"))
+    _POLL_INTERVAL = 1.0
+    _STALL_TIMEOUT = 60.0
+
     def __init__(self, plugin_config: dict, namespace: str, ros2, slamtec_client):
         self._ns = namespace
         self._ros2 = ros2
@@ -4159,17 +4237,21 @@ class NavPlugin:
                     "vyaw": {"type": "number", "description": "旋转速度(rad/s), 正=逆时针"},
                 },
                 "required": ["action"],
+                "x-completion": {
+                    "actions": ["move_to", "rotate", "rotate_to", "go_home"],
+                    "timeout": 180,
+                },
                 "x-action-params": {
                     "move_to": {"params": ["x", "y", "speed"],
-                                "description": "自主导航到目标点(带避障)"},
+                                "description": "自主导航到目标点(带避障)，系统自动等待到达"},
                     "move_by": {"params": ["direction", "speed"],
                                 "description": "方向遥控移动(不避障, 持续500ms)"},
                     "rotate": {"params": ["angle"],
-                               "description": "原地旋转指定角度(度)"},
+                               "description": "原地旋转指定角度(度)，系统自动等待完成"},
                     "rotate_to": {"params": ["angle"],
-                                  "description": "原地旋转到绝对角度(度)"},
+                                  "description": "原地旋转到绝对角度(度)，系统自动等待完成"},
                     "go_home": {"params": [],
-                                "description": "自主导航回充电桩"},
+                                "description": "自主导航回充电桩，系统自动等待到达"},
                     "cancel": {"params": [],
                              "description": "取消当前导航动作"},
                     "get_pose": {"params": [],
@@ -4195,7 +4277,11 @@ class NavPlugin:
             y = args.get("y", 0)
             speed = args.get("speed")
             result = self._slamtec.move_to(x, y, speed_ratio=speed)
-            return {"state": "navigating", "target": {"x": x, "y": y}, "api_result": result}
+            action_id = self._start_poll(action, result, {"x": x, "y": y})
+            resp = {"state": "navigating", "target": {"x": x, "y": y}, "api_result": result}
+            if action_id:
+                resp["action_id"] = action_id
+            return resp
 
         elif action == "move_by":
             direction = args.get("direction", "forward")
@@ -4208,17 +4294,29 @@ class NavPlugin:
             angle_deg = args.get("angle", 0)
             angle_rad = _deg2rad(angle_deg)
             result = self._slamtec.rotate(angle_rad)
-            return {"state": "rotating", "angle": angle_deg, "api_result": result}
+            action_id = self._start_poll(action, result, {"angle": angle_deg})
+            resp = {"state": "rotating", "angle": angle_deg, "api_result": result}
+            if action_id:
+                resp["action_id"] = action_id
+            return resp
 
         elif action == "rotate_to":
             angle_deg = args.get("angle", 0)
             angle_rad = _deg2rad(angle_deg)
             result = self._slamtec.rotate_to(angle_rad)
-            return {"state": "rotating_to", "angle": angle_deg, "api_result": result}
+            action_id = self._start_poll(action, result, {"angle": angle_deg})
+            resp = {"state": "rotating_to", "angle": angle_deg, "api_result": result}
+            if action_id:
+                resp["action_id"] = action_id
+            return resp
 
         elif action == "go_home":
             result = self._slamtec.go_home()
-            return {"state": "going_home", "api_result": result}
+            action_id = self._start_poll(action, result, {})
+            resp = {"state": "going_home", "api_result": result}
+            if action_id:
+                resp["action_id"] = action_id
+            return resp
 
         elif action == "cancel":
             result = self._slamtec.cancel_current_action()
@@ -4238,6 +4336,92 @@ class NavPlugin:
         elif action in ("start", "info"):
             return {"state": "ready"}
         return {"error": f"unknown action: {action}"}
+
+    def _start_poll(self, action: str, api_result: dict, context: dict) -> str | None:
+        """Start ACP polling thread for a Slamtec action. Returns action_id or None."""
+        from uuid import uuid4
+        action_id = f"nav_{action}_{uuid4().hex[:8]}"
+        threading.Thread(
+            target=self._poll_loop,
+            args=(action_id, action, context),
+            daemon=True,
+        ).start()
+        return action_id
+
+    def _poll_loop(self, action_id: str, action: str, context: dict):
+        """Poll Slamtec for action completion, then fire ACP callback."""
+        t0 = time.time()
+        last_pose = None
+        last_move_time = time.time()
+
+        while True:
+            time.sleep(self._POLL_INTERVAL)
+            elapsed = time.time() - t0
+
+            # Check if action is still running
+            try:
+                current = self._slamtec.get_current_action()
+            except Exception:
+                current = {}
+
+            # Slamtec status: action_status 0=waiting, 1=running, 2=finished, 3=paused, 4=error
+            status = current.get("action_status") if current else None
+
+            if status == 2:  # finished
+                result_code = current.get("result", 0)
+                if result_code == 0:
+                    _acp_notify(action_id, "completed", {
+                        "action": action, "elapsed": round(elapsed, 1), **context,
+                    }, "nav")
+                else:
+                    _acp_notify(action_id, "error", {
+                        "action": action, "error": f"result_code={result_code}",
+                        "elapsed": round(elapsed, 1), **context,
+                    }, "nav")
+                return
+
+            if status == 4:  # error
+                _acp_notify(action_id, "error", {
+                    "action": action, "error": "action_error",
+                    "elapsed": round(elapsed, 1), **context,
+                }, "nav")
+                return
+
+            if status is None and elapsed > 3.0:
+                # No current action — may have completed between polls
+                _acp_notify(action_id, "completed", {
+                    "action": action, "elapsed": round(elapsed, 1), **context,
+                }, "nav")
+                return
+
+            # Stall detection (move_to/go_home only)
+            if action in ("move_to", "go_home"):
+                try:
+                    pose = self._slamtec.get_pose()
+                    if last_pose:
+                        dx = pose.get("x", 0) - last_pose.get("x", 0)
+                        dy = pose.get("y", 0) - last_pose.get("y", 0)
+                        if (dx * dx + dy * dy) > 0.01:  # moved > 0.1m
+                            last_pose = pose
+                            last_move_time = time.time()
+                        elif time.time() - last_move_time > self._STALL_TIMEOUT:
+                            _acp_notify(action_id, "error", {
+                                "action": action, "error": "stall_timeout",
+                                "elapsed": round(elapsed, 1), **context,
+                            }, "nav")
+                            return
+                    else:
+                        last_pose = pose
+                        last_move_time = time.time()
+                except Exception:
+                    pass
+
+            # Hard timeout
+            if elapsed > 180:
+                _acp_notify(action_id, "error", {
+                    "action": action, "error": "timeout", "elapsed": 180, **context,
+                }, "nav")
+                return
 
 
 # ══════════════════════════════════════════════════════════════════════════════
