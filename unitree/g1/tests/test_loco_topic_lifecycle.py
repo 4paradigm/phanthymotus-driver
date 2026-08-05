@@ -89,6 +89,7 @@ class FakeClient:
 class FakeSmartMotion:
     def __init__(self):
         self.bound_topic = ""
+        self.expected_nav_id = ""
         self.unbind_reasons = []
         self.unbind_result = {
             "state": "idle",
@@ -96,15 +97,24 @@ class FakeSmartMotion:
             "stop_confirmed": True,
         }
 
-    def bind_velocity_proposal(self, topic):
+    def bind_velocity_proposal(self, topic, expected_nav_id):
         self.bound_topic = topic
-        return {"connected": True, "armed": True, "topic": topic}
+        self.expected_nav_id = expected_nav_id
+        return {
+            "state": "connected",
+            "connected": True,
+            "armed": True,
+            "topic": topic,
+            "expected_nav_id": expected_nav_id,
+            "active_nav_id": expected_nav_id,
+        }
 
     def unbind_velocity_proposal(self, reason):
         self.unbind_reasons.append(reason)
         result = dict(self.unbind_result)
         if not result.get("connected"):
             self.bound_topic = ""
+            self.expected_nav_id = ""
         return result
 
     def get_velocity_proposal_status(self):
@@ -112,6 +122,8 @@ class FakeSmartMotion:
             "connected": bool(self.bound_topic),
             "armed": bool(self.bound_topic),
             "topic": self.bound_topic or None,
+            "expected_nav_id": self.expected_nav_id or None,
+            "active_nav_id": self.expected_nav_id or None,
         }
 
 
@@ -124,6 +136,7 @@ class LocoTopicLifecycleTest(unittest.TestCase):
             smart_motion=self.smart_motion,
         )
         self.topic = "/ubuntu/navigation/nav2/velocity_proposal"
+        self.nav_id = "nav-001"
 
     def test_tool_exposes_velocity_proposal_input(self):
         self.assertEqual(self.plugin.STOP_PRIORITY, 0)
@@ -142,9 +155,14 @@ class LocoTopicLifecycleTest(unittest.TestCase):
         )
 
     def test_start_info_stop_owns_real_subscription_lifecycle(self):
-        started = self.plugin.dispatch("start", {"input_topic": self.topic})
+        started = self.plugin.dispatch(
+            "start",
+            {"input_topic": self.topic, "expected_nav_id": self.nav_id},
+        )
         self.assertTrue(started["connected"])
+        self.assertEqual(started["state"], "ready")
         self.assertEqual(self.smart_motion.bound_topic, self.topic)
+        self.assertEqual(self.smart_motion.expected_nav_id, self.nav_id)
 
         info = self.plugin.dispatch("info", {"_tool_name": "loco"})
         self.assertTrue(info["connected"])
@@ -156,9 +174,21 @@ class LocoTopicLifecycleTest(unittest.TestCase):
         self.assertEqual(self.smart_motion.unbind_reasons, ["canvas_stop"])
 
     def test_start_accepts_exactly_one_input_topics_entry(self):
-        started = self.plugin.dispatch("start", {"input_topics": [self.topic]})
+        started = self.plugin.dispatch(
+            "start",
+            {"input_topics": [self.topic], "expected_nav_id": self.nav_id},
+        )
         self.assertTrue(started["connected"])
         self.assertEqual(self.smart_motion.bound_topic, self.topic)
+
+    def test_start_without_trusted_nav_id_fails_closed(self):
+        result = self.plugin.dispatch("start", {"input_topic": self.topic})
+
+        self.assertEqual(result["state"], "error")
+        self.assertFalse(result["connected"])
+        self.assertEqual(result["error"], "expected_nav_id_required")
+        self.assertEqual(self.smart_motion.bound_topic, "")
+        self.assertEqual(self.client.stop_count, 1)
 
     def test_other_tools_do_not_bind_or_unbind_loco_topic(self):
         self.smart_motion.bound_topic = self.topic
@@ -179,7 +209,11 @@ class LocoTopicLifecycleTest(unittest.TestCase):
     def test_wrong_topic_fails_closed_without_binding(self):
         self.smart_motion.bound_topic = self.topic
         result = self.plugin.dispatch(
-            "start", {"input_topic": "/ubuntu/navigation/nav2/cmd_vel_shadow"}
+            "start",
+            {
+                "input_topic": "/ubuntu/navigation/nav2/cmd_vel_shadow",
+                "expected_nav_id": self.nav_id,
+            },
         )
         self.assertEqual(result["state"], "error")
         self.assertFalse(result["connected"])
@@ -189,7 +223,10 @@ class LocoTopicLifecycleTest(unittest.TestCase):
 
     def test_missing_safety_harness_cannot_execute_topic(self):
         plugin = LocoPlugin({}, "ubuntu", None, self.client, smart_motion=None)
-        result = plugin.dispatch("start", {"input_topic": self.topic})
+        result = plugin.dispatch(
+            "start",
+            {"input_topic": self.topic, "expected_nav_id": self.nav_id},
+        )
         self.assertEqual(result["state"], "error")
         self.assertFalse(result["connected"])
         self.assertEqual(self.client.stop_count, 1)

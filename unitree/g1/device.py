@@ -38,6 +38,7 @@ from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
 from pointcloud_utils import gravity_align_inplace
 from velocity_proposal import (
     DEFAULT_VELOCITY_PROPOSAL_TOPIC,
+    resolve_expected_nav_id,
     resolve_input_topic,
     velocity_proposal_port,
 )
@@ -1036,6 +1037,7 @@ class LocoPlugin:
     def _connect_velocity_proposal(self, args: dict) -> dict:
         try:
             topic = resolve_input_topic(args, self._velocity_proposal_topic)
+            expected_nav_id = resolve_expected_nav_id(args)
         except ValueError as exc:
             self._client.StopMove()
             if self._smart_motion:
@@ -1054,15 +1056,17 @@ class LocoPlugin:
                 "error": "SmartMotion safety harness is required for velocity_proposal",
                 "topic_in": [self._velocity_proposal_port()],
             }
-        result = self._smart_motion.bind_velocity_proposal(topic)
+        result = self._smart_motion.bind_velocity_proposal(topic, expected_nav_id)
         if result.get("error") or not (
             result.get("connected") and result.get("armed")
         ):
             self._client.StopMove()
         return {
-            "state": "ready" if result.get("connected") else "error",
-            "topic_in": [self._velocity_proposal_port()],
             **result,
+            "state": "ready" if (
+                result.get("connected") and result.get("armed")
+            ) else "error",
+            "topic_in": [self._velocity_proposal_port()],
         }
 
     def _disconnect_velocity_proposal(self, reason: str) -> dict:
