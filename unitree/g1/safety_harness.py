@@ -5,8 +5,8 @@ drivers/unitree/g1/safety_harness.py — SmartMotion 独立进程安全层。
 架构：
   - SmartMotionProcess: 独立子进程，拥有自己的 DDS 通道和 ROS2 节点
     - 订阅 LiDAR 点云，10Hz 全量 numpy 处理
-    - 在本地执行停止、FSM 和 SlamClient RPC
-    - 将安全判定通过的 proposal SetVelocity 有界交给主进程 Driver RPC
+    - 在本地执行停止和 SlamClient RPC
+    - 将 proposal SetVelocity 和 FSM GetFsmId 有界交给主进程 Driver RPC
     - 发布运动事件到 ROS2 topic
   - SmartMotionProxy: 主进程中的轻量代理，通过 multiprocessing Queue 通信
     - 对外暴露与原 SmartMotion 相同的 API
@@ -386,31 +386,24 @@ class ProposalApplyDiagnostics:
             }
 
 
-def request_parent_set_velocity(
+def _request_parent_loco_rpc(
     request_queue,
     result_queue,
-    request_id: int,
-    vx: float,
-    vy: float,
-    vyaw: float,
-    duration: float,
+    request: dict,
     timeout: float,
+    timeout_error: str,
+    ipc_error_prefix: str,
 ) -> dict:
-    """Request one finite SetVelocity from the parent and wait boundedly."""
+    """Send one correlated parent Loco RPC request and wait boundedly."""
     started = time.monotonic()
+    request_id = request["request_id"]
     try:
-        request_queue.put({
-            "request_id": request_id,
-            "vx": vx,
-            "vy": vy,
-            "vyaw": vyaw,
-            "duration": duration,
-        })
+        request_queue.put(request)
     except Exception as exc:
         return {
             "request_id": request_id,
             "ret": None,
-            "error": f"parent_set_velocity_ipc_error: {exc}",
+            "error": f"{ipc_error_prefix}: {exc}",
             "completed_monotonic": time.monotonic(),
             "completed_unix_ms": round(time.time() * 1000),
         }
@@ -422,7 +415,7 @@ def request_parent_set_velocity(
             return {
                 "request_id": request_id,
                 "ret": None,
-                "error": "parent_set_velocity_timeout",
+                "error": timeout_error,
                 "completed_monotonic": time.monotonic(),
                 "completed_unix_ms": round(time.time() * 1000),
             }
@@ -432,12 +425,60 @@ def request_parent_set_velocity(
             return {
                 "request_id": request_id,
                 "ret": None,
-                "error": "parent_set_velocity_timeout",
+                "error": timeout_error,
                 "completed_monotonic": time.monotonic(),
                 "completed_unix_ms": round(time.time() * 1000),
             }
         if result.get("request_id") == request_id:
             return result
+
+
+def request_parent_set_velocity(
+    request_queue,
+    result_queue,
+    request_id: int,
+    vx: float,
+    vy: float,
+    vyaw: float,
+    duration: float,
+    timeout: float,
+) -> dict:
+    """Request one finite SetVelocity from the parent and wait boundedly."""
+    return _request_parent_loco_rpc(
+        request_queue,
+        result_queue,
+        request={
+            "method": "set_velocity",
+            "request_id": request_id,
+            "vx": vx,
+            "vy": vy,
+            "vyaw": vyaw,
+            "duration": duration,
+        },
+        timeout=timeout,
+        timeout_error="parent_set_velocity_timeout",
+        ipc_error_prefix="parent_set_velocity_ipc_error",
+    )
+
+
+def request_parent_get_fsm_id(
+    request_queue,
+    result_queue,
+    request_id: int,
+    timeout: float,
+) -> dict:
+    """Request one fail-closed GetFsmId sample from the parent RpcProxy."""
+    return _request_parent_loco_rpc(
+        request_queue,
+        result_queue,
+        request={
+            "method": "get_fsm_id",
+            "request_id": request_id,
+        },
+        timeout=timeout,
+        timeout_error="parent_get_fsm_id_timeout",
+        ipc_error_prefix="parent_get_fsm_id_ipc_error",
+    )
 
 
 # ── SmartMotionProxy (main process) ─────────────────────────────────────────
@@ -447,7 +488,8 @@ class SmartMotionProxy:
 
     def __init__(self, namespace: str, config: dict, network_iface: str,
                  proposal_config: Optional[dict] = None,
-                 fallback_stop=None, parent_set_velocity=None):
+                 fallback_stop=None, parent_set_velocity=None,
+                 parent_get_fsm_id=None):
         ctx = mp.get_context("spawn")
         self._cmd_queue = ctx.Queue()
         self._result_queue = ctx.Queue()
@@ -457,6 +499,7 @@ class SmartMotionProxy:
         self._request_id = 0
         self._fallback_stop = fallback_stop
         self._parent_set_velocity = parent_set_velocity
+        self._parent_get_fsm_id = parent_get_fsm_id
         self._parent_velocity_shutdown = threading.Event()
         self._proc = ctx.Process(
             target=_run_smart_motion_process,
@@ -482,28 +525,50 @@ class SmartMotionProxy:
         print(f"[SmartMotionProxy] subprocess started → pid={self._proc.pid}")
 
     def _serve_parent_velocity_requests(self) -> None:
-        """Execute child-approved SetVelocity calls on the parent RpcProxy."""
+        """Execute child-approved Loco calls on the parent RpcProxy."""
         while True:
             request = self._parent_velocity_queue.get()
             if request is None:
                 return
             request_id = request.get("request_id")
+            method = request.get("method", "set_velocity")
             ret = None
+            fsm_id = None
             error = None
             try:
-                if self._parent_set_velocity is None:
-                    raise RuntimeError("parent SetVelocity RPC is unavailable")
-                ret = self._parent_set_velocity(
-                    request["vx"],
-                    request["vy"],
-                    request["vyaw"],
-                    request["duration"],
-                )
+                if method == "set_velocity":
+                    if self._parent_set_velocity is None:
+                        raise RuntimeError(
+                            "parent SetVelocity RPC is unavailable"
+                        )
+                    ret = self._parent_set_velocity(
+                        request["vx"],
+                        request["vy"],
+                        request["vyaw"],
+                        request["duration"],
+                    )
+                elif method == "get_fsm_id":
+                    if self._parent_get_fsm_id is None:
+                        raise RuntimeError(
+                            "parent GetFsmId RPC is unavailable"
+                        )
+                    result = self._parent_get_fsm_id()
+                    if not isinstance(result, (list, tuple)) or len(result) != 2:
+                        raise RuntimeError(
+                            "parent GetFsmId returned an invalid result"
+                        )
+                    ret, fsm_id = result
+                else:
+                    raise RuntimeError(
+                        f"unsupported parent Loco RPC method: {method}"
+                    )
             except Exception as exc:
                 error = str(exc)
             self._parent_velocity_result_queue.put({
+                "method": method,
                 "request_id": request_id,
                 "ret": ret,
+                "fsm_id": fsm_id,
                 "error": error,
                 "completed_monotonic": time.monotonic(),
                 "completed_unix_ms": round(time.time() * 1000),
@@ -722,10 +787,10 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
     loco_client.Init()
     loco_client.SetTimeout(10.0)
 
-    # Proposal execution is deliberately routed back through the parent
-    # Driver RpcProxy.  Stopping, watchdog stopping and FSM polling retain
-    # independent child clients so a delayed apply cannot block fail-closed
-    # stop paths.
+    # Proposal execution and its FSM authorization are deliberately routed
+    # through the parent Driver RpcProxy. Stopping and watchdog stopping keep
+    # independent child clients so a delayed parent RPC cannot block the
+    # fail-closed stop paths.
     proposal_rpc_timeout = min(
         0.2, max(0.02, float(proposal_config.get("velocity_proposal_rpc_timeout", 0.1)))
     )
@@ -750,17 +815,13 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
     watchdog_loco_client = LocoClient()
     watchdog_loco_client.Init()
     watchdog_loco_client.SetTimeout(stop_rpc_timeout)
-    fsm_loco_client = LocoClient()
-    fsm_loco_client.Init()
-    fsm_loco_client.SetTimeout(fsm_rpc_timeout)
-
     slam_client = SlamClient()
     slam_client.Init()
     slam_client.SetTimeout(10.0)  # must be AFTER Init() — Init() resets timeout to 5.0
 
     print(
-        f"[SmartMotion:pid={os.getpid()}] stop/FSM LocoClient + "
-        "parent proposal RPC + SlamClient ready"
+        f"[SmartMotion:pid={os.getpid()}] stop LocoClient + "
+        "parent proposal/FSM RPC + SlamClient ready"
     )
 
     # ── Initialize ROS2 ──
@@ -878,6 +939,8 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
     last_cloud_time = 0.0
     last_fsm_check = 0.0
     last_fsm_id = None
+    last_fsm_ret = None
+    last_fsm_error = None
     main_control_ready = False
     last_nav_status_time = 0.0
     odom_stop_monitor = OdomStopMonitor()
@@ -891,7 +954,8 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
     proposal_execution_active = False
     proposal_execution_deadline = 0.0
     proposal_watchdog_fault = None
-    proposal_apply_request_id = 0
+    parent_loco_request_id = 0
+    parent_loco_rpc_lock = threading.Lock()
     proposal_apply_diagnostics = ProposalApplyDiagnostics()
 
     def motion_synchronized(func):
@@ -930,20 +994,34 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
             return proposal_watchdog_fault
 
     def apply_parent_set_velocity(vx, vy, vyaw, duration):
-        nonlocal proposal_apply_request_id
-        proposal_apply_request_id += 1
-        result = request_parent_set_velocity(
-            request_queue=parent_velocity_queue,
-            result_queue=parent_velocity_result_queue,
-            request_id=proposal_apply_request_id,
-            vx=vx,
-            vy=vy,
-            vyaw=vyaw,
-            duration=duration,
-            timeout=proposal_rpc_timeout,
-        )
+        nonlocal parent_loco_request_id
+        # The FSM monitor and proposal callback share one request/result pair.
+        # Serialize them so one waiter cannot consume the other's reply.
+        with parent_loco_rpc_lock:
+            parent_loco_request_id += 1
+            result = request_parent_set_velocity(
+                request_queue=parent_velocity_queue,
+                result_queue=parent_velocity_result_queue,
+                request_id=parent_loco_request_id,
+                vx=vx,
+                vy=vy,
+                vyaw=vyaw,
+                duration=duration,
+                timeout=proposal_rpc_timeout,
+            )
         proposal_apply_diagnostics.record_set_velocity(result, duration)
         return result
+
+    def query_parent_fsm_id():
+        nonlocal parent_loco_request_id
+        with parent_loco_rpc_lock:
+            parent_loco_request_id += 1
+            return request_parent_get_fsm_id(
+                request_queue=parent_velocity_queue,
+                result_queue=parent_velocity_result_queue,
+                request_id=parent_loco_request_id,
+                timeout=fsm_rpc_timeout,
+            )
 
     # Obstacle state (written by LiDAR callback, read by main loop)
     obstacle_lock = threading.Lock()
@@ -1386,16 +1464,29 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
         print(f"[SmartMotion:pid={os.getpid()}] WARNING: rt/slam_info subscribe failed: {e}")
 
     def refresh_fsm_state():
-        nonlocal last_fsm_check, last_fsm_id, main_control_ready
+        nonlocal last_fsm_check, last_fsm_id, last_fsm_ret
+        nonlocal last_fsm_error, main_control_ready
+        fsm_id = None
+        ret = None
+        error = None
         try:
-            code, fsm_id = fsm_loco_client.GetFsmId()
-            ready = code == 0 and int(fsm_id) in proposal_allowed_fsm_ids
-        except Exception:
-            fsm_id = None
+            result = query_parent_fsm_id()
+            ret = result.get("ret")
+            fsm_id = result.get("fsm_id")
+            error = result.get("error")
+            ready = (
+                error is None
+                and ret == 0
+                and int(fsm_id) in proposal_allowed_fsm_ids
+            )
+        except Exception as exc:
+            error = str(exc)
             ready = False
         with safety_lock:
             last_fsm_check = time.monotonic()
             last_fsm_id = fsm_id
+            last_fsm_ret = ret
+            last_fsm_error = error
             main_control_ready = ready
 
     def proposal_runtime_status(force_fsm_check=False):
@@ -1413,6 +1504,8 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
             fsm_age = now - last_fsm_check if last_fsm_check else float("inf")
             temperature = max_motor_temp
             fsm_id = last_fsm_id
+            fsm_ret = last_fsm_ret
+            fsm_error = last_fsm_error
             control_ready = main_control_ready
             tilted = tilt_triggered
         odom_age = odom["age"]
@@ -1432,6 +1525,8 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
             reason = "joint_overheat_latched"
         elif nav_status_age > proposal_nav_status_timeout:
             reason = "nav2_status_stale"
+        elif fsm_error is not None or (fsm_ret is not None and fsm_ret != 0):
+            reason = "main_control_rpc_failed"
         elif fsm_age > proposal_fsm_timeout:
             reason = "main_control_status_stale"
         elif not control_ready:
@@ -1441,6 +1536,8 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
             "ready": not reason,
             "reason": reason or None,
             "fsm_id": fsm_id,
+            "fsm_ret": fsm_ret,
+            "fsm_error": fsm_error,
             # In this G1 API, a fresh allowed locomotion FSM is the native
             # fail-closed proxy for main-control/e-stop execution permission.
             "emergency_stop_clear": control_ready and fsm_age <= proposal_fsm_timeout,

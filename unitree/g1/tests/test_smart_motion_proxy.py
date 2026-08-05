@@ -10,6 +10,7 @@ import unittest
 from safety_harness import (
     SmartMotionProxy,
     _run_smart_motion_process,
+    request_parent_get_fsm_id,
     request_parent_set_velocity,
 )
 
@@ -120,13 +121,14 @@ class SmartMotionParentStopSequenceTest(unittest.TestCase):
         self.assertEqual(result["error"], "child unavailable")
 
 
-class SmartMotionParentVelocitySequenceTest(unittest.TestCase):
-    def start_proxy(self, parent_set_velocity):
+class SmartMotionParentLocoSequenceTest(unittest.TestCase):
+    def start_proxy(self, parent_set_velocity, parent_get_fsm_id=lambda: (0, 500)):
         proxy = SmartMotionProxy.__new__(SmartMotionProxy)
         proxy._parent_velocity_queue = queue.Queue()
         proxy._parent_velocity_result_queue = queue.Queue()
         proxy._parent_velocity_shutdown = threading.Event()
         proxy._parent_set_velocity = parent_set_velocity
+        proxy._parent_get_fsm_id = parent_get_fsm_id
         proxy._parent_velocity_thread = threading.Thread(
             target=proxy._serve_parent_velocity_requests,
             daemon=True,
@@ -257,19 +259,108 @@ class SmartMotionParentVelocitySequenceTest(unittest.TestCase):
         self.assertEqual(result["request_id"], 11)
         self.assertEqual(result["ret"], 3104)
 
+    def test_child_request_gets_fsm_id_from_parent(self):
+        proxy = self.start_proxy(lambda *_: 0, lambda: (0, 500))
+        try:
+            result = request_parent_get_fsm_id(
+                proxy._parent_velocity_queue,
+                proxy._parent_velocity_result_queue,
+                request_id=12,
+                timeout=0.2,
+            )
+        finally:
+            self.stop_proxy(proxy)
+
+        self.assertEqual(result["request_id"], 12)
+        self.assertEqual(result["ret"], 0)
+        self.assertEqual(result["fsm_id"], 500)
+        self.assertIsNone(result["error"])
+
+    def test_parent_fsm_exception_is_returned_to_child(self):
+        def fail():
+            raise RuntimeError("parent FSM RPC unavailable")
+
+        proxy = self.start_proxy(lambda *_: 0, fail)
+        try:
+            result = request_parent_get_fsm_id(
+                proxy._parent_velocity_queue,
+                proxy._parent_velocity_result_queue,
+                request_id=13,
+                timeout=0.2,
+            )
+        finally:
+            self.stop_proxy(proxy)
+
+        self.assertIsNone(result["ret"])
+        self.assertIsNone(result["fsm_id"])
+        self.assertEqual(result["error"], "parent FSM RPC unavailable")
+
+    def test_parent_fsm_wait_is_bounded(self):
+        started = time.monotonic()
+        result = request_parent_get_fsm_id(
+            queue.Queue(),
+            queue.Queue(),
+            request_id=14,
+            timeout=0.03,
+        )
+
+        self.assertLess(time.monotonic() - started, 0.15)
+        self.assertIsNone(result["ret"])
+        self.assertEqual(result["error"], "parent_get_fsm_id_timeout")
+
+    def test_stale_set_velocity_reply_cannot_satisfy_fsm_request(self):
+        request_queue = queue.Queue()
+        result_queue = queue.Queue()
+        result_queue.put({
+            "method": "set_velocity",
+            "request_id": 14,
+            "ret": 0,
+            "error": None,
+        })
+
+        def reply_current():
+            time.sleep(0.01)
+            result_queue.put({
+                "method": "get_fsm_id",
+                "request_id": 15,
+                "ret": 0,
+                "fsm_id": 801,
+                "error": None,
+            })
+
+        responder = threading.Thread(target=reply_current, daemon=True)
+        responder.start()
+        result = request_parent_get_fsm_id(
+            request_queue,
+            result_queue,
+            request_id=15,
+            timeout=0.2,
+        )
+        responder.join(timeout=0.5)
+
+        self.assertEqual(result["request_id"], 15)
+        self.assertEqual(result["fsm_id"], 801)
+
     def test_proposal_execution_has_no_child_loco_setvelocity(self):
         source = inspect.getsource(_run_smart_motion_process)
 
         self.assertNotIn("proposal_loco_client", source)
+        self.assertNotIn("fsm_loco_client", source)
         self.assertIn("apply_parent_set_velocity", source)
+        self.assertIn("query_parent_fsm_id", source)
+        self.assertIn("parent_loco_rpc_lock", source)
 
-    def test_main_wires_parent_rpc_proxy_set_velocity(self):
+    def test_main_wires_parent_rpc_proxy_loco_calls(self):
         main_source = Path(__file__).resolve().parents[1].joinpath(
             "main.py"
         ).read_text(encoding="utf-8")
 
         self.assertIn(
             "parent_set_velocity=loco_client.SetVelocity",
+            main_source,
+        )
+        self.assertIn(
+            "parent_get_fsm_id=loco_client.GetFsmId",
             main_source,
         )
 
