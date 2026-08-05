@@ -33,6 +33,7 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   MotorStatePlugin    (sensor)             — 全身21电机状态(2Hz)
   HandStatePlugin     (sensor)             — 灵巧手状态(10Hz, tool name=hand_state)
   RemoteStatePlugin   (sensor)             — 遥控器SBUS事件(5Hz)
+  UserInteractionPlugin (actuator)         — 迎宾与合影固定场景编排
   StatePlugin      (sensor, multi-tool) — 关节/电池/急停/力传感器/URDF
   CameraPlugin     (sensor)             — Orbbec 头部相机
   AsrPlugin        (sensor)             — 语音识别结果
@@ -58,6 +59,7 @@ import subprocess
 import struct
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import rclpy
@@ -195,6 +197,7 @@ class _ActionSequence:
         self._lock = threading.Lock()
         self._cancel_event: threading.Event | None = None
         self._thread: threading.Thread | None = None
+        self._last_error: str | None = None
 
     def start(self, worker) -> None:
         self.cancel()
@@ -204,6 +207,9 @@ class _ActionSequence:
             try:
                 worker(cancel_event)
             except Exception as e:
+                with self._lock:
+                    if self._cancel_event is cancel_event:
+                        self._last_error = str(e)
                 print(f"[{self._name}] sequence failed: {e}")
             finally:
                 with self._lock:
@@ -216,7 +222,17 @@ class _ActionSequence:
         with self._lock:
             self._cancel_event = cancel_event
             self._thread = thread
+            self._last_error = None
         thread.start()
+
+    def snapshot(self) -> dict:
+        """Return lifecycle state without exposing the worker thread."""
+        with self._lock:
+            thread = self._thread
+            return {
+                "running": bool(thread and thread.is_alive()),
+                "error": self._last_error,
+            }
 
     def cancel(self) -> bool:
         with self._lock:
@@ -2043,6 +2059,10 @@ class HeadGesturePlugin:
     def stop(self):
         self._sequence.cancel()
 
+    def sequence_status(self) -> dict:
+        """Internal lifecycle seam used by composed routine skills."""
+        return self._sequence.snapshot()
+
     def dispatch(self, action: str, args: dict) -> dict:
         if action in ("start", "info"):
             return {
@@ -2110,7 +2130,9 @@ class HeadGesturePlugin:
                 if cancel_event.is_set():
                     return
                 result = self._publish_pose(yaw, pitch, roll, speed)
-                if "error" in result or cancel_event.wait(max(0.15, delay)):
+                if "error" in result:
+                    raise RuntimeError(str(result["error"]))
+                if cancel_event.wait(max(0.15, delay)):
                     return
 
         baseline_seq, baseline = self._feedback_snapshot()
@@ -2850,6 +2872,10 @@ class ArmGesturePlugin:
     def stop(self):
         self._sequence.cancel()
 
+    def sequence_status(self) -> dict:
+        """Internal lifecycle seam used by composed routine skills."""
+        return self._sequence.snapshot()
+
     def dispatch(self, action: str, args: dict) -> dict:
         if action in ("start", "info"):
             return {
@@ -2947,6 +2973,8 @@ class ArmGesturePlugin:
                 if cancel_event.is_set():
                     return
                 result = self._publish_pose(side, frame, speed)
+                if "error" in result:
+                    raise RuntimeError(str(result["error"]))
                 max_delta_rad = max(
                     abs(_deg2rad(float(current) - float(old)))
                     for current, old in zip(frame, previous)
@@ -2954,7 +2982,7 @@ class ArmGesturePlugin:
                 transition = max_delta_rad / speed if speed > 0 else 0
                 previous = frame
                 delay = max(0.12, transition * transition_ratio) + hold
-                if "error" in result or cancel_event.wait(delay):
+                if cancel_event.wait(delay):
                     return
 
         baseline_seq, baseline = self._feedback_snapshot(side)
@@ -4994,6 +5022,600 @@ class RobotFaultsPlugin:
             return {"state": "running" if self._running else "idle"}
         with self._lock:
             return self._build_summary_locked()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UserInteractionPlugin — fixed greeting and photo-pose scene orchestration
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _InteractionFailure(RuntimeError):
+    def __init__(self, code: str, message: str, details: dict | None = None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.details = details or {}
+
+
+class _InteractionCancelled(RuntimeError):
+    pass
+
+
+class UserInteractionPlugin:
+    """One MCP card for short, fixed user-interaction scenes.
+
+    Scene setup is synchronous so the initial MCP response confirms that
+    visible outputs were accepted (or returns the rejecting card immediately).
+    Only completion monitoring and cleanup continue in a background thread.
+    """
+
+    _VERSION = "2.0.0"
+    _SCENE_ACTIONS = ("stage_greeting", "photo_pose")
+    _SOURCE_TOOLS = {
+        "estop", "light", "hand", "tts", "head_gesture", "arm_gesture",
+    }
+    _REQUIRED_OUTPUTS = {"light", "hand", "tts", "head_gesture", "arm_gesture"}
+    _TERMINAL_STATES = {"succeeded", "failed", "cancelled"}
+
+    def __init__(self, plugin_config: dict, source_plugins: list):
+        self._config = dict(plugin_config or {})
+        self._sources = {}
+        for plugin in source_plugins:
+            try:
+                tools = (
+                    plugin.get_tools()
+                    if hasattr(plugin, "get_tools")
+                    else [plugin.get_tool()]
+                )
+            except Exception as e:
+                print(f"[UserInteractionPlugin] skip invalid plugin: {e}")
+                continue
+            for tool in tools:
+                name = tool.get("name") if isinstance(tool, dict) else None
+                if name in self._SOURCE_TOOLS:
+                    self._sources[name] = plugin
+
+        self._running = False
+        self._state_lock = threading.Lock()
+        self._output_lock = threading.RLock()
+        self._active = None
+
+    def get_tool(self) -> dict:
+        greeting_cfg = self._config.get("stage_greeting") or {}
+        photo_cfg = self._config.get("photo_pose") or {}
+        return {
+            "name": "user_interaction",
+            "type": "actuator",
+            "description": (
+                "天轶2.0 Pro 用户互动场景：stage_greeting 编排灯光、迎宾语、"
+                "点头和欢迎挥手；photo_pose 编排灯光、倒计时、Victory 手势和"
+                "合影姿态。status 查询进度，cancel 安全取消后续动作。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "stage_greeting", "photo_pose", "status", "cancel",
+                        ],
+                        "description": "互动场景或生命周期动作",
+                    },
+                    "text": {
+                        "type": "string",
+                        "maxLength": 200,
+                        "default": greeting_cfg.get(
+                            "default_text", "您好，欢迎光临。"),
+                        "description": "迎宾播报文字",
+                    },
+                    "countdown_text": {
+                        "type": "string",
+                        "maxLength": 200,
+                        "default": photo_cfg.get(
+                            "countdown_text", "准备拍照，三、二、一。"),
+                        "description": "合影倒计时播报文字",
+                    },
+                    "side": {
+                        "type": "string",
+                        "enum": ["left", "right", "both"],
+                        "default": "right",
+                        "description": "执行动作的一侧或双侧",
+                    },
+                    "cycles": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 3,
+                        "default": greeting_cfg.get("default_cycles", 2),
+                        "description": "欢迎挥手次数",
+                    },
+                    "speed": {
+                        "type": "number",
+                        "minimum": 0.2,
+                        "maximum": 0.8,
+                        "default": 0.5,
+                        "description": "手臂动作速度(rad/s)",
+                    },
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "stage_greeting": {
+                        "params": ["text", "side", "cycles", "speed"],
+                        "description": "执行迎宾灯光、语音、点头和欢迎挥手",
+                    },
+                    "photo_pose": {
+                        "params": ["side", "countdown_text", "speed"],
+                        "description": "执行合影灯光、倒计时、手势和姿态",
+                    },
+                    "status": {
+                        "params": [],
+                        "description": "查询当前或最近一次互动场景的进度和结果",
+                    },
+                    "cancel": {
+                        "params": [],
+                        "description": "取消当前互动场景尚未发送的动作",
+                    },
+                },
+            },
+        }
+
+    def start(self):
+        self._running = True
+
+    def stop(self):
+        self._running = False
+        active = self._active_for_cleanup()
+        if active and active["state"] not in self._TERMINAL_STATES:
+            active["cancel_event"].set()
+            self._cancel_outputs(active["run_id"])
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in self._SCENE_ACTIONS:
+            return self._start_scene(action, args)
+        if action == "status":
+            return self._status()
+        if action == "cancel":
+            return self._cancel()
+        if action in ("start", "info"):
+            return {
+                "state": "ready" if self._running else "idle",
+                "version": self._VERSION,
+                "actions": list(self._SCENE_ACTIONS),
+            }
+        if action == "stop":
+            self._cancel()
+            return {"state": "idle"}
+        return self._error("INVALID_ARGUMENT", f"unknown action: {action}")
+
+    @staticmethod
+    def _error(code: str, message: str, **details) -> dict:
+        result = {"state": "error", "code": code, "error": message}
+        if details:
+            result["details"] = details
+        return result
+
+    def _start_scene(self, scene: str, raw_args: dict) -> dict:
+        try:
+            inputs = self._validate_inputs(scene, raw_args)
+            self._require_dependencies()
+            self._check_explicit_interlocks("PRECHECK_FAILED")
+        except _InteractionFailure as e:
+            return self._error(e.code, e.message, **e.details)
+
+        with self._state_lock:
+            if self._active and self._active["state"] not in self._TERMINAL_STATES:
+                return self._error(
+                    "RESOURCE_BUSY",
+                    f"{self._active['scene']} is already running",
+                    active_run_id=self._active["run_id"],
+                    active_scene=self._active["scene"],
+                )
+            state = {
+                "scene": scene,
+                "version": self._VERSION,
+                "run_id": f"{scene}-{uuid.uuid4().hex[:12]}",
+                "state": "running",
+                "phase": "scene_setup",
+                "progress": 0.1,
+                "started_at_ms": int(time.time() * 1000),
+                "finished_at_ms": None,
+                "completed_steps": [],
+                "claimed_sources": [],
+                "inputs": inputs,
+                "cancel_event": threading.Event(),
+                "monitor_thread": None,
+                "result": None,
+                "error": None,
+            }
+            self._active = state
+
+        try:
+            if scene == "stage_greeting":
+                watched = self._begin_stage_greeting(state)
+            else:
+                watched = self._begin_photo_pose(state)
+            if state["cancel_event"].is_set():
+                raise _InteractionCancelled()
+            self._set_phase(state["run_id"], "performing", 0.65)
+            monitor = threading.Thread(
+                target=self._monitor_scene,
+                args=(state["run_id"], watched),
+                name=f"{scene}_monitor",
+                daemon=True,
+            )
+            with self._state_lock:
+                if self._active and self._active["run_id"] == state["run_id"]:
+                    self._active["monitor_thread"] = monitor
+            monitor.start()
+            return self._status()
+        except _InteractionCancelled:
+            self._cancel_outputs(state["run_id"])
+            self._finish(
+                state["run_id"], "cancelled", "cancelled",
+                state.get("progress", 0.0),
+            )
+        except _InteractionFailure as e:
+            self._cancel_outputs(state["run_id"])
+            self._finish_failure(state["run_id"], e)
+        except Exception as e:
+            self._cancel_outputs(state["run_id"])
+            self._finish_failure(state["run_id"], _InteractionFailure(
+                "INTERNAL_ERROR", str(e)))
+        return self._status()
+
+    def _validate_inputs(self, scene: str, args: dict) -> dict:
+        scene_cfg = self._config.get(scene) or {}
+        side = args.get("side", scene_cfg.get("default_side", "right"))
+        if side not in ("left", "right", "both"):
+            raise _InteractionFailure(
+                "INVALID_ARGUMENT", "side must be left, right, or both")
+        raw_speed = args.get(
+            "speed",
+            scene_cfg.get(
+                "default_speed", 0.5 if scene == "stage_greeting" else 0.4),
+        )
+        if isinstance(raw_speed, bool):
+            raise _InteractionFailure("INVALID_ARGUMENT", "speed must be numeric")
+        try:
+            speed = float(raw_speed)
+        except (TypeError, ValueError) as e:
+            raise _InteractionFailure(
+                "INVALID_ARGUMENT", "speed must be numeric") from e
+        if not math.isfinite(speed) or not 0.2 <= speed <= 0.8:
+            raise _InteractionFailure(
+                "INVALID_ARGUMENT", "speed must be in [0.2, 0.8] rad/s")
+
+        if scene == "stage_greeting":
+            text = args.get(
+                "text", scene_cfg.get("default_text", "您好，欢迎光临。"))
+            cycles = args.get(
+                "cycles", scene_cfg.get("default_cycles", 2))
+            if not isinstance(text, str) or not text.strip() or len(text) > 200:
+                raise _InteractionFailure(
+                    "INVALID_ARGUMENT", "text must be 1-200 characters")
+            if (isinstance(cycles, bool) or not isinstance(cycles, int)
+                    or not 1 <= cycles <= 3):
+                raise _InteractionFailure(
+                    "INVALID_ARGUMENT", "cycles must be an integer in [1, 3]")
+            return {
+                "text": text.strip(), "side": side,
+                "cycles": cycles, "speed": speed,
+            }
+
+        countdown = args.get(
+            "countdown_text",
+            scene_cfg.get("countdown_text", "准备拍照，三、二、一。"),
+        )
+        if (not isinstance(countdown, str) or not countdown.strip()
+                or len(countdown) > 200):
+            raise _InteractionFailure(
+                "INVALID_ARGUMENT",
+                "countdown_text must be 1-200 characters",
+            )
+        return {
+            "side": side,
+            "countdown_text": countdown.strip(),
+            "speed": speed,
+        }
+
+    def _require_dependencies(self) -> None:
+        missing = sorted(self._REQUIRED_OUTPUTS - self._sources.keys())
+        if missing:
+            raise _InteractionFailure(
+                "DEPENDENCY_UNAVAILABLE",
+                "required interaction cards are unavailable",
+                {"missing": missing},
+            )
+
+    def _check_explicit_interlocks(self, code: str) -> None:
+        source = self._sources.get("estop")
+        if source is None:
+            return
+        try:
+            data = source.dispatch("estop", {"_tool_name": "estop"})
+        except Exception:
+            return
+        if not isinstance(data, dict):
+            return
+        blockers = []
+        if data.get("is_estop") is True:
+            blockers.append("physical_estop_active")
+        if data.get("is_remote_estop") is True:
+            blockers.append("remote_estop_active")
+        if data.get("is_power_on") is False:
+            blockers.append("robot_power_off")
+        if blockers:
+            raise _InteractionFailure(
+                code,
+                "emergency-stop or power interlock blocks interaction",
+                {"blockers": blockers},
+            )
+
+    def _begin_stage_greeting(self, state: dict) -> tuple[str, ...]:
+        inputs = state["inputs"]
+        cancel_event = state["cancel_event"]
+        self._invoke("light", "blue_breathing", {"duration": -1}, cancel_event)
+        self._invoke("hand", "open_palm", {"side": "both"}, cancel_event)
+        self._invoke(
+            "tts", "speak",
+            {"text": inputs["text"], "force": True}, cancel_event,
+        )
+        self._invoke(
+            "head_gesture", "nod",
+            {"cycles": 1, "nod_amplitude": 12, "speed": 30}, cancel_event,
+        )
+        self._invoke(
+            "arm_gesture", "welcome",
+            {
+                "side": inputs["side"], "cycles": inputs["cycles"],
+                "speed": inputs["speed"],
+            },
+            cancel_event,
+        )
+        return ("head_gesture", "arm_gesture")
+
+    def _begin_photo_pose(self, state: dict) -> tuple[str, ...]:
+        inputs = state["inputs"]
+        cancel_event = state["cancel_event"]
+        cfg = self._config.get("photo_pose") or {}
+        light_duration = float(cfg.get("light_duration", 8.0))
+        self._invoke(
+            "light", "white", {"duration": light_duration}, cancel_event)
+        self._invoke(
+            "head_gesture", "reset", {"speed": 25}, cancel_event)
+        self._invoke(
+            "hand", "victory", {"side": inputs["side"]}, cancel_event)
+        self._invoke(
+            "tts", "speak",
+            {"text": inputs["countdown_text"], "force": True}, cancel_event,
+        )
+        self._invoke(
+            "arm_gesture", "high_five",
+            {"side": inputs["side"], "speed": inputs["speed"]},
+            cancel_event,
+        )
+        # head_gesture.reset already waits for fresh feedback synchronously;
+        # only the arm sequence remains active after scene setup returns.
+        return ("arm_gesture",)
+
+    def _monitor_scene(self, run_id: str, watched: tuple[str, ...]) -> None:
+        state = self._active_for_run(run_id)
+        if state is None:
+            return
+        try:
+            scene_cfg = self._config.get(state["scene"]) or {}
+            timeout = float(scene_cfg.get(
+                "timeout", 30.0 if state["scene"] == "stage_greeting" else 20.0))
+            self._wait_sequences(watched, timeout, state["cancel_event"])
+            self._set_phase(run_id, "cleanup", 0.9)
+            if state["scene"] == "photo_pose":
+                self._invoke(
+                    "hand", "open_palm", {"side": state["inputs"]["side"]},
+                    state["cancel_event"],
+                )
+            self._invoke(
+                "light", "blue_standby", {"duration": -1},
+                state["cancel_event"],
+            )
+            if state["cancel_event"].is_set():
+                raise _InteractionCancelled()
+            self._finish(run_id, "succeeded", "completed", 1.0, result={
+                "motion_sequence_completed": True,
+                "motion_feedback_checked": True,
+                "tts_completion_verified": False,
+                "hand_completion_verified": False,
+            })
+        except _InteractionCancelled:
+            self._finish(
+                run_id, "cancelled", "cancelled", state.get("progress", 0.0))
+        except _InteractionFailure as e:
+            self._cancel_outputs(run_id)
+            self._finish_failure(run_id, e)
+        except Exception as e:
+            self._cancel_outputs(run_id)
+            self._finish_failure(
+                run_id, _InteractionFailure("INTERNAL_ERROR", str(e)))
+
+    def _wait_sequences(
+            self, source_names: tuple[str, ...], timeout: float,
+            cancel_event: threading.Event) -> None:
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise _InteractionFailure(
+                "INVALID_CONFIGURATION", "interaction timeout must be positive")
+        deadline = time.monotonic() + timeout
+        next_safety_check = 0.0
+        while True:
+            if cancel_event.is_set():
+                raise _InteractionCancelled()
+            now = time.monotonic()
+            if now >= next_safety_check:
+                self._check_explicit_interlocks("SAFETY_STOP")
+                next_safety_check = now + 0.5
+            statuses = []
+            for name in source_names:
+                source = self._sources[name]
+                if not hasattr(source, "sequence_status"):
+                    raise _InteractionFailure(
+                        "DEPENDENCY_UNAVAILABLE",
+                        f"{name} does not expose sequence completion status",
+                    )
+                status = source.sequence_status()
+                if status.get("error"):
+                    raise _InteractionFailure(
+                        "STEP_FAILED", f"{name} sequence failed",
+                        {"source": name, "error": status["error"]},
+                    )
+                statuses.append(status)
+            if statuses and all(not item.get("running") for item in statuses):
+                return
+            if now >= deadline:
+                raise _InteractionFailure(
+                    "STEP_TIMEOUT",
+                    "interaction motion did not finish before timeout",
+                    {"sources": list(source_names), "timeout": timeout},
+                )
+            cancel_event.wait(0.1)
+
+    def _invoke(
+            self, source_name: str, action: str, args: dict,
+            cancel_event: threading.Event) -> dict:
+        source = self._sources[source_name]
+        with self._output_lock:
+            if cancel_event.is_set():
+                raise _InteractionCancelled()
+            self._claim_source(source_name)
+            result = source.dispatch(
+                action, {**args, "_tool_name": source_name})
+        if not isinstance(result, dict):
+            raise _InteractionFailure(
+                "STEP_FAILED", f"{source_name}.{action} returned a non-object")
+        if (result.get("state") == "error"
+                or "error" in result
+                or result.get("ok") is False):
+            raise _InteractionFailure(
+                str(result.get("code") or "STEP_REJECTED"),
+                str(result.get("message") or result.get("error")
+                    or "card rejected the action"),
+                {"source": source_name, "action": action, "result": result},
+            )
+        self._append_step(f"{source_name}.{action}")
+        return result
+
+    def _safe_dispatch(self, source_name: str, action: str, args: dict) -> None:
+        source = self._sources.get(source_name)
+        if source is None:
+            return
+        try:
+            source.dispatch(action, {**args, "_tool_name": source_name})
+        except Exception as e:
+            print(
+                f"[UserInteractionPlugin] cleanup "
+                f"{source_name}.{action} failed: {e}")
+
+    def _cancel_outputs(self, run_id: str) -> None:
+        with self._output_lock:
+            claimed = self._claimed_sources_for_run(run_id)
+            if "arm_gesture" in claimed:
+                self._safe_dispatch("arm_gesture", "cancel", {})
+            if "head_gesture" in claimed:
+                self._safe_dispatch("head_gesture", "cancel", {})
+            if "tts" in claimed:
+                self._safe_dispatch("tts", "interrupt", {})
+            if "light" in claimed:
+                self._safe_dispatch(
+                    "light", "blue_standby", {"duration": -1})
+
+    def _status(self) -> dict:
+        with self._state_lock:
+            if self._active:
+                return self._public_state(self._active)
+        return {
+            "tool": "user_interaction",
+            "version": self._VERSION,
+            "state": "idle",
+            "phase": "idle",
+            "progress": 0.0,
+        }
+
+    def _cancel(self) -> dict:
+        with self._state_lock:
+            active = self._active
+            if active is None or active["state"] in self._TERMINAL_STATES:
+                return {
+                    "tool": "user_interaction", "version": self._VERSION,
+                    "state": "idle", "cancel_requested": False,
+                }
+            active["cancel_event"].set()
+            active["phase"] = "cancelling"
+            run_id = active["run_id"]
+        self._cancel_outputs(run_id)
+        return {
+            "tool": "user_interaction", "version": self._VERSION,
+            "run_id": run_id, "state": "running", "phase": "cancelling",
+            "cancel_requested": True,
+        }
+
+    def _active_for_cleanup(self) -> dict | None:
+        with self._state_lock:
+            return self._active
+
+    def _active_for_run(self, run_id: str) -> dict | None:
+        with self._state_lock:
+            if self._active and self._active["run_id"] == run_id:
+                return self._active
+        return None
+
+    def _set_phase(self, run_id: str, phase: str, progress: float) -> None:
+        with self._state_lock:
+            if self._active and self._active["run_id"] == run_id:
+                self._active["phase"] = phase
+                self._active["progress"] = progress
+
+    def _append_step(self, step: str) -> None:
+        with self._state_lock:
+            if self._active and self._active["state"] == "running":
+                self._active["completed_steps"].append(step)
+
+    def _claim_source(self, source_name: str) -> None:
+        with self._state_lock:
+            if (self._active and self._active["state"] == "running"
+                    and source_name not in self._active["claimed_sources"]):
+                self._active["claimed_sources"].append(source_name)
+
+    def _claimed_sources_for_run(self, run_id: str) -> set[str]:
+        with self._state_lock:
+            if self._active is None or self._active["run_id"] != run_id:
+                return set()
+            return set(self._active["claimed_sources"])
+
+    def _finish_failure(self, run_id: str, failure: _InteractionFailure) -> None:
+        state = self._active_for_run(run_id)
+        progress = state.get("progress", 0.0) if state else 0.0
+        self._finish(run_id, "failed", "failed", progress, error={
+            "code": failure.code,
+            "message": failure.message,
+            "details": failure.details,
+        })
+
+    def _finish(
+            self, run_id: str, state_name: str, phase: str, progress: float,
+            result: dict | None = None, error: dict | None = None) -> None:
+        with self._state_lock:
+            if self._active is None or self._active["run_id"] != run_id:
+                return
+            self._active["state"] = state_name
+            self._active["phase"] = phase
+            self._active["progress"] = progress
+            self._active["finished_at_ms"] = int(time.time() * 1000)
+            self._active["result"] = result
+            self._active["error"] = error
+
+    @staticmethod
+    def _public_state(state: dict) -> dict:
+        private = {"cancel_event", "monitor_thread", "inputs", "claimed_sources"}
+        return {
+            key: json.loads(json.dumps(value))
+            for key, value in state.items()
+            if key not in private and not (key == "error" and value is None)
+        }
 
 
 # ══════════════════════════════════════════════════════════════════════════════

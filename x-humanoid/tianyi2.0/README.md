@@ -4,6 +4,43 @@ Phanthy Motus driver bundle for the Tianyi 2.0 Pro humanoid robot. The driver
 bridges robot-side ROS2 topics on domain 0 to Agent Core topics on domain 42 and
 exposes the capabilities as MCP tools.
 
+## User interaction scene card
+
+`user_interaction` combines the existing Tianyi cards into two fixed,
+scene-facing actions without adding ROS2 publishers, subscribers, or another
+MCP connection:
+
+- `stage_greeting`: blue breathing light, open hands, configurable greeting
+  speech, one head nod, and a left/right/bilateral welcome wave;
+- `photo_pose`: white scene light, centered head, a left/right/bilateral
+  Victory hand, configurable spoken countdown, and the matching high-five
+  photo pose. It prepares the pose but does not capture or store an image.
+
+The same card also exposes `status` and `cancel`. Calling a scene action first
+validates its parameters, verifies all required source cards exist, and checks
+an available emergency-stop snapshot for explicit physical/remote stop or
+power-off states. Scene setup then runs synchronously through the existing
+`light`, `hand`, `tts`, `head_gesture`, and `arm_gesture` plugin instances. The
+initial MCP response is returned only after those visible outputs have been
+accepted; an immediate atomic-card rejection is returned in that first call
+instead of being hidden behind an `accepted` background state.
+
+Only motion completion monitoring remains asynchronous. `status` reports the
+run ID, scene, phase, progress, completed atomic steps, and terminal result.
+Head and arm completion and background publisher errors are read through their
+internal sequence status. If explicit emergency-stop feedback changes during
+motion, the remaining frames are cancelled. TTS and hand cards currently
+confirm command acceptance but do not expose completion feedback, and the
+terminal result states that limitation.
+
+Only one interaction scene can run at a time. `cancel` uses the current atomic
+action names (`arm_gesture.cancel`, `head_gesture.cancel`, and `tts.interrupt`),
+then restores the standby light without commanding a new arm/head reset pose.
+The card does not define another `system_inspection`; whole-robot inspection is
+left to the existing repository capability, while the underlying semantic
+motion cards retain their own motor, power, emergency-stop, and feedback
+preflight checks.
+
 ## Raw arm joint card
 
 `arm` directly commands seven joints per selected arm in this canonical order:

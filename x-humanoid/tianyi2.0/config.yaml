@@ -79,3 +79,19 @@ plugins:
         sender_path: "/home/ubuntu/audio_sender.py"
   light:
     enabled: true
+  # One scene card with stage_greeting and photo_pose actions. It reuses the
+  # existing light/hand/TTS/head_gesture/arm_gesture plugin instances.
+  user_interaction:
+    enabled: true
+    stage_greeting:
+      default_text: "您好，欢迎光临。"
+      default_side: "right"
+      default_cycles: 2
+      default_speed: 0.5
+      timeout: 30
+    photo_pose:
+      default_side: "right"
+      countdown_text: "准备拍照，三、二、一。"
+      default_speed: 0.4
+      light_duration: 8
+      timeout: 20
