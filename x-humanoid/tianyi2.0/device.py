@@ -3690,8 +3690,10 @@ class TtsPlugin:
         self._resume_client = None
         # ACP: PlayEvent 订阅，用于判断播放真正完成
         self._play_event_sub = None
+        self._play_progress_sub = None
         self._pending_play: dict[str, threading.Event] = {}  # sid → Event
         self._pending_play_status: dict[str, int] = {}  # sid → event_code
+        self._pending_play_duration: dict[str, float] = {}  # sid → total duration (from progress)
 
     def get_tool(self) -> dict:
         return {
@@ -3720,7 +3722,7 @@ class TtsPlugin:
     def start(self):
         try:
             from lyre_msgs.srv import PlayText, PlayStop, PlayPause, PlayResume
-            from lyre_msgs.msg import PlayEvent
+            from lyre_msgs.msg import PlayEvent, PlayProgress
             self._play_client = self._srv_node.create_client(PlayText, "/audio_play/play_text")
             self._stop_client = self._srv_node.create_client(PlayStop, "/audio_play/stop")
             self._pause_client = self._srv_node.create_client(PlayPause, "/audio_play/pause")
@@ -3728,7 +3730,10 @@ class TtsPlugin:
             # 订阅播放事件 topic，用于判断播放真正完成
             self._play_event_sub = self._srv_node.create_subscription(
                 PlayEvent, "/audio_play/event", self._on_play_event, 10)
-            print("[TtsPlugin] service clients + event subscription created")
+            # 订阅播放进度 topic，获取精确总时长用于超时计算
+            self._play_progress_sub = self._srv_node.create_subscription(
+                PlayProgress, "/audio_play/progress", self._on_play_progress, 10)
+            print("[TtsPlugin] service clients + event/progress subscriptions created")
         except ImportError as e:
             print(f"[TtsPlugin] WARNING: msg import failed ({e})")
 
@@ -3741,6 +3746,16 @@ class TtsPlugin:
             self._pending_play_status[sid] = event_code
             self._pending_play[sid].set()
             print(f"[TtsPlugin] PlayEvent: sid={sid} event={event_code}")
+
+    def _on_play_progress(self, msg):
+        """PlayProgress callback: 获取播放总时长，用于精确超时计算。"""
+        sid = msg.sid
+        duration = msg.duration
+        if sid and duration > 0 and sid in self._pending_play:
+            # 只更新一次（取第一次收到的 duration）
+            if sid not in self._pending_play_duration:
+                self._pending_play_duration[sid] = duration
+                print(f"[TtsPlugin] PlayProgress: sid={sid} duration={duration:.1f}s")
 
     def stop(self):
         pass
@@ -3796,12 +3811,19 @@ class TtsPlugin:
                     # 注册 pending，让 _on_play_event callback 能匹配
                     ev = threading.Event()
                     self._pending_play[sid] = ev
-                    # 超时 = 字数/3 + 5（中文每秒约3字，含余量）
-                    play_timeout = len(spoken_text) / 3.0 + 5.0
+                    # 先短等 2s 让 progress topic 报告 duration
+                    import time as _t2
+                    _t2.sleep(2.0)
+                    # 超时 = progress 报告的总时长 + 5s 余量，fallback 用字数/3 + 5
+                    reported_duration = self._pending_play_duration.get(sid)
+                    if reported_duration and reported_duration > 0:
+                        play_timeout = reported_duration + 5.0
+                    else:
+                        play_timeout = len(spoken_text) / 3.0 + 5.0
                     if not ev.wait(timeout=play_timeout):
                         # 超时：播放可能卡住
                         status = "error"
-                        print(f"[TtsPlugin] PlayEvent timeout: sid={sid}, waited {play_timeout:.0f}s")
+                        print(f"[TtsPlugin] PlayEvent timeout: sid={sid}, waited {play_timeout:.0f}s (duration={reported_duration})")
                     else:
                         event_code = self._pending_play_status.get(sid, 1)
                         if event_code == 1:
@@ -3811,6 +3833,7 @@ class TtsPlugin:
                     # 清理
                     self._pending_play.pop(sid, None)
                     self._pending_play_status.pop(sid, None)
+                    self._pending_play_duration.pop(sid, None)
                 elif not sid:
                     # 没拿到 sid，fallback 按字数估算
                     fallback_s = len(spoken_text) / 4.0 + 3.0
