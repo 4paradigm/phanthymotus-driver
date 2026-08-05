@@ -13,6 +13,29 @@ plugins:
     enabled: true
   loco:
     enabled: true
+    # N5 canvas input. Driver startup is disarmed until loco action=start binds
+    # the one authoritative proposal topic.
+    velocity_proposal_enabled: true
+    velocity_proposal_driver_authorized: true
+    velocity_proposal_max_ttl_ms: 250
+    velocity_proposal_min_x: -0.05
+    velocity_proposal_max_x: 0.15
+    velocity_proposal_max_abs_y: 0.12
+    velocity_proposal_max_abs_yaw: 0.35
+    velocity_proposal_max_planar_speed: 0.18
+    velocity_proposal_odom_timeout: 0.5
+    velocity_proposal_scan_timeout: 0.5
+    velocity_proposal_fsm_check_interval: 0.2
+    velocity_proposal_fsm_timeout: 0.5
+    velocity_proposal_nav_status_timeout: 0.25
+    velocity_proposal_watchdog_hz: 40
+    velocity_proposal_rpc_timeout: 0.1
+    velocity_proposal_stop_rpc_timeout: 0.1
+    velocity_proposal_fsm_rpc_timeout: 0.2
+    velocity_proposal_stop_confirm_timeout: 0.5
+    velocity_proposal_stop_linear_epsilon: 0.03
+    velocity_proposal_stop_yaw_epsilon: 0.05
+    velocity_proposal_allowed_fsm_ids: [500, 801]
   arm:
     enabled: true
   state:
