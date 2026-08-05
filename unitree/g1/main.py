@@ -422,6 +422,7 @@ def main():
             proposal_config=proposal_cfg,
             fallback_stop=loco_client.StopMove,
             parent_set_velocity=loco_client.SetVelocity,
+            parent_get_fsm_id=loco_client.GetFsmId,
         )
         print("[bundle] SmartMotion safety harness active (subprocess)")
 
