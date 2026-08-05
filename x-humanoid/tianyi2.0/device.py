@@ -3688,6 +3688,10 @@ class TtsPlugin:
         self._stop_client = None
         self._pause_client = None
         self._resume_client = None
+        # ACP: PlayEvent 订阅，用于判断播放真正完成
+        self._play_event_sub = None
+        self._pending_play: dict[str, threading.Event] = {}  # sid → Event
+        self._pending_play_status: dict[str, int] = {}  # sid → event_code
 
     def get_tool(self) -> dict:
         return {
@@ -3716,13 +3720,27 @@ class TtsPlugin:
     def start(self):
         try:
             from lyre_msgs.srv import PlayText, PlayStop, PlayPause, PlayResume
+            from lyre_msgs.msg import PlayEvent
             self._play_client = self._srv_node.create_client(PlayText, "/audio_play/play_text")
             self._stop_client = self._srv_node.create_client(PlayStop, "/audio_play/stop")
             self._pause_client = self._srv_node.create_client(PlayPause, "/audio_play/pause")
             self._resume_client = self._srv_node.create_client(PlayResume, "/audio_play/resume")
-            print("[TtsPlugin] service clients created")
+            # 订阅播放事件 topic，用于判断播放真正完成
+            self._play_event_sub = self._srv_node.create_subscription(
+                PlayEvent, "/audio_play/event", self._on_play_event, 10)
+            print("[TtsPlugin] service clients + event subscription created")
         except ImportError as e:
             print(f"[TtsPlugin] WARNING: msg import failed ({e})")
+
+    def _on_play_event(self, msg):
+        """PlayEvent callback: 播放完成/停止/失败时解锁对应的 pending."""
+        # event: 0=STARTED, 1=COMPLETED, 2=STOPPED, 3=CANCELLED, 4=FAILED
+        sid = msg.sid
+        event_code = msg.event
+        if event_code >= 1 and sid in self._pending_play:
+            self._pending_play_status[sid] = event_code
+            self._pending_play[sid].set()
+            print(f"[TtsPlugin] PlayEvent: sid={sid} event={event_code}")
 
     def stop(self):
         pass
@@ -3756,27 +3774,66 @@ class TtsPlugin:
             req.last = True
             future = self._play_client.call_async(req)
             action_id = f"tts-{_uuid.uuid4().hex[:8]}"
-            # Background thread: wait for service response then ACP callback
-            def _wait_cb(fut, aid):
+
+            # Background thread: wait for PlayEvent COMPLETED then ACP callback
+            def _wait_cb(fut, aid, spoken_text):
                 import time as _t
+                # Phase 1: 等 service response（获取 sid）
+                timeout_service = 10.0
                 start = _t.time()
-                while not fut.done() and _t.time() - start < 60:
+                while not fut.done() and _t.time() - start < timeout_service:
                     _t.sleep(0.1)
+                # 获取 sid
+                sid = None
+                if fut.done():
+                    result = fut.result()
+                    if result:
+                        sid = getattr(result, 'sid', None)
+
+                # Phase 2: 等 PlayEvent 通知播放完成
+                status = "completed"
+                if sid:
+                    # 注册 pending，让 _on_play_event callback 能匹配
+                    ev = threading.Event()
+                    self._pending_play[sid] = ev
+                    # 超时 = 字数/3 + 5（中文每秒约3字，含余量）
+                    play_timeout = len(spoken_text) / 3.0 + 5.0
+                    if not ev.wait(timeout=play_timeout):
+                        # 超时：播放可能卡住
+                        status = "error"
+                        print(f"[TtsPlugin] PlayEvent timeout: sid={sid}, waited {play_timeout:.0f}s")
+                    else:
+                        event_code = self._pending_play_status.get(sid, 1)
+                        if event_code == 1:
+                            status = "completed"
+                        else:
+                            status = "error"
+                    # 清理
+                    self._pending_play.pop(sid, None)
+                    self._pending_play_status.pop(sid, None)
+                elif not sid:
+                    # 没拿到 sid，fallback 按字数估算
+                    fallback_s = len(spoken_text) / 4.0 + 3.0
+                    _t.sleep(fallback_s)
+                    print(f"[TtsPlugin] no sid from service, fallback sleep {fallback_s:.0f}s")
+
+                # ACP callback
                 try:
                     import urllib.request, ssl, json as _json, os as _os
                     url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
                     ctx = ssl.create_default_context()
                     ctx.check_hostname = False
                     ctx.verify_mode = ssl.CERT_NONE
-                    p = _json.dumps({"action_id": aid, "status": "completed",
-                                     "result": {"action": "speak"}}).encode()
+                    p = _json.dumps({"action_id": aid, "status": status,
+                                     "result": {"action": "speak", "sid": sid or "unknown"}}).encode()
                     r = urllib.request.Request(f"{url}/api/acp/complete", data=p,
                                               headers={"Content-Type": "application/json"}, method="POST")
                     urllib.request.urlopen(r, timeout=3, context=ctx)
-                    print(f"[TtsPlugin] ACP complete: {aid}")
+                    print(f"[TtsPlugin] ACP {status}: {aid} (sid={sid})")
                 except Exception as e:
                     print(f"[TtsPlugin] ACP callback failed: {e}")
-            threading.Thread(target=_wait_cb, args=(future, action_id), daemon=True).start()
+
+            threading.Thread(target=_wait_cb, args=(future, action_id, text), daemon=True).start()
             return {"state": "speaking", "action_id": action_id, "text": text[:50]}
         except Exception as e:
             return {"error": str(e)}
