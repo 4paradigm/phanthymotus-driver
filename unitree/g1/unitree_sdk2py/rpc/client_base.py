@@ -55,6 +55,33 @@ class ClientBase:
         else:
             return response.header.status.code, response.data
 
+    def _CallStartBase(self, apiId: int, parameter: str,
+                       proirity: int = 0, leaseId: int = 0,
+                       send_timeout: float = None):
+        """Submit a parameter-only RPC and return before waiting."""
+        header = self.__SetHeader(apiId, leaseId, proirity, False)
+        request = Request(header, parameter, [])
+        timeout = self.__timeout if send_timeout is None else send_timeout
+        future = self.__stub.SendRequest(request, timeout)
+        if future is None:
+            return RPC_ERR_CLIENT_SEND, None
+        return 0, (future, request.header.identity.id, apiId)
+
+    def _CallFinishBase(self, pending, timeout: float = None):
+        future, request_id, apiId = pending
+        result = future.GetResult(self.__timeout if timeout is None else timeout)
+        if result.code != FutureResult.FUTURE_SUCC:
+            self.__stub.RemoveFuture(request_id)
+            code = (RPC_ERR_CLIENT_API_TIMEOUT
+                    if result.code == FutureResult.FUTUTE_ERR_TIMEOUT
+                    else RPC_ERR_UNKNOWN)
+            return code, None
+
+        response = result.value
+        if response.header.identity.api_id != apiId:
+            return RPC_ERR_CLIENT_API_NOT_MATCH, None
+        return response.header.status.code, response.data
+
     def _CallNoReplyBase(self, apiId: int, parameter: str, proirity: int, leaseId: int):
         header = self.__SetHeader(apiId, leaseId, proirity, True)
         request = Request(header, parameter, [])
@@ -87,6 +114,38 @@ class ClientBase:
             return RPC_ERR_CLIENT_API_NOT_MATCH, None
         else:
             return response.header.status.code, response.data
+
+    def _CallRequestWithParamAndBinStartBase(self, apiId: int,
+                                             requestParamter: str,
+                                             requestBinary: list,
+                                             proirity: int = 0,
+                                             leaseId: int = 0,
+                                             send_timeout: float = None):
+        """Submit a binary RPC and return before waiting for its response."""
+        header = self.__SetHeader(apiId, leaseId, proirity, False)
+        request = Request(header, requestParamter, requestBinary)
+        timeout = self.__timeout if send_timeout is None else send_timeout
+        future = self.__stub.SendRequest(request, timeout)
+        if future is None:
+            return RPC_ERR_CLIENT_SEND, None
+        return 0, (future, request.header.identity.id, apiId)
+
+    def _CallRequestWithParamAndBinFinishBase(self, pending,
+                                              timeout: float = None):
+        """Wait for a binary RPC previously returned by StartBase."""
+        future, request_id, apiId = pending
+        result = future.GetResult(self.__timeout if timeout is None else timeout)
+        if result.code != FutureResult.FUTURE_SUCC:
+            self.__stub.RemoveFuture(request_id)
+            code = (RPC_ERR_CLIENT_API_TIMEOUT
+                    if result.code == FutureResult.FUTUTE_ERR_TIMEOUT
+                    else RPC_ERR_UNKNOWN)
+            return code, None
+
+        response = result.value
+        if response.header.identity.api_id != apiId:
+            return RPC_ERR_CLIENT_API_NOT_MATCH, None
+        return response.header.status.code, response.data
 
     def _CallRequestWithParamAndBinNoReplyBase(self, apiId: int, requestParamter: str,
                                                requestBinary: list, proirity: int,

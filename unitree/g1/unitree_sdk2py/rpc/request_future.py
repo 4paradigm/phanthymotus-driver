@@ -42,5 +42,5 @@ class RequestFutureQueue:
 
     def Remove(self, requestId: int):
         with self.__lock:
-            if id in self.__data:
+            if requestId in self.__data:
                 self.__data.pop(requestId)

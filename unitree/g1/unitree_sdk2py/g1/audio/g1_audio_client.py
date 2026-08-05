@@ -26,7 +26,7 @@ class AudioClient(Client):
 
     ## API Call ##
     def TtsMaker(self, text: str, speaker_id: int):
-        self.tts_index += self.tts_index
+        self.tts_index += 1
         p = {}
         p["index"] = self.tts_index
         p["text"] = text
@@ -64,8 +64,29 @@ class AudioClient(Client):
         param = json.dumps({"app_name": app_name, "stream_id": stream_id})
         pcm_list = list(pcm_data)
         return self._CallRequestWithParamAndBin(ROBOT_API_ID_AUDIO_START_PLAY, param, pcm_list)
+
+    def PlayStreamStart(self, app_name: str, stream_id: str, pcm_data: bytes,
+                        send_timeout: float = None):
+        param = json.dumps({"app_name": app_name, "stream_id": stream_id})
+        pcm_list = list(pcm_data)
+        return self._CallRequestWithParamAndBinStart(
+            ROBOT_API_ID_AUDIO_START_PLAY, param, pcm_list, send_timeout,
+        )
+
+    def PlayStreamFinish(self, pending, timeout: float = None):
+        return self._CallRequestWithParamAndBinFinish(pending, timeout)
     
     def PlayStop(self, app_name: str):
         parameter = json.dumps({"app_name": app_name})
-        self._Call(ROBOT_API_ID_AUDIO_STOP_PLAY, parameter)
-        return 0
+        code, _ = self._Call(ROBOT_API_ID_AUDIO_STOP_PLAY, parameter)
+        return code
+
+    def PlayStopStart(self, app_name: str, send_timeout: float = None):
+        parameter = json.dumps({"app_name": app_name})
+        return self._CallStart(
+            ROBOT_API_ID_AUDIO_STOP_PLAY, parameter, send_timeout,
+        )
+
+    def PlayStopFinish(self, pending, timeout: float = None):
+        code, _ = self._CallFinish(pending, timeout)
+        return code

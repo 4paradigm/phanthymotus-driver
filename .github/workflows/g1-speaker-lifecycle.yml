@@ -1,0 +1,40 @@
+name: G1 speaker lifecycle
+
+on:
+  pull_request:
+    paths:
+      - unitree/g1/device.py
+      - unitree/g1/unitree_sdk2py/g1/audio/g1_audio_client.py
+      - unitree/g1/unitree_sdk2py/rpc/client.py
+      - unitree/g1/unitree_sdk2py/rpc/client_base.py
+      - unitree/g1/unitree_sdk2py/rpc/request_future.py
+      - unitree/g1/tests/test_speaker_lifecycle.py
+      - unitree/g1/SPEAKER_LIFECYCLE_PROTOCOL.md
+      - .github/workflows/g1-speaker-lifecycle.yml
+  push:
+    branches: [main]
+    paths:
+      - unitree/g1/device.py
+      - unitree/g1/unitree_sdk2py/g1/audio/g1_audio_client.py
+      - unitree/g1/unitree_sdk2py/rpc/client.py
+      - unitree/g1/unitree_sdk2py/rpc/client_base.py
+      - unitree/g1/unitree_sdk2py/rpc/request_future.py
+      - unitree/g1/tests/test_speaker_lifecycle.py
+      - unitree/g1/SPEAKER_LIFECYCLE_PROTOCOL.md
+      - .github/workflows/g1-speaker-lifecycle.yml
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Run G1 speaker lifecycle tests
+        run: >-
+          PYTHONDONTWRITEBYTECODE=1 python -m unittest discover
+          -s unitree/g1/tests -p 'test_*.py' -v

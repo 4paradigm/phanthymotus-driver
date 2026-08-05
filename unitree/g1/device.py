@@ -25,6 +25,7 @@ import struct
 import subprocess
 import threading
 import time
+import uuid
 
 import rclpy
 from rclpy.node import Node
@@ -47,6 +48,13 @@ _LOW_LAT_QOS = QoSProfile(
     history=HistoryPolicy.KEEP_LAST,
     depth=200,
     durability=DurabilityPolicy.VOLATILE,
+)
+
+_CONTROL_QOS = QoSProfile(
+    reliability=ReliabilityPolicy.RELIABLE,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=50,
+    durability=DurabilityPolicy.TRANSIENT_LOCAL,
 )
 
 
@@ -309,235 +317,1008 @@ APP_NAME = "g1_speaker"
 class _SpeakerNode(Node):
     PREFILL = 3       # buffer 3 chunks (~300ms) before starting playback
     MERGE_BYTES = 9600  # merge into ~300ms blocks before calling PlayStream
+    PLAYBACK_GRACE_SEC = 0.05
+    LEGACY_NEW_UTTERANCE_GAP_SEC = 0.75
+    LEGACY_MUTE_TIMEOUT_SEC = 10.0
+    RPC_SEND_TIMEOUT_SEC = 0.25
+    STREAM_RPC_TIMEOUT_SEC = 1.0
+    CONTROL_RPC_TIMEOUT_SEC = 1.0
+    TERMINAL_HISTORY_LIMIT = 256
 
-    def __init__(self, audio_client: AudioClient):
+    # EOF magic: 8 bytes (4 samples [1,-1,1,-1])，标记 utterance 结束
+    AUDIO_EOF_MAGIC = b'\x01\x00\xff\xff\x01\x00\xff\xff'
+
+    def __init__(self, audio_client: AudioClient, *, monotonic=None,
+                 wall_time=None, waiter=None):
         super().__init__("g1_speaker")
         self._client = audio_client
+        self._monotonic = monotonic or time.monotonic
+        self._wall_time = wall_time or time.time
         self._topic: str | None = None
         self._sub    = None
+        self._receipt_topic: str | None = None
+        self._receipt_pub = None
         self._idx    = 0
         self.state   = "idle"
         self._buf = queue.Queue()
         self._draining = threading.Event()
         self._drain_thread: threading.Thread | None = None
+        self._drain_generation: int | None = None
+        self._generation = 0
+        self._generation_ids: dict[int, set[str]] = {0: set()}
         self._last_chunk_time = 0.0
         self._flush_timer = None
+        self._flush_token = 0
         # 打断/暂停控制
-        self._lock = threading.Lock()
+        self._lifecycle_lock = threading.RLock()
+        self._lock = threading.RLock()
+        self._sdk_lock = threading.Lock()
+        self._receipt_lock = threading.RLock()
+        self._receipt_publish_lock = threading.Lock()
+        self._control_in_progress = False
+        self._accept_chunks = False
         self._interrupt_flag = threading.Event()
+        self._waiter = waiter or self._interrupt_flag.wait
         self._pause_event = threading.Event()
         self._pause_event.set()  # 初始为非暂停状态
-        self._muted = False  # interrupt 后静默，丢弃后续 chunks 直到新 utterance
+        self._pause_epoch = 0
+        self._legacy_muted = False
+        self._legacy_last_dropped_time = 0.0
+        self._legacy_mute_deadline = 0.0
+        self._legacy_utterance_id: str | None = None
+        self._legacy_counter = 0
+        self._active_utterance_id: str | None = None
+        self._session_id = ''
+        self._started_ids: dict[tuple[str, str], bool] = {}
+        self._terminal_ids: dict[tuple[str, str], dict] = {}
+        self._cancelled_ids: dict[str, bool] = {}
+        self._last_terminal_receipt: dict | None = None
+        self._pending_receipts: dict[tuple[str, str, str], dict] = {}
+        self._receipt_publish_errors: dict[tuple[str, str, str], str] = {}
+        self._receipt_retry_timer = None
         # Clear stale PlayStream session from previous container run (MCU keeps state across reboot)
-        self._client.PlayStop(APP_NAME)
+        stop_code = self._call_play_stop('startup')
+        if stop_code != 0:
+            self.get_logger().warn(
+                f"[speaker] stale-session cleanup failed: code={stop_code}"
+            )
         self.get_logger().info("SpeakerNode ready")
 
     def start_play(self, topic: str) -> str:
-        if self._sub is not None:
-            if self._topic == topic:
-                self.get_logger().info(f"[speaker] already subscribing {topic}, skip")
-                return self._topic
-            # topic changed — stop old subscription first
-            self.get_logger().info(f"[speaker] topic changed {self._topic} → {topic}, re-subscribing")
-            self.stop_play()
-        self._topic = topic
-        self._muted = False  # 新 start 时清除静默
-        self.get_logger().info(f"[speaker] creating subscription: topic={topic}, msg_type=AudioChunk, qos=LOW_LAT")
-        self._sub = self.create_subscription(
-            AudioChunk, topic, self._on_chunk, _LOW_LAT_QOS,
-        )
-        self.state = "ready"
+        with self._lifecycle_lock:
+            return self._start_play_serialized(topic)
+
+    def _start_play_serialized(self, topic: str) -> str:
+        with self._lock:
+            if self.state == 'error':
+                raise RuntimeError('speaker is in error state; stop before restarting')
+            if self._sub is not None:
+                if self._topic == topic:
+                    self.get_logger().info(f"[speaker] already subscribing {topic}, skip")
+                    return self._topic
+                raise RuntimeError('speaker must be stopped before changing input_topic')
+            self._generation += 1
+            self._generation_ids = {self._generation: set()}
+            self._drain_buffer_locked()
+            self._buf = queue.Queue()
+            self._topic = topic
+            self._legacy_muted = False
+            self._legacy_last_dropped_time = 0.0
+            self._legacy_mute_deadline = 0.0
+            self._legacy_utterance_id = None
+            self._cancelled_ids.clear()
+            self._session_id = f"speaker:{uuid.uuid4()}"
+            receipt_topic = f"{topic.rstrip('/')}/speaker_receipts"
+            with self._receipt_lock:
+                self._started_ids.clear()
+                if (self._receipt_pub is not None
+                        and self._receipt_topic != receipt_topic):
+                    self.destroy_publisher(self._receipt_pub)
+                    self._receipt_pub = None
+                self._receipt_topic = receipt_topic
+                if self._receipt_pub is None:
+                    self._receipt_pub = self.create_publisher(
+                        String, self._receipt_topic, _CONTROL_QOS,
+                    )
+                if any(
+                    pending.get('receipt_topic') == self._receipt_topic
+                    for pending in self._pending_receipts.values()
+                ):
+                    self._ensure_receipt_retry_timer_locked()
+            self.get_logger().info(f"[speaker] creating subscription: topic={topic}, msg_type=AudioChunk, qos=LOW_LAT")
+            self._sub = self.create_subscription(
+                AudioChunk, topic, self._on_chunk, _LOW_LAT_QOS,
+            )
+            self._control_in_progress = False
+            self._accept_chunks = True
+            self._interrupt_flag.clear()
+            self.state = "ready"
         self.get_logger().info(f"[speaker] subscription created, waiting for chunks on {topic}")
         return topic
 
-    def stop_play(self) -> None:
-        if self._flush_timer is not None:
-            self._flush_timer.cancel()
-            self.destroy_timer(self._flush_timer)
-            self._flush_timer = None
-        if self._sub is not None:
-            self.destroy_subscription(self._sub)
-            self._sub = None
-        self._draining.clear()
-        self._pause_event.set()  # 确保 drain thread 不会卡在 pause wait
-        self._interrupt_flag.set()  # 确保 drain thread 退出
-        if self._drain_thread is not None:
-            self._drain_thread.join(timeout=2)
-            self._drain_thread = None
-        self._interrupt_flag.clear()
-        # flush remaining buffer
-        while not self._buf.empty():
+    def _cancel_flush_timer_locked(self) -> None:
+        # A cancelled ROS timer callback may already be queued. Advancing the
+        # token makes such callbacks harmless after a stop/start or debounce.
+        self._flush_token += 1
+        timer = self._flush_timer
+        self._flush_timer = None
+        if timer is None:
+            return
+        timer.cancel()
+        self.destroy_timer(timer)
+
+    def _schedule_flush_timer_locked(self, delay: float = 0.2) -> None:
+        self._cancel_flush_timer_locked()
+        token = self._flush_token
+        generation = self._generation
+        target_buffer = self._buf
+        self._flush_timer = self.create_timer(
+            max(0.01, delay),
+            lambda: self._check_flush(token, generation, target_buffer),
+        )
+
+    def _cancel_receipt_retry_timer_locked(self) -> None:
+        if self._receipt_retry_timer is None:
+            return
+        self._receipt_retry_timer.cancel()
+        self.destroy_timer(self._receipt_retry_timer)
+        self._receipt_retry_timer = None
+
+    def _ensure_receipt_retry_timer_locked(self) -> None:
+        if self._receipt_retry_timer is None and self._receipt_pub is not None:
+            self._receipt_retry_timer = self.create_timer(
+                0.5, self._retry_pending_receipts,
+            )
+
+    @staticmethod
+    def _remember_bounded(items: dict, key, value) -> None:
+        items[key] = value
+        while len(items) > _SpeakerNode.TERMINAL_HISTORY_LIMIT:
+            items.pop(next(iter(items)))
+
+    def _record_receipt(self, utterance_id: str, state: str, *,
+                        audio_bytes: int = 0, reason: str = '',
+                        completion_basis: str = '') -> dict | None:
+        if not utterance_id:
+            return None
+        terminal = state in ('completed', 'cancelled', 'error')
+        with self._receipt_lock:
+            session_key = (self._session_id, utterance_id)
+            if session_key in self._terminal_ids:
+                # A terminal receipt is final for this session/utterance pair.
+                # In particular, a delayed retry may never publish started
+                # after completed/cancelled/error has been recorded.
+                receipt = self._terminal_ids[session_key]
+                if not terminal:
+                    return None
+                pending_key = (self._session_id, utterance_id, receipt['state'])
+                if pending_key not in self._pending_receipts:
+                    return receipt
+            elif state == 'started' and session_key in self._started_ids:
+                pending_key = (self._session_id, utterance_id, state)
+                receipt = self._pending_receipts.get(pending_key)
+                if receipt is None:
+                    return None
+            else:
+                receipt = {
+                    'type': 'speech_playback_receipt',
+                    'version': 1,
+                    'session_id': self._session_id,
+                    'utterance_id': utterance_id,
+                    'state': state,
+                    'completion_basis': completion_basis,
+                    'audio_bytes': audio_bytes,
+                    'ts': self._wall_time(),
+                    'reason': reason,
+                    'receipt_topic': self._receipt_topic,
+                }
+                if state == 'started':
+                    self._remember_bounded(self._started_ids, session_key, True)
+                if terminal:
+                    started_pending_key = (
+                        self._session_id, utterance_id, 'started',
+                    )
+                    self._pending_receipts.pop(started_pending_key, None)
+                    self._receipt_publish_errors.pop(started_pending_key, None)
+                    self._remember_bounded(self._terminal_ids, session_key, receipt)
+                    self._last_terminal_receipt = receipt
+                pending_key = (self._session_id, utterance_id, state)
+                self._pending_receipts[pending_key] = receipt
+                while len(self._pending_receipts) > self.TERMINAL_HISTORY_LIMIT:
+                    expired_key = next(iter(self._pending_receipts))
+                    self._pending_receipts.pop(expired_key)
+                    self._receipt_publish_errors.pop(expired_key, None)
+        return receipt
+
+    def _publish_and_log_receipt(self, receipt: dict | None) -> None:
+        if receipt is None:
+            return
+        self._publish_receipt(receipt)
+        self.get_logger().info(
+            f"[speaker] receipt state={receipt['state']} "
+            f"utterance_id={receipt['utterance_id']} "
+            f"bytes={receipt['audio_bytes']} reason={receipt['reason']}"
+        )
+
+    def _emit_receipt(self, utterance_id: str, state: str, *,
+                      audio_bytes: int = 0, reason: str = '',
+                      completion_basis: str = '') -> dict | None:
+        receipt = self._record_receipt(
+            utterance_id, state, audio_bytes=audio_bytes, reason=reason,
+            completion_basis=completion_basis,
+        )
+        self._publish_and_log_receipt(receipt)
+        return receipt
+
+    def _publish_receipt(self, receipt: dict) -> bool:
+        key = (
+            receipt.get('session_id', ''),
+            receipt.get('utterance_id', ''),
+            receipt.get('state', ''),
+        )
+        with self._receipt_publish_lock:
+            with self._receipt_lock:
+                # A terminal event may supersede a failed started event after a
+                # retry callback took its snapshot. Never publish stale outbox data.
+                if self._pending_receipts.get(key) is not receipt:
+                    return False
+                publisher = self._receipt_pub
+                current_topic = self._receipt_topic
+            if publisher is None or receipt.get('receipt_topic') != current_topic:
+                with self._receipt_lock:
+                    self._receipt_publish_errors[key] = 'receipt_publisher_unavailable'
+                return False
+
             try:
-                self._buf.get_nowait()
+                msg = String()
+                msg.data = json.dumps(receipt, ensure_ascii=False)
+                publisher.publish(msg)
+            except Exception as e:
+                error = f'{type(e).__name__}: {e}'
+                with self._receipt_lock:
+                    if self._pending_receipts.get(key) is receipt:
+                        self._receipt_publish_errors[key] = error
+                        self._ensure_receipt_retry_timer_locked()
+                self.get_logger().warn(f"[speaker] receipt publish failed: {e}")
+                return False
+
+            with self._receipt_lock:
+                if self._pending_receipts.get(key) is receipt:
+                    self._pending_receipts.pop(key, None)
+                    self._receipt_publish_errors.pop(key, None)
+                has_retryable = any(
+                    pending.get('receipt_topic') == self._receipt_topic
+                    for pending in self._pending_receipts.values()
+                )
+                if not has_retryable:
+                    self._cancel_receipt_retry_timer_locked()
+            return True
+
+    def _retry_pending_receipts(self) -> None:
+        with self._receipt_lock:
+            current_topic = self._receipt_topic
+            pending = [
+                receipt for receipt in self._pending_receipts.values()
+                if receipt.get('receipt_topic') == current_topic
+            ]
+            if not pending:
+                self._cancel_receipt_retry_timer_locked()
+                return
+        for receipt in pending:
+            self._publish_receipt(receipt)
+
+    def _drain_buffer_locked(self, target_buffer=None) -> set[str]:
+        target_buffer = target_buffer or self._buf
+        utterance_ids: set[str] = set()
+        while not target_buffer.empty():
+            try:
+                _kind, utterance_id, _pcm, _generation, _legacy = target_buffer.get_nowait()
+                if utterance_id:
+                    utterance_ids.add(utterance_id)
             except queue.Empty:
                 break
+        return utterance_ids
+
+    def _discard_control_items_locked(self, generation: int,
+                                      target_buffer=None) -> None:
+        target_buffer = target_buffer or self._buf
+        retained = []
+        while True:
+            try:
+                item = target_buffer.get_nowait()
+            except queue.Empty:
+                break
+            kind, _utterance_id, _pcm, item_generation, _legacy = item
+            if kind != 'control' or item_generation != generation:
+                retained.append(item)
+        for item in retained:
+            target_buffer.put(item)
+
+    def _call_play_stop(self, context: str,
+                        expected_generation: int | None = None) -> int | None:
+        deadline = time.monotonic() + self.CONTROL_RPC_TIMEOUT_SEC
         try:
-            self._client.PlayStop(APP_NAME)
+            pending = None
+            with self._sdk_lock:
+                if expected_generation is not None:
+                    with self._lock:
+                        if (self._interrupt_flag.is_set()
+                                or expected_generation != self._generation):
+                            return None
+                if hasattr(self._client, 'PlayStopStart'):
+                    send_timeout = min(
+                        self.RPC_SEND_TIMEOUT_SEC,
+                        max(0.0, deadline - time.monotonic()),
+                    )
+                    code, pending = self._client.PlayStopStart(
+                        APP_NAME, send_timeout=send_timeout,
+                    )
+                else:
+                    code = self._client.PlayStop(APP_NAME)
+            if code == 0 and pending is not None:
+                code = self._client.PlayStopFinish(
+                    pending,
+                    timeout=max(0.0, deadline - time.monotonic()),
+                )
+            return code
         except Exception as e:
-            self.get_logger().warn(f"PlayStop error: {e}")
-        self.state = "idle"
-        self.get_logger().info("Speaker stopped")
+            self.get_logger().warn(f"[speaker] {context} PlayStop error: {e}")
+            return -1
+
+    def stop_play(self) -> dict:
+        with self._lifecycle_lock:
+            return self._stop_play_serialized()
+
+    def _stop_play_serialized(self) -> dict:
+        with self._lock:
+            self._control_in_progress = True
+            self._accept_chunks = False
+            self._cancel_flush_timer_locked()
+            if self._sub is not None:
+                self.destroy_subscription(self._sub)
+                self._sub = None
+            stopped_generation = self._generation
+            stopped_buffer = self._buf
+            self._generation += 1
+            self._generation_ids.setdefault(self._generation, set())
+            self._buf = queue.Queue()
+            self._interrupt_flag.set()
+            self._pause_event.set()
+            cancelled_ids = set(self._generation_ids.pop(stopped_generation, set()))
+            cancelled_ids.update(self._drain_buffer_locked(stopped_buffer))
+            if self._active_utterance_id:
+                cancelled_ids.add(self._active_utterance_id)
+            drain_thread = (self._drain_thread
+                            if self._drain_generation == stopped_generation else None)
+            if drain_thread is not None and drain_thread.is_alive():
+                # Wake a drain blocked in Queue.get(). The control item is queued
+                # before callbacks can enqueue a later generation.
+                stopped_buffer.put(
+                    ('control', '', b'', stopped_generation, False),
+                )
+
+        stop_code = self._call_play_stop('stop')
+
+        if drain_thread is not None and drain_thread.is_alive():
+            drain_thread.join(timeout=0.05)
+        with self._lock:
+            cancelled_ids.update(self._drain_buffer_locked(stopped_buffer))
+            if self._drain_generation == stopped_generation:
+                self._draining.clear()
+                self._drain_thread = None
+                self._drain_generation = None
+                self._active_utterance_id = None
+            # A successful hardware stop plus generation invalidation makes an
+            # old response waiter safe to detach; it cannot submit more audio.
+            success = stop_code == 0
+            self.state = 'idle' if success else 'error'
+
+        receipt_state = 'cancelled' if success else 'error'
+        receipt_reason = ('speaker_stopped' if success else
+                          f'play_stop_failed:{stop_code}')
+        for utterance_id in cancelled_ids:
+            self._emit_receipt(utterance_id, receipt_state, reason=receipt_reason,
+                               completion_basis='driver_control')
+
+        with self._lock:
+            if success:
+                self._interrupt_flag.clear()
+            self._control_in_progress = False
+            self._legacy_utterance_id = None
+            self._legacy_muted = False
+            self._legacy_last_dropped_time = 0.0
+            self._legacy_mute_deadline = 0.0
+            self._cancelled_ids.clear()
+            self._topic = None
+        with self._receipt_lock:
+            self._started_ids.clear()
+        self.get_logger().info(f"Speaker stopped: state={self.state} code={stop_code}")
+        return {
+            'state': self.state,
+            'play_stop_code': stop_code,
+            'error': receipt_reason if not success else '',
+        }
 
     def interrupt(self) -> dict:
         """立即中止播放：清空 buffer，停止 SDK，保持 subscription。"""
+        with self._lifecycle_lock:
+            return self._interrupt_serialized()
+
+    def _interrupt_serialized(self) -> dict:
         with self._lock:
+            if self.state == 'error':
+                return {
+                    "state": "error",
+                    "error": "speaker requires stop/start recovery",
+                }
+            if self._control_in_progress:
+                return {"state": self.state, "error": "speaker control already in progress"}
+            interrupted_generation = self._generation
+            had_subscription = self._sub is not None
+            self._control_in_progress = True
+            interrupted_buffer = self._buf
+            self._generation += 1
+            self._generation_ids.setdefault(self._generation, set())
+            self._buf = queue.Queue()
             self._interrupt_flag.set()
-            # 清空 buffer
-            while not self._buf.empty():
-                try:
-                    self._buf.get_nowait()
-                except queue.Empty:
-                    break
-            # 停止 SDK 播放
-            try:
-                self._client.PlayStop(APP_NAME)
-            except Exception as e:
-                self.get_logger().warn(f"[speaker] interrupt PlayStop error: {e}")
-            # 等 drain thread 退出
-            if self._drain_thread is not None and self._drain_thread.is_alive():
-                self._drain_thread.join(timeout=1)
-                self._drain_thread = None
-            self._interrupt_flag.clear()
             self._pause_event.set()
-            self._draining.clear()
-            self._muted = True  # 静默：丢弃后续 TTS chunks 直到新 utterance
-            self.state = "ready"
-        self.get_logger().info("[speaker] interrupted — buffer cleared, muted until new utterance")
-        return {"state": "ready", "action": "interrupted"}
+            self._cancel_flush_timer_locked()
+            cancelled_ids = set(self._generation_ids.pop(interrupted_generation, set()))
+            cancelled_ids.update(self._drain_buffer_locked(interrupted_buffer))
+            if self._active_utterance_id:
+                cancelled_ids.add(self._active_utterance_id)
+            for utterance_id in cancelled_ids:
+                self._remember_bounded(self._cancelled_ids, utterance_id, True)
+            # Legacy producers have no ID, so late chunks can only be isolated by EOF.
+            self._legacy_muted = self._legacy_utterance_id is not None
+            if self._legacy_muted:
+                now = self._monotonic()
+                self._legacy_last_dropped_time = now
+                self._legacy_mute_deadline = now + self.LEGACY_MUTE_TIMEOUT_SEC
+            drain_thread = (self._drain_thread
+                            if self._drain_generation == interrupted_generation else None)
+            if drain_thread is not None and drain_thread.is_alive():
+                # Keep a blocked old drain from consuming the first frame of the
+                # new generation while PlayStop is in progress.
+                interrupted_buffer.put(
+                    ('control', '', b'', interrupted_generation, False),
+                )
+
+        stop_code = self._call_play_stop('interrupt')
+
+        if drain_thread is not None and drain_thread.is_alive():
+            drain_thread.join(timeout=0.05)
+        with self._lock:
+            self._discard_control_items_locked(
+                interrupted_generation, interrupted_buffer,
+            )
+            if self._drain_generation == interrupted_generation:
+                self._draining.clear()
+                self._drain_thread = None
+                self._drain_generation = None
+                self._active_utterance_id = None
+            success = stop_code == 0
+            if not success:
+                self._accept_chunks = False
+                cancelled_ids.update(self._drain_buffer_locked())
+                cancelled_ids.update(self._generation_ids.pop(self._generation, set()))
+                self.state = 'error'
+
+        receipt_state = 'cancelled' if success else 'error'
+        receipt_reason = ('interrupted' if success else
+                          f'play_stop_failed:{stop_code}')
+        for utterance_id in cancelled_ids:
+            self._emit_receipt(utterance_id, receipt_state, reason=receipt_reason,
+                               completion_basis='driver_control')
+
+        with self._lock:
+            self._control_in_progress = False
+            if success:
+                self._interrupt_flag.clear()
+                if not had_subscription:
+                    self.state = 'idle'
+                else:
+                    self.state = "playing" if not self._buf.empty() else "ready"
+                if had_subscription and not self._buf.empty():
+                    self._start_drain_locked()
+        self.get_logger().info(
+            f"[speaker] interrupted — cancelled={sorted(cancelled_ids)} stop_code={stop_code}"
+        )
+        return {
+            "state": self.state,
+            "action": "interrupted",
+            "play_stop_code": stop_code,
+            "cancelled_utterance_ids": sorted(cancelled_ids),
+            "error": receipt_reason if not success else '',
+        }
 
     def pause(self) -> dict:
         """暂停播放：停止 SDK，保留 buffer 中未播放的内容。"""
+        with self._lifecycle_lock:
+            return self._pause_serialized()
+
+    def _pause_serialized(self) -> dict:
         with self._lock:
+            if self._control_in_progress:
+                return {"state": self.state, "error": "speaker control already in progress"}
             if self.state not in ("playing", "ready"):
                 return {"state": self.state, "error": "not playing"}
-            self._pause_event.clear()  # drain thread 将阻塞在 wait()
-            try:
-                self._client.PlayStop(APP_NAME)
-            except Exception as e:
-                self.get_logger().warn(f"[speaker] pause PlayStop error: {e}")
+            self._control_in_progress = True
+            self._pause_epoch += 1
+            self._pause_event.clear()
             self.state = "paused"
+        stop_code = self._call_play_stop('pause')
+        failed_ids: set[str] = set()
+        drain_thread = None
+        with self._lock:
+            if stop_code != 0:
+                failed_generation = self._generation
+                failed_buffer = self._buf
+                self._generation += 1
+                self._generation_ids.setdefault(self._generation, set())
+                self._buf = queue.Queue()
+                self._accept_chunks = False
+                self._interrupt_flag.set()
+                self._pause_event.set()
+                failed_ids.update(self._generation_ids.pop(failed_generation, set()))
+                failed_ids.update(self._drain_buffer_locked(failed_buffer))
+                if self._active_utterance_id:
+                    failed_ids.add(self._active_utterance_id)
+                drain_thread = (self._drain_thread
+                                if self._drain_generation == failed_generation else None)
+                if drain_thread is not None and drain_thread.is_alive():
+                    failed_buffer.put(
+                        ('control', '', b'', failed_generation, False),
+                    )
+                self.state = 'error'
+        if drain_thread is not None and drain_thread.is_alive():
+            drain_thread.join(timeout=1)
+        if stop_code != 0:
+            with self._lock:
+                failed_ids.update(self._drain_buffer_locked(failed_buffer))
+            for utterance_id in failed_ids:
+                self._emit_receipt(
+                    utterance_id, 'error', reason=f'play_stop_failed:{stop_code}',
+                    completion_basis='driver_control',
+                )
+        with self._lock:
+            self._control_in_progress = False
         self.get_logger().info(f"[speaker] paused — buffer size={self._buf.qsize()}")
-        return {"state": "paused", "buffer_chunks": self._buf.qsize()}
+        return {
+            "state": self.state,
+            "buffer_chunks": self._buf.qsize(),
+            "play_stop_code": stop_code,
+            "error": '' if stop_code == 0 else f'play_stop_failed:{stop_code}',
+        }
 
     def resume(self) -> dict:
         """恢复播放：从 buffer 中剩余内容继续。"""
+        with self._lifecycle_lock:
+            return self._resume_serialized()
+
+    def _resume_serialized(self) -> dict:
         with self._lock:
             if self.state != "paused":
                 return {"state": self.state, "error": "not paused"}
-            self.state = "playing"
+            has_pending_playback = (
+                not self._buf.empty()
+                or (self._drain_thread is not None and self._drain_thread.is_alive())
+            )
+            self.state = "playing" if has_pending_playback else "ready"
             self._pause_event.set()  # 唤醒 drain thread
             # 如果 drain thread 已经退出了（pause 时退出），重新启动
             if self._drain_thread is None or not self._drain_thread.is_alive():
                 if not self._buf.empty():
-                    self._start_drain()
+                    self._start_drain_locked()
         self.get_logger().info("[speaker] resumed")
-        return {"state": "playing"}
-
-    # EOF magic: 8 bytes (4 samples [1,-1,1,-1])，标记 utterance 结束
-    AUDIO_EOF_MAGIC = b'\x01\x00\xff\xff\x01\x00\xff\xff'
+        return {"state": self.state}
 
     def _on_chunk(self, msg: AudioChunk) -> None:
         pcm = bytes(msg.data)
-        now = time.monotonic()
-        self._idx += 1
+        now = self._monotonic()
+        is_eof = len(pcm) == 8 and pcm == self.AUDIO_EOF_MAGIC
+        frame_id = (getattr(getattr(msg, 'header', None), 'frame_id', '') or '').strip()
 
-        # 检测 EOF magic：utterance 结束标记
-        if len(pcm) == 8 and pcm == self.AUDIO_EOF_MAGIC:
-            if self._muted:
-                self._muted = False
-                self.get_logger().info("[speaker] unmuted — received EOF marker")
-            return  # EOF 不入 buffer、不播放
-
-        # Muted 状态：interrupt 后丢弃来自旧 utterance 的 chunks
-        if self._muted:
+        with self._lock:
+            if not self._accept_chunks:
+                return
+            self._idx += 1
             self._last_chunk_time = now
-            return  # 丢弃，等 EOF 到达
+            legacy = not frame_id.startswith('utt:') or len(frame_id) <= 4
 
-        self._buf.put(pcm)
-        self._last_chunk_time = now
-        # 更新状态：收到 chunk 时如果是 ready，变为 playing
-        if self.state == "ready":
-            self.state = "playing"
-        if not self._draining.is_set() and self.state == "playing" and self._buf.qsize() >= self.PREFILL:
-            self._start_drain()
-        elif not self._draining.is_set() and self.state == "playing" and self._flush_timer is None:
-            # start a flush timer — if no more chunks arrive, drain what we have
-            self._flush_timer = self.create_timer(0.2, self._check_flush)
+            if legacy:
+                if self._legacy_muted:
+                    if is_eof:
+                        self._legacy_muted = False
+                        self._legacy_last_dropped_time = 0.0
+                        self._legacy_mute_deadline = 0.0
+                        self._legacy_utterance_id = None
+                        self.get_logger().info("[speaker] legacy stream unmuted at EOF")
+                        return
+                    silence_gap = now - self._legacy_last_dropped_time
+                    if (silence_gap < self.LEGACY_NEW_UTTERANCE_GAP_SEC
+                            and now < self._legacy_mute_deadline):
+                        self._legacy_last_dropped_time = now
+                        return
+                    self._legacy_muted = False
+                    self._legacy_last_dropped_time = 0.0
+                    self._legacy_mute_deadline = 0.0
+                    self._legacy_utterance_id = None
+                    self.get_logger().warn(
+                        "[speaker] legacy mute watchdog opened a new utterance; "
+                        "upgrade the producer to AudioChunk frame_id protocol"
+                    )
+                if self._legacy_utterance_id is None:
+                    self._legacy_counter += 1
+                    self._legacy_utterance_id = f"legacy:{self._legacy_counter}"
+                utterance_id = self._legacy_utterance_id
+            else:
+                utterance_id = frame_id
+                if utterance_id in self._cancelled_ids:
+                    return
+
+            generation = self._generation
+            self._generation_ids.setdefault(generation, set()).add(utterance_id)
+            kind = 'eof' if is_eof else 'audio'
+            self._buf.put((kind, utterance_id, b'' if is_eof else pcm,
+                           generation, legacy))
+
+            if is_eof:
+                if legacy:
+                    self._legacy_utterance_id = None
+                self._cancel_flush_timer_locked()
+                self._start_drain_locked()
+                return
+
+            if self.state == "ready":
+                self.state = "playing"
+            if (not self._control_in_progress and not self._draining.is_set()
+                    and self._buf.qsize() >= self.PREFILL):
+                self._start_drain_locked()
+            elif not self._control_in_progress and not self._draining.is_set():
+                # Backward compatibility for producers that do not send EOF.
+                # Debounce on every chunk so a short stream cannot be stranded
+                # when an earlier timer fires before the idle threshold.
+                self._schedule_flush_timer_locked()
 
     def _start_drain(self) -> None:
-        if self._flush_timer is not None:
-            self._flush_timer.cancel()
-            self.destroy_timer(self._flush_timer)
-            self._flush_timer = None
+        with self._lock:
+            self._start_drain_locked()
+
+    def _start_drain_locked(self) -> None:
+        if self._control_in_progress or not self._accept_chunks:
+            return
+        if self._drain_thread is not None and self._drain_thread.is_alive():
+            return
+        self._cancel_flush_timer_locked()
         self._draining.set()
-        self._drain_thread = threading.Thread(target=self._drain, daemon=True)
+        generation = self._generation
+        drain_buffer = self._buf
+        self._drain_generation = generation
+        self._drain_thread = threading.Thread(
+            target=self._drain_guarded,
+            args=(generation, drain_buffer),
+            daemon=True,
+        )
         self._drain_thread.start()
 
-    def _check_flush(self) -> None:
+    def _check_flush(self, token: int, generation: int, target_buffer) -> None:
         """Timer callback: if no new chunks for 300ms and buffer non-empty, start drain."""
-        if self._flush_timer is not None:
-            self._flush_timer.cancel()
-            self.destroy_timer(self._flush_timer)
-            self._flush_timer = None
-        if not self._draining.is_set() and not self._buf.empty() and self.state == "playing":
-            idle = time.monotonic() - self._last_chunk_time
-            if idle >= 0.15:
-                self._start_drain()
+        with self._lock:
+            if (token != self._flush_token
+                    or generation != self._generation
+                    or target_buffer is not self._buf):
+                return
+            self._cancel_flush_timer_locked()
+            if (self._control_in_progress or self._draining.is_set()
+                    or target_buffer.empty() or self.state != "playing"):
+                return
+            idle = self._monotonic() - self._last_chunk_time
+            remaining = 0.15 - idle
+            if remaining > 0:
+                self._schedule_flush_timer_locked(remaining)
+                return
+            self._start_drain_locked()
 
-    def _drain(self) -> None:
+    def _drain_guarded(self, generation: int, drain_buffer) -> None:
+        try:
+            self._drain(generation, drain_buffer)
+        except Exception as e:
+            receipt = None
+            with self._lock:
+                utterance_id = self._active_utterance_id
+                current_generation = generation == self._generation
+                if utterance_id and current_generation:
+                    # Record while generation and session are protected. A stale
+                    # drain must never write an error into a later start session.
+                    receipt = self._record_receipt(
+                        utterance_id, 'error',
+                        reason=f'drain_exception:{type(e).__name__}',
+                        completion_basis='driver_control',
+                    )
+                    if receipt is not None:
+                        for generation_ids in self._generation_ids.values():
+                            generation_ids.discard(utterance_id)
+            self._publish_and_log_receipt(receipt)
+            with self._lock:
+                if self._drain_generation == generation:
+                    self._draining.clear()
+                    self._drain_thread = None
+                    self._drain_generation = None
+                    self._active_utterance_id = None
+                    self.state = 'error'
+            self.get_logger().error(f"[speaker] drain crashed: {e}")
+
+    def _drain(self, generation: int, drain_buffer) -> None:
         play_idx = 0
         merged = b''
         empty_count = 0
-        while self._draining.is_set():
+        current_id: str | None = None
+        current_legacy = False
+        current_bytes = 0
+        current_error = ''
+
+        def finish_current(*, saw_eof: bool) -> None:
+            nonlocal merged, play_idx, current_id, current_legacy
+            nonlocal current_bytes, current_error
+            if not current_id:
+                return
+            if (merged and not current_error
+                    and not self._interrupt_flag.is_set()):
+                play_idx += 1
+                ok, error = self._play_merged(merged, play_idx, current_id, generation)
+                if not ok and not current_error:
+                    current_error = error
+                    if error != 'interrupted':
+                        self._call_play_stop(
+                            'stream-error', expected_generation=generation,
+                        )
+                merged = b''
+            if not current_error and self.PLAYBACK_GRACE_SEC > 0:
+                while True:
+                    wait_state = self._wait_playback_interval(
+                        self.PLAYBACK_GRACE_SEC, generation,
+                    )
+                    if wait_state == 'paused':
+                        if not self._wait_until_resumed(generation):
+                            return
+                        continue
+                    if wait_state != 'done':
+                        return
+                    break
+            receipt = None
+            # Make the generation check and terminal receipt record atomic with
+            # interrupt(); DDS publication happens after releasing the state lock.
+            with self._lock:
+                if self._interrupt_flag.is_set() or generation != self._generation:
+                    return
+                if current_error:
+                    receipt = self._record_receipt(
+                        current_id, 'error', audio_bytes=current_bytes,
+                        reason=current_error, completion_basis='driver_drained_estimated',
+                    )
+                elif saw_eof or current_legacy:
+                    basis = 'driver_drained_estimated' if saw_eof else 'driver_idle_estimated'
+                    receipt = self._record_receipt(
+                        current_id, 'completed', audio_bytes=current_bytes,
+                        completion_basis=basis,
+                    )
+                else:
+                    receipt = self._record_receipt(
+                        current_id, 'error', audio_bytes=current_bytes,
+                        reason='missing_eof', completion_basis='driver_drained_estimated',
+                    )
+                if (current_legacy
+                        and self._legacy_utterance_id == current_id):
+                    self._legacy_utterance_id = None
+                if receipt is not None:
+                    for generation_ids in self._generation_ids.values():
+                        generation_ids.discard(current_id)
+            self._publish_and_log_receipt(receipt)
+            current_id = None
+            current_legacy = False
+            current_bytes = 0
+            current_error = ''
+
+        while self._draining.is_set() and generation == self._generation:
             # 检查 interrupt
             if self._interrupt_flag.is_set():
-                return
+                break
             # 检查 pause（阻塞等待 resume 或 interrupt）
             if not self._pause_event.wait(timeout=0.1):
                 continue  # 还在 paused，循环检查 interrupt
 
             try:
-                pcm = self._buf.get(timeout=0.1)
-                merged += pcm
+                kind, utterance_id, pcm, item_generation, legacy = drain_buffer.get(timeout=0.1)
+                if item_generation != generation:
+                    continue
+                if kind == 'control':
+                    break
                 empty_count = 0
             except queue.Empty:
                 empty_count += 1
                 if merged and empty_count >= 2:
                     play_idx += 1
-                    self._play_merged(merged, play_idx)
+                    ok, error = self._play_merged(merged, play_idx, current_id or '', generation)
+                    if not ok and not current_error:
+                        current_error = error
+                        if error != 'interrupted':
+                            self._call_play_stop(
+                                'stream-error', expected_generation=generation,
+                            )
                     merged = b''
                 elif not merged and empty_count >= 3:
+                    finish_current(saw_eof=False)
                     break
                 continue
+
+            if current_id is None:
+                current_id = utterance_id
+                current_legacy = legacy
+                with self._lock:
+                    if generation == self._generation:
+                        self._active_utterance_id = current_id
+            elif utterance_id != current_id:
+                finish_current(saw_eof=False)
+                current_id = utterance_id
+                current_legacy = legacy
+                with self._lock:
+                    if generation == self._generation:
+                        self._active_utterance_id = current_id
+
+            if kind == 'eof':
+                finish_current(saw_eof=True)
+                with self._lock:
+                    if (generation == self._generation
+                            and self._active_utterance_id == current_id):
+                        self._active_utterance_id = None
+                if drain_buffer.empty():
+                    break
+                continue
+
+            current_bytes += len(pcm)
+            if current_error:
+                continue
+            merged += pcm
             if len(merged) >= self.MERGE_BYTES:
                 play_idx += 1
-                self._play_merged(merged, play_idx)
+                ok, error = self._play_merged(merged, play_idx, current_id, generation)
+                if not ok and not current_error:
+                    current_error = error
+                    if error != 'interrupted':
+                        self._call_play_stop(
+                            'stream-error', expected_generation=generation,
+                        )
                 merged = b''
-        if merged and not self._interrupt_flag.is_set():
-            play_idx += 1
-            self._play_merged(merged, play_idx)
-        self._draining.clear()
-        # 播放完毕，回到 ready（如果没有被 interrupt/stop）
-        if self.state == "playing":
-            self.state = "ready"
+        if generation == self._generation and not self._interrupt_flag.is_set():
+            finish_current(saw_eof=False)
+        with self._lock:
+            if self._drain_generation == generation:
+                self._draining.clear()
+                self._drain_thread = None
+                self._drain_generation = None
+                self._active_utterance_id = None
+                if (not drain_buffer.empty() and self._accept_chunks
+                        and not self._control_in_progress):
+                    self.state = 'playing'
+                    self._start_drain_locked()
+                elif self.state == "playing":
+                    self.state = "ready"
         self.get_logger().info("[speaker] drain finished")
 
-    def _play_merged(self, pcm: bytes, idx: int) -> None:
-        # 播放前再次检查 interrupt
-        if self._interrupt_flag.is_set():
-            return
+    def _wait_until_resumed(self, generation: int) -> bool:
+        while not self._pause_event.wait(timeout=0.05):
+            with self._lock:
+                if self._interrupt_flag.is_set() or generation != self._generation:
+                    return False
+        with self._lock:
+            return not self._interrupt_flag.is_set() and generation == self._generation
+
+    def _wait_playback_interval(self, seconds: float, generation: int) -> str:
+        deadline = self._monotonic() + seconds
+        while True:
+            with self._lock:
+                if self._interrupt_flag.is_set() or generation != self._generation:
+                    return 'interrupted'
+                if not self._pause_event.is_set():
+                    return 'paused'
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                return 'done'
+            if self._waiter(min(0.05, remaining)):
+                return 'interrupted'
+
+    def _play_merged(self, pcm: bytes, idx: int, utterance_id: str,
+                     generation: int) -> tuple[bool, str]:
         duration = len(pcm) / 32000
-        t0 = time.monotonic()
-        try:
-            code, data = self._client.PlayStream(APP_NAME, "0", pcm)
+        while True:
+            if not self._wait_until_resumed(generation):
+                return False, 'interrupted'
+            # Serialize SDK submissions with PlayStop. The generation check must
+            # be inside the same critical section so an interrupted stream can
+            # never submit PlayStream after the matching PlayStop.
+            pending = None
+            started_receipt = None
+            with self._sdk_lock:
+                with self._lock:
+                    if self._interrupt_flag.is_set() or generation != self._generation:
+                        return False, 'interrupted'
+                    if not self._pause_event.is_set():
+                        continue
+                    pause_epoch = self._pause_epoch
+                t0 = self._monotonic()
+                try:
+                    if hasattr(self._client, 'PlayStreamStart'):
+                        code, pending = self._client.PlayStreamStart(
+                            APP_NAME, "0", pcm,
+                            send_timeout=self.RPC_SEND_TIMEOUT_SEC,
+                        )
+                        data = None
+                    else:
+                        code, data = self._client.PlayStream(APP_NAME, "0", pcm)
+                except Exception as e:
+                    with self._lock:
+                        if (self._interrupt_flag.is_set()
+                                or generation != self._generation):
+                            return False, 'interrupted'
+                        paused_since_submit = pause_epoch != self._pause_epoch
+                    if paused_since_submit:
+                        if not self._wait_until_resumed(generation):
+                            return False, 'interrupted'
+                        continue
+                    self.get_logger().error(f"[speaker] PlayStream error: {e}")
+                    return False, f'play_stream_exception:{type(e).__name__}'
+            if code == 0:
+                with self._lock:
+                    if (self._interrupt_flag.is_set()
+                            or generation != self._generation):
+                        return False, 'interrupted'
+                    started_receipt = self._record_receipt(
+                        utterance_id, 'started',
+                    )
+                self._publish_and_log_receipt(started_receipt)
+            if code == 0 and pending is not None:
+                try:
+                    code, data = self._client.PlayStreamFinish(
+                        pending, timeout=self.STREAM_RPC_TIMEOUT_SEC,
+                    )
+                except Exception as e:
+                    with self._lock:
+                        if (self._interrupt_flag.is_set()
+                                or generation != self._generation):
+                            return False, 'interrupted'
+                        paused_since_submit = pause_epoch != self._pause_epoch
+                    if paused_since_submit:
+                        if not self._wait_until_resumed(generation):
+                            return False, 'interrupted'
+                        continue
+                    self.get_logger().error(f"[speaker] PlayStream response error: {e}")
+                    return False, f'play_stream_exception:{type(e).__name__}'
+            with self._lock:
+                if (self._interrupt_flag.is_set()
+                        or generation != self._generation):
+                    return False, 'interrupted'
+                paused_since_submit = pause_epoch != self._pause_epoch
+            if paused_since_submit:
+                if not self._wait_until_resumed(generation):
+                    return False, 'interrupted'
+                continue
             if code != 0:
-                self.get_logger().error(f"[speaker] PlayStream error code={code}, data={data}")
-        except Exception as e:
-            self.get_logger().error(f"[speaker] PlayStream error: {e}")
-        elapsed = time.monotonic() - t0
-        remaining = duration - elapsed - 0.08
-        if remaining > 0 and not self._interrupt_flag.is_set():
-            time.sleep(remaining)
+                self.get_logger().error(
+                    f"[speaker] PlayStream error code={code}, data={data}"
+                )
+                return False, f'play_stream_failed:{code}'
+            elapsed = self._monotonic() - t0
+            wait_state = self._wait_playback_interval(
+                max(0.0, duration - elapsed), generation,
+            )
+            if wait_state == 'paused':
+                # PlayStop may have interrupted the current block. Re-submit it
+                # after resume; duplicate audio is preferable to a false complete.
+                continue
+            if wait_state != 'done':
+                return False, 'interrupted'
+            return True, ''
 
 
 class SpeakerPlugin:
@@ -569,31 +1350,80 @@ class SpeakerPlugin:
                 "required": ["action"],
             },
             "topic_in": [{"format": "audio/pcm-16k"}],
+            "topic_out": [{
+                "format": "data/json",
+                "schema": "speech_playback_receipt/v1",
+                "qos": {
+                    "reliability": "reliable",
+                    "durability": "transient_local",
+                    "depth": 50,
+                },
+                "desc": "per-utterance playback receipts",
+            }],
         }
 
     def start(self) -> None:
         pass  # startup sound is played on first dispatch(start) when project starts
 
-    def _play_startup_sound(self) -> None:
+    def _play_startup_sound(self, generation: int) -> tuple[bool, str]:
         """Play startup PCM by directly calling PlayStream in small blocks with pacing."""
         import pathlib
         pcm_path = pathlib.Path(__file__).parent / 'resource' / 'startup_beep.pcm'
         try:
             pcm = pcm_path.read_bytes()
+        except Exception as e:
+            self._node.get_logger().warn(f"[speaker] startup sound unavailable: {e}")
+            return True, f'startup_sound_skipped:{type(e).__name__}'
+        try:
             block_size = 9600  # ~300ms per block
             for offset in range(0, len(pcm), block_size):
                 block = pcm[offset:offset + block_size]
-                code, _ = self._node._client.PlayStream(APP_NAME, "0", block)
+                pending = None
+                with self._node._sdk_lock:
+                    with self._node._lock:
+                        if generation != self._node._generation:
+                            return False, 'startup_interrupted'
+                    if hasattr(self._node._client, 'PlayStreamStart'):
+                        code, pending = self._node._client.PlayStreamStart(
+                            APP_NAME, "0", block,
+                            send_timeout=self._node.RPC_SEND_TIMEOUT_SEC,
+                        )
+                        data = None
+                    else:
+                        code, data = self._node._client.PlayStream(
+                            APP_NAME, "0", block,
+                        )
+                if code == 0 and pending is not None:
+                    code, data = self._node._client.PlayStreamFinish(
+                        pending, timeout=self._node.CONTROL_RPC_TIMEOUT_SEC,
+                    )
+                with self._node._lock:
+                    if generation != self._node._generation:
+                        return False, 'startup_interrupted'
                 if code != 0:
                     self._node.get_logger().warn(f"[speaker] startup sound stopped at offset {offset}: code={code}")
-                    return
+                    self._node._call_play_stop(
+                        'startup-error', expected_generation=generation,
+                    )
+                    return False, f'startup_play_failed:{code}'
                 duration = len(block) / 32000
                 remaining = duration - 0.08
-                if remaining > 0:
-                    time.sleep(remaining)
+                if (remaining > 0
+                        and self._node._wait_playback_interval(
+                            remaining, generation,
+                        ) != 'done'):
+                    return False, 'startup_interrupted'
             self._node.get_logger().info(f"[speaker] startup sound OK ({len(pcm)} bytes)")
+            return True, ''
         except Exception as e:
+            with self._node._lock:
+                if generation != self._node._generation:
+                    return False, 'startup_interrupted'
             self._node.get_logger().warn(f"[speaker] startup sound error: {e}")
+            self._node._call_play_stop(
+                'startup-error', expected_generation=generation,
+            )
+            return False, f'startup_play_exception:{type(e).__name__}'
 
     def stop(self) -> None:
         self._node.stop_play()
@@ -606,20 +1436,97 @@ class SpeakerPlugin:
             if not topic:
                 return {"error": "Missing input_topic"}
             # Always stop first to ensure clean restart
-            self._node.stop_play()
+            stop_result = self._node.stop_play()
+            if stop_result.get('state') == 'error':
+                return stop_result
+            with self._node._lock:
+                startup_generation = self._node._generation
             # Play startup sound synchronously before starting subscription
-            self._play_startup_sound()
-            topic = self._node.start_play(topic)
-            return {"state": "ready", "topic": topic}
-        elif action == "stop":
-            self._node.stop_play()
-            return {"state": "idle"}
-        elif action == "info":
+            startup_ok, startup_error = self._play_startup_sound(startup_generation)
+            if not startup_ok:
+                return {
+                    "state": self._node.state,
+                    "error": startup_error,
+                }
+            with self._node._lifecycle_lock:
+                with self._node._lock:
+                    if startup_generation != self._node._generation:
+                        return {
+                            "state": self._node.state,
+                            "error": "startup_interrupted",
+                        }
+                topic = self._node._start_play_serialized(topic)
             return {
-                "state": self._node.state,
-                "topic": self._node._topic,
-                "buffer_chunks": self._node._buf.qsize(),
+                "state": "ready",
+                "topic": topic,
+                "speech_protocol": "audiochunk-frameid-v1",
+                "session_id": self._node._session_id,
+                "receipt_topic": self._node._receipt_topic,
+                "completion_basis": "driver_drained_estimated",
+                "receipt_recovery": "transient_local_then_info_poll",
+                "startup_warning": startup_error,
+                "topic_out": [{
+                    "topic": self._node._receipt_topic,
+                    "format": "data/json",
+                    "schema": "speech_playback_receipt/v1",
+                    "qos": {
+                        "reliability": "reliable",
+                        "durability": "transient_local",
+                        "depth": 50,
+                    },
+                    "desc": "per-utterance playback receipts",
+                }],
             }
+        elif action == "stop":
+            return self._node.stop_play()
+        elif action == "info":
+            with self._node._lock:
+                with self._node._receipt_lock:
+                    receipt_topic = self._node._receipt_topic
+                    last_terminal = self._node._last_terminal_receipt
+                    return {
+                        "state": self._node.state,
+                        "topic": self._node._topic,
+                        "buffer_chunks": self._node._buf.qsize(),
+                        "speech_protocol": "audiochunk-frameid-v1",
+                        "session_id": self._node._session_id,
+                        "receipt_topic": receipt_topic,
+                        "completion_basis": "driver_drained_estimated",
+                        "receipt_recovery": "transient_local_then_info_poll",
+                        "active_utterance_id": self._node._active_utterance_id,
+                        "last_terminal_receipt": (
+                            dict(last_terminal) if last_terminal else None
+                        ),
+                        "recent_terminal_receipts": [
+                            dict(receipt)
+                            for receipt in self._node._terminal_ids.values()
+                        ],
+                        "pending_receipts": [
+                            dict(receipt)
+                            for receipt in self._node._pending_receipts.values()
+                        ],
+                        "receipt_publish_errors": [
+                            {
+                                "session_id": key[0],
+                                "utterance_id": key[1],
+                                "state": key[2],
+                                "error": error,
+                            }
+                            for key, error
+                            in self._node._receipt_publish_errors.items()
+                        ],
+                        "topic_out": [{
+                            "topic": receipt_topic,
+                            "format": "data/json",
+                            "schema": "speech_playback_receipt/v1",
+                            "qos": {
+                                "reliability": "reliable",
+                                "durability": "transient_local",
+                                "depth": 50,
+                            },
+                            "desc": "per-utterance playback receipts",
+                        }] if receipt_topic else [],
+                    }
         return None
 
 

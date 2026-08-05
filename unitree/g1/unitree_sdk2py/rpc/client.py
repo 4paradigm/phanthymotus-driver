@@ -48,6 +48,18 @@ class Client(ClientBase):
             return self._CallBase(apiId, parameter, proirity, leaseId)
         else:
             return RPC_ERR_CLIENT_API_NOT_REG, None
+
+    def _CallStart(self, apiId: int, parameter: str,
+                   send_timeout: float = None):
+        ret, proirity, leaseId = self.__CheckApi(apiId)
+        if ret == 0:
+            return self._CallStartBase(
+                apiId, parameter, proirity, leaseId, send_timeout,
+            )
+        return RPC_ERR_CLIENT_API_NOT_REG, None
+
+    def _CallFinish(self, pending, timeout: float = None):
+        return self._CallFinishBase(pending, timeout)
             
     def _CallNoReply(self, apiId: int, parameter: str):
         ret, proirity, leaseId = self.__CheckApi(apiId)
@@ -65,6 +77,22 @@ class Client(ClientBase):
                                                         leaseId)
         else:
             return RPC_ERR_CLIENT_API_NOT_REG, None
+
+    def _CallRequestWithParamAndBinStart(self, apiId: int,
+                                         requestParamter: str,
+                                         requestBinary: list,
+                                         send_timeout: float = None):
+        ret, proirity, leaseId = self.__CheckApi(apiId)
+        if ret == 0:
+            return self._CallRequestWithParamAndBinStartBase(
+                apiId, requestParamter, requestBinary, proirity, leaseId,
+                send_timeout,
+            )
+        return RPC_ERR_CLIENT_API_NOT_REG, None
+
+    def _CallRequestWithParamAndBinFinish(self, pending,
+                                          timeout: float = None):
+        return self._CallRequestWithParamAndBinFinishBase(pending, timeout)
 
     def _CallRequestWithParamAndBinNoReply(self, apiId: int, requestParamter: str,
                                            requestBinary: list):
