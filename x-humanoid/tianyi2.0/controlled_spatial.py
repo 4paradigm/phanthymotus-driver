@@ -292,10 +292,6 @@ class ControlledSpatialPlugin:
                     "restricted_scheduling_points": {"type": "string", "description": "Restricted area: scheduling points JSON string"},
                 },
                 "required": ["action"],
-                "x-completion": {
-                    "actions": ["navigate_to_tag", "navigate_to_pose"],
-                    "timeout": 180
-                },
                 "x-action-params": {
                     "start_mapping": {"params": ["map_name"], "description": "Start SLAM mapping with given map name"},
                     "stop_mapping": {"params": [], "description": "Stop mapping and save the map"},
