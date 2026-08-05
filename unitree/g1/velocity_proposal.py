@@ -226,6 +226,7 @@ class VelocityProposalGate:
         self.last_receive_monotonic = 0.0
         self.deadline_monotonic = 0.0
         self.last_reason = "not_connected"
+        self.recoverable_stop_active = False
 
     def bind(self, topic: str, expected_nav_id: str) -> None:
         nav_id = resolve_expected_nav_id({"expected_nav_id": expected_nav_id})
@@ -240,6 +241,7 @@ class VelocityProposalGate:
         self.last_receive_monotonic = 0.0
         self.deadline_monotonic = 0.0
         self.last_reason = ""
+        self.recoverable_stop_active = False
 
     def unbind(self, reason: str = "canvas_stop") -> None:
         self._retire_expected_nav_id()
@@ -250,12 +252,22 @@ class VelocityProposalGate:
         self.last_receive_monotonic = 0.0
         self.deadline_monotonic = 0.0
         self.last_reason = reason
+        self.recoverable_stop_active = False
 
     def disarm(self, reason: str) -> None:
         self._retire_expected_nav_id()
         self.armed = False
         self.deadline_monotonic = 0.0
         self.last_reason = reason
+        self.recoverable_stop_active = False
+
+    def hold_for_obstacle(self) -> None:
+        """Keep the nav lease armed after a confirmed local obstacle stop."""
+        if not self.armed:
+            return
+        self.deadline_monotonic = 0.0
+        self.last_reason = "obstacle_stop_recoverable"
+        self.recoverable_stop_active = True
 
     def _retire_expected_nav_id(self) -> None:
         if self.expected_nav_id:
@@ -299,6 +311,21 @@ class VelocityProposalGate:
                 - float(now_unix_ms)
             ) / 1000.0
             if remaining <= 0.0:
+                if self.recoverable_stop_active:
+                    # Stop confirmation can outlive the proposal TTL while
+                    # ROS retains newer samples.  The robot is already at a
+                    # confirmed stop, so reject this stale sample without
+                    # retiring the task lease; only a fresh later sample may
+                    # resume execution.
+                    self.last_sequence = proposal.sequence
+                    self.last_receive_monotonic = now
+                    self.deadline_monotonic = 0.0
+                    self.last_reason = "obstacle_stop_recoverable"
+                    return ProposalDecision(
+                        stop=True,
+                        reason="proposal_ttl_expired",
+                        proposal=proposal,
+                    )
                 self.disarm("proposal_ttl_expired")
                 return ProposalDecision(
                     stop=True,
@@ -320,6 +347,7 @@ class VelocityProposalGate:
 
         self.deadline_monotonic = now + duration
         self.last_reason = ""
+        self.recoverable_stop_active = False
         return ProposalDecision(execute=True, duration=duration, proposal=proposal)
 
     def watchdog(self, now: float) -> ProposalDecision:
@@ -341,4 +369,5 @@ class VelocityProposalGate:
             "last_sequence": self.last_sequence if self.last_sequence >= 0 else None,
             "last_message_age_ms": age_ms,
             "last_reason": self.last_reason or None,
+            "recoverable_stop_active": self.recoverable_stop_active,
         }
