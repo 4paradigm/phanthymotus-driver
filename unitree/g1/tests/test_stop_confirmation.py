@@ -6,8 +6,9 @@ import unittest
 
 from safety_harness import (
     OdomStopMonitor,
+    StopConfirmationStart,
+    finish_stop_confirmation,
     issue_stop_and_confirm,
-    resolve_proposal_stop_timeouts,
 )
 
 
@@ -116,23 +117,77 @@ class StopMoveConfirmationIntegrationTest(unittest.TestCase):
             "rpc unavailable",
         )
 
-    def test_stop_rpc_timeout_has_margin_within_confirmation_budget(self):
-        rpc_timeout, confirmation_timeout = resolve_proposal_stop_timeouts({
-            "velocity_proposal_stop_rpc_timeout": 0.1,
-            "velocity_proposal_stop_confirm_timeout": 0.5,
-        })
+    def test_parent_stop_ack_is_confirmed_by_child_odometry(self):
+        start = self.monitor.begin_confirmation()
+        self.monitor.record((0.0, 0.0, 0.0))
+        completed = time.monotonic()
 
-        self.assertEqual(rpc_timeout, 0.2)
-        self.assertEqual(confirmation_timeout, 0.5)
+        result = finish_stop_confirmation(
+            monitor=self.monitor,
+            start=start,
+            stop_move_ret=0,
+            stop_move_error=None,
+            stop_move_completed_monotonic=completed,
+            timeout=0.2,
+            max_age=0.5,
+            linear_epsilon=0.03,
+            yaw_epsilon=0.05,
+        )
 
-    def test_stop_rpc_timeout_never_exceeds_confirmation_budget(self):
-        rpc_timeout, confirmation_timeout = resolve_proposal_stop_timeouts({
-            "velocity_proposal_stop_rpc_timeout": 10.0,
-            "velocity_proposal_stop_confirm_timeout": 0.4,
-        })
+        self.assertTrue(result["stop_confirmed"])
+        diagnostics = result["stop_confirmation"]
+        self.assertEqual(diagnostics["odometry_callbacks_since_confirmation"], 1)
+        self.assertEqual(diagnostics["odometry_callbacks_during_stop_move"], 1)
 
-        self.assertEqual(rpc_timeout, 0.4)
-        self.assertEqual(confirmation_timeout, 0.4)
+    def test_parent_stop_failure_stays_fail_closed_with_zero_odometry(self):
+        start = StopConfirmationStart(
+            monotonic=time.monotonic(),
+            unix_ms=round(time.time() * 1000),
+            odometry_callback_count=0,
+        )
+        self.monitor.record((0.0, 0.0, 0.0))
+
+        result = finish_stop_confirmation(
+            monitor=self.monitor,
+            start=start,
+            stop_move_ret=3104,
+            stop_move_error=None,
+            stop_move_completed_monotonic=time.monotonic(),
+            timeout=0.2,
+            max_age=0.5,
+            linear_epsilon=0.03,
+            yaw_epsilon=0.05,
+        )
+
+        self.assertFalse(result["stop_confirmed"])
+        self.assertEqual(result["ret"], 3104)
+        self.assertEqual(
+            result["stop_confirmation"]["odometry_callbacks_since_confirmation"],
+            1,
+        )
+
+    def test_parent_completion_count_excludes_later_ipc_callbacks(self):
+        start = self.monitor.begin_confirmation()
+        self.monitor.record((0.0, 0.0, 0.0))
+        completed = time.monotonic()
+        self.monitor.record((0.0, 0.0, 0.0))
+
+        result = finish_stop_confirmation(
+            monitor=self.monitor,
+            start=start,
+            stop_move_ret=0,
+            stop_move_error=None,
+            stop_move_completed_monotonic=completed,
+            timeout=0.2,
+            max_age=0.5,
+            linear_epsilon=0.03,
+            yaw_epsilon=0.05,
+        )
+
+        diagnostics = result["stop_confirmation"]
+        self.assertTrue(result["stop_confirmed"])
+        self.assertEqual(diagnostics["odometry_callbacks_during_stop_move"], 1)
+        self.assertEqual(diagnostics["odometry_callbacks_since_confirmation"], 2)
 
 
 if __name__ == "__main__":

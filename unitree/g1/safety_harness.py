@@ -25,6 +25,7 @@ import queue
 import struct
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -90,6 +91,7 @@ class OdomStopMonitor:
         self._last_time = 0.0
         self._last_velocity = (float("inf"), float("inf"), float("inf"))
         self._callback_count = 0
+        self._callback_history = deque(maxlen=4096)
 
     def record(self, velocity, received_monotonic=None):
         received = (
@@ -104,6 +106,7 @@ class OdomStopMonitor:
             self._last_time = received
             self._last_velocity = motion
             self._callback_count += 1
+            self._callback_history.append((received, self._callback_count))
             self._condition.notify_all()
 
     def begin_confirmation(self):
@@ -128,6 +131,15 @@ class OdomStopMonitor:
                 "velocity": self._last_velocity,
                 "callback_count": self._callback_count,
             }
+
+    def callback_count_at(self, observed_monotonic):
+        """Return the last callback count observed at or before a timestamp."""
+        boundary = float(observed_monotonic)
+        with self._condition:
+            for received, callback_count in reversed(self._callback_history):
+                if received <= boundary:
+                    return callback_count
+            return 0
 
     def wait_for_stopped(
         self,
@@ -213,30 +225,24 @@ class OdomStopMonitor:
         return confirmed, diagnostics
 
 
-def issue_stop_and_confirm(
-    stop_move,
+def finish_stop_confirmation(
     monitor,
+    start,
+    stop_move_ret,
+    stop_move_error,
+    stop_move_completed_monotonic,
     timeout,
     max_age,
     linear_epsilon,
     yaw_epsilon,
     after_stop_attempt=None,
 ):
-    """Issue a bounded StopMove and require a subsequent measured zero frame."""
-    start = monitor.begin_confirmation()
-    stop_move_ret = None
-    stop_move_error = None
-    try:
-        stop_move_ret = stop_move()
-    except Exception as exc:
-        stop_move_error = str(exc)
-    finally:
-        stop_move_completed_monotonic = time.monotonic()
-        callbacks_at_stop_move_completion = monitor.latest(
-            stop_move_completed_monotonic
-        )["callback_count"]
-        if after_stop_attempt is not None:
-            after_stop_attempt()
+    """Confirm an acknowledged StopMove against post-boundary odometry."""
+    callbacks_at_stop_move_completion = monitor.callback_count_at(
+        stop_move_completed_monotonic
+    )
+    if after_stop_attempt is not None:
+        after_stop_attempt()
 
     stop_confirmed, diagnostics = monitor.wait_for_stopped(
         start=start,
@@ -262,29 +268,36 @@ def issue_stop_and_confirm(
     return result
 
 
-def resolve_proposal_stop_timeouts(proposal_config):
-    """Keep StopMove acknowledgement bounded within the odometry budget."""
-    confirmation_timeout = min(
-        1.0,
-        max(
-            0.1,
-            float(
-                proposal_config.get(
-                    "velocity_proposal_stop_confirm_timeout",
-                    0.5,
-                )
-            ),
-        ),
+def issue_stop_and_confirm(
+    stop_move,
+    monitor,
+    timeout,
+    max_age,
+    linear_epsilon,
+    yaw_epsilon,
+    after_stop_attempt=None,
+):
+    """Issue a bounded StopMove and require a subsequent measured zero frame."""
+    start = monitor.begin_confirmation()
+    stop_move_ret = None
+    stop_move_error = None
+    try:
+        stop_move_ret = stop_move()
+    except Exception as exc:
+        stop_move_error = str(exc)
+    stop_move_completed_monotonic = time.monotonic()
+    return finish_stop_confirmation(
+        monitor=monitor,
+        start=start,
+        stop_move_ret=stop_move_ret,
+        stop_move_error=stop_move_error,
+        stop_move_completed_monotonic=stop_move_completed_monotonic,
+        timeout=timeout,
+        max_age=max_age,
+        linear_epsilon=linear_epsilon,
+        yaw_epsilon=yaw_epsilon,
+        after_stop_attempt=after_stop_attempt,
     )
-    requested_rpc_timeout = float(
-        proposal_config.get("velocity_proposal_stop_rpc_timeout", 0.2)
-    )
-    # G1 cfb8efe hardware returned StopMove in about 111 ms.  A 100 ms
-    # client timeout therefore produced SDK code 3104 even while fresh zero
-    # odometry continued to arrive.  Preserve a bounded margin without ever
-    # extending beyond the physical-stop confirmation budget.
-    rpc_timeout = min(confirmation_timeout, max(0.2, requested_rpc_timeout))
-    return rpc_timeout, confirmation_timeout
 
 
 # ── SmartMotionProxy (main process) ─────────────────────────────────────────
@@ -298,7 +311,7 @@ class SmartMotionProxy:
         ctx = mp.get_context("spawn")
         self._cmd_queue = ctx.Queue()
         self._result_queue = ctx.Queue()
-        self._call_lock = threading.Lock()
+        self._call_lock = threading.RLock()
         self._request_id = 0
         self._proc = ctx.Process(
             target=_run_smart_motion_process,
@@ -391,6 +404,42 @@ class SmartMotionProxy:
             self._proc.terminate()
             self._proc.join(timeout=1.0)
 
+    def _call_with_parent_stop(self, method: str, **kwargs) -> dict:
+        """Bracket a parent-side StopMove with child odometry confirmation."""
+        with self._call_lock:
+            prepared = self._call("begin_velocity_proposal_stop_confirmation")
+            confirmation_start = prepared.get("confirmation_start")
+            stop_move_ret = None
+            stop_move_error = None
+            try:
+                if self._fallback_stop is None:
+                    raise RuntimeError("parent StopMove RPC is unavailable")
+                stop_move_ret = self._fallback_stop()
+            except Exception as exc:
+                stop_move_error = str(exc)
+            stop_move_completed_monotonic = time.monotonic()
+
+            if not confirmation_start:
+                return {
+                    "error": prepared.get("error")
+                    or "SmartMotion stop confirmation did not start",
+                    "stop_confirmed": False,
+                    "stop_move_ret": stop_move_ret,
+                    "stop_move_error": stop_move_error,
+                }
+            return self._call(
+                method,
+                external_stop_attempt={
+                    "confirmation_start": confirmation_start,
+                    "stop_move_ret": stop_move_ret,
+                    "stop_move_error": stop_move_error,
+                    "stop_move_completed_monotonic": (
+                        stop_move_completed_monotonic
+                    ),
+                },
+                **kwargs,
+            )
+
     def move(self, vx: float, vy: float, vyaw: float, duration: float = -1.0) -> dict:
         return self._call("move", vx=vx, vy=vy, vyaw=vyaw, duration=duration)
 
@@ -419,14 +468,17 @@ class SmartMotionProxy:
         return self._call("get_state")
 
     def bind_velocity_proposal(self, topic: str, expected_nav_id: str) -> dict:
-        return self._call(
+        return self._call_with_parent_stop(
             "bind_velocity_proposal",
             topic=topic,
             expected_nav_id=expected_nav_id,
         )
 
     def unbind_velocity_proposal(self, reason: str = "canvas_stop") -> dict:
-        return self._call("unbind_velocity_proposal", reason=reason)
+        return self._call_with_parent_stop(
+            "unbind_velocity_proposal",
+            reason=reason,
+        )
 
     def get_velocity_proposal_status(self) -> dict:
         return self._call("get_velocity_proposal_status")
@@ -507,8 +559,17 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
     proposal_rpc_timeout = min(
         0.2, max(0.02, float(proposal_config.get("velocity_proposal_rpc_timeout", 0.1)))
     )
-    stop_rpc_timeout, proposal_stop_confirm_timeout = (
-        resolve_proposal_stop_timeouts(proposal_config)
+    stop_rpc_timeout = min(
+        0.2,
+        max(
+            0.02,
+            float(
+                proposal_config.get(
+                    "velocity_proposal_stop_rpc_timeout",
+                    0.1,
+                )
+            ),
+        ),
     )
     fsm_rpc_timeout = min(
         0.5, max(0.05, float(proposal_config.get("velocity_proposal_fsm_rpc_timeout", 0.2)))
@@ -615,6 +676,18 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
     proposal_watchdog_hz = max(
         20.0, float(proposal_config.get("velocity_proposal_watchdog_hz", 40.0))
     )
+    proposal_stop_confirm_timeout = min(
+        1.0,
+        max(
+            0.1,
+            float(
+                proposal_config.get(
+                    "velocity_proposal_stop_confirm_timeout",
+                    0.5,
+                )
+            ),
+        ),
+    )
     proposal_stop_linear_epsilon = max(
         0.0, float(proposal_config.get("velocity_proposal_stop_linear_epsilon", 0.03))
     )
@@ -642,6 +715,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
     motion_command_lock = threading.RLock()
     proposal_execution_lock = threading.Lock()
     proposal_connected = threading.Event()
+    proposal_stop_transition = threading.Event()
     safety_threads_shutdown = threading.Event()
     proposal_execution_generation = 0
     proposal_execution_active = False
@@ -717,7 +791,11 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
         return stop_loco_client.StopMove()
 
     @motion_synchronized
-    def do_stop(reason_str, confirm_physical_stop=False):
+    def do_stop(
+        reason_str,
+        confirm_physical_stop=False,
+        external_stop_attempt=None,
+    ):
         nonlocal state, current_cmd, speed_zone, move_timer, stop_repeat_count
         was_proposal_motion = bool(
             current_cmd and current_cmd.get("source") == "velocity_proposal"
@@ -736,15 +814,42 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
             stop_repeat_count = 3  # repeat StopMove to ensure controller stops
 
         if confirm_physical_stop:
-            result = issue_stop_and_confirm(
-                issue_stop_move,
-                odom_stop_monitor,
-                proposal_stop_confirm_timeout,
-                proposal_odom_timeout,
-                proposal_stop_linear_epsilon,
-                proposal_stop_yaw_epsilon,
-                after_stop_attempt=complete_logical_stop,
-            )
+            if external_stop_attempt is not None:
+                start_data = external_stop_attempt["confirmation_start"]
+                result = finish_stop_confirmation(
+                    monitor=odom_stop_monitor,
+                    start=StopConfirmationStart(
+                        monotonic=float(start_data["monotonic"]),
+                        unix_ms=int(start_data["unix_ms"]),
+                        odometry_callback_count=int(
+                            start_data["odometry_callback_count"]
+                        ),
+                    ),
+                    stop_move_ret=external_stop_attempt.get("stop_move_ret"),
+                    stop_move_error=external_stop_attempt.get(
+                        "stop_move_error"
+                    ),
+                    stop_move_completed_monotonic=float(
+                        external_stop_attempt[
+                            "stop_move_completed_monotonic"
+                        ]
+                    ),
+                    timeout=proposal_stop_confirm_timeout,
+                    max_age=proposal_odom_timeout,
+                    linear_epsilon=proposal_stop_linear_epsilon,
+                    yaw_epsilon=proposal_stop_yaw_epsilon,
+                    after_stop_attempt=complete_logical_stop,
+                )
+            else:
+                result = issue_stop_and_confirm(
+                    issue_stop_move,
+                    odom_stop_monitor,
+                    proposal_stop_confirm_timeout,
+                    proposal_odom_timeout,
+                    proposal_stop_linear_epsilon,
+                    proposal_stop_yaw_epsilon,
+                    after_stop_attempt=complete_logical_stop,
+                )
         else:
             stop_ret = None
             stop_error = None
@@ -1412,29 +1517,87 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
         return result
 
     @motion_synchronized
-    def handle_bind_velocity_proposal(topic, expected_nav_id):
+    def handle_begin_velocity_proposal_stop_confirmation():
+        # Freeze proposal execution before the responsive parent RpcProxy
+        # issues StopMove.  Keep the subscription until zero odometry is
+        # confirmed so teardown remains fail-closed.
+        if state in (MotionState.NAVIGATING, MotionState.NAV_PAUSED):
+            do_stop_nav()
+        proposal_stop_transition.set()
+        proposal_connected.clear()
+        clear_proposal_execution()
+        start = odom_stop_monitor.begin_confirmation()
+        return {
+            "confirmation_start": {
+                "monotonic": start.monotonic,
+                "unix_ms": start.unix_ms,
+                "odometry_callback_count": start.odometry_callback_count,
+            }
+        }
+
+    @motion_synchronized
+    def handle_bind_velocity_proposal(
+        topic,
+        expected_nav_id,
+        external_stop_attempt=None,
+    ):
         try:
             expected_nav_id = resolve_expected_nav_id(
                 {"expected_nav_id": expected_nav_id}
             )
         except ValueError as exc:
+            stopped = do_stop(
+                str(exc),
+                confirm_physical_stop=True,
+                external_stop_attempt=external_stop_attempt,
+            )
             proposal_gate.disarm(str(exc))
-            do_stop(str(exc))
+            diagnostics = stopped.get("stop_confirmation") or {}
             return {
                 "error": str(exc),
                 "connected": bool(proposal_node.topic),
                 "armed": False,
+                "stop_confirmed": stopped.get("stop_confirmed", False),
+                "stop_move_ret": diagnostics.get("stop_move_ret"),
+                "stop_move_error": diagnostics.get("stop_move_error"),
+                "stop_confirmation": diagnostics,
             }
         if proposal_gate.is_bound_to(topic, expected_nav_id):
+            stopped = do_stop(
+                "proposal_bind_existing",
+                confirm_physical_stop=True,
+                external_stop_attempt=external_stop_attempt,
+            )
+            if not stopped.get("stop_confirmed"):
+                proposal_gate.disarm("stop_unconfirmed")
+                diagnostics = stopped.get("stop_confirmation") or {}
+                return {
+                    "error": "StopMove/odometry stop was not confirmed before proposal bind",
+                    "connected": bool(proposal_node.topic),
+                    "armed": False,
+                    "stop_confirmed": False,
+                    "stop_move_ret": diagnostics.get("stop_move_ret"),
+                    "stop_move_error": diagnostics.get("stop_move_error"),
+                    "stop_confirmation": diagnostics,
+                }
+            proposal_connected.set()
+            proposal_stop_transition.clear()
             result = handle_get_velocity_proposal_status()
             result["state"] = "connected"
+            result["stop_confirmed"] = True
+            result["stop_move_ret"] = stopped.get("ret")
+            result["stop_move_error"] = (
+                (stopped.get("stop_confirmation") or {}).get(
+                    "stop_move_error"
+                )
+            )
+            result["stop_confirmation"] = stopped.get("stop_confirmation")
             return result
-        # A proposal stream and Unitree native navigation may never own motion
-        # at the same time.
-        if state in (MotionState.NAVIGATING, MotionState.NAV_PAUSED):
-            do_stop_nav()
         if proposal_gate.connected_topic or proposal_node.topic:
-            stopped = handle_unbind_velocity_proposal("proposal_rebind")
+            stopped = handle_unbind_velocity_proposal(
+                "proposal_rebind",
+                external_stop_attempt=external_stop_attempt,
+            )
             if not stopped.get("stop_confirmed"):
                 return {
                     "error": "StopMove was not confirmed before proposal rebind",
@@ -1445,7 +1608,11 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                     "stop_confirmation": stopped.get("stop_confirmation"),
                 }
         else:
-            stopped = do_stop("proposal_bind", confirm_physical_stop=True)
+            stopped = do_stop(
+                "proposal_bind",
+                confirm_physical_stop=True,
+                external_stop_attempt=external_stop_attempt,
+            )
             if not stopped.get("stop_confirmed"):
                 diagnostics = stopped.get("stop_confirmation") or {}
                 return {
@@ -1480,6 +1647,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
             except Exception:
                 pass
             return {"error": f"velocity_proposal_subscribe_failed: {exc}", "connected": False}
+        proposal_stop_transition.clear()
         result = handle_get_velocity_proposal_status()
         result["state"] = "connected"
         result["stop_confirmed"] = True
@@ -1489,13 +1657,23 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
         return result
 
     @motion_synchronized
-    def handle_unbind_velocity_proposal(reason="canvas_stop"):
+    def handle_unbind_velocity_proposal(
+        reason="canvas_stop",
+        external_stop_attempt=None,
+    ):
         # N5 ordering: command and observe physical stop before destroying the
         # only proposal subscription.
-        if state in (MotionState.NAVIGATING, MotionState.NAV_PAUSED):
+        if (
+            external_stop_attempt is None
+            and state in (MotionState.NAVIGATING, MotionState.NAV_PAUSED)
+        ):
             do_stop_nav()
-        stopped = do_stop(reason, confirm_physical_stop=True)
-        for _ in range(2):
+        stopped = do_stop(
+            reason,
+            confirm_physical_stop=True,
+            external_stop_attempt=external_stop_attempt,
+        )
+        for _ in range(2 if external_stop_attempt is None else 0):
             # Preserve the original retry contract: retry rejected/failed RPC
             # attempts, but do not mask a measured nonzero or odom timeout by
             # issuing more StopMove calls.
@@ -1549,6 +1727,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
             "canvas_running": proposal_connected.is_set(),
             "driver_authorized": bool(
                 proposal_driver_authorized
+                and not proposal_stop_transition.is_set()
                 and proposal_gate.connected_topic
                 and proposal_gate.armed
             ),
@@ -1561,6 +1740,8 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
     @motion_synchronized
     def on_velocity_proposal(msg):
         nonlocal last_nav_status_time
+        if proposal_stop_transition.is_set():
+            return
         now = time.monotonic()
         pending_fault = current_proposal_watchdog_fault()
         if pending_fault:
@@ -1868,15 +2049,29 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                 result = handle_wait_nav_done(cmd.get("stall_timeout", 60))
             elif method == "get_state":
                 result = handle_get_state()
+            elif method == "begin_velocity_proposal_stop_confirmation":
+                result = handle_begin_velocity_proposal_stop_confirmation()
             elif method == "bind_velocity_proposal":
-                result = handle_bind_velocity_proposal(
-                    cmd.get("topic", ""),
-                    cmd.get("expected_nav_id", ""),
-                )
+                try:
+                    result = handle_bind_velocity_proposal(
+                        cmd.get("topic", ""),
+                        cmd.get("expected_nav_id", ""),
+                        external_stop_attempt=cmd.get(
+                            "external_stop_attempt"
+                        ),
+                    )
+                finally:
+                    proposal_stop_transition.clear()
             elif method == "unbind_velocity_proposal":
-                result = handle_unbind_velocity_proposal(
-                    cmd.get("reason", "canvas_stop")
-                )
+                try:
+                    result = handle_unbind_velocity_proposal(
+                        cmd.get("reason", "canvas_stop"),
+                        external_stop_attempt=cmd.get(
+                            "external_stop_attempt"
+                        ),
+                    )
+                finally:
+                    proposal_stop_transition.clear()
             elif method == "get_velocity_proposal_status":
                 result = handle_get_velocity_proposal_status()
             elif method == "start_mapping":
@@ -1913,6 +2108,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
         except Exception as exc:
             with motion_command_lock:
                 proposal_gate.disarm("smart_motion_command_error")
+                proposal_stop_transition.clear()
                 try:
                     stop_loco_client.StopMove()
                 except Exception:
