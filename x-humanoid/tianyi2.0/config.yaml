@@ -10,6 +10,17 @@ plugins:
     enabled: true
   camera:
     enabled: true
+  camera_hand_gesture:
+    enabled: true
+    # OpenCV-DNN palm + 21-point hand-landmark inference. A playable result
+    # requires 4 matching classifications within the latest 6 frames.
+    inference_hz: 8
+    palm_threshold: 0.60
+    landmark_threshold: 0.60
+    gesture_threshold: 0.68
+    stability_window: 6
+    stable_frames: 4
+    stale_ms: 1000
   imu:
     enabled: true
   camera_depth:

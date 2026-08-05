@@ -4,6 +4,32 @@ Phanthy Motus driver bundle for the Tianyi 2.0 Pro humanoid robot. The driver
 bridges robot-side ROS2 topics on domain 0 to Agent Core topics on domain 42 and
 exposes the capabilities as MCP tools.
 
+## Camera hand-gesture card
+
+`camera_hand_gesture` recognizes only the three gestures needed by
+rock-paper-scissors: `rock` (石头), `scissors` (剪刀), and `paper` (布). It
+subscribes to `/ob_camera_head/color/image_raw`, runs the bundled OpenCV Zoo
+palm detector and 21-point hand-landmark models in a latest-frame-only worker,
+and publishes JSON to `/{namespace}/state/camera_hand_gesture` on domain 42.
+The models run through the existing OpenCV DNN dependency and do not require an
+internet connection or an additional inference runtime on the robot.
+
+The card reports a one-frame `candidate_gesture`, but exposes a playable
+`gesture` only after the configured multi-frame vote succeeds. Consumers must
+require both `stable: true` and `fresh: true`. `detect` can wait up to 3000 ms
+for a stable result; pass the round's start time as `after_timestamp_ms` to
+avoid accepting the previous round's hand pose. If no hand is present, the
+pose is unsupported, confidence is insufficient, or the camera stream is
+stale, the card returns `gesture: unknown` with a diagnostic `reason` rather
+than guessing.
+
+The result also includes detection count, confidence, primary-hand bounding
+box, handedness, 21 image landmarks, four non-thumb finger states, and their
+extension scores. When multiple hands are visible, the largest detected hand
+is selected. Best results require one user facing the head camera with the
+complete hand visible and separated from the face/body; final thresholds
+should be checked under the robot's actual lighting and interaction distance.
+
 ## Raw arm joint card
 
 `arm` directly commands seven joints per selected arm in this canonical order:

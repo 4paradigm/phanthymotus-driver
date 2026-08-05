@@ -16,6 +16,7 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
 插件列表：
   StatePlugin         (sensor, multi-tool) — 关节/电池/急停/力传感器/URDF
   CameraPlugin        (sensor)             — Orbbec 头部相机
+  CameraHandGesturePlugin (sensor)         — 头部相机石头/剪刀/布识别
   AsrPlugin           (sensor)             — 语音识别结果
   NavStatePlugin      (sensor)             — 底盘导航状态
   PowerBoardStatePlugin (sensor)          — 电源板MOS温度/电流/电压
@@ -58,6 +59,7 @@ import subprocess
 import struct
 import threading
 import time
+from collections import Counter, deque
 from pathlib import Path
 
 import rclpy
@@ -891,6 +893,275 @@ class CameraPlugin:
         if action == "info":
             return {"state": "running", "topic_out": [{"topic": self._topic, "format": "image/jpeg"}]}
         return {"state": "running"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CameraHandGesturePlugin (sensor)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class CameraHandGesturePlugin:
+    """Recognize stable rock, paper, and scissors gestures from head RGB."""
+
+    _GESTURE_ZH = {
+        "rock": "石头", "scissors": "剪刀", "paper": "布", "unknown": "未识别",
+    }
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._config = plugin_config
+        self._topic = f"/{namespace}/state/camera_hand_gesture"
+        self._running = False
+        self._recognizer = None
+        self._latest_frame = None
+        self._frame_lock = threading.Lock()
+        self._result_condition = threading.Condition()
+        self._inference_hz = _clamp(plugin_config.get("inference_hz", 8), 1, 15)
+        self._stale_ms = int(_clamp(plugin_config.get("stale_ms", 1000), 250, 5000))
+        window = int(_clamp(plugin_config.get("stability_window", 6), 3, 15))
+        self._stable_frames = int(_clamp(plugin_config.get("stable_frames", 4), 2, window))
+        self._history = deque(maxlen=window)
+        self._latest = self._empty_result("waiting_for_camera_frame", available=False)
+
+        model_dir = Path(__file__).resolve().parent / "resource" / "hand_gesture"
+        self._palm_model = Path(plugin_config.get(
+            "palm_model", model_dir / "palm_detection_mediapipe_2023feb.onnx"))
+        self._hand_model = Path(plugin_config.get(
+            "hand_model", model_dir / "handpose_estimation_mediapipe_2023feb.onnx"))
+
+        self._sub_node = Node("tianyi2_hand_gesture_sub", context=ros2.ctx_tianyi)
+        self._pub_node = Node("tianyi2_hand_gesture_pub", context=ros2.ctx_core)
+        ros2.executor_tianyi.add_node(self._sub_node)
+        ros2.executor_core.add_node(self._pub_node)
+        self._pub = self._pub_node.create_publisher(String, self._topic, _LOW_LAT_QOS)
+        self._subscription = None
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "camera_hand_gesture",
+            "type": "sensor",
+            "multiInstance": False,
+            "readOnly": True,
+            "default_action": "detect",
+            "description": (
+                "使用头部RGB相机识别石头、剪刀、布。仅当连续多帧一致时 stable=true；"
+                "业务判断必须同时要求 stable=true 和 fresh=true。多人入镜时选择面积最大的手。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["detect", "info"],
+                               "default": "detect"},
+                    "wait_ms": {
+                        "type": "integer", "minimum": 0, "maximum": 3000, "default": 0,
+                        "description": "等待稳定识别的最长时间，0表示立即读取。",
+                    },
+                    "after_timestamp_ms": {
+                        "type": "integer", "minimum": 0,
+                        "description": "只接受该时间之后的结果，防止读到上一轮猜拳。",
+                    },
+                },
+                "additionalProperties": False,
+            },
+            "topic_out": [{"topic": self._topic, "format": "data/json"}],
+        }
+
+    def start(self):
+        self._running = True
+        try:
+            from camera_hand_gesture import RockPaperScissorsRecognizer
+            from sensor_msgs.msg import Image
+
+            missing = [str(path) for path in (self._palm_model, self._hand_model)
+                       if not path.is_file()]
+            if missing:
+                raise FileNotFoundError(f"hand gesture model missing: {missing}")
+            self._recognizer = RockPaperScissorsRecognizer(
+                str(self._palm_model), str(self._hand_model),
+                palm_threshold=float(self._config.get("palm_threshold", 0.60)),
+                landmark_threshold=float(self._config.get("landmark_threshold", 0.60)),
+                gesture_threshold=float(self._config.get("gesture_threshold", 0.68)),
+            )
+            self._subscription = self._sub_node.create_subscription(
+                Image, "/ob_camera_head/color/image_raw", self._on_image, _LOW_LAT_QOS)
+            self._worker = threading.Thread(
+                target=self._inference_loop, daemon=True, name="camera-hand-gesture")
+            self._worker.start()
+            print("[CameraHandGesturePlugin] models loaded; RGB subscription created")
+        except Exception as exc:  # noqa: BLE001
+            result = self._empty_result("model_initialization_failed", available=False)
+            result["error"] = str(exc)
+            self._set_result(result)
+            print(f"[CameraHandGesturePlugin] ERROR: {exc}", flush=True)
+
+    def stop(self):
+        self._running = False
+        with self._result_condition:
+            self._result_condition.notify_all()
+
+    def _on_image(self, msg):
+        if self._running:
+            with self._frame_lock:
+                self._latest_frame = msg
+
+    def _inference_loop(self):
+        period = 1.0 / self._inference_hz
+        last_snapshot = 0.0
+        while self._running:
+            started = time.monotonic()
+            with self._frame_lock:
+                msg, self._latest_frame = self._latest_frame, None
+            if msg is None:
+                if started - last_snapshot >= 0.5:
+                    self._publish(self._snapshot())
+                    last_snapshot = started
+                time.sleep(min(0.02, period))
+                continue
+            try:
+                image = self._image_to_bgr(msg)
+                observation, hands_detected = self._recognizer.infer(image)
+                result = self._build_result(
+                    observation, hands_detected, int(time.time() * 1000))
+            except Exception as exc:  # noqa: BLE001
+                result = self._empty_result("inference_failed", available=False)
+                result["error"] = str(exc)
+                print(f"[CameraHandGesturePlugin] inference error: {exc}", flush=True)
+            self._set_result(result)
+            elapsed = time.monotonic() - started
+            if elapsed < period:
+                time.sleep(period - elapsed)
+
+    @staticmethod
+    def _image_to_bgr(msg):
+        import cv2
+        import numpy as np
+
+        encoding = str(msg.encoding).lower()
+        channels = 4 if encoding in ("rgba8", "bgra8") else 3
+        if encoding not in ("rgb8", "bgr8", "rgba8", "bgra8"):
+            raise ValueError(f"unsupported RGB encoding: {msg.encoding}")
+        rows = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.step)
+        image = rows[:, :msg.width * channels].reshape(msg.height, msg.width, channels)
+        conversions = {
+            "rgb8": cv2.COLOR_RGB2BGR,
+            "rgba8": cv2.COLOR_RGBA2BGR,
+            "bgra8": cv2.COLOR_BGRA2BGR,
+        }
+        return cv2.cvtColor(image, conversions[encoding]) if encoding in conversions else image
+
+    def _empty_result(self, reason: str, available: bool = True) -> dict:
+        return {
+            "available": available,
+            "hand_detected": False,
+            "hands_detected": 0,
+            "gesture": "unknown",
+            "gesture_zh": self._GESTURE_ZH["unknown"],
+            "candidate_gesture": "unknown",
+            "candidate_gesture_zh": self._GESTURE_ZH["unknown"],
+            "confidence": 0.0,
+            "stable": False,
+            "stable_frames": 0,
+            "fresh": available,
+            "timestamp_ms": int(time.time() * 1000),
+            "reason": reason,
+        }
+
+    def _build_result(self, observation, hands_detected: int, timestamp_ms: int) -> dict:
+        if observation is None:
+            self._history.clear()
+            result = self._empty_result("no_hand_detected")
+            result.update({"hands_detected": int(hands_detected), "timestamp_ms": timestamp_ms})
+            return result
+
+        candidate = observation.gesture
+        self._history.append((candidate, observation.confidence))
+        valid = [item for item in self._history if item[0] != "unknown"]
+        counts = Counter(name for name, _ in valid)
+        winner, winner_count = counts.most_common(1)[0] if counts else ("unknown", 0)
+        stable = candidate != "unknown" and winner == candidate and winner_count >= self._stable_frames
+        stable_confidence = (
+            sum(conf for name, conf in valid if name == winner) / winner_count
+            if winner_count else 0.0)
+        gesture = winner if stable else "unknown"
+        result = {
+            "available": True,
+            "hand_detected": True,
+            "hands_detected": int(hands_detected),
+            "gesture": gesture,
+            "gesture_zh": self._GESTURE_ZH[gesture],
+            "candidate_gesture": candidate,
+            "candidate_gesture_zh": self._GESTURE_ZH[candidate],
+            "confidence": round(stable_confidence if stable else observation.confidence, 4),
+            "stable": stable,
+            "stable_frames": int(winner_count if winner == candidate else 0),
+            "required_stable_frames": self._stable_frames,
+            "fresh": True,
+            "timestamp_ms": timestamp_ms,
+            "primary_hand": {
+                "handedness": observation.handedness,
+                "handedness_confidence": observation.handedness_confidence,
+                "bbox_px": observation.bbox,
+                "landmarks_px": observation.landmarks,
+                "extended_fingers": observation.extended_fingers,
+                "finger_scores": observation.finger_scores,
+                "palm_confidence": observation.palm_confidence,
+                "landmark_confidence": observation.landmark_confidence,
+            },
+        }
+        if not stable:
+            result["reason"] = (
+                "unsupported_or_uncertain_gesture" if candidate == "unknown" else "stabilizing")
+        return result
+
+    def _set_result(self, result: dict):
+        with self._result_condition:
+            self._latest = result
+            self._result_condition.notify_all()
+        self._publish(result)
+
+    def _snapshot(self) -> dict:
+        with self._result_condition:
+            result = dict(self._latest)
+        age_ms = int(time.time() * 1000) - int(result.get("timestamp_ms", 0))
+        result["fresh"] = bool(result.get("available") and age_ms <= self._stale_ms)
+        if not result["fresh"] and result.get("available"):
+            result.update({
+                "stable": False,
+                "gesture": "unknown",
+                "gesture_zh": self._GESTURE_ZH["unknown"],
+                "reason": "stale_camera_frame",
+            })
+        return result
+
+    def _publish(self, result: dict):
+        out = String()
+        out.data = json.dumps(result, ensure_ascii=False)
+        self._pub.publish(out)
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "info":
+            return {
+                "state": "running" if self._running else "idle",
+                "topic_out": [{"topic": self._topic, "format": "data/json"}],
+                "supported_gestures": ["rock", "scissors", "paper"],
+            }
+        if action not in ("detect", "read", "get"):
+            return {"state": "error", "error": "INVALID_ARGUMENT",
+                    "message": f"unknown action: {action}"}
+
+        wait_ms = int(_clamp(args.get("wait_ms", 0), 0, 3000))
+        after_ms = int(max(0, args.get("after_timestamp_ms", 0)))
+        deadline = time.monotonic() + wait_ms / 1000.0
+        while True:
+            result = self._snapshot()
+            if (result.get("stable") and result.get("fresh")
+                    and int(result.get("timestamp_ms", 0)) >= after_ms):
+                return result
+            remaining = deadline - time.monotonic()
+            if wait_ms == 0 or remaining <= 0 or not self._running:
+                if wait_ms > 0:
+                    result["timed_out"] = True
+                return result
+            with self._result_condition:
+                self._result_condition.wait(timeout=min(remaining, 0.1))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
