@@ -180,6 +180,31 @@ class ControlledSpatialPlugin:
         # Start polling thread for pose, nav status, map status
         self._poll_running = False
 
+    def _acp_callback(self, action_id: str, status: str, result: dict):
+        """POST 动作完成通知到 Agent Core。"""
+        try:
+            import urllib.request as _urllib
+            import ssl as _ssl
+            agent_core_url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+            ctx = _ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = _ssl.CERT_NONE
+            payload = json.dumps({
+                "action_id": action_id,
+                "status": status,
+                "result": result,
+            }).encode()
+            req = _urllib.Request(
+                f"{agent_core_url}/api/acp/complete",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            _urllib.urlopen(req, timeout=3, context=ctx)
+            print(f"[ControlledSpatial] ACP complete: {action_id} ({status})")
+        except Exception as e:
+            print(f"[ControlledSpatial] ACP callback failed: {e}")
+
     def get_tools(self) -> list:
         return [self._tool_def()]
 
@@ -369,18 +394,10 @@ class ControlledSpatialPlugin:
                         self._nav_active = False
                         self._nav_lost_count = 0
                         self._map_status = "localized"
-                        # ACP: push completion SSE
+                        # ACP: callback Agent Core
                         if self._nav_action_id:
-                            try:
-                                from main import sse_push
-                                sse_push({
-                                    "type": "action_complete",
-                                    "action_id": str(self._nav_action_id),
-                                    "status": "completed",
-                                    "result": {"pose": self._current_pose},
-                                })
-                            except Exception:
-                                pass
+                            self._acp_callback(str(self._nav_action_id), "completed",
+                                               {"pose": self._current_pose})
                     elif action_state == 4 and result_code in (-1, -2):
                         # Done + Failed/Aborted
                         label = "failed" if result_code == -1 else "aborted"
@@ -390,18 +407,10 @@ class ControlledSpatialPlugin:
                         self._nav_active = False
                         self._nav_lost_count = 0
                         self._map_status = "localized"
-                        # ACP: push error SSE
+                        # ACP: callback Agent Core
                         if self._nav_action_id:
-                            try:
-                                from main import sse_push
-                                sse_push({
-                                    "type": "action_complete",
-                                    "action_id": str(self._nav_action_id),
-                                    "status": "error",
-                                    "result": {"error": self._nav_error},
-                                })
-                            except Exception:
-                                pass
+                            self._acp_callback(str(self._nav_action_id), "error",
+                                               {"error": self._nav_error})
                     elif action_state == 3:
                         # Paused — still active, don't treat as lost
                         self._nav_lost_count = 0

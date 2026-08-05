@@ -563,7 +563,8 @@ LLM calls speak("hello")
 ...speech plays...
 
 Driver worker finishes
-  → SSE push: {"type":"action_complete", "action_id":"speak-a7f3c", "status":"completed"}
+  → POST /api/acp/complete to Agent Core
+     body: {"action_id":"speak-a7f3c", "status":"completed"}
   → Agent Core resolves the pending action
   → Completion notification injected into LLM turn (via steering)
 
@@ -603,85 +604,38 @@ def dispatch(self, action, args):
 
 The `action_id` must be unique and stable — it's the correlation key for completion.
 
-#### 3. Push SSE completion event
+#### 3. POST completion to Agent Core
 
-When the action finishes, call `sse_push()` (provided by `main.py`):
-
-```python
-from main import sse_push
-
-# On success:
-sse_push({
-    "type": "action_complete",
-    "action_id": action_id,
-    "status": "completed",          # "completed" | "error" | "cancelled"
-    "result": {"frames": 42},       # optional result data
-})
-
-# On error:
-sse_push({
-    "type": "action_complete",
-    "action_id": action_id,
-    "status": "error",
-    "result": {"error": "timeout"},
-})
-```
-
-#### 4. Add SSE endpoint to your `main.py`
-
-Your driver's HTTP handler needs a `/sse` GET endpoint. Add the standard SSE infrastructure:
+When the action finishes, POST to Agent Core's ACP endpoint:
 
 ```python
-import queue as _queue
+import urllib.request, ssl, json, os
 
-_sse_clients: list[_queue.Queue] = []
-_sse_lock = threading.Lock()
-
-def sse_push(event: dict):
-    """Thread-safe broadcast SSE event to all connected clients."""
-    data = json.dumps(event, ensure_ascii=False)
-    with _sse_lock:
-        dead = []
-        for q in _sse_clients:
-            try:
-                q.put_nowait(data)
-            except _queue.Full:
-                dead.append(q)
-        for q in dead:
-            _sse_clients.remove(q)
+def _acp_callback(action_id: str, status: str, result: dict):
+    """POST action completion to Agent Core."""
+    agent_core_url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    payload = json.dumps({
+        "action_id": action_id,
+        "status": status,       # "completed" | "error" | "cancelled"
+        "result": result,       # optional result data
+    }).encode()
+    req = urllib.request.Request(
+        f"{agent_core_url}/api/acp/complete",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    urllib.request.urlopen(req, timeout=3, context=ctx)
 ```
 
-And in the handler's `do_GET`:
+Call this from your worker thread when the action finishes. `AGENT_CORE_URL` env var is already set in all driver containers (same one used for registration heartbeat).
 
-```python
-def do_GET(self):
-    if self.path.split("?")[0] == "/sse":
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
+#### 4. No SSE endpoint needed
 
-        client_queue = _queue.Queue(maxsize=64)
-        with _sse_lock:
-            _sse_clients.append(client_queue)
-        try:
-            while True:
-                try:
-                    data = client_queue.get(timeout=30)
-                    self.wfile.write(f"data: {data}\n\n".encode())
-                    self.wfile.flush()
-                except _queue.Empty:
-                    self.wfile.write(b": ping\n\n")
-                    self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            pass
-        finally:
-            with _sse_lock:
-                if client_queue in _sse_clients:
-                    _sse_clients.remove(client_queue)
-        return
-```
+Unlike earlier designs, drivers do NOT need to implement an `/sse` endpoint. The completion notification is a simple HTTP POST — fire and forget.
 
 ### LLM-Side Usage (handled by Agent Core)
 
@@ -701,4 +655,4 @@ Completion notifications also arrive as **steering messages** between tool calls
 
 - Tools without `x-completion` → unchanged behavior (sync return)
 - Tools that don't return `action_id` → no pending registered, no waiting
-- Drivers without `/sse` → Agent Core's SSE subscription silently reconnects with backoff
+- Drivers that don't POST completion → sync() will timeout gracefully
