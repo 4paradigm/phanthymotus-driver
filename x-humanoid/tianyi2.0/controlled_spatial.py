@@ -196,6 +196,8 @@ class ControlledSpatialPlugin:
                 "action_id": action_id,
                 "status": status,
                 "result": result,
+                "tool": "controlled_spatial",
+                "ts": time.time(),
             }).encode()
             req = _urllib.Request(
                 f"{agent_core_url}/api/acp/complete",
@@ -204,7 +206,7 @@ class ControlledSpatialPlugin:
                 method="POST",
             )
             _urllib.urlopen(req, timeout=3, context=ctx)
-            print(f"[ControlledSpatial] ACP complete: {action_id} ({status})")
+            print(f"[ControlledSpatial] ACP {status}: {action_id} | {json.dumps(result, ensure_ascii=False)[:120]}")
         except Exception as e:
             print(f"[ControlledSpatial] ACP callback failed: {e}")
 
@@ -397,8 +399,12 @@ class ControlledSpatialPlugin:
                         self._map_status = "localized"
                         # ACP: callback Agent Core
                         if self._nav_action_id:
-                            self._acp_callback(str(self._nav_action_id), "completed",
-                                               {"pose": self._current_pose})
+                            elapsed = time.monotonic() - self._nav_start_time
+                            self._acp_callback(str(self._nav_action_id), "completed", {
+                                "pose": self._current_pose,
+                                "elapsed_s": round(elapsed, 1),
+                                "action_id_chassis": str(self._nav_action_id),
+                            })
                     elif action_state == 4 and result_code in (-1, -2):
                         # Done + Failed/Aborted
                         label = "failed" if result_code == -1 else "aborted"
@@ -410,8 +416,15 @@ class ControlledSpatialPlugin:
                         self._map_status = "localized"
                         # ACP: callback Agent Core
                         if self._nav_action_id:
-                            self._acp_callback(str(self._nav_action_id), "error",
-                                               {"error": self._nav_error})
+                            elapsed = time.monotonic() - self._nav_start_time
+                            self._acp_callback(str(self._nav_action_id), "error", {
+                                "error": self._nav_error,
+                                "result_code": result_code,
+                                "reason": reason,
+                                "elapsed_s": round(elapsed, 1),
+                                "pose": self._current_pose,
+                                "action_id_chassis": str(self._nav_action_id),
+                            })
                     elif action_state == 3:
                         # Paused — still active, don't treat as lost
                         self._nav_lost_count = 0
@@ -439,8 +452,15 @@ class ControlledSpatialPlugin:
                                     self._nav_lost_count = 0
                                     # ACP: report stall as error
                                     if self._nav_action_id:
-                                        self._acp_callback(str(self._nav_action_id), "error",
-                                                           {"error": self._nav_error})
+                                        elapsed = time.monotonic() - self._nav_start_time
+                                        self._acp_callback(str(self._nav_action_id), "error", {
+                                            "error": self._nav_error,
+                                            "type": "stall",
+                                            "stall_timeout_s": self._nav_stall_timeout,
+                                            "elapsed_s": round(elapsed, 1),
+                                            "pose": self._current_pose,
+                                            "action_id_chassis": str(self._nav_action_id),
+                                        })
                         # Verify the current action matches our expected action_id.
                         # If load_map left a RecoverLocalizationAction running,
                         # we'd see action_state=1 but for the WRONG action.
