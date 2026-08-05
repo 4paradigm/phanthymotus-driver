@@ -229,7 +229,6 @@ class ControlledSpatialPlugin:
                             "list_maps", "delete_map",
                             "load_map",
                             "navigate_to_tag", "navigate_to_pose",
-                            "wait_navigation_done",
                             "pause_nav", "stop_nav",
                             # Artifact — 虚拟墙
                             "list_walls", "add_wall", "remove_wall", "clear_walls",
@@ -292,6 +291,10 @@ class ControlledSpatialPlugin:
                     "restricted_scheduling_points": {"type": "string", "description": "Restricted area: scheduling points JSON string"},
                 },
                 "required": ["action"],
+                "x-completion": {
+                    "actions": ["navigate_to_tag", "navigate_to_pose"],
+                    "timeout": 180
+                },
                 "x-action-params": {
                     "start_mapping": {"params": ["map_name"], "description": "Start SLAM mapping with given map name"},
                     "stop_mapping": {"params": [], "description": "Stop mapping and save the map"},
@@ -301,9 +304,8 @@ class ControlledSpatialPlugin:
                     "list_maps": {"params": [], "description": "List all saved maps"},
                     "delete_map": {"params": ["map_name"], "description": "Delete a map and its associated data"},
                     "load_map": {"params": ["map_name"], "description": "Load a map (robot must be at map origin)"},
-                    "navigate_to_tag": {"params": ["tag_name", "speed", "mode", "fail_retry_count", "acceptable_precision", "strategy", "ignore_dynamic_obstacles", "precise"], "description": "Navigate to a tagged place. Returns immediately — call wait_navigation_done to wait for arrival."},
-                    "navigate_to_pose": {"params": ["x", "y", "yaw", "speed", "mode", "fail_retry_count", "acceptable_precision", "strategy", "ignore_dynamic_obstacles", "precise"], "description": "Navigate to coordinates. Returns immediately — call wait_navigation_done to wait for arrival."},
-                    "wait_navigation_done": {"params": ["stall_timeout"], "description": "Block until navigation completes or robot is stuck (no movement for stall_timeout seconds). Must be called after navigate_to_tag or navigate_to_pose."},
+                    "navigate_to_tag": {"params": ["tag_name", "speed", "mode", "fail_retry_count", "acceptable_precision", "strategy", "ignore_dynamic_obstacles", "precise"], "description": "Navigate to a tagged place. System waits for arrival and notifies upon completion."},
+                    "navigate_to_pose": {"params": ["x", "y", "yaw", "speed", "mode", "fail_retry_count", "acceptable_precision", "strategy", "ignore_dynamic_obstacles", "precise"], "description": "Navigate to coordinates. System waits for arrival and notifies upon completion."},
                     "pause_nav": {"params": [], "description": "Pause navigation"},
                     "stop_nav": {"params": [], "description": "Stop and cancel navigation"},
                     # Artifact — 虚拟墙
