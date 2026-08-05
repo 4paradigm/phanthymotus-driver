@@ -199,9 +199,9 @@ def _enumerate_ext_cameras() -> list[dict]:
 class _ExtMicNode(Node):
     """Captures audio from a system input device and publishes AudioChunk."""
 
-    def __init__(self, device_index, device_name: str, namespace: str, instance_id: str):
+    def __init__(self, device_index, device_name: str, namespace: str, instance_id: str, context=None):
         node_name = f"ext_mic_{instance_id.replace('-', '_')}"
-        super().__init__(node_name)
+        super().__init__(node_name, context=context)
         self._device_index = device_index  # alsa_id string (hw:CARD=...) or numeric index
         self._device_name = device_name
         self._instance_id = instance_id
@@ -218,7 +218,7 @@ class _ExtMicNode(Node):
         self.state = "idle"
 
     def _is_alsa_id(self) -> bool:
-        return isinstance(self._device_index, str) and self._device_index.startswith("hw:CARD=")
+        return isinstance(self._device_index, str) and self._device_index.startswith("hw:")
 
     def start(self) -> dict:
         if self.state == "running":
@@ -242,52 +242,43 @@ class _ExtMicNode(Node):
 
     def _start_alsaaudio(self):
         import alsaaudio
-        # alsa_id format: "hw:CARD=Pro,DEV=0"
-        card_part = self._device_index.split("hw:CARD=", 1)[1].split(",DEV=")[0]
-        card_idx = alsaaudio.cards().index(card_part)
-
-        # Probe native format: try S24_3LE stereo first (DJI Wireless Mic etc.),
-        # fallback to S16_LE mono for standard USB mics.
-        self._alsa_native_fmt = None
-        for fmt, channels, fmt_name in [
-            (alsaaudio.PCM_FORMAT_S24_3LE, 2, "S24_3LE_stereo"),
-            (alsaaudio.PCM_FORMAT_S16_LE, 1, "S16_LE_mono"),
-        ]:
-            try:
-                test_pcm = alsaaudio.PCM(
-                    type=alsaaudio.PCM_CAPTURE, mode=alsaaudio.PCM_NORMAL,
-                    rate=48000, channels=channels, format=fmt,
-                    periodsize=1024, cardindex=card_idx,
-                )
-                # Quick read to verify it actually works
-                length, _ = test_pcm.read()
-                test_pcm.close()
-                if length > 0:
-                    self._alsa_native_fmt = fmt_name
-                    break
-            except Exception:
-                continue
-
-        if self._alsa_native_fmt == "S24_3LE_stereo":
-            self._alsa_pcm = alsaaudio.PCM(
-                type=alsaaudio.PCM_CAPTURE, mode=alsaaudio.PCM_NORMAL,
-                rate=48000, channels=2, format=alsaaudio.PCM_FORMAT_S24_3LE,
-                periodsize=1024, cardindex=card_idx,
-            )
-            self._alsa_native_rate = 48000
-            self._alsa_rate_locked = True
-            print(f"[ext_mic] opened {self._device_name} as S24_3LE stereo 48kHz", flush=True)
+        # alsa_id format: "hw:CARD=Pro,DEV=0" or "hw:N,M"
+        if "CARD=" in self._device_index:
+            card_part = self._device_index.split("hw:CARD=", 1)[1].split(",DEV=")[0]
+            card_idx = alsaaudio.cards().index(card_part)
         else:
-            # Standard USB mic: S16_LE mono, rate will be probed
-            self._alsa_pcm = alsaaudio.PCM(
-                type=alsaaudio.PCM_CAPTURE, mode=alsaaudio.PCM_NORMAL,
-                rate=16000, channels=1, format=alsaaudio.PCM_FORMAT_S16_LE,
-                periodsize=512, cardindex=card_idx,
+            # "hw:N,M" format — card number is N
+            card_idx = int(self._device_index.split("hw:", 1)[1].split(",")[0])
+
+        # Query device capabilities via arecord --dump-hw-params, then open
+        # at the device's native rate and resample to 16kHz in software.
+        hw_rate = 44100  # safe default
+        try:
+            hw_info = subprocess.run(
+                ['arecord', '-D', f'hw:{card_idx},0', '--dump-hw-params', '-d', '1', '/dev/null'],
+                capture_output=True, text=True, timeout=5,
             )
-            self._alsa_native_fmt = "S16_LE_mono"
-            self._alsa_native_rate = 16000
-            self._alsa_rate_locked = False
-            print(f"[ext_mic] opened {self._device_name} as S16_LE mono 16kHz (will probe rate)", flush=True)
+            # hw params are printed to stderr
+            output = hw_info.stdout + hw_info.stderr
+            for line in output.splitlines():
+                if 'RATE:' in line:
+                    rates = [int(x) for x in re.findall(r'\d+', line.split('RATE:')[1])]
+                    if rates:
+                        hw_rate = min(rates)  # prefer lowest supported rate
+                    break
+            print(f"[ext_mic] hw probe: rate={hw_rate}", flush=True)
+        except Exception as e:
+            print(f"[ext_mic] hw probe failed ({e}), using rate={hw_rate}", flush=True)
+
+        self._alsa_native_fmt = "S16_LE_mono"
+        self._alsa_pcm = alsaaudio.PCM(
+            type=alsaaudio.PCM_CAPTURE, mode=alsaaudio.PCM_NORMAL,
+            rate=hw_rate, channels=1, format=alsaaudio.PCM_FORMAT_S16_LE,
+            periodsize=1024, cardindex=card_idx,
+        )
+        self._alsa_native_rate = hw_rate
+        self._alsa_rate_locked = True
+        print(f"[ext_mic] opened {self._device_name} as S16_LE mono {hw_rate}Hz", flush=True)
 
         self._alsa_probe_samples = 0
         self._alsa_probe_start = 0.0
@@ -297,6 +288,7 @@ class _ExtMicNode(Node):
 
     def _alsa_capture_loop(self):
         first_read = True
+        first_publish = True
         _pub_buf = bytearray()       # accumulate resampled bytes until we have a full 512-sample chunk
         _TARGET = 1024               # 512 int16 samples @ 16 kHz = 1024 bytes
         while self._running:
@@ -311,9 +303,13 @@ class _ExtMicNode(Node):
                 if n_frames == 0:
                     continue
                 raw = raw[:n_frames * 6].reshape(n_frames, 2, 3)
-                # Take high 2 bytes of each 24-bit sample as int16 (effectively >>8)
-                left = raw[:, 0, 1:].copy().view(np.int16).flatten()
-                right = raw[:, 1, 1:].copy().view(np.int16).flatten()
+                # Reconstruct 24-bit signed int, then >> 8 to 16-bit
+                def _s24_to_s16_local(ch):
+                    val = (ch[:, 0].astype(np.int32) | (ch[:, 1].astype(np.int32) << 8) | (ch[:, 2].astype(np.int32) << 16))
+                    val[val >= 0x800000] -= 0x1000000
+                    return (val >> 8).astype(np.int16)
+                left = _s24_to_s16_local(raw[:, 0, :])
+                right = _s24_to_s16_local(raw[:, 1, :])
                 mono = ((left.astype(np.int32) + right.astype(np.int32)) // 2).astype(np.int16)
                 data = mono.tobytes()
                 length = n_frames
@@ -324,6 +320,7 @@ class _ExtMicNode(Node):
                 self._alsa_probe_start = time.monotonic()
                 self._alsa_probe_samples = 0
                 first_read = False
+                print(f"[ext_mic] capture loop running, first read length={length} bytes={len(data)}", flush=True)
 
             # Phase 1: accumulate samples to measure actual hardware rate
             if not self._alsa_rate_locked:
@@ -357,6 +354,9 @@ class _ExtMicNode(Node):
                     msg.format = "audio/pcm-16k"
                     msg.data = list(chunk)
                     self._pub.publish(msg)
+                    if first_publish:
+                        print(f"[ext_mic] first publish on {self._topic}, resample {self._alsa_native_rate}→16k", flush=True)
+                        first_publish = False
                 continue
 
             msg = AudioChunk()
@@ -394,6 +394,297 @@ class _ExtMicNode(Node):
             "state": self.state,
             "device_name": self._device_name,
             "device_index": self._device_index,
+            "topic_in": [],
+            "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k", "desc": ""}],
+        }
+
+
+class _NetworkMicNode(Node):
+    """Captures audio from a remote host via SSH + arecord and publishes AudioChunk."""
+
+    def __init__(self, url: str, device_name: str, namespace: str, instance_id: str, context=None):
+        node_name = f"ext_mic_{instance_id.replace('-', '_')}"
+        super().__init__(node_name, context=context)
+        self._url = url  # "ssh://user:pass@host/hw:card,dev" or "tcp://host:port"
+        self._device_name = device_name
+        self._instance_id = instance_id
+        self._topic = f"/{namespace}/ext_mic/{instance_id.replace('-', '_')}/audio"
+        self._pub = self.create_publisher(AudioChunk, self._topic, _LOW_LAT_QOS)
+        self._thread: Optional[threading.Thread] = None
+        self._running = False
+        self.state = "idle"
+
+    def start(self) -> dict:
+        if self.state == "running":
+            return self._status_dict()
+        self._running = True
+        self._thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._thread.start()
+        self.state = "running"
+        log.info(f"[ext_mic/net] started {self._device_name} ({self._url}) → {self._topic}")
+        return self._status_dict()
+
+    def _capture_loop(self):
+        """Capture via SSH arecord or TCP socket depending on URL scheme."""
+        if self._url.startswith("ssh://"):
+            self._ssh_capture()
+        else:
+            self._tcp_capture()
+
+    def _ssh_capture(self):
+        """ssh://user:pass@host/hw:card,dev — remote arecord via SSH pipe."""
+        # Parse: ssh://ubuntu:123@192.168.41.1/hw:1,0
+        parts = self._url.replace("ssh://", "")
+        user_pass, rest = parts.split("@", 1)
+        host, alsa_dev = rest.split("/", 1)
+        user, password = user_pass.split(":", 1) if ":" in user_pass else (user_pass, "")
+
+        # Probe remote device capabilities
+        rate = 48000
+        fmt = "S16_LE"
+        channels = 1
+        try:
+            probe_cmd = ["sshpass", "-p", password, "ssh", "-o", "StrictHostKeyChecking=no",
+                         f"{user}@{host}",
+                         f"arecord -D {alsa_dev} --dump-hw-params -d 1 /dev/null 2>&1"]
+            probe = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
+            output = probe.stdout + probe.stderr
+            print(f"[ext_mic/ssh] probe output ({len(output)} chars): {output[:200]}", flush=True)
+            for line in output.splitlines():
+                if 'RATE:' in line:
+                    rates = [int(x) for x in re.findall(r'\d+', line.split('RATE:')[1])]
+                    if rates:
+                        rate = min(rates)
+                elif 'FORMAT:' in line:
+                    fmts = line.split('FORMAT:')[1].strip().split()
+                    if 'S24_3LE' in fmts and 'S16_LE' not in fmts:
+                        fmt = "S24_3LE"
+                    elif 'S16_LE' in fmts:
+                        fmt = "S16_LE"
+                elif 'CHANNELS:' in line:
+                    ch = line.split('CHANNELS:')[1].strip()
+                    if '2' in ch and '1' not in ch:
+                        channels = 2
+            print(f"[ext_mic/ssh] remote device: fmt={fmt} ch={channels} rate={rate}", flush=True)
+        except Exception as e:
+            print(f"[ext_mic/ssh] probe failed: {e}, using defaults", flush=True)
+
+        target_rate = 16000
+        CHUNK_SIZE = 1024  # 512 int16 samples
+        is_s24_stereo = (fmt == "S24_3LE" and channels == 2)
+        if fmt == "S24_3LE" and channels == 1:
+            channels = 2  # S24_3LE usually paired with stereo
+
+        while self._running:
+            proc = None
+            try:
+                arecord_fmt = fmt
+                cmd = [
+                    "sshpass", "-p", password,
+                    "ssh", "-o", "StrictHostKeyChecking=no", "-o", "ServerAliveInterval=10",
+                    f"{user}@{host}",
+                    f"arecord -D {alsa_dev} -f {arecord_fmt} -r {rate} -c {channels} -t raw -q -"
+                ]
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                print(f"[ext_mic/ssh] connected to {user}@{host}, {alsa_dev} {arecord_fmt} {channels}ch {rate}Hz", flush=True)
+
+                pub_buf = bytearray()
+                raw_buf = bytearray()  # buffer for frame-alignment
+                first_publish = True
+                bytes_per_frame = (3 * channels) if fmt == "S24_3LE" else (2 * channels)
+
+                while self._running:
+                    data = proc.stdout.read(4096)
+                    if not data:
+                        break
+
+                    raw_buf += data
+
+                    # Process only complete frames
+                    n_frames = len(raw_buf) // bytes_per_frame
+                    if n_frames == 0:
+                        continue
+                    frame_bytes = n_frames * bytes_per_frame
+                    chunk_data = bytes(raw_buf[:frame_bytes])
+                    raw_buf = raw_buf[frame_bytes:]
+
+                    # Convert S24_3LE → S16_LE mono
+                    if fmt == "S24_3LE":
+                        raw = np.frombuffer(chunk_data, dtype=np.uint8)
+
+                        def _s24_to_s16(ch_bytes):
+                            """Reconstruct 24-bit signed int, then >> 8 to 16-bit."""
+                            val = (ch_bytes[:, 0].astype(np.int32) |
+                                   (ch_bytes[:, 1].astype(np.int32) << 8) |
+                                   (ch_bytes[:, 2].astype(np.int32) << 16))
+                            val[val >= 0x800000] -= 0x1000000
+                            return (val >> 8).astype(np.int16)
+
+                        if channels == 2:
+                            raw = raw.reshape(n_frames, 2, 3)
+                            left = _s24_to_s16(raw[:, 0, :])
+                            right = _s24_to_s16(raw[:, 1, :])
+                            samples = ((left.astype(np.int32) + right.astype(np.int32)) // 2).astype(np.int16)
+                        else:
+                            raw = raw.reshape(n_frames, 3)
+                            samples = _s24_to_s16(raw)
+                    else:
+                        samples = np.frombuffer(chunk_data, dtype=np.int16)
+                        if channels == 2:
+                            samples = samples.reshape(-1, 2).mean(axis=1).astype(np.int16)
+
+                    # Resample to 16kHz
+                    if rate != target_rate:
+                        n_out = int(len(samples) * target_rate / rate)
+                        if n_out <= 0:
+                            continue
+                        x_new = np.linspace(0, len(samples) - 1, n_out)
+                        samples = np.interp(x_new, np.arange(len(samples)), samples.astype(np.float32)).astype(np.int16)
+
+                    pub_buf += samples.tobytes()
+                    while len(pub_buf) >= CHUNK_SIZE:
+                        chunk = bytes(pub_buf[:CHUNK_SIZE])
+                        pub_buf = pub_buf[CHUNK_SIZE:]
+                        msg = AudioChunk()
+                        msg.header.stamp = self.get_clock().now().to_msg()
+                        msg.format = "audio/pcm-16k"
+                        msg.data = list(chunk)
+                        self._pub.publish(msg)
+                        if first_publish:
+                            print(f"[ext_mic/ssh] first publish on {self._topic}", flush=True)
+                            first_publish = False
+            except Exception as e:
+                if self._running:
+                    print(f"[ext_mic/ssh] error: {e}, reconnecting in 3s", flush=True)
+            finally:
+                if proc:
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=2)
+                    except Exception:
+                        pass
+            if self._running:
+                time.sleep(3)
+
+    def _tcp_capture(self):
+        """tcp://host:port[/format] — connect to raw audio TCP server.
+
+        Default format: S24_3LE stereo 48kHz (DJI Wireless Mic).
+        Append /pcm16k for pre-converted 16kHz mono streams.
+        """
+        import socket as _socket
+        url_body = self._url.replace("tcp://", "")
+
+        # Parse optional format suffix: tcp://host:port/pcm16k
+        pre_converted = False
+        if "/pcm16k" in url_body:
+            url_body = url_body.replace("/pcm16k", "")
+            pre_converted = True
+
+        host, port = url_body.rsplit(":", 1)
+        port = int(port)
+
+        # S24_3LE stereo 48kHz params
+        FRAME_SIZE = 6  # 3 bytes * 2 channels
+        NATIVE_RATE = 48000
+        TARGET_RATE = 16000
+        PUB_CHUNK = 1024  # 512 int16 samples = 1024 bytes
+
+        connect_failures = 0
+        MAX_CONNECT_RETRIES = 3
+
+        while self._running:
+            sock = None
+            try:
+                sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+                sock.settimeout(5.0)
+                sock.connect((host, port))
+                sock.settimeout(None)
+                sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
+                connect_failures = 0  # reset on successful connect
+                print(f"[ext_mic/tcp] connected to {host}:{port} (pre_converted={pre_converted})", flush=True)
+
+                raw_buf = bytearray()
+                pub_buf = bytearray()
+                first_publish = True
+
+                while self._running:
+                    data = sock.recv(8192)
+                    if not data:
+                        break
+
+                    if pre_converted:
+                        # Already PCM-16k mono
+                        pub_buf += data
+                    else:
+                        # S24_3LE stereo 48kHz → S16_LE mono 16kHz
+                        raw_buf += data
+                        n_frames = len(raw_buf) // FRAME_SIZE
+                        if n_frames == 0:
+                            continue
+                        frame_bytes = n_frames * FRAME_SIZE
+                        chunk = bytes(raw_buf[:frame_bytes])
+                        raw_buf = raw_buf[frame_bytes:]
+
+                        arr = np.frombuffer(chunk, dtype=np.uint8).reshape(n_frames, 2, 3)
+                        # S24_3LE decode
+                        def _s24(ch):
+                            v = (ch[:, 0].astype(np.int32) | (ch[:, 1].astype(np.int32) << 8) | (ch[:, 2].astype(np.int32) << 16))
+                            v[v >= 0x800000] -= 0x1000000
+                            return (v >> 8).astype(np.int16)
+                        left = _s24(arr[:, 0, :])
+                        right = _s24(arr[:, 1, :])
+                        mono = ((left.astype(np.int32) + right.astype(np.int32)) // 2).astype(np.int16)
+
+                        # Resample 48k → 16k
+                        n_out = int(len(mono) * TARGET_RATE / NATIVE_RATE)
+                        if n_out > 0:
+                            x_new = np.linspace(0, len(mono) - 1, n_out)
+                            resampled = np.interp(x_new, np.arange(len(mono)), mono.astype(np.float32)).astype(np.int16)
+                            pub_buf += resampled.tobytes()
+
+                    # Publish in fixed chunks
+                    while len(pub_buf) >= PUB_CHUNK:
+                        chunk = bytes(pub_buf[:PUB_CHUNK])
+                        pub_buf = pub_buf[PUB_CHUNK:]
+                        msg = AudioChunk()
+                        msg.header.stamp = self.get_clock().now().to_msg()
+                        msg.format = "audio/pcm-16k"
+                        msg.data = list(chunk)
+                        self._pub.publish(msg)
+                        if first_publish:
+                            print(f"[ext_mic/tcp] first publish on {self._topic}", flush=True)
+                            first_publish = False
+            except Exception as e:
+                if self._running:
+                    connect_failures += 1
+                    if connect_failures >= MAX_CONNECT_RETRIES:
+                        print(f"[ext_mic/tcp] failed to connect to {host}:{port} after {MAX_CONNECT_RETRIES} attempts, giving up", flush=True)
+                        self.state = "error"
+                        return
+                    print(f"[ext_mic/tcp] error: {e}, retrying ({connect_failures}/{MAX_CONNECT_RETRIES}) in 2s", flush=True)
+            finally:
+                if sock:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+            if self._running:
+                time.sleep(2)
+
+    def stop(self) -> dict:
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=3)
+            self._thread = None
+        self.state = "idle"
+        return self._status_dict()
+
+    def _status_dict(self) -> dict:
+        return {
+            "state": self.state,
+            "device_name": self._device_name,
+            "device_index": self._url,
             "topic_in": [],
             "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k", "desc": ""}],
         }
@@ -623,6 +914,14 @@ class ExtMicPlugin:
         self._nodes: dict[str, _ExtMicNode] = {}
         self._instance_configs: dict[str, dict] = {}  # instance_id → saved config params
         self._available_devices = _enumerate_ext_mics()
+        # Add network sources from config
+        for ns in plugin_cfg.get("network_sources", []):
+            self._available_devices.append({
+                "index": ns["url"],
+                "alsa_id": ns["url"],
+                "name": ns.get("name", ns["url"]),
+                "network": True,
+            })
         log.info(f"[ext_mic] found {len(self._available_devices)} external mic device(s)")
         for d in self._available_devices:
             log.info(f"  [{d['index']}] {d['name']}")
@@ -695,9 +994,14 @@ class ExtMicPlugin:
             try:
                 device_id = int(device_id)
             except (ValueError, TypeError):
-                pass  # keep as string (alsa_id like "hw:0,0")
+                pass  # keep as string (alsa_id like "hw:0,0" or "tcp://...")
             if instance_id not in self._nodes:
-                node = _ExtMicNode(device_id, device_name, self._namespace, instance_id)
+                if isinstance(device_id, str) and (device_id.startswith("tcp://") or device_id.startswith("ssh://")):
+                    node = _NetworkMicNode(device_id, device_name, self._namespace, instance_id,
+                                           context=self._executor.context)
+                else:
+                    node = _ExtMicNode(device_id, device_name, self._namespace, instance_id,
+                                       context=self._executor.context)
                 self._executor.add_node(node)
                 self._nodes[instance_id] = node
             return self._nodes[instance_id].start()

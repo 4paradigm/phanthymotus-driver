@@ -10,7 +10,7 @@
  * Subscribes to:
  *   - DJI_FC_SUBSCRIPTION_TOPIC_QUATERNION (50Hz)
  *   - DJI_FC_SUBSCRIPTION_TOPIC_VELOCITY (50Hz)
- *   - DJI_FC_SUBSCRIPTION_TOPIC_GPS_POSITION (50Hz)
+ *   - DJI_FC_SUBSCRIPTION_TOPIC_GPS_POSITION (5Hz; M3E/M3T limit)
  *   - DJI_FC_SUBSCRIPTION_TOPIC_GPS_DETAILS
  *   - DJI_FC_SUBSCRIPTION_TOPIC_ALTITUDE_FUSED
  *   - DJI_FC_SUBSCRIPTION_TOPIC_ALTITUDE_OF_HOMEPOINT
@@ -32,7 +32,6 @@
 static T_DjiFcSubscriptionQuaternion s_quaternion;
 static T_DjiFcSubscriptionVelocity s_velocity;
 static T_DjiFcSubscriptionGpsPosition s_gps_pos;
-static T_DjiFcSubscriptionPositionFused s_pos_fused;
 static T_DjiFcSubscriptionGpsDetails s_gps_detail;
 static T_DjiFcSubscriptionAltitudeFused s_alt_fused;
 static T_DjiFcSubscriptionAltitudeOfHomePoint s_alt_home;
@@ -52,18 +51,6 @@ static T_DjiReturnCode _quaternion_cb(const uint8_t *data, uint16_t size, const 
 static T_DjiReturnCode _velocity_cb(const uint8_t *data, uint16_t size, const T_DjiDataTimestamp *ts) {
     if (size >= sizeof(s_velocity))
         memcpy(&s_velocity, data, sizeof(s_velocity));
-    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
-}
-
-static T_DjiReturnCode _gps_cb(const uint8_t *data, uint16_t size, const T_DjiDataTimestamp *ts) {
-    if (size >= sizeof(s_gps_pos))
-        memcpy(&s_gps_pos, data, sizeof(s_gps_pos));
-    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
-}
-
-static T_DjiReturnCode _pos_fused_cb(const uint8_t *data, uint16_t size, const T_DjiDataTimestamp *ts) {
-    if (size >= sizeof(s_pos_fused))
-        memcpy(&s_pos_fused, data, sizeof(s_pos_fused));
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
 
@@ -130,11 +117,18 @@ int telemetry_init(void) {
         return -1;
     }
 
-    /* Subscribe at 10Hz (suitable topics) */
+    /* M3E/M3T only supports GPS_POSITION at up to 5Hz.  Do not subscribe to
+     * POSITION_FUSED: that topic is not supported on this aircraft family. */
     rc = DjiFcSubscription_SubscribeTopic(DJI_FC_SUBSCRIPTION_TOPIC_QUATERNION, DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, _quaternion_cb);
     rc = DjiFcSubscription_SubscribeTopic(DJI_FC_SUBSCRIPTION_TOPIC_VELOCITY, DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, _velocity_cb);
-    DjiFcSubscription_SubscribeTopic(DJI_FC_SUBSCRIPTION_TOPIC_GPS_POSITION, DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, _gps_cb);
-    rc = DjiFcSubscription_SubscribeTopic(DJI_FC_SUBSCRIPTION_TOPIC_POSITION_FUSED, DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, _pos_fused_cb);
+    /* GPS_POSITION is pulled with GetLatestValueOfTopic below.  This mirrors
+     * DJI's sample and avoids relying on a callback that is not delivered for
+     * this topic on the M3T E-Port path. */
+    rc = DjiFcSubscription_SubscribeTopic(DJI_FC_SUBSCRIPTION_TOPIC_GPS_POSITION, DJI_DATA_SUBSCRIPTION_TOPIC_5_HZ, NULL);
+    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+        printf("[telemetry] GPS_POSITION subscription failed: 0x%08llX\n", (unsigned long long)rc);
+        return -1;
+    }
     rc = DjiFcSubscription_SubscribeTopic(DJI_FC_SUBSCRIPTION_TOPIC_GPS_DETAILS, DJI_DATA_SUBSCRIPTION_TOPIC_1_HZ, _gps_detail_cb);
     rc = DjiFcSubscription_SubscribeTopic(DJI_FC_SUBSCRIPTION_TOPIC_ALTITUDE_FUSED, DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, _alt_fused_cb);
     rc = DjiFcSubscription_SubscribeTopic(DJI_FC_SUBSCRIPTION_TOPIC_ALTITUDE_OF_HOMEPOINT, DJI_DATA_SUBSCRIPTION_TOPIC_1_HZ, _alt_home_cb);
@@ -157,18 +151,19 @@ int telemetry_get_json(char *buf, size_t buflen) {
     double pitch = asin(2.0*(q0*q2 - q3*q1)) * 180.0 / M_PI;
     double yaw   = atan2(2.0*(q0*q3 + q1*q2), 1.0 - 2.0*(q2*q2 + q3*q3)) * 180.0 / M_PI;
 
-    /* Use POSITION_FUSED as primary source (works in simulator),
-     * fall back to GPS_POSITION if fused is 0 */
-    double lat_deg, lon_deg, gps_alt;
-    if (s_pos_fused.latitude != 0 || s_pos_fused.longitude != 0) {
-        lat_deg = s_pos_fused.latitude * 180.0 / M_PI;
-        lon_deg = s_pos_fused.longitude * 180.0 / M_PI;
-        gps_alt = (double)s_pos_fused.altitude;
-    } else {
-        lat_deg = (double)s_gps_pos.y / 1e7;
-        lon_deg = (double)s_gps_pos.x / 1e7;
-        gps_alt = (double)s_gps_pos.z / 1000.0;
+    /* GPS_POSITION uses x=longitude, y=latitude (degrees * 1e7), z=altitude
+     * (millimetres).  On M3E/M3T this is the supported position source. */
+    T_DjiDataTimestamp gps_timestamp;
+    T_DjiReturnCode gps_rc = DjiFcSubscription_GetLatestValueOfTopic(
+        DJI_FC_SUBSCRIPTION_TOPIC_GPS_POSITION,
+        (uint8_t *)&s_gps_pos, sizeof(s_gps_pos), &gps_timestamp);
+    if (gps_rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+        printf("[telemetry] GPS_POSITION read failed: 0x%08llX\n",
+               (unsigned long long)gps_rc);
     }
+    double lat_deg = (double)s_gps_pos.y / 1e7;
+    double lon_deg = (double)s_gps_pos.x / 1e7;
+    double gps_alt = (double)s_gps_pos.z / 1000.0;
 
     snprintf(buf, buflen,
         "{"
