@@ -11,6 +11,7 @@
 | 驱动 | 硬件 | 端口 | 说明 |
 |------|------|------|------|
 | `unitree/g1` | Unitree G1 人形机器人 | 15701 | 运动控制、机械臂、麦克风、扬声器、LED、状态监控 |
+| `deep_robotics/lynx_m20` | 云深处山猫 M20 | 15716 | 官方 ROS 2/Fast DDS 接口与 basic_server TCP/UDP 原生控制，隔离标准版和 Pro 能力 |
 | `phanthy/remote_control` | 远程控制桥接 | 15710 | 远程控制中继 |
 
 ## 快速开始
