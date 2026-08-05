@@ -474,6 +474,35 @@ def velocity_commands_differ(current, target, abs_tol: float = 1e-9) -> bool:
     )
 
 
+def put_latest(command_queue, command) -> bool:
+    """Insert one command and replace, rather than backlog, an older one.
+
+    Returns true when a queued command was coalesced away.  The consumer may
+    race with replacement, but a capacity-one queue can never retain more than
+    the newest command available at the replacement boundary.
+    """
+    coalesced = False
+    while True:
+        try:
+            command_queue.put_nowait(command)
+            return coalesced
+        except queue.Full:
+            try:
+                command_queue.get_nowait()
+                coalesced = True
+            except queue.Empty:
+                pass
+
+
+def percentile_ms(samples, percentile):
+    """Return a nearest-rank latency percentile for diagnostics."""
+    if not samples:
+        return None
+    ordered = sorted(int(value) for value in samples)
+    rank = max(1, math.ceil(float(percentile) * len(ordered)))
+    return ordered[min(len(ordered) - 1, rank - 1)]
+
+
 @dataclass
 class ProposalApplyDiagnostics:
     """Current or most recent nav-lease execution evidence for ``loco info``."""
@@ -483,6 +512,7 @@ class ProposalApplyDiagnostics:
     accepted: int = 0
     rejected: int = 0
     applied: int = 0
+    coalesced: int = 0
     first_received_monotonic: Optional[float] = None
     last_received_monotonic: Optional[float] = None
     last_receive_gap_ms: Optional[int] = None
@@ -501,6 +531,8 @@ class ProposalApplyDiagnostics:
     last_set_velocity_applied: Optional[bool] = None
     last_set_velocity_request_id: Optional[int] = None
     last_set_velocity_duration_ms: Optional[int] = None
+    last_set_velocity_queue_delay_ms: Optional[int] = None
+    last_set_velocity_end_to_end_ms: Optional[int] = None
     last_set_velocity_completed_monotonic: Optional[float] = None
     last_set_velocity_completed_unix_ms: Optional[int] = None
     last_set_velocity_stop_ret: Optional[int] = None
@@ -515,6 +547,11 @@ class ProposalApplyDiagnostics:
         init=False,
         repr=False,
     )
+    _set_velocity_rpc_durations_ms: deque = field(
+        default_factory=lambda: deque(maxlen=512),
+        init=False,
+        repr=False,
+    )
 
     def begin_session(self, nav_id: str) -> None:
         """Reset per-lease counters while retaining them after later cleanup."""
@@ -524,6 +561,7 @@ class ProposalApplyDiagnostics:
             self.accepted = 0
             self.rejected = 0
             self.applied = 0
+            self.coalesced = 0
             self.first_received_monotonic = None
             self.last_received_monotonic = None
             self.last_receive_gap_ms = None
@@ -542,11 +580,14 @@ class ProposalApplyDiagnostics:
             self.last_set_velocity_applied = None
             self.last_set_velocity_request_id = None
             self.last_set_velocity_duration_ms = None
+            self.last_set_velocity_queue_delay_ms = None
+            self.last_set_velocity_end_to_end_ms = None
             self.last_set_velocity_completed_monotonic = None
             self.last_set_velocity_completed_unix_ms = None
             self.last_set_velocity_stop_ret = None
             self.last_set_velocity_stop_error = None
             self._applied_identities = set()
+            self._set_velocity_rpc_durations_ms = deque(maxlen=512)
 
     def record_received(self, received_monotonic: Optional[float] = None) -> None:
         received = (
@@ -613,6 +654,10 @@ class ProposalApplyDiagnostics:
         with self._lock:
             self.accepted += 1
 
+    def record_coalesced(self) -> None:
+        with self._lock:
+            self.coalesced += 1
+
     def record_rejected(self, reason: str) -> None:
         with self._lock:
             self.rejected += 1
@@ -623,9 +668,46 @@ class ProposalApplyDiagnostics:
                 self.rejections_by_reason.get(reason, 0) + 1
             )
 
-    def record_set_velocity(self, result: dict, duration: float) -> None:
+    def record_set_velocity(
+        self,
+        result: dict,
+        queued_monotonic: Optional[float] = None,
+    ) -> None:
+        """Record measured RPC timing, never the proposal TTL budget."""
+        started_monotonic = result.get("started_monotonic")
         completed_monotonic = result.get("completed_monotonic")
         completed_unix_ms = result.get("completed_unix_ms")
+        duration_ms = result.get("duration_ms")
+        if (
+            duration_ms is None
+            and started_monotonic is not None
+            and completed_monotonic is not None
+        ):
+            duration_ms = max(
+                0,
+                round(
+                    (float(completed_monotonic) - float(started_monotonic))
+                    * 1000
+                ),
+            )
+        queue_delay_ms = None
+        end_to_end_ms = None
+        if queued_monotonic is not None and started_monotonic is not None:
+            queue_delay_ms = max(
+                0,
+                round(
+                    (float(started_monotonic) - float(queued_monotonic))
+                    * 1000
+                ),
+            )
+        if queued_monotonic is not None and completed_monotonic is not None:
+            end_to_end_ms = max(
+                0,
+                round(
+                    (float(completed_monotonic) - float(queued_monotonic))
+                    * 1000
+                ),
+            )
         with self._lock:
             self.last_set_velocity_rpc_method = result.get("rpc_method")
             request = result.get("request")
@@ -636,10 +718,17 @@ class ProposalApplyDiagnostics:
             self.last_set_velocity_error = result.get("error")
             self.last_set_velocity_applied = bool(result.get("applied"))
             self.last_set_velocity_request_id = result.get("request_id")
-            self.last_set_velocity_duration_ms = max(
-                0,
-                round(float(duration) * 1000),
+            self.last_set_velocity_duration_ms = (
+                max(0, int(duration_ms))
+                if duration_ms is not None
+                else None
             )
+            self.last_set_velocity_queue_delay_ms = queue_delay_ms
+            self.last_set_velocity_end_to_end_ms = end_to_end_ms
+            if duration_ms is not None:
+                self._set_velocity_rpc_durations_ms.append(
+                    max(0, int(duration_ms))
+                )
             self.last_set_velocity_completed_monotonic = (
                 float(completed_monotonic)
                 if completed_monotonic is not None
@@ -674,6 +763,7 @@ class ProposalApplyDiagnostics:
                 "accepted": self.accepted,
                 "rejected": self.rejected,
                 "applied": self.applied,
+                "coalesced": self.coalesced,
                 "first_received_monotonic": self.first_received_monotonic,
                 "last_received_monotonic": self.last_received_monotonic,
                 "last_receive_gap_ms": self.last_receive_gap_ms,
@@ -703,6 +793,32 @@ class ProposalApplyDiagnostics:
                 ),
                 "last_set_velocity_duration_ms": (
                     self.last_set_velocity_duration_ms
+                ),
+                "last_set_velocity_queue_delay_ms": (
+                    self.last_set_velocity_queue_delay_ms
+                ),
+                "last_set_velocity_end_to_end_ms": (
+                    self.last_set_velocity_end_to_end_ms
+                ),
+                "set_velocity_rpc_samples": len(
+                    self._set_velocity_rpc_durations_ms
+                ),
+                "set_velocity_rpc_p50_ms": percentile_ms(
+                    self._set_velocity_rpc_durations_ms,
+                    0.50,
+                ),
+                "set_velocity_rpc_p95_ms": percentile_ms(
+                    self._set_velocity_rpc_durations_ms,
+                    0.95,
+                ),
+                "set_velocity_rpc_p99_ms": percentile_ms(
+                    self._set_velocity_rpc_durations_ms,
+                    0.99,
+                ),
+                "set_velocity_rpc_max_ms": (
+                    max(self._set_velocity_rpc_durations_ms)
+                    if self._set_velocity_rpc_durations_ms
+                    else None
                 ),
                 "last_set_velocity_completed_monotonic": (
                     self.last_set_velocity_completed_monotonic
@@ -1421,7 +1537,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
             )
         proposal_apply_diagnostics.record_set_velocity(
             result,
-            max(0.0, command["deadline_monotonic"] - command["queued_monotonic"]),
+            queued_monotonic=command["queued_monotonic"],
         )
         return result
 
@@ -1446,15 +1562,8 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
 
     def enqueue_proposal_apply(command):
         """Keep only the newest validated command while the parent RPC is busy."""
-        while True:
-            try:
-                proposal_apply_queue.put_nowait(command)
-                return
-            except queue.Full:
-                try:
-                    proposal_apply_queue.get_nowait()
-                except queue.Empty:
-                    pass
+        if put_latest(proposal_apply_queue, command):
+            proposal_apply_diagnostics.record_coalesced()
 
     def query_parent_fsm_id():
         nonlocal parent_loco_request_id
@@ -1521,9 +1630,19 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
             reason_str,
             watchdog_fault,
         )
-        if watchdog_fault:
+        if watchdog_fault and reason_str != "proposal_ttl_expired":
             proposal_gate.disarm(reason_str)
-        retry_proposal_stop = was_proposal_motion and not confirm_physical_stop
+        recoverable_stop_requested = bool(
+            proposal_gate.armed
+            and reason_str in {"obstacle", "proposal_ttl_expired"}
+            and (was_proposal_motion or reason_str == "proposal_ttl_expired")
+        )
+        proposal_stop_context = bool(
+            was_proposal_motion or recoverable_stop_requested
+        )
+        retry_proposal_stop = (
+            proposal_stop_context and not confirm_physical_stop
+        )
         if move_timer:
             move_timer.cancel()
             move_timer = None
@@ -1531,7 +1650,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
         clear_proposal_execution()
         was_moving = state == MotionState.MOVING
 
-        if was_proposal_motion and not confirm_physical_stop:
+        if proposal_stop_context and not confirm_physical_stop:
             # The independent client brakes immediately.  The ordered parent
             # StopMove then runs after any in-flight continuous SetVelocity,
             # preventing a late successful apply from restarting motion.
@@ -1646,11 +1765,16 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
             }
             if stop_error:
                 result["error"] = f"StopMove failed: {stop_error}"
-        if was_proposal_motion and reason_str == "obstacle":
+        if recoverable_stop_requested:
             if result.get("stop_confirmed"):
-                proposal_gate.hold_for_obstacle()
+                proposal_gate.hold_after_confirmed_stop(reason_str)
             else:
-                proposal_gate.disarm("obstacle_stop_unconfirmed")
+                unconfirmed_reason = (
+                    "obstacle_stop_unconfirmed"
+                    if reason_str == "obstacle"
+                    else "proposal_ttl_stop_unconfirmed"
+                )
+                proposal_gate.disarm(unconfirmed_reason)
         if was_moving:
             event_data = {"reason": reason_str}
             if reason_str == "obstacle":
@@ -1661,7 +1785,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
         result.update({"state": "idle", "reason": reason_str})
         if confirm_physical_stop:
             last_stop_result = dict(result)
-            if retry_proposal_stop:
+            if proposal_stop_context:
                 last_proposal_stop_result = dict(result)
         return result
 
@@ -2962,7 +3086,10 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                     else:
                         reason = "set_velocity_failed"
                     proposal_apply_diagnostics.record_rejected(reason)
-                    proposal_gate.disarm(reason)
+                    if reason == "proposal_ttl_expired":
+                        proposal_gate.request_ttl_stop(time.monotonic())
+                    else:
+                        proposal_gate.disarm(reason)
                     do_stop(reason)
                     continue
                 proposal_apply_diagnostics.record_applied(

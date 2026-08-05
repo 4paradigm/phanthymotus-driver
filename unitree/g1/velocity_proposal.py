@@ -263,11 +263,50 @@ class VelocityProposalGate:
 
     def hold_for_obstacle(self) -> None:
         """Keep the nav lease armed after a confirmed local obstacle stop."""
+        self.hold_after_confirmed_stop("obstacle")
+
+    def hold_after_confirmed_stop(self, reason: str) -> None:
+        """Keep a trusted nav lease after a confirmed recoverable stop.
+
+        Ordinary obstacle stops and a single proposal TTL lapse are local
+        braking events, not proof that the Agent Core lease is invalid.  The
+        caller must only enter this state after StopMove has been acknowledged
+        and fresh odometry has confirmed zero velocity.
+        """
         if not self.armed:
             return
+        recoverable_reasons = {
+            "obstacle": "obstacle_stop_recoverable",
+            "proposal_ttl_expired": "proposal_ttl_stop_recoverable",
+        }
+        if reason not in recoverable_reasons:
+            raise ValueError("unsupported_recoverable_stop_reason")
         self.deadline_monotonic = 0.0
-        self.last_reason = "obstacle_stop_recoverable"
+        self.last_reason = recoverable_reasons[reason]
         self.recoverable_stop_active = True
+
+    def request_ttl_stop(
+        self,
+        now: float,
+        proposal: Optional[ValidatedVelocityProposal] = None,
+    ) -> ProposalDecision:
+        """Request fail-closed braking without retiring the trusted lease.
+
+        The lease remains armed only so the stop path can move it into a
+        recoverable hold after measured zero velocity.  No new command can be
+        executed while that serialized stop confirmation is in progress.
+        """
+        if proposal is not None:
+            self.last_sequence = proposal.sequence
+            self.last_receive_monotonic = now
+        self.deadline_monotonic = 0.0
+        self.last_reason = "proposal_ttl_expired"
+        self.recoverable_stop_active = False
+        return ProposalDecision(
+            stop=True,
+            reason="proposal_ttl_expired",
+            proposal=proposal,
+        )
 
     def _retire_expected_nav_id(self) -> None:
         if self.expected_nav_id:
@@ -320,18 +359,14 @@ class VelocityProposalGate:
                     self.last_sequence = proposal.sequence
                     self.last_receive_monotonic = now
                     self.deadline_monotonic = 0.0
-                    self.last_reason = "obstacle_stop_recoverable"
+                    # Preserve whether this hold came from an obstacle or a
+                    # prior TTL stop while stale retained samples drain.
                     return ProposalDecision(
                         stop=True,
                         reason="proposal_ttl_expired",
                         proposal=proposal,
                     )
-                self.disarm("proposal_ttl_expired")
-                return ProposalDecision(
-                    stop=True,
-                    reason="proposal_ttl_expired",
-                    proposal=proposal,
-                )
+                return self.request_ttl_stop(now, proposal)
             # A future producer timestamp may not extend the configured TTL.
             duration = min(duration, remaining)
 
@@ -353,8 +388,7 @@ class VelocityProposalGate:
     def watchdog(self, now: float) -> ProposalDecision:
         if self.deadline_monotonic <= 0.0 or now < self.deadline_monotonic:
             return ProposalDecision()
-        self.disarm("proposal_ttl_expired")
-        return ProposalDecision(stop=True, reason=self.last_reason)
+        return self.request_ttl_stop(now)
 
     def snapshot(self, now: float) -> dict:
         age_ms = None

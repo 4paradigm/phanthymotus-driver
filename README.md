@@ -62,6 +62,21 @@ python main.py
 4. Tools become available to the LLM agent and appear in the Web Dashboard
 5. The LLM agent can invoke tools via MCP `tools/call`
 
+### G1 Controlled Navigation Velocity
+
+The G1 `loco` actuator accepts a lease-bound
+`phanthy.navigation.velocity_proposal.v1` input. Valid proposals are executed
+through a capacity-one latest-only queue, so an older pending velocity is
+coalesced instead of backlogged. A proposal TTL lapse immediately triggers
+`StopMove`; only a successful post-call zero-odometry confirmation keeps the
+same navigation lease recoverable for the next fresh proposal. Hard safety,
+identity, sequence, RPC, and stop-confirmation faults still disarm the lease.
+
+`loco info` exposes proposal counters, the coalesced count, measured RPC and
+queue latency, rolling RPC p50/p95/p99/max values, rejection reasons, and the
+last confirmed proposal stop. The `last_set_velocity_duration_ms` value is
+measured RPC time, not the proposal TTL budget.
+
 ## Writing a New Driver
 
 Want to add support for new hardware? See the **[Driver Development Guide](README_dev.md)** for the full specification, including:

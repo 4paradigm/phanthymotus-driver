@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import queue
 import unittest
 
 from safety_harness import (
@@ -8,6 +9,8 @@ from safety_harness import (
     ProposalExecutionLease,
     authoritative_proposal_stop_reason,
     obstacle_observation_applies,
+    percentile_ms,
+    put_latest,
     proposal_decision_requires_physical_stop,
     translation_obstacle_heading,
     velocity_commands_differ,
@@ -35,10 +38,12 @@ class ProposalApplyDiagnosticsTest(unittest.TestCase):
                 "ret": 0,
                 "error": None,
                 "applied": True,
+                "started_monotonic": 34.3,
                 "completed_monotonic": 34.5,
                 "completed_unix_ms": 56,
+                "duration_ms": 200,
             },
-            duration=0.2,
+            queued_monotonic=34.25,
         )
         diagnostics.record_applied()
 
@@ -50,6 +55,7 @@ class ProposalApplyDiagnosticsTest(unittest.TestCase):
                 "accepted": 1,
                 "rejected": 0,
                 "applied": 1,
+                "coalesced": 0,
                 "first_received_monotonic": 10.0,
                 "last_received_monotonic": 10.0,
                 "last_receive_gap_ms": None,
@@ -74,6 +80,13 @@ class ProposalApplyDiagnosticsTest(unittest.TestCase):
                 "last_set_velocity_applied": True,
                 "last_set_velocity_request_id": 12,
                 "last_set_velocity_duration_ms": 200,
+                "last_set_velocity_queue_delay_ms": 50,
+                "last_set_velocity_end_to_end_ms": 250,
+                "set_velocity_rpc_samples": 1,
+                "set_velocity_rpc_p50_ms": 200,
+                "set_velocity_rpc_p95_ms": 200,
+                "set_velocity_rpc_p99_ms": 200,
+                "set_velocity_rpc_max_ms": 200,
                 "last_set_velocity_completed_monotonic": 34.5,
                 "last_set_velocity_completed_unix_ms": 56,
                 "last_set_velocity_stop_ret": None,
@@ -90,10 +103,11 @@ class ProposalApplyDiagnosticsTest(unittest.TestCase):
                 "request_id": 13,
                 "ret": 3104,
                 "error": None,
+                "started_monotonic": 69.85,
                 "completed_monotonic": 70.0,
                 "completed_unix_ms": 80,
+                "duration_ms": 150,
             },
-            duration=0.15,
         )
         diagnostics.record_rejected("set_velocity_failed")
 
@@ -116,6 +130,31 @@ class ProposalApplyDiagnosticsTest(unittest.TestCase):
         self.assertEqual(status["proposal_execution"]["accepted"], 1)
         self.assertEqual(status["proposal_execution"]["rejected"], 1)
         self.assertEqual(status["proposal_execution"]["applied"], 0)
+
+    def test_rpc_percentiles_use_measured_result_duration(self):
+        diagnostics = ProposalApplyDiagnostics()
+        diagnostics.begin_session("nav-latency")
+        for duration_ms in (10, 20, 30, 40, 500):
+            diagnostics.record_set_velocity({"duration_ms": duration_ms})
+
+        status = diagnostics.snapshot()
+
+        self.assertEqual(status["set_velocity_rpc_samples"], 5)
+        self.assertEqual(status["set_velocity_rpc_p50_ms"], 30)
+        self.assertEqual(status["set_velocity_rpc_p95_ms"], 500)
+        self.assertEqual(status["set_velocity_rpc_p99_ms"], 500)
+        self.assertEqual(status["set_velocity_rpc_max_ms"], 500)
+        self.assertEqual(percentile_ms([], 0.99), None)
+
+    def test_latest_only_queue_coalesces_without_backlog(self):
+        commands = queue.Queue(maxsize=1)
+
+        self.assertFalse(put_latest(commands, {"sequence": 1}))
+        self.assertTrue(put_latest(commands, {"sequence": 2}))
+        self.assertTrue(put_latest(commands, {"sequence": 3}))
+
+        self.assertEqual(commands.qsize(), 1)
+        self.assertEqual(commands.get_nowait(), {"sequence": 3})
 
     def test_arrival_timing_and_watchdog_faults_are_reported(self):
         diagnostics = ProposalApplyDiagnostics()
