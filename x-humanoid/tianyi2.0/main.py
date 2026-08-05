@@ -19,6 +19,7 @@ x-humanoid/tianyi2.0/main.py — 天轶2.0 Pro 设备 bundle 统一入口。
 
 import json
 import os
+import queue as _queue
 import re
 import signal
 import socket
@@ -28,6 +29,25 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+# ── ACP: SSE event bus (thread-safe) ─────────────────────────────────────────
+
+_sse_clients: list[_queue.Queue] = []
+_sse_lock = threading.Lock()
+
+
+def sse_push(event: dict):
+    """线程安全地广播 SSE 事件到所有连接的客户端。"""
+    data = json.dumps(event, ensure_ascii=False)
+    with _sse_lock:
+        dead = []
+        for q in _sse_clients:
+            try:
+                q.put_nowait(data)
+            except _queue.Full:
+                dead.append(q)
+        for q in dead:
+            _sse_clients.remove(q)
 
 import yaml
 
@@ -403,6 +423,34 @@ def make_handler():
             self.wfile.write(encoded)
 
         def do_GET(self):
+            if self.path.split("?")[0] == "/sse":
+                # SSE streaming endpoint for ACP completion events
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "keep-alive")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+
+                client_queue = _queue.Queue(maxsize=64)
+                with _sse_lock:
+                    _sse_clients.append(client_queue)
+                try:
+                    while True:
+                        try:
+                            data = client_queue.get(timeout=30)
+                            self.wfile.write(f"data: {data}\n\n".encode())
+                            self.wfile.flush()
+                        except _queue.Empty:
+                            self.wfile.write(b": ping\n\n")
+                            self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+                finally:
+                    with _sse_lock:
+                        if client_queue in _sse_clients:
+                            _sse_clients.remove(client_queue)
+                return
             self.send_response(404)
             self.end_headers()
 
