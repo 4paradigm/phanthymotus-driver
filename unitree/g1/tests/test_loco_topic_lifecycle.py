@@ -94,6 +94,15 @@ class FakeSmartMotion:
     def __init__(self):
         self.bound_topic = ""
         self.expected_nav_id = ""
+        self.last_reason = None
+        self.proposal_execution = {
+            "received": 0,
+            "accepted": 0,
+            "rejected": 0,
+            "applied": 0,
+            "last_rejection_reason": None,
+            "last_set_velocity_ret": None,
+        }
         self.bind_result = None
         self.unbind_reasons = []
         self.unbind_result = {
@@ -118,6 +127,7 @@ class FakeSmartMotion:
 
     def unbind_velocity_proposal(self, reason):
         self.unbind_reasons.append(reason)
+        self.last_reason = reason
         result = dict(self.unbind_result)
         if not result.get("connected"):
             self.bound_topic = ""
@@ -131,6 +141,8 @@ class FakeSmartMotion:
             "topic": self.bound_topic or None,
             "expected_nav_id": self.expected_nav_id or None,
             "active_nav_id": self.expected_nav_id or None,
+            "last_reason": self.last_reason,
+            "proposal_execution": dict(self.proposal_execution),
         }
 
 
@@ -179,6 +191,29 @@ class LocoTopicLifecycleTest(unittest.TestCase):
         self.assertFalse(stopped["connected"])
         self.assertTrue(stopped["stop_confirmed"])
         self.assertEqual(self.smart_motion.unbind_reasons, ["canvas_stop"])
+
+    def test_info_retains_proposal_execution_diagnostics_after_unbind(self):
+        self.smart_motion.proposal_execution.update({
+            "received": 3,
+            "accepted": 2,
+            "rejected": 1,
+            "applied": 1,
+            "last_rejection_reason": "set_velocity_failed",
+            "last_set_velocity_ret": 3104,
+        })
+        self.plugin.dispatch(
+            "start",
+            {"input_topic": self.topic, "expected_nav_id": self.nav_id},
+        )
+
+        self.plugin.dispatch("stop", {})
+        info = self.plugin.dispatch("info", {"_tool_name": "loco"})
+
+        self.assertEqual(info["last_reason"], "canvas_stop")
+        self.assertEqual(
+            info["proposal_execution"],
+            self.smart_motion.proposal_execution,
+        )
 
     def test_start_accepts_exactly_one_input_topics_entry(self):
         started = self.plugin.dispatch(

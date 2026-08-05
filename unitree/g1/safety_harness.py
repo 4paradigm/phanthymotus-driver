@@ -5,7 +5,8 @@ drivers/unitree/g1/safety_harness.py — SmartMotion 独立进程安全层。
 架构：
   - SmartMotionProcess: 独立子进程，拥有自己的 DDS 通道和 ROS2 节点
     - 订阅 LiDAR 点云，10Hz 全量 numpy 处理
-    - 执行 LocoClient / SlamClient RPC 调用
+    - 在本地执行停止、FSM 和 SlamClient RPC
+    - 将安全判定通过的 proposal SetVelocity 有界交给主进程 Driver RPC
     - 发布运动事件到 ROS2 topic
   - SmartMotionProxy: 主进程中的轻量代理，通过 multiprocessing Queue 通信
     - 对外暴露与原 SmartMotion 相同的 API
@@ -300,6 +301,145 @@ def issue_stop_and_confirm(
     )
 
 
+@dataclass
+class ProposalApplyDiagnostics:
+    """Process-lifetime proposal receive/apply evidence for ``loco info``."""
+
+    received: int = 0
+    accepted: int = 0
+    rejected: int = 0
+    applied: int = 0
+    last_rejection_reason: Optional[str] = None
+    last_set_velocity_ret: Optional[int] = None
+    last_set_velocity_error: Optional[str] = None
+    last_set_velocity_request_id: Optional[int] = None
+    last_set_velocity_duration_ms: Optional[int] = None
+    last_set_velocity_completed_monotonic: Optional[float] = None
+    last_set_velocity_completed_unix_ms: Optional[int] = None
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        init=False,
+        repr=False,
+    )
+
+    def record_received(self) -> None:
+        with self._lock:
+            self.received += 1
+
+    def record_accepted(self) -> None:
+        with self._lock:
+            self.accepted += 1
+
+    def record_rejected(self, reason: str) -> None:
+        with self._lock:
+            self.rejected += 1
+            self.last_rejection_reason = reason
+
+    def record_set_velocity(self, result: dict, duration: float) -> None:
+        completed_monotonic = result.get("completed_monotonic")
+        completed_unix_ms = result.get("completed_unix_ms")
+        with self._lock:
+            self.last_set_velocity_ret = result.get("ret")
+            self.last_set_velocity_error = result.get("error")
+            self.last_set_velocity_request_id = result.get("request_id")
+            self.last_set_velocity_duration_ms = max(
+                0,
+                round(float(duration) * 1000),
+            )
+            self.last_set_velocity_completed_monotonic = (
+                float(completed_monotonic)
+                if completed_monotonic is not None
+                else None
+            )
+            self.last_set_velocity_completed_unix_ms = (
+                int(completed_unix_ms)
+                if completed_unix_ms is not None
+                else None
+            )
+
+    def record_applied(self) -> None:
+        with self._lock:
+            self.applied += 1
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "received": self.received,
+                "accepted": self.accepted,
+                "rejected": self.rejected,
+                "applied": self.applied,
+                "last_rejection_reason": self.last_rejection_reason,
+                "last_set_velocity_ret": self.last_set_velocity_ret,
+                "last_set_velocity_error": self.last_set_velocity_error,
+                "last_set_velocity_request_id": (
+                    self.last_set_velocity_request_id
+                ),
+                "last_set_velocity_duration_ms": (
+                    self.last_set_velocity_duration_ms
+                ),
+                "last_set_velocity_completed_monotonic": (
+                    self.last_set_velocity_completed_monotonic
+                ),
+                "last_set_velocity_completed_unix_ms": (
+                    self.last_set_velocity_completed_unix_ms
+                ),
+            }
+
+
+def request_parent_set_velocity(
+    request_queue,
+    result_queue,
+    request_id: int,
+    vx: float,
+    vy: float,
+    vyaw: float,
+    duration: float,
+    timeout: float,
+) -> dict:
+    """Request one finite SetVelocity from the parent and wait boundedly."""
+    started = time.monotonic()
+    try:
+        request_queue.put({
+            "request_id": request_id,
+            "vx": vx,
+            "vy": vy,
+            "vyaw": vyaw,
+            "duration": duration,
+        })
+    except Exception as exc:
+        return {
+            "request_id": request_id,
+            "ret": None,
+            "error": f"parent_set_velocity_ipc_error: {exc}",
+            "completed_monotonic": time.monotonic(),
+            "completed_unix_ms": round(time.time() * 1000),
+        }
+
+    deadline = started + max(0.0, float(timeout))
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            return {
+                "request_id": request_id,
+                "ret": None,
+                "error": "parent_set_velocity_timeout",
+                "completed_monotonic": time.monotonic(),
+                "completed_unix_ms": round(time.time() * 1000),
+            }
+        try:
+            result = result_queue.get(timeout=remaining)
+        except queue.Empty:
+            return {
+                "request_id": request_id,
+                "ret": None,
+                "error": "parent_set_velocity_timeout",
+                "completed_monotonic": time.monotonic(),
+                "completed_unix_ms": round(time.time() * 1000),
+            }
+        if result.get("request_id") == request_id:
+            return result
+
+
 # ── SmartMotionProxy (main process) ─────────────────────────────────────────
 
 class SmartMotionProxy:
@@ -307,20 +447,32 @@ class SmartMotionProxy:
 
     def __init__(self, namespace: str, config: dict, network_iface: str,
                  proposal_config: Optional[dict] = None,
-                 fallback_stop=None):
+                 fallback_stop=None, parent_set_velocity=None):
         ctx = mp.get_context("spawn")
         self._cmd_queue = ctx.Queue()
         self._result_queue = ctx.Queue()
+        self._parent_velocity_queue = ctx.Queue()
+        self._parent_velocity_result_queue = ctx.Queue()
         self._call_lock = threading.RLock()
         self._request_id = 0
+        self._fallback_stop = fallback_stop
+        self._parent_set_velocity = parent_set_velocity
+        self._parent_velocity_shutdown = threading.Event()
         self._proc = ctx.Process(
             target=_run_smart_motion_process,
             args=(namespace, config, proposal_config or {}, network_iface,
-                  self._cmd_queue, self._result_queue),
+                  self._cmd_queue, self._result_queue,
+                  self._parent_velocity_queue,
+                  self._parent_velocity_result_queue),
             name="smart_motion", daemon=True,
         )
         self._proc.start()
-        self._fallback_stop = fallback_stop
+        self._parent_velocity_thread = threading.Thread(
+            target=self._serve_parent_velocity_requests,
+            daemon=True,
+            name="smart_motion_parent_velocity",
+        )
+        self._parent_velocity_thread.start()
         self._exit_monitor = threading.Thread(
             target=self._monitor_process_exit,
             daemon=True,
@@ -361,6 +513,42 @@ class SmartMotionProxy:
             except Exception:
                 continue
 
+    def _serve_parent_velocity_requests(self) -> None:
+        """Execute child-approved SetVelocity calls on the parent RpcProxy."""
+        while True:
+            request = self._parent_velocity_queue.get()
+            if request is None:
+                return
+            request_id = request.get("request_id")
+            ret = None
+            error = None
+            try:
+                if self._parent_set_velocity is None:
+                    raise RuntimeError("parent SetVelocity RPC is unavailable")
+                ret = self._parent_set_velocity(
+                    request["vx"],
+                    request["vy"],
+                    request["vyaw"],
+                    request["duration"],
+                )
+            except Exception as exc:
+                error = str(exc)
+            self._parent_velocity_result_queue.put({
+                "request_id": request_id,
+                "ret": ret,
+                "error": error,
+                "completed_monotonic": time.monotonic(),
+                "completed_unix_ms": round(time.time() * 1000),
+            })
+
+    def _signal_parent_velocity_shutdown(self) -> None:
+        shutdown = getattr(self, "_parent_velocity_shutdown", None)
+        request_queue = getattr(self, "_parent_velocity_queue", None)
+        if shutdown is None or request_queue is None or shutdown.is_set():
+            return
+        shutdown.set()
+        request_queue.put(None)
+
     def _monitor_process_exit(self) -> None:
         """Issue an independent parent-side stop on every child exit.
 
@@ -369,15 +557,16 @@ class SmartMotionProxy:
         after an IPC timeout, where Python cleanup cannot be relied upon.
         """
         self._proc.join()
-        if self._fallback_stop is None:
-            return
         try:
-            self._fallback_stop()
+            if self._fallback_stop is not None:
+                self._fallback_stop()
         except Exception as exc:
             print(
                 f"[SmartMotionProxy] child-exit StopMove failed: {exc}",
                 flush=True,
             )
+        finally:
+            self._signal_parent_velocity_shutdown()
 
     def _call(self, method: str, timeout: float = 15.0, **kwargs) -> dict:
         """Send a correlated command without serializing independent callers."""
@@ -508,6 +697,8 @@ class SmartMotionProxy:
         # Ensure the parent-side child-exit StopMove completes before the
         # caller tears down the independent RpcProxy used by that callback.
         self._exit_monitor.join(timeout=2.0)
+        self._signal_parent_velocity_shutdown()
+        self._parent_velocity_thread.join(timeout=2.0)
         print("[SmartMotionProxy] subprocess stopped")
 
 
@@ -515,7 +706,9 @@ class SmartMotionProxy:
 
 def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dict,
                               network_iface: str, cmd_queue: mp.Queue,
-                              result_queue: mp.Queue):
+                              result_queue: mp.Queue,
+                              parent_velocity_queue: mp.Queue,
+                              parent_velocity_result_queue: mp.Queue):
     """Entry point for the SmartMotion subprocess.
 
     Initializes its own DDS channel, RPC clients, ROS2 node, and LiDAR subscription.
@@ -554,8 +747,10 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
     loco_client.Init()
     loco_client.SetTimeout(10.0)
 
-    # Proposal execution, stopping, watchdog stopping and FSM polling use
-    # independent RPC clients so a delayed call cannot block physical stop.
+    # Proposal execution is deliberately routed back through the parent
+    # Driver RpcProxy.  Stopping, watchdog stopping and FSM polling retain
+    # independent child clients so a delayed apply cannot block fail-closed
+    # stop paths.
     proposal_rpc_timeout = min(
         0.2, max(0.02, float(proposal_config.get("velocity_proposal_rpc_timeout", 0.1)))
     )
@@ -574,9 +769,6 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
     fsm_rpc_timeout = min(
         0.5, max(0.05, float(proposal_config.get("velocity_proposal_fsm_rpc_timeout", 0.2)))
     )
-    proposal_loco_client = LocoClient()
-    proposal_loco_client.Init()
-    proposal_loco_client.SetTimeout(proposal_rpc_timeout)
     stop_loco_client = LocoClient()
     stop_loco_client.Init()
     stop_loco_client.SetTimeout(stop_rpc_timeout)
@@ -591,7 +783,10 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
     slam_client.Init()
     slam_client.SetTimeout(10.0)  # must be AFTER Init() — Init() resets timeout to 5.0
 
-    print(f"[SmartMotion:pid={os.getpid()}] LocoClient + SlamClient ready")
+    print(
+        f"[SmartMotion:pid={os.getpid()}] stop/FSM LocoClient + "
+        "parent proposal RPC + SlamClient ready"
+    )
 
     # ── Initialize ROS2 ──
     rclpy.init()
@@ -721,6 +916,8 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
     proposal_execution_active = False
     proposal_execution_deadline = 0.0
     proposal_watchdog_fault = None
+    proposal_apply_request_id = 0
+    proposal_apply_diagnostics = ProposalApplyDiagnostics()
 
     def motion_synchronized(func):
         def locked(*args, **kwargs):
@@ -756,6 +953,22 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
     def current_proposal_watchdog_fault():
         with proposal_execution_lock:
             return proposal_watchdog_fault
+
+    def apply_parent_set_velocity(vx, vy, vyaw, duration):
+        nonlocal proposal_apply_request_id
+        proposal_apply_request_id += 1
+        result = request_parent_set_velocity(
+            request_queue=parent_velocity_queue,
+            result_queue=parent_velocity_result_queue,
+            request_id=proposal_apply_request_id,
+            vx=vx,
+            vy=vy,
+            vyaw=vyaw,
+            duration=duration,
+            timeout=proposal_rpc_timeout,
+        )
+        proposal_apply_diagnostics.record_set_velocity(result, duration)
+        return result
 
     # Obstacle state (written by LiDAR callback, read by main loop)
     obstacle_lock = threading.Lock()
@@ -1297,13 +1510,16 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
         speed_zone = SpeedZone.NORMAL
 
         proposal_generation = None
+        set_velocity_error = None
         if finite_rpc:
             proposal_generation = arm_proposal_execution(
                 time.monotonic() + duration
             )
-            ret = proposal_loco_client.SetVelocity(
+            apply_result = apply_parent_set_velocity(
                 clamped_vx, clamped_vy, clamped_vyaw, duration
             )
+            ret = apply_result.get("ret")
+            set_velocity_error = apply_result.get("error")
         else:
             clear_proposal_execution()
             ret = loco_client.Move(clamped_vx, clamped_vy, clamped_vyaw, True)
@@ -1319,6 +1535,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                 "duration": duration,
                 "state": state.value,
                 "watchdog_reason": watchdog_reason,
+                "set_velocity_error": set_velocity_error,
             }
 
         if duration > 0 and not finite_rpc:
@@ -1349,8 +1566,15 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                 },
             })
 
-        return {"ret": ret, "vx": clamped_vx, "vy": clamped_vy, "vyaw": clamped_vyaw,
-                "duration": duration, "state": state.value}
+        return {
+            "ret": ret,
+            "vx": clamped_vx,
+            "vy": clamped_vy,
+            "vyaw": clamped_vyaw,
+            "duration": duration,
+            "state": state.value,
+            "set_velocity_error": set_velocity_error,
+        }
 
     @motion_synchronized
     def handle_navigate_to(x, y, yaw, target_name, speed=0.5, mode=1, stall_timeout=60):
@@ -1734,28 +1958,33 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
             "expected_topic": expected_proposal_topic,
             "schema": proposal_limits.schema,
             "safety": proposal_runtime_status(force_fsm_check=False),
+            "proposal_execution": proposal_apply_diagnostics.snapshot(),
         })
         return result
 
     @motion_synchronized
     def on_velocity_proposal(msg):
         nonlocal last_nav_status_time
+        proposal_apply_diagnostics.record_received()
         if proposal_stop_transition.is_set():
+            proposal_apply_diagnostics.record_rejected("stop_transition")
             return
         now = time.monotonic()
         pending_fault = current_proposal_watchdog_fault()
         if pending_fault:
             _, reason = pending_fault
+            proposal_apply_diagnostics.record_rejected(reason)
             if reason == "proposal_ttl_expired":
                 proposal_gate.watchdog(now)
                 do_stop(reason)
             else:
                 proposal_gate.disarm(reason)
                 do_stop(reason)
-                return
+            return
         try:
             payload = json.loads(msg.data)
         except (json.JSONDecodeError, TypeError, AttributeError):
+            proposal_apply_diagnostics.record_rejected("invalid_json")
             if proposal_gate.armed:
                 proposal_gate.disarm("invalid_json")
                 do_stop("invalid_json")
@@ -1764,6 +1993,8 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
         was_armed = proposal_gate.armed
         decision = proposal_gate.accept(payload, now)
         if decision.stop:
+            if decision.reason != "proposal_zero":
+                proposal_apply_diagnostics.record_rejected(decision.reason)
             is_proposal_motion = bool(
                 current_cmd and current_cmd.get("source") == "velocity_proposal"
             )
@@ -1772,6 +2003,9 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                 do_stop(decision.reason)
             return
         if not decision.execute or decision.proposal is None:
+            proposal_apply_diagnostics.record_rejected(
+                decision.reason or "proposal_not_executable"
+            )
             return
 
         with safety_lock:
@@ -1782,6 +2016,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
         runtime = proposal_runtime_status(force_fsm_check=True)
         if not runtime["ready"]:
             reason = runtime["reason"] or "driver_safety_not_ready"
+            proposal_apply_diagnostics.record_rejected(reason)
             proposal_gate.disarm(reason)
             do_stop(reason)
             return
@@ -1789,9 +2024,13 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
         proposal = decision.proposal
         remaining = proposal_gate.deadline_monotonic - time.monotonic()
         if remaining <= 0.0:
+            proposal_apply_diagnostics.record_rejected(
+                "proposal_ttl_expired"
+            )
             proposal_gate.watchdog(time.monotonic())
             do_stop("proposal_ttl_expired")
             return
+        proposal_apply_diagnostics.record_accepted()
         result = handle_move(
             proposal.x,
             proposal.y,
@@ -1802,6 +2041,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
         )
         watchdog_reason = result.get("watchdog_reason")
         if watchdog_reason:
+            proposal_apply_diagnostics.record_rejected(watchdog_reason)
             if watchdog_reason != "proposal_ttl_expired":
                 proposal_gate.disarm(watchdog_reason)
             else:
@@ -1809,9 +2049,18 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
             do_stop(watchdog_reason)
             return
         ret = result.get("ret")
-        if ret not in (None, 0):
-            proposal_gate.disarm("set_velocity_failed")
-            do_stop("set_velocity_failed")
+        set_velocity_error = result.get("set_velocity_error")
+        if set_velocity_error or ret != 0:
+            reason = (
+                "parent_set_velocity_timeout"
+                if set_velocity_error == "parent_set_velocity_timeout"
+                else "set_velocity_failed"
+            )
+            proposal_apply_diagnostics.record_rejected(reason)
+            proposal_gate.disarm(reason)
+            do_stop(reason)
+            return
+        proposal_apply_diagnostics.record_applied()
 
     @motion_synchronized
     def apply_safety_velocity(cmd, vx, vy, vyaw):
@@ -1822,10 +2071,16 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                 proposal_gate.watchdog(time.monotonic())
                 do_stop("proposal_ttl_expired")
                 return
-            ret = proposal_loco_client.SetVelocity(vx, vy, vyaw, remaining)
-            if ret != 0:
-                proposal_gate.disarm("set_velocity_failed")
-                do_stop("set_velocity_failed")
+            result = apply_parent_set_velocity(vx, vy, vyaw, remaining)
+            if result.get("error") or result.get("ret") != 0:
+                reason = (
+                    "parent_set_velocity_timeout"
+                    if result.get("error") == "parent_set_velocity_timeout"
+                    else "set_velocity_failed"
+                )
+                proposal_apply_diagnostics.record_rejected(reason)
+                proposal_gate.disarm(reason)
+                do_stop(reason)
             return
         loco_client.Move(vx, vy, vyaw, True)
 
