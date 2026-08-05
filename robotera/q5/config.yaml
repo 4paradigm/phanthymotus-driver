@@ -1,0 +1,36 @@
+mcp_port: 15711
+ros_namespace: ""
+name: "RobotEra Q5"
+
+ros:
+  robot_domain_id: 211
+  core_domain_id: 42
+  robot_interface: "eth0"
+
+topics:
+  joint_state: "/joint_states"
+  body_command: "/wr1_controller/commands"
+  hand_command: "/hand_controller/commands"
+  base_command: "/wr1_base_drive_controller/cmd_vel"
+  servo_pose: "/servo_poses"
+  mpc_pose: "/get_pose"
+  battery_state: "/battery_state"
+  camera_color: "/camera/camera/color/image_raw"
+  camera_depth: "/camera/camera/depth/image_rect_raw"
+
+control:
+  max_linear_mps: 1.0
+  max_angular_rad_s: 2.0
+
+plugins:
+  state: {enabled: true}
+  lifecycle: {enabled: true}
+  body: {enabled: true}
+  base: {enabled: true}
+  hand: {enabled: true}
+  mpc: {enabled: true}
+  gesture: {enabled: true}
+  audio: {enabled: true}
+  camera: {enabled: true}
+  navigation: {enabled: true}
+  choreography: {enabled: true}

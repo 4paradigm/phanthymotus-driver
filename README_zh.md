@@ -11,6 +11,7 @@
 | 驱动 | 硬件 | 端口 | 说明 |
 |------|------|------|------|
 | `unitree/g1` | Unitree G1 人形机器人 | 15701 | 运动控制、机械臂、麦克风、扬声器、LED、状态监控 |
+| `robotera/q5` | 星动纪元 Q5 | 15711 | 官方 ROS2 生命周期、轮式底盘、MPC、XHand、建图导航与动作编排 |
 | `phanthy/remote_control` | 远程控制桥接 | 15710 | 远程控制中继 |
 
 ## 快速开始
@@ -33,6 +34,7 @@ cp .env.example .env  # 填写镜像仓库凭据
 
 # 构建指定驱动
 ./build.sh unitree/g1
+./build.sh robotera/q5
 ```
 
 不传参数时，`build.sh` 会显示交互式多选菜单，选择要构建的驱动。也可以直接传路径用于 CI：
