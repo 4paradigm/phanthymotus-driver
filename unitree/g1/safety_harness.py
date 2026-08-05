@@ -41,6 +41,7 @@ from velocity_proposal import (
 UNITREE_STOP_MOVE_DURATION_SECONDS = 1.0
 DEFAULT_STOP_CONFIRM_TIMEOUT_SECONDS = 2.0
 MAX_STOP_CONFIRM_TIMEOUT_SECONDS = 3.0
+TRANSLATION_OBSTACLE_EPSILON = 0.01
 
 
 def resolve_stop_confirmation_timeout(configured_timeout):
@@ -84,6 +85,59 @@ class SpeedZone(enum.Enum):
     NORMAL = "normal"
     DECELERATED = "decelerated"
     STOPPED = "stopped"
+
+
+def translation_obstacle_heading(command, epsilon=TRANSLATION_OBSTACLE_EPSILON):
+    """Return the translation heading, or ``None`` for an in-place command."""
+    if not command:
+        return None
+    vx = float(command.get("vx", 0.0))
+    vy = float(command.get("vy", 0.0))
+    if math.hypot(vx, vy) <= float(epsilon):
+        return None
+    return math.atan2(vy, vx)
+
+
+def obstacle_observation_applies(
+    command,
+    observation_heading,
+    heading_tolerance,
+):
+    """Reject stale cones and never treat pure rotation as translation."""
+    command_heading = translation_obstacle_heading(command)
+    if command_heading is None or observation_heading is None:
+        return False
+    delta = abs(
+        (command_heading - float(observation_heading) + math.pi)
+        % (2 * math.pi)
+        - math.pi
+    )
+    return delta <= max(0.0, float(heading_tolerance))
+
+
+def authoritative_proposal_stop_reason(requested_reason, watchdog_fault):
+    """Preserve an execution fault that won before a concurrent local stop."""
+    if watchdog_fault:
+        return str(watchdog_fault[1])
+    return str(requested_reason)
+
+
+def proposal_decision_requires_physical_stop(
+    reason,
+    has_proposal,
+    proposal_motion_active,
+    newly_disarmed,
+    recoverable_stop_active,
+):
+    """Let confirmed obstacle holds drain stale ROS samples without RPCs."""
+    if (
+        recoverable_stop_active
+        and reason == "proposal_ttl_expired"
+        and not proposal_motion_active
+        and not newly_disarmed
+    ):
+        return False
+    return bool(has_proposal or proposal_motion_active or newly_disarmed)
 
 
 @dataclass
@@ -1418,6 +1472,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
     obstacle_dist = float("inf")
     obstacle_angle = 0.0
     lateral_obstacle = False
+    obstacle_scan_heading = None
 
     # Nav arrival state (updated by rt/slam_info DDS callback in this subprocess)
     slam_info_lock = threading.Lock()
@@ -1457,6 +1512,17 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
         was_proposal_motion = bool(
             current_cmd and current_cmd.get("source") == "velocity_proposal"
         )
+        watchdog_fault = (
+            current_proposal_watchdog_fault()
+            if was_proposal_motion
+            else None
+        )
+        reason_str = authoritative_proposal_stop_reason(
+            reason_str,
+            watchdog_fault,
+        )
+        if watchdog_fault:
+            proposal_gate.disarm(reason_str)
         retry_proposal_stop = was_proposal_motion and not confirm_physical_stop
         if move_timer:
             move_timer.cancel()
@@ -1581,7 +1647,10 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
             if stop_error:
                 result["error"] = f"StopMove failed: {stop_error}"
         if was_proposal_motion and reason_str == "obstacle":
-            proposal_gate.disarm("obstacle_stop_latched")
+            if result.get("stop_confirmed"):
+                proposal_gate.hold_for_obstacle()
+            else:
+                proposal_gate.disarm("obstacle_stop_unconfirmed")
         if was_moving:
             event_data = {"reason": reason_str}
             if reason_str == "obstacle":
@@ -1620,13 +1689,12 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
 
     # ── LiDAR DDS Subscription ──
     def on_cloud(msg):
-        nonlocal obstacle_dist, obstacle_angle, lateral_obstacle, last_cloud_time
+        nonlocal obstacle_dist, obstacle_angle, lateral_obstacle
+        nonlocal obstacle_scan_heading, last_cloud_time
 
         # Get heading
         if state == MotionState.MOVING and current_cmd:
-            vx_cmd = current_cmd.get("vx", 0)
-            vy_cmd = current_cmd.get("vy", 0)
-            heading = math.atan2(vy_cmd, vx_cmd) if (abs(vx_cmd) > 0.01 or abs(vy_cmd) > 0.01) else 0.0
+            heading = translation_obstacle_heading(current_cmd)
         else:
             # NAVIGATING/IDLE: LiDAR is in body frame, heading=0 = robot forward
             heading = 0.0
@@ -1644,6 +1712,15 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
             return
         with safety_lock:
             last_cloud_time = time.monotonic()
+        if heading is None:
+            # In-place rotation has no translation corridor.  Keep scan
+            # freshness, but do not apply a synthetic forward obstacle cone.
+            with obstacle_lock:
+                obstacle_dist = float("inf")
+                obstacle_angle = 0.0
+                lateral_obstacle = False
+                obstacle_scan_heading = None
+            return
 
         # Numpy batch extraction (xyz at offsets 0, 4, 8 — already gravity-aligned)
         buf = np.frombuffer(data, dtype=np.uint8, count=n_valid * point_step).reshape(n_valid, point_step)
@@ -1662,6 +1739,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                 obstacle_dist = float("inf")
                 obstacle_angle = 0.0
                 lateral_obstacle = False
+                obstacle_scan_heading = heading
             return
 
         vx_pts = px[valid]
@@ -1702,6 +1780,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
             obstacle_dist = min_fwd_dist
             obstacle_angle = min_fwd_angle
             lateral_obstacle = lat_detected
+            obstacle_scan_heading = heading
 
     try:
         event_node.create_subscription(
@@ -2604,7 +2683,13 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                 current_cmd and current_cmd.get("source") == "velocity_proposal"
             )
             newly_disarmed = was_armed and not proposal_gate.armed
-            if decision.proposal is not None or is_proposal_motion or newly_disarmed:
+            if proposal_decision_requires_physical_stop(
+                decision.reason,
+                decision.proposal is not None,
+                is_proposal_motion,
+                newly_disarmed,
+                proposal_gate.recoverable_stop_active,
+            ):
                 do_stop(decision.reason)
             return
         if not decision.execute or decision.proposal is None:
@@ -2735,18 +2820,26 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
         with obstacle_lock:
             dist = obstacle_dist
             lateral = lateral_obstacle
+            angle = obstacle_angle
+            scan_heading = obstacle_scan_heading
 
         if state == MotionState.MOVING:
             cmd = current_cmd  # snapshot to avoid race condition
+            if not obstacle_observation_applies(
+                cmd,
+                scan_heading,
+                cone_half_angle,
+            ):
+                return
             if dist <= stop_threshold:
                 if speed_zone != SpeedZone.STOPPED:
                     speed_zone = SpeedZone.STOPPED
-                    print(f"[SmartMotion:obstacle] STOP — dist={dist:.2f}m angle={math.degrees(obstacle_angle):.1f}° lateral={lateral}", flush=True)
+                    print(f"[SmartMotion:obstacle] STOP — dist={dist:.2f}m angle={math.degrees(angle):.1f}° lateral={lateral}", flush=True)
                     do_stop("obstacle")
             elif dist <= decel_threshold or lateral:
                 if speed_zone != SpeedZone.DECELERATED:
                     speed_zone = SpeedZone.DECELERATED
-                    print(f"[SmartMotion:obstacle] DECEL — dist={dist:.2f}m angle={math.degrees(obstacle_angle):.1f}° lateral={lateral}", flush=True)
+                    print(f"[SmartMotion:obstacle] DECEL — dist={dist:.2f}m angle={math.degrees(angle):.1f}° lateral={lateral}", flush=True)
                     if cmd:
                         dvx, dvy, dvyaw = clamp(cmd["vx"], cmd["vy"], cmd["vyaw"], SpeedZone.DECELERATED)
                         apply_safety_velocity(cmd, dvx, dvy, dvyaw)

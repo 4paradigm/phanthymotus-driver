@@ -244,6 +244,70 @@ class ProposalGateTest(unittest.TestCase):
         self.assertFalse(self.gate.armed)
         self.assertEqual(self.gate.last_reason, "proposal_ttl_expired")
 
+    def test_confirmed_obstacle_stop_keeps_lease_for_fresh_escape_command(self):
+        self.assertTrue(self.gate.accept(proposal(sequence=1), now=50.0).execute)
+        self.gate.hold_for_obstacle()
+
+        held = self.gate.snapshot(50.1)
+        self.assertTrue(held["connected"])
+        self.assertTrue(held["armed"])
+        self.assertTrue(held["recoverable_stop_active"])
+        self.assertEqual(held["active_nav_id"], "nav-001")
+        self.assertEqual(held["last_reason"], "obstacle_stop_recoverable")
+
+        stale = self.gate.accept(
+            proposal(sequence=2, issued_at_unix_ms=1_000, ttl_ms=200),
+            now=50.2,
+            now_unix_ms=1_201,
+        )
+        self.assertTrue(stale.stop)
+        self.assertEqual(stale.reason, "proposal_ttl_expired")
+        self.assertTrue(self.gate.armed)
+        self.assertTrue(self.gate.recoverable_stop_active)
+        self.assertEqual(self.gate.last_sequence, 2)
+
+        escape = self.gate.accept(
+            proposal(
+                sequence=3,
+                velocity={"x": 0.0, "y": 0.0, "yaw": 0.2},
+            ),
+            now=50.3,
+        )
+        self.assertTrue(escape.execute)
+        self.assertTrue(self.gate.armed)
+        self.assertFalse(self.gate.recoverable_stop_active)
+
+    def test_hard_fault_still_disarms_from_recoverable_obstacle_stop(self):
+        self.assertTrue(self.gate.accept(proposal(sequence=1), now=10.0).execute)
+        self.gate.hold_for_obstacle()
+
+        rejected = self.gate.accept(
+            proposal(sequence=2, frame="map"),
+            now=10.1,
+        )
+
+        self.assertTrue(rejected.stop)
+        self.assertEqual(rejected.reason, "frame_mismatch")
+        self.assertFalse(self.gate.armed)
+        self.assertFalse(self.gate.recoverable_stop_active)
+
+    def test_terminal_zero_retires_recoverable_obstacle_lease(self):
+        self.assertTrue(self.gate.accept(proposal(sequence=1), now=10.0).execute)
+        self.gate.hold_for_obstacle()
+
+        terminal = self.gate.accept(
+            proposal(
+                sequence=2,
+                nav_status="arrived",
+                velocity={"x": 0.0, "y": 0.0, "yaw": 0.0},
+            ),
+            now=10.1,
+        )
+
+        self.assertTrue(terminal.stop)
+        self.assertFalse(self.gate.armed)
+        self.assertFalse(self.gate.recoverable_stop_active)
+
     def test_end_to_end_ttl_uses_only_remaining_producer_lease(self):
         accepted = self.gate.accept(
             proposal(issued_at_unix_ms=1_000, ttl_ms=200),

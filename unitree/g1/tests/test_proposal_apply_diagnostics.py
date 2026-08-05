@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import math
 import unittest
 
 from safety_harness import (
     ProposalApplyDiagnostics,
     ProposalExecutionLease,
+    authoritative_proposal_stop_reason,
+    obstacle_observation_applies,
+    proposal_decision_requires_physical_stop,
+    translation_obstacle_heading,
     velocity_commands_differ,
 )
 from velocity_proposal import VelocityProposalGate, ProposalLimits
@@ -262,6 +267,67 @@ class VelocityCommandDifferenceTest(unittest.TestCase):
             velocity_commands_differ(
                 (0.15, 0.12, 0.35),
                 (0.15, 0.10, 0.20),
+            )
+        )
+
+
+class ObstacleRecoveryPolicyTest(unittest.TestCase):
+    def test_pure_rotation_has_no_translation_obstacle_cone(self):
+        command = {"vx": 0.0, "vy": 0.0, "vyaw": 0.2}
+
+        self.assertIsNone(translation_obstacle_heading(command))
+        self.assertFalse(
+            obstacle_observation_applies(command, 0.0, math.radians(30))
+        )
+
+    def test_matching_translation_cone_remains_fail_closed(self):
+        command = {"vx": 0.1, "vy": 0.0, "vyaw": 0.0}
+
+        self.assertTrue(
+            obstacle_observation_applies(command, 0.0, math.radians(30))
+        )
+
+    def test_stale_forward_cone_does_not_block_escape_direction(self):
+        reverse = {"vx": -0.05, "vy": 0.0, "vyaw": 0.0}
+        lateral = {"vx": 0.0, "vy": 0.1, "vyaw": 0.0}
+
+        self.assertFalse(
+            obstacle_observation_applies(reverse, 0.0, math.radians(30))
+        )
+        self.assertFalse(
+            obstacle_observation_applies(lateral, 0.0, math.radians(30))
+        )
+
+    def test_watchdog_fault_wins_over_concurrent_obstacle_stop(self):
+        self.assertEqual(
+            authoritative_proposal_stop_reason(
+                "obstacle",
+                (4, "proposal_ttl_expired"),
+            ),
+            "proposal_ttl_expired",
+        )
+        self.assertEqual(
+            authoritative_proposal_stop_reason("obstacle", None),
+            "obstacle",
+        )
+
+    def test_recoverable_hold_drains_stale_samples_without_repeated_stop(self):
+        self.assertFalse(
+            proposal_decision_requires_physical_stop(
+                "proposal_ttl_expired",
+                has_proposal=True,
+                proposal_motion_active=False,
+                newly_disarmed=False,
+                recoverable_stop_active=True,
+            )
+        )
+        self.assertTrue(
+            proposal_decision_requires_physical_stop(
+                "proposal_ttl_expired",
+                has_proposal=True,
+                proposal_motion_active=True,
+                newly_disarmed=True,
+                recoverable_stop_active=False,
             )
         )
 
