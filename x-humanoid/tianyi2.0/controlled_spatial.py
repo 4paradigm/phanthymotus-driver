@@ -174,6 +174,9 @@ class ControlledSpatialPlugin:
         self._nav_action_id: str | None = None  # Action ID returned by move_to
         self._nav_start_time: float = 0  # monotonic time when navigation was initiated
         self._nav_lost_count: int = 0  # consecutive polls where action was missing on chassis
+        self._nav_stall_timeout: float = 60.0  # seconds without movement → stall
+        self._nav_last_move_time: float = 0  # last time pose changed during nav
+        self._nav_last_pose: dict | None = None  # last pose for stall detection
         self._lock = threading.Lock()
         self._poll_thread: Optional[threading.Thread] = None
 
@@ -417,6 +420,27 @@ class ControlledSpatialPlugin:
                         # NewBorn or Working
                         self._nav_lost_count = 0
                         self._map_status = "navigating"
+                        # Stall detection: if pose hasn't changed for stall_timeout, fail
+                        if self._nav_active and self._current_pose:
+                            if self._nav_last_pose is None:
+                                self._nav_last_pose = dict(self._current_pose)
+                                self._nav_last_move_time = time.monotonic()
+                            else:
+                                dx = abs(self._current_pose.get('x', 0) - self._nav_last_pose.get('x', 0))
+                                dy = abs(self._current_pose.get('y', 0) - self._nav_last_pose.get('y', 0))
+                                if dx > 0.02 or dy > 0.02:
+                                    self._nav_last_pose = dict(self._current_pose)
+                                    self._nav_last_move_time = time.monotonic()
+                                elif time.monotonic() - self._nav_last_move_time > self._nav_stall_timeout:
+                                    print(f"[ControlledSpatial] STALL detected: no movement for {self._nav_stall_timeout}s")
+                                    self._nav_error = f"Navigation stalled: no movement for {self._nav_stall_timeout:.0f}s"
+                                    self._nav_arrived.set()
+                                    self._nav_active = False
+                                    self._nav_lost_count = 0
+                                    # ACP: report stall as error
+                                    if self._nav_action_id:
+                                        self._acp_callback(str(self._nav_action_id), "error",
+                                                           {"error": self._nav_error})
                         # Verify the current action matches our expected action_id.
                         # If load_map left a RecoverLocalizationAction running,
                         # we'd see action_state=1 but for the WRONG action.
@@ -794,6 +818,8 @@ class ControlledSpatialPlugin:
             self._nav_active = True
             self._nav_start_time = time.monotonic()
             self._nav_lost_count = 0
+            self._nav_last_pose = None
+            self._nav_last_move_time = time.monotonic()
             result = self._slamtec.move_to(poi["x"], poi["y"], yaw=yaw, speed_ratio=speed, mode=mode,
                                            fail_retry_count=fail_retry_count,
                                            acceptable_precision=acceptable_precision,
@@ -872,6 +898,8 @@ class ControlledSpatialPlugin:
             self._nav_active = True
             self._nav_start_time = time.monotonic()
             self._nav_lost_count = 0
+            self._nav_last_pose = None
+            self._nav_last_move_time = time.monotonic()
             result = self._slamtec.move_to(x, y, yaw=yaw, speed_ratio=speed, mode=mode,
                                            fail_retry_count=fail_retry_count, acceptable_precision=acceptable_precision,
                                            ignore_dynamic_obstacles=ignore_dynamic,
