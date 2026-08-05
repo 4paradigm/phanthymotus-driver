@@ -162,6 +162,11 @@ class TianyiDeviceBundle:
             self._plugins.append(ChatPlugin(plugins_cfg["chat"], namespace, ros2))
             print("[bundle] ChatPlugin loaded")
 
+        if plugins_cfg.get("light", {}).get("enabled", False):
+            from device import LightPlugin
+            self._plugins.append(LightPlugin(plugins_cfg["light"], namespace, ros2))
+            print("[bundle] LightPlugin loaded")
+
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
             try:
