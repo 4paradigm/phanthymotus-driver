@@ -8,6 +8,7 @@ from velocity_proposal import (
     ProposalLimits,
     VelocityProposalGate,
     VelocityProposalValidationError,
+    resolve_expected_nav_id,
     resolve_input_topic,
     validate_velocity_proposal,
     velocity_proposal_port,
@@ -78,6 +79,22 @@ class TopicResolutionTest(unittest.TestCase):
             with self.subTest(args=args), self.assertRaises(ValueError):
                 resolve_input_topic(args, EXPECTED_TOPIC)
 
+    def test_resolves_trusted_expected_nav_id_from_control_plane(self):
+        self.assertEqual(
+            resolve_expected_nav_id({"expected_nav_id": " nav-001 "}),
+            "nav-001",
+        )
+
+    def test_rejects_missing_or_invalid_expected_nav_id(self):
+        for args in (
+            {},
+            {"expected_nav_id": ""},
+            {"expected_nav_id": 123},
+            {"expected_nav_id": "x" * 129},
+        ):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                resolve_expected_nav_id(args)
+
 
 class ProposalValidationTest(unittest.TestCase):
     def setUp(self):
@@ -145,7 +162,15 @@ class ProposalValidationTest(unittest.TestCase):
 class ProposalGateTest(unittest.TestCase):
     def setUp(self):
         self.gate = VelocityProposalGate(ProposalLimits())
-        self.gate.bind(EXPECTED_TOPIC)
+        self.gate.bind(EXPECTED_TOPIC, "nav-001")
+
+    def test_first_packet_must_match_control_plane_nav_lease(self):
+        rejected = self.gate.accept(
+            proposal(nav_id="attacker-selected", sequence=1), now=10.0
+        )
+        self.assertTrue(rejected.stop)
+        self.assertEqual(rejected.reason, "nav_id_mismatch")
+        self.assertFalse(self.gate.armed)
 
     def test_sequence_must_strictly_increase_for_active_nav(self):
         first = self.gate.accept(proposal(sequence=10), now=100.0)
@@ -163,7 +188,7 @@ class ProposalGateTest(unittest.TestCase):
         self.assertTrue(rejected.stop)
         self.assertEqual(rejected.reason, "nav_id_mismatch")
 
-    def test_terminal_zero_releases_nav_lease(self):
+    def test_terminal_zero_retires_and_disarms_nav_lease(self):
         self.assertTrue(self.gate.accept(proposal(), now=10.0).execute)
         terminal = self.gate.accept(
             proposal(
@@ -174,8 +199,15 @@ class ProposalGateTest(unittest.TestCase):
             now=10.1,
         )
         self.assertTrue(terminal.stop)
+        self.assertFalse(self.gate.armed)
         next_task = self.gate.accept(proposal(nav_id="nav-002", sequence=1), now=10.2)
-        self.assertTrue(next_task.execute)
+        self.assertFalse(next_task.execute)
+        self.assertTrue(next_task.stop)
+
+        self.gate.bind(EXPECTED_TOPIC, "nav-002")
+        self.assertTrue(
+            self.gate.accept(proposal(nav_id="nav-002", sequence=1), now=10.3).execute
+        )
 
     def test_completed_nav_id_cannot_be_replayed(self):
         self.assertTrue(self.gate.accept(proposal(), now=10.0).execute)
@@ -187,9 +219,8 @@ class ProposalGateTest(unittest.TestCase):
             ),
             now=10.1,
         )
-        replay = self.gate.accept(proposal(sequence=3), now=10.2)
-        self.assertTrue(replay.stop)
-        self.assertEqual(replay.reason, "retired_nav_id_replay")
+        with self.assertRaises(ValueError):
+            self.gate.bind(EXPECTED_TOPIC, "nav-001")
 
     def test_watchdog_uses_local_monotonic_deadline(self):
         accepted = self.gate.accept(proposal(ttl_ms=200), now=50.0)
@@ -207,8 +238,33 @@ class ProposalGateTest(unittest.TestCase):
         self.assertFalse(self.gate.armed)
         still_rejected = self.gate.accept(proposal(sequence=2), now=10.1)
         self.assertFalse(still_rejected.execute)
-        self.gate.bind(EXPECTED_TOPIC)
-        self.assertTrue(self.gate.accept(proposal(), now=10.2).execute)
+        with self.assertRaises(ValueError):
+            self.gate.bind(EXPECTED_TOPIC, "nav-001")
+        self.gate.bind(EXPECTED_TOPIC, "nav-002")
+        self.assertTrue(
+            self.gate.accept(proposal(nav_id="nav-002"), now=10.2).execute
+        )
+
+    def test_canvas_unbind_retires_nav_id_against_delayed_replay(self):
+        self.gate.unbind("canvas_stop")
+        with self.assertRaises(ValueError):
+            self.gate.bind(EXPECTED_TOPIC, "nav-001")
+
+    def test_repeated_identical_bind_is_idempotent_without_sequence_reset(self):
+        self.assertTrue(self.gate.accept(proposal(sequence=10), now=10.0).execute)
+        self.gate.bind(EXPECTED_TOPIC, "nav-001")
+        replay = self.gate.accept(proposal(sequence=10), now=10.1)
+        self.assertTrue(replay.stop)
+        self.assertEqual(replay.reason, "sequence_not_increasing")
+
+    def test_retired_nav_ids_are_not_dropped_after_a_fixed_window(self):
+        self.gate.unbind("canvas_stop")
+        for index in range(2, 41):
+            self.gate.bind(EXPECTED_TOPIC, f"nav-{index:03d}")
+            self.gate.unbind("canvas_stop")
+        for index in range(1, 41):
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                self.gate.bind(EXPECTED_TOPIC, f"nav-{index:03d}")
 
 
 if __name__ == "__main__":

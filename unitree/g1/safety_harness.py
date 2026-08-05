@@ -32,6 +32,7 @@ from velocity_proposal import (
     DEFAULT_VELOCITY_PROPOSAL_TOPIC,
     ProposalLimits,
     VelocityProposalGate,
+    resolve_expected_nav_id,
 )
 
 
@@ -180,8 +181,12 @@ class SmartMotionProxy:
     def get_state(self) -> dict:
         return self._call("get_state")
 
-    def bind_velocity_proposal(self, topic: str) -> dict:
-        return self._call("bind_velocity_proposal", topic=topic)
+    def bind_velocity_proposal(self, topic: str, expected_nav_id: str) -> dict:
+        return self._call(
+            "bind_velocity_proposal",
+            topic=topic,
+            expected_nav_id=expected_nav_id,
+        )
 
     def unbind_velocity_proposal(self, reason: str = "canvas_stop") -> dict:
         return self._call("unbind_velocity_proposal", reason=reason)
@@ -1185,7 +1190,23 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
         return result
 
     @motion_synchronized
-    def handle_bind_velocity_proposal(topic):
+    def handle_bind_velocity_proposal(topic, expected_nav_id):
+        try:
+            expected_nav_id = resolve_expected_nav_id(
+                {"expected_nav_id": expected_nav_id}
+            )
+        except ValueError as exc:
+            proposal_gate.disarm(str(exc))
+            do_stop(str(exc))
+            return {
+                "error": str(exc),
+                "connected": bool(proposal_node.topic),
+                "armed": False,
+            }
+        if proposal_gate.is_bound_to(topic, expected_nav_id):
+            result = handle_get_velocity_proposal_status()
+            result["state"] = "connected"
+            return result
         # A proposal stream and Unitree native navigation may never own motion
         # at the same time.
         if state in (MotionState.NAVIGATING, MotionState.NAV_PAUSED):
@@ -1224,8 +1245,8 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                 "connected": False,
             }
         try:
+            proposal_gate.bind(topic, expected_nav_id)
             proposal_node.bind(topic, on_velocity_proposal)
-            proposal_gate.bind(topic)
             proposal_connected.set()
             refresh_fsm_state()
         except Exception as exc:
@@ -1618,7 +1639,10 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
             elif method == "get_state":
                 result = handle_get_state()
             elif method == "bind_velocity_proposal":
-                result = handle_bind_velocity_proposal(cmd.get("topic", ""))
+                result = handle_bind_velocity_proposal(
+                    cmd.get("topic", ""),
+                    cmd.get("expected_nav_id", ""),
+                )
             elif method == "unbind_velocity_proposal":
                 result = handle_unbind_velocity_proposal(
                     cmd.get("reason", "canvas_stop")
