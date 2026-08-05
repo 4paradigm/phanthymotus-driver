@@ -6,8 +6,18 @@ plugins:
     enabled: true
   tts:
     enabled: true
+    # Native speak is hidden while strict Speaker completion is enabled;
+    # volume control remains available. If Speaker is changed to estimated,
+    # set this to true explicitly to restore native synthesis.
+    speak_enabled: false
   speaker:
     enabled: true
+    # G1 body-speaker firmware publishes {"play_state":1|0} on this DDS topic.
+    # Strict mode reports completed only after the matching playing -> idle cycle.
+    completion_mode: hardware_state
+    play_state_topic: rt/audio_msg
+    play_state_discovery_timeout_sec: 3.0
+    play_state_timeout_sec: 2.0
   led:
     enabled: true
   loco:

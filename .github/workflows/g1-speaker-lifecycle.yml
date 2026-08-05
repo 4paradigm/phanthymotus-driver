@@ -4,22 +4,40 @@ on:
   pull_request:
     paths:
       - unitree/g1/device.py
+      - unitree/g1/main.py
+      - unitree/g1/playback_state.py
+      - unitree/g1/config.yaml
+      - unitree/g1/Dockerfile
       - unitree/g1/unitree_sdk2py/g1/audio/g1_audio_client.py
       - unitree/g1/unitree_sdk2py/rpc/client.py
       - unitree/g1/unitree_sdk2py/rpc/client_base.py
       - unitree/g1/unitree_sdk2py/rpc/request_future.py
+      - unitree/g1/unitree_sdk2py/core/channel.py
       - unitree/g1/tests/test_speaker_lifecycle.py
+      - unitree/g1/tests/test_playback_state.py
+      - unitree/g1/tests/test_channel_matching.py
+      - unitree/g1/tests/test_hardware_smoke_contract.py
+      - unitree/g1/tools/g1_speaker_receipt_smoke.py
       - unitree/g1/SPEAKER_LIFECYCLE_PROTOCOL.md
       - .github/workflows/g1-speaker-lifecycle.yml
   push:
     branches: [main]
     paths:
       - unitree/g1/device.py
+      - unitree/g1/main.py
+      - unitree/g1/playback_state.py
+      - unitree/g1/config.yaml
+      - unitree/g1/Dockerfile
       - unitree/g1/unitree_sdk2py/g1/audio/g1_audio_client.py
       - unitree/g1/unitree_sdk2py/rpc/client.py
       - unitree/g1/unitree_sdk2py/rpc/client_base.py
       - unitree/g1/unitree_sdk2py/rpc/request_future.py
+      - unitree/g1/unitree_sdk2py/core/channel.py
       - unitree/g1/tests/test_speaker_lifecycle.py
+      - unitree/g1/tests/test_playback_state.py
+      - unitree/g1/tests/test_channel_matching.py
+      - unitree/g1/tests/test_hardware_smoke_contract.py
+      - unitree/g1/tools/g1_speaker_receipt_smoke.py
       - unitree/g1/SPEAKER_LIFECYCLE_PROTOCOL.md
       - .github/workflows/g1-speaker-lifecycle.yml
 

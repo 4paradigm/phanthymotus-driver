@@ -259,6 +259,99 @@ class _AudioClient:
         return self.stop_code
 
 
+class _PlaybackStateMonitor:
+    def __init__(self, result=None, *, available=True, ready=None):
+        self.result = result or {
+            'state': 'completed',
+            'reason': '',
+            'playing_seq': 1,
+            'idle_seq': 2,
+        }
+        self.available = available
+        self.ready = available if ready is None else ready
+        self.sequence = 0
+        self.submissions = []
+        self.wait_calls = []
+        self.forgotten = []
+        self.ready_waits = []
+
+    def checkpoint(self):
+        checkpoint = self.sequence
+        self.sequence += 1
+        return checkpoint
+
+    def note_submission(self, key, checkpoint):
+        self.submissions.append((key, checkpoint))
+
+    def wait_for_completion(self, key, *, timeout, cancelled):
+        self.wait_calls.append((key, timeout))
+        if cancelled():
+            return {'state': 'interrupted', 'reason': 'interrupted'}
+        return dict(self.result)
+
+    def wait_until_ready(self, *, timeout, cancelled=None):
+        self.ready_waits.append(timeout)
+        if cancelled is not None and cancelled():
+            return {'state': 'interrupted', 'reason': 'interrupted'}
+        if not self.available:
+            return {'state': 'error', 'reason': 'injected_unavailable'}
+        if not self.ready:
+            return {
+                'state': 'timeout',
+                'reason': 'play_state_publisher_timeout',
+            }
+        return {'state': 'ready', 'reason': ''}
+
+    def forget(self, key):
+        self.forgotten.append(key)
+
+    def status(self):
+        return {
+            'available': self.available,
+            'ready': self.ready,
+            'matched_publishers': 1 if self.ready else 0,
+            'topic': 'rt/audio_msg',
+            'current_state': 0,
+            'event_seq': self.sequence,
+            'last_event_ts': 123.0,
+            'connect_error': '' if self.available else 'injected_unavailable',
+        }
+
+
+class _BlockingPlaybackStateMonitor(_PlaybackStateMonitor):
+    def __init__(self):
+        super().__init__()
+        self.wait_entered = threading.Event()
+        self.release_wait = threading.Event()
+
+    def wait_for_completion(self, key, *, timeout, cancelled):
+        self.wait_calls.append((key, timeout))
+        self.wait_entered.set()
+        while not self.release_wait.wait(timeout=0.005):
+            if cancelled():
+                return {'state': 'interrupted', 'reason': 'interrupted'}
+        if cancelled():
+            return {'state': 'interrupted', 'reason': 'interrupted'}
+        return dict(self.result)
+
+
+class _BlockingReadyPlaybackStateMonitor(_PlaybackStateMonitor):
+    def __init__(self):
+        super().__init__(ready=False)
+        self.ready_wait_entered = threading.Event()
+        self.ready_wait_release = threading.Event()
+
+    def wait_until_ready(self, *, timeout, cancelled=None):
+        self.ready_waits.append(timeout)
+        self.ready_wait_entered.set()
+        while not self.ready_wait_release.wait(timeout=0.005):
+            if cancelled is not None and cancelled():
+                return {'state': 'interrupted', 'reason': 'interrupted'}
+        if cancelled is not None and cancelled():
+            return {'state': 'interrupted', 'reason': 'interrupted'}
+        return {'state': 'ready', 'reason': ''}
+
+
 class _StopFirstSdkLock:
     """Force interrupt's PlayStop to linearize before a pending PlayStream."""
 
@@ -511,6 +604,215 @@ class SpeakerLifecycleTests(unittest.TestCase):
         self.assertLessEqual(
             self.client.stop_finish_timeouts[-1], self.node.CONTROL_RPC_TIMEOUT_SEC,
         )
+
+    def test_hardware_completion_waits_for_g1_play_state(self):
+        monitor = _PlaybackStateMonitor()
+        client = _AudioClient()
+        node = DEVICE._SpeakerNode(
+            client,
+            monotonic=self.clock.monotonic,
+            wall_time=self.clock.wall_time,
+            waiter=self.clock.wait,
+            playback_state_monitor=monitor,
+            completion_mode='hardware_state',
+        )
+        client.stop_calls.clear()
+        node.start_play('/perception/hardware-state')
+        pcm = b'\x10\x20' * 1600
+
+        node._on_chunk(_chunk('utt:hardware', pcm))
+        node._on_chunk(_chunk('utt:hardware', node.AUDIO_EOF_MAGIC))
+        self._join_drain(node)
+
+        terminal = [
+            receipt for receipt in _receipts(node)
+            if receipt['utterance_id'] == 'utt:hardware'
+            and receipt['state'] == 'completed'
+        ][0]
+        generation = node._generation
+        self.assertEqual(
+            monitor.submissions,
+            [((generation, 'utt:hardware'), 0)],
+        )
+        self.assertEqual(
+            monitor.wait_calls,
+            [((generation, 'utt:hardware'), node._play_state_timeout_sec)],
+        )
+        self.assertEqual(terminal['completion_basis'], 'g1_play_state_observed')
+        self.assertIn((generation, 'utt:hardware'), monitor.forgotten)
+
+    def test_hardware_idle_gate_advances_only_after_stream_response(self):
+        monitor = _PlaybackStateMonitor()
+        client = _DelayedFinishClient()
+        node = DEVICE._SpeakerNode(
+            client,
+            monotonic=self.clock.monotonic,
+            wall_time=self.clock.wall_time,
+            waiter=self.clock.wait,
+            playback_state_monitor=monitor,
+            completion_mode='hardware_state',
+        )
+        client.stop_calls.clear()
+        node.start_play('/perception/hardware-response-boundary')
+
+        node._on_chunk(_chunk(
+            'utt:hardware-response-boundary', b'R' * 3200,
+        ))
+        node._on_chunk(_chunk(
+            'utt:hardware-response-boundary', node.AUDIO_EOF_MAGIC,
+        ))
+        self.assertTrue(client.finish_entered.wait(timeout=1))
+
+        self.assertEqual(monitor.submissions, [])
+        client.finish_release.set()
+        self._join_drain(node)
+
+        generation = node._generation
+        self.assertEqual(
+            monitor.submissions,
+            [((generation, 'utt:hardware-response-boundary'), 0)],
+        )
+        self.assertTrue(any(
+            receipt['utterance_id'] == 'utt:hardware-response-boundary'
+            and receipt['state'] == 'completed'
+            for receipt in _receipts(node)
+        ))
+
+    def test_hardware_state_timeout_is_error_and_stops_player(self):
+        monitor = _PlaybackStateMonitor({
+            'state': 'timeout',
+            'reason': 'play_state_idle_timeout',
+        })
+        client = _AudioClient()
+        node = DEVICE._SpeakerNode(
+            client,
+            monotonic=self.clock.monotonic,
+            wall_time=self.clock.wall_time,
+            waiter=self.clock.wait,
+            playback_state_monitor=monitor,
+            completion_mode='hardware_state',
+        )
+        client.stop_calls.clear()
+        node.start_play('/perception/hardware-timeout')
+
+        node._on_chunk(_chunk('utt:hardware-timeout', b'T' * 3200))
+        node._on_chunk(_chunk(
+            'utt:hardware-timeout', node.AUDIO_EOF_MAGIC,
+        ))
+        self._join_drain(node)
+
+        terminal = [
+            receipt for receipt in _receipts(node)
+            if receipt['utterance_id'] == 'utt:hardware-timeout'
+            and receipt['state'] in ('completed', 'cancelled', 'error')
+        ]
+        self.assertEqual([item['state'] for item in terminal], ['error'])
+        self.assertEqual(terminal[0]['reason'], 'play_state_idle_timeout')
+        self.assertEqual(
+            terminal[0]['completion_basis'], 'g1_play_state_observed',
+        )
+        self.assertEqual(client.stop_calls, [DEVICE.APP_NAME])
+
+    def test_hardware_wait_interrupted_cannot_emit_completed(self):
+        monitor = _BlockingPlaybackStateMonitor()
+        client = _AudioClient()
+        node = DEVICE._SpeakerNode(
+            client,
+            playback_state_monitor=monitor,
+            completion_mode='hardware_state',
+        )
+        client.stop_calls.clear()
+        node.start_play('/perception/hardware-interrupt')
+        node._on_chunk(_chunk('utt:hardware-interrupt', b'I' * 3200))
+        node._on_chunk(_chunk(
+            'utt:hardware-interrupt', node.AUDIO_EOF_MAGIC,
+        ))
+        self.assertTrue(monitor.wait_entered.wait(timeout=1))
+
+        result = node.interrupt()
+        monitor.release_wait.set()
+        thread = node._drain_thread
+        if thread is not None:
+            thread.join(timeout=1)
+
+        terminals = [
+            receipt['state'] for receipt in _receipts(node)
+            if receipt['utterance_id'] == 'utt:hardware-interrupt'
+            and receipt['state'] in ('completed', 'cancelled', 'error')
+        ]
+        self.assertEqual(result['cancelled_utterance_ids'], [
+            'utt:hardware-interrupt',
+        ])
+        self.assertEqual(terminals, ['cancelled'])
+
+    def test_stale_stream_response_cannot_recreate_hardware_observation(self):
+        monitor = _PlaybackStateMonitor()
+        client = _DelayedFinishClient()
+        node = DEVICE._SpeakerNode(
+            client,
+            playback_state_monitor=monitor,
+            completion_mode='hardware_state',
+        )
+        client.stop_calls.clear()
+        node.start_play('/perception/hardware-stale-response')
+        node._on_chunk(_chunk(
+            'utt:hardware-stale-response', b'S' * 3200,
+        ))
+        node._on_chunk(_chunk(
+            'utt:hardware-stale-response', node.AUDIO_EOF_MAGIC,
+        ))
+        self.assertTrue(client.finish_entered.wait(timeout=1))
+
+        node.interrupt()
+        client.finish_release.set()
+        thread = node._drain_thread
+        if thread is not None:
+            thread.join(timeout=1)
+
+        self.assertEqual(monitor.submissions, [])
+        terminals = [
+            receipt['state'] for receipt in _receipts(node)
+            if receipt['utterance_id'] == 'utt:hardware-stale-response'
+            and receipt['state'] in ('completed', 'cancelled', 'error')
+        ]
+        self.assertEqual(terminals, ['cancelled'])
+
+    def test_hardware_mode_rejects_lossy_pause(self):
+        monitor = _PlaybackStateMonitor()
+        node = DEVICE._SpeakerNode(
+            _AudioClient(),
+            playback_state_monitor=monitor,
+            completion_mode='hardware_state',
+        )
+        node.start_play('/perception/hardware-pause')
+        node._on_chunk(_chunk('utt:hardware-pause', b'P' * 3200))
+
+        result = node.pause()
+
+        self.assertEqual(
+            result['error'], 'pause_not_supported_with_hardware_state',
+        )
+        self.assertEqual(node.state, 'playing')
+        node.interrupt()
+
+    def test_smart_motion_does_not_advertise_unsupported_hardware_pause(self):
+        executor = types.SimpleNamespace(add_node=lambda _node: None)
+        speaker = DEVICE.SpeakerPlugin(
+            {'completion_mode': 'hardware_state'},
+            '', executor, _AudioClient(),
+            playback_state_monitor=_PlaybackStateMonitor(),
+        )
+        smart_motion = DEVICE.SmartMotionPlugin(
+            {}, '', executor, speaker_plugin=speaker,
+        )
+
+        actions = smart_motion.get_tool()['inputSchema']['properties'][
+            'action'
+        ]['enum']
+
+        self.assertNotIn('pause_speak', actions)
+        self.assertNotIn('resume_speak', actions)
+        self.assertIn('interrupt_speak', actions)
 
     def test_playback_grace_is_applied_once_per_utterance(self):
         self.node.PREFILL = 100
@@ -1455,6 +1757,181 @@ class SpeakerLifecycleTests(unittest.TestCase):
         self.assertEqual(info['receipt_recovery'],
                          'transient_local_then_info_poll')
         self.assertEqual(info['topic_out'][0]['qos']['reliability'], 'reliable')
+
+    def test_native_tts_speak_can_be_hidden_for_strict_speaker_ownership(self):
+        plugin = DEVICE.NativeTtsPlugin(
+            {
+                'speak_enabled': False,
+                'speak_disabled_reason': 'strict_speaker_owns_body_audio',
+            },
+            '', None, _AudioClient(),
+        )
+
+        actions = plugin.get_tool()['inputSchema']['properties']['action'][
+            'enum'
+        ]
+        result = plugin.dispatch('speak', {'text': 'must not play'})
+
+        self.assertNotIn('speak', actions)
+        self.assertIn('get_volume', actions)
+        self.assertEqual(result, {
+            'state': 'error',
+            'error': 'strict_speaker_owns_body_audio',
+        })
+
+    def test_hardware_info_advertises_g1_play_state_evidence(self):
+        executor = types.SimpleNamespace(add_node=lambda _node: None)
+        monitor = _PlaybackStateMonitor()
+        plugin = DEVICE.SpeakerPlugin(
+            {
+                'completion_mode': 'hardware_state',
+                'play_state_timeout_sec': 1.5,
+            },
+            '', executor, _AudioClient(),
+            playback_state_monitor=monitor,
+        )
+        plugin._node.start_play('/perception/hardware-info')
+
+        info = plugin.dispatch('info', {})
+
+        self.assertEqual(info['completion_mode'], 'hardware_state')
+        self.assertEqual(info['completion_basis'], 'g1_play_state_observed')
+        self.assertTrue(info['play_state']['available'])
+        self.assertEqual(info['play_state']['topic'], 'rt/audio_msg')
+        self.assertEqual(plugin._node._play_state_timeout_sec, 1.5)
+
+    def test_hardware_start_fails_before_audio_when_monitor_unavailable(self):
+        executor = types.SimpleNamespace(add_node=lambda _node: None)
+        monitor = _PlaybackStateMonitor(available=False)
+        client = _AudioClient()
+        plugin = DEVICE.SpeakerPlugin(
+            {'completion_mode': 'hardware_state'},
+            '', executor, client,
+            playback_state_monitor=monitor,
+        )
+        client.stop_calls.clear()
+
+        result = plugin.dispatch(
+            'start', {'input_topic': '/perception/unavailable'},
+        )
+
+        self.assertEqual(result['state'], 'error')
+        self.assertEqual(result['error'], 'play_state_monitor_unavailable')
+        self.assertEqual(client.stream_calls, [])
+
+    def test_hardware_start_waits_for_matched_state_publisher(self):
+        executor = types.SimpleNamespace(add_node=lambda _node: None)
+        monitor = _PlaybackStateMonitor(ready=False)
+        client = _AudioClient()
+        plugin = DEVICE.SpeakerPlugin(
+            {
+                'completion_mode': 'hardware_state',
+                'play_state_discovery_timeout_sec': 1.25,
+            },
+            '', executor, client,
+            playback_state_monitor=monitor,
+        )
+        client.stop_calls.clear()
+
+        result = plugin.dispatch(
+            'start', {'input_topic': '/perception/unmatched-state'},
+        )
+
+        self.assertEqual(result['state'], 'error')
+        self.assertEqual(result['error'], 'play_state_publisher_timeout')
+        self.assertEqual(monitor.ready_waits, [1.25])
+        self.assertEqual(client.stream_calls, [])
+
+    def test_stop_during_discovery_cannot_resurrect_stale_start(self):
+        executor = types.SimpleNamespace(add_node=lambda _node: None)
+        monitor = _BlockingReadyPlaybackStateMonitor()
+        client = _AudioClient()
+        plugin = DEVICE.SpeakerPlugin(
+            {'completion_mode': 'hardware_state'},
+            '', executor, client,
+            playback_state_monitor=monitor,
+        )
+        client.stop_calls.clear()
+        result_holder = {}
+        start_thread = threading.Thread(
+            target=lambda: result_holder.setdefault(
+                'value', plugin.dispatch(
+                    'start', {'input_topic': '/perception/stale-discovery'},
+                ),
+            ),
+        )
+        start_thread.start()
+        self.assertTrue(monitor.ready_wait_entered.wait(timeout=1))
+
+        self.assertEqual(plugin._node.stop_play()['state'], 'idle')
+        monitor.ready_wait_release.set()
+        start_thread.join(timeout=1)
+
+        self.assertFalse(start_thread.is_alive())
+        self.assertEqual(result_holder['value']['error'], 'interrupted')
+        self.assertEqual(client.stream_calls, [])
+        self.assertIsNone(plugin._node._sub)
+        self.assertIsNone(plugin._node._topic)
+
+    def test_hardware_startup_sound_waits_for_g1_play_state(self):
+        executor = types.SimpleNamespace(add_node=lambda _node: None)
+        monitor = _PlaybackStateMonitor()
+        client = _AudioClient()
+        plugin = DEVICE.SpeakerPlugin(
+            {'completion_mode': 'hardware_state'},
+            '', executor, client,
+            playback_state_monitor=monitor,
+        )
+        client.stop_calls.clear()
+        plugin._node._monotonic = self.clock.monotonic
+        plugin._node._waiter = self.clock.wait
+
+        result = plugin.dispatch(
+            'start', {'input_topic': '/perception/hardware-startup'},
+        )
+
+        startup_key = monitor.wait_calls[0][0]
+        self.assertEqual(result['state'], 'ready')
+        self.assertEqual(result['completion_basis'], 'g1_play_state_observed')
+        self.assertTrue(client.stream_calls)
+        self.assertEqual(startup_key[1], f'startup:{startup_key[0]}')
+        self.assertEqual(
+            {key for key, _checkpoint in monitor.submissions},
+            {startup_key},
+        )
+        self.assertEqual(
+            monitor.wait_calls,
+            [(startup_key, plugin._node._play_state_timeout_sec)],
+        )
+        self.assertIn(startup_key, monitor.forgotten)
+
+    def test_hardware_startup_state_timeout_fails_before_subscription(self):
+        executor = types.SimpleNamespace(add_node=lambda _node: None)
+        monitor = _PlaybackStateMonitor({
+            'state': 'timeout',
+            'reason': 'play_state_idle_timeout',
+        })
+        client = _AudioClient()
+        plugin = DEVICE.SpeakerPlugin(
+            {'completion_mode': 'hardware_state'},
+            '', executor, client,
+            playback_state_monitor=monitor,
+        )
+        client.stop_calls.clear()
+        plugin._node._monotonic = self.clock.monotonic
+        plugin._node._waiter = self.clock.wait
+
+        result = plugin.dispatch(
+            'start', {'input_topic': '/perception/hardware-startup-timeout'},
+        )
+
+        self.assertEqual(
+            result['error'], 'startup_play_state_idle_timeout',
+        )
+        self.assertIsNone(plugin._node._sub)
+        self.assertIsNone(plugin._node._topic)
+        self.assertTrue(client.stream_calls)
+        self.assertEqual(client.stop_calls, [DEVICE.APP_NAME, DEVICE.APP_NAME])
 
 
 class AudioClientWrapperTests(unittest.TestCase):

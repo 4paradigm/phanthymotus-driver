@@ -76,8 +76,26 @@ class G1DeviceBundle:
 
         if plugins_cfg.get("tts", {}).get("enabled", False):
             from device import NativeTtsPlugin
-            self._plugins.append(NativeTtsPlugin(plugins_cfg["tts"], namespace, executor, audio_client))
-            print("[bundle] NativeTtsPlugin loaded")
+            native_tts_cfg = dict(plugins_cfg["tts"])
+            speaker_cfg = plugins_cfg.get("speaker", {})
+            if (speaker_cfg.get("enabled", False)
+                    and str(speaker_cfg.get(
+                        "completion_mode", "estimated",
+                    )).strip().lower() == "hardware_state"):
+                # rt/audio_msg is global and carries no app/stream identity.
+                # Keep the strict PCM speaker path exclusive inside this
+                # bundle so Native TTS cannot supply a foreign 1 -> 0 cycle.
+                native_tts_cfg["speak_enabled"] = False
+                native_tts_cfg["speak_disabled_reason"] = (
+                    "native_tts_conflicts_with_hardware_state_speaker"
+                )
+            self._plugins.append(NativeTtsPlugin(
+                native_tts_cfg, namespace, executor, audio_client,
+            ))
+            print(
+                "[bundle] NativeTtsPlugin loaded "
+                f"(speak={'enabled' if native_tts_cfg.get('speak_enabled', True) else 'disabled'})"
+            )
 
         if plugins_cfg.get("speaker", {}).get("enabled", False):
             from device import SpeakerPlugin

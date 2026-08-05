@@ -37,23 +37,37 @@ class Channel:
         def __init__(self):
             self.__reader = None
             self.__handler = None
+            self.__matchHandler = None
             self.__queue = None
             self.__queueEnable = False
             self.__threadEvent = None
             self.__threadReader = None
+            self.__subscriptionMatchedCount = 0
+            self.__subscriptionMatchedEvent = Event()
         
-        def Init(self, participant: DomainParticipant, topic: Topic, qos: Qos = None, handler: Callable = None, queueLen: int = 0):
-            if handler is None:
-                self.__reader = DataReader(participant, topic, qos)
-            else:
-                self.__handler = handler
-                if queueLen > 0:
-                    self.__queueEnable = True
-                    self.__queue = BQueue(queueLen)
-                    self.__threadEvent = Event()
-                    self.__threadReader = Thread(target=self.__ChannelReaderThreadFunc, name="ch_reader", daemon=True)
-                    self.__threadReader.start()
-                self.__reader = DataReader(participant, topic, qos, Listener(on_data_available=self.__OnDataAvailable))
+        def Init(self, participant: DomainParticipant, topic: Topic,
+                 qos: Qos = None, handler: Callable = None,
+                 queueLen: int = 0, matchHandler: Callable = None):
+            self.__handler = handler
+            self.__matchHandler = matchHandler
+            self.__queueEnable = False
+            self.__queue = None
+            self.__threadEvent = None
+            self.__threadReader = None
+            if handler is not None and queueLen > 0:
+                self.__queueEnable = True
+                self.__queue = BQueue(queueLen)
+                self.__threadEvent = Event()
+                self.__threadReader = Thread(target=self.__ChannelReaderThreadFunc, name="ch_reader", daemon=True)
+                self.__threadReader.start()
+            listener_args = {
+                "on_subscription_matched": self.__OnSubscriptionMatched,
+            }
+            if handler is not None:
+                listener_args["on_data_available"] = self.__OnDataAvailable
+            self.__reader = DataReader(
+                participant, topic, qos, Listener(**listener_args),
+            )
 
         def Read(self, timeout: float = None):
             sample = None
@@ -74,12 +88,36 @@ class Channel:
         def Close(self):
             if self.__reader is not None:
                 del self.__reader
+                self.__reader = None
+
+            self.__subscriptionMatchedCount = 0
+            self.__subscriptionMatchedEvent.clear()
 
             if self.__queueEnable:
                 self.__threadEvent.set()
                 self.__queue.Interrupt()
                 self.__queue.Clear()
                 self.__threadReader.join()
+                self.__queueEnable = False
+                self.__queue = None
+                self.__threadEvent = None
+                self.__threadReader = None
+
+        def WaitForPublisher(self, timeout: float = None):
+            if self.__subscriptionMatchedCount > 0:
+                return True
+            if not self.__subscriptionMatchedEvent.wait(timeout=timeout):
+                return False
+            return self.__subscriptionMatchedCount > 0
+
+        def __OnSubscriptionMatched(self, reader: DataReader, status):
+            self.__subscriptionMatchedCount = status.current_count
+            if status.current_count > 0:
+                self.__subscriptionMatchedEvent.set()
+            else:
+                self.__subscriptionMatchedEvent.clear()
+            if self.__matchHandler is not None:
+                self.__matchHandler(status.current_count)
 
         def __OnDataAvailable(self, reader: DataReader):
             samples = []
@@ -169,8 +207,12 @@ class Channel:
     def SetWriter(self, qos: Qos = None):
         self.__writer.Init(self.__participant, self.__topic, qos)
 
-    def SetReader(self, qos: Qos = None, handler: Callable = None, queueLen: int = 0):
-        self.__reader.Init(self.__participant, self.__topic, qos, handler, queueLen)
+    def SetReader(self, qos: Qos = None, handler: Callable = None,
+                  queueLen: int = 0, matchHandler: Callable = None):
+        self.__reader.Init(
+            self.__participant, self.__topic, qos, handler, queueLen,
+            matchHandler,
+        )
         
     def Write(self, sample: Any, timeout: float = None):
         return self.__writer.Write(sample, timeout)
@@ -180,6 +222,9 @@ class Channel:
 
     def CloseReader(self):
         self.__reader.Close()
+
+    def WaitForReaderPublisher(self, timeout: float = None):
+        return self.__reader.WaitForPublisher(timeout)
 
     def CloseWriter(self):
         self.__writer.Close()
@@ -280,9 +325,10 @@ class ChannelSubscriber:
         self.__channel = factory.CreateChannel(name, type)
         self.__inited = False
 
-    def Init(self, handler: Callable = None, queueLen: int = 0):
+    def Init(self, handler: Callable = None, queueLen: int = 0,
+             matchHandler: Callable = None):
         if not self.__inited:
-            self.__channel.SetReader(None, handler, queueLen)
+            self.__channel.SetReader(None, handler, queueLen, matchHandler)
             self.__inited = True
 
     def Close(self):
@@ -291,6 +337,9 @@ class ChannelSubscriber:
 
     def Read(self, timeout: int = None):
         return self.__channel.Read(timeout)
+
+    def WaitForPublisher(self, timeout: float = None):
+        return self.__channel.WaitForReaderPublisher(timeout)
 
 """
 " function ChannelFactoryInitialize. used to intialize channel everenment.

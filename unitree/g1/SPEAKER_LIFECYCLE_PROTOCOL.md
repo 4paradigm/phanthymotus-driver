@@ -34,7 +34,7 @@ For input topic `<audio_topic>`, the speaker publishes JSON in
   "session_id": "speaker:<uuid>",
   "utterance_id": "utt:<producer-generated-id>",
   "state": "completed",
-  "completion_basis": "driver_drained_estimated",
+  "completion_basis": "g1_play_state_observed",
   "audio_bytes": 32000,
   "ts": 1780000000.0,
   "reason": "",
@@ -47,10 +47,69 @@ terminal. Terminal identity is `(session_id, utterance_id)`, and consumers must
 deduplicate it. A terminal receipt may arrive without `started` when delivery of
 the earlier event failed; consumers must accept that transition.
 
-`completed` means the driver submitted all PCM, waited its calculated duration,
-and applied a short tail grace. Unitree exposes no hardware drain/audible-end
-acknowledgement, so this is deliberately reported as
-`driver_drained_estimated`, not exact acoustic completion.
+With `completion_mode: hardware_state`, the driver also subscribes to the G1
+controller's `rt/audio_msg` DDS topic. The body-speaker service publishes
+`{"play_state":1}` when its player starts and `{"play_state":0}` when it
+becomes idle. Before the first and every subsequent successful `PlayStream`
+submission, the driver captures an event-sequence checkpoint. It also records
+the event sequence when each successful submission is acknowledged, so a late
+idle event from the preceding block cannot complete the stream. It reports
+`completed` only after observing a `1` after the first pre-submit checkpoint and
+a `0` after the final successful-submission checkpoint. The resulting basis is
+`g1_play_state_observed`.
+
+Before accepting the first audio block, strict mode waits for CycloneDDS to
+report that the `rt/audio_msg` reader has matched a firmware publisher. This
+distinguishes a constructed local reader from a usable state source and avoids
+turning DDS discovery delay into a false first-play timeout. State callbacks run
+directly on the DDS reader, and an idle transition must remain the newest state
+for a short settle window before it becomes terminal.
+
+This is a firmware player-idle acknowledgement, not an acoustic measurement:
+it cannot prove that a failed amplifier produced audible sound. The state topic
+is global rather than stream-ID keyed, so the driver keeps speaker playback
+serialized and fails closed on a missing transition or timeout. `PlayStop`
+during interrupt produces `play_state=0`, but generation invalidation prevents
+that event from becoming a false `completed` receipt.
+
+Because the topic is global, the bundled device also hides/rejects native
+`tts.speak` whenever strict Speaker completion is enabled; volume actions remain
+available. Audio writers outside this Driver bundle cannot be coordinated, so a
+deployment relying on these receipts must give the Speaker plugin exclusive
+ownership of the G1 body-speaker service.
+
+`completion_mode: estimated` remains available for older firmware. In that
+mode `completed` retains the previous `driver_drained_estimated` meaning: all
+PCM was submitted and its calculated duration plus tail grace elapsed. To
+restore native synthesis in such a configuration, also set
+`plugins.tts.speak_enabled: true` explicitly.
+
+Hardware-state mode does not offer resumable pause. Unitree exposes no playback
+cursor, so stopping during the final hardware tail would discard audio that
+cannot be resumed safely; callers should use interrupt/cancel instead.
+
+## Reviewer hardware smoke
+
+Run this only against a dedicated G1 test deployment. It replaces the active
+Speaker input topic, plays the normal startup beep, sends 1.5 seconds of
+near-silent non-zero PCM, validates a hardware-state `completed` receipt, and
+stops Speaker during cleanup:
+
+```bash
+docker exec -it embodied-unitree-g1 bash -lc '
+  source /opt/ros/humble/setup.bash &&
+  source /ros_ws/install/setup.bash &&
+  python3 /work/tools/g1_speaker_receipt_smoke.py \
+    --confirm-exclusive-hardware
+'
+```
+
+Success prints JSON containing `result: passed`, `play_state.ready: true`, at
+least one matched publisher, and a terminal receipt whose basis is
+`g1_play_state_observed`. Missing DDS discovery, missing transitions, receipt
+timeout, non-hardware completion, and incomplete PCM delivery all fail with a
+non-zero exit code. The command is intentionally opt-in because it interrupts
+any existing Speaker session.
 
 ## Delivery and recovery
 

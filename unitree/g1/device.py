@@ -255,19 +255,42 @@ class NativeTtsPlugin:
 
     def __init__(self, plugin_config: dict, namespace: str, executor, audio_client: AudioClient):
         self._client = audio_client
+        self._speak_enabled = bool(plugin_config.get('speak_enabled', True))
+        self._speak_disabled_reason = str(
+            plugin_config.get(
+                'speak_disabled_reason',
+                'native_tts_speak_disabled',
+            )
+        )
 
     def get_tool(self) -> dict:
+        actions = ["get_volume", "set_volume"]
+        action_params = {
+            "get_volume": {"params": [],                 "description": "Get current speaker volume"},
+            "set_volume": {"params": ["volume"],         "description": "Set speaker volume (0-100)"},
+        }
+        if self._speak_enabled:
+            actions.insert(0, "speak")
+            action_params["speak"] = {
+                "params": ["text", "voice"],
+                "description": "Synthesize text to speech on the robot",
+            }
+        description = (
+            "G1 on-board TTS engine — synthesize text to robot speech, control volume"
+            if self._speak_enabled else
+            "G1 body-speaker volume control — native synthesis disabled while strict PCM completion owns the player"
+        )
         return {
             "name": "tts",
             "type": "actuator",
             "multiInstance": False,
-            "description": "G1 on-board TTS engine — synthesize text to robot speech, control volume",
+            "description": description,
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["speak", "get_volume", "set_volume"],
+                        "enum": actions,
                         "description": "Action to perform",
                     },
                     "text":   {"type": "string",  "description": "Text to speak"},
@@ -275,11 +298,7 @@ class NativeTtsPlugin:
                     "volume": {"type": "integer", "description": "Volume 0-100"},
                 },
                 "required": ["action"],
-                "x-action-params": {
-                    "speak":      {"params": ["text", "voice"],  "description": "Synthesize text to speech on the robot"},
-                    "get_volume": {"params": [],                 "description": "Get current speaker volume"},
-                    "set_volume": {"params": ["volume"],         "description": "Set speaker volume (0-100)"},
-                },
+                "x-action-params": action_params,
             },
         }
 
@@ -295,6 +314,11 @@ class NativeTtsPlugin:
         if action == "stop":
             return {"state": "idle"}
         if action == "speak":
+            if not self._speak_enabled:
+                return {
+                    "state": "error",
+                    "error": self._speak_disabled_reason,
+                }
             text  = args.get("text", "")
             voice = int(args.get("voice", 0))
             ret   = self._client.TtsMaker(text, voice)
@@ -324,16 +348,31 @@ class _SpeakerNode(Node):
     STREAM_RPC_TIMEOUT_SEC = 1.0
     CONTROL_RPC_TIMEOUT_SEC = 1.0
     TERMINAL_HISTORY_LIMIT = 256
+    COMPLETION_MODE_ESTIMATED = 'estimated'
+    COMPLETION_MODE_HARDWARE_STATE = 'hardware_state'
 
     # EOF magic: 8 bytes (4 samples [1,-1,1,-1])，标记 utterance 结束
     AUDIO_EOF_MAGIC = b'\x01\x00\xff\xff\x01\x00\xff\xff'
 
     def __init__(self, audio_client: AudioClient, *, monotonic=None,
-                 wall_time=None, waiter=None):
+                 wall_time=None, waiter=None, playback_state_monitor=None,
+                 completion_mode: str = COMPLETION_MODE_ESTIMATED,
+                 play_state_timeout_sec: float = 2.0,
+                 play_state_discovery_timeout_sec: float = 3.0):
         super().__init__("g1_speaker")
+        if completion_mode not in (
+                self.COMPLETION_MODE_ESTIMATED,
+                self.COMPLETION_MODE_HARDWARE_STATE):
+            raise ValueError(f'unsupported speaker completion_mode: {completion_mode}')
         self._client = audio_client
         self._monotonic = monotonic or time.monotonic
         self._wall_time = wall_time or time.time
+        self._playback_state_monitor = playback_state_monitor
+        self._completion_mode = completion_mode
+        self._play_state_timeout_sec = max(0.1, float(play_state_timeout_sec))
+        self._play_state_discovery_timeout_sec = max(
+            0.1, float(play_state_discovery_timeout_sec),
+        )
         self._topic: str | None = None
         self._sub    = None
         self._receipt_topic: str | None = None
@@ -383,6 +422,92 @@ class _SpeakerNode(Node):
                 f"[speaker] stale-session cleanup failed: code={stop_code}"
             )
         self.get_logger().info("SpeakerNode ready")
+
+    def _completion_basis(self, *, legacy: bool = False) -> str:
+        if self._completion_mode == self.COMPLETION_MODE_HARDWARE_STATE:
+            return (
+                'g1_play_state_observed_after_driver_idle'
+                if legacy else 'g1_play_state_observed'
+            )
+        return 'driver_idle_estimated' if legacy else 'driver_drained_estimated'
+
+    def _playback_observation_key(self, utterance_id: str,
+                                  generation: int) -> tuple[int, str]:
+        return generation, utterance_id
+
+    def _playback_checkpoint(self) -> int | None:
+        monitor = self._playback_state_monitor
+        if (self._completion_mode != self.COMPLETION_MODE_HARDWARE_STATE
+                or monitor is None):
+            return None
+        return monitor.checkpoint()
+
+    def _note_playback_submission(self, utterance_id: str, generation: int,
+                                  checkpoint: int | None) -> None:
+        monitor = self._playback_state_monitor
+        if monitor is None or checkpoint is None:
+            return
+        monitor.note_submission(
+            self._playback_observation_key(utterance_id, generation),
+            checkpoint,
+        )
+
+    def _forget_playback_observation(self, utterance_id: str,
+                                     generation: int) -> None:
+        monitor = self._playback_state_monitor
+        if monitor is None or not utterance_id:
+            return
+        monitor.forget(
+            self._playback_observation_key(utterance_id, generation),
+        )
+
+    def _hardware_wait_cancelled(self, generation: int) -> bool:
+        with self._lock:
+            return (
+                self._interrupt_flag.is_set()
+                or generation != self._generation
+            )
+
+    def _wait_for_hardware_completion(self, utterance_id: str,
+                                      generation: int) -> dict:
+        monitor = self._playback_state_monitor
+        if monitor is None:
+            return {
+                'state': 'error',
+                'reason': 'play_state_monitor_unavailable',
+            }
+        return monitor.wait_for_completion(
+            self._playback_observation_key(utterance_id, generation),
+            timeout=self._play_state_timeout_sec,
+            cancelled=lambda: self._hardware_wait_cancelled(generation),
+        )
+
+    def _wait_for_play_state_ready(self, generation: int) -> dict:
+        monitor = self._playback_state_monitor
+        if monitor is None:
+            return {
+                'state': 'error',
+                'reason': 'play_state_monitor_unavailable',
+            }
+        return monitor.wait_until_ready(
+            timeout=self._play_state_discovery_timeout_sec,
+            cancelled=lambda: self._hardware_wait_cancelled(generation),
+        )
+
+    def _play_state_status(self) -> dict:
+        monitor = self._playback_state_monitor
+        if monitor is None:
+            return {
+                'available': False,
+                'ready': False,
+                'matched_publishers': 0,
+                'topic': None,
+                'current_state': None,
+                'event_seq': 0,
+                'last_event_ts': None,
+                'connect_error': 'play_state_monitor_not_configured',
+            }
+        return monitor.status()
 
     def start_play(self, topic: str) -> str:
         with self._lifecycle_lock:
@@ -719,6 +844,9 @@ class _SpeakerNode(Node):
         for utterance_id in cancelled_ids:
             self._emit_receipt(utterance_id, receipt_state, reason=receipt_reason,
                                completion_basis='driver_control')
+            self._forget_playback_observation(
+                utterance_id, stopped_generation,
+            )
 
         with self._lock:
             if success:
@@ -810,6 +938,9 @@ class _SpeakerNode(Node):
         for utterance_id in cancelled_ids:
             self._emit_receipt(utterance_id, receipt_state, reason=receipt_reason,
                                completion_basis='driver_control')
+            self._forget_playback_observation(
+                utterance_id, interrupted_generation,
+            )
 
         with self._lock:
             self._control_in_progress = False
@@ -839,6 +970,14 @@ class _SpeakerNode(Node):
 
     def _pause_serialized(self) -> dict:
         with self._lock:
+            if self._completion_mode == self.COMPLETION_MODE_HARDWARE_STATE:
+                # Unitree reports only global playing/idle, not a playback
+                # cursor. PlayStop during the final hardware tail would discard
+                # audio that cannot be resumed without replaying the block.
+                return {
+                    "state": self.state,
+                    "error": "pause_not_supported_with_hardware_state",
+                }
             if self._control_in_progress:
                 return {"state": self.state, "error": "speaker control already in progress"}
             if self.state not in ("playing", "ready"):
@@ -1040,6 +1179,10 @@ class _SpeakerNode(Node):
                         for generation_ids in self._generation_ids.values():
                             generation_ids.discard(utterance_id)
             self._publish_and_log_receipt(receipt)
+            if utterance_id:
+                self._forget_playback_observation(
+                    utterance_id, generation,
+                )
             with self._lock:
                 if self._drain_generation == generation:
                     self._draining.clear()
@@ -1074,7 +1217,22 @@ class _SpeakerNode(Node):
                             'stream-error', expected_generation=generation,
                         )
                 merged = b''
-            if not current_error and self.PLAYBACK_GRACE_SEC > 0:
+            if (not current_error
+                    and self._completion_mode == self.COMPLETION_MODE_HARDWARE_STATE):
+                hardware_result = self._wait_for_hardware_completion(
+                    current_id, generation,
+                )
+                if hardware_result.get('state') == 'interrupted':
+                    return
+                if hardware_result.get('state') != 'completed':
+                    current_error = (
+                        hardware_result.get('reason')
+                        or f"play_state_{hardware_result.get('state', 'error')}"
+                    )
+                    self._call_play_stop(
+                        'play-state-error', expected_generation=generation,
+                    )
+            elif not current_error and self.PLAYBACK_GRACE_SEC > 0:
                 while True:
                     wait_state = self._wait_playback_interval(
                         self.PLAYBACK_GRACE_SEC, generation,
@@ -1087,6 +1245,10 @@ class _SpeakerNode(Node):
                         return
                     break
             receipt = None
+            finished_id = current_id
+            completion_basis = self._completion_basis(
+                legacy=current_legacy and not saw_eof,
+            )
             # Make the generation check and terminal receipt record atomic with
             # interrupt(); DDS publication happens after releasing the state lock.
             with self._lock:
@@ -1095,18 +1257,17 @@ class _SpeakerNode(Node):
                 if current_error:
                     receipt = self._record_receipt(
                         current_id, 'error', audio_bytes=current_bytes,
-                        reason=current_error, completion_basis='driver_drained_estimated',
+                        reason=current_error, completion_basis=completion_basis,
                     )
                 elif saw_eof or current_legacy:
-                    basis = 'driver_drained_estimated' if saw_eof else 'driver_idle_estimated'
                     receipt = self._record_receipt(
                         current_id, 'completed', audio_bytes=current_bytes,
-                        completion_basis=basis,
+                        completion_basis=completion_basis,
                     )
                 else:
                     receipt = self._record_receipt(
                         current_id, 'error', audio_bytes=current_bytes,
-                        reason='missing_eof', completion_basis='driver_drained_estimated',
+                        reason='missing_eof', completion_basis=completion_basis,
                     )
                 if (current_legacy
                         and self._legacy_utterance_id == current_id):
@@ -1114,7 +1275,10 @@ class _SpeakerNode(Node):
                 if receipt is not None:
                     for generation_ids in self._generation_ids.values():
                         generation_ids.discard(current_id)
+                if self._active_utterance_id == current_id:
+                    self._active_utterance_id = None
             self._publish_and_log_receipt(receipt)
+            self._forget_playback_observation(finished_id, generation)
             current_id = None
             current_legacy = False
             current_bytes = 0
@@ -1246,6 +1410,7 @@ class _SpeakerNode(Node):
                     if not self._pause_event.is_set():
                         continue
                     pause_epoch = self._pause_epoch
+                play_state_checkpoint = self._playback_checkpoint()
                 t0 = self._monotonic()
                 try:
                     if hasattr(self._client, 'PlayStreamStart'):
@@ -1298,6 +1463,15 @@ class _SpeakerNode(Node):
                 if (self._interrupt_flag.is_set()
                         or generation != self._generation):
                     return False, 'interrupted'
+                if code == 0:
+                    # The response, rather than the transport send, is the
+                    # successful-submission boundary. Keep generation
+                    # validation and observation insertion under one lock so
+                    # a stale response cannot recreate an observation that
+                    # interrupt already forgot.
+                    self._note_playback_submission(
+                        utterance_id, generation, play_state_checkpoint,
+                    )
                 paused_since_submit = pause_epoch != self._pause_epoch
             if paused_since_submit:
                 if not self._wait_until_resumed(generation):
@@ -1324,9 +1498,52 @@ class _SpeakerNode(Node):
 class SpeakerPlugin:
     PREFIX = "speaker"
 
-    def __init__(self, plugin_config: dict, namespace: str, executor, audio_client: AudioClient):
-        self._node = _SpeakerNode(audio_client)
+    def __init__(self, plugin_config: dict, namespace: str, executor,
+                 audio_client: AudioClient, *, playback_state_monitor=None):
+        completion_mode = str(
+            plugin_config.get('completion_mode', 'estimated')
+        ).strip().lower()
+        play_state_topic = str(
+            plugin_config.get('play_state_topic', 'rt/audio_msg')
+        ).strip() or 'rt/audio_msg'
+        play_state_timeout_sec = float(
+            plugin_config.get('play_state_timeout_sec', 2.0)
+        )
+        play_state_discovery_timeout_sec = float(
+            plugin_config.get('play_state_discovery_timeout_sec', 3.0)
+        )
+        if (completion_mode == _SpeakerNode.COMPLETION_MODE_HARDWARE_STATE
+                and playback_state_monitor is None):
+            try:
+                from playback_state import G1PlaybackStateMonitor
+                playback_state_monitor = G1PlaybackStateMonitor.connect_dds(
+                    play_state_topic,
+                )
+            except Exception as exc:
+                playback_state_monitor = None
+                print(
+                    '[speaker] G1 play-state monitor load failed: '
+                    f'{type(exc).__name__}: {exc}',
+                    flush=True,
+                )
+        self._node = _SpeakerNode(
+            audio_client,
+            playback_state_monitor=playback_state_monitor,
+            completion_mode=completion_mode,
+            play_state_timeout_sec=play_state_timeout_sec,
+            play_state_discovery_timeout_sec=(
+                play_state_discovery_timeout_sec
+            ),
+        )
         executor.add_node(self._node)
+        if completion_mode == _SpeakerNode.COMPLETION_MODE_HARDWARE_STATE:
+            state_status = self._node._play_state_status()
+            self._node.get_logger().info(
+                '[speaker] hardware completion monitor '
+                f'topic={state_status["topic"]} '
+                f'available={state_status["available"]} '
+                f'error={state_status["connect_error"]}'
+            )
 
     def get_tool(self) -> dict:
         return {
@@ -1374,11 +1591,13 @@ class SpeakerPlugin:
         except Exception as e:
             self._node.get_logger().warn(f"[speaker] startup sound unavailable: {e}")
             return True, f'startup_sound_skipped:{type(e).__name__}'
+        startup_id = f'startup:{generation}'
         try:
             block_size = 9600  # ~300ms per block
             for offset in range(0, len(pcm), block_size):
                 block = pcm[offset:offset + block_size]
                 pending = None
+                play_state_checkpoint = self._node._playback_checkpoint()
                 with self._node._sdk_lock:
                     with self._node._lock:
                         if generation != self._node._generation:
@@ -1406,6 +1625,9 @@ class SpeakerPlugin:
                         'startup-error', expected_generation=generation,
                     )
                     return False, f'startup_play_failed:{code}'
+                self._node._note_playback_submission(
+                    startup_id, generation, play_state_checkpoint,
+                )
                 duration = len(block) / 32000
                 remaining = duration - 0.08
                 if (remaining > 0
@@ -1413,6 +1635,23 @@ class SpeakerPlugin:
                             remaining, generation,
                         ) != 'done'):
                     return False, 'startup_interrupted'
+            if (self._node._completion_mode
+                    == self._node.COMPLETION_MODE_HARDWARE_STATE):
+                hardware_result = self._node._wait_for_hardware_completion(
+                    startup_id, generation,
+                )
+                if hardware_result.get('state') == 'interrupted':
+                    return False, 'startup_interrupted'
+                if hardware_result.get('state') != 'completed':
+                    error = (
+                        hardware_result.get('reason')
+                        or f"play_state_{hardware_result.get('state', 'error')}"
+                    )
+                    self._node._call_play_stop(
+                        'startup-play-state-error',
+                        expected_generation=generation,
+                    )
+                    return False, f'startup_{error}'
             self._node.get_logger().info(f"[speaker] startup sound OK ({len(pcm)} bytes)")
             return True, ''
         except Exception as e:
@@ -1424,6 +1663,10 @@ class SpeakerPlugin:
                 'startup-error', expected_generation=generation,
             )
             return False, f'startup_play_exception:{type(e).__name__}'
+        finally:
+            self._node._forget_playback_observation(
+                startup_id, generation,
+            )
 
     def stop(self) -> None:
         self._node.stop_play()
@@ -1435,12 +1678,38 @@ class SpeakerPlugin:
             topic = args.get("input_topic", "")
             if not topic:
                 return {"error": "Missing input_topic"}
-            # Always stop first to ensure clean restart
-            stop_result = self._node.stop_play()
-            if stop_result.get('state') == 'error':
-                return stop_result
-            with self._node._lock:
-                startup_generation = self._node._generation
+            # Always stop first to ensure clean restart. Snapshot the resulting
+            # generation before releasing the same lifecycle lock, so another
+            # control call cannot slip between stop and ownership capture.
+            with self._node._lifecycle_lock:
+                stop_result = self._node._stop_play_serialized()
+                if stop_result.get('state') == 'error':
+                    return stop_result
+                with self._node._lock:
+                    startup_generation = self._node._generation
+            play_state_status = self._node._play_state_status()
+            if (self._node._completion_mode
+                    == self._node.COMPLETION_MODE_HARDWARE_STATE
+                    and not play_state_status.get('available')):
+                return {
+                    "state": "error",
+                    "error": "play_state_monitor_unavailable",
+                    "play_state": play_state_status,
+                }
+            if (self._node._completion_mode
+                    == self._node.COMPLETION_MODE_HARDWARE_STATE):
+                ready_result = self._node._wait_for_play_state_ready(
+                    startup_generation,
+                )
+                if ready_result.get('state') != 'ready':
+                    return {
+                        "state": "error",
+                        "error": (
+                            ready_result.get('reason')
+                            or 'play_state_publisher_unavailable'
+                        ),
+                        "play_state": self._node._play_state_status(),
+                    }
             # Play startup sound synchronously before starting subscription
             startup_ok, startup_error = self._play_startup_sound(startup_generation)
             if not startup_ok:
@@ -1462,7 +1731,9 @@ class SpeakerPlugin:
                 "speech_protocol": "audiochunk-frameid-v1",
                 "session_id": self._node._session_id,
                 "receipt_topic": self._node._receipt_topic,
-                "completion_basis": "driver_drained_estimated",
+                "completion_mode": self._node._completion_mode,
+                "completion_basis": self._node._completion_basis(),
+                "play_state": self._node._play_state_status(),
                 "receipt_recovery": "transient_local_then_info_poll",
                 "startup_warning": startup_error,
                 "topic_out": [{
@@ -1480,6 +1751,7 @@ class SpeakerPlugin:
         elif action == "stop":
             return self._node.stop_play()
         elif action == "info":
+            play_state_status = self._node._play_state_status()
             with self._node._lock:
                 with self._node._receipt_lock:
                     receipt_topic = self._node._receipt_topic
@@ -1491,7 +1763,9 @@ class SpeakerPlugin:
                         "speech_protocol": "audiochunk-frameid-v1",
                         "session_id": self._node._session_id,
                         "receipt_topic": receipt_topic,
-                        "completion_basis": "driver_drained_estimated",
+                        "completion_mode": self._node._completion_mode,
+                        "completion_basis": self._node._completion_basis(),
+                        "play_state": play_state_status,
                         "receipt_recovery": "transient_local_then_info_poll",
                         "active_utterance_id": self._node._active_utterance_id,
                         "last_terminal_receipt": (
@@ -1542,30 +1816,47 @@ class SmartMotionPlugin:
         self._loco = loco_plugin
 
     def get_tool(self) -> dict:
+        pause_supported = not (
+            self._speaker is not None
+            and self._speaker._node._completion_mode
+            == self._speaker._node.COMPLETION_MODE_HARDWARE_STATE
+        )
+        actions = [
+            "interrupt_all", "interrupt_speak", "interrupt_motion", "status",
+        ]
+        action_params = {
+            "interrupt_all":    {"params": [], "description": "中止所有输出（语音+动作同时停止）"},
+            "interrupt_speak":  {"params": [], "description": "中止语音播放，清空待播队列"},
+            "interrupt_motion": {"params": [], "description": "停止机器人当前运动"},
+            "status":           {"params": [], "description": "查询当前输出状态（语音/运动）"},
+        }
+        if pause_supported:
+            actions[3:3] = ["pause_speak", "resume_speak"]
+            action_params.update({
+                "pause_speak":  {"params": [], "description": "暂停语音播放（保留未播内容，可恢复）"},
+                "resume_speak": {"params": [], "description": "恢复之前暂停的语音播放"},
+            })
+        description = (
+            "SmartMotion — 统一运动/输出控制，提供打断、暂停、恢复能力"
+            if pause_supported else
+            "SmartMotion — 统一运动/输出控制；硬件完成模式支持打断和状态查询，不支持无损暂停"
+        )
         return {
             "name": "smart_motion",
             "type": "actuator",
             "multiInstance": False,
-            "description": "SmartMotion — 统一运动/输出控制，提供打断、暂停、恢复能力",
+            "description": description,
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["interrupt_all", "interrupt_speak", "interrupt_motion",
-                                 "pause_speak", "resume_speak", "status"],
+                        "enum": actions,
                         "description": "Action to perform",
                     },
                 },
                 "required": ["action"],
-                "x-action-params": {
-                    "interrupt_all":    {"params": [], "description": "中止所有输出（语音+动作同时停止）"},
-                    "interrupt_speak":  {"params": [], "description": "中止语音播放，清空待播队列"},
-                    "interrupt_motion": {"params": [], "description": "停止机器人当前运动"},
-                    "pause_speak":      {"params": [], "description": "暂停语音播放（保留未播内容，可恢复）"},
-                    "resume_speak":     {"params": [], "description": "恢复之前暂停的语音播放"},
-                    "status":           {"params": [], "description": "查询当前输出状态（语音/运动）"},
-                },
+                "x-action-params": action_params,
             },
         }
 
