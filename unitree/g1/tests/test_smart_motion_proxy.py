@@ -10,8 +10,9 @@ import unittest
 from safety_harness import (
     SmartMotionProxy,
     _run_smart_motion_process,
+    request_parent_apply_velocity_proposal,
     request_parent_get_fsm_id,
-    request_parent_set_velocity,
+    request_parent_stop_velocity_proposal,
 )
 
 
@@ -122,13 +123,19 @@ class SmartMotionParentStopSequenceTest(unittest.TestCase):
 
 
 class SmartMotionParentLocoSequenceTest(unittest.TestCase):
-    def start_proxy(self, parent_set_velocity, parent_get_fsm_id=lambda: (0, 500)):
+    def start_proxy(
+        self,
+        parent_apply_velocity,
+        parent_get_fsm_id=lambda: (0, 500),
+        fallback_stop=lambda: 0,
+    ):
         proxy = SmartMotionProxy.__new__(SmartMotionProxy)
         proxy._parent_velocity_queue = queue.Queue()
         proxy._parent_velocity_result_queue = queue.Queue()
         proxy._parent_velocity_shutdown = threading.Event()
-        proxy._parent_set_velocity = parent_set_velocity
+        proxy._parent_apply_velocity_proposal = parent_apply_velocity
         proxy._parent_get_fsm_id = parent_get_fsm_id
+        proxy._fallback_stop = fallback_stop
         proxy._parent_velocity_thread = threading.Thread(
             target=proxy._serve_parent_velocity_requests,
             daemon=True,
@@ -141,44 +148,122 @@ class SmartMotionParentLocoSequenceTest(unittest.TestCase):
         proxy._parent_velocity_thread.join(timeout=0.5)
         self.assertFalse(proxy._parent_velocity_thread.is_alive())
 
-    def test_child_request_executes_set_velocity_on_parent(self):
+    def test_child_request_executes_controlled_velocity_on_parent(self):
         calls = []
-        proxy = self.start_proxy(
-            lambda vx, vy, vyaw, duration: calls.append(
-                (vx, vy, vyaw, duration)
-            ) or 0
-        )
+        def apply(vx, vy, vyaw, deadline, nav_id, sequence, request_id):
+            calls.append(
+                (vx, vy, vyaw, deadline, nav_id, sequence, request_id)
+            )
+            return {"ret": 0, "error": None, "applied": True}
+
+        proxy = self.start_proxy(apply)
+        deadline = time.monotonic() + 0.2
         try:
-            result = request_parent_set_velocity(
+            result = request_parent_apply_velocity_proposal(
                 proxy._parent_velocity_queue,
                 proxy._parent_velocity_result_queue,
                 request_id=7,
                 vx=0.1,
                 vy=0.02,
                 vyaw=0.03,
-                duration=0.2,
+                deadline_monotonic=deadline,
+                nav_id="nav-1",
+                sequence=3,
                 timeout=0.2,
             )
         finally:
             self.stop_proxy(proxy)
 
-        self.assertEqual(calls, [(0.1, 0.02, 0.03, 0.2)])
+        self.assertEqual(
+            calls,
+            [(0.1, 0.02, 0.03, deadline, "nav-1", 3, 7)],
+        )
         self.assertEqual(result["request_id"], 7)
         self.assertEqual(result["ret"], 0)
         self.assertIsNone(result["error"])
         self.assertIsNotNone(result["completed_monotonic"])
 
     def test_parent_nonzero_return_is_correlated(self):
-        proxy = self.start_proxy(lambda *_: 3104)
+        proxy = self.start_proxy(
+            lambda *_: {"ret": 3104, "error": None, "applied": False}
+        )
         try:
-            result = request_parent_set_velocity(
+            result = request_parent_apply_velocity_proposal(
                 proxy._parent_velocity_queue,
                 proxy._parent_velocity_result_queue,
                 request_id=8,
                 vx=0.1,
                 vy=0.0,
                 vyaw=0.0,
-                duration=0.2,
+                deadline_monotonic=time.monotonic() + 0.2,
+                nav_id="nav-1",
+                sequence=4,
+                timeout=0.2,
+            )
+        finally:
+            self.stop_proxy(proxy)
+
+        self.assertEqual(result["ret"], 3104)
+        self.assertIsNone(result["error"])
+
+    def test_runtime_stop_is_ordered_after_inflight_parent_apply(self):
+        calls = []
+        apply_started = threading.Event()
+        release_apply = threading.Event()
+
+        def apply(*_):
+            calls.append("apply_started")
+            apply_started.set()
+            release_apply.wait(timeout=0.5)
+            calls.append("apply_completed")
+            return {"ret": 0, "error": None, "applied": True}
+
+        def stop():
+            calls.append("stop")
+            return 0
+
+        proxy = self.start_proxy(apply, fallback_stop=stop)
+        try:
+            proxy._parent_velocity_queue.put({
+                "method": "apply_velocity_proposal",
+                "request_id": 20,
+                "vx": 0.1,
+                "vy": 0.0,
+                "vyaw": 0.0,
+                "deadline_monotonic": time.monotonic() + 1.0,
+                "nav_id": "nav-1",
+                "sequence": 1,
+            })
+            self.assertTrue(apply_started.wait(timeout=0.2))
+            proxy._parent_velocity_queue.put({
+                "method": "stop_velocity_proposal",
+                "request_id": 21,
+            })
+            time.sleep(0.01)
+            self.assertEqual(calls, ["apply_started"])
+            release_apply.set()
+            first = proxy._parent_velocity_result_queue.get(timeout=0.5)
+            second = proxy._parent_velocity_result_queue.get(timeout=0.5)
+        finally:
+            release_apply.set()
+            self.stop_proxy(proxy)
+
+        self.assertEqual(calls, ["apply_started", "apply_completed", "stop"])
+        self.assertEqual(first["request_id"], 20)
+        self.assertEqual(first["ret"], 0)
+        self.assertEqual(second["request_id"], 21)
+        self.assertEqual(second["ret"], 0)
+
+    def test_runtime_parent_stop_failure_is_reported(self):
+        proxy = self.start_proxy(
+            lambda *_: {"ret": 0, "error": None, "applied": True},
+            fallback_stop=lambda: 3104,
+        )
+        try:
+            result = request_parent_stop_velocity_proposal(
+                proxy._parent_velocity_queue,
+                proxy._parent_velocity_result_queue,
+                request_id=22,
                 timeout=0.2,
             )
         finally:
@@ -193,14 +278,16 @@ class SmartMotionParentLocoSequenceTest(unittest.TestCase):
 
         proxy = self.start_proxy(fail)
         try:
-            result = request_parent_set_velocity(
+            result = request_parent_apply_velocity_proposal(
                 proxy._parent_velocity_queue,
                 proxy._parent_velocity_result_queue,
                 request_id=9,
                 vx=0.1,
                 vy=0.0,
                 vyaw=0.0,
-                duration=0.2,
+                deadline_monotonic=time.monotonic() + 0.2,
+                nav_id="nav-1",
+                sequence=5,
                 timeout=0.2,
             )
         finally:
@@ -214,20 +301,22 @@ class SmartMotionParentLocoSequenceTest(unittest.TestCase):
         result_queue = queue.Queue()
         started = time.monotonic()
 
-        result = request_parent_set_velocity(
+        result = request_parent_apply_velocity_proposal(
             request_queue,
             result_queue,
             request_id=10,
             vx=0.1,
             vy=0.0,
             vyaw=0.0,
-            duration=0.2,
+            deadline_monotonic=time.monotonic() + 0.2,
+            nav_id="nav-1",
+            sequence=6,
             timeout=0.03,
         )
 
         self.assertLess(time.monotonic() - started, 0.15)
         self.assertIsNone(result["ret"])
-        self.assertEqual(result["error"], "parent_set_velocity_timeout")
+        self.assertEqual(result["error"], "parent_velocity_proposal_timeout")
 
     def test_stale_parent_reply_cannot_satisfy_new_request(self):
         request_queue = queue.Queue()
@@ -244,14 +333,16 @@ class SmartMotionParentLocoSequenceTest(unittest.TestCase):
 
         responder = threading.Thread(target=reply_current, daemon=True)
         responder.start()
-        result = request_parent_set_velocity(
+        result = request_parent_apply_velocity_proposal(
             request_queue,
             result_queue,
             request_id=11,
             vx=0.1,
             vy=0.0,
             vyaw=0.0,
-            duration=0.2,
+            deadline_monotonic=time.monotonic() + 0.2,
+            nav_id="nav-1",
+            sequence=7,
             timeout=0.2,
         )
         responder.join(timeout=0.5)
@@ -260,7 +351,10 @@ class SmartMotionParentLocoSequenceTest(unittest.TestCase):
         self.assertEqual(result["ret"], 3104)
 
     def test_child_request_gets_fsm_id_from_parent(self):
-        proxy = self.start_proxy(lambda *_: 0, lambda: (0, 500))
+        proxy = self.start_proxy(
+            lambda *_: {"ret": 0, "error": None, "applied": True},
+            lambda: (0, 500),
+        )
         try:
             result = request_parent_get_fsm_id(
                 proxy._parent_velocity_queue,
@@ -280,7 +374,10 @@ class SmartMotionParentLocoSequenceTest(unittest.TestCase):
         def fail():
             raise RuntimeError("parent FSM RPC unavailable")
 
-        proxy = self.start_proxy(lambda *_: 0, fail)
+        proxy = self.start_proxy(
+            lambda *_: {"ret": 0, "error": None, "applied": True},
+            fail,
+        )
         try:
             result = request_parent_get_fsm_id(
                 proxy._parent_velocity_queue,
@@ -346,9 +443,29 @@ class SmartMotionParentLocoSequenceTest(unittest.TestCase):
 
         self.assertNotIn("proposal_loco_client", source)
         self.assertNotIn("fsm_loco_client", source)
-        self.assertIn("apply_parent_set_velocity", source)
+        self.assertIn("apply_parent_velocity_proposal", source)
+        self.assertIn("proposal_apply_loop", source)
         self.assertIn("query_parent_fsm_id", source)
+        self.assertIn("stop_parent_velocity_proposal", source)
+        self.assertEqual(
+            source.count("= stop_parent_velocity_proposal()"),
+            2,
+        )
+        self.assertIn("last_proposal_stop_result = dict(result)", source)
+        self.assertIn('"last_proposal_stop": (', source)
+        self.assertIn("last_proposal_stop_result = None", source)
         self.assertIn("parent_loco_rpc_lock", source)
+        self.assertIn("proposal_ros_spin_loop", source)
+        callback_source = source[
+            source.index("def on_velocity_proposal"):
+            source.index("def apply_safety_velocity")
+        ]
+        self.assertLess(
+            callback_source.index("refresh_proposal_execution_deadline("),
+            callback_source.index("proposal_apply_diagnostics.record_accepted()"),
+        )
+        self.assertIn('name="g1_loco_proposal_ros"', source)
+        self.assertEqual(source.count("executor.spin_once"), 2)
 
     def test_main_wires_parent_rpc_proxy_loco_calls(self):
         main_source = Path(__file__).resolve().parents[1].joinpath(
@@ -356,7 +473,7 @@ class SmartMotionParentLocoSequenceTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertIn(
-            "parent_set_velocity=loco_client.SetVelocity",
+            "parent_apply_velocity_proposal=loco_client.ApplyVelocityProposal",
             main_source,
         )
         self.assertIn(
