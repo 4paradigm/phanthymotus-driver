@@ -33,6 +33,13 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   MotorStatePlugin    (sensor)             — 全身21电机状态(2Hz)
   HandStatePlugin     (sensor)             — 灵巧手状态(10Hz, tool name=hand_state)
   RemoteStatePlugin   (sensor)             — 遥控器SBUS事件(5Hz)
+  RobotFaultsPlugin   (actuator)           — 全身体检卡 (tool name=health_check)
+  LaserScanPlugin     (sensor)             — 激光雷达原始点云
+  ChassisRawPlugin    (actuator)           — 底盘速度控制
+  AebPlugin           (actuator)           — 急刹卡 (tool name=auto_brake)
+  ControlledSpatialPlugin (actuator)      — 空间控制(controlled_spatial)
+  ExtMicPlugin        (actuator)           — 外部麦克风(ext_mic)
+  LightPlugin         (actuator)           — 灯光控制
   StatePlugin      (sensor, multi-tool) — 关节/电池/急停/力传感器/URDF
   CameraPlugin     (sensor)             — Orbbec 头部相机
   AsrPlugin        (sensor)             — 语音识别结果
