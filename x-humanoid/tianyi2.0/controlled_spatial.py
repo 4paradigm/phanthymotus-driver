@@ -174,11 +174,41 @@ class ControlledSpatialPlugin:
         self._nav_action_id: str | None = None  # Action ID returned by move_to
         self._nav_start_time: float = 0  # monotonic time when navigation was initiated
         self._nav_lost_count: int = 0  # consecutive polls where action was missing on chassis
+        self._nav_stall_timeout: float = 60.0  # seconds without movement → stall
+        self._nav_last_move_time: float = 0  # last time pose changed during nav
+        self._nav_last_pose: dict | None = None  # last pose for stall detection
         self._lock = threading.Lock()
         self._poll_thread: Optional[threading.Thread] = None
 
         # Start polling thread for pose, nav status, map status
         self._poll_running = False
+
+    def _acp_callback(self, action_id: str, status: str, result: dict):
+        """POST 动作完成通知到 Agent Core。"""
+        try:
+            import urllib.request as _urllib
+            import ssl as _ssl
+            agent_core_url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+            ctx = _ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = _ssl.CERT_NONE
+            payload = json.dumps({
+                "action_id": action_id,
+                "status": status,
+                "result": result,
+                "tool": "controlled_spatial",
+                "ts": time.time(),
+            }).encode()
+            req = _urllib.Request(
+                f"{agent_core_url}/api/acp/complete",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            _urllib.urlopen(req, timeout=3, context=ctx)
+            print(f"[ControlledSpatial] ACP {status}: {action_id} | {json.dumps(result, ensure_ascii=False)[:120]}")
+        except Exception as e:
+            print(f"[ControlledSpatial] ACP callback failed: {e}")
 
     def get_tools(self) -> list:
         return [self._tool_def()]
@@ -204,7 +234,6 @@ class ControlledSpatialPlugin:
                             "list_maps", "delete_map",
                             "load_map",
                             "navigate_to_tag", "navigate_to_pose",
-                            "wait_navigation_done",
                             "pause_nav", "stop_nav",
                             # Artifact — 虚拟墙
                             "list_walls", "add_wall", "remove_wall", "clear_walls",
@@ -267,6 +296,10 @@ class ControlledSpatialPlugin:
                     "restricted_scheduling_points": {"type": "string", "description": "Restricted area: scheduling points JSON string"},
                 },
                 "required": ["action"],
+                "x-completion": {
+                    "actions": ["navigate_to_tag", "navigate_to_pose"],
+                    "timeout": 180
+                },
                 "x-action-params": {
                     "start_mapping": {"params": ["map_name"], "description": "Start SLAM mapping with given map name"},
                     "stop_mapping": {"params": [], "description": "Stop mapping and save the map"},
@@ -276,9 +309,8 @@ class ControlledSpatialPlugin:
                     "list_maps": {"params": [], "description": "List all saved maps"},
                     "delete_map": {"params": ["map_name"], "description": "Delete a map and its associated data"},
                     "load_map": {"params": ["map_name"], "description": "Load a map (robot must be at map origin)"},
-                    "navigate_to_tag": {"params": ["tag_name", "speed", "mode", "fail_retry_count", "acceptable_precision", "strategy", "ignore_dynamic_obstacles", "precise"], "description": "Navigate to a tagged place. Returns immediately — call wait_navigation_done to wait for arrival."},
-                    "navigate_to_pose": {"params": ["x", "y", "yaw", "speed", "mode", "fail_retry_count", "acceptable_precision", "strategy", "ignore_dynamic_obstacles", "precise"], "description": "Navigate to coordinates. Returns immediately — call wait_navigation_done to wait for arrival."},
-                    "wait_navigation_done": {"params": ["stall_timeout"], "description": "Block until navigation completes or robot is stuck (no movement for stall_timeout seconds). Must be called after navigate_to_tag or navigate_to_pose."},
+                    "navigate_to_tag": {"params": ["tag_name", "speed", "mode", "fail_retry_count", "acceptable_precision", "strategy", "ignore_dynamic_obstacles", "precise"], "description": "Navigate to a tagged place. System waits for arrival and notifies upon completion."},
+                    "navigate_to_pose": {"params": ["x", "y", "yaw", "speed", "mode", "fail_retry_count", "acceptable_precision", "strategy", "ignore_dynamic_obstacles", "precise"], "description": "Navigate to coordinates. System waits for arrival and notifies upon completion."},
                     "pause_nav": {"params": [], "description": "Pause navigation"},
                     "stop_nav": {"params": [], "description": "Stop and cancel navigation"},
                     # Artifact — 虚拟墙
@@ -365,6 +397,14 @@ class ControlledSpatialPlugin:
                         self._nav_active = False
                         self._nav_lost_count = 0
                         self._map_status = "localized"
+                        # ACP: callback Agent Core
+                        if self._nav_action_id:
+                            elapsed = time.monotonic() - self._nav_start_time
+                            self._acp_callback(str(self._nav_action_id), "completed", {
+                                "pose": self._current_pose,
+                                "elapsed_s": round(elapsed, 1),
+                                "action_id_chassis": str(self._nav_action_id),
+                            })
                     elif action_state == 4 and result_code in (-1, -2):
                         # Done + Failed/Aborted
                         label = "failed" if result_code == -1 else "aborted"
@@ -374,6 +414,17 @@ class ControlledSpatialPlugin:
                         self._nav_active = False
                         self._nav_lost_count = 0
                         self._map_status = "localized"
+                        # ACP: callback Agent Core
+                        if self._nav_action_id:
+                            elapsed = time.monotonic() - self._nav_start_time
+                            self._acp_callback(str(self._nav_action_id), "error", {
+                                "error": self._nav_error,
+                                "result_code": result_code,
+                                "reason": reason,
+                                "elapsed_s": round(elapsed, 1),
+                                "pose": self._current_pose,
+                                "action_id_chassis": str(self._nav_action_id),
+                            })
                     elif action_state == 3:
                         # Paused — still active, don't treat as lost
                         self._nav_lost_count = 0
@@ -382,6 +433,34 @@ class ControlledSpatialPlugin:
                         # NewBorn or Working
                         self._nav_lost_count = 0
                         self._map_status = "navigating"
+                        # Stall detection: if pose hasn't changed for stall_timeout, fail
+                        if self._nav_active and self._current_pose:
+                            if self._nav_last_pose is None:
+                                self._nav_last_pose = dict(self._current_pose)
+                                self._nav_last_move_time = time.monotonic()
+                            else:
+                                dx = abs(self._current_pose.get('x', 0) - self._nav_last_pose.get('x', 0))
+                                dy = abs(self._current_pose.get('y', 0) - self._nav_last_pose.get('y', 0))
+                                if dx > 0.02 or dy > 0.02:
+                                    self._nav_last_pose = dict(self._current_pose)
+                                    self._nav_last_move_time = time.monotonic()
+                                elif time.monotonic() - self._nav_last_move_time > self._nav_stall_timeout:
+                                    print(f"[ControlledSpatial] STALL detected: no movement for {self._nav_stall_timeout}s")
+                                    self._nav_error = f"Navigation stalled: no movement for {self._nav_stall_timeout:.0f}s"
+                                    self._nav_arrived.set()
+                                    self._nav_active = False
+                                    self._nav_lost_count = 0
+                                    # ACP: report stall as error
+                                    if self._nav_action_id:
+                                        elapsed = time.monotonic() - self._nav_start_time
+                                        self._acp_callback(str(self._nav_action_id), "error", {
+                                            "error": self._nav_error,
+                                            "type": "stall",
+                                            "stall_timeout_s": self._nav_stall_timeout,
+                                            "elapsed_s": round(elapsed, 1),
+                                            "pose": self._current_pose,
+                                            "action_id_chassis": str(self._nav_action_id),
+                                        })
                         # Verify the current action matches our expected action_id.
                         # If load_map left a RecoverLocalizationAction running,
                         # we'd see action_state=1 but for the WRONG action.
@@ -419,6 +498,15 @@ class ControlledSpatialPlugin:
                                     self._nav_active = False
                                     self._nav_lost_count = 0
                                     self._map_status = "localized"
+                                    # ACP callback
+                                    if self._nav_action_id:
+                                        elapsed = time.monotonic() - self._nav_start_time
+                                        self._acp_callback(str(self._nav_action_id), "completed", {
+                                            "pose": self._current_pose,
+                                            "elapsed_s": round(elapsed, 1),
+                                            "action_id_chassis": str(self._nav_action_id),
+                                            "detection": "query_by_id",
+                                        })
                                 elif final_action_state == 4 and final_result in (-1, -2):
                                     # Done + Failed/Aborted
                                     label = "failed" if final_result == -1 else "aborted"
@@ -428,15 +516,30 @@ class ControlledSpatialPlugin:
                                     self._nav_active = False
                                     self._nav_lost_count = 0
                                     self._map_status = "localized"
+                                    # ACP callback
+                                    if self._nav_action_id:
+                                        elapsed = time.monotonic() - self._nav_start_time
+                                        self._acp_callback(str(self._nav_action_id), "error", {
+                                            "error": self._nav_error,
+                                            "result_code": final_result,
+                                            "elapsed_s": round(elapsed, 1),
+                                            "pose": self._current_pose,
+                                            "detection": "query_by_id",
+                                        })
                                 else:
                                     # Action exists but not done yet — shouldn't happen
-                                    # since :current returned 404, but handle gracefully
                                     self._nav_lost_count += 1
                                     if self._nav_lost_count >= 5:
                                         self._nav_error = "Action lost on chassis"
                                         self._nav_arrived.set()
                                         self._nav_active = False
                                         self._nav_lost_count = 0
+                                        # ACP callback
+                                        if self._nav_action_id:
+                                            self._acp_callback(str(self._nav_action_id), "error", {
+                                                "error": "Action lost on chassis (query returned non-done state 5 times)",
+                                                "detection": "lost_count",
+                                            })
                             else:
                                 # Can't query action by ID either — truly lost
                                 self._nav_lost_count += 1
@@ -445,6 +548,12 @@ class ControlledSpatialPlugin:
                                     self._nav_arrived.set()
                                     self._nav_active = False
                                     self._nav_lost_count = 0
+                                    # ACP callback
+                                    if self._nav_action_id:
+                                        self._acp_callback(str(self._nav_action_id), "error", {
+                                            "error": "Action truly lost (can't query by ID)",
+                                            "detection": "truly_lost",
+                                        })
                 else:
                     # HTTP error from chassis — don't count as "action lost"
                     # Could be transient network issue; just skip this poll cycle
@@ -759,6 +868,8 @@ class ControlledSpatialPlugin:
             self._nav_active = True
             self._nav_start_time = time.monotonic()
             self._nav_lost_count = 0
+            self._nav_last_pose = None
+            self._nav_last_move_time = time.monotonic()
             result = self._slamtec.move_to(poi["x"], poi["y"], yaw=yaw, speed_ratio=speed, mode=mode,
                                            fail_retry_count=fail_retry_count,
                                            acceptable_precision=acceptable_precision,
@@ -797,6 +908,7 @@ class ControlledSpatialPlugin:
 
             return {
                 "status": "navigating",
+                "action_id": str(self._nav_action_id) if self._nav_action_id else None,
                 "target": tag_name,
                 "pose": {"x": poi["x"], "y": poi["y"], "yaw": yaw},
             }
@@ -836,6 +948,8 @@ class ControlledSpatialPlugin:
             self._nav_active = True
             self._nav_start_time = time.monotonic()
             self._nav_lost_count = 0
+            self._nav_last_pose = None
+            self._nav_last_move_time = time.monotonic()
             result = self._slamtec.move_to(x, y, yaw=yaw, speed_ratio=speed, mode=mode,
                                            fail_retry_count=fail_retry_count, acceptable_precision=acceptable_precision,
                                            ignore_dynamic_obstacles=ignore_dynamic,
@@ -873,6 +987,7 @@ class ControlledSpatialPlugin:
 
             return {
                 "status": "navigating",
+                "action_id": str(self._nav_action_id) if self._nav_action_id else None,
                 "target_pose": {"x": x, "y": y, "yaw": yaw},
             }
 

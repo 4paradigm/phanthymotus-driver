@@ -3688,6 +3688,13 @@ class TtsPlugin:
         self._stop_client = None
         self._pause_client = None
         self._resume_client = None
+        # ACP: PlayEvent 订阅，用于判断播放真正完成
+        self._play_event_sub = None
+        self._play_progress_sub = None
+        self._pending_play: dict[str, threading.Event] = {}  # sid → Event
+        self._pending_play_status: dict[str, int] = {}  # sid → event_code
+        self._pending_play_duration: dict[str, float] = {}  # sid → total duration (from progress)
+        self._play_event_buffer: dict[str, int] = {}  # 缓存最近的 PlayEvent（防竞态）
 
     def get_tool(self) -> dict:
         return {
@@ -3703,6 +3710,7 @@ class TtsPlugin:
                     "force": {"type": "boolean", "description": "是否强制播放(打断当前播放)", "default": False},
                 },
                 "required": ["action"],
+                "x-completion": {"actions": ["speak"], "timeout": 60},
                 "x-action-params": {
                     "speak": {"params": ["text", "force"], "description": "合成并播放文本"},
                     "interrupt": {"params": [], "description": "中止播放（不可恢复）"},
@@ -3715,13 +3723,44 @@ class TtsPlugin:
     def start(self):
         try:
             from lyre_msgs.srv import PlayText, PlayStop, PlayPause, PlayResume
+            from lyre_msgs.msg import PlayEvent, PlayProgress
             self._play_client = self._srv_node.create_client(PlayText, "/audio_play/play_text")
             self._stop_client = self._srv_node.create_client(PlayStop, "/audio_play/stop")
             self._pause_client = self._srv_node.create_client(PlayPause, "/audio_play/pause")
             self._resume_client = self._srv_node.create_client(PlayResume, "/audio_play/resume")
-            print("[TtsPlugin] service clients created")
+            # 订阅播放事件 topic，用于判断播放真正完成
+            self._play_event_sub = self._srv_node.create_subscription(
+                PlayEvent, "/audio_play/event", self._on_play_event, 10)
+            # 订阅播放进度 topic，获取精确总时长用于超时计算
+            self._play_progress_sub = self._srv_node.create_subscription(
+                PlayProgress, "/audio_play/progress", self._on_play_progress, 10)
+            print("[TtsPlugin] service clients + event/progress subscriptions created")
         except ImportError as e:
             print(f"[TtsPlugin] WARNING: msg import failed ({e})")
+
+    def _on_play_event(self, msg):
+        """PlayEvent callback: 播放完成/停止/失败时解锁对应的 pending."""
+        # event: 0=STARTED, 1=COMPLETED, 2=STOPPED, 3=CANCELLED, 4=FAILED
+        sid = msg.sid
+        event_code = msg.event
+        if event_code >= 1:
+            # 缓存事件（防止 _wait_cb 还没注册 pending 时 miss）
+            self._play_event_buffer[sid] = event_code
+            # 如果已注册 pending，直接解锁
+            if sid in self._pending_play:
+                self._pending_play_status[sid] = event_code
+                self._pending_play[sid].set()
+            print(f"[TtsPlugin] PlayEvent: sid={sid} event={event_code}")
+
+    def _on_play_progress(self, msg):
+        """PlayProgress callback: 获取播放总时长，用于精确超时计算。"""
+        sid = msg.sid
+        duration = msg.duration
+        if sid and duration > 0 and sid in self._pending_play:
+            # 只更新一次（取第一次收到的 duration）
+            if sid not in self._pending_play_duration:
+                self._pending_play_duration[sid] = duration
+                print(f"[TtsPlugin] PlayProgress: sid={sid} duration={duration:.1f}s")
 
     def stop(self):
         pass
@@ -3748,13 +3787,85 @@ class TtsPlugin:
             return {"error": "service client not initialized"}
         try:
             from lyre_msgs.srv import PlayText
+            import uuid as _uuid
             req = PlayText.Request()
             req.text = text
             req.force = force
             req.last = True
             future = self._play_client.call_async(req)
-            # Non-blocking, just return immediately
-            return {"state": "speaking", "text": text[:50]}
+            action_id = f"tts-{_uuid.uuid4().hex[:8]}"
+
+            # Background thread: wait for PlayEvent COMPLETED then ACP callback
+            def _wait_cb(fut, aid, spoken_text):
+                import time as _t
+                # Phase 1: 等 service response（获取 sid）
+                timeout_service = 10.0
+                start = _t.time()
+                while not fut.done() and _t.time() - start < timeout_service:
+                    _t.sleep(0.1)
+                # 获取 sid
+                sid = None
+                if fut.done():
+                    result = fut.result()
+                    if result:
+                        sid = getattr(result, 'sid', None)
+
+                # Phase 2: 等 PlayEvent 通知播放完成
+                status = "completed"
+                if sid:
+                    # 先检查 buffer：PlayEvent 可能在我们获取 sid 之前就到了
+                    buffered = self._play_event_buffer.pop(sid, None)
+                    if buffered is not None:
+                        # 已经完成了！
+                        status = "completed" if buffered == 1 else "error"
+                        print(f"[TtsPlugin] PlayEvent from buffer: sid={sid} event={buffered}")
+                    else:
+                        # 注册 pending，等 PlayEvent callback
+                        ev = threading.Event()
+                        self._pending_play[sid] = ev
+                        # 超时 = progress 报告的总时长 + 5s，fallback 字数/3 + 5
+                        import time as _t2
+                        _t2.sleep(0.5)  # 短等让 progress 有机会到达
+                        reported_duration = self._pending_play_duration.get(sid)
+                        if reported_duration and reported_duration > 0:
+                            play_timeout = reported_duration + 5.0
+                        else:
+                            play_timeout = len(spoken_text) / 3.0 + 5.0
+                        if not ev.wait(timeout=play_timeout):
+                            status = "error"
+                            print(f"[TtsPlugin] PlayEvent timeout: sid={sid}, waited {play_timeout:.0f}s (duration={reported_duration})")
+                        else:
+                            event_code = self._pending_play_status.get(sid, 1)
+                            status = "completed" if event_code == 1 else "error"
+                        # 清理
+                        self._pending_play.pop(sid, None)
+                        self._pending_play_status.pop(sid, None)
+                    self._pending_play_duration.pop(sid, None)
+                    self._play_event_buffer.pop(sid, None)
+                elif not sid:
+                    # 没拿到 sid，fallback 按字数估算
+                    fallback_s = len(spoken_text) / 4.0 + 3.0
+                    _t.sleep(fallback_s)
+                    print(f"[TtsPlugin] no sid from service, fallback sleep {fallback_s:.0f}s")
+
+                # ACP callback
+                try:
+                    import urllib.request, ssl, json as _json, os as _os
+                    url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+                    ctx = ssl.create_default_context()
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                    p = _json.dumps({"action_id": aid, "status": status,
+                                     "result": {"action": "speak", "sid": sid or "unknown"}}).encode()
+                    r = urllib.request.Request(f"{url}/api/acp/complete", data=p,
+                                              headers={"Content-Type": "application/json"}, method="POST")
+                    urllib.request.urlopen(r, timeout=3, context=ctx)
+                    print(f"[TtsPlugin] ACP {status}: {aid} (sid={sid})")
+                except Exception as e:
+                    print(f"[TtsPlugin] ACP callback failed: {e}")
+
+            threading.Thread(target=_wait_cb, args=(future, action_id, text), daemon=True).start()
+            return {"state": "speaking", "action_id": action_id, "text": text[:50]}
         except Exception as e:
             return {"error": str(e)}
 
@@ -3845,6 +3956,10 @@ class VoicePlayActuatorPlugin:
                     "force": {"type": "boolean", "description": "强制播放(停止当前任务立即播放,可选)"},
                 },
                 "required": ["action"],
+                "x-completion": {
+                    "actions": ["play_text", "play_file", "play_url"],
+                    "timeout": 60
+                },
                 "x-action-params": {
                     "play_file": {"params": ["path", "force"], "description": "播放本地音频文件"},
                     "play_url":  {"params": ["url", "force"],  "description": "播放远程URL音频"},
@@ -3934,11 +4049,49 @@ class VoicePlayActuatorPlugin:
 
         try:
             future = client.call_async(req)
-            # play_file/play_url/play_text: fire-and-forget, 不等合成完成
+            # play_file/play_url/play_text: 立即返回 action_id，后台等待完成后回调
             if action in ("play_file", "play_url", "play_text"):
+                import uuid as _uuid
+                action_id = f"voice-{_uuid.uuid4().hex[:8]}"
+                # 后台线程等待 service response 后回调 Agent Core
+                def _wait_and_callback(fut, aid, act):
+                    try:
+                        timeout = 60.0
+                        start = time.time()
+                        while not fut.done() and time.time() - start < timeout:
+                            time.sleep(0.1)
+                        if fut.done():
+                            result = fut.result()
+                            code = int(getattr(result, "code", 0)) if result else -1
+                            status = "completed" if code == 0 else "error"
+                        else:
+                            status = "completed"  # timeout 也视为播完
+                    except Exception:
+                        status = "error"
+                    # ACP callback
+                    try:
+                        import urllib.request as _urllib
+                        import ssl as _ssl
+                        import os as _os
+                        agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+                        ctx = _ssl.create_default_context()
+                        ctx.check_hostname = False
+                        ctx.verify_mode = _ssl.CERT_NONE
+                        payload = json.dumps({"action_id": aid, "status": status,
+                                              "result": {"action": act}}).encode()
+                        _req = _urllib.Request(f"{agent_core_url}/api/acp/complete",
+                                              data=payload, headers={"Content-Type": "application/json"},
+                                              method="POST")
+                        _urllib.urlopen(_req, timeout=3, context=ctx)
+                        print(f"[VoicePlay] ACP complete: {aid} ({status})")
+                    except Exception as e:
+                        print(f"[VoicePlay] ACP callback failed: {e}")
+                threading.Thread(target=_wait_and_callback,
+                                 args=(future, action_id, action), daemon=True).start()
                 return {
                     "ok": True, "code": 0,
                     "message": "submitted",
+                    "action_id": action_id,
                     "action": action,
                     "timestamp_ms": int(time.time() * 1000),
                 }
@@ -5167,6 +5320,10 @@ class ChassisRawPlugin:
                                  "description": "持续时间(秒), -1=持续运动 (不填 angle 时生效)"},
                 },
                 "required": ["action"],
+                "x-completion": {
+                    "actions": ["move", "rotate"],
+                    "timeout": 60
+                },
                 "x-action-params": {
                     "move":   {"params": ["direction", "duration"],
                                "description": "前进/后退, 固定速率 0.3 m/s, duration=-1 持续运动"},
@@ -5248,15 +5405,18 @@ class ChassisRawPlugin:
         continuous = (duration < 0)
         self._running = True
         gen = self._gen
+        import uuid as _uuid
+        action_id = f"move-{_uuid.uuid4().hex[:8]}"
         threading.Thread(
-            target=self._move_loop, args=(direction, duration, continuous, gen), daemon=True
+            target=self._move_loop, args=(direction, duration, continuous, gen, action_id), daemon=True
         ).start()
 
         return {"direction": self.DIR_NAMES[direction],
                 "duration": duration, "continuous": continuous,
+                "action_id": action_id,
                 "speed": "0.3 m/s (fixed)" if direction < 2 else "1.0 rad/s (fixed)"}
 
-    def _move_loop(self, direction: int, total_duration: float, continuous: bool, gen: int):
+    def _move_loop(self, direction: int, total_duration: float, continuous: bool, gen: int, action_id: str = ''):
         """运动控制 — 非持续模式发单次精确定时 move_by; 持续模式每 200ms 刷新。"""
         if not continuous:
             # 单次精确运动: move_by duration 单位是毫秒
@@ -5267,6 +5427,9 @@ class ChassisRawPlugin:
             time.sleep(total_duration + 0.3)  # 等运动完成+缓冲
             if self._running and self._gen == gen:
                 self._do_stop()
+            # ACP callback
+            if action_id:
+                self._acp_move_callback(action_id, "completed", total_duration)
             return
 
         # 持续模式: 每 200ms 刷新 300ms 运动指令保持连续
@@ -5280,6 +5443,29 @@ class ChassisRawPlugin:
             time.sleep(step)
         if self._running and self._gen == gen:
             self._do_stop()
+        # ACP callback for continuous mode (stopped by brake)
+        if action_id:
+            self._acp_move_callback(action_id, "completed", -1)
+
+    def _acp_move_callback(self, action_id: str, status: str, duration: float):
+        """POST movement completion to Agent Core."""
+        try:
+            import urllib.request as _urllib
+            import ssl as _ssl
+            import os as _os
+            agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+            ctx = _ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = _ssl.CERT_NONE
+            payload = json.dumps({"action_id": action_id, "status": status,
+                                  "result": {"duration": duration}}).encode()
+            req = _urllib.Request(f"{agent_core_url}/api/acp/complete",
+                                 data=payload, headers={"Content-Type": "application/json"},
+                                 method="POST")
+            _urllib.urlopen(req, timeout=3, context=ctx)
+            print(f"[ChassisRawPlugin] ACP complete: {action_id} ({status})")
+        except Exception as e:
+            print(f"[ChassisRawPlugin] ACP callback failed: {e}")
 
     def _do_stop(self) -> dict:
         self._running = False

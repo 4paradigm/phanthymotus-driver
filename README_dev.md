@@ -545,3 +545,114 @@ unitree-g1:                      # Service name (must be unique)
 - `network_mode`, `ipc`, `pid` are injected by Agent Core during deployment — do not specify them in service.yml
 - The `__IMAGE__` placeholder is automatically replaced with the actual image reference
 - Service name should follow the pattern `{provider}-{model}` (e.g. `unitree-g1`, `phanthy-remote-control`)
+
+---
+
+## Action Completion Protocol (ACP)
+
+When a tool performs a long-running physical action (TTS playback, navigation, arm movement), the LLM agent needs to know when the action finishes. ACP solves this at the **harness level** — the Agent Core transparently tracks async actions and exposes a `sync()` tool for the LLM to wait on.
+
+### How It Works
+
+```
+LLM calls speak("hello")
+  → Driver dispatch() returns {"status":"running", "action_id":"speak-a7f3c"}
+  → Agent Core registers pending action
+  → LLM sees the immediate result, can continue reasoning
+
+...speech plays...
+
+Driver worker finishes
+  → POST /api/acp/complete to Agent Core
+     body: {"action_id":"speak-a7f3c", "status":"completed"}
+  → Agent Core resolves the pending action
+  → Completion notification injected into LLM turn (via steering)
+
+LLM calls sync(["speak-a7f3c"])   (or waits for steering notification)
+  → Blocks until action completes → returns results
+```
+
+### Driver Implementation Guide
+
+#### 1. Declare `x-completion` in tool schema
+
+Add to your tool's `inputSchema`:
+
+```python
+"inputSchema": {
+    "type": "object",
+    "properties": { ... },
+    "required": ["action"],
+    "x-completion": {
+        "actions": ["speak", "navigate_to_tag"],  # which actions are async
+        "timeout": 120                             # max wait seconds
+    }
+}
+```
+
+#### 2. Return `action_id` in async action responses
+
+When an async action is dispatched, include `action_id` in the return dict:
+
+```python
+def dispatch(self, action, args):
+    if action == "speak":
+        action_id = f"speak-{uuid4().hex[:8]}"
+        self.queue.put((args["text"], action_id))
+        return {"status": "running", "action_id": action_id}
+```
+
+The `action_id` must be unique and stable — it's the correlation key for completion.
+
+#### 3. POST completion to Agent Core
+
+When the action finishes, POST to Agent Core's ACP endpoint:
+
+```python
+import urllib.request, ssl, json, os
+
+def _acp_callback(action_id: str, status: str, result: dict):
+    """POST action completion to Agent Core."""
+    agent_core_url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    payload = json.dumps({
+        "action_id": action_id,
+        "status": status,       # "completed" | "error" | "cancelled"
+        "result": result,       # optional result data
+    }).encode()
+    req = urllib.request.Request(
+        f"{agent_core_url}/api/acp/complete",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    urllib.request.urlopen(req, timeout=3, context=ctx)
+```
+
+Call this from your worker thread when the action finishes. `AGENT_CORE_URL` env var is already set in all driver containers (same one used for registration heartbeat).
+
+#### 4. No SSE endpoint needed
+
+Unlike earlier designs, drivers do NOT need to implement an `/sse` endpoint. The completion notification is a simple HTTP POST — fire and forget.
+
+### LLM-Side Usage (handled by Agent Core)
+
+The LLM sees a `sync()` system tool:
+
+```
+sync(action_ids="speak-a7f3c,nav-001", timeout=120)
+→ Blocks until all specified actions complete
+→ Returns {"status": "completed", "results": {...}}
+```
+
+If no `action_ids` specified, waits for ALL pending actions.
+
+Completion notifications also arrive as **steering messages** between tool calls, so the LLM can react to completions without explicitly calling `sync()`.
+
+### Backward Compatibility
+
+- Tools without `x-completion` → unchanged behavior (sync return)
+- Tools that don't return `action_id` → no pending registered, no waiting
+- Drivers that don't POST completion → sync() will timeout gracefully
