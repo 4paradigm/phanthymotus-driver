@@ -3845,6 +3845,10 @@ class VoicePlayActuatorPlugin:
                     "force": {"type": "boolean", "description": "强制播放(停止当前任务立即播放,可选)"},
                 },
                 "required": ["action"],
+                "x-completion": {
+                    "actions": ["play_text", "play_file", "play_url"],
+                    "timeout": 60
+                },
                 "x-action-params": {
                     "play_file": {"params": ["path", "force"], "description": "播放本地音频文件"},
                     "play_url":  {"params": ["url", "force"],  "description": "播放远程URL音频"},
@@ -3934,11 +3938,48 @@ class VoicePlayActuatorPlugin:
 
         try:
             future = client.call_async(req)
-            # play_file/play_url/play_text: fire-and-forget, 不等合成完成
+            # play_file/play_url/play_text: 立即返回 action_id，后台等待完成后回调
             if action in ("play_file", "play_url", "play_text"):
+                import uuid as _uuid
+                action_id = f"voice-{_uuid.uuid4().hex[:8]}"
+                # 后台线程等待 service response 后回调 Agent Core
+                def _wait_and_callback(fut, aid, act):
+                    try:
+                        timeout = 60.0
+                        start = time.time()
+                        while not fut.done() and time.time() - start < timeout:
+                            time.sleep(0.1)
+                        if fut.done():
+                            result = fut.result()
+                            code = int(getattr(result, "code", 0)) if result else -1
+                            status = "completed" if code == 0 else "error"
+                        else:
+                            status = "completed"  # timeout 也视为播完
+                    except Exception:
+                        status = "error"
+                    # ACP callback
+                    try:
+                        import urllib.request as _urllib
+                        import ssl as _ssl
+                        agent_core_url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+                        ctx = _ssl.create_default_context()
+                        ctx.check_hostname = False
+                        ctx.verify_mode = _ssl.CERT_NONE
+                        payload = json.dumps({"action_id": aid, "status": status,
+                                              "result": {"action": act}}).encode()
+                        _req = _urllib.Request(f"{agent_core_url}/api/acp/complete",
+                                              data=payload, headers={"Content-Type": "application/json"},
+                                              method="POST")
+                        _urllib.urlopen(_req, timeout=3, context=ctx)
+                        print(f"[VoicePlay] ACP complete: {aid} ({status})")
+                    except Exception as e:
+                        print(f"[VoicePlay] ACP callback failed: {e}")
+                threading.Thread(target=_wait_and_callback,
+                                 args=(future, action_id, action), daemon=True).start()
                 return {
                     "ok": True, "code": 0,
                     "message": "submitted",
+                    "action_id": action_id,
                     "action": action,
                     "timestamp_ms": int(time.time() * 1000),
                 }
@@ -5167,6 +5208,10 @@ class ChassisRawPlugin:
                                  "description": "持续时间(秒), -1=持续运动 (不填 angle 时生效)"},
                 },
                 "required": ["action"],
+                "x-completion": {
+                    "actions": ["move", "rotate"],
+                    "timeout": 60
+                },
                 "x-action-params": {
                     "move":   {"params": ["direction", "duration"],
                                "description": "前进/后退, 固定速率 0.3 m/s, duration=-1 持续运动"},
@@ -5248,15 +5293,18 @@ class ChassisRawPlugin:
         continuous = (duration < 0)
         self._running = True
         gen = self._gen
+        import uuid as _uuid
+        action_id = f"move-{_uuid.uuid4().hex[:8]}"
         threading.Thread(
-            target=self._move_loop, args=(direction, duration, continuous, gen), daemon=True
+            target=self._move_loop, args=(direction, duration, continuous, gen, action_id), daemon=True
         ).start()
 
         return {"direction": self.DIR_NAMES[direction],
                 "duration": duration, "continuous": continuous,
+                "action_id": action_id,
                 "speed": "0.3 m/s (fixed)" if direction < 2 else "1.0 rad/s (fixed)"}
 
-    def _move_loop(self, direction: int, total_duration: float, continuous: bool, gen: int):
+    def _move_loop(self, direction: int, total_duration: float, continuous: bool, gen: int, action_id: str = ''):
         """运动控制 — 非持续模式发单次精确定时 move_by; 持续模式每 200ms 刷新。"""
         if not continuous:
             # 单次精确运动: move_by duration 单位是毫秒
@@ -5267,6 +5315,9 @@ class ChassisRawPlugin:
             time.sleep(total_duration + 0.3)  # 等运动完成+缓冲
             if self._running and self._gen == gen:
                 self._do_stop()
+            # ACP callback
+            if action_id:
+                self._acp_move_callback(action_id, "completed", total_duration)
             return
 
         # 持续模式: 每 200ms 刷新 300ms 运动指令保持连续
@@ -5280,6 +5331,28 @@ class ChassisRawPlugin:
             time.sleep(step)
         if self._running and self._gen == gen:
             self._do_stop()
+        # ACP callback for continuous mode (stopped by brake)
+        if action_id:
+            self._acp_move_callback(action_id, "completed", -1)
+
+    def _acp_move_callback(self, action_id: str, status: str, duration: float):
+        """POST movement completion to Agent Core."""
+        try:
+            import urllib.request as _urllib
+            import ssl as _ssl
+            agent_core_url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+            ctx = _ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = _ssl.CERT_NONE
+            payload = json.dumps({"action_id": action_id, "status": status,
+                                  "result": {"duration": duration}}).encode()
+            req = _urllib.Request(f"{agent_core_url}/api/acp/complete",
+                                 data=payload, headers={"Content-Type": "application/json"},
+                                 method="POST")
+            _urllib.urlopen(req, timeout=3, context=ctx)
+            print(f"[ChassisRawPlugin] ACP complete: {action_id} ({status})")
+        except Exception as e:
+            print(f"[ChassisRawPlugin] ACP callback failed: {e}")
 
     def _do_stop(self) -> dict:
         self._running = False
