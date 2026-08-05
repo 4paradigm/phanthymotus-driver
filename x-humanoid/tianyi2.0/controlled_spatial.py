@@ -498,6 +498,15 @@ class ControlledSpatialPlugin:
                                     self._nav_active = False
                                     self._nav_lost_count = 0
                                     self._map_status = "localized"
+                                    # ACP callback
+                                    if self._nav_action_id:
+                                        elapsed = time.monotonic() - self._nav_start_time
+                                        self._acp_callback(str(self._nav_action_id), "completed", {
+                                            "pose": self._current_pose,
+                                            "elapsed_s": round(elapsed, 1),
+                                            "action_id_chassis": str(self._nav_action_id),
+                                            "detection": "query_by_id",
+                                        })
                                 elif final_action_state == 4 and final_result in (-1, -2):
                                     # Done + Failed/Aborted
                                     label = "failed" if final_result == -1 else "aborted"
@@ -507,15 +516,30 @@ class ControlledSpatialPlugin:
                                     self._nav_active = False
                                     self._nav_lost_count = 0
                                     self._map_status = "localized"
+                                    # ACP callback
+                                    if self._nav_action_id:
+                                        elapsed = time.monotonic() - self._nav_start_time
+                                        self._acp_callback(str(self._nav_action_id), "error", {
+                                            "error": self._nav_error,
+                                            "result_code": final_result,
+                                            "elapsed_s": round(elapsed, 1),
+                                            "pose": self._current_pose,
+                                            "detection": "query_by_id",
+                                        })
                                 else:
                                     # Action exists but not done yet — shouldn't happen
-                                    # since :current returned 404, but handle gracefully
                                     self._nav_lost_count += 1
                                     if self._nav_lost_count >= 5:
                                         self._nav_error = "Action lost on chassis"
                                         self._nav_arrived.set()
                                         self._nav_active = False
                                         self._nav_lost_count = 0
+                                        # ACP callback
+                                        if self._nav_action_id:
+                                            self._acp_callback(str(self._nav_action_id), "error", {
+                                                "error": "Action lost on chassis (query returned non-done state 5 times)",
+                                                "detection": "lost_count",
+                                            })
                             else:
                                 # Can't query action by ID either — truly lost
                                 self._nav_lost_count += 1
@@ -524,6 +548,12 @@ class ControlledSpatialPlugin:
                                     self._nav_arrived.set()
                                     self._nav_active = False
                                     self._nav_lost_count = 0
+                                    # ACP callback
+                                    if self._nav_action_id:
+                                        self._acp_callback(str(self._nav_action_id), "error", {
+                                            "error": "Action truly lost (can't query by ID)",
+                                            "detection": "truly_lost",
+                                        })
                 else:
                     # HTTP error from chassis — don't count as "action lost"
                     # Could be transient network issue; just skip this poll cycle
