@@ -3694,6 +3694,7 @@ class TtsPlugin:
         self._pending_play: dict[str, threading.Event] = {}  # sid → Event
         self._pending_play_status: dict[str, int] = {}  # sid → event_code
         self._pending_play_duration: dict[str, float] = {}  # sid → total duration (from progress)
+        self._play_event_buffer: dict[str, int] = {}  # 缓存最近的 PlayEvent（防竞态）
 
     def get_tool(self) -> dict:
         return {
@@ -3742,9 +3743,13 @@ class TtsPlugin:
         # event: 0=STARTED, 1=COMPLETED, 2=STOPPED, 3=CANCELLED, 4=FAILED
         sid = msg.sid
         event_code = msg.event
-        if event_code >= 1 and sid in self._pending_play:
-            self._pending_play_status[sid] = event_code
-            self._pending_play[sid].set()
+        if event_code >= 1:
+            # 缓存事件（防止 _wait_cb 还没注册 pending 时 miss）
+            self._play_event_buffer[sid] = event_code
+            # 如果已注册 pending，直接解锁
+            if sid in self._pending_play:
+                self._pending_play_status[sid] = event_code
+                self._pending_play[sid].set()
             print(f"[TtsPlugin] PlayEvent: sid={sid} event={event_code}")
 
     def _on_play_progress(self, msg):
@@ -3808,32 +3813,35 @@ class TtsPlugin:
                 # Phase 2: 等 PlayEvent 通知播放完成
                 status = "completed"
                 if sid:
-                    # 注册 pending，让 _on_play_event callback 能匹配
-                    ev = threading.Event()
-                    self._pending_play[sid] = ev
-                    # 先短等 2s 让 progress topic 报告 duration
-                    import time as _t2
-                    _t2.sleep(2.0)
-                    # 超时 = progress 报告的总时长 + 5s 余量，fallback 用字数/3 + 5
-                    reported_duration = self._pending_play_duration.get(sid)
-                    if reported_duration and reported_duration > 0:
-                        play_timeout = reported_duration + 5.0
+                    # 先检查 buffer：PlayEvent 可能在我们获取 sid 之前就到了
+                    buffered = self._play_event_buffer.pop(sid, None)
+                    if buffered is not None:
+                        # 已经完成了！
+                        status = "completed" if buffered == 1 else "error"
+                        print(f"[TtsPlugin] PlayEvent from buffer: sid={sid} event={buffered}")
                     else:
-                        play_timeout = len(spoken_text) / 3.0 + 5.0
-                    if not ev.wait(timeout=play_timeout):
-                        # 超时：播放可能卡住
-                        status = "error"
-                        print(f"[TtsPlugin] PlayEvent timeout: sid={sid}, waited {play_timeout:.0f}s (duration={reported_duration})")
-                    else:
-                        event_code = self._pending_play_status.get(sid, 1)
-                        if event_code == 1:
-                            status = "completed"
+                        # 注册 pending，等 PlayEvent callback
+                        ev = threading.Event()
+                        self._pending_play[sid] = ev
+                        # 超时 = progress 报告的总时长 + 5s，fallback 字数/3 + 5
+                        import time as _t2
+                        _t2.sleep(0.5)  # 短等让 progress 有机会到达
+                        reported_duration = self._pending_play_duration.get(sid)
+                        if reported_duration and reported_duration > 0:
+                            play_timeout = reported_duration + 5.0
                         else:
+                            play_timeout = len(spoken_text) / 3.0 + 5.0
+                        if not ev.wait(timeout=play_timeout):
                             status = "error"
-                    # 清理
-                    self._pending_play.pop(sid, None)
-                    self._pending_play_status.pop(sid, None)
+                            print(f"[TtsPlugin] PlayEvent timeout: sid={sid}, waited {play_timeout:.0f}s (duration={reported_duration})")
+                        else:
+                            event_code = self._pending_play_status.get(sid, 1)
+                            status = "completed" if event_code == 1 else "error"
+                        # 清理
+                        self._pending_play.pop(sid, None)
+                        self._pending_play_status.pop(sid, None)
                     self._pending_play_duration.pop(sid, None)
+                    self._play_event_buffer.pop(sid, None)
                 elif not sid:
                     # 没拿到 sid，fallback 按字数估算
                     fallback_s = len(spoken_text) / 4.0 + 3.0
