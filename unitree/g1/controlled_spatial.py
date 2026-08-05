@@ -285,6 +285,38 @@ def _bearing_label(dx: float, dy: float) -> str:
         return "behind"
 
 
+# ── ACP Helper ───────────────────────────────────────────────────────────────
+
+def _acp_notify(action_id: str, status: str, result: dict, tool: str = "controlled_spatial"):
+    """POST action completion to Agent Core."""
+    import urllib.request as _urllib
+    import ssl as _ssl
+    import os as _os
+
+    agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+    ctx = _ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = _ssl.CERT_NONE
+    payload = json.dumps({
+        "action_id": action_id,
+        "status": status,
+        "result": result,
+        "tool": tool,
+        "ts": time.time(),
+    }).encode()
+    try:
+        req = _urllib.Request(
+            f"{agent_core_url}/api/acp/complete",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        _urllib.urlopen(req, timeout=5, context=ctx)
+    except Exception as e:
+        import sys
+        print(f"[ACP] callback failed for {action_id}: {e}", file=sys.stderr)
+
+
 # ── Plugin ───────────────────────────────────────────────────────────────────
 
 class ControlledSpatialPlugin:
@@ -371,6 +403,10 @@ class ControlledSpatialPlugin:
                     "stall_timeout": {"type": "number", "description": "Seconds without movement before declaring timeout (default 90)"},
                 },
                 "required": ["action"],
+                "x-completion": {
+                    "actions": ["navigate_to_tag", "navigate_to_pose"],
+                    "timeout": 180,
+                },
                 "x-action-params": {
                     "start_mapping": {"params": ["map_name"], "description": "Start SLAM mapping with given map name"},
                     "stop_mapping": {"params": [], "description": "Stop mapping and save the map"},
@@ -380,9 +416,9 @@ class ControlledSpatialPlugin:
                     "list_maps": {"params": [], "description": "List all saved maps"},
                     "delete_map": {"params": ["map_name"], "description": "Delete a map and its associated data"},
                     "load_map": {"params": ["map_name"], "description": "Load a map (robot must be at map origin)"},
-                    "navigate_to_tag": {"params": ["tag_name", "speed", "mode"], "description": "Navigate to a tagged place (non-blocking). mode: 1=stop-on-obstacle (default), 0=detour. MUST be followed by a separate wait_navigation_done call in the same turn to wait for arrival before proceeding."},
-                    "navigate_to_pose": {"params": ["x", "y", "yaw", "speed", "mode"], "description": "Navigate to coordinates (non-blocking). mode: 1=stop-on-obstacle (default), 0=detour. MUST be followed by a separate wait_navigation_done call in the same turn to wait for arrival before proceeding."},
-                    "wait_navigation_done": {"params": ["stall_timeout"], "description": "Block until the previous navigate_to_tag or navigate_to_pose completes. Returns on arrival, timeout, or error. Always call after navigate_to_tag/navigate_to_pose."},
+                    "navigate_to_tag": {"params": ["tag_name", "speed", "mode"], "description": "Navigate to a tagged place. System automatically waits for arrival via ACP barrier."},
+                    "navigate_to_pose": {"params": ["x", "y", "yaw", "speed", "mode"], "description": "Navigate to coordinates. System automatically waits for arrival via ACP barrier."},
+                    "wait_navigation_done": {"params": ["stall_timeout"], "description": "Manually block until navigation completes. Usually unnecessary — ACP barrier handles this automatically."},
                     "pause_nav": {"params": [], "description": "Pause navigation"},
                     "resume_nav": {"params": [], "description": "Resume navigation"},
                     "stop_nav": {"params": [], "description": "Stop and cancel navigation"},
@@ -464,6 +500,65 @@ class ControlledSpatialPlugin:
                 self._last_db_map_status = map_status
         except Exception as e:
             print(f"[ControlledSpatial] failed to update map view state: {e}", flush=True)
+
+    # ── ACP completion thread ────────────────────────────────────────────────
+
+    def _acp_wait_nav(self, action_id: str, target: str, stall_timeout: float = 90):
+        """Wait for navigation to complete, then fire ACP callback."""
+        t0 = time.time()
+        last_pose = self._get_pose()
+        last_move_time = time.time()
+
+        while True:
+            # Check DDS-driven arrival event
+            if self._nav_arrived.wait(timeout=1.0):
+                elapsed = round(time.time() - t0, 1)
+                if self._nav_error:
+                    error = self._nav_error
+                    self._nav_error = None
+                    _acp_notify(action_id, "error", {
+                        "target": target, "error": error, "elapsed": elapsed,
+                    })
+                else:
+                    pose = self._get_pose()
+                    _acp_notify(action_id, "completed", {
+                        "target": target, "pose": pose, "elapsed": elapsed,
+                    })
+                return
+
+            # Stall detection
+            current_pose = self._get_pose()
+            if current_pose and last_pose:
+                dx = current_pose["x"] - last_pose["x"]
+                dy = current_pose["y"] - last_pose["y"]
+                moved = math.sqrt(dx * dx + dy * dy)
+                if moved > 0.05:
+                    last_pose = current_pose
+                    last_move_time = time.time()
+            elif current_pose:
+                last_pose = current_pose
+                last_move_time = time.time()
+
+            if time.time() - last_move_time > stall_timeout:
+                # Pause nav to stop the robot
+                if self._smart_motion:
+                    self._smart_motion.pause_nav()
+                elif self._client:
+                    self._client.PauseNav()
+                _acp_notify(action_id, "error", {
+                    "target": target,
+                    "error": f"stall_timeout ({stall_timeout}s)",
+                    "elapsed": round(time.time() - t0, 1),
+                })
+                return
+
+            # Hard timeout
+            if time.time() - t0 > 180:
+                _acp_notify(action_id, "error", {
+                    "target": target, "error": "timeout_180s",
+                    "elapsed": 180,
+                })
+                return
 
     # ── Dispatch ─────────────────────────────────────────────────────────────
 
@@ -634,14 +729,22 @@ class ControlledSpatialPlugin:
                 mode = int(args.get("mode", 1))
                 if mode != 1:
                     mode = 1  # 强制停障模式，不允许绕障
-                # Non-blocking: sends NavigateTo RPC and returns immediately.
-                # LLM agent must call wait_navigation_done to wait for arrival.
                 self._nav_arrived.clear()
                 self._nav_error = None
-                return self._smart_motion.navigate_to(poi["x"], poi["y"], yaw, tag_name,
-                                                      speed=speed, mode=mode)
+                result = self._smart_motion.navigate_to(poi["x"], poi["y"], yaw, tag_name,
+                                                     speed=speed, mode=mode)
+                # ACP: spawn completion thread
+                from uuid import uuid4
+                action_id = f"g1_nav_{uuid4().hex[:8]}"
+                result["action_id"] = action_id
+                threading.Thread(
+                    target=self._acp_wait_nav,
+                    args=(action_id, tag_name, float(args.get("stall_timeout", 90))),
+                    daemon=True,
+                ).start()
+                return result
 
-            # Fallback: direct SLAM navigation (non-blocking, needs wait_navigation_done)
+            # Fallback: direct SLAM navigation
             q_z = math.sin(yaw / 2)
             q_w = math.cos(yaw / 2)
             speed = max(0.2, min(0.8, float(args.get("speed", 0.5))))
@@ -652,7 +755,16 @@ class ControlledSpatialPlugin:
             self._nav_error = None
             code, resp = self._client.NavigateTo(poi["x"], poi["y"], 0, 0, 0, q_z, q_w, speed=speed, mode=mode)
             if code == 0:
-                return {"status": "navigating", "target": tag_name, "pose": {"x": poi["x"], "y": poi["y"], "yaw": yaw}}
+                from uuid import uuid4
+                action_id = f"g1_nav_{uuid4().hex[:8]}"
+                threading.Thread(
+                    target=self._acp_wait_nav,
+                    args=(action_id, tag_name, float(args.get("stall_timeout", 90))),
+                    daemon=True,
+                ).start()
+                return {"status": "navigating", "target": tag_name,
+                        "pose": {"x": poi["x"], "y": poi["y"], "yaw": yaw},
+                        "action_id": action_id}
             return _rpc_error("NavigateTo", code, resp)
 
         elif action == "navigate_to_pose":
@@ -667,7 +779,16 @@ class ControlledSpatialPlugin:
                     mode = 1  # 强制停障模式，不允许绕障
                 self._nav_arrived.clear()
                 self._nav_error = None
-                return self._smart_motion.navigate_to(x, y, yaw, speed=speed, mode=mode)
+                result = self._smart_motion.navigate_to(x, y, yaw, speed=speed, mode=mode)
+                from uuid import uuid4
+                action_id = f"g1_nav_{uuid4().hex[:8]}"
+                result["action_id"] = action_id
+                threading.Thread(
+                    target=self._acp_wait_nav,
+                    args=(action_id, f"pose({x},{y})", float(args.get("stall_timeout", 90))),
+                    daemon=True,
+                ).start()
+                return result
 
             q_z = math.sin(yaw / 2)
             q_w = math.cos(yaw / 2)
@@ -677,7 +798,15 @@ class ControlledSpatialPlugin:
             self._nav_error = None
             code, resp = self._client.NavigateTo(x, y, 0, 0, 0, q_z, q_w, speed=speed, mode=mode)
             if code == 0:
-                return {"status": "navigating", "target_pose": {"x": x, "y": y, "yaw": yaw}}
+                from uuid import uuid4
+                action_id = f"g1_nav_{uuid4().hex[:8]}"
+                threading.Thread(
+                    target=self._acp_wait_nav,
+                    args=(action_id, f"pose({x},{y})", float(args.get("stall_timeout", 90))),
+                    daemon=True,
+                ).start()
+                return {"status": "navigating", "target_pose": {"x": x, "y": y, "yaw": yaw},
+                        "action_id": action_id}
             return _rpc_error("NavigateTo", code, resp)
 
         elif action == "wait_navigation_done":
