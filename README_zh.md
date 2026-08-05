@@ -60,6 +60,19 @@ python main.py
 4. 工具对 LLM Agent 可用，并显示在 Web Dashboard 中
 5. LLM Agent 通过 MCP `tools/call` 调用工具
 
+### G1 受控导航速度执行
+
+G1 `loco` actuator 接收由导航 lease 约束的
+`phanthy.navigation.velocity_proposal.v1` 输入。有效 proposal 通过容量为 1
+的 latest-only 队列执行：已等待的旧速度会被新速度合并替换，不会积压。
+proposal TTL 失效会立即触发 `StopMove`；只有在返回后用新的 odometry
+样本确认零速，同一导航 lease 才能保留并接受下一条新鲜 proposal。安全、
+身份、序列、RPC 和停车确认类硬故障仍会解除武装。
+
+`loco info` 会返回 proposal 计数、合并数、实测 RPC/队列时延、滚动
+RPC p50/p95/p99/max、逐原因拒绝统计及最近一次已确认停车。
+`last_set_velocity_duration_ms` 表示实测 RPC 耗时，不是 proposal TTL 余量。
+
 ## 开发新驱动
 
 想要为新硬件添加驱动？请参阅 **[驱动开发指南](README_dev.md)** 获取完整规范，包括：

@@ -222,15 +222,21 @@ class ProposalGateTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.gate.bind(EXPECTED_TOPIC, "nav-001")
 
-    def test_watchdog_uses_local_monotonic_deadline(self):
+    def test_watchdog_requests_stop_without_retiring_trusted_lease(self):
         accepted = self.gate.accept(proposal(ttl_ms=200), now=50.0)
         self.assertAlmostEqual(accepted.duration, 0.2)
         self.assertFalse(self.gate.watchdog(now=50.199).stop)
         expired = self.gate.watchdog(now=50.201)
         self.assertTrue(expired.stop)
         self.assertEqual(expired.reason, "proposal_ttl_expired")
-        self.assertFalse(self.gate.armed)
-        self.assertFalse(self.gate.accept(proposal(sequence=2), now=50.202).execute)
+        self.assertTrue(self.gate.armed)
+        self.assertFalse(self.gate.recoverable_stop_active)
+
+        self.gate.hold_after_confirmed_stop("proposal_ttl_expired")
+        recovered = self.gate.accept(proposal(sequence=2), now=50.202)
+        self.assertTrue(recovered.execute)
+        self.assertTrue(self.gate.armed)
+        self.assertFalse(self.gate.recoverable_stop_active)
 
     def test_end_to_end_ttl_rejects_proposal_already_expired_at_driver(self):
         rejected = self.gate.accept(
@@ -241,8 +247,18 @@ class ProposalGateTest(unittest.TestCase):
 
         self.assertTrue(rejected.stop)
         self.assertEqual(rejected.reason, "proposal_ttl_expired")
-        self.assertFalse(self.gate.armed)
+        self.assertTrue(self.gate.armed)
+        self.assertFalse(self.gate.recoverable_stop_active)
         self.assertEqual(self.gate.last_reason, "proposal_ttl_expired")
+
+        self.gate.hold_after_confirmed_stop("proposal_ttl_expired")
+        self.assertEqual(
+            self.gate.last_reason,
+            "proposal_ttl_stop_recoverable",
+        )
+        self.assertTrue(
+            self.gate.accept(proposal(sequence=2), now=50.1).execute
+        )
 
     def test_confirmed_obstacle_stop_keeps_lease_for_fresh_escape_command(self):
         self.assertTrue(self.gate.accept(proposal(sequence=1), now=50.0).execute)
@@ -276,6 +292,29 @@ class ProposalGateTest(unittest.TestCase):
         self.assertTrue(escape.execute)
         self.assertTrue(self.gate.armed)
         self.assertFalse(self.gate.recoverable_stop_active)
+
+    def test_stale_samples_drain_during_confirmed_ttl_hold(self):
+        self.assertTrue(self.gate.accept(proposal(sequence=1), now=50.0).execute)
+        self.gate.watchdog(now=50.3)
+        self.gate.hold_after_confirmed_stop("proposal_ttl_expired")
+
+        stale = self.gate.accept(
+            proposal(sequence=2, issued_at_unix_ms=1_000, ttl_ms=200),
+            now=50.4,
+            now_unix_ms=1_201,
+        )
+
+        self.assertTrue(stale.stop)
+        self.assertEqual(stale.reason, "proposal_ttl_expired")
+        self.assertTrue(self.gate.armed)
+        self.assertTrue(self.gate.recoverable_stop_active)
+        self.assertEqual(
+            self.gate.last_reason,
+            "proposal_ttl_stop_recoverable",
+        )
+        self.assertTrue(
+            self.gate.accept(proposal(sequence=3), now=50.5).execute
+        )
 
     def test_hard_fault_still_disarms_from_recoverable_obstacle_stop(self):
         self.assertTrue(self.gate.accept(proposal(sequence=1), now=10.0).execute)
