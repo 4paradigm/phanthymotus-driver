@@ -1,6 +1,6 @@
-unitree-g1:
+tianyi2:
   image: __IMAGE__
-  container_name: embodied-unitree-g1
+  container_name: embodied-x-humanoid-tianyi2.0
   network_mode: host
   ipc: host
   pid: host
@@ -8,10 +8,9 @@ unitree-g1:
   volumes:
     - /dev:/dev
     - /opt/phanthy-motus/data:/opt/phanthy-motus/data
+    - /home/nvidia/data/param/dds_profile.xml:/work/dds_profile.xml:ro
   environment:
-    - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-    - FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
     - PYTHONUNBUFFERED=1
   logging:
     driver: local

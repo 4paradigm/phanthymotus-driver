@@ -22,8 +22,10 @@ import os
 import re
 import signal
 import socket
+import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -42,6 +44,100 @@ def _load_config() -> dict:
         return yaml.safe_load(f)
 
 
+def _ensure_lyre_audio_mode():
+    """Switch host lyre service to audio mode (ASR + TTS, no dialogue) if not already."""
+    _nsenter = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--"]
+    target = "audio"
+    try:
+        result = subprocess.run(
+            _nsenter + ["cat", "/home/nvidia/data/param/lyre_launch_mode"],
+            capture_output=True, text=True, timeout=5)
+        current = result.stdout.strip()
+        if current == target:
+            print(f"[lyre] already in {target} mode")
+            return
+        subprocess.run(
+            _nsenter + ["bash", "-c", f"echo {target} > /home/nvidia/data/param/lyre_launch_mode"],
+            check=True, timeout=5)
+        subprocess.run(
+            _nsenter + ["systemctl", "restart", "lyre"],
+            check=True, timeout=15)
+        print(f"[lyre] switched from {current!r} to {target} mode, restarted")
+        time.sleep(3)
+    except Exception as e:
+        print(f"[lyre] WARNING: could not switch to {target} mode: {e}")
+
+
+def _ensure_audio_sender(cfg: dict):
+    """Ensure audio_sender.py TCP server is running on remote hosts for network mic sources."""
+    ext_mic_cfg = cfg.get("plugins", {}).get("ext_mic", {})
+    if not ext_mic_cfg.get("enabled", False):
+        return
+    sources = ext_mic_cfg.get("network_sources", [])
+
+    for src in sources:
+        url = src.get("url", "")
+        if not url.startswith("tcp://"):
+            continue
+        ssh_host = src.get("ssh_host")
+        if not ssh_host:
+            continue
+
+        ssh_user = src.get("ssh_user", "ubuntu")
+        ssh_pass = src.get("ssh_password", "")
+        card = src.get("card", 1)
+        sender_path = src.get("sender_path", "/home/ubuntu/audio_sender.py")
+        port = url.rsplit(":", 1)[-1].split("/")[0] if ":" in url else "9800"
+        name = src.get("name", ssh_host)
+
+        def _ssh(cmd: str, timeout: int = 10) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                ["sshpass", "-p", ssh_pass, "ssh",
+                 "-o", "StrictHostKeyChecking=no", "-o", f"ConnectTimeout=3",
+                 f"{ssh_user}@{ssh_host}", cmd],
+                capture_output=True, text=True, timeout=timeout)
+
+        # Check if already running
+        try:
+            result = _ssh("pgrep -f audio_sender.py")
+            if result.returncode == 0 and result.stdout.strip():
+                pid = result.stdout.strip().splitlines()[0]
+                print(f"[audio_sender] {name}: already running on {ssh_host} (pid={pid})")
+                continue
+        except Exception as e:
+            print(f"[audio_sender] {name}: WARNING: SSH check failed: {e}")
+            continue
+
+        # Deploy audio_sender.py if not present
+        try:
+            result = _ssh(f"test -f {sender_path} && echo EXISTS")
+            if "EXISTS" not in (result.stdout or ""):
+                local_src = str(Path(__file__).parent / "audio_sender.py")
+                subprocess.run(
+                    ["sshpass", "-p", ssh_pass, "scp",
+                     "-o", "StrictHostKeyChecking=no",
+                     local_src, f"{ssh_user}@{ssh_host}:{sender_path}"],
+                    check=True, timeout=15)
+                print(f"[audio_sender] {name}: deployed to {ssh_host}:{sender_path}")
+        except Exception as e:
+            print(f"[audio_sender] {name}: WARNING: deploy failed: {e}")
+            continue
+
+        # Start in background
+        try:
+            _ssh(f"nohup python3 {sender_path} --port {port} --card {card} "
+                 f"> /tmp/audio_sender.log 2>&1 &")
+            time.sleep(1)
+            result = _ssh("pgrep -f audio_sender.py")
+            if result.returncode == 0 and result.stdout.strip():
+                pid = result.stdout.strip().splitlines()[0]
+                print(f"[audio_sender] {name}: started on {ssh_host} (pid={pid}, port={port}, card={card})")
+            else:
+                print(f"[audio_sender] {name}: WARNING: did not start, check {ssh_host}:/tmp/audio_sender.log")
+        except Exception as e:
+            print(f"[audio_sender] {name}: WARNING: start failed: {e}")
+
+
 def _resolve_namespace(cfg: dict) -> str:
     ns = cfg.get("ros_namespace", "").strip()
     if ns:
@@ -56,11 +152,17 @@ class DualDomainROS2:
 
     def __init__(self):
         # Domain 0: connect to tianyi body controller
+        # Use lyre's DDS profile so we can discover topics on 192.168.41.x / 127.0.0.1
+        dds_profile = "/work/dds_profile.xml"
+        if os.path.exists(dds_profile):
+            os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = dds_profile
+            print(f"[ros2] domain0: using DDS profile {dds_profile}")
         self.ctx_tianyi = Context()
         rclpy.init(context=self.ctx_tianyi, domain_id=0)
         self.executor_tianyi = rclpy.executors.MultiThreadedExecutor(context=self.ctx_tianyi)
 
-        # Domain 42: publish to agent-core
+        # Domain 42: publish to agent-core (no DDS profile — use all interfaces)
+        os.environ.pop("FASTRTPS_DEFAULT_PROFILES_FILE", None)
         self.ctx_core = Context()
         rclpy.init(context=self.ctx_core, domain_id=42)
         self.executor_core = rclpy.executors.MultiThreadedExecutor(context=self.ctx_core)
@@ -94,6 +196,7 @@ class DualDomainROS2:
 
 class TianyiDeviceBundle:
     def __init__(self, cfg: dict, namespace: str, ros2: DualDomainROS2, slamtec_client):
+        self._cfg = cfg
         self._plugins: list = []
         plugins_cfg = cfg.get("plugins", {})
 
@@ -127,15 +230,47 @@ class TianyiDeviceBundle:
             self._plugins.append(NavStatePlugin(plugins_cfg["nav_state"], namespace, ros2, slamtec_client))
             print("[bundle] NavStatePlugin loaded")
 
+        if plugins_cfg.get("power_board", {}).get("enabled", False):
+            from device import PowerBoardStatePlugin
+            self._plugins.append(PowerBoardStatePlugin(plugins_cfg["power_board"], namespace, ros2))
+            print("[bundle] PowerBoardStatePlugin loaded")
+
+        if plugins_cfg.get("motors", {}).get("enabled", False):
+            from device import MotorStatePlugin
+            self._plugins.append(MotorStatePlugin(plugins_cfg["motors"], namespace, ros2))
+            print("[bundle] MotorStatePlugin loaded")
+
+        if plugins_cfg.get("hand_state", {}).get("enabled", False):
+            from device import HandStatePlugin
+            self._plugins.append(HandStatePlugin(plugins_cfg["hand_state"], namespace, ros2))
+            print("[bundle] HandStatePlugin loaded")
+
+        if plugins_cfg.get("remote_event", {}).get("enabled", False):
+            from device import RemoteStatePlugin
+            self._plugins.append(RemoteStatePlugin(plugins_cfg["remote_event"], namespace, ros2))
+            print("[bundle] RemoteStatePlugin loaded")
+
         if plugins_cfg.get("head", {}).get("enabled", False):
             from device import HeadPlugin
             self._plugins.append(HeadPlugin(plugins_cfg["head"], namespace, ros2))
             print("[bundle] HeadPlugin loaded")
 
+        if plugins_cfg.get("head_gesture", {}).get("enabled", False):
+            from device import HeadGesturePlugin
+            self._plugins.append(HeadGesturePlugin(
+                plugins_cfg["head_gesture"], namespace, ros2))
+            print("[bundle] HeadGesturePlugin loaded")
+
         if plugins_cfg.get("arm", {}).get("enabled", False):
             from device import ArmPlugin
             self._plugins.append(ArmPlugin(plugins_cfg["arm"], namespace, ros2))
             print("[bundle] ArmPlugin loaded")
+
+        if plugins_cfg.get("arm_gesture", {}).get("enabled", False):
+            from device import ArmGesturePlugin
+            self._plugins.append(ArmGesturePlugin(
+                plugins_cfg["arm_gesture"], namespace, ros2))
+            print("[bundle] ArmGesturePlugin loaded")
 
         if plugins_cfg.get("waist", {}).get("enabled", False):
             from device import WaistPlugin
@@ -152,6 +287,11 @@ class TianyiDeviceBundle:
             self._plugins.append(TtsPlugin(plugins_cfg["tts"], namespace, ros2))
             print("[bundle] TtsPlugin loaded")
 
+        if plugins_cfg.get("voice_play", {}).get("enabled", False):
+            from device import VoicePlayActuatorPlugin
+            self._plugins.append(VoicePlayActuatorPlugin(plugins_cfg["voice_play"], namespace, ros2))
+            print("[bundle] VoicePlayActuatorPlugin loaded")
+
         if plugins_cfg.get("nav", {}).get("enabled", False):
             from device import NavPlugin
             self._plugins.append(NavPlugin(plugins_cfg["nav"], namespace, ros2, slamtec_client))
@@ -162,8 +302,37 @@ class TianyiDeviceBundle:
             self._plugins.append(ChatPlugin(plugins_cfg["chat"], namespace, ros2))
             print("[bundle] ChatPlugin loaded")
 
+        if plugins_cfg.get("voice_chat", {}).get("enabled", False):
+            from device import VoiceChatActuatorPlugin
+            self._plugins.append(VoiceChatActuatorPlugin(plugins_cfg["voice_chat"], namespace, ros2))
+            print("[bundle] VoiceChatActuatorPlugin loaded")
+        if plugins_cfg.get("controlled_spatial", {}).get("enabled", False):
+            from controlled_spatial import ControlledSpatialPlugin
+            self._plugins.append(ControlledSpatialPlugin(plugins_cfg["controlled_spatial"], namespace, ros2, slamtec_client))
+            print("[bundle] ControlledSpatialPlugin loaded")
+
+        if plugins_cfg.get("robot_faults", {}).get("enabled", False):
+            from device import RobotFaultsPlugin
+            self._plugins.append(RobotFaultsPlugin(plugins_cfg["robot_faults"], namespace, ros2, slamtec_client))
+            print("[bundle] RobotFaultsPlugin loaded")
+
+        if plugins_cfg.get("laser_scan", {}).get("enabled", False):
+            from device import LaserScanPlugin
+            self._plugins.append(LaserScanPlugin(plugins_cfg["laser_scan"], namespace, ros2, slamtec_client))
+            print("[bundle] LaserScanPlugin loaded")
+
+        if plugins_cfg.get("chassis_raw", {}).get("enabled", False):
+            from device import ChassisRawPlugin
+            self._plugins.append(ChassisRawPlugin(plugins_cfg["chassis_raw"], namespace, ros2, slamtec_client))
+            print("[bundle] ChassisRawPlugin loaded")
+
+        if plugins_cfg.get("ext_mic", {}).get("enabled", False):
+            from ext_devices import ExtMicPlugin
+            self._plugins.append(ExtMicPlugin(plugins_cfg["ext_mic"], namespace, ros2.executor_core))
+            print("[bundle] ExtMicPlugin loaded")
+
         if plugins_cfg.get("light", {}).get("enabled", False):
-            from device import LightPlugin
+            from light import LightPlugin
             self._plugins.append(LightPlugin(plugins_cfg["light"], namespace, ros2))
             print("[bundle] LightPlugin loaded")
 
@@ -201,7 +370,8 @@ class TianyiDeviceBundle:
                 if tool_def["name"] == tool_name:
                     if tool_def["type"] == "resource":
                         return p.dispatch(tool_name, args)
-                    action = args.pop("action", tool_name)
+                    default_action = tool_def.get("default_action", "start")
+                    action = args.pop("action", default_action)
                     args['_tool_name'] = tool_name
                     result = p.dispatch(action, args)
                     return result
@@ -274,7 +444,7 @@ def make_handler():
                     ok({
                         "protocolVersion": "2024-11-05",
                         "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "tianyi2-device-bundle", "version": "1.0.0"},
+                        "serverInfo": {"name": _bundle._cfg.get("name", "tianyi2-device-bundle"), "version": "1.0.0"},
                     })
                 elif method == "tools/list":
                     ok({"tools": _bundle.get_all_tools()})
@@ -285,7 +455,17 @@ def make_handler():
                     if result is None:
                         err(-32601, f"Unknown tool: {name}")
                     else:
-                        ok({"content": [{"type": "text", "text": json.dumps(result)}]})
+                        tool_result = {
+                            "content": [{
+                                "type": "text",
+                                "text": json.dumps(result, ensure_ascii=False),
+                            }],
+                        }
+                        if (isinstance(result, dict)
+                                and (result.get("state") == "error"
+                                     or "error" in result)):
+                            tool_result["isError"] = True
+                        ok(tool_result)
                 else:
                     err(-32601, f"Method not found: {method}")
             except Exception as e:
@@ -344,6 +524,12 @@ def main():
     from nav_client import SlamtecClient
     slamtec_client = SlamtecClient(slamtec_url)
     print(f"[bundle] Slamtec client → {slamtec_url}")
+
+    # Ensure host lyre service is in audio mode (ASR + TTS, no built-in dialogue)
+    _ensure_lyre_audio_mode()
+
+    # Ensure TCP audio sender is running on host for DJI wireless mic
+    _ensure_audio_sender(cfg)
 
     # Dual-domain ROS2
     ros2 = DualDomainROS2()

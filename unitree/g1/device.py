@@ -22,6 +22,7 @@ import json
 import queue
 import socket
 import struct
+import subprocess
 import threading
 import time
 
@@ -82,6 +83,8 @@ class _MicNode(Node):
         self._sock:   socket.socket | None = None
         self._thread: threading.Thread | None = None
         self.state   = "idle"
+        self._packet_count = 0
+        self._last_packet_ts = 0.0
         self.get_logger().info(f"MicNode ready — topic: {topic}")
 
     def start_capture(self) -> str:
@@ -99,7 +102,7 @@ class _MicNode(Node):
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
         sock.settimeout(0.5)
         self._sock   = sock
-        self.state   = "running"
+        self._packet_count = 0
         self._thread = threading.Thread(target=self._pump, daemon=True)
         self._thread.start()
         self.get_logger().info(f"Capture started — multicast {MIC_GROUP_IP}:{MIC_PORT}")
@@ -124,6 +127,8 @@ class _MicNode(Node):
                 continue
             except OSError:
                 break
+            self._packet_count += 1
+            self._last_packet_ts = time.monotonic()
             buf.extend(data)
             while len(buf) >= CHUNK_BYTES:
                 chunk = bytes(buf[:CHUNK_BYTES])
@@ -159,19 +164,80 @@ class MicPlugin:
         }
 
     def start(self) -> None:
-        self._node.start_capture()
+        self._node.start_capture()  # start capture early but no self-check here
 
     def stop(self) -> None:
         self._node.stop_capture()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
-            return {"state": "running"}
+            # Start capture if not already running
+            self._node.start_capture()
+            # Self-check: verify full pipeline (multicast → ROS2 publish → subscribable)
+            state, message = self._self_check()
+            return {"state": state, "message": message} if message else {"state": state}
         if action == "stop":
             return {"state": "idle"}
         if action == "info":
-            return {"state": "running", "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}]}
+            last_ago = int((time.monotonic() - self._node._last_packet_ts) * 1000) if self._node._last_packet_ts > 0 else -1
+            return {
+                "state": self._node.state,
+                "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}],
+                "packets": self._node._packet_count,
+                "last_packet_ago_ms": last_ago,
+            }
         return None
+
+    def _self_check(self) -> tuple[str, str]:
+        """Verify mic pipeline: multicast receiving + ROS2 topic subscribable.
+
+        Check 1: multicast packets arriving (in-process).
+        Check 2: ROS2 topic receivable from a subprocess (avoids same-process
+                 FastDDS intra-participant matching issues).
+        """
+        import time as _t
+
+        # Check 1: multicast receiving
+        if self._node._packet_count == 0:
+            deadline = _t.monotonic() + 3.0
+            while _t.monotonic() < deadline and self._node._packet_count == 0:
+                _t.sleep(0.1)
+        if self._node._packet_count == 0:
+            self._node.state = "error"
+            return "error", "no multicast packets received in 3s"
+
+        # Check 2: ROS2 topic receivable — use subprocess to avoid same-process DDS issues
+        check_script = (
+            "import sys, rclpy, time;"
+            "from rclpy.node import Node;"
+            "from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy;"
+            "from audio_msgs.msg import AudioChunk;"
+            "rclpy.init();"
+            "n = Node('_mic_check');"
+            "qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,"
+            "history=HistoryPolicy.KEEP_LAST, depth=10, durability=DurabilityPolicy.VOLATILE);"
+            "ok = [False];"
+            "n.create_subscription(AudioChunk, sys.argv[1], lambda m: ok.__setitem__(0, True), qos);"
+            "dl = time.monotonic() + 3.0;"
+            "\nwhile time.monotonic() < dl and not ok[0]: rclpy.spin_once(n, timeout_sec=0.1)\n"
+            "rclpy.shutdown();"
+            "sys.exit(0 if ok[0] else 1)"
+        )
+        try:
+            result = subprocess.run(
+                ["python3", "-c", check_script, self._topic],
+                timeout=5,
+                capture_output=True,
+            )
+            if result.returncode != 0:
+                self._node.state = "error"
+                return "error", "topic published but not receivable via ROS2"
+        except (subprocess.TimeoutExpired, Exception) as e:
+            self._node.state = "error"
+            return "error", f"ROS2 subscribe check failed: {e}"
+
+        self._node.state = "running"
+        return "running", ""
 
 
 # ── NativeTtsPlugin (actuator) ───────────────────────────────────────────────
@@ -241,7 +307,7 @@ APP_NAME = "g1_speaker"
 
 
 class _SpeakerNode(Node):
-    PREFILL = 5       # buffer 5 chunks (~160ms) before starting playback
+    PREFILL = 3       # buffer 3 chunks (~300ms) before starting playback
     MERGE_BYTES = 9600  # merge into ~300ms blocks before calling PlayStream
 
     def __init__(self, audio_client: AudioClient):
@@ -256,6 +322,14 @@ class _SpeakerNode(Node):
         self._drain_thread: threading.Thread | None = None
         self._last_chunk_time = 0.0
         self._flush_timer = None
+        # 打断/暂停控制
+        self._lock = threading.Lock()
+        self._interrupt_flag = threading.Event()
+        self._pause_event = threading.Event()
+        self._pause_event.set()  # 初始为非暂停状态
+        self._muted = False  # interrupt 后静默，丢弃后续 chunks 直到新 utterance
+        # Clear stale PlayStream session from previous container run (MCU keeps state across reboot)
+        self._client.PlayStop(APP_NAME)
         self.get_logger().info("SpeakerNode ready")
 
     def start_play(self, topic: str) -> str:
@@ -267,11 +341,12 @@ class _SpeakerNode(Node):
             self.get_logger().info(f"[speaker] topic changed {self._topic} → {topic}, re-subscribing")
             self.stop_play()
         self._topic = topic
+        self._muted = False  # 新 start 时清除静默
         self.get_logger().info(f"[speaker] creating subscription: topic={topic}, msg_type=AudioChunk, qos=LOW_LAT")
         self._sub = self.create_subscription(
             AudioChunk, topic, self._on_chunk, _LOW_LAT_QOS,
         )
-        self.state = "playing"
+        self.state = "ready"
         self.get_logger().info(f"[speaker] subscription created, waiting for chunks on {topic}")
         return topic
 
@@ -284,9 +359,12 @@ class _SpeakerNode(Node):
             self.destroy_subscription(self._sub)
             self._sub = None
         self._draining.clear()
+        self._pause_event.set()  # 确保 drain thread 不会卡在 pause wait
+        self._interrupt_flag.set()  # 确保 drain thread 退出
         if self._drain_thread is not None:
             self._drain_thread.join(timeout=2)
             self._drain_thread = None
+        self._interrupt_flag.clear()
         # flush remaining buffer
         while not self._buf.empty():
             try:
@@ -300,17 +378,89 @@ class _SpeakerNode(Node):
         self.state = "idle"
         self.get_logger().info("Speaker stopped")
 
+    def interrupt(self) -> dict:
+        """立即中止播放：清空 buffer，停止 SDK，保持 subscription。"""
+        with self._lock:
+            self._interrupt_flag.set()
+            # 清空 buffer
+            while not self._buf.empty():
+                try:
+                    self._buf.get_nowait()
+                except queue.Empty:
+                    break
+            # 停止 SDK 播放
+            try:
+                self._client.PlayStop(APP_NAME)
+            except Exception as e:
+                self.get_logger().warn(f"[speaker] interrupt PlayStop error: {e}")
+            # 等 drain thread 退出
+            if self._drain_thread is not None and self._drain_thread.is_alive():
+                self._drain_thread.join(timeout=1)
+                self._drain_thread = None
+            self._interrupt_flag.clear()
+            self._pause_event.set()
+            self._draining.clear()
+            self._muted = True  # 静默：丢弃后续 TTS chunks 直到新 utterance
+            self.state = "ready"
+        self.get_logger().info("[speaker] interrupted — buffer cleared, muted until new utterance")
+        return {"state": "ready", "action": "interrupted"}
+
+    def pause(self) -> dict:
+        """暂停播放：停止 SDK，保留 buffer 中未播放的内容。"""
+        with self._lock:
+            if self.state not in ("playing", "ready"):
+                return {"state": self.state, "error": "not playing"}
+            self._pause_event.clear()  # drain thread 将阻塞在 wait()
+            try:
+                self._client.PlayStop(APP_NAME)
+            except Exception as e:
+                self.get_logger().warn(f"[speaker] pause PlayStop error: {e}")
+            self.state = "paused"
+        self.get_logger().info(f"[speaker] paused — buffer size={self._buf.qsize()}")
+        return {"state": "paused", "buffer_chunks": self._buf.qsize()}
+
+    def resume(self) -> dict:
+        """恢复播放：从 buffer 中剩余内容继续。"""
+        with self._lock:
+            if self.state != "paused":
+                return {"state": self.state, "error": "not paused"}
+            self.state = "playing"
+            self._pause_event.set()  # 唤醒 drain thread
+            # 如果 drain thread 已经退出了（pause 时退出），重新启动
+            if self._drain_thread is None or not self._drain_thread.is_alive():
+                if not self._buf.empty():
+                    self._start_drain()
+        self.get_logger().info("[speaker] resumed")
+        return {"state": "playing"}
+
+    # EOF magic: 8 bytes (4 samples [1,-1,1,-1])，标记 utterance 结束
+    AUDIO_EOF_MAGIC = b'\x01\x00\xff\xff\x01\x00\xff\xff'
+
     def _on_chunk(self, msg: AudioChunk) -> None:
         pcm = bytes(msg.data)
+        now = time.monotonic()
         self._idx += 1
-        self.get_logger().info(
-            f"[speaker] chunk #{self._idx}: {len(pcm)} bytes, format={msg.format}"
-        )
+
+        # 检测 EOF magic：utterance 结束标记
+        if len(pcm) == 8 and pcm == self.AUDIO_EOF_MAGIC:
+            if self._muted:
+                self._muted = False
+                self.get_logger().info("[speaker] unmuted — received EOF marker")
+            return  # EOF 不入 buffer、不播放
+
+        # Muted 状态：interrupt 后丢弃来自旧 utterance 的 chunks
+        if self._muted:
+            self._last_chunk_time = now
+            return  # 丢弃，等 EOF 到达
+
         self._buf.put(pcm)
-        self._last_chunk_time = time.monotonic()
-        if not self._draining.is_set() and self._buf.qsize() >= self.PREFILL:
+        self._last_chunk_time = now
+        # 更新状态：收到 chunk 时如果是 ready，变为 playing
+        if self.state == "ready":
+            self.state = "playing"
+        if not self._draining.is_set() and self.state == "playing" and self._buf.qsize() >= self.PREFILL:
             self._start_drain()
-        elif not self._draining.is_set() and self._flush_timer is None:
+        elif not self._draining.is_set() and self.state == "playing" and self._flush_timer is None:
             # start a flush timer — if no more chunks arrive, drain what we have
             self._flush_timer = self.create_timer(0.2, self._check_flush)
 
@@ -329,18 +479,23 @@ class _SpeakerNode(Node):
             self._flush_timer.cancel()
             self.destroy_timer(self._flush_timer)
             self._flush_timer = None
-        if not self._draining.is_set() and not self._buf.empty():
+        if not self._draining.is_set() and not self._buf.empty() and self.state == "playing":
             idle = time.monotonic() - self._last_chunk_time
             if idle >= 0.15:
-                self.get_logger().info(f"[speaker] flush timer triggered, {self._buf.qsize()} chunks buffered")
                 self._start_drain()
 
     def _drain(self) -> None:
-        self.get_logger().info(f"[speaker] drain started, buffered {self._buf.qsize()} chunks")
         play_idx = 0
         merged = b''
         empty_count = 0
         while self._draining.is_set():
+            # 检查 interrupt
+            if self._interrupt_flag.is_set():
+                return
+            # 检查 pause（阻塞等待 resume 或 interrupt）
+            if not self._pause_event.wait(timeout=0.1):
+                continue  # 还在 paused，循环检查 interrupt
+
             try:
                 pcm = self._buf.get(timeout=0.1)
                 merged += pcm
@@ -358,13 +513,19 @@ class _SpeakerNode(Node):
                 play_idx += 1
                 self._play_merged(merged, play_idx)
                 merged = b''
-        if merged:
+        if merged and not self._interrupt_flag.is_set():
             play_idx += 1
             self._play_merged(merged, play_idx)
         self._draining.clear()
+        # 播放完毕，回到 ready（如果没有被 interrupt/stop）
+        if self.state == "playing":
+            self.state = "ready"
         self.get_logger().info("[speaker] drain finished")
 
     def _play_merged(self, pcm: bytes, idx: int) -> None:
+        # 播放前再次检查 interrupt
+        if self._interrupt_flag.is_set():
+            return
         duration = len(pcm) / 32000
         t0 = time.monotonic()
         try:
@@ -375,7 +536,7 @@ class _SpeakerNode(Node):
             self.get_logger().error(f"[speaker] PlayStream error: {e}")
         elapsed = time.monotonic() - t0
         remaining = duration - elapsed - 0.08
-        if remaining > 0:
+        if remaining > 0 and not self._interrupt_flag.is_set():
             time.sleep(remaining)
 
 
@@ -411,7 +572,28 @@ class SpeakerPlugin:
         }
 
     def start(self) -> None:
-        pass  # no-op until canvas sends input_topic via play action
+        pass  # startup sound is played on first dispatch(start) when project starts
+
+    def _play_startup_sound(self) -> None:
+        """Play startup PCM by directly calling PlayStream in small blocks with pacing."""
+        import pathlib
+        pcm_path = pathlib.Path(__file__).parent / 'resource' / 'startup_beep.pcm'
+        try:
+            pcm = pcm_path.read_bytes()
+            block_size = 9600  # ~300ms per block
+            for offset in range(0, len(pcm), block_size):
+                block = pcm[offset:offset + block_size]
+                code, _ = self._node._client.PlayStream(APP_NAME, "0", block)
+                if code != 0:
+                    self._node.get_logger().warn(f"[speaker] startup sound stopped at offset {offset}: code={code}")
+                    return
+                duration = len(block) / 32000
+                remaining = duration - 0.08
+                if remaining > 0:
+                    time.sleep(remaining)
+            self._node.get_logger().info(f"[speaker] startup sound OK ({len(pcm)} bytes)")
+        except Exception as e:
+            self._node.get_logger().warn(f"[speaker] startup sound error: {e}")
 
     def stop(self) -> None:
         self._node.stop_play()
@@ -423,14 +605,106 @@ class SpeakerPlugin:
             topic = args.get("input_topic", "")
             if not topic:
                 return {"error": "Missing input_topic"}
+            # Always stop first to ensure clean restart
+            self._node.stop_play()
+            # Play startup sound synchronously before starting subscription
+            self._play_startup_sound()
             topic = self._node.start_play(topic)
-            return {"state": "playing", "topic": topic}
+            return {"state": "ready", "topic": topic}
         elif action == "stop":
             self._node.stop_play()
             return {"state": "idle"}
         elif action == "info":
-            return {"state": self._node.state, "topic": self._node._topic}
+            return {
+                "state": self._node.state,
+                "topic": self._node._topic,
+                "buffer_chunks": self._node._buf.qsize(),
+            }
         return None
+
+
+# ── SmartMotionPlugin (controller) ─────────────────────────────────────────
+
+class SmartMotionPlugin:
+    """统一打断/暂停控制卡片。协调 speaker + loco 的中止和暂停。"""
+    PREFIX = "smart_motion"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor,
+                 speaker_plugin=None, loco_plugin=None):
+        self._speaker = speaker_plugin
+        self._loco = loco_plugin
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "smart_motion",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "SmartMotion — 统一运动/输出控制，提供打断、暂停、恢复能力",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["interrupt_all", "interrupt_speak", "interrupt_motion",
+                                 "pause_speak", "resume_speak", "status"],
+                        "description": "Action to perform",
+                    },
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "interrupt_all":    {"params": [], "description": "中止所有输出（语音+动作同时停止）"},
+                    "interrupt_speak":  {"params": [], "description": "中止语音播放，清空待播队列"},
+                    "interrupt_motion": {"params": [], "description": "停止机器人当前运动"},
+                    "pause_speak":      {"params": [], "description": "暂停语音播放（保留未播内容，可恢复）"},
+                    "resume_speak":     {"params": [], "description": "恢复之前暂停的语音播放"},
+                    "status":           {"params": [], "description": "查询当前输出状态（语音/运动）"},
+                },
+            },
+        }
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "interrupt_all":
+            r1 = self._do_interrupt_speak()
+            r2 = self._do_interrupt_motion()
+            return {"speak": r1, "motion": r2}
+        elif action == "interrupt_speak":
+            return self._do_interrupt_speak()
+        elif action == "interrupt_motion":
+            return self._do_interrupt_motion()
+        elif action == "pause_speak":
+            if self._speaker:
+                return self._speaker._node.pause()
+            return {"error": "no speaker plugin"}
+        elif action == "resume_speak":
+            if self._speaker:
+                return self._speaker._node.resume()
+            return {"error": "no speaker plugin"}
+        elif action == "status":
+            return {
+                "speak": self._speaker.dispatch("info", {}) if self._speaker else None,
+                "motion": self._loco.dispatch("info", {}) if self._loco else None,
+            }
+        return None
+
+    def _do_interrupt_speak(self) -> dict | None:
+        if self._speaker:
+            return self._speaker._node.interrupt()
+        return {"error": "no speaker plugin"}
+
+    def _do_interrupt_motion(self) -> dict | None:
+        if self._loco:
+            return self._loco.dispatch("stop_move", {})
+        return {"error": "no loco plugin"}
 
 
 # ── LedPlugin (actuator) ─────────────────────────────────────────────────────
@@ -683,20 +957,29 @@ class LocoPlugin:
             },
         }
 
+    # ── FSM state groups for safety checks ──────────────────────────────────────
+    _GROUND_STATES = {0, 1}            # zero_torque, damp — lying on ground
+    _LOW_STATES = {2, 702}             # squat, prep — stable low stance
+    _STANDING_STATES = {500, 501, 801} # normal_loco, 3dof_waist, run — active balance
+    _UNSAFE_STATES = {3, 706}          # sit, balance_stand — not directly switchable
+
     def _switch_mode_tool(self) -> dict:
         return {
             "name": "switch_mode",
             "type": "actuator",
             "multiInstance": False,
-            "description": "G1 locomotion mode switch — change posture/locomotion mode by name. damp=阻尼, start=主运控, zero_torque=零力矩, squat=下蹲, stand_up=起立, lie_to_stand=躺起, sit=落座, balance_stand=平衡站立, continuous_gait=持续踏步, stop_gait=停止踏步, high_stand=最高站, low_stand=最低站",
+            "description": "G1 safe locomotion mode switch. "
+                           "lie2standup=安全起立(ground→主运控), standup2lie=安全躺下(standing→阻尼), "
+                           "standup2squat=站到蹲(standing→下蹲), squat2standup=蹲到站(下蹲→主运控), "
+                           "damp=阻尼(ground only), zero_torque=零力矩(ground only), "
+                           "emergency_stop=紧急阻尼(any state), get_current_mode=查询当前状态",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "mode": {
                         "type": "string",
-                        "enum": ["damp", "start", "zero_torque", "squat", "stand_up",
-                                 "lie_to_stand", "sit", "balance_stand",
-                                 "continuous_gait", "stop_gait", "high_stand", "low_stand"],
+                        "enum": ["lie2standup", "standup2lie", "standup2squat", "squat2standup",
+                                 "damp", "zero_torque", "emergency_stop", "get_current_mode"],
                         "description": "Target mode",
                     },
                 },
@@ -709,7 +992,7 @@ class LocoPlugin:
             "name": "switch_mode_expert",
             "type": "actuator",
             "multiInstance": False,
-            "description": "G1 locomotion mode switch — directly set FSM mode ID (expert use only). IDs: 0=zero_torque, 1=damp, 2=squat, 3=sit, 4=lock_stand, 500=normal_loco, 501=3dof_waist, 702=lie_to_stand, 706=balance_squat, 801=run_loco",
+            "description": "G1 locomotion mode switch — directly set FSM mode ID (EXPERT ONLY, bypasses safety checks, robot may fall!). IDs: 0=zero_torque, 1=damp, 2=squat, 3=sit, 4=lock_stand, 500=normal_loco, 501=3dof_waist, 702=lie_to_stand, 706=balance_squat, 801=run_loco",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -794,25 +1077,98 @@ class LocoPlugin:
             return {"ret": ret}
         elif action == "switch_mode":
             mode = args.get("mode", "")
-            mode_dispatch = {
-                "damp":            lambda: self._client.Damp(),
-                "start":           lambda: self._client.Start(),
-                "zero_torque":     lambda: self._client.ZeroTorque(),
-                "squat":           lambda: self._client.StandUp2Squat(),
-                "stand_up":        lambda: self._client.Squat2StandUp(),
-                "lie_to_stand":    lambda: self._client.Lie2StandUp(),
-                "sit":             lambda: self._client.Sit(),
-                "balance_stand":   lambda: self._client.BalanceStand(1),
-                "continuous_gait": lambda: self._client.ContinuousGait(True),
-                "stop_gait":       lambda: self._client.ContinuousGait(False),
-                "high_stand":      lambda: self._client.HighStand(),
-                "low_stand":       lambda: self._client.LowStand(),
-            }
-            fn = mode_dispatch.get(mode)
-            if fn is None:
-                return {"error": f"Unknown mode: {mode}. Available: {list(mode_dispatch.keys())}"}
-            ret = fn()
-            return {"ret": ret, "mode": mode}
+            code, current_fsm = self._client.GetFsmId()
+
+            if code != 0:
+                return {"error": f"Cannot read current FSM state (code={code}). Aborting for safety."}
+
+            if mode == "emergency_stop":
+                ret = self._client.Damp()
+                return {"ret": ret, "mode": "emergency_stop",
+                        "warning": "Emergency damp executed regardless of state"}
+
+            elif mode == "get_current_mode":
+                FSM_DESCRIPTIONS = {
+                    0: "lying down, zero torque (零力矩, no resistance)",
+                    1: "lying down, damping (阻尼, resists movement)",
+                    2: "squatting (下蹲, position hold, stable)",
+                    3: "sitting (落座, needs external support, unstable)",
+                    500: "standing, normal locomotion (主运控, balanced)",
+                    501: "standing, 3DOF waist locomotion (balanced)",
+                    702: "prep stance (预备模式, stable low stance)",
+                    706: "balance stand (过渡态, intermediate)",
+                    801: "standing, running gait (跑步运控, balanced)",
+                }
+                desc = FSM_DESCRIPTIONS.get(current_fsm, f"unknown state")
+                return {"fsm_id": current_fsm, "description": desc}
+
+            elif mode == "lie2standup":
+                if current_fsm in self._STANDING_STATES:
+                    return {"info": "Robot is already standing", "fsm_id": current_fsm}
+                if current_fsm in self._UNSAFE_STATES:
+                    return {"error": f"Robot is in unsafe state (FSM={current_fsm}). Use emergency_stop first."}
+                # From ground: damp → lie2stand(702) → auto到500
+                if current_fsm in self._GROUND_STATES:
+                    steps = []
+                    if current_fsm == 0:
+                        steps.append(("Damp", 1, "damp"))
+                    steps.append(("Lie2StandUp", 500, "lie2standup"))
+                    return self._run_fsm_sequence(steps)
+                # From low states (squat/prep): start(500)
+                if current_fsm in self._LOW_STATES:
+                    steps = [("Start", 500, "start")]
+                    return self._run_fsm_sequence(steps)
+                return {"error": f"Cannot stand up from FSM={current_fsm}"}
+
+            elif mode == "standup2lie":
+                if current_fsm in self._GROUND_STATES:
+                    return {"info": "Robot is already on the ground", "fsm_id": current_fsm}
+                if current_fsm in self._STANDING_STATES:
+                    # Stop movement first, wait for stabilization
+                    self._client.StopMove()
+                    import time as _time; _time.sleep(1.0)
+                    steps = [("StandUp2Squat", 2, "standup2squat"), ("Damp", 1, "damp")]
+                    return self._run_fsm_sequence(steps)
+                if current_fsm in self._LOW_STATES:
+                    steps = [("Damp", 1, "damp")]
+                    return self._run_fsm_sequence(steps)
+                return {"error": f"Cannot lie down from FSM={current_fsm}. Use emergency_stop if needed."}
+
+            elif mode == "standup2squat":
+                if current_fsm in self._GROUND_STATES or current_fsm in self._LOW_STATES:
+                    return {"info": "Robot is already in low/ground state", "fsm_id": current_fsm}
+                if current_fsm in self._STANDING_STATES:
+                    self._client.StopMove()
+                    import time as _time; _time.sleep(1.0)
+                    steps = [("StandUp2Squat", 2, "standup2squat")]
+                    return self._run_fsm_sequence(steps)
+                return {"error": f"Cannot squat from FSM={current_fsm}. Use emergency_stop if needed."}
+
+            elif mode == "squat2standup":
+                if current_fsm in self._STANDING_STATES:
+                    return {"info": "Robot is already standing", "fsm_id": current_fsm}
+                if current_fsm in self._LOW_STATES:
+                    steps = [("Start", 500, "start")]
+                    return self._run_fsm_sequence(steps)
+                if current_fsm in self._GROUND_STATES:
+                    return {"error": f"Robot is on ground (FSM={current_fsm}). Use lie2standup instead."}
+                return {"error": f"Cannot stand from FSM={current_fsm}"}
+
+            elif mode in ("damp", "zero_torque"):
+                if current_fsm in self._STANDING_STATES or current_fsm in self._LOW_STATES:
+                    return {"error": f"Cannot enter {mode} from upright/low state (FSM={current_fsm}). "
+                                     f"Robot will collapse. Use standup2lie first."}
+                if current_fsm in self._UNSAFE_STATES:
+                    return {"error": f"Cannot enter {mode} from unsafe state (FSM={current_fsm}). "
+                                     f"Use emergency_stop first."}
+                fn = self._client.ZeroTorque if mode == "zero_torque" else self._client.Damp
+                ret = fn()
+                return {"ret": ret, "mode": mode}
+
+            else:
+                return {"error": f"Unknown mode: {mode}. Available: lie2standup, standup2lie, "
+                                 f"standup2squat, squat2standup, damp, zero_torque, "
+                                 f"emergency_stop, get_current_mode"}
         elif action == "switch_mode_expert":
             fid = int(args.get("fsm_id", 0))
             ret = self._client.SetFsmId(fid)
@@ -847,6 +1203,16 @@ class LocoPlugin:
             ret = self._client.ShakeHand()
             return {"ret": ret}
         return None
+
+    # ── FSM sequence helper ───────────────────────────────────────────────────
+
+    def _run_fsm_sequence(self, steps: list) -> dict:
+        """Execute FSM sequence in subprocess (no GIL contention).
+        steps = [(method_name, target_fsm_id_to_poll, step_name), ...]"""
+        result = self._client.RunFsmSequence(steps, interval=1.0, step_timeout=15.0)
+        if result is None:
+            return {"error": "RPC timeout during sequence execution"}
+        return result
 
 
 # ── AsrPlugin (sensor) ───────────────────────────────────────────────────────
@@ -1673,9 +2039,13 @@ class _SlamInfoNode(Node):
         if msg_type == "pos_info" or msg_type == "mapping_info":
             pose_data = data.get("data", {}).get("currentPose")
             if pose_data:
+                q_x = float(pose_data.get("q_x", 0.0))
+                q_y = float(pose_data.get("q_y", 0.0))
+                q_z = float(pose_data.get("q_z", 0.0))
+                q_w = float(pose_data.get("q_w", 1.0))
                 yaw = math.atan2(
-                    2 * (pose_data.get("q_w", 1) * pose_data.get("q_z", 0)),
-                    1 - 2 * pose_data.get("q_z", 0) ** 2
+                    2 * (q_w * q_z + q_x * q_y),
+                    1 - 2 * (q_y * q_y + q_z * q_z),
                 )
                 with self._lock:
                     prev_status = self._map_status
@@ -1942,7 +2312,9 @@ class _SlamInfoNode(Node):
             pose = self._current_pose
         robot_x = pose["x"] if pose else 0.0
         robot_y = pose["y"] if pose else 0.0
-        robot_yaw = pose["yaw"] if pose else 0.0
+        # The mapping renderer already negates the packet yaw after mapping
+        # SLAM +Y to Three.js -Z, so publish the display-frame value.
+        robot_yaw = -pose["yaw"] if pose else 0.0
 
         # Extract points from voxel buffer
         with self._map_buffer_lock:
@@ -3023,8 +3395,20 @@ def run_realsense_process(namespace: str) -> None:
         executor.spin()
     except KeyboardInterrupt:
         pass
+    except Exception as e:
+        # SIGTERM shuts rclpy down asynchronously. Its executor reports that
+        # expected exit as ExternalShutdownException on Humble.
+        if rclpy.ok():
+            print(f"[realsense-proc] executor stopped: {e}", flush=True)
     finally:
         node.stop_capture()
-        node.destroy_node()
-        rclpy.shutdown()
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
+        if rclpy.ok():
+            try:
+                rclpy.shutdown()
+            except Exception:
+                pass
         print("[realsense-proc] stopped", flush=True)
