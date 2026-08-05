@@ -90,6 +90,7 @@ class FakeSmartMotion:
     def __init__(self):
         self.bound_topic = ""
         self.expected_nav_id = ""
+        self.bind_result = None
         self.unbind_reasons = []
         self.unbind_result = {
             "state": "idle",
@@ -98,6 +99,8 @@ class FakeSmartMotion:
         }
 
     def bind_velocity_proposal(self, topic, expected_nav_id):
+        if self.bind_result is not None:
+            return dict(self.bind_result)
         self.bound_topic = topic
         self.expected_nav_id = expected_nav_id
         return {
@@ -188,6 +191,39 @@ class LocoTopicLifecycleTest(unittest.TestCase):
         self.assertFalse(result["connected"])
         self.assertEqual(result["error"], "expected_nav_id_required")
         self.assertEqual(self.smart_motion.bound_topic, "")
+        self.assertEqual(self.client.stop_count, 1)
+
+    def test_start_preserves_stop_confirmation_diagnostics_on_failure(self):
+        diagnostics = {
+            "stop_move_ret": 0,
+            "stop_move_error": None,
+            "confirmation_started_monotonic": 123.0,
+            "last_odometry_monotonic": 123.4,
+            "last_odometry_age_ms": 100,
+            "last_odometry_velocity": {"x": 0.04, "y": 0.0, "yaw": 0.0},
+            "odometry_callback_count": 42,
+            "odometry_callbacks_since_confirmation": 1,
+            "confirmation_timed_out": True,
+        }
+        self.smart_motion.bind_result = {
+            "error": "StopMove/odometry stop was not confirmed before proposal bind",
+            "connected": False,
+            "armed": False,
+            "stop_confirmed": False,
+            "stop_move_ret": 0,
+            "stop_move_error": None,
+            "stop_confirmation": diagnostics,
+        }
+
+        result = self.plugin.dispatch(
+            "start",
+            {"input_topic": self.topic, "expected_nav_id": self.nav_id},
+        )
+
+        self.assertEqual(result["state"], "error")
+        self.assertFalse(result["connected"])
+        self.assertEqual(result["stop_move_ret"], 0)
+        self.assertEqual(result["stop_confirmation"], diagnostics)
         self.assertEqual(self.client.stop_count, 1)
 
     def test_other_tools_do_not_bind_or_unbind_loco_topic(self):
