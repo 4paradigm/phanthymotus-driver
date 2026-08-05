@@ -1,0 +1,21 @@
+ros_namespace: ""
+
+plugins:
+  navigation_sensors:
+    enabled: true
+    raw_cloud_topic: rt/utlidar/cloud_livox_mid360
+    raw_imu_topic: rt/utlidar/imu_livox_mid360
+    publish_raw_cloud: false
+    publish_fast_livo_cloud: true
+    raw_lidar_frame: livox_raw_frame
+    lidar_frame: livox_frame
+    imu_frame: livox_frame
+    # Fixed MID360 mounting transform. Apply it to LiDAR and its internal IMU
+    # together; never replace it with dashboard-style dynamic gravity alignment.
+    sensor_rotation_matrix: [1.0, 0.0, 0.0,
+                             0.0, -1.0, 0.0,
+                             0.0, 0.0, -1.0]
+    clock_warmup_samples: 32
+    clock_window_samples: 400
+    clock_reset_threshold_ms: 1000
+    clock_reset_confirm_samples: 8

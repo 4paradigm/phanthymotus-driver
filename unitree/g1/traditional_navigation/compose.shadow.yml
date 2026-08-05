@@ -1,0 +1,145 @@
+name: g1-traditional-navigation-shadow
+
+services:
+  sensor-bridge:
+    profiles: ["lio-shadow"]
+    image: ${G1_DRIVER_IMAGE:?use --env-file source-lock.env}
+    container_name: phanthy-navigation-sensors-shadow
+    network_mode: host
+    ipc: host
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: "no"
+    cpus: "3.0"
+    mem_limit: 2g
+    environment:
+      ROS_DOMAIN_ID: "42"
+      RMW_IMPLEMENTATION: rmw_fastrtps_cpp
+      FASTDDS_BUILTIN_TRANSPORTS: DEFAULT
+      ROS_NAMESPACE: ${ROS_NAMESPACE:-ubuntu}
+      NETWORK_INTERFACE: ${NETWORK_INTERFACE:-eth0}
+      CONFIG_PATH: /config/driver.shadow.yaml
+      ROS_LOG_DIR: /tmp/ros-log
+    volumes:
+      - ./driver.shadow.yaml:/config/driver.shadow.yaml:ro
+    tmpfs:
+      - /tmp:rw,size=256m,mode=1777
+    command: >-
+      /bin/bash -lc '
+      source /opt/ros/humble/setup.bash &&
+      source /ros_ws/install/setup.bash &&
+      exec python3 /work/navigation_sensor_bridge_main.py "$${NETWORK_INTERFACE}"'
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - /bin/bash -lc 'source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && ros2 node list | grep -qx /g1_navigation_sensor_bridge'
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+    logging:
+      driver: local
+      options:
+        max-size: "20m"
+        max-file: "3"
+    stop_grace_period: 10s
+
+  fast-livo2:
+    profiles: ["lio-shadow"]
+    depends_on:
+      sensor-bridge:
+        condition: service_healthy
+    build:
+      context: .
+      dockerfile: Dockerfile.fast-livo2
+      args:
+        FAST_LIVO2_REPO: ${FAST_LIVO2_REPO:?use --env-file source-lock.env}
+        FAST_LIVO2_COMMIT: ${FAST_LIVO2_COMMIT:?use --env-file source-lock.env}
+        FAST_LIVO2_RUNTIME_PATCH_SHA256: ${FAST_LIVO2_RUNTIME_PATCH_SHA256:?use --env-file source-lock.env}
+        RPG_VIKIT_REPO: ${RPG_VIKIT_REPO:?use --env-file source-lock.env}
+        RPG_VIKIT_COMMIT: ${RPG_VIKIT_COMMIT:?use --env-file source-lock.env}
+        LIVOX_ROS_DRIVER2_REPO: ${LIVOX_ROS_DRIVER2_REPO:?use --env-file source-lock.env}
+        LIVOX_ROS_DRIVER2_COMMIT: ${LIVOX_ROS_DRIVER2_COMMIT:?use --env-file source-lock.env}
+        LIVOX_SDK2_REPO: ${LIVOX_SDK2_REPO:?use --env-file source-lock.env}
+        LIVOX_SDK2_COMMIT: ${LIVOX_SDK2_COMMIT:?use --env-file source-lock.env}
+        SOPHUS_REPO: ${SOPHUS_REPO:?use --env-file source-lock.env}
+        SOPHUS_COMMIT: ${SOPHUS_COMMIT:?use --env-file source-lock.env}
+    image: phanthy-fast-livo2:g1-${FAST_LIVO2_IMAGE_TAG:?use --env-file source-lock.env}
+    container_name: phanthy-fast-livo2-shadow
+    network_mode: host
+    ipc: host
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: "no"
+    cpus: "4.0"
+    mem_limit: 6g
+    environment:
+      ROS_DOMAIN_ID: "42"
+      RMW_IMPLEMENTATION: rmw_fastrtps_cpp
+      FASTDDS_BUILTIN_TRANSPORTS: DEFAULT
+      ROS_NAMESPACE: ${ROS_NAMESPACE:-ubuntu}
+      ROS_LOG_DIR: /tmp/ros-log
+      # N2 is fail-closed. compose.mapping.yml is the only checked-in override
+      # that enables map writes and gives the output a persistent bind mount.
+      PCD_SAVE_EN: "false"
+      PCD_SAVE_INTERVAL: "-1"
+      PCD_SAVE_TYPE: "0"
+    volumes:
+      - ./g1_lio.yaml:/config/g1_lio.yaml:ro
+    tmpfs:
+      - /tmp:rw,size=512m,mode=1777
+      - /opt/fast_livo_ws/src/fast_livo/Log:rw,size=512m,mode=1777
+    # Keep the installed C++ node as PID 1. The ros2 CLI wrapper forks a child
+    # and does not reliably forward Docker stop signals to map finalization.
+    command: >-
+      /bin/bash -lc '
+      source /opt/ros/humble/setup.bash &&
+      source /opt/fast_livo_ws/install/setup.bash &&
+      exec /opt/fast_livo_ws/install/fast_livo/lib/fast_livo/fastlivo_mapping --ros-args
+      --params-file /config/g1_lio.yaml
+      -p pcd_save.pcd_save_en:=$${PCD_SAVE_EN}
+      -p pcd_save.interval:=$${PCD_SAVE_INTERVAL}
+      -p pcd_save.type:=$${PCD_SAVE_TYPE}
+      --log-level warn
+      -r /livox/lidar:=/$${ROS_NAMESPACE}/navigation/lidar_fast_livo
+      -r /livox/imu:=/$${ROS_NAMESPACE}/navigation/imu
+      -r /left_camera/image:=/$${ROS_NAMESPACE}/navigation/camera_disabled
+      -r /cloud_registered:=/$${ROS_NAMESPACE}/navigation/cloud_registered
+      -r /aft_mapped_to_init:=/$${ROS_NAMESPACE}/navigation/odom
+      -r /path:=/$${ROS_NAMESPACE}/navigation/path
+      -r /Laser_map:=/$${ROS_NAMESPACE}/navigation/laser_map
+      -r /LIVO2/imu_propagate:=/$${ROS_NAMESPACE}/navigation/imu_propagated_odom
+      -r /cloud_visual_sub_map_before:=/$${ROS_NAMESPACE}/navigation/debug/cloud_visual_sub_map
+      -r /cloud_effected:=/$${ROS_NAMESPACE}/navigation/debug/cloud_effected
+      -r /visualization_marker:=/$${ROS_NAMESPACE}/navigation/debug/visualization_marker
+      -r /planner_normal:=/$${ROS_NAMESPACE}/navigation/debug/planner_normal
+      -r /voxels:=/$${ROS_NAMESPACE}/navigation/debug/voxels
+      -r /planes:=/$${ROS_NAMESPACE}/navigation/debug/planes
+      -r /dyn_obj:=/$${ROS_NAMESPACE}/navigation/debug/dyn_obj
+      -r /dyn_obj_removed:=/$${ROS_NAMESPACE}/navigation/debug/dyn_obj_removed
+      -r /dyn_obj_dbg_hist:=/$${ROS_NAMESPACE}/navigation/debug/dyn_obj_history
+      -r /mavros/vision_pose/pose:=/$${ROS_NAMESPACE}/navigation/debug/vision_pose
+      -r /rgb_img:=/$${ROS_NAMESPACE}/navigation/debug/rgb_disabled
+      -r /tf:=/$${ROS_NAMESPACE}/navigation/tf_lio_raw
+      -r /tf_static:=/$${ROS_NAMESPACE}/navigation/tf_static_lio_raw
+      > /dev/null'
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - /bin/bash -lc 'source /opt/ros/humble/setup.bash && source /opt/fast_livo_ws/install/setup.bash && ros2 node list | grep -qx /laserMapping'
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: local
+      options:
+        max-size: "20m"
+        max-file: "3"
+    stop_grace_period: 10s

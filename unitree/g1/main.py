@@ -120,6 +120,13 @@ class G1DeviceBundle:
             self._plugins.append(LidarPlugin(plugins_cfg["lidar"], namespace, executor))
             print("[bundle] LidarPlugin loaded")
 
+        if plugins_cfg.get("navigation_sensors", {}).get("enabled", False):
+            from navigation_sensor_bridge import NavigationSensorPlugin
+            self._plugins.append(
+                NavigationSensorPlugin(plugins_cfg["navigation_sensors"], namespace, executor)
+            )
+            print("[bundle] NavigationSensorPlugin loaded (shadow sensor bridge)")
+
         if plugins_cfg.get("slam", {}).get("enabled", False):
             from device import SpatialPlugin
             self._plugins.append(SpatialPlugin(plugins_cfg["slam"], namespace, executor, slam_client, smart_motion=smart_motion))

@@ -1,0 +1,45 @@
+ARG FAST_LIVO2_RGB_BASE_IMAGE=phanthy-fast-livo2:g1-1fcd0d0-n3save1
+FROM ${FAST_LIVO2_RGB_BASE_IMAGE}
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG FAST_LIVO2_COMMIT
+ARG FAST_LIVO2_RGB_QOS_PATCH_SHA256
+
+# Keep the validated LIO/map-save image immutable. The RGB variant makes the
+# camera reader compatible with the G1 driver's BEST_EFFORT sensor stream and
+# bounds both DDS histories and application buffers. A missing camera frame can
+# therefore no longer make LiDAR/IMU data accumulate until the container OOMs.
+# This preview-only derivative also keeps the validated LIO state and retains
+# only the current camera frame for point coloring; it does not build the
+# uncalibrated visual feature map.
+COPY fast-livo2-rgb-qos.patch /tmp/fast-livo2-rgb-qos.patch
+RUN [[ "${FAST_LIVO2_COMMIT}" =~ ^[0-9a-f]{40}$ ]] && \
+    [[ "${FAST_LIVO2_RGB_QOS_PATCH_SHA256}" =~ ^[0-9a-f]{64}$ ]] && \
+    printf '%s  %s\n' \
+      "${FAST_LIVO2_RGB_QOS_PATCH_SHA256}" \
+      /tmp/fast-livo2-rgb-qos.patch | sha256sum -c - && \
+    cd /opt/fast_livo_ws/src/fast_livo && \
+    test "$(git rev-parse HEAD)" = "${FAST_LIVO2_COMMIT}" && \
+    grep -Fq 'PCD checkpoint completed' src/LIVMapper.cpp && \
+    git apply --check /tmp/fast-livo2-rgb-qos.patch && \
+    git apply /tmp/fast-livo2-rgb-qos.patch && \
+    git diff --check && \
+    grep -Fq 'rclcpp::SensorDataQoS image_qos' src/LIVMapper.cpp && \
+    grep -Fq 'kMaxBufferedLidarFrames = 8' src/LIVMapper.cpp && \
+    grep -Fq 'kMaxBufferedImuSamples = 400' src/LIVMapper.cpp && \
+    grep -Fq 'kMaxBufferedImages = 4' src/LIVMapper.cpp && \
+    grep -Fq 'prepareFrameForColorization' src/LIVMapper.cpp && \
+    grep -Fq 'void VIOManager::prepareFrameForColorization' src/vio.cpp && \
+    ! grep -Fq 'vio_manager->processFrame(LidarMeasures.measures.back().img' src/LIVMapper.cpp && \
+    ! grep -Fq 'img_topic, 200000' src/LIVMapper.cpp && \
+    source /opt/ros/humble/setup.bash && \
+    source /opt/fast_livo_ws/install/setup.bash && \
+    cd /opt/fast_livo_ws && \
+    colcon build \
+      --executor sequential \
+      --packages-select fast_livo \
+      --cmake-clean-cache \
+      --cmake-args -DCMAKE_BUILD_TYPE=Release
+
+LABEL org.opencontainers.image.fast-livo2-rgb-qos-patch="${FAST_LIVO2_RGB_QOS_PATCH_SHA256}"

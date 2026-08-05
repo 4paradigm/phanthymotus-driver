@@ -20,6 +20,27 @@ plugins:
     enabled: true
   lidar:
     enabled: true
+  # FAST-LIVO2/EGO 传统导航的原始传感器桥。默认关闭；shadow 部署时再启用，
+  # 并关闭上面的 lidar 与 controlled_spatial(_map)，避免重复处理点云。
+  navigation_sensors:
+    enabled: false
+    raw_cloud_topic: rt/utlidar/cloud_livox_mid360
+    raw_imu_topic: rt/utlidar/imu_livox_mid360
+    # G1 shadow 默认只发估计器输入；双路大点云会压低 Jetson 上的发布频率。
+    publish_raw_cloud: false
+    publish_fast_livo_cloud: true
+    raw_lidar_frame: livox_raw_frame
+    lidar_frame: livox_frame
+    imu_frame: livox_frame
+    # G1 的 MID360 固定倒装。点云和雷达内置 IMU 必须一起做 Rx(pi)，
+    # FAST-LIVO2 内部的 LiDAR-to-IMU 外参因此仍保持单位阵。
+    sensor_rotation_matrix: [1.0, 0.0, 0.0,
+                             0.0, -1.0, 0.0,
+                             0.0, 0.0, -1.0]
+    clock_warmup_samples: 32
+    clock_window_samples: 400
+    clock_reset_threshold_ms: 1000
+    clock_reset_confirm_samples: 8
   slam:
     enabled: false
     map_dir: /opt/phanthy-motus/data/maps

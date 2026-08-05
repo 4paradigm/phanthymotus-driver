@@ -1,0 +1,198 @@
+--- a/src/LIVMapper.cpp
++++ b/src/LIVMapper.cpp
+@@ -18,6 +18,10 @@
+ 
+ namespace
+ {
++constexpr std::size_t kMaxBufferedLidarFrames = 8;
++constexpr std::size_t kMaxBufferedImuSamples = 400;
++constexpr std::size_t kMaxBufferedImages = 4;
++
+ bool writeIntensityPCDBinary(const std::string &path, const PointCloudXYZI &cloud, std::size_t &written_points)
+ {
+   written_points = 0;
+@@ -397,18 +401,21 @@ void LIVMapper::initializeSubscribersAndPublishers(rclcpp::Node::SharedPtr &node,
+   // indefinitely when a transient load spike occurs.
+   constexpr size_t kPointCloudQueueDepth = 8;
+   constexpr size_t kImuQueueDepth = 400;
++  constexpr size_t kImageQueueDepth = 4;
+   if (p_pre->lidar_type == AVIA) {
+     sub_pcl = this->node->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, kPointCloudQueueDepth, std::bind(&LIVMapper::livox_pcl_cbk, this, std::placeholders::_1));
+   } else {
+     sub_pcl = this->node->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, kPointCloudQueueDepth, std::bind(&LIVMapper::standard_pcl_cbk, this, std::placeholders::_1));
+   }
+   sub_imu = this->node->create_subscription<sensor_msgs::msg::Imu>(imu_topic, kImuQueueDepth, std::bind(&LIVMapper::imu_cbk, this, std::placeholders::_1));
++  rclcpp::SensorDataQoS image_qos;
++  image_qos.keep_last(kImageQueueDepth);
+   if (enable_image_processing) {
+     sub_img_compressed = this->node->create_subscription<sensor_msgs::msg::CompressedImage>(
+-      img_topic, 200000, std::bind(&LIVMapper::jpeg_callback, this, std::placeholders::_1));
++      img_topic, image_qos, std::bind(&LIVMapper::jpeg_callback, this, std::placeholders::_1));
+   } else {
+     sub_img = this->node->create_subscription<sensor_msgs::msg::Image>(
+-      img_topic, 200000, std::bind(&LIVMapper::img_cbk, this, std::placeholders::_1));
++      img_topic, image_qos, std::bind(&LIVMapper::img_cbk, this, std::placeholders::_1));
+   }
+   pubLaserCloudFullRes = this->node->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 100);
+   pubNormal = this->node->create_publisher<visualization_msgs::msg::MarkerArray>("/visualization_marker", 100);
+@@ -457,7 +464,14 @@ void LIVMapper::jpeg_callback(const sensor_msgs::msg::CompressedImage::SharedPtr
+         mtx_buffer.lock();
+         img_buffer.push_back(image);
+         img_time_buffer.push_back(msg_header_time);
++        if (img_buffer.size() > kMaxBufferedImages) {
++            img_buffer.pop_front();
++            img_time_buffer.pop_front();
++            RCLCPP_WARN_THROTTLE(
++              node->get_logger(), *node->get_clock(), 1000,
++              "Image application buffer full; dropping oldest frame");
++        }
+         last_timestamp_img = msg_header_time;
+         mtx_buffer.unlock();
+         // Notify processing thread
+         sig_buffer.notify_all();
+@@ -553,7 +567,10 @@ void LIVMapper::handleVIO() 
+     vio_manager->plot_flag = false;
+   }
+ 
+-  vio_manager->processFrame(LidarMeasures.measures.back().img, _pv_list, voxelmap_manager->voxel_map_, LidarMeasures.last_lio_update_time - _first_lidar_time);
++  // This image is built only for the nominal, stationary RGB preview. Keep
++  // the validated LIO state and retain only the current camera frame needed
++  // to project/colorize the current cloud; do not grow a visual feature map.
++  vio_manager->prepareFrameForColorization(LidarMeasures.measures.back().img);
+ 
+   if (imu_prop_enable) 
+   {
+@@ -971,11 +988,20 @@ void LIVMapper::standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::ConstShared
+   {
+     RCLCPP_ERROR(this->node->get_logger(),"lidar loop back, clear buffer");
+     lid_raw_data_buffer.clear();
++    lid_header_time_buffer.clear();
+   }
+   PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
+   p_pre->process(msg, ptr);
+   lid_raw_data_buffer.push_back(ptr);
+   lid_header_time_buffer.push_back(cur_head_time);
++  if (lid_raw_data_buffer.size() > kMaxBufferedLidarFrames)
++  {
++    lid_raw_data_buffer.pop_front();
++    lid_header_time_buffer.pop_front();
++    RCLCPP_WARN_THROTTLE(
++      this->node->get_logger(), *this->node->get_clock(), 1000,
++      "LiDAR application buffer full; dropping oldest frame");
++  }
+   last_timestamp_lidar = cur_head_time;
+ 
+   mtx_buffer.unlock();
+@@ -1000,19 +1026,28 @@ void LIVMapper::livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::ConstShare
+   {
+     RCLCPP_ERROR(this->node->get_logger(), "lidar loop back, clear buffer");
+     lid_raw_data_buffer.clear();
++    lid_header_time_buffer.clear();
+   }
+   RCLCPP_INFO(this->node->get_logger(), "get point cloud at time: %.6f", stamp2Sec(msg->header.stamp));
+   PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
+   p_pre->process(msg, ptr);
+ 
+   if (!ptr || ptr->empty()) {
+     RCLCPP_ERROR(this->node->get_logger(), "Received an empty point cloud");
+     mtx_buffer.unlock();
+     return;
+   }
+ 
+   lid_raw_data_buffer.push_back(ptr);
+   lid_header_time_buffer.push_back(cur_head_time);
++  if (lid_raw_data_buffer.size() > kMaxBufferedLidarFrames)
++  {
++    lid_raw_data_buffer.pop_front();
++    lid_header_time_buffer.pop_front();
++    RCLCPP_WARN_THROTTLE(
++      this->node->get_logger(), *this->node->get_clock(), 1000,
++      "LiDAR application buffer full; dropping oldest frame");
++  }
+   last_timestamp_lidar = cur_head_time;
+ 
+   mtx_buffer.unlock();
+@@ -1064,13 +1097,24 @@ void LIVMapper::imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
+   last_timestamp_imu = timestamp;
+ 
+   imu_buffer.push_back(msg);
++  if (imu_buffer.size() > kMaxBufferedImuSamples)
++  {
++    imu_buffer.pop_front();
++    RCLCPP_WARN_THROTTLE(
++      this->node->get_logger(), *this->node->get_clock(), 1000,
++      "IMU application buffer full; dropping oldest sample");
++  }
+   mtx_buffer.unlock();
+   if (imu_prop_enable)
+   {
+     mtx_buffer_imu_prop.lock();
+     if (imu_prop_enable && !p_imu->imu_need_init) { prop_imu_buffer.push_back(*msg); }
++    if (prop_imu_buffer.size() > kMaxBufferedImuSamples)
++    {
++      prop_imu_buffer.pop_front();
++    }
+     newest_imu = *msg;
+     new_imu = true;
+     mtx_buffer_imu_prop.unlock();
+   }
+   sig_buffer.notify_all();
+@@ -1117,9 +1161,17 @@ void LIVMapper::img_cbk(const sensor_msgs::msg::Image::ConstSharedPtr &msg_in)
+   cv::Mat img_cur = getImageFromMsg(msg);
+   img_buffer.push_back(img_cur);
+   img_time_buffer.push_back(img_time_correct);
++  if (img_buffer.size() > kMaxBufferedImages)
++  {
++    img_buffer.pop_front();
++    img_time_buffer.pop_front();
++    RCLCPP_WARN_THROTTLE(
++      this->node->get_logger(), *this->node->get_clock(), 1000,
++      "Image application buffer full; dropping oldest frame");
++  }
+ 
+   // ROS_INFO("Correct Image time: %.6f", img_time_correct);
+ 
+   last_timestamp_img = img_time_correct;
+   // cv::imshow("img", img);
+   // cv::waitKey(1);
+--- a/include/vio.h
++++ b/include/vio.h
+@@ -143,6 +143,7 @@ public:
+   ~VIOManager();
+   void updateStateInverse(cv::Mat img, int level);
+   void updateState(cv::Mat img, int level);
++  void prepareFrameForColorization(cv::Mat &img);
+   void processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &feat_map, double img_time);
+   void retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &pg, const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &plane_map);
+   void generateVisualMapPoints(cv::Mat img, vector<pointWithVar> &pg);
+--- a/src/vio.cpp
++++ b/src/vio.cpp
+@@ -1790,6 +1790,28 @@ void VIOManager::dumpDataForColmap()
+   cnt++;
+ }
+ 
++void VIOManager::prepareFrameForColorization(cv::Mat &img)
++{
++  if (img.empty())
++  {
++    img_rgb.release();
++    img_cp.release();
++    new_frame_.reset();
++    return;
++  }
++  if (width != img.cols || height != img.rows)
++  {
++    cv::resize(img, img, cv::Size(img.cols * image_resize_factor, img.rows * image_resize_factor), 0, 0, CV_INTER_LINEAR);
++  }
++
++  img_rgb = img.clone();
++  img_cp = img.clone();
++  if (img.channels() == 3) cv::cvtColor(img, img, CV_BGR2GRAY);
++
++  new_frame_.reset(new Frame(cam, img));
++  updateFrameState(*state);
++}
++
+ void VIOManager::processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &feat_map, double img_time)
+ {
+   if (width != img.cols || height != img.rows)

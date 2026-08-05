@@ -1,0 +1,58 @@
+services:
+  fast-livo2:
+    image: ${FAST_LIVO2_RGB_IMAGE:?use --env-file source-lock.rgb.env}
+    labels:
+      com.phanthy.navigation.mode: rgb_preview
+      com.phanthy.navigation.rgb_evidence: nominal_public_urdf
+      com.phanthy.navigation.rgb_time_evidence: ${G1_RGB_TIME_EVIDENCE:-unverified_callback_arrival}
+      com.phanthy.navigation.rgb_motion_policy: ${G1_RGB_MOTION_POLICY:-stationary_only}
+      com.phanthy.navigation.rgb_pipeline: lio_colorize_only
+    volumes:
+      - ${G1_RGB_CONFIG_PATH:?set G1_RGB_CONFIG_PATH to the generated preview YAML}:/config/g1_livo.rgb-preview.yaml:ro
+    command: >-
+      /bin/bash -lc '
+      source /opt/ros/humble/setup.bash &&
+      source /opt/fast_livo_ws/install/setup.bash &&
+      exec /opt/fast_livo_ws/install/fast_livo/lib/fast_livo/fastlivo_mapping --ros-args
+      --params-file /config/g1_livo.rgb-preview.yaml
+      -p pcd_save.pcd_save_en:=$${PCD_SAVE_EN}
+      -p pcd_save.interval:=$${PCD_SAVE_INTERVAL}
+      -p pcd_save.type:=$${PCD_SAVE_TYPE}
+      --log-level warn
+      -r /livox/lidar:=/$${ROS_NAMESPACE}/navigation/lidar_fast_livo
+      -r /livox/imu:=/$${ROS_NAMESPACE}/navigation/imu
+      -r /left_camera/image:=/$${ROS_NAMESPACE}/camera/rgb
+      -r /cloud_registered:=/$${ROS_NAMESPACE}/navigation/cloud_registered_rgb
+      -r /aft_mapped_to_init:=/$${ROS_NAMESPACE}/navigation/odom_rgb_preview
+      -r /path:=/$${ROS_NAMESPACE}/navigation/path_rgb_preview
+      -r /Laser_map:=/$${ROS_NAMESPACE}/navigation/laser_map_rgb_preview
+      -r /LIVO2/imu_propagate:=/$${ROS_NAMESPACE}/navigation/imu_propagated_odom_rgb_preview
+      -r /cloud_visual_sub_map_before:=/$${ROS_NAMESPACE}/navigation/debug/rgb_cloud_visual_sub_map
+      -r /cloud_effected:=/$${ROS_NAMESPACE}/navigation/debug/rgb_cloud_effected
+      -r /visualization_marker:=/$${ROS_NAMESPACE}/navigation/debug/rgb_visualization_marker
+      -r /planner_normal:=/$${ROS_NAMESPACE}/navigation/debug/rgb_planner_normal
+      -r /voxels:=/$${ROS_NAMESPACE}/navigation/debug/rgb_voxels
+      -r /planes:=/$${ROS_NAMESPACE}/navigation/debug/rgb_planes
+      -r /dyn_obj:=/$${ROS_NAMESPACE}/navigation/debug/rgb_dyn_obj
+      -r /dyn_obj_removed:=/$${ROS_NAMESPACE}/navigation/debug/rgb_dyn_obj_removed
+      -r /dyn_obj_dbg_hist:=/$${ROS_NAMESPACE}/navigation/debug/rgb_dyn_obj_history
+      -r /mavros/vision_pose/pose:=/$${ROS_NAMESPACE}/navigation/debug/rgb_vision_pose
+      -r /rgb_img:=/$${ROS_NAMESPACE}/navigation/rgb_overlay
+      -r /tf:=/$${ROS_NAMESPACE}/navigation/tf_livo_rgb_preview_raw
+      -r /tf_static:=/$${ROS_NAMESPACE}/navigation/tf_static_livo_rgb_preview_raw
+      > /dev/null'
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          /bin/bash -lc "source /opt/ros/humble/setup.bash &&
+          source /opt/fast_livo_ws/install/setup.bash &&
+          timeout 5 stdbuf -oL ros2 topic echo
+          /$${ROS_NAMESPACE}/navigation/cloud_registered_rgb
+          sensor_msgs/msg/PointCloud2
+          --qos-reliability reliable --field width |
+          awk '/^[1-9][0-9]*$$/ {found=1} END {exit !found}'"
+      interval: 10s
+      timeout: 7s
+      retries: 3
+      start_period: 30s

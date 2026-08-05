@@ -1,0 +1,52 @@
+ARG FAST_LIVO2_BASE_IMAGE=phanthy-fast-livo2:g1-1fcd0d0-n2qos1
+FROM ${FAST_LIVO2_BASE_IMAGE}
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG FAST_LIVO2_COMMIT
+ARG FAST_LIVO2_RUNTIME_PATCH_SHA256
+ARG FAST_LIVO2_PCD_SAVE_PATCH_SHA256
+
+# The validated base image already contains every arm64 dependency and the
+# locked upstream checkout. Rebuild only fast_livo so field deployment can
+# transfer this tiny context and compile locally instead of streaming ~973 MB.
+COPY fast-livo2-runtime.patch /tmp/fast-livo2-runtime.patch
+COPY fast-livo2-pcd-save.patch /tmp/fast-livo2-pcd-save.patch
+RUN [[ "${FAST_LIVO2_COMMIT}" =~ ^[0-9a-f]{40}$ ]] && \
+    [[ "${FAST_LIVO2_RUNTIME_PATCH_SHA256}" =~ ^[0-9a-f]{64}$ ]] && \
+    [[ "${FAST_LIVO2_PCD_SAVE_PATCH_SHA256}" =~ ^[0-9a-f]{64}$ ]] && \
+    printf '%s  %s\n' \
+      "${FAST_LIVO2_RUNTIME_PATCH_SHA256}" \
+      /tmp/fast-livo2-runtime.patch | sha256sum -c - && \
+    printf '%s  %s\n' \
+      "${FAST_LIVO2_PCD_SAVE_PATCH_SHA256}" \
+      /tmp/fast-livo2-pcd-save.patch | sha256sum -c - && \
+    cd /opt/fast_livo_ws/src/fast_livo && \
+    test "$(git rev-parse HEAD)" = "${FAST_LIVO2_COMMIT}" && \
+    git reset --hard "${FAST_LIVO2_COMMIT}" && \
+    git apply --check /tmp/fast-livo2-runtime.patch && \
+    git apply /tmp/fast-livo2-runtime.patch && \
+    git apply --check /tmp/fast-livo2-pcd-save.patch && \
+    git apply /tmp/fast-livo2-pcd-save.patch && \
+    source /opt/ros/humble/setup.bash && \
+    source /opt/fast_livo_ws/install/setup.bash && \
+    cd /opt/fast_livo_ws && \
+    colcon build \
+      --executor sequential \
+      --packages-select fast_livo \
+      --cmake-clean-cache \
+      --cmake-args -DCMAKE_BUILD_TYPE=Release
+
+RUN strings /opt/fast_livo_ws/install/fast_livo/lib/fast_livo/fastlivo_mapping \
+      > /tmp/fastlivo_mapping.strings && \
+    grep -Fq "accepting current sample to resynchronize" \
+      /tmp/fastlivo_mapping.strings && \
+    grep -Fq "PCD checkpoint completed" \
+      /tmp/fastlivo_mapping.strings && \
+    grep -Fq "PCD finalization completed" \
+      /tmp/fastlivo_mapping.strings && \
+    ! grep -Fq "imu time stamp Jumps" /tmp/fastlivo_mapping.strings && \
+    rm /tmp/fastlivo_mapping.strings
+
+LABEL org.opencontainers.image.fast-livo2-runtime-patch="${FAST_LIVO2_RUNTIME_PATCH_SHA256}"
+LABEL org.opencontainers.image.fast-livo2-pcd-save-patch="${FAST_LIVO2_PCD_SAVE_PATCH_SHA256}"

@@ -1,0 +1,24 @@
+services:
+  fast-livo2:
+    labels:
+      com.phanthy.navigation.mode: mapping
+      com.phanthy.navigation.map_name: ${G1_MAP_NAME:?set G1_MAP_NAME to the controlled_spatial map_name}
+      com.phanthy.navigation.pcd_save_interval: "${G1_PCD_SAVE_INTERVAL:-600}"
+      com.phanthy.navigation.map_owner: "${G1_MAP_UID:-1000}:${G1_MAP_GID:-1000}"
+    # Keep the root identity already validated with host IPC, but grant the
+    # bind directory's ordinary group write bit without adding capabilities.
+    group_add:
+      - "${G1_MAP_GID:-1000}"
+    environment:
+      # Checkpoint the map about once per minute at a 10 Hz LIO rate, then save
+      # the remaining tail on graceful shutdown. This bounds data loss if final
+      # process teardown fails after a long mapping run.
+      PCD_SAVE_EN: "true"
+      PCD_SAVE_INTERVAL: "${G1_PCD_SAVE_INTERVAL:-600}"
+      PCD_SAVE_TYPE: "0"
+    volumes:
+      - ${G1_MAP_DIR:?set G1_MAP_DIR to a dedicated empty directory}:/opt/fast_livo_ws/src/fast_livo/Log/pcd:rw
+    # The base profile stays on Docker's default signal/10 seconds because it
+    # never saves a map. Mapping uses SIGINT for the final tail checkpoint.
+    stop_signal: SIGINT
+    stop_grace_period: 120s

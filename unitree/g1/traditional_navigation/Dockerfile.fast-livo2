@@ -1,0 +1,152 @@
+ARG ROS_BASE_IMAGE=ros:humble-ros-base-jammy
+FROM ${ROS_BASE_IMAGE}
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG FAST_LIVO2_REPO
+ARG FAST_LIVO2_COMMIT
+ARG RPG_VIKIT_REPO
+ARG RPG_VIKIT_COMMIT
+ARG LIVOX_ROS_DRIVER2_REPO
+ARG LIVOX_ROS_DRIVER2_COMMIT
+ARG LIVOX_SDK2_REPO
+ARG LIVOX_SDK2_COMMIT
+ARG SOPHUS_REPO
+ARG SOPHUS_COMMIT
+
+LABEL org.opencontainers.image.title="Phanthy Motus G1 FAST-LIVO2 shadow" \
+      org.opencontainers.image.source="${FAST_LIVO2_REPO}" \
+      org.opencontainers.image.revision="${FAST_LIVO2_COMMIT}" \
+      org.opencontainers.image.licenses="GPL-2.0"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    ROS_DOMAIN_ID=42 \
+    RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
+    FASTDDS_BUILTIN_TRANSPORTS=DEFAULT \
+    LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH}
+
+RUN for revision in \
+      "${FAST_LIVO2_COMMIT}" \
+      "${RPG_VIKIT_COMMIT}" \
+      "${LIVOX_ROS_DRIVER2_COMMIT}" \
+      "${LIVOX_SDK2_COMMIT}" \
+      "${SOPHUS_COMMIT}"; do \
+      [[ "${revision}" =~ ^[0-9a-f]{40}$ ]] || { \
+        echo "source revision is not a full Git SHA: ${revision}" >&2; exit 2; \
+      }; \
+    done
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential \
+      cmake \
+      git \
+      libapr1-dev \
+      libboost-all-dev \
+      libeigen3-dev \
+      libfmt-dev \
+      libopencv-dev \
+      libpcl-dev \
+      python3-colcon-common-extensions \
+      ros-humble-ament-cmake-auto \
+      ros-humble-cv-bridge \
+      ros-humble-image-transport \
+      ros-humble-pcl-conversions \
+      ros-humble-pcl-ros \
+      ros-humble-rosidl-default-generators \
+      ros-humble-tf2-geometry-msgs \
+      ros-humble-tf2-ros \
+      ros-humble-visualization-msgs && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN git init /tmp/livox-sdk2 && \
+    cd /tmp/livox-sdk2 && \
+    git remote add origin "${LIVOX_SDK2_REPO}" && \
+    git fetch --depth 1 origin "${LIVOX_SDK2_COMMIT}" && \
+    git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "${LIVOX_SDK2_COMMIT}" && \
+    cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && \
+    cmake --build build --parallel 2 && \
+    cmake --install build && \
+    rm -rf /tmp/livox-sdk2 && \
+    ldconfig
+
+RUN git init /tmp/sophus && \
+    cd /tmp/sophus && \
+    git remote add origin "${SOPHUS_REPO}" && \
+    git fetch --depth 1 origin "${SOPHUS_COMMIT}" && \
+    git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "${SOPHUS_COMMIT}" && \
+    cmake -S . -B build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_SOPHUS_TESTS=OFF && \
+    cmake --build build --parallel 2 && \
+    cmake --install build && \
+    rm -rf /tmp/sophus && \
+    ldconfig
+
+WORKDIR /opt/fast_livo_ws/src
+
+RUN git init livox_ros_driver2 && \
+    cd livox_ros_driver2 && \
+    git remote add origin "${LIVOX_ROS_DRIVER2_REPO}" && \
+    git fetch --depth 1 origin "${LIVOX_ROS_DRIVER2_COMMIT}" && \
+    git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "${LIVOX_ROS_DRIVER2_COMMIT}" && \
+    cp package_ROS2.xml package.xml && \
+    cp -r launch_ROS2 launch
+
+RUN git init rpg_vikit_ros2_fisheye && \
+    cd rpg_vikit_ros2_fisheye && \
+    git remote add origin "${RPG_VIKIT_REPO}" && \
+    git fetch --depth 1 origin "${RPG_VIKIT_COMMIT}" && \
+    git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "${RPG_VIKIT_COMMIT}"
+
+RUN git init fast_livo && \
+    cd fast_livo && \
+    git remote add origin "${FAST_LIVO2_REPO}" && \
+    git fetch --depth 1 origin "${FAST_LIVO2_COMMIT}" && \
+    git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "${FAST_LIVO2_COMMIT}"
+
+WORKDIR /opt/fast_livo_ws
+
+RUN source /opt/ros/humble/setup.bash && \
+    colcon build \
+      --executor sequential \
+      --packages-select livox_ros_driver2 vikit_common vikit_ros \
+      --cmake-args \
+        -DROS_EDITION=ROS2 \
+        -DDISTRO_ROS=humble \
+        -DCMAKE_BUILD_TYPE=Release && \
+    source install/setup.bash && \
+    colcon build \
+      --executor sequential \
+      --packages-select fast_livo \
+      --cmake-args -DCMAKE_BUILD_TYPE=Release
+
+ARG FAST_LIVO2_RUNTIME_PATCH_SHA256
+COPY fast-livo2-runtime.patch /tmp/fast-livo2-runtime.patch
+RUN [[ "${FAST_LIVO2_RUNTIME_PATCH_SHA256}" =~ ^[0-9a-f]{64}$ ]] && \
+    printf '%s  %s\n' \
+      "${FAST_LIVO2_RUNTIME_PATCH_SHA256}" \
+      /tmp/fast-livo2-runtime.patch | sha256sum -c - && \
+    cd /opt/fast_livo_ws/src/fast_livo && \
+    git apply --check /tmp/fast-livo2-runtime.patch && \
+    git apply /tmp/fast-livo2-runtime.patch
+
+RUN source /opt/ros/humble/setup.bash && \
+    source install/setup.bash && \
+    colcon build \
+      --executor sequential \
+      --packages-select fast_livo \
+      --cmake-args -DCMAKE_BUILD_TYPE=Release
+
+LABEL org.opencontainers.image.fast-livo2-runtime-patch="${FAST_LIVO2_RUNTIME_PATCH_SHA256}"
+
+RUN mkdir -p /opt/phanthy/config
+COPY g1_lio.yaml /opt/phanthy/config/g1_lio.yaml
+
+ENV ROS_LOG_DIR=/tmp/ros-log
+
+CMD ["/bin/bash", "-lc", "source /opt/ros/humble/setup.bash && source /opt/fast_livo_ws/install/setup.bash && exec ros2 run fast_livo fastlivo_mapping --ros-args --params-file /opt/phanthy/config/g1_lio.yaml"]

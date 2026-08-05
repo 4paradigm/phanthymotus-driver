@@ -2,10 +2,13 @@ ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 ARG PYPI_MIRROR=https://pypi.org/simple/
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
+ARG UBUNTU_PORTS_MIRROR=http://ports.ubuntu.com/ubuntu-ports
 
 WORKDIR /work
 
-RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
+RUN sed -i "s|http://mirrors.tencentyun.com/ubuntu-ports|${UBUNTU_PORTS_MIRROR}|g" \
+        /etc/apt/sources.list && \
+    apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
         python3-pip \
         python3-colcon-common-extensions \
@@ -33,7 +36,7 @@ RUN curl -fsSL ${CYCLONEDDS_URL} \
     rm -rf /tmp/cyclonedds-0.10.5
 
 ENV CYCLONEDDS_HOME=/opt/cyclonedds
-ENV LD_LIBRARY_PATH=/opt/cyclonedds/lib:${LD_LIBRARY_PATH}
+ENV LD_LIBRARY_PATH=/opt/cyclonedds/lib
 
 RUN pip3 install --no-cache-dir --no-binary cyclonedds -i ${PYPI_MIRROR} cyclonedds==0.10.5
 
@@ -52,8 +55,13 @@ COPY ext_devices.py /work/ext_devices.py
 COPY safety_harness.py /work/safety_harness.py
 COPY scan_context.py /work/scan_context.py
 COPY controlled_spatial.py /work/controlled_spatial.py
+COPY controlled_spatial_contract.py /work/controlled_spatial_contract.py
 COPY controlled_spatial_map.py /work/controlled_spatial_map.py
 COPY pointcloud_utils.py /work/pointcloud_utils.py
+COPY navigation_time.py /work/navigation_time.py
+COPY navigation_pointcloud.py /work/navigation_pointcloud.py
+COPY navigation_sensor_bridge.py /work/navigation_sensor_bridge.py
+COPY navigation_sensor_bridge_main.py /work/navigation_sensor_bridge_main.py
 COPY test_slam_rpc.py /work/test_slam_rpc.py
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
