@@ -3703,6 +3703,7 @@ class TtsPlugin:
                     "force": {"type": "boolean", "description": "是否强制播放(打断当前播放)", "default": False},
                 },
                 "required": ["action"],
+                "x-completion": {"actions": ["speak"], "timeout": 60},
                 "x-action-params": {
                     "speak": {"params": ["text", "force"], "description": "合成并播放文本"},
                     "interrupt": {"params": [], "description": "中止播放（不可恢复）"},
@@ -3748,13 +3749,35 @@ class TtsPlugin:
             return {"error": "service client not initialized"}
         try:
             from lyre_msgs.srv import PlayText
+            import uuid as _uuid
             req = PlayText.Request()
             req.text = text
             req.force = force
             req.last = True
             future = self._play_client.call_async(req)
-            # Non-blocking, just return immediately
-            return {"state": "speaking", "text": text[:50]}
+            action_id = f"tts-{_uuid.uuid4().hex[:8]}"
+            # Background thread: wait for service response then ACP callback
+            def _wait_cb(fut, aid):
+                import time as _t
+                start = _t.time()
+                while not fut.done() and _t.time() - start < 60:
+                    _t.sleep(0.1)
+                try:
+                    import urllib.request, ssl, json as _json
+                    url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+                    ctx = ssl.create_default_context()
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                    p = _json.dumps({"action_id": aid, "status": "completed",
+                                     "result": {"action": "speak"}}).encode()
+                    r = urllib.request.Request(f"{url}/api/acp/complete", data=p,
+                                              headers={"Content-Type": "application/json"}, method="POST")
+                    urllib.request.urlopen(r, timeout=3, context=ctx)
+                    print(f"[TtsPlugin] ACP complete: {aid}")
+                except Exception as e:
+                    print(f"[TtsPlugin] ACP callback failed: {e}")
+            threading.Thread(target=_wait_cb, args=(future, action_id), daemon=True).start()
+            return {"state": "speaking", "action_id": action_id, "text": text[:50]}
         except Exception as e:
             return {"error": str(e)}
 
