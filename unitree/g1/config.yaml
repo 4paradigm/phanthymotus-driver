@@ -29,7 +29,7 @@ plugins:
     velocity_proposal_nav_status_timeout: 0.25
     velocity_proposal_watchdog_hz: 40
     velocity_proposal_rpc_timeout: 0.1
-    velocity_proposal_stop_rpc_timeout: 0.1
+    velocity_proposal_stop_rpc_timeout: 0.2
     velocity_proposal_fsm_rpc_timeout: 0.2
     velocity_proposal_stop_confirm_timeout: 0.5
     velocity_proposal_stop_linear_epsilon: 0.03

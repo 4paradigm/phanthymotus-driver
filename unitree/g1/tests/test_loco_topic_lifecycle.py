@@ -75,11 +75,15 @@ from device import LocoPlugin  # noqa: E402
 class FakeClient:
     def __init__(self):
         self.stop_count = 0
+        self.stop_ret = 0
+        self.stop_error = None
         self.fsm_ids = []
 
     def StopMove(self):
         self.stop_count += 1
-        return 0
+        if self.stop_error is not None:
+            raise self.stop_error
+        return self.stop_ret
 
     def SetFsmId(self, fsm_id):
         self.fsm_ids.append(fsm_id)
@@ -224,6 +228,35 @@ class LocoTopicLifecycleTest(unittest.TestCase):
         self.assertFalse(result["connected"])
         self.assertEqual(result["stop_move_ret"], 0)
         self.assertEqual(result["stop_confirmation"], diagnostics)
+        self.assertEqual(result["fallback_stop_ret"], 0)
+        self.assertIsNone(result["fallback_stop_error"])
+        self.assertEqual(self.client.stop_count, 1)
+
+    def test_start_preserves_child_diagnostics_when_fallback_stop_raises(self):
+        diagnostics = {
+            "stop_move_ret": 3104,
+            "stop_move_error": None,
+            "confirmation_timed_out": False,
+        }
+        self.smart_motion.bind_result = {
+            "error": "StopMove/odometry stop was not confirmed before proposal bind",
+            "connected": False,
+            "armed": False,
+            "stop_confirmed": False,
+            "stop_move_ret": 3104,
+            "stop_move_error": None,
+            "stop_confirmation": diagnostics,
+        }
+        self.client.stop_error = RuntimeError("fallback unavailable")
+
+        result = self.plugin.dispatch(
+            "start",
+            {"input_topic": self.topic, "expected_nav_id": self.nav_id},
+        )
+
+        self.assertEqual(result["stop_confirmation"], diagnostics)
+        self.assertIsNone(result["fallback_stop_ret"])
+        self.assertEqual(result["fallback_stop_error"], "fallback unavailable")
         self.assertEqual(self.client.stop_count, 1)
 
     def test_other_tools_do_not_bind_or_unbind_loco_topic(self):
