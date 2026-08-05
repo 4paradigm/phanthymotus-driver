@@ -545,3 +545,160 @@ unitree-g1:                      # Service name (must be unique)
 - `network_mode`, `ipc`, `pid` are injected by Agent Core during deployment — do not specify them in service.yml
 - The `__IMAGE__` placeholder is automatically replaced with the actual image reference
 - Service name should follow the pattern `{provider}-{model}` (e.g. `unitree-g1`, `phanthy-remote-control`)
+
+---
+
+## Action Completion Protocol (ACP)
+
+When a tool performs a long-running physical action (TTS playback, navigation, arm movement), the LLM agent needs to know when the action finishes. ACP solves this at the **harness level** — the Agent Core transparently tracks async actions and exposes a `sync()` tool for the LLM to wait on.
+
+### How It Works
+
+```
+LLM calls speak("hello")
+  → Driver dispatch() returns {"status":"running", "action_id":"speak-a7f3c"}
+  → Agent Core registers pending action
+  → LLM sees the immediate result, can continue reasoning
+
+...speech plays...
+
+Driver worker finishes
+  → SSE push: {"type":"action_complete", "action_id":"speak-a7f3c", "status":"completed"}
+  → Agent Core resolves the pending action
+  → Completion notification injected into LLM turn (via steering)
+
+LLM calls sync(["speak-a7f3c"])   (or waits for steering notification)
+  → Blocks until action completes → returns results
+```
+
+### Driver Implementation Guide
+
+#### 1. Declare `x-completion` in tool schema
+
+Add to your tool's `inputSchema`:
+
+```python
+"inputSchema": {
+    "type": "object",
+    "properties": { ... },
+    "required": ["action"],
+    "x-completion": {
+        "actions": ["speak", "navigate_to_tag"],  # which actions are async
+        "timeout": 120                             # max wait seconds
+    }
+}
+```
+
+#### 2. Return `action_id` in async action responses
+
+When an async action is dispatched, include `action_id` in the return dict:
+
+```python
+def dispatch(self, action, args):
+    if action == "speak":
+        action_id = f"speak-{uuid4().hex[:8]}"
+        self.queue.put((args["text"], action_id))
+        return {"status": "running", "action_id": action_id}
+```
+
+The `action_id` must be unique and stable — it's the correlation key for completion.
+
+#### 3. Push SSE completion event
+
+When the action finishes, call `sse_push()` (provided by `main.py`):
+
+```python
+from main import sse_push
+
+# On success:
+sse_push({
+    "type": "action_complete",
+    "action_id": action_id,
+    "status": "completed",          # "completed" | "error" | "cancelled"
+    "result": {"frames": 42},       # optional result data
+})
+
+# On error:
+sse_push({
+    "type": "action_complete",
+    "action_id": action_id,
+    "status": "error",
+    "result": {"error": "timeout"},
+})
+```
+
+#### 4. Add SSE endpoint to your `main.py`
+
+Your driver's HTTP handler needs a `/sse` GET endpoint. Add the standard SSE infrastructure:
+
+```python
+import queue as _queue
+
+_sse_clients: list[_queue.Queue] = []
+_sse_lock = threading.Lock()
+
+def sse_push(event: dict):
+    """Thread-safe broadcast SSE event to all connected clients."""
+    data = json.dumps(event, ensure_ascii=False)
+    with _sse_lock:
+        dead = []
+        for q in _sse_clients:
+            try:
+                q.put_nowait(data)
+            except _queue.Full:
+                dead.append(q)
+        for q in dead:
+            _sse_clients.remove(q)
+```
+
+And in the handler's `do_GET`:
+
+```python
+def do_GET(self):
+    if self.path.split("?")[0] == "/sse":
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
+        client_queue = _queue.Queue(maxsize=64)
+        with _sse_lock:
+            _sse_clients.append(client_queue)
+        try:
+            while True:
+                try:
+                    data = client_queue.get(timeout=30)
+                    self.wfile.write(f"data: {data}\n\n".encode())
+                    self.wfile.flush()
+                except _queue.Empty:
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            with _sse_lock:
+                if client_queue in _sse_clients:
+                    _sse_clients.remove(client_queue)
+        return
+```
+
+### LLM-Side Usage (handled by Agent Core)
+
+The LLM sees a `sync()` system tool:
+
+```
+sync(action_ids="speak-a7f3c,nav-001", timeout=120)
+→ Blocks until all specified actions complete
+→ Returns {"status": "completed", "results": {...}}
+```
+
+If no `action_ids` specified, waits for ALL pending actions.
+
+Completion notifications also arrive as **steering messages** between tool calls, so the LLM can react to completions without explicitly calling `sync()`.
+
+### Backward Compatibility
+
+- Tools without `x-completion` → unchanged behavior (sync return)
+- Tools that don't return `action_id` → no pending registered, no waiting
+- Drivers without `/sse` → Agent Core's SSE subscription silently reconnects with backoff

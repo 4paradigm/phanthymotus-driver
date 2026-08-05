@@ -267,6 +267,10 @@ class ControlledSpatialPlugin:
                     "restricted_scheduling_points": {"type": "string", "description": "Restricted area: scheduling points JSON string"},
                 },
                 "required": ["action"],
+                "x-completion": {
+                    "actions": ["navigate_to_tag", "navigate_to_pose"],
+                    "timeout": 180
+                },
                 "x-action-params": {
                     "start_mapping": {"params": ["map_name"], "description": "Start SLAM mapping with given map name"},
                     "stop_mapping": {"params": [], "description": "Stop mapping and save the map"},
@@ -365,6 +369,18 @@ class ControlledSpatialPlugin:
                         self._nav_active = False
                         self._nav_lost_count = 0
                         self._map_status = "localized"
+                        # ACP: push completion SSE
+                        if self._nav_action_id:
+                            try:
+                                from main import sse_push
+                                sse_push({
+                                    "type": "action_complete",
+                                    "action_id": str(self._nav_action_id),
+                                    "status": "completed",
+                                    "result": {"pose": self._current_pose},
+                                })
+                            except Exception:
+                                pass
                     elif action_state == 4 and result_code in (-1, -2):
                         # Done + Failed/Aborted
                         label = "failed" if result_code == -1 else "aborted"
@@ -374,6 +390,18 @@ class ControlledSpatialPlugin:
                         self._nav_active = False
                         self._nav_lost_count = 0
                         self._map_status = "localized"
+                        # ACP: push error SSE
+                        if self._nav_action_id:
+                            try:
+                                from main import sse_push
+                                sse_push({
+                                    "type": "action_complete",
+                                    "action_id": str(self._nav_action_id),
+                                    "status": "error",
+                                    "result": {"error": self._nav_error},
+                                })
+                            except Exception:
+                                pass
                     elif action_state == 3:
                         # Paused — still active, don't treat as lost
                         self._nav_lost_count = 0
@@ -797,6 +825,7 @@ class ControlledSpatialPlugin:
 
             return {
                 "status": "navigating",
+                "action_id": str(self._nav_action_id) if self._nav_action_id else None,
                 "target": tag_name,
                 "pose": {"x": poi["x"], "y": poi["y"], "yaw": yaw},
             }
@@ -873,6 +902,7 @@ class ControlledSpatialPlugin:
 
             return {
                 "status": "navigating",
+                "action_id": str(self._nav_action_id) if self._nav_action_id else None,
                 "target_pose": {"x": x, "y": y, "yaw": yaw},
             }
 
