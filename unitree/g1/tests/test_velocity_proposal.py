@@ -232,6 +232,39 @@ class ProposalGateTest(unittest.TestCase):
         self.assertFalse(self.gate.armed)
         self.assertFalse(self.gate.accept(proposal(sequence=2), now=50.202).execute)
 
+    def test_end_to_end_ttl_rejects_proposal_already_expired_at_driver(self):
+        rejected = self.gate.accept(
+            proposal(issued_at_unix_ms=1_000, ttl_ms=200),
+            now=50.0,
+            now_unix_ms=1_201,
+        )
+
+        self.assertTrue(rejected.stop)
+        self.assertEqual(rejected.reason, "proposal_ttl_expired")
+        self.assertFalse(self.gate.armed)
+        self.assertEqual(self.gate.last_reason, "proposal_ttl_expired")
+
+    def test_end_to_end_ttl_uses_only_remaining_producer_lease(self):
+        accepted = self.gate.accept(
+            proposal(issued_at_unix_ms=1_000, ttl_ms=200),
+            now=50.0,
+            now_unix_ms=1_150,
+        )
+
+        self.assertTrue(accepted.execute)
+        self.assertAlmostEqual(accepted.duration, 0.05)
+        self.assertAlmostEqual(self.gate.deadline_monotonic, 50.05)
+
+    def test_future_producer_timestamp_cannot_extend_max_ttl(self):
+        accepted = self.gate.accept(
+            proposal(issued_at_unix_ms=2_000, ttl_ms=200),
+            now=50.0,
+            now_unix_ms=1_000,
+        )
+
+        self.assertAlmostEqual(accepted.duration, 0.2)
+        self.assertAlmostEqual(self.gate.deadline_monotonic, 50.2)
+
     def test_invalid_payload_disarms_until_explicit_bind(self):
         rejected = self.gate.accept(proposal(frame="map"), now=10.0)
         self.assertTrue(rejected.stop)

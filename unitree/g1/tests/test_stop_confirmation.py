@@ -7,8 +7,10 @@ import unittest
 from safety_harness import (
     OdomStopMonitor,
     StopConfirmationStart,
+    aggregate_stop_attempts,
     finish_stop_confirmation,
     issue_stop_and_confirm,
+    resolve_stop_confirmation_timeout,
 )
 
 
@@ -67,6 +69,37 @@ class StopMoveConfirmationIntegrationTest(unittest.TestCase):
             result["stop_confirmation"]["odometry_callbacks_during_stop_move"],
             0,
         )
+
+    def test_zero_frame_after_old_half_second_window_is_confirmed(self):
+        callback_finished = threading.Event()
+
+        def publish_gait_settled_zero():
+            try:
+                time.sleep(0.55)
+                self.monitor.record((0.0, 0.0, 0.0))
+            finally:
+                callback_finished.set()
+
+        publisher = threading.Thread(
+            target=publish_gait_settled_zero,
+            daemon=True,
+        )
+        publisher.start()
+
+        result = self.confirm(
+            lambda: 0,
+            timeout=resolve_stop_confirmation_timeout(0.5),
+        )
+
+        self.assertTrue(callback_finished.wait(0.5))
+        publisher.join(timeout=0.5)
+        self.assertTrue(result["stop_confirmed"])
+        self.assertFalse(result["stop_confirmation"]["confirmation_timed_out"])
+
+    def test_stop_confirmation_timeout_is_sdk_aware_and_bounded(self):
+        self.assertEqual(resolve_stop_confirmation_timeout(0.1), 1.0)
+        self.assertEqual(resolve_stop_confirmation_timeout(2.0), 2.0)
+        self.assertEqual(resolve_stop_confirmation_timeout(10.0), 3.0)
 
     def test_nonzero_frame_fails_closed_and_reports_last_velocity(self):
         def publish_nonzero():
@@ -188,6 +221,47 @@ class StopMoveConfirmationIntegrationTest(unittest.TestCase):
         self.assertTrue(result["stop_confirmed"])
         self.assertEqual(diagnostics["odometry_callbacks_during_stop_move"], 1)
         self.assertEqual(diagnostics["odometry_callbacks_since_confirmation"], 2)
+
+    def test_bounded_retry_keeps_first_failed_confirmation(self):
+        first = {
+            "ret": 0,
+            "stop_confirmed": False,
+            "stop_confirmation": {
+                "confirmation_timed_out": True,
+                "last_odometry_velocity": {
+                    "x": 0.1,
+                    "y": 0.0,
+                    "yaw": 0.0,
+                },
+            },
+        }
+        second = {
+            "ret": 0,
+            "stop_confirmed": True,
+            "stop_confirmation": {
+                "confirmation_timed_out": False,
+                "last_odometry_velocity": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "yaw": 0.0,
+                },
+            },
+        }
+
+        result = aggregate_stop_attempts([first, second])
+
+        self.assertTrue(result["stop_confirmed"])
+        self.assertEqual(result["stop_attempt_count"], 2)
+        self.assertTrue(
+            result["stop_attempts"][0]["stop_confirmation"][
+                "confirmation_timed_out"
+            ]
+        )
+        self.assertFalse(
+            result["stop_attempts"][1]["stop_confirmation"][
+                "confirmation_timed_out"
+            ]
+        )
 
 
 if __name__ == "__main__":

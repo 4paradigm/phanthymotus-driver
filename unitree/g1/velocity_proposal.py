@@ -1,8 +1,8 @@
 """Pure validation and lease state for the N5 Nav2 velocity proposal gate.
 
 This module deliberately has no ROS 2 or Unitree dependency.  The SmartMotion
-subprocess owns physical execution; it may act only on a ProposalDecision
-returned here.
+subprocess owns validation and authorization; only a ProposalDecision returned
+here may be forwarded to the parent Driver RPC worker for physical execution.
 """
 
 from __future__ import annotations
@@ -268,7 +268,12 @@ class VelocityProposalGate:
             and self.expected_nav_id == expected_nav_id
         )
 
-    def accept(self, payload: Mapping[str, Any], now: float) -> ProposalDecision:
+    def accept(
+        self,
+        payload: Mapping[str, Any],
+        now: float,
+        now_unix_ms: Optional[float] = None,
+    ) -> ProposalDecision:
         if not self.connected_topic:
             return ProposalDecision(stop=True, reason="proposal_not_connected")
         if not self.armed:
@@ -286,6 +291,23 @@ class VelocityProposalGate:
             self.disarm("sequence_not_increasing")
             return ProposalDecision(stop=True, reason="sequence_not_increasing", proposal=proposal)
 
+        duration = proposal.ttl_ms / 1000.0
+        if now_unix_ms is not None:
+            remaining = (
+                proposal.issued_at_unix_ms
+                + proposal.ttl_ms
+                - float(now_unix_ms)
+            ) / 1000.0
+            if remaining <= 0.0:
+                self.disarm("proposal_ttl_expired")
+                return ProposalDecision(
+                    stop=True,
+                    reason="proposal_ttl_expired",
+                    proposal=proposal,
+                )
+            # A future producer timestamp may not extend the configured TTL.
+            duration = min(duration, remaining)
+
         self.last_sequence = proposal.sequence
         self.last_receive_monotonic = now
         if proposal.is_zero:
@@ -296,7 +318,6 @@ class VelocityProposalGate:
                 self.last_reason = proposal.status
             return ProposalDecision(stop=True, reason="proposal_zero", proposal=proposal)
 
-        duration = proposal.ttl_ms / 1000.0
         self.deadline_monotonic = now + duration
         self.last_reason = ""
         return ProposalDecision(execute=True, duration=duration, proposal=proposal)
