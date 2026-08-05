@@ -210,12 +210,6 @@ class TianyiDeviceBundle:
             self._plugins.append(CameraPlugin(plugins_cfg["camera"], namespace, ros2))
             print("[bundle] CameraPlugin loaded")
 
-        if plugins_cfg.get("camera_hand_gesture", {}).get("enabled", False):
-            from device import CameraHandGesturePlugin
-            self._plugins.append(CameraHandGesturePlugin(
-                plugins_cfg["camera_hand_gesture"], namespace, ros2))
-            print("[bundle] CameraHandGesturePlugin loaded")
-
         for config_name, class_name in (("imu", "ImuPlugin"),
                                         ("camera_depth", "DepthCameraPlugin"),
                                         ("camera_pointcloud", "PointCloudPlugin")):
