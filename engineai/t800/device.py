@@ -1707,3 +1707,402 @@ class SafetyControlPlugin:
         msg.damping = [1.0] * len(T800_JOINT_NAMES)
         msg.parallel_parser_type = 0
         self._joint_pub.publish(msg)
+
+
+class MicPlugin:
+    """T800 内置麦克风采集，重采样并缓冲后发布到 Agent Core 音频流。
+
+    Robot audio is captured from the local sound card (the T800 application
+    unit), resampled to 16 kHz mono PCM_S16_LE, buffered into 1024-byte chunks
+    and published on domain 42 as ``audio_msgs/AudioChunk`` with format
+    ``audio/pcm-16k``.  The chunk size is a hard constraint of the perception
+    ASR VAD: chunks smaller than 1024 bytes are silently discarded.
+    """
+
+    _CHUNK_SAMPLES = 512  # 16 kHz 下 1024 字节 = 512 samples
+    _CHUNK_BYTES = 1024
+    _FLUSH_INTERVAL = 0.05
+    _FALLBACK_RATE = 48000  # 设备不支持 16k 时的采集回退
+
+    def __init__(self, config: dict, namespace: str, ros2):
+        self._config = config
+        self._ns = namespace
+        self._topic = f"/{namespace}/mic/audio"
+        self._node = Node("t800_mic", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._node)
+        self._publisher = None
+        self._message_type = None
+        self._header_type = None
+        self._running = False
+        self._stream = None
+        self._thread = None
+        self._buf = bytearray()
+        self._buf_lock = threading.Lock()
+        self._samples_published = 0
+        self._last_error = ""
+
+    def get_tool(self) -> dict:
+        return sensor_tool(
+            "mic",
+            f"T800 内置麦克风 PCM-16 16kHz 单声道采集，按 1024 字节缓冲后发布到 {self._topic}（满足 perception ASR 协议）",
+            self._topic,
+            "audio/pcm-16k",
+        )
+
+    def start(self) -> None:
+        if self._running:
+            return
+        try:
+            import sounddevice as sd
+        except ImportError:
+            self._last_error = "sounddevice 未安装"
+            return
+        from audio_msgs.msg import AudioChunk
+        from std_msgs.msg import Header
+
+        self._message_type = AudioChunk
+        self._header_type = Header
+        self._publisher = self._node.create_publisher(AudioChunk, self._topic, _BEST_EFFORT)
+
+        mic_config = (self._config.get("plugins", {}).get("mic", {}) or {})
+        device_index = mic_config.get("device_index")
+        rate = int(mic_config.get("sample_rate", 16000))
+        try:
+            stream = sd.InputStream(
+                samplerate=rate, channels=1, dtype="int16",
+                device=device_index, callback=self._on_audio,
+            )
+        except Exception:
+            # 设备不支持请求采样率时回退 48k，回调内做 3:1 均值重采样
+            stream = sd.InputStream(
+                samplerate=self._FALLBACK_RATE, channels=1, dtype="int16",
+                device=device_index, callback=self._on_audio,
+            )
+            self._downsample = self._FALLBACK_RATE // rate
+        stream.start()
+        self._stream = stream
+        self._running = True
+        self._thread = threading.Thread(target=self._flush_loop, daemon=True, name="t800-mic")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._running = False
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+        self._thread = None
+
+    def _on_audio(self, indata, frames, time_info, status) -> None:
+        # indata: int16 (frames, 1)；48k 回退时按 3:1 均值重采样
+        samples = indata[:, 0]
+        if getattr(self, "_downsample", 1) != 1:
+            step = self._downsample
+            trimmed = samples[: len(samples) - (len(samples) % step)]
+            samples = trimmed.reshape(-1, step).mean(axis=1)
+        with self._buf_lock:
+            self._buf += samples.astype("<i2").tobytes()
+
+    def _flush_loop(self) -> None:
+        while self._running:
+            try:
+                if self._publisher is None:
+                    time.sleep(self._FLUSH_INTERVAL)
+                    continue
+                with self._buf_lock:
+                    buf = self._buf
+                    self._buf = bytearray()
+                while len(buf) >= self._CHUNK_BYTES:
+                    chunk = bytes(buf[:self._CHUNK_BYTES])
+                    buf = buf[self._CHUNK_BYTES:]
+                    self._publish_chunk(chunk)
+                if buf:
+                    # 不足一个 chunk 的残尾写回缓冲，跨轮继续累积（避免采样丢失）
+                    with self._buf_lock:
+                        self._buf = buf + self._buf
+            except Exception as exc:  # noqa: BLE001
+                print(f"[MicPlugin] flush error: {exc}", flush=True)
+            time.sleep(self._FLUSH_INTERVAL)
+
+    def _publish_chunk(self, chunk: bytes) -> None:
+        msg = self._message_type()
+        msg.header = self._header_type()
+        msg.header.stamp = self._node.get_clock().now().to_msg()
+        msg.format = "audio/pcm-16k"
+        msg.data = list(chunk)
+        self._publisher.publish(msg)
+        self._samples_published += len(chunk) // 2
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "start":
+            self.start()
+            if self._running:
+                return {"state": "running", "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}]}
+            return {"error": f"mic capture failed: {self._last_error or 'no audio device'}"}
+        if action == "stop":
+            self.stop()
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "running" if self._running else "idle",
+                    "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}],
+                    "samples_published": self._samples_published}
+        return {"error": f"unknown mic action: {action}"}
+
+
+class SpeakerPlugin:
+    """T800 内置扬声器本地播放（WAV 文件或 base64 PCM_S16_LE 数据）。"""
+
+    def __init__(self, config: dict, namespace: str, ros2):
+        self._config = config
+        self._playing = False
+        self._last_error = ""
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "speaker",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "T800 内置扬声器播放：WAV 文件路径或 base64 PCM_S16_LE 数据",
+            "inputSchema": action_schema(
+                {
+                    "play_file": (["path"], "播放本地 WAV 文件（后台线程，可被 stop 中断）"),
+                    "play_wav": (["data_b64", "sample_rate"], "播放 base64 编码的 PCM_S16_LE 音频"),
+                    "stop": ([], "停止当前播放"),
+                    "list_devices": ([], "列出可用音频输出设备"),
+                },
+                {
+                    "path": {"type": "string", "description": "WAV 文件绝对路径"},
+                    "data_b64": {"type": "string", "description": "PCM_S16_LE 音频数据的 base64 编码"},
+                    "sample_rate": {"type": "integer", "description": "采样率 Hz，默认 16000"},
+                },
+                "扬声器播放",
+            ),
+        }
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        try:
+            import sounddevice as sd
+            sd.stop()
+        except ImportError:
+            pass
+        self._playing = False
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "info"):
+            return {"state": "ready", "playing": self._playing}
+        if action == "stop":
+            self.stop()
+            return {"state": "idle"}
+        if action == "list_devices":
+            try:
+                import sounddevice as sd
+                return {"devices": [str(d) for d in sd.query_devices()]}
+            except ImportError:
+                return {"error": "sounddevice 未安装"}
+        if action == "play_file":
+            import wave
+            path = str(args.get("path", "")).strip()
+            if not path:
+                return {"error": "path is required"}
+            try:
+                with wave.open(path, "rb") as wav:
+                    frames = wav.readframes(wav.getnframes())
+                    sample_rate = wav.getframerate()
+                    channels = wav.getnchannels()
+            except Exception as exc:
+                return {"error": f"cannot read wav file: {exc}"}
+            return self._play_pcm(frames, sample_rate, channels, source=path)
+        if action == "play_wav":
+            import base64
+            data = base64.b64decode(str(args.get("data_b64", "")))
+            sample_rate = int(args.get("sample_rate", 16000))
+            return self._play_pcm(data, sample_rate, channels=1, source="data_b64")
+        return {"error": f"unknown speaker action: {action}"}
+
+    def _play_pcm(self, data: bytes, sample_rate: int, channels: int, *, source: str) -> dict:
+        try:
+            import numpy as np
+            import sounddevice as sd
+        except ImportError:
+            self._last_error = "sounddevice/numpy 未安装"
+            return {"error": self._last_error}
+        samples = np.frombuffer(data, dtype="<i2").reshape(-1, channels)
+        try:
+            sd.play(samples, samplerate=sample_rate)
+            self._playing = True
+        except Exception as exc:
+            self._last_error = str(exc)
+            return {"error": f"playback failed: {exc}"}
+        return {"state": "playing", "source": source, "sample_rate": sample_rate,
+                "channels": channels, "samples": int(len(samples))}
+
+
+class VisionPlugin:
+    """T800-Odin2 激光雷达相机视觉数据桥接（飞书文档 7.2 节）。
+
+    Subscribes to the Odin2 raw/SLAM point clouds, stereo compressed images
+    and depth map topics published by ``odin_ros_driver`` on the Orin board,
+    and republishes normalized streams on domain 42 for Agent Core and the
+    dashboard renderers (``sensor/pointcloud``, ``image/jpeg``,
+    ``image/depth-z16``).  Topic names follow the per-device prefix
+    ``/{topic_prefix}/{model}/device{N}/`` and must be calibrated against
+    ``ros_graph`` on the real robot.
+    """
+
+    _SOURCES = ("raw", "slam")
+
+    def __init__(self, config: dict, namespace: str, ros2):
+        self._config = config
+        self._ns = namespace
+        self._topics = config["topics"]
+        vision_config = config.get("plugins", {}).get("vision", {}) or {}
+        self._source = vision_config.get("source", "raw")
+        if self._source not in self._SOURCES:
+            self._source = "raw"
+        self._cloud_topic = f"/{namespace}/vision/cloud"
+        self._cam_left_topic = f"/{namespace}/vision/camera_left"
+        self._cam_right_topic = f"/{namespace}/vision/camera_right"
+        self._depth_topic = f"/{namespace}/vision/depth"
+        self._sub_node = Node("t800_vision_sub", context=ros2.ctx_robot)
+        self._pub_node = Node("t800_vision_pub", context=ros2.ctx_core)
+        ros2.executor_robot.add_node(self._sub_node)
+        ros2.executor_core.add_node(self._pub_node)
+        self._running = False
+        self._lock = threading.RLock()
+        self._frames = {"pointcloud": 0, "camera_left": 0, "camera_right": 0, "depth": 0}
+
+    def get_tools(self) -> list[dict]:
+        return [self._cloud_tool(), self._camera_tool(), self._depth_tool()]
+
+    def _cloud_tool(self) -> dict:
+        return sensor_tool(
+            "pointcloud",
+            f"T800-Odin2 {self._source} 点云转发（256×192）；二进制 [uint32 point_step][uint32 total_points]"
+            f"[PointCloud2 bytes]，发布到 {self._cloud_topic}",
+            self._cloud_topic,
+            "sensor/pointcloud",
+        )
+
+    def _camera_tool(self) -> dict:
+        return {
+            "name": "camera",
+            "type": "sensor",
+            "multiInstance": False,
+            "readOnly": True,
+            "description": f"T800-Odin2 双目 JPEG 图像转发，发布到 {self._cam_left_topic}（左）和"
+                           f" {self._cam_right_topic}（右）",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [
+                {"topic": self._cam_left_topic, "format": "image/jpeg"},
+                {"topic": self._cam_right_topic, "format": "image/jpeg"},
+            ],
+        }
+
+    def _depth_tool(self) -> dict:
+        return sensor_tool(
+            "depth",
+            f"T800-Odin2 深度图（pointcloud_to_depth 节点输出）转发，发布到 {self._depth_topic}",
+            self._depth_topic,
+            "image/depth-z16",
+        )
+
+    def start(self) -> None:
+        if self._running:
+            return
+        import array as _array
+        import struct as _struct
+        from sensor_msgs.msg import CompressedImage, Image, PointCloud2
+        from std_msgs.msg import UInt8MultiArray
+
+        self._running = True
+        self._struct = _struct
+        self._array = _array
+        self._multi_type = UInt8MultiArray
+        self._cloud_pub = self._pub_node.create_publisher(UInt8MultiArray, self._cloud_topic, _BEST_EFFORT)
+        self._cam_left_pub = self._pub_node.create_publisher(CompressedImage, self._cam_left_topic, _BEST_EFFORT)
+        self._cam_right_pub = self._pub_node.create_publisher(CompressedImage, self._cam_right_topic, _BEST_EFFORT)
+        self._depth_pub = self._pub_node.create_publisher(Image, self._depth_topic, _BEST_EFFORT)
+        self._sub_node.create_subscription(
+            PointCloud2, self._topics["vision_cloud_raw"], self._on_cloud_raw, _BEST_EFFORT
+        )
+        self._sub_node.create_subscription(
+            PointCloud2, self._topics["vision_cloud_slam"], self._on_cloud_slam, _BEST_EFFORT
+        )
+        self._sub_node.create_subscription(
+            CompressedImage, self._topics["vision_camera_left"], self._on_camera_left, _BEST_EFFORT
+        )
+        self._sub_node.create_subscription(
+            CompressedImage, self._topics["vision_camera_right"], self._on_camera_right, _BEST_EFFORT
+        )
+        self._sub_node.create_subscription(
+            Image, self._topics["vision_depth"], self._on_depth, _BEST_EFFORT
+        )
+
+    def stop(self) -> None:
+        self._running = False
+
+    def _on_cloud_raw(self, msg) -> None:
+        self._on_cloud(msg, "raw")
+
+    def _on_cloud_slam(self, msg) -> None:
+        self._on_cloud(msg, "slam")
+
+    def _on_cloud(self, msg, source: str) -> None:
+        if not self._running or source != self._source:
+            return
+        data = bytes(msg.data)
+        if not data:
+            return
+        point_step = int(msg.point_step) or 1
+        header = self._struct.pack("<II", point_step, len(data) // point_step)
+        buf = bytearray(8 + len(data))
+        buf[:8] = header
+        buf[8:] = data
+        out = self._multi_type()
+        out.data = self._array.array("B", buf)
+        self._cloud_pub.publish(out)
+        self._frames["pointcloud"] += 1
+
+    def _on_camera_left(self, msg) -> None:
+        if not self._running:
+            return
+        self._cam_left_pub.publish(msg)
+        self._frames["camera_left"] += 1
+
+    def _on_camera_right(self, msg) -> None:
+        if not self._running:
+            return
+        self._cam_right_pub.publish(msg)
+        self._frames["camera_right"] += 1
+
+    def _on_depth(self, msg) -> None:
+        if not self._running:
+            return
+        self._depth_pub.publish(msg)
+        self._frames["depth"] += 1
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "stop", "info", "pointcloud", "camera", "depth"):
+            return {"state": "running" if self._running else "idle",
+                    "source": self._source,
+                    "topic_out": [
+                        {"topic": self._cloud_topic, "format": "sensor/pointcloud"},
+                        {"topic": self._cam_left_topic, "format": "image/jpeg"},
+                        {"topic": self._cam_right_topic, "format": "image/jpeg"},
+                        {"topic": self._depth_topic, "format": "image/depth-z16"},
+                    ],
+                    "frames": dict(self._frames)}
+        if action == "select_source":
+            source = str(args.get("source", "")).strip()
+            if source not in self._SOURCES:
+                raise ValueError(f"invalid pointcloud source: {source}; expected {'|'.join(self._SOURCES)}")
+            with self._lock:
+                self._source = source
+            return {"state": "running" if self._running else "idle", "source": source}
+        return {"error": f"unknown vision action: {action}"}
