@@ -232,9 +232,9 @@ class ControlledSpatialPlugin:
                             "start_mapping", "stop_mapping",
                             "tag_place", "untag_place", "list_tags",
                             "list_maps", "delete_map",
-                            "load_map",
+                            "load_map", "unload_map",
                             "navigate_to_tag", "navigate_to_pose",
-                            "pause_nav", "stop_nav",
+                            "stop_nav",
                             # Artifact — 虚拟墙
                             "list_walls", "add_wall", "remove_wall", "clear_walls",
                             # Artifact — 虚拟轨道
@@ -309,9 +309,9 @@ class ControlledSpatialPlugin:
                     "list_maps": {"params": [], "description": "List all saved maps"},
                     "delete_map": {"params": ["map_name"], "description": "Delete a map and its associated data"},
                     "load_map": {"params": ["map_name"], "description": "Load a map (robot must be at map origin)"},
+                    "unload_map": {"params": [], "description": "Unload current map from chassis, clear map and all artifacts. Sets active map to idle."},
                     "navigate_to_tag": {"params": ["tag_name", "speed", "mode", "fail_retry_count", "acceptable_precision", "strategy", "ignore_dynamic_obstacles", "precise"], "description": "Navigate to a tagged place. System waits for arrival and notifies upon completion."},
                     "navigate_to_pose": {"params": ["x", "y", "yaw", "speed", "mode", "fail_retry_count", "acceptable_precision", "strategy", "ignore_dynamic_obstacles", "precise"], "description": "Navigate to coordinates. System waits for arrival and notifies upon completion."},
-                    "pause_nav": {"params": [], "description": "Pause navigation"},
                     "stop_nav": {"params": [], "description": "Stop and cancel navigation"},
                     # Artifact — 虚拟墙
                     "list_walls": {"params": [], "description": "List all virtual walls on current map"},
@@ -605,6 +605,23 @@ class ControlledSpatialPlugin:
         print(f"[ControlledSpatial] localization quality final={q}")
         return q >= 30
 
+    def _clear_chassis_artifacts(self):
+        """Clear all artifact data (walls, tracks, areas, POIs) from chassis.
+        Best-effort: errors are logged but not propagated."""
+        for usage in ("walls", "tracks"):
+            result = self._slamtec.clear_lines(usage)
+            if result.get("error"):
+                print(f"[ControlledSpatial] clear_lines({usage}) warning: {result.get('error')}")
+        for usage in ("forbidden_area", "elevator_area", "dangerous_area",
+                      "coverage_area", "maintenance_area", "sensor_disable_area",
+                      "restricted_area"):
+            result = self._slamtec.clear_rectangle_areas(usage)
+            if result.get("error"):
+                print(f"[ControlledSpatial] clear_rectangle_areas({usage}) warning: {result.get('error')}")
+        result = self._slamtec.clear_pois()
+        if result.get("error"):
+            print(f"[ControlledSpatial] clear_pois warning: {result.get('error')}")
+
     # ── Dispatch ─────────────────────────────────────────────────────────────
 
     def dispatch(self, action: str, args: dict) -> dict | None:
@@ -623,6 +640,19 @@ class ControlledSpatialPlugin:
                 return {"error": "map_name is required"}
             if self._is_mapping:
                 return {"error": "Mapping already active"}
+            # Cancel any running navigation before starting mapping
+            if self._nav_active:
+                self._slamtec.cancel_current_action()
+                self._nav_active = False
+                self._nav_action_id = None
+                self._nav_arrived.clear()
+            # Stop mapping mode first (defensive: chassis might still be in
+            # mapping mode e.g. after driver restart), then clear map and
+            # artifacts to start with a clean slate.
+            self._slamtec.stop_mapping()
+            self._slamtec.clear_map()
+            self._clear_chassis_artifacts()
+
             result = self._slamtec.start_mapping()
             if result.get("error"):
                 return {"error": f"Start mapping failed: {result.get('error')}", "api_result": result}
@@ -635,7 +665,7 @@ class ControlledSpatialPlugin:
             return {"status": "mapping", "map_name": map_name, "map_path": map_path}
 
         elif action == "stop_mapping":
-            if not self._active_map:
+            if not self._is_mapping:
                 return {"error": "No active mapping session"}
             map_name = self._active_map
             map_path = f"{self._pcd_dir}/controlled_{map_name}.stcm"
@@ -744,7 +774,7 @@ class ControlledSpatialPlugin:
             if not map_name:
                 return {"error": "map_name is required"}
             if self._active_map == map_name:
-                return {"error": f"Cannot delete active map '{map_name}'. Stop mapping or unload first."}
+                return {"error": f"Cannot delete active map '{map_name}'. Unload it first with unload_map."}
             if self._db.delete_map(map_name):
                 return {"status": "deleted", "map_name": map_name}
             return {"error": f"Map '{map_name}' not found"}
@@ -755,6 +785,12 @@ class ControlledSpatialPlugin:
                 return {"error": "map_name is required"}
             if self._is_mapping:
                 return {"error": "Cannot load map while mapping is active. Stop mapping first."}
+            # Cancel any running navigation before loading a new map
+            if self._nav_active:
+                self._slamtec.cancel_current_action()
+                self._nav_active = False
+                self._nav_action_id = None
+                self._nav_arrived.clear()
             map_info = self._db.get_map(map_name)
             if not map_info:
                 return {"error": f"Map '{map_name}' not found"}
@@ -765,6 +801,9 @@ class ControlledSpatialPlugin:
             if clear_result.get("error"):
                 # Non-fatal: chassis may have no map to clear
                 print(f"[ControlledSpatial] clear_map warning: {clear_result.get('error')}")
+
+            # 1.5 Clear all artifact data from previous map to avoid cross-map contamination
+            self._clear_chassis_artifacts()
 
             # 2. Upload saved map file to chassis
             if not os.path.isfile(map_path):
@@ -991,68 +1030,24 @@ class ControlledSpatialPlugin:
                 "target_pose": {"x": x, "y": y, "yaw": yaw},
             }
 
-        elif action == "wait_navigation_done":
-            stall_timeout = float(args.get("stall_timeout", 60))
-            poll_interval = 0.5
-            last_pose = self._get_pose()
-            stall_start = time.monotonic()
-
-            while True:
-                if self._nav_arrived.is_set():
-                    if self._nav_error:
-                        error = self._nav_error
-                        self._nav_error = None
-                        self._nav_active = False
-                        return {"status": "error", "error": error}
-                    self._nav_active = False
-                    return {"status": "arrived", "pose": self._get_pose()}
-
-                # If nav is active but no action on chassis, query by ID
-                if self._nav_active and self._nav_action_id is not None:
-                    nav_status = self._slamtec.get_nav_status()
-                    if isinstance(nav_status, dict) and nav_status.get("action_state") == -1:
-                        final = self._slamtec.get_action_status(str(self._nav_action_id))
-                        if isinstance(final, dict) and not final.get("error"):
-                            fs = final.get("state") if isinstance(final.get("state"), dict) else None
-                            if isinstance(fs, dict):
-                                final_status = int(fs.get("status", -1))
-                                final_result = int(fs.get("result", 0))
-                                reason = fs.get("reason", "")
-                                if final_status == 4:
-                                    if final_result == 0:
-                                        self._nav_active = False
-                                        return {"status": "arrived", "pose": self._get_pose()}
-                                    else:
-                                        label = "failed" if final_result == -1 else "aborted"
-                                        self._nav_active = False
-                                        return {"status": "error", "error": f"Action {label}: result={final_result}, reason={reason}"}
-
-                time.sleep(poll_interval)
-
-                # Stall detection: no movement for stall_timeout seconds
-                current_pose = self._get_pose()
-                if current_pose and last_pose:
-                    dx = current_pose["x"] - last_pose["x"]
-                    dy = current_pose["y"] - last_pose["y"]
-                    moved = math.sqrt(dx * dx + dy * dy)
-                    dyaw = abs(current_pose.get("yaw", 0) - last_pose.get("yaw", 0))
-                    # Normalize yaw difference to [0, pi]
-                    if dyaw > math.pi:
-                        dyaw = 2 * math.pi - dyaw
-                    if moved > 0.05 or dyaw > 0.05:
-                        stall_start = time.monotonic()
-                        last_pose = current_pose
-
-                if time.monotonic() - stall_start > stall_timeout:
-                    self._slamtec.cancel_current_action()
-                    self._nav_active = False
-                    return {"status": "timeout", "error": f"No movement for {stall_timeout}s, navigation cancelled"}
-
-        elif action == "pause_nav":
-            result = self._slamtec.cancel_current_action()
-            if result.get("error"):
-                return {"error": f"PauseNav failed: {result.get('error')}", "api_result": result}
-            return {"status": "paused"}
+        elif action == "unload_map":
+            if not self._active_map:
+                return {"error": "No active map to unload"}
+            if self._is_mapping:
+                return {"error": "Cannot unload map while mapping is active. Stop mapping first."}
+            # Cancel any running navigation
+            if self._nav_active:
+                self._slamtec.cancel_current_action()
+                self._nav_active = False
+                self._nav_action_id = None
+                self._nav_arrived.clear()
+            # Clear chassis map and all artifacts
+            self._slamtec.clear_map()
+            self._clear_chassis_artifacts()
+            unloaded = self._active_map
+            self._active_map = None
+            self._map_status = "idle"
+            return {"status": "unloaded", "map_name": unloaded}
 
         elif action == "stop_nav":
             result = self._slamtec.cancel_current_action()
