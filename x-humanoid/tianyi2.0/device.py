@@ -4916,7 +4916,7 @@ class RobotFaultsPlugin:
             from bodyctrl_msgs.msg import PowerLightCtrl
             self._sub_node.create_subscription(
                 PowerLightCtrl, self._light_ctrl_topic,
-                self._on_light_ctrl, _RELIABLE_QOS)
+                self._on_light_ctrl, _LOW_LAT_QOS)
             print("[RobotFaultsPlugin] light ctrl subscription created")
             self._light_ctrl_subscribed = True
         except ImportError:
@@ -5043,6 +5043,8 @@ class RobotFaultsPlugin:
         with self._lock:
             self._light_ctrl_state = msg
             self._last_update_ms = now_ms
+        from_ = getattr(msg, "caller_id", "?")
+        print(f"[RobotFaultsPlugin] light ctrl: cmd={msg.cmd} caller={from_}")
 
     # ── 按需查询执行器 ─────────────────────────────────────────────────────
 
