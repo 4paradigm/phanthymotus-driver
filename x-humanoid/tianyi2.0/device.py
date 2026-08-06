@@ -5259,9 +5259,16 @@ class RobotFaultsPlugin:
 
         # ── 各子系统一行概括 ──
         chassis_str = f"底盘: {chassis_data.get('detail', '未知')}"
-        body_detail = body_data.get("detail", "未知")
-        if body_data.get("fault_count", 0) == 0:
+        fault_count = body_data.get("fault_count", 0)
+        if fault_count == 0:
             body_detail = "正常"
+        else:
+            # 只显示计数+最严重的1项
+            severe = [f for f in body_data.get("faults", []) if f.get("severity") == "fatal"]
+            if severe:
+                body_detail = f"{fault_count}项故障(含{severe[0].get('component','未知')})"
+            else:
+                body_detail = f"{fault_count}项故障"
         body_str = f"电机: {body_detail}"
         power_str = f"电源: {full.get('power_board', {}).get('detail', '未知')}"
         hand_str = f"手部: {full.get('hand_state', {}).get('detail', '未知')}"
