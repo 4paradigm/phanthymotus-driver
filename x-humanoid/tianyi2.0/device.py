@@ -3784,7 +3784,7 @@ class TtsPlugin:
                     "force": {"type": "boolean", "description": "是否强制播放(打断当前播放)", "default": False},
                 },
                 "required": ["action"],
-                "x-completion": {"actions": ["speak"], "timeout": 60},
+                "x-completion": {"actions": ["speak"], "timeout": 180},
                 "x-action-params": {
                     "speak": {"params": ["text", "force"], "description": "合成并播放文本"},
                     "interrupt": {"params": [], "description": "中止播放（不可恢复）"},
@@ -3812,6 +3812,9 @@ class TtsPlugin:
         except ImportError as e:
             print(f"[TtsPlugin] WARNING: msg import failed ({e})")
 
+    # PlayEvent event codes
+    _EVENT_NAMES = {0: "STARTED", 1: "COMPLETED", 2: "STOPPED", 3: "CANCELLED", 4: "FAILED"}
+
     def _on_play_event(self, msg):
         """PlayEvent callback: 播放完成/停止/失败时解锁对应的 pending."""
         # event: 0=STARTED, 1=COMPLETED, 2=STOPPED, 3=CANCELLED, 4=FAILED
@@ -3824,7 +3827,8 @@ class TtsPlugin:
             if sid in self._pending_play:
                 self._pending_play_status[sid] = event_code
                 self._pending_play[sid].set()
-            print(f"[TtsPlugin] PlayEvent: sid={sid} event={event_code}")
+            event_name = self._EVENT_NAMES.get(event_code, f"UNKNOWN({event_code})")
+            print(f"[TtsPlugin] PlayEvent: sid={sid} {event_name}")
 
     def _on_play_progress(self, msg):
         """PlayProgress callback: 获取播放总时长，用于精确超时计算。"""
@@ -3860,88 +3864,131 @@ class TtsPlugin:
         if not self._play_client:
             return {"error": "service client not initialized"}
         try:
-            from lyre_msgs.srv import PlayText
             import uuid as _uuid
-            req = PlayText.Request()
-            req.text = text
-            req.force = force
-            req.last = True
-            future = self._play_client.call_async(req)
             action_id = f"tts-{_uuid.uuid4().hex[:8]}"
 
-            # Background thread: wait for PlayEvent COMPLETED then ACP callback
-            def _wait_cb(fut, aid, spoken_text):
-                import time as _t
-                # Phase 1: 等 service response（获取 sid）
-                timeout_service = 10.0
-                start = _t.time()
-                while not fut.done() and _t.time() - start < timeout_service:
-                    _t.sleep(0.1)
-                # 获取 sid
-                sid = None
-                if fut.done():
-                    result = fut.result()
-                    if result:
-                        sid = getattr(result, 'sid', None)
+            # 分段：超过 280 字按标点切分，避免超长文本 PlayEvent 丢失
+            segments = self._split_text(text, max_chars=280)
 
-                # Phase 2: 等 PlayEvent 通知播放完成
-                status = "completed"
-                if sid:
-                    # 先检查 buffer：PlayEvent 可能在我们获取 sid 之前就到了
-                    buffered = self._play_event_buffer.pop(sid, None)
-                    if buffered is not None:
-                        # 已经完成了！
-                        status = "completed" if buffered == 1 else "error"
-                        print(f"[TtsPlugin] PlayEvent from buffer: sid={sid} event={buffered}")
-                    else:
-                        # 注册 pending，等 PlayEvent callback
-                        ev = threading.Event()
-                        self._pending_play[sid] = ev
-                        # 超时 = progress 报告的总时长 + 5s，fallback 字数/3 + 5
-                        import time as _t2
-                        _t2.sleep(0.5)  # 短等让 progress 有机会到达
-                        reported_duration = self._pending_play_duration.get(sid)
-                        if reported_duration and reported_duration > 0:
-                            play_timeout = reported_duration + 5.0
-                        else:
-                            play_timeout = len(spoken_text) / 3.0 + 5.0
-                        if not ev.wait(timeout=play_timeout):
-                            status = "error"
-                            print(f"[TtsPlugin] PlayEvent timeout: sid={sid}, waited {play_timeout:.0f}s (duration={reported_duration})")
-                        else:
-                            event_code = self._pending_play_status.get(sid, 1)
-                            status = "completed" if event_code == 1 else "error"
-                        # 清理
-                        self._pending_play.pop(sid, None)
-                        self._pending_play_status.pop(sid, None)
-                    self._pending_play_duration.pop(sid, None)
-                    self._play_event_buffer.pop(sid, None)
-                elif not sid:
-                    # 没拿到 sid，fallback 按字数估算
-                    fallback_s = len(spoken_text) / 4.0 + 3.0
-                    _t.sleep(fallback_s)
-                    print(f"[TtsPlugin] no sid from service, fallback sleep {fallback_s:.0f}s")
-
-                # ACP callback
-                try:
-                    import urllib.request, ssl, json as _json, os as _os
-                    url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
-                    ctx = ssl.create_default_context()
-                    ctx.check_hostname = False
-                    ctx.verify_mode = ssl.CERT_NONE
-                    p = _json.dumps({"action_id": aid, "status": status,
-                                     "result": {"action": "speak", "sid": sid or "unknown"}}).encode()
-                    r = urllib.request.Request(f"{url}/api/acp/complete", data=p,
-                                              headers={"Content-Type": "application/json"}, method="POST")
-                    urllib.request.urlopen(r, timeout=3, context=ctx)
-                    print(f"[TtsPlugin] ACP {status}: {aid} (sid={sid})")
-                except Exception as e:
-                    print(f"[TtsPlugin] ACP callback failed: {e}")
-
-            threading.Thread(target=_wait_cb, args=(future, action_id, text), daemon=True).start()
-            return {"state": "speaking", "action_id": action_id, "text": text[:50]}
+            # Background thread: 逐段播放, 全部完成后 ACP callback
+            threading.Thread(
+                target=self._speak_segments,
+                args=(segments, force, action_id, text),
+                daemon=True,
+            ).start()
+            return {"state": "speaking", "action_id": action_id, "text": text[:50],
+                    "segments": len(segments)}
         except Exception as e:
             return {"error": str(e)}
+
+    @staticmethod
+    def _split_text(text: str, max_chars: int = 280) -> list[str]:
+        """按标点分段，每段不超过 max_chars 字。"""
+        import re as _re
+        sentences = _re.split(r'(?<=[。！？；\n])', text)
+        segments = []
+        current = ""
+        for sent in sentences:
+            if not sent:
+                continue
+            if len(current) + len(sent) > max_chars and current:
+                segments.append(current)
+                current = sent
+            else:
+                current += sent
+        if current:
+            segments.append(current)
+        return segments if segments else [text]
+
+    def _speak_segments(self, segments: list, force: bool, action_id: str, full_text: str):
+        """顺序播放多段文本，全部完成后 ACP callback。"""
+        import time as _t
+        from lyre_msgs.srv import PlayText
+
+        overall_status = "completed"
+
+        for i, seg_text in enumerate(segments):
+            is_last = (i == len(segments) - 1)
+            # 发送 PlayText service
+            req = PlayText.Request()
+            req.text = seg_text
+            req.force = force if i == 0 else False  # 只第一段 force
+            req.last = is_last
+            future = self._play_client.call_async(req)
+
+            # Phase 1: 等 service response（获取 sid）
+            timeout_service = 10.0
+            start = _t.time()
+            while not future.done() and _t.time() - start < timeout_service:
+                _t.sleep(0.1)
+
+            sid = None
+            if future.done():
+                result = future.result()
+                if result:
+                    sid = getattr(result, 'sid', None)
+
+            # Phase 2: 等 PlayEvent
+            if sid:
+                buffered = self._play_event_buffer.pop(sid, None)
+                if buffered is not None:
+                    seg_status = "completed" if buffered == 1 else "error"
+                    print(f"[TtsPlugin] seg {i+1}/{len(segments)} from buffer: sid={sid} event={buffered}")
+                else:
+                    ev = threading.Event()
+                    self._pending_play[sid] = ev
+                    _t.sleep(0.3)
+                    reported_duration = self._pending_play_duration.get(sid)
+                    if reported_duration and reported_duration > 0:
+                        play_timeout = reported_duration + 8.0
+                    else:
+                        # 更宽松: 2.5字/秒 + 10s buffer
+                        play_timeout = len(seg_text) / 2.5 + 10.0
+                    if not ev.wait(timeout=play_timeout):
+                        seg_status = "error"
+                        print(f"[TtsPlugin] PlayEvent timeout: seg {i+1}/{len(segments)} sid={sid}, waited {play_timeout:.0f}s (duration={reported_duration})")
+                    else:
+                        event_code = self._pending_play_status.get(sid, 1)
+                        # event_code: 1=COMPLETED, 2=STOPPED (也算完成), 3=CANCELLED, 4=FAILED
+                        seg_status = "completed" if event_code <= 2 else "error"
+                        if event_code > 2:
+                            event_name = self._EVENT_NAMES.get(event_code, f"UNKNOWN({event_code})")
+                            print(f"[TtsPlugin] seg {i+1}/{len(segments)} failed: {event_name} (code={event_code})")
+                        elif event_code == 2:
+                            print(f"[TtsPlugin] seg {i+1}/{len(segments)} STOPPED (treated as completed)")
+                    self._pending_play.pop(sid, None)
+                    self._pending_play_status.pop(sid, None)
+                self._pending_play_duration.pop(sid, None)
+                self._play_event_buffer.pop(sid, None)
+
+                if seg_status == "error" and not is_last:
+                    # 某段 error 但还有后续段，继续播下一段
+                    print(f"[TtsPlugin] seg {i+1} error, continuing to next segment")
+                    continue
+                elif seg_status == "error" and is_last:
+                    overall_status = "error"
+            elif not sid:
+                # 没拿到 sid，fallback 按字数估算
+                fallback_s = len(seg_text) / 2.5 + 5.0
+                _t.sleep(fallback_s)
+                print(f"[TtsPlugin] no sid from service seg {i+1}, fallback sleep {fallback_s:.0f}s")
+
+        # ACP callback
+        try:
+            import urllib.request, ssl, json as _json, os as _os
+            url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            p = _json.dumps({"action_id": action_id, "status": overall_status,
+                             "result": {"action": "speak", "sid": sid or "unknown",
+                                        "segments": len(segments)}}).encode()
+            r = urllib.request.Request(f"{url}/api/acp/complete", data=p,
+                                      headers={"Content-Type": "application/json"}, method="POST")
+            urllib.request.urlopen(r, timeout=5, context=ctx)
+            print(f"[TtsPlugin] ACP {overall_status}: {action_id} ({len(segments)} segs, {len(full_text)} chars)")
+        except Exception as e:
+            print(f"[TtsPlugin] ACP callback failed: {e}")
 
     def _call_empty_service(self, client, action_name: str) -> dict:
         if not client:
