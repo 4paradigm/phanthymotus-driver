@@ -348,6 +348,7 @@ class ControlledSpatialPlugin:
         self._map_status: str = "idle"  # idle | mapping | localized
         self._nav_arrived = threading.Event()
         self._nav_error: str | None = None
+        self._nav_action_id: str | None = None  # current navigate ACP action_id
         self._last_db_map_status: str | None = None
         self._lock = threading.Lock()
 
@@ -386,7 +387,6 @@ class ControlledSpatialPlugin:
                             "list_maps", "delete_map",
                             "load_map",
                             "navigate_to_tag", "navigate_to_pose",
-                            "wait_navigation_done",
                             "pause_nav", "resume_nav", "stop_nav",
                         ],
                         "description": "Action to perform",
@@ -418,7 +418,6 @@ class ControlledSpatialPlugin:
                     "load_map": {"params": ["map_name"], "description": "Load a map (robot must be at map origin)"},
                     "navigate_to_tag": {"params": ["tag_name", "speed", "mode"], "description": "Navigate to a tagged place. System automatically waits for arrival via ACP barrier."},
                     "navigate_to_pose": {"params": ["x", "y", "yaw", "speed", "mode"], "description": "Navigate to coordinates. System automatically waits for arrival via ACP barrier."},
-                    "wait_navigation_done": {"params": ["stall_timeout"], "description": "Manually block until navigation completes. Usually unnecessary — ACP barrier handles this automatically."},
                     "pause_nav": {"params": [], "description": "Pause navigation"},
                     "resume_nav": {"params": [], "description": "Resume navigation"},
                     "stop_nav": {"params": [], "description": "Stop and cancel navigation"},
@@ -505,12 +504,44 @@ class ControlledSpatialPlugin:
 
     def _acp_wait_nav(self, action_id: str, target: str, stall_timeout: float = 90):
         """Wait for navigation to complete, then fire ACP callback."""
+        self._nav_action_id = action_id
         t0 = time.time()
+
+        # Primary: delegate to SmartMotion subprocess which has reliable
+        # pose-based arrival detection (dist < 0.3m from target).
+        # The main process DDS callback for ctrl_info.is_arrived is unreliable
+        # (SLAM service never publishes ctrl_info in practice).
+        if self._smart_motion:
+            result = self._smart_motion.wait_nav_done(stall_timeout=stall_timeout)
+            elapsed = round(time.time() - t0, 1)
+            # Guard: if this nav was superseded, don't fire stale ACP
+            if self._nav_action_id != action_id:
+                print(f'[ControlledSpatial] _acp_wait_nav {action_id} superseded, skipping notify')
+                return
+            self._nav_action_id = None
+            status = result.get("status", "error")
+            if status == "arrived":
+                _acp_notify(action_id, "completed", {
+                    "target": target, "pose": result.get("pose"), "elapsed": elapsed,
+                })
+            else:
+                # Validate: if status is unexpected (e.g. "navigating" from queue race),
+                # treat as error with full result for debugging
+                error_msg = result.get("error", status)
+                if status not in ("error", "timeout", "stopped"):
+                    print(f'[ControlledSpatial] _acp_wait_nav unexpected status: {result}')
+                _acp_notify(action_id, "error", {
+                    "target": target,
+                    "error": error_msg,
+                    "elapsed": elapsed,
+                })
+            return
+
+        # Fallback: no SmartMotion — poll local DDS callback + stall detection
         last_pose = self._get_pose()
         last_move_time = time.time()
 
         while True:
-            # Check DDS-driven arrival event
             if self._nav_arrived.wait(timeout=1.0):
                 elapsed = round(time.time() - t0, 1)
                 if self._nav_error:
@@ -526,7 +557,6 @@ class ControlledSpatialPlugin:
                     })
                 return
 
-            # Stall detection
             current_pose = self._get_pose()
             if current_pose and last_pose:
                 dx = current_pose["x"] - last_pose["x"]
@@ -540,10 +570,7 @@ class ControlledSpatialPlugin:
                 last_move_time = time.time()
 
             if time.time() - last_move_time > stall_timeout:
-                # Pause nav to stop the robot
-                if self._smart_motion:
-                    self._smart_motion.pause_nav()
-                elif self._client:
+                if self._client:
                     self._client.PauseNav()
                 _acp_notify(action_id, "error", {
                     "target": target,
@@ -552,7 +579,6 @@ class ControlledSpatialPlugin:
                 })
                 return
 
-            # Hard timeout
             if time.time() - t0 > 180:
                 _acp_notify(action_id, "error", {
                     "target": target, "error": "timeout_180s",
@@ -715,6 +741,10 @@ class ControlledSpatialPlugin:
             tag_name = args.get("tag_name", "")
             if not tag_name:
                 return {"error": "tag_name is required"}
+            # Cancel any in-flight navigation ACP
+            if self._nav_action_id:
+                _acp_notify(self._nav_action_id, "cancelled", {"reason": "superseded by new navigate"})
+                self._nav_action_id = None
             active_map = self._active_map
             if not active_map:
                 return {"error": "No active map. Load a map first."}
@@ -771,6 +801,10 @@ class ControlledSpatialPlugin:
             x = float(args.get("x", 0))
             y = float(args.get("y", 0))
             yaw = float(args.get("yaw", 0))
+            # Cancel any in-flight navigation ACP
+            if self._nav_action_id:
+                _acp_notify(self._nav_action_id, "cancelled", {"reason": "superseded by new navigate"})
+                self._nav_action_id = None
 
             if self._smart_motion:
                 speed = max(0.2, min(0.8, float(args.get("speed", 0.5))))

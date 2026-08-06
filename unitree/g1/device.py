@@ -967,6 +967,37 @@ class LocoStatePlugin:
         return None
 
 
+# ── ACP notify helper (shared by LocoPlugin) ─────────────────────────────────
+
+import os as _os
+
+_LOCO_AGENT_CORE_URL = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+
+
+def _loco_acp_notify(action_id: str, status: str, result: dict, tool: str = "loco"):
+    """POST ACP completion callback to Agent Core."""
+    import urllib.request as _urllib
+    import ssl as _ssl
+
+    ctx = _ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = _ssl.CERT_NONE
+    payload = json.dumps({
+        "action_id": action_id, "status": status,
+        "result": result, "tool": tool, "ts": time.time(),
+    }).encode()
+    try:
+        req = _urllib.Request(
+            f"{_LOCO_AGENT_CORE_URL}/api/acp/complete",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        _urllib.urlopen(req, timeout=5, context=ctx)
+    except Exception as e:
+        print(f"[Loco] ACP notify failed: {e}")
+
+
 # ── LocoPlugin (actuator) ────────────────────────────────────────────────────
 
 class LocoPlugin:
@@ -1018,6 +1049,10 @@ class LocoPlugin:
                     "turn":       {"type": "boolean", "description": "Turn while waving (default false)"},
                 },
                 "required": ["action"],
+                "x-completion": {
+                    "actions": ["move"],
+                    "timeout": 60,
+                },
                 "x-action-params": {
                     "move":             {"params": ["vx", "vy", "vyaw", "duration"], "description": "Move with specified velocities. duration>0 for timed move, 0 or negative for continuous until stop."},
                     "stop_move":        {"params": [],                                 "description": "Stop all movement immediately"},
@@ -1061,6 +1096,20 @@ class LocoPlugin:
                     },
                 },
                 "required": ["mode"],
+                "x-completion": {
+                    "actions": ["lie2standup", "standup2lie", "standup2squat", "squat2standup"],
+                    "timeout": 90,
+                },
+                "x-action-params": {
+                    "lie2standup":     {"params": [], "description": "安全起立 (ground/squat → standing)"},
+                    "standup2lie":     {"params": [], "description": "安全躺下 (standing → damping on ground)"},
+                    "standup2squat":   {"params": [], "description": "站到蹲 (standing → squat)"},
+                    "squat2standup":   {"params": [], "description": "蹲到站 (squat → standing)"},
+                    "damp":            {"params": [], "description": "阻尼模式 (ground only)"},
+                    "zero_torque":     {"params": [], "description": "零力矩 (ground only)"},
+                    "emergency_stop":  {"params": [], "description": "紧急阻尼 (any state)"},
+                    "get_current_mode": {"params": [], "description": "查询当前状态"},
+                },
             },
         }
 
@@ -1096,6 +1145,17 @@ class LocoPlugin:
         self._move_timer = None
         self._client.StopMove()
 
+    def _auto_stop_acp(self, action_id: str):
+        """Timer 回调：自动停止运动 + fire ACP callback."""
+        self._move_timer = None
+        self._client.StopMove()
+        _loco_acp_notify(action_id, "completed", {"reason": "duration_expired"}, tool="loco")
+
+    def _acp_wait_move(self, action_id: str, duration: float):
+        """Wait for SmartMotion timed move to complete, then fire ACP callback."""
+        time.sleep(duration + 0.5)  # SmartMotion auto-stops after duration; small buffer
+        _loco_acp_notify(action_id, "completed", {"reason": "duration_expired"}, tool="loco")
+
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
             return {"state": "ready"}
@@ -1115,7 +1175,18 @@ class LocoPlugin:
 
             # Route through SmartMotion safety harness
             if self._smart_motion:
-                return self._smart_motion.move(vx, vy, vyaw, duration)
+                result = self._smart_motion.move(vx, vy, vyaw, duration)
+                if duration > 0:
+                    from uuid import uuid4
+                    action_id = f"g1_move_{uuid4().hex[:8]}"
+                    result["action_id"] = action_id
+                    # SmartMotion handles auto-stop internally; spawn thread to wait and notify
+                    threading.Thread(
+                        target=self._acp_wait_move,
+                        args=(action_id, duration),
+                        daemon=True,
+                    ).start()
+                return result
 
             # Fallback: direct control (no safety harness)
             vx   = max(-1.0, min(1.0, vx))
@@ -1127,15 +1198,18 @@ class LocoPlugin:
                 self._move_timer = None
 
             if duration > 0:
+                from uuid import uuid4
+                action_id = f"g1_move_{uuid4().hex[:8]}"
                 # G1 SetVelocity duration has known bugs — use Timer fallback
                 ret = self._client.Move(vx, vy, vyaw, True)
-                self._move_timer = threading.Timer(duration, self._auto_stop)
+                self._move_timer = threading.Timer(duration, self._auto_stop_acp, args=[action_id])
                 self._move_timer.start()
+                return {"status": "moving", "action_id": action_id,
+                        "vx": vx, "vy": vy, "vyaw": vyaw, "duration": duration}
             else:
                 # Continuous move until explicit stop
                 ret = self._client.Move(vx, vy, vyaw, True)
-
-            return {"ret": ret, "vx": vx, "vy": vy, "vyaw": vyaw, "duration": duration}
+                return {"ret": ret, "vx": vx, "vy": vy, "vyaw": vyaw, "duration": duration}
         elif action == "stop_move":
             # Route through SmartMotion safety harness
             if self._smart_motion:
@@ -1152,8 +1226,11 @@ class LocoPlugin:
                     pass
             ret = self._client.StopMove()
             return {"ret": ret}
-        elif action == "switch_mode":
-            mode = args.get("mode", "")
+        elif action in ("switch_mode", "lie2standup", "standup2lie", "standup2squat",
+                        "squat2standup", "damp", "zero_torque", "emergency_stop", "get_current_mode"):
+            # x-action-params split: action is the mode directly
+            # Legacy: action == "switch_mode" with mode in args
+            mode = action if action != "switch_mode" else args.get("mode", "")
             code, current_fsm = self._client.GetFsmId()
 
             if code != 0:
@@ -1190,11 +1267,11 @@ class LocoPlugin:
                     if current_fsm == 0:
                         steps.append(("Damp", 1, "damp"))
                     steps.append(("Lie2StandUp", 500, "lie2standup"))
-                    return self._run_fsm_sequence(steps)
+                    return self._async_fsm(mode, steps)
                 # From low states (squat/prep): start(500)
                 if current_fsm in self._LOW_STATES:
                     steps = [("Start", 500, "start")]
-                    return self._run_fsm_sequence(steps)
+                    return self._async_fsm(mode, steps)
                 return {"error": f"Cannot stand up from FSM={current_fsm}"}
 
             elif mode == "standup2lie":
@@ -1205,10 +1282,10 @@ class LocoPlugin:
                     self._client.StopMove()
                     import time as _time; _time.sleep(1.0)
                     steps = [("StandUp2Squat", 2, "standup2squat"), ("Damp", 1, "damp")]
-                    return self._run_fsm_sequence(steps)
+                    return self._async_fsm(mode, steps)
                 if current_fsm in self._LOW_STATES:
                     steps = [("Damp", 1, "damp")]
-                    return self._run_fsm_sequence(steps)
+                    return self._async_fsm(mode, steps)
                 return {"error": f"Cannot lie down from FSM={current_fsm}. Use emergency_stop if needed."}
 
             elif mode == "standup2squat":
@@ -1218,7 +1295,7 @@ class LocoPlugin:
                     self._client.StopMove()
                     import time as _time; _time.sleep(1.0)
                     steps = [("StandUp2Squat", 2, "standup2squat")]
-                    return self._run_fsm_sequence(steps)
+                    return self._async_fsm(mode, steps)
                 return {"error": f"Cannot squat from FSM={current_fsm}. Use emergency_stop if needed."}
 
             elif mode == "squat2standup":
@@ -1226,7 +1303,7 @@ class LocoPlugin:
                     return {"info": "Robot is already standing", "fsm_id": current_fsm}
                 if current_fsm in self._LOW_STATES:
                     steps = [("Start", 500, "start")]
-                    return self._run_fsm_sequence(steps)
+                    return self._async_fsm(mode, steps)
                 if current_fsm in self._GROUND_STATES:
                     return {"error": f"Robot is on ground (FSM={current_fsm}). Use lie2standup instead."}
                 return {"error": f"Cannot stand from FSM={current_fsm}"}
@@ -1290,6 +1367,23 @@ class LocoPlugin:
         if result is None:
             return {"error": "RPC timeout during sequence execution"}
         return result
+
+    def _async_fsm(self, mode: str, steps: list) -> dict:
+        """Launch FSM sequence asynchronously, return action_id immediately."""
+        from uuid import uuid4
+        action_id = f"g1_fsm_{uuid4().hex[:8]}"
+        threading.Thread(
+            target=self._acp_fsm_sequence,
+            args=(action_id, mode, steps),
+            daemon=True,
+        ).start()
+        return {"status": "executing", "mode": mode, "action_id": action_id}
+
+    def _acp_fsm_sequence(self, action_id: str, mode: str, steps: list):
+        """Background thread: execute FSM sequence, then fire ACP callback."""
+        result = self._run_fsm_sequence(steps)
+        status = "error" if result.get("error") else "completed"
+        _loco_acp_notify(action_id, status, {"mode": mode, **result}, tool="switch_mode")
 
 
 # ── AsrPlugin (sensor) ───────────────────────────────────────────────────────
