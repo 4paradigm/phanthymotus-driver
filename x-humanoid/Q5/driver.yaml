@@ -1,0 +1,9 @@
+id: q5-driver
+name: Xingdong Q5 Driver Bundle
+category: driver
+hardware_provider: x-humanoid
+hardware_model: "Q5"
+image_name: q5
+port: 15708
+mcp_url: "http://localhost:15708/mcp"
+description: "星动纪元Q5系列轮式人形机器人 — 最高46DOF(双臂+五指灵巧手+差速底盘+头部), 支持语音交互、导航、动作回放"

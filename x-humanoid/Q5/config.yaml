@@ -1,0 +1,116 @@
+mcp_port: 15708
+ros_namespace: ""   # 留空则自动使用 hostname
+ros_domain_id: 211  # Q5默认ROS2 Domain ID
+
+# 灵巧手型号: "lite" (XHand Lite, 每手6关节) 或 "xhand1" (XHand1, 每手12关节)
+hand_model: "lite"
+
+plugins:
+  # 系统状态类
+  system_state:
+    enabled: true
+  battery:
+    enabled: true
+  estop:
+    enabled: true
+  fault:
+    enabled: true
+  joints:
+    enabled: true
+  imu:
+    enabled: true
+  temperature:
+    enabled: true
+  # 传感器类
+  camera:
+    enabled: true
+  lidar:
+    enabled: true
+  mic:
+    enabled: true
+  asr:
+    enabled: true
+  # 执行器类 - 运动控制
+  chassis:
+    enabled: true
+  head:
+    enabled: true
+  arm:
+    enabled: true
+  arm_servo:
+    enabled: true
+  waist:
+    enabled: true
+  hand:
+    enabled: true
+    hand_model: "lite"  # "lite"=XHand Lite(每手6关节), "xhand1"=XHand1(每手12关节)
+  hand_low:
+    enabled: true
+    hand_model: "lite"  # 同上，底层控制也需指定型号
+  hand_sensor:
+    enabled: true
+  # 传感器 — 里程计
+  odometry:
+    enabled: true
+  # 传感器 — 系统诊断(NUC/Orin/CPU)
+  diagnostics:
+    enabled: true
+  # 传感器 — 手柄/遥控器输入
+  joystick:
+    enabled: true
+  # 传感器+执行器 — 遥操作监控和启停
+  teleop:
+    enabled: true
+  # 执行器类 — 关节参数配置
+  joint_config:
+    enabled: true
+  # 传感器+执行器 — 运动管理器
+  motion:
+    enabled: true
+  # 执行器类 — 抱闸控制
+  brake:
+    enabled: true
+  # 传感器 — TF坐标变换
+  tf:
+    enabled: true
+  # 执行器类 — 遥控指令
+  remote_control:
+    enabled: true
+  # 执行器类 — 电源管理
+  power:
+    enabled: true
+  # 执行器类 - 交互
+  tts:
+    enabled: true
+  audio_player:
+    enabled: true
+  audio:
+    enabled: true
+  led:
+    enabled: true
+  chat:
+    enabled: false  # Q5无 /chat/enable ROS2 topic，对话通过XOS界面控制
+  action_player:
+    enabled: true
+  gesture_player:
+    enabled: true
+  # 导航类
+  nav:
+    enabled: true
+  # 动作录制/回放
+  bag_record:
+    enabled: true
+  bag_playback:
+    enabled: true
+  mpc_controller:
+    enabled: true
+  # 资源类
+  model:
+    enabled: true
+
+safety_harness:
+  enabled: true
+  stop_threshold: 0.8
+  tilt_threshold_deg: 35
+  motor_temp_stop: 85
+  comm_timeout: 0.5
