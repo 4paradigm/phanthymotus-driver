@@ -356,6 +356,15 @@ class TianyiDeviceBundle:
             self._plugins.append(LightPlugin(plugins_cfg["light"], namespace, ros2))
             print("[bundle] LightPlugin loaded")
 
+        # Load the composed interaction card after all source cards. It calls
+        # the existing plugin instances directly and opens no duplicate ROS2
+        # publishers, subscribers, or MCP connections.
+        if plugins_cfg.get("user_interaction", {}).get("enabled", False):
+            from device import UserInteractionPlugin
+            self._plugins.append(UserInteractionPlugin(
+                plugins_cfg["user_interaction"], self._plugins))
+            print("[bundle] UserInteractionPlugin loaded")
+
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
             try:
