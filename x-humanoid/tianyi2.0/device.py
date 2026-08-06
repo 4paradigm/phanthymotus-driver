@@ -4767,6 +4767,7 @@ class RobotFaultsPlugin:
             "imu_accel_topic": "/ob_camera_head/accel/sample",
             "imu_gyro_topic": "/ob_camera_head/gyro/sample",
             "self_check_topic": "/node/status",
+            "light_ctrl_topic": "/power/light/ctrl",
         }
 
     def __init__(self, plugin_config: dict, namespace: str, ros2, slamtec_client):
@@ -4804,6 +4805,8 @@ class RobotFaultsPlugin:
         self._imu_available = False
         self._self_check_state = None       # NodeState
         self._self_check_available = False
+        self._light_ctrl_state = None       # PowerLightCtrl (proc_manager 自检信号)
+        self._light_ctrl_topic = cfg["light_ctrl_topic"]
 
         # 订阅节点 (domain 0) — 接收身体故障
         self._sub_node = Node("tianyi2_robot_faults_sub", context=ros2.ctx_tianyi)
@@ -4906,6 +4909,16 @@ class RobotFaultsPlugin:
             print("[RobotFaultsPlugin] self check subscription created")
         except ImportError:
             print("[RobotFaultsPlugin] NodeState not available, self check disabled")
+
+        # 灯效状态订阅 (PowerLightCtrl) — proc_manager 自检信号 (cmd 20/21/22)
+        try:
+            from bodyctrl_msgs.msg import PowerLightCtrl
+            self._sub_node.create_subscription(
+                PowerLightCtrl, self._light_ctrl_topic,
+                self._on_light_ctrl, _RELIABLE_QOS)
+            print("[RobotFaultsPlugin] light ctrl subscription created")
+        except ImportError:
+            print("[RobotFaultsPlugin] PowerLightCtrl not available, light ctrl disabled")
 
         # 完整数据发布线程 (1Hz → topic)
         print("[RobotFaultsPlugin] started")
@@ -5020,6 +5033,13 @@ class RobotFaultsPlugin:
         now_ms = int(time.time() * 1000)
         with self._lock:
             self._self_check_state = msg
+            self._last_update_ms = now_ms
+
+    def _on_light_ctrl(self, msg):
+        """proc_manager 灯效反馈, cmd 20=自检等待/21=自检启动/22=自检成功."""
+        now_ms = int(time.time() * 1000)
+        with self._lock:
+            self._light_ctrl_state = msg
             self._last_update_ms = now_ms
 
     # ── 按需查询执行器 ─────────────────────────────────────────────────────
@@ -5153,20 +5173,30 @@ class RobotFaultsPlugin:
                 imu_lines.append(f"部分缺失:{','.join(missing)}")
                 issues.append(f"IMU部分数据缺失: {', '.join(missing)}")
 
-        # ── 自检状态 ──
-        self_check_available = self._self_check_available and self._self_check_state is not None
+        # ── 自检状态 (优先灯效反馈 proc_manager, 降级 NodeState) ──
+        sc = self._light_ctrl_state
+        lc_available = sc is not None
+        self_check_available = lc_available or (self._self_check_available and self._self_check_state is not None)
         self_check_lines = []
-        if not self_check_available:
-            self_check_lines.append("未知")
-        else:
-            sc = self._self_check_state
-            if sc.state == 0:  # NODE_STATE_IDLE — 未运行
+        # cmd 映射: 20=自检等待, 21=自检中, 22=自检通过, 99=待机, 10/11=故障事件
+        _SC_MAP = {20: "自检等待", 21: "自检中", 22: "自检通过", 99: "待机", 10: "故障触发", 11: "故障消除"}
+        if lc_available:
+            label = _SC_MAP.get(int(sc.cmd), f"未知(cmd={sc.cmd})")
+            self_check_lines.append(label)
+            if sc.cmd == 21:
+                issues.append("自检进行中")
+            elif sc.cmd == 10:
+                issues.append("故障触发")
+        elif self._self_check_available and self._self_check_state is not None:
+            ns = self._self_check_state
+            if ns.state == 0:
                 self_check_lines.append("空闲")
-            elif sc.state == 1:  # NODE_STATE_RUNNING — 运行中
+            elif ns.state == 1:
                 self_check_lines.append("运行中")
             else:
-                self_check_lines.append(f"异常(state={sc.state})")
-                issues.append(f"节点状态异常 (state={sc.state})")
+                self_check_lines.append(f"异常(state={ns.state})")
+        else:
+            self_check_lines.append("未知")
 
         # ── 综合健康判定 ──
         has_issues = len(issues) > 0
@@ -5297,16 +5327,21 @@ class RobotFaultsPlugin:
         else:
             lines.append(f"✅ IMU — {imu_detail}")
 
-        # ── 6. 自检/节点状态 ──
+        # ── 6. 自检状态 (proc_manager 灯效反馈) ──
         sc_detail = sc_info.get("detail", "未知")
-        motor_fault_count = len(motor_faults)
-        total_motor_expected = 16  # 双臂10+腰2+腿4 估算
-        if sc_detail == "空闲":
-            lines.append("⚠️  自检 — 空闲(自检中或未启动)")
-        elif motor_fault_count > total_motor_expected // 2:
-            lines.append(f"⚠️  自检 — 运行中但{total_motor_expected - motor_fault_count}/{total_motor_expected}电机在线(可能自检中)")
+        sc_label = sc_detail
+        if sc_detail == "自检中":
+            lines.append(f"🔄 自检 — 进行中")
+        elif sc_detail == "自检等待":
+            lines.append(f"⏳ 自检 — 等待中")
+        elif sc_detail == "自检通过":
+            lines.append("✅ 自检 — 通过")
+        elif sc_detail == "待机":
+            lines.append("✅ 自检 — 待机")
+        elif sc_detail == "故障触发":
+            lines.append("⚠️  自检 — 故障触发")
         else:
-            lines.append("✅ 自检 — 通过(节点运行中)")
+            lines.append(f"⚠️  自检 — {sc_detail}")
 
         # ── 7. 底盘 ──
         chassis_detail = chassis_data.get("detail", "未知")
@@ -5322,7 +5357,7 @@ class RobotFaultsPlugin:
 
         fatal_items = [f for f in body_data.get("faults", []) if f.get("severity") == "fatal"]
         blocker_count = len(fatal_items) + (1 if estop_active else 0)
-        if sc_detail == "空闲":
+        if sc_detail in ("空闲", "自检中", "自检等待"):
             blocker_count += 1
 
         if blocker_count > 0 or "电量极低" in power_detail:
