@@ -110,6 +110,11 @@ class G1DeviceBundle:
             self._plugins.append(StatePlugin(plugins_cfg["state"], namespace, executor))
             print("[bundle] StatePlugin loaded")
 
+        if plugins_cfg.get("posture_safety", {}).get("enabled", False):
+            from device import PostureSafetyPlugin
+            self._plugins.append(PostureSafetyPlugin(plugins_cfg["posture_safety"], namespace, executor))
+            print("[bundle] PostureSafetyPlugin loaded")
+
         if plugins_cfg.get("camera", {}).get("enabled", False):
             from device import RealSensePlugin
             self._plugins.append(RealSensePlugin(plugins_cfg["camera"], namespace, executor))

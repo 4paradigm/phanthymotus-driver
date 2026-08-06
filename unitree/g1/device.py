@@ -19,6 +19,7 @@ drivers/unitree/g1/device.py — Unitree G1 设备插件（重构版）。
 """
 
 import json
+import math
 import queue
 import socket
 import struct
@@ -1595,6 +1596,166 @@ class StatePlugin:
             if urdf_path.exists():
                 return {"urdf": urdf_path.read_text()}
             return {"error": "URDF model file not found"}
+        return None
+
+
+# ── PostureSafetyPlugin (sensor) ───────────────────────────────────────────────
+
+class _PostureSafetyNode(Node):
+    """Subscribes to DDS rt/lowstate and publishes derived posture safety status."""
+
+    def __init__(self, topic: str, cfg: dict):
+        super().__init__("g1_posture_safety")
+        self._pub = self.create_publisher(String, topic, _LOW_LAT_QOS)
+        self._topic = topic
+        self._publish_interval = 1.0 / max(float(cfg.get("publish_hz", 10.0)), 0.1)
+        self._warning_tilt_deg = float(cfg.get("warning_tilt_deg", 25.0))
+        self._danger_tilt_deg = float(cfg.get("danger_tilt_deg", 45.0))
+        self._fallen_tilt_deg = float(cfg.get("fallen_tilt_deg", 65.0))
+        self._angular_warning = float(cfg.get("angular_speed_warning_rad_s", 2.5))
+        self._angular_danger = float(cfg.get("angular_speed_danger_rad_s", 5.0))
+        self._impact_accel = float(cfg.get("impact_accel_mps2", 18.0))
+        self._stale_timeout_sec = float(cfg.get("stale_timeout_sec", 1.0))
+        self._last_publish_time = 0.0
+        self._last_seen_time = 0.0
+        self._last_status: dict = {}
+        self._lock = threading.Lock()
+
+        try:
+            from unitree_sdk2py.core.channel import ChannelSubscriber
+            from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
+            # Keep a strong reference for the lifetime of the ROS node. Some
+            # SDK versions stop delivering callbacks once the subscriber is
+            # garbage-collected after __init__ returns.
+            self._sub = ChannelSubscriber("rt/lowstate", LowState_)
+            self._sub.Init(self._on_state, 10)
+            self.get_logger().info(f"PostureSafetyNode subscribed rt/lowstate → {topic}")
+        except Exception as e:
+            self.get_logger().warn(f"PostureSafetyNode: failed to subscribe rt/lowstate: {e}")
+
+    def _on_state(self, msg) -> None:
+        now = time.monotonic()
+        if now - self._last_publish_time < self._publish_interval:
+            return
+        self._last_publish_time = now
+        self._last_seen_time = now
+
+        imu = msg.imu_state
+        rpy = [float(v) for v in getattr(imu, "rpy", [0.0, 0.0, 0.0])]
+        gyro = [float(v) for v in getattr(imu, "gyroscope", [0.0, 0.0, 0.0])]
+        accel = [float(v) for v in getattr(imu, "accelerometer", [0.0, 0.0, 0.0])]
+
+        roll_deg = math.degrees(rpy[0]) if len(rpy) > 0 else 0.0
+        pitch_deg = math.degrees(rpy[1]) if len(rpy) > 1 else 0.0
+        yaw_deg = math.degrees(rpy[2]) if len(rpy) > 2 else 0.0
+        tilt_deg = max(abs(roll_deg), abs(pitch_deg))
+        angular_speed = math.sqrt(sum(v * v for v in gyro))
+        accel_norm = math.sqrt(sum(v * v for v in accel))
+
+        fallen = tilt_deg >= self._fallen_tilt_deg
+        impact = accel_norm >= self._impact_accel
+        if fallen:
+            risk_level = "danger"
+            reason = "fallen_tilt"
+        elif tilt_deg >= self._danger_tilt_deg:
+            risk_level = "danger"
+            reason = "danger_tilt"
+        elif angular_speed >= self._angular_danger:
+            risk_level = "danger"
+            reason = "angular_speed"
+        elif impact:
+            risk_level = "danger"
+            reason = "impact"
+        elif tilt_deg >= self._warning_tilt_deg:
+            risk_level = "warning"
+            reason = "warning_tilt"
+        elif angular_speed >= self._angular_warning:
+            risk_level = "warning"
+            reason = "angular_speed"
+        else:
+            risk_level = "normal"
+            reason = "stable"
+
+        status = {
+            "state": "running",
+            "risk_level": risk_level,
+            "reason": reason,
+            "fallen": fallen,
+            "roll_deg": round(roll_deg, 2),
+            "pitch_deg": round(pitch_deg, 2),
+            "yaw_deg": round(yaw_deg, 2),
+            "tilt_deg": round(tilt_deg, 2),
+            "angular_speed_rad_s": round(angular_speed, 3),
+            "accel_norm_mps2": round(accel_norm, 3),
+            "timestamp_ms": int(time.time() * 1000),
+        }
+        with self._lock:
+            self._last_status = status
+
+        out = String()
+        out.data = json.dumps(status)
+        self._pub.publish(out)
+
+    def get_status(self) -> dict:
+        with self._lock:
+            status = dict(self._last_status)
+        if not status:
+            return {"state": "starting", "risk_level": "unknown", "reason": "no_lowstate"}
+        age = time.monotonic() - self._last_seen_time
+        status["last_update_ago_ms"] = int(age * 1000)
+        if age > self._stale_timeout_sec:
+            status["state"] = "stale"
+            status["risk_level"] = "unknown"
+            status["reason"] = "stale_lowstate"
+        return status
+
+
+class PostureSafetyPlugin:
+    PREFIX = "posture_safety"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor):
+        self._topic = f"/{namespace}/safety/posture"
+        self._node = _PostureSafetyNode(self._topic, plugin_config)
+        executor.add_node(self._node)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "posture_safety",
+            "type": "sensor",
+            "multiInstance": False,
+            "description": f"G1 posture safety detector — derives tilt, fall, impact, and angular-speed risk from IMU lowstate. Publishes to {self._topic}",
+            # Canvas hides start/stop/info for sensor tools. Expose an explicit
+            # snapshot action so operators can read current posture values on
+            # the card as well as through the live topic viewer.
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["snapshot"],
+                        "description": "Read the latest posture safety status",
+                    }
+                },
+                "required": ["action"],
+            },
+            "topic_out": [{"topic": self._topic, "format": "data/json"}],
+        }
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action in ("info", "snapshot"):
+            status = self._node.get_status()
+            status["topic_out"] = [{"topic": self._topic, "format": "data/json"}]
+            return status
         return None
 
 

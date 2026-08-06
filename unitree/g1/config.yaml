@@ -16,6 +16,16 @@ plugins:
     enabled: true
   state:
     enabled: true
+  posture_safety:
+    enabled: true
+    publish_hz: 10
+    warning_tilt_deg: 25
+    danger_tilt_deg: 45
+    fallen_tilt_deg: 65
+    angular_speed_warning_rad_s: 2.5
+    angular_speed_danger_rad_s: 5.0
+    impact_accel_mps2: 18.0
+    stale_timeout_sec: 1.0
   camera:
     enabled: true
   lidar:
