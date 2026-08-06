@@ -694,6 +694,15 @@ class LedPlugin:
         self._client = audio_client
         self._effect_thread = None
         self._effect_stop = threading.Event()
+        self._lock = threading.Lock()
+
+    def _led_set(self, r: int, g: int, b: int) -> int:
+        """Thread-safe LED control with error logging."""
+        with self._lock:
+            code = self._client.LedControl(r, g, b)
+            if code != 0:
+                print(f'[LED] LedControl({r},{g},{b}) failed: code={code}')
+            return code
 
     def get_tool(self) -> dict:
         return {
@@ -750,11 +759,13 @@ class LedPlugin:
             r = int(args.get("r", 0))
             g = int(args.get("g", 0))
             b = int(args.get("b", 0))
-            ret = self._client.LedControl(r, g, b)
+            ret = self._led_set(r, g, b)
+            if ret != 0:
+                return {"error": f"LedControl failed (code={ret})", "ret": ret}
             return {"ret": ret, "r": r, "g": g, "b": b}
         elif action == "off":
             self._stop_effect()
-            ret = self._client.LedControl(0, 0, 0)
+            ret = self._led_set(0, 0, 0)
             return {"ret": ret}
         elif action == "effect":
             effect_name = args.get("effect", "")
@@ -789,17 +800,17 @@ class LedPlugin:
         """Blue blink 3 times (200ms on / 200ms off)."""
         for _ in range(3):
             if self._effect_stop.is_set(): return
-            self._client.LedControl(0, 80, 255)
+            self._led_set(0, 80, 255)
             if self._effect_stop.wait(0.2): return
-            self._client.LedControl(0, 0, 0)
+            self._led_set(0, 0, 0)
             if self._effect_stop.wait(0.2): return
-        self._client.LedControl(0, 0, 0)
+        self._led_set(0, 0, 0)
 
     def _eff_solid_blue_2s(self):
         """Blue solid for 2 seconds, then off."""
-        self._client.LedControl(0, 100, 255)
+        self._led_set(0, 100, 255)
         if self._effect_stop.wait(2.0): return
-        self._client.LedControl(0, 0, 0)
+        self._led_set(0, 0, 0)
 
     def _eff_breathe_rainbow(self):
         """Breathing rainbow cycle (cyan→magenta→blue→purple) until stopped."""
@@ -823,10 +834,10 @@ class LedPlugin:
             b = int(palette[idx][2] * (1 - frac) + palette[next_idx][2] * frac)
             # Breathing: sinusoidal brightness modulation
             brightness = 0.3 + 0.7 * (0.5 + 0.5 * math.sin(step * 0.06))
-            self._client.LedControl(int(r * brightness), int(g * brightness), int(b * brightness))
+            self._led_set(int(r * brightness), int(g * brightness), int(b * brightness))
             step += 1
             if self._effect_stop.wait(0.03): return
-        self._client.LedControl(0, 0, 0)
+        self._led_set(0, 0, 0)
 
     def _eff_blink_red_5s(self):
         """Red blink for 5 seconds (250ms on / 250ms off)."""
@@ -834,11 +845,11 @@ class LedPlugin:
         end = time.monotonic() + 5.0
         while time.monotonic() < end:
             if self._effect_stop.is_set(): return
-            self._client.LedControl(255, 0, 0)
+            self._led_set(255, 0, 0)
             if self._effect_stop.wait(0.25): return
-            self._client.LedControl(0, 0, 0)
+            self._led_set(0, 0, 0)
             if self._effect_stop.wait(0.25): return
-        self._client.LedControl(0, 0, 0)
+        self._led_set(0, 0, 0)
 
 
 # ── LocoStatePlugin (sensor) ─────────────────────────────────────────────────
