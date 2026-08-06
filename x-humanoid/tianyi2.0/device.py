@@ -5340,6 +5340,10 @@ class RobotFaultsPlugin:
             lines.append("✅ 自检 — 待机")
         elif sc_detail == "故障触发":
             lines.append("⚠️  自检 — 故障触发")
+        elif sc_detail == "运行中":
+            lines.append("✅ 自检 — 运行中")
+        elif sc_detail == "空闲":
+            lines.append("⚠️  自检 — 空闲(可能自检中或未启动)")
         else:
             lines.append(f"⚠️  自检 — {sc_detail}")
 
