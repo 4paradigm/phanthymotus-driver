@@ -47,6 +47,7 @@ COPY unitree_sdk2py/ /work/unitree_sdk2py/
 COPY resource/       /work/resource/
 COPY main.py   /work/main.py
 COPY device.py /work/device.py
+COPY joint_health.py /work/joint_health.py
 COPY rpc_proxy.py /work/rpc_proxy.py
 COPY ext_devices.py /work/ext_devices.py
 COPY safety_harness.py /work/safety_harness.py
