@@ -5297,14 +5297,16 @@ class RobotFaultsPlugin:
         else:
             lines.append(f"✅ IMU — {imu_detail}")
 
-        # ── 6. 节点状态 ──
+        # ── 6. 自检/节点状态 ──
         sc_detail = sc_info.get("detail", "未知")
+        motor_fault_count = len(motor_faults)
+        total_motor_expected = 16  # 双臂10+腰2+腿4 估算
         if sc_detail == "空闲":
-            lines.append("⚠️  节点 — 空闲(自检中或未启动)")
-        elif sc_detail == "运行中":
-            lines.append("✅ 节点 — 运行中")
+            lines.append("⚠️  自检 — 空闲(自检中或未启动)")
+        elif motor_fault_count > total_motor_expected // 2:
+            lines.append(f"⚠️  自检 — 运行中但{total_motor_expected - motor_fault_count}/{total_motor_expected}电机在线(可能自检中)")
         else:
-            lines.append(f"⚠️  节点 — {sc_detail}")
+            lines.append("✅ 自检 — 通过(节点运行中)")
 
         # ── 7. 底盘 ──
         chassis_detail = chassis_data.get("detail", "未知")
