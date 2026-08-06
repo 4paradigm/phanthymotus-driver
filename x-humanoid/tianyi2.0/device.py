@@ -4817,12 +4817,14 @@ class RobotFaultsPlugin:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["summary"],
-                               "description": "summary=关键摘要"},
+                    "action": {"type": "string", "enum": ["summary", "detail"],
+                               "default": "summary",
+                               "description": "summary=可操作判定+子系统一句话概括; detail=完整结构化诊断数据"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "summary": {"params": [], "description": "返回全身体检摘要: 底盘/电机/手部/电源/急停/IMU/自检状态"},
+                    "summary": {"params": [], "description": "返回: 自检状态/急停/各子系统就绪/可否操作及原因"},
+                    "detail": {"params": [], "description": "返回完整结构化诊断: 底盘/电机/手部/电源/IMU/自检详情+issues+advice"},
                 },
             },
         }
@@ -5229,7 +5231,97 @@ class RobotFaultsPlugin:
         if action in ("start", "stop", "info"):
             return {"state": "running" if self._running else "idle"}
         with self._lock:
-            return self._build_summary_locked()
+            full = self._build_summary_locked()
+        if action == "detail":
+            return full
+        # action == "summary"
+        return self._build_operability_summary(full)
+
+    def _build_operability_summary(self, full: dict) -> dict:
+        """从完整诊断数据中提取可操作判定 + 人话总结。"""
+
+        # ── 自检状态 ──
+        sc_detail = full.get("self_check", {}).get("detail", "未知")
+        self_check_str = f"自检: {sc_detail}"
+
+        # ── 急停 ──
+        chassis_data = full.get("chassis", {})
+        estop_active = chassis_data.get("emergency_stop", False)
+        body_data = full.get("body", {})
+        # 身体急停 (physical estop)
+        body_faults = body_data.get("faults", [])
+        has_physical_estop = any(
+            f.get("category") == "estop" for f in body_faults)
+        estop_active = estop_active or has_physical_estop
+        estop_str = "急停: 已触发!" if estop_active else "急停: 未触发"
+
+        # ── 各子系统一行概括 ──
+        chassis_str = f"底盘: {chassis_data.get('detail', '未知')}"
+        body_detail = body_data.get("detail", "未知")
+        if body_data.get("fault_count", 0) == 0:
+            body_detail = "正常"
+        body_str = f"电机: {body_detail}"
+        power_str = f"电源: {full.get('power_board', {}).get('detail', '未知')}"
+        hand_str = f"手部: {full.get('hand_state', {}).get('detail', '未知')}"
+        imu_str = f"IMU: {full.get('imu', {}).get('detail', '未知')}"
+
+        subsystems = " | ".join([chassis_str, body_str, power_str, hand_str, imu_str])
+
+        # ── 可操作判定 ──
+        issues = full.get("issues", [])
+        # 阻塞性条件
+        blockers = []
+        if estop_active:
+            blockers.append("急停已触发")
+        if not full.get("healthy"):
+            # 找严重故障
+            for f in body_data.get("faults", []):
+                if f.get("severity") == "fatal":
+                    blockers.append(f.get("component", "未知部件"))
+            if sc_detail == "自检中":
+                blockers.append("自检未完成，电机未上电")
+        if full.get("power_board", {}).get("available"):
+            power_detail = full["power_board"]["detail"]
+            if "电量极低" in power_detail:
+                blockers.append("电池电量极低，有断电风险")
+
+        if blockers:
+            can_operate = "禁止操作"
+            reasons = "、".join(blockers[:5])
+            if len(blockers) > 5:
+                reasons += f" 等{len(blockers)}项"
+            operate_str = f"禁止操作！原因: {reasons}"
+        else:
+            can_operate = "可以操作"
+            operate_str = "可以操作"
+
+        # ── 拼接总结 ──
+        summary_lines = [
+            f"{self_check_str} | {estop_str}",
+            subsystems,
+            operate_str,
+        ]
+
+        # 附加关键建议
+        advice = full.get("advice", [])
+        if advice:
+            summary_lines.append("建议: " + "；".join(advice[:3]))
+
+        return {
+            "can_operate": not bool(blockers),
+            "self_check_state": sc_detail,
+            "emergency_stop": estop_active,
+            "subsystems": {
+                "chassis": chassis_data.get("detail", "未知"),
+                "body": body_detail,
+                "power": full.get("power_board", {}).get("detail", "未知"),
+                "hands": full.get("hand_state", {}).get("detail", "未知"),
+                "imu": full.get("imu", {}).get("detail", "未知"),
+            },
+            "issues": issues,
+            "advice": advice,
+            "summary_text": "\n".join(summary_lines),
+        }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
