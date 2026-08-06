@@ -506,11 +506,32 @@ class ControlledSpatialPlugin:
     def _acp_wait_nav(self, action_id: str, target: str, stall_timeout: float = 90):
         """Wait for navigation to complete, then fire ACP callback."""
         t0 = time.time()
+
+        # Primary: delegate to SmartMotion subprocess which has reliable
+        # pose-based arrival detection (dist < 0.3m from target).
+        # The main process DDS callback for ctrl_info.is_arrived is unreliable
+        # (SLAM service never publishes ctrl_info in practice).
+        if self._smart_motion:
+            result = self._smart_motion.wait_nav_done(stall_timeout=stall_timeout)
+            elapsed = round(time.time() - t0, 1)
+            status = result.get("status", "error")
+            if status == "arrived":
+                _acp_notify(action_id, "completed", {
+                    "target": target, "pose": result.get("pose"), "elapsed": elapsed,
+                })
+            else:
+                _acp_notify(action_id, "error", {
+                    "target": target,
+                    "error": result.get("error", status),
+                    "elapsed": elapsed,
+                })
+            return
+
+        # Fallback: no SmartMotion — poll local DDS callback + stall detection
         last_pose = self._get_pose()
         last_move_time = time.time()
 
         while True:
-            # Check DDS-driven arrival event
             if self._nav_arrived.wait(timeout=1.0):
                 elapsed = round(time.time() - t0, 1)
                 if self._nav_error:
@@ -526,7 +547,6 @@ class ControlledSpatialPlugin:
                     })
                 return
 
-            # Stall detection
             current_pose = self._get_pose()
             if current_pose and last_pose:
                 dx = current_pose["x"] - last_pose["x"]
@@ -540,10 +560,7 @@ class ControlledSpatialPlugin:
                 last_move_time = time.time()
 
             if time.time() - last_move_time > stall_timeout:
-                # Pause nav to stop the robot
-                if self._smart_motion:
-                    self._smart_motion.pause_nav()
-                elif self._client:
+                if self._client:
                     self._client.PauseNav()
                 _acp_notify(action_id, "error", {
                     "target": target,
@@ -552,7 +569,6 @@ class ControlledSpatialPlugin:
                 })
                 return
 
-            # Hard timeout
             if time.time() - t0 > 180:
                 _acp_notify(action_id, "error", {
                     "target": target, "error": "timeout_180s",
