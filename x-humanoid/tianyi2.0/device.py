@@ -33,6 +33,13 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   MotorStatePlugin    (sensor)             — 全身21电机状态(2Hz)
   HandStatePlugin     (sensor)             — 灵巧手状态(10Hz, tool name=hand_state)
   RemoteStatePlugin   (sensor)             — 遥控器SBUS事件(5Hz)
+  RobotFaultsPlugin   (actuator)           — 全身体检卡 (tool name=health_check)
+  LaserScanPlugin     (sensor)             — 激光雷达原始点云
+  ChassisRawPlugin    (actuator)           — 底盘速度控制
+  AebPlugin           (actuator)           — 急刹卡 (tool name=auto_brake)
+  ControlledSpatialPlugin (actuator)      — 空间控制(controlled_spatial)
+  ExtMicPlugin        (actuator)           — 外部麦克风(ext_mic)
+  LightPlugin         (actuator)           — 灯光控制
   StatePlugin      (sensor, multi-tool) — 关节/电池/急停/力传感器/URDF
   CameraPlugin     (sensor)             — Orbbec 头部相机
   AsrPlugin        (sensor)             — 语音识别结果
@@ -5123,7 +5130,8 @@ class RemoteStatePlugin:
         return {"state": "error", "error": "INVALID_ARGUMENT",
                 "message": f"unknown action: {action}"}
 class RobotFaultsPlugin:
-    """全机故障汇总 — 底盘 (Slamtec HTTP) + 身体电机/灵巧手/急停 (ROS2 订阅), 1Hz 发布。
+    """全身体检卡 — 底盘安全 + 身体电机/灵巧手/急停 + 电源 + 手部 + IMU + 自检状态
+    综合诊断结论 + 可行建议。
     bodyctrl_msgs 不可用时身体部分自动降级为 unavailable。"""
 
     @staticmethod
@@ -5134,7 +5142,15 @@ class RobotFaultsPlugin:
                 "left": "/inspire_hand/error/left_hand",
                 "right": "/inspire_hand/error/right_hand",
             },
+            "hand_state_topics": {
+                "left": "/inspire_hand/state/left_hand",
+                "right": "/inspire_hand/state/right_hand",
+            },
             "estop_topic": "/power/board/key_status",
+            "power_board_topic": "/power/board/status",
+            "imu_accel_topic": "/ob_camera_head/accel/sample",
+            "imu_gyro_topic": "/ob_camera_head/gyro/sample",
+            "self_check_topic": "/node/status",
         }
 
     def __init__(self, plugin_config: dict, namespace: str, ros2, slamtec_client):
@@ -5148,7 +5164,12 @@ class RobotFaultsPlugin:
         # 身体故障源配置
         self._motor_topics = cfg["motor_status_topics"]
         self._hand_topics = cfg["hand_error_topics"]
+        self._hand_state_topics = cfg["hand_state_topics"]
         self._estop_topic = cfg["estop_topic"]
+        self._power_board_topic = cfg["power_board_topic"]
+        self._imu_accel_topic = cfg["imu_accel_topic"]
+        self._imu_gyro_topic = cfg["imu_gyro_topic"]
+        self._self_check_topic = cfg["self_check_topic"]
 
         # 状态
         self._chassis_data = None
@@ -5158,24 +5179,36 @@ class RobotFaultsPlugin:
         self._last_update_ms = None
         self._lock = threading.Lock()
 
+        # 新增数据源状态
+        self._power_board_data = None       # PowerStatus
+        self._power_board_available = False
+        self._hand_state_data = {"left": None, "right": None}  # JointState
+        self._hand_state_available = False
+        self._imu_data = {"accel": None, "gyro": None}  # Imu msg
+        self._imu_available = False
+        self._self_check_state = None       # NodeState
+        self._self_check_available = False
+
         # 订阅节点 (domain 0) — 接收身体故障
         self._sub_node = Node("tianyi2_robot_faults_sub", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._sub_node)
 
     def get_tool(self) -> dict:
         return {
-            "name": "robot_faults",
+            "name": "health_check",
             "type": "actuator",
-            "description": "天轶2.0 全机故障检查 — 底盘安全 + 身体电机/灵巧手/急停",
+            "description": "天轶2.0 全身体检 — 底盘/电机/手部/电源/急停/IMU 综合诊断, 含建议",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["summary"],
-                               "description": "summary=关键摘要"},
+                    "action": {"type": "string", "enum": ["summary", "detail"],
+                               "default": "summary",
+                               "description": "summary=可操作判定+子系统一句话概括; detail=完整结构化诊断数据"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "summary": {"params": [], "description": "返回关键摘要: 底盘状态/急停/身体故障数"},
+                    "summary": {"params": [], "description": "返回: 自检状态/急停/各子系统就绪/可否操作及原因"},
+                    "detail": {"params": [], "description": "返回完整结构化诊断: 底盘/电机/手部/电源/IMU/自检详情+issues+advice"},
                 },
             },
         }
@@ -5208,6 +5241,55 @@ class RobotFaultsPlugin:
             print("[RobotFaultsPlugin] body subscriptions created")
         except ImportError as e:
             print(f"[RobotFaultsPlugin] bodyctrl_msgs not available ({e}), body disabled")
+
+        # 电源板订阅 (PowerStatus)
+        try:
+            from bodyctrl_msgs.msg import PowerStatus
+            self._sub_node.create_subscription(
+                PowerStatus, self._power_board_topic,
+                self._on_power_board, _RELIABLE_QOS)
+            self._power_board_available = True
+            print("[RobotFaultsPlugin] power board subscription created")
+        except ImportError:
+            print("[RobotFaultsPlugin] PowerStatus not available, power board disabled")
+
+        # 手部状态订阅 (JointState) — 检测手部是否在线
+        try:
+            from sensor_msgs.msg import JointState
+            for side, src_topic in self._hand_state_topics.items():
+                self._sub_node.create_subscription(
+                    JointState, src_topic,
+                    lambda msg, s=side: self._on_hand_state(msg, s),
+                    _RELIABLE_QOS)
+            self._hand_state_available = True
+            print("[RobotFaultsPlugin] hand state subscriptions created")
+        except ImportError:
+            print("[RobotFaultsPlugin] JointState not available, hand state disabled")
+
+        # IMU 订阅
+        try:
+            from sensor_msgs.msg import Imu as RosImu
+            self._sub_node.create_subscription(
+                RosImu, self._imu_accel_topic,
+                lambda msg: self._on_imu("accel", msg), _RELIABLE_QOS)
+            self._sub_node.create_subscription(
+                RosImu, self._imu_gyro_topic,
+                lambda msg: self._on_imu("gyro", msg), _RELIABLE_QOS)
+            self._imu_available = True
+            print("[RobotFaultsPlugin] IMU subscriptions created")
+        except ImportError:
+            print("[RobotFaultsPlugin] sensor_msgs.Imu not available, IMU disabled")
+
+        # 自检状态订阅 (NodeState)
+        try:
+            from bodyctrl_msgs.msg import NodeState
+            self._sub_node.create_subscription(
+                NodeState, self._self_check_topic,
+                self._on_self_check, _RELIABLE_QOS)
+            self._self_check_available = True
+            print("[RobotFaultsPlugin] self check subscription created")
+        except ImportError:
+            print("[RobotFaultsPlugin] NodeState not available, self check disabled")
 
         # 完整数据发布线程 (1Hz → topic)
         print("[RobotFaultsPlugin] started")
@@ -5298,67 +5380,205 @@ class RobotFaultsPlugin:
             self._body_sources[self._estop_topic] = now_ms
             self._last_update_ms = now_ms
 
+    # ── 新增回调: 电源板 / 手部状态 / IMU / 自检 ──────────────────────────
+
+    def _on_power_board(self, msg):
+        now_ms = int(time.time() * 1000)
+        with self._lock:
+            self._power_board_data = msg
+            self._last_update_ms = now_ms
+
+    def _on_hand_state(self, msg, side: str):
+        now_ms = int(time.time() * 1000)
+        with self._lock:
+            self._hand_state_data[side] = msg
+            self._last_update_ms = now_ms
+
+    def _on_imu(self, kind: str, msg):
+        now_ms = int(time.time() * 1000)
+        with self._lock:
+            self._imu_data[kind] = msg
+            self._last_update_ms = now_ms
+
+    def _on_self_check(self, msg):
+        now_ms = int(time.time() * 1000)
+        with self._lock:
+            self._self_check_state = msg
+            self._last_update_ms = now_ms
+
     # ── 按需查询执行器 ─────────────────────────────────────────────────────
 
     def _build_summary_locked(self) -> dict:
-        """生成关键摘要，每次 dispatch 调用时读取最新快照。"""
+        """生成全身体检摘要，每次 dispatch 调用时读取最新快照。"""
 
-        # 底盘
+        now_ms = int(time.time() * 1000)
+        issues = []
+        advice = []
+
+        # ── 底盘 ──
         chassis_available = self._chassis_data is not None
         chassis_healthy = chassis_available and not self._chassis_data.get("has_error") \
                           and not self._chassis_data.get("has_fatal")
         chassis_lines = []
         if not chassis_available:
             chassis_lines.append("离线")
+            issues.append("底盘通信离线，无法获取安全状态")
         elif not chassis_healthy:
             chassis_lines.append("异常")
+            issues.append("底盘系统异常")
         else:
             chassis_lines.append("正常")
         if chassis_available:
             d = self._chassis_data
             if d.get("emergency_stop"):
                 chassis_lines.append("急停!")
+                issues.append("底盘急停已触发")
+                advice.append("检查急停按钮状态，确认安全后解除急停")
             if d.get("lidar_disconnected"):
                 chassis_lines.append("雷达离线")
+                issues.append("激光雷达离线，AEB/避障功能不可用")
+            if d.get("cliff"):
+                issues.append("检测到跌落风险")
+                advice.append("立即停止移动，检查地面环境")
+            if d.get("collision"):
+                issues.append("检测到碰撞")
+                advice.append("检查碰撞方向，排查周围障碍物")
 
-        # 身体
+        # ── 身体电机/急停 ──
         body_faults = sorted(self._body_faults.values(), key=lambda f: f["fault_id"])
         body_lines = []
         if not self._body_available:
             body_lines.append("离线")
+            issues.append("身体电机/急停数据无法获取 (bodyctrl_msgs 未导入)")
         elif not body_faults:
             body_lines.append("正常")
         else:
             for f in body_faults:
-                body_lines.append(f"{f['component']}({f.get('error_desc', f['error_code'])})")
+                line = f"{f['component']}({f.get('error_desc', f['error_code'])})"
+                body_lines.append(line)
+                issues.append(f"故障: {line}")
+                if f.get("severity") == "fatal":
+                    advice.append(f"严重故障 {f['component']}，请立即停止操作并检查硬件")
 
-        # 生成人类可读总结段落
-        body_fault_count = len(body_faults)
-        if chassis_healthy and self._body_available and body_fault_count == 0:
-            summary_text = "机器人状态良好，底盘运动系统正常，身体各关节无故障。"
+        # ── 电源板 ──
+        power_available = self._power_board_available and self._power_board_data is not None
+        power_lines = []
+        if not self._power_board_available:
+            power_lines.append("离线")
+            issues.append("电源板数据不可用 (PowerStatus 未导入)")
+        elif not power_available:
+            power_lines.append("无数据")
         else:
-            parts = []
-            if not chassis_healthy:
-                parts.append("底盘系统异常")
-            elif chassis_available:
-                parts.append("底盘正常")
-            if not self._body_available:
-                parts.append("身体关节数据无法获取")
-            elif body_fault_count > 0:
-                fault_desc = "，".join(
-                    f"{f['component']}({f.get('error_desc', f['error_code'])})"
-                    for f in body_faults[:3])
-                if body_fault_count > 3:
-                    fault_desc += f" 等{body_fault_count}个故障"
-                parts.append(f"检测到身体故障: {fault_desc}")
+            p = self._power_board_data
+            # 检查各部位温度
+            temps = {
+                "腰部": p.waist_temp, "臂A": p.arm_a_temp, "臂B": p.arm_b_temp,
+                "腿A": p.leg_a_temp, "腿B": p.leg_b_temp,
+            }
+            hot_zones = [f"{k}({v:.0f}°C)" for k, v in temps.items() if v > 75]
+            warm_zones = [f"{k}({v:.0f}°C)" for k, v in temps.items() if 65 < v <= 75]
+            if hot_zones:
+                power_lines.append(f"过热:{','.join(hot_zones)}")
+                issues.append(f"电源板MOS过热: {', '.join(hot_zones)}")
+                advice.append("立即停止运行，检查散热及风扇状态")
+            elif warm_zones:
+                power_lines.append(f"温升:{','.join(warm_zones)}")
+                issues.append(f"电源板MOS温度偏高: {', '.join(warm_zones)}")
             else:
-                parts.append("身体关节正常")
-            summary_text = "；".join(parts) + "。"
+                power_lines.append("温度正常")
+            # 电池
+            if p.battery_power < 10:
+                power_lines.append(f"电量极低({p.battery_power:.0f}%)")
+                issues.append(f"电池电量极低 ({p.battery_power:.0f}%)，随时可能断电")
+                advice.append("立即充电，避免在低电量下操作运动关节")
+            elif p.battery_power < 25:
+                power_lines.append(f"电量偏低({p.battery_power:.0f}%)")
+                issues.append(f"电池电量偏低 ({p.battery_power:.0f}%)")
+            else:
+                power_lines.append(f"电量({p.battery_power:.0f}%)")
+            # 电压异常
+            if p.bus_volt == 0:
+                power_lines.append("母线电压异常")
+                issues.append("母线电压为0V，电源板可能未正常工作")
+
+        # ── 手部状态 ──
+        hand_available = self._hand_state_available
+        hand_lines = []
+        if not hand_available:
+            hand_lines.append("离线")
+        else:
+            for side in ("left", "right"):
+                data = self._hand_state_data[side]
+                if data is None:
+                    hand_lines.append(f"{'左' if side=='left' else '右'}手无数据")
+                    issues.append(f"{'左' if side=='left' else '右'}手传感器无数据")
+                elif data.name and len(data.name) > 0:
+                    hand_lines.append(f"{'左' if side=='left' else '右'}手在线")
+                else:
+                    hand_lines.append(f"{'左' if side=='left' else '右'}手无关节名")
+                    issues.append(f"{'左' if side=='left' else '右'}手关节名称为空，可能未连接")
+
+        # ── IMU ──
+        imu_available = self._imu_available
+        imu_lines = []
+        if not imu_available:
+            imu_lines.append("离线")
+        else:
+            accel_ok = self._imu_data["accel"] is not None
+            gyro_ok = self._imu_data["gyro"] is not None
+            if accel_ok and gyro_ok:
+                imu_lines.append("在线")
+            else:
+                missing = []
+                if not accel_ok:
+                    missing.append("加速度")
+                if not gyro_ok:
+                    missing.append("角速度")
+                imu_lines.append(f"部分缺失:{','.join(missing)}")
+                issues.append(f"IMU部分数据缺失: {', '.join(missing)}")
+
+        # ── 自检状态 ──
+        self_check_available = self._self_check_available and self._self_check_state is not None
+        self_check_lines = []
+        if not self_check_available:
+            self_check_lines.append("未知")
+        else:
+            sc = self._self_check_state
+            if sc.state == 0:  # IDLE
+                self_check_lines.append("自检中")
+            elif sc.state == 1:  # RUNNING
+                self_check_lines.append("自检完成")
+            else:
+                self_check_lines.append(f"异常(state={sc.state})")
+                issues.append(f"节点状态异常 (state={sc.state})")
+
+        # ── 综合健康判定 ──
+        has_issues = len(issues) > 0
+        all_normal = (chassis_healthy and self._body_available and not body_faults
+                      and power_available and not hot_zones and p.battery_power >= 25)
+        healthy = all_normal and not has_issues
+
+        # ── 人类可读总结 ──
+        if healthy:
+            summary_text = "机器人状态良好: 底盘正常, 身体关节无故障, 电源温度正常, 手部在线, IMU在线, 自检完成。"
+        else:
+            snippet = "；".join(issues[:3])
+            if len(issues) > 3:
+                snippet += f" 等{len(issues)}个问题"
+            summary_text = f"检测到异常: {snippet}。"
+        if advice:
+            summary_text += " " + " ".join(advice)
 
         return {
-            "healthy": chassis_healthy and self._body_available and not body_faults,
+            "healthy": healthy,
             "summary_text": summary_text,
-            "summary": ", ".join(chassis_lines + body_lines),
+            "summary": ", ".join(
+                ["底盘:" + ",".join(chassis_lines),
+                 "身体:" + ",".join(body_lines),
+                 "电源:" + ",".join(power_lines),
+                 "手部:" + ",".join(hand_lines),
+                 "IMU:" + ",".join(imu_lines),
+                 "自检:" + ",".join(self_check_lines)]),
             "chassis": {
                 "available": chassis_available,
                 "healthy": chassis_healthy,
@@ -5371,13 +5591,310 @@ class RobotFaultsPlugin:
                 "faults": body_faults if body_faults else [],
                 "detail": ", ".join(body_lines),
             },
+            "power_board": {
+                "available": power_available,
+                "detail": ", ".join(power_lines),
+            },
+            "hand_state": {
+                "available": hand_available,
+                "detail": ", ".join(hand_lines),
+            },
+            "imu": {
+                "available": imu_available,
+                "detail": ", ".join(imu_lines),
+            },
+            "self_check": {
+                "available": self_check_available,
+                "detail": ", ".join(self_check_lines),
+            },
+            "issues": issues,
+            "advice": advice,
         }
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action in ("start", "stop", "info"):
             return {"state": "running" if self._running else "idle"}
         with self._lock:
-            return self._build_summary_locked()
+            full = self._build_summary_locked()
+        if action == "detail":
+            return full
+        # action == "summary"
+        return self._build_operability_summary(full)
+
+    def _build_operability_summary(self, full: dict) -> dict:
+        """从完整诊断数据中提取可操作判定 + 人话总结。"""
+
+        # ── 自检状态 ──
+        sc_detail = full.get("self_check", {}).get("detail", "未知")
+        self_check_str = f"自检: {sc_detail}"
+
+        # ── 急停 ──
+        chassis_data = full.get("chassis", {})
+        estop_active = chassis_data.get("emergency_stop", False)
+        body_data = full.get("body", {})
+        # 身体急停 (physical estop)
+        body_faults = body_data.get("faults", [])
+        has_physical_estop = any(
+            f.get("category") == "estop" for f in body_faults)
+        estop_active = estop_active or has_physical_estop
+        estop_str = "急停: 已触发!" if estop_active else "急停: 未触发"
+
+        # ── 各子系统一行概括 ──
+        chassis_str = f"底盘: {chassis_data.get('detail', '未知')}"
+        body_detail = body_data.get("detail", "未知")
+        if body_data.get("fault_count", 0) == 0:
+            body_detail = "正常"
+        body_str = f"电机: {body_detail}"
+        power_str = f"电源: {full.get('power_board', {}).get('detail', '未知')}"
+        hand_str = f"手部: {full.get('hand_state', {}).get('detail', '未知')}"
+        imu_str = f"IMU: {full.get('imu', {}).get('detail', '未知')}"
+
+        subsystems = " | ".join([chassis_str, body_str, power_str, hand_str, imu_str])
+
+        # ── 可操作判定 ──
+        issues = full.get("issues", [])
+        # 阻塞性条件
+        blockers = []
+        if estop_active:
+            blockers.append("急停已触发")
+        if not full.get("healthy"):
+            # 找严重故障
+            for f in body_data.get("faults", []):
+                if f.get("severity") == "fatal":
+                    blockers.append(f.get("component", "未知部件"))
+            if sc_detail == "自检中":
+                blockers.append("自检未完成，电机未上电")
+        if full.get("power_board", {}).get("available"):
+            power_detail = full["power_board"]["detail"]
+            if "电量极低" in power_detail:
+                blockers.append("电池电量极低，有断电风险")
+
+        if blockers:
+            can_operate = "禁止操作"
+            reasons = "、".join(blockers[:5])
+            if len(blockers) > 5:
+                reasons += f" 等{len(blockers)}项"
+            operate_str = f"禁止操作！原因: {reasons}"
+        else:
+            can_operate = "可以操作"
+            operate_str = "可以操作"
+
+        # ── 拼接总结 ──
+        summary_lines = [
+            f"{self_check_str} | {estop_str}",
+            subsystems,
+            operate_str,
+        ]
+
+        # 附加关键建议
+        advice = full.get("advice", [])
+        if advice:
+            summary_lines.append("建议: " + "；".join(advice[:3]))
+
+        return {
+            "can_operate": not bool(blockers),
+            "self_check_state": sc_detail,
+            "emergency_stop": estop_active,
+            "subsystems": {
+                "chassis": chassis_data.get("detail", "未知"),
+                "body": body_detail,
+                "power": full.get("power_board", {}).get("detail", "未知"),
+                "hands": full.get("hand_state", {}).get("detail", "未知"),
+                "imu": full.get("imu", {}).get("detail", "未知"),
+            },
+            "issues": issues,
+            "advice": advice,
+            "summary_text": "\n".join(summary_lines),
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AebPlugin (actuator)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class AebPlugin:
+    """急刹卡 — 激光雷达前方 ±30° 障碍物检测, 距离 < 0.5m 自动取消当前运动。
+    10Hz 轮询 Slamtec laserscan, 检测到近距离障碍物时调用 cancel_action() 停车。"""
+
+    _DEFAULT_DIST_THRESHOLD = 0.5   # 米
+    _DEFAULT_ANGLE_RANGE = 30.0     # 度, 半角
+    _POLL_HZ = 10
+
+    @staticmethod
+    def _default_config() -> dict:
+        return {
+            "distance_threshold": AebPlugin._DEFAULT_DIST_THRESHOLD,
+            "angle_range_deg": AebPlugin._DEFAULT_ANGLE_RANGE,
+        }
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2, slamtec_client):
+        cfg = self._default_config()
+        cfg.update(plugin_config)
+        self._ns = namespace
+        self._ros2 = ros2
+        self._slamtec = slamtec_client
+        self._topic = f"/{namespace}/state/auto_brake"
+        self._running = False
+        self._monitoring = False
+        self._threshold = float(cfg["distance_threshold"])
+        self._angle_range = float(cfg["angle_range_deg"])
+
+        # 状态
+        self._breached = False           # 当前是否有障碍物进入阈值
+        self._min_distance = None        # 最近障碍物距离
+        self._min_angle = None           # 最近障碍物角度
+        self._brake_count = 0            # 累计触发刹车次数
+        self._last_update_ms = None
+        self._lock = threading.Lock()
+
+        # ROS2 发布节点 (domain 42 → Agent Core)
+        self._pub_node = Node("tianyi2_auto_brake_pub", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._pub_node)
+        self._pub = self._pub_node.create_publisher(String, self._topic, _LOW_LAT_QOS)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "auto_brake",
+            "type": "actuator",
+            "description": f"天轶2.0 急刹 — 前方±{self._angle_range:.0f}°检测, 距离<{self._threshold:.1f}m自动停车",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string",
+                               "enum": ["monitor", "stop_monitor", "status"],
+                               "description": "monitor=启动监控, stop_monitor=停止, status=查看状态"},
+                    "distance_threshold": {"type": "number",
+                                          "description": f"触发阈值(米), 默认{self._threshold}m"},
+                    "angle_range_deg": {"type": "number",
+                                        "description": f"监控角度范围(度, 半角), 默认{self._angle_range}°"},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "monitor": {"params": [],
+                                "description": "启动急刹监控"},
+                    "stop_monitor": {"params": [],
+                                     "description": "停止监控"},
+                    "status": {"params": [],
+                               "description": "查看当前状态: 是否监控/是否有障碍物/最近距离/刹车次数"},
+                },
+            },
+            "topic_out": [{"topic": self._topic, "format": "data/json"}],
+        }
+
+    # ── start / stop ──────────────────────────────────────────────────────
+
+    def start(self):
+        self._running = True
+        print(f"[AebPlugin] started (threshold={self._threshold}m, angle=±{self._angle_range}°)")
+
+    def stop(self):
+        self._running = False
+        self._monitoring = False
+
+    # ── 激光雷达轮询 (10Hz) ────────────────────────────────────────────────
+
+    def _check_obstacle(self) -> tuple[bool, float | None, float | None]:
+        """检查前方扇形区域是否有障碍物在阈值内。
+        Returns: (breached, min_distance, min_angle_deg)"""
+        try:
+            scan = self._slamtec.get_laser_scan()
+        except Exception:
+            return False, None, None
+
+        if not scan or "laser_points" not in scan:
+            return False, None, None
+
+        min_dist = None
+        min_angle = None
+        for pt in scan["laser_points"]:
+            if not pt.get("valid"):
+                continue
+            angle_deg = float(pt.get("angle", 0))
+            distance = float(pt.get("distance", 999))
+            # 只检查前方扇形
+            if abs(angle_deg) > self._angle_range:
+                continue
+            if distance < self._threshold:
+                if min_dist is None or distance < min_dist:
+                    min_dist = distance
+                    min_angle = angle_deg
+
+        breached = min_dist is not None
+        return breached, min_dist, min_angle
+
+    # ── dispatch ──────────────────────────────────────────────────────────
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "stop", "info"):
+            return {"state": "running" if self._running else "idle",
+                    "monitoring": self._monitoring}
+
+        if action == "monitor":
+            if args.get("distance_threshold"):
+                self._threshold = float(args["distance_threshold"])
+            if args.get("angle_range_deg"):
+                self._angle_range = float(args["angle_range_deg"])
+            self._monitoring = True
+            # 启动监控线程
+            threading.Thread(target=self._monitor_poll_loop, daemon=True).start()
+            return {"action": "monitor", "status": "started",
+                    "threshold_m": self._threshold, "angle_range_deg": self._angle_range}
+
+        if action == "stop_monitor":
+            self._monitoring = False
+            return {"action": "stop_monitor", "status": "stopped"}
+
+        if action == "status":
+            with self._lock:
+                return {
+                    "monitoring": self._monitoring,
+                    "threshold_m": self._threshold,
+                    "angle_range_deg": self._angle_range,
+                    "breached": self._breached,
+                    "min_distance_m": self._min_distance,
+                    "min_angle_deg": self._min_angle,
+                    "brake_count": self._brake_count,
+                    "last_update_ms": self._last_update_ms,
+                }
+
+        return {"error": f"unknown action: {action}"}
+
+    # ── 监控轮询线程 ───────────────────────────────────────────────────────
+
+    def _monitor_poll_loop(self):
+        """10Hz 轮询激光雷达并检查障碍物"""
+        while self._running and self._monitoring:
+            try:
+                breached, min_dist, min_angle = self._check_obstacle()
+                now_ms = int(time.time() * 1000)
+                with self._lock:
+                    self._breached = breached
+                    self._min_distance = min_dist
+                    self._min_angle = min_angle
+                    self._last_update_ms = now_ms
+
+                if breached:
+                    # 触发急刹: 取消当前运动
+                    try:
+                        self._slamtec.cancel_action()
+                        with self._lock:
+                            self._brake_count += 1
+                        print(f"[AebPlugin] BRAKE! obstacle at {min_dist:.2f}m, {min_angle:.1f}° (brake #{self._brake_count})")
+                    except Exception as e:
+                        print(f"[AebPlugin] cancel_action failed: {e}")
+
+                # 发布状态到 topic
+                self._pub.publish(String(data=json.dumps({
+                    "ts_ms": now_ms,
+                    "breached": breached,
+                    "min_distance_m": min_dist,
+                    "min_angle_deg": min_angle if min_angle is not None else 0,
+                    "brake_count": self._brake_count,
+                })))
+            except Exception as e:
+                print(f"[AebPlugin] monitor loop error: {e}")
+
+            time.sleep(1.0 / self._POLL_HZ)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
