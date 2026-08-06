@@ -5160,10 +5160,10 @@ class RobotFaultsPlugin:
             self_check_lines.append("未知")
         else:
             sc = self._self_check_state
-            if sc.state == 0:  # IDLE
-                self_check_lines.append("自检中")
-            elif sc.state == 1:  # RUNNING
-                self_check_lines.append("自检完成")
+            if sc.state == 0:  # NODE_STATE_IDLE — 未运行
+                self_check_lines.append("空闲")
+            elif sc.state == 1:  # NODE_STATE_RUNNING — 运行中
+                self_check_lines.append("运行中")
             else:
                 self_check_lines.append(f"异常(state={sc.state})")
                 issues.append(f"节点状态异常 (state={sc.state})")
@@ -5176,7 +5176,7 @@ class RobotFaultsPlugin:
 
         # ── 人类可读总结 ──
         if healthy:
-            summary_text = "机器人状态良好: 底盘正常, 身体关节无故障, 电源温度正常, 手部在线, IMU在线, 自检完成。"
+            summary_text = "机器人状态良好: 底盘正常, 身体关节无故障, 电源温度正常, 手部在线, IMU在线, 节点运行中。"
         else:
             snippet = "；".join(issues[:3])
             if len(issues) > 3:
@@ -5242,7 +5242,9 @@ class RobotFaultsPlugin:
 
         # ── 自检状态 ──
         sc_detail = full.get("self_check", {}).get("detail", "未知")
-        self_check_str = f"自检: {sc_detail}"
+        # NodeState 只反映节点运行状态, 不自检进度。空闲=可能自检中或未启动。
+        node_label = "空闲" if sc_detail == "空闲" else "运行"
+        self_check_str = f"节点: {node_label}"
 
         # ── 急停 ──
         chassis_data = full.get("chassis", {})
@@ -5278,8 +5280,8 @@ class RobotFaultsPlugin:
             for f in body_data.get("faults", []):
                 if f.get("severity") == "fatal":
                     blockers.append(f.get("component", "未知部件"))
-            if sc_detail == "自检中":
-                blockers.append("自检未完成，电机未上电")
+            if sc_detail == "空闲":
+                blockers.append("节点空闲，电机未上电或自检未完成")
         if full.get("power_board", {}).get("available"):
             power_detail = full["power_board"]["detail"]
             if "电量极低" in power_detail:
