@@ -5240,96 +5240,116 @@ class RobotFaultsPlugin:
     def _build_operability_summary(self, full: dict) -> dict:
         """从完整诊断数据中提取可操作判定 + 人话总结。"""
 
-        # ── 自检状态 ──
-        sc_detail = full.get("self_check", {}).get("detail", "未知")
-        # NodeState 只反映节点运行状态, 不自检进度。空闲=可能自检中或未启动。
-        node_label = "空闲" if sc_detail == "空闲" else "运行"
-        self_check_str = f"节点: {node_label}"
-
-        # ── 急停 ──
-        chassis_data = full.get("chassis", {})
-        estop_active = chassis_data.get("emergency_stop", False)
         body_data = full.get("body", {})
-        # 身体急停 (physical estop)
-        body_faults = body_data.get("faults", [])
-        has_physical_estop = any(
-            f.get("category") == "estop" for f in body_faults)
-        estop_active = estop_active or has_physical_estop
-        estop_str = "急停: 已触发!" if estop_active else "急停: 未触发"
+        chassis_data = full.get("chassis", {})
+        power_board = full.get("power_board", {})
+        hand_state = full.get("hand_state", {})
+        imu_info = full.get("imu", {})
+        sc_info = full.get("self_check", {})
 
-        # ── 各子系统一行概括 ──
-        chassis_str = f"底盘: {chassis_data.get('detail', '未知')}"
-        fault_count = body_data.get("fault_count", 0)
-        if fault_count == 0:
-            body_detail = "正常"
-        else:
-            # 只显示计数+最严重的1项
-            severe = [f for f in body_data.get("faults", []) if f.get("severity") == "fatal"]
-            if severe:
-                body_detail = f"{fault_count}项故障(含{severe[0].get('component','未知')})"
-            else:
-                body_detail = f"{fault_count}项故障"
-        body_str = f"电机: {body_detail}"
-        power_str = f"电源: {full.get('power_board', {}).get('detail', '未知')}"
-        hand_str = f"手部: {full.get('hand_state', {}).get('detail', '未知')}"
-        imu_str = f"IMU: {full.get('imu', {}).get('detail', '未知')}"
+        lines = []
 
-        subsystems = " | ".join([chassis_str, body_str, power_str, hand_str, imu_str])
-
-        # ── 可操作判定 ──
-        issues = full.get("issues", [])
-        # 阻塞性条件
-        blockers = []
+        # ── 1. 急停 ──
+        estop_active = chassis_data.get("emergency_stop", False)
+        estop_faults = [f for f in body_data.get("faults", []) if f.get("category") == "estop"]
+        estop_active = estop_active or bool(estop_faults)
         if estop_active:
-            blockers.append("急停已触发")
-        if not full.get("healthy"):
-            # 找严重故障
-            for f in body_data.get("faults", []):
-                if f.get("severity") == "fatal":
-                    blockers.append(f.get("component", "未知部件"))
-            if sc_detail == "空闲":
-                blockers.append("节点空闲，电机未上电或自检未完成")
-        if full.get("power_board", {}).get("available"):
-            power_detail = full["power_board"]["detail"]
-            if "电量极低" in power_detail:
-                blockers.append("电池电量极低，有断电风险")
-
-        if blockers:
-            can_operate = "禁止操作"
-            reasons = "、".join(blockers[:5])
-            if len(blockers) > 5:
-                reasons += f" 等{len(blockers)}项"
-            operate_str = f"禁止操作！原因: {reasons}"
+            lines.append("⚠️  急停 — 已触发 (fatal)")
         else:
-            can_operate = "可以操作"
-            operate_str = "可以操作"
+            lines.append("✅ 急停 — 未触发")
 
-        # ── 拼接总结 ──
-        summary_lines = [
-            f"{self_check_str} | {estop_str}",
-            subsystems,
-            operate_str,
-        ]
+        # ── 2. 电机 ──
+        motor_faults = [f for f in body_data.get("faults", []) if f.get("category") == "motor"]
+        if motor_faults:
+            by_desc = {}
+            for f in motor_faults:
+                d = f.get("error_desc", "unknown")
+                by_desc[d] = by_desc.get(d, 0) + 1
+            parts = [f"{c}个{cate}" for cate, c in by_desc.items()]
+            lines.append(f"⚠️  电机 — {len(motor_faults)}项故障({', '.join(parts)})")
+        elif body_data.get("fault_count", 0) == 0:
+            lines.append("✅ 电机 — 正常")
+        else:
+            lines.append("⚠️  电机 — 无数据")
 
-        # 附加关键建议
-        advice = full.get("advice", [])
-        if advice:
-            summary_lines.append("建议: " + "；".join(advice[:3]))
+        # ── 3. 电源/电池 ──
+        power_detail = power_board.get("detail", "未知")
+        if "过热" in power_detail or "温升" in power_detail:
+            lines.append(f"⚠️  电源 — {power_detail}")
+        elif "电量极低" in power_detail:
+            lines.append(f"⚠️  电池 — {power_detail}")
+        elif "电量偏低" in power_detail:
+            lines.append(f"⚠️  电池 — {power_detail}")
+        else:
+            lines.append(f"✅ 电源 — {power_detail}")
+
+        # ── 4. 手部 ──
+        hands_detail = hand_state.get("detail", "未知")
+        if "离线" in hands_detail or "无数据" in hands_detail or "未连接" in hands_detail:
+            lines.append(f"⚠️  手部 — {hands_detail}")
+        else:
+            lines.append(f"✅ 手部 — {hands_detail}")
+
+        # ── 5. IMU ──
+        imu_detail = imu_info.get("detail", "未知")
+        if "离线" in imu_detail or "缺失" in imu_detail:
+            lines.append(f"⚠️  IMU — {imu_detail}")
+        else:
+            lines.append(f"✅ IMU — {imu_detail}")
+
+        # ── 6. 节点状态 ──
+        sc_detail = sc_info.get("detail", "未知")
+        if sc_detail == "空闲":
+            lines.append("⚠️  节点 — 空闲(自检中或未启动)")
+        elif sc_detail == "运行中":
+            lines.append("✅ 节点 — 运行中")
+        else:
+            lines.append(f"⚠️  节点 — {sc_detail}")
+
+        # ── 7. 底盘 ──
+        chassis_detail = chassis_data.get("detail", "未知")
+        if "离线" in chassis_detail or "异常" in chassis_detail:
+            lines.append(f"⚠️  底盘 — {chassis_detail}")
+        elif "急停" in chassis_detail:
+            lines.append(f"⚠️  底盘 — {chassis_detail}")
+        # 正常底盘不在主列表里重复显示, 省空间
+
+        # ── 8. 判定 + 总结 ──
+        issues = full.get("issues", [])
+        advice_list = full.get("advice", [])
+
+        fatal_items = [f for f in body_data.get("faults", []) if f.get("severity") == "fatal"]
+        blocker_count = len(fatal_items) + (1 if estop_active else 0)
+        if sc_detail == "空闲":
+            blocker_count += 1
+
+        if blocker_count > 0 or "电量极低" in power_detail:
+            worst = [f.get("component", "未知") for f in fatal_items[:3]]
+            worst_parts = worst + (["急停"] if estop_active and "急停" not in "_".join(worst) else [])
+            worst_str = "、".join(worst_parts[:3]) if worst_parts else "未知"
+            summary = f"发现{len(issues)}项问题, 最严重: {worst_str}, 禁止操作"
+        else:
+            summary = "状态良好, 可以操作"
+
+        # 建议
+        if advice_list:
+            summary += "。建议: " + "；".join(advice_list[:2])
 
         return {
-            "can_operate": not bool(blockers),
-            "self_check_state": sc_detail,
+            "can_operate": blocker_count == 0,
+            "issue_count": len(issues),
             "emergency_stop": estop_active,
             "subsystems": {
-                "chassis": chassis_data.get("detail", "未知"),
-                "body": body_detail,
-                "power": full.get("power_board", {}).get("detail", "未知"),
-                "hands": full.get("hand_state", {}).get("detail", "未知"),
-                "imu": full.get("imu", {}).get("detail", "未知"),
+                "chassis": chassis_detail,
+                "body": body_data.get("detail", "未知"),
+                "power": power_detail,
+                "hands": hands_detail,
+                "imu": imu_detail,
+                "node": sc_detail,
             },
             "issues": issues,
-            "advice": advice,
-            "summary_text": "\n".join(summary_lines),
+            "advice": advice_list,
+            "summary_text": "\n".join(lines + [summary]),
         }
 
 
