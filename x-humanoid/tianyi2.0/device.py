@@ -518,6 +518,8 @@ class StatePlugin:
         self._force_left = {}
         self._force_right = {}
         self._lock = threading.Lock()
+        self._last_joints_publish_at = 0.0
+        self._joints_publish_interval = 1.0 / 30.0
 
         self._hand_left_topic = plugin_config.get("hand_left_topic", "/inspire_hand/state/left_hand")
         self._hand_right_topic = plugin_config.get("hand_right_topic", "/inspire_hand/state/right_hand")
@@ -641,6 +643,7 @@ class StatePlugin:
                     "temp": s.temperature,
                     "error": s.error,
                 }
+            self._publish_joints_locked()
 
     def _on_hand_state(self, side: str, msg) -> None:
         values = {finger: None for finger in _SKELETON_HAND_ORDER}
@@ -675,6 +678,7 @@ class StatePlugin:
                 "received_timestamp_ms": int(time.time() * 1000),
                 "message_timestamp_ms": message_timestamp_ms,
             }
+            self._publish_joints_locked()
 
     def _on_battery(self, msg):
         with self._lock:
@@ -797,6 +801,18 @@ class StatePlugin:
 
         return {"joints": joints, "timestamp_ms": now_ms, "hands": hands}
 
+    def _publish_joints_locked(self, force: bool = False) -> None:
+        """Publish a fresh skeleton as soon as feedback arrives, capped at 30 Hz."""
+        if not self._joint_data:
+            return
+        now = time.monotonic()
+        if not force and now - self._last_joints_publish_at < self._joints_publish_interval:
+            return
+        msg = String()
+        msg.data = json.dumps(self._build_joints_payload_locked())
+        self._pub_joints.publish(msg)
+        self._last_joints_publish_at = now
+
     def _publish_loop(self):
         """Publish aggregated state at 10Hz for joints, 1Hz for battery/estop."""
         joint_counter = 0
@@ -806,11 +822,7 @@ class StatePlugin:
 
             # Publish joints
             with self._lock:
-                if self._joint_data:
-                    payload = json.dumps(self._build_joints_payload_locked())
-                    msg = String()
-                    msg.data = payload
-                    self._pub_joints.publish(msg)
+                self._publish_joints_locked(force=True)
 
             # 1Hz for battery/estop/force
             if joint_counter % 10 == 0:
