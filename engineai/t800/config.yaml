@@ -40,6 +40,13 @@ topics:
   joint_command: "/hardware/joint_command"
   tts: "/hardware/tts"
   native_node_control: "/motion/node_control"
+  # T800-Odin2 激光雷达相机（飞书文档 7.2 节）；实机按 ros_graph 发现的
+  # /{topic_prefix}/{model}/device{N}/ 前缀校准
+  vision_cloud_raw: "/manifold/odin2/device0/cloud/raw"
+  vision_cloud_slam: "/manifold/odin2/device0/cloud/slam"
+  vision_camera_left: "/manifold/odin2/device0/camera0/compressed"
+  vision_camera_right: "/manifold/odin2/device0/camera1/compressed"
+  vision_depth: "/manifold/odin2/device0/depth"
 
 services:
   enable_motor: "/hardware/enable_motor"
@@ -84,3 +91,12 @@ plugins:
     command: ["./run_robot.sh", "t800"]
     service: "robotics.service"
     stop_timeout: 10
+  mic:
+    enabled: true
+    device_index: null       # 采集设备索引，null = 自动选择默认声卡
+    sample_rate: 16000        # 采集采样率；设备不支持时自动回退 48k + 重采样
+  speaker:
+    enabled: true
+  vision:
+    enabled: true
+    source: "raw"            # raw | slam —— 转发哪个点云源

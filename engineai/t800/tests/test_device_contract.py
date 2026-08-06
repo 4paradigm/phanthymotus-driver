@@ -109,7 +109,14 @@ def install_ros_stubs():
 
     std_msgs = types.ModuleType("std_msgs.msg")
     std_msgs.String = type("String", (Message,), {"__init__": lambda self: setattr(self, "data", "")})
+    std_msgs.UInt8MultiArray = type("UInt8MultiArray", (Message,), {})
     sys.modules["std_msgs.msg"] = std_msgs
+
+    sensor_msgs = types.ModuleType("sensor_msgs.msg")
+    sensor_msgs.PointCloud2 = type("PointCloud2", (Message,), {})
+    sensor_msgs.CompressedImage = type("CompressedImage", (Message,), {})
+    sensor_msgs.Image = type("Image", (Message,), {})
+    sys.modules["sensor_msgs.msg"] = sensor_msgs
 
     protocol_msg = types.ModuleType("interface_protocol.msg")
     for name in (
@@ -152,6 +159,11 @@ CONFIG = {
         "joint_plan_state": "/motion/joint_motion_plan/state",
         "joint_override": "/motion/joint_override_command", "joint_command": "/hardware/joint_command",
         "tts": "/hardware/tts", "native_node_control": "/motion/node_control",
+        "vision_cloud_raw": "/manifold/odin2/device0/cloud/raw",
+        "vision_cloud_slam": "/manifold/odin2/device0/cloud/slam",
+        "vision_camera_left": "/manifold/odin2/device0/camera0/compressed",
+        "vision_camera_right": "/manifold/odin2/device0/camera1/compressed",
+        "vision_depth": "/manifold/odin2/device0/depth",
     },
     "services": {"enable_motor": "/hardware/enable_motor"},
 }
@@ -182,6 +194,9 @@ class DevicePluginContractTests(unittest.TestCase):
             self.device.JointBridgePlugin(CONFIG, "robot", self.ros, self.state),
             self.device.LedPlugin(CONFIG, "robot", self.ros),
             self.device.TtsPlugin(CONFIG, "robot", self.ros),
+            self.device.MicPlugin(CONFIG, "robot", self.ros),
+            self.device.SpeakerPlugin(CONFIG, "robot", self.ros),
+            self.device.VisionPlugin(CONFIG, "robot", self.ros),
             self.device.MotorPowerPlugin(CONFIG, "robot", self.ros),
             self.device.NativeNodeControlPlugin(CONFIG, "robot", self.ros),
             self.device.SafetyControlPlugin(CONFIG, "robot", self.ros, self.state),
@@ -198,10 +213,11 @@ class DevicePluginContractTests(unittest.TestCase):
              "robot_snapshot", "fault_summary", "stability", "joint_groups", "capabilities", "ros_graph",
              "loco", "motion_mode", "dance", "joint_plan", "joint_plan_state", "gesture",
              "joint_override", "joint_bridge",
-             "led", "tts", "motor_power", "native_node_control", "virtual_gamepad", "safety", "native_sdk"},
+             "led", "tts", "mic", "speaker", "pointcloud", "camera", "depth",
+             "motor_power", "native_node_control", "virtual_gamepad", "safety", "native_sdk"},
             names,
         )
-        self.assertEqual(32, len(names))
+        self.assertEqual(37, len(names))
 
     def test_derived_diagnostics_and_capability_resources(self):
         self.state._set("imu", {
@@ -369,6 +385,50 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual(0.0, safety._override_pub.messages[-1].weight)
         self.assertEqual([1.0] * 25, safety._joint_pub.messages[-1].damping)
         self.assertTrue(all(control.stopped for control in active_controls))
+
+    def test_vision_pointcloud_passthrough_binary_header(self):
+        import struct
+
+        plugin = self.device.VisionPlugin(CONFIG, "robot", self.ros)
+        plugin.start()
+        data = bytes(range(64))  # 4 点 × 16 字节 point_step
+        plugin._on_cloud_raw(types.SimpleNamespace(point_step=16, data=data))
+        out = plugin._cloud_pub.messages[-1]
+        self.assertEqual(struct.pack("<II", 16, 4), bytes(out.data[:8]))
+        self.assertEqual(bytes(range(64)), bytes(out.data[8:]))
+        self.assertEqual(1, plugin._frames["pointcloud"])
+
+    def test_vision_select_source_switches_cloud(self):
+        plugin = self.device.VisionPlugin(CONFIG, "robot", self.ros)
+        plugin.start()
+        plugin.dispatch("select_source", {"source": "slam"})
+        self.assertEqual("slam", plugin._source)
+        data = bytes(32)
+        plugin._on_cloud_raw(types.SimpleNamespace(point_step=16, data=data))  # raw 被忽略
+        self.assertEqual(0, len(plugin._cloud_pub.messages))
+        plugin._on_cloud_slam(types.SimpleNamespace(point_step=16, data=data))
+        self.assertEqual(1, len(plugin._cloud_pub.messages))
+        info = plugin.dispatch("info", {})
+        self.assertEqual("slam", info["source"])
+        self.assertEqual(4, len(info["topic_out"]))
+        self.assertEqual("sensor/pointcloud", info["topic_out"][0]["format"])
+
+    def test_vision_camera_and_depth_passthrough(self):
+        plugin = self.device.VisionPlugin(CONFIG, "robot", self.ros)
+        plugin.start()
+        left = types.SimpleNamespace(format="jpeg", data=bytes([0xFF, 0xD8]))
+        right = types.SimpleNamespace(format="jpeg", data=bytes([0xFF, 0xD9]))
+        plugin._on_camera_left(left)
+        plugin._on_camera_right(right)
+        self.assertIs(left, plugin._cam_left_pub.messages[-1])
+        self.assertIs(right, plugin._cam_right_pub.messages[-1])
+        depth = types.SimpleNamespace(encoding="16UC1", data=bytes(8))
+        plugin._on_depth(depth)
+        self.assertIs(depth, plugin._depth_pub.messages[-1])
+        tools = {tool["name"]: tool for tool in plugin.get_tools()}
+        self.assertEqual("image/jpeg", tools["camera"]["topic_out"][0]["format"])
+        self.assertEqual(2, len(tools["camera"]["topic_out"]))
+        self.assertEqual("image/depth-z16", tools["depth"]["topic_out"][0]["format"])
 
 
 if __name__ == "__main__":
