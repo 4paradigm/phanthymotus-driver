@@ -123,11 +123,48 @@ _WAIST_JOINTS = {
 }
 
 _LEG_JOINTS = {
-    51: "left_hip_pitch_joint",
-    52: "left_knee_pitch_joint",
+    51: "hip_pitch_joint",
+    52: "knee_pitch_joint",
 }
 
 _ALL_JOINTS = {**_HEAD_JOINTS, **_ARM_LEFT_JOINTS, **_ARM_RIGHT_JOINTS, **_WAIST_JOINTS, **_LEG_JOINTS}
+
+# Inspire feedback is folded directly into the joints skeleton. The vendor
+# state messages report one normalized value for each of these six channels.
+_SKELETON_HAND_ORDER = ["little", "ring", "middle", "index", "thumb_bend", "thumb_rotation"]
+_SKELETON_HAND_ALIASES = {
+    "1": "little", "little": "little", "pinky": "little",
+    "2": "ring", "ring": "ring",
+    "3": "middle", "middle": "middle",
+    "4": "index", "index": "index", "fore": "index",
+    "5": "thumb_bend", "thumb": "thumb_bend", "thumb_flex": "thumb_bend",
+    "6": "thumb_rotation", "thumb_rotation": "thumb_rotation", "thumb_rotate": "thumb_rotation",
+}
+_SKELETON_HAND_JOINTS = {
+    side: {
+        "little": f"{side}_hand_little_joint",
+        "ring": f"{side}_hand_ring_joint",
+        "middle": f"{side}_hand_middle_joint",
+        "index": f"{side}_hand_index_joint",
+        "thumb_bend": f"{side}_hand_thumb_bend_joint",
+        "thumb_rotation": f"{side}_hand_thumb_rotation_joint",
+    }
+    for side in ("left", "right")
+}
+_SKELETON_HAND_MAX_BEND_RAD = math.pi / 2.0
+_RIGHT_THUMB_ROTATION_OPEN_RAW = 0.48
+
+# Calibrated full-height encoder values. Unlike process-startup auto-zeroing,
+# these keep the high and low lift poses consistent after a driver restart.
+_SKELETON_JOINT_OFFSET = {
+    "waist_pitch_joint": 0.70,
+    "hip_pitch_joint": -0.70,
+    "knee_pitch_joint": 0.35,
+}
+_SKELETON_JOINT_GAIN = {
+    "hip_pitch_joint": 2.44,
+    "knee_pitch_joint": 1.37,
+}
 
 _MOTOR_ERROR_DESCRIPTIONS = {
     1: "motor_over_temperature",
@@ -149,6 +186,17 @@ def _deg2rad(deg: float) -> float:
 
 def _rad2deg(rad: float) -> float:
     return rad * 180.0 / math.pi
+
+
+def _skeleton_hand_bend_rad(raw: float, side: str, finger: str) -> float:
+    """Map Inspire's open-ratio feedback to the virtual skeleton angle."""
+    if -0.05 <= raw <= 1.05:
+        open_ratio = max(0.0, min(1.0, raw))
+    else:
+        open_ratio = max(0.0, min(100.0, raw)) / 100.0
+    if side == "right" and finger == "thumb_rotation":
+        open_ratio = max(0.0, min(1.0, open_ratio / _RIGHT_THUMB_ROTATION_OPEN_RAW))
+    return (1.0 - open_ratio) * _SKELETON_HAND_MAX_BEND_RAD
 
 
 def _clamp(value: float, lower: float, upper: float) -> float:
@@ -501,11 +549,20 @@ class StatePlugin:
 
         # Cached state
         self._joint_data = {}  # motor_id → {pos, speed, current, temp, error}
+        self._hand_data = {"left": None, "right": None}
         self._battery = {}
         self._estop = {}
         self._force_left = {}
         self._force_right = {}
         self._lock = threading.Lock()
+        self._joints_only = bool(plugin_config.get("joints_only", False))
+        self._publish_joints_enabled = bool(plugin_config.get("publish_joints", True))
+        self._last_joints_publish_at = 0.0
+        self._joints_publish_interval = 1.0 / 30.0
+
+        self._hand_left_topic = plugin_config.get("hand_left_topic", "/inspire_hand/state/left_hand")
+        self._hand_right_topic = plugin_config.get("hand_right_topic", "/inspire_hand/state/right_hand")
+        self._hand_stale_after_sec = float(plugin_config.get("hand_stale_after_sec", 1.0))
 
         # Topics for Agent Core (domain 42)
         self._topic_joints = f"/{namespace}/state/joints"
@@ -514,17 +571,26 @@ class StatePlugin:
         self._topic_force = f"/{namespace}/state/force"
 
         # Subscriber node (domain 0 - tianyi)
-        self._sub_node = Node("tianyi2_state_sub", context=ros2.ctx_tianyi)
+        sub_name = "tianyi2_joints_sub" if self._joints_only else "tianyi2_state_sub"
+        self._sub_node = Node(sub_name, context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._sub_node)
 
         # Publisher node (domain 42 - agent core)
-        self._pub_node = Node("tianyi2_state_pub", context=ros2.ctx_core)
+        pub_name = "tianyi2_joints_pub" if self._joints_only else "tianyi2_state_pub"
+        self._pub_node = Node(pub_name, context=ros2.ctx_core)
         ros2.executor_core.add_node(self._pub_node)
 
-        self._pub_joints = self._pub_node.create_publisher(String, self._topic_joints, _LOW_LAT_QOS)
-        self._pub_battery = self._pub_node.create_publisher(String, self._topic_battery, _LOW_LAT_QOS)
-        self._pub_estop = self._pub_node.create_publisher(String, self._topic_estop, _LOW_LAT_QOS)
-        self._pub_force = self._pub_node.create_publisher(String, self._topic_force, _LOW_LAT_QOS)
+        self._pub_joints = (
+            self._pub_node.create_publisher(String, self._topic_joints, _LOW_LAT_QOS)
+            if self._publish_joints_enabled else None
+        )
+        self._pub_battery = None
+        self._pub_estop = None
+        self._pub_force = None
+        if not self._joints_only:
+            self._pub_battery = self._pub_node.create_publisher(String, self._topic_battery, _LOW_LAT_QOS)
+            self._pub_estop = self._pub_node.create_publisher(String, self._topic_estop, _LOW_LAT_QOS)
+            self._pub_force = self._pub_node.create_publisher(String, self._topic_force, _LOW_LAT_QOS)
 
         # URDF path
         self._urdf_path = Path(__file__).parent / "resource" / "tianyi2_model.urdf"
@@ -534,7 +600,7 @@ class StatePlugin:
             {
                 "name": "joints",
                 "type": "sensor",
-                "description": "天轶2.0 全身关节状态 — 位置/速度/电流/温度 (头/臂/腰/腿 共21个关节)",
+                "description": "天轶2.0 全身关节状态 — 身体关节与 Inspire 灵巧手实时 skeleton 渲染",
                 "inputSchema": {"type": "object", "properties": {}},
                 "topic_out": [{"topic": self._topic_joints, "format": "sensor/skeleton"}],
             },
@@ -578,23 +644,36 @@ class StatePlugin:
                 self._sub_node.create_subscription(
                     MotorStatusMsg, topic, self._on_motor_status, _RELIABLE_QOS)
 
-            # Battery
-            self._sub_node.create_subscription(
-                PowerBatteryStatus, "/power/battery/status", self._on_battery, _RELIABLE_QOS)
+            if not self._joints_only:
+                # Battery
+                self._sub_node.create_subscription(
+                    PowerBatteryStatus, "/power/battery/status", self._on_battery, _RELIABLE_QOS)
 
-            # E-stop
-            self._sub_node.create_subscription(
-                PowerBoardKeyStatus, "/power/board/key_status", self._on_estop, _RELIABLE_QOS)
+                # E-stop
+                self._sub_node.create_subscription(
+                    PowerBoardKeyStatus, "/power/board/key_status", self._on_estop, _RELIABLE_QOS)
 
-            # Force sensors (100Hz, throttle to 5Hz in callback)
-            self._sub_node.create_subscription(
-                WrenchStamped, "/arm_6dof_left", self._on_force_left, _RELIABLE_QOS)
-            self._sub_node.create_subscription(
-                WrenchStamped, "/arm_6dof_right", self._on_force_right, _RELIABLE_QOS)
+                # Force sensors (100Hz, throttle to 5Hz in callback)
+                self._sub_node.create_subscription(
+                    WrenchStamped, "/arm_6dof_left", self._on_force_left, _RELIABLE_QOS)
+                self._sub_node.create_subscription(
+                    WrenchStamped, "/arm_6dof_right", self._on_force_right, _RELIABLE_QOS)
 
             print("[StatePlugin] subscriptions created")
         except ImportError as e:
             print(f"[StatePlugin] WARNING: msg import failed ({e}), running in stub mode")
+
+        try:
+            from sensor_msgs.msg import JointState
+            self._sub_node.create_subscription(
+                JointState, self._hand_left_topic,
+                lambda message: self._on_hand_state("left", message), _LOW_LAT_QOS)
+            self._sub_node.create_subscription(
+                JointState, self._hand_right_topic,
+                lambda message: self._on_hand_state("right", message), _LOW_LAT_QOS)
+            print(f"[StatePlugin] hand subscriptions created: {self._hand_left_topic}, {self._hand_right_topic}")
+        except ImportError as e:
+            print(f"[StatePlugin] WARNING: hand skeleton disabled ({e})")
 
         # Publish timer
         self._pub_thread = threading.Thread(target=self._publish_loop, daemon=True)
@@ -613,6 +692,42 @@ class StatePlugin:
                     "temp": s.temperature,
                     "error": s.error,
                 }
+            self._publish_joints_locked()
+
+    def _on_hand_state(self, side: str, msg) -> None:
+        values = {finger: None for finger in _SKELETON_HAND_ORDER}
+        velocities = {finger: None for finger in _SKELETON_HAND_ORDER}
+        efforts = {finger: None for finger in _SKELETON_HAND_ORDER}
+        names = list(msg.name or [])
+        positions = list(msg.position or [])
+        velocity_values = list(msg.velocity or [])
+        effort_values = list(msg.effort or [])
+
+        for index, finger in enumerate(_SKELETON_HAND_ORDER):
+            if index < len(names):
+                key = str(names[index]).strip().lower().replace("-", "_").replace(" ", "_")
+                finger = _SKELETON_HAND_ALIASES.get(key, finger)
+            if index < len(positions):
+                values[finger] = float(positions[index])
+            if index < len(velocity_values):
+                velocities[finger] = float(velocity_values[index])
+            if index < len(effort_values):
+                efforts[finger] = float(effort_values[index])
+
+        stamp = getattr(msg, "header", None)
+        message_timestamp_ms = 0
+        if stamp is not None:
+            message_timestamp_ms = stamp.stamp.sec * 1000 + stamp.stamp.nanosec // 1_000_000
+        with self._lock:
+            self._hand_data[side] = {
+                "values": values,
+                "velocities": velocities,
+                "efforts": efforts,
+                "source_joint_names": names,
+                "received_timestamp_ms": int(time.time() * 1000),
+                "message_timestamp_ms": message_timestamp_ms,
+            }
+            self._publish_joints_locked()
 
     def _on_battery(self, msg):
         with self._lock:
@@ -663,6 +778,90 @@ class StatePlugin:
                 "tz": msg.wrench.torque.z,
             }
 
+    def _build_joints_payload_locked(self) -> dict:
+        now_ms = int(time.time() * 1000)
+        joints = []
+        body_entries = []
+        visual_q_by_name = {}
+
+        for motor_id, data in self._joint_data.items():
+            motor_key = int(motor_id) if str(motor_id).isdigit() else motor_id
+            name = _ALL_JOINTS.get(motor_key, f"motor_{motor_id}")
+            raw_q = data["pos"]
+            q = (raw_q - _SKELETON_JOINT_OFFSET.get(name, 0.0)) * _SKELETON_JOINT_GAIN.get(name, 1.0)
+            visual_q_by_name[name] = q
+            body_entries.append({
+                "idx": motor_id,
+                "name": name,
+                "q": q,
+                "raw_q": raw_q,
+                "dq": data["speed"],
+                "current": data["current"],
+                "temp": data["temp"],
+            })
+
+        if "hip_pitch_joint" in visual_q_by_name or "knee_pitch_joint" in visual_q_by_name:
+            waist_q = -(
+                visual_q_by_name.get("hip_pitch_joint", 0.0)
+                + visual_q_by_name.get("knee_pitch_joint", 0.0)
+            )
+            for entry in body_entries:
+                if entry["name"] == "waist_pitch_joint":
+                    entry["q"] = waist_q
+                    entry["source"] = "visual_compensation"
+        joints.extend(body_entries)
+
+        hands = {}
+        stale_ms = int(self._hand_stale_after_sec * 1000)
+        for side, hand_data in self._hand_data.items():
+            if not hand_data:
+                hands[side] = {"available": False, "fresh": False}
+                continue
+
+            age_ms = now_ms - hand_data["received_timestamp_ms"]
+            fresh = age_ms <= stale_ms
+            hands[side] = {
+                "available": True,
+                "fresh": fresh,
+                "age_ms": age_ms,
+                "source_joint_names": hand_data["source_joint_names"],
+            }
+            for finger, raw in hand_data["values"].items():
+                if raw is None:
+                    continue
+                bend_q = _skeleton_hand_bend_rad(raw, side, finger)
+                base_name = _SKELETON_HAND_JOINTS[side][finger]
+                shared = {
+                    "raw": round(raw, 4),
+                    "velocity_raw": hand_data["velocities"].get(finger),
+                    "effort_raw": hand_data["efforts"].get(finger),
+                    "source": "inspire_hand",
+                    "fresh": fresh,
+                }
+                q = -bend_q if finger in {"little", "ring", "middle", "index"} else bend_q
+                joints.append({"idx": f"{side}_hand_{finger}", "name": base_name, "q": q, **shared})
+                if finger in {"little", "ring", "middle", "index"}:
+                    joints.append({
+                        "idx": f"{side}_hand_{finger}_distal",
+                        "name": base_name.replace("_joint", "_distal_joint"),
+                        "q": -bend_q,
+                        **shared,
+                    })
+
+        return {"joints": joints, "timestamp_ms": now_ms, "hands": hands}
+
+    def _publish_joints_locked(self, force: bool = False) -> None:
+        """Publish a fresh skeleton as soon as feedback arrives, capped at 30 Hz."""
+        if not self._publish_joints_enabled or self._pub_joints is None or not self._joint_data:
+            return
+        now = time.monotonic()
+        if not force and now - self._last_joints_publish_at < self._joints_publish_interval:
+            return
+        msg = String()
+        msg.data = json.dumps(self._build_joints_payload_locked())
+        self._pub_joints.publish(msg)
+        self._last_joints_publish_at = now
+
     def _publish_loop(self):
         """Publish aggregated state at 10Hz for joints, 1Hz for battery/estop."""
         joint_counter = 0
@@ -672,22 +871,7 @@ class StatePlugin:
 
             # Publish joints
             with self._lock:
-                if self._joint_data:
-                    joints = []
-                    for motor_id, data in self._joint_data.items():
-                        name = _ALL_JOINTS.get(motor_id, f"motor_{motor_id}")
-                        joints.append({
-                            "idx": motor_id,
-                            "name": name,
-                            "q": data["pos"],
-                            "dq": data["speed"],
-                            "current": data["current"],
-                            "temp": data["temp"],
-                        })
-                    payload = json.dumps({"joints": joints})
-                    msg = String()
-                    msg.data = payload
-                    self._pub_joints.publish(msg)
+                self._publish_joints_locked(force=True)
 
             # 1Hz for battery/estop/force
             if joint_counter % 10 == 0:
@@ -720,7 +904,7 @@ class StatePlugin:
         # Sensor tools return state
         if action_or_tool == "joints":
             with self._lock:
-                return {"joints": list(self._joint_data.values())}
+                return self._build_joints_payload_locked()
         if action_or_tool == "battery":
             with self._lock:
                 return self._battery or {"state": "no_data"}
