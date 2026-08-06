@@ -518,6 +518,8 @@ class StatePlugin:
         self._force_left = {}
         self._force_right = {}
         self._lock = threading.Lock()
+        self._joints_only = bool(plugin_config.get("joints_only", False))
+        self._publish_joints_enabled = bool(plugin_config.get("publish_joints", True))
         self._last_joints_publish_at = 0.0
         self._joints_publish_interval = 1.0 / 30.0
 
@@ -532,17 +534,26 @@ class StatePlugin:
         self._topic_force = f"/{namespace}/state/force"
 
         # Subscriber node (domain 0 - tianyi)
-        self._sub_node = Node("tianyi2_state_sub", context=ros2.ctx_tianyi)
+        sub_name = "tianyi2_joints_sub" if self._joints_only else "tianyi2_state_sub"
+        self._sub_node = Node(sub_name, context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._sub_node)
 
         # Publisher node (domain 42 - agent core)
-        self._pub_node = Node("tianyi2_state_pub", context=ros2.ctx_core)
+        pub_name = "tianyi2_joints_pub" if self._joints_only else "tianyi2_state_pub"
+        self._pub_node = Node(pub_name, context=ros2.ctx_core)
         ros2.executor_core.add_node(self._pub_node)
 
-        self._pub_joints = self._pub_node.create_publisher(String, self._topic_joints, _LOW_LAT_QOS)
-        self._pub_battery = self._pub_node.create_publisher(String, self._topic_battery, _LOW_LAT_QOS)
-        self._pub_estop = self._pub_node.create_publisher(String, self._topic_estop, _LOW_LAT_QOS)
-        self._pub_force = self._pub_node.create_publisher(String, self._topic_force, _LOW_LAT_QOS)
+        self._pub_joints = (
+            self._pub_node.create_publisher(String, self._topic_joints, _LOW_LAT_QOS)
+            if self._publish_joints_enabled else None
+        )
+        self._pub_battery = None
+        self._pub_estop = None
+        self._pub_force = None
+        if not self._joints_only:
+            self._pub_battery = self._pub_node.create_publisher(String, self._topic_battery, _LOW_LAT_QOS)
+            self._pub_estop = self._pub_node.create_publisher(String, self._topic_estop, _LOW_LAT_QOS)
+            self._pub_force = self._pub_node.create_publisher(String, self._topic_force, _LOW_LAT_QOS)
 
         # URDF path
         self._urdf_path = Path(__file__).parent / "resource" / "tianyi2_model.urdf"
@@ -596,19 +607,20 @@ class StatePlugin:
                 self._sub_node.create_subscription(
                     MotorStatusMsg, topic, self._on_motor_status, _RELIABLE_QOS)
 
-            # Battery
-            self._sub_node.create_subscription(
-                PowerBatteryStatus, "/power/battery/status", self._on_battery, _RELIABLE_QOS)
+            if not self._joints_only:
+                # Battery
+                self._sub_node.create_subscription(
+                    PowerBatteryStatus, "/power/battery/status", self._on_battery, _RELIABLE_QOS)
 
-            # E-stop
-            self._sub_node.create_subscription(
-                PowerBoardKeyStatus, "/power/board/key_status", self._on_estop, _RELIABLE_QOS)
+                # E-stop
+                self._sub_node.create_subscription(
+                    PowerBoardKeyStatus, "/power/board/key_status", self._on_estop, _RELIABLE_QOS)
 
-            # Force sensors (100Hz, throttle to 5Hz in callback)
-            self._sub_node.create_subscription(
-                WrenchStamped, "/arm_6dof_left", self._on_force_left, _RELIABLE_QOS)
-            self._sub_node.create_subscription(
-                WrenchStamped, "/arm_6dof_right", self._on_force_right, _RELIABLE_QOS)
+                # Force sensors (100Hz, throttle to 5Hz in callback)
+                self._sub_node.create_subscription(
+                    WrenchStamped, "/arm_6dof_left", self._on_force_left, _RELIABLE_QOS)
+                self._sub_node.create_subscription(
+                    WrenchStamped, "/arm_6dof_right", self._on_force_right, _RELIABLE_QOS)
 
             print("[StatePlugin] subscriptions created")
         except ImportError as e:
@@ -803,7 +815,7 @@ class StatePlugin:
 
     def _publish_joints_locked(self, force: bool = False) -> None:
         """Publish a fresh skeleton as soon as feedback arrives, capped at 30 Hz."""
-        if not self._joint_data:
+        if not self._publish_joints_enabled or self._pub_joints is None or not self._joint_data:
             return
         now = time.monotonic()
         if not force and now - self._last_joints_publish_at < self._joints_publish_interval:
