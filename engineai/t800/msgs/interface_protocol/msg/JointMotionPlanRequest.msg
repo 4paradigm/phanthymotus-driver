@@ -1,0 +1,12 @@
+uint8 REQUEST_PLAN_EXECUTE=0
+uint8 REQUEST_CANCEL=1
+uint8 REQUEST_RESET=2
+int32 request_id
+uint8 request_type
+bool use_gravity_compensation
+int32[] joint_indices
+float64[] target_positions
+float64[] target_velocities
+float64 execution_time
+float64[] stiffness
+float64[] damping
