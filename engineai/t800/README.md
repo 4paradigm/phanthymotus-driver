@@ -1,128 +1,116 @@
-# 众擎 EngineAI T800 开发版 Driver
+# EngineAI T800 Development Edition Driver
 
-将 T800 开发版底层暴露的 ROS2 接口封装为 phanthymotus-driver 规范的能力卡片
-（MCP HTTP server），供 agent-core 画布 / LLM 调用。参照 `unitree/g1` 与
-`x-humanoid/tianyi2.0` 的既有模式。
+T800 的完整 Phanthy Motus MCP driver。机器人侧使用 ROS2 Humble、CycloneDDS、
+Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方式：
 
-- 目录：`phanthymotus-driver/engineai/t800/`
-- MCP 端口：**15708**（15700–15799 区间）
-- 硬件：T800 开发版（25 自由度，关节索引 0~24，语义名 `J00_HIP_PITCH_L` … `J24_HEAD_YAW`）
+1. 众擎自带 ROS2/Native SDK runtime 已运行，driver 只连接公开 ROS2 接口。
+2. driver 通过 `native_sdk` 工具管理 Native SDK 子进程或 `robotics.service`。
 
-## 能力清单（12 张卡片）
+协议基线：
 
-| 卡片 (tool) | 类型 | 机器人话题 (domain 69) | 输出 (domain 42) | 说明 |
-|------|------|------------------------|------|------|
-| `motion_state` | sensor | `/motion/motion_state` | `/{ns}/motion/state` data/json | 当前运动状态 + 可用转换白名单 |
-| `motion_switcher` | actuator | `/motion/set_motion_state` (RELIABLE) | — | 切换目标状态：白名单检查 + 3s 超时 + 状态确认 |
-| `loco` | actuator | `/motion/body_vel_cmd` | — | 100Hz 持续发布；限速 x/y ±1 m/s、yaw ±1 rad/s；2s 无命令自停 |
-| `arm` | actuator | `/motion/joint_motion_plan/request` + `/state` | `/{ns}/arm/state` data/json | 上肢运动规划（13 关节 [12..24]），前置 `lower_body_balance` |
-| `joints` | sensor | `/hardware/joint_state` | `/{ns}/state/joints` data/json | 25 关节按部位聚合，含语义名 |
-| `imu` | sensor | `/hardware/imu_info` | `/{ns}/state/imu` data/json | 四元数/RPY/加速度/角速度 |
-| `power` | sensor | `/hardware/power_info` | `/{ns}/state/power` data/json | 电量/电压/电流 |
-| `gamepad` | sensor | `/hardware/gamepad_keys` | `/{ns}/state/gamepad` data/json | 手柄数字键 + 模拟摇杆 |
-| `led` | actuator | `/hardware/led_control` | — | 11 种模式枚举 |
-| `mic` | sensor | —（ALSA 采集） | `/{ns}/mic/audio` audio/pcm-16k | 16kHz 单声道，chunk 1024~4096B，满足 ASR 协议 |
-| `speaker` | actuator | —（ALSA 播放） | — | 播放 PCM/WAV/本地文件 |
-| `joint_bridge` | actuator | `/hardware/joint_command` | — | 500Hz 全身 PD 直通（**config 默认关闭**），前置 `joint_bridge` 模式 |
+- `engineai_ros2_workspace` community commit `ebd638e31709a038d3208517693d33174dbacb46`
+- `engineai_robotics_native_sdk` commit `83204a459e0e786f855235a8507197496a79acc7`
 
-运动状态机是所有控制卡的前置：`loco` / `arm` / `joint_bridge` 在 dispatch 时
-检查当前状态，不在正确模式时返回
-`{"state":"error","error":"WRONG_MOTION_STATE","message":"请先切换到 xxx 模式"}`。
+## 工具
 
-T800 支持的运动状态：`idle` / `passive` / `pd_stand` / `rl_basic` /
-`lower_body_balance` / `joint_bridge` / `pd_sitground` / `walk_server` /
-`rl_mimic_supine_to_stance` / `rl_mimic_prone_to_stance` /
-`rl_mimic_stance_to_supine` / `rl_mimic_sitdown_to_stance` /
-`rl_mimic_stance_to_sitdown`。
+| 工具 | 类型 | 能力 |
+|---|---|---|
+| `joints` | sensor | 25 个关节的位置、速度、力矩及骨架数据流 |
+| `imu` | sensor | 四元数、RPY、角速度、线加速度 |
+| `battery` | sensor | 电源使能、电量、电压、电流、错误码 |
+| `motor_health` | sensor | 电机/MOS 温度、电压、电流、掉线、使能及错误码 |
+| `motor_state` | sensor | Native SDK 原始电机位置、速度和力矩 |
+| `motor_command` | sensor | Native SDK 原始电机控制命令 |
+| `joint_command_feedback` | sensor | Native SDK 最近关节控制命令反馈 |
+| `gamepad` | sensor | 遥控器连接、按键和摇杆状态 |
+| `motion_state` | sensor | 当前 Native SDK motion state 和允许转换 |
+| `driver_health` | sensor | 各 ROS2 数据源连接与新鲜度 |
+| `robot_snapshot` | sensor | 运动、关节、IMU、电源和电机健康聚合快照 |
+| `fault_summary` | sensor | 电机掉线/禁用/错误/过温及电源错误摘要 |
+| `stability` | sensor | 基于 IMU 的倾斜和跌倒风险估计 |
+| `joint_groups` | sensor | 腿、躯干、双臂、头部和全身关节名称/索引映射 |
+| `capabilities` | sensor | Driver 能力发现、原生状态和已知限制 |
+| `ros_graph` | sensor | 实时发现固件节点、topic、service 和尚未映射的新接口 |
+| `model` | resource | 官方 `serial_t800.urdf` |
+| `loco` | actuator | 100 Hz 速度控制；定时/持续、相对位移、转角和圆弧开环动作 |
+| `motion_mode` | actuator | 任意状态切换及 idle/passive/站立/行走/舞蹈/起身/躺下快捷动作 |
+| `dance` | actuator | 舞蹈列表、播放、停止和状态；官方基线为 `dance.mnn` + `dance.npz` |
+| `joint_plan` | actuator | 索引/名称关节轨迹、头部/单臂姿态、当前位置保持、取消、复位和预置动作 |
+| `joint_plan_state` | sensor | 规划 request id、状态和进度 |
+| `gesture` | actuator | 官方完整挥手/握手多步序列及任意自定义关节动作队列 |
+| `joint_override` | actuator | 指定关节 100 Hz 覆盖控制 |
+| `joint_bridge` | actuator | 全 25 关节最高 500 Hz 底层控制 |
+| `led` | actuator | 众擎协议定义的 11 种灯效 |
+| `tts` | actuator | 众擎 TTS 消息；topic 可配置 |
+| `mic` | sensor | 内置麦克风 PCM-16 16kHz 采集，缓冲 1024 字节发布（满足 perception ASR 协议） |
+| `speaker` | actuator | 内置扬声器本地播放：WAV 文件或 base64 PCM_S16_LE 数据 |
+| `motor_power` | actuator | 电机 enable/disable 服务 |
+| `native_node_control` | actuator | Native SDK 已注册 LogicNode 的动态 start/stop |
+| `virtual_gamepad` | actuator | Native SDK LCM 虚拟手柄：12 按键、6 模拟量和 7 种官方组合键 |
+| `safety` | actuator | 零速度、覆盖释放、关节阻尼及 passive/idle/stand 组合动作 |
+| `native_sdk` | actuator | Native SDK status/start/stop/restart |
 
-## 架构（双 rclpy context）
+所有动作差异通过 `x-action-params` 声明。`force=true` 可绕过 locomotion、
+joint override 和 joint bridge 的 motion-state 门禁；完整高风险能力没有从
+MCP schema 中隐藏。
 
-```
-┌────────────────────────── 机器人运控单元 (domain 69 / CycloneDDS) ──────────────────────────┐
-│  /motion/motion_state   /motion/set_motion_state   /motion/body_vel_cmd                    │
-│  /motion/joint_motion_plan/{request,state}         /hardware/joint_state                   │
-│  /hardware/joint_command                           /hardware/{imu_info,power_info,led_control,gamepad_keys} │
-└──────────────────────────────────────────┬─────────────────────────────────────────────────┘
-                                           │ ctx_t800（rclpy context，executor_t800）
-┌──────────────────────────────────────────┴─────────────────────────────────────────────────┐
-│  engineai/t800 driver（main.py + device.py + plugins/*）                                    │
-│  ├─ 传感器转发：订阅 domain 69 → 缓存 → 定时 JSON 发布到 domain 42 /{ns}/xxx                │
-│  ├─ 控制类：   发布 domain 69（运动状态前置检查）                                           │
-│  └─ 音频：     mic 采集/重采样/缓冲 → AudioChunk 发布到 domain 42 /{ns}/mic/audio           │
-└──────────────────────────────────────────┬─────────────────────────────────────────────────┘
-                                           │ ctx_core（rclpy context，executor_core）
-┌──────────────────────────────────────────┴─────────────────────────────────────────────────┐
-│  agent-core (domain 42 / FastDDS)  ·  dashboard 画布渲染  ·  perception ASR/TTS            │
-└─────────────────────────────────────────────────────────────────────────────────────────────┘
-```
+`loco.move_displacement`、`turn_angle` 和 `arc` 由速度乘时间换算。当前官方
+T800 协议没有里程计/定位反馈，因此它们是开环动作，返回结果会明确携带
+`open_loop: true`，不能当作闭环导航精度承诺。
 
-进程内按 context 切换 RMW 实现：`ctx_t800` 用 `rmw_cyclonedds_cpp` +
-`ROS_DOMAIN_ID=69` + `ROS_LOCALHOST_ONLY=0`；`ctx_core` 用 `rmw_fastrtps_cpp` +
-`ROS_DOMAIN_ID=42`（详见 `ros2.py`）。
+`gesture.play` 与旧的 `joint_plan.preset` 不同：前者执行官方示例里的完整多步
+动作（挥手包含准备、举手、5 次摆动和复位；握手包含伸手、收手和复位），
+后者保留为兼容接口，只发送单个目标姿势。`gesture.sequence` 可提交任意多步
+关节动作队列。
 
-## 目录结构
+`virtual_gamepad` 使用 Native SDK 官方通道
+`virtual_gamepad/gamepad_keys`，默认连接 `udpm://239.255.76.67:7667?ttl=1`。
+除了原始按键/摇杆外，提供 idle、passive、stand、walk、dance、get_up、
+lie_down 组合键。LCM 输入会覆盖实体手柄输入，发送完成后 Driver 自动发布
+全零包释放控制权。
 
-```
-engineai/t800/
-├── main.py            # MCP HTTP server 入口（JSON-RPC 2.0，POST /mcp）
-├── device.py          # T800DeviceBundle 插件聚合 + 工具名冲突检查
-├── ros2.py            # Ros2Contexts 双 context 管理 + QoS 常量 + T800_TOPICS
-├── plugins/           # motion.py / sensors.py / peripherals.py（12 张卡片实现）
-├── driver.yaml        # id: t800-driver, port: 15708
-├── config.yaml        # 插件开关（joint_bridge 默认关闭）
-├── Dockerfile         # ros-base + rmw-cyclonedds-cpp + 官方消息包
-├── interface_protocol/  # 官方消息源码（取自 engineai_ros2_workspace，随 driver 入库）
-├── requirements.txt
-├── deploy/service.yml # host 网络 + privileged + /dev:/dev
-└── docs/              # 真机部署实测文档
-```
+## 运行
 
-## 本地运行
+机器人必须通过主机内置以太网口访问；官方默认 ROS Domain 为 69。
 
 ```bash
-cd phanthymotus-driver/engineai/t800
-pip install -r requirements.txt
-python3 main.py          # 可选：CONFIG_PATH=/path/to/config.yaml
+cd engineai/t800
+docker build -t engineai-t800-driver .
+docker run --rm --network host --privileged \
+  -e NETWORK_INTERFACE=eth0 \
+  engineai-t800-driver
 ```
 
-- 无 ROS2 环境的机器：`ros2.py` / `device.py` / `main.py` 均可在模块级纯 import
-  （rclpy 全部延迟导入），可做静态验证（`python3 -m py_compile *.py`）。
-- 真机运行时需机器人侧 ROS2 已启动（domain 69），
-  `ros2 topic list` 可见 `/hardware/joint_state` 等话题。
-
-## 构建与部署
+或在仓库根目录执行：
 
 ```bash
-# 方式一：build.sh（从 driver 仓库根目录，上下文为 driver 目录）
-bash build.sh engineai/t800
-
-# 方式二：手动构建（构建上下文 = driver 仓库根目录，无需外部 third_party/；
-#   interface_protocol 消息包源码已随 driver 入库在 engineai/t800/interface_protocol/，
-#   编译失败时才降级 stub 模式运行——消息包不构建、订阅不可用）
-docker build -f engineai/t800/Dockerfile -t t800-driver .
+./build.sh engineai/t800
 ```
 
-部署：agent-core 部署时提取镜像内 `deploy/service.yml`（host 网络 + privileged +
-`/dev:/dev` 声卡访问），合并进宿主机 `/opt/phanthy-motus/` 的 docker-compose.yml。
-服务名 `engineai-t800`，容器名 `embodied-engineai-t800`。
+健康检查：`GET http://localhost:15708/health`；MCP 入口：
+`POST http://localhost:15708/mcp`。
 
-## 与 agent-core 交互
+## Native SDK 模式
 
-- **注册**：启动后 POST `http://<agent-core>:15678/api/mcp`
-  （可用 `AGENT_CORE_URL` 覆盖），payload `{id, name, url, transport, category}`；
-  agent-core 随后执行 `initialize` → `tools/list` 注册工具；之后每 30s 心跳。
-- **工具调用**：`tools/call`（JSON-RPC 2.0，POST `/mcp`，带 CORS）。
-  插件 dispatch 返回纯 dict；`{"state":"error",...}` 会被标记 `isError`。
-- **画布渲染**：`topic_out` 的 format 与渲染器映射（README_dev）——
-  本 driver 传感器卡全部用 `data/json`（KV 面板），`mic` 用 `audio/pcm-16k`（波形）。
-- **perception 消费**：agent-core `topic_subscriber` 订阅 String 话题注入 event_bus；
-  ASR 通过 mic 卡的 `audio/pcm-16k` 流（`audio_msgs/AudioChunk`，
-  format=`audio/pcm-16k`，16kHz 单声道 PCM_S16_LE，chunk 1024~4096 字节）。
+`config.yaml` 中的 `plugins.native_sdk.mode` 支持：
 
-## 安全注意
+- `external`：默认，只报告外部 runtime 状态，不管理进程。
+- `process`：在 `workdir` 中运行配置的 `command`。
+- `systemd`：通过 host PID namespace 管理 `robotics.service`。
 
-- `loco`：官方限速 x/y ±1 m/s、yaw ±1 rad/s；100Hz 发布；接收端 2 秒未收到自动停；
-  停止 = 显式发零速度。
-- `joint_bridge`：500Hz 高频 + 力矩公式 `tau = kp*(q_cmd-q) + kd*(qd_cmd-qd) + ff`，
-  数组长度必须 = 25；**config 默认关闭**，需要时先切换到 `joint_bridge` 运动模式。
-- 所有控制类卡片均做运动状态前置检查，避免在错误状态下下发指令导致机器人摔倒。
+设置 `autostart: true` 可在 driver 启动时启动 Native SDK；设置
+`stop_on_exit: true` 可在 driver 退出时停止由该配置管理的 runtime。
+
+## 实机校准项
+
+飞书私有文档和实际固件可能调整 topic 或状态名。首次上机前需要核对：
+
+- `ros2 topic list -t` 与 `config.yaml:topics`；
+- `/hardware/joint_state` 数组顺序是否仍为 J00..J24；
+- TTS 的实际 topic；
+- `motion_state.available_transition_motions` 返回的固件状态名；
+- `/motion/node_control` 是否由当前 Native SDK 配置启用；
+- 开发版的速度、刚度、阻尼和力矩允许范围。
+
+低层控制要求机器人处于对应 Native SDK 状态。测试 joint bridge、覆盖控制、
+起身或躺下时，应先悬挂机器人并由现场人员持有急停遥控器。

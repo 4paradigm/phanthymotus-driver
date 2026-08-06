@@ -1,28 +1,5 @@
 #!/usr/bin/env python3
-"""
-engineai/t800/main.py — 众擎 T800 开发版 driver bundle 统一入口（MCP HTTP server）。
-
-读取 config.yaml，按插件配置加载插件，聚合成一个 MCP HTTP server 对外暴露。
-驱动启动时自动 start 所有插件，关闭时自动 stop。
-
-双 domain 架构：
-  - ctx_t800 (domain 69 / rmw_cyclonedds_cpp)：直连 T800 机器人话题
-  - ctx_core (domain 42 / rmw_fastrtps_cpp)  ：与 agent-core / dashboard / perception 通信
-
-启动流程：加载 config → 建 Ros2Contexts → 建 T800DeviceBundle →
-bundle.start_all() → ros2.start() → HTTP server（config 的 mcp_port）→
-向 agent-core 注册并每 30s 心跳。
-
-用法：
-    python3 main.py
-
-环境变量：
-    CONFIG_PATH     — config.yaml 路径（默认同目录下）
-    AGENT_CORE_URL  — agent-core 注册地址（默认 https://localhost:15678）
-
-模块级只 import 标准库；yaml / rclpy 等在函数内延迟导入，
-保证模块可在无 ROS2 环境下被纯 import 测试。
-"""
+"""EngineAI T800 MCP driver entrypoint."""
 
 from __future__ import annotations
 
@@ -31,57 +8,217 @@ import os
 import re
 import signal
 import socket
-import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-
-# ── Config ────────────────────────────────────────────────────────────────────
+import rclpy
+import rclpy.executors
+import yaml
+from rclpy.context import Context
 
 
 def _load_config() -> dict:
-    import yaml
-    config_path = os.environ.get("CONFIG_PATH", str(Path(__file__).parent / "config.yaml"))
-    with open(config_path) as f:
-        return yaml.safe_load(f)
+    path = os.environ.get("CONFIG_PATH", str(Path(__file__).parent / "config.yaml"))
+    with open(path, encoding="utf-8") as handle:
+        return yaml.safe_load(handle)
 
 
-def _resolve_namespace(cfg: dict) -> str:
-    ns = cfg.get("ros_namespace", "").strip()
-    if ns:
-        return re.sub(r"[^a-zA-Z0-9_]", "_", ns)
-    return re.sub(r"[^a-zA-Z0-9_]", "_", socket.gethostname())
+def _resolve_namespace(config: dict) -> str:
+    value = str(config.get("ros_namespace", "")).strip() or socket.gethostname()
+    return re.sub(r"[^a-zA-Z0-9_]", "_", value)
 
 
-# ── MCP HTTP server ───────────────────────────────────────────────────────────
+def _configure_cyclonedds(config: dict) -> str:
+    interface = os.environ.get("NETWORK_INTERFACE") or str(config["ros"].get("robot_interface", "eth0"))
+    if not re.fullmatch(r"[a-zA-Z0-9_.:-]+", interface):
+        raise ValueError(f"invalid robot network interface: {interface}")
+    os.environ.setdefault(
+        "CYCLONEDDS_URI",
+        "<CycloneDDS><Domain><General><Interfaces>"
+        f"<NetworkInterface name='{interface}'/>"
+        "</Interfaces></General></Domain></CycloneDDS>",
+    )
+    return interface
 
-_bundle = None  # T800DeviceBundle，handler 通过闭包访问
+
+class DualDomainROS2:
+    def __init__(self, robot_domain_id: int, core_domain_id: int):
+        self.ctx_robot = Context()
+        rclpy.init(context=self.ctx_robot, domain_id=robot_domain_id)
+        self.executor_robot = rclpy.executors.MultiThreadedExecutor(context=self.ctx_robot)
+
+        self.ctx_core = Context()
+        rclpy.init(context=self.ctx_core, domain_id=core_domain_id)
+        self.executor_core = rclpy.executors.MultiThreadedExecutor(context=self.ctx_core)
+        self._threads: list[threading.Thread] = []
+
+    def start_spin(self) -> None:
+        def spin(executor, context, label):
+            try:
+                while rclpy.ok(context=context):
+                    executor.spin_once(timeout_sec=0.1)
+            except Exception as exc:
+                print(f"[ros2] {label} executor stopped: {exc}", flush=True)
+
+        for executor, context, label in (
+            (self.executor_robot, self.ctx_robot, "robot"),
+            (self.executor_core, self.ctx_core, "core"),
+        ):
+            thread = threading.Thread(target=spin, args=(executor, context, label), daemon=True)
+            thread.start()
+            self._threads.append(thread)
+
+    def shutdown(self) -> None:
+        self.executor_robot.shutdown()
+        self.executor_core.shutdown()
+        if rclpy.ok(context=self.ctx_robot):
+            rclpy.shutdown(context=self.ctx_robot)
+        if rclpy.ok(context=self.ctx_core):
+            rclpy.shutdown(context=self.ctx_core)
+
+
+class T800DeviceBundle:
+    def __init__(self, config: dict, namespace: str, ros2: DualDomainROS2):
+        from device import (
+            DancePlugin,
+            GesturePlugin,
+            JointBridgePlugin,
+            JointOverridePlugin,
+            JointPlanPlugin,
+            LedPlugin,
+            LocomotionPlugin,
+            MicPlugin,
+            MotionModePlugin,
+            MotorPowerPlugin,
+            NativeNodeControlPlugin,
+            NativeSdkPlugin,
+            SafetyControlPlugin,
+            SpeakerPlugin,
+            StatePlugin,
+            TtsPlugin,
+        )
+        from virtual_gamepad import VirtualGamepadPlugin
+
+        self._plugins: list = []
+        plugins = config.get("plugins", {})
+
+        state = StatePlugin(config, namespace, ros2)
+        if plugins.get("state", {}).get("enabled", True):
+            self._plugins.append(state)
+
+        plugin_types = (
+            ("locomotion", LocomotionPlugin, (config, namespace, ros2, state)),
+            ("motion_mode", MotionModePlugin, (config, namespace, ros2, state)),
+            ("joint_plan", JointPlanPlugin, (config, namespace, ros2, state)),
+            ("joint_override", JointOverridePlugin, (config, namespace, ros2, state)),
+            ("joint_bridge", JointBridgePlugin, (config, namespace, ros2, state)),
+            ("led", LedPlugin, (config, namespace, ros2)),
+            ("tts", TtsPlugin, (config, namespace, ros2)),
+            ("mic", MicPlugin, (config, namespace, ros2)),
+            ("speaker", SpeakerPlugin, (config, namespace, ros2)),
+            ("motor_power", MotorPowerPlugin, (config, namespace, ros2)),
+            ("native_node_control", NativeNodeControlPlugin, (config, namespace, ros2)),
+            ("safety", SafetyControlPlugin, (config, namespace, ros2, state)),
+        )
+        instances = {}
+        for key, cls, args in plugin_types:
+            if plugins.get(key, {}).get("enabled", False):
+                instance = cls(*args)
+                instances[key] = instance
+                self._plugins.append(instance)
+
+        if plugins.get("dance", {}).get("enabled", True) and "motion_mode" in instances:
+            instance = DancePlugin(instances["motion_mode"], state)
+            instances["dance"] = instance
+            self._plugins.append(instance)
+
+        if plugins.get("gesture", {}).get("enabled", True) and "joint_plan" in instances:
+            instance = GesturePlugin(instances["joint_plan"])
+            instances["gesture"] = instance
+            self._plugins.append(instance)
+
+        virtual_gamepad_config = plugins.get("virtual_gamepad", {})
+        if virtual_gamepad_config.get("enabled", False):
+            instance = VirtualGamepadPlugin(virtual_gamepad_config, namespace, ros2)
+            instances["virtual_gamepad"] = instance
+            self._plugins.append(instance)
+
+        if "safety" in instances:
+            instances["safety"].set_controls(
+                [
+                    instances[key]
+                    for key in ("locomotion", "joint_override", "joint_bridge", "virtual_gamepad", "gesture")
+                    if key in instances
+                ]
+            )
+
+        native_config = plugins.get("native_sdk", {})
+        if native_config.get("enabled", False):
+            self._plugins.append(NativeSdkPlugin(native_config, namespace, ros2))
+
+    def start_all(self) -> None:
+        for plugin in self._plugins:
+            try:
+                plugin.start()
+                print(f"[bundle] {type(plugin).__name__} started", flush=True)
+            except Exception as exc:
+                print(f"[bundle] {type(plugin).__name__} start failed: {exc}", flush=True)
+
+    def stop_all(self) -> None:
+        for plugin in reversed(self._plugins):
+            try:
+                plugin.stop()
+            except Exception as exc:
+                print(f"[bundle] {type(plugin).__name__} stop failed: {exc}", flush=True)
+
+    def get_all_tools(self) -> list[dict]:
+        tools: list[dict] = []
+        for plugin in self._plugins:
+            tools.extend(plugin.get_tools() if hasattr(plugin, "get_tools") else [plugin.get_tool()])
+        return tools
+
+    def dispatch(self, tool_name: str, arguments: dict) -> dict | None:
+        for plugin in self._plugins:
+            tools = plugin.get_tools() if hasattr(plugin, "get_tools") else [plugin.get_tool()]
+            for definition in tools:
+                if definition["name"] != tool_name:
+                    continue
+                args = dict(arguments)
+                if definition["type"] == "resource":
+                    return plugin.dispatch(tool_name, args)
+                action = args.pop("action", tool_name)
+                args["_tool_name"] = tool_name
+                return plugin.dispatch(action, args)
+        return None
+
+
+_bundle: T800DeviceBundle | None = None
 
 
 def make_handler():
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
-            # 抑制常规请求日志（心跳/info），只记录错误与工具调用
             msg = fmt % args
-            if '"POST /mcp' in msg and '200' in msg:
-                return
-            print(f"[mcp] {self.address_string()} {msg}")
+            if '"POST /mcp' not in msg or "200" not in msg:
+                print(f"[mcp] {self.address_string()} {msg}")
 
-        def _send(self, status: int, body: str):
-            encoded = body.encode()
+        def _send_json(self, status: int, payload: dict) -> None:
+            body = json.dumps(payload, ensure_ascii=False).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(encoded)))
+            self.send_header("Content-Length", str(len(body)))
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "Content-Type, Accept")
             self.end_headers()
-            self.wfile.write(encoded)
+            self.wfile.write(body)
 
         def do_GET(self):
-            self.send_response(404)
-            self.end_headers()
+            if self.path == "/health":
+                self._send_json(200, {"state": "running", "driver": "engineai-t800"})
+            else:
+                self._send_json(404, {"error": "not found"})
 
         def do_OPTIONS(self):
             self.send_response(204)
@@ -91,147 +228,121 @@ def make_handler():
             self.end_headers()
 
         def do_POST(self):
-            length = int(self.headers.get("Content-Length", 0))
-            raw = self.rfile.read(length)
-            try:
-                rpc = json.loads(raw)
-            except Exception:
-                self._send(400, json.dumps({"jsonrpc": "2.0", "id": None,
-                                             "error": {"code": -32700, "message": "Parse error"}}))
+            if self.path != "/mcp":
+                self._send_json(404, {"error": "not found"})
                 return
-
-            rid = rpc.get("id")
-            method = rpc.get("method", "")
-            params = rpc.get("params") or {}
-
-            if rid is None:
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                rpc = json.loads(self.rfile.read(length))
+            except Exception:
+                self._send_json(400, {"jsonrpc": "2.0", "id": None,
+                                      "error": {"code": -32700, "message": "Parse error"}})
+                return
+            request_id = rpc.get("id")
+            if request_id is None:
                 self.send_response(202)
                 self.end_headers()
                 return
 
             def ok(result):
-                self._send(200, json.dumps({"jsonrpc": "2.0", "id": rid, "result": result}))
+                self._send_json(200, {"jsonrpc": "2.0", "id": request_id, "result": result})
 
-            def err(code, msg):
-                self._send(200, json.dumps({"jsonrpc": "2.0", "id": rid,
-                                             "error": {"code": code, "message": msg}}))
+            def error(code, message):
+                self._send_json(200, {"jsonrpc": "2.0", "id": request_id,
+                                      "error": {"code": code, "message": message}})
 
+            method = rpc.get("method", "")
+            params = rpc.get("params") or {}
             try:
                 if method == "initialize":
-                    ok({
-                        "protocolVersion": "2024-11-05",
-                        "capabilities": {"tools": {}},
-                        "serverInfo": {
-                            "name": _bundle._cfg.get("name", "EngineAI T800 Bundle"),
-                            "version": "1.0.0",
-                        },
-                    })
+                    ok({"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "engineai-t800-device-bundle", "version": "1.0.0"}})
                 elif method == "tools/list":
                     ok({"tools": _bundle.get_all_tools()})
                 elif method == "tools/call":
                     name = params.get("name", "")
-                    args = params.get("arguments") or {}
-                    result = _bundle.dispatch(name, args)
+                    result = _bundle.dispatch(name, params.get("arguments") or {})
                     if result is None:
-                        err(-32601, f"Unknown tool: {name}")
+                        error(-32601, f"Unknown tool: {name}")
                     else:
-                        tool_result = {
-                            "content": [{
-                                "type": "text",
-                                "text": json.dumps(result, ensure_ascii=False),
-                            }],
-                        }
-                        # 运动状态前置检查等返回 {"state":"error",...} 时标记 isError，
-                        # 让 agent-core / LLM 明确感知调用失败
-                        if (isinstance(result, dict)
-                                and (result.get("state") == "error" or "error" in result)):
-                            tool_result["isError"] = True
-                        ok(tool_result)
+                        ok({"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]})
                 else:
-                    err(-32601, f"Method not found: {method}")
-            except Exception as e:
+                    error(-32601, f"Method not found: {method}")
+            except (TypeError, ValueError) as exc:
+                error(-32602, str(exc))
+            except Exception as exc:
                 import traceback
                 traceback.print_exc()
-                err(-32603, str(e))
+                error(-32603, str(exc))
 
     return Handler
 
 
-# ── agent-core 注册与心跳 ─────────────────────────────────────────────────────
+def _start_registration(port: int, config: dict) -> None:
+    import ssl
+    import time
+    import urllib.request
 
-
-def _start_registration(mcp_port: int, name: str, category: str):
-    """向 agent-core 注册本 driver（后台线程），之后每 30s 心跳。"""
-    import ssl as _ssl
-    import urllib.request as _urllib
     agent_core_url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
     payload = json.dumps({
-        "id": _bundle._cfg.get("id", "t800-driver"),
-        "name": name,
-        "url": f"http://localhost:{mcp_port}/mcp",
+        "id": "engineai-t800-driver",
+        "name": config.get("name", "EngineAI T800 Development Edition"),
+        "url": f"http://localhost:{port}/mcp",
         "transport": "http",
-        "category": category,
+        "category": "driver",
     }).encode()
-    # agent-core 使用自签名证书，本地回环跳过校验
-    _ctx = _ssl.create_default_context()
-    _ctx.check_hostname = False
-    _ctx.verify_mode = _ssl.CERT_NONE
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
 
-    def _run():
-        import time as _t
+    def register_loop():
         while True:
             try:
-                req = _urllib.Request(
+                request = urllib.request.Request(
                     f"{agent_core_url}/api/mcp", data=payload,
-                    headers={"Content-Type": "application/json"}, method="POST",
+                    headers={"Content-Type": "application/json"}, method="POST"
                 )
-                with _urllib.urlopen(req, timeout=3, context=_ctx):
-                    pass  # 心跳成功，抑制日志
-                _t.sleep(30)
-            except Exception as e:
-                print(f"[register] failed: {e}, retrying in 5s")
-                _t.sleep(5)
+                with urllib.request.urlopen(request, timeout=3, context=context):
+                    pass
+                time.sleep(30)
+            except Exception as exc:
+                print(f"[register] failed: {exc}; retrying in 5s", flush=True)
+                time.sleep(5)
 
-    threading.Thread(target=_run, daemon=True, name="register").start()
-
-
-# ── Entry point ───────────────────────────────────────────────────────────────
+    threading.Thread(target=register_loop, daemon=True, name="register").start()
 
 
-def main():
+def main() -> None:
     global _bundle
+    config = _load_config()
+    namespace = _resolve_namespace(config)
+    port = int(config.get("mcp_port", 15708))
+    robot_domain = int(config["ros"].get("robot_domain_id", 69))
+    core_domain = int(config["ros"].get("core_domain_id", 42))
+    interface = _configure_cyclonedds(config)
+    print(f"[bundle] namespace={namespace} domains={robot_domain}->{core_domain} port={port} interface={interface}")
 
-    cfg = _load_config()
-    namespace = _resolve_namespace(cfg)
-    mcp_port = int(cfg.get("mcp_port", 15708))
-
-    print(f"[bundle] namespace={namespace} mcp_port={mcp_port}")
-
-    # 双域 ROS2：ctx_t800 (domain 69 / CycloneDDS) + ctx_core (domain 42 / FastDDS)
-    from ros2 import Ros2Contexts
-    ros2 = Ros2Contexts(namespace)
-    ros2.start()
-    print("[bundle] dual-domain ROS2 initialized "
-          "(t800: domain 69/cyclonedds, core: domain 42/fastrtps)")
-
-    from device import T800DeviceBundle
-    _bundle = T800DeviceBundle(cfg, namespace, ros2)
+    ros2 = DualDomainROS2(robot_domain, core_domain)
+    ros2.start_spin()
+    _bundle = T800DeviceBundle(config, namespace, ros2)
     _bundle.start_all()
+    _start_registration(port, config)
 
-    _start_registration(mcp_port, cfg.get("name", "EngineAI T800 Bundle"), "driver")
+    server = ThreadingHTTPServer(("", port), make_handler())
+    print(f"[bundle] MCP server http://localhost:{port}/mcp", flush=True)
 
-    server = ThreadingHTTPServer(("", mcp_port), make_handler())
-    print(f"[bundle] MCP server → http://localhost:{mcp_port}")
+    stopping = threading.Event()
 
-    def _shutdown(signum, frame):
-        print(f"[bundle] signal {signum}, shutting down")
+    def shutdown(signum, _frame):
+        if stopping.is_set():
+            return
+        stopping.set()
+        print(f"[bundle] signal {signum}; stopping", flush=True)
         _bundle.stop_all()
-        ros2.shutdown()
         threading.Thread(target=server.shutdown, daemon=True).start()
 
-    signal.signal(signal.SIGTERM, _shutdown)
-    signal.signal(signal.SIGINT, _shutdown)
-
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
     try:
         server.serve_forever()
     finally:

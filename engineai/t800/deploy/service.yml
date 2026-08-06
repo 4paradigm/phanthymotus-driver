@@ -1,6 +1,3 @@
-# T800 driver 部署片段（agent-core 部署时提取并合并进宿主机 docker-compose.yml）。
-# host 网络 + privileged + /dev:/dev（声卡/硬件访问）。
-# 容器级 env 声明 T800 侧环境（domain 69 + CycloneDDS）；ctx_core 由进程内切换。
 engineai-t800:
   image: __IMAGE__
   container_name: embodied-engineai-t800
@@ -10,11 +7,11 @@ engineai-t800:
   privileged: true
   volumes:
     - /dev:/dev
-    - /opt/phanthy-motus/data:/opt/phanthy-motus/data
+    - /opt/engineai/native_sdk:/opt/engineai/native_sdk
   environment:
-    - ROS_DOMAIN_ID=69
     - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
     - ROS_LOCALHOST_ONLY=0
+    - NETWORK_INTERFACE=eth0
     - PYTHONUNBUFFERED=1
   logging:
     driver: local
