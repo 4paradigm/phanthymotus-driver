@@ -1941,3 +1941,168 @@ class SpeakerPlugin:
             return {"error": f"playback failed: {exc}"}
         return {"state": "playing", "source": source, "sample_rate": sample_rate,
                 "channels": channels, "samples": int(len(samples))}
+
+
+class VisionPlugin:
+    """T800-Odin2 激光雷达相机视觉数据桥接（飞书文档 7.2 节）。
+
+    Subscribes to the Odin2 raw/SLAM point clouds, stereo compressed images
+    and depth map topics published by ``odin_ros_driver`` on the Orin board,
+    and republishes normalized streams on domain 42 for Agent Core and the
+    dashboard renderers (``sensor/pointcloud``, ``image/jpeg``,
+    ``image/depth-z16``).  Topic names follow the per-device prefix
+    ``/{topic_prefix}/{model}/device{N}/`` and must be calibrated against
+    ``ros_graph`` on the real robot.
+    """
+
+    _SOURCES = ("raw", "slam")
+
+    def __init__(self, config: dict, namespace: str, ros2):
+        self._config = config
+        self._ns = namespace
+        self._topics = config["topics"]
+        vision_config = config.get("plugins", {}).get("vision", {}) or {}
+        self._source = vision_config.get("source", "raw")
+        if self._source not in self._SOURCES:
+            self._source = "raw"
+        self._cloud_topic = f"/{namespace}/vision/cloud"
+        self._cam_left_topic = f"/{namespace}/vision/camera_left"
+        self._cam_right_topic = f"/{namespace}/vision/camera_right"
+        self._depth_topic = f"/{namespace}/vision/depth"
+        self._sub_node = Node("t800_vision_sub", context=ros2.ctx_robot)
+        self._pub_node = Node("t800_vision_pub", context=ros2.ctx_core)
+        ros2.executor_robot.add_node(self._sub_node)
+        ros2.executor_core.add_node(self._pub_node)
+        self._running = False
+        self._lock = threading.RLock()
+        self._frames = {"pointcloud": 0, "camera_left": 0, "camera_right": 0, "depth": 0}
+
+    def get_tools(self) -> list[dict]:
+        return [self._cloud_tool(), self._camera_tool(), self._depth_tool()]
+
+    def _cloud_tool(self) -> dict:
+        return sensor_tool(
+            "pointcloud",
+            f"T800-Odin2 {self._source} 点云转发（256×192）；二进制 [uint32 point_step][uint32 total_points]"
+            f"[PointCloud2 bytes]，发布到 {self._cloud_topic}",
+            self._cloud_topic,
+            "sensor/pointcloud",
+        )
+
+    def _camera_tool(self) -> dict:
+        return {
+            "name": "camera",
+            "type": "sensor",
+            "multiInstance": False,
+            "readOnly": True,
+            "description": f"T800-Odin2 双目 JPEG 图像转发，发布到 {self._cam_left_topic}（左）和"
+                           f" {self._cam_right_topic}（右）",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [
+                {"topic": self._cam_left_topic, "format": "image/jpeg"},
+                {"topic": self._cam_right_topic, "format": "image/jpeg"},
+            ],
+        }
+
+    def _depth_tool(self) -> dict:
+        return sensor_tool(
+            "depth",
+            f"T800-Odin2 深度图（pointcloud_to_depth 节点输出）转发，发布到 {self._depth_topic}",
+            self._depth_topic,
+            "image/depth-z16",
+        )
+
+    def start(self) -> None:
+        if self._running:
+            return
+        import array as _array
+        import struct as _struct
+        from sensor_msgs.msg import CompressedImage, Image, PointCloud2
+        from std_msgs.msg import UInt8MultiArray
+
+        self._running = True
+        self._struct = _struct
+        self._array = _array
+        self._multi_type = UInt8MultiArray
+        self._cloud_pub = self._pub_node.create_publisher(UInt8MultiArray, self._cloud_topic, _BEST_EFFORT)
+        self._cam_left_pub = self._pub_node.create_publisher(CompressedImage, self._cam_left_topic, _BEST_EFFORT)
+        self._cam_right_pub = self._pub_node.create_publisher(CompressedImage, self._cam_right_topic, _BEST_EFFORT)
+        self._depth_pub = self._pub_node.create_publisher(Image, self._depth_topic, _BEST_EFFORT)
+        self._sub_node.create_subscription(
+            PointCloud2, self._topics["vision_cloud_raw"], self._on_cloud_raw, _BEST_EFFORT
+        )
+        self._sub_node.create_subscription(
+            PointCloud2, self._topics["vision_cloud_slam"], self._on_cloud_slam, _BEST_EFFORT
+        )
+        self._sub_node.create_subscription(
+            CompressedImage, self._topics["vision_camera_left"], self._on_camera_left, _BEST_EFFORT
+        )
+        self._sub_node.create_subscription(
+            CompressedImage, self._topics["vision_camera_right"], self._on_camera_right, _BEST_EFFORT
+        )
+        self._sub_node.create_subscription(
+            Image, self._topics["vision_depth"], self._on_depth, _BEST_EFFORT
+        )
+
+    def stop(self) -> None:
+        self._running = False
+
+    def _on_cloud_raw(self, msg) -> None:
+        self._on_cloud(msg, "raw")
+
+    def _on_cloud_slam(self, msg) -> None:
+        self._on_cloud(msg, "slam")
+
+    def _on_cloud(self, msg, source: str) -> None:
+        if not self._running or source != self._source:
+            return
+        data = bytes(msg.data)
+        if not data:
+            return
+        point_step = int(msg.point_step) or 1
+        header = self._struct.pack("<II", point_step, len(data) // point_step)
+        buf = bytearray(8 + len(data))
+        buf[:8] = header
+        buf[8:] = data
+        out = self._multi_type()
+        out.data = self._array.array("B", buf)
+        self._cloud_pub.publish(out)
+        self._frames["pointcloud"] += 1
+
+    def _on_camera_left(self, msg) -> None:
+        if not self._running:
+            return
+        self._cam_left_pub.publish(msg)
+        self._frames["camera_left"] += 1
+
+    def _on_camera_right(self, msg) -> None:
+        if not self._running:
+            return
+        self._cam_right_pub.publish(msg)
+        self._frames["camera_right"] += 1
+
+    def _on_depth(self, msg) -> None:
+        if not self._running:
+            return
+        self._depth_pub.publish(msg)
+        self._frames["depth"] += 1
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "stop", "info", "pointcloud", "camera", "depth"):
+            return {"state": "running" if self._running else "idle",
+                    "source": self._source,
+                    "topic_out": [
+                        {"topic": self._cloud_topic, "format": "sensor/pointcloud"},
+                        {"topic": self._cam_left_topic, "format": "image/jpeg"},
+                        {"topic": self._cam_right_topic, "format": "image/jpeg"},
+                        {"topic": self._depth_topic, "format": "image/depth-z16"},
+                    ],
+                    "frames": dict(self._frames)}
+        if action == "select_source":
+            source = str(args.get("source", "")).strip()
+            if source not in self._SOURCES:
+                raise ValueError(f"invalid pointcloud source: {source}; expected {'|'.join(self._SOURCES)}")
+            with self._lock:
+                self._source = source
+            return {"state": "running" if self._running else "idle", "source": source}
+        return {"error": f"unknown vision action: {action}"}
