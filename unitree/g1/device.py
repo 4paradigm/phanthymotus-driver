@@ -639,25 +639,23 @@ class SmartMotionPlugin:
             "name": "smart_motion",
             "type": "actuator",
             "multiInstance": False,
-            "description": "SmartMotion — 统一运动/输出控制，提供打断、暂停、恢复能力",
+            "description": "SmartMotion — 运动控制，提供运动打断能力",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["interrupt_all", "interrupt_speak", "interrupt_motion",
-                                 "pause_speak", "resume_speak", "status"],
+                        "enum": ["interrupt_motion", "status"],
                         "description": "Action to perform",
                     },
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "interrupt_all":    {"params": [], "description": "中止所有输出（语音+动作同时停止）"},
-                    "interrupt_speak":  {"params": [], "description": "中止语音播放，清空待播队列"},
                     "interrupt_motion": {"params": [], "description": "停止机器人当前运动"},
-                    "pause_speak":      {"params": [], "description": "暂停语音播放（保留未播内容，可恢复）"},
-                    "resume_speak":     {"params": [], "description": "恢复之前暂停的语音播放"},
-                    "status":           {"params": [], "description": "查询当前输出状态（语音/运动）"},
+                    "status":           {"params": [], "description": "查询当前运动状态"},
+                },
+                "x-hooks": {
+                    "on_interrupt_motion": {"action": "interrupt_motion"},
                 },
             },
         }
@@ -673,33 +671,13 @@ class SmartMotionPlugin:
             return {"state": "ready"}
         if action == "stop":
             return {"state": "idle"}
-        if action == "interrupt_all":
-            r1 = self._do_interrupt_speak()
-            r2 = self._do_interrupt_motion()
-            return {"speak": r1, "motion": r2}
-        elif action == "interrupt_speak":
-            return self._do_interrupt_speak()
-        elif action == "interrupt_motion":
+        if action == "interrupt_motion":
             return self._do_interrupt_motion()
-        elif action == "pause_speak":
-            if self._speaker:
-                return self._speaker._node.pause()
-            return {"error": "no speaker plugin"}
-        elif action == "resume_speak":
-            if self._speaker:
-                return self._speaker._node.resume()
-            return {"error": "no speaker plugin"}
         elif action == "status":
             return {
-                "speak": self._speaker.dispatch("info", {}) if self._speaker else None,
                 "motion": self._loco.dispatch("info", {}) if self._loco else None,
             }
         return None
-
-    def _do_interrupt_speak(self) -> dict | None:
-        if self._speaker:
-            return self._speaker._node.interrupt()
-        return {"error": "no speaker plugin"}
 
     def _do_interrupt_motion(self) -> dict | None:
         if self._loco:
@@ -714,29 +692,43 @@ class LedPlugin:
 
     def __init__(self, plugin_config: dict, namespace: str, executor, audio_client: AudioClient):
         self._client = audio_client
+        self._effect_thread = None
+        self._effect_stop = threading.Event()
 
     def get_tool(self) -> dict:
         return {
             "name": "led",
             "type": "actuator",
             "multiInstance": False,
-            "description": "G1 LED strip control — set RGB color or turn off",
+            "description": "G1 LED strip control — set RGB color, turn off, or play animated effects",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["set", "off"],
+                        "enum": ["set", "off", "effect"],
                         "description": "Action to perform",
                     },
                     "r": {"type": "integer", "description": "Red 0-255"},
                     "g": {"type": "integer", "description": "Green 0-255"},
                     "b": {"type": "integer", "description": "Blue 0-255"},
+                    "effect": {
+                        "type": "string",
+                        "enum": ["blink_blue", "solid_blue_2s", "breathe_rainbow", "blink_red_5s"],
+                        "description": "LED effect to play",
+                    },
                 },
                 "required": ["action"],
                 "x-action-params": {
                     "set": {"params": ["r", "g", "b"], "description": "Set LED strip to specified RGB color"},
                     "off": {"params": [],              "description": "Turn off LED strip"},
+                    "effect": {"params": ["effect"],   "description": "Play animated LED effect"},
+                },
+                "x-hooks": {
+                    "on_hearing":    {"action": "effect", "params": {"effect": "blink_blue"}},
+                    "on_kws_wakeup": {"action": "effect", "params": {"effect": "solid_blue_2s"}},
+                    "on_thinking":   {"action": "effect", "params": {"effect": "breathe_rainbow"}},
+                    "on_error":      {"action": "effect", "params": {"effect": "blink_red_5s"}},
                 },
             },
         }
@@ -745,23 +737,108 @@ class LedPlugin:
         pass
 
     def stop(self) -> None:
-        pass
+        self._stop_effect()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
             return {"state": "ready"}
         if action == "stop":
+            self._stop_effect()
             return {"state": "idle"}
         if action == "set":
-            r   = int(args.get("r", 0))
-            g   = int(args.get("g", 0))
-            b   = int(args.get("b", 0))
+            self._stop_effect()
+            r = int(args.get("r", 0))
+            g = int(args.get("g", 0))
+            b = int(args.get("b", 0))
             ret = self._client.LedControl(r, g, b)
             return {"ret": ret, "r": r, "g": g, "b": b}
         elif action == "off":
+            self._stop_effect()
             ret = self._client.LedControl(0, 0, 0)
             return {"ret": ret}
+        elif action == "effect":
+            effect_name = args.get("effect", "")
+            return self._play_effect(effect_name)
         return None
+
+    def _stop_effect(self):
+        """Stop any running effect thread."""
+        if self._effect_thread and self._effect_thread.is_alive():
+            self._effect_stop.set()
+            self._effect_thread.join(timeout=1)
+        self._effect_stop.clear()
+
+    def _play_effect(self, name: str) -> dict:
+        """Start an LED effect in background thread."""
+        self._stop_effect()
+        effects = {
+            "blink_blue": self._eff_blink_blue,
+            "solid_blue_2s": self._eff_solid_blue_2s,
+            "breathe_rainbow": self._eff_breathe_rainbow,
+            "blink_red_5s": self._eff_blink_red_5s,
+        }
+        fn = effects.get(name)
+        if not fn:
+            return {"error": f"unknown effect: {name}"}
+        self._effect_stop.clear()
+        self._effect_thread = threading.Thread(target=fn, daemon=True)
+        self._effect_thread.start()
+        return {"state": "effect", "effect": name}
+
+    def _eff_blink_blue(self):
+        """Blue blink 3 times (200ms on / 200ms off)."""
+        for _ in range(3):
+            if self._effect_stop.is_set(): return
+            self._client.LedControl(0, 80, 255)
+            if self._effect_stop.wait(0.2): return
+            self._client.LedControl(0, 0, 0)
+            if self._effect_stop.wait(0.2): return
+        self._client.LedControl(0, 0, 0)
+
+    def _eff_solid_blue_2s(self):
+        """Blue solid for 2 seconds, then off."""
+        self._client.LedControl(0, 100, 255)
+        if self._effect_stop.wait(2.0): return
+        self._client.LedControl(0, 0, 0)
+
+    def _eff_breathe_rainbow(self):
+        """Breathing rainbow cycle (cyan→magenta→blue→purple) until stopped."""
+        import math
+        # OpenAI-style color palette: cyan, blue, purple, magenta
+        palette = [
+            (0, 200, 255),    # cyan
+            (80, 40, 255),    # blue-purple
+            (180, 0, 255),    # purple
+            (255, 0, 180),    # magenta
+        ]
+        step = 0
+        while not self._effect_stop.is_set():
+            # Smooth interpolation between palette colors
+            t = (step % 200) / 200.0  # 0→1 over 200 steps
+            idx = int(t * len(palette)) % len(palette)
+            next_idx = (idx + 1) % len(palette)
+            frac = (t * len(palette)) - idx
+            r = int(palette[idx][0] * (1 - frac) + palette[next_idx][0] * frac)
+            g = int(palette[idx][1] * (1 - frac) + palette[next_idx][1] * frac)
+            b = int(palette[idx][2] * (1 - frac) + palette[next_idx][2] * frac)
+            # Breathing: sinusoidal brightness modulation
+            brightness = 0.3 + 0.7 * (0.5 + 0.5 * math.sin(step * 0.06))
+            self._client.LedControl(int(r * brightness), int(g * brightness), int(b * brightness))
+            step += 1
+            if self._effect_stop.wait(0.03): return
+        self._client.LedControl(0, 0, 0)
+
+    def _eff_blink_red_5s(self):
+        """Red blink for 5 seconds (250ms on / 250ms off)."""
+        import time
+        end = time.monotonic() + 5.0
+        while time.monotonic() < end:
+            if self._effect_stop.is_set(): return
+            self._client.LedControl(255, 0, 0)
+            if self._effect_stop.wait(0.25): return
+            self._client.LedControl(0, 0, 0)
+            if self._effect_stop.wait(0.25): return
+        self._client.LedControl(0, 0, 0)
 
 
 # ── LocoStatePlugin (sensor) ─────────────────────────────────────────────────
