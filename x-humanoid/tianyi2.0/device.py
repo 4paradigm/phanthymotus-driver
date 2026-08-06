@@ -4807,6 +4807,7 @@ class RobotFaultsPlugin:
         self._self_check_available = False
         self._light_ctrl_state = None       # PowerLightCtrl (proc_manager 自检信号)
         self._light_ctrl_topic = cfg["light_ctrl_topic"]
+        self._light_ctrl_subscribed = False  # 订阅创建标志
 
         # 订阅节点 (domain 0) — 接收身体故障
         self._sub_node = Node("tianyi2_robot_faults_sub", context=ros2.ctx_tianyi)
@@ -4917,6 +4918,7 @@ class RobotFaultsPlugin:
                 PowerLightCtrl, self._light_ctrl_topic,
                 self._on_light_ctrl, _RELIABLE_QOS)
             print("[RobotFaultsPlugin] light ctrl subscription created")
+            self._light_ctrl_subscribed = True
         except ImportError:
             print("[RobotFaultsPlugin] PowerLightCtrl not available, light ctrl disabled")
 
@@ -5187,6 +5189,9 @@ class RobotFaultsPlugin:
                 issues.append("自检进行中")
             elif sc.cmd == 10:
                 issues.append("故障触发")
+        elif self._light_ctrl_subscribed:
+            # 已订阅但还没收到数据 → 默认待机
+            self_check_lines.append("待机")
         elif self._self_check_available and self._self_check_state is not None:
             ns = self._self_check_state
             if ns.state == 0:
