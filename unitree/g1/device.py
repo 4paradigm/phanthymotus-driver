@@ -970,20 +970,30 @@ class LocoStatePlugin:
 # ── ACP notify helper (shared by LocoPlugin) ─────────────────────────────────
 
 import os as _os
-import requests as _requests
 
 _LOCO_AGENT_CORE_URL = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
 
 
 def _loco_acp_notify(action_id: str, status: str, result: dict, tool: str = "loco"):
     """POST ACP completion callback to Agent Core."""
+    import urllib.request as _urllib
+    import ssl as _ssl
+
+    ctx = _ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = _ssl.CERT_NONE
+    payload = json.dumps({
+        "action_id": action_id, "status": status,
+        "result": result, "tool": tool, "ts": time.time(),
+    }).encode()
     try:
-        _requests.post(
+        req = _urllib.Request(
             f"{_LOCO_AGENT_CORE_URL}/api/acp/complete",
-            json={"action_id": action_id, "status": status,
-                  "result": result, "tool": tool, "ts": time.time()},
-            timeout=5, verify=False,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
         )
+        _urllib.urlopen(req, timeout=5, context=ctx)
     except Exception as e:
         print(f"[Loco] ACP notify failed: {e}")
 
