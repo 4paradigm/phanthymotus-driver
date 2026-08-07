@@ -12,9 +12,15 @@ plugins:
     enabled: true
   loco:
     enabled: true
+  fsm_control:
+    enabled: true
+  height_control:
+    enabled: true
   arm:
     enabled: true
   state:
+    enabled: true
+  wireless_controller:
     enabled: true
   camera:
     enabled: true
