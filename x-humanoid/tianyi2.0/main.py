@@ -314,6 +314,12 @@ class TianyiDeviceBundle:
             self._plugins.append(ControlledSpatialPlugin(plugins_cfg["controlled_spatial"], namespace, ros2, slamtec_client))
             print("[bundle] ControlledSpatialPlugin loaded")
 
+        if plugins_cfg.get("controlled_spatial_map", {}).get("enabled", False):
+            from controlled_spatial_map import ControlledSpatialMapPlugin
+            self._plugins.append(ControlledSpatialMapPlugin(
+                plugins_cfg["controlled_spatial_map"], namespace, ros2, slamtec_client))
+            print("[bundle] ControlledSpatialMapPlugin loaded")
+
         if plugins_cfg.get("robot_faults", {}).get("enabled", False):
             from device import RobotFaultsPlugin
             self._plugins.append(RobotFaultsPlugin(plugins_cfg["robot_faults"], namespace, ros2, slamtec_client))
