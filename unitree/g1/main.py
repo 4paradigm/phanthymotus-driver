@@ -95,6 +95,16 @@ class G1DeviceBundle:
             self._plugins.append(LocoPlugin(plugins_cfg["loco"], namespace, executor, loco_client, slam_client=slam_client, smart_motion=smart_motion))
             print("[bundle] LocoStatePlugin + LocoPlugin loaded")
 
+        if plugins_cfg.get("fsm_control", {}).get("enabled", False):
+            from device import FSMControlPlugin
+            self._plugins.append(FSMControlPlugin(plugins_cfg["fsm_control"], namespace, executor, loco_client))
+            print("[bundle] FSMControlPlugin loaded")
+
+        if plugins_cfg.get("height_control", {}).get("enabled", False):
+            from device import HeightControlPlugin
+            self._plugins.append(HeightControlPlugin(plugins_cfg["height_control"], namespace, executor, loco_client))
+            print("[bundle] HeightControlPlugin loaded")
+
         if plugins_cfg.get("arm", {}).get("enabled", False):
             from device import ArmActionPlugin
             self._plugins.append(ArmActionPlugin(plugins_cfg["arm"], namespace, executor, arm_client))
@@ -109,6 +119,11 @@ class G1DeviceBundle:
             from device import StatePlugin
             self._plugins.append(StatePlugin(plugins_cfg["state"], namespace, executor))
             print("[bundle] StatePlugin loaded")
+
+        if plugins_cfg.get("wireless_controller", {}).get("enabled", False):
+            from device import WirelessControllerPlugin
+            self._plugins.append(WirelessControllerPlugin(plugins_cfg["wireless_controller"], namespace, executor))
+            print("[bundle] WirelessControllerPlugin loaded")
 
         if plugins_cfg.get("camera", {}).get("enabled", False):
             from device import RealSensePlugin
