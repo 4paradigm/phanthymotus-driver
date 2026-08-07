@@ -1215,6 +1215,62 @@ class LocoPlugin:
         return result
 
 
+# ── ContinuousGaitPlugin (actuator) ────────────────────────────────────────────
+
+class ContinuousGaitPlugin:
+    PREFIX = "continuous_gait"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor, loco_client):
+        self._client = loco_client
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "continuous_gait",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "G1 continuous gait mode — enable/disable continuous gait, query balance mode",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["enable", "disable", "get_state"],
+                        "description": "Action to perform",
+                    },
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "enable":    {"params": [], "description": "Enable continuous gait mode (balance mode 1)"},
+                    "disable":   {"params": [], "description": "Disable continuous gait mode (balance mode 0)"},
+                    "get_state": {"params": [], "description": "Get current balance mode (0=standard gait, 1=continuous gait)"},
+                },
+            },
+        }
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "enable":
+            ret = self._client.ContinuousGait(True)
+            return {"ret": ret, "continuous_gait": True}
+        elif action == "disable":
+            ret = self._client.ContinuousGait(False)
+            return {"ret": ret, "continuous_gait": False}
+        elif action == "get_state":
+            code, mode = self._client.GetBalanceMode()
+            return {"ret": code, "balance_mode": mode,
+                    "description": "standard gait" if mode == 0 else "continuous gait" if mode == 1 else f"unknown mode {mode}"}
+        return None
+
+
 # ── AsrPlugin (sensor) ───────────────────────────────────────────────────────
 
 class _AsrNode(Node):

@@ -12,6 +12,8 @@ plugins:
     enabled: true
   loco:
     enabled: true
+  continuous_gait:
+    enabled: true
   arm:
     enabled: true
   state:

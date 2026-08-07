@@ -95,6 +95,11 @@ class G1DeviceBundle:
             self._plugins.append(LocoPlugin(plugins_cfg["loco"], namespace, executor, loco_client, slam_client=slam_client, smart_motion=smart_motion))
             print("[bundle] LocoStatePlugin + LocoPlugin loaded")
 
+        if plugins_cfg.get("continuous_gait", {}).get("enabled", False):
+            from device import ContinuousGaitPlugin
+            self._plugins.append(ContinuousGaitPlugin(plugins_cfg["continuous_gait"], namespace, executor, loco_client))
+            print("[bundle] ContinuousGaitPlugin loaded")
+
         if plugins_cfg.get("arm", {}).get("enabled", False):
             from device import ArmActionPlugin
             self._plugins.append(ArmActionPlugin(plugins_cfg["arm"], namespace, executor, arm_client))
