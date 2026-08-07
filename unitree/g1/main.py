@@ -110,6 +110,11 @@ class G1DeviceBundle:
             self._plugins.append(StatePlugin(plugins_cfg["state"], namespace, executor))
             print("[bundle] StatePlugin loaded")
 
+        if plugins_cfg.get("wireless_controller", {}).get("enabled", False):
+            from device import WirelessControllerPlugin
+            self._plugins.append(WirelessControllerPlugin(plugins_cfg["wireless_controller"], namespace, executor))
+            print("[bundle] WirelessControllerPlugin loaded")
+
         if plugins_cfg.get("camera", {}).get("enabled", False):
             from device import RealSensePlugin
             self._plugins.append(RealSensePlugin(plugins_cfg["camera"], namespace, executor))
