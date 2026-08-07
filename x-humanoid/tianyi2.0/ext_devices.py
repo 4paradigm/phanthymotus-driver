@@ -1062,24 +1062,18 @@ class ExtMicPlugin:
                 "ssh_host": {
                     "type": "string",
                     "description": "Remote host address",
+                    "default": "192.168.41.1",
                 },
                 "ssh_user": {
                     "type": "string",
                     "description": "SSH username",
+                    "default": "ubuntu",
                 },
                 "ssh_pass": {
                     "type": "string",
+                    "format": "password",
                     "description": "SSH password",
-                },
-                "ssh_port": {
-                    "type": "string",
-                    "description": "Audio service port",
-                    "default": "9800",
-                },
-                "ssh_script": {
-                    "type": "string",
-                    "description": "audio_sender.py path on remote",
-                    "default": "/home/ubuntu/audio_sender.py",
+                    "default": "123",
                 },
             },
         }
@@ -1274,9 +1268,9 @@ class ExtMicPlugin:
                     probed = self._probe_remote(
                         ssh_host=ssh_host,
                         ssh_user=args.get("ssh_user", "ubuntu"),
-                        ssh_pass=args.get("ssh_pass", ""),
-                        port=int(args.get("ssh_port", "9800") or "9800"),
-                        script=args.get("ssh_script", "/home/ubuntu/audio_sender.py"),
+                        ssh_pass=args.get("ssh_pass", "123"),
+                        port=9800,
+                        script="/home/ubuntu/audio_sender.py",
                     )
                     return {"configured": True, "remote_devices": probed}
                 return {"configured": True}
