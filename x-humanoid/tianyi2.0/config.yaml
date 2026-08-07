@@ -65,6 +65,13 @@ plugins:
     enabled: true
     native_slam_pcd_dir: "/opt/phanthy-motus/data/maps"
     native_slam_db_path: "/opt/phanthy-motus/data/controlled_spatial.db"
+  controlled_spatial_map:
+    enabled: true
+    native_slam_db_path: "/opt/phanthy-motus/data/controlled_spatial.db"
+    cache_dir: "/opt/phanthy-motus/data/map-visuals"
+    poll_hz: 3.0
+    grid_hz: 0.7
+    artifact_hz: 0.4
   robot_faults:
     enabled: true
   laser_scan:

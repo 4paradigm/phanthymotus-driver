@@ -335,6 +335,10 @@ class SlamtecClient:
         """获取STCM复合地图（二进制数据，包含完整地图信息）。Returns (data, error)."""
         return self._download_binary("/api/core/slam/v1/maps/stcm")
 
+    def get_explore_map(self) -> tuple[bytes | None, str | None]:
+        """获取当前探索栅格的二进制快照，仅用于 spatial_map 实时显示。"""
+        return self._download_binary("/api/core/slam/v1/maps/explore")
+
     def upload_map(self, map_data: bytes) -> dict:
         """上传STCM复合地图数据到底盘。PUT /api/core/slam/v1/maps/stcm
         上传后机器人位姿会被重置到原点，需调用 set_pose_init / recover_localization。"""
