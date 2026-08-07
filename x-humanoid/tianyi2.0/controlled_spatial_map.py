@@ -647,7 +647,12 @@ class ControlledSpatialMapPlugin:
             cells = self._np.frombuffer(raw, dtype=self._np.uint8, count=cell_count,
                                         offset=len(raw) - cell_count).reshape(height, width)
             if self._grid_roll_x_cells:
-                cells = self._np.roll(cells, self._grid_roll_x_cells, axis=1).reshape(-1)
+                cells = self._np.roll(cells, self._grid_roll_x_cells, axis=1)
+            # flatnonzero() below returns indices in row-major order. Keep the
+            # grid flat for all subsequent indexing; otherwise cells[known]
+            # indexes only the first axis of the 2D array and can overflow on
+            # any map whose flattened index exceeds its height.
+            cells = cells.reshape(-1)
         except (OSError, UnicodeDecodeError, ValueError, struct.error) as exc:
             self._startup_error = f"saved map load failed: {exc}"
             print(f"[ControlledSpatialMap] {self._startup_error}", flush=True)
