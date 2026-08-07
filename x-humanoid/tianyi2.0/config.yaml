@@ -72,6 +72,9 @@ plugins:
     poll_hz: 3.0
     grid_hz: 0.7
     artifact_hz: 0.4
+    head_pointcloud_enabled: true
+    head_pointcloud_topic: "/ob_camera_head/depth/points"
+    head_recording_enabled: false
   robot_faults:
     enabled: true
   laser_scan:
