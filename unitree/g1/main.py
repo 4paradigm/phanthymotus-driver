@@ -110,6 +110,13 @@ class G1DeviceBundle:
             self._plugins.append(StatePlugin(plugins_cfg["state"], namespace, executor))
             print("[bundle] StatePlugin loaded")
 
+        if plugins_cfg.get("joint_health", {}).get("enabled", False):
+            from joint_health import JointHealthPlugin
+            self._plugins.append(JointHealthPlugin(
+                plugins_cfg["joint_health"], namespace, executor
+            ))
+            print("[bundle] JointHealthPlugin loaded")
+
         if plugins_cfg.get("camera", {}).get("enabled", False):
             from device import RealSensePlugin
             self._plugins.append(RealSensePlugin(plugins_cfg["camera"], namespace, executor))

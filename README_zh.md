@@ -10,7 +10,7 @@
 
 | 驱动 | 硬件 | 端口 | 说明 |
 |------|------|------|------|
-| `unitree/g1` | Unitree G1 人形机器人 | 15701 | 运动控制、机械臂、麦克风、扬声器、LED、状态监控 |
+| `unitree/g1` | Unitree G1 人形机器人 | 15701 | 运动控制、机械臂、麦克风、扬声器、LED、状态与关节健康监控 |
 | `engineai/t800` | 众擎 T800 开发版 | 15708 | ROS2/Native SDK、全身状态、舞蹈/手势序列、虚拟手柄、运动与高低层控制 |
 | `phanthy/remote_control` | 远程控制桥接 | 15710 | 远程控制中继 |
 
@@ -80,6 +80,10 @@ python main.py
 - 驱动端口范围：**15700–15799**
 
 参见 [CONTRIBUTING.md](CONTRIBUTING.md) 了解开发环境搭建和 PR 指南。
+
+### G1 关节健康卡片
+
+`joint_health` 订阅 G1 的 `rt/lowstate`，提供逐关节温度、温升速率、持续高扭矩和数据超时诊断，并发布到 `/<namespace>/health/joints`。卡片支持 `snapshot`、`list_alerts` 和 `reset_baseline` 操作。它只提供诊断，不会停止或控制机器人；温度、扭矩、连续样本数和超时阈值可在 `unitree/g1/config.yaml` 中配置。
 
 ---
 
