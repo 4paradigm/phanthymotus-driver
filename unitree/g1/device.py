@@ -1271,6 +1271,160 @@ class ContinuousGaitPlugin:
         return None
 
 
+# ── BmsControlPlugin (actuator) ───────────────────────────────────────────────
+
+class BmsControlPlugin:
+    PREFIX = "bms_control"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor):
+        from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber
+        from unitree_sdk2py.idl.unitree_hg.msg.dds_ import BmsCmd_, BmsState_
+
+        self._bms_cmd_type = BmsCmd_
+        self._command_topic = plugin_config.get("command_topic", "rt/lf/bmscmd")
+        self._last_state: dict | None = None
+        self._lock = threading.Lock()
+
+        self._publisher = ChannelPublisher(self._command_topic, BmsCmd_)
+        self._publisher.Init()
+        self._subscriber = ChannelSubscriber("rt/lf/bmsstate", BmsState_)
+        self._subscriber.Init(self._on_state, 10)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "bms_control",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "G1 BMS control — query battery state or send a raw BMS command byte",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["get_state", "get_soc", "get_soh", "get_voltage", "get_current",
+                                 "get_temperatures", "get_cell_voltages", "get_cycle_count",
+                                 "get_health_summary", "send_command"],
+                        "description": "Action to perform",
+                    },
+                    "cmd": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 255,
+                        "description": "Raw BMS command byte (0-255)",
+                    },
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "get_state":          {"params": [],      "description": "Get full BMS state"},
+                    "get_soc":            {"params": [],      "description": "Get state of charge (%)"},
+                    "get_soh":            {"params": [],      "description": "Get state of health (%)"},
+                    "get_voltage":        {"params": [],      "description": "Get total battery voltage (V)"},
+                    "get_current":        {"params": [],      "description": "Get current (A) and direction"},
+                    "get_temperatures":   {"params": [],      "description": "Get all temperature sensors"},
+                    "get_cell_voltages":  {"params": [],      "description": "Get all cell voltages (V)"},
+                    "get_cycle_count":    {"params": [],      "description": "Get charge cycle count"},
+                    "get_health_summary": {"params": [],      "description": "Get battery health summary"},
+                    "send_command":       {"params": ["cmd"], "description": "Send raw BMS command byte"},
+                },
+            },
+        }
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def _on_state(self, msg) -> None:
+        state = {
+            "version_high":     int(msg.version_high),
+            "version_low":      int(msg.version_low),
+            "fn":               int(msg.fn),
+            "soc":              int(msg.soc),
+            "soh":              int(msg.soh),
+            "current":          int(msg.current),
+            "voltage":          [int(v) for v in msg.bmsvoltage if v > 0],
+            "cell_vol":         [int(v) for v in msg.cell_vol if v > 0],
+            "temperature":      [int(t) for t in msg.temperature if t > 0],
+            "cycle":            int(msg.cycle),
+            "manufacturer_date": int(msg.manufacturer_date),
+            "bmsstate":         [int(v) for v in msg.bmsstate],
+        }
+        with self._lock:
+            self._last_state = state
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action.startswith("get_"):
+            with self._lock:
+                state = dict(self._last_state) if self._last_state is not None else None
+            if state is None:
+                return {"error": "BMS state unavailable: no rt/lf/bmsstate message received"}
+
+            if action == "get_state":
+                return state
+            if action == "get_soc":
+                return {"soc": state["soc"], "unit": "%"}
+            if action == "get_soh":
+                return {"soh": state["soh"], "unit": "%"}
+            if action == "get_voltage":
+                voltage = state["voltage"][0] / 1000.0 if state["voltage"] else 0.0
+                return {"voltage": voltage, "unit": "V"}
+            if action == "get_current":
+                current = state["current"] / 1000.0
+                direction = "charging" if current < 0 else "discharging" if current > 0 else "idle"
+                return {"current": current, "unit": "A", "direction": direction}
+            if action == "get_temperatures":
+                temperatures = state["temperature"]
+                return {
+                    "temperatures": temperatures,
+                    "count": len(temperatures),
+                    "max": max(temperatures) if temperatures else 0,
+                    "min": min(temperatures) if temperatures else 0,
+                    "avg": sum(temperatures) / len(temperatures) if temperatures else 0.0,
+                    "unit": "°C",
+                }
+            if action == "get_cell_voltages":
+                voltages = [value / 1000.0 for value in state["cell_vol"]]
+                maximum = max(voltages) if voltages else 0.0
+                minimum = min(voltages) if voltages else 0.0
+                return {
+                    "voltages": voltages,
+                    "count": len(voltages),
+                    "max": maximum,
+                    "min": minimum,
+                    "delta": maximum - minimum,
+                    "unit": "V",
+                }
+            if action == "get_cycle_count":
+                return {"cycle": state["cycle"], "unit": "次"}
+            if action == "get_health_summary":
+                soc = state["soc"]
+                soh = state["soh"]
+                temperatures = state["temperature"]
+                status = "critical" if soc <= 10 or soh <= 60 else "warning" if soc <= 20 or soh <= 80 else "good"
+                return {
+                    "soc": soc,
+                    "soh": soh,
+                    "voltage": state["voltage"][0] / 1000.0 if state["voltage"] else 0.0,
+                    "current": state["current"] / 1000.0,
+                    "temperature_avg": sum(temperatures) / len(temperatures) if temperatures else 0.0,
+                    "cycle_count": state["cycle"],
+                    "status": status,
+                }
+        if action == "send_command":
+            cmd = args.get("cmd")
+            if isinstance(cmd, bool) or not isinstance(cmd, int) or not 0 <= cmd <= 255:
+                return {"error": "cmd must be an integer between 0 and 255"}
+            message = self._bms_cmd_type(cmd=cmd, reserve=[0] * 40)
+            published = self._publisher.Write(message)
+            return {"published": published, "cmd": cmd, "command_topic": self._command_topic}
+        return None
+
+
 # ── AsrPlugin (sensor) ───────────────────────────────────────────────────────
 
 class _AsrNode(Node):

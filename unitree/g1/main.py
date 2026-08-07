@@ -100,6 +100,11 @@ class G1DeviceBundle:
             self._plugins.append(ContinuousGaitPlugin(plugins_cfg["continuous_gait"], namespace, executor, loco_client))
             print("[bundle] ContinuousGaitPlugin loaded")
 
+        if plugins_cfg.get("bms_control", {}).get("enabled", False):
+            from device import BmsControlPlugin
+            self._plugins.append(BmsControlPlugin(plugins_cfg["bms_control"], namespace, executor))
+            print("[bundle] BmsControlPlugin loaded")
+
         if plugins_cfg.get("arm", {}).get("enabled", False):
             from device import ArmActionPlugin
             self._plugins.append(ArmActionPlugin(plugins_cfg["arm"], namespace, executor, arm_client))
