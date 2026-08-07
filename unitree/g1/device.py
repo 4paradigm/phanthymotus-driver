@@ -19,6 +19,7 @@ drivers/unitree/g1/device.py — Unitree G1 设备插件（重构版）。
 """
 
 import json
+import math
 import queue
 import socket
 import struct
@@ -1384,6 +1385,472 @@ class LocoPlugin:
         result = self._run_fsm_sequence(steps)
         status = "error" if result.get("error") else "completed"
         _loco_acp_notify(action_id, status, {"mode": mode, **result}, tool="switch_mode")
+
+
+# ── FallRecoveryPlugin (sensor + actuator) ─────────────────────────────────────
+
+class _FallRecoveryNode(Node):
+    def __init__(self, namespace: str, imu_topic: str, foot_force_topic: str, events_topic: str, config: dict):
+        super().__init__("g1_fall_recovery")
+        self._namespace = namespace
+        self._imu_topic = imu_topic
+        self._foot_force_topic = foot_force_topic
+        self._events_topic = events_topic
+        self._fall_angle_threshold_deg = float(config.get("fall_angle_threshold_deg", 50))
+        self._fall_confirm_duration = float(config.get("fall_confirm_duration", 0.5))
+        self._foot_force_threshold = float(config.get("foot_force_threshold", 10))
+        self._lock = threading.Lock()
+        self._state = {
+            "is_fallen": False,
+            "fall_direction": "none",
+            "confidence": 0.0,
+            "imu_rpy": {"roll": 0.0, "pitch": 0.0, "yaw": 0.0},
+            "foot_force": [],
+            "last_fall_time": 0.0,
+        }
+        self._candidate_start = 0.0
+        self._last_direction = "none"
+        self._event_pub = self.create_publisher(String, events_topic, _LOW_LAT_QOS)
+
+        try:
+            self._imu_sub = self.create_subscription(String, imu_topic, self._on_imu, _LOW_LAT_QOS)
+            print(f"[fall_recovery] IMU subscribed: {imu_topic}", flush=True)
+        except Exception as e:
+            print(f"[fall_recovery] IMU subscribe failed: {e}", flush=True)
+
+        try:
+            self._foot_force_sub = self.create_subscription(String, foot_force_topic, self._on_loco_state, _LOW_LAT_QOS)
+            print(f"[fall_recovery] foot_force subscribed: {foot_force_topic}", flush=True)
+        except Exception as e:
+            print(f"[fall_recovery] foot_force subscribe failed: {e}", flush=True)
+
+    def _on_imu(self, msg) -> None:
+        try:
+            data = json.loads(msg.data)
+            rpy = data.get("rpy") or []
+            if len(rpy) < 3:
+                return
+            roll, pitch, yaw = [math.degrees(float(v)) for v in rpy[:3]]
+            with self._lock:
+                self._state["imu_rpy"] = {
+                    "roll": round(roll, 2),
+                    "pitch": round(pitch, 2),
+                    "yaw": round(yaw, 2),
+                }
+            self._update_detection()
+        except Exception as e:
+            print(f"[fall_recovery] IMU parse failed: {e}", flush=True)
+
+    def _on_loco_state(self, msg) -> None:
+        try:
+            data = json.loads(msg.data)
+            forces = data.get("foot_force") or []
+            with self._lock:
+                self._state["foot_force"] = [float(v) for v in forces]
+            self._update_detection()
+        except Exception as e:
+            print(f"[fall_recovery] foot_force parse failed: {e}", flush=True)
+
+    def _update_detection(self) -> None:
+        now_mono = time.monotonic()
+        event = None
+        with self._lock:
+            imu_rpy = dict(self._state["imu_rpy"])
+            forces = list(self._state["foot_force"])
+            roll = float(imu_rpy.get("roll", 0.0))
+            pitch = float(imu_rpy.get("pitch", 0.0))
+            direction = self._classify_direction(roll, pitch)
+            angle_ok = direction != "none"
+            foot_ok = len(forces) >= 4 and all(float(f) < self._foot_force_threshold for f in forces[:4])
+
+            if angle_ok and foot_ok:
+                if self._candidate_start == 0.0 or direction != self._last_direction:
+                    self._candidate_start = now_mono
+                    self._last_direction = direction
+                confirmed = now_mono - self._candidate_start >= self._fall_confirm_duration
+                confidence = self._confidence(roll, pitch, forces)
+                if confirmed:
+                    was_fallen = bool(self._state["is_fallen"])
+                    self._state.update({
+                        "is_fallen": True,
+                        "fall_direction": direction,
+                        "confidence": confidence,
+                    })
+                    if not was_fallen:
+                        self._state["last_fall_time"] = time.time()
+                        event = {"type": "fall_detected", "direction": direction, "confidence": confidence}
+                else:
+                    self._state["confidence"] = confidence
+            else:
+                self._candidate_start = 0.0
+                self._last_direction = "none"
+                self._state.update({
+                    "is_fallen": False,
+                    "fall_direction": "none",
+                    "confidence": 0.0,
+                })
+
+        if event:
+            self.publish_event(event["type"], {k: v for k, v in event.items() if k != "type"})
+
+    def _classify_direction(self, roll: float, pitch: float) -> str:
+        if max(abs(roll), abs(pitch)) < self._fall_angle_threshold_deg:
+            return "none"
+        if abs(pitch) >= abs(roll):
+            return "prone" if pitch > 0 else "supine"
+        return "right" if roll > 0 else "left"
+
+    def _confidence(self, roll: float, pitch: float, forces: list) -> float:
+        angle_score = min(1.0, max(abs(roll), abs(pitch)) / max(self._fall_angle_threshold_deg, 1.0))
+        force_score = 1.0 if len(forces) >= 4 and all(float(f) < self._foot_force_threshold for f in forces[:4]) else 0.0
+        return round(min(1.0, 0.7 * angle_score + 0.3 * force_score), 3)
+
+    def get_status(self) -> dict:
+        with self._lock:
+            return {
+                "is_fallen": bool(self._state["is_fallen"]),
+                "fall_direction": self._state["fall_direction"],
+                "confidence": float(self._state["confidence"]),
+                "imu_rpy": dict(self._state["imu_rpy"]),
+                "foot_force": list(self._state["foot_force"]),
+                "last_fall_time": float(self._state["last_fall_time"]),
+            }
+
+    def publish_event(self, event_type: str, data: dict | None = None) -> None:
+        try:
+            event = {"type": event_type, "timestamp": time.time()}
+            if data:
+                event.update(data)
+            msg = String()
+            msg.data = json.dumps(event)
+            self._event_pub.publish(msg)
+            print(f"[fall_recovery] event: {event_type} | {json.dumps(data or {})}", flush=True)
+        except Exception as e:
+            print(f"[fall_recovery] event publish failed: {e}", flush=True)
+
+
+class FallRecoveryPlugin:
+    PREFIX = "fall_recovery"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor, loco_plugin=None):
+        self._namespace = namespace
+        self._config = plugin_config
+        self._loco_plugin = loco_plugin
+        self._recovery_timeout = float(plugin_config.get("recovery_timeout", 10))
+        self._imu_topic = self._resolve_topic(namespace, plugin_config.get("imu_topic", "state/imu"))
+        self._foot_force_topic = self._resolve_topic(namespace, plugin_config.get("foot_force_topic", "loco/state"))
+        self._events_topic = f"/{namespace}/fall_recovery/events"
+        self._node = _FallRecoveryNode(namespace, self._imu_topic, self._foot_force_topic, self._events_topic, plugin_config)
+        executor.add_node(self._node)
+
+    def _resolve_topic(self, namespace: str, topic: str) -> str:
+        topic = str(topic).strip()
+        if topic.startswith("/"):
+            return topic
+        return f"/{namespace}/{topic.lstrip('/')}"
+
+    def get_tools(self) -> list:
+        return [self._status_tool(), self._recover_tool(), self._fall_event_tool()]
+
+    def _status_tool(self) -> dict:
+        return {
+            "name": "fall_status",
+            "type": "sensor",
+            "multiInstance": False,
+            "description": "G1 fall detection status — fallen state, posture direction, confidence, IMU RPY and foot force.",
+            "inputSchema": {"type": "object", "properties": {}},
+        }
+
+    def _recover_tool(self) -> dict:
+        return {
+            "name": "fall_recover",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "G1 one-shot fall recovery. Uses existing safe switch_mode lie2standup sequence.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "direction": {
+                        "type": "string",
+                        "enum": ["auto", "prone", "supine", "left", "right"],
+                        "description": "Fall direction. auto uses current detection result.",
+                        "default": "auto",
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Execute recovery even if no fall is detected.",
+                        "default": False,
+                    },
+                },
+            },
+        }
+
+    def _fall_event_tool(self) -> dict:
+        return {
+            "name": "fall_events",
+            "type": "sensor",
+            "multiInstance": False,
+            "description": f"G1 fall recovery events — fall_detected, recovery_started, recovery_completed, recovery_failed. Publishes to {self._events_topic}",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._events_topic, "format": "data/json"}],
+        }
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            tool_name = args.get("_tool_name", "fall_status")
+            if tool_name == "fall_events":
+                return {"state": "running", "topic_out": [{"topic": self._events_topic, "format": "data/json"}]}
+            return self._node.get_status()
+        if action == "fall_status":
+            return self._node.get_status()
+        if action == "fall_recover":
+            return self._recover(args)
+        return None
+
+    def _recover(self, args: dict) -> dict:
+        status = self._node.get_status()
+        direction_arg = str(args.get("direction", "auto"))
+        force = bool(args.get("force", False))
+        direction = status["fall_direction"] if direction_arg == "auto" else direction_arg
+
+        if direction not in ("prone", "supine", "left", "right"):
+            direction = "none"
+        if not force and not status["is_fallen"]:
+            return {"success": False, "state": "not_fallen", "status": status, "error": "Robot is not detected as fallen. Set force=true to recover anyway."}
+        if not self._loco_plugin:
+            self._node.publish_event("recovery_failed", {"reason": "missing_loco_plugin", "direction": direction})
+            return {"success": False, "state": "failed", "direction": direction, "error": "LocoPlugin is unavailable"}
+
+        try:
+            self._node.publish_event("recovery_started", {"direction": direction, "forced": force})
+            result = self._loco_plugin.dispatch("switch_mode", {"mode": "lie2standup"})
+            if isinstance(result, dict) and "error" in result:
+                self._node.publish_event("recovery_failed", {"direction": direction, "error": result["error"]})
+                return {"success": False, "state": "failed", "direction": direction, "progress": "lie2standup", "result": result, "timeout": self._recovery_timeout}
+            self._node.publish_event("recovery_completed", {"direction": direction})
+            return {"success": True, "state": "completed", "direction": direction, "progress": "lie2standup", "result": result, "timeout": self._recovery_timeout}
+        except Exception as e:
+            print(f"[fall_recovery] recovery failed: {e}", flush=True)
+            self._node.publish_event("recovery_failed", {"direction": direction, "error": str(e)})
+            return {"success": False, "state": "failed", "direction": direction, "error": str(e)}
+
+
+class ContinuousGaitPlugin:
+    PREFIX = "continuous_gait"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor, loco_client):
+        self._client = loco_client
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "continuous_gait",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "G1 continuous gait mode — enable/disable continuous gait, query balance mode",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["enable", "disable", "get_state"],
+                        "description": "Action to perform",
+                    },
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "enable":    {"params": [], "description": "Enable continuous gait mode (balance mode 1)"},
+                    "disable":   {"params": [], "description": "Disable continuous gait mode (balance mode 0)"},
+                    "get_state": {"params": [], "description": "Get current balance mode (0=standard gait, 1=continuous gait)"},
+                },
+            },
+        }
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "enable":
+            ret = self._client.ContinuousGait(True)
+            return {"ret": ret, "continuous_gait": True}
+        elif action == "disable":
+            ret = self._client.ContinuousGait(False)
+            return {"ret": ret, "continuous_gait": False}
+        elif action == "get_state":
+            code, mode = self._client.GetBalanceMode()
+            return {"ret": code, "balance_mode": mode,
+                    "description": "standard gait" if mode == 0 else "continuous gait" if mode == 1 else f"unknown mode {mode}"}
+        return None
+
+
+# ── BmsControlPlugin (actuator) ───────────────────────────────────────────────
+
+class BmsControlPlugin:
+    PREFIX = "bms_control"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor):
+        from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber
+        from unitree_sdk2py.idl.unitree_hg.msg.dds_ import BmsCmd_, BmsState_
+
+        self._bms_cmd_type = BmsCmd_
+        self._command_topic = plugin_config.get("command_topic", "rt/lf/bmscmd")
+        self._last_state: dict | None = None
+        self._lock = threading.Lock()
+
+        self._publisher = ChannelPublisher(self._command_topic, BmsCmd_)
+        self._publisher.Init()
+        self._subscriber = ChannelSubscriber("rt/lf/bmsstate", BmsState_)
+        self._subscriber.Init(self._on_state, 10)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "bms_control",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "G1 BMS control — query battery state or send a raw BMS command byte",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["get_state", "get_soc", "get_soh", "get_voltage", "get_current",
+                                 "get_temperatures", "get_cell_voltages", "get_cycle_count",
+                                 "get_health_summary", "send_command"],
+                        "description": "Action to perform",
+                    },
+                    "cmd": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 255,
+                        "description": "Raw BMS command byte (0-255)",
+                    },
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "get_state":          {"params": [],      "description": "Get full BMS state"},
+                    "get_soc":            {"params": [],      "description": "Get state of charge (%)"},
+                    "get_soh":            {"params": [],      "description": "Get state of health (%)"},
+                    "get_voltage":        {"params": [],      "description": "Get total battery voltage (V)"},
+                    "get_current":        {"params": [],      "description": "Get current (A) and direction"},
+                    "get_temperatures":   {"params": [],      "description": "Get all temperature sensors"},
+                    "get_cell_voltages":  {"params": [],      "description": "Get all cell voltages (V)"},
+                    "get_cycle_count":    {"params": [],      "description": "Get charge cycle count"},
+                    "get_health_summary": {"params": [],      "description": "Get battery health summary"},
+                    "send_command":       {"params": ["cmd"], "description": "Send raw BMS command byte"},
+                },
+            },
+        }
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def _on_state(self, msg) -> None:
+        state = {
+            "version_high":     int(msg.version_high),
+            "version_low":      int(msg.version_low),
+            "fn":               int(msg.fn),
+            "soc":              int(msg.soc),
+            "soh":              int(msg.soh),
+            "current":          int(msg.current),
+            "voltage":          [int(v) for v in msg.bmsvoltage if v > 0],
+            "cell_vol":         [int(v) for v in msg.cell_vol if v > 0],
+            "temperature":      [int(t) for t in msg.temperature if t > 0],
+            "cycle":            int(msg.cycle),
+            "manufacturer_date": int(msg.manufacturer_date),
+            "bmsstate":         [int(v) for v in msg.bmsstate],
+        }
+        with self._lock:
+            self._last_state = state
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action.startswith("get_"):
+            with self._lock:
+                state = dict(self._last_state) if self._last_state is not None else None
+            if state is None:
+                return {"error": "BMS state unavailable: no rt/lf/bmsstate message received"}
+
+            if action == "get_state":
+                return state
+            if action == "get_soc":
+                return {"soc": state["soc"], "unit": "%"}
+            if action == "get_soh":
+                return {"soh": state["soh"], "unit": "%"}
+            if action == "get_voltage":
+                voltage = state["voltage"][0] / 1000.0 if state["voltage"] else 0.0
+                return {"voltage": voltage, "unit": "V"}
+            if action == "get_current":
+                current = state["current"] / 1000.0
+                direction = "charging" if current < 0 else "discharging" if current > 0 else "idle"
+                return {"current": current, "unit": "A", "direction": direction}
+            if action == "get_temperatures":
+                temperatures = state["temperature"]
+                return {
+                    "temperatures": temperatures,
+                    "count": len(temperatures),
+                    "max": max(temperatures) if temperatures else 0,
+                    "min": min(temperatures) if temperatures else 0,
+                    "avg": sum(temperatures) / len(temperatures) if temperatures else 0.0,
+                    "unit": "°C",
+                }
+            if action == "get_cell_voltages":
+                voltages = [value / 1000.0 for value in state["cell_vol"]]
+                maximum = max(voltages) if voltages else 0.0
+                minimum = min(voltages) if voltages else 0.0
+                return {
+                    "voltages": voltages,
+                    "count": len(voltages),
+                    "max": maximum,
+                    "min": minimum,
+                    "delta": maximum - minimum,
+                    "unit": "V",
+                }
+            if action == "get_cycle_count":
+                return {"cycle": state["cycle"], "unit": "次"}
+            if action == "get_health_summary":
+                soc = state["soc"]
+                soh = state["soh"]
+                temperatures = state["temperature"]
+                status = "critical" if soc <= 10 or soh <= 60 else "warning" if soc <= 20 or soh <= 80 else "good"
+                return {
+                    "soc": soc,
+                    "soh": soh,
+                    "voltage": state["voltage"][0] / 1000.0 if state["voltage"] else 0.0,
+                    "current": state["current"] / 1000.0,
+                    "temperature_avg": sum(temperatures) / len(temperatures) if temperatures else 0.0,
+                    "cycle_count": state["cycle"],
+                    "status": status,
+                }
+        if action == "send_command":
+            cmd = args.get("cmd")
+            if isinstance(cmd, bool) or not isinstance(cmd, int) or not 0 <= cmd <= 255:
+                return {"error": "cmd must be an integer between 0 and 255"}
+            message = self._bms_cmd_type(cmd=cmd, reserve=[0] * 40)
+            published = self._publisher.Write(message)
+            return {"published": published, "cmd": cmd, "command_topic": self._command_topic}
+        return None
 
 
 # ── AsrPlugin (sensor) ───────────────────────────────────────────────────────
