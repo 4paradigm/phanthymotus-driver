@@ -601,6 +601,8 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
                  s_psdk_state < 0 ? "initialization failed" : "initializing");
         return -1;
     }
+    const char *camera = strstr(raw_json, "\"payload3\"") ? "payload3" :
+                         (strstr(raw_json, "\"payload2\"") ? "payload2" : "payload1");
 
     /* Telemetry */
     if (strstr(raw_json, "\"get_telemetry\"")) {
@@ -732,19 +734,25 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
 
     /* Camera */
     if (strstr(raw_json, "\"take_photo\"")) {
-        int r = camera_mgr_take_photo("single");
+        int r = camera_mgr_take_photo(camera, strstr(raw_json, "\"burst\"") ? "burst" : (strstr(raw_json, "\"interval\"") ? "interval" : "single"));
         if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
         else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"start_video\"")) {
-        int r = camera_mgr_start_video();
+        int r = camera_mgr_start_video(camera);
         if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
         else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"stop_video\"")) {
-        int r = camera_mgr_stop_video();
+        int r = camera_mgr_stop_video(camera);
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
+        return 0;
+    }
+    if (strstr(raw_json, "\"set_camera_mode\"")) {
+        int r = camera_mgr_set_mode(camera, strstr(raw_json, "\"video\"") ? "video" : "photo");
         if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
         else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
@@ -756,7 +764,7 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
             fp = strchr(fp, ':');
             if (fp) factor = (float)atof(fp + 1);
         }
-        int r = camera_mgr_set_zoom(factor);
+        int r = camera_mgr_set_zoom(camera, factor);
         if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
         else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
@@ -767,7 +775,7 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
         const char *yp = strstr(raw_json, "\"y\"");
         if (xp) { xp = strchr(xp, ':'); if (xp) x = (float)atof(xp + 1); }
         if (yp) { yp = strchr(yp, ':'); if (yp) y = (float)atof(yp + 1); }
-        int r = camera_mgr_set_focus(x, y);
+        int r = camera_mgr_set_focus(camera, x, y);
         if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
         else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
@@ -779,14 +787,14 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
         if ((p = strstr(raw_json, "\"aperture\""))) { p = strchr(p, ':'); if (p) aperture = (float)atof(p+1); }
         if ((p = strstr(raw_json, "\"shutter_speed\""))) { p = strchr(p, ':'); if (p) shutter = (float)atof(p+1); }
         if ((p = strstr(raw_json, "\"ev\""))) { p = strchr(p, ':'); if (p) ev = (float)atof(p+1); }
-        int r = camera_mgr_set_exposure(iso, aperture, shutter, ev);
+        int r = camera_mgr_set_exposure(camera, iso, aperture, shutter, ev);
         if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
         else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"get_storage\"")) {
         char storage[256];
-        camera_mgr_get_storage(storage, sizeof(storage));
+        camera_mgr_get_storage(camera, storage, sizeof(storage));
         snprintf(result, result_size, "{\"ok\":true,\"data\":%s}", storage);
         return 0;
     }
@@ -796,7 +804,7 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
         if ((p = strstr(raw_json, "\"x\""))) { p = strchr(p, ':'); if (p) x = (float)atof(p+1); }
         if ((p = strstr(raw_json, "\"y\""))) { p = strchr(p, ':'); if (p) y = (float)atof(p+1); }
         char buf[256];
-        int r = camera_mgr_ir_temp_point(x, y, buf, sizeof(buf));
+        int r = camera_mgr_ir_temp_point(camera, x, y, buf, sizeof(buf));
         snprintf(result, result_size, "{\"ok\":%s,\"data\":%s}", r == 0 ? "true" : "false", buf);
         return 0;
     }
@@ -808,7 +816,7 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
         if ((p = strstr(raw_json, "\"rbx\""))) { p = strchr(p, ':'); if (p) rbx = (float)atof(p+1); }
         if ((p = strstr(raw_json, "\"rby\""))) { p = strchr(p, ':'); if (p) rby = (float)atof(p+1); }
         char buf[256];
-        int r = camera_mgr_ir_temp_area(ltx, lty, rbx, rby, buf, sizeof(buf));
+        int r = camera_mgr_ir_temp_area(camera, ltx, lty, rbx, rby, buf, sizeof(buf));
         snprintf(result, result_size, "{\"ok\":%s,\"data\":%s}", r == 0 ? "true" : "false", buf);
         return 0;
     }
@@ -915,15 +923,17 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
 
     /* Liveview */
     if (strstr(raw_json, "\"start_liveview\"")) {
-        const char *cam = "wide";
-        if (strstr(raw_json, "\"ir\"")) cam = "ir";
-        else if (strstr(raw_json, "\"zoom\"")) cam = "zoom";
+        const char *cam = "payload1";
+        if (strstr(raw_json, "\"fpv\"")) cam = "fpv";
+        else if (strstr(raw_json, "\"payload2\"")) cam = "payload2";
+        else if (strstr(raw_json, "\"payload3\"")) cam = "payload3";
         liveview_start(cam, NULL);
         snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0,\"camera\":\"%s\"}}", cam);
         return 0;
     }
     if (strstr(raw_json, "\"stop_liveview\"")) {
-        liveview_stop();
+        const char *cam = strstr(raw_json, "\"fpv\"") ? "fpv" : camera;
+        liveview_stop(cam);
         snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
         return 0;
     }

@@ -427,29 +427,29 @@ class BridgeClient:
         return self._call("release_joystick_authority")
 
     # Camera
-    def take_photo(self, mode: str = "single"):
-        return self._call("take_photo", {"mode": mode})
+    def take_photo(self, mode: str = "single", camera: str = "payload1"):
+        return self._call("take_photo", {"mode": mode, "camera": camera})
 
-    def start_video(self):
-        return self._call("start_video")
+    def start_video(self, camera: str = "payload1"):
+        return self._call("start_video", {"camera": camera})
 
-    def stop_video(self):
-        return self._call("stop_video")
+    def stop_video(self, camera: str = "payload1"):
+        return self._call("stop_video", {"camera": camera})
 
-    def set_camera_mode(self, mode: str):
-        return self._call("set_camera_mode", {"mode": mode})
+    def set_camera_mode(self, mode: str, camera: str = "payload1"):
+        return self._call("set_camera_mode", {"mode": mode, "camera": camera})
 
-    def set_zoom(self, factor: float):
-        return self._call("set_zoom", {"factor": factor})
+    def set_zoom(self, factor: float, camera: str = "payload1"):
+        return self._call("set_zoom", {"factor": factor, "camera": camera})
 
-    def set_focus(self, x: float, y: float):
-        return self._call("set_focus", {"x": x, "y": y})
+    def set_focus(self, x: float, y: float, camera: str = "payload1"):
+        return self._call("set_focus", {"x": x, "y": y, "camera": camera})
 
     def set_exposure(self, iso: int = 0, aperture: float = 0,
-                     shutter_speed: float = 0, ev: float = 0):
+                     shutter_speed: float = 0, ev: float = 0, camera: str = "payload1"):
         return self._call("set_exposure", {
             "iso": iso, "aperture": aperture,
-            "shutter_speed": shutter_speed, "ev": ev,
+            "shutter_speed": shutter_speed, "ev": ev, "camera": camera,
         })
 
     def get_storage(self):
@@ -521,11 +521,11 @@ class BridgeClient:
         return self._call("get_hms_info")
 
     # Liveview
-    def start_liveview(self, camera: str = "wide"):
+    def start_liveview(self, camera: str = "payload1"):
         return self._call("start_liveview", {"camera": camera})
 
-    def stop_liveview(self):
-        return self._call("stop_liveview")
+    def stop_liveview(self, camera: str = "payload1"):
+        return self._call("stop_liveview", {"camera": camera})
 
     # Perception
     def start_perception(self, direction: str = "front"):

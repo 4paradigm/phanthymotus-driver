@@ -134,7 +134,7 @@ class TelemetryPlugin:
 # ═══════════════════════════════════════════════════════════════════════════
 
 class _CameraStreamNode(Node):
-    def __init__(self, topic: str, bridge, fps: int = 10, camera: str = "wide"):
+    def __init__(self, topic: str, bridge, fps: int = 10, camera: str = "payload1"):
         super().__init__(f"m300_cam_{camera}")
         self._topic = topic
         self._bridge = bridge
@@ -155,13 +155,13 @@ class _CameraStreamNode(Node):
 
     def stop(self):
         self.state = "idle"
-        self._bridge.stop_liveview()
+        self._bridge.stop_liveview(camera=self._camera)
 
     def _stream_loop(self):
         """Read JPEG frames from /dev/shm (FFmpeg decoded in C bridge)."""
         import os
 
-        frame_path = "/dev/shm/dji_frame.jpg"
+        frame_path = f"/dev/shm/dji_frame_{self._camera}.jpg"
         last_mtime = 0
         pub_count = 0
 
@@ -209,7 +209,7 @@ class CameraStreamPlugin:
             "name": "camera_stream",
             "type": "sensor",
             "multiInstance": True,
-            "description": "Matrice 300 RTK 挂载相机实时码流 (H.264 解码 → JPEG)。使用 1 号挂载口当前相机。",
+            "description": "Matrice 300 RTK 四路实时码流：FPV 与 1/2/3 号载荷口，H.264 解码为独立 JPEG 话题。",
             "topic_out": [{"format": "image/jpeg", "desc": "camera JPEG stream"}],
             "configSchema": {
                 "type": "object",
@@ -219,7 +219,10 @@ class CameraStreamPlugin:
                         "description": "Camera source",
                         "scope": "instance",
                         "oneOf": [
-                            {"const": "default", "title": "Payload Port 1 (当前挂载)"},
+                            {"const": "fpv", "title": "Aircraft FPV"},
+                            {"const": "payload1", "title": "Payload Port 1"},
+                            {"const": "payload2", "title": "Payload Port 2"},
+                            {"const": "payload3", "title": "Payload Port 3"},
                         ],
                     },
                 },
@@ -248,7 +251,7 @@ class CameraStreamPlugin:
 
         if action == "config":
             self._instance_configs[instance_id] = args
-            camera = "default"
+            camera = args.get("camera_source", "payload1")
             # If stream is running and camera changed, restart it
             if instance_id in self._nodes:
                 node = self._nodes[instance_id]
@@ -260,7 +263,7 @@ class CameraStreamPlugin:
             return {"ok": True, "camera": camera}
 
         # Resolve camera from cached instance config
-        camera = "default"
+        camera = self._instance_configs.get(instance_id, {}).get("camera_source", "payload1")
 
         if action == "info":
             safe_id = instance_id.replace("-", "_")
@@ -691,6 +694,12 @@ class CameraPlugin:
                         "description": "拍照模式 (single/interval/burst) 或相机模式 (photo/video)",
                         "enum": ["single", "interval", "burst", "photo", "video"],
                     },
+                    "camera_source": {
+                        "type": "string",
+                        "description": "受控载荷口；FPV 仅可预览，不能执行相机控制",
+                        "enum": ["payload1", "payload2", "payload3"],
+                        "default": "payload1",
+                    },
                     "zoom_factor": {"type": "number", "description": "光学变焦倍数（受实际挂载限制）"},
                     "focus_x": {"type": "number", "description": "对焦点 X (0-1 归一化)"},
                     "focus_y": {"type": "number", "description": "对焦点 Y (0-1 归一化)"},
@@ -733,28 +742,29 @@ class CameraPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        camera = args.get("camera_source", "payload1")
         if action == "start":
             return {"state": "ready"}
         if action == "stop":
             return {"state": "idle"}
         if action == "take_photo":
-            resp = self._bridge.take_photo(mode=args.get("mode", "single"))
+            resp = self._bridge.take_photo(mode=args.get("mode", "single"), camera=camera)
             return {"ret": 0 if resp.get("ok") else -1, "data": resp.get("data", {})}
         if action == "start_video":
-            resp = self._bridge.start_video()
+            resp = self._bridge.start_video(camera=camera)
             return {"ret": 0 if resp.get("ok") else -1}
         if action == "stop_video":
-            resp = self._bridge.stop_video()
+            resp = self._bridge.stop_video(camera=camera)
             return {"ret": 0 if resp.get("ok") else -1}
         if action == "set_mode":
-            resp = self._bridge.set_camera_mode(mode=args.get("mode", "photo"))
+            resp = self._bridge.set_camera_mode(mode=args.get("mode", "photo"), camera=camera)
             return {"ret": 0 if resp.get("ok") else -1}
         if action == "set_zoom":
-            resp = self._bridge.set_zoom(factor=args.get("zoom_factor", 1.0))
+            resp = self._bridge.set_zoom(factor=args.get("zoom_factor", 1.0), camera=camera)
             return {"ret": 0 if resp.get("ok") else -1, "data": resp.get("data", {})}
         if action == "set_focus":
             resp = self._bridge.set_focus(
-                x=args.get("focus_x", 0.5), y=args.get("focus_y", 0.5),
+                x=args.get("focus_x", 0.5), y=args.get("focus_y", 0.5), camera=camera,
             )
             return {"ret": 0 if resp.get("ok") else -1}
         if action == "set_exposure":
@@ -762,7 +772,7 @@ class CameraPlugin:
                 iso=args.get("iso", 0),
                 aperture=args.get("aperture", 0),
                 shutter_speed=args.get("shutter_speed", 0),
-                ev=args.get("ev", 0),
+                ev=args.get("ev", 0), camera=camera,
             )
             return {"ret": 0 if resp.get("ok") else -1}
         if action == "get_storage":
