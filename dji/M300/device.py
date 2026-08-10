@@ -307,16 +307,25 @@ class _PerceptionNode(Node):
         self._bridge = bridge
         self._pubs: dict[str, object] = {}
         self._active_directions: set[str] = set()
+        self._last_mtime: dict[str, float] = {}
+        self._timer = self.create_timer(1.0 / 30.0, self._publish_frames)
         self.state = "idle"
 
     def start(self, direction: str):
         topic = f"/{self._namespace}/perception/{direction}"
         if direction not in self._pubs:
-            self._pubs[direction] = self.create_publisher(String, topic, _LOW_LAT_QOS)
+            self._pubs[direction] = self.create_publisher(CompressedImage, topic, _LOW_LAT_QOS)
+        if direction in self._active_directions:
+            return {"ok": True}
+        if len(self._active_directions) >= 2:
+            return {"ok": False, "error": "M300 PSDK supports at most two simultaneous perception streams"}
+        response = self._bridge.start_perception(direction=direction)
+        if not response.get("ok"):
+            return response
         self._active_directions.add(direction)
-        self._bridge.start_perception(direction=direction)
         self.state = "running"
         self.get_logger().info(f"Perception started — {direction}")
+        return response
 
     def stop(self, direction: str = ""):
         if direction:
@@ -328,6 +337,27 @@ class _PerceptionNode(Node):
             self._active_directions.clear()
         if not self._active_directions:
             self.state = "idle"
+
+    def _publish_frames(self):
+        import os
+        for direction in list(self._active_directions):
+            path = f"/dev/shm/dji_perception_{direction}.jpg"
+            try:
+                mtime = os.path.getmtime(path)
+                if mtime == self._last_mtime.get(direction):
+                    continue
+                with open(path, "rb") as f:
+                    data = f.read()
+                if len(data) <= 100:
+                    continue
+                self._last_mtime[direction] = mtime
+                msg = CompressedImage()
+                msg.header.stamp = self.get_clock().now().to_msg()
+                msg.format = "jpeg; grayscale"
+                msg.data = data
+                self._pubs[direction].publish(msg)
+            except OSError:
+                continue
 
 
 class PerceptionPlugin:
@@ -386,8 +416,8 @@ class PerceptionPlugin:
     def dispatch(self, action: str, args: dict) -> dict | None:
         direction = args.get("direction", "front")
         if action == "start":
-            self._node.start(direction)
-            return {"state": "running"}
+            result = self._node.start(direction)
+            return {"state": self._node.state, **result}
         if action == "stop":
             self._node.stop(direction)
             return {"state": self._node.state}

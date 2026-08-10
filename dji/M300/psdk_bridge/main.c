@@ -940,13 +940,23 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
 
     /* Perception */
     if (strstr(raw_json, "\"start_perception\"")) {
-        perception_start("front", NULL);
-        snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        const char *dir = strstr(raw_json, "\"back\"") ? "back" :
+                          (strstr(raw_json, "\"left\"") ? "left" :
+                          (strstr(raw_json, "\"right\"") ? "right" :
+                          (strstr(raw_json, "\"up\"") ? "up" :
+                          (strstr(raw_json, "\"down\"") ? "down" : "front"))));
+        int r = perception_start(dir, NULL);
+        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d,\"direction\":\"%s\"}}", r == 0 ? "true" : "false", r, dir);
         return 0;
     }
     if (strstr(raw_json, "\"stop_perception\"")) {
-        perception_stop("front");
-        snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        const char *dir = strstr(raw_json, "\"back\"") ? "back" :
+                          (strstr(raw_json, "\"left\"") ? "left" :
+                          (strstr(raw_json, "\"right\"") ? "right" :
+                          (strstr(raw_json, "\"up\"") ? "up" :
+                          (strstr(raw_json, "\"down\"") ? "down" : "front"))));
+        int r = perception_stop(dir);
+        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d,\"direction\":\"%s\"}}", r == 0 ? "true" : "false", r, dir);
         return 0;
     }
 
