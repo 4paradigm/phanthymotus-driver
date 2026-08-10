@@ -204,14 +204,22 @@ static T_DjiReturnCode _HalUart_Init(E_DjiHalUartNum uartNum, uint32_t baudRate,
     speed_t speed = _to_speed(baudRate);
     cfsetispeed(&tty, speed);
     cfsetospeed(&tty, speed);
-    tty.c_cflag &= ~(PARENB | PARODD | CSTOPB | CSIZE | CRTSCTS);
+    /* Keep the CDC control lines asserted while PSDK closes and reopens the
+     * port during its UART0 identification sweep.  HUPCL is inherited from
+     * the host's tty defaults; leaving it set drops DTR on every probe close.
+     * On the E-Port CDC bridge that can reset/interrupt the downstream UART
+     * mid-frame, which presents to PSDK as intermittent CRC16 failures. */
+    tty.c_cflag &= ~(PARENB | PARODD | CSTOPB | CSIZE | CRTSCTS | HUPCL);
     tty.c_cflag |= CS8 | CLOCAL | CREAD;
     tty.c_iflag = 0;
     tty.c_oflag = 0;
     tty.c_lflag = 0;
     tty.c_cc[VMIN] = 0;   /* Non-blocking: return immediately with available data */
     tty.c_cc[VTIME] = 5;  /* 500ms timeout — enough for aircraft to respond */
-    if (tcsetattr(handle->fd, TCSANOW, &tty) != 0) {
+    /* Drain the preceding CDC transfer before changing line coding.  The SDK
+     * deliberately tries several baud rates; TCSANOW can otherwise apply a
+     * new rate while the adapter is still transmitting a probe frame. */
+    if (tcsetattr(handle->fd, TCSADRAIN, &tty) != 0) {
         printf("[psdk][uart] tcsetattr %s failed: %s\n", uart->device, strerror(errno));
         close(handle->fd);
         free(handle);
