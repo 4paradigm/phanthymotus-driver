@@ -5061,19 +5061,21 @@ class RobotFaultsPlugin:
             self._last_update_ms = now_ms
 
     def _on_self_check(self, msg):
-        """bodycontrol_state 回调。body_control 重启（state 变 0）时重置自检标记。"""
+        """bodycontrol_state 回调。
+        body_control 重启（state 变 0）时重置自检标记；
+        state 从 Running(1) 变为非 Running 时也重置，防止自检完成/急停后 stuck。"""
         now_ms = int(time.time() * 1000)
         with self._lock:
             prev_state = self._self_check_state.state if self._self_check_state is not None else None
             self._self_check_state = msg
             self._last_update_ms = now_ms
-            # body_control 进入 Initing (state=0) → 重置自检标记，等待下次按 A
-            if msg.state == 0 and prev_state != 0:
+            # body_control 离开 Running (state!=1) → 重置自检标记，避免 stuck
+            if prev_state == 1 and msg.state != 1:
                 self._self_check_started = False
                 self._self_check_completed = False
                 self._audio_window_start_ms = None
                 self._audio_window_count = 0
-                print(f"[RobotFaultsPlugin] body_control restarted, self-check flags reset")
+                print(f"[RobotFaultsPlugin] body_control left Running(state={msg.state}), self-check flags reset")
 
     def _on_light_ctrl(self, msg):
         """proc_manager 灯效反馈, cmd 20=自检等待/21=自检启动/22=自检成功."""
@@ -5262,14 +5264,16 @@ class RobotFaultsPlugin:
                 imu_lines.append(f"部分缺失:{','.join(missing)}")
                 issues.append(f"IMU部分数据缺失: {', '.join(missing)}")
 
-        # ── 自检状态 (方案B: 音频事件 + bodycontrol_state) ──
+        # ── 自检状态 (方案B: 音频事件 + bodycontrol_state 双重校验) ──
         # 两态模型:
-        #   检测到规律音频序列 且 未收到完成短提示音 → "自检中" (禁止操作)
-        #   其他情况                                    → "没有在自检"
+        #   自检中 = bodycontrol_state==1(Running) AND 检测到规律音频序列 AND 未收到完成短提示音
+        #   其他   = 没有在自检
         self_check_available = self._self_check_available and self._self_check_state is not None
         self_check_lines = []
 
-        if self._self_check_started and not self._self_check_completed:
+        bc_running = (self._self_check_state is not None and self._self_check_state.state == 1)
+
+        if bc_running and self._self_check_started and not self._self_check_completed:
             self_check_lines.append("自检中")
             issues.append("自检进行中")
         else:
