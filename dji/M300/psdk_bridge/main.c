@@ -180,14 +180,18 @@ static T_DjiReturnCode _HalUart_Init(E_DjiHalUartNum uartNum, uint32_t baudRate,
     speed_t speed = _to_speed(baudRate);
     cfsetispeed(&tty, speed);
     cfsetospeed(&tty, speed);
-    tty.c_cflag &= ~(PARENB | PARODD | CSTOPB | CSIZE | CRTSCTS);
+    /* DjiCore probes several baud rates.  Do not let the close/reopen cycle
+     * deassert DTR (HUPCL): on the M300 OSDK CDC bridge that resets the
+     * downstream transport in the middle of the next probe. */
+    tty.c_cflag &= ~(PARENB | PARODD | CSTOPB | CSIZE | CRTSCTS | HUPCL);
     tty.c_cflag |= CS8 | CLOCAL | CREAD;
     tty.c_iflag = 0;
     tty.c_oflag = 0;
     tty.c_lflag = 0;
     tty.c_cc[VMIN] = 0;   /* Non-blocking: return immediately with available data */
     tty.c_cc[VTIME] = 5;  /* 500ms timeout — enough for aircraft to respond */
-    if (tcsetattr(handle->fd, TCSANOW, &tty) != 0) {
+    /* Finish an earlier CDC transfer before changing line coding. */
+    if (tcsetattr(handle->fd, TCSADRAIN, &tty) != 0) {
         printf("[psdk][uart] tcsetattr %s failed: %s\n", device, strerror(errno));
         close(handle->fd);
         free(handle);
