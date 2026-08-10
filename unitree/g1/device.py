@@ -690,45 +690,64 @@ class SmartMotionPlugin:
 class LedPlugin:
     PREFIX = "led"
 
+    # State priority: higher number = higher priority
+    _PRIORITY = {'idle': 0, 'hearing': 1, 'thinking': 3, 'speaking': 4, 'error': 5}
+    # Auto-timeout per state (seconds). None = must be explicitly overridden.
+    _TIMEOUT = {'idle': None, 'hearing': 1.2, 'thinking': 60, 'speaking': 120, 'error': 5}
+
     def __init__(self, plugin_config: dict, namespace: str, executor, audio_client: AudioClient):
         self._client = audio_client
+        self._state = 'idle'
+        self._state_ts = 0.0
+        self._state_lock = threading.Lock()
         self._effect_thread = None
         self._effect_stop = threading.Event()
+        self._hw_lock = threading.Lock()  # DDS RPC thread safety
+        self._timeout_timer = None
+
+    def _led_set(self, r: int, g: int, b: int) -> int:
+        """Thread-safe LED control with error logging."""
+        with self._hw_lock:
+            code = self._client.LedControl(r, g, b)
+            if code != 0:
+                print(f'[LED] LedControl({r},{g},{b}) failed: code={code}')
+            return code
 
     def get_tool(self) -> dict:
         return {
             "name": "led",
             "type": "actuator",
             "multiInstance": False,
-            "description": "G1 LED strip control — set RGB color, turn off, or play animated effects",
+            "description": "G1 LED strip — state-driven (hook-triggered) or manual RGB control",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["set", "off", "effect"],
+                        "enum": ["state", "set", "off"],
                         "description": "Action to perform",
+                    },
+                    "state": {
+                        "type": "string",
+                        "enum": ["idle", "hearing", "thinking", "speaking", "error"],
+                        "description": "Target LED state (for action=state)",
                     },
                     "r": {"type": "integer", "description": "Red 0-255"},
                     "g": {"type": "integer", "description": "Green 0-255"},
                     "b": {"type": "integer", "description": "Blue 0-255"},
-                    "effect": {
-                        "type": "string",
-                        "enum": ["blink_blue", "solid_blue_2s", "breathe_rainbow", "blink_red_5s"],
-                        "description": "LED effect to play",
-                    },
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "set": {"params": ["r", "g", "b"], "description": "Set LED strip to specified RGB color"},
-                    "off": {"params": [],              "description": "Turn off LED strip"},
-                    "effect": {"params": ["effect"],   "description": "Play animated LED effect"},
+                    "state": {"params": ["state"], "description": "Transition LED to semantic state (priority-managed)"},
+                    "set":   {"params": ["r", "g", "b"], "description": "Manual RGB override (bypasses state machine)"},
+                    "off":   {"params": [], "description": "Turn off LED (resets state to idle)"},
                 },
                 "x-hooks": {
-                    "on_hearing":    {"action": "effect", "params": {"effect": "blink_blue"}},
-                    "on_kws_wakeup": {"action": "effect", "params": {"effect": "solid_blue_2s"}},
-                    "on_thinking":   {"action": "effect", "params": {"effect": "breathe_rainbow"}},
-                    "on_error":      {"action": "effect", "params": {"effect": "blink_red_5s"}},
+                    "on_hearing":    {"action": "state", "params": {"state": "hearing"}},
+                    "on_thinking":   {"action": "state", "params": {"state": "thinking"}},
+                    "on_speaking":   {"action": "state", "params": {"state": "speaking"}},
+                    "on_idle":       {"action": "state", "params": {"state": "idle"}},
+                    "on_error":      {"action": "state", "params": {"state": "error"}},
                 },
             },
         }
@@ -738,73 +757,103 @@ class LedPlugin:
 
     def stop(self) -> None:
         self._stop_effect()
+        self._cancel_timeout()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
-            return {"state": "ready"}
+            return {"state": self._state}
         if action == "stop":
-            self._stop_effect()
+            self._transition('idle')
             return {"state": "idle"}
-        if action == "set":
-            self._stop_effect()
+        if action == "state":
+            new_state = args.get("state", "idle")
+            if new_state not in self._PRIORITY:
+                return {"error": f"unknown state: {new_state}"}
+            self._transition(new_state)
+            return {"state": self._state}
+        elif action == "set":
+            # Manual override: bypass state machine
+            self._transition('idle')
             r = int(args.get("r", 0))
             g = int(args.get("g", 0))
             b = int(args.get("b", 0))
-            ret = self._client.LedControl(r, g, b)
+            ret = self._led_set(r, g, b)
+            if ret != 0:
+                return {"error": f"LedControl failed (code={ret})", "ret": ret}
             return {"ret": ret, "r": r, "g": g, "b": b}
         elif action == "off":
-            self._stop_effect()
-            ret = self._client.LedControl(0, 0, 0)
-            return {"ret": ret}
-        elif action == "effect":
-            effect_name = args.get("effect", "")
-            return self._play_effect(effect_name)
+            self._transition('idle')
+            return {"state": "idle"}
         return None
+
+    # ── State Machine ─────────────────────────────────────────────────────────
+
+    def _transition(self, new_state: str):
+        """Priority-based state transition. Higher priority overrides lower."""
+        import time as _time
+        with self._state_lock:
+            # Speaking min hold: don't allow idle to override within 1s
+            if self._state == 'speaking' and new_state == 'idle':
+                if _time.time() - self._state_ts < 1.0:
+                    return
+            if new_state not in ('idle', 'error'):
+                # Only allow transition to equal-or-higher priority
+                if self._PRIORITY.get(new_state, 0) <= self._PRIORITY.get(self._state, 0):
+                    return
+            self._state = new_state
+            self._state_ts = _time.time()
+
+        self._stop_effect()
+        self._cancel_timeout()
+
+        # Start the state's visual effect (skip idle — no-op)
+        effect_fn = getattr(self, f'_state_{new_state}', None)
+        if effect_fn and new_state != 'idle':
+            self._effect_stop.clear()
+            self._effect_thread = threading.Thread(target=effect_fn, daemon=True)
+            self._effect_thread.start()
+
+        # Schedule auto-timeout to idle (only if state hasn't changed)
+        timeout = self._TIMEOUT.get(new_state)
+        if timeout:
+            expected_state = new_state
+            def _timeout_cb(expected=expected_state):
+                with self._state_lock:
+                    if self._state != expected:
+                        return  # State was overridden by higher priority, don't fall back
+                self._transition('idle')
+            self._timeout_timer = threading.Timer(timeout, _timeout_cb)
+            self._timeout_timer.daemon = True
+            self._timeout_timer.start()
 
     def _stop_effect(self):
         """Stop any running effect thread."""
+        self._effect_stop.set()
         if self._effect_thread and self._effect_thread.is_alive():
-            self._effect_stop.set()
-            self._effect_thread.join(timeout=1)
-        self._effect_stop.clear()
+            self._effect_thread.join(timeout=2)
+        # Do NOT clear here — cleared in _transition before starting new thread
 
-    def _play_effect(self, name: str) -> dict:
-        """Start an LED effect in background thread."""
-        self._stop_effect()
-        effects = {
-            "blink_blue": self._eff_blink_blue,
-            "solid_blue_2s": self._eff_solid_blue_2s,
-            "breathe_rainbow": self._eff_breathe_rainbow,
-            "blink_red_5s": self._eff_blink_red_5s,
-        }
-        fn = effects.get(name)
-        if not fn:
-            return {"error": f"unknown effect: {name}"}
-        self._effect_stop.clear()
-        self._effect_thread = threading.Thread(target=fn, daemon=True)
-        self._effect_thread.start()
-        return {"state": "effect", "effect": name}
+    def _cancel_timeout(self):
+        """Cancel pending auto-timeout timer."""
+        if self._timeout_timer:
+            self._timeout_timer.cancel()
+            self._timeout_timer = None
 
-    def _eff_blink_blue(self):
-        """Blue blink 3 times (200ms on / 200ms off)."""
-        for _ in range(3):
-            if self._effect_stop.is_set(): return
-            self._client.LedControl(0, 80, 255)
-            if self._effect_stop.wait(0.2): return
-            self._client.LedControl(0, 0, 0)
-            if self._effect_stop.wait(0.2): return
-        self._client.LedControl(0, 0, 0)
+    # ── State Effects ─────────────────────────────────────────────────────────
 
-    def _eff_solid_blue_2s(self):
-        """Blue solid for 2 seconds, then off."""
-        self._client.LedControl(0, 100, 255)
-        if self._effect_stop.wait(2.0): return
-        self._client.LedControl(0, 0, 0)
+    def _state_idle(self):
+        """No-op: let firmware blue blink do its thing."""
+        pass
 
-    def _eff_breathe_rainbow(self):
-        """Breathing rainbow cycle (cyan→magenta→blue→purple) until stopped."""
+    def _state_hearing(self):
+        """Green solid — 30ms refresh to override firmware."""
+        while not self._effect_stop.is_set():
+            self._led_set(0, 255, 80)
+            if self._effect_stop.wait(0.03): return
+
+    def _state_thinking(self):
+        """Breathing rainbow cycle until overridden."""
         import math
-        # OpenAI-style color palette: cyan, blue, purple, magenta
         palette = [
             (0, 200, 255),    # cyan
             (80, 40, 255),    # blue-purple
@@ -813,32 +862,32 @@ class LedPlugin:
         ]
         step = 0
         while not self._effect_stop.is_set():
-            # Smooth interpolation between palette colors
-            t = (step % 200) / 200.0  # 0→1 over 200 steps
+            t = (step % 200) / 200.0
             idx = int(t * len(palette)) % len(palette)
             next_idx = (idx + 1) % len(palette)
             frac = (t * len(palette)) - idx
             r = int(palette[idx][0] * (1 - frac) + palette[next_idx][0] * frac)
             g = int(palette[idx][1] * (1 - frac) + palette[next_idx][1] * frac)
             b = int(palette[idx][2] * (1 - frac) + palette[next_idx][2] * frac)
-            # Breathing: sinusoidal brightness modulation
             brightness = 0.3 + 0.7 * (0.5 + 0.5 * math.sin(step * 0.06))
-            self._client.LedControl(int(r * brightness), int(g * brightness), int(b * brightness))
+            self._led_set(int(r * brightness), int(g * brightness), int(b * brightness))
             step += 1
             if self._effect_stop.wait(0.03): return
-        self._client.LedControl(0, 0, 0)
 
-    def _eff_blink_red_5s(self):
-        """Red blink for 5 seconds (250ms on / 250ms off)."""
-        import time
-        end = time.monotonic() + 5.0
-        while time.monotonic() < end:
+    def _state_speaking(self):
+        """Tiffany blue solid — 30ms refresh to override firmware."""
+        while not self._effect_stop.is_set():
+            self._led_set(129, 216, 208)
+            if self._effect_stop.wait(0.03): return
+
+    def _state_error(self):
+        """Red solid — 30ms refresh to override firmware."""
+        import time as _time
+        end = _time.monotonic() + 5.0
+        while _time.monotonic() < end:
             if self._effect_stop.is_set(): return
-            self._client.LedControl(255, 0, 0)
-            if self._effect_stop.wait(0.25): return
-            self._client.LedControl(0, 0, 0)
-            if self._effect_stop.wait(0.25): return
-        self._client.LedControl(0, 0, 0)
+            self._led_set(255, 0, 0)
+            if self._effect_stop.wait(0.03): return
 
 
 # ── LocoStatePlugin (sensor) ─────────────────────────────────────────────────
