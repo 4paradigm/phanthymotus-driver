@@ -16,8 +16,8 @@
   "max_altitude_m": 7000,
   "max_flight_time_min": 55,
   "max_wind_resistance_ms": 15,
-  "psdk_interface": "Direct M300 PSDK USB CDC",
-  "psdk_uart0": "/dev/ttyACM0",
+  "psdk_interface": "M300 OSDK Type-C bridge (UART + USB Bulk)",
+  "psdk_uart0": "/dev/ttyUSB0",
   "psdk_uart1": "/dev/ttyACM0",
   "waypoint_version": "V2 (not exposed until a V2 mission builder is implemented)",
   "perception_directions": ["front", "back", "left", "right", "up", "down"]

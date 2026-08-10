@@ -8,8 +8,7 @@
  * HAL UART — Linux termios implementation for DJI PSDK.
  *
  * Provides serial communication with Matrice 300 RTK via the PSDK UART.
- * The direct M300 PSDK connection is DJI USB CDC at /dev/ttyACM0; an
- * E-Port development-kit installation may explicitly use an FTDI ttyUSB node.
+ * The deployed Nano link is an FTDI adapter at /dev/ttyUSB0.
  */
 
 typedef struct {

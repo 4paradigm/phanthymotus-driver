@@ -12,15 +12,6 @@ ARG PYPI_MIRROR=https://pypi.org/simple/
 FROM ${PSDK_BASE_IMAGE}
 ARG PYPI_MIRROR
 
-# M300 is pinned to PSDK 3.11.0.  The minimal vendor package contains only
-# psdk_lib headers and prebuilt libraries (no samples or media), so a new
-# machine can build this image without a pre-existing PSDK helper image.
-COPY third_party/psdk_lib-3.11.0.tar.gz /tmp/
-RUN echo "4972b8833069cadb26103a54212f8b4dfc44125882dca3151eca77ed14deb880  /tmp/psdk_lib-3.11.0.tar.gz" | sha256sum -c - && \
-    rm -rf /opt/Payload-SDK && mkdir -p /opt/Payload-SDK && \
-    tar -xzf /tmp/psdk_lib-3.11.0.tar.gz -C /opt/Payload-SDK && \
-    rm -f /tmp/psdk_lib-3.11.0.tar.gz
-
 WORKDIR /work
 
 # ── Python dependencies ─────────────────────────────────────────────
@@ -37,9 +28,10 @@ RUN mkdir -p /work/psdk_bridge/build && \
     cd /work/psdk_bridge/build && \
     cmake .. -DCMAKE_BUILD_TYPE=Release \
              -DPSDK_DIR=/opt/Payload-SDK \
-             -DCMAKE_C_FLAGS="-DPSDK_ENABLED -DPSDK_ARCH_SYS_LINUX=1 -DCONFIG_HARDWARE_CONNECTION=DJI_USE_ONLY_UART" && \
+             -DCMAKE_C_FLAGS="-DPSDK_ENABLED -DPSDK_ARCH_SYS_LINUX=1 -DCONFIG_HARDWARE_CONNECTION=DJI_USE_UART_AND_USB_BULK_DEVICE" && \
     make -j$(nproc) && \
-    cp psdk_bridge /usr/local/bin/psdk_bridge
+    cp psdk_bridge /usr/local/bin/psdk_bridge && \
+    cp startup_bulk /usr/local/bin/startup_bulk
 
 # ── Application code (changes frequently) ──────────────────────────
 COPY main.py         /work/main.py
