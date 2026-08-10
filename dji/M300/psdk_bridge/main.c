@@ -55,6 +55,7 @@ static void _signal_handler(int sig) {
 #include "dji_logger.h"
 #include "dji_payload_camera.h"
 #include "dji_aircraft_info.h"
+#include "hal_usb_bulk.h"
 #include <pthread.h>
 #include <semaphore.h>
 #include <termios.h>
