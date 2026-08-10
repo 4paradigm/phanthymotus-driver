@@ -1,0 +1,6 @@
+string session_name
+int8 action
+---
+bool is_ok
+string rosbag_path
+string error_msg

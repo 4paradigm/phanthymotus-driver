@@ -1,0 +1,9 @@
+id: q5-driver
+name: XBot Q5 Bundle
+category: driver
+hardware_provider: xbot
+hardware_model: "q5"
+image_name: q5
+port: 15708
+mcp_url: "http://localhost:15708/mcp"
+description: "XBot Q5 — 轮式人形机器人，底盘+双臂+灵巧手+头部+导航"

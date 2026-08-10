@@ -1,0 +1,81 @@
+# Request part of the service definition
+# 请求部分
+int64 request_id                         # 请求ID
+
+# 操作类型（字符串枚举）
+# 说明：
+#   "LoadMap"          : 加载地图
+#   "SaveMap"          : 保存地图
+#   "ClearMap"         : 清空地图
+#   "ReadMap"          : 读取地图
+#   "StartRecordingPath": 开始录制路径
+#   "MarkUserNodeOnNewPath"   : 在正在录制的路径上标记用户节点
+#   "FinishRecordingPath": 完成路径录制
+#   "CancelRecordingPath": 取消路径录制
+#   "RecordUserNode": 录制用户节点
+#   "RecordForbiddenArea": 录制禁行区域
+#   "OverrideMap"      : 替换整个地图
+#   "UpdateMapElements": 更新地图元素
+#   "RemoveMapElements": 删除地图元素
+#   "Reserved"         : 保留操作
+string op_type                             # 操作类型
+
+# --- kLoadMap, kReadMap 和 kSaveMap
+string map_name                            # 地图名
+bool force_reload                          # 是否强制重新加载地图
+
+# --- For kFinishRecordingPath and kRecordUserNode
+float64 auto_connection_radius             # FinishRecordingPath 或 RecordUserNode 时，
+                                           # 可以根据需要将新增节点按距离自动连接至原地图中的
+                                           # 已有节点和其他新节点。此参数限定了自动连接的半径范围。
+                                           # 特殊值： 0 表示不自动连接。
+
+# --- For kMarkUserNodeOnNewPath and kRecordUserNode.
+bool record_orientation                    # 是否记录节点的朝向
+
+# --- For kRecordForbiddenArea. Only support recording rectangular areas.
+# 用于录制禁行区域 （仅支持矩形区域）
+float64 area_front_distance                  # 禁行区域距离机器人（基坐标系）前方的距离
+float64 area_length                          # 禁行区域的长度（或深度）
+float64 area_width                           # 禁行区域的宽度
+float64 area_min_h                           # [min_h, max_h] 定义了禁行区域的高度范围（相对于机器人基坐标系）。2D 导航中会忽略此值。
+float64 area_max_h
+
+#--- Business attributes when adding node, edge, or forbidden area.
+# 添加节点、边或禁行区域时的业务属性
+# 使用两个数组表示 map<string, string>
+string[] business_attr_keys
+string[] business_attr_values
+
+# --- Map elements used for map editing (kOverrideMap, kUpdateMapElements, kRemoveMapElements)
+# 地图编辑（kOverrideMap, kUpdateMapElements, kRemoveMapElements）时的地图元素
+era_nav_msgs/TopoNode[] nodes  # 节点列表。删除元素时仅需提供节点ID
+era_nav_msgs/TopoEdge[] edges  # 边列表。删除元素时仅需提供边的 from_node 和 to_node
+era_nav_msgs/ForbiddenArea[] forbidden_areas  # 禁行区域列表。删除元素时仅需提供禁行区域的ID
+
+
+---
+
+# Response part of the service definition
+# 反馈部分
+int64 request_id                         # 回传请求ID
+int64 code                               # 结束状态码，0 或正数 表示成功，负数表示失败
+string message                           # 详细说明
+era_nav_msgs/NavMap map                         # 本操作执行完成后的最新地图数据
+int64[] nodes_on_new_path    # 当我们正在录制路径时，这个字段会记录新路径上的节点。注意如果录制被取消，这些节点将被丢弃。
+
+string user_map_name         # 用户最近加载成功的地图名称，或 ReadMap 请求的地图名称
+
+# 成功码列表
+#   0: 成功
+#  10: 跳过加载重复的地图（LoadMap时）
+
+# 失败码列表
+#   -1: 不支持的操作
+#   -2: 非法的请求（当前状态下不允许的操作）
+#   -3: 无效的请求（请求参数不合法、请求参数不完整等）
+#   -4: 地图尚不可用（保存、读取地图时）
+#   -10: 地图未找到（加载地图时）
+#   -11: 加载地图失败
+#   -20: 保存地图失败
+#   -30: 录制地图元素时，定位尚不可用

@@ -1,0 +1,10 @@
+string session_name
+bool use_real_time
+string[] topics
+bool is_snapshot
+int32 snapshot_size_mb
+string format
+string bag_path
+---
+bool is_ok
+string error_msg

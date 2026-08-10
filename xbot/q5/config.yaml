@@ -1,0 +1,67 @@
+mcp_port: 15708
+ros_namespace: ""   # 留空则自动使用 hostname
+name: "XBot-Q5"
+
+plugins:
+  state:
+    enabled: true
+  loco:
+    enabled: true
+  joint_servo:
+    enabled: true
+  hand:
+    enabled: true
+  hand_state:
+    enabled: true
+  imu:
+    enabled: true
+  head:
+    enabled: true
+  arm:
+    enabled: true
+  arm_gesture:
+    enabled: true
+  head_gesture:
+    enabled: true
+  motion:
+    enabled: true
+  gesture:
+    enabled: true
+  audio:
+    enabled: true
+    device: "plughw:2,0"
+  speaker:
+    enabled: true
+    volume: 50
+    model_dir: "/models/sherpa-onnx/tts"
+    speaker_id: 0
+    speed: 1.0
+    # device: "plughw:2,0"  # ALSA device name (optional, leave empty for default)
+  led:
+    enabled: true
+  battery:
+    enabled: true
+  faults:
+    enabled: true
+  camera:
+    enabled: false
+  nav:
+    enabled: true
+  teleop:
+    enabled: true
+  odom:
+    enabled: true
+  simple_actions:
+    enabled: true
+  simple_trajectory:
+    enabled: true
+    action_server: "/simple_trajectory"
+  behavior:
+    enabled: false  # action server 不存在于真机
+    action_server: "/behavior_action"
+  grasp:
+    enabled: false  # action server 不存在于真机
+    action_server: "/grasp_object_action"
+  motion_action:
+    enabled: false  # action server 不存在于真机
+    action_server: "/motion_action"

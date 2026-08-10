@@ -1,0 +1,7 @@
+float32 resolution
+string map_name
+string data_abs_path
+---
+bool success
+string map_abs_path
+string data_abs_path

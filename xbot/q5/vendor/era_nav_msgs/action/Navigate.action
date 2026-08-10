@@ -1,0 +1,85 @@
+# Goal
+
+# 导航类型（字符串枚举）
+# 说明：
+#   "CancelNav"       : 强制取消正在执行的导航任务
+#   "NavToGlobalNode" : 导航到全局拓扑图中的某个节点
+#   "NavToGlobalPose" : 导航到全局坐标系中的目标位姿
+#   "NavToLocalPose"  : 导航到局部坐标系中的目标位姿
+#   "DockToStation"   : 对接到指定的对接站（如充电桩）
+#   "FollowObject"    : 跟随指定对象
+#   "TempBz1" ... "TempBz5"          : 临时业务任务 1 到 5（用于临时演示任务中的特殊逻辑）
+string nav_type
+
+int64 request_id                         # 请求ID。取消导航 (CancelNav) 时固定为 -1，其他情况是正整数；
+
+# --- kNavToGlobalNode
+int64 goal_node_id                       # 目标节点ID，仅用于 NavToGlobalNode。
+                                         # 为负时，根据 goal_attr 和 goal_attr_value 查找目标节点
+string goal_attr
+string goal_attr_value
+
+# --- kNavToGlobalPose / kNavToLocalPose
+bool goal_ready                          # 目标位姿是否已可用
+geometry_msgs/Pose goal                  # 目标位姿
+geometry_msgs/Point[] ref_path           # 参考路径。为空时由规划器决定。
+string frame                             # 所给目标位姿和路径的参考坐标系。为空时，NavToLocalPose 默认为 "nav_odom", NavToGlobalPose 默认为 "nav_map".
+
+# --- kDockToStation
+string station_type                      # 对接站类型（如充电桩、电梯、闸机、货架等）
+int64 station_id                         # 对接站ID（按需）
+
+# --- kFollowObject
+string object_type                       # 跟随对象类型（如人）
+int64 object_id                          # 跟随对象ID （按需）
+
+# --- Advanced parameters
+float64 max_detour_radius                # 最大绕路半径（m）；<0 时由规划器决定
+float64 parking_position_tolerance       # 车位/泊车位置容差（m）；<0 时由规划器决定
+float64 parking_angle_tolerance          # 车位/泊车角度容差（rad）；<0 时由规划器决定
+float64 max_speed                        # 最大线速度（m/s）；<0 时由规划器决定
+float64 max_acceleration                 # 最大线加速度（m/s^2）；<0 时由规划器决定
+float64 max_angular_speed                # 最大角速度（rad/s）；<0 时由规划器决定
+float64 max_angular_acceleration         # 最大角加速度（rad/s^2）；<0 时由规划器决定
+float64 max_centrifugal                  # 最大离心加速度（m/s^2）；<0 时由规划器决定
+
+# --- Temporary business
+string temp_params                       # 预留业务参数
+
+---
+# Result
+int64 request_id                         # 回传请求ID
+int64 code                               # 结束状态码：0 成功；负数代表失败，失败码列表见下方注释
+string message                           # 详细说明
+
+# 失败码列表
+#   -1: 前一个请求未完成
+#   -2: 不支持的请求 (op_type 不合法)
+#   -3: 启动失败： 无导航地图、或目标站点不存在、或试图启动导航时无定位等，具体原因见 message
+#   -4: 预留
+#   -5: 预留
+#   -6: 预留
+#   -7: 预留
+#   -8: 目标站点不可达（无全局路径）
+
+# 其他结束码(非失败)：
+#   0: 任务成功 （如导航到达、或 CancelNav 命令被响应）
+#   1: 任务被取消
+
+
+---
+# Feedback
+int64 request_id                         # 回传请求ID
+int64 code                               # 阶段性状态码，具体见下；
+string message                           # 阶段性说明
+
+# 阶段性状态码列表
+#   10: 新设置的导航目标被接受 （除 NavToGlobalNode 外，其他模式允许在导航过程中重新设置目标）
+#   11: 新设置的导航目标被拒绝
+#          默认处理逻辑为：
+#              如果本次导航任务中已提供过导航目标，此时将继续使用已有目标；
+#              否则，如果本次导航任务开始后尚未收到过有效目标，则继续等待重新输入目标；
+#          如果这不是调用者希望的逻辑，调用者可取消本次导航任务。
+#   12: 参考路径已准备就绪
+#   13: 导航任务已启动
+#   100: 导航事件，一般是机器人被障碍物阻挡

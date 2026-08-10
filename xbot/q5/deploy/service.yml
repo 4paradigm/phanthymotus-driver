@@ -1,0 +1,21 @@
+xbot-q5:
+  image: __IMAGE__
+  container_name: embodied-xbot-q5
+  network_mode: host
+  ipc: host
+  pid: host
+  privileged: true
+  volumes:
+    - /dev:/dev
+    - /opt/phanthy-motus/data:/opt/phanthy-motus/data
+    - /opt/phanthy-motus/models/sherpa-onnx/tts:/models/sherpa-onnx/tts:ro
+  environment:
+    - ROS_DOMAIN_ID=211
+    - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+    - PYTHONUNBUFFERED=1
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: unless-stopped
