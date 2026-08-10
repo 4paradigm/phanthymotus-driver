@@ -44,6 +44,7 @@ endif()
 # ── Sources ──────────────────────────────────────────────────────────────
 set(SOURCES
     main.c
+    hal_usb_bulk.c
     ipc.c
     osal_posix.c
     telemetry.c

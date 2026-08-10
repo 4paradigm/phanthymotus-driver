@@ -53,6 +53,8 @@ COPY config.yaml     /work/config.yaml
 COPY resource/       /work/resource/
 COPY deploy/         /deploy/
 
+RUN chmod 755 /deploy/entrypoint.sh
+
 # ── udev rules for E-Port device auto-permission ───────────────────
 COPY deploy/99-eport.rules /etc/udev/rules.d/99-eport.rules
 
@@ -65,4 +67,4 @@ RUN rm -f /root/.cache/gstreamer-1.0/registry.aarch64.bin && \
 
 EXPOSE 15702
 
-CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && python3 /work/main.py"]
+CMD ["/deploy/entrypoint.sh"]
