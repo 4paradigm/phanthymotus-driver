@@ -421,6 +421,37 @@ class TianyiDeviceBundle:
         return tools
 
     def dispatch(self, tool_name: str, args: dict) -> dict | None:
+        # Agent Core normally converts an x-action-params function such as
+        # ``head_gesture__nod`` back to ``head_gesture`` plus
+        # ``action=nod``.  During a dynamic MCP registry refresh the split
+        # map can briefly be unavailable, causing the split name to be sent
+        # to the driver unchanged.  Accept that wire form as a compatibility
+        # fallback so the first call does not become an Unknown tool error.
+        if "__" in tool_name:
+            base_name, split_action = tool_name.rsplit("__", 1)
+            for p in self._plugins:
+                plugin_tools = (
+                    p.get_tools() if hasattr(p, "get_tools") else [p.get_tool()]
+                )
+                for tool_def in plugin_tools:
+                    action_params = (
+                        tool_def.get("inputSchema", {}).get("x-action-params", {})
+                    )
+                    if (tool_def.get("name") == base_name
+                            and split_action in action_params):
+                        tool_name = base_name
+                        args = {**args, "action": split_action}
+                        print(
+                            "[bundle] normalized split tool alias "
+                            f"{base_name}__{split_action} -> "
+                            f"{base_name}(action={split_action})",
+                            flush=True,
+                        )
+                        break
+                else:
+                    continue
+                break
+
         for p in self._plugins:
             plugin_tools = p.get_tools() if hasattr(p, 'get_tools') else [p.get_tool()]
             for tool_def in plugin_tools:
@@ -460,7 +491,7 @@ def make_handler():
             self.wfile.write(encoded)
 
         def do_GET(self):
-            if self.path.split("?")[0] == "/sse":
+            if self.path.split("?")[0] in ("/sse", "/mcp/sse"):
                 # SSE streaming endpoint for ACP completion events
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
@@ -521,6 +552,7 @@ def make_handler():
                 self._send(200, json.dumps({"jsonrpc": "2.0", "id": rid, "result": result}))
 
             def err(code, msg):
+                print(f"[mcp] JSON-RPC error {code}: {msg}", flush=True)
                 self._send(200, json.dumps({"jsonrpc": "2.0", "id": rid,
                                              "error": {"code": code, "message": msg}}))
 
