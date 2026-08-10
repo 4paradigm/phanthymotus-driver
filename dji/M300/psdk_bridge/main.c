@@ -969,9 +969,9 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
         T_DjiAircraftInfoBaseInfo baseInfo = {0};
         T_DjiAircraftVersion version = {0};
         bool connected = false;
-        DjiAircraftInfo_GetBaseInfo(&baseInfo);
-        DjiAircraftInfo_GetAircraftVersion(&version);
-        DjiAircraftInfo_GetConnectionStatus(&connected);
+        T_DjiReturnCode base_rc = DjiAircraftInfo_GetBaseInfo(&baseInfo);
+        T_DjiReturnCode version_rc = DjiAircraftInfo_GetAircraftVersion(&version);
+        T_DjiReturnCode connected_rc = DjiAircraftInfo_GetConnectionStatus(&connected);
 
         const char *type_name = "Unknown";
         switch (baseInfo.aircraftType) {
@@ -1014,14 +1014,32 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
             default: break;
         }
 
-        snprintf(result, result_size,
-            "{\"ok\":true,\"data\":{\"aircraft_type\":\"%s\","
-            "\"aircraft_series\":\"%s\","
-            "\"firmware_version\":\"%d.%d.%d.%d\","
-            "\"mount_position\":\"%s\",\"connected\":%s}}",
-            type_name, series_name,
-            version.majorVersion, version.minorVersion, version.modifyVersion, version.debugVersion,
-            mount_name, connected ? "true" : "false");
+        if (version_rc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+            snprintf(result, result_size,
+                "{\"ok\":true,\"data\":{\"aircraft_type\":\"%s\","
+                "\"aircraft_series\":\"%s\","
+                "\"firmware_version\":\"%d.%d.%d.%d\","
+                "\"mount_position\":\"%s\",\"connected\":%s,"
+                "\"base_info_ret\":%llu,\"version_ret\":%llu,\"connection_ret\":%llu}}",
+                type_name, series_name,
+                version.majorVersion, version.minorVersion, version.modifyVersion, version.debugVersion,
+                mount_name, connected ? "true" : "false",
+                (unsigned long long)base_rc,
+                (unsigned long long)version_rc,
+                (unsigned long long)connected_rc);
+        } else {
+            snprintf(result, result_size,
+                "{\"ok\":true,\"data\":{\"aircraft_type\":\"%s\","
+                "\"aircraft_series\":\"%s\","
+                "\"firmware_version\":\"unknown\","
+                "\"mount_position\":\"%s\",\"connected\":%s,"
+                "\"base_info_ret\":%llu,\"version_ret\":%llu,\"connection_ret\":%llu}}",
+                type_name, series_name,
+                mount_name, connected ? "true" : "false",
+                (unsigned long long)base_rc,
+                (unsigned long long)version_rc,
+                (unsigned long long)connected_rc);
+        }
         return 0;
     }
 
