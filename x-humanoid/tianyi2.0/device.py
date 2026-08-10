@@ -5247,12 +5247,12 @@ class RobotFaultsPlugin:
                 self_check_lines.append("自检中")
                 issues.append("自检进行中")
             else:
-                self_check_lines.append("运行中")
+                self_check_lines.append("自检完成, 正常运行")
         elif ns is not None and ns.state == 0:
             self_check_lines.append("未启动")
             issues.append("body_control 未启动, 请按遥控器 A 键触发自检")
         elif self_check_available:
-            self_check_lines.append("运行中")
+            self_check_lines.append("自检完成, 正常运行")
         else:
             self_check_lines.append("未知")
 
