@@ -1,9 +1,6 @@
 dji-m300:
   image: __IMAGE__
-  # Runtime privileges and device mounts belong in this deployment manifest,
-  # not Dockerfile. Every service deployment therefore exposes both M300
-  # serial links (/dev/ttyUSB0 and /dev/ttyACM0) to the container.
-  container_name: dji-m300
+  container_name: embodied-dji-m300
   network_mode: host
   ipc: host
   privileged: true
@@ -15,9 +12,6 @@ dji-m300:
     - /dev/usb-ffs:/dev/usb-ffs
     - /usr/lib/aarch64-linux-gnu/tegra:/usr/lib/aarch64-linux-gnu/tegra:ro
   environment:
-    # Explicit IPv4 avoids an IPv6 ::1 connection attempt on Nano, where IPv6
-    # is normally disabled in the driver namespace.
-    - AGENT_CORE_URL=https://127.0.0.1:15678
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - PYTHONUNBUFFERED=1

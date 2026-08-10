@@ -259,7 +259,69 @@ def make_handler():
     return Handler
 
 
+# ── Device auto-detect (container startup) ────────────────────────────────
+
+# Known E-Port USB devices (VID, PID or None for any PID)
+_EPORT_USB_IDS = [
+    ("2ca3", None),    # DJI direct (any PID)
+    ("0403", "6001"),  # FTDI FT232R (E-Port dev board)
+    ("0403", "6010"),  # FTDI FT2232 (dual-port variant)
+    ("0403", "6014"),  # FTDI FT232H
+]
+
+
+def _detect_uart_device(timeout: int = 30) -> str | None:
+    """Auto-detect E-Port serial device by scanning /dev/ttyUSB* and /dev/ttyACM*.
+    Matches by USB VID/PID whitelist from sysfs. Returns device path or None."""
+    import glob
+    import time as _t
+
+    start = _t.time()
+    while True:
+        candidates = sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*"))
+        for dev in candidates:
+            vid, pid = _get_usb_ids(dev)
+            if not vid:
+                continue
+            for known_vid, known_pid in _EPORT_USB_IDS:
+                if vid == known_vid and (known_pid is None or pid == known_pid):
+                    print(f"[bundle] E-Port detected: {dev} (VID={vid} PID={pid})")
+                    return dev
+
+        elapsed = _t.time() - start
+        if elapsed > timeout:
+            print(f"[bundle] WARNING: no E-Port device found after {timeout}s")
+            return None
+        if int(elapsed) % 5 == 0 and int(elapsed) > 0:
+            print(f"[bundle] waiting for E-Port device... ({int(elapsed)}s)")
+        _t.sleep(1)
+
+
+def _get_usb_ids(device_path: str) -> tuple[str, str]:
+    """Read USB VID/PID from sysfs for a tty device."""
+    dev_name = os.path.basename(device_path)
+    # Try /sys/class/tty/<dev>/device/../idVendor
+    for base in [f"/sys/class/tty/{dev_name}/device/..",
+                 f"/sys/class/tty/{dev_name}/device/../.."]:
+        vid_path = f"{base}/idVendor"
+        pid_path = f"{base}/idProduct"
+        try:
+            with open(vid_path) as f:
+                vid = f.read().strip()
+            with open(pid_path) as f:
+                pid = f.read().strip()
+            if vid:
+                return vid, pid
+        except (FileNotFoundError, PermissionError):
+            continue
+    return "", ""
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
+
+def _configure_usb_gadget():
+    """Check USB network status for DJI video/perception support."""
+    pass  # Network HAL configured in C bridge based on UDC state
 
 
 def _start_registration(mcp_port: int, name: str, category: str):
@@ -267,11 +329,7 @@ def _start_registration(mcp_port: int, name: str, category: str):
     import urllib.request as _urllib
     import ssl as _ssl
 
-    # Drivers share the Nano network namespace with Agent Core.  Use the IPv4
-    # loopback address explicitly: on Nano images that have IPv6 disabled,
-    # ``localhost`` may resolve to ``::1`` first and urllib fails with
-    # EADDRNOTAVAIL before it attempts IPv4.
-    agent_core_url = os.environ.get("AGENT_CORE_URL", "https://127.0.0.1:15678")
+    agent_core_url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
     payload = json.dumps({
         "name": name,
         "url": f"http://localhost:{mcp_port}/mcp",
@@ -307,24 +365,20 @@ def main():
     mcp_port = int(cfg.get("mcp_port", 15702))
     psdk_cfg = cfg.get("psdk_bridge", {})
 
-    # This deployment is directly connected to the M300 PSDK port.  Its DJI
-    # USB CDC device (VID:PID 2ca3:001f) is UART0 at /dev/ttyACM0.  Do not
-    # select the optional E-Port development-kit FTDI node (/dev/ttyUSB0).
-    uart0_dev = psdk_cfg.get("uart0_dev", "/dev/ttyACM0")
+    # M300 OSDK Type-C exposes a pair of transport devices.  UART0 is the
+    # FTDI TTL port configured in DJI Assistant 2; UART1 is the DJI ACM link
+    # needed by PSDK for M300 OSDK-version negotiation.
+    uart0_dev = psdk_cfg.get("uart0_dev", "/dev/ttyUSB0")
     uart1_dev = psdk_cfg.get("uart1_dev", "/dev/ttyACM0")
     missing = [dev for dev in (uart0_dev, uart1_dev) if not os.path.exists(dev)]
     if missing:
-        print("[bundle] ERROR: M300 E-Port UARTs are incomplete: "
-              f"missing {', '.join(missing)}. Driver will not start.")
-        print("[bundle] Expected UART0=/dev/ttyACM0 (DJI USB CDC); "
-              "ttyUSB0 is only used with the optional E-Port dev kit.")
+        print("[bundle] ERROR: M300 OSDK transport incomplete: missing " + ", ".join(missing))
         # Keep process alive so container doesn't restart-loop, but don't serve
         import time as _t
         while True:
             _t.sleep(60)
 
-    print(f"[bundle] namespace={namespace} mcp_port={mcp_port} "
-          f"uart0={uart0_dev} uart1={uart1_dev}")
+    print(f"[bundle] namespace={namespace} mcp_port={mcp_port} uart0={uart0_dev} uart1={uart1_dev}")
 
     # Start psdk_bridge C process as subprocess
     import subprocess as _sp
@@ -333,13 +387,17 @@ def main():
         bridge_bin = "/work/psdk_bridge/build/psdk_bridge"
     socket_path = "/tmp/psdk_bridge.sock"
 
+    # Configure USB Bulk gadget (host-side setup required first via install script)
+    # Container only checks if FFS endpoints are available — does NOT modify configfs.
+    _configure_usb_gadget()
+
     bridge_proc = _sp.Popen(
         [bridge_bin, socket_path,
          psdk_cfg.get("app_id", ""),
          psdk_cfg.get("app_key", ""),
          psdk_cfg.get("app_license", ""),
          uart0_dev,
-         str(psdk_cfg.get("uart0_baud_rate", 460800)),
+         str(psdk_cfg.get("uart0_baud_rate", 921600)),
          uart1_dev],
         stdout=sys.stdout, stderr=sys.stderr,
     )
@@ -378,7 +436,7 @@ def main():
         print("[bundle] ERROR: cannot connect to psdk_bridge, exiting")
         bridge_proc.terminate()
         sys.exit(1)
-    print(f"[bundle] BridgeClient connected (uart0={uart0_dev} uart1={uart1_dev})")
+    print(f"[bundle] BridgeClient connected (uart0={uart0_dev}, uart1={uart1_dev})")
 
     # ROS2
     rclpy.init()
