@@ -22,7 +22,6 @@
 
 #include "ipc.h"
 #include "hal_network.h"
-#include "hal_usb_bulk.h"
 #include "osal_posix.h"
 #include "telemetry.h"
 #include "flight_ctrl.h"
@@ -488,12 +487,6 @@ static int _psdk_core_init(const char *app_id, const char *app_key,
     rc = DjiPlatform_RegOsalHandler(&osalHandler);
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
         printf("[psdk] OSAL registration failed: 0x%08llX\n", (unsigned long long)rc);
-        return -1;
-    }
-
-    rc = DjiPlatform_RegHalUsbBulkHandler(&g_usbBulkHandler);
-    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-        printf("[psdk] USB Bulk HAL registration failed: 0x%08llX\n", (unsigned long long)rc);
         return -1;
     }
 
@@ -1107,7 +1100,7 @@ int main(int argc, char *argv[]) {
     const char *app_key = "";
     const char *app_license = "";
     const char *app_name = "PhanthyMotus";
-    const char *uart_dev = "/dev/ttyUSB0";
+    const char *uart_dev = "/dev/ttyACM0";
     uint32_t baud_rate = 921600;
     const char *uart1_dev = "/dev/ttyACM0";
 
