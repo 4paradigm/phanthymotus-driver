@@ -1,5 +1,5 @@
 mcp_port: 15701
-ros_namespace: ""   # 留空则自动使用 hostname
+ros_namespace: ""
 
 plugins:
   mic:
@@ -12,8 +12,9 @@ plugins:
     enabled: true
   loco:
     enabled: true
+  # ArmActionPlugin and teleoperation are exclusive arm authorities.
   arm:
-    enabled: true
+    enabled: false
   state:
     enabled: true
   camera:
@@ -54,8 +55,7 @@ safety_harness:
   motor_temp_stop: 85
 
 teleop:
-  # Teleoperation is opt-in so existing G1 deployments retain ArmActionPlugin.
-  enabled: false
+  enabled: true
   mode: shadow
   profile_id: unitree_g1_23_dual_arm_controller_v1
   mode_machine: 4
@@ -67,8 +67,6 @@ teleop:
   dispatch_io_timeout_ms: 150
   dispatch_ack_timeout_ms: 200
   live:
-    # Set mode=live and this flag=true only after the image cold-IK smoke passes
-    # on the target G1 computer and the robot is in mode_machine=4.
     enabled: false
     control_hz: 250
     ramp_seconds: 2.0

@@ -10,7 +10,7 @@ Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server t
 
 | Driver | Hardware | Port | Description |
 |--------|----------|------|-------------|
-| `unitree/g1` | Unitree G1 Humanoid | 15701 | Locomotion, arm control, mic, speaker, LED, state monitoring |
+| [`unitree/g1`](unitree/g1/TELEOP.md) | Unitree G1 Humanoid | 15701 | Locomotion, arm control, mic, speaker, LED, state monitoring, and opt-in single-Driver Quest G1_23 dual-arm Shadow/Live teleoperation |
 | `engineai/t800` | EngineAI T800 Development Edition | 15708 | ROS2/Native SDK, full state, dance/gesture sequences, virtual gamepad, locomotion and low-level joint control |
 | `phanthy/remote_control` | Remote Control Bridge | 15710 | Remote control relay |
 

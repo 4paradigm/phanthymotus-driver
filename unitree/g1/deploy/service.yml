@@ -8,11 +8,19 @@ unitree-g1:
   volumes:
     - /dev:/dev
     - /opt/phanthy-motus/data:/opt/phanthy-motus/data
+    - /opt/phanthy-motus/data/certs:/etc/motus-core-certs:ro
   environment:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
     - PYTHONUNBUFFERED=1
+    - AGENT_CORE_URL=https://localhost:15678
+    - MOTUS_DRIVER_ID=${MOTUS_DRIVER_ID:-unitree-g1}
+    - MOTUS_ROBOT_ID=${MOTUS_ROBOT_ID:-unitree-g1}
+    # Legacy deployments keep working while teleop is disabled; the teleop
+    # factory rejects an empty token as soon as teleop.enabled=true.
+    - MOTUS_DRIVER_TOKEN=${MOTUS_DRIVER_TOKEN:-}
+    - MOTUS_TELEOP_TICKET_SECRET=${MOTUS_TELEOP_TICKET_SECRET:-}
   logging:
     driver: local
     options:

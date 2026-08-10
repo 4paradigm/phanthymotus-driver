@@ -1,6 +1,9 @@
 netifaces>=0.11.0
 pyyaml>=6.0
 opencv-python-headless>=4.8
-numpy>=1.24
+numpy==1.26.4
 pyrealsense2>=2.54
 sounddevice>=0.4.6
+aiohttp>=3.13,<3.15
+aiortc>=1.14,<1.16
+cryptography>=44,<47
