@@ -421,12 +421,13 @@ class TianyiDeviceBundle:
         return tools
 
     def dispatch(self, tool_name: str, args: dict) -> dict | None:
-        # Agent Core normally converts an x-action-params function such as
+        # Agent Core normally converts a cached split function such as
         # ``head_gesture__nod`` back to ``head_gesture`` plus
         # ``action=nod``.  During a dynamic MCP registry refresh the split
         # map can briefly be unavailable, causing the split name to be sent
-        # to the driver unchanged.  Accept that wire form as a compatibility
-        # fallback so the first call does not become an Unknown tool error.
+        # to the driver unchanged.  Accept actions declared either through
+        # x-action-params or the base action enum so old cached aliases remain
+        # usable after a tool switches back to an explicit action argument.
         if "__" in tool_name:
             base_name, split_action = tool_name.rsplit("__", 1)
             for p in self._plugins:
@@ -437,8 +438,15 @@ class TianyiDeviceBundle:
                     action_params = (
                         tool_def.get("inputSchema", {}).get("x-action-params", {})
                     )
+                    action_enum = (
+                        tool_def.get("inputSchema", {})
+                        .get("properties", {})
+                        .get("action", {})
+                        .get("enum", [])
+                    )
                     if (tool_def.get("name") == base_name
-                            and split_action in action_params):
+                            and (split_action in action_params
+                                 or split_action in action_enum)):
                         tool_name = base_name
                         args = {**args, "action": split_action}
                         print(
@@ -568,7 +576,28 @@ def make_handler():
                 elif method == "tools/call":
                     name   = params.get("name", "")
                     args   = params.get("arguments") or {}
+                    if name == "head_gesture" or name.startswith("head_gesture__"):
+                        print(
+                            f"[mcp/head_gesture] request name={name} "
+                            f"action={args.get('action')}",
+                            flush=True,
+                        )
                     result = _bundle.dispatch(name, args)
+                    if name == "head_gesture" or name.startswith("head_gesture__"):
+                        if isinstance(result, dict):
+                            print(
+                                "[mcp/head_gesture] result "
+                                f"state={result.get('state')} "
+                                f"gesture={result.get('gesture')} "
+                                f"code={result.get('code')} "
+                                f"error={result.get('error')}",
+                                flush=True,
+                            )
+                        else:
+                            print(
+                                f"[mcp/head_gesture] result={result!r}",
+                                flush=True,
+                            )
                     if result is None:
                         err(-32601, f"Unknown tool: {name}")
                     else:
