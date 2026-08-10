@@ -146,12 +146,17 @@ class _CameraStreamNode(Node):
 
     def start(self):
         if self.state == "running":
-            return
-        self._bridge.start_liveview(camera=self._camera)
+            return {"ok": True}
+        response = self._bridge.start_liveview(camera=self._camera)
+        if not response.get("ok"):
+            self.get_logger().error(
+                f"Camera stream start failed ({self._camera}): {response.get('error', response.get('data', {}))}")
+            return response
         self.state = "running"
         self._thread = threading.Thread(target=self._stream_loop, daemon=True)
         self._thread.start()
         self.get_logger().info(f"Camera stream started — {self._topic} ({self._camera})")
+        return response
 
     def stop(self):
         self.state = "idle"
@@ -279,15 +284,15 @@ class CameraStreamPlugin:
                     node.stop()
                     time.sleep(0.3)
                     node._camera = camera
-                node.start()
+                result = node.start()
             else:
                 safe_id = instance_id.replace("-", "_")
                 topic = f"/{self._namespace}/camera/{safe_id}/rgb"
                 node = _CameraStreamNode(topic, self._bridge, self._fps, camera)
                 self._executor.add_node(node)
                 self._nodes[instance_id] = node
-                node.start()
-            return {"state": "running", "camera": camera}
+                result = node.start()
+            return {"state": node.state, "camera": camera, **result}
         if action == "stop":
             if instance_id in self._nodes:
                 self._nodes[instance_id].stop()

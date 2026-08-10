@@ -28,6 +28,20 @@ static T_DjiReturnCode _UsbBulk_Init(T_DjiHalUsbBulkInfo info,
     if (!out_handle || !info.isUsbHost)
         return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
 
+    /* The M300's PSDK 3.11 liveview request reports vendor interface 6
+     * (0x05/0x87), but the aircraft exposes the actual H.264 bulk channel on
+     * interface 7 (0x06/0x88).  The official on-board PSDK 3.8 demo uses
+     * interface 7 successfully.  Keep the SDK-provided mapping for every
+     * other channel; only remap this known M300 liveview tuple. */
+    if (info.vid == 0x2ca3 && info.pid == 0x001f &&
+        info.channelInfo.interfaceNum == 6 &&
+        info.channelInfo.endPointOut == 0x05 && info.channelInfo.endPointIn == 0x87) {
+        info.channelInfo.interfaceNum = 7;
+        info.channelInfo.endPointOut = 0x06;
+        info.channelInfo.endPointIn = 0x88;
+        printf("[usb_bulk] remapped M300 liveview to interface=7 in=0x88 out=0x06\n");
+    }
+
     handle = calloc(1, sizeof(*handle));
     if (!handle)
         return DJI_ERROR_SYSTEM_MODULE_CODE_MEMORY_ALLOC_FAILED;
