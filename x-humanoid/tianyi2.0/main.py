@@ -316,11 +316,6 @@ class TianyiDeviceBundle:
             self._plugins.append(RobotFaultsPlugin(plugins_cfg["health_check"], namespace, ros2, slamtec_client))
             print("[bundle] RobotFaultsPlugin loaded (health_check)")
 
-        if plugins_cfg.get("auto_brake", {}).get("enabled", False):
-            from device import AebPlugin
-            self._plugins.append(AebPlugin(plugins_cfg["auto_brake"], namespace, ros2, slamtec_client))
-            print("[bundle] AebPlugin loaded")
-
         if plugins_cfg.get("laser_scan", {}).get("enabled", False):
             from device import LaserScanPlugin
             self._plugins.append(LaserScanPlugin(plugins_cfg["laser_scan"], namespace, ros2, slamtec_client))
