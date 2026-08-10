@@ -927,8 +927,12 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
         if (strstr(raw_json, "\"fpv\"")) cam = "fpv";
         else if (strstr(raw_json, "\"payload2\"")) cam = "payload2";
         else if (strstr(raw_json, "\"payload3\"")) cam = "payload3";
-        liveview_start(cam, NULL);
-        snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0,\"camera\":\"%s\"}}", cam);
+        int r = liveview_start(cam, NULL);
+        if (r == 0) {
+            snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0,\"camera\":\"%s\"}}", cam);
+        } else {
+            snprintf(result, result_size, "{\"ok\":false,\"error\":\"failed to start liveview for %s\"}", cam);
+        }
         return 0;
     }
     if (strstr(raw_json, "\"stop_liveview\"")) {

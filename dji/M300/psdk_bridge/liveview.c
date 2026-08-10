@@ -120,7 +120,10 @@ static void _h264_cb(E_DjiLiveViewCameraPosition position, const uint8_t *data, 
 
 int liveview_init(void) {
     T_DjiReturnCode rc = DjiLiveview_Init();
-    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) return -1;
+    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+        printf("[liveview] init failed: 0x%08llX\n", (unsigned long long)rc);
+        return -1;
+    }
     avcodec_register_all(); av_log_set_level(AV_LOG_FATAL);
     AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_H264);
     if (!codec) return -1;
