@@ -5263,33 +5263,17 @@ class RobotFaultsPlugin:
                 issues.append(f"IMU部分数据缺失: {', '.join(missing)}")
 
         # ── 自检状态 (方案B: 音频事件 + bodycontrol_state) ──
-        # 状态机:
-        #   state=0 (Initing)        → "未启动" (等按 A 键)
-        #   state=1 + 未开始自检      → "等待自检" (body_control 运行中，但还没按 A)
-        #   state=1 + 自检中          → "自检中" (规律提示音已检测到，等完成)
-        #   state=1 + 自检完成        → "自检完成, 正常运行"
+        # 两态模型:
+        #   检测到规律音频序列 且 未收到完成短提示音 → "自检中" (禁止操作)
+        #   其他情况                                    → "没有在自检"
         self_check_available = self._self_check_available and self._self_check_state is not None
         self_check_lines = []
 
-        ns = self._self_check_state
-        if ns is not None and ns.state == 1:
-            # body_control 运行中
-            if self._self_check_started and not self._self_check_completed:
-                self_check_lines.append("自检中")
-                issues.append("自检进行中")
-            elif self._self_check_completed:
-                self_check_lines.append("自检完成, 正常运行")
-            else:
-                # state=1 但自检还没开始（从未按过 A，或已重置）
-                self_check_lines.append("等待自检")
-        elif ns is not None and ns.state == 0:
-            self_check_lines.append("未启动")
-            issues.append("body_control 未启动, 请按遥控器 A 键触发自检")
-        elif self_check_available:
-            # 有状态但 state 不是 0/1（如 unknown），当作等待自检
-            self_check_lines.append("等待自检")
+        if self._self_check_started and not self._self_check_completed:
+            self_check_lines.append("自检中")
+            issues.append("自检进行中")
         else:
-            self_check_lines.append("未知")
+            self_check_lines.append("没有在自检")
 
         # ── 综合健康判定 ──
         has_issues = len(issues) > 0
@@ -5420,19 +5404,13 @@ class RobotFaultsPlugin:
         else:
             lines.append(f"✅ IMU — {imu_detail}")
 
-        # ── 6. 自检状态 (方案B: audio_play/event + bodycontrol_state) ──
+        # ── 6. 自检状态 (两态: 自检中 / 没有在自检) ──
         sc_detail = sc_info.get("detail", "未知")
         sc_label = sc_detail
         if sc_detail == "自检中":
-            lines.append(f"🔄 自检 — 进行中")
-        elif sc_detail == "自检完成, 正常运行":
-            lines.append("✅ 自检 — 运行中（自检已通过）")
-        elif sc_detail == "等待自检":
-            lines.append("⏳ 自检 — 等待自检（请按遥控器 A 键）")
-        elif sc_detail == "未启动":
-            lines.append("⚠️  自检 — 未启动（请按遥控器 A 键触发自检）")
+            lines.append("🔄 自检 — 进行中")
         else:
-            lines.append(f"⚠️  自检 — {sc_detail}")
+            lines.append("✅ 自检 — 没有在自检")
 
         # ── 7. 底盘 ──
         chassis_detail = chassis_data.get("detail", "未知")
@@ -5448,7 +5426,7 @@ class RobotFaultsPlugin:
 
         fatal_items = [f for f in body_data.get("faults", []) if f.get("severity") == "fatal"]
         blocker_count = len(fatal_items) + (1 if estop_active else 0)
-        if sc_detail in ("未启动", "等待自检", "自检中"):
+        if sc_detail == "自检中":
             blocker_count += 1
 
         if blocker_count > 0 or "电量极低" in power_detail:
