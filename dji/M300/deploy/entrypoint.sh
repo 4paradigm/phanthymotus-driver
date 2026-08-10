@@ -59,6 +59,11 @@ enable_uart_transceiver
     exit 1
 }
 
+# ROS 2 Humble's generated setup scripts reference optional AMENT variables
+# directly. They are valid when unset, but incompatible with bash nounset.
+# Keep nounset disabled only while importing that third-party environment.
+set +u
 source /opt/ros/humble/setup.bash
 source /ros_ws/install/setup.bash
+set -u
 exec python3 /work/main.py
