@@ -4766,7 +4766,7 @@ class RobotFaultsPlugin:
             "power_board_topic": "/power/board/status",
             "imu_accel_topic": "/ob_camera_head/accel/sample",
             "imu_gyro_topic": "/ob_camera_head/gyro/sample",
-            "self_check_topic": "/node/status",
+            "self_check_topic": "/bodycontrol_state",
             "light_ctrl_topic": "/power/light/ctrl",
         }
 
@@ -4808,6 +4808,13 @@ class RobotFaultsPlugin:
         self._light_ctrl_state = None       # PowerLightCtrl (proc_manager 自检信号)
         self._light_ctrl_topic = cfg["light_ctrl_topic"]
         self._light_ctrl_subscribed = False  # 订阅创建标志
+
+        # 方案B: 音频事件追踪自检状态
+        self._audio_event_available = False
+        self._last_audio_event_ts = None     # 最后收到的音频事件时间戳
+        self._last_audio_done_ts = None      # 最后音频播放完成的时间戳
+        self._self_check_started = False     # 自检已检测到音频信号
+        self._self_check_completed = False   # 自检已完成（音频静默 > 10s）
 
         # 订阅节点 (domain 0) — 接收身体故障
         self._sub_node = Node("tianyi2_robot_faults_sub", context=ros2.ctx_tianyi)
@@ -4922,6 +4929,17 @@ class RobotFaultsPlugin:
         except ImportError:
             print("[RobotFaultsPlugin] PowerLightCtrl not available, light ctrl disabled")
 
+        # 方案B: 音频播放事件订阅 (检测自检提示音)
+        try:
+            from lyre_msgs.msg import PlayEvent
+            self._sub_node.create_subscription(
+                PlayEvent, "/audio_play/event",
+                self._on_play_event, _LOW_LAT_QOS)
+            self._audio_event_available = True
+            print("[RobotFaultsPlugin] audio event subscription created")
+        except ImportError:
+            print("[RobotFaultsPlugin] PlayEvent not available, audio event disabled")
+
         # 完整数据发布线程 (1Hz → topic)
         print("[RobotFaultsPlugin] started")
 
@@ -5034,8 +5052,14 @@ class RobotFaultsPlugin:
     def _on_self_check(self, msg):
         now_ms = int(time.time() * 1000)
         with self._lock:
+            prev_state = self._self_check_state.state if self._self_check_state is not None else None
             self._self_check_state = msg
             self._last_update_ms = now_ms
+            # state 从非1变到1 → body_control 刚启动/重启, 进入自检等待
+            if msg.state == 1 and prev_state != 1:
+                self._self_check_started = False
+                self._self_check_completed = False
+                self._last_audio_done_ts = None
 
     def _on_light_ctrl(self, msg):
         """proc_manager 灯效反馈, cmd 20=自检等待/21=自检启动/22=自检成功."""
@@ -5045,6 +5069,25 @@ class RobotFaultsPlugin:
             self._last_update_ms = now_ms
         from_ = getattr(msg, "caller_id", "?")
         print(f"[RobotFaultsPlugin] light ctrl: cmd={msg.cmd} caller={from_}")
+
+    def _on_play_event(self, msg):
+        """方案B: 检测音频播放事件, 用于判断自检状态。
+        PlayEvent.event: 0=STARTED, 1=COMPLETED, 2=STOPPED, 3=CANCELLED, 4=FAILED."""
+        now_ms = int(time.time() * 1000)
+        with self._lock:
+            self._last_audio_event_ts = now_ms
+            if msg.event == 0:  # STARTED
+                # body_control 在运行且自检未完成 → 检测到音频 → 标记自检已开始
+                if (self._self_check_state is not None
+                    and self._self_check_state.state == 1
+                    and not self._self_check_completed):
+                    self._self_check_started = True
+                    self._last_audio_done_ts = None
+                    print(f"[RobotFaultsPlugin] self-check audio started (sid={msg.sid})")
+            elif msg.event in (1, 2):  # COMPLETED or STOPPED
+                if self._self_check_started:
+                    self._last_audio_done_ts = now_ms
+                    print(f"[RobotFaultsPlugin] self-check audio completed (sid={msg.sid})")
 
     # ── 按需查询执行器 ─────────────────────────────────────────────────────
 
@@ -5177,31 +5220,33 @@ class RobotFaultsPlugin:
                 imu_lines.append(f"部分缺失:{','.join(missing)}")
                 issues.append(f"IMU部分数据缺失: {', '.join(missing)}")
 
-        # ── 自检状态 (优先灯效反馈 proc_manager, 降级 NodeState) ──
-        sc = self._light_ctrl_state
-        lc_available = sc is not None
-        self_check_available = lc_available or (self._self_check_available and self._self_check_state is not None)
+        # ── 自检状态 (方案B: audio_play/event 检测提示音 + bodycontrol_state) ──
+        self_check_available = self._self_check_available and self._self_check_state is not None
         self_check_lines = []
-        # cmd 映射: 20=自检等待, 21=自检中, 22=自检通过, 99=待机, 10/11=故障事件
-        _SC_MAP = {20: "自检等待", 21: "自检中", 22: "自检通过", 99: "待机", 10: "故障触发", 11: "故障消除"}
-        if lc_available:
-            label = _SC_MAP.get(int(sc.cmd), f"未知(cmd={sc.cmd})")
-            self_check_lines.append(label)
-            if sc.cmd == 21:
-                issues.append("自检进行中")
-            elif sc.cmd == 10:
-                issues.append("故障触发")
-        elif self._light_ctrl_subscribed:
-            # 已订阅但还没收到数据 → 默认待机
-            self_check_lines.append("待机")
-        elif self._self_check_available and self._self_check_state is not None:
-            ns = self._self_check_state
-            if ns.state == 0:
-                self_check_lines.append("空闲")
-            elif ns.state == 1:
-                self_check_lines.append("运行中")
+        now_ms_sc = int(time.time() * 1000)
+
+        ns = self._self_check_state
+        if ns is not None and ns.state == 1:
+            # body_control 运行中 → 用音频事件区分"自检中"和"正常运行"
+            if not self._self_check_completed:
+                # 检测音频静默期, 超过10秒无新音频 → 自检完成
+                if (self._last_audio_done_ts is not None
+                    and (now_ms_sc - self._last_audio_done_ts) > 10000):
+                    self._self_check_completed = True
+                    self_check_lines.append("运行中")
+                elif self._self_check_started:
+                    self_check_lines.append("自检中")
+                    issues.append("自检进行中")
+                else:
+                    # state=1 但没检测到自检音频 → 可能早已完成运行中
+                    self_check_lines.append("运行中")
             else:
-                self_check_lines.append(f"异常(state={ns.state})")
+                self_check_lines.append("运行中")
+        elif ns is not None and ns.state == 0:
+            self_check_lines.append("未启动")
+            issues.append("body_control 未启动, 请按遥控器 A 键触发自检")
+        elif self_check_available:
+            self_check_lines.append("运行中")
         else:
             self_check_lines.append("未知")
 
@@ -5334,23 +5379,15 @@ class RobotFaultsPlugin:
         else:
             lines.append(f"✅ IMU — {imu_detail}")
 
-        # ── 6. 自检状态 (proc_manager 灯效反馈) ──
+        # ── 6. 自检状态 (方案B: audio_play/event + bodycontrol_state) ──
         sc_detail = sc_info.get("detail", "未知")
         sc_label = sc_detail
         if sc_detail == "自检中":
             lines.append(f"🔄 自检 — 进行中")
-        elif sc_detail == "自检等待":
-            lines.append(f"⏳ 自检 — 等待中")
-        elif sc_detail == "自检通过":
-            lines.append("✅ 自检 — 通过")
-        elif sc_detail == "待机":
-            lines.append("✅ 自检 — 待机")
-        elif sc_detail == "故障触发":
-            lines.append("⚠️  自检 — 故障触发")
         elif sc_detail == "运行中":
-            lines.append("✅ 自检 — 运行中")
-        elif sc_detail == "空闲":
-            lines.append("⚠️  自检 — 空闲(可能自检中或未启动)")
+            lines.append("✅ 自检 — 运行中（自检已通过）")
+        elif sc_detail == "未启动":
+            lines.append("⚠️  自检 — 未启动（请按遥控器 A 键触发自检）")
         else:
             lines.append(f"⚠️  自检 — {sc_detail}")
 
@@ -5368,7 +5405,7 @@ class RobotFaultsPlugin:
 
         fatal_items = [f for f in body_data.get("faults", []) if f.get("severity") == "fatal"]
         blocker_count = len(fatal_items) + (1 if estop_active else 0)
-        if sc_detail in ("空闲", "自检中", "自检等待"):
+        if sc_detail in ("未启动", "自检中"):
             blocker_count += 1
 
         if blocker_count > 0 or "电量极低" in power_detail:
