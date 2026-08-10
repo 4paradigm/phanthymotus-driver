@@ -5134,7 +5134,7 @@ class RobotFaultsPlugin:
                 advice.append("检查急停按钮状态，确认安全后解除急停")
             if d.get("lidar_disconnected"):
                 chassis_lines.append("雷达离线")
-                issues.append("激光雷达离线，AEB/避障功能不可用")
+                issues.append("激光雷达离线")
             if d.get("cliff"):
                 issues.append("检测到跌落风险")
                 advice.append("立即停止移动，检查地面环境")
