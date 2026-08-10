@@ -4809,15 +4809,20 @@ class RobotFaultsPlugin:
         self._light_ctrl_subscribed = False  # 订阅创建标志
 
         # 方案B: 音频事件追踪自检状态
-        # 自检开始: bodycontrol_state state 从非0变到0 → _self_check_started=True
-        # 自检完成: 收到短提示音 (duration < 2.5s) → _self_check_completed=True
+        # 自检开始: 30秒内出现 3+ 个音频事件（规律自检提示音）→ _self_check_started=True
+        # 自检完成: 自检已开始 + 收到短提示音 (duration < 2.5s) → _self_check_completed=True
         self._audio_event_available = False
         self._last_audio_event_ts = None     # 最后收到的音频事件时间戳
-        self._self_check_started = False     # 自检已开始 (state 曾到过 0)
+        self._self_check_started = False     # 自检已开始 (检测到规律提示音序列)
         self._self_check_completed = False   # 自检已完成 (收到短提示音)
         self._last_play_duration = None      # 最后一个音频片段的 duration
         self._sid_duration = {}              # sid -> duration（来自 /audio_play/progress）
         self._max_sid_track = 20             # 最多保留的 sid 数，避免内存泄漏
+        # 自检序列检测窗口
+        self._audio_window_start_ms = None   # 当前统计窗口起点
+        self._audio_window_count = 0         # 当前窗口内的音频事件数
+        self._audio_window_threshold = 3     # 窗口内事件数阈值
+        self._audio_window_ms = 30000        # 窗口长度 (30s)
 
         # 订阅节点 (domain 0) — 接收身体故障
         self._sub_node = Node("tianyi2_robot_faults_sub", context=ros2.ctx_tianyi)
@@ -5056,16 +5061,11 @@ class RobotFaultsPlugin:
             self._last_update_ms = now_ms
 
     def _on_self_check(self, msg):
+        """bodycontrol_state 回调，仅记录状态，自检开始/完成由音频事件判断。"""
         now_ms = int(time.time() * 1000)
         with self._lock:
-            prev_state = self._self_check_state.state if self._self_check_state is not None else None
             self._self_check_state = msg
             self._last_update_ms = now_ms
-            # state == 0 (Initing) → 自检开始; state 从非0变到0 或 从1变到0 都触发
-            if msg.state == 0 and prev_state != 0:
-                self._self_check_started = True
-                self._self_check_completed = False
-                print(f"[RobotFaultsPlugin] self-check started (state: {prev_state} -> 0)")
 
     def _on_light_ctrl(self, msg):
         """proc_manager 灯效反馈, cmd 20=自检等待/21=自检启动/22=自检成功."""
@@ -5079,19 +5079,38 @@ class RobotFaultsPlugin:
     def _on_play_event(self, msg):
         """方案B: 检测音频播放事件, 用于判断自检状态。
         PlayEvent.event: 0=STARTED, 1=COMPLETED, 2=STOPPED, 3=CANCELLED, 4=FAILED.
-        自检完成标志: 自检已开始 + 收到短提示音 (duration < 2.5s)。"""
+        自检开始: 30s 窗口内收到 3+ 个音频完成事件（规律自检提示音序列）
+        自检完成: 自检已开始 + 收到短提示音 (duration < 2.5s)"""
         now_ms = int(time.time() * 1000)
         with self._lock:
             self._last_audio_event_ts = now_ms
-            if msg.event in (1, 2):  # COMPLETED or STOPPED
-                if self._self_check_started and not self._self_check_completed:
-                    dur = self._sid_duration.get(msg.sid)
-                    if dur is not None:
-                        self._last_play_duration = dur
-                    # 短提示音 → 自检完成
-                    if dur is not None and dur < 2.5:
-                        self._self_check_completed = True
-                        print(f"[RobotFaultsPlugin] self-check completed (sid={msg.sid}, duration={dur:.2f}s)")
+            if msg.event not in (1, 2):  # 只处理 COMPLETED/STOPPED
+                return
+
+            # ── 滑动窗口：统计 30s 内的音频完成事件数 ──
+            if self._audio_window_start_ms is None:
+                self._audio_window_start_ms = now_ms
+            elif (now_ms - self._audio_window_start_ms) > self._audio_window_ms:
+                # 超过 30s 无事件 → 重置窗口
+                self._audio_window_start_ms = now_ms
+                self._audio_window_count = 0
+            self._audio_window_count += 1
+
+            # 窗口内达到阈值 → 自检开始
+            if not self._self_check_started and self._audio_window_count >= self._audio_window_threshold:
+                self._self_check_started = True
+                self._self_check_completed = False
+                print(f"[RobotFaultsPlugin] self-check detected ({self._audio_window_count} audio events in 30s window)")
+
+            # ── 自检完成判断 ──
+            if self._self_check_started and not self._self_check_completed:
+                dur = self._sid_duration.get(msg.sid)
+                if dur is not None:
+                    self._last_play_duration = dur
+                # 短提示音 → 自检完成
+                if dur is not None and dur < 2.5:
+                    self._self_check_completed = True
+                    print(f"[RobotFaultsPlugin] self-check completed (sid={msg.sid}, duration={dur:.2f}s)")
 
     def _on_play_progress(self, msg):
         """订阅 /audio_play/progress, 用于获取每个 sid 的真实 duration, 不依赖 PlayEvent 字段。"""
@@ -5235,7 +5254,7 @@ class RobotFaultsPlugin:
                 imu_lines.append(f"部分缺失:{','.join(missing)}")
                 issues.append(f"IMU部分数据缺失: {', '.join(missing)}")
 
-        # ── 自检状态 (方案B: bodycontrol_state state=0 判断开始 + 短提示音 duration<2.5s 判断完成) ──
+        # ── 自检状态 (方案B: 音频序列检测开始 + 短提示音 duration<2.5s 判断完成) ──
         self_check_available = self._self_check_available and self._self_check_state is not None
         self_check_lines = []
 
