@@ -18,6 +18,7 @@ psdk_bridge:
 plugins:
   telemetry:
     enabled: true
+    auto_start: true
     publish_rate: 10   # Hz
   camera_stream:
     enabled: true

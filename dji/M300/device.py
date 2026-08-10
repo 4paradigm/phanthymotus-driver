@@ -87,6 +87,7 @@ class TelemetryPlugin:
         self._namespace = namespace
         self._topic = f"/{namespace}/telemetry/state"
         rate = plugin_config.get("publish_rate", 10)
+        self._auto_start = plugin_config.get("auto_start", True)
         self._node = _TelemetryNode(self._topic, bridge, rate)
         executor.add_node(self._node)
 
@@ -96,6 +97,7 @@ class TelemetryPlugin:
             "type": "sensor",
             "description": "DJI Matrice 300 RTK 遥测数据：GPS位置、姿态、速度、电池、卫星、避障距离、飞行状态。",
             "topic_out": [{"topic": self._topic, "format": "data/json"}],
+            "autoStart": self._auto_start,
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -122,8 +124,11 @@ class TelemetryPlugin:
             self._node.stop()
             return {"state": "idle"}
         if action == "info":
+            if self._auto_start and self._node.state != "running":
+                self._node.start()
             return {
                 "state": self._node.state,
+                "auto_start": self._auto_start,
                 "topic_out": [{"topic": self._topic, "format": "data/json"}],
             }
         return None
@@ -1271,7 +1276,7 @@ class WaypointPlugin:
 # ═══════════════════════════════════════════════════════════════════════════
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  TimeSyncPlugin (actuator)
+#  TimeSyncPlugin (resource)
 #  PSDK: 机型信息 + 时间同步
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1284,7 +1289,7 @@ class TimeSyncPlugin:
     def get_tool(self) -> dict:
         return {
             "name": "aircraft_info",
-            "type": "actuator",
+            "type": "resource",
             "description": "飞机信息查询：机型、固件版本、连接状态、GPS 对时。",
             "inputSchema": {
                 "type": "object",
