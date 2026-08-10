@@ -29,6 +29,25 @@ plugins:
     enabled: true
   state:
     enabled: true
+  gripper_state:
+    enabled: true
+    left_dds_topic: "rt/hand/left_state"
+    right_dds_topic: "rt/hand/right_state"
+    min_angle_rad: 0.0
+    max_angle_rad: 1.5
+    grasp_tau_threshold: 0.1
+    publish_hz: 20
+  gripper_control:
+    enabled: true
+    left_dds_topic: "rt/hand/left_cmd"
+    right_dds_topic: "rt/hand/right_cmd"
+    min_angle_rad: 0.0
+    max_angle_rad: 1.5
+    motor_mode: 10
+    default_kp: 20.0
+    default_kd: 1.0
+    default_force_pct: 50
+    max_tau: 0.5
   camera:
     enabled: true
   lidar:

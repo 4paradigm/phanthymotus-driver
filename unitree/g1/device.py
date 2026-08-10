@@ -2065,6 +2065,243 @@ class StatePlugin:
         return None
 
 
+# ── GripperStatePlugin (sensor) ──────────────────────────────────────────────
+
+class _GripperStateNode(Node):
+    """Subscribes to left/right gripper DDS state and republishes JSON to ROS2."""
+
+    def __init__(self, topic: str, plugin_config: dict):
+        super().__init__("g1_gripper_state")
+        self._publisher = self.create_publisher(String, topic, _LOW_LAT_QOS)
+        self._min_angle = float(plugin_config.get("min_angle_rad", 0.0))
+        self._max_angle = float(plugin_config.get("max_angle_rad", 1.5))
+        self._grasp_tau_threshold = float(plugin_config.get("grasp_tau_threshold", 0.1))
+        self._publish_interval = 1.0 / float(plugin_config.get("publish_hz", 20))
+        self._last_publish_time = {"left": 0.0, "right": 0.0}
+        self._subscribers = []
+
+        from unitree_sdk2py.core.channel import ChannelSubscriber
+        from unitree_sdk2py.idl.unitree_hg.msg.dds_ import HandState_
+
+        for side, config_key, default_topic in (
+            ("left", "left_dds_topic", "rt/hand/left_state"),
+            ("right", "right_dds_topic", "rt/hand/right_state"),
+        ):
+            dds_topic = plugin_config.get(config_key, default_topic)
+            try:
+                subscriber = ChannelSubscriber(dds_topic, HandState_)
+                subscriber.Init(lambda msg, side=side: self._on_state(side, msg), 10)
+                self._subscribers.append(subscriber)
+                self.get_logger().info(f"GripperStateNode subscribed {dds_topic} → {topic}")
+            except Exception as e:
+                self.get_logger().warn(f"GripperStateNode: failed to subscribe {dds_topic}: {e}")
+
+    def _on_state(self, side: str, msg) -> None:
+        now = time.monotonic()
+        if now - self._last_publish_time[side] < self._publish_interval:
+            return
+        self._last_publish_time[side] = now
+
+        # TODO: Confirm motor index 0 and whether larger angles mean a more closed gripper.
+        motor = msg.motor_state[0]
+        position_rad = float(motor.q)
+        position_pct = (position_rad - self._min_angle) / (self._max_angle - self._min_angle) * 100.0
+        position_pct = max(0.0, min(100.0, position_pct))
+        tau_est = float(motor.tau_est)
+        data = {
+            "side": side,
+            "position_pct": round(position_pct, 2),
+            "position_rad": position_rad,
+            "tau_est": tau_est,
+            "temperature": [int(value) for value in motor.temperature],
+            "object_grasped": abs(tau_est) >= self._grasp_tau_threshold,
+            "error_code": [int(value) for value in msg.error],
+            "power_v": float(msg.power_v),
+            "power_a": float(msg.power_a),
+        }
+        output = String()
+        output.data = json.dumps(data)
+        self._publisher.publish(output)
+
+
+class GripperStatePlugin:
+    PREFIX = "gripper_state"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor):
+        self._topic = f"/{namespace}/gripper/state"
+        self._node = _GripperStateNode(self._topic, plugin_config)
+        executor.add_node(self._node)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "gripper_state",
+            "type": "sensor",
+            "multiInstance": False,
+            "description": f"G1 gripper state — position, torque, temperature, grasp detection, errors, and power. Publishes to {self._topic}",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._topic, "format": "data/json"}],
+        }
+
+    def start(self) -> None:
+        pass  # DDS subscriptions start in __init__
+
+    def stop(self) -> None:
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "running", "topic_out": [{"topic": self._topic, "format": "data/json"}]}
+        return None
+
+
+# ── GripperControlPlugin (actuator) ──────────────────────────────────────────
+
+class GripperControlPlugin:
+    PREFIX = "gripper_control"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor):
+        self._dds_topics = {
+            "left": plugin_config.get("left_dds_topic", "rt/hand/left_cmd"),
+            "right": plugin_config.get("right_dds_topic", "rt/hand/right_cmd"),
+        }
+        self._min_angle = float(plugin_config.get("min_angle_rad", 0.0))
+        self._max_angle = float(plugin_config.get("max_angle_rad", 1.5))
+        self._motor_mode = int(plugin_config.get("motor_mode", 10))
+        self._default_kp = float(plugin_config.get("default_kp", 20.0))
+        self._default_kd = float(plugin_config.get("default_kd", 1.0))
+        self._force_pct = float(plugin_config.get("default_force_pct", 50))
+        self._max_tau = float(plugin_config.get("max_tau", 0.5))
+        self._publishers = {}
+        self._last_position_pct = {"left": 0.0, "right": 0.0}
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "gripper_control",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "G1 parallel gripper control — open, close, set position or force, and stop",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["open", "close", "set_position", "set_force", "stop"],
+                        "description": "Action to perform",
+                    },
+                    "side": {
+                        "type": "string",
+                        "enum": ["left", "right", "both"],
+                        "default": "both",
+                        "description": "Gripper side to control",
+                    },
+                    "position_pct": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": "Opening position, where 0% is open and 100% is closed",
+                    },
+                    "force_pct": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": "Gripping force limit percentage",
+                    },
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "open": {"params": ["side"], "description": "Fully open the selected gripper"},
+                    "close": {"params": ["side", "force_pct"], "description": "Close the selected gripper, optionally setting the force limit"},
+                    "set_position": {"params": ["side", "position_pct"], "description": "Set gripper position from 0% open to 100% closed"},
+                    "set_force": {"params": ["side", "force_pct"], "description": "Set the gripping force limit"},
+                    "stop": {"params": ["side"], "description": "Stop by holding the last commanded position"},
+                },
+            },
+        }
+
+    def start(self) -> None:
+        pass  # DDS publishers are initialized lazily on the first action
+
+    def stop(self) -> None:
+        pass
+
+    def _get_publisher(self, side: str):
+        if side not in self._publishers:
+            from unitree_sdk2py.core.channel import ChannelPublisher
+            from unitree_sdk2py.idl.unitree_hg.msg.dds_ import HandCmd_
+            publisher = ChannelPublisher(self._dds_topics[side], HandCmd_)
+            publisher.Init()
+            self._publishers[side] = publisher
+        return self._publishers[side]
+
+    def _send_position(self, side: str, position_pct: float) -> dict:
+        from unitree_sdk2py.idl.default import unitree_hg_msg_dds__HandCmd_
+
+        # TODO: Confirm motor index 0, mode 10, and whether larger angles mean a more closed gripper.
+        position_rad = self._min_angle + position_pct / 100.0 * (self._max_angle - self._min_angle)
+        message = unitree_hg_msg_dds__HandCmd_()
+        motor = message.motor_cmd[0]
+        motor.mode = self._motor_mode
+        motor.q = position_rad
+        motor.dq = 0.0
+        motor.tau = 0.0
+        motor.kp = self._default_kp
+        motor.kd = self._default_kd
+        published = self._get_publisher(side).Write(message)
+        self._last_position_pct[side] = position_pct
+        return {
+            "side": side,
+            "position_pct": position_pct,
+            "position_rad": position_rad,
+            "published": bool(published),
+        }
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "ready"}
+        side = args.get("side", "both")
+        if side not in ("left", "right", "both"):
+            return {"error": "side must be left, right, or both"}
+        sides = ("left", "right") if side == "both" else (side,)
+
+        if action == "set_force":
+            if "force_pct" not in args:
+                return {"error": "force_pct is required"}
+            force_pct = float(args["force_pct"])
+            if not 0.0 <= force_pct <= 100.0:
+                return {"error": "force_pct must be between 0 and 100"}
+            self._force_pct = force_pct
+            # TODO: Apply the force limit once the HandCmd_ force-control semantics are confirmed on hardware.
+            return {"side": side, "force_pct": force_pct, "max_tau": self._max_tau, "applied": False}
+
+        if action == "open":
+            position_pct = 0.0
+        elif action == "close":
+            if "force_pct" in args:
+                force_pct = float(args["force_pct"])
+                if not 0.0 <= force_pct <= 100.0:
+                    return {"error": "force_pct must be between 0 and 100"}
+                self._force_pct = force_pct
+            position_pct = 100.0
+        elif action == "set_position":
+            if "position_pct" not in args:
+                return {"error": "position_pct is required"}
+            position_pct = float(args["position_pct"])
+            if not 0.0 <= position_pct <= 100.0:
+                return {"error": "position_pct must be between 0 and 100"}
+        elif action == "stop":
+            # TODO: Replace last-target hold with measured-position hold if hardware testing requires it.
+            return {"results": [self._send_position(item, self._last_position_pct[item]) for item in sides]}
+        else:
+            return None
+
+        results = [self._send_position(item, position_pct) for item in sides]
+        return {"results": results, "force_pct": self._force_pct}
+
+
 # ── LidarPlugin (sensor) ─────────────────────────────────────────────────────
 
 LIDAR_CLOUD_INTERVAL = 0.05      # 20 Hz max (source is ~10Hz, allow headroom)
