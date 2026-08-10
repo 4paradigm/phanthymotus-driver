@@ -1,0 +1,21 @@
+engineai-t800:
+  image: __IMAGE__
+  container_name: embodied-engineai-t800
+  network_mode: host
+  ipc: host
+  pid: host
+  privileged: true
+  volumes:
+    - /dev:/dev
+    - /opt/engineai/native_sdk:/opt/engineai/native_sdk
+  environment:
+    - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+    - ROS_LOCALHOST_ONLY=0
+    - NETWORK_INTERFACE=eth0
+    - PYTHONUNBUFFERED=1
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: unless-stopped

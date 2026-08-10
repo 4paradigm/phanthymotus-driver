@@ -187,6 +187,36 @@ _LEG_LEVELS = [
 ]
 
 
+def _acp_notify(action_id: str, status: str, result: dict, tool: str = ""):
+    """POST action completion to Agent Core (module-level ACP helper)."""
+    import urllib.request as _urllib
+    import ssl as _ssl
+    import os as _os
+
+    agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+    ctx = _ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = _ssl.CERT_NONE
+    payload = json.dumps({
+        "action_id": action_id,
+        "status": status,
+        "result": result,
+        "tool": tool,
+        "ts": time.time(),
+    }).encode()
+    try:
+        req = _urllib.Request(
+            f"{agent_core_url}/api/acp/complete",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        _urllib.urlopen(req, timeout=5, context=ctx)
+    except Exception as e:
+        import sys
+        print(f"[ACP] callback failed for {action_id}: {e}", file=sys.stderr)
+
+
 class _ActionSequence:
     """Run one cancellable actuator sequence at a time."""
 
@@ -196,7 +226,8 @@ class _ActionSequence:
         self._cancel_event: threading.Event | None = None
         self._thread: threading.Thread | None = None
 
-    def start(self, worker) -> None:
+    def start(self, worker, on_done=None) -> None:
+        """Start a worker sequence. on_done(cancelled: bool) called when finished."""
         self.cancel()
         cancel_event = threading.Event()
 
@@ -206,10 +237,16 @@ class _ActionSequence:
             except Exception as e:
                 print(f"[{self._name}] sequence failed: {e}")
             finally:
+                cancelled = cancel_event.is_set()
                 with self._lock:
                     if self._cancel_event is cancel_event:
                         self._cancel_event = None
                         self._thread = None
+                if on_done:
+                    try:
+                        on_done(cancelled)
+                    except Exception as e:
+                        print(f"[{self._name}] on_done callback failed: {e}")
 
         thread = threading.Thread(
             target=_run, name=f"{self._name}_sequence", daemon=True)
@@ -2013,10 +2050,11 @@ class HeadGesturePlugin:
                     },
                 },
                 "required": ["action"],
+                "x-completion": {
+                    "actions": ["scan", "shake"],
+                    "timeout": 30,
+                },
                 "x-action-params": {
-                    "nod": {"params": ["cycles", "nod_amplitude", "speed"], "description": "向下点头后回正，不经过抬头姿态"},
-                    "shake": {"params": ["cycles", "shake_amplitude", "speed"], "description": "在左右方向之间连续摇头后回正"},
-                    "scan": {"params": ["cycles", "scan_amplitude", "speed", "scan_hold"], "description": "依次观察左侧并停留、回中、观察右侧并停留、回中"},
                     "tilt": {"params": ["side", "tilt_amplitude", "speed", "hold"], "description": "向指定方向歪头、保持后回正"},
                     "reset": {"params": ["speed"], "description": "取消序列并将头部回正"},
                     "cancel": {"params": [], "description": "取消尚未发送的后续动作帧"},
@@ -2114,19 +2152,35 @@ class HeadGesturePlugin:
                     return
 
         baseline_seq, baseline = self._feedback_snapshot()
-        self._sequence.start(_worker)
+        # ACP: for long actions (scan, shake), return action_id and callback on done
+        action_id = None
+        on_done = None
+        if action in ("scan", "shake"):
+            from uuid import uuid4
+            action_id = f"head_gesture_{action}_{uuid4().hex[:8]}"
+
+            def on_done(cancelled):
+                if cancelled:
+                    _acp_notify(action_id, "cancelled", {"gesture": action}, "head_gesture")
+                else:
+                    _acp_notify(action_id, "completed", {"gesture": action, "cycles": cycles}, "head_gesture")
+
+        self._sequence.start(_worker, on_done=on_done)
         first_target = frames[0][:3]
         feedback = self._wait_for_head_feedback(
             first_target, baseline_seq, baseline)
         if feedback.get("state") == "error":
             self._sequence.cancel()
             return feedback
-        return {
+        result = {
             "state": "running", "gesture": action, "cycles": cycles,
             "amplitude": amplitude, "speed": speed,
             "feedback_verified": True,
             "feedback": feedback,
         }
+        if action_id:
+            result["action_id"] = action_id
+        return result
 
     def _on_head_status(self, msg):
         now = time.monotonic()
@@ -2819,6 +2873,10 @@ class ArmGesturePlugin:
                     },
                 },
                 "required": ["action"],
+                "x-completion": {
+                    "actions": ["salute", "welcome", "shake_hands"],
+                    "timeout": 30,
+                },
                 "x-action-params": {
                     "salute": {"params": ["salute_side", "speed"], "description": "抬起小臂、将手靠近额侧、停留后回正"},
                     "welcome": {"params": ["side", "cycles", "speed"], "description": "在身体侧上方抬起手掌并左右摆动后回正"},
@@ -2958,18 +3016,34 @@ class ArmGesturePlugin:
                     return
 
         baseline_seq, baseline = self._feedback_snapshot(side)
-        self._sequence.start(_worker)
+        # ACP: for long gestures, return action_id and callback on done
+        action_id = None
+        on_done = None
+        if action in ("salute", "welcome", "shake_hands"):
+            from uuid import uuid4
+            action_id = f"arm_gesture_{action}_{uuid4().hex[:8]}"
+
+            def on_done(cancelled):
+                if cancelled:
+                    _acp_notify(action_id, "cancelled", {"gesture": action, "side": side}, "arm_gesture")
+                else:
+                    _acp_notify(action_id, "completed", {"gesture": action, "side": side}, "arm_gesture")
+
+        self._sequence.start(_worker, on_done=on_done)
         feedback = self._wait_for_arm_feedback(
             side, frames[0][0], baseline_seq, baseline)
         if feedback.get("state") == "error":
             self._sequence.cancel()
             return feedback
-        return {
+        result = {
             "state": "running", "gesture": action, "side": side,
             "cycles": cycles, "speed": speed,
             "feedback_verified": True,
             "feedback": feedback,
         }
+        if action_id:
+            result["action_id"] = action_id
+        return result
 
     def _on_arm_status(self, msg):
         now = time.monotonic()
@@ -3688,6 +3762,13 @@ class TtsPlugin:
         self._stop_client = None
         self._pause_client = None
         self._resume_client = None
+        # ACP: PlayEvent 订阅，用于判断播放真正完成
+        self._play_event_sub = None
+        self._play_progress_sub = None
+        self._pending_play: dict[str, threading.Event] = {}  # sid → Event
+        self._pending_play_status: dict[str, int] = {}  # sid → event_code
+        self._pending_play_duration: dict[str, float] = {}  # sid → total duration (from progress)
+        self._play_event_buffer: dict[str, int] = {}  # 缓存最近的 PlayEvent（防竞态）
 
     def get_tool(self) -> dict:
         return {
@@ -3703,6 +3784,7 @@ class TtsPlugin:
                     "force": {"type": "boolean", "description": "是否强制播放(打断当前播放)", "default": False},
                 },
                 "required": ["action"],
+                "x-completion": {"actions": ["speak"], "timeout": 180},
                 "x-action-params": {
                     "speak": {"params": ["text", "force"], "description": "合成并播放文本"},
                     "interrupt": {"params": [], "description": "中止播放（不可恢复）"},
@@ -3715,13 +3797,48 @@ class TtsPlugin:
     def start(self):
         try:
             from lyre_msgs.srv import PlayText, PlayStop, PlayPause, PlayResume
+            from lyre_msgs.msg import PlayEvent, PlayProgress
             self._play_client = self._srv_node.create_client(PlayText, "/audio_play/play_text")
             self._stop_client = self._srv_node.create_client(PlayStop, "/audio_play/stop")
             self._pause_client = self._srv_node.create_client(PlayPause, "/audio_play/pause")
             self._resume_client = self._srv_node.create_client(PlayResume, "/audio_play/resume")
-            print("[TtsPlugin] service clients created")
+            # 订阅播放事件 topic，用于判断播放真正完成
+            self._play_event_sub = self._srv_node.create_subscription(
+                PlayEvent, "/audio_play/event", self._on_play_event, 10)
+            # 订阅播放进度 topic，获取精确总时长用于超时计算
+            self._play_progress_sub = self._srv_node.create_subscription(
+                PlayProgress, "/audio_play/progress", self._on_play_progress, 10)
+            print("[TtsPlugin] service clients + event/progress subscriptions created")
         except ImportError as e:
             print(f"[TtsPlugin] WARNING: msg import failed ({e})")
+
+    # PlayEvent event codes
+    _EVENT_NAMES = {0: "STARTED", 1: "COMPLETED", 2: "STOPPED", 3: "CANCELLED", 4: "FAILED"}
+
+    def _on_play_event(self, msg):
+        """PlayEvent callback: 播放完成/停止/失败时解锁对应的 pending."""
+        # event: 0=STARTED, 1=COMPLETED, 2=STOPPED, 3=CANCELLED, 4=FAILED
+        sid = msg.sid
+        event_code = msg.event
+        if event_code >= 1:
+            # 缓存事件（防止 _wait_cb 还没注册 pending 时 miss）
+            self._play_event_buffer[sid] = event_code
+            # 如果已注册 pending，直接解锁
+            if sid in self._pending_play:
+                self._pending_play_status[sid] = event_code
+                self._pending_play[sid].set()
+            event_name = self._EVENT_NAMES.get(event_code, f"UNKNOWN({event_code})")
+            print(f"[TtsPlugin] PlayEvent: sid={sid} {event_name}")
+
+    def _on_play_progress(self, msg):
+        """PlayProgress callback: 获取播放总时长，用于精确超时计算。"""
+        sid = msg.sid
+        duration = msg.duration
+        if sid and duration > 0 and sid in self._pending_play:
+            # 只更新一次（取第一次收到的 duration）
+            if sid not in self._pending_play_duration:
+                self._pending_play_duration[sid] = duration
+                print(f"[TtsPlugin] PlayProgress: sid={sid} duration={duration:.1f}s")
 
     def stop(self):
         pass
@@ -3747,16 +3864,131 @@ class TtsPlugin:
         if not self._play_client:
             return {"error": "service client not initialized"}
         try:
-            from lyre_msgs.srv import PlayText
-            req = PlayText.Request()
-            req.text = text
-            req.force = force
-            req.last = True
-            future = self._play_client.call_async(req)
-            # Non-blocking, just return immediately
-            return {"state": "speaking", "text": text[:50]}
+            import uuid as _uuid
+            action_id = f"tts-{_uuid.uuid4().hex[:8]}"
+
+            # 分段：超过 280 字按标点切分，避免超长文本 PlayEvent 丢失
+            segments = self._split_text(text, max_chars=280)
+
+            # Background thread: 逐段播放, 全部完成后 ACP callback
+            threading.Thread(
+                target=self._speak_segments,
+                args=(segments, force, action_id, text),
+                daemon=True,
+            ).start()
+            return {"state": "speaking", "action_id": action_id, "text": text[:50],
+                    "segments": len(segments)}
         except Exception as e:
             return {"error": str(e)}
+
+    @staticmethod
+    def _split_text(text: str, max_chars: int = 280) -> list[str]:
+        """按标点分段，每段不超过 max_chars 字。"""
+        import re as _re
+        sentences = _re.split(r'(?<=[。！？；\n])', text)
+        segments = []
+        current = ""
+        for sent in sentences:
+            if not sent:
+                continue
+            if len(current) + len(sent) > max_chars and current:
+                segments.append(current)
+                current = sent
+            else:
+                current += sent
+        if current:
+            segments.append(current)
+        return segments if segments else [text]
+
+    def _speak_segments(self, segments: list, force: bool, action_id: str, full_text: str):
+        """顺序播放多段文本，全部完成后 ACP callback。"""
+        import time as _t
+        from lyre_msgs.srv import PlayText
+
+        overall_status = "completed"
+
+        for i, seg_text in enumerate(segments):
+            is_last = (i == len(segments) - 1)
+            # 发送 PlayText service
+            req = PlayText.Request()
+            req.text = seg_text
+            req.force = force if i == 0 else False  # 只第一段 force
+            req.last = is_last
+            future = self._play_client.call_async(req)
+
+            # Phase 1: 等 service response（获取 sid）
+            timeout_service = 10.0
+            start = _t.time()
+            while not future.done() and _t.time() - start < timeout_service:
+                _t.sleep(0.1)
+
+            sid = None
+            if future.done():
+                result = future.result()
+                if result:
+                    sid = getattr(result, 'sid', None)
+
+            # Phase 2: 等 PlayEvent
+            if sid:
+                buffered = self._play_event_buffer.pop(sid, None)
+                if buffered is not None:
+                    seg_status = "completed" if buffered == 1 else "error"
+                    print(f"[TtsPlugin] seg {i+1}/{len(segments)} from buffer: sid={sid} event={buffered}")
+                else:
+                    ev = threading.Event()
+                    self._pending_play[sid] = ev
+                    _t.sleep(0.3)
+                    reported_duration = self._pending_play_duration.get(sid)
+                    if reported_duration and reported_duration > 0:
+                        play_timeout = reported_duration + 8.0
+                    else:
+                        # 更宽松: 2.5字/秒 + 10s buffer
+                        play_timeout = len(seg_text) / 2.5 + 10.0
+                    if not ev.wait(timeout=play_timeout):
+                        seg_status = "error"
+                        print(f"[TtsPlugin] PlayEvent timeout: seg {i+1}/{len(segments)} sid={sid}, waited {play_timeout:.0f}s (duration={reported_duration})")
+                    else:
+                        event_code = self._pending_play_status.get(sid, 1)
+                        # event_code: 1=COMPLETED, 2=STOPPED (也算完成), 3=CANCELLED, 4=FAILED
+                        seg_status = "completed" if event_code <= 2 else "error"
+                        if event_code > 2:
+                            event_name = self._EVENT_NAMES.get(event_code, f"UNKNOWN({event_code})")
+                            print(f"[TtsPlugin] seg {i+1}/{len(segments)} failed: {event_name} (code={event_code})")
+                        elif event_code == 2:
+                            print(f"[TtsPlugin] seg {i+1}/{len(segments)} STOPPED (treated as completed)")
+                    self._pending_play.pop(sid, None)
+                    self._pending_play_status.pop(sid, None)
+                self._pending_play_duration.pop(sid, None)
+                self._play_event_buffer.pop(sid, None)
+
+                if seg_status == "error" and not is_last:
+                    # 某段 error 但还有后续段，继续播下一段
+                    print(f"[TtsPlugin] seg {i+1} error, continuing to next segment")
+                    continue
+                elif seg_status == "error" and is_last:
+                    overall_status = "error"
+            elif not sid:
+                # 没拿到 sid，fallback 按字数估算
+                fallback_s = len(seg_text) / 2.5 + 5.0
+                _t.sleep(fallback_s)
+                print(f"[TtsPlugin] no sid from service seg {i+1}, fallback sleep {fallback_s:.0f}s")
+
+        # ACP callback
+        try:
+            import urllib.request, ssl, json as _json, os as _os
+            url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            p = _json.dumps({"action_id": action_id, "status": overall_status,
+                             "result": {"action": "speak", "sid": sid or "unknown",
+                                        "segments": len(segments)}}).encode()
+            r = urllib.request.Request(f"{url}/api/acp/complete", data=p,
+                                      headers={"Content-Type": "application/json"}, method="POST")
+            urllib.request.urlopen(r, timeout=5, context=ctx)
+            print(f"[TtsPlugin] ACP {overall_status}: {action_id} ({len(segments)} segs, {len(full_text)} chars)")
+        except Exception as e:
+            print(f"[TtsPlugin] ACP callback failed: {e}")
 
     def _call_empty_service(self, client, action_name: str) -> dict:
         if not client:
@@ -3845,6 +4077,10 @@ class VoicePlayActuatorPlugin:
                     "force": {"type": "boolean", "description": "强制播放(停止当前任务立即播放,可选)"},
                 },
                 "required": ["action"],
+                "x-completion": {
+                    "actions": ["play_text", "play_file", "play_url"],
+                    "timeout": 60
+                },
                 "x-action-params": {
                     "play_file": {"params": ["path", "force"], "description": "播放本地音频文件"},
                     "play_url":  {"params": ["url", "force"],  "description": "播放远程URL音频"},
@@ -3934,11 +4170,49 @@ class VoicePlayActuatorPlugin:
 
         try:
             future = client.call_async(req)
-            # play_file/play_url/play_text: fire-and-forget, 不等合成完成
+            # play_file/play_url/play_text: 立即返回 action_id，后台等待完成后回调
             if action in ("play_file", "play_url", "play_text"):
+                import uuid as _uuid
+                action_id = f"voice-{_uuid.uuid4().hex[:8]}"
+                # 后台线程等待 service response 后回调 Agent Core
+                def _wait_and_callback(fut, aid, act):
+                    try:
+                        timeout = 60.0
+                        start = time.time()
+                        while not fut.done() and time.time() - start < timeout:
+                            time.sleep(0.1)
+                        if fut.done():
+                            result = fut.result()
+                            code = int(getattr(result, "code", 0)) if result else -1
+                            status = "completed" if code == 0 else "error"
+                        else:
+                            status = "completed"  # timeout 也视为播完
+                    except Exception:
+                        status = "error"
+                    # ACP callback
+                    try:
+                        import urllib.request as _urllib
+                        import ssl as _ssl
+                        import os as _os
+                        agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+                        ctx = _ssl.create_default_context()
+                        ctx.check_hostname = False
+                        ctx.verify_mode = _ssl.CERT_NONE
+                        payload = json.dumps({"action_id": aid, "status": status,
+                                              "result": {"action": act}}).encode()
+                        _req = _urllib.Request(f"{agent_core_url}/api/acp/complete",
+                                              data=payload, headers={"Content-Type": "application/json"},
+                                              method="POST")
+                        _urllib.urlopen(_req, timeout=3, context=ctx)
+                        print(f"[VoicePlay] ACP complete: {aid} ({status})")
+                    except Exception as e:
+                        print(f"[VoicePlay] ACP callback failed: {e}")
+                threading.Thread(target=_wait_and_callback,
+                                 args=(future, action_id, action), daemon=True).start()
                 return {
                     "ok": True, "code": 0,
                     "message": "submitted",
+                    "action_id": action_id,
                     "action": action,
                     "timestamp_ms": int(time.time() * 1000),
                 }
@@ -3973,6 +4247,10 @@ class VoicePlayActuatorPlugin:
 class NavPlugin:
     """底盘导航控制 — 自主导航/遥控/旋转/回桩"""
 
+    _ACP_ACTIONS = frozenset(("move_to", "rotate", "rotate_to", "go_home"))
+    _POLL_INTERVAL = 1.0
+    _STALL_TIMEOUT = 60.0
+
     def __init__(self, plugin_config: dict, namespace: str, ros2, slamtec_client):
         self._ns = namespace
         self._ros2 = ros2
@@ -4006,17 +4284,21 @@ class NavPlugin:
                     "vyaw": {"type": "number", "description": "旋转速度(rad/s), 正=逆时针"},
                 },
                 "required": ["action"],
+                "x-completion": {
+                    "actions": ["move_to", "rotate", "rotate_to", "go_home"],
+                    "timeout": 180,
+                },
                 "x-action-params": {
                     "move_to": {"params": ["x", "y", "speed"],
-                                "description": "自主导航到目标点(带避障)"},
+                                "description": "自主导航到目标点(带避障)，系统自动等待到达"},
                     "move_by": {"params": ["direction", "speed"],
                                 "description": "方向遥控移动(不避障, 持续500ms)"},
                     "rotate": {"params": ["angle"],
-                               "description": "原地旋转指定角度(度)"},
+                               "description": "原地旋转指定角度(度)，系统自动等待完成"},
                     "rotate_to": {"params": ["angle"],
-                                  "description": "原地旋转到绝对角度(度)"},
+                                  "description": "原地旋转到绝对角度(度)，系统自动等待完成"},
                     "go_home": {"params": [],
-                                "description": "自主导航回充电桩"},
+                                "description": "自主导航回充电桩，系统自动等待到达"},
                     "cancel": {"params": [],
                              "description": "取消当前导航动作"},
                     "get_pose": {"params": [],
@@ -4042,7 +4324,11 @@ class NavPlugin:
             y = args.get("y", 0)
             speed = args.get("speed")
             result = self._slamtec.move_to(x, y, speed_ratio=speed)
-            return {"state": "navigating", "target": {"x": x, "y": y}, "api_result": result}
+            action_id = self._start_poll(action, result, {"x": x, "y": y})
+            resp = {"state": "navigating", "target": {"x": x, "y": y}, "api_result": result}
+            if action_id:
+                resp["action_id"] = action_id
+            return resp
 
         elif action == "move_by":
             direction = args.get("direction", "forward")
@@ -4055,17 +4341,29 @@ class NavPlugin:
             angle_deg = args.get("angle", 0)
             angle_rad = _deg2rad(angle_deg)
             result = self._slamtec.rotate(angle_rad)
-            return {"state": "rotating", "angle": angle_deg, "api_result": result}
+            action_id = self._start_poll(action, result, {"angle": angle_deg})
+            resp = {"state": "rotating", "angle": angle_deg, "api_result": result}
+            if action_id:
+                resp["action_id"] = action_id
+            return resp
 
         elif action == "rotate_to":
             angle_deg = args.get("angle", 0)
             angle_rad = _deg2rad(angle_deg)
             result = self._slamtec.rotate_to(angle_rad)
-            return {"state": "rotating_to", "angle": angle_deg, "api_result": result}
+            action_id = self._start_poll(action, result, {"angle": angle_deg})
+            resp = {"state": "rotating_to", "angle": angle_deg, "api_result": result}
+            if action_id:
+                resp["action_id"] = action_id
+            return resp
 
         elif action == "go_home":
             result = self._slamtec.go_home()
-            return {"state": "going_home", "api_result": result}
+            action_id = self._start_poll(action, result, {})
+            resp = {"state": "going_home", "api_result": result}
+            if action_id:
+                resp["action_id"] = action_id
+            return resp
 
         elif action == "cancel":
             result = self._slamtec.cancel_current_action()
@@ -4085,6 +4383,92 @@ class NavPlugin:
         elif action in ("start", "info"):
             return {"state": "ready"}
         return {"error": f"unknown action: {action}"}
+
+    def _start_poll(self, action: str, api_result: dict, context: dict) -> str | None:
+        """Start ACP polling thread for a Slamtec action. Returns action_id or None."""
+        from uuid import uuid4
+        action_id = f"nav_{action}_{uuid4().hex[:8]}"
+        threading.Thread(
+            target=self._poll_loop,
+            args=(action_id, action, context),
+            daemon=True,
+        ).start()
+        return action_id
+
+    def _poll_loop(self, action_id: str, action: str, context: dict):
+        """Poll Slamtec for action completion, then fire ACP callback."""
+        t0 = time.time()
+        last_pose = None
+        last_move_time = time.time()
+
+        while True:
+            time.sleep(self._POLL_INTERVAL)
+            elapsed = time.time() - t0
+
+            # Check if action is still running
+            try:
+                current = self._slamtec.get_current_action()
+            except Exception:
+                current = {}
+
+            # Slamtec status: action_status 0=waiting, 1=running, 2=finished, 3=paused, 4=error
+            status = current.get("action_status") if current else None
+
+            if status == 2:  # finished
+                result_code = current.get("result", 0)
+                if result_code == 0:
+                    _acp_notify(action_id, "completed", {
+                        "action": action, "elapsed": round(elapsed, 1), **context,
+                    }, "nav")
+                else:
+                    _acp_notify(action_id, "error", {
+                        "action": action, "error": f"result_code={result_code}",
+                        "elapsed": round(elapsed, 1), **context,
+                    }, "nav")
+                return
+
+            if status == 4:  # error
+                _acp_notify(action_id, "error", {
+                    "action": action, "error": "action_error",
+                    "elapsed": round(elapsed, 1), **context,
+                }, "nav")
+                return
+
+            if status is None and elapsed > 3.0:
+                # No current action — may have completed between polls
+                _acp_notify(action_id, "completed", {
+                    "action": action, "elapsed": round(elapsed, 1), **context,
+                }, "nav")
+                return
+
+            # Stall detection (move_to/go_home only)
+            if action in ("move_to", "go_home"):
+                try:
+                    pose = self._slamtec.get_pose()
+                    if last_pose:
+                        dx = pose.get("x", 0) - last_pose.get("x", 0)
+                        dy = pose.get("y", 0) - last_pose.get("y", 0)
+                        if (dx * dx + dy * dy) > 0.01:  # moved > 0.1m
+                            last_pose = pose
+                            last_move_time = time.time()
+                        elif time.time() - last_move_time > self._STALL_TIMEOUT:
+                            _acp_notify(action_id, "error", {
+                                "action": action, "error": "stall_timeout",
+                                "elapsed": round(elapsed, 1), **context,
+                            }, "nav")
+                            return
+                    else:
+                        last_pose = pose
+                        last_move_time = time.time()
+                except Exception:
+                    pass
+
+            # Hard timeout
+            if elapsed > 180:
+                _acp_notify(action_id, "error", {
+                    "action": action, "error": "timeout", "elapsed": 180, **context,
+                }, "nav")
+                return
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -5167,6 +5551,10 @@ class ChassisRawPlugin:
                                  "description": "持续时间(秒), -1=持续运动 (不填 angle 时生效)"},
                 },
                 "required": ["action"],
+                "x-completion": {
+                    "actions": ["move", "rotate"],
+                    "timeout": 60
+                },
                 "x-action-params": {
                     "move":   {"params": ["direction", "duration"],
                                "description": "前进/后退, 固定速率 0.3 m/s, duration=-1 持续运动"},
@@ -5248,15 +5636,18 @@ class ChassisRawPlugin:
         continuous = (duration < 0)
         self._running = True
         gen = self._gen
+        import uuid as _uuid
+        action_id = f"move-{_uuid.uuid4().hex[:8]}"
         threading.Thread(
-            target=self._move_loop, args=(direction, duration, continuous, gen), daemon=True
+            target=self._move_loop, args=(direction, duration, continuous, gen, action_id), daemon=True
         ).start()
 
         return {"direction": self.DIR_NAMES[direction],
                 "duration": duration, "continuous": continuous,
+                "action_id": action_id,
                 "speed": "0.3 m/s (fixed)" if direction < 2 else "1.0 rad/s (fixed)"}
 
-    def _move_loop(self, direction: int, total_duration: float, continuous: bool, gen: int):
+    def _move_loop(self, direction: int, total_duration: float, continuous: bool, gen: int, action_id: str = ''):
         """运动控制 — 非持续模式发单次精确定时 move_by; 持续模式每 200ms 刷新。"""
         if not continuous:
             # 单次精确运动: move_by duration 单位是毫秒
@@ -5267,6 +5658,9 @@ class ChassisRawPlugin:
             time.sleep(total_duration + 0.3)  # 等运动完成+缓冲
             if self._running and self._gen == gen:
                 self._do_stop()
+            # ACP callback
+            if action_id:
+                self._acp_move_callback(action_id, "completed", total_duration)
             return
 
         # 持续模式: 每 200ms 刷新 300ms 运动指令保持连续
@@ -5280,6 +5674,29 @@ class ChassisRawPlugin:
             time.sleep(step)
         if self._running and self._gen == gen:
             self._do_stop()
+        # ACP callback for continuous mode (stopped by brake)
+        if action_id:
+            self._acp_move_callback(action_id, "completed", -1)
+
+    def _acp_move_callback(self, action_id: str, status: str, duration: float):
+        """POST movement completion to Agent Core."""
+        try:
+            import urllib.request as _urllib
+            import ssl as _ssl
+            import os as _os
+            agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+            ctx = _ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = _ssl.CERT_NONE
+            payload = json.dumps({"action_id": action_id, "status": status,
+                                  "result": {"duration": duration}}).encode()
+            req = _urllib.Request(f"{agent_core_url}/api/acp/complete",
+                                 data=payload, headers={"Content-Type": "application/json"},
+                                 method="POST")
+            _urllib.urlopen(req, timeout=3, context=ctx)
+            print(f"[ChassisRawPlugin] ACP complete: {action_id} ({status})")
+        except Exception as e:
+            print(f"[ChassisRawPlugin] ACP callback failed: {e}")
 
     def _do_stop(self) -> dict:
         self._running = False
