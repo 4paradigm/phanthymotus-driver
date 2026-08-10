@@ -2302,6 +2302,191 @@ class GripperControlPlugin:
         return {"results": results, "force_pct": self._force_pct}
 
 
+# ── HeadControlPlugin (actuator) ─────────────────────────────────────────────
+
+class HeadControlPlugin:
+    PREFIX = "head_control"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor):
+        self._motor_index = int(plugin_config.get("motor_index", 23))
+        self._min_angle_rad = math.radians(float(plugin_config.get("min_angle_deg", -90.0)))
+        self._max_angle_rad = math.radians(float(plugin_config.get("max_angle_deg", 90.0)))
+        self._motor_mode = int(plugin_config.get("motor_mode", 10))
+        self._default_kp = float(plugin_config.get("default_kp", 20.0))
+        self._default_kd = float(plugin_config.get("default_kd", 1.0))
+        self._lowcmd_topic = plugin_config.get("lowcmd_topic", "rt/lowcmd")
+        self._lowstate_topic = plugin_config.get("lowstate_topic", "rt/lowstate")
+        self._shake_amplitude_deg = float(plugin_config.get("shake_amplitude_deg", 30.0))
+        self._shake_speed_hz = float(plugin_config.get("shake_speed_hz", 1.5))
+        self._shake_times = int(plugin_config.get("shake_times", 3))
+        self._publisher = None
+        self._animation_stop = threading.Event()
+        self._animation_thread = None
+        self._state_lock = threading.Lock()
+        self._current_angle_rad = None
+        self._last_commanded_angle_rad = 0.0
+
+        try:
+            from unitree_sdk2py.core.channel import ChannelSubscriber
+            from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
+            self._subscriber = ChannelSubscriber(self._lowstate_topic, LowState_)
+            self._subscriber.Init(self._on_lowstate, 10)
+        except Exception as e:
+            self._subscriber = None
+            print(f"[head_control] LowState subscription unavailable: {e}")
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "head_control",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "G1 head yaw control — set angle, recenter, shake head, or read current angle",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["set_angle", "recenter", "shake_head", "get_angle"],
+                        "description": "Action to perform",
+                    },
+                    "angle_deg": {
+                        "type": "number",
+                        "minimum": math.degrees(self._min_angle_rad),
+                        "maximum": math.degrees(self._max_angle_rad),
+                        "description": "Target yaw angle in degrees; negative is left and positive is right",
+                    },
+                    "speed": {
+                        "type": "number",
+                        "exclusiveMinimum": 0,
+                        "description": "Shake frequency in Hz",
+                    },
+                    "times": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Number of shake cycles",
+                    },
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "set_angle": {"params": ["angle_deg"], "description": "Set head yaw angle"},
+                    "recenter": {"params": [], "description": "Return head yaw to zero"},
+                    "shake_head": {"params": ["speed", "times"], "description": "Shake head asynchronously, then return to the starting angle"},
+                    "get_angle": {"params": [], "description": "Read the current head yaw angle from LowState"},
+                },
+            },
+        }
+
+    def start(self) -> None:
+        pass  # DDS publisher is initialized lazily on the first motion command
+
+    def stop(self) -> None:
+        self._animation_stop.set()
+
+    def _on_lowstate(self, msg) -> None:
+        if self._motor_index >= len(msg.motor_state):
+            return
+        with self._state_lock:
+            self._current_angle_rad = float(msg.motor_state[self._motor_index].q)
+
+    def _get_publisher(self):
+        if self._publisher is None:
+            from unitree_sdk2py.core.channel import ChannelPublisher
+            from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_
+            self._publisher = ChannelPublisher(self._lowcmd_topic, LowCmd_)
+            self._publisher.Init()
+        return self._publisher
+
+    def _send_position(self, angle_rad: float) -> dict:
+        from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
+
+        angle_rad = max(self._min_angle_rad, min(self._max_angle_rad, angle_rad))
+        message = unitree_hg_msg_dds__LowCmd_()
+        motor = message.motor_cmd[self._motor_index]
+        # TODO: Confirm motor index 23, position mode 10, angle direction, and physical limits on hardware.
+        motor.mode = self._motor_mode
+        motor.q = angle_rad
+        motor.dq = 0.0
+        motor.tau = 0.0
+        motor.kp = self._default_kp
+        motor.kd = self._default_kd
+        # TODO: Confirm whether LowCmd CRC must be calculated before publishing.
+        published = self._get_publisher().Write(message)
+        with self._state_lock:
+            self._last_commanded_angle_rad = angle_rad
+        return {
+            "angle_deg": math.degrees(angle_rad),
+            "angle_rad": angle_rad,
+            "published": bool(published),
+        }
+
+    def _cancel_animation(self) -> None:
+        self._animation_stop.set()
+
+    def _start_shake(self, speed_hz: float, times: int) -> dict:
+        self._cancel_animation()
+        stop_event = threading.Event()
+        self._animation_stop = stop_event
+        with self._state_lock:
+            origin = self._current_angle_rad
+            if origin is None:
+                origin = self._last_commanded_angle_rad
+
+        amplitude = math.radians(self._shake_amplitude_deg)
+        duration = times / speed_hz
+
+        def animate():
+            started = time.monotonic()
+            while not stop_event.is_set():
+                elapsed = time.monotonic() - started
+                if elapsed >= duration:
+                    break
+                angle = origin + amplitude * math.sin(2.0 * math.pi * speed_hz * elapsed)
+                self._send_position(angle)
+                stop_event.wait(0.02)
+            if not stop_event.is_set():
+                self._send_position(origin)
+
+        self._animation_thread = threading.Thread(target=animate, daemon=True, name="head_shake")
+        self._animation_thread.start()
+        return {
+            "state": "shaking",
+            "speed_hz": speed_hz,
+            "times": times,
+            "amplitude_deg": self._shake_amplitude_deg,
+            "return_angle_deg": math.degrees(origin),
+        }
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "ready"}
+        if action == "set_angle":
+            if "angle_deg" not in args:
+                return {"error": "angle_deg is required"}
+            angle_deg = float(args["angle_deg"])
+            if not math.degrees(self._min_angle_rad) <= angle_deg <= math.degrees(self._max_angle_rad):
+                return {"error": f"angle_deg must be between {math.degrees(self._min_angle_rad)} and {math.degrees(self._max_angle_rad)}"}
+            self._cancel_animation()
+            return self._send_position(math.radians(angle_deg))
+        if action == "recenter":
+            self._cancel_animation()
+            return self._send_position(0.0)
+        if action == "shake_head":
+            speed_hz = float(args.get("speed", self._shake_speed_hz))
+            times = int(args.get("times", self._shake_times))
+            if speed_hz <= 0:
+                return {"error": "speed must be greater than 0"}
+            if times < 1:
+                return {"error": "times must be at least 1"}
+            return self._start_shake(speed_hz, times)
+        if action == "get_angle":
+            with self._state_lock:
+                angle_rad = self._current_angle_rad
+            if angle_rad is None:
+                return {"error": "No LowState angle received yet"}
+            return {"angle_deg": math.degrees(angle_rad), "angle_rad": angle_rad}
+        return None
+
+
 # ── LidarPlugin (sensor) ─────────────────────────────────────────────────────
 
 LIDAR_CLOUD_INTERVAL = 0.05      # 20 Hz max (source is ~10Hz, allow headroom)

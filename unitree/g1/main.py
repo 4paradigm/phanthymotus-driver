@@ -139,6 +139,11 @@ class G1DeviceBundle:
             self._plugins.append(GripperControlPlugin(plugins_cfg["gripper_control"], namespace, executor))
             print("[bundle] GripperControlPlugin loaded")
 
+        if plugins_cfg.get("head_control", {}).get("enabled", False):
+            from device import HeadControlPlugin
+            self._plugins.append(HeadControlPlugin(plugins_cfg["head_control"], namespace, executor))
+            print("[bundle] HeadControlPlugin loaded")
+
         if plugins_cfg.get("camera", {}).get("enabled", False):
             from device import RealSensePlugin
             self._plugins.append(RealSensePlugin(plugins_cfg["camera"], namespace, executor))
