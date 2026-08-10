@@ -2054,6 +2054,19 @@ class HeadGesturePlugin:
                     "actions": ["scan", "shake"],
                     "timeout": 30,
                 },
+                # Agent Core exposes actuator actions to the LLM through this
+                # split-tool map.  Keep nod/shake explicit: the generic
+                # ``action`` enum alone is not surfaced as a callable choice
+                # by the current runtime and can make the model fall back to
+                # the only cached action (typically tilt).
+                "x-action-params": {
+                    "nod": {"params": [], "description": "点头后回正，表示肯定或回答正确"},
+                    "shake": {"params": [], "description": "摇头后回正，表示否定或回答错误"},
+                    "scan": {"params": [], "description": "左右观察后回正"},
+                    "tilt": {"params": [], "description": "向默认方向歪头后回正，仅表示疑惑或部分正确"},
+                    "reset": {"params": ["speed"], "description": "取消序列并将头部回正"},
+                    "cancel": {"params": [], "description": "取消尚未发送的后续动作帧"},
+                },
             },
         }
 
