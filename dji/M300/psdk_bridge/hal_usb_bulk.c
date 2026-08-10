@@ -1,110 +1,134 @@
 #include "hal_usb_bulk.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <errno.h>
 
 #ifdef PSDK_ENABLED
+
+#include <libusb-1.0/libusb.h>
+#include <stdio.h>
+#include <stdlib.h>
+
 #include "dji_platform.h"
 
 /*
- * USB Bulk HAL for DJI PSDK — FunctionFS endpoints.
- *
- * Each bulk channel has:
- *   ep1 = EP_IN  (read: data from aircraft to Jetson)
- *   ep2 = EP_OUT (write: data from Jetson to aircraft)
- *
- * WriteData → write to ep_in (fd_in = ep1)
- * ReadData  → read from ep_out (fd_out = ep2)
+ * M300 presents itself to the Jetson as a USB device (VID:PID 2ca3:001f).
+ * PSDK supplies the interface number and endpoints for each stream channel;
+ * the host must claim those interfaces with libusb.  FunctionFS is the
+ * inverse topology (Jetson acting as USB device) and cannot receive M300
+ * liveview data.
  */
-
 typedef struct {
-    int fd_in;
-    int fd_out;
-    int channel;  /* 1, 2, or 3 */
-} BulkHandle_t;
+    libusb_device_handle *device;
+    T_DjiHalUsbBulkInfo info;
+} T_UsbBulkHandle;
 
-static T_DjiReturnCode _UsbBulk_Init(T_DjiHalUsbBulkInfo usbBulkInfo,
-                                      T_DjiUsbBulkHandle *usbBulkHandle) {
-    /* Determine channel from endpoint address */
-    int channel;
-    if (usbBulkInfo.channelInfo.endPointIn == 0x81) channel = 1;
-    else if (usbBulkInfo.channelInfo.endPointIn == 0x82) channel = 2;
-    else if (usbBulkInfo.channelInfo.endPointIn == 0x83) channel = 3;
-    else channel = 1;
+static T_DjiReturnCode _UsbBulk_Init(T_DjiHalUsbBulkInfo info,
+                                     T_DjiUsbBulkHandle *out_handle) {
+    T_UsbBulkHandle *handle;
+    int rc;
 
-    /* DJI convention: ep1 = EP_IN_FD, ep2 = EP_OUT_FD */
-    char ep_in[64], ep_out[64];
-    snprintf(ep_in, sizeof(ep_in), "/dev/usb-ffs/bulk%d/ep1", channel);
-    snprintf(ep_out, sizeof(ep_out), "/dev/usb-ffs/bulk%d/ep2", channel);
+    if (!out_handle || !info.isUsbHost)
+        return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
 
-    BulkHandle_t *h = (BulkHandle_t *)malloc(sizeof(BulkHandle_t));
-    if (!h) return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
+    handle = calloc(1, sizeof(*handle));
+    if (!handle)
+        return DJI_ERROR_SYSTEM_MODULE_CODE_MEMORY_ALLOC_FAILED;
 
-    h->channel = channel;
-    h->fd_in = open(ep_in, O_RDWR);
-    if (h->fd_in < 0) {
-        printf("[usb_bulk] open %s failed: %s\n", ep_in, strerror(errno));
-        free(h);
+    rc = libusb_init(NULL);
+    if (rc != LIBUSB_SUCCESS)
+        goto fail;
+
+    handle->device = libusb_open_device_with_vid_pid(NULL, info.vid, info.pid);
+    if (!handle->device) {
+        printf("[usb_bulk] DJI USB %04x:%04x not found\n", info.vid, info.pid);
+        goto fail_exit;
+    }
+
+    /* The M300 liveview endpoints are vendor-specific, but auto-detach keeps
+     * this safe on boards where a generic driver has bound the interface. */
+    (void)libusb_set_auto_detach_kernel_driver(handle->device, 1);
+    rc = libusb_claim_interface(handle->device, info.channelInfo.interfaceNum);
+    if (rc != LIBUSB_SUCCESS) {
+        printf("[usb_bulk] claim interface %u failed: %s\n",
+               info.channelInfo.interfaceNum, libusb_error_name(rc));
+        goto fail_close;
+    }
+
+    handle->info = info;
+    *out_handle = handle;
+    printf("[usb_bulk] host %04x:%04x interface=%u in=0x%02x out=0x%02x\n",
+           info.vid, info.pid, info.channelInfo.interfaceNum,
+           info.channelInfo.endPointIn, info.channelInfo.endPointOut);
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+
+fail_close:
+    libusb_close(handle->device);
+fail_exit:
+    libusb_exit(NULL);
+fail:
+    free(handle);
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
+}
+
+static T_DjiReturnCode _UsbBulk_DeInit(T_DjiUsbBulkHandle opaque) {
+    T_UsbBulkHandle *handle = opaque;
+    if (!handle)
+        return DJI_ERROR_SYSTEM_MODULE_CODE_INVALID_PARAMETER;
+    libusb_release_interface(handle->device, handle->info.channelInfo.interfaceNum);
+    libusb_close(handle->device);
+    libusb_exit(NULL);
+    free(handle);
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
+static T_DjiReturnCode _UsbBulk_Transfer(T_DjiUsbBulkHandle opaque, uint8_t endpoint,
+                                         uint8_t *data, uint32_t len, uint32_t *real_len,
+                                         unsigned int timeout_ms) {
+    T_UsbBulkHandle *handle = opaque;
+    int actual_len = 0;
+    int rc;
+
+    if (!handle || !data || !real_len)
+        return DJI_ERROR_SYSTEM_MODULE_CODE_INVALID_PARAMETER;
+    rc = libusb_bulk_transfer(handle->device, endpoint, data, (int)len,
+                              &actual_len, timeout_ms);
+    if (rc != LIBUSB_SUCCESS) {
+        *real_len = 0;
+        if (rc != LIBUSB_ERROR_TIMEOUT)
+            printf("[usb_bulk] transfer endpoint 0x%02x failed: %s\n",
+                   endpoint, libusb_error_name(rc));
         return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
     }
-    h->fd_out = open(ep_out, O_RDWR);
-    if (h->fd_out < 0) {
-        printf("[usb_bulk] open %s failed: %s\n", ep_out, strerror(errno));
-        close(h->fd_in);
-        free(h);
-        return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
-    }
-
-    *usbBulkHandle = (T_DjiUsbBulkHandle)h;
-    printf("[usb_bulk] ch%d init (ep_in=%s ep_out=%s isHost=%d)\n",
-           channel, ep_in, ep_out, usbBulkInfo.isUsbHost);
+    *real_len = (uint32_t)actual_len;
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
 
-static T_DjiReturnCode _UsbBulk_DeInit(T_DjiUsbBulkHandle usbBulkHandle) {
-    BulkHandle_t *h = (BulkHandle_t *)usbBulkHandle;
-    if (h) {
-        if (h->fd_in >= 0) close(h->fd_in);
-        if (h->fd_out >= 0) close(h->fd_out);
-        free(h);
-    }
+static T_DjiReturnCode _UsbBulk_WriteData(T_DjiUsbBulkHandle handle,
+                                          const uint8_t *data, uint32_t len,
+                                          uint32_t *real_len) {
+    T_UsbBulkHandle *bulk = handle;
+    if (!bulk)
+        return DJI_ERROR_SYSTEM_MODULE_CODE_INVALID_PARAMETER;
+    return _UsbBulk_Transfer(handle, (uint8_t)bulk->info.channelInfo.endPointOut,
+                             (uint8_t *)data, len, real_len, 50);
+}
+
+static T_DjiReturnCode _UsbBulk_ReadData(T_DjiUsbBulkHandle handle,
+                                         uint8_t *data, uint32_t len,
+                                         uint32_t *real_len) {
+    T_UsbBulkHandle *bulk = handle;
+    if (!bulk)
+        return DJI_ERROR_SYSTEM_MODULE_CODE_INVALID_PARAMETER;
+    return _UsbBulk_Transfer(handle, (uint8_t)bulk->info.channelInfo.endPointIn,
+                             data, len, real_len, 0);
+}
+
+static T_DjiReturnCode _UsbBulk_GetDeviceInfo(T_DjiHalUsbBulkDeviceInfo *info) {
+    /* This callback is only used when the payload computer is a USB gadget.
+     * M300 is host-connected, so the SDK passes the aircraft VID/PID to Init. */
+    if (!info)
+        return DJI_ERROR_SYSTEM_MODULE_CODE_INVALID_PARAMETER;
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
 
-static T_DjiReturnCode _UsbBulk_WriteData(T_DjiUsbBulkHandle usbBulkHandle,
-                                           const uint8_t *buf, uint32_t len, uint32_t *realLen) {
-    BulkHandle_t *h = (BulkHandle_t *)usbBulkHandle;
-    ssize_t n = write(h->fd_in, buf, len);  /* ep1 = IN direction (write to host) */
-    *realLen = (n > 0) ? (uint32_t)n : 0;
-    *realLen = (n > 0) ? (uint32_t)n : 0;
-    return (n >= 0) ? DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS : DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
-}
-
-static T_DjiReturnCode _UsbBulk_ReadData(T_DjiUsbBulkHandle usbBulkHandle,
-                                          uint8_t *buf, uint32_t len, uint32_t *realLen) {
-    BulkHandle_t *h = (BulkHandle_t *)usbBulkHandle;
-    ssize_t n = read(h->fd_out, buf, len);  /* ep2 = OUT direction (read from host) */
-    *realLen = (n > 0) ? (uint32_t)n : 0;
-    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
-}
-
-static T_DjiReturnCode _UsbBulk_GetDeviceInfo(T_DjiHalUsbBulkDeviceInfo *deviceInfo) {
-    deviceInfo->vid = 0x2CA3;
-    deviceInfo->pid = 0xF001;
-    /* Channel endpoint addresses */
-    deviceInfo->channelInfo[0].endPointIn = 0x81;
-    deviceInfo->channelInfo[0].endPointOut = 0x01;
-    deviceInfo->channelInfo[1].endPointIn = 0x82;
-    deviceInfo->channelInfo[1].endPointOut = 0x02;
-    deviceInfo->channelInfo[2].endPointIn = 0x83;
-    deviceInfo->channelInfo[2].endPointOut = 0x03;
-    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
-}
-
-/* Public: register USB Bulk HAL with PSDK */
 T_DjiHalUsbBulkHandler g_usbBulkHandler = {
     .UsbBulkInit = _UsbBulk_Init,
     .UsbBulkDeInit = _UsbBulk_DeInit,
@@ -113,4 +137,4 @@ T_DjiHalUsbBulkHandler g_usbBulkHandler = {
     .UsbBulkGetDeviceInfo = _UsbBulk_GetDeviceInfo,
 };
 
-#endif /* PSDK_ENABLED */
+#endif
