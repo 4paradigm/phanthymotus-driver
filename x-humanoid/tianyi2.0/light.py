@@ -63,6 +63,13 @@ class LightPlugin:
                     action: {"params": ["duration"], "description": action}
                     for action in self._commands
                 },
+                "x-hooks": {
+                    "on_hearing":  {"action": "blue_breathing", "params": {"duration": -1}},
+                    "on_thinking": {"action": "rainbow",        "params": {"duration": -1}},
+                    "on_speaking": {"action": "white",          "params": {"duration": -1}},
+                    "on_idle":     {"action": "blue_standby",   "params": {"duration": -1}},
+                    "on_error":    {"action": "error",          "params": {"duration": 5}},
+                },
             },
         }
 
