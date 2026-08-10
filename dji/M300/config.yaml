@@ -8,9 +8,10 @@ psdk_bridge:
   app_id: "190076"
   app_key: "26af38fb6126f58c195b5c8da0b481c"
   app_license: "Y4wiW8E6tI2TmZoEkAt7jUM0Oqu3gJM1fNBoXKJO/fzlvYhPMUpxTP9qIB0w5KPrJ5XUkL8ImoxiVesgjEJ5FMe43KqbL8YrUQCK8i8xWVmEMQh0+ADPpfmBi7IAm43PzlJezFYSw6CfO1TjLuRNqLFs3y+LnAh95x5g7DCIaKGUSzPBjORgqRL/wbYngLBOedJtTOIq9T0zB1M922ffvubT2RoRCjhFWb9T6l3V3C2W15JlQ0hRCADyvvHhA2qI7ITq8YXTHktc8yAiRtTVC4+IOqQppkJfxvpE+n810/4vt1xfXKLtIuZxaUcMZY/Q3oEvbV4ZL2AKpiuFRwoz5g=="
-  # M300 E-Port has two PSDK UARTs. UART0 is the FTDI link, while UART1 is
-  # the E-Port USB CDC virtual serial device and must be present before start.
-  uart0_dev: "/dev/ttyUSB0"
+  # This board is connected directly to the M300 PSDK port.  The DJI USB CDC
+  # device (VID:PID 2ca3:001f) is /dev/ttyACM0 and carries PSDK UART0.
+  # A /dev/ttyUSB0 FTDI adapter exists only when using the E-Port dev kit.
+  uart0_dev: "/dev/ttyACM0"
   uart0_baud_rate: 460800
   uart1_dev: "/dev/ttyACM0"
 

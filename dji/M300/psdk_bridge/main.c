@@ -64,10 +64,10 @@ static void _signal_handler(int sig) {
 
 /* ── UART HAL implementation matching T_DjiHalUartHandler ─────────────── */
 
-/* M300 Extension Port has two distinct PSDK serial links.  UART0 is the
- * E-Port UART routed through the FTDI adapter.  UART1 is the E-Port USB CDC
- * virtual serial port.  Never collapse these into one descriptor: the SDK
- * selects the UART number according to the aircraft and mount type. */
+/* The direct M300 PSDK connection exposes DJI USB CDC (2ca3:001f) as
+ * /dev/ttyACM0, which carries UART0.  An E-Port development kit may instead
+ * provide an FTDI /dev/ttyUSB0 endpoint, but that must be explicitly passed
+ * in configuration rather than being the default. */
 #define M300_UART_COUNT 2
 typedef struct {
     const char *device;
@@ -77,7 +77,7 @@ typedef struct {
 } T_M300Uart;
 
 static T_M300Uart s_uart[M300_UART_COUNT] = {
-    [DJI_HAL_UART_NUM_0] = {.device = "/dev/ttyUSB0"},
+    [DJI_HAL_UART_NUM_0] = {.device = "/dev/ttyACM0"},
     [DJI_HAL_UART_NUM_1] = {.device = "/dev/ttyACM0"},
 };
 
@@ -298,7 +298,7 @@ static T_DjiReturnCode _HalUart_GetStatus(E_DjiHalUartNum uartNum, T_DjiUartStat
 
 #if DJI_VERSION_MINOR >= 16
 static T_DjiReturnCode _HalUart_GetDeviceInfo(T_DjiHalUartDeviceInfo *deviceInfo) {
-    /* E-Port V2 asks for the VID/PID of the USB-to-UART adapter on UART0. */
+    /* Report the VID/PID of the USB endpoint carrying UART0. */
     T_M300Uart *uart = &s_uart[DJI_HAL_UART_NUM_0];
     if (!deviceInfo || uart->vid == 0 || uart->pid == 0) {
         printf("[psdk][uart] cannot report USB UART VID/PID\n");
@@ -1012,7 +1012,7 @@ int main(int argc, char *argv[]) {
     const char *app_key = "";
     const char *app_license = "";
     const char *app_name = "PhanthyMotus";
-    const char *uart0_dev = "/dev/ttyUSB0";
+    const char *uart0_dev = "/dev/ttyACM0";
     uint32_t uart0_baud = 460800;
     const char *uart1_dev = "/dev/ttyACM0";
 

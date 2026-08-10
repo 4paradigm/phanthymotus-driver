@@ -307,17 +307,17 @@ def main():
     mcp_port = int(cfg.get("mcp_port", 15702))
     psdk_cfg = cfg.get("psdk_bridge", {})
 
-    # M300 Extension Port exposes two different PSDK serial links.  Do not
-    # auto-select one USB serial node: an FTDI UART and the E-Port CDC ACM
-    # device have different PSDK UART numbers and both are required.
-    uart0_dev = psdk_cfg.get("uart0_dev", "/dev/ttyUSB0")
+    # This deployment is directly connected to the M300 PSDK port.  Its DJI
+    # USB CDC device (VID:PID 2ca3:001f) is UART0 at /dev/ttyACM0.  Do not
+    # select the optional E-Port development-kit FTDI node (/dev/ttyUSB0).
+    uart0_dev = psdk_cfg.get("uart0_dev", "/dev/ttyACM0")
     uart1_dev = psdk_cfg.get("uart1_dev", "/dev/ttyACM0")
     missing = [dev for dev in (uart0_dev, uart1_dev) if not os.path.exists(dev)]
     if missing:
         print("[bundle] ERROR: M300 E-Port UARTs are incomplete: "
               f"missing {', '.join(missing)}. Driver will not start.")
-        print("[bundle] Expected UART0=/dev/ttyUSB0 (FTDI) and "
-              "UART1=/dev/ttyACM0 (E-Port USB CDC).")
+        print("[bundle] Expected UART0=/dev/ttyACM0 (DJI USB CDC); "
+              "ttyUSB0 is only used with the optional E-Port dev kit.")
         # Keep process alive so container doesn't restart-loop, but don't serve
         import time as _t
         while True:
