@@ -1,0 +1,25 @@
+generic-teleop-shadow:
+  image: __IMAGE__
+  container_name: embodied-generic-teleop-shadow
+  network_mode: host
+  volumes:
+    - /opt/phanthy-motus/data/certs:/etc/motus-core-certs:ro
+  environment:
+    - MOTUS_BIND_HOST=127.0.0.1
+    - MOTUS_MCP_PORT=15711
+    - MOTUS_MCP_URL=http://localhost:15711/mcp
+    - MOTUS_DRIVER_ID
+    - MOTUS_DRIVER_NAME
+    - MOTUS_ROBOT_ID
+    - MOTUS_DRIVER_TOKEN=${MOTUS_DRIVER_TOKEN:?set MOTUS_DRIVER_TOKEN before Docker Compose validation}
+    - MOTUS_TELEOP_TICKET_SECRET=${MOTUS_TELEOP_TICKET_SECRET:?set MOTUS_TELEOP_TICKET_SECRET before Docker Compose validation}
+    - AGENT_CORE_URL=https://localhost:15678
+    - MOTUS_AGENT_CORE_VERIFY_TLS=1
+    - MOTUS_AGENT_CORE_CA_FILE=/etc/motus-core-certs/cert.pem
+    - PYTHONUNBUFFERED=1
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: unless-stopped

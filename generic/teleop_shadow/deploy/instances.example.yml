@@ -1,0 +1,19 @@
+schema_version: 2
+core_ca_file: /opt/phanthy-motus/data/certs/cert.pem
+instances:
+  - service: teleop-shadow-lab-a
+    container: motus-teleop-shadow-lab-a
+    driver_id: teleop-shadow-lab-a
+    driver_name: Lab A Quest Teleop Shadow
+    robot_id: teleop-shadow-lab-a
+    mcp_port: 15711
+    driver_token_env: MOTUS_TELEOP_SHADOW_LAB_A_DRIVER_TOKEN
+    ticket_secret_env: MOTUS_TELEOP_SHADOW_LAB_A_TICKET_SECRET
+  - service: teleop-shadow-lab-b
+    container: motus-teleop-shadow-lab-b
+    driver_id: teleop-shadow-lab-b
+    driver_name: Lab B Quest Teleop Shadow
+    robot_id: teleop-shadow-lab-b
+    mcp_port: 15712
+    driver_token_env: MOTUS_TELEOP_SHADOW_LAB_B_DRIVER_TOKEN
+    ticket_secret_env: MOTUS_TELEOP_SHADOW_LAB_B_TICKET_SECRET

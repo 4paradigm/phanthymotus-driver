@@ -1,0 +1,22 @@
+driver_id: "teleop-shadow-driver"
+driver_name: "Generic Teleop Shadow Diagnostics"
+robot_id: null
+mcp_port: 15711
+bind_host: "127.0.0.1"
+
+teleop:
+  lease_timeout_ms: 1000
+  pose_timeout_ms: 200
+  watchdog_interval_ms: 25
+  dispatch_io_timeout_ms: 100
+  dispatch_ack_timeout_ms: 200
+  ticket_ttl_max_seconds: 30
+  ticket_replay_cache_entries: 4096
+
+registration:
+  enabled: true
+  agent_core_url: "https://localhost:15678"
+  advertise_url: "http://localhost:15711/mcp"
+  interval_seconds: 30
+  verify_tls: true
+  ca_file: "/etc/motus-core-certs/cert.pem"

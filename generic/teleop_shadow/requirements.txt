@@ -1,0 +1,8 @@
+# aiohttp: MCP, registration and WebRTC signaling HTTP service (Apache-2.0/MIT).
+aiohttp>=3.13,<3.15
+# aiortc: standards-based ICE/DTLS/SCTP/DataChannel implementation (BSD-3-Clause).
+# The Driver does not implement or fork WebRTC itself.
+aiortc>=1.14,<1.16
+# Keep aiortc's crypto backend on a wheel-backed, reproducible range (Apache-2.0/BSD-3-Clause).
+cryptography>=44,<47
+PyYAML>=6.0,<7
