@@ -2055,6 +2055,9 @@ class HeadGesturePlugin:
                     "timeout": 30,
                 },
                 "x-action-params": {
+                    "nod": {"params": [], "description": "点头后回正，使用默认次数、幅度和速度"},
+                    "shake": {"params": [], "description": "摇头后回正，使用默认次数、幅度和速度"},
+                    "scan": {"params": [], "description": "左右观察后回正，使用默认次数、幅度、速度和停留时间"},
                     "tilt": {"params": ["side", "tilt_amplitude", "speed", "hold"], "description": "向指定方向歪头、保持后回正"},
                     "reset": {"params": ["speed"], "description": "取消序列并将头部回正"},
                     "cancel": {"params": [], "description": "取消尚未发送的后续动作帧"},
