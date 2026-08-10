@@ -4809,11 +4809,13 @@ class RobotFaultsPlugin:
         self._light_ctrl_topic = cfg["light_ctrl_topic"]
         self._light_ctrl_subscribed = False  # 订阅创建标志
 
-        # 方案B: 音频事件追踪自检状态（仅通过最后一个短提示音判断自检完成）
+        # 方案B: 音频事件追踪自检状态
+        # 自检开始: bodycontrol_state state 从非0变到0 → _self_check_started=True
+        # 自检完成: 收到短提示音 (duration < 2.5s) → _self_check_completed=True
         self._audio_event_available = False
         self._last_audio_event_ts = None     # 最后收到的音频事件时间戳
-        self._self_check_started = False     # 自检已检测到音频信号
-        self._self_check_completed = False   # 自检已完成（收到最后一个短提示音）
+        self._self_check_started = False     # 自检已开始 (state 曾到过 0)
+        self._self_check_completed = False   # 自检已完成 (收到短提示音)
         self._last_play_duration = None      # 最后一个音频片段的 duration
         self._sid_duration = {}              # sid -> duration（来自 /audio_play/progress）
         self._max_sid_track = 20             # 最多保留的 sid 数，避免内存泄漏
@@ -5060,10 +5062,11 @@ class RobotFaultsPlugin:
             prev_state = self._self_check_state.state if self._self_check_state is not None else None
             self._self_check_state = msg
             self._last_update_ms = now_ms
-            # state 从非1变到1 → body_control 刚启动/重启, 进入自检等待
-            if msg.state == 1 and prev_state != 1:
-                self._self_check_started = False
+            # state == 0 (Initing) → 自检开始; state 从非0变到0 或 从1变到0 都触发
+            if msg.state == 0 and prev_state != 0:
+                self._self_check_started = True
                 self._self_check_completed = False
+                print(f"[RobotFaultsPlugin] self-check started (state: {prev_state} -> 0)")
 
     def _on_light_ctrl(self, msg):
         """proc_manager 灯效反馈, cmd 20=自检等待/21=自检启动/22=自检成功."""
@@ -5076,23 +5079,20 @@ class RobotFaultsPlugin:
 
     def _on_play_event(self, msg):
         """方案B: 检测音频播放事件, 用于判断自检状态。
-        PlayEvent.event: 0=STARTED, 1=COMPLETED, 2=STOPPED, 3=CANCELLED, 4=FAILED."""
+        PlayEvent.event: 0=STARTED, 1=COMPLETED, 2=STOPPED, 3=CANCELLED, 4=FAILED.
+        自检完成标志: 自检已开始 + 收到短提示音 (duration < 2.5s)。"""
         now_ms = int(time.time() * 1000)
         with self._lock:
             self._last_audio_event_ts = now_ms
-            if msg.event == 0:  # STARTED
-                # body_control 在运行且自检未完成 → 检测到音频 → 标记自检已开始
-                if (self._self_check_state is not None
-                    and self._self_check_state.state == 1
-                    and not self._self_check_completed):
-                    self._self_check_started = True
-                    print(f"[RobotFaultsPlugin] self-check audio started (sid={msg.sid})")
-            elif msg.event in (1, 2):  # COMPLETED or STOPPED
-                if self._self_check_started:
+            if msg.event in (1, 2):  # COMPLETED or STOPPED
+                if self._self_check_started and not self._self_check_completed:
                     dur = self._sid_duration.get(msg.sid)
                     if dur is not None:
                         self._last_play_duration = dur
-                    print(f"[RobotFaultsPlugin] self-check audio completed (sid={msg.sid}, duration={dur})")
+                    # 短提示音 → 自检完成
+                    if dur is not None and dur < 2.5:
+                        self._self_check_completed = True
+                        print(f"[RobotFaultsPlugin] self-check completed (sid={msg.sid}, duration={dur:.2f}s)")
 
     def _on_play_progress(self, msg):
         """订阅 /audio_play/progress, 用于获取每个 sid 的真实 duration, 不依赖 PlayEvent 字段。"""
@@ -5236,27 +5236,16 @@ class RobotFaultsPlugin:
                 imu_lines.append(f"部分缺失:{','.join(missing)}")
                 issues.append(f"IMU部分数据缺失: {', '.join(missing)}")
 
-        # ── 自检状态 (方案B: audio_play/event + bodycontrol_state，仅用最后一个短提示音判断完成) ──
+        # ── 自检状态 (方案B: bodycontrol_state state=0 判断开始 + 短提示音 duration<2.5s 判断完成) ──
         self_check_available = self._self_check_available and self._self_check_state is not None
         self_check_lines = []
-        now_ms_sc = int(time.time() * 1000)
 
         ns = self._self_check_state
         if ns is not None and ns.state == 1:
-            # body_control 运行中 → 用音频事件区分"自检中"和"正常运行"
-            if not self._self_check_completed:
-                # 检测最后一个短提示音 (<2.5s) 来判断自检完成
-                if (self._self_check_started
-                    and self._last_play_duration is not None
-                    and self._last_play_duration < 2.5):
-                    self._self_check_completed = True
-                    self_check_lines.append("运行中")
-                elif self._self_check_started:
-                    self_check_lines.append("自检中")
-                    issues.append("自检进行中")
-                else:
-                    # state=1 但还没检测到自检音频 → 可能早已完成运行中
-                    self_check_lines.append("运行中")
+            # body_control 运行中 → 用自检标记区分"自检中"和"正常运行"
+            if self._self_check_started and not self._self_check_completed:
+                self_check_lines.append("自检中")
+                issues.append("自检进行中")
             else:
                 self_check_lines.append("运行中")
         elif ns is not None and ns.state == 0:
