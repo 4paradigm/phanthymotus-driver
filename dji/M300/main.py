@@ -365,10 +365,9 @@ def main():
     mcp_port = int(cfg.get("mcp_port", 15702))
     psdk_cfg = cfg.get("psdk_bridge", {})
 
-    # M300 OSDK Type-C exposes a pair of transport devices.  UART0 is the
-    # FTDI TTL port configured in DJI Assistant 2; UART1 is the DJI ACM link
-    # needed by PSDK for M300 OSDK-version negotiation.
-    uart0_dev = psdk_cfg.get("uart0_dev", "/dev/ttyUSB0")
+    # The actual M300 link is DJI USB CDC (2ca3:001f).  Do not auto-select
+    # ttyUSB*: on this board those nodes belong to the Quectel cellular modem.
+    uart0_dev = psdk_cfg.get("uart0_dev", "/dev/ttyACM0")
     uart1_dev = psdk_cfg.get("uart1_dev", "/dev/ttyACM0")
     missing = [dev for dev in (uart0_dev, uart1_dev) if not os.path.exists(dev)]
     if missing:

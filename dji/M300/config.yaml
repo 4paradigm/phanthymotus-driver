@@ -8,14 +8,11 @@ psdk_bridge:
   app_id: "190076"
   app_key: "26af38fb6126f58c195b5c8da0b481c"
   app_license: "Y4wiW8E6tI2TmZoEkAt7jUM0Oqu3gJM1fNBoXKJO/fzlvYhPMUpxTP9qIB0w5KPrJ5XUkL8ImoxiVesgjEJ5FMe43KqbL8YrUQCK8i8xWVmEMQh0+ADPpfmBi7IAm43PzlJezFYSw6CfO1TjLuRNqLFs3y+LnAh95x5g7DCIaKGUSzPBjORgqRL/wbYngLBOedJtTOIq9T0zB1M922ffvubT2RoRCjhFWb9T6l3V3C2W15JlQ0hRCADyvvHhA2qI7ITq8YXTHktc8yAiRtTVC4+IOqQppkJfxvpE+n810/4vt1xfXKLtIuZxaUcMZY/Q3oEvbV4ZL2AKpiuFRwoz5g=="
-  # This payload is connected through the M300 OSDK Type-C board.  DJI
-  # Assistant 2 configures its OSDK UART at 921600.  PSDK must use both
-  # transports: the FTDI TTL link and the DJI ACM control/data channel.
-  uart0_dev: "/dev/ttyUSB0"
+  # The M300 OSDK board is the DJI USB CDC device (VID:PID 2ca3:001f).
+  # ttyUSB0..ttyUSB3 belong to the Quectel modem (2c7c:0800), not the drone.
+  uart0_dev: "/dev/ttyACM0"
   uart0_baud_rate: 921600
   uart1_dev: "/dev/ttyACM0"
-  usb_vid: "0403"
-  network_iface: "usb0"
 
 plugins:
   telemetry:
