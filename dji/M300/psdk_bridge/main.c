@@ -538,6 +538,16 @@ static int _psdk_core_init(const char *app_id, const char *app_key,
      * command timeouts despite a healthy PSDK heartbeat. */
     _Osal_TaskSleepMs(5000);
 
+    /* Liveview must claim its PSDK extended-command handler before camera,
+     * gimbal and HMS modules.  The hzhy M300 FPV sample follows this minimal
+     * sequence successfully on the target.  Calling it after those modules
+     * caused the liveview status request to time out; retrying then cannot
+     * recover because PSDK retains the handler registration. */
+    rc = liveview_init();
+    if (rc != 0) {
+        printf("[psdk] liveview init unavailable; camera_stream will return an error without crashing\n");
+    }
+
     /* Camera init required even for non-camera payloads (Pilot won't detect otherwise) */
     rc = DjiPayloadCamera_Init();
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
@@ -554,10 +564,10 @@ static void _init_modules(void) {
     flight_ctrl_init();
     camera_mgr_init();
     gimbal_mgr_init();
-    /* Liveview is initialized lazily on the first camera-stream request.
-     * It must not be used after a failed initialization.  In particular,
-     * starting a camera after DjiLiveview_Init failed used to dereference a
-     * NULL FFmpeg decoder and terminate the bridge. */
+    /* Liveview is initialized in _psdk_core_init before these modules.
+     * Keep its failed state terminal for the current PSDK process: retrying
+     * DjiLiveview_Init re-registers an extended command handler and cannot
+     * recover from a previous status-subscription timeout. */
     waypoint_init();
     perception_init();
     speaker_init();
