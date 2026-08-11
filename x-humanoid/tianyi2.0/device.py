@@ -4766,7 +4766,7 @@ class RobotFaultsPlugin:
             "imu_accel_topic": "/ob_camera_head/accel/sample",
             "imu_gyro_topic": "/ob_camera_head/gyro/sample",
             "self_check_topic": "/bodycontrol_state",
-            "light_ctrl_topic": "/power/light/ctrl",
+            "light_ctrl_topic": "/xsys/light/ctrl",
         }
 
     def __init__(self, plugin_config: dict, namespace: str, ros2, slamtec_client):
@@ -4804,7 +4804,7 @@ class RobotFaultsPlugin:
         self._imu_available = False
         self._self_check_state = None       # NodeState
         self._self_check_available = False
-        self._light_ctrl_state = None       # PowerLightCtrl (proc_manager 自检信号)
+        self._light_ctrl_state = None       # LightCtrl (proc_manager 自检信号，来自 /xsys/light/ctrl)
         self._light_ctrl_topic = cfg["light_ctrl_topic"]
         self._light_ctrl_subscribed = False  # 订阅创建标志
 
@@ -4926,16 +4926,17 @@ class RobotFaultsPlugin:
         except ImportError:
             print("[RobotFaultsPlugin] NodeState not available, self check disabled")
 
-        # 灯效状态订阅 (PowerLightCtrl) — proc_manager 自检信号 (cmd 20/21/22)
+        # 灯效状态订阅 (LightCtrl) — proc_manager 自检信号 (cmd 20/21/22)
+        # 注意: /xsys/light/ctrl 使用 LightCtrl 类型，不是 PowerLightCtrl
         try:
-            from bodyctrl_msgs.msg import PowerLightCtrl
+            from bodyctrl_msgs.msg import LightCtrl
             self._sub_node.create_subscription(
-                PowerLightCtrl, self._light_ctrl_topic,
+                LightCtrl, self._light_ctrl_topic,
                 self._on_light_ctrl, _LOW_LAT_QOS)
             print("[RobotFaultsPlugin] light ctrl subscription created")
             self._light_ctrl_subscribed = True
         except ImportError:
-            print("[RobotFaultsPlugin] PowerLightCtrl not available, light ctrl disabled")
+            print("[RobotFaultsPlugin] LightCtrl not available, light ctrl disabled")
 
         # 方案B: 音频播放事件 + 进度订阅 (检测自检提示音)
         try:
