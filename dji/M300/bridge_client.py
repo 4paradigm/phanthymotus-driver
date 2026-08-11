@@ -352,6 +352,15 @@ class BridgeClient:
     def _mock_get_hms_info(self, args: dict) -> dict:
         return {"ok": True, "data": {"alerts": []}}
 
+    def _mock_hms_inject(self, args: dict) -> dict:
+        code = args.get("code", 0x1E020001)
+        level = args.get("level", 1)
+        return {"ok": True, "data": {"ret": 0, "code": f"0x{code:08X}", "note": f"mock injected 0x{code:08X} level={level}"}}
+
+    def _mock_hms_eliminate(self, args: dict) -> dict:
+        code = args.get("code", 0x1E020001)
+        return {"ok": True, "data": {"ret": 0, "code": f"0x{code:08X}", "note": f"mock eliminated 0x{code:08X}"}}
+
     def _mock_start_liveview(self, args: dict) -> dict:
         return {"ok": True, "data": {"ret": 0}}
 
@@ -519,6 +528,12 @@ class BridgeClient:
     # HMS
     def get_hms_info(self):
         return self._call("get_hms_info")
+
+    def hms_inject_error(self, error_code: int = 0x1E020001, error_level: int = 1):
+        return self._call("hms_inject", {"code": error_code, "level": error_level})
+
+    def hms_eliminate_error(self, error_code: int = 0x1E020001):
+        return self._call("hms_eliminate", {"code": error_code})
 
     # Liveview
     def start_liveview(self, camera: str = "payload1"):
