@@ -3826,6 +3826,9 @@ class TtsPlugin:
                     "pause": {"params": [], "description": "暂停播放"},
                     "resume": {"params": [], "description": "恢复播放"},
                 },
+                "x-hooks": {
+                    "on_interrupt_speak": {"action": "interrupt"},
+                },
             },
         }
 
@@ -4338,6 +4341,9 @@ class NavPlugin:
                              "description": "取消当前导航动作"},
                     "get_pose": {"params": [],
                                  "description": "获取当前位姿(x, y, yaw)"},
+                },
+                "x-hooks": {
+                    "on_interrupt_motion": {"action": "cancel"},
                 },
             },
         }
