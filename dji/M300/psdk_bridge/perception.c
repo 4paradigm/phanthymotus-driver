@@ -10,6 +10,10 @@
 static perception_image_cb_t s_image_cb = NULL;
 static const char *s_names[] = {"front", "back", "left", "right", "up", "down"};
 static int s_active[6] = {0};
+/* Each direction is a stereo pair. Expose only one physical camera per
+ * direction, otherwise alternating left/right frames appear to jump. */
+static uint32_t s_selected_data_type[6] = {0};
+static int s_has_selected_data_type[6] = {0};
 
 static int _index_from_name(const char *name) {
     for (int i = 0; i < 6; ++i) if (strcmp(name, s_names[i]) == 0) return i;
@@ -46,6 +50,14 @@ static int _encode_gray_jpeg(const char *path, uint8_t *gray, int width, int hei
 static void _image_cb(T_DjiPerceptionImageInfo info, uint8_t *data, uint32_t len) {
     int index = _index_from_direction(info.rawInfo.direction);
     if (index < 0 || !s_active[index] || !data || len < info.rawInfo.width * info.rawInfo.height) return;
+    /* DJI calls back both cameras of a stereo direction. dataType is the
+     * physical camera position; keep the first one seen for this stream. */
+    if (!s_has_selected_data_type[index]) {
+        s_selected_data_type[index] = info.dataType;
+        s_has_selected_data_type[index] = 1;
+        printf("[perception] %s selected stereo camera=%u\n", s_names[index], info.dataType);
+    }
+    if (info.dataType != s_selected_data_type[index]) return;
     char path[128];
     snprintf(path, sizeof(path), "/dev/shm/dji_perception_%s.jpg", s_names[index]);
     _encode_gray_jpeg(path, data, info.rawInfo.width, info.rawInfo.height);
@@ -61,6 +73,7 @@ int perception_start(const char *direction, perception_image_cb_t cb) {
     int active = 0; for (int i = 0; i < 6; ++i) active += s_active[i];
     if (!s_active[index] && active >= 2) { printf("[perception] at most two streams may be active\n"); return -1; }
     s_image_cb = cb;
+    s_has_selected_data_type[index] = 0;
     T_DjiReturnCode rc = DjiPerception_SubscribePerceptionImage(_direction_from_index(index), _image_cb);
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) { printf("[perception] subscribe %s failed: 0x%08llX\n", direction, (unsigned long long)rc); return -1; }
     s_active[index] = 1; printf("[perception] subscribed %s\n", direction); return 0;
