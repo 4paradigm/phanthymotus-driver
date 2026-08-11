@@ -69,11 +69,31 @@ coalesced instead of backlogged. A proposal TTL lapse immediately triggers
 `StopMove`; only a successful post-call zero-odometry confirmation keeps the
 same navigation lease recoverable for the next fresh proposal. Hard safety,
 identity, sequence, RPC, and stop-confirmation faults still disarm the lease.
+The Driver proposal envelope matches the `loco` motion contract: `x` and `y`
+accept `[-1, 1]` m/s, and yaw accepts `[-2, 2]` rad/s. Deploy-time
+configuration may tighten these bounds but cannot loosen them.
+
+`loco start` supports two binding modes. Supplying `expected_nav_id` keeps the
+strict control-plane binding behavior. If it is omitted, the Driver subscribes
+in an unarmed `waiting_for_nav_id` state and atomically binds to the `nav_id` of
+the first fresh, schema-valid, nonzero, nonterminal proposal. Invalid, expired,
+zero, terminal, or retired-nav proposals cannot claim that waiting lease. After
+an automatically bound task reaches a terminal state, the Driver retires its
+`nav_id` and returns to `waiting_for_nav_id` only after `StopMove` and fresh
+odometry confirm zero velocity. A concurrent watchdog fault takes precedence
+over terminal completion and blocks that automatic rearm, so its delayed
+physical stop cannot cross into the next lease. Explicit bindings, unconfirmed
+stops, and manual overrides remain disarmed until the control plane starts a
+new lease.
+Every proposal still requires its own `nav_id`; omitting it from `loco start`
+does not disable identity checks.
 
 `loco info` exposes proposal counters, the coalesced count, measured RPC and
 queue latency, rolling RPC p50/p95/p99/max values, rejection reasons, and the
-last confirmed proposal stop. The `last_set_velocity_duration_ms` value is
-measured RPC time, not the proposal TTL budget.
+last confirmed proposal stop. It also reports `binding_mode`,
+`waiting_for_nav_id`, and `auto_bound_nav_id`. The
+`last_set_velocity_duration_ms` value is measured RPC time, not the proposal
+TTL budget.
 
 ## Writing a New Driver
 

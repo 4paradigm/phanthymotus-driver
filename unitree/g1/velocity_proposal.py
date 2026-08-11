@@ -28,6 +28,12 @@ ALLOWED_STATUSES = TERMINAL_STATUSES | ACTIVE_STATUSES
 _STATUS_FIELD = "nav_status"
 _UNSUPPORTED_STATUS_ALIASES = {"status", "navigation_status", "navigation_state"}
 
+DRIVER_MIN_X = -1.0
+DRIVER_MAX_X = 1.0
+DRIVER_MAX_ABS_Y = 1.0
+DRIVER_MAX_ABS_YAW = 2.0
+DRIVER_MAX_PLANAR_SPEED = math.sqrt(2.0)
+
 
 def velocity_proposal_port(topic: str) -> dict:
     """Return the authoritative N5 canvas port declaration."""
@@ -54,11 +60,52 @@ class ProposalLimits:
     schema: str = VELOCITY_PROPOSAL_SCHEMA
     frame: str = "base_link"
     max_ttl_ms: int = 250
-    min_x: float = -0.05
-    max_x: float = 0.15
-    max_abs_y: float = 0.12
-    max_abs_yaw: float = 0.35
-    max_planar_speed: float = 0.18
+    min_x: float = DRIVER_MIN_X
+    max_x: float = DRIVER_MAX_X
+    max_abs_y: float = DRIVER_MAX_ABS_Y
+    max_abs_yaw: float = DRIVER_MAX_ABS_YAW
+    max_planar_speed: float = DRIVER_MAX_PLANAR_SPEED
+
+
+def resolve_proposal_limits(config: Mapping[str, Any]) -> ProposalLimits:
+    """Resolve deploy-time tightening against the Driver's fixed envelope."""
+    return ProposalLimits(
+        frame="base_link",
+        max_ttl_ms=min(
+            250,
+            int(config.get("velocity_proposal_max_ttl_ms", 250)),
+        ),
+        min_x=max(
+            DRIVER_MIN_X,
+            float(config.get("velocity_proposal_min_x", DRIVER_MIN_X)),
+        ),
+        max_x=min(
+            DRIVER_MAX_X,
+            float(config.get("velocity_proposal_max_x", DRIVER_MAX_X)),
+        ),
+        max_abs_y=min(
+            DRIVER_MAX_ABS_Y,
+            float(config.get("velocity_proposal_max_abs_y", DRIVER_MAX_ABS_Y)),
+        ),
+        max_abs_yaw=min(
+            DRIVER_MAX_ABS_YAW,
+            float(
+                config.get(
+                    "velocity_proposal_max_abs_yaw",
+                    DRIVER_MAX_ABS_YAW,
+                )
+            ),
+        ),
+        max_planar_speed=min(
+            DRIVER_MAX_PLANAR_SPEED,
+            float(
+                config.get(
+                    "velocity_proposal_max_planar_speed",
+                    DRIVER_MAX_PLANAR_SPEED,
+                )
+            ),
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -220,6 +267,8 @@ class VelocityProposalGate:
         self.limits = limits
         self.connected_topic = ""
         self.armed = False
+        self.binding_mode = ""
+        self.waiting_for_nav_id = False
         self.expected_nav_id = ""
         self.retired_nav_ids: set[str] = set()
         self.last_sequence = -1
@@ -228,7 +277,22 @@ class VelocityProposalGate:
         self.last_reason = "not_connected"
         self.recoverable_stop_active = False
 
-    def bind(self, topic: str, expected_nav_id: str) -> None:
+    def bind(self, topic: str, expected_nav_id: Optional[str] = None) -> None:
+        if expected_nav_id is None or expected_nav_id == "":
+            if self.is_waiting_on(topic):
+                return
+            self.connected_topic = topic
+            self.armed = False
+            self.binding_mode = "first_valid_proposal"
+            self.waiting_for_nav_id = True
+            self.expected_nav_id = ""
+            self.last_sequence = -1
+            self.last_receive_monotonic = 0.0
+            self.deadline_monotonic = 0.0
+            self.last_reason = "waiting_for_nav_id"
+            self.recoverable_stop_active = False
+            return
+
         nav_id = resolve_expected_nav_id({"expected_nav_id": expected_nav_id})
         if self.is_bound_to(topic, nav_id):
             return
@@ -236,6 +300,8 @@ class VelocityProposalGate:
             raise ValueError("retired_nav_id_replay")
         self.connected_topic = topic
         self.armed = True
+        self.binding_mode = "explicit"
+        self.waiting_for_nav_id = False
         self.expected_nav_id = nav_id
         self.last_sequence = -1
         self.last_receive_monotonic = 0.0
@@ -247,6 +313,8 @@ class VelocityProposalGate:
         self._retire_expected_nav_id()
         self.connected_topic = ""
         self.armed = False
+        self.binding_mode = ""
+        self.waiting_for_nav_id = False
         self.expected_nav_id = ""
         self.last_sequence = -1
         self.last_receive_monotonic = 0.0
@@ -257,9 +325,38 @@ class VelocityProposalGate:
     def disarm(self, reason: str) -> None:
         self._retire_expected_nav_id()
         self.armed = False
+        self.waiting_for_nav_id = False
         self.deadline_monotonic = 0.0
         self.last_reason = reason
         self.recoverable_stop_active = False
+
+    def resume_waiting_after_terminal_stop(self, stop_confirmed: bool) -> bool:
+        """Allow the next automatic task only after measured terminal stop.
+
+        The completed task has already been retired by ``disarm``.  Explicit
+        control-plane leases and every other disarm reason remain fail-closed;
+        in particular, a manual override can never be reclaimed by an incoming
+        proposal without a new lifecycle authorization.
+        """
+        if (
+            not self.connected_topic
+            or self.binding_mode != "first_valid_proposal"
+            or self.armed
+            or self.waiting_for_nav_id
+            or self.last_reason != "nav_task_terminal"
+        ):
+            return False
+        if not stop_confirmed:
+            self.last_reason = "nav_task_terminal_stop_unconfirmed"
+            return False
+        self.waiting_for_nav_id = True
+        self.expected_nav_id = ""
+        self.last_sequence = -1
+        self.last_receive_monotonic = 0.0
+        self.deadline_monotonic = 0.0
+        self.last_reason = "waiting_for_nav_id"
+        self.recoverable_stop_active = False
+        return True
 
     def hold_for_obstacle(self) -> None:
         """Keep the nav lease armed after a confirmed local obstacle stop."""
@@ -319,6 +416,44 @@ class VelocityProposalGate:
             and self.expected_nav_id == expected_nav_id
         )
 
+    def is_waiting_on(self, topic: str) -> bool:
+        return bool(
+            self.connected_topic == topic
+            and self.binding_mode == "first_valid_proposal"
+            and self.waiting_for_nav_id
+            and not self.armed
+            and not self.expected_nav_id
+        )
+
+    def _claim_first_valid_proposal(self, nav_id: str) -> None:
+        if not self.waiting_for_nav_id:
+            raise ValueError("not_waiting_for_nav_id")
+        resolved = resolve_expected_nav_id({"expected_nav_id": nav_id})
+        if resolved in self.retired_nav_ids:
+            raise ValueError("retired_nav_id_replay")
+        self.expected_nav_id = resolved
+        self.armed = True
+        self.waiting_for_nav_id = False
+        self.last_reason = ""
+
+    @staticmethod
+    def _remaining_duration(
+        proposal: ValidatedVelocityProposal,
+        now_unix_ms: Optional[float],
+    ) -> float:
+        duration = proposal.ttl_ms / 1000.0
+        if now_unix_ms is None:
+            return duration
+        remaining = (
+            proposal.issued_at_unix_ms
+            + proposal.ttl_ms
+            - float(now_unix_ms)
+        ) / 1000.0
+        if remaining <= 0.0:
+            return 0.0
+        # A future producer timestamp may not extend the configured TTL.
+        return min(duration, remaining)
+
     def accept(
         self,
         payload: Mapping[str, Any],
@@ -327,13 +462,43 @@ class VelocityProposalGate:
     ) -> ProposalDecision:
         if not self.connected_topic:
             return ProposalDecision(stop=True, reason="proposal_not_connected")
-        if not self.armed:
+        if not self.armed and not self.waiting_for_nav_id:
             return ProposalDecision(stop=True, reason=self.last_reason or "proposal_not_armed")
         try:
             proposal = validate_velocity_proposal(payload, self.limits)
         except VelocityProposalValidationError as exc:
+            if self.waiting_for_nav_id:
+                return ProposalDecision(reason=exc.code)
             self.disarm(exc.code)
             return ProposalDecision(stop=True, reason=exc.code)
+
+        duration = self._remaining_duration(proposal, now_unix_ms)
+        if self.waiting_for_nav_id:
+            if duration <= 0.0:
+                return ProposalDecision(
+                    reason="proposal_ttl_expired",
+                    proposal=proposal,
+                )
+            if proposal.nav_id in self.retired_nav_ids:
+                return ProposalDecision(
+                    reason="retired_nav_id_replay",
+                    proposal=proposal,
+                )
+            if proposal.is_zero:
+                # A retained zero/terminal sample from an earlier task must
+                # not claim a newly waiting lease.  Only an executable command
+                # establishes physical-control intent for a new nav_id.
+                return ProposalDecision(
+                    reason="waiting_for_active_proposal",
+                    proposal=proposal,
+                )
+            try:
+                self._claim_first_valid_proposal(proposal.nav_id)
+            except ValueError as exc:
+                return ProposalDecision(
+                    reason=str(exc),
+                    proposal=proposal,
+                )
 
         if proposal.nav_id != self.expected_nav_id:
             self.disarm("nav_id_mismatch")
@@ -342,14 +507,8 @@ class VelocityProposalGate:
             self.disarm("sequence_not_increasing")
             return ProposalDecision(stop=True, reason="sequence_not_increasing", proposal=proposal)
 
-        duration = proposal.ttl_ms / 1000.0
-        if now_unix_ms is not None:
-            remaining = (
-                proposal.issued_at_unix_ms
-                + proposal.ttl_ms
-                - float(now_unix_ms)
-            ) / 1000.0
-            if remaining <= 0.0:
+        if duration <= 0.0:
+            if now_unix_ms is not None:
                 if self.recoverable_stop_active:
                     # Stop confirmation can outlive the proposal TTL while
                     # ROS retains newer samples.  The robot is already at a
@@ -367,8 +526,6 @@ class VelocityProposalGate:
                         proposal=proposal,
                     )
                 return self.request_ttl_stop(now, proposal)
-            # A future producer timestamp may not extend the configured TTL.
-            duration = min(duration, remaining)
 
         self.last_sequence = proposal.sequence
         self.last_receive_monotonic = now
@@ -397,6 +554,14 @@ class VelocityProposalGate:
         return {
             "connected": bool(self.connected_topic),
             "armed": self.armed,
+            "binding_mode": self.binding_mode or None,
+            "waiting_for_nav_id": self.waiting_for_nav_id,
+            "auto_bound_nav_id": (
+                self.expected_nav_id
+                if self.binding_mode == "first_valid_proposal"
+                and self.expected_nav_id
+                else None
+            ),
             "topic": self.connected_topic or None,
             "expected_nav_id": self.expected_nav_id or None,
             "active_nav_id": self.expected_nav_id if self.armed else None,

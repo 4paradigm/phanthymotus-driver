@@ -32,9 +32,9 @@ from typing import Optional
 
 from velocity_proposal import (
     DEFAULT_VELOCITY_PROPOSAL_TOPIC,
-    ProposalLimits,
     VelocityProposalGate,
     resolve_expected_nav_id,
+    resolve_proposal_limits,
 )
 
 
@@ -426,18 +426,33 @@ class ProposalExecutionLease:
                 self._deadline = max(self._deadline, candidate)
             return True
 
-    def clear(self) -> None:
+    def clear_and_observe_fault(self):
+        """Clear the lease and atomically return any fault that won first."""
         with self._lock:
+            fault = self._fault
             self._generation += 1
             self._active = False
             self._deadline = 0.0
             self._fault = None
+            return fault
+
+    def clear(self) -> None:
+        self.clear_and_observe_fault()
 
     def fault_for_generation(self, generation: int) -> str:
         with self._lock:
             if self._fault and self._fault[0] == generation:
                 return self._fault[1]
             return ""
+
+    def is_current_generation(self, generation: int) -> bool:
+        """Return whether an asynchronous apply still owns the active lease."""
+        with self._lock:
+            return bool(
+                self._active
+                and self._fault is None
+                and generation == self._generation
+            )
 
     def current_fault(self):
         with self._lock:
@@ -459,6 +474,48 @@ class ProposalExecutionLease:
             self._active = False
             self._fault = (generation, reason)
             return True
+
+
+class ProposalWatchdogTransition:
+    """Serialize watchdog trip/stop dispatch against execution cleanup."""
+
+    def __init__(self, lease: ProposalExecutionLease):
+        self._lease = lease
+        self._lock = threading.Lock()
+
+    def clear_and_observe_fault(self):
+        """Wait for an already-tripped stop dispatch before clearing."""
+        with self._lock:
+            return self._lease.clear_and_observe_fault()
+
+    def trip_and_dispatch_stop(
+        self,
+        generation: int,
+        reason: str,
+        now: float,
+        dispatch_stop,
+    ) -> bool:
+        """Dispatch the physical stop before cleanup may cross generations."""
+        with self._lock:
+            if not self._lease.trip(generation, reason, now):
+                return False
+            dispatch_stop()
+            return True
+
+
+def proposal_apply_result_is_current(
+    command,
+    proposal_gate,
+    proposal_execution_lease,
+    generation,
+) -> bool:
+    """Reject an RPC completion superseded by stop, task, or sequence change."""
+    return bool(
+        proposal_execution_lease.is_current_generation(generation)
+        and proposal_gate.armed
+        and command.get("nav_id") == proposal_gate.expected_nav_id
+        and command.get("sequence") == proposal_gate.last_sequence
+    )
 
 
 def velocity_commands_differ(current, target, abs_tol: float = 1e-9) -> bool:
@@ -537,8 +594,8 @@ class ProposalApplyDiagnostics:
     last_set_velocity_completed_unix_ms: Optional[int] = None
     last_set_velocity_stop_ret: Optional[int] = None
     last_set_velocity_stop_error: Optional[str] = None
-    _lock: threading.Lock = field(
-        default_factory=threading.Lock,
+    _lock: threading.RLock = field(
+        default_factory=threading.RLock,
         init=False,
         repr=False,
     )
@@ -553,7 +610,7 @@ class ProposalApplyDiagnostics:
         repr=False,
     )
 
-    def begin_session(self, nav_id: str) -> None:
+    def begin_session(self, nav_id: Optional[str]) -> None:
         """Reset per-lease counters while retaining them after later cleanup."""
         with self._lock:
             self.session_nav_id = nav_id
@@ -588,6 +645,39 @@ class ProposalApplyDiagnostics:
             self.last_set_velocity_stop_error = None
             self._applied_identities = set()
             self._set_velocity_rpc_durations_ms = deque(maxlen=512)
+
+    def bind_session_nav_id(self, nav_id: str) -> None:
+        """Attach a first-proposal lease without resetting arrival evidence."""
+        with self._lock:
+            if self.session_nav_id is None:
+                self.session_nav_id = str(nav_id)
+
+    def bind_claimed_session(
+        self,
+        nav_id: str,
+        received_monotonic: float,
+        payload,
+        received_unix_ms: float,
+    ) -> bool:
+        """Bind an auto-claimed lease and roll counters on later tasks.
+
+        The first claim preserves invalid/expired packets observed while the
+        Canvas connection was initially waiting.  A later claim starts a new
+        per-lease diagnostic session and restores the claiming packet as its
+        first arrival evidence.
+        """
+        resolved = str(nav_id)
+        with self._lock:
+            if self.session_nav_id is None:
+                self.session_nav_id = resolved
+                return False
+            if self.session_nav_id == resolved:
+                return False
+            # Keep rollover atomic against async apply/watchdog diagnostics.
+            self.begin_session(resolved)
+            self.record_received(received_monotonic)
+            self.record_proposal_arrival(payload, received_unix_ms)
+            return True
 
     def record_received(self, received_monotonic: Optional[float] = None) -> None:
         received = (
@@ -1192,7 +1282,11 @@ class SmartMotionProxy:
     def get_state(self) -> dict:
         return self._call("get_state")
 
-    def bind_velocity_proposal(self, topic: str, expected_nav_id: str) -> dict:
+    def bind_velocity_proposal(
+        self,
+        topic: str,
+        expected_nav_id: Optional[str] = None,
+    ) -> dict:
         return self._call_with_parent_stop(
             "bind_velocity_proposal",
             topic=topic,
@@ -1382,16 +1476,8 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
         proposal_config.get("velocity_proposal_driver_authorized", False)
     )
     expected_proposal_topic = DEFAULT_VELOCITY_PROPOSAL_TOPIC
-    # Deployment configuration may tighten, but never loosen, N5 limits.
-    proposal_limits = ProposalLimits(
-        frame="base_link",
-        max_ttl_ms=min(250, int(proposal_config.get("velocity_proposal_max_ttl_ms", 250))),
-        min_x=max(-0.05, float(proposal_config.get("velocity_proposal_min_x", -0.05))),
-        max_x=min(0.15, float(proposal_config.get("velocity_proposal_max_x", 0.15))),
-        max_abs_y=min(0.12, float(proposal_config.get("velocity_proposal_max_abs_y", 0.12))),
-        max_abs_yaw=min(0.35, float(proposal_config.get("velocity_proposal_max_abs_yaw", 0.35))),
-        max_planar_speed=min(0.18, float(proposal_config.get("velocity_proposal_max_planar_speed", 0.18))),
-    )
+    # Deployment configuration may tighten, but never loosen, Driver limits.
+    proposal_limits = resolve_proposal_limits(proposal_config)
     proposal_gate = VelocityProposalGate(proposal_limits)
     proposal_odom_timeout = float(proposal_config.get("velocity_proposal_odom_timeout", 0.5))
     proposal_scan_timeout = float(proposal_config.get("velocity_proposal_scan_timeout", 0.5))
@@ -1443,6 +1529,9 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
     safety_lock = threading.Lock()
     motion_command_lock = threading.RLock()
     proposal_execution_lease = ProposalExecutionLease()
+    proposal_watchdog_transition = ProposalWatchdogTransition(
+        proposal_execution_lease
+    )
     proposal_connected = threading.Event()
     proposal_stop_transition = threading.Event()
     safety_threads_shutdown = threading.Event()
@@ -1484,7 +1573,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
         return proposal_execution_lease.renew_if_active(deadline)
 
     def clear_proposal_execution():
-        proposal_execution_lease.clear()
+        return proposal_watchdog_transition.clear_and_observe_fault()
 
     def proposal_fault_for_generation(generation):
         return proposal_execution_lease.fault_for_generation(generation)
@@ -1510,10 +1599,6 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                 sequence=command["sequence"],
                 timeout=proposal_rpc_timeout,
             )
-        proposal_apply_diagnostics.record_set_velocity(
-            result,
-            queued_monotonic=command["queued_monotonic"],
-        )
         return result
 
     def stop_parent_velocity_proposal():
@@ -1596,16 +1681,22 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
         was_proposal_motion = bool(
             current_cmd and current_cmd.get("source") == "velocity_proposal"
         )
-        watchdog_fault = (
-            current_proposal_watchdog_fault()
-            if was_proposal_motion
-            else None
-        )
+        if move_timer:
+            move_timer.cancel()
+            move_timer = None
+        clear_proposal_apply_queue()
+        # Linearize terminal/local stop against the independent watchdog.  If
+        # clear wins, a stale generation can no longer trip.  If trip wins,
+        # preserve that fault so this stop cannot authorize a new lease while
+        # the watchdog's physical StopMove may still be in flight.
+        watchdog_fault = clear_proposal_execution()
         reason_str = authoritative_proposal_stop_reason(
             reason_str,
             watchdog_fault,
         )
-        if watchdog_fault and reason_str != "proposal_ttl_expired":
+        if watchdog_fault and (
+            reason_str != "proposal_ttl_expired" or not proposal_gate.armed
+        ):
             proposal_gate.disarm(reason_str)
         recoverable_stop_requested = bool(
             proposal_gate.armed
@@ -1616,16 +1707,11 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
             was_proposal_motion or recoverable_stop_requested
         )
         retry_proposal_stop = (
-            proposal_stop_context and not confirm_physical_stop
+            proposal_stop_context and external_stop_attempt is None
         )
-        if move_timer:
-            move_timer.cancel()
-            move_timer = None
-        clear_proposal_apply_queue()
-        clear_proposal_execution()
         was_moving = state == MotionState.MOVING
 
-        if proposal_stop_context and not confirm_physical_stop:
+        if proposal_stop_context and external_stop_attempt is None:
             # The independent client brakes immediately.  The ordered parent
             # StopMove then runs after any in-flight continuous SetVelocity,
             # preventing a late successful apply from restarting motion.
@@ -2494,32 +2580,40 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
     @motion_synchronized
     def handle_bind_velocity_proposal(
         topic,
-        expected_nav_id,
+        expected_nav_id=None,
         external_stop_attempt=None,
     ):
         nonlocal last_proposal_stop_result
-        try:
-            expected_nav_id = resolve_expected_nav_id(
-                {"expected_nav_id": expected_nav_id}
-            )
-        except ValueError as exc:
-            stopped = do_stop(
-                str(exc),
-                confirm_physical_stop=True,
-                external_stop_attempt=external_stop_attempt,
-            )
-            proposal_gate.disarm(str(exc))
-            diagnostics = stopped.get("stop_confirmation") or {}
-            return {
-                "error": str(exc),
-                "connected": bool(proposal_node.topic),
-                "armed": False,
-                "stop_confirmed": stopped.get("stop_confirmed", False),
-                "stop_move_ret": diagnostics.get("stop_move_ret"),
-                "stop_move_error": diagnostics.get("stop_move_error"),
-                "stop_confirmation": diagnostics,
-            }
-        if proposal_gate.is_bound_to(topic, expected_nav_id):
+        if expected_nav_id is not None and expected_nav_id != "":
+            try:
+                expected_nav_id = resolve_expected_nav_id(
+                    {"expected_nav_id": expected_nav_id}
+                )
+            except ValueError as exc:
+                stopped = do_stop(
+                    str(exc),
+                    confirm_physical_stop=True,
+                    external_stop_attempt=external_stop_attempt,
+                )
+                proposal_gate.disarm(str(exc))
+                diagnostics = stopped.get("stop_confirmation") or {}
+                return {
+                    "error": str(exc),
+                    "connected": bool(proposal_node.topic),
+                    "armed": False,
+                    "stop_confirmed": stopped.get("stop_confirmed", False),
+                    "stop_move_ret": diagnostics.get("stop_move_ret"),
+                    "stop_move_error": diagnostics.get("stop_move_error"),
+                    "stop_confirmation": diagnostics,
+                }
+        else:
+            expected_nav_id = None
+        already_bound = (
+            proposal_gate.is_bound_to(topic, expected_nav_id)
+            if expected_nav_id is not None
+            else proposal_gate.is_waiting_on(topic)
+        )
+        if already_bound:
             stopped = do_stop(
                 "proposal_bind_existing",
                 confirm_physical_stop=True,
@@ -2730,7 +2824,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
 
     @motion_synchronized
     def on_velocity_proposal(msg):
-        nonlocal last_nav_status_time
+        nonlocal last_nav_status_time, stop_repeat_count
         now = time.monotonic()
         received_unix_ms = time.time() * 1000
         proposal_apply_diagnostics.record_received(now)
@@ -2770,14 +2864,43 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
             return
 
         was_armed = proposal_gate.armed
+        was_waiting_for_nav_id = proposal_gate.waiting_for_nav_id
         decision = proposal_gate.accept(
             payload,
             now,
             now_unix_ms=received_unix_ms,
         )
+        if was_waiting_for_nav_id and proposal_gate.expected_nav_id:
+            proposal_apply_diagnostics.bind_claimed_session(
+                proposal_gate.expected_nav_id,
+                received_monotonic=now,
+                payload=payload,
+                received_unix_ms=received_unix_ms,
+            )
         if decision.stop:
             if decision.reason != "proposal_zero":
                 proposal_apply_diagnostics.record_rejected(decision.reason)
+            terminal_proposal = bool(
+                decision.proposal and decision.proposal.is_terminal
+            )
+            if terminal_proposal:
+                stopped = do_stop(
+                    decision.reason,
+                    confirm_physical_stop=terminal_proposal,
+                )
+                terminal_stop_clean = bool(
+                    stopped.get("reason") == decision.reason
+                )
+                resumed_waiting = proposal_gate.resume_waiting_after_terminal_stop(
+                    bool(stopped.get("stop_confirmed"))
+                    and terminal_stop_clean
+                )
+                if resumed_waiting:
+                    # The confirmed terminal stop already completed the
+                    # physical brake.  Do not let its deferred StopMove
+                    # repeats cross the lease boundary into the next task.
+                    stop_repeat_count = 0
+                return
             is_proposal_motion = bool(
                 current_cmd and current_cmd.get("source") == "velocity_proposal"
             )
@@ -3048,6 +3171,23 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                     do_stop(watchdog_reason)
                     continue
 
+                if not proposal_apply_result_is_current(
+                    command,
+                    proposal_gate,
+                    proposal_execution_lease,
+                    generation,
+                ):
+                    # Stop/terminal/manual override cleared the generation, or
+                    # a newer task/sequence superseded this result while the
+                    # parent RPC was in flight.  It must not disarm or pollute
+                    # diagnostics for the current lease.
+                    continue
+
+                proposal_apply_diagnostics.record_set_velocity(
+                    result,
+                    queued_monotonic=command["queued_monotonic"],
+                )
+
                 error = result.get("error")
                 ret = result.get("ret")
                 if error or ret != 0 or not result.get("applied"):
@@ -3088,13 +3228,20 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                     reason = runtime["reason"] or "driver_safety_not_ready"
             if not reason:
                 continue
-            if not proposal_execution_lease.trip(generation, reason, now):
+            def dispatch_watchdog_stop():
+                proposal_apply_diagnostics.record_watchdog_fault(reason)
+                try:
+                    watchdog_loco_client.StopMove()
+                except Exception:
+                    pass
+
+            if not proposal_watchdog_transition.trip_and_dispatch_stop(
+                generation,
+                reason,
+                now,
+                dispatch_watchdog_stop,
+            ):
                 continue
-            proposal_apply_diagnostics.record_watchdog_fault(reason)
-            try:
-                watchdog_loco_client.StopMove()
-            except Exception:
-                pass
 
     def consume_proposal_watchdog_fault():
         fault = current_proposal_watchdog_fault()
@@ -3239,7 +3386,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                 try:
                     result = handle_bind_velocity_proposal(
                         cmd.get("topic", ""),
-                        cmd.get("expected_nav_id", ""),
+                        cmd.get("expected_nav_id"),
                         external_stop_attempt=cmd.get(
                             "external_stop_attempt"
                         ),
@@ -3324,12 +3471,13 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                 )
 
             # Repeat StopMove after emergency_stop to ensure controller receives it
-            if stop_repeat_count > 0 and state == MotionState.IDLE:
-                try:
-                    stop_loco_client.StopMove()
-                except Exception:
-                    pass
-                stop_repeat_count -= 1
+            with motion_command_lock:
+                if stop_repeat_count > 0 and state == MotionState.IDLE:
+                    try:
+                        stop_loco_client.StopMove()
+                    except Exception:
+                        pass
+                    stop_repeat_count -= 1
 
         # Periodic health log: verify slam_info subscription is working
         if now - last_slam_info_log >= 10.0:

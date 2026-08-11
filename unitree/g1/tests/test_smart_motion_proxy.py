@@ -86,6 +86,23 @@ class SmartMotionParentStopSequenceTest(unittest.TestCase):
             56,
         )
 
+    def test_bind_without_nav_id_preserves_waiting_mode_request(self):
+        calls = []
+        proxy = self.make_proxy(lambda: 0)
+
+        def fake_call(method, **kwargs):
+            calls.append((method, kwargs))
+            if method == "begin_velocity_proposal_stop_confirmation":
+                return {"confirmation_start": {"monotonic": 1.0}}
+            return {"connected": True, "waiting_for_nav_id": True}
+
+        proxy._call = fake_call
+        result = proxy.bind_velocity_proposal("/proposal")
+
+        self.assertTrue(result["waiting_for_nav_id"])
+        self.assertEqual(calls[-1][0], "bind_velocity_proposal")
+        self.assertIsNone(calls[-1][1]["expected_nav_id"])
+
     def test_parent_stop_exception_is_forwarded_for_fail_closed_confirmation(self):
         def fail_stop():
             raise RuntimeError("parent rpc unavailable")
@@ -464,6 +481,50 @@ class SmartMotionParentLocoSequenceTest(unittest.TestCase):
             callback_source.index("refresh_proposal_execution_deadline("),
             callback_source.index("proposal_apply_diagnostics.record_accepted()"),
         )
+        self.assertIn("terminal_proposal", callback_source)
+        self.assertIn("confirm_physical_stop=terminal_proposal", callback_source)
+        self.assertIn("terminal_stop_clean", callback_source)
+        self.assertIn(
+            'stopped.get("reason") == decision.reason',
+            callback_source,
+        )
+        self.assertIn("resume_waiting_after_terminal_stop", callback_source)
+        self.assertIn("if resumed_waiting:", callback_source)
+        self.assertIn("stop_repeat_count = 0", callback_source)
+        self.assertIn(
+            "retry_proposal_stop = (\n"
+            "            proposal_stop_context and external_stop_attempt is None",
+            source,
+        )
+        stop_source = source[
+            source.index("def do_stop("):
+            source.index("def do_stop_nav")
+        ]
+        self.assertLess(
+            stop_source.index("watchdog_fault = clear_proposal_execution()"),
+            stop_source.index("authoritative_proposal_stop_reason("),
+        )
+        apply_loop_source = source[
+            source.index("def proposal_apply_loop"):
+            source.index("def proposal_watchdog_loop")
+        ]
+        self.assertLess(
+            apply_loop_source.index("proposal_apply_result_is_current("),
+            apply_loop_source.index("record_set_velocity("),
+        )
+        watchdog_loop_source = source[
+            source.index("def proposal_watchdog_loop"):
+            source.index("def consume_proposal_watchdog_fault")
+        ]
+        self.assertIn(
+            "proposal_watchdog_transition.trip_and_dispatch_stop(",
+            watchdog_loop_source,
+        )
+        repeat_stop_source = source[
+            source.index("# Repeat StopMove after emergency_stop"):
+            source.index("# Periodic health log")
+        ]
+        self.assertIn("with motion_command_lock:", repeat_stop_source)
         self.assertIn('name="g1_loco_proposal_ros"', source)
         self.assertEqual(source.count("executor.spin_once"), 2)
 

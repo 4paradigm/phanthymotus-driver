@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import math
 import queue
+import threading
 import unittest
 
 from safety_harness import (
     ProposalApplyDiagnostics,
     ProposalExecutionLease,
+    ProposalWatchdogTransition,
     authoritative_proposal_stop_reason,
     obstacle_observation_applies,
     percentile_ms,
     put_latest,
+    proposal_apply_result_is_current,
     proposal_decision_requires_physical_stop,
     translation_obstacle_heading,
     velocity_commands_differ,
@@ -220,6 +223,52 @@ class ProposalApplyDiagnosticsTest(unittest.TestCase):
         self.assertEqual(reset["watchdog_faults_by_reason"], {})
         self.assertIsNone(reset["first_rejection_reason"])
 
+    def test_first_proposal_binding_keeps_preclaim_arrival_evidence(self):
+        diagnostics = ProposalApplyDiagnostics()
+        diagnostics.begin_session(None)
+        diagnostics.record_received(10.0)
+        diagnostics.record_rejected("proposal_ttl_expired")
+
+        diagnostics.bind_session_nav_id("nav-auto")
+        status = diagnostics.snapshot()
+
+        self.assertEqual(status["session_nav_id"], "nav-auto")
+        self.assertEqual(status["received"], 1)
+        self.assertEqual(status["rejected"], 1)
+        self.assertEqual(
+            status["first_rejection_reason"],
+            "proposal_ttl_expired",
+        )
+
+    def test_next_auto_claim_rolls_diagnostics_to_new_lease(self):
+        diagnostics = ProposalApplyDiagnostics()
+        diagnostics.begin_session(None)
+        diagnostics.record_received(10.0)
+        diagnostics.bind_claimed_session(
+            "nav-1",
+            received_monotonic=10.0,
+            payload={"issued_at_unix_ms": 900, "ttl_ms": 250},
+            received_unix_ms=1_000,
+        )
+        diagnostics.record_accepted()
+        diagnostics.record_applied("nav-1", 1)
+
+        rolled_over = diagnostics.bind_claimed_session(
+            "nav-2",
+            received_monotonic=20.0,
+            payload={"issued_at_unix_ms": 1_900, "ttl_ms": 250},
+            received_unix_ms=2_000,
+        )
+        status = diagnostics.snapshot()
+
+        self.assertTrue(rolled_over)
+        self.assertEqual(status["session_nav_id"], "nav-2")
+        self.assertEqual(status["received"], 1)
+        self.assertEqual(status["accepted"], 0)
+        self.assertEqual(status["applied"], 0)
+        self.assertEqual(status["first_received_monotonic"], 20.0)
+        self.assertEqual(status["last_proposal_age_ms"], 100)
+
     def test_applied_count_deduplicates_safety_reapply_by_proposal_identity(self):
         diagnostics = ProposalApplyDiagnostics()
         diagnostics.begin_session("nav-1")
@@ -257,6 +306,77 @@ class ProposalExecutionLeaseTest(unittest.TestCase):
         self.assertTrue(lease.renew_if_active(10.30))
         self.assertEqual(lease.watchdog_snapshot(), (generation, 10.40))
 
+    def test_cleared_generation_cannot_publish_late_apply_result(self):
+        lease = ProposalExecutionLease()
+        gate = VelocityProposalGate(ProposalLimits())
+        gate.bind("/ubuntu/navigation/nav2/velocity_proposal")
+        decision = gate.accept(
+            {
+                "schema": "phanthy.navigation.velocity_proposal.v1",
+                "nav_id": "nav-1",
+                "sequence": 1,
+                "ttl_ms": 250,
+                "issued_at_unix_ms": 1_000,
+                "frame": "base_link",
+                "nav_status": "navigating",
+                "velocity": {"x": 0.1, "y": 0.0, "yaw": 0.0},
+                "shadow_only": True,
+                "physical_execution": False,
+            },
+            now=10.0,
+        )
+        self.assertTrue(decision.execute)
+        generation = lease.arm(10.25)
+        command = {"nav_id": "nav-1", "sequence": 1}
+        self.assertTrue(
+            proposal_apply_result_is_current(
+                command,
+                gate,
+                lease,
+                generation,
+            )
+        )
+
+        lease.clear()
+        self.assertFalse(
+            proposal_apply_result_is_current(
+                command,
+                gate,
+                lease,
+                generation,
+            )
+        )
+
+    def test_superseded_sequence_cannot_publish_apply_result(self):
+        lease = ProposalExecutionLease()
+        gate = VelocityProposalGate(ProposalLimits())
+        gate.bind("/ubuntu/navigation/nav2/velocity_proposal", "nav-1")
+        first = {
+            "schema": "phanthy.navigation.velocity_proposal.v1",
+            "nav_id": "nav-1",
+            "sequence": 1,
+            "ttl_ms": 250,
+            "issued_at_unix_ms": 1_000,
+            "frame": "base_link",
+            "nav_status": "navigating",
+            "velocity": {"x": 0.1, "y": 0.0, "yaw": 0.0},
+            "shadow_only": True,
+            "physical_execution": False,
+        }
+        self.assertTrue(gate.accept(first, now=10.0).execute)
+        generation = lease.arm(10.25)
+        second = dict(first, sequence=2, issued_at_unix_ms=1_010)
+        self.assertTrue(gate.accept(second, now=10.01).execute)
+
+        self.assertFalse(
+            proposal_apply_result_is_current(
+                {"nav_id": "nav-1", "sequence": 1},
+                gate,
+                lease,
+                generation,
+            )
+        )
+
     def test_watchdog_rechecks_deadline_after_concurrent_renewal(self):
         lease = ProposalExecutionLease()
         generation = lease.arm(10.25)
@@ -290,6 +410,94 @@ class ProposalExecutionLeaseTest(unittest.TestCase):
         lease.clear()
         self.assertTrue(lease.renew_if_active(10.75))
         self.assertIsNotNone(lease.arm(10.75))
+
+    def test_clear_and_observe_fault_serializes_watchdog_transition(self):
+        tripped = ProposalExecutionLease()
+        tripped_generation = tripped.arm(10.25)
+        self.assertTrue(
+            tripped.trip(
+                tripped_generation,
+                "proposal_ttl_expired",
+                now=10.26,
+            )
+        )
+
+        self.assertEqual(
+            tripped.clear_and_observe_fault(),
+            (tripped_generation, "proposal_ttl_expired"),
+        )
+        self.assertIsNone(tripped.current_fault())
+
+        cleared = ProposalExecutionLease()
+        cleared_generation = cleared.arm(20.25)
+        self.assertIsNone(cleared.clear_and_observe_fault())
+        self.assertFalse(
+            cleared.trip(
+                cleared_generation,
+                "proposal_ttl_expired",
+                now=20.26,
+            )
+        )
+
+    def test_watchdog_stop_dispatch_finishes_before_clear_returns(self):
+        lease = ProposalExecutionLease()
+        transition = ProposalWatchdogTransition(lease)
+        generation = lease.arm(30.25)
+        stop_started = threading.Event()
+        release_stop = threading.Event()
+        clear_started = threading.Event()
+        clear_finished = threading.Event()
+        observed_fault = []
+
+        def blocking_stop():
+            stop_started.set()
+            self.assertTrue(release_stop.wait(timeout=1.0))
+
+        watchdog_thread = threading.Thread(
+            target=lambda: transition.trip_and_dispatch_stop(
+                generation,
+                "proposal_ttl_expired",
+                30.26,
+                blocking_stop,
+            )
+        )
+
+        def clear_execution():
+            clear_started.set()
+            observed_fault.append(transition.clear_and_observe_fault())
+            clear_finished.set()
+
+        watchdog_thread.start()
+        self.assertTrue(stop_started.wait(timeout=1.0))
+        clear_thread = threading.Thread(target=clear_execution)
+        clear_thread.start()
+        self.assertTrue(clear_started.wait(timeout=1.0))
+        self.assertFalse(clear_finished.wait(timeout=0.05))
+
+        release_stop.set()
+        watchdog_thread.join(timeout=1.0)
+        clear_thread.join(timeout=1.0)
+
+        self.assertFalse(watchdog_thread.is_alive())
+        self.assertFalse(clear_thread.is_alive())
+        self.assertEqual(
+            observed_fault,
+            [(generation, "proposal_ttl_expired")],
+        )
+
+        stop_calls = []
+        next_generation = lease.arm(31.25)
+        self.assertIsNotNone(next_generation)
+        self.assertIsNone(transition.clear_and_observe_fault())
+        self.assertFalse(
+            transition.trip_and_dispatch_stop(
+                next_generation,
+                "proposal_ttl_expired",
+                31.26,
+                lambda: stop_calls.append("late_stop"),
+            )
+        )
+        self.assertEqual(stop_calls, [])
 
 
 class VelocityCommandDifferenceTest(unittest.TestCase):

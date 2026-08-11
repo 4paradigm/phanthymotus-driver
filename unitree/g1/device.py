@@ -1037,7 +1037,11 @@ class LocoPlugin:
     def _connect_velocity_proposal(self, args: dict) -> dict:
         try:
             topic = resolve_input_topic(args, self._velocity_proposal_topic)
-            expected_nav_id = resolve_expected_nav_id(args)
+            expected_nav_id = None
+            if args.get("expected_nav_id") is not None and args.get(
+                "expected_nav_id"
+            ) != "":
+                expected_nav_id = resolve_expected_nav_id(args)
         except ValueError as exc:
             self._client.StopMove()
             if self._smart_motion:
@@ -1046,6 +1050,7 @@ class LocoPlugin:
                 "state": "error",
                 "connected": False,
                 "error": str(exc),
+                "message": str(exc),
                 "topic_in": [self._velocity_proposal_port()],
             }
         if not self._smart_motion:
@@ -1057,9 +1062,14 @@ class LocoPlugin:
                 "topic_in": [self._velocity_proposal_port()],
             }
         result = self._smart_motion.bind_velocity_proposal(topic, expected_nav_id)
-        if result.get("error") or not (
-            result.get("connected") and result.get("armed")
-        ):
+        connected_for_execution = bool(
+            result.get("connected")
+            and (
+                result.get("armed")
+                or result.get("waiting_for_nav_id")
+            )
+        )
+        if result.get("error") or not connected_for_execution:
             result = dict(result)
             fallback_stop_ret = None
             fallback_stop_error = None
@@ -1069,13 +1079,14 @@ class LocoPlugin:
                 fallback_stop_error = str(exc)
             result["fallback_stop_ret"] = fallback_stop_ret
             result["fallback_stop_error"] = fallback_stop_error
-        return {
+        response = {
             **result,
-            "state": "ready" if (
-                result.get("connected") and result.get("armed")
-            ) else "error",
+            "state": "ready" if connected_for_execution else "error",
             "topic_in": [self._velocity_proposal_port()],
         }
+        if response.get("error") and not response.get("message"):
+            response["message"] = str(response["error"])
+        return response
 
     def _disconnect_velocity_proposal(self, reason: str) -> dict:
         # Main-process RPC is an independent first stop path.  It guarantees
