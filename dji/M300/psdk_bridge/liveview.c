@@ -4,9 +4,8 @@
 #include <stdlib.h>
 #include <pthread.h>
 
-/* M300 can expose FPV plus payload-camera H.264 positions.  Availability is
- * aircraft/payload dependent: on the target M300 only FPV is currently
- * advertised by DJI's own PSDK 3.8 sample. */
+/* This target's M300 Extension Port exposes only the aircraft FPV H.264
+ * source. Payload-camera stream positions are intentionally not registered. */
 #ifdef PSDK_ENABLED
 #include "dji_liveview.h"
 #include <libavcodec/avcodec.h>
@@ -36,9 +35,6 @@ typedef struct {
 
 static T_LiveviewStream s_streams[] = {
     {"fpv",      DJI_LIVEVIEW_CAMERA_POSITION_FPV,  "/dev/shm/dji_frame_fpv.jpg",      0, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, 0, PTHREAD_MUTEX_INITIALIZER},
-    {"payload1", DJI_LIVEVIEW_CAMERA_POSITION_NO_1, "/dev/shm/dji_frame_payload1.jpg", 0, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, 0, PTHREAD_MUTEX_INITIALIZER},
-    {"payload2", DJI_LIVEVIEW_CAMERA_POSITION_NO_2, "/dev/shm/dji_frame_payload2.jpg", 0, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, 0, PTHREAD_MUTEX_INITIALIZER},
-    {"payload3", DJI_LIVEVIEW_CAMERA_POSITION_NO_3, "/dev/shm/dji_frame_payload3.jpg", 0, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, 0, PTHREAD_MUTEX_INITIALIZER},
 };
 #define STREAM_COUNT (sizeof(s_streams) / sizeof(s_streams[0]))
 
@@ -160,11 +156,6 @@ int liveview_start(const char *camera, liveview_frame_cb_t cb) {
         return -1;
     if (!s_liveview_ready || !stream->codec || !stream->parser || !stream->yuv) {
         printf("[liveview] start %s rejected: liveview initialization did not complete\n", stream->name);
-        return -1;
-    }
-    if (stream->position != DJI_LIVEVIEW_CAMERA_POSITION_FPV) {
-        printf("[liveview] start %s rejected: this aircraft exposes no verified payload liveview source; use fpv\n",
-               stream->name);
         return -1;
     }
     if (stream->running) return 0;

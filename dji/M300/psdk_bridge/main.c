@@ -452,7 +452,6 @@ static int _psdk_core_init(const char *app_id, const char *app_key,
 static void _init_modules(void) {
     telemetry_init();
     flight_ctrl_init();
-    camera_mgr_init();
     gimbal_mgr_init();
     waypoint_init();
     perception_init();
@@ -480,7 +479,6 @@ static void *_psdk_start_thread(void *arg) {
         printf("[psdk_bridge] PSDK core init failed; IPC remains available for status/errors\n");
         return NULL;
     }
-    _init_modules();
     T_DjiReturnCode rc = DjiCore_ApplicationStart();
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
         s_psdk_state = -1;
@@ -488,11 +486,17 @@ static void *_psdk_start_thread(void *arg) {
                (unsigned long long)rc);
         return NULL;
     }
+    /* The M300 accepts the Liveview status-push request only after the
+     * application handshake has settled.  Do not let other service-module
+     * subscriptions compete with that request during this interval. */
+    (void)Osal_TaskSleepMs(5000);
     if (liveview_init() != 0) {
         printf("[psdk] liveview init unavailable; camera_stream will return an error without crashing\n");
     }
-    /* HMS subscription is rejected before ApplicationStart on this M300.
-     * Initialise it only after Pilot has accepted the application. */
+    /* Camera Manager remains lazy: this FPV-only M300 has no default external
+     * payload camera.  The remaining service modules start only after the
+     * Liveview status subscription has had exclusive access to the link. */
+    _init_modules();
     hms_init();
     s_psdk_state = 1;
     printf("[psdk_bridge] PSDK modules ready\n");
@@ -710,8 +714,8 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
     }
     if (strstr(raw_json, "\"get_storage\"")) {
         char storage[256];
-        camera_mgr_get_storage(camera, storage, sizeof(storage));
-        snprintf(result, result_size, "{\"ok\":true,\"data\":%s}", storage);
+        int r = camera_mgr_get_storage(camera, storage, sizeof(storage));
+        snprintf(result, result_size, "{\"ok\":%s,\"data\":%s}", r == 0 ? "true" : "false", storage);
         return 0;
     }
     if (strstr(raw_json, "\"ir_temp_point\"")) {
@@ -859,10 +863,7 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
 
     /* Liveview */
     if (strstr(raw_json, "\"start_liveview\"")) {
-        const char *cam = "payload1";
-        if (strstr(raw_json, "\"fpv\"")) cam = "fpv";
-        else if (strstr(raw_json, "\"payload2\"")) cam = "payload2";
-        else if (strstr(raw_json, "\"payload3\"")) cam = "payload3";
+        const char *cam = "fpv";
         int r = liveview_start(cam, NULL);
         if (r == 0) {
             snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0,\"camera\":\"%s\"}}", cam);
@@ -872,8 +873,7 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
         return 0;
     }
     if (strstr(raw_json, "\"stop_liveview\"")) {
-        const char *cam = strstr(raw_json, "\"fpv\"") ? "fpv" : camera;
-        liveview_stop(cam);
+        liveview_stop("fpv");
         snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
         return 0;
     }
