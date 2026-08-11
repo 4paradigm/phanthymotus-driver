@@ -31,8 +31,12 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     pyyaml netifaces numpy opencv-python-headless pyrealsense2 pybind11
 
-# Noetix Bumi SDK — copy source and build pybind modules
+# Noetix Bumi SDK — copy source and download pre-built libs from COS
 COPY noetix_sdk_bumi/ /work/noetix_sdk_bumi/
+
+# Download pre-built libs (libdriver.a, DDS .so, etc.) from COS
+ARG SDK_LIBS_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/noetix/noetix_sdk_bumi_libs.tar.gz
+RUN curl -fsSL ${SDK_LIBS_URL} | tar xz -C /work/noetix_sdk_bumi/
 
 # Patch CMakeLists: remove onnxruntime dep and executables (we only need pybind .so)
 RUN cd /work/noetix_sdk_bumi && \
