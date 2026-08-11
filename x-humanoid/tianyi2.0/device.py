@@ -5069,13 +5069,13 @@ class RobotFaultsPlugin:
             prev_state = self._self_check_state.state if self._self_check_state is not None else None
             self._self_check_state = msg
             self._last_update_ms = now_ms
-            # body_control 离开 Running (state!=1) → 重置自检标记，避免 stuck
-            if prev_state == 1 and msg.state != 1:
+            # 自检结束: 从 Initing(0) 回到 Running(1)，且当时确实在自检中 → 重置
+            if prev_state != 1 and msg.state == 1 and self._self_check_started:
                 self._self_check_started = False
                 self._self_check_completed = False
                 self._audio_window_start_ms = None
                 self._audio_window_count = 0
-                print(f"[RobotFaultsPlugin] body_control left Running(state={msg.state}), self-check flags reset")
+                print(f"[RobotFaultsPlugin] body_control returned to Running, self-check flags reset")
 
     def _on_light_ctrl(self, msg):
         """proc_manager 灯效反馈, cmd 20=自检等待/21=自检启动/22=自检成功."""
