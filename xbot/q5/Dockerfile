@@ -17,7 +17,8 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
         libportaudio2 \
         portaudio19-dev \
         libasound2-dev \
-        alsa-utils && \
+        alsa-utils \
+        ros-humble-rmw-cyclonedds-cpp && \
     rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
