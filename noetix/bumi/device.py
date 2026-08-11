@@ -22,6 +22,8 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from std_msgs.msg import String
+from audio_msgs.msg import AudioChunk
+from sensor_msgs.msg import CompressedImage
 
 
 _LOW_LAT_QOS = QoSProfile(
@@ -512,9 +514,9 @@ class MicPlugin:
         self._running = False
         self._thread: threading.Thread | None = None
 
-        # ROS2 publisher
+        # ROS2 publisher — use AudioChunk (same as R1, expected by Agent Core)
         self._node = Node("bumi_mic")
-        self._pub = self._node.create_publisher(String, self._topic, _LOW_LAT_QOS)
+        self._pub = self._node.create_publisher(AudioChunk, self._topic, _LOW_LAT_QOS)
         executor.add_node(self._node)
 
     def get_tool(self) -> dict:
@@ -536,7 +538,7 @@ class MicPlugin:
         self._running = False
 
     def _capture_loop(self):
-        """Poll MediaController for audio data, downmix 8ch to mono, publish."""
+        """Poll MediaController for audio data, downmix 8ch to mono, publish as AudioChunk."""
         while self._running:
             try:
                 audio = self._media_ctrl.get_audio_capture_data()
@@ -546,21 +548,16 @@ class MicPlugin:
 
                 # Downmix: extract channel 0 from interleaved 8-channel data
                 channels = audio.channels  # 8
-                samples = audio.audio_data  # int16 array, interleaved
+                samples = audio.audio_data  # int16 list, interleaved
                 mono_samples = samples[::channels]  # Take every 8th sample (ch0)
 
                 # Pack as PCM bytes
                 pcm_bytes = struct.pack(f'<{len(mono_samples)}h', *mono_samples)
 
-                # Publish as base64-encoded audio chunk via String
-                # (matches audio_msgs/AudioChunk format expected by perception)
-                import base64
-                msg = String()
-                msg.data = json.dumps({
-                    "format": "audio/pcm-16k",
-                    "data": base64.b64encode(pcm_bytes).decode(),
-                    "samples": len(mono_samples),
-                })
+                # Publish as AudioChunk (matches Agent Core expectation)
+                msg = AudioChunk()
+                msg.format = "pcm_16k_16bit_mono"
+                msg.data = pcm_bytes
                 self._pub.publish(msg)
 
             except Exception as e:
@@ -728,8 +725,8 @@ class CameraPlugin:
         self._color_topic = f"/{namespace}/camera/color"
         self._depth_topic = f"/{namespace}/camera/depth"
         self._node = Node("bumi_camera")
-        self._color_pub = self._node.create_publisher(String, self._color_topic, _LOW_LAT_QOS)
-        self._depth_pub = self._node.create_publisher(String, self._depth_topic, _LOW_LAT_QOS)
+        self._color_pub = self._node.create_publisher(CompressedImage, self._color_topic, _LOW_LAT_QOS)
+        self._depth_pub = self._node.create_publisher(CompressedImage, self._depth_topic, _LOW_LAT_QOS)
         executor.add_node(self._node)
         self._running = False
         self._thread: threading.Thread | None = None
@@ -792,15 +789,21 @@ class CameraPlugin:
                 if color_frame:
                     color_image = np.asanyarray(color_frame.get_data())
                     _, jpeg_buf = cv2.imencode('.jpg', color_image, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                    msg = String()
-                    msg.data = base64.b64encode(jpeg_buf.tobytes()).decode()
+                    msg = CompressedImage()
+                    msg.header.stamp = self._node.get_clock().now().to_msg()
+                    msg.format = "jpeg"
+                    msg.data = jpeg_buf.tobytes()
                     self._color_pub.publish(msg)
 
                 depth_frame = frames.get_depth_frame()
                 if depth_frame:
                     depth_image = np.asanyarray(depth_frame.get_data())
-                    msg = String()
-                    msg.data = base64.b64encode(depth_image.tobytes()).decode()
+                    # Encode depth as 16-bit PNG for lossless transport
+                    _, png_buf = cv2.imencode('.png', depth_image)
+                    msg = CompressedImage()
+                    msg.header.stamp = self._node.get_clock().now().to_msg()
+                    msg.format = "png"
+                    msg.data = png_buf.tobytes()
                     self._depth_pub.publish(msg)
 
         except Exception as e:
