@@ -554,9 +554,9 @@ def _mic_subprocess(namespace: str):
             samples = _np.array(audio.audio_data, dtype=_np.int16)
             mono = samples[::audio.channels]
 
-            # SDK returns 8-bit amplitude in int16 container (range ±128)
-            # Scale to proper 16-bit range for PCM-16k format
-            mono = _np.clip(mono.astype(_np.int32) * 256, -32768, 32767).astype(_np.int16)
+            # SDK returns low-amplitude signal (~8-bit dynamic range in 16-bit container)
+            # Apply moderate gain to reach usable 16-bit level without clipping
+            mono = _np.clip(mono.astype(_np.int32) * 50, -32768, 32767).astype(_np.int16)
 
             # Accumulate until we have enough for a proper chunk
             buffer = _np.concatenate([buffer, mono])
