@@ -2,6 +2,7 @@
 #define HMS_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 int hms_init(void);
 int hms_get_info(char *buf, size_t buflen);
