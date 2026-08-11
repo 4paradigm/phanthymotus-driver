@@ -19,11 +19,17 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
         libasound2-dev \
         alsa-utils \
         ros-humble-rmw-cyclonedds-cpp \
-        ros-humble-control-msgs && \
+        ros-humble-control-msgs \
+        ros-humble-nav-msgs \
+        ros-humble-sensor-msgs \
+        ros-humble-geometry-msgs \
+        ros-humble-std-srvs \
+        ros-humble-diagnostic-msgs \
+        ros-humble-action-msgs && \
     rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    pyyaml pyaudio
+    pyyaml pyaudio sherpa-onnx
 
 # 本地 vendor 的 ROS2 消息包：xbot_common_interfaces + era_nav_msgs
 COPY vendor/xbot_common_interfaces /q5_ws/src/xbot_common_interfaces

@@ -51,137 +51,58 @@ class Q5DeviceBundle:
     def __init__(self, cfg: dict, namespace: str, executor):
         self._cfg = cfg
         self._plugins: list = []
+        self._failed_plugins: list = []
         plugins_cfg = cfg.get("plugins", {})
 
-        if plugins_cfg.get("state", {}).get("enabled", False):
-            from device import StatePlugin
-            self._plugins.append(StatePlugin(plugins_cfg["state"], namespace, executor))
-            print("[bundle] StatePlugin loaded")
+        # (config_key, plugin_class_name, module_path)
+        _PLUGIN_MAP = [
+            ("state", "StatePlugin"),
+            ("imu", "ImuPlugin"),
+            ("battery", "BatteryPlugin"),
+            ("faults", "FaultsPlugin"),
+            ("loco", "LocoPlugin"),
+            ("joint_servo", "JointServoPlugin"),
+            ("hand", "HandPlugin"),
+            ("hand_state", "HandStatePlugin"),
+            ("head", "HeadPlugin"),
+            ("head_gesture", "HeadGesturePlugin"),
+            ("arm", "ArmPlugin"),
+            ("arm_gesture", "ArmGesturePlugin"),
+            ("motion", "MotionPlugin"),
+            ("gesture", "GesturePlugin"),
+            ("audio", "AudioPlugin"),
+            ("speaker", "SpeakerPlugin"),
+            ("led", "LedPlugin"),
+            ("nav", "NavPlugin"),
+            ("teleop", "TeleopPlugin"),
+            ("odom", "OdomPlugin"),
+            ("simple_actions", "SimpleActionsPlugin"),
+            ("simple_trajectory", "SimpleTrajectoryPlugin"),
+            ("behavior", "BehaviorPlugin"),
+            ("grasp", "GraspObjectPlugin"),
+            ("motion_action", "MotionActionPlugin"),
+            ("camera", "CameraPlugin"),
+        ]
 
-        if plugins_cfg.get("imu", {}).get("enabled", False):
-            from device import ImuPlugin
-            self._plugins.append(ImuPlugin(plugins_cfg["imu"], namespace, executor))
-            print("[bundle] ImuPlugin loaded")
+        for key, cls_name in _PLUGIN_MAP:
+            if not plugins_cfg.get(key, {}).get("enabled", False):
+                continue
+            try:
+                import device
+                cls = getattr(device, cls_name)
+                plugin = cls(plugins_cfg[key], namespace, executor)
+                self._plugins.append(plugin)
+                print(f"[bundle] {cls_name} loaded")
+            except Exception as e:
+                print(f"[bundle] {cls_name} FAILED to load: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
+                self._failed_plugins.append((key, cls_name, str(e)))
 
-        if plugins_cfg.get("battery", {}).get("enabled", False):
-            from device import BatteryPlugin
-            self._plugins.append(BatteryPlugin(plugins_cfg["battery"], namespace, executor))
-            print("[bundle] BatteryPlugin loaded")
-
-        if plugins_cfg.get("faults", {}).get("enabled", False):
-            from device import FaultsPlugin
-            self._plugins.append(FaultsPlugin(plugins_cfg["faults"], namespace, executor))
-            print("[bundle] FaultsPlugin loaded")
-
-        if plugins_cfg.get("loco", {}).get("enabled", False):
-            from device import LocoPlugin
-            self._plugins.append(LocoPlugin(plugins_cfg["loco"], namespace, executor))
-            print("[bundle] LocoPlugin loaded")
-
-        if plugins_cfg.get("joint_servo", {}).get("enabled", False):
-            from device import JointServoPlugin
-            self._plugins.append(JointServoPlugin(plugins_cfg["joint_servo"], namespace, executor))
-            print("[bundle] JointServoPlugin loaded")
-
-        if plugins_cfg.get("hand", {}).get("enabled", False):
-            from device import HandPlugin
-            self._plugins.append(HandPlugin(plugins_cfg["hand"], namespace, executor))
-            print("[bundle] HandPlugin loaded")
-
-        if plugins_cfg.get("hand_state", {}).get("enabled", False):
-            from device import HandStatePlugin
-            self._plugins.append(HandStatePlugin(plugins_cfg["hand_state"], namespace, executor))
-            print("[bundle] HandStatePlugin loaded")
-
-        if plugins_cfg.get("head", {}).get("enabled", False):
-            from device import HeadPlugin
-            self._plugins.append(HeadPlugin(plugins_cfg["head"], namespace, executor))
-            print("[bundle] HeadPlugin loaded")
-
-        if plugins_cfg.get("head_gesture", {}).get("enabled", False):
-            from device import HeadGesturePlugin
-            self._plugins.append(HeadGesturePlugin(plugins_cfg["head_gesture"], namespace, executor))
-            print("[bundle] HeadGesturePlugin loaded")
-
-        if plugins_cfg.get("arm", {}).get("enabled", False):
-            from device import ArmPlugin
-            self._plugins.append(ArmPlugin(plugins_cfg["arm"], namespace, executor))
-            print("[bundle] ArmPlugin loaded")
-
-        if plugins_cfg.get("arm_gesture", {}).get("enabled", False):
-            from device import ArmGesturePlugin
-            self._plugins.append(ArmGesturePlugin(plugins_cfg["arm_gesture"], namespace, executor))
-            print("[bundle] ArmGesturePlugin loaded")
-
-        if plugins_cfg.get("motion", {}).get("enabled", False):
-            from device import MotionPlugin
-            self._plugins.append(MotionPlugin(plugins_cfg["motion"], namespace, executor))
-            print("[bundle] MotionPlugin loaded")
-
-        if plugins_cfg.get("gesture", {}).get("enabled", False):
-            from device import GesturePlugin
-            self._plugins.append(GesturePlugin(plugins_cfg["gesture"], namespace, executor))
-            print("[bundle] GesturePlugin loaded")
-
-        if plugins_cfg.get("audio", {}).get("enabled", False):
-            from device import AudioPlugin
-            self._plugins.append(AudioPlugin(plugins_cfg["audio"], namespace, executor))
-            print("[bundle] AudioPlugin loaded")
-
-        if plugins_cfg.get("speaker", {}).get("enabled", False):
-            from device import SpeakerPlugin
-            self._plugins.append(SpeakerPlugin(plugins_cfg["speaker"], namespace, executor))
-            print("[bundle] SpeakerPlugin loaded")
-
-        if plugins_cfg.get("led", {}).get("enabled", False):
-            from device import LedPlugin
-            self._plugins.append(LedPlugin(plugins_cfg["led"], namespace, executor))
-            print("[bundle] LedPlugin loaded")
-
-        if plugins_cfg.get("nav", {}).get("enabled", False):
-            from device import NavPlugin
-            self._plugins.append(NavPlugin(plugins_cfg["nav"], namespace, executor))
-            print("[bundle] NavPlugin loaded")
-
-        if plugins_cfg.get("teleop", {}).get("enabled", False):
-            from device import TeleopPlugin
-            self._plugins.append(TeleopPlugin(plugins_cfg["teleop"], namespace, executor))
-            print("[bundle] TeleopPlugin loaded")
-
-        if plugins_cfg.get("odom", {}).get("enabled", False):
-            from device import OdomPlugin
-            self._plugins.append(OdomPlugin(plugins_cfg["odom"], namespace, executor))
-            print("[bundle] OdomPlugin loaded")
-
-        if plugins_cfg.get("simple_actions", {}).get("enabled", False):
-            from device import SimpleActionsPlugin
-            self._plugins.append(SimpleActionsPlugin(plugins_cfg["simple_actions"], namespace, executor))
-            print("[bundle] SimpleActionsPlugin loaded")
-
-        if plugins_cfg.get("simple_trajectory", {}).get("enabled", False):
-            from device import SimpleTrajectoryPlugin
-            self._plugins.append(SimpleTrajectoryPlugin(plugins_cfg["simple_trajectory"], namespace, executor))
-            print("[bundle] SimpleTrajectoryPlugin loaded")
-
-        if plugins_cfg.get("behavior", {}).get("enabled", False):
-            from device import BehaviorPlugin
-            self._plugins.append(BehaviorPlugin(plugins_cfg["behavior"], namespace, executor))
-            print("[bundle] BehaviorPlugin loaded")
-
-        if plugins_cfg.get("grasp", {}).get("enabled", False):
-            from device import GraspObjectPlugin
-            self._plugins.append(GraspObjectPlugin(plugins_cfg["grasp"], namespace, executor))
-            print("[bundle] GraspObjectPlugin loaded")
-
-        if plugins_cfg.get("motion_action", {}).get("enabled", False):
-            from device import MotionActionPlugin
-            self._plugins.append(MotionActionPlugin(plugins_cfg["motion_action"], namespace, executor))
-            print("[bundle] MotionActionPlugin loaded")
-
-        if plugins_cfg.get("camera", {}).get("enabled", False):
-            from device import CameraPlugin
-            self._plugins.append(CameraPlugin(plugins_cfg["camera"], namespace, executor))
-            print("[bundle] CameraPlugin loaded")
+        if self._failed_plugins:
+            print(f"[bundle] WARNING: {len(self._failed_plugins)} plugin(s) failed to load: "
+                  f"{', '.join(f'{n}({k})' for k, n, _ in self._failed_plugins)}", flush=True)
+        print(f"[bundle] {len(self._plugins)}/{len(self._plugins)+len(self._failed_plugins)} plugins loaded successfully")
 
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
