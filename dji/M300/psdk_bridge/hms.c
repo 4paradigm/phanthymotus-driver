@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include "cJSON.h"
 
 /*
  * PSDK HMS (Health Management System) for Matrice 300 RTK.
@@ -23,6 +24,11 @@
  *   2. If it fails with 0xE1, fall back to DjiHmsCustomization which
  *      does NOT depend on the camera subscription path.
  *   3. Provide manual inject/eliminate APIs for testing custom HMS alerts.
+ *
+ * Error code lookup (two-tier):
+ *   1. Primary: hms_2023_08_22.json (DJI's latest error code database, ~1.7MB).
+ *      Contains 1000+ error codes vs ~150 in the compiled-in hmsErrCodeInfoTbl.
+ *   2. Fallback: hmsErrCodeInfoTbl (compiled into PSDK library).
  *
  * Prerequisites (per DJI docs):
  *   - DjiFcSubscription_Init() + DJI_FC_SUBSCRIPTION_TOPIC_STATUS_FLIGHT
@@ -58,17 +64,116 @@ static T_DjiReturnCode _hms_cb(T_DjiHmsInfoTable info) {
 }
 
 /* ── HMS customization: manually inject/eliminate error codes ─────────── */
-/*
- * These functions work independently of DjiHmsManager. They let us
- * inject custom HMS alerts (0x1E020000 ~ 0x1E02FFFF range) for testing.
- */
 static uint32_t s_injected_alerts[MAX_ALERTS];
 static uint8_t  s_injected_levels[MAX_ALERTS];
 static int      s_injected_count = 0;
 
-/* Lookup error code in built-in hmsErrCodeInfoTbl */
-static char s_unknown_buf[64];
+/* ── JSON-based error code lookup (hzhy demo approach) ────────────────── */
+/*
+ * The compiled-in hmsErrCodeInfoTbl only contains ~150 error codes.
+ * DJI publishes a much more comprehensive JSON database (~1000+ codes)
+ * that is updated regularly.  We load it at startup and search it first,
+ * falling back to hmsErrCodeInfoTbl only when the JSON is unavailable
+ * or the code is not found.
+ *
+ * JSON key format:
+ *   "fpv_tip_0x%08X"             — ground message
+ *   "fpv_tip_0x%08X_in_the_sky"  — in-air message
+ * Each key maps to an object with language keys: "en", "zh", etc.
+ */
+static cJSON *s_hms_json_root = NULL;
+
+/* Search paths for the HMS JSON database, tried in order */
+static const char *HMS_JSON_SEARCH_PATHS[] = {
+    "data/hms_2023_08_22.json",                         /* relative to CWD */
+    "/opt/dji/M300/psdk_bridge/data/hms_2023_08_22.json",  /* deployed path */
+    NULL
+};
+
+static int _load_hms_json(void) {
+    FILE *fp = NULL;
+    long file_size;
+    char *file_buf = NULL;
+
+    for (int i = 0; HMS_JSON_SEARCH_PATHS[i] != NULL; i++) {
+        fp = fopen(HMS_JSON_SEARCH_PATHS[i], "rb");
+        if (fp) {
+            printf("[hms] loading JSON database: %s\n", HMS_JSON_SEARCH_PATHS[i]);
+            break;
+        }
+    }
+    if (!fp) {
+        printf("[hms] JSON database not found, falling back to hmsErrCodeInfoTbl only\n");
+        return -1;
+    }
+
+    fseek(fp, 0, SEEK_END);
+    file_size = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+
+    file_buf = (char *)malloc(file_size + 1);
+    if (!file_buf) {
+        printf("[hms] failed to allocate %ld bytes for JSON\n", file_size);
+        fclose(fp);
+        return -1;
+    }
+    fread(file_buf, 1, file_size, fp);
+    file_buf[file_size] = '\0';
+    fclose(fp);
+
+    s_hms_json_root = cJSON_Parse(file_buf);
+    free(file_buf);
+
+    if (!s_hms_json_root) {
+        printf("[hms] JSON parse failed: %s\n",
+               cJSON_GetErrorPtr() ? cJSON_GetErrorPtr() : "unknown error");
+        return -1;
+    }
+
+    printf("[hms] JSON database loaded (%ld bytes)\n", file_size);
+    return 0;
+}
+
+/* Lookup error code in the JSON database.
+ * Returns the message string (English), or NULL if not found.
+ * The returned pointer is valid as long as s_hms_json_root is alive. */
+static const char *_lookup_msg_json(uint32_t code, int is_flying) {
+    if (!s_hms_json_root) return NULL;
+
+    char key[64];
+    if (is_flying) {
+        snprintf(key, sizeof(key), "fpv_tip_0x%08X_in_the_sky", code);
+    } else {
+        snprintf(key, sizeof(key), "fpv_tip_0x%08X", code);
+    }
+
+    cJSON *error_obj = cJSON_GetObjectItem(s_hms_json_root, key);
+    if (!error_obj) {
+        /* If in_the_sky key not found, try the ground key as fallback */
+        if (is_flying) {
+            snprintf(key, sizeof(key), "fpv_tip_0x%08X", code);
+            error_obj = cJSON_GetObjectItem(s_hms_json_root, key);
+        }
+        if (!error_obj) return NULL;
+    }
+
+    cJSON *en_msg = cJSON_GetObjectItem(error_obj, "en");
+    if (!en_msg || !en_msg->valuestring) return NULL;
+
+    return en_msg->valuestring;
+}
+
+/* ── Error code → human-readable message ─────────────────────────────── */
+
+static char s_unknown_buf[128];
+
+/* Lookup error code: try JSON first, then fall back to hmsErrCodeInfoTbl. */
 static const char *_lookup_msg(uint32_t code, int is_flying) {
+    /* Tier 1: JSON database (comprehensive, ~1000+ codes) */
+    const char *json_msg = _lookup_msg_json(code, is_flying);
+    if (json_msg) return json_msg;
+
+    /* Tier 2: Compiled-in hmsErrCodeInfoTbl (~150 codes) */
     size_t tbl_size = sizeof(hmsErrCodeInfoTbl) / sizeof(hmsErrCodeInfoTbl[0]);
     for (size_t i = 0; i < tbl_size; i++) {
         if (hmsErrCodeInfoTbl[i].alarmId == code) {
@@ -79,7 +184,24 @@ static const char *_lookup_msg(uint32_t code, int is_flying) {
             return hmsErrCodeInfoTbl[i].flyAlarmInfo ? hmsErrCodeInfoTbl[i].flyAlarmInfo : "Unknown";
         }
     }
-    snprintf(s_unknown_buf, sizeof(s_unknown_buf), "Unknown error 0x%08X", code);
+
+    /* Tier 3: Give a category-level hint based on the error code prefix */
+    uint8_t module_id = (code >> 24) & 0xFF;
+    const char *category;
+    switch (module_id) {
+        case 0x16: category = "Flight control"; break;
+        case 0x17: category = "Battery"; break;
+        case 0x18: category = "Remote controller / Transmission"; break;
+        case 0x19: category = "Avionics system"; break;
+        case 0x1A: category = "Payload"; break;
+        case 0x1B: category = "RTK"; break;
+        case 0x1C: category = "Radar"; break;
+        case 0x1D: category = "Vision system"; break;
+        case 0x1E: category = "PSDK custom"; break;
+        default:   category = "Unknown module"; break;
+    }
+    snprintf(s_unknown_buf, sizeof(s_unknown_buf),
+             "Unknown error 0x%08X (%s)", code, category);
     return s_unknown_buf;
 }
 
@@ -165,6 +287,9 @@ int hms_eliminate_error(uint32_t error_code) {
 int hms_init(void) {
     T_DjiReturnCode rc;
 
+    /* Load JSON error code database (best-effort; fallback to built-in table) */
+    _load_hms_json();
+
     /* ── Strategy 1: Try normal HMS manager (may work on some devices) ── */
     printf("[hms] trying DjiHmsManager_Init()...\n");
     rc = DjiHmsManager_Init();
@@ -198,7 +323,8 @@ int hms_init(void) {
         }
     }
 
-    printf("[hms] initialized (manager_ready=%d)\n", s_hms_manager_ready);
+    printf("[hms] initialized (manager_ready=%d, json_loaded=%d)\n",
+           s_hms_manager_ready, s_hms_json_root != NULL);
     return 0;
 }
 
@@ -207,6 +333,10 @@ void hms_cleanup(void) {
         DjiHmsManager_DeInit();
     }
     DjiHmsCustomization_DeInit();
+    if (s_hms_json_root) {
+        cJSON_Delete(s_hms_json_root);
+        s_hms_json_root = NULL;
+    }
 }
 
 #else /* stub */
