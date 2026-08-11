@@ -15,6 +15,7 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
         cmake \
         build-essential \
         libportaudio2 \
+        portaudio19-dev \
         libasound2-dev \
         alsa-utils && \
     rm -rf /var/lib/apt/lists/*
