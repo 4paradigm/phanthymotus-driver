@@ -538,6 +538,8 @@ def _mic_subprocess(namespace: str):
 
     print(f"[mic_subprocess] publishing to {topic}", flush=True)
 
+    frame_count = 0
+    t_start = _time.monotonic()
     while True:
         try:
             audio = media_ctrl.get_audio_capture_data()
@@ -553,6 +555,11 @@ def _mic_subprocess(namespace: str):
             msg.format = "pcm_16k_16bit_mono"
             msg.data = mono.tobytes()
             pub.publish(msg)
+
+            frame_count += 1
+            if frame_count % 500 == 0:
+                elapsed = _time.monotonic() - t_start
+                print(f"[mic_subprocess] {frame_count} chunks, {frame_count/elapsed:.1f} chunks/s, last mono_len={len(mono)}", flush=True)
         except Exception as e:
             print(f"[mic_subprocess] error: {e}", flush=True)
             _time.sleep(0.5)
@@ -775,7 +782,7 @@ def _camera_subprocess(namespace: str):
         def encode_jpeg(bgr_image):
             return _tj.encode(bgr_image, pixel_format=TJPF_BGR, quality=80)
         print("[camera_subprocess] using TurboJPEG encoder", flush=True)
-    except ImportError:
+    except Exception:
         def encode_jpeg(bgr_image):
             _, buf = cv2.imencode('.jpg', bgr_image, [cv2.IMWRITE_JPEG_QUALITY, 80])
             return buf.tobytes()
@@ -786,7 +793,7 @@ def _camera_subprocess(namespace: str):
     color_topic = f"/{namespace}/camera/color"
     depth_topic = f"/{namespace}/camera/depth"
     color_pub = node.create_publisher(_CompressedImage, color_topic, _QOS)
-    depth_pub = node.create_publisher(_SensorImage, depth_topic, _QOS)
+    depth_pub = node.create_publisher(_CompressedImage, depth_topic, _QOS)
 
     pipeline = rs.pipeline()
     config = rs.config()
@@ -801,14 +808,20 @@ def _camera_subprocess(namespace: str):
 
     print(f"[camera_subprocess] publishing color→{color_topic} depth→{depth_topic}", flush=True)
 
+    frame_count = 0
+    t_start = _time.monotonic()
     try:
         while True:
+            t0 = _time.monotonic()
             frames = pipeline.wait_for_frames(timeout_ms=1000)
+            t_wait = _time.monotonic() - t0
 
             color_frame = frames.get_color_frame()
             if color_frame:
                 color_image = _np.asanyarray(color_frame.get_data())
+                t1 = _time.monotonic()
                 jpeg_bytes = encode_jpeg(color_image)
+                t_enc = _time.monotonic() - t1
                 msg = _CompressedImage()
                 msg.header.stamp = node.get_clock().now().to_msg()
                 msg.format = "jpeg"
@@ -818,15 +831,22 @@ def _camera_subprocess(namespace: str):
             depth_frame = frames.get_depth_frame()
             if depth_frame:
                 depth_image = _np.asanyarray(depth_frame.get_data())
-                msg = _SensorImage()
+                import zlib as _zlib
+                compressed = _zlib.compress(depth_image.tobytes(), 1)
+                msg = _CompressedImage()
                 msg.header.stamp = node.get_clock().now().to_msg()
-                msg.height = depth_image.shape[0]
-                msg.width = depth_image.shape[1]
-                msg.encoding = "16UC1"
-                msg.is_bigendian = 0
-                msg.step = msg.width * 2
-                msg.data = depth_image.tobytes()
+                msg.format = "16UC1; compressedDepth zlib"
+                msg.data = compressed
                 depth_pub.publish(msg)
+
+            frame_count += 1
+            # Log every 100 frames
+            if frame_count % 100 == 0:
+                elapsed = _time.monotonic() - t_start
+                fps = frame_count / elapsed
+                print(f"[camera_subprocess] {frame_count} frames, {fps:.1f} fps, last: wait={t_wait*1000:.1f}ms enc={t_enc*1000:.1f}ms", flush=True)
+
+            _time.sleep(0.001)  # yield CPU
     except Exception as e:
         print(f"[camera_subprocess] error: {e}", flush=True)
     finally:
@@ -856,9 +876,9 @@ class CameraPlugin:
                 "name": "depth",
                 "type": "sensor",
                 "multiInstance": False,
-                "description": f"Bumi Realsense D435i depth camera — 640x480 Z16 @ 30fps. Publishes to {self._depth_topic}",
+                "description": f"Bumi Realsense D435i depth camera — 640x480 zlib-compressed Z16 @ 30fps. Publishes to {self._depth_topic}",
                 "inputSchema": {"type": "object", "properties": {}},
-                "topic_out": [{"topic": self._depth_topic, "format": "image/depth-z16"}],
+                "topic_out": [{"topic": self._depth_topic, "format": "image/depth-zlib"}],
             },
         ]
 
@@ -889,6 +909,6 @@ class CameraPlugin:
             if tool_name == "camera":
                 return {"state": "running", "topic_out": [{"topic": self._color_topic, "format": "image/jpeg"}]}
             if tool_name == "depth":
-                return {"state": "running", "topic_out": [{"topic": self._depth_topic, "format": "image/depth-z16"}]}
+                return {"state": "running", "topic_out": [{"topic": self._depth_topic, "format": "image/depth-zlib"}]}
             return {"state": "running"}
         return None

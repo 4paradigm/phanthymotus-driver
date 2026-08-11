@@ -386,7 +386,8 @@ The Agent Core Web Dashboard automatically selects a renderer based on the `form
 | `audio/*` (e.g. `audio/pcm-16k`) | Audio waveform | `hint.startsWith('audio/')` |
 | `video/*` (e.g. `video/mjpeg`) | Video stream | `hint.startsWith('video/')` |
 | `image/jpeg` | Camera image | `hint === 'image/jpeg'` |
-| `image/depth-z16` | Depth colormap | `hint === 'image/depth-z16'` |
+| `image/depth-z16` | Depth colormap (raw) | `hint === 'image/depth-z16'` |
+| `image/depth-zlib` | Depth colormap (zlib compressed) | `hint === 'image/depth-zlib'` |
 | `image` | Generic image | `hint === 'image'` |
 | `data/json` | Text / KV panel | `hint === 'data/json'` |
 | `text/*` | Text display | `hint.startsWith('text/')` |
@@ -396,6 +397,36 @@ The Agent Core Web Dashboard automatically selects a renderer based on the `form
 | `sensor/mapping` | 2D Occupancy map | `hint === 'sensor/mapping'` |
 | `sensor/htmsg` | HT structured message | `hint === 'sensor/htmsg'` |
 | (no hint) | Activity stream | Fallback when no format specified |
+
+### Depth Rendering — `image/depth-z16` vs `image/depth-zlib`
+
+Two depth formats are supported:
+
+- **`image/depth-z16`**: Raw uint16 buffer (640×480 = 614KB/frame). Uses `sensor_msgs/Image`. Simple but high bandwidth — causes CPU saturation on ARM64 due to DDS serialization of large messages.
+
+- **`image/depth-zlib`** (recommended): Zlib-compressed uint16 buffer (~10-15KB/frame). Uses `sensor_msgs/CompressedImage` with `format="16UC1; compressedDepth zlib"`. 47× smaller, negligible publish overhead. Dashboard decompresses in browser using native `DecompressionStream`.
+
+**Driver-side usage (Python):**
+```python
+import zlib
+import numpy as np
+from sensor_msgs.msg import CompressedImage
+
+depth_image = np.asanyarray(depth_frame.get_data())  # uint16, 640×480
+compressed = zlib.compress(depth_image.tobytes(), 1)  # level=1 fastest
+
+msg = CompressedImage()
+msg.format = "16UC1; compressedDepth zlib"
+msg.data = compressed
+publisher.publish(msg)
+```
+
+**Tool definition:**
+```yaml
+topic_out:
+  - topic: /{namespace}/camera/depth
+    format: image/depth-zlib
+```
 
 ### Skeleton Rendering (`sensor/skeleton`) — Full Spec
 
