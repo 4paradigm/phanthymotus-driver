@@ -252,16 +252,30 @@ def main():
         sys.path.insert(0, "/work/noetix_sdk_bumi/build")
         from highcontrol_py import HighController
         high_ctrl = HighController.instance()
-        high_ctrl.init()
+
+        # init() may block indefinitely if robot is unreachable — run with timeout
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(high_ctrl.init)
+            future.result(timeout=10)
         print("[bundle] HighController initialized")
+    except concurrent.futures.TimeoutError:
+        print("[bundle] WARNING: HighController.init() timed out (robot unreachable?)")
+        print("[bundle] MCP server will start without robot connection")
+        high_ctrl = None
     except Exception as e:
         print(f"[bundle] WARNING: HighController init failed: {e}")
         print("[bundle] State/Loco plugins will be unavailable")
+        high_ctrl = None
 
     try:
         from mediacontrol_py import MediaController
         media_ctrl = MediaController.instance()
-        media_ctrl.init()
+
+        import concurrent.futures as _cf
+        with _cf.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(media_ctrl.init)
+            future.result(timeout=10)
         import time
         time.sleep(5)  # Wait for data sync per SDK docs
         print("[bundle] MediaController initialized")
