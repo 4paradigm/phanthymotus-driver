@@ -461,6 +461,17 @@ class PerceptionPlugin:
             self._node.stop(direction)
             return {"state": self._node.state}
         if action == "info":
+            # Agent Core probes every sensor with an unscoped `info` call at
+            # registration time.  There is no physical camera selected for
+            # that call, so advertising the fallback front topic makes Agent
+            # Core subscribe to front before a Canvas instance is configured.
+            # Only an instance that has a selected direction may expose a
+            # concrete topic.
+            if instance_id not in self._instance_configs:
+                return {
+                    "state": self._node.state,
+                    "topic_out": [],
+                }
             # The ROS publisher is keyed by the physical direction, not by
             # canvas instance id.  Returning an instance-id topic here made
             # downstream cards subscribe to a topic that never receives data.
