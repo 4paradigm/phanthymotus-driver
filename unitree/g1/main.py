@@ -130,7 +130,10 @@ class G1DeviceBundle:
             from navigation_sensor_bridge import NavigationSensorPlugin
             self._plugins.append(
                 NavigationSensorPlugin(
-                    plugins_cfg["navigation_sensors"], namespace, executor
+                    plugins_cfg["navigation_sensors"],
+                    namespace,
+                    executor,
+                    network_iface,
                 )
             )
             print("[bundle] NavigationSensorPlugin loaded")

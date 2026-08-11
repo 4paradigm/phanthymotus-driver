@@ -10,7 +10,11 @@ from __future__ import annotations
 
 from array import array
 import json
+import os
+from pathlib import Path
 import queue
+import subprocess
+import sys
 import threading
 import time
 
@@ -412,7 +416,8 @@ class _NavigationSensorNode(Node):
         if now - self._last_diagnostics_time < 1.0:
             return
         self._last_diagnostics_time = now
-        clock = self._clock_offset.snapshot().to_dict()
+        status = self.status()
+        clock = status["clock"]
         if clock["offset_ns"] is not None:
             clock["offset_sec"] = round(clock["offset_ns"] / 1_000_000_000, 6)
         if clock["residual_ns"] is not None:
@@ -420,8 +425,7 @@ class _NavigationSensorNode(Node):
         out = String()
         out.data = json.dumps(
             {
-                "clock": clock,
-                "counters": dict(self._counters),
+                **status,
                 "raw_topics": {
                     "cloud": self._raw_cloud_topic,
                     "imu": self._raw_imu_topic,
@@ -491,34 +495,108 @@ class _NavigationSensorNode(Node):
         self._imu_worker.join(timeout=2.0)
 
 
+class _NavigationSensorStatusNode(Node):
+    """Lightweight main-process monitor for the isolated bridge worker."""
+
+    def __init__(self, config: dict, namespace: str):
+        super().__init__("g1_navigation_sensor_status")
+        prefix = f"/{namespace}/navigation"
+        self.cloud_topic = _absolute_topic(config.get("cloud_topic"), f"{prefix}/lidar")
+        self.fast_livo_cloud_topic = _absolute_topic(
+            config.get("fast_livo_cloud_topic"), f"{prefix}/lidar_fast_livo"
+        )
+        self.imu_topic = _absolute_topic(config.get("imu_topic"), f"{prefix}/imu")
+        self.diagnostics_topic = _absolute_topic(
+            config.get("diagnostics_topic"), f"{prefix}/sensor_diagnostics"
+        )
+        self._publish_raw_cloud = bool(config.get("publish_raw_cloud", True))
+        self._publish_fast_livo_cloud = bool(
+            config.get("publish_fast_livo_cloud", True)
+        )
+        self._lock = threading.RLock()
+        self._last_diagnostics = None
+        self._last_diagnostics_monotonic = 0.0
+        self._diagnostics_sub = self.create_subscription(
+            String, self.diagnostics_topic, self._on_diagnostics, 10
+        )
+
+    def _on_diagnostics(self, msg) -> None:
+        try:
+            payload = json.loads(msg.data)
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        with self._lock:
+            self._last_diagnostics = payload
+            self._last_diagnostics_monotonic = time.monotonic()
+
+    def status(self, worker_running: bool) -> dict:
+        with self._lock:
+            payload = dict(self._last_diagnostics or {})
+            received_at = self._last_diagnostics_monotonic
+
+        diagnostics_age_ms = (
+            round((time.monotonic() - received_at) * 1000.0, 1)
+            if received_at > 0.0
+            else None
+        )
+        blockers = list(payload.get("blockers") or [])
+        if not worker_running:
+            blockers.append("worker_not_running")
+        if diagnostics_age_ms is None:
+            blockers.append("diagnostics_not_received")
+        elif diagnostics_age_ms > 2000.0:
+            blockers.append("diagnostics_stale")
+
+        blockers = list(dict.fromkeys(blockers))
+        return {
+            **payload,
+            "ready": not blockers,
+            "blockers": blockers,
+            "worker_running": bool(worker_running),
+            "diagnostics_age_ms": diagnostics_age_ms,
+        }
+
+
 class NavigationSensorPlugin:
     PREFIX = "navigation_sensors"
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
+    def __init__(
+        self,
+        plugin_config: dict,
+        namespace: str,
+        executor,
+        network_iface: str = "eth0",
+    ):
         self._executor = executor
-        self._node = _NavigationSensorNode(plugin_config, namespace)
-        executor.add_node(self._node)
+        self._namespace = namespace
+        self._network_iface = network_iface
+        self._status_node = _NavigationSensorStatusNode(plugin_config, namespace)
+        executor.add_node(self._status_node)
+        self._worker_path = Path(__file__).with_name("navigation_sensor_bridge_main.py")
+        self._proc = None
 
     def get_tools(self) -> list[dict]:
         tools = []
-        if self._node._publish_fast_livo_cloud:
+        if self._status_node._publish_fast_livo_cloud:
             tools.append(
                 self._tool(
                     "navigation_lidar_fast_livo",
                     "MID360 PointCloud2 adapted for the pinned FAST-LIVO2 ROS2 port",
-                    self._node.fast_livo_cloud_topic,
+                    self._status_node.fast_livo_cloud_topic,
                     "sensor/pointcloud",
                     "sensor_msgs/msg/PointCloud2",
                     "RELIABLE + KEEP_LAST(depth=2) + VOLATILE",
                     "livox_frame",
                 )
             )
-        if self._node._publish_raw_cloud:
+        if self._status_node._publish_raw_cloud:
             tools.append(
                 self._tool(
                     "navigation_lidar",
                     "Standard PointCloud2 with raw MID360 fields and per-point time preserved",
-                    self._node.cloud_topic,
+                    self._status_node.cloud_topic,
                     "sensor/pointcloud",
                     "sensor_msgs/msg/PointCloud2",
                     "BEST_EFFORT + KEEP_LAST(depth=2) + VOLATILE",
@@ -530,7 +608,7 @@ class NavigationSensorPlugin:
                 self._tool(
                     "navigation_imu",
                     "Standard IMU for FAST-LIVO2 in the same normalized clock domain as LiDAR",
-                    self._node.imu_topic,
+                    self._status_node.imu_topic,
                     "sensor/imu",
                     "sensor_msgs/msg/Imu",
                     "RELIABLE + KEEP_LAST(depth=200) + VOLATILE",
@@ -539,7 +617,7 @@ class NavigationSensorPlugin:
                 self._tool(
                     "navigation_sensor_diagnostics",
                     "Navigation sensor clock and drop diagnostics",
-                    self._node.diagnostics_topic,
+                    self._status_node.diagnostics_topic,
                     "data/json",
                     "std_msgs/msg/String",
                     "RELIABLE + KEEP_LAST(depth=10) + VOLATILE",
@@ -578,25 +656,53 @@ class NavigationSensorPlugin:
         }
 
     def start(self) -> None:
-        pass
+        if self._worker_running():
+            return
+        if not self._worker_path.is_file():
+            raise FileNotFoundError(f"navigation sensor worker missing: {self._worker_path}")
+        env = os.environ.copy()
+        env["ROS_NAMESPACE"] = self._namespace
+        self._proc = subprocess.Popen(
+            [sys.executable, str(self._worker_path), self._network_iface],
+            cwd=str(self._worker_path.parent),
+            env=env,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+        )
+        print(
+            f"[navigation-sensors] isolated worker started pid={self._proc.pid}",
+            flush=True,
+        )
+
+    def _worker_running(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
 
     def stop(self) -> None:
-        self._node.close()
+        if self._worker_running():
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+                self._proc.wait(timeout=2.0)
         try:
-            self._executor.remove_node(self._node)
-            self._node.destroy_node()
+            self._executor.remove_node(self._status_node)
+            self._status_node.destroy_node()
         except Exception:
             pass
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action in {"start", "info"}:
+            if action == "start" and not self._worker_running():
+                self.start()
             tool_name = args.get("_tool_name", "")
             tools = {tool["name"]: tool for tool in self.get_tools()}
             selected = tools.get(tool_name, tools["navigation_sensor_diagnostics"])
-            status = self._node.status()
+            status = self._status_node.status(self._worker_running())
             return {
                 "state": "ready" if status["ready"] else "not_ready",
                 "topic_out": selected["topic_out"],
+                "worker_pid": self._proc.pid if self._worker_running() else None,
                 **status,
             }
         if action == "stop":
