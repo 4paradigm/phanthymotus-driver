@@ -433,9 +433,12 @@ class PerceptionPlugin:
             self._instance_configs[instance_id] = {"direction": direction}
             return {"ok": True, "direction": direction}
 
-        direction = args.get(
-            "direction",
-            self._instance_configs.get(instance_id, {}).get("direction", "front"),
+        # The Canvas start/info requests include the schema default (front),
+        # even after it has sent a separate per-instance config request.  Once
+        # an instance is configured, its persisted direction must therefore
+        # take precedence or every card subscribes to front.
+        direction = self._instance_configs.get(instance_id, {}).get(
+            "direction", args.get("direction", "front")
         )
         if direction not in self.DIRECTIONS:
             return {"state": "error", "message": f"unsupported perception direction: {direction}"}
