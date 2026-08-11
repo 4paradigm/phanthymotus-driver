@@ -1,7 +1,7 @@
 # Q5 外挂 PC 驱动构建上下文
 # SDK 全部为本地 vendor，构建时不访问网络拉取
 
-ARG ROS_BASE_IMAGE=jetson-base:humble-desktop-l4t-r35.3.1
+ARG ROS_BASE_IMAGE=ros:humble
 ARG PYPI_MIRROR=https://pypi.org/simple/
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
