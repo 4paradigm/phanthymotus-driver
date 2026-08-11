@@ -74,8 +74,8 @@ ENV LD_LIBRARY_PATH=/work/noetix_sdk_bumi/dds/aarch64/lib:${LD_LIBRARY_PATH}
 ENV PYTHONPATH=/work:/work/noetix_sdk_bumi/build
 ENV PYTHONUNBUFFERED=1
 
-# Suppress CycloneDDS tracing
-ENV CYCLONEDDS_URI='<CycloneDDS><Domain><Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>'
+# Use SDK's DDS config for peer discovery (unicast to motion control board 192.168.55.102)
+ENV CYCLONEDDS_URI='file:///work/noetix_sdk_bumi/config/dds.xml'
 
 EXPOSE 15704
 
