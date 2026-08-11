@@ -33,15 +33,20 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
 # Noetix Bumi SDK — copy source and build pybind modules
 COPY noetix_sdk_bumi/ /work/noetix_sdk_bumi/
 
-# Build only the pybind modules (highcontrol_py, mediacontrol_py)
-# Skip onnxruntime-dependent executables via custom CMakeLists target selection
+# Patch CMakeLists: remove onnxruntime dep and executables (we only need pybind .so)
+RUN cd /work/noetix_sdk_bumi && \
+    sed -i 's/find_package(onnxruntime REQUIRED)/#find_package(onnxruntime REQUIRED)/' CMakeLists.txt && \
+    sed -i '/add_executable/,/^)/s/^/#/' CMakeLists.txt && \
+    sed -i '/target_include_directories(example/,/^)/s/^/#/' CMakeLists.txt && \
+    sed -i '/target_link_libraries(example/,/^)/s/^/#/' CMakeLists.txt
+
+# Build pybind modules (highcontrol_py, mediacontrol_py)
 RUN cd /work/noetix_sdk_bumi && \
     mkdir -p build && cd build && \
     cmake .. \
         -DCMAKE_CXX_STANDARD=17 \
-        -Dpybind11_DIR=$(python3 -c "import pybind11; print(pybind11.get_cmake_dir())") \
-    2>&1 || true && \
-    make -j$(nproc) highcontrol_py mediacontrol_py 2>&1 && \
+        -Dpybind11_DIR=$(python3 -c "import pybind11; print(pybind11.get_cmake_dir())") && \
+    make -j$(nproc) highcontrol_py mediacontrol_py && \
     echo "[build] pybind modules built successfully"
 
 # Verify .so files exist
