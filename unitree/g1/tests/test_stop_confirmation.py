@@ -30,7 +30,8 @@ class StopMoveConfirmationIntegrationTest(unittest.TestCase):
 
     def test_zero_frame_arriving_during_synchronous_stopmove_is_confirmed(self):
         def stop_move():
-            self.monitor.record((0.0, 0.0, 0.0))
+            for _ in range(3):
+                self.monitor.record((0.0, 0.0, 0.0))
             return 0
 
         result = self.confirm(stop_move)
@@ -39,8 +40,9 @@ class StopMoveConfirmationIntegrationTest(unittest.TestCase):
         diagnostics = result["stop_confirmation"]
         self.assertEqual(diagnostics["stop_move_ret"], 0)
         self.assertIsNone(diagnostics["stop_move_error"])
-        self.assertEqual(diagnostics["odometry_callbacks_since_confirmation"], 1)
-        self.assertEqual(diagnostics["odometry_callbacks_during_stop_move"], 1)
+        self.assertEqual(diagnostics["odometry_callbacks_since_confirmation"], 3)
+        self.assertEqual(diagnostics["odometry_callbacks_during_stop_move"], 3)
+        self.assertEqual(diagnostics["consecutive_zero_samples"], 3)
         self.assertEqual(
             diagnostics["last_odometry_velocity"],
             {"x": 0.0, "y": 0.0, "yaw": 0.0},
@@ -52,7 +54,8 @@ class StopMoveConfirmationIntegrationTest(unittest.TestCase):
         def publish_delayed_zero():
             try:
                 time.sleep(0.03)
-                self.monitor.record((0.0, 0.0, 0.0))
+                for _ in range(3):
+                    self.monitor.record((0.0, 0.0, 0.0))
             finally:
                 callback_finished.set()
 
@@ -76,7 +79,8 @@ class StopMoveConfirmationIntegrationTest(unittest.TestCase):
         def publish_gait_settled_zero():
             try:
                 time.sleep(0.55)
-                self.monitor.record((0.0, 0.0, 0.0))
+                for _ in range(3):
+                    self.monitor.record((0.0, 0.0, 0.0))
             finally:
                 callback_finished.set()
 
@@ -99,7 +103,52 @@ class StopMoveConfirmationIntegrationTest(unittest.TestCase):
     def test_stop_confirmation_timeout_is_sdk_aware_and_bounded(self):
         self.assertEqual(resolve_stop_confirmation_timeout(0.1), 1.0)
         self.assertEqual(resolve_stop_confirmation_timeout(2.0), 2.0)
-        self.assertEqual(resolve_stop_confirmation_timeout(10.0), 3.0)
+        self.assertEqual(resolve_stop_confirmation_timeout(10.0), 5.0)
+
+    def test_single_zero_frame_does_not_unlock_the_next_task(self):
+        def publish_one_zero():
+            time.sleep(0.02)
+            self.monitor.record((0.0, 0.0, 0.0))
+
+        publisher = threading.Thread(target=publish_one_zero, daemon=True)
+        publisher.start()
+
+        result = self.confirm(lambda: 0, timeout=0.08)
+
+        publisher.join(timeout=0.5)
+        self.assertFalse(result["stop_confirmed"])
+        diagnostics = result["stop_confirmation"]
+        self.assertTrue(diagnostics["confirmation_timed_out"])
+        self.assertEqual(diagnostics["required_consecutive_zero_samples"], 3)
+        self.assertEqual(diagnostics["consecutive_zero_samples"], 1)
+
+    def test_nonzero_frame_resets_the_consecutive_zero_window(self):
+        def publish_settling_sequence():
+            time.sleep(0.02)
+            for velocity in (
+                (0.0, 0.0, 0.0),
+                (0.0, 0.0, 0.0),
+                (0.04, 0.0, 0.0),
+                (0.0, 0.0, 0.0),
+                (0.0, 0.0, 0.0),
+                (0.0, 0.0, 0.0),
+            ):
+                self.monitor.record(velocity)
+
+        publisher = threading.Thread(
+            target=publish_settling_sequence,
+            daemon=True,
+        )
+        publisher.start()
+
+        result = self.confirm(lambda: 0, timeout=0.2)
+
+        publisher.join(timeout=0.5)
+        self.assertTrue(result["stop_confirmed"])
+        self.assertEqual(
+            result["stop_confirmation"]["consecutive_zero_samples"],
+            3,
+        )
 
     def test_nonzero_frame_fails_closed_and_reports_last_velocity(self):
         def publish_nonzero():
@@ -152,7 +201,8 @@ class StopMoveConfirmationIntegrationTest(unittest.TestCase):
 
     def test_parent_stop_ack_is_confirmed_by_child_odometry(self):
         start = self.monitor.begin_confirmation()
-        self.monitor.record((0.0, 0.0, 0.0))
+        for _ in range(3):
+            self.monitor.record((0.0, 0.0, 0.0))
         completed = time.monotonic()
 
         result = finish_stop_confirmation(
@@ -169,8 +219,8 @@ class StopMoveConfirmationIntegrationTest(unittest.TestCase):
 
         self.assertTrue(result["stop_confirmed"])
         diagnostics = result["stop_confirmation"]
-        self.assertEqual(diagnostics["odometry_callbacks_since_confirmation"], 1)
-        self.assertEqual(diagnostics["odometry_callbacks_during_stop_move"], 1)
+        self.assertEqual(diagnostics["odometry_callbacks_since_confirmation"], 3)
+        self.assertEqual(diagnostics["odometry_callbacks_during_stop_move"], 3)
 
     def test_parent_stop_failure_stays_fail_closed_with_zero_odometry(self):
         start = StopConfirmationStart(
@@ -203,7 +253,8 @@ class StopMoveConfirmationIntegrationTest(unittest.TestCase):
         start = self.monitor.begin_confirmation()
         self.monitor.record((0.0, 0.0, 0.0))
         completed = time.monotonic()
-        self.monitor.record((0.0, 0.0, 0.0))
+        for _ in range(2):
+            self.monitor.record((0.0, 0.0, 0.0))
 
         result = finish_stop_confirmation(
             monitor=self.monitor,
@@ -220,7 +271,7 @@ class StopMoveConfirmationIntegrationTest(unittest.TestCase):
         diagnostics = result["stop_confirmation"]
         self.assertTrue(result["stop_confirmed"])
         self.assertEqual(diagnostics["odometry_callbacks_during_stop_move"], 1)
-        self.assertEqual(diagnostics["odometry_callbacks_since_confirmation"], 2)
+        self.assertEqual(diagnostics["odometry_callbacks_since_confirmation"], 3)
 
     def test_bounded_retry_keeps_first_failed_confirmation(self):
         first = {

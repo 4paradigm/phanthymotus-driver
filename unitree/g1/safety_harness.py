@@ -39,8 +39,9 @@ from velocity_proposal import (
 
 
 UNITREE_STOP_MOVE_DURATION_SECONDS = 1.0
-DEFAULT_STOP_CONFIRM_TIMEOUT_SECONDS = 2.0
-MAX_STOP_CONFIRM_TIMEOUT_SECONDS = 3.0
+DEFAULT_STOP_CONFIRM_TIMEOUT_SECONDS = 5.0
+MAX_STOP_CONFIRM_TIMEOUT_SECONDS = 5.0
+STOP_CONFIRM_REQUIRED_ZERO_SAMPLES = 3
 TRANSLATION_OBSTACLE_EPSILON = 0.01
 
 
@@ -183,7 +184,9 @@ class OdomStopMonitor:
             self._last_time = received
             self._last_velocity = motion
             self._callback_count += 1
-            self._callback_history.append((received, self._callback_count))
+            self._callback_history.append(
+                (received, self._callback_count, motion)
+            )
             self._condition.notify_all()
 
     def begin_confirmation(self):
@@ -213,7 +216,9 @@ class OdomStopMonitor:
         """Return the last callback count observed at or before a timestamp."""
         boundary = float(observed_monotonic)
         with self._condition:
-            for received, callback_count in reversed(self._callback_history):
+            for received, callback_count, _motion in reversed(
+                self._callback_history
+            ):
                 if received <= boundary:
                     return callback_count
             return 0
@@ -229,27 +234,38 @@ class OdomStopMonitor:
         stop_move_error=None,
         stop_move_completed_monotonic=None,
         callbacks_at_stop_move_completion=None,
+        required_zero_samples=STOP_CONFIRM_REQUIRED_ZERO_SAMPLES,
     ):
         deadline = start.monotonic + timeout
         confirmed = False
         timed_out = False
+        required_zero_samples = max(1, int(required_zero_samples))
+        consecutive_zero_samples = 0
+        last_processed_callback_count = start.odometry_callback_count
         with self._condition:
             while stop_move_ret == 0:
                 now = time.monotonic()
-                vx, vy, yaw = self._last_velocity
-                is_new = (
-                    self._callback_count > start.odometry_callback_count
-                    and self._last_time >= start.monotonic
-                    and self._last_time <= deadline
-                )
-                is_fresh = self._last_time and now - self._last_time <= max_age
-                is_zero = (
-                    abs(vx) <= linear_epsilon
-                    and abs(vy) <= linear_epsilon
-                    and abs(yaw) <= yaw_epsilon
-                )
-                if is_new and is_fresh and is_zero:
-                    confirmed = True
+                for received, callback_count, motion in self._callback_history:
+                    if callback_count <= last_processed_callback_count:
+                        continue
+                    last_processed_callback_count = callback_count
+                    if received < start.monotonic or received > deadline:
+                        continue
+                    vx, vy, yaw = motion
+                    is_fresh = now - received <= max_age
+                    is_zero = (
+                        abs(vx) <= linear_epsilon
+                        and abs(vy) <= linear_epsilon
+                        and abs(yaw) <= yaw_epsilon
+                    )
+                    if is_fresh and is_zero:
+                        consecutive_zero_samples += 1
+                    else:
+                        consecutive_zero_samples = 0
+                    if consecutive_zero_samples >= required_zero_samples:
+                        confirmed = True
+                        break
+                if confirmed:
                     break
                 remaining = deadline - now
                 if remaining <= 0.0:
@@ -297,6 +313,8 @@ class OdomStopMonitor:
                         else start.odometry_callback_count
                     ) - start.odometry_callback_count,
                 ),
+                "required_consecutive_zero_samples": required_zero_samples,
+                "consecutive_zero_samples": consecutive_zero_samples,
                 "confirmation_timed_out": timed_out,
             }
         return confirmed, diagnostics
@@ -313,6 +331,7 @@ def finish_stop_confirmation(
     linear_epsilon,
     yaw_epsilon,
     after_stop_attempt=None,
+    required_zero_samples=STOP_CONFIRM_REQUIRED_ZERO_SAMPLES,
 ):
     """Confirm an acknowledged StopMove against post-boundary odometry."""
     callbacks_at_stop_move_completion = monitor.callback_count_at(
@@ -331,6 +350,7 @@ def finish_stop_confirmation(
         stop_move_error=stop_move_error,
         stop_move_completed_monotonic=stop_move_completed_monotonic,
         callbacks_at_stop_move_completion=callbacks_at_stop_move_completion,
+        required_zero_samples=required_zero_samples,
     )
     result = {
         "ret": stop_move_ret,
@@ -353,6 +373,7 @@ def issue_stop_and_confirm(
     linear_epsilon,
     yaw_epsilon,
     after_stop_attempt=None,
+    required_zero_samples=STOP_CONFIRM_REQUIRED_ZERO_SAMPLES,
 ):
     """Issue a bounded StopMove and require a subsequent measured zero frame."""
     start = monitor.begin_confirmation()
@@ -374,6 +395,7 @@ def issue_stop_and_confirm(
         linear_epsilon=linear_epsilon,
         yaw_epsilon=yaw_epsilon,
         after_stop_attempt=after_stop_attempt,
+        required_zero_samples=required_zero_samples,
     )
 
 
