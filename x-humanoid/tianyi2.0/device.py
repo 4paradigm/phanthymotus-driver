@@ -3952,6 +3952,8 @@ class TtsPlugin:
         self._stop_client = None
         self._pause_client = None
         self._resume_client = None
+        # 取消信号：interrupt 时 set，通知 _speak_segments 线程停止
+        self._cancel_event: threading.Event | None = None
         # ACP: PlayEvent 订阅，用于判断播放真正完成
         self._play_event_sub = None
         self._play_progress_sub = None
@@ -3977,9 +3979,9 @@ class TtsPlugin:
                 "x-completion": {"actions": ["speak"], "timeout": 180},
                 "x-action-params": {
                     "speak": {"params": ["text", "force"], "description": "合成并播放文本"},
-                    "interrupt": {"params": [], "description": "中止播放（不可恢复）"},
-                    "pause": {"params": [], "description": "暂停播放"},
-                    "resume": {"params": [], "description": "恢复播放"},
+                    "interrupt": {"params": [], "description": "立即停止播放并丢弃剩余内容，无需再调 pause"},
+                    "pause": {"params": [], "description": "暂停播放（可用 resume 恢复，不要与 interrupt 同时使用）"},
+                    "resume": {"params": [], "description": "恢复被 pause 暂停的播放"},
                 },
                 "x-hooks": {
                     "on_interrupt_speak": {"action": "interrupt"},
@@ -4044,6 +4046,10 @@ class TtsPlugin:
                 return {"error": "text is required"}
             return self._speak(text, force)
         elif action == "interrupt":
+            # 先通知后台线程停止循环
+            ce = self._cancel_event
+            if ce:
+                ce.set()
             return self._call_empty_service(self._stop_client, "interrupt")
         elif action == "pause":
             return self._call_empty_service(self._pause_client, "pause")
@@ -4063,10 +4069,17 @@ class TtsPlugin:
             # 分段：超过 280 字按标点切分，避免超长文本 PlayEvent 丢失
             segments = self._split_text(text, max_chars=280)
 
+            # 取消旧的播放线程（如果有）
+            old_ce = self._cancel_event
+            if old_ce:
+                old_ce.set()
+            cancel_event = threading.Event()
+            self._cancel_event = cancel_event
+
             # Background thread: 逐段播放, 全部完成后 ACP callback
             threading.Thread(
                 target=self._speak_segments,
-                args=(segments, force, action_id, text),
+                args=(segments, force, action_id, text, cancel_event),
                 daemon=True,
             ).start()
             return {"state": "speaking", "action_id": action_id, "text": text[:50],
@@ -4093,14 +4106,20 @@ class TtsPlugin:
             segments.append(current)
         return segments if segments else [text]
 
-    def _speak_segments(self, segments: list, force: bool, action_id: str, full_text: str):
-        """顺序播放多段文本，全部完成后 ACP callback。"""
+    def _speak_segments(self, segments: list, force: bool, action_id: str, full_text: str, cancel_event: threading.Event):
+        """顺序播放多段文本，全部完成后 ACP callback。支持 cancel_event 打断。"""
         import time as _t
         from lyre_msgs.srv import PlayText
 
         overall_status = "completed"
 
         for i, seg_text in enumerate(segments):
+            # 每段开始前检查取消
+            if cancel_event.is_set():
+                overall_status = "cancelled"
+                print(f"[TtsPlugin] cancelled before seg {i+1}/{len(segments)}")
+                break
+
             is_last = (i == len(segments) - 1)
             # 发送 PlayText service
             req = PlayText.Request()
@@ -4113,7 +4132,14 @@ class TtsPlugin:
             timeout_service = 10.0
             start = _t.time()
             while not future.done() and _t.time() - start < timeout_service:
+                if cancel_event.is_set():
+                    break
                 _t.sleep(0.1)
+
+            if cancel_event.is_set():
+                overall_status = "cancelled"
+                print(f"[TtsPlugin] cancelled during service wait seg {i+1}/{len(segments)}")
+                break
 
             sid = None
             if future.done():
@@ -4125,6 +4151,12 @@ class TtsPlugin:
             if sid:
                 buffered = self._play_event_buffer.pop(sid, None)
                 if buffered is not None:
+                    # 被 interrupt 停止的情况
+                    if buffered >= 2 and cancel_event.is_set():
+                        overall_status = "cancelled"
+                        print(f"[TtsPlugin] cancelled (buffered STOPPED/CANCELLED) seg {i+1}/{len(segments)}")
+                        self._pending_play_duration.pop(sid, None)
+                        break
                     seg_status = "completed" if buffered == 1 else "error"
                     print(f"[TtsPlugin] seg {i+1}/{len(segments)} from buffer: sid={sid} event={buffered}")
                 else:
@@ -4137,11 +4169,40 @@ class TtsPlugin:
                     else:
                         # 更宽松: 2.5字/秒 + 10s buffer
                         play_timeout = len(seg_text) / 2.5 + 10.0
-                    if not ev.wait(timeout=play_timeout):
+                    # 分段等待，每 0.5s 检查一次 cancel
+                    waited = 0.0
+                    timed_out = True
+                    while waited < play_timeout:
+                        if cancel_event.is_set():
+                            break
+                        chunk = min(0.5, play_timeout - waited)
+                        if ev.wait(timeout=chunk):
+                            timed_out = False
+                            break
+                        waited += chunk
+
+                    if cancel_event.is_set():
+                        overall_status = "cancelled"
+                        self._pending_play.pop(sid, None)
+                        self._pending_play_status.pop(sid, None)
+                        self._pending_play_duration.pop(sid, None)
+                        self._play_event_buffer.pop(sid, None)
+                        print(f"[TtsPlugin] cancelled during PlayEvent wait seg {i+1}/{len(segments)}")
+                        break
+                    elif timed_out:
                         seg_status = "error"
                         print(f"[TtsPlugin] PlayEvent timeout: seg {i+1}/{len(segments)} sid={sid}, waited {play_timeout:.0f}s (duration={reported_duration})")
                     else:
                         event_code = self._pending_play_status.get(sid, 1)
+                        # STOPPED(2) 或 CANCELLED(3) + cancel_event → 被打断
+                        if event_code >= 2 and cancel_event.is_set():
+                            overall_status = "cancelled"
+                            self._pending_play.pop(sid, None)
+                            self._pending_play_status.pop(sid, None)
+                            self._pending_play_duration.pop(sid, None)
+                            self._play_event_buffer.pop(sid, None)
+                            print(f"[TtsPlugin] cancelled (PlayEvent STOPPED) seg {i+1}/{len(segments)}")
+                            break
                         # event_code: 1=COMPLETED, 2=STOPPED (也算完成), 3=CANCELLED, 4=FAILED
                         seg_status = "completed" if event_code <= 2 else "error"
                         if event_code > 2:
@@ -4161,9 +4222,20 @@ class TtsPlugin:
                 elif seg_status == "error" and is_last:
                     overall_status = "error"
             elif not sid:
-                # 没拿到 sid，fallback 按字数估算
+                # 没拿到 sid，fallback 按字数估算（但也要检查 cancel）
                 fallback_s = len(seg_text) / 2.5 + 5.0
-                _t.sleep(fallback_s)
+                waited = 0.0
+                while waited < fallback_s:
+                    if cancel_event.is_set():
+                        overall_status = "cancelled"
+                        break
+                    _t.sleep(min(0.5, fallback_s - waited))
+                    waited += 0.5
+                if cancel_event.is_set() and overall_status != "cancelled":
+                    overall_status = "cancelled"
+                if overall_status == "cancelled":
+                    print(f"[TtsPlugin] cancelled during fallback wait seg {i+1}/{len(segments)}")
+                    break
                 print(f"[TtsPlugin] no sid from service seg {i+1}, fallback sleep {fallback_s:.0f}s")
 
         # ACP callback
