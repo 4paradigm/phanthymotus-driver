@@ -23,7 +23,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from std_msgs.msg import String
 from audio_msgs.msg import AudioChunk
-from sensor_msgs.msg import CompressedImage
+from sensor_msgs.msg import CompressedImage, Image as SensorImage
 
 
 _LOW_LAT_QOS = QoSProfile(
@@ -177,7 +177,7 @@ class _BumiStateNode(Node):
                     joints_out = String()
                     joints_out.data = json.dumps({
                         "joints": joints,
-                        "imu_quat": [imu.ori[i] for i in range(4)],
+                        "imu_quat": [float(imu.ori[3]), float(imu.ori[0]), float(imu.ori[1]), float(imu.ori[2])],  # SDK [x,y,z,w] → renderer [w,x,y,z]
                         "workmode": workmode,
                     })
                     self._joints_pub.publish(joints_out)
@@ -726,7 +726,7 @@ class CameraPlugin:
         self._depth_topic = f"/{namespace}/camera/depth"
         self._node = Node("bumi_camera")
         self._color_pub = self._node.create_publisher(CompressedImage, self._color_topic, _LOW_LAT_QOS)
-        self._depth_pub = self._node.create_publisher(CompressedImage, self._depth_topic, _LOW_LAT_QOS)
+        self._depth_pub = self._node.create_publisher(SensorImage, self._depth_topic, _LOW_LAT_QOS)
         executor.add_node(self._node)
         self._running = False
         self._thread: threading.Thread | None = None
@@ -798,12 +798,15 @@ class CameraPlugin:
                 depth_frame = frames.get_depth_frame()
                 if depth_frame:
                     depth_image = np.asanyarray(depth_frame.get_data())
-                    # Encode depth as 16-bit PNG for lossless transport
-                    _, png_buf = cv2.imencode('.png', depth_image)
-                    msg = CompressedImage()
+                    # Publish raw Z16 data (uint16 mm) — dashboard renderer applies colormap
+                    msg = SensorImage()
                     msg.header.stamp = self._node.get_clock().now().to_msg()
-                    msg.format = "png"
-                    msg.data = png_buf.tobytes()
+                    msg.height = depth_image.shape[0]
+                    msg.width = depth_image.shape[1]
+                    msg.encoding = "16UC1"
+                    msg.is_bigendian = 0
+                    msg.step = msg.width * 2
+                    msg.data = depth_image.tobytes()
                     self._depth_pub.publish(msg)
 
         except Exception as e:
