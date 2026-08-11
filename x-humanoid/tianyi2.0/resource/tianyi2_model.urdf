@@ -364,7 +364,8 @@
 
   <link name="right_hand_little_link"><inertial><mass value="0.02"/></inertial></link>
   <joint name="right_hand_little_joint" type="revolute">
-    <origin xyz="0 -0.03 -0.050" rpy="0 0 0"/>
+    <!-- The palm is already mirrored, so mirror only this lateral placement. -->
+    <origin xyz="0 0.030 -0.050" rpy="0 0 0"/>
     <parent link="right_palm_link"/><child link="right_hand_little_link"/>
     <axis xyz="0 1 0"/>
     <limit lower="-1.571" upper="0" effort="2" velocity="4"/>
@@ -384,7 +385,7 @@
 
   <link name="right_hand_ring_link"><inertial><mass value="0.02"/></inertial></link>
   <joint name="right_hand_ring_joint" type="revolute">
-    <origin xyz="0 -0.015 -0.060" rpy="0 0 0"/>
+    <origin xyz="0 0.015 -0.060" rpy="0 0 0"/>
     <parent link="right_palm_link"/><child link="right_hand_ring_link"/>
     <axis xyz="0 1 0"/>
     <limit lower="-1.571" upper="0" effort="2" velocity="4"/>
@@ -424,7 +425,7 @@
 
   <link name="right_hand_index_link"><inertial><mass value="0.02"/></inertial></link>
   <joint name="right_hand_index_joint" type="revolute">
-    <origin xyz="0 0.015 -0.060" rpy="0 0 0"/>
+    <origin xyz="0 -0.015 -0.060" rpy="0 0 0"/>
     <parent link="right_palm_link"/><child link="right_hand_index_link"/>
     <axis xyz="0 1 0"/>
     <limit lower="-1.571" upper="0" effort="2" velocity="4"/>
