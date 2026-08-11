@@ -4,9 +4,9 @@
 #include <stdlib.h>
 #include <pthread.h>
 
-/* M300 exposes four independent H.264 positions: FPV plus payload ports 1-3.
- * Each position owns a decoder and an output file so active card instances
- * never overwrite one another's frames. */
+/* M300 can expose FPV plus payload-camera H.264 positions.  Availability is
+ * aircraft/payload dependent: on the target M300 only FPV is currently
+ * advertised by DJI's own PSDK 3.8 sample. */
 #ifdef PSDK_ENABLED
 #include "dji_liveview.h"
 #include <libavcodec/avcodec.h>
@@ -42,9 +42,11 @@ static T_LiveviewStream s_streams[] = {
 };
 #define STREAM_COUNT (sizeof(s_streams) / sizeof(s_streams[0]))
 
+static int s_liveview_ready = 0;
+
 static T_LiveviewStream *_find_stream(const char *camera) {
-    if (!camera || !*camera || strcmp(camera, "default") == 0 || strcmp(camera, "wide") == 0)
-        return &s_streams[1];
+    if (!camera || !*camera || strcmp(camera, "default") == 0)
+        return &s_streams[0];
     for (size_t i = 0; i < STREAM_COUNT; ++i)
         if (strcmp(camera, s_streams[i].name) == 0) return &s_streams[i];
     return NULL;
@@ -119,6 +121,7 @@ static void _h264_cb(E_DjiLiveViewCameraPosition position, const uint8_t *data, 
 }
 
 int liveview_init(void) {
+    s_liveview_ready = 0;
     T_DjiReturnCode rc = DjiLiveview_Init();
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
         printf("[liveview] init failed: 0x%08llX\n", (unsigned long long)rc);
@@ -136,7 +139,8 @@ int liveview_init(void) {
         s->parser = av_parser_init(AV_CODEC_ID_H264); s->yuv = av_frame_alloc();
         if (!s->parser || !s->yuv) return -1;
     }
-    printf("[liveview] initialized four M300 positions\n");
+    s_liveview_ready = 1;
+    printf("[liveview] initialized; FPV is the verified source on this M300\n");
     return 0;
 }
 
@@ -144,6 +148,17 @@ int liveview_start(const char *camera, liveview_frame_cb_t cb) {
     (void)cb;
     T_LiveviewStream *stream = _find_stream(camera);
     if (!stream) { printf("[liveview] unknown camera: %s\n", camera); return -1; }
+    if (!s_liveview_ready && liveview_init() != 0)
+        return -1;
+    if (!s_liveview_ready || !stream->codec || !stream->parser || !stream->yuv) {
+        printf("[liveview] start %s rejected: liveview initialization did not complete\n", stream->name);
+        return -1;
+    }
+    if (stream->position != DJI_LIVEVIEW_CAMERA_POSITION_FPV) {
+        printf("[liveview] start %s rejected: this aircraft exposes no verified payload liveview source; use fpv\n",
+               stream->name);
+        return -1;
+    }
     if (stream->running) return 0;
     pthread_mutex_lock(&stream->mutex);
     avcodec_flush_buffers(stream->codec); stream->src_width = stream->src_height = 0; stream->callback_count = 0;
@@ -171,7 +186,11 @@ int liveview_stop(const char *camera) {
 }
 
 void liveview_cleanup(void) {
-    liveview_stop("all"); DjiLiveview_Deinit();
+    if (s_liveview_ready) {
+        liveview_stop("all");
+        DjiLiveview_Deinit();
+    }
+    s_liveview_ready = 0;
     for (size_t i = 0; i < STREAM_COUNT; ++i) {
         T_LiveviewStream *s = &s_streams[i];
         if (s->parser) av_parser_close(s->parser);

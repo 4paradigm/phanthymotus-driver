@@ -2,8 +2,10 @@
 #include <stdio.h>
 #include <string.h>
 
-/* M300 perception cameras deliver mono8 VGA frames.  PSDK permits at most two
- * concurrent subscriptions, so enforcement happens here as well as in the UI. */
+/* M300 perception cameras deliver mono8 VGA stereo frames.  The target M300
+ * was verified with DJI's PSDK 3.8 sample for all six directions: front,
+ * rear, left, right, up and down.  PSDK permits at most two concurrent
+ * subscriptions, so enforcement happens here as well as in the UI. */
 #ifdef PSDK_ENABLED
 #include "dji_perception.h"
 #include <jpeglib.h>
