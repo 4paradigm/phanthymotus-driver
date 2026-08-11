@@ -909,8 +909,6 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
         T_DjiReturnCode connected_rc = DjiAircraftInfo_GetConnectionStatus(&connected);
         T_DjiReturnCode version_rc = DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
         bool version_attempted = true;
-        const char *version_status = "ok";
-        const char *version_note = "";
 
         const char *type_name = "Unknown";
         switch (baseInfo.aircraftType) {
@@ -955,22 +953,8 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
 
         if (baseInfo.aircraftType == 60 && baseInfo.mountPosition == 4) {
             version_attempted = false;
-            version_status = "not_available";
-            version_note = "DjiAircraftInfo_GetAircraftVersion times out on M300 Extension Port; firmware was identified during PSDK startup logs.";
         } else {
             version_rc = DjiAircraftInfo_GetAircraftVersion(&version);
-            if (version_rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-                version_status = (version_rc == 0x000000E1) ? "timeout" : "error";
-                version_note = (version_rc == 0x000000E1) ?
-                    "DjiAircraftInfo_GetAircraftVersion timed out." :
-                    "DjiAircraftInfo_GetAircraftVersion failed.";
-            }
-        }
-        char version_ret_json[32];
-        if (version_attempted) {
-            snprintf(version_ret_json, sizeof(version_ret_json), "%llu", (unsigned long long)version_rc);
-        } else {
-            snprintf(version_ret_json, sizeof(version_ret_json), "null");
         }
 
         if (version_attempted && version_rc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
@@ -979,30 +963,21 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
                 "\"aircraft_series\":\"%s\","
                 "\"firmware_version\":\"%d.%d.%d.%d\","
                 "\"mount_position\":\"%s\",\"connected\":%s,"
-                "\"firmware_version_status\":\"%s\","
-                "\"base_info_ret\":%llu,\"version_ret\":%llu,\"connection_ret\":%llu}}",
+                "\"base_info_ret\":%llu,\"connection_ret\":%llu}}",
                 type_name, series_name,
                 version.majorVersion, version.minorVersion, version.modifyVersion, version.debugVersion,
                 mount_name, connected ? "true" : "false",
-                version_status,
                 (unsigned long long)base_rc,
-                (unsigned long long)version_rc,
                 (unsigned long long)connected_rc);
         } else {
             snprintf(result, result_size,
                 "{\"ok\":true,\"data\":{\"aircraft_type\":\"%s\","
                 "\"aircraft_series\":\"%s\","
-                "\"firmware_version\":null,"
                 "\"mount_position\":\"%s\",\"connected\":%s,"
-                "\"firmware_version_status\":\"%s\","
-                "\"firmware_version_note\":\"%s\","
-                "\"base_info_ret\":%llu,\"version_ret\":%s,\"connection_ret\":%llu}}",
+                "\"base_info_ret\":%llu,\"connection_ret\":%llu}}",
                 type_name, series_name,
                 mount_name, connected ? "true" : "false",
-                version_status,
-                version_note,
                 (unsigned long long)base_rc,
-                version_ret_json,
                 (unsigned long long)connected_rc);
         }
         return 0;
