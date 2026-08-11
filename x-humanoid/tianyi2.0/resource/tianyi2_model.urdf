@@ -333,7 +333,7 @@
   <link name="left_hand_thumb_rotation_link"><inertial><mass value="0.02"/></inertial></link>
   <joint name="left_hand_thumb_rotation_joint" type="revolute">
     <!-- Thumb sits on the index-finger side of the left palm. -->
-    <origin xyz="0 0.035 -0.015" rpy="0 0 0"/>
+    <origin xyz="0 0.035 -0.015" rpy="0 0 -0.349066"/>
     <parent link="left_palm_link"/><child link="left_hand_thumb_rotation_link"/>
     <!-- Mirror the right thumb so positive rotation moves toward centre. -->
     <axis xyz="0 0 -1"/>
@@ -445,7 +445,7 @@
 
   <link name="right_hand_thumb_rotation_link"><inertial><mass value="0.02"/></inertial></link>
   <joint name="right_hand_thumb_rotation_joint" type="revolute">
-    <origin xyz="0 -0.035 -0.015" rpy="0 0 0"/>
+    <origin xyz="0 -0.035 -0.015" rpy="0 0 0.349066"/>
     <parent link="right_palm_link"/><child link="right_hand_thumb_rotation_link"/>
     <axis xyz="0 0 1"/>
     <limit lower="0" upper="1.571" effort="2" velocity="4"/>
