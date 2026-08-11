@@ -4830,7 +4830,7 @@ class RobotFaultsPlugin:
         return {
             "name": "health_check",
             "type": "actuator",
-            "description": "天轶2.0 全身体检 — 底盘/电机/手部/电源/急停/IMU 综合诊断, 含建议",
+            "description": "天轶2.0 全身体检 — 底盘/电机/手部/电源/急停/IMU/自检状态综合诊断。应在以下场景调用：①用户说\"体检\"\"状态\"\"健康\"\"自检怎么样了\"时；②收到多个电机故障(error)或急停(fatal)事件后需汇总伤情时；③长时间无状态更新后确认机器人是否正常时。其他健康/故障类卡片(如auto_brake)无法判断整体态势时应回退到此卡片。支持 summary(人话判定+建议)/detail(完整结构化数据)/reset_self_check(手动解除自检卡死)",
             "inputSchema": {
                 "type": "object",
                 "properties": {
