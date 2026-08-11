@@ -50,26 +50,43 @@ _BUMI_JOINT_NAMES = [
 ]
 
 # ── ControlCmd Mapping ────────────────────────────────────────────────────────
+# Lazy-loaded from highcontrol_py.ControlCmd enum at runtime
 
-_MODE_TO_CMD = {
-    "walk": 0,       # WALK
-    "swing": 1,      # SWING (挥手)
-    "shake": 2,      # SHAKE (握手)
-    "cheer": 3,      # CHEER (欢呼)
-    "run": 4,        # RUN (预留)
-    "enable": 5,     # START (使能/失能)
-    "ready": 6,      # SWITCH (准备模式)
-    "start_teach": 7,
-    "save_teach": 8,
-    "end_teach": 9,
-    "play_teach": 10,
-    "dance": 11,
-    "fall_to_stand": 12,
-    "stand_to_fall": 13,
-    "dance1": 14,
-    "dance2": 15,
-    "tear": 16,      # 擦眼泪
+_MODE_TO_CMD_NAME = {
+    "walk": "WALK",
+    "swing": "SWING",       # 挥手
+    "shake": "SHAKE",       # 握手
+    "cheer": "CHEER",       # 欢呼
+    "run": "RUN",           # 预留
+    "enable": "START",      # 使能/失能
+    "ready": "SWITCH",      # 准备模式
+    "start_teach": "STARTTEACH",
+    "save_teach": "SAVETEACH",
+    "end_teach": "ENDTEACH",
+    "play_teach": "PLAYTEACH",
+    "dance": "DANCE",
+    "fall_to_stand": "FALLTOSTAND",
+    "stand_to_fall": "STANDTOFALL",
+    "dance1": "DANCE1",
+    "dance2": "DANCE2",
+    "tear": "TEAR",         # 擦眼泪
 }
+
+_ControlCmd = None  # Lazy-loaded enum module
+
+
+def _get_control_cmd(name: str):
+    """Get ControlCmd enum value by name."""
+    global _ControlCmd
+    if _ControlCmd is None:
+        from highcontrol_py import ControlCmd
+        _ControlCmd = ControlCmd
+    return getattr(_ControlCmd, name)
+
+
+def _get_default_cmd():
+    """Get DEFAULT command."""
+    return _get_control_cmd("DEFAULT")
 
 _WORKMODE_NAMES = {
     0: "enabled", 1: "ready", 2: "walking", 5: "dance",
@@ -168,10 +185,10 @@ class _BumiStateNode(Node):
                     last_bms_time = now
                     bms = self._high_ctrl.get_robot_bms_data()
                     bms_data = {
-                        "soc": int(bms.battery_soc_),
-                        "soh": int(bms.battery_soh_),
-                        "temperature": int(bms.battery_temp_),
-                        "alarm": int(bms.battery_alarm_),
+                        "soc": int(bms.battery_soc),
+                        "soh": int(bms.battery_soh),
+                        "temperature": int(bms.battery_temp),
+                        "alarm": int(bms.battery_alarm),
                     }
                     with self._lock:
                         self._last_battery = bms_data
@@ -331,7 +348,7 @@ class LocoPlugin:
                     },
                     "mode": {
                         "type": "string",
-                        "enum": list(_MODE_TO_CMD.keys()),
+                        "enum": list(_MODE_TO_CMD_NAME.keys()),
                         "description": "Target mode to switch to.",
                     },
                     "index": {
@@ -380,8 +397,8 @@ class LocoPlugin:
             return self._do_get_mode()
         return None
 
-    def _publish_cmd(self, x: float, y: float, z: float, action_cmd: int, index: int = 0):
-        """Send command with rate limiting (≥2ms between calls)."""
+    def _publish_cmd(self, x: float, y: float, z: float, action_cmd, index: int = 0):
+        """Send command with rate limiting (≥2ms between calls). action_cmd is ControlCmd enum."""
         with self._lock:
             now = time.monotonic()
             elapsed = now - self._last_cmd_time
@@ -409,16 +426,17 @@ class LocoPlugin:
             self._move_thread.join(timeout=1)
 
         self._move_stop_event.clear()
+        default_cmd = _get_default_cmd()
 
         if duration > 0:
             # Timed move
             def _move_timed():
                 end_time = time.monotonic() + duration
                 while not self._move_stop_event.is_set() and time.monotonic() < end_time:
-                    self._publish_cmd(vx, vy, vyaw, 17, 0)  # DEFAULT action, just sends velocity
+                    self._publish_cmd(vx, vy, vyaw, default_cmd, 0)
                     time.sleep(0.02)  # 50 Hz
                 # Stop
-                self._publish_cmd(0, 0, 0, 17, 0)
+                self._publish_cmd(0, 0, 0, default_cmd, 0)
 
             self._move_thread = threading.Thread(target=_move_timed, daemon=True, name="bumi_move")
             self._move_thread.start()
@@ -428,9 +446,9 @@ class LocoPlugin:
             def _move_continuous():
                 watchdog_end = time.monotonic() + 5.0
                 while not self._move_stop_event.is_set() and time.monotonic() < watchdog_end:
-                    self._publish_cmd(vx, vy, vyaw, 17, 0)
+                    self._publish_cmd(vx, vy, vyaw, default_cmd, 0)
                     time.sleep(0.02)
-                self._publish_cmd(0, 0, 0, 17, 0)
+                self._publish_cmd(0, 0, 0, default_cmd, 0)
 
             self._move_thread = threading.Thread(target=_move_continuous, daemon=True, name="bumi_move")
             self._move_thread.start()
@@ -440,27 +458,27 @@ class LocoPlugin:
         self._move_stop_event.set()
         if self._move_thread and self._move_thread.is_alive():
             self._move_thread.join(timeout=1)
-        self._publish_cmd(0, 0, 0, 17, 0)  # DEFAULT with zero velocity
+        self._publish_cmd(0, 0, 0, _get_default_cmd(), 0)
         return {"state": "stopped"}
 
     def _do_switch(self, args: dict) -> dict:
         mode_str = args.get("mode", "")
         index = int(args.get("index", 0))
 
-        if mode_str not in _MODE_TO_CMD:
-            return {"error": f"Unknown mode: {mode_str}. Available: {list(_MODE_TO_CMD.keys())}"}
+        if mode_str not in _MODE_TO_CMD_NAME:
+            return {"error": f"Unknown mode: {mode_str}. Available: {list(_MODE_TO_CMD_NAME.keys())}"}
 
         # Safety: check protection mode
         current_mode = self._high_ctrl.get_mode()
         if current_mode == 26:
             return {"error": "Robot in protection mode. Cannot switch modes."}
 
-        cmd_val = _MODE_TO_CMD[mode_str]
+        cmd_enum = _get_control_cmd(_MODE_TO_CMD_NAME[mode_str])
 
         # Edge-trigger: send action once, then DEFAULT
-        self._publish_cmd(0, 0, 0, cmd_val, index)
+        self._publish_cmd(0, 0, 0, cmd_enum, index)
         time.sleep(0.003)  # ≥2ms
-        self._publish_cmd(0, 0, 0, 17, 0)  # DEFAULT
+        self._publish_cmd(0, 0, 0, _get_default_cmd(), 0)
 
         # Wait briefly and check new mode
         time.sleep(0.1)
@@ -682,7 +700,7 @@ class SpeakerPlugin:
                     stereo_samples.extend([s, s])  # duplicate L=R
 
                 # Create AudioStream and publish
-                from highcontrol_py import AudioStream
+                from mediacontrol_py import AudioStream
                 stream = AudioStream()
                 stream.channels = 2
                 stream.sample_rate = 16000

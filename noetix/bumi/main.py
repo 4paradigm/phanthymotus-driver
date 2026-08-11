@@ -259,7 +259,7 @@ def main():
         print("[bundle] State/Loco plugins will be unavailable")
 
     try:
-        from highcontrol_py import MediaController
+        from mediacontrol_py import MediaController
         media_ctrl = MediaController.instance()
         media_ctrl.init()
         import time

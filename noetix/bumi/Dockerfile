@@ -8,6 +8,7 @@ WORKDIR /work
 RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
         python3-pip \
+        python3-dev \
         cmake \
         build-essential \
         curl \
@@ -15,7 +16,8 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
         libusb-1.0-0 \
         libportaudio2 \
         libasound2-dev \
-        libssl-dev && \
+        libssl-dev \
+        libeigen3-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # Realsense SDK (D435i camera)
@@ -26,26 +28,25 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    pyyaml netifaces numpy opencv-python-headless pyrealsense2
+    pyyaml netifaces numpy opencv-python-headless pyrealsense2 pybind11
 
-# Build CycloneDDS 0.11.0 from source (required by noetix_sdk_bumi)
-ARG CYCLONEDDS_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/cyclonedds-0.11.0.tar.gz
-RUN curl -fsSL ${CYCLONEDDS_URL} \
-    | tar xz -C /tmp && \
-    mkdir -p /tmp/cyclonedds-0.11.0/build && \
-    cd /tmp/cyclonedds-0.11.0/build && \
-    cmake .. -DCMAKE_INSTALL_PREFIX=/opt/cyclonedds && \
-    cmake --build . --config RelWithDebInfo --parallel --target install && \
-    rm -rf /tmp/cyclonedds-0.11.0
+# Noetix Bumi SDK — clone and build pybind modules
+RUN git clone --depth 1 https://github.com/Noetix-Robotics/noetix_sdk_bumi.git /work/noetix_sdk_bumi
 
-ENV CYCLONEDDS_HOME=/opt/cyclonedds
-ENV LD_LIBRARY_PATH=/opt/cyclonedds/lib:${LD_LIBRARY_PATH}
+# Build only the pybind modules (highcontrol_py, mediacontrol_py)
+# Skip onnxruntime-dependent executables via custom CMakeLists target selection
+RUN cd /work/noetix_sdk_bumi && \
+    mkdir -p build && cd build && \
+    cmake .. \
+        -DCMAKE_CXX_STANDARD=17 \
+        -Dpybind11_DIR=$(python3 -c "import pybind11; print(pybind11.get_cmake_dir())") \
+    2>&1 || true && \
+    make -j$(nproc) highcontrol_py mediacontrol_py 2>&1 && \
+    echo "[build] pybind modules built successfully"
 
-RUN pip3 install --no-cache-dir --no-binary cyclonedds -i ${PYPI_MIRROR} cyclonedds==0.11.0
-
-# Noetix Bumi SDK (pybind11 bindings)
-# Pre-built from noetix_sdk_bumi repo, includes highcontrol_py and lowcontrol_py
-COPY noetix_sdk_bumi/ /work/noetix_sdk_bumi/
+# Verify .so files exist
+RUN ls /work/noetix_sdk_bumi/build/highcontrol_py*.so && \
+    ls /work/noetix_sdk_bumi/build/mediacontrol_py*.so
 
 # ROS2 domain isolation
 ENV ROS_DOMAIN_ID=42
@@ -58,6 +59,8 @@ COPY device.py /work/device.py
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
 
+# Add SDK DDS libs + pybind modules to paths
+ENV LD_LIBRARY_PATH=/work/noetix_sdk_bumi/dds/aarch64/lib:${LD_LIBRARY_PATH}
 ENV PYTHONPATH=/work:/work/noetix_sdk_bumi/build
 ENV PYTHONUNBUFFERED=1
 
