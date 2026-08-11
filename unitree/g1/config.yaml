@@ -12,6 +12,14 @@ plugins:
     enabled: true
   loco:
     enabled: true
+  fall_recovery:
+    enabled: true
+    fall_angle_threshold_deg: 50
+    fall_confirm_duration: 0.5
+    foot_force_threshold: 10
+    recovery_timeout: 10
+    imu_topic: state/imu
+    foot_force_topic: loco/state
   arm:
     enabled: true
   state:
