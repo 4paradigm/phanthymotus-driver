@@ -6,12 +6,7 @@
 #include <unistd.h>
 #include <pthread.h>
 
-/*
- * PSDK Flight Controller for Matrice 300 RTK.
- *
- * All functions return 0 on success or the raw PSDK T_DjiReturnCode on failure.
- * move uses a background thread to send joystick commands at 50Hz.
- */
+
 
 #ifdef PSDK_ENABLED
 #include "dji_flight_controller.h"

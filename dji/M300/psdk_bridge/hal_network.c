@@ -12,16 +12,7 @@
 #include <arpa/inet.h>
 #include <ifaddrs.h>
 
-/*
- * E-Port USB-Ethernet detection strategy:
- *
- * 1. Scan /sys/class/net/ for interfaces backed by USB subsystem
- * 2. Match by USB VID (0x2CA3 = DJI) or by interface naming pattern
- * 3. Common interface names: usb0, usb1, enx* (predictable naming)
- *
- * On Jetson NX with E-Port connected, the RNDIS/NCM device typically
- * creates a "usb0" interface with a 192.168.x.x address.
- */
+
 
 static T_HalNetworkInfo s_net_info = {0};
 static int s_initialized = 0;

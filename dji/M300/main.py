@@ -178,9 +178,6 @@ _bundle: M300DeviceBundle | None = None
 
 
 def make_handler():
-    # Agent Core still uses the legacy MCP SSE transport.  Keep the current
-    # Streamable-HTTP endpoint as well so direct POST /mcp clients continue to
-    # work during the migration.
     sse_sessions: dict[str, "Handler"] = {}
     sse_sessions_lock = threading.Lock()
 
@@ -327,10 +324,6 @@ def _start_registration(mcp_port: int, name: str, category: str):
     import urllib.request as _urllib
     import ssl as _ssl
 
-    # Drivers share the Nano network namespace with Agent Core.  Use the IPv4
-    # loopback address explicitly: on Nano images that have IPv6 disabled,
-    # ``localhost`` may resolve to ``::1`` first and urllib fails with
-    # EADDRNOTAVAIL before it attempts IPv4.
     agent_core_url = os.environ.get("AGENT_CORE_URL", "https://127.0.0.1:15678")
     payload = json.dumps({
         "name": name,
@@ -367,9 +360,6 @@ def main():
     mcp_port = int(cfg.get("mcp_port", 15702))
     psdk_cfg = cfg.get("psdk_bridge", {})
 
-    # This deployment is directly connected to the M300 PSDK port.  Its DJI
-    # USB CDC device (VID:PID 2ca3:001f) is UART0 at /dev/ttyACM0.  Do not
-    # select the optional E-Port development-kit FTDI node (/dev/ttyUSB0).
     uart0_dev = psdk_cfg.get("uart0_dev", "/dev/ttyACM0")
     uart1_dev = psdk_cfg.get("uart1_dev", "/dev/ttyACM0")
     missing = [dev for dev in (uart0_dev, uart1_dev) if not os.path.exists(dev)]
@@ -440,9 +430,6 @@ def main():
         sys.exit(1)
     print(f"[bundle] BridgeClient connected (uart0={uart0_dev} uart1={uart1_dev})")
 
-    # A dead bridge used to leave the Python HTTP process serving a healthy
-    # looking but unusable port.  Exit the container when its only hardware
-    # backend exits so Docker's restart policy can recover it.
     bridge_stopping = threading.Event()
 
     def _watch_bridge() -> None:

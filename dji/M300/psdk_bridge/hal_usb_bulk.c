@@ -8,13 +8,7 @@
 
 #include "dji_platform.h"
 
-/*
- * M300 presents itself to the Jetson as a USB device (VID:PID 2ca3:001f).
- * PSDK supplies the interface number and endpoints for each stream channel;
- * the host must claim those interfaces with libusb.  FunctionFS is the
- * inverse topology (Jetson acting as USB device) and cannot receive M300
- * liveview data.
- */
+
 typedef struct {
     libusb_device_handle *device;
     T_DjiHalUsbBulkInfo info;
@@ -28,11 +22,7 @@ static T_DjiReturnCode _UsbBulk_Init(T_DjiHalUsbBulkInfo info,
     if (!out_handle || !info.isUsbHost)
         return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
 
-    /* Do not rewrite the channel selected by PSDK.  The M300 exposes several
-     * valid bulk pairs (including 3/0x84/0x03, 6/0x87/0x05 and 7/0x88/0x06),
-     * and the working hzhy PSDK sample claims exactly the tuple supplied by
-     * the SDK.  Rewriting 6 to 7 made the control/data channels disagree and
-     * left a failed Liveview initialisation unrecoverable in this process. */
+
 
     handle = calloc(1, sizeof(*handle));
     if (!handle)
@@ -48,9 +38,7 @@ static T_DjiReturnCode _UsbBulk_Init(T_DjiHalUsbBulkInfo info,
         goto fail_exit;
     }
 
-    /* Match the verified M300 PSDK sample: claim the SDK-selected interface
-     * without detaching an existing kernel driver.  Some control/status
-     * traffic shares the device topology, and auto-detach can disrupt it. */
+
     rc = libusb_claim_interface(handle->device, info.channelInfo.interfaceNum);
     if (rc != LIBUSB_SUCCESS) {
         printf("[usb_bulk] claim interface %u failed: %s\n",

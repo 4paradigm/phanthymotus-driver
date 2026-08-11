@@ -3,12 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 
-/*
- * PSDK Camera Manager for Matrice 300 RTK payload port 1.
- *
- * Uses DjiCameraManager_* API with mount position DJI_MOUNT_POSITION_PAYLOAD_PORT_NO1.
- * Camera support depends on the installed payload.
- */
+
 
 #ifdef PSDK_ENABLED
 #include "dji_camera_manager.h"

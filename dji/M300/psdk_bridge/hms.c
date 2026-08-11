@@ -3,15 +3,7 @@
 #include <string.h>
 #include "cJSON.h"
 
-/*
- * PSDK HMS (Health Management System) for Matrice 300 RTK.
- *
- * DjiHmsManager_Init() → register callback _hms_cb → aircraft pushes
- * alerts into s_alerts[] → hms_get_info() serializes them to JSON.
- *
- * Error code lookup: JSON database first (hms_2023_08_22.json),
- * fall back to compiled-in hmsErrCodeInfoTbl.
- */
+
 
 #ifdef PSDK_ENABLED
 #include "dji_hms.h"

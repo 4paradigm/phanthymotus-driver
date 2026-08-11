@@ -27,9 +27,6 @@ enable_uart_transceiver() {
     }
 
     if ! gpio_dir="$(find_gpio_dir)"; then
-        # The official ONX M300 demo exports GPIO 472, which appears as PY.02
-        # on this carrier board. EBUSY is normal when another start already
-        # exported it, so re-check the directory afterwards.
         printf '%s' "${GPIO_NUMBER}" > "${HOST_SYS}/class/gpio/export" 2>/dev/null || true
         for attempt in {1..20}; do
             if gpio_dir="$(find_gpio_dir)"; then
@@ -59,9 +56,6 @@ enable_uart_transceiver
     exit 1
 }
 
-# ROS 2 Humble's generated setup scripts reference optional AMENT variables
-# directly. They are valid when unset, but incompatible with bash nounset.
-# Keep nounset disabled only while importing that third-party environment.
 set +u
 source /opt/ros/humble/setup.bash
 source /ros_ws/install/setup.bash

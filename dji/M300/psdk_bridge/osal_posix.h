@@ -1,9 +1,7 @@
 #ifndef OSAL_POSIX_H
 #define OSAL_POSIX_H
 
-/* This is the OSAL ABI registered with libpayloadsdk.  Keep its ownership,
- * task cancellation, and wall-clock-relative timing behaviour consistent
- * with the verified hzhy Jetson M300 platform implementation. */
+
 #ifdef PSDK_ENABLED
 
 #include "dji_platform.h"

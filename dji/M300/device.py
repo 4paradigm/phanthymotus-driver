@@ -41,10 +41,6 @@ _LOW_LAT_QOS = QoSProfile(
 )
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  TelemetryPlugin (sensor)
-#  PSDK: 数据订阅 + 机型信息
-# ═══════════════════════════════════════════════════════════════════════════
 
 class _TelemetryNode(Node):
     def __init__(self, topic: str, bridge, publish_rate: int = 10):
@@ -133,10 +129,6 @@ class TelemetryPlugin:
             }
         return None
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  CameraStreamPlugin (sensor, multiInstance)
-#  PSDK: 获取相机码流 + 视频流传输
-# ═══════════════════════════════════════════════════════════════════════════
 
 class _CameraStreamNode(Node):
     def __init__(self, topic: str, bridge, fps: int = 10, camera: str = "fpv"):
@@ -302,10 +294,6 @@ class CameraStreamPlugin:
         return None
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  PerceptionPlugin (sensor, multiInstance)
-#  PSDK: 感知数据 — 6方向避障灰度图
-# ═══════════════════════════════════════════════════════════════════════════
 
 class _PerceptionNode(Node):
     def __init__(self, namespace: str, bridge):
@@ -369,9 +357,6 @@ class _PerceptionNode(Node):
 
 class PerceptionPlugin:
     PREFIX = "perception"
-    # Canvas terminology uses "back"; DJI PSDK calls the same stereo pair
-    # RECTIFY_REAR.  All six entries below were verified on the target M300
-    # with hzhy's PSDK 3.8 stereo-view sample.
     DIRECTIONS = ["front", "back", "left", "right", "up", "down"]
 
     def __init__(self, plugin_config: dict, namespace: str, executor, bridge):
@@ -386,10 +371,6 @@ class PerceptionPlugin:
             "type": "sensor",
             "multiInstance": True,
             "description": "Matrice 300 RTK 感知避障立体灰度图：前/后(rear)/左/右/上/下，全部已实测可订阅；最多同时2路。",
-            # The output topic is selected by this card's instance config.
-            # Do not register a template or a front default here: Canvas reads
-            # static topics before config is applied, which otherwise pins the
-            # card (and Smart Control's websocket) to the front camera.
             "topic_out": [{"format": "image/jpeg", "desc": "perception grayscale stream"}],
             "configSchema": {
                 "type": "object",
@@ -437,10 +418,6 @@ class PerceptionPlugin:
             self._instance_configs[instance_id] = {"direction": direction}
             return {"ok": True, "direction": direction}
 
-        # The Canvas start/info requests include the schema default (front),
-        # even after it has sent a separate per-instance config request.  Once
-        # an instance is configured, its persisted direction must therefore
-        # take precedence or every card subscribes to front.
         direction = self._instance_configs.get(instance_id, {}).get(
             "direction", args.get("direction", "front")
         )
@@ -448,9 +425,6 @@ class PerceptionPlugin:
             return {"state": "error", "message": f"unsupported perception direction: {direction}"}
         if action == "start":
             result = self._node.start(direction)
-            # Start is the point at which Agent Core reapplies the persisted
-            # per-instance config.  Return the resolved physical topic so the
-            # Canvas replaces any stale topic captured before configuration.
             topic = f"/{self._namespace}/perception/{direction}"
             return {
                 "state": self._node.state,
@@ -461,20 +435,11 @@ class PerceptionPlugin:
             self._node.stop(direction)
             return {"state": self._node.state}
         if action == "info":
-            # Agent Core probes every sensor with an unscoped `info` call at
-            # registration time.  There is no physical camera selected for
-            # that call, so advertising the fallback front topic makes Agent
-            # Core subscribe to front before a Canvas instance is configured.
-            # Only an instance that has a selected direction may expose a
-            # concrete topic.
             if instance_id not in self._instance_configs:
                 return {
                     "state": self._node.state,
                     "topic_out": [],
                 }
-            # The ROS publisher is keyed by the physical direction, not by
-            # canvas instance id.  Returning an instance-id topic here made
-            # downstream cards subscribe to a topic that never receives data.
             topic = f"/{self._namespace}/perception/{direction}"
             return {
                 "state": self._node.state,
@@ -483,10 +448,6 @@ class PerceptionPlugin:
         return None
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  HmsPlugin (sensor)
-#  PSDK: HMS管理 + 自定义HMS
-# ═══════════════════════════════════════════════════════════════════════════
 
 class _HmsNode(Node):
     def __init__(self, topic: str, bridge):
@@ -568,10 +529,6 @@ class HmsPlugin:
         return None
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  FlightPlugin (actuator, multi-tool)
-#  PSDK: 飞行控制
-# ═══════════════════════════════════════════════════════════════════════════
 
 class FlightPlugin:
     PREFIX = "flight"
@@ -741,10 +698,6 @@ class FlightPlugin:
         return None
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  CameraPlugin (actuator)
-#  PSDK: 相机管理 + 基础相机功能
-# ═══════════════════════════════════════════════════════════════════════════
 
 class CameraPlugin:
     PREFIX = "camera"
@@ -872,10 +825,6 @@ class CameraPlugin:
         return None
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  GimbalPlugin (actuator)
-#  PSDK: 云台管理 + 云台功能
-# ═══════════════════════════════════════════════════════════════════════════
 
 class GimbalPlugin:
     PREFIX = "gimbal"
@@ -959,10 +908,6 @@ class GimbalPlugin:
         return None
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  WaypointPlugin (actuator)
-#  PSDK: 运动规划 (Waypoint V3)
-# ═══════════════════════════════════════════════════════════════════════════
 
 class WaypointPlugin:
     PREFIX = "waypoint"
@@ -1310,15 +1255,7 @@ class WaypointPlugin:
         return None
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  SpeakerPlugin (actuator)
-#  PSDK: 喊话器控件
-# ═══════════════════════════════════════════════════════════════════════════
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  TimeSyncPlugin (resource)
-#  PSDK: 机型信息 + 时间同步
-# ═══════════════════════════════════════════════════════════════════════════
 
 class TimeSyncPlugin:
     PREFIX = "aircraft_info"

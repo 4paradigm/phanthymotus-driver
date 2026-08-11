@@ -39,10 +39,7 @@ static T_LiveviewStream s_streams[] = {
 #define STREAM_COUNT (sizeof(s_streams) / sizeof(s_streams[0]))
 
 static int s_liveview_ready = 0;
-/* DjiLiveview_Init registers an extended-command handler before it requests
- * status.  A status timeout leaves that registration in place, so a second
- * call cannot recover in the same PSDK process and instead fails with
- * "Reg extend cmd handler error". */
+
 static int s_liveview_init_attempted = 0;
 
 static T_LiveviewStream *_find_stream(const char *camera) {

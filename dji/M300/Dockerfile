@@ -1,20 +1,9 @@
-# ── DJI Matrice 300 RTK Driver Image ─────────────────────────────────
-# FROM psdk-base (pre-built PSDK library), adds:
-#   - psdk_bridge C binary (compiled with PSDK_ENABLED)
-#   - Python MCP server + plugins
-#
-# Build:
-#   ./build.sh dji/M300
-# ────────────────────────────────────────────────────────────────────
 
 ARG PSDK_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/psdk-base:latest
 ARG PYPI_MIRROR=https://pypi.org/simple/
 FROM ${PSDK_BASE_IMAGE}
 ARG PYPI_MIRROR
 
-# M300 is pinned to the PSDK 3.8 library bundled with the ONX M300 demo that
-# has been verified on the target Jetson.  Later PSDK builds reach a liveview
-# status-subscription timeout on this M300 E-Port topology.
 COPY third_party/psdk_lib-3.8.0-m300.tar.gz /tmp/
 RUN echo "5cd52fc65b05baa1826a16d138136eec68a456aea3b0cf4ade78cc3e54f089bd  /tmp/psdk_lib-3.8.0-m300.tar.gz" | sha256sum -c - && \
     rm -rf /opt/Payload-SDK && mkdir -p /opt/Payload-SDK && \

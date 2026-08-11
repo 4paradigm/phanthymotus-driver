@@ -1,20 +1,3 @@
-/*
- * psdk_bridge/main.c — DJI PSDK Bridge main entry point.
- *
- * This is the C process that:
- *   1. Initializes DJI PSDK with app credentials
- *   2. Initializes all PSDK modules (telemetry, flight, camera, gimbal, etc.)
- *   3. Starts IPC server (Unix socket) for Python communication
- *   4. Runs main event loop processing IPC commands + PSDK callbacks
- *
- * Build with PSDK_ENABLED defined to link against libpayloadsdk.a.
- * Without PSDK_ENABLED, builds in stub mode for development/testing.
- *
- * Usage:
- *   ./psdk_bridge [socket_path] [app_id] [app_key] [app_license]
- *                 [uart0_dev] [uart0_baud] [uart1_dev]
- */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,9 +19,7 @@
 #include "error_code.h"
 
 static volatile int s_running = 1;
-/* 0 = PSDK initialising, 1 = modules ready, -1 = initialisation failed.
- * Keep the IPC server independent from the (potentially slow) PSDK UART
- * handshake so callers never silently fall back to simulated data. */
+
 static volatile int s_psdk_state = 0;
 
 static void _signal_handler(int sig) {
@@ -65,10 +46,7 @@ static void _signal_handler(int sig) {
 
 /* ── UART HAL implementation matching T_DjiHalUartHandler ─────────────── */
 
-/* The direct M300 PSDK connection exposes DJI USB CDC (2ca3:001f) as
- * /dev/ttyACM0, which carries UART0.  An E-Port development kit may instead
- * provide an FTDI /dev/ttyUSB0 endpoint, but that must be explicitly passed
- * in configuration rather than being the default. */
+
 #define M300_UART_COUNT 2
 typedef struct {
     const char *device;
@@ -116,9 +94,7 @@ static T_M300UartHandle *_HalUart_Handle(T_DjiUartHandle handle) {
     return (T_M300UartHandle *)(intptr_t)handle;
 }
 
-/* PSDK uses this information to identify the USB-to-UART device attached to
- * the aircraft.  Do not hard-code a particular FTDI product ID: FT232R,
- * FT231X and FT2232 adapters all expose different PIDs. */
+
 static void _HalUart_DetectDeviceInfo(T_M300Uart *uart) {
     char path[PATH_MAX], current[PATH_MAX], value[16];
     const char *name = strrchr(uart->device, '/');
@@ -130,9 +106,7 @@ static void _HalUart_DetectDeviceInfo(T_M300Uart *uart) {
 
     snprintf(path, sizeof(path), "/sys/class/tty/%s/device", name);
     if (realpath(path, current)) {
-        /* ttyUSB points at a tty node below a USB interface.  Find the first
-         * ancestor that has both USB descriptors rather than assuming a
-         * fixed number of parent directories. */
+
         while (current[0] != '\0') {
             snprintf(path, sizeof(path), "%s/idVendor", current);
             f = fopen(path, "r");
@@ -196,9 +170,7 @@ static T_DjiReturnCode _HalUart_Init(E_DjiHalUartNum uartNum, uint32_t baudRate,
         return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
     }
 
-    /* Keep hzhy's process-level exclusive UART ownership.  The lock is
-     * acquired after open, before any termios/PSDK probe traffic, so a second
-     * bridge cannot interleave auto-baud frames with this process. */
+
     struct flock lock = {
         .l_type = F_WRLCK,
         .l_whence = SEEK_SET,
@@ -230,10 +202,7 @@ static T_DjiReturnCode _HalUart_Init(E_DjiHalUartNum uartNum, uint32_t baudRate,
     speed_t speed = _to_speed(baudRate);
     cfsetispeed(&tty, speed);
     cfsetospeed(&tty, speed);
-    /* Keep the termios transformation byte-for-byte compatible with hzhy's
-     * Jetson M300 HAL.  In particular, do not zero all input flags: the
-     * carrier driver's remaining flags are part of the liveview control-link
-     * behaviour after PSDK's auto-baud probe. */
+
     tty.c_cflag |= CLOCAL;
     tty.c_cflag |= CREAD;
     tty.c_cflag &= ~CRTSCTS;
@@ -339,9 +308,7 @@ static T_DjiReturnCode _HalUart_GetStatus(E_DjiHalUartNum uartNum, T_DjiUartStat
     T_M300Uart *uart = _HalUart_Get(uartNum);
     if (!uart || !status)
         return DJI_ERROR_SYSTEM_MODULE_CODE_INVALID_PARAMETER;
-    /* hzhy's platform reports both configured UARTs as available.  PSDK can
-     * query UART1 while its liveview status transaction is carried by UART0;
-     * reporting UART1 as disconnected changes that transaction's path. */
+
     status->isConnect = true;
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
@@ -419,9 +386,7 @@ static int _psdk_core_init(const char *app_id, const char *app_key,
         return -1;
     }
 
-    /* M300 liveview uses the aircraft USB vendor interfaces in addition to
-     * the UART control link.  Register this before DjiCore_Init so PSDK can
-     * create the bulk stream channels during liveview initialization. */
+
     rc = DjiPlatform_RegHalUsbBulkHandler(&g_usbBulkHandler);
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
         printf("[psdk] HAL USB bulk registration failed: 0x%08llX\n",
@@ -450,9 +415,7 @@ static int _psdk_core_init(const char *app_id, const char *app_key,
         return -1;
     }
 
-    /* Preserve the core identity sequence used by the verified hzhy M300
-     * sample before ApplicationStart.  These calls are intentionally made
-     * before the liveview stability window below. */
+
     rc = DjiCore_SetAlias("PSDK_APPALIAS");
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS)
         printf("[psdk] set alias failed: 0x%08llX\n", (unsigned long long)rc);
@@ -465,10 +428,7 @@ static int _psdk_core_init(const char *app_id, const char *app_key,
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS)
         printf("[psdk] set serial number failed: 0x%08llX\n", (unsigned long long)rc);
 
-    /* hzhy's verified M300 sequence initializes service modules before
-     * announcing the application to Pilot, then initializes Liveview.  Do
-     * not issue Liveview control commands here: its status-push handler is
-     * only accepted after that complete sequence. */
+
     printf("[psdk] core initialized (app=%s, id=%s)\n", app_name, app_id);
     return 0;
 }
@@ -511,16 +471,12 @@ static void *_psdk_start_thread(void *arg) {
                (unsigned long long)rc);
         return NULL;
     }
-    /* The M300 accepts the Liveview status-push request only after the
-     * application handshake has settled.  Do not let other service-module
-     * subscriptions compete with that request during this interval. */
+
     (void)Osal_TaskSleepMs(5000);
     if (liveview_init() != 0) {
         printf("[psdk] liveview init unavailable; camera_stream will return an error without crashing\n");
     }
-    /* Camera Manager remains lazy: this FPV-only M300 has no default external
-     * payload camera.  The remaining service modules start only after the
-     * Liveview status subscription has had exclusive access to the link. */
+
     _init_modules();
     camera_mgr_init();  /* must precede hms_init: DjiHmsManager_Init internally depends on DjiCameraManager */
     hms_init();
@@ -534,10 +490,7 @@ static void *_psdk_start_thread(void *arg) {
 
 static int _dispatch_cmd(const char *raw_json, const char *unused,
                          char *result, size_t result_size) {
-    /*
-     * Simple JSON command dispatch. In production, use cJSON for proper parsing.
-     * For now, use strstr-based matching for the common commands.
-     */
+
 
     /* Do not run any PSDK API before its asynchronous UART handshake has
      * completed.  This is a live bridge response, not a mock fallback. */
@@ -1042,13 +995,8 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, _signal_handler);
     signal(SIGTERM, _signal_handler);
 
-    /* PSDK owns the UART through the callbacks registered in _psdk_core_init.
-     * Opening it here as well used to create a second, unrelated file handle:
-     * the preflight log could show incoming bytes even while PSDK used a
-     * differently configured descriptor for its registration handshake. */
-    /* The Unix socket is the driver control plane.  Start it before PSDK:
-     * DjiCore_Init may spend minutes probing UART baud rates while waiting for
-     * an aircraft, but Python must still connect to the real bridge. */
+
+
     if (ipc_init(socket_path) != 0) {
         printf("[psdk_bridge] IPC init failed, exiting\n");
         return 1;
