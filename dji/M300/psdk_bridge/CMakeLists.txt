@@ -56,7 +56,6 @@ set(SOURCES
     perception.c
     speaker.c
     hms.c
-    cJSON.c
     time_sync.c
     error_code.c
 )
