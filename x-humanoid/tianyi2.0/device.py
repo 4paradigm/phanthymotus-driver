@@ -5084,7 +5084,14 @@ class RobotFaultsPlugin:
             self._light_ctrl_state = msg
             self._last_update_ms = now_ms
         from_ = getattr(msg, "caller_id", "?")
-        print(f"[RobotFaultsPlugin] light ctrl: cmd={msg.cmd} caller={from_}")
+        # cmd=22 是硬件层面的"自检成功"信号，作为自检完成的主判定依据
+        if msg.cmd == 22 and self._self_check_started and not self._self_check_completed:
+            self._self_check_completed = True
+            print(f"[RobotFaultsPlugin] self-check completed via light_ctrl cmd=22 (caller={from_})")
+        elif msg.cmd == 21:
+            print(f"[RobotFaultsPlugin] self-check started via light_ctrl cmd=21 (caller={from_})")
+        else:
+            print(f"[RobotFaultsPlugin] light ctrl: cmd={msg.cmd} caller={from_}")
 
     def _on_play_event(self, msg):
         """方案B: 检测音频播放事件, 用于判断自检状态。
@@ -5113,14 +5120,8 @@ class RobotFaultsPlugin:
                 print(f"[RobotFaultsPlugin] self-check detected ({self._audio_window_count} audio events in 30s window)")
 
             # ── 自检完成判断 ──
-            if self._self_check_started and not self._self_check_completed:
-                dur = self._sid_duration.get(msg.sid)
-                if dur is not None:
-                    self._last_play_duration = dur
-                # 短提示音 → 自检完成
-                if dur is not None and dur < 2.5:
-                    self._self_check_completed = True
-                    print(f"[RobotFaultsPlugin] self-check completed (sid={msg.sid}, duration={dur:.2f}s)")
+            # 不再通过音频短提示音判断完成，改为依赖 light_ctrl cmd=22（硬件级信号）
+            # 音频短提示音在自检过程中也会出现，容易导致提前误判
 
     def _on_play_progress(self, msg):
         """订阅 /audio_play/progress, 用于获取每个 sid 的真实 duration, 不依赖 PlayEvent 字段。"""
