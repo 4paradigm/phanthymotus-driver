@@ -206,7 +206,7 @@ class StatePlugin:
         self._pub_servo = self._node.create_publisher(ServoPose, f"/{self._ns}/servo_pose", _RELIABLE_QOS)
         self._pub_robot_status = self._node.create_publisher(RobotStatus, f"/{self._ns}/robot_status", _RELIABLE_QOS)
 
-        # Subscribers
+        # Subscribers — subscribe to global topics (no namespace prefix)
         self._sub_joint = self._node.create_subscription(
             JointState, "/joint_states", lambda m: self._pub_joint.publish(m), _RELIABLE_QOS)
         self._sub_dynjoint = self._node.create_subscription(
