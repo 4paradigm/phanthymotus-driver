@@ -814,6 +814,26 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
         snprintf(result, result_size, "{\"ok\":true,\"data\":%s}", hms_buf);
         return 0;
     }
+    if (strstr(raw_json, "\"hms_inject\"")) {
+        uint32_t code = 0;
+        uint8_t level = 0;
+        const char *p;
+        if ((p = strstr(raw_json, "\"code\""))) { p = strchr(p, ':'); if (p) code = (uint32_t)strtoul(p + 1, NULL, 16); }
+        if ((p = strstr(raw_json, "\"level\""))) { p = strchr(p, ':'); if (p) level = (uint8_t)atoi(p + 1); }
+        int r = hms_inject_error(code, level);
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0,\"code\":\"0x%08X\"}}", code);
+        else snprintf(result, result_size, "{\"ok\":false,\"error\":\"inject failed\"}");
+        return 0;
+    }
+    if (strstr(raw_json, "\"hms_eliminate\"")) {
+        uint32_t code = 0;
+        const char *p;
+        if ((p = strstr(raw_json, "\"code\""))) { p = strchr(p, ':'); if (p) code = (uint32_t)strtoul(p + 1, NULL, 16); }
+        int r = hms_eliminate_error(code);
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0,\"code\":\"0x%08X\"}}", code);
+        else snprintf(result, result_size, "{\"ok\":false,\"error\":\"eliminate not found\"}");
+        return 0;
+    }
 
     /* Speaker */
     if (strstr(raw_json, "\"speaker_play\"")) {
