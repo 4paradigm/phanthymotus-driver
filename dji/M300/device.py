@@ -139,7 +139,7 @@ class TelemetryPlugin:
 # ═══════════════════════════════════════════════════════════════════════════
 
 class _CameraStreamNode(Node):
-    def __init__(self, topic: str, bridge, fps: int = 10, camera: str = "payload1"):
+    def __init__(self, topic: str, bridge, fps: int = 10, camera: str = "fpv"):
         super().__init__(f"m300_cam_{camera}")
         self._topic = topic
         self._bridge = bridge
@@ -219,7 +219,7 @@ class CameraStreamPlugin:
             "name": "camera_stream",
             "type": "sensor",
             "multiInstance": True,
-            "description": "Matrice 300 RTK 四路实时码流：FPV 与 1/2/3 号载荷口，H.264 解码为独立 JPEG 话题。",
+            "description": "Matrice 300 RTK 实时码流。当前飞机已验证仅支持 FPV；未挂载可用的 1/2/3 号载荷码流。",
             "topic_out": [{"format": "image/jpeg", "desc": "camera JPEG stream"}],
             "configSchema": {
                 "type": "object",
@@ -229,10 +229,7 @@ class CameraStreamPlugin:
                         "description": "Camera source",
                         "scope": "instance",
                         "oneOf": [
-                            {"const": "fpv", "title": "Aircraft FPV"},
-                            {"const": "payload1", "title": "Payload Port 1"},
-                            {"const": "payload2", "title": "Payload Port 2"},
-                            {"const": "payload3", "title": "Payload Port 3"},
+                            {"const": "fpv", "title": "Aircraft FPV (verified)"},
                         ],
                     },
                 },
@@ -261,7 +258,7 @@ class CameraStreamPlugin:
 
         if action == "config":
             self._instance_configs[instance_id] = args
-            camera = args.get("camera_source", "payload1")
+            camera = args.get("camera_source", "fpv")
             # If stream is running and camera changed, restart it
             if instance_id in self._nodes:
                 node = self._nodes[instance_id]
@@ -273,7 +270,7 @@ class CameraStreamPlugin:
             return {"ok": True, "camera": camera}
 
         # Resolve camera from cached instance config
-        camera = self._instance_configs.get(instance_id, {}).get("camera_source", "payload1")
+        camera = self._instance_configs.get(instance_id, {}).get("camera_source", "fpv")
 
         if action == "info":
             safe_id = instance_id.replace("-", "_")
@@ -372,11 +369,15 @@ class _PerceptionNode(Node):
 
 class PerceptionPlugin:
     PREFIX = "perception"
+    # Canvas terminology uses "back"; DJI PSDK calls the same stereo pair
+    # RECTIFY_REAR.  All six entries below were verified on the target M300
+    # with hzhy's PSDK 3.8 stereo-view sample.
     DIRECTIONS = ["front", "back", "left", "right", "up", "down"]
 
     def __init__(self, plugin_config: dict, namespace: str, executor, bridge):
         self._namespace = namespace
         self._node = _PerceptionNode(namespace, bridge)
+        self._instance_configs: dict[str, dict] = {}
         executor.add_node(self._node)
 
     def get_tool(self) -> dict:
@@ -384,7 +385,7 @@ class PerceptionPlugin:
             "name": "perception",
             "type": "sensor",
             "multiInstance": True,
-            "description": "Matrice 300 RTK 感知避障图像。6个方向 (前/后/左/右/上/下) VGA 灰度图，最多同时2路。",
+            "description": "Matrice 300 RTK 感知避障立体灰度图：前/后(rear)/左/右/上/下，全部已实测可订阅；最多同时2路。",
             "topic_out": [{"topic": f"/{self._namespace}/perception/{{direction}}", "format": "image/jpeg"}],
             "configSchema": {
                 "type": "object",
@@ -424,7 +425,20 @@ class PerceptionPlugin:
         self._node.stop()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
-        direction = args.get("direction", "front")
+        instance_id = args.get("instance_id", "")
+        if action == "config":
+            direction = args.get("direction", "front")
+            if direction not in self.DIRECTIONS:
+                return {"ok": False, "error": f"unsupported perception direction: {direction}"}
+            self._instance_configs[instance_id] = {"direction": direction}
+            return {"ok": True, "direction": direction}
+
+        direction = args.get(
+            "direction",
+            self._instance_configs.get(instance_id, {}).get("direction", "front"),
+        )
+        if direction not in self.DIRECTIONS:
+            return {"state": "error", "message": f"unsupported perception direction: {direction}"}
         if action == "start":
             result = self._node.start(direction)
             return {"state": self._node.state, **result}
@@ -432,11 +446,10 @@ class PerceptionPlugin:
             self._node.stop(direction)
             return {"state": self._node.state}
         if action == "info":
-            instance_id = args.get("instance_id", "")
-            dir_name = args.get("direction", "front")
-            topic = f"/{self._namespace}/perception/{dir_name}"
-            if instance_id:
-                topic = f"/{self._namespace}/perception/{instance_id.replace('-', '_')}"
+            # The ROS publisher is keyed by the physical direction, not by
+            # canvas instance id.  Returning an instance-id topic here made
+            # downstream cards subscribe to a topic that never receives data.
+            topic = f"/{self._namespace}/perception/{direction}"
             return {
                 "state": self._node.state,
                 "topic_out": [{"topic": topic, "format": "image/jpeg"}],

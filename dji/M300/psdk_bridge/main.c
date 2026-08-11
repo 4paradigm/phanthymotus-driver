@@ -554,7 +554,10 @@ static void _init_modules(void) {
     flight_ctrl_init();
     camera_mgr_init();
     gimbal_mgr_init();
-    liveview_init();
+    /* Liveview is initialized lazily on the first camera-stream request.
+     * It must not be used after a failed initialization.  In particular,
+     * starting a camera after DjiLiveview_Init failed used to dereference a
+     * NULL FFmpeg decoder and terminate the bridge. */
     waypoint_init();
     perception_init();
     speaker_init();

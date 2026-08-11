@@ -23,8 +23,8 @@ plugins:
   camera_stream:
     enabled: true
     fps: 10
-    # M300 uses the currently mounted payload on port 1 (for example H20/H20T).
-    camera_source: "default"
+    # Verified on the target M300 using hzhy's PSDK 3.8 FPV demo.
+    camera_source: "fpv"
   perception:
     enabled: true
   hms:
