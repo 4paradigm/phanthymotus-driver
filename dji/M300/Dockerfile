@@ -18,7 +18,7 @@ ARG PYPI_MIRROR
 COPY third_party/psdk_lib-3.8.0-m300.tar.gz /tmp/
 RUN echo "5cd52fc65b05baa1826a16d138136eec68a456aea3b0cf4ade78cc3e54f089bd  /tmp/psdk_lib-3.8.0-m300.tar.gz" | sha256sum -c - && \
     rm -rf /opt/Payload-SDK && mkdir -p /opt/Payload-SDK && \
-    tar -xzf /tmp/psdk_lib-3.8.0-m300.tar.gz -C /opt/Payload-SDK --strip-components=1 && \
+    tar -xzf /tmp/psdk_lib-3.8.0-m300.tar.gz -C /opt/Payload-SDK && \
     rm -f /tmp/psdk_lib-3.8.0-m300.tar.gz
 
 WORKDIR /work
