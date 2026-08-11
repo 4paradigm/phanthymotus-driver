@@ -4810,7 +4810,7 @@ class RobotFaultsPlugin:
         self._self_check_started = False
         self._self_check_completed = False
         # 短提示音判定 (自检完成)
-        self._short_prompt_threshold_ms = 2000   # < 2.0s 视为短促提示音
+        self._short_prompt_threshold_ms = 2.0    # < 2.0s 视为短促提示音 (duration 单位是秒)
 
         # 音频进度 duration 跟踪 (sid -> duration)
         self._audio_event_available = False
