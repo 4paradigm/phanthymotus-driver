@@ -522,6 +522,7 @@ static void *_psdk_start_thread(void *arg) {
      * payload camera.  The remaining service modules start only after the
      * Liveview status subscription has had exclusive access to the link. */
     _init_modules();
+    camera_mgr_init();  /* must precede hms_init: DjiHmsManager_Init internally depends on DjiCameraManager */
     hms_init();
     s_psdk_state = 1;
     printf("[psdk_bridge] PSDK modules ready\n");
