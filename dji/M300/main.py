@@ -132,7 +132,7 @@ class M300DeviceBundle:
         print("[bundle] All plugins stopped")
 
     def get_all_tools(self) -> list:
-        tools = [self._model_tool()]
+        tools = []
         for p in self._plugins:
             if hasattr(p, "get_tools"):
                 tools.extend(p.get_tools())
@@ -140,26 +140,7 @@ class M300DeviceBundle:
                 tools.append(p.get_tool())
         return tools
 
-    def _model_tool(self) -> dict:
-        return {
-            "name": "model",
-            "type": "resource",
-            "description": "DJI Matrice 300 RTK aircraft metadata (payload, gimbal range, specs)",
-            "inputSchema": {"type": "object", "properties": {}},
-        }
-
     def dispatch(self, tool_name: str, args: dict) -> dict | None:
-        if tool_name == "model":
-            info_path = Path(__file__).parent / "resource" / "m300_info.json"
-            info = json.loads(info_path.read_text())
-            # Merge dynamic aircraft info from bridge
-            try:
-                resp = self._bridge.get_aircraft_info()
-                if resp and resp.get("ok"):
-                    info["aircraft_info"] = resp["data"]
-            except Exception:
-                pass
-            return info
         for p in self._plugins:
             plugin_tools = p.get_tools() if hasattr(p, "get_tools") else [p.get_tool()]
             for tool_def in plugin_tools:
