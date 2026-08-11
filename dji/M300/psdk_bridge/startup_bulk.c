@@ -1,11 +1,4 @@
-/*
- * startup_bulk.c — Initialize USB FunctionFS bulk endpoint.
- *
- * Based on DJI PSDK official sample + community fix for Little Endian.
- * Writes USB descriptors to FFS ep0, making endpoints ready for PSDK.
- *
- * Usage: startup_bulk /dev/usb-ffs/bulk1
- */
+
 
 #include <stdio.h>
 #include <stdlib.h>

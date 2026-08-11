@@ -7,13 +7,7 @@
 #include <time.h>
 #include <sys/time.h>
 
-/*
- * Time Sync for Matrice 300 RTK — uses FC subscription GPS_DATE + GPS_TIME.
- *
- * DjiTimeSync requires hardware PPS which is not available on Jetson Nano
- * E-Port dev board. Instead, we subscribe to GPS date/time topics from FC
- * and use settimeofday() to sync the local clock.
- */
+
 
 #ifdef PSDK_ENABLED
 #include "dji_fc_subscription.h"

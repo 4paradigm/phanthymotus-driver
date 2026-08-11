@@ -1,8 +1,4 @@
 #!/bin/bash
-# setup_usb_bulk.sh — Configure USB gadget for DJI PSDK Bulk mode
-#
-# Modifies existing Jetson l4t gadget in-place (can't create new one).
-# Must run with root/privileged.
 
 set -x
 
@@ -62,10 +58,6 @@ for i in 1 2 3; do
 done
 echo "[usb_bulk] FFS bulk functions created"
 
-# ── Step 6: Initialize endpoints with startup_bulk ───────────────────
-# NOTE: startup_bulk must be launched EXTERNALLY as a long-running daemon.
-# It keeps ep0 open — if it dies, the gadget stops working.
-# The calling process (main.py) handles this.
 echo "[usb_bulk] FFS ready — startup_bulk must be launched externally"
 
 # ── Step 7: Bind UDC ─────────────────────────────────────────────────

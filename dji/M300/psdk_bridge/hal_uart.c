@@ -44,11 +44,7 @@ static speed_t _baud_to_speed(uint32_t baud) {
 /* ── Auto-detect USB VID/PID from sysfs ─────────────────────────────── */
 
 static int _detect_vid_pid(const char *device) {
-    /*
-     * For /dev/ttyACMx, find the USB device in sysfs:
-     *   /sys/class/tty/ttyACM0/device/../idVendor
-     *   /sys/class/tty/ttyACM0/device/../idProduct
-     */
+
     char path[256], buf[16];
     const char *dev_name = strrchr(device, '/');
     if (!dev_name) dev_name = device;

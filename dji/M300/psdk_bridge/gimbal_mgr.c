@@ -2,10 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 
-/*
- * PSDK Gimbal Manager for Matrice 300 RTK.
- * Limits are payload-specific; PSDK is the authoritative limit check.
- */
+
 
 #ifdef PSDK_ENABLED
 #include "dji_gimbal_manager.h"

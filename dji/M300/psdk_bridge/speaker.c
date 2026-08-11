@@ -1,12 +1,7 @@
 #include "speaker.h"
 #include <stdio.h>
 
-/*
- * PSDK Speaker Widget for Matrice 300 RTK.
- *
- * Uses the DJI speaker widget API (喊话器控件).
- * Supports TTS text and audio file playback.
- */
+
 
 #ifdef PSDK_ENABLED
 #include "dji_widget.h"

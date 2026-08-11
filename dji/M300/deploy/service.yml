@@ -1,8 +1,5 @@
 dji-m300:
   image: __IMAGE__
-  # Runtime privileges and device mounts belong in this deployment manifest,
-  # not Dockerfile. Every service deployment therefore exposes both M300
-  # serial links (/dev/ttyTHS0 and /dev/ttyACM0) to the container.
   container_name: dji-m300
   network_mode: host
   ipc: host
@@ -11,9 +8,6 @@ dji-m300:
     - /dev:/dev
     - /opt/phanthy-motus/data:/opt/phanthy-motus/data
     - /run/udev:/run/udev:ro
-    # The M300 carrier board's UART transceiver is enabled through a host
-    # GPIO. Mount the host sysfs at a distinct path so startup never depends
-    # on Docker's namespaced /sys view.
     - /sys:/host-sys:rw
     - /sys/kernel/config:/sys/kernel/config
     - /dev/usb-ffs:/dev/usb-ffs
