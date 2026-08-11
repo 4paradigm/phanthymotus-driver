@@ -386,7 +386,11 @@ class PerceptionPlugin:
             "type": "sensor",
             "multiInstance": True,
             "description": "Matrice 300 RTK 感知避障立体灰度图：前/后(rear)/左/右/上/下，全部已实测可订阅；最多同时2路。",
-            "topic_out": [{"topic": f"/{self._namespace}/perception/{{direction}}", "format": "image/jpeg"}],
+            # The output topic is selected by this card's instance config.
+            # Do not register a template or a front default here: Canvas reads
+            # static topics before config is applied, which otherwise pins the
+            # card (and Smart Control's websocket) to the front camera.
+            "topic_out": [{"format": "image/jpeg", "desc": "perception grayscale stream"}],
             "configSchema": {
                 "type": "object",
                 "properties": {
@@ -444,7 +448,15 @@ class PerceptionPlugin:
             return {"state": "error", "message": f"unsupported perception direction: {direction}"}
         if action == "start":
             result = self._node.start(direction)
-            return {"state": self._node.state, **result}
+            # Start is the point at which Agent Core reapplies the persisted
+            # per-instance config.  Return the resolved physical topic so the
+            # Canvas replaces any stale topic captured before configuration.
+            topic = f"/{self._namespace}/perception/{direction}"
+            return {
+                "state": self._node.state,
+                "topic_out": [{"topic": topic, "format": "image/jpeg"}],
+                **result,
+            }
         if action == "stop":
             self._node.stop(direction)
             return {"state": self._node.state}
