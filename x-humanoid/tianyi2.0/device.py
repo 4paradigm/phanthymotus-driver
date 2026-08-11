@@ -4830,19 +4830,17 @@ class RobotFaultsPlugin:
         return {
             "name": "health_check",
             "type": "actuator",
-            "description": "天轶2.0 全身体检 — 底盘/电机/手部/电源/急停/IMU/自检状态综合诊断。应在以下场景调用：①用户说\"体检\"\"状态\"\"健康\"\"自检怎么样了\"时；②收到多个电机故障(error)或急停(fatal)事件后需汇总伤情时；③长时间无状态更新后确认机器人是否正常时。其他健康/故障类卡片(如auto_brake)无法判断整体态势时应回退到此卡片。支持 summary(人话判定+建议)/detail(完整结构化数据)/reset_self_check(手动解除自检卡死)",
+            "description": "天轶2.0 全身体检 — 底盘/电机/手部/电源/急停/IMU/自检状态综合诊断。应在以下场景调用：①用户说\"体检\"\"状态\"\"健康\"\"自检怎么样了\"时；②收到多个电机故障(error)或急停(fatal)事件后需汇总伤情时；③长时间无状态更新后确认机器人是否正常时。急停激活时建议用户拔掉急停按钮并按遥控器A键自检。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["summary", "detail", "reset_self_check"],
+                    "action": {"type": "string", "enum": ["summary"],
                                "default": "summary",
-                               "description": "summary=可操作判定; detail=完整诊断; reset_self_check=重置自检状态+恢复TTS"},
+                               "description": "summary=返回可操作判定+各子系统一句话概括+建议"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "summary": {"params": [], "description": "返回: 自检状态/急停/各子系统就绪/可否操作及原因"},
-                    "detail": {"params": [], "description": "返回完整结构化诊断: 底盘/电机/手部/电源/IMU/自检详情+issues+advice"},
-                    "reset_self_check": {"params": [], "description": "手动重置自检状态(恢复TTS)，用于自检卡死时恢复"},
+                    "summary": {"params": [], "description": "返回: 自检状态/急停/各子系统就绪/可否操作及原因+建议"},
                 },
             },
         }
@@ -5310,18 +5308,8 @@ class RobotFaultsPlugin:
     def dispatch(self, action: str, args: dict) -> dict:
         if action in ("start", "stop", "info"):
             return {"state": "running" if self._running else "idle"}
-        if action == "reset_self_check":
-            with self._lock:
-                was_stuck = self._self_check_started
-                self._self_check_started = False
-                self._self_check_completed = False
-                self._enable_tts()
-            return {"state": "reset", "was_stuck": was_stuck}
         with self._lock:
             full = self._build_summary_locked()
-        if action == "detail":
-            return full
-        # action == "summary"
         return self._build_operability_summary(full)
 
     def _build_operability_summary(self, full: dict) -> dict:
@@ -5418,6 +5406,8 @@ class RobotFaultsPlugin:
             summary = "状态良好, 可以操作"
 
         # 建议
+        if estop_active:
+            advice_list = ["请拔掉急停按钮，然后按下遥控器A键让机器人自检（自检完成后才能正常操作）"] + (advice_list or [])
         if advice_list:
             summary += "。建议: " + "；".join(advice_list[:2])
 
