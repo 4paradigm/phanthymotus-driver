@@ -50,12 +50,12 @@ class BumiDeviceBundle:
         self._plugins: list = []
         plugins_cfg = cfg.get("plugins", {})
 
-        if plugins_cfg.get("state", {}).get("enabled", False):
+        if plugins_cfg.get("state", {}).get("enabled", False) and high_ctrl is not None:
             from device import StatePlugin
             self._plugins.append(StatePlugin(plugins_cfg["state"], namespace, executor, high_ctrl))
             print("[bundle] StatePlugin loaded")
 
-        if plugins_cfg.get("loco", {}).get("enabled", False):
+        if plugins_cfg.get("loco", {}).get("enabled", False) and high_ctrl is not None:
             from device import LocoPlugin
             self._plugins.append(LocoPlugin(plugins_cfg["loco"], namespace, executor, high_ctrl))
             print("[bundle] LocoPlugin loaded")
@@ -253,35 +253,64 @@ def main():
         from highcontrol_py import HighController
         high_ctrl = HighController.instance()
 
-        # init() may block indefinitely if robot is unreachable — run with timeout
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(high_ctrl.init)
-            future.result(timeout=10)
-        print("[bundle] HighController initialized")
-    except concurrent.futures.TimeoutError:
-        print("[bundle] WARNING: HighController.init() timed out (robot unreachable?)")
-        print("[bundle] MCP server will start without robot connection")
-        high_ctrl = None
+        # init() may block indefinitely if robot is unreachable (GIL held in C++).
+        # Use subprocess probe to check if DDS connection is possible first.
+        import subprocess
+        probe_code = (
+            "import sys; sys.path.insert(0, '/work/noetix_sdk_bumi/build'); "
+            "from highcontrol_py import HighController; "
+            "ctrl = HighController.instance(); ctrl.init(); "
+            "print('OK')"
+        )
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", probe_code],
+                capture_output=True, text=True, timeout=10,
+            )
+            if "OK" in result.stdout:
+                # Probe succeeded, safe to init in main process
+                high_ctrl.init()
+                print("[bundle] HighController initialized")
+            else:
+                print(f"[bundle] WARNING: HighController probe failed: {result.stderr.strip()}")
+                high_ctrl = None
+        except subprocess.TimeoutExpired:
+            print("[bundle] WARNING: HighController.init() timed out (robot unreachable?)")
+            print("[bundle] MCP server will start without robot connection")
+            high_ctrl = None
     except Exception as e:
         print(f"[bundle] WARNING: HighController init failed: {e}")
-        print("[bundle] State/Loco plugins will be unavailable")
         high_ctrl = None
 
-    try:
-        from mediacontrol_py import MediaController
-        media_ctrl = MediaController.instance()
+    if high_ctrl is not None:
+        try:
+            from mediacontrol_py import MediaController
+            media_ctrl = MediaController.instance()
 
-        import concurrent.futures as _cf
-        with _cf.ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(media_ctrl.init)
-            future.result(timeout=10)
-        import time
-        time.sleep(5)  # Wait for data sync per SDK docs
-        print("[bundle] MediaController initialized")
-    except Exception as e:
-        print(f"[bundle] MediaController unavailable: {e}")
-        media_ctrl = None
+            probe_code2 = (
+                "import sys; sys.path.insert(0, '/work/noetix_sdk_bumi/build'); "
+                "from mediacontrol_py import MediaController; "
+                "ctrl = MediaController.instance(); ctrl.init(); "
+                "print('OK')"
+            )
+            result = subprocess.run(
+                [sys.executable, "-c", probe_code2],
+                capture_output=True, text=True, timeout=10,
+            )
+            if "OK" in result.stdout:
+                media_ctrl.init()
+                import time
+                time.sleep(5)  # Wait for data sync per SDK docs
+                print("[bundle] MediaController initialized")
+            else:
+                print(f"[bundle] MediaController probe failed: {result.stderr.strip()}")
+                media_ctrl = None
+        except subprocess.TimeoutExpired:
+            print("[bundle] MediaController timed out")
+            media_ctrl = None
+        except Exception as e:
+            print(f"[bundle] MediaController unavailable: {e}")
+            media_ctrl = None
 
     # ── ROS2 ──
     rclpy.init()
