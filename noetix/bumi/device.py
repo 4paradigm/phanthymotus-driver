@@ -840,8 +840,8 @@ def _camera_subprocess(namespace: str):
                 depth_pub.publish(msg)
 
             frame_count += 1
-            # Log every 100 frames
-            if frame_count % 100 == 0:
+            # Log every 300 frames (~15s at 20fps)
+            if frame_count % 300 == 0:
                 elapsed = _time.monotonic() - t_start
                 fps = frame_count / elapsed
                 print(f"[camera_subprocess] {frame_count} frames, {fps:.1f} fps, last: wait={t_wait*1000:.1f}ms enc={t_enc*1000:.1f}ms", flush=True)
