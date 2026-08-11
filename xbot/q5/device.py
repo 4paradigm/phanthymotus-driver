@@ -152,6 +152,12 @@ def _clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, float(value)))
 
 
+def _clamp_int(value, lower: int, upper: int) -> int:
+    """Clamp an integer value and ensure return type is int (not float)."""
+    result = _clamp(value, float(lower), float(upper))
+    return int(result)
+
+
 def _make_hybrid_command(joint_names: list, positions: list,
                          velocities: list | None = None,
                          kps: list | None = None,
@@ -720,7 +726,7 @@ class JointServoPlugin:
         try:
             # dynamic_launch: app_name (留空), sync_control, launch_mode
             # 本机带 XHand 灵巧手 → launch_mode='pos'；无手机型用 'no_hand_pos'
-            if self._srv_dynamic_launch.is_ready():
+            if self._srv_dynamic_launch.service_is_ready():
                 req = DynamicLaunch.Request()
                 req.app_name = ""
                 req.sync_control = True
@@ -732,7 +738,7 @@ class JointServoPlugin:
             self._node.get_logger().warn(f"dynamic_launch failed: {e}")
 
         try:
-            if self._srv_ready.is_ready():
+            if self._srv_ready.service_is_ready():
                 req = Trigger.Request()
                 future = self._srv_ready.call_async(req)
                 rclpy.spin_until_future_complete(self._node, future, timeout_sec=5.0)
@@ -741,7 +747,7 @@ class JointServoPlugin:
             self._node.get_logger().warn(f"ready_service failed: {e}")
 
         try:
-            if self._srv_activate.is_ready():
+            if self._srv_activate.service_is_ready():
                 req = Trigger.Request()
                 future = self._srv_activate.call_async(req)
                 rclpy.spin_until_future_complete(self._node, future, timeout_sec=5.0)
@@ -762,7 +768,7 @@ class JointServoPlugin:
     def _deactivate(self):
         """Call /deactivate_service for clean shutdown."""
         try:
-            if self._srv_deactivate.is_ready():
+            if self._srv_deactivate.service_is_ready():
                 req = Trigger.Request()
                 future = self._srv_deactivate.call_async(req)
                 rclpy.spin_until_future_complete(self._node, future, timeout_sec=3.0)
@@ -1303,7 +1309,7 @@ class MotionPlugin:
         return None
 
     def _execute(self, args: dict) -> dict:
-        if not self._srv.is_ready():
+        if not self._srv.service_is_ready():
             return {"state": "error", "message": "motion_request service not available"}
 
         priority_map = {"LOW": 0, "MEDIUM": 20, "HIGH": 50, "SYSTEM": 80, "EMERGENCY": 99}
@@ -1382,7 +1388,7 @@ class GesturePlugin:
         return None
 
     def _stop(self):
-        if not self._srv_stop.is_ready():
+        if not self._srv_stop.service_is_ready():
             return
         req = Trigger.Request()
         future = self._srv_stop.call_async(req)
@@ -1392,7 +1398,7 @@ class GesturePlugin:
             pass
 
     def _is_playing(self) -> dict:
-        if not self._srv_is.is_ready():
+        if not self._srv_is.service_is_ready():
             return {"state": "error", "message": "is_play service not available"}
         req = Trigger.Request()
         future = self._srv_is.call_async(req)
@@ -1503,7 +1509,7 @@ class AudioPlugin:
 
     def _set_volume(self, volume: int) -> dict:
         volume = max(0, min(100, volume))
-        if not self._srv_volume.is_ready():
+        if not self._srv_volume.service_is_ready():
             return {"state": "error", "message": "set_volume service not available"}
         req = SetVolume.Request()
         req.volume = volume
@@ -1517,7 +1523,7 @@ class AudioPlugin:
             return {"state": "error", "message": str(e)}
 
     def _stop(self):
-        if not self._srv_stop.is_ready():
+        if not self._srv_stop.service_is_ready():
             return
         req = Trigger.Request()
         future = self._srv_stop.call_async(req)
@@ -1528,7 +1534,7 @@ class AudioPlugin:
 
     def _is_play(self) -> dict:
         """查询当前是否正在播放音频 (audio_player/is_play, Trigger 类型)。"""
-        if not self._srv_is_play.is_ready():
+        if not self._srv_is_play.service_is_ready():
             return {"state": "error", "message": "is_play service not available"}
         req = Trigger.Request()
         future = self._srv_is_play.call_async(req)
@@ -1807,7 +1813,7 @@ class LedPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "set":
-            val = _clamp(int(args.get("value", 0)), 0, 255)
+            val = _clamp_int(args.get("value", 0), 0, 255)
             self._publish(val)
             return {"state": "ok", "value": val}
         if action in ("start", "info"):
@@ -1884,7 +1890,7 @@ class NavPlugin:
         return None
 
     def _start_nav(self, mode: str) -> dict:
-        if not self._srv_start.is_ready():
+        if not self._srv_start.service_is_ready():
             return {"state": "error", "message": "start_nav service not available"}
         req = StringMessage.Request()
         req.data = mode
@@ -1897,7 +1903,7 @@ class NavPlugin:
             return {"state": "error", "message": str(e)}
 
     def _stop_nav(self) -> dict:
-        if not self._srv_stop.is_ready():
+        if not self._srv_stop.service_is_ready():
             return {"state": "error", "message": "stop_nav service not available"}
         req = Trigger.Request()
         future = self._srv_stop.call_async(req)
@@ -1909,7 +1915,7 @@ class NavPlugin:
             return {"state": "error", "message": str(e)}
 
     def _pause_nav(self) -> dict:
-        if not self._srv_pause.is_ready():
+        if not self._srv_pause.service_is_ready():
             return {"state": "error", "message": "pause_nav_ctrl service not available"}
         req = StringMessage.Request()
         req.data = "pause"
@@ -1922,7 +1928,7 @@ class NavPlugin:
             return {"state": "error", "message": str(e)}
 
     def _status(self) -> dict:
-        if not self._srv_is_exec.is_ready():
+        if not self._srv_is_exec.service_is_ready():
             return {"state": "error", "message": "is_nav_executing service not available"}
         req = Trigger.Request()
         future = self._srv_is_exec.call_async(req)
