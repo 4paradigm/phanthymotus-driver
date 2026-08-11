@@ -33,7 +33,9 @@ plugins:
   flight:
     enabled: true
   camera:
-    enabled: true
+    # This M300 currently exposes FPV only. Enable only after a compatible
+    # external payload camera has been installed and validated.
+    enabled: false
   gimbal:
     enabled: true
   waypoint:

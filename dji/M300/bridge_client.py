@@ -536,10 +536,10 @@ class BridgeClient:
         return self._call("hms_eliminate", {"code": error_code})
 
     # Liveview
-    def start_liveview(self, camera: str = "payload1"):
+    def start_liveview(self, camera: str = "fpv"):
         return self._call("start_liveview", {"camera": camera})
 
-    def stop_liveview(self, camera: str = "payload1"):
+    def stop_liveview(self, camera: str = "fpv"):
         return self._call("stop_liveview", {"camera": camera})
 
     # Perception
