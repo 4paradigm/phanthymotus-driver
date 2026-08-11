@@ -11,6 +11,7 @@ Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server t
 | Driver | Hardware | Port | Description |
 |--------|----------|------|-------------|
 | `unitree/g1` | Unitree G1 Humanoid | 15701 | Locomotion, arm control, mic, speaker, LED, state monitoring |
+| `engineai/t800` | EngineAI T800 Development Edition | 15708 | ROS2/Native SDK, full state, dance/gesture sequences, virtual gamepad, locomotion and low-level joint control |
 | `phanthy/remote_control` | Remote Control Bridge | 15710 | Remote control relay |
 
 ## Quick Start
@@ -33,6 +34,7 @@ cp .env.example .env  # Fill in registry credentials
 
 # Build a specific driver
 ./build.sh unitree/g1
+./build.sh engineai/t800
 ```
 
 When run without arguments, `build.sh` shows an interactive multi-select menu to choose which drivers to build. You can also pass driver paths directly for CI usage:
