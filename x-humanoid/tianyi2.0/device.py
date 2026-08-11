@@ -2054,8 +2054,16 @@ class HeadGesturePlugin:
                     "actions": ["scan", "shake"],
                     "timeout": 30,
                 },
+                # Agent Core exposes actuator actions to the LLM through this
+                # split-tool map.  Keep nod/shake explicit: the generic
+                # ``action`` enum alone is not surfaced as a callable choice
+                # by the current runtime and can make the model fall back to
+                # the only cached action (typically tilt).
                 "x-action-params": {
-                    "tilt": {"params": ["side", "tilt_amplitude", "speed", "hold"], "description": "向指定方向歪头、保持后回正"},
+                    "nod": {"params": [], "description": "点头后回正，表示肯定或回答正确"},
+                    "shake": {"params": [], "description": "摇头后回正，表示否定或回答错误"},
+                    "scan": {"params": [], "description": "左右观察后回正"},
+                    "tilt": {"params": [], "description": "向默认方向歪头后回正，仅表示疑惑或部分正确"},
                     "reset": {"params": ["speed"], "description": "取消序列并将头部回正"},
                     "cancel": {"params": [], "description": "取消尚未发送的后续动作帧"},
                 },
@@ -2143,15 +2151,48 @@ class HeadGesturePlugin:
             frames.append((0, 0, roll, amplitude / speed + hold))
         frames.append((0, 0, 0, max(0.15, amplitude / speed)))
 
+        # Verify the first pose while it remains commanded.  Starting the
+        # complete sequence before verification made short gestures racy: a
+        # low-rate /head/status sample could arrive only after the first pose
+        # had already returned to neutral, so a real nod was reported as
+        # head_no_motion.  This was most visible on the first nod of a class.
+        first_yaw, first_pitch, first_roll, first_delay = frames[0]
+        remaining_frames = frames[1:]
+
         def _worker(cancel_event: threading.Event):
-            for yaw, pitch, roll, delay in frames:
+            # Preserve the intended first-pose hold after motion has been
+            # observed, then execute the rest of the gesture normally.
+            if cancel_event.wait(max(0.15, first_delay)):
+                return
+            for yaw, pitch, roll, delay in remaining_frames:
                 if cancel_event.is_set():
                     return
                 result = self._publish_pose(yaw, pitch, roll, speed)
                 if "error" in result or cancel_event.wait(max(0.15, delay)):
                     return
 
+        # Stop any previous semantic head sequence before establishing the
+        # feedback baseline for this command.
+        self._sequence.cancel()
         baseline_seq, baseline = self._feedback_snapshot()
+        first_publish = self._publish_pose(
+            first_yaw, first_pitch, first_roll, speed)
+        if "error" in first_publish:
+            return first_publish
+        feedback = self._wait_for_head_feedback(
+            (first_yaw, first_pitch, first_roll), baseline_seq, baseline)
+        if feedback.get("state") == "error":
+            # Do not leave the head at the first gesture pose after a failed
+            # verification.  The original error remains the caller result.
+            self._publish_pose(0, 0, 0, speed)
+            print(
+                "[HeadGesturePlugin] first-pose feedback failed: "
+                f"action={action} code={feedback.get('code')} "
+                f"error={feedback.get('error')}",
+                flush=True,
+            )
+            return feedback
+
         # ACP: for long actions (scan, shake), return action_id and callback on done
         action_id = None
         on_done = None
@@ -2166,12 +2207,6 @@ class HeadGesturePlugin:
                     _acp_notify(action_id, "completed", {"gesture": action, "cycles": cycles}, "head_gesture")
 
         self._sequence.start(_worker, on_done=on_done)
-        first_target = frames[0][:3]
-        feedback = self._wait_for_head_feedback(
-            first_target, baseline_seq, baseline)
-        if feedback.get("state") == "error":
-            self._sequence.cancel()
-            return feedback
         result = {
             "state": "running", "gesture": action, "cycles": cycles,
             "amplitude": amplitude, "speed": speed,
