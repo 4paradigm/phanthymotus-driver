@@ -2915,21 +2915,15 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                 decision.proposal and decision.proposal.is_terminal
             )
             if terminal_proposal:
-                stopped = do_stop(
+                do_stop(
                     decision.reason,
                     confirm_physical_stop=terminal_proposal,
                 )
-                terminal_stop_clean = bool(
-                    stopped.get("reason") == decision.reason
-                )
-                resumed_waiting = proposal_gate.resume_waiting_after_terminal_stop(
-                    bool(stopped.get("stop_confirmed"))
-                    and terminal_stop_clean
-                )
+                resumed_waiting = proposal_gate.resume_waiting_after_terminal()
                 if resumed_waiting:
-                    # The confirmed terminal stop already completed the
-                    # physical brake.  Do not let its deferred StopMove
-                    # repeats cross the lease boundary into the next task.
+                    # The terminal stop attempt has completed.  Keep its
+                    # deferred StopMove repeats out of the next task even when
+                    # the SDK receipt or odometry confirmation timed out.
                     stop_repeat_count = 0
                 return
             is_proposal_motion = bool(

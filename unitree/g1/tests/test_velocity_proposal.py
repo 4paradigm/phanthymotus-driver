@@ -386,7 +386,7 @@ class ProposalGateTest(unittest.TestCase):
             self.gate.accept(proposal(nav_id="nav-002", sequence=1), now=10.3).execute
         )
 
-    def test_confirmed_terminal_stop_rearms_first_valid_binding_for_next_task(self):
+    def test_terminal_stop_rearms_first_valid_binding_for_next_task(self):
         gate = VelocityProposalGate(ProposalLimits())
         gate.bind(EXPECTED_TOPIC)
         self.assertTrue(gate.accept(proposal(nav_id="nav-001"), now=10.0).execute)
@@ -402,7 +402,7 @@ class ProposalGateTest(unittest.TestCase):
 
         self.assertTrue(terminal.stop)
         self.assertFalse(gate.armed)
-        self.assertTrue(gate.resume_waiting_after_terminal_stop(True))
+        self.assertTrue(gate.resume_waiting_after_terminal())
         self.assertTrue(gate.waiting_for_nav_id)
         self.assertEqual(gate.expected_nav_id, "")
 
@@ -441,12 +441,12 @@ class ProposalGateTest(unittest.TestCase):
         self.assertFalse(terminal.execute)
         self.assertEqual(terminal.reason, "proposal_zero")
         self.assertEqual(gate.last_reason, "nav_task_terminal")
-        self.assertTrue(gate.resume_waiting_after_terminal_stop(True))
+        self.assertTrue(gate.resume_waiting_after_terminal())
         self.assertTrue(
             gate.accept(proposal(nav_id="nav-002", sequence=1), now=10.6).execute
         )
 
-    def test_unconfirmed_terminal_stop_remains_fail_closed(self):
+    def test_terminal_task_releases_without_stop_receipt_lock(self):
         gate = VelocityProposalGate(ProposalLimits())
         gate.bind(EXPECTED_TOPIC)
         self.assertTrue(gate.accept(proposal(), now=10.0).execute)
@@ -459,10 +459,10 @@ class ProposalGateTest(unittest.TestCase):
             now=10.1,
         )
 
-        self.assertFalse(gate.resume_waiting_after_terminal_stop(False))
+        self.assertTrue(gate.resume_waiting_after_terminal())
         self.assertFalse(gate.armed)
-        self.assertFalse(gate.waiting_for_nav_id)
-        self.assertEqual(gate.last_reason, "nav_task_terminal_stop_unconfirmed")
+        self.assertTrue(gate.waiting_for_nav_id)
+        self.assertEqual(gate.last_reason, "waiting_for_nav_id")
 
     def test_late_terminal_confirmation_cannot_rearm_after_unbind(self):
         gate = VelocityProposalGate(ProposalLimits())
@@ -478,7 +478,7 @@ class ProposalGateTest(unittest.TestCase):
         )
         gate.unbind("canvas_stop")
 
-        self.assertFalse(gate.resume_waiting_after_terminal_stop(True))
+        self.assertFalse(gate.resume_waiting_after_terminal())
         self.assertFalse(gate.connected_topic)
         self.assertFalse(gate.waiting_for_nav_id)
         self.assertEqual(gate.last_reason, "canvas_stop")
@@ -493,14 +493,14 @@ class ProposalGateTest(unittest.TestCase):
             ),
             now=10.1,
         )
-        self.assertFalse(self.gate.resume_waiting_after_terminal_stop(True))
+        self.assertFalse(self.gate.resume_waiting_after_terminal())
         self.assertFalse(self.gate.waiting_for_nav_id)
 
         gate = VelocityProposalGate(ProposalLimits())
         gate.bind(EXPECTED_TOPIC)
         self.assertTrue(gate.accept(proposal(), now=20.0).execute)
         gate.disarm("manual_override")
-        self.assertFalse(gate.resume_waiting_after_terminal_stop(True))
+        self.assertFalse(gate.resume_waiting_after_terminal())
         self.assertFalse(gate.waiting_for_nav_id)
         self.assertEqual(gate.last_reason, "manual_override")
 

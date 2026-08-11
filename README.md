@@ -84,17 +84,14 @@ in an unarmed `waiting_for_nav_id` state and atomically binds to the `nav_id` of
 the first fresh, schema-valid, nonzero, nonterminal proposal. Invalid, expired,
 zero, terminal, or retired-nav proposals cannot claim that waiting lease. After
 an automatically bound task reaches a terminal state, the Driver retires its
-`nav_id` and returns to `waiting_for_nav_id` only after `StopMove` and fresh
-odometry confirm zero velocity. Terminal confirmation waits at most five
-seconds and requires three consecutive fresh samples within `0.03 m/s` on both
-planar axes and `0.05 rad/s` on yaw; a single noisy zero sample cannot unlock
-the next task. A schema-valid terminal proposal for the currently bound
+`nav_id`, attempts `StopMove`, records the SDK and odometry diagnostics, and
+immediately returns to `waiting_for_nav_id`. A missing `StopMove` receipt or
+odometry confirmation never latches the Canvas connection or blocks the next
+navigation task. A schema-valid terminal proposal for the currently bound
 `nav_id` is always strict zero, so it may retire the lease even if ROS delivery
 exceeds the motion TTL; an expired nonzero proposal remains a TTL fault and can
-never execute. A concurrent watchdog fault takes precedence over terminal
-completion and blocks that automatic rearm, so its delayed physical stop cannot
-cross into the next lease. Explicit bindings, unconfirmed stops, and manual
-overrides remain disarmed until the control plane starts a new lease.
+never execute. Non-terminal watchdog faults, explicit bindings, and manual
+overrides remain fail-closed until the control plane starts a new lease.
 Every proposal still requires its own `nav_id`; omitting it from `loco start`
 does not disable identity checks.
 

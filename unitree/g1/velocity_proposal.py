@@ -330,13 +330,12 @@ class VelocityProposalGate:
         self.last_reason = reason
         self.recoverable_stop_active = False
 
-    def resume_waiting_after_terminal_stop(self, stop_confirmed: bool) -> bool:
-        """Allow the next automatic task only after measured terminal stop.
+    def resume_waiting_after_terminal(self) -> bool:
+        """Release an automatic terminal task and wait for the next nav id.
 
-        The completed task has already been retired by ``disarm``.  Explicit
-        control-plane leases and every other disarm reason remain fail-closed;
-        in particular, a manual override can never be reclaimed by an incoming
-        proposal without a new lifecycle authorization.
+        Terminal StopMove and odometry results remain diagnostic evidence, but
+        they do not latch the first-valid Canvas connection.  Explicit leases
+        and non-terminal safety disarms still require a new lifecycle bind.
         """
         if (
             not self.connected_topic
@@ -345,9 +344,6 @@ class VelocityProposalGate:
             or self.waiting_for_nav_id
             or self.last_reason != "nav_task_terminal"
         ):
-            return False
-        if not stop_confirmed:
-            self.last_reason = "nav_task_terminal_stop_unconfirmed"
             return False
         self.waiting_for_nav_id = True
         self.expected_nav_id = ""

@@ -490,12 +490,8 @@ class SmartMotionParentLocoSequenceTest(unittest.TestCase):
         )
         self.assertIn("terminal_proposal", callback_source)
         self.assertIn("confirm_physical_stop=terminal_proposal", callback_source)
-        self.assertIn("terminal_stop_clean", callback_source)
-        self.assertIn(
-            'stopped.get("reason") == decision.reason',
-            callback_source,
-        )
-        self.assertIn("resume_waiting_after_terminal_stop", callback_source)
+        self.assertNotIn("terminal_stop_clean", callback_source)
+        self.assertIn("resume_waiting_after_terminal", callback_source)
         self.assertIn("if resumed_waiting:", callback_source)
         self.assertIn("stop_repeat_count = 0", callback_source)
         self.assertIn(
