@@ -117,11 +117,17 @@ class ControlledSpatialMapPlugin:
         self._db = _MapDB(config.get("native_slam_db_path", "/data/controlled_spatial/controlled_spatial.db"))
         self._cache_dir = config.get("cache_dir", "/data/controlled_spatial/map-visuals")
         os.makedirs(self._cache_dir, exist_ok=True)
-        self._head_map_path = config.get(
+        # The former global cloud is intentionally left untouched. It has no
+        # reliable map association, so it must not be silently assigned to a
+        # newly selected 2D map.
+        self._legacy_head_map_path = config.get(
             "head_map_path",
             os.path.join(os.path.dirname(self._cache_dir), "tianyi_head_3d.npz"),
         )
-        os.makedirs(os.path.dirname(self._head_map_path), exist_ok=True)
+        self._head_map_dir = config.get(
+            "head_map_dir", os.path.join(os.path.dirname(self._cache_dir), "head-3d")
+        )
+        os.makedirs(self._head_map_dir, exist_ok=True)
         self._topic = f"/{namespace}/controlled_spatial/map"
         self._poll_hz = max(0.5, float(config.get("poll_hz", 3.0)))
         self._artifact_hz = max(0.1, float(config.get("artifact_hz", 0.4)))
@@ -160,6 +166,7 @@ class ControlledSpatialMapPlugin:
         self._lasers = {}
         self._laser_hits = {}
         self._head_cloud = {}
+        self._head_cloud_map_name = None
         self._head_hits = {}
         self._latest_head_frame = None
         self._last_head_process = 0.0
@@ -172,7 +179,6 @@ class ControlledSpatialMapPlugin:
         self._last_cache = 0.0
         self._last_publish = 0.0
         self._startup_error = None
-        self._load_3d_map()
         if self._head_pointcloud_enabled:
             self._sub_node.create_subscription(
                 PointCloud2, self._head_pointcloud_topic, self._on_head_cloud,
@@ -189,32 +195,15 @@ class ControlledSpatialMapPlugin:
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": [
                     "list_maps", "select_map",
-                    "start_3d_calibration", "capture_3d_calibration",
-                    "set_3d_extrinsic", "save_3d_calibration",
-                    "clear_3d_calibration", "get_3d_calibration",
                     "set_3d_recording", "clear_3d_cloud", "clear_trajectory",
                 ]},
                 "map_name": {"type": "string"},
-                "translation_m": {
-                    "type": "array", "items": {"type": "number"},
-                    "minItems": 3, "maxItems": 3,
-                },
-                "rotation_rpy_rad": {
-                    "type": "array", "items": {"type": "number"},
-                    "minItems": 3, "maxItems": 3,
-                },
                 "enabled": {"type": "boolean"},
             }, "required": ["action"], "x-action-params": {
                 "list_maps": {"params": [], "description": "List saved maps."},
                 "select_map": {"params": ["map_name"], "description": "Select one saved map for display."},
-                "start_3d_calibration": {"params": [], "description": "Clear previous captures and begin 3D calibration."},
-                "capture_3d_calibration": {"params": [], "description": "Capture the newest head point-cloud frame."},
-                "set_3d_extrinsic": {"params": ["translation_m", "rotation_rpy_rad"], "description": "Adjust the candidate head-camera transform."},
-                "save_3d_calibration": {"params": [], "description": "Persist the current calibrated transform."},
-                "clear_3d_calibration": {"params": [], "description": "Discard calibration captures."},
-                "get_3d_calibration": {"params": [], "description": "Read calibration state and transform."},
                 "set_3d_recording": {"params": ["enabled"], "description": "Enable or disable persistent 3D point-cloud recording."},
-                "clear_3d_cloud": {"params": [], "description": "Clear the accumulated head-camera 3D point cloud."},
+                "clear_3d_cloud": {"params": ["map_name"], "description": "Clear the persistent 3D point cloud for one saved map."},
                 "clear_trajectory": {"params": [], "description": "Clear the displayed robot trajectory."},
             }},
             "topic_out": [{"topic": self._topic, "format": "sensor/mapping"}],
@@ -353,7 +342,8 @@ class ControlledSpatialMapPlugin:
             with self._lock:
                 pose = dict(self._pose) if self._pose else None
                 extrinsic = dict(self._head_camera_extrinsic)
-                if pose is None:
+                map_name = self._current_map
+                if pose is None or map_name is None:
                     return
                 self._latest_head_frame = (camera, pose)
                 # 3D capture is independent from the 2D map's mapping state.
@@ -369,6 +359,9 @@ class ControlledSpatialMapPlugin:
                 for point in world
             }
             with self._lock:
+                if self._head_cloud_map_name != map_name:
+                    # A map change replaces the cloud before recording resumes.
+                    return
                 for key, point in frame.items():
                     # Voxel deduplication already removes most depth noise.
                     # Insert the first observation so recording becomes
@@ -404,7 +397,7 @@ class ControlledSpatialMapPlugin:
             "head_pointcloud_topic": self._head_pointcloud_topic,
             "head_camera_extrinsic": extrinsic,
             "head_recording_enabled": self._head_recording_enabled,
-            "head_map_path": self._head_map_path,
+            "head_map_path": self._head_map_path_for(self._head_cloud_map_name),
             "head_cloud_points": len(self._head_cloud),
         }
 
@@ -426,6 +419,7 @@ class ControlledSpatialMapPlugin:
                     return {"error": "cannot select another map while recording"}
                 self._selected = name
                 self._load_saved_map(found)
+            self._db.set_state("active_map", name)
             self._publish(force=True)
             return self._info("selected")
         if action == "start_3d_calibration":
@@ -477,6 +471,8 @@ class ControlledSpatialMapPlugin:
             if not isinstance(args.get("enabled"), bool):
                 return {"error": "enabled must be a boolean"}
             with self._lock:
+                if args["enabled"] and self._current_map is None:
+                    return {"error": "select a map before enabling 3D recording"}
                 self._head_recording_enabled = args["enabled"]
                 if args["enabled"]:
                     self._last_head_process = 0.0
@@ -488,14 +484,30 @@ class ControlledSpatialMapPlugin:
             return self._calibration_info(
                 "recording_enabled" if args["enabled"] else "recording_disabled")
         if action == "clear_3d_cloud":
+            name = args.get("map_name")
+            found = next((m for m in self._db.maps() if m["name"] == name), None)
+            if not found:
+                return {"error": "map_name not found"}
             with self._lock:
-                cleared = len(self._head_cloud)
-                self._head_cloud.clear()
-                self._head_hits.clear()
-                self._latest_head_frame = None
-            self._save_cache(force=True)
+                if self._head_recording_enabled and self._head_cloud_map_name == name:
+                    return {"error": "disable 3D recording before clearing its map"}
+                if self._head_cloud_map_name == name:
+                    cleared = len(self._head_cloud)
+                    self._head_cloud.clear()
+                    self._head_hits.clear()
+                    self._latest_head_frame = None
+                else:
+                    cleared = self._head_cloud_point_count(name)
+                path = self._head_map_path_for(name)
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    return {"error": f"failed to clear 3D cloud: {exc}"}
             self._publish(force=True)
-            return {"cleared_3d_points": cleared, **self._info("3d_cloud_cleared")}
+            return {"map_name": name, "cleared_3d_points": cleared,
+                    **self._info("3d_cloud_cleared")}
         if action == "clear_trajectory":
             with self._lock:
                 cleared = len(self._trajectory)
@@ -585,12 +597,12 @@ class ControlledSpatialMapPlugin:
 
     def _load_saved_map(self, item):
         """Load a map's formal STCM grid, then restore cached overlays only."""
+        self._save_3d_map()
         self._reset_buffers()
         loaded = self._load_stcm_grid(item.get("pcd_path", ""))
         self._loaded_map_signature = self._map_signature(item) if loaded else None
         self._load_cache(item)
-        # Head-camera points are persisted independently of the selected 2D map.
-        self._load_3d_map()
+        self._load_3d_map(item["name"])
 
     @staticmethod
     def _map_signature(item):
@@ -910,45 +922,106 @@ class ControlledSpatialMapPlugin:
         if not force and now - self._last_cache < 5:
             return False
         with self._lock:
-            head_cloud = self._np.asarray(
-                list(self._head_cloud.values()), dtype=self._np.float32
-            ).reshape(-1, 3)
-            self._np.savez_compressed(
-                self._head_map_path,
-                head_cloud=head_cloud,
-                updated_at=self._np.asarray(time.time(), dtype=self._np.float64),
-            )
             # The STCM file owns the base grid.  This cache contains only
             # overlays accumulated by this plugin for the selected map.
             name = self._recording or self._current_map
             if not name:
                 self._last_cache = now
                 return False
+            self._save_3d_map()
             path = self._cache_path(name)
-            self._np.savez_compressed(path, head_cloud=head_cloud,
+            self._np.savez_compressed(path,
                                       trajectory=self._np.asarray(self._trajectory, dtype=self._np.float32),
                                       artifacts=json.dumps(self._artifacts),
                                       source_map_name=self._np.asarray(name))
             self._last_cache = now
             return True
 
-    def _load_3d_map(self):
-        if not os.path.exists(self._head_map_path):
+    def _head_map_path_for(self, name):
+        if not name:
+            return None
+        return os.path.join(self._head_map_dir, f"{self._safe(name)}.npz")
+
+    def _save_3d_map(self):
+        name = self._head_cloud_map_name
+        path = self._head_map_path_for(name)
+        if not path:
+            return False
+        head_cloud = self._np.asarray(
+            list(self._head_cloud.values()), dtype=self._np.float32
+        ).reshape(-1, 3)
+        self._np.savez_compressed(
+            path,
+            head_cloud=head_cloud,
+            source_map_name=self._np.asarray(name),
+            updated_at=self._np.asarray(time.time(), dtype=self._np.float64),
+        )
+        return True
+
+    def _head_cloud_point_count(self, name):
+        path = self._head_map_path_for(name)
+        if not path or not os.path.exists(path):
+            return 0
+        try:
+            with self._np.load(path, allow_pickle=False) as data:
+                points = data["head_cloud"] if "head_cloud" in data.files else ()
+                return len(points)
+        except Exception:
+            return 0
+
+    def _load_3d_map(self, name):
+        self._head_cloud = {}
+        self._head_cloud_map_name = name
+        path = self._head_map_path_for(name)
+        if not path:
+            return
+        if not os.path.exists(path):
+            self._migrate_legacy_map_cloud(name)
             return
         try:
-            data = self._np.load(self._head_map_path, allow_pickle=False)
-            saved_head = data["head_cloud"] if "head_cloud" in data.files else self._np.zeros((0, 3), dtype=self._np.float32)
+            with self._np.load(path, allow_pickle=False) as data:
+                source = str(data["source_map_name"].item()) if "source_map_name" in data.files else name
+                if source != name:
+                    raise ValueError(f"mismatched source map: {source}")
+                saved_head = (data["head_cloud"] if "head_cloud" in data.files
+                              else self._np.zeros((0, 3), dtype=self._np.float32))
             self._head_cloud = {
                 (round(p[0] / self.HEAD_VOXEL), round(p[1] / self.HEAD_VOXEL), round(p[2] / self.HEAD_VOXEL)): tuple(p)
                 for p in saved_head
             }
             print(
-                f"[ControlledSpatialMap] loaded independent 3D map: "
-                f"{self._head_map_path} points={len(self._head_cloud)}",
+                f"[ControlledSpatialMap] loaded 3D map: "
+                f"{path} points={len(self._head_cloud)}",
                 flush=True,
             )
         except Exception as exc:
-            print(f"[ControlledSpatialMap] independent 3D map load failed: {exc}", flush=True)
+            print(f"[ControlledSpatialMap] 3D map load failed: {exc}", flush=True)
+
+    def _migrate_legacy_map_cloud(self, name):
+        """Move only safely attributable per-map cache clouds to the new store."""
+        path = self._cache_path(name)
+        if not os.path.exists(path):
+            return
+        try:
+            with self._np.load(path, allow_pickle=False) as data:
+                source = (str(data["source_map_name"].item())
+                          if "source_map_name" in data.files else None)
+                if source != name or "head_cloud" not in data.files:
+                    return
+                saved_head = data["head_cloud"]
+            self._head_cloud = {
+                (round(p[0] / self.HEAD_VOXEL), round(p[1] / self.HEAD_VOXEL),
+                 round(p[2] / self.HEAD_VOXEL)): tuple(p)
+                for p in saved_head
+            }
+            self._save_3d_map()
+            print(
+                f"[ControlledSpatialMap] migrated legacy 3D map: {name} "
+                f"points={len(self._head_cloud)}",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"[ControlledSpatialMap] legacy 3D migration failed: {exc}", flush=True)
 
     def _load_cache(self, item):
         path = item.get("visual_path") or self._cache_path(item["name"])
@@ -970,11 +1043,6 @@ class ControlledSpatialMapPlugin:
             # Ignore legacy saved scan overlays. They were captured while
             # mapping and are already represented by the STCM occupancy grid.
             self._lasers = {}
-            saved_head = data["head_cloud"] if "head_cloud" in data.files else self._np.zeros((0, 3), dtype=self._np.float32)
-            self._head_cloud = {
-                (round(p[0] / self.HEAD_VOXEL), round(p[1] / self.HEAD_VOXEL), round(p[2] / self.HEAD_VOXEL)): tuple(p)
-                for p in saved_head
-            }
             self._trajectory = deque(
                 (tuple(p) for p in data["trajectory"]),
                 maxlen=self._trajectory_max_points,
