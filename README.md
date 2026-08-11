@@ -97,10 +97,12 @@ TTL budget.
 
 ### G1 Navigation Sensors
 
-The read-only `navigation_sensors` Driver plugin subscribes directly to the
-MID360 raw DDS streams instead of converting the body `/ubuntu/state/imu`
-JSON. It publishes the estimator inputs expected by the Perception FAST-LIVO2
-card:
+The read-only `navigation_sensors` Driver plugin launches an isolated worker
+process which subscribes directly to the MID360 raw DDS streams instead of
+converting the body `/ubuntu/state/imu` JSON. Keeping raw LiDAR conversion and
+IMU forwarding out of the full Driver process prevents the legacy LiDAR,
+camera, and MCP threads from starving the estimator input callbacks. The
+worker publishes the inputs expected by the Perception FAST-LIVO2 card:
 
 - `/ubuntu/navigation/lidar_fast_livo` — `sensor_msgs/msg/PointCloud2`,
   RELIABLE + KEEP_LAST(2), with `x/y/z/intensity/tag/line/timestamp` fields;
@@ -117,7 +119,9 @@ enabled for Canvas and safety consumers.
 
 FAST-LIVO2 must connect to the two native topics above. The body IMU JSON is
 approximately 20 Hz, has no source timestamp, and is not a valid substitute
-for the MID360 built-in IMU.
+for the MID360 built-in IMU. Before accepting a map, verify the isolated worker
+delivers approximately 10 Hz LiDAR and 200 Hz IMU; materially lower rates or
+repeated source-stamp gaps invalidate the mapping run.
 
 ## Writing a New Driver
 

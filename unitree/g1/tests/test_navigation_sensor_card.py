@@ -2,8 +2,11 @@ import ast
 import importlib
 from pathlib import Path
 import sys
+import threading
+import time
 import types
 import unittest
+from unittest import mock
 
 
 G1_DIR = Path(__file__).resolve().parents[1]
@@ -73,6 +76,7 @@ class NavigationSensorCardContractTest(unittest.TestCase):
         source = (G1_DIR / "main.py").read_text()
         self.assertIn('plugins_cfg.get("navigation_sensors"', source)
         self.assertIn("NavigationSensorPlugin", source)
+        self.assertIn("network_iface,", source)
         ast.parse(source)
 
     def test_default_config_uses_mid360_raw_dds_and_native_ros_topics(self):
@@ -103,6 +107,8 @@ class NavigationSensorCardContractTest(unittest.TestCase):
             'blockers.append("clock_not_ready")',
             'blockers.append("cloud_stale")',
             'blockers.append("imu_stale")',
+            'blockers.append("worker_not_running")',
+            'subprocess.Popen(',
         ):
             self.assertIn(expected, source)
         self.assertNotIn('"sensor/pointcloud2"', source)
@@ -111,14 +117,14 @@ class NavigationSensorCardContractTest(unittest.TestCase):
     def test_runtime_tool_descriptors_match_fast_livo2_inputs(self):
         module = self.load_bridge_module()
         plugin = module.NavigationSensorPlugin.__new__(module.NavigationSensorPlugin)
-        plugin._node = types.SimpleNamespace(
+        plugin._status_node = types.SimpleNamespace(
             _publish_fast_livo_cloud=True,
             _publish_raw_cloud=False,
             fast_livo_cloud_topic="/ubuntu/navigation/lidar_fast_livo",
             cloud_topic="/ubuntu/navigation/lidar",
             imu_topic="/ubuntu/navigation/imu",
             diagnostics_topic="/ubuntu/navigation/sensor_diagnostics",
-            status=lambda: {
+            status=lambda worker_running: {
                 "ready": False,
                 "blockers": ["clock_not_ready"],
                 "receive_age_ms": {"cloud": None, "imu": None},
@@ -126,6 +132,7 @@ class NavigationSensorCardContractTest(unittest.TestCase):
                 "counters": {},
             },
         )
+        plugin._proc = types.SimpleNamespace(poll=lambda: None, pid=1234)
 
         tools = {tool["name"]: tool for tool in plugin.get_tools()}
         lidar = tools["navigation_lidar_fast_livo"]["topic_out"][0]
@@ -147,10 +154,62 @@ class NavigationSensorCardContractTest(unittest.TestCase):
         dockerfile = (G1_DIR / "Dockerfile").read_text()
         for filename in (
             "navigation_sensor_bridge.py",
+            "navigation_sensor_bridge_main.py",
             "navigation_pointcloud.py",
             "navigation_time.py",
         ):
             self.assertIn(f"COPY {filename} /work/{filename}", dockerfile)
+
+    def test_worker_entry_owns_the_heavy_sensor_node(self):
+        source = (G1_DIR / "navigation_sensor_bridge_main.py").read_text()
+        self.assertIn("_NavigationSensorNode(plugin_config, namespace)", source)
+        self.assertIn("ChannelFactoryInitialize(0, network_interface)", source)
+        self.assertNotIn("NavigationSensorPlugin(", source)
+        ast.parse(source)
+
+    def test_plugin_starts_and_stops_one_isolated_worker(self):
+        module = self.load_bridge_module()
+        plugin = module.NavigationSensorPlugin.__new__(module.NavigationSensorPlugin)
+        plugin._namespace = "ubuntu"
+        plugin._network_iface = "eth0"
+        plugin._worker_path = G1_DIR / "navigation_sensor_bridge_main.py"
+        plugin._proc = None
+        plugin._executor = mock.Mock()
+        plugin._status_node = mock.Mock()
+        proc = mock.Mock(pid=4321)
+        proc.poll.return_value = None
+
+        with mock.patch.object(module.subprocess, "Popen", return_value=proc) as popen:
+            plugin.start()
+            plugin.start()
+
+        popen.assert_called_once()
+        self.assertEqual(
+            popen.call_args.args[0],
+            [sys.executable, str(plugin._worker_path), "eth0"],
+        )
+        plugin.stop()
+        proc.terminate.assert_called_once_with()
+        proc.wait.assert_called_once_with(timeout=5.0)
+        plugin._executor.remove_node.assert_called_once_with(plugin._status_node)
+        plugin._status_node.destroy_node.assert_called_once_with()
+
+    def test_status_monitor_fails_closed_for_dead_or_stale_worker(self):
+        module = self.load_bridge_module()
+        node = module._NavigationSensorStatusNode.__new__(
+            module._NavigationSensorStatusNode
+        )
+        node._lock = threading.RLock()
+        node._last_diagnostics = {"ready": True, "blockers": []}
+        node._last_diagnostics_monotonic = time.monotonic() - 3.0
+
+        stale = node.status(worker_running=True)
+        self.assertFalse(stale["ready"])
+        self.assertIn("diagnostics_stale", stale["blockers"])
+
+        dead = node.status(worker_running=False)
+        self.assertFalse(dead["ready"])
+        self.assertIn("worker_not_running", dead["blockers"])
 
 
 if __name__ == "__main__":
