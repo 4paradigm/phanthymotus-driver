@@ -12,14 +12,14 @@ ARG PYPI_MIRROR=https://pypi.org/simple/
 FROM ${PSDK_BASE_IMAGE}
 ARG PYPI_MIRROR
 
-# M300 is pinned to PSDK 3.11.0.  The minimal vendor package contains only
-# psdk_lib headers and prebuilt libraries (no samples or media), so a new
-# machine can build this image without a pre-existing PSDK helper image.
-COPY third_party/psdk_lib-3.11.0.tar.gz /tmp/
-RUN echo "4972b8833069cadb26103a54212f8b4dfc44125882dca3151eca77ed14deb880  /tmp/psdk_lib-3.11.0.tar.gz" | sha256sum -c - && \
+# M300 is pinned to the PSDK 3.8 library bundled with the ONX M300 demo that
+# has been verified on the target Jetson.  Later PSDK builds reach a liveview
+# status-subscription timeout on this M300 E-Port topology.
+COPY third_party/psdk_lib-3.8.0-m300.tar.gz /tmp/
+RUN echo "5cd52fc65b05baa1826a16d138136eec68a456aea3b0cf4ade78cc3e54f089bd  /tmp/psdk_lib-3.8.0-m300.tar.gz" | sha256sum -c - && \
     rm -rf /opt/Payload-SDK && mkdir -p /opt/Payload-SDK && \
-    tar -xzf /tmp/psdk_lib-3.11.0.tar.gz -C /opt/Payload-SDK && \
-    rm -f /tmp/psdk_lib-3.11.0.tar.gz
+    tar -xzf /tmp/psdk_lib-3.8.0-m300.tar.gz -C /opt/Payload-SDK --strip-components=1 && \
+    rm -f /tmp/psdk_lib-3.8.0-m300.tar.gz
 
 WORKDIR /work
 
