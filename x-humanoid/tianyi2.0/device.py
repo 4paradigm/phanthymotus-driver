@@ -4932,7 +4932,7 @@ class RobotFaultsPlugin:
             from bodyctrl_msgs.msg import LightCtrl
             self._sub_node.create_subscription(
                 LightCtrl, self._light_ctrl_topic,
-                self._on_light_ctrl, _LOW_LAT_QOS)
+                self._on_light_ctrl, _RELIABLE_QOS)
             print("[RobotFaultsPlugin] light ctrl subscription created")
             self._light_ctrl_subscribed = True
         except ImportError:
