@@ -95,6 +95,30 @@ last confirmed proposal stop. It also reports `binding_mode`,
 `last_set_velocity_duration_ms` value is measured RPC time, not the proposal
 TTL budget.
 
+### G1 Navigation Sensors
+
+The read-only `navigation_sensors` Driver plugin subscribes directly to the
+MID360 raw DDS streams instead of converting the body `/ubuntu/state/imu`
+JSON. It publishes the estimator inputs expected by the Perception FAST-LIVO2
+card:
+
+- `/ubuntu/navigation/lidar_fast_livo` — `sensor_msgs/msg/PointCloud2`,
+  RELIABLE + KEEP_LAST(2), with `x/y/z/intensity/tag/line/timestamp` fields;
+- `/ubuntu/navigation/imu` — `sensor_msgs/msg/Imu`, RELIABLE + KEEP_LAST(200);
+- `/ubuntu/navigation/sensor_diagnostics` — clock warm-up/reset and drop
+  counters as `std_msgs/msg/String` JSON.
+
+LiDAR and IMU retain their shared MID360 source clock and are normalized into
+one ROS system-time domain. Samples are dropped while clock offset estimation
+is not ready or after an invalid/reset observation; the Driver never invents a
+source timestamp. The fixed upside-down mounting rotation is applied equally
+to cloud and IMU. The existing `/ubuntu/lidar/cloud` legacy card remains
+enabled for Canvas and safety consumers.
+
+FAST-LIVO2 must connect to the two native topics above. The body IMU JSON is
+approximately 20 Hz, has no source timestamp, and is not a valid substitute
+for the MID360 built-in IMU.
+
 ## Writing a New Driver
 
 Want to add support for new hardware? See the **[Driver Development Guide](README_dev.md)** for the full specification, including:
