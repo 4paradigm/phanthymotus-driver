@@ -421,6 +421,31 @@ class ProposalGateTest(unittest.TestCase):
         self.assertTrue(next_task.execute)
         self.assertEqual(gate.expected_nav_id, "nav-002")
 
+    def test_expired_terminal_zero_can_close_current_first_valid_task(self):
+        gate = VelocityProposalGate(ProposalLimits())
+        gate.bind(EXPECTED_TOPIC)
+        self.assertTrue(gate.accept(proposal(nav_id="nav-001"), now=10.0).execute)
+
+        terminal = gate.accept(
+            proposal(
+                nav_id="nav-001",
+                sequence=2,
+                nav_status="stopped",
+                velocity={"x": 0.0, "y": 0.0, "yaw": 0.0},
+            ),
+            now=10.5,
+            now_unix_ms=1_800_000_000_500,
+        )
+
+        self.assertTrue(terminal.stop)
+        self.assertFalse(terminal.execute)
+        self.assertEqual(terminal.reason, "proposal_zero")
+        self.assertEqual(gate.last_reason, "nav_task_terminal")
+        self.assertTrue(gate.resume_waiting_after_terminal_stop(True))
+        self.assertTrue(
+            gate.accept(proposal(nav_id="nav-002", sequence=1), now=10.6).execute
+        )
+
     def test_unconfirmed_terminal_stop_remains_fail_closed(self):
         gate = VelocityProposalGate(ProposalLimits())
         gate.bind(EXPECTED_TOPIC)

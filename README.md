@@ -85,7 +85,10 @@ the first fresh, schema-valid, nonzero, nonterminal proposal. Invalid, expired,
 zero, terminal, or retired-nav proposals cannot claim that waiting lease. After
 an automatically bound task reaches a terminal state, the Driver retires its
 `nav_id` and returns to `waiting_for_nav_id` only after `StopMove` and fresh
-odometry confirm zero velocity. A concurrent watchdog fault takes precedence
+odometry confirm zero velocity. A schema-valid terminal proposal for the
+currently bound `nav_id` is always strict zero, so it may retire the lease even
+if ROS delivery exceeds the motion TTL; an expired nonzero proposal remains a
+TTL fault and can never execute. A concurrent watchdog fault takes precedence
 over terminal completion and blocks that automatic rearm, so its delayed
 physical stop cannot cross into the next lease. Explicit bindings, unconfirmed
 stops, and manual overrides remain disarmed until the control plane starts a

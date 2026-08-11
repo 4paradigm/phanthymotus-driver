@@ -507,6 +507,23 @@ class VelocityProposalGate:
             self.disarm("sequence_not_increasing")
             return ProposalDecision(stop=True, reason="sequence_not_increasing", proposal=proposal)
 
+        if proposal.is_terminal:
+            # A terminal proposal is schema-validated to carry exact zero
+            # velocity.  For the currently bound nav_id, accepting it after
+            # its motion TTL has elapsed can only stop and retire the lease;
+            # it can never authorize stale motion.  This keeps consecutive
+            # first-valid tasks recoverable when a loaded ROS executor delays
+            # the one-shot terminal sample beyond the 250 ms motion budget.
+            self.last_sequence = proposal.sequence
+            self.last_receive_monotonic = now
+            self.deadline_monotonic = 0.0
+            self.disarm("nav_task_terminal")
+            return ProposalDecision(
+                stop=True,
+                reason="proposal_zero",
+                proposal=proposal,
+            )
+
         if duration <= 0.0:
             if now_unix_ms is not None:
                 if self.recoverable_stop_active:
@@ -531,10 +548,7 @@ class VelocityProposalGate:
         self.last_receive_monotonic = now
         if proposal.is_zero:
             self.deadline_monotonic = 0.0
-            if proposal.is_terminal:
-                self.disarm("nav_task_terminal")
-            else:
-                self.last_reason = proposal.status
+            self.last_reason = proposal.status
             return ProposalDecision(stop=True, reason="proposal_zero", proposal=proposal)
 
         self.deadline_monotonic = now + duration
