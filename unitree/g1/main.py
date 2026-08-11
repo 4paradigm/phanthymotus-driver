@@ -115,6 +115,13 @@ class G1DeviceBundle:
             self._plugins.append(RealSensePlugin(plugins_cfg["camera"], namespace, executor))
             print("[bundle] RealSensePlugin loaded")
 
+        if plugins_cfg.get("camera_frame_buffer", {}).get("enabled", False):
+            from device import CameraFrameBufferPlugin
+            self._plugins.append(CameraFrameBufferPlugin(
+                plugins_cfg["camera_frame_buffer"], namespace, executor
+            ))
+            print("[bundle] CameraFrameBufferPlugin loaded")
+
         if plugins_cfg.get("lidar", {}).get("enabled", False):
             from device import LidarPlugin
             self._plugins.append(LidarPlugin(plugins_cfg["lidar"], namespace, executor))

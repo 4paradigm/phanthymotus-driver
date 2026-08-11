@@ -18,6 +18,10 @@ plugins:
     enabled: true
   camera:
     enabled: true
+  camera_frame_buffer:
+    enabled: true
+    max_frames: 90
+    storage_dir: /opt/phanthy-motus/data/camera_frames
   lidar:
     enabled: true
   slam:
