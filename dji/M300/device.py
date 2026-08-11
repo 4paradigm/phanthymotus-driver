@@ -55,9 +55,6 @@ class _TelemetryNode(Node):
         self._timer = None
         self._rate = publish_rate
         self.state = "idle"
-        self.last_sample = None
-        self.last_sample_ts = None
-        self.last_error = None
 
     def start(self):
         if self.state == "running":
@@ -76,16 +73,10 @@ class _TelemetryNode(Node):
         try:
             resp = self._bridge.get_telemetry()
             if resp.get("ok"):
-                self.last_sample = resp["data"]
-                self.last_sample_ts = time.time()
-                self.last_error = None
                 msg = String()
                 msg.data = json.dumps(resp["data"], separators=(",", ":"))
                 self._pub.publish(msg)
-            else:
-                self.last_error = resp.get("error", "telemetry unavailable")
         except Exception as e:
-            self.last_error = str(e)
             self.get_logger().error(f"Telemetry tick error: {e}")
 
 
@@ -139,9 +130,6 @@ class TelemetryPlugin:
                 "state": self._node.state,
                 "auto_start": self._auto_start,
                 "topic_out": [{"topic": self._topic, "format": "data/json"}],
-                "last_sample": self._node.last_sample,
-                "last_sample_ts": self._node.last_sample_ts,
-                "last_error": self._node.last_error,
             }
         return None
 
@@ -1288,8 +1276,8 @@ class WaypointPlugin:
 # ═══════════════════════════════════════════════════════════════════════════
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  AircraftInfoPlugin (resource)
-#  PSDK: 机型信息
+#  TimeSyncPlugin (resource)
+#  PSDK: 机型信息 + 时间同步
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TimeSyncPlugin:
@@ -1302,18 +1290,19 @@ class TimeSyncPlugin:
         return {
             "name": "aircraft_info",
             "type": "resource",
-            "description": "飞机信息查询：机型、固件版本、挂载位置、连接状态。",
+            "description": "飞机信息查询：机型、固件版本、连接状态、GPS 对时。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["get_info"],
+                        "enum": ["get_info", "sync_time"],
                     },
                 },
                 "required": ["action"],
                 "x-action-params": {
                     "get_info": {"params": [], "description": "获取机型/固件/连接状态"},
+                    "sync_time": {"params": [], "description": "从飞机 GPS 对时，返回 UTC 时间"},
                 },
             },
         }
@@ -1329,5 +1318,8 @@ class TimeSyncPlugin:
             return {"state": "ready"}
         if action == "get_info":
             resp = self._bridge.get_aircraft_info()
+            return {"ret": 0 if resp.get("ok") else -1, "data": resp.get("data", {})}
+        if action == "sync_time":
+            resp = self._bridge.sync_clock()
             return {"ret": 0 if resp.get("ok") else -1, "data": resp.get("data", {})}
         return None
