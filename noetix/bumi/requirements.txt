@@ -1,0 +1,5 @@
+pyyaml
+netifaces
+numpy
+opencv-python-headless
+pyrealsense2
