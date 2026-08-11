@@ -41,8 +41,10 @@ RUN apt-get update && \
         ros-humble-action-msgs && \
     rm -rf /var/lib/apt/lists/*
 
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    pyyaml pyaudio sherpa-onnx
+RUN pip3 install --no-cache-dir --timeout=300 --retries=5 -i ${PYPI_MIRROR} \
+    pyaudio && \
+    pip3 install --no-cache-dir --timeout=300 --retries=5 -i ${PYPI_MIRROR} \
+    sherpa-onnx || echo "[WARN] sherpa-onnx install failed — SpeakerPlugin will not work"
 
 # 本地 vendor 的 ROS2 消息包：xbot_common_interfaces + era_nav_msgs
 COPY vendor/xbot_common_interfaces /q5_ws/src/xbot_common_interfaces
