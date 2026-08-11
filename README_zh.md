@@ -69,6 +69,10 @@ proposal TTL 失效会立即触发 `StopMove`；只有在返回后用新的 odom
 样本确认零速，同一导航 lease 才能保留并接受下一条新鲜 proposal。安全、
 身份、序列、RPC 和停车确认类硬故障仍会解除武装。
 
+安全点云使用 `BEST_EFFORT + KEEP_LAST(1)`，并在与 proposal 接收分离的
+ROS executor worker 上处理。有界 `StopMove` 或 proposal RPC 不会再阻塞
+LiDAR freshness；点云缺失或无效时仍按原 500 ms 门槛 fail closed。
+
 `loco info` 会返回 proposal 计数、合并数、实测 RPC/队列时延、滚动
 RPC p50/p95/p99/max、逐原因拒绝统计及最近一次已确认停车。
 `last_set_velocity_duration_ms` 表示实测 RPC 耗时，不是 proposal TTL 余量。

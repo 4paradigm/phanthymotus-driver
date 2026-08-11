@@ -1348,7 +1348,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
     import rclpy
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-    from rclpy.executors import SingleThreadedExecutor
+    from rclpy.executors import MultiThreadedExecutor
     from std_msgs.msg import String, UInt8MultiArray
 
     from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscriber
@@ -1365,6 +1365,12 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
         reliability=ReliabilityPolicy.RELIABLE,
         history=HistoryPolicy.KEEP_LAST,
         depth=10,
+        durability=DurabilityPolicy.VOLATILE,
+    )
+    _CLOUD_QOS = QoSProfile(
+        reliability=ReliabilityPolicy.BEST_EFFORT,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=1,
         durability=DurabilityPolicy.VOLATILE,
     )
 
@@ -1422,7 +1428,10 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
 
     # ── Initialize ROS2 ──
     rclpy.init()
-    executor = SingleThreadedExecutor()
+    # LiDAR freshness and proposal intake live on separate nodes.  Two executor
+    # workers prevent a fail-closed StopMove in the proposal callback from
+    # starving the 10 Hz cloud callback and recursively creating scan_stale.
+    executor = MultiThreadedExecutor(num_threads=2)
 
     class _EventNode(Node):
         def __init__(self):
@@ -1969,7 +1978,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
 
     try:
         event_node.create_subscription(
-            UInt8MultiArray, f"/{namespace}/lidar/cloud", on_cloud, _QOS)
+            UInt8MultiArray, f"/{namespace}/lidar/cloud", on_cloud, _CLOUD_QOS)
         print(f"[SmartMotion:pid={os.getpid()}] LiDAR subscribed (ROS2 /{namespace}/lidar/cloud)")
     except Exception as e:
         print(f"[SmartMotion:pid={os.getpid()}] WARNING: LiDAR subscribe failed: {e}")

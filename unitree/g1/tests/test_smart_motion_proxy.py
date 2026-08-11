@@ -473,6 +473,13 @@ class SmartMotionParentLocoSequenceTest(unittest.TestCase):
         self.assertIn("last_proposal_stop_result = None", source)
         self.assertIn("parent_loco_rpc_lock", source)
         self.assertIn("proposal_ros_spin_loop", source)
+        self.assertIn("MultiThreadedExecutor(num_threads=2)", source)
+        self.assertIn("depth=1", source)
+        self.assertIn(
+            'f"/{namespace}/lidar/cloud", on_cloud, _CLOUD_QOS',
+            source,
+        )
+        self.assertNotIn("SingleThreadedExecutor", source)
         callback_source = source[
             source.index("def on_velocity_proposal"):
             source.index("def apply_safety_velocity")

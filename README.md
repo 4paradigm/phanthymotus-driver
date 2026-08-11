@@ -73,6 +73,11 @@ The Driver proposal envelope matches the `loco` motion contract: `x` and `y`
 accept `[-1, 1]` m/s, and yaw accepts `[-2, 2]` rad/s. Deploy-time
 configuration may tighten these bounds but cannot loosen them.
 
+The safety cloud uses best-effort `KEEP_LAST(1)` delivery and a ROS executor
+worker independent from proposal intake. A bounded `StopMove` or proposal RPC
+therefore cannot starve LiDAR freshness, while missing or invalid clouds still
+fail closed under the unchanged scan timeout.
+
 `loco start` supports two binding modes. Supplying `expected_nav_id` keeps the
 strict control-plane binding behavior. If it is omitted, the Driver subscribes
 in an unarmed `waiting_for_nav_id` state and atomically binds to the `nav_id` of
