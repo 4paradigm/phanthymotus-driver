@@ -1014,7 +1014,12 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
             default: break;
         }
 
-        if (version_rc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+        bool version_known = version_rc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS &&
+                             (version.majorVersion != 0 ||
+                              version.minorVersion != 0 ||
+                              version.modifyVersion != 0 ||
+                              version.debugVersion != 0);
+        if (version_known) {
             snprintf(result, result_size,
                 "{\"ok\":true,\"data\":{\"aircraft_type\":\"%s\","
                 "\"aircraft_series\":\"%s\","
