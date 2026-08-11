@@ -10,7 +10,8 @@ psdk_bridge:
   app_license: "Y4wiW8E6tI2TmZoEkAt7jUM0Oqu3gJM1fNBoXKJO/fzlvYhPMUpxTP9qIB0w5KPrJ5XUkL8ImoxiVesgjEJ5FMe43KqbL8YrUQCK8i8xWVmEMQh0+ADPpfmBi7IAm43PzlJezFYSw6CfO1TjLuRNqLFs3y+LnAh95x5g7DCIaKGUSzPBjORgqRL/wbYngLBOedJtTOIq9T0zB1M922ffvubT2RoRCjhFWb9T6l3V3C2W15JlQ0hRCADyvvHhA2qI7ITq8YXTHktc8yAiRtTVC4+IOqQppkJfxvpE+n810/4vt1xfXKLtIuZxaUcMZY/Q3oEvbV4ZL2AKpiuFRwoz5g=="
   # Match the official M300 Jetson demo: the carrier-board UART is the PSDK
   # control link, while the M300 USB CDC endpoint is the secondary UART.
-  # The camera stream itself is carried over DJI USB Bulk interfaces 7/8.
+  # The camera stream is carried over the DJI USB Bulk channel selected by
+  # PSDK for this aircraft; do not hard-code an interface/endpoint pair.
   uart0_dev: "/dev/ttyTHS0"
   uart0_baud_rate: 460800
   uart1_dev: "/dev/ttyACM0"
