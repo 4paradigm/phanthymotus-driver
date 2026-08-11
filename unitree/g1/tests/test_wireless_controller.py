@@ -170,7 +170,8 @@ class WirelessControllerPluginTests(unittest.TestCase):
             [{"topic": "/test_g1/state/wireless_controller", "format": "data/json"}],
             tool["topic_out"],
         )
-        self.assertEqual(["snapshot", "info"], tool["inputSchema"]["properties"]["action"]["enum"])
+        self.assertEqual(["read", "info"], tool["inputSchema"]["properties"]["action"]["enum"])
+        self.assertIn("read-only", tool["description"])
 
     def test_subscribes_to_unitree_lowstate_dds(self):
         self.assertEqual(1, len(FakeChannelSubscriber.instances))
@@ -179,7 +180,7 @@ class WirelessControllerPluginTests(unittest.TestCase):
         self.assertIs(sub.message_type, LowState)
         self.assertEqual(10, sub.queue_len)
 
-    def test_publishes_json_and_returns_snapshot(self):
+    def test_publishes_json_and_returns_current_input_state(self):
         remote = [0] * 40
         remote[2] = 1
         remote[3] = 2
@@ -192,7 +193,7 @@ class WirelessControllerPluginTests(unittest.TestCase):
 
         node = self.executor.nodes[0]
         self.assertEqual([], node.publishers[0].messages)
-        self.plugin._node._publish_snapshot()
+        self.plugin._node._publish_state()
         published = json.loads(node.publishers[0].messages[-1].data)
         self.assertEqual("running", published["state"])
         self.assertTrue(published["connected"])
@@ -200,33 +201,41 @@ class WirelessControllerPluginTests(unittest.TestCase):
         self.assertEqual(1, published["sample_count"])
         self.assertEqual("rt/lowstate", published["source_topic"])
         self.assertEqual(0, published["last_update_ago_ms"])
-        self.assertAlmostEqual(0.1, published["lx"])
-        self.assertAlmostEqual(-0.2, published["ly"])
-        self.assertAlmostEqual(0.3, published["rx"])
-        self.assertAlmostEqual(-0.4, published["ry"])
-        self.assertEqual(513, published["keys"])
+        self.assertAlmostEqual(0.1, published["left_stick"]["x"])
+        self.assertAlmostEqual(-0.2, published["left_stick"]["y"])
+        self.assertTrue(published["left_stick"]["active"])
+        self.assertEqual("y", published["left_stick"]["primary_axis"])
+        self.assertEqual("negative", published["left_stick"]["direction"])
+        self.assertAlmostEqual(0.3, published["right_stick"]["x"])
+        self.assertAlmostEqual(-0.4, published["right_stick"]["y"])
+        self.assertTrue(published["right_stick"]["active"])
+        self.assertEqual(513, published["buttons"]["raw"])
+        self.assertTrue(published["buttons"]["active"])
 
-        snapshot = self.plugin.dispatch("wireless_controller", {})
-        self.assertEqual("running", snapshot["state"])
-        self.assertTrue(snapshot["connected"])
-        self.assertAlmostEqual(0.1, snapshot["lx"])
-        self.assertAlmostEqual(-0.2, snapshot["ly"])
-        self.assertAlmostEqual(0.3, snapshot["rx"])
-        self.assertAlmostEqual(-0.4, snapshot["ry"])
-        self.assertEqual(513, snapshot["keys"])
-        self.assertEqual(1, snapshot["sample_count"])
-        self.assertGreaterEqual(snapshot["last_update_ago_ms"], 0)
+        state = self.plugin.dispatch("wireless_controller", {})
+        self.assertEqual("running", state["state"])
+        self.assertTrue(state["connected"])
+        self.assertAlmostEqual(0.1, state["left_stick"]["x"])
+        self.assertAlmostEqual(-0.2, state["left_stick"]["y"])
+        self.assertAlmostEqual(0.3, state["right_stick"]["x"])
+        self.assertAlmostEqual(-0.4, state["right_stick"]["y"])
+        self.assertEqual(513, state["buttons"]["raw"])
+        self.assertEqual(1, state["sample_count"])
+        self.assertGreaterEqual(state["last_update_ago_ms"], 0)
 
-    def test_no_data_snapshot_is_explicit(self):
-        snapshot = self.plugin.dispatch("snapshot", {})
-        self.assertEqual("no_data", snapshot["state"])
-        self.assertFalse(snapshot["connected"])
-        self.assertEqual("no_data", snapshot["reason"])
-        self.assertEqual(0, snapshot["sample_count"])
-        self.assertEqual(-1, snapshot["last_update_ago_ms"])
+        read_state = self.plugin.dispatch("read", {})
+        self.assertEqual(state["buttons"], read_state["buttons"])
+
+    def test_no_data_state_is_explicit(self):
+        state = self.plugin.dispatch("read", {})
+        self.assertEqual("no_data", state["state"])
+        self.assertFalse(state["connected"])
+        self.assertEqual("no_data", state["reason"])
+        self.assertEqual(0, state["sample_count"])
+        self.assertEqual(-1, state["last_update_ago_ms"])
         self.assertEqual(
             [{"topic": "/test_g1/state/wireless_controller", "format": "data/json"}],
-            snapshot["topic_out"],
+            state["topic_out"],
         )
 
     def test_info_reports_source_and_freshness_without_axes(self):
@@ -241,12 +250,13 @@ class WirelessControllerPluginTests(unittest.TestCase):
             info["topic_out"],
         )
         self.assertEqual(1.0, info["fresh_timeout_sec"])
+        self.assertEqual(0.1, info["deadzone"])
         self.assertTrue(info["connected"])
         self.assertEqual(1, info["sample_count"])
-        self.assertNotIn("lx", info)
-        self.assertNotIn("keys", info)
+        self.assertNotIn("left_stick", info)
+        self.assertNotIn("buttons", info)
 
-    def test_stale_snapshot_is_published_by_timer(self):
+    def test_stale_state_is_published_by_timer(self):
         node = self.executor.nodes[0]
         stale_now = 102.0
         msg = types.SimpleNamespace(wireless_remote=[0] * 40)
@@ -254,14 +264,14 @@ class WirelessControllerPluginTests(unittest.TestCase):
         with self.plugin._node._lock:
             self.plugin._node._last_state["_updated_at"] = 100.0
 
-        snapshot = self.plugin._node.snapshot(now=stale_now)
-        self.assertEqual("stale", snapshot["state"])
-        self.assertFalse(snapshot["connected"])
-        self.assertEqual("stale", snapshot["reason"])
-        self.assertEqual(1, snapshot["sample_count"])
-        self.assertGreaterEqual(snapshot["last_update_ago_ms"], 1000)
+        state = self.plugin._node.current_state(now=stale_now)
+        self.assertEqual("stale", state["state"])
+        self.assertFalse(state["connected"])
+        self.assertEqual("stale", state["reason"])
+        self.assertEqual(1, state["sample_count"])
+        self.assertGreaterEqual(state["last_update_ago_ms"], 1000)
 
-        self.plugin._node._publish_snapshot(now=stale_now)
+        self.plugin._node._publish_state(now=stale_now)
         published = json.loads(node.publishers[0].messages[-1].data)
         self.assertEqual("stale", published["state"])
         self.assertFalse(published["connected"])

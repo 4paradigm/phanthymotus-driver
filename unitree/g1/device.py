@@ -1829,6 +1829,7 @@ class _WirelessControllerNode(Node):
     DDS_TOPIC = "rt/lowstate"
     FRESH_TIMEOUT_SEC = 1.0
     PUBLISH_INTERVAL_SEC = 0.1
+    ACTIVE_DEADZONE = 0.1
 
     def __init__(self, topic: str, fresh_timeout_sec: float = FRESH_TIMEOUT_SEC):
         super().__init__("g1_wireless_controller")
@@ -1839,7 +1840,7 @@ class _WirelessControllerNode(Node):
         self._last_state: dict | None = None
         self._sample_count = 0
         self._sub = None
-        self._timer = self.create_timer(self.PUBLISH_INTERVAL_SEC, self._publish_snapshot)
+        self._timer = self.create_timer(self.PUBLISH_INTERVAL_SEC, self._publish_state)
 
         try:
             from unitree_sdk2py.core.channel import ChannelSubscriber
@@ -1867,6 +1868,27 @@ class _WirelessControllerNode(Node):
             "_updated_at": update_time,
         }
 
+    def _stick_state(self, x: float, y: float) -> dict:
+        magnitude = min(1.0, (x * x + y * y) ** 0.5)
+        active = magnitude >= self.ACTIVE_DEADZONE
+        if not active:
+            primary_axis = "neutral"
+            direction = "neutral"
+        elif abs(x) >= abs(y):
+            primary_axis = "x"
+            direction = "positive" if x > 0 else "negative"
+        else:
+            primary_axis = "y"
+            direction = "positive" if y > 0 else "negative"
+        return {
+            "x": round(x, 3),
+            "y": round(y, 3),
+            "active": active,
+            "primary_axis": primary_axis,
+            "direction": direction,
+            "magnitude": round(magnitude, 3),
+        }
+
     def _public_state(self, state: dict | None, sample_count: int, now: float | None = None) -> dict:
         current = time.monotonic() if now is None else now
         base = {
@@ -1874,6 +1896,7 @@ class _WirelessControllerNode(Node):
             "topic_out": [{"topic": self._topic, "format": "data/json"}],
             "fresh_timeout_sec": self._fresh_timeout_sec,
             "sample_count": sample_count,
+            "deadzone": self.ACTIVE_DEADZONE,
         }
         if not state:
             return {
@@ -1886,14 +1909,19 @@ class _WirelessControllerNode(Node):
 
         last_update_ago_ms = max(0, int((current - state["_updated_at"]) * 1000))
         connected = last_update_ago_ms <= int(self._fresh_timeout_sec * 1000)
-        public = {k: v for k, v in state.items() if not k.startswith("_")}
+        keys = int(state["keys"])
         return {
             **base,
-            **public,
             "state": "running" if connected else "stale",
             "connected": connected,
             "reason": "fresh" if connected else "stale",
             "last_update_ago_ms": last_update_ago_ms,
+            "left_stick": self._stick_state(float(state["lx"]), float(state["ly"])),
+            "right_stick": self._stick_state(float(state["rx"]), float(state["ry"])),
+            "buttons": {
+                "raw": keys,
+                "active": keys != 0,
+            },
         }
 
     def _on_wireless_controller(self, msg) -> None:
@@ -1902,29 +1930,30 @@ class _WirelessControllerNode(Node):
             self._last_state = state
             self._sample_count += 1
 
-    def _publish_snapshot(self, now: float | None = None) -> None:
-        snapshot = self.snapshot(now=now)
+    def _publish_state(self, now: float | None = None) -> None:
+        state = self.current_state(now=now)
         out = String()
-        out.data = json.dumps(snapshot)
+        out.data = json.dumps(state)
         self._pub.publish(out)
 
-    def snapshot(self, now: float | None = None) -> dict:
+    def current_state(self, now: float | None = None) -> dict:
         with self._lock:
             state = dict(self._last_state) if self._last_state else None
             sample_count = self._sample_count
         return self._public_state(state, sample_count, now=now)
 
     def info(self) -> dict:
-        snapshot = self.snapshot()
+        state = self.current_state()
         return {
-            "state": snapshot["state"],
+            "state": state["state"],
             "source_topic": self.DDS_TOPIC,
             "topic_out": [{"topic": self._topic, "format": "data/json"}],
             "fresh_timeout_sec": self._fresh_timeout_sec,
-            "connected": snapshot["connected"],
-            "reason": snapshot["reason"],
-            "sample_count": snapshot["sample_count"],
-            "last_update_ago_ms": snapshot["last_update_ago_ms"],
+            "deadzone": self.ACTIVE_DEADZONE,
+            "connected": state["connected"],
+            "reason": state["reason"],
+            "sample_count": state["sample_count"],
+            "last_update_ago_ms": state["last_update_ago_ms"],
         }
 
 
@@ -1943,16 +1972,16 @@ class WirelessControllerPlugin:
             "type": "sensor",
             "multiInstance": False,
             "description": (
-                "G1 wireless controller status — read-only DDS snapshot of lx/ly/rx/ry axes, "
-                "raw keys bitmap, and data freshness"
+                "G1 wireless controller input monitor — read whether physical controller stick "
+                "or button input is reaching the driver. This is read-only and never commands motion."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["snapshot", "info"],
-                        "description": "Optional read action; omitted calls return the current snapshot",
+                        "enum": ["read", "info"],
+                        "description": "Optional action; omitted calls read the current controller input",
                     },
                 },
             },
@@ -1966,8 +1995,8 @@ class WirelessControllerPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict | None:
-        if action in ("wireless_controller", "snapshot", "start"):
-            return self._node.snapshot()
+        if action in ("wireless_controller", "read", "start"):
+            return self._node.current_state()
         if action == "info":
             return self._node.info()
         if action == "stop":
