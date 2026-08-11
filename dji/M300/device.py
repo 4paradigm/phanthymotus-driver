@@ -498,27 +498,74 @@ class HmsPlugin:
     PREFIX = "hms"
 
     def __init__(self, plugin_config: dict, namespace: str, executor, bridge):
+        self._bridge = bridge
         self._topic = f"/{namespace}/hms/alerts"
         self._node = _HmsNode(self._topic, bridge)
         executor.add_node(self._node)
 
-    def get_tool(self) -> dict:
-        return {
-            "name": "hms",
-            "type": "sensor",
-            "description": "Matrice 300 RTK 健康管理系统 (HMS) 告警。监控飞行器/负载健康状态，输出告警事件。",
-            "topic_out": [{"topic": self._topic, "format": "data/json"}],
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["start", "stop", "info"],
+    def get_tools(self) -> list:
+        return [
+            {
+                "name": "hms",
+                "type": "sensor",
+                "description": "Matrice 300 RTK 健康管理系统 (HMS) 告警。监控飞行器/负载健康状态，输出告警事件。",
+                "topic_out": [{"topic": self._topic, "format": "data/json"}],
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["start", "stop", "info"],
+                        },
                     },
+                    "required": ["action"],
                 },
-                "required": ["action"],
             },
-        }
+            {
+                "name": "hms_inject",
+                "type": "actuator",
+                "description": "Matrice 300 RTK HMS 手动注入告警（用于测试）。注入一个自定义错误码到健康管理系统。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["inject"],
+                        },
+                        "error_code": {
+                            "type": "integer",
+                            "description": "错误码，十六进制格式，如 0x1E020001",
+                        },
+                        "error_level": {
+                            "type": "integer",
+                            "description": "告警级别，1=提示，2=警告，3=严重",
+                            "minimum": 1,
+                            "maximum": 3,
+                        },
+                    },
+                    "required": ["action", "error_code"],
+                },
+            },
+            {
+                "name": "hms_eliminate",
+                "type": "actuator",
+                "description": "Matrice 300 RTK HMS 手动消除告警（用于测试）。消除一个指定的自定义错误码告警。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["eliminate"],
+                        },
+                        "error_code": {
+                            "type": "integer",
+                            "description": "错误码，十六进制格式，如 0x1E020001",
+                        },
+                    },
+                    "required": ["action", "error_code"],
+                },
+            },
+        ]
 
     def start(self):
         self._node.start()
@@ -527,17 +574,28 @@ class HmsPlugin:
         self._node.stop()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
-        if action == "start":
-            self._node.start()
-            return {"state": "running"}
-        if action == "stop":
-            self._node.stop()
-            return {"state": "idle"}
-        if action == "info":
-            return {
-                "state": self._node.state,
-                "topic_out": [{"topic": self._topic, "format": "data/json"}],
-            }
+        tool_name = args.pop("_tool_name", None)
+        if tool_name == "hms":
+            if action == "start":
+                self._node.start()
+                return {"state": "running"}
+            if action == "stop":
+                self._node.stop()
+                return {"state": "idle"}
+            if action == "info":
+                return {
+                    "state": self._node.state,
+                    "topic_out": [{"topic": self._topic, "format": "data/json"}],
+                }
+        elif tool_name == "hms_inject":
+            if action == "inject":
+                error_code = args.get("error_code", 0x1E020001)
+                error_level = args.get("error_level", 1)
+                return self._bridge.hms_inject_error(error_code, error_level)
+        elif tool_name == "hms_eliminate":
+            if action == "eliminate":
+                error_code = args.get("error_code", 0x1E020001)
+                return self._bridge.hms_eliminate_error(error_code)
         return None
 
 
