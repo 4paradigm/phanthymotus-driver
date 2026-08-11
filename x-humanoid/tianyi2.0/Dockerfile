@@ -2,12 +2,10 @@ ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 ARG PYPI_MIRROR=https://pypi.org/simple/
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
-ARG APT_MIRROR=http://mirrors.tencentyun.com/ubuntu-ports
 
 WORKDIR /work
 
-RUN sed -i "s|http://mirrors.tencentyun.com/ubuntu-ports|${APT_MIRROR}|g" /etc/apt/sources.list && \
-    apt-get -o Acquire::AllowInsecureRepositories=true update && \
+RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
         python3-pip \
         python3-colcon-common-extensions \
