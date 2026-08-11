@@ -30,8 +30,8 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     pyyaml netifaces numpy opencv-python-headless pyrealsense2 pybind11
 
-# Noetix Bumi SDK — clone and build pybind modules
-RUN git clone --depth 1 https://github.com/Noetix-Robotics/noetix_sdk_bumi.git /work/noetix_sdk_bumi
+# Noetix Bumi SDK — copy source and build pybind modules
+COPY noetix_sdk_bumi/ /work/noetix_sdk_bumi/
 
 # Build only the pybind modules (highcontrol_py, mediacontrol_py)
 # Skip onnxruntime-dependent executables via custom CMakeLists target selection
