@@ -540,26 +540,38 @@ def _mic_subprocess(namespace: str):
 
     frame_count = 0
     t_start = _time.monotonic()
+    buffer = _np.array([], dtype=_np.int16)
+    MIN_CHUNK_SAMPLES = 512  # 1024 bytes = 32ms @ 16kHz
+
     while True:
         try:
             audio = media_ctrl.get_audio_capture_data()
             if audio.channels == 0 or len(audio.audio_data) == 0:
-                _time.sleep(0.02)
+                _time.sleep(0.005)
                 continue
 
             # Downmix 8ch → mono (channel 0) using numpy for speed
             samples = _np.array(audio.audio_data, dtype=_np.int16)
             mono = samples[::audio.channels]
 
-            msg = _AudioChunk()
-            msg.format = "pcm_16k_16bit_mono"
-            msg.data = mono.tobytes()
-            pub.publish(msg)
+            # SDK returns 8-bit amplitude in int16 container (range ±128)
+            # Scale to proper 16-bit range for PCM-16k format
+            mono = _np.clip(mono.astype(_np.int32) * 256, -32768, 32767).astype(_np.int16)
 
-            frame_count += 1
-            if frame_count % 500 == 0:
-                elapsed = _time.monotonic() - t_start
-                print(f"[mic_subprocess] {frame_count} chunks, {frame_count/elapsed:.1f} chunks/s, last mono_len={len(mono)}", flush=True)
+            # Accumulate until we have enough for a proper chunk
+            buffer = _np.concatenate([buffer, mono])
+
+            if len(buffer) >= MIN_CHUNK_SAMPLES:
+                msg = _AudioChunk()
+                msg.format = "pcm_16k_16bit_mono"
+                msg.data = buffer.tobytes()
+                pub.publish(msg)
+                buffer = _np.array([], dtype=_np.int16)
+
+                frame_count += 1
+                if frame_count % 200 == 0:
+                    elapsed = _time.monotonic() - t_start
+                    print(f"[mic_subprocess] {frame_count} chunks, {frame_count/elapsed:.1f} chunks/s", flush=True)
         except Exception as e:
             print(f"[mic_subprocess] error: {e}", flush=True)
             _time.sleep(0.5)
