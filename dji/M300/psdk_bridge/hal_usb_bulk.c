@@ -48,9 +48,9 @@ static T_DjiReturnCode _UsbBulk_Init(T_DjiHalUsbBulkInfo info,
         goto fail_exit;
     }
 
-    /* The M300 liveview endpoints are vendor-specific, but auto-detach keeps
-     * this safe on boards where a generic driver has bound the interface. */
-    (void)libusb_set_auto_detach_kernel_driver(handle->device, 1);
+    /* Match the verified M300 PSDK sample: claim the SDK-selected interface
+     * without detaching an existing kernel driver.  Some control/status
+     * traffic shares the device topology, and auto-detach can disrupt it. */
     rc = libusb_claim_interface(handle->device, info.channelInfo.interfaceNum);
     if (rc != LIBUSB_SUCCESS) {
         printf("[usb_bulk] claim interface %u failed: %s\n",
@@ -79,6 +79,11 @@ static T_DjiReturnCode _UsbBulk_DeInit(T_DjiUsbBulkHandle opaque) {
     if (!handle)
         return DJI_ERROR_SYSTEM_MODULE_CODE_INVALID_PARAMETER;
     libusb_release_interface(handle->device, handle->info.channelInfo.interfaceNum);
+    /* hzhy leaves a short settle interval after releasing the M300 bulk
+     * interface.  Without it a following liveview retry can race teardown. */
+    T_DjiOsalHandler *osal = DjiPlatform_GetOsalHandler();
+    if (osal && osal->TaskSleepMs)
+        (void)osal->TaskSleepMs(100);
     libusb_close(handle->device);
     libusb_exit(NULL);
     free(handle);
@@ -124,7 +129,7 @@ static T_DjiReturnCode _UsbBulk_ReadData(T_DjiUsbBulkHandle handle,
     if (!bulk)
         return DJI_ERROR_SYSTEM_MODULE_CODE_INVALID_PARAMETER;
     return _UsbBulk_Transfer(handle, (uint8_t)bulk->info.channelInfo.endPointIn,
-                             data, len, real_len, 0);
+                             data, len, real_len, (unsigned int)-1);
 }
 
 static T_DjiReturnCode _UsbBulk_GetDeviceInfo(T_DjiHalUsbBulkDeviceInfo *info) {

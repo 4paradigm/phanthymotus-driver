@@ -85,7 +85,7 @@ static T_M300Uart s_uart[M300_UART_COUNT] = {
 typedef struct {
     int fd;
     T_M300Uart *uart;
-    bool closed;
+    bool lock_held;
 } T_M300UartHandle;
 
 static volatile uint64_t s_uart_tx_bytes;
@@ -189,12 +189,37 @@ static T_DjiReturnCode _HalUart_Init(E_DjiHalUartNum uartNum, uint32_t baudRate,
     T_M300UartHandle *handle = calloc(1, sizeof(*handle));
     if (handle == NULL)
         return DJI_ERROR_SYSTEM_MODULE_CODE_MEMORY_ALLOC_FAILED;
-    handle->fd = open(uart->device, O_RDWR | O_NOCTTY);
+    handle->fd = open(uart->device, O_RDWR | O_NOCTTY | O_NDELAY);
     if (handle->fd < 0) {
         printf("[hal] uart%d open %s failed: %s\n", uartNum, uart->device, strerror(errno));
         free(handle);
         return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
     }
+
+    /* Keep hzhy's process-level exclusive UART ownership.  The lock is
+     * acquired after open, before any termios/PSDK probe traffic, so a second
+     * bridge cannot interleave auto-baud frames with this process. */
+    struct flock lock = {
+        .l_type = F_WRLCK,
+        .l_whence = SEEK_SET,
+        .l_start = 0,
+        .l_len = 0,
+    };
+    if (fcntl(handle->fd, F_GETLK, &lock) != 0 || lock.l_type != F_UNLCK) {
+        printf("[psdk][uart] %s is already locked by another process\n", uart->device);
+        close(handle->fd);
+        free(handle);
+        return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
+    }
+    lock.l_type = F_WRLCK;
+    lock.l_pid = getpid();
+    if (fcntl(handle->fd, F_SETLKW, &lock) != 0) {
+        printf("[psdk][uart] lock %s failed: %s\n", uart->device, strerror(errno));
+        close(handle->fd);
+        free(handle);
+        return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
+    }
+    handle->lock_held = true;
 
     if (tcgetattr(handle->fd, &tty) != 0) {
         printf("[psdk][uart] tcgetattr %s failed: %s\n", uart->device, strerror(errno));
@@ -205,28 +230,23 @@ static T_DjiReturnCode _HalUart_Init(E_DjiHalUartNum uartNum, uint32_t baudRate,
     speed_t speed = _to_speed(baudRate);
     cfsetispeed(&tty, speed);
     cfsetospeed(&tty, speed);
-    /* Keep the CDC control lines asserted while PSDK closes and reopens the
-     * port during its UART0 identification sweep.  HUPCL is inherited from
-     * the host's tty defaults; leaving it set drops DTR on every probe close.
-     * On the E-Port CDC bridge that can reset/interrupt the downstream UART
-     * mid-frame, which presents to PSDK as intermittent CRC16 failures. */
-    tty.c_cflag &= ~(PARENB | PARODD | CSTOPB | CSIZE | CRTSCTS | HUPCL);
+    /* Match the hzhy M300 HAL's line discipline exactly.  PSDK performs its
+     * own UART probe/reopen sequence; changing its flush or timing behaviour
+     * caused status-subscription commands to time out after core handshake. */
+    tty.c_cflag &= ~(PARENB | PARODD | CSTOPB | CSIZE | CRTSCTS);
     tty.c_cflag |= CS8 | CLOCAL | CREAD;
     tty.c_iflag = 0;
     tty.c_oflag = 0;
     tty.c_lflag = 0;
-    tty.c_cc[VMIN] = 0;   /* Non-blocking: return immediately with available data */
-    tty.c_cc[VTIME] = 5;  /* 500ms timeout — enough for aircraft to respond */
-    /* Drain the preceding CDC transfer before changing line coding.  The SDK
-     * deliberately tries several baud rates; TCSANOW can otherwise apply a
-     * new rate while the adapter is still transmitting a probe frame. */
-    if (tcsetattr(handle->fd, TCSADRAIN, &tty) != 0) {
+    tty.c_cc[VMIN] = 0;
+    tty.c_cc[VTIME] = 0;
+    tcflush(handle->fd, TCIFLUSH);
+    if (tcsetattr(handle->fd, TCSANOW, &tty) != 0) {
         printf("[psdk][uart] tcsetattr %s failed: %s\n", uart->device, strerror(errno));
         close(handle->fd);
         free(handle);
         return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
     }
-    tcflush(handle->fd, TCIOFLUSH);
     _HalUart_DetectDeviceInfo(uart);
 
     handle->uart = uart;
@@ -239,20 +259,31 @@ static T_DjiReturnCode _HalUart_Init(E_DjiHalUartNum uartNum, uint32_t baudRate,
 
 static T_DjiReturnCode _HalUart_DeInit(T_DjiUartHandle uartHandle) {
     T_M300UartHandle *handle = _HalUart_Handle(uartHandle);
-    if (handle != NULL && !handle->closed) {
-        if (close(handle->fd) != 0)
-            printf("[psdk][uart] close fd=%d failed: %s\n", handle->fd, strerror(errno));
-        if (handle->uart != NULL && handle->uart->open_handles > 0)
-            handle->uart->open_handles--;
-        handle->closed = true;
+    if (handle == NULL)
+        return DJI_ERROR_SYSTEM_MODULE_CODE_INVALID_PARAMETER;
+    if (handle->lock_held) {
+        struct flock lock = {
+            .l_type = F_UNLCK,
+            .l_whence = SEEK_SET,
+            .l_start = 0,
+            .l_len = 0,
+        };
+        (void)fcntl(handle->fd, F_SETLK, &lock);
     }
+    if (close(handle->fd) != 0) {
+        printf("[psdk][uart] close fd=%d failed: %s\n", handle->fd, strerror(errno));
+        return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
+    }
+    if (handle->uart != NULL && handle->uart->open_handles > 0)
+        handle->uart->open_handles--;
+    free(handle);
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
 
 static T_DjiReturnCode _HalUart_WriteData(T_DjiUartHandle uartHandle,
                                            const uint8_t *buf, uint32_t len, uint32_t *realLen) {
     T_M300UartHandle *handle = _HalUart_Handle(uartHandle);
-    if (handle == NULL || handle->closed || realLen == NULL)
+    if (handle == NULL || realLen == NULL)
         return DJI_ERROR_SYSTEM_MODULE_CODE_INVALID_PARAMETER;
     int fd = handle->fd;
     uint32_t total = 0;
@@ -278,7 +309,7 @@ static T_DjiReturnCode _HalUart_WriteData(T_DjiUartHandle uartHandle,
 static T_DjiReturnCode _HalUart_ReadData(T_DjiUartHandle uartHandle,
                                           uint8_t *buf, uint32_t len, uint32_t *realLen) {
     T_M300UartHandle *handle = _HalUart_Handle(uartHandle);
-    if (handle == NULL || handle->closed || realLen == NULL)
+    if (handle == NULL || realLen == NULL)
         return DJI_ERROR_SYSTEM_MODULE_CODE_INVALID_PARAMETER;
     int fd = handle->fd;
     ssize_t n;
@@ -325,119 +356,6 @@ static void _HalUart_LogHandshakeStats(void) {
            s_uart_write_errors, s_uart_read_errors);
 }
 
-/* ── OSAL implementation matching T_DjiOsalHandler ────────────────────── */
-
-static T_DjiReturnCode _Osal_TaskCreate(const char *name, void *(*taskFunc)(void *),
-                                         uint32_t stackSize, void *arg, T_DjiTaskHandle *task) {
-    pthread_t *tid = (pthread_t *)malloc(sizeof(pthread_t));
-    if (!tid) return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    if (stackSize > 0 && stackSize >= 64*1024)
-        pthread_attr_setstacksize(&attr, stackSize);
-    if (pthread_create(tid, &attr, taskFunc, arg) != 0) {
-        free(tid);
-        pthread_attr_destroy(&attr);
-        return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
-    }
-    pthread_attr_destroy(&attr);
-    *task = (T_DjiTaskHandle)tid;
-    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
-}
-
-static T_DjiReturnCode _Osal_TaskDestroy(T_DjiTaskHandle task) {
-    pthread_t *tid = (pthread_t *)task;
-    pthread_cancel(*tid);
-    pthread_join(*tid, NULL);
-    free(tid);
-    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
-}
-
-static T_DjiReturnCode _Osal_TaskSleepMs(uint32_t timeMs) {
-    usleep((useconds_t)timeMs * 1000);
-    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
-}
-
-static T_DjiReturnCode _Osal_MutexCreate(T_DjiMutexHandle *mutex) {
-    pthread_mutex_t *m = (pthread_mutex_t *)malloc(sizeof(pthread_mutex_t));
-    if (!m) return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
-    pthread_mutex_init(m, NULL);
-    *mutex = (T_DjiMutexHandle)m;
-    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
-}
-
-static T_DjiReturnCode _Osal_MutexDestroy(T_DjiMutexHandle mutex) {
-    pthread_mutex_destroy((pthread_mutex_t *)mutex);
-    free(mutex);
-    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
-}
-
-static T_DjiReturnCode _Osal_MutexLock(T_DjiMutexHandle mutex) {
-    pthread_mutex_lock((pthread_mutex_t *)mutex);
-    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
-}
-
-static T_DjiReturnCode _Osal_MutexUnlock(T_DjiMutexHandle mutex) {
-    pthread_mutex_unlock((pthread_mutex_t *)mutex);
-    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
-}
-
-static T_DjiReturnCode _Osal_SemCreate(uint32_t initValue, T_DjiSemaHandle *semaphore) {
-    sem_t *s = (sem_t *)malloc(sizeof(sem_t));
-    if (!s) return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
-    sem_init(s, 0, initValue);
-    *semaphore = (T_DjiSemaHandle)s;
-    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
-}
-
-static T_DjiReturnCode _Osal_SemDestroy(T_DjiSemaHandle semaphore) {
-    sem_destroy((sem_t *)semaphore);
-    free(semaphore);
-    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
-}
-
-static T_DjiReturnCode _Osal_SemWait(T_DjiSemaHandle semaphore) {
-    sem_wait((sem_t *)semaphore);
-    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
-}
-
-static T_DjiReturnCode _Osal_SemTimedWait(T_DjiSemaHandle semaphore, uint32_t waitTimeMs) {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec += waitTimeMs / 1000;
-    ts.tv_nsec += (waitTimeMs % 1000) * 1000000L;
-    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
-    int ret = sem_timedwait((sem_t *)semaphore, &ts);
-    return (ret == 0) ? DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS : DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
-}
-
-static T_DjiReturnCode _Osal_SemPost(T_DjiSemaHandle semaphore) {
-    sem_post((sem_t *)semaphore);
-    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
-}
-
-static T_DjiReturnCode _Osal_GetTimeMs(uint32_t *ms) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    *ms = (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
-    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
-}
-
-static T_DjiReturnCode _Osal_GetTimeUs(uint64_t *us) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    *us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
-    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
-}
-
-static T_DjiReturnCode _Osal_GetRandomNum(uint16_t *randomNum) {
-    *randomNum = (uint16_t)(rand() & 0xFFFF);
-    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
-}
-
-static void *_Osal_Malloc(uint32_t size) { return malloc(size); }
-static void _Osal_Free(void *ptr) { free(ptr); }
-
 /* ── PSDK init ────────────────────────────────────────────────────────── */
 
 static int _psdk_core_init(const char *app_id, const char *app_key,
@@ -450,23 +368,23 @@ static int _psdk_core_init(const char *app_id, const char *app_key,
 
     /* Register OSAL first (PSDK needs threads before anything else) */
     T_DjiOsalHandler osalHandler = {
-        .TaskCreate = _Osal_TaskCreate,
-        .TaskDestroy = _Osal_TaskDestroy,
-        .TaskSleepMs = _Osal_TaskSleepMs,
-        .MutexCreate = _Osal_MutexCreate,
-        .MutexDestroy = _Osal_MutexDestroy,
-        .MutexLock = _Osal_MutexLock,
-        .MutexUnlock = _Osal_MutexUnlock,
-        .SemaphoreCreate = _Osal_SemCreate,
-        .SemaphoreDestroy = _Osal_SemDestroy,
-        .SemaphoreWait = _Osal_SemWait,
-        .SemaphoreTimedWait = _Osal_SemTimedWait,
-        .SemaphorePost = _Osal_SemPost,
-        .GetTimeMs = _Osal_GetTimeMs,
-        .GetTimeUs = _Osal_GetTimeUs,
-        .GetRandomNum = _Osal_GetRandomNum,
-        .Malloc = _Osal_Malloc,
-        .Free = _Osal_Free,
+        .TaskCreate = Osal_TaskCreate,
+        .TaskDestroy = Osal_TaskDestroy,
+        .TaskSleepMs = Osal_TaskSleepMs,
+        .MutexCreate = Osal_MutexCreate,
+        .MutexDestroy = Osal_MutexDestroy,
+        .MutexLock = Osal_MutexLock,
+        .MutexUnlock = Osal_MutexUnlock,
+        .SemaphoreCreate = Osal_SemaphoreCreate,
+        .SemaphoreDestroy = Osal_SemaphoreDestroy,
+        .SemaphoreWait = Osal_SemaphoreWait,
+        .SemaphoreTimedWait = Osal_SemaphoreTimedWait,
+        .SemaphorePost = Osal_SemaphorePost,
+        .GetTimeMs = Osal_GetTimeMs,
+        .GetTimeUs = Osal_GetTimeUs,
+        .GetRandomNum = Osal_GetRandomNum,
+        .Malloc = Osal_Malloc,
+        .Free = Osal_Free,
     };
     rc = DjiPlatform_RegOsalHandler(&osalHandler);
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
@@ -522,38 +440,10 @@ static int _psdk_core_init(const char *app_id, const char *app_key,
         return -1;
     }
 
-    rc = DjiCore_SetAlias("PhanthyMotus");
-    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-        printf("[psdk] set alias warning: 0x%08llX\n", (unsigned long long)rc);
-    }
-
-    rc = DjiCore_ApplicationStart();
-    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-        printf("[psdk] application start failed: 0x%08llX\n", (unsigned long long)rc);
-        return -1;
-    }
-
-    /* The M300 needs time after application start before camera, HMS and
-     * liveview commands are accepted.  Initialising them immediately caused
-     * command timeouts despite a healthy PSDK heartbeat. */
-    _Osal_TaskSleepMs(5000);
-
-    /* Liveview must claim its PSDK extended-command handler before camera,
-     * gimbal and HMS modules.  The hzhy M300 FPV sample follows this minimal
-     * sequence successfully on the target.  Calling it after those modules
-     * caused the liveview status request to time out; retrying then cannot
-     * recover because PSDK retains the handler registration. */
-    rc = liveview_init();
-    if (rc != 0) {
-        printf("[psdk] liveview init unavailable; camera_stream will return an error without crashing\n");
-    }
-
-    /* Camera init required even for non-camera payloads (Pilot won't detect otherwise) */
-    rc = DjiPayloadCamera_Init();
-    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-        printf("[psdk] payload camera init warning: 0x%08llX\n", (unsigned long long)rc);
-    }
-
+    /* hzhy's verified M300 sequence initializes service modules before
+     * announcing the application to Pilot, then initializes Liveview.  Do
+     * not issue Liveview control commands here: its status-push handler is
+     * only accepted after that complete sequence. */
     printf("[psdk] core initialized (app=%s, id=%s)\n", app_name, app_id);
     return 0;
 }
@@ -564,14 +454,9 @@ static void _init_modules(void) {
     flight_ctrl_init();
     camera_mgr_init();
     gimbal_mgr_init();
-    /* Liveview is initialized in _psdk_core_init before these modules.
-     * Keep its failed state terminal for the current PSDK process: retrying
-     * DjiLiveview_Init re-registers an extended command handler and cannot
-     * recover from a previous status-subscription timeout. */
     waypoint_init();
     perception_init();
     speaker_init();
-    hms_init();
     time_sync_init();
 }
 
@@ -596,6 +481,19 @@ static void *_psdk_start_thread(void *arg) {
         return NULL;
     }
     _init_modules();
+    T_DjiReturnCode rc = DjiCore_ApplicationStart();
+    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+        s_psdk_state = -1;
+        printf("[psdk_bridge] application start failed: 0x%08llX\n",
+               (unsigned long long)rc);
+        return NULL;
+    }
+    if (liveview_init() != 0) {
+        printf("[psdk] liveview init unavailable; camera_stream will return an error without crashing\n");
+    }
+    /* HMS subscription is rejected before ApplicationStart on this M300.
+     * Initialise it only after Pilot has accepted the application. */
+    hms_init();
     s_psdk_state = 1;
     printf("[psdk_bridge] PSDK modules ready\n");
     return NULL;

@@ -1,55 +1,42 @@
 #ifndef OSAL_POSIX_H
 #define OSAL_POSIX_H
 
-#include <stdint.h>
-#include <stddef.h>
+/* This is the OSAL ABI registered with libpayloadsdk.  Keep its ownership,
+ * task cancellation, and wall-clock-relative timing behaviour consistent
+ * with the verified hzhy Jetson M300 platform implementation. */
+#ifdef PSDK_ENABLED
 
-/**
- * OSAL (Operating System Abstraction Layer) — POSIX implementation for PSDK.
- *
- * Provides thread, mutex, semaphore, time, and memory operations
- * required by the PSDK core library.
- */
+#include "dji_platform.h"
 
-/* Task (Thread) */
-typedef void *(*OsalTaskFunc)(void *arg);
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-typedef struct {
-    void *handle;  /* pthread_t internal */
-} T_OsalTask;
+T_DjiReturnCode Osal_TaskCreate(const char *name, void *(*taskFunc)(void *),
+                                uint32_t stackSize, void *arg, T_DjiTaskHandle *task);
+T_DjiReturnCode Osal_TaskDestroy(T_DjiTaskHandle task);
+T_DjiReturnCode Osal_TaskSleepMs(uint32_t timeMs);
 
-int Osal_TaskCreate(const char *name, OsalTaskFunc func, uint32_t stackSize,
-                    void *arg, T_OsalTask *task);
-int Osal_TaskDestroy(T_OsalTask *task);
-int Osal_TaskSleepMs(uint32_t ms);
+T_DjiReturnCode Osal_MutexCreate(T_DjiMutexHandle *mutex);
+T_DjiReturnCode Osal_MutexDestroy(T_DjiMutexHandle mutex);
+T_DjiReturnCode Osal_MutexLock(T_DjiMutexHandle mutex);
+T_DjiReturnCode Osal_MutexUnlock(T_DjiMutexHandle mutex);
 
-/* Mutex */
-typedef struct {
-    void *handle;  /* pthread_mutex_t internal */
-} T_OsalMutex;
+T_DjiReturnCode Osal_SemaphoreCreate(uint32_t initValue, T_DjiSemaHandle *semaphore);
+T_DjiReturnCode Osal_SemaphoreDestroy(T_DjiSemaHandle semaphore);
+T_DjiReturnCode Osal_SemaphoreWait(T_DjiSemaHandle semaphore);
+T_DjiReturnCode Osal_SemaphoreTimedWait(T_DjiSemaHandle semaphore, uint32_t waitTime);
+T_DjiReturnCode Osal_SemaphorePost(T_DjiSemaHandle semaphore);
 
-int Osal_MutexCreate(T_OsalMutex *mutex);
-int Osal_MutexLock(T_OsalMutex *mutex);
-int Osal_MutexUnlock(T_OsalMutex *mutex);
-int Osal_MutexDestroy(T_OsalMutex *mutex);
-
-/* Semaphore */
-typedef struct {
-    void *handle;  /* sem_t internal */
-} T_OsalSemaphore;
-
-int Osal_SemaphoreCreate(uint32_t initValue, T_OsalSemaphore *sem);
-int Osal_SemaphoreWait(T_OsalSemaphore *sem);
-int Osal_SemaphoreTimedWait(T_OsalSemaphore *sem, uint32_t timeout_ms);
-int Osal_SemaphorePost(T_OsalSemaphore *sem);
-int Osal_SemaphoreDestroy(T_OsalSemaphore *sem);
-
-/* Time */
-uint64_t Osal_GetTimeMs(void);
-uint64_t Osal_GetTimeUs(void);
-
-/* Memory */
+T_DjiReturnCode Osal_GetTimeMs(uint32_t *ms);
+T_DjiReturnCode Osal_GetTimeUs(uint64_t *us);
+T_DjiReturnCode Osal_GetRandomNum(uint16_t *randomNum);
 void *Osal_Malloc(uint32_t size);
 void Osal_Free(void *ptr);
 
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* PSDK_ENABLED */
 #endif /* OSAL_POSIX_H */
