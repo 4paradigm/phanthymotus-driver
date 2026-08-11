@@ -502,22 +502,69 @@ class LocoPlugin:
         }
 
 
-# ── MicPlugin (sensor) ───────────────────────────────────────────────────────
+# ── MicPlugin (sensor, subprocess) ────────────────────────────────────────────
+
+def _mic_subprocess(namespace: str):
+    """Mic capture subprocess — polls MediaController, publishes AudioChunk."""
+    import os as _os
+    _os.environ.setdefault('CYCLONEDDS_URI', 'file:///work/noetix_sdk_bumi/config/dds.xml')
+    import sys as _sys
+    _sys.path.insert(0, '/work/noetix_sdk_bumi/build')
+    import time as _time
+    import struct as _struct
+    import numpy as _np
+
+    import rclpy as _rclpy
+    from rclpy.node import Node as _Node
+    from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+    from audio_msgs.msg import AudioChunk as _AudioChunk
+
+    _QOS = QoSProfile(
+        reliability=ReliabilityPolicy.BEST_EFFORT,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=200,
+        durability=DurabilityPolicy.VOLATILE,
+    )
+
+    from mediacontrol_py import MediaController
+    media_ctrl = MediaController.instance()
+    media_ctrl.init()
+    _time.sleep(3)
+
+    _rclpy.init()
+    node = _Node("bumi_mic_sub")
+    topic = f"/{namespace}/mic/audio"
+    pub = node.create_publisher(_AudioChunk, topic, _QOS)
+
+    print(f"[mic_subprocess] publishing to {topic}", flush=True)
+
+    while True:
+        try:
+            audio = media_ctrl.get_audio_capture_data()
+            if audio.channels == 0 or len(audio.audio_data) == 0:
+                _time.sleep(0.02)
+                continue
+
+            # Downmix 8ch → mono (channel 0) using numpy for speed
+            samples = _np.array(audio.audio_data, dtype=_np.int16)
+            mono = samples[::audio.channels]
+
+            msg = _AudioChunk()
+            msg.format = "pcm_16k_16bit_mono"
+            msg.data = mono.tobytes()
+            pub.publish(msg)
+        except Exception as e:
+            print(f"[mic_subprocess] error: {e}", flush=True)
+            _time.sleep(0.5)
+
 
 class MicPlugin:
     PREFIX = "mic"
 
     def __init__(self, plugin_config: dict, namespace: str, executor, media_ctrl):
-        self._media_ctrl = media_ctrl
         self._namespace = namespace
         self._topic = f"/{namespace}/mic/audio"
-        self._running = False
-        self._thread: threading.Thread | None = None
-
-        # ROS2 publisher — use AudioChunk (same as R1, expected by Agent Core)
-        self._node = Node("bumi_mic")
-        self._pub = self._node.create_publisher(AudioChunk, self._topic, _LOW_LAT_QOS)
-        executor.add_node(self._node)
+        self._proc: subprocess.Popen | None = None
 
     def get_tool(self) -> dict:
         return {
@@ -530,39 +577,22 @@ class MicPlugin:
         }
 
     def start(self) -> None:
-        self._running = True
-        self._thread = threading.Thread(target=self._capture_loop, daemon=True, name="bumi_mic")
-        self._thread.start()
+        import sys
+        self._proc = subprocess.Popen(
+            [sys.executable, "-c",
+             f"import sys; sys.path.insert(0, '/work'); from device import _mic_subprocess; _mic_subprocess({self._namespace!r})"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        # Forward subprocess stdout in background
+        def _fwd():
+            for line in self._proc.stdout:
+                print(line.decode(errors='replace').rstrip(), flush=True)
+        threading.Thread(target=_fwd, daemon=True).start()
 
     def stop(self) -> None:
-        self._running = False
-
-    def _capture_loop(self):
-        """Poll MediaController for audio data, downmix 8ch to mono, publish as AudioChunk."""
-        while self._running:
-            try:
-                audio = self._media_ctrl.get_audio_capture_data()
-                if audio.channels == 0 or len(audio.audio_data) == 0:
-                    time.sleep(0.02)
-                    continue
-
-                # Downmix: extract channel 0 from interleaved 8-channel data
-                channels = audio.channels  # 8
-                samples = audio.audio_data  # int16 list, interleaved
-                mono_samples = samples[::channels]  # Take every 8th sample (ch0)
-
-                # Pack as PCM bytes
-                pcm_bytes = struct.pack(f'<{len(mono_samples)}h', *mono_samples)
-
-                # Publish as AudioChunk (matches Agent Core expectation)
-                msg = AudioChunk()
-                msg.format = "pcm_16k_16bit_mono"
-                msg.data = pcm_bytes
-                self._pub.publish(msg)
-
-            except Exception as e:
-                self._node.get_logger().warn(f"Mic capture error: {e}")
-                time.sleep(0.5)
+        if self._proc:
+            self._proc.terminate()
+            self._proc = None
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
@@ -570,7 +600,7 @@ class MicPlugin:
         if action == "stop":
             return {"state": "idle"}
         if action == "info":
-            return {"state": "running" if self._running else "idle", "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}]}
+            return {"state": "running" if self._proc and self._proc.poll() is None else "idle"}
         return None
 
 
@@ -715,7 +745,93 @@ class SpeakerPlugin:
         return {"state": "playing", "input_topic": input_topic}
 
 
-# ── CameraPlugin (sensor) ────────────────────────────────────────────────────
+# ── CameraPlugin (sensor, subprocess) ────────────────────────────────────────
+
+def _camera_subprocess(namespace: str):
+    """Camera subprocess — captures Realsense D435i color+depth, publishes to ROS2."""
+    import time as _time
+    import numpy as _np
+
+    import rclpy as _rclpy
+    from rclpy.node import Node as _Node
+    from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+    from sensor_msgs.msg import CompressedImage as _CompressedImage
+    from sensor_msgs.msg import Image as _SensorImage
+
+    _QOS = QoSProfile(
+        reliability=ReliabilityPolicy.BEST_EFFORT,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=1,
+        durability=DurabilityPolicy.VOLATILE,
+    )
+
+    import pyrealsense2 as rs
+    import cv2
+
+    # Try turbojpeg for faster encoding, fallback to cv2
+    try:
+        from turbojpeg import TurboJPEG, TJPF_BGR
+        _tj = TurboJPEG()
+        def encode_jpeg(bgr_image):
+            return _tj.encode(bgr_image, pixel_format=TJPF_BGR, quality=80)
+        print("[camera_subprocess] using TurboJPEG encoder", flush=True)
+    except ImportError:
+        def encode_jpeg(bgr_image):
+            _, buf = cv2.imencode('.jpg', bgr_image, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            return buf.tobytes()
+        print("[camera_subprocess] using cv2 JPEG encoder", flush=True)
+
+    _rclpy.init()
+    node = _Node("bumi_camera_sub")
+    color_topic = f"/{namespace}/camera/color"
+    depth_topic = f"/{namespace}/camera/depth"
+    color_pub = node.create_publisher(_CompressedImage, color_topic, _QOS)
+    depth_pub = node.create_publisher(_SensorImage, depth_topic, _QOS)
+
+    pipeline = rs.pipeline()
+    config = rs.config()
+    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+    config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+
+    try:
+        pipeline.start(config)
+    except Exception as e:
+        print(f"[camera_subprocess] Realsense pipeline start failed: {e}", flush=True)
+        return
+
+    print(f"[camera_subprocess] publishing color→{color_topic} depth→{depth_topic}", flush=True)
+
+    try:
+        while True:
+            frames = pipeline.wait_for_frames(timeout_ms=1000)
+
+            color_frame = frames.get_color_frame()
+            if color_frame:
+                color_image = _np.asanyarray(color_frame.get_data())
+                jpeg_bytes = encode_jpeg(color_image)
+                msg = _CompressedImage()
+                msg.header.stamp = node.get_clock().now().to_msg()
+                msg.format = "jpeg"
+                msg.data = jpeg_bytes
+                color_pub.publish(msg)
+
+            depth_frame = frames.get_depth_frame()
+            if depth_frame:
+                depth_image = _np.asanyarray(depth_frame.get_data())
+                msg = _SensorImage()
+                msg.header.stamp = node.get_clock().now().to_msg()
+                msg.height = depth_image.shape[0]
+                msg.width = depth_image.shape[1]
+                msg.encoding = "16UC1"
+                msg.is_bigendian = 0
+                msg.step = msg.width * 2
+                msg.data = depth_image.tobytes()
+                depth_pub.publish(msg)
+    except Exception as e:
+        print(f"[camera_subprocess] error: {e}", flush=True)
+    finally:
+        pipeline.stop()
+
 
 class CameraPlugin:
     PREFIX = "camera"
@@ -724,12 +840,7 @@ class CameraPlugin:
         self._namespace = namespace
         self._color_topic = f"/{namespace}/camera/color"
         self._depth_topic = f"/{namespace}/camera/depth"
-        self._node = Node("bumi_camera")
-        self._color_pub = self._node.create_publisher(CompressedImage, self._color_topic, _LOW_LAT_QOS)
-        self._depth_pub = self._node.create_publisher(SensorImage, self._depth_topic, _LOW_LAT_QOS)
-        executor.add_node(self._node)
-        self._running = False
-        self._thread: threading.Thread | None = None
+        self._proc: subprocess.Popen | None = None
 
     def get_tools(self) -> list:
         return [
@@ -752,67 +863,21 @@ class CameraPlugin:
         ]
 
     def start(self) -> None:
-        self._running = True
-        self._thread = threading.Thread(target=self._camera_loop, daemon=True, name="bumi_camera")
-        self._thread.start()
+        import sys
+        self._proc = subprocess.Popen(
+            [sys.executable, "-c",
+             f"import sys; sys.path.insert(0, '/work'); from device import _camera_subprocess; _camera_subprocess({self._namespace!r})"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        def _fwd():
+            for line in self._proc.stdout:
+                print(line.decode(errors='replace').rstrip(), flush=True)
+        threading.Thread(target=_fwd, daemon=True).start()
 
     def stop(self) -> None:
-        self._running = False
-
-    def _camera_loop(self):
-        """Capture from Realsense D435i using pyrealsense2."""
-        try:
-            import pyrealsense2 as rs
-            import numpy as np
-            import cv2
-        except ImportError as e:
-            self._node.get_logger().error(f"Camera dependencies missing: {e}")
-            return
-
-        pipeline = rs.pipeline()
-        config = rs.config()
-        config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-        config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
-
-        try:
-            pipeline.start(config)
-        except Exception as e:
-            self._node.get_logger().error(f"Realsense pipeline start failed: {e}")
-            return
-
-        import base64
-        try:
-            while self._running:
-                frames = pipeline.wait_for_frames(timeout_ms=1000)
-
-                color_frame = frames.get_color_frame()
-                if color_frame:
-                    color_image = np.asanyarray(color_frame.get_data())
-                    _, jpeg_buf = cv2.imencode('.jpg', color_image, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                    msg = CompressedImage()
-                    msg.header.stamp = self._node.get_clock().now().to_msg()
-                    msg.format = "jpeg"
-                    msg.data = jpeg_buf.tobytes()
-                    self._color_pub.publish(msg)
-
-                depth_frame = frames.get_depth_frame()
-                if depth_frame:
-                    depth_image = np.asanyarray(depth_frame.get_data())
-                    # Publish raw Z16 data (uint16 mm) — dashboard renderer applies colormap
-                    msg = SensorImage()
-                    msg.header.stamp = self._node.get_clock().now().to_msg()
-                    msg.height = depth_image.shape[0]
-                    msg.width = depth_image.shape[1]
-                    msg.encoding = "16UC1"
-                    msg.is_bigendian = 0
-                    msg.step = msg.width * 2
-                    msg.data = depth_image.tobytes()
-                    self._depth_pub.publish(msg)
-
-        except Exception as e:
-            self._node.get_logger().error(f"Camera loop error: {e}")
-        finally:
-            pipeline.stop()
+        if self._proc:
+            self._proc.terminate()
+            self._proc = None
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
