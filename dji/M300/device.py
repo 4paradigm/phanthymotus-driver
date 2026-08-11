@@ -1289,7 +1289,7 @@ class TimeSyncPlugin:
     def get_tool(self) -> dict:
         return {
             "name": "aircraft_info",
-            "type": "resource",
+            "type": "actuator",
             "description": "飞机信息查询：机型、固件版本、连接状态、GPS 对时。",
             "inputSchema": {
                 "type": "object",
