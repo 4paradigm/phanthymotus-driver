@@ -4805,22 +4805,14 @@ class RobotFaultsPlugin:
         self._self_check_available = False
 
         # 自检状态判定:
-        #   开始: bodycontrol_state 1→0 (proc_manager 触发自检的瞬间)
-        #   完成: 短促提示音 (audio progress duration < 2.5s) 或 灯效 cmd=22
+        #   开始: bodycontrol_state 1→0 (proc_manager 触发自检的瞬间, 同时禁用 TTS)
+        #   完成: 短促提示音 (duration < 2000ms)
         self._self_check_started = False
         self._self_check_completed = False
-        # 自检序列检测窗口 (辅助开始判定)
-        self._audio_window_start_ms = None   # 当前统计窗口起点
-        self._audio_window_count = 0         # 当前窗口内的音频事件数
-        self._audio_window_threshold = 3     # 窗口内事件数阈值
-        self._audio_window_ms = 30000        # 窗口长度 (30s)
         # 短提示音判定 (自检完成)
-        self._short_prompt_threshold_ms = 2500   # < 2.5s 视为短促提示音
-        # 灯效信号 (自检完成)
-        self._light_ctrl_topic = "/xsys/light/ctrl"
-        self._light_ctrl_subscribed = False
+        self._short_prompt_threshold_ms = 2000   # < 2.0s 视为短促提示音
+
         # 音频进度 duration 跟踪 (sid -> duration)
-        self._last_audio_event_ts = None
         self._audio_event_available = False
         self._sid_duration = {}
         self._max_sid_track = 20
@@ -4828,6 +4820,11 @@ class RobotFaultsPlugin:
         # 订阅节点 (domain 0) — 接收身体故障
         self._sub_node = Node("tianyi2_robot_faults_sub", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._sub_node)
+        # TTS 禁用发布节点
+        self._pub_node = Node("tianyi2_robot_faults_pub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._pub_node)
+        self._tts_enable_pub = None
+        self._tts_enabled_before_check = True  # 自检前的 TTS 状态
 
     def get_tool(self) -> dict:
         return {
@@ -4927,30 +4924,24 @@ class RobotFaultsPlugin:
         except ImportError:
             print("[RobotFaultsPlugin] NodeState not available, self check disabled")
 
-        # 方案B: 音频播放事件 + 进度订阅 (检测自检提示音)
+        # 音频进度订阅 (短促提示音 → 自检完成)
         try:
-            from lyre_msgs.msg import PlayEvent, PlayProgress
-            self._sub_node.create_subscription(
-                PlayEvent, "/audio_play/event",
-                self._on_play_event, _LOW_LAT_QOS)
+            from lyre_msgs.msg import PlayProgress
             self._sub_node.create_subscription(
                 PlayProgress, "/audio_play/progress",
                 self._on_play_progress, _LOW_LAT_QOS)
             self._audio_event_available = True
-            print("[RobotFaultsPlugin] audio event + progress subscription created")
+            print("[RobotFaultsPlugin] audio progress subscription created")
         except ImportError:
-            print("[RobotFaultsPlugin] PlayEvent/PlayProgress not available, audio event disabled")
+            print("[RobotFaultsPlugin] PlayProgress not available, audio progress disabled")
 
-        # 灯效控制订阅 (LightCtrl) — proc_manager 自检信号 (cmd 20/21/22)
+        # TTS 禁用 publisher
         try:
-            from bodyctrl_msgs.msg import LightCtrl
-            self._sub_node.create_subscription(
-                LightCtrl, self._light_ctrl_topic,
-                self._on_light_ctrl, _RELIABLE_QOS)
-            print("[RobotFaultsPlugin] light ctrl subscription created")
-            self._light_ctrl_subscribed = True
+            from std_msgs.msg import Bool
+            self._tts_enable_pub = self._pub_node.create_publisher(
+                Bool, "/audio_chat/enable", _RELIABLE_QOS)
         except ImportError:
-            print("[RobotFaultsPlugin] LightCtrl not available, light ctrl disabled")
+            print("[RobotFaultsPlugin] std_msgs not available, TTS control disabled")
 
         # 完整数据发布线程 (1Hz → topic)
         print("[RobotFaultsPlugin] started")
@@ -5063,76 +5054,56 @@ class RobotFaultsPlugin:
 
     def _on_self_check(self, msg):
         """bodycontrol_state 回调。
-        state 1→0: 自检触发（瞬间跳变，作为自检开始的信号）;
-        state 0→1: 自检服务恢复就绪，不代表自检完成。"""
+        state 1→0: 自检触发 → 置 started, 禁用 TTS 防止音频误触发完成判定;
+        state 0→1: 服务恢复就绪，不代表完成。"""
         now_ms = int(time.time() * 1000)
         with self._lock:
             prev_state = self._self_check_state.state if self._self_check_state is not None else None
             self._self_check_state = msg
             self._last_update_ms = now_ms
-            # 自检开始: Running(1) → Initing(0)（瞬间跳变，仅作为开始标志）
+            # 自检开始: Running(1) → Initing(0)
             if prev_state == 1 and msg.state == 0:
                 self._self_check_started = True
                 self._self_check_completed = False
-                self._audio_window_start_ms = None
-                self._audio_window_count = 0
-                print(f"[RobotFaultsPlugin] self-check triggered (state 1→0)")
-
-    def _on_play_event(self, msg):
-        """音频播放事件辅助确认自检开始（规律提示音）。"""
-        now_ms = int(time.time() * 1000)
-        with self._lock:
-            self._last_audio_event_ts = now_ms
-            if msg.event not in (1, 2):
-                return
-            # 30s 内 3+ 个完成事件 → 规律自检提示音，辅助确认自检开始
-            if self._audio_window_start_ms is None:
-                self._audio_window_start_ms = now_ms
-            elif (now_ms - self._audio_window_start_ms) > self._audio_window_ms:
-                self._audio_window_start_ms = now_ms
-                self._audio_window_count = 0
-            self._audio_window_count += 1
-            if not self._self_check_started and self._audio_window_count >= self._audio_window_threshold:
-                self._self_check_started = True
-                self._self_check_completed = False
-                print(f"[RobotFaultsPlugin] self-check confirmed by audio ({self._audio_window_count} events)")
+                # 禁用 TTS，防止用户对话的短音频被误判为自检完成提示音
+                self._disable_tts()
+                print(f"[RobotFaultsPlugin] self-check triggered (state 1→0, TTS disabled)")
 
     def _on_play_progress(self, msg):
-        """订阅 /audio_play/progress, 用于获取每个 sid 的真实 duration.
-        短促提示音 (duration < 2.5s) → 自检完成信号。"""
+        """订阅 /audio_play/progress, 短促提示音 (duration < 2.0s) → 自检完成."""
         with self._lock:
             if msg.sid:
                 self._sid_duration[msg.sid] = msg.duration
-                # 保持字典不过大
                 if len(self._sid_duration) > self._max_sid_track:
                     keys = sorted(self._sid_duration.keys())
                     for k in keys[:len(keys) - self._max_sid_track]:
                         self._sid_duration.pop(k, None)
-                # 短促提示音 → 自检完成
                 if (self._self_check_started and not self._self_check_completed
                         and msg.duration is not None
                         and msg.duration < self._short_prompt_threshold_ms):
                     self._self_check_completed = True
                     self._self_check_started = False
+                    self._enable_tts()
                     print(f"[RobotFaultsPlugin] self-check completed by short prompt "
-                          f"(sid={msg.sid}, duration={msg.duration}ms)")
+                          f"(sid={msg.sid}, duration={msg.duration}ms, TTS re-enabled)")
 
-    def _on_light_ctrl(self, msg):
-        """proc_manager 灯效反馈, cmd 21=自检启动/22=自检成功.
-        仅用 cmd=22 作为自检完成的辅助确认。"""
-        now_ms = int(time.time() * 1000)
-        with self._lock:
-            self._last_update_ms = now_ms
-            from_ = getattr(msg, "caller_id", "?")
-            if msg.cmd == 22 and self._self_check_started and not self._self_check_completed:
-                self._self_check_completed = True
-                self._self_check_started = False
-                print(f"[RobotFaultsPlugin] self-check completed via light_ctrl cmd=22 "
-                      f"(caller={from_})")
-            elif msg.cmd == 21:
-                print(f"[RobotFaultsPlugin] light_ctrl cmd=21 (caller={from_})")
-            else:
-                print(f"[RobotFaultsPlugin] light ctrl: cmd={msg.cmd} caller={from_}")
+    # ── TTS 控制 ────────────────────────────────────────────────────────
+
+    def _disable_tts(self):
+        """自检开始时禁用 TTS, 防止用户对话短音频误判为完成提示音."""
+        if self._tts_enable_pub is not None:
+            from std_msgs.msg import Bool
+            msg = Bool()
+            msg.data = False
+            self._tts_enable_pub.publish(msg)
+
+    def _enable_tts(self):
+        """自检完成后恢复 TTS."""
+        if self._tts_enable_pub is not None:
+            from std_msgs.msg import Bool
+            msg = Bool()
+            msg.data = True
+            self._tts_enable_pub.publish(msg)
 
     # ── 按需查询执行器 ─────────────────────────────────────────────────────
 
@@ -5265,7 +5236,7 @@ class RobotFaultsPlugin:
                 imu_lines.append(f"部分缺失:{','.join(missing)}")
                 issues.append(f"IMU部分数据缺失: {', '.join(missing)}")
 
-        # ── 自检状态 (简化: state 1→0=开始, 0→1=完成) ──
+        # ── 自检状态 (state 1→0=开始+TTS禁用, 短提示音=完成+TTS恢复) ──
         # 自检中 = 检测到开始信号 且 未检测到完成信号
         self_check_available = self._self_check_available and self._self_check_state is not None
         self_check_lines = []
