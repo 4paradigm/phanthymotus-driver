@@ -2,6 +2,11 @@ mcp_port: 15707
 ros_namespace: ""   # 留空则自动使用 hostname
 name: "Tianyi 2.0 Pro"
 
+# Run the skeleton publisher in its own ROS process. The main bundle keeps
+# the other cards but does not publish a competing joints topic.
+joints_bridge:
+  enabled: true
+
 slamtec:
   base_url: "http://192.168.11.1:1448"
 
@@ -60,6 +65,15 @@ plugins:
     enabled: true
     native_slam_pcd_dir: "/opt/phanthy-motus/data/maps"
     native_slam_db_path: "/opt/phanthy-motus/data/controlled_spatial.db"
+  controlled_spatial_map:
+    enabled: true
+    native_slam_db_path: "/opt/phanthy-motus/data/controlled_spatial.db"
+    cache_dir: "/opt/phanthy-motus/data/map-visuals"
+    poll_hz: 3.0
+    artifact_hz: 0.4
+    head_pointcloud_enabled: true
+    head_pointcloud_topic: "/ob_camera_head/depth/points"
+    head_recording_enabled: false
   robot_faults:
     enabled: true
   laser_scan:
