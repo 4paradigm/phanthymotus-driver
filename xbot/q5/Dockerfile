@@ -1,15 +1,28 @@
 # Q5 外挂 PC 驱动构建上下文
 # SDK 全部为本地 vendor，构建时不访问网络拉取
+#
+# 构建参数：
+#   ROS_BASE_IMAGE  — 基础镜像（默认 ros:humble，需预先 docker pull）
+#   PYPI_MIRROR     — pip 镜像（默认 https://pypi.tuna.tsinghua.edu.cn/simple/）
+#   APT_MIRROR      — apt 镜像站点（默认 mirrors.tuna.tsinghua.edu.cn，留空则用默认源）
 
 ARG ROS_BASE_IMAGE=ros:humble
-ARG PYPI_MIRROR=https://pypi.org/simple/
+ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
+ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
+ARG APT_MIRROR
 
 WORKDIR /work
 
-RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
-    apt-get install -y --no-install-recommends --allow-unauthenticated \
+# 替换 apt 源为国内镜像（arm64 用 ubuntu-ports）
+RUN if [ -n "$APT_MIRROR" ]; then \
+        sed -i "s|ports.ubuntu.com|${APT_MIRROR}|g" /etc/apt/sources.list && \
+        sed -i "s|archive.ubuntu.com|${APT_MIRROR}|g" /etc/apt/sources.list; \
+    fi
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
         python3-pip \
         python3-colcon-common-extensions \
         cmake \
