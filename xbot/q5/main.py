@@ -366,16 +366,15 @@ def main():
     print(f"[bundle] namespace={namespace} mcp_port={mcp_port}")
 
     # ROS2 init — Domain ID 211 for Q5 (set via ROS_DOMAIN_ID env var)
-    ctx = rclpy.context.Context()
-    rclpy.init(context=ctx)
-    executor = rclpy.executors.MultiThreadedExecutor(context=ctx)
+    rclpy.init()
+    executor = rclpy.executors.MultiThreadedExecutor()
     print(f"[bundle] ROS2 initialized on domain {os.environ.get('ROS_DOMAIN_ID', '?')}")
 
     _bundle = Q5DeviceBundle(cfg, namespace, executor)
     _bundle.start_all()
 
     def _spin():
-        while rclpy.ok(context=ctx):
+        while rclpy.ok():
             executor.spin_once(timeout_sec=0.1)
 
     spin_thread = threading.Thread(target=_spin, daemon=True, name="bundle_spin")
@@ -399,7 +398,7 @@ def main():
     finally:
         _bundle.stop_all()
         executor.shutdown()
-        rclpy.shutdown(context=ctx)
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":
