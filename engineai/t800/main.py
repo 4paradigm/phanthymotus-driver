@@ -94,6 +94,7 @@ class T800DeviceBundle:
             NativeSdkPlugin,
             SafetyControlPlugin,
             StatePlugin,
+            SystemHealthPlugin,
             TtsPlugin,
         )
         from virtual_gamepad import VirtualGamepadPlugin
@@ -116,6 +117,7 @@ class T800DeviceBundle:
             ("motor_power", MotorPowerPlugin, (config, namespace, ros2)),
             ("native_node_control", NativeNodeControlPlugin, (config, namespace, ros2)),
             ("safety", SafetyControlPlugin, (config, namespace, ros2, state)),
+            ("system_health", SystemHealthPlugin, (config, namespace, ros2, state)),
         )
         instances = {}
         for key, cls, args in plugin_types:

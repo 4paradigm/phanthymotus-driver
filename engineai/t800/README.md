@@ -28,6 +28,7 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 | `robot_snapshot` | sensor | 运动、关节、IMU、电源和电机健康聚合快照 |
 | `fault_summary` | sensor | 电机掉线/禁用/错误/过温及电源错误摘要 |
 | `stability` | sensor | 基于 IMU 的倾斜和跌倒风险估计 |
+| `system_health` | sensor | 驱动连接、电机故障、电池状态、机身稳定性的四级健康聚合诊断与处置建议 |
 | `joint_groups` | sensor | 腿、躯干、双臂、头部和全身关节名称/索引映射 |
 | `capabilities` | sensor | Driver 能力发现、原生状态和已知限制 |
 | `ros_graph` | sensor | 实时发现固件节点、topic、service 和尚未映射的新接口 |

@@ -1707,3 +1707,189 @@ class SafetyControlPlugin:
         msg.damping = [1.0] * len(T800_JOINT_NAMES)
         msg.parallel_parser_type = 0
         self._joint_pub.publish(msg)
+
+
+# ── SystemHealthPlugin (sensor) ──────────────────────────────────────────────
+
+class SystemHealthPlugin:
+    """Aggregated system health diagnostic — driver, motor, battery, stability."""
+
+    def __init__(self, config: dict, namespace: str, ros2, state: StatePlugin):
+        self._config = config
+        self._state = state
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "system_health",
+            "type": "sensor",
+            "multiInstance": False,
+            "readOnly": True,
+            "description": "T800 系统健康聚合诊断，综合驱动连接、电机故障、电池状态、机身稳定性输出健康等级和处置建议",
+            "inputSchema": {"type": "object", "properties": {}},
+        }
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
+        return self._diagnose()
+
+    def _diagnose(self) -> dict:
+        driver_health = self._state._snapshot("driver_health")
+        fault_summary = self._state._derived_snapshot("fault_summary")
+        stability = self._state._derived_snapshot("stability")
+        battery = self._state._snapshot("battery")
+
+        # --- issues collection ---
+        issues: list[dict] = []
+
+        # Critical: motor
+        for entry in fault_summary.get("offline_joints", []):
+            issues.append({"severity": "critical", "category": "motor",
+                           "message": f"关节 {entry} 掉线"})
+        for entry in fault_summary.get("motor_errors", []):
+            issues.append({"severity": "critical", "category": "motor",
+                           "message": f"关节 {entry['joint_index']} 电机错误码 {entry['code']}"})
+        power_err = fault_summary.get("power_error_code", 0)
+        if power_err != 0:
+            issues.append({"severity": "critical", "category": "battery",
+                           "message": f"电源错误码 {power_err}"})
+        if fault_summary.get("disabled_joints"):
+            issues.append({"severity": "warning", "category": "motor",
+                           "message": f"关节 {fault_summary['disabled_joints']} 电机禁用"})
+
+        # Critical: stability
+        if stability.get("state") == "fall_risk":
+            tilt = float(stability.get("tilt_rad", 0.0))
+            issues.append({"severity": "critical", "category": "stability",
+                           "message": f"跌倒风险，倾斜 {tilt:.3f} rad"})
+
+        # Critical: battery
+        batt_pct = float(battery.get("percentage") or 100)
+        if batt_pct <= 10:
+            issues.append({"severity": "critical", "category": "battery",
+                           "message": f"电量极低 {int(batt_pct)}%"})
+
+        # Warning: motor
+        for entry in fault_summary.get("hot_motors", []):
+            issues.append({"severity": "warning", "category": "motor",
+                           "message": f"关节 {entry['joint_index']} 过温 {entry['temperature_c']:.1f}°C"})
+
+        # Warning: stability
+        if stability.get("state") == "tilted":
+            tilt = float(stability.get("tilt_rad", 0.0))
+            issues.append({"severity": "warning", "category": "stability",
+                           "message": f"机身倾斜 {tilt:.3f} rad"})
+
+        # Warning: battery
+        if 10 < batt_pct <= 30:
+            issues.append({"severity": "warning", "category": "battery",
+                           "message": f"电量偏低 {int(batt_pct)}%"})
+
+        # Warning: driver
+        stale_names = [
+            name for name, src in driver_health.get("sources", {}).items()
+            if src.get("stale", False)
+        ]
+        for name in stale_names:
+            issues.append({"severity": "warning", "category": "driver",
+                           "message": f"数据源 {name} 数据超时"})
+
+        # Sort: critical first
+        issues.sort(key=lambda i: 0 if i["severity"] == "critical" else 1)
+
+        # --- recommendations ---
+        rec_set: set[str] = set()
+        if fault_summary.get("offline_joints"):
+            rec_set.add("检查掉线关节连接线与供电")
+        if fault_summary.get("motor_errors"):
+            rec_set.add("排查电机故障码，必要时停机检修")
+        if fault_summary.get("disabled_joints"):
+            rec_set.add("检查电机禁用状态，确认是否为安全保护触发")
+        if fault_summary.get("hot_motors"):
+            rec_set.add("降低负载，等待电机降温")
+        if power_err != 0:
+            rec_set.add("检查电源系统")
+        if batt_pct <= 30:
+            rec_set.add("立即充电" if batt_pct <= 10 else "尽快充电")
+        if stability.get("state") == "fall_risk":
+            rec_set.add("立即停止运动，切换 passive 或人工扶持")
+        if stability.get("state") == "tilted":
+            rec_set.add("注意机身姿态，避免剧烈动作")
+        if stale_names:
+            rec_set.add("检查 ROS2 话题连接")
+        deduped_recs = list(rec_set)
+
+        # --- level ---
+        has_critical = any(i["severity"] == "critical" for i in issues)
+        has_warning = any(i["severity"] == "warning" for i in issues)
+
+        batt_stale = battery.get("stale", True)
+        if (driver_health.get("state") == "waiting"
+                or fault_summary.get("source_stale", True)
+                or stability.get("state") == "no_data"
+                or batt_stale):
+            level = "unknown"
+        elif has_critical:
+            level = "critical"
+        elif has_warning:
+            level = "warning"
+        else:
+            level = "ok"
+
+        # --- subsystems ---
+        motor_state = "ok"
+        if fault_summary.get("source_stale", True):
+            motor_state = "unknown"
+        elif any(i["severity"] == "critical" and i["category"] == "motor" for i in issues):
+            motor_state = "critical"
+        elif any(i["severity"] == "warning" and i["category"] == "motor" for i in issues):
+            motor_state = "warning"
+
+        batt_state = "ok"
+        if batt_stale:
+            batt_state = "unknown"
+        elif any(i["severity"] == "critical" and i["category"] == "battery" for i in issues):
+            batt_state = "critical"
+        elif any(i["severity"] == "warning" and i["category"] == "battery" for i in issues):
+            batt_state = "warning"
+
+        stab_state = stability.get("state", "unknown")
+        if stab_state == "no_data":
+            stab_state = "unknown"
+
+        return {
+            "level": level,
+            "subsystems": {
+                "driver": {"state": driver_health.get("state", "unknown"),
+                           "stale_sources": stale_names},
+                "motor": {
+                    "state": motor_state,
+                    "offline_count": len(fault_summary.get("offline_joints", [])),
+                    "error_count": len(fault_summary.get("motor_errors", [])),
+                    "hot_count": len(fault_summary.get("hot_motors", [])),
+                    "disabled_count": len(fault_summary.get("disabled_joints", [])),
+                },
+                "battery": {
+                    "state": batt_state,
+                    "percentage": int(batt_pct),
+                    "voltage_v": float(battery.get("voltage_v", 0) or 0),
+                    "current_a": float(battery.get("current_a", 0) or 0),
+                    "error_code": int(battery.get("error_code", 0) or 0),
+                },
+                "stability": {
+                    "state": stab_state,
+                    "tilt_rad": float(stability.get("tilt_rad", 0.0)),
+                },
+            },
+            "issues": issues,
+            "recommendations": deduped_recs,
+            "timestamp_ms": _now_ms(),
+        }

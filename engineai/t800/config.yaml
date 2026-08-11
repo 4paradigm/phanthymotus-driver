@@ -76,6 +76,8 @@ plugins:
     rate_hz: 20.0
   safety:
     enabled: true
+  system_health:
+    enabled: true
   native_sdk:
     enabled: true
     mode: "external"       # external | process | systemd
