@@ -12,6 +12,11 @@ plugins:
     enabled: true
   loco:
     enabled: true
+  continuous_gait:
+    enabled: true
+  bms_control:
+    enabled: true
+    command_topic: rt/lf/bmscmd
   arm:
     enabled: true
   state:
