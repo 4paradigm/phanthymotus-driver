@@ -458,7 +458,8 @@ class LocoPlugin:
         self._move_stop_event.set()
         if self._move_thread and self._move_thread.is_alive():
             self._move_thread.join(timeout=1)
-        self._publish_cmd(0, 0, 0, _get_default_cmd(), 0)
+        if self._high_ctrl is not None:
+            self._publish_cmd(0, 0, 0, _get_default_cmd(), 0)
         return {"state": "stopped"}
 
     def _do_switch(self, args: dict) -> dict:
