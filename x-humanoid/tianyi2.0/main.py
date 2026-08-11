@@ -258,7 +258,10 @@ class TianyiDeviceBundle:
 
         if plugins_cfg.get("state", {}).get("enabled", False):
             from device import StatePlugin
-            self._plugins.append(StatePlugin(plugins_cfg["state"], namespace, ros2))
+            state_cfg = dict(plugins_cfg["state"])
+            if cfg.get("joints_bridge", {}).get("enabled", False):
+                state_cfg["publish_joints"] = False
+            self._plugins.append(StatePlugin(state_cfg, namespace, ros2))
             print("[bundle] StatePlugin loaded")
 
         if plugins_cfg.get("camera", {}).get("enabled", False):
@@ -367,6 +370,12 @@ class TianyiDeviceBundle:
             self._plugins.append(ControlledSpatialPlugin(plugins_cfg["controlled_spatial"], namespace, ros2, slamtec_client))
             print("[bundle] ControlledSpatialPlugin loaded")
 
+        if plugins_cfg.get("controlled_spatial_map", {}).get("enabled", False):
+            from controlled_spatial_map import ControlledSpatialMapPlugin
+            self._plugins.append(ControlledSpatialMapPlugin(
+                plugins_cfg["controlled_spatial_map"], namespace, ros2, slamtec_client))
+            print("[bundle] ControlledSpatialMapPlugin loaded")
+
         if plugins_cfg.get("robot_faults", {}).get("enabled", False):
             from device import HealthCheckPlugin
             self._plugins.append(HealthCheckPlugin(plugins_cfg["robot_faults"], namespace, ros2, slamtec_client))
@@ -438,6 +447,25 @@ class TianyiDeviceBundle:
 # ── MCP HTTP server ───────────────────────────────────────────────────────────
 
 _bundle: TianyiDeviceBundle | None = None
+_joints_bridge_proc: subprocess.Popen | None = None
+
+
+def _start_joints_bridge(cfg: dict) -> None:
+    global _joints_bridge_proc
+    if not cfg.get("joints_bridge", {}).get("enabled", False):
+        return
+    bridge_path = Path(__file__).parent / "joints_bridge.py"
+    bridge_env = os.environ.copy()
+    bridge_env["CONFIG_PATH"] = os.environ.get(
+        "CONFIG_PATH", str(Path(__file__).parent / "config.yaml"))
+    try:
+        _joints_bridge_proc = subprocess.Popen(
+            [sys.executable, str(bridge_path)],
+            env=bridge_env,
+        )
+        print(f"[bundle] joints bridge started (pid={_joints_bridge_proc.pid})", flush=True)
+    except Exception as e:
+        print(f"[bundle] joints bridge FAILED: {e}", flush=True)
 
 
 def make_handler():
@@ -623,6 +651,7 @@ def main():
 
     _bundle = TianyiDeviceBundle(cfg, namespace, ros2, slamtec_client, remote_mics=remote_mics)
     _bundle.start_all()
+    _start_joints_bridge(cfg)
 
     _start_registration(mcp_port, cfg.get("name", "Tianyi 2.0 Pro"), "driver")
 
@@ -631,6 +660,8 @@ def main():
 
     def _shutdown(signum, frame):
         print(f"[bundle] signal {signum}, shutting down")
+        if _joints_bridge_proc is not None:
+            _joints_bridge_proc.terminate()
         _bundle.stop_all()
         threading.Thread(target=server.shutdown, daemon=True).start()
 
@@ -640,6 +671,8 @@ def main():
     try:
         server.serve_forever()
     finally:
+        if _joints_bridge_proc is not None and _joints_bridge_proc.poll() is None:
+            _joints_bridge_proc.terminate()
         _bundle.stop_all()
         ros2.shutdown()
 
