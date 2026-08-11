@@ -533,6 +533,11 @@ static int _psdk_core_init(const char *app_id, const char *app_key,
         return -1;
     }
 
+    /* The M300 needs time after application start before camera, HMS and
+     * liveview commands are accepted.  Initialising them immediately caused
+     * command timeouts despite a healthy PSDK heartbeat. */
+    _Osal_TaskSleepMs(5000);
+
     /* Camera init required even for non-camera payloads (Pilot won't detect otherwise) */
     rc = DjiPayloadCamera_Init();
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
@@ -1065,6 +1070,9 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
 /* ── Main ───────────────────────────────────────────────────────────────── */
 
 int main(int argc, char *argv[]) {
+    /* IPC peers may disconnect while a stream command is in flight.  Never
+     * let a write to that socket terminate the bridge process. */
+    signal(SIGPIPE, SIG_IGN);
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
 

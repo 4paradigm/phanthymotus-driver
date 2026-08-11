@@ -22,8 +22,11 @@ import signal
 import socket
 import sys
 import threading
+import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import yaml
 
@@ -175,6 +178,12 @@ _bundle: M300DeviceBundle | None = None
 
 
 def make_handler():
+    # Agent Core still uses the legacy MCP SSE transport.  Keep the current
+    # Streamable-HTTP endpoint as well so direct POST /mcp clients continue to
+    # work during the migration.
+    sse_sessions: dict[str, "Handler"] = {}
+    sse_sessions_lock = threading.Lock()
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             msg = fmt % args
@@ -193,7 +202,37 @@ def make_handler():
             self.end_headers()
             self.wfile.write(encoded)
 
+        def _send_sse(self, event: str, data: str) -> bool:
+            try:
+                payload = f"event: {event}\ndata: {data}\n\n".encode()
+                self.wfile.write(payload)
+                self.wfile.flush()
+                return True
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return False
+
         def do_GET(self):
+            if urlparse(self.path).path == "/mcp/sse":
+                session_id = uuid.uuid4().hex
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "keep-alive")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                with sse_sessions_lock:
+                    sse_sessions[session_id] = self
+                endpoint = f"/mcp/messages?session_id={session_id}"
+                try:
+                    if not self._send_sse("endpoint", endpoint):
+                        return
+                    # Do not let an idle proxy tear down the discovery stream.
+                    while self._send_sse("ping", "{}"):
+                        time.sleep(15)
+                finally:
+                    with sse_sessions_lock:
+                        sse_sessions.pop(session_id, None)
+                return
             self.send_response(404)
             self.end_headers()
 
@@ -205,6 +244,11 @@ def make_handler():
             self.end_headers()
 
         def do_POST(self):
+            parsed = urlparse(self.path)
+            if parsed.path not in ("/mcp", "/mcp/messages"):
+                self.send_response(404)
+                self.end_headers()
+                return
             length = int(self.headers.get("Content-Length", 0))
             raw = self.rfile.read(length)
             try:
@@ -220,19 +264,35 @@ def make_handler():
             method = rpc.get("method", "")
             params = rpc.get("params") or {}
 
+            session_id = parse_qs(parsed.query).get("session_id", [""])[0]
+            with sse_sessions_lock:
+                sse_client = sse_sessions.get(session_id)
+
+            def response(payload: dict):
+                if sse_client is not None:
+                    # Legacy MCP sends responses on the SSE stream and only
+                    # requires acknowledgement of the POST request.
+                    self.send_response(202)
+                    self.end_headers()
+                    if not sse_client._send_sse("message", json.dumps(payload)):
+                        with sse_sessions_lock:
+                            sse_sessions.pop(session_id, None)
+                else:
+                    self._send(200, json.dumps(payload))
+
             if rid is None:
                 self.send_response(202)
                 self.end_headers()
                 return
 
             def ok(result):
-                self._send(200, json.dumps({"jsonrpc": "2.0", "id": rid, "result": result}))
+                response({"jsonrpc": "2.0", "id": rid, "result": result})
 
             def err(code, msg):
-                self._send(200, json.dumps({
+                response({
                     "jsonrpc": "2.0", "id": rid,
                     "error": {"code": code, "message": msg},
-                }))
+                })
 
             try:
                 if method == "initialize":
@@ -380,6 +440,19 @@ def main():
         sys.exit(1)
     print(f"[bundle] BridgeClient connected (uart0={uart0_dev} uart1={uart1_dev})")
 
+    # A dead bridge used to leave the Python HTTP process serving a healthy
+    # looking but unusable port.  Exit the container when its only hardware
+    # backend exits so Docker's restart policy can recover it.
+    bridge_stopping = threading.Event()
+
+    def _watch_bridge() -> None:
+        exit_code = bridge_proc.wait()
+        if not bridge_stopping.is_set():
+            print(f"[bundle] FATAL: psdk_bridge exited ({exit_code}); restarting container", flush=True)
+            os._exit(1)
+
+    threading.Thread(target=_watch_bridge, daemon=True, name="bridge_watchdog").start()
+
     # ROS2
     rclpy.init()
     executor = rclpy.executors.MultiThreadedExecutor()
@@ -401,6 +474,7 @@ def main():
 
     def _shutdown(signum, frame):
         print(f"[bundle] signal {signum}, shutting down")
+        bridge_stopping.set()
         _bundle.stop_all()
         bridge_proc.terminate()
         threading.Thread(target=server.shutdown, daemon=True).start()
@@ -411,6 +485,7 @@ def main():
     try:
         server.serve_forever()
     finally:
+        bridge_stopping.set()
         _bundle.stop_all()
         bridge_proc.terminate()
         bridge_proc.wait(timeout=3)
