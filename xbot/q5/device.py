@@ -1426,9 +1426,9 @@ class AudioPlugin:
         # Action server on real machine: /audio_player/play (type: AudioPlay)
         self._action_client = ActionClient(self._node, AudioPlay, "/audio_player/play")
 
-        self._srv_volume = self._node.create_client(SetVolume, "audio_player/set_volume")
-        self._srv_stop = self._node.create_client(Trigger, "audio_player/stop_play")
-        self._srv_is_play = self._node.create_client(Trigger, "audio_player/is_play")
+        self._srv_volume = self._node.create_client(SetVolume, "/audio_player/set_volume")
+        self._srv_stop = self._node.create_client(Trigger, "/audio_player/stop_play")
+        self._srv_is_play = self._node.create_client(Trigger, "/audio_player/is_play")
 
         self._state = "idle"
         self._device = plugin_config.get("device", "plughw:2,0")
@@ -1454,6 +1454,10 @@ class AudioPlugin:
                          "description": "JSON item string (mode=2), e.g. {\"file_name\":\"x.wav\",\"text\":\"hello\"}"},
                 "force_play": {"type": "boolean", "description": "true=interrupt current audio, false=default"},
                 "timeout": {"type": "integer", "description": "Playback timeout in seconds"},
+                "file_name": {"type": "string", "description": "Audio file name (mode=3)"},
+                "channel": {"type": "string", "description": "Audio channel: default, channel1, channel2, channel3",
+                            "default": "default"},
+                "version": {"type": "string", "description": "Audio version: v1, v2", "default": "v1"},
                 "volume": {"type": "integer", "description": "Volume level 0-100 (for set_volume action)"},
             }},
             "default_action": "play",
@@ -1494,6 +1498,9 @@ class AudioPlugin:
         goal.id = int(args.get("id", 0))
         goal.path = str(args.get("path", ""))
         goal.item = str(args.get("item", ""))
+        goal.file_name = str(args.get("file_name", ""))
+        goal.channel = str(args.get("channel", "default"))
+        goal.version = str(args.get("version", "v1"))
         goal.timeout = int(args.get("timeout", 0))
         future = self._action_client.send_goal_async(goal)
         rclpy.spin_until_future_complete(self._node, future, timeout_sec=5.0)
@@ -1883,10 +1890,8 @@ class NavPlugin:
             return self._pause_nav()  # toggle
         if action == "status":
             return self._status()
-        if action in ("start", "info"):
+        if action == "info":
             return {"state": "active"}
-        if action == "stop":
-            return {"state": "idle"}
         return None
 
     def _start_nav(self, mode: str) -> dict:
@@ -2162,7 +2167,7 @@ class SimpleTrajectoryPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "execute":
-            return self._execute(int(args.get("traj_type", 3)),
+            return self._execute(int(args.get("traj_type", 0)),
                                  float(args.get("duration", 0.0)))
         if action in ("start", "info"):
             return {"state": "active", "action_server": self._srv_name,
