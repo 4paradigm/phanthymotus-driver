@@ -17,7 +17,8 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
         libportaudio2 \
         libasound2-dev \
         libssl-dev \
-        libeigen3-dev && \
+        libeigen3-dev \
+        libboost-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # Realsense SDK (D435i camera)
