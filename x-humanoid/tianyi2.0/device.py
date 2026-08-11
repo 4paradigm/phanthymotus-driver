@@ -4834,14 +4834,15 @@ class RobotFaultsPlugin:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["summary", "detail"],
+                    "action": {"type": "string", "enum": ["summary", "detail", "reset_self_check"],
                                "default": "summary",
-                               "description": "summary=可操作判定+子系统一句话概括; detail=完整结构化诊断数据"},
+                               "description": "summary=可操作判定; detail=完整诊断; reset_self_check=重置自检状态+恢复TTS"},
                 },
                 "required": ["action"],
                 "x-action-params": {
                     "summary": {"params": [], "description": "返回: 自检状态/急停/各子系统就绪/可否操作及原因"},
                     "detail": {"params": [], "description": "返回完整结构化诊断: 底盘/电机/手部/电源/IMU/自检详情+issues+advice"},
+                    "reset_self_check": {"params": [], "description": "手动重置自检状态(恢复TTS)，用于自检卡死时恢复"},
                 },
             },
         }
@@ -5309,6 +5310,13 @@ class RobotFaultsPlugin:
     def dispatch(self, action: str, args: dict) -> dict:
         if action in ("start", "stop", "info"):
             return {"state": "running" if self._running else "idle"}
+        if action == "reset_self_check":
+            with self._lock:
+                was_stuck = self._self_check_started
+                self._self_check_started = False
+                self._self_check_completed = False
+                self._enable_tts()
+            return {"state": "reset", "was_stuck": was_stuck}
         with self._lock:
             full = self._build_summary_locked()
         if action == "detail":
