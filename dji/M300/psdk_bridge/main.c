@@ -230,14 +230,21 @@ static T_DjiReturnCode _HalUart_Init(E_DjiHalUartNum uartNum, uint32_t baudRate,
     speed_t speed = _to_speed(baudRate);
     cfsetispeed(&tty, speed);
     cfsetospeed(&tty, speed);
-    /* Match the hzhy M300 HAL's line discipline exactly.  PSDK performs its
-     * own UART probe/reopen sequence; changing its flush or timing behaviour
-     * caused status-subscription commands to time out after core handshake. */
-    tty.c_cflag &= ~(PARENB | PARODD | CSTOPB | CSIZE | CRTSCTS);
-    tty.c_cflag |= CS8 | CLOCAL | CREAD;
-    tty.c_iflag = 0;
-    tty.c_oflag = 0;
-    tty.c_lflag = 0;
+    /* Keep the termios transformation byte-for-byte compatible with hzhy's
+     * Jetson M300 HAL.  In particular, do not zero all input flags: the
+     * carrier driver's remaining flags are part of the liveview control-link
+     * behaviour after PSDK's auto-baud probe. */
+    tty.c_cflag |= CLOCAL;
+    tty.c_cflag |= CREAD;
+    tty.c_cflag &= ~CRTSCTS;
+    tty.c_cflag &= ~CSIZE;
+    tty.c_cflag |= CS8;
+    tty.c_cflag &= ~PARENB;
+    tty.c_iflag &= ~INPCK;
+    tty.c_cflag &= ~CSTOPB;
+    tty.c_oflag &= ~OPOST;
+    tty.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
+    tty.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
     tty.c_cc[VMIN] = 0;
     tty.c_cc[VTIME] = 0;
     tcflush(handle->fd, TCIFLUSH);
@@ -332,7 +339,10 @@ static T_DjiReturnCode _HalUart_GetStatus(E_DjiHalUartNum uartNum, T_DjiUartStat
     T_M300Uart *uart = _HalUart_Get(uartNum);
     if (!uart || !status)
         return DJI_ERROR_SYSTEM_MODULE_CODE_INVALID_PARAMETER;
-    status->isConnect = (uart->open_handles > 0);
+    /* hzhy's platform reports both configured UARTs as available.  PSDK can
+     * query UART1 while its liveview status transaction is carried by UART0;
+     * reporting UART1 as disconnected changes that transaction's path. */
+    status->isConnect = true;
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
 
@@ -439,6 +449,21 @@ static int _psdk_core_init(const char *app_id, const char *app_key,
         _HalUart_LogHandshakeStats();
         return -1;
     }
+
+    /* Preserve the core identity sequence used by the verified hzhy M300
+     * sample before ApplicationStart.  These calls are intentionally made
+     * before the liveview stability window below. */
+    rc = DjiCore_SetAlias("PSDK_APPALIAS");
+    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS)
+        printf("[psdk] set alias failed: 0x%08llX\n", (unsigned long long)rc);
+    T_DjiFirmwareVersion firmwareVersion = { .majorVersion = 1, .minorVersion = 0,
+                                              .modifyVersion = 0, .debugVersion = 0 };
+    rc = DjiCore_SetFirmwareVersion(firmwareVersion);
+    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS)
+        printf("[psdk] set firmware version failed: 0x%08llX\n", (unsigned long long)rc);
+    rc = DjiCore_SetSerialNumber("PSDK12345678XX");
+    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS)
+        printf("[psdk] set serial number failed: 0x%08llX\n", (unsigned long long)rc);
 
     /* hzhy's verified M300 sequence initializes service modules before
      * announcing the application to Pilot, then initializes Liveview.  Do
