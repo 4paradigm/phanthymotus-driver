@@ -101,7 +101,6 @@ class ControlledSpatialMapPlugin:
     HEAD_FRAME_LIMIT = 9000
     HEAD_PROCESS_INTERVAL = 0.20
     HEAD_MAP_LIMIT = 300000
-    CALIBRATION_CAPTURE_LIMIT = 6
     _EXTRINSIC_STATE_KEY = "controlled_spatial_map_head_camera_extrinsic"
     _RECORDING_STATE_KEY = "controlled_spatial_map_head_recording_enabled"
 
@@ -117,13 +116,6 @@ class ControlledSpatialMapPlugin:
         self._db = _MapDB(config.get("native_slam_db_path", "/data/controlled_spatial/controlled_spatial.db"))
         self._cache_dir = config.get("cache_dir", "/data/controlled_spatial/map-visuals")
         os.makedirs(self._cache_dir, exist_ok=True)
-        # The former global cloud is intentionally left untouched. It has no
-        # reliable map association, so it must not be silently assigned to a
-        # newly selected 2D map.
-        self._legacy_head_map_path = config.get(
-            "head_map_path",
-            os.path.join(os.path.dirname(self._cache_dir), "tianyi_head_3d.npz"),
-        )
         self._head_map_dir = config.get(
             "head_map_dir", os.path.join(os.path.dirname(self._cache_dir), "head-3d")
         )
@@ -168,10 +160,7 @@ class ControlledSpatialMapPlugin:
         self._head_cloud = {}
         self._head_cloud_map_name = None
         self._head_hits = {}
-        self._latest_head_frame = None
         self._last_head_process = 0.0
-        self._calibration_frames = []
-        self._calibrating = False
         self._trajectory_max_points = max(50, int(config.get("trajectory_max_points", 400)))
         self._trajectory = deque(maxlen=self._trajectory_max_points)
         self._artifacts = {"walls": [], "tracks": [], "areas": {}}
@@ -232,7 +221,7 @@ class ControlledSpatialMapPlugin:
             candidate = self._validate_extrinsic(configured)
         except ValueError:
             # Nominal optical -> robot conversion. It is only a starting point
-            # for calibration and must not be treated as a factory measurement.
+            # before a persisted transform is available.
             candidate = {
                 "translation_m": [0.0, 0.0, 1.50],
                 "rotation_rpy_rad": [-math.pi / 2.0, 0.0, -math.pi / 2.0],
@@ -302,11 +291,10 @@ class ControlledSpatialMapPlugin:
         return world
 
     def _on_head_cloud(self, msg):
-        """Keep one downsampled raw camera frame; map it only while recording."""
+        """Project downsampled camera frames only while recording."""
         try:
             # PointCloud2 may arrive at camera frame rate. Throttle the
-            # expensive map projection and voxel merge while retaining the
-            # newest frame for calibration.
+            # expensive map projection and voxel merge.
             with self._lock:
                 recording = self._head_recording_enabled
                 if (recording and
@@ -345,7 +333,6 @@ class ControlledSpatialMapPlugin:
                 map_name = self._current_map
                 if pose is None or map_name is None:
                     return
-                self._latest_head_frame = (camera, pose)
                 # 3D capture is independent from the 2D map's mapping state.
                 # The spatial_map card's recording switch is the sole gate.
                 recording = self._head_recording_enabled
@@ -375,30 +362,16 @@ class ControlledSpatialMapPlugin:
         except Exception as exc:
             self._startup_error = f"head point cloud: {exc}"
 
-    def _calibration_points(self):
+    def _recording_info(self, state):
         with self._lock:
-            frames = [(points.copy(), dict(pose)) for points, pose in self._calibration_frames]
-            extrinsic = dict(self._head_camera_extrinsic)
-        if not frames:
-            return self._np.zeros((0, 3), dtype=self._np.float32)
-        return self._np.vstack([
-            self._camera_to_map(points, pose, extrinsic) for points, pose in frames
-        ])
-
-    def _calibration_info(self, state):
-        with self._lock:
-            captures = len(self._calibration_frames)
-            extrinsic = dict(self._head_camera_extrinsic)
-            calibrating = self._calibrating
+            recording_enabled = self._head_recording_enabled
+            map_name = self._head_cloud_map_name
+            cloud_points = len(self._head_cloud)
         return {
             **self._info(state),
-            "calibrating": calibrating,
-            "capture_count": captures,
-            "head_pointcloud_topic": self._head_pointcloud_topic,
-            "head_camera_extrinsic": extrinsic,
-            "head_recording_enabled": self._head_recording_enabled,
-            "head_map_path": self._head_map_path_for(self._head_cloud_map_name),
-            "head_cloud_points": len(self._head_cloud),
+            "head_recording_enabled": recording_enabled,
+            "head_map_path": self._head_map_path_for(map_name),
+            "head_cloud_points": cloud_points,
         }
 
     def dispatch(self, action: str, args: dict):
@@ -422,51 +395,6 @@ class ControlledSpatialMapPlugin:
             self._db.set_state("active_map", name)
             self._publish(force=True)
             return self._info("selected")
-        if action == "start_3d_calibration":
-            with self._lock:
-                self._calibration_frames = []
-                self._calibrating = True
-            self._publish(force=True)
-            return self._calibration_info("calibrating")
-        if action == "capture_3d_calibration":
-            with self._lock:
-                if not self._calibrating:
-                    return {"error": "call start_3d_calibration before capturing"}
-                frame = self._latest_head_frame
-                if frame is None:
-                    return {"error": "no head point-cloud frame received yet"}
-                points, pose = frame
-                self._calibration_frames.append((points.copy(), dict(pose)))
-                self._calibration_frames = self._calibration_frames[-self.CALIBRATION_CAPTURE_LIMIT:]
-            self._publish(force=True)
-            return self._calibration_info("captured")
-        if action == "set_3d_extrinsic":
-            try:
-                extrinsic = self._validate_extrinsic({
-                    "translation_m": args.get("translation_m"),
-                    "rotation_rpy_rad": args.get("rotation_rpy_rad"),
-                })
-            except ValueError as exc:
-                return {"error": str(exc)}
-            with self._lock:
-                self._head_camera_extrinsic = extrinsic
-            self._publish(force=True)
-            return self._calibration_info("adjusted")
-        if action == "save_3d_calibration":
-            with self._lock:
-                encoded = json.dumps(self._head_camera_extrinsic, separators=(",", ":"))
-                self._calibrating = False
-            self._db.set_state(self._EXTRINSIC_STATE_KEY, encoded)
-            self._publish(force=True)
-            return self._calibration_info("saved")
-        if action == "clear_3d_calibration":
-            with self._lock:
-                self._calibration_frames = []
-                self._calibrating = False
-            self._publish(force=True)
-            return self._calibration_info("cleared")
-        if action == "get_3d_calibration":
-            return self._calibration_info("ready")
         if action == "set_3d_recording":
             if not isinstance(args.get("enabled"), bool):
                 return {"error": "enabled must be a boolean"}
@@ -481,7 +409,7 @@ class ControlledSpatialMapPlugin:
                 "true" if args["enabled"] else "false",
             )
             self._save_cache(force=True)
-            return self._calibration_info(
+            return self._recording_info(
                 "recording_enabled" if args["enabled"] else "recording_disabled")
         if action == "clear_3d_cloud":
             name = args.get("map_name")
@@ -495,7 +423,6 @@ class ControlledSpatialMapPlugin:
                     cleared = len(self._head_cloud)
                     self._head_cloud.clear()
                     self._head_hits.clear()
-                    self._latest_head_frame = None
                 else:
                     cleared = self._head_cloud_point_count(name)
                 path = self._head_map_path_for(name)
@@ -799,7 +726,6 @@ class ControlledSpatialMapPlugin:
                       if overlays else self._np.zeros((0, 3), dtype=self._np.float32))
         saved_head = (self._np.asarray(head_cloud, dtype=self._np.float32).reshape(-1, 3)
                       if head_cloud else self._np.zeros((0, 3), dtype=self._np.float32))
-        calibration = self._calibration_points()
 
         def sample(points, limit):
             if len(points) <= limit:
@@ -813,9 +739,7 @@ class ControlledSpatialMapPlugin:
         base_parts = [part for part in (grid, flat_cloud) if len(part)]
         base_points = (self._np.vstack(base_parts) if base_parts
                        else self._np.zeros((0, 3), dtype=self._np.float32))
-        head_parts = [part for part in (saved_head, calibration) if len(part)]
-        head_points = (self._np.vstack(head_parts) if head_parts
-                       else self._np.zeros((0, 3), dtype=self._np.float32))
+        head_points = saved_head
         head_budget = self.MAX_POINTS if not len(base_points) else min(60000, self.MAX_POINTS)
         head_limit = min(len(head_points), head_budget)
         head_points = sample(head_points, head_limit)
@@ -826,7 +750,7 @@ class ControlledSpatialMapPlugin:
         meta = {"version": 3, "active_map": current_map, "robot": {**robot, "pose_available": pose is not None},
                 "maps": maps, "tags": tags, "boundary": bounds, "artifacts": artifacts,
                 "trajectory_points": len(trajectory), "laser_points": 0, "grid_points": len(grid),
-                "head_cloud_points": len(saved_head), "calibration_points": len(calibration),
+                "head_cloud_points": len(saved_head),
                 "head_recording_enabled": self._head_recording_enabled}
         raw_meta = json.dumps(meta, ensure_ascii=False).encode()
         display_yaw = -float(robot["yaw"])
