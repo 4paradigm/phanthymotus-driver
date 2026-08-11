@@ -33,7 +33,7 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   MotorStatePlugin    (sensor)             — 全身21电机状态(2Hz)
   HandStatePlugin     (sensor)             — 灵巧手状态(10Hz, tool name=hand_state)
   RemoteStatePlugin   (sensor)             — 遥控器SBUS事件(5Hz)
-  TijianPlugin   (actuator)           — 全身体检卡 (tool name=health_check)
+  HealthCheckPlugin   (actuator)           — 全身体检卡 (tool name=health_check)
   LaserScanPlugin     (sensor)             — 激光雷达原始点云
   ChassisRawPlugin    (actuator)           — 底盘速度控制
   ControlledSpatialPlugin (actuator)      — 空间控制(controlled_spatial)
@@ -4744,7 +4744,7 @@ class RemoteStatePlugin:
                     "topic_out": [{"topic": self._topic, "format": "data/json"}]}
         return {"state": "error", "error": "INVALID_ARGUMENT",
                 "message": f"unknown action: {action}"}
-class TijianPlugin:
+class HealthCheckPlugin:
     """全身体检卡 — 底盘安全 + 身体电机/灵巧手/急停 + 电源 + 手部 + IMU + 自检状态
     综合诊断结论 + 可行建议。
     bodyctrl_msgs 不可用时身体部分自动降级为 unavailable。"""
@@ -4818,7 +4818,7 @@ class TijianPlugin:
         self._max_sid_track = 20
 
         # 订阅节点 (domain 0) — 接收身体故障
-        self._sub_node = Node("tianyi2_tijian_sub", context=ros2.ctx_tianyi)
+        self._sub_node = Node("tianyi2_health_check_sub", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._sub_node)
 
     def get_tool(self) -> dict:
@@ -4865,9 +4865,9 @@ class TijianPlugin:
                 PowerBoardKeyStatus, self._estop_topic,
                 self._on_estop, _RELIABLE_QOS)
             self._body_available = True
-            print("[TijianPlugin] body subscriptions created")
+            print("[HealthCheckPlugin] body subscriptions created")
         except ImportError as e:
-            print(f"[TijianPlugin] bodyctrl_msgs not available ({e}), body disabled")
+            print(f"[HealthCheckPlugin] bodyctrl_msgs not available ({e}), body disabled")
 
         # 电源板订阅 (PowerStatus)
         try:
@@ -4876,9 +4876,9 @@ class TijianPlugin:
                 PowerStatus, self._power_board_topic,
                 self._on_power_board, _RELIABLE_QOS)
             self._power_board_available = True
-            print("[TijianPlugin] power board subscription created")
+            print("[HealthCheckPlugin] power board subscription created")
         except ImportError:
-            print("[TijianPlugin] PowerStatus not available, power board disabled")
+            print("[HealthCheckPlugin] PowerStatus not available, power board disabled")
 
         # 手部状态订阅 (JointState) — 检测手部是否在线
         try:
@@ -4889,9 +4889,9 @@ class TijianPlugin:
                     lambda msg, s=side: self._on_hand_state(msg, s),
                     _RELIABLE_QOS)
             self._hand_state_available = True
-            print("[TijianPlugin] hand state subscriptions created")
+            print("[HealthCheckPlugin] hand state subscriptions created")
         except ImportError:
-            print("[TijianPlugin] JointState not available, hand state disabled")
+            print("[HealthCheckPlugin] JointState not available, hand state disabled")
 
         # IMU 订阅
         try:
@@ -4903,9 +4903,9 @@ class TijianPlugin:
                 RosImu, self._imu_gyro_topic,
                 lambda msg: self._on_imu("gyro", msg), _RELIABLE_QOS)
             self._imu_available = True
-            print("[TijianPlugin] IMU subscriptions created")
+            print("[HealthCheckPlugin] IMU subscriptions created")
         except ImportError:
-            print("[TijianPlugin] sensor_msgs.Imu not available, IMU disabled")
+            print("[HealthCheckPlugin] sensor_msgs.Imu not available, IMU disabled")
 
         # 自检状态订阅 (NodeState)
         try:
@@ -4914,9 +4914,9 @@ class TijianPlugin:
                 NodeState, self._self_check_topic,
                 self._on_self_check, _RELIABLE_QOS)
             self._self_check_available = True
-            print("[TijianPlugin] self check subscription created")
+            print("[HealthCheckPlugin] self check subscription created")
         except ImportError:
-            print("[TijianPlugin] NodeState not available, self check disabled")
+            print("[HealthCheckPlugin] NodeState not available, self check disabled")
 
         # 音频进度订阅 (短促提示音 → 自检完成)
         try:
@@ -4925,12 +4925,12 @@ class TijianPlugin:
                 PlayProgress, "/audio_play/progress",
                 self._on_play_progress, _LOW_LAT_QOS)
             self._audio_event_available = True
-            print("[TijianPlugin] audio progress subscription created")
+            print("[HealthCheckPlugin] audio progress subscription created")
         except ImportError:
-            print("[TijianPlugin] PlayProgress not available, audio progress disabled")
+            print("[HealthCheckPlugin] PlayProgress not available, audio progress disabled")
 
         # 完整数据发布线程 (1Hz → topic)
-        print("[TijianPlugin] started")
+        print("[HealthCheckPlugin] started")
 
     def stop(self):
         self._running = False
@@ -5051,7 +5051,7 @@ class TijianPlugin:
             if prev_state == 1 and msg.state == 0:
                 self._self_check_started = True
                 self._self_check_completed = False
-                print(f"[TijianPlugin] self-check triggered (state 1→0)")
+                print(f"[HealthCheckPlugin] self-check triggered (state 1→0)")
 
     def _on_play_progress(self, msg):
         """订阅 /audio_play/progress, 短促提示音 (duration < 2.0s) → 自检完成."""
@@ -5067,7 +5067,7 @@ class TijianPlugin:
                         and msg.duration < self._short_prompt_threshold_ms):
                     self._self_check_completed = True
                     self._self_check_started = False
-                    print(f"[TijianPlugin] self-check completed by short prompt "
+                    print(f"[HealthCheckPlugin] self-check completed by short prompt "
                           f"(sid={msg.sid}, duration={msg.duration}ms)")
 
     # ── 按需查询执行器 ─────────────────────────────────────────────────────
