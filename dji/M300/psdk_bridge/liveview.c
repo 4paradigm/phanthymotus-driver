@@ -43,6 +43,11 @@ static T_LiveviewStream s_streams[] = {
 #define STREAM_COUNT (sizeof(s_streams) / sizeof(s_streams[0]))
 
 static int s_liveview_ready = 0;
+/* DjiLiveview_Init registers an extended-command handler before it requests
+ * status.  A status timeout leaves that registration in place, so a second
+ * call cannot recover in the same PSDK process and instead fails with
+ * "Reg extend cmd handler error". */
+static int s_liveview_init_attempted = 0;
 
 static T_LiveviewStream *_find_stream(const char *camera) {
     if (!camera || !*camera || strcmp(camera, "default") == 0)
@@ -121,6 +126,9 @@ static void _h264_cb(E_DjiLiveViewCameraPosition position, const uint8_t *data, 
 }
 
 int liveview_init(void) {
+    if (s_liveview_init_attempted)
+        return s_liveview_ready ? 0 : -1;
+    s_liveview_init_attempted = 1;
     s_liveview_ready = 0;
     T_DjiReturnCode rc = DjiLiveview_Init();
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
@@ -191,6 +199,7 @@ void liveview_cleanup(void) {
         DjiLiveview_Deinit();
     }
     s_liveview_ready = 0;
+    s_liveview_init_attempted = 0;
     for (size_t i = 0; i < STREAM_COUNT; ++i) {
         T_LiveviewStream *s = &s_streams[i];
         if (s->parser) av_parser_close(s->parser);
