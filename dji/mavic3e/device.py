@@ -22,6 +22,7 @@ dji/mavic3e/device.py — DJI Mavic 3E 无人机设备插件。
 """
 
 import json
+import re
 import threading
 import time
 
@@ -890,6 +891,7 @@ class WaypointPlugin:
         self._mark_points = []
         self._mark_name = ""
         self._mark_active = False
+        self._mission_speed = 5.0
         import os
         os.makedirs(self.WAYPOINT_DIR, exist_ok=True)
 
@@ -910,24 +912,25 @@ class WaypointPlugin:
                             "start", "stop",
                             "record_start", "record_stop",
                             "mark_start", "mark_point", "mark_stop",
-                            "list", "execute",
+                            "list", "upload", "execute",
                             "pause", "resume", "cancel", "status",
                         ],
                     },
                     "name": {"type": "string", "description": "Mission name (for record/mark/load)"},
                     "tag": {"type": "string", "description": "Optional tag for mission or point"},
-                    "speed": {"type": "number", "description": "Flight speed (m/s), -1=use recorded speed", "default": 5},
+                    "speed": {"type": "number", "description": "Mission cruise speed (m/s), 1-15", "default": 5, "minimum": 1, "maximum": 15},
                     "return_home": {"type": "boolean", "description": "Return to start point after mark_stop", "default": True},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "record_start": {"params": ["name", "tag"], "description": "Start recording GPS track"},
+                    "record_start": {"params": ["name", "tag", "speed"], "description": "Start recording GPS track"},
                     "record_stop": {"params": [], "description": "Stop recording, save as KMZ"},
-                    "mark_start": {"params": ["name", "tag"], "description": "Start marking key points"},
+                    "mark_start": {"params": ["name", "tag", "speed"], "description": "Start marking key points"},
                     "mark_point": {"params": ["tag"], "description": "Mark current position as waypoint"},
                     "mark_stop": {"params": ["return_home"], "description": "Stop marking, save as KMZ"},
                     "list": {"params": [], "description": "List all saved waypoint missions"},
-                    "execute": {"params": ["name", "speed"], "description": "Load and execute a saved mission"},
+                    "upload": {"params": ["name"], "description": "Upload a saved mission only; does not start flight"},
+                    "execute": {"params": ["name"], "description": "Upload and execute a saved mission"},
                     "pause": {"params": [], "description": "Pause mission"},
                     "resume": {"params": [], "description": "Resume mission"},
                     "cancel": {"params": [], "description": "Cancel mission"},
@@ -955,7 +958,9 @@ class WaypointPlugin:
         lat = pos.get("latitude")
         lon = pos.get("longitude")
         alt = pos.get("altitude")
-        if lat is None or lon is None:
+        if (lat is None or lon is None or
+                not (-90 <= lat <= 90 and -180 <= lon <= 180) or
+                (abs(lat) < 1e-7 and abs(lon) < 1e-7)):
             return None
         # Compute horizontal speed
         import math
@@ -968,10 +973,10 @@ class WaypointPlugin:
 
     def _generate_kmz(self, waypoints: list, name: str, speed: float = 5.0,
                       finish_action: str = "goHome") -> str:
-        """Generate KMZ file from waypoint list. Returns file path.
-        speed=-1 means use per-point recorded speed."""
+        """Generate a DJI Pilot 2 compatible WPML KMZ from waypoint samples."""
         import zipfile
         import os
+        import math
 
         if not waypoints or len(waypoints) < 2:
             return ""
@@ -984,13 +989,32 @@ class WaypointPlugin:
         else:
             eff_speed = speed
 
-        # Build waypoints XML
-        wp_xml_parts = []
+        # The static WPML layout below is copied from the Pilot 2 exported
+        # two-point route ``新建航点飞行1.kmz``.  Only route-dependent values
+        # (coordinates, height, speed, distance and duration) are generated.
+        point_template_parts = []
         for i, wp in enumerate(waypoints):
             wp_speed = wp.get("speed", eff_speed) if speed <= 0 else eff_speed
-            wp_speed = max(1.0, wp_speed)  # minimum 1 m/s
+            wp_speed = max(1.0, min(15.0, float(wp_speed)))
+            point_template_parts.append(f"""      <Placemark>
+        <Point>
+          <coordinates>{wp['lon']},{wp['lat']}</coordinates>
+        </Point>
+        <wpml:index>{i}</wpml:index>
+        <wpml:ellipsoidHeight>{wp.get('alt', 0):.1f}</wpml:ellipsoidHeight>
+        <wpml:height>{wp.get('alt', 0):.1f}</wpml:height>
+        <wpml:useGlobalHeight>1</wpml:useGlobalHeight>
+        <wpml:useGlobalSpeed>1</wpml:useGlobalSpeed>
+        <wpml:useGlobalHeadingParam>1</wpml:useGlobalHeadingParam>
+        <wpml:useGlobalTurnParam>1</wpml:useGlobalTurnParam>
+        <wpml:useStraightLine>0</wpml:useStraightLine>
+      </Placemark>""")
+
+        point_wayline_parts = []
         for i, wp in enumerate(waypoints):
-            wp_xml_parts.append(f"""      <Placemark>
+            wp_speed = wp.get("speed", eff_speed) if speed <= 0 else eff_speed
+            wp_speed = max(1.0, min(15.0, float(wp_speed)))
+            point_wayline_parts.append(f"""      <Placemark>
         <Point>
           <coordinates>{wp['lon']},{wp['lat']}</coordinates>
         </Point>
@@ -999,61 +1023,115 @@ class WaypointPlugin:
         <wpml:waypointSpeed>{wp_speed:.1f}</wpml:waypointSpeed>
         <wpml:waypointHeadingParam>
           <wpml:waypointHeadingMode>followWayline</wpml:waypointHeadingMode>
+          <wpml:waypointHeadingAngle>0</wpml:waypointHeadingAngle>
+          <wpml:waypointPoiPoint>0.000000,0.000000,0.000000</wpml:waypointPoiPoint>
+          <wpml:waypointHeadingAngleEnable>0</wpml:waypointHeadingAngleEnable>
         </wpml:waypointHeadingParam>
         <wpml:waypointTurnParam>
           <wpml:waypointTurnMode>toPointAndStopWithDiscontinuityCurvature</wpml:waypointTurnMode>
           <wpml:waypointTurnDampingDist>0</wpml:waypointTurnDampingDist>
         </wpml:waypointTurnParam>
+        <wpml:useStraightLine>1</wpml:useStraightLine>
       </Placemark>""")
 
-        waypoints_xml = "\n".join(wp_xml_parts)
+        template_points_xml = "\n".join(point_template_parts)
+        wayline_points_xml = "\n".join(point_wayline_parts)
+        route_distance = 0.0
+        for previous, current in zip(waypoints, waypoints[1:]):
+            lat1, lon1 = math.radians(previous["lat"]), math.radians(previous["lon"])
+            lat2, lon2 = math.radians(current["lat"]), math.radians(current["lon"])
+            dlat, dlon = lat2 - lat1, lon2 - lon1
+            a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+            route_distance += 6371000.0 * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+        route_duration = route_distance / eff_speed
+        global_height = float(waypoints[0].get("alt", 0))
+        timestamp_ms = int(time.time() * 1000)
 
         template_kml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <kml xmlns="http://www.opengis.net/kml/2.2"
-     xmlns:wpml="http://www.dji.com/wpmz/1.0.6">
+     xmlns:wpml="http://www.dji.com/wpmz/1.0.2">
   <Document>
-    <wpml:author>PhanthyMotus</wpml:author>
-    <wpml:createTime>{int(time.time() * 1000)}</wpml:createTime>
-    <wpml:updateTime>{int(time.time() * 1000)}</wpml:updateTime>
+    <wpml:createTime>{timestamp_ms}</wpml:createTime>
+    <wpml:updateTime>{timestamp_ms}</wpml:updateTime>
+    <wpml:missionConfig>
+      <wpml:flyToWaylineMode>safely</wpml:flyToWaylineMode>
+      <wpml:finishAction>{finish_action}</wpml:finishAction>
+      <wpml:exitOnRCLost>executeLostAction</wpml:exitOnRCLost>
+      <wpml:executeRCLostAction>goBack</wpml:executeRCLostAction>
+      <wpml:takeOffSecurityHeight>20</wpml:takeOffSecurityHeight>
+      <wpml:globalTransitionalSpeed>{eff_speed:.1f}</wpml:globalTransitionalSpeed>
+      <wpml:droneInfo>
+        <wpml:droneEnumValue>77</wpml:droneEnumValue>
+        <wpml:droneSubEnumValue>1</wpml:droneSubEnumValue>
+      </wpml:droneInfo>
+      <wpml:payloadInfo>
+        <wpml:payloadEnumValue>67</wpml:payloadEnumValue>
+        <wpml:payloadSubEnumValue>0</wpml:payloadSubEnumValue>
+        <wpml:payloadPositionIndex>0</wpml:payloadPositionIndex>
+      </wpml:payloadInfo>
+    </wpml:missionConfig>
     <Folder>
+      <wpml:templateType>waypoint</wpml:templateType>
       <wpml:templateId>0</wpml:templateId>
       <wpml:waylineCoordinateSysParam>
         <wpml:coordinateMode>WGS84</wpml:coordinateMode>
         <wpml:heightMode>relativeToStartPoint</wpml:heightMode>
+        <wpml:positioningType>GPS</wpml:positioningType>
       </wpml:waylineCoordinateSysParam>
       <wpml:autoFlightSpeed>{eff_speed:.1f}</wpml:autoFlightSpeed>
-      <Placemark>
-        <wpml:missionConfig>
-          <wpml:flyToWaylineMode>safely</wpml:flyToWaylineMode>
-          <wpml:finishAction>{finish_action}</wpml:finishAction>
-          <wpml:exitOnRCLost>executeLostAction</wpml:exitOnRCLost>
-          <wpml:executeRCLostAction>goBack</wpml:executeRCLostAction>
-          <wpml:globalTransitionalSpeed>{eff_speed:.1f}</wpml:globalTransitionalSpeed>
-          <wpml:droneInfo>
-            <wpml:droneEnumValue>89</wpml:droneEnumValue>
-            <wpml:droneSubEnumValue>0</wpml:droneSubEnumValue>
-          </wpml:droneInfo>
-        </wpml:missionConfig>
-      </Placemark>
+      <wpml:globalHeight>{global_height:.1f}</wpml:globalHeight>
+      <wpml:caliFlightEnable>0</wpml:caliFlightEnable>
+      <wpml:gimbalPitchMode>manual</wpml:gimbalPitchMode>
+      <wpml:globalWaypointHeadingParam>
+        <wpml:waypointHeadingMode>followWayline</wpml:waypointHeadingMode>
+        <wpml:waypointHeadingAngle>0</wpml:waypointHeadingAngle>
+        <wpml:waypointPoiPoint>0.000000,0.000000,0.000000</wpml:waypointPoiPoint>
+      </wpml:globalWaypointHeadingParam>
+      <wpml:globalWaypointTurnMode>toPointAndStopWithDiscontinuityCurvature</wpml:globalWaypointTurnMode>
+      <wpml:globalUseStraightLine>1</wpml:globalUseStraightLine>
+{template_points_xml}
+      <wpml:payloadParam>
+        <wpml:payloadPositionIndex>0</wpml:payloadPositionIndex>
+      </wpml:payloadParam>
     </Folder>
   </Document>
 </kml>"""
 
         waylines_wpml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <kml xmlns="http://www.opengis.net/kml/2.2"
-     xmlns:wpml="http://www.dji.com/wpmz/1.0.6">
+     xmlns:wpml="http://www.dji.com/wpmz/1.0.2">
   <Document>
+    <wpml:missionConfig>
+      <wpml:flyToWaylineMode>safely</wpml:flyToWaylineMode>
+      <wpml:finishAction>{finish_action}</wpml:finishAction>
+      <wpml:exitOnRCLost>executeLostAction</wpml:exitOnRCLost>
+      <wpml:executeRCLostAction>goBack</wpml:executeRCLostAction>
+      <wpml:takeOffSecurityHeight>20</wpml:takeOffSecurityHeight>
+      <wpml:globalTransitionalSpeed>{eff_speed:.1f}</wpml:globalTransitionalSpeed>
+      <wpml:droneInfo>
+        <wpml:droneEnumValue>77</wpml:droneEnumValue>
+        <wpml:droneSubEnumValue>1</wpml:droneSubEnumValue>
+      </wpml:droneInfo>
+      <wpml:payloadInfo>
+        <wpml:payloadEnumValue>67</wpml:payloadEnumValue>
+        <wpml:payloadSubEnumValue>0</wpml:payloadSubEnumValue>
+        <wpml:payloadPositionIndex>0</wpml:payloadPositionIndex>
+      </wpml:payloadInfo>
+    </wpml:missionConfig>
     <Folder>
       <wpml:templateId>0</wpml:templateId>
+      <wpml:executeHeightMode>relativeToStartPoint</wpml:executeHeightMode>
       <wpml:waylineId>0</wpml:waylineId>
+      <wpml:distance>{route_distance:.3f}</wpml:distance>
+      <wpml:duration>{route_duration:.3f}</wpml:duration>
       <wpml:autoFlightSpeed>{eff_speed:.1f}</wpml:autoFlightSpeed>
-{waypoints_xml}
+{wayline_points_xml}
     </Folder>
   </Document>
 </kml>"""
 
         timestamp = int(time.time())
-        safe_name = name.replace(" ", "_").replace("'", "").replace('"', '')
+        safe_name = self._safe_mission_name(name)
         filename = f"{safe_name}_{timestamp}.kmz"
         filepath = os.path.join(self.WAYPOINT_DIR, filename)
 
@@ -1062,6 +1140,11 @@ class WaypointPlugin:
             zf.writestr("wpmz/waylines.wpml", waylines_wpml)
 
         return filepath
+
+    @staticmethod
+    def _safe_mission_name(name: str) -> str:
+        """Return the filename prefix used consistently for save and lookup."""
+        return re.sub(r"[^A-Za-z0-9_-]+", "_", str(name)).strip("_") or "mission"
 
     # ── Record mode ───────────────────────────────────────────────────
 
@@ -1103,6 +1186,10 @@ class WaypointPlugin:
                 return {"ret": -1, "error": "Recording already in progress"}
             self._record_points = []
             self._record_name = f"{name}_{tag}" if tag else name
+            try:
+                self._mission_speed = max(1.0, min(15.0, float(args.get("speed", 5))))
+            except (TypeError, ValueError):
+                return {"ret": -1, "error": "speed must be a number between 1 and 15 m/s"}
             self._record_active = True
             self._record_thread = threading.Thread(target=self._record_loop, daemon=True)
             self._record_thread.start()
@@ -1121,12 +1208,9 @@ class WaypointPlugin:
             points = self._record_points
             if len(points) == 0:
                 return {"ret": -1, "error": "No GPS data captured"}
-            if len(points) == 1:
-                # Didn't move — duplicate with slight offset so KMZ is valid
-                p = dict(points[0])
-                p["lat"] += 0.00001  # ~1m offset
-                points.append(p)
-            filepath = self._generate_kmz(points, self._record_name)
+            if len(points) < 2:
+                return {"ret": -1, "error": "Too few distinct GPS points; move at least 1 m before saving"}
+            filepath = self._generate_kmz(points, self._record_name, self._mission_speed)
             return {"ret": 0, "message": f"Recorded {len(points)} points",
                     "file": filepath, "points": len(points)}
 
@@ -1138,6 +1222,10 @@ class WaypointPlugin:
                 return {"ret": -1, "error": "Marking already in progress"}
             self._mark_points = []
             self._mark_name = f"{name}_{tag}" if tag else name
+            try:
+                self._mission_speed = max(1.0, min(15.0, float(args.get("speed", 5))))
+            except (TypeError, ValueError):
+                return {"ret": -1, "error": "speed must be a number between 1 and 15 m/s"}
             self._mark_active = True
             # Record start point
             gps = self._get_current_gps()
@@ -1174,7 +1262,7 @@ class WaypointPlugin:
                 points.append(home)
             if len(points) < 2:
                 return {"ret": -1, "error": f"Too few points ({len(points)}), need >= 2"}
-            filepath = self._generate_kmz(points, self._mark_name)
+            filepath = self._generate_kmz(points, self._mark_name, self._mission_speed)
             return {"ret": 0, "message": f"Saved {len(points)} waypoints",
                     "file": filepath, "points": len(points)}
 
@@ -1185,13 +1273,12 @@ class WaypointPlugin:
             missions = [os.path.basename(f) for f in files]
             return {"ret": 0, "missions": missions, "count": len(missions)}
 
-        if action == "execute":
+        if action in ("upload", "execute"):
             name = args.get("name", "")
-            speed = float(args.get("speed", 5))
             if not name:
                 return {"ret": -1, "error": "name is required"}
             # Find matching file
-            pattern = os.path.join(self.WAYPOINT_DIR, f"{name}*")
+            pattern = os.path.join(self.WAYPOINT_DIR, f"{self._safe_mission_name(name)}_*.kmz")
             files = sorted(glob.glob(pattern))
             if not files:
                 return {"ret": -1, "error": f"Mission not found: {name}"}
@@ -1200,11 +1287,14 @@ class WaypointPlugin:
             resp = self._bridge.waypoint_upload(kmz_path)
             if not resp.get("ok"):
                 return {"ret": -1, "error": "Upload failed", "data": resp.get("data", {})}
+            if action == "upload":
+                return {"ret": 0, "message": f"Uploaded (not started): {os.path.basename(kmz_path)}",
+                        "file": kmz_path}
             # Start execution
             resp = self._bridge.waypoint_start()
             if resp.get("ok"):
                 return {"ret": 0, "message": f"Executing: {os.path.basename(kmz_path)}",
-                        "file": kmz_path, "speed": speed}
+                        "file": kmz_path}
             return {"ret": -1, "error": "Execute failed", "data": resp.get("data", {})}
         if action == "pause":
             resp = self._bridge.waypoint_pause()
@@ -1275,6 +1365,3 @@ class TimeSyncPlugin:
             resp = self._bridge.sync_clock()
             return {"ret": 0 if resp.get("ok") else -1, "data": resp.get("data", {})}
         return None
-
-
-
