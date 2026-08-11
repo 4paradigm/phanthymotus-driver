@@ -365,12 +365,11 @@ def main():
 
     print(f"[bundle] namespace={namespace} mcp_port={mcp_port}")
 
-    # ROS2 init — Domain ID 211 for Q5
-    DOMAIN_ID = 211
+    # ROS2 init — Domain ID 211 for Q5 (set via ROS_DOMAIN_ID env var)
     ctx = rclpy.context.Context()
-    rclpy.init(context=ctx, domain_id=DOMAIN_ID)
+    rclpy.init(context=ctx)
     executor = rclpy.executors.MultiThreadedExecutor(context=ctx)
-    print(f"[bundle] ROS2 initialized on domain {DOMAIN_ID}")
+    print(f"[bundle] ROS2 initialized on domain {os.environ.get('ROS_DOMAIN_ID', '?')}")
 
     _bundle = Q5DeviceBundle(cfg, namespace, executor)
     _bundle.start_all()
