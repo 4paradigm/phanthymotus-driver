@@ -478,7 +478,6 @@ static void *_psdk_start_thread(void *arg) {
     }
 
     _init_modules();
-    camera_mgr_init();  /* must precede hms_init: DjiHmsManager_Init internally depends on DjiCameraManager */
     hms_init();
     s_psdk_state = 1;
     printf("[psdk_bridge] PSDK modules ready\n");
@@ -795,6 +794,26 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
         char hms_buf[4096];
         hms_get_info(hms_buf, sizeof(hms_buf));
         snprintf(result, result_size, "{\"ok\":true,\"data\":%s}", hms_buf);
+        return 0;
+    }
+    if (strstr(raw_json, "\"hms_inject\"")) {
+        uint32_t code = 0;
+        uint8_t level = 0;
+        const char *p;
+        if ((p = strstr(raw_json, "\"code\""))) { p = strchr(p, ':'); if (p) code = (uint32_t)strtoul(p + 1, NULL, 16); }
+        if ((p = strstr(raw_json, "\"level\""))) { p = strchr(p, ':'); if (p) level = (uint8_t)atoi(p + 1); }
+        int r = hms_inject_error(code, level);
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0,\"code\":\"0x%08X\"}}", code);
+        else snprintf(result, result_size, "{\"ok\":false,\"error\":\"inject failed\"}");
+        return 0;
+    }
+    if (strstr(raw_json, "\"hms_eliminate\"")) {
+        uint32_t code = 0;
+        const char *p;
+        if ((p = strstr(raw_json, "\"code\""))) { p = strchr(p, ':'); if (p) code = (uint32_t)strtoul(p + 1, NULL, 16); }
+        int r = hms_eliminate_error(code);
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0,\"code\":\"0x%08X\"}}", code);
+        else snprintf(result, result_size, "{\"ok\":false,\"error\":\"eliminate not found\"}");
         return 0;
     }
 
