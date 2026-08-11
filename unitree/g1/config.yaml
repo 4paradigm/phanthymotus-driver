@@ -27,27 +27,16 @@ plugins:
     command_topic: rt/lf/bmscmd
   arm:
     enabled: true
-  state:
+  arm_trajectory:
     enabled: true
-  gripper_state:
-    enabled: true
-    left_dds_topic: "rt/hand/left_state"
-    right_dds_topic: "rt/hand/right_state"
-    min_angle_rad: 0.0
-    max_angle_rad: 1.5
-    grasp_tau_threshold: 0.1
-    publish_hz: 20
-  gripper_control:
-    enabled: true
-    left_dds_topic: "rt/hand/left_cmd"
-    right_dds_topic: "rt/hand/right_cmd"
-    min_angle_rad: 0.0
-    max_angle_rad: 1.5
+    lowcmd_topic: "rt/lowcmd"
+    lowstate_topic: "rt/lowstate"
     motor_mode: 10
     default_kp: 20.0
     default_kd: 1.0
-    default_force_pct: 50
-    max_tau: 0.5
+    control_freq_hz: 50
+  state:
+    enabled: true
   head_control:
     enabled: true
     motor_index: 23           # 头部电机索引，待真机确认
@@ -60,6 +49,19 @@ plugins:
     lowstate_topic: "rt/lowstate"
     shake_amplitude_deg: 30.0
     shake_speed_hz: 1.5
+    shake_times: 3
+  waist_control:
+    enabled: true
+    motor_index: 12           # 腰部电机索引，待真机确认
+    min_angle_deg: -180.0     # 最小角度，待确认
+    max_angle_deg: 180.0      # 最大角度，待确认
+    motor_mode: 10            # 位置控制模式，待确认
+    default_kp: 20.0
+    default_kd: 1.0
+    lowcmd_topic: "rt/lowcmd"
+    lowstate_topic: "rt/lowstate"
+    shake_amplitude_deg: 45.0
+    shake_speed_hz: 1.0
     shake_times: 3
   camera:
     enabled: true

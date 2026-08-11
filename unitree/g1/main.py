@@ -119,6 +119,11 @@ class G1DeviceBundle:
             self._plugins.append(ArmActionPlugin(plugins_cfg["arm"], namespace, executor, arm_client))
             print("[bundle] ArmActionPlugin loaded")
 
+        if plugins_cfg.get("arm_trajectory", {}).get("enabled", False):
+            from device import ArmTrajectoryPlugin
+            self._plugins.append(ArmTrajectoryPlugin(plugins_cfg["arm_trajectory"], namespace, executor))
+            print("[bundle] ArmTrajectoryPlugin loaded")
+
         if plugins_cfg.get("asr", {}).get("enabled", False):
             from device import AsrPlugin
             self._plugins.append(AsrPlugin(plugins_cfg["asr"], namespace, executor))
@@ -129,20 +134,15 @@ class G1DeviceBundle:
             self._plugins.append(StatePlugin(plugins_cfg["state"], namespace, executor))
             print("[bundle] StatePlugin loaded")
 
-        if plugins_cfg.get("gripper_state", {}).get("enabled", False):
-            from device import GripperStatePlugin
-            self._plugins.append(GripperStatePlugin(plugins_cfg["gripper_state"], namespace, executor))
-            print("[bundle] GripperStatePlugin loaded")
-
-        if plugins_cfg.get("gripper_control", {}).get("enabled", False):
-            from device import GripperControlPlugin
-            self._plugins.append(GripperControlPlugin(plugins_cfg["gripper_control"], namespace, executor))
-            print("[bundle] GripperControlPlugin loaded")
-
         if plugins_cfg.get("head_control", {}).get("enabled", False):
             from device import HeadControlPlugin
             self._plugins.append(HeadControlPlugin(plugins_cfg["head_control"], namespace, executor))
             print("[bundle] HeadControlPlugin loaded")
+
+        if plugins_cfg.get("waist_control", {}).get("enabled", False):
+            from device import WaistControlPlugin
+            self._plugins.append(WaistControlPlugin(plugins_cfg["waist_control"], namespace, executor))
+            print("[bundle] WaistControlPlugin loaded")
 
         if plugins_cfg.get("camera", {}).get("enabled", False):
             from device import RealSensePlugin
