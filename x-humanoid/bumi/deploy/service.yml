@@ -1,0 +1,16 @@
+bumi:
+  image: __IMAGE__
+  container_name: embodied-x-humanoid-bumi
+  privileged: true
+  volumes:
+    - /dev:/dev
+    - /opt/phanthy-motus/data:/opt/phanthy-motus/data
+  environment:
+    - PYTHONUNBUFFERED=1
+    - CYCLONEDDS_URI=file:///work/config/dds.xml
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: unless-stopped

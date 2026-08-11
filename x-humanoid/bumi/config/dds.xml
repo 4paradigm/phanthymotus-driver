@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CycloneDDS>
+    <!-- Bumi 算力板与运控板通信 DDS 配置 -->
+    <!-- 运控板 IP: 192.168.55.102, 算力板 IP: 192.168.55.101 -->
+    <Domain id="any">
+        <General>
+            <Transport>udp</Transport>
+            <AllowMulticast>false</AllowMulticast>
+        </General>
+        <Discovery>
+            <ParticipantIndex>auto</ParticipantIndex>
+            <Peers>
+                <Peer address="192.168.55.102"/>
+            </Peers>
+            <SPDPInterval>50</SPDPInterval>
+        </Discovery>
+    </Domain>
+</CycloneDDS>
