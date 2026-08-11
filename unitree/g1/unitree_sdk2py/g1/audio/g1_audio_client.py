@@ -63,10 +63,7 @@ class AudioClient(Client):
     def PlayStream(self, app_name: str, stream_id: str, pcm_data: bytes):
         param = json.dumps({"app_name": app_name, "stream_id": stream_id})
         pcm_list = list(pcm_data)
-        print(f"[AudioClient] PlayStream app={app_name} id={stream_id} pcm_bytes={len(pcm_data)} list_len={len(pcm_list)}")
-        result = self._CallRequestWithParamAndBin(ROBOT_API_ID_AUDIO_START_PLAY, param, pcm_list)
-        print(f"[AudioClient] PlayStream result={result}")
-        return result
+        return self._CallRequestWithParamAndBin(ROBOT_API_ID_AUDIO_START_PLAY, param, pcm_list)
     
     def PlayStop(self, app_name: str):
         parameter = json.dumps({"app_name": app_name})
