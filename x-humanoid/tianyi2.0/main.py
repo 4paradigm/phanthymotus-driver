@@ -368,9 +368,9 @@ class TianyiDeviceBundle:
             print("[bundle] ControlledSpatialPlugin loaded")
 
         if plugins_cfg.get("robot_faults", {}).get("enabled", False):
-            from device import RobotFaultsPlugin
-            self._plugins.append(RobotFaultsPlugin(plugins_cfg["robot_faults"], namespace, ros2, slamtec_client))
-            print("[bundle] RobotFaultsPlugin loaded")
+            from device import HealthCheckPlugin
+            self._plugins.append(HealthCheckPlugin(plugins_cfg["robot_faults"], namespace, ros2, slamtec_client))
+            print("[bundle] HealthCheckPlugin loaded (health_check)")
 
         if plugins_cfg.get("laser_scan", {}).get("enabled", False):
             from device import LaserScanPlugin
