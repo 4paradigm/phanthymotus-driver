@@ -12,6 +12,8 @@ import math
 import threading
 import time
 from collections import deque
+from pathlib import Path
+from xml.etree import ElementTree as ET
 
 
 G1_MOTOR_NAMES = (
@@ -41,6 +43,31 @@ def _finite(value, default=0.0) -> float:
         return default
 
 
+def _load_urdf_joint_limits(path: Path | None = None) -> dict[str, tuple[float, float]]:
+    """Read revolute joint position limits from the bundled G1 URDF."""
+    urdf_path = path or Path(__file__).parent / "resource" / "g1_model.urdf"
+    limits: dict[str, tuple[float, float]] = {}
+    try:
+        root = ET.parse(urdf_path).getroot()
+    except (FileNotFoundError, ET.ParseError, OSError):
+        return limits
+    for joint in root.findall("joint"):
+        if joint.get("type") not in ("revolute", "continuous"):
+            continue
+        limit = joint.find("limit")
+        if limit is None:
+            continue
+        lower = limit.get("lower")
+        upper = limit.get("upper")
+        if lower is None or upper is None:
+            continue
+        try:
+            limits[str(joint.get("name"))] = (float(lower), float(upper))
+        except (TypeError, ValueError):
+            continue
+    return limits
+
+
 class JointHealthAnalyzer:
     """Classify G1 motor telemetry using conservative configurable limits."""
 
@@ -62,9 +89,23 @@ class JointHealthAnalyzer:
         self.stale_timeout_sec = float(cfg.get("stale_timeout_sec", 1.0))
         self.publish_interval_sec = float(cfg.get("publish_interval_sec", 0.5))
         self.sample_interval_sec = float(cfg.get("sample_interval_sec", 0.1))
+        self.position_limit_enabled = bool(cfg.get("position_limit_enabled", True))
+        self.position_warning_margin_ratio = float(
+            cfg.get("position_warning_margin_ratio", 0.02)
+        )
         self._history_window_sec = max(
             5.0, float(cfg.get("temperature_history_sec", 30.0))
         )
+        self._joint_limits = _load_urdf_joint_limits()
+        for joint, limit_cfg in dict(cfg.get("joint_position_limits", {})).items():
+            if not isinstance(limit_cfg, dict):
+                continue
+            lower = limit_cfg.get("lower_rad", limit_cfg.get("lower"))
+            upper = limit_cfg.get("upper_rad", limit_cfg.get("upper"))
+            try:
+                self._joint_limits[str(joint)] = (float(lower), float(upper))
+            except (TypeError, ValueError):
+                continue
         self._lock = threading.Lock()
         self._latest: list[dict] = []
         self._last_update: float | None = None
@@ -80,6 +121,8 @@ class JointHealthAnalyzer:
             )
         if self.warning_torque_nm >= self.critical_torque_nm:
             raise ValueError("warning_torque_nm must be lower than critical_torque_nm")
+        if not 0.0 <= self.position_warning_margin_ratio < 0.5:
+            raise ValueError("position_warning_margin_ratio must be in [0, 0.5)")
 
     @staticmethod
     def _read(motor, field, default=0.0):
@@ -131,6 +174,14 @@ class JointHealthAnalyzer:
                     ),
                     "position_rad": round(
                         _finite(self._read(motor, "q", 0.0)), 4
+                    ),
+                    "position_limit_rad": (
+                        {
+                            "lower": self._joint_limits[G1_MOTOR_NAMES[idx]][0],
+                            "upper": self._joint_limits[G1_MOTOR_NAMES[idx]][1],
+                        }
+                        if G1_MOTOR_NAMES[idx] in self._joint_limits
+                        else None
                     ),
                     "motorstate_raw": int(self._read(motor, "motorstate", 0)),
                     "over_torque_samples": self._torque_counts[idx],
@@ -191,6 +242,24 @@ class JointHealthAnalyzer:
                 add("critical", "sustained_high_torque", abs_torque, self.critical_torque_nm)
             else:
                 add("warning", "sustained_high_torque", abs_torque, self.warning_torque_nm)
+
+        if self.position_limit_enabled:
+            limit = motor.get("position_limit_rad")
+            position = motor["position_rad"]
+            if limit:
+                lower = float(limit["lower"])
+                upper = float(limit["upper"])
+                if position < lower:
+                    add("critical", "joint_position_out_of_range", position, lower)
+                elif position > upper:
+                    add("critical", "joint_position_out_of_range", position, upper)
+                else:
+                    span = upper - lower
+                    margin = span * self.position_warning_margin_ratio
+                    if margin > 0 and position - lower <= margin:
+                        add("warning", "joint_position_near_limit", position, lower)
+                    elif margin > 0 and upper - position <= margin:
+                        add("warning", "joint_position_near_limit", position, upper)
         return alerts
 
     def snapshot(self, now: float | None = None) -> dict:
