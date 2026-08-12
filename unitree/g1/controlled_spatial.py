@@ -899,3 +899,134 @@ class ControlledSpatialPlugin:
             return {"status": "stopped"}
 
         return None
+
+
+# ── Isolated Process Mode ─────────────────────────────────────────────────────
+
+def _controlled_spatial_process(plugin_config: dict, namespace: str, command_queue, result_queue):
+    """Subprocess entry: runs ControlledSpatialPlugin with its own DDS + GIL."""
+    import os as _os
+    _os.setsid()
+
+    try:
+        from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+        network_iface = plugin_config.get("network_iface", "eth0")
+        ChannelFactoryInitialize(0, network_iface)
+
+        # Suppress C++ stdout in subprocess
+        _orig_fd = _os.dup(1)
+        _devnull = _os.open(_os.devnull, _os.O_WRONLY)
+        _os.dup2(_devnull, 1)
+        _os.close(_devnull)
+        import sys
+        sys.stdout = _os.fdopen(_orig_fd, 'w', buffering=1)
+
+        child_config = dict(plugin_config)
+        child_config["isolated_process"] = False
+        plugin = ControlledSpatialPlugin(child_config, namespace, None, slam_client=None, smart_motion=None)
+        plugin.start()
+        tool_def = plugin.get_tools()
+        result_queue.put({"ready": True, "tools": tool_def})
+    except Exception as e:
+        result_queue.put({"ready": False, "error": str(e)})
+        return
+
+    print(f"[ControlledSpatial:subprocess] ready, pid={_os.getpid()}", flush=True)
+
+    while True:
+        try:
+            cmd = command_queue.get()
+        except Exception:
+            break
+        if cmd is None:
+            break
+        request_id = cmd.get("id")
+        action = cmd.get("action", "")
+        args = cmd.get("args", {})
+        try:
+            result = plugin.dispatch(action, args)
+            result_queue.put({"id": request_id, "result": result})
+        except Exception as e:
+            result_queue.put({"id": request_id, "result": {"error": str(e)}})
+
+    plugin.stop()
+
+
+class ControlledSpatialIsolatedProxy:
+    """Main-process proxy: forwards dispatch calls to isolated subprocess via Queue."""
+
+    PREFIX = "controlled_spatial"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor, slam_client=None, smart_motion=None):
+        import multiprocessing as _mp
+        import queue as _q
+
+        self._ipc_lock = threading.Lock()
+        self._request_id = 0
+        self._startup_error = None
+        self._tools = None
+
+        ctx = _mp.get_context("spawn")
+        self._command_queue = ctx.Queue()
+        self._result_queue = ctx.Queue()
+        child_config = dict(plugin_config)
+        child_config["isolated_process"] = False
+        self._proc = ctx.Process(
+            target=_controlled_spatial_process,
+            args=(child_config, namespace, self._command_queue, self._result_queue),
+            daemon=False,
+            name="controlled_spatial",
+        )
+        self._proc.start()
+        import atexit
+        atexit.register(self.stop)
+        try:
+            result = self._result_queue.get(timeout=30.0)
+        except _q.Empty:
+            self._startup_error = "controlled_spatial subprocess startup timed out"
+            print(f"[ControlledSpatial:proxy] {self._startup_error}", flush=True)
+            return
+        if not result.get("ready"):
+            self._startup_error = result.get("error", "subprocess failed to start")
+            print(f"[ControlledSpatial:proxy] {self._startup_error}", flush=True)
+            return
+        self._tools = result.get("tools", [])
+        print(f"[ControlledSpatial:proxy] subprocess ready, pid={self._proc.pid}", flush=True)
+
+    def get_tools(self) -> list:
+        if self._tools:
+            return self._tools
+        # Fallback: return minimal tool def
+        return [{"name": "controlled_spatial", "type": "actuator",
+                 "description": "Controlled spatial navigation (degraded — subprocess not running)",
+                 "inputSchema": {"type": "object", "properties": {"action": {"type": "string"}}, "required": ["action"]}}]
+
+    def get_tool(self) -> dict:
+        return self.get_tools()[0]
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        if self._proc and self._proc.is_alive():
+            self._command_queue.put(None)
+            self._proc.join(timeout=5)
+            if self._proc.is_alive():
+                self._proc.terminate()
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        if not self._proc or not self._proc.is_alive():
+            return {"error": self._startup_error or "controlled_spatial subprocess is not running"}
+        import queue as _q
+        with self._ipc_lock:
+            self._request_id += 1
+            request_id = self._request_id
+            self._command_queue.put({"id": request_id, "action": action, "args": dict(args)})
+            try:
+                while True:
+                    result = self._result_queue.get(timeout=120.0)
+                    if result.get("id") == request_id:
+                        return result.get("result")
+            except _q.Empty:
+                return {"error": f"controlled_spatial action '{action}' timed out (120s)"}
+
