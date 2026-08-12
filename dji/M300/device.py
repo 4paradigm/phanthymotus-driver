@@ -301,7 +301,7 @@ class _PerceptionNode(Node):
     DJI's API subscribes by direction, while each subscription delivers both
     eyes in that direction.  The C bridge performs the dataType split and
     writes one JPEG per source; this node only polls and publishes those
-    independent files.  Two eye instances from the same direction therefore
+    independent files.  Both eye instances from the same direction therefore
     share one DJI subscription and still get separate topics.
     """
 
@@ -338,15 +338,6 @@ class _PerceptionNode(Node):
             if source in self._active_sources:
                 return {"ok": True, "source": source}
 
-            active_directions = {
-                self.SOURCE_TO_DIRECTION[s] for s in self._active_sources
-            }
-            direction = self.SOURCE_TO_DIRECTION[source]
-            if direction not in active_directions and len(active_directions) >= 2:
-                return {
-                    "ok": False,
-                    "error": "M300 PSDK supports at most two simultaneous perception directions",
-                }
             response = self._bridge.start_perception(source=source)
             if not response.get("ok"):
                 return response
@@ -458,7 +449,7 @@ class PerceptionPlugin:
             "name": "perception",
             "type": "sensor",
             "multiInstance": True,
-            "description": "Matrice 300 RTK 12路感知灰度相机：六个方向各自提供左眼和右眼；每个物理相机对应独立 topic/file，底层最多同时订阅两个方向。",
+            "description": "Matrice 300 RTK 12路感知灰度相机：六个方向各自提供左眼和右眼；每个物理相机对应独立 topic/file，支持同时订阅多路输出。",
             "topic_out": [{"format": "image/jpeg", "desc": "perception grayscale stream"}],
             "configSchema": {
                 "type": "object",
@@ -541,7 +532,7 @@ class PerceptionPlugin:
                 self._instance_configs[instance_id] = {"source": source}
                 # A live card may be reconfigured from one physical camera to
                 # another. Release the old source before applying the new one
-                # so it does not consume one of the two PSDK subscriptions.
+                # so the active source set stays in sync with the card.
                 if previous and previous != source and instance_key in self._active_instances:
                     self._release_instance(instance_key)
             return {
@@ -567,9 +558,8 @@ class PerceptionPlugin:
                     **result,
                 }
                 # `state` is per card.  The node can remain running for a
-                # different card even when this card hit the PSDK two-stream
-                # limit; returning global node state made Agent Core treat a
-                # failed card as successfully started.
+                # different card; returning global node state made Agent Core
+                # treat a failed card as successfully started.
                 response["state"] = (
                     "running" if result.get("ok") else "error"
                 )
