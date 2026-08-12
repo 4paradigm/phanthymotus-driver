@@ -34,7 +34,7 @@ class BridgeROS2:
     def start(self):
         def spin(executor):
             while rclpy.ok(context=executor.context):
-                executor.spin_once(timeout_sec=0.05)
+                executor.spin_once(timeout_sec=0.1)
 
         for executor in (self.executor_tianyi, self.executor_core):
             thread = threading.Thread(target=spin, args=(executor,), daemon=True)
