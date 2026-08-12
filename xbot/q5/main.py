@@ -291,7 +291,13 @@ def main():
     executor = rclpy.executors.MultiThreadedExecutor()
     print(f"[bundle] ROS2 initialized on domain {os.environ.get('ROS_DOMAIN_ID', '?')}")
 
-    _bundle = Q5DeviceBundle(cfg, namespace, executor)
+    # Shared read-only ROS2 client — subscribes to all sensor topics
+    from q5_sdk_client import Q5SdkClient
+    sdk_client = Q5SdkClient(cfg.get("joint_state_position_unit", "radians"))
+    sdk_client.start(executor)
+    print(f"[bundle] SDK client started ({'live' if sdk_client.available else 'STUB'})")
+
+    _bundle = Q5DeviceBundle(cfg, namespace, executor, sdk_client)
     _bundle.start_all()
 
     def _spin():

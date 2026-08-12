@@ -193,89 +193,100 @@ class _Q5Node(Node):
 # ── StatePlugin (multi-tool: state, joint_state, servo_pose) ──────────────────
 
 class StatePlugin:
-    """整机状态传感器 — joint_states / dynamic_joint_states / servo_pose / xbot_state."""
+    """整机状态传感器 — 使用共享 Q5SdkClient snapshot()。"""
 
     def __init__(self, plugin_config: dict, namespace: str, executor, client=None):
         self._ns = namespace
+        self._client = client
         self._node = _Q5Node("state")
         executor.add_node(self._node)
 
-        # Publishers
+        # Publishers — republish raw data on namespaced topics for bridge discovery
         self._pub_joint = self._node.create_publisher(JointState, f"/{self._ns}/joint_states", _RELIABLE_QOS)
         self._pub_dynjoint = self._node.create_publisher(DynamicJointState, f"/{self._ns}/dynamic_joint_states", _RELIABLE_QOS)
         self._pub_servo = self._node.create_publisher(ServoPose, f"/{self._ns}/servo_pose", _RELIABLE_QOS)
         self._pub_robot_status = self._node.create_publisher(RobotStatus, f"/{self._ns}/robot_status", _RELIABLE_QOS)
 
-        # Subscribers — subscribe to global topics (no namespace prefix)
-        self._sub_joint = self._node.create_subscription(
-            JointState, "/joint_states", lambda m: self._pub_joint.publish(m), _LOW_LAT_QOS)
-        self._sub_dynjoint = self._node.create_subscription(
-            DynamicJointState, "/dynamic_joint_states", lambda m: self._pub_dynjoint.publish(m), _LOW_LAT_QOS)
-        self._sub_servo = self._node.create_subscription(
-            ServoPose, "/servo_poses", lambda m: self._pub_servo.publish(m), _LOW_LAT_QOS)
-        self._sub_status = self._node.create_subscription(
-            RobotStatus, "/xbot_state", self._on_robot_status, _LOW_LAT_QOS)
-
-        # /get_servo_poses service is not available on the real machine (empty output from ros2 service type).
-        # Servo pose data is obtained from /servo_poses topic subscription instead.
-        self._robot_status = None
         self._state = "idle"
+        self._last_joint = None
+        self._last_robot_status = None
 
     def get_tool(self) -> dict:
         return {
             "name": "state",
             "type": "sensor",
             "multiInstance": False,
-            "description": "Q5 robot state — joint_states, dynamic_joint_states, servo_pose, robot_status published on ROS2 topics",
+            "description": "Q5 robot state — joint_states, dynamic_joint_states, servo_pose, robot_status",
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["start", "stop", "info"], "default": "info"},
             }},
             "default_action": "info",
+            "topic_out": [
+                {"topic": f"/{self._ns}/joint_states", "format": "data/json"},
+                {"topic": f"/{self._ns}/robot_status", "format": "data/json"},
+            ],
         }
 
     def start(self) -> None:
         self._state = "active"
+        self._tick_timer = self._node.create_timer(0.05, self._tick)
 
     def stop(self) -> None:
         self._state = "idle"
+        if hasattr(self, '_tick_timer'):
+            self._tick_timer.cancel()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action in ("start", "info"):
+            snap = self._client.snapshot() if self._client else {}
             return {
                 "state": "active",
+                "fresh": snap.get("fresh", False),
+                "age_ms": snap.get("age_ms"),
+                "joint_count": snap.get("joint_count", 0),
                 "topics": {
                     "joint_states": f"/{self._ns}/joint_states",
-                    "dynamic_joint_states": f"/{self._ns}/dynamic_joint_states",
-                    "servo_pose": f"/{self._ns}/servo_pose",
                     "robot_status": f"/{self._ns}/robot_status",
                 },
             }
         return None
 
-    def _on_robot_status(self, msg: RobotStatus):
-        self._robot_status = msg
+    def _tick(self):
+        if self._state != "active":
+            return
+        snap = self._client.snapshot() if self._client else {}
+        if snap.get("fresh"):
+            msg = JointState()
+            msg.header.frame_id = snap.get("header_frame", "")
+            msg.name = snap.get("joint_names", [])
+            msg.position = list(snap.get("joints", {}).values())
+            msg.velocity = list(snap.get("velocities", {}).values())
+            msg.effort = list(snap.get("efforts", {}).values())
+            self._pub_joint.publish(msg)
+            self._last_joint = snap
+
+        # robot_status from sensor_snapshot
+        rs = self._client.sensor_snapshot("robot_status") if self._client else {}
+        if rs.get("available"):
+            msg = RobotStatus()
+            msg.state = rs.get("state", 0)
+            msg.msg = rs.get("message", "")
+            self._pub_robot_status.publish(msg)
+            self._last_robot_status = rs
 
 
 # ── ImuPlugin (sensor) ───────────────────────────────────────────────────────
 
 class ImuPlugin:
-    """IMU 姿态数据 — xbot_common_interfaces/msg/Imu。
-
-    真机确认：ros2 topic list -t | grep -i imu 无输出，
-    说明真机上没有独立的 IMU topic。Imu 数据可能通过其他渠道获取
-    （如 dynamic_joint_states 或内部 SDK）。此插件订阅 /imu 作为预留，
-    真机上可能收不到数据。
-    """
+    """IMU 姿态数据 — 使用共享 Q5SdkClient sensor_snapshot("imu")。"""
 
     def __init__(self, plugin_config: dict, namespace: str, executor, client=None):
         self._ns = namespace
+        self._client = client
         self._node = _Q5Node("imu")
         executor.add_node(self._node)
 
-        self._pub = self._node.create_publisher(Imu, f"/{self._ns}/imu/data", _LOW_LAT_QOS)
-        # 真机上未发现 IMU topic，订阅 /imu 作为预留
-        self._sub = self._node.create_subscription(
-            Imu, "/imu", self._on_imu, _LOW_LAT_QOS)
+        self._pub = self._node.create_publisher(String, f"/{self._ns}/imu/data", _LOW_LAT_QOS)
         self._state = "idle"
         self._last_data = None
 
@@ -289,49 +300,61 @@ class ImuPlugin:
                 "action": {"type": "string", "enum": ["start", "stop", "info"], "default": "info"},
             }},
             "default_action": "info",
+            "topic_out": [{"topic": f"/{self._ns}/imu/data", "format": "data/json"}],
         }
 
     def start(self) -> None:
         self._state = "active"
+        self._tick_timer = self._node.create_timer(0.05, self._tick)
 
     def stop(self) -> None:
         self._state = "idle"
+        if hasattr(self, '_tick_timer'):
+            self._tick_timer.cancel()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action in ("start", "info"):
-            info = {"state": "active", "topic": f"/{self._ns}/imu/data"}
-            if self._last_data:
-                info["data"] = self._last_data
+            snap = self._client.sensor_snapshot("imu") if self._client else {}
+            info = {"state": "active", "topic": f"/{self._ns}/imu/data",
+                    "fresh": snap.get("fresh", False), "age_ms": snap.get("age_ms")}
+            if snap.get("available"):
+                info["data"] = self._last_data or snap
             return info
         if action == "stop":
             return {"state": "idle"}
         return None
 
-    def _on_imu(self, msg: Imu):
+    def _tick(self):
+        if self._state != "active":
+            return
+        snap = self._client.sensor_snapshot("imu") if self._client else {}
+        if not snap.get("available"):
+            return
         data = {
-            "angular_vel": {"x": msg.angular_vel_x, "y": msg.angular_vel_y, "z": msg.angular_vel_z},
-            "linear_acc": {"x": msg.linear_acc_x, "y": msg.linear_acc_y, "z": msg.linear_acc_z},
-            "orientation": {"w": msg.orientation_w, "x": msg.orientation_x,
-                            "y": msg.orientation_y, "z": msg.orientation_z},
-            "euler": {"roll": msg.roll, "pitch": msg.pitch, "yaw": msg.yaw},
+            "angular_vel": snap.get("angular_velocity", {}),
+            "linear_acc": snap.get("linear_acceleration", {}),
+            "orientation": {"w": 1.0, "x": 0.0, "y": 0.0, "z": 0.0},
+            "euler": {"roll": 0.0, "pitch": 0.0, "yaw": 0.0},
+            "timestamp_ms": snap.get("timestamp_ms", int(time.time() * 1000)),
+            "fresh": snap.get("fresh", False),
+            "age_ms": snap.get("age_ms"),
         }
         self._last_data = data
-        self._pub.publish(msg)
+        self._pub.publish(String(data=json.dumps(data, ensure_ascii=False)))
 
 
 # ── BatteryPlugin (sensor) ───────────────────────────────────────────────────
 
 class BatteryPlugin:
-    """电池状态 — /battery_state (BatteryState)。"""
+    """电池状态 — 使用共享 Q5SdkClient sensor_snapshot("battery")。"""
 
     def __init__(self, plugin_config: dict, namespace: str, executor, client=None):
         self._ns = namespace
+        self._client = client
         self._node = _Q5Node("battery")
         executor.add_node(self._node)
 
-        self._pub = self._node.create_publisher(BatteryState, f"/{self._ns}/battery_state", _RELIABLE_QOS)
-        self._sub = self._node.create_subscription(
-            BatteryState, "/battery_state", self._on_battery, _LOW_LAT_QOS)
+        self._pub = self._node.create_publisher(String, f"/{self._ns}/battery_state", _RELIABLE_QOS)
 
         self._state = "idle"
         self._battery_info = None
@@ -346,58 +369,76 @@ class BatteryPlugin:
                 "action": {"type": "string", "enum": ["start", "stop", "info"], "default": "info"},
             }},
             "default_action": "info",
+            "topic_out": [{"topic": f"/{self._ns}/battery_state", "format": "data/json"}],
         }
 
     def start(self) -> None:
         self._state = "active"
+        self._tick_timer = self._node.create_timer(0.05, self._tick)
 
     def stop(self) -> None:
         self._state = "idle"
+        if hasattr(self, '_tick_timer'):
+            self._tick_timer.cancel()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action in ("start", "info"):
-            info = {"state": "active", "topic": f"/{self._ns}/battery_state"}
-            if self._battery_info:
+            snap = self._client.sensor_snapshot("battery") if self._client else {}
+            info = {"state": "active", "topic": f"/{self._ns}/battery_state",
+                    "fresh": snap.get("fresh", False), "age_ms": snap.get("age_ms")}
+            if snap.get("available"):
                 info.update({
-                    "voltage": self._battery_info.voltage,
-                    "current": self._battery_info.current,
-                    "percentage": self._battery_info.percentage,
-                    "temperature": self._battery_info.temperature,
-                    "power_supply_status": self._battery_info.power_supply_status,
+                    "voltage": snap.get("voltage"),
+                    "current": snap.get("current"),
+                    "percentage": snap.get("percentage"),
+                    "temperature": snap.get("temperature"),
+                    "power_supply_status": snap.get("power_supply_status"),
                 })
             return info
         if action == "stop":
             return {"state": "idle"}
         return None
 
-    def _on_battery(self, msg: BatteryState):
-        self._battery_info = msg
+    def _tick(self):
+        if self._state != "active":
+            return
+        snap = self._client.sensor_snapshot("battery") if self._client else {}
+        if not snap.get("available"):
+            return
+        data = {
+            "voltage": snap.get("voltage"),
+            "current": snap.get("current"),
+            "percentage": snap.get("percentage"),
+            "temperature": snap.get("temperature"),
+            "power_supply_status": snap.get("power_supply_status"),
+            "power_supply_health": snap.get("power_supply_health"),
+            "charge": snap.get("charge"),
+            "capacity": snap.get("capacity"),
+            "present": snap.get("present"),
+            "location": snap.get("location"),
+            "timestamp_ms": snap.get("timestamp_ms", int(time.time() * 1000)),
+            "fresh": snap.get("fresh", False),
+            "age_ms": snap.get("age_ms"),
+        }
+        self._battery_info = data
+        self._pub.publish(String(data=json.dumps(data, ensure_ascii=False)))
 
 
 # ── FaultsPlugin (sensor) ────────────────────────────────────────────────────
 
 class FaultsPlugin:
-    """故障诊断 — 订阅 /fault_array (FaultArray) 和 /fault_aggregator/highest_level (UInt8)。
-
-    真机上 /fault_array 和 /fault_array_agg 均为 xbot_common_interfaces/msg/FaultArray 类型。
-    /fault_aggregator/highest_level 是 UInt8 类型，作为故障等级指示。
-    """
+    """故障诊断 — 使用共享 Q5SdkClient sensor_snapshot("faults")。"""
 
     def __init__(self, plugin_config: dict, namespace: str, executor, client=None):
         self._ns = namespace
+        self._client = client
         self._node = _Q5Node("faults")
         executor.add_node(self._node)
 
         self._pub = self._node.create_publisher(String, f"/{self._ns}/faults", _LOW_LAT_QOS)
-        self._sub = self._node.create_subscription(
-            FaultArray, "/fault_array", self._on_faults, _LOW_LAT_QOS)
-        # /fault_aggregator/highest_level is UInt8 (confirmed on real machine)
-        self._sub_level = self._node.create_subscription(
-            UInt8, "/fault_aggregator/highest_level", self._on_fault_level, _LOW_LAT_QOS)
 
         self._state = "idle"
-        self._faults = []
-        self._highest_level = 0
+        self._last_data = None
 
     def get_tool(self) -> dict:
         return {
@@ -409,64 +450,63 @@ class FaultsPlugin:
                 "action": {"type": "string", "enum": ["start", "stop", "info"], "default": "info"},
             }},
             "default_action": "info",
+            "topic_out": [{"topic": f"/{self._ns}/faults", "format": "data/json"}],
         }
 
     def start(self) -> None:
         self._state = "active"
+        self._tick_timer = self._node.create_timer(0.05, self._tick)
 
     def stop(self) -> None:
         self._state = "idle"
+        if hasattr(self, '_tick_timer'):
+            self._tick_timer.cancel()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action in ("start", "info"):
+            snap = self._client.sensor_snapshot("faults") if self._client else {}
+            level = 0
+            faults = []
+            if snap.get("available"):
+                faults = snap.get("faults", [])
+                level = max((f.get("level", 0) for f in faults), default=0)
             return {
-                "state": "active" if self._highest_level == 0 else "warning",
+                "state": "active" if level == 0 else "warning",
                 "topic": f"/{self._ns}/faults",
-                "highest_level": self._highest_level,
-                "fault_count": len(self._faults),
-                "faults": self._faults,
+                "highest_level": level,
+                "fault_count": len(faults),
+                "fresh": snap.get("fresh", False),
+                "age_ms": snap.get("age_ms"),
             }
         if action == "stop":
             return {"state": "idle"}
         return None
 
-    def _on_faults(self, msg: FaultArray):
-        faults = []
-        for f in msg.faults:
-            faults.append({
-                "fault_code": f.fault_code,
-                "name": f.name,
-                "level": f.level,
-                "message": f.message,
-                "joint_name": f.joint_name,
-                "fault_type": f.fault_type,
-                "is_active": f.is_active,
-            })
-        self._faults = faults
-        self._pub.publish(String(data=json.dumps({"fault_count": len(faults), "faults": faults})))
-
-    def _on_fault_level(self, msg: UInt8):
-        self._highest_level = msg.data
+    def _tick(self):
+        if self._state != "active":
+            return
+        snap = self._client.sensor_snapshot("faults") if self._client else {}
+        if not snap.get("available"):
+            return
+        faults = snap.get("faults", [])
+        data = {"fault_count": len(faults), "faults": faults,
+                "fresh": snap.get("fresh", False), "age_ms": snap.get("age_ms")}
+        self._last_data = data
+        self._pub.publish(String(data=json.dumps(data, ensure_ascii=False)))
 
 
 # ── HandStatePlugin (sensor) ─────────────────────────────────────────────────
 
 class HandStatePlugin:
-    """灵巧手状态 — /hand_sensor (HandXd12)。
-
-    HandXd12 字段为 float32 数组：拇指/食指 3 个关节，中指/无名指/小指各 2 个关节：
-      lefthumb[3], leftindex[3], leftmid[2], leftring[2], leftpinky[2],
-      righthumb[3], rightindex[3], rightmid[2], rightring[2], rightpinky[2]
-    """
+    """灵巧手状态 — 使用共享 Q5SdkClient sensor_snapshot("hand")。"""
 
     def __init__(self, plugin_config: dict, namespace: str, executor, client=None):
         self._ns = namespace
+        self._client = client
         self._node = _Q5Node("hand_state")
         executor.add_node(self._node)
 
         self._pub = self._node.create_publisher(String, f"/{self._ns}/hand_sensor", _LOW_LAT_QOS)
-        self._sub = self._node.create_subscription(
-            HandXd12, "/hand_sensor", self._on_hand_sensor, _LOW_LAT_QOS)
 
         self._state = "idle"
         self._last_data = None
@@ -482,60 +522,54 @@ class HandStatePlugin:
                 "action": {"type": "string", "enum": ["start", "stop", "info"], "default": "info"},
             }},
             "default_action": "info",
+            "topic_out": [{"topic": f"/{self._ns}/hand_sensor", "format": "data/json"}],
         }
 
     def start(self) -> None:
         self._state = "active"
+        self._tick_timer = self._node.create_timer(0.05, self._tick)
 
     def stop(self) -> None:
         self._state = "idle"
+        if hasattr(self, '_tick_timer'):
+            self._tick_timer.cancel()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action in ("start", "info"):
-            info = {"state": "active", "topic": f"/{self._ns}/hand_sensor"}
-            if self._last_data:
-                info["data"] = self._last_data
+            snap = self._client.sensor_snapshot("hand") if self._client else {}
+            info = {"state": "active", "topic": f"/{self._ns}/hand_sensor",
+                    "fresh": snap.get("fresh", False), "age_ms": snap.get("age_ms")}
+            if snap.get("available"):
+                info["data"] = self._last_data or snap.get("hand_data", {})
             return info
         if action == "stop":
             return {"state": "idle"}
         return None
 
-    def _on_hand_sensor(self, msg: HandXd12):
-        # HandXd12 fields are float32 arrays: thumb/index have 3 joints, mid/ring/pinky have 2
-        data = {
-            "left": {
-                "thumb": list(msg.lefthumb),
-                "index": list(msg.leftindex),
-                "mid": list(msg.leftmid),
-                "pinky": list(msg.leftpinky),
-                "ring": list(msg.leftring),
-            },
-            "right": {
-                "thumb": list(msg.righthumb),
-                "index": list(msg.rightindex),
-                "mid": list(msg.rightmid),
-                "pinky": list(msg.rightpinky),
-                "ring": list(msg.rightring),
-            },
-        }
+    def _tick(self):
+        if self._state != "active":
+            return
+        snap = self._client.sensor_snapshot("hand") if self._client else {}
+        if not snap.get("available"):
+            return
+        hand_data = snap.get("hand_data", {})
+        data = {**hand_data, "fresh": snap.get("fresh", False), "age_ms": snap.get("age_ms")}
         self._last_data = data
-        self._pub.publish(String(data=json.dumps(data)))
+        self._pub.publish(String(data=json.dumps(data, ensure_ascii=False)))
 
 
 # ── OdomPlugin (sensor) ──────────────────────────────────────────────────────
 
 class OdomPlugin:
-    """底盘里程计 — /wr1_base_drive_controller/odom。"""
+    """底盘里程计 — 使用共享 Q5SdkClient sensor_snapshot("odom")。"""
 
     def __init__(self, plugin_config: dict, namespace: str, executor, client=None):
         self._ns = namespace
+        self._client = client
         self._node = _Q5Node("odom")
         executor.add_node(self._node)
 
-        self._pub = self._node.create_publisher(Odometry, f"/{self._ns}/odom", _RELIABLE_QOS)
-        self._sub = self._node.create_subscription(
-            Odometry, "/wr1_base_drive_controller/odom",
-            lambda m: self._pub.publish(m), _LOW_LAT_QOS)
+        self._pub = self._node.create_publisher(String, f"/{self._ns}/odom", _RELIABLE_QOS)
 
         self._state = "idle"
 
@@ -549,20 +583,45 @@ class OdomPlugin:
                 "action": {"type": "string", "enum": ["start", "stop", "info"], "default": "info"},
             }},
             "default_action": "info",
+            "topic_out": [{"topic": f"/{self._ns}/odom", "format": "data/json"}],
         }
 
     def start(self) -> None:
         self._state = "active"
+        self._tick_timer = self._node.create_timer(0.05, self._tick)
 
     def stop(self) -> None:
         self._state = "idle"
+        if hasattr(self, '_tick_timer'):
+            self._tick_timer.cancel()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action in ("start", "info"):
-            return {"state": "active", "topic": f"/{self._ns}/odom"}
+            snap = self._client.sensor_snapshot("odom") if self._client else {}
+            info = {"state": "active", "topic": f"/{self._ns}/odom",
+                    "fresh": snap.get("fresh", False), "age_ms": snap.get("age_ms")}
+            if snap.get("available"):
+                info["data"] = snap
+            return info
         if action == "stop":
             return {"state": "idle"}
         return None
+
+    def _tick(self):
+        if self._state != "active":
+            return
+        snap = self._client.sensor_snapshot("odom") if self._client else {}
+        if not snap.get("available"):
+            return
+        data = {
+            "position": snap.get("position", {}),
+            "orientation": snap.get("orientation", {}),
+            "linear_velocity": snap.get("linear_velocity", {}),
+            "angular_velocity": snap.get("angular_velocity", {}),
+            "fresh": snap.get("fresh", False),
+            "age_ms": snap.get("age_ms"),
+        }
+        self._pub.publish(String(data=json.dumps(data, ensure_ascii=False)))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
