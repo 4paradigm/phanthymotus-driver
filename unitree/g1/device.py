@@ -1892,8 +1892,6 @@ class _WirelessControllerNode(Node):
     def _public_state(self, state: dict | None, sample_count: int, now: float | None = None) -> dict:
         current = time.monotonic() if now is None else now
         base = {
-            "source_topic": self.DDS_TOPIC,
-            "topic_out": [{"topic": self._topic, "format": "data/json"}],
             "fresh_timeout_sec": self._fresh_timeout_sec,
             "sample_count": sample_count,
             "deadzone": self.ACTIVE_DEADZONE,
@@ -1946,8 +1944,6 @@ class _WirelessControllerNode(Node):
         state = self.current_state()
         return {
             "state": state["state"],
-            "source_topic": self.DDS_TOPIC,
-            "topic_out": [{"topic": self._topic, "format": "data/json"}],
             "fresh_timeout_sec": self._fresh_timeout_sec,
             "deadzone": self.ACTIVE_DEADZONE,
             "connected": state["connected"],
@@ -1972,19 +1968,10 @@ class WirelessControllerPlugin:
             "type": "sensor",
             "multiInstance": False,
             "description": (
-                "G1 wireless controller input monitor — read whether physical controller stick "
-                "or button input is reaching the driver. This is read-only and never commands motion."
+                "G1 wireless controller input monitor — publishes physical controller stick "
+                "and button input reaching the driver. This sensor never commands motion."
             ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["read", "info"],
-                        "description": "Optional action; omitted calls read the current controller input",
-                    },
-                },
-            },
+            "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._topic, "format": "data/json"}],
         }
 
@@ -1995,12 +1982,12 @@ class WirelessControllerPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict | None:
-        if action in ("wireless_controller", "read", "start"):
+        if action in ("wireless_controller", "start"):
             return self._node.current_state()
         if action == "info":
             return self._node.info()
         if action == "stop":
-            return {"state": "idle", "topic_out": [{"topic": self._topic, "format": "data/json"}]}
+            return {"state": "idle"}
         return None
 
 

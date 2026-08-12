@@ -170,8 +170,9 @@ class WirelessControllerPluginTests(unittest.TestCase):
             [{"topic": "/test_g1/state/wireless_controller", "format": "data/json"}],
             tool["topic_out"],
         )
-        self.assertEqual(["read", "info"], tool["inputSchema"]["properties"]["action"]["enum"])
-        self.assertIn("read-only", tool["description"])
+        self.assertEqual({}, tool["inputSchema"]["properties"])
+        self.assertNotIn("read", tool["description"].lower())
+        self.assertIn("never commands motion", tool["description"])
 
     def test_subscribes_to_unitree_lowstate_dds(self):
         self.assertEqual(1, len(FakeChannelSubscriber.instances))
@@ -199,7 +200,8 @@ class WirelessControllerPluginTests(unittest.TestCase):
         self.assertTrue(published["connected"])
         self.assertEqual("fresh", published["reason"])
         self.assertEqual(1, published["sample_count"])
-        self.assertEqual("rt/lowstate", published["source_topic"])
+        self.assertNotIn("source_topic", published)
+        self.assertNotIn("topic_out", published)
         self.assertEqual(0, published["last_update_ago_ms"])
         self.assertAlmostEqual(0.1, published["left_stick"]["x"])
         self.assertAlmostEqual(-0.2, published["left_stick"]["y"])
@@ -223,20 +225,17 @@ class WirelessControllerPluginTests(unittest.TestCase):
         self.assertEqual(1, state["sample_count"])
         self.assertGreaterEqual(state["last_update_ago_ms"], 0)
 
-        read_state = self.plugin.dispatch("read", {})
-        self.assertEqual(state["buttons"], read_state["buttons"])
+        self.assertIsNone(self.plugin.dispatch("read", {}))
 
     def test_no_data_state_is_explicit(self):
-        state = self.plugin.dispatch("read", {})
+        state = self.plugin.dispatch("wireless_controller", {})
         self.assertEqual("no_data", state["state"])
         self.assertFalse(state["connected"])
         self.assertEqual("no_data", state["reason"])
         self.assertEqual(0, state["sample_count"])
         self.assertEqual(-1, state["last_update_ago_ms"])
-        self.assertEqual(
-            [{"topic": "/test_g1/state/wireless_controller", "format": "data/json"}],
-            state["topic_out"],
-        )
+        self.assertNotIn("source_topic", state)
+        self.assertNotIn("topic_out", state)
 
     def test_info_reports_source_and_freshness_without_axes(self):
         msg = types.SimpleNamespace(wireless_remote=[0] * 40)
@@ -244,11 +243,8 @@ class WirelessControllerPluginTests(unittest.TestCase):
 
         info = self.plugin.dispatch("info", {})
         self.assertEqual("running", info["state"])
-        self.assertEqual("rt/lowstate", info["source_topic"])
-        self.assertEqual(
-            [{"topic": "/test_g1/state/wireless_controller", "format": "data/json"}],
-            info["topic_out"],
-        )
+        self.assertNotIn("source_topic", info)
+        self.assertNotIn("topic_out", info)
         self.assertEqual(1.0, info["fresh_timeout_sec"])
         self.assertEqual(0.1, info["deadzone"])
         self.assertTrue(info["connected"])
