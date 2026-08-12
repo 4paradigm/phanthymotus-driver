@@ -1087,8 +1087,15 @@ class _MotionStateNode(Node):
             and result["sample_age_ms"] is not None
             and result["sample_age_ms"] <= max(1000, int(self._interval_s * 5_000))
         )
-        if detail != "joints":
-            result.pop("joint_states", None)
+        if detail == "joints" and result.get("state") not in ("error", "no_data"):
+            return {
+                "state": result["state"],
+                "fresh": result["fresh"],
+                "sample_age_ms": result["sample_age_ms"],
+                "source": result.get("source"),
+                "joint_states": result.get("joint_states", []),
+            }
+        result.pop("joint_states", None)
         return result
 
     def history(self, limit: int) -> list[dict]:
@@ -1219,13 +1226,16 @@ class _MotionStateNode(Node):
         groups = {}
         for name, indices in self._JOINT_GROUPS.items():
             selected = [joint_states[index] for index in indices]
+            group_velocities = [abs(item["velocity"]) for item in selected]
             groups[name] = {
-                "joints": [{
-                    "joint": item["joint"],
-                    "position": item["position"],
-                    "velocity": item["velocity"],
-                } for item in selected],
-                "max_abs_velocity": round(max(abs(item["velocity"]) for item in selected), 6),
+                "joint_count": len(selected),
+                "moving_joint_count": sum(
+                    velocity >= self._activity_velocity_threshold
+                    for velocity in group_velocities
+                ),
+                "max_abs_velocity": round(max(group_velocities), 6),
+                "mean_abs_velocity": round(
+                    sum(group_velocities) / len(group_velocities), 6),
             }
 
         return {
@@ -1305,7 +1315,7 @@ class MotionStatePlugin:
                     "detail": {
                         "type": "string", "enum": ["summary", "joints"],
                         "default": "summary",
-                        "description": "仅用于 snapshot。summary（默认）返回整机和分组摘要；joints 额外返回全部 21 个关节的位置、速度、扭矩、温度和错误。",
+                        "description": "仅用于 snapshot。summary（默认）返回整机和分组摘要；joints 仅返回全部 21 个关节的位置、速度、扭矩、温度和错误，不附带 summary。",
                     },
                     "limit": {
                         "type": "integer", "minimum": 1, "maximum": 100,
@@ -1315,7 +1325,7 @@ class MotionStatePlugin:
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "snapshot": {"params": ["detail"], "description": "Get whole-body motion telemetry; detail=joints includes all 21 joints"},
+                    "snapshot": {"params": ["detail"], "description": "获取当前运动遥测；summary 返回整机摘要，joints 仅返回 21 个关节完整明细。"},
                     "history": {"params": ["limit"], "description": "Get recent motion, mode, protection and motor-fault events"},
                     "clear_history": {"params": [], "description": "Clear recorded motion events"},
                 },
@@ -1331,6 +1341,8 @@ class MotionStatePlugin:
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action in ("start", "snapshot", "info"):
+            if action == "snapshot" and "limit" in args:
+                return {"state": "error", "error": "limit is only valid for history"}
             detail = args.get("detail", "summary")
             if detail not in ("summary", "joints"):
                 return {"state": "error", "error": "detail must be summary or joints"}
@@ -1338,6 +1350,8 @@ class MotionStatePlugin:
         if action == "stop":
             return {"state": "idle"}
         if action == "history":
+            if "detail" in args:
+                return {"state": "error", "error": "detail is only valid for snapshot"}
             try:
                 limit = int(args.get("limit", 20))
             except (TypeError, ValueError):
@@ -1346,6 +1360,9 @@ class MotionStatePlugin:
                 return {"state": "error", "error": "limit must be in [1, 100]"}
             return {"state": "completed", "events": self._node.history(limit)}
         if action == "clear_history":
+            unexpected = sorted(set(args) - {"_tool_name"})
+            if unexpected:
+                return {"state": "error", "error": "clear_history does not accept parameters"}
             self._node.clear_history()
             return {"state": "completed"}
         return {"state": "error", "error": f"unknown action: {action}"}
