@@ -16,7 +16,10 @@ drivers/unitree/g1/device.py — Unitree G1 设备插件（重构版）。
   LocoPlugin         (actuator)  — 运动控制
   ArmActionPlugin    (actuator)  — 手臂动作
   StatePlugin        (sensor)    — DDS LowState → IMU/battery ROS2 topic
+  FootContactSlipPlugin (sensor) — DDS SportModeState foot forces → ROS2 topic
 """
+
+from __future__ import annotations
 
 import json
 import queue
@@ -25,6 +28,7 @@ import struct
 import subprocess
 import threading
 import time
+from collections import deque
 
 import rclpy
 from rclpy.node import Node
@@ -1815,6 +1819,220 @@ class StatePlugin:
             if urdf_path.exists():
                 return {"urdf": urdf_path.read_text()}
             return {"error": "URDF model file not found"}
+        return None
+
+
+# ── FootContactSlipPlugin (sensor/status) ───────────────────────────────────
+
+class _FootContactSlipNode(Node):
+    """Derives bilateral contact and conservative slip suspicion from SportModeState."""
+
+    DDS_TOPIC = "rt/odommodestate"
+    PUBLISH_INTERVAL_SEC = 0.1
+    FRESH_TIMEOUT_SEC = 0.5
+    HISTORY_SEC = 0.6
+    CONTACT_FORCE_THRESHOLD = 10.0
+    SLIP_ALERT_THRESHOLD = 0.65
+
+    def __init__(self, topic: str, contact_force_threshold: float = CONTACT_FORCE_THRESHOLD,
+                 fresh_timeout_sec: float = FRESH_TIMEOUT_SEC, history_sec: float = HISTORY_SEC,
+                 left_force_indices: tuple[int, ...] = (0, 1),
+                 right_force_indices: tuple[int, ...] = (2, 3)):
+        super().__init__("g1_foot_contact_slip")
+        self._topic = topic
+        self._pub = self.create_publisher(String, topic, _LOW_LAT_QOS)
+        self._contact_force_threshold = max(0.0, float(contact_force_threshold))
+        self._fresh_timeout_sec = max(0.1, float(fresh_timeout_sec))
+        self._history_sec = max(0.1, float(history_sec))
+        self._left_force_indices = tuple(left_force_indices)
+        self._right_force_indices = tuple(right_force_indices)
+        self._lock = threading.Lock()
+        self._last_sample: dict | None = None
+        self._history = deque()
+        self._sample_count = 0
+        self._force_seen = False
+        self._timer = self.create_timer(self.PUBLISH_INTERVAL_SEC, self._publish_state)
+
+        try:
+            from unitree_sdk2py.core.channel import ChannelSubscriber
+            from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_
+            self._sub = ChannelSubscriber(self.DDS_TOPIC, SportModeState_)
+            self._sub.Init(self._on_sport_state, 10)
+            self.get_logger().info(f"FootContactSlipNode subscribed {self.DDS_TOPIC} → {topic}")
+        except Exception as e:
+            self._sub = None
+            self.get_logger().warn(f"FootContactSlipNode: failed to subscribe {self.DDS_TOPIC}: {e}")
+
+    @staticmethod
+    def _side_force(forces: tuple[float, ...], indices: tuple[int, ...]) -> float:
+        return sum(forces[index] for index in indices if 0 <= index < len(forces))
+
+    def _on_sport_state(self, msg, now: float | None = None) -> None:
+        updated_at = time.monotonic() if now is None else now
+        raw_forces = list(getattr(msg, "foot_force", []))[:4]
+        forces = tuple(max(0.0, float(value)) for value in raw_forces)
+        forces += (0.0,) * (4 - len(forces))
+        sample = {
+            "updated_at": updated_at,
+            "left_force": self._side_force(forces, self._left_force_indices),
+            "right_force": self._side_force(forces, self._right_force_indices),
+            "raw_forces": list(forces),
+        }
+        with self._lock:
+            self._last_sample = sample
+            self._history.append(sample)
+            cutoff = updated_at - self._history_sec
+            while self._history and self._history[0]["updated_at"] < cutoff:
+                self._history.popleft()
+            self._sample_count += 1
+            self._force_seen = self._force_seen or sum(forces) >= self._contact_force_threshold
+
+    @staticmethod
+    def _instability(values: list[float], current: float, threshold: float) -> float:
+        if len(values) < 2:
+            return 0.0
+        peak = max(values)
+        if peak < threshold:
+            return 0.0
+        abrupt_unload = max(0.0, peak - current) / peak
+        mean = sum(values) / len(values)
+        variation = (max(values) - min(values)) / max(mean, threshold)
+        return min(1.0, 0.7 * abrupt_unload + 0.3 * min(1.0, variation))
+
+    def _public_state(self, sample: dict | None, history: list[dict], sample_count: int,
+                      force_seen: bool, now: float | None = None) -> dict:
+        current = time.monotonic() if now is None else now
+        base = {
+            "contact_force_threshold": self._contact_force_threshold,
+            "fresh_timeout_sec": self._fresh_timeout_sec,
+            "history_sec": self._history_sec,
+            "sample_count": sample_count,
+            "force_signal_observed": force_seen,
+            "slip_score_note": "Heuristic suspicion from foot-force instability; it is not a calibrated slip detector.",
+        }
+        if sample is None:
+            return {
+                **base, "state": "no_data", "connected": False, "contact_observable": False,
+                "left_contact": None, "right_contact": None, "slip_score": None,
+                "slipping_foot": "unknown", "confidence": 0.0, "reason": "no_sport_state",
+                "last_update_ago_ms": -1,
+            }
+
+        age_ms = max(0, int((current - sample["updated_at"]) * 1000))
+        connected = age_ms <= int(self._fresh_timeout_sec * 1000)
+        if not connected:
+            return {
+                **base, "state": "stale", "connected": False, "contact_observable": False,
+                "left_contact": None, "right_contact": None, "slip_score": None,
+                "slipping_foot": "unknown", "confidence": 0.0, "reason": "stale_sport_state",
+                "last_update_ago_ms": age_ms,
+            }
+
+        if not force_seen:
+            return {
+                **base, "state": "unsupported", "connected": True, "contact_observable": False,
+                "left_contact": None, "right_contact": None, "slip_score": None,
+                "slipping_foot": "unknown", "confidence": 0.0,
+                "reason": "no_force_signal_observed", "last_update_ago_ms": age_ms,
+                "diagnosis": (
+                    "DDS sport state is fresh, but foot_force has never exceeded the configured threshold. "
+                    "Foot-contact/slip cannot be validated until this G1 exposes nonzero rt/odommodestate.foot_force."
+                ),
+                "raw_foot_force": [round(value, 2) for value in sample["raw_forces"]],
+            }
+
+        left_force = sample["left_force"]
+        right_force = sample["right_force"]
+        total_force = left_force + right_force
+        left_contact = left_force >= self._contact_force_threshold
+        right_contact = right_force >= self._contact_force_threshold
+        left_values = [item["left_force"] for item in history]
+        right_values = [item["right_force"] for item in history]
+        left_score = self._instability(left_values, left_force, self._contact_force_threshold) if left_contact else 0.0
+        right_score = self._instability(right_values, right_force, self._contact_force_threshold) if right_contact else 0.0
+        slip_score = max(left_score, right_score)
+        if slip_score < self.SLIP_ALERT_THRESHOLD:
+            slipping_foot = "none"
+        elif left_score > right_score:
+            slipping_foot = "left"
+        elif right_score > left_score:
+            slipping_foot = "right"
+        else:
+            slipping_foot = "both"
+        confidence = min(0.8, 0.2 + 0.1 * min(6, len(history)))
+        return {
+            **base, "state": "running", "connected": True, "contact_observable": True,
+            "left_contact": left_contact, "right_contact": right_contact,
+            "left_load_ratio": round(left_force / total_force, 3) if total_force > 0 else 0.0,
+            "right_load_ratio": round(right_force / total_force, 3) if total_force > 0 else 0.0,
+            "slip_score": round(slip_score, 3), "slipping_foot": slipping_foot,
+            "confidence": round(confidence, 2),
+            "reason": "force_distribution_stable" if slipping_foot == "none" else "force_distribution_unstable",
+            "last_update_ago_ms": age_ms,
+            "raw_foot_force": [round(value, 2) for value in sample["raw_forces"]],
+        }
+
+    def current_state(self, now: float | None = None) -> dict:
+        with self._lock:
+            sample = dict(self._last_sample) if self._last_sample else None
+            history = [dict(item) for item in self._history]
+            sample_count = self._sample_count
+            force_seen = self._force_seen
+        return self._public_state(sample, history, sample_count, force_seen, now=now)
+
+    def _publish_state(self) -> None:
+        out = String()
+        out.data = json.dumps(self.current_state())
+        self._pub.publish(out)
+
+    def info(self) -> dict:
+        state = self.current_state()
+        return {
+            "state": state["state"], "contact_force_threshold": self._contact_force_threshold,
+            "fresh_timeout_sec": self._fresh_timeout_sec, "history_sec": self._history_sec,
+            "contact_observable": state["contact_observable"], "sample_count": state["sample_count"],
+        }
+
+
+class FootContactSlipPlugin:
+    PREFIX = "foot_contact_slip"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor):
+        self._topic = f"/{namespace}/state/foot_contact_slip"
+        self._node = _FootContactSlipNode(
+            self._topic,
+            contact_force_threshold=plugin_config.get("contact_force_threshold", _FootContactSlipNode.CONTACT_FORCE_THRESHOLD),
+            fresh_timeout_sec=plugin_config.get("fresh_timeout_sec", _FootContactSlipNode.FRESH_TIMEOUT_SEC),
+            history_sec=plugin_config.get("history_sec", _FootContactSlipNode.HISTORY_SEC),
+            left_force_indices=tuple(plugin_config.get("left_force_indices", [0, 1])),
+            right_force_indices=tuple(plugin_config.get("right_force_indices", [2, 3])),
+        )
+        executor.add_node(self._node)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "foot_contact_slip", "type": "sensor", "multiInstance": False,
+            "description": (
+                "G1 bilateral foot-contact and load-distribution monitor. Publishes contact state, "
+                "load ratio, and conservative force-only slip suspicion; it never commands motion."
+            ),
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._topic, "format": "data/json"}],
+        }
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        if action in ("foot_contact_slip", "start"):
+            return self._node.current_state()
+        if action == "info":
+            return self._node.info()
+        if action == "stop":
+            return {"state": "idle"}
         return None
 
 
