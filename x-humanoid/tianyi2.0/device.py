@@ -4069,10 +4069,17 @@ class TtsPlugin:
             # 分段：超过 280 字按标点切分，避免超长文本 PlayEvent 丢失
             segments = self._split_text(text, max_chars=280)
 
-            # 取消旧的播放线程（如果有）
+            # 取消旧的播放线程（如果有）— 同时对 lyre 发 stop
             old_ce = self._cancel_event
-            if old_ce:
+            if old_ce and not old_ce.is_set():
                 old_ce.set()
+                # 停止 lyre 当前播放，确保新请求能拿到 sid
+                if self._stop_client:
+                    try:
+                        req = type(self._stop_client.srv_type.Request)()
+                        self._stop_client.call_async(req)
+                    except Exception:
+                        pass
             cancel_event = threading.Event()
             self._cancel_event = cancel_event
 
@@ -4112,6 +4119,7 @@ class TtsPlugin:
         from lyre_msgs.srv import PlayText
 
         overall_status = "completed"
+        sid = None  # 记录最后一个成功的 sid（用于 ACP callback）
 
         for i, seg_text in enumerate(segments):
             # 每段开始前检查取消
@@ -4121,10 +4129,10 @@ class TtsPlugin:
                 break
 
             is_last = (i == len(segments) - 1)
-            # 发送 PlayText service
+            # 发送 PlayText service — 第一段用调用方指定的 force，后续段不 force
             req = PlayText.Request()
             req.text = seg_text
-            req.force = force if i == 0 else False  # 只第一段 force
+            req.force = force if i == 0 else False
             req.last = is_last
             future = self._play_client.call_async(req)
 
@@ -4141,29 +4149,31 @@ class TtsPlugin:
                 print(f"[TtsPlugin] cancelled during service wait seg {i+1}/{len(segments)}")
                 break
 
-            sid = None
+            seg_sid = None
             if future.done():
                 result = future.result()
                 if result:
-                    sid = getattr(result, 'sid', None)
+                    seg_sid = getattr(result, 'sid', None)
+            if seg_sid:
+                sid = seg_sid
 
             # Phase 2: 等 PlayEvent
-            if sid:
-                buffered = self._play_event_buffer.pop(sid, None)
+            if seg_sid:
+                buffered = self._play_event_buffer.pop(seg_sid, None)
                 if buffered is not None:
                     # 被 interrupt 停止的情况
                     if buffered >= 2 and cancel_event.is_set():
                         overall_status = "cancelled"
                         print(f"[TtsPlugin] cancelled (buffered STOPPED/CANCELLED) seg {i+1}/{len(segments)}")
-                        self._pending_play_duration.pop(sid, None)
+                        self._pending_play_duration.pop(seg_sid, None)
                         break
                     seg_status = "completed" if buffered == 1 else "error"
-                    print(f"[TtsPlugin] seg {i+1}/{len(segments)} from buffer: sid={sid} event={buffered}")
+                    print(f"[TtsPlugin] seg {i+1}/{len(segments)} from buffer: sid={seg_sid} event={buffered}")
                 else:
                     ev = threading.Event()
-                    self._pending_play[sid] = ev
+                    self._pending_play[seg_sid] = ev
                     _t.sleep(0.3)
-                    reported_duration = self._pending_play_duration.get(sid)
+                    reported_duration = self._pending_play_duration.get(seg_sid)
                     if reported_duration and reported_duration > 0:
                         play_timeout = reported_duration + 8.0
                     else:
@@ -4183,24 +4193,24 @@ class TtsPlugin:
 
                     if cancel_event.is_set():
                         overall_status = "cancelled"
-                        self._pending_play.pop(sid, None)
-                        self._pending_play_status.pop(sid, None)
-                        self._pending_play_duration.pop(sid, None)
-                        self._play_event_buffer.pop(sid, None)
+                        self._pending_play.pop(seg_sid, None)
+                        self._pending_play_status.pop(seg_sid, None)
+                        self._pending_play_duration.pop(seg_sid, None)
+                        self._play_event_buffer.pop(seg_sid, None)
                         print(f"[TtsPlugin] cancelled during PlayEvent wait seg {i+1}/{len(segments)}")
                         break
                     elif timed_out:
                         seg_status = "error"
-                        print(f"[TtsPlugin] PlayEvent timeout: seg {i+1}/{len(segments)} sid={sid}, waited {play_timeout:.0f}s (duration={reported_duration})")
+                        print(f"[TtsPlugin] PlayEvent timeout: seg {i+1}/{len(segments)} sid={seg_sid}, waited {play_timeout:.0f}s (duration={reported_duration})")
                     else:
-                        event_code = self._pending_play_status.get(sid, 1)
+                        event_code = self._pending_play_status.get(seg_sid, 1)
                         # STOPPED(2) 或 CANCELLED(3) + cancel_event → 被打断
                         if event_code >= 2 and cancel_event.is_set():
                             overall_status = "cancelled"
-                            self._pending_play.pop(sid, None)
-                            self._pending_play_status.pop(sid, None)
-                            self._pending_play_duration.pop(sid, None)
-                            self._play_event_buffer.pop(sid, None)
+                            self._pending_play.pop(seg_sid, None)
+                            self._pending_play_status.pop(seg_sid, None)
+                            self._pending_play_duration.pop(seg_sid, None)
+                            self._play_event_buffer.pop(seg_sid, None)
                             print(f"[TtsPlugin] cancelled (PlayEvent STOPPED) seg {i+1}/{len(segments)}")
                             break
                         # event_code: 1=COMPLETED, 2=STOPPED (也算完成), 3=CANCELLED, 4=FAILED
@@ -4210,10 +4220,10 @@ class TtsPlugin:
                             print(f"[TtsPlugin] seg {i+1}/{len(segments)} failed: {event_name} (code={event_code})")
                         elif event_code == 2:
                             print(f"[TtsPlugin] seg {i+1}/{len(segments)} STOPPED (treated as completed)")
-                    self._pending_play.pop(sid, None)
-                    self._pending_play_status.pop(sid, None)
-                self._pending_play_duration.pop(sid, None)
-                self._play_event_buffer.pop(sid, None)
+                    self._pending_play.pop(seg_sid, None)
+                    self._pending_play_status.pop(seg_sid, None)
+                self._pending_play_duration.pop(seg_sid, None)
+                self._play_event_buffer.pop(seg_sid, None)
 
                 if seg_status == "error" and not is_last:
                     # 某段 error 但还有后续段，继续播下一段
@@ -4221,7 +4231,7 @@ class TtsPlugin:
                     continue
                 elif seg_status == "error" and is_last:
                     overall_status = "error"
-            elif not sid:
+            elif not seg_sid:
                 # 没拿到 sid，fallback 按字数估算（但也要检查 cancel）
                 fallback_s = len(seg_text) / 2.5 + 5.0
                 waited = 0.0
