@@ -18,7 +18,7 @@ plugins:
     poll_interval_s: 0.5
     history_size: 100
     # Activity classification only; this is not a motor safety or command limit.
-    activity_velocity_threshold: 0.05
+    activity_velocity_threshold: 0.15
   arm:
     enabled: true
     # Bumi LowController writes all 21 motors, even for an arm-only target.

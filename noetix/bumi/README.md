@@ -15,6 +15,10 @@ Read-only whole-body motion telemetry from `HighController`.
 - ROS2 output: `/<namespace>/motion/state`, JSON.
 
 The default polling and topic publication rate is 2 Hz (`poll_interval_s: 0.5`).
+Motion activity uses a configurable joint-speed threshold, defaulting to
+`0.15 rad/s`. Only motor error codes explicitly documented by Noetix are
+classified as faults; other non-zero raw values are returned separately as
+`unrecognized_motor_statuses` for device-side verification.
 
 Every snapshot identifies `Noetix HighController/CycloneDDS` as its source and includes freshness and sample-age fields. It deliberately excludes battery data, which belongs to the existing `battery` card. The SDK does not expose world-frame position or translational velocity, so the card reports only documented IMU and joint measurements and does not invent odometry.
 

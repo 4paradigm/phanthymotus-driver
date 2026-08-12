@@ -1189,9 +1189,11 @@ class _MotionStateNode(Node):
         linear_acceleration = [float(imu.linear_acc[index]) for index in range(3)]
         joint_states = []
         faults = []
+        unrecognized_statuses = []
         for index, joint in enumerate(raw_joint_state):
             motor_id = int(getattr(joint, "motor_id", index))
             error = int(getattr(joint, "error", 0))
+            documented_fault = error in _MOTOR_ERROR_NAMES
             item = {
                 "motor_id": motor_id,
                 "joint": _JOINT_NAMES_BY_ID[index],
@@ -1200,14 +1202,22 @@ class _MotionStateNode(Node):
                 "torque": round(float(joint.tau), 6),
                 "temperature": int(joint.temperature),
                 "error": error,
+                "fault": documented_fault,
+                "error_documented": error == 0 or documented_fault,
             }
             joint_states.append(item)
-            if error:
+            if documented_fault:
                 faults.append({
                     "motor_id": motor_id, "joint": _JOINT_NAMES_BY_ID[index],
                     "error": error,
-                    "error_name": _MOTOR_ERROR_NAMES.get(error, "unknown"),
+                    "error_name": _MOTOR_ERROR_NAMES[error],
                     "temperature": int(joint.temperature),
+                })
+            elif error:
+                unrecognized_statuses.append({
+                    "motor_id": motor_id,
+                    "joint": _JOINT_NAMES_BY_ID[index],
+                    "raw_error": error,
                 })
 
         absolute_velocities = [abs(item["velocity"]) for item in joint_states]
@@ -1253,6 +1263,7 @@ class _MotionStateNode(Node):
                 },
             },
             "motor_faults": faults,
+            "unrecognized_motor_statuses": unrecognized_statuses,
             "joint_states": joint_states,
         }
 
@@ -1268,7 +1279,7 @@ class MotionStatePlugin:
         if not 1 <= history_size <= 1000:
             raise ValueError("history_size must be in [1, 1000]")
         activity_threshold = _finite_number(
-            plugin_config.get("activity_velocity_threshold", 0.05),
+            plugin_config.get("activity_velocity_threshold", 0.15),
             "activity_velocity_threshold",
         )
         if not 0.001 <= activity_threshold <= 10.0:
@@ -1936,10 +1947,25 @@ class DiagnosticsPlugin:
             checks.append(self._check("bms_alarm", "failed" if alarm else "passed",
                                       "battery alarm present" if alarm else "no battery alarm", alarm=alarm))
             states = self._high.get_joint_state()
-            errors = [{"motor_id": int(getattr(item, "motor_id", index)), "error": int(item.error)}
-                      for index, item in enumerate(states) if int(item.error)]
+            errors = [{
+                "motor_id": int(getattr(item, "motor_id", index)),
+                "error": int(item.error),
+                "error_name": _MOTOR_ERROR_NAMES[int(item.error)],
+            } for index, item in enumerate(states)
+                if int(item.error) in _MOTOR_ERROR_NAMES]
+            unrecognized = [{
+                "motor_id": int(getattr(item, "motor_id", index)),
+                "raw_error": int(item.error),
+            } for index, item in enumerate(states)
+                if int(item.error) and int(item.error) not in _MOTOR_ERROR_NAMES]
             checks.append(self._check("motor_errors", "failed" if errors else "passed",
                                       f"{len(errors)} motor error(s)" if errors else "no motor errors", errors=errors))
+            if unrecognized:
+                checks.append(self._check(
+                    "unrecognized_motor_statuses", "warning",
+                    f"{len(unrecognized)} undocumented non-zero motor status value(s); not classified as faults",
+                    statuses=unrecognized,
+                ))
         except Exception as exc:
             checks.append(self._check("high_controller_read", "failed", str(exc)))
         if self._low is None:
