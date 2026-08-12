@@ -511,6 +511,7 @@ class HmsPlugin:
             {
                 "name": "hms_inject",
                 "type": "actuator",
+                "hidden": True,
                 "description": "Matrice 300 RTK HMS 手动注入告警（用于测试）。注入一个自定义错误码到健康管理系统。",
                 "inputSchema": {
                     "type": "object",
@@ -536,6 +537,7 @@ class HmsPlugin:
             {
                 "name": "hms_eliminate",
                 "type": "actuator",
+                "hidden": True,
                 "description": "Matrice 300 RTK HMS 手动消除告警（用于测试）。消除一个指定的自定义错误码告警。",
                 "inputSchema": {
                     "type": "object",

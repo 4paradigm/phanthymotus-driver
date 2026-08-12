@@ -280,7 +280,9 @@ def make_handler():
                         "serverInfo": {"name": "dji-m300-bundle", "version": "1.0.0"},
                     })
                 elif method == "tools/list":
-                    ok({"tools": _bundle.get_all_tools()})
+                    all_tools = _bundle.get_all_tools()
+                    visible = [t for t in all_tools if not t.get("hidden")]
+                    ok({"tools": visible})
                 elif method == "tools/call":
                     name = params.get("name", "")
                     args = params.get("arguments") or {}
