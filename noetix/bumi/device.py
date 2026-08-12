@@ -1030,3 +1030,576 @@ class CameraPlugin:
                 return {"state": "running", "topic_out": [{"topic": self._depth_topic, "format": "image/depth-zlib"}]}
             return {"state": "running"}
         return None
+
+# ── VideoPlugin (actuator ×1 + sensor ×1 + actuator ×1) ──────────────────────
+#
+# 算力板 Bumi 的视频数据流（参考 SDK demo test_media.py / example_media.cpp）：
+#
+#   摄像头/USB → YUYV帧 → publish_external_video_stream() → 运控板 Agent（识别+脱敏）
+#                                                              │
+#                                          get_video_capture_desensed_data() ←┘
+#
+#   get_video_capture_data() / pause_video_capture() / resume_video_capture()
+#   仅不带算力板的 Bumi 可用，本插件不封装。
+
+def _yuv422_to_rgb(yuv_data: bytes, width: int, height: int):
+    """Convert YUYV/YUV422 raw bytes to RGB numpy array."""
+    import numpy as np
+    yuv = np.frombuffer(yuv_data, dtype=np.uint8).reshape((height, width, 2))
+    y = yuv[:, :, 0].astype(np.float32)
+    u = yuv[:, ::2, 1].astype(np.float32)
+    v = yuv[:, 1::2, 1].astype(np.float32)
+    u = np.repeat(np.repeat(u, 2, axis=1), 1, axis=0)[:height, :width]
+    v = np.repeat(np.repeat(v, 2, axis=1), 1, axis=0)[:height, :width]
+    y = y - 16
+    u = u - 128
+    v = v - 128
+    r = (y + 1.402 * v).clip(0, 255).astype(np.uint8)
+    g = (y - 0.344136 * u - 0.714136 * v).clip(0, 255).astype(np.uint8)
+    b = (y + 1.772 * u).clip(0, 255).astype(np.uint8)
+    return np.stack([r, g, b], axis=2)
+
+
+def _encode_jpeg(bgr_image) -> bytes:
+    """Encode BGR numpy array to JPEG bytes. TurboJPEG preferred, cv2 fallback."""
+    try:
+        from turbojpeg import TurboJPEG, TJPF_BGR
+        _tj = TurboJPEG()
+        return _tj.encode(bgr_image, pixel_format=TJPF_BGR, quality=80)
+    except Exception:
+        import cv2
+        _, buf = cv2.imencode('.jpg', bgr_image, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        return buf.tobytes()
+
+
+def _frame_to_yuyv(bgr_frame) -> bytes:
+    """Convert OpenCV BGR frame to YUYV bytes (test_media.py publish_video pattern)."""
+    import numpy as np
+    import cv2
+    h, w = bgr_frame.shape[:2]
+    yuv = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2YUV)
+    out = np.zeros((h, w, 2), dtype=np.uint8)
+    out[:, 0::2, 0] = yuv[:, 0::2, 0]   # Y even
+    out[:, 0::2, 1] = yuv[:, 0::2, 1]   # U
+    out[:, 1::2, 0] = yuv[:, 1::2, 0]   # Y odd
+    out[:, 1::2, 1] = yuv[:, 1::2, 2]   # V
+    return out.tobytes()
+
+
+def _decode_video_frame(data: bytes, width: int, height: int):
+    """Decode raw video frame data (YUV422 or RGB) to BGR for JPEG encoding."""
+    import numpy as np
+    import cv2
+
+    if len(data) < 100:
+        return None
+    try:
+        from io import BytesIO
+        from PIL import Image
+        img = Image.open(BytesIO(data))
+        rgb = np.array(img.convert("RGB"))
+        return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    except Exception:
+        pass
+
+    if len(data) == width * height * 2:
+        try:
+            rgb = _yuv422_to_rgb(data, width, height)
+            return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        except Exception:
+            pass
+
+    if len(data) == width * height * 3:
+        try:
+            rgb = np.frombuffer(data, dtype=np.uint8).reshape((height, width, 3))
+            return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        except Exception:
+            pass
+
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Subprocess: USB camera → YUYV → publish_external_video_stream() + ROS2 JPEG
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _external_video_subprocess(namespace: str, camera_id: int):
+    """Open USB camera, push YUYV frames to robot AI agent, also publish JPEG to ROS2.
+
+    This is the PRIMARY video path for 算力板 Bumi.
+    Follows test_media.py publish_video() pattern exactly.
+    """
+    import os as _os
+    _os.environ.setdefault('CYCLONEDDS_URI', 'file:///work/noetix_sdk_bumi/config/dds.xml')
+    import sys as _sys
+    _sys.path.insert(0, '/work/noetix_sdk_bumi/build')
+    import time as _time
+    import cv2
+    import numpy as _np
+
+    import rclpy as _rclpy
+    from rclpy.node import Node as _Node
+    from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+    from sensor_msgs.msg import CompressedImage as _CompressedImage
+
+    _QOS = QoSProfile(
+        reliability=ReliabilityPolicy.BEST_EFFORT,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=1,
+        durability=DurabilityPolicy.VOLATILE,
+    )
+
+    from mediacontrol_py import MediaController, VideoStream
+
+    # ── Init MediaController ──
+    media = MediaController.instance()
+    if not media.init():
+        print("[external_video] MediaController.init() FAILED", flush=True)
+        return
+    _time.sleep(3)
+
+    # ── Enable external video routing to agent ──
+    media.set_external_custom_video_data_to_agent_enable(True)
+    _time.sleep(0.2)
+
+    # ── Open USB camera ──
+    cap = cv2.VideoCapture(camera_id)
+    if not cap.isOpened():
+        print(f"[external_video] Cannot open camera {camera_id}", flush=True)
+        import os as __os
+        for d in range(10):
+            p = f"/dev/video{d}"
+            if __os.path.exists(p):
+                print(f"    available: {p}", flush=True)
+        return
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(f"[external_video] camera {camera_id}: {w}x{h}", flush=True)
+
+    # ── ROS2 publisher for external consumers ──
+    _rclpy.init()
+    node = _Node("bumi_external_video")
+    topic = f"/{namespace}/video/external"
+    pub = node.create_publisher(_CompressedImage, topic, _QOS)
+
+    print(f"[external_video] publishing YUYV→agent + JPEG→{topic}", flush=True)
+
+    fc = 0
+    t_start = _time.monotonic()
+    try:
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                _time.sleep(0.01)
+                continue
+
+            # ── Push YUYV to agent ──
+            yuyv = _frame_to_yuyv(frame)
+            vs = VideoStream()
+            vs.width = w
+            vs.height = h
+            vs.format = 0   # 0 = YUYV (SDK demo convention)
+            vs.fps = 30
+            vs.timestamp_us = int(_time.time() * 1e6)
+            vs.video_data = list(yuyv)
+            media.publish_external_video_stream(vs)
+
+            # ── Also publish JPEG to ROS2 ──
+            jpeg = _encode_jpeg(frame)
+            msg = _CompressedImage()
+            msg.header.stamp = node.get_clock().now().to_msg()
+            msg.format = "jpeg"
+            msg.data = jpeg
+            pub.publish(msg)
+
+            fc += 1
+            if fc % 300 == 0:
+                elapsed = _time.monotonic() - t_start
+                print(f"[external_video] {fc} frames, {fc / elapsed:.1f} fps", flush=True)
+
+            _time.sleep(0.001)  # yield
+    except Exception as e:
+        print(f"[external_video] error: {e}", flush=True)
+    finally:
+        cap.release()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Subprocess: poll get_video_capture_desensed_data() → ROS2 JPEG
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _desensed_video_subprocess(namespace: str):
+    """Poll desensed (privacy-masked) video from robot agent, publish as JPEG to ROS2.
+
+    Only works while external video is being pushed via publish_external_video_stream().
+    Follows test_media.py desensed_video() pattern.
+    """
+    import os as _os
+    _os.environ.setdefault('CYCLONEDDS_URI', 'file:///work/noetix_sdk_bumi/config/dds.xml')
+    import sys as _sys
+    _sys.path.insert(0, '/work/noetix_sdk_bumi/build')
+    import time as _time
+
+    import rclpy as _rclpy
+    from rclpy.node import Node as _Node
+    from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+    from sensor_msgs.msg import CompressedImage as _CompressedImage
+
+    _QOS = QoSProfile(
+        reliability=ReliabilityPolicy.BEST_EFFORT,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=1,
+        durability=DurabilityPolicy.VOLATILE,
+    )
+
+    from mediacontrol_py import MediaController
+    media = MediaController.instance()
+    if not media.init():
+        print("[desensed_video] MediaController.init() FAILED", flush=True)
+        return
+    _time.sleep(3)
+
+    _rclpy.init()
+    node = _Node("bumi_desensed_video")
+    topic = f"/{namespace}/video/desensed"
+    pub = node.create_publisher(_CompressedImage, topic, _QOS)
+
+    # Enable routing so desensed frames are produced
+    media.set_internal_capture_video_data_to_agent_enable(True)
+
+    print(f"[desensed_video] waiting for desensed frames → {topic}", flush=True)
+    print(f"[desensed_video] (requires active external video push)", flush=True)
+
+    frame_count = 0
+    t_start = _time.monotonic()
+    no_data_count = 0
+
+    while True:
+        try:
+            vs = media.get_video_capture_desensed_data()
+            if vs.width == 0 or len(vs.video_data) == 0:
+                no_data_count += 1
+                if no_data_count == 1:
+                    print("[desensed_video] no desensed data yet (is external video pushing?)", flush=True)
+                _time.sleep(0.05)
+                continue
+            no_data_count = 0
+
+            raw = bytes(vs.video_data)
+            bgr = _decode_video_frame(raw, vs.width, vs.height)
+            if bgr is None:
+                _time.sleep(0.02)
+                continue
+
+            jpeg_bytes = _encode_jpeg(bgr)
+            msg = _CompressedImage()
+            msg.header.stamp = node.get_clock().now().to_msg()
+            msg.format = "jpeg"
+            msg.data = jpeg_bytes
+            pub.publish(msg)
+
+            frame_count += 1
+            if frame_count % 300 == 0:
+                elapsed = _time.monotonic() - t_start
+                print(f"[desensed_video] {frame_count} frames, {frame_count / elapsed:.1f} fps", flush=True)
+
+            _time.sleep(0.005)
+        except Exception as e:
+            print(f"[desensed_video] error: {e}", flush=True)
+            _time.sleep(0.5)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# VideoPlugin class
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class VideoPlugin:
+    """Video for 算力板 Bumi via MediaController.
+
+    Tools:
+      external-video (actuator) — push video + routing config
+      desensed-video (sensor)   — read back privacy-masked frames from agent
+    """
+
+    PREFIX = "video"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor, media_ctrl):
+        self._namespace = namespace
+        self._media_ctrl = media_ctrl
+        self._node = Node("bumi_video")
+        executor.add_node(self._node)
+
+        self._external_topic = f"/{namespace}/video/external"
+        self._desensed_topic = f"/{namespace}/video/desensed"
+
+        # external-video subprocess state
+        self._proc_external: subprocess.Popen | None = None
+        # desensed-video subprocess state
+        self._proc_desensed: subprocess.Popen | None = None
+        # push_from_topic state (in-process)
+        self._pushing = False
+        self._sub = None
+
+    # ── Tool definitions ──────────────────────────────────────────────────
+
+    def get_tools(self) -> list:
+        return [
+            self._external_video_tool(),
+            {
+                "name": "desensed-video",
+                "type": "sensor",
+                "multiInstance": False,
+                "description": (
+                    f"Bumi desensed (privacy-masked) video from robot agent — "
+                    f"only works while external video is being pushed. Publishes JPEG to {self._desensed_topic}"
+                ),
+                "inputSchema": {"type": "object", "properties": {}},
+                "topic_out": [{"topic": self._desensed_topic, "format": "image/jpeg"}],
+            },
+        ]
+
+    def _external_video_tool(self) -> dict:
+        return {
+            "name": "external-video",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": (
+                "Push external video to Bumi AI agent for recognition. "
+                "Opens USB camera or subscribes to ROS2 topic, converts to YUYV, "
+                f"calls publish_external_video_stream(). Also publishes JPEG to {self._external_topic}"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["push_from_camera", "push_from_topic", "stop_push",
+                                    "agent_enable", "agent_disable",
+                                    "agent_external_enable", "agent_external_disable",
+                                    "get_status"],
+                    },
+                    "camera_id": {
+                        "type": "integer",
+                        "description": "USB camera device ID (default 0, e.g. /dev/video0)",
+                        "minimum": 0,
+                    },
+                    "input_topic": {
+                        "type": "string",
+                        "description": "ROS2 CompressedImage JPEG topic to forward to agent (for push_from_topic)",
+                    },
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "push_from_camera": {
+                        "params": ["camera_id"],
+                        "description": "Open USB camera, push YUYV frames to agent + publish JPEG to ROS2.",
+                    },
+                    "push_from_topic": {
+                        "params": ["input_topic"],
+                        "description": "Subscribe to ROS2 JPEG topic, convert to YUYV, push to agent.",
+                    },
+                    "stop_push": {
+                        "params": [],
+                        "description": "Stop all external video push.",
+                    },
+                    "agent_enable": {
+                        "params": [],
+                        "description": "Enable internal video → robot AI agent.",
+                    },
+                    "agent_disable": {
+                        "params": [],
+                        "description": "Disable internal video → robot AI agent.",
+                    },
+                    "agent_external_enable": {
+                        "params": [],
+                        "description": "Enable external video → robot AI agent.",
+                    },
+                    "agent_external_disable": {
+                        "params": [],
+                        "description": "Disable external video → robot AI agent.",
+                    },
+                    "get_status": {
+                        "params": [],
+                        "description": "Get current video routing configuration status.",
+                    },
+                },
+            },
+            "topic_in": [{"format": "image/jpeg"}],
+            "topic_out": [{"topic": self._external_topic, "format": "image/jpeg"}],
+        }
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        self._stop_external()
+        self._stop_desensed()
+        self._pushing = False
+
+    # ── Dispatch ──────────────────────────────────────────────────────────
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        tool_name = args.pop('_tool_name', '')
+
+        # ── external-video actions ──
+        if tool_name == "external-video":
+            if action == "push_from_camera":
+                return self._do_push_from_camera(args)
+            if action == "push_from_topic":
+                return self._do_push_from_topic(args)
+            if action == "stop_push":
+                return self._do_stop_external_push()
+            if action == "agent_enable":
+                self._media_ctrl.set_internal_capture_video_data_to_agent_enable(True)
+                return {"state": "enabled", "internal_video_to_agent": True}
+            if action == "agent_disable":
+                self._media_ctrl.set_internal_capture_video_data_to_agent_enable(False)
+                return {"state": "disabled", "internal_video_to_agent": False}
+            if action == "agent_external_enable":
+                self._media_ctrl.set_external_custom_video_data_to_agent_enable(True)
+                return {"state": "enabled", "external_video_to_agent": True}
+            if action == "agent_external_disable":
+                self._media_ctrl.set_external_custom_video_data_to_agent_enable(False)
+                return {"state": "disabled", "external_video_to_agent": False}
+            if action == "get_status":
+                return {
+                    "internal_video_to_agent": self._media_ctrl.get_internal_capture_video_data_to_agent_enable(),
+                    "external_video_to_agent": self._media_ctrl.get_external_custom_video_data_to_agent_enable(),
+                }
+            if action == "start":
+                return {"state": "ready"}
+            if action == "stop":
+                self._stop_external()
+                return {"state": "idle"}
+            if action == "info":
+                running = self._proc_external is not None and self._proc_external.poll() is None
+                return {
+                    "state": "running" if running else "idle",
+                    "topic_out": [{"topic": self._external_topic, "format": "image/jpeg"}] if running else [],
+                }
+
+        # ── desensed-video actions ──
+        if tool_name == "desensed-video":
+            if action == "start":
+                return self._start_desensed()
+            if action == "stop":
+                return self._stop_desensed()
+            if action == "info":
+                running = self._proc_desensed is not None and self._proc_desensed.poll() is None
+                return {
+                    "state": "running" if running else "idle",
+                    "topic_out": [{"topic": self._desensed_topic, "format": "image/jpeg"}] if running else [],
+                }
+
+        return None
+
+    # ── external-video: push_from_camera (subprocess) ─────────────────────
+
+    def _do_push_from_camera(self, args: dict) -> dict:
+        camera_id = int(args.get("camera_id", 4))  # Default /dev/video4 (Realsense on Jetson)
+
+        # Stop any existing push
+        self._do_stop_external_push()
+
+        import sys
+        self._proc_external = subprocess.Popen(
+            [sys.executable, "-c",
+             f"import sys; sys.path.insert(0, '/work'); from device import _external_video_subprocess; _external_video_subprocess({self._namespace!r}, {camera_id})"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        def _fwd():
+            for line in self._proc_external.stdout:
+                print(line.decode(errors='replace').rstrip(), flush=True)
+        threading.Thread(target=_fwd, daemon=True).start()
+
+        return {
+            "state": "pushing",
+            "camera_id": camera_id,
+            "topic_out": [{"topic": self._external_topic, "format": "image/jpeg"}],
+        }
+
+    def _stop_external(self) -> None:
+        if self._proc_external:
+            self._proc_external.terminate()
+            self._proc_external = None
+
+    # ── external-video: push_from_topic (in-process, like SpeakerPlugin) ──
+
+    def _do_push_from_topic(self, args: dict) -> dict:
+        import cv2
+        import numpy as np
+        import time as _t
+
+        input_topic = args.get("input_topic", "")
+        if not input_topic:
+            return {"error": "input_topic is required"}
+
+        # Stop camera subprocess if running (only one push active at a time)
+        self._stop_external()
+
+        self._media_ctrl.set_external_custom_video_data_to_agent_enable(True)
+        self._pushing = True
+
+        from mediacontrol_py import VideoStream
+
+        def _on_frame(msg):
+            if not self._pushing:
+                return
+            try:
+                raw = np.frombuffer(msg.data, dtype=np.uint8)
+                bgr = cv2.imdecode(raw, cv2.IMREAD_COLOR)
+                if bgr is None:
+                    return
+                h, w = bgr.shape[:2]
+
+                yuyv_bytes = _frame_to_yuyv(bgr)
+                vs = VideoStream()
+                vs.width = w
+                vs.height = h
+                vs.format = 0
+                vs.fps = 30
+                vs.timestamp_us = int(_t.time() * 1e6)
+                vs.video_data = list(yuyv_bytes)
+                self._media_ctrl.publish_external_video_stream(vs)
+            except Exception as e:
+                self._node.get_logger().warn(f"Video push_from_topic error: {e}")
+
+        if self._sub is not None:
+            self._node.destroy_subscription(self._sub)
+        from sensor_msgs.msg import CompressedImage
+        self._sub = self._node.create_subscription(CompressedImage, input_topic, _on_frame, _LOW_LAT_QOS)
+
+        return {"state": "pushing", "input_topic": input_topic}
+
+    def _do_stop_external_push(self) -> dict:
+        self._stop_external()
+        self._pushing = False
+        if self._sub is not None:
+            self._node.destroy_subscription(self._sub)
+            self._sub = None
+        return {"state": "stopped"}
+
+    # ── desensed-video (subprocess) ───────────────────────────────────────
+
+    def _start_desensed(self) -> dict:
+        if self._proc_desensed and self._proc_desensed.poll() is None:
+            return {"state": "already_running", "topic_out": [{"topic": self._desensed_topic, "format": "image/jpeg"}]}
+        import sys
+        self._proc_desensed = subprocess.Popen(
+            [sys.executable, "-c",
+             f"import sys; sys.path.insert(0, '/work'); from device import _desensed_video_subprocess; _desensed_video_subprocess({self._namespace!r})"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        def _fwd():
+            for line in self._proc_desensed.stdout:
+                print(line.decode(errors='replace').rstrip(), flush=True)
+        threading.Thread(target=_fwd, daemon=True).start()
+        return {"state": "running", "topic_out": [{"topic": self._desensed_topic, "format": "image/jpeg"}]}
+
+    def _stop_desensed(self) -> dict:
+        if self._proc_desensed:
+            self._proc_desensed.terminate()
+            self._proc_desensed = None
+        return {"state": "stopped"}

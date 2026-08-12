@@ -12,3 +12,5 @@ plugins:
     enabled: true
   camera:
     enabled: true
+  video:
+    enabled: true

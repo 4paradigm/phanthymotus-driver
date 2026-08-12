@@ -75,6 +75,11 @@ class BumiDeviceBundle:
             self._plugins.append(CameraPlugin(plugins_cfg["camera"], namespace, executor))
             print("[bundle] CameraPlugin loaded")
 
+        if plugins_cfg.get("video", {}).get("enabled", False) and media_ctrl is not None:
+            from device import VideoPlugin
+            self._plugins.append(VideoPlugin(plugins_cfg["video"], namespace, executor, media_ctrl))
+            print("[bundle] VideoPlugin loaded")
+
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
             try:
