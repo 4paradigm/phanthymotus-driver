@@ -318,6 +318,7 @@ class _PerceptionNode(Node):
         super().__init__("m300_perception")
         self._namespace = namespace
         self._bridge = bridge
+        self._lock = threading.RLock()
         self._pubs: dict[str, object] = {}
         self._active_sources: set[str] = set()
         self._last_mtime: dict[str, int] = {}
@@ -328,48 +329,58 @@ class _PerceptionNode(Node):
         return f"/{self._namespace}/perception/{source}"
 
     def start(self, source: str):
-        if source not in self.SOURCE_TO_DIRECTION:
-            return {"ok": False, "error": f"unsupported perception source: {source}"}
-        if source not in self._pubs:
-            self._pubs[source] = self.create_publisher(
-                CompressedImage, self.topic(source), _LOW_LAT_QOS)
-        if source in self._active_sources:
-            return {"ok": True, "source": source}
+        with self._lock:
+            if source not in self.SOURCE_TO_DIRECTION:
+                return {"ok": False, "error": f"unsupported perception source: {source}"}
+            if source not in self._pubs:
+                self._pubs[source] = self.create_publisher(
+                    CompressedImage, self.topic(source), _LOW_LAT_QOS)
+            if source in self._active_sources:
+                return {"ok": True, "source": source}
 
-        active_directions = {
-            self.SOURCE_TO_DIRECTION[s] for s in self._active_sources
-        }
-        direction = self.SOURCE_TO_DIRECTION[source]
-        if direction not in active_directions and len(active_directions) >= 2:
-            return {
-                "ok": False,
-                "error": "M300 PSDK supports at most two simultaneous perception directions",
+            active_directions = {
+                self.SOURCE_TO_DIRECTION[s] for s in self._active_sources
             }
-        response = self._bridge.start_perception(source=source)
-        if not response.get("ok"):
+            direction = self.SOURCE_TO_DIRECTION[source]
+            if direction not in active_directions and len(active_directions) >= 2:
+                return {
+                    "ok": False,
+                    "error": "M300 PSDK supports at most two simultaneous perception directions",
+                }
+            response = self._bridge.start_perception(source=source)
+            if not response.get("ok"):
+                return response
+            self._active_sources.add(source)
+            self.state = "running"
+            self.get_logger().info(
+                f"Perception started — {source} ({self.topic(source)})")
             return response
-        self._active_sources.add(source)
-        self.state = "running"
-        self.get_logger().info(
-            f"Perception started — {source} ({self.topic(source)})")
-        return response
 
     def stop(self, source: str = ""):
-        if source:
-            if source in self._active_sources:
-                self._bridge.stop_perception(source=source)
-                self._active_sources.discard(source)
-        else:
-            for active_source in list(self._active_sources):
-                self._bridge.stop_perception(source=active_source)
-            self._active_sources.clear()
-        if not self._active_sources:
-            self.state = "idle"
+        with self._lock:
+            if source:
+                if source in self._active_sources:
+                    self._bridge.stop_perception(source=source)
+                    self._active_sources.discard(source)
+            else:
+                for active_source in list(self._active_sources):
+                    self._bridge.stop_perception(source=active_source)
+                self._active_sources.clear()
+            if not self._active_sources:
+                self.state = "idle"
+
+    def is_active(self, source: str) -> bool:
+        with self._lock:
+            return source in self._active_sources
+
+    def active_sources(self) -> set[str]:
+        with self._lock:
+            return set(self._active_sources)
 
     def _publish_frames(self):
         import os
 
-        for source in list(self._active_sources):
+        for source in self.active_sources():
             path = f"/dev/shm/dji_perception_{source}.jpg"
             try:
                 # Use nanosecond mtime so two adjacent eye frames cannot be
@@ -426,7 +437,9 @@ class PerceptionPlugin:
     def __init__(self, plugin_config: dict, namespace: str, executor, bridge):
         self._namespace = namespace
         self._node = _PerceptionNode(namespace, bridge)
+        self._lock = threading.RLock()
         self._instance_configs: dict[str, dict] = {}
+        self._active_instances: dict[str, str] = {}
         executor.add_node(self._node)
 
     def _source_from_args(self, args: dict) -> str:
@@ -482,15 +495,55 @@ class PerceptionPlugin:
         pass  # Perception starts per-instance
 
     def stop(self):
-        self._node.stop()
+        with self._lock:
+            self._active_instances.clear()
+            self._node.stop()
+
+    @staticmethod
+    def _instance_key(instance_id: str) -> str:
+        # Canvas cards always provide an id.  Keep a single compatibility
+        # slot for direct, unscoped MCP callers instead of letting every
+        # unscoped call become a hidden independent instance.
+        return instance_id or "__default__"
+
+    def _release_instance(self, instance_key: str):
+        source = self._active_instances.pop(instance_key, None)
+        if source and source not in self._active_instances.values():
+            self._node.stop(source)
+
+    def _start_instance(self, instance_key: str, source: str) -> dict:
+        old_source = self._active_instances.get(instance_key)
+        if old_source and old_source != source:
+            self._release_instance(instance_key)
+
+        result = self._node.start(source)
+        if result.get("ok"):
+            self._active_instances[instance_key] = source
+        return result
+
+    def _instance_state(self, instance_key: str, source: str) -> str:
+        return (
+            "running"
+            if self._active_instances.get(instance_key) == source
+            and self._node.is_active(source)
+            else "idle"
+        )
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         instance_id = args.get("instance_id", "")
+        instance_key = self._instance_key(instance_id)
         if action == "config":
             source = self._source_from_args(args)
             if source not in self.SOURCES:
                 return {"ok": False, "error": f"unsupported perception source: {source}"}
-            self._instance_configs[instance_id] = {"source": source}
+            with self._lock:
+                previous = self._instance_configs.get(instance_id, {}).get("source")
+                self._instance_configs[instance_id] = {"source": source}
+                # A live card may be reconfigured from one physical camera to
+                # another. Release the old source before applying the new one
+                # so it does not consume one of the two PSDK subscriptions.
+                if previous and previous != source and instance_key in self._active_instances:
+                    self._release_instance(instance_key)
             return {
                 "ok": True,
                 "source": source,
@@ -505,29 +558,45 @@ class PerceptionPlugin:
             return {"state": "error", "message": f"unsupported perception source: {source}"}
         topic = self._node.topic(source)
         if action == "start":
-            result = self._node.start(source)
-            return {
-                "state": self._node.state,
-                "source": source,
-                "direction": source,
-                "topic_out": [{"topic": topic, "format": "image/jpeg"}],
-                **result,
-            }
-        if action == "stop":
-            self._node.stop(source)
-            return {"state": self._node.state, "source": source}
-        if action == "info":
-            if instance_id not in self._instance_configs:
-                return {
-                    "state": self._node.state,
-                    "topic_out": [],
+            with self._lock:
+                result = self._start_instance(instance_key, source)
+                response = {
+                    "source": source,
+                    "direction": source,
+                    "topic_out": [{"topic": topic, "format": "image/jpeg"}],
+                    **result,
                 }
-            return {
-                "state": self._node.state,
-                "source": source,
-                "direction": source,
-                "topic_out": [{"topic": topic, "format": "image/jpeg"}],
-            }
+                # `state` is per card.  The node can remain running for a
+                # different card even when this card hit the PSDK two-stream
+                # limit; returning global node state made Agent Core treat a
+                # failed card as successfully started.
+                response["state"] = (
+                    "running" if result.get("ok") else "error"
+                )
+                if not result.get("ok"):
+                    # Agent Core renders this as the per-card startup error;
+                    # the bridge keeps the low-level detail in `error`.
+                    response["message"] = result.get(
+                        "error", "perception start failed"
+                    )
+                return response
+        if action == "stop":
+            with self._lock:
+                self._release_instance(instance_key)
+                return {"state": "idle", "source": source}
+        if action == "info":
+            with self._lock:
+                if instance_id not in self._instance_configs:
+                    return {
+                        "state": self._instance_state(instance_key, source),
+                        "topic_out": [],
+                    }
+                return {
+                    "state": self._instance_state(instance_key, source),
+                    "source": source,
+                    "direction": source,
+                    "topic_out": [{"topic": topic, "format": "image/jpeg"}],
+                }
         return None
 
 
