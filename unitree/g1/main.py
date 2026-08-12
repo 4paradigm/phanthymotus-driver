@@ -116,6 +116,13 @@ class G1DeviceBundle:
             self._plugins.append(StatePlugin(plugins_cfg["state"], namespace, executor))
             print("[bundle] StatePlugin loaded")
 
+        if plugins_cfg.get("network_dds_health", {}).get("enabled", False):
+            from device import NetworkDdsHealthPlugin
+            health_cfg = dict(plugins_cfg["network_dds_health"])
+            health_cfg["mcp_port"] = cfg.get("mcp_port")
+            self._plugins.append(NetworkDdsHealthPlugin(health_cfg, namespace, executor))
+            print("[bundle] NetworkDdsHealthPlugin loaded")
+
         if plugins_cfg.get("camera", {}).get("enabled", False):
             from device import RealSensePlugin
             self._plugins.append(RealSensePlugin(plugins_cfg["camera"], namespace, executor))

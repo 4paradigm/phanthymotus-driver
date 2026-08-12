@@ -18,6 +18,9 @@ drivers/unitree/g1/device.py — Unitree G1 设备插件（重构版）。
   StatePlugin        (sensor)    — DDS LowState → IMU/battery ROS2 topic
 """
 
+from __future__ import annotations
+
+from collections import deque
 import json
 import queue
 import socket
@@ -2027,6 +2030,313 @@ class StatePlugin:
             if urdf_path.exists():
                 return {"urdf": urdf_path.read_text()}
             return {"error": "URDF model file not found"}
+        return None
+
+
+# ── NetworkDdsHealthPlugin (sensor) ──────────────────────────────────────────
+
+class _TopicHealth:
+    def __init__(self, name: str, topic: str, group: str, expected_hz: float, stale_after_s: float, required: bool):
+        self.name = name
+        self.topic = topic
+        self.group = group
+        self.required = bool(required)
+        self.expected_hz = float(expected_hz)
+        self.stale_after_s = float(stale_after_s)
+        self.sample_count = 0
+        self.estimated_missed = 0
+        self.first_time: float | None = None
+        self.last_time: float | None = None
+        self._last_interval_time: float | None = None
+        self._intervals = deque(maxlen=30)
+        self.last_latency_ms: float | None = None
+        self.max_latency_ms: float | None = None
+        self.last_payload: dict = {}
+
+    def record(self, msg, now: float, clock_ns: int | None) -> None:
+        if self.first_time is None:
+            self.first_time = now
+        if self._last_interval_time is not None:
+            interval = now - self._last_interval_time
+            if interval > 0:
+                self._intervals.append(interval)
+                self._record_gap(interval)
+        self._last_interval_time = now
+        self.last_time = now
+        self.sample_count += 1
+        self._record_latency(msg, clock_ns)
+
+    def _record_gap(self, interval: float) -> None:
+        if self.expected_hz <= 0:
+            return
+        period = 1.0 / self.expected_hz
+        if interval <= period * 1.5:
+            return
+        self.estimated_missed += max(0, int(interval / period) - 1)
+
+    def _record_latency(self, msg, clock_ns: int | None) -> None:
+        if clock_ns is None:
+            return
+        header = getattr(msg, "header", None)
+        stamp = getattr(header, "stamp", None)
+        if stamp is None:
+            return
+        try:
+            stamp_ns = int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+        except Exception:
+            return
+        if stamp_ns <= 0:
+            return
+        latency_ms = max(0.0, (clock_ns - stamp_ns) / 1_000_000.0)
+        self.last_latency_ms = latency_ms
+        if self.max_latency_ms is None or latency_ms > self.max_latency_ms:
+            self.max_latency_ms = latency_ms
+
+    def hz(self) -> float | None:
+        if not self._intervals:
+            return None
+        avg = sum(self._intervals) / len(self._intervals)
+        if avg <= 0:
+            return None
+        return 1.0 / avg
+
+    def payload(self, now: float) -> dict:
+        if self.last_time is None:
+            state = "no_data"
+            age_ms = None
+            fresh = False
+        else:
+            age = now - self.last_time
+            age_ms = round(age * 1000.0, 1)
+            fresh = age <= self.stale_after_s
+            state = "fresh" if fresh else "stale"
+
+        out = {
+            "name": self.name,
+            "status": state,
+            "fresh": fresh,
+            "required": self.required,
+            "age_ms": age_ms,
+            "samples": self.sample_count,
+            "missed": self.estimated_missed,
+        }
+        hz = self.hz()
+        if hz is not None:
+            out["hz"] = round(hz, 2)
+        if self.last_latency_ms is not None:
+            out["latency_ms"] = round(self.last_latency_ms, 1)
+        if self.max_latency_ms is not None:
+            out["max_latency_ms"] = round(self.max_latency_ms, 1)
+        return out
+
+
+class _NetworkDdsHealthNode(Node):
+    """Aggregates ROS2 topic freshness and transport health into one JSON status topic."""
+
+    _TOPIC_SPECS = (
+        ("loco_state", "loco/state", "dds", "json", 10.0, 1.0, True),
+        ("loco_motion_state", "loco/motion_state", "dds", "json", 10.0, 1.0, False),
+        ("imu", "state/imu", "dds", "json", 20.0, 0.5, True),
+        ("battery", "state/battery", "dds", "json", 1.0, 3.0, True),
+        ("joints", "state/joints", "dds", "json", 10.0, 1.0, True),
+        ("mainboard", "state/mainboard", "dds", "json", 0.5, 5.0, True),
+        ("lidar_cloud", "lidar/cloud", "lidar", "bytes", 10.0, 1.0, True),
+    )
+
+    def __init__(self, health_topic: str, namespace: str, mcp_port: int | None, publish_hz: float = 2.0):
+        super().__init__("g1_network_dds_health")
+        from std_msgs.msg import UInt8MultiArray
+
+        self._health_topic = health_topic
+        self._namespace = namespace
+        self._mcp_port = mcp_port
+        self._pub = self.create_publisher(String, health_topic, _LOW_LAT_QOS)
+        self._lock = threading.Lock()
+        self._stats: dict[str, _TopicHealth] = {}
+        self._subscriptions = []
+
+        msg_types = {
+            "json": String,
+            "bytes": UInt8MultiArray,
+        }
+        for name, path, group, msg_kind, expected_hz, stale_after_s, required in self._TOPIC_SPECS:
+            topic = f"/{namespace}/{path}"
+            self._stats[name] = _TopicHealth(name, topic, group, expected_hz, stale_after_s, required)
+            sub = self.create_subscription(
+                msg_types[msg_kind],
+                topic,
+                lambda msg, topic_name=name: self._on_topic(topic_name, msg),
+                _LOW_LAT_QOS,
+            )
+            self._subscriptions.append(sub)
+
+        period = 1.0 / max(0.1, float(publish_hz))
+        self._timer = self.create_timer(period, self._publish)
+        self.get_logger().info(f"NetworkDdsHealthNode ready — topic: {health_topic}")
+
+    def _clock_ns(self) -> int | None:
+        try:
+            return int(self.get_clock().now().nanoseconds)
+        except Exception:
+            return None
+
+    def _on_topic(self, name: str, msg) -> None:
+        now = time.monotonic()
+        with self._lock:
+            stat = self._stats.get(name)
+            if stat is None:
+                return
+            stat.record(msg, now, self._clock_ns())
+
+    def current_state(self) -> dict:
+        return self._build_state(time.monotonic())
+
+    def _build_state(self, now: float) -> dict:
+        with self._lock:
+            stats = {name: stat for name, stat in self._stats.items()}
+            topics = {name: stat.payload(now) for name, stat in stats.items()}
+
+        counts = {
+            "fresh": sum(1 for item in topics.values() if item["status"] == "fresh"),
+            "stale": sum(1 for item in topics.values() if item["status"] == "stale"),
+            "no_data": sum(1 for item in topics.values() if item["status"] == "no_data"),
+        }
+        required_topics = {name: item for name, item in topics.items() if item["required"]}
+        required_problem_topics = [
+            name for name, item in required_topics.items()
+            if item["status"] != "fresh"
+        ]
+
+        if counts["fresh"] == 0:
+            state = "no_data"
+        elif required_problem_topics:
+            state = "degraded"
+        else:
+            state = "healthy"
+
+        def group_state(group_name: str) -> str:
+            group_items = [
+                topics[name] for name, stat in stats.items()
+                if stat.group == group_name and topics[name]["required"]
+            ]
+            if not group_items:
+                return "healthy"
+            fresh = sum(1 for item in group_items if item["status"] == "fresh")
+            bad = sum(1 for item in group_items if item["status"] != "fresh")
+            if fresh == 0:
+                return "no_data"
+            if bad:
+                return "degraded"
+            return "healthy"
+
+        dds_state = group_state("dds")
+        lidar_state = group_state("lidar")
+
+        latency_values = [
+            item["latency_ms"]
+            for item in topics.values()
+            if "latency_ms" in item
+        ]
+        issues = [
+            {"name": name, "status": topics[name]["status"]}
+            for name in required_problem_topics
+        ]
+        dds = [topics[name] for name, stat in stats.items() if stat.group == "dds" and topics[name]["required"]]
+        lidar = [topics[name] for name, stat in stats.items() if stat.group == "lidar" and topics[name]["required"]]
+        optional = [topics[name] for name, stat in stats.items() if not topics[name]["required"]]
+        return {
+            "state": state,
+            "checks": {
+                "dds": dds_state == "healthy",
+                "lidar": lidar_state == "healthy",
+                "mcp": True,
+            },
+            "metrics": {
+                "fresh_topics": counts["fresh"],
+                "stale_topics": counts["stale"],
+                "no_data_topics": counts["no_data"],
+                "missed_samples": sum(item["missed"] for item in topics.values()),
+                "max_latency_ms": round(max(latency_values), 1) if latency_values else None,
+            },
+            "issues": issues,
+            "dds": dds,
+            "lidar": lidar,
+            "optional": optional,
+        }
+
+    def _publish(self) -> None:
+        out = String()
+        out.data = json.dumps(self.current_state(), separators=(",", ":"))
+        self._pub.publish(out)
+
+
+class NetworkDdsHealthPlugin:
+    PREFIX = "network_dds_health"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor):
+        self._topic = f"/{namespace}/state/network_dds_health"
+        publish_hz = float(plugin_config.get("publish_hz", 2.0))
+        mcp_port = plugin_config.get("mcp_port")
+        self._node = _NetworkDdsHealthNode(self._topic, namespace, mcp_port, publish_hz=publish_hz)
+        executor.add_node(self._node)
+
+    def get_tools(self) -> list:
+        return [{
+            "name": "network_dds_health",
+            "type": "sensor",
+            "multiInstance": False,
+            "description": (
+                "G1 Network & DDS Health — aggregates DDS topic freshness, estimated missed samples, "
+                "message latency where headers are available, and LiDAR/MCP communication state. "
+                f"Publishes status JSON to {self._topic}"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["current_frame"],
+                        "description": "Return the latest in-memory network health frame",
+                    },
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "current_frame": {
+                        "description": "查看当前帧数据",
+                    },
+                },
+            },
+            "configSchema": {
+                "type": "object",
+                "properties": {
+                    "publish_hz": {
+                        "type": "number",
+                        "title": "Status publish rate in Hz",
+                        "description": "Frequency for publishing network health status JSON",
+                        "default": 2.0,
+                        "minimum": 0.2,
+                        "maximum": 10.0,
+                    },
+                },
+            },
+            "topic_out": [{"topic": self._topic, "format": "data/json"}],
+        }]
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "current_frame":
+            return self._node.current_state()
+        if action in ("info", "network_dds_health"):
+            return {"state": "running"}
         return None
 
 
