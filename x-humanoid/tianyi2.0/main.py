@@ -406,6 +406,7 @@ class TianyiDeviceBundle:
     _ALWAYS_START = {'StatePlugin', 'AsrPlugin', 'RemoteStatePlugin', 'TtsPlugin', 'ExtMicPlugin'}
 
     def start_all(self) -> None:
+        self._started_plugins: set = set()
         started = 0
         lazy = 0
         for i, p in enumerate(self._plugins):
@@ -413,6 +414,7 @@ class TianyiDeviceBundle:
             if name in self._ALWAYS_START:
                 try:
                     p.start()
+                    self._started_plugins.add(p)
                     started += 1
                 except Exception as e:
                     print(f"[bundle] {name} start() FAILED: {e}", flush=True)
@@ -448,6 +450,14 @@ class TianyiDeviceBundle:
                         return p.dispatch(tool_name, args)
                     default_action = tool_def.get("default_action", "start")
                     action = args.pop("action", default_action)
+                    # 懒启动：首次 start 时真正初始化插件
+                    if action == "start" and p not in self._started_plugins:
+                        try:
+                            p.start()
+                            self._started_plugins.add(p)
+                            print(f"[bundle] {type(p).__name__} lazy-started via MCP")
+                        except Exception as e:
+                            return {"error": f"start failed: {e}"}
                     args['_tool_name'] = tool_name
                     result = p.dispatch(action, args)
                     return result
