@@ -155,10 +155,12 @@ fetch_and_checkout() {
   git fetch "$REMOTE" "$main_branch" --quiet || die "Failed to fetch origin/$main_branch."
 
   # Fetch PR head into a temporary local ref (avoid FETCH_HEAD ambiguity)
+  # Use + prefix to force-update in case PR was force-pushed (non-fast-forward)
   echo ""
   info "Fetching PR #$PR_NUMBER head..."
   local tmp_pr_ref="refs/tmp/pr-${PR_NUMBER}-head"
-  git fetch "$REMOTE" "$head_ref:$tmp_pr_ref" || \
+  git update-ref -d "$tmp_pr_ref" 2>/dev/null  # clean up stale ref from prior runs
+  git fetch "$REMOTE" "+$head_ref:$tmp_pr_ref" || \
     die "Failed to fetch PR #$PR_NUMBER. Check that the PR exists and you have access."
 
   # Create branch from origin/main, then merge PR into it

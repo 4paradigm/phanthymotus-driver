@@ -1,0 +1,20 @@
+tianyi2:
+  image: __IMAGE__
+  container_name: embodied-x-humanoid-tianyi2.0
+  network_mode: host
+  ipc: host
+  pid: host
+  privileged: true
+  volumes:
+    - /dev:/dev
+    - /opt/phanthy-motus/data:/opt/phanthy-motus/data
+    - /home/nvidia/data/param/dds_profile.xml:/work/dds_profile.xml:ro
+  environment:
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - PYTHONUNBUFFERED=1
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: unless-stopped

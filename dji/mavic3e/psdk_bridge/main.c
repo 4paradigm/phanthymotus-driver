@@ -38,6 +38,34 @@
 
 static volatile int s_running = 1;
 
+/* Extract a JSON string value without pulling a JSON library into the bridge.
+ * The IPC protocol only needs this for local, trusted file paths. */
+static int _json_get_string(const char *json, const char *key, char *out, size_t out_size) {
+    char needle[96];
+    const char *p;
+    size_t n = 0;
+
+    if (!json || !key || !out || out_size == 0)
+        return -1;
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    p = strstr(json, needle);
+    if (!p || !(p = strchr(p + strlen(needle), ':')))
+        return -1;
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != '\"') return -1;
+    p++;
+    while (*p && *p != '\"') {
+        /* Mission filenames are generated locally and must not contain escapes. */
+        if (*p == '\\' || n + 1 >= out_size)
+            return -1;
+        out[n++] = *p++;
+    }
+    if (*p != '\"' || n == 0) return -1;
+    out[n] = '\0';
+    return 0;
+}
+
 static void _signal_handler(int sig) {
     printf("[psdk_bridge] signal %d, shutting down\n", sig);
     s_running = 0;
@@ -743,10 +771,27 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
     }
 
     /* Waypoint */
+    if (strstr(raw_json, "\"waypoint_upload\"")) {
+        char kmz_path[512];
+        if (_json_get_string(raw_json, "kmz_path", kmz_path, sizeof(kmz_path)) != 0) {
+            snprintf(result, result_size,
+                "{\"ok\":false,\"error\":\"waypoint_upload requires a valid kmz_path\"}");
+            return 0;
+        }
+        int r = waypoint_upload(kmz_path);
+        if (r == 0) {
+            snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0,\"path\":\"%s\"}}", kmz_path);
+        } else {
+            snprintf(result, result_size,
+                "{\"ok\":false,\"error\":\"waypoint KMZ upload rejected; check bridge logs and KMZ format\"}");
+        }
+        return 0;
+    }
     if (strstr(raw_json, "\"waypoint_start\"")) {
-        int r = waypoint_start();
+        uint64_t waypoint_rc = UINT64_MAX;
+        int r = waypoint_start(&waypoint_rc);
         if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
-        else { char eb[256]; error_code_to_json((uint64_t)r, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
+        else { char eb[256]; error_code_to_json(waypoint_rc, eb, sizeof(eb)); snprintf(result, result_size, "{\"ok\":false,\"data\":%s}", eb); }
         return 0;
     }
     if (strstr(raw_json, "\"waypoint_pause\"")) {

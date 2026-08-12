@@ -4,6 +4,69 @@ Phanthy Motus driver bundle for the Tianyi 2.0 Pro humanoid robot. The driver
 bridges robot-side ROS2 topics on domain 0 to Agent Core topics on domain 42 and
 exposes the capabilities as MCP tools.
 
+## Raw arm joint card
+
+`arm` directly commands seven joints per selected arm in this canonical order:
+
+```text
+[shoulder_pitch, shoulder_roll, shoulder_yaw,
+ elbow_pitch, wrist_yaw, wrist_pitch, wrist_roll]
+```
+
+The card always exposes separate `left_positions` and `right_positions` arrays
+in degrees and publishes both arrays in one 14-joint command, so the arms can
+move to different poses simultaneously. There is no `side` selector. Raw arm
+input is never mirrored automatically. To create a mirrored right-arm pose manually, negate
+shoulder roll, shoulder yaw, wrist yaw, and wrist roll (indices 1, 2, 4, and 6)
+from the left pose. Right-arm motor IDs are 21-27 and left-arm IDs are 11-17.
+`move_pos` accepts speed [0.2, 1.5] rad/s. `move_ctrl` accepts seven-element
+`kp` [10, 200] and `kd` [5, 50] arrays shared by both arms. Raw-control defaults
+are `kp=50` and `kd=20` for every joint. The bounded tuning range includes the
+tested lower-gain and original-default combinations while excluding zero
+position stiffness and the previous unverified extreme upper bounds. These are
+still not vendor-certified gains.
+
+`move_pos` uses the rated-current limits from the Tianyi joint specification
+table instead of one fixed current for every arm motor. In joint order, each
+arm uses `[35, 23, 8, 8, 8, 5, 5]` A for shoulder pitch, shoulder roll,
+shoulder yaw, elbow pitch, wrist yaw, wrist pitch, and wrist roll. The same
+limits apply to left motor IDs 11-17 and right motor IDs 21-27. Raw and semantic
+head position commands use 5 A for motor IDs 1-3. `move_ctrl` has no current
+field and is unaffected by this mapping. Do not increase these values beyond
+the specification; clear the workspace and keep the emergency stop available
+when validating the higher-current shoulder joints.
+
+`move_ctrl` sends a position step with target speed and feed-forward torque set
+to zero. The vendor-side controller applies `kp` and `kd`; this driver does not
+calculate the PD output or impose a trajectory speed limit. Use small target
+changes, begin with low gains, keep the emergency stop available, and use
+`move_pos` when bounded motion speed is required.
+
+In practical terms, `move_ctrl` is intended for controller commissioning,
+pose holding and already-validated compliant interaction where the operator
+needs to tune joint stiffness and damping. Higher `kp` generally increases
+position response and holding stiffness but can increase impact and overshoot;
+lower `kp` is more compliant but can leave a larger load-dependent position
+error. Higher `kd` generally adds damping, while insufficient `kd` can allow
+overshoot or oscillation. The exact control law runs in the vendor controller,
+so these effects are guidance rather than a driver-side torque calculation.
+The same seven-element gain arrays are applied to corresponding joints on both
+arms. Do not use `move_ctrl` as a substitute for `move_pos` for routine poses,
+large position steps or semantic gestures.
+
+Both modes reject malformed arrays and poses outside the checked-in URDF
+limits. They check fresh `/arm/status`, selected motor faults, emergency stop,
+and power state before publishing, then wait for newer feedback. Do not command
+the raw `arm` and `arm_gesture` cards concurrently because both can publish to
+`/arm/cmd_pos`.
+
+For compatibility with dashboard array fields, `left_positions`,
+`right_positions`, `kp`, and `kd` accept either native JSON arrays or strings
+containing a JSON array. Both forms are decoded into seven numeric values before
+the same range and URDF checks run. Direct callers using the former `positions`
+field remain supported as a fallback, but its values are sent unchanged to both
+arms and are no longer mirrored.
+
 ## Head gesture card
 
 `head_gesture` turns safe, bounded head-position commands into cancellable

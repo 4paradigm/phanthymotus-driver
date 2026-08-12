@@ -1,0 +1,86 @@
+mcp_port: 15708
+ros_namespace: ""
+name: "EngineAI T800 Development Edition"
+
+ros:
+  robot_domain_id: 69
+  core_domain_id: 42
+  robot_interface: "eth0"
+  source_timeout_sec: 1.0
+
+control:
+  velocity_rate_hz: 100.0
+  low_level_rate_hz: 500.0
+  override_rate_hz: 100.0
+  max_vx: 3.0
+  max_vy: 1.0
+  max_vyaw: 3.141592653589793
+  mode_transition_timeout_sec: 5.0
+  motor_warning_temperature_c: 70.0
+  tilt_warning_rad: 0.45
+  fall_tilt_rad: 0.9
+  fall_angular_speed_rad_s: 3.0
+
+topics:
+  joint_state: "/hardware/joint_state"
+  imu: "/hardware/imu_info"
+  gamepad: "/hardware/gamepad_keys"
+  motor_debug: "/hardware/motor_debug"
+  motor_state: "/hardware/motor_state"
+  motor_command: "/hardware/motor_command"
+  joint_command_feedback: "/hardware/joint_command_feedback"
+  power: "/hardware/power_info"
+  motion_state: "/motion/motion_state"
+  body_velocity: "/motion/body_vel_cmd"
+  motion_request: "/motion/set_motion_state"
+  led: "/hardware/led_control"
+  joint_plan_request: "/motion/joint_motion_plan/request"
+  joint_plan_state: "/motion/joint_motion_plan/state"
+  joint_override: "/motion/joint_override_command"
+  joint_command: "/hardware/joint_command"
+  tts: "/hardware/tts"
+  native_node_control: "/motion/node_control"
+
+services:
+  enable_motor: "/hardware/enable_motor"
+
+plugins:
+  state:
+    enabled: true
+  locomotion:
+    enabled: true
+  motion_mode:
+    enabled: true
+  dance:
+    enabled: true
+  joint_plan:
+    enabled: true
+  gesture:
+    enabled: true
+  joint_override:
+    enabled: true
+  joint_bridge:
+    enabled: true
+  led:
+    enabled: true
+  tts:
+    enabled: true
+  motor_power:
+    enabled: true
+  native_node_control:
+    enabled: true
+  virtual_gamepad:
+    enabled: true
+    url: "udpm://239.255.76.67:7667?ttl=1"
+    channel: "virtual_gamepad/gamepad_keys"
+    rate_hz: 20.0
+  safety:
+    enabled: true
+  native_sdk:
+    enabled: true
+    mode: "external"       # external | process | systemd
+    source_revision: "83204a459e0e786f855235a8507197496a79acc7"
+    workdir: "/opt/engineai/native_sdk"
+    command: ["./run_robot.sh", "t800"]
+    service: "robotics.service"
+    stop_timeout: 10

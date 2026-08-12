@@ -305,6 +305,9 @@ class _SpeakerNode(Node):
     PREFILL = 3       # buffer 3 chunks (~300ms) before starting playback
     MERGE_BYTES = 9600  # merge into ~300ms blocks before calling PlayStream
 
+    # EOF magic: 8 bytes (4 samples [1,-1,1,-1])，标记 utterance 结束
+    AUDIO_EOF_MAGIC = b'\x01\x00\xff\xff\x01\x00\xff\xff'
+
     def __init__(self, audio_client: AudioClient):
         super().__init__("r1_speaker")
         self._client = audio_client
@@ -317,6 +320,14 @@ class _SpeakerNode(Node):
         self._drain_thread: threading.Thread | None = None
         self._last_chunk_time = 0.0
         self._flush_timer = None
+        # 打断/暂停控制
+        self._lock = threading.Lock()
+        self._interrupt_flag = threading.Event()
+        self._pause_event = threading.Event()
+        self._pause_event.set()  # 初始为非暂停状态
+        self._muted = False  # interrupt 后静默，丢弃后续 chunks 直到 EOF
+        # Clear stale PlayStream session from previous container run (MCU keeps state across reboot)
+        self._client.PlayStop(APP_NAME)
         self.get_logger().info("SpeakerNode ready")
 
     def start_play(self, topic: str) -> str:
@@ -325,10 +336,11 @@ class _SpeakerNode(Node):
                 return self._topic
             self.stop_play()
         self._topic = topic
+        self._muted = False  # 新 start 时清除静默
         self._sub = self.create_subscription(
             AudioChunk, topic, self._on_chunk, _LOW_LAT_QOS,
         )
-        self.state = "playing"
+        self.state = "ready"
         self.get_logger().info(f"[speaker] subscribed to {topic}")
         return topic
 
@@ -341,9 +353,12 @@ class _SpeakerNode(Node):
             self.destroy_subscription(self._sub)
             self._sub = None
         self._draining.clear()
+        self._pause_event.set()
+        self._interrupt_flag.set()
         if self._drain_thread is not None:
             self._drain_thread.join(timeout=2)
             self._drain_thread = None
+        self._interrupt_flag.clear()
         while not self._buf.empty():
             try:
                 self._buf.get_nowait()
@@ -355,14 +370,81 @@ class _SpeakerNode(Node):
             self.get_logger().warn(f"PlayStop error: {e}")
         self.state = "idle"
 
+    def interrupt(self) -> dict:
+        """立即中止播放：清空 buffer，停止 SDK，保持 subscription。"""
+        with self._lock:
+            self._interrupt_flag.set()
+            while not self._buf.empty():
+                try:
+                    self._buf.get_nowait()
+                except queue.Empty:
+                    break
+            try:
+                self._client.PlayStop(APP_NAME)
+            except Exception as e:
+                self.get_logger().warn(f"[speaker] interrupt PlayStop error: {e}")
+            if self._drain_thread is not None and self._drain_thread.is_alive():
+                self._drain_thread.join(timeout=1)
+                self._drain_thread = None
+            self._interrupt_flag.clear()
+            self._pause_event.set()
+            self._draining.clear()
+            self._muted = True  # 静默：丢弃后续 TTS chunks 直到 EOF
+            self.state = "ready"
+        self.get_logger().info("[speaker] interrupted — buffer cleared, muted until EOF")
+        return {"state": "ready", "action": "interrupted"}
+
+    def pause(self) -> dict:
+        """暂停播放：停止 SDK，保留 buffer。"""
+        with self._lock:
+            if self.state not in ("playing", "ready"):
+                return {"state": self.state, "error": "not playing"}
+            self._pause_event.clear()
+            try:
+                self._client.PlayStop(APP_NAME)
+            except Exception as e:
+                self.get_logger().warn(f"[speaker] pause PlayStop error: {e}")
+            self.state = "paused"
+        self.get_logger().info(f"[speaker] paused — buffer size={self._buf.qsize()}")
+        return {"state": "paused", "buffer_chunks": self._buf.qsize()}
+
+    def resume(self) -> dict:
+        """恢复播放：从 buffer 中剩余内容继续。"""
+        with self._lock:
+            if self.state != "paused":
+                return {"state": self.state, "error": "not paused"}
+            self.state = "playing"
+            self._pause_event.set()
+            if self._drain_thread is None or not self._drain_thread.is_alive():
+                if not self._buf.empty():
+                    self._start_drain()
+        self.get_logger().info("[speaker] resumed")
+        return {"state": "playing"}
+
     def _on_chunk(self, msg: AudioChunk) -> None:
         pcm = bytes(msg.data)
+        now = time.monotonic()
         self._idx += 1
+
+        # 检测 EOF magic：utterance 结束标记
+        if len(pcm) == 8 and pcm == self.AUDIO_EOF_MAGIC:
+            if self._muted:
+                self._muted = False
+                self.get_logger().info("[speaker] unmuted — received EOF marker")
+            return
+
+        # Muted 状态：interrupt 后丢弃来自旧 utterance 的 chunks
+        if self._muted:
+            self._last_chunk_time = now
+            return
+
         self._buf.put(pcm)
-        self._last_chunk_time = time.monotonic()
-        if not self._draining.is_set() and self._buf.qsize() >= self.PREFILL:
+        self._last_chunk_time = now
+        if self.state == "ready":
+            self.state = "playing"
+        if not self._draining.is_set() and self.state == "playing" and self._buf.qsize() >= self.PREFILL:
             self._start_drain()
-        elif not self._draining.is_set() and self._flush_timer is None:
+        elif not self._draining.is_set() and self.state == "playing" and self._flush_timer is None:
             self._flush_timer = self.create_timer(0.2, self._check_flush)
 
     def _start_drain(self) -> None:
@@ -379,7 +461,7 @@ class _SpeakerNode(Node):
             self._flush_timer.cancel()
             self.destroy_timer(self._flush_timer)
             self._flush_timer = None
-        if not self._draining.is_set() and not self._buf.empty():
+        if not self._draining.is_set() and not self._buf.empty() and self.state == "playing":
             idle = time.monotonic() - self._last_chunk_time
             if idle >= 0.15:
                 self._start_drain()
@@ -389,6 +471,11 @@ class _SpeakerNode(Node):
         merged = b''
         empty_count = 0
         while self._draining.is_set():
+            if self._interrupt_flag.is_set():
+                return
+            if not self._pause_event.wait(timeout=0.1):
+                continue
+
             try:
                 pcm = self._buf.get(timeout=0.1)
                 merged += pcm
@@ -406,12 +493,17 @@ class _SpeakerNode(Node):
                 play_idx += 1
                 self._play_merged(merged, play_idx)
                 merged = b''
-        if merged:
+        if merged and not self._interrupt_flag.is_set():
             play_idx += 1
             self._play_merged(merged, play_idx)
         self._draining.clear()
+        if self.state == "playing":
+            self.state = "ready"
+        self.get_logger().info("[speaker] drain finished")
 
     def _play_merged(self, pcm: bytes, idx: int) -> None:
+        if self._interrupt_flag.is_set():
+            return
         duration = len(pcm) / 32000
         t0 = time.monotonic()
         try:
@@ -422,7 +514,7 @@ class _SpeakerNode(Node):
             self.get_logger().error(f"[speaker] PlayStream error: {e}")
         elapsed = time.monotonic() - t0
         remaining = duration - elapsed - 0.08
-        if remaining > 0:
+        if remaining > 0 and not self._interrupt_flag.is_set():
             time.sleep(remaining)
 
 
@@ -458,7 +550,7 @@ class SpeakerPlugin:
         }
 
     def start(self) -> None:
-        pass  # startup sound is played on first dispatch(start) when project starts
+        pass
 
     def _play_startup_sound(self) -> None:
         """Play startup PCM by directly calling PlayStream in small blocks with pacing."""
@@ -466,7 +558,7 @@ class SpeakerPlugin:
         pcm_path = pathlib.Path(__file__).parent / 'resource' / 'startup_beep.pcm'
         try:
             pcm = pcm_path.read_bytes()
-            block_size = 9600  # ~300ms per block
+            block_size = 9600
             for offset in range(0, len(pcm), block_size):
                 block = pcm[offset:offset + block_size]
                 code, _ = self._node._client.PlayStream(APP_NAME, "0", block)
@@ -489,50 +581,57 @@ class SpeakerPlugin:
             topic = args.get("input_topic", "")
             if not topic:
                 return {"error": "Missing input_topic"}
-            # Always stop first to ensure clean restart and startup sound plays
             self._node.stop_play()
-            # Play startup sound in background
             threading.Thread(target=self._play_startup_sound, daemon=True).start()
             topic = self._node.start_play(topic)
-            return {"state": "playing", "topic": topic}
+            return {"state": "ready", "topic": topic}
         elif action == "stop":
             self._node.stop_play()
             return {"state": "idle"}
         elif action == "info":
-            return {"state": self._node.state, "topic": self._node._topic}
+            return {
+                "state": self._node.state,
+                "topic": self._node._topic,
+                "buffer_chunks": self._node._buf.qsize(),
+            }
         return None
 
 
-# ── LedPlugin (actuator) ─────────────────────────────────────────────────────
+# ── SmartMotionPlugin (actuator) ─────────────────────────────────────────
 
-class LedPlugin:
-    PREFIX = "led"
+class SmartMotionPlugin:
+    """统一打断/暂停控制卡片。协调 speaker + loco 的中止和暂停。"""
+    PREFIX = "smart_motion"
 
-    def __init__(self, plugin_config: dict, namespace: str, executor, audio_client: AudioClient):
-        self._client = audio_client
+    def __init__(self, plugin_config: dict, namespace: str, executor,
+                 speaker_plugin=None, loco_plugin=None):
+        self._speaker = speaker_plugin
+        self._loco = loco_plugin
 
     def get_tool(self) -> dict:
         return {
-            "name": "led",
+            "name": "smart_motion",
             "type": "actuator",
             "multiInstance": False,
-            "description": "R1 RGB LED strip control — set color or turn off",
+            "description": "SmartMotion — 统一运动/输出控制，提供打断、暂停、恢复能力",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["set", "off"],
+                        "enum": ["interrupt_all", "interrupt_speak", "interrupt_motion",
+                                 "pause_speak", "resume_speak", "status"],
                         "description": "Action to perform",
                     },
-                    "r": {"type": "integer", "description": "Red 0-255"},
-                    "g": {"type": "integer", "description": "Green 0-255"},
-                    "b": {"type": "integer", "description": "Blue 0-255"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "set": {"params": ["r", "g", "b"], "description": "Set LED strip to specified RGB color"},
-                    "off": {"params": [],              "description": "Turn off LED strip"},
+                    "interrupt_all":    {"params": [], "description": "中止所有输出（语音+动作同时停止）"},
+                    "interrupt_speak":  {"params": [], "description": "中止语音播放，清空待播队列"},
+                    "interrupt_motion": {"params": [], "description": "停止机器人当前运动"},
+                    "pause_speak":      {"params": [], "description": "暂停语音播放（保留未播内容，可恢复）"},
+                    "resume_speak":     {"params": [], "description": "恢复之前暂停的语音播放"},
+                    "status":           {"params": [], "description": "查询当前输出状态（语音/运动）"},
                 },
             },
         }
@@ -548,16 +647,161 @@ class LedPlugin:
             return {"state": "ready"}
         if action == "stop":
             return {"state": "idle"}
-        if action == "set":
-            r   = int(args.get("r", 0))
-            g   = int(args.get("g", 0))
-            b   = int(args.get("b", 0))
+        if action == "interrupt_all":
+            r1 = self._do_interrupt_speak()
+            r2 = self._do_interrupt_motion()
+            return {"speak": r1, "motion": r2}
+        elif action == "interrupt_speak":
+            return self._do_interrupt_speak()
+        elif action == "interrupt_motion":
+            return self._do_interrupt_motion()
+        elif action == "pause_speak":
+            if self._speaker:
+                return self._speaker._node.pause()
+            return {"error": "no speaker plugin"}
+        elif action == "resume_speak":
+            if self._speaker:
+                return self._speaker._node.resume()
+            return {"error": "no speaker plugin"}
+        elif action == "status":
+            return {
+                "speak": self._speaker.dispatch("info", {}) if self._speaker else None,
+                "motion": self._loco.dispatch("info", {}) if self._loco else None,
+            }
+        return None
+
+    def _do_interrupt_speak(self) -> dict | None:
+        if self._speaker:
+            return self._speaker._node.interrupt()
+        return {"error": "no speaker plugin"}
+
+    def _do_interrupt_motion(self) -> dict | None:
+        if self._loco:
+            return self._loco.dispatch("stop_move", {})
+        return {"error": "no loco plugin"}
+
+
+# ── LedPlugin (actuator) ─────────────────────────────────────────────────────
+
+class LedPlugin:
+    PREFIX = "led"
+
+    # State priority: higher number = higher priority
+    _PRIORITY = {'idle': 0, 'hearing': 1, 'thinking': 3, 'speaking': 4, 'error': 5}
+    # Auto-timeout per state (seconds). None = must be explicitly overridden.
+    _TIMEOUT = {'idle': None, 'hearing': 1.2, 'thinking': 60, 'speaking': 120, 'error': 5}
+    # State → solid color (R1 has no animation support, only solid colors)
+    _COLORS = {
+        'idle':     (0, 0, 0),
+        'hearing':  (0, 80, 255),
+        'thinking': (80, 40, 255),
+        'speaking': (0, 200, 220),
+        'error':    (255, 0, 0),
+    }
+
+    def __init__(self, plugin_config: dict, namespace: str, executor, audio_client: AudioClient):
+        self._client = audio_client
+        self._state = 'idle'
+        self._state_lock = threading.Lock()
+        self._timeout_timer = None
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "led",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "R1 LED strip — state-driven (hook-triggered) or manual RGB control",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["state", "set", "off"],
+                        "description": "Action to perform",
+                    },
+                    "state": {
+                        "type": "string",
+                        "enum": ["idle", "hearing", "thinking", "speaking", "error"],
+                        "description": "Target LED state (for action=state)",
+                    },
+                    "r": {"type": "integer", "description": "Red 0-255"},
+                    "g": {"type": "integer", "description": "Green 0-255"},
+                    "b": {"type": "integer", "description": "Blue 0-255"},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "state": {"params": ["state"], "description": "Transition LED to semantic state (priority-managed)"},
+                    "set":   {"params": ["r", "g", "b"], "description": "Manual RGB override (bypasses state machine)"},
+                    "off":   {"params": [], "description": "Turn off LED (resets state to idle)"},
+                },
+                "x-hooks": {
+                    "on_hearing":    {"action": "state", "params": {"state": "hearing"}},
+                    "on_thinking":   {"action": "state", "params": {"state": "thinking"}},
+                    "on_speaking":   {"action": "state", "params": {"state": "speaking"}},
+                    "on_idle":       {"action": "state", "params": {"state": "idle"}},
+                    "on_error":      {"action": "state", "params": {"state": "error"}},
+                },
+            },
+        }
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        self._cancel_timeout()
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": self._state}
+        if action == "stop":
+            self._transition('idle')
+            return {"state": "idle"}
+        if action == "state":
+            new_state = args.get("state", "idle")
+            if new_state not in self._PRIORITY:
+                return {"error": f"unknown state: {new_state}"}
+            self._transition(new_state)
+            return {"state": self._state}
+        elif action == "set":
+            self._transition('idle')
+            r = int(args.get("r", 0))
+            g = int(args.get("g", 0))
+            b = int(args.get("b", 0))
             ret = self._client.LedControl(r, g, b)
             return {"ret": ret, "r": r, "g": g, "b": b}
         elif action == "off":
-            ret = self._client.LedControl(0, 0, 0)
-            return {"ret": ret}
+            self._transition('idle')
+            return {"state": "idle"}
         return None
+
+    def _transition(self, new_state: str):
+        """Priority-based state transition."""
+        with self._state_lock:
+            if new_state not in ('idle', 'error'):
+                if self._PRIORITY.get(new_state, 0) <= self._PRIORITY.get(self._state, 0):
+                    return
+            self._state = new_state
+
+        self._cancel_timeout()
+        color = self._COLORS.get(new_state, (0, 0, 0))
+        self._client.LedControl(*color)
+
+        timeout = self._TIMEOUT.get(new_state)
+        if timeout:
+            expected_state = new_state
+            def _timeout_cb(expected=expected_state):
+                with self._state_lock:
+                    if self._state != expected:
+                        return
+                self._transition('idle')
+            self._timeout_timer = threading.Timer(timeout, _timeout_cb)
+            self._timeout_timer.daemon = True
+            self._timeout_timer.start()
+
+    def _cancel_timeout(self):
+        if self._timeout_timer:
+            self._timeout_timer.cancel()
+            self._timeout_timer = None
 
 
 # ── LocoStatePlugin (sensor) ─────────────────────────────────────────────────

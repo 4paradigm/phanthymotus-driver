@@ -2,6 +2,11 @@ mcp_port: 15707
 ros_namespace: ""   # 留空则自动使用 hostname
 name: "Tianyi 2.0 Pro"
 
+# Run the skeleton publisher in its own ROS process. The main bundle keeps
+# the other cards but does not publish a competing joints topic.
+joints_bridge:
+  enabled: true
+
 slamtec:
   base_url: "http://192.168.11.1:1448"
 
@@ -10,9 +15,29 @@ plugins:
     enabled: true
   camera:
     enabled: true
+  imu:
+    enabled: true
+  camera_depth:
+    enabled: true
+    # Raw 640x480 Z16 is 614 KiB/frame. Keep the dashboard stream below the
+    # browser/DDS forwarding budget and always display the newest frame.
+    hz: 8
+  camera_pointcloud:
+    enabled: true
+    # Head camera height above the floor. The point-cloud renderer uses Y=0
+    # as its grid plane, so raise the gravity-levelled cloud by this amount.
+    floor_offset_m: 1.50
   asr:
     enabled: true
   nav_state:
+    enabled: true
+  power_board:
+    enabled: true
+  motors:
+    enabled: true
+  hand_state:
+    enabled: true
+  remote_event:
     enabled: true
   head:
     enabled: true
@@ -28,7 +53,40 @@ plugins:
     enabled: true
   tts:
     enabled: true
+  voice_play:
+    enabled: true
   nav:
     enabled: true
   chat:
+    enabled: true
+  voice_chat:
+    enabled: true
+  controlled_spatial:
+    enabled: true
+    native_slam_pcd_dir: "/opt/phanthy-motus/data/maps"
+    native_slam_db_path: "/opt/phanthy-motus/data/controlled_spatial.db"
+  controlled_spatial_map:
+    enabled: true
+    native_slam_db_path: "/opt/phanthy-motus/data/controlled_spatial.db"
+    cache_dir: "/opt/phanthy-motus/data/map-visuals"
+    poll_hz: 3.0
+    artifact_hz: 0.4
+    head_pointcloud_enabled: true
+    head_pointcloud_topic: "/ob_camera_head/depth/points"
+    head_recording_enabled: false
+  robot_faults:
+    enabled: true
+  laser_scan:
+    enabled: true
+  chassis_raw:
+    enabled: true
+  ext_mic:
+    enabled: true
+    network_sources:
+      - ssh_host: "192.168.41.1"
+        ssh_user: "ubuntu"
+        ssh_password: "123"
+        port: 9800
+        sender_path: "/home/ubuntu/audio_sender.py"
+  light:
     enabled: true

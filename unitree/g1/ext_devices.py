@@ -245,17 +245,50 @@ class _ExtMicNode(Node):
         # alsa_id format: "hw:CARD=Pro,DEV=0"
         card_part = self._device_index.split("hw:CARD=", 1)[1].split(",DEV=")[0]
         card_idx = alsaaudio.cards().index(card_part)
-        self._alsa_pcm = alsaaudio.PCM(
-            type=alsaaudio.PCM_CAPTURE,
-            mode=alsaaudio.PCM_NORMAL,
-            rate=16000, channels=1,
-            format=alsaaudio.PCM_FORMAT_S16_LE,
-            periodsize=512,
-            cardindex=card_idx,
-        )
-        # Init dynamic rate probe fields (timer starts on first real read in loop)
-        self._alsa_native_rate = 16000
-        self._alsa_rate_locked = False
+
+        # Probe native format: try S24_3LE stereo first (DJI Wireless Mic etc.),
+        # fallback to S16_LE mono for standard USB mics.
+        self._alsa_native_fmt = None
+        for fmt, channels, fmt_name in [
+            (alsaaudio.PCM_FORMAT_S24_3LE, 2, "S24_3LE_stereo"),
+            (alsaaudio.PCM_FORMAT_S16_LE, 1, "S16_LE_mono"),
+        ]:
+            try:
+                test_pcm = alsaaudio.PCM(
+                    type=alsaaudio.PCM_CAPTURE, mode=alsaaudio.PCM_NORMAL,
+                    rate=48000, channels=channels, format=fmt,
+                    periodsize=1024, cardindex=card_idx,
+                )
+                # Quick read to verify it actually works
+                length, _ = test_pcm.read()
+                test_pcm.close()
+                if length > 0:
+                    self._alsa_native_fmt = fmt_name
+                    break
+            except Exception:
+                continue
+
+        if self._alsa_native_fmt == "S24_3LE_stereo":
+            self._alsa_pcm = alsaaudio.PCM(
+                type=alsaaudio.PCM_CAPTURE, mode=alsaaudio.PCM_NORMAL,
+                rate=48000, channels=2, format=alsaaudio.PCM_FORMAT_S24_3LE,
+                periodsize=1024, cardindex=card_idx,
+            )
+            self._alsa_native_rate = 48000
+            self._alsa_rate_locked = True
+            print(f"[ext_mic] opened {self._device_name} as S24_3LE stereo 48kHz", flush=True)
+        else:
+            # Standard USB mic: S16_LE mono, rate will be probed
+            self._alsa_pcm = alsaaudio.PCM(
+                type=alsaaudio.PCM_CAPTURE, mode=alsaaudio.PCM_NORMAL,
+                rate=16000, channels=1, format=alsaaudio.PCM_FORMAT_S16_LE,
+                periodsize=512, cardindex=card_idx,
+            )
+            self._alsa_native_fmt = "S16_LE_mono"
+            self._alsa_native_rate = 16000
+            self._alsa_rate_locked = False
+            print(f"[ext_mic] opened {self._device_name} as S16_LE mono 16kHz (will probe rate)", flush=True)
+
         self._alsa_probe_samples = 0
         self._alsa_probe_start = 0.0
         self._running = True
@@ -270,6 +303,20 @@ class _ExtMicNode(Node):
             length, data = self._alsa_pcm.read()
             if length <= 0:
                 continue
+
+            # Convert S24_3LE stereo to S16_LE mono if needed
+            if self._alsa_native_fmt == "S24_3LE_stereo":
+                raw = np.frombuffer(data, dtype=np.uint8)
+                n_frames = len(raw) // 6  # 6 bytes per stereo frame (3 bytes × 2 channels)
+                if n_frames == 0:
+                    continue
+                raw = raw[:n_frames * 6].reshape(n_frames, 2, 3)
+                # Take high 2 bytes of each 24-bit sample as int16 (effectively >>8)
+                left = raw[:, 0, 1:].copy().view(np.int16).flatten()
+                right = raw[:, 1, 1:].copy().view(np.int16).flatten()
+                mono = ((left.astype(np.int32) + right.astype(np.int32)) // 2).astype(np.int16)
+                data = mono.tobytes()
+                length = n_frames
 
             # Start probe timer on first actual data (not before thread start,
             # to avoid counting ALSA init latency as part of elapsed time)
@@ -574,6 +621,7 @@ class ExtMicPlugin:
         self._namespace = namespace
         self._executor = executor
         self._nodes: dict[str, _ExtMicNode] = {}
+        self._instance_configs: dict[str, dict] = {}  # instance_id → saved config params
         self._available_devices = _enumerate_ext_mics()
         log.info(f"[ext_mic] found {len(self._available_devices)} external mic device(s)")
         for d in self._available_devices:
@@ -592,7 +640,6 @@ class ExtMicPlugin:
                     "scope": "instance",
                     "oneOf": device_options if device_options else [{"const": "", "title": "无可用设备"}],
                 },
-                "device_name": {"type": "string", "description": "设备名称", "scope": "instance"},
             },
         }
         return [tool]
@@ -627,6 +674,10 @@ class ExtMicPlugin:
                 raise ValueError("instance_id is required for multiInstance tool")
             device_id = args.get("device_index")  # alsa_id string like "hw:0,0" or integer index
             device_name = args.get("device_name", "")
+            # Fallback to saved config from prior 'config' action
+            if not device_id and instance_id in self._instance_configs:
+                device_id = self._instance_configs[instance_id].get("device_index")
+                device_name = device_name or self._instance_configs[instance_id].get("device_name", "")
             if not device_id:
                 # Try to pick first available device
                 if self._available_devices:
@@ -634,6 +685,12 @@ class ExtMicPlugin:
                     device_name = self._available_devices[0]["name"]
                 else:
                     raise ValueError("No external mic device available")
+            # Auto-resolve device_name from available devices if not provided
+            if not device_name:
+                for d in self._available_devices:
+                    if d.get("alsa_id") == device_id or str(d.get("index")) == str(device_id):
+                        device_name = d["name"]
+                        break
             # Try to convert to int for sounddevice numeric index, keep string for alsa_id
             try:
                 device_id = int(device_id)
@@ -659,6 +716,14 @@ class ExtMicPlugin:
                     del self._nodes[key]
                 return {"state": "idle"}
             return {"state": "idle"}
+
+        elif action == "config":
+            # Save instance config params for later use during start
+            if instance_id:
+                self._instance_configs[instance_id] = {
+                    k: v for k, v in args.items() if k not in ('action', 'instance_id')
+                }
+            return {"configured": True, "instance_id": instance_id}
 
         return None
 
