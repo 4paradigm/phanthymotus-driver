@@ -67,11 +67,6 @@ static int _direction_has_active_source(int direction_index) {
     }
     return 0;
 }
-static int _active_direction_count(void) {
-    int count = 0;
-    for (int i = 0; i < 6; ++i) count += s_subscribed_direction[i] ? 1 : 0;
-    return count;
-}
 static int _encode_gray_jpeg(const char *path, uint8_t *gray, int width, int height) {
     char tmp[160];
     snprintf(tmp, sizeof(tmp), "%s.tmp", path);
@@ -108,10 +103,6 @@ int perception_start(const char *source, perception_image_cb_t cb) {
     int direction_index = s_source_direction_index[source_index];
     if (s_active_source[source_index]) return 0;
     if (!s_subscribed_direction[direction_index]) {
-        if (_active_direction_count() >= 2) {
-            printf("[perception] at most two directions may be active\n");
-            return -1;
-        }
         T_DjiReturnCode rc = DjiPerception_SubscribePerceptionImage(
             s_directions[direction_index], _image_cb);
         if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
