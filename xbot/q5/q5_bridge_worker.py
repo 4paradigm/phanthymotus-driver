@@ -104,6 +104,8 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, debug: bool):
     )
 
     # ── Publishers ─────────────────────────────────────────────────────────────
+    # 注意：这里不使用namespace，因为bridge worker应该发布原始topic
+    # 前缀由应用层添加
     pub_joint = node.create_publisher(JointState, "/joint_states", QOS_SENSOR)
     pub_batt = node.create_publisher(BatteryState, "/battery_state", QOS_SENSOR)
     pub_imu_accel = node.create_publisher(Imu, "/camera/camera/accel/sample", QOS_SENSOR)
@@ -112,6 +114,7 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, debug: bool):
     pub_hand = node.create_publisher(String, "/hand_sensor", QOS_SENSOR)
     pub_odom = node.create_publisher(Odometry, "/wr1_base_drive_controller/odom", QOS_SENSOR)
     pub_status = node.create_publisher(String, "/xbot_state", QOS_SENSOR)
+    pub_robot_status = node.create_publisher(String, "/xbot_state", QOS_SENSOR)  # 添加robot_status publisher
 
     node.get_logger().info("bridge publishers ready → 8 topics")
     executor.add_node(node)
@@ -162,6 +165,18 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, debug: bool):
         msg = String()
         msg.data = json.dumps(snap, ensure_ascii=False)
         pub.publish(msg)
+
+    def _publish_robot_status(snap):
+        """Publish robot status as String message."""
+        msg = String()
+        msg.data = json.dumps({
+            "state": snap.get("state", 0),
+            "message": snap.get("message", ""),
+            "timestamp_ms": snap.get("received_at_ms", int(time.time() * 1000)),
+            "fresh": snap.get("fresh", False),
+            "age_ms": snap.get("age_ms")
+        }, ensure_ascii=False)
+        pub_robot_status.publish(msg)
 
     def _publish_odom(snap):
         msg = Odometry()
@@ -224,10 +239,10 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, debug: bool):
         if odom:
             _publish_odom(odom)
 
-        # /xbot_state
-        status = snap.get("_sensor_robot_status")
-        if status:
-            _publish_json(pub_status, status)
+        # /xbot_state - robot status
+        robot_status = snap.get("_sensor_robot_status")
+        if robot_status:
+            _publish_robot_status(robot_status)
 
     # ── Main loop ──────────────────────────────────────────────────────────────
     running = True

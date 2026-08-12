@@ -224,6 +224,8 @@ class StatePlugin:
             "topic_out": [
                 {"topic": f"/{self._ns}/joint_states", "format": "data/json"},
                 {"topic": f"/{self._ns}/robot_status", "format": "data/json"},
+                {"topic": f"/{self._ns}/dynamic_joint_states", "format": "data/json"},
+                {"topic": f"/{self._ns}/servo_pose", "format": "data/json"},
             ],
         }
 
@@ -257,6 +259,7 @@ class StatePlugin:
         snap = self._client.snapshot() if self._client else {}
         if snap.get("fresh"):
             msg = JointState()
+            msg.header.stamp = self._node.get_clock().now().to_msg()
             msg.header.frame_id = snap.get("header_frame", "")
             msg.name = snap.get("joint_names", [])
             msg.position = list(snap.get("joints", {}).values())
@@ -264,6 +267,27 @@ class StatePlugin:
             msg.effort = list(snap.get("efforts", {}).values())
             self._pub_joint.publish(msg)
             self._last_joint = snap
+
+            # 同时发布JSON格式的数据供画布使用
+            json_data = {
+                "timestamp_ms": snap.get("timestamp_ms", int(time.time() * 1000)),
+                "received_at_ms": snap.get("received_at_ms"),
+                "fresh": snap.get("fresh", False),
+                "available": snap.get("available", False),
+                "age_ms": snap.get("age_ms"),
+                "stale": snap.get("stale", False),
+                "source_topic": "/joint_states",
+                "joint_count": snap.get("joint_count", len(snap.get("joint_names", []))),
+                "joint_names": snap.get("joint_names", []),
+                "positions": snap.get("joints", {}),
+                "velocities": snap.get("velocities", {}),
+                "efforts": snap.get("efforts", {}),
+                "position_unit": snap.get("position_unit", "rad"),
+            }
+            if not snap.get("fresh"):
+                json_data["message"] = "关节状态消息已过期" if snap.get("available", False) else "未收到 /joint_states 消息"
+
+            self._pub_dynjoint.publish(String(data=json.dumps(json_data, ensure_ascii=False)))
 
         # robot_status from sensor_snapshot
         rs = self._client.sensor_snapshot("robot_status") if self._client else {}
@@ -330,15 +354,39 @@ class ImuPlugin:
         snap = self._client.sensor_snapshot("imu") if self._client else {}
         if not snap.get("available"):
             return
+
+        # 构建标准化IMU数据格式
         data = {
-            "angular_vel": snap.get("angular_velocity", {}),
-            "linear_acc": snap.get("linear_acceleration", {}),
-            "orientation": {"w": 1.0, "x": 0.0, "y": 0.0, "z": 0.0},
-            "euler": {"roll": 0.0, "pitch": 0.0, "yaw": 0.0},
             "timestamp_ms": snap.get("timestamp_ms", int(time.time() * 1000)),
+            "received_at_ms": snap.get("received_at_ms"),
+            "message_timestamp_ms": snap.get("message_timestamp_ms"),
             "fresh": snap.get("fresh", False),
+            "available": snap.get("available", False),
             "age_ms": snap.get("age_ms"),
+            "stale": snap.get("stale", False),
+            "source_topic": "/camera/camera/accel/sample",
         }
+
+        # 添加IMU原始数据
+        angular_vel = snap.get("angular_velocity", {})
+        linear_acc = snap.get("linear_acceleration", {})
+
+        if angular_vel:
+            data["angular_velocity"] = angular_vel
+        if linear_acc:
+            data["linear_acceleration"] = linear_acc
+
+        # 添加可选的姿态信息（如果有）
+        if angular_vel or linear_acc:
+            data["orientation"] = {"w": 1.0, "x": 0.0, "y": 0.0, "z": 0.0}
+            data["euler"] = {"roll": 0.0, "pitch": 0.0, "yaw": 0.0}
+
+        # 添加状态消息
+        if not data["fresh"]:
+            data["message"] = "IMU消息已过期"
+        else:
+            data["message"] = "IMU状态正常"
+
         self._last_data = data
         self._pub.publish(String(data=json.dumps(data, ensure_ascii=False)))
 
@@ -405,10 +453,31 @@ class BatteryPlugin:
         snap = self._client.sensor_snapshot("battery") if self._client else {}
         if not snap.get("available"):
             return
+
+        # 计算电量等级
+        percentage = snap.get("percentage", 0)
+        if percentage >= 99.5:
+            level = "full"
+        elif percentage <= 15.0:
+            level = "critical"
+        elif percentage <= 30.0:
+            level = "low"
+        else:
+            level = "normal"
+
+        # 构建包含所有信息的数据
         data = {
+            "timestamp_ms": snap.get("timestamp_ms", int(time.time() * 1000)),
+            "received_at_ms": snap.get("received_at_ms"),
+            "fresh": snap.get("fresh", False),
+            "available": snap.get("available", False),
+            "age_ms": snap.get("age_ms"),
+            "stale": snap.get("stale", False),
+            "source_topic": "/battery_state",
+            "percentage": percentage,
+            "level": level,
             "voltage": snap.get("voltage"),
             "current": snap.get("current"),
-            "percentage": snap.get("percentage"),
             "temperature": snap.get("temperature"),
             "power_supply_status": snap.get("power_supply_status"),
             "power_supply_health": snap.get("power_supply_health"),
@@ -416,10 +485,18 @@ class BatteryPlugin:
             "capacity": snap.get("capacity"),
             "present": snap.get("present"),
             "location": snap.get("location"),
-            "timestamp_ms": snap.get("timestamp_ms", int(time.time() * 1000)),
-            "fresh": snap.get("fresh", False),
-            "age_ms": snap.get("age_ms"),
         }
+
+        # 添加状态消息
+        if not data["fresh"]:
+            data["message"] = "电池消息已过期"
+        elif level == "full":
+            data["message"] = "电量已满"
+        elif level == "unknown":
+            data["message"] = "电量百分比未上报"
+        else:
+            data["message"] = "电池状态正常"
+
         self._battery_info = data
         self._pub.publish(String(data=json.dumps(data, ensure_ascii=False)))
 
@@ -489,8 +566,29 @@ class FaultsPlugin:
         if not snap.get("available"):
             return
         faults = snap.get("faults", [])
-        data = {"fault_count": len(faults), "faults": faults,
-                "fresh": snap.get("fresh", False), "age_ms": snap.get("age_ms")}
+
+        # 构建标准化的故障数据格式
+        data = {
+            "timestamp_ms": snap.get("timestamp_ms", int(time.time() * 1000)),
+            "received_at_ms": snap.get("received_at_ms"),
+            "fresh": snap.get("fresh", False),
+            "available": snap.get("available", False),
+            "age_ms": snap.get("age_ms"),
+            "stale": snap.get("stale", False),
+            "source_topic": "/fault_array",
+            "fault_count": len(faults),
+            "faults": faults,
+            "highest_level": max((f.get("level", 0) for f in faults), default=0),
+        }
+
+        # 添加状态消息
+        if not data["fresh"]:
+            data["message"] = "故障消息已过期"
+        elif data["fault_count"] > 0:
+            data["message"] = f"检测到 {data['fault_count']} 个故障"
+        else:
+            data["message"] = "无故障"
+
         self._last_data = data
         self._pub.publish(String(data=json.dumps(data, ensure_ascii=False)))
 
@@ -553,7 +651,27 @@ class HandStatePlugin:
         if not snap.get("available"):
             return
         hand_data = snap.get("hand_data", {})
-        data = {**hand_data, "fresh": snap.get("fresh", False), "age_ms": snap.get("age_ms")}
+
+        # 构建标准化的手部传感器数据格式
+        data = {
+            "timestamp_ms": snap.get("timestamp_ms", int(time.time() * 1000)),
+            "received_at_ms": snap.get("received_at_ms"),
+            "fresh": snap.get("fresh", False),
+            "available": snap.get("available", False),
+            "age_ms": snap.get("age_ms"),
+            "stale": snap.get("stale", False),
+            "source_topic": "/hand_sensor",
+            **hand_data,
+        }
+
+        # 添加状态消息
+        if not data["fresh"]:
+            data["message"] = "手部传感器消息已过期"
+        else:
+            data["message"] = "手部传感器状态正常"
+
+        self._last_data = data
+        self._pub.publish(String(data=json.dumps(data, ensure_ascii=False)))
         self._last_data = data
         self._pub.publish(String(data=json.dumps(data, ensure_ascii=False)))
 
@@ -613,14 +731,28 @@ class OdomPlugin:
         snap = self._client.sensor_snapshot("odom") if self._client else {}
         if not snap.get("available"):
             return
+
+        # 构建标准化的里程计数据格式
         data = {
+            "timestamp_ms": snap.get("timestamp_ms", int(time.time() * 1000)),
+            "received_at_ms": snap.get("received_at_ms"),
+            "fresh": snap.get("fresh", False),
+            "available": snap.get("available", False),
+            "age_ms": snap.get("age_ms"),
+            "stale": snap.get("stale", False),
+            "source_topic": "/wr1_base_drive_controller/odom",
             "position": snap.get("position", {}),
             "orientation": snap.get("orientation", {}),
             "linear_velocity": snap.get("linear_velocity", {}),
             "angular_velocity": snap.get("angular_velocity", {}),
-            "fresh": snap.get("fresh", False),
-            "age_ms": snap.get("age_ms"),
         }
+
+        # 添加状态消息
+        if not data["fresh"]:
+            data["message"] = "里程计消息已过期"
+        else:
+            data["message"] = "里程计状态正常"
+
         self._pub.publish(String(data=json.dumps(data, ensure_ascii=False)))
 
 
@@ -668,12 +800,35 @@ class LocoPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "move":
-            lifecycle_state = self._client.get_lifecycle_state() if hasattr(self, '_client') else "unknown"
+            # 检查lifecycle状态，最多重试3次
+            max_retries = 3
+            retry_delay = 1.0
+            lifecycle_state = "unknown"
+
+            for attempt in range(max_retries):
+                lifecycle_state = self._client.get_lifecycle_state() if hasattr(self, '_client') else "unknown"
+                if lifecycle_state == "active":
+                    break
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+
             if lifecycle_state != "active":
-                return {"state": "error", "message": "motion_manager lifecycle must be active", "lifecycle_state": lifecycle_state}
+                return {
+                    "state": "error",
+                    "message": f"motion_manager lifecycle must be active (got: {lifecycle_state})",
+                    "lifecycle_state": lifecycle_state,
+                    "suggestion": "Ensure motion_manager is running and in active state"
+                }
+
             snap = self._client.snapshot() if hasattr(self, '_client') else {}
             if not snap.get("fresh", False):
-                return {"state": "error", "message": "Refusing motion without fresh /joint_states"}
+                return {
+                    "state": "error",
+                    "message": "Refusing motion without fresh /joint_states",
+                    "data_fresh": snap.get("fresh", False),
+                    "data_age_ms": snap.get("age_ms")
+                }
+
             vx = _clamp(args.get("vx", 0.0), -0.5, 0.5)
             vyaw = _clamp(args.get("vyaw", 0.0), -1.0, 1.0)
             duration = args.get("duration", 0)
@@ -685,7 +840,12 @@ class LocoPlugin:
             self._publish_stop()
             return {"state": "ok", "message": "chassis stopped"}
         if action in ("start", "info"):
-            return {"state": "active", "topic": "/wr1_base_drive_controller/cmd_vel"}
+            lifecycle_state = self._client.get_lifecycle_state() if hasattr(self, '_client') else "unknown"
+            return {
+                "state": "active",
+                "topic": "/wr1_base_drive_controller/cmd_vel",
+                "lifecycle_state": lifecycle_state
+            }
         if action == "stop":
             return {"state": "idle"}
         return None
@@ -1228,16 +1388,46 @@ class HeadGesturePlugin:
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "gesture":
-            lifecycle_state = self._client.get_lifecycle_state() if hasattr(self, '_client') else "unknown"
+            # 检查lifecycle状态，最多重试3次
+            max_retries = 3
+            retry_delay = 1.0
+            lifecycle_state = "unknown"
+
+            for attempt in range(max_retries):
+                lifecycle_state = self._client.get_lifecycle_state() if hasattr(self, '_client') else "unknown"
+                if lifecycle_state == "active":
+                    break
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+
             if lifecycle_state != "active":
-                return {"state": "error", "message": "motion_manager lifecycle must be active", "lifecycle_state": lifecycle_state}
+                return {
+                    "state": "error",
+                    "message": f"motion_manager lifecycle must be active (got: {lifecycle_state})",
+                    "lifecycle_state": lifecycle_state,
+                    "suggestion": "Ensure motion_manager is running and in active state"
+                }
+
             name = args.get("gesture", "nod")
             if name not in self.GESTURES:
-                return {"state": "error", "message": f"Unknown gesture: {name}"}
+                return {"state": "error", "message": f"Unknown gesture: {name}. Available: {list(self.GESTURES.keys())}"}
+
             g = self.GESTURES[name]
             if g["joint"] is None:
                 self._publish_zero()
                 return {"state": "ok", "gesture": name, "description": g["desc"]}
+
+            # 检查传感器数据是否新鲜（可选，根据需要启用）
+            if hasattr(self, '_client'):
+                snap = self._client.snapshot()
+                if not snap.get("fresh", False):
+                    return {
+                        "state": "warning",
+                        "message": "Sensor data is stale, gesture may be inaccurate",
+                        "gesture": name,
+                        "data_fresh": snap.get("fresh", False)
+                    }
+
             cmd = _make_hybrid_command([g["joint"]], [g["position"]], kps=[500.0], kds=[5.0])
             cmd.header.stamp = self._node.get_clock().now().to_msg()
             self._pub.publish(cmd)
@@ -1245,7 +1435,12 @@ class HeadGesturePlugin:
             threading.Thread(target=self._reset, args=(g["joint"],), daemon=True).start()
             return {"state": "ok", "gesture": name, "description": g["desc"]}
         if action in ("start", "info"):
-            return {"state": "active", "gestures": list(self.GESTURES.keys())}
+            lifecycle_state = self._client.get_lifecycle_state() if hasattr(self, '_client') else "unknown"
+            return {
+                "state": "active",
+                "gestures": list(self.GESTURES.keys()),
+                "lifecycle_state": lifecycle_state
+            }
         if action == "stop":
             return {"state": "idle"}
         return None

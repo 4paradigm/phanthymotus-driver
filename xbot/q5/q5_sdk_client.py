@@ -146,6 +146,8 @@ class Q5SdkClient:
             joint_map = {}
             velocity_map = {}
             effort_map = {}
+            joint_count = len(msg.name)
+
             for i, name in enumerate(msg.name):
                 if i < len(msg.position):
                     position = float(msg.position[i])
@@ -161,6 +163,7 @@ class Q5SdkClient:
             message_timestamp_ms = None
             if stamp is not None and (stamp.sec or stamp.nanosec):
                 message_timestamp_ms = int(stamp.sec * 1000 + stamp.nanosec / 1_000_000)
+
             with self._lock:
                 self._last_joint_stamp = time.time()
                 self._snapshot = {
@@ -174,10 +177,17 @@ class Q5SdkClient:
                     "velocities": velocity_map,
                     "efforts": effort_map,
                     "joint_names": list(msg.name),
+                    "joint_count": joint_count,
                     "position_unit": "rad",
                     "source_position_unit": "deg" if self._joint_state_position_unit == "degrees" else "rad",
                     "header_frame": msg.header.frame_id if hasattr(msg, 'header') else "",
                 }
+
+            # 首次收到数据或数据有重大变化时打印日志
+            if not hasattr(self, '_first_joint_data_received'):
+                self._first_joint_data_received = True
+                print(f"[Q5SdkClient] JointState received: {joint_count} joints, "
+                      f"names={list(msg.name)[:5]}{'...' if len(msg.name)>5 else ''}", flush=True)
         except Exception as e:
             print(f"[Q5SdkClient] _on_joint_state error: {e}", flush=True)
 
@@ -379,7 +389,27 @@ class Q5SdkClient:
 
     def get_lifecycle_state(self) -> str:
         with self._lock:
-            return self._lifecycle_state
+            state = self._lifecycle_state
+
+        # 如果状态是 "unknown" 或服务不可用，尝试立即刷新一次
+        if state in ("unknown", "service_unavailable") and self._lifecycle_client:
+            try:
+                if self._lifecycle_client.service_is_ready():
+                    future = self._lifecycle_client.call_async(self._lifecycle_request_type())
+                    self._lifecycle_request_pending = True
+                    # 等待结果
+                    rclpy.spin_until_future_complete(self._node, future, timeout_sec=1.0)
+                    if future.result():
+                        response = future.result()
+                        state_label = getattr(response, "current_state", None)
+                        label = str(getattr(state_label, "label", "unknown") or "unknown")
+                        with self._lock:
+                            self._lifecycle_state = label
+                            state = label
+            except Exception:
+                pass
+
+        return state
 
     def full_snapshot(self) -> dict:
         """Return complete snapshot for bridge worker (joints + all sensors).
@@ -406,3 +436,38 @@ class Q5SdkClient:
             snap["stale"] = True
 
         return snap
+
+    def get_diagnostic_info(self) -> dict:
+        """获取诊断信息，帮助调试传感器和lifecycle问题"""
+        with self._lock:
+            lifecycle_state = self._lifecycle_state
+            lifecycle_source = self._lifecycle_source
+
+        joint_snap = self.snapshot()
+
+        # 检查各个传感器的状态
+        sensor_states = {}
+        for sensor_name in self._sensor_snapshots.keys():
+            sensor_states[sensor_name] = self.sensor_snapshot(sensor_name)
+
+        # 计算最后一次收到数据的时间
+        last_joint_data = self._last_joint_stamp if hasattr(self, '_last_joint_stamp') else 0
+        last_joint_age_ms = int((time.time() - last_joint_data) * 1000) if last_joint_data > 0 else -1
+
+        return {
+            "available": self.available,
+            "running": self._running,
+            "lifecycle_state": lifecycle_state,
+            "lifecycle_source": lifecycle_source,
+            "joint_data": {
+                "available": joint_snap.get("available", False),
+                "fresh": joint_snap.get("fresh", False),
+                "stale": joint_snap.get("stale", False),
+                "age_ms": joint_snap.get("age_ms"),
+                "joint_count": joint_snap.get("joint_count", 0),
+                "last_received_ms_ago": last_joint_age_ms,
+            },
+            "sensor_states": sensor_states,
+            "node_initialized": self._node is not None,
+            "lifecycle_service_available": self._lifecycle_client is not None,
+        }

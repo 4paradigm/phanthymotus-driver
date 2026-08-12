@@ -21,6 +21,7 @@ import signal
 import socket
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -325,6 +326,26 @@ def main():
 
     _bridge_pusher_thread = threading.Thread(target=_bridge_pusher, daemon=True, name="bridge_pusher")
     _bridge_pusher_thread.start()
+
+    # 等待一下让SDK客户端初始化并获取一些数据
+    print("[bundle] Waiting for sensor data...")
+    time.sleep(2)
+
+    # 输出诊断信息
+    if sdk_client.available:
+        diag = sdk_client.get_diagnostic_info()
+        print(f"[bundle] SDK diagnostic info:")
+        print(f"  - available: {diag['available']}")
+        print(f"  - running: {diag['running']}")
+        print(f"  - lifecycle_state: {diag['lifecycle_state']}")
+        print(f"  - lifecycle_source: {diag['lifecycle_source']}")
+        print(f"  - joint_data: available={diag['joint_data']['available']}, fresh={diag['joint_data']['fresh']}, count={diag['joint_data']['joint_count']}")
+        if diag['joint_data']['age_ms'] is not None:
+            print(f"  - joint_data age: {diag['joint_data']['age_ms']}ms")
+        print(f"  - node_initialized: {diag['node_initialized']}")
+        print(f"  - lifecycle_service_available: {diag['lifecycle_service_available']}")
+    else:
+        print("[bundle] SDK client is not available")
 
     _bundle = Q5DeviceBundle(cfg, namespace, executor, sdk_client)
     _bundle.start_all()
