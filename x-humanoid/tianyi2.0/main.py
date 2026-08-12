@@ -402,15 +402,25 @@ class TianyiDeviceBundle:
             self._plugins.append(LightPlugin(plugins_cfg["light"], namespace, ros2))
             print("[bundle] LightPlugin loaded")
 
+    # 核心插件始终自动启动，其余等 MCP action:start 触发（懒启动）
+    _ALWAYS_START = {'StatePlugin', 'AsrPlugin', 'RemoteStatePlugin', 'TtsPlugin', 'ExtMicPlugin'}
+
     def start_all(self) -> None:
+        started = 0
+        lazy = 0
         for i, p in enumerate(self._plugins):
-            try:
-                p.start()
-            except Exception as e:
-                print(f"[bundle] Plugin {i} ({type(p).__name__}) start() FAILED: {e}", flush=True)
-                import traceback
-                traceback.print_exc()
-        print(f"[bundle] All {len(self._plugins)} plugins started", flush=True)
+            name = type(p).__name__
+            if name in self._ALWAYS_START:
+                try:
+                    p.start()
+                    started += 1
+                except Exception as e:
+                    print(f"[bundle] {name} start() FAILED: {e}", flush=True)
+                    import traceback
+                    traceback.print_exc()
+            else:
+                lazy += 1
+        print(f"[bundle] {started} plugins auto-started, {lazy} lazy (total {started+lazy})", flush=True)
 
     def stop_all(self) -> None:
         for p in self._plugins:
