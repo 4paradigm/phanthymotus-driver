@@ -218,6 +218,7 @@ int telemetry_get_json(char *buf, size_t buflen) {
                      s_gps_detail.totalSatelliteNumberUsed > 0 ||
                      s_pos_fused.visibleSatelliteNumber > 0);
     double relative_alt = (double)s_alt_fused - (double)s_alt_home;
+    double world_z = s_avoid.down > 0 ? (double)s_avoid.down : relative_alt;
     double local_x = 0.0;
     double local_y = 0.0;
     if (gps_valid) {
@@ -322,7 +323,7 @@ int telemetry_get_json(char *buf, size_t buflen) {
         lat_json, lon_json,
         gps_valid ? "true" : "false",
         relative_alt, gps_alt, (double)s_alt_fused, (double)s_alt_home, relative_alt,
-        local_x, local_y, relative_alt,
+        local_x, local_y, world_z,
         q0, q1, q2, q3, yaw, pitch, roll, yaw_rad, pitch_rad, roll_rad,
         (double)s_velocity.data.x, (double)s_velocity.data.y, (double)s_velocity.data.z,
         battery_pct_json, battery_volt_json,
