@@ -672,24 +672,26 @@ def _speaker_process(network_iface: str, namespace: str, plugin_config: dict,
         result_queue.put({"ready": False, "error": str(e)})
         return
 
-    # Play startup sound
-    import pathlib
-    pcm_path = pathlib.Path(__file__).parent / 'resource' / 'startup_beep.pcm'
-    try:
-        pcm = pcm_path.read_bytes()
-        block_size = 9600
-        for offset in range(0, len(pcm), block_size):
-            block = pcm[offset:offset + block_size]
-            code, _ = audio_client.PlayStream(APP_NAME, "0", block)
-            if code != 0:
-                break
-            duration = len(block) / 32000
-            remaining = duration - 0.08
-            if remaining > 0:
-                time.sleep(remaining)
-        print(f"[Speaker:subprocess] startup sound OK ({len(pcm)} bytes)", flush=True)
-    except Exception as e:
-        print(f"[Speaker:subprocess] startup sound error: {e}", flush=True)
+    def _play_beep():
+        """Play startup beep synchronously."""
+        import pathlib
+        pcm_path = pathlib.Path(__file__).parent / 'resource' / 'startup_beep.pcm'
+        try:
+            pcm = pcm_path.read_bytes()
+            block_size = 9600
+            for off in range(0, len(pcm), block_size):
+                block = pcm[off:off + block_size]
+                code, _ = audio_client.PlayStream(APP_NAME, "0", block)
+                if code != 0:
+                    print(f"[Speaker:subprocess] startup sound stopped at offset {off}: code={code}", flush=True)
+                    return
+                duration = len(block) / 32000
+                remaining = duration - 0.08
+                if remaining > 0:
+                    time.sleep(remaining)
+            print(f"[Speaker:subprocess] startup sound OK ({len(pcm)} bytes)", flush=True)
+        except Exception as e:
+            print(f"[Speaker:subprocess] startup sound error: {e}", flush=True)
 
     # Command loop
     while True:
@@ -709,6 +711,8 @@ def _speaker_process(network_iface: str, namespace: str, plugin_config: dict,
                     result_queue.put({"id": request_id, "result": {"error": "Missing input_topic"}})
                     continue
                 node.stop_play()
+                # Play startup sound before starting subscription (same as non-isolated path)
+                _play_beep()
                 topic = node.start_play(topic)
                 result_queue.put({"id": request_id, "result": {"state": "ready", "topic": topic}})
             elif action == "stop":
