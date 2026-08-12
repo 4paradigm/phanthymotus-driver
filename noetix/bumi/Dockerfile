@@ -5,7 +5,11 @@ ARG PYPI_MIRROR
 
 WORKDIR /work
 
-RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
+# The base image points at a Tencent Ubuntu mirror that is not reachable from
+# every build network. Use the official ARM64 mirror for reproducible builds.
+RUN find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) \
+        -exec sed -i 's#mirrors.tencentyun.com/ubuntu-ports#ports.ubuntu.com/ubuntu-ports#g' {} + && \
+    apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
         python3-pip \
         python3-dev \
