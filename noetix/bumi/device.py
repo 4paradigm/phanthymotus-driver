@@ -93,6 +93,11 @@ _MOTOR_ERROR_MESSAGES = {
     0x0E: "Overload",
 }
 
+# The Bumi guide lists 02H, 03H, 04H and 06H-0EH as motor error codes.  The
+# robot reports 01H for an otherwise healthy motor, so it must be treated like
+# the SDK's zero-value/no-error state rather than surfaced as an unknown fault.
+_MOTOR_HEALTH_NORMAL_CODES = {0x00, 0x01}
+
 
 def _build_motor_health(joint_state) -> dict:
     """Convert the SDK's 21 MotorState values to the motor-health schema."""
@@ -100,7 +105,7 @@ def _build_motor_health(joint_state) -> dict:
     for index, motor in enumerate(joint_state):
         motor_id = int(getattr(motor, "motor_id", index))
         error = int(getattr(motor, "error", 0))
-        if error == 0:
+        if error in _MOTOR_HEALTH_NORMAL_CODES:
             continue
 
         faults.append({
