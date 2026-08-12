@@ -8,15 +8,24 @@ drivers/noetix/bumi/device.py — Noetix Bumi-EDU 设备插件实现。
   - MicPlugin: 8ch mic capture → mono PCM 16kHz
   - SpeakerPlugin: audio playback via MediaController
   - CameraPlugin: Realsense D435i color + depth
+  - MotionStatePlugin: motion/safety state and change history
+  - ArmPlugin: guarded Bumi-EDU dual-arm control
+  - MediaSystemPlugin: MediaController status/configuration
+  - DiagnosticsPlugin: low-risk read-only self-test
 """
 
 import json
+import math
 import os
 import struct
 import subprocess
 import threading
 import time
+from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+from uuid import uuid4
 
 import rclpy
 from rclpy.node import Node
@@ -924,3 +933,838 @@ class CameraPlugin:
                 return {"state": "running", "topic_out": [{"topic": self._depth_topic, "format": "image/depth-zlib"}]}
             return {"state": "running"}
         return None
+
+
+# ── Higher-level Bumi cards ──────────────────────────────────────────────────
+#
+# These cards intentionally live in device.py with the base device plugins so
+# the Bumi bundle has a single implementation module.
+
+
+_WORKMODE_NAMES = {
+    0: "enabled", 1: "ready", 2: "walking", 5: "dance",
+    8: "greet", 9: "shake", 10: "cheer", 11: "start_teach",
+    12: "end_teach", 14: "save_teach_1", 23: "play_teach",
+    26: "protection", 27: "fall_to_stand", 28: "stand_to_fall",
+    29: "save_teach_2", 30: "disabled", 31: "dance1", 32: "dance2",
+    33: "tear",
+}
+
+_MOTOR_ERROR_NAMES = {
+    0x02: "overcurrent",
+    0x03: "undervoltage",
+    0x04: "encoder_error",
+    0x06: "brake_voltage_high",
+    0x07: "driver_error",
+    0x08: "overvoltage",
+    0x09: "undervoltage",
+    0x0A: "overcurrent",
+    0x0B: "mos_overtemperature",
+    0x0C: "coil_overtemperature",
+    0x0D: "communication_lost",
+    0x0E: "overload",
+}
+
+_JOINT_NAMES_BY_ID = [
+    "l_arm_pitch_joint", "l_arm_roll_joint", "l_arm_yaw_joint", "l_elbow_pitch_joint",
+    "l_leg_pitch_joint", "l_leg_roll_joint", "l_leg_yaw_joint",
+    "l_knee_pitch_joint", "l_ankle_pitch_joint", "l_ankle_roll_joint",
+    "r_arm_pitch_joint", "r_arm_roll_joint", "r_arm_yaw_joint", "r_elbow_pitch_joint",
+    "r_leg_pitch_joint", "r_leg_roll_joint", "r_leg_yaw_joint",
+    "r_knee_pitch_joint", "r_ankle_pitch_joint", "r_ankle_roll_joint",
+    "waist_yaw_joint",
+]
+
+
+def _wall_time_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _enum_name(value: Any) -> str:
+    """Return a stable readable value for pybind enums and ordinary values."""
+    name = getattr(value, "name", None)
+    if name:
+        return str(name)
+    text = str(value)
+    return text.rsplit(".", 1)[-1] if "." in text else text
+
+
+def _finite_number(value: Any, field: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be a number")
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be a number") from exc
+    if not math.isfinite(result):
+        raise ValueError(f"{field} must be finite")
+    return result
+
+
+def _header_payload(header: Any) -> dict:
+    if header is None:
+        return {}
+    return {
+        "message_id": getattr(header, "message_id", None),
+        "source_timestamp_us": getattr(header, "timestamp_us", None),
+        "sn": getattr(header, "sn", None),
+    }
+
+
+class _MotionStateNode(Node):
+    def __init__(self, namespace: str, high_ctrl, interval_s: float, history_size: int):
+        super().__init__("bumi_motion_state")
+        self._high_ctrl = high_ctrl
+        self._topic = f"/{namespace}/motion/state"
+        self._pub = self.create_publisher(String, self._topic, 10)
+        self._interval_s = interval_s
+        self._history = deque(maxlen=history_size)
+        self._snapshot: dict = {
+            "state": "no_data", "fresh": False, "observed_at_ms": None,
+            "reason": "waiting_for_high_controller",
+        }
+        self._last_signature = None
+        self._lock = threading.Lock()
+        self._running = False
+        self._thread = None
+
+    @property
+    def topic(self) -> str:
+        return self._topic
+
+    def start_polling(self):
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="bumi_motion_state")
+        self._thread.start()
+
+    def stop_polling(self):
+        self._running = False
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            result = dict(self._snapshot)
+        observed = result.get("observed_at_ms")
+        result["age_ms"] = max(0, _wall_time_ms() - observed) if observed else None
+        result["fresh"] = bool(
+            result.get("state") not in ("error", "no_data")
+            and observed
+            and result["age_ms"] <= max(1000, int(self._interval_s * 5_000))
+        )
+        return result
+
+    def history(self, limit: int) -> list[dict]:
+        with self._lock:
+            return list(self._history)[-limit:]
+
+    def clear_history(self):
+        with self._lock:
+            self._history.clear()
+
+    def _loop(self):
+        while self._running:
+            try:
+                payload = self._read_once()
+                signature = (
+                    payload["workmode"], payload["battery"]["alarm"],
+                    tuple((item["motor_id"], item["error"]) for item in payload["motor_errors"]),
+                )
+                with self._lock:
+                    if self._last_signature is not None and signature != self._last_signature:
+                        self._history.append({
+                            "event": "motion_state_changed",
+                            "observed_at_ms": payload["observed_at_ms"],
+                            "workmode": payload["workmode"],
+                            "workmode_name": payload["workmode_name"],
+                            "protection": payload["protection"],
+                            "battery_alarm": payload["battery"]["alarm"],
+                            "motor_errors": payload["motor_errors"],
+                        })
+                    self._last_signature = signature
+                    self._snapshot = payload
+                msg = String()
+                msg.data = json.dumps(payload, ensure_ascii=False)
+                self._pub.publish(msg)
+                time.sleep(self._interval_s)
+            except Exception as exc:
+                error = {
+                    "state": "error", "fresh": False, "observed_at_ms": _wall_time_ms(),
+                    "reason": str(exc),
+                }
+                with self._lock:
+                    self._snapshot = error
+                    self._history.append({"event": "state_read_error", **error})
+                time.sleep(max(0.5, self._interval_s))
+
+    def _read_once(self) -> dict:
+        observed_at_ms = _wall_time_ms()
+        mode = int(self._high_ctrl.get_mode())
+        bms = self._high_ctrl.get_robot_bms_data()
+        joint_state = self._high_ctrl.get_joint_state()
+        errors = []
+        for index, joint in enumerate(joint_state):
+            motor_id = int(getattr(joint, "motor_id", index))
+            error = int(getattr(joint, "error", 0))
+            if error:
+                errors.append({
+                    "motor_id": motor_id,
+                    "joint": _JOINT_NAMES_BY_ID[motor_id] if 0 <= motor_id < len(_JOINT_NAMES_BY_ID) else None,
+                    "error": error,
+                    "error_name": _MOTOR_ERROR_NAMES.get(error, "unknown"),
+                    "temperature": int(getattr(joint, "temperature", 0)),
+                })
+        if mode == 26 or errors or int(bms.battery_alarm):
+            state = "unsafe"
+        elif mode == 30:
+            state = "disabled"
+        elif mode in (0, 1, 2):
+            state = "ready"
+        else:
+            state = "busy"
+        return {
+            "state": state,
+            "observed_at_ms": observed_at_ms,
+            "fresh": True,
+            "source": "Noetix HighController/CycloneDDS",
+            "workmode": mode,
+            "workmode_name": _WORKMODE_NAMES.get(mode, "unknown"),
+            "protection": mode == 26,
+            "battery": {
+                "soc": int(bms.battery_soc), "soh": int(bms.battery_soh),
+                "temperature": int(bms.battery_temp), "alarm": int(bms.battery_alarm),
+            },
+            "motor_errors": errors,
+        }
+
+
+class MotionStatePlugin:
+    PREFIX = "motion_state"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor, high_ctrl):
+        interval = _finite_number(plugin_config.get("poll_interval_s", 0.1), "poll_interval_s")
+        if not 0.02 <= interval <= 2.0:
+            raise ValueError("poll_interval_s must be in [0.02, 2.0]")
+        history_size = int(plugin_config.get("history_size", 100))
+        if not 1 <= history_size <= 1000:
+            raise ValueError("history_size must be in [1, 1000]")
+        self._node = _MotionStateNode(namespace, high_ctrl, interval, history_size)
+        executor.add_node(self._node)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "motion_state", "type": "sensor", "multiInstance": False,
+            "description": "Bumi motion state and safety events — workmode, protection, BMS alarm and motor faults.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["snapshot", "history", "clear_history"]},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "snapshot": {"params": [], "description": "Get the latest motion and safety state"},
+                    "history": {"params": ["limit"], "description": "Get recent state-change events"},
+                    "clear_history": {"params": [], "description": "Clear recorded state-change events"},
+                },
+            },
+            "topic_out": [{"topic": self._node.topic, "format": "data/json"}],
+        }
+
+    def start(self):
+        self._node.start_polling()
+
+    def stop(self):
+        self._node.stop_polling()
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "snapshot", "info"):
+            return self._node.snapshot()
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "history":
+            try:
+                limit = int(args.get("limit", 20))
+            except (TypeError, ValueError):
+                return {"state": "error", "error": "limit must be an integer"}
+            if not 1 <= limit <= 100:
+                return {"state": "error", "error": "limit must be in [1, 100]"}
+            return {"state": "completed", "events": self._node.history(limit)}
+        if action == "clear_history":
+            self._node.clear_history()
+            return {"state": "completed"}
+        return {"state": "error", "error": f"unknown action: {action}"}
+
+
+@dataclass(frozen=True)
+class _ArmJoint:
+    name: str
+    lower: float
+    upper: float
+
+
+_LEFT_ARM = (
+    _ArmJoint("l_arm_pitch_joint", -2.36, 2.36),
+    _ArmJoint("l_arm_roll_joint", -0.14, 1.94),
+    _ArmJoint("l_arm_yaw_joint", -1.57, 1.57),
+    _ArmJoint("l_elbow_pitch_joint", -2.26, 0.0),
+)
+_RIGHT_ARM = (
+    _ArmJoint("r_arm_pitch_joint", -2.36, 2.36),
+    _ArmJoint("r_arm_roll_joint", -1.94, 0.14),
+    _ArmJoint("r_arm_yaw_joint", -1.57, 1.57),
+    _ArmJoint("r_elbow_pitch_joint", -2.26, 0.0),
+)
+
+
+class ArmPlugin:
+    """Guarded Bumi-EDU arm card backed by the whole-body LowController."""
+
+    PREFIX = "arm"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor, low_ctrl, high_ctrl=None):
+        self._ctrl = low_ctrl
+        self._high_ctrl = high_ctrl
+        self._write_enabled = plugin_config.get("write_enabled", False) is True
+        self._speed_limit = plugin_config.get("verified_speed_limit_rad_s")
+        self._update_hz = plugin_config.get("verified_trajectory_update_hz")
+        self._kp = plugin_config.get("verified_joint_kp")
+        self._kd = plugin_config.get("verified_joint_kd")
+        self._position_tolerance = plugin_config.get("verified_position_tolerance_rad")
+        self._feedback_timeout = plugin_config.get("verified_feedback_timeout_s")
+        self._max_action_duration = plugin_config.get("verified_max_action_duration_s")
+        self._takeover_verified = plugin_config.get("high_low_arbitration_verified", False) is True
+        self._recovery_verified = plugin_config.get("low_control_recovery_verified", False) is True
+        self._lock = threading.Lock()
+        self._cancel = threading.Event()
+        self._thread = None
+        self._status = {"state": "idle", "write_enabled": self._write_enabled}
+        self._joint_indices = self._resolve_arm_indices()
+
+    def _resolve_arm_indices(self) -> dict[str, int]:
+        result = {}
+        for joint in (*_LEFT_ARM, *_RIGHT_ARM):
+            try:
+                index = int(self._ctrl.getJointsIndex(joint.name))
+            except Exception:
+                index = -1
+            result[joint.name] = index
+        return result
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "arm", "type": "actuator", "multiInstance": False,
+            "description": "Bumi-EDU guarded 8-DOF dual-arm control. LowController write is disabled until a verified whole-body hold profile is configured.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["get_state", "get_limits", "move", "status", "cancel"]},
+                    "left_positions": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4,
+                                       "description": "Radians: [shoulder_pitch, shoulder_roll, shoulder_yaw, elbow_pitch]"},
+                    "right_positions": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4,
+                                        "description": "Radians: [shoulder_pitch, shoulder_roll, shoulder_yaw, elbow_pitch]"},
+                    "speed": {"type": "number", "exclusiveMinimum": 0, "description": "Target joint speed in rad/s; bounded by verified driver configuration"},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "get_state": {"params": [], "description": "Read current dual-arm motor state"},
+                    "get_limits": {"params": [], "description": "Read URDF-derived arm joint limits"},
+                    "move": {"params": ["left_positions", "right_positions", "speed"], "description": "Move one or both arms to target angles"},
+                    "status": {"params": [], "description": "Get current arm action status"},
+                    "cancel": {"params": [], "description": "Cancel target interpolation while retaining the last commanded hold"},
+                },
+            },
+        }
+
+    def start(self):
+        pass
+
+    def stop(self):
+        self._cancel.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "info", "status"):
+            with self._lock:
+                return dict(self._status)
+        if action == "stop":
+            self.stop()
+            return {"state": "idle"}
+        if action == "get_limits":
+            return {"state": "completed", "unit": "rad", "source": "resource/bumi_model.urdf",
+                    "left": [joint.__dict__ for joint in _LEFT_ARM],
+                    "right": [joint.__dict__ for joint in _RIGHT_ARM]}
+        if action == "get_state":
+            return self._get_state()
+        if action == "cancel":
+            self._cancel.set()
+            with self._lock:
+                action_id = self._status.get("action_id")
+                self._status = {"state": "cancelled", "action_id": action_id,
+                                "note": "interpolation cancelled; LowController retains its last command"}
+                return dict(self._status)
+        if action == "move":
+            return self._move(args)
+        return {"state": "error", "error": f"unknown action: {action}"}
+
+    def _get_state(self) -> dict:
+        try:
+            states = self._ctrl.get_joint_state()
+            arms = {}
+            for side, joints in (("left", _LEFT_ARM), ("right", _RIGHT_ARM)):
+                values = []
+                for joint in joints:
+                    index = self._joint_indices[joint.name]
+                    if not 0 <= index < len(states):
+                        values.append({"name": joint.name, "available": False})
+                        continue
+                    state = states[index]
+                    values.append({
+                        "name": joint.name, "motor_id": int(getattr(state, "motor_id", index)),
+                        "position": float(state.pos), "velocity": float(state.vel),
+                        "torque": float(state.tau), "temperature": int(state.temperature),
+                        "error": int(state.error), "available": True,
+                    })
+                arms[side] = values
+            return {"state": "completed", "observed_at_ms": _wall_time_ms(), "source": "Noetix LowController/CycloneDDS", **arms}
+        except Exception as exc:
+            return {"state": "error", "error": str(exc)}
+
+    def _validate_pose(self, values: Any, joints: tuple[_ArmJoint, ...], field: str) -> list[float] | None:
+        if values is None:
+            return None
+        if not isinstance(values, (list, tuple)) or len(values) != 4:
+            raise ValueError(f"{field} must contain exactly 4 values")
+        result = [_finite_number(value, field) for value in values]
+        violations = [
+            {"joint": joint.name, "value": value, "lower": joint.lower, "upper": joint.upper}
+            for joint, value in zip(joints, result) if not joint.lower <= value <= joint.upper
+        ]
+        if violations:
+            raise ValueError(f"{field} exceeds URDF limits: {violations}")
+        return result
+
+    def _validated_write_profile(self) -> tuple[float, float, float, float, float, list[float], list[float]]:
+        if not self._write_enabled:
+            raise ValueError("arm write control is disabled; set arm.write_enabled only after the LowController takeover procedure is verified")
+        if not self._takeover_verified or not self._recovery_verified:
+            raise ValueError(
+                "arm write control requires high_low_arbitration_verified=true and "
+                "low_control_recovery_verified=true")
+        speed_limit = _finite_number(self._speed_limit, "verified_speed_limit_rad_s")
+        update_hz = _finite_number(self._update_hz, "verified_trajectory_update_hz")
+        position_tolerance = _finite_number(self._position_tolerance, "verified_position_tolerance_rad")
+        feedback_timeout = _finite_number(self._feedback_timeout, "verified_feedback_timeout_s")
+        max_action_duration = _finite_number(
+            self._max_action_duration, "verified_max_action_duration_s")
+        if (speed_limit <= 0 or not 1 <= update_hz <= 500
+                or position_tolerance <= 0 or feedback_timeout <= 0
+                or max_action_duration <= 0):
+            raise ValueError("verified speed, update, tolerance or feedback timeout values are invalid")
+        if not isinstance(self._kp, list) or not isinstance(self._kd, list) or len(self._kp) != 21 or len(self._kd) != 21:
+            raise ValueError("verified_joint_kp and verified_joint_kd must each contain 21 values")
+        kp = [_finite_number(value, "verified_joint_kp") for value in self._kp]
+        kd = [_finite_number(value, "verified_joint_kd") for value in self._kd]
+        if any(value < 0 for value in (*kp, *kd)):
+            raise ValueError("verified_joint_kp/kd cannot contain negative values")
+        if any(not 0 <= index < 21 for index in self._joint_indices.values()):
+            raise ValueError("one or more Bumi arm joints could not be resolved by LowController")
+        return (speed_limit, update_hz, position_tolerance, feedback_timeout,
+                max_action_duration, kp, kd)
+
+    def _move(self, args: dict) -> dict:
+        try:
+            left = self._validate_pose(args.get("left_positions"), _LEFT_ARM, "left_positions")
+            right = self._validate_pose(args.get("right_positions"), _RIGHT_ARM, "right_positions")
+            if left is None and right is None:
+                raise ValueError("left_positions or right_positions is required")
+            (speed_limit, update_hz, position_tolerance, feedback_timeout,
+             max_action_duration, kp, kd) = self._validated_write_profile()
+            speed = _finite_number(args.get("speed"), "speed")
+            if not 0 < speed <= speed_limit:
+                raise ValueError(f"speed must be in (0, {speed_limit}] rad/s")
+        except ValueError as exc:
+            return {"state": "error", "error": str(exc), "code": "arm_validation_failed"}
+
+        with self._lock:
+            if self._thread and self._thread.is_alive():
+                return {"state": "error", "error": "another arm action is running", "code": "arm_busy"}
+            action_id = f"bumi_arm_{uuid4().hex[:12]}"
+            self._cancel.clear()
+            self._status = {"state": "accepted", "action_id": action_id}
+            self._thread = threading.Thread(
+                target=self._run_move,
+                args=(action_id, left, right, speed, update_hz,
+                      position_tolerance, feedback_timeout,
+                      max_action_duration, kp, kd),
+                daemon=True, name="bumi_arm_move",
+            )
+            self._thread.start()
+            return dict(self._status)
+
+    def _run_move(self, action_id, left, right, speed, update_hz,
+                  position_tolerance, feedback_timeout, max_action_duration, kp, kd):
+        try:
+            from lowcontrol_py import MotorCmd
+            if self._high_ctrl is not None and int(self._high_ctrl.get_mode()) == 26:
+                raise RuntimeError("robot is in protection mode")
+            states = self._ctrl.get_joint_state()
+            if len(states) != 21:
+                raise RuntimeError(f"LowController returned {len(states)} joints, expected 21")
+            motor_errors = [
+                {"motor_id": int(getattr(item, "motor_id", index)), "error": int(item.error)}
+                for index, item in enumerate(states) if int(item.error)
+            ]
+            if motor_errors:
+                raise RuntimeError(f"motor errors present: {motor_errors}")
+            try:
+                bms = self._ctrl.get_robot_bms_data()
+                if int(bms.battery_alarm):
+                    raise RuntimeError(f"battery alarm present: {int(bms.battery_alarm)}")
+            except AttributeError:
+                pass
+            start = [float(item.pos) for item in states]
+            target = list(start)
+            target_indices = []
+            for pose, joints in ((left, _LEFT_ARM), (right, _RIGHT_ARM)):
+                if pose is None:
+                    continue
+                for value, joint in zip(pose, joints):
+                    index = self._joint_indices[joint.name]
+                    target[index] = value
+                    target_indices.append(index)
+            duration = max(abs(goal - initial) for goal, initial in zip(target, start)) / speed
+            if duration > max_action_duration:
+                raise RuntimeError(
+                    f"planned arm trajectory duration {duration:.3f}s exceeds verified "
+                    f"maximum {max_action_duration:.3f}s")
+            steps = max(1, int(math.ceil(duration * update_hz)))
+            with self._lock:
+                self._status = {"state": "running", "action_id": action_id, "steps": steps}
+            for step in range(1, steps + 1):
+                if self._cancel.is_set():
+                    return
+                ratio = step / steps
+                commands = []
+                for index in range(21):
+                    cmd = MotorCmd()
+                    cmd.motor_id = index
+                    cmd.pos = start[index] + (target[index] - start[index]) * ratio
+                    cmd.vel = 0.0
+                    cmd.tau = 0.0
+                    cmd.kp = kp[index]
+                    cmd.kd = kd[index]
+                    commands.append(cmd)
+                self._ctrl.set_joint(commands)
+                time.sleep(1.0 / update_hz)
+            deadline = time.monotonic() + feedback_timeout
+            max_error = float("inf")
+            while not self._cancel.is_set() and time.monotonic() < deadline:
+                actual = self._ctrl.get_joint_state()
+                if len(actual) != 21:
+                    raise RuntimeError(f"LowController returned {len(actual)} joints during feedback")
+                feedback_errors = [
+                    {"motor_id": int(getattr(item, "motor_id", index)), "error": int(item.error)}
+                    for index, item in enumerate(actual) if int(item.error)
+                ]
+                if feedback_errors:
+                    raise RuntimeError(f"motor errors during motion: {feedback_errors}")
+                max_error = max(abs(float(actual[i].pos) - target[i]) for i in target_indices)
+                if max_error <= position_tolerance:
+                    break
+                time.sleep(min(0.05, 1.0 / update_hz))
+            if self._cancel.is_set():
+                return
+            if max_error > position_tolerance:
+                raise RuntimeError(
+                    f"arm feedback timeout: max error {max_error:.6f} rad exceeds "
+                    f"verified tolerance {position_tolerance:.6f} rad")
+            with self._lock:
+                self._status = {"state": "completed", "action_id": action_id,
+                                "feedback_verified": True,
+                                "max_position_error_rad": max_error}
+        except Exception as exc:
+            with self._lock:
+                self._status = {"state": "error", "action_id": action_id, "error": str(exc)}
+
+
+class MediaSystemPlugin:
+    PREFIX = "media_system"
+    _SET_INTERVAL_S = 0.5
+    _BOOL_FIELDS = {
+        "audio_cue": ("set_audio_cue_enable", "get_audio_cue_enable"),
+        "internal_capture_audio_to_agent": ("set_internal_capture_audio_data_to_agent_enable", "get_internal_capture_audio_data_to_agent_enable"),
+        "external_audio_to_agent": ("set_external_custom_audio_data_to_agent_enable", "get_external_custom_audio_data_to_agent_enable"),
+        "internal_agent_audio_to_playback": ("set_internal_agent_audio_data_to_playback_enable", "get_internal_agent_audio_data_to_playback_enable"),
+        "external_audio_to_playback": ("set_external_custom_audio_data_to_playback_enable", "get_external_custom_audio_data_to_playback_enable"),
+        "internal_video_to_agent": ("set_internal_capture_video_data_to_agent_enable", "get_internal_capture_video_data_to_agent_enable"),
+        "external_video_to_agent": ("set_external_custom_video_data_to_agent_enable", "get_external_custom_video_data_to_agent_enable"),
+        "external_audio_use_internal_3a": ("set_external_custom_audio_data_to_agent_use_internal_3a", "get_external_custom_audio_data_to_agent_use_internal_3a"),
+    }
+
+    def __init__(self, plugin_config: dict, namespace: str, executor, media_ctrl):
+        self._ctrl = media_ctrl
+        self._set_lock = threading.Lock()
+        self._last_set = 0.0
+
+    def get_tool(self) -> dict:
+        bool_props = {name: {"type": "boolean"} for name in self._BOOL_FIELDS}
+        config_props = {
+            "timeout_ms": {"type": "integer", "minimum": 0},
+            "wakeup_response": {"type": "string", "maxLength": 256},
+            "sleep_response": {"type": "string", "maxLength": 256},
+            **bool_props,
+        }
+        return {
+            "name": "media_system", "type": "actuator", "multiInstance": False,
+            "description": "Bumi MediaController system status, wake words, response text, timeout, cue and audio/video routing.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["status", "get_config", "set_config", "get_wake_words", "wakeup", "sleep", "restart", "pause", "resume"]},
+                    "config": {"type": "object", "properties": config_props, "additionalProperties": False, "minProperties": 1},
+                    "stream": {"type": "string", "enum": ["audio_capture", "audio_playback", "video_capture", "all"]},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "status": {"params": [], "description": "Get media system status and error"},
+                    "get_config": {"params": [], "description": "Read all supported media configuration"},
+                    "set_config": {"params": ["config"], "description": "Set one or more supported configuration fields with SDK rate limiting"},
+                    "get_wake_words": {"params": [], "description": "Read configured wake words"},
+                    "wakeup": {"params": [], "description": "Wake the media agent"},
+                    "sleep": {"params": [], "description": "Put the media agent to sleep"},
+                    "restart": {"params": [], "description": "Restart the media agent"},
+                    "pause": {"params": ["stream"], "description": "Pause an audio/video stream path"},
+                    "resume": {"params": ["stream"], "description": "Resume an audio/video stream path"},
+                },
+            },
+        }
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        try:
+            if action in ("start", "info", "status"):
+                return self._status()
+            if action == "stop":
+                return {"state": "idle"}
+            if action == "get_config":
+                return {"state": "completed", "config": self._get_config()}
+            if action == "get_wake_words":
+                return {"state": "completed", "wake_words": str(self._ctrl.get_wakeup_words())}
+            if action == "set_config":
+                return self._set_config(args.get("config"))
+            if action in ("wakeup", "sleep", "restart"):
+                self._rate_limited_call(getattr(self._ctrl, action))
+                return {"state": "accepted", "requested": action, "media_status": self._status()}
+            if action in ("pause", "resume"):
+                return self._stream_control(action, args.get("stream"))
+            return {"state": "error", "error": f"unknown action: {action}"}
+        except Exception as exc:
+            return {"state": "error", "error": str(exc)}
+
+    def _status(self) -> dict:
+        status = self._ctrl.get_system_status()
+        error = self._ctrl.get_system_error()
+        return {
+            "state": "completed", "observed_at_ms": _wall_time_ms(),
+            "source": "Noetix MediaController/CycloneDDS",
+            "status": _enum_name(status.value), "reason": _enum_name(status.reason),
+            "status_header": _header_payload(getattr(status, "header", None)),
+            "error": {"code": int(error.code), "message": str(error.message),
+                      "header": _header_payload(getattr(error, "header", None))},
+        }
+
+    def _get_config(self) -> dict:
+        config = {
+            "timeout_ms": int(self._ctrl.get_timeout()),
+            "wakeup_response": str(self._ctrl.get_wakeup_response_words()),
+            "sleep_response": str(self._ctrl.get_sleep_response_words()),
+        }
+        for name, (_, getter) in self._BOOL_FIELDS.items():
+            config[name] = bool(getattr(self._ctrl, getter)())
+        return config
+
+    def _rate_limited_call(self, fn, *args):
+        with self._set_lock:
+            wait = self._SET_INTERVAL_S - (time.monotonic() - self._last_set)
+            if wait > 0:
+                time.sleep(wait)
+            result = fn(*args)
+            self._last_set = time.monotonic()
+            return result
+
+    def _set_config(self, config: Any) -> dict:
+        if not isinstance(config, dict) or not config:
+            return {"state": "error", "error": "config must be a non-empty object"}
+        allowed = {"timeout_ms", "wakeup_response", "sleep_response", *self._BOOL_FIELDS.keys()}
+        unknown = sorted(set(config) - allowed)
+        if unknown:
+            return {"state": "error", "error": f"unsupported config fields: {unknown}"}
+        setters = []
+        for name, value in config.items():
+            if name in self._BOOL_FIELDS:
+                if type(value) is not bool:
+                    return {"state": "error", "error": f"{name} must be boolean"}
+                setters.append((getattr(self._ctrl, self._BOOL_FIELDS[name][0]), value))
+            elif name == "timeout_ms":
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    return {"state": "error", "error": "timeout_ms must be a non-negative integer"}
+                setters.append((self._ctrl.set_timeout, value))
+            else:
+                if not isinstance(value, str) or len(value) > 256:
+                    return {"state": "error", "error": f"{name} must be a string of at most 256 characters"}
+                setter = self._ctrl.set_wakeup_response_words if name == "wakeup_response" else self._ctrl.set_sleep_response_words
+                setters.append((setter, value))
+        for setter, value in setters:
+            self._rate_limited_call(setter, value)
+        return {"state": "completed", "config": self._get_config()}
+
+    def _stream_control(self, action: str, stream: Any) -> dict:
+        if stream not in ("audio_capture", "audio_playback", "video_capture", "all"):
+            return {"state": "error", "error": "stream must be audio_capture, audio_playback, video_capture or all"}
+        prefix = "pause" if action == "pause" else "resume"
+        selected = ("audio_capture", "audio_playback", "video_capture") if stream == "all" else (stream,)
+        for item in selected:
+            self._rate_limited_call(getattr(self._ctrl, f"{prefix}_{item}"))
+        return {"state": "completed", "action": action, "streams": list(selected)}
+
+
+class DiagnosticsPlugin:
+    PREFIX = "diagnostics"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor, high_ctrl=None,
+                 media_ctrl=None, low_ctrl=None, plugins: list | None = None):
+        self._high = high_ctrl
+        self._media = media_ctrl
+        self._low = low_ctrl
+        self._plugins = plugins or []
+        self._last_report = None
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "diagnostics", "type": "sensor", "multiInstance": False,
+            "description": "Bumi low-risk self-test — motion controller, media controller, microphone and camera process health.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"action": {"type": "string", "enum": ["quick_check", "motion_check", "media_check", "vision_check", "full_check", "report"]}},
+                "required": ["action"],
+                "x-action-params": {
+                    "quick_check": {"params": [], "description": "Run read-only controller and process checks"},
+                    "motion_check": {"params": [], "description": "Check HighController, mode, BMS and motor errors without moving"},
+                    "media_check": {"params": [], "description": "Check MediaController and microphone process without playback"},
+                    "vision_check": {"params": [], "description": "Check camera process health without changing capture"},
+                    "full_check": {"params": [], "description": "Run every low-risk read-only check"},
+                    "report": {"params": [], "description": "Return the most recent diagnostic report"},
+                },
+            },
+        }
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "info", "report"):
+            return self._last_report or {"state": "no_data", "reason": "no diagnostic check has run"}
+        if action == "stop":
+            return {"state": "idle"}
+        groups = {
+            "quick_check": ("motion", "media", "vision"),
+            "full_check": ("motion", "media", "vision"),
+            "motion_check": ("motion",),
+            "media_check": ("media",),
+            "vision_check": ("vision",),
+        }.get(action)
+        if groups is None:
+            return {"state": "error", "error": f"unknown action: {action}"}
+        checks = []
+        if "motion" in groups:
+            checks.extend(self._motion_checks())
+        if "media" in groups:
+            checks.extend(self._media_checks())
+        if "vision" in groups:
+            checks.extend(self._vision_checks())
+        result = "failed" if any(item["status"] == "failed" for item in checks) else (
+            "warning" if any(item["status"] == "warning" for item in checks) else "passed")
+        self._last_report = {"state": "completed", "result": result,
+                             "observed_at_ms": _wall_time_ms(), "checks": checks}
+        return self._last_report
+
+    @staticmethod
+    def _check(name: str, status: str, message: str, **data) -> dict:
+        return {"name": name, "status": status, "message": message, **data}
+
+    def _motion_checks(self) -> list[dict]:
+        if self._high is None:
+            return [self._check("high_controller", "failed", "HighController unavailable")]
+        checks = []
+        try:
+            mode = int(self._high.get_mode())
+            checks.append(self._check("high_controller", "passed", "state reads succeeded", workmode=mode,
+                                      workmode_name=_WORKMODE_NAMES.get(mode, "unknown")))
+            if mode == 26:
+                checks.append(self._check("protection_mode", "failed", "robot is in protection mode"))
+            bms = self._high.get_robot_bms_data()
+            alarm = int(bms.battery_alarm)
+            checks.append(self._check("bms_alarm", "failed" if alarm else "passed",
+                                      "battery alarm present" if alarm else "no battery alarm", alarm=alarm))
+            states = self._high.get_joint_state()
+            errors = [{"motor_id": int(getattr(item, "motor_id", index)), "error": int(item.error)}
+                      for index, item in enumerate(states) if int(item.error)]
+            checks.append(self._check("motor_errors", "failed" if errors else "passed",
+                                      f"{len(errors)} motor error(s)" if errors else "no motor errors", errors=errors))
+        except Exception as exc:
+            checks.append(self._check("high_controller_read", "failed", str(exc)))
+        if self._low is None:
+            checks.append(self._check(
+                "low_controller", "failed", "LowController unavailable; arm card cannot be loaded"))
+        else:
+            try:
+                low_states = self._low.get_joint_state()
+                checks.append(self._check(
+                    "low_controller", "passed" if len(low_states) == 21 else "failed",
+                    f"received {len(low_states)} joint states", joint_count=len(low_states)))
+            except Exception as exc:
+                checks.append(self._check("low_controller", "failed", str(exc)))
+        return checks
+
+    def _media_checks(self) -> list[dict]:
+        checks = []
+        if self._media is None:
+            checks.append(self._check("media_controller", "failed", "MediaController unavailable"))
+        else:
+            try:
+                status = self._media.get_system_status()
+                error = self._media.get_system_error()
+                code = int(error.code)
+                checks.append(self._check("media_controller", "failed" if code else "passed",
+                                          f"status={_enum_name(status.value)} error={code}",
+                                          status_value=_enum_name(status.value), error_code=code,
+                                          error_message=str(error.message)))
+            except Exception as exc:
+                checks.append(self._check("media_controller", "failed", str(exc)))
+        mic = next((item for item in self._plugins if getattr(item, "PREFIX", "") == "mic"), None)
+        if mic is not None:
+            alive = bool(getattr(mic, "_proc", None) and mic._proc.poll() is None)
+            checks.append(self._check("microphone_process", "passed" if alive else "failed",
+                                      "process running" if alive else "process not running"))
+        return checks
+
+    def _vision_checks(self) -> list[dict]:
+        camera = next((item for item in self._plugins if getattr(item, "PREFIX", "") == "camera"), None)
+        if camera is None:
+            return [self._check("camera_process", "warning", "camera plugin not loaded")]
+        proc = getattr(camera, "_proc", None)
+        alive = bool(proc and proc.poll() is None)
+        return [self._check("camera_process", "passed" if alive else "failed",
+                            "process running" if alive else "process not running")]

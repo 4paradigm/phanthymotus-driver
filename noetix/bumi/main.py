@@ -17,6 +17,7 @@ import os
 import re
 import signal
 import socket
+import subprocess
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -46,7 +47,7 @@ def _resolve_namespace(cfg: dict) -> str:
 # ── Bundle ────────────────────────────────────────────────────────────────────
 
 class BumiDeviceBundle:
-    def __init__(self, cfg: dict, namespace: str, executor, high_ctrl, media_ctrl):
+    def __init__(self, cfg: dict, namespace: str, executor, high_ctrl, media_ctrl, low_ctrl=None):
         self._plugins: list = []
         plugins_cfg = cfg.get("plugins", {})
 
@@ -74,6 +75,34 @@ class BumiDeviceBundle:
             from device import CameraPlugin
             self._plugins.append(CameraPlugin(plugins_cfg["camera"], namespace, executor))
             print("[bundle] CameraPlugin loaded")
+
+        if plugins_cfg.get("motion_state", {}).get("enabled", False) and high_ctrl is not None:
+            from device import MotionStatePlugin
+            self._plugins.append(MotionStatePlugin(
+                plugins_cfg["motion_state"], namespace, executor, high_ctrl))
+            print("[bundle] MotionStatePlugin loaded")
+
+        if plugins_cfg.get("arm", {}).get("enabled", False) and low_ctrl is not None:
+            from device import ArmPlugin
+            self._plugins.append(ArmPlugin(
+                plugins_cfg["arm"], namespace, executor, low_ctrl, high_ctrl=high_ctrl))
+            print("[bundle] ArmPlugin loaded")
+
+        if plugins_cfg.get("media_system", {}).get("enabled", False) and media_ctrl is not None:
+            from device import MediaSystemPlugin
+            self._plugins.append(MediaSystemPlugin(
+                plugins_cfg["media_system"], namespace, executor, media_ctrl))
+            print("[bundle] MediaSystemPlugin loaded")
+
+        if plugins_cfg.get("diagnostics", {}).get("enabled", False):
+            from device import DiagnosticsPlugin
+            observed_plugins = list(self._plugins)
+            self._plugins.append(DiagnosticsPlugin(
+                plugins_cfg["diagnostics"], namespace, executor,
+                high_ctrl=high_ctrl, media_ctrl=media_ctrl, low_ctrl=low_ctrl,
+                plugins=observed_plugins,
+            ))
+            print("[bundle] DiagnosticsPlugin loaded")
 
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
@@ -247,6 +276,7 @@ def main():
     # ── Initialize Noetix SDK ──
     high_ctrl = None
     media_ctrl = None
+    low_ctrl = None
 
     try:
         sys.path.insert(0, "/work/noetix_sdk_bumi/build")
@@ -255,7 +285,6 @@ def main():
 
         # init() may block indefinitely if robot is unreachable (GIL held in C++).
         # Use subprocess probe to check if DDS connection is possible first.
-        import subprocess
         probe_code = (
             "import sys; sys.path.insert(0, '/work/noetix_sdk_bumi/build'); "
             "from highcontrol_py import HighController; "
@@ -312,11 +341,39 @@ def main():
             print(f"[bundle] MediaController unavailable: {e}")
             media_ctrl = None
 
+    # LowController is initialized only when the guarded arm card is enabled.
+    # Merely loading the driver must never start whole-body low-level writes.
+    if cfg.get("plugins", {}).get("arm", {}).get("enabled", False):
+        try:
+            from lowcontrol_py import LowController
+            low_ctrl = LowController.instance()
+            probe_code3 = (
+                "import sys; sys.path.insert(0, '/work/noetix_sdk_bumi/build'); "
+                "from lowcontrol_py import LowController; "
+                "ctrl = LowController.instance(); ctrl.init(); print('OK')"
+            )
+            result = subprocess.run(
+                [sys.executable, "-c", probe_code3],
+                capture_output=True, text=True, timeout=10,
+            )
+            if "OK" in result.stdout:
+                low_ctrl.init()
+                print("[bundle] LowController initialized (arm writes remain config-gated)")
+            else:
+                print(f"[bundle] LowController probe failed: {result.stderr.strip()}")
+                low_ctrl = None
+        except subprocess.TimeoutExpired:
+            print("[bundle] LowController timed out")
+            low_ctrl = None
+        except Exception as e:
+            print(f"[bundle] LowController unavailable: {e}")
+            low_ctrl = None
+
     # ── ROS2 ──
     rclpy.init()
     executor = rclpy.executors.MultiThreadedExecutor()
 
-    _bundle = BumiDeviceBundle(cfg, namespace, executor, high_ctrl, media_ctrl)
+    _bundle = BumiDeviceBundle(cfg, namespace, executor, high_ctrl, media_ctrl, low_ctrl)
     _bundle.start_all()
 
     def _spin():
