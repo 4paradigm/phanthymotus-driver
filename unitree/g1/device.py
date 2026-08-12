@@ -623,7 +623,215 @@ class SpeakerPlugin:
         return None
 
 
-# ── SmartMotionPlugin (controller) ─────────────────────────────────────────
+# ── Speaker Isolated Process Mode ─────────────────────────────────────────────
+
+def _speaker_process(network_iface: str, namespace: str, plugin_config: dict,
+                     command_queue, result_queue):
+    """Subprocess: runs SpeakerNode with its own DDS context + ROS2.
+
+    Owns an independent AudioClient whose PlayStream RPC is not blocked by
+    the main process's lidar/SLAM DDS traffic.
+    """
+    import os as _os
+    import sys as _sys
+    _os.setsid()
+
+    try:
+        from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+        ChannelFactoryInitialize(0, network_iface)
+
+        # Suppress C++ stdout
+        _orig_fd = _os.dup(1)
+        _devnull = _os.open(_os.devnull, _os.O_WRONLY)
+        _os.dup2(_devnull, 1)
+        _os.close(_devnull)
+        _sys.stdout = _os.fdopen(_orig_fd, 'w', buffering=1)
+
+        audio_client = AudioClient()
+        audio_client.SetTimeout(10.0)
+        audio_client.Init()
+
+        import rclpy as _rclpy
+        from rclpy.executors import MultiThreadedExecutor
+        _rclpy.init()
+        executor = MultiThreadedExecutor()
+
+        node = _SpeakerNode(audio_client)
+        executor.add_node(node)
+
+        import threading
+        spin_thread = threading.Thread(
+            target=lambda: _spin_until_shutdown(executor),
+            daemon=True, name="speaker_spin",
+        )
+        spin_thread.start()
+
+        result_queue.put({"ready": True})
+        print(f"[Speaker:subprocess] ready, pid={_os.getpid()}", flush=True)
+    except Exception as e:
+        result_queue.put({"ready": False, "error": str(e)})
+        return
+
+    # Play startup sound
+    import pathlib
+    pcm_path = pathlib.Path(__file__).parent / 'resource' / 'startup_beep.pcm'
+    try:
+        pcm = pcm_path.read_bytes()
+        block_size = 9600
+        for offset in range(0, len(pcm), block_size):
+            block = pcm[offset:offset + block_size]
+            code, _ = audio_client.PlayStream(APP_NAME, "0", block)
+            if code != 0:
+                break
+            duration = len(block) / 32000
+            remaining = duration - 0.08
+            if remaining > 0:
+                time.sleep(remaining)
+        print(f"[Speaker:subprocess] startup sound OK ({len(pcm)} bytes)", flush=True)
+    except Exception as e:
+        print(f"[Speaker:subprocess] startup sound error: {e}", flush=True)
+
+    # Command loop
+    while True:
+        try:
+            cmd = command_queue.get()
+        except Exception:
+            break
+        if cmd is None:
+            break
+        request_id = cmd.get("id")
+        action = cmd.get("action", "")
+        args = cmd.get("args", {})
+        try:
+            if action in ("start", "play"):
+                topic = args.get("input_topic", "")
+                if not topic:
+                    result_queue.put({"id": request_id, "result": {"error": "Missing input_topic"}})
+                    continue
+                node.stop_play()
+                topic = node.start_play(topic)
+                result_queue.put({"id": request_id, "result": {"state": "ready", "topic": topic}})
+            elif action == "stop":
+                node.stop_play()
+                result_queue.put({"id": request_id, "result": {"state": "idle"}})
+            elif action == "interrupt":
+                r = node.interrupt()
+                result_queue.put({"id": request_id, "result": r})
+            elif action == "pause":
+                r = node.pause()
+                result_queue.put({"id": request_id, "result": r})
+            elif action == "resume":
+                r = node.resume()
+                result_queue.put({"id": request_id, "result": r})
+            elif action == "info":
+                result_queue.put({"id": request_id, "result": {
+                    "state": node.state,
+                    "topic": node._topic,
+                    "buffer_chunks": node._buf.qsize(),
+                }})
+            else:
+                result_queue.put({"id": request_id, "result": None})
+        except Exception as e:
+            result_queue.put({"id": request_id, "result": {"error": str(e)}})
+
+    node.stop_play()
+    executor.shutdown()
+
+
+def _spin_until_shutdown(executor):
+    import rclpy as _rclpy
+    while _rclpy.ok():
+        executor.spin_once(timeout_sec=0.1)
+
+
+class SpeakerIsolatedProxy:
+    """Main-process proxy: forwards speaker commands to isolated subprocess."""
+
+    PREFIX = "speaker"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor, audio_client=None,
+                 network_iface: str = "eth0"):
+        import multiprocessing as _mp
+        import queue as _q
+
+        self._ipc_lock = threading.Lock()
+        self._request_id = 0
+        self._startup_error = None
+
+        ctx = _mp.get_context("spawn")
+        self._command_queue = ctx.Queue()
+        self._result_queue = ctx.Queue()
+        self._proc = ctx.Process(
+            target=_speaker_process,
+            args=(network_iface, namespace, plugin_config,
+                  self._command_queue, self._result_queue),
+            daemon=False,
+            name="speaker_isolated",
+        )
+        self._proc.start()
+        import atexit
+        atexit.register(self.stop)
+        try:
+            result = self._result_queue.get(timeout=20.0)
+        except _q.Empty:
+            self._startup_error = "speaker subprocess startup timed out"
+            print(f"[Speaker:proxy] {self._startup_error}", flush=True)
+            return
+        if not result.get("ready"):
+            self._startup_error = result.get("error", "subprocess failed to start")
+            print(f"[Speaker:proxy] {self._startup_error}", flush=True)
+            return
+        print(f"[Speaker:proxy] subprocess ready, pid={self._proc.pid}", flush=True)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "speaker",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "G1 speaker — subscribes to ROS2 topic and streams PCM-16k audio to robot speaker",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["start", "stop", "info"],
+                        "description": "Action to perform",
+                    },
+                    "input_topic": {
+                        "type": "string",
+                        "description": "ROS2 topic to subscribe for PCM audio (provided by canvas connection)",
+                    },
+                },
+                "required": ["action"],
+            },
+            "topic_in": [{"format": "audio/pcm-16k"}],
+        }
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        if self._proc and self._proc.is_alive():
+            self._command_queue.put(None)
+            self._proc.join(timeout=5)
+            if self._proc.is_alive():
+                self._proc.terminate()
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        if not self._proc or not self._proc.is_alive():
+            return {"error": self._startup_error or "speaker subprocess is not running"}
+        import queue as _q
+        with self._ipc_lock:
+            self._request_id += 1
+            request_id = self._request_id
+            self._command_queue.put({"id": request_id, "action": action, "args": dict(args)})
+            try:
+                while True:
+                    result = self._result_queue.get(timeout=15.0)
+                    if result.get("id") == request_id:
+                        return result.get("result")
+            except _q.Empty:
+                return {"error": f"speaker action '{action}' timed out (15s)"}
 
 class SmartMotionPlugin:
     """统一打断/暂停控制卡片。协调 speaker + loco 的中止和暂停。"""
