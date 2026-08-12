@@ -11,7 +11,7 @@ dji/M300/device.py — DJI Matrice 300 RTK 无人机设备插件。
 插件：
   TelemetryPlugin        (sensor)    — 遥测数据订阅 (GPS, 姿态, 速度, 电池, 避障)
   CameraStreamPlugin     (sensor)    — 相机码流 H.264 → JPEG
-  PerceptionPlugin       (sensor)    — 感知图像 (6方向避障相机)
+  PerceptionPlugin       (sensor)    — 感知图像 (6方向×左右眼，共12路)
   HmsPlugin              (sensor)    — 健康管理系统告警
   FlightPlugin           (actuator)  — 飞行控制 (起飞/降落/返航/摇杆/刹车)
   CameraPlugin           (actuator)  — 相机管理 (拍照/录像/变焦/对焦/曝光)
@@ -296,68 +296,132 @@ class CameraStreamPlugin:
 
 
 class _PerceptionNode(Node):
+    """Publish each physical perception camera on its own ROS topic.
+
+    DJI's API subscribes by direction, while each subscription delivers both
+    eyes in that direction.  The C bridge performs the dataType split and
+    writes one JPEG per source; this node only polls and publishes those
+    independent files.  Two eye instances from the same direction therefore
+    share one DJI subscription and still get separate topics.
+    """
+
+    SOURCE_TO_DIRECTION = {
+        "front_left": "front", "front_right": "front",
+        "back_left": "back", "back_right": "back",
+        "left_left": "left", "left_right": "left",
+        "right_left": "right", "right_right": "right",
+        "up_left": "up", "up_right": "up",
+        "down_left": "down", "down_right": "down",
+    }
+
     def __init__(self, namespace: str, bridge):
         super().__init__("m300_perception")
         self._namespace = namespace
         self._bridge = bridge
         self._pubs: dict[str, object] = {}
-        self._active_directions: set[str] = set()
-        self._last_mtime: dict[str, float] = {}
+        self._active_sources: set[str] = set()
+        self._last_mtime: dict[str, int] = {}
         self._timer = self.create_timer(1.0 / 30.0, self._publish_frames)
         self.state = "idle"
 
-    def start(self, direction: str):
-        topic = f"/{self._namespace}/perception/{direction}"
-        if direction not in self._pubs:
-            self._pubs[direction] = self.create_publisher(CompressedImage, topic, _LOW_LAT_QOS)
-        if direction in self._active_directions:
-            return {"ok": True}
-        if len(self._active_directions) >= 2:
-            return {"ok": False, "error": "M300 PSDK supports at most two simultaneous perception streams"}
-        response = self._bridge.start_perception(direction=direction)
+    def topic(self, source: str) -> str:
+        return f"/{self._namespace}/perception/{source}"
+
+    def start(self, source: str):
+        if source not in self.SOURCE_TO_DIRECTION:
+            return {"ok": False, "error": f"unsupported perception source: {source}"}
+        if source not in self._pubs:
+            self._pubs[source] = self.create_publisher(
+                CompressedImage, self.topic(source), _LOW_LAT_QOS)
+        if source in self._active_sources:
+            return {"ok": True, "source": source}
+
+        active_directions = {
+            self.SOURCE_TO_DIRECTION[s] for s in self._active_sources
+        }
+        direction = self.SOURCE_TO_DIRECTION[source]
+        if direction not in active_directions and len(active_directions) >= 2:
+            return {
+                "ok": False,
+                "error": "M300 PSDK supports at most two simultaneous perception directions",
+            }
+        response = self._bridge.start_perception(source=source)
         if not response.get("ok"):
             return response
-        self._active_directions.add(direction)
+        self._active_sources.add(source)
         self.state = "running"
-        self.get_logger().info(f"Perception started — {direction}")
+        self.get_logger().info(
+            f"Perception started — {source} ({self.topic(source)})")
         return response
 
-    def stop(self, direction: str = ""):
-        if direction:
-            self._active_directions.discard(direction)
-            self._bridge.stop_perception(direction=direction)
+    def stop(self, source: str = ""):
+        if source:
+            if source in self._active_sources:
+                self._bridge.stop_perception(source=source)
+                self._active_sources.discard(source)
         else:
-            for d in list(self._active_directions):
-                self._bridge.stop_perception(direction=d)
-            self._active_directions.clear()
-        if not self._active_directions:
+            for active_source in list(self._active_sources):
+                self._bridge.stop_perception(source=active_source)
+            self._active_sources.clear()
+        if not self._active_sources:
             self.state = "idle"
 
     def _publish_frames(self):
         import os
-        for direction in list(self._active_directions):
-            path = f"/dev/shm/dji_perception_{direction}.jpg"
+
+        for source in list(self._active_sources):
+            path = f"/dev/shm/dji_perception_{source}.jpg"
             try:
-                mtime = os.path.getmtime(path)
-                if mtime == self._last_mtime.get(direction):
+                # Use nanosecond mtime so two adjacent eye frames cannot be
+                # mistaken for the same frame on filesystems with fine mtime.
+                mtime = os.stat(path).st_mtime_ns
+                if mtime == self._last_mtime.get(source):
                     continue
                 with open(path, "rb") as f:
                     data = f.read()
                 if len(data) <= 100:
                     continue
-                self._last_mtime[direction] = mtime
+                self._last_mtime[source] = mtime
                 msg = CompressedImage()
                 msg.header.stamp = self.get_clock().now().to_msg()
                 msg.format = "jpeg; grayscale"
                 msg.data = data
-                self._pubs[direction].publish(msg)
+                self._pubs[source].publish(msg)
             except OSError:
                 continue
 
 
 class PerceptionPlugin:
     PREFIX = "perception"
-    DIRECTIONS = ["front", "back", "left", "right", "up", "down"]
+    SOURCES = [
+        "front_left", "front_right",
+        "back_left", "back_right",
+        "left_left", "left_right",
+        "right_left", "right_right",
+        "up_left", "up_right",
+        "down_left", "down_right",
+    ]
+    # Compatibility alias for code that used the old six-direction constant.
+    DIRECTIONS = SOURCES
+    SOURCE_LABELS = {
+        "front_left": "Front — left eye",
+        "front_right": "Front — right eye",
+        "back_left": "Back — left eye",
+        "back_right": "Back — right eye",
+        "left_left": "Left — left eye",
+        "left_right": "Left — right eye",
+        "right_left": "Right — left eye",
+        "right_right": "Right — right eye",
+        "up_left": "Up — left eye",
+        "up_right": "Up — right eye",
+        "down_left": "Down — left eye",
+        "down_right": "Down — right eye",
+    }
+    LEGACY_DIRECTION_TO_SOURCE = {
+        "front": "front_left", "back": "back_left",
+        "left": "left_left", "right": "right_left",
+        "up": "up_left", "down": "down_left",
+    }
 
     def __init__(self, plugin_config: dict, namespace: str, executor, bridge):
         self._namespace = namespace
@@ -365,23 +429,34 @@ class PerceptionPlugin:
         self._instance_configs: dict[str, dict] = {}
         executor.add_node(self._node)
 
+    def _source_from_args(self, args: dict) -> str:
+        # ``direction`` is the existing card field.  The aliases make direct
+        # MCP callers able to use the clearer source/camera_source names too.
+        source = (
+            args.get("source")
+            or args.get("camera_source")
+            or args.get("direction")
+            or "front_left"
+        )
+        return self.LEGACY_DIRECTION_TO_SOURCE.get(source, source)
+
     def get_tool(self) -> dict:
         return {
             "name": "perception",
             "type": "sensor",
             "multiInstance": True,
-            "description": "Matrice 300 RTK 感知避障立体灰度图：前/后(rear)/左/右/上/下，全部已实测可订阅；最多同时2路。",
+            "description": "Matrice 300 RTK 12路感知灰度相机：六个方向各自提供左眼和右眼；每个物理相机对应独立 topic/file，底层最多同时订阅两个方向。",
             "topic_out": [{"format": "image/jpeg", "desc": "perception grayscale stream"}],
             "configSchema": {
                 "type": "object",
                 "properties": {
                     "direction": {
                         "type": "string",
-                        "description": "Perception direction",
+                        "description": "Perception camera source (direction + eye)",
                         "scope": "instance",
                         "oneOf": [
-                            {"const": d, "title": d.capitalize()}
-                            for d in self.DIRECTIONS
+                            {"const": source, "title": self.SOURCE_LABELS[source]}
+                            for source in self.SOURCES
                         ],
                     },
                 },
@@ -395,8 +470,8 @@ class PerceptionPlugin:
                     },
                     "direction": {
                         "type": "string",
-                        "enum": self.DIRECTIONS,
-                        "description": "Perception direction",
+                        "enum": self.SOURCES,
+                        "description": "Perception camera source",
                     },
                 },
                 "required": ["action"],
@@ -412,37 +487,45 @@ class PerceptionPlugin:
     def dispatch(self, action: str, args: dict) -> dict | None:
         instance_id = args.get("instance_id", "")
         if action == "config":
-            direction = args.get("direction", "front")
-            if direction not in self.DIRECTIONS:
-                return {"ok": False, "error": f"unsupported perception direction: {direction}"}
-            self._instance_configs[instance_id] = {"direction": direction}
-            return {"ok": True, "direction": direction}
+            source = self._source_from_args(args)
+            if source not in self.SOURCES:
+                return {"ok": False, "error": f"unsupported perception source: {source}"}
+            self._instance_configs[instance_id] = {"source": source}
+            return {
+                "ok": True,
+                "source": source,
+                "direction": source,
+                "topic": self._node.topic(source),
+            }
 
-        direction = self._instance_configs.get(instance_id, {}).get(
-            "direction", args.get("direction", "front")
+        source = self._instance_configs.get(instance_id, {}).get(
+            "source", self._source_from_args(args)
         )
-        if direction not in self.DIRECTIONS:
-            return {"state": "error", "message": f"unsupported perception direction: {direction}"}
+        if source not in self.SOURCES:
+            return {"state": "error", "message": f"unsupported perception source: {source}"}
+        topic = self._node.topic(source)
         if action == "start":
-            result = self._node.start(direction)
-            topic = f"/{self._namespace}/perception/{direction}"
+            result = self._node.start(source)
             return {
                 "state": self._node.state,
+                "source": source,
+                "direction": source,
                 "topic_out": [{"topic": topic, "format": "image/jpeg"}],
                 **result,
             }
         if action == "stop":
-            self._node.stop(direction)
-            return {"state": self._node.state}
+            self._node.stop(source)
+            return {"state": self._node.state, "source": source}
         if action == "info":
             if instance_id not in self._instance_configs:
                 return {
                     "state": self._node.state,
                     "topic_out": [],
                 }
-            topic = f"/{self._namespace}/perception/{direction}"
             return {
                 "state": self._node.state,
+                "source": source,
+                "direction": source,
                 "topic_out": [{"topic": topic, "format": "image/jpeg"}],
             }
         return None

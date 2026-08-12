@@ -20,5 +20,13 @@
   "psdk_uart0": "/dev/ttyACM0",
   "psdk_uart1": "/dev/ttyACM0",
   "waypoint_version": "V2 (not exposed until a V2 mission builder is implemented)",
-  "perception_directions": ["front", "back", "left", "right", "up", "down"]
+  "perception_directions": ["front", "back", "left", "right", "up", "down"],
+  "perception_sources": [
+    "front_left", "front_right",
+    "back_left", "back_right",
+    "left_left", "left_right",
+    "right_left", "right_right",
+    "up_left", "up_right",
+    "down_left", "down_right"
+  ]
 }

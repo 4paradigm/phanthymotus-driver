@@ -368,10 +368,12 @@ class BridgeClient:
         return {"ok": True, "data": {"ret": 0}}
 
     def _mock_start_perception(self, args: dict) -> dict:
-        return {"ok": True, "data": {"ret": 0}}
+        source = args.get("source") or args.get("direction", "front_left")
+        return {"ok": True, "data": {"ret": 0, "source": source}}
 
     def _mock_stop_perception(self, args: dict) -> dict:
-        return {"ok": True, "data": {"ret": 0}}
+        source = args.get("source") or args.get("direction", "front_left")
+        return {"ok": True, "data": {"ret": 0, "source": source}}
 
     def _mock_get_aircraft_info(self, args: dict) -> dict:
         return {"ok": True, "data": {
@@ -543,11 +545,21 @@ class BridgeClient:
         return self._call("stop_liveview", {"camera": camera})
 
     # Perception
-    def start_perception(self, direction: str = "front"):
-        return self._call("start_perception", {"direction": direction})
+    def start_perception(self, source: str = "front_left", direction: str | None = None):
+        """Start one physical perception camera.
 
-    def stop_perception(self, direction: str = "front"):
-        return self._call("stop_perception", {"direction": direction})
+        ``direction`` remains accepted as a compatibility alias for older
+        callers; direction-only values are interpreted as the left camera by
+        the bridge.
+        """
+        if direction is not None:
+            source = direction
+        return self._call("start_perception", {"source": source})
+
+    def stop_perception(self, source: str = "front_left", direction: str | None = None):
+        if direction is not None:
+            source = direction
+        return self._call("stop_perception", {"source": source})
 
     # Aircraft info
     def get_aircraft_info(self):
