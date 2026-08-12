@@ -4269,7 +4269,7 @@ class TtsPlugin:
         if not client:
             return {"error": f"{action_name} service client not initialized"}
         try:
-            req = type(client.srv_type.Request)()
+            req = client.srv_type.Request()
             client.call_async(req)
             return {"state": action_name}
         except Exception as e:
