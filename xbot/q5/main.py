@@ -90,7 +90,7 @@ class Q5DeviceBundle:
             try:
                 import device
                 cls = getattr(device, cls_name)
-                plugin = cls(plugins_cfg[key], namespace, executor, client)
+                plugin = cls(plugins_cfg[key], namespace, executor, None)
                 self._plugins.append(plugin)
                 print(f"[bundle] {cls_name} loaded")
             except Exception as e:
