@@ -29,6 +29,11 @@ import yaml
 import rclpy
 import rclpy.executors
 
+# ── Q5 Bridge Worker (subprocess DDS bridge) ──────────────────────────────────
+# Spawned as a subprocess with Domain 42/FastDDS to publish sensor snapshots
+# to Agent Core ROS2 domain. Mirrors G1's safety_harness.py pattern.
+import q5_bridge_worker as bridge_worker_mod
+
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -298,6 +303,29 @@ def main():
     sdk_client.start(executor)
     print(f"[bundle] SDK client started ({'live' if sdk_client.available else 'STUB'})")
 
+    # Bridge Worker subprocess — publishes sensor snapshots to Domain 42/FastDDS
+    bridge_worker = bridge_worker_mod.BridgeWorker(debug=False)
+    bridge_worker.start()
+    print("[bundle] BridgeWorker subprocess started (Domain 42/FastDDS)")
+
+    # Background thread: periodically push full_snapshot to bridge worker
+    # This replaces the old q5_sensor_bridge.py HTTP polling with direct multiprocessing.Queue
+    _bridge_running = True
+
+    def _bridge_pusher():
+        """Push sensor snapshots to bridge subprocess at ~10Hz."""
+        import time as _time
+        while _bridge_running and sdk_client.available:
+            try:
+                full_snap = sdk_client.full_snapshot()
+                bridge_worker.push_snapshot(full_snap)
+            except Exception as e:
+                print(f"[bundle] bridge push error: {e}", flush=True)
+            _time.sleep(0.1)  # 10Hz
+
+    _bridge_pusher_thread = threading.Thread(target=_bridge_pusher, daemon=True, name="bridge_pusher")
+    _bridge_pusher_thread.start()
+
     _bundle = Q5DeviceBundle(cfg, namespace, executor, sdk_client)
     _bundle.start_all()
 
@@ -315,6 +343,9 @@ def main():
 
     def _shutdown(signum, frame):
         print(f"[bundle] signal {signum}, shutting down")
+        global _bridge_running
+        _bridge_running = False
+        bridge_worker.shutdown()
         _bundle.stop_all()
         threading.Thread(target=server.shutdown, daemon=True).start()
 

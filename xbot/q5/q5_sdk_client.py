@@ -380,3 +380,29 @@ class Q5SdkClient:
     def get_lifecycle_state(self) -> str:
         with self._lock:
             return self._lifecycle_state
+
+    def full_snapshot(self) -> dict:
+        """Return complete snapshot for bridge worker (joints + all sensors).
+
+        Used by q5_bridge_worker subprocess to publish to Domain 42/ROS2 topics.
+        Returns a flat dict with nested sensor data under '_sensor_*' keys.
+        """
+        with self._lock:
+            snap = dict(self._snapshot) if self._snapshot else {}
+            # Merge sensor snapshots under '_sensor_' prefix
+            for key, val in self._sensor_snapshots.items():
+                snap[f"_sensor_{key}"] = dict(val)
+            for key, val in self._last_sensor_received.items():
+                snap[f"_sensor_received_{key}"] = val
+
+        # Check freshness
+        if snap.get("fresh"):
+            elapsed_ms = int((time.time() - self._last_joint_stamp) * 1000)
+            snap["age_ms"] = elapsed_ms
+            snap["fresh"] = elapsed_ms <= STALE_THRESHOLD_MS
+            snap["stale"] = not snap["fresh"]
+        else:
+            snap["fresh"] = False
+            snap["stale"] = True
+
+        return snap
