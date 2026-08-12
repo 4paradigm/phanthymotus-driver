@@ -8,8 +8,8 @@ The bundle exposes the original Bumi sensor, locomotion, audio and camera cards 
 
 Read-only whole-body motion telemetry from `HighController`.
 
-- `snapshot` with `detail: summary`: current activity, workmode context, protection flag, body orientation, angular velocity, linear acceleration, grouped joint positions/velocities, motion statistics and active motor faults.
-- `snapshot` with `detail: joints`: the summary plus position, velocity, torque, temperature and error for all 21 joints.
+- `snapshot` with `detail: summary`: current activity, workmode context, protection flag, body orientation, angular velocity, linear acceleration, per-limb aggregate motion statistics and active motor faults.
+- `snapshot` with `detail: joints`: only the position, velocity, torque, temperature and error for each of all 21 joints, plus source/freshness metadata; it does not repeat the summary.
 - `history`: recent motion-start/stop, mode, protection, controller-read and motor-fault events.
 - `clear_history`: clear the in-memory motion event history.
 - ROS2 output: `/<namespace>/motion/state`, JSON.
