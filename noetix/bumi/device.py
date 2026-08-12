@@ -1029,14 +1029,6 @@ def _quaternion_xyzw_to_rpy(quaternion: list[float]) -> list[float] | None:
 
 
 class _MotionStateNode(Node):
-    _JOINT_GROUPS = {
-        "left_arm": range(0, 4),
-        "left_leg": range(4, 10),
-        "right_arm": range(10, 14),
-        "right_leg": range(14, 20),
-        "waist": range(20, 21),
-    }
-
     def __init__(self, namespace: str, high_ctrl, interval_s: float,
                  history_size: int, activity_velocity_threshold: float):
         super().__init__("bumi_motion_state")
@@ -1223,20 +1215,6 @@ class _MotionStateNode(Node):
         most_active_index = absolute_velocities.index(max_velocity)
         moving = [item for item in joint_states
                   if abs(item["velocity"]) >= self._activity_velocity_threshold]
-        groups = {}
-        for name, indices in self._JOINT_GROUPS.items():
-            selected = [joint_states[index] for index in indices]
-            group_velocities = [abs(item["velocity"]) for item in selected]
-            groups[name] = {
-                "joint_count": len(selected),
-                "moving_joint_count": sum(
-                    velocity >= self._activity_velocity_threshold
-                    for velocity in group_velocities
-                ),
-                "max_abs_velocity": round(max(group_velocities), 6),
-                "mean_abs_velocity": round(
-                    sum(group_velocities) / len(group_velocities), 6),
-            }
 
         return {
             "state": "completed",
@@ -1273,7 +1251,6 @@ class _MotionStateNode(Node):
                     "joint": joint_states[most_active_index]["joint"],
                     "velocity": joint_states[most_active_index]["velocity"],
                 },
-                "groups": groups,
             },
             "motor_faults": faults,
             "joint_states": joint_states,
@@ -1284,7 +1261,7 @@ class MotionStatePlugin:
     PREFIX = "motion_state"
 
     def __init__(self, plugin_config: dict, namespace: str, executor, high_ctrl):
-        interval = _finite_number(plugin_config.get("poll_interval_s", 0.1), "poll_interval_s")
+        interval = _finite_number(plugin_config.get("poll_interval_s", 0.5), "poll_interval_s")
         if not 0.02 <= interval <= 2.0:
             raise ValueError("poll_interval_s must be in [0.02, 2.0]")
         history_size = int(plugin_config.get("history_size", 100))
@@ -1303,7 +1280,7 @@ class MotionStatePlugin:
     def get_tool(self) -> dict:
         return {
             "name": "motion_state", "type": "sensor", "multiInstance": False,
-            "description": "Bumi whole-body motion telemetry — body orientation/dynamics, grouped joint position/velocity, activity and motion events.",
+            "description": "Bumi whole-body motion telemetry — body orientation/dynamics, joint activity and motion events.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1313,9 +1290,9 @@ class MotionStatePlugin:
                         "description": "操作：snapshot 获取当前运动遥测；history 查询近期运动事件；clear_history 清空内存中的事件记录。",
                     },
                     "detail": {
-                        "type": "string", "enum": ["summary", "joints"],
+                        "type": "string", "enum": ["summary", "joints", "none"],
                         "default": "summary",
-                        "description": "仅用于 snapshot。summary（默认）返回整机和分组摘要；joints 仅返回全部 21 个关节的位置、速度、扭矩、温度和错误，不附带 summary。",
+                        "description": "snapshot 时选择 summary（默认，整机运动摘要）或 joints（仅 21 个关节明细）；history 时必须选择 none；clear_history 无需设置。",
                     },
                     "limit": {
                         "type": "integer", "minimum": 1, "maximum": 100,
@@ -1326,8 +1303,8 @@ class MotionStatePlugin:
                 "required": ["action"],
                 "x-action-params": {
                     "snapshot": {"params": ["detail"], "description": "获取当前运动遥测；summary 返回整机摘要，joints 仅返回 21 个关节完整明细。"},
-                    "history": {"params": ["limit"], "description": "Get recent motion, mode, protection and motor-fault events"},
-                    "clear_history": {"params": [], "description": "Clear recorded motion events"},
+                    "history": {"params": ["detail", "limit"], "description": "查询近期运动事件；detail 必须选择 none，limit 可选且默认返回 20 条。"},
+                    "clear_history": {"params": [], "description": "清空内存中的运动事件记录；不需要任何参数。"},
                 },
             },
             "topic_out": [{"topic": self._node.topic, "format": "data/json"}],
@@ -1341,17 +1318,21 @@ class MotionStatePlugin:
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action in ("start", "snapshot", "info"):
-            if action == "snapshot" and "limit" in args:
-                return {"state": "error", "error": "limit is only valid for history"}
             detail = args.get("detail", "summary")
             if detail not in ("summary", "joints"):
-                return {"state": "error", "error": "detail must be summary or joints"}
+                return {
+                    "state": "error",
+                    "error": "snapshot requires detail=summary or detail=joints; none is only for history",
+                }
             return self._node.snapshot(detail)
         if action == "stop":
             return {"state": "idle"}
         if action == "history":
-            if "detail" in args:
-                return {"state": "error", "error": "detail is only valid for snapshot"}
+            if args.get("detail") != "none":
+                return {
+                    "state": "error",
+                    "error": "history requires detail=none; select none in the detail field",
+                }
             try:
                 limit = int(args.get("limit", 20))
             except (TypeError, ValueError):
@@ -1360,9 +1341,6 @@ class MotionStatePlugin:
                 return {"state": "error", "error": "limit must be in [1, 100]"}
             return {"state": "completed", "events": self._node.history(limit)}
         if action == "clear_history":
-            unexpected = sorted(set(args) - {"_tool_name"})
-            if unexpected:
-                return {"state": "error", "error": "clear_history does not accept parameters"}
             self._node.clear_history()
             return {"state": "completed"}
         return {"state": "error", "error": f"unknown action: {action}"}
@@ -1729,19 +1707,19 @@ class MediaSystemPlugin:
         }
         return {
             "name": "media_system", "type": "actuator", "multiInstance": False,
-            "description": "Bumi MediaController system status, wake words, response text, timeout, cue and audio/video routing.",
+            "description": "管理 Bumi 媒体 Agent：查询状态和配置、控制唤醒/休眠/重启，以及暂停或恢复麦克风、扬声器和视频采集通道。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
                         "enum": ["status", "get_config", "set_config", "get_wake_words", "wakeup", "sleep", "restart", "pause", "resume"],
-                        "description": "媒体操作：查询状态/配置/唤醒词，修改配置，唤醒、休眠、重启，或暂停、恢复媒体流。",
+                        "description": "status=查媒体 Agent 状态；get/set_config=查/改配置；get_wake_words=查唤醒词；wakeup/sleep/restart=唤醒/休眠/重启媒体 Agent；pause/resume=暂停/恢复 stream 指定的媒体通道。",
                     },
                     "config": {
                         "type": "object", "properties": config_props,
                         "additionalProperties": False, "minProperties": 1,
-                        "description": "仅用于 set_config。填写一个或多个需要修改的字段；未填写的配置保持不变。",
+                        "description": "set_config 专用，请填写 JSON，例如 {\"audio_cue\":true,\"timeout_ms\":30000}；可填一个或多个字段，未填写项保持不变。",
                     },
                     "stream": {
                         "type": "string",
@@ -1755,11 +1733,11 @@ class MediaSystemPlugin:
                     "get_config": {"params": [], "description": "读取卡片支持的全部媒体配置。"},
                     "set_config": {"params": ["config"], "description": "修改 config 中填写的一个或多个配置，并回读修改后的完整配置。"},
                     "get_wake_words": {"params": [], "description": "读取当前唤醒词；不能通过此操作修改唤醒词。"},
-                    "wakeup": {"params": [], "description": "向媒体 Agent 发送唤醒指令；返回 accepted 后应再调用 status 确认。"},
-                    "sleep": {"params": [], "description": "向媒体 Agent 发送休眠指令；返回 accepted 后应再调用 status 确认。"},
-                    "restart": {"params": [], "description": "重启媒体 Agent，会暂时中断音视频交互；之后应调用 status 确认恢复。"},
-                    "pause": {"params": ["stream"], "description": "暂停 stream 指定的音频或视频通道。"},
-                    "resume": {"params": ["stream"], "description": "恢复 stream 指定的音频或视频通道。"},
+                    "wakeup": {"params": [], "description": "唤醒 Bumi 媒体 Agent，使其进入可语音交互状态；返回 accepted 后调用 status 确认。"},
+                    "sleep": {"params": [], "description": "让 Bumi 媒体 Agent 休眠，语音交互将暂停；返回 accepted 后调用 status 确认。"},
+                    "restart": {"params": [], "description": "重启 Bumi 媒体 Agent，期间音视频交互会暂时中断；之后调用 status 确认恢复。"},
+                    "pause": {"params": ["stream"], "description": "暂停 Bumi 的 stream 通道：麦克风采集、扬声器播放、视频采集或全部。"},
+                    "resume": {"params": ["stream"], "description": "恢复之前暂停的 Bumi stream 通道，使相应采集或播放继续。"},
                 },
             },
         }
@@ -1823,8 +1801,26 @@ class MediaSystemPlugin:
             return result
 
     def _set_config(self, config: Any) -> dict:
+        if isinstance(config, str):
+            try:
+                config = json.loads(config)
+            except json.JSONDecodeError as exc:
+                return {
+                    "state": "error",
+                    "error": (
+                        "config must be valid JSON, for example "
+                        "{\"audio_cue\":true,\"timeout_ms\":30000}; "
+                        f"parse error: {exc.msg}"
+                    ),
+                }
         if not isinstance(config, dict) or not config:
-            return {"state": "error", "error": "config must be a non-empty object"}
+            return {
+                "state": "error",
+                "error": (
+                    "config must be a non-empty JSON object, for example "
+                    "{\"audio_cue\":true,\"timeout_ms\":30000}"
+                ),
+            }
         allowed = {"timeout_ms", "wakeup_response", "sleep_response", *self._BOOL_FIELDS.keys()}
         unknown = sorted(set(config) - allowed)
         if unknown:

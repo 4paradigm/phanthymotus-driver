@@ -8,11 +8,13 @@ The bundle exposes the original Bumi sensor, locomotion, audio and camera cards 
 
 Read-only whole-body motion telemetry from `HighController`.
 
-- `snapshot` with `detail: summary`: current activity, workmode context, protection flag, body orientation, angular velocity, linear acceleration, per-limb aggregate motion statistics and active motor faults.
+- `snapshot` with `detail: summary`: current activity, workmode context, protection flag, body orientation, angular velocity, linear acceleration, whole-body joint activity statistics and active motor faults.
 - `snapshot` with `detail: joints`: only the position, velocity, torque, temperature and error for each of all 21 joints, plus source/freshness metadata; it does not repeat the summary.
-- `history`: recent motion-start/stop, mode, protection, controller-read and motor-fault events.
-- `clear_history`: clear the in-memory motion event history.
+- `history`: recent motion-start/stop, mode, protection, controller-read and motor-fault events. Select `detail: none`; `limit` is optional and defaults to 20.
+- `clear_history`: clear the in-memory motion event history. It requires no parameters and ignores unrelated fields supplied by older canvas clients.
 - ROS2 output: `/<namespace>/motion/state`, JSON.
+
+The default polling and topic publication rate is 2 Hz (`poll_interval_s: 0.5`).
 
 Every snapshot identifies `Noetix HighController/CycloneDDS` as its source and includes freshness and sample-age fields. It deliberately excludes battery data, which belongs to the existing `battery` card. The SDK does not expose world-frame position or translational velocity, so the card reports only documented IMU and joint measurements and does not invent odometry.
 
@@ -57,6 +59,9 @@ MediaController system management.
 - `pause` / `resume`: audio capture, audio playback, video capture, or all paths.
 
 All mutating MediaController calls are serialized with the documented minimum 500 ms interval. `set_config` reads the configuration back before returning `completed`.
+
+On the canvas, enter `set_config.config` as a JSON object, for example
+`{"audio_cue":true,"timeout_ms":30000}`. The driver accepts both this JSON text form and a native object supplied by Agent Core. Fields omitted from the object are left unchanged.
 
 ### `diagnostics`
 
