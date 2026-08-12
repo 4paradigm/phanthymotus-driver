@@ -56,7 +56,7 @@ RUN cd /q5_ws && \
 # 本地 vendor 的纯 Python SDK（非 colcon 包，直接 import）
 COPY vendor/xbot_sdk_api /opt/xbot_sdk_api
 
-COPY main.py device.py config.yaml driver.yaml /work/
+COPY main.py device.py q5_sdk_client.py q5_sensor_bridge.py config.yaml driver.yaml /work/
 
 ENV RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 ENV ROS_DOMAIN_ID=211
