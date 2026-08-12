@@ -143,22 +143,86 @@ class BridgeClient:
         self._socket_path = socket_path
         self._mock_mode = mock_mode
         self._sock: socket.socket | None = None
-        self._lock = threading.Lock()
+        # Keep a perception call's response validation and possible reconnect
+        # atomic with the underlying request.  Telemetry runs concurrently
+        # and must not reuse a socket while a late perception reply is being
+        # discarded.
+        self._lock = threading.RLock()
         self._push_callbacks: dict[str, list] = {}
         self._reader_thread: threading.Thread | None = None
         self._running = False
+        self._closed = False
         self._request_id = 0
 
         if not mock_mode:
             self._connect()
 
     def _connect(self):
-        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._sock.connect(self._socket_path)
-        self._sock.settimeout(10.0)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.connect(self._socket_path)
+        except Exception:
+            sock.close()
+            raise
+        sock.settimeout(10.0)
+        self._sock = sock
         self._running = True
         # Note: no reader thread — _call() does synchronous send/recv
         print(f"[BridgeClient] connected to {self._socket_path}", flush=True)
+
+    def _invalidate_connection(self):
+        """Drop a connection whose receive stream may contain a late reply.
+
+        The bridge uses one length-prefixed stream and does not include a
+        request id in its reply.  If a command times out, its eventual reply
+        would otherwise be consumed as the reply to the next command.  Close
+        the stream so the bridge discards that late reply before we reconnect.
+        """
+        sock = self._sock
+        self._sock = None
+        self._running = False
+        if sock:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def _ensure_connected(self) -> bool:
+        if self._closed:
+            return False
+        if self._sock is not None and self._running:
+            return True
+        try:
+            self._connect()
+            return True
+        except Exception as e:
+            print(f"[BridgeClient] reconnect failed: {e}", flush=True)
+            return False
+
+    def _handle_push(self, msg: dict):
+        push_type = msg.get("push")
+        if not push_type:
+            return
+        for cb in self._push_callbacks.get(push_type, []):
+            try:
+                cb(msg.get("data"))
+            except Exception as e:
+                print(f"[BridgeClient] push callback error: {e}", flush=True)
+
+    def _recv_response(self) -> dict | None:
+        """Read the next command reply, ignoring asynchronous push frames."""
+        while True:
+            msg = _recv_msg(self._sock)
+            if msg is None:
+                return None
+            if "push" in msg:
+                self._handle_push(msg)
+                continue
+            return msg
 
     def _reader_loop(self):
         """Background thread: reads push messages from the C bridge."""
@@ -169,12 +233,7 @@ class BridgeClient:
                     print("[BridgeClient] bridge disconnected", flush=True)
                     break
                 if "push" in msg:
-                    push_type = msg["push"]
-                    for cb in self._push_callbacks.get(push_type, []):
-                        try:
-                            cb(msg.get("data"))
-                        except Exception as e:
-                            print(f"[BridgeClient] push callback error: {e}", flush=True)
+                    self._handle_push(msg)
             except Exception as e:
                 if self._running:
                     print(f"[BridgeClient] reader error: {e}", flush=True)
@@ -190,26 +249,30 @@ class BridgeClient:
             return self._mock_dispatch(cmd, args or {})
 
         with self._lock:
+            if not self._ensure_connected():
+                return {"ok": False, "error": "bridge unavailable"}
             self._request_id += 1
             req = {"id": self._request_id, "cmd": cmd, "args": args or {}}
             try:
+                self._sock.settimeout(timeout)
                 _send_msg(self._sock, req)
-                msg = _recv_msg(self._sock)
+                msg = self._recv_response()
                 if msg is None:
+                    self._invalidate_connection()
                     return {"ok": False, "error": "bridge disconnected"}
                 return msg
             except socket.timeout:
+                self._invalidate_connection()
                 return {"ok": False, "error": "bridge timeout"}
             except Exception as e:
+                self._invalidate_connection()
                 return {"ok": False, "error": str(e)}
 
     def stop(self):
-        self._running = False
-        if self._sock:
-            try:
-                self._sock.close()
-            except Exception:
-                pass
+        with self._lock:
+            self._closed = True
+            self._running = False
+            self._invalidate_connection()
 
     # ── Mock dispatch ──────────────────────────────────────────────────────
 
@@ -554,12 +617,41 @@ class BridgeClient:
         """
         if direction is not None:
             source = direction
-        return self._call("start_perception", {"source": source})
+        return self._perception_call("start_perception", source)
 
     def stop_perception(self, source: str = "front_left", direction: str | None = None):
         if direction is not None:
             source = direction
-        return self._call("stop_perception", {"source": source})
+        return self._perception_call("stop_perception", source)
+
+    def _perception_call(self, cmd: str, source: str) -> dict:
+        """Call perception and reject a reply belonging to another request.
+
+        Perception replies always echo the requested source.  This gives the
+        client a cheap guard against a late reply left by an earlier timed-out
+        IPC command; retrying start/stop is safe because both operations are
+        idempotent for an already matching source.
+        """
+        args = {"source": source}
+        with self._lock:
+            response = self._call(cmd, args)
+            data = response.get("data")
+            reply_source = data.get("source") if isinstance(data, dict) else None
+            if reply_source == source:
+                return response
+            if response.get("ok") is False and not reply_source:
+                return response
+
+            self._invalidate_connection()
+            retry = self._call(cmd, args)
+            retry_data = retry.get("data")
+            retry_source = retry_data.get("source") if isinstance(retry_data, dict) else None
+            if retry_source == source:
+                return retry
+            return {
+                "ok": False,
+                "error": f"bridge response mismatch for {cmd}: expected {source}, got {reply_source or retry_source or 'unknown'}",
+            }
 
     # Aircraft info
     def get_aircraft_info(self):
