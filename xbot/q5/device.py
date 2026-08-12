@@ -206,6 +206,9 @@ class StatePlugin:
         self._pub_dynjoint = self._node.create_publisher(DynamicJointState, f"/{self._ns}/dynamic_joint_states", _RELIABLE_QOS)
         self._pub_servo = self._node.create_publisher(ServoPose, f"/{self._ns}/servo_pose", _RELIABLE_QOS)
         self._pub_robot_status = self._node.create_publisher(RobotStatus, f"/{self._ns}/robot_status", _RELIABLE_QOS)
+        # String publishers for JSON data
+        self._pub_joint_json = self._node.create_publisher(String, f"/{self._ns}/joint_states_json", _RELIABLE_QOS)
+        self._pub_robot_status_json = self._node.create_publisher(String, f"/{self._ns}/robot_status_json", _RELIABLE_QOS)
 
         self._state = "idle"
         self._last_joint = None
@@ -223,7 +226,9 @@ class StatePlugin:
             "default_action": "info",
             "topic_out": [
                 {"topic": f"/{self._ns}/joint_states", "format": "data/json"},
+                {"topic": f"/{self._ns}/joint_states_json", "format": "data/json"},
                 {"topic": f"/{self._ns}/robot_status", "format": "data/json"},
+                {"topic": f"/{self._ns}/robot_status_json", "format": "data/json"},
                 {"topic": f"/{self._ns}/dynamic_joint_states", "format": "data/json"},
                 {"topic": f"/{self._ns}/servo_pose", "format": "data/json"},
             ],
@@ -287,7 +292,7 @@ class StatePlugin:
             if not snap.get("fresh"):
                 json_data["message"] = "关节状态消息已过期" if snap.get("available", False) else "未收到 /joint_states 消息"
 
-            self._pub_dynjoint.publish(String(data=json.dumps(json_data, ensure_ascii=False)))
+            self._pub_joint_json.publish(String(data=json.dumps(json_data, ensure_ascii=False)))
 
         # robot_status from sensor_snapshot
         rs = self._client.sensor_snapshot("robot_status") if self._client else {}
@@ -297,6 +302,20 @@ class StatePlugin:
             msg.msg = rs.get("message", "")
             self._pub_robot_status.publish(msg)
             self._last_robot_status = rs
+
+            # 同时发布JSON格式的robot_status
+            json_status = {
+                "timestamp_ms": rs.get("timestamp_ms", int(time.time() * 1000)),
+                "received_at_ms": rs.get("received_at_ms"),
+                "fresh": rs.get("fresh", False),
+                "available": rs.get("available", False),
+                "age_ms": rs.get("age_ms"),
+                "stale": rs.get("stale", False),
+                "source_topic": "/xbot_state",
+                "state": rs.get("state", 0),
+                "message": rs.get("message", ""),
+            }
+            self._pub_robot_status_json.publish(String(data=json.dumps(json_status, ensure_ascii=False)))
 
 
 # ── ImuPlugin (sensor) ───────────────────────────────────────────────────────
