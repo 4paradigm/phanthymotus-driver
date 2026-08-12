@@ -1011,19 +1011,49 @@ def _header_payload(header: Any) -> dict:
     }
 
 
+def _quaternion_xyzw_to_rpy(quaternion: list[float]) -> list[float] | None:
+    """Convert the SDK's documented [x, y, z, w] quaternion to roll/pitch/yaw."""
+    norm = math.sqrt(sum(value * value for value in quaternion))
+    if norm < 1e-12:
+        return None
+    x, y, z, w = (value / norm for value in quaternion)
+    sinr_cosp = 2.0 * (w * x + y * z)
+    cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+    roll = math.atan2(sinr_cosp, cosr_cosp)
+    sinp = 2.0 * (w * y - z * x)
+    pitch = math.copysign(math.pi / 2.0, sinp) if abs(sinp) >= 1.0 else math.asin(sinp)
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    yaw = math.atan2(siny_cosp, cosy_cosp)
+    return [round(roll, 6), round(pitch, 6), round(yaw, 6)]
+
+
 class _MotionStateNode(Node):
-    def __init__(self, namespace: str, high_ctrl, interval_s: float, history_size: int):
+    _JOINT_GROUPS = {
+        "left_arm": range(0, 4),
+        "left_leg": range(4, 10),
+        "right_arm": range(10, 14),
+        "right_leg": range(14, 20),
+        "waist": range(20, 21),
+    }
+
+    def __init__(self, namespace: str, high_ctrl, interval_s: float,
+                 history_size: int, activity_velocity_threshold: float):
         super().__init__("bumi_motion_state")
         self._high_ctrl = high_ctrl
         self._topic = f"/{namespace}/motion/state"
         self._pub = self.create_publisher(String, self._topic, 10)
         self._interval_s = interval_s
+        self._activity_velocity_threshold = activity_velocity_threshold
         self._history = deque(maxlen=history_size)
         self._snapshot: dict = {
-            "state": "no_data", "fresh": False, "observed_at_ms": None,
+            "state": "no_data", "fresh": False, "sample_age_ms": None,
             "reason": "waiting_for_high_controller",
         }
-        self._last_signature = None
+        self._sampled_monotonic: float | None = None
+        self._last_signature: dict | None = None
+        self._event_sequence = 0
+        self._read_failed = False
         self._lock = threading.Lock()
         self._running = False
         self._thread = None
@@ -1044,99 +1074,199 @@ class _MotionStateNode(Node):
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=1.0)
 
-    def snapshot(self) -> dict:
+    def snapshot(self, detail: str = "summary") -> dict:
         with self._lock:
             result = dict(self._snapshot)
-        observed = result.get("observed_at_ms")
-        result["age_ms"] = max(0, _wall_time_ms() - observed) if observed else None
+            sampled_monotonic = self._sampled_monotonic
+        result["sample_age_ms"] = (
+            max(0, int((time.monotonic() - sampled_monotonic) * 1000))
+            if sampled_monotonic is not None else None
+        )
         result["fresh"] = bool(
             result.get("state") not in ("error", "no_data")
-            and observed
-            and result["age_ms"] <= max(1000, int(self._interval_s * 5_000))
+            and result["sample_age_ms"] is not None
+            and result["sample_age_ms"] <= max(1000, int(self._interval_s * 5_000))
         )
+        if detail != "joints":
+            result.pop("joint_states", None)
         return result
 
     def history(self, limit: int) -> list[dict]:
         with self._lock:
-            return list(self._history)[-limit:]
+            events = [dict(event) for event in list(self._history)[-limit:]]
+        now = time.monotonic()
+        for event in events:
+            recorded = event.pop("_recorded_monotonic", None)
+            event["age_ms"] = max(0, int((now - recorded) * 1000)) if recorded else None
+        return events
 
     def clear_history(self):
         with self._lock:
             self._history.clear()
 
+    def _append_event(self, event: str, **data):
+        self._event_sequence += 1
+        self._history.append({
+            "sequence": self._event_sequence,
+            "event": event,
+            "_recorded_monotonic": time.monotonic(),
+            **data,
+        })
+
+    def _record_changes(self, payload: dict, signature: dict):
+        previous = self._last_signature
+        if previous is None:
+            self._last_signature = signature
+            return
+        if signature["workmode"] != previous["workmode"]:
+            self._append_event(
+                "workmode_changed",
+                previous={"code": previous["workmode"], "name": previous["workmode_name"]},
+                current={"code": signature["workmode"], "name": signature["workmode_name"]},
+            )
+        if signature["protection"] != previous["protection"]:
+            self._append_event(
+                "protection_changed",
+                previous=previous["protection"], current=signature["protection"],
+            )
+        if signature["activity"] != previous["activity"]:
+            self._append_event(
+                "motion_started" if signature["activity"] == "moving" else "motion_stopped",
+                previous=previous["activity"], current=signature["activity"],
+                max_abs_joint_velocity=payload["joint_motion"]["max_abs_velocity"],
+                activity_velocity_threshold=self._activity_velocity_threshold,
+            )
+        if signature["motor_faults"] != previous["motor_faults"]:
+            self._append_event(
+                "motor_faults_changed", faults=payload["motor_faults"],
+            )
+        self._last_signature = signature
+
     def _loop(self):
         while self._running:
             try:
                 payload = self._read_once()
-                signature = (
-                    payload["workmode"], payload["battery"]["alarm"],
-                    tuple((item["motor_id"], item["error"]) for item in payload["motor_errors"]),
-                )
+                signature = {
+                    "workmode": payload["workmode"]["code"],
+                    "workmode_name": payload["workmode"]["name"],
+                    "protection": payload["workmode"]["protection"],
+                    "activity": payload["activity"],
+                    "motor_faults": tuple(
+                        (item["motor_id"], item["error"]) for item in payload["motor_faults"]),
+                }
                 with self._lock:
-                    if self._last_signature is not None and signature != self._last_signature:
-                        self._history.append({
-                            "event": "motion_state_changed",
-                            "observed_at_ms": payload["observed_at_ms"],
-                            "workmode": payload["workmode"],
-                            "workmode_name": payload["workmode_name"],
-                            "protection": payload["protection"],
-                            "battery_alarm": payload["battery"]["alarm"],
-                            "motor_errors": payload["motor_errors"],
-                        })
-                    self._last_signature = signature
+                    if self._read_failed:
+                        self._append_event("state_read_recovered")
+                        self._read_failed = False
+                    self._record_changes(payload, signature)
                     self._snapshot = payload
+                    self._sampled_monotonic = time.monotonic()
                 msg = String()
                 msg.data = json.dumps(payload, ensure_ascii=False)
                 self._pub.publish(msg)
                 time.sleep(self._interval_s)
             except Exception as exc:
                 error = {
-                    "state": "error", "fresh": False, "observed_at_ms": _wall_time_ms(),
+                    "state": "error", "fresh": False, "sample_age_ms": None,
                     "reason": str(exc),
                 }
                 with self._lock:
                     self._snapshot = error
-                    self._history.append({"event": "state_read_error", **error})
+                    self._sampled_monotonic = None
+                    if not self._read_failed:
+                        self._append_event("state_read_error", reason=str(exc))
+                        self._read_failed = True
                 time.sleep(max(0.5, self._interval_s))
 
     def _read_once(self) -> dict:
-        observed_at_ms = _wall_time_ms()
         mode = int(self._high_ctrl.get_mode())
-        bms = self._high_ctrl.get_robot_bms_data()
-        joint_state = self._high_ctrl.get_joint_state()
-        errors = []
-        for index, joint in enumerate(joint_state):
+        imu = self._high_ctrl.get_imu_data()
+        raw_joint_state = self._high_ctrl.get_joint_state()
+        if len(raw_joint_state) != 21:
+            raise RuntimeError(f"HighController returned {len(raw_joint_state)} joints, expected 21")
+
+        quaternion = [float(imu.ori[index]) for index in range(4)]
+        angular_velocity = [float(imu.angular_vel[index]) for index in range(3)]
+        linear_acceleration = [float(imu.linear_acc[index]) for index in range(3)]
+        joint_states = []
+        faults = []
+        for index, joint in enumerate(raw_joint_state):
             motor_id = int(getattr(joint, "motor_id", index))
             error = int(getattr(joint, "error", 0))
+            item = {
+                "motor_id": motor_id,
+                "joint": _JOINT_NAMES_BY_ID[index],
+                "position": round(float(joint.pos), 6),
+                "velocity": round(float(joint.vel), 6),
+                "torque": round(float(joint.tau), 6),
+                "temperature": int(joint.temperature),
+                "error": error,
+            }
+            joint_states.append(item)
             if error:
-                errors.append({
-                    "motor_id": motor_id,
-                    "joint": _JOINT_NAMES_BY_ID[motor_id] if 0 <= motor_id < len(_JOINT_NAMES_BY_ID) else None,
+                faults.append({
+                    "motor_id": motor_id, "joint": _JOINT_NAMES_BY_ID[index],
                     "error": error,
                     "error_name": _MOTOR_ERROR_NAMES.get(error, "unknown"),
-                    "temperature": int(getattr(joint, "temperature", 0)),
+                    "temperature": int(joint.temperature),
                 })
-        if mode == 26 or errors or int(bms.battery_alarm):
-            state = "unsafe"
-        elif mode == 30:
-            state = "disabled"
-        elif mode in (0, 1, 2):
-            state = "ready"
-        else:
-            state = "busy"
+
+        absolute_velocities = [abs(item["velocity"]) for item in joint_states]
+        max_velocity = max(absolute_velocities)
+        most_active_index = absolute_velocities.index(max_velocity)
+        moving = [item for item in joint_states
+                  if abs(item["velocity"]) >= self._activity_velocity_threshold]
+        groups = {}
+        for name, indices in self._JOINT_GROUPS.items():
+            selected = [joint_states[index] for index in indices]
+            groups[name] = {
+                "joints": [{
+                    "joint": item["joint"],
+                    "position": item["position"],
+                    "velocity": item["velocity"],
+                } for item in selected],
+                "max_abs_velocity": round(max(abs(item["velocity"]) for item in selected), 6),
+            }
+
         return {
-            "state": state,
-            "observed_at_ms": observed_at_ms,
+            "state": "completed",
             "fresh": True,
             "source": "Noetix HighController/CycloneDDS",
-            "workmode": mode,
-            "workmode_name": _WORKMODE_NAMES.get(mode, "unknown"),
-            "protection": mode == 26,
-            "battery": {
-                "soc": int(bms.battery_soc), "soh": int(bms.battery_soh),
-                "temperature": int(bms.battery_temp), "alarm": int(bms.battery_alarm),
+            "activity": "moving" if moving else "stationary",
+            "workmode": {
+                "code": mode, "name": _WORKMODE_NAMES.get(mode, "unknown"),
+                "protection": mode == 26,
             },
-            "motor_errors": errors,
+            "body_motion": {
+                "orientation": {
+                    "quaternion_xyzw": [round(value, 8) for value in quaternion],
+                    "roll_pitch_yaw_rad": _quaternion_xyzw_to_rpy(quaternion),
+                },
+                "angular_velocity": {
+                    "xyz": [round(value, 6) for value in angular_velocity],
+                    "magnitude": round(math.sqrt(sum(value * value for value in angular_velocity)), 6),
+                },
+                "linear_acceleration": {
+                    "xyz": [round(value, 6) for value in linear_acceleration],
+                    "magnitude": round(math.sqrt(sum(value * value for value in linear_acceleration)), 6),
+                },
+            },
+            "joint_motion": {
+                "joint_count": len(joint_states),
+                "activity_velocity_threshold": self._activity_velocity_threshold,
+                "moving_joint_count": len(moving),
+                "moving_joints": [item["joint"] for item in moving],
+                "max_abs_velocity": round(max_velocity, 6),
+                "mean_abs_velocity": round(sum(absolute_velocities) / len(absolute_velocities), 6),
+                "most_active_joint": {
+                    "motor_id": joint_states[most_active_index]["motor_id"],
+                    "joint": joint_states[most_active_index]["joint"],
+                    "velocity": joint_states[most_active_index]["velocity"],
+                },
+                "groups": groups,
+            },
+            "motor_faults": faults,
+            "joint_states": joint_states,
         }
 
 
@@ -1150,24 +1280,44 @@ class MotionStatePlugin:
         history_size = int(plugin_config.get("history_size", 100))
         if not 1 <= history_size <= 1000:
             raise ValueError("history_size must be in [1, 1000]")
-        self._node = _MotionStateNode(namespace, high_ctrl, interval, history_size)
+        activity_threshold = _finite_number(
+            plugin_config.get("activity_velocity_threshold", 0.05),
+            "activity_velocity_threshold",
+        )
+        if not 0.001 <= activity_threshold <= 10.0:
+            raise ValueError("activity_velocity_threshold must be in [0.001, 10.0]")
+        self._node = _MotionStateNode(
+            namespace, high_ctrl, interval, history_size, activity_threshold)
         executor.add_node(self._node)
 
     def get_tool(self) -> dict:
         return {
             "name": "motion_state", "type": "sensor", "multiInstance": False,
-            "description": "Bumi motion state and safety events — workmode, protection, BMS alarm and motor faults.",
+            "description": "Bumi whole-body motion telemetry — body orientation/dynamics, grouped joint position/velocity, activity and motion events.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["snapshot", "history", "clear_history"]},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                    "action": {
+                        "type": "string",
+                        "enum": ["snapshot", "history", "clear_history"],
+                        "description": "操作：snapshot 获取当前运动遥测；history 查询近期运动事件；clear_history 清空内存中的事件记录。",
+                    },
+                    "detail": {
+                        "type": "string", "enum": ["summary", "joints"],
+                        "default": "summary",
+                        "description": "仅用于 snapshot。summary（默认）返回整机和分组摘要；joints 额外返回全部 21 个关节的位置、速度、扭矩、温度和错误。",
+                    },
+                    "limit": {
+                        "type": "integer", "minimum": 1, "maximum": 100,
+                        "default": 20,
+                        "description": "仅用于 history，最多返回最近多少条事件；范围 1～100，未填写时默认 20。事件不足时返回全部已有事件。",
+                    },
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "snapshot": {"params": [], "description": "Get the latest motion and safety state"},
-                    "history": {"params": ["limit"], "description": "Get recent state-change events"},
-                    "clear_history": {"params": [], "description": "Clear recorded state-change events"},
+                    "snapshot": {"params": ["detail"], "description": "Get whole-body motion telemetry; detail=joints includes all 21 joints"},
+                    "history": {"params": ["limit"], "description": "Get recent motion, mode, protection and motor-fault events"},
+                    "clear_history": {"params": [], "description": "Clear recorded motion events"},
                 },
             },
             "topic_out": [{"topic": self._node.topic, "format": "data/json"}],
@@ -1181,7 +1331,10 @@ class MotionStatePlugin:
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action in ("start", "snapshot", "info"):
-            return self._node.snapshot()
+            detail = args.get("detail", "summary")
+            if detail not in ("summary", "joints"):
+                return {"state": "error", "error": "detail must be summary or joints"}
+            return self._node.snapshot(detail)
         if action == "stop":
             return {"state": "idle"}
         if action == "history":
@@ -1511,12 +1664,51 @@ class MediaSystemPlugin:
         self._last_set = 0.0
 
     def get_tool(self) -> dict:
-        bool_props = {name: {"type": "boolean"} for name in self._BOOL_FIELDS}
         config_props = {
-            "timeout_ms": {"type": "integer", "minimum": 0},
-            "wakeup_response": {"type": "string", "maxLength": 256},
-            "sleep_response": {"type": "string", "maxLength": 256},
-            **bool_props,
+            "timeout_ms": {
+                "type": "integer", "minimum": 0,
+                "description": "媒体 Agent 的超时配置，单位毫秒；必须为非负整数。",
+            },
+            "wakeup_response": {
+                "type": "string", "maxLength": 256,
+                "description": "唤醒后使用的回复文本，不是唤醒词；最长 256 个字符。",
+            },
+            "sleep_response": {
+                "type": "string", "maxLength": 256,
+                "description": "进入休眠时使用的回复文本；最长 256 个字符。",
+            },
+            "audio_cue": {
+                "type": "boolean",
+                "description": "是否启用媒体系统提示音。",
+            },
+            "internal_capture_audio_to_agent": {
+                "type": "boolean",
+                "description": "是否将机器人内部采集的音频发送给媒体 Agent。",
+            },
+            "external_audio_to_agent": {
+                "type": "boolean",
+                "description": "是否允许外部程序提供的自定义音频发送给媒体 Agent。",
+            },
+            "internal_agent_audio_to_playback": {
+                "type": "boolean",
+                "description": "是否将媒体 Agent 内部生成的音频发送到机器人播放端。",
+            },
+            "external_audio_to_playback": {
+                "type": "boolean",
+                "description": "是否允许外部程序提供的自定义音频发送到机器人播放端。",
+            },
+            "internal_video_to_agent": {
+                "type": "boolean",
+                "description": "是否将机器人内部采集的视频发送给媒体 Agent。",
+            },
+            "external_video_to_agent": {
+                "type": "boolean",
+                "description": "是否允许外部程序提供的自定义视频发送给媒体 Agent。",
+            },
+            "external_audio_use_internal_3a": {
+                "type": "boolean",
+                "description": "外部自定义音频发送给 Agent 前是否使用机器人内部 3A 音频处理。",
+            },
         }
         return {
             "name": "media_system", "type": "actuator", "multiInstance": False,
@@ -1524,21 +1716,33 @@ class MediaSystemPlugin:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["status", "get_config", "set_config", "get_wake_words", "wakeup", "sleep", "restart", "pause", "resume"]},
-                    "config": {"type": "object", "properties": config_props, "additionalProperties": False, "minProperties": 1},
-                    "stream": {"type": "string", "enum": ["audio_capture", "audio_playback", "video_capture", "all"]},
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "get_config", "set_config", "get_wake_words", "wakeup", "sleep", "restart", "pause", "resume"],
+                        "description": "媒体操作：查询状态/配置/唤醒词，修改配置，唤醒、休眠、重启，或暂停、恢复媒体流。",
+                    },
+                    "config": {
+                        "type": "object", "properties": config_props,
+                        "additionalProperties": False, "minProperties": 1,
+                        "description": "仅用于 set_config。填写一个或多个需要修改的字段；未填写的配置保持不变。",
+                    },
+                    "stream": {
+                        "type": "string",
+                        "enum": ["audio_capture", "audio_playback", "video_capture", "all"],
+                        "description": "仅用于 pause/resume：audio_capture=麦克风采集，audio_playback=扬声器播放，video_capture=视频采集，all=以上全部。",
+                    },
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "status": {"params": [], "description": "Get media system status and error"},
-                    "get_config": {"params": [], "description": "Read all supported media configuration"},
-                    "set_config": {"params": ["config"], "description": "Set one or more supported configuration fields with SDK rate limiting"},
-                    "get_wake_words": {"params": [], "description": "Read configured wake words"},
-                    "wakeup": {"params": [], "description": "Wake the media agent"},
-                    "sleep": {"params": [], "description": "Put the media agent to sleep"},
-                    "restart": {"params": [], "description": "Restart the media agent"},
-                    "pause": {"params": ["stream"], "description": "Pause an audio/video stream path"},
-                    "resume": {"params": ["stream"], "description": "Resume an audio/video stream path"},
+                    "status": {"params": [], "description": "查询媒体 Agent 当前状态、状态变化原因和系统错误。"},
+                    "get_config": {"params": [], "description": "读取卡片支持的全部媒体配置。"},
+                    "set_config": {"params": ["config"], "description": "修改 config 中填写的一个或多个配置，并回读修改后的完整配置。"},
+                    "get_wake_words": {"params": [], "description": "读取当前唤醒词；不能通过此操作修改唤醒词。"},
+                    "wakeup": {"params": [], "description": "向媒体 Agent 发送唤醒指令；返回 accepted 后应再调用 status 确认。"},
+                    "sleep": {"params": [], "description": "向媒体 Agent 发送休眠指令；返回 accepted 后应再调用 status 确认。"},
+                    "restart": {"params": [], "description": "重启媒体 Agent，会暂时中断音视频交互；之后应调用 status 确认恢复。"},
+                    "pause": {"params": ["stream"], "description": "暂停 stream 指定的音频或视频通道。"},
+                    "resume": {"params": ["stream"], "description": "恢复 stream 指定的音频或视频通道。"},
                 },
             },
         }
