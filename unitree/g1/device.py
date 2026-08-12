@@ -16,7 +16,10 @@ drivers/unitree/g1/device.py — Unitree G1 设备插件（重构版）。
   LocoPlugin         (actuator)  — 运动控制
   ArmActionPlugin    (actuator)  — 手臂动作
   StatePlugin        (sensor)    — DDS LowState → IMU/battery ROS2 topic
+  WirelessControllerPlugin (sensor) — DDS LowState wireless_remote → ROS2 topic
 """
+
+from __future__ import annotations
 
 import json
 import queue
@@ -1815,6 +1818,176 @@ class StatePlugin:
             if urdf_path.exists():
                 return {"urdf": urdf_path.read_text()}
             return {"error": "URDF model file not found"}
+        return None
+
+
+# ── WirelessControllerPlugin (sensor/status) ─────────────────────────────────
+
+class _WirelessControllerNode(Node):
+    """Subscribes to DDS lowstate wireless remote bytes and republishes JSON to ROS2."""
+
+    DDS_TOPIC = "rt/lowstate"
+    FRESH_TIMEOUT_SEC = 1.0
+    PUBLISH_INTERVAL_SEC = 0.1
+    ACTIVE_DEADZONE = 0.1
+
+    def __init__(self, topic: str, fresh_timeout_sec: float = FRESH_TIMEOUT_SEC):
+        super().__init__("g1_wireless_controller")
+        self._topic = topic
+        self._pub = self.create_publisher(String, topic, _LOW_LAT_QOS)
+        self._fresh_timeout_sec = float(fresh_timeout_sec)
+        self._lock = threading.Lock()
+        self._last_state: dict | None = None
+        self._sample_count = 0
+        self._sub = None
+        self._timer = self.create_timer(self.PUBLISH_INTERVAL_SEC, self._publish_state)
+
+        try:
+            from unitree_sdk2py.core.channel import ChannelSubscriber
+            from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
+            self._sub = ChannelSubscriber(self.DDS_TOPIC, LowState_)
+            self._sub.Init(self._on_wireless_controller, 10)
+            self.get_logger().info(f"WirelessControllerNode subscribed {self.DDS_TOPIC} → {topic}")
+        except Exception as e:
+            self.get_logger().warn(f"WirelessControllerNode: failed to subscribe {self.DDS_TOPIC}: {e}")
+
+    def _format_state(self, msg, now: float | None = None) -> dict:
+        update_time = time.monotonic() if now is None else now
+        remote = list(msg.wireless_remote)
+        keys = int(remote[2]) | (int(remote[3]) << 8)
+
+        def unpack_float(offset: int) -> float:
+            return struct.unpack("f", bytes(remote[offset:offset + 4]))[0]
+
+        return {
+            "lx": float(unpack_float(4)),
+            "ly": float(unpack_float(20)),
+            "rx": float(unpack_float(8)),
+            "ry": float(unpack_float(12)),
+            "keys": keys,
+            "_updated_at": update_time,
+        }
+
+    def _stick_state(self, x: float, y: float) -> dict:
+        magnitude = min(1.0, (x * x + y * y) ** 0.5)
+        active = magnitude >= self.ACTIVE_DEADZONE
+        if not active:
+            primary_axis = "neutral"
+            direction = "neutral"
+        elif abs(x) >= abs(y):
+            primary_axis = "x"
+            direction = "positive" if x > 0 else "negative"
+        else:
+            primary_axis = "y"
+            direction = "positive" if y > 0 else "negative"
+        return {
+            "x": round(x, 3),
+            "y": round(y, 3),
+            "active": active,
+            "primary_axis": primary_axis,
+            "direction": direction,
+            "magnitude": round(magnitude, 3),
+        }
+
+    def _public_state(self, state: dict | None, sample_count: int, now: float | None = None) -> dict:
+        current = time.monotonic() if now is None else now
+        base = {
+            "fresh_timeout_sec": self._fresh_timeout_sec,
+            "sample_count": sample_count,
+            "deadzone": self.ACTIVE_DEADZONE,
+        }
+        if not state:
+            return {
+                **base,
+                "state": "no_data",
+                "connected": False,
+                "reason": "no_data",
+                "last_update_ago_ms": -1,
+            }
+
+        last_update_ago_ms = max(0, int((current - state["_updated_at"]) * 1000))
+        connected = last_update_ago_ms <= int(self._fresh_timeout_sec * 1000)
+        keys = int(state["keys"])
+        return {
+            **base,
+            "state": "running" if connected else "stale",
+            "connected": connected,
+            "reason": "fresh" if connected else "stale",
+            "last_update_ago_ms": last_update_ago_ms,
+            "left_stick": self._stick_state(float(state["lx"]), float(state["ly"])),
+            "right_stick": self._stick_state(float(state["rx"]), float(state["ry"])),
+            "buttons": {
+                "raw": keys,
+                "active": keys != 0,
+            },
+        }
+
+    def _on_wireless_controller(self, msg) -> None:
+        state = self._format_state(msg)
+        with self._lock:
+            self._last_state = state
+            self._sample_count += 1
+
+    def _publish_state(self, now: float | None = None) -> None:
+        state = self.current_state(now=now)
+        out = String()
+        out.data = json.dumps(state)
+        self._pub.publish(out)
+
+    def current_state(self, now: float | None = None) -> dict:
+        with self._lock:
+            state = dict(self._last_state) if self._last_state else None
+            sample_count = self._sample_count
+        return self._public_state(state, sample_count, now=now)
+
+    def info(self) -> dict:
+        state = self.current_state()
+        return {
+            "state": state["state"],
+            "fresh_timeout_sec": self._fresh_timeout_sec,
+            "deadzone": self.ACTIVE_DEADZONE,
+            "connected": state["connected"],
+            "reason": state["reason"],
+            "sample_count": state["sample_count"],
+            "last_update_ago_ms": state["last_update_ago_ms"],
+        }
+
+
+class WirelessControllerPlugin:
+    PREFIX = "wireless_controller"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor):
+        self._topic = f"/{namespace}/state/wireless_controller"
+        fresh_timeout_sec = plugin_config.get("fresh_timeout_sec", _WirelessControllerNode.FRESH_TIMEOUT_SEC)
+        self._node = _WirelessControllerNode(self._topic, fresh_timeout_sec=fresh_timeout_sec)
+        executor.add_node(self._node)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "wireless_controller",
+            "type": "sensor",
+            "multiInstance": False,
+            "description": (
+                "G1 wireless controller input monitor — publishes physical controller stick "
+                "and button input reaching the driver. This sensor never commands motion."
+            ),
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._topic, "format": "data/json"}],
+        }
+
+    def start(self) -> None:
+        pass  # DDS subscription starts in __init__
+
+    def stop(self) -> None:
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        if action in ("wireless_controller", "start"):
+            return self._node.current_state()
+        if action == "info":
+            return self._node.info()
+        if action == "stop":
+            return {"state": "idle"}
         return None
 
 
