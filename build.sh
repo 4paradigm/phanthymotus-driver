@@ -265,7 +265,11 @@ for idx in "${SELECTED_INDICES[@]}"; do
         for extra in "${extras[@]}"; do
             src="${dir}${extra}"
             if [ -d "${src}" ]; then
-                cp -r "${src}" "${BUILD_CTX}/${extra}"
+                # Extras may live above the driver directory (for example ../../common).
+                # Always copy them under their basename so the temporary Docker context
+                # cannot escape through a ../ destination.
+                extra_dest="$(basename "${extra%/}")"
+                cp -r "${src}" "${BUILD_CTX}/${extra_dest}"
             else
                 echo "警告：build_context_extras 中的 ${extra} 不存在，跳过"
             fi
