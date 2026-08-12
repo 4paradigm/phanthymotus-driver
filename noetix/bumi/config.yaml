@@ -12,3 +12,17 @@ plugins:
     enabled: true
   camera:
     enabled: true
+  media_system:
+    enabled: true
+  media_config:
+    enabled: true
+  wakeup_words:
+    enabled: true
+  audio_playback:
+    enabled: true
+  video:
+    enabled: true
+  low_cmd:
+    enabled: false   # opt-in: requires LowController subprocess
+  rl_policy:
+    enabled: false   # opt-in: requires onnxruntime + ONNX model

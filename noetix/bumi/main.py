@@ -75,6 +75,41 @@ class BumiDeviceBundle:
             self._plugins.append(CameraPlugin(plugins_cfg["camera"], namespace, executor))
             print("[bundle] CameraPlugin loaded")
 
+        if plugins_cfg.get("media_system", {}).get("enabled", False) and media_ctrl is not None:
+            from device import MediaSystemPlugin
+            self._plugins.append(MediaSystemPlugin(plugins_cfg["media_system"], namespace, executor, media_ctrl))
+            print("[bundle] MediaSystemPlugin loaded")
+
+        if plugins_cfg.get("media_config", {}).get("enabled", False) and media_ctrl is not None:
+            from device import MediaConfigPlugin
+            self._plugins.append(MediaConfigPlugin(plugins_cfg["media_config"], namespace, executor, media_ctrl))
+            print("[bundle] MediaConfigPlugin loaded")
+
+        if plugins_cfg.get("wakeup_words", {}).get("enabled", False) and media_ctrl is not None:
+            from device import WakeupWordsPlugin
+            self._plugins.append(WakeupWordsPlugin(plugins_cfg["wakeup_words"], namespace, executor, media_ctrl))
+            print("[bundle] WakeupWordsPlugin loaded")
+
+        if plugins_cfg.get("audio_playback", {}).get("enabled", False) and media_ctrl is not None:
+            from device import AudioPlaybackPlugin
+            self._plugins.append(AudioPlaybackPlugin(plugins_cfg["audio_playback"], namespace, executor, media_ctrl))
+            print("[bundle] AudioPlaybackPlugin loaded")
+
+        if plugins_cfg.get("video", {}).get("enabled", False) and media_ctrl is not None:
+            from device import VideoPlugin
+            self._plugins.append(VideoPlugin(plugins_cfg["video"], namespace, executor, media_ctrl))
+            print("[bundle] VideoPlugin loaded")
+
+        if plugins_cfg.get("low_cmd", {}).get("enabled", False):
+            from device import LowCmdPlugin
+            self._plugins.append(LowCmdPlugin(plugins_cfg["low_cmd"], namespace, executor))
+            print("[bundle] LowCmdPlugin loaded")
+
+        if plugins_cfg.get("rl_policy", {}).get("enabled", False):
+            from device import RlPolicyPlugin
+            self._plugins.append(RlPolicyPlugin(plugins_cfg["rl_policy"], namespace, executor))
+            print("[bundle] RlPolicyPlugin loaded")
+
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
             try:

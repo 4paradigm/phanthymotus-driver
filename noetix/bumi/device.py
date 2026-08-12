@@ -3,11 +3,18 @@
 drivers/noetix/bumi/device.py — Noetix Bumi-EDU 设备插件实现。
 
 插件列表：
-  - StatePlugin: joints (21-DOF skeleton), imu, battery, model (URDF resource)
+  - StatePlugin: joints (21-DOF skeleton), imu, battery, joy, model (URDF resource)
   - LocoPlugin: loco (move/stop), switch_mode (mode transitions)
   - MicPlugin: 8ch mic capture → mono PCM 16kHz
   - SpeakerPlugin: audio playback via MediaController
   - CameraPlugin: Realsense D435i color + depth
+  - MediaSystemPlugin: media_system (wakeup/sleep/restart/status/errors)
+  - MediaConfigPlugin: media_config (volume/timeout/enables/3A/pause/resume)
+  - WakeupWordsPlugin: wakeup_words (wakeup/response/sleep response words)
+  - AudioPlaybackPlugin: audio_playback (agent→speaker playback stream monitor)
+  - VideoPlugin: video_capture (internal camera), video_external (external video push)
+  - LowCmdPlugin: low_cmd (LowController set_joint, subprocess)
+  - RlPolicyPlugin: rl_policy (ONNX RL walking, subprocess)
 """
 
 import json
@@ -107,6 +114,7 @@ class _BumiStateNode(Node):
     _JOINTS_INTERVAL = 0.1     # 10 Hz
     _IMU_INTERVAL    = 0.05    # 20 Hz
     _BMS_INTERVAL    = 1.0     # 1 Hz
+    _JOY_INTERVAL    = 0.1     # 10 Hz
 
     def __init__(self, namespace: str, high_ctrl):
         super().__init__("bumi_state")
@@ -114,10 +122,12 @@ class _BumiStateNode(Node):
         self._imu_topic     = f"/{namespace}/state/imu"
         self._battery_topic = f"/{namespace}/state/battery"
         self._joints_topic  = f"/{namespace}/state/joints"
+        self._joy_topic     = f"/{namespace}/state/joy"
 
         self._imu_pub     = self.create_publisher(String, self._imu_topic,     _LOW_LAT_QOS)
         self._battery_pub = self.create_publisher(String, self._battery_topic, _LOW_LAT_QOS)
         self._joints_pub  = self.create_publisher(String, self._joints_topic,  _LOW_LAT_QOS)
+        self._joy_pub     = self.create_publisher(String, self._joy_topic,      _LOW_LAT_QOS)
 
         self._last_imu: dict = {}
         self._last_battery: dict = {}
@@ -137,6 +147,7 @@ class _BumiStateNode(Node):
         last_joints_time = 0.0
         last_imu_time = 0.0
         last_bms_time = 0.0
+        last_joy_time = 0.0
 
         while self._running:
             try:
@@ -198,6 +209,23 @@ class _BumiStateNode(Node):
                     msg.data = json.dumps(bms_data)
                     self._battery_pub.publish(msg)
 
+                # Joy: 10 Hz
+                if now - last_joy_time >= self._JOY_INTERVAL:
+                    last_joy_time = now
+                    joy = self._high_ctrl.from_dds_get_joydata()
+                    joy_data = {
+                        "buttons": [int(joy.btnA[i]) for i in range(4)],
+                        "axes": {
+                            "lx": round(float(joy.lx), 4),
+                            "rx": round(float(joy.rx), 4),
+                            "ly": round(float(joy.ly), 4),
+                            "ry": round(float(joy.ry), 4),
+                        },
+                    }
+                    msg = String()
+                    msg.data = json.dumps(joy_data)
+                    self._joy_pub.publish(msg)
+
                 time.sleep(0.02)  # 50 Hz poll loop
             except Exception as e:
                 self.get_logger().warn(f"State poll error: {e}")
@@ -239,6 +267,14 @@ class StatePlugin:
                 "description": f"Bumi joint states — 21 DOF with position(q rad), velocity(dq), torque(tau), temperature. Publishes at 10Hz to /{ns}/state/joints",
                 "inputSchema": {"type": "object", "properties": {}},
                 "topic_out": [{"topic": f"/{ns}/state/joints", "format": "sensor/skeleton"}],
+            },
+            {
+                "name": "joy",
+                "type": "sensor",
+                "multiInstance": False,
+                "description": f"Bumi joystick — 4 buttons + 4 axes (lx,rx,ly,ry). Publishes at 10Hz to /{ns}/state/joy",
+                "inputSchema": {"type": "object", "properties": {}},
+                "topic_out": [{"topic": f"/{ns}/state/joy", "format": "data/json"}],
             },
             {
                 "name": "model",
@@ -923,4 +959,875 @@ class CameraPlugin:
             if tool_name == "depth":
                 return {"state": "running", "topic_out": [{"topic": self._depth_topic, "format": "image/depth-zlib"}]}
             return {"state": "running"}
+        return None
+
+
+# ── MediaSystemPlugin (system) ───────────────────────────────────────────────
+
+class MediaSystemPlugin:
+    """MediaController system control — wakeup/sleep/restart, status, errors."""
+
+    PREFIX = "media_system"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor, media_ctrl):
+        self._media_ctrl = media_ctrl
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "media_system",
+            "type": "system",
+            "multiInstance": False,
+            "description": "Bumi media system — wakeup/sleep/restart audio agent, query work status, system status, and errors.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["read", "wakeup", "sleep", "restart"],
+                    },
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "read": {"params": [], "description": "Query work status, system status, and error codes"},
+                    "wakeup": {"params": [], "description": "Wake up audio agent"},
+                    "sleep": {"params": [], "description": "Put audio agent to sleep"},
+                    "restart": {"params": [], "description": "Restart audio agent"},
+                },
+            },
+            "topic_in": [],
+            "topic_out": [],
+        }
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        args.pop('_tool_name', None)
+
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "read":
+            return {
+                "work_status": self._media_ctrl.get_work_status(),
+                "system_status": self._media_ctrl.get_system_status(),
+                "system_error": self._media_ctrl.get_system_error(),
+            }
+        if action == "wakeup":
+            self._media_ctrl.wakeup()
+            return {"state": "awake"}
+        if action == "sleep":
+            self._media_ctrl.sleep()
+            return {"state": "sleeping"}
+        if action == "restart":
+            self._media_ctrl.restart()
+            return {"state": "restarting"}
+        return None
+
+
+# ── MediaConfigPlugin (system) ──────────────────────────────────────────────
+
+class MediaConfigPlugin:
+    """MediaController configuration — volume, timeout, audio cue, 6 routing
+    enables, 3A processing, pause/resume."""
+
+    PREFIX = "media_config"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor, media_ctrl):
+        self._media_ctrl = media_ctrl
+        self._last_set_ms = 0
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "media_config",
+            "type": "system",
+            "multiInstance": False,
+            "description": "Bumi media configuration — volume, timeout, audio cue, 6 audio/video routing enables, 3A processing, pause/resume playback.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "read", "set_volume", "set_timeout", "set_audio_cue",
+                            "set_mic_to_agent", "set_agent_to_speaker",
+                            "set_ext_audio_3a", "pause_playback", "resume_playback",
+                        ],
+                    },
+                    "volume": {"type": "integer", "description": "0-200", "minimum": 0, "maximum": 200},
+                    "timeout_ms": {"type": "integer", "description": "Sleep timeout in ms"},
+                    "enable": {"type": "boolean", "description": "true=on, false=off"},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "read": {"params": [], "description": "Read all config values"},
+                    "set_volume": {"params": ["volume"], "description": "Set speaker volume (0-200)"},
+                    "set_timeout": {"params": ["timeout_ms"], "description": "Set auto-sleep timeout (ms)"},
+                    "set_audio_cue": {"params": ["enable"], "description": "Toggle system audio cue/beep"},
+                    "set_mic_to_agent": {"params": ["enable"], "description": "Toggle internal mic capture → agent"},
+                    "set_agent_to_speaker": {"params": ["enable"], "description": "Toggle agent audio → speaker playback"},
+                    "set_ext_audio_3a": {"params": ["enable"], "description": "Toggle external audio 3A (noise reduction/echo cancel)"},
+                    "pause_playback": {"params": [], "description": "Pause audio playback"},
+                    "resume_playback": {"params": [], "description": "Resume audio playback"},
+                },
+            },
+            "topic_in": [],
+            "topic_out": [],
+        }
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        args.pop('_tool_name', None)
+
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "read":
+            return {
+                "volume": self._media_ctrl.get_volume(),
+                "timeout_ms": self._media_ctrl.get_timeout(),
+                "audio_cue_enable": self._media_ctrl.get_audio_cue_enable(),
+                "mic_to_agent": self._media_ctrl.get_internal_capture_audio_data_to_agent_enable(),
+                "agent_to_speaker": self._media_ctrl.get_internal_agent_audio_data_to_playback_enable(),
+                "ext_audio_3a": self._media_ctrl.get_external_custom_audio_data_to_agent_use_internal_3a(),
+            }
+        if action == "pause_playback":
+            self._media_ctrl.pause_audio_playback()
+            return {"state": "paused"}
+        if action == "resume_playback":
+            self._media_ctrl.resume_audio_playback()
+            return {"state": "resumed"}
+
+        # Rate-limit all set actions to >=500ms
+        now_ms = int(time.time() * 1000)
+        elapsed = now_ms - self._last_set_ms
+        if self._last_set_ms > 0 and elapsed < 500:
+            return {"error": f"rate limited: {elapsed}ms since last set, need >=500ms"}
+        self._last_set_ms = now_ms
+
+        if action == "set_volume":
+            vol = int(args.get("volume", 100))
+            self._media_ctrl.set_volume(vol)
+            return {"volume": vol, "state": "set"}
+        if action == "set_timeout":
+            timeout_ms = int(args.get("timeout_ms", 30000))
+            self._media_ctrl.set_timeout(timeout_ms)
+            return {"timeout_ms": timeout_ms, "state": "set"}
+        if action == "set_audio_cue":
+            enable = bool(args.get("enable", True))
+            self._media_ctrl.set_audio_cue_enable(enable)
+            return {"audio_cue_enable": enable, "state": "set"}
+        if action == "set_mic_to_agent":
+            enable = bool(args.get("enable", True))
+            self._media_ctrl.set_internal_capture_audio_data_to_agent_enable(enable)
+            return {"mic_to_agent": enable, "state": "set"}
+        if action == "set_agent_to_speaker":
+            enable = bool(args.get("enable", True))
+            self._media_ctrl.set_internal_agent_audio_data_to_playback_enable(enable)
+            return {"agent_to_speaker": enable, "state": "set"}
+        if action == "set_ext_audio_3a":
+            enable = bool(args.get("enable", True))
+            self._media_ctrl.set_external_custom_audio_data_to_agent_use_internal_3a(enable)
+            return {"ext_audio_3a": enable, "state": "set"}
+        return None
+
+
+# ── WakeupWordsPlugin (system) ───────────────────────────────────────────────
+
+class WakeupWordsPlugin:
+    """MediaController wakeup/response words configuration."""
+
+    PREFIX = "wakeup_words"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor, media_ctrl):
+        self._media_ctrl = media_ctrl
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "wakeup_words",
+            "type": "system",
+            "multiInstance": False,
+            "description": "Bumi wakeup words — configure wakeup word, response word, and sleep response word.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["read", "set_wakeup_word", "set_response_word", "set_sleep_response_word"],
+                    },
+                    "word": {"type": "string", "description": "Wakeup/response phrase"},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "read": {"params": [], "description": "Read current wakeup, response, and sleep response words"},
+                    "set_wakeup_word": {"params": ["word"], "description": "Set wakeup word phrase"},
+                    "set_response_word": {"params": ["word"], "description": "Set response word phrase"},
+                    "set_sleep_response_word": {"params": ["word"], "description": "Set sleep response word phrase"},
+                },
+            },
+            "topic_in": [],
+            "topic_out": [],
+        }
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        args.pop('_tool_name', None)
+
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "read":
+            return {
+                "wakeup_word": self._media_ctrl.get_wakeup_words(),
+                "response_word": self._media_ctrl.get_response_words(),
+                "sleep_response_word": self._media_ctrl.get_sleep_response_words(),
+            }
+        if action == "set_wakeup_word":
+            word = str(args.get("word", ""))
+            self._media_ctrl.set_wakeup_words(word)
+            return {"wakeup_word": word, "state": "set"}
+        if action == "set_response_word":
+            word = str(args.get("word", ""))
+            self._media_ctrl.set_response_words(word)
+            return {"response_word": word, "state": "set"}
+        if action == "set_sleep_response_word":
+            word = str(args.get("word", ""))
+            self._media_ctrl.set_sleep_response_words(word)
+            return {"sleep_response_word": word, "state": "set"}
+        return None
+
+
+# ── AudioPlaybackPlugin (sensor) ─────────────────────────────────────────────
+
+class AudioPlaybackPlugin:
+    """Monitor agent→speaker playback stream from MediaController."""
+
+    PREFIX = "audio_playback"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor, media_ctrl):
+        self._media_ctrl = media_ctrl
+        self._namespace = namespace
+        self._topic = f"/{namespace}/audio/playback"
+        self._node = Node("bumi_audio_playback")
+        executor.add_node(self._node)
+        self._pub = None
+        self._running = False
+        self._thread: threading.Thread | None = None
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "audio_playback",
+            "type": "sensor",
+            "multiInstance": False,
+            "description": f"Bumi audio playback monitor — agent→speaker PCM stream. Publishes to {self._topic}. Silent when no audio playing.",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}],
+        }
+
+    def start(self) -> None:
+        self._pub = self._node.create_publisher(String, self._topic, _LOW_LAT_QOS)
+        self._running = True
+        self._thread = threading.Thread(target=self._poll_loop, daemon=True, name="bumi_audio_playback")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._running = False
+
+    def _poll_loop(self):
+        while self._running:
+            try:
+                audio = self._media_ctrl.get_agent_audio_playback_data()
+                if audio.channels == 0 or len(audio.audio_data) == 0:
+                    time.sleep(0.01)
+                    continue
+                samples = list(audio.audio_data)
+                msg = String()
+                msg.data = json.dumps({
+                    "channels": audio.channels,
+                    "sample_rate": audio.sample_rate,
+                    "format": audio.format,
+                    "data": __import__('base64').b64encode(
+                        struct.pack(f'<{len(samples)}h', *samples)
+                    ).decode(),
+                })
+                self._pub.publish(msg)
+            except Exception:
+                time.sleep(0.01)
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "running", "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}]}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "running" if self._running else "idle"}
+        return None
+
+
+# ── VideoPlugin (sensor + actuator) ───────────────────────────────────────────
+
+class VideoPlugin:
+    """Internal camera capture (sensor) + external video push (actuator)."""
+
+    PREFIX = "video"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor, media_ctrl):
+        self._media_ctrl = media_ctrl
+        self._namespace = namespace
+        self._capture_topic = f"/{namespace}/video/capture"
+        self._node = Node("bumi_video")
+        executor.add_node(self._node)
+        self._pub = None
+        self._running = False
+        self._thread: threading.Thread | None = None
+
+    def get_tools(self) -> list:
+        return [
+            {
+                "name": "video_capture",
+                "type": "sensor",
+                "multiInstance": False,
+                "description": f"Bumi internal camera video capture. Publishes to {self._capture_topic}. May have no data if no internal camera.",
+                "inputSchema": {"type": "object", "properties": {}},
+                "topic_out": [{"topic": self._capture_topic, "format": "image/jpeg"}],
+            },
+            {
+                "name": "video_external",
+                "type": "actuator",
+                "multiInstance": False,
+                "description": "Bumi external video push — publish external video stream to robot AI agent.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["publish", "stop"],
+                        },
+                        "input_topic": {
+                            "type": "string",
+                            "description": "ROS2 topic to subscribe for video frames",
+                        },
+                    },
+                    "required": ["action"],
+                    "x-action-params": {
+                        "publish": {"params": ["input_topic"], "description": "Subscribe to video topic and push to robot agent"},
+                        "stop": {"params": [], "description": "Stop external video push"},
+                    },
+                },
+                "topic_in": [{"format": "image/jpeg"}],
+                "topic_out": [],
+            },
+        ]
+
+    def start(self) -> None:
+        self._pub = self._node.create_publisher(String, self._capture_topic, _LOW_LAT_QOS)
+        self._running = True
+        self._thread = threading.Thread(target=self._poll_loop, daemon=True, name="bumi_video_capture")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._running = False
+
+    def _poll_loop(self):
+        while self._running:
+            try:
+                video = self._media_ctrl.get_capture_video_data()
+                if video.width == 0 or len(video.video_data) == 0:
+                    time.sleep(0.05)
+                    continue
+                msg = String()
+                msg.data = json.dumps({
+                    "width": video.width,
+                    "height": video.height,
+                    "format": video.format,
+                    "data": __import__('base64').b64encode(bytes(video.video_data)).decode(),
+                })
+                self._pub.publish(msg)
+            except Exception:
+                time.sleep(0.05)
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        tool_name = args.pop('_tool_name', '')
+
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            if tool_name == "video_external":
+                return {"state": "idle"}
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "running" if self._running else "idle"}
+
+        if tool_name == "video_external":
+            if action == "publish":
+                input_topic = args.get("input_topic", "")
+                if not input_topic:
+                    return {"error": "input_topic is required"}
+                self._media_ctrl.set_external_custom_video_data_to_agent_enable(True)
+
+                def _on_video(msg):
+                    try:
+                        data = json.loads(msg.data)
+                        from mediacontrol_py import VideoStream
+                        stream = VideoStream()
+                        stream.width = data.get("width", 640)
+                        stream.height = data.get("height", 480)
+                        stream.format = 1  # YUV422
+                        import base64 as _b64
+                        stream.video_data = list(_b64.b64decode(data["data"]))
+                        self._media_ctrl.publish_external_video_stream(stream)
+                    except Exception:
+                        pass
+
+                sub = self._node.create_subscription(String, input_topic, _on_video, _LOW_LAT_QOS)
+                return {"state": "publishing", "input_topic": input_topic}
+            if action == "stop":
+                self._media_ctrl.set_external_custom_video_data_to_agent_enable(False)
+                return {"state": "stopped"}
+        return None
+
+
+# ── LowCmdPlugin (actuator, subprocess) ──────────────────────────────────────
+
+def _lowcmd_subprocess(namespace: str):
+    """LowController subprocess — set_joint for 21 motors at 500Hz.
+
+    Runs in a separate process because LowController and HighController
+    cannot coexist in the same Python process (type registration conflict).
+    """
+    import os as _os
+    _os.environ.setdefault('CYCLONEDDS_URI', 'file:///work/noetix_sdk_bumi/config/dds.xml')
+    import sys as _sys
+    _sys.path.insert(0, '/work/noetix_sdk_bumi/build')
+    import time as _time
+
+    from lowcontrol_py import LowController, MotorCmd
+
+    ctrl = LowController.instance()
+    ctrl.init()
+    _time.sleep(2)
+
+    import rclpy as _rclpy
+    from rclpy.node import Node as _Node
+    from std_msgs.msg import String as _String
+
+    _rclpy.init()
+    node = _Node("bumi_lowcmd_sub")
+
+    # Joint name → hardware index mapping
+    joint_names = [
+        'leg_l1', 'leg_r1', 'waist_1', 'leg_l2', 'leg_r2',
+        'arm_l1', 'arm_r1', 'leg_l3', 'leg_r3', 'arm_l2', 'arm_r2',
+        'leg_l4', 'leg_r4', 'arm_l3', 'arm_r3', 'leg_l5', 'leg_r5',
+        'arm_l4', 'arm_r4', 'leg_l6', 'leg_r6',
+    ]
+
+    cmd_topic = f"/{namespace}/low_cmd"
+    last_cmd = None
+
+    def _on_cmd(msg):
+        nonlocal last_cmd
+        try:
+            data = json.loads(msg.data)
+            cmds = []
+            for i in range(21):
+                mc = MotorCmd()
+                mc.motor_id = i
+                mc.kp = float(data.get("kp", 0))
+                mc.kd = float(data.get("kd", 0))
+                mc.q = float(data.get("q", 0))
+                mc.dq = float(data.get("dq", 0))
+                mc.tau = float(data.get("tau", 0))
+                cmds.append(mc)
+            last_cmd = cmds
+        except Exception as e:
+            print(f"[lowcmd_subprocess] error: {e}", flush=True)
+
+    sub = node.create_subscription(_String, cmd_topic, _on_cmd, _LOW_LAT_QOS)
+    print(f"[lowcmd_subprocess] listening on {cmd_topic}", flush=True)
+
+    rate = _rclpy.rate.Rate(500)  # 500 Hz
+    while _rclpy.ok():
+        if last_cmd is not None:
+            ctrl.set_joint(last_cmd)
+        rate.spin_once()
+
+    ctrl = None
+
+
+class LowCmdPlugin:
+    """Low-level motor control via LowController (subprocess)."""
+
+    PREFIX = "low_cmd"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor):
+        self._namespace = namespace
+        self._cmd_topic = f"/{namespace}/low_cmd"
+        self._proc: subprocess.Popen | None = None
+        self._node = Node("bumi_lowcmd")
+        executor.add_node(self._node)
+        self._pub = self._node.create_publisher(String, self._cmd_topic, _LOW_LAT_QOS)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "low_cmd",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "Bumi low-level motor control — set 21 joint PD targets (kp,kd,q,dq,tau) at 500Hz via LowController subprocess.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["send", "stop"],
+                    },
+                    "kp": {"type": "number", "description": "Position gain (default 0)"},
+                    "kd": {"type": "number", "description": "Velocity gain (default 0)"},
+                    "q": {"type": "number", "description": "Target position in rad (default 0)"},
+                    "dq": {"type": "number", "description": "Target velocity in rad/s (default 0)"},
+                    "tau": {"type": "number", "description": "Feedforward torque in Nm (default 0)"},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "send": {"params": ["kp", "kd", "q", "dq", "tau"], "description": "Send PD command to all 21 joints"},
+                    "stop": {"params": [], "description": "Stop sending commands (zero all targets)"},
+                },
+            },
+            "topic_out": [{"topic": self._cmd_topic, "format": "data/json"}],
+        }
+
+    def start(self) -> None:
+        import sys
+        self._proc = subprocess.Popen(
+            [sys.executable, "-c",
+             f"import sys; sys.path.insert(0, '/work'); from device import _lowcmd_subprocess; _lowcmd_subprocess({self._namespace!r})"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        def _fwd():
+            for line in self._proc.stdout:
+                print(line.decode(errors='replace').rstrip(), flush=True)
+        threading.Thread(target=_fwd, daemon=True).start()
+
+    def stop(self) -> None:
+        if self._proc:
+            self._proc.terminate()
+            self._proc = None
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        args.pop('_tool_name', None)
+
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            msg = String()
+            msg.data = json.dumps({"kp": 0, "kd": 0, "q": 0, "dq": 0, "tau": 0})
+            self._pub.publish(msg)
+            return {"state": "stopped"}
+        if action == "send":
+            cmd = {
+                "kp": float(args.get("kp", 0)),
+                "kd": float(args.get("kd", 0)),
+                "q": float(args.get("q", 0)),
+                "dq": float(args.get("dq", 0)),
+                "tau": float(args.get("tau", 0)),
+            }
+            msg = String()
+            msg.data = json.dumps(cmd)
+            self._pub.publish(msg)
+            return {"state": "sent", "cmd": cmd}
+        return None
+
+
+# ── RlPolicyPlugin (actuator, subprocess) ────────────────────────────────────
+
+def _rlpolicy_subprocess(namespace: str):
+    """RL policy walking subprocess — ONNX model inference + state machine.
+
+    Runs in a separate process because LowController and HighController
+    cannot coexist in the same Python process.
+    """
+    import os as _os
+    _os.environ.setdefault('CYCLONEDDS_URI', 'file:///work/noetix_sdk_bumi/config/dds.xml')
+    import sys as _sys
+    _sys.path.insert(0, '/work/noetix_sdk_bumi/build')
+    import time as _time
+    import numpy as _np
+
+    from lowcontrol_py import LowController, MotorCmd
+
+    ctrl = LowController.instance()
+    ctrl.init()
+    _time.sleep(2)
+
+    import rclpy as _rclpy
+    from rclpy.node import Node as _Node
+    from std_msgs.msg import String as _String
+
+    _rclpy.init()
+    node = _Node("bumi_rl_sub")
+
+    # Joint names (SDK order)
+    joint_names = [
+        'leg_l1', 'leg_r1', 'waist_1', 'leg_l2', 'leg_r2',
+        'arm_l1', 'arm_r1', 'leg_l3', 'leg_r3', 'arm_l2', 'arm_r2',
+        'leg_l4', 'leg_r4', 'arm_l3', 'arm_r3', 'leg_l5', 'leg_r5',
+        'arm_l4', 'arm_r4', 'leg_l6', 'leg_r6',
+    ]
+
+    # Map joint name → hardware index
+    joint_indices = {}
+    for name in joint_names:
+        joint_indices[name] = ctrl.getJointsIndex(name)
+
+    # Load ONNX model
+    model_path = "/work/noetix_sdk_bumi/models/policy.onnx"
+    try:
+        import onnxruntime as ort
+        session = ort.InferenceSession(model_path)
+        print(f"[rl_subprocess] ONNX model loaded: {model_path}", flush=True)
+    except Exception as e:
+        print(f"[rl_subprocess] ONNX load failed: {e}", flush=True)
+        return
+
+    # State machine
+    mode_ = "DEFAULT"
+    cmd_topic = f"/{namespace}/rl_cmd"
+    target_vel = {"vx": 0.0, "vy": 0.0, "vyaw": 0.0}
+    running = True
+
+    def _on_cmd(msg):
+        nonlocal mode_, target_vel, running
+        try:
+            data = json.loads(msg.data)
+            action = data.get("action", "")
+            if action == "start":
+                mode_ = "LIE"
+            elif action == "stop":
+                mode_ = "DEFAULT"
+                target_vel = {"vx": 0.0, "vy": 0.0, "vyaw": 0.0}
+            elif action == "stand":
+                mode_ = "STAND"
+            elif action == "lie":
+                mode_ = "LIE"
+            elif action == "walk":
+                mode_ = "USERMODE"
+                target_vel = {
+                    "vx": float(data.get("vx", 0)),
+                    "vy": float(data.get("vy", 0)),
+                    "vyaw": float(data.get("vyaw", 0)),
+                }
+        except Exception as e:
+            print(f"[rl_subprocess] cmd error: {e}", flush=True)
+
+    sub = node.create_subscription(_String, cmd_topic, _on_cmd, _LOW_LAT_QOS)
+    print(f"[rl_subprocess] listening on {cmd_topic}", flush=True)
+
+    # Default PD gains
+    kp_stiff = [100.0] * 21
+    kd_stiff = [3.0] * 21
+    kp_soft = [20.0] * 21
+    kd_soft = [1.0] * 21
+
+    # Default standing pose
+    default_pos = [0.0] * 21
+
+    rate = _rclpy.rate.Rate(100)  # 100 Hz inference
+    while _rclpy.ok():
+        try:
+            if mode_ == "DEFAULT":
+                # Soft PD to default pose
+                cmds = []
+                for i in range(21):
+                    mc = MotorCmd()
+                    mc.motor_id = i
+                    mc.kp = kp_soft[i]
+                    mc.kd = kd_soft[i]
+                    mc.q = default_pos[i]
+                    mc.dq = 0.0
+                    mc.tau = 0.0
+                    cmds.append(mc)
+                ctrl.set_joint(cmds)
+
+            elif mode_ in ("LIE", "STAND", "USERMODE"):
+                # Get joint state
+                joint_state = ctrl.get_joint_state()
+                imu = ctrl.get_imu_data()
+
+                # Build observation vector
+                joint_pos = []
+                joint_vel = []
+                for i in range(21):
+                    joint_pos.append(float(joint_state[i].pos))
+                    joint_vel.append(float(joint_state[i].vel))
+
+                # Projected gravity from IMU
+                quat = [float(imu.ori[i]) for i in range(4)]
+                # Simple projected gravity calculation
+                projected_gravity = [
+                    2 * (quat[0] * quat[2] + quat[1] * quat[3]),
+                    2 * (quat[1] * quat[2] - quat[0] * quat[3]),
+                    1 - 2 * (quat[0] * quat[0] + quat[1] * quat[1]),
+                ]
+
+                # Fall protection
+                if projected_gravity[2] >= -0.3:
+                    mode_ = "DEFAULT"
+                    continue
+
+                # Build obs: projected_gravity(3) + joint_pos(21) + joint_vel(21) + velocity(3)
+                vx = max(-1.5, min(1.5, target_vel["vx"]))
+                vy = max(-1.0, min(1.0, target_vel["vy"]))
+                vyaw = max(-1.0, min(1.0, target_vel["vyaw"]))
+
+                obs = _np.array(
+                    projected_gravity + joint_pos + joint_vel + [vx, vy, vyaw],
+                    dtype=_np.float32,
+                ).reshape(1, -1)
+
+                # ONNX inference
+                outputs = session.run(None, {"obs": obs})
+                action = outputs[0][0]
+
+                # Apply action
+                cmds = []
+                for i in range(21):
+                    mc = MotorCmd()
+                    mc.motor_id = i
+                    mc.kp = kp_stiff[i]
+                    mc.kd = kd_stiff[i]
+                    mc.q = float(action[i])
+                    mc.dq = 0.0
+                    mc.tau = 0.0
+                    cmds.append(mc)
+                ctrl.set_joint(cmds)
+
+        except Exception as e:
+            print(f"[rl_subprocess] loop error: {e}", flush=True)
+
+        rate.spin_once()
+
+    ctrl = None
+
+
+class RlPolicyPlugin:
+    """RL policy walking control via ONNX model (subprocess)."""
+
+    PREFIX = "rl_policy"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor):
+        self._namespace = namespace
+        self._cmd_topic = f"/{namespace}/rl_cmd"
+        self._proc: subprocess.Popen | None = None
+        self._node = Node("bumi_rl_policy")
+        executor.add_node(self._node)
+        self._pub = self._node.create_publisher(String, self._cmd_topic, _LOW_LAT_QOS)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "rl_policy",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "Bumi RL policy walking — ONNX model-based reinforcement learning locomotion. State machine: DEFAULT→LIE→STAND→USERMODE(walk). Fall protection auto-recovers.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["read", "start", "stop", "stand", "lie", "walk"],
+                    },
+                    "vx": {"type": "number", "description": "Forward velocity [-1.5, 1.5]", "minimum": -1.5, "maximum": 1.5},
+                    "vy": {"type": "number", "description": "Lateral velocity [-1.0, 1.0]", "minimum": -1, "maximum": 1},
+                    "vyaw": {"type": "number", "description": "Turning velocity [-1.0, 1.0]", "minimum": -1, "maximum": 1},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "read": {"params": [], "description": "Check if RL subprocess is running"},
+                    "start": {"params": [], "description": "Start RL policy (enter LIE state)"},
+                    "stop": {"params": [], "description": "Stop RL policy (return to DEFAULT)"},
+                    "stand": {"params": [], "description": "Stand up from lying"},
+                    "lie": {"params": [], "description": "Lie down from standing"},
+                    "walk": {"params": ["vx", "vy", "vyaw"], "description": "Walk with velocity commands"},
+                },
+            },
+            "topic_out": [{"topic": self._cmd_topic, "format": "data/json"}],
+        }
+
+    def start(self) -> None:
+        import sys
+        self._proc = subprocess.Popen(
+            [sys.executable, "-c",
+             f"import sys; sys.path.insert(0, '/work'); from device import _rlpolicy_subprocess; _rlpolicy_subprocess({self._namespace!r})"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        def _fwd():
+            for line in self._proc.stdout:
+                print(line.decode(errors='replace').rstrip(), flush=True)
+        threading.Thread(target=_fwd, daemon=True).start()
+
+    def stop(self) -> None:
+        if self._proc:
+            # Send stop command first
+            msg = String()
+            msg.data = json.dumps({"action": "stop"})
+            self._pub.publish(msg)
+            time.sleep(0.1)
+            self._proc.terminate()
+            self._proc = None
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        args.pop('_tool_name', None)
+
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "read":
+            return {"state": "running" if self._proc and self._proc.poll() is None else "idle"}
+        if action == "start":
+            msg = String()
+            msg.data = json.dumps({"action": "start"})
+            self._pub.publish(msg)
+            return {"state": "starting"}
+        if action == "stop":
+            msg = String()
+            msg.data = json.dumps({"action": "stop"})
+            self._pub.publish(msg)
+            return {"state": "stopped"}
+        if action == "stand":
+            msg = String()
+            msg.data = json.dumps({"action": "stand"})
+            self._pub.publish(msg)
+            return {"state": "standing"}
+        if action == "lie":
+            msg = String()
+            msg.data = json.dumps({"action": "lie"})
+            self._pub.publish(msg)
+            return {"state": "lying"}
+        if action == "walk":
+            cmd = {
+                "action": "walk",
+                "vx": float(args.get("vx", 0)),
+                "vy": float(args.get("vy", 0)),
+                "vyaw": float(args.get("vyaw", 0)),
+            }
+            msg = String()
+            msg.data = json.dumps(cmd)
+            self._pub.publish(msg)
+            return {"state": "walking", "cmd": cmd}
         return None
