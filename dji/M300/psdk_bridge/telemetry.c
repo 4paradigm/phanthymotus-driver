@@ -185,6 +185,10 @@ static const char *_display_mode_text(int mode) {
     }
 }
 
+static int s_local_origin_valid = 0;
+static double s_local_origin_lat_deg = 0.0;
+static double s_local_origin_lon_deg = 0.0;
+
 int telemetry_get_json(char *buf, size_t buflen) {
     /* Convert quaternion to Euler angles */
     double q0 = s_quaternion.q0, q1 = s_quaternion.q1;
@@ -192,6 +196,9 @@ int telemetry_get_json(char *buf, size_t buflen) {
     double roll  = atan2(2.0*(q0*q1 + q2*q3), 1.0 - 2.0*(q1*q1 + q2*q2)) * 180.0 / M_PI;
     double pitch = asin(2.0*(q0*q2 - q3*q1)) * 180.0 / M_PI;
     double yaw   = atan2(2.0*(q0*q3 + q1*q2), 1.0 - 2.0*(q2*q2 + q3*q3)) * 180.0 / M_PI;
+    double roll_rad = roll * M_PI / 180.0;
+    double pitch_rad = pitch * M_PI / 180.0;
+    double yaw_rad = yaw * M_PI / 180.0;
 
     /* Use POSITION_FUSED as primary source (works in simulator),
      * fall back to GPS_POSITION if fused is 0 */
@@ -211,6 +218,22 @@ int telemetry_get_json(char *buf, size_t buflen) {
                      s_gps_detail.totalSatelliteNumberUsed > 0 ||
                      s_pos_fused.visibleSatelliteNumber > 0);
     double relative_alt = (double)s_alt_fused - (double)s_alt_home;
+    double local_x = 0.0;
+    double local_y = 0.0;
+    if (gps_valid) {
+        if (!s_local_origin_valid) {
+            s_local_origin_lat_deg = lat_deg;
+            s_local_origin_lon_deg = lon_deg;
+            s_local_origin_valid = 1;
+        }
+        double lat_rad = lat_deg * M_PI / 180.0;
+        double origin_lat_rad = s_local_origin_lat_deg * M_PI / 180.0;
+        double dlat_rad = (lat_deg - s_local_origin_lat_deg) * M_PI / 180.0;
+        double dlon_rad = (lon_deg - s_local_origin_lon_deg) * M_PI / 180.0;
+        double mean_lat = (lat_rad + origin_lat_rad) * 0.5;
+        local_x = dlon_rad * cos(mean_lat) * 6378137.0;
+        local_y = dlat_rad * 6378137.0;
+    }
 
     int battery_valid = s_battery_whole_valid || s_battery1_valid || s_battery2_valid;
     int battery_percent = 0;
@@ -277,9 +300,11 @@ int telemetry_get_json(char *buf, size_t buflen) {
         "{"
         "\"position\":{\"latitude\":%s,\"longitude\":%s,\"valid\":%s,"
         "\"altitude\":%.2f,\"altitude_gps\":%.2f,\"altitude_fused\":%.2f,"
-        "\"home_altitude\":%.2f,\"relative_altitude\":%.2f},"
+        "\"home_altitude\":%.2f,\"relative_altitude\":%.2f,"
+        "\"world_x\":%.3f,\"world_y\":%.3f,\"world_z\":%.3f},"
         "\"attitude\":{\"quaternion\":[%.4f,%.4f,%.4f,%.4f],"
-        "\"yaw\":%.2f,\"pitch\":%.2f,\"roll\":%.2f},"
+        "\"yaw\":%.2f,\"pitch\":%.2f,\"roll\":%.2f,"
+        "\"yaw_rad\":%.4f,\"pitch_rad\":%.4f,\"roll_rad\":%.4f},"
         "\"velocity\":{\"vx\":%.3f,\"vy\":%.3f,\"vz\":%.3f},"
         "\"battery\":{\"percent\":%s,\"voltage\":%s,\"valid\":%s,\"source\":\"%s\","
         "\"battery1\":{\"percent\":%s,\"voltage\":%s,\"valid\":%s},"
@@ -296,8 +321,9 @@ int telemetry_get_json(char *buf, size_t buflen) {
         /* GPS_POSITION: x=Longitude, y=Latitude, z=Altitude(mm) — per PSDK docs */
         lat_json, lon_json,
         gps_valid ? "true" : "false",
-        gps_alt, gps_alt, (double)s_alt_fused, (double)s_alt_home, relative_alt,
-        q0, q1, q2, q3, yaw, pitch, roll,
+        relative_alt, gps_alt, (double)s_alt_fused, (double)s_alt_home, relative_alt,
+        local_x, local_y, relative_alt,
+        q0, q1, q2, q3, yaw, pitch, roll, yaw_rad, pitch_rad, roll_rad,
         (double)s_velocity.data.x, (double)s_velocity.data.y, (double)s_velocity.data.z,
         battery_pct_json, battery_volt_json,
         battery_valid ? "true" : "false", battery_source,
@@ -363,8 +389,10 @@ int telemetry_get_json(char *buf, size_t buflen) {
     snprintf(buf, buflen,
         "{\"position\":{\"latitude\":39.9042,\"longitude\":116.4074,\"valid\":true,"
         "\"altitude\":0,\"altitude_gps\":0,\"altitude_fused\":0,"
-        "\"home_altitude\":0,\"relative_altitude\":0},"
-        "\"attitude\":{\"quaternion\":[1,0,0,0],\"yaw\":0,\"pitch\":0,\"roll\":0},"
+        "\"home_altitude\":0,\"relative_altitude\":0,"
+        "\"world_x\":0,\"world_y\":0,\"world_z\":0},"
+        "\"attitude\":{\"quaternion\":[1,0,0,0],\"yaw\":0,\"pitch\":0,\"roll\":0,"
+        "\"yaw_rad\":0,\"pitch_rad\":0,\"roll_rad\":0},"
         "\"velocity\":{\"vx\":0,\"vy\":0,\"vz\":0},"
         "\"battery\":{\"percent\":85,\"voltage\":22.8,\"valid\":true,\"source\":\"stub\","
         "\"battery1\":{\"percent\":85,\"voltage\":22.8,\"valid\":true},"
