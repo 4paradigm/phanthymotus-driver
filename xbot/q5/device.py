@@ -195,7 +195,7 @@ class _Q5Node(Node):
 class StatePlugin:
     """整机状态传感器 — joint_states / dynamic_joint_states / servo_pose / xbot_state."""
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
+    def __init__(self, plugin_config: dict, namespace: str, executor, client=None):
         self._ns = namespace
         self._node = _Q5Node("state")
         executor.add_node(self._node)
@@ -208,13 +208,13 @@ class StatePlugin:
 
         # Subscribers — subscribe to global topics (no namespace prefix)
         self._sub_joint = self._node.create_subscription(
-            JointState, "/joint_states", lambda m: self._pub_joint.publish(m), _RELIABLE_QOS)
+            JointState, "/joint_states", lambda m: self._pub_joint.publish(m), _LOW_LAT_QOS)
         self._sub_dynjoint = self._node.create_subscription(
-            DynamicJointState, "/dynamic_joint_states", lambda m: self._pub_dynjoint.publish(m), _RELIABLE_QOS)
+            DynamicJointState, "/dynamic_joint_states", lambda m: self._pub_dynjoint.publish(m), _LOW_LAT_QOS)
         self._sub_servo = self._node.create_subscription(
-            ServoPose, "/servo_poses", lambda m: self._pub_servo.publish(m), _RELIABLE_QOS)
+            ServoPose, "/servo_poses", lambda m: self._pub_servo.publish(m), _LOW_LAT_QOS)
         self._sub_status = self._node.create_subscription(
-            RobotStatus, "/xbot_state", self._on_robot_status, _RELIABLE_QOS)
+            RobotStatus, "/xbot_state", self._on_robot_status, _LOW_LAT_QOS)
 
         # /get_servo_poses service is not available on the real machine (empty output from ros2 service type).
         # Servo pose data is obtained from /servo_poses topic subscription instead.
@@ -267,7 +267,7 @@ class ImuPlugin:
     真机上可能收不到数据。
     """
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
+    def __init__(self, plugin_config: dict, namespace: str, executor, client=None):
         self._ns = namespace
         self._node = _Q5Node("imu")
         executor.add_node(self._node)
@@ -324,14 +324,14 @@ class ImuPlugin:
 class BatteryPlugin:
     """电池状态 — /battery_state (BatteryState)。"""
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
+    def __init__(self, plugin_config: dict, namespace: str, executor, client=None):
         self._ns = namespace
         self._node = _Q5Node("battery")
         executor.add_node(self._node)
 
         self._pub = self._node.create_publisher(BatteryState, f"/{self._ns}/battery_state", _RELIABLE_QOS)
         self._sub = self._node.create_subscription(
-            BatteryState, "/battery_state", self._on_battery, _RELIABLE_QOS)
+            BatteryState, "/battery_state", self._on_battery, _LOW_LAT_QOS)
 
         self._state = "idle"
         self._battery_info = None
@@ -383,7 +383,7 @@ class FaultsPlugin:
     /fault_aggregator/highest_level 是 UInt8 类型，作为故障等级指示。
     """
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
+    def __init__(self, plugin_config: dict, namespace: str, executor, client=None):
         self._ns = namespace
         self._node = _Q5Node("faults")
         executor.add_node(self._node)
@@ -459,7 +459,7 @@ class HandStatePlugin:
       righthumb[3], rightindex[3], rightmid[2], rightring[2], rightpinky[2]
     """
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
+    def __init__(self, plugin_config: dict, namespace: str, executor, client=None):
         self._ns = namespace
         self._node = _Q5Node("hand_state")
         executor.add_node(self._node)
@@ -527,7 +527,7 @@ class HandStatePlugin:
 class OdomPlugin:
     """底盘里程计 — /wr1_base_drive_controller/odom。"""
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
+    def __init__(self, plugin_config: dict, namespace: str, executor, client=None):
         self._ns = namespace
         self._node = _Q5Node("odom")
         executor.add_node(self._node)
@@ -535,7 +535,7 @@ class OdomPlugin:
         self._pub = self._node.create_publisher(Odometry, f"/{self._ns}/odom", _RELIABLE_QOS)
         self._sub = self._node.create_subscription(
             Odometry, "/wr1_base_drive_controller/odom",
-            lambda m: self._pub.publish(m), _RELIABLE_QOS)
+            lambda m: self._pub.publish(m), _LOW_LAT_QOS)
 
         self._state = "idle"
 
@@ -574,9 +574,10 @@ class OdomPlugin:
 class LocoPlugin:
     """底盘运动控制 — TwistStamped on /wr1_base_drive_controller/cmd_vel。"""
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
+    def __init__(self, plugin_config: dict, namespace: str, executor, client=None):
         self._ns = namespace
         self._node = _Q5Node("loco")
+        self._client = client
         executor.add_node(self._node)
 
         self._pub = self._node.create_publisher(
@@ -608,6 +609,12 @@ class LocoPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "move":
+            lifecycle_state = self._client.get_lifecycle_state() if hasattr(self, '_client') else "unknown"
+            if lifecycle_state != "active":
+                return {"state": "error", "message": "motion_manager lifecycle must be active", "lifecycle_state": lifecycle_state}
+            snap = self._client.snapshot() if hasattr(self, '_client') else {}
+            if not snap.get("fresh", False):
+                return {"state": "error", "message": "Refusing motion without fresh /joint_states"}
             vx = _clamp(args.get("vx", 0.0), -0.5, 0.5)
             vyaw = _clamp(args.get("vyaw", 0.0), -1.0, 1.0)
             duration = args.get("duration", 0)
@@ -649,7 +656,7 @@ class JointServoPlugin:
       - "servo" 模式：通过 ServoPose 控制双臂+头部目标位姿
     """
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
+    def __init__(self, plugin_config: dict, namespace: str, executor, client=None):
         self._ns = namespace
         self._node = _Q5Node("joint_servo")
         executor.add_node(self._node)
@@ -694,6 +701,10 @@ class JointServoPlugin:
         self._state = "idle"
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action in ("set_joint", "set_poses", "home"):
+            lifecycle_state = self._client.get_lifecycle_state() if hasattr(self, '_client') else "unknown"
+            if lifecycle_state != "active":
+                return {"state": "error", "message": "motion_manager lifecycle must be active", "lifecycle_state": lifecycle_state}
         if action == "set_joint":
             self._ensure_ready()
             name = args.get("joint_name")
@@ -839,7 +850,7 @@ class HandPlugin:
     通过 hand 参数控制单手，或不指定则控制双手。
     """
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
+    def __init__(self, plugin_config: dict, namespace: str, executor, client=None):
         self._ns = namespace
         self._node = _Q5Node("hand")
         executor.add_node(self._node)
@@ -878,6 +889,13 @@ class HandPlugin:
         self._state = "idle"
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action in ("set_joint", "grip", "open"):
+            lifecycle_state = self._client.get_lifecycle_state() if hasattr(self, '_client') else "unknown"
+            if lifecycle_state != "active":
+                return {"state": "error", "message": "motion_manager lifecycle must be active", "lifecycle_state": lifecycle_state}
+            snap = self._client.snapshot() if hasattr(self, '_client') else {}
+            if not snap.get("fresh", False):
+                return {"state": "error", "message": "Refusing hand control without fresh /joint_states"}
         if action == "set_joint":
             name = args.get("joint_name")
             pos = _clamp(args.get("position", 0.0), -1.57, 1.57)
@@ -931,7 +949,7 @@ class HandPlugin:
 class HeadPlugin:
     """头部控制 — 通过 HybridJointCommand 控制 neck_pitch_joint / neck_yaw_joint。"""
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
+    def __init__(self, plugin_config: dict, namespace: str, executor, client=None):
         self._ns = namespace
         self._node = _Q5Node("head")
         executor.add_node(self._node)
@@ -964,6 +982,10 @@ class HeadPlugin:
         self._state = "idle"
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action in ("set", "look_at"):
+            lifecycle_state = self._client.get_lifecycle_state() if hasattr(self, '_client') else "unknown"
+            if lifecycle_state != "active":
+                return {"state": "error", "message": "motion_manager lifecycle must be active", "lifecycle_state": lifecycle_state}
         if action == "set":
             name = args.get("joint_name", "neck_pitch_joint")
             if name not in ("neck_pitch_joint", "neck_yaw_joint"):
@@ -1002,7 +1024,7 @@ class HeadPlugin:
 class ArmPlugin:
     """双臂控制 — 通过 ServoPose 设置左右臂目标位姿。"""
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
+    def __init__(self, plugin_config: dict, namespace: str, executor, client=None):
         self._ns = namespace
         self._node = _Q5Node("arm")
         executor.add_node(self._node)
@@ -1034,6 +1056,10 @@ class ArmPlugin:
         self._state = "idle"
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action in ("set_pose", "home"):
+            lifecycle_state = self._client.get_lifecycle_state() if hasattr(self, '_client') else "unknown"
+            if lifecycle_state != "active":
+                return {"state": "error", "message": "motion_manager lifecycle must be active", "lifecycle_state": lifecycle_state}
         if action == "set_pose":
             return self._set_pose(args)
         if action == "home":
@@ -1112,7 +1138,7 @@ class HeadGesturePlugin:
         "reset": {"joint": None, "position": 0.0, "desc": "头部回中"},
     }
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
+    def __init__(self, plugin_config: dict, namespace: str, executor, client=None):
         self._ns = namespace
         self._node = _Q5Node("head_gesture")
         executor.add_node(self._node)
@@ -1143,6 +1169,9 @@ class HeadGesturePlugin:
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "gesture":
+            lifecycle_state = self._client.get_lifecycle_state() if hasattr(self, '_client') else "unknown"
+            if lifecycle_state != "active":
+                return {"state": "error", "message": "motion_manager lifecycle must be active", "lifecycle_state": lifecycle_state}
             name = args.get("gesture", "nod")
             if name not in self.GESTURES:
                 return {"state": "error", "message": f"Unknown gesture: {name}"}
@@ -1186,7 +1215,7 @@ class ArmGesturePlugin:
         "home": {"desc": "双臂回中"},
     }
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
+    def __init__(self, plugin_config: dict, namespace: str, executor, client=None):
         self._ns = namespace
         self._node = _Q5Node("arm_gesture")
         executor.add_node(self._node)
@@ -1216,6 +1245,9 @@ class ArmGesturePlugin:
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "gesture":
+            lifecycle_state = self._client.get_lifecycle_state() if hasattr(self, '_client') else "unknown"
+            if lifecycle_state != "active":
+                return {"state": "error", "message": "motion_manager lifecycle must be active", "lifecycle_state": lifecycle_state}
             name = args.get("gesture", "wave")
             if name not in self.GESTURES:
                 return {"state": "error", "message": f"Unknown gesture: {name}"}
@@ -1261,7 +1293,7 @@ class ArmGesturePlugin:
 class MotionPlugin:
     """运动管理 — /motion_manager/motion_request (MotionRequest)。"""
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
+    def __init__(self, plugin_config: dict, namespace: str, executor, client=None):
         self._ns = namespace
         self._node = _Q5Node("motion")
         executor.add_node(self._node)
@@ -1337,7 +1369,7 @@ class MotionPlugin:
 class GesturePlugin:
     """手势播放 — /gesture/upper_limb_play (topic) + stop_play/is_play (services)。"""
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
+    def __init__(self, plugin_config: dict, namespace: str, executor, client=None):
         self._ns = namespace
         self._node = _Q5Node("gesture")
         executor.add_node(self._node)
@@ -1371,6 +1403,9 @@ class GesturePlugin:
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "play":
+            lifecycle_state = self._client.get_lifecycle_state() if hasattr(self, '_client') else "unknown"
+            if lifecycle_state != "active":
+                return {"state": "error", "message": "motion_manager lifecycle must be active", "lifecycle_state": lifecycle_state}
             name = args.get("gesture_name", "")
             if not name:
                 return {"state": "error", "message": "gesture_name required"}
@@ -1418,7 +1453,7 @@ class AudioPlugin:
     + audio_player/is_play (Trigger)。
     """
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
+    def __init__(self, plugin_config: dict, namespace: str, executor, client=None):
         self._ns = namespace
         self._node = _Q5Node("audio")
         executor.add_node(self._node)
@@ -1569,7 +1604,7 @@ class SpeakerPlugin:
     因此音量控制通过 pyaudio 软件音量实现，播放通过 pyaudio 直接输出。
     """
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
+    def __init__(self, plugin_config: dict, namespace: str, executor, client=None):
         self._ns = namespace
         self._node = _Q5Node("speaker")
         executor.add_node(self._node)
@@ -1790,7 +1825,7 @@ class SpeakerPlugin:
 class LedPlugin:
     """LED 控制 — /led_control (UInt8)。"""
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
+    def __init__(self, plugin_config: dict, namespace: str, executor, client=None):
         self._ns = namespace
         self._node = _Q5Node("led")
         executor.add_node(self._node)
@@ -1847,7 +1882,7 @@ class NavPlugin:
       /navigate/is_license_verify  — StringMessage (额外发现)
     """
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
+    def __init__(self, plugin_config: dict, namespace: str, executor, client=None):
         self._ns = namespace
         self._node = _Q5Node("nav")
         executor.add_node(self._node)
@@ -1955,16 +1990,18 @@ class TeleopPlugin:
       /remote_control/trigger_play [std_msgs/msg/String]
     """
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
+    def __init__(self, plugin_config: dict, namespace: str, executor, client=None):
         self._ns = namespace
         self._node = _Q5Node("teleop")
         executor.add_node(self._node)
 
         self._pub_joy = self._node.create_publisher(Joy, "/send_remote/command", _LOW_LAT_QOS)
-        self._pub_radio = self._node.create_publisher(ChannelsMsg, "/loco/remoteControl/radio", _LOW_LAT_QOS)
+        self._pub_radio = self._node.create_publisher(ChannelsMsg, "/loco/remoteControl/radio", _RELIABLE_QOS)
 
         self._sub_joy = self._node.create_subscription(
             Joy, "/joy", self._on_joy, _LOW_LAT_QOS)
+        self._sub_radio = self._node.create_subscription(
+            ChannelsMsg, "/loco/remoteControl/radio", self._on_radio, _LOW_LAT_QOS)
 
         self._state = "idle"
 
@@ -2006,13 +2043,16 @@ class TeleopPlugin:
     def _on_joy(self, msg: Joy):
         self._pub_joy.publish(msg)
 
+    def _on_radio(self, msg: ChannelsMsg):
+        pass  # forward radio messages if needed by consumer
+
 
 # ── CameraPlugin (sensor) — placeholder ──────────────────────────────────────
 
 class CameraPlugin:
     """相机 — 预留实现，待确认相机 ROS2 topic 名称后补充。"""
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
+    def __init__(self, plugin_config: dict, namespace: str, executor, client=None):
         self._ns = namespace
         self._node = _Q5Node("camera")
         executor.add_node(self._node)
@@ -2055,7 +2095,7 @@ class SimpleActionsPlugin:
     SimpleActions Feedback: progress (float32)
     """
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
+    def __init__(self, plugin_config: dict, namespace: str, executor, client=None):
         self._ns = namespace
         self._node = _Q5Node("simple_actions")
         executor.add_node(self._node)
@@ -2130,7 +2170,7 @@ class SimpleTrajectoryPlugin:
 
     _TYPE_NAMES = {0: "ZERO", 1: "SIN_WAVE", 2: "LIFT_UP", 14: "MPC_INIT"}
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
+    def __init__(self, plugin_config: dict, namespace: str, executor, client=None):
         self._ns = namespace
         self._node = _Q5Node("simple_trajectory")
         executor.add_node(self._node)
@@ -2207,7 +2247,7 @@ class BehaviorPlugin:
       result 常量: CREATE_FAILED, EXECUTION_FAILED, INVALID_COMMAND, SUCCESS
     """
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
+    def __init__(self, plugin_config: dict, namespace: str, executor, client=None):
         self._ns = namespace
         self._node = _Q5Node("behavior")
         executor.add_node(self._node)
@@ -2277,7 +2317,7 @@ class GraspObjectPlugin:
     GraspObject Goal: arg (string), cmd (string)
     """
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
+    def __init__(self, plugin_config: dict, namespace: str, executor, client=None):
         self._ns = namespace
         self._node = _Q5Node("grasp")
         executor.add_node(self._node)
@@ -2348,7 +2388,7 @@ class MotionActionPlugin:
 
     _PRIORITY_NAMES = {}
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
+    def __init__(self, plugin_config: dict, namespace: str, executor, client=None):
         self._ns = namespace
         self._node = _Q5Node("motion_action")
         executor.add_node(self._node)
