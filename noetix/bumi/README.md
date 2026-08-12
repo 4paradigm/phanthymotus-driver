@@ -6,14 +6,15 @@ The bundle exposes the original Bumi sensor, locomotion, audio and camera cards 
 
 ### `motion_state`
 
-Read-only motion and safety state from `HighController`.
+Read-only whole-body motion telemetry from `HighController`.
 
-- `snapshot`: current workmode, protection flag, BMS summary and active motor errors.
-- `history`: recent changes in mode, BMS alarm or motor error state.
-- `clear_history`: clear the in-memory event history.
+- `snapshot` with `detail: summary`: current activity, workmode context, protection flag, body orientation, angular velocity, linear acceleration, grouped joint positions/velocities, motion statistics and active motor faults.
+- `snapshot` with `detail: joints`: the summary plus position, velocity, torque, temperature and error for all 21 joints.
+- `history`: recent motion-start/stop, mode, protection, controller-read and motor-fault events.
+- `clear_history`: clear the in-memory motion event history.
 - ROS2 output: `/<namespace>/motion/state`, JSON.
 
-Every snapshot identifies `Noetix HighController/CycloneDDS` as its source and includes an observation timestamp and freshness fields. A missing or failed read is not reported as a safe state.
+Every snapshot identifies `Noetix HighController/CycloneDDS` as its source and includes freshness and sample-age fields. It deliberately excludes battery data, which belongs to the existing `battery` card. The SDK does not expose world-frame position or translational velocity, so the card reports only documented IMU and joint measurements and does not invent odometry.
 
 ### `arm`
 
