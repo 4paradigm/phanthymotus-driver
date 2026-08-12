@@ -48,8 +48,9 @@ def _resolve_namespace(cfg: dict) -> str:
 # ── Bundle ────────────────────────────────────────────────────────────────────
 
 class Q5DeviceBundle:
-    def __init__(self, cfg: dict, namespace: str, executor):
+    def __init__(self, cfg: dict, namespace: str, executor, sdk_client=None):
         self._cfg = cfg
+        self._sdk_client = sdk_client
         self._plugins: list = []
         self._failed_plugins: list = []
         plugins_cfg = cfg.get("plugins", {})
@@ -90,7 +91,7 @@ class Q5DeviceBundle:
             try:
                 import device
                 cls = getattr(device, cls_name)
-                plugin = cls(plugins_cfg[key], namespace, executor, None)
+                plugin = cls(plugins_cfg[key], namespace, executor, self._sdk_client)
                 self._plugins.append(plugin)
                 print(f"[bundle] {cls_name} loaded")
             except Exception as e:
