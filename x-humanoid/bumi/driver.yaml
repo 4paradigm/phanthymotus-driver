@@ -1,9 +1,0 @@
-id: bumi-driver
-name: Bumi Edu Max Bundle
-category: driver
-hardware_provider: x-humanoid
-hardware_model: "bumi"
-image_name: bumi
-port: 15709
-mcp_url: "http://localhost:15709/mcp"
-description: "Bumi Edu Max — 21DOF 双足人形机器人 (双足行走 + 双臂 + 腰关节 + DDS 通信)"
