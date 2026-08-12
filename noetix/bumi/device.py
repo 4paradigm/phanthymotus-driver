@@ -8,6 +8,7 @@ drivers/noetix/bumi/device.py — Noetix Bumi-EDU 设备插件实现。
   - MicPlugin: 8ch mic capture → mono PCM 16kHz
   - SpeakerPlugin: audio playback via MediaController
   - CameraPlugin: Realsense D435i color + depth
+  - VideoPlugin: external video push + desensed video read (auto-start desensed)
 """
 
 import json
@@ -1336,6 +1337,7 @@ class VideoPlugin:
 
         self._external_topic = f"/{namespace}/video/external"
         self._desensed_topic = f"/{namespace}/video/desensed"
+        self._camera_color_topic = f"/{namespace}/camera/color"
 
         # external-video subprocess state
         self._proc_external: subprocess.Popen | None = None
@@ -1370,7 +1372,7 @@ class VideoPlugin:
             "multiInstance": False,
             "description": (
                 "Push external video to Bumi AI agent for recognition. "
-                "Opens USB camera or subscribes to ROS2 topic, converts to YUYV, "
+                "Subscribes to CameraPlugin color topic, converts to YUYV, "
                 f"calls publish_external_video_stream(). Also publishes JPEG to {self._external_topic}"
             ),
             "inputSchema": {
@@ -1378,30 +1380,22 @@ class VideoPlugin:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["push_from_camera", "push_from_topic", "stop_push",
+                        "enum": ["push_from_topic", "push_from_camera", "stop_push",
                                     "agent_enable", "agent_disable",
                                     "agent_external_enable", "agent_external_disable",
                                     "get_status"],
                     },
                     "camera_id": {
                         "type": "integer",
-                        "description": "USB camera device ID (default 0, e.g. /dev/video0)",
+                        "description": "USB camera device ID (default 4, only for push_from_camera)",
                         "minimum": 0,
-                    },
-                    "input_topic": {
-                        "type": "string",
-                        "description": "ROS2 CompressedImage JPEG topic to forward to agent (for push_from_topic)",
                     },
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "push_from_camera": {
-                        "params": ["camera_id"],
-                        "description": "Open USB camera, push YUYV frames to agent + publish JPEG to ROS2.",
-                    },
                     "push_from_topic": {
-                        "params": ["input_topic"],
-                        "description": "Subscribe to ROS2 JPEG topic, convert to YUYV, push to agent.",
+                        "params": [],
+                        "description": f"Subscribe to {self._camera_color_topic} from CameraPlugin, convert to YUYV, push to agent.",
                     },
                     "stop_push": {
                         "params": [],
@@ -1436,7 +1430,10 @@ class VideoPlugin:
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
     def start(self) -> None:
-        pass
+        # Canvas sensor lifecycle: auto-start desensed-video subprocess
+        self._start_desensed()
+        # Auto-enable routing for desensed data
+        self._media_ctrl.set_internal_capture_video_data_to_agent_enable(True)
 
     def stop(self) -> None:
         self._stop_external()
@@ -1537,9 +1534,8 @@ class VideoPlugin:
         import numpy as np
         import time as _t
 
-        input_topic = args.get("input_topic", "")
-        if not input_topic:
-            return {"error": "input_topic is required"}
+        # Default to CameraPlugin color topic
+        input_topic = args.get("input_topic", self._camera_color_topic)
 
         # Stop camera subprocess if running (only one push active at a time)
         self._stop_external()
