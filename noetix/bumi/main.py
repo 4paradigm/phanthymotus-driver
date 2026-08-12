@@ -326,7 +326,7 @@ def main():
     spin_thread = threading.Thread(target=_spin, daemon=True, name="bundle_spin")
     spin_thread.start()
 
-    _start_registration(mcp_port, "Noetix Bumi", "driver")
+    _start_registration(mcp_port, "bumi-fqy", "driver")
 
     server = ThreadingHTTPServer(("", mcp_port), make_handler())
     print(f"[bundle] MCP server → http://localhost:{mcp_port}")

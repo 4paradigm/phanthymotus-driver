@@ -3,7 +3,7 @@
 drivers/noetix/bumi/device.py — Noetix Bumi-EDU 设备插件实现。
 
 插件列表：
-  - StatePlugin: joints (21-DOF skeleton), imu, battery, model (URDF resource)
+  - StatePlugin: joints (21-DOF skeleton), motor-health, imu, battery, model (URDF resource)
   - LocoPlugin: loco (move/stop), switch_mode (mode transitions)
   - MicPlugin: 8ch mic capture → mono PCM 16kHz
   - SpeakerPlugin: audio playback via MediaController
@@ -50,6 +50,72 @@ _BUMI_JOINT_NAMES = [
     # 20: waist
     'waist_yaw_joint',
 ]
+
+# Motor-health uses the names defined by the Bumi SDK documentation. Keep this
+# mapping separate from the skeleton names above: the latter must match the
+# bundled URDF, while the health card is an API-facing diagnostic contract.
+_MOTOR_HEALTH_JOINT_NAMES = {
+    0: "arm_l1_joint",
+    1: "arm_l2_joint",
+    2: "arm_l3_joint",
+    3: "arm_l4_joint",
+    4: "leg_l1_joint",
+    5: "leg_l2_joint",
+    6: "leg_l3_joint",
+    7: "leg_l4_joint",
+    8: "leg_l5_joint",
+    9: "leg_l6_joint",
+    10: "arm_r1_joint",
+    11: "arm_r2_joint",
+    12: "arm_r3_joint",
+    13: "arm_r4_joint",
+    14: "leg_r1_joint",
+    15: "leg_r2_joint",
+    16: "leg_r3_joint",
+    17: "leg_r4_joint",
+    18: "leg_r5_joint",
+    19: "leg_r6_joint",
+    20: "waist_1_joint",
+}
+
+_MOTOR_ERROR_MESSAGES = {
+    0x02: "Motor over current",
+    0x03: "Motor under voltage",
+    0x04: "Encoder error",
+    0x06: "Brake voltage over",
+    0x07: "DRV driver error",
+    0x08: "Over voltage",
+    0x09: "Under voltage",
+    0x0A: "Over current",
+    0x0B: "MOS over temperature",
+    0x0C: "Coil over temperature",
+    0x0D: "Communication lost",
+    0x0E: "Overload",
+}
+
+
+def _build_motor_health(joint_state) -> dict:
+    """Convert the SDK's 21 MotorState values to the motor-health schema."""
+    faults = []
+    for index, motor in enumerate(joint_state):
+        motor_id = int(getattr(motor, "motor_id", index))
+        error = int(getattr(motor, "error", 0))
+        if error == 0:
+            continue
+
+        faults.append({
+            "joint": _MOTOR_HEALTH_JOINT_NAMES.get(motor_id, f"motor_{motor_id}"),
+            "motor_id": motor_id,
+            "code": f"0x{error:02X}",
+            "message": _MOTOR_ERROR_MESSAGES.get(error, "Unknown motor error"),
+            "temperature": int(getattr(motor, "temperature", 0)),
+        })
+
+    return {
+        "healthy": not faults,
+        "fault_count": len(faults),
+        "faults": faults,
+    }
 
 # ── ControlCmd Mapping ────────────────────────────────────────────────────────
 # Lazy-loaded from highcontrol_py.ControlCmd enum at runtime
@@ -114,13 +180,20 @@ class _BumiStateNode(Node):
         self._imu_topic     = f"/{namespace}/state/imu"
         self._battery_topic = f"/{namespace}/state/battery"
         self._joints_topic  = f"/{namespace}/state/joints"
+        self._motor_health_topic = f"/{namespace}/state/motor-health"
 
         self._imu_pub     = self.create_publisher(String, self._imu_topic,     _LOW_LAT_QOS)
         self._battery_pub = self.create_publisher(String, self._battery_topic, _LOW_LAT_QOS)
         self._joints_pub  = self.create_publisher(String, self._joints_topic,  _LOW_LAT_QOS)
+        self._motor_health_pub = self.create_publisher(String, self._motor_health_topic, _LOW_LAT_QOS)
 
         self._last_imu: dict = {}
         self._last_battery: dict = {}
+        self._last_motor_health: dict = {
+            "healthy": True,
+            "fault_count": 0,
+            "faults": [],
+        }
         self._lock = threading.Lock()
         self._running = False
         self._thread: threading.Thread | None = None
@@ -132,6 +205,14 @@ class _BumiStateNode(Node):
 
     def stop_polling(self):
         self._running = False
+
+    def get_motor_health(self) -> dict:
+        with self._lock:
+            return {
+                "healthy": self._last_motor_health["healthy"],
+                "fault_count": self._last_motor_health["fault_count"],
+                "faults": [dict(fault) for fault in self._last_motor_health["faults"]],
+            }
 
     def _poll_loop(self):
         last_joints_time = 0.0
@@ -181,6 +262,13 @@ class _BumiStateNode(Node):
                         "workmode": workmode,
                     })
                     self._joints_pub.publish(joints_out)
+
+                    motor_health = _build_motor_health(joint_state)
+                    with self._lock:
+                        self._last_motor_health = motor_health
+                    motor_health_out = String()
+                    motor_health_out.data = json.dumps(motor_health)
+                    self._motor_health_pub.publish(motor_health_out)
 
                 # Battery: 1 Hz
                 if now - last_bms_time >= self._BMS_INTERVAL:
@@ -241,6 +329,14 @@ class StatePlugin:
                 "topic_out": [{"topic": f"/{ns}/state/joints", "format": "sensor/skeleton"}],
             },
             {
+                "name": "motor-health",
+                "type": "sensor",
+                "multiInstance": False,
+                "description": f"Bumi motor health — active motor faults with joint, error code, message, and temperature. Publishes at 10Hz to /{ns}/state/motor-health",
+                "inputSchema": {"type": "object", "properties": {}},
+                "topic_out": [{"topic": f"/{ns}/state/motor-health", "format": "data/json"}],
+            },
+            {
                 "name": "model",
                 "type": "resource",
                 "multiInstance": False,
@@ -260,7 +356,17 @@ class StatePlugin:
             return {"state": "running"}
         if action == "stop":
             return {"state": "idle"}
+        if action == "motor-health":
+            return self._node.get_motor_health()
         if action == "info":
+            if args.get("_tool_name") == "motor-health":
+                return {
+                    "state": "running",
+                    "topic_out": [{
+                        "topic": f"/{self._namespace}/state/motor-health",
+                        "format": "data/json",
+                    }],
+                }
             return {"state": "running"}
         if action == "model":
             urdf_path = Path(__file__).parent / "resource" / "bumi_model.urdf"

@@ -1,6 +1,6 @@
 noetix-bumi:
   image: __IMAGE__
-  container_name: embodied-noetix-bumi
+  container_name: embodied-bumi-fqy
   network_mode: host
   ipc: host
   pid: host
