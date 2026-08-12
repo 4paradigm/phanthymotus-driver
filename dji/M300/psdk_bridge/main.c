@@ -487,6 +487,39 @@ static void *_psdk_start_thread(void *arg) {
 
 /* ── IPC Command Dispatcher ─────────────────────────────────────────────── */
 
+static const char *_perception_source_from_json(const char *raw_json) {
+    static const char *sources[] = {
+        "front_left", "front_right",
+        "back_left", "back_right",
+        "left_left", "left_right",
+        "right_left", "right_right",
+        "up_left", "up_right",
+        "down_left", "down_right",
+    };
+    static const char *legacy_directions[] = {
+        "front", "back", "left", "right", "up", "down",
+    };
+
+    /* The IPC client sends the selected source as a JSON string. Match the
+     * complete quoted value so e.g. front_left cannot be confused with left. */
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); ++i) {
+        char needle[64];
+        snprintf(needle, sizeof(needle), "\"%s\"", sources[i]);
+        if (strstr(raw_json, needle)) return sources[i];
+    }
+    /* Backward compatibility for clients that still send direction=front. */
+    for (size_t i = 0; i < sizeof(legacy_directions) / sizeof(legacy_directions[0]); ++i) {
+        char needle[32];
+        snprintf(needle, sizeof(needle), "\"%s\"", legacy_directions[i]);
+        if (strstr(raw_json, needle)) {
+            static char legacy_source[32];
+            snprintf(legacy_source, sizeof(legacy_source), "%s_left", legacy_directions[i]);
+            return legacy_source;
+        }
+    }
+    return "front_left";
+}
+
 static int _dispatch_cmd(const char *raw_json, const char *unused,
                          char *result, size_t result_size) {
 
@@ -858,23 +891,15 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
 
     /* Perception */
     if (strstr(raw_json, "\"start_perception\"")) {
-        const char *dir = strstr(raw_json, "\"back\"") ? "back" :
-                          (strstr(raw_json, "\"left\"") ? "left" :
-                          (strstr(raw_json, "\"right\"") ? "right" :
-                          (strstr(raw_json, "\"up\"") ? "up" :
-                          (strstr(raw_json, "\"down\"") ? "down" : "front"))));
-        int r = perception_start(dir, NULL);
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d,\"direction\":\"%s\"}}", r == 0 ? "true" : "false", r, dir);
+        const char *source = _perception_source_from_json(raw_json);
+        int r = perception_start(source, NULL);
+        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d,\"source\":\"%s\"}}", r == 0 ? "true" : "false", r, source);
         return 0;
     }
     if (strstr(raw_json, "\"stop_perception\"")) {
-        const char *dir = strstr(raw_json, "\"back\"") ? "back" :
-                          (strstr(raw_json, "\"left\"") ? "left" :
-                          (strstr(raw_json, "\"right\"") ? "right" :
-                          (strstr(raw_json, "\"up\"") ? "up" :
-                          (strstr(raw_json, "\"down\"") ? "down" : "front"))));
-        int r = perception_stop(dir);
-        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d,\"direction\":\"%s\"}}", r == 0 ? "true" : "false", r, dir);
+        const char *source = _perception_source_from_json(raw_json);
+        int r = perception_stop(source);
+        snprintf(result, result_size, "{\"ok\":%s,\"data\":{\"ret\":%d,\"source\":\"%s\"}}", r == 0 ? "true" : "false", r, source);
         return 0;
     }
 

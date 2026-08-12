@@ -8,28 +8,69 @@
 #include <jpeglib.h>
 
 static perception_image_cb_t s_image_cb = NULL;
-static const char *s_names[] = {"front", "back", "left", "right", "up", "down"};
-static int s_active[6] = {0};
-/* Each direction is a stereo pair. Expose only one physical camera per
- * direction, otherwise alternating left/right frames appear to jump. */
-static uint32_t s_selected_data_type[6] = {0};
-static int s_has_selected_data_type[6] = {0};
+static const char *s_direction_names[] = {"front", "back", "left", "right", "up", "down"};
+static const E_DjiPerceptionDirection s_directions[] = {
+    DJI_PERCEPTION_RECTIFY_FRONT, DJI_PERCEPTION_RECTIFY_REAR,
+    DJI_PERCEPTION_RECTIFY_LEFT, DJI_PERCEPTION_RECTIFY_RIGHT,
+    DJI_PERCEPTION_RECTIFY_UP, DJI_PERCEPTION_RECTIFY_DOWN,
+};
 
-static int _index_from_name(const char *name) {
-    for (int i = 0; i < 6; ++i) if (strcmp(name, s_names[i]) == 0) return i;
+/* One source identifies one physical camera in a stereo pair.  The numeric
+ * values are E_DjiPerceptionCameraPosition values from dji_perception.h. */
+static const char *s_source_names[] = {
+    "front_left", "front_right",
+    "back_left", "back_right",
+    "left_left", "left_right",
+    "right_left", "right_right",
+    "up_left", "up_right",
+    "down_left", "down_right",
+};
+static const int s_source_direction_index[] = {
+    0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5,
+};
+static const uint32_t s_source_data_types[] = {
+    RECTIFY_FRONT_LEFT, RECTIFY_FRONT_RIGHT,
+    RECTIFY_REAR_LEFT, RECTIFY_REAR_RIGHT,
+    RECTIFY_LEFT_LEFT, RECTIFY_LEFT_RIGHT,
+    RECTIFY_RIGHT_LEFT, RECTIFY_RIGHT_RIGHT,
+    RECTIFY_UP_LEFT, RECTIFY_UP_RIGHT,
+    RECTIFY_DOWN_LEFT, RECTIFY_DOWN_RIGHT,
+};
+
+static int s_active_source[12] = {0};
+static int s_subscribed_direction[6] = {0};
+
+static int _source_index_from_name(const char *name) {
+    for (int i = 0; i < 12; ++i) if (strcmp(name, s_source_names[i]) == 0) return i;
+    /* Keep old callers working: a direction-only request means its left eye. */
+    for (int i = 0; i < 6; ++i) {
+        if (strcmp(name, s_direction_names[i]) == 0) return i * 2;
+    }
     return -1;
 }
-static E_DjiPerceptionDirection _direction_from_index(int index) {
-    static const E_DjiPerceptionDirection dirs[] = {
-        DJI_PERCEPTION_RECTIFY_FRONT, DJI_PERCEPTION_RECTIFY_REAR,
-        DJI_PERCEPTION_RECTIFY_LEFT, DJI_PERCEPTION_RECTIFY_RIGHT,
-        DJI_PERCEPTION_RECTIFY_UP, DJI_PERCEPTION_RECTIFY_DOWN,
-    };
-    return dirs[index];
-}
-static int _index_from_direction(E_DjiPerceptionDirection direction) {
-    for (int i = 0; i < 6; ++i) if (_direction_from_index(i) == direction) return i;
+static int _direction_index_from_enum(E_DjiPerceptionDirection direction) {
+    for (int i = 0; i < 6; ++i) if (s_directions[i] == direction) return i;
     return -1;
+}
+static int _source_index_from_image(T_DjiPerceptionImageInfo info) {
+    int direction_index = _direction_index_from_enum(info.rawInfo.direction);
+    if (direction_index < 0) return -1;
+    for (int i = 0; i < 12; ++i) {
+        if (s_source_direction_index[i] == direction_index &&
+            s_source_data_types[i] == info.dataType) return i;
+    }
+    return -1;
+}
+static int _direction_has_active_source(int direction_index) {
+    for (int i = 0; i < 12; ++i) {
+        if (s_source_direction_index[i] == direction_index && s_active_source[i]) return 1;
+    }
+    return 0;
+}
+static int _active_direction_count(void) {
+    int count = 0;
+    for (int i = 0; i < 6; ++i) count += s_subscribed_direction[i] ? 1 : 0;
+    return count;
 }
 static int _encode_gray_jpeg(const char *path, uint8_t *gray, int width, int height) {
     char tmp[160];
@@ -48,42 +89,59 @@ static int _encode_gray_jpeg(const char *path, uint8_t *gray, int width, int hei
     return rename(tmp, path);
 }
 static void _image_cb(T_DjiPerceptionImageInfo info, uint8_t *data, uint32_t len) {
-    int index = _index_from_direction(info.rawInfo.direction);
-    if (index < 0 || !s_active[index] || !data || len < info.rawInfo.width * info.rawInfo.height) return;
-    /* DJI calls back both cameras of a stereo direction. dataType is the
-     * physical camera position; keep the first one seen for this stream. */
-    if (!s_has_selected_data_type[index]) {
-        s_selected_data_type[index] = info.dataType;
-        s_has_selected_data_type[index] = 1;
-        printf("[perception] %s selected stereo camera=%u\n", s_names[index], info.dataType);
-    }
-    if (info.dataType != s_selected_data_type[index]) return;
+    int source_index = _source_index_from_image(info);
+    if (source_index < 0 || !s_active_source[source_index] || !data ||
+        len < info.rawInfo.width * info.rawInfo.height) return;
     char path[128];
-    snprintf(path, sizeof(path), "/dev/shm/dji_perception_%s.jpg", s_names[index]);
+    snprintf(path, sizeof(path), "/dev/shm/dji_perception_%s.jpg", s_source_names[source_index]);
     _encode_gray_jpeg(path, data, info.rawInfo.width, info.rawInfo.height);
-    if (s_image_cb) s_image_cb(s_names[index], data, info.rawInfo.width, info.rawInfo.height);
+    if (s_image_cb) s_image_cb(s_source_names[source_index], data,
+                                info.rawInfo.width, info.rawInfo.height);
 }
 int perception_init(void) {
     T_DjiReturnCode rc = DjiPerception_Init();
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) { printf("[perception] init failed: 0x%08llX\n", (unsigned long long)rc); return -1; }
     printf("[perception] initialized\n"); return 0;
 }
-int perception_start(const char *direction, perception_image_cb_t cb) {
-    int index = _index_from_name(direction); if (index < 0) return -1;
-    int active = 0; for (int i = 0; i < 6; ++i) active += s_active[i];
-    if (!s_active[index] && active >= 2) { printf("[perception] at most two streams may be active\n"); return -1; }
+int perception_start(const char *source, perception_image_cb_t cb) {
+    int source_index = _source_index_from_name(source); if (source_index < 0) return -1;
+    int direction_index = s_source_direction_index[source_index];
+    if (s_active_source[source_index]) return 0;
+    if (!s_subscribed_direction[direction_index]) {
+        if (_active_direction_count() >= 2) {
+            printf("[perception] at most two directions may be active\n");
+            return -1;
+        }
+        T_DjiReturnCode rc = DjiPerception_SubscribePerceptionImage(
+            s_directions[direction_index], _image_cb);
+        if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+            printf("[perception] subscribe %s failed: 0x%08llX\n", source,
+                   (unsigned long long)rc);
+            return -1;
+        }
+        s_subscribed_direction[direction_index] = 1;
+    }
     s_image_cb = cb;
-    s_has_selected_data_type[index] = 0;
-    T_DjiReturnCode rc = DjiPerception_SubscribePerceptionImage(_direction_from_index(index), _image_cb);
-    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) { printf("[perception] subscribe %s failed: 0x%08llX\n", direction, (unsigned long long)rc); return -1; }
-    s_active[index] = 1; printf("[perception] subscribed %s\n", direction); return 0;
+    s_active_source[source_index] = 1;
+    printf("[perception] subscribed %s (dataType=%u)\n", s_source_names[source_index],
+           s_source_data_types[source_index]);
+    return 0;
 }
-int perception_stop(const char *direction) {
-    int index = _index_from_name(direction); if (index < 0) return -1;
-    DjiPerception_UnsubscribePerceptionImage(_direction_from_index(index));
-    s_active[index] = 0; return 0;
+int perception_stop(const char *source) {
+    int source_index = _source_index_from_name(source); if (source_index < 0) return -1;
+    int direction_index = s_source_direction_index[source_index];
+    if (!s_active_source[source_index]) return 0;
+    s_active_source[source_index] = 0;
+    if (!_direction_has_active_source(direction_index) && s_subscribed_direction[direction_index]) {
+        DjiPerception_UnsubscribePerceptionImage(s_directions[direction_index]);
+        s_subscribed_direction[direction_index] = 0;
+    }
+    return 0;
 }
-void perception_cleanup(void) { for (int i = 0; i < 6; ++i) if (s_active[i]) perception_stop(s_names[i]); DjiPerception_Deinit(); }
+void perception_cleanup(void) {
+    for (int i = 0; i < 12; ++i) if (s_active_source[i]) perception_stop(s_source_names[i]);
+    DjiPerception_Deinit();
+}
 #else
 int perception_init(void) { return 0; }
 int perception_start(const char *direction, perception_image_cb_t cb) { (void)direction; (void)cb; return 0; }
