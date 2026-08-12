@@ -113,8 +113,8 @@ def _probe_remote_mics(cfg: dict) -> list[dict]:
 
         # Step 1: Probe remote audio devices
         try:
-            result = _ssh("arecord -l")
-            devices = _parse_arecord_output(result.stdout + result.stderr)
+            result = _ssh("arecord -l 2>&1")
+            devices = _parse_arecord_output(result.stdout)
         except Exception as e:
             print(f"[ext_mic/probe] {ssh_host}: SSH probe failed: {e}")
             continue
@@ -149,25 +149,59 @@ def _probe_remote_mics(cfg: dict) -> list[dict]:
         except Exception as e:
             print(f"[ext_mic/probe] {ssh_host}: deploy failed: {e}")
 
-        # Step 3: Start audio_sender if not running (use first detected card)
+        # Step 3: Verify audio_sender is healthy (not just alive) via TCP data probe
         primary_card = devices[0]["card"]
+        healthy = False
         try:
-            check = _ssh("pgrep -f audio_sender.py")
-            if check.returncode != 0 or not check.stdout.strip():
-                _ssh(f"nohup python3 {sender_path} --port {port} --card {primary_card} "
-                     f"> /tmp/audio_sender.log 2>&1 &")
-                time.sleep(1)
-                verify = _ssh("pgrep -f audio_sender.py")
-                if verify.returncode == 0 and verify.stdout.strip():
-                    pid = verify.stdout.strip().splitlines()[0]
-                    print(f"[ext_mic/probe] {ssh_host}: started audio_sender (pid={pid}, card={primary_card}, port={port})")
-                else:
-                    print(f"[ext_mic/probe] {ssh_host}: WARNING: audio_sender did not start")
+            probe_cmd = (
+                f"python3 -c \""
+                f"import socket,sys;"
+                f"s=socket.socket();"
+                f"s.settimeout(3);"
+                f"s.connect(('127.0.0.1',{port}));"
+                f"d=s.recv(1024);"
+                f"s.close();"
+                f"sys.exit(0 if len(d)>0 else 1)\""
+            )
+            check = _ssh(probe_cmd, timeout=10)
+            healthy = (check.returncode == 0)
+        except Exception:
+            pass
+
+        if not healthy:
+            # Kill existing (might be zombie) + restart
+            try:
+                _ssh("pkill -9 -f audio_sender.py 2>/dev/null")
+            except Exception:
+                pass
+            time.sleep(3)  # wait for ALSA device release
+            # Deploy audio_sender.py if missing
+            try:
+                check = _ssh(f"test -f {sender_path} && echo EXISTS")
+                if "EXISTS" not in (check.stdout or ""):
+                    local_src = str(Path(__file__).parent / "audio_sender.py")
+                    subprocess.run(
+                        ["sshpass", "-p", ssh_pass, "scp",
+                         "-o", "StrictHostKeyChecking=no",
+                         local_src, f"{ssh_user}@{ssh_host}:{sender_path}"],
+                        check=True, timeout=15)
+                    print(f"[ext_mic/probe] {ssh_host}: deployed audio_sender.py")
+            except Exception as e:
+                print(f"[ext_mic/probe] {ssh_host}: deploy failed: {e}")
+            # Start fresh
+            _ssh(f"nohup python3 {sender_path} --port {port} --card {primary_card} "
+                 f"> /tmp/audio_sender.log 2>&1 &")
+            time.sleep(2)
+            verify = _ssh("pgrep -f audio_sender.py")
+            if verify.returncode == 0 and verify.stdout.strip():
+                pid = verify.stdout.strip().splitlines()[0]
+                print(f"[ext_mic/probe] {ssh_host}: restarted audio_sender (pid={pid}, card={primary_card}, port={port})")
             else:
-                pid = check.stdout.strip().splitlines()[0]
-                print(f"[ext_mic/probe] {ssh_host}: audio_sender already running (pid={pid})")
-        except Exception as e:
-            print(f"[ext_mic/probe] {ssh_host}: start failed: {e}")
+                print(f"[ext_mic/probe] {ssh_host}: WARNING: audio_sender did not start")
+        else:
+            check = _ssh("pgrep -f audio_sender.py")
+            pid = check.stdout.strip().splitlines()[0] if check.stdout.strip() else "?"
+            print(f"[ext_mic/probe] {ssh_host}: audio_sender healthy (pid={pid})")
 
         # Step 4: Build device list entries (name includes format info)
         for dev in devices:
