@@ -151,6 +151,26 @@ class SensorBusBridge:
 
     def refresh(self) -> dict[str, list[str]]:
         self._sensors = select_sensor_tools(self._mcp.list_tools())
+        # Fallback: if a sensor tool has no topic_out, derive topic name from tool name
+        for name in list(self._sensors.keys()):
+            pass  # already selected; topics list is non-empty due to select_sensor_tools
+        # Discover any sensor tools not yet mapped (no topic_out declared)
+        for tool in (self._mcp.list_tools() or []):
+            if not isinstance(tool, dict) or tool.get("type") != "sensor":
+                continue
+            tname = tool.get("name")
+            if not isinstance(tname, str) or not tname:
+                continue
+            topics = []
+            for entry in tool.get("topic_out") or []:
+                topic = entry.get("topic") if isinstance(entry, dict) else None
+                if isinstance(topic, str) and topic and topic not in topics:
+                    topics.append(topic)
+            if not topics:
+                # Derive a default topic from the sensor name
+                topics = [f"/q5_sensor_bridge/{tname}"]
+            if tname not in self._sensors:
+                self._sensors[tname] = topics
         return self.sensors
 
     def poll_once(self) -> int:
