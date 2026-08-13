@@ -1041,9 +1041,10 @@ class CameraPlugin:
 #
 # 算力板 Bumi 的视频数据流（参考 SDK demo test_media.py / example_media.cpp）：
 #
-#   摄像头/USB → YUYV帧 → publish_external_video_stream() → 运控板 Agent（识别+脱敏）
-#                                                              │
-#                                          get_video_capture_desensed_data() ←┘
+#   external-video: 摄像头/USB → YUYV帧 → publish_external_video_stream() → 运控板 Agent
+#                              │
+#   desensed-video: 音视频交互系统加工脱敏 → get_video_capture_desensed_data()
+#                   （官方：带算力板需持续推外部视频流才有脱敏流；实测不推也可能出运控板相机画面）
 #
 #   get_video_capture_data() / pause_video_capture() / resume_video_capture()
 #   仅不带算力板的 Bumi 可用，本插件不封装。
@@ -1253,10 +1254,14 @@ def _external_video_subprocess(namespace: str, camera_id: int):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _desensed_video_subprocess(namespace: str):
-    """Poll desensed (privacy-masked) video from robot agent, publish as JPEG to ROS2.
+    """Poll the desensed (privacy-masked) video stream, publish as JPEG to ROS2.
 
-    Only works while external video is being pushed via publish_external_video_stream().
-    Follows test_media.py desensed_video() pattern.
+    Reads get_video_capture_desensed_data() — the stream the robot's audio/video
+    interaction system produces by desensitizing its current video input. Per the
+    SDK docs, on a 算力板 Bumi this needs an active external video push
+    (external-video). In practice a frame may also appear without a push, when
+    set_internal_capture_video_data_to_agent_enable(True) routes the control-board
+    camera through. Follows test_media.py desensed_video() pattern.
     """
     import os as _os
     _os.environ.setdefault('CYCLONEDDS_URI', 'file:///work/noetix_sdk_bumi/config/dds.xml')
@@ -1292,7 +1297,7 @@ def _desensed_video_subprocess(namespace: str):
     media.set_internal_capture_video_data_to_agent_enable(True)
 
     print(f"[desensed_video] waiting for desensed frames → {topic}", flush=True)
-    print(f"[desensed_video] (requires active external video push)", flush=True)
+    print(f"[desensed_video] (desensed stream; per SDK docs needs external video push)", flush=True)
 
     frame_count = 0
     t_start = _time.monotonic()
@@ -1342,7 +1347,7 @@ class VideoPlugin:
 
     Tools:
       external-video (actuator) — push video + routing config
-      desensed-video (sensor)   — read back privacy-masked frames from agent
+      desensed-video (sensor)   — read the system's desensed (privacy-masked) video stream
     """
 
     PREFIX = "video"
@@ -1375,8 +1380,8 @@ class VideoPlugin:
                 "type": "sensor",
                 "multiInstance": False,
                 "description": (
-                    f"Bumi desensed (privacy-masked) video from robot agent — "
-                    f"only works while external video is being pushed. Publishes JPEG to {self._desensed_topic}"
+                    f"Bumi desensed (privacy-masked) video stream from the robot's audio/video system. "
+                    f"Per SDK docs, needs an active external video push. Publishes JPEG to {self._desensed_topic}"
                 ),
                 "inputSchema": {"type": "object", "properties": {}},
                 "topic_out": [{"topic": self._desensed_topic, "format": "image/jpeg"}],
@@ -1410,6 +1415,10 @@ class VideoPlugin:
                 },
                 "required": ["action"],
                 "x-action-params": {
+                    "push_from_camera": {
+                        "params": ["camera_id"],
+                        "description": "Open specified USB camera, convert frames to YUYV, push to agent.",
+                    },
                     "push_from_topic": {
                         "params": [],
                         "description": f"Subscribe to {self._camera_color_topic} from CameraPlugin, convert to YUYV, push to agent.",
@@ -1447,9 +1456,9 @@ class VideoPlugin:
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
     def start(self) -> None:
-        # Canvas sensor lifecycle: auto-start desensed-video subprocess
+        # Auto-start desensed-video subprocess (reads the desensed stream)
         self._start_desensed()
-        # Auto-enable routing for desensed data
+        # Enable internal capture → agent (also drives the desensed stream)
         self._media_ctrl.set_internal_capture_video_data_to_agent_enable(True)
 
     def stop(self) -> None:
