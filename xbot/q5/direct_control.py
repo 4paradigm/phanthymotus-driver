@@ -547,7 +547,7 @@ class ArmControlPlugin:
                 status=status,
             )
         # Direct HybridJointCommand control is owned by the vendor body
-        # controller after q5_control_mode completes. motion_manager is a
+        # controller after arm_control preparation completes. motion_manager is a
         # separate lifecycle node and may legitimately remain inactive.
         q5_ready, q5_status = q5_is_control_ready(self._client)
         if not q5_ready:
