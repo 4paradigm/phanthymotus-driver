@@ -585,17 +585,17 @@ class ControlledSpatialPlugin:
             q = 0
         return q
 
-    def _wait_for_localization(self, timeout: float = 30.0) -> bool:
-        """Wait until SLAM reports localization with sufficient quality (>= 50).
+    def _wait_for_localization(self, timeout: float = 10.0) -> bool:
+        """Wait until SLAM reports localization with sufficient quality (>= 40).
 
-        Returns True if quality >= 50, False if timeout but quality >= 30.
-        Quality < 30 means the robot likely isn't at the expected position on the map.
+        Returns True if quality >= 40, False if timeout.
+        Quality < 40 means the robot likely isn't at the expected position on the map.
         """
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if self._map_status == "localized":
                 q = self._get_localization_quality()
-                if q >= 50:
+                if q >= 40:
                     print(f"[ControlledSpatial] localization quality={q} ✓")
                     return True
                 print(f"[ControlledSpatial] localization quality={q}, waiting...")
@@ -840,22 +840,19 @@ class ControlledSpatialPlugin:
             self._active_map = map_name
             self._map_status = "localizing"
 
-            # Wait for localization to converge (up to 30s)
-            if not self._wait_for_localization(timeout=30.0):
+            # Wait for localization to converge (up to 10s)
+            if not self._wait_for_localization(timeout=10.0):
                 q = self._get_localization_quality()
-                if q < 30:
+                if q >= 40:
+                    self._map_status = "localized"
+                    return {"status": "loaded", "map_name": map_name, "map_path": map_path}
+                if q < 40:
                     return {
                         "status": "loaded_poor",
                         "map_name": map_name,
                         "map_path": map_path,
                         "error": f"Localization quality too low ({q}/100). Robot may not be at the map origin, or the map may be outdated. Try: 1) move robot to map origin and reload, 2) rebuild the map.",
                     }
-                return {
-                    "status": "loaded",
-                    "map_name": map_name,
-                    "map_path": map_path,
-                    "warning": f"Localization quality is marginal ({q}/100). Navigation may fail. Consider moving robot to map origin or rebuilding the map.",
-                }
             self._map_status = "localized"
             return {"status": "loaded", "map_name": map_name, "map_path": map_path}
 

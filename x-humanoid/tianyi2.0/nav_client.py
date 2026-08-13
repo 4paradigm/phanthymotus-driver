@@ -320,7 +320,11 @@ class SlamtecClient:
         """重定位（使用RecoverLocalizationAction运动行为）"""
         return self._post("/api/core/motion/v1/actions", {
             "action_name": "slamtec.agent.actions.RecoverLocalizationAction",
-            "options": {},
+            "options": {
+                "relocalization_options": {
+                    "recover_movement_type": "NoMove"
+                }
+            },
         })
 
     def set_pose_init(self, x: float, y: float, yaw: float) -> dict:
