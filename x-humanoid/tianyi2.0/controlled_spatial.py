@@ -246,7 +246,7 @@ class ControlledSpatialPlugin:
                 "properties": {
                     "password": {
                         "type": "string",
-                        "description": "受保护操作（建图、删除、增删虚拟墙/轨道/区域/POI等）所需的密码",
+                        "description": "受保护操作（建图、删除、增删虚拟墙/轨道/区域/POI等）所需的密码，初始密码为 123456",
                         "default": "123456",
                         "format": "password",
                         "scope": "shared",
