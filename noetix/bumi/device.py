@@ -59,7 +59,7 @@ _BUMI_JOINT_NAMES = [
 
 _POSTURE_ACTIONS = {
     "stand_up": ("FALLTOSTAND", {27}),
-    "lie_down": ("STANDTOFALL", {28, 30}),
+    "lie_prone": ("STANDTOFALL", {28, 30}),
 }
 
 _PRESET_ACTIONS = {
@@ -70,6 +70,7 @@ _PRESET_ACTIONS = {
     "dance_2": ("DANCE1", {31}),
     "dance_3": ("DANCE2", {32}),
     "wipe_tears": ("TEAR", {33}),
+    "reset": ("WALK", {2}),
 }
 
 _TEACHING_ACTIONS = {
@@ -77,7 +78,10 @@ _TEACHING_ACTIONS = {
     # ENDTEACH is deprecated. SAVETEACH finishes the recording and saves it.
     "finish_and_save_recording": ("SAVETEACH", {12, 14, 29}),
     "play_recording": ("PLAYTEACH", {23}),
+    "stop_playback": ("WALK", {2}),
 }
+
+_SEMANTIC_ACTION_WORKMODES = {5, 8, 9, 10, 31, 32, 33}
 
 _ControlCmd = None  # Lazy-loaded enum module
 
@@ -291,7 +295,7 @@ class LocoPlugin:
     def get_tools(self) -> list:
         return [
             self._loco_tool(),
-            self._stand_up_lie_down_tool(),
+            self._stand_up_lie_prone_tool(),
             self._semantic_action_tool(),
             self._action_recording_tool(),
             self._debug_workmode_tool(),
@@ -346,30 +350,34 @@ class LocoPlugin:
             "topic_out": [],
         }
 
-    def _stand_up_lie_down_tool(self) -> dict:
+    def _stand_up_lie_prone_tool(self) -> dict:
         return {
-            "name": "stand_up_lie_down",
+            "name": "stand_up_lie_prone",
             "type": "actuator",
             "multiInstance": False,
-            "description": "让 Bumi 从仰面平躺自主起身，或从正常站立姿态躺下收纳。卡片会自动完成内部使能/准备/行走模式切换；SDK 无法确认真实姿态，用户必须按 action 描述摆放机器人。错误姿态可能触发保护模式。",
+            "description": "让 Bumi 从仰面平躺自主起身，或从正常站立姿态趴下收纳。卡片会自动完成内部使能/准备/行走模式切换；SDK 无法确认真实姿态，用户必须按 action 描述摆放机器人。错误姿态可能触发保护模式。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
                         "enum": list(_POSTURE_ACTIONS),
-                        "description": "stand_up=自主起身：仅限机器人面朝上平躺、四肢自然放置、双腿伸直、脚底无异物，并在平坦防滑地面留出至少 3m×3m 无人无障碍空间；lie_down=躺下收纳：仅限机器人已稳定站立，并在平坦防滑地面留出至少 3m×3m 无人无障碍空间。",
+                        "description": "stand_up=自主起身：仅限机器人面朝上平躺、四肢自然放置、双腿伸直、脚底无异物，并在平坦防滑地面留出至少 3m×3m 无人无障碍空间；lie_prone=趴下收纳：仅限机器人已稳定站立，并在平坦防滑地面留出至少 3m×3m 无人无障碍空间。",
+                    },
+                    "standing_pose_confirmed": {
+                        "type": "boolean",
+                        "description": "仅 lie_prone 使用。执行前必须确认机器人正常稳定站立、地面平坦防滑且周围 3m×3m 无障碍；确认后填写 true。",
                     },
                 },
                 "required": ["action"],
                 "x-action-params": {
                     "stand_up": {
                         "params": [],
-                        "description": "从仰面平躺自主起身。调用即会自动准备内部模式并执行；调用前必须完成姿态和 3m×3m 环境检查。",
+                        "description": "仅从 disabled/enabled 状态自主起身。调用前必须由用户确认机器人仰面平躺且周围 3m×3m 安全；站立、准备、行走或动作状态下会拒绝执行。",
                     },
-                    "lie_down": {
-                        "params": [],
-                        "description": "从稳定站立姿态躺下收纳。调用即会自动准备内部模式并执行；调用前必须确认地面和 3m×3m 环境安全。",
+                    "lie_prone": {
+                        "params": ["standing_pose_confirmed"],
+                        "description": "仅从 walking 且 standing_pose_confirmed=true 时趴下收纳；其他工作模式不会发送动作命令。",
                     },
                 },
             },
@@ -385,7 +393,7 @@ class LocoPlugin:
                 "properties": {
                     "action": {
                         "type": "string", "enum": list(_PRESET_ACTIONS),
-                        "description": "wave=挥手；handshake=握手；cheer=欢呼；dance_1/dance_2/dance_3=三种出厂舞蹈；wipe_tears=擦眼泪。选择后立即执行。",
+                        "description": "wave=挥手；handshake=握手；cheer=欢呼；dance_1/dance_2/dance_3=三种出厂舞蹈；wipe_tears=擦眼泪；reset=终止/退出当前语义动作并返回 walking 模式。",
                     },
                 },
                 "required": ["action"],
@@ -399,6 +407,7 @@ class LocoPlugin:
                         "dance_2": "执行舞蹈 2。机器人属于盲舞，至少留出 3m×3m 平坦防滑空间。",
                         "dance_3": "执行舞蹈 3。机器人属于盲舞，至少留出 3m×3m 平坦防滑空间。",
                         "wipe_tears": "执行擦眼泪动作。确认机器人稳定站立且手臂周围无障碍物。",
+                        "reset": "结束当前语义动作并返回 workmode=2（walking），用于动作后复位。",
                     }.items()
                 },
             },
@@ -408,13 +417,13 @@ class LocoPlugin:
     def _action_recording_tool(self) -> dict:
         return {
             "name": "action_recording", "type": "actuator", "multiInstance": False,
-            "description": "录制、结束并保存或播放 Bumi 示教动作。start_recording 和 play_recording 会自动进入所需行走模式；finish_and_save_recording 只能在已开始录制后使用。示教时不得强推关节至限位，播放前须确认机器人稳定站立且周围空间安全。",
+            "description": "录制、结束并保存、播放或停止播放 Bumi 示教动作。start_recording 和 play_recording 会自动进入所需行走模式；finish_and_save_recording 只能在已开始录制后使用；stop_playback 用于在确认动作结束或需要中断时返回 walking。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string", "enum": list(_TEACHING_ACTIONS),
-                        "description": "start_recording=开始录制示教；finish_and_save_recording=结束当前录制并保存；play_recording=播放已保存的示教动作。",
+                        "description": "start_recording=开始录制示教；finish_and_save_recording=结束当前录制并保存；play_recording=播放已保存动作；stop_playback=停止播放并返回 walking。",
                     },
                     "recording_id": {
                         "type": "integer", "minimum": 0, "maximum": 65535,
@@ -426,6 +435,7 @@ class LocoPlugin:
                     "start_recording": {"params": [], "description": "自动准备模式后开始示教录制。确认机器人稳定站立；缓慢引导关节，禁止强推至机械限位。"},
                     "finish_and_save_recording": {"params": ["recording_id"], "description": "结束当前示教并保存到 recording_id。若尚未开始录制，则不会发送命令。"},
                     "play_recording": {"params": ["recording_id"], "description": "自动准备模式并播放 recording_id。确认该编号存在，机器人稳定站立，周围无人和障碍物。"},
+                    "stop_playback": {"params": [], "description": "仅在 workmode=23（play_teach）时发送 WALK，停止/退出播放并确认返回 walking；不会从失能、使能或准备状态自动补链。"},
                 },
             },
             "topic_out": [],
@@ -474,8 +484,8 @@ class LocoPlugin:
             return self._do_move(args)
         if tool_name == "loco" and action == "stop_move":
             return self._stop_move()
-        if tool_name == "stand_up_lie_down" and action in _POSTURE_ACTIONS:
-            return self._do_posture_action(action)
+        if tool_name == "stand_up_lie_prone" and action in _POSTURE_ACTIONS:
+            return self._do_posture_action(action, args)
         if tool_name == "semantic_action" and action in _PRESET_ACTIONS:
             return self._do_preset_action(action)
         if tool_name == "action_recording" and action in _TEACHING_ACTIONS:
@@ -556,8 +566,38 @@ class LocoPlugin:
             self._publish_cmd(0, 0, 0, _get_default_cmd(), 0)
         return {"state": "stopped"}
 
-    def _do_posture_action(self, action: str) -> dict:
+    def _do_posture_action(self, action: str, args: dict) -> dict:
         safety = self._safety_requirements(action)
+        if action == "lie_prone" and args.get("standing_pose_confirmed") is not True:
+            return {
+                "state": "error", "command_sent": False,
+                "requested_action": action,
+                "error": "standing_pose_confirmed=true is required after completing the physical pose and clearance check.",
+                "safety_requirements": safety,
+                "pose_verification": "The SDK cannot verify the physical pose. The confirmation must be provided by the operator.",
+            }
+
+        current_mode = int(self._high_ctrl.get_mode())
+        if current_mode == 26:
+            return self._protection_error(action, [], current_mode, safety)
+        allowed_modes = {0, 30} if action == "stand_up" else {2}
+        if current_mode not in allowed_modes:
+            return {
+                "state": "error", "command_sent": False,
+                "requested_action": action,
+                "current_workmode": current_mode,
+                "current_workmode_name": _WORKMODE_NAMES.get(current_mode, "unknown"),
+                "allowed_workmodes": [
+                    {"code": mode, "name": _WORKMODE_NAMES.get(mode, "unknown")}
+                    for mode in sorted(allowed_modes)
+                ],
+                "error": (
+                    "stand_up is allowed only from disabled or enabled mode after the robot has been placed face-up. It is blocked from ready, walking, and action modes to prevent a standing robot from collapsing."
+                    if action == "stand_up" else
+                    "lie_prone is allowed only from walking mode after stable standing has been confirmed."
+                ),
+                "safety_requirements": safety,
+            }
         target_mode = 1 if action == "stand_up" else 2
         prepared = self._prepare_workmode(target_mode, action)
         if prepared["state"] == "error":
@@ -569,6 +609,8 @@ class LocoPlugin:
 
     def _do_preset_action(self, action: str) -> dict:
         safety = self._safety_requirements(action)
+        if action == "reset":
+            return self._do_semantic_reset(safety)
         prepared = self._prepare_workmode(2, action)
         if prepared["state"] == "error":
             prepared["safety_requirements"] = safety
@@ -579,22 +621,24 @@ class LocoPlugin:
 
     def _do_teaching_action(self, action: str, args: dict) -> dict:
         safety = self._safety_requirements(action)
+        if action == "stop_playback":
+            return self._do_stop_playback(safety)
         recording_id = None
         if action in ("finish_and_save_recording", "play_recording"):
             if "recording_id" not in args:
                 return {
                     "state": "error", "command_sent": False,
-                    "error": f"{action} 必须填写 recording_id（0～65535）",
+                    "error": f"{action} requires recording_id in the range 0 to 65535",
                     "safety_requirements": safety,
                 }
             try:
                 recording_id = int(args["recording_id"])
             except (TypeError, ValueError):
                 return {"state": "error", "command_sent": False,
-                        "error": "recording_id 必须是整数", "safety_requirements": safety}
+                        "error": "recording_id must be an integer", "safety_requirements": safety}
             if not 0 <= recording_id <= 65535:
                 return {"state": "error", "command_sent": False,
-                        "error": "recording_id 必须在 0～65535 范围内", "safety_requirements": safety}
+                        "error": "recording_id must be in the range 0 to 65535", "safety_requirements": safety}
 
         if action == "finish_and_save_recording":
             mode = int(self._high_ctrl.get_mode())
@@ -606,7 +650,7 @@ class LocoPlugin:
                     "requested_action": action,
                     "current_workmode": mode,
                     "current_workmode_name": _WORKMODE_NAMES.get(mode, "unknown"),
-                    "error": "当前没有正在进行的示教录制；请先调用 start_recording，完成动作引导后再结束并保存",
+                    "error": "No action recording is currently active. Call start_recording first, guide the action, and then finish and save it.",
                     "safety_requirements": safety,
                 }
             steps = []
@@ -622,6 +666,98 @@ class LocoPlugin:
             action, command_name, expected_modes, steps, safety,
             index=recording_id or 0, recording_id=recording_id)
 
+    def _do_semantic_reset(self, safety: str) -> dict:
+        self._move_stop_event.set()
+        if self._move_thread and self._move_thread.is_alive():
+            self._move_thread.join(timeout=1)
+        current_mode = int(self._high_ctrl.get_mode())
+        if current_mode == 26:
+            return self._protection_error("reset", [], current_mode, safety)
+
+        if current_mode == 2:
+            return {
+                "state": "completed",
+                "command_sent": False,
+                "requested_action": "reset",
+                "confirmed": True,
+                "workmode": 2,
+                "workmode_name": "walking",
+                "preparation_steps": [],
+                "safety_requirements": safety,
+                "message": "The robot is already in walking mode; no command was sent.",
+            }
+
+        if current_mode == 23:
+            return {
+                "state": "error", "command_sent": False,
+                "requested_action": "reset",
+                "current_workmode": current_mode,
+                "current_workmode_name": "play_teach",
+                "error": "semantic_action.reset does not control action recording playback. Use action_recording.stop_playback instead.",
+                "safety_requirements": safety,
+            }
+
+        if current_mode not in _SEMANTIC_ACTION_WORKMODES:
+            return {
+                "state": "error", "command_sent": False,
+                "requested_action": "reset",
+                "current_workmode": current_mode,
+                "current_workmode_name": _WORKMODE_NAMES.get(current_mode, "unknown"),
+                "allowed_workmodes": sorted(_SEMANTIC_ACTION_WORKMODES),
+                "error": "reset is allowed only while a semantic action is active. It will not enable the robot or enter ready/walking mode from disabled, enabled, ready, prone, or unknown physical states.",
+                "safety_requirements": safety,
+            }
+
+        return self._send_walk_exit("reset", safety)
+
+    def _do_stop_playback(self, safety: str) -> dict:
+        current_mode = int(self._high_ctrl.get_mode())
+        if current_mode == 26:
+            return self._protection_error("stop_playback", [], current_mode, safety)
+        if current_mode == 2:
+            return {
+                "state": "completed", "command_sent": False,
+                "requested_action": "stop_playback",
+                "confirmed": True,
+                "workmode": 2,
+                "workmode_name": "walking",
+                "safety_requirements": safety,
+                "message": "Playback has already exited to walking mode; no command was sent.",
+            }
+        if current_mode != 23:
+            return {
+                "state": "error", "command_sent": False,
+                "requested_action": "stop_playback",
+                "current_workmode": current_mode,
+                "current_workmode_name": _WORKMODE_NAMES.get(current_mode, "unknown"),
+                "error": "stop_playback is allowed only from play_teach mode. It will not enter walking mode from another physical or workmode state.",
+                "safety_requirements": safety,
+            }
+        return self._send_walk_exit("stop_playback", safety)
+
+    def _send_walk_exit(self, requested_action: str, safety: str) -> dict:
+        observed = self._send_edge_and_wait(
+            _get_control_cmd("WALK"), {2, 26}, timeout_s=3.0)
+        if observed == 26:
+            return self._protection_error(
+                requested_action, [], observed, safety, command_sent=True)
+        confirmed = observed == 2
+        return {
+            "state": "completed" if confirmed else "accepted",
+            "command_sent": True,
+            "requested_action": requested_action,
+            "confirmed": confirmed,
+            "workmode": observed,
+            "workmode_name": _WORKMODE_NAMES.get(observed, "unknown"),
+            "preparation_steps": [],
+            "safety_requirements": safety,
+            "message": (
+                "The active action was exited and walking mode was confirmed."
+                if confirmed else
+                "The WALK exit command was sent, but walking mode was not observed within 3 seconds."
+            ),
+        }
+
     def _do_debug_workmode(self, action: str) -> dict:
         current_mode = int(self._high_ctrl.get_mode())
         if action == "enable":
@@ -633,7 +769,7 @@ class LocoPlugin:
                     "requested_action": action,
                     "current_workmode": current_mode,
                     "current_workmode_name": _WORKMODE_NAMES.get(current_mode, "unknown"),
-                    "error": "enable 仅允许从 workmode=30（失能）执行；当前状态下不发送 START，避免其切换语义造成意外失能",
+                    "error": "enable is allowed only from workmode 30 (disabled). START was not sent because its toggle behavior could disable the robot unexpectedly.",
                 }
             command_name, expected_modes = "START", {0}
         elif action == "disable":
@@ -672,9 +808,9 @@ class LocoPlugin:
             "workmode": observed,
             "workmode_name": _WORKMODE_NAMES.get(observed, "unknown"),
             "message": (
-                "已确认目标工作模式" if confirmed and command_sent else
-                "机器人已经处于目标工作模式，未重复发送命令" if confirmed else
-                "命令已发送，但 3 秒内未观察到目标工作模式"
+                "The target workmode was confirmed." if confirmed and command_sent else
+                "The robot is already in the target workmode; no command was sent." if confirmed else
+                "The command was sent, but the target workmode was not observed within 3 seconds."
             ),
         }
         if command_name:
@@ -706,14 +842,14 @@ class LocoPlugin:
             if mode not in stable_modes:
                 return self._preparation_error(
                     requested_action, steps, mode,
-                    "机器人当前动作尚未结束，未继续切换内部模式；请等待动作完成后重试")
+                    "The current robot action has not finished. No further mode transition was sent; wait for the action to finish and try again.")
 
         if mode == 30:
             mode = self._run_preparation_step("enable", "START", {0}, steps)
             if mode == 26:
                 return self._protection_error(requested_action, steps, mode)
             if mode != 0:
-                return self._preparation_error(requested_action, steps, mode, "机器人未能进入使能状态")
+                return self._preparation_error(requested_action, steps, mode, "The robot did not enter enabled mode.")
 
         if target_mode == 1 and mode == 2:
             mode = self._run_preparation_step("prepare", "SWITCH", {1}, steps)
@@ -724,7 +860,7 @@ class LocoPlugin:
             return self._protection_error(requested_action, steps, mode)
         if target_mode == 1:
             if mode != 1:
-                return self._preparation_error(requested_action, steps, mode, "机器人未能进入起身所需的准备状态")
+                return self._preparation_error(requested_action, steps, mode, "The robot did not enter the ready mode required for standing up.")
             return {"state": "completed", "steps": steps, "workmode": mode}
 
         if mode == 1:
@@ -732,7 +868,7 @@ class LocoPlugin:
         if mode == 26:
             return self._protection_error(requested_action, steps, mode)
         if mode != 2:
-            return self._preparation_error(requested_action, steps, mode, "机器人未能进入动作所需的行走状态")
+            return self._preparation_error(requested_action, steps, mode, "The robot did not enter the walking mode required for this action.")
         return {"state": "completed", "steps": steps, "workmode": mode}
 
     def _run_preparation_step(self, step: str, command_name: str,
@@ -769,15 +905,22 @@ class LocoPlugin:
             "workmode_name": _WORKMODE_NAMES.get(observed, "unknown"),
             "preparation_steps": preparation_steps,
             "safety_requirements": safety_requirements,
-            "pose_verification": "SDK 仅提供 workmode，不能确认机器人真实姿态；姿态和周围环境必须由用户检查",
+            "pose_verification": "The SDK exposes only workmode and cannot verify the robot's physical pose. The user must check the pose and surrounding area.",
             "message": (
-                "已观察到目标动作模式，动作正在执行；此返回不代表物理动作已经完成"
+                "The target action mode was observed and the action is running. This response does not mean the physical action has completed."
                 if confirmed else
-                "命令已发送，但 3 秒内未观察到目标动作模式；请检查机器人实际状态和 motion_state"
+                "The command was sent, but the target action mode was not observed within 3 seconds. Check the robot and motion_state."
             ),
         }
         if recording_id is not None:
             result["recording_id"] = recording_id
+        if requested_action == "play_recording":
+            result["completion_note"] = (
+                "The SDK reports that playback entered play_teach mode but provides no documented physical-completion event. The card does not send WALK automatically because that could interrupt a recording that is still playing."
+            )
+            result["next_action"] = (
+                "After the motion has visibly finished, or if playback must be interrupted, call action_recording.stop_playback to return to walking mode."
+            )
         return result
 
     @staticmethod
@@ -790,7 +933,7 @@ class LocoPlugin:
             "current_workmode_name": _WORKMODE_NAMES.get(mode, "unknown"),
             "preparation_steps": steps,
             "error": message,
-            "message": "目标动作未发送；请检查机器人姿态、地面和周围空间后重试",
+            "message": "The requested action was not sent. Check the robot pose, floor, and surrounding clearance before trying again.",
         }
 
     @staticmethod
@@ -805,8 +948,8 @@ class LocoPlugin:
             "current_workmode_name": "protection",
             "protection": True,
             "preparation_steps": steps,
-            "error": "机器人已进入保护模式，动作无法继续",
-            "recovery": "请停止操作并重启机器人；重启前将机器人面朝上平躺于平坦防滑地面，四肢自然放置，脚底无异物，并确保周围至少 3m×3m 无人和障碍物，再执行 stand_up",
+            "error": "The robot has entered protection mode and the action cannot continue.",
+            "recovery": "Stop operating and restart the robot. Before restarting, place it face-up on a flat, non-slip floor with its limbs naturally positioned and no objects under its feet. Clear at least a 3 m x 3 m area, then run stand_up.",
         }
         if safety_requirements:
             result["safety_requirements"] = safety_requirements
@@ -815,16 +958,20 @@ class LocoPlugin:
     @staticmethod
     def _safety_requirements(action: str) -> str:
         if action == "stand_up":
-            return "只能在机器人面朝上平躺、四肢自然放置、双腿伸直、脚底无异物，地面平坦防滑且周围至少 3m×3m 无人无障碍物时使用"
-        if action == "lie_down":
-            return "只能在机器人正常稳定站立，地面平坦防滑且周围至少 3m×3m 无人无障碍物时使用"
+            return "Use only when the robot is lying face-up with its limbs naturally positioned, legs straight, no objects under its feet, on a flat non-slip floor, with at least a clear 3 m x 3 m area."
+        if action == "lie_prone":
+            return "Use only when the robot is standing normally and steadily on a flat non-slip floor, with at least a clear 3 m x 3 m area."
         if action in {"dance_1", "dance_2", "dance_3", "play_recording"}:
-            return "只能在机器人正常稳定站立、双脚着地，地面平坦防滑且周围至少 3m×3m 无人无障碍物时使用"
+            return "Use only when the robot is standing normally and steadily with both feet on a flat non-slip floor, with at least a clear 3 m x 3 m area."
         if action == "start_recording":
-            return "确认机器人稳定站立、地面平坦防滑且有人看护；缓慢引导关节，禁止强推、快速扭转或越过机械限位"
+            return "Make sure the robot is standing steadily on a flat non-slip floor under supervision. Guide joints slowly; never force, twist quickly, or exceed mechanical limits."
         if action == "finish_and_save_recording":
-            return "仅在已经调用 start_recording 且示教动作已完成时使用；保存期间不要继续搬动机器人"
-        return "只能在机器人正常稳定站立、双脚着地，地面平坦防滑且动作范围内无人和障碍物时使用"
+            return "Use only after start_recording has been called and action guidance is finished. Do not move the robot while the recording is being saved."
+        if action == "stop_playback":
+            return "Use after the recorded motion has visibly finished, or when playback must be interrupted. Keep the robot supported on a flat non-slip floor with a clear movement area."
+        if action == "reset":
+            return "Keep the robot standing with both feet on a flat non-slip floor and keep people and obstacles outside its movement range while returning to walking mode."
+        return "Use only when the robot is standing normally and steadily with both feet on a flat non-slip floor, with no people or obstacles in its movement range."
 
     def _wait_for_workmode(self, expected_modes: set[int], timeout_s: float) -> int:
         deadline = time.monotonic() + timeout_s

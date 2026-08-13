@@ -28,8 +28,8 @@ The former `switch_mode` tool is split into three user-facing cards. Internal
 `enable`, `ready` and `walk` transitions are completed automatically and are no
 longer exposed as user choices:
 
-- `stand_up_lie_down`: `stand_up` from a face-up lying pose, or `lie_down` from a
-  stable standing pose;
+- `stand_up_lie_prone`: `stand_up` from a face-up lying pose, or `lie_prone`
+  from a stable standing pose into the prone storage posture;
 - `semantic_action`: wave, handshake, cheer, three dances and wipe-tears;
 - `action_recording`: start recording, finish and save a recording, or play a
   saved recording by `recording_id`.
@@ -42,6 +42,23 @@ physical pose. An observed target action mode returns `running`, not
 finished. If any preparation or action enters protection mode, the card stops
 the sequence and tells the user to restart, place Bumi face-up on a flat,
 non-slip surface with a clear 3 m × 3 m area, and then use `stand_up`.
+
+`semantic_action.reset` exits or interrupts an active semantic action and
+returns the robot to workmode 2 (`walking`). It is accepted only from semantic
+action workmodes, or treated as a no-op when already walking. It never promotes
+disabled, enabled or ready modes into walking because the SDK cannot verify the
+physical pose.
+
+`stand_up` is accepted only from disabled or enabled mode and its description
+requires the operator to place the robot face-up before calling it. `lie_prone` requires
+`standing_pose_confirmed=true` and is accepted only from walking mode. These
+guards prevent a standing robot from receiving the get-up trajectory.
+
+`play_recording` remains `running` after play-teach mode is observed. The SDK
+does not document a physical playback-completion event, so the driver does not
+send `WALK` on a guessed timeout. After visible completion, or to interrupt
+playback, use `action_recording.stop_playback`; it is accepted only from
+play-teach mode and confirms the return to walking.
 
 `finish_and_save_recording` maps to the supported `SAVETEACH` command. The
 vendor-deprecated `ENDTEACH` command and unavailable `RUN` command remain
