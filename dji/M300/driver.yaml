@@ -1,0 +1,9 @@
+id: dji-m300
+name: DJI Matrice 300 RTK Bundle
+category: driver
+hardware_provider: dji
+hardware_model: "matrice300"
+image_name: dji-m300
+port: 15702
+mcp_url: "http://localhost:15702/mcp"
+description: "DJI Matrice 300 RTK — 飞行控制 + 遥测 + 感知 + HMS + 飞机信息"
