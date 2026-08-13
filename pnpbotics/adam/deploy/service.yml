@@ -15,7 +15,6 @@ pnpbotics-adam:
     - PYTHONUNBUFFERED=1
     - GRPC_HOST=localhost
     - GRPC_PORT=6666
-    - NETWORK_INTERFACE=eth0
   logging:
     driver: local
     options:
