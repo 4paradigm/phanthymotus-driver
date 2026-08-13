@@ -1,0 +1,29 @@
+mcp_port: 15716
+ros_namespace: ""
+name: "云深处山猫 M20"
+model_variant: "standard"
+velocity_command_timeout: 0.5
+ros:
+  robot_domain_id: 0
+  core_domain_id: 42
+  robot_interface: "eth0"
+basic_server:
+  enabled: true
+  host: "10.21.31.103"
+  udp_port: 30000
+  tcp_port: 30001
+  timeout: 1.5
+topics:
+  motion_info: "/MOTION_INFO"
+  motion_state: "/MOTION_STATE"
+  gait: "/GAIT"
+  nav_cmd: "/NAV_CMD"
+  imu: "/IMU"
+  lidar: "/LIDAR/POINTS"
+  lidar_rear: "/LIDAR/POINTS2"
+  hard_estop: "/HES_STATUS"
+  charge: "/CHARGE"
+  charge_status: "/CHARGE_STATUS"
+  gps: "/GPS"
+  joints: "/JOINTS_DATA"
+  odometry: "/ODOM"
