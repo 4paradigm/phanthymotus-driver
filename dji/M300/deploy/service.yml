@@ -1,6 +1,8 @@
 dji-m300:
   image: __IMAGE__
-  container_name: dji-m300
+  # Agent Core derives the driver container name as embodied-<driver_id>.
+  # The registered M300 driver id is dji-matrice300.
+  container_name: embodied-dji-matrice300
   network_mode: host
   ipc: host
   privileged: true
