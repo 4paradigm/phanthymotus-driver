@@ -77,6 +77,33 @@ queue latency, rolling RPC p50/p95/p99/max values, rejection reasons, and the
 last confirmed proposal stop. The `last_set_velocity_duration_ms` value is
 measured RPC time, not the proposal TTL budget.
 
+### G1 Navigation Sensors
+
+The read-only `navigation_sensors` Driver plugin launches an isolated worker
+process which subscribes directly to the MID360 raw DDS streams instead of
+converting the body `/ubuntu/state/imu` JSON. Keeping raw LiDAR conversion and
+IMU forwarding out of the full Driver process prevents the legacy LiDAR,
+camera, and MCP threads from starving navigation input callbacks. The worker
+publishes two algorithm-independent navigation sensor topics:
+
+- `/ubuntu/navigation/lidar` — `sensor_msgs/msg/PointCloud2`,
+  RELIABLE + KEEP_LAST(2), with `x/y/z/intensity/tag/line/timestamp` fields;
+- `/ubuntu/navigation/imu` — `sensor_msgs/msg/Imu`, RELIABLE + KEEP_LAST(200);
+
+LiDAR and IMU retain their shared MID360 source clock and are normalized into
+one ROS system-time domain. Samples are dropped while clock offset estimation
+is not ready or after an invalid/reset observation; the Driver never invents a
+source timestamp. The fixed upside-down mounting rotation is applied equally
+to cloud and IMU. The existing `/ubuntu/lidar/cloud` legacy card remains
+enabled for Canvas and safety consumers.
+
+Navigation consumers such as LiDAR-inertial mapping and path planning can bind
+to these topics without the Driver naming or selecting a specific algorithm.
+The body IMU JSON is approximately 20 Hz, has no source timestamp, and is not a
+valid substitute for the MID360 built-in IMU. Before accepting a navigation
+run, verify the isolated worker delivers approximately 10 Hz LiDAR and 200 Hz
+IMU; materially lower rates or repeated source-stamp gaps invalidate the run.
+
 ## Writing a New Driver
 
 Want to add support for new hardware? See the **[Driver Development Guide](README_dev.md)** for the full specification, including:
