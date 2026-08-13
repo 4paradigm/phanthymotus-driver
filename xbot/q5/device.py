@@ -1,8 +1,7 @@
-"""Verified non-motion cards for the RobotEra Q5 bundle.
+"""Verified sensor and audio cards for the RobotEra Q5 bundle.
 
 Direct base, arm, head, and hand cards live in ``direct_control.py``. This
-module contains the verified state, battery, audio, D455 camera, and SLAM map
-cards.
+module contains the verified state, battery, audio, and D455 camera cards.
 """
 
 from __future__ import annotations
@@ -46,6 +45,205 @@ _LATEST_QOS = QoSProfile(
     depth=1,
     durability=DurabilityPolicy.VOLATILE,
 )
+
+_REMOTE_AUDIO_LOCK = threading.Lock()
+_REMOTE_AUDIO_READY = False
+
+
+def _q5_ssh_args(command: str):
+    return [
+        "sshpass", "-p", "developer", "ssh", "-p", "2222",
+        "-o", "PreferredAuthentications=password", "-o", "PubkeyAuthentication=no",
+        "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null", "developer@192.168.8.100",
+        f"bash -lc {shlex.quote(command)}",
+    ]
+
+
+def _q5_remote_command(command: str, timeout: float = 20.0, stdin=None):
+    """Run a noninteractive command in Q5's documented developer container."""
+    return subprocess.run(_q5_ssh_args(command), input=stdin, capture_output=True, timeout=timeout)
+
+
+def _ensure_remote_audio_tools():
+    """Install the minimal ALSA tools missing from a stock Q5 developer container."""
+    global _REMOTE_AUDIO_READY
+    with _REMOTE_AUDIO_LOCK:
+        if _REMOTE_AUDIO_READY:
+            return
+        command = (
+            "command -v arecord >/dev/null && command -v aplay >/dev/null || "
+            "(echo developer | sudo -S apt-get -o Acquire::Retries=3 update && "
+            "echo developer | sudo -S apt-get install -y --no-install-recommends alsa-utils); "
+            "arecord -l; aplay -l"
+        )
+        result = _q5_remote_command(command, timeout=180.0)
+        if result.returncode:
+            detail = (result.stderr or result.stdout).decode(errors="replace").strip()
+            raise RuntimeError(f"Q5 remote audio setup failed: {detail}")
+        _REMOTE_AUDIO_READY = True
+        print("[Q5Audio] remote ALSA devices:\n" + result.stdout.decode(errors="replace"), flush=True)
+
+
+class MicPlugin:
+    """Q5 developer-container microphone as a 16 kHz PCM stream."""
+
+    def __init__(self, plugin_config, namespace, executor, client):
+        del executor
+        self._client = client
+        self._topic = f"/{namespace}/q5/mic/audio"
+        self._device = str(plugin_config.get("device", "default"))
+        self._rate = int(plugin_config.get("sample_rate_hz", 16000))
+        self._channels = int(plugin_config.get("channels", 1))
+        self._process = None
+        self._thread = None
+        self._running = False
+        if self._rate != 16000 or self._channels != 1:
+            raise ValueError("Q5 mic only supports the shared 16 kHz mono PCM contract")
+
+    def get_tool(self):
+        return {
+            "name": "mic", "type": "sensor", "multiInstance": False,
+            "description": "Q5 microphone, live PCM 16 kHz/16-bit/mono for ASR.",
+            "inputSchema": {"type": "object", "properties": {
+                "action": {"type": "string", "enum": ["start", "stop", "info"]},
+            }, "required": ["action"], "additionalProperties": False},
+            "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}],
+        }
+
+    def start(self):
+        if self._running:
+            return
+        _ensure_remote_audio_tools()
+        command = (
+            "exec arecord -D " + shlex.quote(self._device) +
+            f" -f S16_LE -r {self._rate} -c {self._channels} -t raw"
+        )
+        self._process = subprocess.Popen(
+            _q5_ssh_args(command), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+        self._running = True
+        self._thread = threading.Thread(target=self._pump, daemon=True, name="q5_mic_stream")
+        self._thread.start()
+        print(f"[MicPlugin] capturing Q5 ALSA {self._device} -> {self._topic}", flush=True)
+
+    def _pump(self):
+        # 100 ms frames are the same size emitted by perception TTS.
+        while self._running and self._process and self._process.stdout:
+            chunk = self._process.stdout.read(3200)
+            if not chunk:
+                break
+            sender = getattr(self._client, "publish_audio", None)
+            if callable(sender):
+                sender(chunk)
+        if self._running:
+            print("[MicPlugin] remote capture stream ended", flush=True)
+
+    def stop(self):
+        self._running = False
+        if self._process is not None:
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+            self._process = None
+
+    def dispatch(self, action, args):
+        del args
+        if action == "start":
+            self.start()
+        elif action == "stop":
+            self.stop()
+        if action in ("start", "stop", "info"):
+            return {"state": "running" if self._running else "idle",
+                    "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}]}
+        return None
+
+
+class SpeakerPlugin:
+    """Play perception's PCM AudioChunk stream on the Q5 developer-container ALSA output."""
+
+    def __init__(self, plugin_config, namespace, executor, client):
+        del namespace, executor
+        self._client = client
+        self._topic = str(plugin_config.get("input_topic", "/perception/tts"))
+        self._device = str(plugin_config.get("device", "default"))
+        self._rate = int(plugin_config.get("sample_rate_hz", 16000))
+        self._channels = int(plugin_config.get("channels", 1))
+        self._process = None
+        self._thread = None
+        self._running = False
+        if self._rate != 16000 or self._channels != 1:
+            raise ValueError("Q5 speaker only supports the shared 16 kHz mono PCM contract")
+
+    def get_tool(self):
+        return {
+            "name": "speaker", "type": "actuator", "multiInstance": False,
+            "description": "Q5 speaker. Connect a perception TTS audio/pcm-16k output to play live speech.",
+            "inputSchema": {"type": "object", "properties": {
+                "action": {"type": "string", "enum": ["start", "stop", "info"]},
+                "input_topic": {"type": "string", "description": "PCM 16 kHz AudioChunk topic"},
+            }, "required": ["action"], "additionalProperties": False},
+            "topic_in": [{"topic": self._topic, "format": "audio/pcm-16k"}],
+        }
+
+    def start(self, input_topic=None):
+        requested = str(input_topic or self._topic)
+        if self._running and requested == self._topic:
+            return
+        self.stop()
+        _ensure_remote_audio_tools()
+        self._topic = requested
+        command = (
+            "exec aplay -D " + shlex.quote(self._device) +
+            f" -f S16_LE -r {self._rate} -c {self._channels} -t raw"
+        )
+        self._process = subprocess.Popen(_q5_ssh_args(command), stdin=subprocess.PIPE,
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, bufsize=0)
+        configure = getattr(self._client, "configure_speaker", None)
+        if callable(configure):
+            configure(self._topic)
+        self._running = True
+        self._thread = threading.Thread(target=self._pump, daemon=True, name="q5_speaker_stream")
+        self._thread.start()
+        print(f"[SpeakerPlugin] subscribed {self._topic} -> Q5 ALSA {self._device}", flush=True)
+
+    def _pump(self):
+        while self._running and self._process and self._process.stdin:
+            getter = getattr(self._client, "pop_speaker_chunk", None)
+            chunk = getter() if callable(getter) else None
+            if chunk is None:
+                time.sleep(0.005)
+                continue
+            try:
+                self._process.stdin.write(chunk)
+                self._process.stdin.flush()
+            except (BrokenPipeError, OSError):
+                print("[SpeakerPlugin] remote playback stream ended", flush=True)
+                break
+
+    def stop(self):
+        self._running = False
+        if self._process is not None:
+            try:
+                if self._process.stdin:
+                    self._process.stdin.close()
+                self._process.wait(timeout=3)
+            except (subprocess.TimeoutExpired, OSError):
+                self._process.terminate()
+            self._process = None
+
+    def dispatch(self, action, args):
+        if action == "start":
+            self.start(args.get("input_topic"))
+        elif action == "stop":
+            self.stop()
+        if action in ("start", "stop", "info"):
+            return {"state": "running" if self._running else "idle",
+                    "topic_in": [{"topic": self._topic, "format": "audio/pcm-16k"}]}
+        return None
 
 
 class _Q5MediaPlugin:

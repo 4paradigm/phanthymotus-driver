@@ -40,6 +40,19 @@ plugins:
     device: "plughw:2,0"
   battery:
     enabled: true
+  mic:
+    enabled: true
+    device: "default"
+    sample_rate_hz: 16000
+    channels: 1
+  speaker:
+    enabled: true
+    # Agent Core wires perception TTS's audio/pcm-16k output here. The default
+    # also makes a default perception TTS instance work without extra config.
+    input_topic: "/perception/tts"
+    device: "default"
+    sample_rate_hz: 16000
+    channels: 1
   camera_rgb:
     enabled: true
     source_topic: "/camera/camera/color/image_raw"

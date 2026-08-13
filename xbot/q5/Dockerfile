@@ -43,12 +43,13 @@ RUN apt-get -o Acquire::Retries=5 update && \
         ros-humble-action-msgs && \
     rm -rf /var/lib/apt/lists/*
 
-# 本地 vendor 的 ROS2 消息包：xbot_common_interfaces + era_nav_msgs
+# 本地 vendor 的 ROS2 消息包。
 COPY vendor/xbot_common_interfaces /q5_ws/src/xbot_common_interfaces
 COPY vendor/era_nav_msgs /q5_ws/src/era_nav_msgs
+COPY vendor/audio_msgs /q5_ws/src/audio_msgs
 RUN cd /q5_ws && \
     . /opt/ros/humble/setup.sh && \
-    colcon build --packages-select xbot_common_interfaces era_nav_msgs
+    colcon build --packages-select xbot_common_interfaces era_nav_msgs audio_msgs
 
 # 本地 vendor 的纯 Python SDK（非 colcon 包，直接 import）
 COPY vendor/xbot_sdk_api /opt/xbot_sdk_api

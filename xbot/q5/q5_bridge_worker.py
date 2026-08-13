@@ -37,6 +37,8 @@ class BridgeWorker:
         self._cmd_q = self._ctx.Queue()
         self._sensor_q = self._ctx.Queue()
         self._media_q = self._ctx.Queue(maxsize=4)
+        self._audio_q = self._ctx.Queue(maxsize=100)
+        self._speaker_q = self._ctx.Queue(maxsize=64)
         self._proc = None
         self._debug = debug
         self._namespace = namespace
@@ -45,7 +47,8 @@ class BridgeWorker:
         """Spawn the bridge subprocess."""
         self._proc = self._ctx.Process(
             target=_run_bridge_subprocess,
-            args=(self._cmd_q, self._sensor_q, self._media_q, self._debug, self._namespace),
+            args=(self._cmd_q, self._sensor_q, self._media_q, self._audio_q, self._speaker_q,
+                  self._debug, self._namespace),
             name="q5_bridge_worker", daemon=True,
         )
         self._proc.start()
@@ -65,6 +68,25 @@ class BridgeWorker:
         except Exception:
             pass
 
+    def push_audio(self, audio: bytes):
+        """Queue ordered PCM audio independently of lossy latest-frame media."""
+        try:
+            self._audio_q.put_nowait(audio)
+        except Exception:
+            pass
+
+    def configure_speaker(self, topic: str):
+        try:
+            self._cmd_q.put_nowait({"kind": "speaker_config", "topic": topic})
+        except Exception:
+            pass
+
+    def pop_speaker_chunk(self):
+        try:
+            return self._speaker_q.get_nowait()
+        except Exception:
+            return None
+
     def shutdown(self):
         """Gracefully stop the bridge subprocess."""
         try:
@@ -79,7 +101,7 @@ class BridgeWorker:
 
 
 def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queue,
-                           debug: bool, namespace: str):
+                           audio_q: mp.Queue, speaker_q: mp.Queue, debug: bool, namespace: str):
     """Subprocess entry point — runs in separate process with own DDS domain."""
     # ── Environment: Force Domain 42 + FastDDS in subprocess ────────────────────
     os.environ["ROS_DOMAIN_ID"] = "42"
@@ -98,6 +120,7 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
     from std_msgs.msg import String
     from sensor_msgs.msg import CompressedImage, Image
+    from audio_msgs.msg import AudioChunk
 
     print(f"[BridgeWorker:pid={os.getpid()}] subprocess ready (Domain 42/FastDDS)", flush=True)
 
@@ -130,6 +153,16 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
     pub_odom = _pub(f"{prefix}/odom")
     pub_rgb = node.create_publisher(CompressedImage, f"{prefix}/q5/camera/rgb", QOS_SENSOR)
     pub_depth = node.create_publisher(Image, f"{prefix}/q5/camera/depth", QOS_SENSOR)
+    pub_mic = node.create_publisher(AudioChunk, f"{prefix}/q5/mic/audio", QOS_SENSOR)
+    speaker_sub = None
+
+    def _on_speaker(msg):
+        if msg.format != "audio/pcm-16k":
+            return
+        try:
+            speaker_q.put_nowait(bytes(msg.data))
+        except Exception:
+            pass
 
     node.get_logger().info(f"bridge publishers ready for namespace={namespace}")
     executor.add_node(node)
@@ -238,6 +271,12 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
             if cmd == "shutdown":
                 node.get_logger().info("shutdown command received")
                 running = False
+            elif isinstance(cmd, dict) and cmd.get("kind") == "speaker_config":
+                if speaker_sub is not None:
+                    node.destroy_subscription(speaker_sub)
+                speaker_sub = node.create_subscription(
+                    AudioChunk, str(cmd["topic"]), _on_speaker, QOS_SENSOR)
+                node.get_logger().info(f"speaker subscribed to {cmd['topic']}")
             elif debug:
                 node.get_logger().debug(f"bridge cmd: {cmd}")
         except Exception:
@@ -251,6 +290,18 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
                 break
         if newest_media is not None:
             _dispatch_media(newest_media)
+
+        # Unlike images, PCM frames must preserve their order. Drain the
+        # bounded queue so short bridge delays do not produce audible gaps.
+        while True:
+            try:
+                pcm = audio_q.get_nowait()
+            except Exception:
+                break
+            out = AudioChunk()
+            out.format = "audio/pcm-16k"
+            out.data = pcm
+            pub_mic.publish(out)
 
         # Process sensor snapshot (non-blocking, latest only)
         try:

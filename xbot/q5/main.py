@@ -71,6 +71,8 @@ class Q5DeviceBundle:
             ("state", "StatePlugin"),
             ("battery", "BatteryPlugin"),
             ("audio", "AudioPlugin"),
+            ("mic", "MicPlugin"),
+            ("speaker", "SpeakerPlugin"),
             ("camera_rgb", "CameraRgbPlugin"),
             ("camera_depth", "CameraDepthPlugin"),
         ]
@@ -298,6 +300,9 @@ def main():
     bridge_worker = bridge_worker_mod.BridgeWorker(namespace, debug=False)
     bridge_worker.start()
     sdk_client.publish_media = bridge_worker.push_media
+    sdk_client.publish_audio = bridge_worker.push_audio
+    sdk_client.configure_speaker = bridge_worker.configure_speaker
+    sdk_client.pop_speaker_chunk = bridge_worker.pop_speaker_chunk
     print("[bundle] BridgeWorker subprocess started (Domain 42/FastDDS)")
 
     # Background thread: periodically push full_snapshot to bridge worker
