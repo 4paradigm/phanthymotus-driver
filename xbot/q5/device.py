@@ -451,7 +451,10 @@ class CameraDepthPlugin(_Q5MediaPlugin):
 
     def __init__(self, plugin_config, namespace, executor, client):
         self._source_topic = str(plugin_config.get("source_topic", "/camera/camera/aligned_depth_to_color/image_raw"))
-        self._topic = f"/{namespace}/camera/depth"
+        # Preserve the canonical raw depth topic's ROS message type. The card
+        # exposes a separate JPEG preview topic so Agent Core never sees two
+        # incompatible message types on one DDS path.
+        self._topic = f"/{namespace}/camera/depth_preview"
         self._frames_received = 0
         self._frames_sent = 0
         super().__init__(plugin_config, namespace, executor, client)
