@@ -85,19 +85,16 @@ class NavigationSensorCardContractTest(unittest.TestCase):
             "navigation_sensors:\n    enabled: true",
             "raw_cloud_topic: rt/utlidar/cloud_livox_mid360",
             "raw_imu_topic: rt/utlidar/imu_livox_mid360",
-            "fast_livo_cloud_topic: /ubuntu/navigation/lidar_fast_livo",
+            "cloud_topic: /ubuntu/navigation/lidar",
             "imu_topic: /ubuntu/navigation/imu",
-            "publish_raw_cloud: false",
-            "publish_fast_livo_cloud: true",
         ):
             self.assertIn(expected, config)
 
     def test_tools_declare_native_types_qos_and_fail_closed_status(self):
         source = (G1_DIR / "navigation_sensor_bridge.py").read_text()
         for expected in (
-            '"navigation_lidar_fast_livo"',
+            '"navigation_lidar"',
             '"navigation_imu"',
-            '"navigation_sensor_diagnostics"',
             '"sensor/pointcloud"',
             '"sensor_msgs/msg/PointCloud2"',
             '"sensor_msgs/msg/Imu"',
@@ -114,16 +111,12 @@ class NavigationSensorCardContractTest(unittest.TestCase):
         self.assertNotIn('"sensor/pointcloud2"', source)
         ast.parse(source)
 
-    def test_runtime_tool_descriptors_match_fast_livo2_inputs(self):
+    def test_runtime_exposes_only_generic_navigation_sensor_tools(self):
         module = self.load_bridge_module()
         plugin = module.NavigationSensorPlugin.__new__(module.NavigationSensorPlugin)
         plugin._status_node = types.SimpleNamespace(
-            _publish_fast_livo_cloud=True,
-            _publish_raw_cloud=False,
-            fast_livo_cloud_topic="/ubuntu/navigation/lidar_fast_livo",
             cloud_topic="/ubuntu/navigation/lidar",
             imu_topic="/ubuntu/navigation/imu",
-            diagnostics_topic="/ubuntu/navigation/sensor_diagnostics",
             status=lambda worker_running: {
                 "ready": False,
                 "blockers": ["clock_not_ready"],
@@ -135,7 +128,8 @@ class NavigationSensorCardContractTest(unittest.TestCase):
         plugin._proc = types.SimpleNamespace(poll=lambda: None, pid=1234)
 
         tools = {tool["name"]: tool for tool in plugin.get_tools()}
-        lidar = tools["navigation_lidar_fast_livo"]["topic_out"][0]
+        self.assertEqual(set(tools), {"navigation_lidar", "navigation_imu"})
+        lidar = tools["navigation_lidar"]["topic_out"][0]
         imu = tools["navigation_imu"]["topic_out"][0]
         self.assertEqual(lidar["format"], "sensor/pointcloud")
         self.assertEqual(lidar["ros_type"], "sensor_msgs/msg/PointCloud2")
@@ -144,9 +138,7 @@ class NavigationSensorCardContractTest(unittest.TestCase):
         self.assertEqual(imu["ros_type"], "sensor_msgs/msg/Imu")
         self.assertEqual(imu["qos"], "RELIABLE + KEEP_LAST(depth=200) + VOLATILE")
 
-        info = plugin.dispatch(
-            "info", {"_tool_name": "navigation_lidar_fast_livo"}
-        )
+        info = plugin.dispatch("info", {"_tool_name": "navigation_lidar"})
         self.assertEqual(info["state"], "not_ready")
         self.assertEqual(info["blockers"], ["clock_not_ready"])
 
@@ -196,16 +188,16 @@ class NavigationSensorCardContractTest(unittest.TestCase):
 
     def test_status_monitor_fails_closed_for_dead_or_stale_worker(self):
         module = self.load_bridge_module()
-        node = module._NavigationSensorStatusNode.__new__(
-            module._NavigationSensorStatusNode
+        node = module._NavigationSensorMonitorNode.__new__(
+            module._NavigationSensorMonitorNode
         )
         node._lock = threading.RLock()
-        node._last_diagnostics = {"ready": True, "blockers": []}
-        node._last_diagnostics_monotonic = time.monotonic() - 3.0
+        node._last_status = {"ready": True, "blockers": []}
+        node._last_status_monotonic = time.monotonic() - 3.0
 
         stale = node.status(worker_running=True)
         self.assertFalse(stale["ready"])
-        self.assertIn("diagnostics_stale", stale["blockers"])
+        self.assertIn("status_stale", stale["blockers"])
 
         dead = node.status(worker_running=False)
         self.assertFalse(dead["ready"])

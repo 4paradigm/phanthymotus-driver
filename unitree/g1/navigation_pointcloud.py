@@ -1,4 +1,4 @@
-"""MID360 PointCloud2 layout conversion for the FAST-LIVO2 ROS2 MID360 port."""
+"""MID360 PointCloud2 conversion for the generic navigation sensor contract."""
 
 from __future__ import annotations
 
@@ -22,9 +22,9 @@ class PointFieldSpec:
     count: int = 1
 
 
-# Match the PCL point layout used by the ROS2 MID360 FAST-LIVO2 port:
-# PCL_ADD_POINT4D, intensity, tag, line, alignment padding, timestamp.
-FAST_LIVO_FIELDS = (
+# Stable navigation layout: PCL_ADD_POINT4D, intensity, tag, line, alignment
+# padding and an absolute per-point timestamp in the normalized ROS clock.
+NAVIGATION_FIELDS = (
     PointFieldSpec("x", 0, FLOAT32),
     PointFieldSpec("y", 4, FLOAT32),
     PointFieldSpec("z", 8, FLOAT32),
@@ -33,13 +33,13 @@ FAST_LIVO_FIELDS = (
     PointFieldSpec("line", 21, UINT8),
     PointFieldSpec("timestamp", 24, FLOAT64),
 )
-FAST_LIVO_POINT_STEP = 32
-_FAST_LIVO_DTYPE = np.dtype(
+NAVIGATION_POINT_STEP = 32
+_NAVIGATION_DTYPE = np.dtype(
     {
-        "names": [field.name for field in FAST_LIVO_FIELDS],
+        "names": [field.name for field in NAVIGATION_FIELDS],
         "formats": ["<f4", "<f4", "<f4", "<f4", "u1", "u1", "<f8"],
-        "offsets": [field.offset for field in FAST_LIVO_FIELDS],
-        "itemsize": FAST_LIVO_POINT_STEP,
+        "offsets": [field.offset for field in NAVIGATION_FIELDS],
+        "itemsize": NAVIGATION_POINT_STEP,
     }
 )
 
@@ -168,7 +168,7 @@ def rotate_orientation_xyzw(
     return tuple(float(value) for value in corrected)
 
 
-def unitree_mid360_to_fast_livo(
+def unitree_mid360_to_navigation_cloud(
     *,
     data: bytes,
     point_count: int,
@@ -177,11 +177,11 @@ def unitree_mid360_to_fast_livo(
     header_stamp_ns: int,
     rotation_matrix: np.ndarray | None = None,
 ) -> bytes:
-    """Convert Unitree's packed MID360 points to the ROS2 port's PCL schema.
+    """Convert Unitree's packed MID360 points to the navigation PCL schema.
 
-    Unitree provides ``time`` as a per-point offset in nanoseconds.  The target
-    FAST-LIVO2 MID360 handler expects ``timestamp`` as an absolute nanosecond
-    value and subtracts the ROS header internally.
+    Unitree provides ``time`` as a per-point offset in nanoseconds.  The output
+    preserves it as an absolute nanosecond ``timestamp`` in the same normalized
+    clock domain as the ROS header and navigation IMU.
     """
     point_count = int(point_count)
     point_step = int(point_step)
@@ -228,7 +228,7 @@ def unitree_mid360_to_fast_livo(
     if not np.array_equal(rotation, np.eye(3)):
         xyz = xyz @ rotation.astype(np.float32).T
 
-    converted = np.zeros(point_count, dtype=_FAST_LIVO_DTYPE)
+    converted = np.zeros(point_count, dtype=_NAVIGATION_DTYPE)
     converted["x"] = xyz[:, 0]
     converted["y"] = xyz[:, 1]
     converted["z"] = xyz[:, 2]

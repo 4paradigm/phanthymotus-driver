@@ -68,14 +68,12 @@ The read-only `navigation_sensors` Driver plugin launches an isolated worker
 process which subscribes directly to the MID360 raw DDS streams instead of
 converting the body `/ubuntu/state/imu` JSON. Keeping raw LiDAR conversion and
 IMU forwarding out of the full Driver process prevents the legacy LiDAR,
-camera, and MCP threads from starving the estimator input callbacks. The
-worker publishes the inputs expected by the Perception FAST-LIVO2 card:
+camera, and MCP threads from starving navigation input callbacks. The worker
+publishes two algorithm-independent navigation sensor topics:
 
-- `/ubuntu/navigation/lidar_fast_livo` — `sensor_msgs/msg/PointCloud2`,
+- `/ubuntu/navigation/lidar` — `sensor_msgs/msg/PointCloud2`,
   RELIABLE + KEEP_LAST(2), with `x/y/z/intensity/tag/line/timestamp` fields;
 - `/ubuntu/navigation/imu` — `sensor_msgs/msg/Imu`, RELIABLE + KEEP_LAST(200);
-- `/ubuntu/navigation/sensor_diagnostics` — clock warm-up/reset and drop
-  counters as `std_msgs/msg/String` JSON.
 
 LiDAR and IMU retain their shared MID360 source clock and are normalized into
 one ROS system-time domain. Samples are dropped while clock offset estimation
@@ -84,11 +82,12 @@ source timestamp. The fixed upside-down mounting rotation is applied equally
 to cloud and IMU. The existing `/ubuntu/lidar/cloud` legacy card remains
 enabled for Canvas and safety consumers.
 
-FAST-LIVO2 must connect to the two native topics above. The body IMU JSON is
-approximately 20 Hz, has no source timestamp, and is not a valid substitute
-for the MID360 built-in IMU. Before accepting a map, verify the isolated worker
-delivers approximately 10 Hz LiDAR and 200 Hz IMU; materially lower rates or
-repeated source-stamp gaps invalidate the mapping run.
+Navigation consumers such as LiDAR-inertial mapping and path planning can bind
+to these topics without the Driver naming or selecting a specific algorithm.
+The body IMU JSON is approximately 20 Hz, has no source timestamp, and is not a
+valid substitute for the MID360 built-in IMU. Before accepting a navigation
+run, verify the isolated worker delivers approximately 10 Hz LiDAR and 200 Hz
+IMU; materially lower rates or repeated source-stamp gaps invalidate the run.
 
 ## Writing a New Driver
 

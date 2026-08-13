@@ -10,14 +10,14 @@ if not hasattr(sys.modules.get("numpy"), "dtype"):
 import numpy as np
 
 from navigation_pointcloud import (
-    FAST_LIVO_FIELDS,
-    FAST_LIVO_POINT_STEP,
+    NAVIGATION_FIELDS,
+    NAVIGATION_POINT_STEP,
     FLOAT32,
     UINT16,
     rotate_covariance9,
     rotate_orientation_xyzw,
     rotate_vector3,
-    unitree_mid360_to_fast_livo,
+    unitree_mid360_to_navigation_cloud,
     validated_rotation_matrix,
 )
 
@@ -44,17 +44,17 @@ class Mid360ConversionTest(unittest.TestCase):
     def decode(self, converted):
         dtype = np.dtype(
             {
-                "names": [field.name for field in FAST_LIVO_FIELDS],
+                "names": [field.name for field in NAVIGATION_FIELDS],
                 "formats": ["<f4", "<f4", "<f4", "<f4", "u1", "u1", "<f8"],
-                "offsets": [field.offset for field in FAST_LIVO_FIELDS],
-                "itemsize": FAST_LIVO_POINT_STEP,
+                "offsets": [field.offset for field in NAVIGATION_FIELDS],
+                "itemsize": NAVIGATION_POINT_STEP,
             }
         )
         return np.frombuffer(converted, dtype=dtype)
 
     def test_converts_relative_time_to_absolute_nanoseconds(self):
         header_ns = 1_785_811_000_000_000_000
-        converted = unitree_mid360_to_fast_livo(
+        converted = unitree_mid360_to_navigation_cloud(
             data=self.make_cloud(),
             point_count=2,
             point_step=22,
@@ -63,7 +63,7 @@ class Mid360ConversionTest(unittest.TestCase):
         )
         points = self.decode(converted)
 
-        self.assertEqual(len(converted), 2 * FAST_LIVO_POINT_STEP)
+        self.assertEqual(len(converted), 2 * NAVIGATION_POINT_STEP)
         np.testing.assert_allclose(points["x"], [1.0, -1.0])
         np.testing.assert_allclose(points["intensity"], [42.0, 163.0])
         np.testing.assert_array_equal(points["tag"], [0x10, 0x10])
@@ -76,7 +76,7 @@ class Mid360ConversionTest(unittest.TestCase):
 
     def test_rejects_missing_time_field(self):
         with self.assertRaisesRegex(ValueError, "missing MID360 field: time"):
-            unitree_mid360_to_fast_livo(
+            unitree_mid360_to_navigation_cloud(
                 data=self.make_cloud(),
                 point_count=2,
                 point_step=22,
@@ -86,7 +86,7 @@ class Mid360ConversionTest(unittest.TestCase):
 
     def test_rejects_short_data(self):
         with self.assertRaisesRegex(ValueError, "shorter"):
-            unitree_mid360_to_fast_livo(
+            unitree_mid360_to_navigation_cloud(
                 data=b"short",
                 point_count=2,
                 point_step=22,
@@ -109,7 +109,7 @@ class Mid360ConversionTest(unittest.TestCase):
             ]
         )
         header_ns = 1_785_811_000_000_000_000
-        converted = unitree_mid360_to_fast_livo(
+        converted = unitree_mid360_to_navigation_cloud(
             data=self.make_cloud(),
             point_count=2,
             point_step=22,
