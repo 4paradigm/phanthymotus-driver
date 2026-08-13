@@ -182,8 +182,8 @@ def main():
 
     print(f"[adam] namespace={namespace} variant={variant} mcp_port={mcp_port}")
 
-    # DDS init (pnd_sdk_python)
-    dds_domain_id = int(cfg.get("dds_domain_id", 1))
+    # DDS init (pnd_sdk_python) — MUST be before rclpy.init() to avoid CycloneDDS/FastDDS conflict
+    dds_domain_id = int(cfg.get("dds_domain_id", 0))
     try:
         from pndbotics_sdk_py.core.channel import ChannelFactoryInitialize
         if network_iface:
@@ -196,6 +196,27 @@ def main():
     except Exception as e:
         print(f"[adam] WARNING: DDS init failed: {e}")
 
+    # Pre-create DDS subscribers before rclpy.init() to avoid CycloneDDS/FastDDS conflict
+    dds_lowstate_sub = None
+    dds_handstate_sub = None
+    dds_hand_pub = None
+    dds_hand_sub = None
+    try:
+        from pndbotics_sdk_py.core.channel import ChannelSubscriber, ChannelPublisher
+        from pndbotics_sdk_py.idl.pnd_adam.msg.dds_ import LowState_, HandState_, HandCmd_
+
+        dds_lowstate_sub = ChannelSubscriber("rt/lowstate", LowState_)
+        dds_lowstate_sub.Init()
+        dds_handstate_sub = ChannelSubscriber("rt/handstate", HandState_)
+        dds_handstate_sub.Init()
+        dds_hand_pub = ChannelPublisher("rt/handcmd", HandCmd_)
+        dds_hand_pub.Init()
+        dds_hand_sub = ChannelSubscriber("rt/handstate", HandState_)
+        dds_hand_sub.Init()
+        print("[adam] DDS subscribers/publishers created")
+    except Exception as e:
+        print(f"[adam] WARNING: DDS channels failed: {e}")
+
     # gRPC client
     grpc_host = os.environ.get("GRPC_HOST", cfg.get("grpc_host", "localhost"))
     grpc_port = int(os.environ.get("GRPC_PORT", cfg.get("grpc_port", 6666)))
@@ -204,16 +225,20 @@ def main():
     grpc_client.connect()
     print(f"[adam] gRPC client → {grpc_host}:{grpc_port}")
 
-    # ROS2
+    # ROS2 — init after DDS to avoid CycloneDDS participant conflict
     import rclpy
     import rclpy.executors
     rclpy.init()
     executor = rclpy.executors.MultiThreadedExecutor()
     print("[adam] ROS2 initialized")
 
-    # Load plugins
+    # Load plugins (pass pre-created DDS channels)
     from device import AdamDeviceBundle
-    _bundle = AdamDeviceBundle(cfg, namespace, executor, grpc_client)
+    _bundle = AdamDeviceBundle(cfg, namespace, executor, grpc_client,
+                               dds_lowstate_sub=dds_lowstate_sub,
+                               dds_handstate_sub=dds_handstate_sub,
+                               dds_hand_pub=dds_hand_pub,
+                               dds_hand_sub=dds_hand_sub)
     _bundle.start_all()
     print(f"[adam] Bundle loaded ({len(_bundle.get_all_tools())} tools)")
 
