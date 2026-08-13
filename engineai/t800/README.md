@@ -41,7 +41,10 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 | `joint_override` | actuator | 指定关节 100 Hz 覆盖控制 |
 | `joint_bridge` | actuator | 全 25 关节最高 500 Hz 底层控制 |
 | `led` | actuator | 众擎协议定义的 11 种灯效 |
-| `tts` | actuator | 众擎 TTS 消息；topic 可配置 |
+| `mic` | sensor | 内置麦克风 PCM-16 16kHz 采集，缓冲 1024 字节发布（满足 perception ASR 协议） |
+| `pointcloud` | sensor | Odin2 原始/SLAM 点云转发（`sensor/pointcloud` 二进制渲染流） |
+| `camera` | sensor | Odin2 双目 JPEG 图像转发（左/右目 `image/jpeg` 流） |
+| `depth` | sensor | Odin2 官方标定深度图转 640×480 毫米 16UC1（`image/depth-z16`） |
 | `motor_power` | actuator | 电机 enable/disable 服务 |
 | `native_node_control` | actuator | Native SDK 已注册 LogicNode 的动态 start/stop |
 | `virtual_gamepad` | actuator | Native SDK LCM 虚拟手柄：12 按键、6 模拟量和 7 种官方组合键 |
@@ -67,6 +70,19 @@ T800 协议没有里程计/定位反馈，因此它们是开环动作，返回�
 lie_down 组合键。LCM 输入会覆盖实体手柄输入，发送完成后 Driver 自动发布
 全零包释放控制权。
 
+`pointcloud`、`camera`、`depth` 桥接 T800-Odin2 激光雷达相机（飞书文档
+7.2 节）在 Orin 主板上发布的 `odin_ros_driver` topic。点云按
+`[uint32 point_step][uint32 total_points][PointCloud2 bytes]` 二进制格式
+重发布到 `sensor/pointcloud` 流；双目压缩图原样转发。深度订阅官方
+`pcd2depth_ros2_node` 发布的 `/manifold/ODIN2/device0/depth`（`32FC1`、米），
+转换为固定 640×480 的毫米 `16UC1`；点云到相机坐标系的标定投影、膨胀、
+Sobel 边缘抑制和最近邻上采样均由众擎节点完成。使用 `depth` 前需按众擎
+文档 7.2 节启动该深度图节点。
+点云源可用 `pointcloud` 工具的 `select_source` action 在 `raw`/`slam`
+之间切换。Odin2 topic 带逐设备前缀 `/{topic_prefix}/{model}/device{N}/`，
+默认按 `config.yaml:topics.vision_*` 的 `/manifold/ODIN2/device0` 订阅，
+上机前请用 `ros_graph` 工具核对实际前缀。
+
 ## 运行
 
 机器人必须通过主机内置以太网口访问；官方默认 ROS Domain 为 69。
@@ -75,7 +91,12 @@ lie_down 组合键。LCM 输入会覆盖实体手柄输入，发送完成后 Dri
 cd engineai/t800
 docker build -t engineai-t800-driver .
 docker run --rm --network host --privileged \
-  -e NETWORK_INTERFACE=eth0 \
+  -v /dev:/dev \
+  -v /opt/engineai/native_sdk:/opt/engineai/native_sdk \
+  -v /run/user/1000/pulse:/run/user/1000/pulse \
+  -v /home/ubuntu/.config/pulse:/root/.config/pulse:ro \
+  -e NETWORK_INTERFACE=${T800_NETWORK_INTERFACE:-eth1} \
+  -e PULSE_SERVER=unix:/run/user/1000/pulse/native \
   engineai-t800-driver
 ```
 
@@ -104,8 +125,9 @@ docker run --rm --network host --privileged \
 飞书私有文档和实际固件可能调整 topic 或状态名。首次上机前需要核对：
 
 - `ros2 topic list -t` 与 `config.yaml:topics`；
+- Odin2 实际 topic 前缀（`/{topic_prefix}/{model}/device{N}/`，默认按
+  `/manifold/ODIN2/device0` 配置）；
 - `/hardware/joint_state` 数组顺序是否仍为 J00..J24；
-- TTS 的实际 topic；
 - `motion_state.available_transition_motions` 返回的固件状态名；
 - `/motion/node_control` 是否由当前 Native SDK 配置启用；
 - 开发版的速度、刚度、阻尼和力矩允许范围。

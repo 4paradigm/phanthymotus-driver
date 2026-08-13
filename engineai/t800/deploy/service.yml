@@ -8,10 +8,14 @@ engineai-t800:
   volumes:
     - /dev:/dev
     - /opt/engineai/native_sdk:/opt/engineai/native_sdk
+    # T800 厂商 PulseAudio 已独占机身麦克风，mic 通过宿主音频服务采集。
+    - /run/user/1000/pulse:/run/user/1000/pulse
+    - /home/ubuntu/.config/pulse:/root/.config/pulse:ro
   environment:
     - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
     - ROS_LOCALHOST_ONLY=0
-    - NETWORK_INTERFACE=eth0
+    - NETWORK_INTERFACE=${T800_NETWORK_INTERFACE:-eth1}
+    - PULSE_SERVER=unix:/run/user/1000/pulse/native
     - PYTHONUNBUFFERED=1
   logging:
     driver: local

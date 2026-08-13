@@ -88,13 +88,14 @@ class T800DeviceBundle:
             JointPlanPlugin,
             LedPlugin,
             LocomotionPlugin,
+            MicPlugin,
             MotionModePlugin,
             MotorPowerPlugin,
             NativeNodeControlPlugin,
             NativeSdkPlugin,
             SafetyControlPlugin,
             StatePlugin,
-            TtsPlugin,
+            VisionPlugin,
         )
         from virtual_gamepad import VirtualGamepadPlugin
 
@@ -112,7 +113,8 @@ class T800DeviceBundle:
             ("joint_override", JointOverridePlugin, (config, namespace, ros2, state)),
             ("joint_bridge", JointBridgePlugin, (config, namespace, ros2, state)),
             ("led", LedPlugin, (config, namespace, ros2)),
-            ("tts", TtsPlugin, (config, namespace, ros2)),
+            ("mic", MicPlugin, (config, namespace, ros2)),
+            ("vision", VisionPlugin, (config, namespace, ros2)),
             ("motor_power", MotorPowerPlugin, (config, namespace, ros2)),
             ("native_node_control", NativeNodeControlPlugin, (config, namespace, ros2)),
             ("safety", SafetyControlPlugin, (config, namespace, ros2, state)),

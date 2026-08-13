@@ -1,2 +1,3 @@
 pyyaml
 lcm==1.5.0
+numpy
