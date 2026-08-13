@@ -48,6 +48,92 @@ class SmartMotionExitMonitorTest(unittest.TestCase):
         proxy._monitor_process_exit()
 
 
+class SmartMotionCallRoutingTest(unittest.TestCase):
+    class AliveProcess:
+        def __init__(self):
+            self.alive = True
+            self.terminate_count = 0
+            self.join_count = 0
+
+        def is_alive(self):
+            return self.alive
+
+        def terminate(self):
+            self.terminate_count += 1
+            self.alive = False
+
+        def join(self, timeout=None):
+            self.join_count += 1
+
+    def make_proxy(self, *, dispatch_results: bool):
+        proxy = SmartMotionProxy.__new__(SmartMotionProxy)
+        proxy._proc = self.AliveProcess()
+        proxy._cmd_queue = queue.Queue()
+        proxy._result_queue = queue.Queue()
+        proxy._pending = {}
+        proxy._dispatch_lock = threading.Lock()
+        proxy._req_counter = 0
+        proxy._req_lock = threading.Lock()
+        if dispatch_results:
+            proxy._dispatch_thread = threading.Thread(
+                target=proxy._dispatch_results,
+                daemon=True,
+            )
+            proxy._dispatch_thread.start()
+        return proxy
+
+    def test_concurrent_calls_receive_only_their_correlated_reply(self):
+        proxy = self.make_proxy(dispatch_results=True)
+        results = {}
+
+        first_thread = threading.Thread(
+            target=lambda: results.setdefault(
+                "first", proxy._call("first", timeout=0.5)
+            ),
+            daemon=True,
+        )
+        second_thread = threading.Thread(
+            target=lambda: results.setdefault(
+                "second", proxy._call("second", timeout=0.5)
+            ),
+            daemon=True,
+        )
+        first_thread.start()
+        second_thread.start()
+        commands = {
+            command["method"]: command
+            for command in (
+                proxy._cmd_queue.get(timeout=0.2),
+                proxy._cmd_queue.get(timeout=0.2),
+            )
+        }
+
+        proxy._result_queue.put({
+            "_req_id": commands["second"]["_req_id"],
+            "reply": "second-result",
+        })
+        proxy._result_queue.put({
+            "_req_id": commands["first"]["_req_id"],
+            "reply": "first-result",
+        })
+        first_thread.join(timeout=0.5)
+        second_thread.join(timeout=0.5)
+
+        self.assertFalse(first_thread.is_alive())
+        self.assertFalse(second_thread.is_alive())
+        self.assertEqual(results["first"], {"reply": "first-result"})
+        self.assertEqual(results["second"], {"reply": "second-result"})
+
+    def test_timeout_terminates_unresponsive_motion_owner(self):
+        proxy = self.make_proxy(dispatch_results=False)
+
+        result = proxy._call("hung", timeout=0.01)
+
+        self.assertEqual(result, {"error": "SmartMotion subprocess timeout (hung)"})
+        self.assertEqual(proxy._proc.terminate_count, 1)
+        self.assertEqual(proxy._proc.join_count, 1)
+
+
 class SmartMotionParentStopSequenceTest(unittest.TestCase):
     def make_proxy(self, fallback_stop):
         proxy = SmartMotionProxy.__new__(SmartMotionProxy)
