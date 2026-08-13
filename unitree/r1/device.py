@@ -686,22 +686,43 @@ class SmartMotionPlugin:
 class LedPlugin:
     PREFIX = "led"
 
+    # State priority: higher number = higher priority
+    _PRIORITY = {'idle': 0, 'hearing': 1, 'thinking': 3, 'speaking': 4, 'error': 5}
+    # Auto-timeout per state (seconds). None = must be explicitly overridden.
+    _TIMEOUT = {'idle': None, 'hearing': 1.2, 'thinking': 60, 'speaking': 120, 'error': 5}
+    # State → solid color (R1 has no animation support, only solid colors)
+    _COLORS = {
+        'idle':     (0, 0, 0),
+        'hearing':  (0, 80, 255),
+        'thinking': (80, 40, 255),
+        'speaking': (0, 200, 220),
+        'error':    (255, 0, 0),
+    }
+
     def __init__(self, plugin_config: dict, namespace: str, executor, audio_client: AudioClient):
         self._client = audio_client
+        self._state = 'idle'
+        self._state_lock = threading.Lock()
+        self._timeout_timer = None
 
     def get_tool(self) -> dict:
         return {
             "name": "led",
             "type": "actuator",
             "multiInstance": False,
-            "description": "R1 RGB LED strip control — set color or turn off",
+            "description": "R1 LED strip — state-driven (hook-triggered) or manual RGB control",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["set", "off"],
+                        "enum": ["state", "set", "off"],
                         "description": "Action to perform",
+                    },
+                    "state": {
+                        "type": "string",
+                        "enum": ["idle", "hearing", "thinking", "speaking", "error"],
+                        "description": "Target LED state (for action=state)",
                     },
                     "r": {"type": "integer", "description": "Red 0-255"},
                     "g": {"type": "integer", "description": "Green 0-255"},
@@ -709,8 +730,16 @@ class LedPlugin:
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "set": {"params": ["r", "g", "b"], "description": "Set LED strip to specified RGB color"},
-                    "off": {"params": [],              "description": "Turn off LED strip"},
+                    "state": {"params": ["state"], "description": "Transition LED to semantic state (priority-managed)"},
+                    "set":   {"params": ["r", "g", "b"], "description": "Manual RGB override (bypasses state machine)"},
+                    "off":   {"params": [], "description": "Turn off LED (resets state to idle)"},
+                },
+                "x-hooks": {
+                    "on_hearing":    {"action": "state", "params": {"state": "hearing"}},
+                    "on_thinking":   {"action": "state", "params": {"state": "thinking"}},
+                    "on_speaking":   {"action": "state", "params": {"state": "speaking"}},
+                    "on_idle":       {"action": "state", "params": {"state": "idle"}},
+                    "on_error":      {"action": "state", "params": {"state": "error"}},
                 },
             },
         }
@@ -719,23 +748,60 @@ class LedPlugin:
         pass
 
     def stop(self) -> None:
-        pass
+        self._cancel_timeout()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
-            return {"state": "ready"}
+            return {"state": self._state}
         if action == "stop":
+            self._transition('idle')
             return {"state": "idle"}
-        if action == "set":
-            r   = int(args.get("r", 0))
-            g   = int(args.get("g", 0))
-            b   = int(args.get("b", 0))
+        if action == "state":
+            new_state = args.get("state", "idle")
+            if new_state not in self._PRIORITY:
+                return {"error": f"unknown state: {new_state}"}
+            self._transition(new_state)
+            return {"state": self._state}
+        elif action == "set":
+            self._transition('idle')
+            r = int(args.get("r", 0))
+            g = int(args.get("g", 0))
+            b = int(args.get("b", 0))
             ret = self._client.LedControl(r, g, b)
             return {"ret": ret, "r": r, "g": g, "b": b}
         elif action == "off":
-            ret = self._client.LedControl(0, 0, 0)
-            return {"ret": ret}
+            self._transition('idle')
+            return {"state": "idle"}
         return None
+
+    def _transition(self, new_state: str):
+        """Priority-based state transition."""
+        with self._state_lock:
+            if new_state not in ('idle', 'error'):
+                if self._PRIORITY.get(new_state, 0) <= self._PRIORITY.get(self._state, 0):
+                    return
+            self._state = new_state
+
+        self._cancel_timeout()
+        color = self._COLORS.get(new_state, (0, 0, 0))
+        self._client.LedControl(*color)
+
+        timeout = self._TIMEOUT.get(new_state)
+        if timeout:
+            expected_state = new_state
+            def _timeout_cb(expected=expected_state):
+                with self._state_lock:
+                    if self._state != expected:
+                        return
+                self._transition('idle')
+            self._timeout_timer = threading.Timer(timeout, _timeout_cb)
+            self._timeout_timer.daemon = True
+            self._timeout_timer.start()
+
+    def _cancel_timeout(self):
+        if self._timeout_timer:
+            self._timeout_timer.cancel()
+            self._timeout_timer = None
 
 
 # ── LocoStatePlugin (sensor) ─────────────────────────────────────────────────

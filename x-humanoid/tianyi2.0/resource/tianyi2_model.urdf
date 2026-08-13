@@ -10,8 +10,8 @@
     <color rgba="0.2 0.4 0.8 1"/>
   </material>
 
-  <!-- Root: chassis (wheeled base) -->
-  <link name="chassis_link">
+  <!-- Root: mobile base. The monitor skeleton is arranged bottom-up for readability. -->
+  <link name="base_center_link">
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <mass value="15.0"/>
@@ -19,34 +19,64 @@
     </inertial>
   </link>
 
-  <!-- Pelvis (fixed to chassis top) -->
+  <link name="base_rear_link"><inertial><mass value="0.1"/></inertial></link>
+  <joint name="base_center_to_rear" type="fixed">
+    <origin xyz="-0.32 0 0" rpy="0 0 0"/>
+    <parent link="base_center_link"/><child link="base_rear_link"/>
+  </joint>
+
+  <link name="base_left_link"><inertial><mass value="0.1"/></inertial></link>
+  <joint name="base_center_to_left" type="fixed">
+    <origin xyz="0 0.24 0" rpy="0 0 0"/>
+    <parent link="base_center_link"/><child link="base_left_link"/>
+  </joint>
+
+  <!-- Base-mounted heading marker. Tianyi body X axis points forward. -->
+  <link name="base_heading_apex_link"><inertial><mass value="0.02"/></inertial></link>
+  <joint name="base_left_to_heading_apex" type="fixed">
+    <origin xyz="0.30 -0.24 0.03" rpy="0 0 0"/>
+    <parent link="base_left_link"/><child link="base_heading_apex_link"/>
+  </joint>
+  <link name="base_heading_tail_link"><inertial><mass value="0.02"/></inertial></link>
+  <joint name="base_heading_apex_to_tail" type="fixed">
+    <origin xyz="-0.30 -0.24 0" rpy="0 0 0"/>
+    <parent link="base_heading_apex_link"/><child link="base_heading_tail_link"/>
+  </joint>
+  <link name="base_heading_close_link"><inertial><mass value="0.02"/></inertial></link>
+  <joint name="base_heading_tail_to_close" type="fixed">
+    <origin xyz="0 0.48 -0.03" rpy="0 0 0"/>
+    <parent link="base_heading_tail_link"/><child link="base_heading_close_link"/>
+  </joint>
+
+  <!-- Leg support chain: base -> knee -> hip -> pelvis -> waist. -->
+  <link name="knee_base_link"><inertial><mass value="1.5"/></inertial></link>
+  <joint name="knee_pitch_joint" type="revolute">
+    <origin xyz="0 0 0.36" rpy="0 0 0"/>
+    <parent link="base_center_link"/><child link="knee_base_link"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.571" upper="2.793" effort="332" velocity="3.93"/>
+  </joint>
+
+  <link name="hip_pitch_link"><inertial><mass value="2.0"/></inertial></link>
+  <joint name="hip_pitch_joint" type="revolute">
+    <!-- Equal-length lower linkage, mirrored around the knee/waist axis. -->
+    <origin xyz="-0.225 0 0.390" rpy="0 0 0"/>
+    <parent link="knee_base_link"/><child link="hip_pitch_link"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-0.227" upper="3.142" effort="332" velocity="3.93"/>
+  </joint>
+
   <link name="pelvis_link"><inertial><mass value="3.0"/></inertial></link>
-  <joint name="chassis_to_pelvis" type="fixed">
-    <origin xyz="0 0 0.45" rpy="0 0 0"/>
-    <parent link="chassis_link"/><child link="pelvis_link"/>
-  </joint>
-
-  <!-- ═══ Left Leg (2 DOF: hip pitch + knee pitch) ═══ -->
-  <link name="left_hip_pitch_link"><inertial><mass value="2.0"/></inertial></link>
-  <joint name="left_hip_pitch_joint" type="revolute">
-    <origin xyz="0.0 0.1 -0.05" rpy="0 0 0"/>
-    <parent link="pelvis_link"/><child link="left_hip_pitch_link"/>
-    <axis xyz="0 1 0"/>
-    <limit lower="-0.227" upper="1.396" effort="332" velocity="3.93"/>
-  </joint>
-
-  <link name="left_knee_pitch_link"><inertial><mass value="1.5"/></inertial></link>
-  <joint name="left_knee_pitch_joint" type="revolute">
-    <origin xyz="0 0 -0.25" rpy="0 0 0"/>
-    <parent link="left_hip_pitch_link"/><child link="left_knee_pitch_link"/>
-    <axis xyz="0 1 0"/>
-    <limit lower="-0.454" upper="2.793" effort="332" velocity="3.93"/>
+  <joint name="hip_to_waist" type="fixed">
+    <!-- High pose: 120 deg at hip. Low pose: closes to roughly 10 deg. -->
+    <origin xyz="0.225 0 0.390" rpy="0 0 0"/>
+    <parent link="hip_pitch_link"/><child link="pelvis_link"/>
   </joint>
 
   <!-- ═══ Waist (2 DOF: yaw + pitch) ═══ -->
   <link name="waist_yaw_link"><inertial><mass value="3.0"/></inertial></link>
   <joint name="waist_yaw_joint" type="revolute">
-    <origin xyz="0 0 0.1" rpy="0 0 0"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
     <parent link="pelvis_link"/><child link="waist_yaw_link"/>
     <axis xyz="0 0 1"/>
     <limit lower="-2.793" upper="3.142" effort="143" velocity="3.14"/>
@@ -54,16 +84,16 @@
 
   <link name="waist_pitch_link"><inertial><mass value="2.5"/></inertial></link>
   <joint name="waist_pitch_joint" type="revolute">
-    <origin xyz="0 0 0.05" rpy="0 0 0"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
     <parent link="waist_yaw_link"/><child link="waist_pitch_link"/>
     <axis xyz="0 1 0"/>
-    <limit lower="-0.785" upper="2.094" effort="332" velocity="3.93"/>
+    <limit lower="-1.745" upper="2.094" effort="332" velocity="3.93"/>
   </joint>
 
   <!-- Torso (from waist) -->
   <link name="torso_link"><inertial><mass value="5.0"/></inertial></link>
   <joint name="waist_to_torso" type="fixed">
-    <origin xyz="0 0 0.3" rpy="0 0 0"/>
+    <origin xyz="0 0 0.36" rpy="0 0 0"/>
     <parent link="waist_pitch_link"/><child link="torso_link"/>
   </joint>
 
@@ -78,7 +108,7 @@
 
   <link name="head_pitch_link"><inertial><mass value="0.3"/></inertial></link>
   <joint name="head_pitch_joint" type="revolute">
-    <origin xyz="0 0 0.05" rpy="0 0 0"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
     <parent link="head_yaw_link"/><child link="head_pitch_link"/>
     <axis xyz="0 1 0"/>
     <limit lower="-0.436" upper="0.436" effort="9" velocity="6.7"/>
@@ -86,16 +116,22 @@
 
   <link name="head_roll_link"><inertial><mass value="0.8"/></inertial></link>
   <joint name="head_roll_joint" type="revolute">
-    <origin xyz="0 0 0.05" rpy="0 0 0"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
     <parent link="head_pitch_link"/><child link="head_roll_link"/>
     <axis xyz="1 0 0"/>
     <limit lower="-0.454" upper="0.454" effort="9" velocity="6.7"/>
   </joint>
 
+  <link name="head_tip_link"><inertial><mass value="0.2"/></inertial></link>
+  <joint name="head_to_tip" type="fixed">
+    <origin xyz="0 0 0.12" rpy="0 0 0"/>
+    <parent link="head_roll_link"/><child link="head_tip_link"/>
+  </joint>
+
   <!-- ═══ Left Arm (7 DOF) ═══ -->
   <link name="left_shoulder_pitch_link"><inertial><mass value="1.0"/></inertial></link>
   <joint name="left_shoulder_pitch_joint" type="revolute">
-    <origin xyz="0 0.18 0.05" rpy="0 0 0"/>
+    <origin xyz="0 0.22 -0.02" rpy="0 0 0"/>
     <parent link="torso_link"/><child link="left_shoulder_pitch_link"/>
     <axis xyz="0 1 0"/>
     <limit lower="-2.967" upper="2.967" effort="91" velocity="9.2"/>
@@ -103,7 +139,7 @@
 
   <link name="left_shoulder_roll_link"><inertial><mass value="0.8"/></inertial></link>
   <joint name="left_shoulder_roll_joint" type="revolute">
-    <origin xyz="0 0.05 0" rpy="0 0 0"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
     <parent link="left_shoulder_pitch_link"/><child link="left_shoulder_roll_link"/>
     <axis xyz="1 0 0"/>
     <limit lower="-0.262" upper="2.618" effort="60" velocity="12.6"/>
@@ -111,7 +147,7 @@
 
   <link name="left_shoulder_yaw_link"><inertial><mass value="0.6"/></inertial></link>
   <joint name="left_shoulder_yaw_joint" type="revolute">
-    <origin xyz="0 0.05 0" rpy="0 0 0"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
     <parent link="left_shoulder_roll_link"/><child link="left_shoulder_yaw_link"/>
     <axis xyz="0 0 1"/>
     <limit lower="-2.967" upper="2.967" effort="30" velocity="7.6"/>
@@ -119,7 +155,7 @@
 
   <link name="left_elbow_pitch_link"><inertial><mass value="0.5"/></inertial></link>
   <joint name="left_elbow_pitch_joint" type="revolute">
-    <origin xyz="0 0 -0.22" rpy="0 0 0"/>
+    <origin xyz="0 0 -0.30" rpy="0 0 0"/>
     <parent link="left_shoulder_yaw_link"/><child link="left_elbow_pitch_link"/>
     <axis xyz="0 1 0"/>
     <limit lower="-2.618" upper="0.262" effort="30" velocity="7.6"/>
@@ -127,7 +163,7 @@
 
   <link name="left_wrist_yaw_link"><inertial><mass value="0.3"/></inertial></link>
   <joint name="left_wrist_yaw_joint" type="revolute">
-    <origin xyz="0 0 -0.2" rpy="0 0 0"/>
+    <origin xyz="0 0 -0.24" rpy="0 0 0"/>
     <parent link="left_elbow_pitch_link"/><child link="left_wrist_yaw_link"/>
     <axis xyz="0 0 1"/>
     <limit lower="-2.967" upper="2.967" effort="15" velocity="15.3"/>
@@ -135,7 +171,7 @@
 
   <link name="left_wrist_pitch_link"><inertial><mass value="0.2"/></inertial></link>
   <joint name="left_wrist_pitch_joint" type="revolute">
-    <origin xyz="0 0 -0.05" rpy="0 0 0"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
     <parent link="left_wrist_yaw_link"/><child link="left_wrist_pitch_link"/>
     <axis xyz="0 1 0"/>
     <limit lower="-0.785" upper="1.047" effort="9" velocity="7.5"/>
@@ -143,7 +179,7 @@
 
   <link name="left_wrist_roll_link"><inertial><mass value="0.4"/></inertial></link>
   <joint name="left_wrist_roll_joint" type="revolute">
-    <origin xyz="0 0 -0.05" rpy="0 0 0"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
     <parent link="left_wrist_pitch_link"/><child link="left_wrist_roll_link"/>
     <axis xyz="1 0 0"/>
     <limit lower="-1.658" upper="1.309" effort="9" velocity="7.5"/>
@@ -152,7 +188,7 @@
   <!-- ═══ Right Arm (7 DOF) ═══ -->
   <link name="right_shoulder_pitch_link"><inertial><mass value="1.0"/></inertial></link>
   <joint name="right_shoulder_pitch_joint" type="revolute">
-    <origin xyz="0 -0.18 0.05" rpy="0 0 0"/>
+    <origin xyz="0 -0.22 -0.02" rpy="0 0 0"/>
     <parent link="torso_link"/><child link="right_shoulder_pitch_link"/>
     <axis xyz="0 1 0"/>
     <limit lower="-2.967" upper="2.967" effort="91" velocity="9.2"/>
@@ -160,7 +196,7 @@
 
   <link name="right_shoulder_roll_link"><inertial><mass value="0.8"/></inertial></link>
   <joint name="right_shoulder_roll_joint" type="revolute">
-    <origin xyz="0 -0.05 0" rpy="0 0 0"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
     <parent link="right_shoulder_pitch_link"/><child link="right_shoulder_roll_link"/>
     <axis xyz="1 0 0"/>
     <limit lower="-2.618" upper="0.262" effort="60" velocity="12.6"/>
@@ -168,7 +204,7 @@
 
   <link name="right_shoulder_yaw_link"><inertial><mass value="0.6"/></inertial></link>
   <joint name="right_shoulder_yaw_joint" type="revolute">
-    <origin xyz="0 -0.05 0" rpy="0 0 0"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
     <parent link="right_shoulder_roll_link"/><child link="right_shoulder_yaw_link"/>
     <axis xyz="0 0 1"/>
     <limit lower="-2.967" upper="2.967" effort="30" velocity="7.6"/>
@@ -176,7 +212,7 @@
 
   <link name="right_elbow_pitch_link"><inertial><mass value="0.5"/></inertial></link>
   <joint name="right_elbow_pitch_joint" type="revolute">
-    <origin xyz="0 0 -0.22" rpy="0 0 0"/>
+    <origin xyz="0 0 -0.30" rpy="0 0 0"/>
     <parent link="right_shoulder_yaw_link"/><child link="right_elbow_pitch_link"/>
     <axis xyz="0 1 0"/>
     <limit lower="-2.618" upper="0.262" effort="30" velocity="7.6"/>
@@ -184,7 +220,7 @@
 
   <link name="right_wrist_yaw_link"><inertial><mass value="0.3"/></inertial></link>
   <joint name="right_wrist_yaw_joint" type="revolute">
-    <origin xyz="0 0 -0.2" rpy="0 0 0"/>
+    <origin xyz="0 0 -0.24" rpy="0 0 0"/>
     <parent link="right_elbow_pitch_link"/><child link="right_wrist_yaw_link"/>
     <axis xyz="0 0 1"/>
     <limit lower="-2.967" upper="2.967" effort="15" velocity="15.3"/>
@@ -192,7 +228,7 @@
 
   <link name="right_wrist_pitch_link"><inertial><mass value="0.2"/></inertial></link>
   <joint name="right_wrist_pitch_joint" type="revolute">
-    <origin xyz="0 0 -0.05" rpy="0 0 0"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
     <parent link="right_wrist_yaw_link"/><child link="right_wrist_pitch_link"/>
     <axis xyz="0 1 0"/>
     <limit lower="-0.785" upper="1.047" effort="9" velocity="7.5"/>
@@ -200,10 +236,235 @@
 
   <link name="right_wrist_roll_link"><inertial><mass value="0.4"/></inertial></link>
   <joint name="right_wrist_roll_joint" type="revolute">
-    <origin xyz="0 0 -0.05" rpy="0 0 0"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
     <parent link="right_wrist_pitch_link"/><child link="right_wrist_roll_link"/>
     <axis xyz="1 0 0"/>
     <limit lower="-1.309" upper="1.658" effort="9" velocity="7.5"/>
+  </joint>
+
+  <!-- ═══ Left Inspire Hand (6 status values: 4 fingers + thumb bend + thumb rotation) ═══ -->
+  <link name="left_palm_link"><inertial><mass value="0.15"/></inertial></link>
+  <joint name="left_wrist_to_palm" type="fixed">
+    <!-- Turn the palm toward the robot centre: fingers extend along -Y. -->
+    <origin xyz="0 0 0" rpy="0 0 -1.570796"/>
+    <parent link="left_wrist_roll_link"/><child link="left_palm_link"/>
+  </joint>
+
+  <link name="left_hand_little_link"><inertial><mass value="0.02"/></inertial></link>
+  <joint name="left_hand_little_joint" type="revolute">
+    <origin xyz="0 -0.03 -0.050" rpy="0 0 0"/>
+    <parent link="left_palm_link"/><child link="left_hand_little_link"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.571" upper="0" effort="2" velocity="4"/>
+  </joint>
+  <link name="left_hand_little_distal_link"><inertial><mass value="0.02"/></inertial></link>
+  <joint name="left_hand_little_distal_joint" type="revolute">
+    <origin xyz="0 0 -0.030" rpy="0 0 0"/>
+    <parent link="left_hand_little_link"/><child link="left_hand_little_distal_link"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.571" upper="0" effort="2" velocity="4"/>
+  </joint>
+  <link name="left_hand_little_tip_link"><inertial><mass value="0.01"/></inertial></link>
+  <joint name="left_hand_little_tip" type="fixed">
+    <origin xyz="0 0 -0.030" rpy="0 0 0"/>
+    <parent link="left_hand_little_distal_link"/><child link="left_hand_little_tip_link"/>
+  </joint>
+
+  <link name="left_hand_ring_link"><inertial><mass value="0.02"/></inertial></link>
+  <joint name="left_hand_ring_joint" type="revolute">
+    <origin xyz="0 -0.015 -0.060" rpy="0 0 0"/>
+    <parent link="left_palm_link"/><child link="left_hand_ring_link"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.571" upper="0" effort="2" velocity="4"/>
+  </joint>
+  <link name="left_hand_ring_distal_link"><inertial><mass value="0.02"/></inertial></link>
+  <joint name="left_hand_ring_distal_joint" type="revolute">
+    <origin xyz="0 0 -0.035" rpy="0 0 0"/>
+    <parent link="left_hand_ring_link"/><child link="left_hand_ring_distal_link"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.571" upper="0" effort="2" velocity="4"/>
+  </joint>
+  <link name="left_hand_ring_tip_link"><inertial><mass value="0.01"/></inertial></link>
+  <joint name="left_hand_ring_tip" type="fixed">
+    <origin xyz="0 0 -0.035" rpy="0 0 0"/>
+    <parent link="left_hand_ring_distal_link"/><child link="left_hand_ring_tip_link"/>
+  </joint>
+
+  <link name="left_hand_middle_link"><inertial><mass value="0.02"/></inertial></link>
+  <joint name="left_hand_middle_joint" type="revolute">
+    <origin xyz="0 0 -0.0655" rpy="0 0 0"/>
+    <parent link="left_palm_link"/><child link="left_hand_middle_link"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.571" upper="0" effort="2" velocity="4"/>
+  </joint>
+  <link name="left_hand_middle_distal_link"><inertial><mass value="0.02"/></inertial></link>
+  <joint name="left_hand_middle_distal_joint" type="revolute">
+    <origin xyz="0 0 -0.0375" rpy="0 0 0"/>
+    <parent link="left_hand_middle_link"/><child link="left_hand_middle_distal_link"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.571" upper="0" effort="2" velocity="4"/>
+  </joint>
+  <link name="left_hand_middle_tip_link"><inertial><mass value="0.01"/></inertial></link>
+  <joint name="left_hand_middle_tip" type="fixed">
+    <origin xyz="0 0 -0.0375" rpy="0 0 0"/>
+    <parent link="left_hand_middle_distal_link"/><child link="left_hand_middle_tip_link"/>
+  </joint>
+
+  <link name="left_hand_index_link"><inertial><mass value="0.02"/></inertial></link>
+  <joint name="left_hand_index_joint" type="revolute">
+    <origin xyz="0 0.015 -0.060" rpy="0 0 0"/>
+    <parent link="left_palm_link"/><child link="left_hand_index_link"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.571" upper="0" effort="2" velocity="4"/>
+  </joint>
+  <link name="left_hand_index_distal_link"><inertial><mass value="0.02"/></inertial></link>
+  <joint name="left_hand_index_distal_joint" type="revolute">
+    <origin xyz="0 0 -0.035" rpy="0 0 0"/>
+    <parent link="left_hand_index_link"/><child link="left_hand_index_distal_link"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.571" upper="0" effort="2" velocity="4"/>
+  </joint>
+  <link name="left_hand_index_tip_link"><inertial><mass value="0.01"/></inertial></link>
+  <joint name="left_hand_index_tip" type="fixed">
+    <origin xyz="0 0 -0.035" rpy="0 0 0"/>
+    <parent link="left_hand_index_distal_link"/><child link="left_hand_index_tip_link"/>
+  </joint>
+
+  <link name="left_hand_thumb_rotation_link"><inertial><mass value="0.02"/></inertial></link>
+  <joint name="left_hand_thumb_rotation_joint" type="revolute">
+    <!-- Thumb sits on the index-finger side of the left palm. -->
+    <origin xyz="0 0.035 -0.015" rpy="0 0 -0.349066"/>
+    <parent link="left_palm_link"/><child link="left_hand_thumb_rotation_link"/>
+    <!-- Mirror the right thumb so positive rotation moves toward centre. -->
+    <axis xyz="0 0 -1"/>
+    <limit lower="0" upper="1.571" effort="2" velocity="4"/>
+  </joint>
+  <link name="left_hand_thumb_bend_link"><inertial><mass value="0.02"/></inertial></link>
+  <joint name="left_hand_thumb_bend_joint" type="revolute">
+    <origin xyz="0 0.025 -0.02" rpy="0 0 0"/>
+    <parent link="left_hand_thumb_rotation_link"/><child link="left_hand_thumb_bend_link"/>
+    <!-- Mirror the right thumb's downward bend axis. -->
+    <axis xyz="-1 0 0"/>
+    <limit lower="0" upper="1.571" effort="2" velocity="4"/>
+  </joint>
+  <link name="left_hand_thumb_tip_link"><inertial><mass value="0.01"/></inertial></link>
+  <joint name="left_hand_thumb_tip" type="fixed">
+    <!-- Mirrored right-thumb tip: forward, slightly inward, and downward. -->
+    <origin xyz="0.006 0.035 -0.020" rpy="0 0 0"/>
+    <parent link="left_hand_thumb_bend_link"/><child link="left_hand_thumb_tip_link"/>
+  </joint>
+
+  <!-- ═══ Right Inspire Hand (mirrored lightweight skeleton) ═══ -->
+  <link name="right_palm_link"><inertial><mass value="0.15"/></inertial></link>
+  <joint name="right_wrist_to_palm" type="fixed">
+    <!-- Turn the palm toward the robot centre: fingers extend along +Y. -->
+    <origin xyz="0 0 0" rpy="0 0 1.570796"/>
+    <parent link="right_wrist_roll_link"/><child link="right_palm_link"/>
+  </joint>
+
+  <link name="right_hand_little_link"><inertial><mass value="0.02"/></inertial></link>
+  <joint name="right_hand_little_joint" type="revolute">
+    <!-- The palm is already mirrored, so mirror only this lateral placement. -->
+    <origin xyz="0 0.030 -0.050" rpy="0 0 0"/>
+    <parent link="right_palm_link"/><child link="right_hand_little_link"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.571" upper="0" effort="2" velocity="4"/>
+  </joint>
+  <link name="right_hand_little_distal_link"><inertial><mass value="0.02"/></inertial></link>
+  <joint name="right_hand_little_distal_joint" type="revolute">
+    <origin xyz="0 0 -0.030" rpy="0 0 0"/>
+    <parent link="right_hand_little_link"/><child link="right_hand_little_distal_link"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.571" upper="0" effort="2" velocity="4"/>
+  </joint>
+  <link name="right_hand_little_tip_link"><inertial><mass value="0.01"/></inertial></link>
+  <joint name="right_hand_little_tip" type="fixed">
+    <origin xyz="0 0 -0.030" rpy="0 0 0"/>
+    <parent link="right_hand_little_distal_link"/><child link="right_hand_little_tip_link"/>
+  </joint>
+
+  <link name="right_hand_ring_link"><inertial><mass value="0.02"/></inertial></link>
+  <joint name="right_hand_ring_joint" type="revolute">
+    <origin xyz="0 0.015 -0.060" rpy="0 0 0"/>
+    <parent link="right_palm_link"/><child link="right_hand_ring_link"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.571" upper="0" effort="2" velocity="4"/>
+  </joint>
+  <link name="right_hand_ring_distal_link"><inertial><mass value="0.02"/></inertial></link>
+  <joint name="right_hand_ring_distal_joint" type="revolute">
+    <origin xyz="0 0 -0.035" rpy="0 0 0"/>
+    <parent link="right_hand_ring_link"/><child link="right_hand_ring_distal_link"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.571" upper="0" effort="2" velocity="4"/>
+  </joint>
+  <link name="right_hand_ring_tip_link"><inertial><mass value="0.01"/></inertial></link>
+  <joint name="right_hand_ring_tip" type="fixed">
+    <origin xyz="0 0 -0.035" rpy="0 0 0"/>
+    <parent link="right_hand_ring_distal_link"/><child link="right_hand_ring_tip_link"/>
+  </joint>
+
+  <link name="right_hand_middle_link"><inertial><mass value="0.02"/></inertial></link>
+  <joint name="right_hand_middle_joint" type="revolute">
+    <origin xyz="0 0 -0.0655" rpy="0 0 0"/>
+    <parent link="right_palm_link"/><child link="right_hand_middle_link"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.571" upper="0" effort="2" velocity="4"/>
+  </joint>
+  <link name="right_hand_middle_distal_link"><inertial><mass value="0.02"/></inertial></link>
+  <joint name="right_hand_middle_distal_joint" type="revolute">
+    <origin xyz="0 0 -0.0375" rpy="0 0 0"/>
+    <parent link="right_hand_middle_link"/><child link="right_hand_middle_distal_link"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.571" upper="0" effort="2" velocity="4"/>
+  </joint>
+  <link name="right_hand_middle_tip_link"><inertial><mass value="0.01"/></inertial></link>
+  <joint name="right_hand_middle_tip" type="fixed">
+    <origin xyz="0 0 -0.0375" rpy="0 0 0"/>
+    <parent link="right_hand_middle_distal_link"/><child link="right_hand_middle_tip_link"/>
+  </joint>
+
+  <link name="right_hand_index_link"><inertial><mass value="0.02"/></inertial></link>
+  <joint name="right_hand_index_joint" type="revolute">
+    <origin xyz="0 -0.015 -0.060" rpy="0 0 0"/>
+    <parent link="right_palm_link"/><child link="right_hand_index_link"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.571" upper="0" effort="2" velocity="4"/>
+  </joint>
+  <link name="right_hand_index_distal_link"><inertial><mass value="0.02"/></inertial></link>
+  <joint name="right_hand_index_distal_joint" type="revolute">
+    <origin xyz="0 0 -0.035" rpy="0 0 0"/>
+    <parent link="right_hand_index_link"/><child link="right_hand_index_distal_link"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.571" upper="0" effort="2" velocity="4"/>
+  </joint>
+  <link name="right_hand_index_tip_link"><inertial><mass value="0.01"/></inertial></link>
+  <joint name="right_hand_index_tip" type="fixed">
+    <origin xyz="0 0 -0.035" rpy="0 0 0"/>
+    <parent link="right_hand_index_distal_link"/><child link="right_hand_index_tip_link"/>
+  </joint>
+
+  <link name="right_hand_thumb_rotation_link"><inertial><mass value="0.02"/></inertial></link>
+  <joint name="right_hand_thumb_rotation_joint" type="revolute">
+    <origin xyz="0 -0.035 -0.015" rpy="0 0 0.349066"/>
+    <parent link="right_palm_link"/><child link="right_hand_thumb_rotation_link"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="0" upper="1.571" effort="2" velocity="4"/>
+  </joint>
+  <link name="right_hand_thumb_bend_link"><inertial><mass value="0.02"/></inertial></link>
+  <joint name="right_hand_thumb_bend_joint" type="revolute">
+    <origin xyz="0 -0.025 -0.02" rpy="0 0 0"/>
+    <parent link="right_hand_thumb_rotation_link"/><child link="right_hand_thumb_bend_link"/>
+    <!-- Bend the thumb downward: local X is the right-palm bend axis. -->
+    <axis xyz="1 0 0"/>
+    <limit lower="0" upper="1.571" effort="2" velocity="4"/>
+  </joint>
+  <link name="right_hand_thumb_tip_link"><inertial><mass value="0.01"/></inertial></link>
+  <joint name="right_hand_thumb_tip" type="fixed">
+    <!-- Keep the thumb pointing toward +X (the robot front). -->
+    <!-- Add a small local +X component; after the palm mirror this points
+         toward the robot centre in both open and closed poses. -->
+    <origin xyz="0.006 -0.035 -0.020" rpy="0 0 0"/>
+    <parent link="right_hand_thumb_bend_link"/><child link="right_hand_thumb_tip_link"/>
   </joint>
 
 </robot>

@@ -1,0 +1,9 @@
+id: bumi-driver
+name: Noetix Bumi Bundle
+category: driver
+hardware_provider: noetix
+hardware_model: "bumi"
+image_name: noetix-bumi
+port: 15704
+mcp_url: "http://localhost:15704/mcp"
+description: "Noetix Bumi-EDU — 麦克风 + 扬声器 + 运动控制 + Realsense 摄像头 + 状态感知"

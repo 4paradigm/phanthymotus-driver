@@ -386,7 +386,8 @@ The Agent Core Web Dashboard automatically selects a renderer based on the `form
 | `audio/*` (e.g. `audio/pcm-16k`) | Audio waveform | `hint.startsWith('audio/')` |
 | `video/*` (e.g. `video/mjpeg`) | Video stream | `hint.startsWith('video/')` |
 | `image/jpeg` | Camera image | `hint === 'image/jpeg'` |
-| `image/depth-z16` | Depth colormap | `hint === 'image/depth-z16'` |
+| `image/depth-z16` | Depth colormap (raw) | `hint === 'image/depth-z16'` |
+| `image/depth-zlib` | Depth colormap (zlib compressed) | `hint === 'image/depth-zlib'` |
 | `image` | Generic image | `hint === 'image'` |
 | `data/json` | Text / KV panel | `hint === 'data/json'` |
 | `text/*` | Text display | `hint.startsWith('text/')` |
@@ -396,6 +397,36 @@ The Agent Core Web Dashboard automatically selects a renderer based on the `form
 | `sensor/mapping` | 2D Occupancy map | `hint === 'sensor/mapping'` |
 | `sensor/htmsg` | HT structured message | `hint === 'sensor/htmsg'` |
 | (no hint) | Activity stream | Fallback when no format specified |
+
+### Depth Rendering — `image/depth-z16` vs `image/depth-zlib`
+
+Two depth formats are supported:
+
+- **`image/depth-z16`**: Raw uint16 buffer (640×480 = 614KB/frame). Uses `sensor_msgs/Image`. Simple but high bandwidth — causes CPU saturation on ARM64 due to DDS serialization of large messages.
+
+- **`image/depth-zlib`** (recommended): Zlib-compressed uint16 buffer (~10-15KB/frame). Uses `sensor_msgs/CompressedImage` with `format="16UC1; compressedDepth zlib"`. 47× smaller, negligible publish overhead. Dashboard decompresses in browser using native `DecompressionStream`.
+
+**Driver-side usage (Python):**
+```python
+import zlib
+import numpy as np
+from sensor_msgs.msg import CompressedImage
+
+depth_image = np.asanyarray(depth_frame.get_data())  # uint16, 640×480
+compressed = zlib.compress(depth_image.tobytes(), 1)  # level=1 fastest
+
+msg = CompressedImage()
+msg.format = "16UC1; compressedDepth zlib"
+msg.data = compressed
+publisher.publish(msg)
+```
+
+**Tool definition:**
+```yaml
+topic_out:
+  - topic: /{namespace}/camera/depth
+    format: image/depth-zlib
+```
 
 ### Skeleton Rendering (`sensor/skeleton`) — Full Spec
 
@@ -744,3 +775,80 @@ def _nav_poll_thread(self, action_id, target, stall_timeout=60):
 - Tools without `x-completion` → unchanged behavior (sync return)
 - Tools that don't return `action_id` → no pending registered, barrier passes through
 - Drivers that don't POST completion → barrier will timeout gracefully (uses `x-completion.timeout`)
+
+---
+
+## System Hooks (`x-hooks`)
+
+System hooks enable **instant, bypass-LLM actions** triggered by framework events. Unlike normal tool calls (which require LLM decision + ACP barrier), hooks fire directly and immediately (<50ms).
+
+### Use Cases
+
+- **LED feedback**: blink on hearing, breathe while thinking, flash red on error
+- **Interrupt**: stop TTS/motion instantly on user barge-in (no barrier wait)
+- **Status indicators**: hardware signals for robot state
+
+### How It Works
+
+```
+Driver declares x-hooks in tool schema
+  → Agent Core registers bindings at device init/heartbeat
+  → System event occurs (ASR arrives, LLM starts, error...)
+  → Agent Core fires hook: call_tool_direct() → bypasses barrier + ACP
+  → Driver executes action immediately
+```
+
+### Driver Implementation
+
+Add `x-hooks` to your tool's `inputSchema`:
+
+```python
+"inputSchema": {
+    "type": "object",
+    "properties": { ... },
+    "required": ["action"],
+    "x-hooks": {
+        "on_hearing":    {"action": "effect", "params": {"effect": "blink_blue"}},
+        "on_thinking":   {"action": "effect", "params": {"effect": "breathe_rainbow"}},
+        "on_error":      {"action": "effect", "params": {"effect": "blink_red_5s"}},
+        "on_kws_wakeup": {"action": "effect", "params": {"effect": "solid_blue_2s"}},
+        "on_interrupt_all": {"action": "interrupt_all"},
+    }
+}
+```
+
+Each hook entry maps a `hook_id` to an action + params that will be called directly.
+
+### Available Hook IDs
+
+| Hook ID | Fired When | Typical Binding |
+|---------|-----------|-----------------|
+| `on_hearing` | ASR detects voice activity | LED blink / pause TTS |
+| `on_kws_wakeup` | Wake word detected | LED solid / chime |
+| `on_thinking` | LLM turn starts | LED breathe animation |
+| `on_error` | LLM call fails after retries | LED red flash |
+| `on_interrupt_speak` | User barge-in (speech) | Stop TTS |
+| `on_interrupt_motion` | Emergency stop | Stop locomotion |
+| `on_interrupt_all` | Full interrupt | Stop all outputs |
+
+### Key Differences from Normal Tools
+
+| Aspect | Normal Tool Call | Hook Call |
+|--------|----------------|-----------|
+| Triggered by | LLM decision | System event |
+| Barrier | Waits for pending | Bypasses |
+| ACP | Registers pending | Does not |
+| Latency | 1-5s (LLM round) | <50ms |
+| Schema validation | Yes | No |
+
+### Manual Triggering (API)
+
+```bash
+# Fire a hook manually
+curl -X POST https://localhost:15678/api/hooks/fire \
+  -H 'Content-Type: application/json' \
+  -d '{"hook": "on_interrupt_all"}'
+
+# List registered hooks
+curl https://localhost:15678/api/hooks
+```

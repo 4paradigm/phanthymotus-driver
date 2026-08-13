@@ -623,7 +623,219 @@ class SpeakerPlugin:
         return None
 
 
-# ── SmartMotionPlugin (controller) ─────────────────────────────────────────
+# ── Speaker Isolated Process Mode ─────────────────────────────────────────────
+
+def _speaker_process(network_iface: str, namespace: str, plugin_config: dict,
+                     command_queue, result_queue):
+    """Subprocess: runs SpeakerNode with its own DDS context + ROS2.
+
+    Owns an independent AudioClient whose PlayStream RPC is not blocked by
+    the main process's lidar/SLAM DDS traffic.
+    """
+    import os as _os
+    import sys as _sys
+    _os.setsid()
+
+    try:
+        from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+        ChannelFactoryInitialize(0, network_iface)
+
+        # Suppress C++ stdout
+        _orig_fd = _os.dup(1)
+        _devnull = _os.open(_os.devnull, _os.O_WRONLY)
+        _os.dup2(_devnull, 1)
+        _os.close(_devnull)
+        _sys.stdout = _os.fdopen(_orig_fd, 'w', buffering=1)
+
+        audio_client = AudioClient()
+        audio_client.SetTimeout(10.0)
+        audio_client.Init()
+
+        import rclpy as _rclpy
+        from rclpy.executors import MultiThreadedExecutor
+        _rclpy.init()
+        executor = MultiThreadedExecutor()
+
+        node = _SpeakerNode(audio_client)
+        executor.add_node(node)
+
+        import threading
+        spin_thread = threading.Thread(
+            target=lambda: _spin_until_shutdown(executor),
+            daemon=True, name="speaker_spin",
+        )
+        spin_thread.start()
+
+        result_queue.put({"ready": True})
+        print(f"[Speaker:subprocess] ready, pid={_os.getpid()}", flush=True)
+    except Exception as e:
+        result_queue.put({"ready": False, "error": str(e)})
+        return
+
+    def _play_beep():
+        """Play startup beep synchronously."""
+        import pathlib
+        pcm_path = pathlib.Path(__file__).parent / 'resource' / 'startup_beep.pcm'
+        try:
+            pcm = pcm_path.read_bytes()
+            block_size = 9600
+            for off in range(0, len(pcm), block_size):
+                block = pcm[off:off + block_size]
+                code, _ = audio_client.PlayStream(APP_NAME, "0", block)
+                if code != 0:
+                    print(f"[Speaker:subprocess] startup sound stopped at offset {off}: code={code}", flush=True)
+                    return
+                duration = len(block) / 32000
+                remaining = duration - 0.08
+                if remaining > 0:
+                    time.sleep(remaining)
+            print(f"[Speaker:subprocess] startup sound OK ({len(pcm)} bytes)", flush=True)
+        except Exception as e:
+            print(f"[Speaker:subprocess] startup sound error: {e}", flush=True)
+
+    # Command loop
+    while True:
+        try:
+            cmd = command_queue.get()
+        except Exception:
+            break
+        if cmd is None:
+            break
+        request_id = cmd.get("id")
+        action = cmd.get("action", "")
+        args = cmd.get("args", {})
+        try:
+            if action in ("start", "play"):
+                topic = args.get("input_topic", "")
+                if not topic:
+                    result_queue.put({"id": request_id, "result": {"error": "Missing input_topic"}})
+                    continue
+                node.stop_play()
+                # Play startup sound before starting subscription (same as non-isolated path)
+                _play_beep()
+                topic = node.start_play(topic)
+                result_queue.put({"id": request_id, "result": {"state": "ready", "topic": topic}})
+            elif action == "stop":
+                node.stop_play()
+                result_queue.put({"id": request_id, "result": {"state": "idle"}})
+            elif action == "interrupt":
+                r = node.interrupt()
+                result_queue.put({"id": request_id, "result": r})
+            elif action == "pause":
+                r = node.pause()
+                result_queue.put({"id": request_id, "result": r})
+            elif action == "resume":
+                r = node.resume()
+                result_queue.put({"id": request_id, "result": r})
+            elif action == "info":
+                result_queue.put({"id": request_id, "result": {
+                    "state": node.state,
+                    "topic": node._topic,
+                    "buffer_chunks": node._buf.qsize(),
+                }})
+            else:
+                result_queue.put({"id": request_id, "result": None})
+        except Exception as e:
+            result_queue.put({"id": request_id, "result": {"error": str(e)}})
+
+    node.stop_play()
+    executor.shutdown()
+
+
+def _spin_until_shutdown(executor):
+    import rclpy as _rclpy
+    while _rclpy.ok():
+        executor.spin_once(timeout_sec=0.1)
+
+
+class SpeakerIsolatedProxy:
+    """Main-process proxy: forwards speaker commands to isolated subprocess."""
+
+    PREFIX = "speaker"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor, audio_client=None,
+                 network_iface: str = "eth0"):
+        import multiprocessing as _mp
+        import queue as _q
+
+        self._ipc_lock = threading.Lock()
+        self._request_id = 0
+        self._startup_error = None
+
+        ctx = _mp.get_context("spawn")
+        self._command_queue = ctx.Queue()
+        self._result_queue = ctx.Queue()
+        self._proc = ctx.Process(
+            target=_speaker_process,
+            args=(network_iface, namespace, plugin_config,
+                  self._command_queue, self._result_queue),
+            daemon=False,
+            name="speaker_isolated",
+        )
+        self._proc.start()
+        import atexit
+        atexit.register(self.stop)
+        try:
+            result = self._result_queue.get(timeout=20.0)
+        except _q.Empty:
+            self._startup_error = "speaker subprocess startup timed out"
+            print(f"[Speaker:proxy] {self._startup_error}", flush=True)
+            return
+        if not result.get("ready"):
+            self._startup_error = result.get("error", "subprocess failed to start")
+            print(f"[Speaker:proxy] {self._startup_error}", flush=True)
+            return
+        print(f"[Speaker:proxy] subprocess ready, pid={self._proc.pid}", flush=True)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "speaker",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "G1 speaker — subscribes to ROS2 topic and streams PCM-16k audio to robot speaker",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["start", "stop", "info"],
+                        "description": "Action to perform",
+                    },
+                    "input_topic": {
+                        "type": "string",
+                        "description": "ROS2 topic to subscribe for PCM audio (provided by canvas connection)",
+                    },
+                },
+                "required": ["action"],
+            },
+            "topic_in": [{"format": "audio/pcm-16k"}],
+        }
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        if self._proc and self._proc.is_alive():
+            self._command_queue.put(None)
+            self._proc.join(timeout=5)
+            if self._proc.is_alive():
+                self._proc.terminate()
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        if not self._proc or not self._proc.is_alive():
+            return {"error": self._startup_error or "speaker subprocess is not running"}
+        import queue as _q
+        with self._ipc_lock:
+            self._request_id += 1
+            request_id = self._request_id
+            self._command_queue.put({"id": request_id, "action": action, "args": dict(args)})
+            try:
+                while True:
+                    result = self._result_queue.get(timeout=15.0)
+                    if result.get("id") == request_id:
+                        return result.get("result")
+            except _q.Empty:
+                return {"error": f"speaker action '{action}' timed out (15s)"}
 
 class SmartMotionPlugin:
     """统一打断/暂停控制卡片。协调 speaker + loco 的中止和暂停。"""
@@ -639,25 +851,23 @@ class SmartMotionPlugin:
             "name": "smart_motion",
             "type": "actuator",
             "multiInstance": False,
-            "description": "SmartMotion — 统一运动/输出控制，提供打断、暂停、恢复能力",
+            "description": "SmartMotion — 运动控制，提供运动打断能力",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["interrupt_all", "interrupt_speak", "interrupt_motion",
-                                 "pause_speak", "resume_speak", "status"],
+                        "enum": ["interrupt_motion", "status"],
                         "description": "Action to perform",
                     },
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "interrupt_all":    {"params": [], "description": "中止所有输出（语音+动作同时停止）"},
-                    "interrupt_speak":  {"params": [], "description": "中止语音播放，清空待播队列"},
                     "interrupt_motion": {"params": [], "description": "停止机器人当前运动"},
-                    "pause_speak":      {"params": [], "description": "暂停语音播放（保留未播内容，可恢复）"},
-                    "resume_speak":     {"params": [], "description": "恢复之前暂停的语音播放"},
-                    "status":           {"params": [], "description": "查询当前输出状态（语音/运动）"},
+                    "status":           {"params": [], "description": "查询当前运动状态"},
+                },
+                "x-hooks": {
+                    "on_interrupt_motion": {"action": "interrupt_motion"},
                 },
             },
         }
@@ -673,33 +883,13 @@ class SmartMotionPlugin:
             return {"state": "ready"}
         if action == "stop":
             return {"state": "idle"}
-        if action == "interrupt_all":
-            r1 = self._do_interrupt_speak()
-            r2 = self._do_interrupt_motion()
-            return {"speak": r1, "motion": r2}
-        elif action == "interrupt_speak":
-            return self._do_interrupt_speak()
-        elif action == "interrupt_motion":
+        if action == "interrupt_motion":
             return self._do_interrupt_motion()
-        elif action == "pause_speak":
-            if self._speaker:
-                return self._speaker._node.pause()
-            return {"error": "no speaker plugin"}
-        elif action == "resume_speak":
-            if self._speaker:
-                return self._speaker._node.resume()
-            return {"error": "no speaker plugin"}
         elif action == "status":
             return {
-                "speak": self._speaker.dispatch("info", {}) if self._speaker else None,
                 "motion": self._loco.dispatch("info", {}) if self._loco else None,
             }
         return None
-
-    def _do_interrupt_speak(self) -> dict | None:
-        if self._speaker:
-            return self._speaker._node.interrupt()
-        return {"error": "no speaker plugin"}
 
     def _do_interrupt_motion(self) -> dict | None:
         if self._loco:
@@ -712,22 +902,47 @@ class SmartMotionPlugin:
 class LedPlugin:
     PREFIX = "led"
 
+    # State priority: higher number = higher priority
+    _PRIORITY = {'idle': 0, 'hearing': 1, 'thinking': 3, 'speaking': 4, 'error': 5}
+    # Auto-timeout per state (seconds). None = must be explicitly overridden.
+    _TIMEOUT = {'idle': None, 'hearing': 1.2, 'thinking': 60, 'speaking': 120, 'error': 5}
+
     def __init__(self, plugin_config: dict, namespace: str, executor, audio_client: AudioClient):
         self._client = audio_client
+        self._state = 'idle'
+        self._state_ts = 0.0
+        self._state_lock = threading.Lock()
+        self._effect_thread = None
+        self._effect_stop = threading.Event()
+        self._hw_lock = threading.Lock()  # DDS RPC thread safety
+        self._timeout_timer = None
+
+    def _led_set(self, r: int, g: int, b: int) -> int:
+        """Thread-safe LED control with error logging."""
+        with self._hw_lock:
+            code = self._client.LedControl(r, g, b)
+            if code != 0:
+                print(f'[LED] LedControl({r},{g},{b}) failed: code={code}')
+            return code
 
     def get_tool(self) -> dict:
         return {
             "name": "led",
             "type": "actuator",
             "multiInstance": False,
-            "description": "G1 LED strip control — set RGB color or turn off",
+            "description": "G1 LED strip — state-driven (hook-triggered) or manual RGB control",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["set", "off"],
+                        "enum": ["state", "set", "off"],
                         "description": "Action to perform",
+                    },
+                    "state": {
+                        "type": "string",
+                        "enum": ["idle", "hearing", "thinking", "speaking", "error"],
+                        "description": "Target LED state (for action=state)",
                     },
                     "r": {"type": "integer", "description": "Red 0-255"},
                     "g": {"type": "integer", "description": "Green 0-255"},
@@ -735,8 +950,16 @@ class LedPlugin:
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "set": {"params": ["r", "g", "b"], "description": "Set LED strip to specified RGB color"},
-                    "off": {"params": [],              "description": "Turn off LED strip"},
+                    "state": {"params": ["state"], "description": "Transition LED to semantic state (priority-managed)"},
+                    "set":   {"params": ["r", "g", "b"], "description": "Manual RGB override (bypasses state machine)"},
+                    "off":   {"params": [], "description": "Turn off LED (resets state to idle)"},
+                },
+                "x-hooks": {
+                    "on_hearing":    {"action": "state", "params": {"state": "hearing"}},
+                    "on_thinking":   {"action": "state", "params": {"state": "thinking"}},
+                    "on_speaking":   {"action": "state", "params": {"state": "speaking"}},
+                    "on_idle":       {"action": "state", "params": {"state": "idle"}},
+                    "on_error":      {"action": "state", "params": {"state": "error"}},
                 },
             },
         }
@@ -745,23 +968,138 @@ class LedPlugin:
         pass
 
     def stop(self) -> None:
-        pass
+        self._stop_effect()
+        self._cancel_timeout()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
-            return {"state": "ready"}
+            return {"state": self._state}
         if action == "stop":
+            self._transition('idle')
             return {"state": "idle"}
-        if action == "set":
-            r   = int(args.get("r", 0))
-            g   = int(args.get("g", 0))
-            b   = int(args.get("b", 0))
-            ret = self._client.LedControl(r, g, b)
+        if action == "state":
+            new_state = args.get("state", "idle")
+            if new_state not in self._PRIORITY:
+                return {"error": f"unknown state: {new_state}"}
+            self._transition(new_state)
+            return {"state": self._state}
+        elif action == "set":
+            # Manual override: bypass state machine
+            self._transition('idle')
+            r = int(args.get("r", 0))
+            g = int(args.get("g", 0))
+            b = int(args.get("b", 0))
+            ret = self._led_set(r, g, b)
+            if ret != 0:
+                return {"error": f"LedControl failed (code={ret})", "ret": ret}
             return {"ret": ret, "r": r, "g": g, "b": b}
         elif action == "off":
-            ret = self._client.LedControl(0, 0, 0)
-            return {"ret": ret}
+            self._transition('idle')
+            return {"state": "idle"}
         return None
+
+    # ── State Machine ─────────────────────────────────────────────────────────
+
+    def _transition(self, new_state: str):
+        """Priority-based state transition. Higher priority overrides lower."""
+        import time as _time
+        with self._state_lock:
+            # Speaking min hold: don't allow idle to override within 1s
+            if self._state == 'speaking' and new_state == 'idle':
+                if _time.time() - self._state_ts < 1.0:
+                    return
+            if new_state not in ('idle', 'error'):
+                # Only allow transition to equal-or-higher priority
+                if self._PRIORITY.get(new_state, 0) <= self._PRIORITY.get(self._state, 0):
+                    return
+            self._state = new_state
+            self._state_ts = _time.time()
+
+        self._stop_effect()
+        self._cancel_timeout()
+
+        # Start the state's visual effect (skip idle — no-op)
+        effect_fn = getattr(self, f'_state_{new_state}', None)
+        if effect_fn and new_state != 'idle':
+            self._effect_stop.clear()
+            self._effect_thread = threading.Thread(target=effect_fn, daemon=True)
+            self._effect_thread.start()
+
+        # Schedule auto-timeout to idle (only if state hasn't changed)
+        timeout = self._TIMEOUT.get(new_state)
+        if timeout:
+            expected_state = new_state
+            def _timeout_cb(expected=expected_state):
+                with self._state_lock:
+                    if self._state != expected:
+                        return  # State was overridden by higher priority, don't fall back
+                self._transition('idle')
+            self._timeout_timer = threading.Timer(timeout, _timeout_cb)
+            self._timeout_timer.daemon = True
+            self._timeout_timer.start()
+
+    def _stop_effect(self):
+        """Stop any running effect thread."""
+        self._effect_stop.set()
+        if self._effect_thread and self._effect_thread.is_alive():
+            self._effect_thread.join(timeout=2)
+        # Do NOT clear here — cleared in _transition before starting new thread
+
+    def _cancel_timeout(self):
+        """Cancel pending auto-timeout timer."""
+        if self._timeout_timer:
+            self._timeout_timer.cancel()
+            self._timeout_timer = None
+
+    # ── State Effects ─────────────────────────────────────────────────────────
+
+    def _state_idle(self):
+        """No-op: let firmware blue blink do its thing."""
+        pass
+
+    def _state_hearing(self):
+        """Green solid — 30ms refresh to override firmware."""
+        while not self._effect_stop.is_set():
+            self._led_set(0, 255, 80)
+            if self._effect_stop.wait(0.03): return
+
+    def _state_thinking(self):
+        """Breathing rainbow cycle until overridden."""
+        import math
+        palette = [
+            (0, 200, 255),    # cyan
+            (80, 40, 255),    # blue-purple
+            (180, 0, 255),    # purple
+            (255, 0, 180),    # magenta
+        ]
+        step = 0
+        while not self._effect_stop.is_set():
+            t = (step % 200) / 200.0
+            idx = int(t * len(palette)) % len(palette)
+            next_idx = (idx + 1) % len(palette)
+            frac = (t * len(palette)) - idx
+            r = int(palette[idx][0] * (1 - frac) + palette[next_idx][0] * frac)
+            g = int(palette[idx][1] * (1 - frac) + palette[next_idx][1] * frac)
+            b = int(palette[idx][2] * (1 - frac) + palette[next_idx][2] * frac)
+            brightness = 0.3 + 0.7 * (0.5 + 0.5 * math.sin(step * 0.06))
+            self._led_set(int(r * brightness), int(g * brightness), int(b * brightness))
+            step += 1
+            if self._effect_stop.wait(0.03): return
+
+    def _state_speaking(self):
+        """Tiffany blue solid — 30ms refresh to override firmware."""
+        while not self._effect_stop.is_set():
+            self._led_set(129, 216, 208)
+            if self._effect_stop.wait(0.03): return
+
+    def _state_error(self):
+        """Red solid — 30ms refresh to override firmware."""
+        import time as _time
+        end = _time.monotonic() + 5.0
+        while _time.monotonic() < end:
+            if self._effect_stop.is_set(): return
+            self._led_set(255, 0, 0)
+            if self._effect_stop.wait(0.03): return
 
 
 # ── LocoStatePlugin (sensor) ─────────────────────────────────────────────────
@@ -890,6 +1228,37 @@ class LocoStatePlugin:
         return None
 
 
+# ── ACP notify helper (shared by LocoPlugin) ─────────────────────────────────
+
+import os as _os
+
+_LOCO_AGENT_CORE_URL = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+
+
+def _loco_acp_notify(action_id: str, status: str, result: dict, tool: str = "loco"):
+    """POST ACP completion callback to Agent Core."""
+    import urllib.request as _urllib
+    import ssl as _ssl
+
+    ctx = _ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = _ssl.CERT_NONE
+    payload = json.dumps({
+        "action_id": action_id, "status": status,
+        "result": result, "tool": tool, "ts": time.time(),
+    }).encode()
+    try:
+        req = _urllib.Request(
+            f"{_LOCO_AGENT_CORE_URL}/api/acp/complete",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        _urllib.urlopen(req, timeout=5, context=ctx)
+    except Exception as e:
+        print(f"[Loco] ACP notify failed: {e}")
+
+
 # ── LocoPlugin (actuator) ────────────────────────────────────────────────────
 
 class LocoPlugin:
@@ -941,6 +1310,10 @@ class LocoPlugin:
                     "turn":       {"type": "boolean", "description": "Turn while waving (default false)"},
                 },
                 "required": ["action"],
+                "x-completion": {
+                    "actions": ["move"],
+                    "timeout": 60,
+                },
                 "x-action-params": {
                     "move":             {"params": ["vx", "vy", "vyaw", "duration"], "description": "Move with specified velocities. duration>0 for timed move, 0 or negative for continuous until stop."},
                     "stop_move":        {"params": [],                                 "description": "Stop all movement immediately"},
@@ -984,6 +1357,20 @@ class LocoPlugin:
                     },
                 },
                 "required": ["mode"],
+                "x-completion": {
+                    "actions": ["lie2standup", "standup2lie", "standup2squat", "squat2standup"],
+                    "timeout": 90,
+                },
+                "x-action-params": {
+                    "lie2standup":     {"params": [], "description": "安全起立 (ground/squat → standing)"},
+                    "standup2lie":     {"params": [], "description": "安全躺下 (standing → damping on ground)"},
+                    "standup2squat":   {"params": [], "description": "站到蹲 (standing → squat)"},
+                    "squat2standup":   {"params": [], "description": "蹲到站 (squat → standing)"},
+                    "damp":            {"params": [], "description": "阻尼模式 (ground only)"},
+                    "zero_torque":     {"params": [], "description": "零力矩 (ground only)"},
+                    "emergency_stop":  {"params": [], "description": "紧急阻尼 (any state)"},
+                    "get_current_mode": {"params": [], "description": "查询当前状态"},
+                },
             },
         }
 
@@ -1019,6 +1406,17 @@ class LocoPlugin:
         self._move_timer = None
         self._client.StopMove()
 
+    def _auto_stop_acp(self, action_id: str):
+        """Timer 回调：自动停止运动 + fire ACP callback."""
+        self._move_timer = None
+        self._client.StopMove()
+        _loco_acp_notify(action_id, "completed", {"reason": "duration_expired"}, tool="loco")
+
+    def _acp_wait_move(self, action_id: str, duration: float):
+        """Wait for SmartMotion timed move to complete, then fire ACP callback."""
+        time.sleep(duration + 0.5)  # SmartMotion auto-stops after duration; small buffer
+        _loco_acp_notify(action_id, "completed", {"reason": "duration_expired"}, tool="loco")
+
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
             return {"state": "ready"}
@@ -1038,7 +1436,18 @@ class LocoPlugin:
 
             # Route through SmartMotion safety harness
             if self._smart_motion:
-                return self._smart_motion.move(vx, vy, vyaw, duration)
+                result = self._smart_motion.move(vx, vy, vyaw, duration)
+                if duration > 0:
+                    from uuid import uuid4
+                    action_id = f"g1_move_{uuid4().hex[:8]}"
+                    result["action_id"] = action_id
+                    # SmartMotion handles auto-stop internally; spawn thread to wait and notify
+                    threading.Thread(
+                        target=self._acp_wait_move,
+                        args=(action_id, duration),
+                        daemon=True,
+                    ).start()
+                return result
 
             # Fallback: direct control (no safety harness)
             vx   = max(-1.0, min(1.0, vx))
@@ -1050,15 +1459,18 @@ class LocoPlugin:
                 self._move_timer = None
 
             if duration > 0:
+                from uuid import uuid4
+                action_id = f"g1_move_{uuid4().hex[:8]}"
                 # G1 SetVelocity duration has known bugs — use Timer fallback
                 ret = self._client.Move(vx, vy, vyaw, True)
-                self._move_timer = threading.Timer(duration, self._auto_stop)
+                self._move_timer = threading.Timer(duration, self._auto_stop_acp, args=[action_id])
                 self._move_timer.start()
+                return {"status": "moving", "action_id": action_id,
+                        "vx": vx, "vy": vy, "vyaw": vyaw, "duration": duration}
             else:
                 # Continuous move until explicit stop
                 ret = self._client.Move(vx, vy, vyaw, True)
-
-            return {"ret": ret, "vx": vx, "vy": vy, "vyaw": vyaw, "duration": duration}
+                return {"ret": ret, "vx": vx, "vy": vy, "vyaw": vyaw, "duration": duration}
         elif action == "stop_move":
             # Route through SmartMotion safety harness
             if self._smart_motion:
@@ -1075,8 +1487,11 @@ class LocoPlugin:
                     pass
             ret = self._client.StopMove()
             return {"ret": ret}
-        elif action == "switch_mode":
-            mode = args.get("mode", "")
+        elif action in ("switch_mode", "lie2standup", "standup2lie", "standup2squat",
+                        "squat2standup", "damp", "zero_torque", "emergency_stop", "get_current_mode"):
+            # x-action-params split: action is the mode directly
+            # Legacy: action == "switch_mode" with mode in args
+            mode = action if action != "switch_mode" else args.get("mode", "")
             code, current_fsm = self._client.GetFsmId()
 
             if code != 0:
@@ -1113,11 +1528,11 @@ class LocoPlugin:
                     if current_fsm == 0:
                         steps.append(("Damp", 1, "damp"))
                     steps.append(("Lie2StandUp", 500, "lie2standup"))
-                    return self._run_fsm_sequence(steps)
+                    return self._async_fsm(mode, steps)
                 # From low states (squat/prep): start(500)
                 if current_fsm in self._LOW_STATES:
                     steps = [("Start", 500, "start")]
-                    return self._run_fsm_sequence(steps)
+                    return self._async_fsm(mode, steps)
                 return {"error": f"Cannot stand up from FSM={current_fsm}"}
 
             elif mode == "standup2lie":
@@ -1128,10 +1543,10 @@ class LocoPlugin:
                     self._client.StopMove()
                     import time as _time; _time.sleep(1.0)
                     steps = [("StandUp2Squat", 2, "standup2squat"), ("Damp", 1, "damp")]
-                    return self._run_fsm_sequence(steps)
+                    return self._async_fsm(mode, steps)
                 if current_fsm in self._LOW_STATES:
                     steps = [("Damp", 1, "damp")]
-                    return self._run_fsm_sequence(steps)
+                    return self._async_fsm(mode, steps)
                 return {"error": f"Cannot lie down from FSM={current_fsm}. Use emergency_stop if needed."}
 
             elif mode == "standup2squat":
@@ -1141,7 +1556,7 @@ class LocoPlugin:
                     self._client.StopMove()
                     import time as _time; _time.sleep(1.0)
                     steps = [("StandUp2Squat", 2, "standup2squat")]
-                    return self._run_fsm_sequence(steps)
+                    return self._async_fsm(mode, steps)
                 return {"error": f"Cannot squat from FSM={current_fsm}. Use emergency_stop if needed."}
 
             elif mode == "squat2standup":
@@ -1149,7 +1564,7 @@ class LocoPlugin:
                     return {"info": "Robot is already standing", "fsm_id": current_fsm}
                 if current_fsm in self._LOW_STATES:
                     steps = [("Start", 500, "start")]
-                    return self._run_fsm_sequence(steps)
+                    return self._async_fsm(mode, steps)
                 if current_fsm in self._GROUND_STATES:
                     return {"error": f"Robot is on ground (FSM={current_fsm}). Use lie2standup instead."}
                 return {"error": f"Cannot stand from FSM={current_fsm}"}
@@ -1213,6 +1628,23 @@ class LocoPlugin:
         if result is None:
             return {"error": "RPC timeout during sequence execution"}
         return result
+
+    def _async_fsm(self, mode: str, steps: list) -> dict:
+        """Launch FSM sequence asynchronously, return action_id immediately."""
+        from uuid import uuid4
+        action_id = f"g1_fsm_{uuid4().hex[:8]}"
+        threading.Thread(
+            target=self._acp_fsm_sequence,
+            args=(action_id, mode, steps),
+            daemon=True,
+        ).start()
+        return {"status": "executing", "mode": mode, "action_id": action_id}
+
+    def _acp_fsm_sequence(self, action_id: str, mode: str, steps: list):
+        """Background thread: execute FSM sequence, then fire ACP callback."""
+        result = self._run_fsm_sequence(steps)
+        status = "error" if result.get("error") else "completed"
+        _loco_acp_notify(action_id, status, {"mode": mode, **result}, tool="switch_mode")
 
 
 # ── AsrPlugin (sensor) ───────────────────────────────────────────────────────

@@ -139,6 +139,46 @@ def _enumerate_ext_mics() -> list[dict]:
     return devices
 
 
+def _parse_arecord_output(output: str) -> list[dict]:
+    """Parse arecord -l output into device list, excluding internal devices."""
+    devices = []
+    EXCLUDE = ["realsense", "nvidia", "tegra", "hdmi", "ape"]
+    for line in output.splitlines():
+        m = re.match(r'card (\d+): (\w+) \[(.+?)\], device (\d+):', line)
+        if m:
+            card_idx, card_id, desc, dev_idx = m.groups()
+            if any(x in desc.lower() or x in card_id.lower() for x in EXCLUDE):
+                continue
+            devices.append({
+                "card": int(card_idx),
+                "device": int(dev_idx),
+                "name": desc,
+                "alsa_id": f"hw:{card_idx},{dev_idx}",
+            })
+    return devices
+
+
+def _parse_hw_params(output: str) -> dict:
+    """Parse arecord --dump-hw-params output for format/rate/channels."""
+    info = {"format": "S16_LE", "rate": 48000, "channels": 1}
+    for line in output.splitlines():
+        if line.strip().startswith('FORMAT:'):
+            fmts = line.split('FORMAT:')[1].strip().split()
+            if 'S24_3LE' in fmts:
+                info["format"] = "S24_3LE"
+            elif 'S16_LE' in fmts:
+                info["format"] = "S16_LE"
+        elif 'CHANNELS:' in line:
+            ch = line.split('CHANNELS:')[1].strip()
+            if '2' in ch:
+                info["channels"] = 2
+        elif 'RATE:' in line:
+            rates = [int(x) for x in re.findall(r'\d+', line.split('RATE:')[1])]
+            if rates:
+                info["rate"] = min(rates)
+    return info
+
+
 def _enumerate_ext_cameras() -> list[dict]:
     """List external V4L2 video capture devices (excluding RealSense)."""
     devices = []
@@ -402,7 +442,8 @@ class _ExtMicNode(Node):
 class _NetworkMicNode(Node):
     """Captures audio from a remote host via SSH + arecord and publishes AudioChunk."""
 
-    def __init__(self, url: str, device_name: str, namespace: str, instance_id: str, context=None):
+    def __init__(self, url: str, device_name: str, namespace: str, instance_id: str, context=None,
+                 ssh_user: str = "", ssh_pass: str = "", ssh_script: str = "", ssh_card: str = "1"):
         node_name = f"ext_mic_{instance_id.replace('-', '_')}"
         super().__init__(node_name, context=context)
         self._url = url  # "ssh://user:pass@host/hw:card,dev" or "tcp://host:port"
@@ -413,10 +454,23 @@ class _NetworkMicNode(Node):
         self._thread: Optional[threading.Thread] = None
         self._running = False
         self.state = "idle"
+        # SSH management config for remote audio_sender health check / restart
+        self._ssh_user = ssh_user
+        self._ssh_pass = ssh_pass
+        self._ssh_script = ssh_script
+        self._ssh_card = ssh_card
 
     def start(self) -> dict:
         if self.state == "running":
-            return self._status_dict()
+            # Check if capture thread is actually alive
+            if self._thread and self._thread.is_alive():
+                return self._status_dict()
+            # Thread died — reset and restart
+            self._running = False
+            self._thread = None
+            self.state = "idle"
+            log.warning(f"[ext_mic/net] thread was dead for {self._device_name}, restarting")
+
         self._running = True
         self._thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._thread.start()
@@ -584,6 +638,9 @@ class _NetworkMicNode(Node):
         host, port = url_body.rsplit(":", 1)
         port = int(port)
 
+        # Health check: ensure remote audio_sender is alive and streaming
+        self._ensure_remote_ready(host, port)
+
         # S24_3LE stereo 48kHz params
         FRAME_SIZE = 6  # 3 bytes * 2 channels
         NATIVE_RATE = 48000
@@ -599,7 +656,7 @@ class _NetworkMicNode(Node):
                 sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
                 sock.settimeout(5.0)
                 sock.connect((host, port))
-                sock.settimeout(None)
+                sock.settimeout(10.0)  # detect stale connection (no data for 10s)
                 sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
                 connect_failures = 0  # reset on successful connect
                 print(f"[ext_mic/tcp] connected to {host}:{port} (pre_converted={pre_converted})", flush=True)
@@ -609,7 +666,11 @@ class _NetworkMicNode(Node):
                 first_publish = True
 
                 while self._running:
-                    data = sock.recv(8192)
+                    try:
+                        data = sock.recv(8192)
+                    except _socket.timeout:
+                        print(f"[ext_mic/tcp] no data for 10s, reconnecting...", flush=True)
+                        break
                     if not data:
                         break
 
@@ -671,6 +732,79 @@ class _NetworkMicNode(Node):
                         pass
             if self._running:
                 time.sleep(2)
+                self._ensure_remote_ready(host, port)
+
+    def _ensure_remote_ready(self, host: str, port: int, force_restart: bool = False):
+        """Check remote audio_sender health; restart via SSH if unhealthy."""
+        import socket as _socket
+        import subprocess as _subprocess
+
+        # Step 1: probe — connect and try to read data within 3s
+        if not force_restart:
+            healthy = False
+            try:
+                sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+                sock.settimeout(3.0)
+                sock.connect((host, port))
+                sock.settimeout(3.0)
+                data = sock.recv(1024)
+                healthy = len(data) > 0
+                sock.close()
+            except Exception:
+                pass
+
+            if healthy:
+                return
+
+        # Step 2: unhealthy — SSH restart if config available
+        if not self._ssh_user or not self._ssh_script:
+            print(f"[ext_mic/tcp] remote unhealthy on {host}:{port} but no SSH config", flush=True)
+            return
+
+        print(f"[ext_mic/tcp] remote unhealthy, restarting via SSH...", flush=True)
+        # Use SIGKILL to ensure immediate termination
+        kill_cmd = f"pkill -9 -f '{self._ssh_script}' 2>/dev/null"
+        ssh_base = [
+            "sshpass", "-p", self._ssh_pass,
+            "ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
+            f"{self._ssh_user}@{host}",
+        ]
+        try:
+            _subprocess.run(ssh_base + [kill_cmd], capture_output=True, timeout=10)
+        except Exception as e:
+            print(f"[ext_mic/tcp] SSH kill failed: {e}", flush=True)
+
+        # Wait for ALSA device to be fully released
+        time.sleep(3)
+
+        # Start fresh audio_sender
+        start_cmd = (
+            f"nohup python3 {self._ssh_script} --port {port} --card {self._ssh_card} "
+            f"> /tmp/audio_sender.log 2>&1 &"
+        )
+        try:
+            _subprocess.run(ssh_base + [start_cmd], capture_output=True, timeout=10)
+        except Exception as e:
+            print(f"[ext_mic/tcp] SSH start failed: {e}", flush=True)
+            return
+
+        # Step 3: wait for ready — poll TCP until data received (max ~10s)
+        for i in range(5):
+            time.sleep(2)
+            try:
+                sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+                sock.settimeout(3.0)
+                sock.connect((host, port))
+                sock.settimeout(3.0)
+                data = sock.recv(1024)
+                sock.close()
+                if len(data) > 0:
+                    print(f"[ext_mic/tcp] remote ready after restart ({(i+1)*2}s)", flush=True)
+                    return
+            except Exception:
+                pass
+
+        print(f"[ext_mic/tcp] remote still not ready after restart, proceeding anyway", flush=True)
 
     def stop(self) -> dict:
         self._running = False
@@ -908,20 +1042,25 @@ TOOLS_EXT_CAMERA = [
 class ExtMicPlugin:
     PREFIX = "ext_mic"
 
-    def __init__(self, plugin_cfg: dict, namespace: str, executor):
+    def __init__(self, plugin_cfg: dict, namespace: str, executor, remote_devices: list = None):
         self._namespace = namespace
         self._executor = executor
         self._nodes: dict[str, _ExtMicNode] = {}
         self._instance_configs: dict[str, dict] = {}  # instance_id → saved config params
         self._available_devices = _enumerate_ext_mics()
-        # Add network sources from config
-        for ns in plugin_cfg.get("network_sources", []):
-            self._available_devices.append({
-                "index": ns["url"],
-                "alsa_id": ns["url"],
-                "name": ns.get("name", ns["url"]),
-                "network": True,
-            })
+        # Add dynamically probed remote devices (from main.py _probe_remote_mics)
+        if remote_devices:
+            self._available_devices.extend(remote_devices)
+        elif plugin_cfg.get("network_sources"):
+            # Fallback: static config (backward compat if probe not called)
+            for ns in plugin_cfg.get("network_sources", []):
+                url = ns.get("url", f"tcp://{ns.get('ssh_host', '')}:{ns.get('port', 9800)}/pcm16k")
+                self._available_devices.append({
+                    "index": url,
+                    "alsa_id": url,
+                    "name": ns.get("name", ns.get("ssh_host", "Remote Mic")),
+                    "network": True,
+                })
         log.info(f"[ext_mic] found {len(self._available_devices)} external mic device(s)")
         for d in self._available_devices:
             log.info(f"  [{d['index']}] {d['name']}")
@@ -935,9 +1074,25 @@ class ExtMicPlugin:
             "properties": {
                 "device_index": {
                     "type": "string",
-                    "description": "音频设备",
+                    "description": "Audio device",
                     "scope": "instance",
-                    "oneOf": device_options if device_options else [{"const": "", "title": "无可用设备"}],
+                    "oneOf": device_options if device_options else [{"const": "", "title": "No devices available"}],
+                },
+                "ssh_host": {
+                    "type": "string",
+                    "description": "Remote host address",
+                    "default": "192.168.41.1",
+                },
+                "ssh_user": {
+                    "type": "string",
+                    "description": "SSH username",
+                    "default": "ubuntu",
+                },
+                "ssh_pass": {
+                    "type": "string",
+                    "format": "password",
+                    "description": "SSH password",
+                    "default": "123",
                 },
             },
         }
@@ -951,6 +1106,92 @@ class ExtMicPlugin:
             self._nodes[key].stop()
             self._executor.remove_node(self._nodes[key])
             del self._nodes[key]
+
+    def _probe_remote(self, ssh_host: str, ssh_user: str, ssh_pass: str,
+                      port: int, script: str) -> list[dict]:
+        """SSH probe remote host: detect devices, deploy & start audio_sender, cache results."""
+        import subprocess as _sp
+        from pathlib import Path
+
+        def _ssh(cmd, timeout=10):
+            return _sp.run(
+                ["sshpass", "-p", ssh_pass, "ssh",
+                 "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=3",
+                 f"{ssh_user}@{ssh_host}", cmd],
+                capture_output=True, text=True, timeout=timeout)
+
+        # Remove old remote devices for this host
+        self._available_devices = [d for d in self._available_devices
+                                   if not (d.get("network") and d.get("_ssh_host") == ssh_host)]
+
+        # Probe devices
+        try:
+            result = _ssh("arecord -l")
+            devices = _parse_arecord_output(result.stdout + result.stderr)
+        except Exception as e:
+            log.warning(f"[ext_mic/probe] {ssh_host}: SSH failed: {e}")
+            return []
+
+        if not devices:
+            log.info(f"[ext_mic/probe] {ssh_host}: no capture devices")
+            return []
+
+        # Probe hw params for each device
+        for dev in devices:
+            try:
+                hw = _ssh(f"arecord -D hw:{dev['card']},{dev['device']} --dump-hw-params -d 1 /dev/null 2>&1")
+                dev.update(_parse_hw_params(hw.stdout + hw.stderr))
+            except Exception:
+                dev.setdefault("format", "S16_LE")
+                dev.setdefault("rate", 16000)
+                dev.setdefault("channels", 1)
+
+        # Deploy audio_sender.py if missing
+        try:
+            check = _ssh(f"test -f {script} && echo EXISTS")
+            if "EXISTS" not in (check.stdout or ""):
+                local_src = str(Path(__file__).parent / "audio_sender.py")
+                _sp.run(["sshpass", "-p", ssh_pass, "scp",
+                         "-o", "StrictHostKeyChecking=no",
+                         local_src, f"{ssh_user}@{ssh_host}:{script}"],
+                        check=True, timeout=15)
+                log.info(f"[ext_mic/probe] {ssh_host}: deployed audio_sender.py")
+        except Exception as e:
+            log.warning(f"[ext_mic/probe] {ssh_host}: deploy failed: {e}")
+
+        # Start audio_sender if not running
+        primary_card = devices[0]["card"]
+        try:
+            check = _ssh("pgrep -f audio_sender.py")
+            if check.returncode != 0 or not check.stdout.strip():
+                _ssh(f"nohup python3 {script} --port {port} --card {primary_card} "
+                     f"> /tmp/audio_sender.log 2>&1 &")
+                time.sleep(1)
+                log.info(f"[ext_mic/probe] {ssh_host}: started audio_sender (card={primary_card}, port={port})")
+        except Exception:
+            pass
+
+        # Cache results and return summary
+        probed = []
+        for dev in devices:
+            fmt_desc = f"{dev.get('format', '?')}/{dev.get('rate', '?')}Hz/{dev.get('channels', '?')}ch"
+            entry = {
+                "index": f"tcp://{ssh_host}:{port}/pcm16k",
+                "alsa_id": f"tcp://{ssh_host}:{port}/pcm16k",
+                "name": f"{dev['name']} ({fmt_desc}) @ {ssh_host}",
+                "network": True,
+                "_ssh_host": ssh_host,
+                "_ssh_user": ssh_user,
+                "_ssh_pass": ssh_pass,
+                "_ssh_card": str(dev["card"]),
+                "_ssh_script": script,
+                "_port": port,
+            }
+            self._available_devices.append(entry)
+            probed.append({"name": entry["name"], "url": entry["alsa_id"]})
+
+        log.info(f"[ext_mic/probe] {ssh_host}: found {len(devices)} device(s)")
+        return probed
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         instance_id = args.get("instance_id", "")
@@ -997,8 +1238,19 @@ class ExtMicPlugin:
                 pass  # keep as string (alsa_id like "hw:0,0" or "tcp://...")
             if instance_id not in self._nodes:
                 if isinstance(device_id, str) and (device_id.startswith("tcp://") or device_id.startswith("ssh://")):
+                    # Extract SSH params from available_devices for health check/restart
+                    ssh_params = {}
+                    for d in self._available_devices:
+                        if d.get("alsa_id") == device_id or d.get("index") == device_id:
+                            ssh_params = {
+                                "ssh_user": d.get("_ssh_user", ""),
+                                "ssh_pass": d.get("_ssh_pass", ""),
+                                "ssh_script": d.get("_ssh_script", ""),
+                                "ssh_card": d.get("_ssh_card", "1"),
+                            }
+                            break
                     node = _NetworkMicNode(device_id, device_name, self._namespace, instance_id,
-                                           context=self._executor.context)
+                                           context=self._executor.context, **ssh_params)
                 else:
                     node = _ExtMicNode(device_id, device_name, self._namespace, instance_id,
                                        context=self._executor.context)
@@ -1022,12 +1274,25 @@ class ExtMicPlugin:
             return {"state": "idle"}
 
         elif action == "config":
-            # Save instance config params for later use during start
             if instance_id:
+                # Instance config (per-card device selection)
                 self._instance_configs[instance_id] = {
                     k: v for k, v in args.items() if k not in ('action', 'instance_id')
                 }
-            return {"configured": True, "instance_id": instance_id}
+                return {"configured": True, "instance_id": instance_id}
+            else:
+                # Shared config (sidebar SSH settings) — trigger remote probe
+                ssh_host = args.get("ssh_host", "").strip()
+                if ssh_host:
+                    probed = self._probe_remote(
+                        ssh_host=ssh_host,
+                        ssh_user=args.get("ssh_user", "ubuntu"),
+                        ssh_pass=args.get("ssh_pass", "123"),
+                        port=9800,
+                        script="/home/ubuntu/audio_sender.py",
+                    )
+                    return {"configured": True, "remote_devices": probed}
+                return {"configured": True}
 
         return None
 
