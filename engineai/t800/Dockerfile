@@ -11,9 +11,6 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
         python3-pip \
         build-essential \
         cmake && \
-    if ! /bin/bash -lc "source /opt/ros/humble/setup.bash && ros2 pkg prefix rmw_cyclonedds_cpp >/dev/null 2>&1"; then \
-        apt-get install -y --no-install-recommends --allow-unauthenticated ros-humble-rmw-cyclonedds-cpp; \
-    fi && \
     rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /tmp/t800-requirements.txt
@@ -28,11 +25,11 @@ COPY main.py device.py control.py native_sdk.py virtual_gamepad.py config.yaml d
 COPY resource/ /work/resource/
 COPY deploy/ /deploy/
 
-ENV RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+ENV T800_PREFERRED_RMW=rmw_cyclonedds_cpp
 ENV ROS_LOCALHOST_ONLY=0
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/work
 
 EXPOSE 15708
 
-CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /t800_ws/install/setup.bash && export CYCLONEDDS_URI=\"<CycloneDDS><Domain><General><Interfaces><NetworkInterface name='${NETWORK_INTERFACE:-eth0}'/></Interfaces></General></Domain></CycloneDDS>\" && python3 /work/main.py"]
+CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /t800_ws/install/setup.bash && if ros2 pkg prefix \"${T800_PREFERRED_RMW}\" >/dev/null 2>&1; then export RMW_IMPLEMENTATION=\"${T800_PREFERRED_RMW}\"; fi && export CYCLONEDDS_URI=\"<CycloneDDS><Domain><General><Interfaces><NetworkInterface name='${NETWORK_INTERFACE:-eth0}'/></Interfaces></General></Domain></CycloneDDS>\" && python3 /work/main.py"]
