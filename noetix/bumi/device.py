@@ -8,8 +8,7 @@ drivers/noetix/bumi/device.py — Noetix Bumi-EDU 设备插件实现。
   - MicPlugin: 8ch mic capture → mono PCM 16kHz
   - SpeakerPlugin: audio playback via MediaController
   - CameraPlugin: Realsense D435i color + depth
-  - MotionStatePlugin: motion/safety state and change history
-  - MediaSystemPlugin: MediaController status/configuration
+  - MotionStatePlugin: combined whole-body motion state
 """
 
 import json
@@ -19,7 +18,6 @@ import struct
 import subprocess
 import threading
 import time
-from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -60,16 +58,15 @@ _BUMI_JOINT_NAMES = [
 # Lazy-loaded from highcontrol_py.ControlCmd enum at runtime
 
 _MODE_TO_CMD_NAME = {
+    "enable": "START",      # 仅从失能模式进入使能模式
+    "disable": "START",     # 从任意非失能模式进入失能模式
+    "ready": "SWITCH",      # 准备模式
     "walk": "WALK",
     "swing": "SWING",       # 挥手
     "shake": "SHAKE",       # 握手
     "cheer": "CHEER",       # 欢呼
-    "run": "RUN",           # 预留
-    "enable": "START",      # 使能/失能
-    "ready": "SWITCH",      # 准备模式
     "start_teach": "STARTTEACH",
     "save_teach": "SAVETEACH",
-    "end_teach": "ENDTEACH",
     "play_teach": "PLAYTEACH",
     "dance": "DANCE",
     "fall_to_stand": "FALLTOSTAND",
@@ -77,6 +74,26 @@ _MODE_TO_CMD_NAME = {
     "dance1": "DANCE1",
     "dance2": "DANCE2",
     "tear": "TEAR",         # 擦眼泪
+}
+
+_MODE_EXPECTED_WORKMODES = {
+    "enable": {0},
+    "disable": {30},
+    "ready": {1},
+    "walk": {2},
+    "swing": {8},
+    "shake": {9},
+    "cheer": {10},
+    "start_teach": {11},
+    # SAVETEACH reports exit-teach/save stages according to the vendor docs.
+    "save_teach": {12, 14, 29},
+    "play_teach": {23},
+    "dance": {5},
+    "fall_to_stand": {27, 2},
+    "stand_to_fall": {28, 30},
+    "dance1": {31},
+    "dance2": {32},
+    "tear": {33},
 }
 
 _ControlCmd = None  # Lazy-loaded enum module
@@ -345,34 +362,35 @@ class LocoPlugin:
             "name": "switch_mode",
             "type": "actuator",
             "multiInstance": False,
-            "description": "Bumi mode switching — switch between walking, gestures, dance, teach modes.",
+            "description": "Bumi 运控模式管理。切换前检查厂商规定的直接前置状态，但不会替用户自动补齐状态链；前置状态不符时返回安全操作顺序，便于用户先确认机器人姿态和环境。实际发送模式命令前会停止本卡片的速度命令。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
                         "enum": ["switch", "get_mode"],
+                        "description": "switch=切换或触发 mode；get_mode=只查询当前模式。enable 和 disable 请在 switch 的 mode 中选择。",
                     },
                     "mode": {
                         "type": "string",
                         "enum": list(_MODE_TO_CMD_NAME.keys()),
-                        "description": "Target mode to switch to.",
+                        "description": "仅 switch 使用。enable=从失能进入使能；disable=进入失能；ready=准备；walk=走路；swing=挥手；shake=握手；cheer=欢呼；start_teach/save_teach/play_teach=开始/保存/播放示教；dance/dance1/dance2=三种舞蹈；fall_to_stand=倒地起身；stand_to_fall=起身倒地；tear=擦眼泪。run 当前不可用，end_teach 已弃用。",
                     },
                     "index": {
                         "type": "integer",
-                        "description": "Teach file index (for save_teach/play_teach)",
-                        "minimum": 0,
+                        "description": "仅 save_teach/play_teach 使用的示教文件编号，范围 0～65535；其他模式无需填写。",
+                        "minimum": 0, "maximum": 65535,
                     },
                 },
                 "required": ["action"],
                 "x-action-params": {
                     "switch": {
                         "params": ["mode", "index"],
-                        "description": "Switch robot to specified mode. Edge-triggered (sends once).",
+                        "description": "先检查当前 workmode 是否是目标模式的直接前置状态；不符合时不发送命令，而是返回 required_sequence。符合时只发送一次命令并用 DEFAULT 释放。",
                     },
                     "get_mode": {
                         "params": [],
-                        "description": "Get current workmode.",
+                        "description": "读取当前 workmode 编号、名称以及当前是否处于失能/保护状态。",
                     },
                 },
             },
@@ -416,11 +434,18 @@ class LocoPlugin:
 
     def _do_move(self, args: dict) -> dict:
         # Check if in walking mode
-        mode = self._high_ctrl.get_mode()
+        mode = int(self._high_ctrl.get_mode())
         if mode == 26:
-            return {"error": "Robot in protection mode, cannot move"}
-        if mode not in (2, 0, 1):
-            return {"error": f"Cannot move in workmode {mode} ({_WORKMODE_NAMES.get(mode, 'unknown')}). Switch to walk mode first."}
+            return {"state": "error", "error": "Robot in protection mode, cannot move"}
+        if mode != 2:
+            return {
+                "state": "error",
+                "error": (
+                    f"movement requires workmode=2 (walking); current mode is "
+                    f"{mode} ({_WORKMODE_NAMES.get(mode, 'unknown')}). "
+                    "Use switch_mode switch=walk first."
+                ),
+            }
 
         vx = float(args.get("vx", 0))
         vy = float(args.get("vy", 0))
@@ -471,39 +496,179 @@ class LocoPlugin:
 
     def _do_switch(self, args: dict) -> dict:
         mode_str = args.get("mode", "")
-        index = int(args.get("index", 0))
 
         if mode_str not in _MODE_TO_CMD_NAME:
-            return {"error": f"Unknown mode: {mode_str}. Available: {list(_MODE_TO_CMD_NAME.keys())}"}
+            return {
+                "state": "error",
+                "error": f"Unknown mode: {mode_str}. Available: {list(_MODE_TO_CMD_NAME.keys())}",
+            }
 
-        # Safety: check protection mode
-        current_mode = self._high_ctrl.get_mode()
+        if mode_str in ("save_teach", "play_teach") and "index" not in args:
+            return {"state": "error", "error": f"index is required for {mode_str}"}
+        try:
+            index = int(args.get("index", 0))
+        except (TypeError, ValueError):
+            return {"state": "error", "error": "index must be an integer"}
+        if not 0 <= index <= 65535:
+            return {"state": "error", "error": "index must be in [0, 65535]"}
+
+        current_mode = int(self._high_ctrl.get_mode())
+        if mode_str == "disable":
+            return self._switch_disable(current_mode)
         if current_mode == 26:
-            return {"error": "Robot in protection mode. Cannot switch modes."}
+            return {"state": "error", "error": "Robot in protection mode. Cannot switch modes."}
+        if mode_str == "enable":
+            return self._switch_enable(current_mode)
+
+        persistent_modes = {"ready": 1, "walk": 2}
+        if mode_str in persistent_modes and current_mode == persistent_modes[mode_str]:
+            return self._already_in_mode(mode_str, current_mode)
+
+        allowed_predecessors = {
+            "ready": {0, 2},
+            "walk": {1},
+            "fall_to_stand": {1},
+            "save_teach": {11},
+        }
+        required_modes = allowed_predecessors.get(mode_str, {2})
+        if current_mode not in required_modes:
+            return self._prerequisite_error(mode_str, current_mode, required_modes)
+
+        # Prevent the 50 Hz movement publisher from racing with an edge-triggered
+        # mode command and overwriting it with DEFAULT. This happens only after
+        # the prerequisite check succeeds, so a rejected request changes nothing.
+        self._stop_move()
 
         cmd_enum = _get_control_cmd(_MODE_TO_CMD_NAME[mode_str])
-
-        # Edge-trigger: send action once, then DEFAULT
-        self._publish_cmd(0, 0, 0, cmd_enum, index)
-        time.sleep(0.003)  # ≥2ms
-        self._publish_cmd(0, 0, 0, _get_default_cmd(), 0)
-
-        # Wait briefly and check new mode
-        time.sleep(0.1)
-        new_mode = self._high_ctrl.get_mode()
-
+        observed = self._send_edge_and_wait(
+            cmd_enum, _MODE_EXPECTED_WORKMODES[mode_str], index=index, timeout_s=3.0)
+        transition_steps = [{
+            "command": _MODE_TO_CMD_NAME[mode_str],
+            "expected_workmodes": sorted(_MODE_EXPECTED_WORKMODES[mode_str]),
+            "observed_workmode": observed,
+        }]
+        confirmed = observed in _MODE_EXPECTED_WORKMODES[mode_str]
         return {
-            "state": "switched",
+            "state": "completed" if confirmed else "accepted",
             "requested": mode_str,
-            "workmode": new_mode,
-            "workmode_name": _WORKMODE_NAMES.get(new_mode, "unknown"),
+            "confirmed": confirmed,
+            "workmode": observed,
+            "workmode_name": _WORKMODE_NAMES.get(observed, "unknown"),
+            "transition_steps": transition_steps,
+            "message": (
+                "target mode was observed"
+                if confirmed else
+                "command was sent, but the expected mode was not observed before timeout"
+            ),
         }
 
+    def _switch_enable(self, current_mode: int) -> dict:
+        if current_mode == 0:
+            return self._already_in_mode("enable", current_mode)
+        if current_mode != 30:
+            return self._prerequisite_error("enable", current_mode, {30})
+        observed = self._send_edge_and_wait(_get_control_cmd("START"), {0})
+        confirmed = observed == 0
+        return {
+            "state": "completed" if confirmed else "accepted",
+            "requested": "enable",
+            "confirmed": confirmed,
+            "changed": confirmed,
+            "workmode": observed,
+            "workmode_name": _WORKMODE_NAMES.get(observed, "unknown"),
+            "message": "enable confirmed" if confirmed else "START sent but enabled mode was not observed",
+        }
+
+    def _switch_disable(self, current_mode: int) -> dict:
+        if current_mode == 30:
+            return self._already_in_mode("disable", current_mode)
+        self._stop_move()
+        observed = self._send_edge_and_wait(_get_control_cmd("START"), {30})
+        confirmed = observed == 30
+        return {
+            "state": "completed" if confirmed else "accepted",
+            "requested": "disable",
+            "confirmed": confirmed,
+            "changed": confirmed,
+            "workmode": observed,
+            "workmode_name": _WORKMODE_NAMES.get(observed, "unknown"),
+            "message": "disable confirmed" if confirmed else "START sent but disabled mode was not observed",
+        }
+
+    @staticmethod
+    def _already_in_mode(requested: str, current_mode: int) -> dict:
+        return {
+            "state": "completed",
+            "requested": requested,
+            "confirmed": True,
+            "changed": False,
+            "workmode": current_mode,
+            "workmode_name": _WORKMODE_NAMES.get(current_mode, "unknown"),
+            "message": "robot is already in the requested mode; no command was sent",
+        }
+
+    @staticmethod
+    def _prerequisite_error(requested: str, current_mode: int,
+                            required_modes: set[int]) -> dict:
+        if requested == "enable":
+            sequence = ["disable", "enable"]
+        elif requested == "ready":
+            sequence = ["enable", "ready"] if current_mode == 30 else ["ready"]
+        elif requested == "walk":
+            sequence = (
+                ["enable", "ready", "walk"] if current_mode == 30 else
+                ["ready", "walk"] if current_mode == 0 else
+                ["walk"]
+            )
+        elif requested == "fall_to_stand":
+            sequence = (
+                ["enable", "ready", "fall_to_stand"] if current_mode == 30 else
+                ["ready", "fall_to_stand"]
+            )
+        elif requested == "save_teach":
+            sequence = ["start_teach", "save_teach"]
+        else:
+            sequence = (
+                ["enable", "ready", "walk", requested] if current_mode == 30 else
+                ["ready", "walk", requested] if current_mode == 0 else
+                ["walk", requested]
+            )
+        return {
+            "state": "error",
+            "error": "current workmode does not satisfy the requested mode prerequisite; no command was sent",
+            "requested": requested,
+            "current_workmode": current_mode,
+            "current_workmode_name": _WORKMODE_NAMES.get(current_mode, "unknown"),
+            "required_current_workmodes": [
+                {"code": mode, "name": _WORKMODE_NAMES.get(mode, "unknown")}
+                for mode in sorted(required_modes)
+            ],
+            "required_sequence": sequence,
+            "safety_note": "verify robot pose, support, ground and surrounding clearance before executing each step",
+        }
+
+    def _send_edge_and_wait(self, cmd_enum, expected_modes: set[int],
+                            index: int = 0, timeout_s: float = 2.0) -> int:
+        """Send one event command, release with DEFAULT, then observe feedback."""
+        self._publish_cmd(0, 0, 0, cmd_enum, index)
+        # The vendor demo runs a 10 ms command loop. This also exceeds the
+        # documented minimum 2 ms interval without repeatedly firing the event.
+        time.sleep(0.01)
+        self._publish_cmd(0, 0, 0, _get_default_cmd(), 0)
+        deadline = time.monotonic() + timeout_s
+        observed = int(self._high_ctrl.get_mode())
+        while observed not in expected_modes and time.monotonic() < deadline:
+            time.sleep(0.05)
+            observed = int(self._high_ctrl.get_mode())
+        return observed
+
     def _do_get_mode(self) -> dict:
-        mode = self._high_ctrl.get_mode()
+        mode = int(self._high_ctrl.get_mode())
         return {
             "workmode": mode,
             "workmode_name": _WORKMODE_NAMES.get(mode, "unknown"),
+            "enabled": mode != 30,
+            "protection": mode == 26,
         }
 
 
@@ -972,19 +1137,6 @@ _JOINT_NAMES_BY_ID = [
 ]
 
 
-def _wall_time_ms() -> int:
-    return int(time.time() * 1000)
-
-
-def _enum_name(value: Any) -> str:
-    """Return a stable readable value for pybind enums and ordinary values."""
-    name = getattr(value, "name", None)
-    if name:
-        return str(name)
-    text = str(value)
-    return text.rsplit(".", 1)[-1] if "." in text else text
-
-
 def _finite_number(value: Any, field: str) -> float:
     if isinstance(value, bool):
         raise ValueError(f"{field} must be a number")
@@ -995,16 +1147,6 @@ def _finite_number(value: Any, field: str) -> float:
     if not math.isfinite(result):
         raise ValueError(f"{field} must be finite")
     return result
-
-
-def _header_payload(header: Any) -> dict:
-    if header is None:
-        return {}
-    return {
-        "message_id": getattr(header, "message_id", None),
-        "source_timestamp_us": getattr(header, "timestamp_us", None),
-        "sn": getattr(header, "sn", None),
-    }
 
 
 def _quaternion_xyzw_to_rpy(quaternion: list[float]) -> list[float] | None:
@@ -1026,23 +1168,13 @@ def _quaternion_xyzw_to_rpy(quaternion: list[float]) -> list[float] | None:
 
 class _MotionStateNode(Node):
     def __init__(self, namespace: str, high_ctrl, interval_s: float,
-                 history_size: int, activity_velocity_threshold: float):
+                 activity_velocity_threshold: float):
         super().__init__("bumi_motion_state")
         self._high_ctrl = high_ctrl
         self._topic = f"/{namespace}/motion/state"
         self._pub = self.create_publisher(String, self._topic, 10)
         self._interval_s = interval_s
         self._activity_velocity_threshold = activity_velocity_threshold
-        self._history = deque(maxlen=history_size)
-        self._snapshot: dict = {
-            "state": "no_data", "fresh": False, "sample_age_ms": None,
-            "reason": "waiting_for_high_controller",
-        }
-        self._sampled_monotonic: float | None = None
-        self._last_signature: dict | None = None
-        self._event_sequence = 0
-        self._read_failed = False
-        self._lock = threading.Lock()
         self._running = False
         self._thread = None
 
@@ -1062,138 +1194,22 @@ class _MotionStateNode(Node):
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=1.0)
 
-    def snapshot(self, detail: str = "summary") -> dict:
-        with self._lock:
-            result = dict(self._snapshot)
-            sampled_monotonic = self._sampled_monotonic
-        result["sample_age_ms"] = (
-            max(0, int((time.monotonic() - sampled_monotonic) * 1000))
-            if sampled_monotonic is not None else None
-        )
-        result["fresh"] = bool(
-            result.get("state") not in ("error", "no_data")
-            and result["sample_age_ms"] is not None
-            and result["sample_age_ms"] <= max(1000, int(self._interval_s * 5_000))
-        )
-        if detail == "joints" and result.get("state") not in ("error", "no_data"):
-            return {
-                "state": result["state"],
-                "fresh": result["fresh"],
-                "sample_age_ms": result["sample_age_ms"],
-                "source": result.get("source"),
-                "field_help": {
-                    "position": "joint position in radians",
-                    "velocity": "joint angular velocity in radians per second",
-                    "torque": "raw joint torque feedback from HighController",
-                    "temperature": "motor temperature reported by HighController",
-                    "error": "raw SDK motor status/error value; use fault=true only for a documented fault",
-                },
-                "joint_states": result.get("joint_states", []),
-            }
-        result.pop("joint_states", None)
-        # Undocumented non-zero values are retained in the per-joint raw view,
-        # but must not be presented as actionable whole-body faults.
-        result.pop("unrecognized_motor_statuses", None)
-        if result.get("state") not in ("error", "no_data"):
-            result["activity_description"] = (
-                "at least one joint velocity reached the configured activity threshold"
-                if result.get("activity") == "moving"
-                else "all joint velocities are below the configured activity threshold"
-            )
-            result["motor_fault_summary"] = {
-                "has_documented_fault": bool(result.get("motor_faults")),
-                "documented_fault_count": len(result.get("motor_faults", [])),
-                "meaning": "only Noetix-documented motor error codes are classified as faults",
-            }
-        return result
-
-    def history(self, limit: int) -> list[dict]:
-        with self._lock:
-            events = [dict(event) for event in list(self._history)[-limit:]]
-        now = time.monotonic()
-        for event in events:
-            recorded = event.pop("_recorded_monotonic", None)
-            event["age_ms"] = max(0, int((now - recorded) * 1000)) if recorded else None
-        return events
-
-    def clear_history(self) -> int:
-        with self._lock:
-            cleared_count = len(self._history)
-            self._history.clear()
-        return cleared_count
-
-    def _append_event(self, event: str, **data):
-        self._event_sequence += 1
-        self._history.append({
-            "sequence": self._event_sequence,
-            "event": event,
-            "_recorded_monotonic": time.monotonic(),
-            **data,
-        })
-
-    def _record_changes(self, payload: dict, signature: dict):
-        previous = self._last_signature
-        if previous is None:
-            self._last_signature = signature
-            return
-        if signature["workmode"] != previous["workmode"]:
-            self._append_event(
-                "workmode_changed",
-                previous={"code": previous["workmode"], "name": previous["workmode_name"]},
-                current={"code": signature["workmode"], "name": signature["workmode_name"]},
-            )
-        if signature["protection"] != previous["protection"]:
-            self._append_event(
-                "protection_changed",
-                previous=previous["protection"], current=signature["protection"],
-            )
-        if signature["activity"] != previous["activity"]:
-            self._append_event(
-                "motion_started" if signature["activity"] == "moving" else "motion_stopped",
-                previous=previous["activity"], current=signature["activity"],
-                max_abs_joint_velocity=payload["joint_motion"]["max_abs_velocity"],
-                activity_velocity_threshold=self._activity_velocity_threshold,
-            )
-        if signature["motor_faults"] != previous["motor_faults"]:
-            self._append_event(
-                "motor_faults_changed", faults=payload["motor_faults"],
-            )
-        self._last_signature = signature
-
     def _loop(self):
         while self._running:
             try:
                 payload = self._read_once()
-                signature = {
-                    "workmode": payload["workmode"]["code"],
-                    "workmode_name": payload["workmode"]["name"],
-                    "protection": payload["workmode"]["protection"],
-                    "activity": payload["activity"],
-                    "motor_faults": tuple(
-                        (item["motor_id"], item["error"]) for item in payload["motor_faults"]),
-                }
-                with self._lock:
-                    if self._read_failed:
-                        self._append_event("state_read_recovered")
-                        self._read_failed = False
-                    self._record_changes(payload, signature)
-                    self._snapshot = payload
-                    self._sampled_monotonic = time.monotonic()
                 msg = String()
                 msg.data = json.dumps(payload, ensure_ascii=False)
                 self._pub.publish(msg)
                 time.sleep(self._interval_s)
             except Exception as exc:
                 error = {
-                    "state": "error", "fresh": False, "sample_age_ms": None,
+                    "state": "error", "fresh": False,
                     "reason": str(exc),
                 }
-                with self._lock:
-                    self._snapshot = error
-                    self._sampled_monotonic = None
-                    if not self._read_failed:
-                        self._append_event("state_read_error", reason=str(exc))
-                        self._read_failed = True
+                msg = String()
+                msg.data = json.dumps(error, ensure_ascii=False)
+                self._pub.publish(msg)
                 time.sleep(max(0.5, self._interval_s))
 
     def _read_once(self) -> dict:
@@ -1208,7 +1224,6 @@ class _MotionStateNode(Node):
         linear_acceleration = [float(imu.linear_acc[index]) for index in range(3)]
         joint_states = []
         faults = []
-        unrecognized_statuses = []
         for index, joint in enumerate(raw_joint_state):
             motor_id = int(getattr(joint, "motor_id", index))
             error = int(getattr(joint, "error", 0))
@@ -1232,12 +1247,6 @@ class _MotionStateNode(Node):
                     "error_name": _MOTOR_ERROR_NAMES[error],
                     "temperature": int(joint.temperature),
                 })
-            elif error:
-                unrecognized_statuses.append({
-                    "motor_id": motor_id,
-                    "joint": _JOINT_NAMES_BY_ID[index],
-                    "raw_error": error,
-                })
 
         absolute_velocities = [abs(item["velocity"]) for item in joint_states]
         max_velocity = max(absolute_velocities)
@@ -1250,6 +1259,11 @@ class _MotionStateNode(Node):
             "fresh": True,
             "source": "Noetix HighController/CycloneDDS",
             "activity": "moving" if moving else "stationary",
+            "activity_description": (
+                "at least one joint velocity reached the configured activity threshold"
+                if moving else
+                "all joint velocities are below the configured activity threshold"
+            ),
             "workmode": {
                 "code": mode, "name": _WORKMODE_NAMES.get(mode, "unknown"),
                 "protection": mode == 26,
@@ -1282,7 +1296,18 @@ class _MotionStateNode(Node):
                 },
             },
             "motor_faults": faults,
-            "unrecognized_motor_statuses": unrecognized_statuses,
+            "motor_fault_summary": {
+                "has_documented_fault": bool(faults),
+                "documented_fault_count": len(faults),
+                "meaning": "only Noetix-documented motor error codes are classified as faults",
+            },
+            "joint_field_help": {
+                "position": "joint position in radians",
+                "velocity": "joint angular velocity in radians per second",
+                "torque": "raw joint torque feedback from HighController",
+                "temperature": "motor temperature reported by HighController",
+                "error": "raw SDK motor status/error value; use fault=true only for a documented fault",
+            },
             "joint_states": joint_states,
         }
 
@@ -1294,49 +1319,20 @@ class MotionStatePlugin:
         interval = _finite_number(plugin_config.get("poll_interval_s", 0.5), "poll_interval_s")
         if not 0.02 <= interval <= 2.0:
             raise ValueError("poll_interval_s must be in [0.02, 2.0]")
-        history_size = int(plugin_config.get("history_size", 100))
-        if not 1 <= history_size <= 1000:
-            raise ValueError("history_size must be in [1, 1000]")
         activity_threshold = _finite_number(
             plugin_config.get("activity_velocity_threshold", 0.15),
             "activity_velocity_threshold",
         )
         if not 0.001 <= activity_threshold <= 10.0:
             raise ValueError("activity_velocity_threshold must be in [0.001, 10.0]")
-        self._node = _MotionStateNode(
-            namespace, high_ctrl, interval, history_size, activity_threshold)
+        self._node = _MotionStateNode(namespace, high_ctrl, interval, activity_threshold)
         executor.add_node(self._node)
 
     def get_tool(self) -> dict:
         return {
             "name": "motion_state", "type": "sensor", "multiInstance": False,
-            "description": "查看 Bumi 当前整机运动遥测及近期变化：姿态、IMU、关节运动、已确认的电机故障与运动/模式事件；不包含电池信息，也不用于控制机器人。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["snapshot", "history", "clear_history"],
-                        "description": "snapshot=查看当前状态；history=查看驱动启动后记录的近期变化；clear_history=清空这些内存事件，不会改变机器人状态。",
-                    },
-                    "detail": {
-                        "type": "string", "enum": ["summary", "joints", "none"],
-                        "default": "summary",
-                        "description": "仅 snapshot 使用：summary=整机姿态、IMU、运动统计及已确认故障；joints=21 个关节的位置/速度/力矩/温度/原始错误值。history 请选择 none；clear_history 无需填写。",
-                    },
-                    "limit": {
-                        "type": "integer", "minimum": 1, "maximum": 100,
-                        "default": 20,
-                        "description": "仅用于 history，最多返回最近多少条事件；范围 1～100，未填写时默认 20。事件不足时返回全部已有事件。",
-                    },
-                },
-                "required": ["action"],
-                "x-action-params": {
-                    "snapshot": {"params": ["detail"], "description": "读取当前一次运动遥测。summary 适合判断整机是否运动、姿态和已确认故障；joints 适合检查 21 个关节完整反馈。"},
-                    "history": {"params": ["detail", "limit"], "description": "查看运动开始/停止、工作模式、保护状态、已确认电机故障及读取异常等变化；detail 必须选 none，limit 默认 20。"},
-                    "clear_history": {"params": [], "description": "只清空本卡片内存中的历史事件；不停止动作、不清故障、不改变机器人。清空后 history 暂时为空，后续新变化会重新记录。"},
-                },
-            },
+            "description": "Bumi 整机运动状态：持续输出工作模式、保护状态、运动判断、IMU 姿态与动态、关节运动统计、已确认的电机故障，以及全部 21 个关节的位置、速度、力矩、温度和原始错误值。不包含电池信息，也不控制机器人。",
+            "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._node.topic, "format": "data/json"}],
         }
 
@@ -1346,335 +1342,9 @@ class MotionStatePlugin:
     def stop(self):
         self._node.stop_polling()
 
-    def dispatch(self, action: str, args: dict) -> dict:
-        if action in ("start", "snapshot", "info"):
-            detail = args.get("detail", "summary")
-            if detail not in ("summary", "joints"):
-                return {
-                    "state": "error",
-                    "error": "snapshot requires detail=summary or detail=joints; none is only for history",
-                }
-            return self._node.snapshot(detail)
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "running"}
         if action == "stop":
             return {"state": "idle"}
-        if action == "history":
-            if args.get("detail") != "none":
-                return {
-                    "state": "error",
-                    "error": "history requires detail=none; select none in the detail field",
-                }
-            try:
-                limit = int(args.get("limit", 20))
-            except (TypeError, ValueError):
-                return {"state": "error", "error": "limit must be an integer"}
-            if not 1 <= limit <= 100:
-                return {"state": "error", "error": "limit must be in [1, 100]"}
-            events = self._node.history(limit)
-            return {
-                "state": "completed",
-                "event_count": len(events),
-                "requested_limit": limit,
-                "events": events,
-                "meaning": (
-                    "no motion-state changes have been recorded since startup or the last clear_history"
-                    if not events else
-                    "events are returned from older to newer within the requested recent window"
-                ),
-            }
-        if action == "clear_history":
-            cleared_count = self._node.clear_history()
-            return {
-                "state": "completed",
-                "cleared_event_count": cleared_count,
-                "meaning": "in-memory event history was cleared; robot motion and faults were not changed",
-            }
-        return {"state": "error", "error": f"unknown action: {action}"}
-
-
-class MediaSystemPlugin:
-    PREFIX = "media_system"
-    _SET_INTERVAL_S = 0.5
-    _STATUS_MEANINGS = {
-        "READY": "媒体 Agent 已就绪，等待进入唤醒或休眠等工作状态",
-        "SLEEPED": "媒体 Agent 处于休眠状态，不进行正常语音交互",
-        "WAKEUPED": "媒体 Agent 已唤醒，可进行语音交互",
-        "EXIT": "媒体 Agent 已退出，音视频交互不可用",
-    }
-    _REASON_MEANINGS = {
-        "SYSTEM_LAUNCH": "系统启动",
-        "CMD_RESET": "指令触发重启",
-        "AUDIO_WAKEUPED": "识别到真实语音唤醒词后唤醒",
-        "CMD_WAKEUPED": "wakeup 指令触发唤醒，不播放唤醒回复词",
-        "AUDIO_SLEEPED": "语音交互触发休眠",
-        "CMD_SLEEPED": "sleep 指令触发休眠，不播放休眠回复词",
-        "TIMEOUT_SLEEPED": "超过配置的超时时间后自动休眠",
-        "ERROR_SLEEPED": "媒体系统因错误进入休眠",
-    }
-    _BOOL_FIELDS = {
-        "audio_cue": ("set_audio_cue_enable", "get_audio_cue_enable"),
-        "internal_capture_audio_to_agent": ("set_internal_capture_audio_data_to_agent_enable", "get_internal_capture_audio_data_to_agent_enable"),
-        "external_audio_to_agent": ("set_external_custom_audio_data_to_agent_enable", "get_external_custom_audio_data_to_agent_enable"),
-        "internal_agent_audio_to_playback": ("set_internal_agent_audio_data_to_playback_enable", "get_internal_agent_audio_data_to_playback_enable"),
-        "external_audio_to_playback": ("set_external_custom_audio_data_to_playback_enable", "get_external_custom_audio_data_to_playback_enable"),
-        "internal_video_to_agent": ("set_internal_capture_video_data_to_agent_enable", "get_internal_capture_video_data_to_agent_enable"),
-        "external_video_to_agent": ("set_external_custom_video_data_to_agent_enable", "get_external_custom_video_data_to_agent_enable"),
-        "external_audio_use_internal_3a": ("set_external_custom_audio_data_to_agent_use_internal_3a", "get_external_custom_audio_data_to_agent_use_internal_3a"),
-    }
-
-    def __init__(self, plugin_config: dict, namespace: str, executor, media_ctrl):
-        self._ctrl = media_ctrl
-        self._set_lock = threading.Lock()
-        self._last_set = 0.0
-
-    def get_tool(self) -> dict:
-        config_props = {
-            "timeout_ms": {
-                "type": "integer", "minimum": 0,
-                "description": "媒体 Agent 的超时配置，单位毫秒；必须为非负整数。",
-            },
-            "wakeup_response": {
-                "type": "string", "maxLength": 256,
-                "description": "语音唤醒后的回复文本，不是唤醒词；最长 256 个字符。卡片的 wakeup 指令不会播放此文本。",
-            },
-            "sleep_response": {
-                "type": "string", "maxLength": 256,
-                "description": "语音休眠时的回复文本；最长 256 个字符。卡片的 sleep 指令不会播放此文本。",
-            },
-            "audio_cue": {
-                "type": "boolean",
-                "description": "是否启用媒体系统提示音。",
-            },
-            "internal_capture_audio_to_agent": {
-                "type": "boolean",
-                "description": "是否将机器人内部采集的音频发送给媒体 Agent。",
-            },
-            "external_audio_to_agent": {
-                "type": "boolean",
-                "description": "是否允许外部程序提供的自定义音频发送给媒体 Agent。",
-            },
-            "internal_agent_audio_to_playback": {
-                "type": "boolean",
-                "description": "是否将媒体 Agent 内部生成的音频发送到机器人播放端。",
-            },
-            "external_audio_to_playback": {
-                "type": "boolean",
-                "description": "是否允许外部程序提供的自定义音频发送到机器人播放端。",
-            },
-            "internal_video_to_agent": {
-                "type": "boolean",
-                "description": "是否将机器人内部采集的视频发送给媒体 Agent。",
-            },
-            "external_video_to_agent": {
-                "type": "boolean",
-                "description": "是否允许外部程序提供的自定义视频发送给媒体 Agent。",
-            },
-            "external_audio_use_internal_3a": {
-                "type": "boolean",
-                "description": "外部自定义音频发送给 Agent 前是否使用机器人内部 3A 音频处理。",
-            },
-        }
-        return {
-            "name": "media_system", "type": "actuator", "multiInstance": False,
-            "description": "管理 Bumi EDU 的音视频交互 Agent：查询运行状态/错误和配置，读取唤醒词，控制 Agent 唤醒/休眠/重启，以及暂停或恢复麦克风、扬声器和视频采集通道。本卡片不负责直接播放文本或音频。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["status", "get_config", "set_config", "get_wake_words", "wakeup", "sleep", "restart", "pause", "resume"],
-                        "description": "status=查 Agent 状态/原因/错误；get_config/set_config=查改媒体配置；get_wake_words=只读唤醒词；wakeup/sleep/restart=控制媒体 Agent；pause/resume=控制 stream 指定的数据通道。",
-                    },
-                    "config": {
-                        "type": "object", "properties": config_props,
-                        "additionalProperties": False, "minProperties": 1,
-                        "description": "仅 set_config 使用。填写 JSON 对象，如 {\"audio_cue\":true,\"timeout_ms\":30000} 或 {\"wakeup_response\":\"我在\"}；只修改已填写字段。response 是回复词，不是唤醒词。",
-                    },
-                    "stream": {
-                        "type": "string",
-                        "enum": ["audio_capture", "audio_playback", "video_capture", "all"],
-                        "description": "仅用于 pause/resume：audio_capture=麦克风采集，audio_playback=扬声器播放，video_capture=视频采集，all=以上全部。",
-                    },
-                },
-                "required": ["action"],
-                "x-action-params": {
-                    "status": {"params": [], "description": "查询媒体 Agent 当前状态、最近变化原因和系统错误。error.code=0 通常表示没有系统错误。"},
-                    "get_config": {"params": [], "description": "读取本卡片支持的全部媒体配置；仅查询，不产生唤醒、播报或通道切换。"},
-                    "set_config": {"params": ["config"], "description": "修改 JSON 中填写的字段并回读完整配置。示例：{\"audio_cue\":true,\"timeout_ms\":30000}。"},
-                    "get_wake_words": {"params": [], "description": "只读当前唤醒词和便于查看的 @ 后中文短语；SDK 不支持用此卡片修改唤醒词。"},
-                    "wakeup": {"params": [], "description": "用控制指令将媒体 Agent 切到 WAKEUPED；不会播放 wakeup_response。返回 accepted 仅表示指令已发出，请查看 media_status 或再调用 status 确认。"},
-                    "sleep": {"params": [], "description": "用控制指令将媒体 Agent 切到 SLEEPED，并暂停正常语音交互；不会播放 sleep_response。返回 accepted 仅表示指令已发出。"},
-                    "restart": {"params": [], "description": "重启音视频交互 Agent，期间语音和视频交互会暂时中断；返回 accepted 后再调用 status 确认恢复。"},
-                    "pause": {"params": ["stream"], "description": "暂停选定数据通道：audio_capture 停麦克风采集，audio_playback 停扬声器播放，video_capture 停视频采集，all 全部暂停。不会让整个 Agent 休眠。"},
-                    "resume": {"params": ["stream"], "description": "恢复之前暂停的选定通道；不会自动唤醒处于 SLEEPED 的媒体 Agent。"},
-                },
-            },
-        }
-
-    def start(self):
-        pass
-
-    def stop(self):
-        pass
-
-    def dispatch(self, action: str, args: dict) -> dict:
-        try:
-            if action in ("start", "info", "status"):
-                return self._status()
-            if action == "stop":
-                return {"state": "idle"}
-            if action == "get_config":
-                return {
-                    "state": "completed",
-                    "config": self._get_config(),
-                    "meaning": "current MediaController configuration; response fields are replies, not wake words",
-                }
-            if action == "get_wake_words":
-                raw_words = str(self._ctrl.get_wakeup_words())
-                display_words = []
-                for line in raw_words.splitlines():
-                    if "@" not in line:
-                        continue
-                    phrase = line.rsplit("@", 1)[1].strip()
-                    if phrase and phrase not in display_words:
-                        display_words.append(phrase)
-                return {
-                    "state": "completed",
-                    "wake_words": raw_words,
-                    "display_wake_words": display_words,
-                    "meaning": "read-only wake-word grammar; display_wake_words contains the readable phrases after @",
-                }
-            if action == "set_config":
-                return self._set_config(args.get("config"))
-            if action in ("wakeup", "sleep", "restart"):
-                self._rate_limited_call(getattr(self._ctrl, action))
-                response = {
-                    "state": "accepted",
-                    "requested": action,
-                    "meaning": "control command was sent; media_status is an immediate observation, not a completion guarantee",
-                    "media_status": self._status(),
-                }
-                if action in ("wakeup", "sleep"):
-                    response.update({
-                        "audio_response_expected": False,
-                        "audio_response_note": (
-                            "command wakeup/sleep does not play the configured response text; "
-                            "use status.reason to distinguish command and voice transitions"
-                        ),
-                    })
-                else:
-                    response["next_step"] = "call status after restart to confirm that the media Agent recovered"
-                return response
-            if action in ("pause", "resume"):
-                return self._stream_control(action, args.get("stream"))
-            return {"state": "error", "error": f"unknown action: {action}"}
-        except Exception as exc:
-            return {"state": "error", "error": str(exc)}
-
-    def _status(self) -> dict:
-        status = self._ctrl.get_system_status()
-        error = self._ctrl.get_system_error()
-        status_name = _enum_name(status.value)
-        reason_name = _enum_name(status.reason)
-        error_code = int(error.code)
-        return {
-            "state": "completed", "observed_at_ms": _wall_time_ms(),
-            "source": "Noetix MediaController/CycloneDDS",
-            "status": status_name,
-            "status_meaning": self._STATUS_MEANINGS.get(status_name, "SDK returned an unknown media Agent status"),
-            "reason": reason_name,
-            "reason_meaning": self._REASON_MEANINGS.get(reason_name, "SDK returned an unknown status-change reason"),
-            "status_header": _header_payload(getattr(status, "header", None)),
-            "error": {"code": error_code, "message": str(error.message),
-                      "has_error": error_code != 0,
-                      "meaning": "code=0 means no MediaController system error was reported",
-                      "header": _header_payload(getattr(error, "header", None))},
-        }
-
-    def _get_config(self) -> dict:
-        config = {
-            "timeout_ms": int(self._ctrl.get_timeout()),
-            "wakeup_response": str(self._ctrl.get_wakeup_response_words()),
-            "sleep_response": str(self._ctrl.get_sleep_response_words()),
-        }
-        for name, (_, getter) in self._BOOL_FIELDS.items():
-            config[name] = bool(getattr(self._ctrl, getter)())
-        return config
-
-    def _rate_limited_call(self, fn, *args):
-        with self._set_lock:
-            wait = self._SET_INTERVAL_S - (time.monotonic() - self._last_set)
-            if wait > 0:
-                time.sleep(wait)
-            result = fn(*args)
-            self._last_set = time.monotonic()
-            return result
-
-    def _set_config(self, config: Any) -> dict:
-        if isinstance(config, str):
-            try:
-                config = json.loads(config)
-            except json.JSONDecodeError as exc:
-                return {
-                    "state": "error",
-                    "error": (
-                        "config must be valid JSON, for example "
-                        "{\"audio_cue\":true,\"timeout_ms\":30000}; "
-                        f"parse error: {exc.msg}"
-                    ),
-                }
-        if not isinstance(config, dict) or not config:
-            return {
-                "state": "error",
-                "error": (
-                    "config must be a non-empty JSON object, for example "
-                    "{\"audio_cue\":true,\"timeout_ms\":30000}"
-                ),
-            }
-        allowed = {"timeout_ms", "wakeup_response", "sleep_response", *self._BOOL_FIELDS.keys()}
-        unknown = sorted(set(config) - allowed)
-        if unknown:
-            return {"state": "error", "error": f"unsupported config fields: {unknown}"}
-        setters = []
-        for name, value in config.items():
-            if name in self._BOOL_FIELDS:
-                if type(value) is not bool:
-                    return {"state": "error", "error": f"{name} must be boolean"}
-                setters.append((getattr(self._ctrl, self._BOOL_FIELDS[name][0]), value))
-            elif name == "timeout_ms":
-                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                    return {"state": "error", "error": "timeout_ms must be a non-negative integer"}
-                setters.append((self._ctrl.set_timeout, value))
-            else:
-                if not isinstance(value, str) or len(value) > 256:
-                    return {"state": "error", "error": f"{name} must be a string of at most 256 characters"}
-                setter = self._ctrl.set_wakeup_response_words if name == "wakeup_response" else self._ctrl.set_sleep_response_words
-                setters.append((setter, value))
-        for setter, value in setters:
-            self._rate_limited_call(setter, value)
-        return {
-            "state": "completed",
-            "changed_fields": sorted(config),
-            "config": self._get_config(),
-            "meaning": (
-                "requested fields were set and the complete configuration was read back; "
-                "wakeup_response/sleep_response are voice-interaction replies and are not played by command wakeup/sleep"
-            ),
-        }
-
-    def _stream_control(self, action: str, stream: Any) -> dict:
-        if stream not in ("audio_capture", "audio_playback", "video_capture", "all"):
-            return {"state": "error", "error": "stream must be audio_capture, audio_playback, video_capture or all"}
-        prefix = "pause" if action == "pause" else "resume"
-        selected = ("audio_capture", "audio_playback", "video_capture") if stream == "all" else (stream,)
-        for item in selected:
-            self._rate_limited_call(getattr(self._ctrl, f"{prefix}_{item}"))
-        return {
-            "state": "completed",
-            "action": action,
-            "streams": list(selected),
-            "meaning": (
-                "selected media data paths were paused; the media Agent work status was not changed"
-                if action == "pause" else
-                "selected media data paths were resumed; a sleeping media Agent was not automatically awakened"
-            ),
-        }
+        return None
