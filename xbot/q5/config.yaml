@@ -42,8 +42,8 @@ plugins:
     enabled: true
   mic:
     enabled: true
-    # Q5 manual: USB Audio Device is input/output index 6.
-    device: 6
+    # Verified on this Q5: POROSVOC USB microphone is PortAudio index 1.
+    device: 1
     sample_rate_hz: 16000
     channels: 1
   speaker:
@@ -51,7 +51,9 @@ plugins:
     # Agent Core wires perception TTS's audio/pcm-16k output here. The default
     # also makes a default perception TTS instance work without extra config.
     input_topic: "/perception/tts"
-    device: 6
+    # This requires a PortAudio device with maxOutputChannels > 0. The current
+    # Q5 enumeration exposes no output device; configure it after XOS exposes one.
+    device: 1
     sample_rate_hz: 16000
     channels: 1
   camera_rgb:

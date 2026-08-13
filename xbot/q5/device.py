@@ -61,15 +61,20 @@ def _q5_remote_command(command: str, timeout: float = 20.0, stdin=None):
     return subprocess.run(_q5_ssh_args(command), input=stdin, capture_output=True, timeout=timeout)
 
 
-def _ensure_remote_audio_tools():
-    """Validate the installed PortAudio Python binding without mutating Q5 XOS."""
+def _ensure_remote_audio_device(device: int, direction: str):
+    """Validate the requested PortAudio input/output capability on Q5."""
+    channel_key = "maxInputChannels" if direction == "input" else "maxOutputChannels"
     result = _q5_remote_command(
-        "python3 -c \"import pyaudio; print(pyaudio.PyAudio().get_device_info_by_index(6))\"", timeout=15.0)
+        "python3 -c " + shlex.quote(
+            "import pyaudio; "
+            "pa=pyaudio.PyAudio(); "
+            f"d=pa.get_device_info_by_index({device}); "
+            f"assert d['{channel_key}'] > 0, d; print(d); pa.terminate()"
+        ), timeout=15.0)
     if result.returncode:
         detail = (result.stderr or result.stdout).decode(errors="replace").strip()
         raise RuntimeError(
-            "Q5 PyAudio/PortAudio device 6 is unavailable. The Q5 manual requires "
-            f"PortAudio access to the USB Audio Device: {detail}")
+            f"Q5 audio {direction} device {device} is unavailable: {detail}")
 
 
 class MicPlugin:
@@ -129,7 +134,7 @@ class MicPlugin:
         del args
         if action == "start":
             try:
-                _ensure_remote_audio_tools()
+                _ensure_remote_audio_device(self._device, "input")
                 command = (
                     "import pyaudio, sys; "
                     "pa=pyaudio.PyAudio(); "
@@ -215,7 +220,7 @@ class SpeakerPlugin:
                 if self._running and requested == self._topic:
                     return {"state": "running", "topic_in": [{"topic": self._topic, "format": "audio/pcm-16k"}]}
                 self.stop()
-                _ensure_remote_audio_tools()
+                _ensure_remote_audio_device(self._device, "output")
                 self._topic = requested
                 command = (
                     "import pyaudio, sys; "
