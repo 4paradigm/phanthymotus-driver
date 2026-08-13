@@ -128,6 +128,16 @@ class LynxM20ContractTests(unittest.TestCase):
         self.assertNotIn("stop", motion["inputSchema"]["x-action-params"])
         self.assertEqual((1, 60), (motion["inputSchema"]["properties"]["duration"]["default"], motion["inputSchema"]["properties"]["duration"]["maximum"]))
 
+    def test_axis_schema_exposes_safe_hardware_guidance_without_motion_defaults(self):
+        properties = m20.M20MotionPlugin(FakeNodes()).get_tool()["inputSchema"]["properties"]
+        self.assertEqual([1, -1], properties["x"]["examples"])
+        self.assertEqual([0.5, -0.5], properties["y"]["examples"])
+        self.assertEqual([0.4, -0.4], properties["yaw"]["examples"])
+        for axis in ("x", "y", "yaw"):
+            self.assertEqual((-1, 1), (properties[axis]["minimum"], properties[axis]["maximum"]))
+            self.assertNotIn("default", properties[axis])
+            self.assertIn("Omitted means 0", properties[axis]["description"])
+
     def test_motion_events_is_a_distinct_read_only_sensor(self):
         tool_def = m20.M20MotionEventsPlugin(FakeNodes()).get_tool()
         self.assertEqual(("motion_events", "sensor", False), (tool_def["name"], tool_def["type"], tool_def["multiInstance"]))
