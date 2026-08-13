@@ -2,7 +2,7 @@ id: engineai-t800-driver
 name: EngineAI T800 Development Edition Bundle
 category: driver
 hardware_provider: engineai
-hardware_model: "t800-dev"
+hardware_model: "t800"
 image_name: engineai-t800
 port: 15708
 mcp_url: "http://localhost:15708/mcp"
