@@ -4,7 +4,7 @@ drivers/noetix/bumi/device.py — Noetix Bumi-EDU 设备插件实现。
 
 插件列表：
   - StatePlugin: joints (21-DOF skeleton), imu, battery, model (URDF resource)
-  - LocoPlugin: loco (move/stop), switch_mode (mode transitions)
+  - LocoPlugin: locomotion, stand-up/lie-down, semantic actions, action recording and debug workmode
   - MicPlugin: 8ch mic capture → mono PCM 16kHz
   - SpeakerPlugin: audio playback via MediaController
   - CameraPlugin: Realsense D435i color + depth
@@ -57,43 +57,26 @@ _BUMI_JOINT_NAMES = [
 # ── ControlCmd Mapping ────────────────────────────────────────────────────────
 # Lazy-loaded from highcontrol_py.ControlCmd enum at runtime
 
-_MODE_TO_CMD_NAME = {
-    "enable": "START",      # 仅从失能模式进入使能模式
-    "disable": "START",     # 从任意非失能模式进入失能模式
-    "ready": "SWITCH",      # 准备模式
-    "walk": "WALK",
-    "swing": "SWING",       # 挥手
-    "shake": "SHAKE",       # 握手
-    "cheer": "CHEER",       # 欢呼
-    "start_teach": "STARTTEACH",
-    "save_teach": "SAVETEACH",
-    "play_teach": "PLAYTEACH",
-    "dance": "DANCE",
-    "fall_to_stand": "FALLTOSTAND",
-    "stand_to_fall": "STANDTOFALL",
-    "dance1": "DANCE1",
-    "dance2": "DANCE2",
-    "tear": "TEAR",         # 擦眼泪
+_POSTURE_ACTIONS = {
+    "stand_up": ("FALLTOSTAND", {27}),
+    "lie_down": ("STANDTOFALL", {28, 30}),
 }
 
-_MODE_EXPECTED_WORKMODES = {
-    "enable": {0},
-    "disable": {30},
-    "ready": {1},
-    "walk": {2},
-    "swing": {8},
-    "shake": {9},
-    "cheer": {10},
-    "start_teach": {11},
-    # SAVETEACH reports exit-teach/save stages according to the vendor docs.
-    "save_teach": {12, 14, 29},
-    "play_teach": {23},
-    "dance": {5},
-    "fall_to_stand": {27, 2},
-    "stand_to_fall": {28, 30},
-    "dance1": {31},
-    "dance2": {32},
-    "tear": {33},
+_PRESET_ACTIONS = {
+    "wave": ("SWING", {8}),
+    "handshake": ("SHAKE", {9}),
+    "cheer": ("CHEER", {10}),
+    "dance_1": ("DANCE", {5}),
+    "dance_2": ("DANCE1", {31}),
+    "dance_3": ("DANCE2", {32}),
+    "wipe_tears": ("TEAR", {33}),
+}
+
+_TEACHING_ACTIONS = {
+    "start_recording": ("STARTTEACH", {11}),
+    # ENDTEACH is deprecated. SAVETEACH finishes the recording and saves it.
+    "finish_and_save_recording": ("SAVETEACH", {12, 14, 29}),
+    "play_recording": ("PLAYTEACH", {23}),
 }
 
 _ControlCmd = None  # Lazy-loaded enum module
@@ -306,7 +289,13 @@ class LocoPlugin:
         self._move_stop_event = threading.Event()
 
     def get_tools(self) -> list:
-        return [self._loco_tool(), self._switch_mode_tool()]
+        return [
+            self._loco_tool(),
+            self._stand_up_lie_down_tool(),
+            self._semantic_action_tool(),
+            self._action_recording_tool(),
+            self._debug_workmode_tool(),
+        ]
 
     def _loco_tool(self) -> dict:
         return {
@@ -357,41 +346,110 @@ class LocoPlugin:
             "topic_out": [],
         }
 
-    def _switch_mode_tool(self) -> dict:
+    def _stand_up_lie_down_tool(self) -> dict:
         return {
-            "name": "switch_mode",
+            "name": "stand_up_lie_down",
             "type": "actuator",
             "multiInstance": False,
-            "description": "Bumi 运控模式管理。切换前检查厂商规定的直接前置状态，但不会替用户自动补齐状态链；前置状态不符时返回安全操作顺序，便于用户先确认机器人姿态和环境。实际发送模式命令前会停止本卡片的速度命令。",
+            "description": "让 Bumi 从仰面平躺自主起身，或从正常站立姿态躺下收纳。卡片会自动完成内部使能/准备/行走模式切换；SDK 无法确认真实姿态，用户必须按 action 描述摆放机器人。错误姿态可能触发保护模式。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["switch", "get_mode"],
-                        "description": "switch=切换或触发 mode；get_mode=只查询当前模式。enable 和 disable 请在 switch 的 mode 中选择。",
-                    },
-                    "mode": {
-                        "type": "string",
-                        "enum": list(_MODE_TO_CMD_NAME.keys()),
-                        "description": "仅 switch 使用。enable=从失能进入使能；disable=进入失能；ready=准备；walk=走路；swing=挥手；shake=握手；cheer=欢呼；start_teach/save_teach/play_teach=开始/保存/播放示教；dance/dance1/dance2=三种舞蹈；fall_to_stand=倒地起身；stand_to_fall=起身倒地；tear=擦眼泪。run 当前不可用，end_teach 已弃用。",
-                    },
-                    "index": {
-                        "type": "integer",
-                        "description": "仅 save_teach/play_teach 使用的示教文件编号，范围 0～65535；其他模式无需填写。",
-                        "minimum": 0, "maximum": 65535,
+                        "enum": list(_POSTURE_ACTIONS),
+                        "description": "stand_up=自主起身：仅限机器人面朝上平躺、四肢自然放置、双腿伸直、脚底无异物，并在平坦防滑地面留出至少 3m×3m 无人无障碍空间；lie_down=躺下收纳：仅限机器人已稳定站立，并在平坦防滑地面留出至少 3m×3m 无人无障碍空间。",
                     },
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "switch": {
-                        "params": ["mode", "index"],
-                        "description": "先检查当前 workmode 是否是目标模式的直接前置状态；不符合时不发送命令，而是返回 required_sequence。符合时只发送一次命令并用 DEFAULT 释放。",
-                    },
-                    "get_mode": {
+                    "stand_up": {
                         "params": [],
-                        "description": "读取当前 workmode 编号、名称以及当前是否处于失能/保护状态。",
+                        "description": "从仰面平躺自主起身。调用即会自动准备内部模式并执行；调用前必须完成姿态和 3m×3m 环境检查。",
                     },
+                    "lie_down": {
+                        "params": [],
+                        "description": "从稳定站立姿态躺下收纳。调用即会自动准备内部模式并执行；调用前必须确认地面和 3m×3m 环境安全。",
+                    },
+                },
+            },
+            "topic_out": [],
+        }
+
+    def _semantic_action_tool(self) -> dict:
+        return {
+            "name": "semantic_action", "type": "actuator", "multiInstance": False,
+            "description": "执行 Bumi 出厂预设的挥手、握手、欢呼、三种舞蹈和擦眼泪动作。卡片会自动进入动作所需的行走模式。执行前必须确认机器人已正常站立、双脚着地，地面平坦防滑且周围无人和障碍物；舞蹈建议至少留出 3m×3m 空间。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string", "enum": list(_PRESET_ACTIONS),
+                        "description": "wave=挥手；handshake=握手；cheer=欢呼；dance_1/dance_2/dance_3=三种出厂舞蹈；wipe_tears=擦眼泪。选择后立即执行。",
+                    },
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    name: {"params": [], "description": description}
+                    for name, description in {
+                        "wave": "挥手。确认机器人稳定站立，手臂摆动范围内无人和障碍物。",
+                        "handshake": "握手。确认机器人稳定站立，人员不要拉扯机器人手臂。",
+                        "cheer": "欢呼。确认机器人稳定站立，肢体活动范围内无人和障碍物。",
+                        "dance_1": "执行舞蹈 1。机器人属于盲舞，至少留出 3m×3m 平坦防滑空间。",
+                        "dance_2": "执行舞蹈 2。机器人属于盲舞，至少留出 3m×3m 平坦防滑空间。",
+                        "dance_3": "执行舞蹈 3。机器人属于盲舞，至少留出 3m×3m 平坦防滑空间。",
+                        "wipe_tears": "执行擦眼泪动作。确认机器人稳定站立且手臂周围无障碍物。",
+                    }.items()
+                },
+            },
+            "topic_out": [],
+        }
+
+    def _action_recording_tool(self) -> dict:
+        return {
+            "name": "action_recording", "type": "actuator", "multiInstance": False,
+            "description": "录制、结束并保存或播放 Bumi 示教动作。start_recording 和 play_recording 会自动进入所需行走模式；finish_and_save_recording 只能在已开始录制后使用。示教时不得强推关节至限位，播放前须确认机器人稳定站立且周围空间安全。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string", "enum": list(_TEACHING_ACTIONS),
+                        "description": "start_recording=开始录制示教；finish_and_save_recording=结束当前录制并保存；play_recording=播放已保存的示教动作。",
+                    },
+                    "recording_id": {
+                        "type": "integer", "minimum": 0, "maximum": 65535,
+                        "description": "动作记录编号，范围 0～65535。结束并保存、播放时必须填写；开始录制时无需填写。保存与播放同一动作时使用相同编号。",
+                    },
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "start_recording": {"params": [], "description": "自动准备模式后开始示教录制。确认机器人稳定站立；缓慢引导关节，禁止强推至机械限位。"},
+                    "finish_and_save_recording": {"params": ["recording_id"], "description": "结束当前示教并保存到 recording_id。若尚未开始录制，则不会发送命令。"},
+                    "play_recording": {"params": ["recording_id"], "description": "自动准备模式并播放 recording_id。确认该编号存在，机器人稳定站立，周围无人和障碍物。"},
+                },
+            },
+            "topic_out": [],
+        }
+
+    def _debug_workmode_tool(self) -> dict:
+        return {
+            "name": "debug_workmode", "type": "actuator", "multiInstance": False,
+            "description": "仅供开发者实机调试 Bumi 基础工作模式。直接发送 enable、disable、ready 或 walk，不自动补齐前置步骤。执行前必须由调试人员确认机器人姿态、地面、支撑和周围空间安全。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["enable", "disable", "ready", "walk"],
+                        "description": "enable=失能状态下使能；disable=进入失能；ready=切换准备模式；walk=切换行走模式。卡片不会自动执行缺失的前置模式。",
+                    },
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "enable": {"params": [], "description": "仅在 workmode=30（失能）时发送 START；已使能时不会重复发送。"},
+                    "disable": {"params": [], "description": "从非失能状态发送 START 进入失能；已失能时不会重复发送。"},
+                    "ready": {"params": [], "description": "直接发送 SWITCH 并等待 workmode=1；不会自动使能。"},
+                    "walk": {"params": [], "description": "直接发送 WALK 并等待 workmode=2；不会自动进入 enable 或 ready。"},
                 },
             },
             "topic_out": [],
@@ -412,14 +470,18 @@ class LocoPlugin:
 
         tool_name = args.pop('_tool_name', '')
 
-        if action == "move":
+        if tool_name == "loco" and action == "move":
             return self._do_move(args)
-        if action == "stop_move":
+        if tool_name == "loco" and action == "stop_move":
             return self._stop_move()
-        if action == "switch":
-            return self._do_switch(args)
-        if action == "get_mode":
-            return self._do_get_mode()
+        if tool_name == "stand_up_lie_down" and action in _POSTURE_ACTIONS:
+            return self._do_posture_action(action)
+        if tool_name == "semantic_action" and action in _PRESET_ACTIONS:
+            return self._do_preset_action(action)
+        if tool_name == "action_recording" and action in _TEACHING_ACTIONS:
+            return self._do_teaching_action(action, args)
+        if tool_name == "debug_workmode" and action in {"enable", "disable", "ready", "walk"}:
+            return self._do_debug_workmode(action)
         return None
 
     def _publish_cmd(self, x: float, y: float, z: float, action_cmd, index: int = 0):
@@ -494,158 +556,283 @@ class LocoPlugin:
             self._publish_cmd(0, 0, 0, _get_default_cmd(), 0)
         return {"state": "stopped"}
 
-    def _do_switch(self, args: dict) -> dict:
-        mode_str = args.get("mode", "")
+    def _do_posture_action(self, action: str) -> dict:
+        safety = self._safety_requirements(action)
+        target_mode = 1 if action == "stand_up" else 2
+        prepared = self._prepare_workmode(target_mode, action)
+        if prepared["state"] == "error":
+            prepared["safety_requirements"] = safety
+            return prepared
+        command_name, expected_modes = _POSTURE_ACTIONS[action]
+        return self._trigger_user_action(
+            action, command_name, expected_modes, prepared["steps"], safety)
 
-        if mode_str not in _MODE_TO_CMD_NAME:
-            return {
-                "state": "error",
-                "error": f"Unknown mode: {mode_str}. Available: {list(_MODE_TO_CMD_NAME.keys())}",
-            }
+    def _do_preset_action(self, action: str) -> dict:
+        safety = self._safety_requirements(action)
+        prepared = self._prepare_workmode(2, action)
+        if prepared["state"] == "error":
+            prepared["safety_requirements"] = safety
+            return prepared
+        command_name, expected_modes = _PRESET_ACTIONS[action]
+        return self._trigger_user_action(
+            action, command_name, expected_modes, prepared["steps"], safety)
 
-        if mode_str in ("save_teach", "play_teach") and "index" not in args:
-            return {"state": "error", "error": f"index is required for {mode_str}"}
-        try:
-            index = int(args.get("index", 0))
-        except (TypeError, ValueError):
-            return {"state": "error", "error": "index must be an integer"}
-        if not 0 <= index <= 65535:
-            return {"state": "error", "error": "index must be in [0, 65535]"}
+    def _do_teaching_action(self, action: str, args: dict) -> dict:
+        safety = self._safety_requirements(action)
+        recording_id = None
+        if action in ("finish_and_save_recording", "play_recording"):
+            if "recording_id" not in args:
+                return {
+                    "state": "error", "command_sent": False,
+                    "error": f"{action} 必须填写 recording_id（0～65535）",
+                    "safety_requirements": safety,
+                }
+            try:
+                recording_id = int(args["recording_id"])
+            except (TypeError, ValueError):
+                return {"state": "error", "command_sent": False,
+                        "error": "recording_id 必须是整数", "safety_requirements": safety}
+            if not 0 <= recording_id <= 65535:
+                return {"state": "error", "command_sent": False,
+                        "error": "recording_id 必须在 0～65535 范围内", "safety_requirements": safety}
 
+        if action == "finish_and_save_recording":
+            mode = int(self._high_ctrl.get_mode())
+            if mode == 26:
+                return self._protection_error(action, [], mode, safety)
+            if mode != 11:
+                return {
+                    "state": "error", "command_sent": False,
+                    "requested_action": action,
+                    "current_workmode": mode,
+                    "current_workmode_name": _WORKMODE_NAMES.get(mode, "unknown"),
+                    "error": "当前没有正在进行的示教录制；请先调用 start_recording，完成动作引导后再结束并保存",
+                    "safety_requirements": safety,
+                }
+            steps = []
+        else:
+            prepared = self._prepare_workmode(2, action)
+            if prepared["state"] == "error":
+                prepared["safety_requirements"] = safety
+                return prepared
+            steps = prepared["steps"]
+
+        command_name, expected_modes = _TEACHING_ACTIONS[action]
+        return self._trigger_user_action(
+            action, command_name, expected_modes, steps, safety,
+            index=recording_id or 0, recording_id=recording_id)
+
+    def _do_debug_workmode(self, action: str) -> dict:
         current_mode = int(self._high_ctrl.get_mode())
-        if mode_str == "disable":
-            return self._switch_disable(current_mode)
-        if current_mode == 26:
-            return {"state": "error", "error": "Robot in protection mode. Cannot switch modes."}
-        if mode_str == "enable":
-            return self._switch_enable(current_mode)
+        if action == "enable":
+            if current_mode == 0:
+                return self._debug_mode_result(action, current_mode, True, False)
+            if current_mode != 30:
+                return {
+                    "state": "error", "command_sent": False,
+                    "requested_action": action,
+                    "current_workmode": current_mode,
+                    "current_workmode_name": _WORKMODE_NAMES.get(current_mode, "unknown"),
+                    "error": "enable 仅允许从 workmode=30（失能）执行；当前状态下不发送 START，避免其切换语义造成意外失能",
+                }
+            command_name, expected_modes = "START", {0}
+        elif action == "disable":
+            if current_mode == 30:
+                return self._debug_mode_result(action, current_mode, True, False)
+            command_name, expected_modes = "START", {30}
+        elif action == "ready":
+            if current_mode == 1:
+                return self._debug_mode_result(action, current_mode, True, False)
+            command_name, expected_modes = "SWITCH", {1}
+        else:
+            if current_mode == 2:
+                return self._debug_mode_result(action, current_mode, True, False)
+            command_name, expected_modes = "WALK", {2}
 
-        persistent_modes = {"ready": 1, "walk": 2}
-        if mode_str in persistent_modes and current_mode == persistent_modes[mode_str]:
-            return self._already_in_mode(mode_str, current_mode)
-
-        allowed_predecessors = {
-            "ready": {0, 2},
-            "walk": {1},
-            "fall_to_stand": {1},
-            "save_teach": {11},
-        }
-        required_modes = allowed_predecessors.get(mode_str, {2})
-        if current_mode not in required_modes:
-            return self._prerequisite_error(mode_str, current_mode, required_modes)
-
-        # Prevent the 50 Hz movement publisher from racing with an edge-triggered
-        # mode command and overwriting it with DEFAULT. This happens only after
-        # the prerequisite check succeeds, so a rejected request changes nothing.
-        self._stop_move()
-
-        cmd_enum = _get_control_cmd(_MODE_TO_CMD_NAME[mode_str])
+        self._move_stop_event.set()
+        if self._move_thread and self._move_thread.is_alive():
+            self._move_thread.join(timeout=1)
         observed = self._send_edge_and_wait(
-            cmd_enum, _MODE_EXPECTED_WORKMODES[mode_str], index=index, timeout_s=3.0)
-        transition_steps = [{
-            "command": _MODE_TO_CMD_NAME[mode_str],
-            "expected_workmodes": sorted(_MODE_EXPECTED_WORKMODES[mode_str]),
-            "observed_workmode": observed,
-        }]
-        confirmed = observed in _MODE_EXPECTED_WORKMODES[mode_str]
-        return {
+            _get_control_cmd(command_name), expected_modes | {26}, timeout_s=3.0)
+        if observed == 26:
+            return self._protection_error(action, [], observed, command_sent=True)
+        return self._debug_mode_result(
+            action, observed, observed in expected_modes, True,
+            command_name=command_name, expected_modes=expected_modes)
+
+    @staticmethod
+    def _debug_mode_result(action: str, observed: int, confirmed: bool,
+                           command_sent: bool, command_name: str | None = None,
+                           expected_modes: set[int] | None = None) -> dict:
+        result = {
             "state": "completed" if confirmed else "accepted",
-            "requested": mode_str,
+            "requested_action": action,
+            "command_sent": command_sent,
             "confirmed": confirmed,
             "workmode": observed,
             "workmode_name": _WORKMODE_NAMES.get(observed, "unknown"),
-            "transition_steps": transition_steps,
             "message": (
-                "target mode was observed"
-                if confirmed else
-                "command was sent, but the expected mode was not observed before timeout"
+                "已确认目标工作模式" if confirmed and command_sent else
+                "机器人已经处于目标工作模式，未重复发送命令" if confirmed else
+                "命令已发送，但 3 秒内未观察到目标工作模式"
             ),
         }
+        if command_name:
+            result["command"] = command_name
+            result["expected_workmodes"] = sorted(expected_modes or set())
+        return result
 
-    def _switch_enable(self, current_mode: int) -> dict:
-        if current_mode == 0:
-            return self._already_in_mode("enable", current_mode)
-        if current_mode != 30:
-            return self._prerequisite_error("enable", current_mode, {30})
-        observed = self._send_edge_and_wait(_get_control_cmd("START"), {0})
-        confirmed = observed == 0
-        return {
-            "state": "completed" if confirmed else "accepted",
-            "requested": "enable",
-            "confirmed": confirmed,
-            "changed": confirmed,
+    def _prepare_workmode(self, target_mode: int, requested_action: str) -> dict:
+        """Automatically reach ready(1) or walking(2) through documented steps."""
+        self._move_stop_event.set()
+        if self._move_thread and self._move_thread.is_alive():
+            self._move_thread.join(timeout=1)
+
+        steps = []
+        mode = int(self._high_ctrl.get_mode())
+        if mode == 26:
+            return self._protection_error(requested_action, steps, mode)
+
+        stable_modes = {0, 1, 2, 30}
+        if mode not in stable_modes:
+            mode = self._wait_for_workmode(stable_modes, timeout_s=15.0)
+            steps.append({
+                "step": "wait_for_current_action",
+                "result_workmode": mode,
+                "result_workmode_name": _WORKMODE_NAMES.get(mode, "unknown"),
+            })
+            if mode == 26:
+                return self._protection_error(requested_action, steps, mode)
+            if mode not in stable_modes:
+                return self._preparation_error(
+                    requested_action, steps, mode,
+                    "机器人当前动作尚未结束，未继续切换内部模式；请等待动作完成后重试")
+
+        if mode == 30:
+            mode = self._run_preparation_step("enable", "START", {0}, steps)
+            if mode == 26:
+                return self._protection_error(requested_action, steps, mode)
+            if mode != 0:
+                return self._preparation_error(requested_action, steps, mode, "机器人未能进入使能状态")
+
+        if target_mode == 1 and mode == 2:
+            mode = self._run_preparation_step("prepare", "SWITCH", {1}, steps)
+        elif mode == 0:
+            mode = self._run_preparation_step("prepare", "SWITCH", {1}, steps)
+
+        if mode == 26:
+            return self._protection_error(requested_action, steps, mode)
+        if target_mode == 1:
+            if mode != 1:
+                return self._preparation_error(requested_action, steps, mode, "机器人未能进入起身所需的准备状态")
+            return {"state": "completed", "steps": steps, "workmode": mode}
+
+        if mode == 1:
+            mode = self._run_preparation_step("enter_walking", "WALK", {2}, steps)
+        if mode == 26:
+            return self._protection_error(requested_action, steps, mode)
+        if mode != 2:
+            return self._preparation_error(requested_action, steps, mode, "机器人未能进入动作所需的行走状态")
+        return {"state": "completed", "steps": steps, "workmode": mode}
+
+    def _run_preparation_step(self, step: str, command_name: str,
+                              expected_modes: set[int], steps: list[dict]) -> int:
+        observed = self._send_edge_and_wait(
+            _get_control_cmd(command_name), expected_modes | {26}, timeout_s=3.0)
+        steps.append({
+            "step": step,
+            "command": command_name,
+            "expected_workmodes": sorted(expected_modes),
+            "observed_workmode": observed,
+            "observed_workmode_name": _WORKMODE_NAMES.get(observed, "unknown"),
+            "confirmed": observed in expected_modes,
+        })
+        return observed
+
+    def _trigger_user_action(self, requested_action: str, command_name: str,
+                             expected_modes: set[int], preparation_steps: list[dict],
+                             safety_requirements: str, index: int = 0,
+                             recording_id: int | None = None) -> dict:
+        observed = self._send_edge_and_wait(
+            _get_control_cmd(command_name), expected_modes | {26}, index=index, timeout_s=3.0)
+        if observed == 26:
+            return self._protection_error(
+                requested_action, preparation_steps, observed, safety_requirements,
+                command_sent=True)
+        confirmed = observed in expected_modes
+        result = {
+            "state": "running" if confirmed else "accepted",
+            "command_sent": True,
+            "requested_action": requested_action,
+            "confirmed_started": confirmed,
             "workmode": observed,
             "workmode_name": _WORKMODE_NAMES.get(observed, "unknown"),
-            "message": "enable confirmed" if confirmed else "START sent but enabled mode was not observed",
+            "preparation_steps": preparation_steps,
+            "safety_requirements": safety_requirements,
+            "pose_verification": "SDK 仅提供 workmode，不能确认机器人真实姿态；姿态和周围环境必须由用户检查",
+            "message": (
+                "已观察到目标动作模式，动作正在执行；此返回不代表物理动作已经完成"
+                if confirmed else
+                "命令已发送，但 3 秒内未观察到目标动作模式；请检查机器人实际状态和 motion_state"
+            ),
         }
+        if recording_id is not None:
+            result["recording_id"] = recording_id
+        return result
 
-    def _switch_disable(self, current_mode: int) -> dict:
-        if current_mode == 30:
-            return self._already_in_mode("disable", current_mode)
-        self._stop_move()
-        observed = self._send_edge_and_wait(_get_control_cmd("START"), {30})
-        confirmed = observed == 30
+    @staticmethod
+    def _preparation_error(requested_action: str, steps: list[dict],
+                           mode: int, message: str) -> dict:
         return {
-            "state": "completed" if confirmed else "accepted",
-            "requested": "disable",
-            "confirmed": confirmed,
-            "changed": confirmed,
-            "workmode": observed,
-            "workmode_name": _WORKMODE_NAMES.get(observed, "unknown"),
-            "message": "disable confirmed" if confirmed else "START sent but disabled mode was not observed",
+            "state": "error", "command_sent": bool(steps),
+            "requested_action": requested_action,
+            "current_workmode": mode,
+            "current_workmode_name": _WORKMODE_NAMES.get(mode, "unknown"),
+            "preparation_steps": steps,
+            "error": message,
+            "message": "目标动作未发送；请检查机器人姿态、地面和周围空间后重试",
         }
 
     @staticmethod
-    def _already_in_mode(requested: str, current_mode: int) -> dict:
-        return {
-            "state": "completed",
-            "requested": requested,
-            "confirmed": True,
-            "changed": False,
-            "workmode": current_mode,
-            "workmode_name": _WORKMODE_NAMES.get(current_mode, "unknown"),
-            "message": "robot is already in the requested mode; no command was sent",
-        }
-
-    @staticmethod
-    def _prerequisite_error(requested: str, current_mode: int,
-                            required_modes: set[int]) -> dict:
-        if requested == "enable":
-            sequence = ["disable", "enable"]
-        elif requested == "ready":
-            sequence = ["enable", "ready"] if current_mode == 30 else ["ready"]
-        elif requested == "walk":
-            sequence = (
-                ["enable", "ready", "walk"] if current_mode == 30 else
-                ["ready", "walk"] if current_mode == 0 else
-                ["walk"]
-            )
-        elif requested == "fall_to_stand":
-            sequence = (
-                ["enable", "ready", "fall_to_stand"] if current_mode == 30 else
-                ["ready", "fall_to_stand"]
-            )
-        elif requested == "save_teach":
-            sequence = ["start_teach", "save_teach"]
-        else:
-            sequence = (
-                ["enable", "ready", "walk", requested] if current_mode == 30 else
-                ["ready", "walk", requested] if current_mode == 0 else
-                ["walk", requested]
-            )
-        return {
+    def _protection_error(requested_action: str, steps: list[dict], mode: int,
+                          safety_requirements: str | None = None,
+                          command_sent: bool = False) -> dict:
+        result = {
             "state": "error",
-            "error": "current workmode does not satisfy the requested mode prerequisite; no command was sent",
-            "requested": requested,
-            "current_workmode": current_mode,
-            "current_workmode_name": _WORKMODE_NAMES.get(current_mode, "unknown"),
-            "required_current_workmodes": [
-                {"code": mode, "name": _WORKMODE_NAMES.get(mode, "unknown")}
-                for mode in sorted(required_modes)
-            ],
-            "required_sequence": sequence,
-            "safety_note": "verify robot pose, support, ground and surrounding clearance before executing each step",
+            "command_sent": command_sent or bool(steps),
+            "requested_action": requested_action,
+            "current_workmode": mode,
+            "current_workmode_name": "protection",
+            "protection": True,
+            "preparation_steps": steps,
+            "error": "机器人已进入保护模式，动作无法继续",
+            "recovery": "请停止操作并重启机器人；重启前将机器人面朝上平躺于平坦防滑地面，四肢自然放置，脚底无异物，并确保周围至少 3m×3m 无人和障碍物，再执行 stand_up",
         }
+        if safety_requirements:
+            result["safety_requirements"] = safety_requirements
+        return result
+
+    @staticmethod
+    def _safety_requirements(action: str) -> str:
+        if action == "stand_up":
+            return "只能在机器人面朝上平躺、四肢自然放置、双腿伸直、脚底无异物，地面平坦防滑且周围至少 3m×3m 无人无障碍物时使用"
+        if action == "lie_down":
+            return "只能在机器人正常稳定站立，地面平坦防滑且周围至少 3m×3m 无人无障碍物时使用"
+        if action in {"dance_1", "dance_2", "dance_3", "play_recording"}:
+            return "只能在机器人正常稳定站立、双脚着地，地面平坦防滑且周围至少 3m×3m 无人无障碍物时使用"
+        if action == "start_recording":
+            return "确认机器人稳定站立、地面平坦防滑且有人看护；缓慢引导关节，禁止强推、快速扭转或越过机械限位"
+        if action == "finish_and_save_recording":
+            return "仅在已经调用 start_recording 且示教动作已完成时使用；保存期间不要继续搬动机器人"
+        return "只能在机器人正常稳定站立、双脚着地，地面平坦防滑且动作范围内无人和障碍物时使用"
+
+    def _wait_for_workmode(self, expected_modes: set[int], timeout_s: float) -> int:
+        deadline = time.monotonic() + timeout_s
+        observed = int(self._high_ctrl.get_mode())
+        while observed not in expected_modes and observed != 26 and time.monotonic() < deadline:
+            time.sleep(0.05)
+            observed = int(self._high_ctrl.get_mode())
+        return observed
 
     def _send_edge_and_wait(self, cmd_enum, expected_modes: set[int],
                             index: int = 0, timeout_s: float = 2.0) -> int:
@@ -661,16 +848,6 @@ class LocoPlugin:
             time.sleep(0.05)
             observed = int(self._high_ctrl.get_mode())
         return observed
-
-    def _do_get_mode(self) -> dict:
-        mode = int(self._high_ctrl.get_mode())
-        return {
-            "workmode": mode,
-            "workmode_name": _WORKMODE_NAMES.get(mode, "unknown"),
-            "enabled": mode != 30,
-            "protection": mode == 26,
-        }
-
 
 # ── MicPlugin (sensor, subprocess) ────────────────────────────────────────────
 
