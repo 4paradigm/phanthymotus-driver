@@ -46,10 +46,6 @@ _LATEST_QOS = QoSProfile(
     durability=DurabilityPolicy.VOLATILE,
 )
 
-_REMOTE_AUDIO_LOCK = threading.Lock()
-_REMOTE_AUDIO_READY = False
-
-
 def _q5_ssh_args(command: str):
     return [
         "sshpass", "-p", "developer", "ssh", "-p", "2222",
@@ -66,23 +62,14 @@ def _q5_remote_command(command: str, timeout: float = 20.0, stdin=None):
 
 
 def _ensure_remote_audio_tools():
-    """Install the minimal ALSA tools missing from a stock Q5 developer container."""
-    global _REMOTE_AUDIO_READY
-    with _REMOTE_AUDIO_LOCK:
-        if _REMOTE_AUDIO_READY:
-            return
-        command = (
-            "command -v arecord >/dev/null && command -v aplay >/dev/null || "
-            "(echo developer | sudo -S apt-get -o Acquire::Retries=3 update && "
-            "echo developer | sudo -S apt-get install -y --no-install-recommends alsa-utils); "
-            "arecord -l; aplay -l"
-        )
-        result = _q5_remote_command(command, timeout=180.0)
-        if result.returncode:
-            detail = (result.stderr or result.stdout).decode(errors="replace").strip()
-            raise RuntimeError(f"Q5 remote audio setup failed: {detail}")
-        _REMOTE_AUDIO_READY = True
-        print("[Q5Audio] remote ALSA devices:\n" + result.stdout.decode(errors="replace"), flush=True)
+    """Validate the documented sounddevice runtime without mutating Q5 XOS."""
+    result = _q5_remote_command(
+        "python3 -c \"import sounddevice as sd; print(sd.query_devices())\"", timeout=15.0)
+    if result.returncode:
+        detail = (result.stderr or result.stdout).decode(errors="replace").strip()
+        raise RuntimeError(
+            "Q5 sounddevice is unavailable. Install the Q5 manual's PortAudio and sounddevice "
+            f"dependencies in the developer container first: {detail}")
 
 
 class MicPlugin:
@@ -92,7 +79,7 @@ class MicPlugin:
         del executor
         self._client = client
         self._topic = f"/{namespace}/mic/audio"
-        self._device = str(plugin_config.get("device", "default"))
+        self._device = int(plugin_config.get("device", 6))
         self._rate = int(plugin_config.get("sample_rate_hz", 16000))
         self._channels = int(plugin_config.get("channels", 1))
         self._process = None
@@ -143,10 +130,15 @@ class MicPlugin:
         if action == "start":
             try:
                 _ensure_remote_audio_tools()
-                command = ("exec arecord -D " + shlex.quote(self._device) +
-                           f" -f S16_LE -r {self._rate} -c {self._channels} -t raw")
+                command = (
+                    "import sounddevice as sd, sys; "
+                    f"sd.default.device=({self._device}, {self._device}); "
+                    f"stream=sd.RawInputStream(samplerate={self._rate}, channels={self._channels}, "
+                    "dtype='int16', blocksize=1600); stream.start(); "
+                    "\nwhile True:\n data, overflowed=stream.read(1600); sys.stdout.buffer.write(data); sys.stdout.buffer.flush()"
+                )
                 self._process = subprocess.Popen(
-                    _q5_ssh_args(command), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    _q5_ssh_args("python3 -u -c " + shlex.quote(command)), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     bufsize=0)
                 self._running = True
                 self._thread = threading.Thread(target=self._pump, daemon=True, name="q5_mic_stream")
@@ -168,7 +160,7 @@ class SpeakerPlugin:
         del namespace, executor
         self._client = client
         self._topic = str(plugin_config.get("input_topic", "/perception/tts"))
-        self._device = str(plugin_config.get("device", "default"))
+        self._device = int(plugin_config.get("device", 6))
         self._rate = int(plugin_config.get("sample_rate_hz", 16000))
         self._channels = int(plugin_config.get("channels", 1))
         self._process = None
@@ -225,9 +217,14 @@ class SpeakerPlugin:
                 self.stop()
                 _ensure_remote_audio_tools()
                 self._topic = requested
-                command = ("exec aplay -D " + shlex.quote(self._device) +
-                           f" -f S16_LE -r {self._rate} -c {self._channels} -t raw")
-                self._process = subprocess.Popen(_q5_ssh_args(command), stdin=subprocess.PIPE,
+                command = (
+                    "import sounddevice as sd, sys; "
+                    f"sd.default.device=({self._device}, {self._device}); "
+                    f"stream=sd.RawOutputStream(samplerate={self._rate}, channels={self._channels}, "
+                    "dtype='int16', blocksize=1600); stream.start(); "
+                    "\nwhile True:\n data=sys.stdin.buffer.read(3200);\n if not data: break\n stream.write(data)"
+                )
+                self._process = subprocess.Popen(_q5_ssh_args("python3 -u -c " + shlex.quote(command)), stdin=subprocess.PIPE,
                                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, bufsize=0)
                 configure = getattr(self._client, "configure_speaker", None)
                 if callable(configure):

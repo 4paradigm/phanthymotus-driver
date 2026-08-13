@@ -42,7 +42,8 @@ plugins:
     enabled: true
   mic:
     enabled: true
-    device: "default"
+    # Q5 manual: USB Audio Device is input/output index 6.
+    device: 6
     sample_rate_hz: 16000
     channels: 1
   speaker:
@@ -50,7 +51,7 @@ plugins:
     # Agent Core wires perception TTS's audio/pcm-16k output here. The default
     # also makes a default perception TTS instance work without extra config.
     input_topic: "/perception/tts"
-    device: "default"
+    device: 6
     sample_rate_hz: 16000
     channels: 1
   camera_rgb:
