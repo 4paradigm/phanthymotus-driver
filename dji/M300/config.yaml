@@ -28,11 +28,5 @@ plugins:
     enabled: true
   flight:
     enabled: true
-  camera:
-    enabled: true
-  gimbal:
-    enabled: true
-  waypoint:
-    enabled: false
   time_sync:
     enabled: true

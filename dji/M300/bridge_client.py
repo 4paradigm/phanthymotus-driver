@@ -60,16 +60,11 @@ class _MockState:
         self.yaw = 0.0
         self.pitch = 0.0
         self.roll = 0.0
-        self.gimbal_pitch = 0.0
-        self.gimbal_yaw = 0.0
-        self.gimbal_roll = 0.0
         self.battery_percent = 85
         self.flight_status = "on_ground"  # on_ground / in_air
         self.flight_mode = "normal"
         self.motor_on = False
         self.satellites = 18
-        self.recording_video = False
-        self.waypoint_state = "idle"  # idle / executing / paused
         self.obstacle_avoidance = True
 
 
@@ -328,90 +323,6 @@ class BridgeClient:
     def _mock_release_joystick_authority(self, args: dict) -> dict:
         return {"ok": True, "data": {"ret": 0}}
 
-    def _mock_take_photo(self, args: dict) -> dict:
-        return {"ok": True, "data": {"ret": 0, "photo_index": 1}}
-
-    def _mock_start_video(self, args: dict) -> dict:
-        _mock.recording_video = True
-        return {"ok": True, "data": {"ret": 0}}
-
-    def _mock_stop_video(self, args: dict) -> dict:
-        _mock.recording_video = False
-        return {"ok": True, "data": {"ret": 0}}
-
-    def _mock_set_camera_mode(self, args: dict) -> dict:
-        return {"ok": True, "data": {"ret": 0}}
-
-    def _mock_set_zoom(self, args: dict) -> dict:
-        return {"ok": True, "data": {"ret": 0, "zoom_factor": args.get("factor", 1.0)}}
-
-    def _mock_set_focus(self, args: dict) -> dict:
-        return {"ok": True, "data": {"ret": 0}}
-
-    def _mock_set_exposure(self, args: dict) -> dict:
-        return {"ok": True, "data": {"ret": 0}}
-
-    def _mock_get_storage(self, args: dict) -> dict:
-        return {"ok": True, "data": {"total_mb": 128000, "free_mb": 95000}}
-
-    def _mock_gimbal_rotate(self, args: dict) -> dict:
-        _mock.gimbal_pitch = max(-90, min(35, args.get("pitch", _mock.gimbal_pitch)))
-        _mock.gimbal_yaw = max(-40, min(40, args.get("yaw", _mock.gimbal_yaw)))
-        return {"ok": True, "data": {"ret": 0}}
-
-    def _mock_gimbal_reset(self, args: dict) -> dict:
-        _mock.gimbal_pitch = _mock.gimbal_yaw = _mock.gimbal_roll = 0
-        return {"ok": True, "data": {"ret": 0}}
-
-    def _mock_gimbal_set_mode(self, args: dict) -> dict:
-        return {"ok": True, "data": {"ret": 0}}
-
-    def _mock_gimbal_get_angles(self, args: dict) -> dict:
-        return {"ok": True, "data": {
-            "pitch": _mock.gimbal_pitch,
-            "yaw": _mock.gimbal_yaw,
-            "roll": _mock.gimbal_roll,
-        }}
-
-    def _mock_waypoint_upload(self, args: dict) -> dict:
-        return {"ok": True, "data": {"ret": 0}}
-
-    def _mock_waypoint_start(self, args: dict) -> dict:
-        _mock.waypoint_state = "executing"
-        return {"ok": True, "data": {"ret": 0}}
-
-    def _mock_waypoint_pause(self, args: dict) -> dict:
-        _mock.waypoint_state = "paused"
-        return {"ok": True, "data": {"ret": 0}}
-
-    def _mock_waypoint_resume(self, args: dict) -> dict:
-        _mock.waypoint_state = "executing"
-        return {"ok": True, "data": {"ret": 0}}
-
-    def _mock_waypoint_stop(self, args: dict) -> dict:
-        _mock.waypoint_state = "idle"
-        return {"ok": True, "data": {"ret": 0}}
-
-    def _mock_waypoint_status(self, args: dict) -> dict:
-        return {"ok": True, "data": {"state": _mock.waypoint_state, "progress": 0.0}}
-
-    def _mock_speaker_play(self, args: dict) -> dict:
-        return {"ok": True, "data": {"ret": 0}}
-
-    def _mock_speaker_set_volume(self, args: dict) -> dict:
-        return {"ok": True, "data": {"ret": 0}}
-
-    def _mock_speaker_stop(self, args: dict) -> dict:
-        return {"ok": True, "data": {"ret": 0}}
-
-    def _mock_get_power_state(self, args: dict) -> dict:
-        return {"ok": True, "data": {
-            "battery_percent": _mock.battery_percent,
-            "voltage": 22.8,
-            "current": 5.2,
-            "eport_power": True,
-        }}
-
     def _mock_get_hms_info(self, args: dict) -> dict:
         return {"ok": True, "data": {"alerts": []}}
 
@@ -500,95 +411,9 @@ class BridgeClient:
     def release_joystick_authority(self):
         return self._call("release_joystick_authority")
 
-    # Camera
-    def take_photo(self, mode: str = "single", camera: str = "payload1"):
-        return self._call("take_photo", {"mode": mode, "camera": camera})
-
-    def start_video(self, camera: str = "payload1"):
-        return self._call("start_video", {"camera": camera})
-
-    def stop_video(self, camera: str = "payload1"):
-        return self._call("stop_video", {"camera": camera})
-
-    def set_camera_mode(self, mode: str, camera: str = "payload1"):
-        return self._call("set_camera_mode", {"mode": mode, "camera": camera})
-
-    def set_zoom(self, factor: float, camera: str = "payload1"):
-        return self._call("set_zoom", {"factor": factor, "camera": camera})
-
-    def set_focus(self, x: float, y: float, camera: str = "payload1"):
-        return self._call("set_focus", {"x": x, "y": y, "camera": camera})
-
-    def set_exposure(self, iso: int = 0, aperture: float = 0,
-                     shutter_speed: float = 0, ev: float = 0, camera: str = "payload1"):
-        return self._call("set_exposure", {
-            "iso": iso, "aperture": aperture,
-            "shutter_speed": shutter_speed, "ev": ev, "camera": camera,
-        })
-
-    def get_storage(self):
-        return self._call("get_storage")
-
-    def ir_temp_point(self, x: float = 0.5, y: float = 0.5):
-        return self._call("ir_temp_point", {"x": x, "y": y})
-
-    def ir_temp_area(self, ltx: float = 0.25, lty: float = 0.25,
-                     rbx: float = 0.75, rby: float = 0.75):
-        return self._call("ir_temp_area", {"ltx": ltx, "lty": lty, "rbx": rbx, "rby": rby})
-
-    # Gimbal
-    def gimbal_rotate(self, pitch: float = 0, yaw: float = 0, roll: float = 0,
-                      mode: str = "absolute", duration: float = 1.0):
-        return self._call("gimbal_rotate", {
-            "pitch": pitch, "yaw": yaw, "roll": roll,
-            "mode": mode, "duration": duration,
-        })
-
-    def gimbal_reset(self):
-        return self._call("gimbal_reset")
-
-    def gimbal_set_mode(self, mode: str):
-        return self._call("gimbal_set_mode", {"mode": mode})
-
-    def gimbal_get_angles(self):
-        return self._call("gimbal_get_angles")
-
-    # Waypoint
-    def waypoint_upload(self, kmz_path: str):
-        return self._call("waypoint_upload", {"kmz_path": kmz_path})
-
-    def waypoint_start(self):
-        return self._call("waypoint_start")
-
-    def waypoint_pause(self):
-        return self._call("waypoint_pause")
-
-    def waypoint_resume(self):
-        return self._call("waypoint_resume")
-
-    def waypoint_stop(self):
-        return self._call("waypoint_stop")
-
-    def waypoint_status(self):
-        return self._call("waypoint_status")
-
-    # Speaker
-    def speaker_play(self, text: str = "", file_path: str = ""):
-        return self._call("speaker_play", {"text": text, "file_path": file_path})
-
-    def speaker_set_volume(self, volume: int):
-        return self._call("speaker_set_volume", {"volume": volume})
-
-    def speaker_stop(self):
-        return self._call("speaker_stop")
-
     # Telemetry
     def get_telemetry(self):
         return self._call("get_telemetry")
-
-    # Power
-    def get_power_state(self):
-        return self._call("get_power_state")
 
     # HMS
     def get_hms_info(self):

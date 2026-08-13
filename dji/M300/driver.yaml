@@ -6,4 +6,4 @@ hardware_model: "matrice300"
 image_name: dji-m300
 port: 15702
 mcp_url: "http://localhost:15702/mcp"
-description: "DJI Matrice 300 RTK — 飞行控制 + 挂载相机/云台 + 遥测 + 感知 + HMS"
+description: "DJI Matrice 300 RTK — 飞行控制 + 遥测 + 感知 + HMS + 飞机信息"
