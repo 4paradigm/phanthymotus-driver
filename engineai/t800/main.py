@@ -90,6 +90,7 @@ class T800DeviceBundle:
             LocomotionPlugin,
             MotionModePlugin,
             MotorPowerPlugin,
+            NativeInterfaceProbePlugin,
             NativeNodeControlPlugin,
             NativeSdkPlugin,
             SafetyControlPlugin,
@@ -106,6 +107,7 @@ class T800DeviceBundle:
             self._plugins.append(state)
 
         plugin_types = (
+            ("native_interface_probe", NativeInterfaceProbePlugin, (config, namespace, ros2)),
             ("locomotion", LocomotionPlugin, (config, namespace, ros2, state)),
             ("motion_mode", MotionModePlugin, (config, namespace, ros2, state)),
             ("joint_plan", JointPlanPlugin, (config, namespace, ros2, state)),

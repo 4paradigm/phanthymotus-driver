@@ -47,6 +47,8 @@ services:
 plugins:
   state:
     enabled: true
+  native_interface_probe:
+    enabled: true
   locomotion:
     enabled: true
   motion_mode:

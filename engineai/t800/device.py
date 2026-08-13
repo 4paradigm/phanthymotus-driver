@@ -505,6 +505,173 @@ class StatePlugin:
                 publisher.publish(_json_message(self._derived_snapshot(name)))
 
 
+class NativeInterfaceProbePlugin:
+    _NAME_KEYWORDS = ("engineai", "motion", "hardware")
+    _PRIORITY_RANK = {"high": 3, "medium": 2, "low": 1}
+
+    def __init__(self, config: dict, namespace: str, ros2):
+        self._config = config
+        self._ns = namespace
+        self._node = Node("t800_native_interface_probe", context=ros2.ctx_robot)
+        self._pub_node = Node("t800_native_interface_probe_pub", context=ros2.ctx_core)
+        ros2.executor_robot.add_node(self._node)
+        ros2.executor_core.add_node(self._pub_node)
+        self._publisher = self._pub_node.create_publisher(
+            String, f"/{namespace}/state/native_interface_probe", _RELIABLE
+        )
+        self._latest_scan: dict | None = None
+        self._last_scan_at = 0.0
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "native_interface_probe",
+            "type": "sensor",
+            "multiInstance": False,
+            "readOnly": True,
+            "description": "扫描 T800 ROS 图，汇总已映射与未映射原生接口",
+            "inputSchema": action_schema(
+                {
+                    "scan": ([], "扫描 ROS2 topic/service 并输出适合画布验收的摘要"),
+                    "debug": ([], "输出完整 topic/service/mapped/unmapped 清单，供研发排查"),
+                },
+                {},
+                "原生接口探测动作",
+            ),
+            "topic_out": [{"topic": f"/{self._ns}/state/native_interface_probe", "format": "data/json"}],
+        }
+
+    def start(self) -> None:
+        self._pub_node.create_timer(1.0, self._publish)
+
+    def stop(self) -> None:
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("native_interface_probe", "scan", "status", "info", "start"):
+            return self._scan()
+        if action == "debug":
+            return self._scan(debug=True)
+        if action == "stop":
+            return {"state": "idle"}
+        return {"error": f"unknown native interface probe action: {action}"}
+
+    def _scan(self, debug: bool = False) -> dict:
+        topics = self._graph("get_topic_names_and_types")
+        services = self._graph("get_service_names_and_types")
+        configured_topics = set(self._config.get("topics", {}).values())
+        configured_services = set(self._config.get("services", {}).values())
+        mapped, unmapped = [], []
+        for name, types in topics:
+            for message_type in types:
+                if not self._is_relevant(name, message_type):
+                    continue
+                candidate = {
+                    "kind": "topic", "name": name, "message_type": message_type,
+                    "publishers": self._count("count_publishers", name),
+                    "subscribers": self._count("count_subscribers", name),
+                    "suggested_priority": self._priority(name, message_type),
+                }
+                (mapped if name in configured_topics else unmapped).append(candidate)
+        for name, types in services:
+            for service_type in types:
+                if not self._is_relevant(name, service_type):
+                    continue
+                candidate = {
+                    "kind": "service", "name": name, "message_type": service_type,
+                    "servers": self._count("count_services", name),
+                    "clients": self._count("count_clients", name),
+                    "suggested_priority": self._priority(name, service_type),
+                }
+                (mapped if name in configured_services else unmapped).append(candidate)
+        result = {
+            "state": "available" if topics or services else "no_data",
+            "topics": [{"name": name, "types": list(types)} for name, types in topics],
+            "services": [{"name": name, "types": list(types)} for name, types in services],
+            "mapped": mapped,
+            "unmapped_candidates": unmapped,
+            "topic_count": len(topics),
+            "service_count": len(services),
+            "timestamp_ms": _now_ms(),
+        }
+        compact = self._compact_scan(result)
+        self._latest_scan = compact
+        self._last_scan_at = time.monotonic()
+        return result if debug else compact
+
+    @classmethod
+    def _compact_scan(cls, result: dict) -> dict:
+        unmapped = sorted(
+            result.get("unmapped_candidates", []),
+            key=lambda item: cls._PRIORITY_RANK.get(str(item.get("suggested_priority")), 0),
+            reverse=True,
+        )
+        high_priority = [
+            {
+                "kind": item.get("kind"),
+                "name": item.get("name"),
+                "type": item.get("message_type"),
+                "priority": item.get("suggested_priority"),
+            }
+            for item in unmapped[:5]
+        ]
+        return {
+            "state": result.get("state"),
+            "topic_count": result.get("topic_count", 0),
+            "service_count": result.get("service_count", 0),
+            "mapped_count": len(result.get("mapped", [])),
+            "unmapped_count": len(result.get("unmapped_candidates", [])),
+            "top_unmapped": high_priority,
+            "summary_text": (
+                f"{result.get('topic_count', 0)} topics, "
+                f"{result.get('service_count', 0)} services, "
+                f"{len(result.get('unmapped_candidates', []))} unmapped"
+            ),
+            "timestamp_ms": result.get("timestamp_ms", _now_ms()),
+        }
+
+    def _publish(self) -> None:
+        payload = self._latest_scan
+        if payload is None or time.monotonic() - self._last_scan_at > 5.0:
+            payload = self._scan()
+        self._publisher.publish(_json_message(payload))
+
+    def _graph(self, method: str) -> list:
+        callback = getattr(self._node, method, None)
+        if callback is None:
+            return []
+        try:
+            return list(callback())
+        except Exception:
+            return []
+
+    def _count(self, method: str, name: str) -> int:
+        callback = getattr(self._node, method, None)
+        if callback is None:
+            return 0
+        try:
+            return int(callback(name))
+        except Exception:
+            return 0
+
+    @classmethod
+    def _is_relevant(cls, name: str, interface_type: str) -> bool:
+        lowered_name = name.lower()
+        lowered_type = interface_type.lower()
+        return "interface_protocol" in lowered_type or any(
+            keyword in lowered_name or keyword in lowered_type for keyword in cls._NAME_KEYWORDS
+        )
+
+    @staticmethod
+    def _priority(name: str, interface_type: str) -> str:
+        lowered_type = interface_type.lower()
+        lowered_name = name.lower()
+        if "interface_protocol" in lowered_type:
+            return "high"
+        if "motion" in lowered_name or "hardware" in lowered_name:
+            return "medium"
+        return "low"
+
+
 class LocomotionPlugin:
     def __init__(self, config: dict, namespace: str, ros2, state: StatePlugin):
         self._config = config
