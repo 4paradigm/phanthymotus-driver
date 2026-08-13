@@ -1,0 +1,31 @@
+generic-teleop-shadow:
+  image: __IMAGE__
+  container_name: embodied-generic-teleop-shadow
+  network_mode: host
+  volumes:
+    - /opt/phanthy-motus/data/certs/cert.pem:/etc/motus-core-ca/core-ca.pem:ro
+    - /opt/phanthy-motus/data/teleop-capture-tls:/etc/motus-capture-tls:ro
+    - /opt/phanthy-motus/data/teleop-shadow:/var/lib/motus-teleop-shadow
+  environment:
+    - MOTUS_BIND_HOST=127.0.0.1
+    - MOTUS_MCP_PORT=15711
+    - MOTUS_MCP_URL=http://localhost:15711/mcp
+    - MOTUS_DRIVER_ID
+    - MOTUS_DRIVER_NAME
+    - MOTUS_ROBOT_ID
+    - MOTUS_CAPTURE_BIND_HOST=0.0.0.0
+    - MOTUS_CAPTURE_PORT=15712
+    - MOTUS_CAPTURE_WSS_URL=${MOTUS_CAPTURE_WSS_URL:?set the headset-reachable wss URL}
+    - MOTUS_CAPTURE_TLS_CERT_FILE=/etc/motus-capture-tls/cert.pem
+    - MOTUS_CAPTURE_TLS_KEY_FILE=/etc/motus-capture-tls/key.pem
+    - MOTUS_CAPTURE_STATE_FILE=/var/lib/motus-teleop-shadow/capture.json
+    - AGENT_CORE_URL=https://localhost:15678
+    - MOTUS_AGENT_CORE_VERIFY_TLS=1
+    - MOTUS_AGENT_CORE_CA_FILE=/etc/motus-core-ca/core-ca.pem
+    - PYTHONUNBUFFERED=1
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: unless-stopped

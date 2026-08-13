@@ -8,11 +8,23 @@ unitree-g1:
   volumes:
     - /dev:/dev
     - /opt/phanthy-motus/data:/opt/phanthy-motus/data
+    - /opt/phanthy-motus/data/certs:/etc/motus-core-certs:ro
+    # Dedicated Capture identity: never point this at the Core certificate/key.
+    - /opt/phanthy-motus/data/g1-teleop-capture-tls:/etc/motus-g1-capture-tls:ro
+    - /opt/phanthy-motus/data/g1-teleop-state:/var/lib/motus-g1-teleop
   environment:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
     - PYTHONUNBUFFERED=1
+    - AGENT_CORE_URL=https://localhost:15678
+    - MOTUS_DRIVER_ID=${MOTUS_DRIVER_ID:-unitree-g1}
+    - MOTUS_ROBOT_ID=${MOTUS_ROBOT_ID:-unitree-g1}
+    - MOTUS_CAPTURE_WSS_URL=${MOTUS_CAPTURE_WSS_URL:-wss://10.110.12.110:15702/ws/teleop-capture}
+    - MOTUS_CAPTURE_PORT=${MOTUS_CAPTURE_PORT:-15702}
+    - MOTUS_CAPTURE_TLS_CERT=/etc/motus-g1-capture-tls/cert.pem
+    - MOTUS_CAPTURE_TLS_KEY=/etc/motus-g1-capture-tls/key.pem
+    - MOTUS_CAPTURE_STATE_FILE=/var/lib/motus-g1-teleop/capture.json
   logging:
     driver: local
     options:
