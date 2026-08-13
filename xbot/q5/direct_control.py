@@ -356,7 +356,6 @@ are validated against the bundled URDF limits before interpolation.
 ARM_CARD = "arm_control"
 ARM_TYPE = "actuator"
 ARM_TOPIC = "/wr1_controller/commands"
-ARM_DESC = "Q5 手臂控制：将单个关节设置到指定安全角度"
 ARM_JOINTS = (
     "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_arm_yaw_joint",
     "left_elbow_pitch_joint", "left_elbow_yaw_joint", "left_wrist_pitch_joint",
@@ -373,6 +372,21 @@ ARM_JOINT_LABELS = {
     "right_elbow_pitch_joint": "右肘俯仰", "right_elbow_yaw_joint": "右肘偏航",
     "right_wrist_pitch_joint": "右腕俯仰", "right_wrist_roll_joint": "右腕旋转",
 }
+
+
+def _arm_limit_summary() -> str:
+    """Human-readable limits for clients that do not render JSON Schema allOf."""
+    return "; ".join(
+        f"{ARM_JOINT_LABELS[name]} {JOINT_LIMITS[name][0]:g}~{JOINT_LIMITS[name][1]:g} rad"
+        for name in ARM_JOINTS
+    )
+
+
+ARM_DESC = (
+    "Q5 手臂单关节位置控制。target_position_rad 是绝对角度（不是增量）；"
+    "先执行 prepare_position_control。每步最多 0.010 rad、20 Hz，最大约 0.20 rad/s。"
+    "关节范围：" + _arm_limit_summary()
+)
 
 
 def _arm_failure(code: str, message: str, **details) -> dict:
@@ -437,9 +451,9 @@ class ArmControlPlugin:
                     "joint_name": {"type": "string", "title": "目标关节", "enum": list(ARM_JOINTS), "oneOf": [
                         {"const": name, "title": ARM_JOINT_LABELS[name]} for name in ARM_JOINTS
                     ]},
-                    "target_position_rad": {"type": "number", "title": "目标角度 (rad)",
+                    "target_position_rad": {"type": "number", "title": "目标绝对角度 (rad)",
                                              "multipleOf": 0.005,
-                                             "description": "先看范围，再填目标。"},
+                                             "description": "绝对目标角度，不是相对位移。范围随关节变化，见卡片说明；超限会被拒绝。"},
                 },
                 "required": ["action"],
                 "additionalProperties": False,
@@ -447,7 +461,7 @@ class ArmControlPlugin:
                 "x-action-params": {
                     "start": {"params": [], "description": "检查 ROS 连接和机器人状态。"},
                     "prepare_position_control": {"params": [], "description": "执行厂商 DynamicLaunch(pos)、READY、初始姿态、抬臂和ACTIVE流程。"},
-                    "move": {"params": ["joint_name", "target_position_rad"], "description": "将一个关节设置到指定绝对角度。"},
+                    "move": {"params": ["joint_name", "target_position_rad"], "description": "设置单个关节的绝对角度；最大速度约 0.20 rad/s。范围：" + _arm_limit_summary()},
                     "cancel": {"params": [], "description": "取消微调，并保持当前关节角度。"},
                     "info": {"params": [], "description": "查看当前运动和安全条件。"},
                 },
