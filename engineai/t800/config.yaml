@@ -40,12 +40,15 @@ topics:
   joint_command: "/hardware/joint_command"
   tts: "/hardware/tts"
   native_node_control: "/motion/node_control"
+  link_info: "/motion/link_info"
 
 services:
   enable_motor: "/hardware/enable_motor"
 
 plugins:
   state:
+    enabled: true
+  link_info:
     enabled: true
   locomotion:
     enabled: true
