@@ -40,6 +40,3 @@ Thumbs.db
 
 # Docker
 .docker/
-
-# Local pinned vendor build archives
-deep_robotics/lynx_m20/deep-robotics-msg-*.zip

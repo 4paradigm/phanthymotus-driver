@@ -2,27 +2,24 @@
 
 本 Driver 依据供应商《山猫 M20 开发指南》（适用系统版本 V1.1.8）实现。
 
-## 构建前准备
+## 固定版本构建依赖
 
-镜像构建不会在容器内访问 GitHub，也不会执行 `git clone`。请预先下载固定版本的官方 `deep-robotics-msg` ZIP：
+镜像构建不会在容器内访问 GitHub，也不会执行 `git clone`。仓库已包含固定版本的官方 `deep-robotics-msg` ZIP，无需手动下载：
 
 - 提交版本：`a0d1a29eec5c4db5a9107595bb51e3be8122b86c`
-- 下载地址：`https://github.com/DeepRoboticsLab/deep-robotics-msg/archive/a0d1a29eec5c4db5a9107595bb51e3be8122b86c.zip`
 - 文件名：`deep-robotics-msg-a0d1a29eec5c4db5a9107595bb51e3be8122b86c.zip`
 - 放置位置：`deep_robotics/lynx_m20/deep-robotics-msg-a0d1a29eec5c4db5a9107595bb51e3be8122b86c.zip`
+- 上游来源：`https://github.com/DeepRoboticsLab/deep-robotics-msg/archive/a0d1a29eec5c4db5a9107595bb51e3be8122b86c.zip`
 - SHA256：`1d268a76e80af8ea5aa3dc28de0c236de87bce55a5d397fdad1e23515f02a537`
 
 示例：
 
 ```bash
-curl -fL -o deep_robotics/lynx_m20/deep-robotics-msg-a0d1a29eec5c4db5a9107595bb51e3be8122b86c.zip \
-  https://github.com/DeepRoboticsLab/deep-robotics-msg/archive/a0d1a29eec5c4db5a9107595bb51e3be8122b86c.zip
-
 shasum -a 256 deep_robotics/lynx_m20/deep-robotics-msg-a0d1a29eec5c4db5a9107595bb51e3be8122b86c.zip
 bash build.sh --mirror tuna deep_robotics/lynx_m20
 ```
 
-Dockerfile 会在解压和编译前再次校验 SHA256。ZIP 被 `.gitignore` 排除，不会进入提交。
+Dockerfile 会在解压和编译前再次校验 SHA256。归档内保留上游 `LICENSE`，更新依赖时必须同时更新提交版本、文件名和 SHA256。
 
 ## 已实现接口
 
