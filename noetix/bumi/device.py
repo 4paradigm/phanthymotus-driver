@@ -3,7 +3,7 @@
 drivers/noetix/bumi/device.py — Noetix Bumi-EDU 设备插件实现。
 
 插件列表：
-  - StatePlugin: joints (21-DOF skeleton), motor-health, imu, battery, model (URDF resource)
+  - StatePlugin: joints (21-DOF skeleton), motor_health, imu, battery, model (URDF resource)
   - LocoPlugin: loco (move/stop), switch_mode (mode transitions)
   - MicPlugin: 8ch mic capture → mono PCM 16kHz
   - SpeakerPlugin: audio playback via MediaController
@@ -101,7 +101,7 @@ _MOTOR_HEALTH_NORMAL_CODES = {0x00, 0x01}
 
 
 def _build_motor_health(joint_state) -> dict:
-    """Convert the SDK's 21 MotorState values to the motor-health schema."""
+    """Convert the SDK's 21 MotorState values to the motor_health schema."""
     faults = []
     for index, motor in enumerate(joint_state):
         motor_id = int(getattr(motor, "motor_id", index))
@@ -186,7 +186,7 @@ class _BumiStateNode(Node):
         self._imu_topic     = f"/{namespace}/state/imu"
         self._battery_topic = f"/{namespace}/state/battery"
         self._joints_topic  = f"/{namespace}/state/joints"
-        self._motor_health_topic = f"/{namespace}/state/motor-health"
+        self._motor_health_topic = f"/{namespace}/state/motor_health"
 
         self._imu_pub     = self.create_publisher(String, self._imu_topic,     _LOW_LAT_QOS)
         self._battery_pub = self.create_publisher(String, self._battery_topic, _LOW_LAT_QOS)
@@ -335,12 +335,12 @@ class StatePlugin:
                 "topic_out": [{"topic": f"/{ns}/state/joints", "format": "sensor/skeleton"}],
             },
             {
-                "name": "motor-health",
+                "name": "motor_health",
                 "type": "sensor",
                 "multiInstance": False,
-                "description": f"Bumi motor health — active motor faults with joint, error code, message, and temperature. Publishes at 10Hz to /{ns}/state/motor-health",
+                "description": f"Bumi motor health — active motor faults with joint, error code, message, and temperature. Publishes at 10Hz to /{ns}/state/motor_health",
                 "inputSchema": {"type": "object", "properties": {}},
-                "topic_out": [{"topic": f"/{ns}/state/motor-health", "format": "data/json"}],
+                "topic_out": [{"topic": f"/{ns}/state/motor_health", "format": "data/json"}],
             },
             {
                 "name": "model",
@@ -362,14 +362,14 @@ class StatePlugin:
             return {"state": "running"}
         if action == "stop":
             return {"state": "idle"}
-        if action == "motor-health":
+        if action == "motor_health":
             return self._node.get_motor_health()
         if action == "info":
-            if args.get("_tool_name") == "motor-health":
+            if args.get("_tool_name") == "motor_health":
                 return {
                     "state": "running",
                     "topic_out": [{
-                        "topic": f"/{self._namespace}/state/motor-health",
+                        "topic": f"/{self._namespace}/state/motor_health",
                         "format": "data/json",
                     }],
                 }
