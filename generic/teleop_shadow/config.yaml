@@ -1,0 +1,39 @@
+driver_id: "teleop-shadow-driver"
+driver_name: "Generic Teleop Shadow Diagnostics"
+robot_id: null
+mcp_port: 15711
+bind_host: "127.0.0.1"
+mcp_allow_non_loopback: false
+
+teleop:
+  lease_timeout_ms: 6000
+  pose_timeout_ms: 200
+  watchdog_interval_ms: 25
+  dispatch_io_timeout_ms: 100
+  dispatch_ack_timeout_ms: 200
+  ticket_ttl_max_seconds: 30
+  ticket_replay_cache_entries: 4096
+  ticket_ttl_seconds: 20
+
+capture:
+  bind_host: "0.0.0.0"
+  port: 15712
+  public_wss_url: null
+  tls_cert_file: "/etc/motus-capture-tls/cert.pem"
+  tls_key_file: "/etc/motus-capture-tls/key.pem"
+  state_file: "/var/lib/motus-teleop-shadow/capture.json"
+  pairing_ttl_seconds: 60
+  presence_interval_ms: 1000
+  presence_timeout_ms: 5000
+
+registration:
+  enabled: true
+  agent_core_url: "https://localhost:15678"
+  advertise_url: "http://localhost:15711/mcp"
+  interval_seconds: 30
+  verify_tls: true
+  ca_file: "/etc/motus-core-ca/core-ca.pem"
+  # Null preserves a no-lock/no-wait single-instance fast path. The strict
+  # multi-instance renderer mounts one shared coordination directory and
+  # overrides this with its durable lock/marker file.
+  coordination_file: null

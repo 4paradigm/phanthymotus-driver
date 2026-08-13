@@ -1,0 +1,24 @@
+schema_version: 4
+core_ca_file: /opt/phanthy-motus/data/certs/cert.pem
+registration_coordination_dir: /opt/phanthy-motus/data/teleop-registration
+instances:
+  - service: teleop-shadow-lab-a
+    container: motus-teleop-shadow-lab-a
+    driver_id: teleop-shadow-lab-a
+    driver_name: Lab A Quest Teleop Shadow
+    robot_id: teleop-shadow-lab-a
+    mcp_port: 15711
+    capture_port: 15811
+    capture_wss_url: wss://192.0.2.110:15811/ws/teleop-capture
+    capture_tls_dir: /opt/phanthy-motus/data/teleop-capture-tls/lab-a
+    capture_state_dir: /opt/phanthy-motus/data/teleop-shadow/lab-a
+  - service: teleop-shadow-lab-b
+    container: motus-teleop-shadow-lab-b
+    driver_id: teleop-shadow-lab-b
+    driver_name: Lab B PICO Teleop Shadow
+    robot_id: teleop-shadow-lab-b
+    mcp_port: 15712
+    capture_port: 15812
+    capture_wss_url: wss://192.0.2.111:15812/ws/teleop-capture
+    capture_tls_dir: /opt/phanthy-motus/data/teleop-capture-tls/lab-b
+    capture_state_dir: /opt/phanthy-motus/data/teleop-shadow/lab-b

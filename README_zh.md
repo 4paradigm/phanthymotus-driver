@@ -13,6 +13,7 @@
 | `unitree/g1` | Unitree G1 人形机器人 | 15701 | 运动控制、机械臂、麦克风、扬声器、LED、状态监控 |
 | `engineai/t800` | 众擎 T800 开发版 | 15708 | ROS2/Native SDK、全身状态、舞蹈/手势序列、虚拟手柄、运动与高低层控制 |
 | `phanthy/remote_control` | 远程控制桥接 | 15710 | 远程控制中继 |
+| [`generic/teleop_shadow`](generic/teleop_shadow/README.md) | 无机器人 OpenXR/WebRTC 端点 | 15711 | Driver 自主管理 Meta/PICO 采集、严格 Frame v1、Shadow 会话与看门狗诊断；永不执行硬件动作 |
 
 ## 快速开始
 
