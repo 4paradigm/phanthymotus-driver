@@ -4006,6 +4006,82 @@ class TtsPlugin:
             print("[TtsPlugin] service clients + event/progress subscriptions created")
         except ImportError as e:
             print(f"[TtsPlugin] WARNING: msg import failed ({e})")
+            return
+
+        # Health check: verify PlayEvent pipeline is working
+        self._startup_error = self._lyre_health_check()
+
+    def _lyre_health_check(self) -> str | None:
+        """Call play_text and verify PlayEvent arrives. Returns error message or None."""
+        import subprocess as _sp
+        import time as _time
+
+        for attempt in range(2):
+            if attempt > 0:
+                # Restart lyre via nsenter on second attempt
+                print("[TtsPlugin] health check failed, restarting lyre...", flush=True)
+                try:
+                    _sp.run(["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--",
+                             "systemctl", "restart", "lyre"],
+                            capture_output=True, timeout=15)
+                    _time.sleep(5)
+                except Exception as e:
+                    print(f"[TtsPlugin] lyre restart failed: {e}", flush=True)
+
+            # Wait for service to be available (poll without spinning — executor thread handles it)
+            service_ready = False
+            deadline = _time.time() + 5
+            while _time.time() < deadline:
+                if self._play_client.service_is_ready():
+                    service_ready = True
+                    break
+                _time.sleep(0.2)
+            if not service_ready:
+                print(f"[TtsPlugin] health check attempt {attempt+1}: play_text service not available", flush=True)
+                continue
+
+            # Send a silent test (single dot — minimal TTS)
+            from lyre_msgs.srv import PlayText
+            req = PlayText.Request()
+            req.text = "."
+            req.force = True
+            future = self._play_client.call_async(req)
+
+            # Wait for response (max 3s) — executor spin thread delivers it
+            deadline = _time.time() + 3
+            while not future.done() and _time.time() < deadline:
+                _time.sleep(0.1)
+
+            if not future.done():
+                print(f"[TtsPlugin] health check attempt {attempt+1}: play_text call timeout", flush=True)
+                continue
+
+            resp = future.result()
+            if resp is None or resp.code != 0:
+                print(f"[TtsPlugin] health check attempt {attempt+1}: play_text returned error", flush=True)
+                continue
+
+            sid = resp.sid
+            # Wait for PlayEvent with this sid (3s timeout)
+            # The executor spin thread will call _on_play_event which populates _play_event_buffer
+            deadline = _time.time() + 3
+            while _time.time() < deadline:
+                if sid in self._play_event_buffer:
+                    break
+                _time.sleep(0.1)
+
+            if sid in self._play_event_buffer:
+                # Cleanup test sid from buffers
+                self._play_event_buffer.pop(sid, None)
+                self._pending_play.pop(sid, None)
+                self._pending_play_status.pop(sid, None)
+                self._pending_play_duration.pop(sid, None)
+                print(f"[TtsPlugin] health check passed (attempt {attempt+1})", flush=True)
+                return None  # success
+            else:
+                print(f"[TtsPlugin] health check attempt {attempt+1}: PlayEvent not received for sid={sid}", flush=True)
+
+        return "Lyre TTS PlayEvent 链路异常：播放成功但无法收到完成事件。已尝试重启 lyre 仍未恢复，请检查 lyre 服务状态。"
 
     # PlayEvent event codes
     _EVENT_NAMES = {0: "STARTED", 1: "COMPLETED", 2: "STOPPED", 3: "CANCELLED", 4: "FAILED"}
@@ -4056,6 +4132,8 @@ class TtsPlugin:
         elif action == "resume":
             return self._call_empty_service(self._resume_client, "resume")
         elif action in ("start", "info"):
+            if hasattr(self, '_startup_error') and self._startup_error:
+                return {"state": "error", "message": self._startup_error}
             return {"state": "ready"}
         return {"error": f"unknown action: {action}"}
 
