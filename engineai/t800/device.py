@@ -12,6 +12,7 @@ import json
 import math
 import threading
 import time
+from collections import deque
 from dataclasses import asdict
 from pathlib import Path
 
@@ -503,6 +504,216 @@ class StatePlugin:
         if tick % 20 == 0:
             for name, publisher in self._derived_publishers.items():
                 publisher.publish(_json_message(self._derived_snapshot(name)))
+
+
+class MotionCommandTracePlugin:
+    def __init__(self, config: dict, namespace: str, ros2):
+        self._config = config
+        self._ns = namespace
+        capacity = max(1, int(config.get("diagnostics", {}).get("command_trace_capacity", 20)))
+        self._node = Node("t800_motion_command_trace", context=ros2.ctx_robot)
+        self._pub_node = Node("t800_motion_command_trace_pub", context=ros2.ctx_core)
+        ros2.executor_robot.add_node(self._node)
+        ros2.executor_core.add_node(self._pub_node)
+        self._publisher = self._pub_node.create_publisher(
+            String, f"/{namespace}/state/motion_command_trace", _RELIABLE
+        )
+        self._lock = threading.RLock()
+        self._velocity_commands = deque(maxlen=capacity)
+        self._motion_requests = deque(maxlen=capacity)
+        self._gamepad_inputs = deque(maxlen=capacity)
+        self._odometry_samples = deque(maxlen=capacity)
+        self._velocity_count = 0
+        self._motion_count = 0
+        self._gamepad_count = 0
+        self._odometry_count = 0
+        self._velocity_updated: float | None = None
+        self._motion_updated: float | None = None
+        self._gamepad_updated: float | None = None
+        self._odometry_updated: float | None = None
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "motion_command_trace",
+            "type": "sensor",
+            "multiInstance": False,
+            "readOnly": True,
+            "description": "输出 T800 当前速度，兼容手柄、驱动指令和里程计来源",
+            "inputSchema": action_schema(
+                {
+                    "status": ([], "返回适合画布验收的简洁速度状态"),
+                    "debug": ([], "返回最近命令、手柄、里程计原始摘要，供研发排查"),
+                },
+                {},
+                "运动速度查询",
+            ),
+            "topic_out": [{"topic": f"/{self._ns}/state/motion_command_trace", "format": "data/json"}],
+        }
+
+    def start(self) -> None:
+        from interface_protocol.msg import BodyVelCmd, GamepadKeys, MotionStateRequest
+        from nav_msgs.msg import Odometry
+
+        topics = self._config["topics"]
+        self._node.create_subscription(
+            BodyVelCmd, topics["body_velocity"], self._on_velocity, _RELIABLE
+        )
+        self._node.create_subscription(
+            MotionStateRequest, topics["motion_request"], self._on_motion_request, _RELIABLE_ONE
+        )
+        self._node.create_subscription(
+            GamepadKeys, topics["gamepad"], self._on_gamepad, _BEST_EFFORT
+        )
+        odometry_topic = str(topics.get("odometry", "")).strip()
+        if odometry_topic:
+            self._node.create_subscription(
+                Odometry, odometry_topic, self._on_odometry, _BEST_EFFORT
+            )
+        self._pub_node.create_timer(0.2, self._publish)
+
+    def stop(self) -> None:
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("motion_command_trace", "status", "info", "start"):
+            return self._snapshot()
+        if action == "debug":
+            return self._debug_snapshot()
+        if action == "stop":
+            return {"state": "idle"}
+        return {"error": f"unknown motion trace action: {action}"}
+
+    def _on_velocity(self, msg) -> None:
+        entry = {
+            "linear_velocity": [float(value) for value in msg.linear_velocity],
+            "yaw_velocity": float(msg.yaw_velocity),
+            "timestamp_ms": _now_ms(),
+        }
+        with self._lock:
+            self._velocity_commands.append(entry)
+            self._velocity_count += 1
+            self._velocity_updated = time.monotonic()
+
+    def _on_motion_request(self, msg) -> None:
+        entry = {"target_motion_name": str(msg.target_motion_name), "timestamp_ms": _now_ms()}
+        with self._lock:
+            self._motion_requests.append(entry)
+            self._motion_count += 1
+            self._motion_updated = time.monotonic()
+
+    def _on_gamepad(self, msg) -> None:
+        analog = [float(value) for value in msg.analog_states]
+        entry = {
+            "hardware_connected": bool(msg.hardware_connected),
+            "digital_pressed": [index for index, value in enumerate(msg.digital_states) if int(value) != 0],
+            "analog_states": analog,
+            "left_stick": {"x": analog[2] if len(analog) > 2 else None, "y": analog[3] if len(analog) > 3 else None},
+            "right_stick": {"x": analog[4] if len(analog) > 4 else None, "y": analog[5] if len(analog) > 5 else None},
+            "timestamp_ms": _now_ms(),
+        }
+        with self._lock:
+            self._gamepad_inputs.append(entry)
+            self._gamepad_count += 1
+            self._gamepad_updated = time.monotonic()
+
+    def _on_odometry(self, msg) -> None:
+        linear = msg.twist.twist.linear
+        angular = msg.twist.twist.angular
+        vx, vy, vz = float(linear.x), float(linear.y), float(linear.z)
+        entry = {
+            "frame_id": str(getattr(msg.header, "frame_id", "")),
+            "child_frame_id": str(getattr(msg, "child_frame_id", "")),
+            "linear_velocity": {"x": vx, "y": vy, "z": vz},
+            "speed_m_s": math.sqrt(vx * vx + vy * vy + vz * vz),
+            "angular_velocity": {"x": float(angular.x), "y": float(angular.y), "z": float(angular.z)},
+            "yaw_rate_rad_s": float(angular.z),
+            "timestamp_ms": _now_ms(),
+        }
+        with self._lock:
+            self._odometry_samples.append(entry)
+            self._odometry_count += 1
+            self._odometry_updated = time.monotonic()
+
+    def _snapshot(self) -> dict:
+        now = time.monotonic()
+        with self._lock:
+            velocity = self._velocity_commands[-1] if self._velocity_commands else None
+            gamepad = self._gamepad_inputs[-1] if self._gamepad_inputs else None
+            odometry = self._odometry_samples[-1] if self._odometry_samples else None
+            velocity_updated = self._velocity_updated
+            gamepad_updated = self._gamepad_updated
+            odometry_updated = self._odometry_updated
+        timeout_sec = float(self._config["ros"].get("source_timeout_sec", 1.0))
+        odometry_age = None if odometry_updated is None else max(0.0, now - odometry_updated)
+        velocity_age = None if velocity_updated is None else max(0.0, now - velocity_updated)
+
+        source = "none"
+        speed = 0.0
+        age_sec = None
+        if odometry is not None:
+            source = "odometry"
+            speed = float(odometry.get("speed_m_s", 0.0))
+            age_sec = odometry_age
+        elif velocity is not None:
+            source = "body_velocity_command"
+            values = [float(value) for value in velocity.get("linear_velocity", [])]
+            speed = math.sqrt(sum(value * value for value in values))
+            age_sec = velocity_age
+
+        stale = age_sec is None or age_sec > timeout_sec
+        speed_rounded = round(speed, 2)
+        motion_state = "moving" if speed_rounded >= 0.03 else "stopped"
+        state = "no_data" if source == "none" else ("stale" if stale else "running")
+        return {
+            "state": state,
+            "speed": f"{speed_rounded:.2f} m/s",
+            "motion_state": motion_state,
+            "source": source,
+            "gamepad_connected": None if gamepad is None else bool(gamepad.get("hardware_connected")),
+            "age_sec": None if age_sec is None else round(age_sec, 1),
+            "timestamp_ms": _now_ms(),
+        }
+
+    def _debug_snapshot(self) -> dict:
+        now = time.monotonic()
+        with self._lock:
+            velocity = list(self._velocity_commands)
+            motions = list(self._motion_requests)
+            gamepad = list(self._gamepad_inputs)
+            odometry = list(self._odometry_samples)
+            velocity_updated = self._velocity_updated
+            motion_updated = self._motion_updated
+            gamepad_updated = self._gamepad_updated
+            odometry_updated = self._odometry_updated
+            counts = {
+                "body_velocity": self._velocity_count,
+                "motion_request": self._motion_count,
+                "gamepad": self._gamepad_count,
+                "odometry": self._odometry_count,
+            }
+        ages = {
+            "body_velocity": None if velocity_updated is None else max(0.0, now - velocity_updated),
+            "motion_request": None if motion_updated is None else max(0.0, now - motion_updated),
+            "gamepad": None if gamepad_updated is None else max(0.0, now - gamepad_updated),
+            "odometry": None if odometry_updated is None else max(0.0, now - odometry_updated),
+        }
+        return {
+            "state": "running" if velocity or motions or gamepad or odometry else "no_data",
+            "velocity_commands": velocity,
+            "motion_requests": motions,
+            "gamepad_inputs": gamepad,
+            "odometry_samples": odometry,
+            "latest_velocity_command": velocity[-1] if velocity else None,
+            "latest_motion_request": motions[-1] if motions else None,
+            "latest_gamepad_input": gamepad[-1] if gamepad else None,
+            "latest_measured_velocity": odometry[-1] if odometry else None,
+            "last_seen_age_sec": ages,
+            "command_count": {**counts, "total": sum(counts.values())},
+            "timestamp_ms": _now_ms(),
+        }
+
+    def _publish(self) -> None:
+        self._publisher.publish(_json_message(self._snapshot()))
 
 
 class LocomotionPlugin:

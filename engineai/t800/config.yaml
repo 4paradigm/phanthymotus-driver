@@ -33,6 +33,7 @@ topics:
   motion_state: "/motion/motion_state"
   body_velocity: "/motion/body_vel_cmd"
   motion_request: "/motion/set_motion_state"
+  odometry: "/manifold/ODIN2/device0/odometry"
   led: "/hardware/led_control"
   joint_plan_request: "/motion/joint_motion_plan/request"
   joint_plan_state: "/motion/joint_motion_plan/state"
@@ -44,8 +45,13 @@ topics:
 services:
   enable_motor: "/hardware/enable_motor"
 
+diagnostics:
+  command_trace_capacity: 20
+
 plugins:
   state:
+    enabled: true
+  motion_command_trace:
     enabled: true
   locomotion:
     enabled: true

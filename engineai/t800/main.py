@@ -88,6 +88,7 @@ class T800DeviceBundle:
             JointPlanPlugin,
             LedPlugin,
             LocomotionPlugin,
+            MotionCommandTracePlugin,
             MotionModePlugin,
             MotorPowerPlugin,
             NativeNodeControlPlugin,
@@ -106,6 +107,7 @@ class T800DeviceBundle:
             self._plugins.append(state)
 
         plugin_types = (
+            ("motion_command_trace", MotionCommandTracePlugin, (config, namespace, ros2)),
             ("locomotion", LocomotionPlugin, (config, namespace, ros2, state)),
             ("motion_mode", MotionModePlugin, (config, namespace, ros2, state)),
             ("joint_plan", JointPlanPlugin, (config, namespace, ros2, state)),
