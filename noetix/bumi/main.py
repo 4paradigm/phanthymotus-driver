@@ -82,12 +82,6 @@ class BumiDeviceBundle:
                 plugins_cfg["motion_state"], namespace, executor, high_ctrl))
             print("[bundle] MotionStatePlugin loaded")
 
-        if plugins_cfg.get("media_system", {}).get("enabled", False) and media_ctrl is not None:
-            from device import MediaSystemPlugin
-            self._plugins.append(MediaSystemPlugin(
-                plugins_cfg["media_system"], namespace, executor, media_ctrl))
-            print("[bundle] MediaSystemPlugin loaded")
-
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
             try:
