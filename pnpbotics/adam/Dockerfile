@@ -29,7 +29,7 @@ RUN pip3 install --no-cache-dir --no-binary cyclonedds -i ${PYPI_MIRROR} cyclone
 
 # pnd_sdk_python (Adam DDS SDK)
 COPY pnd_sdk_python/ /tmp/pnd_sdk_python/
-RUN pip3 install /tmp/pnd_sdk_python && \
+RUN pip3 install --no-cache-dir --no-deps /tmp/pnd_sdk_python && \
     rm -rf /tmp/pnd_sdk_python
 
 # Application files
