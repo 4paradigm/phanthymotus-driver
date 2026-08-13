@@ -553,6 +553,7 @@ Each driver must include a `deploy/service.yml` file that defines its Docker Com
 
 ```yaml
 unitree-g1:                      # Service name (must be unique)
+  container_name: embodied-unitree-g1  # Recommended: embodied-{provider}-{model}
   image: __IMAGE__               # Placeholder, replaced by Agent Core at deploy time
   privileged: true               # Required: access to /dev and hardware
   volumes:
@@ -572,6 +573,7 @@ unitree-g1:                      # Service name (must be unique)
 
 **Notes:**
 
+- **`container_name` 命名建议**: 推荐使用 `embodied-{provider}-{model}` 格式（如 `embodied-dji-matrice300`）。Agent Core 会自动从 service.yml 中读取 `container_name` 并用于容器状态查询/停止/删除。如果不指定 `container_name`，Agent Core 会回退到 `embodied-{driver_id}` 作为默认值。自定义名称（如 `dji-m300`）也可以正常工作。
 - `privileged: true` and `/dev:/dev` are mandatory for any driver that accesses hardware (cameras, USB devices, GPIO)
 - `network_mode`, `ipc`, `pid` are injected by Agent Core during deployment — do not specify them in service.yml
 - The `__IMAGE__` placeholder is automatically replaced with the actual image reference
