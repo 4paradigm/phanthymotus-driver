@@ -30,9 +30,15 @@ def _resolve_namespace(config: dict) -> str:
 
 
 def _configure_cyclonedds(config: dict) -> str:
-    interface = os.environ.get("NETWORK_INTERFACE") or str(config["ros"].get("robot_interface", "eth0"))
+    interface = os.environ.get("NETWORK_INTERFACE") or str(config["ros"].get("robot_interface", "eth1"))
     if not re.fullmatch(r"[a-zA-Z0-9_.:-]+", interface):
         raise ValueError(f"invalid robot network interface: {interface}")
+    available = {name for _index, name in socket.if_nameindex()}
+    if available and interface not in available:
+        names = ", ".join(sorted(available))
+        raise ValueError(
+            f"robot network interface {interface!r} does not exist; available interfaces: {names}"
+        )
     os.environ.setdefault(
         "CYCLONEDDS_URI",
         "<CycloneDDS><Domain><General><Interfaces>"
@@ -92,6 +98,7 @@ class T800DeviceBundle:
             LocomotionPlugin,
             MotionCommandTracePlugin,
             MotionEventsPlugin,
+            MicPlugin,
             MotionModePlugin,
             MotorPowerPlugin,
             NativeInterfaceProbePlugin,
@@ -100,10 +107,14 @@ class T800DeviceBundle:
             SafetyControlPlugin,
             StatePlugin,
             TtsPlugin,
+            VisionPlugin,
         )
         from virtual_gamepad import VirtualGamepadPlugin
 
         self._plugins: list = []
+        self._active_plugins: list = []
+        self._startup_errors: dict[str, str] = {}
+        self._started = False
         plugins = config.get("plugins", {})
 
         motion_events = None
@@ -129,6 +140,8 @@ class T800DeviceBundle:
             ("joint_bridge", JointBridgePlugin, (config, namespace, ros2, state)),
             ("led", LedPlugin, (config, namespace, ros2)),
             ("tts", TtsPlugin, (config, namespace, ros2)),
+            ("mic", MicPlugin, (config, namespace, ros2)),
+            ("vision", VisionPlugin, (config, namespace, ros2)),
             ("motor_power", MotorPowerPlugin, (config, namespace, ros2)),
             ("native_node_control", NativeNodeControlPlugin, (config, namespace, ros2)),
             ("safety", SafetyControlPlugin, (config, namespace, ros2, state)),
@@ -170,28 +183,69 @@ class T800DeviceBundle:
             self._plugins.append(NativeSdkPlugin(native_config, namespace, ros2))
 
     def start_all(self) -> None:
+        if self._started:
+            return
+        self._active_plugins = []
+        self._startup_errors = {}
         for plugin in self._plugins:
             try:
                 plugin.start()
                 print(f"[bundle] {type(plugin).__name__} started", flush=True)
             except Exception as exc:
+                plugin_name = type(plugin).__name__
+                self._startup_errors[plugin_name] = str(exc)
                 print(f"[bundle] {type(plugin).__name__} start failed: {exc}", flush=True)
+                try:
+                    plugin.stop()
+                except Exception as stop_exc:
+                    print(f"[bundle] {plugin_name} cleanup failed: {stop_exc}", flush=True)
+            else:
+                self._active_plugins.append(plugin)
+        self._started = True
 
     def stop_all(self) -> None:
-        for plugin in reversed(self._plugins):
+        if not self._started:
+            return
+        for plugin in reversed(self._active_plugins):
             try:
                 plugin.stop()
             except Exception as exc:
                 print(f"[bundle] {type(plugin).__name__} stop failed: {exc}", flush=True)
+        self._active_plugins = []
+        self._started = False
 
     def get_all_tools(self) -> list[dict]:
         tools: list[dict] = []
-        for plugin in self._plugins:
+        for plugin in self._active_plugins:
             tools.extend(plugin.get_tools() if hasattr(plugin, "get_tools") else [plugin.get_tool()])
         return tools
 
-    def dispatch(self, tool_name: str, arguments: dict) -> dict | None:
+    def health(self) -> dict:
+        configured_tools = 0
         for plugin in self._plugins:
+            definitions = plugin.get_tools() if hasattr(plugin, "get_tools") else [plugin.get_tool()]
+            configured_tools += len(definitions)
+        active_tools = len(self.get_all_tools())
+        if not self._started:
+            state = "starting"
+        elif self._startup_errors and not self._active_plugins:
+            state = "failed"
+        elif self._startup_errors:
+            state = "degraded"
+        else:
+            state = "running"
+        return {
+            "state": state,
+            "driver": "engineai-t800",
+            "configured_plugins": len(self._plugins),
+            "active_plugins": len(self._active_plugins),
+            "configured_tools": configured_tools,
+            "active_tools": active_tools,
+            "startup_errors": dict(self._startup_errors),
+        }
+
+    def dispatch(self, tool_name: str, arguments: dict) -> dict | None:
+        for plugin in self._active_plugins:
             tools = plugin.get_tools() if hasattr(plugin, "get_tools") else [plugin.get_tool()]
             for definition in tools:
                 if definition["name"] != tool_name:
@@ -239,7 +293,11 @@ def make_handler():
 
         def do_GET(self):
             if self.path == "/health":
-                self._send_json(200, {"state": "running", "driver": "engineai-t800"})
+                if _bundle is None:
+                    self._send_json(503, {"state": "starting", "driver": "engineai-t800"})
+                    return
+                payload = _bundle.health()
+                self._send_json(200 if payload.get("state") == "running" else 503, payload)
             else:
                 self._send_json(404, {"error": "not found"})
 
@@ -349,10 +407,10 @@ def main() -> None:
     ros2.start_spin()
     _bundle = T800DeviceBundle(config, namespace, ros2)
     _bundle.start_all()
-    _start_registration(port, config)
 
     server = ThreadingHTTPServer(("", port), make_handler())
     print(f"[bundle] MCP server http://localhost:{port}/mcp", flush=True)
+    _start_registration(port, config)
 
     stopping = threading.Event()
 

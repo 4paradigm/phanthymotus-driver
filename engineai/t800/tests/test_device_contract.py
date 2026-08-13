@@ -1,4 +1,5 @@
 import importlib.util
+import struct
 import sys
 import time
 import types
@@ -79,6 +80,24 @@ class FakeNode:
     def get_clock(self):
         return types.SimpleNamespace(now=lambda: types.SimpleNamespace(to_msg=lambda: "stamp"))
 
+    def get_topic_names_and_types(self):
+        return []
+
+    def get_service_names_and_types(self):
+        return []
+
+    def count_publishers(self, _name):
+        return 0
+
+    def count_subscribers(self, _name):
+        return 0
+
+    def count_services(self, _name):
+        return 0
+
+    def count_clients(self, _name):
+        return 0
+
 
 class FakeExecutor:
     def __init__(self):
@@ -108,14 +127,35 @@ def install_ros_stubs():
     sys.modules["rclpy.qos"] = rclpy_qos
 
     std_msgs = types.ModuleType("std_msgs.msg")
+    std_msgs.Header = type("Header", (Message,), {})
     std_msgs.String = type("String", (Message,), {"__init__": lambda self: setattr(self, "data", "")})
+    std_msgs.UInt8MultiArray = type("UInt8MultiArray", (Message,), {})
     sys.modules["std_msgs.msg"] = std_msgs
+
+    sensor_msgs = types.ModuleType("sensor_msgs.msg")
+    sensor_msgs.PointCloud2 = type("PointCloud2", (Message,), {})
+    sensor_msgs.CompressedImage = type("CompressedImage", (Message,), {})
+    sensor_msgs.Image = type("Image", (Message,), {})
+    sys.modules["sensor_msgs.msg"] = sensor_msgs
+
+    nav_msgs = types.ModuleType("nav_msgs.msg")
+    nav_msgs.Odometry = type("Odometry", (Message,), {})
+    sys.modules["nav_msgs.msg"] = nav_msgs
+
+    audio_msgs = types.ModuleType("audio_msgs.msg")
+    audio_msgs.AudioChunk = type(
+        "AudioChunk",
+        (Message,),
+        {"__init__": lambda self: (Message.__init__(self), setattr(self, "format", ""),
+                                    setattr(self, "data", []))[-1]},
+    )
+    sys.modules["audio_msgs.msg"] = audio_msgs
 
     protocol_msg = types.ModuleType("interface_protocol.msg")
     for name in (
         "BodyVelCmd", "GamepadKeys", "ImuInfo", "JointCommand", "JointMotionPlanState",
         "JointOverrideCommand", "JointState", "LedControl", "MotionState", "MotionStateRequest",
-        "MotorDebug", "NodeControl", "PowerInfo", "Tts",
+        "Heartbeat", "LinkInfo", "MotorDebug", "NodeControl", "PowerInfo", "Tts",
     ):
         setattr(protocol_msg, name, type(name, (Message,), {}))
     protocol_msg.JointMotionPlanRequest = JointMotionPlanRequest
@@ -152,8 +192,16 @@ CONFIG = {
         "joint_plan_state": "/motion/joint_motion_plan/state",
         "joint_override": "/motion/joint_override_command", "joint_command": "/hardware/joint_command",
         "tts": "/hardware/tts", "native_node_control": "/motion/node_control",
+        "heartbeat": "/heartbeat", "link_info": "/motion/link_info",
+        "odometry": "/manifold/ODIN2/device0/odometry",
+        "vision_cloud_raw": "/manifold/ODIN2/device0/cloud/raw",
+        "vision_cloud_slam": "/manifold/ODIN2/device0/cloud/slam",
+        "vision_camera_left": "/manifold/ODIN2/device0/camera0/compressed",
+        "vision_camera_right": "/manifold/ODIN2/device0/camera1/compressed",
+        "vision_depth": "/manifold/ODIN2/device0/depth",
     },
     "services": {"enable_motor": "/hardware/enable_motor"},
+    "diagnostics": {"command_trace_capacity": 20, "motion_events_capacity": 100},
 }
 
 
@@ -182,6 +230,8 @@ class DevicePluginContractTests(unittest.TestCase):
             self.device.JointBridgePlugin(CONFIG, "robot", self.ros, self.state),
             self.device.LedPlugin(CONFIG, "robot", self.ros),
             self.device.TtsPlugin(CONFIG, "robot", self.ros),
+            self.device.MicPlugin(CONFIG, "robot", self.ros),
+            self.device.VisionPlugin(CONFIG, "robot", self.ros),
             self.device.MotorPowerPlugin(CONFIG, "robot", self.ros),
             self.device.NativeNodeControlPlugin(CONFIG, "robot", self.ros),
             self.device.SafetyControlPlugin(CONFIG, "robot", self.ros, self.state),
@@ -194,8 +244,10 @@ class DevicePluginContractTests(unittest.TestCase):
             VirtualGamepadPlugin({}, "robot", self.ros),
         ]
         names = set()
+        definitions = []
         for plugin in plugins:
             tools = plugin.get_tools() if hasattr(plugin, "get_tools") else [plugin.get_tool()]
+            definitions.extend(tools)
             names.update(tool["name"] for tool in tools)
         self.assertEqual(
             {"joints", "imu", "battery", "motor_health", "motor_state", "motor_command", "joint_command_feedback",
@@ -205,10 +257,74 @@ class DevicePluginContractTests(unittest.TestCase):
              "native_interface_probe",
              "loco", "motion_mode", "dance", "joint_plan", "joint_plan_state", "gesture",
              "joint_override", "joint_bridge",
-             "led", "tts", "motor_power", "native_node_control", "virtual_gamepad", "safety", "native_sdk"},
+             "led", "tts", "mic", "pointcloud", "camera", "depth",
+             "motor_power", "native_node_control", "virtual_gamepad", "safety", "native_sdk"},
             names,
         )
-        self.assertEqual(38, len(names))
+        self.assertEqual(42, len(names))
+        self.assertEqual(42, len(definitions), "tool names must be unique")
+        for tool in definitions:
+            schema = tool.get("inputSchema")
+            self.assertEqual("object", schema.get("type"), tool["name"])
+            properties = schema.get("properties", {})
+            action = properties.get("action")
+            if not action:
+                continue
+            enum = action.get("enum", [])
+            self.assertEqual(len(enum), len(set(enum)), tool["name"])
+            for action_name, detail in schema.get("x-action-params", {}).items():
+                self.assertIn(action_name, enum, tool["name"])
+                for parameter in detail.get("params", []):
+                    self.assertIn(parameter, properties, f"{tool['name']}.{action_name}")
+
+    def test_sensor_lifecycle_schemas_and_info_topics_match_agent_core(self):
+        plugins = [
+            self.state,
+            self.device.HeartbeatStatusPlugin(CONFIG, "robot", self.ros),
+            self.device.LinkInfoPlugin(CONFIG, "robot", self.ros),
+            self.device.MotionCommandTracePlugin(CONFIG, "robot", self.ros),
+            self.device.MotionEventsPlugin(CONFIG, "robot", self.ros),
+            self.device.NativeInterfaceProbePlugin(CONFIG, "robot", self.ros),
+            self.device.VisionPlugin(CONFIG, "robot", self.ros),
+            self.device.JointPlanPlugin(CONFIG, "robot", self.ros),
+        ]
+        for plugin in plugins:
+            tools = plugin.get_tools() if hasattr(plugin, "get_tools") else [plugin.get_tool()]
+            for tool in tools:
+                if tool["type"] != "sensor":
+                    continue
+                action = tool["inputSchema"]["properties"]["action"]
+                self.assertTrue({"start", "info", "stop"}.issubset(action["enum"]), tool["name"])
+                info = plugin.dispatch("info", {"_tool_name": tool["name"]})
+                self.assertTrue(info.get("topic_out"), tool["name"])
+
+    def test_new_status_plugins_can_start_with_declared_ros_dependencies(self):
+        plugins = [
+            self.device.HeartbeatStatusPlugin(CONFIG, "robot", self.ros),
+            self.device.LinkInfoPlugin(CONFIG, "robot", self.ros),
+            self.device.MotionCommandTracePlugin(CONFIG, "robot", self.ros),
+            self.device.MotionEventsPlugin(CONFIG, "robot", self.ros),
+            self.device.NativeInterfaceProbePlugin(CONFIG, "robot", self.ros),
+        ]
+        for plugin in plugins:
+            plugin.start()
+            plugin.stop()
+
+    def test_motion_trace_prefers_fresh_command_over_stale_odometry(self):
+        plugin = self.device.MotionCommandTracePlugin(CONFIG, "robot", self.ros)
+        plugin._on_odometry(types.SimpleNamespace(
+            header=types.SimpleNamespace(frame_id="odom"),
+            child_frame_id="base",
+            twist=types.SimpleNamespace(twist=types.SimpleNamespace(
+                linear=types.SimpleNamespace(x=0.1, y=0.0, z=0.0),
+                angular=types.SimpleNamespace(x=0.0, y=0.0, z=0.0),
+            )),
+        ))
+        plugin._odometry_updated = time.monotonic() - 5.0
+        plugin._on_velocity(types.SimpleNamespace(linear_velocity=[0.8, 0.0, 0.0], yaw_velocity=0.0))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("body_velocity_command", snapshot["source"])
+        self.assertEqual("0.80 m/s", snapshot["speed"])
 
     def test_derived_diagnostics_and_capability_resources(self):
         self.state._set("imu", {
@@ -351,6 +467,48 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertFalse(result["enabled"])
 
+        motor._client = types.SimpleNamespace(service_is_ready=lambda: False)
+        unavailable = motor.dispatch("start", {})
+        self.assertEqual("error", unavailable["state"])
+
+    def test_mic_uses_pulseaudio_capture_and_publishes_pcm_chunks(self):
+        plugin = self.device.MicPlugin(CONFIG, "robot", self.ros)
+
+        class FakeStdout:
+            def __init__(self):
+                self.reads = [b"\x01\x00" * 512, b""]
+
+            def read(self, _size):
+                return self.reads.pop(0)
+
+        class FakeProcess:
+            def __init__(self):
+                self.stdout = FakeStdout()
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = 0
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        process = FakeProcess()
+        plugin._check_pulse = lambda: None
+        plugin._spawn_capture = lambda: process
+        self.assertEqual("running", plugin.dispatch("start", {})["state"])
+        deadline = time.monotonic() + 1
+        while not plugin._publisher.messages and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual("audio/pcm-16k", plugin._publisher.messages[0].format)
+        self.assertEqual(1024, len(plugin._publisher.messages[0].data))
+        self.assertEqual("idle", plugin.dispatch("stop", {})["state"])
+
     def test_native_node_control_and_composed_safety(self):
         native = self.device.NativeNodeControlPlugin(CONFIG, "robot", self.ros)
         native.start()
@@ -376,6 +534,97 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual(0.0, safety._override_pub.messages[-1].weight)
         self.assertEqual([1.0] * 25, safety._joint_pub.messages[-1].damping)
         self.assertTrue(all(control.stopped for control in active_controls))
+
+    def test_vision_pointcloud_passthrough_binary_header(self):
+        import struct
+
+        plugin = self.device.VisionPlugin(CONFIG, "robot", self.ros)
+        plugin.start()
+        data = bytes(range(64))  # 4 点 × 16 字节 point_step
+        plugin._on_cloud_raw(types.SimpleNamespace(point_step=16, data=data))
+        out = plugin._cloud_pub.messages[-1]
+        self.assertEqual(struct.pack("<II", 16, 4), bytes(out.data[:8]))
+        self.assertEqual(bytes(range(64)), bytes(out.data[8:]))
+        self.assertEqual(1, plugin._frames["pointcloud"])
+
+    def test_vision_select_source_switches_cloud(self):
+        plugin = self.device.VisionPlugin(CONFIG, "robot", self.ros)
+        plugin.start()
+        plugin.dispatch("select_source", {"source": "slam"})
+        self.assertEqual("slam", plugin._source)
+        data = bytes(32)
+        plugin._on_cloud_raw(types.SimpleNamespace(point_step=16, data=data))  # raw 被忽略
+        self.assertEqual(0, len(plugin._cloud_pub.messages))
+        plugin._on_cloud_slam(types.SimpleNamespace(point_step=16, data=data))
+        self.assertEqual(1, len(plugin._cloud_pub.messages))
+        info = plugin.dispatch("info", {})
+        self.assertEqual("slam", info["source"])
+        self.assertEqual(4, len(info["topic_out"]))
+        self.assertEqual("sensor/pointcloud", info["topic_out"][0]["format"])
+
+    def test_vision_lifecycle_resolves_and_stops_only_the_requested_card(self):
+        plugin = self.device.VisionPlugin(CONFIG, "robot", self.ros)
+        plugin.start()
+        tools = {tool["name"]: tool for tool in plugin.get_tools()}
+        cloud_schema = tools["pointcloud"]["inputSchema"]
+        self.assertIn("select_source", cloud_schema["properties"]["action"]["enum"])
+        self.assertEqual(["raw", "slam"], cloud_schema["properties"]["source"]["enum"])
+
+        for tool_name, tool in tools.items():
+            info = plugin.dispatch("info", {"_tool_name": tool_name})
+            self.assertEqual(tool["topic_out"], info["topic_out"], tool_name)
+
+        stopped = plugin.dispatch("stop", {"_tool_name": "depth"})
+        camera = plugin.dispatch("info", {"_tool_name": "camera"})
+        self.assertEqual("idle", stopped["state"])
+        self.assertEqual("running", camera["state"])
+        self.assertTrue(plugin._running)
+        self.assertNotIn("depth", plugin._enabled_tools)
+
+        plugin.stop()
+        restarted = plugin.dispatch("start", {"_tool_name": "pointcloud"})
+        self.assertEqual("running", restarted["state"])
+        self.assertEqual({"pointcloud"}, plugin._enabled_tools)
+
+    def test_vision_camera_passthrough_and_native_depth_conversion(self):
+        plugin = self.device.VisionPlugin(CONFIG, "robot", self.ros)
+        plugin.start()
+        left = types.SimpleNamespace(format="jpeg", data=bytes([0xFF, 0xD8]))
+        right = types.SimpleNamespace(format="jpeg", data=bytes([0xFF, 0xD9]))
+        plugin._on_camera_left(left)
+        plugin._on_camera_right(right)
+        self.assertIs(left, plugin._cam_left_pub.messages[-1])
+        self.assertIs(right, plugin._cam_right_pub.messages[-1])
+        # The official pcd2depth node publishes camera optical-axis depth in
+        # metres.  Include invalid values and an over-range value to exercise
+        # normalization into the dashboard's uint16 millimetre contract.
+        values = (
+            2.0, float("nan"), -1.0, 70.0,
+            1.5, 1.0, 0.0, 0.5,
+            3.0, 2.5, 2.0, 1.5,
+        )
+        depth = types.SimpleNamespace(
+            header=types.SimpleNamespace(stamp="source-stamp", frame_id="camera"),
+            width=4,
+            height=3,
+            encoding="32FC1",
+            is_bigendian=False,
+            step=16,
+            data=struct.pack("<12f", *values),
+        )
+        plugin._on_depth(depth)
+        out = plugin._depth_pub.messages[-1]
+        self.assertEqual("16UC1", out.encoding)
+        self.assertEqual((640, 480, 1280), (out.width, out.height, out.step))
+        self.assertEqual(640 * 480 * 2, len(out.data))
+        self.assertEqual("source-stamp", out.header.stamp)
+        self.assertEqual("camera", out.header.frame_id)
+        row = struct.unpack("<640H", bytes(out.data[:1280]))
+        self.assertEqual((2000, 0, 0, 65535), (row[0], row[160], row[320], row[480]))
+        tools = {tool["name"]: tool for tool in plugin.get_tools()}
+        self.assertEqual("image/jpeg", tools["camera"]["topic_out"][0]["format"])
+        self.assertEqual(2, len(tools["camera"]["topic_out"]))
+        self.assertEqual("image/depth-z16", tools["depth"]["topic_out"][0]["format"])
 
 
 if __name__ == "__main__":

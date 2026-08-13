@@ -36,6 +36,7 @@ from control import (
     joint_payload,
     list_or_default,
     optional_floats,
+    sensor_action_schema,
     sensor_tool,
     validate_joint_indices,
     validate_parallel_arrays,
@@ -61,6 +62,20 @@ _RELIABLE_ONE = QoSProfile(
     depth=1,
     durability=DurabilityPolicy.VOLATILE,
 )
+
+_LIFECYCLE_ACTIONS = {
+    "start": ([], "启动卡片数据流"),
+    "info": ([], "返回卡片状态和实际输出 topic"),
+    "stop": ([], "停止卡片数据流"),
+}
+
+
+def _with_lifecycle(actions: dict[str, tuple[list[str], str]]) -> dict[str, tuple[list[str], str]]:
+    return {**_LIFECYCLE_ACTIONS, **actions}
+
+
+def _with_topic_out(payload: dict, topic: str, fmt: str = "data/json") -> dict:
+    return {**payload, "topic_out": [{"topic": topic, "format": fmt}]}
 
 
 def _now_ms() -> int:
@@ -255,13 +270,13 @@ class StatePlugin:
             return {"state": "idle"}
         if action_or_tool == "info":
             name = args.get("_tool_name", "driver_health")
-            if name not in self._STREAMS:
-                return {"state": "running"}
-            relative, fmt, _ = self._STREAMS[name]
-            return {
-                "state": "running",
-                "topic_out": [{"topic": f"/{self._ns}/{relative}", "format": fmt}],
-            }
+            if name in self._STREAMS:
+                relative, fmt, _ = self._STREAMS[name]
+                return _with_topic_out({"state": "running"}, f"/{self._ns}/{relative}", fmt)
+            if name in self._DERIVED_STREAMS:
+                relative, _ = self._DERIVED_STREAMS[name]
+                return _with_topic_out({"state": "running"}, f"/{self._ns}/{relative}")
+            return {"state": "running"}
         return {"error": f"unknown state action: {action_or_tool}"}
 
     def _derived_snapshot(self, name: str) -> dict:
@@ -353,7 +368,7 @@ class StatePlugin:
                 ],
                 "limitations": [
                     "no odometry topic: displacement/turn/arc are time-integrated open-loop estimates",
-                    "no public camera/lidar/dexterous-hand interface in the referenced T800 protocol",
+                    "no public dexterous-hand interface in the referenced T800 protocol",
                 ],
                 "timestamp_ms": _now_ms(),
             }
@@ -557,8 +572,18 @@ class StatePlugin:
             }
         for value in sources.values():
             value["stale"] = value["age_sec"] is None or value["age_sec"] > self._timeout
+        connected = sum(1 for value in sources.values() if value["connected"])
+        fresh = sum(1 for value in sources.values() if value["connected"] and not value["stale"])
+        if fresh:
+            state = "running"
+        elif connected:
+            state = "degraded"
+        else:
+            state = "waiting"
         return {
-            "state": "running" if any(v["connected"] for v in sources.values()) else "waiting",
+            "state": state,
+            "connected_sources": connected,
+            "fresh_sources": fresh,
             "sources": sources,
             "robot_domain_id": self._config["ros"]["robot_domain_id"],
             "core_domain_id": self._config["ros"]["core_domain_id"],
@@ -713,10 +738,10 @@ class HeartbeatStatusPlugin:
             "readOnly": True,
             "description": "显示 T800 ROS2 节点心跳、健康状态和数据新鲜度",
             "inputSchema": action_schema(
-                {
+                _with_lifecycle({
                     "status": ([], "返回适合画布验收的简洁心跳状态"),
                     "debug": ([], "返回原始心跳字段，供研发排查"),
-                },
+                }),
                 {},
                 "心跳查询动作",
             ),
@@ -735,7 +760,9 @@ class HeartbeatStatusPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict:
-        if action in ("heartbeat_status", "status", "info", "start"):
+        if action == "info":
+            return _with_topic_out(self._snapshot(), f"/{self._ns}/state/heartbeat_status")
+        if action in ("heartbeat_status", "status", "start"):
             return self._snapshot()
         if action == "debug":
             return self._debug_snapshot()
@@ -823,10 +850,10 @@ class LinkInfoPlugin:
             "readOnly": True,
             "description": "显示 T800 LinkInfo 位姿、高度、速度和数据新鲜度",
             "inputSchema": action_schema(
-                {
+                _with_lifecycle({
                     "status": ([], "返回适合画布验收的简洁 link 状态"),
                     "debug": ([], "返回原始 pose/twist 字段，供研发排查"),
-                },
+                }),
                 {},
                 "LinkInfo 查询动作",
             ),
@@ -845,7 +872,9 @@ class LinkInfoPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict:
-        if action in ("link_info", "status", "info", "start"):
+        if action == "info":
+            return _with_topic_out(self._snapshot(), f"/{self._ns}/state/link_info")
+        if action in ("link_info", "status", "start"):
             return self._snapshot()
         if action == "debug":
             return self._debug_snapshot()
@@ -955,10 +984,10 @@ class MotionCommandTracePlugin:
             "readOnly": True,
             "description": "输出 T800 当前速度，兼容手柄、驱动指令和里程计来源",
             "inputSchema": action_schema(
-                {
+                _with_lifecycle({
                     "status": ([], "返回适合画布验收的简洁速度状态"),
                     "debug": ([], "返回最近命令、手柄、里程计原始摘要，供研发排查"),
-                },
+                }),
                 {},
                 "运动速度查询",
             ),
@@ -990,7 +1019,9 @@ class MotionCommandTracePlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict:
-        if action in ("motion_command_trace", "status", "info", "start"):
+        if action == "info":
+            return _with_topic_out(self._snapshot(), f"/{self._ns}/state/motion_command_trace")
+        if action in ("motion_command_trace", "status", "start"):
             return self._snapshot()
         if action == "debug":
             return self._debug_snapshot()
@@ -1065,7 +1096,14 @@ class MotionCommandTracePlugin:
         source = "none"
         speed = 0.0
         age_sec = None
-        if odometry is not None:
+        odometry_fresh = odometry is not None and odometry_age is not None and odometry_age <= timeout_sec
+        velocity_fresh = velocity is not None and velocity_age is not None and velocity_age <= timeout_sec
+        use_odometry = odometry_fresh or (
+            odometry is not None
+            and not velocity_fresh
+            and (velocity_age is None or (odometry_age is not None and odometry_age <= velocity_age))
+        )
+        if use_odometry:
             source = "odometry"
             speed = float(odometry.get("speed_m_s", 0.0))
             age_sec = odometry_age
@@ -1175,14 +1213,12 @@ class MotionEventsPlugin:
             "multiInstance": False,
             "readOnly": True,
             "description": "T800 motion event stream — motion state changes and motion command lifecycle events",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["status", "info", "debug"],
-                        "description": "status returns the latest event summary; debug returns the buffered timeline",
-                    },
+            "inputSchema": action_schema(
+                _with_lifecycle({
+                    "status": ([], "返回最新事件摘要"),
+                    "debug": (["limit", "since_event_id", "source_tool", "severity"], "返回筛选后的事件时间线"),
+                }),
+                {
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
@@ -1203,7 +1239,8 @@ class MotionEventsPlugin:
                         "description": "按事件级别过滤",
                     },
                 },
-            },
+                "运动事件查询动作",
+            ),
             "topic_out": [{"topic": f"/{self._ns}/state/motion_events", "format": "data/json"}],
         }
 
@@ -1221,7 +1258,9 @@ class MotionEventsPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict:
-        if action in ("motion_events", "status", "info", "start"):
+        if action == "info":
+            return _with_topic_out(self._summary_snapshot(), f"/{self._ns}/state/motion_events")
+        if action in ("motion_events", "status", "start"):
             return self._summary_snapshot()
         if action in ("debug", "list"):
             return self._debug_snapshot(args)
@@ -1455,10 +1494,10 @@ class NativeInterfaceProbePlugin:
             "readOnly": True,
             "description": "扫描 T800 ROS 图，汇总已映射与未映射原生接口",
             "inputSchema": action_schema(
-                {
+                _with_lifecycle({
                     "scan": ([], "扫描 ROS2 topic/service 并输出适合画布验收的摘要"),
                     "debug": ([], "输出完整 topic/service/mapped/unmapped 清单，供研发排查"),
-                },
+                }),
                 {},
                 "原生接口探测动作",
             ),
@@ -1472,7 +1511,9 @@ class NativeInterfaceProbePlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict:
-        if action in ("native_interface_probe", "scan", "status", "info", "start"):
+        if action == "info":
+            return _with_topic_out(self._scan(), f"/{self._ns}/state/native_interface_probe")
+        if action in ("native_interface_probe", "scan", "status", "start"):
             return self._scan()
         if action == "debug":
             return self._scan(debug=True)
@@ -1968,7 +2009,10 @@ class JointPlanPlugin:
             return {"state": "running" if args.get("_tool_name") == "joint_plan_state" else "ready"}
         if action in ("info", "status", "joint_plan_state"):
             with self._state_lock:
-                return dict(self._last_state)
+                snapshot = dict(self._last_state)
+            if args.get("_tool_name") == "joint_plan_state" or action == "joint_plan_state":
+                return _with_topic_out(snapshot, self._core_topic)
+            return snapshot
         if action == "stop":
             return {"state": "idle"}
         if action == "reset":
@@ -2579,8 +2623,12 @@ class MotorPowerPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action in ("start", "info"):
+            available = bool(self._client and self._client.service_is_ready())
+            if action == "start" and not available:
+                return {"state": "error", "message": "motor enable service is unavailable",
+                        "service": self._config["services"]["enable_motor"], "available": False}
             return {"state": "ready", "service": self._config["services"]["enable_motor"],
-                    "available": bool(self._client and self._client.service_is_ready())}
+                    "available": available}
         if action == "stop":
             return {"state": "idle"}
         if action not in ("enable", "disable"):
@@ -2798,3 +2846,422 @@ class SafetyControlPlugin:
         msg.damping = [1.0] * len(T800_JOINT_NAMES)
         msg.parallel_parser_type = 0
         self._joint_pub.publish(msg)
+
+
+class MicPlugin:
+    """Capture the T800 microphone through the vendor-owned PulseAudio server."""
+
+    _CHUNK_SAMPLES = 512  # 16 kHz 下 1024 字节 = 512 samples
+    _CHUNK_BYTES = 1024
+
+    def __init__(self, config: dict, namespace: str, ros2):
+        self._config = config
+        self._ns = namespace
+        self._topic = f"/{namespace}/mic/audio"
+        self._node = Node("t800_mic", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._node)
+        self._publisher = None
+        self._message_type = None
+        self._header_type = None
+        self._running = False
+        self._process = None
+        self._thread = None
+        self._samples_published = 0
+        self._last_error = ""
+
+    def get_tool(self) -> dict:
+        return sensor_tool(
+            "mic",
+            f"T800 内置麦克风，经 PulseAudio 采集 PCM-16 16kHz 单声道并发布到 {self._topic}",
+            self._topic,
+            "audio/pcm-16k",
+        )
+
+    def start(self) -> None:
+        if self._running:
+            return
+        if self._publisher is None:
+            from audio_msgs.msg import AudioChunk
+            from std_msgs.msg import Header
+
+            self._message_type = AudioChunk
+            self._header_type = Header
+            self._publisher = self._node.create_publisher(AudioChunk, self._topic, _BEST_EFFORT)
+
+        try:
+            self._check_pulse()
+            self._process = self._spawn_capture()
+        except Exception as exc:
+            self._last_error = str(exc)
+            raise RuntimeError(f"PulseAudio capture is unavailable: {exc}") from exc
+        if self._process.poll() is not None:
+            self._last_error = f"parec exited with code {self._process.returncode}"
+            self._process = None
+            raise RuntimeError(self._last_error)
+        self._running = True
+        self._thread = threading.Thread(target=self._capture_loop, daemon=True, name="t800-mic")
+        self._thread.start()
+
+    def _spawn_capture(self):
+        return subprocess.Popen(
+            ["parec", "--raw", "--format=s16le", "--rate=16000", "--channels=1",
+             "--latency-msec=50"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
+        )
+
+    def _check_pulse(self) -> None:
+        subprocess.run(["pactl", "info"], capture_output=True, text=True, timeout=3, check=True)
+
+    def stop(self) -> None:
+        self._running = False
+        process = self._process
+        self._process = None
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+                process.wait(timeout=1)
+            except Exception:
+                process.kill()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1)
+        self._thread = None
+
+    def _capture_loop(self) -> None:
+        pending = bytearray()
+        process = self._process
+        try:
+            while self._running and process is not None and process.stdout is not None:
+                data = process.stdout.read(self._CHUNK_BYTES - len(pending))
+                if not data:
+                    if process.poll() is not None:
+                        break
+                    continue
+                pending.extend(data)
+                if len(pending) == self._CHUNK_BYTES:
+                    self._publish_chunk(bytes(pending))
+                    pending.clear()
+        except Exception as exc:  # noqa: BLE001
+            self._last_error = str(exc)
+        finally:
+            if self._running and process is not None and process.poll() is not None:
+                self._last_error = f"parec exited with code {process.returncode}"
+                self._running = False
+
+    def _publish_chunk(self, chunk: bytes) -> None:
+        msg = self._message_type()
+        msg.header = self._header_type()
+        msg.header.stamp = self._node.get_clock().now().to_msg()
+        msg.format = "audio/pcm-16k"
+        msg.data = list(chunk)
+        self._publisher.publish(msg)
+        self._samples_published += len(chunk) // 2
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "start":
+            try:
+                self.start()
+            except RuntimeError as exc:
+                message = f"mic capture failed: {exc}"
+                return {"state": "error", "message": message, "error": message}
+            if self._running:
+                return {"state": "running", "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}]}
+            message = f"mic capture failed: {self._last_error or 'no audio device'}"
+            return {"state": "error", "message": message, "error": message}
+        if action == "stop":
+            self.stop()
+            return {"state": "idle"}
+        if action in ("info", "status"):
+            return {"state": "running" if self._running else "idle",
+                    "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}],
+                    "samples_published": self._samples_published,
+                    "last_error": self._last_error}
+        return {"error": f"unknown mic action: {action}"}
+
+
+class VisionPlugin:
+    """T800-Odin2 激光雷达相机视觉数据桥接（飞书文档 7.2 节）。
+
+    Subscribes to the Odin2 raw/SLAM point clouds, stereo compressed images
+    and the calibrated ``32FC1`` depth image published by the official
+    ``pcd2depth_ros2_node`` on the Orin board.  It republishes normalized
+    streams on domain 42 for Agent Core and the dashboard renderers
+    (``sensor/pointcloud``, ``image/jpeg``, ``image/depth-z16``).  Topic names
+    follow the per-device prefix ``/{topic_prefix}/{model}/device{N}/`` and
+    must be calibrated against ``ros_graph`` on the real robot.
+    """
+
+    _SOURCES = ("raw", "slam")
+    _TOOL_NAMES = ("pointcloud", "camera", "depth")
+    _DEPTH_WIDTH = 640
+    _DEPTH_HEIGHT = 480
+
+    def __init__(self, config: dict, namespace: str, ros2):
+        self._config = config
+        self._ns = namespace
+        self._topics = config["topics"]
+        vision_config = config.get("plugins", {}).get("vision", {}) or {}
+        self._source = vision_config.get("source", "raw")
+        if self._source not in self._SOURCES:
+            self._source = "raw"
+        self._cloud_topic = f"/{namespace}/vision/cloud"
+        self._cam_left_topic = f"/{namespace}/vision/camera_left"
+        self._cam_right_topic = f"/{namespace}/vision/camera_right"
+        self._depth_topic = f"/{namespace}/vision/depth"
+        self._sub_node = Node("t800_vision_sub", context=ros2.ctx_robot)
+        self._pub_node = Node("t800_vision_pub", context=ros2.ctx_core)
+        ros2.executor_robot.add_node(self._sub_node)
+        ros2.executor_core.add_node(self._pub_node)
+        self._running = False
+        self._initialized = False
+        self._enabled_tools: set[str] = set()
+        self._lock = threading.RLock()
+        self._frames = {"pointcloud": 0, "camera_left": 0, "camera_right": 0, "depth": 0}
+
+    def get_tools(self) -> list[dict]:
+        return [self._cloud_tool(), self._camera_tool(), self._depth_tool()]
+
+    def _cloud_tool(self) -> dict:
+        tool = sensor_tool(
+            "pointcloud",
+            f"T800-Odin2 {self._source} 点云转发（256×192）；二进制 [uint32 point_step][uint32 total_points]"
+            f"[PointCloud2 bytes]，发布到 {self._cloud_topic}",
+            self._cloud_topic,
+            "sensor/pointcloud",
+        )
+        schema = action_schema(
+            _with_lifecycle({
+                "status": ([], "返回点云流状态"),
+                "select_source": (["source"], "切换 Odin2 raw 或 SLAM 点云源"),
+            }),
+            {"source": {"type": "string", "enum": list(self._SOURCES)}},
+            "点云生命周期和数据源选择",
+        )
+        schema.pop("required", None)
+        tool["inputSchema"] = schema
+        return tool
+
+    def _camera_tool(self) -> dict:
+        return {
+            "name": "camera",
+            "type": "sensor",
+            "multiInstance": False,
+            "readOnly": True,
+            "description": f"T800-Odin2 双目 JPEG 图像转发，发布到 {self._cam_left_topic}（左）和"
+                           f" {self._cam_right_topic}（右）",
+            "inputSchema": sensor_action_schema(),
+            "topic_out": [
+                {"topic": self._cam_left_topic, "format": "image/jpeg"},
+                {"topic": self._cam_right_topic, "format": "image/jpeg"},
+            ],
+        }
+
+    def _depth_tool(self) -> dict:
+        return sensor_tool(
+            "depth",
+            f"T800-Odin2 官方标定深度图（640×480，毫米 16UC1），发布到 {self._depth_topic}",
+            self._depth_topic,
+            "image/depth-z16",
+        )
+
+    def start(self) -> None:
+        if self._running:
+            return
+        if self._initialized:
+            self._enabled_tools.update(self._TOOL_NAMES)
+            self._running = True
+            return
+        import array as _array
+        import struct as _struct
+        import numpy as _np
+        from sensor_msgs.msg import CompressedImage, Image, PointCloud2
+        from std_msgs.msg import UInt8MultiArray
+
+        self._running = True
+        self._struct = _struct
+        self._np = _np
+        self._image_type = Image
+        self._array = _array
+        self._multi_type = UInt8MultiArray
+        self._cloud_pub = self._pub_node.create_publisher(UInt8MultiArray, self._cloud_topic, _BEST_EFFORT)
+        self._cam_left_pub = self._pub_node.create_publisher(CompressedImage, self._cam_left_topic, _BEST_EFFORT)
+        self._cam_right_pub = self._pub_node.create_publisher(CompressedImage, self._cam_right_topic, _BEST_EFFORT)
+        self._depth_pub = self._pub_node.create_publisher(Image, self._depth_topic, _BEST_EFFORT)
+        self._sub_node.create_subscription(
+            PointCloud2, self._topics["vision_cloud_raw"], self._on_cloud_raw, _BEST_EFFORT
+        )
+        self._sub_node.create_subscription(
+            PointCloud2, self._topics["vision_cloud_slam"], self._on_cloud_slam, _BEST_EFFORT
+        )
+        self._sub_node.create_subscription(
+            CompressedImage, self._topics["vision_camera_left"], self._on_camera_left, _BEST_EFFORT
+        )
+        self._sub_node.create_subscription(
+            CompressedImage, self._topics["vision_camera_right"], self._on_camera_right, _BEST_EFFORT
+        )
+        self._sub_node.create_subscription(
+            Image, self._topics["vision_depth"], self._on_depth, _RELIABLE
+        )
+        self._initialized = True
+        self._enabled_tools.update(self._TOOL_NAMES)
+
+    def stop(self) -> None:
+        self._running = False
+        self._enabled_tools.clear()
+
+    def _on_cloud_raw(self, msg) -> None:
+        self._on_cloud(msg, "raw")
+
+    def _on_cloud_slam(self, msg) -> None:
+        self._on_cloud(msg, "slam")
+
+    def _on_cloud(self, msg, source: str) -> None:
+        if not self._running or "pointcloud" not in self._enabled_tools or source != self._source:
+            return
+        data = bytes(msg.data)
+        if not data:
+            return
+        point_step = int(msg.point_step) or 1
+        header = self._struct.pack("<II", point_step, len(data) // point_step)
+        buf = bytearray(8 + len(data))
+        buf[:8] = header
+        buf[8:] = data
+        out = self._multi_type()
+        out.data = self._array.array("B", buf)
+        self._cloud_pub.publish(out)
+        self._frames["pointcloud"] += 1
+
+    def _on_camera_left(self, msg) -> None:
+        if not self._running or "camera" not in self._enabled_tools:
+            return
+        self._cam_left_pub.publish(msg)
+        self._frames["camera_left"] += 1
+
+    def _on_camera_right(self, msg) -> None:
+        if not self._running or "camera" not in self._enabled_tools:
+            return
+        self._cam_right_pub.publish(msg)
+        self._frames["camera_right"] += 1
+
+    def _on_depth(self, msg) -> None:
+        if not self._running or "depth" not in self._enabled_tools:
+            return
+        width = int(msg.width)
+        height = int(msg.height)
+        encoding = str(msg.encoding).upper()
+        if encoding == "32FC1":
+            item_size = 4
+            dtype = "f4"
+        elif encoding in ("16UC1", "MONO16"):
+            item_size = 2
+            dtype = "u2"
+        else:
+            return
+        row_step = int(msg.step)
+        if width <= 0 or height <= 0 or row_step < width * item_size:
+            return
+        data = memoryview(msg.data)
+        required = (height - 1) * row_step + width * item_size
+        if len(data) < required:
+            return
+        byte_order = ">" if bool(msg.is_bigendian) else "<"
+        depth = self._np.ndarray(
+            shape=(height, width),
+            dtype=self._np.dtype(f"{byte_order}{dtype}"),
+            buffer=data,
+            strides=(row_step, item_size),
+        )
+
+        if encoding == "32FC1":
+            # The vendor node has already transformed the lidar points into
+            # the camera frame and publishes optical-axis depth in metres.
+            valid = self._np.isfinite(depth) & (depth > 0.0)
+            depth_mm = self._np.zeros((height, width), dtype="<u2")
+            depth_mm[valid] = self._np.clip(
+                self._np.rint(depth[valid] * 1000.0), 1, 65535
+            ).astype("<u2")
+        else:
+            depth_mm = depth.astype("<u2", copy=True)
+
+        # Agent Core's depth renderer consumes the Image payload without its
+        # ROS metadata and therefore requires a fixed 640x480 uint16 buffer.
+        target_width = self._DEPTH_WIDTH
+        target_height = self._DEPTH_HEIGHT
+        if width * target_height > height * target_width:
+            crop_width = max(1, height * target_width // target_height)
+            x0 = (width - crop_width) // 2
+            depth_mm = depth_mm[:, x0:x0 + crop_width]
+        elif width * target_height < height * target_width:
+            crop_height = max(1, width * target_height // target_width)
+            y0 = (height - crop_height) // 2
+            depth_mm = depth_mm[y0:y0 + crop_height, :]
+        source_height, source_width = depth_mm.shape
+        rows = self._np.arange(target_height) * source_height // target_height
+        cols = self._np.arange(target_width) * source_width // target_width
+        depth_mm = depth_mm[rows[:, None], cols[None, :]].astype("<u2", copy=False)
+
+        out = self._image_type()
+        out.header = msg.header
+        out.height = target_height
+        out.width = target_width
+        out.encoding = "16UC1"
+        out.is_bigendian = False
+        out.step = target_width * 2
+        out.data = depth_mm.tobytes(order="C")
+        self._depth_pub.publish(out)
+        self._frames["depth"] += 1
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        tool_name = str(args.get("_tool_name", ""))
+        if not tool_name and action in self._TOOL_NAMES:
+            tool_name = action
+        if tool_name not in self._TOOL_NAMES:
+            tool_name = ""
+
+        if action == "start":
+            was_initialized = self._initialized
+            if not was_initialized:
+                self.start()
+            if tool_name and not was_initialized:
+                # Direct use outside the bundle initializes all publishers and
+                # subscriptions once, but only activates the requested card.
+                self._enabled_tools = {tool_name}
+            elif tool_name:
+                self._enabled_tools.add(tool_name)
+            else:
+                self._enabled_tools.update(self._TOOL_NAMES)
+            self._running = bool(self._enabled_tools)
+        elif action == "stop":
+            if tool_name:
+                self._enabled_tools.discard(tool_name)
+                self._running = bool(self._enabled_tools)
+            else:
+                self.stop()
+        if action in ("start", "stop", "info", "status", "pointcloud", "camera", "depth"):
+            topic_out_by_tool = {
+                "pointcloud": [{"topic": self._cloud_topic, "format": "sensor/pointcloud"}],
+                "camera": [
+                    {"topic": self._cam_left_topic, "format": "image/jpeg"},
+                    {"topic": self._cam_right_topic, "format": "image/jpeg"},
+                ],
+                "depth": [{"topic": self._depth_topic, "format": "image/depth-z16"}],
+            }
+            selected_tools = (tool_name,) if tool_name else self._TOOL_NAMES
+            topic_out = [topic for name in selected_tools for topic in topic_out_by_tool[name]]
+            is_running = (
+                tool_name in self._enabled_tools if tool_name else bool(self._enabled_tools)
+            )
+            return {"state": "running" if is_running else "idle",
+                    "source": self._source,
+                    "topic_out": topic_out,
+                    "frames": dict(self._frames)}
+        if action == "select_source":
+            source = str(args.get("source", "")).strip()
+            if source not in self._SOURCES:
+                raise ValueError(f"invalid pointcloud source: {source}; expected {'|'.join(self._SOURCES)}")
+            with self._lock:
+                self._source = source
+            return {"state": "running" if self._running else "idle", "source": source}
+        return {"error": f"unknown vision action: {action}"}

@@ -35,8 +35,14 @@ def load_main_without_ros():
 
 
 class FakeBundle:
+    def __init__(self, state="running"):
+        self.state = state
+
     def get_all_tools(self):
         return [{"name": "echo", "type": "actuator", "inputSchema": {"type": "object"}}]
+
+    def health(self):
+        return {"state": self.state, "driver": "engineai-t800"}
 
     def dispatch(self, name, arguments):
         if name == "echo":
@@ -88,7 +94,20 @@ class McpHttpContractTests(unittest.TestCase):
 
     def test_health_endpoint(self):
         with urllib.request.urlopen(self.url + "/health", timeout=2) as response:
-            self.assertEqual("engineai-t800", json.loads(response.read())["driver"])
+            payload = json.loads(response.read())
+            self.assertEqual("engineai-t800", payload["driver"])
+            self.assertEqual("running", payload["state"])
+
+    def test_degraded_health_is_not_reported_as_healthy(self):
+        previous = self.module._bundle
+        self.module._bundle = FakeBundle(state="degraded")
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as captured:
+                urllib.request.urlopen(self.url + "/health", timeout=2)
+            self.assertEqual(503, captured.exception.code)
+            self.assertEqual("degraded", json.loads(captured.exception.read())["state"])
+        finally:
+            self.module._bundle = previous
 
     def test_non_mcp_path_is_404(self):
         with self.assertRaises(urllib.error.HTTPError) as captured:
@@ -98,6 +117,8 @@ class McpHttpContractTests(unittest.TestCase):
     def test_cyclonedds_interface_is_validated(self):
         previous = os.environ.pop("CYCLONEDDS_URI", None)
         previous_interface = os.environ.pop("NETWORK_INTERFACE", None)
+        previous_if_nameindex = self.module.socket.if_nameindex
+        self.module.socket.if_nameindex = lambda: [(1, "lo"), (2, "eno1")]
         try:
             interface = self.module._configure_cyclonedds({"ros": {"robot_interface": "eno1"}})
             self.assertEqual("eno1", interface)
@@ -105,12 +126,53 @@ class McpHttpContractTests(unittest.TestCase):
             os.environ.pop("CYCLONEDDS_URI", None)
             with self.assertRaisesRegex(ValueError, "invalid"):
                 self.module._configure_cyclonedds({"ros": {"robot_interface": "bad iface"}})
+            with self.assertRaisesRegex(ValueError, "does not exist"):
+                self.module._configure_cyclonedds({"ros": {"robot_interface": "eth9"}})
         finally:
+            self.module.socket.if_nameindex = previous_if_nameindex
             os.environ.pop("CYCLONEDDS_URI", None)
             if previous is not None:
                 os.environ["CYCLONEDDS_URI"] = previous
             if previous_interface is not None:
                 os.environ["NETWORK_INTERFACE"] = previous_interface
+
+    def test_bundle_hides_failed_plugins_and_reports_degraded(self):
+        class Plugin:
+            def __init__(self, name, fail=False):
+                self.name = name
+                self.fail = fail
+                self.stops = 0
+
+            def get_tool(self):
+                return {"name": self.name, "type": "sensor", "inputSchema": {"type": "object"}}
+
+            def start(self):
+                if self.fail:
+                    raise RuntimeError(f"{self.name} failed")
+
+            def stop(self):
+                self.stops += 1
+
+            def dispatch(self, action, _args):
+                return {"state": action}
+
+        good = Plugin("good")
+        bad = Plugin("bad", fail=True)
+        bundle = self.module.T800DeviceBundle.__new__(self.module.T800DeviceBundle)
+        bundle._plugins = [good, bad]
+        bundle._active_plugins = []
+        bundle._startup_errors = {}
+        bundle._started = False
+        bundle._motion_events = None
+
+        bundle.start_all()
+        self.assertEqual(["good"], [tool["name"] for tool in bundle.get_all_tools()])
+        self.assertEqual("degraded", bundle.health()["state"])
+        self.assertIn("Plugin", bundle.health()["startup_errors"])
+        self.assertIsNone(bundle.dispatch("bad", {}))
+        bundle.stop_all()
+        bundle.stop_all()
+        self.assertEqual(1, good.stops)
 
 
 class VendoredContractTests(unittest.TestCase):
