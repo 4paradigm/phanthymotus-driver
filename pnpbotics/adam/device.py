@@ -209,7 +209,7 @@ class StatePlugin:
     PREFIX = "state"
 
     def __init__(self, plugin_config: dict, namespace: str, executor,
-                 variant: str, **kwargs):
+                 variant: str, dds_lowstate_sub=None, dds_handstate_sub=None, **kwargs):
         self._namespace = namespace
         self._variant = variant
         self._running = False
@@ -218,28 +218,32 @@ class StatePlugin:
         self._node = _StatePublisherNode(namespace, variant, rate)
         executor.add_node(self._node)
 
-        # DDS subscribers
-        self._lowstate_sub = None
-        self._handstate_sub = None
-        if HAS_PND_SDK:
-            try:
-                self._lowstate_sub = ChannelSubscriber("rt/lowstate", LowState_)
-                self._lowstate_sub.Init(handler=self._on_lowstate, queueLen=10)
-            except Exception as e:
-                print(f"[state] DDS lowstate subscribe failed: {e}")
-                self._lowstate_sub = None
-            try:
-                self._handstate_sub = ChannelSubscriber("rt/handstate", HandState_)
-                self._handstate_sub.Init(handler=self._on_handstate, queueLen=10)
-            except Exception as e:
-                print(f"[state] DDS handstate subscribe failed: {e}")
-                self._handstate_sub = None
+        # DDS subscribers (pre-created in main.py before rclpy.init to avoid conflict)
+        self._lowstate_sub = dds_lowstate_sub
+        self._handstate_sub = dds_handstate_sub
 
-    def _on_lowstate(self, msg):
-        self._node.update_state(msg)
+        # Start polling thread for DDS data
+        if self._lowstate_sub or self._handstate_sub:
+            self._poll_thread = threading.Thread(target=self._poll_dds, daemon=True)
+            self._poll_thread.start()
 
-    def _on_handstate(self, msg):
-        self._node.update_hand(msg)
+    def _poll_dds(self):
+        """Poll DDS subscribers in a background thread."""
+        while True:
+            if self._lowstate_sub:
+                try:
+                    msg = self._lowstate_sub.Read(timeout=1)
+                    if msg:
+                        self._node.update_state(msg)
+                except Exception:
+                    pass
+            if self._handstate_sub:
+                try:
+                    msg = self._handstate_sub.Read(timeout=0)
+                    if msg:
+                        self._node.update_hand(msg)
+                except Exception:
+                    pass
 
     def get_tools(self) -> list:
         return [
@@ -596,33 +600,30 @@ class HandPlugin:
 
     PREFIX = "hand"
 
-    def __init__(self, plugin_config: dict, namespace: str, executor, **kwargs):
+    def __init__(self, plugin_config: dict, namespace: str, executor,
+                 dds_hand_pub=None, dds_hand_sub=None, **kwargs):
         self._namespace = namespace
         self._hand_type = plugin_config.get("hand_type", "pnd")
         self._max_val = 1000 if self._hand_type == "pnd" else 1800
 
-        self._hand_pub = None
-        self._hand_sub = None
+        self._hand_pub = dds_hand_pub
+        self._hand_sub = dds_hand_sub
         self._latest_hand_state = None
         self._lock = threading.Lock()
 
-        if HAS_PND_SDK:
-            try:
-                self._hand_pub = ChannelPublisher("rt/handcmd", HandCmd_)
-                self._hand_pub.Init()
-            except Exception as e:
-                print(f"[hand] DDS handcmd publisher failed: {e}")
-                self._hand_pub = None
-            try:
-                self._hand_sub = ChannelSubscriber("rt/handstate", HandState_)
-                self._hand_sub.Init(handler=self._on_handstate, queueLen=5)
-            except Exception as e:
-                print(f"[hand] DDS handstate subscribe failed: {e}")
-                self._hand_sub = None
+        # Poll hand state in background
+        if self._hand_sub:
+            threading.Thread(target=self._poll_hand, daemon=True).start()
 
-    def _on_handstate(self, msg):
-        with self._lock:
-            self._latest_hand_state = msg
+    def _poll_hand(self):
+        while True:
+            try:
+                msg = self._hand_sub.Read(timeout=1)
+                if msg:
+                    with self._lock:
+                        self._latest_hand_state = msg
+            except Exception:
+                pass
 
     def get_tool(self) -> dict:
         return {
@@ -782,7 +783,9 @@ class ModelPlugin:
 class AdamDeviceBundle:
     """Loads and manages all Adam plugins based on config."""
 
-    def __init__(self, config: dict, namespace: str, executor, grpc_client):
+    def __init__(self, config: dict, namespace: str, executor, grpc_client,
+                 dds_lowstate_sub=None, dds_handstate_sub=None,
+                 dds_hand_pub=None, dds_hand_sub=None):
         self._plugins = []
         self._tool_map = {}  # tool_name → plugin
 
@@ -794,6 +797,8 @@ class AdamDeviceBundle:
             p = StatePlugin(
                 plugins_cfg.get("state", {}), namespace, executor,
                 variant=variant,
+                dds_lowstate_sub=dds_lowstate_sub,
+                dds_handstate_sub=dds_handstate_sub,
             )
             self._plugins.append(p)
 
@@ -815,7 +820,8 @@ class AdamDeviceBundle:
 
         # HandPlugin
         if plugins_cfg.get("hand", {}).get("enabled", True):
-            p = HandPlugin(plugins_cfg.get("hand", {}), namespace, executor)
+            p = HandPlugin(plugins_cfg.get("hand", {}), namespace, executor,
+                           dds_hand_pub=dds_hand_pub, dds_hand_sub=dds_hand_sub)
             self._plugins.append(p)
 
         # ModelPlugin
