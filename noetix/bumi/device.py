@@ -1130,11 +1130,37 @@ def _decode_video_frame(data: bytes, width: int, height: int):
 # Subprocess: USB camera → YUYV → publish_external_video_stream() + ROS2 JPEG
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _detect_usb_camera(camera_id: int) -> int:
+    """Resolve a USB camera device id by trying to open candidates.
+
+    Order: explicit id → video4/2/0 → any /dev/videoN present. Returns the first
+    openable id, or the original `camera_id` unchanged if none open.
+    """
+    import os as _os
+    import cv2 as _cv2
+
+    if camera_id >= 0:
+        ids = [camera_id] + [i for i in (4, 2, 0) if i != camera_id]
+    else:
+        ids = [4, 2, 0]
+    for d in range(10):
+        if _os.path.exists(f"/dev/video{d}") and d not in ids:
+            ids.append(d)
+
+    for cid in ids:
+        cap = _cv2.VideoCapture(cid)
+        if cap.isOpened():
+            cap.release()
+            return cid
+    return camera_id
+
+
 def _external_video_subprocess(namespace: str, camera_id: int):
-    """Open USB camera, push YUYV frames to robot AI agent, also publish JPEG to ROS2.
+    """Open USB camera (auto-detect), push YUYV frames to robot AI agent, also publish JPEG to ROS2.
 
     This is the PRIMARY video path for 算力板 Bumi.
-    Follows test_media.py publish_video() pattern exactly.
+    Follows test_media.py publish_video() pattern. Camera selection falls back
+    from the requested id through video4→2→0→any /dev/videoN.
     """
     import os as _os
     _os.environ.setdefault('CYCLONEDDS_URI', 'file:///work/noetix_sdk_bumi/config/dds.xml')
@@ -1174,9 +1200,8 @@ def _external_video_subprocess(namespace: str, camera_id: int):
         candidate_ids = [camera_id] + [i for i in (4, 2, 0) if i != camera_id]
     else:
         candidate_ids = [4, 2, 0]
-    import os as __os
     for d in range(10):
-        if __os.path.exists(f"/dev/video{d}") and d not in candidate_ids:
+        if _os.path.exists(f"/dev/video{d}") and d not in candidate_ids:
             candidate_ids.append(d)
 
     cap = None
@@ -1193,7 +1218,7 @@ def _external_video_subprocess(namespace: str, camera_id: int):
         print(f"[external_video] Cannot open camera (tried: {candidate_ids})", flush=True)
         for d in range(10):
             p = f"/dev/video{d}"
-            if __os.path.exists(p):
+            if _os.path.exists(p):
                 print(f"    available: {p}", flush=True)
         return
 
@@ -1417,7 +1442,7 @@ class VideoPlugin:
                 "x-action-params": {
                     "push_from_camera": {
                         "params": ["camera_id"],
-                        "description": "Open specified USB camera, convert frames to YUYV, push to agent.",
+                        "description": "Open a USB camera (auto-detect video4→2→0→any), convert to YUYV, push to agent.",
                     },
                     "push_from_topic": {
                         "params": [],
@@ -1531,10 +1556,13 @@ class VideoPlugin:
         # Stop any existing push
         self._do_stop_external_push()
 
+        # Resolve the actual device id now so the caller sees the real id (not -1).
+        resolved_id = _detect_usb_camera(camera_id)
+
         import sys
         self._proc_external = subprocess.Popen(
             [sys.executable, "-c",
-             f"import sys; sys.path.insert(0, '/work'); from device import _external_video_subprocess; _external_video_subprocess({self._namespace!r}, {camera_id})"],
+             f"import sys; sys.path.insert(0, '/work'); from device import _external_video_subprocess; _external_video_subprocess({self._namespace!r}, {resolved_id})"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         )
         def _fwd():
@@ -1544,7 +1572,7 @@ class VideoPlugin:
 
         return {
             "state": "pushing",
-            "camera_id": camera_id,
+            "camera_id": resolved_id,
             "topic_out": [{"topic": self._external_topic, "format": "image/jpeg"}],
         }
 
