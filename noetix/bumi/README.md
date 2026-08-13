@@ -17,25 +17,39 @@ The default polling and topic publication rate is 2 Hz (`poll_interval_s: 0.5`).
 Motion activity uses a configurable joint-speed threshold, defaulting to
 `0.15 rad/s`. Only motor error codes explicitly documented by Noetix are
 classified as faults. Undocumented non-zero raw values are not shown in the
-fault summary and remain available only in each joint's raw `error` field for device-side verification.
+documented fault list and remain available only in each joint's raw `error`
+field for device-side verification.
 
 Every published state identifies `Noetix HighController/CycloneDDS` as its source and includes a freshness flag. It deliberately excludes battery data, which belongs to the existing `battery` card. The SDK does not expose world-frame position or translational velocity, so the card reports only documented IMU and joint measurements and does not invent odometry.
 
-## `switch_mode` behavior
+## Direct action cards
 
-The card follows the vendor's documented main transition chain:
-`disabled -> enabled -> ready -> walking`. It validates the immediate
-prerequisite but never executes missing transitions automatically. A rejected
-request returns `required_sequence` so the user can check robot pose, ground,
-support and clearance before executing each step. `fall_to_stand` starts from
-ready; `stand_to_fall`, gestures, dances and teach entry/play start from walking.
+The former `switch_mode` tool is split into three user-facing cards. Internal
+`enable`, `ready` and `walk` transitions are completed automatically and are no
+longer exposed as user choices:
 
-`enable` and `disable` are separate idempotent `mode` values even though the
-SDK exposes only the state-dependent `START` toggle. `enable` sends `START`
-only from workmode 30; `disable` sends it only from a non-disabled mode. The
-card waits for workmode feedback and reports `completed` only after
-confirmation. The unavailable `RUN` command and deprecated `ENDTEACH` command
-are not exposed.
+- `stand_up_lie_down`: `stand_up` from a face-up lying pose, or `lie_down` from a
+  stable standing pose;
+- `semantic_action`: wave, handshake, cheer, three dances and wipe-tears;
+- `action_recording`: start recording, finish and save a recording, or play a
+  saved recording by `recording_id`.
+
+Every result reports the automatically executed preparation steps, the observed
+workmode, whether the requested action start was confirmed, plain-language
+safety requirements and the fact that the SDK cannot verify the robot's real
+physical pose. An observed target action mode returns `running`, not
+`completed`, because mode feedback does not prove the physical motion has
+finished. If any preparation or action enters protection mode, the card stops
+the sequence and tells the user to restart, place Bumi face-up on a flat,
+non-slip surface with a clear 3 m × 3 m area, and then use `stand_up`.
+
+`finish_and_save_recording` maps to the supported `SAVETEACH` command. The
+vendor-deprecated `ENDTEACH` command and unavailable `RUN` command remain
+unexposed.
+
+`debug_workmode` is a developer-only actuator for direct `enable`, `disable`,
+`ready` and `walk` testing. It does not automatically fill missing prerequisite
+modes; the operator remains responsible for pose and environment checks.
 
 Useful observations while the driver is running:
 
