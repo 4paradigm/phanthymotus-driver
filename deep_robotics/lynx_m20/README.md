@@ -2,6 +2,28 @@
 
 本 Driver 依据供应商《山猫 M20 开发指南》（适用系统版本 V1.1.8）实现。
 
+## 构建前准备
+
+镜像构建不会在容器内访问 GitHub，也不会执行 `git clone`。请预先下载固定版本的官方 `deep-robotics-msg` ZIP：
+
+- 提交版本：`a0d1a29eec5c4db5a9107595bb51e3be8122b86c`
+- 下载地址：`https://github.com/DeepRoboticsLab/deep-robotics-msg/archive/a0d1a29eec5c4db5a9107595bb51e3be8122b86c.zip`
+- 文件名：`deep-robotics-msg-a0d1a29eec5c4db5a9107595bb51e3be8122b86c.zip`
+- 放置位置：`deep_robotics/lynx_m20/deep-robotics-msg-a0d1a29eec5c4db5a9107595bb51e3be8122b86c.zip`
+- SHA256：`1d268a76e80af8ea5aa3dc28de0c236de87bce55a5d397fdad1e23515f02a537`
+
+示例：
+
+```bash
+curl -fL -o deep_robotics/lynx_m20/deep-robotics-msg-a0d1a29eec5c4db5a9107595bb51e3be8122b86c.zip \
+  https://github.com/DeepRoboticsLab/deep-robotics-msg/archive/a0d1a29eec5c4db5a9107595bb51e3be8122b86c.zip
+
+shasum -a 256 deep_robotics/lynx_m20/deep-robotics-msg-a0d1a29eec5c4db5a9107595bb51e3be8122b86c.zip
+bash build.sh --mirror tuna deep_robotics/lynx_m20
+```
+
+Dockerfile 会在解压和编译前再次校验 SHA256。ZIP 被 `.gitignore` 排除，不会进入提交。
+
 ## 已实现接口
 
 - `basic_server` 原生协议：TCP `10.21.31.103:30001` 可靠指令与 1 Hz 心跳，UDP `10.21.31.103:30000` 高频运动指令；包含官方 16 字节帧头、JSON ASDU、响应关联与状态上报缓存。

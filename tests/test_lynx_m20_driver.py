@@ -244,6 +244,12 @@ class LynxM20ContractTests(unittest.TestCase):
             self.assertIn(topic, config)
         self.assertIn("rmw_fastrtps_cpp", dockerfile)
         self.assertIn("a0d1a29eec5c4db5a9107595bb51e3be8122b86c", dockerfile)
+        self.assertIn("deep-robotics-msg-${DEEP_ROBOTICS_MSG_REV}.zip", dockerfile)
+        self.assertIn("1d268a76e80af8ea5aa3dc28de0c236de87bce55a5d397fdad1e23515f02a537", dockerfile)
+        self.assertIn("sha256sum -c -", dockerfile)
+        self.assertIn("python3 -m zipfile -e", dockerfile)
+        self.assertNotIn("apt-get install -y --no-install-recommends unzip", dockerfile)
+        self.assertNotIn("git clone", dockerfile)
 
     def test_container_preserves_repository_depth_for_entrypoint(self):
         dockerfile = (DRIVER / "Dockerfile").read_text()
@@ -253,7 +259,9 @@ class LynxM20ContractTests(unittest.TestCase):
 
     def test_no_stale_s10_identity_remains(self):
         old_model = "s" + "10"
-        files = list(DRIVER.glob("*")) + [ROOT / "README.md", ROOT / "README_zh.md"]
+        text_suffixes = {".md", ".py", ".yaml", ".yml", ".txt", ""}
+        files = [path for path in DRIVER.glob("*") if path.suffix in text_suffixes]
+        files += [ROOT / "README.md", ROOT / "README_zh.md"]
         stale = [str(path) for path in files if path.is_file() and old_model in path.read_text().lower()]
         self.assertEqual([], stale)
 
