@@ -251,6 +251,14 @@ class LynxM20ContractTests(unittest.TestCase):
         self.assertNotIn("apt-get install -y --no-install-recommends unzip", dockerfile)
         self.assertNotIn("git clone", dockerfile)
 
+        archive = DRIVER / "deep-robotics-msg-a0d1a29eec5c4db5a9107595bb51e3be8122b86c.zip"
+        self.assertTrue(archive.is_file())
+        import hashlib
+        self.assertEqual(
+            "1d268a76e80af8ea5aa3dc28de0c236de87bce55a5d397fdad1e23515f02a537",
+            hashlib.sha256(archive.read_bytes()).hexdigest(),
+        )
+
     def test_container_preserves_repository_depth_for_entrypoint(self):
         dockerfile = (DRIVER / "Dockerfile").read_text()
         self.assertIn("/work/deep_robotics/lynx_m20/", dockerfile)
