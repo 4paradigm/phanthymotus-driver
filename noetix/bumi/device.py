@@ -1424,7 +1424,7 @@ class VideoPlugin:
                 },
             },
             "topic_in": [{"format": "image/jpeg"}],
-            "topic_out": [{"topic": self._external_topic, "format": "image/jpeg"}],
+            "topic_out": [],
         }
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
