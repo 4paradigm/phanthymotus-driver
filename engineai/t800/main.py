@@ -103,6 +103,7 @@ class T800DeviceBundle:
             HeartbeatStatusPlugin,
             LedPlugin,
             LocomotionPlugin,
+            MappingPlugin,
             MotionCommandTracePlugin,
             MotionEventsPlugin,
             MicPlugin,
@@ -174,6 +175,15 @@ class T800DeviceBundle:
             instance = VirtualGamepadPlugin(virtual_gamepad_config, namespace, ros2)
             instances["virtual_gamepad"] = instance
             self._plugins.append(instance)
+
+        mapping_config = plugins.get("mapping", {})
+        if mapping_config.get("enabled", False):
+            try:
+                instance = MappingPlugin(mapping_config, namespace, ros2)
+                instances["mapping"] = instance
+                self._plugins.append(instance)
+            except Exception as exc:
+                print(f"[bundle] MappingPlugin init failed, mapping disabled: {exc}", flush=True)
 
         if "safety" in instances:
             instances["safety"].set_controls(

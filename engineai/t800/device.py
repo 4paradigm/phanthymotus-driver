@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import math
 import numbers
+import os
+import sqlite3
 import subprocess
 import threading
 import time
@@ -18,9 +20,18 @@ from collections import deque
 from dataclasses import asdict
 from pathlib import Path
 
+import numpy as np
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
+
+# Open3D is optional; fall back to numpy-only PCD writing when unavailable.
+try:
+    import open3d as o3d
+
+    _HAS_OPEN3D = True
+except ImportError:
+    _HAS_OPEN3D = False
 
 from control import (
     LED_MODES,
@@ -3419,3 +3430,706 @@ class VisionPlugin:
                 self._source = source
             return {"state": "running" if self._running else "idle", "source": source}
         return {"error": f"unknown vision action: {action}"}
+
+
+# ── Mapping (Odin2 odometry + point cloud) ───────────────────────────────────
+
+class _MappingDB:
+    """SQLite storage for saved maps (name, pcd path, point count)."""
+
+    def __init__(self, db_path: str):
+        os.makedirs(os.path.dirname(db_path) if os.path.dirname(db_path) else ".", exist_ok=True)
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._migrate()
+
+    def _migrate(self) -> None:
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS maps (
+                name        TEXT PRIMARY KEY,
+                pcd_path    TEXT NOT NULL,
+                point_count INTEGER DEFAULT 0,
+                created_at  REAL DEFAULT (strftime('%s','now'))
+            );
+            CREATE TABLE IF NOT EXISTS poi (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                name        TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                x           REAL NOT NULL,
+                y           REAL NOT NULL,
+                z           REAL DEFAULT 0,
+                yaw         REAL DEFAULT 0,
+                map_name    TEXT NOT NULL,
+                created_at  REAL DEFAULT (strftime('%s','now')),
+                UNIQUE(name, map_name)
+            );
+            CREATE TABLE IF NOT EXISTS state (
+                key        TEXT PRIMARY KEY,
+                value      TEXT,
+                updated_at REAL DEFAULT (strftime('%s','now'))
+            );
+            """
+        )
+        # Add cloud_path column to maps if missing (legacy DB compatibility)
+        try:
+            self._conn.execute("ALTER TABLE maps ADD COLUMN cloud_path TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        self._conn.commit()
+
+    def add_map(self, name: str, pcd_path: str, point_count: int) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO maps (name, pcd_path, point_count) VALUES (?, ?, ?)",
+            (name, pcd_path, point_count),
+        )
+        self._conn.commit()
+
+    def get_map(self, name: str) -> dict | None:
+        row = self._conn.execute("SELECT * FROM maps WHERE name = ?", (name,)).fetchone()
+        return dict(row) if row else None
+
+    def list_maps(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT name, pcd_path, point_count, created_at FROM maps ORDER BY created_at DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_map(self, name: str) -> bool:
+        map_info = self.get_map(name)
+        if not map_info:
+            return False
+        try:
+            os.remove(map_info["pcd_path"])
+        except OSError:
+            pass
+        self._conn.execute("DELETE FROM maps WHERE name = ?", (name,))
+        self._conn.execute("DELETE FROM poi WHERE map_name = ?", (name,))
+        self._conn.commit()
+        return True
+
+    def add_poi(
+        self,
+        name: str,
+        x: float,
+        y: float,
+        z: float,
+        yaw: float,
+        map_name: str,
+        description: str = "",
+    ) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO poi (name, description, x, y, z, yaw, map_name) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (name, description, x, y, z, yaw, map_name),
+        )
+        self._conn.commit()
+
+    def delete_poi(self, name: str, map_name: str) -> bool:
+        cur = self._conn.execute(
+            "DELETE FROM poi WHERE name = ? AND map_name = ?", (name, map_name)
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def list_pois(self, map_name: str) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT name, description, x, y, z, yaw, map_name, created_at "
+            "FROM poi WHERE map_name = ? ORDER BY name",
+            (map_name,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def find_poi(self, query: str, map_name: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT name, description, x, y, z, yaw, map_name "
+            "FROM poi WHERE map_name = ? AND name LIKE ?",
+            (map_name, f"%{query}%"),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def set_state(self, key: str, value: str | None) -> None:
+        if value is None:
+            self._conn.execute("DELETE FROM state WHERE key = ?", (key,))
+        else:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO state (key, value, updated_at) "
+                "VALUES (?, ?, strftime('%s','now'))",
+                (key, value),
+            )
+        self._conn.commit()
+
+    def get_state(self, key: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT value FROM state WHERE key = ?", (key,)
+        ).fetchone()
+        return row["value"] if row else None
+
+    def set_cloud_path(self, map_name: str, cloud_path: str) -> None:
+        self._conn.execute(
+            "UPDATE maps SET cloud_path = ? WHERE name = ?", (cloud_path, map_name)
+        )
+        self._conn.commit()
+
+    def list_maps_with_pois(self) -> list[dict]:
+        maps = self.list_maps()
+        for m in maps:
+            m["tags"] = [p["name"] for p in self.list_pois(m["name"])]
+        return maps
+
+
+class MappingPlugin:
+    """Laser point cloud mapping via Odin2 odometry + undistorted point cloud."""
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._config = plugin_config
+        self._ns = namespace
+        self._ros2 = ros2
+
+        self._map_save_dir = plugin_config.get("map_save_dir", "/opt/phanthy-motus/data/maps")
+        db_path = plugin_config.get("db_path", "/opt/phanthy-motus/data/mapping.db")
+        self._voxel_size = float(plugin_config.get("voxel_size", 0.05))
+        self._max_points = int(plugin_config.get("max_points", 5_000_000))
+        self._odometry_topic = plugin_config.get(
+            "odometry_topic", "/manifold/ODIN2/device0/odometry"
+        )
+        self._pointcloud_topic = plugin_config.get(
+            "pointcloud_topic", "/manifold/ODIN2/device0/cloud/slam"
+        )
+
+        self._db = _MappingDB(db_path)
+
+        self._is_mapping = False
+        self._current_map: str | None = None
+        self._active_map: str | None = None  # 当前活动地图（建图中或已加载）
+        self._loaded_points: np.ndarray | None = None  # load_map 加载的点云（可选）
+        self._current_pose: dict | None = None
+        self._global_points: np.ndarray | None = None
+        self._start_time: float | None = None
+        self._frame_count = 0
+        self._lock = threading.Lock()
+
+        self._node = Node("t800_mapping", context=ros2.ctx_robot)
+        ros2.executor_robot.add_node(self._node)
+        self._odom_sub = None
+        self._cloud_sub = None
+
+        self._create_odom_subscription()
+
+        print(
+            f"[mapping] ready (odom={self._odometry_topic}, cloud={self._pointcloud_topic}, "
+            f"open3d={_HAS_OPEN3D})",
+            flush=True,
+        )
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "mapping",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": (
+                "T800 激光点云建图卡片；人工遥控行走时按 Odin2 里程计位姿累积点云，"
+                "生成并保存 .pcd 地图。支持开始/停止/取消建图、状态查询、地图管理、"
+                "语义标记（tag）管理和已保存地图加载。"
+            ),
+            "inputSchema": action_schema(
+                {
+                    "start_mapping": (["map_name"], "开始建图，用遥控器或 loco 控制机器人行走"),
+                    "stop_mapping": ([], "停止建图，体素下采样后保存 .pcd 地图"),
+                    "cancel_mapping": ([], "取消建图，丢弃已累积点云，不保存"),
+                    "mapping_status": ([], "查询当前建图状态、实时位姿和已累积点数"),
+                    "list_maps": ([], "列出所有已保存地图"),
+                    "delete_map": (["map_name"], "删除指定地图及 .pcd 文件"),
+                    "tag_place": (["name", "description"], "在当前位置打语义标记，关联到活动地图"),
+                    "untag_place": (["name"], "删除指定名称的位置标记"),
+                    "list_tags": ([], "列出当前活动地图的所有标记，含相对机器人的距离和方位"),
+                    "load_map": (["map_name"], "加载已保存地图为活动地图（不做重定位，需手动将机器人放置在地图原点附近）"),
+                },
+                {
+                    "map_name": {"type": "string", "description": "地图名称"},
+                    "description": {"type": "string", "description": "标记描述（可选）"},
+                },
+                "建图动作",
+            ),
+        }
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        if self._is_mapping:
+            self._destroy_cloud_subscription()
+            print("[mapping] driver shutdown, mapping stopped without saving", flush=True)
+        self._destroy_odom_subscription()
+        try:
+            self._ros2.executor_robot.remove_node(self._node)
+            self._node.destroy_node()
+        except Exception:
+            pass
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "info"):
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "start_mapping":
+            return self._start_mapping(args.get("map_name", ""))
+        if action == "stop_mapping":
+            return self._stop_mapping()
+        if action == "cancel_mapping":
+            return self._cancel_mapping()
+        if action == "mapping_status":
+            return self._mapping_status()
+        if action == "list_maps":
+            return self._list_maps()
+        if action == "delete_map":
+            return self._delete_map(args.get("map_name", ""))
+        if action == "tag_place":
+            return self._tag_place(args.get("name", ""), args.get("description", ""))
+        if action == "untag_place":
+            return self._untag_place(args.get("name", ""))
+        if action == "list_tags":
+            return self._list_tags()
+        if action == "load_map":
+            return self._load_map(args.get("map_name", ""))
+        return {"error": f"unknown mapping action: {action}"}
+
+    # ── Action handlers ──────────────────────────────────────────────
+
+    def _start_mapping(self, map_name: str) -> dict:
+        map_name = str(map_name).strip()
+        if not map_name:
+            return {"error": "map_name is required"}
+        with self._lock:
+            if self._is_mapping:
+                return {"error": f"already mapping '{self._current_map}'", "current_map": self._current_map}
+
+        existing = self._db.get_map(map_name)
+        if existing:
+            print(f"[mapping] map '{map_name}' already exists, will overwrite on save", flush=True)
+
+        try:
+            self._create_cloud_subscription()
+        except Exception as exc:
+            return {"error": f"failed to create ROS2 subscriptions: {exc}"}
+
+        with self._lock:
+            self._is_mapping = True
+            self._current_map = map_name
+            self._active_map = map_name
+            self._current_pose = None
+            self._global_points = None
+            self._start_time = time.monotonic()
+            self._frame_count = 0
+
+        print(f"[mapping] started mapping '{map_name}'", flush=True)
+        return {
+            "state": "mapping",
+            "map_name": map_name,
+            "message": "建图已开始，请用 virtual_gamepad 或 loco 控制机器人行走",
+        }
+
+    def _stop_mapping(self) -> dict:
+        with self._lock:
+            if not self._is_mapping:
+                return {"error": "no active mapping session"}
+            map_name = self._current_map
+            start_time = self._start_time
+            points = self._global_points
+
+        self._destroy_cloud_subscription()
+        elapsed = time.monotonic() - start_time if start_time else 0.0
+        result = self._save_map(map_name, points)
+
+        with self._lock:
+            self._is_mapping = False
+            self._current_map = None
+            self._global_points = None
+            self._current_pose = None
+            self._start_time = None
+            self._frame_count = 0
+            # _active_map 保留为 map_name：地图仍处于活动状态，可继续 tag_place
+
+        if "error" in result:
+            print(f"[mapping] save failed for '{map_name}': {result['error']}", flush=True)
+            return result
+
+        result["elapsed_time"] = round(elapsed, 2)
+        print(
+            f"[mapping] saved '{map_name}': {result['point_count']} points "
+            f"({elapsed:.1f}s) -> {result['pcd_path']}",
+            flush=True,
+        )
+        return result
+
+    def _cancel_mapping(self) -> dict:
+        with self._lock:
+            if not self._is_mapping:
+                return {"error": "no active mapping session"}
+            map_name = self._current_map
+
+        self._destroy_cloud_subscription()
+
+        with self._lock:
+            self._is_mapping = False
+            self._current_map = None
+            self._global_points = None
+            self._current_pose = None
+            self._start_time = None
+            self._frame_count = 0
+            self._active_map = None
+
+        print(f"[mapping] cancelled mapping '{map_name}'", flush=True)
+        return {"state": "cancelled", "map_name": map_name}
+
+    def _mapping_status(self) -> dict:
+        with self._lock:
+            active_map = self._active_map
+            if not self._is_mapping:
+                return {"state": "idle", "is_mapping": False, "active_map": active_map}
+            pose = dict(self._current_pose) if self._current_pose else None
+            point_count = int(len(self._global_points)) if self._global_points is not None else 0
+            elapsed = time.monotonic() - self._start_time if self._start_time else 0.0
+            return {
+                "state": "mapping",
+                "is_mapping": True,
+                "current_map": self._current_map,
+                "active_map": active_map,
+                "current_pose": pose,
+                "point_count": point_count,
+                "frame_count": self._frame_count,
+                "elapsed_time": round(elapsed, 2),
+            }
+
+    def _list_maps(self) -> dict:
+        try:
+            return {"maps": self._db.list_maps()}
+        except Exception as exc:
+            return {"error": f"failed to list maps: {exc}"}
+
+    def _delete_map(self, map_name: str) -> dict:
+        map_name = str(map_name).strip()
+        if not map_name:
+            return {"error": "map_name is required"}
+        with self._lock:
+            if self._is_mapping and self._current_map == map_name:
+                return {"error": f"cannot delete active map '{map_name}'. Stop or cancel mapping first."}
+        try:
+            if self._db.delete_map(map_name):
+                with self._lock:
+                    if self._active_map == map_name:
+                        self._active_map = None
+                return {"state": "deleted", "map_name": map_name}
+            return {"error": f"map '{map_name}' not found"}
+        except Exception as exc:
+            return {"error": f"failed to delete map: {exc}"}
+
+    # ── Tag / map-load handlers ──────────────────────────────────────
+
+    def _tag_place(self, name: str, description: str = "") -> dict:
+        name = str(name).strip()
+        if not name:
+            return {"error": "name is required"}
+        pose = self._get_pose()
+        if pose is None:
+            return {"error": "no odometry pose available yet"}
+        active_map = self._active_map
+        if not active_map:
+            return {"error": "no active map; call start_mapping or load_map first"}
+        self._db.add_poi(
+            name=name,
+            x=pose["x"],
+            y=pose["y"],
+            z=pose.get("z", 0.0),
+            yaw=pose.get("yaw", 0.0),
+            map_name=active_map,
+            description=description,
+        )
+        print(f"[mapping] tagged place '{name}' on map '{active_map}'", flush=True)
+        return {"status": "tagged", "name": name, "pose": pose, "map": active_map}
+
+    def _untag_place(self, name: str) -> dict:
+        name = str(name).strip()
+        if not name:
+            return {"error": "name is required"}
+        active_map = self._active_map
+        if not active_map:
+            return {"error": "no active map; call start_mapping or load_map first"}
+        if self._db.delete_poi(name, active_map):
+            print(f"[mapping] untagged place '{name}' from map '{active_map}'", flush=True)
+            return {"status": "deleted", "name": name}
+        return {"error": f"tag '{name}' not found in map '{active_map}'"}
+
+    def _list_tags(self) -> dict:
+        active_map = self._active_map
+        if not active_map:
+            return {"error": "no active map; call start_mapping or load_map first"}
+        pois = self._db.list_pois(active_map)
+        pose = self._get_pose()
+        tags = []
+        for poi in pois:
+            entry = {
+                "name": poi["name"],
+                "description": poi["description"],
+                "x": poi["x"],
+                "y": poi["y"],
+                "z": poi["z"],
+                "yaw": poi["yaw"],
+            }
+            if pose:
+                dx = poi["x"] - pose["x"]
+                dy = poi["y"] - pose["y"]
+                dist = math.sqrt(dx * dx + dy * dy)
+                # Rotate target vector into robot frame
+                cos_yaw = math.cos(-pose["yaw"])
+                sin_yaw = math.sin(-pose["yaw"])
+                rx = dx * cos_yaw - dy * sin_yaw
+                ry = dx * sin_yaw + dy * cos_yaw
+                entry["distance"] = round(dist, 2)
+                entry["bearing"] = self._bearing_label(rx, ry)
+            tags.append(entry)
+        return {"tags": tags, "map": active_map}
+
+    def _load_map(self, map_name: str) -> dict:
+        map_name = str(map_name).strip()
+        if not map_name:
+            return {"error": "map_name is required"}
+        if self._is_mapping:
+            return {"error": "cannot load map while mapping; call stop_mapping first"}
+        map_info = self._db.get_map(map_name)
+        if not map_info:
+            return {"error": f"map '{map_name}' not found"}
+        self._active_map = map_name
+        self._loaded_points = None  # 第一期不加载点云到内存，仅设置活动地图
+        self._db.set_state("active_map", map_name)
+        print(f"[mapping] loaded map '{map_name}' as active", flush=True)
+        return {
+            "status": "loaded",
+            "map_name": map_name,
+            "pcd_path": map_info["pcd_path"],
+            "note": "T800 无 SLAM 重定位服务，请手动将机器人放置在地图原点附近",
+        }
+
+    # ── Helpers ──────────────────────────────────────────────────────
+
+    def _get_pose(self) -> dict | None:
+        """Thread-safe deep copy of the current odometry pose."""
+        with self._lock:
+            return dict(self._current_pose) if self._current_pose else None
+
+    @staticmethod
+    def _bearing_label(dx: float, dy: float) -> str:
+        """Convert delta (x=forward, y=left) to 8-direction bearing label."""
+        angle = math.atan2(dy, dx)  # radians, 0=forward, pi/2=left
+        deg = math.degrees(angle)
+        if -22.5 <= deg < 22.5:
+            return "front"
+        elif 22.5 <= deg < 67.5:
+            return "left_front"
+        elif 67.5 <= deg < 112.5:
+            return "left"
+        elif 112.5 <= deg < 157.5:
+            return "left_behind"
+        elif -67.5 <= deg < -22.5:
+            return "right_front"
+        elif -112.5 <= deg < -67.5:
+            return "right"
+        elif -157.5 <= deg < -112.5:
+            return "right_behind"
+        else:
+            return "behind"
+
+    # ── ROS2 subscriptions ───────────────────────────────────────────
+
+    def _create_odom_subscription(self) -> None:
+        from nav_msgs.msg import Odometry
+
+        self._odom_sub = self._node.create_subscription(
+            Odometry, self._odometry_topic, self._on_odometry, _BEST_EFFORT
+        )
+
+    def _create_cloud_subscription(self) -> None:
+        from sensor_msgs.msg import PointCloud2
+
+        self._cloud_sub = self._node.create_subscription(
+            PointCloud2, self._pointcloud_topic, self._on_pointcloud, _BEST_EFFORT
+        )
+
+    def _destroy_cloud_subscription(self) -> None:
+        if self._cloud_sub is not None:
+            try:
+                self._node.destroy_subscription(self._cloud_sub)
+            except Exception:
+                pass
+            self._cloud_sub = None
+
+    def _destroy_odom_subscription(self) -> None:
+        if self._odom_sub is not None:
+            try:
+                self._node.destroy_subscription(self._odom_sub)
+            except Exception:
+                pass
+            self._odom_sub = None
+
+    # ── Callbacks ────────────────────────────────────────────────────
+
+    def _on_odometry(self, msg) -> None:
+        position = msg.pose.pose.position
+        orientation = msg.pose.pose.orientation
+        yaw = self._quaternion_to_yaw(orientation.x, orientation.y, orientation.z, orientation.w)
+        with self._lock:
+            self._current_pose = {
+                "x": float(position.x),
+                "y": float(position.y),
+                "z": float(position.z),
+                "qx": float(orientation.x),
+                "qy": float(orientation.y),
+                "qz": float(orientation.z),
+                "qw": float(orientation.w),
+                "yaw": round(yaw, 4),
+            }
+
+    def _on_pointcloud(self, msg) -> None:
+        with self._lock:
+            if not self._is_mapping:
+                return
+            if self._current_pose is None:
+                return
+            if self._global_points is not None and len(self._global_points) >= self._max_points:
+                return
+            pose = dict(self._current_pose)
+
+        try:
+            points = self._parse_pointcloud2(msg)
+        except Exception as exc:
+            print(f"[mapping] pointcloud parse error: {exc}", flush=True)
+            return
+
+        if points is None or len(points) == 0:
+            return
+
+        transformed = self._transform_points(points, pose)
+
+        with self._lock:
+            if self._global_points is None:
+                self._global_points = transformed
+            else:
+                self._global_points = np.vstack([self._global_points, transformed])
+            self._frame_count += 1
+
+    # ── Point cloud helpers ──────────────────────────────────────────
+
+    @staticmethod
+    def _parse_pointcloud2(msg) -> np.ndarray | None:
+        fields = {f.name: f for f in msg.fields}
+        if not all(name in fields for name in ("x", "y", "z")):
+            return None
+
+        x_off = fields["x"].offset
+        y_off = fields["y"].offset
+        z_off = fields["z"].offset
+        point_step = msg.point_step
+        num_points = msg.width * msg.height
+
+        if num_points == 0 or point_step == 0:
+            return None
+
+        raw = np.frombuffer(msg.data, dtype=np.uint8)
+        raw = raw[: num_points * point_step].reshape(num_points, point_step)
+
+        x = np.frombuffer(raw[:, x_off : x_off + 4].tobytes(), dtype=np.float32)
+        y = np.frombuffer(raw[:, y_off : y_off + 4].tobytes(), dtype=np.float32)
+        z = np.frombuffer(raw[:, z_off : z_off + 4].tobytes(), dtype=np.float32)
+
+        points = np.column_stack([x, y, z]).astype(np.float64)
+        valid = np.isfinite(points).all(axis=1)
+        return points[valid]
+
+    @staticmethod
+    def _transform_points(points: np.ndarray, pose: dict) -> np.ndarray:
+        qx, qy, qz, qw = pose["qx"], pose["qy"], pose["qz"], pose["qw"]
+        # Normalize quaternion to avoid scale drift in the rotation matrix.
+        qnorm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+        if qnorm > 0:
+            qx, qy, qz, qw = qx / qnorm, qy / qnorm, qz / qnorm, qw / qnorm
+        R = np.array(
+            [
+                [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
+                [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
+                [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)],
+            ]
+        )
+        rotated = points @ R.T
+        rotated[:, 0] += pose["x"]
+        rotated[:, 1] += pose["y"]
+        rotated[:, 2] += pose["z"]
+        return rotated
+
+    @staticmethod
+    def _quaternion_to_yaw(qx: float, qy: float, qz: float, qw: float) -> float:
+        return math.atan2(
+            2 * (qw * qz + qx * qy),
+            1 - 2 * (qy * qy + qz * qz),
+        )
+
+    # ── Save map ─────────────────────────────────────────────────────
+
+    def _save_map(self, map_name: str, points: np.ndarray | None) -> dict:
+        if points is None or len(points) == 0:
+            return {"error": "no point cloud data to save"}
+
+        os.makedirs(self._map_save_dir, exist_ok=True)
+        pcd_path = os.path.join(self._map_save_dir, f"{map_name}.pcd")
+
+        try:
+            points = self._voxel_downsample(points, self._voxel_size)
+        except Exception as exc:
+            print(f"[mapping] voxel downsample failed, saving raw: {exc}", flush=True)
+
+        point_count = int(len(points))
+
+        try:
+            if _HAS_OPEN3D:
+                pcd = o3d.geometry.PointCloud()
+                pcd.points = o3d.utility.Vector3dVector(points)
+                o3d.io.write_point_cloud(pcd_path, pcd)
+            else:
+                self._write_pcd_ascii(pcd_path, points)
+        except Exception as exc:
+            return {"error": f"failed to write PCD: {exc}"}
+
+        try:
+            self._db.add_map(map_name, pcd_path, point_count)
+        except Exception as exc:
+            return {"error": f"failed to update database: {exc}", "pcd_path": pcd_path, "point_count": point_count}
+
+        return {"state": "saved", "map_name": map_name, "pcd_path": pcd_path, "point_count": point_count}
+
+    @staticmethod
+    def _voxel_downsample(points: np.ndarray, voxel_size: float) -> np.ndarray:
+        if voxel_size <= 0:
+            return points
+        voxel_idx = np.floor(points / voxel_size).astype(np.int64)
+        _, unique_idx = np.unique(voxel_idx, axis=0, return_index=True)
+        return points[unique_idx]
+
+    @staticmethod
+    def _write_pcd_ascii(path: str, points: np.ndarray) -> None:
+        n = len(points)
+        header = (
+            "# .PCD v0.7 - Point Cloud Data file format\n"
+            "VERSION 0.7\n"
+            "FIELDS x y z\n"
+            "SIZE 4 4 4\n"
+            "TYPE F F F\n"
+            "COUNT 1 1 1\n"
+            f"WIDTH {n}\n"
+            "HEIGHT 1\n"
+            "VIEWPOINT 0 0 0 1 0 0 0\n"
+            f"POINTS {n}\n"
+            "DATA ascii\n"
+        )
+        with open(path, "w") as f:
+            f.write(header)
+            for p in points:
+                f.write(f"{p[0]:.6f} {p[1]:.6f} {p[2]:.6f}\n")
