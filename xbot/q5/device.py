@@ -62,14 +62,14 @@ def _q5_remote_command(command: str, timeout: float = 20.0, stdin=None):
 
 
 def _ensure_remote_audio_tools():
-    """Validate the documented sounddevice runtime without mutating Q5 XOS."""
+    """Validate the installed PortAudio Python binding without mutating Q5 XOS."""
     result = _q5_remote_command(
-        "python3 -c \"import sounddevice as sd; print(sd.query_devices())\"", timeout=15.0)
+        "python3 -c \"import pyaudio; print(pyaudio.PyAudio().get_device_info_by_index(6))\"", timeout=15.0)
     if result.returncode:
         detail = (result.stderr or result.stdout).decode(errors="replace").strip()
         raise RuntimeError(
-            "Q5 sounddevice is unavailable. Install the Q5 manual's PortAudio and sounddevice "
-            f"dependencies in the developer container first: {detail}")
+            "Q5 PyAudio/PortAudio device 6 is unavailable. The Q5 manual requires "
+            f"PortAudio access to the USB Audio Device: {detail}")
 
 
 class MicPlugin:
@@ -131,11 +131,11 @@ class MicPlugin:
             try:
                 _ensure_remote_audio_tools()
                 command = (
-                    "import sounddevice as sd, sys; "
-                    f"sd.default.device=({self._device}, {self._device}); "
-                    f"stream=sd.RawInputStream(samplerate={self._rate}, channels={self._channels}, "
-                    "dtype='int16', blocksize=1600); stream.start(); "
-                    "\nwhile True:\n data, overflowed=stream.read(1600); sys.stdout.buffer.write(data); sys.stdout.buffer.flush()"
+                    "import pyaudio, sys; "
+                    "pa=pyaudio.PyAudio(); "
+                    f"stream=pa.open(format=pyaudio.paInt16, channels={self._channels}, rate={self._rate}, "
+                    f"input=True, input_device_index={self._device}, frames_per_buffer=1600); "
+                    "\nwhile True:\n data=stream.read(1600, exception_on_overflow=False); sys.stdout.buffer.write(data); sys.stdout.buffer.flush()"
                 )
                 self._process = subprocess.Popen(
                     _q5_ssh_args("python3 -u -c " + shlex.quote(command)), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -218,10 +218,10 @@ class SpeakerPlugin:
                 _ensure_remote_audio_tools()
                 self._topic = requested
                 command = (
-                    "import sounddevice as sd, sys; "
-                    f"sd.default.device=({self._device}, {self._device}); "
-                    f"stream=sd.RawOutputStream(samplerate={self._rate}, channels={self._channels}, "
-                    "dtype='int16', blocksize=1600); stream.start(); "
+                    "import pyaudio, sys; "
+                    "pa=pyaudio.PyAudio(); "
+                    f"stream=pa.open(format=pyaudio.paInt16, channels={self._channels}, rate={self._rate}, "
+                    f"output=True, output_device_index={self._device}, frames_per_buffer=1600); "
                     "\nwhile True:\n data=sys.stdin.buffer.read(3200);\n if not data: break\n stream.write(data)"
                 )
                 self._process = subprocess.Popen(_q5_ssh_args("python3 -u -c " + shlex.quote(command)), stdin=subprocess.PIPE,
