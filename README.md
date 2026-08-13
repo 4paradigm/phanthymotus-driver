@@ -10,7 +10,7 @@ Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server t
 
 | Driver | Hardware | Port | Description |
 |--------|----------|------|-------------|
-| `unitree/g1` | Unitree G1 Humanoid | 15701 | Locomotion, arm control, mic, speaker, LED, state monitoring |
+| `unitree/g1` | Unitree G1 Humanoid | 15701 | Locomotion, arm control, mic, speaker, LED, state and joint-health monitoring |
 | `engineai/t800` | EngineAI T800 Development Edition | 15708 | ROS2/Native SDK, full state, dance/gesture sequences, virtual gamepad, locomotion and low-level joint control |
 | `phanthy/remote_control` | Remote Control Bridge | 15710 | Remote control relay |
 
@@ -78,6 +78,10 @@ Quick overview:
 - Each driver implements MCP JSON-RPC 2.0 over HTTP (`initialize`, `tools/list`, `tools/call`)
 - Tool naming convention: `{device}_{action}` (e.g., `loco_move`, `mic_start`)
 - Driver port range: **15700–15799**
+
+### G1 Joint Health Card
+
+`joint_health` subscribes to G1 `rt/lowstate` and diagnoses per-joint temperature, temperature rise, sustained high torque, and telemetry timeouts. It publishes to `/<namespace>/health/joints` and supports `snapshot`, `list_alerts`, and `reset_baseline`. The card is read-only and never stops or commands the robot; its thresholds are configurable in `unitree/g1/config.yaml`.
 
 ### Topic Inference via `info` Action
 

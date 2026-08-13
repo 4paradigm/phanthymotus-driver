@@ -17,6 +17,21 @@ plugins:
     enabled: true
   state:
     enabled: true
+  joint_health:
+    enabled: true
+    warning_temp_c: 70
+    critical_temp_c: 85
+    warning_temp_rise_c_per_min: 12
+    critical_temp_rise_c_per_min: 20
+    temperature_history_sec: 30
+    warning_torque_nm: 45
+    critical_torque_nm: 70
+    torque_consecutive_samples: 10
+    position_limit_enabled: true
+    position_warning_margin_ratio: 0.02
+    stale_timeout_sec: 1.0
+    sample_interval_sec: 0.1
+    publish_interval_sec: 0.5
   camera:
     enabled: true
   lidar:
