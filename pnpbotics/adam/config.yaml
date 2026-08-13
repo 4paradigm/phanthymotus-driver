@@ -2,14 +2,14 @@ mcp_port: 15702
 ros_namespace: ""  # auto-detect from hostname
 
 # Robot variant: "lite" (23 DOF), "sp" (29 DOF), "pro" (31 DOF)
-variant: "sp"
+variant: "pro"
 
 # gRPC endpoint for locomotion control
 grpc_host: "localhost"
 grpc_port: 6666
 
-# DDS domain ID (Adam SDK default is 1)
-dds_domain_id: 1
+# DDS domain ID (must match robot's domain)
+dds_domain_id: 0
 
 plugins:
   state:
