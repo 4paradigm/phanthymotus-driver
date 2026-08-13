@@ -1085,9 +1085,30 @@ class _MotionStateNode(Node):
                 "fresh": result["fresh"],
                 "sample_age_ms": result["sample_age_ms"],
                 "source": result.get("source"),
+                "field_help": {
+                    "position": "joint position in radians",
+                    "velocity": "joint angular velocity in radians per second",
+                    "torque": "raw joint torque feedback from HighController",
+                    "temperature": "motor temperature reported by HighController",
+                    "error": "raw SDK motor status/error value; use fault=true only for a documented fault",
+                },
                 "joint_states": result.get("joint_states", []),
             }
         result.pop("joint_states", None)
+        # Undocumented non-zero values are retained in the per-joint raw view,
+        # but must not be presented as actionable whole-body faults.
+        result.pop("unrecognized_motor_statuses", None)
+        if result.get("state") not in ("error", "no_data"):
+            result["activity_description"] = (
+                "at least one joint velocity reached the configured activity threshold"
+                if result.get("activity") == "moving"
+                else "all joint velocities are below the configured activity threshold"
+            )
+            result["motor_fault_summary"] = {
+                "has_documented_fault": bool(result.get("motor_faults")),
+                "documented_fault_count": len(result.get("motor_faults", [])),
+                "meaning": "only Noetix-documented motor error codes are classified as faults",
+            }
         return result
 
     def history(self, limit: int) -> list[dict]:
@@ -1099,9 +1120,11 @@ class _MotionStateNode(Node):
             event["age_ms"] = max(0, int((now - recorded) * 1000)) if recorded else None
         return events
 
-    def clear_history(self):
+    def clear_history(self) -> int:
         with self._lock:
+            cleared_count = len(self._history)
             self._history.clear()
+        return cleared_count
 
     def _append_event(self, event: str, **data):
         self._event_sequence += 1
@@ -1291,19 +1314,19 @@ class MotionStatePlugin:
     def get_tool(self) -> dict:
         return {
             "name": "motion_state", "type": "sensor", "multiInstance": False,
-            "description": "Bumi whole-body motion telemetry — body orientation/dynamics, joint activity and motion events.",
+            "description": "查看 Bumi 当前整机运动遥测及近期变化：姿态、IMU、关节运动、已确认的电机故障与运动/模式事件；不包含电池信息，也不用于控制机器人。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
                         "enum": ["snapshot", "history", "clear_history"],
-                        "description": "操作：snapshot 获取当前运动遥测；history 查询近期运动事件；clear_history 清空内存中的事件记录。",
+                        "description": "snapshot=查看当前状态；history=查看驱动启动后记录的近期变化；clear_history=清空这些内存事件，不会改变机器人状态。",
                     },
                     "detail": {
                         "type": "string", "enum": ["summary", "joints", "none"],
                         "default": "summary",
-                        "description": "snapshot 时选择 summary（默认，整机运动摘要）或 joints（仅 21 个关节明细）；history 时必须选择 none；clear_history 无需设置。",
+                        "description": "仅 snapshot 使用：summary=整机姿态、IMU、运动统计及已确认故障；joints=21 个关节的位置/速度/力矩/温度/原始错误值。history 请选择 none；clear_history 无需填写。",
                     },
                     "limit": {
                         "type": "integer", "minimum": 1, "maximum": 100,
@@ -1313,9 +1336,9 @@ class MotionStatePlugin:
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "snapshot": {"params": ["detail"], "description": "获取当前运动遥测；summary 返回整机摘要，joints 仅返回 21 个关节完整明细。"},
-                    "history": {"params": ["detail", "limit"], "description": "查询近期运动事件；detail 必须选择 none，limit 可选且默认返回 20 条。"},
-                    "clear_history": {"params": [], "description": "清空内存中的运动事件记录；不需要任何参数。"},
+                    "snapshot": {"params": ["detail"], "description": "读取当前一次运动遥测。summary 适合判断整机是否运动、姿态和已确认故障；joints 适合检查 21 个关节完整反馈。"},
+                    "history": {"params": ["detail", "limit"], "description": "查看运动开始/停止、工作模式、保护状态、已确认电机故障及读取异常等变化；detail 必须选 none，limit 默认 20。"},
+                    "clear_history": {"params": [], "description": "只清空本卡片内存中的历史事件；不停止动作、不清故障、不改变机器人。清空后 history 暂时为空，后续新变化会重新记录。"},
                 },
             },
             "topic_out": [{"topic": self._node.topic, "format": "data/json"}],
@@ -1350,10 +1373,25 @@ class MotionStatePlugin:
                 return {"state": "error", "error": "limit must be an integer"}
             if not 1 <= limit <= 100:
                 return {"state": "error", "error": "limit must be in [1, 100]"}
-            return {"state": "completed", "events": self._node.history(limit)}
+            events = self._node.history(limit)
+            return {
+                "state": "completed",
+                "event_count": len(events),
+                "requested_limit": limit,
+                "events": events,
+                "meaning": (
+                    "no motion-state changes have been recorded since startup or the last clear_history"
+                    if not events else
+                    "events are returned from older to newer within the requested recent window"
+                ),
+            }
         if action == "clear_history":
-            self._node.clear_history()
-            return {"state": "completed"}
+            cleared_count = self._node.clear_history()
+            return {
+                "state": "completed",
+                "cleared_event_count": cleared_count,
+                "meaning": "in-memory event history was cleared; robot motion and faults were not changed",
+            }
         return {"state": "error", "error": f"unknown action: {action}"}
 
 
@@ -1653,6 +1691,22 @@ class ArmPlugin:
 class MediaSystemPlugin:
     PREFIX = "media_system"
     _SET_INTERVAL_S = 0.5
+    _STATUS_MEANINGS = {
+        "READY": "媒体 Agent 已就绪，等待进入唤醒或休眠等工作状态",
+        "SLEEPED": "媒体 Agent 处于休眠状态，不进行正常语音交互",
+        "WAKEUPED": "媒体 Agent 已唤醒，可进行语音交互",
+        "EXIT": "媒体 Agent 已退出，音视频交互不可用",
+    }
+    _REASON_MEANINGS = {
+        "SYSTEM_LAUNCH": "系统启动",
+        "CMD_RESET": "指令触发重启",
+        "AUDIO_WAKEUPED": "识别到真实语音唤醒词后唤醒",
+        "CMD_WAKEUPED": "wakeup 指令触发唤醒，不播放唤醒回复词",
+        "AUDIO_SLEEPED": "语音交互触发休眠",
+        "CMD_SLEEPED": "sleep 指令触发休眠，不播放休眠回复词",
+        "TIMEOUT_SLEEPED": "超过配置的超时时间后自动休眠",
+        "ERROR_SLEEPED": "媒体系统因错误进入休眠",
+    }
     _BOOL_FIELDS = {
         "audio_cue": ("set_audio_cue_enable", "get_audio_cue_enable"),
         "internal_capture_audio_to_agent": ("set_internal_capture_audio_data_to_agent_enable", "get_internal_capture_audio_data_to_agent_enable"),
@@ -1677,11 +1731,11 @@ class MediaSystemPlugin:
             },
             "wakeup_response": {
                 "type": "string", "maxLength": 256,
-                "description": "唤醒后使用的回复文本，不是唤醒词；最长 256 个字符。",
+                "description": "语音唤醒后的回复文本，不是唤醒词；最长 256 个字符。卡片的 wakeup 指令不会播放此文本。",
             },
             "sleep_response": {
                 "type": "string", "maxLength": 256,
-                "description": "进入休眠时使用的回复文本；最长 256 个字符。",
+                "description": "语音休眠时的回复文本；最长 256 个字符。卡片的 sleep 指令不会播放此文本。",
             },
             "audio_cue": {
                 "type": "boolean",
@@ -1718,19 +1772,19 @@ class MediaSystemPlugin:
         }
         return {
             "name": "media_system", "type": "actuator", "multiInstance": False,
-            "description": "管理 Bumi 媒体 Agent：查询状态和配置、控制唤醒/休眠/重启，以及暂停或恢复麦克风、扬声器和视频采集通道。",
+            "description": "管理 Bumi EDU 的音视频交互 Agent：查询运行状态/错误和配置，读取唤醒词，控制 Agent 唤醒/休眠/重启，以及暂停或恢复麦克风、扬声器和视频采集通道。本卡片不负责直接播放文本或音频。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
                         "enum": ["status", "get_config", "set_config", "get_wake_words", "wakeup", "sleep", "restart", "pause", "resume"],
-                        "description": "status=查媒体 Agent 状态；get/set_config=查/改配置；get_wake_words=查唤醒词；wakeup/sleep/restart=唤醒/休眠/重启媒体 Agent；pause/resume=暂停/恢复 stream 指定的媒体通道。",
+                        "description": "status=查 Agent 状态/原因/错误；get_config/set_config=查改媒体配置；get_wake_words=只读唤醒词；wakeup/sleep/restart=控制媒体 Agent；pause/resume=控制 stream 指定的数据通道。",
                     },
                     "config": {
                         "type": "object", "properties": config_props,
                         "additionalProperties": False, "minProperties": 1,
-                        "description": "set_config 专用，请填写 JSON，例如 {\"audio_cue\":true,\"timeout_ms\":30000}；可填一个或多个字段，未填写项保持不变。",
+                        "description": "仅 set_config 使用。填写 JSON 对象，如 {\"audio_cue\":true,\"timeout_ms\":30000} 或 {\"wakeup_response\":\"我在\"}；只修改已填写字段。response 是回复词，不是唤醒词。",
                     },
                     "stream": {
                         "type": "string",
@@ -1740,15 +1794,15 @@ class MediaSystemPlugin:
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "status": {"params": [], "description": "查询媒体 Agent 当前状态、状态变化原因和系统错误。"},
-                    "get_config": {"params": [], "description": "读取卡片支持的全部媒体配置。"},
-                    "set_config": {"params": ["config"], "description": "修改 config 中填写的一个或多个配置，并回读修改后的完整配置。"},
-                    "get_wake_words": {"params": [], "description": "读取当前唤醒词；不能通过此操作修改唤醒词。"},
-                    "wakeup": {"params": [], "description": "唤醒 Bumi 媒体 Agent，使其进入可语音交互状态；返回 accepted 后调用 status 确认。"},
-                    "sleep": {"params": [], "description": "让 Bumi 媒体 Agent 休眠，语音交互将暂停；返回 accepted 后调用 status 确认。"},
-                    "restart": {"params": [], "description": "重启 Bumi 媒体 Agent，期间音视频交互会暂时中断；之后调用 status 确认恢复。"},
-                    "pause": {"params": ["stream"], "description": "暂停 Bumi 的 stream 通道：麦克风采集、扬声器播放、视频采集或全部。"},
-                    "resume": {"params": ["stream"], "description": "恢复之前暂停的 Bumi stream 通道，使相应采集或播放继续。"},
+                    "status": {"params": [], "description": "查询媒体 Agent 当前状态、最近变化原因和系统错误。error.code=0 通常表示没有系统错误。"},
+                    "get_config": {"params": [], "description": "读取本卡片支持的全部媒体配置；仅查询，不产生唤醒、播报或通道切换。"},
+                    "set_config": {"params": ["config"], "description": "修改 JSON 中填写的字段并回读完整配置。示例：{\"audio_cue\":true,\"timeout_ms\":30000}。"},
+                    "get_wake_words": {"params": [], "description": "只读当前唤醒词和便于查看的 @ 后中文短语；SDK 不支持用此卡片修改唤醒词。"},
+                    "wakeup": {"params": [], "description": "用控制指令将媒体 Agent 切到 WAKEUPED；不会播放 wakeup_response。返回 accepted 仅表示指令已发出，请查看 media_status 或再调用 status 确认。"},
+                    "sleep": {"params": [], "description": "用控制指令将媒体 Agent 切到 SLEEPED，并暂停正常语音交互；不会播放 sleep_response。返回 accepted 仅表示指令已发出。"},
+                    "restart": {"params": [], "description": "重启音视频交互 Agent，期间语音和视频交互会暂时中断；返回 accepted 后再调用 status 确认恢复。"},
+                    "pause": {"params": ["stream"], "description": "暂停选定数据通道：audio_capture 停麦克风采集，audio_playback 停扬声器播放，video_capture 停视频采集，all 全部暂停。不会让整个 Agent 休眠。"},
+                    "resume": {"params": ["stream"], "description": "恢复之前暂停的选定通道；不会自动唤醒处于 SLEEPED 的媒体 Agent。"},
                 },
             },
         }
@@ -1766,14 +1820,47 @@ class MediaSystemPlugin:
             if action == "stop":
                 return {"state": "idle"}
             if action == "get_config":
-                return {"state": "completed", "config": self._get_config()}
+                return {
+                    "state": "completed",
+                    "config": self._get_config(),
+                    "meaning": "current MediaController configuration; response fields are replies, not wake words",
+                }
             if action == "get_wake_words":
-                return {"state": "completed", "wake_words": str(self._ctrl.get_wakeup_words())}
+                raw_words = str(self._ctrl.get_wakeup_words())
+                display_words = []
+                for line in raw_words.splitlines():
+                    if "@" not in line:
+                        continue
+                    phrase = line.rsplit("@", 1)[1].strip()
+                    if phrase and phrase not in display_words:
+                        display_words.append(phrase)
+                return {
+                    "state": "completed",
+                    "wake_words": raw_words,
+                    "display_wake_words": display_words,
+                    "meaning": "read-only wake-word grammar; display_wake_words contains the readable phrases after @",
+                }
             if action == "set_config":
                 return self._set_config(args.get("config"))
             if action in ("wakeup", "sleep", "restart"):
                 self._rate_limited_call(getattr(self._ctrl, action))
-                return {"state": "accepted", "requested": action, "media_status": self._status()}
+                response = {
+                    "state": "accepted",
+                    "requested": action,
+                    "meaning": "control command was sent; media_status is an immediate observation, not a completion guarantee",
+                    "media_status": self._status(),
+                }
+                if action in ("wakeup", "sleep"):
+                    response.update({
+                        "audio_response_expected": False,
+                        "audio_response_note": (
+                            "command wakeup/sleep does not play the configured response text; "
+                            "use status.reason to distinguish command and voice transitions"
+                        ),
+                    })
+                else:
+                    response["next_step"] = "call status after restart to confirm that the media Agent recovered"
+                return response
             if action in ("pause", "resume"):
                 return self._stream_control(action, args.get("stream"))
             return {"state": "error", "error": f"unknown action: {action}"}
@@ -1783,12 +1870,20 @@ class MediaSystemPlugin:
     def _status(self) -> dict:
         status = self._ctrl.get_system_status()
         error = self._ctrl.get_system_error()
+        status_name = _enum_name(status.value)
+        reason_name = _enum_name(status.reason)
+        error_code = int(error.code)
         return {
             "state": "completed", "observed_at_ms": _wall_time_ms(),
             "source": "Noetix MediaController/CycloneDDS",
-            "status": _enum_name(status.value), "reason": _enum_name(status.reason),
+            "status": status_name,
+            "status_meaning": self._STATUS_MEANINGS.get(status_name, "SDK returned an unknown media Agent status"),
+            "reason": reason_name,
+            "reason_meaning": self._REASON_MEANINGS.get(reason_name, "SDK returned an unknown status-change reason"),
             "status_header": _header_payload(getattr(status, "header", None)),
-            "error": {"code": int(error.code), "message": str(error.message),
+            "error": {"code": error_code, "message": str(error.message),
+                      "has_error": error_code != 0,
+                      "meaning": "code=0 means no MediaController system error was reported",
                       "header": _header_payload(getattr(error, "header", None))},
         }
 
@@ -1853,7 +1948,15 @@ class MediaSystemPlugin:
                 setters.append((setter, value))
         for setter, value in setters:
             self._rate_limited_call(setter, value)
-        return {"state": "completed", "config": self._get_config()}
+        return {
+            "state": "completed",
+            "changed_fields": sorted(config),
+            "config": self._get_config(),
+            "meaning": (
+                "requested fields were set and the complete configuration was read back; "
+                "wakeup_response/sleep_response are voice-interaction replies and are not played by command wakeup/sleep"
+            ),
+        }
 
     def _stream_control(self, action: str, stream: Any) -> dict:
         if stream not in ("audio_capture", "audio_playback", "video_capture", "all"):
@@ -1862,7 +1965,16 @@ class MediaSystemPlugin:
         selected = ("audio_capture", "audio_playback", "video_capture") if stream == "all" else (stream,)
         for item in selected:
             self._rate_limited_call(getattr(self._ctrl, f"{prefix}_{item}"))
-        return {"state": "completed", "action": action, "streams": list(selected)}
+        return {
+            "state": "completed",
+            "action": action,
+            "streams": list(selected),
+            "meaning": (
+                "selected media data paths were paused; the media Agent work status was not changed"
+                if action == "pause" else
+                "selected media data paths were resumed; a sleeping media Agent was not automatically awakened"
+            ),
+        }
 
 
 class DiagnosticsPlugin:
