@@ -9,9 +9,11 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
         python3-colcon-common-extensions \
         python3-pip \
-        ros-humble-rmw-cyclonedds-cpp \
         build-essential \
         cmake && \
+    if ! /bin/bash -lc "source /opt/ros/humble/setup.bash && ros2 pkg prefix rmw_cyclonedds_cpp >/dev/null 2>&1"; then \
+        apt-get install -y --no-install-recommends --allow-unauthenticated ros-humble-rmw-cyclonedds-cpp; \
+    fi && \
     rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /tmp/t800-requirements.txt
