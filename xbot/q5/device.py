@@ -227,12 +227,12 @@ class MicPlugin:
 
 
 class SpeakerPlugin:
-    """Play perception's PCM AudioChunk stream on the Q5 developer-container ALSA output."""
+    """Play any canvas-connected PCM AudioChunk stream on Q5 ALSA output."""
 
     def __init__(self, plugin_config, namespace, executor, client):
         del namespace, executor
         self._client = client
-        self._topic = str(plugin_config.get("input_topic", "/perception/tts"))
+        self._topic = ""
         self._device = str(plugin_config.get("device", "hw:2,0"))
         self._rate = int(plugin_config.get("sample_rate_hz", 16000))
         self._channels = int(plugin_config.get("channels", 1))
@@ -251,15 +251,25 @@ class SpeakerPlugin:
     def get_tool(self):
         return {
             "name": "speaker", "type": "actuator", "multiInstance": False,
-            "description": "Q5 speaker. Connect a perception TTS audio/pcm-16k output to play live speech.",
-            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
-            "topic_in": [{"topic": self._topic, "format": "audio/pcm-16k"}],
+            "description": "Q5 speaker. Connect any audio/pcm-16k output (TTS, microphone, or other PCM source) to play it live.",
+            "inputSchema": {"type": "object", "properties": {
+                "action": {"type": "string", "enum": ["start", "stop", "info"]},
+                "input_topic": {"type": "string", "description": "PCM 16 kHz AudioChunk topic from the canvas connection"},
+            }, "required": ["action"], "additionalProperties": False},
+            # Leave the topic unresolved until canvas supplies input_topic.
+            "topic_in": [{"format": "audio/pcm-16k"}],
         }
 
     def start(self, input_topic=None):
-        if self._running:
+        del input_topic
+        # The canvas calls dispatch(start, {input_topic}) when an audio output
+        # is connected. Do not subscribe to a hard-coded TTS topic at boot.
+        return
+
+    def _start_for_topic(self, requested: str) -> None:
+        if self._running and requested == self._topic:
             return
-        requested = str(input_topic or self._topic)
+        self.stop()
         try:
             self._start_playback(requested)
             print(f"[SpeakerPlugin] playback subscribed <- {self._topic}", flush=True)
@@ -333,12 +343,17 @@ class SpeakerPlugin:
 
     def dispatch(self, action, args):
         if action == "start":
-            self.start(args.get("input_topic"))
+            requested = str(args.get("input_topic") or "")
+            if not requested:
+                return {"ok": False, "code": "INPUT_TOPIC_REQUIRED",
+                        "message": "Connect an audio/pcm-16k output to speaker before starting playback"}
+            self._start_for_topic(requested)
         elif action == "stop":
             self.stop()
         if action in ("start", "stop", "info"):
             return {"state": "running" if self._running else "idle",
-                    "topic_in": [{"topic": self._topic, "format": "audio/pcm-16k"}],
+                    "topic_in": ([{"topic": self._topic, "format": "audio/pcm-16k"}]
+                                 if self._topic else [{"format": "audio/pcm-16k"}]),
                     "playback": {"device": self._device, "sample_rate_hz": self._output_rate,
                                  "channels": self._output_channels},
                     "frames_received": self._frames_received,

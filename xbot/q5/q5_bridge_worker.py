@@ -294,6 +294,11 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
             elif isinstance(cmd, dict) and cmd.get("kind") == "speaker_config":
                 if speaker_sub is not None:
                     node.destroy_subscription(speaker_sub)
+                while True:
+                    try:
+                        speaker_q.get_nowait()
+                    except Exception:
+                        break
                 speaker_sub = node.create_subscription(
                     # Perception TTS publishes BEST_EFFORT for low latency.
                     # A RELIABLE request is incompatible and receives zero
