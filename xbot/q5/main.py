@@ -95,8 +95,11 @@ class Q5DeviceBundle:
 
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
+            start = getattr(p, "start", None)
+            if not callable(start):
+                continue
             try:
-                p.start()
+                start()
             except Exception as e:
                 print(f"[bundle] Plugin {i} ({type(p).__name__}) start() FAILED: {e}", flush=True)
                 import traceback
@@ -105,8 +108,11 @@ class Q5DeviceBundle:
 
     def stop_all(self) -> None:
         for p in self._plugins:
+            stop = getattr(p, "stop", None)
+            if not callable(stop):
+                continue
             try:
-                p.stop()
+                stop()
             except Exception:
                 pass
         print("[bundle] All plugins stopped")
