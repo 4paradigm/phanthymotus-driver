@@ -1,0 +1,114 @@
+syntax = "proto3";
+
+package adam_control;
+
+service RobotControl {
+  rpc SetMode (SetModeRequest) returns (SetModeResponse);
+  rpc SetStandMotion (SetStandMotionRequest) returns (SetStandMotionResponse);
+  rpc SetStandCarryBox (SetCarryBoxRequest) returns (SetCarryBoxResponse);
+  rpc SetStandAction (SetActionRequest) returns (SetActionResponse);
+  rpc SetStandDynamic (SetDynamicStandRequest) returns (SetDynamicStandResponse);
+  rpc SetSpeed (SetSpeedRequest) returns (SetSpeedResponse);
+  rpc AutoUnigaitCOM (SetUnigaitCOMRequest) returns (SetUnigaitCOMResponse);
+  rpc SetErrorClear (SetErrorClearRequest) returns (SetErrorClearResponse);
+  rpc GetStandList (GetStandListRequest) returns (GetStandListResponse);
+  rpc GetRobotState (GetRobotStateRequest) returns (GetRobotStateResponse);
+}
+
+// --- Mode ---
+message SetModeRequest {
+  int32 mode = 1;
+}
+message SetModeResponse {
+  int32 code = 1;
+  string message = 2;
+}
+
+// --- Stand Motion (predefined pose) ---
+message SetStandMotionRequest {
+  int32 motion_id = 1;
+}
+message SetStandMotionResponse {
+  int32 code = 1;
+  string message = 2;
+}
+
+// --- Carry Box ---
+message SetCarryBoxRequest {
+  bool enable = 1;
+}
+message SetCarryBoxResponse {
+  int32 code = 1;
+  string message = 2;
+}
+
+// --- Stand Action (gesture/dance) ---
+message SetActionRequest {
+  int32 action_id = 1;
+}
+message SetActionResponse {
+  int32 code = 1;
+  string message = 2;
+}
+
+// --- Dynamic Stand ---
+message SetDynamicStandRequest {
+  float pitch = 1;
+  float roll = 2;
+  float yaw = 3;
+  float height = 4;
+}
+message SetDynamicStandResponse {
+  int32 code = 1;
+  string message = 2;
+}
+
+// --- Speed (locomotion) ---
+message SetSpeedRequest {
+  float vx = 1;
+  float vy = 2;
+  float vyaw = 3;
+}
+message SetSpeedResponse {
+  int32 code = 1;
+  string message = 2;
+}
+
+// --- Unigait COM ---
+message SetUnigaitCOMRequest {
+  bool enable = 1;
+}
+message SetUnigaitCOMResponse {
+  int32 code = 1;
+  string message = 2;
+}
+
+// --- Error Clear ---
+message SetErrorClearRequest {}
+message SetErrorClearResponse {
+  int32 code = 1;
+  string message = 2;
+}
+
+// --- Get Stand List ---
+message GetStandListRequest {}
+message GetStandListResponse {
+  int32 code = 1;
+  string message = 2;
+  repeated StandItem motions = 3;
+  repeated StandItem actions = 4;
+}
+message StandItem {
+  int32 id = 1;
+  string name = 2;
+}
+
+// --- Get Robot State ---
+message GetRobotStateRequest {}
+message GetRobotStateResponse {
+  int32 code = 1;
+  string message = 2;
+  int32 mode = 3;
+  int32 gait_state = 4;
+  float battery_percentage = 5;
+}
