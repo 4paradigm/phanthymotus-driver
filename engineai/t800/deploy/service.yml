@@ -9,7 +9,6 @@ engineai-t800:
     - /dev:/dev
     - /opt/engineai/native_sdk:/opt/engineai/native_sdk
   environment:
-    - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
     - ROS_LOCALHOST_ONLY=0
     - NETWORK_INTERFACE=eth0
     - PYTHONUNBUFFERED=1

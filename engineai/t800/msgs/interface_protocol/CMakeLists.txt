@@ -8,6 +8,8 @@ find_package(std_msgs REQUIRED)
 
 file(GLOB MSG_FILES RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}" "msg/*.msg")
 file(GLOB SRV_FILES RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}" "srv/*.srv")
+list(FILTER MSG_FILES EXCLUDE REGEX "(^|/)\\._")
+list(FILTER SRV_FILES EXCLUDE REGEX "(^|/)\\._")
 rosidl_generate_interfaces(${PROJECT_NAME}
   ${MSG_FILES}
   ${SRV_FILES}
