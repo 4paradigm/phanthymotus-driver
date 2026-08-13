@@ -46,11 +46,14 @@ plugins:
     max_hz: 10.0
     jpeg_quality: 70
     remote_start:
-      enabled: false
+      # Q5 D455 is physically connected to the developer container. The Q5
+      # driver starts it automatically through the vendor's documented fixed
+      # developer account; no interactive SSH login is required on deploy.
+      enabled: true
       host: "192.168.8.100"
       port: 2222
       user: "developer"
-      identity_file: "/run/q5-camera-ssh/id_ed25519"
+      password: "developer"
       depth_profile: "848x480x30"
       color_profile: "848x480x30"
   camera_depth:

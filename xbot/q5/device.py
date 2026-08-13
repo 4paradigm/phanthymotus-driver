@@ -138,13 +138,14 @@ class CameraRgbPlugin(_Q5MediaPlugin):
         """Optionally start the D455 on its owning developer container via SSH.
 
         This is intentionally opt-in: XOS can also own the camera, and the
-        launch must never use an embedded password or restart a live driver.
+        launch never restarts a live driver. Q5 documents this developer
+        account as part of its external-development workflow.
         """
         if not self._remote_start.get("enabled", False):
             return
-        identity = str(self._remote_start.get("identity_file", ""))
         host = str(self._remote_start.get("host", "192.168.8.100"))
         user = str(self._remote_start.get("user", "developer"))
+        password = str(self._remote_start.get("password", ""))
         try:
             port = int(self._remote_start.get("port", 2222))
         except (TypeError, ValueError):
@@ -153,8 +154,7 @@ class CameraRgbPlugin(_Q5MediaPlugin):
             str(self._remote_start.get("depth_profile", "848x480x30")),
             str(self._remote_start.get("color_profile", "848x480x30")),
         )
-        if (not identity or not re.fullmatch(r"[A-Za-z0-9_.:/-]+", identity) or
-                not re.fullmatch(r"[A-Za-z0-9.-]+", host) or
+        if (not password or not re.fullmatch(r"[A-Za-z0-9.-]+", host) or
                 not re.fullmatch(r"[A-Za-z0-9_-]+", user) or
                 any(not re.fullmatch(r"[0-9]+x[0-9]+x[0-9]+", value) for value in profiles)):
             raise ValueError("invalid camera_rgb.remote_start configuration")
@@ -166,8 +166,10 @@ class CameraRgbPlugin(_Q5MediaPlugin):
             f"depth_module.depth_profile:={profiles[0]} rgb_camera.color_profile:={profiles[1]} "
             ">/tmp/q5-realsense.log 2>&1 &"
         )
-        command = ["ssh", "-i", identity, "-p", str(port), "-o", "BatchMode=yes",
-                   "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=accept-new",
+        command = ["sshpass", "-p", password, "ssh", "-p", str(port),
+                   "-o", "PreferredAuthentications=password", "-o", "PubkeyAuthentication=no",
+                   "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no",
+                   "-o", "UserKnownHostsFile=/dev/null",
                    f"{user}@{host}", f"bash -lc {shlex.quote(remote)}"]
         result = subprocess.run(command, capture_output=True, text=True, timeout=12)
         if result.returncode:

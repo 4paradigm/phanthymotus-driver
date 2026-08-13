@@ -27,6 +27,7 @@ RUN apt-get -o Acquire::Retries=5 update && \
         python3-numpy \
         python3-opencv \
         openssh-client \
+        sshpass \
         python3-colcon-common-extensions \
         cmake \
         build-essential \

@@ -8,8 +8,6 @@ xbot-q5:
   volumes:
     - /dev:/dev
     - /opt/phanthy-motus/data:/opt/phanthy-motus/data
-    # Read-only SSH key used only when camera_rgb.remote_start.enabled=true.
-    - /opt/phanthy-motus/q5-camera-ssh:/run/q5-camera-ssh:ro
   environment:
     - ROS_DOMAIN_ID=211
     - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
