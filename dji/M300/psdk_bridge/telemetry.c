@@ -335,7 +335,7 @@ int telemetry_get_json(char *buf, size_t buflen) {
         lat_json, lon_json,
         gps_valid ? "true" : "false",
         gps_alt, gps_alt, (double)s_alt_fused, (double)s_alt_home, relative_alt,
-        local_x, local_y, world_z,
+        local_y, local_x, world_z,
         q0, q1, q2, q3, yaw, pitch, roll, yaw_rad, pitch_rad, roll_rad,
         (double)s_velocity.data.x, (double)s_velocity.data.y, (double)s_velocity.data.z,
         battery_pct_json, battery_volt_json,
