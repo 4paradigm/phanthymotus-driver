@@ -232,7 +232,15 @@ fi
 
 select_mirror
 
-docker run --privileged --rm "${BINFMT_IMAGE}" --install arm64
+# ARM64 hosts (including Apple Silicon Docker Desktop) build linux/arm64
+# natively. Registering binfmt there is unnecessary and may fail because
+# Docker Desktop does not expose /proc/sys/fs/binfmt_misc/register.
+HOST_ARCH="$(uname -m)"
+if [ "${HOST_ARCH}" != "arm64" ] && [ "${HOST_ARCH}" != "aarch64" ]; then
+    docker run --privileged --rm "${BINFMT_IMAGE}" --install arm64
+else
+    echo "[info] Native ${HOST_ARCH} host — skipping ARM64 binfmt setup."
+fi
 
 # ── 构建 ──────────────────────────────────────────────────────────────────
 declare -a BUILT_INDICES
@@ -276,8 +284,10 @@ for idx in "${SELECTED_INDICES[@]}"; do
         done
     fi
 
+    # Use the builder selected by the active Docker context. Docker Desktop
+    # commonly names it desktop-linux; forcing `default` crosses contexts and
+    # fails before the build starts.
     docker buildx build \
-        --builder default \
         --platform linux/arm64 \
         ${NO_CACHE} \
         --build-arg "PYPI_MIRROR=${PYPI_MIRROR}" \

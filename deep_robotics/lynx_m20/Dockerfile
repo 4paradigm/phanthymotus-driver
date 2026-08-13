@@ -11,7 +11,7 @@ RUN git clone https://github.com/DeepRoboticsLab/deep-robotics-msg.git /tmp/deep
     rm -rf /tmp/deep-robotics-msg /lynx_m20_ws/src/deep-robotics-msg/.git
 WORKDIR /work
 COPY common/ /work/common/
-COPY main.py device.py basic_server.py config.yaml driver.yaml /work/
+COPY main.py device.py basic_server.py config.yaml driver.yaml /work/deep_robotics/lynx_m20/
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp ROS_LOCALHOST_ONLY=0 PYTHONUNBUFFERED=1 PYTHONPATH=/work
 EXPOSE 15716
-CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /lynx_m20_ws/install/setup.bash && python3 /work/main.py"]
+CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /lynx_m20_ws/install/setup.bash && python3 /work/deep_robotics/lynx_m20/main.py"]
