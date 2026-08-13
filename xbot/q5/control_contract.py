@@ -19,8 +19,14 @@ def q5_active_status(client) -> dict:
         raw = reader("robot_status") or {}
         # QueryState is a vendor read-only fallback when the transient
         # /xbot_state topic has not yet delivered a sample to this process.
-        if not raw.get("available", False):
-            raw = reader("query_state") or raw
+        query = reader("query_state") or {}
+        # The transient /xbot_state stream can retain an old ERROR sample when
+        # the vendor service has already completed a READY/ACTIVE transition.
+        # Prefer a fresh control-state service result in that case.
+        if (query.get("fresh") and query.get("state") in Q5_CONTROL_READY_STATES):
+            raw = query
+        elif not raw.get("available", False):
+            raw = query or raw
     except Exception:
         raw = {}
     state = raw.get("state")
@@ -38,12 +44,17 @@ def q5_active_status(client) -> dict:
 Q5_CONTROL_READY_STATES = (3, 4)
 
 
-def q5_is_control_ready(client) -> tuple[bool, dict]:
+def q5_is_control_ready(client, allow_prepared: bool = False) -> tuple[bool, dict]:
     """Allow commands only when the fresh Q5 FSM reports READY or ACTIVE."""
     status = q5_active_status(client)
     status["control_ready_states"] = list(Q5_CONTROL_READY_STATES)
-    return bool(status["available"] and status["fresh"] and
-                status["state"] in Q5_CONTROL_READY_STATES), status
+    ready = bool(status["available"] and status["fresh"] and
+                 status["state"] in Q5_CONTROL_READY_STATES)
+    if (not ready and allow_prepared and bool(getattr(client, "direct_control_prepared", False))
+            and (not status.get("fresh") or status.get("state") is None)):
+        status["prepared_evidence"] = True
+        ready = True
+    return ready, status
 
 
 # Compatibility alias for cards that have not yet adopted the clearer name.
