@@ -1,0 +1,11 @@
+id: deep-robotics-lynx-m20-driver
+name: DEEP Robotics Lynx M20 Driver
+category: driver
+hardware_provider: deep-robotics
+hardware_model: "lynx-m20"
+image_name: deep-robotics-lynx-m20
+port: 15716
+mcp_url: "http://localhost:15716/mcp"
+description: "Lynx M20 official ROS 2/Fast DDS motion and perception interfaces, native basic_server TCP/UDP control, and Standard/Pro capability isolation"
+build_context_extras:
+  - ../../common
