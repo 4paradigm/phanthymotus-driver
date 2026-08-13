@@ -1,0 +1,29 @@
+dji-m300:
+  image: __IMAGE__
+  # Agent Core derives the driver container name as embodied-<driver_id>.
+  # The registered M300 driver id is dji-matrice300.
+  container_name: embodied-dji-matrice300
+  network_mode: host
+  ipc: host
+  privileged: true
+  volumes:
+    - /dev:/dev
+    - /opt/phanthy-motus/data:/opt/phanthy-motus/data
+    - /run/udev:/run/udev:ro
+    - /sys:/host-sys:rw
+    - /sys/kernel/config:/sys/kernel/config
+    - /dev/usb-ffs:/dev/usb-ffs
+    - /usr/lib/aarch64-linux-gnu/tegra:/usr/lib/aarch64-linux-gnu/tegra:ro
+  environment:
+    # Explicit IPv4 avoids an IPv6 ::1 connection attempt on Nano, where IPv6
+    # is normally disabled in the driver namespace.
+    - AGENT_CORE_URL=https://127.0.0.1:15678
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - PYTHONUNBUFFERED=1
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: unless-stopped

@@ -1,0 +1,32 @@
+{
+  "name": "DJI Matrice 300 RTK",
+  "type": "drone",
+  "manufacturer": "DJI",
+  "model": "Matrice 300 RTK",
+  "payload": {
+    "mount_position": "Payload Port No.1",
+    "note": "Camera, zoom, thermal and gimbal capabilities are determined by the installed payload."
+  },
+  "gimbal_range": {
+    "pitch": [-90, 30],
+    "yaw": [-180, 180],
+    "note": "Conservative software limits; the payload reports the final limits through PSDK."
+  },
+  "max_speed_ms": 23,
+  "max_altitude_m": 7000,
+  "max_flight_time_min": 55,
+  "max_wind_resistance_ms": 15,
+  "psdk_interface": "Direct M300 PSDK USB CDC",
+  "psdk_uart0": "/dev/ttyACM0",
+  "psdk_uart1": "/dev/ttyACM0",
+  "waypoint_version": "V2 (not exposed until a V2 mission builder is implemented)",
+  "perception_directions": ["front", "back", "left", "right", "up", "down"],
+  "perception_sources": [
+    "front_left", "front_right",
+    "back_left", "back_right",
+    "left_left", "left_right",
+    "right_left", "right_right",
+    "up_left", "up_right",
+    "down_left", "down_right"
+  ]
+}
