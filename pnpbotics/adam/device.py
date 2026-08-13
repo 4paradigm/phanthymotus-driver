@@ -222,10 +222,18 @@ class StatePlugin:
         self._lowstate_sub = None
         self._handstate_sub = None
         if HAS_PND_SDK:
-            self._lowstate_sub = ChannelSubscriber("rt/lowstate", LowState_)
-            self._lowstate_sub.Init(handler=self._on_lowstate, queueLen=10)
-            self._handstate_sub = ChannelSubscriber("rt/handstate", HandState_)
-            self._handstate_sub.Init(handler=self._on_handstate, queueLen=10)
+            try:
+                self._lowstate_sub = ChannelSubscriber("rt/lowstate", LowState_)
+                self._lowstate_sub.Init(handler=self._on_lowstate, queueLen=10)
+            except Exception as e:
+                print(f"[state] DDS lowstate subscribe failed: {e}")
+                self._lowstate_sub = None
+            try:
+                self._handstate_sub = ChannelSubscriber("rt/handstate", HandState_)
+                self._handstate_sub.Init(handler=self._on_handstate, queueLen=10)
+            except Exception as e:
+                print(f"[state] DDS handstate subscribe failed: {e}")
+                self._handstate_sub = None
 
     def _on_lowstate(self, msg):
         self._node.update_state(msg)
@@ -599,10 +607,18 @@ class HandPlugin:
         self._lock = threading.Lock()
 
         if HAS_PND_SDK:
-            self._hand_pub = ChannelPublisher("rt/handcmd", HandCmd_)
-            self._hand_pub.Init()
-            self._hand_sub = ChannelSubscriber("rt/handstate", HandState_)
-            self._hand_sub.Init(handler=self._on_handstate, queueLen=5)
+            try:
+                self._hand_pub = ChannelPublisher("rt/handcmd", HandCmd_)
+                self._hand_pub.Init()
+            except Exception as e:
+                print(f"[hand] DDS handcmd publisher failed: {e}")
+                self._hand_pub = None
+            try:
+                self._hand_sub = ChannelSubscriber("rt/handstate", HandState_)
+                self._hand_sub.Init(handler=self._on_handstate, queueLen=5)
+            except Exception as e:
+                print(f"[hand] DDS handstate subscribe failed: {e}")
+                self._hand_sub = None
 
     def _on_handstate(self, msg):
         with self._lock:

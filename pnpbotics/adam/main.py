@@ -174,7 +174,7 @@ def _start_registration(mcp_port: int, name: str, category: str):
 def main():
     global _bundle
 
-    network_iface = sys.argv[1] if len(sys.argv) > 1 else "eth0"
+    network_iface = sys.argv[1] if len(sys.argv) > 1 else None
     cfg           = _load_config()
     namespace     = _resolve_namespace(cfg)
     mcp_port      = int(cfg.get("mcp_port", 15702))
@@ -186,8 +186,11 @@ def main():
     dds_domain_id = int(cfg.get("dds_domain_id", 1))
     try:
         from pndbotics_sdk_py.core.channel import ChannelFactoryInitialize
-        ChannelFactoryInitialize(dds_domain_id, network_iface)
-        print(f"[adam] DDS initialized (domain={dds_domain_id}, iface={network_iface})")
+        if network_iface:
+            ChannelFactoryInitialize(dds_domain_id, network_iface)
+        else:
+            ChannelFactoryInitialize(dds_domain_id)
+        print(f"[adam] DDS initialized (domain={dds_domain_id}, iface={network_iface or 'auto'})")
     except ImportError:
         print("[adam] WARNING: pndbotics_sdk_py not found, DDS features disabled")
     except Exception as e:
