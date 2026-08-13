@@ -83,6 +83,7 @@ class T800DeviceBundle:
         from device import (
             DancePlugin,
             GesturePlugin,
+            HeartbeatStatusPlugin,
             JointBridgePlugin,
             JointOverridePlugin,
             JointPlanPlugin,
@@ -106,6 +107,7 @@ class T800DeviceBundle:
             self._plugins.append(state)
 
         plugin_types = (
+            ("heartbeat_status", HeartbeatStatusPlugin, (config, namespace, ros2)),
             ("locomotion", LocomotionPlugin, (config, namespace, ros2, state)),
             ("motion_mode", MotionModePlugin, (config, namespace, ros2, state)),
             ("joint_plan", JointPlanPlugin, (config, namespace, ros2, state)),

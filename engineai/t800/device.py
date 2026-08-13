@@ -505,6 +505,117 @@ class StatePlugin:
                 publisher.publish(_json_message(self._derived_snapshot(name)))
 
 
+class HeartbeatStatusPlugin:
+    def __init__(self, config: dict, namespace: str, ros2):
+        self._config = config
+        self._ns = namespace
+        self._timeout = float(config["ros"].get("source_timeout_sec", 1.0))
+        self._node = Node("t800_heartbeat_status", context=ros2.ctx_robot)
+        self._pub_node = Node("t800_heartbeat_status_pub", context=ros2.ctx_core)
+        ros2.executor_robot.add_node(self._node)
+        ros2.executor_core.add_node(self._pub_node)
+        self._publisher = self._pub_node.create_publisher(
+            String, f"/{namespace}/state/heartbeat_status", _RELIABLE
+        )
+        self._lock = threading.RLock()
+        self._latest: dict | None = None
+        self._updated: float | None = None
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "heartbeat_status",
+            "type": "sensor",
+            "multiInstance": False,
+            "readOnly": True,
+            "description": "显示 T800 ROS2 节点心跳、健康状态和数据新鲜度",
+            "inputSchema": action_schema(
+                {
+                    "status": ([], "返回适合画布验收的简洁心跳状态"),
+                    "debug": ([], "返回原始心跳字段，供研发排查"),
+                },
+                {},
+                "心跳查询动作",
+            ),
+            "topic_out": [{"topic": f"/{self._ns}/state/heartbeat_status", "format": "data/json"}],
+        }
+
+    def start(self) -> None:
+        from interface_protocol.msg import Heartbeat
+
+        self._node.create_subscription(
+            Heartbeat, self._config["topics"]["heartbeat"], self._on_heartbeat, _BEST_EFFORT
+        )
+        self._pub_node.create_timer(0.2, self._publish)
+
+    def stop(self) -> None:
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("heartbeat_status", "status", "info", "start"):
+            return self._snapshot()
+        if action == "debug":
+            return self._debug_snapshot()
+        if action == "stop":
+            return {"state": "idle"}
+        return {"error": f"unknown heartbeat action: {action}"}
+
+    def _on_heartbeat(self, msg) -> None:
+        with self._lock:
+            self._latest = {
+                "node_name": str(msg.node_name),
+                "node_status": str(msg.node_status),
+                "startup_timestamp": int(msg.startup_timestamp),
+                "error_code": int(msg.error_code),
+                "error_message": str(msg.error_message),
+            }
+            self._updated = time.monotonic()
+
+    def _snapshot(self) -> dict:
+        with self._lock:
+            latest = dict(self._latest or {})
+            updated = self._updated
+        age_sec = None if updated is None else max(0.0, time.monotonic() - updated)
+        stale = updated is None or age_sec > self._timeout
+        if updated is None:
+            return {
+                "state": "no_data",
+                "health": "unknown",
+                "node": None,
+                "message": "no heartbeat data",
+                "age_sec": None,
+                "timestamp_ms": _now_ms(),
+            }
+        error_code = int(latest.get("error_code", 0))
+        message = str(latest.get("error_message") or latest.get("node_status") or "ok")
+        return {
+            "state": "stale" if stale else "running",
+            "health": "error" if error_code else "ok",
+            "node": latest.get("node_name"),
+            "message": message,
+            "age_sec": round(age_sec, 1),
+            "timestamp_ms": _now_ms(),
+        }
+
+    def _debug_snapshot(self) -> dict:
+        with self._lock:
+            latest = dict(self._latest or {})
+            updated = self._updated
+        age_sec = None if updated is None else max(0.0, time.monotonic() - updated)
+        stale = updated is None or age_sec > self._timeout
+        if updated is None:
+            return {
+                "state": "no_data", "node_name": None, "node_status": None,
+                "startup_timestamp": None, "error_code": None, "error_message": None,
+                "age_sec": None, "stale": True, "timestamp_ms": _now_ms(),
+            }
+        latest.update({"state": "stale" if stale else "running", "age_sec": age_sec,
+                       "stale": stale, "timestamp_ms": _now_ms()})
+        return latest
+
+    def _publish(self) -> None:
+        self._publisher.publish(_json_message(self._snapshot()))
+
+
 class LocomotionPlugin:
     def __init__(self, config: dict, namespace: str, ros2, state: StatePlugin):
         self._config = config
