@@ -112,21 +112,9 @@ class MicPlugin:
         }
 
     def start(self):
-        if self._running:
-            return
-        _ensure_remote_audio_tools()
-        command = (
-            "exec arecord -D " + shlex.quote(self._device) +
-            f" -f S16_LE -r {self._rate} -c {self._channels} -t raw"
-        )
-        self._process = subprocess.Popen(
-            _q5_ssh_args(command), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            bufsize=0,
-        )
-        self._running = True
-        self._thread = threading.Thread(target=self._pump, daemon=True, name="q5_mic_stream")
-        self._thread.start()
-        print(f"[MicPlugin] capturing Q5 ALSA {self._device} -> {self._topic}", flush=True)
+        # Audio hardware is opt-in. The developer container may need a network
+        # package install, so never make bundle startup depend on it.
+        return
 
     def _pump(self):
         # 100 ms frames are the same size emitted by perception TTS.
@@ -153,7 +141,18 @@ class MicPlugin:
     def dispatch(self, action, args):
         del args
         if action == "start":
-            self.start()
+            try:
+                _ensure_remote_audio_tools()
+                command = ("exec arecord -D " + shlex.quote(self._device) +
+                           f" -f S16_LE -r {self._rate} -c {self._channels} -t raw")
+                self._process = subprocess.Popen(
+                    _q5_ssh_args(command), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    bufsize=0)
+                self._running = True
+                self._thread = threading.Thread(target=self._pump, daemon=True, name="q5_mic_stream")
+                self._thread.start()
+            except Exception as exc:
+                return {"ok": False, "code": "AUDIO_SETUP_FAILED", "message": str(exc)}
         elif action == "stop":
             self.stop()
         if action in ("start", "stop", "info"):
@@ -196,10 +195,8 @@ class SpeakerPlugin:
         self.stop()
         _ensure_remote_audio_tools()
         self._topic = requested
-        command = (
-            "exec aplay -D " + shlex.quote(self._device) +
-            f" -f S16_LE -r {self._rate} -c {self._channels} -t raw"
-        )
+        command = ("exec aplay -D " + shlex.quote(self._device) +
+                   f" -f S16_LE -r {self._rate} -c {self._channels} -t raw")
         self._process = subprocess.Popen(_q5_ssh_args(command), stdin=subprocess.PIPE,
                                          stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, bufsize=0)
         configure = getattr(self._client, "configure_speaker", None)
@@ -237,7 +234,10 @@ class SpeakerPlugin:
 
     def dispatch(self, action, args):
         if action == "start":
-            self.start(args.get("input_topic"))
+            try:
+                self.start(args.get("input_topic"))
+            except Exception as exc:
+                return {"ok": False, "code": "AUDIO_SETUP_FAILED", "message": str(exc)}
         elif action == "stop":
             self.stop()
         if action in ("start", "stop", "info"):
