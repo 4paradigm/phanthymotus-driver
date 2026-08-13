@@ -364,9 +364,21 @@ class M20MotionPlugin:
         return tool("motion", "actuator", "山猫 M20 官方运动状态、步态和速度控制", action_schema(self.ACTIONS, {
             "transport": {"type": "string", "enum": ["native", "ros2"], "default": "native", "description": "控制通道；推荐 native，axis 仅支持 native"},
             "gait": {"type": "string", "enum": list(GAITS), "description": "basic=基础，standard_stairs=标准楼梯，agile_flat=敏捷平地，agile_stairs=敏捷楼梯"},
-            "x": {"type": "number", "description": "前后方向；axis 模式范围 [-1, 1]"},
-            "y": {"type": "number", "description": "左右方向；axis 模式范围 [-1, 1]"},
-            "yaw": {"type": "number", "description": "偏航方向；axis 模式范围 [-1, 1]"},
+            "x": {
+                "type": "number", "minimum": -1, "maximum": 1,
+                "examples": [1, -1],
+                "description": "Forward/backward normalized axis [-1, 1]. Recommended test input: +/-1. Omitted means 0.",
+            },
+            "y": {
+                "type": "number", "minimum": -1, "maximum": 1,
+                "examples": [0.5, -0.5],
+                "description": "Left/right normalized axis [-1, 1]. Hardware-tested reliable input: |y| >= 0.5. Omitted means 0.",
+            },
+            "yaw": {
+                "type": "number", "minimum": -1, "maximum": 1,
+                "examples": [0.4, -0.4],
+                "description": "Normalized yaw axis [-1, 1]. Recommended input: +/-0.4; |yaw|=1 produced about 45 degrees in hardware testing. Omitted means 0.",
+            },
             "duration": {"type": "number", "minimum": 0, "maximum": 60, "default": 1, "description": "持续秒数；留空默认 1 秒，1-60 秒后自动停止，明确输入 0 表示持续到显式 stopmotion"},
     }))
     def start(self): pass
