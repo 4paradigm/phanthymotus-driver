@@ -1168,19 +1168,37 @@ def _external_video_subprocess(namespace: str, camera_id: int):
     media.set_external_custom_video_data_to_agent_enable(True)
     _time.sleep(0.2)
 
-    # ── Open USB camera ──
-    cap = cv2.VideoCapture(camera_id)
-    if not cap.isOpened():
-        print(f"[external_video] Cannot open camera {camera_id}", flush=True)
-        import os as __os
+    # ── Open USB camera (auto-detect: explicit id → video4/2/0 → any /dev/videoN) ──
+    if camera_id >= 0:
+        candidate_ids = [camera_id] + [i for i in (4, 2, 0) if i != camera_id]
+    else:
+        candidate_ids = [4, 2, 0]
+    import os as __os
+    for d in range(10):
+        if __os.path.exists(f"/dev/video{d}") and d not in candidate_ids:
+            candidate_ids.append(d)
+
+    cap = None
+    used_id = -1
+    for cid in candidate_ids:
+        c = cv2.VideoCapture(cid)
+        if c.isOpened():
+            cap = c
+            used_id = cid
+            break
+        c.release()
+
+    if cap is None:
+        print(f"[external_video] Cannot open camera (tried: {candidate_ids})", flush=True)
         for d in range(10):
             p = f"/dev/video{d}"
             if __os.path.exists(p):
                 print(f"    available: {p}", flush=True)
         return
+
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"[external_video] camera {camera_id}: {w}x{h}", flush=True)
+    print(f"[external_video] camera /dev/video{used_id}: {w}x{h}", flush=True)
 
     # ── ROS2 publisher for external consumers ──
     _rclpy.init()
@@ -1387,8 +1405,7 @@ class VideoPlugin:
                     },
                     "camera_id": {
                         "type": "integer",
-                        "description": "USB camera device ID (default 4, only for push_from_camera)",
-                        "minimum": 0,
+                        "description": "USB camera device ID (omit or -1 = auto-detect video4→2→0→any)",
                     },
                 },
                 "required": ["action"],
@@ -1500,7 +1517,7 @@ class VideoPlugin:
     # ── external-video: push_from_camera (subprocess) ─────────────────────
 
     def _do_push_from_camera(self, args: dict) -> dict:
-        camera_id = int(args.get("camera_id", 4))  # Default /dev/video4 (Realsense on Jetson)
+        camera_id = int(args.get("camera_id", -1))  # -1 = auto-detect (video4→2→0→any /dev/videoN)
 
         # Stop any existing push
         self._do_stop_external_push()
