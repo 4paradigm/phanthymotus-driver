@@ -540,6 +540,12 @@ class ArmControlPlugin:
                 "Refusing arm motion: multiple q5_body_command publishers are active on /wr1_controller/commands",
                 status=status,
             )
+        if status["other_publishers"]:
+            return _arm_failure(
+                "COMPETING_BODY_PUBLISHER",
+                "Refusing arm motion: another node publishes /wr1_controller/commands; stop MPC or switch vendor control ownership first",
+                status=status,
+            )
         if not bool(getattr(self._client, "direct_control_prepared", False)):
             return _arm_failure(
                 "DIRECT_CONTROL_NOT_PREPARED",
