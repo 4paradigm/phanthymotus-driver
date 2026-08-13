@@ -57,6 +57,8 @@ plugins:
     enabled: true
   nav:
     enabled: true
+  home:
+    enabled: true
   chat:
     enabled: true
   voice_chat:

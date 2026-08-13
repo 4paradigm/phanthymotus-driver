@@ -28,6 +28,7 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   TtsPlugin           (actuator)           — 语音合成
   VoicePlayActuatorPlugin (actuator)      — 音频播放控制(文件/URL/TTS)
   NavPlugin           (actuator)           — 底盘导航控制
+  HomePlugin          (actuator)           — 充电桩管理与回桩
   ChatPlugin          (actuator)           — 语音交互开关
   VoiceChatActuatorPlugin (actuator)      — 语音对话开关
   MotorStatePlugin    (sensor)             — 全身21电机状态(2Hz)
@@ -4598,9 +4599,9 @@ class VoicePlayActuatorPlugin:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class NavPlugin:
-    """底盘导航控制 — 自主导航/遥控/旋转/回桩"""
+    """底盘导航控制 — 自主导航/遥控/旋转"""
 
-    _ACP_ACTIONS = frozenset(("move_to", "rotate", "rotate_to", "go_home"))
+    _ACP_ACTIONS = frozenset(("move_to", "rotate", "rotate_to"))
     _POLL_INTERVAL = 1.0
     _STALL_TIMEOUT = 60.0
 
@@ -4608,6 +4609,8 @@ class NavPlugin:
         self._ns = namespace
         self._ros2 = ros2
         self._slamtec = slamtec_client
+        self._poll_lock = threading.Lock()
+        self._active_poll: str | None = None
 
         # cmd_vel publisher for direct velocity control (domain 0)
         self._vel_node = Node("tianyi2_nav_vel", context=ros2.ctx_tianyi)
@@ -4618,12 +4621,12 @@ class NavPlugin:
         return {
             "name": "nav",
             "type": "actuator",
-            "description": "天轶2.0 底盘导航 — 自主导航到目标点/方向遥控/旋转/回桩充电 (Slamtec轮式底盘)",
+            "description": "天轶2.0 底盘导航 — 自主导航到目标点/方向遥控/旋转 (Slamtec轮式底盘)",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string",
-                               "enum": ["move_to", "move_by", "rotate", "rotate_to", "go_home", "cancel", "get_pose"],
+                               "enum": ["move_to", "move_by", "rotate", "rotate_to", "cancel", "get_pose"],
                                "description": "导航动作"},
                     "x": {"type": "number", "description": "目标x坐标(米)"},
                     "y": {"type": "number", "description": "目标y坐标(米)"},
@@ -4638,7 +4641,7 @@ class NavPlugin:
                 },
                 "required": ["action"],
                 "x-completion": {
-                    "actions": ["move_to", "rotate", "rotate_to", "go_home"],
+                    "actions": ["move_to", "rotate", "rotate_to"],
                     "timeout": 180,
                 },
                 "x-action-params": {
@@ -4650,8 +4653,6 @@ class NavPlugin:
                                "description": "原地旋转指定角度(度)，系统自动等待完成"},
                     "rotate_to": {"params": ["angle"],
                                   "description": "原地旋转到绝对角度(度)，系统自动等待完成"},
-                    "go_home": {"params": [],
-                                "description": "自主导航回充电桩，系统自动等待到达"},
                     "cancel": {"params": [],
                              "description": "取消当前导航动作"},
                     "get_pose": {"params": [],
@@ -4680,6 +4681,8 @@ class NavPlugin:
             y = args.get("y", 0)
             speed = args.get("speed")
             result = self._slamtec.move_to(x, y, speed_ratio=speed)
+            if result.get("error"):
+                return {"state": "error", "api_result": result}
             action_id = self._start_poll(action, result, {"x": x, "y": y})
             resp = {"state": "navigating", "target": {"x": x, "y": y}, "api_result": result}
             if action_id:
@@ -4697,6 +4700,8 @@ class NavPlugin:
             angle_deg = args.get("angle", 0)
             angle_rad = _deg2rad(angle_deg)
             result = self._slamtec.rotate(angle_rad)
+            if result.get("error"):
+                return {"state": "error", "api_result": result}
             action_id = self._start_poll(action, result, {"angle": angle_deg})
             resp = {"state": "rotating", "angle": angle_deg, "api_result": result}
             if action_id:
@@ -4707,22 +4712,18 @@ class NavPlugin:
             angle_deg = args.get("angle", 0)
             angle_rad = _deg2rad(angle_deg)
             result = self._slamtec.rotate_to(angle_rad)
+            if result.get("error"):
+                return {"state": "error", "api_result": result}
             action_id = self._start_poll(action, result, {"angle": angle_deg})
             resp = {"state": "rotating_to", "angle": angle_deg, "api_result": result}
             if action_id:
                 resp["action_id"] = action_id
             return resp
 
-        elif action == "go_home":
-            result = self._slamtec.go_home()
-            action_id = self._start_poll(action, result, {})
-            resp = {"state": "going_home", "api_result": result}
-            if action_id:
-                resp["action_id"] = action_id
-            return resp
-
         elif action == "cancel":
             result = self._slamtec.cancel_current_action()
+            with self._poll_lock:
+                self._active_poll = None
             # Also stop cmd_vel
             if self._vel_pub:
                 try:
@@ -4744,6 +4745,8 @@ class NavPlugin:
         """Start ACP polling thread for a Slamtec action. Returns action_id or None."""
         from uuid import uuid4
         action_id = f"nav_{action}_{uuid4().hex[:8]}"
+        with self._poll_lock:
+            self._active_poll = action_id
         threading.Thread(
             target=self._poll_loop,
             args=(action_id, action, context),
@@ -4759,19 +4762,30 @@ class NavPlugin:
 
         while True:
             time.sleep(self._POLL_INTERVAL)
+            with self._poll_lock:
+                if self._active_poll != action_id:
+                    return
             elapsed = time.time() - t0
 
             # Check if action is still running
             try:
-                current = self._slamtec.get_current_action()
-            except Exception:
-                current = {}
+                current = self._slamtec.get_nav_status()
+            except Exception as exc:
+                current = {"error": str(exc)}
 
-            # Slamtec status: action_status 0=waiting, 1=running, 2=finished, 3=paused, 4=error
-            status = current.get("action_status") if current else None
+            if current.get("error"):
+                if elapsed > 180:
+                    _acp_notify(action_id, "error", {
+                        "action": action, "error": current["error"],
+                        "elapsed": round(elapsed, 1), **context,
+                    }, "nav")
+                    return
+                continue
 
-            if status == 2:  # finished
-                result_code = current.get("result", 0)
+            # Slamtec ActionState: 0=NewBorn, 1=Working, 3=Paused, 4=Done.
+            status = current.get("action_state")
+            if status == 4:
+                result_code = current.get("result")
                 if result_code == 0:
                     _acp_notify(action_id, "completed", {
                         "action": action, "elapsed": round(elapsed, 1), **context,
@@ -4783,22 +4797,17 @@ class NavPlugin:
                     }, "nav")
                 return
 
-            if status == 4:  # error
+            if status is None or status == -1:
+                if elapsed <= 3.0:
+                    continue
                 _acp_notify(action_id, "error", {
-                    "action": action, "error": "action_error",
+                    "action": action, "error": "action_disappeared",
                     "elapsed": round(elapsed, 1), **context,
                 }, "nav")
                 return
 
-            if status is None and elapsed > 3.0:
-                # No current action — may have completed between polls
-                _acp_notify(action_id, "completed", {
-                    "action": action, "elapsed": round(elapsed, 1), **context,
-                }, "nav")
-                return
-
-            # Stall detection (move_to/go_home only)
-            if action in ("move_to", "go_home"):
+            # Stall detection for position navigation only.
+            if action == "move_to":
                 try:
                     pose = self._slamtec.get_pose()
                     if last_pose:
@@ -4824,6 +4833,194 @@ class NavPlugin:
                 _acp_notify(action_id, "error", {
                     "action": action, "error": "timeout", "elapsed": 180, **context,
                 }, "nav")
+                return
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HomePlugin (actuator)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class HomePlugin:
+    """充电桩管理与回桩控制。回桩动作通过 ACP 异步报告最终结果。"""
+
+    _POLL_INTERVAL = 1.0
+    _STALL_TIMEOUT = 60.0
+    _ACTION_TIMEOUT = 180.0
+    _MISSING_ACTION_TIMEOUT = 3.0
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2, slamtec_client):
+        self._ns = namespace
+        self._slamtec = slamtec_client
+        self._poll_lock = threading.Lock()
+        self._active_poll: str | None = None
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "home",
+            "type": "actuator",
+            "description": "天轶2.0 充电桩管理与回桩 — 管理充电桩、回桩充电或返回上桩点",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": [
+                        "list_docks", "register_dock", "set_dock", "delete_dock",
+                        "clear_docks", "get_dock", "go_home", "go_home_no_dock", "cancel",
+                    ], "description": "充电桩或回桩动作"},
+                    "display_name": {"type": "string", "description": "新充电桩显示名称"},
+                    "dock_id": {"type": "string", "description": "充电桩 UUID"},
+                    "pose": {"type": "object", "description": "Pose3D: x,y,z,yaw,pitch,roll"},
+                    "back_to_landing": {"type": "boolean", "description": "上桩失败后回到上桩点"},
+                    "charging_retry_count": {"type": "integer", "description": "上桩重试次数"},
+                    "move_mode": {"type": "integer", "enum": [0, 2], "description": "回桩运动模式: 0自由导航, 2轨道优先"},
+                },
+                "required": ["action"],
+                "x-completion": {
+                    "actions": ["go_home", "go_home_no_dock"],
+                    "timeout": 180,
+                },
+                "x-action-params": {
+                    "list_docks": {"params": [], "description": "列出所有已注册充电桩"},
+                    "register_dock": {"params": ["display_name"], "description": "在机器人当前位置注册充电桩"},
+                    "set_dock": {"params": ["dock_id", "pose"], "description": "按 dock_id 或 Pose3D 设置当前充电桩"},
+                    "delete_dock": {"params": ["dock_id"], "description": "删除指定充电桩"},
+                    "clear_docks": {"params": [], "description": "清空所有充电桩"},
+                    "get_dock": {"params": [], "description": "获取当前充电桩位置"},
+                    "go_home": {"params": [], "description": "回桩并尝试充电，系统自动等待完成"},
+                    "go_home_no_dock": {"params": [], "description": "返回上桩点但不上桩，系统自动等待完成"},
+                    "cancel": {"params": [], "description": "取消当前回桩动作"},
+                },
+                "x-hooks": {"on_interrupt_motion": {"action": "cancel"}},
+            },
+        }
+
+    def start(self):
+        pass
+
+    def stop(self):
+        with self._poll_lock:
+            self._active_poll = None
+
+    @staticmethod
+    def _error(result: dict) -> bool:
+        return isinstance(result, dict) and bool(result.get("error"))
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "list_docks":
+            return {"docks": self._slamtec.get_home_docks()}
+        if action == "register_dock":
+            name = str(args.get("display_name", "")).strip()
+            if not name:
+                return {"error": "display_name is required"}
+            return {"dock": self._slamtec.register_home_dock(name)}
+        if action == "set_dock":
+            dock_id = str(args.get("dock_id", "")).strip()
+            pose = args.get("pose")
+            if dock_id:
+                docks = self._slamtec.get_home_docks()
+                entries = docks.get("raw", docks) if isinstance(docks, dict) else docks
+                if isinstance(entries, list):
+                    selected = next((d for d in entries if str(d.get("id")) == dock_id), None)
+                    if selected and selected.get("pose"):
+                        pose = selected["pose"]
+            if not isinstance(pose, dict):
+                return {"error": "dock_id or pose is required"}
+            return {"api_result": self._slamtec.set_home_pose(pose), "pose": pose}
+        if action == "delete_dock":
+            dock_id = str(args.get("dock_id", "")).strip()
+            if not dock_id:
+                return {"error": "dock_id is required"}
+            return {"api_result": self._slamtec.delete_home_dock(dock_id)}
+        if action == "clear_docks":
+            return {"api_result": self._slamtec.clear_home_docks()}
+        if action == "get_dock":
+            return {"pose": self._slamtec.get_home_pose()}
+        if action in ("go_home", "go_home_no_dock"):
+            result = self._slamtec.go_home(
+                dock=action == "go_home",
+                back_to_landing=args.get("back_to_landing"),
+                charging_retry_count=args.get("charging_retry_count"),
+                move_mode=args.get("move_mode"),
+            )
+            if self._error(result):
+                return {"state": "error", "api_result": result}
+            action_id = self._start_poll(action, result, {})
+            response = {"state": "going_home", "api_result": result}
+            if action_id:
+                response["action_id"] = action_id
+            return response
+        if action == "cancel":
+            result = self._slamtec.cancel_action()
+            with self._poll_lock:
+                self._active_poll = None
+            return {"state": "cancelled", "api_result": result}
+        if action in ("start", "info"):
+            return {"state": "ready"}
+        return {"error": f"unknown action: {action}"}
+
+    def _start_poll(self, action: str, api_result: dict, context: dict) -> str:
+        from uuid import uuid4
+        action_id = f"home_{action}_{uuid4().hex[:8]}"
+        with self._poll_lock:
+            self._active_poll = action_id
+        threading.Thread(target=self._poll_loop, args=(action_id, action, context), daemon=True).start()
+        return action_id
+
+    def _poll_loop(self, action_id: str, action: str, context: dict):
+        t0 = time.time()
+        last_pose = None
+        last_move_time = t0
+        while True:
+            time.sleep(self._POLL_INTERVAL)
+            with self._poll_lock:
+                if self._active_poll != action_id:
+                    return
+            elapsed = time.time() - t0
+            try:
+                current = self._slamtec.get_nav_status()
+            except Exception as exc:
+                current = {"error": str(exc)}
+            if current.get("error"):
+                if elapsed > self._ACTION_TIMEOUT:
+                    _acp_notify(action_id, "error", {"action": action, "error": current["error"], **context}, "home")
+                    return
+                continue
+
+            state = current.get("action_state")
+            result_code = current.get("result")
+            if state == 4:
+                if result_code == 0:
+                    _acp_notify(action_id, "completed", {"action": action, "elapsed": round(elapsed, 1), **context}, "home")
+                else:
+                    _acp_notify(action_id, "error", {"action": action, "error": current.get("reason") or f"result_code={result_code}", "elapsed": round(elapsed, 1), **context}, "home")
+                return
+            if state == 3:
+                if elapsed > self._ACTION_TIMEOUT:
+                    _acp_notify(action_id, "error", {"action": action, "error": "timeout", "elapsed": self._ACTION_TIMEOUT, **context}, "home")
+                    return
+                continue
+            if state is None or state == -1:
+                # A successful action is reported as Done/result=0. Never infer
+                # success merely because the chassis no longer exposes an action.
+                if elapsed > self._MISSING_ACTION_TIMEOUT:
+                    _acp_notify(action_id, "error", {"action": action, "error": "action_disappeared", "elapsed": round(elapsed, 1), **context}, "home")
+                    return
+            if action in ("go_home", "go_home_no_dock"):
+                try:
+                    pose = self._slamtec.get_pose()
+                    if last_pose is None:
+                        last_pose = pose
+                    dx = pose.get("x", 0) - last_pose.get("x", 0)
+                    dy = pose.get("y", 0) - last_pose.get("y", 0)
+                    if dx * dx + dy * dy > 0.01:
+                        last_pose = pose
+                        last_move_time = time.time()
+                    elif time.time() - last_move_time > self._STALL_TIMEOUT:
+                        _acp_notify(action_id, "error", {"action": action, "error": "stall_timeout", "elapsed": round(elapsed, 1), **context}, "home")
+                        return
+                except Exception:
+                    pass
+            if elapsed > self._ACTION_TIMEOUT:
+                _acp_notify(action_id, "error", {"action": action, "error": "timeout", "elapsed": self._ACTION_TIMEOUT, **context}, "home")
                 return
 
 
