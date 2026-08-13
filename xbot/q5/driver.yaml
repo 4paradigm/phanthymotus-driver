@@ -6,4 +6,4 @@ hardware_model: "q5"
 image_name: robotera-q5
 port: 15708
 mcp_url: "http://localhost:15708/mcp"
-description: "XBot Q5 — 已验证的底盘、双臂、灵巧手、头部、状态、电池与音频卡"
+description: "XBot Q5 — 控制、状态、电池、音频、D455 RGB/深度与 SLAM 地图点云卡"

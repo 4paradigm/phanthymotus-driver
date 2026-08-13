@@ -36,6 +36,7 @@ class BridgeWorker:
         self._ctx = mp.get_context("spawn")
         self._cmd_q = self._ctx.Queue()
         self._sensor_q = self._ctx.Queue()
+        self._media_q = self._ctx.Queue(maxsize=4)
         self._proc = None
         self._debug = debug
         self._namespace = namespace
@@ -44,7 +45,7 @@ class BridgeWorker:
         """Spawn the bridge subprocess."""
         self._proc = self._ctx.Process(
             target=_run_bridge_subprocess,
-            args=(self._cmd_q, self._sensor_q, self._debug, self._namespace),
+            args=(self._cmd_q, self._sensor_q, self._media_q, self._debug, self._namespace),
             name="q5_bridge_worker", daemon=True,
         )
         self._proc.start()
@@ -54,6 +55,13 @@ class BridgeWorker:
         """Push a sensor snapshot to the bridge subprocess (non-blocking)."""
         try:
             self._sensor_q.put_nowait(snap)
+        except Exception:
+            pass
+
+    def push_media(self, media: dict):
+        """Queue a processed media frame without blocking control state updates."""
+        try:
+            self._media_q.put_nowait(media)
         except Exception:
             pass
 
@@ -70,7 +78,8 @@ class BridgeWorker:
         print("[BridgeWorker] subprocess stopped")
 
 
-def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, debug: bool, namespace: str):
+def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queue,
+                           debug: bool, namespace: str):
     """Subprocess entry point — runs in separate process with own DDS domain."""
     # ── Environment: Force Domain 42 + FastDDS in subprocess ────────────────────
     os.environ["ROS_DOMAIN_ID"] = "42"
@@ -87,7 +96,10 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, debug: bool, nam
     import rclpy.qos
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-    from std_msgs.msg import String
+    from std_msgs.msg import String, UInt8MultiArray
+    from sensor_msgs.msg import CompressedImage, Image
+    import array
+    import struct
 
     print(f"[BridgeWorker:pid={os.getpid()}] subprocess ready (Domain 42/FastDDS)", flush=True)
 
@@ -118,6 +130,9 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, debug: bool, nam
     pub_fault = _pub(f"{prefix}/faults")
     pub_hand = _pub(f"{prefix}/hand_sensor")
     pub_odom = _pub(f"{prefix}/odom")
+    pub_rgb = node.create_publisher(CompressedImage, f"{prefix}/q5/camera/rgb", QOS_SENSOR)
+    pub_depth = node.create_publisher(Image, f"{prefix}/q5/camera/depth", QOS_SENSOR)
+    pub_cloud = node.create_publisher(UInt8MultiArray, f"{prefix}/q5/slam/pointcloud", QOS_SENSOR)
 
     node.get_logger().info(f"bridge publishers ready for namespace={namespace}")
     executor.add_node(node)
@@ -189,6 +204,28 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, debug: bool, nam
         if robot_status:
             _publish_robot_status(robot_status)
 
+    def _dispatch_media(media):
+        kind = media.get("kind")
+        if kind == "rgb":
+            out = CompressedImage()
+            out.format = "jpeg"
+            out.data = media["data"]
+            pub_rgb.publish(out)
+        elif kind == "depth":
+            out = Image()
+            out.height = int(media["height"])
+            out.width = int(media["width"])
+            out.encoding = str(media["encoding"])
+            out.is_bigendian = int(media["is_bigendian"])
+            out.step = int(media["step"])
+            out.data = media["data"]
+            pub_depth.publish(out)
+        elif kind == "pointcloud":
+            out = UInt8MultiArray()
+            payload = struct.pack("<II", int(media["point_step"]), int(media["count"])) + media["data"]
+            out.data = array.array("B", payload)
+            pub_cloud.publish(out)
+
     # ── Main loop ──────────────────────────────────────────────────────────────
     running = True
     last_log = time.time()
@@ -213,6 +250,15 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, debug: bool, nam
                 node.get_logger().debug(f"bridge cmd: {cmd}")
         except Exception:
             pass
+
+        newest_media = None
+        while True:
+            try:
+                newest_media = media_q.get_nowait()
+            except Exception:
+                break
+        if newest_media is not None:
+            _dispatch_media(newest_media)
 
         # Process sensor snapshot (non-blocking, latest only)
         try:

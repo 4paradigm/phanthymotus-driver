@@ -40,3 +40,17 @@ plugins:
     device: "plughw:2,0"
   battery:
     enabled: true
+  camera_rgb:
+    enabled: true
+    source_topic: "/camera/camera/color/image_raw"
+    max_hz: 10.0
+    jpeg_quality: 70
+  camera_depth:
+    enabled: true
+    source_topic: "/camera/camera/aligned_depth_to_color/image_raw"
+    max_hz: 10.0
+  slam_pointcloud:
+    enabled: true
+    source_topic: "/slam/map_cmap"
+    max_hz: 2.0
+    max_points: 10000

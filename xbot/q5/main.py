@@ -71,6 +71,9 @@ class Q5DeviceBundle:
             ("state", "StatePlugin"),
             ("battery", "BatteryPlugin"),
             ("audio", "AudioPlugin"),
+            ("camera_rgb", "CameraRgbPlugin"),
+            ("camera_depth", "CameraDepthPlugin"),
+            ("slam_pointcloud", "SlamPointCloudPlugin"),
         ]
 
         for key, cls_name in _PLUGIN_MAP:
@@ -295,6 +298,7 @@ def main():
     # Bridge Worker subprocess — publishes sensor snapshots to Domain 42/FastDDS
     bridge_worker = bridge_worker_mod.BridgeWorker(namespace, debug=False)
     bridge_worker.start()
+    sdk_client.publish_media = bridge_worker.push_media
     print("[bundle] BridgeWorker subprocess started (Domain 42/FastDDS)")
 
     # Background thread: periodically push full_snapshot to bridge worker
