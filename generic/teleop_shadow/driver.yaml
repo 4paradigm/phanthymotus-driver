@@ -1,0 +1,9 @@
+id: teleop-shadow-driver
+name: Generic Teleop Shadow Diagnostics
+category: driver
+hardware_provider: generic
+hardware_model: "teleop-shadow"
+image_name: teleop-shadow
+port: 15711
+mcp_url: "http://localhost:15711/mcp"
+description: "Robot-free Quest/WebRTC protocol, fencing and recording final-dispatch diagnostics; permanently zero hardware actuation"

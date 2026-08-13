@@ -13,6 +13,7 @@ Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server t
 | `unitree/g1` | Unitree G1 Humanoid | 15701 | Locomotion, arm control, mic, speaker, LED, state monitoring |
 | `engineai/t800` | EngineAI T800 Development Edition | 15708 | ROS2/Native SDK, full state, dance/gesture sequences, virtual gamepad, locomotion and low-level joint control |
 | `phanthy/remote_control` | Remote Control Bridge | 15710 | Remote control relay |
+| [`generic/teleop_shadow`](generic/teleop_shadow/README.md) | Robot-free OpenXR/WebRTC endpoint | 15711 | Driver-owned Meta/PICO capture, strict Frame v1, fenced Shadow sessions and watchdog diagnostics; zero actuation |
 
 ## Quick Start
 
