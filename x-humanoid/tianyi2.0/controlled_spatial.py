@@ -231,15 +231,13 @@ class ControlledSpatialPlugin:
             "type": "actuator",
             "multiInstance": False,
             "description": (
+                "⚠ 受保护操作需要密码：执行以下操作前，必须先向操作者索取密码并通过 password 参数传入——"
+                "start_mapping, untag_place, delete_map, add_wall, remove_wall, clear_walls, "
+                "add_track, remove_track, clear_tracks, add_area, edit_area, remove_area, "
+                "clear_areas, add_artifact_poi, remove_artifact_poi, clear_artifact_pois。\n\n"
                 "Controlled mapping & navigation via Slamtec底盘 HTTP REST API — "
                 "start/stop mapping, tag places, list/delete maps, load map, navigate between tags, "
-                "manage virtual walls/tracks/areas (artifacts).\n\n"
-                "⚠ 受保护操作：以下操作需要操作者密码才能执行（需向操作者索取密码后传入 "
-                "password 参数）：start_mapping, untag_place, delete_map, add_wall, "
-                "remove_wall, clear_walls, add_track, remove_track, clear_tracks, "
-                "add_area, edit_area, remove_area, clear_areas, add_artifact_poi, "
-                "remove_artifact_poi, clear_artifact_pois。\n"
-                "当 agent 需要执行这些操作时，应先询问操作者提供密码，再在 password 参数中传入。"
+                "manage virtual walls/tracks/areas (artifacts)."
             ),
             "configSchema": {
                 "type": "object",
@@ -324,7 +322,7 @@ class ControlledSpatialPlugin:
                     "sensor_type": {"type": "string", "description": "Sensor disable area: sensor types e.g. '[0,3]' (0=bump,1=fall,2=ultrasonic,3=depth)"},
                     "restricted_robots_number_limit": {"type": "integer", "description": "Restricted area: max simultaneous robots"},
                     "restricted_scheduling_points": {"type": "string", "description": "Restricted area: scheduling points JSON string"},
-                    "password": {"type": "string", "description": "操作者密码，执行受保护操作（start_mapping, untag_place, delete_map, add_wall, remove_wall, clear_walls, add_track, remove_track, clear_tracks, add_area, edit_area, remove_area, clear_areas, add_artifact_poi, remove_artifact_poi, clear_artifact_pois）时必须提供。请向操作者索取密码。"},
+                    "password": {"type": "string", "description": "🔒 向操作者索取密码后传入。执行受保护操作（start_mapping, untag_place, delete_map, add_wall, remove_wall, clear_walls, add_track, remove_track, clear_tracks, add_area, edit_area, remove_area, clear_areas, add_artifact_poi, remove_artifact_poi, clear_artifact_pois）时必须提供。"},
                 },
                 "required": ["action"],
                 "x-completion": {
@@ -332,13 +330,13 @@ class ControlledSpatialPlugin:
                     "timeout": 180
                 },
                 "x-action-params": {
-                    "start_mapping": {"params": ["map_name", "password"], "description": "Start SLAM mapping with given map name. 🔒 Requires operator password — ask the operator for the password and pass it in the 'password' field."},
+                    "start_mapping": {"params": ["map_name", "password"], "description": "🔒 向操作者索取密码后传入 password 字段。Start SLAM mapping with given map name."},
                     "stop_mapping": {"params": [], "description": "Stop mapping and save the map"},
                     "tag_place": {"params": ["name", "description"], "description": "Tag current position with a semantic name"},
-                    "untag_place": {"params": ["name", "password"], "description": "Remove a place tag. 🔒 Requires operator password — ask the operator for the password and pass it in the 'password' field."},
+                    "untag_place": {"params": ["name", "password"], "description": "🔒 向操作者索取密码后传入 password 字段。Remove a place tag."},
                     "list_tags": {"params": [], "description": "List all tags in current map with relative positions"},
                     "list_maps": {"params": [], "description": "List all saved maps"},
-                    "delete_map": {"params": ["map_name", "password"], "description": "Delete a map and its associated data. 🔒 Requires operator password — ask the operator for the password and pass it in the 'password' field."},
+                    "delete_map": {"params": ["map_name", "password"], "description": "🔒 向操作者索取密码后传入 password 字段。Delete a map and its associated data."},
                     "load_map": {"params": ["map_name"], "description": "Load a map (robot must be at map origin)"},
                     "unload_map": {"params": [], "description": "Unload current map from chassis, clear map and all artifacts. Sets active map to idle."},
                     "navigate_to_tag": {"params": ["tag_name", "speed", "mode", "fail_retry_count", "acceptable_precision", "strategy", "ignore_dynamic_obstacles", "precise"], "description": "Navigate to a tagged place. System waits for arrival and notifies upon completion."},
@@ -346,25 +344,25 @@ class ControlledSpatialPlugin:
                     "stop_nav": {"params": [], "description": "Stop and cancel navigation"},
                     # Artifact — 虚拟墙
                     "list_walls": {"params": [], "description": "List all virtual walls on current map"},
-                    "add_wall": {"params": ["start_x", "start_y", "end_x", "end_y", "password"], "description": "Add a virtual wall (forbidden line segment on the map). 🔒 Requires operator password — ask the operator for the password and pass it in the 'password' field."},
-                    "remove_wall": {"params": ["artifact_id", "password"], "description": "Remove a virtual wall by ID. 🔒 Requires operator password — ask the operator for the password and pass it in the 'password' field."},
-                    "clear_walls": {"params": ["password"], "description": "Remove all virtual walls. 🔒 Requires operator password — ask the operator for the password and pass it in the 'password' field."},
+                    "add_wall": {"params": ["start_x", "start_y", "end_x", "end_y", "password"], "description": "🔒 向操作者索取密码后传入 password 字段。Add a virtual wall (forbidden line segment on the map)."},
+                    "remove_wall": {"params": ["artifact_id", "password"], "description": "🔒 向操作者索取密码后传入 password 字段。Remove a virtual wall by ID."},
+                    "clear_walls": {"params": ["password"], "description": "🔒 向操作者索取密码后传入 password 字段。Remove all virtual walls."},
                     # Artifact — 虚拟轨道
                     "list_tracks": {"params": [], "description": "List all virtual tracks on current map"},
-                    "add_track": {"params": ["start_x", "start_y", "end_x", "end_y", "password"], "description": "Add a virtual track (path constraint line segment). 🔒 Requires operator password — ask the operator for the password and pass it in the 'password' field."},
-                    "remove_track": {"params": ["artifact_id", "password"], "description": "Remove a virtual track by ID. 🔒 Requires operator password — ask the operator for the password and pass it in the 'password' field."},
-                    "clear_tracks": {"params": ["password"], "description": "Remove all virtual tracks. 🔒 Requires operator password — ask the operator for the password and pass it in the 'password' field."},
+                    "add_track": {"params": ["start_x", "start_y", "end_x", "end_y", "password"], "description": "🔒 向操作者索取密码后传入 password 字段。Add a virtual track (path constraint line segment)."},
+                    "remove_track": {"params": ["artifact_id", "password"], "description": "🔒 向操作者索取密码后传入 password 字段。Remove a virtual track by ID."},
+                    "clear_tracks": {"params": ["password"], "description": "🔒 向操作者索取密码后传入 password 字段。Remove all virtual tracks."},
                     # Artifact — 矩形区域
                     "list_areas": {"params": ["area_usage"], "description": "List rectangle areas of given type (forbidden_area/elevator_area/dangerous_area/coverage_area/maintenance_area/sensor_disable_area/restricted_area)"},
-                    "add_area": {"params": ["area_usage", "start_x", "start_y", "end_x", "end_y", "half_width", "metadata", "escape_distance", "dangerous_area_type", "max_line_speed", "elevator_id", "sensor_type", "restricted_robots_number_limit", "password"], "description": "Add a rectangle area. Metadata auto-built from area-specific params if not provided explicitly. 🔒 Requires operator password — ask the operator for the password and pass it in the 'password' field."},
-                    "edit_area": {"params": ["area_usage", "artifact_id", "start_x", "start_y", "end_x", "end_y", "half_width", "metadata", "password"], "description": "Edit a rectangle area by ID. 🔒 Requires operator password — ask the operator for the password and pass it in the 'password' field."},
-                    "remove_area": {"params": ["area_usage", "artifact_id", "password"], "description": "Remove a rectangle area by ID. 🔒 Requires operator password — ask the operator for the password and pass it in the 'password' field."},
-                    "clear_areas": {"params": ["area_usage", "password"], "description": "Remove all rectangle areas of given type. 🔒 Requires operator password — ask the operator for the password and pass it in the 'password' field."},
+                    "add_area": {"params": ["area_usage", "start_x", "start_y", "end_x", "end_y", "half_width", "metadata", "escape_distance", "dangerous_area_type", "max_line_speed", "elevator_id", "sensor_type", "restricted_robots_number_limit", "password"], "description": "🔒 向操作者索取密码后传入 password 字段。Add a rectangle area. Metadata auto-built from area-specific params if not provided explicitly."},
+                    "edit_area": {"params": ["area_usage", "artifact_id", "start_x", "start_y", "end_x", "end_y", "half_width", "metadata", "password"], "description": "🔒 向操作者索取密码后传入 password 字段。Edit a rectangle area by ID."},
+                    "remove_area": {"params": ["area_usage", "artifact_id", "password"], "description": "🔒 向操作者索取密码后传入 password 字段。Remove a rectangle area by ID."},
+                    "clear_areas": {"params": ["area_usage", "password"], "description": "🔒 向操作者索取密码后传入 password 字段。Remove all rectangle areas of given type."},
                     # Artifact — 地图POI
                     "list_artifact_pois": {"params": [], "description": "List all POIs on current map (Slamtec artifact POIs, separate from local tag_place tags)"},
-                    "add_artifact_poi": {"params": ["display_name", "poi_type", "x", "y", "yaw", "password"], "description": "Add a POI to the map. If x/y/yaw omitted, chassis uses current robot pose and records sensor data for loop-closure adjustment (recommended during mapping). 🔒 Requires operator password — ask the operator for the password and pass it in the 'password' field."},
-                    "remove_artifact_poi": {"params": ["poi_id", "password"], "description": "Remove a POI by UUID. 🔒 Requires operator password — ask the operator for the password and pass it in the 'password' field."},
-                    "clear_artifact_pois": {"params": ["password"], "description": "Remove all POIs from current map. 🔒 Requires operator password — ask the operator for the password and pass it in the 'password' field."},
+                    "add_artifact_poi": {"params": ["display_name", "poi_type", "x", "y", "yaw", "password"], "description": "🔒 向操作者索取密码后传入 password 字段。Add a POI to the map. If x/y/yaw omitted, chassis uses current robot pose and records sensor data for loop-closure adjustment (recommended during mapping)."},
+                    "remove_artifact_poi": {"params": ["poi_id", "password"], "description": "🔒 向操作者索取密码后传入 password 字段。Remove a POI by UUID."},
+                    "clear_artifact_pois": {"params": ["password"], "description": "🔒 向操作者索取密码后传入 password 字段。Remove all POIs from current map."},
                     # Pose & Localization
                     "get_pose": {"params": [], "description": "Get current robot pose (x, y, yaw) from Slamtec chassis"},
                     "get_localization_quality": {"params": [], "description": "Get current localization quality (0-100) from Slamtec chassis"},
