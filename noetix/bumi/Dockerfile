@@ -45,18 +45,17 @@ RUN cd /work/noetix_sdk_bumi && \
     sed -i '/target_include_directories(example/,/^)/s/^/#/' CMakeLists.txt && \
     sed -i '/target_link_libraries(example/,/^)/s/^/#/' CMakeLists.txt
 
-# Build pybind modules (highcontrol_py, lowcontrol_py, mediacontrol_py)
+# Build the pybind modules used by the current cards
 RUN cd /work/noetix_sdk_bumi && \
     mkdir -p build && cd build && \
     cmake .. \
         -DCMAKE_CXX_STANDARD=17 \
         -Dpybind11_DIR=$(python3 -c "import pybind11; print(pybind11.get_cmake_dir())") && \
-    make -j$(nproc) highcontrol_py lowcontrol_py mediacontrol_py && \
+    make -j$(nproc) highcontrol_py mediacontrol_py && \
     echo "[build] pybind modules built successfully"
 
 # Verify .so files exist
 RUN ls /work/noetix_sdk_bumi/build/highcontrol_py*.so && \
-    ls /work/noetix_sdk_bumi/build/lowcontrol_py*.so && \
     ls /work/noetix_sdk_bumi/build/mediacontrol_py*.so
 
 # ROS2 domain isolation
