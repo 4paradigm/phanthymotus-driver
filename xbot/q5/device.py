@@ -198,6 +198,8 @@ class MicPlugin:
             if callable(sender):
                 sender(chunk)
                 self._frames_sent += 1
+                if self._frames_sent == 1:
+                    print(f"[MicPlugin] first 100 ms frame published -> {self._topic}", flush=True)
         if self._running:
             print("[MicPlugin] remote capture stream ended", flush=True)
 
@@ -267,10 +269,19 @@ class SpeakerPlugin:
 
     def _start_playback(self, requested: str) -> None:
         self._topic = requested
-        _q5_remote_command(
-            "source /opt/ros/humble/setup.bash; "
-            "ros2 service call /audio_player/stop_play std_srvs/srv/Trigger '{}'",
-            timeout=10.0)
+        # Stop the vendor player when possible, but never let a temporarily
+        # unavailable ROS service prevent the independent ALSA stream from
+        # starting. The developer-container service discovery can block here.
+        try:
+            stopped = _q5_remote_command(
+                "source /opt/ros/humble/setup.bash; "
+                "timeout 2 ros2 service call /audio_player/stop_play std_srvs/srv/Trigger '{}'",
+                timeout=4.0)
+            if stopped.returncode:
+                detail = (stopped.stderr or stopped.stdout).decode(errors="replace").strip()
+                print(f"[SpeakerPlugin] vendor player was not stopped: {detail}", flush=True)
+        except Exception as exc:
+            print(f"[SpeakerPlugin] vendor player stop timed out; continuing with ALSA: {exc}", flush=True)
         command = _q5_alsa_speaker_command(
             self._device, self._output_rate, self._output_channels)
         self._process = subprocess.Popen(

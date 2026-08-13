@@ -454,7 +454,7 @@ class ArmControlPlugin:
                     "target_position_rad": {"type": "number",
                                              "title": "范围 (rad)：" + _arm_limit_summary() + "；目标绝对角度",
                                              "multipleOf": 0.005,
-                                             "description": "绝对目标角度，不是相对位移。范围随关节变化，见卡片说明；超限会被拒绝。"},
+                                             "description": "范围 (rad)：" + _arm_limit_summary() + "；绝对目标角度，不是相对位移；超限会被拒绝。"},
                 },
                 "required": ["action"],
                 "additionalProperties": False,
