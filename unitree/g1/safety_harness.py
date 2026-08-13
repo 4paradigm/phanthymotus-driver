@@ -82,15 +82,54 @@ class SmartMotionProxy:
         )
         self._proc.start()
         print(f"[SmartMotionProxy] subprocess started → pid={self._proc.pid}")
+        # Per-request result routing: avoid race when multiple threads call _call
+        self._pending: dict[str, queue.Queue] = {}  # req_id → per-request queue
+        self._dispatch_lock = threading.Lock()
+        self._dispatch_thread = threading.Thread(target=self._dispatch_results, daemon=True)
+        self._dispatch_thread.start()
+        self._req_counter = 0
+        self._req_lock = threading.Lock()
+
+    def _next_req_id(self) -> str:
+        with self._req_lock:
+            self._req_counter += 1
+            return f"req_{self._req_counter}"
+
+    def _dispatch_results(self):
+        """Background thread that routes results from subprocess to the correct caller."""
+        while True:
+            try:
+                item = self._result_queue.get(timeout=1.0)
+                req_id = item.pop("_req_id", None) if isinstance(item, dict) else None
+                if req_id and req_id in self._pending:
+                    self._pending[req_id].put(item)
+                else:
+                    # Fallback: shouldn't happen, but don't lose the result
+                    # Put it in any waiting queue (legacy behavior)
+                    with self._dispatch_lock:
+                        for q in self._pending.values():
+                            q.put(item)
+                            break
+            except queue.Empty:
+                continue
+            except Exception:
+                continue
 
     def _call(self, method: str, timeout: float = 15.0, **kwargs) -> dict:
-        """Send command to subprocess and wait for result."""
-        self._cmd_queue.put({"method": method, **kwargs})
+        """Send command to subprocess and wait for result (thread-safe)."""
+        req_id = self._next_req_id()
+        result_q = queue.Queue(maxsize=1)
+        with self._dispatch_lock:
+            self._pending[req_id] = result_q
         try:
-            result = self._result_queue.get(timeout=timeout)
+            self._cmd_queue.put({"method": method, "_req_id": req_id, **kwargs})
+            result = result_q.get(timeout=timeout)
             return result
         except queue.Empty:
             return {"error": f"SmartMotion subprocess timeout ({method})"}
+        finally:
+            with self._dispatch_lock:
+                self._pending.pop(req_id, None)
 
     def move(self, vx: float, vy: float, vyaw: float, duration: float = -1.0) -> dict:
         return self._call("move", vx=vx, vy=vy, vyaw=vyaw, duration=duration)
@@ -920,6 +959,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
                 result = {"status": "shutdown"}
 
             if result is not None:
+                result["_req_id"] = cmd.get("_req_id")
                 result_queue.put(result)
         except queue.Empty:
             pass

@@ -80,9 +80,15 @@ class G1DeviceBundle:
             print("[bundle] NativeTtsPlugin loaded")
 
         if plugins_cfg.get("speaker", {}).get("enabled", False):
-            from device import SpeakerPlugin
-            self._plugins.append(SpeakerPlugin(plugins_cfg["speaker"], namespace, executor, audio_client))
-            print("[bundle] SpeakerPlugin loaded")
+            speaker_cfg = plugins_cfg["speaker"]
+            if speaker_cfg.get("isolated_process", False):
+                from device import SpeakerIsolatedProxy
+                self._plugins.append(SpeakerIsolatedProxy(speaker_cfg, namespace, executor, audio_client, network_iface=network_iface))
+                print("[bundle] SpeakerPlugin loaded (isolated process)")
+            else:
+                from device import SpeakerPlugin
+                self._plugins.append(SpeakerPlugin(speaker_cfg, namespace, executor, audio_client))
+                print("[bundle] SpeakerPlugin loaded")
 
         if plugins_cfg.get("led", {}).get("enabled", False):
             from device import LedPlugin
@@ -126,11 +132,16 @@ class G1DeviceBundle:
             print("[bundle] SpatialPlugin loaded")
 
         if plugins_cfg.get("controlled_spatial", {}).get("enabled", False):
-            from controlled_spatial import ControlledSpatialPlugin
             controlled_cfg = dict(plugins_cfg["controlled_spatial"])
             controlled_cfg["network_iface"] = network_iface
-            self._plugins.append(ControlledSpatialPlugin(controlled_cfg, namespace, executor, slam_client, smart_motion=smart_motion))
-            print("[bundle] ControlledSpatialPlugin loaded")
+            if controlled_cfg.get("isolated_process", False):
+                from controlled_spatial import ControlledSpatialIsolatedProxy
+                self._plugins.append(ControlledSpatialIsolatedProxy(controlled_cfg, namespace, executor, slam_client, smart_motion=smart_motion))
+                print("[bundle] ControlledSpatialPlugin loaded (isolated process)")
+            else:
+                from controlled_spatial import ControlledSpatialPlugin
+                self._plugins.append(ControlledSpatialPlugin(controlled_cfg, namespace, executor, slam_client, smart_motion=smart_motion))
+                print("[bundle] ControlledSpatialPlugin loaded")
 
         if plugins_cfg.get("controlled_spatial_map", {}).get("enabled", False):
             try:
