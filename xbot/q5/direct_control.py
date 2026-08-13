@@ -374,6 +374,19 @@ ARM_JOINT_LABELS = {
 }
 
 
+ARM_JOINT_OPTIONS = {
+    f"{name} ({JOINT_LIMITS[name][0]:g}~{JOINT_LIMITS[name][1]:g} rad)": name
+    for name in ARM_JOINTS
+}
+
+
+def _normalise_arm_joint(value: str | None) -> str | None:
+    """Accept canonical ROS names and the range-labelled canvas choices."""
+    if value in ARM_JOINTS:
+        return value
+    return ARM_JOINT_OPTIONS.get(value)
+
+
 def _arm_limit_summary() -> str:
     """Human-readable limits for clients that do not render JSON Schema allOf."""
     return "; ".join(
@@ -428,11 +441,6 @@ class ArmControlPlugin:
         client.direct_control_prepared = False
 
     def get_tool(self):
-        limit_rules = [
-            {"if": {"properties": {"joint_name": {"const": name}}, "required": ["joint_name"]},
-             "then": {"properties": {"target_position_rad": {"minimum": lower, "maximum": upper}}}}
-            for name, (lower, upper) in ((name, JOINT_LIMITS[name]) for name in ARM_JOINTS)
-        ]
         return {
             "name": ARM_CARD,
             "type": ARM_TYPE,
@@ -448,21 +456,19 @@ class ArmControlPlugin:
                         {"const": "cancel", "title": "取消并保持当前角度"},
                         {"const": "info", "title": "查看状态"},
                     ]},
-                    "joint_name": {"type": "string", "title": "目标关节", "enum": list(ARM_JOINTS), "oneOf": [
-                        {"const": name, "title": ARM_JOINT_LABELS[name]} for name in ARM_JOINTS
-                    ]},
+                    "joint_name": {"type": "string", "title": "目标关节（每项已标注范围）",
+                                   "enum": list(ARM_JOINT_OPTIONS)},
                     "target_position_rad": {"type": "number",
-                                             "title": "范围 (rad)：" + _arm_limit_summary() + "；目标绝对角度",
+                                             "title": "目标绝对角度 (rad)",
                                              "multipleOf": 0.005,
-                                             "description": "范围 (rad)：" + _arm_limit_summary() + "；绝对目标角度，不是相对位移；超限会被拒绝。"},
+                                             "description": "绝对目标角度，不是相对位移；范围见所选关节。"},
                 },
                 "required": ["action"],
                 "additionalProperties": False,
-                "allOf": limit_rules,
                 "x-action-params": {
                     "start": {"params": [], "description": "检查 ROS 连接和机器人状态。"},
                     "prepare_position_control": {"params": [], "description": "执行厂商 DynamicLaunch(pos)、READY、初始姿态、抬臂和ACTIVE流程。"},
-                    "move": {"params": ["joint_name", "target_position_rad"], "description": "设置单个关节的绝对角度；最大速度约 0.20 rad/s。范围：" + _arm_limit_summary()},
+                    "move": {"params": ["joint_name", "target_position_rad"], "description": "先在目标关节中选择带范围的项目，再设置绝对角度；最大速度约 0.20 rad/s。"},
                     "cancel": {"params": [], "description": "取消微调，并保持当前关节角度。"},
                     "info": {"params": [], "description": "查看当前运动和安全条件。"},
                 },
@@ -543,8 +549,8 @@ class ArmControlPlugin:
                 "hold_command_published": held}
 
     def _validate_move(self, args):
-        joint_name = args.get("joint_name")
-        if joint_name not in ARM_JOINTS:
+        joint_name = _normalise_arm_joint(args.get("joint_name"))
+        if joint_name is None:
             return _arm_failure("JOINT_NOT_ALLOWED", "Joint is not in the Q5 arm allowlist")
         status = self._safety()
         if not status["ros_publisher_available"]:
