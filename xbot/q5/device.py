@@ -17,6 +17,17 @@ from std_srvs.srv import Trigger
 from xbot_common_interfaces.action import AudioPlay
 from xbot_common_interfaces.srv import SetVolume
 
+# main.py resolves all card classes through this module. Keep the direct
+# control cards here as explicit exports while their implementation remains
+# consolidated in direct_control.py.
+from direct_control import (
+    ArmControlPlugin,
+    BaseDrivePlugin,
+    HandControlPlugin,
+    HandGesturePlugin,
+    HeadControlPlugin,
+)
+
 
 _RELIABLE_QOS = QoSProfile(
     reliability=ReliabilityPolicy.RELIABLE,
