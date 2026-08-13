@@ -452,7 +452,7 @@ class ArmControlPlugin:
                         {"const": name, "title": ARM_JOINT_LABELS[name]} for name in ARM_JOINTS
                     ]},
                     "target_position_rad": {"type": "number",
-                                             "title": "目标绝对角度 (rad)。范围：" + _arm_limit_summary(),
+                                             "title": "范围 (rad)：" + _arm_limit_summary() + "；目标绝对角度",
                                              "multipleOf": 0.005,
                                              "description": "绝对目标角度，不是相对位移。范围随关节变化，见卡片说明；超限会被拒绝。"},
                 },

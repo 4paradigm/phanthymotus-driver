@@ -159,23 +159,34 @@ class MicPlugin:
         return {
             "name": "mic", "type": "sensor", "multiInstance": False,
             "description": "Q5 microphone, live PCM 16 kHz/16-bit/mono for ASR.",
-            "inputSchema": {"type": "object", "properties": {
-                "action": {"type": "string", "enum": ["start_stream", "stop_stream", "start", "stop", "info"],
-                           "oneOf": [
-                               {"const": "start_stream", "title": "开始采集"},
-                               {"const": "stop_stream", "title": "停止采集"},
-                               {"const": "start", "title": "开始采集（兼容）"},
-                               {"const": "stop", "title": "停止采集（兼容）"},
-                               {"const": "info", "title": "查看状态"},
-                           ]},
-            }, "required": ["action"], "additionalProperties": False},
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
             "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}],
         }
 
     def start(self):
-        # Audio hardware is opt-in. The developer container may need a network
-        # package install, so never make bundle startup depend on it.
-        return
+        if self._running:
+            return
+        try:
+            _ensure_remote_audio_device(self._device, "input")
+            command = (
+                "import pyaudio, sys; "
+                "pa=pyaudio.PyAudio(); "
+                f"stream=pa.open(format=pyaudio.paInt16, channels={self._channels}, rate={self._rate}, "
+                f"input=True, input_device_index={self._device}, frames_per_buffer=1600); "
+                "\nwhile True:\n data=stream.read(1600, exception_on_overflow=False); sys.stdout.buffer.write(data); sys.stdout.buffer.flush()"
+            )
+            self._process = subprocess.Popen(
+                _q5_ssh_args("python3 -u -c " + shlex.quote(command)), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                bufsize=0)
+            _raise_if_remote_process_exited(self._process, "microphone")
+            self._running = True
+            self._frames_sent = 0
+            self._thread = threading.Thread(target=self._pump, daemon=True, name="q5_mic_stream")
+            self._thread.start()
+            print(f"[MicPlugin] capture started -> {self._topic}", flush=True)
+        except Exception as exc:
+            self.stop()
+            print(f"[MicPlugin] capture unavailable: {exc}", flush=True)
 
     def _pump(self):
         # 100 ms frames are the same size emitted by perception TTS.
@@ -202,29 +213,11 @@ class MicPlugin:
 
     def dispatch(self, action, args):
         del args
-        if action in ("start_stream", "start"):
-            try:
-                _ensure_remote_audio_device(self._device, "input")
-                command = (
-                    "import pyaudio, sys; "
-                    "pa=pyaudio.PyAudio(); "
-                    f"stream=pa.open(format=pyaudio.paInt16, channels={self._channels}, rate={self._rate}, "
-                    f"input=True, input_device_index={self._device}, frames_per_buffer=1600); "
-                    "\nwhile True:\n data=stream.read(1600, exception_on_overflow=False); sys.stdout.buffer.write(data); sys.stdout.buffer.flush()"
-                )
-                self._process = subprocess.Popen(
-                    _q5_ssh_args("python3 -u -c " + shlex.quote(command)), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    bufsize=0)
-                _raise_if_remote_process_exited(self._process, "microphone")
-                self._running = True
-                self._frames_sent = 0
-                self._thread = threading.Thread(target=self._pump, daemon=True, name="q5_mic_stream")
-                self._thread.start()
-            except Exception as exc:
-                return {"ok": False, "code": "AUDIO_SETUP_FAILED", "message": str(exc)}
-        elif action in ("stop_stream", "stop"):
+        if action == "start":
+            self.start()
+        elif action == "stop":
             self.stop()
-        if action in ("start_stream", "stop_stream", "start", "stop", "info"):
+        if action in ("start", "stop", "info"):
             return {"state": "running" if self._running else "idle",
                     "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}],
                     "frames_sent": self._frames_sent}
@@ -257,22 +250,41 @@ class SpeakerPlugin:
         return {
             "name": "speaker", "type": "actuator", "multiInstance": False,
             "description": "Q5 speaker. Connect a perception TTS audio/pcm-16k output to play live speech.",
-            "inputSchema": {"type": "object", "properties": {
-                "action": {"type": "string", "enum": ["start_stream", "stop_stream", "start", "stop", "info"],
-                           "oneOf": [
-                               {"const": "start_stream", "title": "开始播放"},
-                               {"const": "stop_stream", "title": "停止播放"},
-                               {"const": "start", "title": "开始播放（兼容）"},
-                               {"const": "stop", "title": "停止播放（兼容）"},
-                               {"const": "info", "title": "查看状态"},
-                           ]},
-                "input_topic": {"type": "string", "description": "PCM 16 kHz AudioChunk topic"},
-            }, "required": ["action"], "additionalProperties": False},
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
             "topic_in": [{"topic": self._topic, "format": "audio/pcm-16k"}],
         }
 
     def start(self, input_topic=None):
-        return
+        if self._running:
+            return
+        requested = str(input_topic or self._topic)
+        try:
+            self._start_playback(requested)
+            print(f"[SpeakerPlugin] playback subscribed <- {self._topic}", flush=True)
+        except Exception as exc:
+            self.stop()
+            print(f"[SpeakerPlugin] playback unavailable: {exc}", flush=True)
+
+    def _start_playback(self, requested: str) -> None:
+        self._topic = requested
+        _q5_remote_command(
+            "source /opt/ros/humble/setup.bash; "
+            "ros2 service call /audio_player/stop_play std_srvs/srv/Trigger '{}'",
+            timeout=10.0)
+        command = _q5_alsa_speaker_command(
+            self._device, self._output_rate, self._output_channels)
+        self._process = subprocess.Popen(
+            _q5_ssh_args("python3 -u -c " + shlex.quote(command)), stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, bufsize=0)
+        _raise_if_remote_process_exited(self._process, "speaker")
+        configure = getattr(self._client, "configure_speaker", None)
+        if callable(configure):
+            configure(self._topic)
+        self._running = True
+        self._frames_received = 0
+        self._frames_written = 0
+        self._thread = threading.Thread(target=self._pump, daemon=True, name="q5_speaker_stream")
+        self._thread.start()
 
     def _pump(self):
         while self._running and self._process and self._process.stdin:
@@ -309,37 +321,11 @@ class SpeakerPlugin:
             self._process = None
 
     def dispatch(self, action, args):
-        if action in ("start_stream", "start"):
-            try:
-                requested = str(args.get("input_topic") or self._topic)
-                if self._running and requested == self._topic:
-                    return {"state": "running", "topic_in": [{"topic": self._topic, "format": "audio/pcm-16k"}]}
-                self.stop()
-                self._topic = requested
-                # The vendor player owns the card while it is playing. Its
-                # public stop service releases it without touching XOS nodes.
-                _q5_remote_command(
-                    "source /opt/ros/humble/setup.bash; "
-                    "ros2 service call /audio_player/stop_play std_srvs/srv/Trigger '{}'",
-                    timeout=10.0)
-                command = _q5_alsa_speaker_command(
-                    self._device, self._output_rate, self._output_channels)
-                self._process = subprocess.Popen(_q5_ssh_args("python3 -u -c " + shlex.quote(command)), stdin=subprocess.PIPE,
-                                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, bufsize=0)
-                _raise_if_remote_process_exited(self._process, "speaker")
-                configure = getattr(self._client, "configure_speaker", None)
-                if callable(configure):
-                    configure(self._topic)
-                self._running = True
-                self._frames_received = 0
-                self._frames_written = 0
-                self._thread = threading.Thread(target=self._pump, daemon=True, name="q5_speaker_stream")
-                self._thread.start()
-            except Exception as exc:
-                return {"ok": False, "code": "AUDIO_SETUP_FAILED", "message": str(exc)}
-        elif action in ("stop_stream", "stop"):
+        if action == "start":
+            self.start(args.get("input_topic"))
+        elif action == "stop":
             self.stop()
-        if action in ("start_stream", "stop_stream", "start", "stop", "info"):
+        if action in ("start", "stop", "info"):
             return {"state": "running" if self._running else "idle",
                     "topic_in": [{"topic": self._topic, "format": "audio/pcm-16k"}],
                     "playback": {"device": self._device, "sample_rate_hz": self._output_rate,
