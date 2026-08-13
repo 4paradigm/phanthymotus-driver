@@ -56,8 +56,8 @@ plugins:
   camera_rgb:
     enabled: true
     source_topic: "/camera/camera/color/image_raw"
-    max_hz: 10.0
-    jpeg_quality: 70
+    max_hz: 15.0
+    jpeg_quality: 60
     remote_start:
       # Q5 D455 is physically connected to the developer container. The Q5
       # driver starts it automatically through the vendor's documented fixed
@@ -72,4 +72,4 @@ plugins:
   camera_depth:
     enabled: true
     source_topic: "/camera/camera/aligned_depth_to_color/image_raw"
-    max_hz: 10.0
+    max_hz: 15.0

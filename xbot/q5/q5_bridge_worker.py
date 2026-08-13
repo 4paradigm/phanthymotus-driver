@@ -157,7 +157,7 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
     pub_hand = _pub(f"{prefix}/hand_sensor")
     pub_odom = _pub(f"{prefix}/odom")
     pub_rgb = node.create_publisher(CompressedImage, f"{prefix}/camera/rgb", QOS_MEDIA)
-    pub_depth = node.create_publisher(Image, f"{prefix}/camera/depth", QOS_MEDIA)
+    pub_depth = node.create_publisher(CompressedImage, f"{prefix}/camera/depth", QOS_MEDIA)
     pub_mic = node.create_publisher(AudioChunk, f"{prefix}/mic/audio", QOS_MEDIA)
     speaker_sub = None
 
@@ -247,7 +247,14 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
             out.format = "jpeg"
             out.data = media["data"]
             pub_rgb.publish(out)
+        elif kind == "depth_jpeg":
+            out = CompressedImage()
+            out.header.stamp = node.get_clock().now().to_msg()
+            out.format = "jpeg"
+            out.data = media["data"]
+            pub_depth.publish(out)
         elif kind == "depth":
+            # Backward-compatible raw-depth path; currently unused by Q5.
             out = Image()
             out.header.stamp = node.get_clock().now().to_msg()
             out.height = int(media["height"])
@@ -256,7 +263,9 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
             out.is_bigendian = int(media["is_bigendian"])
             out.step = int(media["step"])
             out.data = media["data"]
-            pub_depth.publish(out)
+            # Keep this branch explicit in case a future raw-depth topic is
+            # introduced; the live card publishes `depth_jpeg` above.
+            node.get_logger().warn("raw depth media ignored: camera/depth is JPEG")
 
     # ── Main loop ──────────────────────────────────────────────────────────────
     running = True

@@ -447,10 +447,10 @@ cat /tmp/q5-realsense.pid 2>/dev/null || true
 
 
 class CameraDepthPlugin(_Q5MediaPlugin):
-    """D455 aligned depth image, preserving the source Z16/16UC1 measurement unit."""
+    """D455 aligned depth rendered as a dimension-preserving grayscale JPEG."""
 
     _node_name = "q5_camera_depth"
-    _format = "image/depth-z16"
+    _format = "image/jpeg"
 
     def __init__(self, plugin_config, namespace, executor, client):
         self._source_topic = str(plugin_config.get("source_topic", "/camera/camera/aligned_depth_to_color/image_raw"))
@@ -462,7 +462,7 @@ class CameraDepthPlugin(_Q5MediaPlugin):
     def get_tool(self):
         return {
             "name": "camera_depth", "type": "sensor", "multiInstance": False,
-            "description": "Q5 D455 depth image, aligned to RGB. Values remain Z16/16UC1 millimetres.",
+            "description": "Q5 D455 aligned depth preview. Grayscale: near is dark, far is bright.",
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["start", "stop", "info"]},
             }, "required": ["action"], "additionalProperties": False},
@@ -473,7 +473,10 @@ class CameraDepthPlugin(_Q5MediaPlugin):
     def start(self):
         if self._running:
             return
+        import cv2
+        import numpy as np
         from sensor_msgs.msg import Image
+        self._cv2, self._np = cv2, np
         self._running = True
         if self._subscription is None:
             self._subscription = self._node.create_subscription(
@@ -490,9 +493,20 @@ class CameraDepthPlugin(_Q5MediaPlugin):
         needed = int(msg.height) * int(msg.step)
         if msg.width <= 0 or msg.height <= 0 or msg.step < msg.width * 2 or len(msg.data) < needed:
             return
-        self._send_media({"kind": "depth", "height": msg.height, "width": msg.width,
-                          "encoding": "16UC1", "is_bigendian": msg.is_bigendian,
-                          "step": msg.step, "data": bytes(msg.data[:needed])})
+        try:
+            dtype = self._np.dtype(">u2" if msg.is_bigendian else "<u2")
+            depth = self._np.frombuffer(msg.data[:needed], dtype=dtype).reshape(msg.height, msg.step // 2)
+            depth = depth[:, :msg.width].astype(self._np.float32)
+            # D455 Z16 is millimetres. A fixed 0.25-5.0 m window is stable
+            # across frames and avoids the confusing red/green pseudo-colors.
+            preview = self._np.clip((depth - 250.0) * (255.0 / 4750.0), 0, 255).astype(self._np.uint8)
+            ok, jpeg = self._cv2.imencode(".jpg", preview, [self._cv2.IMWRITE_JPEG_QUALITY, 75])
+            if not ok:
+                return
+            self._send_media({"kind": "depth_jpeg", "data": jpeg.tobytes()})
+        except Exception as exc:
+            self._node.get_logger().warn(f"Depth preview encode failed: {exc}")
+            return
         self._frames_sent += 1
         self._last_sent = time.monotonic()
 

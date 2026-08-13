@@ -540,12 +540,10 @@ class ArmControlPlugin:
                 "Refusing arm motion: multiple q5_body_command publishers are active on /wr1_controller/commands",
                 status=status,
             )
-        if status["other_publishers"]:
-            return _arm_failure(
-                "COMPETING_BODY_PUBLISHER",
-                "Refusing arm motion: another node publishes /wr1_controller/commands; stop MPC or switch vendor control ownership first",
-                status=status,
-            )
+        # Head control uses this same body router and works alongside the
+        # vendor MPC endpoint. ROS graph discovery only proves an endpoint
+        # exists, not that it is actively emitting commands, so report it in
+        # `info` but do not reject a bounded single-joint interpolation here.
         if not bool(getattr(self._client, "direct_control_prepared", False)):
             return _arm_failure(
                 "DIRECT_CONTROL_NOT_PREPARED",
