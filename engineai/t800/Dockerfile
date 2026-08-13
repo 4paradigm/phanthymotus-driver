@@ -10,6 +10,7 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
         python3-colcon-common-extensions \
         python3-pip \
         ros-humble-rmw-cyclonedds-cpp \
+        pulseaudio-utils \
         build-essential \
         cmake && \
     rm -rf /var/lib/apt/lists/*

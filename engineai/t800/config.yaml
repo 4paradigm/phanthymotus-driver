@@ -38,8 +38,14 @@ topics:
   joint_plan_state: "/motion/joint_motion_plan/state"
   joint_override: "/motion/joint_override_command"
   joint_command: "/hardware/joint_command"
-  tts: "/hardware/tts"
   native_node_control: "/motion/node_control"
+  # T800-Odin2 激光雷达相机（飞书文档 7.2 节）；实机按 ros_graph 发现的
+  # /{topic_prefix}/{model}/device{N}/ 前缀校准
+  vision_cloud_raw: "/manifold/ODIN2/device0/cloud/raw"
+  vision_cloud_slam: "/manifold/ODIN2/device0/cloud/slam"
+  vision_camera_left: "/manifold/ODIN2/device0/camera0/compressed"
+  vision_camera_right: "/manifold/ODIN2/device0/camera1/compressed"
+  vision_depth: "/manifold/ODIN2/device0/depth"
 
 services:
   enable_motor: "/hardware/enable_motor"
@@ -63,8 +69,6 @@ plugins:
     enabled: true
   led:
     enabled: true
-  tts:
-    enabled: true
   motor_power:
     enabled: true
   native_node_control:
@@ -84,3 +88,8 @@ plugins:
     command: ["./run_robot.sh", "t800"]
     service: "robotics.service"
     stop_timeout: 10
+  mic:
+    enabled: true
+  vision:
+    enabled: true
+    source: "raw"            # raw | slam —— 转发哪个点云源
