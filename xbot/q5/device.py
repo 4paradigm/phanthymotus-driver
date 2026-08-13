@@ -77,6 +77,51 @@ def _ensure_remote_audio_device(device: int, direction: str):
             f"Q5 audio {direction} device {device} is unavailable: {detail}")
 
 
+def _q5_alsa_speaker_command(device: str, output_rate: int, output_channels: int) -> str:
+    """Return the remote PCM16 stdin -> Q5 ALSA playback process.
+
+    The Q5's playback card is visible as ``hw:2,0`` but its incomplete ALSA
+    configuration means PortAudio does not enumerate it as an output device.
+    It accepts S16_LE stereo at 44.1/48 kHz.  Keep the public contract at
+    16 kHz mono and convert only at this hardware boundary.
+    """
+    return """import audioop, ctypes, sys
+alsa = ctypes.CDLL('libasound.so.2')
+alsa.snd_pcm_open.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+alsa.snd_pcm_set_params.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint, ctypes.c_int, ctypes.c_uint]
+alsa.snd_pcm_writei.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
+alsa.snd_pcm_prepare.argtypes = [ctypes.c_void_p]
+alsa.snd_pcm_drain.argtypes = [ctypes.c_void_p]
+alsa.snd_pcm_close.argtypes = [ctypes.c_void_p]
+pcm = ctypes.c_void_p()
+rc = alsa.snd_pcm_open(ctypes.byref(pcm), b'%s', 0, 0)
+if rc < 0: raise RuntimeError('snd_pcm_open(%s) failed: %%d' %% rc)
+rc = alsa.snd_pcm_set_params(pcm, 2, 3, %d, %d, 1, 200000)
+if rc < 0: raise RuntimeError('snd_pcm_set_params failed: %%d' %% rc)
+state = None
+try:
+  while True:
+    raw = sys.stdin.buffer.read(3200)
+    if not raw: break
+    mono, state = audioop.ratecv(raw, 2, 1, 16000, %d, state)
+    stereo = audioop.tostereo(mono, 2, 1, 1)
+    frames = len(stereo) // %d
+    offset = 0
+    while offset < frames:
+      portion = stereo[offset * %d:]
+      buf = ctypes.create_string_buffer(portion)
+      written = alsa.snd_pcm_writei(pcm, buf, frames - offset)
+      if written < 0:
+        alsa.snd_pcm_prepare(pcm)
+        continue
+      offset += written
+finally:
+  alsa.snd_pcm_drain(pcm)
+  alsa.snd_pcm_close(pcm)
+""" % (device, device, output_channels, output_rate, output_rate, output_channels * 2,
+       output_channels * 2)
+
+
 class MicPlugin:
     """Q5 developer-container microphone as a 16 kHz PCM stream."""
 
@@ -165,14 +210,18 @@ class SpeakerPlugin:
         del namespace, executor
         self._client = client
         self._topic = str(plugin_config.get("input_topic", "/perception/tts"))
-        self._device = int(plugin_config.get("device", 6))
+        self._device = str(plugin_config.get("device", "hw:2,0"))
         self._rate = int(plugin_config.get("sample_rate_hz", 16000))
         self._channels = int(plugin_config.get("channels", 1))
+        self._output_rate = int(plugin_config.get("output_sample_rate_hz", 44100))
+        self._output_channels = int(plugin_config.get("output_channels", 2))
         self._process = None
         self._thread = None
         self._running = False
         if self._rate != 16000 or self._channels != 1:
             raise ValueError("Q5 speaker only supports the shared 16 kHz mono PCM contract")
+        if self._output_rate not in (44100, 48000) or self._output_channels != 2:
+            raise ValueError("Q5 speaker hardware requires 44.1/48 kHz stereo output")
 
     def get_tool(self):
         return {
@@ -220,15 +269,15 @@ class SpeakerPlugin:
                 if self._running and requested == self._topic:
                     return {"state": "running", "topic_in": [{"topic": self._topic, "format": "audio/pcm-16k"}]}
                 self.stop()
-                _ensure_remote_audio_device(self._device, "output")
                 self._topic = requested
-                command = (
-                    "import pyaudio, sys; "
-                    "pa=pyaudio.PyAudio(); "
-                    f"stream=pa.open(format=pyaudio.paInt16, channels={self._channels}, rate={self._rate}, "
-                    f"output=True, output_device_index={self._device}, frames_per_buffer=1600); "
-                    "\nwhile True:\n data=sys.stdin.buffer.read(3200);\n if not data: break\n stream.write(data)"
-                )
+                # The vendor player owns the card while it is playing. Its
+                # public stop service releases it without touching XOS nodes.
+                _q5_remote_command(
+                    "source /opt/ros/humble/setup.bash; "
+                    "ros2 service call /audio_player/stop_play std_srvs/srv/Trigger '{}'",
+                    timeout=10.0)
+                command = _q5_alsa_speaker_command(
+                    self._device, self._output_rate, self._output_channels)
                 self._process = subprocess.Popen(_q5_ssh_args("python3 -u -c " + shlex.quote(command)), stdin=subprocess.PIPE,
                                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, bufsize=0)
                 configure = getattr(self._client, "configure_speaker", None)
@@ -243,7 +292,9 @@ class SpeakerPlugin:
             self.stop()
         if action in ("start", "stop", "info"):
             return {"state": "running" if self._running else "idle",
-                    "topic_in": [{"topic": self._topic, "format": "audio/pcm-16k"}]}
+                    "topic_in": [{"topic": self._topic, "format": "audio/pcm-16k"}],
+                    "playback": {"device": self._device, "sample_rate_hz": self._output_rate,
+                                 "channels": self._output_channels}}
         return None
 
 
