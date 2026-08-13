@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import threading
 import time
@@ -136,7 +137,10 @@ class LynxM20ContractTests(unittest.TestCase):
         for axis in ("x", "y", "yaw"):
             self.assertEqual((-1, 1), (properties[axis]["minimum"], properties[axis]["maximum"]))
             self.assertNotIn("default", properties[axis])
-            self.assertIn("Omitted means 0", properties[axis]["description"])
+            self.assertIn("blank=0", properties[axis]["description"][:40])
+        self.assertEqual("Use +/-1; blank=0.", properties["x"]["description"].split(" Forward")[0])
+        self.assertEqual("Use |y| >= 0.5; blank=0.", properties["y"]["description"].split(" Left")[0])
+        self.assertEqual("Use +/-0.4; +/-1 ~= 45deg; blank=0.", properties["yaw"]["description"].split(" Normalized")[0])
 
     def test_motion_events_is_a_distinct_read_only_sensor(self):
         tool_def = m20.M20MotionEventsPlugin(FakeNodes()).get_tool()
@@ -145,6 +149,35 @@ class LynxM20ContractTests(unittest.TestCase):
             [{"topic": "/host/lynx_m20/motion_events", "format": "data/json"}],
             tool_def["topic_out"],
         )
+
+    def test_json_state_stream_publishes_string_payload_and_keeps_snapshot_value(self):
+        class FakePublisher:
+            def __init__(self): self.messages = []
+            def publish(self, message): self.messages.append(message)
+
+        class FakeString:
+            def __init__(self): self.data = ""
+
+        class FakeImu:
+            def __init__(self):
+                self.orientation = {"w": 1.0, "x": 0.0, "y": 0.0, "z": 0.0}
+
+        nodes = object.__new__(m20.M20Nodes)
+        nodes.lock = threading.Lock()
+        nodes.values = {}
+        publisher = FakePublisher()
+        callback = nodes._callback("imu", publisher, as_json=True, string_type=FakeString)
+        callback(FakeImu())
+
+        payload = json.loads(publisher.messages[0].data)
+        self.assertEqual({"w": 1.0, "x": 0.0, "y": 0.0, "z": 0.0}, payload["orientation"])
+        self.assertEqual(payload, nodes.values["imu"])
+
+    def test_json_state_streams_use_agent_core_compatible_format(self):
+        source = (DRIVER / "device.py").read_text()
+        self.assertNotIn('("imu", Imu, "/IMU", "data/imu"', source)
+        self.assertIn('("imu", Imu, "/IMU", "data/json"', source)
+        self.assertIn("core_msg_type = String if as_json else msg_type", source)
 
     def test_motion_events_separate_request_acceptance_from_feedback(self):
         nodes = FakeNodes()

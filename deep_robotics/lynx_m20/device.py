@@ -65,7 +65,7 @@ class M20Nodes:
 
         streams = [
             ("motion_info", MotionInfo, "/MOTION_INFO", "data/json", 20),
-            ("imu", Imu, "/IMU", "data/imu", 50),
+            ("imu", Imu, "/IMU", "data/json", 50),
             ("lidar", PointCloud2, "/LIDAR/POINTS", "pointcloud/ros2", 10),
             ("lidar_rear", PointCloud2, "/LIDAR/POINTS2", "pointcloud/ros2", 10),
             ("hard_estop", StdMsgInt32, "/HES_STATUS", "data/json", 10),
@@ -78,18 +78,32 @@ class M20Nodes:
         for key, msg_type, default, fmt, depth in streams:
             robot_topic = topics.get(key, default)
             core_topic = f"/{namespace}/lynx_m20/{key}"
-            pub = self.core.create_publisher(msg_type, core_topic, depth)
-            self.robot.create_subscription(msg_type, robot_topic, self._callback(key, pub), depth)
+            as_json = fmt == "data/json"
+            core_msg_type = String if as_json else msg_type
+            pub = self.core.create_publisher(core_msg_type, core_topic, depth)
+            self.robot.create_subscription(
+                msg_type,
+                robot_topic,
+                self._callback(key, pub, as_json=as_json, string_type=String),
+                depth,
+            )
             self.streams[key] = {"robot_topic": robot_topic, "topic": core_topic, "format": fmt}
 
-    def _callback(self, key, publisher):
+    def _callback(self, key, publisher, *, as_json=False, string_type=None):
         def callback(msg):
-            publisher.publish(msg)
             if key.startswith("lidar"):
                 header = getattr(msg, "header", None)
                 value = {"received": True, "frame_id": getattr(header, "frame_id", ""), "timestamp": time.time()}
             else:
                 value = jsonable(msg)
+            if as_json:
+                if string_type is None:
+                    raise RuntimeError("JSON state streams require std_msgs/msg/String")
+                output = string_type()
+                output.data = json.dumps(value, ensure_ascii=False)
+                publisher.publish(output)
+            else:
+                publisher.publish(msg)
             with self.lock:
                 self.values[key] = value
             if key == "motion_info":
@@ -367,17 +381,17 @@ class M20MotionPlugin:
             "x": {
                 "type": "number", "minimum": -1, "maximum": 1,
                 "examples": [1, -1],
-                "description": "Forward/backward normalized axis [-1, 1]. Recommended test input: +/-1. Omitted means 0.",
+                "description": "Use +/-1; blank=0. Forward/backward normalized axis [-1, 1].",
             },
             "y": {
                 "type": "number", "minimum": -1, "maximum": 1,
                 "examples": [0.5, -0.5],
-                "description": "Left/right normalized axis [-1, 1]. Hardware-tested reliable input: |y| >= 0.5. Omitted means 0.",
+                "description": "Use |y| >= 0.5; blank=0. Left/right normalized axis [-1, 1]; lower values may only tilt the body.",
             },
             "yaw": {
                 "type": "number", "minimum": -1, "maximum": 1,
                 "examples": [0.4, -0.4],
-                "description": "Normalized yaw axis [-1, 1]. Recommended input: +/-0.4; |yaw|=1 produced about 45 degrees in hardware testing. Omitted means 0.",
+                "description": "Use +/-0.4; +/-1 ~= 45deg; blank=0. Normalized yaw axis [-1, 1], based on hardware testing.",
             },
             "duration": {"type": "number", "minimum": 0, "maximum": 60, "default": 1, "description": "持续秒数；留空默认 1 秒，1-60 秒后自动停止，明确输入 0 表示持续到显式 stopmotion"},
     }))
