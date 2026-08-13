@@ -81,7 +81,12 @@ class BasicServerClient:
         self._tcp = None
         self._udp = None
         self._decoder = StreamDecoder()
-        self._lock = threading.Lock()
+        # Reliable TCP requests may block for up to ``timeout`` while waiting
+        # for a reply.  Keep them independent from the 20 Hz UDP velocity
+        # stream so a slow heartbeat can never delay motion or its zero frame.
+        self._tcp_lock = threading.Lock()
+        self._udp_lock = threading.Lock()
+        self._message_id_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._message_id = 0
         self._stop = threading.Event()
@@ -90,15 +95,14 @@ class BasicServerClient:
         self.last_error = None
 
     def _next_id(self) -> int:
-        self._message_id = (self._message_id + 1) & 0xFFFF
-        return self._message_id
+        with self._message_id_lock:
+            self._message_id = (self._message_id + 1) & 0xFFFF
+            return self._message_id
 
-    def _connect(self):
+    def _connect_tcp(self):
         if self._tcp is None:
             self._tcp = socket.create_connection((self.host, self.tcp_port), timeout=self.timeout)
             self._tcp.settimeout(self.timeout)
-        if self._udp is None:
-            self._udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     def _remember(self, payload: dict) -> None:
         body = payload.get("PatrolDevice", {})
@@ -109,8 +113,8 @@ class BasicServerClient:
     def request(self, message_type: int, command: int, items: dict | None = None) -> dict:
         if not self.enabled:
             return {"state": "disabled"}
-        with self._lock:
-            self._connect()
+        with self._tcp_lock:
+            self._connect_tcp()
             message_id = self._next_id()
             self._tcp.sendall(encode_frame(message_id, message_type, command, items))
             deadline = time.monotonic() + self.timeout
@@ -125,7 +129,7 @@ class BasicServerClient:
     def send_velocity(self, command: int, items: dict) -> dict:
         if not self.enabled:
             return {"state": "disabled"}
-        with self._lock:
+        with self._udp_lock:
             if self._udp is None:
                 self._udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             message_id = self._next_id()
@@ -142,7 +146,7 @@ class BasicServerClient:
                     self.last_error = None
                 except Exception as exc:
                     self.last_error = str(exc)
-                    self._close_sockets()
+                    self._close_tcp()
         self._thread = threading.Thread(target=heartbeat, daemon=True, name="m20-basic-server")
         self._thread.start()
 
@@ -151,14 +155,24 @@ class BasicServerClient:
             latest = dict(self.latest)
         return {"enabled": self.enabled, "host": self.host, "connected": self._tcp is not None, "last_error": self.last_error, "reports": latest}
 
-    def _close_sockets(self):
-        for name in ("_tcp", "_udp"):
-            sock = getattr(self, name)
-            if sock:
-                try: sock.close()
+    def _close_tcp(self):
+        with self._tcp_lock:
+            if self._tcp:
+                try: self._tcp.close()
                 except OSError: pass
-                setattr(self, name, None)
-        self._decoder = StreamDecoder()
+                self._tcp = None
+            self._decoder = StreamDecoder()
+
+    def _close_udp(self):
+        with self._udp_lock:
+            if self._udp:
+                try: self._udp.close()
+                except OSError: pass
+                self._udp = None
+
+    def _close_sockets(self):
+        self._close_tcp()
+        self._close_udp()
 
     def close(self) -> None:
         self._stop.set()
