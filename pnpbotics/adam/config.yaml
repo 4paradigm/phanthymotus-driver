@@ -4,8 +4,8 @@ ros_namespace: ""  # auto-detect from hostname
 # Robot variant: "lite" (23 DOF), "sp" (29 DOF), "pro" (31 DOF)
 variant: "pro"
 
-# gRPC endpoint for locomotion control
-grpc_host: "localhost"
+# gRPC endpoint for locomotion control (PC1)
+grpc_host: "10.10.20.127"
 grpc_port: 6666
 
 # DDS domain ID (must match robot's domain)
