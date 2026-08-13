@@ -159,7 +159,9 @@ class T800DeviceBundle:
             plugins.get("pose_teach", {}).get("enabled", True)
             and "gesture" in instances
         ):
-            instance = PoseTeachPlugin(state, instances["gesture"])
+            instance = PoseTeachPlugin(
+                state, instances["gesture"], instances.get("motion_mode")
+            )
             instances["pose_teach"] = instance
             self._plugins.append(instance)
 

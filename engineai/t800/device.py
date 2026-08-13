@@ -1679,10 +1679,12 @@ class PoseTeachPlugin:
     _INDICES = list(range(12, 25))
     _DEFAULT_DURATION = 2.0
     _MAX_FRAMES = 64
+    _BALANCE_MODE = "lower_body_balance"
 
-    def __init__(self, state: StatePlugin, gesture: GesturePlugin):
+    def __init__(self, state: StatePlugin, gesture: GesturePlugin, motion_mode=None):
         self._state = state
         self._gesture = gesture
+        self._motion_mode = motion_mode
         self._lock = threading.Lock()
         self._frames: list[dict] = []
 
@@ -1700,7 +1702,8 @@ class PoseTeachPlugin:
                     "capture": (["label", "duration"], "读取当前上肢关节角并追加一帧"),
                     "list": ([], "列出当前会话已录关键帧"),
                     "update": (["index", "label", "duration"], "修改指定关键帧的 label / duration"),
-                    "preview": (["reset_after", "wait"], "用 gesture.sequence 回放已录关键帧"),
+                    "preview": (["reset_after", "restore_balance", "wait"], "用 gesture.sequence 回放已录关键帧"),
+                    "restore_balance": (["force", "wait"], "切回下肢平衡（上肢低阻尼）；回放结束后用这个，不要停在行走/运动模式"),
                     "export": (["format", "name"], "导出 gesture.sequence 步骤或 GesturePlugin YAML 片段"),
                     "clear": ([], "清空当前会话关键帧"),
                     "status": ([], "查询关键帧数量与关节范围"),
@@ -1718,8 +1721,19 @@ class PoseTeachPlugin:
                         "minimum": 0,
                         "description": "关帧下标（从 0 开始）",
                     },
-                    "reset_after": {"type": "boolean"},
-                    "wait": {"type": "boolean", "description": "等待预览序列完成"},
+                    "reset_after": {
+                        "type": "boolean",
+                        "description": "回放后调用 joint_plan.reset（会离开示教姿态，可能回到行走/运动模式）",
+                    },
+                    "restore_balance": {
+                        "type": "boolean",
+                        "description": "回放结束后切回 lower_body_balance（下肢平衡 + 上肢低阻尼），默认开",
+                    },
+                    "wait": {"type": "boolean", "description": "等待预览序列或模式切换完成"},
+                    "force": {
+                        "type": "boolean",
+                        "description": "目标不在 available transitions 时仍发送 lower_body_balance",
+                    },
                     "format": {
                         "type": "string",
                         "enum": ["sequence", "yaml"],
@@ -1760,6 +1774,8 @@ class PoseTeachPlugin:
             return self._update(args)
         if action == "preview":
             return self._preview(args)
+        if action == "restore_balance":
+            return self._restore_balance(args)
         if action == "export":
             return self._export(args)
         if action == "clear":
@@ -1839,14 +1855,58 @@ class PoseTeachPlugin:
         steps = self._steps()
         if not steps:
             return {"error": "no frames to preview; capture at least one keyframe"}
-        return self._gesture.dispatch(
+        wait = bool(args.get("wait", False))
+        restore_balance = bool(args.get("restore_balance", True))
+        result = self._gesture.dispatch(
             "sequence",
             {
                 "steps": steps,
                 "reset_after": bool(args.get("reset_after", False)),
-                "wait": bool(args.get("wait", False)),
+                "wait": wait,
             },
         )
+        if result.get("error") or not restore_balance:
+            return result
+        payload = dict(result)
+        if wait:
+            payload["restore_balance"] = self._restore_balance({
+                "wait": True,
+                "force": bool(args.get("force", False)),
+            })
+            return payload
+        threading.Thread(
+            target=self._restore_balance_after_preview,
+            args=(bool(args.get("force", False)),),
+            daemon=True,
+            name="t800-pose-teach-restore-balance",
+        ).start()
+        payload["restore_balance"] = {"state": "scheduled", "target": self._BALANCE_MODE}
+        return payload
+
+    def _restore_balance_after_preview(self, force: bool) -> None:
+        deadline = time.monotonic() + 180.0
+        while time.monotonic() < deadline:
+            status = self._gesture.dispatch("status", {})
+            if status.get("state") != "running":
+                break
+            time.sleep(0.05)
+        self._restore_balance({"wait": True, "force": force})
+
+    def _restore_balance(self, args: dict) -> dict:
+        if self._motion_mode is None:
+            return {"error": "motion_mode plugin is not available"}
+        result = self._motion_mode.dispatch(
+            "switch",
+            {
+                "target": self._BALANCE_MODE,
+                "wait": bool(args.get("wait", True)),
+                "force": bool(args.get("force", False)),
+            },
+        )
+        payload = dict(result)
+        payload["target"] = self._BALANCE_MODE
+        payload["mode"] = "lower_body_balance + upper-body low damping"
+        return payload
 
     def _export(self, args: dict) -> dict:
         steps = self._steps()

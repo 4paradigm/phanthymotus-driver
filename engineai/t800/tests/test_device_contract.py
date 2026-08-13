@@ -512,7 +512,7 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("neutral", updated["frame"]["label"])
         self.assertEqual(2.0, updated["frame"]["duration"])
 
-        preview = teach.dispatch("preview", {"reset_after": False, "wait": True})
+        preview = teach.dispatch("preview", {"reset_after": False, "restore_balance": False, "wait": True})
         self.assertEqual("completed", preview["state"])
         self.assertGreaterEqual(len(plan._publisher.messages), 2)
         self.assertEqual(list(range(12, 25)), plan._publisher.messages[-1].joint_indices)
@@ -532,6 +532,32 @@ class DevicePluginContractTests(unittest.TestCase):
         cleared = teach.dispatch("clear", {})
         self.assertEqual(0, len(cleared["frames"]))
         self.assertEqual(0, teach.dispatch("list", {})["frame_count"])
+
+    def test_pose_teach_restore_balance_after_preview(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros)
+        plan.start()
+        gesture = self.device.GesturePlugin(plan)
+        motion = self.device.MotionModePlugin(CONFIG, "robot", self.ros, self.state)
+        motion.start()
+        teach = self.device.PoseTeachPlugin(self.state, gesture, motion)
+
+        schema = teach.get_tool()["inputSchema"]
+        self.assertIn("restore_balance", schema["properties"]["action"]["enum"])
+        self.assertIn("restore_balance", schema["properties"])
+
+        self.state._current_motion = "walk"
+        self.state._available_motions = ["walk", "lower_body_balance", "pd_stand"]
+        restored = teach.dispatch("restore_balance", {"wait": False})
+        self.assertEqual("requested", restored["state"])
+        self.assertEqual("lower_body_balance", restored["target"])
+        self.assertEqual("lower_body_balance", motion._publisher.messages[-1].target_motion_name)
+
+        self.state._last_joint_positions = [0.01] * 25
+        teach.dispatch("capture", {"duration": 0.05})
+        preview = teach.dispatch("preview", {"reset_after": False, "restore_balance": True, "wait": True})
+        self.assertEqual("completed", preview["state"])
+        self.assertEqual("lower_body_balance", preview["restore_balance"]["target"])
+        self.assertEqual("lower_body_balance", motion._publisher.messages[-1].target_motion_name)
 
     def test_joint_override_force_path_and_release(self):
         plugin = self.device.JointOverridePlugin(CONFIG, "robot", self.ros, self.state)
