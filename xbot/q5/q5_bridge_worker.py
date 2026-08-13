@@ -156,9 +156,9 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
     pub_fault = _pub(f"{prefix}/faults")
     pub_hand = _pub(f"{prefix}/hand_sensor")
     pub_odom = _pub(f"{prefix}/odom")
-    pub_rgb = node.create_publisher(CompressedImage, f"{prefix}/q5/camera/rgb", QOS_MEDIA)
-    pub_depth = node.create_publisher(Image, f"{prefix}/q5/camera/depth", QOS_MEDIA)
-    pub_mic = node.create_publisher(AudioChunk, f"{prefix}/q5/mic/audio", QOS_MEDIA)
+    pub_rgb = node.create_publisher(CompressedImage, f"{prefix}/camera/rgb", QOS_MEDIA)
+    pub_depth = node.create_publisher(Image, f"{prefix}/camera/depth", QOS_MEDIA)
+    pub_mic = node.create_publisher(AudioChunk, f"{prefix}/mic/audio", QOS_MEDIA)
     speaker_sub = None
 
     def _on_speaker(msg):

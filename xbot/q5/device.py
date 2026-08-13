@@ -91,7 +91,7 @@ class MicPlugin:
     def __init__(self, plugin_config, namespace, executor, client):
         del executor
         self._client = client
-        self._topic = f"/{namespace}/q5/mic/audio"
+        self._topic = f"/{namespace}/mic/audio"
         self._device = str(plugin_config.get("device", "default"))
         self._rate = int(plugin_config.get("sample_rate_hz", 16000))
         self._channels = int(plugin_config.get("channels", 1))
@@ -189,23 +189,7 @@ class SpeakerPlugin:
         }
 
     def start(self, input_topic=None):
-        requested = str(input_topic or self._topic)
-        if self._running and requested == self._topic:
-            return
-        self.stop()
-        _ensure_remote_audio_tools()
-        self._topic = requested
-        command = ("exec aplay -D " + shlex.quote(self._device) +
-                   f" -f S16_LE -r {self._rate} -c {self._channels} -t raw")
-        self._process = subprocess.Popen(_q5_ssh_args(command), stdin=subprocess.PIPE,
-                                         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, bufsize=0)
-        configure = getattr(self._client, "configure_speaker", None)
-        if callable(configure):
-            configure(self._topic)
-        self._running = True
-        self._thread = threading.Thread(target=self._pump, daemon=True, name="q5_speaker_stream")
-        self._thread.start()
-        print(f"[SpeakerPlugin] subscribed {self._topic} -> Q5 ALSA {self._device}", flush=True)
+        return
 
     def _pump(self):
         while self._running and self._process and self._process.stdin:
@@ -235,7 +219,22 @@ class SpeakerPlugin:
     def dispatch(self, action, args):
         if action == "start":
             try:
-                self.start(args.get("input_topic"))
+                requested = str(args.get("input_topic") or self._topic)
+                if self._running and requested == self._topic:
+                    return {"state": "running", "topic_in": [{"topic": self._topic, "format": "audio/pcm-16k"}]}
+                self.stop()
+                _ensure_remote_audio_tools()
+                self._topic = requested
+                command = ("exec aplay -D " + shlex.quote(self._device) +
+                           f" -f S16_LE -r {self._rate} -c {self._channels} -t raw")
+                self._process = subprocess.Popen(_q5_ssh_args(command), stdin=subprocess.PIPE,
+                                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, bufsize=0)
+                configure = getattr(self._client, "configure_speaker", None)
+                if callable(configure):
+                    configure(self._topic)
+                self._running = True
+                self._thread = threading.Thread(target=self._pump, daemon=True, name="q5_speaker_stream")
+                self._thread.start()
             except Exception as exc:
                 return {"ok": False, "code": "AUDIO_SETUP_FAILED", "message": str(exc)}
         elif action == "stop":
@@ -303,7 +302,7 @@ class CameraRgbPlugin(_Q5MediaPlugin):
 
     def __init__(self, plugin_config, namespace, executor, client):
         self._source_topic = str(plugin_config.get("source_topic", "/camera/camera/color/image_raw"))
-        self._topic = f"/{namespace}/q5/camera/rgb"
+        self._topic = f"/{namespace}/camera/rgb"
         self._jpeg_quality = max(20, min(95, int(plugin_config.get("jpeg_quality", 70))))
         self._latest = None
         self._frames_received = 0
@@ -429,7 +428,7 @@ class CameraDepthPlugin(_Q5MediaPlugin):
 
     def __init__(self, plugin_config, namespace, executor, client):
         self._source_topic = str(plugin_config.get("source_topic", "/camera/camera/aligned_depth_to_color/image_raw"))
-        self._topic = f"/{namespace}/q5/camera/depth"
+        self._topic = f"/{namespace}/camera/depth"
         self._frames_received = 0
         self._frames_sent = 0
         super().__init__(plugin_config, namespace, executor, client)
