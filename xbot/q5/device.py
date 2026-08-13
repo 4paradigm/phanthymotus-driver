@@ -61,6 +61,22 @@ def _q5_remote_command(command: str, timeout: float = 20.0, stdin=None):
     return subprocess.run(_q5_ssh_args(command), input=stdin, capture_output=True, timeout=timeout)
 
 
+def _raise_if_remote_process_exited(process, label: str) -> None:
+    """Surface setup failures before a card falsely reports a running stream."""
+    time.sleep(0.25)
+    returncode = process.poll()
+    if returncode is None:
+        return
+    detail = b""
+    if process.stderr:
+        try:
+            detail = process.stderr.read()
+        except Exception:
+            pass
+    message = detail.decode(errors="replace").strip() or f"remote process exited with code {returncode}"
+    raise RuntimeError(f"Q5 {label} stream failed to start: {message}")
+
+
 def _ensure_remote_audio_device(device: int, direction: str):
     """Validate the requested PortAudio input/output capability on Q5."""
     channel_key = "maxInputChannels" if direction == "input" else "maxOutputChannels"
@@ -135,6 +151,7 @@ class MicPlugin:
         self._process = None
         self._thread = None
         self._running = False
+        self._frames_sent = 0
         if self._rate != 16000 or self._channels != 1:
             raise ValueError("Q5 mic only supports the shared 16 kHz mono PCM contract")
 
@@ -162,6 +179,7 @@ class MicPlugin:
             sender = getattr(self._client, "publish_audio", None)
             if callable(sender):
                 sender(chunk)
+                self._frames_sent += 1
         if self._running:
             print("[MicPlugin] remote capture stream ended", flush=True)
 
@@ -190,7 +208,9 @@ class MicPlugin:
                 self._process = subprocess.Popen(
                     _q5_ssh_args("python3 -u -c " + shlex.quote(command)), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     bufsize=0)
+                _raise_if_remote_process_exited(self._process, "microphone")
                 self._running = True
+                self._frames_sent = 0
                 self._thread = threading.Thread(target=self._pump, daemon=True, name="q5_mic_stream")
                 self._thread.start()
             except Exception as exc:
@@ -199,7 +219,8 @@ class MicPlugin:
             self.stop()
         if action in ("start", "stop", "info"):
             return {"state": "running" if self._running else "idle",
-                    "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}]}
+                    "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}],
+                    "frames_sent": self._frames_sent}
         return None
 
 
@@ -218,6 +239,8 @@ class SpeakerPlugin:
         self._process = None
         self._thread = None
         self._running = False
+        self._frames_received = 0
+        self._frames_written = 0
         if self._rate != 16000 or self._channels != 1:
             raise ValueError("Q5 speaker only supports the shared 16 kHz mono PCM contract")
         if self._output_rate not in (44100, 48000) or self._output_channels != 2:
@@ -244,11 +267,20 @@ class SpeakerPlugin:
             if chunk is None:
                 time.sleep(0.005)
                 continue
+            self._frames_received += 1
             try:
                 self._process.stdin.write(chunk)
                 self._process.stdin.flush()
+                self._frames_written += 1
             except (BrokenPipeError, OSError):
-                print("[SpeakerPlugin] remote playback stream ended", flush=True)
+                detail = ""
+                if self._process and self._process.stderr:
+                    try:
+                        detail = self._process.stderr.read().decode(errors="replace").strip()
+                    except Exception:
+                        pass
+                print(f"[SpeakerPlugin] remote playback stream ended: {detail}", flush=True)
+                self._running = False
                 break
 
     def stop(self):
@@ -280,10 +312,13 @@ class SpeakerPlugin:
                     self._device, self._output_rate, self._output_channels)
                 self._process = subprocess.Popen(_q5_ssh_args("python3 -u -c " + shlex.quote(command)), stdin=subprocess.PIPE,
                                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, bufsize=0)
+                _raise_if_remote_process_exited(self._process, "speaker")
                 configure = getattr(self._client, "configure_speaker", None)
                 if callable(configure):
                     configure(self._topic)
                 self._running = True
+                self._frames_received = 0
+                self._frames_written = 0
                 self._thread = threading.Thread(target=self._pump, daemon=True, name="q5_speaker_stream")
                 self._thread.start()
             except Exception as exc:
@@ -294,7 +329,9 @@ class SpeakerPlugin:
             return {"state": "running" if self._running else "idle",
                     "topic_in": [{"topic": self._topic, "format": "audio/pcm-16k"}],
                     "playback": {"device": self._device, "sample_rate_hz": self._output_rate,
-                                 "channels": self._output_channels}}
+                                 "channels": self._output_channels},
+                    "frames_received": self._frames_received,
+                    "frames_written": self._frames_written}
         return None
 
 

@@ -139,6 +139,11 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
         history=HistoryPolicy.KEEP_LAST,
         depth=1,
     )
+    QOS_AUDIO = QoSProfile(
+        reliability=ReliabilityPolicy.BEST_EFFORT,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=20,
+    )
 
     # ── Publishers ─────────────────────────────────────────────────────────────
     def _pub(topic):
@@ -290,8 +295,12 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
                 if speaker_sub is not None:
                     node.destroy_subscription(speaker_sub)
                 speaker_sub = node.create_subscription(
-                    AudioChunk, str(cmd["topic"]), _on_speaker, QOS_MEDIA)
-                node.get_logger().info(f"speaker subscribed to {cmd['topic']}")
+                    # Perception TTS publishes BEST_EFFORT for low latency.
+                    # A RELIABLE request is incompatible and receives zero
+                    # samples. Keep a short ordered PCM buffer instead.
+                    AudioChunk, str(cmd["topic"]), _on_speaker, QOS_AUDIO)
+                node.get_logger().info(
+                    f"speaker subscribed to {cmd['topic']} (BEST_EFFORT)")
             elif debug:
                 node.get_logger().debug(f"bridge cmd: {cmd}")
         except Exception:

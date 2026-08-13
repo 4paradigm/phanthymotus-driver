@@ -383,9 +383,9 @@ def _arm_limit_summary() -> str:
 
 
 ARM_DESC = (
-    "Q5 手臂单关节位置控制。target_position_rad 是绝对角度（不是增量）；"
+    "关节绝对角度范围：" + _arm_limit_summary() + "。"
+    "Q5 手臂单关节位置控制；target_position_rad 是绝对角度（不是增量），"
     "先执行 prepare_position_control。每步最多 0.010 rad、20 Hz，最大约 0.20 rad/s。"
-    "关节范围：" + _arm_limit_summary()
 )
 
 
