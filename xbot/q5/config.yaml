@@ -45,12 +45,15 @@ plugins:
     source_topic: "/camera/camera/color/image_raw"
     max_hz: 10.0
     jpeg_quality: 70
+    remote_start:
+      enabled: false
+      host: "192.168.8.100"
+      port: 2222
+      user: "developer"
+      identity_file: "/run/q5-camera-ssh/id_ed25519"
+      depth_profile: "848x480x30"
+      color_profile: "848x480x30"
   camera_depth:
     enabled: true
     source_topic: "/camera/camera/aligned_depth_to_color/image_raw"
     max_hz: 10.0
-  slam_pointcloud:
-    enabled: true
-    source_topic: "/slam/map_cmap"
-    max_hz: 2.0
-    max_points: 10000

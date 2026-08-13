@@ -73,7 +73,6 @@ class Q5DeviceBundle:
             ("audio", "AudioPlugin"),
             ("camera_rgb", "CameraRgbPlugin"),
             ("camera_depth", "CameraDepthPlugin"),
-            ("slam_pointcloud", "SlamPointCloudPlugin"),
         ]
 
         for key, cls_name in _PLUGIN_MAP:

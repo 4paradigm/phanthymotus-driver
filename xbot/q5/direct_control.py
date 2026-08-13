@@ -521,6 +521,12 @@ class ArmControlPlugin:
         status = self._safety()
         if not status["ros_publisher_available"]:
             return _arm_failure("ROS_UNAVAILABLE", "Q5 arm command publisher is unavailable", status=status)
+        if status["same_name_publisher_count"] > 1:
+            return _arm_failure(
+                "DUPLICATE_BODY_PUBLISHER",
+                "Refusing arm motion: multiple q5_body_command publishers are active on /wr1_controller/commands",
+                status=status,
+            )
         if status["lifecycle_state"] != "active":
             return _arm_failure("LIFECYCLE_NOT_ACTIVE", "Q5 motion_manager must be active before arm control", status=status)
         q5_ready, q5_status = q5_is_control_ready(self._client)

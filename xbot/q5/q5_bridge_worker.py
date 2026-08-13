@@ -96,10 +96,8 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
     import rclpy.qos
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-    from std_msgs.msg import String, UInt8MultiArray
+    from std_msgs.msg import String
     from sensor_msgs.msg import CompressedImage, Image
-    import array
-    import struct
 
     print(f"[BridgeWorker:pid={os.getpid()}] subprocess ready (Domain 42/FastDDS)", flush=True)
 
@@ -132,7 +130,6 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
     pub_odom = _pub(f"{prefix}/odom")
     pub_rgb = node.create_publisher(CompressedImage, f"{prefix}/q5/camera/rgb", QOS_SENSOR)
     pub_depth = node.create_publisher(Image, f"{prefix}/q5/camera/depth", QOS_SENSOR)
-    pub_cloud = node.create_publisher(UInt8MultiArray, f"{prefix}/q5/slam/pointcloud", QOS_SENSOR)
 
     node.get_logger().info(f"bridge publishers ready for namespace={namespace}")
     executor.add_node(node)
@@ -220,11 +217,6 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
             out.step = int(media["step"])
             out.data = media["data"]
             pub_depth.publish(out)
-        elif kind == "pointcloud":
-            out = UInt8MultiArray()
-            payload = struct.pack("<II", int(media["point_step"]), int(media["count"])) + media["data"]
-            out.data = array.array("B", payload)
-            pub_cloud.publish(out)
 
     # ── Main loop ──────────────────────────────────────────────────────────────
     running = True

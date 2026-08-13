@@ -8,8 +8,9 @@ cards.
 from __future__ import annotations
 
 import json
-import math
-import struct
+import re
+import shlex
+import subprocess
 import threading
 import time
 
@@ -103,6 +104,7 @@ class CameraRgbPlugin(_Q5MediaPlugin):
         self._latest = None
         self._lock = threading.Lock()
         self._encoder = None
+        self._remote_start = dict(plugin_config.get("remote_start") or {})
         super().__init__(plugin_config, namespace, executor, client)
 
     def get_tool(self):
@@ -122,6 +124,7 @@ class CameraRgbPlugin(_Q5MediaPlugin):
         import numpy as np
         from sensor_msgs.msg import Image
 
+        self._start_remote_realsense_if_configured()
         self._cv2, self._np = cv2, np
         self._running = True
         if self._subscription is None:
@@ -130,6 +133,47 @@ class CameraRgbPlugin(_Q5MediaPlugin):
         self._encoder = threading.Thread(target=self._encode_loop, daemon=True, name="q5_rgb_encoder")
         self._encoder.start()
         print(f"[CameraRgbPlugin] subscribed {self._source_topic} -> {self._topic} <= {self._max_hz:g}Hz", flush=True)
+
+    def _start_remote_realsense_if_configured(self):
+        """Optionally start the D455 on its owning developer container via SSH.
+
+        This is intentionally opt-in: XOS can also own the camera, and the
+        launch must never use an embedded password or restart a live driver.
+        """
+        if not self._remote_start.get("enabled", False):
+            return
+        identity = str(self._remote_start.get("identity_file", ""))
+        host = str(self._remote_start.get("host", "192.168.8.100"))
+        user = str(self._remote_start.get("user", "developer"))
+        try:
+            port = int(self._remote_start.get("port", 2222))
+        except (TypeError, ValueError):
+            raise ValueError("camera_rgb.remote_start.port must be an integer")
+        profiles = (
+            str(self._remote_start.get("depth_profile", "848x480x30")),
+            str(self._remote_start.get("color_profile", "848x480x30")),
+        )
+        if (not identity or not re.fullmatch(r"[A-Za-z0-9_.:/-]+", identity) or
+                not re.fullmatch(r"[A-Za-z0-9.-]+", host) or
+                not re.fullmatch(r"[A-Za-z0-9_-]+", user) or
+                any(not re.fullmatch(r"[0-9]+x[0-9]+x[0-9]+", value) for value in profiles)):
+            raise ValueError("invalid camera_rgb.remote_start configuration")
+        remote = (
+            "source /opt/ros/humble/setup.bash; "
+            "export ROS_DOMAIN_ID=211 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp; "
+            "pgrep -f realsense2_camera_node >/dev/null || "
+            "nohup ros2 launch realsense2_camera rs_align_depth_launch.py "
+            f"depth_module.depth_profile:={profiles[0]} rgb_camera.color_profile:={profiles[1]} "
+            ">/tmp/q5-realsense.log 2>&1 &"
+        )
+        command = ["ssh", "-i", identity, "-p", str(port), "-o", "BatchMode=yes",
+                   "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=accept-new",
+                   f"{user}@{host}", f"bash -lc {shlex.quote(remote)}"]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=12)
+        if result.returncode:
+            detail = (result.stderr or result.stdout).strip()
+            raise RuntimeError(f"remote RealSense launch failed: {detail}")
+        print(f"[CameraRgbPlugin] requested remote D455 launch on {user}@{host}:{port}", flush=True)
 
     def _on_image(self, msg):
         if self._running:
@@ -206,71 +250,6 @@ class CameraDepthPlugin(_Q5MediaPlugin):
                           "encoding": "16UC1", "is_bigendian": msg.is_bigendian,
                           "step": msg.step, "data": bytes(msg.data[:needed])})
         self._last_sent = time.monotonic()
-
-
-class SlamPointCloudPlugin(_Q5MediaPlugin):
-    """Q5 SLAM map cloud, separate from a real-time lidar/obstacle stream."""
-
-    _node_name = "q5_slam_pointcloud"
-    _format = "sensor/pointcloud"
-
-    def __init__(self, plugin_config, namespace, executor, client):
-        self._source_topic = str(plugin_config.get("source_topic", "/slam/map_cmap"))
-        self._topic = f"/{namespace}/q5/slam/pointcloud"
-        self._max_points = max(100, min(100000, int(plugin_config.get("max_points", 10000))))
-        super().__init__(plugin_config, namespace, executor, client)
-
-    def get_tool(self):
-        return {
-            "name": "slam_pointcloud", "type": "sensor", "multiInstance": False,
-            "description": "Q5 SLAM map point cloud (not a real-time obstacle/lidar stream), limited for dashboard rendering.",
-            "inputSchema": {"type": "object", "properties": {
-                "action": {"type": "string", "enum": ["start", "stop", "info"]},
-            }, "required": ["action"], "additionalProperties": False},
-            "topic_out": [{"topic": self._topic, "format": self._format}],
-        }
-
-    def start(self):
-        if self._running:
-            return
-        from sensor_msgs.msg import PointCloud2
-        self._running = True
-        if self._subscription is None:
-            self._subscription = self._node.create_subscription(
-                PointCloud2, self._source_topic, self._on_cloud, _LATEST_QOS)
-        print(f"[SlamPointCloudPlugin] subscribed {self._source_topic} -> {self._topic} <= {self._max_hz:g}Hz", flush=True)
-
-    def _on_cloud(self, msg):
-        if not self._running or time.monotonic() - self._last_sent < 1.0 / self._max_hz:
-            return
-        point_step = int(msg.point_step)
-        total = int(msg.width) * int(msg.height)
-        raw = bytes(msg.data)
-        if point_step < 12 or total <= 0 or len(raw) < point_step * total:
-            return
-        fields = {field.name: field for field in msg.fields}
-        if not all(name in fields for name in ("x", "y", "z")):
-            return
-        # sensor_msgs/PointField.FLOAT32. A map with another scalar format is
-        # rejected rather than silently publishing corrupted coordinates.
-        if any(int(fields[name].datatype) != 7 for name in ("x", "y", "z")):
-            self._node.get_logger().warn("SLAM point cloud x/y/z are not float32")
-            return
-        endian = ">" if msg.is_bigendian else "<"
-        stride = max(1, math.ceil(total / self._max_points))
-        selected = bytearray()
-        for index in range(0, total, stride):
-            start = index * point_step
-            x, y, z = (struct.unpack_from(endian + "f", raw, start + fields[name].offset)[0]
-                       for name in ("x", "y", "z"))
-            if all(math.isfinite(value) for value in (x, y, z)):
-                # Agent Core expects tightly packed XYZ float32 records.
-                selected.extend(struct.pack("<fff", x, y, z))
-        count = len(selected) // 12
-        if count:
-            self._send_media({"kind": "pointcloud", "point_step": 12,
-                              "count": count, "data": bytes(selected)})
-            self._last_sent = time.monotonic()
 
 
 def _wait_for_future(future, timeout_sec: float):

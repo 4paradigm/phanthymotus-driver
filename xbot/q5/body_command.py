@@ -44,21 +44,28 @@ class BodyCommandRouter:
 
     def status(self):
         competitors = []
+        publishers = []
         endpoint_query_available = self._node is not None
         if self._node is not None:
             try:
-                competitors = [
+                publishers = [
                     {"node_name": endpoint.node_name, "node_namespace": endpoint.node_namespace}
                     for endpoint in self._node.get_publishers_info_by_topic(TOPIC)
-                    if endpoint.node_name != NODE
                 ]
+                competitors = [endpoint for endpoint in publishers if endpoint["node_name"] != NODE]
             except Exception:
                 endpoint_query_available = False
         with self._lock:
             owner = self._owner
         return {"ros_publisher_available": self._pub is not None,
                 "endpoint_query_available": endpoint_query_available,
-                "other_publishers": competitors, "active_owner": owner,
+                "other_publishers": competitors,
+                # Node names are not unique in a ROS graph. Several
+                # q5_body_command endpoints mean several driver instances are
+                # simultaneously writing absolute positions to the same bus.
+                "same_name_publisher_count": sum(1 for endpoint in publishers
+                                                   if endpoint["node_name"] == NODE),
+                "active_owner": owner,
                 "topic": TOPIC, "publisher_node": NODE}
 
     def acquire(self, owner: str) -> bool:
