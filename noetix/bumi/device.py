@@ -1296,18 +1296,6 @@ class _MotionStateNode(Node):
                 },
             },
             "motor_faults": faults,
-            "motor_fault_summary": {
-                "has_documented_fault": bool(faults),
-                "documented_fault_count": len(faults),
-                "meaning": "only Noetix-documented motor error codes are classified as faults",
-            },
-            "joint_field_help": {
-                "position": "joint position in radians",
-                "velocity": "joint angular velocity in radians per second",
-                "torque": "raw joint torque feedback from HighController",
-                "temperature": "motor temperature reported by HighController",
-                "error": "raw SDK motor status/error value; use fault=true only for a documented fault",
-            },
             "joint_states": joint_states,
         }
 
