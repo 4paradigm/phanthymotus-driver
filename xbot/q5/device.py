@@ -160,7 +160,14 @@ class MicPlugin:
             "name": "mic", "type": "sensor", "multiInstance": False,
             "description": "Q5 microphone, live PCM 16 kHz/16-bit/mono for ASR.",
             "inputSchema": {"type": "object", "properties": {
-                "action": {"type": "string", "enum": ["start", "stop", "info"]},
+                "action": {"type": "string", "enum": ["start_stream", "stop_stream", "start", "stop", "info"],
+                           "oneOf": [
+                               {"const": "start_stream", "title": "开始采集"},
+                               {"const": "stop_stream", "title": "停止采集"},
+                               {"const": "start", "title": "开始采集（兼容）"},
+                               {"const": "stop", "title": "停止采集（兼容）"},
+                               {"const": "info", "title": "查看状态"},
+                           ]},
             }, "required": ["action"], "additionalProperties": False},
             "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}],
         }
@@ -195,7 +202,7 @@ class MicPlugin:
 
     def dispatch(self, action, args):
         del args
-        if action == "start":
+        if action in ("start_stream", "start"):
             try:
                 _ensure_remote_audio_device(self._device, "input")
                 command = (
@@ -215,9 +222,9 @@ class MicPlugin:
                 self._thread.start()
             except Exception as exc:
                 return {"ok": False, "code": "AUDIO_SETUP_FAILED", "message": str(exc)}
-        elif action == "stop":
+        elif action in ("stop_stream", "stop"):
             self.stop()
-        if action in ("start", "stop", "info"):
+        if action in ("start_stream", "stop_stream", "start", "stop", "info"):
             return {"state": "running" if self._running else "idle",
                     "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}],
                     "frames_sent": self._frames_sent}
@@ -251,7 +258,14 @@ class SpeakerPlugin:
             "name": "speaker", "type": "actuator", "multiInstance": False,
             "description": "Q5 speaker. Connect a perception TTS audio/pcm-16k output to play live speech.",
             "inputSchema": {"type": "object", "properties": {
-                "action": {"type": "string", "enum": ["start", "stop", "info"]},
+                "action": {"type": "string", "enum": ["start_stream", "stop_stream", "start", "stop", "info"],
+                           "oneOf": [
+                               {"const": "start_stream", "title": "开始播放"},
+                               {"const": "stop_stream", "title": "停止播放"},
+                               {"const": "start", "title": "开始播放（兼容）"},
+                               {"const": "stop", "title": "停止播放（兼容）"},
+                               {"const": "info", "title": "查看状态"},
+                           ]},
                 "input_topic": {"type": "string", "description": "PCM 16 kHz AudioChunk topic"},
             }, "required": ["action"], "additionalProperties": False},
             "topic_in": [{"topic": self._topic, "format": "audio/pcm-16k"}],
@@ -295,7 +309,7 @@ class SpeakerPlugin:
             self._process = None
 
     def dispatch(self, action, args):
-        if action == "start":
+        if action in ("start_stream", "start"):
             try:
                 requested = str(args.get("input_topic") or self._topic)
                 if self._running and requested == self._topic:
@@ -323,9 +337,9 @@ class SpeakerPlugin:
                 self._thread.start()
             except Exception as exc:
                 return {"ok": False, "code": "AUDIO_SETUP_FAILED", "message": str(exc)}
-        elif action == "stop":
+        elif action in ("stop_stream", "stop"):
             self.stop()
-        if action in ("start", "stop", "info"):
+        if action in ("start_stream", "stop_stream", "start", "stop", "info"):
             return {"state": "running" if self._running else "idle",
                     "topic_in": [{"topic": self._topic, "format": "audio/pcm-16k"}],
                     "playback": {"device": self._device, "sample_rate_hz": self._output_rate,
