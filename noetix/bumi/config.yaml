@@ -19,23 +19,5 @@ plugins:
     history_size: 100
     # Activity classification only; this is not a motor safety or command limit.
     activity_velocity_threshold: 0.15
-  arm:
-    enabled: true
-    # Bumi LowController writes all 21 motors, even for an arm-only target.
-    # Keep writes disabled until takeover/recovery and a whole-body hold profile
-    # have been verified on the physical EDU robot.
-    write_enabled: false
-    high_low_arbitration_verified: false
-    low_control_recovery_verified: false
-    # Required before write_enabled may be set to true:
-    # verified_speed_limit_rad_s: <vendor-or-bench-verified value>
-    # verified_trajectory_update_hz: <verified value, 1..500>
-    # verified_position_tolerance_rad: <verified completion tolerance>
-    # verified_feedback_timeout_s: <verified timeout>
-    # verified_max_action_duration_s: <verified maximum trajectory duration>
-    # verified_joint_kp: [21 verified values]
-    # verified_joint_kd: [21 verified values]
   media_system:
-    enabled: true
-  diagnostics:
     enabled: true
