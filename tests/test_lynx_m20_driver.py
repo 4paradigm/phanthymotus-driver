@@ -257,6 +257,11 @@ class LynxM20ContractTests(unittest.TestCase):
         stale = [str(path) for path in files if path.is_file() and old_model in path.read_text().lower()]
         self.assertEqual([], stale)
 
+    def test_build_selector_metadata_is_english(self):
+        metadata = (DRIVER / "driver.yaml").read_text()
+        self.assertIn("name: DEEP Robotics Lynx M20 Driver", metadata)
+        self.assertNotRegex(metadata, r"[\u4e00-\u9fff]")
+
 
 if __name__ == "__main__":
     unittest.main()
