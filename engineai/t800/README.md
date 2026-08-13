@@ -38,6 +38,10 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 | `joint_plan` | actuator | 索引/名称关节轨迹、头部/单臂姿态、当前位置保持、取消、复位和预置动作 |
 | `joint_plan_state` | sensor | 规划 request id、状态和进度 |
 | `gesture` | actuator | 官方完整挥手/握手多步序列及任意自定义关节动作队列 |
+| `pose_teach` | actuator | 上肢关键帧示教：capture / preview / export（兼容 `gesture.sequence`） |
+| `odometry` | sensor | Odin2 `nav_msgs/Odometry` 桥接：位姿、四元数、yaw、线/角速度、`stale` |
+| `waypoint` | actuator | 基于 odometry 的命名路标：mark/get/list/delete/distance_to（无 goto） |
+| `mapping` | sensor | Odin2 `cloud/slam` → 二维占据栅格（`sensor/mapping`，不做路径规划） |
 | `joint_override` | actuator | 指定关节 100 Hz 覆盖控制 |
 | `joint_bridge` | actuator | 全 25 关节最高 500 Hz 底层控制 |
 | `led` | actuator | 众擎协议定义的 11 种灯效 |

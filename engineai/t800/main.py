@@ -92,9 +92,13 @@ class T800DeviceBundle:
             MotorPowerPlugin,
             NativeNodeControlPlugin,
             NativeSdkPlugin,
+            OdometryPlugin,
+            MappingPlugin,
+            PoseTeachPlugin,
             SafetyControlPlugin,
             StatePlugin,
             TtsPlugin,
+            WaypointPlugin,
         )
         from virtual_gamepad import VirtualGamepadPlugin
 
@@ -104,6 +108,24 @@ class T800DeviceBundle:
         state = StatePlugin(config, namespace, ros2)
         if plugins.get("state", {}).get("enabled", True):
             self._plugins.append(state)
+
+        instances: dict = {}
+        if plugins.get("odometry", {}).get("enabled", False):
+            instance = OdometryPlugin(config, namespace, ros2)
+            instances["odometry"] = instance
+            self._plugins.append(instance)
+
+        if plugins.get("waypoint", {}).get("enabled", False) and "odometry" in instances:
+            instance = WaypointPlugin(instances["odometry"])
+            instances["waypoint"] = instance
+            self._plugins.append(instance)
+
+        if plugins.get("mapping", {}).get("enabled", False):
+            instance = MappingPlugin(
+                config, namespace, ros2, odometry=instances.get("odometry")
+            )
+            instances["mapping"] = instance
+            self._plugins.append(instance)
 
         plugin_types = (
             ("locomotion", LocomotionPlugin, (config, namespace, ros2, state)),
@@ -117,7 +139,6 @@ class T800DeviceBundle:
             ("native_node_control", NativeNodeControlPlugin, (config, namespace, ros2)),
             ("safety", SafetyControlPlugin, (config, namespace, ros2, state)),
         )
-        instances = {}
         for key, cls, args in plugin_types:
             if plugins.get(key, {}).get("enabled", False):
                 instance = cls(*args)
@@ -132,6 +153,14 @@ class T800DeviceBundle:
         if plugins.get("gesture", {}).get("enabled", True) and "joint_plan" in instances:
             instance = GesturePlugin(instances["joint_plan"])
             instances["gesture"] = instance
+            self._plugins.append(instance)
+
+        if (
+            plugins.get("pose_teach", {}).get("enabled", True)
+            and "gesture" in instances
+        ):
+            instance = PoseTeachPlugin(state, instances["gesture"])
+            instances["pose_teach"] = instance
             self._plugins.append(instance)
 
         virtual_gamepad_config = plugins.get("virtual_gamepad", {})

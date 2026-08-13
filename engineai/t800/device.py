@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import threading
 import time
 from dataclasses import asdict
@@ -17,7 +18,7 @@ from pathlib import Path
 
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-from std_msgs.msg import String
+from std_msgs.msg import String, UInt8MultiArray
 
 from control import (
     LED_MODES,
@@ -32,6 +33,10 @@ from control import (
     float_list,
     joint_payload,
     list_or_default,
+    normalize_odometry_payload,
+    OccupancyGrid2D,
+    extract_xyz_from_pointcloud2,
+    pack_sensor_mapping_binary,
     optional_floats,
     sensor_tool,
     validate_joint_indices,
@@ -301,12 +306,14 @@ class StatePlugin:
                 "control": [
                     "body_velocity", "open_loop_displacement", "open_loop_turn", "open_loop_arc",
                     "motion_fsm", "joint_plan", "joint_override", "joint_bridge", "native_node_control",
-                    "gesture_sequences", "dance", "virtual_gamepad", "soft_emergency_stop",
-                    "motor_power", "led", "tts", "ros_graph_discovery",
+                    "gesture_sequences", "pose_teach", "dance", "virtual_gamepad", "soft_emergency_stop",
+                    "motor_power", "led", "tts", "ros_graph_discovery", "waypoint",
                 ],
-                "feedback": list(self._STREAMS) + ["joint_plan_state"],
+                "feedback": list(self._STREAMS) + ["joint_plan_state", "odometry", "mapping"],
                 "limitations": [
-                    "no odometry topic: displacement/turn/arc are time-integrated open-loop estimates",
+                    "loco displacement/turn/arc remain open-loop even when odometry is available",
+                    "waypoint has no goto; it only stores places and relative geometry",
+                    "mapping is display-only occupancy; no path planning in v1",
                     "no public camera/lidar/dexterous-hand interface in the referenced T800 protocol",
                 ],
                 "timestamp_ms": _now_ms(),
@@ -503,6 +510,497 @@ class StatePlugin:
         if tick % 20 == 0:
             for name, publisher in self._derived_publishers.items():
                 publisher.publish(_json_message(self._derived_snapshot(name)))
+
+
+class OdometryPlugin:
+    """Bridge Odin2 nav_msgs/Odometry to Agent Core as normalized JSON."""
+
+    def __init__(self, config: dict, namespace: str, ros2):
+        self._config = config
+        self._ros2 = ros2
+        plugin_cfg = config.get("plugins", {}).get("odometry", {})
+        self._timeout = float(
+            plugin_cfg.get("stale_timeout_sec", config["ros"].get("source_timeout_sec", 1.0))
+        )
+        self._running = False
+        self._lock = threading.RLock()
+        self._cache: dict | None = None
+        self._updated: float | None = None
+        self._source_topic = self._resolve_source_topic(config)
+        self._core_topic = f"/{namespace}/state/odometry"
+
+        self._sub_node = Node("t800_odometry_sub", context=ros2.ctx_robot)
+        self._pub_node = Node("t800_odometry_pub", context=ros2.ctx_core)
+        ros2.executor_robot.add_node(self._sub_node)
+        ros2.executor_core.add_node(self._pub_node)
+        self._publisher = self._pub_node.create_publisher(String, self._core_topic, _BEST_EFFORT)
+        self._timer = None
+
+    @staticmethod
+    def _resolve_source_topic(config: dict | None = None) -> str:
+        env_topic = os.environ.get("ODOMETRY_TOPIC", "").strip()
+        if env_topic:
+            return env_topic
+        if config is None:
+            return ""
+        return str(config.get("topics", {}).get("odometry", "") or "").strip()
+
+    def get_tool(self) -> dict:
+        source = self._source_topic or "(not configured — set topics.odometry or ODOMETRY_TOPIC)"
+        return sensor_tool(
+            "odometry",
+            f"T800 Odin2 里程计桥接：解析 nav_msgs/Odometry 并发布位姿/速度 JSON（源 topic: {source}）",
+            self._core_topic,
+            "data/json",
+        )
+
+    def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        if not self._source_topic:
+            print("[odometry] source topic not configured; sensor will stay no_data until configured", flush=True)
+            return
+        from nav_msgs.msg import Odometry
+
+        self._sub_node.create_subscription(
+            Odometry, self._source_topic, self._on_odometry, _BEST_EFFORT
+        )
+        self._timer = self._pub_node.create_timer(0.1, self._publish_tick)
+        print(f"[odometry] subscribed {self._source_topic} → {self._core_topic}", flush=True)
+
+    def stop(self) -> None:
+        self._running = False
+
+    def current_pose(self) -> dict | None:
+        snapshot = self._snapshot()
+        if snapshot.get("state") == "no_data" or snapshot.get("stale", True):
+            return None
+        return snapshot
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "info"):
+            return {
+                "state": "running" if self._running else "idle",
+                "source_topic": self._source_topic or None,
+                "topic_out": [{"topic": self._core_topic, "format": "data/json"}],
+            }
+        if action == "stop":
+            return {"state": "idle"}
+        if action in ("odometry", "status"):
+            return self._snapshot()
+        return {"error": f"unknown odometry action: {action}"}
+
+    def _on_odometry(self, msg) -> None:
+        stamp = msg.header.stamp
+        payload = normalize_odometry_payload(
+            frame_id=msg.header.frame_id,
+            child_frame_id=msg.child_frame_id,
+            position=[msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z],
+            orientation=[
+                msg.pose.pose.orientation.x,
+                msg.pose.pose.orientation.y,
+                msg.pose.pose.orientation.z,
+                msg.pose.pose.orientation.w,
+            ],
+            linear_velocity=[
+                msg.twist.twist.linear.x,
+                msg.twist.twist.linear.y,
+                msg.twist.twist.linear.z,
+            ],
+            angular_velocity=[
+                msg.twist.twist.angular.x,
+                msg.twist.twist.angular.y,
+                msg.twist.twist.angular.z,
+            ],
+            stamp_sec=int(stamp.sec),
+            stamp_nanosec=int(stamp.nanosec),
+            received_monotonic=time.monotonic(),
+            stale_timeout_sec=self._timeout,
+        )
+        with self._lock:
+            self._cache = payload
+            self._updated = time.monotonic()
+
+    def _snapshot(self) -> dict:
+        with self._lock:
+            if self._cache is None:
+                return {
+                    "state": "no_data",
+                    "stale": True,
+                    "source_topic": self._source_topic or None,
+                    "timestamp_ms": _now_ms(),
+                }
+            payload = dict(self._cache)
+            updated = self._updated
+        payload["age_sec"] = None if updated is None else max(0.0, time.monotonic() - updated)
+        payload["stale"] = updated is None or payload["age_sec"] > self._timeout
+        payload["state"] = "stale" if payload["stale"] else "ok"
+        payload["source_topic"] = self._source_topic or None
+        payload["timestamp_ms"] = _now_ms()
+        return payload
+
+    def _publish_tick(self) -> None:
+        if not self._running:
+            return
+        with self._lock:
+            if self._cache is None:
+                return
+        self._publisher.publish(_json_message(self._snapshot()))
+
+
+class WaypointPlugin:
+    """Named place markers based on live Odin2 odometry (no autonomous goto)."""
+
+    _MAX_WAYPOINTS = 128
+
+    def __init__(self, odometry: OdometryPlugin):
+        self._odometry = odometry
+        self._lock = threading.Lock()
+        self._waypoints: dict[str, dict] = {}
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "waypoint",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": (
+                "T800 地点路标：基于 odometry 记录/查询命名地点，"
+                "计算距离与方位；第一版不提供 goto 导航"
+            ),
+            "inputSchema": action_schema(
+                {
+                    "mark": (["name", "note", "overwrite"], "记录当前位姿为路标；同名需 overwrite=true"),
+                    "get": (["name"], "查询单个路标"),
+                    "list": ([], "列举全部路标"),
+                    "delete": (["name"], "删除路标"),
+                    "distance_to": (["name"], "相对当前位姿的距离、目标方位与朝向误差"),
+                    "status": ([], "路标数量与 odometry 可用性"),
+                },
+                {
+                    "name": {"type": "string", "description": "路标名称，非空"},
+                    "note": {"type": "string", "description": "备注，可选"},
+                    "overwrite": {
+                        "type": "boolean",
+                        "description": "同名已存在时是否覆盖，默认 false",
+                    },
+                },
+                "路标动作",
+            ),
+        }
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        with self._lock:
+            self._waypoints.clear()
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "info", "status"):
+            pose = self._odometry.current_pose()
+            with self._lock:
+                count = len(self._waypoints)
+            return {
+                "state": "ready",
+                "waypoint_count": count,
+                "odometry_ok": pose is not None,
+                "max_waypoints": self._MAX_WAYPOINTS,
+                "goto_supported": False,
+            }
+        if action == "mark":
+            return self._mark(args)
+        if action == "get":
+            return self._get(args)
+        if action == "list":
+            return self._list()
+        if action == "delete":
+            return self._delete(args)
+        if action == "distance_to":
+            return self._distance_to(args)
+        if action == "stop":
+            with self._lock:
+                return {"state": "idle", "waypoint_count": len(self._waypoints)}
+        return {"error": f"unknown waypoint action: {action}"}
+
+    @staticmethod
+    def _require_name(args: dict) -> str | dict:
+        name = str(args.get("name", "") or "").strip()
+        if not name:
+            return {"error": "name is required and must be non-empty"}
+        return name
+
+    def _mark(self, args: dict) -> dict:
+        name = self._require_name(args)
+        if isinstance(name, dict):
+            return name
+        pose = self._odometry.current_pose()
+        if pose is None:
+            return {"error": "odometry unavailable or stale; cannot mark waypoint"}
+        overwrite = bool(args.get("overwrite", False))
+        note = str(args.get("note", "") or "").strip()
+        waypoint = {
+            "name": name,
+            "x": float(pose["x"]),
+            "y": float(pose["y"]),
+            "z": float(pose["z"]),
+            "yaw_rad": float(pose["yaw_rad"]),
+            "frame_id": str(pose.get("frame_id", "") or ""),
+            "created_at_ms": _now_ms(),
+            "note": note,
+        }
+        with self._lock:
+            exists = name in self._waypoints
+            if exists and not overwrite:
+                return {
+                    "error": f"waypoint already exists: {name}; pass overwrite=true to replace",
+                    "existing": dict(self._waypoints[name]),
+                }
+            if not exists and len(self._waypoints) >= self._MAX_WAYPOINTS:
+                return {"error": f"waypoint limit reached ({self._MAX_WAYPOINTS})"}
+            if exists:
+                waypoint["created_at_ms"] = self._waypoints[name].get(
+                    "created_at_ms", waypoint["created_at_ms"]
+                )
+                waypoint["updated_at_ms"] = _now_ms()
+            self._waypoints[name] = waypoint
+            return {
+                "state": "updated" if exists else "marked",
+                "waypoint": dict(waypoint),
+                "waypoint_count": len(self._waypoints),
+            }
+
+    def _get(self, args: dict) -> dict:
+        name = self._require_name(args)
+        if isinstance(name, dict):
+            return name
+        with self._lock:
+            waypoint = self._waypoints.get(name)
+            if waypoint is None:
+                return {"error": f"waypoint not found: {name}"}
+            return {"state": "ok", "waypoint": dict(waypoint)}
+
+    def _list(self) -> dict:
+        with self._lock:
+            waypoints = [dict(item) for item in self._waypoints.values()]
+        waypoints.sort(key=lambda item: item.get("created_at_ms", 0))
+        return {"state": "ok", "waypoint_count": len(waypoints), "waypoints": waypoints}
+
+    def _delete(self, args: dict) -> dict:
+        name = self._require_name(args)
+        if isinstance(name, dict):
+            return name
+        with self._lock:
+            removed = self._waypoints.pop(name, None)
+            if removed is None:
+                return {"error": f"waypoint not found: {name}"}
+            return {
+                "state": "deleted",
+                "name": name,
+                "waypoint": dict(removed),
+                "waypoint_count": len(self._waypoints),
+            }
+
+    def _distance_to(self, args: dict) -> dict:
+        name = self._require_name(args)
+        if isinstance(name, dict):
+            return name
+        with self._lock:
+            waypoint = self._waypoints.get(name)
+            if waypoint is None:
+                return {"error": f"waypoint not found: {name}"}
+            target = dict(waypoint)
+        pose = self._odometry.current_pose()
+        if pose is None:
+            return {"error": "odometry unavailable or stale; cannot compute distance"}
+        dx = float(target["x"]) - float(pose["x"])
+        dy = float(target["y"]) - float(pose["y"])
+        distance_m = math.hypot(dx, dy)
+        bearing_rad = math.atan2(dy, dx)
+        heading_error_rad = self._normalize_angle(float(target["yaw_rad"]) - float(pose["yaw_rad"]))
+        bearing_error_rad = self._normalize_angle(bearing_rad - float(pose["yaw_rad"]))
+        return {
+            "state": "ok",
+            "name": name,
+            "distance_m": distance_m,
+            "bearing_rad": bearing_rad,
+            "bearing_error_rad": bearing_error_rad,
+            "heading_error_rad": heading_error_rad,
+            "current": {
+                "x": float(pose["x"]),
+                "y": float(pose["y"]),
+                "z": float(pose["z"]),
+                "yaw_rad": float(pose["yaw_rad"]),
+                "frame_id": str(pose.get("frame_id", "") or ""),
+            },
+            "waypoint": target,
+        }
+
+    @staticmethod
+    def _normalize_angle(angle: float) -> float:
+        while angle > math.pi:
+            angle -= 2.0 * math.pi
+        while angle < -math.pi:
+            angle += 2.0 * math.pi
+        return angle
+
+
+class MappingPlugin:
+    """Build a 2D occupancy bird's-eye map from Odin2 cloud/slam and publish sensor/mapping."""
+
+    def __init__(self, config: dict, namespace: str, ros2, odometry: OdometryPlugin | None = None):
+        self._config = config
+        self._odometry = odometry
+        plugin_cfg = config.get("plugins", {}).get("mapping", {})
+        self._timeout = float(
+            plugin_cfg.get("stale_timeout_sec", config["ros"].get("source_timeout_sec", 1.0))
+        )
+        self._publish_period = 1.0 / max(0.1, float(plugin_cfg.get("publish_hz", 1.0)))
+        self._max_points = int(plugin_cfg.get("max_points", 50000))
+        self._source_topic = self._resolve_source_topic(config)
+        self._core_topic = f"/{namespace}/state/mapping"
+        self._running = False
+        self._lock = threading.RLock()
+        self._updated: float | None = None
+        self._last_accepted = 0
+        self._grid = OccupancyGrid2D(
+            resolution_m=float(plugin_cfg.get("resolution_m", 0.1)),
+            z_min_m=float(plugin_cfg.get("z_min_m", 0.1)),
+            z_max_m=float(plugin_cfg.get("z_max_m", 1.8)),
+            min_hits=int(plugin_cfg.get("min_hits", 1)),
+            max_extent_m=float(plugin_cfg.get("max_extent_m", 40.0)),
+        )
+
+        self._sub_node = Node("t800_mapping_sub", context=ros2.ctx_robot)
+        self._pub_node = Node("t800_mapping_pub", context=ros2.ctx_core)
+        ros2.executor_robot.add_node(self._sub_node)
+        ros2.executor_core.add_node(self._pub_node)
+        self._publisher = self._pub_node.create_publisher(UInt8MultiArray, self._core_topic, _BEST_EFFORT)
+        self._timer = None
+
+    @staticmethod
+    def _resolve_source_topic(config: dict) -> str:
+        env_topic = os.environ.get("CLOUD_SLAM_TOPIC", "").strip()
+        if env_topic:
+            return env_topic
+        return str(config.get("topics", {}).get("cloud_slam", "") or "").strip()
+
+    def get_tool(self) -> dict:
+        source = self._source_topic or "(not configured — set topics.cloud_slam or CLOUD_SLAM_TOPIC)"
+        return {
+            "name": "mapping",
+            "type": "sensor",
+            "multiInstance": False,
+            "readOnly": True,
+            "description": (
+                "T800 Odin2 SLAM 点云二维占据栅格：高度带滤波后投影到 XY，"
+                f"以 sensor/mapping 发布给画布（源 topic: {source}）；第一版不做路径规划"
+            ),
+            "inputSchema": action_schema(
+                {
+                    "clear": ([], "清空当前累计栅格"),
+                    "status": ([], "查询分辨率、原点、占据统计与 stale"),
+                },
+                {},
+                "建图动作",
+            ),
+            "topic_out": [{"topic": self._core_topic, "format": "sensor/mapping"}],
+        }
+
+    def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        if not self._source_topic:
+            print("[mapping] source topic not configured; sensor will stay no_data until configured", flush=True)
+            return
+        from sensor_msgs.msg import PointCloud2
+
+        self._sub_node.create_subscription(
+            PointCloud2, self._source_topic, self._on_cloud, _BEST_EFFORT
+        )
+        self._timer = self._pub_node.create_timer(self._publish_period, self._publish_tick)
+        print(f"[mapping] subscribed {self._source_topic} → {self._core_topic}", flush=True)
+
+    def stop(self) -> None:
+        self._running = False
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "info"):
+            return {
+                "state": "running" if self._running else "idle",
+                "source_topic": self._source_topic or None,
+                "topic_out": [{"topic": self._core_topic, "format": "sensor/mapping"}],
+                "path_planning": False,
+            }
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "clear":
+            with self._lock:
+                self._grid.clear()
+                self._updated = None
+                self._last_accepted = 0
+            return {"state": "cleared"}
+        if action in ("mapping", "status"):
+            return self._snapshot()
+        return {"error": f"unknown mapping action: {action}"}
+
+    def _on_cloud(self, msg) -> None:
+        points = extract_xyz_from_pointcloud2(
+            msg.fields,
+            int(msg.point_step),
+            int(msg.width),
+            int(msg.height),
+            msg.data,
+        )
+        frame_id = str(getattr(msg.header, "frame_id", "") or "")
+        with self._lock:
+            accepted = self._grid.ingest_points(points, frame_id=frame_id)
+            self._last_accepted = accepted
+            self._updated = time.monotonic()
+
+    def _snapshot(self) -> dict:
+        with self._lock:
+            meta = self._grid.snapshot()
+            updated = self._updated
+            last_accepted = self._last_accepted
+        age = None if updated is None else max(0.0, time.monotonic() - updated)
+        stale = updated is None or (age is not None and age > self._timeout)
+        return {
+            "state": "no_data" if updated is None else ("stale" if stale else "ok"),
+            "stale": stale,
+            "age_sec": age,
+            "source_topic": self._source_topic or None,
+            "last_accepted_points": last_accepted,
+            "timestamp_ms": _now_ms(),
+            "path_planning": False,
+            **meta,
+        }
+
+    def _robot_pose(self) -> tuple[float, float, float]:
+        if self._odometry is None:
+            return 0.0, 0.0, 0.0
+        pose = self._odometry.current_pose()
+        if pose is None:
+            return 0.0, 0.0, 0.0
+        return float(pose["x"]), float(pose["y"]), float(pose["yaw_rad"])
+
+    def _publish_tick(self) -> None:
+        if not self._running:
+            return
+        with self._lock:
+            if self._updated is None:
+                return
+            centers = self._grid.occupied_cell_centers(max_points=self._max_points)
+        if not centers:
+            return
+        robot_x, robot_y, robot_yaw = self._robot_pose()
+        payload = pack_sensor_mapping_binary(
+            robot_x, robot_y, robot_yaw, centers, max_points=self._max_points
+        )
+        msg = UInt8MultiArray()
+        msg.data = list(payload)
+        self._publisher.publish(msg)
 
 
 class LocomotionPlugin:
@@ -1173,6 +1671,216 @@ class GesturePlugin:
         with self._lock:
             self._status["state"] = "cancelled"
             return dict(self._status)
+
+
+class PoseTeachPlugin:
+    """Capture upper-body keyframes from live joints for gesture.sequence export."""
+
+    _INDICES = list(range(12, 25))
+    _DEFAULT_DURATION = 2.0
+    _MAX_FRAMES = 64
+
+    def __init__(self, state: StatePlugin, gesture: GesturePlugin):
+        self._state = state
+        self._gesture = gesture
+        self._lock = threading.Lock()
+        self._frames: list[dict] = []
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "pose_teach",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": (
+                "T800 姿态示教：从当前关节状态录制上肢关键帧（索引 12–24），"
+                "支持预览回放与导出为 gesture.sequence 兼容步骤"
+            ),
+            "inputSchema": action_schema(
+                {
+                    "capture": (["label", "duration"], "读取当前上肢关节角并追加一帧"),
+                    "list": ([], "列出当前会话已录关键帧"),
+                    "update": (["index", "label", "duration"], "修改指定关键帧的 label / duration"),
+                    "preview": (["reset_after", "wait"], "用 gesture.sequence 回放已录关键帧"),
+                    "export": (["format", "name"], "导出 gesture.sequence 步骤或 GesturePlugin YAML 片段"),
+                    "clear": ([], "清空当前会话关键帧"),
+                    "status": ([], "查询关键帧数量与关节范围"),
+                },
+                {
+                    "label": {"type": "string", "description": "关帧备注名，可选"},
+                    "duration": {
+                        "type": "number",
+                        "minimum": 0.05,
+                        "maximum": 120.0,
+                        "description": "该步规划时长（秒），默认 2.0",
+                    },
+                    "index": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "关帧下标（从 0 开始）",
+                    },
+                    "reset_after": {"type": "boolean"},
+                    "wait": {"type": "boolean", "description": "等待预览序列完成"},
+                    "format": {
+                        "type": "string",
+                        "enum": ["sequence", "yaml"],
+                        "description": "sequence=gesture.sequence 步骤；yaml=可粘贴进 _GESTURES 的片段",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "yaml 导出时的手势名，默认 custom_pose",
+                    },
+                },
+                "示教动作",
+            ),
+        }
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        with self._lock:
+            self._frames.clear()
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "info", "status"):
+            with self._lock:
+                count = len(self._frames)
+            return {
+                "state": "ready",
+                "frame_count": count,
+                "joint_indices": list(self._INDICES),
+                "joint_names": [T800_JOINT_NAMES[i] for i in self._INDICES],
+                "max_frames": self._MAX_FRAMES,
+            }
+        if action == "capture":
+            return self._capture(args)
+        if action == "list":
+            return self._list_frames()
+        if action == "update":
+            return self._update(args)
+        if action == "preview":
+            return self._preview(args)
+        if action == "export":
+            return self._export(args)
+        if action == "clear":
+            with self._lock:
+                cleared = len(self._frames)
+                self._frames.clear()
+            return {"state": "cleared", "cleared": cleared, "frames": []}
+        if action == "stop":
+            return {"state": "idle", "frame_count": len(self._frames)}
+        return {"error": f"unknown pose_teach action: {action}"}
+
+    def _capture(self, args: dict) -> dict:
+        positions = self._state.joint_positions()
+        if len(positions) < max(self._INDICES) + 1:
+            return {"error": "joint state unavailable or incomplete"}
+        duration = float(args.get("duration", self._DEFAULT_DURATION))
+        if duration < 0.05 or duration > 120.0:
+            return {"error": "duration must be between 0.05 and 120"}
+        label = str(args.get("label", "") or "").strip()
+        targets = [float(positions[i]) for i in self._INDICES]
+        with self._lock:
+            if len(self._frames) >= self._MAX_FRAMES:
+                return {"error": f"frame limit reached ({self._MAX_FRAMES})"}
+            frame = {
+                "index": len(self._frames),
+                "label": label or f"frame_{len(self._frames)}",
+                "joint_indices": list(self._INDICES),
+                "target_positions": targets,
+                "duration": duration,
+            }
+            self._frames.append(frame)
+            return {"state": "captured", "frame": dict(frame), "frame_count": len(self._frames)}
+
+    def _list_frames(self) -> dict:
+        with self._lock:
+            frames = [dict(frame) for frame in self._frames]
+        return {"state": "ready", "frame_count": len(frames), "frames": frames}
+
+    def _update(self, args: dict) -> dict:
+        if "index" not in args:
+            return {"error": "index is required"}
+        try:
+            index = int(args["index"])
+        except (TypeError, ValueError):
+            return {"error": "index must be an integer"}
+        with self._lock:
+            if index < 0 or index >= len(self._frames):
+                return {"error": f"index out of range: {index}"}
+            frame = self._frames[index]
+            if "label" in args:
+                label = str(args.get("label", "") or "").strip()
+                frame["label"] = label or frame["label"]
+            if "duration" in args:
+                duration = float(args["duration"])
+                if duration < 0.05 or duration > 120.0:
+                    return {"error": "duration must be between 0.05 and 120"}
+                frame["duration"] = duration
+            frame["index"] = index
+            return {"state": "updated", "frame": dict(frame), "frame_count": len(self._frames)}
+
+    def _steps(self) -> list[dict]:
+        with self._lock:
+            frames = [dict(frame) for frame in self._frames]
+        return [
+            {
+                "joint_indices": list(frame["joint_indices"]),
+                "target_positions": list(frame["target_positions"]),
+                "duration": float(frame["duration"]),
+                "stiffness": list(GesturePlugin._BASE_STIFFNESS),
+                "damping": list(GesturePlugin._BASE_DAMPING),
+                "gravity_compensation": True,
+            }
+            for frame in frames
+        ]
+
+    def _preview(self, args: dict) -> dict:
+        steps = self._steps()
+        if not steps:
+            return {"error": "no frames to preview; capture at least one keyframe"}
+        return self._gesture.dispatch(
+            "sequence",
+            {
+                "steps": steps,
+                "reset_after": bool(args.get("reset_after", False)),
+                "wait": bool(args.get("wait", False)),
+            },
+        )
+
+    def _export(self, args: dict) -> dict:
+        steps = self._steps()
+        if not steps:
+            return {"error": "no frames to export; capture at least one keyframe"}
+        fmt = str(args.get("format", "sequence") or "sequence")
+        name = str(args.get("name", "custom_pose") or "custom_pose").strip() or "custom_pose"
+        with self._lock:
+            frames = [dict(frame) for frame in self._frames]
+        payload = {
+            "state": "exported",
+            "format": fmt,
+            "frame_count": len(frames),
+            "frames": frames,
+            "steps": steps,
+            "gesture_call": {
+                "tool": "gesture",
+                "action": "sequence",
+                "arguments": {"steps": steps, "reset_after": True, "wait": False},
+            },
+        }
+        if fmt == "yaml":
+            lines = [f'"{name}": [']
+            for frame in frames:
+                pos = ", ".join(f"{value:.6g}" for value in frame["target_positions"])
+                lines.append(
+                    f"    ([{pos}], {float(frame['duration']):.3g}, _BASE_STIFFNESS),"
+                )
+            lines.append("]")
+            payload["yaml"] = "\n".join(lines)
+            payload["name"] = name
+        elif fmt != "sequence":
+            return {"error": f"unsupported export format: {fmt}"}
+        return payload
 
 
 class _JointStreamBase:

@@ -40,6 +40,10 @@ topics:
   joint_command: "/hardware/joint_command"
   tts: "/hardware/tts"
   native_node_control: "/motion/node_control"
+  # Odin2 nav_msgs/Odometry — confirm full path via: ros2 topic list | grep odometry
+  odometry: ""
+  # Odin2 SLAM point cloud — confirm via: ros2 topic list | grep cloud/slam
+  cloud_slam: ""
 
 services:
   enable_motor: "/hardware/enable_motor"
@@ -57,6 +61,22 @@ plugins:
     enabled: true
   gesture:
     enabled: true
+  pose_teach:
+    enabled: true
+  odometry:
+    enabled: true
+    stale_timeout_sec: 1.0
+  waypoint:
+    enabled: true
+  mapping:
+    enabled: true
+    resolution_m: 0.1
+    z_min_m: 0.1
+    z_max_m: 1.8
+    publish_hz: 1.0
+    min_hits: 1
+    max_extent_m: 40.0
+    stale_timeout_sec: 2.0
   joint_override:
     enabled: true
   joint_bridge:
