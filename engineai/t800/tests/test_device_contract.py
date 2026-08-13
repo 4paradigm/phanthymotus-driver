@@ -186,6 +186,11 @@ class DevicePluginContractTests(unittest.TestCase):
             self.device.NativeNodeControlPlugin(CONFIG, "robot", self.ros),
             self.device.SafetyControlPlugin(CONFIG, "robot", self.ros, self.state),
             self.device.NativeSdkPlugin({"mode": "external"}, "robot", self.ros),
+            self.device.HeartbeatStatusPlugin(CONFIG, "robot", self.ros),
+            self.device.LinkInfoPlugin(CONFIG, "robot", self.ros),
+            self.device.MotionCommandTracePlugin(CONFIG, "robot", self.ros),
+            self.device.MotionEventsPlugin(CONFIG, "robot", self.ros),
+            self.device.NativeInterfaceProbePlugin(CONFIG, "robot", self.ros),
             VirtualGamepadPlugin({}, "robot", self.ros),
         ]
         names = set()
@@ -196,12 +201,14 @@ class DevicePluginContractTests(unittest.TestCase):
             {"joints", "imu", "battery", "motor_health", "motor_state", "motor_command", "joint_command_feedback",
              "gamepad", "motion_state", "driver_health", "model",
              "robot_snapshot", "fault_summary", "stability", "joint_groups", "capabilities", "ros_graph",
+             "mainboard", "heartbeat_status", "link_info", "motion_command_trace", "motion_events",
+             "native_interface_probe",
              "loco", "motion_mode", "dance", "joint_plan", "joint_plan_state", "gesture",
              "joint_override", "joint_bridge",
              "led", "tts", "motor_power", "native_node_control", "virtual_gamepad", "safety", "native_sdk"},
             names,
         )
-        self.assertEqual(32, len(names))
+        self.assertEqual(38, len(names))
 
     def test_derived_diagnostics_and_capability_resources(self):
         self.state._set("imu", {
