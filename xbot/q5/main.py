@@ -61,34 +61,16 @@ class Q5DeviceBundle:
         self._failed_plugins: list = []
         plugins_cfg = cfg.get("plugins", {})
 
-        # (config_key, plugin_class_name, module_path)
+        # Only verified Q5 cards are shipped in this bundle.
         _PLUGIN_MAP = [
+            ("base_drive", "BaseDrivePlugin"),
+            ("arm_control", "ArmControlPlugin"),
+            ("hand_control", "HandControlPlugin"),
+            ("hand_gesture", "HandGesturePlugin"),
+            ("head_control", "HeadControlPlugin"),
             ("state", "StatePlugin"),
-            ("imu", "ImuPlugin"),
             ("battery", "BatteryPlugin"),
-            ("faults", "FaultsPlugin"),
-            ("loco", "LocoPlugin"),
-            ("joint_servo", "JointServoPlugin"),
-            ("hand", "HandPlugin"),
-            ("hand_state", "HandStatePlugin"),
-            ("head", "HeadPlugin"),
-            ("head_gesture", "HeadGesturePlugin"),
-            ("arm", "ArmPlugin"),
-            ("arm_gesture", "ArmGesturePlugin"),
-            ("motion", "MotionPlugin"),
-            ("gesture", "GesturePlugin"),
             ("audio", "AudioPlugin"),
-            ("speaker", "SpeakerPlugin"),
-            ("led", "LedPlugin"),
-            ("nav", "NavPlugin"),
-            ("teleop", "TeleopPlugin"),
-            ("odom", "OdomPlugin"),
-            ("simple_actions", "SimpleActionsPlugin"),
-            ("simple_trajectory", "SimpleTrajectoryPlugin"),
-            ("behavior", "BehaviorPlugin"),
-            ("grasp", "GraspObjectPlugin"),
-            ("motion_action", "MotionActionPlugin"),
-            ("camera", "CameraPlugin"),
         ]
 
         for key, cls_name in _PLUGIN_MAP:
@@ -305,7 +287,7 @@ def main():
     print(f"[bundle] SDK client started ({'live' if sdk_client.available else 'STUB'})")
 
     # Bridge Worker subprocess — publishes sensor snapshots to Domain 42/FastDDS
-    bridge_worker = bridge_worker_mod.BridgeWorker(debug=False)
+    bridge_worker = bridge_worker_mod.BridgeWorker(namespace, debug=False)
     bridge_worker.start()
     print("[bundle] BridgeWorker subprocess started (Domain 42/FastDDS)")
 

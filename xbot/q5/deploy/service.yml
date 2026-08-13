@@ -8,7 +8,6 @@ xbot-q5:
   volumes:
     - /dev:/dev
     - /opt/phanthy-motus/data:/opt/phanthy-motus/data
-    - /opt/phanthy-motus/models/sherpa-onnx/tts:/models/sherpa-onnx/tts:ro
   environment:
     - ROS_DOMAIN_ID=211
     - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp

@@ -27,12 +27,9 @@ RUN apt-get update && \
         python3-colcon-common-extensions \
         cmake \
         build-essential \
-        libportaudio2 \
-        portaudio19-dev \
-        libasound2-dev \
-        alsa-utils \
         ros-humble-rmw-cyclonedds-cpp \
         ros-humble-rmw-fastrtps-cpp \
+        ros-humble-lifecycle-msgs \
         ros-humble-control-msgs \
         ros-humble-nav-msgs \
         ros-humble-sensor-msgs \
@@ -41,11 +38,6 @@ RUN apt-get update && \
         ros-humble-diagnostic-msgs \
         ros-humble-action-msgs && \
     rm -rf /var/lib/apt/lists/*
-
-RUN pip3 install --no-cache-dir --timeout=300 --retries=5 -i ${PYPI_MIRROR} \
-    pyaudio && \
-    pip3 install --no-cache-dir --timeout=300 --retries=5 -i ${PYPI_MIRROR} \
-    sherpa-onnx || echo "[WARN] sherpa-onnx install failed — SpeakerPlugin will not work"
 
 # 本地 vendor 的 ROS2 消息包：xbot_common_interfaces + era_nav_msgs
 COPY vendor/xbot_common_interfaces /q5_ws/src/xbot_common_interfaces
@@ -58,6 +50,8 @@ RUN cd /q5_ws && \
 COPY vendor/xbot_sdk_api /opt/xbot_sdk_api
 
 COPY main.py device.py q5_sdk_client.py q5_bridge_worker.py config.yaml driver.yaml /work/
+COPY direct_control.py body_command.py hand_command.py control_contract.py joint_limits.py /work/
+COPY resource /work/resource
 
 ENV RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 ENV ROS_DOMAIN_ID=211

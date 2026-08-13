@@ -1,67 +1,42 @@
 mcp_port: 15708
 ros_namespace: ""   # 留空则自动使用 hostname
 name: "XBot-Q5"
+joint_state_position_unit: "radians"
 
 plugins:
   state:
     enabled: true
-  loco:
+  base_drive:
     enabled: true
-  joint_servo:
+    max_linear_x_mps: 0.20
+    max_angular_z_radps: 0.40
+    max_duration_s: 2.0
+    publish_rate_hz: 10.0
+    stop_repetitions: 3
+  arm_control:
     enabled: true
-  hand:
+    max_step_rad: 0.010
+    publish_rate_hz: 20.0
+    hold_repetitions: 3
+  hand_control:
     enabled: true
-  hand_state:
+    min_position_rad: 0.0
+    max_position_rad: 1.0
+    max_step_rad: 0.04
+    max_duration_s: 2.0
+    publish_rate_hz: 20.0
+    hold_repetitions: 3
+  hand_gesture:
     enabled: true
-  imu:
+    max_duration_s: 2.0
+    publish_rate_hz: 20.0
+  head_control:
     enabled: true
-  head:
-    enabled: true
-  arm:
-    enabled: true
-  arm_gesture:
-    enabled: true
-  head_gesture:
-    enabled: true
-  motion:
-    enabled: true
-  gesture:
-    enabled: true
+    max_step_rad: 0.025
+    publish_rate_hz: 20.0
+    hold_repetitions: 3
   audio:
-    enabled: true
+    enabled: true  # 已确认 /audio_player/play (AudioPlay) 及配套服务存在
     device: "plughw:2,0"
-  speaker:
-    enabled: true
-    volume: 50
-    model_dir: "/models/sherpa-onnx/tts"
-    speaker_id: 0
-    speed: 1.0
-    # device: "plughw:2,0"  # ALSA device name (optional, leave empty for default)
-  led:
-    enabled: true
   battery:
     enabled: true
-  faults:
-    enabled: true
-  camera:
-    enabled: false
-  nav:
-    enabled: true
-  teleop:
-    enabled: true
-  odom:
-    enabled: true
-  simple_actions:
-    enabled: true
-  simple_trajectory:
-    enabled: true
-    action_server: "/simple_trajectory"
-  behavior:
-    enabled: false  # action server 不存在于真机
-    action_server: "/behavior_action"
-  grasp:
-    enabled: false  # action server 不存在于真机
-    action_server: "/grasp_object_action"
-  motion_action:
-    enabled: false  # action server 不存在于真机
-    action_server: "/motion_action"

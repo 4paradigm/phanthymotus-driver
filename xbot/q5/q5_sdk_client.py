@@ -44,6 +44,13 @@ class Q5SdkClient:
         self._lifecycle_client = None
         self._lifecycle_request_type = None
         self._lifecycle_request_pending = False
+        self._query_state_client = None
+        self._query_state_request_type = None
+        self._query_state_pending = False
+        self._battery_version_client = None
+        self._battery_version_request_type = None
+        self._battery_version_pending = False
+        self._battery_version_received = False
         self._executor = None
         self._joint_state_position_unit = joint_state_position_unit
 
@@ -56,6 +63,7 @@ class Q5SdkClient:
             from sensor_msgs.msg import BatteryState, Imu
             from nav_msgs.msg import Odometry
             from xbot_common_interfaces.msg import FaultArray, HandXd12
+            from xbot_common_interfaces.srv import GetVersion, QueryState
             from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, HistoryPolicy
             from lifecycle_msgs.srv import GetState
 
@@ -85,6 +93,16 @@ class Q5SdkClient:
                 GetState, "/motion_manager/get_state")
             self._lifecycle_request_type = GetState.Request
             self._node.create_timer(1.0, self._refresh_lifecycle_state)
+            # Read-only service fallbacks/complements for the vendor status
+            # topics. QueryState is polled at 1 Hz; battery firmware is static
+            # for the lifetime of a process and therefore requested once.
+            self._query_state_client = self._node.create_client(
+                QueryState, "/query_xbot_state")
+            self._query_state_request_type = QueryState.Request
+            self._battery_version_client = self._node.create_client(
+                GetVersion, "/Battery/GetVersion")
+            self._battery_version_request_type = GetVersion.Request
+            self._node.create_timer(1.0, self._refresh_readonly_services)
 
             # RobotStatus is vendor-defined and published with TRANSIENT_LOCAL
             # durability.
@@ -139,6 +157,62 @@ class Q5SdkClient:
                 self._node.get_logger().warn(f"lifecycle response failed: {e}")
         finally:
             self._lifecycle_request_pending = False
+
+    def _refresh_readonly_services(self):
+        if self._query_state_client is not None and not self._query_state_pending:
+            if self._query_state_client.service_is_ready():
+                try:
+                    future = self._query_state_client.call_async(
+                        self._query_state_request_type())
+                    self._query_state_pending = True
+                    future.add_done_callback(self._on_query_state)
+                except Exception as e:
+                    if self._node is not None:
+                        self._node.get_logger().warn(f"query_xbot_state failed: {e}")
+        if (self._battery_version_client is not None and not self._battery_version_pending
+                and not self._battery_version_received and self._battery_version_client.service_is_ready()):
+            try:
+                future = self._battery_version_client.call_async(
+                    self._battery_version_request_type())
+                self._battery_version_pending = True
+                future.add_done_callback(self._on_battery_version)
+            except Exception as e:
+                if self._node is not None:
+                    self._node.get_logger().warn(f"Battery/GetVersion failed: {e}")
+
+    def _on_query_state(self, future):
+        try:
+            response = future.result()
+            status = response.status
+            received_at_ms = int(time.time() * 1000)
+            snapshot = {"available": True, "received_at_ms": received_at_ms,
+                        "state": int(status.state), "message": str(status.msg),
+                        "source_service": "/query_xbot_state"}
+            with self._lock:
+                self._sensor_snapshots["query_state"] = snapshot
+                self._last_sensor_received["query_state"] = time.time()
+        except Exception as e:
+            if self._node is not None:
+                self._node.get_logger().warn(f"query_xbot_state response failed: {e}")
+        finally:
+            self._query_state_pending = False
+
+    def _on_battery_version(self, future):
+        try:
+            response = future.result()
+            received_at_ms = int(time.time() * 1000)
+            snapshot = {"available": True, "received_at_ms": received_at_ms,
+                        "components": dict(zip(response.name, response.version)),
+                        "source_service": "/Battery/GetVersion"}
+            with self._lock:
+                self._sensor_snapshots["battery_version"] = snapshot
+                self._last_sensor_received["battery_version"] = time.time()
+            self._battery_version_received = True
+        except Exception as e:
+            if self._node is not None:
+                self._node.get_logger().warn(f"Battery/GetVersion response failed: {e}")
+        finally:
+            self._battery_version_pending = False
 
     def _on_joint_state(self, msg):
         """JointState callback → update snapshot."""
@@ -348,6 +422,10 @@ class Q5SdkClient:
                 self._lifecycle_client = None
                 self._lifecycle_request_type = None
                 self._lifecycle_request_pending = False
+                self._query_state_client = None
+                self._query_state_request_type = None
+                self._battery_version_client = None
+                self._battery_version_request_type = None
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -419,9 +497,18 @@ class Q5SdkClient:
         """
         with self._lock:
             snap = dict(self._snapshot) if self._snapshot else {}
-            # Merge sensor snapshots under '_sensor_' prefix
+            # Merge sensor snapshots under '_sensor_' prefix. Compute the same
+            # local freshness verdict used by sensor_snapshot(), so the Domain
+            # 42 bridge never publishes an otherwise-valid reading as stale.
+            now = time.time()
             for key, val in self._sensor_snapshots.items():
-                snap[f"_sensor_{key}"] = dict(val)
+                sensor = dict(val)
+                received = self._last_sensor_received.get(key)
+                age_ms = int((now - received) * 1000) if received is not None else None
+                sensor["age_ms"] = age_ms
+                sensor["fresh"] = bool(age_ms is not None and age_ms <= STALE_THRESHOLD_MS)
+                sensor["stale"] = not sensor["fresh"]
+                snap[f"_sensor_{key}"] = sensor
             for key, val in self._last_sensor_received.items():
                 snap[f"_sensor_received_{key}"] = val
 
