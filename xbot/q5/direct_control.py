@@ -527,8 +527,15 @@ class ArmControlPlugin:
                 "Refusing arm motion: multiple q5_body_command publishers are active on /wr1_controller/commands",
                 status=status,
             )
-        if status["lifecycle_state"] != "active":
-            return _arm_failure("LIFECYCLE_NOT_ACTIVE", "Q5 motion_manager must be active before arm control", status=status)
+        if not bool(getattr(self._client, "direct_control_prepared", False)):
+            return _arm_failure(
+                "DIRECT_CONTROL_NOT_PREPARED",
+                "Run q5_control_mode action=prepare_position_control first; vendor position-control sequence has not completed",
+                status=status,
+            )
+        # Direct HybridJointCommand control is owned by the vendor body
+        # controller after q5_control_mode completes. motion_manager is a
+        # separate lifecycle node and may legitimately remain inactive.
         q5_ready, q5_status = q5_is_control_ready(self._client)
         if not q5_ready:
             return _arm_failure("Q5_FSM_NOT_READY", "Q5 /xbot_state must be fresh and READY or ACTIVE before arm control",

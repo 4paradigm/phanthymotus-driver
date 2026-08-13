@@ -134,6 +134,11 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
         history=HistoryPolicy.KEEP_LAST,
         depth=1,
     )
+    QOS_MEDIA = QoSProfile(
+        reliability=ReliabilityPolicy.RELIABLE,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=1,
+    )
 
     # ── Publishers ─────────────────────────────────────────────────────────────
     def _pub(topic):
@@ -151,9 +156,9 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
     pub_fault = _pub(f"{prefix}/faults")
     pub_hand = _pub(f"{prefix}/hand_sensor")
     pub_odom = _pub(f"{prefix}/odom")
-    pub_rgb = node.create_publisher(CompressedImage, f"{prefix}/q5/camera/rgb", QOS_SENSOR)
-    pub_depth = node.create_publisher(Image, f"{prefix}/q5/camera/depth", QOS_SENSOR)
-    pub_mic = node.create_publisher(AudioChunk, f"{prefix}/q5/mic/audio", QOS_SENSOR)
+    pub_rgb = node.create_publisher(CompressedImage, f"{prefix}/q5/camera/rgb", QOS_MEDIA)
+    pub_depth = node.create_publisher(Image, f"{prefix}/q5/camera/depth", QOS_MEDIA)
+    pub_mic = node.create_publisher(AudioChunk, f"{prefix}/q5/mic/audio", QOS_MEDIA)
     speaker_sub = None
 
     def _on_speaker(msg):
@@ -238,11 +243,13 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
         kind = media.get("kind")
         if kind == "rgb":
             out = CompressedImage()
+            out.header.stamp = node.get_clock().now().to_msg()
             out.format = "jpeg"
             out.data = media["data"]
             pub_rgb.publish(out)
         elif kind == "depth":
             out = Image()
+            out.header.stamp = node.get_clock().now().to_msg()
             out.height = int(media["height"])
             out.width = int(media["width"])
             out.encoding = str(media["encoding"])
@@ -275,7 +282,7 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
                 if speaker_sub is not None:
                     node.destroy_subscription(speaker_sub)
                 speaker_sub = node.create_subscription(
-                    AudioChunk, str(cmd["topic"]), _on_speaker, QOS_SENSOR)
+                    AudioChunk, str(cmd["topic"]), _on_speaker, QOS_MEDIA)
                 node.get_logger().info(f"speaker subscribed to {cmd['topic']}")
             elif debug:
                 node.get_logger().debug(f"bridge cmd: {cmd}")

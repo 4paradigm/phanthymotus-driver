@@ -23,7 +23,6 @@ RUN if [ -n "$APT_MIRROR" ]; then \
 
 RUN apt-get -o Acquire::Retries=5 update && \
     apt-get install -y --no-install-recommends \
-        python3-pip \
         python3-numpy \
         python3-opencv \
         openssh-client \
@@ -45,11 +44,10 @@ RUN apt-get -o Acquire::Retries=5 update && \
 
 # 本地 vendor 的 ROS2 消息包。
 COPY vendor/xbot_common_interfaces /q5_ws/src/xbot_common_interfaces
-COPY vendor/era_nav_msgs /q5_ws/src/era_nav_msgs
 COPY vendor/audio_msgs /q5_ws/src/audio_msgs
 RUN cd /q5_ws && \
     . /opt/ros/humble/setup.sh && \
-    colcon build --packages-select xbot_common_interfaces era_nav_msgs audio_msgs
+    colcon build --packages-select xbot_common_interfaces audio_msgs
 
 # 本地 vendor 的纯 Python SDK（非 colcon 包，直接 import）
 COPY vendor/xbot_sdk_api /opt/xbot_sdk_api

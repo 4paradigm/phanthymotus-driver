@@ -18,7 +18,8 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_srvs.srv import Trigger
 from xbot_common_interfaces.action import AudioPlay
-from xbot_common_interfaces.srv import SetVolume
+from xbot_common_interfaces.action import SimpleActions
+from xbot_common_interfaces.srv import DynamicLaunch, SetVolume
 
 # main.py resolves all card classes through this module. Keep the direct
 # control cards here as explicit exports while their implementation remains
@@ -246,6 +247,101 @@ class SpeakerPlugin:
         return None
 
 
+class Q5ControlModePlugin:
+    """Explicitly prepare the vendor position-control pipeline for direct cards."""
+
+    def __init__(self, plugin_config, namespace, executor, client):
+        del plugin_config, namespace
+        self._client = client
+        self._node = Node("q5_control_mode")
+        executor.add_node(self._node)
+        self._dynamic = self._node.create_client(DynamicLaunch, "/dynamic_launch")
+        self._ready = self._node.create_client(Trigger, "/ready_service")
+        self._activate = self._node.create_client(Trigger, "/activate_service")
+        self._actions = ActionClient(self._node, SimpleActions, "/simple_actions")
+        self._prepared = bool(getattr(client, "direct_control_prepared", False))
+        client.direct_control_prepared = self._prepared
+
+    def get_tool(self):
+        return {
+            "name": "q5_control_mode", "type": "actuator", "multiInstance": False,
+            "description": "Q5直控模式准备：按厂商流程切换到位置控制并校验READY/ACTIVE。",
+            "inputSchema": {"type": "object", "properties": {
+                "action": {"type": "string", "enum": ["status", "prepare_position_control"]},
+            }, "required": ["action"], "additionalProperties": False},
+        }
+
+    @staticmethod
+    def _wait(future, timeout):
+        deadline = time.monotonic() + timeout
+        while not future.done() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        return future.result() if future.done() else None
+
+    def _call(self, client, timeout=15.0):
+        if not client.wait_for_service(timeout_sec=timeout):
+            return None, "service unavailable"
+        response = self._wait(client.call_async(Trigger.Request()), timeout)
+        return response, "timeout" if response is None else ""
+
+    def _simple_action(self, name, timeout=30.0):
+        if not self._actions.wait_for_server(timeout_sec=5.0):
+            return False, "simple_actions unavailable"
+        goal = SimpleActions.Goal()
+        goal.action_name = name
+        goal.time_cost = 4.0
+        sent = self._wait(self._actions.send_goal_async(goal), 8.0)
+        if sent is None or not sent.accepted:
+            return False, "goal rejected"
+        result = self._wait(sent.get_result_async(), timeout)
+        if result is None:
+            return False, "goal timeout"
+        wrapped = result.result
+        return int(getattr(wrapped, "result", 0)) == 0, str(getattr(wrapped, "message", ""))
+
+    def start(self):
+        pass
+
+    def stop(self):
+        self._prepared = False
+        self._client.direct_control_prepared = False
+
+    def dispatch(self, action, args):
+        del args
+        if action == "status":
+            status = self._client.sensor_snapshot("robot_status") or self._client.sensor_snapshot("query_state")
+            return {"ok": True, "prepared": self._prepared, "robot_status": status,
+                    "note": "motion_manager lifecycle is separate from Q5 READY/ACTIVE"}
+        if action != "prepare_position_control":
+            return None
+        steps = []
+        if not self._dynamic.wait_for_service(timeout_sec=10.0):
+            return {"ok": False, "code": "DYNAMIC_LAUNCH_UNAVAILABLE", "steps": steps}
+        request = DynamicLaunch.Request()
+        request.app_name = ""
+        request.sync_control = False
+        request.launch_mode = "pos"
+        response = self._wait(self._dynamic.call_async(request), 15.0)
+        steps.append({"step": "dynamic_launch_pos", "success": bool(response and response.success),
+                      "message": getattr(response, "message", "timeout") if response else "timeout"})
+        if not response or not response.success:
+            return {"ok": False, "code": "DYNAMIC_LAUNCH_FAILED", "steps": steps}
+        response, detail = self._call(self._ready, 25.0)
+        steps.append({"step": "ready_service", "success": bool(response and response.success), "message": detail or getattr(response, "message", "")})
+        if not response or not response.success:
+            return {"ok": False, "code": "READY_FAILED", "steps": steps}
+        for name in ("initpose_handsdown", "lift_up"):
+            success, detail = self._simple_action(name)
+            steps.append({"step": name, "success": success, "message": detail})
+            if not success:
+                return {"ok": False, "code": "SIMPLE_ACTION_FAILED", "steps": steps}
+        response, detail = self._call(self._activate, 15.0)
+        steps.append({"step": "activate_service", "success": bool(response and response.success), "message": detail or getattr(response, "message", "")})
+        self._prepared = bool(response and response.success)
+        self._client.direct_control_prepared = self._prepared
+        return {"ok": self._prepared, "state": "active" if self._prepared else "failed", "steps": steps}
+
+
 class _Q5MediaPlugin:
     """Base for read-only Domain-211 media subscriptions.
 
@@ -281,11 +377,17 @@ class _Q5MediaPlugin:
         if action == "start":
             self.start()
         if action in ("start", "info"):
-            return {
+            result = {
                 "state": "running" if self._running else "idle",
                 "source_topic": self._source_topic,
                 "topic_out": [{"topic": self._topic, "format": self._format}],
             }
+            if hasattr(self, "_frames_received"):
+                result["diagnostics"] = {
+                    "frames_received": self._frames_received,
+                    "frames_sent": self._frames_sent,
+                }
+            return result
         return None
 
 
@@ -300,6 +402,8 @@ class CameraRgbPlugin(_Q5MediaPlugin):
         self._topic = f"/{namespace}/q5/camera/rgb"
         self._jpeg_quality = max(20, min(95, int(plugin_config.get("jpeg_quality", 70))))
         self._latest = None
+        self._frames_received = 0
+        self._frames_sent = 0
         self._lock = threading.Lock()
         self._encoder = None
         self._remote_start = dict(plugin_config.get("remote_start") or {})
@@ -313,6 +417,7 @@ class CameraRgbPlugin(_Q5MediaPlugin):
                 "action": {"type": "string", "enum": ["start", "stop", "info"]},
             }, "required": ["action"], "additionalProperties": False},
             "topic_out": [{"topic": self._topic, "format": self._format}],
+            "diagnostics": {"frames_received": self._frames_received, "frames_sent": self._frames_sent},
         }
 
     def start(self):
@@ -379,6 +484,7 @@ class CameraRgbPlugin(_Q5MediaPlugin):
         if self._running:
             with self._lock:
                 self._latest = msg
+                self._frames_received += 1
 
     def _encode_loop(self):
         while self._running:
@@ -402,7 +508,10 @@ class CameraRgbPlugin(_Q5MediaPlugin):
                     image = self._cv2.cvtColor(image, self._cv2.COLOR_BGRA2BGR)
                 ok, jpeg = self._cv2.imencode(".jpg", image, [self._cv2.IMWRITE_JPEG_QUALITY, self._jpeg_quality])
                 if ok:
-                    self._send_media({"kind": "rgb", "data": jpeg.tobytes()})
+                    self._send_media({"kind": "rgb", "data": jpeg.tobytes(),
+                                      "width": int(msg.width), "height": int(msg.height),
+                                      "encoding": msg.encoding, "timestamp_ms": int(time.time() * 1000)})
+                    self._frames_sent += 1
                     self._last_sent = time.monotonic()
             except Exception as exc:
                 self._node.get_logger().warn(f"RGB encode failed: {exc}")
@@ -417,6 +526,8 @@ class CameraDepthPlugin(_Q5MediaPlugin):
     def __init__(self, plugin_config, namespace, executor, client):
         self._source_topic = str(plugin_config.get("source_topic", "/camera/camera/aligned_depth_to_color/image_raw"))
         self._topic = f"/{namespace}/q5/camera/depth"
+        self._frames_received = 0
+        self._frames_sent = 0
         super().__init__(plugin_config, namespace, executor, client)
 
     def get_tool(self):
@@ -427,6 +538,7 @@ class CameraDepthPlugin(_Q5MediaPlugin):
                 "action": {"type": "string", "enum": ["start", "stop", "info"]},
             }, "required": ["action"], "additionalProperties": False},
             "topic_out": [{"topic": self._topic, "format": self._format}],
+            "diagnostics": {"frames_received": self._frames_received, "frames_sent": self._frames_sent},
         }
 
     def start(self):
@@ -440,7 +552,10 @@ class CameraDepthPlugin(_Q5MediaPlugin):
         print(f"[CameraDepthPlugin] subscribed {self._source_topic} -> {self._topic} <= {self._max_hz:g}Hz", flush=True)
 
     def _on_depth(self, msg):
-        if (not self._running or msg.encoding not in ("16UC1", "mono16") or
+        if not self._running:
+            return
+        self._frames_received += 1
+        if (msg.encoding not in ("16UC1", "mono16") or
                 time.monotonic() - self._last_sent < 1.0 / self._max_hz):
             return
         needed = int(msg.height) * int(msg.step)
@@ -449,6 +564,7 @@ class CameraDepthPlugin(_Q5MediaPlugin):
         self._send_media({"kind": "depth", "height": msg.height, "width": msg.width,
                           "encoding": "16UC1", "is_bigendian": msg.is_bigendian,
                           "step": msg.step, "data": bytes(msg.data[:needed])})
+        self._frames_sent += 1
         self._last_sent = time.monotonic()
 
 
