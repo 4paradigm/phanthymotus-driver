@@ -41,6 +41,7 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 | `joint_override` | actuator | 指定关节 100 Hz 覆盖控制 |
 | `joint_bridge` | actuator | 全 25 关节最高 500 Hz 底层控制 |
 | `led` | actuator | 众擎协议定义的 11 种灯效 |
+| `tts` | actuator | 众擎 TTS 消息；topic 可配置 |
 | `mic` | sensor | 内置麦克风 PCM-16 16kHz 采集，缓冲 1024 字节发布（满足 perception ASR 协议） |
 | `pointcloud` | sensor | Odin2 原始/SLAM 点云转发（`sensor/pointcloud` 二进制渲染流） |
 | `camera` | sensor | Odin2 双目 JPEG 图像转发（左/右目 `image/jpeg` 流） |
@@ -128,6 +129,7 @@ docker run --rm --network host --privileged \
 - Odin2 实际 topic 前缀（`/{topic_prefix}/{model}/device{N}/`，默认按
   `/manifold/ODIN2/device0` 配置）；
 - `/hardware/joint_state` 数组顺序是否仍为 J00..J24；
+- TTS 的实际 topic；
 - `motion_state.available_transition_motions` 返回的固件状态名；
 - `/motion/node_control` 是否由当前 Native SDK 配置启用；
 - 开发版的速度、刚度、阻尼和力矩允许范围。

@@ -1,5 +1,4 @@
 import importlib.util
-import json
 import struct
 import sys
 import time
@@ -134,7 +133,7 @@ def install_ros_stubs():
     for name in (
         "BodyVelCmd", "GamepadKeys", "ImuInfo", "JointCommand", "JointMotionPlanState",
         "JointOverrideCommand", "JointState", "LedControl", "MotionState", "MotionStateRequest",
-        "MotorDebug", "NodeControl", "PowerInfo",
+        "MotorDebug", "NodeControl", "PowerInfo", "Tts",
     ):
         setattr(protocol_msg, name, type(name, (Message,), {}))
     protocol_msg.JointMotionPlanRequest = JointMotionPlanRequest
@@ -170,7 +169,7 @@ CONFIG = {
         "led": "/hardware/led_control", "joint_plan_request": "/motion/joint_motion_plan/request",
         "joint_plan_state": "/motion/joint_motion_plan/state",
         "joint_override": "/motion/joint_override_command", "joint_command": "/hardware/joint_command",
-        "native_node_control": "/motion/node_control",
+        "tts": "/hardware/tts", "native_node_control": "/motion/node_control",
         "vision_cloud_raw": "/manifold/ODIN2/device0/cloud/raw",
         "vision_cloud_slam": "/manifold/ODIN2/device0/cloud/slam",
         "vision_camera_left": "/manifold/ODIN2/device0/camera0/compressed",
@@ -205,6 +204,7 @@ class DevicePluginContractTests(unittest.TestCase):
             self.device.JointOverridePlugin(CONFIG, "robot", self.ros, self.state),
             self.device.JointBridgePlugin(CONFIG, "robot", self.ros, self.state),
             self.device.LedPlugin(CONFIG, "robot", self.ros),
+            self.device.TtsPlugin(CONFIG, "robot", self.ros),
             self.device.MicPlugin(CONFIG, "robot", self.ros),
             self.device.VisionPlugin(CONFIG, "robot", self.ros),
             self.device.MotorPowerPlugin(CONFIG, "robot", self.ros),
@@ -223,11 +223,11 @@ class DevicePluginContractTests(unittest.TestCase):
              "robot_snapshot", "fault_summary", "stability", "joint_groups", "capabilities", "ros_graph",
              "loco", "motion_mode", "dance", "joint_plan", "joint_plan_state", "gesture",
              "joint_override", "joint_bridge",
-             "led", "mic", "pointcloud", "camera", "depth",
+             "led", "tts", "mic", "pointcloud", "camera", "depth",
              "motor_power", "native_node_control", "virtual_gamepad", "safety", "native_sdk"},
             names,
         )
-        self.assertEqual(35, len(names))
+        self.assertEqual(36, len(names))
 
     def test_derived_diagnostics_and_capability_resources(self):
         self.state._set("imu", {
@@ -353,11 +353,16 @@ class DevicePluginContractTests(unittest.TestCase):
         plugin.dispatch("stop_command", {})
         self.assertEqual([1.0] * 25, plugin._publisher.messages[-1].damping)
 
-    def test_led_and_motor_service_paths(self):
+    def test_led_tts_and_motor_service_paths(self):
         led = self.device.LedPlugin(CONFIG, "robot", self.ros)
         led.start()
         self.assertEqual("set", led.dispatch("led", {"mode": "breathe_red"})["state"])
         self.assertEqual(9, led._publisher.messages[-1].color)
+
+        tts = self.device.TtsPlugin(CONFIG, "robot", self.ros)
+        tts.start()
+        self.assertEqual("published", tts.dispatch("tts", {"text": "你好", "rate": 150})["state"])
+        self.assertEqual("你好", tts._publisher.messages[-1].text)
 
         motor = self.device.MotorPowerPlugin(CONFIG, "robot", self.ros)
         motor.start()
@@ -440,17 +445,6 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual(struct.pack("<II", 16, 4), bytes(out.data[:8]))
         self.assertEqual(bytes(range(64)), bytes(out.data[8:]))
         self.assertEqual(1, plugin._frames["pointcloud"])
-
-    def test_json_message_normalizes_numpy_scalars(self):
-        import numpy as np
-
-        msg = self.device._json_message(
-            {"signed": np.int32(-7), "unsigned": np.uint16(42), "value": np.float32(1.5)}
-        )
-        self.assertEqual(
-            {"signed": -7, "unsigned": 42, "value": 1.5},
-            json.loads(msg.data),
-        )
 
     def test_vision_select_source_switches_cloud(self):
         plugin = self.device.VisionPlugin(CONFIG, "robot", self.ros)

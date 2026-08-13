@@ -38,6 +38,7 @@ topics:
   joint_plan_state: "/motion/joint_motion_plan/state"
   joint_override: "/motion/joint_override_command"
   joint_command: "/hardware/joint_command"
+  tts: "/hardware/tts"
   native_node_control: "/motion/node_control"
   # T800-Odin2 激光雷达相机（飞书文档 7.2 节）；实机按 ros_graph 发现的
   # /{topic_prefix}/{model}/device{N}/ 前缀校准
@@ -68,6 +69,8 @@ plugins:
   joint_bridge:
     enabled: true
   led:
+    enabled: true
+  tts:
     enabled: true
   motor_power:
     enabled: true

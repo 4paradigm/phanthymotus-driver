@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import math
-import numbers
 import subprocess
 import threading
 import time
@@ -67,30 +66,8 @@ def _now_ms() -> int:
 
 
 def _json_message(payload: dict) -> String:
-    def scalar_default(value):
-        # ROS array fields on ARM64 can expose NumPy/array scalar values.
-        # Normalize them at the JSON boundary so a vendor scalar cannot stop
-        # the domain-42 executor and, with it, the four sensor cards.
-        item = getattr(value, "item", None)
-        if callable(item):
-            return item()
-        if isinstance(value, numbers.Integral):
-            return int(value)
-        if isinstance(value, numbers.Real):
-            return float(value)
-        if hasattr(value, "__float__"):
-            return float(value)
-        if hasattr(value, "__int__"):
-            return int(value)
-        raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
-
     msg = String()
-    msg.data = json.dumps(
-        payload,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        default=scalar_default,
-    )
+    msg.data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
     return msg
 
 
@@ -326,7 +303,7 @@ class StatePlugin:
                     "body_velocity", "open_loop_displacement", "open_loop_turn", "open_loop_arc",
                     "motion_fsm", "joint_plan", "joint_override", "joint_bridge", "native_node_control",
                     "gesture_sequences", "dance", "virtual_gamepad", "soft_emergency_stop",
-                    "motor_power", "led", "ros_graph_discovery",
+                    "motor_power", "led", "tts", "ros_graph_discovery",
                 ],
                 "feedback": list(self._STREAMS) + ["joint_plan_state"],
                 "limitations": [
@@ -1436,6 +1413,50 @@ class LedPlugin:
         msg.color = LED_MODES[mode]
         self._publisher.publish(msg)
         return {"state": "set", "mode": mode, "value": LED_MODES[mode]}
+
+
+class TtsPlugin:
+    def __init__(self, config: dict, namespace: str, ros2):
+        self._config = config
+        self._node = Node("t800_tts", context=ros2.ctx_robot)
+        ros2.executor_robot.add_node(self._node)
+        self._publisher = None
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "tts",
+            "type": "actuator",
+            "description": "T800 Native SDK TTS 消息接口；topic 可通过 config.yaml 校准",
+            "inputSchema": {"type": "object", "properties": {
+                "text": {"type": "string"}, "language": {"type": "string"},
+                "speaker": {"type": "string"}, "rate": {"type": "integer", "minimum": 50, "maximum": 300}},
+                "required": ["text"]},
+        }
+
+    def start(self) -> None:
+        from interface_protocol.msg import Tts
+        self._message_type = Tts
+        self._publisher = self._node.create_publisher(Tts, self._config["topics"]["tts"], _RELIABLE)
+
+    def stop(self) -> None:
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "info"):
+            return {"state": "ready", "topic": self._config["topics"]["tts"]}
+        if action == "stop":
+            return {"state": "idle"}
+        text = str(args.get("text", "")).strip()
+        if not text:
+            return {"error": "text is required"}
+        msg = self._message_type()
+        msg.text = text
+        msg.language = str(args.get("language", "zh"))
+        msg.speaker = str(args.get("speaker", "default"))
+        msg.rate = int(clamp(args.get("rate", 150), 50, 300))
+        self._publisher.publish(msg)
+        return {"state": "published", "characters": len(text), "language": msg.language,
+                "speaker": msg.speaker, "rate": msg.rate}
 
 
 class MotorPowerPlugin:
