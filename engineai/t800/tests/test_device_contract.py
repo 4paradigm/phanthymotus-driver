@@ -1,4 +1,5 @@
 import importlib.util
+import math
 import sys
 import time
 import types
@@ -109,6 +110,11 @@ def install_ros_stubs():
 
     std_msgs = types.ModuleType("std_msgs.msg")
     std_msgs.String = type("String", (Message,), {"__init__": lambda self: setattr(self, "data", "")})
+    std_msgs.UInt8MultiArray = type(
+        "UInt8MultiArray",
+        (Message,),
+        {"__init__": lambda self: setattr(self, "data", [])},
+    )
     sys.modules["std_msgs.msg"] = std_msgs
 
     protocol_msg = types.ModuleType("interface_protocol.msg")
@@ -152,6 +158,19 @@ CONFIG = {
         "joint_plan_state": "/motion/joint_motion_plan/state",
         "joint_override": "/motion/joint_override_command", "joint_command": "/hardware/joint_command",
         "tts": "/hardware/tts", "native_node_control": "/motion/node_control",
+        "odometry": "/manifold/odin1/device0/odometry",
+        "cloud_slam": "/manifold/odin1/device0/cloud/slam",
+    },
+    "plugins": {
+        "odometry": {"enabled": True, "stale_timeout_sec": 1.0},
+        "mapping": {
+            "enabled": True,
+            "resolution_m": 0.1,
+            "z_min_m": 0.1,
+            "z_max_m": 1.8,
+            "publish_hz": 1.0,
+            "stale_timeout_sec": 1.0,
+        },
     },
     "services": {"enable_motor": "/hardware/enable_motor"},
 }
@@ -171,13 +190,19 @@ class DevicePluginContractTests(unittest.TestCase):
 
         motion_mode = self.device.MotionModePlugin(CONFIG, "robot", self.ros, self.state)
         joint_plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros)
+        odometry = self.device.OdometryPlugin(CONFIG, "robot", self.ros)
+        gesture = self.device.GesturePlugin(joint_plan)
         plugins = [
             self.state,
+            odometry,
+            self.device.WaypointPlugin(odometry),
+            self.device.MappingPlugin(CONFIG, "robot", self.ros, odometry=odometry),
             self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state),
             motion_mode,
             self.device.DancePlugin(motion_mode, self.state),
             joint_plan,
-            self.device.GesturePlugin(joint_plan),
+            gesture,
+            self.device.PoseTeachPlugin(self.state, gesture),
             self.device.JointOverridePlugin(CONFIG, "robot", self.ros, self.state),
             self.device.JointBridgePlugin(CONFIG, "robot", self.ros, self.state),
             self.device.LedPlugin(CONFIG, "robot", self.ros),
@@ -196,12 +221,156 @@ class DevicePluginContractTests(unittest.TestCase):
             {"joints", "imu", "battery", "motor_health", "motor_state", "motor_command", "joint_command_feedback",
              "gamepad", "motion_state", "driver_health", "model",
              "robot_snapshot", "fault_summary", "stability", "joint_groups", "capabilities", "ros_graph",
-             "loco", "motion_mode", "dance", "joint_plan", "joint_plan_state", "gesture",
+             "odometry", "waypoint", "mapping",
+             "loco", "motion_mode", "dance", "joint_plan", "joint_plan_state", "gesture", "pose_teach",
              "joint_override", "joint_bridge",
              "led", "tts", "motor_power", "native_node_control", "virtual_gamepad", "safety", "native_sdk"},
             names,
         )
-        self.assertEqual(32, len(names))
+        self.assertEqual(36, len(names))
+
+    def test_odometry_bridge_normalizes_pose_and_stale(self):
+        plugin = self.device.OdometryPlugin(CONFIG, "robot", self.ros)
+        tool = plugin.get_tool()
+        self.assertEqual("odometry", tool["name"])
+        self.assertEqual("/robot/state/odometry", tool["topic_out"][0]["topic"])
+
+        empty = plugin.dispatch("odometry", {})
+        self.assertEqual("no_data", empty["state"])
+        self.assertTrue(empty["stale"])
+
+        msg = Message()
+        msg.header = types.SimpleNamespace(
+            frame_id="odom",
+            stamp=types.SimpleNamespace(sec=12, nanosec=250_000_000),
+        )
+        msg.child_frame_id = "base_link"
+        msg.pose = types.SimpleNamespace(
+            pose=types.SimpleNamespace(
+                position=types.SimpleNamespace(x=1.5, y=-0.5, z=0.0),
+                orientation=types.SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0),
+            )
+        )
+        msg.twist = types.SimpleNamespace(
+            twist=types.SimpleNamespace(
+                linear=types.SimpleNamespace(x=0.3, y=0.0, z=0.0),
+                angular=types.SimpleNamespace(x=0.0, y=0.0, z=0.05),
+            )
+        )
+        plugin._on_odometry(msg)
+        snapshot = plugin.dispatch("odometry", {})
+        self.assertEqual("ok", snapshot["state"])
+        self.assertFalse(snapshot["stale"])
+        self.assertEqual("odom", snapshot["frame_id"])
+        self.assertAlmostEqual(1.5, snapshot["x"])
+        self.assertAlmostEqual(-0.5, snapshot["y"])
+        self.assertAlmostEqual(0.3, snapshot["vx"])
+        self.assertIsNotNone(plugin.current_pose())
+
+        plugin._updated = time.monotonic() - 2.0
+        stale = plugin.dispatch("odometry", {})
+        self.assertTrue(stale["stale"])
+        self.assertEqual("stale", stale["state"])
+        self.assertIsNone(plugin.current_pose())
+
+    def test_waypoint_mark_list_distance_and_overwrite_guard(self):
+        odometry = self.device.OdometryPlugin(CONFIG, "robot", self.ros)
+        waypoint = self.device.WaypointPlugin(odometry)
+
+        blocked = waypoint.dispatch("mark", {"name": "充电点"})
+        self.assertIn("error", blocked)
+
+        msg = Message()
+        msg.header = types.SimpleNamespace(
+            frame_id="odom",
+            stamp=types.SimpleNamespace(sec=1, nanosec=0),
+        )
+        msg.child_frame_id = "base_link"
+        msg.pose = types.SimpleNamespace(
+            pose=types.SimpleNamespace(
+                position=types.SimpleNamespace(x=0.0, y=0.0, z=0.0),
+                orientation=types.SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0),
+            )
+        )
+        msg.twist = types.SimpleNamespace(
+            twist=types.SimpleNamespace(
+                linear=types.SimpleNamespace(x=0.0, y=0.0, z=0.0),
+                angular=types.SimpleNamespace(x=0.0, y=0.0, z=0.0),
+            )
+        )
+        odometry._on_odometry(msg)
+
+        marked = waypoint.dispatch("mark", {"name": "充电点", "note": "大厅"})
+        self.assertEqual("marked", marked["state"])
+        self.assertEqual("充电点", marked["waypoint"]["name"])
+        self.assertEqual("大厅", marked["waypoint"]["note"])
+
+        duplicate = waypoint.dispatch("mark", {"name": "充电点"})
+        self.assertIn("overwrite=true", duplicate["error"])
+
+        msg.pose.pose.position.x = 3.0
+        msg.pose.pose.position.y = 4.0
+        odometry._on_odometry(msg)
+        dist = waypoint.dispatch("distance_to", {"name": "充电点"})
+        self.assertEqual("ok", dist["state"])
+        self.assertAlmostEqual(5.0, dist["distance_m"])
+        self.assertAlmostEqual(math.atan2(0.0 - 4.0, 0.0 - 3.0), dist["bearing_rad"])
+
+        listed = waypoint.dispatch("list", {})
+        self.assertEqual(1, listed["waypoint_count"])
+        overwritten = waypoint.dispatch("mark", {"name": "充电点", "overwrite": True, "note": "更新"})
+        self.assertEqual("updated", overwritten["state"])
+        self.assertEqual("更新", overwritten["waypoint"]["note"])
+        deleted = waypoint.dispatch("delete", {"name": "充电点"})
+        self.assertEqual("deleted", deleted["state"])
+        self.assertEqual(0, waypoint.dispatch("list", {})["waypoint_count"])
+
+    def test_mapping_ingests_pointcloud_and_publishes_occupancy(self):
+        import struct
+
+        odometry = self.device.OdometryPlugin(CONFIG, "robot", self.ros)
+        mapping = self.device.MappingPlugin(CONFIG, "robot", self.ros, odometry=odometry)
+        tool = mapping.get_tool()
+        self.assertEqual("mapping", tool["name"])
+        self.assertEqual("sensor/mapping", tool["topic_out"][0]["format"])
+
+        empty = mapping.dispatch("status", {})
+        self.assertEqual("no_data", empty["state"])
+        self.assertTrue(empty["stale"])
+
+        # One FLOAT32 XYZ point at (0.15, 0.25, 0.5) → occupied cell near origin.
+        point = struct.pack("<fff", 0.15, 0.25, 0.5)
+        msg = Message()
+        msg.header = types.SimpleNamespace(frame_id="map")
+        msg.fields = [
+            types.SimpleNamespace(name="x", offset=0, datatype=7),
+            types.SimpleNamespace(name="y", offset=4, datatype=7),
+            types.SimpleNamespace(name="z", offset=8, datatype=7),
+        ]
+        msg.point_step = 12
+        msg.width = 1
+        msg.height = 1
+        msg.data = point
+        mapping._on_cloud(msg)
+
+        status = mapping.dispatch("status", {})
+        self.assertEqual("ok", status["state"])
+        self.assertEqual("map", status["frame_id"])
+        self.assertGreaterEqual(status["occupied"], 1)
+        self.assertFalse(status["path_planning"])
+
+        mapping._running = True
+        mapping._publish_tick()
+        self.assertGreaterEqual(len(mapping._publisher.messages), 1)
+        payload = bytes(mapping._publisher.messages[-1].data)
+        robot_x, robot_y, robot_yaw, flags, count = struct.unpack_from("<fffBI", payload, 0)
+        self.assertEqual(0x03, flags)
+        self.assertGreaterEqual(count, 1)
+        self.assertAlmostEqual(0.0, robot_x)
+
+        mapping.dispatch("clear", {})
+        cleared = mapping.dispatch("status", {})
+        self.assertEqual("no_data", cleared["state"])
 
     def test_derived_diagnostics_and_capability_resources(self):
         self.state._set("imu", {
@@ -310,6 +479,83 @@ class DevicePluginContractTests(unittest.TestCase):
         })
         self.assertEqual("completed", result["state"])
         self.assertEqual([23, 24], plan._publisher.messages[-1].joint_indices)
+
+    def test_pose_teach_capture_preview_and_export(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        gesture = self.device.GesturePlugin(plan)
+        teach = self.device.PoseTeachPlugin(self.state, gesture)
+
+        self.state._last_joint_positions = [i * 0.01 for i in range(25)]
+
+        empty = teach.dispatch("preview", {})
+        self.assertIn("error", empty)
+
+        first = teach.dispatch("capture", {"label": "raised", "duration": 1.5})
+        self.assertEqual("captured", first["state"])
+        self.assertEqual("raised", first["frame"]["label"])
+        self.assertEqual(1.5, first["frame"]["duration"])
+        self.assertEqual(13, len(first["frame"]["target_positions"]))
+        self.assertAlmostEqual(0.12, first["frame"]["target_positions"][0])
+        self.assertAlmostEqual(0.24, first["frame"]["target_positions"][-1])
+
+        self.state._last_joint_positions = [0.0] * 25
+        second = teach.dispatch("capture", {"duration": 0.5})
+        self.assertEqual(2, second["frame_count"])
+
+        listed = teach.dispatch("list", {})
+        self.assertEqual(2, listed["frame_count"])
+        self.assertEqual("raised", listed["frames"][0]["label"])
+
+        updated = teach.dispatch("update", {"index": 1, "label": "neutral", "duration": 2.0})
+        self.assertEqual("updated", updated["state"])
+        self.assertEqual("neutral", updated["frame"]["label"])
+        self.assertEqual(2.0, updated["frame"]["duration"])
+
+        preview = teach.dispatch("preview", {"reset_after": False, "wait": True})
+        self.assertEqual("completed", preview["state"])
+        self.assertGreaterEqual(len(plan._publisher.messages), 2)
+        self.assertEqual(list(range(12, 25)), plan._publisher.messages[-1].joint_indices)
+
+        exported = teach.dispatch("export", {"format": "sequence"})
+        self.assertEqual("exported", exported["state"])
+        self.assertEqual(2, len(exported["steps"]))
+        self.assertEqual(list(range(12, 25)), exported["steps"][0]["joint_indices"])
+        self.assertEqual(list(self.device.GesturePlugin._BASE_STIFFNESS), exported["steps"][0]["stiffness"])
+        self.assertEqual("gesture", exported["gesture_call"]["tool"])
+        self.assertEqual("sequence", exported["gesture_call"]["action"])
+
+        yaml_export = teach.dispatch("export", {"format": "yaml", "name": "heart"})
+        self.assertIn('"heart": [', yaml_export["yaml"])
+        self.assertIn("_BASE_STIFFNESS", yaml_export["yaml"])
+
+        cleared = teach.dispatch("clear", {})
+        self.assertEqual(0, len(cleared["frames"]))
+        self.assertEqual(0, teach.dispatch("list", {})["frame_count"])
+
+    def test_pose_teach_release_upper_cancels_and_softens(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        gesture = self.device.GesturePlugin(plan)
+        teach = self.device.PoseTeachPlugin(self.state, gesture)
+
+        schema = teach.get_tool()["inputSchema"]
+        self.assertIn("release_upper", schema["properties"]["action"]["enum"])
+        self.assertNotIn("restore_balance", schema["properties"]["action"]["enum"])
+
+        self.state._current_motion = "lower_body_balance"
+        self.state._available_motions = ["walk", "lower_body_balance", "pd_stand"]
+        self.state._last_joint_positions = [0.01] * 25
+        released = teach.dispatch("release_upper", {})
+        self.assertEqual("released", released["state"])
+        self.assertEqual("lower_body_balance", released["motion"])
+        self.assertEqual(1, plan._publisher.messages[0].request_type)
+        soften = plan._publisher.messages[-1]
+        self.assertEqual(0, soften.request_type)
+        self.assertEqual(list(range(12, 25)), soften.joint_indices)
+        self.assertEqual([0.0] * 13, list(soften.stiffness))
+        self.assertEqual([1.0] * 13, list(soften.damping))
+        self.assertIsNone(released.get("target"))
 
     def test_joint_override_force_path_and_release(self):
         plugin = self.device.JointOverridePlugin(CONFIG, "robot", self.ros, self.state)

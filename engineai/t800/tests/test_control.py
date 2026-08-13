@@ -3,6 +3,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from pathlib import Path
 
@@ -12,11 +13,16 @@ sys.path.insert(0, str(ROOT))
 
 from control import (  # noqa: E402
     T800_JOINT_NAMES,
+    OccupancyGrid2D,
     RepeatingCommand,
     action_schema,
     clamp,
+    extract_xyz_from_pointcloud2,
     float_list,
     joint_payload,
+    normalize_odometry_payload,
+    pack_sensor_mapping_binary,
+    quaternion_to_yaw_rad,
     sensor_tool,
     validate_joint_indices,
 )
@@ -81,6 +87,81 @@ class ValidationTests(unittest.TestCase):
         self.assertTrue(tool["readOnly"])
         self.assertEqual("sensor", tool["type"])
         self.assertEqual("/robot/state/imu", tool["topic_out"][0]["topic"])
+
+    def test_odometry_payload_preserves_frame_and_yaw(self):
+        payload = normalize_odometry_payload(
+            frame_id="odom",
+            child_frame_id="base_link",
+            position=[1.0, 2.0, 0.1],
+            orientation=[0.0, 0.0, math.sin(0.5 / 2), math.cos(0.5 / 2)],
+            linear_velocity=[0.2, 0.0, 0.0],
+            angular_velocity=[0.0, 0.0, 0.1],
+            stamp_sec=10,
+            stamp_nanosec=500_000_000,
+            received_monotonic=100.0,
+            stale_timeout_sec=1.0,
+            now_monotonic=100.2,
+        )
+        self.assertEqual("odom", payload["frame_id"])
+        self.assertEqual("base_link", payload["child_frame_id"])
+        self.assertAlmostEqual(0.5, payload["yaw_rad"], places=3)
+        self.assertAlmostEqual(0.2, payload["age_sec"])
+        self.assertFalse(payload["stale"])
+        self.assertEqual(10500, payload["timestamp_ms"])
+
+    def test_odometry_payload_marks_stale_after_timeout(self):
+        payload = normalize_odometry_payload(
+            frame_id="map",
+            child_frame_id="body",
+            position=[0.0, 0.0, 0.0],
+            orientation=[0.0, 0.0, 0.0, 1.0],
+            linear_velocity=[0.0, 0.0, 0.0],
+            angular_velocity=[0.0, 0.0, 0.0],
+            received_monotonic=10.0,
+            stale_timeout_sec=0.5,
+            now_monotonic=11.0,
+        )
+        self.assertTrue(payload["stale"])
+        self.assertAlmostEqual(0.0, quaternion_to_yaw_rad(0.0, 0.0, 0.0, 1.0))
+
+    def test_occupancy_grid_filters_height_and_packs_mapping_binary(self):
+        import struct
+
+        grid = OccupancyGrid2D(resolution_m=0.1, z_min_m=0.1, z_max_m=1.0, min_hits=1)
+        accepted = grid.ingest_points(
+            [
+                (0.05, 0.05, 0.5),   # keep
+                (0.05, 0.05, 2.0),   # too high
+                (0.05, 0.05, 0.0),   # too low
+                (1.05, 0.05, 0.4),   # keep
+            ],
+            frame_id="map",
+        )
+        self.assertEqual(2, accepted)
+        snap = grid.snapshot()
+        self.assertEqual("map", snap["frame_id"])
+        self.assertEqual(2, snap["occupied"])
+        centers = grid.occupied_cell_centers()
+        self.assertEqual(2, len(centers))
+
+        fields = [
+            types.SimpleNamespace(name="x", offset=0, datatype=7),
+            types.SimpleNamespace(name="y", offset=4, datatype=7),
+            types.SimpleNamespace(name="z", offset=8, datatype=7),
+        ]
+        cloud = struct.pack("<fff", 0.2, 0.3, 0.5)
+        parsed = extract_xyz_from_pointcloud2(fields, 12, 1, 1, cloud)
+        self.assertEqual(1, len(parsed))
+        self.assertAlmostEqual(0.2, parsed[0][0], places=5)
+        self.assertAlmostEqual(0.3, parsed[0][1], places=5)
+        self.assertAlmostEqual(0.5, parsed[0][2], places=5)
+
+        packed = pack_sensor_mapping_binary(1.0, 2.0, 0.25, centers)
+        rx, ry, ryaw, flags, count = struct.unpack_from("<fffBI", packed, 0)
+        self.assertAlmostEqual(1.0, rx)
+        self.assertAlmostEqual(2.0, ry)
+        self.assertEqual(0x03, flags)
+        self.assertEqual(2, count)
 
 
 class RepeatingCommandTests(unittest.TestCase):
