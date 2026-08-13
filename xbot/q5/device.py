@@ -13,13 +13,11 @@ import subprocess
 import threading
 import time
 
-from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_srvs.srv import Trigger
 from xbot_common_interfaces.action import AudioPlay
-from xbot_common_interfaces.action import SimpleActions
-from xbot_common_interfaces.srv import DynamicLaunch, SetVolume
+from xbot_common_interfaces.srv import SetVolume
 
 # main.py resolves all card classes through this module. Keep the direct
 # control cards here as explicit exports while their implementation remains
@@ -245,101 +243,6 @@ class SpeakerPlugin:
             return {"state": "running" if self._running else "idle",
                     "topic_in": [{"topic": self._topic, "format": "audio/pcm-16k"}]}
         return None
-
-
-class Q5ControlModePlugin:
-    """Explicitly prepare the vendor position-control pipeline for direct cards."""
-
-    def __init__(self, plugin_config, namespace, executor, client):
-        del plugin_config, namespace
-        self._client = client
-        self._node = Node("q5_control_mode")
-        executor.add_node(self._node)
-        self._dynamic = self._node.create_client(DynamicLaunch, "/dynamic_launch")
-        self._ready = self._node.create_client(Trigger, "/ready_service")
-        self._activate = self._node.create_client(Trigger, "/activate_service")
-        self._actions = ActionClient(self._node, SimpleActions, "/simple_actions")
-        self._prepared = bool(getattr(client, "direct_control_prepared", False))
-        client.direct_control_prepared = self._prepared
-
-    def get_tool(self):
-        return {
-            "name": "q5_control_mode", "type": "actuator", "multiInstance": False,
-            "description": "Q5直控模式准备：按厂商流程切换到位置控制并校验READY/ACTIVE。",
-            "inputSchema": {"type": "object", "properties": {
-                "action": {"type": "string", "enum": ["status", "prepare_position_control"]},
-            }, "required": ["action"], "additionalProperties": False},
-        }
-
-    @staticmethod
-    def _wait(future, timeout):
-        deadline = time.monotonic() + timeout
-        while not future.done() and time.monotonic() < deadline:
-            time.sleep(0.02)
-        return future.result() if future.done() else None
-
-    def _call(self, client, timeout=15.0):
-        if not client.wait_for_service(timeout_sec=timeout):
-            return None, "service unavailable"
-        response = self._wait(client.call_async(Trigger.Request()), timeout)
-        return response, "timeout" if response is None else ""
-
-    def _simple_action(self, name, timeout=30.0):
-        if not self._actions.wait_for_server(timeout_sec=5.0):
-            return False, "simple_actions unavailable"
-        goal = SimpleActions.Goal()
-        goal.action_name = name
-        goal.time_cost = 4.0
-        sent = self._wait(self._actions.send_goal_async(goal), 8.0)
-        if sent is None or not sent.accepted:
-            return False, "goal rejected"
-        result = self._wait(sent.get_result_async(), timeout)
-        if result is None:
-            return False, "goal timeout"
-        wrapped = result.result
-        return int(getattr(wrapped, "result", 0)) == 0, str(getattr(wrapped, "message", ""))
-
-    def start(self):
-        pass
-
-    def stop(self):
-        self._prepared = False
-        self._client.direct_control_prepared = False
-
-    def dispatch(self, action, args):
-        del args
-        if action == "status":
-            status = self._client.sensor_snapshot("robot_status") or self._client.sensor_snapshot("query_state")
-            return {"ok": True, "prepared": self._prepared, "robot_status": status,
-                    "note": "motion_manager lifecycle is separate from Q5 READY/ACTIVE"}
-        if action != "prepare_position_control":
-            return None
-        steps = []
-        if not self._dynamic.wait_for_service(timeout_sec=10.0):
-            return {"ok": False, "code": "DYNAMIC_LAUNCH_UNAVAILABLE", "steps": steps}
-        request = DynamicLaunch.Request()
-        request.app_name = ""
-        request.sync_control = False
-        request.launch_mode = "pos"
-        response = self._wait(self._dynamic.call_async(request), 15.0)
-        steps.append({"step": "dynamic_launch_pos", "success": bool(response and response.success),
-                      "message": getattr(response, "message", "timeout") if response else "timeout"})
-        if not response or not response.success:
-            return {"ok": False, "code": "DYNAMIC_LAUNCH_FAILED", "steps": steps}
-        response, detail = self._call(self._ready, 25.0)
-        steps.append({"step": "ready_service", "success": bool(response and response.success), "message": detail or getattr(response, "message", "")})
-        if not response or not response.success:
-            return {"ok": False, "code": "READY_FAILED", "steps": steps}
-        for name in ("initpose_handsdown", "lift_up"):
-            success, detail = self._simple_action(name)
-            steps.append({"step": name, "success": success, "message": detail})
-            if not success:
-                return {"ok": False, "code": "SIMPLE_ACTION_FAILED", "steps": steps}
-        response, detail = self._call(self._activate, 15.0)
-        steps.append({"step": "activate_service", "success": bool(response and response.success), "message": detail or getattr(response, "message", "")})
-        self._prepared = bool(response and response.success)
-        self._client.direct_control_prepared = self._prepared
-        return {"ok": self._prepared, "state": "active" if self._prepared else "failed", "steps": steps}
 
 
 class _Q5MediaPlugin:

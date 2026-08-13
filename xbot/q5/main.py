@@ -63,7 +63,6 @@ class Q5DeviceBundle:
 
         # Only verified Q5 cards are shipped in this bundle.
         _PLUGIN_MAP = [
-            ("q5_control_mode", "Q5ControlModePlugin"),
             ("base_drive", "BaseDrivePlugin"),
             ("arm_control", "ArmControlPlugin"),
             ("hand_control", "HandControlPlugin"),

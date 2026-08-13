@@ -4,8 +4,6 @@ name: "XBot-Q5"
 joint_state_position_unit: "radians"
 
 plugins:
-  q5_control_mode:
-    enabled: true
   state:
     enabled: true
   base_drive:

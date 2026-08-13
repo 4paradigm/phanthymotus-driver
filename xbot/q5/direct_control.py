@@ -12,7 +12,11 @@ import threading
 import time
 
 from geometry_msgs.msg import TwistStamped
+from rclpy.action import ActionClient
 from rclpy.node import Node
+from std_srvs.srv import Trigger
+from xbot_common_interfaces.action import SimpleActions
+from xbot_common_interfaces.srv import DynamicLaunch
 from body_command import get_router as _get_body_router
 from hand_command import HAND_JOINTS, failure as _hand_failure, finite_number as _hand_finite_number, get_router as _get_hand_router
 from control_contract import q5_active_status, q5_is_control_ready
@@ -78,7 +82,6 @@ class BaseDrivePlugin:
         self._motion_stop = None
         self._motion_thread = None
         self._active_command = None
-
         if min(self._max_linear, self._max_angular, self._max_duration, self._publish_rate) <= 0:
             raise ValueError("base_drive limits and publish_rate_hz must be positive")
         if self._stop_repetitions < 1:
@@ -401,6 +404,14 @@ class ArmControlPlugin:
         self._motion_stop = None
         self._motion_thread = None
         self._active_command = None
+        self._mode_node = Node("q5_arm_control_mode")
+        executor.add_node(self._mode_node)
+        self._dynamic = self._mode_node.create_client(DynamicLaunch, "/dynamic_launch")
+        self._ready = self._mode_node.create_client(Trigger, "/ready_service")
+        self._activate = self._mode_node.create_client(Trigger, "/activate_service")
+        self._actions = ActionClient(self._mode_node, SimpleActions, "/simple_actions")
+        self._prepared = False
+        client.direct_control_prepared = False
 
     def get_tool(self):
         limit_rules = [
@@ -416,8 +427,9 @@ class ArmControlPlugin:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["start", "move", "cancel", "info"], "oneOf": [
+                    "action": {"type": "string", "enum": ["start", "prepare_position_control", "move", "cancel", "info"], "oneOf": [
                         {"const": "start", "title": "检查连接状态"},
+                        {"const": "prepare_position_control", "title": "准备位置直控"},
                         {"const": "move", "title": "设置单关节角度"},
                         {"const": "cancel", "title": "取消并保持当前角度"},
                         {"const": "info", "title": "查看状态"},
@@ -434,6 +446,7 @@ class ArmControlPlugin:
                 "allOf": limit_rules,
                 "x-action-params": {
                     "start": {"params": [], "description": "检查 ROS 连接和机器人状态。"},
+                    "prepare_position_control": {"params": [], "description": "执行厂商 DynamicLaunch(pos)、READY、初始姿态、抬臂和ACTIVE流程。"},
                     "move": {"params": ["joint_name", "target_position_rad"], "description": "将一个关节设置到指定绝对角度。"},
                     "cancel": {"params": [], "description": "取消微调，并保持当前关节角度。"},
                     "info": {"params": [], "description": "查看当前运动和安全条件。"},
@@ -530,7 +543,7 @@ class ArmControlPlugin:
         if not bool(getattr(self._client, "direct_control_prepared", False)):
             return _arm_failure(
                 "DIRECT_CONTROL_NOT_PREPARED",
-                "Run q5_control_mode action=prepare_position_control first; vendor position-control sequence has not completed",
+                "Run arm_control action=prepare_position_control first; vendor position-control sequence has not completed",
                 status=status,
             )
         # Direct HybridJointCommand control is owned by the vendor body
@@ -563,12 +576,58 @@ class ArmControlPlugin:
     def start(self):
         return {"state": "ready" if self._router.status()["ros_publisher_available"] else "unavailable"}
 
+    @staticmethod
+    def _wait_future(future, timeout):
+        deadline = time.monotonic() + timeout
+        while not future.done() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        return future.result() if future.done() else None
+
+    def _prepare_position_control(self):
+        steps = []
+        if not self._dynamic.wait_for_service(timeout_sec=10.0):
+            return _arm_failure("DYNAMIC_LAUNCH_UNAVAILABLE", "Q5 /dynamic_launch is unavailable", steps=steps)
+        req = DynamicLaunch.Request()
+        req.app_name, req.sync_control, req.launch_mode = "", False, "pos"
+        response = self._wait_future(self._dynamic.call_async(req), 15.0)
+        steps.append({"step": "dynamic_launch_pos", "success": bool(response and response.success), "message": getattr(response, "message", "timeout") if response else "timeout"})
+        if not response or not response.success:
+            return _arm_failure("DYNAMIC_LAUNCH_FAILED", "Q5 position launch failed", steps=steps)
+        if not self._ready.wait_for_service(timeout_sec=10.0):
+            return _arm_failure("READY_SERVICE_UNAVAILABLE", "Q5 /ready_service is unavailable", steps=steps)
+        response = self._wait_future(self._ready.call_async(Trigger.Request()), 30.0)
+        steps.append({"step": "ready_service", "success": bool(response and response.success), "message": getattr(response, "message", "timeout") if response else "timeout"})
+        if not response or not response.success:
+            return _arm_failure("READY_FAILED", "Q5 ready initialization failed", steps=steps)
+        if not self._actions.wait_for_server(timeout_sec=5.0):
+            return _arm_failure("SIMPLE_ACTIONS_UNAVAILABLE", "Q5 /simple_actions is unavailable", steps=steps)
+        for name in ("initpose_handsdown", "lift_up"):
+            goal = SimpleActions.Goal()
+            goal.action_name = name
+            goal.time_cost = 4.0
+            handle = self._wait_future(self._actions.send_goal_async(goal), 8.0)
+            result = self._wait_future(handle.get_result_async(), 35.0) if handle and handle.accepted else None
+            success = bool(result and getattr(result.result, "result", 2) == 0)
+            steps.append({"step": name, "success": success, "message": getattr(result.result, "message", "timeout") if result else "timeout"})
+            if not success:
+                return _arm_failure("SIMPLE_ACTION_FAILED", f"Q5 action {name} failed", steps=steps)
+        if not self._activate.wait_for_service(timeout_sec=10.0):
+            return _arm_failure("ACTIVATE_SERVICE_UNAVAILABLE", "Q5 /activate_service is unavailable", steps=steps)
+        response = self._wait_future(self._activate.call_async(Trigger.Request()), 15.0)
+        success = bool(response and response.success)
+        steps.append({"step": "activate_service", "success": success, "message": getattr(response, "message", "timeout") if response else "timeout"})
+        self._prepared = success
+        self._client.direct_control_prepared = success
+        return {"ok": success, "state": "active" if success else "failed", "steps": steps}
+
     def stop(self):
         self._stop("driver_shutdown")
 
     def dispatch(self, action, args):
         if action == "start":
             return {**self.start(), "safety": self._safety()}
+        if action == "prepare_position_control":
+            return self._prepare_position_control()
         if action in ("cancel", "stop"):
             return self._stop("command")
         if action == "info":
