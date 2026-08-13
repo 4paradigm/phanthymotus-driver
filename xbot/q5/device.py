@@ -367,33 +367,42 @@ class CameraRgbPlugin(_Q5MediaPlugin):
         # `nohup ... &` alone is not evidence that the remote launch survived
         # the SSH session. Keep a PID/log file and synchronously verify the
         # process, otherwise the UI only sees a permanent black frame.
-        remote = (
-            "set -e; "
-            "mkdir -p /tmp; "
-            "if ! pgrep -f realsense2_camera_node >/dev/null; then "
-            "nohup bash -c " + shlex.quote(
-                "source /opt/ros/humble/setup.bash; "
-                "export ROS_DOMAIN_ID=211 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp; "
-                "exec ros2 launch realsense2_camera rs_align_depth_launch.py "
-                f"depth_module.depth_profile:={profiles[0]} rgb_camera.color_profile:={profiles[1]}"
-            ) + " </dev/null >/tmp/q5-realsense.log 2>&1 & echo $! >/tmp/q5-realsense.pid; "
-            "fi; sleep 5; "
-            "if ! pgrep -f realsense2_camera_node >/dev/null; then "
-            "echo 'RealSense process did not remain running'; "
-            "test -f /tmp/q5-realsense.log && tail -100 /tmp/q5-realsense.log || true; exit 1; fi; "
-            "if ! ros2 topic info /camera/camera/color/image_raw 2>/dev/null | grep -Eq 'Publisher count: [1-9]'; then "
-            "echo 'RealSense RGB publisher is unavailable'; tail -100 /tmp/q5-realsense.log; exit 1; fi; "
-            "if ! ros2 topic info /camera/camera/aligned_depth_to_color/image_raw 2>/dev/null | grep -Eq 'Publisher count: [1-9]'; then "
-            "echo 'RealSense aligned-depth publisher is unavailable'; tail -100 /tmp/q5-realsense.log; exit 1; fi; "
-            "echo 'RealSense process is running'; "
-            "cat /tmp/q5-realsense.pid 2>/dev/null || true"
-        )
+        remote = f'''#!/usr/bin/env bash
+set -e
+source /opt/ros/humble/setup.bash
+export ROS_DOMAIN_ID=211 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+if ! pgrep -f realsense2_camera_node >/dev/null; then
+  nohup ros2 launch realsense2_camera rs_align_depth_launch.py \\
+    depth_module.depth_profile:={profiles[0]} \\
+    rgb_camera.color_profile:={profiles[1]} \\
+    </dev/null >/tmp/q5-realsense.log 2>&1 &
+  echo $! >/tmp/q5-realsense.pid
+fi
+sleep 5
+if ! pgrep -f realsense2_camera_node >/dev/null; then
+  echo 'RealSense process did not remain running'
+  test -f /tmp/q5-realsense.log && tail -100 /tmp/q5-realsense.log || true
+  exit 1
+fi
+if ! ros2 topic info /camera/camera/color/image_raw 2>/dev/null | grep -Eq 'Publisher count: [1-9]'; then
+  echo 'RealSense RGB publisher is unavailable'
+  tail -100 /tmp/q5-realsense.log || true
+  exit 1
+fi
+if ! ros2 topic info /camera/camera/aligned_depth_to_color/image_raw 2>/dev/null | grep -Eq 'Publisher count: [1-9]'; then
+  echo 'RealSense aligned-depth publisher is unavailable'
+  tail -100 /tmp/q5-realsense.log || true
+  exit 1
+fi
+echo 'RealSense process is running'
+cat /tmp/q5-realsense.pid 2>/dev/null || true
+'''
         command = ["sshpass", "-p", password, "ssh", "-p", str(port),
                    "-o", "PreferredAuthentications=password", "-o", "PubkeyAuthentication=no",
                    "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no",
                    "-o", "UserKnownHostsFile=/dev/null",
-                   f"{user}@{host}", f"bash -lc {shlex.quote(remote)}"]
-        result = subprocess.run(command, capture_output=True, text=True, timeout=12)
+                   f"{user}@{host}", "bash", "-s"]
+        result = subprocess.run(command, input=remote, capture_output=True, text=True, timeout=20)
         if result.returncode:
             detail = (result.stderr or result.stdout).strip()
             raise RuntimeError(f"remote RealSense launch failed: {detail}")
