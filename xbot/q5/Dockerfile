@@ -4,11 +4,11 @@
 # 构建参数：
 #   ROS_BASE_IMAGE  — 基础镜像（默认 ros:humble，需预先 docker pull）
 #   PYPI_MIRROR     — pip 镜像（默认 https://pypi.tuna.tsinghua.edu.cn/simple/）
-#   APT_MIRROR      — apt 镜像站点（默认 mirrors.tuna.tsinghua.edu.cn，留空则用默认源）
+#   APT_MIRROR      — 可选 apt 镜像站点（默认保留基础镜像官方源）
 
 ARG ROS_BASE_IMAGE=ros:humble
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
-ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
+ARG APT_MIRROR=
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
 ARG APT_MIRROR
@@ -21,7 +21,7 @@ RUN if [ -n "$APT_MIRROR" ]; then \
         sed -i "s|archive.ubuntu.com|${APT_MIRROR}|g" /etc/apt/sources.list; \
     fi
 
-RUN apt-get update && \
+RUN apt-get -o Acquire::Retries=5 update && \
     apt-get install -y --no-install-recommends \
         python3-pip \
         python3-colcon-common-extensions \
