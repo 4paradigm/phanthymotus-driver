@@ -50,10 +50,6 @@ def q5_is_control_ready(client, allow_prepared: bool = False) -> tuple[bool, dic
     status["control_ready_states"] = list(Q5_CONTROL_READY_STATES)
     ready = bool(status["available"] and status["fresh"] and
                  status["state"] in Q5_CONTROL_READY_STATES)
-    if (not ready and allow_prepared and bool(getattr(client, "direct_control_prepared", False))
-            and (not status.get("fresh") or status.get("state") is None)):
-        status["prepared_evidence"] = True
-        ready = True
     return ready, status
 
 
