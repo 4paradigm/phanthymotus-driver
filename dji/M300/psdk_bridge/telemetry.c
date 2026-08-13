@@ -188,6 +188,8 @@ static const char *_display_mode_text(int mode) {
 static int s_local_origin_valid = 0;
 static double s_local_origin_lat_deg = 0.0;
 static double s_local_origin_lon_deg = 0.0;
+static int s_down_origin_valid = 0;
+static double s_down_origin = 0.0;
 
 int telemetry_get_json(char *buf, size_t buflen) {
     /* Convert quaternion to Euler angles */
@@ -218,7 +220,17 @@ int telemetry_get_json(char *buf, size_t buflen) {
                      s_gps_detail.totalSatelliteNumberUsed > 0 ||
                      s_pos_fused.visibleSatelliteNumber > 0);
     double relative_alt = (double)s_alt_fused - (double)s_alt_home;
-    double world_z = s_avoid.down > 0 ? (double)s_avoid.down : relative_alt;
+    double down_range = (double)s_avoid.down;
+    if ((int)s_flight_status != 2 && down_range > 0.0) {
+        s_down_origin = down_range;
+        s_down_origin_valid = 1;
+    }
+    double world_z = relative_alt;
+    if (down_range > 0.0) {
+        world_z = down_range - (s_down_origin_valid ? s_down_origin : 0.0);
+        if (world_z < 0.0)
+            world_z = 0.0;
+    }
     double local_x = 0.0;
     double local_y = 0.0;
     if (gps_valid) {
@@ -322,7 +334,7 @@ int telemetry_get_json(char *buf, size_t buflen) {
         /* GPS_POSITION: x=Longitude, y=Latitude, z=Altitude(mm) — per PSDK docs */
         lat_json, lon_json,
         gps_valid ? "true" : "false",
-        relative_alt, gps_alt, (double)s_alt_fused, (double)s_alt_home, relative_alt,
+        gps_alt, gps_alt, (double)s_alt_fused, (double)s_alt_home, relative_alt,
         local_x, local_y, world_z,
         q0, q1, q2, q3, yaw, pitch, roll, yaw_rad, pitch_rad, roll_rad,
         (double)s_velocity.data.x, (double)s_velocity.data.y, (double)s_velocity.data.z,
