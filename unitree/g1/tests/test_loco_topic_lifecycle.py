@@ -70,6 +70,7 @@ def _install_driver_import_stubs():
 _install_driver_import_stubs()
 
 from device import LocoPlugin  # noqa: E402
+from velocity_proposal import resolve_optional_expected_nav_id  # noqa: E402
 
 
 class FakeClient:
@@ -114,12 +115,22 @@ class FakeSmartMotion:
     def bind_velocity_proposal(self, topic, expected_nav_id):
         if self.bind_result is not None:
             return dict(self.bind_result)
+        expected_nav_id = resolve_optional_expected_nav_id(
+            {"expected_nav_id": expected_nav_id}
+        )
         self.bound_topic = topic
-        self.expected_nav_id = expected_nav_id
+        self.expected_nav_id = expected_nav_id or ""
+        awaiting_nav_id = expected_nav_id is None
         return {
             "state": "connected",
             "connected": True,
-            "armed": True,
+            "armed": not awaiting_nav_id,
+            "awaiting_nav_id": awaiting_nav_id,
+            "nav_id_binding_mode": (
+                "first_valid_proposal"
+                if awaiting_nav_id
+                else "control_plane"
+            ),
             "topic": topic,
             "expected_nav_id": expected_nav_id,
             "active_nav_id": expected_nav_id,
@@ -137,10 +148,18 @@ class FakeSmartMotion:
     def get_velocity_proposal_status(self):
         return {
             "connected": bool(self.bound_topic),
-            "armed": bool(self.bound_topic),
+            "armed": bool(self.bound_topic and self.expected_nav_id),
+            "awaiting_nav_id": bool(
+                self.bound_topic and not self.expected_nav_id
+            ),
             "topic": self.bound_topic or None,
             "expected_nav_id": self.expected_nav_id or None,
             "active_nav_id": self.expected_nav_id or None,
+            "nav_id_binding_mode": (
+                "control_plane"
+                if self.expected_nav_id
+                else "first_valid_proposal" if self.bound_topic else None
+            ),
             "last_reason": self.last_reason,
             "proposal_execution": dict(self.proposal_execution),
         }
@@ -223,13 +242,39 @@ class LocoTopicLifecycleTest(unittest.TestCase):
         self.assertTrue(started["connected"])
         self.assertEqual(self.smart_motion.bound_topic, self.topic)
 
-    def test_start_without_trusted_nav_id_fails_closed(self):
+    def test_start_without_nav_id_is_ready_for_legacy_core(self):
         result = self.plugin.dispatch("start", {"input_topic": self.topic})
+
+        self.assertEqual(result["state"], "ready")
+        self.assertTrue(result["connected"])
+        self.assertFalse(result["armed"])
+        self.assertTrue(result["awaiting_nav_id"])
+        self.assertEqual(
+            result["nav_id_binding_mode"],
+            "first_valid_proposal",
+        )
+        self.assertEqual(self.smart_motion.bound_topic, self.topic)
+        self.assertEqual(self.smart_motion.expected_nav_id, "")
+        self.assertEqual(self.client.stop_count, 0)
+
+    def test_fake_smart_motion_matches_real_optional_nav_id_contract(self):
+        empty = self.smart_motion.bind_velocity_proposal(self.topic, "")
+
+        self.assertTrue(empty["connected"])
+        self.assertFalse(empty["armed"])
+        self.assertTrue(empty["awaiting_nav_id"])
+        with self.assertRaises(ValueError):
+            self.smart_motion.bind_velocity_proposal(self.topic, 123)
+
+    def test_start_rejects_invalid_explicit_nav_id(self):
+        result = self.plugin.dispatch(
+            "start",
+            {"input_topic": self.topic, "expected_nav_id": 123},
+        )
 
         self.assertEqual(result["state"], "error")
         self.assertFalse(result["connected"])
-        self.assertEqual(result["error"], "expected_nav_id_required")
-        self.assertEqual(self.smart_motion.bound_topic, "")
+        self.assertEqual(result["error"], "invalid_expected_nav_id")
         self.assertEqual(self.client.stop_count, 1)
 
     def test_start_preserves_stop_confirmation_diagnostics_on_failure(self):

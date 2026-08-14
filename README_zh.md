@@ -71,6 +71,15 @@ proposal TTL 失效会立即触发 `StopMove`；只有在返回后用新的 odom
 样本确认零速，同一导航 lease 才能保留并接受下一条新鲜 proposal。安全、
 身份、序列、RPC 和停车确认类硬故障仍会解除武装。
 
+Agent Core 不需要生成或传递导航 lease。`loco.start` 只提供已连接
+proposal topic 时，Driver 会在保持物理停止的同时成功启动，并在
+首条新鲜、合法、非终止 proposal 的同一回调中原子绑定其
+`nav_id` 并立即执行。任务期间不允许更换 ID。新版控制面仍可传入
+`expected_nav_id` 使用严格预绑定模式。终止零速后，兼容模式会
+永久退役已完成 ID，并保持订阅以接受下一个任务；显式 lease
+模式则等待控制面重新绑定。格式错误、过期、终止、已退役 ID
+或任务中切换 ID 的 proposal 都不能建立或替换 lease。
+
 `loco info` 会返回 proposal 计数、合并数、实测 RPC/队列时延、滚动
 RPC p50/p95/p99/max、逐原因拒绝统计及最近一次已确认停车。
 `last_set_velocity_duration_ms` 表示实测 RPC 耗时，不是 proposal TTL 余量。

@@ -10,6 +10,7 @@ from velocity_proposal import (
     VelocityProposalValidationError,
     resolve_expected_nav_id,
     resolve_input_topic,
+    resolve_optional_expected_nav_id,
     validate_velocity_proposal,
     velocity_proposal_port,
 )
@@ -95,6 +96,20 @@ class TopicResolutionTest(unittest.TestCase):
             with self.subTest(args=args), self.assertRaises(ValueError):
                 resolve_expected_nav_id(args)
 
+    def test_optional_control_plane_nav_id_supports_legacy_core(self):
+        self.assertIsNone(resolve_optional_expected_nav_id({}))
+        self.assertIsNone(
+            resolve_optional_expected_nav_id({"expected_nav_id": ""})
+        )
+        self.assertEqual(
+            resolve_optional_expected_nav_id(
+                {"expected_nav_id": " nav-001 "}
+            ),
+            "nav-001",
+        )
+        with self.assertRaises(ValueError):
+            resolve_optional_expected_nav_id({"expected_nav_id": 123})
+
 
 class ProposalValidationTest(unittest.TestCase):
     def setUp(self):
@@ -171,6 +186,117 @@ class ProposalGateTest(unittest.TestCase):
         self.assertTrue(rejected.stop)
         self.assertEqual(rejected.reason, "nav_id_mismatch")
         self.assertFalse(self.gate.armed)
+
+    def test_legacy_core_first_fresh_proposal_binds_and_executes(self):
+        gate = VelocityProposalGate(ProposalLimits())
+        gate.bind(EXPECTED_TOPIC)
+
+        waiting = gate.snapshot(10.0)
+        self.assertTrue(waiting["connected"])
+        self.assertFalse(waiting["armed"])
+        self.assertTrue(waiting["awaiting_nav_id"])
+        self.assertEqual(
+            waiting["nav_id_binding_mode"],
+            "first_valid_proposal",
+        )
+
+        accepted = gate.accept(
+            proposal(sequence=7, issued_at_unix_ms=1_000),
+            now=10.0,
+            now_unix_ms=1_050,
+        )
+
+        self.assertTrue(accepted.execute)
+        self.assertEqual(gate.expected_nav_id, "nav-001")
+        self.assertTrue(gate.armed)
+        self.assertFalse(gate.awaiting_nav_id)
+        self.assertEqual(gate.last_sequence, 7)
+
+    def test_legacy_core_does_not_bind_invalid_stale_or_terminal_proposal(self):
+        gate = VelocityProposalGate(ProposalLimits())
+        gate.bind(EXPECTED_TOPIC)
+
+        invalid = gate.accept(proposal(frame="map"), now=10.0)
+        stale = gate.accept(
+            proposal(issued_at_unix_ms=1_000),
+            now=10.1,
+            now_unix_ms=1_201,
+        )
+        terminal = gate.accept(
+            proposal(
+                nav_status="arrived",
+                velocity={"x": 0.0, "y": 0.0, "yaw": 0.0},
+            ),
+            now=10.2,
+        )
+
+        self.assertEqual(invalid.reason, "frame_mismatch")
+        self.assertEqual(stale.reason, "proposal_ttl_expired")
+        self.assertEqual(terminal.reason, "bootstrap_terminal_proposal")
+        self.assertTrue(gate.awaiting_nav_id)
+        self.assertFalse(gate.armed)
+        self.assertIsNone(gate.snapshot(10.3)["active_nav_id"])
+
+        accepted = gate.accept(proposal(sequence=2), now=10.3)
+        self.assertTrue(accepted.execute)
+        self.assertEqual(gate.expected_nav_id, "nav-001")
+
+    def test_legacy_core_cannot_change_adopted_nav_id(self):
+        gate = VelocityProposalGate(ProposalLimits())
+        gate.bind(EXPECTED_TOPIC)
+        self.assertTrue(gate.accept(proposal(sequence=1), now=10.0).execute)
+
+        rejected = gate.accept(
+            proposal(nav_id="nav-002", sequence=2),
+            now=10.1,
+        )
+
+        self.assertEqual(rejected.reason, "nav_id_mismatch")
+        self.assertFalse(gate.armed)
+        self.assertFalse(gate.awaiting_nav_id)
+
+    def test_legacy_core_cannot_bootstrap_a_retired_nav_id(self):
+        gate = VelocityProposalGate(ProposalLimits())
+        gate.bind(EXPECTED_TOPIC, "nav-001")
+        gate.unbind("canvas_stop")
+        gate.bind(EXPECTED_TOPIC)
+
+        replay = gate.accept(proposal(sequence=2), now=10.0)
+
+        self.assertEqual(replay.reason, "retired_nav_id_replay")
+        self.assertTrue(gate.awaiting_nav_id)
+        self.assertFalse(gate.armed)
+
+    def test_legacy_core_terminal_zero_waits_for_next_task(self):
+        gate = VelocityProposalGate(ProposalLimits())
+        gate.bind(EXPECTED_TOPIC)
+        self.assertTrue(gate.accept(proposal(sequence=1), now=10.0).execute)
+
+        terminal = gate.accept(
+            proposal(
+                sequence=2,
+                nav_status="arrived",
+                velocity={"x": 0.0, "y": 0.0, "yaw": 0.0},
+            ),
+            now=10.1,
+        )
+
+        self.assertTrue(terminal.stop)
+        self.assertFalse(gate.armed)
+        self.assertTrue(gate.awaiting_nav_id)
+        self.assertIsNone(gate.expected_nav_id or None)
+        self.assertIn("nav-001", gate.retired_nav_ids)
+
+        replay = gate.accept(proposal(sequence=3), now=10.2)
+        self.assertEqual(replay.reason, "retired_nav_id_replay")
+        self.assertTrue(gate.awaiting_nav_id)
+
+        next_task = gate.accept(
+            proposal(nav_id="nav-002", sequence=1),
+            now=10.3,
+        )
+        self.assertTrue(next_task.execute)
+        self.assertEqual(gate.expected_nav_id, "nav-002")
 
     def test_sequence_must_strictly_increase_for_active_nav(self):
         first = self.gate.accept(proposal(sequence=10), now=100.0)

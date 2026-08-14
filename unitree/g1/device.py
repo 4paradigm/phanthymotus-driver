@@ -38,7 +38,7 @@ from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
 from pointcloud_utils import gravity_align_inplace
 from velocity_proposal import (
     DEFAULT_VELOCITY_PROPOSAL_TOPIC,
-    resolve_expected_nav_id,
+    resolve_optional_expected_nav_id,
     resolve_input_topic,
     velocity_proposal_port,
 )
@@ -1424,7 +1424,7 @@ class LocoPlugin:
     def _connect_velocity_proposal(self, args: dict) -> dict:
         try:
             topic = resolve_input_topic(args, self._velocity_proposal_topic)
-            expected_nav_id = resolve_expected_nav_id(args)
+            expected_nav_id = resolve_optional_expected_nav_id(args)
         except ValueError as exc:
             self._client.StopMove()
             if self._smart_motion:
@@ -1444,9 +1444,11 @@ class LocoPlugin:
                 "topic_in": [self._velocity_proposal_port()],
             }
         result = self._smart_motion.bind_velocity_proposal(topic, expected_nav_id)
-        if result.get("error") or not (
-            result.get("connected") and result.get("armed")
-        ):
+        connected_ready = bool(
+            result.get("connected")
+            and (result.get("armed") or result.get("awaiting_nav_id"))
+        )
+        if result.get("error") or not connected_ready:
             result = dict(result)
             fallback_stop_ret = None
             fallback_stop_error = None
@@ -1458,9 +1460,7 @@ class LocoPlugin:
             result["fallback_stop_error"] = fallback_stop_error
         return {
             **result,
-            "state": "ready" if (
-                result.get("connected") and result.get("armed")
-            ) else "error",
+            "state": "ready" if connected_ready else "error",
             "topic_in": [self._velocity_proposal_port()],
         }
 

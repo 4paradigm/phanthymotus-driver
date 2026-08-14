@@ -34,7 +34,7 @@ from velocity_proposal import (
     DEFAULT_VELOCITY_PROPOSAL_TOPIC,
     ProposalLimits,
     VelocityProposalGate,
-    resolve_expected_nav_id,
+    resolve_optional_expected_nav_id,
 )
 
 
@@ -553,7 +553,7 @@ class ProposalApplyDiagnostics:
         repr=False,
     )
 
-    def begin_session(self, nav_id: str) -> None:
+    def begin_session(self, nav_id: Optional[str]) -> None:
         """Reset per-lease counters while retaining them after later cleanup."""
         with self._lock:
             self.session_nav_id = nav_id
@@ -1217,7 +1217,11 @@ class SmartMotionProxy:
     def get_state(self) -> dict:
         return self._call("get_state")
 
-    def bind_velocity_proposal(self, topic: str, expected_nav_id: str) -> dict:
+    def bind_velocity_proposal(
+        self,
+        topic: str,
+        expected_nav_id: Optional[str] = None,
+    ) -> dict:
         return self._call_with_parent_stop(
             "bind_velocity_proposal",
             topic=topic,
@@ -2524,7 +2528,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
     ):
         nonlocal last_proposal_stop_result
         try:
-            expected_nav_id = resolve_expected_nav_id(
+            expected_nav_id = resolve_optional_expected_nav_id(
                 {"expected_nav_id": expected_nav_id}
             )
         except ValueError as exc:
@@ -2800,6 +2804,18 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
             now,
             now_unix_ms=received_unix_ms,
         )
+        if not was_armed and proposal_gate.armed:
+            proposal_apply_diagnostics.begin_session(
+                proposal_gate.expected_nav_id
+            )
+            # begin_session resets the counters accumulated while no task was
+            # authorized. Preserve this first executable proposal as the
+            # first sample of the newly adopted lease.
+            proposal_apply_diagnostics.record_received(now)
+            proposal_apply_diagnostics.record_proposal_arrival(
+                payload,
+                received_unix_ms,
+            )
         if decision.stop:
             if decision.reason != "proposal_zero":
                 proposal_apply_diagnostics.record_rejected(decision.reason)
@@ -2814,7 +2830,13 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                 newly_disarmed,
                 proposal_gate.recoverable_stop_active,
             ):
-                do_stop(decision.reason)
+                stopped = do_stop(decision.reason)
+                if (
+                    decision.proposal is not None
+                    and decision.proposal.is_terminal
+                    and stopped.get("stop_confirmed") is not True
+                ):
+                    proposal_gate.disarm("terminal_stop_unconfirmed")
             return
         if not decision.execute or decision.proposal is None:
             proposal_apply_diagnostics.record_rejected(

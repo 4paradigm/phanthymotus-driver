@@ -72,6 +72,17 @@ coalesced instead of backlogged. A proposal TTL lapse immediately triggers
 same navigation lease recoverable for the next fresh proposal. Hard safety,
 identity, sequence, RPC, and stop-confirmation faults still disarm the lease.
 
+Agent Core does not need to generate or pass a navigation lease. When
+`loco.start` supplies only the connected proposal topic, the Driver starts
+successfully while physically stopped, then atomically adopts the `nav_id`
+from the first fresh, valid, non-terminal proposal and executes that same
+proposal. The ID is fixed for the rest of the session. A newer control plane
+may still provide `expected_nav_id` to select strict pre-bound mode;
+malformed, stale, terminal, retired-ID, or later mismatched-ID proposals never
+establish or replace a lease. After a terminal zero proposal, implicit mode
+retires the completed ID and remains subscribed for the next task; explicit
+mode disarms until the control plane binds another lease.
+
 `loco info` exposes proposal counters, the coalesced count, measured RPC and
 queue latency, rolling RPC p50/p95/p99/max values, rejection reasons, and the
 last confirmed proposal stop. The `last_set_velocity_duration_ms` value is

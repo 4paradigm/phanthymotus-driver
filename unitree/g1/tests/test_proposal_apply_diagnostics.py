@@ -220,6 +220,21 @@ class ProposalApplyDiagnosticsTest(unittest.TestCase):
         self.assertEqual(reset["watchdog_faults_by_reason"], {})
         self.assertIsNone(reset["first_rejection_reason"])
 
+    def test_implicit_lease_session_starts_with_first_valid_proposal(self):
+        diagnostics = ProposalApplyDiagnostics()
+        diagnostics.begin_session(None)
+        diagnostics.record_received(9.0)
+        diagnostics.record_rejected("frame_mismatch")
+        diagnostics.begin_session("nav-legacy")
+        diagnostics.record_received(10.0)
+
+        status = diagnostics.snapshot()
+
+        self.assertEqual(status["session_nav_id"], "nav-legacy")
+        self.assertEqual(status["received"], 1)
+        self.assertEqual(status["first_received_monotonic"], 10.0)
+        self.assertEqual(status["rejected"], 0)
+
     def test_applied_count_deduplicates_safety_reapply_by_proposal_identity(self):
         diagnostics = ProposalApplyDiagnostics()
         diagnostics.begin_session("nav-1")
