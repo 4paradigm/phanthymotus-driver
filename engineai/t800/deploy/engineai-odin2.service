@@ -1,0 +1,25 @@
+[Unit]
+Description=EngineAI T800 Odin2 ROS2 vision driver
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/opt/ros/humble/share/odin_ros_driver_rev1/launch/driver.launch.py
+ConditionPathExists=/home/ubuntu/odin/src/ros_driver/config/control_command.yaml
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/odin
+Environment=HOME=/home/ubuntu
+Environment=ROS_DOMAIN_ID=69
+Environment=ROS_LOCALHOST_ONLY=0
+Environment=RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+ExecStartPre=/usr/bin/ping -c 1 -W 2 192.168.100.251
+ExecStart=/usr/bin/bash -lc 'source /opt/ros/humble/setup.bash && exec ros2 launch odin_ros_driver_rev1 driver.launch.py start_rviz:=false'
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
