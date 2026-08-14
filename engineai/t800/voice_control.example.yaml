@@ -1,0 +1,34 @@
+# 复制 config.yaml 为单独的 config.voice-control.yaml 后，将本段加入 plugins:。
+# 原 config.yaml 和已有插件实现均不需要修改。
+voice_control:
+  enabled: true
+  # 空值时，默认订阅 /{ros_namespace}/mic/audio/asr。
+  # 若 ros_namespace 留空，建议在部署配置中显式填写实际 Perception ASR 输出 Topic。
+  asr_topic: ""
+  require_wake_word: true
+  cooldown_sec: 3.0
+
+  # ASR 文本只能匹配以下固定短语，不能直接指定任意 Driver 工具或参数。
+  actions:
+    wave:
+      description: "举手挥手打招呼"
+      phrases: ["你好", "您好", "打招呼"]
+      target:
+        tool: gesture
+        action: play
+        arguments:
+          name: wave_hands
+          repetitions: 1
+          reset_after: true
+          wait: false
+    shake_hand:
+      description: "伸手握手"
+      phrases: ["握手", "握个手"]
+      target:
+        tool: gesture
+        action: play
+        arguments:
+          name: shake_hand
+          repetitions: 1
+          reset_after: true
+          wait: false
