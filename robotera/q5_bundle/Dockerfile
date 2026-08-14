@@ -16,15 +16,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     openssh-client \
     sshpass \
-    python3-pip \
+    python3-yaml \
     ros-humble-rmw-cyclonedds-cpp \
     ros-humble-rmw-fastrtps-cpp \
     ros-humble-geometry-msgs \
     ros-humble-lifecycle-msgs \
     ros-humble-sensor-msgs \
     ros-humble-std-srvs \
-    ros-humble-control-msgs \
-    ros-humble-nav-msgs \
     ros-humble-diagnostic-msgs \
     ros-humble-action-msgs \
     && rm -rf /var/lib/apt/lists/*
@@ -35,11 +33,6 @@ COPY vendor/xbot_common_interfaces /q5_ws/src/xbot_common_interfaces
 COPY vendor/audio_msgs /q5_ws/src/audio_msgs
 RUN cd /q5_ws && . /opt/ros/humble/setup.sh && \
     colcon build --packages-select xbot_common_interfaces audio_msgs
-COPY vendor/xbot_sdk_api /opt/xbot_sdk_api
-
-COPY requirements.txt /work/requirements.txt
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r requirements.txt
-
 COPY main.py /work/main.py
 COPY q5_bus_bridge.py /work/q5_bus_bridge.py
 COPY q5_bundle_entrypoint.sh /work/q5_bundle_entrypoint.sh
@@ -77,7 +70,7 @@ COPY resource/q5_model.urdf /work/resource/q5_model.urdf
 COPY resource/fastdds_udp_only.xml /work/resource/fastdds_udp_only.xml
 COPY deploy/ /deploy/
 
-ENV PYTHONPATH=/work:/opt/xbot_sdk_api
+ENV PYTHONPATH=/work
 
 RUN chmod +x /work/q5_bundle_entrypoint.sh
 
