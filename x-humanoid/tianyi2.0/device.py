@@ -4864,7 +4864,7 @@ class HomePlugin:
                 "properties": {
                     "action": {"type": "string", "enum": [
                         "list_docks", "register_dock", "set_dock", "delete_dock",
-                        "clear_docks", "get_dock", "go_home", "go_home_no_dock", "cancel",
+                        "clear_docks", "get_dock", "go_home", "cancel",
                     ], "description": "充电桩或回桩动作"},
                     "display_name": {"type": "string", "description": "新充电桩显示名称"},
                     "dock_id": {"type": "string", "description": "充电桩 UUID"},
@@ -4875,7 +4875,7 @@ class HomePlugin:
                 },
                 "required": ["action"],
                 "x-completion": {
-                    "actions": ["go_home", "go_home_no_dock"],
+                    "actions": ["go_home"],
                     "timeout": 180,
                 },
                 "x-action-params": {
@@ -4886,7 +4886,6 @@ class HomePlugin:
                     "clear_docks": {"params": [], "description": "清空所有充电桩"},
                     "get_dock": {"params": [], "description": "获取当前充电桩位置"},
                     "go_home": {"params": [], "description": "回桩并尝试充电，系统自动等待完成"},
-                    "go_home_no_dock": {"params": [], "description": "返回上桩点但不上桩，系统自动等待完成"},
                     "cancel": {"params": [], "description": "取消当前回桩动作"},
                 },
                 "x-hooks": {"on_interrupt_motion": {"action": "cancel"}},
@@ -4934,9 +4933,8 @@ class HomePlugin:
             return {"api_result": self._slamtec.clear_home_docks()}
         if action == "get_dock":
             return {"pose": self._slamtec.get_home_pose()}
-        if action in ("go_home", "go_home_no_dock"):
+        if action == "go_home":
             result = self._slamtec.go_home(
-                dock=action == "go_home",
                 back_to_landing=args.get("back_to_landing"),
                 charging_retry_count=args.get("charging_retry_count"),
                 move_mode=args.get("move_mode"),
@@ -5004,7 +5002,7 @@ class HomePlugin:
                 if elapsed > self._MISSING_ACTION_TIMEOUT:
                     _acp_notify(action_id, "error", {"action": action, "error": "action_disappeared", "elapsed": round(elapsed, 1), **context}, "home")
                     return
-            if action in ("go_home", "go_home_no_dock"):
+            if action == "go_home":
                 try:
                     pose = self._slamtec.get_pose()
                     if last_pose is None:

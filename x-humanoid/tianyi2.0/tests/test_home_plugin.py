@@ -79,7 +79,9 @@ def _plugin(status):
 
 def test_home_schema_owns_go_home():
     module, home, _ = _plugin({"action_state": 1, "result": 0})
-    assert "go_home" in home.get_tool()["inputSchema"]["properties"]["action"]["enum"]
+    home_actions = home.get_tool()["inputSchema"]["properties"]["action"]["enum"]
+    assert "go_home" in home_actions
+    assert "go_home_no_dock" not in home_actions
     assert "go_home" not in module.NavPlugin({}, "", types.SimpleNamespace(ctx_tianyi=None, executor_tianyi=types.SimpleNamespace(add_node=lambda _: None)), _Client({})).get_tool()["inputSchema"]["properties"]["action"]["enum"]
 
 
