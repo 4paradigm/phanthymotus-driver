@@ -119,6 +119,8 @@ plugins:
     stop_timeout: 10
   mic:
     enabled: true
+  speaker:
+    enabled: true
   vision:
     enabled: true
     source: "slam"           # raw | slam —— 转发哪个点云源（slam=odom 标准坐标系 z 轴朝上；raw=传感器坐标系，随头部俯仰倾斜，渲染会上下颠倒）
