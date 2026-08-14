@@ -1,0 +1,5 @@
+# SetVolume.srv    支持 0～100 之间的整数值
+int32 volume
+---
+bool success
+string message
