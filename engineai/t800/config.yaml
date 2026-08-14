@@ -95,7 +95,7 @@ plugins:
     url: "udpm://239.255.76.67:7667?ttl=1"
     channel: "virtual_gamepad/gamepad_keys"
     rate_hz: 20.0
-  mapping:
+  controlled_spatial:
     enabled: true
     map_save_dir: /opt/phanthy-motus/data/maps
     db_path: /opt/phanthy-motus/data/mapping.db

@@ -103,7 +103,7 @@ class T800DeviceBundle:
             HeartbeatStatusPlugin,
             LedPlugin,
             LocomotionPlugin,
-            MappingPlugin,
+            ControlledSpatialPlugin,
             MotionCommandTracePlugin,
             MotionEventsPlugin,
             MicPlugin,
@@ -176,14 +176,14 @@ class T800DeviceBundle:
             instances["virtual_gamepad"] = instance
             self._plugins.append(instance)
 
-        mapping_config = plugins.get("mapping", {})
-        if mapping_config.get("enabled", False):
+        controlled_spatial_config = plugins.get("controlled_spatial", {})
+        if controlled_spatial_config.get("enabled", False):
             try:
-                instance = MappingPlugin(mapping_config, namespace, ros2)
-                instances["mapping"] = instance
+                instance = ControlledSpatialPlugin(controlled_spatial_config, namespace, ros2)
+                instances["controlled_spatial"] = instance
                 self._plugins.append(instance)
             except Exception as exc:
-                print(f"[bundle] MappingPlugin init failed, mapping disabled: {exc}", flush=True)
+                print(f"[bundle] ControlledSpatialPlugin init failed, controlled_spatial disabled: {exc}", flush=True)
 
         if "safety" in instances:
             instances["safety"].set_controls(
