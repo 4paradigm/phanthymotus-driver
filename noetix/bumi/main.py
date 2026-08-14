@@ -17,6 +17,7 @@ import os
 import re
 import signal
 import socket
+import subprocess
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -74,6 +75,12 @@ class BumiDeviceBundle:
             from device import CameraPlugin
             self._plugins.append(CameraPlugin(plugins_cfg["camera"], namespace, executor))
             print("[bundle] CameraPlugin loaded")
+
+        if plugins_cfg.get("motion_state", {}).get("enabled", False) and high_ctrl is not None:
+            from device import MotionStatePlugin
+            self._plugins.append(MotionStatePlugin(
+                plugins_cfg["motion_state"], namespace, executor, high_ctrl))
+            print("[bundle] MotionStatePlugin loaded")
 
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
@@ -255,7 +262,6 @@ def main():
 
         # init() may block indefinitely if robot is unreachable (GIL held in C++).
         # Use subprocess probe to check if DDS connection is possible first.
-        import subprocess
         probe_code = (
             "import sys; sys.path.insert(0, '/work/noetix_sdk_bumi/build'); "
             "from highcontrol_py import HighController; "

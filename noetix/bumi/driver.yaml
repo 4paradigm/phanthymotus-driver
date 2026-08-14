@@ -6,4 +6,4 @@ hardware_model: "bumi"
 image_name: noetix-bumi
 port: 15704
 mcp_url: "http://localhost:15704/mcp"
-description: "Noetix Bumi-EDU — 麦克风 + 扬声器 + 运动控制 + Realsense 摄像头 + 状态感知"
+description: "Noetix Bumi-EDU — 麦克风、扬声器、摄像头、整机运动遥测、移动、起身收纳、预设动作和动作示教"
