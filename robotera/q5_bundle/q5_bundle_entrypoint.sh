@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# Run the Q5 vendor-facing driver. The driver itself starts the verified
-# multiprocessing media/audio bridge on Domain 42; do not also start the old
-# polling String bridge, since it would claim the same camera/audio topics
-# with incompatible ROS message types.
+# Run the Q5 vendor-facing driver and Agent Core's JSON sensor bridge. The
+# driver starts a separate typed media/audio bridge; q5_bus_bridge forwards
+# only data/json topics, so it cannot claim camera/audio DDS topic types.
 # ROS setup scripts intentionally read optional variables that may be unset;
 # nounset would abort while sourcing /opt/ros/humble/setup.bash.
 set -Ee -o pipefail
@@ -27,15 +26,27 @@ driver_uri="${Q5_CYCLONEDDS_URI:-${CYCLONEDDS_URI:-}}"
 ) &
 driver_pid=$!
 
+(
+  export ROS_DOMAIN_ID="${AGENT_CORE_ROS_DOMAIN_ID:-42}"
+  export RMW_IMPLEMENTATION="rmw_fastrtps_cpp"
+  export ROS_LOCALHOST_ONLY="${ROS_LOCALHOST_ONLY:-0}"
+  export Q5_DRIVER_URL="${Q5_DRIVER_URL:-http://127.0.0.1:15793/mcp}"
+  # Do not let the Q5 CycloneDDS configuration affect Fast DDS discovery.
+  unset CYCLONEDDS_URI
+  exec python3 /work/q5_bus_bridge.py
+) &
+bridge_pid=$!
+
 shutdown() {
   trap - TERM INT EXIT
-  kill -TERM "$driver_pid" 2>/dev/null || true
+  kill -TERM "$bridge_pid" "$driver_pid" 2>/dev/null || true
+  wait "$bridge_pid" 2>/dev/null || true
   wait "$driver_pid" 2>/dev/null || true
 }
 
 trap shutdown TERM INT EXIT
 
 # The media bridge is a child of main.py and is shut down with it.
-wait "$driver_pid"
+wait -n "$driver_pid" "$bridge_pid"
 exit_code=$?
 exit "$exit_code"

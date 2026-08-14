@@ -70,7 +70,12 @@ def select_sensor_tools(tools: Any) -> dict[str, list[str]]:
         topics = []
         for entry in tool.get("topic_out") or []:
             topic = entry.get("topic") if isinstance(entry, dict) else None
-            if isinstance(topic, str) and topic and topic not in topics:
+            fmt = entry.get("format") if isinstance(entry, dict) else None
+            # Live media has a dedicated typed bridge. Publishing it here as
+            # std_msgs/String would claim the same DDS topic with a different
+            # type and prevent Agent Core from receiving AudioChunk/Image.
+            if (isinstance(topic, str) and topic and fmt == "data/json"
+                    and topic not in topics):
                 topics.append(topic)
         if topics:
             selected[name] = topics

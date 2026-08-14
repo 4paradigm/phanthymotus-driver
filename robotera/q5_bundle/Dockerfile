@@ -31,10 +31,23 @@ COPY q5_bundle_entrypoint.sh /work/q5_bundle_entrypoint.sh
 COPY sensor_contract.py /work/sensor_contract.py
 COPY control_contract.py /work/control_contract.py
 COPY q5_sdk_client.py /work/q5_sdk_client.py
+COPY base_drive.py /work/base_drive.py
+COPY joints_state.py /work/joints_state.py
+COPY joints.py /work/joints.py
+COPY robot_ready.py /work/robot_ready.py
+COPY battery.py /work/battery.py
+COPY system_health.py /work/system_health.py
+COPY hand_state.py /work/hand_state.py
+COPY estop.py /work/estop.py
+COPY diagnostics.py /work/diagnostics.py
+COPY simple_action.py /work/simple_action.py
 COPY body_command.py /work/body_command.py
 COPY hand_command.py /work/hand_command.py
 COPY arm_control.py /work/arm_control.py
 COPY joint_limits.py /work/joint_limits.py
+COPY hand_control.py /work/hand_control.py
+COPY hand_gesture.py /work/hand_gesture.py
+COPY head_control.py /work/head_control.py
 COPY mic.py speaker.py audio.py camera_rgb.py camera_depth.py q5_control_mode.py /work/
 COPY legacy_device.py legacy_direct_control.py q5_media_bridge.py /work/
 COPY config.yaml /work/config.yaml
