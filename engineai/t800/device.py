@@ -3614,6 +3614,12 @@ class ControlledSpatialPlugin:
         self._frame_count = 0
         self._lock = threading.Lock()
 
+        # 启动时从 DB 恢复上次的 active_map（持久化）
+        saved_active = self._db.get_state("active_map")
+        if saved_active and self._db.get_map(saved_active):
+            self._active_map = saved_active
+            print(f"[controlled_spatial] restored active_map='{saved_active}' from DB", flush=True)
+
         self._node = Node("t800_mapping", context=ros2.ctx_robot)
         ros2.executor_robot.add_node(self._node)
         self._odom_sub = None
@@ -3639,7 +3645,7 @@ class ControlledSpatialPlugin:
             ),
             "inputSchema": action_schema(
                 {
-                    "start_mapping": (["map_name"], "开始建图，用遥控器或 loco 控制机器人行走"),
+                    "start_mapping": (["map_name", "overwrite"], "开始建图，用遥控器或 loco 控制机器人行走。若同名地图已存在需 overwrite=true 才允许覆盖"),
                     "stop_mapping": ([], "停止建图，体素下采样后保存 .pcd 地图"),
                     "cancel_mapping": ([], "取消建图，丢弃已累积点云，不保存"),
                     "mapping_status": ([], "查询当前建图状态、实时位姿和已累积点数"),
@@ -3652,6 +3658,7 @@ class ControlledSpatialPlugin:
                 },
                 {
                     "map_name": {"type": "string", "description": "地图名称"},
+                    "overwrite": {"type": "boolean", "description": "地图已存在时是否覆盖（默认 false，防止误操作覆盖已有地图）", "default": False},
                     "name": {"type": "string", "description": "标记名称"},
                     "description": {"type": "string", "description": "标记描述（可选）"},
                 },
@@ -3679,7 +3686,7 @@ class ControlledSpatialPlugin:
         if action == "stop":
             return {"state": "idle"}
         if action == "start_mapping":
-            return self._start_mapping(args.get("map_name", ""))
+            return self._start_mapping(args.get("map_name", ""), args.get("overwrite", False))
         if action == "stop_mapping":
             return self._stop_mapping()
         if action == "cancel_mapping":
@@ -3702,7 +3709,7 @@ class ControlledSpatialPlugin:
 
     # ── Action handlers ──────────────────────────────────────────────
 
-    def _start_mapping(self, map_name: str) -> dict:
+    def _start_mapping(self, map_name: str, overwrite: bool = False) -> dict:
         map_name = str(map_name).strip()
         if not map_name:
             return {"error": "map_name is required"}
@@ -3711,8 +3718,17 @@ class ControlledSpatialPlugin:
                 return {"error": f"already mapping '{self._current_map}'", "current_map": self._current_map}
 
         existing = self._db.get_map(map_name)
+        if existing and not overwrite:
+            return {
+                "error": f"map '{map_name}' already exists. Use overwrite=true to overwrite, or choose a different name.",
+                "existing_map": {
+                    "name": existing["name"],
+                    "point_count": existing.get("point_count", 0),
+                    "created_at": existing.get("created_at"),
+                },
+            }
         if existing:
-            print(f"[controlled_spatial] map '{map_name}' already exists, will overwrite on save", flush=True)
+            print(f"[controlled_spatial] overwriting existing map '{map_name}' (overwrite=true)", flush=True)
 
         try:
             self._create_cloud_subscription()

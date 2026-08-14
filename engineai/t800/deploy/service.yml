@@ -7,6 +7,7 @@ engineai-t800:
   privileged: true
   volumes:
     - /dev:/dev
+    - /opt/phanthy-motus/data:/opt/phanthy-motus/data
     - ${T800_NATIVE_SDK_DIR:-/opt/engineai/native_sdk}:/opt/engineai/native_sdk
     # T800 厂商 PulseAudio 已独占机身麦克风，mic 通过宿主音频服务采集。
     - ${T800_PULSE_RUNTIME_DIR:-/run/user/1000/pulse}:/run/user/1000/pulse
