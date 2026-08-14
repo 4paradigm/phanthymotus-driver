@@ -103,6 +103,10 @@ plugins:
     max_points: 5000000
     odometry_topic: /manifold/ODIN2/device0/odometry
     pointcloud_topic: /manifold/ODIN2/device0/cloud/slam
+  controlled_spatial_map:
+    enabled: true
+    db_path: /opt/phanthy-motus/data/mapping.db
+    cloud_dir: /opt/phanthy-motus/data/controlled_spatial_clouds
   safety:
     enabled: true
   native_sdk:
