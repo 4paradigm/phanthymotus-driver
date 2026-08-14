@@ -6,6 +6,7 @@ module contains the verified state, battery, audio, and D455 camera cards.
 
 from __future__ import annotations
 
+import io
 import re
 import shlex
 import subprocess
@@ -550,12 +551,12 @@ class CameraRgbPlugin(_Q5MediaPlugin):
     def start(self):
         if self._running:
             return
-        import cv2
         import numpy as np
+        from PIL import Image as PilImage
         from sensor_msgs.msg import Image
 
         self._start_remote_realsense_if_configured()
-        self._cv2, self._np = cv2, np
+        self._pil_image, self._np = PilImage, np
         self._running = True
         if self._subscription is None:
             self._subscription = self._node.create_subscription(
@@ -653,19 +654,21 @@ cat /tmp/q5-realsense.pid 2>/dev/null || true
                 raw = self._np.frombuffer(msg.data, dtype=self._np.uint8)
                 image = raw[:msg.height * msg.step].reshape(msg.height, msg.step)[:, :msg.width * channels]
                 image = image.reshape(msg.height, msg.width, channels)
-                if msg.encoding == "rgb8":
-                    image = self._cv2.cvtColor(image, self._cv2.COLOR_RGB2BGR)
+                if msg.encoding == "bgr8":
+                    image = image[:, :, ::-1]
                 elif msg.encoding == "rgba8":
-                    image = self._cv2.cvtColor(image, self._cv2.COLOR_RGBA2BGR)
+                    image = image[:, :, :3]
                 elif msg.encoding == "bgra8":
-                    image = self._cv2.cvtColor(image, self._cv2.COLOR_BGRA2BGR)
-                ok, jpeg = self._cv2.imencode(".jpg", image, [self._cv2.IMWRITE_JPEG_QUALITY, self._jpeg_quality])
-                if ok:
-                    self._send_media({"kind": "rgb", "data": jpeg.tobytes(),
-                                      "width": int(msg.width), "height": int(msg.height),
-                                      "encoding": msg.encoding, "timestamp_ms": int(time.time() * 1000)})
-                    self._frames_sent += 1
-                    self._last_sent = time.monotonic()
+                    image = image[:, :, [2, 1, 0]]
+                image = self._np.ascontiguousarray(image)
+                encoded = io.BytesIO()
+                self._pil_image.fromarray(image, "RGB").save(
+                    encoded, format="JPEG", quality=self._jpeg_quality)
+                self._send_media({"kind": "rgb", "data": encoded.getvalue(),
+                                  "width": int(msg.width), "height": int(msg.height),
+                                  "encoding": msg.encoding, "timestamp_ms": int(time.time() * 1000)})
+                self._frames_sent += 1
+                self._last_sent = time.monotonic()
             except Exception as exc:
                 self._node.get_logger().warn(f"RGB encode failed: {exc}")
 
@@ -700,10 +703,10 @@ class CameraDepthPlugin(_Q5MediaPlugin):
     def start(self):
         if self._running:
             return
-        import cv2
         import numpy as np
+        from PIL import Image as PilImage
         from sensor_msgs.msg import Image
-        self._cv2, self._np = cv2, np
+        self._pil_image, self._np = PilImage, np
         self._running = True
         if self._subscription is None:
             self._subscription = self._node.create_subscription(
@@ -727,10 +730,9 @@ class CameraDepthPlugin(_Q5MediaPlugin):
             # D455 Z16 is millimetres. A fixed 0.25-5.0 m window is stable
             # across frames and avoids the confusing red/green pseudo-colors.
             preview = self._np.clip((depth - 250.0) * (255.0 / 4750.0), 0, 255).astype(self._np.uint8)
-            ok, jpeg = self._cv2.imencode(".jpg", preview, [self._cv2.IMWRITE_JPEG_QUALITY, 75])
-            if not ok:
-                return
-            self._send_media({"kind": "depth_jpeg", "data": jpeg.tobytes()})
+            encoded = io.BytesIO()
+            self._pil_image.fromarray(preview, "L").save(encoded, format="JPEG", quality=75)
+            self._send_media({"kind": "depth_jpeg", "data": encoded.getvalue()})
         except Exception as exc:
             self._node.get_logger().warn(f"Depth preview encode failed: {exc}")
             return
