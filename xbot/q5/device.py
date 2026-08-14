@@ -185,10 +185,11 @@ rc = alsa.snd_pcm_set_params(pcm, 2, 3, %d, %d, 1, 200000)
 if rc < 0: raise RuntimeError('snd_pcm_set_params failed: %%d' %% rc)
 state = None
 pending = bytearray()
-# ROS, the bridge worker, and SSH do not share a real-time clock. Prefill six
-# browser-sized frames (192 ms) once so a brief transport delay cannot starve
-# the USB sound card between live PCM writes.
-prefill_bytes = 1024 * 6
+# The observed Agent Core bridge can deliver bursts after up to 262 ms without
+# a frame. Prefill 512 ms once so those delays cannot starve the USB card.
+# This intentionally trades a small fixed live-monitoring delay for stable
+# speech, instead of repeatedly underrunning and restarting ALSA playback.
+prefill_bytes = 1024 * 16
 try:
   while True:
     chunk = sys.stdin.buffer.read(1024)
