@@ -189,7 +189,7 @@ class T800DeviceBundle:
             try:
                 from controlled_spatial_map import make_plugin as make_map_plugin
                 map_cfg = dict(plugins["controlled_spatial_map"])
-                self._plugins.append(make_map_plugin(map_cfg, namespace, ros2.executor_robot))
+                self._plugins.append(make_map_plugin(map_cfg, namespace, ros2))
                 print("[bundle] ControlledSpatialMapPlugin loaded")
             except Exception as e:
                 print(f"[bundle] ControlledSpatialMapPlugin load skipped: {e}", flush=True)
