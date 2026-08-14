@@ -1,13 +1,13 @@
-# T800 Voice Control Extension
+# T800 Voice Gesture Extension
 
-`voice_control.py` 是可选扩展：它订阅 Perception ASR 的最终 JSON，不采集音频、
+`voice_gesture.py` 是可选扩展：它订阅 Perception ASR 的最终 JSON，不采集音频、
 不运行 ASR 模型，也不调用外部 LLM。原有 `main.py`、`device.py`、`MicPlugin` 和
 `config.yaml` 不作修改。
 
 ## 数据流
 
 ```text
-mic/audio -> Perception asr -> mic/audio/asr -> voice_control
+mic/audio -> Perception asr -> mic/audio/asr -> voice_gesture -> gesture.play
                                                 `- 固定短语 -> gesture.play
 ```
 
@@ -25,8 +25,8 @@ Perception 当前输出形如：
 
 ## 规则动作
 
-从 `voice_control.example.yaml` 把 `voice_control:` 段复制到独立的
-`config.voice-control.yaml` 的 `plugins:` 下。动作配置定义的是固定的 `action_id`
+从 `voice_gesture.example.yaml` 把 `voice_gesture:` 段复制到独立的
+`config.voice-gesture.yaml` 的 `plugins:` 下。动作配置定义的是固定的 `action_id`
 到现有 Driver `gesture` 的映射；ASR 文字不会被当作任意函数或关节参数执行。
 
 默认提供：
@@ -41,25 +41,25 @@ Perception 当前输出形如：
 ```bash
 cd engineai/t800
 docker build -t engineai-t800-driver .
-docker build -f Dockerfile.voice-control \
+docker build -f Dockerfile.voice-gesture \
   --build-arg BASE_IMAGE=engineai-t800-driver \
-  -t engineai-t800-voice-control .
+  -t engineai-t800-voice-gesture .
 ```
 
 运行扩展镜像时，用 `CONFIG_PATH` 挂载独立配置：
 
 ```bash
 docker run --rm --network host --privileged \
-  -e CONFIG_PATH=/work/config.voice-control.yaml \
-  -v /path/to/config.voice-control.yaml:/work/config.voice-control.yaml:ro \
+  -e CONFIG_PATH=/work/config.voice-gesture.yaml \
+  -v /path/to/config.voice-gesture.yaml:/work/config.voice-gesture.yaml:ro \
   -v /dev:/dev \
   -v /opt/engineai/native_sdk:/opt/engineai/native_sdk \
   -v /run/user/1000/pulse:/run/user/1000/pulse \
   -v /home/ubuntu/.config/pulse:/root/.config/pulse:ro \
   -e NETWORK_INTERFACE=eth1 \
   -e PULSE_SERVER=unix:/run/user/1000/pulse/native \
-  engineai-t800-voice-control
+  engineai-t800-voice-gesture
 ```
 
-扩展入口是 `voice_control_main.py`；它在运行时把插件追加到原 Bundle。因此旧的
+扩展入口是 `voice_gesture_main.py`；它在运行时把插件追加到原 Bundle。因此旧的
 T800 Driver 镜像/入口可继续用于回退。

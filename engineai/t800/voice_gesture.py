@@ -1,4 +1,4 @@
-"""Optional T800 voice-control extension.
+"""Optional T800 voice-gesture extension.
 
 This module deliberately contains no ASR model client and no LLM client.  It
 consumes final events published by Perception and performs only deterministic,
@@ -36,7 +36,7 @@ def _normalise_text(value: str) -> str:
     return _PUNCTUATION.sub("", value).lower()
 
 
-class VoiceControlPlugin:
+class VoiceGesturePlugin:
     """Route final Perception ASR events to approved T800 actions.
 
     The ASR text is matched exactly after whitespace and common punctuation are
@@ -45,17 +45,17 @@ class VoiceControlPlugin:
     """
 
     def __init__(self, config: dict, namespace: str, ros2, targets: dict[str, object]):
-        plugin_config = config.get("plugins", {}).get("voice_control", {}) or {}
+        plugin_config = config.get("plugins", {}).get("voice_gesture", {}) or {}
         self._config = plugin_config
         self._ns = namespace
         self._targets = dict(targets)
         self._asr_topic = str(plugin_config.get("asr_topic") or f"/{namespace}/mic/audio/asr")
-        base_topic = f"/{namespace}/voice_control"
+        base_topic = f"/{namespace}/voice_gesture"
         self._events_topic = str(plugin_config.get("events_topic") or f"{base_topic}/events")
         self._require_wake_word = bool(plugin_config.get("require_wake_word", True))
         self._cooldown_sec = max(0.0, float(plugin_config.get("cooldown_sec", 3.0)))
         self._actions = self._load_actions(plugin_config.get("actions", {}) or {})
-        self._node = Node("t800_voice_control", context=ros2.ctx_core)
+        self._node = Node("t800_voice_gesture", context=ros2.ctx_core)
         ros2.executor_core.add_node(self._node)
         self._events_pub = None
         self._started = False
@@ -94,7 +94,7 @@ class VoiceControlPlugin:
 
     def get_tool(self) -> dict:
         return {
-            "name": "voice_control",
+            "name": "voice_gesture",
             "type": "processor",
             "multiInstance": False,
             "description": "T800 ASR 语音指令路由；仅执行配置白名单中的固定动作",
@@ -135,7 +135,7 @@ class VoiceControlPlugin:
             return self._info()
         if action == "info":
             return self._info()
-        return {"error": f"unknown voice_control action: {action}"}
+        return {"error": f"unknown voice_gesture action: {action}"}
 
     def _on_asr(self, message: String) -> None:
         try:
@@ -156,7 +156,7 @@ class VoiceControlPlugin:
             self._reject("wake_word_required", text=text)
             return
         if not self._enabled:
-            self._reject("voice_control_stopped", text=text)
+            self._reject("voice_gesture_stopped", text=text)
             return
         self._set_status(last_text=text, last_error="")
         action_id = self._match_action(text)

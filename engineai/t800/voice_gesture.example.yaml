@@ -1,6 +1,6 @@
-# 复制 config.yaml 为单独的 config.voice-control.yaml 后，将本段加入 plugins:。
+# 复制 config.yaml 为单独的 config.voice-gesture.yaml 后，将本段加入 plugins:。
 # 原 config.yaml 和已有插件实现均不需要修改。
-voice_control:
+voice_gesture:
   enabled: true
   # 空值时，默认订阅 /{ros_namespace}/mic/audio/asr。
   # 若 ros_namespace 留空，建议在部署配置中显式填写实际 Perception ASR 输出 Topic。

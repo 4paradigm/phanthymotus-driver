@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Start the T800 driver with the optional voice-control extension enabled.
+"""Start the T800 driver with the optional voice-gesture extension enabled.
 
 This is an alternate entrypoint.  It subclasses the existing bundle at
 runtime, so the original ``main.py`` and device plugins remain untouched.
@@ -9,15 +9,15 @@ from __future__ import annotations
 
 import main as driver_main
 
-from voice_control import VoiceControlPlugin
+from voice_gesture import VoiceGesturePlugin
 
 
-class VoiceControlBundle(driver_main.T800DeviceBundle):
-    """Append VoiceControlPlugin after the regular T800 driver plugins."""
+class VoiceGestureBundle(driver_main.T800DeviceBundle):
+    """Append VoiceGesturePlugin after the regular T800 driver plugins."""
 
     def __init__(self, config: dict, namespace: str, ros2):
         super().__init__(config, namespace, ros2)
-        plugin_config = config.get("plugins", {}).get("voice_control", {}) or {}
+        plugin_config = config.get("plugins", {}).get("voice_gesture", {}) or {}
         if not plugin_config.get("enabled", False):
             return
         targets = {}
@@ -27,11 +27,11 @@ class VoiceControlBundle(driver_main.T800DeviceBundle):
                 name = definition.get("name")
                 if name in ("gesture", "motion_mode"):
                     targets[name] = plugin
-        self._plugins.append(VoiceControlPlugin(config, namespace, ros2, targets))
+        self._plugins.append(VoiceGesturePlugin(config, namespace, ros2, targets))
 
 
 def main() -> None:
-    driver_main.T800DeviceBundle = VoiceControlBundle
+    driver_main.T800DeviceBundle = VoiceGestureBundle
     driver_main.main()
 
 
