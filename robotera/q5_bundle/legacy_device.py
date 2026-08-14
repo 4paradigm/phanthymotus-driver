@@ -24,10 +24,6 @@ from xbot_common_interfaces.srv import SetVolume
 # consolidated in direct_control.py.
 from legacy_direct_control import (
     ArmControlPlugin,
-    BaseDrivePlugin,
-    HandControlPlugin,
-    HandGesturePlugin,
-    HeadControlPlugin,
     Q5ControlModePlugin,
 )
 
@@ -748,111 +744,6 @@ def _wait_for_future(future, timeout_sec: float):
     while not future.done() and time.monotonic() < deadline:
         time.sleep(0.01)
     return future.result() if future.done() else None
-
-
-class StatePlugin:
-    """Read-only joint and Q5 FSM state card."""
-
-    def __init__(self, plugin_config, namespace, executor, client):
-        del plugin_config, executor
-        self._ns = namespace
-        self._client = client
-
-    def get_tool(self):
-        return {
-            "name": "state", "type": "sensor", "multiInstance": False,
-            "description": "Q5 joint feedback and READY/ACTIVE state.",
-            "inputSchema": {"type": "object", "properties": {
-                "action": {"type": "string", "enum": ["start", "stop", "info"]},
-            }, "required": ["action"], "additionalProperties": False},
-            # q5_bridge_worker publishes these JSON topics in Agent Core's DDS domain.
-            "topic_out": [
-                {"topic": f"/{self._ns}/q5/joints_state", "format": "data/json"},
-                {"topic": f"/{self._ns}/q5/robot_status", "format": "data/json"},
-            ],
-        }
-
-    def start(self):
-        pass
-
-    def stop(self):
-        pass
-
-    def dispatch(self, action, args):
-        del args
-        if action == "stop":
-            return {"state": "idle"}
-        if action not in ("start", "info"):
-            return None
-        joint = self._client.snapshot()
-        status = self._client.sensor_snapshot("robot_status")
-        if not status.get("available"):
-            status = self._client.sensor_snapshot("query_state")
-        return {
-            "state": "running",
-            "joint_state": {
-                "available": joint.get("available", False),
-                "fresh": joint.get("fresh", False),
-                "age_ms": joint.get("age_ms"),
-                "joint_count": joint.get("joint_count", 0),
-                "position_unit": joint.get("position_unit", "rad"),
-            },
-            "robot_status": {
-                "available": status.get("available", False),
-                "fresh": status.get("fresh", False),
-                "age_ms": status.get("age_ms"),
-                "state": status.get("state"),
-                "message": status.get("message", ""),
-                "source": status.get("source_service", "/xbot_state"),
-            },
-            "motion_manager_lifecycle": self._client.get_lifecycle_state(),
-        }
-
-
-class BatteryPlugin:
-    """Read-only battery state card, including verified board firmware."""
-
-    def __init__(self, plugin_config, namespace, executor, client):
-        del plugin_config, executor
-        self._ns = namespace
-        self._client = client
-
-    def get_tool(self):
-        return {
-            "name": "battery", "type": "sensor", "multiInstance": False,
-            "description": "Q5 battery level, electrical readings, and power-board firmware.",
-            "inputSchema": {"type": "object", "properties": {
-                "action": {"type": "string", "enum": ["start", "stop", "info"]},
-            }, "required": ["action"], "additionalProperties": False},
-            "topic_out": [{"topic": f"/{self._ns}/battery_state", "format": "data/json"}],
-        }
-
-    def start(self):
-        pass
-
-    def stop(self):
-        pass
-
-    def dispatch(self, action, args):
-        del args
-        if action == "stop":
-            return {"state": "idle"}
-        if action not in ("start", "info"):
-            return None
-        battery = self._client.sensor_snapshot("battery")
-        firmware = self._client.sensor_snapshot("battery_version")
-        return {
-            "state": "running",
-            "available": battery.get("available", False),
-            "fresh": battery.get("fresh", False),
-            "age_ms": battery.get("age_ms"),
-            "percentage": battery.get("percentage"),
-            "voltage_v": battery.get("voltage"),
-            "current_a": battery.get("current"),
-            "temperature_c": battery.get("temperature"),
-            "power_supply_status": battery.get("power_supply_status"),
-            "firmware": firmware.get("components", {}),
-        }
 
 
 class AudioPlugin:

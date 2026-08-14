@@ -42,14 +42,16 @@ plugins:
     device: "hw:2,0"
     sample_rate_hz: 16000
     channels: 1
-    output_sample_rate_hz: 44100
+    output_sample_rate_hz: 48000
     output_channels: 2
   audio:
     enabled: true
+    device: "plughw:2,0"
   camera_rgb:
     enabled: true
+    source_topic: "/camera/camera/color/image_raw"
     max_hz: 15.0
-    jpeg_quality: 70
+    jpeg_quality: 60
     remote_start:
       enabled: true
       host: "192.168.8.100"
@@ -60,6 +62,7 @@ plugins:
       color_profile: "848x480x30"
   camera_depth:
     enabled: true
+    source_topic: "/camera/camera/aligned_depth_to_color/image_raw"
     max_hz: 15.0
   arm_control:
     enabled: true
@@ -68,7 +71,7 @@ plugins:
     # spaced 0.3 s apart. URDF hard limits alone are not a safe move envelope.
     max_target_delta_rad: 0.050
     max_step_rad: 0.010
-    publish_rate_hz: 3.3333333333
+    publish_rate_hz: 20.0
     hold_repetitions: 3
     # Keep the final arm target published until feedback has caught up.
     settle_tolerance_rad: 0.035
