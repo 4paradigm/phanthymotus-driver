@@ -65,6 +65,7 @@ import struct
 import threading
 import time
 from pathlib import Path
+from uuid import uuid4
 
 import rclpy
 from rclpy.node import Node
@@ -2621,6 +2622,7 @@ class ArmPlugin:
         self._pos_publisher = None
         self._ctrl_publisher = None
         self._feedback = _JointCommandFeedback("arm", "/arm/status")
+        self._sequence = _ActionSequence("ArmPlugin")
 
     def get_tool(self) -> dict:
         return {
@@ -2635,12 +2637,38 @@ class ArmPlugin:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["move_pos", "move_ctrl"],
+                    "action": {"type": "string", "enum": ["move_pos", "move_ctrl", "move_traj"],
                                "default": "move_pos",
                                "description": (
                                    "模式选择：抬手、弯肘、摆姿势、回零等普通操作选move_pos；"
-                                   "只有需要调节手臂保持力度或减少晃动时才选move_ctrl"
+                                   "只有需要调节手臂保持力度或减少晃动时才选move_ctrl；"
+                                   "连贯多段动作（如太极、舞蹈）选move_traj"
                                )},
+                    "waypoints": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "left_positions": {
+                                    "type": "array", "items": {"type": "number", "minimum": -170, "maximum": 170},
+                                    "minItems": 7, "maxItems": 7,
+                                    "description": "左臂7关节角度(度)，缺失时继承上一个路径点"
+                                },
+                                "right_positions": {
+                                    "type": "array", "items": {"type": "number", "minimum": -170, "maximum": 170},
+                                    "minItems": 7, "maxItems": 7,
+                                    "description": "右臂7关节角度(度)，缺失时继承上一个路径点"
+                                },
+                                "time_from_start": {
+                                    "type": "number", "minimum": 0,
+                                    "description": "从轨迹开始到此点的秒数，必须递增"
+                                },
+                            },
+                            "required": ["time_from_start"],
+                        },
+                        "minItems": 2,
+                        "description": "轨迹路径点列表（≥2个），按time_from_start升序排列。每点可只指定left或right，缺失的一侧继承上一个路径点"
+                    },
                     "left_positions": {
                         "type": "array", "items": {"type": "number", "minimum": -170, "maximum": 170},
                         "minItems": 7, "maxItems": 7,
@@ -2691,6 +2719,11 @@ class ArmPlugin:
                                       "或已确认安全的轻推柔顺实验。它没有可设置的移动速度，同一角度在"
                                       "不同KP/KD下也可能停在不同位置；普通摆姿势或大幅移动请用move_pos"
                                   )},
+                    "move_traj": {"params": ["waypoints", "speed"],
+                                  "description": (
+                                      "轨迹模式：一次接收完整waypoint序列，驱动侧50Hz插值连续下发，"
+                                      "消除多段move_pos之间的LLM调度停顿。适合太极、舞蹈等连贯动作"
+                                  )},
                 },
             },
         }
@@ -2734,6 +2767,8 @@ class ArmPlugin:
             result["feedback_verified"] = True
             result["feedback"] = feedback
             return result
+        elif action == "move_traj":
+            return self._handle_move_traj(args)
         elif action == "move_ctrl":
             poses = self._requested_poses(args)
             kp = args.get("kp", [self._DEFAULT_KP] * 7)
@@ -2934,6 +2969,123 @@ class ArmPlugin:
             return {"state": "moving", "side": "both", "joints": len(cmds)}
         except Exception as e:
             return {"error": str(e)}
+
+    def _handle_move_traj(self, args: dict) -> dict:
+        waypoints_raw = args.get("waypoints")
+        if not waypoints_raw or not isinstance(waypoints_raw, list) or len(waypoints_raw) < 2:
+            return {"state": "error", "error": "waypoints is required for move_traj and must have at least 2 points",
+                    "code": "invalid_arm_waypoints"}
+        speed = args.get("speed", 0.5)
+        try:
+            speed = float(speed)
+        except (TypeError, ValueError):
+            return {"state": "error", "error": "speed must be numeric"}
+        if speed < 0.2 or speed > 1.5:
+            return {"state": "error", "error": "speed must be in [0.2, 1.5] rad/s"}
+        prev_left = None
+        prev_right = None
+        resolved = []
+        for i, wp in enumerate(waypoints_raw):
+            if not isinstance(wp, dict):
+                return {"state": "error", "error": f"waypoint {i} must be an object"}
+            tfs = wp.get("time_from_start")
+            if tfs is None:
+                return {"state": "error", "error": f"waypoint {i} missing time_from_start"}
+            try:
+                tfs = float(tfs)
+            except (TypeError, ValueError):
+                return {"state": "error", "error": f"waypoint {i} time_from_start must be numeric"}
+            left = wp.get("left_positions")
+            right = wp.get("right_positions")
+            if left is not None:
+                left, err = self._decode_array_argument(left, "left_positions")
+                if err:
+                    return err
+                if not isinstance(left, (list, tuple)) or len(left) != 7:
+                    return {"state": "error", "error": f"waypoint {i} left_positions must have 7 values"}
+                left = [float(v) for v in left]
+                prev_left = left
+            else:
+                left = prev_left
+            if right is not None:
+                right, err = self._decode_array_argument(right, "right_positions")
+                if err:
+                    return err
+                if not isinstance(right, (list, tuple)) or len(right) != 7:
+                    return {"state": "error", "error": f"waypoint {i} right_positions must have 7 values"}
+                right = [float(v) for v in right]
+                prev_right = right
+            else:
+                right = prev_right
+            if left is None and right is None:
+                return {"state": "error", "error": f"waypoint {i} has no arm target and no prior point to inherit"}
+            if left is None:
+                left = [0.0] * 7
+            if right is None:
+                right = [0.0] * 7
+            poses = {"left": left, "right": right}
+            violations = self._pose_violations(poses)
+            if violations:
+                return {"state": "error", "error": f"waypoint {i} pose exceeds URDF joint limits",
+                        "violations": violations}
+            resolved.append((tfs, left, right))
+        if len(resolved) < 2:
+            return {"state": "error", "error": "need at least 2 valid waypoints"}
+        for i in range(1, len(resolved)):
+            if resolved[i][0] <= resolved[i - 1][0]:
+                return {"state": "error", "error": f"waypoint {i} time_from_start must be greater than previous"}
+        motor_ids = self._motor_ids()
+        check = self._feedback.preflight(self._pos_publisher, motor_ids)
+        if check is not None:
+            return check
+        action_id = f"arm_traj_{uuid4().hex[:8]}"
+        duration = resolved[-1][0]
+        if duration <= 3.0:
+            cancel_event = threading.Event()
+            self._run_trajectory(resolved, speed, cancel_event)
+            return {
+                "state": "completed",
+                "action_id": action_id,
+                "waypoints": len(resolved),
+                "duration_s": duration,
+            }
+        else:
+            def _worker(cancel_event):
+                self._run_trajectory(resolved, speed, cancel_event)
+            self._sequence.start(_worker)
+            return {
+                "state": "moving",
+                "action_id": action_id,
+                "waypoints": len(resolved),
+                "duration_s": duration,
+                "async": True,
+            }
+
+    def _run_trajectory(self, resolved: list, speed: float, cancel_event: threading.Event):
+        rate = 0.02
+        total_time = resolved[-1][0]
+        t = 0.0
+        while t < total_time:
+            if cancel_event.is_set():
+                break
+            idx = 0
+            for i in range(len(resolved) - 1):
+                if resolved[i][0] <= t <= resolved[i + 1][0]:
+                    idx = i
+                    break
+            else:
+                idx = len(resolved) - 2
+            t0, left0, right0 = resolved[idx]
+            t1, left1, right1 = resolved[idx + 1]
+            dt = t1 - t0
+            alpha = (t - t0) / dt if dt > 0 else 0.0
+            alpha = max(0.0, min(1.0, alpha))
+            interp_left = [left0[j] + (left1[j] - left0[j]) * alpha for j in range(7)]
+            interp_right = [right0[j] + (right1[j] - right0[j]) * alpha for j in range(7)]
+            poses = {"left": interp_left, "right": interp_right}
+            self._send_pos(poses, speed)
+            time.sleep(rate)
+            t += rate
 
     def _send_ctrl(self, poses: dict[str, list[float]], kp: list, kd: list) -> dict:
         if not self._ctrl_publisher:
