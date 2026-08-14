@@ -1,0 +1,1 @@
+float32[] sub_move_cmds #[vx,vy,vyaw,height] #其中height （0-1）归一化float值

@@ -229,9 +229,25 @@ def main():
         print("[bundle] 未检测到 rclpy，状态卡走 MCP 轮询")
 
     from q5_sdk_client import Q5SdkClient
-    client = Q5SdkClient(cfg.get("joint_state_position_unit", "degrees"))
+    client = Q5SdkClient(cfg.get("joint_state_position_unit", "radians"))
     client.start(executor)
     print(f"[bundle] SDK client started ({'live' if client.available else 'STUB'})")
+
+    # Preserve the verified live PCM/media path while keeping RobotEra's
+    # dynamic plugin factory. The bridge owns Domain 42/FastDDS; the bundle
+    # process remains on the vendor Q5 domain.
+    bridge = None
+    try:
+        from q5_media_bridge import BridgeWorker
+        bridge = BridgeWorker(namespace, debug=False)
+        bridge.start()
+        client.publish_audio = bridge.push_audio
+        client.publish_media = bridge.push_media
+        client.configure_speaker = bridge.configure_speaker
+        client.pop_speaker_chunk = bridge.pop_speaker_chunk
+        print("[bundle] Q5 media/audio bridge started (Domain 42/FastDDS)", flush=True)
+    except Exception as exc:
+        print(f"[bundle] media/audio bridge unavailable: {exc}", flush=True)
 
     _bundle = Q5Bundle(cfg, namespace, executor, client)
     _bundle.start_all()
@@ -250,6 +266,8 @@ def main():
     def _shutdown(signum, frame):
         print(f"[bundle] signal {signum}, shutting down")
         _bundle.stop_all()
+        if bridge is not None:
+            bridge.shutdown()
         client.stop()
         threading.Thread(target=server.shutdown, daemon=True).start()
 
@@ -259,6 +277,8 @@ def main():
         server.serve_forever()
     finally:
         _bundle.stop_all()
+        if bridge is not None:
+            bridge.shutdown()
         client.stop()
         if executor is not None:
             executor.shutdown()
