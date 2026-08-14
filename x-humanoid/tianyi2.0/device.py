@@ -4858,7 +4858,7 @@ class HomePlugin:
         return {
             "name": "home",
             "type": "actuator",
-            "description": "天轶2.0 充电桩管理与回桩。简单流程：机器人停在充电桩对接位置并定位正常后执行 register_dock 注册，再执行 list_docks 获取 dock_id，接着执行 set_dock 选定当前目标，最后执行 go_home 回桩充电。回桩前需加载地图并保持定位正常。",
+            "description": "天轶2.0 充电桩管理与回桩。简单流程：机器人停在充电桩对接位置并定位正常后执行 register_dock；新桩会自动设为当前回桩目标，随后可直接执行 go_home 回桩充电。要切换到已有充电桩时，先用 list_docks 获取 dock_id，再执行 set_dock。回桩前需加载地图并保持定位正常。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -4880,7 +4880,7 @@ class HomePlugin:
                 },
                 "x-action-params": {
                     "list_docks": {"params": [], "description": "列出当前地图已注册的全部充电桩，返回名称、dock_id 与位姿；可据此选择或删除充电桩"},
-                    "register_dock": {"params": ["display_name"], "description": "将机器人当前定位位姿保存为一个新充电桩。执行前应让机器人停在实际充电桩的对接位置并确认定位正常。此操作只注册记录，不会自动设为当前回桩目标；注册后请用 list_docks 获取 dock_id，再执行 set_dock"},
+                    "register_dock": {"params": ["display_name"], "description": "将机器人当前定位位姿保存为一个新充电桩，并自动设为当前回桩目标。执行前应让机器人停在实际充电桩的对接位置并确认定位正常；成功后可直接执行 go_home"},
                     "set_dock": {"params": ["dock_id", "pose"], "description": "设置本次及后续回桩使用的当前目标。填写 dock_id 时读取已注册充电桩的位姿；也可直接填写 pose。二者任选其一，位姿必须匹配当前地图"},
                     "delete_dock": {"params": ["dock_id"], "description": "删除 list_docks 返回的指定充电桩记录，不会移动机器人"},
                     "clear_docks": {"params": [], "description": "删除全部已注册充电桩记录，不会移动机器人，操作不可恢复"},
@@ -4910,7 +4910,30 @@ class HomePlugin:
             name = str(args.get("display_name", "")).strip()
             if not name:
                 return {"error": "display_name is required"}
-            return {"dock": self._slamtec.register_home_dock(name)}
+            dock = self._slamtec.register_home_dock(name)
+            if self._error(dock):
+                return {"state": "error", "dock": dock}
+            pose = dock.get("pose") if isinstance(dock, dict) else None
+            if not isinstance(pose, dict):
+                return {
+                    "state": "registered_not_selected",
+                    "dock": dock,
+                    "error": "registered dock response does not contain pose",
+                }
+            selected = self._slamtec.set_home_pose(pose)
+            if self._error(selected):
+                return {
+                    "state": "registered_not_selected",
+                    "dock": dock,
+                    "pose": pose,
+                    "selection_result": selected,
+                }
+            return {
+                "state": "registered_and_selected",
+                "dock": dock,
+                "pose": pose,
+                "selection_result": selected,
+            }
         if action == "set_dock":
             dock_id = str(args.get("dock_id", "")).strip()
             pose = args.get("pose")

@@ -58,6 +58,10 @@ class _Client:
         self.calls.append(("go_home", kwargs))
         return {"action_id": 1}
 
+    def register_home_dock(self, display_name):
+        self.calls.append(("register_home_dock", display_name))
+        return {"id": "dock-new", "pose": {"x": 3, "y": 4, "yaw": 0.5}}
+
     def get_home_docks(self):
         return {"raw": [{"id": "dock-a", "pose": {"x": 1, "y": 2, "yaw": 0}}]}
 
@@ -87,7 +91,7 @@ def test_home_schema_owns_go_home():
     set_dock = home.get_tool()["inputSchema"]["x-action-params"]["set_dock"]
     assert "二者任选其一" in set_dock["description"]
     register_dock = home.get_tool()["inputSchema"]["x-action-params"]["register_dock"]
-    assert "不会自动设为当前回桩目标" in register_dock["description"]
+    assert "自动设为当前回桩目标" in register_dock["description"]
     assert "go_home" not in module.NavPlugin({}, "", types.SimpleNamespace(ctx_tianyi=None, executor_tianyi=types.SimpleNamespace(add_node=lambda _: None)), _Client({})).get_tool()["inputSchema"]["properties"]["action"]["enum"]
 
 
@@ -96,6 +100,17 @@ def test_set_dock_resolves_pose_from_dock_id():
     result = home.dispatch("set_dock", {"dock_id": "dock-a"})
     assert result["pose"] == {"x": 1, "y": 2, "yaw": 0}
     assert client.calls == [("set_home_pose", {"x": 1, "y": 2, "yaw": 0})]
+
+
+def test_register_dock_selects_new_dock():
+    _, home, client = _plugin({"action_state": 1, "result": 0})
+    result = home.dispatch("register_dock", {"display_name": "main_dock"})
+    assert result["state"] == "registered_and_selected"
+    assert result["pose"] == {"x": 3, "y": 4, "yaw": 0.5}
+    assert client.calls == [
+        ("register_home_dock", "main_dock"),
+        ("set_home_pose", {"x": 3, "y": 4, "yaw": 0.5}),
+    ]
 
 
 def test_home_poll_only_completes_on_done_success():
