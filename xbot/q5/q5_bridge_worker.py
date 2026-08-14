@@ -172,9 +172,15 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
     mic_frames_published = 0
     speaker_frames_received = 0
 
+    supported_audio_formats = {"audio/pcm-16k", "pcm_16k_16bit_mono"}
+
     def _on_speaker(msg):
         nonlocal speaker_frames_received
-        if msg.format != "audio/pcm-16k":
+        # Agent Core's remote microphone uses pcm_16k_16bit_mono while
+        # perception TTS uses audio/pcm-16k. Both carry S16_LE, 16 kHz mono.
+        if msg.format not in supported_audio_formats:
+            node.get_logger().warning(
+                f"speaker ignored unsupported audio format: {msg.format!r}")
             return
         try:
             speaker_q.put_nowait(bytes(msg.data))
