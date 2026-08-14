@@ -4,7 +4,7 @@ drivers/noetix/bumi/device.py — Noetix Bumi-EDU 设备插件实现。
 
 插件列表：
   - StatePlugin: joints (21-DOF skeleton), imu, battery, model (URDF resource)
-  - LocoPlugin: locomotion, stand-up/lie-down, semantic actions, action recording and debug workmode
+  - LocoPlugin: locomotion, stand-up/prone storage, semantic actions and action recording
   - MicPlugin: 8ch mic capture → mono PCM 16kHz
   - SpeakerPlugin: audio playback via MediaController
   - CameraPlugin: Realsense D435i color + depth
@@ -298,7 +298,6 @@ class LocoPlugin:
             self._stand_up_lie_prone_tool(),
             self._semantic_action_tool(),
             self._action_recording_tool(),
-            self._debug_workmode_tool(),
         ]
 
     def _loco_tool(self) -> dict:
@@ -364,10 +363,6 @@ class LocoPlugin:
                         "enum": list(_POSTURE_ACTIONS),
                         "description": "stand_up=自主起身：仅限机器人面朝上平躺、四肢自然放置、双腿伸直、脚底无异物，并在平坦防滑地面留出至少 3m×3m 无人无障碍空间；lie_prone=趴下收纳：仅限机器人已稳定站立，并在平坦防滑地面留出至少 3m×3m 无人无障碍空间。",
                     },
-                    "standing_pose_confirmed": {
-                        "type": "boolean",
-                        "description": "仅 lie_prone 使用。执行前必须确认机器人正常稳定站立、地面平坦防滑且周围 3m×3m 无障碍；确认后填写 true。",
-                    },
                 },
                 "required": ["action"],
                 "x-action-params": {
@@ -376,8 +371,8 @@ class LocoPlugin:
                         "description": "仅从 disabled/enabled 状态自主起身。调用前必须由用户确认机器人仰面平躺且周围 3m×3m 安全；站立、准备、行走或动作状态下会拒绝执行。",
                     },
                     "lie_prone": {
-                        "params": ["standing_pose_confirmed"],
-                        "description": "仅从 walking 且 standing_pose_confirmed=true 时趴下收纳；其他工作模式不会发送动作命令。",
+                        "params": [],
+                        "description": "仅从 walking 状态趴下收纳。调用前必须由用户确认机器人稳定站立且周围 3m×3m 安全；其他工作模式不会发送动作命令。",
                     },
                 },
             },
@@ -441,30 +436,6 @@ class LocoPlugin:
             "topic_out": [],
         }
 
-    def _debug_workmode_tool(self) -> dict:
-        return {
-            "name": "debug_workmode", "type": "actuator", "multiInstance": False,
-            "description": "仅供开发者实机调试 Bumi 基础工作模式。直接发送 enable、disable、ready 或 walk，不自动补齐前置步骤。执行前必须由调试人员确认机器人姿态、地面、支撑和周围空间安全。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["enable", "disable", "ready", "walk"],
-                        "description": "enable=失能状态下使能；disable=进入失能；ready=切换准备模式；walk=切换行走模式。卡片不会自动执行缺失的前置模式。",
-                    },
-                },
-                "required": ["action"],
-                "x-action-params": {
-                    "enable": {"params": [], "description": "仅在 workmode=30（失能）时发送 START；已使能时不会重复发送。"},
-                    "disable": {"params": [], "description": "从非失能状态发送 START 进入失能；已失能时不会重复发送。"},
-                    "ready": {"params": [], "description": "直接发送 SWITCH 并等待 workmode=1；不会自动使能。"},
-                    "walk": {"params": [], "description": "直接发送 WALK 并等待 workmode=2；不会自动进入 enable 或 ready。"},
-                },
-            },
-            "topic_out": [],
-        }
-
     def start(self) -> None:
         pass
 
@@ -490,8 +461,6 @@ class LocoPlugin:
             return self._do_preset_action(action)
         if tool_name == "action_recording" and action in _TEACHING_ACTIONS:
             return self._do_teaching_action(action, args)
-        if tool_name == "debug_workmode" and action in {"enable", "disable", "ready", "walk"}:
-            return self._do_debug_workmode(action)
         return None
 
     def _publish_cmd(self, x: float, y: float, z: float, action_cmd, index: int = 0):
@@ -568,15 +537,6 @@ class LocoPlugin:
 
     def _do_posture_action(self, action: str, args: dict) -> dict:
         safety = self._safety_requirements(action)
-        if action == "lie_prone" and args.get("standing_pose_confirmed") is not True:
-            return {
-                "state": "error", "command_sent": False,
-                "requested_action": action,
-                "error": "standing_pose_confirmed=true is required after completing the physical pose and clearance check.",
-                "safety_requirements": safety,
-                "pose_verification": "The SDK cannot verify the physical pose. The confirmation must be provided by the operator.",
-            }
-
         current_mode = int(self._high_ctrl.get_mode())
         if current_mode == 26:
             return self._protection_error(action, [], current_mode, safety)
@@ -757,66 +717,6 @@ class LocoPlugin:
                 "The WALK exit command was sent, but walking mode was not observed within 3 seconds."
             ),
         }
-
-    def _do_debug_workmode(self, action: str) -> dict:
-        current_mode = int(self._high_ctrl.get_mode())
-        if action == "enable":
-            if current_mode == 0:
-                return self._debug_mode_result(action, current_mode, True, False)
-            if current_mode != 30:
-                return {
-                    "state": "error", "command_sent": False,
-                    "requested_action": action,
-                    "current_workmode": current_mode,
-                    "current_workmode_name": _WORKMODE_NAMES.get(current_mode, "unknown"),
-                    "error": "enable is allowed only from workmode 30 (disabled). START was not sent because its toggle behavior could disable the robot unexpectedly.",
-                }
-            command_name, expected_modes = "START", {0}
-        elif action == "disable":
-            if current_mode == 30:
-                return self._debug_mode_result(action, current_mode, True, False)
-            command_name, expected_modes = "START", {30}
-        elif action == "ready":
-            if current_mode == 1:
-                return self._debug_mode_result(action, current_mode, True, False)
-            command_name, expected_modes = "SWITCH", {1}
-        else:
-            if current_mode == 2:
-                return self._debug_mode_result(action, current_mode, True, False)
-            command_name, expected_modes = "WALK", {2}
-
-        self._move_stop_event.set()
-        if self._move_thread and self._move_thread.is_alive():
-            self._move_thread.join(timeout=1)
-        observed = self._send_edge_and_wait(
-            _get_control_cmd(command_name), expected_modes | {26}, timeout_s=3.0)
-        if observed == 26:
-            return self._protection_error(action, [], observed, command_sent=True)
-        return self._debug_mode_result(
-            action, observed, observed in expected_modes, True,
-            command_name=command_name, expected_modes=expected_modes)
-
-    @staticmethod
-    def _debug_mode_result(action: str, observed: int, confirmed: bool,
-                           command_sent: bool, command_name: str | None = None,
-                           expected_modes: set[int] | None = None) -> dict:
-        result = {
-            "state": "completed" if confirmed else "accepted",
-            "requested_action": action,
-            "command_sent": command_sent,
-            "confirmed": confirmed,
-            "workmode": observed,
-            "workmode_name": _WORKMODE_NAMES.get(observed, "unknown"),
-            "message": (
-                "The target workmode was confirmed." if confirmed and command_sent else
-                "The robot is already in the target workmode; no command was sent." if confirmed else
-                "The command was sent, but the target workmode was not observed within 3 seconds."
-            ),
-        }
-        if command_name:
-            result["command"] = command_name
-            result["expected_workmodes"] = sorted(expected_modes or set())
-        return result
 
     def _prepare_workmode(self, target_mode: int, requested_action: str) -> dict:
         """Automatically reach ready(1) or walking(2) through documented steps."""
