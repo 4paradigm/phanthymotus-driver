@@ -30,6 +30,7 @@ RUN test -s /usr/share/keyrings/ros2-archive-keyring.gpg || \
         ros-humble-nav-msgs \
         ros-humble-sensor-msgs \
         pulseaudio-utils \
+        alsa-utils \
         build-essential \
         cmake && \
     rm -rf /var/lib/apt/lists/*

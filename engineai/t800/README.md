@@ -43,6 +43,7 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 | `led` | actuator | 众擎协议定义的 11 种灯效 |
 | `tts` | actuator | 众擎 TTS 消息；topic 可配置 |
 | `mic` | sensor | 内置麦克风 PCM-16 16kHz 采集，缓冲 1024 字节发布（满足 perception ASR 协议） |
+| `speaker` | actuator | 订阅画布连接的 `audio/pcm-16k` 流，经官方 ALSA `aplay` 接口播放到机器人喇叭；音量经官方 `pactl` 接口控制 |
 | `pointcloud` | sensor | Odin2 原始/SLAM 点云转发（`sensor/pointcloud` 二进制渲染流） |
 | `camera` | sensor | Odin2 双目 JPEG 图像转发（左/右目 `image/jpeg` 流） |
 | `depth` | sensor | Odin2 官方标定深度图转 640×480 毫米 16UC1（`image/depth-z16`） |
@@ -84,6 +85,14 @@ Sobel 边缘抑制和最近邻上采样均由众擎节点完成。使用 `depth`
 之间切换。Odin2 topic 带逐设备前缀 `/{topic_prefix}/{model}/device{N}/`，
 默认按 `config.yaml:topics.vision_*` 的 `/manifold/ODIN2/device0` 订阅，
 上机前请用 `ros_graph` 工具核对实际前缀。
+
+`speaker` 按众擎飞书《ROS2 接口开发文档》第8章实现：播放走官方 ALSA
+接口 `aplay`（`-t raw -f S16_LE -r 16000 -c 1`，从 stdin 流式播放），
+系统音量走官方 `pactl` 接口（`get-sink-volume`/`set-sink-volume
+@DEFAULT_SINK@`，0-100）。画布把音频文件解码与用户 mic 采集统一转为
+`audio/pcm-16k` 块流发布到 `topic_in`（与 G1 speaker 契约一致，含
+utterance 结束的 8 字节 EOF magic），driver 只负责流式播放。镜像已含
+`alsa-utils`；容器经 `-v /dev:/dev` 挂载声卡节点。
 
 ## 运行
 
