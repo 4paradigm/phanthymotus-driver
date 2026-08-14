@@ -390,6 +390,11 @@ class TianyiDeviceBundle:
             self._plugins.append(NavPlugin(plugins_cfg["nav"], namespace, ros2, slamtec_client))
             print("[bundle] NavPlugin loaded")
 
+        if plugins_cfg.get("home", {}).get("enabled", False):
+            from device import HomePlugin
+            self._plugins.append(HomePlugin(plugins_cfg["home"], namespace, ros2, slamtec_client))
+            print("[bundle] HomePlugin loaded")
+
         if plugins_cfg.get("chat", {}).get("enabled", False):
             from device import ChatPlugin
             self._plugins.append(ChatPlugin(plugins_cfg["chat"], namespace, ros2))
