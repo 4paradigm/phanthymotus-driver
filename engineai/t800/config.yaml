@@ -41,7 +41,6 @@ topics:
   tts: "/hardware/tts"
   native_node_control: "/motion/node_control"
   heartbeat: "/heartbeat"
-  link_info: "/motion/link_info"
   odometry: "/manifold/ODIN2/device0/odometry"
   # T800-Odin2 激光雷达相机（飞书文档 7.2 节）；实机按 ros_graph 发现的
   # /{topic_prefix}/{model}/device{N}/ 前缀校准
@@ -64,8 +63,6 @@ plugins:
   motion_events:
     enabled: true
   heartbeat_status:
-    enabled: true
-  link_info:
     enabled: true
   motion_command_trace:
     enabled: true

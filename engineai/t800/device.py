@@ -362,7 +362,7 @@ class StatePlugin:
                     "motor_power", "led", "tts", "ros_graph_discovery",
                 ],
                 "feedback": list(self._STREAMS) + [
-                    "joint_plan_state", "heartbeat_status", "link_info",
+                    "joint_plan_state", "heartbeat_status",
                     "motion_command_trace", "native_interface_probe",
                     "motion_events", "mainboard",
                 ],
@@ -819,130 +819,6 @@ class HeartbeatStatusPlugin:
                 "startup_timestamp": None, "error_code": None, "error_message": None,
                 "age_sec": None, "stale": True, "timestamp_ms": _now_ms(),
             }
-        latest.update({"state": "stale" if stale else "running", "age_sec": age_sec,
-                       "stale": stale, "timestamp_ms": _now_ms()})
-        return latest
-
-    def _publish(self) -> None:
-        self._publisher.publish(_json_message(self._snapshot()))
-
-class LinkInfoPlugin:
-    def __init__(self, config: dict, namespace: str, ros2):
-        self._config = config
-        self._ns = namespace
-        self._timeout = float(config["ros"].get("source_timeout_sec", 1.0))
-        self._node = Node("t800_link_info", context=ros2.ctx_robot)
-        self._pub_node = Node("t800_link_info_pub", context=ros2.ctx_core)
-        ros2.executor_robot.add_node(self._node)
-        ros2.executor_core.add_node(self._pub_node)
-        self._publisher = self._pub_node.create_publisher(
-            String, f"/{namespace}/state/link_info", _RELIABLE
-        )
-        self._lock = threading.RLock()
-        self._latest: dict | None = None
-        self._updated: float | None = None
-
-    def get_tool(self) -> dict:
-        return {
-            "name": "link_info",
-            "type": "sensor",
-            "multiInstance": False,
-            "readOnly": True,
-            "description": "显示 T800 LinkInfo 位姿、高度、速度和数据新鲜度",
-            "inputSchema": action_schema(
-                _with_lifecycle({
-                    "status": ([], "返回适合画布验收的简洁 link 状态"),
-                    "debug": ([], "返回原始 pose/twist 字段，供研发排查"),
-                }),
-                {},
-                "LinkInfo 查询动作",
-            ),
-            "topic_out": [{"topic": f"/{self._ns}/state/link_info", "format": "data/json"}],
-        }
-
-    def start(self) -> None:
-        from interface_protocol.msg import LinkInfo
-
-        self._node.create_subscription(
-            LinkInfo, self._config["topics"]["link_info"], self._on_link_info, _BEST_EFFORT
-        )
-        self._pub_node.create_timer(0.2, self._publish)
-
-    def stop(self) -> None:
-        pass
-
-    def dispatch(self, action: str, args: dict) -> dict:
-        if action == "info":
-            return _with_topic_out(self._snapshot(), f"/{self._ns}/state/link_info")
-        if action in ("link_info", "status", "start"):
-            return self._snapshot()
-        if action == "debug":
-            return self._debug_snapshot()
-        if action == "stop":
-            return {"state": "idle"}
-        return {"error": f"unknown link info action: {action}"}
-
-    def _on_link_info(self, msg) -> None:
-        header = getattr(msg, "header", None)
-        pose = msg.pose
-        twist = msg.twist
-        payload = {
-            "position": {"x": float(pose.position.x), "y": float(pose.position.y), "z": float(pose.position.z)},
-            "orientation": {
-                "x": float(pose.orientation.x), "y": float(pose.orientation.y),
-                "z": float(pose.orientation.z), "w": float(pose.orientation.w),
-            },
-            "linear_velocity": {
-                "x": float(twist.linear.x), "y": float(twist.linear.y), "z": float(twist.linear.z),
-            },
-            "angular_velocity": {
-                "x": float(twist.angular.x), "y": float(twist.angular.y), "z": float(twist.angular.z),
-            },
-            "frame_id": str(getattr(header, "frame_id", "")),
-        }
-        with self._lock:
-            self._latest = payload
-            self._updated = time.monotonic()
-
-    def _snapshot(self) -> dict:
-        with self._lock:
-            latest = dict(self._latest or {})
-            updated = self._updated
-        age_sec = None if updated is None else max(0.0, time.monotonic() - updated)
-        stale = updated is None or age_sec > self._timeout
-        if updated is None:
-            return {
-                "state": "no_data",
-                "link": None,
-                "position_text": None,
-                "height_m": None,
-                "speed": None,
-                "age_sec": None,
-                "timestamp_ms": _now_ms(),
-            }
-        position = latest.get("position", {})
-        linear = latest.get("linear_velocity", {})
-        px, py, pz = float(position.get("x", 0.0)), float(position.get("y", 0.0)), float(position.get("z", 0.0))
-        vx, vy, vz = float(linear.get("x", 0.0)), float(linear.get("y", 0.0)), float(linear.get("z", 0.0))
-        speed = math.sqrt(vx * vx + vy * vy + vz * vz)
-        return {
-            "state": "stale" if stale else "running",
-            "link": latest.get("frame_id") or "unknown",
-            "position_text": f"x={px:.2f}, y={py:.2f}, z={pz:.2f} m",
-            "height_m": round(pz, 2),
-            "speed": f"{speed:.2f} m/s",
-            "age_sec": round(age_sec, 1),
-            "timestamp_ms": _now_ms(),
-        }
-
-    def _debug_snapshot(self) -> dict:
-        with self._lock:
-            latest = dict(self._latest or {})
-            updated = self._updated
-        age_sec = None if updated is None else max(0.0, time.monotonic() - updated)
-        stale = updated is None or age_sec > self._timeout
-        if updated is None:
-            return {"state": "no_data", "age_sec": None, "stale": True, "timestamp_ms": _now_ms()}
         latest.update({"state": "stale" if stale else "running", "age_sec": age_sec,
                        "stale": stale, "timestamp_ms": _now_ms()})
         return latest

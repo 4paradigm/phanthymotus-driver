@@ -102,7 +102,6 @@ class T800DeviceBundle:
             JointPlanPlugin,
             HeartbeatStatusPlugin,
             LedPlugin,
-            LinkInfoPlugin,
             LocomotionPlugin,
             MotionCommandTracePlugin,
             MotionEventsPlugin,
@@ -138,7 +137,6 @@ class T800DeviceBundle:
 
         plugin_types = (
             ("heartbeat_status", HeartbeatStatusPlugin, (config, namespace, ros2)),
-            ("link_info", LinkInfoPlugin, (config, namespace, ros2)),
             ("motion_command_trace", MotionCommandTracePlugin, (config, namespace, ros2)),
             ("native_interface_probe", NativeInterfaceProbePlugin, (config, namespace, ros2)),
             ("locomotion", LocomotionPlugin, (config, namespace, ros2, state)),
