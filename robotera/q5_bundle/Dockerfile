@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-humble-geometry-msgs \
     ros-humble-lifecycle-msgs \
     ros-humble-sensor-msgs \
+    ros-humble-std-srvs \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /work
@@ -31,6 +32,7 @@ COPY sensor_contract.py /work/sensor_contract.py
 COPY control_contract.py /work/control_contract.py
 COPY q5_sdk_client.py /work/q5_sdk_client.py
 COPY body_command.py /work/body_command.py
+COPY hand_command.py /work/hand_command.py
 COPY arm_control.py /work/arm_control.py
 COPY joint_limits.py /work/joint_limits.py
 COPY mic.py speaker.py audio.py camera_rgb.py camera_depth.py q5_control_mode.py /work/
