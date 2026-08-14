@@ -201,6 +201,7 @@ class MicPlugin:
         self._thread = None
         self._running = False
         self._frames_sent = 0
+        self._lock = threading.RLock()
         if self._rate != 16000 or self._channels != 1:
             raise ValueError("Q5 mic only supports the shared 16 kHz mono PCM contract")
 
@@ -213,23 +214,26 @@ class MicPlugin:
         }
 
     def start(self):
-        if self._running:
-            return
-        try:
-            device = self._device if self._device is not None else _find_remote_mic_device()
-            command = _q5_alsa_mic_command(device, self._rate, self._channels)
-            self._process = subprocess.Popen(
-                _q5_ssh_args("python3 -u -c " + shlex.quote(command)), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                bufsize=0)
-            _raise_if_remote_process_exited(self._process, "microphone")
-            self._running = True
-            self._frames_sent = 0
-            self._thread = threading.Thread(target=self._pump, daemon=True, name="q5_mic_stream")
-            self._thread.start()
-            print(f"[MicPlugin] capture started from device {device} -> {self._topic}", flush=True)
-        except Exception as exc:
-            self.stop()
-            print(f"[MicPlugin] capture unavailable: {exc}", flush=True)
+        # The bundle start and a canvas sensor-start request may arrive nearly
+        # simultaneously. ALSA allows only one capture owner for hw:1,0.
+        with self._lock:
+            if self._running:
+                return
+            try:
+                device = self._device if self._device is not None else _find_remote_mic_device()
+                command = _q5_alsa_mic_command(device, self._rate, self._channels)
+                self._process = subprocess.Popen(
+                    _q5_ssh_args("python3 -u -c " + shlex.quote(command)), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    bufsize=0)
+                _raise_if_remote_process_exited(self._process, "microphone")
+                self._running = True
+                self._frames_sent = 0
+                self._thread = threading.Thread(target=self._pump, daemon=True, name="q5_mic_stream")
+                self._thread.start()
+                print(f"[MicPlugin] capture started from device {device} -> {self._topic}", flush=True)
+            except Exception as exc:
+                self.stop()
+                print(f"[MicPlugin] capture unavailable: {exc}", flush=True)
 
     def _pump(self):
         # 100 ms frames are the same size emitted by perception TTS.
@@ -249,14 +253,15 @@ class MicPlugin:
             print("[MicPlugin] remote capture stream ended", flush=True)
 
     def stop(self):
-        self._running = False
-        if self._process is not None:
-            self._process.terminate()
-            try:
-                self._process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self._process.kill()
-            self._process = None
+        with self._lock:
+            self._running = False
+            if self._process is not None:
+                self._process.terminate()
+                try:
+                    self._process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    self._process.kill()
+                self._process = None
 
     def dispatch(self, action, args):
         del args
