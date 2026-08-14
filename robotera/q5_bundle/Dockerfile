@@ -33,7 +33,6 @@ COPY robot_ready.py /work/robot_ready.py
 COPY battery.py /work/battery.py
 COPY system_health.py /work/system_health.py
 COPY hand_state.py /work/hand_state.py
-COPY nav_state.py /work/nav_state.py
 COPY estop.py /work/estop.py
 COPY diagnostics.py /work/diagnostics.py
 COPY simple_action.py /work/simple_action.py

@@ -26,8 +26,6 @@ plugins:
     enabled: true
   hand_state:
     enabled: true
-  nav_state:
-    enabled: true
   estop:
     enabled: true
   diagnostics:
