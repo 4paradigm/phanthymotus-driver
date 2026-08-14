@@ -1,0 +1,1 @@
+float32 mimic_progress #0~1  #mimic进展

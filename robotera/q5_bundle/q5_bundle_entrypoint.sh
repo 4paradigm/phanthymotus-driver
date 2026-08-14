@@ -7,6 +7,9 @@
 set -Ee -o pipefail
 
 source /opt/ros/humble/setup.bash
+if [[ -f /q5_ws/install/setup.bash ]]; then
+  source /q5_ws/install/setup.bash
+fi
 if [[ -f /opt/teleop_client/install/setup.bash ]]; then
   source /opt/teleop_client/install/setup.bash
 fi

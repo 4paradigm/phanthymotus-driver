@@ -1,0 +1,4 @@
+string motion_name
+MotionPriority motion_priority
+---
+MotionResult result

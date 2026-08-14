@@ -1,0 +1,5 @@
+string[] joint_name
+float32[] param_value
+---
+bool success
+string message
