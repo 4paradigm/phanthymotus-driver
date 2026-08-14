@@ -8,18 +8,31 @@ ENV RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 ENV PYTHONUNBUFFERED=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3-pip \
+    python3-numpy \
+    python3-pil \
+    python3-dev \
+    python3-colcon-common-extensions \
+    cmake \
+    build-essential \
+    openssh-client \
+    sshpass \
+    python3-yaml \
     ros-humble-rmw-cyclonedds-cpp \
     ros-humble-rmw-fastrtps-cpp \
     ros-humble-geometry-msgs \
     ros-humble-lifecycle-msgs \
     ros-humble-sensor-msgs \
+    ros-humble-std-srvs \
+    ros-humble-diagnostic-msgs \
+    ros-humble-action-msgs \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /work
-COPY requirements.txt /work/requirements.txt
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r requirements.txt
-
+RUN mkdir -p /q5_ws/src
+COPY vendor/xbot_common_interfaces /q5_ws/src/xbot_common_interfaces
+COPY vendor/audio_msgs /q5_ws/src/audio_msgs
+RUN cd /q5_ws && . /opt/ros/humble/setup.sh && \
+    colcon build --packages-select xbot_common_interfaces audio_msgs
 COPY main.py /work/main.py
 COPY q5_bus_bridge.py /work/q5_bus_bridge.py
 COPY q5_bundle_entrypoint.sh /work/q5_bundle_entrypoint.sh
@@ -37,16 +50,27 @@ COPY estop.py /work/estop.py
 COPY diagnostics.py /work/diagnostics.py
 COPY simple_action.py /work/simple_action.py
 COPY body_command.py /work/body_command.py
-COPY arm_control.py /work/arm_control.py
 COPY hand_command.py /work/hand_command.py
+COPY arm_control.py /work/arm_control.py
+COPY joint_limits.py /work/joint_limits.py
 COPY hand_control.py /work/hand_control.py
 COPY hand_gesture.py /work/hand_gesture.py
 COPY head_control.py /work/head_control.py
-COPY joint_limits.py /work/joint_limits.py
+COPY mic.py /work/mic.py
+COPY speaker.py /work/speaker.py
+COPY audio.py /work/audio.py
+COPY camera_rgb.py /work/camera_rgb.py
+COPY camera_depth.py /work/camera_depth.py
+COPY q5_control_mode.py /work/q5_control_mode.py
+COPY legacy_device.py /work/legacy_device.py
+COPY legacy_direct_control.py /work/legacy_direct_control.py
+COPY q5_media_bridge.py /work/q5_media_bridge.py
 COPY config.yaml /work/config.yaml
 COPY resource/q5_model.urdf /work/resource/q5_model.urdf
 COPY resource/fastdds_udp_only.xml /work/resource/fastdds_udp_only.xml
 COPY deploy/ /deploy/
+
+ENV PYTHONPATH=/work
 
 RUN chmod +x /work/q5_bundle_entrypoint.sh
 

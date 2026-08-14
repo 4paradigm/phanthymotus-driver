@@ -1,0 +1,6 @@
+# 请求部分：空（无需输入参数）
+---
+# 响应部分：返回当前模式和状态，0行走 1跑步 2站立锁定
+int16 mode
+bool success
+string message

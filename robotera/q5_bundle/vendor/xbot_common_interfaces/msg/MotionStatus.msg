@@ -1,0 +1,6 @@
+int32 status 0
+int32 NOT_REQUEST = 0
+int32 RUNNING = 1
+int32 STOPPED = 2
+int32 ERROR = 3
+int32 REFUSED = 4

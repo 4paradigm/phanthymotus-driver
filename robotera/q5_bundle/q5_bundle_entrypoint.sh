@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# Run the Q5 vendor-facing driver and the Agent Core-facing bridge in one
-# container.  They must remain separate processes because rclpy selects its
-# ROS middleware and domain once per process.
+# Run the Q5 vendor-facing driver and Agent Core's JSON sensor bridge. The
+# driver starts a separate typed media/audio bridge; q5_bus_bridge forwards
+# only data/json topics, so it cannot claim camera/audio DDS topic types.
 # ROS setup scripts intentionally read optional variables that may be unset;
 # nounset would abort while sourcing /opt/ros/humble/setup.bash.
 set -Ee -o pipefail
 
 source /opt/ros/humble/setup.bash
+if [[ -f /q5_ws/install/setup.bash ]]; then
+  source /q5_ws/install/setup.bash
+fi
 if [[ -f /opt/teleop_client/install/setup.bash ]]; then
   source /opt/teleop_client/install/setup.bash
 fi
@@ -46,8 +49,7 @@ shutdown() {
 
 trap shutdown TERM INT EXIT
 
-# A failure in either half makes the container unhealthy and lets Docker's
-# restart policy recover both processes in the known-good order.
+# The media bridge is a child of main.py and is shut down with it.
 wait -n "$driver_pid" "$bridge_pid"
 exit_code=$?
 exit "$exit_code"

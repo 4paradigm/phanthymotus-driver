@@ -55,6 +55,7 @@ class Q5BusBridgeTests(unittest.TestCase):
         self.assertIn('RMW_IMPLEMENTATION="rmw_fastrtps_cpp"', source)
         self.assertIn('exec python3 /work/main.py', source)
         self.assertIn('exec python3 /work/q5_bus_bridge.py', source)
+        self.assertIn('media/audio bridge', source)
         self.assertIn('wait -n "$driver_pid" "$bridge_pid"', source)
 
     def test_fastdds_bridge_uses_its_udp_profile_when_not_overridden(self):
@@ -77,6 +78,13 @@ class Q5BusBridgeTests(unittest.TestCase):
         self.assertEqual(selected, {
             "battery": ["/q5/battery", "/q5/battery_alias"],
         })
+
+    def test_media_topics_are_reserved_for_the_typed_bridge(self):
+        self.assertEqual(q5_bus_bridge.select_sensor_tools([{
+            "name": "mic", "type": "sensor", "topic_out": [
+                {"topic": "/q5/mic/audio", "format": "audio/pcm-16k"},
+            ],
+        }]), {})
 
     def test_mcp_envelope_parser_returns_data_not_protocol_envelope(self):
         response = {

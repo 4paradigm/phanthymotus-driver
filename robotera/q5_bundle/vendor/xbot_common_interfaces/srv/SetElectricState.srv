@@ -1,0 +1,5 @@
+uint8 electric_type
+uint8 state
+---
+bool success
+string message
