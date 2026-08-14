@@ -678,19 +678,30 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual([1.0] * 25, safety._joint_pub.messages[-1].damping)
         self.assertTrue(all(control.stopped for control in active_controls))
 
-    def test_vision_pointcloud_passthrough_binary_header(self):
+    def test_vision_pointcloud_defaults_to_slam_standard_frame(self):
         import struct
 
+        # 无 plugins.vision 配置时默认源为 slam（odom 标准坐标系，z 轴朝上），
+        # raw 传感器坐标系数据默认被忽略——直接渲染会上下颠倒。
         plugin = self.device.VisionPlugin(CONFIG, "robot", self.ros)
+        self.assertEqual("slam", plugin._source)
         plugin.start()
         data = bytes(range(64))  # 4 点 × 16 字节 point_step
-        plugin._on_cloud_raw(types.SimpleNamespace(point_step=16, data=data))
+        plugin._on_cloud_raw(types.SimpleNamespace(point_step=16, data=data))  # raw 默认忽略
+        self.assertEqual(0, len(plugin._cloud_pub.messages))
+        plugin._on_cloud_slam(types.SimpleNamespace(point_step=16, data=data))
         out = plugin._cloud_pub.messages[-1]
         self.assertEqual(struct.pack("<II", 16, 4), bytes(out.data[:8]))
         self.assertEqual(bytes(range(64)), bytes(out.data[8:]))
         self.assertEqual(1, plugin._frames["pointcloud"])
+        tools = {tool["name"]: tool for tool in plugin.get_tools()}
+        self.assertIn("slam", tools["pointcloud"]["description"])
 
-    def test_vision_select_source_switches_cloud(self):
+    def test_vision_config_source_override_and_select_source(self):
+        config = dict(CONFIG, plugins={"vision": {"enabled": True, "source": "raw"}})
+        plugin = self.device.VisionPlugin(config, "robot", self.ros)
+        self.assertEqual("raw", plugin._source)  # 显式配置 raw 仍受尊重
+
         plugin = self.device.VisionPlugin(CONFIG, "robot", self.ros)
         plugin.start()
         plugin.dispatch("select_source", {"source": "slam"})
@@ -700,8 +711,12 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual(0, len(plugin._cloud_pub.messages))
         plugin._on_cloud_slam(types.SimpleNamespace(point_step=16, data=data))
         self.assertEqual(1, len(plugin._cloud_pub.messages))
+        # 切回 raw（调试源）后 raw 帧被转发
+        plugin.dispatch("select_source", {"source": "raw"})
+        plugin._on_cloud_raw(types.SimpleNamespace(point_step=16, data=data))
+        self.assertEqual(2, len(plugin._cloud_pub.messages))
         info = plugin.dispatch("info", {})
-        self.assertEqual("slam", info["source"])
+        self.assertEqual("raw", info["source"])
         self.assertEqual(4, len(info["topic_out"]))
         self.assertEqual("sensor/pointcloud", info["topic_out"][0]["format"])
 

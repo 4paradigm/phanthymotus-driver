@@ -3156,6 +3156,11 @@ class VisionPlugin:
     (``sensor/pointcloud``, ``image/jpeg``, ``image/depth-z16``).  Topic names
     follow the per-device prefix ``/{topic_prefix}/{model}/device{N}/`` and
     must be calibrated against ``ros_graph`` on the real robot.
+
+    点云默认转发 SLAM 云（``cloud/slam``）：它位于 odom 标准坐标系
+    （z 轴朝上、重力对齐），满足渲染端 ``sensor/pointcloud`` 的坐标系契约。
+    ``raw`` 是 Odin2 传感器坐标系（z 轴朝下前方、随头部俯仰倾斜），直接
+    渲染会上下颠倒，仅作为调试源经 ``select_source`` 显式切换。
     """
 
     _SOURCES = ("raw", "slam")
@@ -3168,9 +3173,9 @@ class VisionPlugin:
         self._ns = namespace
         self._topics = config["topics"]
         vision_config = config.get("plugins", {}).get("vision", {}) or {}
-        self._source = vision_config.get("source", "raw")
+        self._source = vision_config.get("source", "slam")
         if self._source not in self._SOURCES:
-            self._source = "raw"
+            self._source = "slam"
         self._cloud_topic = f"/{namespace}/vision/cloud"
         self._cam_left_topic = f"/{namespace}/vision/camera_left"
         self._cam_right_topic = f"/{namespace}/vision/camera_right"
@@ -3191,7 +3196,8 @@ class VisionPlugin:
     def _cloud_tool(self) -> dict:
         tool = sensor_tool(
             "pointcloud",
-            f"T800-Odin2 {self._source} 点云转发（256×192）；二进制 [uint32 point_step][uint32 total_points]"
+            f"T800-Odin2 {self._source} 点云转发（slam=odom 标准坐标系 z 轴朝上，"
+            f"raw=传感器坐标系仅调试用）；二进制 [uint32 point_step][uint32 total_points]"
             f"[PointCloud2 bytes]，发布到 {self._cloud_topic}",
             self._cloud_topic,
             "sensor/pointcloud",
@@ -3199,7 +3205,7 @@ class VisionPlugin:
         schema = action_schema(
             _with_lifecycle({
                 "status": ([], "返回点云流状态"),
-                "select_source": (["source"], "切换 Odin2 raw 或 SLAM 点云源"),
+                "select_source": (["source"], "切换 Odin2 SLAM（标准坐标系）或 raw（传感器坐标系）点云源"),
             }),
             {"source": {"type": "string", "enum": list(self._SOURCES)}},
             "点云生命周期和数据源选择",
@@ -3283,6 +3289,9 @@ class VisionPlugin:
         self._on_cloud(msg, "slam")
 
     def _on_cloud(self, msg, source: str) -> None:
+        # 字节级透传：坐标系由源决定。默认源 slam 已处于 odom 标准坐标系
+        # （z 轴朝上），满足渲染端契约；raw 为传感器坐标系（z 轴随头部俯仰
+        # 倾斜），直接渲染会上下颠倒，仅作调试源使用。
         if not self._running or "pointcloud" not in self._enabled_tools or source != self._source:
             return
         data = bytes(msg.data)
