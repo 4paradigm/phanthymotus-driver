@@ -852,6 +852,17 @@ class MotionCommandTracePlugin:
         self._gamepad_updated: float | None = None
         self._odometry_updated: float | None = None
 
+    def _max_reasonable_speed(self) -> float:
+        control = self._config.get("control", {})
+        max_vx = abs(float(control.get("max_vx", 3.0)))
+        max_vy = abs(float(control.get("max_vy", 1.0)))
+        # Leave a small margin for measured odometry noise while still rejecting
+        # ODIN2-internal values that are not robot m/s velocity on T800.
+        return max(1.0, math.hypot(max_vx, max_vy) * 1.5)
+
+    def _is_valid_speed(self, speed: float) -> bool:
+        return math.isfinite(speed) and 0.0 <= speed <= self._max_reasonable_speed()
+
     def get_tool(self) -> dict:
         return {
             "name": "motion_command_trace",
@@ -925,12 +936,18 @@ class MotionCommandTracePlugin:
 
     def _on_gamepad(self, msg) -> None:
         analog = [float(value) for value in msg.analog_states]
+        max_vx = abs(float(self._config.get("control", {}).get("max_vx", 3.0)))
+        max_vy = abs(float(self._config.get("control", {}).get("max_vy", 1.0)))
+        stick_x = analog[2] if len(analog) > 2 else 0.0
+        stick_y = analog[3] if len(analog) > 3 else 0.0
+        estimated_speed = math.hypot(stick_y * max_vx, stick_x * max_vy)
         entry = {
             "hardware_connected": bool(msg.hardware_connected),
             "digital_pressed": [index for index, value in enumerate(msg.digital_states) if int(value) != 0],
             "analog_states": analog,
-            "left_stick": {"x": analog[2] if len(analog) > 2 else None, "y": analog[3] if len(analog) > 3 else None},
+            "left_stick": {"x": stick_x if len(analog) > 2 else None, "y": stick_y if len(analog) > 3 else None},
             "right_stick": {"x": analog[4] if len(analog) > 4 else None, "y": analog[5] if len(analog) > 5 else None},
+            "estimated_speed_m_s": estimated_speed,
             "timestamp_ms": _now_ms(),
         }
         with self._lock:
@@ -942,11 +959,13 @@ class MotionCommandTracePlugin:
         linear = msg.twist.twist.linear
         angular = msg.twist.twist.angular
         vx, vy, vz = float(linear.x), float(linear.y), float(linear.z)
+        speed = math.sqrt(vx * vx + vy * vy + vz * vz)
         entry = {
             "frame_id": str(getattr(msg.header, "frame_id", "")),
             "child_frame_id": str(getattr(msg, "child_frame_id", "")),
             "linear_velocity": {"x": vx, "y": vy, "z": vz},
-            "speed_m_s": math.sqrt(vx * vx + vy * vy + vz * vz),
+            "speed_m_s": speed,
+            "valid": self._is_valid_speed(speed),
             "angular_velocity": {"x": float(angular.x), "y": float(angular.y), "z": float(angular.z)},
             "yaw_rate_rad_s": float(angular.z),
             "timestamp_ms": _now_ms(),
@@ -968,14 +987,16 @@ class MotionCommandTracePlugin:
         timeout_sec = float(self._config["ros"].get("source_timeout_sec", 1.0))
         odometry_age = None if odometry_updated is None else max(0.0, now - odometry_updated)
         velocity_age = None if velocity_updated is None else max(0.0, now - velocity_updated)
+        gamepad_age = None if gamepad_updated is None else max(0.0, now - gamepad_updated)
 
         source = "none"
         speed = 0.0
         age_sec = None
-        odometry_fresh = odometry is not None and odometry_age is not None and odometry_age <= timeout_sec
+        odometry_valid = bool(odometry and odometry.get("valid", False))
+        odometry_fresh = odometry_valid and odometry_age is not None and odometry_age <= timeout_sec
         velocity_fresh = velocity is not None and velocity_age is not None and velocity_age <= timeout_sec
         use_odometry = odometry_fresh or (
-            odometry is not None
+            odometry_valid
             and not velocity_fresh
             and (velocity_age is None or (odometry_age is not None and odometry_age <= velocity_age))
         )
@@ -988,6 +1009,10 @@ class MotionCommandTracePlugin:
             values = [float(value) for value in velocity.get("linear_velocity", [])]
             speed = math.sqrt(sum(value * value for value in values))
             age_sec = velocity_age
+        elif gamepad is not None:
+            source = "gamepad"
+            speed = float(gamepad.get("estimated_speed_m_s", 0.0))
+            age_sec = gamepad_age
 
         stale = age_sec is None or age_sec > timeout_sec
         speed_rounded = round(speed, 2)
@@ -1082,6 +1107,12 @@ class MotionEventsPlugin:
         self._motion_start_threshold = 0.05
         self._motion_stop_threshold = 0.03
 
+    def _max_reasonable_speed(self) -> float:
+        control = self._config.get("control", {})
+        max_vx = abs(float(control.get("max_vx", 3.0)))
+        max_vy = abs(float(control.get("max_vy", 1.0)))
+        return max(1.0, math.hypot(max_vx, max_vy) * 1.5)
+
     def get_tool(self) -> dict:
         return {
             "name": "motion_events",
@@ -1148,6 +1179,8 @@ class MotionEventsPlugin:
         linear = msg.twist.twist.linear
         vx, vy, vz = float(linear.x), float(linear.y), float(linear.z)
         speed = math.sqrt(vx * vx + vy * vy + vz * vz)
+        if not math.isfinite(speed) or speed > self._max_reasonable_speed():
+            return
         with self._lock:
             moving = self._moving
             if not moving and speed >= self._motion_start_threshold:

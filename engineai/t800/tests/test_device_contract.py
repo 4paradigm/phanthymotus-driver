@@ -323,6 +323,36 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("body_velocity_command", snapshot["source"])
         self.assertEqual("0.80 m/s", snapshot["speed"])
 
+    def test_motion_trace_rejects_implausible_odin_odometry(self):
+        plugin = self.device.MotionCommandTracePlugin(CONFIG, "robot", self.ros)
+        plugin._on_odometry(types.SimpleNamespace(
+            header=types.SimpleNamespace(frame_id="device0/odom"),
+            child_frame_id="device0/base_link",
+            twist=types.SimpleNamespace(twist=types.SimpleNamespace(
+                linear=types.SimpleNamespace(x=-10057.9, y=-27579.0, z=-17383.9),
+                angular=types.SimpleNamespace(x=0.0, y=0.0, z=0.0),
+            )),
+        ))
+        plugin._on_gamepad(types.SimpleNamespace(
+            hardware_connected=True,
+            digital_states=[],
+            analog_states=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("gamepad", snapshot["source"])
+        self.assertEqual("0.00 m/s", snapshot["speed"])
+        self.assertEqual("stopped", snapshot["motion_state"])
+
+    def test_motion_events_ignore_implausible_odin_odometry(self):
+        plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
+        plugin._on_odometry(types.SimpleNamespace(
+            twist=types.SimpleNamespace(twist=types.SimpleNamespace(
+                linear=types.SimpleNamespace(x=-10057.9, y=-27579.0, z=-17383.9),
+            )),
+        ))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("no_data", snapshot["state"])
+
     def test_derived_diagnostics_and_capability_resources(self):
         self.state._set("imu", {
             "rpy_rad": [1.1, 0.0, 0.0],
