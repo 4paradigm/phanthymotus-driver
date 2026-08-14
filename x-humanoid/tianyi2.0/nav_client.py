@@ -277,11 +277,11 @@ class SlamtecClient:
             "options": {"angle": angle_rad},
         })
 
-    def go_home(self, *, dock: bool = True, back_to_landing: Optional[bool] = None,
+    def go_home(self, *, back_to_landing: Optional[bool] = None,
                 charging_retry_count: Optional[int] = None,
                 move_mode: Optional[int] = None) -> dict:
-        """回到充电桩。dock=False 时只回到上桩点，不执行上桩。"""
-        gohome_options: dict = {"flags": "dock" if dock else "no_dock"}
+        """回到充电桩并尝试上桩充电。"""
+        gohome_options: dict = {"flags": "dock"}
         if back_to_landing is not None:
             gohome_options["back_to_landing"] = bool(back_to_landing)
         if charging_retry_count is not None:
