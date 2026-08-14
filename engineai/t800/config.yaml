@@ -95,6 +95,18 @@ plugins:
     url: "udpm://239.255.76.67:7667?ttl=1"
     channel: "virtual_gamepad/gamepad_keys"
     rate_hz: 20.0
+  controlled_spatial:
+    enabled: true
+    map_save_dir: /opt/phanthy-motus/data/maps
+    db_path: /opt/phanthy-motus/data/mapping.db
+    voxel_size: 0.05
+    max_points: 5000000
+    odometry_topic: /manifold/ODIN2/device0/odometry
+    pointcloud_topic: /manifold/ODIN2/device0/cloud/slam
+  controlled_spatial_map:
+    enabled: true
+    db_path: /opt/phanthy-motus/data/mapping.db
+    cloud_dir: /opt/phanthy-motus/data/controlled_spatial_clouds
   safety:
     enabled: true
   native_sdk:
