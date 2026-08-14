@@ -60,9 +60,14 @@ class ControlledSpatialMapNode:
         ControlledSpatialMapNode.np = np
         os.makedirs(cloud_dir, exist_ok=True)
 
-        self._node = Node("t800_controlled_spatial_map", context=ros2.ctx_robot)
-        ros2.executor_robot.add_node(self._node)
-        self._pub = self._node.create_publisher(UInt8MultiArray, topic, 10)
+        # Subscriptions live on the robot domain (odometry + point cloud),
+        # while the map publisher must be on the core domain so the frontend
+        # / agent-core can receive it.
+        self._sub_node = Node("t800_controlled_spatial_map_sub", context=ros2.ctx_robot)
+        ros2.executor_robot.add_node(self._sub_node)
+        self._pub_node = Node("t800_controlled_spatial_map_pub", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._pub_node)
+        self._pub = self._pub_node.create_publisher(UInt8MultiArray, topic, 10)
         self._topic = topic
         self._db = db
         self._cloud_dir = cloud_dir
@@ -104,16 +109,16 @@ class ControlledSpatialMapNode:
         )
         self._worker.start()
 
-        # --- ROS2 subscriptions ---
-        self._odom_sub = self._node.create_subscription(
+        # --- ROS2 subscriptions (robot domain) ---
+        self._odom_sub = self._sub_node.create_subscription(
             Odometry, odometry_topic, self._on_odometry, _BEST_EFFORT
         )
-        self._cloud_sub = self._node.create_subscription(
+        self._cloud_sub = self._sub_node.create_subscription(
             PointCloud2, pointcloud_topic, self._on_pointcloud, _BEST_EFFORT
         )
 
-        # --- fallback heartbeat timer ---
-        self._publish_timer = self._node.create_timer(0.5, self._periodic_publish)
+        # --- fallback heartbeat timer (core domain) ---
+        self._publish_timer = self._pub_node.create_timer(0.5, self._periodic_publish)
 
         print(
             f"[ControlledSpatialMapNode] ready topic={topic} "
@@ -126,7 +131,7 @@ class ControlledSpatialMapNode:
     # ------------------------------------------------------------------
     @property
     def node(self):
-        return self._node
+        return self._pub_node
 
     def stop(self):
         if self._closing.is_set():
@@ -143,7 +148,11 @@ class ControlledSpatialMapNode:
             pass
         try:
             with self._publish_lock:
-                self._node.destroy_node()
+                self._pub_node.destroy_node()
+        except Exception:
+            pass
+        try:
+            self._sub_node.destroy_node()
         except Exception:
             pass
 
@@ -813,6 +822,8 @@ class ControlledSpatialMapPlugin:
         self._map_node = None
         self._startup_error = None
         self._last_selected_map = None
+        self._closing = threading.Event()
+        self._sync_timer = None
 
         try:
             self._db = _MappingDB(db_path)
@@ -835,6 +846,10 @@ class ControlledSpatialMapPlugin:
             except Exception:
                 pass
             return
+
+        # T800 has no DDS slam_info channel like g1; poll the shared DB once
+        # per second so actuator-driven map_status changes are picked up.
+        self._schedule_sync()
 
         print(f"[ControlledSpatialMap] plugin ready, topic: {self._map_topic}", flush=True)
 
@@ -881,8 +896,28 @@ class ControlledSpatialMapPlugin:
         self._map_node.publish_now(force=True)
 
     def stop(self):
+        self._closing.set()
+        if self._sync_timer is not None:
+            self._sync_timer.cancel()
+            self._sync_timer = None
         if self._map_node:
             self._map_node.stop()
+
+    def _schedule_sync(self):
+        if self._closing.is_set():
+            return
+        self._sync_timer = threading.Timer(1.0, self._periodic_sync)
+        self._sync_timer.daemon = True
+        self._sync_timer.start()
+
+    def _periodic_sync(self):
+        if self._closing.is_set():
+            return
+        try:
+            self._sync_from_db(force=False)
+        except Exception as e:
+            print(f"[ControlledSpatialMap] periodic sync error: {e}", flush=True)
+        self._schedule_sync()
 
     # ------------------------------------------------------------------
     # dispatch
