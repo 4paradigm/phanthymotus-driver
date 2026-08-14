@@ -69,6 +69,18 @@ class _LifecycleService:
 
 
 class Q5BasicSensorTests(unittest.TestCase):
+    def test_dockerfile_copies_every_runtime_python_module(self):
+        package_dir = Path(__file__).parent
+        dockerfile = (package_dir / "Dockerfile").read_text(encoding="utf-8")
+        copied_modules = set(
+            re.findall(r"^COPY ([A-Za-z0-9_]+\.py) /work/", dockerfile, flags=re.MULTILINE)
+        )
+        runtime_modules = {
+            path.name for path in package_dir.glob("*.py") if not path.name.startswith("test_")
+        }
+
+        self.assertSetEqual(copied_modules, runtime_modules)
+
     def test_joint_state_groups_confirmed_hand_names(self):
         data = joints_state.build(FRESH_JOINT_SNAPSHOT)
         self.assertTrue(data["fresh"])
