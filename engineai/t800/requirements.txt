@@ -1,2 +1,3 @@
-pyyaml
+PyYAML==6.0.3
 lcm==1.5.0
+numpy==2.0.2
