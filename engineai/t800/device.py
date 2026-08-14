@@ -3578,8 +3578,13 @@ class _MappingDB:
         return maps
 
 
-class MappingPlugin:
-    """Laser point cloud mapping via Odin2 odometry + undistorted point cloud."""
+class ControlledSpatialPlugin:
+    """人工遥控建图与语义标记（controlled_spatial），与 unitree/g1 接口对齐。
+
+    通过 Odin2 里程计位姿累积激光点云生成 .pcd 地图，支持开始/停止/取消建图、
+    状态查询、地图管理、语义标记（tag）管理和已保存地图加载。
+    暂不包含 navigation（navigate_to_tag / navigate_to_pose）。
+    """
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._config = plugin_config
@@ -3617,20 +3622,20 @@ class MappingPlugin:
         self._create_odom_subscription()
 
         print(
-            f"[mapping] ready (odom={self._odometry_topic}, cloud={self._pointcloud_topic}, "
+            f"[controlled_spatial] ready (odom={self._odometry_topic}, cloud={self._pointcloud_topic}, "
             f"open3d={_HAS_OPEN3D})",
             flush=True,
         )
 
     def get_tool(self) -> dict:
         return {
-            "name": "mapping",
+            "name": "controlled_spatial",
             "type": "actuator",
             "multiInstance": False,
             "description": (
-                "T800 激光点云建图卡片；人工遥控行走时按 Odin2 里程计位姿累积点云，"
-                "生成并保存 .pcd 地图。支持开始/停止/取消建图、状态查询、地图管理、"
-                "语义标记（tag）管理和已保存地图加载。"
+                "T800 人工控制建图与语义标记卡片（与 unitree/g1 controlled_spatial 对齐）。"
+                "人工遥控行走时按 Odin2 里程计位姿累积点云，生成并保存 .pcd 地图。"
+                "支持开始/停止/取消建图、状态查询、地图管理、语义标记（tag）管理和已保存地图加载。"
             ),
             "inputSchema": action_schema(
                 {
@@ -3660,7 +3665,7 @@ class MappingPlugin:
     def stop(self) -> None:
         if self._is_mapping:
             self._destroy_cloud_subscription()
-            print("[mapping] driver shutdown, mapping stopped without saving", flush=True)
+            print("[controlled_spatial] driver shutdown, mapping stopped without saving", flush=True)
         self._destroy_odom_subscription()
         try:
             self._ros2.executor_robot.remove_node(self._node)
@@ -3693,7 +3698,7 @@ class MappingPlugin:
             return self._list_tags()
         if action == "load_map":
             return self._load_map(args.get("map_name", ""))
-        return {"error": f"unknown mapping action: {action}"}
+        return {"error": f"unknown controlled_spatial action: {action}"}
 
     # ── Action handlers ──────────────────────────────────────────────
 
@@ -3707,7 +3712,7 @@ class MappingPlugin:
 
         existing = self._db.get_map(map_name)
         if existing:
-            print(f"[mapping] map '{map_name}' already exists, will overwrite on save", flush=True)
+            print(f"[controlled_spatial] map '{map_name}' already exists, will overwrite on save", flush=True)
 
         try:
             self._create_cloud_subscription()
@@ -3723,7 +3728,7 @@ class MappingPlugin:
             self._start_time = time.monotonic()
             self._frame_count = 0
 
-        print(f"[mapping] started mapping '{map_name}'", flush=True)
+        print(f"[controlled_spatial] started mapping '{map_name}'", flush=True)
         return {
             "state": "mapping",
             "map_name": map_name,
@@ -3752,12 +3757,12 @@ class MappingPlugin:
             # _active_map 保留为 map_name：地图仍处于活动状态，可继续 tag_place
 
         if "error" in result:
-            print(f"[mapping] save failed for '{map_name}': {result['error']}", flush=True)
+            print(f"[controlled_spatial] save failed for '{map_name}': {result['error']}", flush=True)
             return result
 
         result["elapsed_time"] = round(elapsed, 2)
         print(
-            f"[mapping] saved '{map_name}': {result['point_count']} points "
+            f"[controlled_spatial] saved '{map_name}': {result['point_count']} points "
             f"({elapsed:.1f}s) -> {result['pcd_path']}",
             flush=True,
         )
@@ -3780,7 +3785,7 @@ class MappingPlugin:
             self._frame_count = 0
             self._active_map = None
 
-        print(f"[mapping] cancelled mapping '{map_name}'", flush=True)
+        print(f"[controlled_spatial] cancelled mapping '{map_name}'", flush=True)
         return {"state": "cancelled", "map_name": map_name}
 
     def _mapping_status(self) -> dict:
@@ -3846,7 +3851,7 @@ class MappingPlugin:
             map_name=active_map,
             description=description,
         )
-        print(f"[mapping] tagged place '{name}' on map '{active_map}'", flush=True)
+        print(f"[controlled_spatial] tagged place '{name}' on map '{active_map}'", flush=True)
         return {"status": "tagged", "name": name, "pose": pose, "map": active_map}
 
     def _untag_place(self, name: str) -> dict:
@@ -3857,7 +3862,7 @@ class MappingPlugin:
         if not active_map:
             return {"error": "no active map; call start_mapping or load_map first"}
         if self._db.delete_poi(name, active_map):
-            print(f"[mapping] untagged place '{name}' from map '{active_map}'", flush=True)
+            print(f"[controlled_spatial] untagged place '{name}' from map '{active_map}'", flush=True)
             return {"status": "deleted", "name": name}
         return {"error": f"tag '{name}' not found in map '{active_map}'"}
 
@@ -3903,7 +3908,7 @@ class MappingPlugin:
         self._active_map = map_name
         self._loaded_points = None  # 第一期不加载点云到内存，仅设置活动地图
         self._db.set_state("active_map", map_name)
-        print(f"[mapping] loaded map '{map_name}' as active", flush=True)
+        print(f"[controlled_spatial] loaded map '{map_name}' as active", flush=True)
         return {
             "status": "loaded",
             "map_name": map_name,
@@ -4003,7 +4008,7 @@ class MappingPlugin:
         try:
             points = self._parse_pointcloud2(msg)
         except Exception as exc:
-            print(f"[mapping] pointcloud parse error: {exc}", flush=True)
+            print(f"[controlled_spatial] pointcloud parse error: {exc}", flush=True)
             return
 
         if points is None or len(points) == 0:
@@ -4085,7 +4090,7 @@ class MappingPlugin:
         try:
             points = self._voxel_downsample(points, self._voxel_size)
         except Exception as exc:
-            print(f"[mapping] voxel downsample failed, saving raw: {exc}", flush=True)
+            print(f"[controlled_spatial] voxel downsample failed, saving raw: {exc}", flush=True)
 
         point_count = int(len(points))
 
