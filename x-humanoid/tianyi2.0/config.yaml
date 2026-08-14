@@ -76,3 +76,11 @@ plugins:
         sender_path: "/home/ubuntu/audio_sender.py"
   light:
     enabled: true
+  action_sequence:
+    enabled: true
+    # Generic choreography guardrails. The card validates every nested call
+    # against a fixed actuator/action allowlist before starting its timeline.
+    max_steps: 64
+    max_calls_per_step: 8
+    max_total_calls: 128
+    max_duration: 300

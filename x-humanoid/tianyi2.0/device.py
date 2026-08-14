@@ -30,6 +30,7 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   NavPlugin           (actuator)           — 底盘导航控制
   ChatPlugin          (actuator)           — 语音交互开关
   VoiceChatActuatorPlugin (actuator)      — 语音对话开关
+  ActionSequencePlugin (actuator)         — 通用多卡片定时动作序列
   MotorStatePlugin    (sensor)             — 全身21电机状态(2Hz)
   HandStatePlugin     (sensor)             — 灵巧手状态(10Hz, tool name=hand_state)
   RemoteStatePlugin   (sensor)             — 遥控器SBUS事件(5Hz)
@@ -1964,6 +1965,561 @@ class HeadPlugin:
             return {"state": "moving", "yaw": yaw_deg, "pitch": pitch_deg, "roll": roll_deg}
         except Exception as e:
             return {"error": str(e)}
+
+
+class ActionSequencePlugin:
+    """Run validated actuator calls on one monotonic timeline.
+
+    This plugin only orchestrates existing cards.  It deliberately does not
+    publish ROS commands itself, so joint limits, feedback checks and hardware
+    error handling remain owned by the underlying actuator plugins.
+    """
+
+    _ALLOWED_ACTIONS = {
+        "arm": {"move_pos"},
+        "arm_gesture": {
+            "salute", "welcome", "raise", "shake_hands", "high_five",
+            "reset", "cancel",
+        },
+        "waist": {"move_waist", "set_zero_waist"},
+        "hand": {
+            "thumbs_up", "fist", "victory", "handshake", "point", "ok",
+            "open_palm", "set_fingers_raw",
+        },
+        "head_gesture": {"nod", "shake", "scan", "tilt", "reset", "cancel"},
+        "tts": {"speak", "interrupt", "pause", "resume"},
+        "light": {
+            "blue_standby", "blue_breathing", "white", "rainbow",
+            "warning", "error",
+        },
+    }
+
+    def __init__(self, plugin_config: dict, dispatcher):
+        self._dispatch_tool = dispatcher
+        self._max_steps = max(
+            1, min(256, int(plugin_config.get("max_steps", 64))))
+        self._max_calls_per_step = max(
+            1, min(16, int(plugin_config.get("max_calls_per_step", 8))))
+        self._max_total_calls = max(
+            1, min(512, int(plugin_config.get("max_total_calls", 128))))
+        self._max_duration = max(
+            0.1, min(300.0, float(plugin_config.get("max_duration", 300.0))))
+        self._lock = threading.Lock()
+        self._active = None
+        self._last_status = {
+            "state": "idle",
+            "sequence_name": None,
+            "action_id": None,
+        }
+
+    @staticmethod
+    def _call_schema() -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "tool": {
+                    "type": "string",
+                    "enum": sorted(ActionSequencePlugin._ALLOWED_ACTIONS),
+                    "description": "要调用的同设备执行器卡片",
+                },
+                "action": {
+                    "type": "string",
+                    "description": "该卡片的动作名；运行前会按白名单校验",
+                },
+                "args": {
+                    "type": "object",
+                    "description": "传给目标动作的参数，不要在此重复填写action",
+                    "additionalProperties": True,
+                },
+            },
+            "required": ["tool", "action"],
+            "additionalProperties": False,
+        }
+
+    def get_tool(self) -> dict:
+        call_schema = self._call_schema()
+        return {
+            "name": "action_sequence",
+            "type": "actuator",
+            "description": (
+                "通用定时动作序列。一次提交完整时间轴，驱动后台按绝对秒数调度"
+                "手臂、语义手势、腰部、灵巧手、头部语义动作、TTS和灯效，执行过程"
+                "不再逐步请求LLM。相同at的calls近似同时启动；run返回action_id，"
+                "可用cancel中止未执行步骤。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["run", "cancel", "status"],
+                        "default": "run",
+                        "description": "run执行序列，cancel取消，status查询",
+                    },
+                    "name": {
+                        "type": "string",
+                        "maxLength": 80,
+                        "description": "序列名称",
+                    },
+                    "steps": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": self._max_steps,
+                        "description": (
+                            "按at升序排列的时间轴步骤；at是相对run开始的绝对秒数，"
+                            "同一步内的calls并行启动"
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "at": {
+                                    "type": "number",
+                                    "minimum": 0,
+                                    "maximum": self._max_duration,
+                                },
+                                "calls": {
+                                    "type": "array",
+                                    "minItems": 1,
+                                    "maxItems": self._max_calls_per_step,
+                                    "items": call_schema,
+                                },
+                            },
+                            "required": ["at", "calls"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "duration": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": self._max_duration,
+                        "description": (
+                            "序列总时长秒，必须不小于最后一步at；用于给最后动作留出完成时间"
+                        ),
+                    },
+                    "on_cancel": {
+                        "type": "array",
+                        "maxItems": self._max_calls_per_step,
+                        "items": call_schema,
+                        "description": (
+                            "取消或步骤失败时立即并行调用的收尾动作，例如tts.interrupt、"
+                            "arm.move_pos回中性位和head_gesture.reset"
+                        ),
+                    },
+                    "stop_on_error": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "任一底层卡片明确报错时取消剩余步骤并执行on_cancel",
+                    },
+                },
+                "required": ["action"],
+                "x-completion": {"actions": ["run"], "timeout": 360},
+                "x-action-params": {
+                    "run": {
+                        "params": [
+                            "name", "steps", "duration", "on_cancel",
+                            "stop_on_error",
+                        ],
+                        "description": "校验后在后台按绝对时间轴执行完整动作序列",
+                    },
+                    "cancel": {
+                        "params": [],
+                        "description": "取消尚未调度的步骤并执行on_cancel收尾动作",
+                    },
+                    "status": {
+                        "params": [],
+                        "description": "查询当前或最近一次序列的执行进度和错误",
+                    },
+                },
+            },
+        }
+
+    def start(self):
+        pass
+
+    def stop(self):
+        self._cancel("plugin_stopped")
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "run":
+            return self._run(args)
+        if action == "cancel":
+            return self._cancel("user_cancelled")
+        if action == "status":
+            return self._status()
+        if action in ("start", "info"):
+            return {"state": "ready", "max_steps": self._max_steps,
+                    "max_duration": self._max_duration}
+        return self._error("unknown_action", f"unknown action: {action}")
+
+    @staticmethod
+    def _error(code: str, message: str, **details) -> dict:
+        result = {"state": "error", "code": code, "error": message}
+        result.update(details)
+        return result
+
+    @staticmethod
+    def _is_number(value) -> bool:
+        return (isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value)))
+
+    def _validate_call(self, raw, location: str):
+        if not isinstance(raw, dict):
+            return None, self._error(
+                "invalid_call", f"{location} must be an object")
+        unknown = set(raw) - {"tool", "action", "args"}
+        if unknown:
+            return None, self._error(
+                "invalid_call", f"{location} has unknown fields",
+                fields=sorted(unknown))
+        tool = raw.get("tool")
+        action = raw.get("action")
+        args = raw.get("args", {})
+        if tool not in self._ALLOWED_ACTIONS:
+            return None, self._error(
+                "tool_not_allowed", f"{location} tool is not allowed",
+                tool=tool, allowed_tools=sorted(self._ALLOWED_ACTIONS))
+        if action not in self._ALLOWED_ACTIONS[tool]:
+            return None, self._error(
+                "action_not_allowed", f"{location} action is not allowed",
+                tool=tool, action=action,
+                allowed_actions=sorted(self._ALLOWED_ACTIONS[tool]))
+        if not isinstance(args, dict):
+            return None, self._error(
+                "invalid_args", f"{location}.args must be an object")
+        if "action" in args or "_tool_name" in args:
+            return None, self._error(
+                "reserved_argument",
+                f"{location}.args cannot contain action or _tool_name")
+        if tool == "tts" and action == "speak":
+            text = args.get("text")
+            if not isinstance(text, str) or not text.strip():
+                return None, self._error(
+                    "invalid_tts_text", f"{location} tts.speak requires text")
+            if len(text) > 500:
+                return None, self._error(
+                    "tts_text_too_long", f"{location} text exceeds 500 characters")
+            if args.get("force") is True:
+                return None, self._error(
+                    "force_tts_not_allowed",
+                    f"{location} cannot use force=true inside a sequence")
+        return {
+            "tool": tool,
+            "action": action,
+            "args": dict(args),
+        }, None
+
+    def _validate_calls(self, raw_calls, location: str, allow_empty=False):
+        if not isinstance(raw_calls, list):
+            return None, self._error(
+                "invalid_calls", f"{location} must be an array")
+        if not allow_empty and not raw_calls:
+            return None, self._error(
+                "empty_calls", f"{location} cannot be empty")
+        if len(raw_calls) > self._max_calls_per_step:
+            return None, self._error(
+                "too_many_calls", f"{location} exceeds call limit",
+                maximum=self._max_calls_per_step)
+        calls = []
+        seen_tools = set()
+        for index, raw in enumerate(raw_calls):
+            call, error = self._validate_call(raw, f"{location}[{index}]")
+            if error:
+                return None, error
+            if call["tool"] in seen_tools:
+                return None, self._error(
+                    "duplicate_tool_in_step",
+                    f"{location} cannot call the same tool twice concurrently",
+                    tool=call["tool"])
+            seen_tools.add(call["tool"])
+            calls.append(call)
+        return calls, None
+
+    def _validate_sequence(self, args: dict):
+        name = args.get("name", "action-sequence")
+        if not isinstance(name, str) or not name.strip() or len(name) > 80:
+            return None, self._error(
+                "invalid_name", "name must contain 1 to 80 characters")
+        raw_steps = args.get("steps")
+        if not isinstance(raw_steps, list) or not raw_steps:
+            return None, self._error(
+                "invalid_steps", "steps must be a non-empty array")
+        if len(raw_steps) > self._max_steps:
+            return None, self._error(
+                "too_many_steps", "steps exceeds configured limit",
+                maximum=self._max_steps)
+
+        steps = []
+        previous_at = -1.0
+        total_calls = 0
+        for index, raw_step in enumerate(raw_steps):
+            if not isinstance(raw_step, dict):
+                return None, self._error(
+                    "invalid_step", f"steps[{index}] must be an object")
+            unknown = set(raw_step) - {"at", "calls"}
+            if unknown:
+                return None, self._error(
+                    "invalid_step", f"steps[{index}] has unknown fields",
+                    fields=sorted(unknown))
+            at = raw_step.get("at")
+            if not self._is_number(at):
+                return None, self._error(
+                    "invalid_step_time", f"steps[{index}].at must be finite")
+            at = float(at)
+            if at < 0 or at > self._max_duration:
+                return None, self._error(
+                    "step_time_out_of_range",
+                    f"steps[{index}].at must be within sequence duration limit",
+                    maximum=self._max_duration)
+            if at < previous_at:
+                return None, self._error(
+                    "steps_not_sorted", "steps must be sorted by nondecreasing at")
+            calls, error = self._validate_calls(
+                raw_step.get("calls"), f"steps[{index}].calls")
+            if error:
+                return None, error
+            total_calls += len(calls)
+            if total_calls > self._max_total_calls:
+                return None, self._error(
+                    "too_many_total_calls", "sequence exceeds total call limit",
+                    maximum=self._max_total_calls)
+            steps.append({"at": at, "calls": calls})
+            previous_at = at
+
+        raw_duration = args.get("duration", previous_at)
+        if not self._is_number(raw_duration):
+            return None, self._error(
+                "invalid_duration", "duration must be a finite number")
+        duration = float(raw_duration)
+        if duration < previous_at or duration > self._max_duration:
+            return None, self._error(
+                "duration_out_of_range",
+                "duration must be at least the final step time and within the limit",
+                final_step_at=previous_at, maximum=self._max_duration)
+
+        on_cancel, error = self._validate_calls(
+            args.get("on_cancel", []), "on_cancel", allow_empty=True)
+        if error:
+            return None, error
+        stop_on_error = args.get("stop_on_error", True)
+        if not isinstance(stop_on_error, bool):
+            return None, self._error(
+                "invalid_stop_on_error", "stop_on_error must be boolean")
+        return {
+            "name": name.strip(),
+            "steps": steps,
+            "duration": duration,
+            "on_cancel": on_cancel,
+            "stop_on_error": stop_on_error,
+            "total_calls": total_calls,
+        }, None
+
+    def _run(self, args: dict) -> dict:
+        sequence, error = self._validate_sequence(args)
+        if error:
+            return error
+        with self._lock:
+            if self._active is not None:
+                return self._error(
+                    "sequence_busy", "another action sequence is already running",
+                    action_id=self._active["action_id"],
+                    sequence_name=self._active["name"])
+            from uuid import uuid4
+            action_id = f"action_sequence_{uuid4().hex[:8]}"
+            active = {
+                **sequence,
+                "action_id": action_id,
+                "cancel_event": threading.Event(),
+                "cancel_reason": None,
+                "failed": False,
+                "errors": [],
+                "started_monotonic": time.monotonic(),
+                "started_at": time.time(),
+                "current_step": -1,
+                "dispatched_steps": 0,
+            }
+            self._active = active
+            self._last_status = self._snapshot_locked(active, "running")
+
+        thread = threading.Thread(
+            target=self._sequence_worker,
+            args=(active,),
+            name=f"action_sequence_{action_id[-8:]}",
+            daemon=True,
+        )
+        active["thread"] = thread
+        thread.start()
+        return {
+            "state": "running",
+            "action_id": action_id,
+            "sequence_name": sequence["name"],
+            "steps": len(sequence["steps"]),
+            "calls": sequence["total_calls"],
+            "duration": sequence["duration"],
+        }
+
+    def _cancel(self, reason: str) -> dict:
+        with self._lock:
+            active = self._active
+            if active is None:
+                return {"state": self._last_status.get("state", "idle"),
+                        "cancelled": False}
+            active["cancel_reason"] = reason
+            active["cancel_event"].set()
+            self._last_status = self._snapshot_locked(active, "cancelling")
+            return {
+                "state": "cancelling",
+                "cancelled": True,
+                "action_id": active["action_id"],
+                "sequence_name": active["name"],
+            }
+
+    def _status(self) -> dict:
+        with self._lock:
+            if self._active is None:
+                return dict(self._last_status)
+            state = (
+                "cancelling"
+                if self._active["cancel_event"].is_set()
+                else "running"
+            )
+            return self._snapshot_locked(self._active, state)
+
+    def _snapshot_locked(self, active: dict, state: str) -> dict:
+        elapsed = max(0.0, time.monotonic() - active["started_monotonic"])
+        return {
+            "state": state,
+            "sequence_name": active["name"],
+            "action_id": active["action_id"],
+            "current_step": active["current_step"],
+            "dispatched_steps": active["dispatched_steps"],
+            "total_steps": len(active["steps"]),
+            "elapsed": round(elapsed, 3),
+            "duration": active["duration"],
+            "errors": list(active["errors"]),
+        }
+
+    def _sequence_worker(self, active: dict):
+        step_threads = []
+        for index, step in enumerate(active["steps"]):
+            delay = (active["started_monotonic"] + step["at"]
+                     - time.monotonic())
+            if delay > 0 and active["cancel_event"].wait(delay):
+                break
+            if active["cancel_event"].is_set():
+                break
+            with self._lock:
+                if self._active is not active:
+                    return
+                active["current_step"] = index
+                active["dispatched_steps"] += 1
+                self._last_status = self._snapshot_locked(active, "running")
+            thread = threading.Thread(
+                target=self._execute_step,
+                args=(active, index, step["calls"]),
+                name=f"action_sequence_step_{index}",
+                daemon=True,
+            )
+            step_threads.append(thread)
+            thread.start()
+
+        remaining = (active["started_monotonic"] + active["duration"]
+                     - time.monotonic())
+        if remaining > 0:
+            active["cancel_event"].wait(remaining)
+
+        cleanup_started = False
+        while any(thread.is_alive() for thread in step_threads):
+            if active["cancel_event"].is_set() and not cleanup_started:
+                cleanup_started = True
+                self._execute_cleanup(active)
+            for thread in step_threads:
+                thread.join(timeout=0.03)
+        if active["cancel_event"].is_set() and not cleanup_started:
+            self._execute_cleanup(active)
+
+        if active["failed"]:
+            final_state = "error"
+            acp_status = "error"
+        elif active["cancel_event"].is_set():
+            final_state = "cancelled"
+            acp_status = "cancelled"
+        else:
+            final_state = "completed"
+            acp_status = "completed"
+
+        with self._lock:
+            final = self._snapshot_locked(active, final_state)
+            final["cancel_reason"] = active.get("cancel_reason")
+            self._last_status = final
+            if self._active is active:
+                self._active = None
+        _acp_notify(
+            active["action_id"], acp_status,
+            {
+                "sequence_name": active["name"],
+                "state": final_state,
+                "dispatched_steps": active["dispatched_steps"],
+                "total_steps": len(active["steps"]),
+                "errors": list(active["errors"]),
+            },
+            "action_sequence",
+        )
+
+    def _execute_step(self, active: dict, step_index: int, calls: list):
+        start_gate = threading.Event()
+        results = [None] * len(calls)
+
+        def _invoke(call_index: int, call: dict):
+            start_gate.wait()
+            try:
+                result = self._dispatch_tool(
+                    call["tool"], call["action"], dict(call["args"]))
+            except Exception as exc:
+                result = self._error(
+                    "dispatch_exception", str(exc),
+                    tool=call["tool"], action=call["action"])
+            results[call_index] = result
+
+        threads = [
+            threading.Thread(
+                target=_invoke, args=(index, call), daemon=True,
+                name=f"action_sequence_call_{step_index}_{index}",
+            )
+            for index, call in enumerate(calls)
+        ]
+        for thread in threads:
+            thread.start()
+        start_gate.set()
+        for thread in threads:
+            thread.join()
+
+        errors = []
+        for call, result in zip(calls, results):
+            if (result is None
+                    or (isinstance(result, dict)
+                        and (result.get("state") == "error"
+                             or "error" in result
+                             or result.get("ok") is False))):
+                errors.append({
+                    "step": step_index,
+                    "tool": call["tool"],
+                    "action": call["action"],
+                    "result": result,
+                })
+        if errors:
+            with self._lock:
+                active["errors"].extend(errors)
+                if active["stop_on_error"]:
+                    active["failed"] = True
+                    active["cancel_reason"] = "step_error"
+                    active["cancel_event"].set()
+
+    def _execute_cleanup(self, active: dict):
+        if not active["on_cancel"]:
+            return
+        cleanup_active = {**active, "stop_on_error": False}
+        self._execute_step(cleanup_active, -1, active["on_cancel"])
 
 
 # ══════════════════════════════════════════════════════════════════════════════

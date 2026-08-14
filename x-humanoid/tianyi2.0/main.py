@@ -393,6 +393,19 @@ class TianyiDeviceBundle:
             self._plugins.append(LightPlugin(plugins_cfg["light"], namespace, ros2))
             print("[bundle] LightPlugin loaded")
 
+        # Load the orchestrator after its target actuator plugins.  It receives
+        # a narrow callback instead of direct plugin references so every timed
+        # call still goes through the bundle's normal action dispatch path.
+        if plugins_cfg.get("action_sequence", {}).get("enabled", False):
+            from device import ActionSequencePlugin
+            self._plugins.append(ActionSequencePlugin(
+                plugins_cfg["action_sequence"], self._dispatch_sequence_call))
+            print("[bundle] ActionSequencePlugin loaded")
+
+    def _dispatch_sequence_call(
+            self, tool_name: str, action: str, args: dict) -> dict | None:
+        return self.dispatch(tool_name, {**dict(args), "action": action})
+
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
             try:
