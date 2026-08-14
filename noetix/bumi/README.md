@@ -51,7 +51,8 @@ physical pose.
 
 `stand_up` is accepted only from disabled or enabled mode and its description
 requires the operator to place the robot face-up before calling it. `lie_prone` requires
-`standing_pose_confirmed=true` and is accepted only from walking mode. These
+the operator to confirm stable standing through the card instructions and is
+accepted only from walking mode. These
 guards prevent a standing robot from receiving the get-up trajectory.
 
 `play_recording` remains `running` after play-teach mode is observed. The SDK
@@ -63,10 +64,6 @@ play-teach mode and confirms the return to walking.
 `finish_and_save_recording` maps to the supported `SAVETEACH` command. The
 vendor-deprecated `ENDTEACH` command and unavailable `RUN` command remain
 unexposed.
-
-`debug_workmode` is a developer-only actuator for direct `enable`, `disable`,
-`ready` and `walk` testing. It does not automatically fill missing prerequisite
-modes; the operator remains responsible for pose and environment checks.
 
 Useful observations while the driver is running:
 
