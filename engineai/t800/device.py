@@ -3647,6 +3647,7 @@ class MappingPlugin:
                 },
                 {
                     "map_name": {"type": "string", "description": "地图名称"},
+                    "name": {"type": "string", "description": "标记名称"},
                     "description": {"type": "string", "description": "标记描述（可选）"},
                 },
                 "建图动作",
