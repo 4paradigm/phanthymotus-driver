@@ -104,7 +104,13 @@ def _raise_if_remote_process_exited(process, label: str) -> None:
 
 
 def _find_remote_mic_device() -> str:
-    """Find Q5's POROSVOC ALSA capture card without PortAudio enumeration."""
+    """Find the documented Q5 capture endpoint without PortAudio enumeration.
+
+    The manual uses the full-duplex ``USB Audio Device`` (its device index is
+    not stable), while POROSVOC is a capture-only fallback on some machines.
+    Return ``plughw`` for the full-duplex card so ALSA can convert its native
+    USB rate to the bridge's 16 kHz mono contract.
+    """
     probe = r"""from pathlib import Path
 sound = Path('/sys/class/sound')
 candidates = []
@@ -114,11 +120,21 @@ for card in sound.glob('card*'):
         name = (card / 'id').read_text().strip()
     except (OSError, ValueError):
         continue
-    if Path('/dev/snd/pcmC%dD0c' % index).exists():
-        candidates.append((index, name))
-preferred = [item for item in candidates if 'porosvoc' in item[1].lower()]
-selected = (preferred or candidates[:1])
-print('hw:%d,0' % selected[0][0] if selected else '')"""
+    capture = Path('/dev/snd/pcmC%dD0c' % index).exists()
+    playback = Path('/dev/snd/pcmC%dD0p' % index).exists()
+    if capture:
+        candidates.append((index, name, playback))
+preferred = [item for item in candidates
+             if 'usb audio device' in item[1].lower() and item[2]]
+if not preferred:
+    preferred = [item for item in candidates if 'porosvoc' in item[1].lower()]
+if not preferred:
+    preferred = candidates
+if preferred:
+    index, name, playback = preferred[0]
+    print(('plughw:' if playback else 'hw:') + '%d,0' % index)
+else:
+    print('')"""
     result = _q5_remote_command("python3 -c " + shlex.quote(probe), timeout=15.0)
     if result.returncode:
         detail = (result.stderr or result.stdout).decode(errors="replace").strip()

@@ -44,8 +44,9 @@ plugins:
     enabled: true
   mic:
     enabled: true
-    # Discover the Q5 POROSVOC USB capture card by ALSA name. PortAudio's
-    # device indices are unreliable in the developer container.
+    # Discover the documented full-duplex USB Audio Device by ALSA name.
+    # PortAudio's device indices are unreliable in the developer container;
+    # POROSVOC remains the fallback capture-only device.
     device: auto
     sample_rate_hz: 16000
     channels: 1
