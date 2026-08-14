@@ -4858,7 +4858,7 @@ class HomePlugin:
         return {
             "name": "home",
             "type": "actuator",
-            "description": "天轶2.0 充电桩管理与回桩。回桩前需加载地图、定位正常，并设置当前充电桩位姿。",
+            "description": "天轶2.0 充电桩管理与回桩。简单流程：机器人停在充电桩对接位置并定位正常后执行 register_dock 注册，再执行 list_docks 获取 dock_id，接着执行 set_dock 选定当前目标，最后执行 go_home 回桩充电。回桩前需加载地图并保持定位正常。",
             "inputSchema": {
                 "type": "object",
                 "properties": {

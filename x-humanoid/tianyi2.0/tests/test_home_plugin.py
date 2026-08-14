@@ -79,9 +79,11 @@ def _plugin(status):
 
 def test_home_schema_owns_go_home():
     module, home, _ = _plugin({"action_state": 1, "result": 0})
-    home_actions = home.get_tool()["inputSchema"]["properties"]["action"]["enum"]
+    tool = home.get_tool()
+    home_actions = tool["inputSchema"]["properties"]["action"]["enum"]
     assert "go_home" in home_actions
     assert "go_home_no_dock" not in home_actions
+    assert all(step in tool["description"] for step in ("register_dock", "list_docks", "set_dock", "go_home"))
     set_dock = home.get_tool()["inputSchema"]["x-action-params"]["set_dock"]
     assert "二者任选其一" in set_dock["description"]
     register_dock = home.get_tool()["inputSchema"]["x-action-params"]["register_dock"]
