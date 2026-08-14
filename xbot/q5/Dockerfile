@@ -25,6 +25,7 @@ RUN apt-get -o Acquire::Retries=5 update && \
     apt-get install -y --no-install-recommends \
         python3-numpy \
         python3-opencv \
+        python3-dev \
         openssh-client \
         sshpass \
         python3-colcon-common-extensions \
