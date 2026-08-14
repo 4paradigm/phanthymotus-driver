@@ -108,10 +108,10 @@ def _pressed_gamepad_buttons(digital_states) -> list[str]:
 
 
 def _gamepad_control_source(msg) -> str:
-    # T800 touch-screen locomotion and the physical remote both fan into the
-    # GamepadKeys stream. The only stable runtime hint available in the message
-    # is hardware_connected, so keep the label explicit for canvas validation.
-    return "remote_gamepad" if bool(getattr(msg, "hardware_connected", False)) else "touchscreen_gamepad"
+    # Movement speed is derived from the GamepadKeys analog stream. On T800 this
+    # can be produced by the physical joystick or a virtual/software sender; the
+    # card exposes hardware_connected separately instead of guessing UI origin.
+    return "gamepad_analog"
 
 
 def _motion_direction(stick_x: float, stick_y: float, yaw_x: float = 0.0) -> str:
@@ -123,6 +123,28 @@ def _motion_direction(stick_x: float, stick_y: float, yaw_x: float = 0.0) -> str
     if not parts and abs(yaw_x) >= 0.10:
         parts.append("turn_right" if yaw_x > 0 else "turn_left")
     return "_".join(parts) if parts else "none"
+
+
+def _normalize_motion_action(name: str) -> str:
+    value = str(name or "").strip()
+    lowered = value.lower()
+    if not lowered or lowered == "unknown":
+        return "unknown"
+    aliases = (
+        ("stand", ("stand", "pd_stand", "stance")),
+        ("sit", ("sit", "sitting", "seated", "seat", "squat")),
+        ("punch", ("punch", "boxing", "box", "fight", "fist", "打拳")),
+        ("dance", ("dance",)),
+        ("walk", ("walk", "loco")),
+        ("get_up", ("get_up", "getup")),
+        ("lie_down", ("lie_down", "liedown", "supine")),
+        ("idle", ("idle",)),
+        ("passive", ("passive", "damping")),
+    )
+    for normalized, tokens in aliases:
+        if any(token in lowered for token in tokens):
+            return normalized
+    return value
 
 
 def _json_message(payload: dict) -> String:
@@ -1278,15 +1300,19 @@ class MotionEventsPlugin:
 
     def _on_motion_request(self, msg) -> None:
         motion_name = str(msg.target_motion_name)
+        action = _normalize_motion_action(motion_name)
         with self._lock:
-            self._latest_action = motion_name
+            self._latest_action = action
+            self._latest_control_source = "motion_request"
+            self._latest_direction = "none"
         self.record_event(
             source_tool="motion_command_trace",
             event_type="motion_request",
             severity="info",
             phase="requested",
-            summary=f"motion request: {motion_name}",
+            summary=f"motion request: {action} ({motion_name})",
             detail={
+                "action": action,
                 "target_motion_name": motion_name,
                 "source": self._config.get("topics", {}).get("motion_request"),
             },
@@ -1345,19 +1371,22 @@ class MotionEventsPlugin:
 
     def _on_motion_state(self, msg) -> None:
         current = str(getattr(msg, "current_motion_task", "") or "unknown")
+        action = _normalize_motion_action(current)
         with self._lock:
             previous = self._current_motion_state
             self._last_motion_state = previous
             self._current_motion_state = current
-            self._latest_action = current
+            self._latest_action = action
+            self._latest_control_source = "motion_state"
+            self._latest_direction = "none"
         if current and current != "unknown" and current != previous:
             self.record_event(
                 source_tool="motion_state",
                 event_type="motion_state_changed",
                 severity="info",
                 phase="confirmed",
-                summary=f"motion state: {current}",
-                detail={"previous": previous, "current": current},
+                summary=f"motion state: {action} ({current})",
+                detail={"action": action, "previous": previous, "current": current},
             )
 
     def _on_odometry(self, msg) -> None:

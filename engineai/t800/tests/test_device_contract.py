@@ -339,12 +339,12 @@ class DevicePluginContractTests(unittest.TestCase):
             analog_states=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         ))
         snapshot = plugin.dispatch("status", {})
-        self.assertEqual("remote_gamepad", snapshot["source"])
+        self.assertEqual("gamepad_analog", snapshot["source"])
         self.assertEqual("0.00 m/s", snapshot["speed"])
         self.assertEqual("stopped", snapshot["motion_state"])
         self.assertEqual("none", snapshot["direction"])
 
-    def test_motion_trace_recognizes_touchscreen_gamepad_speed(self):
+    def test_motion_trace_recognizes_gamepad_analog_speed(self):
         plugin = self.device.MotionCommandTracePlugin(CONFIG, "robot", self.ros)
         plugin._on_gamepad(types.SimpleNamespace(
             hardware_connected=False,
@@ -352,7 +352,7 @@ class DevicePluginContractTests(unittest.TestCase):
             analog_states=[0.0, 0.0, -0.4, 0.3, 0.0, 0.0],
         ))
         snapshot = plugin.dispatch("status", {})
-        self.assertEqual("touchscreen_gamepad", snapshot["source"])
+        self.assertEqual("gamepad_analog", snapshot["source"])
         self.assertEqual("moving", snapshot["motion_state"])
         self.assertEqual("forward_left", snapshot["direction"])
         self.assertEqual("0.98 m/s", snapshot["speed"])
@@ -378,7 +378,7 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("running", moving["state"])
         self.assertEqual("moving", moving["motion_state"])
         self.assertEqual("gamepad", moving["speed_source"])
-        self.assertEqual("touchscreen_gamepad", moving["control_source"])
+        self.assertEqual("gamepad_analog", moving["control_source"])
         self.assertEqual("move", moving["action"])
         self.assertEqual("forward", moving["direction"])
         self.assertEqual([], moving["buttons"])
@@ -407,7 +407,7 @@ class DevicePluginContractTests(unittest.TestCase):
         ))
         snapshot = plugin.dispatch("status", {})
         self.assertEqual("stand", snapshot["action"])
-        self.assertEqual("remote_gamepad", snapshot["control_source"])
+        self.assertEqual("gamepad_analog", snapshot["control_source"])
         self.assertEqual("none", snapshot["direction"])
         self.assertEqual(["LB", "A"], snapshot["buttons"])
         self.assertEqual("gamepad_action", snapshot["event"])
@@ -415,8 +415,24 @@ class DevicePluginContractTests(unittest.TestCase):
         plugin._on_motion_state(types.SimpleNamespace(current_motion_task="pd_stand"))
         snapshot = plugin.dispatch("status", {})
         self.assertEqual("pd_stand", snapshot["current_motion_state"])
-        self.assertEqual("pd_stand", snapshot["action"])
+        self.assertEqual("stand", snapshot["action"])
+        self.assertEqual("motion_state", snapshot["control_source"])
         self.assertEqual("motion_state_changed", snapshot["event"])
+
+    def test_motion_events_normalize_screen_motion_states(self):
+        plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
+        for raw, action in (
+            ("sit_down", "sit"),
+            ("boxing_combo", "punch"),
+            ("screen_punch", "punch"),
+        ):
+            with self.subTest(raw=raw):
+                plugin._on_motion_state(types.SimpleNamespace(current_motion_task=raw))
+                snapshot = plugin.dispatch("status", {})
+                self.assertEqual(raw, snapshot["current_motion_state"])
+                self.assertEqual(action, snapshot["action"])
+                self.assertEqual("motion_state", snapshot["control_source"])
+                self.assertEqual("motion_state_changed", snapshot["event"])
 
     def test_derived_diagnostics_and_capability_resources(self):
         self.state._set("imu", {
