@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import json
 import math
+import numbers
+import subprocess
 import threading
 import time
+from collections import deque
 from dataclasses import asdict
 from pathlib import Path
 
@@ -33,6 +36,7 @@ from control import (
     joint_payload,
     list_or_default,
     optional_floats,
+    sensor_action_schema,
     sensor_tool,
     validate_joint_indices,
     validate_parallel_arrays,
@@ -59,15 +63,124 @@ _RELIABLE_ONE = QoSProfile(
     durability=DurabilityPolicy.VOLATILE,
 )
 
+_LIFECYCLE_ACTIONS = {
+    "start": ([], "启动卡片数据流"),
+    "info": ([], "返回卡片状态和实际输出 topic"),
+    "stop": ([], "停止卡片数据流"),
+}
+
+
+def _with_lifecycle(actions: dict[str, tuple[list[str], str]]) -> dict[str, tuple[list[str], str]]:
+    return {**_LIFECYCLE_ACTIONS, **actions}
+
+
+def _with_topic_out(payload: dict, topic: str, fmt: str = "data/json") -> dict:
+    return {**payload, "topic_out": [{"topic": topic, "format": fmt}]}
+
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+_GAMEPAD_BUTTON_NAMES = {
+    0: "LB", 1: "RB", 2: "A", 3: "B", 4: "X", 5: "Y",
+    6: "BACK", 7: "START", 8: "CROSS_X_UP", 9: "CROSS_X_DOWN",
+    10: "CROSS_Y_LEFT", 11: "CROSS_Y_RIGHT",
+}
+
+_GAMEPAD_ACTIONS = {
+    frozenset({"LB", "START"}): "idle",
+    frozenset({"LB", "RB"}): "passive",
+    frozenset({"LB", "A"}): "stand",
+    frozenset({"LB", "B"}): "walk",
+    frozenset({"RB", "B"}): "dance",
+    frozenset({"START", "CROSS_X_UP"}): "get_up",
+    frozenset({"START", "CROSS_X_DOWN"}): "lie_down",
+}
+
+
+def _pressed_gamepad_buttons(digital_states) -> list[str]:
+    states = [] if digital_states is None else digital_states
+    return [
+        _GAMEPAD_BUTTON_NAMES.get(index, str(index))
+        for index, value in enumerate(states)
+        if int(value) != 0
+    ]
+
+
+def _gamepad_control_source(msg) -> str:
+    # Movement speed is derived from the GamepadKeys analog stream. On T800 this
+    # can be produced by the physical joystick or a virtual/software sender; the
+    # card exposes hardware_connected separately instead of guessing UI origin.
+    return "gamepad_analog"
+
+
+def _motion_direction(stick_x: float, stick_y: float, yaw_x: float = 0.0) -> str:
+    parts: list[str] = []
+    if abs(stick_y) >= 0.10:
+        parts.append("forward" if stick_y > 0 else "backward")
+    if abs(stick_x) >= 0.10:
+        parts.append("right" if stick_x > 0 else "left")
+    if not parts and abs(yaw_x) >= 0.10:
+        parts.append("turn_right" if yaw_x > 0 else "turn_left")
+    return "_".join(parts) if parts else "none"
+
+
+def _normalize_motion_action(name: str) -> str:
+    value = str(name or "").strip()
+    lowered = value.lower()
+    if not lowered or lowered == "unknown":
+        return "unknown"
+    aliases = (
+        ("stand", ("stand", "pd_stand", "stance")),
+        ("sit", ("sit", "sitting", "seated", "seat", "squat")),
+        ("punch", ("punch", "boxing", "box", "fight", "fist", "打拳")),
+        ("dance", ("dance",)),
+        ("walk", ("walk", "loco")),
+        ("get_up", ("get_up", "getup")),
+        ("lie_down", ("lie_down", "liedown", "supine")),
+        ("idle", ("idle",)),
+        ("passive", ("passive", "damping")),
+    )
+    for normalized, tokens in aliases:
+        if any(token in lowered for token in tokens):
+            return normalized
+    return value
+
+
 def _json_message(payload: dict) -> String:
+    def scalar_default(value):
+        item = getattr(value, "item", None)
+        if callable(item):
+            return item()
+        if isinstance(value, numbers.Integral):
+            return int(value)
+        if isinstance(value, numbers.Real):
+            return float(value)
+        if hasattr(value, "__float__"):
+            return float(value)
+        if hasattr(value, "__int__"):
+            return int(value)
+        raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
     msg = String()
-    msg.data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    msg.data = json.dumps(
+        payload,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=scalar_default,
+    )
     return msg
+
+
+def _graph_items(node, method: str) -> list:
+    callback = getattr(node, method, None)
+    if callback is None:
+        return []
+    try:
+        return list(callback())
+    except Exception:
+        return []
 
 
 class StatePlugin:
@@ -92,13 +205,17 @@ class StatePlugin:
         "joint_groups": ("model/joint_groups", "T800 腿、躯干、双臂和头部关节分组"),
         "capabilities": ("model/capabilities", "T800 Driver 原生接口、高阶动作和限制说明"),
         "ros_graph": ("state/ros_graph", "实时发现 T800 ROS2 节点、topic、service 和固件扩展接口"),
+        "mainboard": ("state/mainboard", "展示 T800 主控板关联的温度、电源与电机诊断摘要"),
     }
+    _MAINBOARD_KEYWORDS = ("mainboard", "main_board", "board", "thermal", "temperature", "fan", "diagnostic")
+    _MAINBOARD_STRONG_KEYWORDS = ("mainboard", "main_board", "board")
 
-    def __init__(self, config: dict, namespace: str, ros2):
+    def __init__(self, config: dict, namespace: str, ros2, motion_events=None):
         self._config = config
         self._ns = namespace
         self._ros2 = ros2
         self._topics = config["topics"]
+        self._motion_events = motion_events
         self._timeout = float(config["ros"].get("source_timeout_sec", 1.0))
         self._running = False
         self._lock = threading.RLock()
@@ -207,19 +324,25 @@ class StatePlugin:
             return self._derived_snapshot(action_or_tool)
         if action_or_tool in self._STREAMS:
             return self._snapshot(action_or_tool)
+        if action_or_tool == "status":
+            name = args.get("_tool_name", "driver_health")
+            if name in self._DERIVED_STREAMS:
+                return self._derived_snapshot(name)
+            if name in self._STREAMS:
+                return self._snapshot(name)
         if action_or_tool == "start":
             return {"state": "running"}
         if action_or_tool == "stop":
             return {"state": "idle"}
         if action_or_tool == "info":
             name = args.get("_tool_name", "driver_health")
-            if name not in self._STREAMS:
-                return {"state": "running"}
-            relative, fmt, _ = self._STREAMS[name]
-            return {
-                "state": "running",
-                "topic_out": [{"topic": f"/{self._ns}/{relative}", "format": fmt}],
-            }
+            if name in self._STREAMS:
+                relative, fmt, _ = self._STREAMS[name]
+                return _with_topic_out({"state": "running"}, f"/{self._ns}/{relative}", fmt)
+            if name in self._DERIVED_STREAMS:
+                relative, _ = self._DERIVED_STREAMS[name]
+                return _with_topic_out({"state": "running"}, f"/{self._ns}/{relative}")
+            return {"state": "running"}
         return {"error": f"unknown state action: {action_or_tool}"}
 
     def _derived_snapshot(self, name: str) -> dict:
@@ -304,10 +427,14 @@ class StatePlugin:
                     "gesture_sequences", "dance", "virtual_gamepad", "soft_emergency_stop",
                     "motor_power", "led", "tts", "ros_graph_discovery",
                 ],
-                "feedback": list(self._STREAMS) + ["joint_plan_state"],
+                "feedback": list(self._STREAMS) + [
+                    "joint_plan_state", "heartbeat_status",
+                    "motion_command_trace", "native_interface_probe",
+                    "motion_events", "mainboard",
+                ],
                 "limitations": [
                     "no odometry topic: displacement/turn/arc are time-integrated open-loop estimates",
-                    "no public camera/lidar/dexterous-hand interface in the referenced T800 protocol",
+                    "no public dexterous-hand interface in the referenced T800 protocol",
                 ],
                 "timestamp_ms": _now_ms(),
             }
@@ -342,7 +469,145 @@ class StatePlugin:
                 "unmapped_topics": [item for item in topics if item["name"] not in configured],
                 "timestamp_ms": _now_ms(),
             }
+        if name == "mainboard":
+            return self._mainboard_snapshot()
         return {"error": f"unknown derived state: {name}"}
+
+    def _mainboard_snapshot(self) -> dict:
+        motor = self._snapshot("motor_health")
+        power = self._snapshot("battery")
+        if "mos_temperature_c" in motor or "voltage_v" in power:
+            return self._mainboard_hardware_snapshot(motor, power)
+
+        candidates = self._mainboard_candidates()
+        strong = [
+            item for item in candidates
+            if self._is_strong_mainboard_name(item["name"])
+        ]
+        state = "source_discovered" if strong else "no_data_source"
+        source = strong[0] if strong else None
+        return {
+            "state": state,
+            "ok": False,
+            "source": source,
+            "discovered_candidates": candidates,
+            "message": (
+                "mainboard candidate topic discovered; add a typed adapter after confirming the message contract"
+                if source else "No confirmed T800 mainboard telemetry topic or API was found."
+            ),
+            "search_keywords": list(self._MAINBOARD_KEYWORDS),
+            "timestamp_ms": _now_ms(),
+        }
+
+    def _mainboard_hardware_snapshot(self, motor: dict, power: dict) -> dict:
+        mos_temperatures = [float(value) for value in motor.get("mos_temperature_c", [])]
+        motor_errors = [int(value) for value in motor.get("error_code", [])]
+        offline = [int(value) for value in motor.get("offline", [])]
+        disabled = [0 if bool(value) else 1 for value in motor.get("enabled", [])]
+
+        board_temperature = max(mos_temperatures) if mos_temperatures else None
+        warning_temperature = float(self._config["control"].get("motor_warning_temperature_c", 70.0))
+        temperature_warning = board_temperature is not None and board_temperature >= warning_temperature
+        power_error = int(power.get("error_code", 0) or 0)
+        motor_error_count = sum(1 for value in motor_errors if value != 0)
+        offline_count = sum(1 for value in offline if value != 0)
+        disabled_count = sum(1 for value in disabled if value != 0)
+        stale = bool(motor.get("stale", True) or power.get("stale", True))
+
+        if stale:
+            state = "stale"
+        elif power_error or motor_error_count or offline_count or disabled_count:
+            state = "error"
+        elif temperature_warning:
+            state = "warning"
+        else:
+            state = "ok"
+
+        ages = [
+            value for value in (motor.get("age_sec"), power.get("age_sec"))
+            if value is not None
+        ]
+        message_parts = []
+        if stale:
+            message_parts.append("hardware telemetry is stale")
+        if temperature_warning:
+            message_parts.append(f"board temperature >= {warning_temperature:.0f} C")
+        if power_error:
+            message_parts.append(f"power error code {power_error}")
+        if motor_error_count:
+            message_parts.append(f"{motor_error_count} motor driver errors")
+        if offline_count:
+            message_parts.append(f"{offline_count} offline motor drivers")
+        if disabled_count:
+            message_parts.append(f"{disabled_count} disabled motor drivers")
+        message = "; ".join(message_parts) if message_parts else "hardware telemetry normal"
+
+        return {
+            "state": state,
+            "ok": state == "ok",
+            "temperature": [] if board_temperature is None else [round(board_temperature, 1)],
+            "power": {
+                "enabled": power.get("enabled"),
+                "battery_percentage": None if power.get("percentage") is None else round(float(power["percentage"]), 1),
+                "input_voltage_v": None if power.get("voltage_v") is None else round(float(power["voltage_v"]), 2),
+                "current_a": None if power.get("current_a") is None else round(float(power["current_a"]), 2),
+                "current_limit_a": None if power.get("current_limit_a") is None else round(float(power["current_limit_a"]), 1),
+            },
+            "diagnostics": {
+                "error_code": power_error,
+                "motor_error_count": motor_error_count,
+                "offline_count": offline_count,
+                "disabled_count": disabled_count,
+                "message": message,
+            },
+            "age_sec": round(max(ages), 1) if ages else None,
+            "timestamp_ms": _now_ms(),
+        }
+
+    def _mainboard_candidates(self) -> list[dict]:
+        candidates = []
+        configured = set(self._topics.values())
+        for name, types in _graph_items(self._sub_node, "get_topic_names_and_types"):
+            if not self._is_mainboard_candidate(name, types):
+                continue
+            candidates.append({
+                "kind": "topic",
+                "name": name,
+                "message_types": list(types),
+                "configured": name in configured,
+            })
+        for name, types in _graph_items(self._sub_node, "get_service_names_and_types"):
+            if not self._is_mainboard_candidate(name, types):
+                continue
+            candidates.append({
+                "kind": "service",
+                "name": name,
+                "message_types": list(types),
+                "configured": False,
+            })
+        return candidates
+
+    @classmethod
+    def _is_mainboard_candidate(cls, name: str, interface_types: list[str]) -> bool:
+        if cls._is_strong_mainboard_name(name):
+            return True
+        if any(cls._is_strong_mainboard_name(interface_type) for interface_type in interface_types):
+            return True
+        lowered = " ".join([name, *interface_types]).lower()
+        return any(
+            keyword in lowered
+            for keyword in ("thermal", "temperature", "fan", "diagnostic")
+        )
+
+    @staticmethod
+    def _is_strong_mainboard_name(name: str) -> bool:
+        lowered = name.lower().replace("-", "_")
+        if "mainboard" in lowered or "main_board" in lowered:
+            return True
+        tokenized = lowered
+        for separator in ("/", ".", "_", ":"):
+            tokenized = tokenized.replace(separator, " ")
+        return "board" in tokenized.split()
 
     def _set(self, name: str, payload: dict) -> None:
         with self._lock:
@@ -373,8 +638,18 @@ class StatePlugin:
             }
         for value in sources.values():
             value["stale"] = value["age_sec"] is None or value["age_sec"] > self._timeout
+        connected = sum(1 for value in sources.values() if value["connected"])
+        fresh = sum(1 for value in sources.values() if value["connected"] and not value["stale"])
+        if fresh:
+            state = "running"
+        elif connected:
+            state = "degraded"
+        else:
+            state = "waiting"
         return {
-            "state": "running" if any(v["connected"] for v in sources.values()) else "waiting",
+            "state": state,
+            "connected_sources": connected,
+            "fresh_sources": fresh,
             "sources": sources,
             "robot_domain_id": self._config["ros"]["robot_domain_id"],
             "core_domain_id": self._config["ros"]["core_domain_id"],
@@ -504,6 +779,1017 @@ class StatePlugin:
             for name, publisher in self._derived_publishers.items():
                 publisher.publish(_json_message(self._derived_snapshot(name)))
 
+
+class HeartbeatStatusPlugin:
+    def __init__(self, config: dict, namespace: str, ros2):
+        self._config = config
+        self._ns = namespace
+        self._timeout = float(config["ros"].get("source_timeout_sec", 1.0))
+        self._node = Node("t800_heartbeat_status", context=ros2.ctx_robot)
+        self._pub_node = Node("t800_heartbeat_status_pub", context=ros2.ctx_core)
+        ros2.executor_robot.add_node(self._node)
+        ros2.executor_core.add_node(self._pub_node)
+        self._publisher = self._pub_node.create_publisher(
+            String, f"/{namespace}/state/heartbeat_status", _RELIABLE
+        )
+        self._lock = threading.RLock()
+        self._latest: dict | None = None
+        self._updated: float | None = None
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "heartbeat_status",
+            "type": "sensor",
+            "multiInstance": False,
+            "readOnly": True,
+            "description": "显示 T800 ROS2 节点心跳、健康状态和数据新鲜度",
+            "inputSchema": action_schema(
+                _with_lifecycle({
+                    "status": ([], "返回适合画布验收的简洁心跳状态"),
+                    "debug": ([], "返回原始心跳字段，供研发排查"),
+                }),
+                {},
+                "心跳查询动作",
+            ),
+            "topic_out": [{"topic": f"/{self._ns}/state/heartbeat_status", "format": "data/json"}],
+        }
+
+    def start(self) -> None:
+        from interface_protocol.msg import Heartbeat
+
+        self._node.create_subscription(
+            Heartbeat, self._config["topics"]["heartbeat"], self._on_heartbeat, _BEST_EFFORT
+        )
+        self._pub_node.create_timer(0.2, self._publish)
+
+    def stop(self) -> None:
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "info":
+            return _with_topic_out(self._snapshot(), f"/{self._ns}/state/heartbeat_status")
+        if action in ("heartbeat_status", "status", "start"):
+            return self._snapshot()
+        if action == "debug":
+            return self._debug_snapshot()
+        if action == "stop":
+            return {"state": "idle"}
+        return {"error": f"unknown heartbeat action: {action}"}
+
+    def _on_heartbeat(self, msg) -> None:
+        with self._lock:
+            self._latest = {
+                "node_name": str(msg.node_name),
+                "node_status": str(msg.node_status),
+                "startup_timestamp": int(msg.startup_timestamp),
+                "error_code": int(msg.error_code),
+                "error_message": str(msg.error_message),
+            }
+            self._updated = time.monotonic()
+
+    def _snapshot(self) -> dict:
+        with self._lock:
+            latest = dict(self._latest or {})
+            updated = self._updated
+        age_sec = None if updated is None else max(0.0, time.monotonic() - updated)
+        stale = updated is None or age_sec > self._timeout
+        if updated is None:
+            return {
+                "state": "no_data",
+                "health": "unknown",
+                "node": None,
+                "message": "no heartbeat data",
+                "age_sec": None,
+                "timestamp_ms": _now_ms(),
+            }
+        error_code = int(latest.get("error_code", 0))
+        message = str(latest.get("error_message") or latest.get("node_status") or "ok")
+        return {
+            "state": "stale" if stale else "running",
+            "health": "error" if error_code else "ok",
+            "node": latest.get("node_name"),
+            "message": message,
+            "age_sec": round(age_sec, 1),
+            "timestamp_ms": _now_ms(),
+        }
+
+    def _debug_snapshot(self) -> dict:
+        with self._lock:
+            latest = dict(self._latest or {})
+            updated = self._updated
+        age_sec = None if updated is None else max(0.0, time.monotonic() - updated)
+        stale = updated is None or age_sec > self._timeout
+        if updated is None:
+            return {
+                "state": "no_data", "node_name": None, "node_status": None,
+                "startup_timestamp": None, "error_code": None, "error_message": None,
+                "age_sec": None, "stale": True, "timestamp_ms": _now_ms(),
+            }
+        latest.update({"state": "stale" if stale else "running", "age_sec": age_sec,
+                       "stale": stale, "timestamp_ms": _now_ms()})
+        return latest
+
+    def _publish(self) -> None:
+        self._publisher.publish(_json_message(self._snapshot()))
+
+class MotionCommandTracePlugin:
+    def __init__(self, config: dict, namespace: str, ros2):
+        self._config = config
+        self._ns = namespace
+        capacity = max(1, int(config.get("diagnostics", {}).get("command_trace_capacity", 20)))
+        self._node = Node("t800_motion_command_trace", context=ros2.ctx_robot)
+        self._pub_node = Node("t800_motion_command_trace_pub", context=ros2.ctx_core)
+        ros2.executor_robot.add_node(self._node)
+        ros2.executor_core.add_node(self._pub_node)
+        self._publisher = self._pub_node.create_publisher(
+            String, f"/{namespace}/state/motion_command_trace", _RELIABLE
+        )
+        self._lock = threading.RLock()
+        self._velocity_commands = deque(maxlen=capacity)
+        self._motion_requests = deque(maxlen=capacity)
+        self._gamepad_inputs = deque(maxlen=capacity)
+        self._odometry_samples = deque(maxlen=capacity)
+        self._velocity_count = 0
+        self._motion_count = 0
+        self._gamepad_count = 0
+        self._odometry_count = 0
+        self._velocity_updated: float | None = None
+        self._motion_updated: float | None = None
+        self._gamepad_updated: float | None = None
+        self._odometry_updated: float | None = None
+
+    def _max_reasonable_speed(self) -> float:
+        control = self._config.get("control", {})
+        max_vx = abs(float(control.get("max_vx", 3.0)))
+        max_vy = abs(float(control.get("max_vy", 1.0)))
+        # Leave a small margin for measured odometry noise while still rejecting
+        # ODIN2-internal values that are not robot m/s velocity on T800.
+        return max(1.0, math.hypot(max_vx, max_vy) * 1.5)
+
+    def _is_valid_speed(self, speed: float) -> bool:
+        return math.isfinite(speed) and 0.0 <= speed <= self._max_reasonable_speed()
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "motion_command_trace",
+            "type": "sensor",
+            "multiInstance": False,
+            "readOnly": True,
+            "description": "输出 T800 当前速度，兼容手柄、驱动指令和里程计来源",
+            "inputSchema": action_schema(
+                _with_lifecycle({
+                    "status": ([], "返回适合画布验收的简洁速度状态"),
+                    "debug": ([], "返回最近命令、手柄、里程计原始摘要，供研发排查"),
+                }),
+                {},
+                "运动速度查询",
+            ),
+            "topic_out": [{"topic": f"/{self._ns}/state/motion_command_trace", "format": "data/json"}],
+        }
+
+    def start(self) -> None:
+        from interface_protocol.msg import BodyVelCmd, GamepadKeys, MotionStateRequest
+        from nav_msgs.msg import Odometry
+
+        topics = self._config["topics"]
+        self._node.create_subscription(
+            BodyVelCmd, topics["body_velocity"], self._on_velocity, _RELIABLE
+        )
+        self._node.create_subscription(
+            MotionStateRequest, topics["motion_request"], self._on_motion_request, _RELIABLE_ONE
+        )
+        self._node.create_subscription(
+            GamepadKeys, topics["gamepad"], self._on_gamepad, _BEST_EFFORT
+        )
+        odometry_topic = str(topics.get("odometry", "")).strip()
+        if odometry_topic:
+            self._node.create_subscription(
+                Odometry, odometry_topic, self._on_odometry, _BEST_EFFORT
+            )
+        self._pub_node.create_timer(0.2, self._publish)
+
+    def stop(self) -> None:
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "info":
+            return _with_topic_out(self._snapshot(), f"/{self._ns}/state/motion_command_trace")
+        if action in ("motion_command_trace", "status", "start"):
+            return self._snapshot()
+        if action == "debug":
+            return self._debug_snapshot()
+        if action == "stop":
+            return {"state": "idle"}
+        return {"error": f"unknown motion trace action: {action}"}
+
+    def _on_velocity(self, msg) -> None:
+        entry = {
+            "linear_velocity": [float(value) for value in msg.linear_velocity],
+            "yaw_velocity": float(msg.yaw_velocity),
+            "timestamp_ms": _now_ms(),
+        }
+        with self._lock:
+            self._velocity_commands.append(entry)
+            self._velocity_count += 1
+            self._velocity_updated = time.monotonic()
+
+    def _on_motion_request(self, msg) -> None:
+        entry = {"target_motion_name": str(msg.target_motion_name), "timestamp_ms": _now_ms()}
+        with self._lock:
+            self._motion_requests.append(entry)
+            self._motion_count += 1
+            self._motion_updated = time.monotonic()
+
+    def _on_gamepad(self, msg) -> None:
+        analog = [float(value) for value in msg.analog_states]
+        max_vx = abs(float(self._config.get("control", {}).get("max_vx", 3.0)))
+        max_vy = abs(float(self._config.get("control", {}).get("max_vy", 1.0)))
+        stick_x = analog[2] if len(analog) > 2 else 0.0
+        stick_y = analog[3] if len(analog) > 3 else 0.0
+        yaw_x = analog[4] if len(analog) > 4 else 0.0
+        estimated_speed = math.hypot(stick_y * max_vx, stick_x * max_vy)
+        entry = {
+            "hardware_connected": bool(msg.hardware_connected),
+            "control_source": _gamepad_control_source(msg),
+            "digital_pressed": [index for index, value in enumerate(msg.digital_states) if int(value) != 0],
+            "buttons": _pressed_gamepad_buttons(msg.digital_states),
+            "analog_states": analog,
+            "left_stick": {"x": stick_x if len(analog) > 2 else None, "y": stick_y if len(analog) > 3 else None},
+            "right_stick": {"x": analog[4] if len(analog) > 4 else None, "y": analog[5] if len(analog) > 5 else None},
+            "direction": _motion_direction(stick_x, stick_y, yaw_x),
+            "estimated_speed_m_s": estimated_speed,
+            "timestamp_ms": _now_ms(),
+        }
+        with self._lock:
+            self._gamepad_inputs.append(entry)
+            self._gamepad_count += 1
+            self._gamepad_updated = time.monotonic()
+
+    def _on_odometry(self, msg) -> None:
+        linear = msg.twist.twist.linear
+        angular = msg.twist.twist.angular
+        vx, vy, vz = float(linear.x), float(linear.y), float(linear.z)
+        speed = math.sqrt(vx * vx + vy * vy + vz * vz)
+        entry = {
+            "frame_id": str(getattr(msg.header, "frame_id", "")),
+            "child_frame_id": str(getattr(msg, "child_frame_id", "")),
+            "linear_velocity": {"x": vx, "y": vy, "z": vz},
+            "speed_m_s": speed,
+            "valid": self._is_valid_speed(speed),
+            "angular_velocity": {"x": float(angular.x), "y": float(angular.y), "z": float(angular.z)},
+            "yaw_rate_rad_s": float(angular.z),
+            "timestamp_ms": _now_ms(),
+        }
+        with self._lock:
+            self._odometry_samples.append(entry)
+            self._odometry_count += 1
+            self._odometry_updated = time.monotonic()
+
+    def _snapshot(self) -> dict:
+        now = time.monotonic()
+        with self._lock:
+            velocity = self._velocity_commands[-1] if self._velocity_commands else None
+            gamepad = self._gamepad_inputs[-1] if self._gamepad_inputs else None
+            odometry = self._odometry_samples[-1] if self._odometry_samples else None
+            velocity_updated = self._velocity_updated
+            gamepad_updated = self._gamepad_updated
+            odometry_updated = self._odometry_updated
+        timeout_sec = float(self._config["ros"].get("source_timeout_sec", 1.0))
+        odometry_age = None if odometry_updated is None else max(0.0, now - odometry_updated)
+        velocity_age = None if velocity_updated is None else max(0.0, now - velocity_updated)
+        gamepad_age = None if gamepad_updated is None else max(0.0, now - gamepad_updated)
+
+        source = "none"
+        speed = 0.0
+        age_sec = None
+        odometry_valid = bool(odometry and odometry.get("valid", False))
+        odometry_fresh = odometry_valid and odometry_age is not None and odometry_age <= timeout_sec
+        velocity_fresh = velocity is not None and velocity_age is not None and velocity_age <= timeout_sec
+        use_odometry = odometry_fresh or (
+            odometry_valid
+            and not velocity_fresh
+            and (velocity_age is None or (odometry_age is not None and odometry_age <= velocity_age))
+        )
+        if use_odometry:
+            source = "odometry"
+            speed = float(odometry.get("speed_m_s", 0.0))
+            age_sec = odometry_age
+        elif velocity is not None:
+            source = "body_velocity_command"
+            values = [float(value) for value in velocity.get("linear_velocity", [])]
+            speed = math.sqrt(sum(value * value for value in values))
+            age_sec = velocity_age
+        elif gamepad is not None:
+            source = str(gamepad.get("control_source", "gamepad"))
+            speed = float(gamepad.get("estimated_speed_m_s", 0.0))
+            age_sec = gamepad_age
+
+        stale = age_sec is None or age_sec > timeout_sec
+        speed_rounded = round(speed, 2)
+        motion_state = "moving" if speed_rounded >= 0.03 else "stopped"
+        state = "no_data" if source == "none" else ("stale" if stale else "running")
+        return {
+            "state": state,
+            "speed": f"{speed_rounded:.2f} m/s",
+            "motion_state": motion_state,
+            "source": source,
+            "direction": "none" if gamepad is None else str(gamepad.get("direction", "none")),
+            "gamepad_connected": None if gamepad is None else bool(gamepad.get("hardware_connected")),
+            "age_sec": None if age_sec is None else round(age_sec, 1),
+            "timestamp_ms": _now_ms(),
+        }
+
+    def _debug_snapshot(self) -> dict:
+        now = time.monotonic()
+        with self._lock:
+            velocity = list(self._velocity_commands)
+            motions = list(self._motion_requests)
+            gamepad = list(self._gamepad_inputs)
+            odometry = list(self._odometry_samples)
+            velocity_updated = self._velocity_updated
+            motion_updated = self._motion_updated
+            gamepad_updated = self._gamepad_updated
+            odometry_updated = self._odometry_updated
+            counts = {
+                "body_velocity": self._velocity_count,
+                "motion_request": self._motion_count,
+                "gamepad": self._gamepad_count,
+                "odometry": self._odometry_count,
+            }
+        ages = {
+            "body_velocity": None if velocity_updated is None else max(0.0, now - velocity_updated),
+            "motion_request": None if motion_updated is None else max(0.0, now - motion_updated),
+            "gamepad": None if gamepad_updated is None else max(0.0, now - gamepad_updated),
+            "odometry": None if odometry_updated is None else max(0.0, now - odometry_updated),
+        }
+        return {
+            "state": "running" if velocity or motions or gamepad or odometry else "no_data",
+            "velocity_commands": velocity,
+            "motion_requests": motions,
+            "gamepad_inputs": gamepad,
+            "odometry_samples": odometry,
+            "latest_velocity_command": velocity[-1] if velocity else None,
+            "latest_motion_request": motions[-1] if motions else None,
+            "latest_gamepad_input": gamepad[-1] if gamepad else None,
+            "latest_measured_velocity": odometry[-1] if odometry else None,
+            "last_seen_age_sec": ages,
+            "command_count": {**counts, "total": sum(counts.values())},
+            "timestamp_ms": _now_ms(),
+        }
+
+    def _publish(self) -> None:
+        self._publisher.publish(_json_message(self._snapshot()))
+
+class MotionEventsPlugin:
+    """Read-only event timeline for T800 motion-related MCP calls and feedback."""
+
+    _MOTION_TOOLS = {
+        "loco",
+        "motion_mode",
+        "dance",
+        "joint_plan",
+        "joint_plan_state",
+        "gesture",
+        "joint_override",
+        "joint_bridge",
+        "motor_power",
+        "native_node_control",
+        "virtual_gamepad",
+        "safety",
+        "motion_state",
+    }
+
+    def __init__(self, config: dict, namespace: str, ros2):
+        self._config = config
+        self._ns = namespace
+        capacity = int(config.get("diagnostics", {}).get("motion_events_capacity", 100))
+        self._capacity = max(1, min(capacity, 1000))
+        self._robot_node = Node("t800_motion_events_sub", context=ros2.ctx_robot)
+        self._node = Node("t800_motion_events_pub", context=ros2.ctx_core)
+        ros2.executor_robot.add_node(self._robot_node)
+        ros2.executor_core.add_node(self._node)
+        self._publisher = self._node.create_publisher(
+            String, f"/{namespace}/state/motion_events", _RELIABLE
+        )
+        self._lock = threading.RLock()
+        self._events = deque(maxlen=self._capacity)
+        self._sequence = 0
+        self._moving = False
+        self._latest_speed = 0.0
+        self._latest_speed_source = "none"
+        self._latest_speed_updated: float | None = None
+        self._latest_action = "none"
+        self._latest_buttons: list[str] = []
+        self._latest_control_source = "none"
+        self._latest_direction = "none"
+        self._current_motion_state = "unknown"
+        self._last_motion_state = "unknown"
+        self._last_gamepad_signature = ""
+        self._motion_start_threshold = 0.05
+        self._motion_stop_threshold = 0.03
+
+    def _max_reasonable_speed(self) -> float:
+        control = self._config.get("control", {})
+        max_vx = abs(float(control.get("max_vx", 3.0)))
+        max_vy = abs(float(control.get("max_vy", 1.0)))
+        return max(1.0, math.hypot(max_vx, max_vy) * 1.5)
+
+    def _classify_gamepad_action(self, buttons: list[str], speed: float) -> str:
+        button_set = frozenset(buttons)
+        if button_set in _GAMEPAD_ACTIONS:
+            return _GAMEPAD_ACTIONS[button_set]
+        if speed >= self._motion_start_threshold:
+            return "move"
+        if buttons:
+            return "buttons:" + "+".join(buttons)
+        return "none"
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "motion_events",
+            "type": "sensor",
+            "multiInstance": False,
+            "readOnly": True,
+            "description": "T800 motion event stream — motion state changes and motion command lifecycle events",
+            "inputSchema": action_schema(
+                _with_lifecycle({
+                    "status": ([], "返回最新事件摘要"),
+                    "debug": (["limit", "since_event_id", "source_tool", "severity"], "返回筛选后的事件时间线"),
+                }),
+                {
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 200,
+                        "description": "最多返回事件条数",
+                    },
+                    "since_event_id": {
+                        "type": "string",
+                        "description": "只返回该事件之后的新事件",
+                    },
+                    "source_tool": {
+                        "type": "string",
+                        "description": "按来源 tool 过滤",
+                    },
+                    "severity": {
+                        "type": "string",
+                        "enum": ["debug", "info", "warning", "error"],
+                        "description": "按事件级别过滤",
+                    },
+                },
+                "运动事件查询动作",
+            ),
+            "topic_out": [{"topic": f"/{self._ns}/state/motion_events", "format": "data/json"}],
+        }
+
+    def start(self) -> None:
+        from interface_protocol.msg import BodyVelCmd, GamepadKeys, MotionState, MotionStateRequest
+
+        topics = self._config.get("topics", {})
+        body_velocity_topic = str(topics.get("body_velocity", "")).strip()
+        if body_velocity_topic:
+            self._robot_node.create_subscription(
+                BodyVelCmd, body_velocity_topic, self._on_velocity, _RELIABLE
+            )
+        motion_request_topic = str(topics.get("motion_request", "")).strip()
+        if motion_request_topic:
+            self._robot_node.create_subscription(
+                MotionStateRequest, motion_request_topic, self._on_motion_request, _RELIABLE_ONE
+            )
+        gamepad_topic = str(topics.get("gamepad", "")).strip()
+        if gamepad_topic:
+            self._robot_node.create_subscription(
+                GamepadKeys, gamepad_topic, self._on_gamepad, _BEST_EFFORT
+            )
+        motion_state_topic = str(topics.get("motion_state", "")).strip()
+        if motion_state_topic:
+            self._robot_node.create_subscription(
+                MotionState, motion_state_topic, self._on_motion_state, _BEST_EFFORT
+            )
+        odometry_topic = str(self._config.get("topics", {}).get("odometry", "")).strip()
+        if odometry_topic:
+            from nav_msgs.msg import Odometry
+
+            self._robot_node.create_subscription(
+                Odometry, odometry_topic, self._on_odometry, _BEST_EFFORT
+            )
+        self._node.create_timer(0.2, self._publish)
+
+    def stop(self) -> None:
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "info":
+            return _with_topic_out(self._summary_snapshot(), f"/{self._ns}/state/motion_events")
+        if action in ("motion_events", "status", "start"):
+            return self._summary_snapshot()
+        if action in ("debug", "list"):
+            return self._debug_snapshot(args)
+        if action == "stop":
+            return {"state": "idle"}
+        return {"error": f"unknown motion events action: {action}"}
+
+    def _on_velocity(self, msg) -> None:
+        values = [float(value) for value in msg.linear_velocity]
+        speed = math.sqrt(sum(value * value for value in values))
+        self._handle_speed_sample(
+            speed,
+            source_tool="motion_command_trace",
+            source_kind="body_velocity_command",
+            detail={"linear_velocity": values, "yaw_velocity": float(msg.yaw_velocity)},
+        )
+
+    def _on_motion_request(self, msg) -> None:
+        motion_name = str(msg.target_motion_name)
+        action = _normalize_motion_action(motion_name)
+        with self._lock:
+            self._latest_action = action
+            self._latest_control_source = "motion_request"
+            self._latest_direction = "none"
+        self.record_event(
+            source_tool="motion_command_trace",
+            event_type="motion_request",
+            severity="info",
+            phase="requested",
+            summary=f"motion request: {action} ({motion_name})",
+            detail={
+                "action": action,
+                "target_motion_name": motion_name,
+                "source": self._config.get("topics", {}).get("motion_request"),
+            },
+        )
+
+    def _on_gamepad(self, msg) -> None:
+        analog = [float(value) for value in msg.analog_states]
+        max_vx = abs(float(self._config.get("control", {}).get("max_vx", 3.0)))
+        max_vy = abs(float(self._config.get("control", {}).get("max_vy", 1.0)))
+        stick_x = analog[2] if len(analog) > 2 else 0.0
+        stick_y = analog[3] if len(analog) > 3 else 0.0
+        yaw_x = analog[4] if len(analog) > 4 else 0.0
+        speed = math.hypot(stick_y * max_vx, stick_x * max_vy)
+        buttons = _pressed_gamepad_buttons(msg.digital_states)
+        control_source = _gamepad_control_source(msg)
+        direction = _motion_direction(stick_x, stick_y, yaw_x)
+        action = self._classify_gamepad_action(buttons, speed)
+        signature = f"{control_source}|{action}|{direction}|{','.join(buttons)}|{round(speed, 2):.2f}"
+        should_record_input = (bool(buttons) or speed >= self._motion_start_threshold) and signature != self._last_gamepad_signature
+        with self._lock:
+            self._latest_action = action
+            self._latest_buttons = list(buttons)
+            self._latest_control_source = control_source
+            self._latest_direction = direction
+            self._last_gamepad_signature = signature
+        if should_record_input:
+            self.record_event(
+                source_tool="motion_command_trace",
+                event_type="gamepad_action",
+                severity="info",
+                phase="input",
+                summary=f"{control_source} action: {action}, {direction}, {speed:.2f} m/s",
+                detail={
+                    "action": action,
+                    "buttons": buttons,
+                    "control_source": control_source,
+                    "direction": direction,
+                    "speed": f"{speed:.2f} m/s",
+                    "source": self._config.get("topics", {}).get("gamepad"),
+                },
+            )
+        self._handle_speed_sample(
+            speed,
+            source_tool="motion_command_trace",
+            source_kind="gamepad",
+            detail={
+                "hardware_connected": bool(msg.hardware_connected),
+                "action": action,
+                "buttons": buttons,
+                "control_source": control_source,
+                "direction": direction,
+                "left_stick": {"x": stick_x if len(analog) > 2 else None, "y": stick_y if len(analog) > 3 else None},
+                "source": self._config.get("topics", {}).get("gamepad"),
+            },
+        )
+
+    def _on_motion_state(self, msg) -> None:
+        current = str(getattr(msg, "current_motion_task", "") or "unknown")
+        action = _normalize_motion_action(current)
+        with self._lock:
+            previous = self._current_motion_state
+            self._last_motion_state = previous
+            self._current_motion_state = current
+            self._latest_action = action
+            self._latest_control_source = "motion_state"
+            self._latest_direction = "none"
+        if current and current != "unknown" and current != previous:
+            self.record_event(
+                source_tool="motion_state",
+                event_type="motion_state_changed",
+                severity="info",
+                phase="confirmed",
+                summary=f"motion state: {action} ({current})",
+                detail={"action": action, "previous": previous, "current": current},
+            )
+
+    def _on_odometry(self, msg) -> None:
+        linear = msg.twist.twist.linear
+        vx, vy, vz = float(linear.x), float(linear.y), float(linear.z)
+        speed = math.sqrt(vx * vx + vy * vy + vz * vz)
+        if not math.isfinite(speed) or speed > self._max_reasonable_speed():
+            return
+        self._handle_speed_sample(
+            speed,
+            source_tool="motion_command_trace",
+            source_kind="odometry",
+            detail={
+                "linear_velocity": {"x": vx, "y": vy, "z": vz},
+                "source": self._config.get("topics", {}).get("odometry"),
+            },
+        )
+
+    def _handle_speed_sample(self, speed: float, *, source_tool: str, source_kind: str, detail: dict) -> None:
+        if not math.isfinite(speed) or speed < 0.0 or speed > self._max_reasonable_speed():
+            return
+        with self._lock:
+            moving = self._moving
+            if not moving and speed >= self._motion_start_threshold:
+                self._moving = True
+                event = "motion_start"
+            elif moving and speed <= self._motion_stop_threshold:
+                self._moving = False
+                event = "motion_stop"
+            else:
+                event = ""
+            self._latest_speed = speed
+            self._latest_speed_source = source_kind
+            self._latest_speed_updated = time.monotonic()
+            if source_kind != "gamepad":
+                self._latest_control_source = source_kind
+                self._latest_direction = "none"
+        if not event:
+            return
+        event_phase = "running" if event == "motion_start" else "completed"
+        self.record_event(
+            source_tool=source_tool,
+            event_type=event,
+            severity="info",
+            phase=event_phase,
+            summary=f"{event} detected from {source_kind} speed {speed:.2f} m/s",
+            detail={"speed": f"{speed:.2f} m/s", "source_kind": source_kind, **detail},
+        )
+
+    def record_tool_call(self, tool_name: str, action: str, args: dict, result: dict) -> None:
+        if tool_name not in self._MOTION_TOOLS:
+            return
+        event_type, severity, phase = self._classify(tool_name, action, result)
+        self.record_event(
+            source_tool=tool_name,
+            event_type=event_type,
+            severity=severity,
+            phase=phase,
+            summary=self._summary(tool_name, action, result),
+            detail={
+                "action": action,
+                "arguments": self._compact_value(args),
+                "result": self._compact_value(result),
+            },
+        )
+
+    def record_exception(self, tool_name: str, action: str, args: dict, exc: Exception) -> None:
+        if tool_name not in self._MOTION_TOOLS:
+            return
+        self.record_event(
+            source_tool=tool_name,
+            event_type="dispatch_exception",
+            severity="error",
+            phase="failed",
+            summary=f"{tool_name}.{action} raised {type(exc).__name__}",
+            detail={"action": action, "arguments": self._compact_value(args), "error": str(exc)},
+        )
+
+    def record_event(
+        self,
+        *,
+        source_tool: str,
+        event_type: str,
+        severity: str,
+        phase: str,
+        summary: str,
+        detail: dict | None = None,
+    ) -> dict:
+        with self._lock:
+            self._sequence += 1
+            event_id = f"t800-motion-{self._sequence:06d}"
+            timestamp_ms = _now_ms()
+            event = {
+                "type": event_type,
+                "timestamp": round(timestamp_ms / 1000.0, 3),
+                "event_id": event_id,
+                "timestamp_ms": timestamp_ms,
+                "source_tool": source_tool,
+                "event_type": event_type,
+                "severity": severity,
+                "phase": phase,
+                "summary": summary,
+                "detail": detail or {},
+            }
+            self._events.append(event)
+            return dict(event)
+
+    def _summary_snapshot(self) -> dict:
+        now = time.monotonic()
+        with self._lock:
+            latest_event = dict(self._events[-1]) if self._events else None
+            events = [dict(event) for event in self._events]
+            total_recorded = self._sequence
+            moving = self._moving
+            latest_speed = self._latest_speed
+            latest_speed_source = self._latest_speed_source
+            latest_speed_updated = self._latest_speed_updated
+            latest_action = self._latest_action
+            latest_buttons = list(self._latest_buttons)
+            latest_control_source = self._latest_control_source
+            latest_direction = self._latest_direction
+            current_motion_state = self._current_motion_state
+        speed_age = None if latest_speed_updated is None else max(0.0, now - latest_speed_updated)
+        display_action = latest_action
+        display_control_source = latest_control_source
+        if display_action == "none" and current_motion_state not in ("", "unknown"):
+            display_action = _normalize_motion_action(current_motion_state)
+            display_control_source = "motion_state"
+        return {
+            "state": "running" if latest_event or latest_speed_updated is not None else "no_data",
+            "motion_state": "moving" if moving else "stopped",
+            "speed": f"{round(latest_speed, 2):.2f} m/s",
+            "speed_source": latest_speed_source,
+            "control_source": display_control_source,
+            "action": display_action,
+            "direction": latest_direction,
+            "buttons": latest_buttons,
+            "current_motion_state": current_motion_state,
+            "event": None if latest_event is None else latest_event.get("type"),
+            "summary": None if latest_event is None else latest_event.get("summary"),
+            "event_id": None if latest_event is None else latest_event.get("event_id"),
+            "event_count": total_recorded,
+        }
+
+    def _debug_snapshot(self, args: dict | None = None) -> dict:
+        args = args or {}
+        limit = int(args.get("limit", 50))
+        limit = max(1, min(limit, 200))
+        since_event_id = str(args.get("since_event_id", "") or "")
+        source_tool = str(args.get("source_tool", "") or "")
+        severity = str(args.get("severity", "") or "")
+        with self._lock:
+            events = [dict(event) for event in self._events]
+            total_buffered = len(self._events)
+            latest_event_id = events[-1]["event_id"] if events else None
+            total_recorded = self._sequence
+        if since_event_id:
+            events = self._after_event(events, since_event_id)
+        if source_tool:
+            events = [event for event in events if event["source_tool"] == source_tool]
+        if severity:
+            events = [event for event in events if event["severity"] == severity]
+        events = events[-limit:]
+        warning_count = sum(1 for event in events if event["severity"] == "warning")
+        error_count = sum(1 for event in events if event["severity"] == "error")
+        return {
+            "state": "running" if events else "no_data",
+            "ok": True,
+            "robot": "t800",
+            "tool": "motion_events",
+            "events": events,
+            "summary": {
+                "capacity": self._capacity,
+                "total_recorded": total_recorded,
+                "total_buffered": total_buffered,
+                "returned": len(events),
+                "latest_event_id": latest_event_id,
+                "warning_count": warning_count,
+                "error_count": error_count,
+            },
+            "timestamp_ms": _now_ms(),
+        }
+
+    @staticmethod
+    def _after_event(events: list[dict], since_event_id: str) -> list[dict]:
+        for index, event in enumerate(events):
+            if event["event_id"] == since_event_id:
+                return events[index + 1:]
+        return events
+
+    @staticmethod
+    def _classify(tool_name: str, action: str, result: dict) -> tuple[str, str, str]:
+        if "error" in result:
+            return "command_rejected", "warning", "rejected"
+        state = str(result.get("state", "completed"))
+        if state in ("timeout", "error", "failed"):
+            return "command_failed", "error", "failed"
+        if state == "rejected":
+            return "command_rejected", "warning", "rejected"
+        if action in ("status", "info", "start") or tool_name in ("motion_state", "joint_plan_state"):
+            return "status_read", "debug", "completed"
+        if action in ("stop", "stop_move", "stop_dance", "stop_gesture", "release", "stop_command", "soft_stop"):
+            return "motion_stop", "info", "completed"
+        if tool_name == "safety":
+            return "safety_request", "warning", "dispatch"
+        return "command_requested", "info", "dispatch"
+
+    @staticmethod
+    def _summary(tool_name: str, action: str, result: dict) -> str:
+        if "error" in result:
+            return f"{tool_name}.{action} rejected: {result['error']}"
+        state = result.get("state", "completed")
+        target = result.get("target") or result.get("target_motion") or result.get("node_name")
+        suffix = f" -> {target}" if target else ""
+        return f"{tool_name}.{action} {state}{suffix}"
+
+    @classmethod
+    def _compact_value(cls, value):
+        if isinstance(value, dict):
+            return {
+                str(key): cls._compact_value(inner)
+                for key, inner in value.items()
+                if not str(key).startswith("_")
+            }
+        if isinstance(value, (list, tuple)):
+            if len(value) > 8:
+                return {"length": len(value), "preview": [cls._compact_value(item) for item in value[:8]]}
+            return [cls._compact_value(item) for item in value]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return str(value)
+
+    def _publish(self) -> None:
+        self._publisher.publish(_json_message(self._summary_snapshot()))
+
+class NativeInterfaceProbePlugin:
+    _NAME_KEYWORDS = ("engineai", "motion", "hardware")
+    _PRIORITY_RANK = {"high": 3, "medium": 2, "low": 1}
+
+    def __init__(self, config: dict, namespace: str, ros2):
+        self._config = config
+        self._ns = namespace
+        self._node = Node("t800_native_interface_probe", context=ros2.ctx_robot)
+        self._pub_node = Node("t800_native_interface_probe_pub", context=ros2.ctx_core)
+        ros2.executor_robot.add_node(self._node)
+        ros2.executor_core.add_node(self._pub_node)
+        self._publisher = self._pub_node.create_publisher(
+            String, f"/{namespace}/state/native_interface_probe", _RELIABLE
+        )
+        self._latest_scan: dict | None = None
+        self._last_scan_at = 0.0
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "native_interface_probe",
+            "type": "sensor",
+            "multiInstance": False,
+            "readOnly": True,
+            "description": "扫描 T800 ROS 图，汇总已映射与未映射原生接口",
+            "inputSchema": action_schema(
+                _with_lifecycle({
+                    "scan": ([], "扫描 ROS2 topic/service 并输出适合画布验收的摘要"),
+                    "debug": ([], "输出完整 topic/service/mapped/unmapped 清单，供研发排查"),
+                }),
+                {},
+                "原生接口探测动作",
+            ),
+            "topic_out": [{"topic": f"/{self._ns}/state/native_interface_probe", "format": "data/json"}],
+        }
+
+    def start(self) -> None:
+        self._pub_node.create_timer(1.0, self._publish)
+
+    def stop(self) -> None:
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "info":
+            return _with_topic_out(self._scan(), f"/{self._ns}/state/native_interface_probe")
+        if action in ("native_interface_probe", "scan", "status", "start"):
+            return self._scan()
+        if action == "debug":
+            return self._scan(debug=True)
+        if action == "stop":
+            return {"state": "idle"}
+        return {"error": f"unknown native interface probe action: {action}"}
+
+    def _scan(self, debug: bool = False) -> dict:
+        topics = self._graph("get_topic_names_and_types")
+        services = self._graph("get_service_names_and_types")
+        configured_topics = set(self._config.get("topics", {}).values())
+        configured_services = set(self._config.get("services", {}).values())
+        mapped, unmapped = [], []
+        for name, types in topics:
+            for message_type in types:
+                if not self._is_relevant(name, message_type):
+                    continue
+                candidate = {
+                    "kind": "topic", "name": name, "message_type": message_type,
+                    "publishers": self._count("count_publishers", name),
+                    "subscribers": self._count("count_subscribers", name),
+                    "suggested_priority": self._priority(name, message_type),
+                }
+                (mapped if name in configured_topics else unmapped).append(candidate)
+        for name, types in services:
+            for service_type in types:
+                if not self._is_relevant(name, service_type):
+                    continue
+                candidate = {
+                    "kind": "service", "name": name, "message_type": service_type,
+                    "servers": self._count("count_services", name),
+                    "clients": self._count("count_clients", name),
+                    "suggested_priority": self._priority(name, service_type),
+                }
+                (mapped if name in configured_services else unmapped).append(candidate)
+        result = {
+            "state": "available" if topics or services else "no_data",
+            "topics": [{"name": name, "types": list(types)} for name, types in topics],
+            "services": [{"name": name, "types": list(types)} for name, types in services],
+            "mapped": mapped,
+            "unmapped_candidates": unmapped,
+            "topic_count": len(topics),
+            "service_count": len(services),
+            "timestamp_ms": _now_ms(),
+        }
+        compact = self._compact_scan(result)
+        self._latest_scan = compact
+        self._last_scan_at = time.monotonic()
+        return result if debug else compact
+
+    @classmethod
+    def _compact_scan(cls, result: dict) -> dict:
+        unmapped = sorted(
+            result.get("unmapped_candidates", []),
+            key=lambda item: cls._PRIORITY_RANK.get(str(item.get("suggested_priority")), 0),
+            reverse=True,
+        )
+        high_priority = [
+            {
+                "kind": item.get("kind"),
+                "name": item.get("name"),
+                "type": item.get("message_type"),
+                "priority": item.get("suggested_priority"),
+            }
+            for item in unmapped[:5]
+        ]
+        return {
+            "state": result.get("state"),
+            "topic_count": result.get("topic_count", 0),
+            "service_count": result.get("service_count", 0),
+            "mapped_count": len(result.get("mapped", [])),
+            "unmapped_count": len(result.get("unmapped_candidates", [])),
+            "top_unmapped": high_priority,
+            "summary_text": (
+                f"{result.get('topic_count', 0)} topics, "
+                f"{result.get('service_count', 0)} services, "
+                f"{len(result.get('unmapped_candidates', []))} unmapped"
+            ),
+            "timestamp_ms": result.get("timestamp_ms", _now_ms()),
+        }
+
+    def _publish(self) -> None:
+        payload = self._latest_scan
+        if payload is None or time.monotonic() - self._last_scan_at > 5.0:
+            payload = self._scan()
+        self._publisher.publish(_json_message(payload))
+
+    def _graph(self, method: str) -> list:
+        callback = getattr(self._node, method, None)
+        if callback is None:
+            return []
+        try:
+            return list(callback())
+        except Exception:
+            return []
+
+    def _count(self, method: str, name: str) -> int:
+        callback = getattr(self._node, method, None)
+        if callback is None:
+            return 0
+        try:
+            return int(callback(name))
+        except Exception:
+            return 0
+
+    @classmethod
+    def _is_relevant(cls, name: str, interface_type: str) -> bool:
+        lowered_name = name.lower()
+        lowered_type = interface_type.lower()
+        return "interface_protocol" in lowered_type or any(
+            keyword in lowered_name or keyword in lowered_type for keyword in cls._NAME_KEYWORDS
+        )
+
+    @staticmethod
+    def _priority(name: str, interface_type: str) -> str:
+        lowered_type = interface_type.lower()
+        lowered_name = name.lower()
+        if "interface_protocol" in lowered_type:
+            return "high"
+        if "motion" in lowered_name or "hardware" in lowered_name:
+            return "medium"
+        return "low"
 
 class LocomotionPlugin:
     def __init__(self, config: dict, namespace: str, ros2, state: StatePlugin):
@@ -877,7 +2163,10 @@ class JointPlanPlugin:
             return {"state": "running" if args.get("_tool_name") == "joint_plan_state" else "ready"}
         if action in ("info", "status", "joint_plan_state"):
             with self._state_lock:
-                return dict(self._last_state)
+                snapshot = dict(self._last_state)
+            if args.get("_tool_name") == "joint_plan_state" or action == "joint_plan_state":
+                return _with_topic_out(snapshot, self._core_topic)
+            return snapshot
         if action == "stop":
             return {"state": "idle"}
         if action == "reset":
@@ -1488,8 +2777,12 @@ class MotorPowerPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action in ("start", "info"):
+            available = bool(self._client and self._client.service_is_ready())
+            if action == "start" and not available:
+                return {"state": "error", "message": "motor enable service is unavailable",
+                        "service": self._config["services"]["enable_motor"], "available": False}
             return {"state": "ready", "service": self._config["services"]["enable_motor"],
-                    "available": bool(self._client and self._client.service_is_ready())}
+                    "available": available}
         if action == "stop":
             return {"state": "idle"}
         if action not in ("enable", "disable"):
@@ -1707,3 +3000,422 @@ class SafetyControlPlugin:
         msg.damping = [1.0] * len(T800_JOINT_NAMES)
         msg.parallel_parser_type = 0
         self._joint_pub.publish(msg)
+
+
+class MicPlugin:
+    """Capture the T800 microphone through the vendor-owned PulseAudio server."""
+
+    _CHUNK_SAMPLES = 512  # 16 kHz 下 1024 字节 = 512 samples
+    _CHUNK_BYTES = 1024
+
+    def __init__(self, config: dict, namespace: str, ros2):
+        self._config = config
+        self._ns = namespace
+        self._topic = f"/{namespace}/mic/audio"
+        self._node = Node("t800_mic", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._node)
+        self._publisher = None
+        self._message_type = None
+        self._header_type = None
+        self._running = False
+        self._process = None
+        self._thread = None
+        self._samples_published = 0
+        self._last_error = ""
+
+    def get_tool(self) -> dict:
+        return sensor_tool(
+            "mic",
+            f"T800 内置麦克风，经 PulseAudio 采集 PCM-16 16kHz 单声道并发布到 {self._topic}",
+            self._topic,
+            "audio/pcm-16k",
+        )
+
+    def start(self) -> None:
+        if self._running:
+            return
+        if self._publisher is None:
+            from audio_msgs.msg import AudioChunk
+            from std_msgs.msg import Header
+
+            self._message_type = AudioChunk
+            self._header_type = Header
+            self._publisher = self._node.create_publisher(AudioChunk, self._topic, _BEST_EFFORT)
+
+        try:
+            self._check_pulse()
+            self._process = self._spawn_capture()
+        except Exception as exc:
+            self._last_error = str(exc)
+            raise RuntimeError(f"PulseAudio capture is unavailable: {exc}") from exc
+        if self._process.poll() is not None:
+            self._last_error = f"parec exited with code {self._process.returncode}"
+            self._process = None
+            raise RuntimeError(self._last_error)
+        self._running = True
+        self._thread = threading.Thread(target=self._capture_loop, daemon=True, name="t800-mic")
+        self._thread.start()
+
+    def _spawn_capture(self):
+        return subprocess.Popen(
+            ["parec", "--raw", "--format=s16le", "--rate=16000", "--channels=1",
+             "--latency-msec=50"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
+        )
+
+    def _check_pulse(self) -> None:
+        subprocess.run(["pactl", "info"], capture_output=True, text=True, timeout=3, check=True)
+
+    def stop(self) -> None:
+        self._running = False
+        process = self._process
+        self._process = None
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+                process.wait(timeout=1)
+            except Exception:
+                process.kill()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1)
+        self._thread = None
+
+    def _capture_loop(self) -> None:
+        pending = bytearray()
+        process = self._process
+        try:
+            while self._running and process is not None and process.stdout is not None:
+                data = process.stdout.read(self._CHUNK_BYTES - len(pending))
+                if not data:
+                    if process.poll() is not None:
+                        break
+                    continue
+                pending.extend(data)
+                if len(pending) == self._CHUNK_BYTES:
+                    self._publish_chunk(bytes(pending))
+                    pending.clear()
+        except Exception as exc:  # noqa: BLE001
+            self._last_error = str(exc)
+        finally:
+            if self._running and process is not None and process.poll() is not None:
+                self._last_error = f"parec exited with code {process.returncode}"
+                self._running = False
+
+    def _publish_chunk(self, chunk: bytes) -> None:
+        msg = self._message_type()
+        msg.header = self._header_type()
+        msg.header.stamp = self._node.get_clock().now().to_msg()
+        msg.format = "audio/pcm-16k"
+        msg.data = list(chunk)
+        self._publisher.publish(msg)
+        self._samples_published += len(chunk) // 2
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "start":
+            try:
+                self.start()
+            except RuntimeError as exc:
+                message = f"mic capture failed: {exc}"
+                return {"state": "error", "message": message, "error": message}
+            if self._running:
+                return {"state": "running", "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}]}
+            message = f"mic capture failed: {self._last_error or 'no audio device'}"
+            return {"state": "error", "message": message, "error": message}
+        if action == "stop":
+            self.stop()
+            return {"state": "idle"}
+        if action in ("info", "status"):
+            return {"state": "running" if self._running else "idle",
+                    "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}],
+                    "samples_published": self._samples_published,
+                    "last_error": self._last_error}
+        return {"error": f"unknown mic action: {action}"}
+
+
+class VisionPlugin:
+    """T800-Odin2 激光雷达相机视觉数据桥接（飞书文档 7.2 节）。
+
+    Subscribes to the Odin2 raw/SLAM point clouds, stereo compressed images
+    and the calibrated ``32FC1`` depth image published by the official
+    ``pcd2depth_ros2_node`` on the Orin board.  It republishes normalized
+    streams on domain 42 for Agent Core and the dashboard renderers
+    (``sensor/pointcloud``, ``image/jpeg``, ``image/depth-z16``).  Topic names
+    follow the per-device prefix ``/{topic_prefix}/{model}/device{N}/`` and
+    must be calibrated against ``ros_graph`` on the real robot.
+    """
+
+    _SOURCES = ("raw", "slam")
+    _TOOL_NAMES = ("pointcloud", "camera", "depth")
+    _DEPTH_WIDTH = 640
+    _DEPTH_HEIGHT = 480
+
+    def __init__(self, config: dict, namespace: str, ros2):
+        self._config = config
+        self._ns = namespace
+        self._topics = config["topics"]
+        vision_config = config.get("plugins", {}).get("vision", {}) or {}
+        self._source = vision_config.get("source", "raw")
+        if self._source not in self._SOURCES:
+            self._source = "raw"
+        self._cloud_topic = f"/{namespace}/vision/cloud"
+        self._cam_left_topic = f"/{namespace}/vision/camera_left"
+        self._cam_right_topic = f"/{namespace}/vision/camera_right"
+        self._depth_topic = f"/{namespace}/vision/depth"
+        self._sub_node = Node("t800_vision_sub", context=ros2.ctx_robot)
+        self._pub_node = Node("t800_vision_pub", context=ros2.ctx_core)
+        ros2.executor_robot.add_node(self._sub_node)
+        ros2.executor_core.add_node(self._pub_node)
+        self._running = False
+        self._initialized = False
+        self._enabled_tools: set[str] = set()
+        self._lock = threading.RLock()
+        self._frames = {"pointcloud": 0, "camera_left": 0, "camera_right": 0, "depth": 0}
+
+    def get_tools(self) -> list[dict]:
+        return [self._cloud_tool(), self._camera_tool(), self._depth_tool()]
+
+    def _cloud_tool(self) -> dict:
+        tool = sensor_tool(
+            "pointcloud",
+            f"T800-Odin2 {self._source} 点云转发（256×192）；二进制 [uint32 point_step][uint32 total_points]"
+            f"[PointCloud2 bytes]，发布到 {self._cloud_topic}",
+            self._cloud_topic,
+            "sensor/pointcloud",
+        )
+        schema = action_schema(
+            _with_lifecycle({
+                "status": ([], "返回点云流状态"),
+                "select_source": (["source"], "切换 Odin2 raw 或 SLAM 点云源"),
+            }),
+            {"source": {"type": "string", "enum": list(self._SOURCES)}},
+            "点云生命周期和数据源选择",
+        )
+        schema.pop("required", None)
+        tool["inputSchema"] = schema
+        return tool
+
+    def _camera_tool(self) -> dict:
+        return {
+            "name": "camera",
+            "type": "sensor",
+            "multiInstance": False,
+            "readOnly": True,
+            "description": f"T800-Odin2 双目 JPEG 图像转发，发布到 {self._cam_left_topic}（左）和"
+                           f" {self._cam_right_topic}（右）",
+            "inputSchema": sensor_action_schema(),
+            "topic_out": [
+                {"topic": self._cam_left_topic, "format": "image/jpeg"},
+                {"topic": self._cam_right_topic, "format": "image/jpeg"},
+            ],
+        }
+
+    def _depth_tool(self) -> dict:
+        return sensor_tool(
+            "depth",
+            f"T800-Odin2 官方标定深度图（640×480，毫米 16UC1），发布到 {self._depth_topic}",
+            self._depth_topic,
+            "image/depth-z16",
+        )
+
+    def start(self) -> None:
+        if self._running:
+            return
+        if self._initialized:
+            self._enabled_tools.update(self._TOOL_NAMES)
+            self._running = True
+            return
+        import array as _array
+        import struct as _struct
+        import numpy as _np
+        from sensor_msgs.msg import CompressedImage, Image, PointCloud2
+        from std_msgs.msg import UInt8MultiArray
+
+        self._running = True
+        self._struct = _struct
+        self._np = _np
+        self._image_type = Image
+        self._array = _array
+        self._multi_type = UInt8MultiArray
+        self._cloud_pub = self._pub_node.create_publisher(UInt8MultiArray, self._cloud_topic, _BEST_EFFORT)
+        self._cam_left_pub = self._pub_node.create_publisher(CompressedImage, self._cam_left_topic, _BEST_EFFORT)
+        self._cam_right_pub = self._pub_node.create_publisher(CompressedImage, self._cam_right_topic, _BEST_EFFORT)
+        self._depth_pub = self._pub_node.create_publisher(Image, self._depth_topic, _BEST_EFFORT)
+        self._sub_node.create_subscription(
+            PointCloud2, self._topics["vision_cloud_raw"], self._on_cloud_raw, _BEST_EFFORT
+        )
+        self._sub_node.create_subscription(
+            PointCloud2, self._topics["vision_cloud_slam"], self._on_cloud_slam, _BEST_EFFORT
+        )
+        self._sub_node.create_subscription(
+            CompressedImage, self._topics["vision_camera_left"], self._on_camera_left, _BEST_EFFORT
+        )
+        self._sub_node.create_subscription(
+            CompressedImage, self._topics["vision_camera_right"], self._on_camera_right, _BEST_EFFORT
+        )
+        self._sub_node.create_subscription(
+            Image, self._topics["vision_depth"], self._on_depth, _RELIABLE
+        )
+        self._initialized = True
+        self._enabled_tools.update(self._TOOL_NAMES)
+
+    def stop(self) -> None:
+        self._running = False
+        self._enabled_tools.clear()
+
+    def _on_cloud_raw(self, msg) -> None:
+        self._on_cloud(msg, "raw")
+
+    def _on_cloud_slam(self, msg) -> None:
+        self._on_cloud(msg, "slam")
+
+    def _on_cloud(self, msg, source: str) -> None:
+        if not self._running or "pointcloud" not in self._enabled_tools or source != self._source:
+            return
+        data = bytes(msg.data)
+        if not data:
+            return
+        point_step = int(msg.point_step) or 1
+        header = self._struct.pack("<II", point_step, len(data) // point_step)
+        buf = bytearray(8 + len(data))
+        buf[:8] = header
+        buf[8:] = data
+        out = self._multi_type()
+        out.data = self._array.array("B", buf)
+        self._cloud_pub.publish(out)
+        self._frames["pointcloud"] += 1
+
+    def _on_camera_left(self, msg) -> None:
+        if not self._running or "camera" not in self._enabled_tools:
+            return
+        self._cam_left_pub.publish(msg)
+        self._frames["camera_left"] += 1
+
+    def _on_camera_right(self, msg) -> None:
+        if not self._running or "camera" not in self._enabled_tools:
+            return
+        self._cam_right_pub.publish(msg)
+        self._frames["camera_right"] += 1
+
+    def _on_depth(self, msg) -> None:
+        if not self._running or "depth" not in self._enabled_tools:
+            return
+        width = int(msg.width)
+        height = int(msg.height)
+        encoding = str(msg.encoding).upper()
+        if encoding == "32FC1":
+            item_size = 4
+            dtype = "f4"
+        elif encoding in ("16UC1", "MONO16"):
+            item_size = 2
+            dtype = "u2"
+        else:
+            return
+        row_step = int(msg.step)
+        if width <= 0 or height <= 0 or row_step < width * item_size:
+            return
+        data = memoryview(msg.data)
+        required = (height - 1) * row_step + width * item_size
+        if len(data) < required:
+            return
+        byte_order = ">" if bool(msg.is_bigendian) else "<"
+        depth = self._np.ndarray(
+            shape=(height, width),
+            dtype=self._np.dtype(f"{byte_order}{dtype}"),
+            buffer=data,
+            strides=(row_step, item_size),
+        )
+
+        if encoding == "32FC1":
+            # The vendor node has already transformed the lidar points into
+            # the camera frame and publishes optical-axis depth in metres.
+            valid = self._np.isfinite(depth) & (depth > 0.0)
+            depth_mm = self._np.zeros((height, width), dtype="<u2")
+            depth_mm[valid] = self._np.clip(
+                self._np.rint(depth[valid] * 1000.0), 1, 65535
+            ).astype("<u2")
+        else:
+            depth_mm = depth.astype("<u2", copy=True)
+
+        # Agent Core's depth renderer consumes the Image payload without its
+        # ROS metadata and therefore requires a fixed 640x480 uint16 buffer.
+        target_width = self._DEPTH_WIDTH
+        target_height = self._DEPTH_HEIGHT
+        if width * target_height > height * target_width:
+            crop_width = max(1, height * target_width // target_height)
+            x0 = (width - crop_width) // 2
+            depth_mm = depth_mm[:, x0:x0 + crop_width]
+        elif width * target_height < height * target_width:
+            crop_height = max(1, width * target_height // target_width)
+            y0 = (height - crop_height) // 2
+            depth_mm = depth_mm[y0:y0 + crop_height, :]
+        source_height, source_width = depth_mm.shape
+        rows = self._np.arange(target_height) * source_height // target_height
+        cols = self._np.arange(target_width) * source_width // target_width
+        depth_mm = depth_mm[rows[:, None], cols[None, :]].astype("<u2", copy=False)
+
+        out = self._image_type()
+        out.header = msg.header
+        out.height = target_height
+        out.width = target_width
+        out.encoding = "16UC1"
+        out.is_bigendian = False
+        out.step = target_width * 2
+        out.data = depth_mm.tobytes(order="C")
+        self._depth_pub.publish(out)
+        self._frames["depth"] += 1
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        tool_name = str(args.get("_tool_name", ""))
+        if not tool_name and action in self._TOOL_NAMES:
+            tool_name = action
+        if tool_name not in self._TOOL_NAMES:
+            tool_name = ""
+
+        if action == "start":
+            was_initialized = self._initialized
+            if not was_initialized:
+                self.start()
+            if tool_name and not was_initialized:
+                # Direct use outside the bundle initializes all publishers and
+                # subscriptions once, but only activates the requested card.
+                self._enabled_tools = {tool_name}
+            elif tool_name:
+                self._enabled_tools.add(tool_name)
+            else:
+                self._enabled_tools.update(self._TOOL_NAMES)
+            self._running = bool(self._enabled_tools)
+        elif action == "stop":
+            if tool_name:
+                self._enabled_tools.discard(tool_name)
+                self._running = bool(self._enabled_tools)
+            else:
+                self.stop()
+        if action in ("start", "stop", "info", "status", "pointcloud", "camera", "depth"):
+            topic_out_by_tool = {
+                "pointcloud": [{"topic": self._cloud_topic, "format": "sensor/pointcloud"}],
+                "camera": [
+                    {"topic": self._cam_left_topic, "format": "image/jpeg"},
+                    {"topic": self._cam_right_topic, "format": "image/jpeg"},
+                ],
+                "depth": [{"topic": self._depth_topic, "format": "image/depth-z16"}],
+            }
+            selected_tools = (tool_name,) if tool_name else self._TOOL_NAMES
+            topic_out = [topic for name in selected_tools for topic in topic_out_by_tool[name]]
+            is_running = (
+                tool_name in self._enabled_tools if tool_name else bool(self._enabled_tools)
+            )
+            return {"state": "running" if is_running else "idle",
+                    "source": self._source,
+                    "topic_out": topic_out,
+                    "frames": dict(self._frames)}
+        if action == "select_source":
+            source = str(args.get("source", "")).strip()
+            if source not in self._SOURCES:
+                raise ValueError(f"invalid pointcloud source: {source}; expected {'|'.join(self._SOURCES)}")
+            with self._lock:
+                self._source = source
+            return {"state": "running" if self._running else "idle", "source": source}
+        return {"error": f"unknown vision action: {action}"}

@@ -1,7 +1,9 @@
 import struct
 import sys
 import time
+import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -46,6 +48,14 @@ class VirtualGamepadTests(unittest.TestCase):
         result = plugin.dispatch("command", {"buttons": [], "analogs": [2, -2, 0, 0, 0, 0], "duration": -1})
         self.assertEqual([1.0, -1.0, 0.0, 0.0, 0.0, 0.0], result["analogs"])
         plugin.dispatch("release", {})
+
+    def test_start_reports_lcm_initialization_failure_to_bundle(self):
+        plugin = VirtualGamepadPlugin({}, "robot", None)
+        fake_lcm = types.SimpleNamespace(LCM=mock.Mock(side_effect=OSError("no multicast route")))
+        with mock.patch.dict(sys.modules, {"lcm": fake_lcm}):
+            with self.assertRaisesRegex(RuntimeError, "no multicast route"):
+                plugin.start()
+        self.assertEqual("unavailable", plugin.dispatch("status", {})["state"])
 
 
 if __name__ == "__main__":
