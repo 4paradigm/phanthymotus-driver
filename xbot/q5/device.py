@@ -184,13 +184,20 @@ if rc < 0: raise RuntimeError('snd_pcm_open(%s) failed: %%d' %% rc)
 rc = alsa.snd_pcm_set_params(pcm, 2, 3, %d, %d, 1, 200000)
 if rc < 0: raise RuntimeError('snd_pcm_set_params failed: %%d' %% rc)
 state = None
+pending = bytearray()
+# ROS, the bridge worker, and SSH do not share a real-time clock. Prefill six
+# browser-sized frames (192 ms) once so a brief transport delay cannot starve
+# the USB sound card between live PCM writes.
+prefill_bytes = 1024 * 6
 try:
   while True:
-    # Agent Core publishes 1,024-byte PCM16 chunks (32 ms at 16 kHz).
-    # Preserve that cadence through the hardware conversion instead of
-    # accumulating 100 ms batches, which audibly distorts live speech.
-    raw = sys.stdin.buffer.read(1024)
-    if not raw: break
+    chunk = sys.stdin.buffer.read(1024)
+    if not chunk: break
+    pending.extend(chunk)
+    if len(pending) < prefill_bytes:
+      continue
+    raw = bytes(pending[:1024])
+    del pending[:1024]
     mono, state = audioop.ratecv(raw, 2, 1, 16000, %d, state)
     stereo = audioop.tostereo(mono, 2, 1, 1)
     frames = len(stereo) // %d
