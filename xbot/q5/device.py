@@ -141,7 +141,7 @@ else:
         raise RuntimeError(f"unable to enumerate Q5 microphone devices: {detail}")
     try:
         selected = result.stdout.decode(errors="replace").strip()
-        if not re.fullmatch(r"hw:\d+,\d+", selected):
+        if not re.fullmatch(r"(?:hw|plughw):\d+,\d+", selected):
             raise ValueError(selected)
         return selected
     except ValueError as exc:
