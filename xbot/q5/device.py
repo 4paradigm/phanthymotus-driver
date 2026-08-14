@@ -6,7 +6,6 @@ module contains the verified state, battery, audio, and D455 camera cards.
 
 from __future__ import annotations
 
-import json
 import re
 import shlex
 import subprocess
@@ -78,53 +77,63 @@ def _raise_if_remote_process_exited(process, label: str) -> None:
     raise RuntimeError(f"Q5 {label} stream failed to start: {message}")
 
 
-def _ensure_remote_audio_device(device: int, direction: str):
-    """Validate the requested PortAudio input/output capability on Q5."""
-    channel_key = "maxInputChannels" if direction == "input" else "maxOutputChannels"
-    result = _q5_remote_command(
-        "python3 -c " + shlex.quote(
-            "import pyaudio; "
-            "pa=pyaudio.PyAudio(); "
-            f"d=pa.get_device_info_by_index({device}); "
-            f"assert d['{channel_key}'] > 0, d; print(d); pa.terminate()"
-        ), timeout=15.0)
-    if result.returncode:
-        detail = (result.stderr or result.stdout).decode(errors="replace").strip()
-        raise RuntimeError(
-            f"Q5 audio {direction} device {device} is unavailable: {detail}")
-
-
-def _find_remote_mic_device() -> int:
-    """Find the Q5 USB microphone without relying on a volatile PA index."""
-    probe = r"""import json, pyaudio
-pa = pyaudio.PyAudio()
+def _find_remote_mic_device() -> str:
+    """Find Q5's POROSVOC ALSA capture card without PortAudio enumeration."""
+    probe = r"""from pathlib import Path
+sound = Path('/sys/class/sound')
 candidates = []
-try:
-    for index in range(pa.get_device_count()):
-        info = pa.get_device_info_by_index(index)
-        if info.get('maxInputChannels', 0) < 1:
-            continue
-        try:
-            pa.is_format_supported(16000, input_device=index,
-                                   input_channels=1, input_format=pyaudio.paInt16)
-        except ValueError:
-            continue
-        candidates.append({'index': index, 'name': info.get('name', '')})
-finally:
-    pa.terminate()
-preferred = [item for item in candidates if any(
-    token in item['name'].lower() for token in ('porosvoc', 'usb', 'mic'))]
-print(json.dumps((preferred or candidates)[0] if (preferred or candidates) else {}))"""
+for card in sound.glob('card*'):
+    try:
+        index = int(card.name[4:])
+        name = (card / 'id').read_text().strip()
+    except (OSError, ValueError):
+        continue
+    if Path('/dev/snd/pcmC%dD0c' % index).exists():
+        candidates.append((index, name))
+preferred = [item for item in candidates if 'porosvoc' in item[1].lower()]
+selected = (preferred or candidates[:1])
+print('hw:%d,0' % selected[0][0] if selected else '')"""
     result = _q5_remote_command("python3 -c " + shlex.quote(probe), timeout=15.0)
     if result.returncode:
         detail = (result.stderr or result.stdout).decode(errors="replace").strip()
         raise RuntimeError(f"unable to enumerate Q5 microphone devices: {detail}")
     try:
-        selected = json.loads(result.stdout.decode(errors="replace").strip())
-        return int(selected["index"])
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        selected = result.stdout.decode(errors="replace").strip()
+        if not re.fullmatch(r"hw:\d+,\d+", selected):
+            raise ValueError(selected)
+        return selected
+    except ValueError as exc:
         detail = result.stdout.decode(errors="replace").strip()
-        raise RuntimeError(f"no usable 16 kHz mono Q5 microphone found: {detail}") from exc
+        raise RuntimeError(f"no Q5 ALSA microphone capture device found: {detail}") from exc
+
+
+def _q5_alsa_mic_command(device: str, sample_rate: int, channels: int) -> str:
+    """Return a remote ALSA capture process which writes PCM16 to stdout."""
+    return """import ctypes, sys
+alsa = ctypes.CDLL('libasound.so.2')
+alsa.snd_pcm_open.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+alsa.snd_pcm_set_params.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint, ctypes.c_int, ctypes.c_uint]
+alsa.snd_pcm_readi.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
+alsa.snd_pcm_prepare.argtypes = [ctypes.c_void_p]
+alsa.snd_pcm_close.argtypes = [ctypes.c_void_p]
+pcm = ctypes.c_void_p()
+rc = alsa.snd_pcm_open(ctypes.byref(pcm), b'%s', 1, 0)
+if rc < 0: raise RuntimeError('snd_pcm_open(%s) failed: %%d' %% rc)
+rc = alsa.snd_pcm_set_params(pcm, 2, 3, %d, %d, 1, 200000)
+if rc < 0: raise RuntimeError('snd_pcm_set_params failed: %%d' %% rc)
+frames = 1600
+buffer = ctypes.create_string_buffer(frames * %d)
+try:
+  while True:
+    count = alsa.snd_pcm_readi(pcm, buffer, frames)
+    if count < 0:
+      alsa.snd_pcm_prepare(pcm)
+      continue
+    sys.stdout.buffer.write(buffer.raw[:count * %d])
+    sys.stdout.buffer.flush()
+finally:
+  alsa.snd_pcm_close(pcm)
+""" % (device, device, channels, sample_rate, channels * 2, channels * 2)
 
 
 def _q5_alsa_speaker_command(device: str, output_rate: int, output_channels: int) -> str:
@@ -180,7 +189,12 @@ class MicPlugin:
         self._client = client
         self._topic = f"/{namespace}/mic/audio"
         configured_device = plugin_config.get("device", "auto")
-        self._device = None if str(configured_device).lower() == "auto" else int(configured_device)
+        configured_text = str(configured_device).lower()
+        self._device = (
+            None if configured_text == "auto"
+            else f"hw:{configured_text},0" if configured_text.isdigit()
+            else str(configured_device)
+        )
         self._rate = int(plugin_config.get("sample_rate_hz", 16000))
         self._channels = int(plugin_config.get("channels", 1))
         self._process = None
@@ -203,14 +217,7 @@ class MicPlugin:
             return
         try:
             device = self._device if self._device is not None else _find_remote_mic_device()
-            _ensure_remote_audio_device(device, "input")
-            command = (
-                "import pyaudio, sys; "
-                "pa=pyaudio.PyAudio(); "
-                f"stream=pa.open(format=pyaudio.paInt16, channels={self._channels}, rate={self._rate}, "
-                f"input=True, input_device_index={device}, frames_per_buffer=1600); "
-                "\nwhile True:\n data=stream.read(1600, exception_on_overflow=False); sys.stdout.buffer.write(data); sys.stdout.buffer.flush()"
-            )
+            command = _q5_alsa_mic_command(device, self._rate, self._channels)
             self._process = subprocess.Popen(
                 _q5_ssh_args("python3 -u -c " + shlex.quote(command)), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 bufsize=0)

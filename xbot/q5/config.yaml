@@ -44,9 +44,8 @@ plugins:
     enabled: true
   mic:
     enabled: true
-    # PortAudio indices vary after the developer container or ALSA devices
-    # restart.  Auto-detect a usable 16 kHz mono input; set an integer only
-    # when a specific, verified device index must be forced.
+    # Discover the Q5 POROSVOC USB capture card by ALSA name. PortAudio's
+    # device indices are unreliable in the developer container.
     device: auto
     sample_rate_hz: 16000
     channels: 1
