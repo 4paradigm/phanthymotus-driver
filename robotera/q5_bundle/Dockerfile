@@ -9,7 +9,7 @@ ENV PYTHONUNBUFFERED=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-numpy \
-    python3-opencv \
+    python3-pil \
     python3-dev \
     python3-colcon-common-extensions \
     cmake \
