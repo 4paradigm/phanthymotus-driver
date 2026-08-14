@@ -54,7 +54,7 @@ RUN cd /q5_ws && \
 COPY vendor/xbot_sdk_api /opt/xbot_sdk_api
 
 COPY main.py device.py q5_sdk_client.py q5_bridge_worker.py config.yaml driver.yaml /work/
-COPY direct_control.py body_command.py hand_command.py control_contract.py joint_limits.py /work/
+COPY direct_control.py body_command.py control_contract.py joint_limits.py /work/
 COPY resource /work/resource
 
 ENV RMW_IMPLEMENTATION=rmw_cyclonedds_cpp

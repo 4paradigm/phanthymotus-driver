@@ -4,15 +4,6 @@ name: "XBot-Q5"
 joint_state_position_unit: "radians"
 
 plugins:
-  state:
-    enabled: false
-  base_drive:
-    enabled: false
-    max_linear_x_mps: 0.20
-    max_angular_z_radps: 0.40
-    max_duration_s: 2.0
-    publish_rate_hz: 10.0
-    stop_repetitions: 3
   q5_control_mode:
     enabled: true
   arm_control:
@@ -20,28 +11,9 @@ plugins:
     max_step_rad: 0.010
     publish_rate_hz: 20.0
     hold_repetitions: 3
-  hand_control:
-    enabled: false
-    min_position_rad: 0.0
-    max_position_rad: 1.0
-    max_step_rad: 0.04
-    max_duration_s: 2.0
-    publish_rate_hz: 20.0
-    hold_repetitions: 3
-  hand_gesture:
-    enabled: false
-    max_duration_s: 2.0
-    publish_rate_hz: 20.0
-  head_control:
-    enabled: false
-    max_step_rad: 0.025
-    publish_rate_hz: 20.0
-    hold_repetitions: 3
   audio:
     enabled: true  # 已确认 /audio_player/play (AudioPlay) 及配套服务存在
     device: "plughw:2,0"
-  battery:
-    enabled: true
   mic:
     enabled: true
     # Discover the documented full-duplex USB Audio Device by ALSA name.
