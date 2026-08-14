@@ -192,7 +192,7 @@ CONFIG = {
         "joint_plan_state": "/motion/joint_motion_plan/state",
         "joint_override": "/motion/joint_override_command", "joint_command": "/hardware/joint_command",
         "tts": "/hardware/tts", "native_node_control": "/motion/node_control",
-        "heartbeat": "/heartbeat", "link_info": "/motion/link_info",
+        "heartbeat": "/heartbeat",
         "odometry": "/manifold/ODIN2/device0/odometry",
         "vision_cloud_raw": "/manifold/ODIN2/device0/cloud/raw",
         "vision_cloud_slam": "/manifold/ODIN2/device0/cloud/slam",
@@ -237,7 +237,6 @@ class DevicePluginContractTests(unittest.TestCase):
             self.device.SafetyControlPlugin(CONFIG, "robot", self.ros, self.state),
             self.device.NativeSdkPlugin({"mode": "external"}, "robot", self.ros),
             self.device.HeartbeatStatusPlugin(CONFIG, "robot", self.ros),
-            self.device.LinkInfoPlugin(CONFIG, "robot", self.ros),
             self.device.MotionCommandTracePlugin(CONFIG, "robot", self.ros),
             self.device.MotionEventsPlugin(CONFIG, "robot", self.ros),
             self.device.NativeInterfaceProbePlugin(CONFIG, "robot", self.ros),
@@ -253,7 +252,7 @@ class DevicePluginContractTests(unittest.TestCase):
             {"joints", "imu", "battery", "motor_health", "motor_state", "motor_command", "joint_command_feedback",
              "gamepad", "motion_state", "driver_health", "model",
              "robot_snapshot", "fault_summary", "stability", "joint_groups", "capabilities", "ros_graph",
-             "mainboard", "heartbeat_status", "link_info", "motion_command_trace", "motion_events",
+             "mainboard", "heartbeat_status", "motion_command_trace", "motion_events",
              "native_interface_probe",
              "loco", "motion_mode", "dance", "joint_plan", "joint_plan_state", "gesture",
              "joint_override", "joint_bridge",
@@ -261,8 +260,8 @@ class DevicePluginContractTests(unittest.TestCase):
              "motor_power", "native_node_control", "virtual_gamepad", "safety", "native_sdk"},
             names,
         )
-        self.assertEqual(42, len(names))
-        self.assertEqual(42, len(definitions), "tool names must be unique")
+        self.assertEqual(41, len(names))
+        self.assertEqual(41, len(definitions), "tool names must be unique")
         for tool in definitions:
             schema = tool.get("inputSchema")
             self.assertEqual("object", schema.get("type"), tool["name"])
@@ -281,7 +280,6 @@ class DevicePluginContractTests(unittest.TestCase):
         plugins = [
             self.state,
             self.device.HeartbeatStatusPlugin(CONFIG, "robot", self.ros),
-            self.device.LinkInfoPlugin(CONFIG, "robot", self.ros),
             self.device.MotionCommandTracePlugin(CONFIG, "robot", self.ros),
             self.device.MotionEventsPlugin(CONFIG, "robot", self.ros),
             self.device.NativeInterfaceProbePlugin(CONFIG, "robot", self.ros),
@@ -301,7 +299,6 @@ class DevicePluginContractTests(unittest.TestCase):
     def test_new_status_plugins_can_start_with_declared_ros_dependencies(self):
         plugins = [
             self.device.HeartbeatStatusPlugin(CONFIG, "robot", self.ros),
-            self.device.LinkInfoPlugin(CONFIG, "robot", self.ros),
             self.device.MotionCommandTracePlugin(CONFIG, "robot", self.ros),
             self.device.MotionEventsPlugin(CONFIG, "robot", self.ros),
             self.device.NativeInterfaceProbePlugin(CONFIG, "robot", self.ros),
