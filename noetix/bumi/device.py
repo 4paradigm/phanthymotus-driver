@@ -1124,38 +1124,77 @@ class SpeakerPlugin:
             return {"error": "input_topic is required"}
 
         self._playing = True
+
+        # Wake up the audio agent before playback (per SDK test_media.py)
+        try:
+            self._media_ctrl.wakeup()
+            time.sleep(1.0)
+        except Exception as e:
+            self._node.get_logger().warn(f"Speaker wakeup failed: {e}")
         self._media_ctrl.resume_audio_playback()
 
-        # Subscribe to the audio topic
+        import queue
+        if getattr(self, "_audio_queue", None) is None:
+            self._audio_queue = queue.Queue()
+            self._start_play_loop()
+
+        # Subscribe to the audio topic (AudioChunk: raw mono PCM bytes)
         def _on_audio(msg):
             if not self._playing:
                 return
             try:
-                import base64
-                data = json.loads(msg.data)
-                pcm_bytes = base64.b64decode(data["data"])
-                # Convert mono to stereo (duplicate channel) for MediaController (2ch required)
-                mono_samples = struct.unpack(f'<{len(pcm_bytes)//2}h', pcm_bytes)
-                stereo_samples = []
-                for s in mono_samples:
-                    stereo_samples.extend([s, s])  # duplicate L=R
-
-                # Create AudioStream and publish
-                from mediacontrol_py import AudioStream
-                stream = AudioStream()
-                stream.channels = 2
-                stream.sample_rate = 16000
-                stream.format = 2
-                stream.audio_data = stereo_samples
-                self._media_ctrl.publish_external_audio_playback_stream(stream)
+                self._audio_queue.put(bytes(msg.data))
             except Exception as e:
-                self._node.get_logger().warn(f"Speaker playback error: {e}")
+                self._node.get_logger().warn(f"Speaker enqueue error: {e}")
 
         if self._sub is not None:
             self._node.destroy_subscription(self._sub)
-        self._sub = self._node.create_subscription(String, input_topic, _on_audio, _LOW_LAT_QOS)
+        self._sub = self._node.create_subscription(AudioChunk, input_topic, _on_audio, _LOW_LAT_QOS)
 
         return {"state": "playing", "input_topic": input_topic}
+
+    def _start_play_loop(self) -> None:
+        """Background thread: mono PCM -> stereo, stream 10ms frames to the robot speaker.
+
+        Mirrors SDK test_media.py publish_audio_speaker: 320 samples (10ms @ 16kHz
+        stereo) per frame, duration_ms=10, per-frame timestamp_us, 10ms pacing.
+        """
+
+        import queue as _queue
+        import numpy as _np
+
+        def _loop():
+            from mediacontrol_py import AudioStream
+            frame_n = 16000 * 2 // 100  # 320 samples = 10ms @ 16kHz stereo
+            while True:
+                try:
+                    pcm_bytes = self._audio_queue.get(timeout=0.5)
+                except _queue.Empty:
+                    continue
+                if not pcm_bytes:
+                    continue
+                mono = _np.frombuffer(pcm_bytes, dtype="<i2")
+                if mono.size == 0:
+                    continue
+                # mono -> interleaved stereo (L=R)
+                stereo = _np.repeat(mono, 2)
+                for off in range(0, len(stereo), frame_n):
+                    if not self._playing:
+                        break
+                    chunk = stereo[off:off + frame_n]
+                    if len(chunk) < frame_n:
+                        break
+                    s = AudioStream()
+                    s.channels = 2
+                    s.sample_rate = 16000
+                    s.format = 2
+                    s.duration_ms = 10
+                    s.timestamp_us = int(time.time() * 1e6)
+                    s.audio_data = [int(x) for x in chunk]
+                    self._media_ctrl.publish_external_audio_playback_stream(s)
+                    time.sleep(0.01)
+
+        threading.Thread(target=_loop, daemon=True, name="bumi_speaker_play").start()
 
 
 # ── CameraPlugin (sensor, subprocess) ────────────────────────────────────────
