@@ -212,7 +212,7 @@ def main():
     global _bundle
     cfg = _load_config()
     namespace = _resolve_namespace(cfg)
-    mcp_port = int(cfg.get("mcp_port", 15708))
+    mcp_port = int(cfg.get("mcp_port", 15793))
 
     print(f"[bundle] namespace={namespace} mcp_port={mcp_port}")
 

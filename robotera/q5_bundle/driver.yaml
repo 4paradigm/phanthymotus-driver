@@ -4,6 +4,6 @@ category: driver
 hardware_provider: robotera
 hardware_model: q5
 image_name: robotera-q5
-port: 15708
-mcp_url: "http://localhost:15708/mcp"
+port: 15793
+mcp_url: "http://localhost:15793/mcp"
 description: "RobotEra Q5 state driver with guarded runtime-locked control cards and action-specific canvas forms"
