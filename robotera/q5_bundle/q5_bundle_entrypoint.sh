@@ -33,7 +33,7 @@ driver_pid=$!
   export ROS_DOMAIN_ID="${AGENT_CORE_ROS_DOMAIN_ID:-42}"
   export RMW_IMPLEMENTATION="rmw_fastrtps_cpp"
   export ROS_LOCALHOST_ONLY="${ROS_LOCALHOST_ONLY:-0}"
-  export Q5_DRIVER_URL="${Q5_DRIVER_URL:-http://127.0.0.1:15793/mcp}"
+  export Q5_DRIVER_URL="${Q5_DRIVER_URL:-http://127.0.0.1:15708/mcp}"
   # Do not let the Q5 CycloneDDS configuration affect Fast DDS discovery.
   unset CYCLONEDDS_URI
   exec python3 /work/q5_bus_bridge.py

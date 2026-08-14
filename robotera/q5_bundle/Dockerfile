@@ -81,6 +81,6 @@ ENV PYTHONPATH=/work:/opt/xbot_sdk_api
 
 RUN chmod +x /work/q5_bundle_entrypoint.sh
 
-EXPOSE 15793
+EXPOSE 15708
 
 CMD ["bash", "/work/q5_bundle_entrypoint.sh"]

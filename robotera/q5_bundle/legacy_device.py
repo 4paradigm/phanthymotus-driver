@@ -760,19 +760,50 @@ class AudioPlugin:
         self._device = plugin_config.get("device", "plughw:2,0")
 
     def get_tool(self):
+        play_actions = {
+            "play_by_id": {"mode": 0, "title": "按内置音频 ID 播放", "param": "id"},
+            "play_by_path": {"mode": 1, "title": "按设备路径播放", "param": "path"},
+            "play_by_item": {"mode": 2, "title": "按 item JSON 播放", "param": "item"},
+            "play_by_file_name": {"mode": 3, "title": "按文件名播放", "param": "file_name"},
+        }
         return {
             "name": "audio", "type": "actuator", "multiInstance": False,
             "description": "Q5 vendor audio playback, volume, stop, and status.",
             "inputSchema": {"type": "object", "properties": {
-                "action": {"type": "string", "enum": ["start", "stop", "play", "set_volume", "stop_audio", "is_play", "info"]},
-                "mode": {"type": "integer", "enum": [0, 1, 2, 3], "description": "0=id, 1=path, 2=item JSON, 3=file name"},
-                "id": {"type": "integer"}, "path": {"type": "string"}, "item": {"type": "string"},
-                "file_name": {"type": "string"}, "force_play": {"type": "boolean"},
-                "timeout": {"type": "integer", "minimum": 0},
-                "channel": {"type": "string", "enum": ["default", "channel1", "channel2", "channel3"]},
-                "version": {"type": "string", "enum": ["v1", "v2"]},
-                "volume": {"type": "integer", "minimum": 0, "maximum": 100},
-            }, "required": ["action"], "additionalProperties": False},
+                "action": {"type": "string", "enum": [
+                    "start", *play_actions, "set_volume", "stop_audio", "is_play", "stop", "info"],
+                    "oneOf": [
+                        {"const": "start", "title": "检查音频服务"},
+                        *[{"const": action, "title": detail["title"]}
+                          for action, detail in play_actions.items()],
+                        {"const": "set_volume", "title": "设置音量"},
+                        {"const": "stop_audio", "title": "停止播放"},
+                        {"const": "is_play", "title": "查询播放状态"},
+                        {"const": "stop", "title": "停止音频卡"},
+                        {"const": "info", "title": "查看状态"},
+                    ]},
+                "id": {"type": "integer", "title": "内置音频 ID"},
+                "path": {"type": "string", "title": "设备音频路径", "minLength": 1},
+                "item": {"type": "string", "title": "item JSON", "minLength": 1},
+                "file_name": {"type": "string", "title": "音频文件名", "minLength": 1},
+                "force_play": {"type": "boolean", "title": "强制打断当前播放"},
+                "timeout": {"type": "integer", "title": "超时 (s)", "minimum": 0},
+                "channel": {"type": "string", "title": "播放通道",
+                            "enum": ["default", "channel1", "channel2", "channel3"]},
+                "version": {"type": "string", "title": "音频版本", "enum": ["v1", "v2"]},
+                "volume": {"type": "integer", "title": "音量", "minimum": 0, "maximum": 100},
+            }, "required": ["action"], "additionalProperties": False,
+                "x-action-params": {
+                    "start": {"params": [], "description": "检查 Q5 厂商音频服务。"},
+                    **{action: {"params": [detail["param"], "force_play", "timeout", "channel", "version"],
+                                  "description": f"模式 {detail['mode']}；只接受 {detail['param']} 作为播放来源。"}
+                       for action, detail in play_actions.items()},
+                    "set_volume": {"params": ["volume"], "description": "设置 0 到 100 的播放音量。"},
+                    "stop_audio": {"params": [], "description": "停止当前厂商音频播放。"},
+                    "is_play": {"params": [], "description": "查询当前是否正在播放。"},
+                    "stop": {"params": [], "description": "停止音频卡并停止当前播放。"},
+                    "info": {"params": [], "description": "查看音频服务状态。"},
+                }},
         }
 
     def start(self):
@@ -784,8 +815,10 @@ class AudioPlugin:
     def dispatch(self, action, args):
         if action in ("start", "info"):
             return {"state": "ready", "action_server": "/audio_player/play", "device": self._device}
-        if action == "play":
-            return self._play(args)
+        play_modes = {"play_by_id": 0, "play_by_path": 1,
+                      "play_by_item": 2, "play_by_file_name": 3}
+        if action in play_modes:
+            return self._play(args, play_modes[action])
         if action == "set_volume":
             return self._set_volume(args.get("volume", 50))
         if action == "stop_audio":
@@ -797,11 +830,20 @@ class AudioPlugin:
             return {"state": "idle"}
         return None
 
-    def _play(self, args):
+    def _play(self, args, mode: int):
+        source_fields = {0: "id", 1: "path", 2: "item", 3: "file_name"}
+        source_field = source_fields[mode]
+        if source_field not in args:
+            return {"state": "error", "message": f"mode {mode} requires {source_field}"}
+        unrelated = sorted(field for field in source_fields.values()
+                           if field != source_field and field in args)
+        if unrelated:
+            return {"state": "error", "message": (
+                f"mode {mode} only accepts {source_field}; do not provide {', '.join(unrelated)}")}
         if not self._action_client.wait_for_server(timeout_sec=3.0):
             return {"state": "error", "message": "/audio_player/play is unavailable"}
         goal = AudioPlay.Goal()
-        goal.mode = int(args.get("mode", 1))
+        goal.mode = mode
         goal.force_play = bool(args.get("force_play", False))
         goal.id = int(args.get("id", 0))
         goal.path = str(args.get("path", ""))
