@@ -87,6 +87,7 @@ class Q5BasicSensorTests(unittest.TestCase):
         service = (package_dir / "deploy" / "service.yml").read_text(encoding="utf-8")
 
         self.assertIn("COPY deploy/ /deploy/", dockerfile)
+        self.assertIn("network_mode: host", service)
         self.assertIn("/home/nvidia/teleop_client/install:/opt/teleop_client/install:ro", service)
         self.assertIn("/home/nvidia/cyclonedds-orin.xml:/etc/cyclonedds/q5.xml:ro", service)
         self.assertIn("Q5_CYCLONEDDS_URI=file:///etc/cyclonedds/q5.xml", service)
