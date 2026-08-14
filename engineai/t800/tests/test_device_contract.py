@@ -434,6 +434,28 @@ class DevicePluginContractTests(unittest.TestCase):
                 self.assertEqual("motion_state", snapshot["control_source"])
                 self.assertEqual("motion_state_changed", snapshot["event"])
 
+    def test_motion_events_accept_ros_array_like_gamepad_states(self):
+        class RosArrayLike:
+            def __init__(self, values):
+                self._values = list(values)
+
+            def __iter__(self):
+                return iter(self._values)
+
+            def __bool__(self):
+                raise ValueError("ambiguous truth value")
+
+        plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
+        digital = RosArrayLike([1, 0, 1] + [0] * 9)
+        plugin._on_gamepad(types.SimpleNamespace(
+            hardware_connected=True,
+            digital_states=digital,
+            analog_states=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("stand", snapshot["action"])
+        self.assertEqual(["LB", "A"], snapshot["buttons"])
+
     def test_derived_diagnostics_and_capability_resources(self):
         self.state._set("imu", {
             "rpy_rad": [1.1, 0.0, 0.0],

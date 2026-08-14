@@ -100,9 +100,10 @@ _GAMEPAD_ACTIONS = {
 
 
 def _pressed_gamepad_buttons(digital_states) -> list[str]:
+    states = [] if digital_states is None else digital_states
     return [
         _GAMEPAD_BUTTON_NAMES.get(index, str(index))
-        for index, value in enumerate(digital_states or [])
+        for index, value in enumerate(states)
         if int(value) != 0
     ]
 
