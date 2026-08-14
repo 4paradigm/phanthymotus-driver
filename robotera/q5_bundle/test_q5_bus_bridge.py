@@ -49,13 +49,12 @@ class Q5BusBridgeTests(unittest.TestCase):
             {"battery": ["/nvidia_desktop/q5/battery"]},
         )
 
-    def test_single_container_entrypoint_keeps_dds_stacks_in_separate_processes(self):
+    def test_single_container_entrypoint_uses_the_verified_media_bridge(self):
         source = Path(__file__).with_name("q5_bundle_entrypoint.sh").read_text()
         self.assertIn('RMW_IMPLEMENTATION="rmw_cyclonedds_cpp"', source)
-        self.assertIn('RMW_IMPLEMENTATION="rmw_fastrtps_cpp"', source)
         self.assertIn('exec python3 /work/main.py', source)
-        self.assertIn('exec python3 /work/q5_bus_bridge.py', source)
-        self.assertIn('wait -n "$driver_pid" "$bridge_pid"', source)
+        self.assertIn('media/audio bridge', source)
+        self.assertNotIn('exec python3 /work/q5_bus_bridge.py', source)
 
     def test_fastdds_bridge_uses_its_udp_profile_when_not_overridden(self):
         with mock.patch.dict(os.environ, {"RMW_IMPLEMENTATION": "rmw_fastrtps_cpp"}, clear=True):

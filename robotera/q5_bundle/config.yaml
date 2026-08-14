@@ -6,43 +6,34 @@ ros_namespace: ""
 joint_state_position_unit: "radians"
 
 plugins:
-  base_drive:
+  mic:
     enabled: true
-    # Deployment guardrails, not vendor-certified motion limits.
-    max_linear_x_mps: 0.20
-    max_angular_z_radps: 0.40
-    max_duration_s: 2.0
-    publish_rate_hz: 10.0
-    stop_repetitions: 3
-  joints:
+    sample_rate_hz: 16000
+    channels: 1
+  speaker:
     enabled: true
-  joints_state:
+    device: "hw:2,0"
+    sample_rate_hz: 16000
+    channels: 1
+    output_sample_rate_hz: 44100
+    output_channels: 2
+  audio:
     enabled: true
-  robot_ready:
+  camera_rgb:
     enabled: true
-  battery:
-    enabled: true
-  system_health:
-    enabled: true
-  hand_state:
-    enabled: true
-  estop:
-    enabled: true
-  diagnostics:
-    enabled: true
-  imu:
-    # The source names and type are confirmed: /camera/camera/{accel,gyro}/sample
-    # are sensor_msgs/msg/Imu. The 2026-08-11 inspection found zero publishers
-    # for both streams, so retain this card disabled until the camera driver runs.
-    enabled: false
+    max_hz: 15.0
+    jpeg_quality: 70
+    remote_start:
+      enabled: true
+      host: "192.168.8.100"
+      user: "developer"
+      password: "developer"
+      port: 2222
+      depth_profile: "848x480x30"
+      color_profile: "848x480x30"
   camera_depth:
-    # No Image/depth publisher or camera driver is present in the observed ROS
-    # graph. Do not use /slam/map_cmap: it is a SLAM PointCloud2 map, not depth.
-    enabled: false
-  simple_action:
-    # Vendor action service, not direct joint control. Keep this disabled in
-    # the default direct-control deployment.
-    enabled: false
+    enabled: true
+    max_hz: 15.0
   arm_control:
     enabled: true
     hardware_enable: true
@@ -55,24 +46,5 @@ plugins:
     # Keep the final arm target published until feedback has caught up.
     settle_tolerance_rad: 0.035
     settle_timeout_s: 1.5
-  hand_control:
+  q5_control_mode:
     enabled: true
-    # Deployment guardrails, not vendor-certified XHand Lite joint limits.
-    min_position_rad: 0.0
-    max_position_rad: 1.0
-    max_step_rad: 0.04
-    max_duration_s: 2.0
-    publish_rate_hz: 20.0
-    hold_repetitions: 3
-  hand_gesture:
-    # Uses the same direct hand command publisher as hand_control.
-    enabled: true
-    max_duration_s: 2.0
-    publish_rate_hz: 20.0
-  head_control:
-    # The neck joint names come from the bundled Q5 URDF and must match the
-    # installed robot's /joint_states.
-    enabled: true
-    max_step_rad: 0.025
-    publish_rate_hz: 20.0
-    hold_repetitions: 3
