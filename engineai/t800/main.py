@@ -185,6 +185,15 @@ class T800DeviceBundle:
             except Exception as exc:
                 print(f"[bundle] ControlledSpatialPlugin init failed, controlled_spatial disabled: {exc}", flush=True)
 
+        if plugins.get("controlled_spatial_map", {}).get("enabled", False):
+            try:
+                from controlled_spatial_map import make_plugin as make_map_plugin
+                map_cfg = dict(plugins["controlled_spatial_map"])
+                self._plugins.append(make_map_plugin(map_cfg, namespace, ros2.executor_robot))
+                print("[bundle] ControlledSpatialMapPlugin loaded")
+            except Exception as e:
+                print(f"[bundle] ControlledSpatialMapPlugin load skipped: {e}", flush=True)
+
         if "safety" in instances:
             instances["safety"].set_controls(
                 [
