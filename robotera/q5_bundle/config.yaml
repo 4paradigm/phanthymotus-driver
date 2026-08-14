@@ -1,5 +1,5 @@
 name: "RobotEra Q5 (Bundle)"
-mcp_port: 15708
+mcp_port: 15793
 ros_namespace: ""
 # `sensor_msgs/JointState` and the Q5 command interface use radians. Change
 # this only after verifying a vendor-specific deviation from a raw ROS sample.
