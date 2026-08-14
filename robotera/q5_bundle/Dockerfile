@@ -47,6 +47,7 @@ COPY joint_limits.py /work/joint_limits.py
 COPY config.yaml /work/config.yaml
 COPY resource/q5_model.urdf /work/resource/q5_model.urdf
 COPY resource/fastdds_udp_only.xml /work/resource/fastdds_udp_only.xml
+COPY deploy/ /deploy/
 
 RUN chmod +x /work/q5_bundle_entrypoint.sh
 
