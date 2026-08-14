@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import threading
+import time
 import types
 import unittest
 import urllib.error
@@ -114,6 +115,40 @@ class McpHttpContractTests(unittest.TestCase):
             urllib.request.urlopen(self.url + "/missing", timeout=2)
         self.assertEqual(404, captured.exception.code)
 
+    def test_legacy_sse_endpoint_and_messages_path(self):
+        stream = urllib.request.urlopen(self.url + "/mcp/sse", timeout=2)
+        try:
+            self.assertEqual("text/event-stream", stream.headers.get_content_type())
+            endpoint = ""
+            deadline = time.time() + 2
+            while time.time() < deadline:
+                line = stream.readline().decode().strip()
+                if line.startswith("data: "):
+                    endpoint = line[len("data: "):]
+                    break
+            self.assertTrue(endpoint.startswith("/mcp/messages?session_id="), endpoint)
+            request = urllib.request.Request(
+                self.url + endpoint,
+                data=json.dumps({"jsonrpc": "2.0", "id": 99, "method": "tools/list"}).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(request, timeout=2) as response:
+                self.assertEqual(202, response.status)
+            deadline = time.time() + 2
+            payload = None
+            while time.time() < deadline:
+                line = stream.readline().decode().strip()
+                if line.startswith("data: "):
+                    candidate = json.loads(line[len("data: "):])
+                    if candidate.get("jsonrpc") == "2.0":
+                        payload = candidate
+                        break
+            self.assertIsNotNone(payload)
+            self.assertEqual(99, payload["id"])
+            self.assertEqual("echo", payload["result"]["tools"][0]["name"])
+        finally:
+            stream.close()
+
     def test_cyclonedds_interface_is_validated(self):
         previous = os.environ.pop("CYCLONEDDS_URI", None)
         previous_interface = os.environ.pop("NETWORK_INTERFACE", None)
@@ -135,6 +170,15 @@ class McpHttpContractTests(unittest.TestCase):
                 os.environ["CYCLONEDDS_URI"] = previous
             if previous_interface is not None:
                 os.environ["NETWORK_INTERFACE"] = previous_interface
+
+    def test_numeric_docker_hostname_becomes_valid_ros_namespace(self):
+        previous_gethostname = self.module.socket.gethostname
+        try:
+            self.module.socket.gethostname = lambda: "20f7d0265d7d"
+            self.assertEqual("t800_20f7d0265d7d", self.module._resolve_namespace({}))
+            self.assertEqual("t800", self.module._resolve_namespace({"ros_namespace": "---"}))
+        finally:
+            self.module.socket.gethostname = previous_gethostname
 
     def test_bundle_hides_failed_plugins_and_reports_degraded(self):
         class Plugin:
