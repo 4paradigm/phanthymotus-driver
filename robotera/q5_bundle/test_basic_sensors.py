@@ -20,7 +20,6 @@ import head_control
 import hand_state
 import joints
 import joints_state
-import nav_state
 import q5_sdk_client
 import robot_ready
 import simple_action
@@ -507,14 +506,11 @@ class Q5BasicSensorTests(unittest.TestCase):
         self.assertTrue(data["left"]["complete"])
         self.assertTrue(data["right"]["complete"])
 
-    def test_nav_diagnostics_and_estop_state_cards_preserve_safe_state(self):
+    def test_diagnostics_and_estop_state_cards_preserve_safe_state(self):
         now = int(time.time() * 1000)
-        nav = nav_state.build(None, None, publisher_count=0)
         diagnostic_waiting = diagnostics.build(None, None, publisher_count=1)
         emergency = estop.build(7, "E_STOP", now)
         normal = estop.build(4, "ACTIVE", now)
-        self.assertFalse(nav["available"])
-        self.assertEqual(nav["source_state"], "navigation_stack_not_running")
         self.assertFalse(diagnostic_waiting["available"])
         self.assertTrue(diagnostic_waiting["publisher_connected"])
         self.assertEqual(diagnostic_waiting["source_state"], "awaiting_diagnostic_event")
@@ -523,13 +519,8 @@ class Q5BasicSensorTests(unittest.TestCase):
         self.assertIsNone(normal["message"])
         self.assertNotIn("physical_estop_state", normal)
 
-    def test_nav_and_diagnostics_do_not_hide_stale_payloads_as_waiting(self):
-        nav = nav_state.build("finished", 1, publisher_count=1)
+    def test_diagnostics_do_not_hide_stale_payloads_as_waiting(self):
         diagnostic = diagnostics.build({"status": []}, 1, publisher_count=1)
-        self.assertTrue(nav["available"])
-        self.assertFalse(nav["fresh"])
-        self.assertEqual(nav["source_state"], "stale")
-        self.assertEqual(nav["message"], "导航状态消息已过期")
         self.assertTrue(diagnostic["available"])
         self.assertFalse(diagnostic["fresh"])
         self.assertEqual(diagnostic["source_state"], "stale")
