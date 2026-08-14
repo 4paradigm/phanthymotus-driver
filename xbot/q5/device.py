@@ -61,6 +61,32 @@ def _q5_remote_command(command: str, timeout: float = 20.0, stdin=None):
     return subprocess.run(_q5_ssh_args(command), input=stdin, capture_output=True, timeout=timeout)
 
 
+_Q5_MIC_PIDFILE = "/tmp/phanthymotus-q5-mic-capture.pid"
+
+
+def _stop_remote_mic_capture() -> None:
+    """Stop only the tagged microphone process left by this driver."""
+    command = f"""pidfile={shlex.quote(_Q5_MIC_PIDFILE)}
+if test -r \"$pidfile\"; then
+  pid=$(cat \"$pidfile\" 2>/dev/null || true)
+  if test -n \"$pid\" && test -r \"/proc/$pid/cmdline\" && grep -aq q5_mic_capture \"/proc/$pid/cmdline\"; then
+    kill \"$pid\" 2>/dev/null || true
+  fi
+  rm -f \"$pidfile\"
+fi"""
+    try:
+        _q5_remote_command(command, timeout=5.0)
+    except Exception:
+        pass
+
+
+def _q5_mic_capture_shell(command: str) -> str:
+    """Tag the remote PCM process so restart cleanup cannot leave it owning ALSA."""
+    return f"""pidfile={shlex.quote(_Q5_MIC_PIDFILE)}
+echo $$ > \"$pidfile\"
+exec -a q5_mic_capture python3 -u -c {shlex.quote(command)}"""
+
+
 def _raise_if_remote_process_exited(process, label: str) -> None:
     """Surface setup failures before a card falsely reports a running stream."""
     time.sleep(0.25)
@@ -222,8 +248,9 @@ class MicPlugin:
             try:
                 device = self._device if self._device is not None else _find_remote_mic_device()
                 command = _q5_alsa_mic_command(device, self._rate, self._channels)
+                _stop_remote_mic_capture()
                 self._process = subprocess.Popen(
-                    _q5_ssh_args("python3 -u -c " + shlex.quote(command)), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    _q5_ssh_args(_q5_mic_capture_shell(command)), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     bufsize=0)
                 _raise_if_remote_process_exited(self._process, "microphone")
                 self._running = True
@@ -255,6 +282,7 @@ class MicPlugin:
     def stop(self):
         with self._lock:
             self._running = False
+            _stop_remote_mic_capture()
             if self._process is not None:
                 self._process.terminate()
                 try:
