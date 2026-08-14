@@ -63,8 +63,15 @@ COPY joint_limits.py /work/joint_limits.py
 COPY hand_control.py /work/hand_control.py
 COPY hand_gesture.py /work/hand_gesture.py
 COPY head_control.py /work/head_control.py
-COPY mic.py speaker.py audio.py camera_rgb.py camera_depth.py q5_control_mode.py /work/
-COPY legacy_device.py legacy_direct_control.py q5_media_bridge.py /work/
+COPY mic.py /work/mic.py
+COPY speaker.py /work/speaker.py
+COPY audio.py /work/audio.py
+COPY camera_rgb.py /work/camera_rgb.py
+COPY camera_depth.py /work/camera_depth.py
+COPY q5_control_mode.py /work/q5_control_mode.py
+COPY legacy_device.py /work/legacy_device.py
+COPY legacy_direct_control.py /work/legacy_direct_control.py
+COPY q5_media_bridge.py /work/q5_media_bridge.py
 COPY config.yaml /work/config.yaml
 COPY resource/q5_model.urdf /work/resource/q5_model.urdf
 COPY resource/fastdds_udp_only.xml /work/resource/fastdds_udp_only.xml
