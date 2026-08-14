@@ -1,0 +1,24 @@
+# Python 缓存文件
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# IDL Python 工具生成的文件
+.idlpy_manifest
+
+# pip install -e . 产生的文件
+*.egg-info/
+build/
+dist/
+*.egg
+*.whl
+
+
+# IDE 和编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

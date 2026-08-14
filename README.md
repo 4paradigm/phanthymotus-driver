@@ -11,9 +11,17 @@ Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server t
 | Driver | Hardware | Port | Description |
 |--------|----------|------|-------------|
 | `unitree/g1` | Unitree G1 Humanoid | 15701 | Locomotion, arm control, mic, speaker, LED, state monitoring |
+| `unitree/go1` | Unitree Go1 (EDU) Quadruped | 15715 | State, locomotion, camera (RGB/depth/pointcloud), ext peripherals, URDF |
+| `unitree/go2` | Unitree Go2 Quadruped | 15703 | Locomotion, obstacle avoidance, voice, video, navigation |
+| `unitree/r1` | Unitree R1 (EDU) Humanoid | 15702 | Mic, TTS, LED, locomotion, stereo camera, state monitoring |
+| `dji/M300` | DJI Matrice 300 RTK | 15702 | Flight control, telemetry, perception, HMS, aircraft info |
+| `dji/mavic3e` | DJI Mavic 3E/3T | 15702 | Flight control, camera (wide/zoom/IR), gimbal, waypoint missions, perception, IR thermometry |
+| `dji/mavic4e` | DJI Mavic 4E/4T | 15703 | Flight control, camera, gimbal, waypoint missions, telemetry, perception |
 | `engineai/t800` | EngineAI T800 Development Edition | 15708 | ROS2/Native SDK, full state, dance/gesture sequences, virtual gamepad, locomotion and low-level joint control |
+| `noetix/bumi` | Noetix Bumi-EDU Humanoid | 15704 | Mic, speaker, locomotion, RealSense camera, state monitoring |
+| `x-humanoid/tianyi2.0` | Tianyi 2.0 Pro Humanoid | 15707 | 35DOF (wheeled chassis + dual arms + dexterous hands + head + navigation) |
 | `deep_robotics/lynx_m20` | DEEPRobotics Lynx M20 | 15716 | Official ROS 2/Fast DDS interfaces and basic_server TCP/UDP native control, with Standard/Pro capability isolation |
-| `phanthy/remote_control` | Remote Control Bridge | 15710 | Remote control relay |
+| `pnpbotics/adam` | PNPbotics Adam Humanoid | 15702 | State, locomotion (gRPC), upper body control, dexterous hands, 3D model |
 
 ## Quick Start
 
