@@ -321,9 +321,11 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
     signal.signal(signal.SIGINT, _handle_signal)
 
     while running:
-        # Process commands (non-blocking)
+        # Commands are rare.  Do not block this loop waiting for one: browser
+        # mic uploads arrive as bursts of 1 KiB DDS samples, and a 50 ms wait
+        # here caps callback processing below their ~30 Hz stream rate.
         try:
-            cmd = cmd_q.get(timeout=0.05)
+            cmd = cmd_q.get_nowait()
             if cmd == "shutdown":
                 node.get_logger().info("shutdown command received")
                 running = False
@@ -389,7 +391,9 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
             if debug:
                 node.get_logger().info("bridge worker health OK")
 
-        executor.spin_once(timeout_sec=0)
+        # A short DDS wait avoids a busy loop while draining bursty live PCM
+        # fast enough to preserve every 1 KiB browser-microphone frame.
+        executor.spin_once(timeout_sec=0.005)
 
     # Cleanup
     node.destroy_node()
