@@ -186,7 +186,10 @@ if rc < 0: raise RuntimeError('snd_pcm_set_params failed: %%d' %% rc)
 state = None
 try:
   while True:
-    raw = sys.stdin.buffer.read(3200)
+    # Agent Core publishes 1,024-byte PCM16 chunks (32 ms at 16 kHz).
+    # Preserve that cadence through the hardware conversion instead of
+    # accumulating 100 ms batches, which audibly distorts live speech.
+    raw = sys.stdin.buffer.read(1024)
     if not raw: break
     mono, state = audioop.ratecv(raw, 2, 1, 16000, %d, state)
     stereo = audioop.tostereo(mono, 2, 1, 1)

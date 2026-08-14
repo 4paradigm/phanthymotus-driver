@@ -58,9 +58,10 @@ plugins:
     device: "hw:2,0"
     sample_rate_hz: 16000
     channels: 1
-    # Hardware probe verified 44.1/48 kHz stereo; the card converts the shared
-    # 16 kHz mono TTS contract at the final playback boundary.
-    output_sample_rate_hz: 44100
+    # Hardware probe verified 44.1/48 kHz stereo. 48 kHz is the native stable
+    # live-playback setting for the USB speaker; conversion happens only at
+    # this final hardware boundary.
+    output_sample_rate_hz: 48000
     output_channels: 2
   camera_rgb:
     enabled: true
