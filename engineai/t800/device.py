@@ -1511,13 +1511,18 @@ class MotionEventsPlugin:
             latest_direction = self._latest_direction
             current_motion_state = self._current_motion_state
         speed_age = None if latest_speed_updated is None else max(0.0, now - latest_speed_updated)
+        display_action = latest_action
+        display_control_source = latest_control_source
+        if display_action == "none" and current_motion_state not in ("", "unknown"):
+            display_action = _normalize_motion_action(current_motion_state)
+            display_control_source = "motion_state"
         return {
             "state": "running" if latest_event or latest_speed_updated is not None else "no_data",
             "motion_state": "moving" if moving else "stopped",
             "speed": f"{round(latest_speed, 2):.2f} m/s",
             "speed_source": latest_speed_source,
-            "control_source": latest_control_source,
-            "action": latest_action,
+            "control_source": display_control_source,
+            "action": display_action,
             "direction": latest_direction,
             "buttons": latest_buttons,
             "current_motion_state": current_motion_state,

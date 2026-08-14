@@ -434,6 +434,19 @@ class DevicePluginContractTests(unittest.TestCase):
                 self.assertEqual("motion_state", snapshot["control_source"])
                 self.assertEqual("motion_state_changed", snapshot["event"])
 
+    def test_motion_events_keep_screen_state_visible_after_idle_gamepad(self):
+        plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
+        plugin._on_motion_state(types.SimpleNamespace(current_motion_task="sit_down"))
+        plugin._on_gamepad(types.SimpleNamespace(
+            hardware_connected=True,
+            digital_states=[0] * 12,
+            analog_states=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("sit", snapshot["action"])
+        self.assertEqual("motion_state", snapshot["control_source"])
+        self.assertEqual("sit_down", snapshot["current_motion_state"])
+
     def test_motion_events_accept_ros_array_like_gamepad_states(self):
         class RosArrayLike:
             def __init__(self, values):
