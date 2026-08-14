@@ -29,6 +29,7 @@ from direct_control import (
     HandControlPlugin,
     HandGesturePlugin,
     HeadControlPlugin,
+    Q5ControlModePlugin,
 )
 
 
