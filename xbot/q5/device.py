@@ -124,8 +124,8 @@ for card in sound.glob('card*'):
     playback = Path('/dev/snd/pcmC%dD0p' % index).exists()
     if capture:
         candidates.append((index, name, playback))
-preferred = [item for item in candidates
-             if 'usb audio device' in item[1].lower() and item[2]]
+preferred = [item for item in candidates if item[2]]
+preferred.sort(key=lambda item: 'usb audio' not in item[1].lower())
 if not preferred:
     preferred = [item for item in candidates if 'porosvoc' in item[1].lower()]
 if not preferred:
