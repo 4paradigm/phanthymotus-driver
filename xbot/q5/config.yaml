@@ -44,8 +44,10 @@ plugins:
     enabled: true
   mic:
     enabled: true
-    # Verified on this Q5: POROSVOC USB microphone is PortAudio index 1.
-    device: 1
+    # PortAudio indices vary after the developer container or ALSA devices
+    # restart.  Auto-detect a usable 16 kHz mono input; set an integer only
+    # when a specific, verified device index must be forced.
+    device: auto
     sample_rate_hz: 16000
     channels: 1
   speaker:

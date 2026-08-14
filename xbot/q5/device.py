@@ -94,6 +94,39 @@ def _ensure_remote_audio_device(device: int, direction: str):
             f"Q5 audio {direction} device {device} is unavailable: {detail}")
 
 
+def _find_remote_mic_device() -> int:
+    """Find the Q5 USB microphone without relying on a volatile PA index."""
+    probe = r"""import json, pyaudio
+pa = pyaudio.PyAudio()
+candidates = []
+try:
+    for index in range(pa.get_device_count()):
+        info = pa.get_device_info_by_index(index)
+        if info.get('maxInputChannels', 0) < 1:
+            continue
+        try:
+            pa.is_format_supported(16000, input_device=index,
+                                   input_channels=1, input_format=pyaudio.paInt16)
+        except ValueError:
+            continue
+        candidates.append({'index': index, 'name': info.get('name', '')})
+finally:
+    pa.terminate()
+preferred = [item for item in candidates if any(
+    token in item['name'].lower() for token in ('porosvoc', 'usb', 'mic'))]
+print(json.dumps((preferred or candidates)[0] if (preferred or candidates) else {}))"""
+    result = _q5_remote_command("python3 -c " + shlex.quote(probe), timeout=15.0)
+    if result.returncode:
+        detail = (result.stderr or result.stdout).decode(errors="replace").strip()
+        raise RuntimeError(f"unable to enumerate Q5 microphone devices: {detail}")
+    try:
+        selected = json.loads(result.stdout.decode(errors="replace").strip())
+        return int(selected["index"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        detail = result.stdout.decode(errors="replace").strip()
+        raise RuntimeError(f"no usable 16 kHz mono Q5 microphone found: {detail}") from exc
+
+
 def _q5_alsa_speaker_command(device: str, output_rate: int, output_channels: int) -> str:
     """Return the remote PCM16 stdin -> Q5 ALSA playback process.
 
@@ -146,7 +179,8 @@ class MicPlugin:
         del executor
         self._client = client
         self._topic = f"/{namespace}/mic/audio"
-        self._device = int(plugin_config.get("device", 6))
+        configured_device = plugin_config.get("device", "auto")
+        self._device = None if str(configured_device).lower() == "auto" else int(configured_device)
         self._rate = int(plugin_config.get("sample_rate_hz", 16000))
         self._channels = int(plugin_config.get("channels", 1))
         self._process = None
@@ -168,12 +202,13 @@ class MicPlugin:
         if self._running:
             return
         try:
-            _ensure_remote_audio_device(self._device, "input")
+            device = self._device if self._device is not None else _find_remote_mic_device()
+            _ensure_remote_audio_device(device, "input")
             command = (
                 "import pyaudio, sys; "
                 "pa=pyaudio.PyAudio(); "
                 f"stream=pa.open(format=pyaudio.paInt16, channels={self._channels}, rate={self._rate}, "
-                f"input=True, input_device_index={self._device}, frames_per_buffer=1600); "
+                f"input=True, input_device_index={device}, frames_per_buffer=1600); "
                 "\nwhile True:\n data=stream.read(1600, exception_on_overflow=False); sys.stdout.buffer.write(data); sys.stdout.buffer.flush()"
             )
             self._process = subprocess.Popen(
@@ -184,7 +219,7 @@ class MicPlugin:
             self._frames_sent = 0
             self._thread = threading.Thread(target=self._pump, daemon=True, name="q5_mic_stream")
             self._thread.start()
-            print(f"[MicPlugin] capture started -> {self._topic}", flush=True)
+            print(f"[MicPlugin] capture started from device {device} -> {self._topic}", flush=True)
         except Exception as exc:
             self.stop()
             print(f"[MicPlugin] capture unavailable: {exc}", flush=True)
