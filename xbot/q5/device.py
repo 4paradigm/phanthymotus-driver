@@ -315,10 +315,14 @@ class SpeakerPlugin:
                 time.sleep(0.005)
                 continue
             self._frames_received += 1
+            if self._frames_received == 1:
+                print(f"[SpeakerPlugin] first PCM frame received from {self._topic}", flush=True)
             try:
                 self._process.stdin.write(chunk)
                 self._process.stdin.flush()
                 self._frames_written += 1
+                if self._frames_written == 1:
+                    print("[SpeakerPlugin] first PCM frame written to ALSA", flush=True)
             except (BrokenPipeError, OSError):
                 detail = ""
                 if self._process and self._process.stderr:

@@ -166,12 +166,18 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
     pub_depth_preview = node.create_publisher(CompressedImage, f"{prefix}/camera/depth_preview", QOS_MEDIA)
     pub_mic = node.create_publisher(AudioChunk, f"{prefix}/mic/audio", QOS_MEDIA)
     speaker_sub = None
+    mic_frames_published = 0
+    speaker_frames_received = 0
 
     def _on_speaker(msg):
+        nonlocal speaker_frames_received
         if msg.format != "audio/pcm-16k":
             return
         try:
             speaker_q.put_nowait(bytes(msg.data))
+            speaker_frames_received += 1
+            if speaker_frames_received == 1:
+                node.get_logger().info("speaker received first PCM frame")
         except Exception:
             pass
 
@@ -331,6 +337,9 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
             out.format = "audio/pcm-16k"
             out.data = pcm
             pub_mic.publish(out)
+            mic_frames_published += 1
+            if mic_frames_published == 1:
+                node.get_logger().info("mic published first PCM frame to Domain 42")
 
         # Process sensor snapshot (non-blocking, latest only)
         try:
