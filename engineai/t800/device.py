@@ -82,6 +82,49 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+_GAMEPAD_BUTTON_NAMES = {
+    0: "LB", 1: "RB", 2: "A", 3: "B", 4: "X", 5: "Y",
+    6: "BACK", 7: "START", 8: "CROSS_X_UP", 9: "CROSS_X_DOWN",
+    10: "CROSS_Y_LEFT", 11: "CROSS_Y_RIGHT",
+}
+
+_GAMEPAD_ACTIONS = {
+    frozenset({"LB", "START"}): "idle",
+    frozenset({"LB", "RB"}): "passive",
+    frozenset({"LB", "A"}): "stand",
+    frozenset({"LB", "B"}): "walk",
+    frozenset({"RB", "B"}): "dance",
+    frozenset({"START", "CROSS_X_UP"}): "get_up",
+    frozenset({"START", "CROSS_X_DOWN"}): "lie_down",
+}
+
+
+def _pressed_gamepad_buttons(digital_states) -> list[str]:
+    return [
+        _GAMEPAD_BUTTON_NAMES.get(index, str(index))
+        for index, value in enumerate(digital_states or [])
+        if int(value) != 0
+    ]
+
+
+def _gamepad_control_source(msg) -> str:
+    # T800 touch-screen locomotion and the physical remote both fan into the
+    # GamepadKeys stream. The only stable runtime hint available in the message
+    # is hardware_connected, so keep the label explicit for canvas validation.
+    return "remote_gamepad" if bool(getattr(msg, "hardware_connected", False)) else "touchscreen_gamepad"
+
+
+def _motion_direction(stick_x: float, stick_y: float, yaw_x: float = 0.0) -> str:
+    parts: list[str] = []
+    if abs(stick_y) >= 0.10:
+        parts.append("forward" if stick_y > 0 else "backward")
+    if abs(stick_x) >= 0.10:
+        parts.append("right" if stick_x > 0 else "left")
+    if not parts and abs(yaw_x) >= 0.10:
+        parts.append("turn_right" if yaw_x > 0 else "turn_left")
+    return "_".join(parts) if parts else "none"
+
+
 def _json_message(payload: dict) -> String:
     def scalar_default(value):
         item = getattr(value, "item", None)
@@ -940,13 +983,17 @@ class MotionCommandTracePlugin:
         max_vy = abs(float(self._config.get("control", {}).get("max_vy", 1.0)))
         stick_x = analog[2] if len(analog) > 2 else 0.0
         stick_y = analog[3] if len(analog) > 3 else 0.0
+        yaw_x = analog[4] if len(analog) > 4 else 0.0
         estimated_speed = math.hypot(stick_y * max_vx, stick_x * max_vy)
         entry = {
             "hardware_connected": bool(msg.hardware_connected),
+            "control_source": _gamepad_control_source(msg),
             "digital_pressed": [index for index, value in enumerate(msg.digital_states) if int(value) != 0],
+            "buttons": _pressed_gamepad_buttons(msg.digital_states),
             "analog_states": analog,
             "left_stick": {"x": stick_x if len(analog) > 2 else None, "y": stick_y if len(analog) > 3 else None},
             "right_stick": {"x": analog[4] if len(analog) > 4 else None, "y": analog[5] if len(analog) > 5 else None},
+            "direction": _motion_direction(stick_x, stick_y, yaw_x),
             "estimated_speed_m_s": estimated_speed,
             "timestamp_ms": _now_ms(),
         }
@@ -1010,7 +1057,7 @@ class MotionCommandTracePlugin:
             speed = math.sqrt(sum(value * value for value in values))
             age_sec = velocity_age
         elif gamepad is not None:
-            source = "gamepad"
+            source = str(gamepad.get("control_source", "gamepad"))
             speed = float(gamepad.get("estimated_speed_m_s", 0.0))
             age_sec = gamepad_age
 
@@ -1023,6 +1070,7 @@ class MotionCommandTracePlugin:
             "speed": f"{speed_rounded:.2f} m/s",
             "motion_state": motion_state,
             "source": source,
+            "direction": "none" if gamepad is None else str(gamepad.get("direction", "none")),
             "gamepad_connected": None if gamepad is None else bool(gamepad.get("hardware_connected")),
             "age_sec": None if age_sec is None else round(age_sec, 1),
             "timestamp_ms": _now_ms(),
@@ -1104,6 +1152,16 @@ class MotionEventsPlugin:
         self._events = deque(maxlen=self._capacity)
         self._sequence = 0
         self._moving = False
+        self._latest_speed = 0.0
+        self._latest_speed_source = "none"
+        self._latest_speed_updated: float | None = None
+        self._latest_action = "none"
+        self._latest_buttons: list[str] = []
+        self._latest_control_source = "none"
+        self._latest_direction = "none"
+        self._current_motion_state = "unknown"
+        self._last_motion_state = "unknown"
+        self._last_gamepad_signature = ""
         self._motion_start_threshold = 0.05
         self._motion_stop_threshold = 0.03
 
@@ -1112,6 +1170,16 @@ class MotionEventsPlugin:
         max_vx = abs(float(control.get("max_vx", 3.0)))
         max_vy = abs(float(control.get("max_vy", 1.0)))
         return max(1.0, math.hypot(max_vx, max_vy) * 1.5)
+
+    def _classify_gamepad_action(self, buttons: list[str], speed: float) -> str:
+        button_set = frozenset(buttons)
+        if button_set in _GAMEPAD_ACTIONS:
+            return _GAMEPAD_ACTIONS[button_set]
+        if speed >= self._motion_start_threshold:
+            return "move"
+        if buttons:
+            return "buttons:" + "+".join(buttons)
+        return "none"
 
     def get_tool(self) -> dict:
         return {
@@ -1152,6 +1220,29 @@ class MotionEventsPlugin:
         }
 
     def start(self) -> None:
+        from interface_protocol.msg import BodyVelCmd, GamepadKeys, MotionState, MotionStateRequest
+
+        topics = self._config.get("topics", {})
+        body_velocity_topic = str(topics.get("body_velocity", "")).strip()
+        if body_velocity_topic:
+            self._robot_node.create_subscription(
+                BodyVelCmd, body_velocity_topic, self._on_velocity, _RELIABLE
+            )
+        motion_request_topic = str(topics.get("motion_request", "")).strip()
+        if motion_request_topic:
+            self._robot_node.create_subscription(
+                MotionStateRequest, motion_request_topic, self._on_motion_request, _RELIABLE_ONE
+            )
+        gamepad_topic = str(topics.get("gamepad", "")).strip()
+        if gamepad_topic:
+            self._robot_node.create_subscription(
+                GamepadKeys, gamepad_topic, self._on_gamepad, _BEST_EFFORT
+            )
+        motion_state_topic = str(topics.get("motion_state", "")).strip()
+        if motion_state_topic:
+            self._robot_node.create_subscription(
+                MotionState, motion_state_topic, self._on_motion_state, _BEST_EFFORT
+            )
         odometry_topic = str(self._config.get("topics", {}).get("odometry", "")).strip()
         if odometry_topic:
             from nav_msgs.msg import Odometry
@@ -1175,11 +1266,118 @@ class MotionEventsPlugin:
             return {"state": "idle"}
         return {"error": f"unknown motion events action: {action}"}
 
+    def _on_velocity(self, msg) -> None:
+        values = [float(value) for value in msg.linear_velocity]
+        speed = math.sqrt(sum(value * value for value in values))
+        self._handle_speed_sample(
+            speed,
+            source_tool="motion_command_trace",
+            source_kind="body_velocity_command",
+            detail={"linear_velocity": values, "yaw_velocity": float(msg.yaw_velocity)},
+        )
+
+    def _on_motion_request(self, msg) -> None:
+        motion_name = str(msg.target_motion_name)
+        with self._lock:
+            self._latest_action = motion_name
+        self.record_event(
+            source_tool="motion_command_trace",
+            event_type="motion_request",
+            severity="info",
+            phase="requested",
+            summary=f"motion request: {motion_name}",
+            detail={
+                "target_motion_name": motion_name,
+                "source": self._config.get("topics", {}).get("motion_request"),
+            },
+        )
+
+    def _on_gamepad(self, msg) -> None:
+        analog = [float(value) for value in msg.analog_states]
+        max_vx = abs(float(self._config.get("control", {}).get("max_vx", 3.0)))
+        max_vy = abs(float(self._config.get("control", {}).get("max_vy", 1.0)))
+        stick_x = analog[2] if len(analog) > 2 else 0.0
+        stick_y = analog[3] if len(analog) > 3 else 0.0
+        yaw_x = analog[4] if len(analog) > 4 else 0.0
+        speed = math.hypot(stick_y * max_vx, stick_x * max_vy)
+        buttons = _pressed_gamepad_buttons(msg.digital_states)
+        control_source = _gamepad_control_source(msg)
+        direction = _motion_direction(stick_x, stick_y, yaw_x)
+        action = self._classify_gamepad_action(buttons, speed)
+        signature = f"{control_source}|{action}|{direction}|{','.join(buttons)}|{round(speed, 2):.2f}"
+        should_record_input = (bool(buttons) or speed >= self._motion_start_threshold) and signature != self._last_gamepad_signature
+        with self._lock:
+            self._latest_action = action
+            self._latest_buttons = list(buttons)
+            self._latest_control_source = control_source
+            self._latest_direction = direction
+            self._last_gamepad_signature = signature
+        if should_record_input:
+            self.record_event(
+                source_tool="motion_command_trace",
+                event_type="gamepad_action",
+                severity="info",
+                phase="input",
+                summary=f"{control_source} action: {action}, {direction}, {speed:.2f} m/s",
+                detail={
+                    "action": action,
+                    "buttons": buttons,
+                    "control_source": control_source,
+                    "direction": direction,
+                    "speed": f"{speed:.2f} m/s",
+                    "source": self._config.get("topics", {}).get("gamepad"),
+                },
+            )
+        self._handle_speed_sample(
+            speed,
+            source_tool="motion_command_trace",
+            source_kind="gamepad",
+            detail={
+                "hardware_connected": bool(msg.hardware_connected),
+                "action": action,
+                "buttons": buttons,
+                "control_source": control_source,
+                "direction": direction,
+                "left_stick": {"x": stick_x if len(analog) > 2 else None, "y": stick_y if len(analog) > 3 else None},
+                "source": self._config.get("topics", {}).get("gamepad"),
+            },
+        )
+
+    def _on_motion_state(self, msg) -> None:
+        current = str(getattr(msg, "current_motion_task", "") or "unknown")
+        with self._lock:
+            previous = self._current_motion_state
+            self._last_motion_state = previous
+            self._current_motion_state = current
+            self._latest_action = current
+        if current and current != "unknown" and current != previous:
+            self.record_event(
+                source_tool="motion_state",
+                event_type="motion_state_changed",
+                severity="info",
+                phase="confirmed",
+                summary=f"motion state: {current}",
+                detail={"previous": previous, "current": current},
+            )
+
     def _on_odometry(self, msg) -> None:
         linear = msg.twist.twist.linear
         vx, vy, vz = float(linear.x), float(linear.y), float(linear.z)
         speed = math.sqrt(vx * vx + vy * vy + vz * vz)
         if not math.isfinite(speed) or speed > self._max_reasonable_speed():
+            return
+        self._handle_speed_sample(
+            speed,
+            source_tool="motion_command_trace",
+            source_kind="odometry",
+            detail={
+                "linear_velocity": {"x": vx, "y": vy, "z": vz},
+                "source": self._config.get("topics", {}).get("odometry"),
+            },
+        )
+
+    def _handle_speed_sample(self, speed: float, *, source_tool: str, source_kind: str, detail: dict) -> None:
+        if not math.isfinite(speed) or speed < 0.0 or speed > self._max_reasonable_speed():
             return
         with self._lock:
             moving = self._moving
@@ -1191,18 +1389,22 @@ class MotionEventsPlugin:
                 event = "motion_stop"
             else:
                 event = ""
+            self._latest_speed = speed
+            self._latest_speed_source = source_kind
+            self._latest_speed_updated = time.monotonic()
+            if source_kind != "gamepad":
+                self._latest_control_source = source_kind
+                self._latest_direction = "none"
         if not event:
             return
+        event_phase = "running" if event == "motion_start" else "completed"
         self.record_event(
-            source_tool="odometry",
+            source_tool=source_tool,
             event_type=event,
             severity="info",
-            phase="running" if event == "motion_start" else "completed",
-            summary=f"{event} detected from odometry speed {speed:.2f} m/s",
-            detail={
-                "speed": f"{speed:.2f} m/s",
-                "source": self._config.get("topics", {}).get("odometry"),
-            },
+            phase=event_phase,
+            summary=f"{event} detected from {source_kind} speed {speed:.2f} m/s",
+            detail={"speed": f"{speed:.2f} m/s", "source_kind": source_kind, **detail},
         )
 
     def record_tool_call(self, tool_name: str, action: str, args: dict, result: dict) -> None:
@@ -1264,27 +1466,35 @@ class MotionEventsPlugin:
             return dict(event)
 
     def _summary_snapshot(self) -> dict:
+        now = time.monotonic()
         with self._lock:
             latest_event = dict(self._events[-1]) if self._events else None
             events = [dict(event) for event in self._events]
-            total_buffered = len(self._events)
             total_recorded = self._sequence
-        warning_count = sum(1 for event in events if event["severity"] == "warning")
-        error_count = sum(1 for event in events if event["severity"] == "error")
+            moving = self._moving
+            latest_speed = self._latest_speed
+            latest_speed_source = self._latest_speed_source
+            latest_speed_updated = self._latest_speed_updated
+            latest_action = self._latest_action
+            latest_buttons = list(self._latest_buttons)
+            latest_control_source = self._latest_control_source
+            latest_direction = self._latest_direction
+            current_motion_state = self._current_motion_state
+        speed_age = None if latest_speed_updated is None else max(0.0, now - latest_speed_updated)
         return {
-            "state": "running" if latest_event else "no_data",
-            "type": None if latest_event is None else latest_event.get("type"),
-            "timestamp": None if latest_event is None else latest_event.get("timestamp"),
-            "source_tool": None if latest_event is None else latest_event.get("source_tool"),
-            "severity": None if latest_event is None else latest_event.get("severity"),
-            "phase": None if latest_event is None else latest_event.get("phase"),
+            "state": "running" if latest_event or latest_speed_updated is not None else "no_data",
+            "motion_state": "moving" if moving else "stopped",
+            "speed": f"{round(latest_speed, 2):.2f} m/s",
+            "speed_source": latest_speed_source,
+            "control_source": latest_control_source,
+            "action": latest_action,
+            "direction": latest_direction,
+            "buttons": latest_buttons,
+            "current_motion_state": current_motion_state,
+            "event": None if latest_event is None else latest_event.get("type"),
             "summary": None if latest_event is None else latest_event.get("summary"),
             "event_id": None if latest_event is None else latest_event.get("event_id"),
-            "total_recorded": total_recorded,
-            "total_buffered": total_buffered,
-            "warning_count": warning_count,
-            "error_count": error_count,
-            "timestamp_ms": _now_ms(),
+            "event_count": total_recorded,
         }
 
     def _debug_snapshot(self, args: dict | None = None) -> dict:

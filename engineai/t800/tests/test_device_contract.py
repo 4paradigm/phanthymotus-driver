@@ -339,9 +339,23 @@ class DevicePluginContractTests(unittest.TestCase):
             analog_states=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         ))
         snapshot = plugin.dispatch("status", {})
-        self.assertEqual("gamepad", snapshot["source"])
+        self.assertEqual("remote_gamepad", snapshot["source"])
         self.assertEqual("0.00 m/s", snapshot["speed"])
         self.assertEqual("stopped", snapshot["motion_state"])
+        self.assertEqual("none", snapshot["direction"])
+
+    def test_motion_trace_recognizes_touchscreen_gamepad_speed(self):
+        plugin = self.device.MotionCommandTracePlugin(CONFIG, "robot", self.ros)
+        plugin._on_gamepad(types.SimpleNamespace(
+            hardware_connected=False,
+            digital_states=[],
+            analog_states=[0.0, 0.0, -0.4, 0.3, 0.0, 0.0],
+        ))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("touchscreen_gamepad", snapshot["source"])
+        self.assertEqual("moving", snapshot["motion_state"])
+        self.assertEqual("forward_left", snapshot["direction"])
+        self.assertEqual("0.98 m/s", snapshot["speed"])
 
     def test_motion_events_ignore_implausible_odin_odometry(self):
         plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
@@ -352,6 +366,57 @@ class DevicePluginContractTests(unittest.TestCase):
         ))
         snapshot = plugin.dispatch("status", {})
         self.assertEqual("no_data", snapshot["state"])
+
+    def test_motion_events_detect_gamepad_motion_transitions(self):
+        plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
+        plugin._on_gamepad(types.SimpleNamespace(
+            hardware_connected=False,
+            digital_states=[],
+            analog_states=[0.0, 0.0, 0.0, 0.5, 0.0, 0.0],
+        ))
+        moving = plugin.dispatch("status", {})
+        self.assertEqual("running", moving["state"])
+        self.assertEqual("moving", moving["motion_state"])
+        self.assertEqual("gamepad", moving["speed_source"])
+        self.assertEqual("touchscreen_gamepad", moving["control_source"])
+        self.assertEqual("move", moving["action"])
+        self.assertEqual("forward", moving["direction"])
+        self.assertEqual([], moving["buttons"])
+        self.assertEqual("1.50 m/s", moving["speed"])
+        self.assertEqual("motion_start", moving["event"])
+
+        plugin._on_gamepad(types.SimpleNamespace(
+            hardware_connected=False,
+            digital_states=[],
+            analog_states=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ))
+        stopped = plugin.dispatch("status", {})
+        self.assertEqual("stopped", stopped["motion_state"])
+        self.assertEqual("0.00 m/s", stopped["speed"])
+        self.assertEqual("motion_stop", stopped["event"])
+
+    def test_motion_events_identify_gamepad_macro_and_motion_state(self):
+        plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
+        digital = [0] * 12
+        digital[0] = 1  # LB
+        digital[2] = 1  # A
+        plugin._on_gamepad(types.SimpleNamespace(
+            hardware_connected=True,
+            digital_states=digital,
+            analog_states=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("stand", snapshot["action"])
+        self.assertEqual("remote_gamepad", snapshot["control_source"])
+        self.assertEqual("none", snapshot["direction"])
+        self.assertEqual(["LB", "A"], snapshot["buttons"])
+        self.assertEqual("gamepad_action", snapshot["event"])
+
+        plugin._on_motion_state(types.SimpleNamespace(current_motion_task="pd_stand"))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("pd_stand", snapshot["current_motion_state"])
+        self.assertEqual("pd_stand", snapshot["action"])
+        self.assertEqual("motion_state_changed", snapshot["event"])
 
     def test_derived_diagnostics_and_capability_resources(self):
         self.state._set("imu", {
