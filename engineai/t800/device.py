@@ -3744,6 +3744,12 @@ class ControlledSpatialPlugin:
             self._start_time = time.monotonic()
             self._frame_count = 0
 
+        try:
+            self._db.set_state("map_status", "mapping")
+            self._db.set_state("active_map", map_name)
+        except Exception as exc:
+            print(f"[controlled_spatial] failed to persist map_status: {exc}", flush=True)
+
         print(f"[controlled_spatial] started mapping '{map_name}'", flush=True)
         return {
             "state": "mapping",
@@ -3771,6 +3777,11 @@ class ControlledSpatialPlugin:
             self._start_time = None
             self._frame_count = 0
             # _active_map 保留为 map_name：地图仍处于活动状态，可继续 tag_place
+
+        try:
+            self._db.set_state("map_status", "idle")
+        except Exception as exc:
+            print(f"[controlled_spatial] failed to persist map_status: {exc}", flush=True)
 
         if "error" in result:
             print(f"[controlled_spatial] save failed for '{map_name}': {result['error']}", flush=True)
@@ -3800,6 +3811,12 @@ class ControlledSpatialPlugin:
             self._start_time = None
             self._frame_count = 0
             self._active_map = None
+
+        try:
+            self._db.set_state("map_status", "idle")
+            self._db.set_state("active_map", None)
+        except Exception as exc:
+            print(f"[controlled_spatial] failed to persist map_status: {exc}", flush=True)
 
         print(f"[controlled_spatial] cancelled mapping '{map_name}'", flush=True)
         return {"state": "cancelled", "map_name": map_name}
