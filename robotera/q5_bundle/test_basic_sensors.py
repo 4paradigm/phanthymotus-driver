@@ -81,6 +81,16 @@ class Q5BasicSensorTests(unittest.TestCase):
 
         self.assertSetEqual(copied_modules, runtime_modules)
 
+    def test_deploy_manifest_mounts_q5_interfaces_and_dds_config(self):
+        package_dir = Path(__file__).parent
+        dockerfile = (package_dir / "Dockerfile").read_text(encoding="utf-8")
+        service = (package_dir / "deploy" / "service.yml").read_text(encoding="utf-8")
+
+        self.assertIn("COPY deploy/ /deploy/", dockerfile)
+        self.assertIn("/home/nvidia/teleop_client/install:/opt/teleop_client/install:ro", service)
+        self.assertIn("/home/nvidia/cyclonedds-orin.xml:/etc/cyclonedds/q5.xml:ro", service)
+        self.assertIn("Q5_CYCLONEDDS_URI=file:///etc/cyclonedds/q5.xml", service)
+
     def test_joint_state_groups_confirmed_hand_names(self):
         data = joints_state.build(FRESH_JOINT_SNAPSHOT)
         self.assertTrue(data["fresh"])
