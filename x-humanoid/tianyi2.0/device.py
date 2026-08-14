@@ -2972,7 +2972,16 @@ class ArmPlugin:
 
     def _handle_move_traj(self, args: dict) -> dict:
         waypoints_raw = args.get("waypoints")
-        if not waypoints_raw or not isinstance(waypoints_raw, list) or len(waypoints_raw) < 2:
+        if waypoints_raw is None:
+            return {"state": "error", "error": "waypoints is required for move_traj and must have at least 2 points",
+                    "code": "invalid_arm_waypoints"}
+        if isinstance(waypoints_raw, str):
+            try:
+                waypoints_raw = json.loads(waypoints_raw)
+            except json.JSONDecodeError as exc:
+                return {"state": "error", "error": f"waypoints must be valid JSON: {exc}",
+                        "code": "invalid_arm_waypoints"}
+        if not isinstance(waypoints_raw, list) or len(waypoints_raw) < 2:
             return {"state": "error", "error": "waypoints is required for move_traj and must have at least 2 points",
                     "code": "invalid_arm_waypoints"}
         speed = args.get("speed", 0.5)
