@@ -9,8 +9,11 @@ import re
 import signal
 import socket
 import threading
+import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import rclpy
 import rclpy.executors
@@ -26,7 +29,12 @@ def _load_config() -> dict:
 
 def _resolve_namespace(config: dict) -> str:
     value = str(config.get("ros_namespace", "")).strip() or socket.gethostname()
-    return re.sub(r"[^a-zA-Z0-9_]", "_", value)
+    namespace = re.sub(r"[^a-zA-Z0-9_]", "_", value).strip("_")
+    if not namespace:
+        return "t800"
+    if not re.match(r"[a-zA-Z_]", namespace):
+        namespace = f"t800_{namespace}"
+    return namespace
 
 
 def _configure_cyclonedds(config: dict) -> str:
@@ -274,6 +282,9 @@ _bundle: T800DeviceBundle | None = None
 
 
 def make_handler():
+    sse_sessions: dict[str, "Handler"] = {}
+    sse_sessions_lock = threading.Lock()
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             msg = fmt % args
@@ -291,8 +302,38 @@ def make_handler():
             self.end_headers()
             self.wfile.write(body)
 
+        def _send_sse(self, event: str, data: str) -> bool:
+            try:
+                payload = f"event: {event}\ndata: {data}\n\n".encode()
+                self.wfile.write(payload)
+                self.wfile.flush()
+                return True
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return False
+
         def do_GET(self):
-            if self.path == "/health":
+            parsed = urlparse(self.path)
+            if parsed.path == "/mcp/sse":
+                session_id = uuid.uuid4().hex
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "keep-alive")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                with sse_sessions_lock:
+                    sse_sessions[session_id] = self
+                endpoint = f"/mcp/messages?session_id={session_id}"
+                try:
+                    if not self._send_sse("endpoint", endpoint):
+                        return
+                    while self._send_sse("ping", "{}"):
+                        time.sleep(15)
+                finally:
+                    with sse_sessions_lock:
+                        sse_sessions.pop(session_id, None)
+                return
+            if parsed.path == "/health":
                 if _bundle is None:
                     self._send_json(503, {"state": "starting", "driver": "engineai-t800"})
                     return
@@ -309,7 +350,8 @@ def make_handler():
             self.end_headers()
 
         def do_POST(self):
-            if self.path != "/mcp":
+            parsed = urlparse(self.path)
+            if parsed.path not in ("/mcp", "/mcp/messages"):
                 self._send_json(404, {"error": "not found"})
                 return
             length = int(self.headers.get("Content-Length", 0))
@@ -325,12 +367,27 @@ def make_handler():
                 self.end_headers()
                 return
 
+            session_id = parse_qs(parsed.query).get("session_id", [""])[0]
+            with sse_sessions_lock:
+                sse_client = sse_sessions.get(session_id)
+
+            def response(payload: dict) -> None:
+                if sse_client is None:
+                    self._send_json(200, payload)
+                    return
+                self.send_response(202)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                if not sse_client._send_sse("message", json.dumps(payload, ensure_ascii=False)):
+                    with sse_sessions_lock:
+                        sse_sessions.pop(session_id, None)
+
             def ok(result):
-                self._send_json(200, {"jsonrpc": "2.0", "id": request_id, "result": result})
+                response({"jsonrpc": "2.0", "id": request_id, "result": result})
 
             def error(code, message):
-                self._send_json(200, {"jsonrpc": "2.0", "id": request_id,
-                                      "error": {"code": code, "message": message}})
+                response({"jsonrpc": "2.0", "id": request_id,
+                          "error": {"code": code, "message": message}})
 
             method = rpc.get("method", "")
             params = rpc.get("params") or {}
