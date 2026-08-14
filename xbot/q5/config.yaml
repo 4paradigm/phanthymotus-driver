@@ -48,9 +48,8 @@ plugins:
     channels: 1
   speaker:
     enabled: true
-    # Agent Core wires perception TTS's audio/pcm-16k output here. The default
-    # also makes a default perception TTS instance work without extra config.
-    input_topic: "/perception/tts"
+    # The canvas supplies the connected audio/pcm-16k source topic when the
+    # speaker starts. This accepts microphone, TTS, and any compatible source.
     # Verified hardware ALSA endpoint. PortAudio cannot enumerate it as an
     # output device in Q5's developer container, so speaker uses ALSA directly.
     device: "hw:2,0"

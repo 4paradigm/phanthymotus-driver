@@ -200,6 +200,8 @@ class MicPlugin:
                 self._frames_sent += 1
                 if self._frames_sent == 1:
                     print(f"[MicPlugin] first 100 ms frame published -> {self._topic}", flush=True)
+                elif self._frames_sent % 100 == 0:
+                    print(f"[MicPlugin] {self._frames_sent} PCM frames forwarded to bridge", flush=True)
         if self._running:
             print("[MicPlugin] remote capture stream ended", flush=True)
 
@@ -317,6 +319,8 @@ class SpeakerPlugin:
             self._frames_received += 1
             if self._frames_received == 1:
                 print(f"[SpeakerPlugin] first PCM frame received from {self._topic}", flush=True)
+            elif self._frames_received % 100 == 0:
+                print(f"[SpeakerPlugin] {self._frames_received} PCM frames received from {self._topic}", flush=True)
             try:
                 self._process.stdin.write(chunk)
                 self._process.stdin.flush()

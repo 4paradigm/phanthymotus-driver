@@ -164,7 +164,10 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
     pub_rgb = node.create_publisher(CompressedImage, f"{prefix}/camera/rgb", QOS_MEDIA)
     pub_depth = node.create_publisher(Image, f"{prefix}/camera/depth", QOS_MEDIA)
     pub_depth_preview = node.create_publisher(CompressedImage, f"{prefix}/camera/depth_preview", QOS_MEDIA)
-    pub_mic = node.create_publisher(AudioChunk, f"{prefix}/mic/audio", QOS_MEDIA)
+    # Audio is a live lossy stream. Match the audio cards used by the other
+    # drivers so Agent Core/FastDDS subscribers can request BEST_EFFORT without
+    # a reliability negotiation mismatch or unnecessary retransmission delay.
+    pub_mic = node.create_publisher(AudioChunk, f"{prefix}/mic/audio", QOS_AUDIO)
     speaker_sub = None
     mic_frames_published = 0
     speaker_frames_received = 0
@@ -334,12 +337,16 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
             except Exception:
                 break
             out = AudioChunk()
+            out.header.stamp = node.get_clock().now().to_msg()
             out.format = "audio/pcm-16k"
             out.data = pcm
             pub_mic.publish(out)
             mic_frames_published += 1
             if mic_frames_published == 1:
                 node.get_logger().info("mic published first PCM frame to Domain 42")
+            elif mic_frames_published % 100 == 0:
+                node.get_logger().info(
+                    f"mic published {mic_frames_published} PCM frames to Domain 42")
 
         # Process sensor snapshot (non-blocking, latest only)
         try:
