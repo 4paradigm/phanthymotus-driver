@@ -9,9 +9,11 @@
 ARG ROS_BASE_IMAGE=ros:humble
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
 ARG APT_MIRROR=
-FROM ${ROS_BASE_IMAGE}
+ARG SKIP_SYSTEM_DEPS=0
+FROM ${ROS_BASE_IMAGE} AS q5-system-deps
 ARG PYPI_MIRROR
 ARG APT_MIRROR
+ARG SKIP_SYSTEM_DEPS
 
 WORKDIR /work
 
@@ -21,8 +23,11 @@ RUN if [ -n "$APT_MIRROR" ]; then \
         sed -i "s|archive.ubuntu.com|${APT_MIRROR}|g" /etc/apt/sources.list; \
     fi
 
-RUN apt-get -o Acquire::Retries=5 update && \
-    apt-get install -y --no-install-recommends \
+RUN if [ "$SKIP_SYSTEM_DEPS" = "1" ]; then \
+        echo "using prebuilt Q5 system-dependency image"; \
+    else \
+        apt-get -o Acquire::Retries=5 update && \
+        apt-get install -y --no-install-recommends \
         python3-numpy \
         python3-opencv \
         openssh-client \
@@ -40,7 +45,15 @@ RUN apt-get -o Acquire::Retries=5 update && \
         ros-humble-std-srvs \
         ros-humble-diagnostic-msgs \
         ros-humble-action-msgs && \
-    rm -rf /var/lib/apt/lists/*
+        rm -rf /var/lib/apt/lists/*; \
+    fi
+
+# Build once on the external PC with:
+#   docker build --target q5-system-deps -t q5-driver-base:humble .
+# Normal code-only rebuilds then reuse it with:
+#   docker build --build-arg ROS_BASE_IMAGE=q5-driver-base:humble \
+#     --build-arg SKIP_SYSTEM_DEPS=1 -t q5-driver:zhang .
+FROM q5-system-deps
 
 # 本地 vendor 的 ROS2 消息包。
 COPY vendor/xbot_common_interfaces /q5_ws/src/xbot_common_interfaces
