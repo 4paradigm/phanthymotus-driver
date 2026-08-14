@@ -196,7 +196,9 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
             # identical packet that arrives in this short duplicate window.
             now = time.monotonic()
             digest = hashlib.blake2s(pcm, digest_size=8).digest()
-            if digest == last_speaker_digest and now - last_speaker_frame_at < 0.02:
+            browser_frame = msg.header.stamp.sec == 0 and msg.header.stamp.nanosec == 0
+            if (browser_frame and digest == last_speaker_digest
+                    and now - last_speaker_frame_at < 0.02):
                 speaker_duplicate_frames_dropped += 1
                 return
             last_speaker_digest = digest
