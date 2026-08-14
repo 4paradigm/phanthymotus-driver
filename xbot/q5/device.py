@@ -201,20 +201,21 @@ rc = alsa.snd_pcm_set_params(pcm, 2, 3, %d, %d, 1, 200000)
 if rc < 0: raise RuntimeError('snd_pcm_set_params failed: %%d' %% rc)
 state = None
 pending = bytearray()
-# The observed Agent Core bridge can deliver bursts after up to 262 ms without
-# a frame. Prefill 512 ms once so those delays cannot starve the USB card.
-# This intentionally trades a small fixed live-monitoring delay for stable
-# speech, instead of repeatedly underrunning and restarting ALSA playback.
-prefill_bytes = 1024 * 16
+# Handle and submit fixed 300 ms PCM blocks, matching the stable Unitree live
+# speaker strategy.  The bridge has shown gaps up to 262 ms, so prefill two
+# blocks before opening the audio gate.  This avoids USB-card underruns caused
+# by scheduling a separate ALSA write for every arbitrary transport fragment.
+input_block_bytes = 9600
+prefill_bytes = input_block_bytes * 2
 try:
   while True:
-    chunk = sys.stdin.buffer.read(1024)
+    chunk = sys.stdin.buffer.read(input_block_bytes)
     if not chunk: break
     pending.extend(chunk)
     if len(pending) < prefill_bytes:
       continue
-    raw = bytes(pending[:1024])
-    del pending[:1024]
+    raw = bytes(pending[:input_block_bytes])
+    del pending[:input_block_bytes]
     mono, state = audioop.ratecv(raw, 2, 1, 16000, %d, state)
     stereo = audioop.tostereo(mono, 2, 1, 1)
     frames = len(stereo) // %d
