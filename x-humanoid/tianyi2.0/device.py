@@ -2652,12 +2652,12 @@ class ArmPlugin:
                                 "left_positions": {
                                     "type": "array", "items": {"type": "number", "minimum": -170, "maximum": 170},
                                     "minItems": 7, "maxItems": 7,
-                                    "description": "左臂7关节角度(度)，缺失时继承上一个路径点"
+                                    "description": "左臂7关节角度(度)，顺序[肩pitch,肩roll,肩yaw,肘pitch,腕yaw,腕pitch,腕roll]，缺失时继承上一个路径点"
                                 },
                                 "right_positions": {
                                     "type": "array", "items": {"type": "number", "minimum": -170, "maximum": 170},
                                     "minItems": 7, "maxItems": 7,
-                                    "description": "右臂7关节角度(度)，缺失时继承上一个路径点"
+                                    "description": "右臂7关节角度(度)，顺序同左臂，缺失时继承上一个路径点"
                                 },
                                 "time_from_start": {
                                     "type": "number", "minimum": 0,
@@ -2684,8 +2684,11 @@ class ArmPlugin:
                     "speed": {"type": "number", "minimum": 0.2, "maximum": 1.5,
                               "default": 0.5,
                               "description": (
-                                  "仅move_pos使用：决定手臂移动到目标姿势时有多快。"
-                                  "范围[0.2,1.5]rad/s，默认0.5。move_ctrl不能用它来减速"
+                                  "关节角速度，可设置范围[0.2,1.5]rad/s，推荐默认值0.5。"
+                                  "move_pos：决定手臂移动到目标姿势有多快；常规动作用0.5，"
+                                  "想要更慢更稳可降到0.3左右，想要更快更利落可提到0.8左右。"
+                                  "move_traj：整条轨迹执行时关节移动的快慢，实际节奏由waypoints的"
+                                  "time_from_start控制。move_ctrl不使用此参数（不能靠它减速）"
                               )},
                     "kp": {"type": "array", "items": {"type": "number", "minimum": 10, "maximum": 200},
                            "minItems": 7, "maxItems": 7,
@@ -2721,8 +2724,16 @@ class ArmPlugin:
                                   )},
                     "move_traj": {"params": ["waypoints", "speed"],
                                   "description": (
-                                      "轨迹模式：一次接收完整waypoint序列，驱动侧50Hz插值连续下发，"
-                                      "消除多段move_pos之间的LLM调度停顿。适合太极、舞蹈等连贯动作"
+                                      "轨迹模式：一次下发完整路径点序列，驱动侧以50Hz线性插值连续下发"
+                                      "CmdSetMotorPosition，消除多段move_pos之间的LLM调度停顿。适合太极、"
+                                      "舞蹈、连贯手势等多段连续动作。参数格式："
+                                      "waypoints为数组(至少2个点，按time_from_start升序)，每个点包含："
+                                      "time_from_start(秒，从轨迹开始到此点的时间，必填且必须递增)、"
+                                      "left_positions/right_positions(7关节角度，单位度，两者可省略其一，"
+                                      "缺失的一侧自动继承上一个路径点；第一个点若缺失某侧则该侧默认全0)。"
+                                      "关节顺序为[肩pitch,肩roll,肩yaw,肘pitch,腕yaw,腕pitch,腕roll]，"
+                                      "负pitch=向前。speed为关节角速度[0.2,1.5]rad/s，推荐0.5。"
+                                      "轨迹总时长>3秒时异步执行并返回action_id，≤3秒同步返回completed"
                                   )},
                 },
             },
