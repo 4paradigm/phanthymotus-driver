@@ -4880,7 +4880,7 @@ class HomePlugin:
                 },
                 "x-action-params": {
                     "list_docks": {"params": [], "description": "列出当前地图已注册的全部充电桩，返回名称、dock_id 与位姿；可据此选择或删除充电桩"},
-                    "register_dock": {"params": ["display_name"], "description": "将机器人当前定位位姿保存为一个新充电桩。执行前应让机器人停在实际充电桩的对接位置并确认定位正常"},
+                    "register_dock": {"params": ["display_name"], "description": "将机器人当前定位位姿保存为一个新充电桩。执行前应让机器人停在实际充电桩的对接位置并确认定位正常。此操作只注册记录，不会自动设为当前回桩目标；注册后请用 list_docks 获取 dock_id，再执行 set_dock"},
                     "set_dock": {"params": ["dock_id", "pose"], "description": "设置本次及后续回桩使用的当前目标。填写 dock_id 时读取已注册充电桩的位姿；也可直接填写 pose。二者任选其一，位姿必须匹配当前地图"},
                     "delete_dock": {"params": ["dock_id"], "description": "删除 list_docks 返回的指定充电桩记录，不会移动机器人"},
                     "clear_docks": {"params": [], "description": "删除全部已注册充电桩记录，不会移动机器人，操作不可恢复"},

@@ -84,6 +84,8 @@ def test_home_schema_owns_go_home():
     assert "go_home_no_dock" not in home_actions
     set_dock = home.get_tool()["inputSchema"]["x-action-params"]["set_dock"]
     assert "二者任选其一" in set_dock["description"]
+    register_dock = home.get_tool()["inputSchema"]["x-action-params"]["register_dock"]
+    assert "不会自动设为当前回桩目标" in register_dock["description"]
     assert "go_home" not in module.NavPlugin({}, "", types.SimpleNamespace(ctx_tianyi=None, executor_tianyi=types.SimpleNamespace(add_node=lambda _: None)), _Client({})).get_tool()["inputSchema"]["properties"]["action"]["enum"]
 
 
