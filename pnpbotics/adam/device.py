@@ -1112,6 +1112,16 @@ class ZedCameraPlugin:
     def _capture_active(self):
         return self._running and not self._stop_event.is_set()
 
+    @staticmethod
+    def _advance_deadline(deadline, period, now):
+        """Advance a stream on an absolute schedule without jitter drift."""
+        if deadline <= 0.0:
+            return now + period
+        deadline += period
+        if deadline <= now:
+            return now + period
+        return deadline
+
     def _publish_capture_message(self, publisher, message):
         """Publish while keeping teardown from racing the ROS call."""
         if publisher is None:
@@ -1240,6 +1250,9 @@ class ZedCameraPlugin:
         next_rgb = 0.0
         next_depth = 0.0
         next_pointcloud = 0.0
+        rgb_period = 1.0 / self._rgb_hz
+        depth_period = 1.0 / self._depth_hz
+        pointcloud_period = 1.0 / self._pointcloud_hz
         last_grab_error = None
 
         try:
@@ -1284,7 +1297,8 @@ class ZedCameraPlugin:
                     except Exception as exc:
                         if self._capture_active():
                             self._set_error(f"RGB publish failed: {exc}")
-                    next_rgb = now + 1.0 / self._rgb_hz
+                    next_rgb = self._advance_deadline(
+                        next_rgb, rgb_period, now)
 
                 need_depth = depth_enabled and now >= next_depth
                 need_pointcloud = pointcloud_enabled and now >= next_pointcloud
@@ -1302,7 +1316,8 @@ class ZedCameraPlugin:
                     except Exception as exc:
                         if self._capture_active():
                             self._set_error(f"depth publish failed: {exc}")
-                    next_depth = now + 1.0 / self._depth_hz
+                    next_depth = self._advance_deadline(
+                        next_depth, depth_period, now)
 
                 if need_pointcloud and self._capture_active():
                     try:
@@ -1317,7 +1332,8 @@ class ZedCameraPlugin:
                     except Exception as exc:
                         if self._capture_active():
                             self._set_error(f"pointcloud publish failed: {exc}")
-                    next_pointcloud = now + 1.0 / self._pointcloud_hz
+                    next_pointcloud = self._advance_deadline(
+                        next_pointcloud, pointcloud_period, now)
         finally:
             self._available = False
             if self._running and not self._stop_event.is_set():
