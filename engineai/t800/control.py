@@ -334,8 +334,10 @@ def action_schema(
     actions: dict[str, tuple[list[str], str]],
     properties: dict,
     description: str,
+    *,
+    completion: dict | None = None,
 ) -> dict:
-    return {
+    schema = {
         "type": "object",
         "properties": {
             "action": {
@@ -351,6 +353,9 @@ def action_schema(
             for name, (params, action_description) in actions.items()
         },
     }
+    if completion is not None:
+        schema["x-completion"] = completion
+    return schema
 
 
 def sensor_action_schema() -> dict:

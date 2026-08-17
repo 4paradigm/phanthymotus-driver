@@ -282,6 +282,11 @@ class DevicePluginContractTests(unittest.TestCase):
                 for parameter in detail.get("params", []):
                     self.assertIn(parameter, properties, f"{tool['name']}.{action_name}")
 
+    def test_loco_tool_declares_move_completion(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        schema = plugin.get_tool()["inputSchema"]
+        self.assertEqual({"actions": ["move"], "timeout": 60}, schema["x-completion"])
+
     def test_sensor_lifecycle_schemas_and_info_topics_match_agent_core(self):
         plugins = [
             self.state,

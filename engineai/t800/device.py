@@ -1873,6 +1873,7 @@ class LocomotionPlugin:
                     "linear_speed_m_s": {"type": "number", "description": "圆弧线速度，m/s；负数为后退"},
                 },
                 "运动动作",
+                completion={"actions": ["move"], "timeout": 60},
             ),
         }
 

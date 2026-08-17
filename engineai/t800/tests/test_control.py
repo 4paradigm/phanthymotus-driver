@@ -79,6 +79,19 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(["move", "stop"], schema["properties"]["action"]["enum"])
         self.assertEqual(["vx"], schema["x-action-params"]["move"]["params"])
 
+    def test_action_schema_can_declare_x_completion(self):
+        schema = action_schema(
+            {"move": (["vx"], "移动"), "stop": ([], "停止")},
+            {"vx": {"type": "number"}},
+            "运动",
+            completion={"actions": ["move"], "timeout": 60},
+        )
+        self.assertEqual({"actions": ["move"], "timeout": 60}, schema["x-completion"])
+
+    def test_action_schema_without_completion_has_no_x_completion(self):
+        schema = action_schema({"stop": ([], "停止")}, {}, "运动")
+        self.assertNotIn("x-completion", schema)
+
     def test_sensor_tool_has_read_only_topic_contract(self):
         tool = sensor_tool("imu", "IMU", "/robot/state/imu", "data/json")
         self.assertTrue(tool["readOnly"])
