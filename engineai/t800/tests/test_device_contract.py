@@ -1078,11 +1078,32 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("idle", plugin.dispatch("stop", {})["state"])
         self.assertEqual([], plugin._node.subscriptions)
 
+    def test_speaker_discards_callbacks_from_previous_session(self):
+        # review 反馈:stop() 后残留的 ROS 回调若在新会话播放器就绪后执行,
+        # 会把旧 topic 的 PCM 入队泄漏到新连接——回调须绑定会话。
+        plugin = self.device.SpeakerPlugin(CONFIG, "robot", self.ros)
+        plugin.start()
+        old_session = plugin._session
+        # 旧会话回调(模拟 stop 后仍被派发)必须被丢弃
+        plugin._on_chunk(types.SimpleNamespace(format="audio/pcm-16k",
+                                               data=[1, 2, 3, 4]), session=old_session)
+        self.assertEqual(0, plugin._queue.qsize())
+        # 未绑定会话且未运行的回调也丢弃
+        plugin._running = False
+        plugin._on_chunk(types.SimpleNamespace(format="audio/pcm-16k", data=[1, 2, 3, 4]))
+        self.assertEqual(0, plugin._queue.qsize())
+        # 当前会话回调正常入队
+        plugin._running = True
+        plugin._on_chunk(types.SimpleNamespace(format="audio/pcm-16k",
+                                               data=[1, 2, 3, 4]), session=plugin._session)
+        self.assertEqual(1, plugin._queue.qsize())
+
     def test_speaker_sliding_window_drops_oldest_on_overflow(self):
         # 持续实时流(remote_mic)发布速率高于播放速率时,队列满应丢最旧块
         # 而非新块,保证播放跟随最新输入(否则永远滞后 6 秒+)。
         plugin = self.device.SpeakerPlugin(CONFIG, "robot", self.ros)
         plugin.start()
+        plugin._running = True
         # 队列 maxsize=50,塞 55 块,验证尾部(最新)数据保留、头部(最旧)被丢
         for i in range(55):
             plugin._on_chunk(types.SimpleNamespace(

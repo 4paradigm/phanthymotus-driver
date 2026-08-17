@@ -3611,13 +3611,14 @@ class SpeakerPlugin:
     def _start_play(self, topic: str) -> dict:
         self.stop()
         from audio_msgs.msg import AudioChunk
+        session = self._session  # stop() 已递增,捕获当前会话
         try:
             self._check_pulse()
             self._run_command(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "0"])
             self._process = self._spawn_player()
             self._input_topic = topic
             self._subscription = self._node.create_subscription(
-                AudioChunk, topic, self._on_chunk, _AUDIO_QOS
+                AudioChunk, topic, lambda msg: self._on_chunk(msg, session), _AUDIO_QOS
             )
         except Exception as exc:
             self.stop()
@@ -3637,7 +3638,13 @@ class SpeakerPlugin:
         self._thread.start()
         return {"state": "ready", "topic_in": [{"topic": topic, "format": "audio/pcm-16k"}]}
 
-    def _on_chunk(self, msg) -> None:
+    def _on_chunk(self, msg, session: int | None = None) -> None:
+        # 丢弃不属于当前会话的回调:stop() 后残留的 ROS 回调若在新会话
+        # 播放器已就绪后执行,会把旧 topic 的 PCM 入队泄漏到新连接。
+        if session is not None and session != self._session:
+            return
+        if not self._running:
+            return
         pcm = bytes(msg.data)
         if pcm == self._EOF_MAGIC or not pcm:
             return
