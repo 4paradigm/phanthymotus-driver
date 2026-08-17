@@ -155,7 +155,7 @@ class LynxM20ContractTests(unittest.TestCase):
             streams = {
                 "motion_info": {"robot_topic": "/MOTION_INFO", "topic": "/host/lynx_m20/motion_info", "format": "data/json"},
                 "imu": {"robot_topic": "/IMU", "topic": "/host/lynx_m20/imu", "format": "data/json"},
-                "lidar": {"robot_topic": "/LIDAR/POINTS", "topic": "/host/lynx_m20/lidar", "format": "pointcloud/ros2"},
+                "lidar": {"robot_topic": "/LIDAR/POINTS", "topic": "/host/lynx_m20/lidar", "format": "sensor/pointcloud"},
             }
             rtsp_streams = {
                 "camera_front": {"url": "rtsp://10.21.31.103:8554/video1", "format": "video/h265"},
@@ -167,6 +167,11 @@ class LynxM20ContractTests(unittest.TestCase):
             for definition in plugin.get_tools()
             if "topic_out" in definition
         }
+        canvas_formats = {"data/json", "data/odometry", "sensor/pointcloud", "video/h265"}
+
+        for topic_out in static_topics.values():
+            for output in topic_out:
+                self.assertIn(output["format"], canvas_formats)
 
         for name in (*FakeStateNodes.streams, *FakeStateNodes.rtsp_streams):
             info = plugin.dispatch("info", {"_tool_name": name})
