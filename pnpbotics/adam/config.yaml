@@ -29,7 +29,6 @@ plugins:
     camera_flip: true
     rgb_hz: 15
     depth_hz: 8
-    info_hz: 1
     jpeg_quality: 70
     pointcloud:
       # Discover the card without continuously consuming GPU/bandwidth.
