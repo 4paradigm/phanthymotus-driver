@@ -78,10 +78,45 @@ _TEACHING_ACTIONS = {
     # ENDTEACH is deprecated. SAVETEACH finishes the recording and saves it.
     "finish_and_save_recording": ("SAVETEACH", {12, 14, 29}),
     "play_recording": ("PLAYTEACH", {23}),
-    "stop_playback": ("WALK", {2}),
 }
 
 _SEMANTIC_ACTION_WORKMODES = {5, 8, 9, 10, 31, 32, 33}
+_TEAR_AUTO_EXIT_S = 5.0
+_PLAYBACK_MOVING_THRESHOLD = 0.15
+_PLAYBACK_STATIONARY_THRESHOLD = 0.10
+_PLAYBACK_STATIONARY_CONFIRM_S = 2.0
+_PLAYBACK_MOTION_START_TIMEOUT_S = 10.0
+_PLAYBACK_MAX_MONITOR_S = 120.0
+
+# Face-up stand-up safety gate, calibrated from the supplied Bumi samples.
+# Linear acceleration is expressed in the robot IMU frame.  Comparing its
+# normalized direction avoids depending on the exact measured gravity value.
+_STAND_POSE_SAMPLE_COUNT = 5
+_STAND_POSE_SAMPLE_INTERVAL_S = 0.05
+_FACE_UP_GRAVITY_DIRECTION = (0.98480989, 0.00318972, 0.17360677)
+_FACE_UP_MAX_GRAVITY_ANGLE_DEG = 8.0
+_STAND_POSE_ACCELERATION_RANGE = (9.2, 10.4)
+_STAND_POSE_MAX_ANGULAR_VELOCITY = 0.10
+_STAND_POSE_MAX_JOINT_VELOCITY = 0.15
+
+# Median joint references from the verified face-up sample.  Tolerances are
+# deliberately wider than its sensor noise, while still rejecting the supplied
+# bent-leg sample and grossly misplaced limbs.  IMU and joint checks must both
+# pass; joint positions alone are not treated as proof of physical pose.
+_FACE_UP_JOINT_REFERENCES = (
+    0.37175, 0.02994, -0.07954, -0.53407,
+    -0.14630, -0.00973, -0.00858, -0.03567, -0.29445, 0.00682,
+    0.40684, -0.09136, 0.07916, -0.53845,
+    -0.15660, -0.01545, 0.09556, -0.04482, -0.25210, -0.01301,
+    0.01850,
+)
+_FACE_UP_JOINT_TOLERANCES = (
+    0.65, 0.45, 0.45, 0.55,
+    0.40, 0.30, 0.35, 0.40, 0.45, 0.45,
+    0.65, 0.45, 0.45, 0.55,
+    0.40, 0.30, 0.35, 0.40, 0.45, 0.45,
+    0.45,
+)
 
 _ControlCmd = None  # Lazy-loaded enum module
 
@@ -288,9 +323,16 @@ class LocoPlugin:
         self._high_ctrl = high_ctrl
         self._namespace = namespace
         self._lock = threading.Lock()
+        self._action_lock = threading.Lock()
         self._last_cmd_time: float = 0.0
         self._move_thread: threading.Thread | None = None
         self._move_stop_event = threading.Event()
+        self._control_period = 0.01       # 100 Hz, matching the vendor demo
+        self._control_preroll_s = 0.3     # establish/refresh the DDS writer path
+        self._auto_exit_lock = threading.Lock()
+        self._auto_exit_timers: dict[str, threading.Timer] = {}
+        self._playback_monitor_stop: threading.Event | None = None
+        self._playback_monitor_thread: threading.Thread | None = None
 
     def get_tools(self) -> list:
         return [
@@ -354,7 +396,7 @@ class LocoPlugin:
             "name": "stand_up_lie_prone",
             "type": "actuator",
             "multiInstance": False,
-            "description": "让 Bumi 从仰面平躺自主起身，或从正常站立姿态趴下收纳。卡片会自动完成内部使能/准备/行走模式切换；SDK 无法确认真实姿态，用户必须按 action 描述摆放机器人。错误姿态可能触发保护模式。",
+            "description": "让 Bumi 从仰面平躺自主起身，或从正常站立姿态趴下收纳。stand_up 会先用 IMU 和 21 个关节状态检查仰面方向、静止状态及四肢姿态，不通过时不发送任何控制命令；通过后自动完成内部使能/准备切换。传感器无法检查地面、脚下异物和周围空间，用户仍须完成 action 描述中的现场安全检查。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -368,7 +410,7 @@ class LocoPlugin:
                 "x-action-params": {
                     "stand_up": {
                         "params": [],
-                        "description": "仅从 disabled/enabled 状态自主起身。调用前必须由用户确认机器人仰面平躺且周围 3m×3m 安全；站立、准备、行走或动作状态下会拒绝执行。",
+                        "description": "仅从 disabled/enabled 状态自主起身。卡片先自动检查机器人是否静止、躯干是否仰面及 21 个关节是否接近安全平躺姿态；检查失败时不会使能或起身。用户仍须确认平坦防滑地面、脚底无异物且周围 3m×3m 安全。",
                     },
                     "lie_prone": {
                         "params": [],
@@ -388,7 +430,7 @@ class LocoPlugin:
                 "properties": {
                     "action": {
                         "type": "string", "enum": list(_PRESET_ACTIONS),
-                        "description": "wave=挥手；handshake=握手；cheer=欢呼；dance_1/dance_2/dance_3=三种出厂舞蹈；wipe_tears=擦眼泪；reset=终止/退出当前语义动作并返回 walking 模式。",
+                        "description": "wave=挥手；handshake=握手；cheer=欢呼；dance_1/dance_2/dance_3=三种出厂舞蹈；wipe_tears=擦眼泪并在定时结束后自动返回 walking；reset=终止/退出当前语义动作并返回 walking 模式。",
                     },
                 },
                 "required": ["action"],
@@ -401,9 +443,14 @@ class LocoPlugin:
                         "dance_1": "执行舞蹈 1。机器人属于盲舞，至少留出 3m×3m 平坦防滑空间。",
                         "dance_2": "执行舞蹈 2。机器人属于盲舞，至少留出 3m×3m 平坦防滑空间。",
                         "dance_3": "执行舞蹈 3。机器人属于盲舞，至少留出 3m×3m 平坦防滑空间。",
-                        "wipe_tears": "执行擦眼泪动作。确认机器人稳定站立且手臂周围无障碍物。",
+                        "wipe_tears": "执行擦眼泪动作，固定 5 秒后自动返回 walking。确认机器人稳定站立且手臂周围无障碍物。",
                         "reset": "结束当前语义动作并返回 workmode=2（walking），用于动作后复位。",
                     }.items()
+                } | {
+                    "wipe_tears": {
+                        "params": [],
+                        "description": "执行擦眼泪动作，固定 5 秒后自动返回 walking，无需填写时长或调用 reset。",
+                    },
                 },
             },
             "topic_out": [],
@@ -412,13 +459,13 @@ class LocoPlugin:
     def _action_recording_tool(self) -> dict:
         return {
             "name": "action_recording", "type": "actuator", "multiInstance": False,
-            "description": "录制、结束并保存、播放或停止播放 Bumi 示教动作。start_recording 和 play_recording 会自动进入所需行走模式；finish_and_save_recording 只能在已开始录制后使用；stop_playback 用于在确认动作结束或需要中断时返回 walking。",
+            "description": "录制、结束并保存或播放 Bumi 示教动作。start_recording 和 play_recording 会自动进入所需行走模式；finish_and_save_recording 只能在已开始录制后使用；play_recording 会根据关节运动状态判断播放结束并自动返回 walking。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string", "enum": list(_TEACHING_ACTIONS),
-                        "description": "start_recording=开始录制示教；finish_and_save_recording=结束当前录制并保存；play_recording=播放已保存动作；stop_playback=停止播放并返回 walking。",
+                        "description": "start_recording=开始录制示教；finish_and_save_recording=结束当前录制并保存；play_recording=播放已保存动作，检测到动作完成后自动返回 walking。",
                     },
                     "recording_id": {
                         "type": "integer", "minimum": 0, "maximum": 65535,
@@ -429,8 +476,7 @@ class LocoPlugin:
                 "x-action-params": {
                     "start_recording": {"params": [], "description": "自动准备模式后开始示教录制。确认机器人稳定站立；缓慢引导关节，禁止强推至机械限位。"},
                     "finish_and_save_recording": {"params": ["recording_id"], "description": "结束当前示教并保存到 recording_id。若尚未开始录制，则不会发送命令。"},
-                    "play_recording": {"params": ["recording_id"], "description": "自动准备模式并播放 recording_id。确认该编号存在，机器人稳定站立，周围无人和障碍物。"},
-                    "stop_playback": {"params": [], "description": "仅在 workmode=23（play_teach）时发送 WALK，停止/退出播放并确认返回 walking；不会从失能、使能或准备状态自动补链。"},
+                    "play_recording": {"params": ["recording_id"], "description": "自动准备并播放 recording_id；卡片根据 workmode 和 21 个关节速度推断动作完成，随后自动返回 walking，无需填写时长或手动停止。"},
                 },
             },
             "topic_out": [],
@@ -440,6 +486,8 @@ class LocoPlugin:
         pass
 
     def stop(self) -> None:
+        self._cancel_all_auto_exits()
+        self._cancel_playback_monitor()
         self._stop_move()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
@@ -458,7 +506,7 @@ class LocoPlugin:
         if tool_name == "stand_up_lie_prone" and action in _POSTURE_ACTIONS:
             return self._do_posture_action(action, args)
         if tool_name == "semantic_action" and action in _PRESET_ACTIONS:
-            return self._do_preset_action(action)
+            return self._do_preset_action(action, args)
         if tool_name == "action_recording" and action in _TEACHING_ACTIONS:
             return self._do_teaching_action(action, args)
         return None
@@ -558,31 +606,203 @@ class LocoPlugin:
                 ),
                 "safety_requirements": safety,
             }
+        pose_check = None
+        if action == "stand_up":
+            pose_check = self._check_face_up_stand_pose()
+            if not pose_check["safe_to_stand"]:
+                return {
+                    "state": "error",
+                    "command_sent": False,
+                    "requested_action": action,
+                    "current_workmode": current_mode,
+                    "current_workmode_name": _WORKMODE_NAMES.get(current_mode, "unknown"),
+                    "error": "Automatic pose check failed. No enable, prepare, or stand-up command was sent.",
+                    "pose_check": pose_check,
+                    "message": "Place the robot face-up with both legs straight and all limbs naturally positioned, wait until it is still, then try again.",
+                    "safety_requirements": safety,
+                }
         target_mode = 1 if action == "stand_up" else 2
         prepared = self._prepare_workmode(target_mode, action)
         if prepared["state"] == "error":
             prepared["safety_requirements"] = safety
+            if pose_check is not None:
+                prepared["pose_check"] = pose_check
             return prepared
         command_name, expected_modes = _POSTURE_ACTIONS[action]
-        return self._trigger_user_action(
+        result = self._trigger_user_action(
             action, command_name, expected_modes, prepared["steps"], safety)
+        if pose_check is not None:
+            result["pose_check"] = pose_check
+            result["pose_verification"] = (
+                "IMU direction, stillness, and median joint positions passed the automatic "
+                "face-up check. Floor condition, objects under the feet, and surrounding "
+                "clearance still require visual confirmation by the user."
+            )
+        return result
 
-    def _do_preset_action(self, action: str) -> dict:
+    def _check_face_up_stand_pose(self) -> dict:
+        """Fail-closed sensor check before any stand-up preparation command."""
+        acceleration_samples = []
+        angular_speed_samples = []
+        joint_velocity_samples = []
+        joint_position_samples = []
+        documented_faults = []
+
+        try:
+            for sample_index in range(_STAND_POSE_SAMPLE_COUNT):
+                imu = self._high_ctrl.get_imu_data()
+                joints = self._high_ctrl.get_joint_state()
+                if len(joints) != len(_BUMI_JOINT_NAMES):
+                    raise RuntimeError(
+                        f"HighController returned {len(joints)} joints; expected "
+                        f"{len(_BUMI_JOINT_NAMES)}")
+
+                acceleration = [float(imu.linear_acc[index]) for index in range(3)]
+                angular_velocity = [float(imu.angular_vel[index]) for index in range(3)]
+                positions = [float(joint.pos) for joint in joints]
+                velocities = [abs(float(joint.vel)) for joint in joints]
+                values = acceleration + angular_velocity + positions + velocities
+                if not all(math.isfinite(value) for value in values):
+                    raise RuntimeError("IMU or joint state contains a non-finite value")
+
+                acceleration_samples.append(acceleration)
+                angular_speed_samples.append(
+                    math.sqrt(sum(value * value for value in angular_velocity)))
+                joint_velocity_samples.append(max(velocities))
+                joint_position_samples.append(positions)
+
+                for index, joint in enumerate(joints):
+                    error = int(getattr(joint, "error", 0))
+                    if error in _MOTOR_ERROR_NAMES:
+                        documented_faults.append({
+                            "motor_id": int(getattr(joint, "motor_id", index)),
+                            "joint": _BUMI_JOINT_NAMES[index],
+                            "error": error,
+                            "error_name": _MOTOR_ERROR_NAMES[error],
+                        })
+                if sample_index + 1 < _STAND_POSE_SAMPLE_COUNT:
+                    time.sleep(_STAND_POSE_SAMPLE_INTERVAL_S)
+        except Exception as exc:
+            return {
+                "safe_to_stand": False,
+                "sample_count": len(acceleration_samples),
+                "failed_checks": ["sensor_data_available"],
+                "error": str(exc),
+                "meaning": "The sensor state could not be verified, so stand-up was blocked.",
+            }
+
+        gravity_angles = []
+        acceleration_magnitudes = []
+        for acceleration in acceleration_samples:
+            magnitude = math.sqrt(sum(value * value for value in acceleration))
+            acceleration_magnitudes.append(magnitude)
+            if magnitude < 1e-9:
+                gravity_angles.append(180.0)
+                continue
+            direction = [value / magnitude for value in acceleration]
+            cosine = sum(
+                value * reference
+                for value, reference in zip(direction, _FACE_UP_GRAVITY_DIRECTION)
+            )
+            gravity_angles.append(math.degrees(math.acos(max(-1.0, min(1.0, cosine)))))
+
+        median_positions = []
+        for joint_index in range(len(_BUMI_JOINT_NAMES)):
+            values = sorted(sample[joint_index] for sample in joint_position_samples)
+            median_positions.append(values[len(values) // 2])
+
+        out_of_pose_joints = []
+        for index, (position, reference, tolerance) in enumerate(zip(
+                median_positions, _FACE_UP_JOINT_REFERENCES,
+                _FACE_UP_JOINT_TOLERANCES)):
+            deviation = abs(position - reference)
+            if deviation > tolerance:
+                out_of_pose_joints.append({
+                    "motor_id": index,
+                    "joint": _BUMI_JOINT_NAMES[index],
+                    "position_rad": round(position, 5),
+                    "reference_rad": reference,
+                    "deviation_rad": round(deviation, 5),
+                    "maximum_deviation_rad": tolerance,
+                })
+
+        max_gravity_angle = max(gravity_angles)
+        min_acceleration = min(acceleration_magnitudes)
+        max_acceleration = max(acceleration_magnitudes)
+        max_angular_speed = max(angular_speed_samples)
+        max_joint_velocity = max(joint_velocity_samples)
+        checks = {
+            "face_up_orientation": max_gravity_angle <= _FACE_UP_MAX_GRAVITY_ANGLE_DEG,
+            "gravity_like_acceleration": (
+                min_acceleration >= _STAND_POSE_ACCELERATION_RANGE[0]
+                and max_acceleration <= _STAND_POSE_ACCELERATION_RANGE[1]
+            ),
+            "body_stationary": max_angular_speed <= _STAND_POSE_MAX_ANGULAR_VELOCITY,
+            "joints_stationary": max_joint_velocity <= _STAND_POSE_MAX_JOINT_VELOCITY,
+            "joint_pose": not out_of_pose_joints,
+            "no_documented_motor_fault": not documented_faults,
+        }
+        failed_checks = [name for name, passed in checks.items() if not passed]
+        return {
+            "safe_to_stand": not failed_checks,
+            "sample_count": _STAND_POSE_SAMPLE_COUNT,
+            "sample_window_s": round(
+                (_STAND_POSE_SAMPLE_COUNT - 1) * _STAND_POSE_SAMPLE_INTERVAL_S, 2),
+            "checks": checks,
+            "failed_checks": failed_checks,
+            "measurements": {
+                "maximum_gravity_direction_error_deg": round(max_gravity_angle, 3),
+                "acceleration_magnitude_range_m_s2": [
+                    round(min_acceleration, 3), round(max_acceleration, 3)],
+                "maximum_angular_velocity_rad_s": round(max_angular_speed, 4),
+                "maximum_joint_velocity_rad_s": round(max_joint_velocity, 4),
+                "out_of_pose_joints": out_of_pose_joints,
+                "documented_motor_faults": documented_faults,
+            },
+            "thresholds": {
+                "maximum_gravity_direction_error_deg": _FACE_UP_MAX_GRAVITY_ANGLE_DEG,
+                "acceleration_magnitude_m_s2": list(_STAND_POSE_ACCELERATION_RANGE),
+                "maximum_angular_velocity_rad_s": _STAND_POSE_MAX_ANGULAR_VELOCITY,
+                "maximum_joint_velocity_rad_s": _STAND_POSE_MAX_JOINT_VELOCITY,
+                "joint_position_rule": (
+                    "The five-sample median of every joint must be within its calibrated "
+                    "per-joint maximum deviation. Failed joints include their limits."
+                ),
+            },
+            "meaning": (
+                "All available sensor checks passed. This is a safety gate, not proof of "
+                "a safe environment; visually confirm the floor, feet, and 3 m x 3 m clearance."
+                if not failed_checks else
+                "One or more sensor checks failed, so no stand-up preparation or action command was sent."
+            ),
+        }
+
+    def _do_preset_action(self, action: str, args: dict) -> dict:
         safety = self._safety_requirements(action)
         if action == "reset":
+            self._cancel_auto_exit("wipe_tears")
             return self._do_semantic_reset(safety)
         prepared = self._prepare_workmode(2, action)
         if prepared["state"] == "error":
             prepared["safety_requirements"] = safety
             return prepared
         command_name, expected_modes = _PRESET_ACTIONS[action]
-        return self._trigger_user_action(
+        result = self._trigger_user_action(
             action, command_name, expected_modes, prepared["steps"], safety)
+        if action == "wipe_tears" and result.get("confirmed_started"):
+            self._schedule_auto_walk_exit(
+                "wipe_tears", 33, _TEAR_AUTO_EXIT_S, safety)
+            result.update({
+                "auto_return_to_walk": True,
+                "auto_return_after_s": _TEAR_AUTO_EXIT_S,
+                "auto_return_condition": (
+                    "WALK will be sent only if the robot is still in tear mode when the timer expires."
+                ),
+            })
+        return result
 
     def _do_teaching_action(self, action: str, args: dict) -> dict:
         safety = self._safety_requirements(action)
-        if action == "stop_playback":
-            return self._do_stop_playback(safety)
         recording_id = None
         if action in ("finish_and_save_recording", "play_recording"):
             if "recording_id" not in args:
@@ -599,7 +819,6 @@ class LocoPlugin:
             if not 0 <= recording_id <= 65535:
                 return {"state": "error", "command_sent": False,
                         "error": "recording_id must be in the range 0 to 65535", "safety_requirements": safety}
-
         if action == "finish_and_save_recording":
             mode = int(self._high_ctrl.get_mode())
             if mode == 26:
@@ -622,9 +841,24 @@ class LocoPlugin:
             steps = prepared["steps"]
 
         command_name, expected_modes = _TEACHING_ACTIONS[action]
-        return self._trigger_user_action(
+        result = self._trigger_user_action(
             action, command_name, expected_modes, steps, safety,
             index=recording_id or 0, recording_id=recording_id)
+        if action == "play_recording" and result.get("confirmed_started"):
+            self._schedule_playback_completion_monitor(safety)
+            result.update({
+                "auto_return_to_walk": True,
+                "completion_detection": "inferred_from_workmode_and_joint_velocity",
+                "auto_return_condition": (
+                    "After joint motion has been observed, WALK is sent when all joints "
+                    "remain stationary for 2 seconds while the robot is still in play_teach mode."
+                ),
+                "completion_detection_note": (
+                    "The SDK exposes no explicit playback-completion event; completion is "
+                    "inferred from the 21 reported joint velocities."
+                ),
+            })
+        return result
 
     def _do_semantic_reset(self, safety: str) -> dict:
         self._move_stop_event.set()
@@ -653,7 +887,7 @@ class LocoPlugin:
                 "requested_action": "reset",
                 "current_workmode": current_mode,
                 "current_workmode_name": "play_teach",
-                "error": "semantic_action.reset does not control action recording playback. Use action_recording.stop_playback instead.",
+                "error": "semantic_action.reset does not control action recording playback. Wait for the automatic playback timer to return the robot to walking mode.",
                 "safety_requirements": safety,
             }
 
@@ -670,30 +904,140 @@ class LocoPlugin:
 
         return self._send_walk_exit("reset", safety)
 
-    def _do_stop_playback(self, safety: str) -> dict:
-        current_mode = int(self._high_ctrl.get_mode())
-        if current_mode == 26:
-            return self._protection_error("stop_playback", [], current_mode, safety)
-        if current_mode == 2:
-            return {
-                "state": "completed", "command_sent": False,
-                "requested_action": "stop_playback",
-                "confirmed": True,
-                "workmode": 2,
-                "workmode_name": "walking",
-                "safety_requirements": safety,
-                "message": "Playback has already exited to walking mode; no command was sent.",
-            }
-        if current_mode != 23:
-            return {
-                "state": "error", "command_sent": False,
-                "requested_action": "stop_playback",
-                "current_workmode": current_mode,
-                "current_workmode_name": _WORKMODE_NAMES.get(current_mode, "unknown"),
-                "error": "stop_playback is allowed only from play_teach mode. It will not enter walking mode from another physical or workmode state.",
-                "safety_requirements": safety,
-            }
-        return self._send_walk_exit("stop_playback", safety)
+    def _schedule_auto_walk_exit(self, key: str, expected_mode: int,
+                                 delay_s: float, safety: str) -> None:
+        self._cancel_auto_exit(key)
+
+        def _auto_exit() -> None:
+            with self._auto_exit_lock:
+                if self._auto_exit_timers.get(key) is not timer:
+                    return
+                self._auto_exit_timers.pop(key, None)
+            current_mode = int(self._high_ctrl.get_mode())
+            if current_mode != expected_mode:
+                print(
+                    f"[loco] {key} auto-return skipped: workmode={current_mode} "
+                    f"({_WORKMODE_NAMES.get(current_mode, 'unknown')})",
+                    flush=True,
+                )
+                return
+            result = self._send_walk_exit(f"{key}_auto_return", safety)
+            print(
+                f"[loco] {key} auto-return result: {json.dumps(result)}",
+                flush=True,
+            )
+
+        timer = threading.Timer(delay_s, _auto_exit)
+        timer.daemon = True
+        with self._auto_exit_lock:
+            self._auto_exit_timers[key] = timer
+        timer.start()
+
+    def _schedule_playback_completion_monitor(self, safety: str) -> None:
+        self._cancel_playback_monitor()
+        stop_event = threading.Event()
+
+        def _monitor() -> None:
+            started_at = time.monotonic()
+            motion_seen = False
+            stationary_since = None
+            exit_reason = None
+
+            while not stop_event.wait(0.05):
+                now = time.monotonic()
+                mode = int(self._high_ctrl.get_mode())
+                if mode == 2:
+                    print(
+                        "[loco] play_recording completed: firmware already returned to walking",
+                        flush=True,
+                    )
+                    return
+                if mode == 26:
+                    print(
+                        "[loco] play_recording monitor stopped: robot entered protection mode",
+                        flush=True,
+                    )
+                    return
+                if mode != 23:
+                    print(
+                        f"[loco] play_recording monitor stopped: workmode={mode} "
+                        f"({_WORKMODE_NAMES.get(mode, 'unknown')})",
+                        flush=True,
+                    )
+                    return
+
+                try:
+                    joint_states = self._high_ctrl.get_joint_state()
+                    max_velocity = max(
+                        abs(float(state.vel)) for state in joint_states)
+                except Exception as exc:
+                    print(
+                        f"[loco] play_recording completion sample failed: {exc}",
+                        flush=True,
+                    )
+                    continue
+
+                if max_velocity >= _PLAYBACK_MOVING_THRESHOLD:
+                    motion_seen = True
+                    stationary_since = None
+                elif motion_seen and max_velocity <= _PLAYBACK_STATIONARY_THRESHOLD:
+                    if stationary_since is None:
+                        stationary_since = now
+                    elif now - stationary_since >= _PLAYBACK_STATIONARY_CONFIRM_S:
+                        exit_reason = "joint_motion_completed"
+                        break
+                elif motion_seen:
+                    stationary_since = None
+
+                elapsed = now - started_at
+                if not motion_seen and elapsed >= _PLAYBACK_MOTION_START_TIMEOUT_S:
+                    exit_reason = "no_joint_motion_detected"
+                    break
+                if elapsed >= _PLAYBACK_MAX_MONITOR_S:
+                    exit_reason = "maximum_monitor_time_reached"
+                    break
+
+            if stop_event.is_set() or exit_reason is None:
+                return
+            if int(self._high_ctrl.get_mode()) != 23:
+                return
+            result = self._send_walk_exit("play_recording_auto_return", safety)
+            result["completion_inference"] = exit_reason
+            print(
+                f"[loco] play_recording auto-return result: {json.dumps(result)}",
+                flush=True,
+            )
+
+        monitor_thread = threading.Thread(
+            target=_monitor,
+            daemon=True,
+            name="bumi_playback_completion_monitor",
+        )
+        with self._auto_exit_lock:
+            self._playback_monitor_stop = stop_event
+            self._playback_monitor_thread = monitor_thread
+        monitor_thread.start()
+
+    def _cancel_playback_monitor(self) -> None:
+        with self._auto_exit_lock:
+            stop_event = self._playback_monitor_stop
+            self._playback_monitor_stop = None
+            self._playback_monitor_thread = None
+        if stop_event is not None:
+            stop_event.set()
+
+    def _cancel_auto_exit(self, key: str) -> None:
+        with self._auto_exit_lock:
+            timer = self._auto_exit_timers.pop(key, None)
+        if timer is not None:
+            timer.cancel()
+
+    def _cancel_all_auto_exits(self) -> None:
+        with self._auto_exit_lock:
+            timers = list(self._auto_exit_timers.values())
+            self._auto_exit_timers.clear()
+        for timer in timers:
+            timer.cancel()
 
     def _send_walk_exit(self, requested_action: str, safety: str) -> dict:
         observed = self._send_edge_and_wait(
@@ -814,13 +1158,6 @@ class LocoPlugin:
         }
         if recording_id is not None:
             result["recording_id"] = recording_id
-        if requested_action == "play_recording":
-            result["completion_note"] = (
-                "The SDK reports that playback entered play_teach mode but provides no documented physical-completion event. The card does not send WALK automatically because that could interrupt a recording that is still playing."
-            )
-            result["next_action"] = (
-                "After the motion has visibly finished, or if playback must be interrupted, call action_recording.stop_playback to return to walking mode."
-            )
         return result
 
     @staticmethod
@@ -867,8 +1204,6 @@ class LocoPlugin:
             return "Make sure the robot is standing steadily on a flat non-slip floor under supervision. Guide joints slowly; never force, twist quickly, or exceed mechanical limits."
         if action == "finish_and_save_recording":
             return "Use only after start_recording has been called and action guidance is finished. Do not move the robot while the recording is being saved."
-        if action == "stop_playback":
-            return "Use after the recorded motion has visibly finished, or when playback must be interrupted. Keep the robot supported on a flat non-slip floor with a clear movement area."
         if action == "reset":
             return "Keep the robot standing with both feet on a flat non-slip floor and keep people and obstacles outside its movement range while returning to walking mode."
         return "Use only when the robot is standing normally and steadily with both feet on a flat non-slip floor, with no people or obstacles in its movement range."
@@ -883,18 +1218,31 @@ class LocoPlugin:
 
     def _send_edge_and_wait(self, cmd_enum, expected_modes: set[int],
                             index: int = 0, timeout_s: float = 2.0) -> int:
-        """Send one event command, release with DEFAULT, then observe feedback."""
-        self._publish_cmd(0, 0, 0, cmd_enum, index)
-        # The vendor demo runs a 10 ms command loop. This also exceeds the
-        # documented minimum 2 ms interval without repeatedly firing the event.
-        time.sleep(0.01)
-        self._publish_cmd(0, 0, 0, _get_default_cmd(), 0)
-        deadline = time.monotonic() + timeout_s
-        observed = int(self._high_ctrl.get_mode())
-        while observed not in expected_modes and time.monotonic() < deadline:
-            time.sleep(0.05)
+        """Prime DDS, send one action edge, then maintain neutral control frames."""
+        with self._action_lock:
+            default_cmd = _get_default_cmd()
+
+            # A newly idle DDS writer can lose its first control sample on some
+            # Bumi firmware. Neutral frames warm the command path without
+            # changing workmode or requesting motion.
+            preroll_deadline = time.monotonic() + self._control_preroll_s
+            while time.monotonic() < preroll_deadline:
+                self._publish_cmd(0, 0, 0, default_cmd, 0)
+                time.sleep(self._control_period)
+
+            # Actions such as START and PLAYTEACH are edge-triggered. Never
+            # retry them automatically: START is a toggle and repeated actions
+            # can reverse a transition or restart an active policy.
+            self._publish_cmd(0, 0, 0, cmd_enum, index)
+            time.sleep(self._control_period)
+
+            deadline = time.monotonic() + timeout_s
             observed = int(self._high_ctrl.get_mode())
-        return observed
+            while observed not in expected_modes and time.monotonic() < deadline:
+                self._publish_cmd(0, 0, 0, default_cmd, 0)
+                time.sleep(self._control_period)
+                observed = int(self._high_ctrl.get_mode())
+            return observed
 
 # ── MicPlugin (sensor, subprocess) ────────────────────────────────────────────
 
