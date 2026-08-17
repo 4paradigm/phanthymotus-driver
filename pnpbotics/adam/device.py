@@ -777,14 +777,12 @@ class ZedCameraPlugin:
     _CARD_NAMES = (
         "camera_head",
         "camera_depth",
-        "camera_info",
         "camera_pointcloud",
     )
 
     _FORMATS = {
         "camera_head": "image/jpeg",
         "camera_depth": "image/depth-zlib",
-        "camera_info": "data/json",
         "camera_pointcloud": "sensor/pointcloud",
     }
 
@@ -794,7 +792,6 @@ class ZedCameraPlugin:
         self._topics = {
             "camera_head": f"/{namespace}/camera/head",
             "camera_depth": f"/{namespace}/camera/head/depth",
-            "camera_info": f"/{namespace}/camera/head/info",
             "camera_pointcloud": f"/{namespace}/camera/head/points",
         }
 
@@ -805,19 +802,17 @@ class ZedCameraPlugin:
         self._pointcloud_enabled = bool(
             pointcloud_config.get(
                 "enabled", self._config.get("pointcloud_enabled", False)))
-        # The four cards share one ZED capture thread, but each card has its
-        # own publication lifecycle.  Metadata remains available at startup;
-        # RGB and depth are opt-in because they are expensive image streams,
-        # matching the point-cloud card's on-demand behaviour.
+        # The three cards share one ZED capture thread, but each card has its
+        # own publication lifecycle.  RGB and depth are opt-in because they
+        # are expensive image streams, matching the point-cloud card's
+        # on-demand behaviour.
         self._card_enabled = {
             "camera_head": False,
             "camera_depth": False,
-            "camera_info": True,
             "camera_pointcloud": self._pointcloud_enabled,
         }
         self._rgb_hz = max(1.0, min(float(self._config.get("rgb_hz", 15)), 30.0))
         self._depth_hz = max(1.0, min(float(self._config.get("depth_hz", 8)), 15.0))
-        self._info_hz = max(0.2, min(float(self._config.get("info_hz", 1)), 5.0))
         self._pointcloud_hz = max(
             0.2, min(float(pointcloud_config.get("hz", 2)), 10.0))
         self._jpeg_quality = max(
@@ -863,13 +858,10 @@ class ZedCameraPlugin:
         self._publish_locks = {
             "rgb": threading.Lock(),
             "depth": threading.Lock(),
-            "info": threading.Lock(),
             "pointcloud": threading.Lock(),
         }
-        self._info_timer = None
         self._rgb_pub = None
         self._depth_pub = None
-        self._info_pub = None
         self._pointcloud_pub = None
         self._lock = threading.Lock()
         self._state = {
@@ -909,10 +901,6 @@ class ZedCameraPlugin:
                 "Adam ZED Mini depth image, zlib-compressed little-endian uint16 millimetres",
                 self._topics["camera_depth"], self._FORMATS["camera_depth"]),
             self._tool(
-                "camera_info",
-                "Adam ZED Mini connection status, stream settings, calibration and intrinsics",
-                self._topics["camera_info"], self._FORMATS["camera_info"]),
-            self._tool(
                 "camera_pointcloud",
                 "Adam ZED Mini XYZ point cloud for the Phanthymotus 3D renderer; runtime-toggleable",
                 self._topics["camera_pointcloud"], self._FORMATS["camera_pointcloud"],
@@ -951,7 +939,7 @@ class ZedCameraPlugin:
             self._running = True
             try:
                 from sensor_msgs.msg import CompressedImage
-                from std_msgs.msg import String, UInt8MultiArray
+                from std_msgs.msg import UInt8MultiArray
 
                 qos = _best_effort_qos()
                 self._CompressedImage = CompressedImage
@@ -960,12 +948,8 @@ class ZedCameraPlugin:
                     CompressedImage, self._topics["camera_head"], qos)
                 self._depth_pub = self._pub_node.create_publisher(
                     CompressedImage, self._topics["camera_depth"], qos)
-                self._info_pub = self._pub_node.create_publisher(
-                    String, self._topics["camera_info"], qos)
                 self._pointcloud_pub = self._pub_node.create_publisher(
                     UInt8MultiArray, self._topics["camera_pointcloud"], qos)
-                self._info_timer = self._pub_node.create_timer(
-                    1.0 / self._info_hz, self._publish_info)
             except Exception as exc:
                 self._running = False
                 self._stop_event.set()
@@ -995,28 +979,17 @@ class ZedCameraPlugin:
             for worker in self._worker_threads:
                 worker.start()
 
-            self._publish_info()
             self._capture_thread = threading.Thread(
                 target=self._capture_loop, daemon=True, name="adam_zed_capture")
             self._capture_thread.start()
             return True
 
     def _destroy_publishers(self):
-        # Cancel the timer before taking the info lock, then destroy each
-        # publisher under its own lock so RGB publication cannot wait behind a
-        # slow depth or point-cloud publication.
-        timer = self._info_timer
-        self._info_timer = None
-        if timer is not None:
-            try:
-                timer.cancel()
-            except Exception:
-                pass
-
+        # Destroy each publisher under its own lock so RGB publication cannot
+        # wait behind a slow depth or point-cloud publication.
         for attr, lock_name in (
                 ("_rgb_pub", "rgb"),
                 ("_depth_pub", "depth"),
-                ("_info_pub", "info"),
                 ("_pointcloud_pub", "pointcloud")):
             with self._publish_locks[lock_name]:
                 publisher = getattr(self, attr, None)
@@ -1032,13 +1005,6 @@ class ZedCameraPlugin:
         with self._lifecycle_lock:
             self._running = False
             self._stop_event.set()
-
-            if self._info_timer is not None:
-                try:
-                    self._info_timer.cancel()
-                except Exception:
-                    pass
-                self._info_timer = None
 
             # Closing before join is intentional: it gives a blocking SDK
             # grab() a chance to return so that the capture thread can exit.
@@ -1081,7 +1047,6 @@ class ZedCameraPlugin:
                     "available": False,
                     "pointcloud_enabled": self._pointcloud_enabled,
                 })
-            self._publish_info()
             self._destroy_publishers()
             return True
 
@@ -1114,8 +1079,8 @@ class ZedCameraPlugin:
         except (TypeError, ValueError):
             return []
 
-    def _camera_metadata(self, camera_info, params):
-        configuration = camera_info.camera_configuration
+    def _camera_metadata(self, sdk_camera_info, params):
+        configuration = sdk_camera_info.camera_configuration
         calibration = configuration.calibration_parameters
         left = calibration.left_cam
         right = calibration.right_cam
@@ -1197,7 +1162,7 @@ class ZedCameraPlugin:
             "camera_head": "rgb",
             "camera_depth": "depth",
             "camera_pointcloud": "pointcloud",
-        }.get(card_name, "info")
+        }.get(card_name, "rgb")
         with self._publish_locks[lock_name]:
             if not self._capture_active():
                 return False
@@ -1316,7 +1281,6 @@ class ZedCameraPlugin:
             return
         with self._lock:
             self._state = metadata
-        self._publish_info()
 
         runtime = sl.RuntimeParameters()
         image = sl.Mat()
@@ -1596,20 +1560,6 @@ class ZedCameraPlugin:
         packed_xyz[:, 2] = -display[:, 1]
         return struct.pack("<II", 12, int(packed_xyz.shape[0])) + packed_xyz.tobytes()
 
-    def _publish_info(self):
-        with self._publish_locks["info"]:
-            publisher = getattr(self, "_info_pub", None)
-            if publisher is None:
-                return
-            with self._lock:
-                if not self._card_enabled["camera_info"]:
-                    return
-                payload = dict(self._state)
-                payload["pointcloud_enabled"] = self._pointcloud_enabled
-            message = String()
-            message.data = json.dumps(payload, separators=(",", ":"))
-            publisher.publish(message)
-
     def _card_state(self, tool_name):
         with self._lock:
             enabled = self._card_enabled[tool_name]
@@ -1657,7 +1607,6 @@ class ZedCameraPlugin:
                 self._state["pointcloud_enabled"] = True
             if not self._running:
                 self.start()
-            self._publish_info()
             return self._card_response(tool_name)
 
         if tool_name == "camera_pointcloud" and action in ("stop", "disable"):
@@ -1665,7 +1614,6 @@ class ZedCameraPlugin:
                 self._card_enabled[tool_name] = False
                 self._pointcloud_enabled = False
                 self._state["pointcloud_enabled"] = False
-            self._publish_info()
             self._stop_if_no_cards_enabled()
             return self._card_response(tool_name)
 
@@ -1674,8 +1622,6 @@ class ZedCameraPlugin:
                 self._card_enabled[tool_name] = True
             if not self._running:
                 self.start()
-            if tool_name == "camera_info":
-                self._publish_info()
             return self._card_response(tool_name)
 
         if action == "stop":
@@ -1684,11 +1630,6 @@ class ZedCameraPlugin:
             self._stop_if_no_cards_enabled()
             return self._card_response(tool_name)
 
-        if action in ("read", "get") and tool_name == "camera_info":
-            with self._lock:
-                state = dict(self._state)
-                state["pointcloud_enabled"] = self._pointcloud_enabled
-                return state
         if action in ("info", tool_name):
             return self._card_response(tool_name)
         return {"state": self._state.get("state", "idle")}
