@@ -1,6 +1,7 @@
 pnpbotics-adam:
   image: __IMAGE__
   container_name: embodied-pnpbotics-adam
+  runtime: nvidia
   network_mode: host
   ipc: host
   pid: host
@@ -8,6 +9,10 @@ pnpbotics-adam:
   volumes:
     - /dev:/dev
     - /opt/phanthy-motus/data:/opt/phanthy-motus/data
+    # ZED SDK binaries and the Jetson/aarch64 pyzed extension are provided by
+    # the host rather than baked into the driver image.
+    - /usr/local/zed:/usr/local/zed:ro
+    - /home/pnd-humanoid/.local/lib/python3.10/site-packages/pyzed:/opt/pyzed:ro
   environment:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
@@ -15,6 +20,10 @@ pnpbotics-adam:
     - PYTHONUNBUFFERED=1
     - GRPC_HOST=localhost
     - GRPC_PORT=6666
+    - NVIDIA_VISIBLE_DEVICES=all
+    - NVIDIA_DRIVER_CAPABILITIES=all
+    - ZED_PYTHON_PATH=/opt/pyzed
+    - LD_LIBRARY_PATH=/usr/local/zed/lib:/opt/cyclonedds/lib
   logging:
     driver: local
     options:
