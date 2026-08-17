@@ -6,9 +6,12 @@ voice_gesture:
   # 若 ros_namespace 留空，建议在部署配置中显式填写实际 Perception ASR 输出 Topic。
   asr_topic: ""
   require_wake_word: true
-  # true 时，仅在唤醒词和动作关键词均匹配后调用官方 /hardware/enable_motor。
-  # 不会在 Driver 容器启动时自动上电，也不会在插件停止时自动失能。
+  # true 时，在唤醒词和动作关键词均匹配后尝试调用 /hardware/enable_motor。
+  # T800 通常仍需先用遥控器完成物理使能；服务不存在时默认降级到关节规划器。
   auto_enable_motors: true
+  # false: 使能服务失败后继续发布规划，由规划器决定是否接受；true: 立即终止动作。
+  motor_enable_required: false
+  motor_enable_discovery_timeout_sec: 1.0
   motor_enable_timeout_sec: 5.0
   cooldown_sec: 3.0
   planner_ready_timeout_sec: 10.0

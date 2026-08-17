@@ -73,6 +73,10 @@ class VoiceGesturePlugin:
         )
         self._require_wake_word = bool(plugin_config.get("require_wake_word", True))
         self._auto_enable_motors = bool(plugin_config.get("auto_enable_motors", True))
+        self._motor_enable_required = bool(plugin_config.get("motor_enable_required", False))
+        self._motor_enable_discovery_timeout = max(
+            0.0, float(plugin_config.get("motor_enable_discovery_timeout_sec", 1.0))
+        )
         self._motor_enable_timeout = max(
             1.0, float(plugin_config.get("motor_enable_timeout_sec", 5.0))
         )
@@ -263,19 +267,21 @@ class VoiceGesturePlugin:
 
     def _ensure_motors_enabled(self, motion_id: str, text: str) -> bool:
         if not self._auto_enable_motors:
+            self._set_status(last_motor_enable_error="")
+            self._publish_event(
+                "motor_enable_skipped", motion_id=motion_id, text=text,
+                reason="automatic motor enable is disabled",
+            )
             return True
         if self._motor_enable_client is None or self._motor_enable_type is None:
-            self._set_status(last_motor_enable_error="motor enable client is unavailable")
-            self._publish_event(
-                "motor_enable_error", motion_id=motion_id, text=text,
-                error="motor enable client is unavailable",
+            return self._handle_motor_enable_failure(
+                motion_id, text, "motor enable client is unavailable"
             )
-            return False
-        if not self._motor_enable_client.wait_for_service(timeout_sec=1.0):
+        if not self._motor_enable_client.wait_for_service(
+            timeout_sec=self._motor_enable_discovery_timeout
+        ):
             error = f"motor enable service is unavailable: {self._motor_enable_service}"
-            self._set_status(last_motor_enable_error=error)
-            self._publish_event("motor_enable_error", motion_id=motion_id, text=text, error=error)
-            return False
+            return self._handle_motor_enable_failure(motion_id, text, error)
         request = self._motor_enable_type.Request()
         request.enable = True
         self._publish_event("motor_enable_requested", motion_id=motion_id, text=text)
@@ -284,24 +290,40 @@ class VoiceGesturePlugin:
         while not future.done() and time.monotonic() < deadline:
             time.sleep(0.02)
         if not future.done():
-            error = "motor enable request timed out"
-            self._set_status(last_motor_enable_error=error)
-            self._publish_event("motor_enable_error", motion_id=motion_id, text=text, error=error)
-            return False
+            return self._handle_motor_enable_failure(
+                motion_id, text, "motor enable request timed out"
+            )
         try:
             response = future.result()
         except Exception as exc:  # noqa: BLE001
-            error = str(exc)
-            self._set_status(last_motor_enable_error=error)
-            self._publish_event("motor_enable_error", motion_id=motion_id, text=text, error=error)
-            return False
+            return self._handle_motor_enable_failure(motion_id, text, str(exc))
         if not bool(response.success):
             error = str(response.message or "motor enable was rejected")
-            self._set_status(last_motor_enable_error=error)
-            self._publish_event("motor_enable_error", motion_id=motion_id, text=text, error=error)
-            return False
+            return self._handle_motor_enable_failure(motion_id, text, error)
         self._set_status(last_motor_enable_error="")
         self._publish_event("motor_enable_completed", motion_id=motion_id, text=text)
+        return True
+
+    def _handle_motor_enable_failure(self, motion_id: str, text: str, error: str) -> bool:
+        """Apply the configured policy when the optional motor service fails.
+
+        T800 deployments commonly require physical motor enable from the remote
+        control and do not expose ``/hardware/enable_motor``.  In the default
+        best-effort mode, the joint planner remains the authority that accepts
+        or rejects the requested motion.  Strict deployments can set
+        ``motor_enable_required`` to retain fail-closed behavior.
+        """
+        self._set_status(last_motor_enable_error=error)
+        if self._motor_enable_required:
+            self._publish_event(
+                "motor_enable_error", motion_id=motion_id, text=text,
+                error=error, continuing=False,
+            )
+            return False
+        self._publish_event(
+            "motor_enable_degraded", motion_id=motion_id, text=text,
+            error=error, continuing=True,
+        )
         return True
 
     def _start_motion(self, motion_id: str, text: str) -> None:
@@ -542,7 +564,9 @@ class VoiceGesturePlugin:
             },
             "motor_enable": {
                 "automatic": self._auto_enable_motors,
+                "required": self._motor_enable_required,
                 "service": self._motor_enable_service,
+                "discovery_timeout_sec": self._motor_enable_discovery_timeout,
                 "timeout_sec": self._motor_enable_timeout,
                 "last_error": status["last_motor_enable_error"],
             },
@@ -568,6 +592,7 @@ class VoiceGesturePlugin:
             ensure_ascii=False,
             separators=(",", ":"),
         )
+        print(f"[voice_gesture] {message.data}", flush=True)
         self._events_pub.publish(message)
         with self._lock:
             self._status["events_published"] += 1

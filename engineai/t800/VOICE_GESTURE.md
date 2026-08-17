@@ -29,16 +29,24 @@ Driver 直接向官方 `LedControl` Topic 发布 `blink_green`；默认一秒后
 `constant_white`。这不依赖 Dashboard，也不调用 `GesturePlugin`。该信号是在整句识别
 完成后确认唤醒成功，不是说出唤醒词瞬间的指示。
 
-`auto_enable_motors` 默认启用。插件只会在唤醒词和动作关键词均匹配时调用官方
-`/hardware/enable_motor` 服务；不会在容器启动时自动上电，也不会在插件停止时自动失能。
-若要禁止此行为，可显式设为 `false`。该操作会使机器人电机进入可控状态，部署前必须确保
-急停已释放、机器人姿态稳定且周围无人。
+`auto_enable_motors` 默认启用。插件只会在唤醒词和动作关键词均匹配时尝试调用
+`/hardware/enable_motor`，不会在容器启动时自动上电，也不会在插件停止时自动失能。
+T800 实机通常仍需先用遥控器完成物理使能。部分 runtime 不提供该 ROS 服务，因此默认
+`motor_enable_required: false`：服务不存在、超时或拒绝时发布 `motor_enable_degraded`，
+随后继续向官方关节规划器提交动作，由规划器状态决定是否接受。需要服务失败时立即终止
+动作的部署可设为 `true`；也可设置 `auto_enable_motors: false` 完全跳过服务调用。
+部署前必须确保急停已释放、机器人姿态稳定且周围无人。
+
+插件的事件既发布到 `/{namespace}/voice_gesture/events`，也以 `[voice_gesture]` 前缀写入
+容器标准输出，便于直接通过 `docker logs` 区分使能降级、规划发布和规划器超时。
 
 ## 规则动作
 
-从 `voice_gesture.example.yaml` 把 `voice_gesture:` 段复制到独立的
-`config.voice-gesture.yaml` 的 `plugins:` 下。每个动作的关节轨迹直接写在同一份
-YAML 的 `motion_plan` 内；ASR 文字不会被当作任意函数、关节参数或路径执行。
+仓库内的 `config.voice-gesture.yaml` 是可直接挂载到 T800 的完整实机配置，固定使用
+`ubuntu` namespace、`/ubuntu/mic/audio/asr` 输入和 `/ubuntu/voice_gesture/events` 输出。
+`voice_gesture.example.yaml` 继续保留为仅含 `voice_gesture:` 的配置片段，供其他 namespace
+或派生配置复用。每个动作的关节轨迹直接写在 `motion_plan` 内；ASR 文字不会被当作任意
+函数、关节参数或路径执行。
 
 默认提供：
 
@@ -51,7 +59,7 @@ YAML 的 `motion_plan` 内；ASR 文字不会被当作任意函数、关节参�
 
 ## 独立镜像与入口
 
-先构建原 Driver 镜像，再构建扩展镜像；不改原 Dockerfile：
+先构建原 Driver 镜像，再构建扩展镜像；扩展镜像会同时内置完整实机配置：
 
 ```bash
 cd engineai/t800
@@ -61,12 +69,12 @@ docker build -f Dockerfile.voice-gesture \
   -t engineai-t800-voice-gesture .
 ```
 
-运行扩展镜像时，用 `CONFIG_PATH` 挂载独立配置：
+运行扩展镜像时，可用 `CONFIG_PATH` 直接读取镜像内配置。开发时若要覆盖配置，再挂载仓库
+里的同名文件：
 
 ```bash
 docker run --rm --network host --privileged \
   -e CONFIG_PATH=/work/config.voice-gesture.yaml \
-  -v /path/to/config.voice-gesture.yaml:/work/config.voice-gesture.yaml:ro \
   -v /dev:/dev \
   -v /opt/engineai/native_sdk:/opt/engineai/native_sdk \
   -v /run/user/1000/pulse:/run/user/1000/pulse \
@@ -74,6 +82,12 @@ docker run --rm --network host --privileged \
   -e NETWORK_INTERFACE=eth1 \
   -e PULSE_SERVER=unix:/run/user/1000/pulse/native \
   engineai-t800-voice-gesture
+```
+
+覆盖镜像内配置时增加：
+
+```bash
+-v /path/to/config.voice-gesture.yaml:/work/config.voice-gesture.yaml:ro
 ```
 
 扩展入口是 `voice_gesture_main.py`；它在运行时把插件追加到原 Bundle。因此旧的
