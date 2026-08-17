@@ -143,6 +143,22 @@ class VoiceGestureActuatorTests(unittest.TestCase):
 
         self.assertEqual("actuator", plugin.get_tool()["type"])
 
+    def test_relative_topics_follow_resolved_bundle_namespace(self):
+        resolve = self.module._resolve_namespaced_topic
+
+        self.assertEqual(
+            "/robot_alpha/mic/audio/asr",
+            resolve("mic/audio/asr", "robot_alpha", "mic/audio/asr"),
+        )
+        self.assertEqual(
+            "/robot_alpha/voice_gesture/events",
+            resolve("voice_gesture/events", "robot_alpha", "voice_gesture/events"),
+        )
+        self.assertEqual(
+            "/custom/asr",
+            resolve("/custom/asr", "robot_alpha", "mic/audio/asr"),
+        )
+
     def test_wave_and_handshake_reuse_tts_actuator(self):
         plugin = self.make_plugin()
 
@@ -173,9 +189,9 @@ class VoiceGestureDeploymentConfigTests(unittest.TestCase):
     def test_standard_config_contains_real_device_voice_gesture(self):
         config = (ROOT / "config.yaml").read_text(encoding="utf-8")
 
-        self.assertIn('ros_namespace: "ubuntu"', config)
-        self.assertIn('asr_topic: "/ubuntu/mic/audio/asr"', config)
-        self.assertIn('events_topic: "/ubuntu/voice_gesture/events"', config)
+        self.assertIn('ros_namespace: ""', config)
+        self.assertIn('asr_topic: "mic/audio/asr"', config)
+        self.assertIn('events_topic: "voice_gesture/events"', config)
         self.assertIn("motor_enable_required: false", config)
         self.assertIn('reply_text: "你好"', config)
         self.assertIn('reply_text: "好的"', config)

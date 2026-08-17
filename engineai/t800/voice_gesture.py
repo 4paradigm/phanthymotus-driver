@@ -42,6 +42,15 @@ def _normalise_text(value: str) -> str:
     return _PUNCTUATION.sub("", value).lower()
 
 
+def _resolve_namespaced_topic(value: object, namespace: str, default_suffix: str) -> str:
+    """Resolve a configured core-domain topic suffix against the bundle namespace."""
+    topic = str(value or default_suffix).strip()
+    if topic.startswith("/"):
+        return topic
+    suffix = topic.strip("/") or default_suffix.strip("/")
+    return f"/{namespace}/{suffix}"
+
+
 def _flatten(values: object) -> list[float]:
     if not isinstance(values, list):
         raise ValueError("stiffness and damping must be arrays")
@@ -67,9 +76,11 @@ class VoiceGesturePlugin:
         self._config = plugin_config
         self._namespace = namespace
         self._topics = config["topics"]
-        self._asr_topic = str(plugin_config.get("asr_topic") or f"/{namespace}/mic/audio/asr")
-        self._events_topic = str(
-            plugin_config.get("events_topic") or f"/{namespace}/voice_gesture/events"
+        self._asr_topic = _resolve_namespaced_topic(
+            plugin_config.get("asr_topic"), namespace, "mic/audio/asr"
+        )
+        self._events_topic = _resolve_namespaced_topic(
+            plugin_config.get("events_topic"), namespace, "voice_gesture/events"
         )
         self._require_wake_word = bool(plugin_config.get("require_wake_word", True))
         self._auto_enable_motors = bool(plugin_config.get("auto_enable_motors", True))

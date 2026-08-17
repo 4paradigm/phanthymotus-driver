@@ -1,5 +1,5 @@
 mcp_port: 15708
-ros_namespace: "ubuntu"
+ros_namespace: ""
 name: "EngineAI T800 Development Edition"
 
 ros:
@@ -124,9 +124,9 @@ plugins:
     source: "raw"            # raw | slam —— 转发哪个点云源
   voice_gesture:
     enabled: true
-    # T800 实机 namespace 固定为 ubuntu，显式 Topic 避免容器名影响。
-    asr_topic: "/ubuntu/mic/audio/asr"
-    events_topic: "/ubuntu/voice_gesture/events"
+    # 相对 Topic 会自动拼接 main.py 解析出的 namespace；以 / 开头则保持绝对路径。
+    asr_topic: "mic/audio/asr"
+    events_topic: "voice_gesture/events"
     require_wake_word: true
     # 实机仍需用遥控器物理使能；ROS 服务不可用时继续交给规划器判断。
     auto_enable_motors: true
