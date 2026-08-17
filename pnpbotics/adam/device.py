@@ -843,19 +843,12 @@ class ZedCameraPlugin:
             "state": "idle",
             "available": False,
             "source": "zed-sdk-local",
-            "model": None,
-            "serial_number": None,
             "error": None,
-            "last_frame_ts_ms": None,
-            "last_rgb_ts_ms": None,
-            "last_depth_ts_ms": None,
-            "last_pointcloud_ts_ms": None,
             "pointcloud_enabled": self._pointcloud_enabled,
-            "camera_flip": self._camera_flip,
-            "pointcloud_mount_rotation_deg": dict(
-                self._pointcloud_mount_rotation_deg),
-            "pointcloud_mount_translation_m": dict(
-                self._pointcloud_mount_translation_m),
+            "left_intrinsics": None,
+            "right_intrinsics": None,
+            "stereo_baseline_m": None,
+            "stereo_translation_m": None,
         }
 
         self._pub_node = Node("adam_zed_camera")
@@ -1029,33 +1022,24 @@ class ZedCameraPlugin:
             "available": True,
             "connected": True,
             "source": "zed-sdk-local",
-            "sdk": "ZED SDK",
-            "model": str(camera_info.camera_model),
-            "serial_number": int(camera_info.serial_number),
-            "firmware_version": int(configuration.firmware_version),
             "resolution": self._resolution_dict(configuration.resolution),
             "fps": int(configuration.fps),
             "depth_mode": self._enum_name(params.depth_mode),
             "coordinate_units": self._enum_name(params.coordinate_units),
-            "calibration": {
-                "left": {
-                    "fx": float(left.fx), "fy": float(left.fy),
-                    "cx": float(left.cx), "cy": float(left.cy),
-                    "distortion": self._float_list(left.disto),
-                },
-                "right": {
-                    "fx": float(right.fx), "fy": float(right.fy),
-                    "cx": float(right.cx), "cy": float(right.cy),
-                    "distortion": self._float_list(right.disto),
-                },
-                "baseline_m": float(calibration.get_camera_baseline()),
-                "stereo_translation_m": self._float_list(translation),
+            "left_intrinsics": {
+                "fx": float(left.fx), "fy": float(left.fy),
+                "cx": float(left.cx), "cy": float(left.cy),
+                "distortion": self._float_list(left.disto),
             },
+            "right_intrinsics": {
+                "fx": float(right.fx), "fy": float(right.fy),
+                "cx": float(right.cx), "cy": float(right.cy),
+                "distortion": self._float_list(right.disto),
+            },
+            "stereo_baseline_m": float(calibration.get_camera_baseline()),
+            "stereo_translation_m": self._float_list(translation),
             "error": None,
             "pointcloud_enabled": self._pointcloud_enabled,
-            "camera_flip": self._camera_flip,
-            "pointcloud_mount_rotation_deg": dict(
-                self._pointcloud_mount_rotation_deg),
         }
 
     @staticmethod
@@ -1164,9 +1148,6 @@ class ZedCameraPlugin:
                     continue
                 last_grab_error = None
                 now = time.monotonic()
-                now_ms = int(time.time() * 1000)
-                with self._lock:
-                    self._state["last_frame_ts_ms"] = now_ms
 
                 with self._lock:
                     rgb_enabled = self._card_enabled["camera_head"]
@@ -1184,8 +1165,6 @@ class ZedCameraPlugin:
                         msg.format = "jpeg"
                         msg.data = jpeg
                         self._rgb_pub.publish(msg)
-                        with self._lock:
-                            self._state["last_rgb_ts_ms"] = now_ms
                     except Exception as exc:
                         self._set_error(f"RGB publish failed: {exc}")
                     next_rgb = now + 1.0 / self._rgb_hz
@@ -1203,8 +1182,6 @@ class ZedCameraPlugin:
                         msg.data = zlib.compress(
                             depth_mm.astype("<u2", copy=False).tobytes(), level=1)
                         self._depth_pub.publish(msg)
-                        with self._lock:
-                            self._state["last_depth_ts_ms"] = now_ms
                     except Exception as exc:
                         self._set_error(f"depth publish failed: {exc}")
                     next_depth = now + 1.0 / self._depth_hz
@@ -1219,8 +1196,6 @@ class ZedCameraPlugin:
                             msg = self._UInt8MultiArray()
                             msg.data = list(payload)
                             self._pointcloud_pub.publish(msg)
-                            with self._lock:
-                                self._state["last_pointcloud_ts_ms"] = now_ms
                     except Exception as exc:
                         self._set_error(f"pointcloud publish failed: {exc}")
                     next_pointcloud = now + 1.0 / self._pointcloud_hz
