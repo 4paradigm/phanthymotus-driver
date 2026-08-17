@@ -522,14 +522,6 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertAlmostEqual(0.5, move["vx"])
         self.assertAlmostEqual(2.0, move["duration"])
         plugin.dispatch("stop_move", {})
-
-    def test_locomotion_move_ramps_from_zero_without_overshoot(self):
-        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
-        plugin.start()
-        plugin.dispatch("move", {"vx": 0.05, "duration": 0.2, "force": True})
-        self.assertEqual([0.0, 0.0], plugin._publisher.messages[0].linear_velocity)
-        time.sleep(0.12)  # 100Hz × 1.0 m/s² 加速度：≥5 tick 即可到 0.05 后封顶
-        self.assertAlmostEqual(0.05, plugin._publisher.messages[-1].linear_velocity[0], places=3)
         turn = plugin.dispatch("turn_angle", {
             "angle_rad": -1.0, "angular_speed_rad_s": 0.5, "force": True,
         })
@@ -540,6 +532,14 @@ class DevicePluginContractTests(unittest.TestCase):
         })
         self.assertAlmostEqual(arc["vx"], arc["vyaw"])
         plugin.dispatch("stop_move", {})
+
+    def test_locomotion_move_ramps_from_zero_without_overshoot(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        plugin.dispatch("move", {"vx": 0.05, "duration": 0.2, "force": True})
+        self.assertEqual([0.0, 0.0], plugin._publisher.messages[0].linear_velocity)
+        time.sleep(0.12)  # 100Hz × 1.0 m/s² 加速度：≥5 tick 即可到 0.05 后封顶
+        self.assertAlmostEqual(0.05, plugin._publisher.messages[-1].linear_velocity[0], places=3)
 
     def test_locomotion_gate_accepts_walk_states(self):
         plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
