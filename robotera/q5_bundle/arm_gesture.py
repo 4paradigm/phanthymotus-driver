@@ -299,6 +299,7 @@ class Plugin:
         status = {
             "ros_publisher_available": router_status["ros_publisher_available"],
             "other_publishers": router_status["other_publishers"],
+            "same_name_publisher_count": router_status.get("same_name_publisher_count", 0),
             "lifecycle_state": self._client.get_lifecycle_state(),
             "joint_state_fresh": bool(self._client.snapshot().get("fresh", False)),
             "q5_fsm": q5_active_status(self._client),
@@ -323,7 +324,7 @@ class Plugin:
         if not status["ros_publisher_available"]:
             return _failure("ROS_UNAVAILABLE", "Q5 arm command publisher is unavailable", status=status)
 
-        if router_status.get("same_name_publisher_count", 0) > 1:
+        if status.get("same_name_publisher_count", 0) > 1:
             return _failure("DUPLICATE_BODY_PUBLISHER",
                             "Multiple q5_body_command publishers detected on /wr1_controller/commands",
                             status=status)
