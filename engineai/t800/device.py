@@ -3681,9 +3681,9 @@ class SpeakerPlugin:
                 process.stdin.flush()
                 self._chunks_played += 1
                 self._state = "playing"
-                # 按 16 kHz 单声道 PCM-16 的实时节奏限速写入（32 KB/s），
-                # 避免突发灌流打满 aplay 管道缓冲后阻塞在 write 上。
-                time.sleep(len(pcm) / 32000.0)
+                # 注意：不要再加 sleep 节流——aplay 消费速率即硬件实时速率，
+                # write 在管道/ALSA 缓冲满时自然阻塞（背压限速）；人为 sleep
+                # 会与背压阻塞叠加成半速播放（实测 remote_mic 流 7.8kHz 半速）。
             except Exception as exc:  # noqa: BLE001
                 if self._session == session:
                     self._last_error = str(exc)
