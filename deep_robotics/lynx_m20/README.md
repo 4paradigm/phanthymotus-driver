@@ -36,7 +36,7 @@ Dockerfile 会在解压和编译前再次校验 SHA256。归档内保留上游 `
 
 默认 `model_variant: standard`。供应商文档明确建图、定位和内置导航仅 M20 Pro 支持，因此标准版不会注册导航工具。
 
-M20 Pro 的建图卡片默认关闭。启用后，Driver 使用专用 SSH 密钥连接 NOS，并只调用固定的 `drmap mapping`、`drmap stop_mapping` 及只读状态命令；密码和私钥不会写入配置或镜像。部署时必须以只读方式挂载专用私钥和预先核验的 `known_hosts` 文件，并在 NOS 上仅为所需 `drmap` 命令配置最小 sudo 权限。
+M20 Pro 的建图卡片默认关闭。启用后，Driver 使用专用 SSH 密钥连接 NOS，并通过根用户安装的 `nos_mapping_helper.sh` 只调用固定的 `drmap mapping`、`drmap stop_mapping` 及只读状态命令；密码和私钥不会写入配置或镜像。部署时必须以只读方式挂载专用私钥和预先核验的 `known_hosts` 文件，并在 NOS 上只为 `/usr/local/sbin/phanthy-m20-mapping *` 配置 sudo 权限。助手会再次校验动作、参数数量和地图名。
 
 供应商文档未提供舞蹈、自定义特技或关节位置控制接口，本 Driver 不虚构这些能力。
 

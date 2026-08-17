@@ -144,13 +144,26 @@ class LynxM20ContractTests(unittest.TestCase):
         self.assertIn("StrictHostKeyChecking=yes", command)
         self.assertIn("UserKnownHostsFile=/secrets/known_hosts", command)
         self.assertEqual(
-            "sudo -n /usr/local/bin/drmap mapping -s -n floor-1 -b",
+            "sudo -n /usr/local/sbin/phanthy-m20-mapping start floor-1 false",
             command[-1],
         )
         self.assertFalse(calls[0][1]["check"])
         for invalid in ("", "../map", "map name", "map;reboot", "a" * 65):
             with self.assertRaises(ValueError):
                 client.start_mapping(invalid)
+
+        client.stop_mapping()
+        self.assertEqual(
+            "sudo -n /usr/local/sbin/phanthy-m20-mapping stop",
+            calls[-1][0][-1],
+        )
+
+    def test_nos_helper_has_a_strict_command_allowlist(self):
+        helper = (DRIVER / "nos_mapping_helper.sh").read_text()
+        self.assertIn('case "${action}" in', helper)
+        self.assertIn('^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$', helper)
+        self.assertIn('exec /usr/local/bin/drmap mapping -s -n "${map_name}"', helper)
+        self.assertIn("exec /usr/local/bin/drmap stop_mapping", helper)
 
     def test_mapping_status_distinguishes_active_service(self):
         responses = iter([
