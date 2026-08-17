@@ -321,7 +321,7 @@ class LocoPlugin:
     _MOVE_MIN_DURATION_S = 1.0
     _MOVE_DEFAULT_DURATION_S = 2.0
     _MOVE_MAX_DURATION_S = 5.0
-    _MOVE_CONFIRM_TIMEOUT_S = 1.0
+    _MOVE_CONFIRM_TIMEOUT_S = 2.0
     _MOVE_CONFIRM_MIN_JOINT_VELOCITY = 0.30
     _MOVE_CONFIRM_BASELINE_MARGIN = 0.15
 
@@ -662,6 +662,23 @@ class LocoPlugin:
                     "error": "The previous loco command did not stop within 1 second",
                 }
 
+        # Capture the stationary baseline before WALK carries the requested
+        # velocity. Sampling afterwards would insert an avoidable gap between
+        # the edge and the DEFAULT velocity stream.
+        try:
+            baseline_samples = []
+            for sample_index in range(3):
+                baseline_samples.append(self._sample_max_joint_velocity())
+                if sample_index < 2:
+                    time.sleep(0.05)
+            baseline_joint_velocity = max(baseline_samples)
+        except Exception as exc:
+            return {
+                "state": "error", "command_sent": False,
+                "error": f"Cannot verify pre-move joint feedback: {exc}",
+                "message": "No walking activation or velocity command was sent.",
+            }
+
         # The vendor HighController example sends WALK once to enter/activate
         # the walking policy and then streams DEFAULT frames with x/y/z. A
         # workmode value of 2 alone does not prove that this SDK publisher has
@@ -669,7 +686,8 @@ class LocoPlugin:
         walking_policy_refreshed = False
         if not self._walking_stream_armed:
             observed = self._send_edge_and_wait(
-                _get_control_cmd("WALK"), {2, 26}, timeout_s=1.0)
+                _get_control_cmd("WALK"), {2, 26}, timeout_s=1.0,
+                command_values=(vx, vy, vyaw))
             if observed == 26:
                 self._walking_stream_armed = False
                 return self._protection_error(
@@ -689,20 +707,6 @@ class LocoPlugin:
                 }
             self._walking_stream_armed = True
             walking_policy_refreshed = True
-
-        try:
-            baseline_samples = []
-            for sample_index in range(3):
-                baseline_samples.append(self._sample_max_joint_velocity())
-                if sample_index < 2:
-                    time.sleep(0.05)
-            baseline_joint_velocity = max(baseline_samples)
-        except Exception as exc:
-            return {
-                "state": "error", "command_sent": walking_policy_refreshed,
-                "error": f"Cannot verify pre-move joint feedback: {exc}",
-                "message": "No non-zero walking velocity was sent.",
-            }
 
         self._move_stop_event.clear()
         default_cmd = _get_default_cmd()
@@ -1548,7 +1552,8 @@ class LocoPlugin:
 
     def _send_edge_and_wait(self, cmd_enum, expected_modes: set[int],
                             index: int = 0, timeout_s: float = 2.0,
-                            preroll_override_s: float | None = None) -> int:
+                            preroll_override_s: float | None = None,
+                            command_values: tuple[float, float, float] | None = None) -> int:
         """Prime DDS, send one action edge, then maintain neutral control frames."""
         with self._action_lock:
             default_cmd = _get_default_cmd()
@@ -1590,7 +1595,8 @@ class LocoPlugin:
             # Actions such as START and PLAYTEACH are edge-triggered. Never
             # retry them automatically: START is a toggle and repeated actions
             # can reverse a transition or restart an active policy.
-            self._publish_cmd(0, 0, 0, cmd_enum, index)
+            command_x, command_y, command_z = command_values or (0.0, 0.0, 0.0)
+            self._publish_cmd(command_x, command_y, command_z, cmd_enum, index)
             time.sleep(self._control_period)
 
             deadline = time.monotonic() + timeout_s
