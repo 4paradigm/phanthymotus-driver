@@ -9,6 +9,7 @@ import time
 
 from basic_server import BasicServerClient
 from common.vendor_runtime import action_schema, jsonable, tool
+from nos_mapping import NOSMappingClient
 
 
 GAITS = {"basic": 0x1001, "standard_stairs": 0x1003, "agile_flat": 0x3002, "agile_stairs": 0x3003}
@@ -532,8 +533,48 @@ class M20ProNavigationPlugin:
         return self.nodes.native.request(1003, 1, items)
 
 
+class M20ProMappingPlugin:
+    def __init__(self, nodes, client=None):
+        self.nodes = nodes
+        self.client = client or NOSMappingClient(nodes.config.get("mapping", {}))
+
+    def get_tool(self):
+        return tool("mapping", "actuator", "仅 M20 Pro：通过 NOS 的 drmap 开始、保存建图并查询地图状态", action_schema(
+            {
+                "start_mapping": (["map_name", "activate"], "开始新地图建图；需人工遥控机器人巡视环境"),
+                "stop_mapping": ([], "停止建图并保存地图"),
+                "status": ([], "查询建图服务和当前激活地图"),
+                "list_maps": ([], "列出 NOS 中已有地图"),
+            },
+            {
+                "map_name": {
+                    "type": "string", "minLength": 1, "maxLength": 64,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+                },
+                "activate": {"type": "boolean", "default": True},
+            },
+        ))
+
+    def start(self): pass
+    def stop(self): pass
+
+    def dispatch(self, action, args):
+        if action == "start_mapping":
+            return self.client.start_mapping(args["map_name"], activate=bool(args.get("activate", True)))
+        if action == "stop_mapping":
+            return self.client.stop_mapping()
+        if action == "status":
+            return self.client.status()
+        if action == "list_maps":
+            return self.client.list_maps()
+        raise ValueError(f"unsupported mapping action: {action}")
+
+
 def build_plugins(config, namespace, ros2):
     nodes = M20Nodes(config, namespace, ros2)
     plugins = [M20StatePlugin(nodes), M20MotionPlugin(nodes), M20MotionEventsPlugin(nodes), M20ChargePlugin(nodes), M20DevicePlugin(nodes)]
-    if nodes.is_pro: plugins.append(M20ProNavigationPlugin(nodes))
+    if nodes.is_pro:
+        plugins.append(M20ProNavigationPlugin(nodes))
+        if config.get("mapping", {}).get("enabled", False):
+            plugins.append(M20ProMappingPlugin(nodes))
     return plugins

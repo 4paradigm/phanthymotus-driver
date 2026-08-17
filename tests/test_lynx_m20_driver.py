@@ -25,6 +25,7 @@ def load(name, path):
 
 protocol = load("lynx_m20_basic_server", DRIVER / "basic_server.py")
 m20 = load("lynx_m20_contract", DRIVER / "device.py")
+nos_mapping = load("lynx_m20_nos_mapping", DRIVER / "nos_mapping.py")
 
 
 class FakeNative:
@@ -92,6 +93,80 @@ class LynxM20ContractTests(unittest.TestCase):
         self.assertEqual((2, 23), (body["Type"], body["Command"]))
         self.assertEqual(0x3002, body["Items"]["GaitParam"])
         self.assertEqual(protocol.SYNC, frame[:4])
+
+    def test_mapping_card_uses_only_documented_drmap_commands(self):
+        class FakeMappingClient:
+            def __init__(self): self.calls = []
+            def start_mapping(self, name, activate=True):
+                self.calls.append(("start", name, activate)); return {"state": "mapping"}
+            def stop_mapping(self): self.calls.append(("stop",)); return {"state": "saved"}
+            def status(self): self.calls.append(("status",)); return {"state": "idle"}
+            def list_maps(self): self.calls.append(("list",)); return {"maps": []}
+
+        client = FakeMappingClient()
+        plugin = m20.M20ProMappingPlugin(FakeNodes(), client=client)
+        tool_def = plugin.get_tool()
+        self.assertEqual(("mapping", "actuator"), (tool_def["name"], tool_def["type"]))
+        self.assertEqual(
+            ["map_name", "activate"],
+            tool_def["inputSchema"]["x-action-params"]["start_mapping"]["params"],
+        )
+        plugin.dispatch("start_mapping", {"map_name": "floor_1", "activate": False})
+        plugin.dispatch("stop_mapping", {})
+        plugin.dispatch("status", {})
+        plugin.dispatch("list_maps", {})
+        self.assertEqual(
+            [("start", "floor_1", False), ("stop",), ("status",), ("list",)],
+            client.calls,
+        )
+
+    def test_mapping_ssh_is_pinned_noninteractive_and_rejects_shell_input(self):
+        class Completed:
+            returncode = 0
+            stdout = "Start mapping program"
+            stderr = ""
+
+        calls = []
+        def runner(command, **kwargs):
+            calls.append((command, kwargs))
+            return Completed()
+
+        client = nos_mapping.NOSMappingClient({
+            "host": "10.21.31.106",
+            "user": "user",
+            "identity_file": "/secrets/key",
+            "known_hosts_file": "/secrets/known_hosts",
+        }, runner=runner)
+        result = client.start_mapping("floor-1", activate=False)
+        command = calls[0][0]
+        self.assertEqual("mapping", result["state"])
+        self.assertIn("BatchMode=yes", command)
+        self.assertIn("StrictHostKeyChecking=yes", command)
+        self.assertIn("UserKnownHostsFile=/secrets/known_hosts", command)
+        self.assertEqual(
+            "sudo -n /usr/local/bin/drmap mapping -s -n floor-1 -b",
+            command[-1],
+        )
+        self.assertFalse(calls[0][1]["check"])
+        for invalid in ("", "../map", "map name", "map;reboot", "a" * 65):
+            with self.assertRaises(ValueError):
+                client.start_mapping(invalid)
+
+    def test_mapping_status_distinguishes_active_service(self):
+        responses = iter([
+            (0, "active\n"),
+            (0, "/var/opt/robot/data/maps/floor-1\n"),
+            (0, "floor-2\nfloor-1\n"),
+        ])
+        def runner(command, **kwargs):
+            code, stdout = next(responses)
+            return type("Completed", (), {"returncode": code, "stdout": stdout, "stderr": ""})()
+
+        client = nos_mapping.NOSMappingClient({}, runner=runner)
+        status = client.status()
+        maps = client.list_maps()
+        self.assertEqual(("mapping", "/var/opt/robot/data/maps/floor-1"), (status["state"], status["active_map"]))
+        self.assertEqual(["floor-1", "floor-2"], maps["maps"])
 
     def test_tcp_stream_decoder_handles_fragmented_and_concatenated_frames(self):
         first = protocol.encode_frame(1, 100, 100)

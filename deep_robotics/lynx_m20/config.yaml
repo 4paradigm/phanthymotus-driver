@@ -13,6 +13,14 @@ basic_server:
   udp_port: 30000
   tcp_port: 30001
   timeout: 1.5
+mapping:
+  enabled: false
+  host: "10.21.31.106"
+  user: "user"
+  port: 22
+  identity_file: "/run/secrets/m20_nos_ssh_key"
+  known_hosts_file: "/run/secrets/m20_nos_known_hosts"
+  timeout: 15
 topics:
   motion_info: "/MOTION_INFO"
   motion_state: "/MOTION_STATE"
