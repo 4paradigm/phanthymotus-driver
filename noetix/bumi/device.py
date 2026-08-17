@@ -320,7 +320,8 @@ class LocoPlugin:
     PREFIX = "loco"
     _MOVE_MIN_DURATION_S = 1.0
     _MOVE_DEFAULT_DURATION_S = 2.0
-    _MOVE_MAX_DURATION_S = 5.0
+    _MOVE_MAX_DURATION_S = 10.0
+    _MOVE_MIN_NONZERO_AXIS = 0.5
     _MOVE_CONFIRM_TIMEOUT_S = 2.0
     # Stationary feedback on the tested robot can peak around 0.16 rad/s, while
     # a real low-amplitude gait can start below the former fixed 0.30 rad/s
@@ -366,7 +367,7 @@ class LocoPlugin:
                 "sends a fresh WALK trigger for this bounded command, then follows the vendor "
                 "example by continuously sending DEFAULT with the requested velocity. Every "
                 "move automatically sends zero velocity after at "
-                "most 5 seconds. Values are normalized SDK commands, not metres per second. "
+                "most 10 seconds. Values are normalized SDK commands, not metres per second. "
                 "Before moving, confirm that Bumi is standing steadily on a flat non-slip floor "
                 "and that its path is clear."
             ),
@@ -386,10 +387,7 @@ class LocoPlugin:
                         "type": "number",
                         "default": 0.0,
                         "description": (
-                            "Normalized forward command from -1 to 1; positive moves forward, "
-                            "negative moves backward, default 0. This firmware showed a "
-                            "direction-dependent startup deadband: 0.3 may not start forward "
-                            "motion, so use 0.5 for the first low-risk forward test."
+                            "Allowed range: -1 to -0.5, 0, or 0.5 to 1; default 0."
                         ),
                         "minimum": -1, "maximum": 1,
                     },
@@ -397,10 +395,7 @@ class LocoPlugin:
                         "type": "number",
                         "default": 0.0,
                         "description": (
-                            "Normalized lateral command from -1 to 1; positive moves left, "
-                            "negative moves right, default 0. Lateral startup required a larger "
-                            "command in current real-robot testing: 0.5 may not start, while 0.7 "
-                            "did; test both signs cautiously because their deadbands may differ."
+                            "Allowed range: -1 to -0.5, 0, or 0.5 to 1; default 0."
                         ),
                         "minimum": -1, "maximum": 1,
                     },
@@ -408,9 +403,7 @@ class LocoPlugin:
                         "type": "number",
                         "default": 0.0,
                         "description": (
-                            "Normalized turning command from -1 to 1; positive turns left, "
-                            "negative turns right, default 0. A magnitude of 0.3 started turning "
-                            "in current real-robot testing; test the opposite sign cautiously."
+                            "Allowed range: -1 to -0.5, 0, or 0.5 to 1; default 0."
                         ),
                         "minimum": -1, "maximum": 1,
                     },
@@ -418,7 +411,7 @@ class LocoPlugin:
                         "type": "number",
                         "default": self._MOVE_DEFAULT_DURATION_S,
                         "description": (
-                        "Movement duration in seconds, from 1 to 5; default 2.0. Shorter pulses "
+                        "Movement duration in seconds, from 1 to 10; default 2.0. Shorter pulses "
                         "can end before Bumi's walking policy starts a visible gait. The card "
                         "automatically sends zero velocity when this time expires."
                         ),
@@ -431,7 +424,7 @@ class LocoPlugin:
                     "move": {
                         "params": ["vx", "vy", "vyaw", "duration"],
                         "description": (
-                            "Move with normalized HighController commands for 1-5 seconds. "
+                            "Move with normalized HighController commands for 1-10 seconds. "
                             "At least one velocity must be non-zero and the robot must already "
                             "be upright, stable and in walking mode (motion_state must report "
                             "workmode.code=2). If it is not, the card returns an error without "
@@ -622,6 +615,22 @@ class LocoPlugin:
 
         vx, vy, vyaw = values["vx"], values["vy"], values["vyaw"]
         duration = values["duration"]
+        for field, value in (("vx", vx), ("vy", vy), ("vyaw", vyaw)):
+            if value != 0.0 and abs(value) < self._MOVE_MIN_NONZERO_AXIS:
+                return {
+                    "state": "error",
+                    "command_sent": False,
+                    "error": (
+                        f"{field} must be 0 or have an absolute value from "
+                        f"{self._MOVE_MIN_NONZERO_AXIS} to 1.0"
+                    ),
+                    "received": args.get(field),
+                    "allowed_ranges": [
+                        [-1.0, -self._MOVE_MIN_NONZERO_AXIS],
+                        [0.0, 0.0],
+                        [self._MOVE_MIN_NONZERO_AXIS, 1.0],
+                    ],
+                }
         if vx == 0.0 and vy == 0.0 and vyaw == 0.0:
             return {
                 "state": "error", "command_sent": False,
