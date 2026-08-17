@@ -84,10 +84,13 @@ def _mirror_deg(pose: list[float]) -> list[float]:
 
 def _gesture_to_positions(gesture: str, side: str, deg_pose: list[float]) -> dict:
     """Map a 7-element degree list to {joint_name: position_rad} for *side*."""
-    left_deg = deg_pose
     if side == "right":
-        left_deg = _mirror_deg(deg_pose)
-    return {ARM_JOINTS_LEFT[i]: _deg2rad(left_deg[i]) for i in range(7)}
+        deg_list = _mirror_deg(deg_pose)
+        joints = ARM_JOINTS_RIGHT
+    else:
+        deg_list = deg_pose
+        joints = ARM_JOINTS_LEFT
+    return {joints[i]: _deg2rad(deg_list[i]) for i in range(7)}
 
 
 def _mirrored_positions(gesture: str, side: str, deg_pose: list[float]) -> dict:
@@ -287,10 +290,11 @@ class Plugin:
             return self._arm_control.start()
         return {"state": "ready" if self._router is not None else "unavailable"}
 
-    def stop(self):
+    def stop(self) -> dict:
         self._stop("driver_shutdown")
         if self._arm_control is not None:
             self._arm_control.stop()
+        return {"state": "idle"}
 
     # ── Safety ────────────────────────────────────────────────────────────
 
@@ -313,8 +317,10 @@ class Plugin:
         return status
 
     def _validate_run(self, gesture: str, side: str) -> dict | None:
-        """Pre-flight checks. Returns None on success or an error dict."""
-        if gesture not in _GESTURES_DEG:
+        """Pre-flight checks. Returns None on success or an error dict.
+        If gesture is empty string, skip gesture-name validation but still
+        check side, publisher, lifecycle, and Q5 FSM state."""
+        if gesture and gesture not in _GESTURES_DEG:
             return _failure("UNKNOWN_GESTURE", f"Unknown gesture: {gesture}")
         if side not in ("left", "right", "both"):
             return _failure("INVALID_ARGUMENT", "side must be left, right, or both")
@@ -374,8 +380,8 @@ class Plugin:
 
     # ── Move worker ───────────────────────────────────────────────────────
 
-    def _run_move(self, stop_event: threading.Event, frames, speed: float):
-        """Interpolate through gesture frames, honoring stop_event."""
+    def _run_move(self, stop_event: threading.Event, frames, speed: float, side: str):
+        """Interpolate through gesture frames, honoring stop_event and commanded side."""
         try:
             previous_positions = dict(self._hold_current())  # start from current pose
 
@@ -383,7 +389,7 @@ class Plugin:
                 if stop_event.is_set():
                     break
 
-                positions = _mirrored_positions("_current", "both", frame_deg)
+                positions = _mirrored_positions("_current", side, frame_deg)
                 if stop_event.is_set():
                     break
 
@@ -485,7 +491,9 @@ class Plugin:
 
         if action == "reset":
             speed = _clamp(args.get("speed", 0.5), 0.2, 1.5)
-            check = self._validate_run("reset", "right")
+            # reset bypasses gesture validation; check side/robot safety instead
+            side = "right"
+            check = self._validate_run("", side)
             if isinstance(check, dict):
                 return check
             with self._lock:
@@ -553,7 +561,7 @@ class Plugin:
             self._stop_event = stop_event
             self._motion_thread = threading.Thread(
                 target=self._run_move,
-                args=(stop_event, frames, speed),
+                args=(stop_event, frames, speed, side),
                 daemon=True,
                 name="q5_arm_gesture",
             )

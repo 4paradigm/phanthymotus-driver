@@ -71,7 +71,6 @@ COPY heartbeat.py /work/heartbeat.py
 COPY odom.py /work/odom.py
 COPY teleop_state.py /work/teleop_state.py
 COPY robot_status.py /work/robot_status.py
-COPY arm_gesture.py /work/arm_gesture.py
 COPY config.yaml /work/config.yaml
 COPY resource/q5_model.urdf /work/resource/q5_model.urdf
 COPY resource/fastdds_udp_only.xml /work/resource/fastdds_udp_only.xml
