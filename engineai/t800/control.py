@@ -57,18 +57,32 @@ T800_JOINT_GROUPS = {
 
 T800_JOINT_INDEX = {name: index for index, name in enumerate(T800_JOINT_NAMES)}
 
+# 官方 T800 开发版 motion state 全集（飞书《ROS2 接口开发文档》第 1 章状态机）。
+# 前 13 个为 T800 状态；rl_amp / rl_terrain / rl_recover_prone / rl_floor_sitting
+# 为 PM01 专属，T800 固件不返回，仅列全供 capabilities 展示。walk_server 是整机
+# 动作服务器状态，不是 BodyVelCmd 速度行走模式。
 MOTION_STATES = (
     "idle",
     "passive",
     "pd_stand",
-    "walk",
-    "dance",
-    "supine_to_stance",
-    "stance_to_supine",
-    "joint_bridge",
+    "rl_basic",
     "lower_body_balance",
+    "joint_bridge",
+    "pd_sitground",
+    "walk_server",
+    "rl_mimic_supine_to_stance",
+    "rl_mimic_prone_to_stance",
+    "rl_mimic_stance_to_supine",
+    "rl_mimic_sitdown_to_stance",
+    "rl_mimic_stance_to_sitdown",
+    "rl_amp",
     "rl_terrain",
+    "rl_recover_prone",
+    "rl_floor_sitting",
 )
+
+# BodyVelCmd 有效的官方步行模式（速度控制门禁白名单）。
+WALK_MOTION_STATES = ("rl_basic", "lower_body_balance")
 
 LED_MODES = {
     "blink_red": 0x1,

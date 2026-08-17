@@ -11,7 +11,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from control import (  # noqa: E402
+    MOTION_STATES,
     T800_JOINT_NAMES,
+    WALK_MOTION_STATES,
     RepeatingCommand,
     action_schema,
     clamp,
@@ -81,6 +83,22 @@ class ValidationTests(unittest.TestCase):
         self.assertTrue(tool["readOnly"])
         self.assertEqual("sensor", tool["type"])
         self.assertEqual("/robot/state/imu", tool["topic_out"][0]["topic"])
+
+    def test_motion_states_match_official_t800_list(self):
+        self.assertEqual(
+            ("idle", "passive", "pd_stand", "rl_basic", "lower_body_balance",
+             "joint_bridge", "pd_sitground", "walk_server",
+             "rl_mimic_supine_to_stance", "rl_mimic_prone_to_stance",
+             "rl_mimic_stance_to_supine", "rl_mimic_sitdown_to_stance",
+             "rl_mimic_stance_to_sitdown",
+             "rl_amp", "rl_terrain", "rl_recover_prone", "rl_floor_sitting"),
+            MOTION_STATES,
+        )
+
+    def test_walk_motion_states_exclude_invented_names(self):
+        self.assertEqual(("rl_basic", "lower_body_balance"), WALK_MOTION_STATES)
+        self.assertNotIn("walk", WALK_MOTION_STATES)
+        self.assertNotIn("dance", WALK_MOTION_STATES)
 
 
 class RepeatingCommandTests(unittest.TestCase):
