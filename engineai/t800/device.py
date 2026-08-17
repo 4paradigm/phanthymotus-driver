@@ -1812,6 +1812,9 @@ class NativeInterfaceProbePlugin:
         return "low"
 
 class LocomotionPlugin:
+    # 停止顺序契约：bundle 关停时 loco 必须最先归零（main.py stop_all 消费）。
+    STOP_PRIORITY = 0
+
     def __init__(self, config: dict, namespace: str, ros2, state: StatePlugin):
         self._config = config
         self._state = state

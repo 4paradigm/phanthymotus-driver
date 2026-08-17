@@ -233,7 +233,7 @@ class T800DeviceBundle:
     def stop_all(self) -> None:
         if not self._started:
             return
-        for plugin in reversed(self._active_plugins):
+        for plugin in sorted(self._active_plugins, key=lambda p: getattr(p, "STOP_PRIORITY", 100)):
             try:
                 plugin.stop()
             except Exception as exc:

@@ -287,6 +287,10 @@ class DevicePluginContractTests(unittest.TestCase):
         schema = plugin.get_tool()["inputSchema"]
         self.assertEqual({"actions": ["move"], "timeout": 60}, schema["x-completion"])
 
+    def test_locomotion_has_highest_stop_priority(self):
+        self.assertEqual(0, self.device.LocomotionPlugin.STOP_PRIORITY)
+        self.assertEqual(100, getattr(self.device.MotionModePlugin, "STOP_PRIORITY", 100))
+
     def test_sensor_lifecycle_schemas_and_info_topics_match_agent_core(self):
         plugins = [
             self.state,
