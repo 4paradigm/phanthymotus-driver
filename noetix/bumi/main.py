@@ -47,7 +47,8 @@ def _resolve_namespace(cfg: dict) -> str:
 # ── Bundle ────────────────────────────────────────────────────────────────────
 
 class BumiDeviceBundle:
-    def __init__(self, cfg: dict, namespace: str, executor, high_ctrl, media_ctrl):
+    def __init__(self, cfg: dict, namespace: str, executor, high_ctrl, media_ctrl,
+                 low_ctrl):
         self._plugins: list = []
         plugins_cfg = cfg.get("plugins", {})
 
@@ -81,6 +82,13 @@ class BumiDeviceBundle:
             self._plugins.append(MotionStatePlugin(
                 plugins_cfg["motion_state"], namespace, executor, high_ctrl))
             print("[bundle] MotionStatePlugin loaded")
+
+        if (plugins_cfg.get("arm", {}).get("enabled", False)
+                and low_ctrl is not None and high_ctrl is not None):
+            from device import ArmPlugin
+            self._plugins.append(ArmPlugin(
+                plugins_cfg["arm"], namespace, executor, low_ctrl, high_ctrl))
+            print("[bundle] ArmPlugin loaded")
 
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
@@ -254,6 +262,7 @@ def main():
     # ── Initialize Noetix SDK ──
     high_ctrl = None
     media_ctrl = None
+    low_ctrl = None
 
     try:
         sys.path.insert(0, "/work/noetix_sdk_bumi/build")
@@ -318,11 +327,42 @@ def main():
             print(f"[bundle] MediaController unavailable: {e}")
             media_ctrl = None
 
+    if (high_ctrl is not None
+            and cfg.get("plugins", {}).get("arm", {}).get("enabled", False)):
+        try:
+            from lowcontrol_py import LowController
+            low_ctrl = LowController.instance()
+            probe_code3 = (
+                "import sys; sys.path.insert(0, '/work/noetix_sdk_bumi/build'); "
+                "from lowcontrol_py import LowController; "
+                "ctrl = LowController.instance(); result = ctrl.init(); "
+                "print('OK' if result is not False else 'FAILED')"
+            )
+            result = subprocess.run(
+                [sys.executable, "-c", probe_code3],
+                capture_output=True, text=True, timeout=10,
+            )
+            if "OK" in result.stdout:
+                init_result = low_ctrl.init()
+                if init_result is False:
+                    raise RuntimeError("LowController.init() returned false")
+                print("[bundle] LowController initialized")
+            else:
+                print(f"[bundle] LowController probe failed: {result.stderr.strip()}")
+                low_ctrl = None
+        except subprocess.TimeoutExpired:
+            print("[bundle] LowController timed out")
+            low_ctrl = None
+        except Exception as e:
+            print(f"[bundle] LowController unavailable: {e}")
+            low_ctrl = None
+
     # ── ROS2 ──
     rclpy.init()
     executor = rclpy.executors.MultiThreadedExecutor()
 
-    _bundle = BumiDeviceBundle(cfg, namespace, executor, high_ctrl, media_ctrl)
+    _bundle = BumiDeviceBundle(
+        cfg, namespace, executor, high_ctrl, media_ctrl, low_ctrl)
     _bundle.start_all()
 
     def _spin():

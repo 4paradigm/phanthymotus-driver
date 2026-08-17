@@ -1,6 +1,8 @@
 # Noetix Bumi driver
 
-The bundle exposes the original Bumi sensor, locomotion, audio and camera cards plus one higher-level motion-state card backed by documented Noetix SDK APIs. All card implementations are kept in `device.py`.
+The bundle exposes the original Bumi sensor, locomotion, audio and camera cards,
+the higher-level motion-state card, and an EDU-only LowController arm card. All
+card implementations are kept in `device.py`.
 
 ## New cards
 
@@ -23,6 +25,28 @@ field for device-side verification.
 Every published state identifies `Noetix HighController/CycloneDDS` as its source and includes a freshness flag. It deliberately excludes battery data, which belongs to the existing `battery` card. The SDK does not expose world-frame position or translational velocity, so the card reports only documented IMU and joint measurements and does not invent odometry.
 
 ## Direct action cards
+
+### `arm`
+
+Moves the left arm, right arm, or both arms through the EDU-only LowController.
+Each supplied side is a four-number array in degrees ordered as shoulder pitch,
+shoulder roll, shoulder yaw and elbow pitch. At least one side is required; an
+omitted side remains at its measured starting pose. `speed_deg_s` is limited to
+10-30 degrees per second and defaults to 20.
+
+Before sending a command, the card requires HighController workmode 2
+(`walking`), samples the 21 joint velocities five times to reject a robot that
+is still moving, verifies the SDK motor-ID mapping, validates all documented arm
+limits and rejects documented motor faults. It interpolates a cosine trajectory
+and reports `completed` only when measured arm feedback reaches every requested
+target within 5 degrees.
+
+LowController requires a complete 21-motor command even for an arm-only move,
+so all non-target joints are held at their measured starting positions with
+fixed gains from the vendor policy configuration. The LowController send thread
+continues holding the latest command after the tool returns. This is not a
+balancing controller: use only on an EDU Bumi secured by a load-bearing safety
+hanger, and never run a HighController motion card concurrently.
 
 The former `switch_mode` tool is split into three user-facing cards. Internal
 `enable`, `ready` and `walk` transitions are completed automatically and are no

@@ -10,7 +10,9 @@ using namespace noetix;
 
 PYBIND11_MODULE(lowcontrol_py, m) {
         // RobotBmsData
-        py::class_<RobotBmsData>(m, "RobotBmsData")
+        // These SDK data types are also bound by highcontrol_py. Keep the
+        // low-control copies module-local so both modules can coexist.
+        py::class_<RobotBmsData>(m, "RobotBmsData", py::module_local())
             .def(py::init<>())
             .def_readonly("battery_temp", &RobotBmsData::battery_temp_)
             .def_readonly("battery_alarm", &RobotBmsData::battery_alarm_)
@@ -27,7 +29,7 @@ PYBIND11_MODULE(lowcontrol_py, m) {
             .def_readwrite("kd", &MotorCmd::kd)
             .def_readwrite("motor_id", &MotorCmd::motor_id);
 
-        py::class_<joydata>(m, "JoyData")
+        py::class_<joydata>(m, "JoyData", py::module_local())
             .def(py::init<>())
             .def_property_readonly("axes",
                                    [](const joydata &d) {
@@ -38,7 +40,7 @@ PYBIND11_MODULE(lowcontrol_py, m) {
                     return py::array_t<int>({14}, {sizeof(int)}, d.button);
             });
 
-        py::class_<NingImuData>(m, "NingImuData")
+        py::class_<NingImuData>(m, "NingImuData", py::module_local())
             .def(py::init<>())
             .def_property_readonly("ori",
                                    [](const NingImuData &d) {
@@ -74,7 +76,7 @@ PYBIND11_MODULE(lowcontrol_py, m) {
                                                d.linear_acc_cov);
             });
 
-        py::class_<MotorState>(m, "MotorState")
+        py::class_<MotorState>(m, "MotorState", py::module_local())
             .def(py::init<>())
             .def_readwrite("pos", &MotorState::pos)
             .def_readwrite("vel", &MotorState::vel)
@@ -121,7 +123,7 @@ PYBIND11_MODULE(lowcontrol_py, m) {
 
             .def("get_robot_bms_data", &LowController::get_robot_bms_data);
 
-        py::class_<AoLionDriver>(m, "AoLionDriver")
+        py::class_<AoLionDriver>(m, "AoLionDriver", py::module_local())
             .def(py::init<>())
 
             // init
