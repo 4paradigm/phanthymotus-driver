@@ -3175,11 +3175,15 @@ class SpeakerPlugin:
         self._state = "idle"
         self._last_error = ""
         self._process = None
-        self._queue = queue.Queue(maxsize=200)
+        # 实时音频滑动窗口：队列上限限制最大滞后（50 块 × 1024B ≈ 1.6s）。
+        # remote_mic 等持续流若发布速率高于播放速率，满时丢最旧块而非新块，
+        # 保证播放的是最新内容而非永远滞后的积压数据。
+        self._queue = queue.Queue(maxsize=50)
         self._thread = None
         self._running = False
         self._session = 0
         self._chunks_played = 0
+        self._dropped = 0
         self._last_chunk_time = 0.0
 
     def get_tool(self) -> dict:
@@ -3322,7 +3326,19 @@ class SpeakerPlugin:
             self._queue.put_nowait(pcm)
             self._last_chunk_time = time.monotonic()
         except queue.Full:
-            self._last_error = "speaker buffer full; audio chunk dropped"
+            # 滑动窗口：丢弃最旧的块，腾出位置放新块——持续实时流下
+            # 播放始终跟随最新输入，而不是永远滞后的积压音频。
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._queue.put_nowait(pcm)
+            except queue.Full:
+                self._last_error = "speaker buffer full; audio chunk dropped"
+                return
+            self._last_chunk_time = time.monotonic()
+            self._dropped += 1
 
     def _play_loop(self, session: int) -> None:
         # 会话隔离：stop() 会递增 _session 并关闭 aplay stdin，旧线程随后在
@@ -3378,6 +3394,7 @@ class SpeakerPlugin:
                         if self._input_topic else [{"format": "audio/pcm-16k"}])
             return {"state": self._state, "topic_in": topic_in,
                     "buffer_chunks": self._queue.qsize(), "chunks_played": self._chunks_played,
+                    "dropped_old": self._dropped,
                     "last_error": self._last_error}
         return {"error": f"unknown speaker action: {action}"}
 

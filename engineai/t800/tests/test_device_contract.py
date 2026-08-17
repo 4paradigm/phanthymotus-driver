@@ -726,6 +726,23 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("idle", plugin.dispatch("stop", {})["state"])
         self.assertEqual([], plugin._node.subscriptions)
 
+    def test_speaker_sliding_window_drops_oldest_on_overflow(self):
+        # 持续实时流(remote_mic)发布速率高于播放速率时,队列满应丢最旧块
+        # 而非新块,保证播放跟随最新输入(否则永远滞后 6 秒+)。
+        plugin = self.device.SpeakerPlugin(CONFIG, "robot", self.ros)
+        plugin.start()
+        # 队列 maxsize=50,塞 55 块,验证尾部(最新)数据保留、头部(最旧)被丢
+        for i in range(55):
+            plugin._on_chunk(types.SimpleNamespace(
+                format="audio/pcm-16k", data=list(bytes([i & 0xFF]) * 1024)))
+        qsize = plugin._queue.qsize()
+        self.assertEqual(50, qsize)
+        self.assertEqual(plugin._dropped, 5)
+        head = bytes(plugin._queue.queue[0])[0]
+        self.assertEqual(5, head)  # 0-4 被丢,队首是最新保留块中最旧的
+        tail = bytes(plugin._queue.queue[-1])[0]
+        self.assertEqual(54, tail)  # 最新的 54 在队尾
+
     def test_speaker_volume_uses_official_pactl_interface(self):
         plugin = self.device.SpeakerPlugin(CONFIG, "robot", self.ros)
         commands = []
