@@ -8,7 +8,7 @@ import threading
 import time
 
 try:
-    from arm_control import Plugin as ArmControlPlugin
+    from arm_control import ArmControlPlugin
 except ImportError:
     ArmControlPlugin = None
 
@@ -45,7 +45,7 @@ _MIRROR_MASK = [1, 2, 4]
 _GESTURES_DEG = {
     "salute":          [-10, 90, 60, -110, 50, 0, 0],
     "welcome":         [-10, 65, 75, -100, 0, 0, 0],
-    "raise":           [0, 130, 0, -15, 0, 0, 0],
+    "raise":           [0, 103, 0, -15, 0, 0, 0],
     "shake_hands":     [-55, 15, 5, -35, 0, 0, 0],
     "high_five":       [-40, 40, -20, -80, 0, 0, 50],
 }
@@ -220,12 +220,13 @@ class Plugin:
 
     def get_tool(self) -> dict:
         actions = ["salute", "welcome", "raise", "shake_hands", "high_five", "reset",
-                    "cancel", "start", "info"]
+                    "cancel", "stop", "start", "info"]
         one_of_actions = [
             {"const": "start", "title": "检查连接状态"},
             *[{"const": name, "title": label} for name, label in _GESTURE_LABELS.items()],
             {"const": "reset", "title": "归零"},
             {"const": "cancel", "title": "取消并保持"},
+            {"const": "stop", "title": "停止并归零"},
             {"const": "info", "title": "查看状态"},
         ]
         return {
@@ -277,6 +278,7 @@ class Plugin:
                     "high_five": {"params": ["side", "speed"], "description": "将手掌伸到身体前方并保持在肩部附近，做出击掌等待姿势"},
                     "reset": {"params": ["speed"], "description": "取消序列并回到中性姿态"},
                     "cancel": {"params": [], "description": "取消尚未发送的后续动作帧，并保持当前位置"},
+                    "stop": {"params": [], "description": "停止当前手势并回到中性姿态（归零）"},
                     "start": {"params": [], "description": "检查 ROS 连接和机器人状态"},
                     "info": {"params": [], "description": "查看当前运动和安全条件"},
                 },
@@ -489,6 +491,9 @@ class Plugin:
         if action == "cancel":
             return self._stop("command")
 
+        if action == "stop":
+            return self.stop()
+
         if action == "reset":
             speed = _clamp(args.get("speed", 0.5), 0.2, 1.5)
             # reset bypasses gesture validation; check side/robot safety instead
@@ -496,9 +501,15 @@ class Plugin:
             check = self._validate_run("", side)
             if isinstance(check, dict):
                 return check
+            # Check for active motion outside the lock to avoid deadlock:
+            # _stop() also acquires self._lock, so we peek first then call
+            # _stop() only if needed (and _stop() will re-acquire the lock).
+            need_cancel = False
             with self._lock:
                 if self._motion_thread is not None and self._motion_thread.is_alive():
-                    self._stop("preempt")
+                    need_cancel = True
+            if need_cancel:
+                self._stop("preempt")
             # Publish neutral to all arm joints
             neutral = {name: 0.0 for name in ARM_JOINT_NAMES}
             violations = _validate_pose_rad(neutral)
