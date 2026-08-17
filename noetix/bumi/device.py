@@ -4,7 +4,6 @@ drivers/noetix/bumi/device.py — Noetix Bumi-EDU 设备插件实现。
 插件列表：
   - StatePlugin: joints (21-DOF skeleton), imu, battery, model (URDF resource)
   - LocoPlugin: locomotion, stand-up/prone storage, semantic actions and action recording
-  - ArmPlugin: bilateral 8-DOF arm position control through LowController
   - MicPlugin: 8ch mic capture → mono PCM 16kHz
   - SpeakerPlugin: audio playback via MediaController
   - CameraPlugin: Realsense D435i color + depth
@@ -53,40 +52,6 @@ _BUMI_JOINT_NAMES = [
     # 20: waist
     'waist_yaw_joint',
 ]
-
-# LowController motor IDs and mechanical limits documented by Noetix. Card
-# inputs use degrees; MotorCmd.pos is always sent in radians.
-_BUMI_ARM_JOINTS = {
-    "left": (
-        (0, "shoulder_pitch", -135.0, 135.0),
-        (1, "shoulder_roll", -8.0, 111.0),
-        (2, "shoulder_yaw", -90.0, 90.0),
-        (3, "elbow_pitch", -129.0, 0.0),
-    ),
-    "right": (
-        (10, "shoulder_pitch", -135.0, 135.0),
-        (11, "shoulder_roll", -111.0, 8.0),
-        (12, "shoulder_yaw", -90.0, 90.0),
-        (13, "elbow_pitch", -129.0, 0.0),
-    ),
-}
-
-# Fixed gains from the vendor Bumi policy configuration, reordered into motor
-# ID order. They are intentionally not exposed through the MCP schema.
-_BUMI_LOWCONTROL_KP = (
-    12.0, 12.0, 12.0, 12.0,
-    60.0, 60.0, 60.0, 45.0, 10.0, 10.0,
-    12.0, 12.0, 12.0, 12.0,
-    60.0, 60.0, 60.0, 45.0, 10.0, 10.0,
-    53.0,
-)
-_BUMI_LOWCONTROL_KD = (
-    0.4, 0.4, 0.4, 0.4,
-    3.0, 3.0, 2.5, 2.0, 0.5, 0.5,
-    0.4, 0.4, 0.4, 0.4,
-    3.0, 3.0, 2.5, 2.0, 0.5, 0.5,
-    3.4,
-)
 
 # ── ControlCmd Mapping ────────────────────────────────────────────────────────
 # Lazy-loaded from highcontrol_py.ControlCmd enum at runtime
@@ -349,475 +314,13 @@ class StatePlugin:
         return None
 
 
-# ── ArmPlugin (actuator, LowController) ──────────────────────────────────────
-
-# LowController arm card. This is intentionally separate from LocoPlugin even
-# though both are actuator plugins: they use different vendor control layers.
-class ArmPlugin:
-    """Smooth bilateral arm position control using the 21-motor API."""
-
-    PREFIX = "arm"
-    _DEFAULT_SPEED_DEG_S = 20.0
-    _MIN_SPEED_DEG_S = 10.0
-    _MAX_SPEED_DEG_S = 30.0
-    _CONTROL_INTERVAL_S = 0.01  # SDK send_thread republishes at 500 Hz.
-    _MIN_TRAJECTORY_S = 0.5
-    _FEEDBACK_TIMEOUT_S = 2.0
-    _POSITION_TOLERANCE_DEG = 5.0
-    _STATIONARY_VELOCITY_THRESHOLD = 0.20
-    _STATIONARY_SAMPLE_COUNT = 5
-
-    def __init__(self, plugin_config: dict, namespace: str, executor, low_ctrl,
-                 high_ctrl=None):
-        self._low_ctrl = low_ctrl
-        self._high_ctrl = high_ctrl
-        self._move_lock = threading.Lock()
-        self._stop_event = threading.Event()
-        self._motor_cmd_cls = None
-        self._initialization_error: str | None = None
-
-    def get_tool(self) -> dict:
-        left_limits = [[item[2], item[3]] for item in _BUMI_ARM_JOINTS["left"]]
-        right_limits = [[item[2], item[3]] for item in _BUMI_ARM_JOINTS["right"]]
-        return {
-            "name": "arm",
-            "type": "actuator",
-            "multiInstance": False,
-            "description": (
-                "Move Bumi's left arm, right arm, or both arms to specified joint angles "
-                "through LowController. Provide at least one four-angle array in degrees, "
-                "ordered as [shoulder pitch, shoulder roll, shoulder yaw, elbow pitch]. "
-                "The driver validates every documented joint limit and moves smoothly; "
-                "KP, KD, and torque are fixed internally and cannot be supplied by the user. "
-                "The command is accepted only when HighController reports workmode=2 "
-                "(walking) and five state samples confirm that Bumi is stationary. "
-                "LowController takes control of all 21 motors even for an arm-only move. "
-                "Per the vendor safety instructions, test only with the robot secured by a "
-                "load-bearing safety hanger, and do not call high-level motion cards at the "
-                "same time."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "left_positions": {
-                        "type": "array",
-                        "items": {"type": "number"},
-                        "minItems": 4,
-                        "maxItems": 4,
-                        "description": (
-                            "Optional left-arm target angles in degrees: [shoulder_pitch, "
-                            "shoulder_roll, shoulder_yaw, elbow_pitch]. Per-joint ranges are "
-                            f"{left_limits}. Omit this field to keep the left arm at its "
-                            "measured starting angles. Example: [0, 20, 0, -45]."
-                        ),
-                    },
-                    "right_positions": {
-                        "type": "array",
-                        "items": {"type": "number"},
-                        "minItems": 4,
-                        "maxItems": 4,
-                        "description": (
-                            "Optional right-arm target angles in degrees: [shoulder_pitch, "
-                            "shoulder_roll, shoulder_yaw, elbow_pitch]. Per-joint ranges are "
-                            f"{right_limits}. Omit this field to keep the right arm at its "
-                            "measured starting angles. Example: [0, -20, 0, -45]."
-                        ),
-                    },
-                    "speed_deg_s": {
-                        "type": "number",
-                        "minimum": self._MIN_SPEED_DEG_S,
-                        "maximum": self._MAX_SPEED_DEG_S,
-                        "default": self._DEFAULT_SPEED_DEG_S,
-                        "description": (
-                            "Maximum joint speed in degrees per second. Range 10-30; default "
-                            "20. The minimum keeps worst-case moves within the MCP request window."
-                        ),
-                    },
-                },
-                "anyOf": [
-                    {"required": ["left_positions"]},
-                    {"required": ["right_positions"]},
-                ],
-            },
-            "topic_out": [],
-        }
-
-    def start(self) -> None:
-        try:
-            from lowcontrol_py import MotorCmd
-            self._motor_cmd_cls = MotorCmd
-            self._verify_joint_mapping()
-        except Exception as exc:
-            self._initialization_error = str(exc)
-            print(f"[ArmPlugin] unavailable: {exc}", flush=True)
-
-    def stop(self) -> None:
-        # Request the interpolation loop to stop at its latest smoothly reached
-        # position. Do not enqueue a damping command here because it could
-        # unexpectedly release a standing robot.
-        self._stop_event.set()
-
-    def dispatch(self, action: str, args: dict) -> dict:
-        if action in ("start", "info"):
-            return {
-                "state": "ready" if self._initialization_error is None else "error",
-                "control": "LowController 21-motor position command",
-                "supported_joints": 8,
-                "initialization_error": self._initialization_error,
-            }
-        if action == "stop":
-            self._stop_event.set()
-            return {"state": "stopping"}
-        if action not in ("arm", "move"):
-            return {"state": "error", "error": f"unknown arm operation: {action}"}
-        return self._move(args)
-
-    def _verify_joint_mapping(self) -> None:
-        expected = {
-            "arm_l1_joint": 0, "arm_l2_joint": 1,
-            "arm_l3_joint": 2, "arm_l4_joint": 3,
-            "arm_r1_joint": 10, "arm_r2_joint": 11,
-            "arm_r3_joint": 12, "arm_r4_joint": 13,
-        }
-        mismatches = []
-        for name, expected_id in expected.items():
-            actual_id = int(self._low_ctrl.getJointsIndex(name))
-            if actual_id != expected_id:
-                mismatches.append(
-                    {"joint": name, "expected_id": expected_id, "actual_id": actual_id})
-        if mismatches:
-            raise RuntimeError(f"LowController arm joint mapping mismatch: {mismatches}")
-
-    @staticmethod
-    def _decode_positions(value: Any, field_name: str) -> tuple[Any, dict | None]:
-        if isinstance(value, str):
-            try:
-                value = json.loads(value)
-            except json.JSONDecodeError as exc:
-                return None, {
-                    "state": "error", "command_sent": False,
-                    "error": f"{field_name} must be a valid JSON array: {exc}",
-                }
-        if not isinstance(value, (list, tuple)) or len(value) != 4:
-            return None, {
-                "state": "error", "command_sent": False,
-                "error": f"{field_name} must contain exactly four joint angles",
-            }
-        converted = []
-        for index, item in enumerate(value):
-            if isinstance(item, bool) or not isinstance(item, (int, float)):
-                return None, {
-                    "state": "error", "command_sent": False,
-                    "error": f"{field_name}[{index}] must be a finite number",
-                }
-            number = float(item)
-            if not math.isfinite(number):
-                return None, {
-                    "state": "error", "command_sent": False,
-                    "error": f"{field_name}[{index}] must be a finite number",
-                }
-            converted.append(number)
-        return converted, None
-
-    def _validate_request(self, args: dict) -> tuple[dict, float] | dict:
-        requested: dict[str, list[float]] = {}
-        violations = []
-        for side in ("left", "right"):
-            field_name = f"{side}_positions"
-            if field_name not in args or args[field_name] is None:
-                continue
-            values, error = self._decode_positions(args[field_name], field_name)
-            if error is not None:
-                return error
-            requested[side] = values
-            for value, (_, joint_name, lower, upper) in zip(
-                    values, _BUMI_ARM_JOINTS[side]):
-                if value < lower or value > upper:
-                    violations.append({
-                        "side": side,
-                        "joint": joint_name,
-                        "value_deg": value,
-                        "minimum_deg": lower,
-                        "maximum_deg": upper,
-                    })
-
-        if not requested:
-            return {
-                "state": "error", "command_sent": False,
-                "error": "Provide left_positions, right_positions, or both",
-            }
-        if violations:
-            return {
-                "state": "error", "command_sent": False,
-                "error": "One or more arm targets exceed the documented joint limits",
-                "violations": violations,
-            }
-
-        speed = args.get("speed_deg_s", self._DEFAULT_SPEED_DEG_S)
-        if isinstance(speed, bool) or not isinstance(speed, (int, float)):
-            return {
-                "state": "error", "command_sent": False,
-                "error": "speed_deg_s must be a number from 10 to 30",
-            }
-        speed = float(speed)
-        if not math.isfinite(speed) or not self._MIN_SPEED_DEG_S <= speed <= self._MAX_SPEED_DEG_S:
-            return {
-                "state": "error", "command_sent": False,
-                "error": "speed_deg_s must be between 10 and 30",
-            }
-        return requested, speed
-
-    def _new_commands(self, positions: list[float]) -> list:
-        commands = []
-        for motor_id, position in enumerate(positions):
-            cmd = self._motor_cmd_cls()
-            cmd.pos = float(position)
-            cmd.vel = 0.0
-            cmd.tau = 0.0
-            cmd.kp = _BUMI_LOWCONTROL_KP[motor_id]
-            cmd.kd = _BUMI_LOWCONTROL_KD[motor_id]
-            cmd.motor_id = motor_id
-            commands.append(cmd)
-        return commands
-
-    @staticmethod
-    def _read_states(low_ctrl):
-        states = low_ctrl.get_joint_state()
-        if len(states) != 21:
-            raise RuntimeError(f"expected 21 joint states, received {len(states)}")
-        motor_ids = [int(states[i].motor_id) for i in range(21)]
-        if motor_ids != list(range(21)):
-            raise RuntimeError(
-                f"LowController joint state is not ready; motor IDs are {motor_ids}")
-        positions = [float(states[i].pos) for i in range(21)]
-        velocities = [float(states[i].vel) for i in range(21)]
-        if not all(math.isfinite(value) for value in positions + velocities):
-            raise RuntimeError("LowController returned a non-finite joint state")
-        return states, positions
-
-    def _check_stationary_walking(self) -> dict | None:
-        maximum_velocity = 0.0
-        for sample_index in range(self._STATIONARY_SAMPLE_COUNT):
-            mode = int(self._high_ctrl.get_mode())
-            if mode == 26:
-                return {
-                    "state": "error", "command_sent": False,
-                    "current_workmode": 26,
-                    "current_workmode_name": "protection",
-                    "protection": True,
-                    "error": (
-                        "Robot is in protection mode. Restart and inspect it before "
-                        "attempting LowController motion."
-                    ),
-                }
-            if mode != 2:
-                return {
-                    "state": "error", "command_sent": False,
-                    "current_workmode": mode,
-                    "current_workmode_name": _WORKMODE_NAMES.get(mode, "unknown"),
-                    "required_workmode": 2,
-                    "required_workmode_name": "walking",
-                    "error": (
-                        "Arm movement requires workmode=2 (walking). The card does not "
-                        "switch modes automatically."
-                    ),
-                }
-            states = self._high_ctrl.get_joint_state()
-            if len(states) != 21:
-                return {
-                    "state": "error", "command_sent": False,
-                    "error": f"HighController returned {len(states)} joints; expected 21",
-                }
-            sample_maximum = max(abs(float(state.vel)) for state in states)
-            if not math.isfinite(sample_maximum):
-                return {
-                    "state": "error", "command_sent": False,
-                    "error": "HighController returned a non-finite joint velocity",
-                }
-            maximum_velocity = max(maximum_velocity, sample_maximum)
-            if sample_index + 1 < self._STATIONARY_SAMPLE_COUNT:
-                time.sleep(0.05)
-        if maximum_velocity >= self._STATIONARY_VELOCITY_THRESHOLD:
-            return {
-                "state": "error", "command_sent": False,
-                "maximum_joint_velocity_rad_s": round(maximum_velocity, 4),
-                "stationary_threshold_rad_s": self._STATIONARY_VELOCITY_THRESHOLD,
-                "error": (
-                    "The robot is in walking mode but is not stationary. Stop locomotion, "
-                    "wait for the body to settle, and retry."
-                ),
-            }
-        return None
-
-    def _move(self, args: dict) -> dict:
-        if self._initialization_error is not None or self._motor_cmd_cls is None:
-            return {
-                "state": "error", "command_sent": False,
-                "error": "LowController arm control is unavailable",
-                "detail": self._initialization_error,
-            }
-        validated = self._validate_request(args)
-        if isinstance(validated, dict):
-            return validated
-        requested, speed_deg_s = validated
-
-        if self._high_ctrl is None:
-            return {
-                "state": "error", "command_sent": False,
-                "error": (
-                    "Cannot verify walking and stationary prerequisites because "
-                    "HighController is unavailable; no LowController command was sent."
-                ),
-            }
-        try:
-            prerequisite_error = self._check_stationary_walking()
-        except Exception as exc:
-            return {
-                "state": "error", "command_sent": False,
-                "error": f"Failed to verify arm movement prerequisites: {exc}",
-            }
-        if prerequisite_error is not None:
-            return prerequisite_error
-
-        if not self._move_lock.acquire(blocking=False):
-            return {
-                "state": "error", "command_sent": False,
-                "error": "Another arm movement is already running",
-            }
-
-        command_sent = False
-        try:
-            self._stop_event.clear()
-            low_states, start_positions = self._read_states(self._low_ctrl)
-            documented_faults = []
-            for index, state in enumerate(low_states):
-                error = int(getattr(state, "error", 0))
-                if error in _MOTOR_ERROR_NAMES:
-                    documented_faults.append({
-                        "motor_id": int(getattr(state, "motor_id", index)),
-                        "joint": _BUMI_JOINT_NAMES[index],
-                        "error": error,
-                        "error_name": _MOTOR_ERROR_NAMES[error],
-                    })
-            if documented_faults:
-                return {
-                    "state": "error", "command_sent": False,
-                    "error": "Documented motor faults are active; arm movement was blocked",
-                    "motor_faults": documented_faults,
-                }
-            target_positions = list(start_positions)
-            target_ids = []
-            for side, values in requested.items():
-                for value_deg, (motor_id, _, _, _) in zip(
-                        values, _BUMI_ARM_JOINTS[side]):
-                    target_positions[motor_id] = math.radians(value_deg)
-                    target_ids.append(motor_id)
-
-            max_delta_deg = max(
-                abs(math.degrees(target_positions[i] - start_positions[i]))
-                for i in target_ids
-            )
-            # Cosine easing has a peak velocity of pi/2 times its average.
-            duration_s = max(
-                self._MIN_TRAJECTORY_S,
-                max_delta_deg * math.pi / (2.0 * speed_deg_s),
-            )
-            commands = self._new_commands(start_positions)
-            started_at = time.monotonic()
-            next_update = started_at
-
-            while True:
-                if self._stop_event.is_set():
-                    return {
-                        "state": "error",
-                        "command_sent": command_sent,
-                        "error": "Arm movement was interrupted before reaching its target",
-                        "control_state": (
-                            "LowController retains its latest 21-motor command; keep the "
-                            "safety hanger attached."
-                        ),
-                    }
-                elapsed = time.monotonic() - started_at
-                progress = min(1.0, elapsed / duration_s)
-                blend = 0.5 - 0.5 * math.cos(math.pi * progress)
-                for motor_id in range(21):
-                    commands[motor_id].pos = (
-                        start_positions[motor_id]
-                        + (target_positions[motor_id] - start_positions[motor_id]) * blend
-                    )
-                self._low_ctrl.set_joint(commands)
-                command_sent = True
-                if progress >= 1.0:
-                    break
-                next_update += self._CONTROL_INTERVAL_S
-                time.sleep(max(0.0, next_update - time.monotonic()))
-
-            feedback_deadline = time.monotonic() + self._FEEDBACK_TIMEOUT_S
-            measured_positions = start_positions
-            errors_deg = {}
-            while True:
-                _, measured_positions = self._read_states(self._low_ctrl)
-                errors_deg = {
-                    f"{side}_{joint_name}": round(math.degrees(
-                        measured_positions[motor_id] - target_positions[motor_id]), 3)
-                    for side, values in requested.items()
-                    for _, (motor_id, joint_name, _, _) in zip(
-                        values, _BUMI_ARM_JOINTS[side])
-                }
-                if max(abs(value) for value in errors_deg.values()) <= self._POSITION_TOLERANCE_DEG:
-                    break
-                if time.monotonic() >= feedback_deadline:
-                    break
-                time.sleep(0.05)
-            max_error_deg = max(abs(value) for value in errors_deg.values())
-            measured = {
-                side: [
-                    round(math.degrees(measured_positions[motor_id]), 3)
-                    for motor_id, _, _, _ in _BUMI_ARM_JOINTS[side]
-                ]
-                for side in requested
-            }
-            completed = max_error_deg <= self._POSITION_TOLERANCE_DEG
-            return {
-                "state": "completed" if completed else "error",
-                "command_sent": True,
-                "requested_positions_deg": requested,
-                "measured_positions_deg": measured,
-                "joint_errors_deg": errors_deg,
-                "max_abs_error_deg": round(max_error_deg, 3),
-                "completion_tolerance_deg": self._POSITION_TOLERANCE_DEG,
-                "speed_deg_s": speed_deg_s,
-                "trajectory_duration_s": round(duration_s, 3),
-                "control_state": (
-                    "LowController continues holding the latest complete 21-motor "
-                    "position command after this call returns."
-                ),
-                "message": (
-                    "Arm movement completed and measured feedback is within tolerance."
-                    if completed else
-                    "The trajectory was sent, but arm feedback did not reach the target "
-                    "within 5 degrees before the 2-second feedback timeout. Keep the "
-                    "safety hanger attached and inspect the robot before retrying."
-                ),
-            }
-        except Exception as exc:
-            return {
-                "state": "error",
-                "command_sent": command_sent,
-                "error": f"LowController arm movement failed: {exc}",
-                "safety": (
-                    "Keep the robot supported by the safety hanger and stop other "
-                    "motion commands before inspection."
-                ),
-            }
-        finally:
-            self._move_lock.release()
-
-
 # ── LocoPlugin (actuator, multi-tool) ───────────────────────────────
 
 class LocoPlugin:
     PREFIX = "loco"
+    _MOVE_MIN_DURATION_S = 0.1
+    _MOVE_DEFAULT_DURATION_S = 1.0
+    _MOVE_MAX_DURATION_S = 5.0
 
     def __init__(self, plugin_config: dict, namespace: str, executor, high_ctrl):
         self._high_ctrl = high_ctrl
@@ -849,44 +352,80 @@ class LocoPlugin:
             "name": "loco",
             "type": "actuator",
             "multiInstance": False,
-            "description": "Bumi locomotion — move with velocity commands or stop.",
+            "description": (
+                "Move Bumi with bounded HighController walking commands or stop an active "
+                "move. The card uses only the vendor HighController; it does not initialize "
+                "LowController. move is accepted only when workmode=2 (walking), and every "
+                "move automatically sends zero velocity after at most 5 seconds. Values are "
+                "normalized SDK commands, not metres per second. Before moving, confirm that "
+                "Bumi is standing steadily on a flat non-slip floor and that its path is clear."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
                         "enum": ["move", "stop_move"],
+                        "description": (
+                            "move=send a time-limited walking command; "
+                            "stop_move=immediately send zero walking velocity and requires no "
+                            "other parameters."
+                        ),
                     },
                     "vx": {
                         "type": "number",
-                        "description": "Forward velocity [-1, 1] (>0 forward)",
+                        "default": 0.0,
+                        "description": (
+                            "Normalized forward command from -1 to 1; positive moves forward, "
+                            "negative moves backward, default 0."
+                        ),
                         "minimum": -1, "maximum": 1,
                     },
                     "vy": {
                         "type": "number",
-                        "description": "Lateral velocity [-1, 1] (>0 left)",
+                        "default": 0.0,
+                        "description": (
+                            "Normalized lateral command from -1 to 1; positive moves left, "
+                            "negative moves right, default 0."
+                        ),
                         "minimum": -1, "maximum": 1,
                     },
                     "vyaw": {
                         "type": "number",
-                        "description": "Turning velocity [-1, 1] (>0 left turn)",
+                        "default": 0.0,
+                        "description": (
+                            "Normalized turning command from -1 to 1; positive turns left, "
+                            "negative turns right, default 0."
+                        ),
                         "minimum": -1, "maximum": 1,
                     },
                     "duration": {
                         "type": "number",
-                        "description": "Duration in seconds (0 = continuous until stop_move)",
-                        "minimum": 0,
+                        "default": self._MOVE_DEFAULT_DURATION_S,
+                        "description": (
+                            "Movement duration in seconds, from 0.1 to 5; default 1.0. The card "
+                            "automatically sends zero velocity when this time expires."
+                        ),
+                        "minimum": self._MOVE_MIN_DURATION_S,
+                        "maximum": self._MOVE_MAX_DURATION_S,
                     },
                 },
                 "required": ["action"],
                 "x-action-params": {
                     "move": {
                         "params": ["vx", "vy", "vyaw", "duration"],
-                        "description": "Move with specified velocities. Requires walking mode.",
+                        "description": (
+                            "Move with normalized HighController commands for a bounded time. "
+                            "At least one velocity must be non-zero and the robot must already "
+                            "be in walking mode."
+                        ),
                     },
                     "stop_move": {
                         "params": [],
-                        "description": "Stop all movement immediately.",
+                        "description": (
+                            "Stop the active loco command by sending zero forward, lateral and "
+                            "turning velocity. No additional parameters are used."
+                        ),
                     },
                 },
             },
@@ -1024,66 +563,142 @@ class LocoPlugin:
             self._last_cmd_time = time.monotonic()
 
     def _do_move(self, args: dict) -> dict:
-        # Check if in walking mode
-        mode = int(self._high_ctrl.get_mode())
-        if mode == 26:
-            return {"state": "error", "error": "Robot in protection mode, cannot move"}
-        if mode != 2:
+        values = {}
+        limits = {
+            "vx": (-1.0, 1.0, 0.0),
+            "vy": (-1.0, 1.0, 0.0),
+            "vyaw": (-1.0, 1.0, 0.0),
+            "duration": (
+                self._MOVE_MIN_DURATION_S,
+                self._MOVE_MAX_DURATION_S,
+                self._MOVE_DEFAULT_DURATION_S,
+            ),
+        }
+        for field, (minimum, maximum, default) in limits.items():
+            value = args.get(field, default)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return {
+                    "state": "error", "command_sent": False,
+                    "error": f"{field} must be a number from {minimum} to {maximum}",
+                }
+            value = float(value)
+            if not math.isfinite(value) or value < minimum or value > maximum:
+                return {
+                    "state": "error", "command_sent": False,
+                    "error": f"{field} must be a finite number from {minimum} to {maximum}",
+                    "received": args.get(field),
+                }
+            values[field] = value
+
+        vx, vy, vyaw = values["vx"], values["vy"], values["vyaw"]
+        duration = values["duration"]
+        if vx == 0.0 and vy == 0.0 and vyaw == 0.0:
             return {
-                "state": "error",
+                "state": "error", "command_sent": False,
                 "error": (
-                    f"movement requires workmode=2 (walking); current mode is "
-                    f"{mode} ({_WORKMODE_NAMES.get(mode, 'unknown')}). "
-                    "Use switch_mode switch=walk first."
+                    "move requires at least one non-zero velocity; use stop_move to send "
+                    "a zero-velocity stop command"
                 ),
             }
 
-        vx = float(args.get("vx", 0))
-        vy = float(args.get("vy", 0))
-        vyaw = float(args.get("vyaw", 0))
-        duration = float(args.get("duration", 0))
+        mode = int(self._high_ctrl.get_mode())
+        if mode == 26:
+            return {
+                "state": "error", "command_sent": False,
+                "current_workmode": 26,
+                "current_workmode_name": "protection",
+                "protection": True,
+                "error": (
+                    "The robot is in protection mode. No movement command was sent; stop "
+                    "operation and inspect the robot before following the documented restart "
+                    "procedure."
+                ),
+            }
+        if mode != 2:
+            return {
+                "state": "error", "command_sent": False,
+                "current_workmode": mode,
+                "current_workmode_name": _WORKMODE_NAMES.get(mode, "unknown"),
+                "required_workmode": 2,
+                "required_workmode_name": "walking",
+                "error": (
+                    "loco.move is allowed only in workmode=2 (walking). The card does not "
+                    "automatically enable or stand the robot because HighController cannot "
+                    "verify that its physical pose and surroundings are safe."
+                ),
+                "recovery": (
+                    "First place the robot in a documented stable standing/walking state, "
+                    "confirm a clear path, then retry. Never force walking from a lying pose."
+                ),
+            }
 
-        # Stop any existing move thread
+        # Stop the previous bounded command before reusing the shared event.
         self._move_stop_event.set()
         if self._move_thread and self._move_thread.is_alive():
             self._move_thread.join(timeout=1)
+            if self._move_thread.is_alive():
+                return {
+                    "state": "error", "command_sent": False,
+                    "error": "The previous loco command did not stop within 1 second",
+                }
 
         self._move_stop_event.clear()
         default_cmd = _get_default_cmd()
 
-        if duration > 0:
-            # Timed move
-            def _move_timed():
-                end_time = time.monotonic() + duration
-                while not self._move_stop_event.is_set() and time.monotonic() < end_time:
+        # Send the first frame synchronously so command_sent=True is truthful.
+        self._publish_cmd(vx, vy, vyaw, default_cmd, 0)
+
+        def _move_timed():
+            end_time = time.monotonic() + duration
+            next_send = time.monotonic() + self._control_period
+            try:
+                while (not self._move_stop_event.is_set()
+                       and time.monotonic() < end_time):
+                    if int(self._high_ctrl.get_mode()) != 2:
+                        break
+                    time.sleep(max(0.0, next_send - time.monotonic()))
+                    if self._move_stop_event.is_set() or time.monotonic() >= end_time:
+                        break
+                    if int(self._high_ctrl.get_mode()) != 2:
+                        break
                     self._publish_cmd(vx, vy, vyaw, default_cmd, 0)
-                    time.sleep(0.02)  # 50 Hz
-                # Stop
+                    next_send += self._control_period
+            finally:
                 self._publish_cmd(0, 0, 0, default_cmd, 0)
 
-            self._move_thread = threading.Thread(target=_move_timed, daemon=True, name="bumi_move")
-            self._move_thread.start()
-            return {"state": "moving", "vx": vx, "vy": vy, "vyaw": vyaw, "duration": duration}
-        else:
-            # Continuous move with 5s watchdog
-            def _move_continuous():
-                watchdog_end = time.monotonic() + 5.0
-                while not self._move_stop_event.is_set() and time.monotonic() < watchdog_end:
-                    self._publish_cmd(vx, vy, vyaw, default_cmd, 0)
-                    time.sleep(0.02)
-                self._publish_cmd(0, 0, 0, default_cmd, 0)
-
-            self._move_thread = threading.Thread(target=_move_continuous, daemon=True, name="bumi_move")
-            self._move_thread.start()
-            return {"state": "moving", "vx": vx, "vy": vy, "vyaw": vyaw, "duration": "continuous (5s watchdog)"}
+        self._move_thread = threading.Thread(
+            target=_move_timed, daemon=True, name="bumi_move")
+        self._move_thread.start()
+        return {
+            "state": "running",
+            "command_sent": True,
+            "workmode": mode,
+            "workmode_name": "walking",
+            "normalized_command": {"forward": vx, "lateral": vy, "turn": vyaw},
+            "duration_s": duration,
+            "control_rate_hz": round(1.0 / self._control_period),
+            "message": (
+                "The bounded walking command is running. Zero velocity will be sent when "
+                "duration_s expires, stop_move is called, or workmode leaves walking."
+            ),
+        }
 
     def _stop_move(self) -> dict:
         self._move_stop_event.set()
+        was_running = bool(self._move_thread and self._move_thread.is_alive())
         if self._move_thread and self._move_thread.is_alive():
             self._move_thread.join(timeout=1)
         if self._high_ctrl is not None:
             self._publish_cmd(0, 0, 0, _get_default_cmd(), 0)
-        return {"state": "stopped"}
+        mode = int(self._high_ctrl.get_mode()) if self._high_ctrl is not None else None
+        return {
+            "state": "completed",
+            "command_sent": self._high_ctrl is not None,
+            "was_running": was_running,
+            "workmode": mode,
+            "workmode_name": _WORKMODE_NAMES.get(mode, "unknown"),
+            "message": "Zero forward, lateral and turning velocity was sent.",
+        }
 
     def _do_posture_action(self, action: str, args: dict) -> dict:
         safety = self._safety_requirements(action)

@@ -1,8 +1,9 @@
 # Noetix Bumi driver
 
 The bundle exposes the original Bumi sensor, locomotion, audio and camera cards,
-the higher-level motion-state card, and an EDU-only LowController arm card. All
-card implementations are kept in `device.py`.
+plus the higher-level motion-state and direct-action cards. All card
+implementations are kept in `device.py` and use HighController or MediaController;
+the bundle does not initialize LowController.
 
 ## New cards
 
@@ -26,27 +27,15 @@ Every published state identifies `Noetix HighController/CycloneDDS` as its sourc
 
 ## Direct action cards
 
-### `arm`
+### `loco`
 
-Moves the left arm, right arm, or both arms through the EDU-only LowController.
-Each supplied side is a four-number array in degrees ordered as shoulder pitch,
-shoulder roll, shoulder yaw and elbow pitch. At least one side is required; an
-omitted side remains at its measured starting pose. `speed_deg_s` is limited to
-10-30 degrees per second and defaults to 20.
-
-Before sending a command, the card requires HighController workmode 2
-(`walking`), samples the 21 joint velocities five times to reject a robot that
-is still moving, verifies the SDK motor-ID mapping, validates all documented arm
-limits and rejects documented motor faults. It interpolates a cosine trajectory
-and reports `completed` only when measured arm feedback reaches every requested
-target within 5 degrees.
-
-LowController requires a complete 21-motor command even for an arm-only move,
-so all non-target joints are held at their measured starting positions with
-fixed gains from the vendor policy configuration. The LowController send thread
-continues holding the latest command after the tool returns. This is not a
-balancing controller: use only on an EDU Bumi secured by a load-bearing safety
-hanger, and never run a HighController motion card concurrently.
+Uses only `HighController` to send bounded normalized forward, lateral and
+turning commands. A move is accepted only in workmode 2 (`walking`), requires
+at least one non-zero velocity, defaults to 1 second and is limited to 5
+seconds. The driver sends commands at 100 Hz and automatically sends zero
+velocity when the duration expires, `stop_move` is called, or the observed
+workmode leaves walking. It does not automatically promote another mode into
+walking because the SDK cannot verify that the robot is physically standing.
 
 The former `switch_mode` tool is split into three user-facing cards. Internal
 `enable`, `ready` and `walk` transitions are completed automatically and are no
