@@ -559,6 +559,12 @@ class M20ProMappingPlugin:
     def stop(self): pass
 
     def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready"}
         if action == "start_mapping":
             return self.client.start_mapping(args["map_name"], activate=bool(args.get("activate", True)))
         if action == "stop_mapping":

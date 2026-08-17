@@ -111,6 +111,9 @@ class LynxM20ContractTests(unittest.TestCase):
             ["map_name", "activate"],
             tool_def["inputSchema"]["x-action-params"]["start_mapping"]["params"],
         )
+        self.assertEqual({"state": "ready"}, plugin.dispatch("start", {}))
+        self.assertEqual({"state": "idle"}, plugin.dispatch("stop", {}))
+        self.assertEqual({"state": "ready"}, plugin.dispatch("info", {}))
         plugin.dispatch("start_mapping", {"map_name": "floor_1", "activate": False})
         plugin.dispatch("stop_mapping", {})
         plugin.dispatch("status", {})
