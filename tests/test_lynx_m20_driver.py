@@ -361,6 +361,8 @@ class LynxM20ContractTests(unittest.TestCase):
         for topic in ("/MOTION_STATE", "/GAIT", "/NAV_CMD", "/MOTION_INFO", "/IMU", "/LIDAR/POINTS", "/HES_STATUS", "/CHARGE", "/JOINTS_DATA"):
             self.assertIn(topic, config)
         self.assertIn("rmw_fastrtps_cpp", dockerfile)
+        self.assertIn("ARG APT_MIRROR=", dockerfile)
+        self.assertIn('--build-arg "APT_MIRROR=${APT_MIRROR}"', (ROOT / "build.sh").read_text())
         self.assertIn("a0d1a29eec5c4db5a9107595bb51e3be8122b86c", dockerfile)
         self.assertIn("deep-robotics-msg-${DEEP_ROBOTICS_MSG_REV}.zip", dockerfile)
         self.assertIn("1d268a76e80af8ea5aa3dc28de0c236de87bce55a5d397fdad1e23515f02a537", dockerfile)
