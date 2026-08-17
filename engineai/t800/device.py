@@ -3572,9 +3572,13 @@ class SpeakerPlugin:
         self._state = "idle"
 
     def _spawn_player(self):
-        # 官方 8.2.2：aplay 回放；-t raw 表示从 stdin 流式读原始 PCM
+        # 官方 8.2.2：aplay 回放；-t raw 表示从 stdin 流式读原始 PCM。
+        # 默认设备已路由到 PulseAudio（/etc/asound.conf），--buffer-time/
+        # --period-time 压低 aplay 读前缓冲（默认 500ms 会让 remote_mic
+        # 等实时音频源产生明显延迟），PulseAudio 侧延迟由 PULSE_LATENCY_MSEC 控制。
         return subprocess.Popen(
-            ["aplay", "-q", "-t", "raw", "-f", "S16_LE", "-r", "16000", "-c", "1", "-"],
+            ["aplay", "-q", "-t", "raw", "-f", "S16_LE", "-r", "16000", "-c", "1",
+             "--buffer-time=100000", "--period-time=20000", "-"],
             stdin=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             bufsize=0,

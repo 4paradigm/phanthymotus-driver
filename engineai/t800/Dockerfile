@@ -31,6 +31,7 @@ RUN test -s /usr/share/keyrings/ros2-archive-keyring.gpg || \
         ros-humble-sensor-msgs \
         pulseaudio-utils \
         alsa-utils \
+        libasound2-plugins \
         build-essential \
         cmake && \
     rm -rf /var/lib/apt/lists/*
@@ -72,6 +73,9 @@ RUN echo "[t800] checking ROS interface build dependencies" && \
 
 COPY main.py device.py control.py native_sdk.py virtual_gamepad.py config.yaml driver.yaml controlled_spatial_map.py /work/
 COPY resource/ /work/resource/
+# aplay 默认设备经 PulseAudio 路由（官方音量接口 pactl 才能作用于播放输出，
+# 且避免 ALSA dmix 默认 ~341ms 大缓冲带来的流式播放延迟）
+COPY resource/asound.conf /etc/asound.conf
 COPY deploy/ /deploy/
 RUN . /opt/ros/humble/setup.sh && \
     . /ros_ws/install/setup.sh && \

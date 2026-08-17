@@ -16,6 +16,8 @@ engineai-t800:
     - ROS_LOCALHOST_ONLY=0
     - NETWORK_INTERFACE=${T800_NETWORK_INTERFACE:-eth1}
     - PULSE_SERVER=unix:/run/user/1000/pulse/native
+    # aplay 经 PulseAudio 路由的 tsched 延迟上限（毫秒），保证实时音频播放
+    - PULSE_LATENCY_MSEC=40
     - PYTHONUNBUFFERED=1
   healthcheck:
     test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:15708/health', timeout=2)"]
