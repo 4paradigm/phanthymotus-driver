@@ -833,6 +833,9 @@ class ZedCameraPlugin:
         self._available = False
         self._camera = None
         self._capture_thread = None
+        self._stop_event = threading.Event()
+        self._lifecycle_lock = threading.RLock()
+        self._publish_lock = threading.Lock()
         self._info_timer = None
         self._rgb_pub = None
         self._depth_pub = None
@@ -896,91 +899,124 @@ class ZedCameraPlugin:
         ]
 
     def start(self):
-        if self._running:
+        with self._lifecycle_lock:
+            if self._running:
+                if (self._capture_thread is None
+                        or self._capture_thread.is_alive()):
+                    return True
+                # The capture thread died outside its normal error path.  Let
+                # the cleanup below close any stale camera before restarting.
+                self._running = False
+
+            # A capture loop can stop unexpectedly after opening the camera.
+            # Do not create a replacement thread until the old one and all of
+            # its camera calls have definitely finished.
+            if self._capture_thread is not None or self._camera is not None:
+                if not self.stop():
+                    return False
+
+            self._stop_event.clear()
+            self._running = True
+            try:
+                from sensor_msgs.msg import CompressedImage
+                from std_msgs.msg import String, UInt8MultiArray
+
+                qos = _best_effort_qos()
+                self._CompressedImage = CompressedImage
+                self._UInt8MultiArray = UInt8MultiArray
+                self._rgb_pub = self._pub_node.create_publisher(
+                    CompressedImage, self._topics["camera_head"], qos)
+                self._depth_pub = self._pub_node.create_publisher(
+                    CompressedImage, self._topics["camera_depth"], qos)
+                self._info_pub = self._pub_node.create_publisher(
+                    String, self._topics["camera_info"], qos)
+                self._pointcloud_pub = self._pub_node.create_publisher(
+                    UInt8MultiArray, self._topics["camera_pointcloud"], qos)
+                self._info_timer = self._pub_node.create_timer(
+                    1.0 / self._info_hz, self._publish_info)
+            except Exception as exc:
+                self._running = False
+                self._stop_event.set()
+                self._destroy_publishers()
+                self._set_error(f"ROS2 camera publisher setup failed: {exc}")
+                return False
+
+            self._publish_info()
+            self._capture_thread = threading.Thread(
+                target=self._capture_loop, daemon=True, name="adam_zed_capture")
+            self._capture_thread.start()
             return True
 
-        # A capture loop can stop unexpectedly after opening the camera.  Do
-        # the normal cleanup before creating a replacement thread/publishers.
-        if self._capture_thread is not None or self._camera is not None:
-            self.stop()
-
-        self._running = True
-        try:
-            from sensor_msgs.msg import CompressedImage
-            from std_msgs.msg import String, UInt8MultiArray
-
-            qos = _best_effort_qos()
-            self._CompressedImage = CompressedImage
-            self._UInt8MultiArray = UInt8MultiArray
-            self._rgb_pub = self._pub_node.create_publisher(
-                CompressedImage, self._topics["camera_head"], qos)
-            self._depth_pub = self._pub_node.create_publisher(
-                CompressedImage, self._topics["camera_depth"], qos)
-            self._info_pub = self._pub_node.create_publisher(
-                String, self._topics["camera_info"], qos)
-            self._pointcloud_pub = self._pub_node.create_publisher(
-                UInt8MultiArray, self._topics["camera_pointcloud"], qos)
-            self._info_timer = self._pub_node.create_timer(
-                1.0 / self._info_hz, self._publish_info)
-        except Exception as exc:
-            self._running = False
-            self._destroy_publishers()
-            self._set_error(f"ROS2 camera publisher setup failed: {exc}")
-            return False
-
-        self._publish_info()
-        self._capture_thread = threading.Thread(
-            target=self._capture_loop, daemon=True, name="adam_zed_capture")
-        self._capture_thread.start()
-        return True
-
     def _destroy_publishers(self):
-        timer = self._info_timer
-        self._info_timer = None
-        if timer is not None:
-            try:
-                timer.cancel()
-            except Exception:
-                pass
+        # The capture thread and the info timer may both be publishing.  Do
+        # not destroy a ROS publisher while either path is inside publish().
+        with self._publish_lock:
+            timer = self._info_timer
+            self._info_timer = None
+            if timer is not None:
+                try:
+                    timer.cancel()
+                except Exception:
+                    pass
 
-        for attr in (
-                "_rgb_pub", "_depth_pub", "_info_pub", "_pointcloud_pub"):
-            publisher = getattr(self, attr, None)
-            setattr(self, attr, None)
-            if publisher is None:
-                continue
-            try:
-                self._pub_node.destroy_publisher(publisher)
-            except Exception:
-                pass
+            for attr in (
+                    "_rgb_pub", "_depth_pub", "_info_pub", "_pointcloud_pub"):
+                publisher = getattr(self, attr, None)
+                setattr(self, attr, None)
+                if publisher is None:
+                    continue
+                try:
+                    self._pub_node.destroy_publisher(publisher)
+                except Exception:
+                    pass
 
     def stop(self):
-        self._running = False
-        if self._info_timer is not None:
-            try:
-                self._info_timer.cancel()
-            except Exception:
-                pass
-            self._info_timer = None
-        if self._capture_thread is not None:
-            self._capture_thread.join(timeout=3.0)
+        with self._lifecycle_lock:
+            self._running = False
+            self._stop_event.set()
+
+            if self._info_timer is not None:
+                try:
+                    self._info_timer.cancel()
+                except Exception:
+                    pass
+                self._info_timer = None
+
+            # Closing before join is intentional: it gives a blocking SDK
+            # grab() a chance to return so that the capture thread can exit.
+            camera = self._camera
+            if camera is not None:
+                try:
+                    camera.close()
+                except Exception:
+                    pass
+
+            thread = self._capture_thread
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(timeout=3.0)
+
+            # Never clear the thread handle or destroy publishers while the
+            # capture loop is still able to call publish().  A later start()
+            # will retry this cleanup before creating a new thread.
+            if thread is not None and thread.is_alive():
+                self._available = False
+                self._set_error(
+                    "ZED capture thread did not stop within 3 seconds; "
+                    "camera publishers were kept alive")
+                return False
+
             self._capture_thread = None
-        camera = self._camera
-        self._camera = None
-        if camera is not None:
-            try:
-                camera.close()
-            except Exception:
-                pass
-        self._available = False
-        with self._lock:
-            self._state.update({
-                "state": "idle",
-                "available": False,
-                "pointcloud_enabled": self._pointcloud_enabled,
-            })
-        self._publish_info()
-        self._destroy_publishers()
+            self._camera = None
+            self._available = False
+            with self._lock:
+                self._state.update({
+                    "state": "idle",
+                    "available": False,
+                    "pointcloud_enabled": self._pointcloud_enabled,
+                })
+            self._publish_info()
+            self._destroy_publishers()
+            return True
 
     def _set_error(self, message):
         with self._lock:
@@ -1073,14 +1109,42 @@ class ZedCameraPlugin:
             except Exception:
                 raise first_error
 
+    def _capture_active(self):
+        return self._running and not self._stop_event.is_set()
+
+    def _publish_capture_message(self, publisher, message):
+        """Publish while keeping teardown from racing the ROS call."""
+        if publisher is None:
+            return False
+        with self._publish_lock:
+            if not self._capture_active():
+                return False
+            publisher.publish(message)
+            return True
+
     def _capture_loop(self):
+        try:
+            self._capture_loop_body()
+        except Exception as exc:
+            if self._capture_active():
+                self._running = False
+                self._set_error(f"ZED capture loop failed: {exc}")
+        finally:
+            self._available = False
+
+    def _capture_loop_body(self):
         try:
             import numpy as np
             from PIL import Image as PillowImage
             sl = self._load_zed_module()
         except Exception as exc:
+            if not self._capture_active():
+                return
             self._running = False
             self._set_error(f"local ZED SDK import failed: {exc}")
+            return
+
+        if not self._capture_active():
             return
 
         params = sl.InitParameters()
@@ -1105,14 +1169,33 @@ class ZedCameraPlugin:
         if hasattr(params, "depth_maximum_distance"):
             params.depth_maximum_distance = self._max_point_distance_m
 
+        if not self._capture_active():
+            return
+
         camera = sl.Camera()
         try:
             status = camera.open(params)
         except Exception as exc:
+            if not self._capture_active():
+                try:
+                    camera.close()
+                except Exception:
+                    pass
+                return
             self._running = False
             self._set_error(f"ZED camera open failed: {exc}")
+            try:
+                camera.close()
+            except Exception:
+                pass
             return
         if status != sl.ERROR_CODE.SUCCESS:
+            if not self._capture_active():
+                try:
+                    camera.close()
+                except Exception:
+                    pass
+                return
             self._running = False
             self._set_error(f"ZED camera open failed: {status}")
             try:
@@ -1121,11 +1204,33 @@ class ZedCameraPlugin:
                 pass
             return
 
+        # stop() may have been called while the SDK was opening the camera.
+        # Never publish or enter grab() after that stop request.
+        if not self._capture_active():
+            try:
+                camera.close()
+            except Exception:
+                pass
+            return
         self._camera = camera
         self._available = True
-        with self._lock:
-            self._state = self._camera_metadata(
+        try:
+            metadata = self._camera_metadata(
                 camera.get_camera_information(), params)
+        except Exception as exc:
+            self._available = False
+            if self._capture_active():
+                self._running = False
+                self._set_error(f"ZED camera metadata read failed: {exc}")
+            try:
+                camera.close()
+            except Exception:
+                pass
+            return
+        if not self._capture_active():
+            return
+        with self._lock:
+            self._state = metadata
         self._publish_info()
 
         runtime = sl.RuntimeParameters()
@@ -1138,15 +1243,26 @@ class ZedCameraPlugin:
         last_grab_error = None
 
         try:
-            while self._running:
-                status = camera.grab(runtime)
+            while self._capture_active():
+                try:
+                    status = camera.grab(runtime)
+                except Exception as exc:
+                    if not self._capture_active():
+                        break
+                    self._running = False
+                    self._set_error(f"ZED grab failed: {exc}")
+                    break
                 if status != sl.ERROR_CODE.SUCCESS:
+                    if not self._capture_active():
+                        break
                     if status != last_grab_error:
                         print(f"[ZedCameraPlugin] grab status: {status}", flush=True)
                         last_grab_error = status
-                    time.sleep(0.01)
+                    self._stop_event.wait(0.01)
                     continue
                 last_grab_error = None
+                if not self._capture_active():
+                    break
                 now = time.monotonic()
 
                 with self._lock:
@@ -1156,7 +1272,7 @@ class ZedCameraPlugin:
                         self._card_enabled["camera_pointcloud"]
                         and self._pointcloud_enabled)
 
-                if rgb_enabled and now >= next_rgb:
+                if rgb_enabled and now >= next_rgb and self._capture_active():
                     try:
                         camera.retrieve_image(image, sl.VIEW.LEFT, sl.MEM.CPU)
                         jpeg = self._encode_jpeg(
@@ -1164,15 +1280,16 @@ class ZedCameraPlugin:
                         msg = self._CompressedImage()
                         msg.format = "jpeg"
                         msg.data = jpeg
-                        self._rgb_pub.publish(msg)
+                        self._publish_capture_message(self._rgb_pub, msg)
                     except Exception as exc:
-                        self._set_error(f"RGB publish failed: {exc}")
+                        if self._capture_active():
+                            self._set_error(f"RGB publish failed: {exc}")
                     next_rgb = now + 1.0 / self._rgb_hz
 
                 need_depth = depth_enabled and now >= next_depth
                 need_pointcloud = pointcloud_enabled and now >= next_pointcloud
 
-                if need_depth:
+                if need_depth and self._capture_active():
                     try:
                         camera.retrieve_measure(depth, sl.MEASURE.DEPTH, sl.MEM.CPU)
                         depth_mm = self._normalize_depth(
@@ -1181,12 +1298,13 @@ class ZedCameraPlugin:
                         msg.format = "16UC1; compressedDepth zlib"
                         msg.data = zlib.compress(
                             depth_mm.astype("<u2", copy=False).tobytes(), level=1)
-                        self._depth_pub.publish(msg)
+                        self._publish_capture_message(self._depth_pub, msg)
                     except Exception as exc:
-                        self._set_error(f"depth publish failed: {exc}")
+                        if self._capture_active():
+                            self._set_error(f"depth publish failed: {exc}")
                     next_depth = now + 1.0 / self._depth_hz
 
-                if need_pointcloud:
+                if need_pointcloud and self._capture_active():
                     try:
                         camera.retrieve_measure(
                             pointcloud, sl.MEASURE.XYZRGBA, sl.MEM.CPU)
@@ -1195,13 +1313,14 @@ class ZedCameraPlugin:
                         if payload is not None:
                             msg = self._UInt8MultiArray()
                             msg.data = list(payload)
-                            self._pointcloud_pub.publish(msg)
+                            self._publish_capture_message(self._pointcloud_pub, msg)
                     except Exception as exc:
-                        self._set_error(f"pointcloud publish failed: {exc}")
+                        if self._capture_active():
+                            self._set_error(f"pointcloud publish failed: {exc}")
                     next_pointcloud = now + 1.0 / self._pointcloud_hz
         finally:
             self._available = False
-            if self._running:
+            if self._running and not self._stop_event.is_set():
                 self._running = False
                 self._set_error("ZED capture loop stopped unexpectedly")
 
@@ -1303,17 +1422,18 @@ class ZedCameraPlugin:
         return struct.pack("<II", 12, int(packed_xyz.shape[0])) + packed_xyz.tobytes()
 
     def _publish_info(self):
-        publisher = getattr(self, "_info_pub", None)
-        if publisher is None:
-            return
-        with self._lock:
-            if not self._card_enabled["camera_info"]:
+        with self._publish_lock:
+            publisher = getattr(self, "_info_pub", None)
+            if publisher is None:
                 return
-            payload = dict(self._state)
-            payload["pointcloud_enabled"] = self._pointcloud_enabled
-        message = String()
-        message.data = json.dumps(payload, separators=(",", ":"))
-        publisher.publish(message)
+            with self._lock:
+                if not self._card_enabled["camera_info"]:
+                    return
+                payload = dict(self._state)
+                payload["pointcloud_enabled"] = self._pointcloud_enabled
+            message = String()
+            message.data = json.dumps(payload, separators=(",", ":"))
+            publisher.publish(message)
 
     def _card_state(self, tool_name):
         with self._lock:
