@@ -29,6 +29,11 @@ Driver 直接向官方 `LedControl` Topic 发布 `blink_green`；默认一秒后
 `constant_white`。这不依赖 Dashboard，也不调用 `GesturePlugin`。该信号是在整句识别
 完成后确认唤醒成功，不是说出唤醒词瞬间的指示。
 
+`auto_enable_motors` 默认启用。插件只会在唤醒词和动作关键词均匹配时调用官方
+`/hardware/enable_motor` 服务；不会在容器启动时自动上电，也不会在插件停止时自动失能。
+若要禁止此行为，可显式设为 `false`。该操作会使机器人电机进入可控状态，部署前必须确保
+急停已释放、机器人姿态稳定且周围无人。
+
 ## 规则动作
 
 从 `voice_gesture.example.yaml` 把 `voice_gesture:` 段复制到独立的
@@ -40,9 +45,9 @@ YAML 的 `motion_plan` 内；ASR 文字不会被当作任意函数、关节参�
 - `你好` / `您好` / `打招呼` -> 内嵌挥手规划
 - `握手` / `握个手` -> 内嵌握手规划
 
-插件先等待官方规划器的初始 `IDLE` 和 request id；每一步都等待
-`EXECUTING`，再等待同一 request 回到 `IDLE`，才发送下一步。这与众擎官方多关节规划
-示例的队列状态机一致。
+若已收到官方规划器状态，插件先等待 `IDLE`；若固件尚未发布初始状态，则先发送第一条
+官方规划并使用本地递增 request id。每一步仍等待 `EXECUTING`，再等待同一 request 回到
+`IDLE`，才发送下一步。
 
 ## 独立镜像与入口
 

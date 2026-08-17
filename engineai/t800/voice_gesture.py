@@ -72,6 +72,13 @@ class VoiceGesturePlugin:
             plugin_config.get("events_topic") or f"/{namespace}/voice_gesture/events"
         )
         self._require_wake_word = bool(plugin_config.get("require_wake_word", True))
+        self._auto_enable_motors = bool(plugin_config.get("auto_enable_motors", True))
+        self._motor_enable_timeout = max(
+            1.0, float(plugin_config.get("motor_enable_timeout_sec", 5.0))
+        )
+        self._motor_enable_service = str(
+            config.get("services", {}).get("enable_motor", "/hardware/enable_motor")
+        )
         self._cooldown_sec = max(0.0, float(plugin_config.get("cooldown_sec", 3.0)))
         self._ready_timeout = max(1.0, float(plugin_config.get("planner_ready_timeout_sec", 10.0)))
         self._step_timeout = max(1.0, float(plugin_config.get("planner_step_timeout_sec", 15.0)))
@@ -96,6 +103,8 @@ class VoiceGesturePlugin:
         self._request_type = None
         self._state_type = None
         self._led_message_type = None
+        self._motor_enable_type = None
+        self._motor_enable_client = None
         self._started = False
         self._enabled = False
         self._planner_state = None
@@ -116,6 +125,7 @@ class VoiceGesturePlugin:
             "last_error": "",
             "last_led_mode": "",
             "last_led_error": "",
+            "last_motor_enable_error": "",
             "events_published": 0,
         }
 
@@ -160,9 +170,11 @@ class VoiceGesturePlugin:
             self._enabled = True
             return
         from interface_protocol.msg import JointMotionPlanRequest, JointMotionPlanState
+        from interface_protocol.srv import EnableMotor
 
         self._request_type = JointMotionPlanRequest
         self._state_type = JointMotionPlanState
+        self._motor_enable_type = EnableMotor
         self._events_pub = self._core_node.create_publisher(String, self._events_topic, _BEST_EFFORT)
         self._core_node.create_subscription(String, self._asr_topic, self._on_asr, _BEST_EFFORT)
         self._request_pub = self._plan_node.create_publisher(
@@ -170,6 +182,9 @@ class VoiceGesturePlugin:
         )
         self._plan_node.create_subscription(
             JointMotionPlanState, self._topics["joint_plan_state"], self._on_planner_state, _BEST_EFFORT
+        )
+        self._motor_enable_client = self._plan_node.create_client(
+            EnableMotor, self._motor_enable_service
         )
         if self._led_enabled:
             from interface_protocol.msg import LedControl
@@ -227,6 +242,8 @@ class VoiceGesturePlugin:
         if motion_id is None:
             self._reject("no_motion_match", text=text)
             return
+        if not self._ensure_motors_enabled(motion_id, text):
+            return
         self._start_motion(motion_id, text)
 
     def _on_planner_state(self, message) -> None:
@@ -243,6 +260,49 @@ class VoiceGesturePlugin:
                 if phrase and phrase in normalised:
                     return motion_id
         return None
+
+    def _ensure_motors_enabled(self, motion_id: str, text: str) -> bool:
+        if not self._auto_enable_motors:
+            return True
+        if self._motor_enable_client is None or self._motor_enable_type is None:
+            self._set_status(last_motor_enable_error="motor enable client is unavailable")
+            self._publish_event(
+                "motor_enable_error", motion_id=motion_id, text=text,
+                error="motor enable client is unavailable",
+            )
+            return False
+        if not self._motor_enable_client.wait_for_service(timeout_sec=1.0):
+            error = f"motor enable service is unavailable: {self._motor_enable_service}"
+            self._set_status(last_motor_enable_error=error)
+            self._publish_event("motor_enable_error", motion_id=motion_id, text=text, error=error)
+            return False
+        request = self._motor_enable_type.Request()
+        request.enable = True
+        self._publish_event("motor_enable_requested", motion_id=motion_id, text=text)
+        future = self._motor_enable_client.call_async(request)
+        deadline = time.monotonic() + self._motor_enable_timeout
+        while not future.done() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if not future.done():
+            error = "motor enable request timed out"
+            self._set_status(last_motor_enable_error=error)
+            self._publish_event("motor_enable_error", motion_id=motion_id, text=text, error=error)
+            return False
+        try:
+            response = future.result()
+        except Exception as exc:  # noqa: BLE001
+            error = str(exc)
+            self._set_status(last_motor_enable_error=error)
+            self._publish_event("motor_enable_error", motion_id=motion_id, text=text, error=error)
+            return False
+        if not bool(response.success):
+            error = str(response.message or "motor enable was rejected")
+            self._set_status(last_motor_enable_error=error)
+            self._publish_event("motor_enable_error", motion_id=motion_id, text=text, error=error)
+            return False
+        self._set_status(last_motor_enable_error="")
+        self._publish_event("motor_enable_completed", motion_id=motion_id, text=text)
+        return True
 
     def _start_motion(self, motion_id: str, text: str) -> None:
         now = time.monotonic()
@@ -479,6 +539,12 @@ class VoiceGesturePlugin:
                 "duration_sec": self._led_duration,
                 "last_mode": status["last_led_mode"],
                 "last_error": status["last_led_error"],
+            },
+            "motor_enable": {
+                "automatic": self._auto_enable_motors,
+                "service": self._motor_enable_service,
+                "timeout_sec": self._motor_enable_timeout,
+                "last_error": status["last_motor_enable_error"],
             },
             "planner_state": planner_state,
             "planner_request_id": planner_request_id,

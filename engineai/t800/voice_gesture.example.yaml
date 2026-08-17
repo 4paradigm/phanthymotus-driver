@@ -6,6 +6,10 @@ voice_gesture:
   # 若 ros_namespace 留空，建议在部署配置中显式填写实际 Perception ASR 输出 Topic。
   asr_topic: ""
   require_wake_word: true
+  # true 时，仅在唤醒词和动作关键词均匹配后调用官方 /hardware/enable_motor。
+  # 不会在 Driver 容器启动时自动上电，也不会在插件停止时自动失能。
+  auto_enable_motors: true
+  motor_enable_timeout_sec: 5.0
   cooldown_sec: 3.0
   planner_ready_timeout_sec: 10.0
   planner_step_timeout_sec: 15.0
