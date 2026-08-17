@@ -906,6 +906,39 @@ class DevicePluginContractTests(unittest.TestCase):
         out = plugin._cloud_pub.messages[-1]
         self.assertEqual(bytes(range(32)), bytes(out.data[8:]))
 
+    def test_vision_pointcloud_skips_z_negation_on_non_float32_or_bigendian(self):
+        import struct
+
+        # reviewer 建议:z 字段非 FLOAT32(datatype=6=UINT32)时跳过取反,避免损坏
+        plugin = self.device.VisionPlugin(CONFIG, "robot", self.ros)
+        plugin.start()
+        fields = [
+            types.SimpleNamespace(name="x", offset=0, datatype=7),
+            types.SimpleNamespace(name="y", offset=4, datatype=7),
+            types.SimpleNamespace(name="z", offset=8, datatype=6),  # UINT32
+        ]
+        data = struct.pack("<3f", 1.0, 2.0, 3.0)
+        plugin._on_cloud_slam(types.SimpleNamespace(point_step=12, data=data,
+                                                    fields=fields, is_bigendian=False))
+        out = plugin._cloud_pub.messages[-1]
+        z = struct.unpack("<f", bytes(out.data[8 + 8:8 + 12]))[0]
+        self.assertEqual(3.0, z)  # 未取反
+
+        # 大端布局跳过取反
+        plugin2 = self.device.VisionPlugin(CONFIG, "robot", self.ros)
+        plugin2.start()
+        fields2 = [
+            types.SimpleNamespace(name="x", offset=0, datatype=7),
+            types.SimpleNamespace(name="y", offset=4, datatype=7),
+            types.SimpleNamespace(name="z", offset=8, datatype=7),
+        ]
+        data2 = struct.pack("<3f", 4.0, 5.0, 6.0)
+        plugin2._on_cloud_slam(types.SimpleNamespace(point_step=12, data=data2,
+                                                     fields=fields2, is_bigendian=True))
+        out2 = plugin2._cloud_pub.messages[-1]
+        z2 = struct.unpack("<f", bytes(out2.data[8 + 8:8 + 12]))[0]
+        self.assertEqual(6.0, z2)  # 未取反
+
     def test_vision_config_source_override_and_select_source(self):
         config = dict(CONFIG, plugins={"vision": {"enabled": True, "source": "raw"}})
         plugin = self.device.VisionPlugin(config, "robot", self.ros)
