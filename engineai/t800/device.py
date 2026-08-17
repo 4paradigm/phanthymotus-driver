@@ -3499,6 +3499,7 @@ class SpeakerPlugin:
         self._queue = queue.Queue(maxsize=200)
         self._thread = None
         self._running = False
+        self._session = 0
         self._chunks_played = 0
         self._last_chunk_time = 0.0
 
@@ -3543,6 +3544,7 @@ class SpeakerPlugin:
 
     def stop(self) -> None:
         self._running = False
+        self._session += 1  # 使旧播放线程失效，防止其状态更新覆盖新会话
         if self._subscription is not None:
             self._node.destroy_subscription(self._subscription)
             self._subscription = None
@@ -3619,7 +3621,10 @@ class SpeakerPlugin:
             return {"state": "error", "message": self._last_error}
         self._running = True
         self._state = "ready"
-        self._thread = threading.Thread(target=self._play_loop, daemon=True, name="t800-speaker")
+        session = self._session
+        self._thread = threading.Thread(
+            target=self._play_loop, args=(session,), daemon=True, name="t800-speaker"
+        )
         self._thread.start()
         return {"state": "ready", "topic_in": [{"topic": topic, "format": "audio/pcm-16k"}]}
 
@@ -3636,11 +3641,15 @@ class SpeakerPlugin:
         except queue.Full:
             self._last_error = "speaker buffer full; audio chunk dropped"
 
-    def _play_loop(self) -> None:
-        while self._running:
+    def _play_loop(self, session: int) -> None:
+        # 会话隔离：stop() 会递增 _session 并关闭 aplay stdin，旧线程随后在
+        # 写失败/队列超时处退出，其状态更新不得覆盖新会话。
+        while self._running and self._session == session:
             try:
                 pcm = self._queue.get(timeout=0.1)
             except queue.Empty:
+                if self._session != session:
+                    return
                 if self._state == "playing" and time.monotonic() - self._last_chunk_time >= 0.3:
                     self._state = "ready"
                 continue
@@ -3652,10 +3661,14 @@ class SpeakerPlugin:
                 process.stdin.flush()
                 self._chunks_played += 1
                 self._state = "playing"
+                # 按 16 kHz 单声道 PCM-16 的实时节奏限速写入（32 KB/s），
+                # 避免突发灌流打满 aplay 管道缓冲后阻塞在 write 上。
+                time.sleep(len(pcm) / 32000.0)
             except Exception as exc:  # noqa: BLE001
-                self._last_error = str(exc)
-                self._state = "error"
-                self._running = False
+                if self._session == session:
+                    self._last_error = str(exc)
+                    self._state = "error"
+                    self._running = False
                 break
 
     def dispatch(self, action: str, args: dict) -> dict:
@@ -3833,10 +3846,29 @@ class VisionPlugin:
         buf = bytearray(8 + len(data))
         buf[:8] = header
         buf[8:] = data
+        z_offset = next(
+            (int(field.offset) for field in getattr(msg, "fields", []) if field.name == "z"),
+            None,
+        )
+        if z_offset is not None and z_offset + 4 <= point_step:
+            self._negate_z_inplace(buf, 8, point_step, z_offset)
         out = self._multi_type()
         out.data = self._array.array("B", buf)
         self._cloud_pub.publish(out)
         self._frames["pointcloud"] += 1
+
+    @staticmethod
+    def _negate_z_inplace(buf: bytearray, start: int, point_step: int, z_offset: int) -> None:
+        import numpy as np
+
+        total = (len(buf) - start) // point_step
+        if total <= 0:
+            return
+        raw = np.frombuffer(buf, dtype=np.uint8, count=total * point_step, offset=start)
+        raw = raw.reshape(total, point_step)
+        # 注意：不能用 ravel()——不连续视图上 ravel 会拷贝，原地乘法写不回去
+        z_values = raw[:, z_offset:z_offset + 4].view("<f4")
+        z_values *= -1
 
     def _on_camera_left(self, msg) -> None:
         if not self._running or "camera" not in self._enabled_tools:

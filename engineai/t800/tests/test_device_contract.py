@@ -1149,6 +1149,28 @@ class DevicePluginContractTests(unittest.TestCase):
     def test_vision_pointcloud_passthrough_binary_header(self):
         import struct
 
+    def test_vision_pointcloud_passthrough_binary_header(self):
+        import struct
+
+        plugin = self.device.VisionPlugin(CONFIG, "robot", self.ros)
+        plugin.start()
+        data = bytes(range(64))  # 4 点 × 16 字节 point_step
+        plugin._on_cloud_raw(types.SimpleNamespace(point_step=16, data=data))
+        out = plugin._cloud_pub.messages[-1]
+        self.assertEqual(struct.pack("<II", 16, 4), bytes(out.data[:8]))
+        self.assertEqual(bytes(range(64)), bytes(out.data[8:]))
+        self.assertEqual(1, plugin._frames["pointcloud"])
+        plugin = self.device.VisionPlugin(CONFIG, "robot", self.ros)
+        plugin.start()
+        data = bytes(range(64))  # 4 点 × 16 字节 point_step
+        plugin._on_cloud_raw(types.SimpleNamespace(point_step=16, data=data))
+        out = plugin._cloud_pub.messages[-1]
+        self.assertEqual(struct.pack("<II", 16, 4), bytes(out.data[:8]))
+        self.assertEqual(bytes(range(64)), bytes(out.data[8:]))
+        self.assertEqual(1, plugin._frames["pointcloud"])
+    def test_vision_pointcloud_passthrough_binary_header(self):
+        import struct
+
         plugin = self.device.VisionPlugin(CONFIG, "robot", self.ros)
         plugin.start()
         data = bytes(range(64))  # 4 点 × 16 字节 point_step
