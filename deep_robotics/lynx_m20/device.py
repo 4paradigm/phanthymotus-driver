@@ -66,8 +66,8 @@ class M20Nodes:
         streams = [
             ("motion_info", MotionInfo, "/MOTION_INFO", "data/json", 20),
             ("imu", Imu, "/IMU", "data/json", 50),
-            ("lidar", PointCloud2, "/LIDAR/POINTS", "pointcloud/ros2", 10),
-            ("lidar_rear", PointCloud2, "/LIDAR/POINTS2", "pointcloud/ros2", 10),
+            ("lidar", PointCloud2, "/LIDAR/POINTS", "sensor/pointcloud", 10),
+            ("lidar_rear", PointCloud2, "/LIDAR/POINTS2", "sensor/pointcloud", 10),
             ("hard_estop", StdMsgInt32, "/HES_STATUS", "data/json", 10),
             ("charge_status", StdStatus, "/CHARGE_STATUS", "data/json", 10),
             ("gps", NavSat, "/GPS", "data/json", 10),

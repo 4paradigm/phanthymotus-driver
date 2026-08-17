@@ -207,6 +207,12 @@ class LynxM20ContractTests(unittest.TestCase):
         self.assertIn('("imu", Imu, "/IMU", "data/json"', source)
         self.assertIn("core_msg_type = String if as_json else msg_type", source)
 
+    def test_lidar_streams_use_canvas_pointcloud_format(self):
+        source = (DRIVER / "device.py").read_text()
+        self.assertIn('("lidar", PointCloud2, "/LIDAR/POINTS", "sensor/pointcloud"', source)
+        self.assertIn('("lidar_rear", PointCloud2, "/LIDAR/POINTS2", "sensor/pointcloud"', source)
+        self.assertNotIn('"pointcloud/ros2"', source)
+
     def test_motion_events_separate_request_acceptance_from_feedback(self):
         nodes = FakeNodes()
         plugin = m20.M20MotionPlugin(nodes)
