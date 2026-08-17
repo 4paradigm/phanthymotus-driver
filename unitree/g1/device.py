@@ -19,6 +19,7 @@ drivers/unitree/g1/device.py — Unitree G1 设备插件（重构版）。
 """
 
 import json
+import math
 import queue
 import socket
 import struct
@@ -1645,6 +1646,264 @@ class LocoPlugin:
         result = self._run_fsm_sequence(steps)
         status = "error" if result.get("error") else "completed"
         _loco_acp_notify(action_id, status, {"mode": mode, **result}, tool="switch_mode")
+
+
+# ── FallRecoveryPlugin (sensor + actuator) ─────────────────────────────────────
+
+class _FallRecoveryNode(Node):
+    def __init__(self, namespace: str, imu_topic: str, foot_force_topic: str, events_topic: str, config: dict):
+        super().__init__("g1_fall_recovery")
+        self._namespace = namespace
+        self._imu_topic = imu_topic
+        self._foot_force_topic = foot_force_topic
+        self._events_topic = events_topic
+        self._fall_angle_threshold_deg = float(config.get("fall_angle_threshold_deg", 50))
+        self._fall_confirm_duration = float(config.get("fall_confirm_duration", 0.5))
+        self._foot_force_threshold = float(config.get("foot_force_threshold", 10))
+        self._lock = threading.Lock()
+        self._state = {
+            "is_fallen": False,
+            "fall_direction": "none",
+            "confidence": 0.0,
+            "imu_rpy": {"roll": 0.0, "pitch": 0.0, "yaw": 0.0},
+            "foot_force": [],
+            "last_fall_time": 0.0,
+        }
+        self._candidate_start = 0.0
+        self._last_direction = "none"
+        self._event_pub = self.create_publisher(String, events_topic, _LOW_LAT_QOS)
+
+        try:
+            self._imu_sub = self.create_subscription(String, imu_topic, self._on_imu, _LOW_LAT_QOS)
+            print(f"[fall_recovery] IMU subscribed: {imu_topic}", flush=True)
+        except Exception as e:
+            print(f"[fall_recovery] IMU subscribe failed: {e}", flush=True)
+
+        try:
+            self._foot_force_sub = self.create_subscription(String, foot_force_topic, self._on_loco_state, _LOW_LAT_QOS)
+            print(f"[fall_recovery] foot_force subscribed: {foot_force_topic}", flush=True)
+        except Exception as e:
+            print(f"[fall_recovery] foot_force subscribe failed: {e}", flush=True)
+
+    def _on_imu(self, msg) -> None:
+        try:
+            data = json.loads(msg.data)
+            rpy = data.get("rpy") or []
+            if len(rpy) < 3:
+                return
+            roll, pitch, yaw = [math.degrees(float(v)) for v in rpy[:3]]
+            with self._lock:
+                self._state["imu_rpy"] = {
+                    "roll": round(roll, 2),
+                    "pitch": round(pitch, 2),
+                    "yaw": round(yaw, 2),
+                }
+            self._update_detection()
+        except Exception as e:
+            print(f"[fall_recovery] IMU parse failed: {e}", flush=True)
+
+    def _on_loco_state(self, msg) -> None:
+        try:
+            data = json.loads(msg.data)
+            forces = data.get("foot_force") or []
+            with self._lock:
+                self._state["foot_force"] = [float(v) for v in forces]
+            self._update_detection()
+        except Exception as e:
+            print(f"[fall_recovery] foot_force parse failed: {e}", flush=True)
+
+    def _update_detection(self) -> None:
+        now_mono = time.monotonic()
+        event = None
+        with self._lock:
+            imu_rpy = dict(self._state["imu_rpy"])
+            forces = list(self._state["foot_force"])
+            roll = float(imu_rpy.get("roll", 0.0))
+            pitch = float(imu_rpy.get("pitch", 0.0))
+            direction = self._classify_direction(roll, pitch)
+            angle_ok = direction != "none"
+            foot_ok = len(forces) >= 4 and all(float(f) < self._foot_force_threshold for f in forces[:4])
+
+            if angle_ok and foot_ok:
+                if self._candidate_start == 0.0 or direction != self._last_direction:
+                    self._candidate_start = now_mono
+                    self._last_direction = direction
+                confirmed = now_mono - self._candidate_start >= self._fall_confirm_duration
+                confidence = self._confidence(roll, pitch, forces)
+                if confirmed:
+                    was_fallen = bool(self._state["is_fallen"])
+                    self._state.update({
+                        "is_fallen": True,
+                        "fall_direction": direction,
+                        "confidence": confidence,
+                    })
+                    if not was_fallen:
+                        self._state["last_fall_time"] = time.time()
+                        event = {"type": "fall_detected", "direction": direction, "confidence": confidence}
+                else:
+                    self._state["confidence"] = confidence
+            else:
+                self._candidate_start = 0.0
+                self._last_direction = "none"
+                self._state.update({
+                    "is_fallen": False,
+                    "fall_direction": "none",
+                    "confidence": 0.0,
+                })
+
+        if event:
+            self.publish_event(event["type"], {k: v for k, v in event.items() if k != "type"})
+
+    def _classify_direction(self, roll: float, pitch: float) -> str:
+        if max(abs(roll), abs(pitch)) < self._fall_angle_threshold_deg:
+            return "none"
+        if abs(pitch) >= abs(roll):
+            return "prone" if pitch > 0 else "supine"
+        return "right" if roll > 0 else "left"
+
+    def _confidence(self, roll: float, pitch: float, forces: list) -> float:
+        angle_score = min(1.0, max(abs(roll), abs(pitch)) / max(self._fall_angle_threshold_deg, 1.0))
+        force_score = 1.0 if len(forces) >= 4 and all(float(f) < self._foot_force_threshold for f in forces[:4]) else 0.0
+        return round(min(1.0, 0.7 * angle_score + 0.3 * force_score), 3)
+
+    def get_status(self) -> dict:
+        with self._lock:
+            return {
+                "is_fallen": bool(self._state["is_fallen"]),
+                "fall_direction": self._state["fall_direction"],
+                "confidence": float(self._state["confidence"]),
+                "imu_rpy": dict(self._state["imu_rpy"]),
+                "foot_force": list(self._state["foot_force"]),
+                "last_fall_time": float(self._state["last_fall_time"]),
+            }
+
+    def publish_event(self, event_type: str, data: dict | None = None) -> None:
+        try:
+            event = {"type": event_type, "timestamp": time.time()}
+            if data:
+                event.update(data)
+            msg = String()
+            msg.data = json.dumps(event)
+            self._event_pub.publish(msg)
+            print(f"[fall_recovery] event: {event_type} | {json.dumps(data or {})}", flush=True)
+        except Exception as e:
+            print(f"[fall_recovery] event publish failed: {e}", flush=True)
+
+
+class FallRecoveryPlugin:
+    PREFIX = "fall_recovery"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor, loco_plugin=None):
+        self._namespace = namespace
+        self._config = plugin_config
+        self._loco_plugin = loco_plugin
+        self._recovery_timeout = float(plugin_config.get("recovery_timeout", 10))
+        self._imu_topic = self._resolve_topic(namespace, plugin_config.get("imu_topic", "state/imu"))
+        self._foot_force_topic = self._resolve_topic(namespace, plugin_config.get("foot_force_topic", "loco/state"))
+        self._events_topic = f"/{namespace}/fall_recovery/events"
+        self._node = _FallRecoveryNode(namespace, self._imu_topic, self._foot_force_topic, self._events_topic, plugin_config)
+        executor.add_node(self._node)
+
+    def _resolve_topic(self, namespace: str, topic: str) -> str:
+        topic = str(topic).strip()
+        if topic.startswith("/"):
+            return topic
+        return f"/{namespace}/{topic.lstrip('/')}"
+
+    def get_tools(self) -> list:
+        return [self._status_tool(), self._recover_tool(), self._fall_event_tool()]
+
+    def _status_tool(self) -> dict:
+        return {
+            "name": "fall_status",
+            "type": "sensor",
+            "multiInstance": False,
+            "description": "G1 fall detection status — fallen state, posture direction, confidence, IMU RPY and foot force.",
+            "inputSchema": {"type": "object", "properties": {}},
+        }
+
+    def _recover_tool(self) -> dict:
+        return {
+            "name": "fall_recover",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "G1 one-shot fall recovery. Uses existing safe switch_mode lie2standup sequence.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "direction": {
+                        "type": "string",
+                        "enum": ["auto", "prone", "supine", "left", "right"],
+                        "description": "Fall direction. auto uses current detection result.",
+                        "default": "auto",
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Execute recovery even if no fall is detected.",
+                        "default": False,
+                    },
+                },
+            },
+        }
+
+    def _fall_event_tool(self) -> dict:
+        return {
+            "name": "fall_events",
+            "type": "sensor",
+            "multiInstance": False,
+            "description": f"G1 fall recovery events — fall_detected, recovery_started, recovery_completed, recovery_failed. Publishes to {self._events_topic}",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._events_topic, "format": "data/json"}],
+        }
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            tool_name = args.get("_tool_name", "fall_status")
+            if tool_name == "fall_events":
+                return {"state": "running", "topic_out": [{"topic": self._events_topic, "format": "data/json"}]}
+            return self._node.get_status()
+        if action == "fall_status":
+            return self._node.get_status()
+        if action == "fall_recover":
+            return self._recover(args)
+        return None
+
+    def _recover(self, args: dict) -> dict:
+        status = self._node.get_status()
+        direction_arg = str(args.get("direction", "auto"))
+        force = bool(args.get("force", False))
+        direction = status["fall_direction"] if direction_arg == "auto" else direction_arg
+
+        if direction not in ("prone", "supine", "left", "right"):
+            direction = "none"
+        if not force and not status["is_fallen"]:
+            return {"success": False, "state": "not_fallen", "status": status, "error": "Robot is not detected as fallen. Set force=true to recover anyway."}
+        if not self._loco_plugin:
+            self._node.publish_event("recovery_failed", {"reason": "missing_loco_plugin", "direction": direction})
+            return {"success": False, "state": "failed", "direction": direction, "error": "LocoPlugin is unavailable"}
+
+        try:
+            self._node.publish_event("recovery_started", {"direction": direction, "forced": force})
+            result = self._loco_plugin.dispatch("switch_mode", {"mode": "lie2standup"})
+            if isinstance(result, dict) and "error" in result:
+                self._node.publish_event("recovery_failed", {"direction": direction, "error": result["error"]})
+                return {"success": False, "state": "failed", "direction": direction, "progress": "lie2standup", "result": result, "timeout": self._recovery_timeout}
+            self._node.publish_event("recovery_completed", {"direction": direction})
+            return {"success": True, "state": "completed", "direction": direction, "progress": "lie2standup", "result": result, "timeout": self._recovery_timeout}
+        except Exception as e:
+            print(f"[fall_recovery] recovery failed: {e}", flush=True)
+            self._node.publish_event("recovery_failed", {"direction": direction, "error": str(e)})
+            return {"success": False, "state": "failed", "direction": direction, "error": str(e)}
 
 
 # ── AsrPlugin (sensor) ───────────────────────────────────────────────────────

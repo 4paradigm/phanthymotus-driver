@@ -101,6 +101,15 @@ class G1DeviceBundle:
             self._plugins.append(LocoPlugin(plugins_cfg["loco"], namespace, executor, loco_client, slam_client=slam_client, smart_motion=smart_motion))
             print("[bundle] LocoStatePlugin + LocoPlugin loaded")
 
+        if plugins_cfg.get("fall_recovery", {}).get("enabled", False):
+            from device import FallRecoveryPlugin
+            loco_plugin = next((p for p in self._plugins if getattr(p, 'PREFIX', '') == 'loco'), None)
+            self._plugins.append(FallRecoveryPlugin(
+                plugins_cfg["fall_recovery"], namespace, executor,
+                loco_plugin=loco_plugin,
+            ))
+            print("[bundle] FallRecoveryPlugin loaded")
+
         if plugins_cfg.get("arm", {}).get("enabled", False):
             from device import ArmActionPlugin
             self._plugins.append(ArmActionPlugin(plugins_cfg["arm"], namespace, executor, arm_client))
