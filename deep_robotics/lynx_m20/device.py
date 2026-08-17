@@ -352,6 +352,12 @@ class M20StatePlugin:
                     "state": "ready",
                     "topic_out": [{"topic": stream["topic"], "format": stream["format"]}],
                 }
+            if name in self.nodes.rtsp_streams:
+                stream = self.nodes.rtsp_streams[name]
+                return {
+                    "state": "ready",
+                    "topic_out": [{"topic": stream["url"], "format": stream["format"]}],
+                }
             return {"state": "ready"}
         if action in ("start", "stop"): return {"state": "ready" if action == "start" else "idle"}
         if name == "state": return self.nodes.snapshot()
