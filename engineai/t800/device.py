@@ -55,6 +55,14 @@ from control import (
     validate_joint_indices,
     validate_parallel_arrays,
 )
+from velocity_proposal import (
+    DEFAULT_VELOCITY_PROPOSAL_TOPIC,
+    ProposalLimits,
+    VelocityProposalGate,
+    resolve_expected_nav_id,
+    resolve_input_topic,
+    velocity_proposal_port,
+)
 from native_sdk import NativeSdkManager
 
 
@@ -1845,13 +1853,30 @@ class LocomotionPlugin:
             self._publish_zero,
             rate_hz=float(limits["velocity_rate_hz"]),
         )
+        proposal_config = config.get("plugins", {}).get("locomotion", {})
+        self._proposal_enabled = bool(proposal_config.get("velocity_proposal_enabled", False))
+        self._proposal_topic = config.get("topics", {}).get(
+            "velocity_proposal", DEFAULT_VELOCITY_PROPOSAL_TOPIC
+        )
+        # 部署配置只能收紧、不能放宽平台限值（与 G1 safety_harness 同语义）。
+        self._proposal_limits = ProposalLimits(
+            max_ttl_ms=min(250, int(proposal_config.get("velocity_proposal_max_ttl_ms", 250))),
+            min_x=max(-0.05, float(proposal_config.get("velocity_proposal_min_x", -0.05))),
+            max_x=min(0.15, float(proposal_config.get("velocity_proposal_max_x", 0.15))),
+            max_abs_y=min(0.12, float(proposal_config.get("velocity_proposal_max_abs_y", 0.12))),
+            max_abs_yaw=min(0.35, float(proposal_config.get("velocity_proposal_max_abs_yaw", 0.35))),
+            max_planar_speed=min(0.18, float(proposal_config.get("velocity_proposal_max_planar_speed", 0.18))),
+        )
+        self._gate = VelocityProposalGate(self._proposal_limits)
+        self._proposal_subscription = None
+        self._proposal_watchdog_timer = None
 
     def get_tool(self) -> dict:
         return {
             "name": "loco",
             "type": "actuator",
             "multiInstance": False,
-            "description": "T800 全向速度控制（官方限幅 ±1 m/s、±1 rad/s），支持定时和持续运动",
+            "description": "T800 全向速度控制（官方限幅 ±1 m/s、±1 rad/s），支持定时和持续运动；action=start 绑定 Nav2 velocity_proposal 导航端口",
             "inputSchema": action_schema(
                 {
                     "move": (["vx", "vy", "vyaw", "duration", "force"], "按速度移动；duration=-1 持续到 stop_move"),
@@ -1878,6 +1903,7 @@ class LocomotionPlugin:
                 "运动动作",
                 completion={"actions": ["move"], "timeout": 60},
             ),
+            "topic_in": [self._velocity_proposal_port()],
         }
 
     def start(self) -> None:
@@ -1892,6 +1918,7 @@ class LocomotionPlugin:
         )
 
     def stop(self) -> None:
+        self._disconnect_velocity_proposal("driver_stop")
         self._stream.stop()
 
     def dispatch(self, action: str, args: dict) -> dict:
@@ -1922,13 +1949,17 @@ class LocomotionPlugin:
 
     def _dispatch(self, action: str, args: dict) -> dict:
         if action == "start":
+            if any(key in args for key in ("input_topic", "input_topics", "expected_nav_id")):
+                return self._connect_velocity_proposal(args)
             return {"state": "ready"}
         if action == "stop":
-            self.stop()
-            return {"state": "idle"}
+            self._disconnect_velocity_proposal("canvas_stop")
+            self._stream.stop()
+            return {"state": "idle", "gate": self._gate.snapshot(time.monotonic())}
         if action == "status" or action == "info":
             return {"state": "ready", "stream": asdict(self._stream.snapshot())}
         if action == "stop_move":
+            self._gate.disarm("manual_stop")
             stopped = self._stream.stop()
             self._publish_zero()
             return {"state": "stopped", "was_active": stopped}
@@ -1938,6 +1969,7 @@ class LocomotionPlugin:
         motion, _ = self._state.current_motion()
         if motion not in WALK_MOTION_STATES and not bool(args.get("force", False)):
             return {"error": f"move requires motion state in {WALK_MOTION_STATES} (current: {motion or 'unknown'})"}
+        self._gate.disarm("manual_move_takeover")
         open_loop = action != "move"
         if action == "move":
             vx = clamp(args.get("vx", 0), -self._limits[0], self._limits[0])
@@ -1996,6 +2028,80 @@ class LocomotionPlugin:
     def _publish_zero(self) -> None:
         if self._publisher is not None:
             self._publish_payload({"vx": 0.0, "vy": 0.0, "vyaw": 0.0})
+
+    def _velocity_proposal_port(self) -> dict:
+        return velocity_proposal_port(self._proposal_topic)
+
+    def _connect_velocity_proposal(self, args: dict) -> dict:
+        if not self._proposal_enabled:
+            self._stream.stop()
+            self._publish_zero()
+            return {"state": "error", "connected": False,
+                    "error": "velocity_proposal is disabled in config",
+                    "topic_in": [self._velocity_proposal_port()]}
+        try:
+            topic = resolve_input_topic(args, self._proposal_topic)
+            expected_nav_id = resolve_expected_nav_id(args)
+        except ValueError as exc:
+            self._stream.stop()
+            self._publish_zero()
+            return {"state": "error", "connected": False, "error": str(exc),
+                    "topic_in": [self._velocity_proposal_port()]}
+        try:
+            self._gate.bind(topic, expected_nav_id)
+        except ValueError as exc:
+            self._stream.stop()
+            self._publish_zero()
+            return {"state": "error", "connected": False, "error": str(exc),
+                    "topic_in": [self._velocity_proposal_port()]}
+        self._destroy_proposal_subscription()
+        self._proposal_subscription = self._node.create_subscription(
+            String, topic, self._on_velocity_proposal, _RELIABLE
+        )
+        if self._proposal_watchdog_timer is None:
+            self._proposal_watchdog_timer = self._node.create_timer(
+                0.025, self._watchdog_proposal
+            )
+        return {"state": "ready", "connected": True, "armed": True,
+                "expected_nav_id": expected_nav_id,
+                "topic_in": [self._velocity_proposal_port()]}
+
+    def _disconnect_velocity_proposal(self, reason: str) -> None:
+        self._gate.unbind(reason)
+        self._destroy_proposal_subscription()
+        self._stream.stop()  # stop_publisher 已发布零速度
+
+    def _destroy_proposal_subscription(self) -> None:
+        if self._proposal_subscription is not None:
+            try:
+                self._node.destroy_subscription(self._proposal_subscription)
+            except Exception:
+                pass
+            self._proposal_subscription = None
+
+    def _on_velocity_proposal(self, msg) -> None:
+        try:
+            payload = json.loads(msg.data)
+        except (ValueError, TypeError):
+            payload = {"invalid_json": True}  # 交给 gate 走 schema_mismatch 解武装
+        decision = self._gate.accept(payload, time.monotonic())
+        if decision.stop:
+            self._stream.stop()  # 发布零速度
+            return
+        self._stream.start(
+            {
+                "vx": decision.proposal.x,
+                "vy": decision.proposal.y,
+                "vyaw": decision.proposal.yaw,
+            },
+            decision.duration,
+            ramp=None,  # Nav2 40Hz 自带平滑；TTL 内必须瞬时达速
+        )
+
+    def _watchdog_proposal(self) -> None:
+        decision = self._gate.watchdog(time.monotonic())
+        if decision.stop:
+            self._stream.stop()
 
 
 class MotionModePlugin:

@@ -10,6 +10,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from velocity_proposal import DEFAULT_VELOCITY_PROPOSAL_TOPIC
+
 
 class Message:
     def __init__(self):
@@ -207,6 +209,7 @@ CONFIG = {
     },
     "services": {"enable_motor": "/hardware/enable_motor"},
     "diagnostics": {"command_trace_capacity": 20, "motion_events_capacity": 100},
+    "plugins": {"locomotion": {"velocity_proposal_enabled": True}},
 }
 
 
@@ -996,6 +999,116 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("image/jpeg", tools["camera"]["topic_out"][0]["format"])
         self.assertEqual(2, len(tools["camera"]["topic_out"]))
         self.assertEqual("image/depth-z16", tools["depth"]["topic_out"][0]["format"])
+
+
+class LocomotionVelocityProposalTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # 独立可运行：单独选中本类时 DevicePluginContractTests.setUpClass 不会执行。
+        if not hasattr(DevicePluginContractTests, "device"):
+            DevicePluginContractTests.device = load_device()
+
+    def setUp(self):
+        self.ros = FakeRos()
+        self.state = DevicePluginContractTests.device.StatePlugin(CONFIG, "robot", self.ros)
+        self.plugin = DevicePluginContractTests.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        self.plugin.start()
+
+    def _bind(self):
+        result = self.plugin.dispatch("start", {
+            "input_topic": DEFAULT_VELOCITY_PROPOSAL_TOPIC,
+            "expected_nav_id": "nav-001",
+        })
+        self.assertEqual("ready", result["state"])
+        self.assertTrue(result["connected"])
+        self.assertEqual(1, len(self.plugin._node.subscriptions))
+        return result
+
+    def _proposal(self, **changes):
+        payload = {
+            "schema": "phanthy.navigation.velocity_proposal.v1",
+            "nav_id": "nav-001",
+            "sequence": 1,
+            "issued_at_unix_ms": 1_800_000_000_000,
+            "ttl_ms": 200,
+            "frame": "base_link",
+            "shadow_only": True,
+            "physical_execution": False,
+            "nav_status": "navigating",
+            "velocity": {"x": 0.10, "y": 0.02, "yaw": 0.15},
+        }
+        payload.update(changes)
+        return payload
+
+    def _send(self, payload):
+        message = DevicePluginContractTests.device._json_message(payload)
+        self.plugin._node.subscriptions[-1].callback(message)
+
+    def test_bind_rejects_wrong_topic_and_zeros(self):
+        result = self.plugin.dispatch("start", {
+            "input_topic": "/ubuntu/navigation/nav2/cmd_vel_shadow",
+            "expected_nav_id": "nav-001",
+        })
+        self.assertEqual("error", result["state"])
+        self.assertEqual([0.0, 0.0], self.plugin._publisher.messages[-1].linear_velocity)
+
+    def test_bind_rejects_missing_nav_id(self):
+        result = self.plugin.dispatch("start", {"input_topic": DEFAULT_VELOCITY_PROPOSAL_TOPIC})
+        self.assertEqual("error", result["state"])
+        self.assertIn("expected_nav_id", result["error"])
+
+    def test_proposal_executes_onto_velocity_stream(self):
+        self._bind()
+        self._send(self._proposal())
+        self.assertEqual([0.10, 0.02], self.plugin._publisher.messages[-1].linear_velocity)
+        self.assertAlmostEqual(0.15, self.plugin._publisher.messages[-1].yaw_velocity)
+
+    def test_sequence_replay_disarms_and_stops(self):
+        self._bind()
+        self._send(self._proposal())
+        self._send(self._proposal())  # 同 sequence 重放
+        self.assertFalse(self.plugin._gate.armed)
+        self.assertEqual([0.0, 0.0], self.plugin._publisher.messages[-1].linear_velocity)
+
+    def test_watchdog_ttl_expiry_stops_stream(self):
+        self._bind()
+        self._send(self._proposal(ttl_ms=200))
+        self.plugin._proposal_watchdog_timer.callback()  # 未到期：不动
+        self.assertNotEqual([0.0, 0.0], self.plugin._publisher.messages[-1].linear_velocity)
+        time.sleep(0.25)
+        self.plugin._proposal_watchdog_timer.callback()  # 已到期：归零
+        self.assertEqual([0.0, 0.0], self.plugin._publisher.messages[-1].linear_velocity)
+
+    def test_manual_move_disarms_proposal(self):
+        self._bind()
+        self._send(self._proposal())
+        self.plugin.dispatch("move", {"vx": 0.1, "duration": 0.01, "force": True})
+        self.assertFalse(self.plugin._gate.armed)
+        self._send(self._proposal(sequence=2))  # 解武装后提案 → 停流
+        self.assertEqual([0.0, 0.0], self.plugin._publisher.messages[-1].linear_velocity)
+
+    def test_canvas_stop_unbinds_and_retires_nav_id(self):
+        self._bind()
+        result = self.plugin.dispatch("stop", {})
+        self.assertEqual("idle", result["state"])
+        self.assertEqual([], self.plugin._node.subscriptions)
+        replay = self.plugin.dispatch("start", {
+            "input_topic": DEFAULT_VELOCITY_PROPOSAL_TOPIC,
+            "expected_nav_id": "nav-001",
+        })
+        self.assertEqual("error", replay["state"])
+        self.assertIn("retired_nav_id_replay", replay["error"])
+
+    def test_proposal_disabled_by_default_without_config(self):
+        config = {k: v for k, v in CONFIG.items() if k != "plugins"}
+        plugin = DevicePluginContractTests.device.LocomotionPlugin(config, "robot", self.ros, self.state)
+        plugin.start()
+        result = plugin.dispatch("start", {
+            "input_topic": DEFAULT_VELOCITY_PROPOSAL_TOPIC,
+            "expected_nav_id": "nav-001",
+        })
+        self.assertEqual("error", result["state"])
+        self.assertEqual("velocity_proposal is disabled in config", result["error"])
 
 
 if __name__ == "__main__":
