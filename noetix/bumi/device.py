@@ -322,8 +322,12 @@ class LocoPlugin:
     _MOVE_DEFAULT_DURATION_S = 2.0
     _MOVE_MAX_DURATION_S = 5.0
     _MOVE_CONFIRM_TIMEOUT_S = 2.0
-    _MOVE_CONFIRM_MIN_JOINT_VELOCITY = 0.30
-    _MOVE_CONFIRM_BASELINE_MARGIN = 0.15
+    # Stationary feedback on the tested robot can peak around 0.16 rad/s, while
+    # a real low-amplitude gait can start below the former fixed 0.30 rad/s
+    # threshold. Keep an absolute noise floor and require a rise over the
+    # command-specific stationary baseline instead of using 0.30 unconditionally.
+    _MOVE_CONFIRM_MIN_JOINT_VELOCITY = 0.22
+    _MOVE_CONFIRM_BASELINE_MARGIN = 0.10
 
     def __init__(self, plugin_config: dict, namespace: str, executor, high_ctrl):
         self._high_ctrl = high_ctrl
@@ -337,7 +341,6 @@ class LocoPlugin:
         self._control_preroll_s = 0.3     # refresh an already active DDS writer path
         self._control_cold_preroll_s = 3.0
         self._control_channel_warmed = False
-        self._walking_stream_armed = False
         self._auto_exit_lock = threading.Lock()
         self._auto_exit_timers: dict[str, threading.Timer] = {}
         self._playback_monitor_stop: threading.Event | None = None
@@ -359,10 +362,10 @@ class LocoPlugin:
             "description": (
                 "Move Bumi with bounded HighController walking commands or stop an active "
                 "move. The card uses only the vendor HighController; it does not initialize "
-                "LowController. move is accepted only when workmode=2 (walking). Before the "
-                "first velocity stream, the card sends one WALK edge to activate this SDK "
-                "client, then follows the vendor example by continuously sending DEFAULT with "
-                "the requested velocity. Every move automatically sends zero velocity after at "
+                "LowController. move is accepted only when workmode=2 (walking). Every move "
+                "sends a fresh WALK trigger for this bounded command, then follows the vendor "
+                "example by continuously sending DEFAULT with the requested velocity. Every "
+                "move automatically sends zero velocity after at "
                 "most 5 seconds. Values are normalized SDK commands, not metres per second. "
                 "Before moving, confirm that Bumi is standing steadily on a flat non-slip floor "
                 "and that its path is clear."
@@ -384,7 +387,9 @@ class LocoPlugin:
                         "default": 0.0,
                         "description": (
                             "Normalized forward command from -1 to 1; positive moves forward, "
-                            "negative moves backward, default 0."
+                            "negative moves backward, default 0. This firmware showed a "
+                            "direction-dependent startup deadband: 0.3 may not start forward "
+                            "motion, so use 0.5 for the first low-risk forward test."
                         ),
                         "minimum": -1, "maximum": 1,
                     },
@@ -393,7 +398,9 @@ class LocoPlugin:
                         "default": 0.0,
                         "description": (
                             "Normalized lateral command from -1 to 1; positive moves left, "
-                            "negative moves right, default 0."
+                            "negative moves right, default 0. Lateral startup required a larger "
+                            "command in current real-robot testing: 0.5 may not start, while 0.7 "
+                            "did; test both signs cautiously because their deadbands may differ."
                         ),
                         "minimum": -1, "maximum": 1,
                     },
@@ -402,7 +409,8 @@ class LocoPlugin:
                         "default": 0.0,
                         "description": (
                             "Normalized turning command from -1 to 1; positive turns left, "
-                            "negative turns right, default 0."
+                            "negative turns right, default 0. A magnitude of 0.3 started turning "
+                            "in current real-robot testing; test the opposite sign cautiously."
                         ),
                         "minimum": -1, "maximum": 1,
                     },
@@ -425,8 +433,10 @@ class LocoPlugin:
                         "description": (
                             "Move with normalized HighController commands for 1-5 seconds. "
                             "At least one velocity must be non-zero and the robot must already "
-                            "be in walking mode. For the first low-risk test, use forward=0.3, "
-                            "lateral=0, turn=0 and duration=2 in a clear area."
+                            "be upright, stable and in walking mode (motion_state must report "
+                            "workmode.code=2). If it is not, the card returns an error without "
+                            "sending WALK or velocity commands. For the first low-risk test, use "
+                            "forward=0.5, lateral=0, turn=0 and duration=2 in a clear area."
                         ),
                     },
                     "stop_move": {
@@ -642,13 +652,22 @@ class LocoPlugin:
                 "required_workmode": 2,
                 "required_workmode_name": "walking",
                 "error": (
-                    "loco.move is allowed only in workmode=2 (walking). The card does not "
-                    "automatically enable or stand the robot because HighController cannot "
-                    "verify that its physical pose and surroundings are safe."
+                    "loco.move can run only when motion_state reports workmode.code=2 "
+                    "(walking). No WALK trigger or velocity command was sent."
                 ),
-                "recovery": (
-                    "First place the robot in a documented stable standing/walking state, "
-                    "confirm a clear path, then retry. Never force walking from a lying pose."
+                "why_not_automatic": (
+                    "The card does not automatically enable, stand up or enter walking because "
+                    "HighController cannot verify the physical pose, floor or surrounding space."
+                ),
+                "recovery_steps": [
+                    "Place Bumi upright with both feet stable on a flat non-slip floor.",
+                    "Keep people and obstacles out of the intended path.",
+                    "Use a documented supported control to enter walking mode.",
+                    "Call motion_state and confirm workmode.code=2 before retrying loco.move.",
+                ],
+                "message": (
+                    "Prepare the robot safely, enter walking mode, verify workmode.code=2 with "
+                    "motion_state, and then retry. Never force walking from a lying pose."
                 ),
             }
 
@@ -679,34 +698,31 @@ class LocoPlugin:
                 "message": "No walking activation or velocity command was sent.",
             }
 
-        # The vendor HighController example sends WALK once to enter/activate
-        # the walking policy and then streams DEFAULT frames with x/y/z. A
-        # workmode value of 2 alone does not prove that this SDK publisher has
-        # activated the current walking command path (the app may have done it).
-        walking_policy_refreshed = False
-        if not self._walking_stream_armed:
-            observed = self._send_edge_and_wait(
-                _get_control_cmd("WALK"), {2, 26}, timeout_s=1.0,
-                command_values=(vx, vy, vyaw))
-            if observed == 26:
-                self._walking_stream_armed = False
-                return self._protection_error(
-                    "move", [], observed,
-                    "Keep the robot standing on a flat non-slip floor with a clear path.",
-                    command_sent=True)
-            if observed != 2:
-                self._walking_stream_armed = False
-                return {
-                    "state": "error", "command_sent": True,
-                    "current_workmode": observed,
-                    "current_workmode_name": _WORKMODE_NAMES.get(observed, "unknown"),
-                    "error": (
-                        "The WALK activation edge was sent, but workmode=2 was not observed. "
-                        "No velocity stream was started."
-                    ),
-                }
-            self._walking_stream_armed = True
-            walking_policy_refreshed = True
+        # Trigger WALK for every bounded move. The previous implementation kept
+        # a process-local "armed" flag after sending zero velocity, but that flag
+        # cannot prove that the firmware still accepts this writer's next
+        # command. A fresh, non-toggle WALK edge makes separate MCP calls
+        # deterministic while DEFAULT remains the continuous velocity frame,
+        # matching the vendor example and the successful host-side A/B test.
+        observed = self._send_edge_and_wait(
+            _get_control_cmd("WALK"), {2, 26}, timeout_s=1.0,
+            command_values=(vx, vy, vyaw))
+        walking_policy_refreshed = True
+        if observed == 26:
+            return self._protection_error(
+                "move", [], observed,
+                "Keep the robot standing on a flat non-slip floor with a clear path.",
+                command_sent=True)
+        if observed != 2:
+            return {
+                "state": "error", "command_sent": True,
+                "current_workmode": observed,
+                "current_workmode_name": _WORKMODE_NAMES.get(observed, "unknown"),
+                "error": (
+                    "The WALK activation edge was sent, but workmode=2 was not observed. "
+                    "No velocity stream was started."
+                ),
+            }
 
         self._move_stop_event.clear()
         default_cmd = _get_default_cmd()
@@ -726,7 +742,6 @@ class LocoPlugin:
                     if current_mode != 2:
                         move_observation["stop_reason"] = "workmode_left_walking"
                         move_observation["observed_workmode"] = current_mode
-                        self._walking_stream_armed = False
                         break
                     time.sleep(max(0.0, next_send - time.monotonic()))
                     if self._move_stop_event.is_set() or time.monotonic() >= end_time:
@@ -737,7 +752,6 @@ class LocoPlugin:
                     if current_mode != 2:
                         move_observation["stop_reason"] = "workmode_left_walking"
                         move_observation["observed_workmode"] = current_mode
-                        self._walking_stream_armed = False
                         break
                     self._publish_cmd(vx, vy, vyaw, default_cmd, 0)
                     next_send += self._control_period
@@ -785,14 +799,9 @@ class LocoPlugin:
             and observed_peak_joint_velocity >= confirmation_threshold
         )
         if not confirmed_started:
-            # Re-arm the WALK edge on the next request because this publisher's
-            # walking stream was not accepted or could not be verified.
-            self._walking_stream_armed = False
             self._move_stop_event.set()
             self._move_thread.join(timeout=1)
             observed_mode = int(self._high_ctrl.get_mode())
-            if observed_mode != 2:
-                self._walking_stream_armed = False
             return {
                 "state": "error",
                 "command_sent": True,
@@ -816,7 +825,13 @@ class LocoPlugin:
                     "confirm that locomotion started. Zero velocity was sent."
                 ),
                 "possible_causes": [
-                    "The requested normalized velocity is inside the firmware deadband.",
+                    (
+                        "The requested normalized velocity may be inside a direction-dependent "
+                        "firmware startup deadband. On the tested robot, forward 0.3 and lateral "
+                        "0.5 could fail to start, while forward 0.5, lateral 0.7 and turn 0.3 "
+                        "started in low-risk tests. Do not assume both signs have identical "
+                        "deadbands."
+                    ),
                     "Another Bumi app, driver container, SDK process, or remote controller is "
                     "publishing zero velocity and overriding this driver.",
                     "The firmware reports walking mode but is not accepting this SDK client's "
