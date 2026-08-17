@@ -132,6 +132,7 @@ _FACE_UP_MAX_GRAVITY_ANGLE_DEG = 8.0
 _STAND_POSE_ACCELERATION_RANGE = (9.2, 10.4)
 _STAND_POSE_MAX_ANGULAR_VELOCITY = 0.10
 _STAND_POSE_MAX_JOINT_VELOCITY = 0.15
+_STAND_POSE_MAX_JOINT_VELOCITY_SPIKE = 0.30
 
 # Median joint references from the verified face-up sample.  Tolerances are
 # deliberately wider than its sensor noise, while still rejecting the supplied
@@ -1258,7 +1259,10 @@ class LocoPlugin:
         min_acceleration = min(acceleration_magnitudes)
         max_acceleration = max(acceleration_magnitudes)
         max_angular_speed = max(angular_speed_samples)
-        max_joint_velocity = max(joint_velocity_samples)
+        sorted_joint_velocities = sorted(joint_velocity_samples)
+        median_joint_velocity = sorted_joint_velocities[
+            len(sorted_joint_velocities) // 2]
+        max_joint_velocity = sorted_joint_velocities[-1]
         checks = {
             "face_up_orientation": max_gravity_angle <= _FACE_UP_MAX_GRAVITY_ANGLE_DEG,
             "gravity_like_acceleration": (
@@ -1266,7 +1270,10 @@ class LocoPlugin:
                 and max_acceleration <= _STAND_POSE_ACCELERATION_RANGE[1]
             ),
             "body_stationary": max_angular_speed <= _STAND_POSE_MAX_ANGULAR_VELOCITY,
-            "joints_stationary": max_joint_velocity <= _STAND_POSE_MAX_JOINT_VELOCITY,
+            "joints_stationary": (
+                median_joint_velocity <= _STAND_POSE_MAX_JOINT_VELOCITY
+                and max_joint_velocity <= _STAND_POSE_MAX_JOINT_VELOCITY_SPIKE
+            ),
             "joint_pose": not out_of_pose_joints,
             "no_documented_motor_fault": not documented_faults,
         }
@@ -1283,6 +1290,8 @@ class LocoPlugin:
                 "acceleration_magnitude_range_m_s2": [
                     round(min_acceleration, 3), round(max_acceleration, 3)],
                 "maximum_angular_velocity_rad_s": round(max_angular_speed, 4),
+                "median_maximum_joint_velocity_rad_s": round(
+                    median_joint_velocity, 4),
                 "maximum_joint_velocity_rad_s": round(max_joint_velocity, 4),
                 "out_of_pose_joints": out_of_pose_joints,
                 "documented_motor_faults": documented_faults,
@@ -1291,7 +1300,9 @@ class LocoPlugin:
                 "maximum_gravity_direction_error_deg": _FACE_UP_MAX_GRAVITY_ANGLE_DEG,
                 "acceleration_magnitude_m_s2": list(_STAND_POSE_ACCELERATION_RANGE),
                 "maximum_angular_velocity_rad_s": _STAND_POSE_MAX_ANGULAR_VELOCITY,
-                "maximum_joint_velocity_rad_s": _STAND_POSE_MAX_JOINT_VELOCITY,
+                "median_maximum_joint_velocity_rad_s": _STAND_POSE_MAX_JOINT_VELOCITY,
+                "maximum_joint_velocity_spike_rad_s": (
+                    _STAND_POSE_MAX_JOINT_VELOCITY_SPIKE),
                 "joint_position_rule": (
                     "The five-sample median of every joint must be within its calibrated "
                     "per-joint maximum deviation. Failed joints include their limits."
@@ -1651,16 +1662,26 @@ class LocoPlugin:
 
     def _run_preparation_step(self, step: str, command_name: str,
                               expected_modes: set[int], steps: list[dict]) -> int:
+        # START is a toggle, so it must never be retried.  On the tested Bumi,
+        # however, the disabled state reached after STANDTOFALL can ignore a
+        # START edge until it has first received a sustained neutral stream.
+        # Prime that transition every time instead of only once per process.
+        neutral_preroll_s = (
+            self._control_cold_preroll_s if command_name == "START" else None)
         observed = self._send_edge_and_wait(
-            _get_control_cmd(command_name), expected_modes | {26}, timeout_s=3.0)
-        steps.append({
+            _get_control_cmd(command_name), expected_modes | {26}, timeout_s=3.0,
+            preroll_override_s=neutral_preroll_s)
+        step_result = {
             "step": step,
             "command": command_name,
             "expected_workmodes": sorted(expected_modes),
             "observed_workmode": observed,
             "observed_workmode_name": _WORKMODE_NAMES.get(observed, "unknown"),
             "confirmed": observed in expected_modes,
-        })
+        }
+        if neutral_preroll_s is not None:
+            step_result["neutral_preroll_s"] = neutral_preroll_s
+        steps.append(step_result)
         return observed
 
     def _trigger_user_action(self, requested_action: str, command_name: str,
@@ -1751,23 +1772,32 @@ class LocoPlugin:
         return observed
 
     def _send_edge_and_wait(self, cmd_enum, expected_modes: set[int],
-                            index: int = 0, timeout_s: float = 2.0) -> int:
+                            index: int = 0, timeout_s: float = 2.0,
+                            preroll_override_s: float | None = None) -> int:
         """Prime DDS, send one action edge, then maintain neutral control frames."""
         with self._action_lock:
             default_cmd = _get_default_cmd()
 
-            # The vendor examples keep publishing at 100 Hz. The first event
-            # from a newly started driver can otherwise be lost before the DDS
-            # subscriber path is fully active. Use a longer DEFAULT-only pre-roll
-            # once per driver lifetime, then retain the short refresh pre-roll.
+            # The vendor examples keep publishing at 100 Hz. Use a longer
+            # DEFAULT-only pre-roll for a new DDS writer and whenever the caller
+            # explicitly requests it for a state transition such as START.
             # Never retry the action itself: START is a toggle and a delayed
             # duplicate could immediately disable the robot again.
-            preroll_s = (
-                self._control_cold_preroll_s
-                if not self._control_channel_warmed
-                else self._control_preroll_s
-            )
-            if preroll_s == self._control_cold_preroll_s:
+            if preroll_override_s is not None:
+                preroll_s = preroll_override_s
+            else:
+                preroll_s = (
+                    self._control_cold_preroll_s
+                    if not self._control_channel_warmed
+                    else self._control_preroll_s
+                )
+            if preroll_override_s is not None:
+                print(
+                    f"[loco] priming control transition with DEFAULT for "
+                    f"{preroll_s:.1f}s",
+                    flush=True,
+                )
+            elif preroll_s == self._control_cold_preroll_s:
                 print(
                     f"[loco] priming new control channel with DEFAULT for {preroll_s:.1f}s",
                     flush=True,
