@@ -1,0 +1,17 @@
+string motion_name
+int32 priority 
+int32 LOW = 0
+int32 MEDIUM = 20
+int32 HIGH = 50
+int32 SYSTEM = 80
+int32 EMERGENCY = 99
+---
+int32 error_code 0
+int32 SUCCESS = 0
+int32 DENIED = 1
+int32 ERROR = 2
+int32 INVALID = 3
+string error_description 
+---
+int32 status 0
+int32 RUNNING = 1

@@ -86,8 +86,6 @@ class SmartMotionProxy:
         ctx = mp.get_context("spawn")
         self._cmd_queue = ctx.Queue()
         self._result_queue = ctx.Queue()
-        self._call_lock = threading.Lock()
-        self._request_id = 0
         self._proc = ctx.Process(
             target=_run_smart_motion_process,
             args=(namespace, config, proposal_config or {}, network_iface,
@@ -103,6 +101,38 @@ class SmartMotionProxy:
         )
         self._exit_monitor.start()
         print(f"[SmartMotionProxy] subprocess started → pid={self._proc.pid}")
+        # Per-request result routing: avoid race when multiple threads call _call
+        self._pending: dict[str, queue.Queue] = {}  # req_id → per-request queue
+        self._dispatch_lock = threading.Lock()
+        self._dispatch_thread = threading.Thread(target=self._dispatch_results, daemon=True)
+        self._dispatch_thread.start()
+        self._req_counter = 0
+        self._req_lock = threading.Lock()
+
+    def _next_req_id(self) -> str:
+        with self._req_lock:
+            self._req_counter += 1
+            return f"req_{self._req_counter}"
+
+    def _dispatch_results(self):
+        """Background thread that routes results from subprocess to the correct caller."""
+        while True:
+            try:
+                item = self._result_queue.get(timeout=1.0)
+                req_id = item.pop("_req_id", None) if isinstance(item, dict) else None
+                if req_id and req_id in self._pending:
+                    self._pending[req_id].put(item)
+                else:
+                    # Fallback: shouldn't happen, but don't lose the result
+                    # Put it in any waiting queue (legacy behavior)
+                    with self._dispatch_lock:
+                        for q in self._pending.values():
+                            q.put(item)
+                            break
+            except queue.Empty:
+                continue
+            except Exception:
+                continue
 
     def _monitor_process_exit(self) -> None:
         """Issue an independent parent-side stop on every child exit.
@@ -123,30 +153,21 @@ class SmartMotionProxy:
             )
 
     def _call(self, method: str, timeout: float = 15.0, **kwargs) -> dict:
-        """Serialize calls and correlate replies across HTTP/ROS threads."""
-        with self._call_lock:
-            if not self._proc.is_alive():
-                return {"error": "SmartMotion subprocess is not running"}
-            self._request_id += 1
-            request_id = self._request_id
-            self._cmd_queue.put({
-                "method": method,
-                "request_id": request_id,
-                **kwargs,
-            })
-            deadline = time.monotonic() + timeout
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0.0:
-                    self._terminate_unresponsive_process()
-                    return {"error": f"SmartMotion subprocess timeout ({method})"}
-                try:
-                    envelope = self._result_queue.get(timeout=remaining)
-                except queue.Empty:
-                    self._terminate_unresponsive_process()
-                    return {"error": f"SmartMotion subprocess timeout ({method})"}
-                if envelope.get("request_id") == request_id:
-                    return envelope.get("result") or {}
+        """Send command to subprocess and wait for result (thread-safe)."""
+        req_id = self._next_req_id()
+        result_q = queue.Queue(maxsize=1)
+        with self._dispatch_lock:
+            self._pending[req_id] = result_q
+        try:
+            self._cmd_queue.put({"method": method, "_req_id": req_id, **kwargs})
+            result = result_q.get(timeout=timeout)
+            return result
+        except queue.Empty:
+            self._terminate_unresponsive_process()
+            return {"error": f"SmartMotion subprocess timeout ({method})"}
+        finally:
+            with self._dispatch_lock:
+                self._pending.pop(req_id, None)
 
     def _terminate_unresponsive_process(self) -> None:
         """Fail closed: an IPC-hung motion owner may not keep executing."""
@@ -1676,10 +1697,8 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                 result = {"error": f"unknown SmartMotion method: {method}"}
 
             if result is not None:
-                result_queue.put({
-                    "request_id": cmd.get("request_id"),
-                    "result": result,
-                })
+                result["_req_id"] = cmd.get("_req_id")
+                result_queue.put(result)
         except queue.Empty:
             pass
         except Exception as exc:
@@ -1691,7 +1710,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                     pass
             if cmd is not None:
                 result_queue.put({
-                    "request_id": cmd.get("request_id"),
+                    "_req_id": cmd.get("_req_id"),
                     "result": {"error": f"SmartMotion command failed: {exc}"},
                 })
 

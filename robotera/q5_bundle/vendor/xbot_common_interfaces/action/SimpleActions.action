@@ -1,0 +1,10 @@
+string action_name
+float32 time_cost
+---
+int32 SUCCESS=0
+int32 DENIED=1
+int32 FAILED=2
+int32 result
+string message
+---
+float32 progress

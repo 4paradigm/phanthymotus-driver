@@ -28,6 +28,7 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   TtsPlugin           (actuator)           — 语音合成
   VoicePlayActuatorPlugin (actuator)      — 音频播放控制(文件/URL/TTS)
   NavPlugin           (actuator)           — 底盘导航控制
+  HomePlugin          (actuator)           — 充电桩管理与回桩
   ChatPlugin          (actuator)           — 语音交互开关
   VoiceChatActuatorPlugin (actuator)      — 语音对话开关
   MotorStatePlugin    (sensor)             — 全身21电机状态(2Hz)
@@ -35,6 +36,12 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   RemoteStatePlugin   (sensor)             — 遥控器SBUS事件(5Hz)
   SystemInspectionSkillPlugin (actuator)   — 作业前全机自检组合 Skill
   RoutineSkillsPlugin (actuator, multi-tool) — 舞台迎宾与合影姿态场景 Skill
+  HealthCheckPlugin   (actuator)           — 全身体检卡 (tool name=health_check)
+  LaserScanPlugin     (sensor)             — 激光雷达原始点云
+  ChassisRawPlugin    (actuator)           — 底盘速度控制
+  ControlledSpatialPlugin (actuator)      — 空间控制(controlled_spatial)
+  ExtMicPlugin        (actuator)           — 外部麦克风(ext_mic)
+  LightPlugin         (actuator)           — 灯光控制
   StatePlugin      (sensor, multi-tool) — 关节/电池/急停/力传感器/URDF
   CameraPlugin     (sensor)             — Orbbec 头部相机
   AsrPlugin        (sensor)             — 语音识别结果
@@ -55,12 +62,14 @@ from __future__ import annotations
 
 import json
 import math
+import re as _re
 import subprocess
 import struct
 import threading
 import time
 import uuid
 from pathlib import Path
+from uuid import uuid4
 
 import rclpy
 from rclpy.node import Node
@@ -125,11 +134,48 @@ _WAIST_JOINTS = {
 }
 
 _LEG_JOINTS = {
-    51: "left_hip_pitch_joint",
-    52: "left_knee_pitch_joint",
+    51: "hip_pitch_joint",
+    52: "knee_pitch_joint",
 }
 
 _ALL_JOINTS = {**_HEAD_JOINTS, **_ARM_LEFT_JOINTS, **_ARM_RIGHT_JOINTS, **_WAIST_JOINTS, **_LEG_JOINTS}
+
+# Inspire feedback is folded directly into the joints skeleton. The vendor
+# state messages report one normalized value for each of these six channels.
+_SKELETON_HAND_ORDER = ["little", "ring", "middle", "index", "thumb_bend", "thumb_rotation"]
+_SKELETON_HAND_ALIASES = {
+    "1": "little", "little": "little", "pinky": "little",
+    "2": "ring", "ring": "ring",
+    "3": "middle", "middle": "middle",
+    "4": "index", "index": "index", "fore": "index",
+    "5": "thumb_bend", "thumb": "thumb_bend", "thumb_flex": "thumb_bend",
+    "6": "thumb_rotation", "thumb_rotation": "thumb_rotation", "thumb_rotate": "thumb_rotation",
+}
+_SKELETON_HAND_JOINTS = {
+    side: {
+        "little": f"{side}_hand_little_joint",
+        "ring": f"{side}_hand_ring_joint",
+        "middle": f"{side}_hand_middle_joint",
+        "index": f"{side}_hand_index_joint",
+        "thumb_bend": f"{side}_hand_thumb_bend_joint",
+        "thumb_rotation": f"{side}_hand_thumb_rotation_joint",
+    }
+    for side in ("left", "right")
+}
+_SKELETON_HAND_MAX_BEND_RAD = math.pi / 2.0
+_RIGHT_THUMB_ROTATION_OPEN_RAW = 0.48
+
+# Calibrated full-height encoder values. Unlike process-startup auto-zeroing,
+# these keep the high and low lift poses consistent after a driver restart.
+_SKELETON_JOINT_OFFSET = {
+    "waist_pitch_joint": 0.70,
+    "hip_pitch_joint": -0.70,
+    "knee_pitch_joint": 0.35,
+}
+_SKELETON_JOINT_GAIN = {
+    "hip_pitch_joint": 2.44,
+    "knee_pitch_joint": 1.37,
+}
 
 _MOTOR_ERROR_DESCRIPTIONS = {
     1: "motor_over_temperature",
@@ -151,6 +197,17 @@ def _deg2rad(deg: float) -> float:
 
 def _rad2deg(rad: float) -> float:
     return rad * 180.0 / math.pi
+
+
+def _skeleton_hand_bend_rad(raw: float, side: str, finger: str) -> float:
+    """Map Inspire's open-ratio feedback to the virtual skeleton angle."""
+    if -0.05 <= raw <= 1.05:
+        open_ratio = max(0.0, min(1.0, raw))
+    else:
+        open_ratio = max(0.0, min(100.0, raw)) / 100.0
+    if side == "right" and finger == "thumb_rotation":
+        open_ratio = max(0.0, min(1.0, open_ratio / _RIGHT_THUMB_ROTATION_OPEN_RAW))
+    return (1.0 - open_ratio) * _SKELETON_HAND_MAX_BEND_RAD
 
 
 def _clamp(value: float, lower: float, upper: float) -> float:
@@ -189,6 +246,36 @@ _LEG_LEVELS = [
 ]
 
 
+def _acp_notify(action_id: str, status: str, result: dict, tool: str = ""):
+    """POST action completion to Agent Core (module-level ACP helper)."""
+    import urllib.request as _urllib
+    import ssl as _ssl
+    import os as _os
+
+    agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+    ctx = _ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = _ssl.CERT_NONE
+    payload = json.dumps({
+        "action_id": action_id,
+        "status": status,
+        "result": result,
+        "tool": tool,
+        "ts": time.time(),
+    }).encode()
+    try:
+        req = _urllib.Request(
+            f"{agent_core_url}/api/acp/complete",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        _urllib.urlopen(req, timeout=5, context=ctx)
+    except Exception as e:
+        import sys
+        print(f"[ACP] callback failed for {action_id}: {e}", file=sys.stderr)
+
+
 class _ActionSequence:
     """Run one cancellable actuator sequence at a time."""
 
@@ -199,7 +286,8 @@ class _ActionSequence:
         self._thread: threading.Thread | None = None
         self._last_error: str | None = None
 
-    def start(self, worker) -> None:
+    def start(self, worker, on_done=None) -> None:
+        """Start a worker sequence. on_done(cancelled: bool) called when finished."""
         self.cancel()
         cancel_event = threading.Event()
 
@@ -212,10 +300,16 @@ class _ActionSequence:
                         self._last_error = str(e)
                 print(f"[{self._name}] sequence failed: {e}")
             finally:
+                cancelled = cancel_event.is_set()
                 with self._lock:
                     if self._cancel_event is cancel_event:
                         self._cancel_event = None
                         self._thread = None
+                if on_done:
+                    try:
+                        on_done(cancelled)
+                    except Exception as e:
+                        print(f"[{self._name}] on_done callback failed: {e}")
 
         thread = threading.Thread(
             target=_run, name=f"{self._name}_sequence", daemon=True)
@@ -480,11 +574,20 @@ class StatePlugin:
 
         # Cached state
         self._joint_data = {}  # motor_id → {pos, speed, current, temp, error}
+        self._hand_data = {"left": None, "right": None}
         self._battery = {}
         self._estop = {}
         self._force_left = {}
         self._force_right = {}
         self._lock = threading.Lock()
+        self._joints_only = bool(plugin_config.get("joints_only", False))
+        self._publish_joints_enabled = bool(plugin_config.get("publish_joints", True))
+        self._last_joints_publish_at = 0.0
+        self._joints_publish_interval = 1.0 / 30.0
+
+        self._hand_left_topic = plugin_config.get("hand_left_topic", "/inspire_hand/state/left_hand")
+        self._hand_right_topic = plugin_config.get("hand_right_topic", "/inspire_hand/state/right_hand")
+        self._hand_stale_after_sec = float(plugin_config.get("hand_stale_after_sec", 1.0))
 
         # Topics for Agent Core (domain 42)
         self._topic_joints = f"/{namespace}/state/joints"
@@ -493,17 +596,26 @@ class StatePlugin:
         self._topic_force = f"/{namespace}/state/force"
 
         # Subscriber node (domain 0 - tianyi)
-        self._sub_node = Node("tianyi2_state_sub", context=ros2.ctx_tianyi)
+        sub_name = "tianyi2_joints_sub" if self._joints_only else "tianyi2_state_sub"
+        self._sub_node = Node(sub_name, context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._sub_node)
 
         # Publisher node (domain 42 - agent core)
-        self._pub_node = Node("tianyi2_state_pub", context=ros2.ctx_core)
+        pub_name = "tianyi2_joints_pub" if self._joints_only else "tianyi2_state_pub"
+        self._pub_node = Node(pub_name, context=ros2.ctx_core)
         ros2.executor_core.add_node(self._pub_node)
 
-        self._pub_joints = self._pub_node.create_publisher(String, self._topic_joints, _LOW_LAT_QOS)
-        self._pub_battery = self._pub_node.create_publisher(String, self._topic_battery, _LOW_LAT_QOS)
-        self._pub_estop = self._pub_node.create_publisher(String, self._topic_estop, _LOW_LAT_QOS)
-        self._pub_force = self._pub_node.create_publisher(String, self._topic_force, _LOW_LAT_QOS)
+        self._pub_joints = (
+            self._pub_node.create_publisher(String, self._topic_joints, _LOW_LAT_QOS)
+            if self._publish_joints_enabled else None
+        )
+        self._pub_battery = None
+        self._pub_estop = None
+        self._pub_force = None
+        if not self._joints_only:
+            self._pub_battery = self._pub_node.create_publisher(String, self._topic_battery, _LOW_LAT_QOS)
+            self._pub_estop = self._pub_node.create_publisher(String, self._topic_estop, _LOW_LAT_QOS)
+            self._pub_force = self._pub_node.create_publisher(String, self._topic_force, _LOW_LAT_QOS)
 
         # URDF path
         self._urdf_path = Path(__file__).parent / "resource" / "tianyi2_model.urdf"
@@ -513,7 +625,7 @@ class StatePlugin:
             {
                 "name": "joints",
                 "type": "sensor",
-                "description": "天轶2.0 全身关节状态 — 位置/速度/电流/温度 (头/臂/腰/腿 共21个关节)",
+                "description": "天轶2.0 全身关节状态 — 身体关节与 Inspire 灵巧手实时 skeleton 渲染",
                 "inputSchema": {"type": "object", "properties": {}},
                 "topic_out": [{"topic": self._topic_joints, "format": "sensor/skeleton"}],
             },
@@ -557,23 +669,36 @@ class StatePlugin:
                 self._sub_node.create_subscription(
                     MotorStatusMsg, topic, self._on_motor_status, _RELIABLE_QOS)
 
-            # Battery
-            self._sub_node.create_subscription(
-                PowerBatteryStatus, "/power/battery/status", self._on_battery, _RELIABLE_QOS)
+            if not self._joints_only:
+                # Battery
+                self._sub_node.create_subscription(
+                    PowerBatteryStatus, "/power/battery/status", self._on_battery, _RELIABLE_QOS)
 
-            # E-stop
-            self._sub_node.create_subscription(
-                PowerBoardKeyStatus, "/power/board/key_status", self._on_estop, _RELIABLE_QOS)
+                # E-stop
+                self._sub_node.create_subscription(
+                    PowerBoardKeyStatus, "/power/board/key_status", self._on_estop, _RELIABLE_QOS)
 
-            # Force sensors (100Hz, throttle to 5Hz in callback)
-            self._sub_node.create_subscription(
-                WrenchStamped, "/arm_6dof_left", self._on_force_left, _RELIABLE_QOS)
-            self._sub_node.create_subscription(
-                WrenchStamped, "/arm_6dof_right", self._on_force_right, _RELIABLE_QOS)
+                # Force sensors (100Hz, throttle to 5Hz in callback)
+                self._sub_node.create_subscription(
+                    WrenchStamped, "/arm_6dof_left", self._on_force_left, _RELIABLE_QOS)
+                self._sub_node.create_subscription(
+                    WrenchStamped, "/arm_6dof_right", self._on_force_right, _RELIABLE_QOS)
 
             print("[StatePlugin] subscriptions created")
         except ImportError as e:
             print(f"[StatePlugin] WARNING: msg import failed ({e}), running in stub mode")
+
+        try:
+            from sensor_msgs.msg import JointState
+            self._sub_node.create_subscription(
+                JointState, self._hand_left_topic,
+                lambda message: self._on_hand_state("left", message), _LOW_LAT_QOS)
+            self._sub_node.create_subscription(
+                JointState, self._hand_right_topic,
+                lambda message: self._on_hand_state("right", message), _LOW_LAT_QOS)
+            print(f"[StatePlugin] hand subscriptions created: {self._hand_left_topic}, {self._hand_right_topic}")
+        except ImportError as e:
+            print(f"[StatePlugin] WARNING: hand skeleton disabled ({e})")
 
         # Publish timer
         self._pub_thread = threading.Thread(target=self._publish_loop, daemon=True)
@@ -592,6 +717,42 @@ class StatePlugin:
                     "temp": s.temperature,
                     "error": s.error,
                 }
+            self._publish_joints_locked()
+
+    def _on_hand_state(self, side: str, msg) -> None:
+        values = {finger: None for finger in _SKELETON_HAND_ORDER}
+        velocities = {finger: None for finger in _SKELETON_HAND_ORDER}
+        efforts = {finger: None for finger in _SKELETON_HAND_ORDER}
+        names = list(msg.name or [])
+        positions = list(msg.position or [])
+        velocity_values = list(msg.velocity or [])
+        effort_values = list(msg.effort or [])
+
+        for index, finger in enumerate(_SKELETON_HAND_ORDER):
+            if index < len(names):
+                key = str(names[index]).strip().lower().replace("-", "_").replace(" ", "_")
+                finger = _SKELETON_HAND_ALIASES.get(key, finger)
+            if index < len(positions):
+                values[finger] = float(positions[index])
+            if index < len(velocity_values):
+                velocities[finger] = float(velocity_values[index])
+            if index < len(effort_values):
+                efforts[finger] = float(effort_values[index])
+
+        stamp = getattr(msg, "header", None)
+        message_timestamp_ms = 0
+        if stamp is not None:
+            message_timestamp_ms = stamp.stamp.sec * 1000 + stamp.stamp.nanosec // 1_000_000
+        with self._lock:
+            self._hand_data[side] = {
+                "values": values,
+                "velocities": velocities,
+                "efforts": efforts,
+                "source_joint_names": names,
+                "received_timestamp_ms": int(time.time() * 1000),
+                "message_timestamp_ms": message_timestamp_ms,
+            }
+            self._publish_joints_locked()
 
     def _on_battery(self, msg):
         with self._lock:
@@ -642,6 +803,90 @@ class StatePlugin:
                 "tz": msg.wrench.torque.z,
             }
 
+    def _build_joints_payload_locked(self) -> dict:
+        now_ms = int(time.time() * 1000)
+        joints = []
+        body_entries = []
+        visual_q_by_name = {}
+
+        for motor_id, data in self._joint_data.items():
+            motor_key = int(motor_id) if str(motor_id).isdigit() else motor_id
+            name = _ALL_JOINTS.get(motor_key, f"motor_{motor_id}")
+            raw_q = data["pos"]
+            q = (raw_q - _SKELETON_JOINT_OFFSET.get(name, 0.0)) * _SKELETON_JOINT_GAIN.get(name, 1.0)
+            visual_q_by_name[name] = q
+            body_entries.append({
+                "idx": motor_id,
+                "name": name,
+                "q": q,
+                "raw_q": raw_q,
+                "dq": data["speed"],
+                "current": data["current"],
+                "temp": data["temp"],
+            })
+
+        if "hip_pitch_joint" in visual_q_by_name or "knee_pitch_joint" in visual_q_by_name:
+            waist_q = -(
+                visual_q_by_name.get("hip_pitch_joint", 0.0)
+                + visual_q_by_name.get("knee_pitch_joint", 0.0)
+            )
+            for entry in body_entries:
+                if entry["name"] == "waist_pitch_joint":
+                    entry["q"] = waist_q
+                    entry["source"] = "visual_compensation"
+        joints.extend(body_entries)
+
+        hands = {}
+        stale_ms = int(self._hand_stale_after_sec * 1000)
+        for side, hand_data in self._hand_data.items():
+            if not hand_data:
+                hands[side] = {"available": False, "fresh": False}
+                continue
+
+            age_ms = now_ms - hand_data["received_timestamp_ms"]
+            fresh = age_ms <= stale_ms
+            hands[side] = {
+                "available": True,
+                "fresh": fresh,
+                "age_ms": age_ms,
+                "source_joint_names": hand_data["source_joint_names"],
+            }
+            for finger, raw in hand_data["values"].items():
+                if raw is None:
+                    continue
+                bend_q = _skeleton_hand_bend_rad(raw, side, finger)
+                base_name = _SKELETON_HAND_JOINTS[side][finger]
+                shared = {
+                    "raw": round(raw, 4),
+                    "velocity_raw": hand_data["velocities"].get(finger),
+                    "effort_raw": hand_data["efforts"].get(finger),
+                    "source": "inspire_hand",
+                    "fresh": fresh,
+                }
+                q = -bend_q if finger in {"little", "ring", "middle", "index"} else bend_q
+                joints.append({"idx": f"{side}_hand_{finger}", "name": base_name, "q": q, **shared})
+                if finger in {"little", "ring", "middle", "index"}:
+                    joints.append({
+                        "idx": f"{side}_hand_{finger}_distal",
+                        "name": base_name.replace("_joint", "_distal_joint"),
+                        "q": -bend_q,
+                        **shared,
+                    })
+
+        return {"joints": joints, "timestamp_ms": now_ms, "hands": hands}
+
+    def _publish_joints_locked(self, force: bool = False) -> None:
+        """Publish a fresh skeleton as soon as feedback arrives, capped at 30 Hz."""
+        if not self._publish_joints_enabled or self._pub_joints is None or not self._joint_data:
+            return
+        now = time.monotonic()
+        if not force and now - self._last_joints_publish_at < self._joints_publish_interval:
+            return
+        msg = String()
+        msg.data = json.dumps(self._build_joints_payload_locked())
+        self._pub_joints.publish(msg)
+        self._last_joints_publish_at = now
+
     def _publish_loop(self):
         """Publish aggregated state at 10Hz for joints, 1Hz for battery/estop."""
         joint_counter = 0
@@ -651,22 +896,7 @@ class StatePlugin:
 
             # Publish joints
             with self._lock:
-                if self._joint_data:
-                    joints = []
-                    for motor_id, data in self._joint_data.items():
-                        name = _ALL_JOINTS.get(motor_id, f"motor_{motor_id}")
-                        joints.append({
-                            "idx": motor_id,
-                            "name": name,
-                            "q": data["pos"],
-                            "dq": data["speed"],
-                            "current": data["current"],
-                            "temp": data["temp"],
-                        })
-                    payload = json.dumps({"joints": joints})
-                    msg = String()
-                    msg.data = payload
-                    self._pub_joints.publish(msg)
+                self._publish_joints_locked(force=True)
 
             # 1Hz for battery/estop/force
             if joint_counter % 10 == 0:
@@ -699,7 +929,7 @@ class StatePlugin:
         # Sensor tools return state
         if action_or_tool == "joints":
             with self._lock:
-                return {"joints": list(self._joint_data.values())}
+                return self._build_joints_payload_locked()
         if action_or_tool == "battery":
             with self._lock:
                 return self._battery or {"state": "no_data"}
@@ -1252,6 +1482,211 @@ class PointCloudPlugin:
 # AsrPlugin (sensor)
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════════════════
+# IPA phoneme matching for ASR KWS (ported from perception/plugins/asr.py)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_ESPEAK_BACKENDS = {}  # lang -> EspeakBackend instance
+_ESPEAK_SEP = None
+
+
+def _get_espeak_backend(lang):
+    global _ESPEAK_SEP
+    if _ESPEAK_SEP is None:
+        from phonemizer.separator import Separator
+        _ESPEAK_SEP = Separator(phone=' ', word='  ', syllable='')
+    if lang not in _ESPEAK_BACKENDS:
+        from phonemizer.backend import EspeakBackend
+        _ESPEAK_BACKENDS[lang] = EspeakBackend(lang, with_stress=False)
+    return _ESPEAK_BACKENDS[lang]
+
+
+def _phonemize_safe(text: str, lang: str) -> str:
+    """Phonemize with persistent backend; auto-rebuild on failure."""
+    backend = _get_espeak_backend(lang)
+    try:
+        return backend.phonemize([text], separator=_ESPEAK_SEP, strip=True)[0]
+    except Exception:
+        _ESPEAK_BACKENDS.pop(lang, None)
+        backend = _get_espeak_backend(lang)
+        return backend.phonemize([text], separator=_ESPEAK_SEP, strip=True)[0]
+
+
+def _text_to_ipa(text: str) -> list:
+    """Convert text to IPA phoneme sequence using persistent espeak-ng backend."""
+    segments = []
+    current = ''
+    current_is_cjk = None
+    for char in text:
+        is_cjk = '\u4e00' <= char <= '\u9fff'
+        if current_is_cjk is None:
+            current_is_cjk = is_cjk
+        if is_cjk != current_is_cjk:
+            if current.strip():
+                segments.append((current.strip(), current_is_cjk))
+            current = ''
+            current_is_cjk = is_cjk
+        current += char
+    if current.strip():
+        segments.append((current.strip(), current_is_cjk))
+
+    ipa_seq = []
+    for seg_text, is_cjk in segments:
+        lang = 'cmn' if is_cjk else 'en-us'
+        try:
+            ipa = _phonemize_safe(seg_text, lang)
+            ipa = _re.sub(r'[0-9˥˦˧˨˩¹²³⁴⁵]', '', ipa)
+            phones = [p for p in ipa.split() if p]
+            ipa_seq.extend(phones)
+        except Exception:
+            ipa_seq.extend(list(seg_text))
+    return ipa_seq
+
+
+_SIMILAR_GROUPS = [
+    {'t', 'd'},           # alveolar stops
+    {'p', 'b'},           # bilabial stops
+    {'k', 'g'},           # velar stops
+    {'f', 'v'},           # labiodental fricatives
+    {'s', 'z'},           # alveolar fricatives
+    {'s.', 'z.'},         # retroflex fricatives
+    {'ɕ', 'ʃ', 'ʂ'},     # postalveolar/retroflex sibilants
+    {'tsh', 'dz'},        # affricates
+    {'n', 'ŋ'},           # nasals
+    {'l', 'r', 'ɹ'},      # liquids
+    {'t', 'tsh'},         # stop ~ affricate
+    {'f', 't'},           # common confusion in noisy env
+    {'x', 'h'},           # velar/glottal fricatives
+    {'ɑu', 'au', 'ɑo', 'ao'},  # diphthong variants
+    {'ou', 'uo'},         # vowel variants
+    {'i', 'i.'},          # apical vowel variant
+    {'a', 'ɑ'},           # open vowels
+    {'an', 'ɑn'},         # front nasal variants
+    {'f', 'kh'},          # 范/康 confusion in noisy env
+    {'f', 'x'},           # 范/欢 confusion
+    {'ts.', 'tɕh'},       # retroflex/palatal affricate confusion
+    {'ɑ', 'ɑu'},          # vowel truncation
+    {'ai', 'a'},          # diphthong simplification
+    {'aiɜ', 'ai', 'a'},   # diphthong variants
+    {'iɜ', 'i'},          # rhotacized vowel
+    {'əɜ', 'ə', 'e'},     # schwa variants
+]
+
+
+def _phoneme_sub_cost(a: str, b: str) -> float:
+    """Substitution cost: 0 if same, 0.3 if similar, 1.0 otherwise."""
+    if a == b:
+        return 0
+    for group in _SIMILAR_GROUPS:
+        if a in group and b in group:
+            return 0.3
+    return 1.0
+
+
+def _phoneme_edit_distance(seq1: list, seq2: list) -> float:
+    """Normalized edit distance with phoneme similarity (0=match, 1=different)."""
+    m, n = len(seq1), len(seq2)
+    if m == 0 or n == 0:
+        return 1.0
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+    for i in range(m + 1):
+        dp[i][0] = i
+    for j in range(n + 1):
+        dp[0][j] = j
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            cost = _phoneme_sub_cost(seq1[i - 1], seq2[j - 1])
+            dp[i][j] = min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost)
+    return dp[m][n] / max(m, n)
+
+
+def _find_keyword_in_ipa(text_ipa: list, keyword_ipa: list, threshold: float):
+    """Sliding window search for keyword in text IPA. Returns (matched, end_position)."""
+    kw_len = len(keyword_ipa)
+    if kw_len == 0 or len(text_ipa) < kw_len:
+        return False, -1
+    best_dist = float('inf')
+    best_end = -1
+    for i in range(len(text_ipa) - kw_len + 1):
+        window = text_ipa[i:i + kw_len]
+        dist = _phoneme_edit_distance(window, keyword_ipa)
+        if dist < best_dist:
+            best_dist = dist
+            best_end = i + kw_len
+    return best_dist <= threshold, best_end
+
+
+def _extract_after_keyword(text: str, keyword_text: str, end_pos: int) -> str:
+    """Extract text after the matched keyword using IPA end_pos to locate cut point.
+
+    end_pos is the IPA phoneme index where the keyword match ends.
+    We map this back to the original text by counting phoneme-producing
+    characters (CJK chars each produce ~3 phonemes, alpha chars ~1-2).
+    """
+    # Build a mapping: for each phoneme-producing character, how many IPA tokens it generates
+    segments = []
+    current = ''
+    current_is_cjk = None
+    for char in text:
+        is_cjk = '\u4e00' <= char <= '\u9fff'
+        is_alpha = char.isalpha()
+        if not is_cjk and not is_alpha:
+            continue  # skip punctuation/numbers for phoneme counting
+        if current_is_cjk is None:
+            current_is_cjk = is_cjk
+        if is_cjk != current_is_cjk:
+            if current.strip():
+                segments.append((current.strip(), current_is_cjk))
+            current = ''
+            current_is_cjk = is_cjk
+        current += char
+    if current.strip():
+        segments.append((current.strip(), current_is_cjk))
+
+    # Count IPA tokens per character to find the text position for end_pos
+    ipa_idx = 0
+    char_idx = 0  # index into original text (counting all chars)
+    phoneme_char_pos = 0  # index into phoneme-producing chars
+
+    for seg_text, is_cjk in segments:
+        lang = 'cmn' if is_cjk else 'en-us'
+        try:
+            ipa = _phonemize_safe(seg_text, lang)
+            ipa = _re.sub(r'[0-9˥˦˧˨˩¹²³⁴⁵]', '', ipa)
+            phones = [p for p in ipa.split() if p]
+        except Exception:
+            phones = list(seg_text)
+
+        seg_ipa_count = len(phones)
+        if ipa_idx + seg_ipa_count >= end_pos:
+            # end_pos falls within this segment
+            # Estimate character position within segment proportionally
+            offset_in_seg = end_pos - ipa_idx
+            chars_in_seg = len(seg_text)
+            # For CJK, each char ≈ equal IPA tokens; for alpha, approximate
+            if seg_ipa_count > 0:
+                cut_chars = round(offset_in_seg * chars_in_seg / seg_ipa_count)
+            else:
+                cut_chars = chars_in_seg
+            cut_chars = min(cut_chars, chars_in_seg)
+
+            # Find the actual position in original text
+            found = 0
+            for i, c in enumerate(text):
+                if '\u4e00' <= c <= '\u9fff' or c.isalpha():
+                    found += 1
+                if found >= phoneme_char_pos + cut_chars:
+                    cut_idx = i + 1
+                    remaining = text[cut_idx:]
+                    remaining = remaining.lstrip('，。！？、；：,.!?;: ')
+                    return remaining
+            return ''
+        ipa_idx += seg_ipa_count
+        phoneme_char_pos += len(seg_text)
+
+    return ''
+
+
 class AsrPlugin:
     """语音识别结果 (lyre ASR)"""
 
@@ -1260,6 +1695,12 @@ class AsrPlugin:
         self._ros2 = ros2
         self._topic = f"/{namespace}/asr/text"
         self._running = False
+
+        # KWS config (defaults: enabled, keyword=小范小范)
+        self._kws_enabled = True
+        self._kws_keyword = '小范小范'
+        self._kws_keyword_ipa = None  # lazy init on first ASR callback
+        self._kws_threshold = 0.3
 
         self._sub_node = Node("tianyi2_asr_sub", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._sub_node)
@@ -1274,6 +1715,31 @@ class AsrPlugin:
             "type": "sensor",
             "description": "天轶2.0 语音识别 (lyre ASR) — 实时语音转文字",
             "inputSchema": {"type": "object", "properties": {}},
+            "configSchema": {
+                "type": "object",
+                "properties": {
+                    "kws_enabled": {
+                        "type": "boolean",
+                        "description": "启用关键词唤醒（启用后仅包含唤醒词的语音会被转发）",
+                        "default": True,
+                        "scope": "shared",
+                    },
+                    "kws_keyword": {
+                        "type": "string",
+                        "description": "唤醒词文本（如'小范小范'、'hello robot'）",
+                        "default": "小范小范",
+                        "scope": "shared",
+                        "x-show-when": {"kws_enabled": "true"},
+                    },
+                    "kws_threshold": {
+                        "type": "number",
+                        "description": "音素匹配阈值（0-1，越小越严格，推荐0.3）",
+                        "default": 0.3,
+                        "scope": "shared",
+                        "x-show-when": {"kws_enabled": "true"},
+                    },
+                },
+            },
             "topic_out": [{"topic": self._topic, "format": "data/json"}],
         }
 
@@ -1293,19 +1759,86 @@ class AsrPlugin:
     def stop(self):
         self._running = False
 
+    def _ensure_keyword_ipa(self):
+        """Lazy-init keyword IPA on first use (phonemizer import is slow)."""
+        if self._kws_keyword_ipa is None and self._kws_keyword:
+            try:
+                self._kws_keyword_ipa = _text_to_ipa(self._kws_keyword)
+                print(f"[AsrPlugin] KWS keyword='{self._kws_keyword}' ipa={self._kws_keyword_ipa}")
+            except Exception as e:
+                print(f"[AsrPlugin] KWS ipa init failed: {e}")
+
+    def _kws_filter(self, text: str) -> str | None:
+        """Apply KWS filtering. Returns filtered text or None if rejected."""
+        if not self._kws_enabled:
+            return text
+        self._ensure_keyword_ipa()
+        if not self._kws_keyword_ipa:
+            return text
+        text_ipa = _text_to_ipa(text)
+        matched, end_pos = _find_keyword_in_ipa(text_ipa, self._kws_keyword_ipa, self._kws_threshold)
+        if not matched:
+            return None
+        remaining = _extract_after_keyword(text, self._kws_keyword, end_pos)
+        if not remaining.strip():
+            return None
+        return remaining
+
     def _on_asr(self, msg):
         if not self._running:
             return
+        text = msg.text
+        if not text or not text.strip():
+            return
+        print(f"[AsrPlugin] IN: {text!r}", flush=True)
+        text = self._kws_filter(text)
+        if text is None:
+            print(f"[AsrPlugin] KWS rejected", flush=True)
+            return
+        print(f"[AsrPlugin] OUT: {text!r}", flush=True)
         out = String()
-        out.data = json.dumps({"id": msg.id, "text": msg.text})
+        out.data = json.dumps({"id": msg.id, "text": text})
         self._pub.publish(out)
 
     def _on_asr_string(self, msg):
         if not self._running:
             return
-        self._pub.publish(msg)
+        try:
+            data = json.loads(msg.data)
+            text = data.get("text", "")
+        except (json.JSONDecodeError, AttributeError):
+            text = msg.data if hasattr(msg, 'data') else str(msg)
+            data = None
+        if not text or not text.strip():
+            return
+        print(f"[AsrPlugin] IN(str): {text!r}", flush=True)
+        filtered = self._kws_filter(text)
+        if filtered is None:
+            print(f"[AsrPlugin] KWS rejected", flush=True)
+            return
+        print(f"[AsrPlugin] OUT: {filtered!r}", flush=True)
+        if data is not None:
+            data["text"] = filtered
+            out = String()
+            out.data = json.dumps(data, ensure_ascii=False)
+            self._pub.publish(out)
+        else:
+            out = String()
+            out.data = filtered
+            self._pub.publish(out)
 
     def dispatch(self, action: str, args: dict) -> dict:
+        if action == "config":
+            if 'kws_enabled' in args:
+                self._kws_enabled = bool(args['kws_enabled'])
+            if 'kws_keyword' in args:
+                self._kws_keyword = args['kws_keyword']
+                self._kws_keyword_ipa = _text_to_ipa(args['kws_keyword']) if args['kws_keyword'] else None
+                print(f"[AsrPlugin] KWS keyword updated: '{self._kws_keyword}' ipa={self._kws_keyword_ipa}")
+            if 'kws_threshold' in args:
+                self._kws_threshold = float(args['kws_threshold'])
+            return {"status": "configured", "kws_enabled": self._kws_enabled,
+                    "kws_keyword": self._kws_keyword, "kws_threshold": self._kws_threshold}
         if action in ("start", "stop", "info"):
             return {"state": "running" if self._running else "idle",
                     "topic_out": [{"topic": self._topic, "format": "data/json"}]}
@@ -1676,9 +2209,9 @@ class HeadGesturePlugin:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["nod", "shake", "scan", "tilt", "reset", "stop"],
+                        "enum": ["nod", "shake", "scan", "tilt", "reset", "cancel"],
                         "default": "nod",
-                        "description": "头部动作，可选[nod, shake, scan, tilt, reset, stop]",
+                        "description": "头部动作，可选[nod, shake, scan, tilt, reset, cancel]",
                     },
                     "cycles": {
                         "type": "integer", "minimum": 1, "maximum": 5,
@@ -1726,13 +2259,14 @@ class HeadGesturePlugin:
                     },
                 },
                 "required": ["action"],
+                "x-completion": {
+                    "actions": ["scan", "shake"],
+                    "timeout": 30,
+                },
                 "x-action-params": {
-                    "nod": {"params": ["cycles", "nod_amplitude", "speed"], "description": "向下点头后回正，不经过抬头姿态"},
-                    "shake": {"params": ["cycles", "shake_amplitude", "speed"], "description": "在左右方向之间连续摇头后回正"},
-                    "scan": {"params": ["cycles", "scan_amplitude", "speed", "scan_hold"], "description": "依次观察左侧并停留、回中、观察右侧并停留、回中"},
                     "tilt": {"params": ["side", "tilt_amplitude", "speed", "hold"], "description": "向指定方向歪头、保持后回正"},
                     "reset": {"params": ["speed"], "description": "取消序列并将头部回正"},
-                    "stop": {"params": [], "description": "取消尚未发送的后续动作帧"},
+                    "cancel": {"params": [], "description": "取消尚未发送的后续动作帧"},
                 },
             },
         }
@@ -1767,8 +2301,8 @@ class HeadGesturePlugin:
                 "feedback_supported": True,
                 "feedback_topic": "/head/status",
             }
-        if action == "stop":
-            return {"state": "stopped", "cancelled": self._sequence.cancel()}
+        if action == "cancel":
+            return {"state": "cancelled", "cancelled": self._sequence.cancel()}
         if action == "reset":
             self._sequence.cancel()
             check = self._preflight()
@@ -1833,19 +2367,35 @@ class HeadGesturePlugin:
                     return
 
         baseline_seq, baseline = self._feedback_snapshot()
-        self._sequence.start(_worker)
+        # ACP: for long actions (scan, shake), return action_id and callback on done
+        action_id = None
+        on_done = None
+        if action in ("scan", "shake"):
+            from uuid import uuid4
+            action_id = f"head_gesture_{action}_{uuid4().hex[:8]}"
+
+            def on_done(cancelled):
+                if cancelled:
+                    _acp_notify(action_id, "cancelled", {"gesture": action}, "head_gesture")
+                else:
+                    _acp_notify(action_id, "completed", {"gesture": action, "cycles": cycles}, "head_gesture")
+
+        self._sequence.start(_worker, on_done=on_done)
         first_target = frames[0][:3]
         feedback = self._wait_for_head_feedback(
             first_target, baseline_seq, baseline)
         if feedback.get("state") == "error":
             self._sequence.cancel()
             return feedback
-        return {
+        result = {
             "state": "running", "gesture": action, "cycles": cycles,
             "amplitude": amplitude, "speed": speed,
             "feedback_verified": True,
             "feedback": feedback,
         }
+        if action_id:
+            result["action_id"] = action_id
+        return result
 
     def _on_head_status(self, msg):
         now = time.monotonic()
@@ -2096,6 +2646,7 @@ class ArmPlugin:
         self._pos_publisher = None
         self._ctrl_publisher = None
         self._feedback = _JointCommandFeedback("arm", "/arm/status")
+        self._sequence = _ActionSequence("ArmPlugin")
 
     def get_tool(self) -> dict:
         return {
@@ -2110,12 +2661,38 @@ class ArmPlugin:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["move_pos", "move_ctrl"],
+                    "action": {"type": "string", "enum": ["move_pos", "move_ctrl", "move_traj"],
                                "default": "move_pos",
                                "description": (
                                    "模式选择：抬手、弯肘、摆姿势、回零等普通操作选move_pos；"
-                                   "只有需要调节手臂保持力度或减少晃动时才选move_ctrl"
+                                   "只有需要调节手臂保持力度或减少晃动时才选move_ctrl；"
+                                   "连贯多段动作（如太极、舞蹈）选move_traj"
                                )},
+                    "waypoints": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "left_positions": {
+                                    "type": "array", "items": {"type": "number", "minimum": -170, "maximum": 170},
+                                    "minItems": 7, "maxItems": 7,
+                                    "description": "左臂7关节角度(度)，顺序[肩pitch,肩roll,肩yaw,肘pitch,腕yaw,腕pitch,腕roll]，缺失时继承上一个路径点"
+                                },
+                                "right_positions": {
+                                    "type": "array", "items": {"type": "number", "minimum": -170, "maximum": 170},
+                                    "minItems": 7, "maxItems": 7,
+                                    "description": "右臂7关节角度(度)，顺序同左臂，缺失时继承上一个路径点"
+                                },
+                                "time_from_start": {
+                                    "type": "number", "minimum": 0,
+                                    "description": "从轨迹开始到此点的秒数，必须递增"
+                                },
+                            },
+                            "required": ["time_from_start"],
+                        },
+                        "minItems": 2,
+                        "description": "轨迹路径点列表（≥2个），按time_from_start升序排列。每点可只指定left或right，缺失的一侧继承上一个路径点"
+                    },
                     "left_positions": {
                         "type": "array", "items": {"type": "number", "minimum": -170, "maximum": 170},
                         "minItems": 7, "maxItems": 7,
@@ -2131,8 +2708,11 @@ class ArmPlugin:
                     "speed": {"type": "number", "minimum": 0.2, "maximum": 1.5,
                               "default": 0.5,
                               "description": (
-                                  "仅move_pos使用：决定手臂移动到目标姿势时有多快。"
-                                  "范围[0.2,1.5]rad/s，默认0.5。move_ctrl不能用它来减速"
+                                  "关节角速度，可设置范围[0.2,1.5]rad/s，推荐默认值0.5。"
+                                  "move_pos：决定手臂移动到目标姿势有多快；常规动作用0.5，"
+                                  "想要更慢更稳可降到0.3左右，想要更快更利落可提到0.8左右。"
+                                  "move_traj：整条轨迹执行时关节移动的快慢，实际节奏由waypoints的"
+                                  "time_from_start控制。move_ctrl不使用此参数（不能靠它减速）"
                               )},
                     "kp": {"type": "array", "items": {"type": "number", "minimum": 10, "maximum": 200},
                            "minItems": 7, "maxItems": 7,
@@ -2165,6 +2745,19 @@ class ArmPlugin:
                                       "力度，KD决定减少晃动的力度。适用于手臂被负载压偏、到位后晃动，"
                                       "或已确认安全的轻推柔顺实验。它没有可设置的移动速度，同一角度在"
                                       "不同KP/KD下也可能停在不同位置；普通摆姿势或大幅移动请用move_pos"
+                                  )},
+                    "move_traj": {"params": ["waypoints", "speed"],
+                                  "description": (
+                                      "轨迹模式：一次下发完整路径点序列，驱动侧以50Hz线性插值连续下发"
+                                      "CmdSetMotorPosition，消除多段move_pos之间的LLM调度停顿。适合太极、"
+                                      "舞蹈、连贯手势等多段连续动作。参数格式："
+                                      "waypoints为数组(至少2个点，按time_from_start升序)，每个点包含："
+                                      "time_from_start(秒，从轨迹开始到此点的时间，必填且必须递增)、"
+                                      "left_positions/right_positions(7关节角度，单位度，两者可省略其一，"
+                                      "缺失的一侧自动继承上一个路径点；第一个点若缺失某侧则该侧默认全0)。"
+                                      "关节顺序为[肩pitch,肩roll,肩yaw,肘pitch,腕yaw,腕pitch,腕roll]，"
+                                      "负pitch=向前。speed为关节角速度[0.2,1.5]rad/s，推荐0.5。"
+                                      "轨迹总时长>3秒时异步执行并返回action_id，≤3秒同步返回completed"
                                   )},
                 },
             },
@@ -2209,6 +2802,8 @@ class ArmPlugin:
             result["feedback_verified"] = True
             result["feedback"] = feedback
             return result
+        elif action == "move_traj":
+            return self._handle_move_traj(args)
         elif action == "move_ctrl":
             poses = self._requested_poses(args)
             kp = args.get("kp", [self._DEFAULT_KP] * 7)
@@ -2410,6 +3005,132 @@ class ArmPlugin:
         except Exception as e:
             return {"error": str(e)}
 
+    def _handle_move_traj(self, args: dict) -> dict:
+        waypoints_raw = args.get("waypoints")
+        if waypoints_raw is None:
+            return {"state": "error", "error": "waypoints is required for move_traj and must have at least 2 points",
+                    "code": "invalid_arm_waypoints"}
+        if isinstance(waypoints_raw, str):
+            try:
+                waypoints_raw = json.loads(waypoints_raw)
+            except json.JSONDecodeError as exc:
+                return {"state": "error", "error": f"waypoints must be valid JSON: {exc}",
+                        "code": "invalid_arm_waypoints"}
+        if not isinstance(waypoints_raw, list) or len(waypoints_raw) < 2:
+            return {"state": "error", "error": "waypoints is required for move_traj and must have at least 2 points",
+                    "code": "invalid_arm_waypoints"}
+        speed = args.get("speed", 0.5)
+        try:
+            speed = float(speed)
+        except (TypeError, ValueError):
+            return {"state": "error", "error": "speed must be numeric"}
+        if speed < 0.2 or speed > 1.5:
+            return {"state": "error", "error": "speed must be in [0.2, 1.5] rad/s"}
+        prev_left = None
+        prev_right = None
+        resolved = []
+        for i, wp in enumerate(waypoints_raw):
+            if not isinstance(wp, dict):
+                return {"state": "error", "error": f"waypoint {i} must be an object"}
+            tfs = wp.get("time_from_start")
+            if tfs is None:
+                return {"state": "error", "error": f"waypoint {i} missing time_from_start"}
+            try:
+                tfs = float(tfs)
+            except (TypeError, ValueError):
+                return {"state": "error", "error": f"waypoint {i} time_from_start must be numeric"}
+            left = wp.get("left_positions")
+            right = wp.get("right_positions")
+            if left is not None:
+                left, err = self._decode_array_argument(left, "left_positions")
+                if err:
+                    return err
+                if not isinstance(left, (list, tuple)) or len(left) != 7:
+                    return {"state": "error", "error": f"waypoint {i} left_positions must have 7 values"}
+                left = [float(v) for v in left]
+                prev_left = left
+            else:
+                left = prev_left
+            if right is not None:
+                right, err = self._decode_array_argument(right, "right_positions")
+                if err:
+                    return err
+                if not isinstance(right, (list, tuple)) or len(right) != 7:
+                    return {"state": "error", "error": f"waypoint {i} right_positions must have 7 values"}
+                right = [float(v) for v in right]
+                prev_right = right
+            else:
+                right = prev_right
+            if left is None and right is None:
+                return {"state": "error", "error": f"waypoint {i} has no arm target and no prior point to inherit"}
+            if left is None:
+                left = [0.0] * 7
+            if right is None:
+                right = [0.0] * 7
+            poses = {"left": left, "right": right}
+            violations = self._pose_violations(poses)
+            if violations:
+                return {"state": "error", "error": f"waypoint {i} pose exceeds URDF joint limits",
+                        "violations": violations}
+            resolved.append((tfs, left, right))
+        if len(resolved) < 2:
+            return {"state": "error", "error": "need at least 2 valid waypoints"}
+        for i in range(1, len(resolved)):
+            if resolved[i][0] <= resolved[i - 1][0]:
+                return {"state": "error", "error": f"waypoint {i} time_from_start must be greater than previous"}
+        motor_ids = self._motor_ids()
+        check = self._feedback.preflight(self._pos_publisher, motor_ids)
+        if check is not None:
+            return check
+        action_id = f"arm_traj_{uuid4().hex[:8]}"
+        duration = resolved[-1][0]
+        if duration <= 3.0:
+            cancel_event = threading.Event()
+            self._run_trajectory(resolved, speed, cancel_event)
+            return {
+                "state": "completed",
+                "action_id": action_id,
+                "waypoints": len(resolved),
+                "duration_s": duration,
+            }
+        else:
+            def _worker(cancel_event):
+                self._run_trajectory(resolved, speed, cancel_event)
+            self._sequence.start(_worker)
+            return {
+                "state": "moving",
+                "action_id": action_id,
+                "waypoints": len(resolved),
+                "duration_s": duration,
+                "async": True,
+            }
+
+    def _run_trajectory(self, resolved: list, speed: float, cancel_event: threading.Event):
+        rate = 0.02
+        total_time = resolved[-1][0]
+        t = 0.0
+        while t < total_time:
+            if cancel_event.is_set():
+                break
+            idx = 0
+            for i in range(len(resolved) - 1):
+                if resolved[i][0] <= t <= resolved[i + 1][0]:
+                    idx = i
+                    break
+            else:
+                idx = len(resolved) - 2
+            t0, left0, right0 = resolved[idx]
+            t1, left1, right1 = resolved[idx + 1]
+            dt = t1 - t0
+            alpha = (t - t0) / dt if dt > 0 else 0.0
+            alpha = max(0.0, min(1.0, alpha))
+            interp_left = [left0[j] + (left1[j] - left0[j]) * alpha for j in range(7)]
+            interp_right = [right0[j] + (right1[j] - right0[j]) * alpha for j in range(7)]
+            poses = {"left": interp_left, "right": interp_right}
+            self._send_pos(poses, speed)
+            time.sleep(rate)
+            t += rate
+
     def _send_ctrl(self, poses: dict[str, list[float]], kp: list, kd: list) -> dict:
         if not self._ctrl_publisher:
             return {"error": "publisher not initialized"}
@@ -2511,10 +3232,10 @@ class ArmGesturePlugin:
                         "type": "string",
                         "enum": [
                             "salute", "welcome", "raise", "shake_hands",
-                            "high_five", "reset", "stop",
+                            "high_five", "reset", "cancel",
                         ],
                         "default": "welcome",
-                        "description": "手臂动作，可选[salute, welcome, raise, shake_hands, high_five, reset, stop]",
+                        "description": "手臂动作，可选[salute, welcome, raise, shake_hands, high_five, reset, cancel]",
                     },
                     "side": {
                         "type": "string", "enum": ["left", "right", "both"],
@@ -2538,6 +3259,10 @@ class ArmGesturePlugin:
                     },
                 },
                 "required": ["action"],
+                "x-completion": {
+                    "actions": ["salute", "welcome", "shake_hands"],
+                    "timeout": 30,
+                },
                 "x-action-params": {
                     "salute": {"params": ["salute_side", "speed"], "description": "抬起小臂、将手靠近额侧、停留后回正"},
                     "welcome": {"params": ["side", "cycles", "speed"], "description": "在身体侧上方抬起手掌并左右摆动后回正"},
@@ -2545,7 +3270,7 @@ class ArmGesturePlugin:
                     "shake_hands": {"params": ["side", "cycles", "speed"], "description": "向前伸手并轻柔上下摆动，做出握手动作"},
                     "high_five": {"params": ["side", "speed"], "description": "将手掌伸到身体前方并保持在肩部附近，做出击掌等待姿势"},
                     "reset": {"params": ["side", "speed"], "description": "取消序列并回到中性姿态"},
-                    "stop": {"params": [], "description": "取消尚未发送的后续动作帧"},
+                    "cancel": {"params": [], "description": "取消尚未发送的后续动作帧"},
                 },
             },
         }
@@ -2580,8 +3305,8 @@ class ArmGesturePlugin:
                 "feedback_supported": True,
                 "feedback_topic": "/arm/status",
             }
-        if action == "stop":
-            return {"state": "stopped", "cancelled": self._sequence.cancel()}
+        if action == "cancel":
+            return {"state": "cancelled", "cancelled": self._sequence.cancel()}
         if action == "salute":
             # The salute card exposes a dedicated left/right-only selector.
             # Keep accepting the old `side` argument for direct MCP callers.
@@ -2683,18 +3408,34 @@ class ArmGesturePlugin:
                     return
 
         baseline_seq, baseline = self._feedback_snapshot(side)
-        self._sequence.start(_worker)
+        # ACP: for long gestures, return action_id and callback on done
+        action_id = None
+        on_done = None
+        if action in ("salute", "welcome", "shake_hands"):
+            from uuid import uuid4
+            action_id = f"arm_gesture_{action}_{uuid4().hex[:8]}"
+
+            def on_done(cancelled):
+                if cancelled:
+                    _acp_notify(action_id, "cancelled", {"gesture": action, "side": side}, "arm_gesture")
+                else:
+                    _acp_notify(action_id, "completed", {"gesture": action, "side": side}, "arm_gesture")
+
+        self._sequence.start(_worker, on_done=on_done)
         feedback = self._wait_for_arm_feedback(
             side, frames[0][0], baseline_seq, baseline)
         if feedback.get("state") == "error":
             self._sequence.cancel()
             return feedback
-        return {
+        result = {
             "state": "running", "gesture": action, "side": side,
             "cycles": cycles, "speed": speed,
             "feedback_verified": True,
             "feedback": feedback,
         }
+        if action_id:
+            result["action_id"] = action_id
+        return result
 
     def _on_arm_status(self, msg):
         now = time.monotonic()
@@ -3413,6 +4154,15 @@ class TtsPlugin:
         self._stop_client = None
         self._pause_client = None
         self._resume_client = None
+        # 取消信号：interrupt 时 set，通知 _speak_segments 线程停止
+        self._cancel_event: threading.Event | None = None
+        # ACP: PlayEvent 订阅，用于判断播放真正完成
+        self._play_event_sub = None
+        self._play_progress_sub = None
+        self._pending_play: dict[str, threading.Event] = {}  # sid → Event
+        self._pending_play_status: dict[str, int] = {}  # sid → event_code
+        self._pending_play_duration: dict[str, float] = {}  # sid → total duration (from progress)
+        self._play_event_buffer: dict[str, int] = {}  # 缓存最近的 PlayEvent（防竞态）
 
     def get_tool(self) -> dict:
         return {
@@ -3422,17 +4172,21 @@ class TtsPlugin:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["speak", "stop", "pause", "resume"],
+                    "action": {"type": "string", "enum": ["speak", "interrupt", "pause", "resume"],
                                "description": "控制动作"},
                     "text": {"type": "string", "description": "要播放的文本"},
                     "force": {"type": "boolean", "description": "是否强制播放(打断当前播放)", "default": False},
                 },
                 "required": ["action"],
+                "x-completion": {"actions": ["speak"], "timeout": 180},
                 "x-action-params": {
                     "speak": {"params": ["text", "force"], "description": "合成并播放文本"},
-                    "stop": {"params": [], "description": "停止播放"},
-                    "pause": {"params": [], "description": "暂停播放"},
-                    "resume": {"params": [], "description": "恢复播放"},
+                    "interrupt": {"params": [], "description": "立即停止播放并丢弃剩余内容，无需再调 pause"},
+                    "pause": {"params": [], "description": "暂停播放（可用 resume 恢复，不要与 interrupt 同时使用）"},
+                    "resume": {"params": [], "description": "恢复被 pause 暂停的播放"},
+                },
+                "x-hooks": {
+                    "on_interrupt_speak": {"action": "interrupt"},
                 },
             },
         }
@@ -3440,13 +4194,124 @@ class TtsPlugin:
     def start(self):
         try:
             from lyre_msgs.srv import PlayText, PlayStop, PlayPause, PlayResume
+            from lyre_msgs.msg import PlayEvent, PlayProgress
             self._play_client = self._srv_node.create_client(PlayText, "/audio_play/play_text")
             self._stop_client = self._srv_node.create_client(PlayStop, "/audio_play/stop")
             self._pause_client = self._srv_node.create_client(PlayPause, "/audio_play/pause")
             self._resume_client = self._srv_node.create_client(PlayResume, "/audio_play/resume")
-            print("[TtsPlugin] service clients created")
+            # 订阅播放事件 topic，用于判断播放真正完成
+            self._play_event_sub = self._srv_node.create_subscription(
+                PlayEvent, "/audio_play/event", self._on_play_event, 10)
+            # 订阅播放进度 topic，获取精确总时长用于超时计算
+            self._play_progress_sub = self._srv_node.create_subscription(
+                PlayProgress, "/audio_play/progress", self._on_play_progress, 10)
+            print("[TtsPlugin] service clients + event/progress subscriptions created")
         except ImportError as e:
             print(f"[TtsPlugin] WARNING: msg import failed ({e})")
+            return
+
+        # Health check: verify PlayEvent pipeline is working
+        self._startup_error = self._lyre_health_check()
+
+    def _lyre_health_check(self) -> str | None:
+        """Call play_text and verify PlayEvent arrives. Returns error message or None."""
+        import subprocess as _sp
+        import time as _time
+
+        for attempt in range(2):
+            if attempt > 0:
+                # Restart lyre via nsenter on second attempt
+                print("[TtsPlugin] health check failed, restarting lyre...", flush=True)
+                try:
+                    _sp.run(["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--",
+                             "systemctl", "restart", "lyre"],
+                            capture_output=True, timeout=15)
+                    _time.sleep(5)
+                except Exception as e:
+                    print(f"[TtsPlugin] lyre restart failed: {e}", flush=True)
+
+            # Wait for service to be available (poll without spinning — executor thread handles it)
+            service_ready = False
+            deadline = _time.time() + 5
+            while _time.time() < deadline:
+                if self._play_client.service_is_ready():
+                    service_ready = True
+                    break
+                _time.sleep(0.2)
+            if not service_ready:
+                print(f"[TtsPlugin] health check attempt {attempt+1}: play_text service not available", flush=True)
+                continue
+
+            # Send a silent test (single dot — minimal TTS)
+            from lyre_msgs.srv import PlayText
+            req = PlayText.Request()
+            req.text = "."
+            req.force = True
+            future = self._play_client.call_async(req)
+
+            # Wait for response (max 3s) — executor spin thread delivers it
+            deadline = _time.time() + 3
+            while not future.done() and _time.time() < deadline:
+                _time.sleep(0.1)
+
+            if not future.done():
+                print(f"[TtsPlugin] health check attempt {attempt+1}: play_text call timeout", flush=True)
+                continue
+
+            resp = future.result()
+            if resp is None or resp.code != 0:
+                print(f"[TtsPlugin] health check attempt {attempt+1}: play_text returned error", flush=True)
+                continue
+
+            sid = resp.sid
+            # Wait for PlayEvent with this sid (3s timeout)
+            # The executor spin thread will call _on_play_event which populates _play_event_buffer
+            deadline = _time.time() + 3
+            while _time.time() < deadline:
+                if sid in self._play_event_buffer:
+                    break
+                _time.sleep(0.1)
+
+            if sid in self._play_event_buffer:
+                # Cleanup test sid from buffers
+                self._play_event_buffer.pop(sid, None)
+                self._pending_play.pop(sid, None)
+                self._pending_play_status.pop(sid, None)
+                self._pending_play_duration.pop(sid, None)
+                print(f"[TtsPlugin] health check passed (attempt {attempt+1})", flush=True)
+                return None  # success
+            else:
+                print(f"[TtsPlugin] health check attempt {attempt+1}: PlayEvent not received for sid={sid}", flush=True)
+
+        return "Lyre TTS PlayEvent 链路异常：播放成功但无法收到完成事件。已尝试重启 lyre 仍未恢复，请检查 lyre 服务状态。"
+
+    # PlayEvent event codes
+    _EVENT_NAMES = {0: "STARTED", 1: "COMPLETED", 2: "STOPPED", 3: "CANCELLED", 4: "FAILED"}
+
+    def _on_play_event(self, msg):
+        """PlayEvent callback: 播放完成/停止/失败时解锁对应的 pending."""
+        # event: 0=STARTED, 1=COMPLETED, 2=STOPPED, 3=CANCELLED, 4=FAILED
+        sid = msg.sid
+        event_code = msg.event
+        if event_code >= 1:
+            # 缓存事件（防止 _wait_cb 还没注册 pending 时 miss）
+            self._play_event_buffer[sid] = event_code
+            # 如果已注册 pending，直接解锁
+            if sid in self._pending_play:
+                self._pending_play_status[sid] = event_code
+                self._pending_play[sid].set()
+            event_name = self._EVENT_NAMES.get(event_code, f"UNKNOWN({event_code})")
+            print(f"[TtsPlugin] PlayEvent: sid={sid} {event_name}")
+
+    def _on_play_progress(self, msg):
+        """PlayProgress callback: 获取播放总时长，用于精确超时计算。"""
+        sid = msg.sid
+        duration = msg.duration
+        if sid and duration > 0 and sid in self._pending_play:
+            # 只更新一次（取第一次收到的 duration）
+            if sid not in self._pending_play_duration:
+                self._pending_play_duration[sid] = duration
+                print(f"[TtsPlugin] PlayProgress: sid={sid} duration={duration:.1f}s")
 
     def stop(self):
         pass
@@ -3458,13 +4323,19 @@ class TtsPlugin:
             if not text:
                 return {"error": "text is required"}
             return self._speak(text, force)
-        elif action == "stop":
-            return self._call_empty_service(self._stop_client, "stop")
+        elif action == "interrupt":
+            # 先通知后台线程停止循环
+            ce = self._cancel_event
+            if ce:
+                ce.set()
+            return self._call_empty_service(self._stop_client, "interrupt")
         elif action == "pause":
             return self._call_empty_service(self._pause_client, "pause")
         elif action == "resume":
             return self._call_empty_service(self._resume_client, "resume")
         elif action in ("start", "info"):
+            if hasattr(self, '_startup_error') and self._startup_error:
+                return {"state": "error", "message": self._startup_error}
             return {"state": "ready"}
         return {"error": f"unknown action: {action}"}
 
@@ -3472,22 +4343,213 @@ class TtsPlugin:
         if not self._play_client:
             return {"error": "service client not initialized"}
         try:
-            from lyre_msgs.srv import PlayText
-            req = PlayText.Request()
-            req.text = text
-            req.force = force
-            req.last = True
-            future = self._play_client.call_async(req)
-            # Non-blocking, just return immediately
-            return {"state": "speaking", "text": text[:50]}
+            import uuid as _uuid
+            action_id = f"tts-{_uuid.uuid4().hex[:8]}"
+
+            # 分段：超过 280 字按标点切分，避免超长文本 PlayEvent 丢失
+            segments = self._split_text(text, max_chars=280)
+
+            # 取消旧的播放线程（如果有）— 同时对 lyre 发 stop
+            old_ce = self._cancel_event
+            if old_ce and not old_ce.is_set():
+                old_ce.set()
+                # 停止 lyre 当前播放，确保新请求能拿到 sid
+                if self._stop_client:
+                    try:
+                        req = type(self._stop_client.srv_type.Request)()
+                        self._stop_client.call_async(req)
+                    except Exception:
+                        pass
+            cancel_event = threading.Event()
+            self._cancel_event = cancel_event
+
+            # Background thread: 逐段播放, 全部完成后 ACP callback
+            threading.Thread(
+                target=self._speak_segments,
+                args=(segments, force, action_id, text, cancel_event),
+                daemon=True,
+            ).start()
+            return {"state": "speaking", "action_id": action_id, "text": text[:50],
+                    "segments": len(segments)}
         except Exception as e:
             return {"error": str(e)}
+
+    @staticmethod
+    def _split_text(text: str, max_chars: int = 280) -> list[str]:
+        """按标点分段，每段不超过 max_chars 字。"""
+        import re as _re
+        sentences = _re.split(r'(?<=[。！？；\n])', text)
+        segments = []
+        current = ""
+        for sent in sentences:
+            if not sent:
+                continue
+            if len(current) + len(sent) > max_chars and current:
+                segments.append(current)
+                current = sent
+            else:
+                current += sent
+        if current:
+            segments.append(current)
+        return segments if segments else [text]
+
+    def _speak_segments(self, segments: list, force: bool, action_id: str, full_text: str, cancel_event: threading.Event):
+        """顺序播放多段文本，全部完成后 ACP callback。支持 cancel_event 打断。"""
+        import time as _t
+        from lyre_msgs.srv import PlayText
+
+        overall_status = "completed"
+        sid = None  # 记录最后一个成功的 sid（用于 ACP callback）
+
+        for i, seg_text in enumerate(segments):
+            # 每段开始前检查取消
+            if cancel_event.is_set():
+                overall_status = "cancelled"
+                print(f"[TtsPlugin] cancelled before seg {i+1}/{len(segments)}")
+                break
+
+            is_last = (i == len(segments) - 1)
+            # 发送 PlayText service — 第一段用调用方指定的 force，后续段不 force
+            req = PlayText.Request()
+            req.text = seg_text
+            req.force = force if i == 0 else False
+            req.last = is_last
+            future = self._play_client.call_async(req)
+
+            # Phase 1: 等 service response（获取 sid）
+            timeout_service = 10.0
+            start = _t.time()
+            while not future.done() and _t.time() - start < timeout_service:
+                if cancel_event.is_set():
+                    break
+                _t.sleep(0.1)
+
+            if cancel_event.is_set():
+                overall_status = "cancelled"
+                print(f"[TtsPlugin] cancelled during service wait seg {i+1}/{len(segments)}")
+                break
+
+            seg_sid = None
+            if future.done():
+                result = future.result()
+                if result:
+                    seg_sid = getattr(result, 'sid', None)
+            if seg_sid:
+                sid = seg_sid
+
+            # Phase 2: 等 PlayEvent
+            if seg_sid:
+                buffered = self._play_event_buffer.pop(seg_sid, None)
+                if buffered is not None:
+                    # 被 interrupt 停止的情况
+                    if buffered >= 2 and cancel_event.is_set():
+                        overall_status = "cancelled"
+                        print(f"[TtsPlugin] cancelled (buffered STOPPED/CANCELLED) seg {i+1}/{len(segments)}")
+                        self._pending_play_duration.pop(seg_sid, None)
+                        break
+                    seg_status = "completed" if buffered == 1 else "error"
+                    print(f"[TtsPlugin] seg {i+1}/{len(segments)} from buffer: sid={seg_sid} event={buffered}")
+                else:
+                    ev = threading.Event()
+                    self._pending_play[seg_sid] = ev
+                    _t.sleep(0.3)
+                    reported_duration = self._pending_play_duration.get(seg_sid)
+                    if reported_duration and reported_duration > 0:
+                        play_timeout = reported_duration + 8.0
+                    else:
+                        # 更宽松: 2.5字/秒 + 10s buffer
+                        play_timeout = len(seg_text) / 2.5 + 10.0
+                    # 分段等待，每 0.5s 检查一次 cancel
+                    waited = 0.0
+                    timed_out = True
+                    while waited < play_timeout:
+                        if cancel_event.is_set():
+                            break
+                        chunk = min(0.5, play_timeout - waited)
+                        if ev.wait(timeout=chunk):
+                            timed_out = False
+                            break
+                        waited += chunk
+
+                    if cancel_event.is_set():
+                        overall_status = "cancelled"
+                        self._pending_play.pop(seg_sid, None)
+                        self._pending_play_status.pop(seg_sid, None)
+                        self._pending_play_duration.pop(seg_sid, None)
+                        self._play_event_buffer.pop(seg_sid, None)
+                        print(f"[TtsPlugin] cancelled during PlayEvent wait seg {i+1}/{len(segments)}")
+                        break
+                    elif timed_out:
+                        seg_status = "error"
+                        print(f"[TtsPlugin] PlayEvent timeout: seg {i+1}/{len(segments)} sid={seg_sid}, waited {play_timeout:.0f}s (duration={reported_duration})")
+                    else:
+                        event_code = self._pending_play_status.get(seg_sid, 1)
+                        # STOPPED(2) 或 CANCELLED(3) + cancel_event → 被打断
+                        if event_code >= 2 and cancel_event.is_set():
+                            overall_status = "cancelled"
+                            self._pending_play.pop(seg_sid, None)
+                            self._pending_play_status.pop(seg_sid, None)
+                            self._pending_play_duration.pop(seg_sid, None)
+                            self._play_event_buffer.pop(seg_sid, None)
+                            print(f"[TtsPlugin] cancelled (PlayEvent STOPPED) seg {i+1}/{len(segments)}")
+                            break
+                        # event_code: 1=COMPLETED, 2=STOPPED (也算完成), 3=CANCELLED, 4=FAILED
+                        seg_status = "completed" if event_code <= 2 else "error"
+                        if event_code > 2:
+                            event_name = self._EVENT_NAMES.get(event_code, f"UNKNOWN({event_code})")
+                            print(f"[TtsPlugin] seg {i+1}/{len(segments)} failed: {event_name} (code={event_code})")
+                        elif event_code == 2:
+                            print(f"[TtsPlugin] seg {i+1}/{len(segments)} STOPPED (treated as completed)")
+                    self._pending_play.pop(seg_sid, None)
+                    self._pending_play_status.pop(seg_sid, None)
+                self._pending_play_duration.pop(seg_sid, None)
+                self._play_event_buffer.pop(seg_sid, None)
+
+                if seg_status == "error" and not is_last:
+                    # 某段 error 但还有后续段，继续播下一段
+                    print(f"[TtsPlugin] seg {i+1} error, continuing to next segment")
+                    continue
+                elif seg_status == "error" and is_last:
+                    overall_status = "error"
+            elif not seg_sid:
+                # 没拿到 sid，fallback 按字数估算（但也要检查 cancel）
+                fallback_s = len(seg_text) / 2.5 + 5.0
+                waited = 0.0
+                while waited < fallback_s:
+                    if cancel_event.is_set():
+                        overall_status = "cancelled"
+                        break
+                    _t.sleep(min(0.5, fallback_s - waited))
+                    waited += 0.5
+                if cancel_event.is_set() and overall_status != "cancelled":
+                    overall_status = "cancelled"
+                if overall_status == "cancelled":
+                    print(f"[TtsPlugin] cancelled during fallback wait seg {i+1}/{len(segments)}")
+                    break
+                print(f"[TtsPlugin] no sid from service seg {i+1}, fallback sleep {fallback_s:.0f}s")
+
+        # ACP callback
+        try:
+            import urllib.request, ssl, json as _json, os as _os
+            url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            p = _json.dumps({"action_id": action_id, "status": overall_status,
+                             "result": {"action": "speak", "sid": sid or "unknown",
+                                        "segments": len(segments)}}).encode()
+            r = urllib.request.Request(f"{url}/api/acp/complete", data=p,
+                                      headers={"Content-Type": "application/json"}, method="POST")
+            urllib.request.urlopen(r, timeout=5, context=ctx)
+            print(f"[TtsPlugin] ACP {overall_status}: {action_id} ({len(segments)} segs, {len(full_text)} chars)")
+        except Exception as e:
+            print(f"[TtsPlugin] ACP callback failed: {e}")
 
     def _call_empty_service(self, client, action_name: str) -> dict:
         if not client:
             return {"error": f"{action_name} service client not initialized"}
         try:
-            req = type(client.srv_type.Request)()
+            req = client.srv_type.Request()
             client.call_async(req)
             return {"state": action_name}
         except Exception as e:
@@ -3561,7 +4623,7 @@ class VoicePlayActuatorPlugin:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["play_file", "play_url", "play_text", "stop", "pause", "resume"],
+                        "enum": ["play_file", "play_url", "play_text", "interrupt", "pause", "resume"],
                         "description": "控制模式",
                     },
                     "path": {"type": "string", "description": "本地音频文件绝对路径(play_file)"},
@@ -3570,11 +4632,15 @@ class VoicePlayActuatorPlugin:
                     "force": {"type": "boolean", "description": "强制播放(停止当前任务立即播放,可选)"},
                 },
                 "required": ["action"],
+                "x-completion": {
+                    "actions": ["play_text", "play_file", "play_url"],
+                    "timeout": 60
+                },
                 "x-action-params": {
                     "play_file": {"params": ["path", "force"], "description": "播放本地音频文件"},
                     "play_url":  {"params": ["url", "force"],  "description": "播放远程URL音频"},
                     "play_text": {"params": ["text", "force"], "description": "TTS合成并播放文本"},
-                    "stop":      {"params": [],                 "description": "停止播放(不可恢复)"},
+                    "interrupt":  {"params": [],                 "description": "中止播放(不可恢复)"},
                     "pause":     {"params": [],                 "description": "暂停播放(可恢复)"},
                     "resume":    {"params": [],                 "description": "恢复暂停的播放"},
                 },
@@ -3588,7 +4654,7 @@ class VoicePlayActuatorPlugin:
                 "play_file": ("/audio_play/play_file", PlayFile),
                 "play_url":  ("/audio_play/play_url",  PlayUrl),
                 "play_text": ("/audio_play/play_text", PlayText),
-                "stop":      ("/audio_play/stop",      PlayStop),
+                "interrupt":  ("/audio_play/stop",      PlayStop),
                 "pause":     ("/audio_play/pause",     PlayPause),
                 "resume":    ("/audio_play/resume",   PlayResume),
             }
@@ -3659,12 +4725,61 @@ class VoicePlayActuatorPlugin:
 
         try:
             future = client.call_async(req)
-            # 等待 service 完成(3s 超时,本地调用,5s 太长)
-            rclpy.spin_until_future_complete(self._srv_node, future, timeout_sec=3.0)
+            # play_file/play_url/play_text: 立即返回 action_id，后台等待完成后回调
+            if action in ("play_file", "play_url", "play_text"):
+                import uuid as _uuid
+                action_id = f"voice-{_uuid.uuid4().hex[:8]}"
+                # 后台线程等待 service response 后回调 Agent Core
+                def _wait_and_callback(fut, aid, act):
+                    try:
+                        timeout = 60.0
+                        start = time.time()
+                        while not fut.done() and time.time() - start < timeout:
+                            time.sleep(0.1)
+                        if fut.done():
+                            result = fut.result()
+                            code = int(getattr(result, "code", 0)) if result else -1
+                            status = "completed" if code == 0 else "error"
+                        else:
+                            status = "completed"  # timeout 也视为播完
+                    except Exception:
+                        status = "error"
+                    # ACP callback
+                    try:
+                        import urllib.request as _urllib
+                        import ssl as _ssl
+                        import os as _os
+                        agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+                        ctx = _ssl.create_default_context()
+                        ctx.check_hostname = False
+                        ctx.verify_mode = _ssl.CERT_NONE
+                        payload = json.dumps({"action_id": aid, "status": status,
+                                              "result": {"action": act}}).encode()
+                        _req = _urllib.Request(f"{agent_core_url}/api/acp/complete",
+                                              data=payload, headers={"Content-Type": "application/json"},
+                                              method="POST")
+                        _urllib.urlopen(_req, timeout=3, context=ctx)
+                        print(f"[VoicePlay] ACP complete: {aid} ({status})")
+                    except Exception as e:
+                        print(f"[VoicePlay] ACP callback failed: {e}")
+                threading.Thread(target=_wait_and_callback,
+                                 args=(future, action_id, action), daemon=True).start()
+                return {
+                    "ok": True, "code": 0,
+                    "message": "submitted",
+                    "action_id": action_id,
+                    "action": action,
+                    "timestamp_ms": int(time.time() * 1000),
+                }
+            # interrupt/pause/resume: 短超时等待确认
+            timeout = 3.0
+            start = time.time()
+            while not future.done() and time.time() - start < timeout:
+                time.sleep(0.05)
             result = future.result()
             if result is None:
                 return {"ok": False, "code": "CALL_FAILED",
-                        "message": f"{action} service call returned empty (timeout 3s)",
+                        "message": f"{action} service call returned empty (timeout {timeout:.0f}s)",
                         "action": action, "timestamp_ms": int(time.time() * 1000)}
             code = int(getattr(result, "code", 0))
             return {
@@ -3685,12 +4800,18 @@ class VoicePlayActuatorPlugin:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class NavPlugin:
-    """底盘导航控制 — 自主导航/遥控/旋转/回桩"""
+    """底盘导航控制 — 自主导航/遥控/旋转"""
+
+    _ACP_ACTIONS = frozenset(("move_to", "rotate", "rotate_to"))
+    _POLL_INTERVAL = 1.0
+    _STALL_TIMEOUT = 60.0
 
     def __init__(self, plugin_config: dict, namespace: str, ros2, slamtec_client):
         self._ns = namespace
         self._ros2 = ros2
         self._slamtec = slamtec_client
+        self._poll_lock = threading.Lock()
+        self._active_poll: str | None = None
 
         # cmd_vel publisher for direct velocity control (domain 0)
         self._vel_node = Node("tianyi2_nav_vel", context=ros2.ctx_tianyi)
@@ -3701,12 +4822,12 @@ class NavPlugin:
         return {
             "name": "nav",
             "type": "actuator",
-            "description": "天轶2.0 底盘导航 — 自主导航到目标点/方向遥控/旋转/回桩充电 (Slamtec轮式底盘)",
+            "description": "天轶2.0 底盘导航 — 自主导航到目标点/方向遥控/旋转 (Slamtec轮式底盘)",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string",
-                               "enum": ["move_to", "move_by", "rotate", "rotate_to", "go_home", "stop", "get_pose"],
+                               "enum": ["move_to", "move_by", "rotate", "rotate_to", "cancel", "get_pose"],
                                "description": "导航动作"},
                     "x": {"type": "number", "description": "目标x坐标(米)"},
                     "y": {"type": "number", "description": "目标y坐标(米)"},
@@ -3720,21 +4841,26 @@ class NavPlugin:
                     "vyaw": {"type": "number", "description": "旋转速度(rad/s), 正=逆时针"},
                 },
                 "required": ["action"],
+                "x-completion": {
+                    "actions": ["move_to", "rotate", "rotate_to"],
+                    "timeout": 180,
+                },
                 "x-action-params": {
                     "move_to": {"params": ["x", "y", "speed"],
-                                "description": "自主导航到目标点(带避障)"},
+                                "description": "自主导航到目标点(带避障)，系统自动等待到达"},
                     "move_by": {"params": ["direction", "speed"],
                                 "description": "方向遥控移动(不避障, 持续500ms)"},
                     "rotate": {"params": ["angle"],
-                               "description": "原地旋转指定角度(度)"},
+                               "description": "原地旋转指定角度(度)，系统自动等待完成"},
                     "rotate_to": {"params": ["angle"],
-                                  "description": "原地旋转到绝对角度(度)"},
-                    "go_home": {"params": [],
-                                "description": "自主导航回充电桩"},
-                    "stop": {"params": [],
-                             "description": "停止当前导航动作"},
+                                  "description": "原地旋转到绝对角度(度)，系统自动等待完成"},
+                    "cancel": {"params": [],
+                             "description": "取消当前导航动作"},
                     "get_pose": {"params": [],
                                  "description": "获取当前位姿(x, y, yaw)"},
+                },
+                "x-hooks": {
+                    "on_interrupt_motion": {"action": "cancel"},
                 },
             },
         }
@@ -3756,7 +4882,13 @@ class NavPlugin:
             y = args.get("y", 0)
             speed = args.get("speed")
             result = self._slamtec.move_to(x, y, speed_ratio=speed)
-            return {"state": "navigating", "target": {"x": x, "y": y}, "api_result": result}
+            if result.get("error"):
+                return {"state": "error", "api_result": result}
+            action_id = self._start_poll(action, result, {"x": x, "y": y})
+            resp = {"state": "navigating", "target": {"x": x, "y": y}, "api_result": result}
+            if action_id:
+                resp["action_id"] = action_id
+            return resp
 
         elif action == "move_by":
             direction = args.get("direction", "forward")
@@ -3769,20 +4901,30 @@ class NavPlugin:
             angle_deg = args.get("angle", 0)
             angle_rad = _deg2rad(angle_deg)
             result = self._slamtec.rotate(angle_rad)
-            return {"state": "rotating", "angle": angle_deg, "api_result": result}
+            if result.get("error"):
+                return {"state": "error", "api_result": result}
+            action_id = self._start_poll(action, result, {"angle": angle_deg})
+            resp = {"state": "rotating", "angle": angle_deg, "api_result": result}
+            if action_id:
+                resp["action_id"] = action_id
+            return resp
 
         elif action == "rotate_to":
             angle_deg = args.get("angle", 0)
             angle_rad = _deg2rad(angle_deg)
             result = self._slamtec.rotate_to(angle_rad)
-            return {"state": "rotating_to", "angle": angle_deg, "api_result": result}
+            if result.get("error"):
+                return {"state": "error", "api_result": result}
+            action_id = self._start_poll(action, result, {"angle": angle_deg})
+            resp = {"state": "rotating_to", "angle": angle_deg, "api_result": result}
+            if action_id:
+                resp["action_id"] = action_id
+            return resp
 
-        elif action == "go_home":
-            result = self._slamtec.go_home()
-            return {"state": "going_home", "api_result": result}
-
-        elif action == "stop":
+        elif action == "cancel":
             result = self._slamtec.cancel_current_action()
+            with self._poll_lock:
+                self._active_poll = None
             # Also stop cmd_vel
             if self._vel_pub:
                 try:
@@ -3799,6 +4941,309 @@ class NavPlugin:
         elif action in ("start", "info"):
             return {"state": "ready"}
         return {"error": f"unknown action: {action}"}
+
+    def _start_poll(self, action: str, api_result: dict, context: dict) -> str | None:
+        """Start ACP polling thread for a Slamtec action. Returns action_id or None."""
+        from uuid import uuid4
+        action_id = f"nav_{action}_{uuid4().hex[:8]}"
+        with self._poll_lock:
+            self._active_poll = action_id
+        threading.Thread(
+            target=self._poll_loop,
+            args=(action_id, action, context),
+            daemon=True,
+        ).start()
+        return action_id
+
+    def _poll_loop(self, action_id: str, action: str, context: dict):
+        """Poll Slamtec for action completion, then fire ACP callback."""
+        t0 = time.time()
+        last_pose = None
+        last_move_time = time.time()
+
+        while True:
+            time.sleep(self._POLL_INTERVAL)
+            with self._poll_lock:
+                if self._active_poll != action_id:
+                    return
+            elapsed = time.time() - t0
+
+            # Check if action is still running
+            try:
+                current = self._slamtec.get_nav_status()
+            except Exception as exc:
+                current = {"error": str(exc)}
+
+            if current.get("error"):
+                if elapsed > 180:
+                    _acp_notify(action_id, "error", {
+                        "action": action, "error": current["error"],
+                        "elapsed": round(elapsed, 1), **context,
+                    }, "nav")
+                    return
+                continue
+
+            # Slamtec ActionState: 0=NewBorn, 1=Working, 3=Paused, 4=Done.
+            status = current.get("action_state")
+            if status == 4:
+                result_code = current.get("result")
+                if result_code == 0:
+                    _acp_notify(action_id, "completed", {
+                        "action": action, "elapsed": round(elapsed, 1), **context,
+                    }, "nav")
+                else:
+                    _acp_notify(action_id, "error", {
+                        "action": action, "error": f"result_code={result_code}",
+                        "elapsed": round(elapsed, 1), **context,
+                    }, "nav")
+                return
+
+            if status is None or status == -1:
+                if elapsed <= 3.0:
+                    continue
+                _acp_notify(action_id, "error", {
+                    "action": action, "error": "action_disappeared",
+                    "elapsed": round(elapsed, 1), **context,
+                }, "nav")
+                return
+
+            # Stall detection for position navigation only.
+            if action == "move_to":
+                try:
+                    pose = self._slamtec.get_pose()
+                    if last_pose:
+                        dx = pose.get("x", 0) - last_pose.get("x", 0)
+                        dy = pose.get("y", 0) - last_pose.get("y", 0)
+                        if (dx * dx + dy * dy) > 0.01:  # moved > 0.1m
+                            last_pose = pose
+                            last_move_time = time.time()
+                        elif time.time() - last_move_time > self._STALL_TIMEOUT:
+                            _acp_notify(action_id, "error", {
+                                "action": action, "error": "stall_timeout",
+                                "elapsed": round(elapsed, 1), **context,
+                            }, "nav")
+                            return
+                    else:
+                        last_pose = pose
+                        last_move_time = time.time()
+                except Exception:
+                    pass
+
+            # Hard timeout
+            if elapsed > 180:
+                _acp_notify(action_id, "error", {
+                    "action": action, "error": "timeout", "elapsed": 180, **context,
+                }, "nav")
+                return
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HomePlugin (actuator)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class HomePlugin:
+    """充电桩管理与回桩控制。回桩动作通过 ACP 异步报告最终结果。"""
+
+    _POLL_INTERVAL = 1.0
+    _STALL_TIMEOUT = 60.0
+    _ACTION_TIMEOUT = 180.0
+    _MISSING_ACTION_TIMEOUT = 3.0
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2, slamtec_client):
+        self._ns = namespace
+        self._slamtec = slamtec_client
+        self._poll_lock = threading.Lock()
+        self._active_poll: str | None = None
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "home",
+            "type": "actuator",
+            "description": "天轶2.0 充电桩管理与回桩。简单流程：机器人停在充电桩对接位置并定位正常后执行 register_dock；新桩会自动设为当前回桩目标，随后可直接执行 go_home 回桩充电。要切换到已有充电桩时，先用 list_docks 获取 dock_id，再执行 set_dock。回桩前需加载地图并保持定位正常。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": [
+                        "list_docks", "register_dock", "set_dock", "delete_dock",
+                        "clear_docks", "get_dock", "go_home", "cancel",
+                    ], "description": "充电桩管理或回桩动作"},
+                    "display_name": {"type": "string", "description": "注册时使用的充电桩名称，例如 main_dock"},
+                    "dock_id": {"type": "string", "description": "充电桩 UUID，由 list_docks 返回，用于选定或删除该充电桩"},
+                    "pose": {"type": "object", "description": "直接设定当前充电桩的 Pose3D（x,y,z,yaw,pitch,roll），必须属于当前地图坐标系"},
+                    "back_to_landing": {"type": "boolean", "description": "上桩失败后是否回到对接前的上桩点"},
+                    "charging_retry_count": {"type": "integer", "description": "上桩失败时的额外重试次数"},
+                    "move_mode": {"type": "integer", "enum": [0, 2], "description": "回桩路径模式：0 为自由导航，2 为轨道优先（需底盘固件支持）"},
+                },
+                "required": ["action"],
+                "x-completion": {
+                    "actions": ["go_home"],
+                    "timeout": 180,
+                },
+                "x-action-params": {
+                    "list_docks": {"params": [], "description": "列出当前地图已注册的全部充电桩，返回名称、dock_id 与位姿；可据此选择或删除充电桩"},
+                    "register_dock": {"params": ["display_name"], "description": "将机器人当前定位位姿保存为一个新充电桩，并自动设为当前回桩目标。执行前应让机器人停在实际充电桩的对接位置并确认定位正常；成功后可直接执行 go_home"},
+                    "set_dock": {"params": ["dock_id", "pose"], "description": "设置本次及后续回桩使用的当前目标。填写 dock_id 时读取已注册充电桩的位姿；也可直接填写 pose。二者任选其一，位姿必须匹配当前地图"},
+                    "delete_dock": {"params": ["dock_id"], "description": "删除 list_docks 返回的指定充电桩记录，不会移动机器人"},
+                    "clear_docks": {"params": [], "description": "删除全部已注册充电桩记录，不会移动机器人，操作不可恢复"},
+                    "get_dock": {"params": [], "description": "读取当前回桩目标的位姿；返回为空或 404 表示尚未设置"},
+                    "go_home": {"params": [], "description": "在当前地图中导航到已设置的充电桩并尝试对接充电。需地图已加载、机器人定位正常且当前充电桩已设置"},
+                    "cancel": {"params": [], "description": "取消当前回桩请求；机器人将停止等待该回桩动作完成"},
+                },
+                "x-hooks": {"on_interrupt_motion": {"action": "cancel"}},
+            },
+        }
+
+    def start(self):
+        pass
+
+    def stop(self):
+        with self._poll_lock:
+            self._active_poll = None
+
+    @staticmethod
+    def _error(result: dict) -> bool:
+        return isinstance(result, dict) and bool(result.get("error"))
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "list_docks":
+            return {"docks": self._slamtec.get_home_docks()}
+        if action == "register_dock":
+            name = str(args.get("display_name", "")).strip()
+            if not name:
+                return {"error": "display_name is required"}
+            dock = self._slamtec.register_home_dock(name)
+            if self._error(dock):
+                return {"state": "error", "dock": dock}
+            pose = dock.get("pose") if isinstance(dock, dict) else None
+            if not isinstance(pose, dict):
+                return {
+                    "state": "registered_not_selected",
+                    "dock": dock,
+                    "error": "registered dock response does not contain pose",
+                }
+            selected = self._slamtec.set_home_pose(pose)
+            if self._error(selected):
+                return {
+                    "state": "registered_not_selected",
+                    "dock": dock,
+                    "pose": pose,
+                    "selection_result": selected,
+                }
+            return {
+                "state": "registered_and_selected",
+                "dock": dock,
+                "pose": pose,
+                "selection_result": selected,
+            }
+        if action == "set_dock":
+            dock_id = str(args.get("dock_id", "")).strip()
+            pose = args.get("pose")
+            if dock_id:
+                docks = self._slamtec.get_home_docks()
+                entries = docks.get("raw", docks) if isinstance(docks, dict) else docks
+                if isinstance(entries, list):
+                    selected = next((d for d in entries if str(d.get("id")) == dock_id), None)
+                    if selected and selected.get("pose"):
+                        pose = selected["pose"]
+            if not isinstance(pose, dict):
+                return {"error": "dock_id or pose is required"}
+            return {"api_result": self._slamtec.set_home_pose(pose), "pose": pose}
+        if action == "delete_dock":
+            dock_id = str(args.get("dock_id", "")).strip()
+            if not dock_id:
+                return {"error": "dock_id is required"}
+            return {"api_result": self._slamtec.delete_home_dock(dock_id)}
+        if action == "clear_docks":
+            return {"api_result": self._slamtec.clear_home_docks()}
+        if action == "get_dock":
+            return {"pose": self._slamtec.get_home_pose()}
+        if action == "go_home":
+            result = self._slamtec.go_home(
+                back_to_landing=args.get("back_to_landing"),
+                charging_retry_count=args.get("charging_retry_count"),
+                move_mode=args.get("move_mode"),
+            )
+            if self._error(result):
+                return {"state": "error", "api_result": result}
+            action_id = self._start_poll(action, result, {})
+            response = {"state": "going_home", "api_result": result}
+            if action_id:
+                response["action_id"] = action_id
+            return response
+        if action == "cancel":
+            result = self._slamtec.cancel_action()
+            with self._poll_lock:
+                self._active_poll = None
+            return {"state": "cancelled", "api_result": result}
+        if action in ("start", "info"):
+            return {"state": "ready"}
+        return {"error": f"unknown action: {action}"}
+
+    def _start_poll(self, action: str, api_result: dict, context: dict) -> str:
+        from uuid import uuid4
+        action_id = f"home_{action}_{uuid4().hex[:8]}"
+        with self._poll_lock:
+            self._active_poll = action_id
+        threading.Thread(target=self._poll_loop, args=(action_id, action, context), daemon=True).start()
+        return action_id
+
+    def _poll_loop(self, action_id: str, action: str, context: dict):
+        t0 = time.time()
+        last_pose = None
+        last_move_time = t0
+        while True:
+            time.sleep(self._POLL_INTERVAL)
+            with self._poll_lock:
+                if self._active_poll != action_id:
+                    return
+            elapsed = time.time() - t0
+            try:
+                current = self._slamtec.get_nav_status()
+            except Exception as exc:
+                current = {"error": str(exc)}
+            if current.get("error"):
+                if elapsed > self._ACTION_TIMEOUT:
+                    _acp_notify(action_id, "error", {"action": action, "error": current["error"], **context}, "home")
+                    return
+                continue
+
+            state = current.get("action_state")
+            result_code = current.get("result")
+            if state == 4:
+                if result_code == 0:
+                    _acp_notify(action_id, "completed", {"action": action, "elapsed": round(elapsed, 1), **context}, "home")
+                else:
+                    _acp_notify(action_id, "error", {"action": action, "error": current.get("reason") or f"result_code={result_code}", "elapsed": round(elapsed, 1), **context}, "home")
+                return
+            if state == 3:
+                if elapsed > self._ACTION_TIMEOUT:
+                    _acp_notify(action_id, "error", {"action": action, "error": "timeout", "elapsed": self._ACTION_TIMEOUT, **context}, "home")
+                    return
+                continue
+            if state is None or state == -1:
+                # A successful action is reported as Done/result=0. Never infer
+                # success merely because the chassis no longer exposes an action.
+                if elapsed > self._MISSING_ACTION_TIMEOUT:
+                    _acp_notify(action_id, "error", {"action": action, "error": "action_disappeared", "elapsed": round(elapsed, 1), **context}, "home")
+                    return
+            if action == "go_home":
+                try:
+                    pose = self._slamtec.get_pose()
+                    if last_pose is None:
+                        last_pose = pose
+                    dx = pose.get("x", 0) - last_pose.get("x", 0)
+                    dy = pose.get("y", 0) - last_pose.get("y", 0)
+                    if dx * dx + dy * dy > 0.01:
+                        last_pose = pose
+                        last_move_time = time.time()
+                    elif time.time() - last_move_time > self._STALL_TIMEOUT:
+                        _acp_notify(action_id, "error", {"action": action, "error": "stall_timeout", "elapsed": round(elapsed, 1), **context}, "home")
+                        return
+                except Exception:
+                    pass
+            if elapsed > self._ACTION_TIMEOUT:
+                _acp_notify(action_id, "error", {"action": action, "error": "timeout", "elapsed": self._ACTION_TIMEOUT, **context}, "home")
+                return
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -4452,8 +5897,9 @@ class RemoteStatePlugin:
                     "topic_out": [{"topic": self._topic, "format": "data/json"}]}
         return {"state": "error", "error": "INVALID_ARGUMENT",
                 "message": f"unknown action: {action}"}
-class RobotFaultsPlugin:
-    """全机故障汇总 — 底盘 (Slamtec HTTP) + 身体电机/灵巧手/急停 (ROS2 订阅), 1Hz 发布。
+class HealthCheckPlugin:
+    """全身体检卡 — 底盘安全 + 身体电机/灵巧手/急停 + 电源 + 手部 + IMU + 自检状态
+    综合诊断结论 + 可行建议。
     bodyctrl_msgs 不可用时身体部分自动降级为 unavailable。"""
 
     @staticmethod
@@ -4464,7 +5910,15 @@ class RobotFaultsPlugin:
                 "left": "/inspire_hand/error/left_hand",
                 "right": "/inspire_hand/error/right_hand",
             },
+            "hand_state_topics": {
+                "left": "/inspire_hand/state/left_hand",
+                "right": "/inspire_hand/state/right_hand",
+            },
             "estop_topic": "/power/board/key_status",
+            "power_board_topic": "/power/board/status",
+            "imu_accel_topic": "/ob_camera_head/accel/sample",
+            "imu_gyro_topic": "/ob_camera_head/gyro/sample",
+            "self_check_topic": "/bodycontrol_state",
         }
 
     def __init__(self, plugin_config: dict, namespace: str, ros2, slamtec_client):
@@ -4478,7 +5932,12 @@ class RobotFaultsPlugin:
         # 身体故障源配置
         self._motor_topics = cfg["motor_status_topics"]
         self._hand_topics = cfg["hand_error_topics"]
+        self._hand_state_topics = cfg["hand_state_topics"]
         self._estop_topic = cfg["estop_topic"]
+        self._power_board_topic = cfg["power_board_topic"]
+        self._imu_accel_topic = cfg["imu_accel_topic"]
+        self._imu_gyro_topic = cfg["imu_gyro_topic"]
+        self._self_check_topic = cfg["self_check_topic"]
 
         # 状态
         self._chassis_data = None
@@ -4488,24 +5947,48 @@ class RobotFaultsPlugin:
         self._last_update_ms = None
         self._lock = threading.Lock()
 
+        # 新增数据源状态
+        self._power_board_data = None       # PowerStatus
+        self._power_board_available = False
+        self._hand_state_data = {"left": None, "right": None}  # JointState
+        self._hand_state_available = False
+        self._imu_data = {"accel": None, "gyro": None}  # Imu msg
+        self._imu_available = False
+        self._self_check_state = None       # NodeState
+        self._self_check_available = False
+
+        # 自检状态判定:
+        #   开始: bodycontrol_state 1→0 (proc_manager 触发自检的瞬间, 同时禁用 TTS)
+        #   完成: 短促提示音 (duration < 2000ms)
+        self._self_check_started = False
+        self._self_check_completed = False
+        # 短提示音判定 (自检完成)
+        self._short_prompt_threshold_ms = 2.0    # < 2.0s 视为短促提示音 (duration 单位是秒)
+
+        # 音频进度 duration 跟踪 (sid -> duration)
+        self._audio_event_available = False
+        self._sid_duration = {}
+        self._max_sid_track = 20
+
         # 订阅节点 (domain 0) — 接收身体故障
-        self._sub_node = Node("tianyi2_robot_faults_sub", context=ros2.ctx_tianyi)
+        self._sub_node = Node("tianyi2_health_check_sub", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._sub_node)
 
     def get_tool(self) -> dict:
         return {
-            "name": "robot_faults",
+            "name": "health_check",
             "type": "actuator",
-            "description": "天轶2.0 全机故障检查 — 底盘安全 + 身体电机/灵巧手/急停",
+            "description": "天轶2.0 全身体检：汇总底盘、电机、手部、电源、急停、IMU、自检等所有子系统状态，给出故障原因和操作建议。应在以下场景调用：①Agent Core 发现机器人无法正常移动或操作（可能被急停锁住，也可能出现电机/电源故障），需要排查根因时；②用户说\"检查一下机器人\"\"体检\"\"状态怎么样\"\"有没有故障\"等类似话语时。急停激活时会提示用户拔掉急停按钮并按遥控器A键自检。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": ["summary"],
-                               "description": "summary=关键摘要"},
+                               "default": "summary",
+                               "description": "summary=返回可操作判定+各子系统一句话概括+建议"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "summary": {"params": [], "description": "返回关键摘要: 底盘状态/急停/身体故障数"},
+                    "summary": {"params": [], "description": "返回: 自检状态/急停/各子系统就绪/可否操作及原因+建议"},
                 },
             },
         }
@@ -4535,12 +6018,72 @@ class RobotFaultsPlugin:
                 PowerBoardKeyStatus, self._estop_topic,
                 self._on_estop, _RELIABLE_QOS)
             self._body_available = True
-            print("[RobotFaultsPlugin] body subscriptions created")
+            print("[HealthCheckPlugin] body subscriptions created")
         except ImportError as e:
-            print(f"[RobotFaultsPlugin] bodyctrl_msgs not available ({e}), body disabled")
+            print(f"[HealthCheckPlugin] bodyctrl_msgs not available ({e}), body disabled")
+
+        # 电源板订阅 (PowerStatus)
+        try:
+            from bodyctrl_msgs.msg import PowerStatus
+            self._sub_node.create_subscription(
+                PowerStatus, self._power_board_topic,
+                self._on_power_board, _RELIABLE_QOS)
+            self._power_board_available = True
+            print("[HealthCheckPlugin] power board subscription created")
+        except ImportError:
+            print("[HealthCheckPlugin] PowerStatus not available, power board disabled")
+
+        # 手部状态订阅 (JointState) — 检测手部是否在线
+        try:
+            from sensor_msgs.msg import JointState
+            for side, src_topic in self._hand_state_topics.items():
+                self._sub_node.create_subscription(
+                    JointState, src_topic,
+                    lambda msg, s=side: self._on_hand_state(msg, s),
+                    _RELIABLE_QOS)
+            self._hand_state_available = True
+            print("[HealthCheckPlugin] hand state subscriptions created")
+        except ImportError:
+            print("[HealthCheckPlugin] JointState not available, hand state disabled")
+
+        # IMU 订阅
+        try:
+            from sensor_msgs.msg import Imu as RosImu
+            self._sub_node.create_subscription(
+                RosImu, self._imu_accel_topic,
+                lambda msg: self._on_imu("accel", msg), _RELIABLE_QOS)
+            self._sub_node.create_subscription(
+                RosImu, self._imu_gyro_topic,
+                lambda msg: self._on_imu("gyro", msg), _RELIABLE_QOS)
+            self._imu_available = True
+            print("[HealthCheckPlugin] IMU subscriptions created")
+        except ImportError:
+            print("[HealthCheckPlugin] sensor_msgs.Imu not available, IMU disabled")
+
+        # 自检状态订阅 (NodeState)
+        try:
+            from bodyctrl_msgs.msg import NodeState
+            self._sub_node.create_subscription(
+                NodeState, self._self_check_topic,
+                self._on_self_check, _RELIABLE_QOS)
+            self._self_check_available = True
+            print("[HealthCheckPlugin] self check subscription created")
+        except ImportError:
+            print("[HealthCheckPlugin] NodeState not available, self check disabled")
+
+        # 音频进度订阅 (短促提示音 → 自检完成)
+        try:
+            from lyre_msgs.msg import PlayProgress
+            self._sub_node.create_subscription(
+                PlayProgress, "/audio_play/progress",
+                self._on_play_progress, _LOW_LAT_QOS)
+            self._audio_event_available = True
+            print("[HealthCheckPlugin] audio progress subscription created")
+        except ImportError:
+            print("[HealthCheckPlugin] PlayProgress not available, audio progress disabled")
 
         # 完整数据发布线程 (1Hz → topic)
-        print("[RobotFaultsPlugin] started")
+        print("[HealthCheckPlugin] started")
 
     def stop(self):
         self._running = False
@@ -4628,67 +6171,227 @@ class RobotFaultsPlugin:
             self._body_sources[self._estop_topic] = now_ms
             self._last_update_ms = now_ms
 
+    # ── 新增回调: 电源板 / 手部状态 / IMU / 自检 ──────────────────────────
+
+    def _on_power_board(self, msg):
+        now_ms = int(time.time() * 1000)
+        with self._lock:
+            self._power_board_data = msg
+            self._last_update_ms = now_ms
+
+    def _on_hand_state(self, msg, side: str):
+        now_ms = int(time.time() * 1000)
+        with self._lock:
+            self._hand_state_data[side] = msg
+            self._last_update_ms = now_ms
+
+    def _on_imu(self, kind: str, msg):
+        now_ms = int(time.time() * 1000)
+        with self._lock:
+            self._imu_data[kind] = msg
+            self._last_update_ms = now_ms
+
+    def _on_self_check(self, msg):
+        """bodycontrol_state 回调。
+        state 1→0: 自检触发 → 置 started, 禁用 TTS 防止音频误触发完成判定;
+        state 0→1: 服务恢复就绪，不代表完成。"""
+        now_ms = int(time.time() * 1000)
+        with self._lock:
+            prev_state = self._self_check_state.state if self._self_check_state is not None else None
+            self._self_check_state = msg
+            self._last_update_ms = now_ms
+            # 自检开始: Running(1) → Initing(0)
+            if prev_state == 1 and msg.state == 0:
+                self._self_check_started = True
+                self._self_check_completed = False
+                print(f"[HealthCheckPlugin] self-check triggered (state 1→0)")
+
+    def _on_play_progress(self, msg):
+        """订阅 /audio_play/progress, 短促提示音 (duration < 2.0s) → 自检完成."""
+        with self._lock:
+            if msg.sid:
+                self._sid_duration[msg.sid] = msg.duration
+                if len(self._sid_duration) > self._max_sid_track:
+                    keys = sorted(self._sid_duration.keys())
+                    for k in keys[:len(keys) - self._max_sid_track]:
+                        self._sid_duration.pop(k, None)
+                if (self._self_check_started and not self._self_check_completed
+                        and msg.duration is not None
+                        and msg.duration < self._short_prompt_threshold_ms):
+                    self._self_check_completed = True
+                    self._self_check_started = False
+                    print(f"[HealthCheckPlugin] self-check completed by short prompt "
+                          f"(sid={msg.sid}, duration={msg.duration}ms)")
+
     # ── 按需查询执行器 ─────────────────────────────────────────────────────
 
     def _build_summary_locked(self) -> dict:
-        """生成关键摘要，每次 dispatch 调用时读取最新快照。"""
+        """生成全身体检摘要，每次 dispatch 调用时读取最新快照。"""
 
-        # 底盘
+        now_ms = int(time.time() * 1000)
+        issues = []
+        advice = []
+
+        # ── 底盘 ──
         chassis_available = self._chassis_data is not None
         chassis_healthy = chassis_available and not self._chassis_data.get("has_error") \
                           and not self._chassis_data.get("has_fatal")
         chassis_lines = []
         if not chassis_available:
             chassis_lines.append("离线")
+            issues.append("底盘通信离线，无法获取安全状态")
         elif not chassis_healthy:
             chassis_lines.append("异常")
+            issues.append("底盘系统异常")
         else:
             chassis_lines.append("正常")
         if chassis_available:
             d = self._chassis_data
             if d.get("emergency_stop"):
                 chassis_lines.append("急停!")
+                issues.append("底盘急停已触发")
+                advice.append("检查急停按钮状态，确认安全后解除急停")
             if d.get("lidar_disconnected"):
                 chassis_lines.append("雷达离线")
+                issues.append("激光雷达离线")
+            if d.get("cliff"):
+                issues.append("检测到跌落风险")
+                advice.append("立即停止移动，检查地面环境")
+            if d.get("collision"):
+                issues.append("检测到碰撞")
+                advice.append("检查碰撞方向，排查周围障碍物")
 
-        # 身体
+        # ── 身体电机/急停 ──
         body_faults = sorted(self._body_faults.values(), key=lambda f: f["fault_id"])
         body_lines = []
         if not self._body_available:
             body_lines.append("离线")
+            issues.append("身体电机/急停数据无法获取 (bodyctrl_msgs 未导入)")
         elif not body_faults:
             body_lines.append("正常")
         else:
             for f in body_faults:
-                body_lines.append(f"{f['component']}({f.get('error_desc', f['error_code'])})")
+                line = f"{f['component']}({f.get('error_desc', f['error_code'])})"
+                body_lines.append(line)
+                issues.append(f"故障: {line}")
+                if f.get("severity") == "fatal":
+                    advice.append(f"严重故障 {f['component']}，请立即停止操作并检查硬件")
 
-        # 生成人类可读总结段落
-        body_fault_count = len(body_faults)
-        if chassis_healthy and self._body_available and body_fault_count == 0:
-            summary_text = "机器人状态良好，底盘运动系统正常，身体各关节无故障。"
+        # ── 电源板 ──
+        power_available = self._power_board_available and self._power_board_data is not None
+        power_lines = []
+        if not self._power_board_available:
+            power_lines.append("离线")
+            issues.append("电源板数据不可用 (PowerStatus 未导入)")
+        elif not power_available:
+            power_lines.append("无数据")
         else:
-            parts = []
-            if not chassis_healthy:
-                parts.append("底盘系统异常")
-            elif chassis_available:
-                parts.append("底盘正常")
-            if not self._body_available:
-                parts.append("身体关节数据无法获取")
-            elif body_fault_count > 0:
-                fault_desc = "，".join(
-                    f"{f['component']}({f.get('error_desc', f['error_code'])})"
-                    for f in body_faults[:3])
-                if body_fault_count > 3:
-                    fault_desc += f" 等{body_fault_count}个故障"
-                parts.append(f"检测到身体故障: {fault_desc}")
+            p = self._power_board_data
+            # 检查各部位温度
+            temps = {
+                "腰部": p.waist_temp, "臂A": p.arm_a_temp, "臂B": p.arm_b_temp,
+                "腿A": p.leg_a_temp, "腿B": p.leg_b_temp,
+            }
+            hot_zones = [f"{k}({v:.0f}°C)" for k, v in temps.items() if v > 75]
+            warm_zones = [f"{k}({v:.0f}°C)" for k, v in temps.items() if 65 < v <= 75]
+            if hot_zones:
+                power_lines.append(f"过热:{','.join(hot_zones)}")
+                issues.append(f"电源板MOS过热: {', '.join(hot_zones)}")
+                advice.append("立即停止运行，检查散热及风扇状态")
+            elif warm_zones:
+                power_lines.append(f"温升:{','.join(warm_zones)}")
+                issues.append(f"电源板MOS温度偏高: {', '.join(warm_zones)}")
             else:
-                parts.append("身体关节正常")
-            summary_text = "；".join(parts) + "。"
+                power_lines.append("温度正常")
+            # 电池
+            if p.battery_power < 10:
+                power_lines.append(f"电量极低({p.battery_power:.0f}%)")
+                issues.append(f"电池电量极低 ({p.battery_power:.0f}%)，随时可能断电")
+                advice.append("立即充电，避免在低电量下操作运动关节")
+            elif p.battery_power < 25:
+                power_lines.append(f"电量偏低({p.battery_power:.0f}%)")
+                issues.append(f"电池电量偏低 ({p.battery_power:.0f}%)")
+            else:
+                power_lines.append(f"电量({p.battery_power:.0f}%)")
+            # 电压异常
+            if p.bus_volt == 0:
+                power_lines.append("母线电压异常")
+                issues.append("母线电压为0V，电源板可能未正常工作")
+
+        # ── 手部状态 ──
+        hand_available = self._hand_state_available
+        hand_lines = []
+        if not hand_available:
+            hand_lines.append("离线")
+        else:
+            for side in ("left", "right"):
+                data = self._hand_state_data[side]
+                if data is None:
+                    hand_lines.append(f"{'左' if side=='left' else '右'}手无数据")
+                    issues.append(f"{'左' if side=='left' else '右'}手传感器无数据")
+                elif data.name and len(data.name) > 0:
+                    hand_lines.append(f"{'左' if side=='left' else '右'}手在线")
+                else:
+                    hand_lines.append(f"{'左' if side=='left' else '右'}手无关节名")
+                    issues.append(f"{'左' if side=='left' else '右'}手关节名称为空，可能未连接")
+
+        # ── IMU ──
+        imu_available = self._imu_available
+        imu_lines = []
+        if not imu_available:
+            imu_lines.append("离线")
+        else:
+            accel_ok = self._imu_data["accel"] is not None
+            gyro_ok = self._imu_data["gyro"] is not None
+            if accel_ok and gyro_ok:
+                imu_lines.append("在线")
+            else:
+                missing = []
+                if not accel_ok:
+                    missing.append("加速度")
+                if not gyro_ok:
+                    missing.append("角速度")
+                imu_lines.append(f"部分缺失:{','.join(missing)}")
+                issues.append(f"IMU部分数据缺失: {', '.join(missing)}")
+
+        # ── 自检状态 (state 1→0=开始, 短提示音=完成) ──
+        # 自检中 = 检测到开始信号 且 未检测到完成信号
+        self_check_available = self._self_check_available and self._self_check_state is not None
+        self_check_lines = []
+
+        if self._self_check_started and not self._self_check_completed:
+            self_check_lines.append("自检中")
+            issues.append("自检进行中")
+        else:
+            self_check_lines.append("没有在自检")
+
+        # ── 综合健康判定 ──
+        has_issues = len(issues) > 0
+        all_normal = (chassis_healthy and self._body_available and not body_faults
+                      and power_available and not hot_zones and p.battery_power >= 25)
+        healthy = all_normal and not has_issues
+
+        # ── 人类可读总结 ──
+        if healthy:
+            summary_text = "机器人状态良好: 底盘正常, 身体关节无故障, 电源温度正常, 手部在线, IMU在线, 节点运行中。"
+        else:
+            snippet = "；".join(issues[:3])
+            if len(issues) > 3:
+                snippet += f" 等{len(issues)}个问题"
+            summary_text = f"检测到异常: {snippet}。"
+        if advice:
+            summary_text += " " + " ".join(advice)
 
         return {
-            "healthy": chassis_healthy and self._body_available and not body_faults,
+            "healthy": healthy,
             "summary_text": summary_text,
-            "summary": ", ".join(chassis_lines + body_lines),
+            "summary": ", ".join(
+                ["底盘:" + ",".join(chassis_lines),
+                 "身体:" + ",".join(body_lines),
+                 "电源:" + ",".join(power_lines),
+                 "手部:" + ",".join(hand_lines),
+                 "IMU:" + ",".join(imu_lines),
+                 "自检:" + ",".join(self_check_lines)]),
             "chassis": {
                 "available": chassis_available,
                 "healthy": chassis_healthy,
@@ -4701,13 +6404,148 @@ class RobotFaultsPlugin:
                 "faults": body_faults if body_faults else [],
                 "detail": ", ".join(body_lines),
             },
+            "power_board": {
+                "available": power_available,
+                "detail": ", ".join(power_lines),
+            },
+            "hand_state": {
+                "available": hand_available,
+                "detail": ", ".join(hand_lines),
+            },
+            "imu": {
+                "available": imu_available,
+                "detail": ", ".join(imu_lines),
+            },
+            "self_check": {
+                "available": self_check_available,
+                "detail": ", ".join(self_check_lines),
+            },
+            "issues": issues,
+            "advice": advice,
         }
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action in ("start", "stop", "info"):
             return {"state": "running" if self._running else "idle"}
         with self._lock:
-            return self._build_summary_locked()
+            full = self._build_summary_locked()
+        return self._build_operability_summary(full)
+
+    def _build_operability_summary(self, full: dict) -> dict:
+        """从完整诊断数据中提取可操作判定 + 人话总结。"""
+
+        body_data = full.get("body", {})
+        chassis_data = full.get("chassis", {})
+        power_board = full.get("power_board", {})
+        hand_state = full.get("hand_state", {})
+        imu_info = full.get("imu", {})
+        sc_info = full.get("self_check", {})
+
+        lines = []
+
+        # ── 1. 急停 ──
+        estop_active = chassis_data.get("emergency_stop", False)
+        estop_faults = [f for f in body_data.get("faults", []) if f.get("category") == "estop"]
+        estop_active = estop_active or bool(estop_faults)
+        if estop_active:
+            lines.append("⚠️  急停 — 已触发 (fatal)")
+        else:
+            lines.append("✅ 急停 — 未触发")
+
+        # ── 2. 电机 ──
+        motor_faults = [f for f in body_data.get("faults", []) if f.get("category") == "motor"]
+        if motor_faults:
+            by_desc = {}
+            for f in motor_faults:
+                d = f.get("error_desc", "unknown")
+                by_desc[d] = by_desc.get(d, 0) + 1
+            parts = [f"{c}个{cate}" for cate, c in by_desc.items()]
+            lines.append(f"⚠️  电机 — {len(motor_faults)}项故障({', '.join(parts)})")
+        elif body_data.get("fault_count", 0) == 0:
+            lines.append("✅ 电机 — 正常")
+        else:
+            lines.append("⚠️  电机 — 无数据")
+
+        # ── 3. 电源/电池 ──
+        power_detail = power_board.get("detail", "未知")
+        if "过热" in power_detail or "温升" in power_detail:
+            lines.append(f"⚠️  电源 — {power_detail}")
+        elif "电量极低" in power_detail:
+            lines.append(f"⚠️  电池 — {power_detail}")
+        elif "电量偏低" in power_detail:
+            lines.append(f"⚠️  电池 — {power_detail}")
+        else:
+            lines.append(f"✅ 电源 — {power_detail}")
+
+        # ── 4. 手部 ──
+        hands_detail = hand_state.get("detail", "未知")
+        if "离线" in hands_detail or "无数据" in hands_detail or "未连接" in hands_detail:
+            lines.append(f"⚠️  手部 — {hands_detail}")
+        else:
+            lines.append(f"✅ 手部 — {hands_detail}")
+
+        # ── 5. IMU ──
+        imu_detail = imu_info.get("detail", "未知")
+        if "离线" in imu_detail or "缺失" in imu_detail:
+            lines.append(f"⚠️  IMU — {imu_detail}")
+        else:
+            lines.append(f"✅ IMU — {imu_detail}")
+
+        # ── 6. 自检状态 (两态: 自检中 / 没有在自检) ──
+        sc_detail = sc_info.get("detail", "未知")
+        sc_label = sc_detail
+        if sc_detail == "自检中":
+            lines.append("🔄 自检 — 进行中")
+        else:
+            lines.append("✅ 自检 — 没有在自检")
+
+        # ── 7. 底盘 ──
+        chassis_detail = chassis_data.get("detail", "未知")
+        if "离线" in chassis_detail or "异常" in chassis_detail:
+            lines.append(f"⚠️  底盘 — {chassis_detail}")
+        elif "急停" in chassis_detail:
+            lines.append(f"⚠️  底盘 — {chassis_detail}")
+        # 正常底盘不在主列表里重复显示, 省空间
+
+        # ── 8. 判定 + 总结 ──
+        issues = full.get("issues", [])
+        advice_list = full.get("advice", [])
+
+        fatal_items = [f for f in body_data.get("faults", []) if f.get("severity") == "fatal"]
+        blocker_count = len(fatal_items) + (1 if estop_active else 0)
+        if sc_detail == "自检中":
+            blocker_count += 1
+
+        if blocker_count > 0 or "电量极低" in power_detail:
+            worst = [f.get("component", "未知") for f in fatal_items[:3]]
+            worst_parts = worst + (["急停"] if estop_active and "急停" not in "_".join(worst) else [])
+            worst_str = "、".join(worst_parts[:3]) if worst_parts else "未知"
+            summary = f"发现{len(issues)}项问题, 最严重: {worst_str}, 禁止操作"
+        else:
+            summary = "状态良好, 可以操作"
+
+        # 建议
+        if estop_active:
+            advice_list = ["请拔掉急停按钮，然后按下遥控器A键让机器人自检（自检完成后才能正常操作）"] + (advice_list or [])
+        if advice_list:
+            summary += "。建议: " + "；".join(advice_list[:2])
+
+        return {
+            "can_operate": blocker_count == 0,
+            "issue_count": len(issues),
+            "emergency_stop": estop_active,
+            "subsystems": {
+                "chassis": chassis_detail,
+                "body": body_data.get("detail", "未知"),
+                "power": power_detail,
+                "hands": hands_detail,
+                "imu": imu_detail,
+                "node": sc_detail,
+            },
+            "issues": issues,
+            "advice": advice_list,
+            "summary_text": "\n".join(lines + [summary]),
+        }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -5773,7 +7611,7 @@ class ChassisRawPlugin:
                 "type": "object",
                 "properties": {
                     "action": {"type": "string",
-                               "enum": ["move", "rotate", "stop"],
+                               "enum": ["move", "rotate", "brake"],
                                "description": "控制动作"},
                     "direction": {"type": "string",
                                   "enum": ["forward", "backward"],
@@ -5787,12 +7625,16 @@ class ChassisRawPlugin:
                                  "description": "持续时间(秒), -1=持续运动 (不填 angle 时生效)"},
                 },
                 "required": ["action"],
+                "x-completion": {
+                    "actions": ["move", "rotate"],
+                    "timeout": 60
+                },
                 "x-action-params": {
                     "move":   {"params": ["direction", "duration"],
                                "description": "前进/后退, 固定速率 0.3 m/s, duration=-1 持续运动"},
                     "rotate": {"params": ["rotation", "angle", "duration"],
                                "description": "精确旋转: angle(度) 用 Slamtec RotateAction 闭环; duration 为持续旋转"},
-                    "stop":   {"params": [],
+                    "brake":  {"params": [],
                                "description": "立即停止移动"},
                 },
             },
@@ -5852,7 +7694,7 @@ class ChassisRawPlugin:
             except (TypeError, ValueError):
                 return {"error": "duration must be a number"}
             return self._start(direction, dur)
-        elif action == "stop":
+        elif action == "brake":
             return self._do_stop()
         elif action in ("start", "info"):
             return {"state": "ready"}
@@ -5868,15 +7710,18 @@ class ChassisRawPlugin:
         continuous = (duration < 0)
         self._running = True
         gen = self._gen
+        import uuid as _uuid
+        action_id = f"move-{_uuid.uuid4().hex[:8]}"
         threading.Thread(
-            target=self._move_loop, args=(direction, duration, continuous, gen), daemon=True
+            target=self._move_loop, args=(direction, duration, continuous, gen, action_id), daemon=True
         ).start()
 
         return {"direction": self.DIR_NAMES[direction],
                 "duration": duration, "continuous": continuous,
+                "action_id": action_id,
                 "speed": "0.3 m/s (fixed)" if direction < 2 else "1.0 rad/s (fixed)"}
 
-    def _move_loop(self, direction: int, total_duration: float, continuous: bool, gen: int):
+    def _move_loop(self, direction: int, total_duration: float, continuous: bool, gen: int, action_id: str = ''):
         """运动控制 — 非持续模式发单次精确定时 move_by; 持续模式每 200ms 刷新。"""
         if not continuous:
             # 单次精确运动: move_by duration 单位是毫秒
@@ -5887,6 +7732,9 @@ class ChassisRawPlugin:
             time.sleep(total_duration + 0.3)  # 等运动完成+缓冲
             if self._running and self._gen == gen:
                 self._do_stop()
+            # ACP callback
+            if action_id:
+                self._acp_move_callback(action_id, "completed", total_duration)
             return
 
         # 持续模式: 每 200ms 刷新 300ms 运动指令保持连续
@@ -5900,6 +7748,29 @@ class ChassisRawPlugin:
             time.sleep(step)
         if self._running and self._gen == gen:
             self._do_stop()
+        # ACP callback for continuous mode (stopped by brake)
+        if action_id:
+            self._acp_move_callback(action_id, "completed", -1)
+
+    def _acp_move_callback(self, action_id: str, status: str, duration: float):
+        """POST movement completion to Agent Core."""
+        try:
+            import urllib.request as _urllib
+            import ssl as _ssl
+            import os as _os
+            agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+            ctx = _ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = _ssl.CERT_NONE
+            payload = json.dumps({"action_id": action_id, "status": status,
+                                  "result": {"duration": duration}}).encode()
+            req = _urllib.Request(f"{agent_core_url}/api/acp/complete",
+                                 data=payload, headers={"Content-Type": "application/json"},
+                                 method="POST")
+            _urllib.urlopen(req, timeout=3, context=ctx)
+            print(f"[ChassisRawPlugin] ACP complete: {action_id} ({status})")
+        except Exception as e:
+            print(f"[ChassisRawPlugin] ACP callback failed: {e}")
 
     def _do_stop(self) -> dict:
         self._running = False

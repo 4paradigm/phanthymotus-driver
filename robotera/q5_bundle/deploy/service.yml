@@ -1,0 +1,20 @@
+robotera-q5:
+  image: __IMAGE__
+  container_name: embodied-robotera-q5
+  network_mode: host
+  privileged: true
+  volumes:
+    - /home/nvidia/teleop_client/install:/opt/teleop_client/install:ro
+    - /home/nvidia/cyclonedds-orin.xml:/etc/cyclonedds/q5.xml:ro
+  environment:
+    - Q5_ROS_DOMAIN_ID=211
+    - AGENT_CORE_ROS_DOMAIN_ID=42
+    - Q5_CYCLONEDDS_URI=file:///etc/cyclonedds/q5.xml
+    - ROS_LOCALHOST_ONLY=0
+    - PYTHONUNBUFFERED=1
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: unless-stopped

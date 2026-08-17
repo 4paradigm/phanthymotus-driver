@@ -163,6 +163,18 @@ class ControlledSpatialPlugin:
         os.makedirs(self._pcd_dir, exist_ok=True)
         self._db = _ControlledSpatialDB(db_path)
 
+        # Password for protected operations
+        self._password: str = str(plugin_config.get("password", "123456"))
+
+        # Actions that require password verification
+        self._protected_actions = {
+            "start_mapping", "untag_place", "delete_map",
+            "add_wall", "remove_wall", "clear_walls",
+            "add_track", "remove_track", "clear_tracks",
+            "add_area", "edit_area", "remove_area", "clear_areas",
+            "add_artifact_poi", "remove_artifact_poi", "clear_artifact_pois",
+        }
+
         # State
         self._active_map: str | None = None
         self._is_mapping: bool = False
@@ -174,11 +186,41 @@ class ControlledSpatialPlugin:
         self._nav_action_id: str | None = None  # Action ID returned by move_to
         self._nav_start_time: float = 0  # monotonic time when navigation was initiated
         self._nav_lost_count: int = 0  # consecutive polls where action was missing on chassis
+        self._nav_stall_timeout: float = 60.0  # seconds without movement → stall
+        self._nav_last_move_time: float = 0  # last time pose changed during nav
+        self._nav_last_pose: dict | None = None  # last pose for stall detection
         self._lock = threading.Lock()
         self._poll_thread: Optional[threading.Thread] = None
 
         # Start polling thread for pose, nav status, map status
         self._poll_running = False
+
+    def _acp_callback(self, action_id: str, status: str, result: dict):
+        """POST 动作完成通知到 Agent Core。"""
+        try:
+            import urllib.request as _urllib
+            import ssl as _ssl
+            agent_core_url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+            ctx = _ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = _ssl.CERT_NONE
+            payload = json.dumps({
+                "action_id": action_id,
+                "status": status,
+                "result": result,
+                "tool": "controlled_spatial",
+                "ts": time.time(),
+            }).encode()
+            req = _urllib.Request(
+                f"{agent_core_url}/api/acp/complete",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            _urllib.urlopen(req, timeout=3, context=ctx)
+            print(f"[ControlledSpatial] ACP {status}: {action_id} | {json.dumps(result, ensure_ascii=False)[:120]}")
+        except Exception as e:
+            print(f"[ControlledSpatial] ACP callback failed: {e}")
 
     def get_tools(self) -> list:
         return [self._tool_def()]
@@ -189,10 +231,26 @@ class ControlledSpatialPlugin:
             "type": "actuator",
             "multiInstance": False,
             "description": (
+                "⚠ 受保护操作需要密码：执行以下操作前，必须先向操作者索取密码并通过 password 参数传入——"
+                "start_mapping, untag_place, delete_map, add_wall, remove_wall, clear_walls, "
+                "add_track, remove_track, clear_tracks, add_area, edit_area, remove_area, "
+                "clear_areas, add_artifact_poi, remove_artifact_poi, clear_artifact_pois。\n\n"
                 "Controlled mapping & navigation via Slamtec底盘 HTTP REST API — "
                 "start/stop mapping, tag places, list/delete maps, load map, navigate between tags, "
                 "manage virtual walls/tracks/areas (artifacts)."
             ),
+            "configSchema": {
+                "type": "object",
+                "properties": {
+                    "password": {
+                        "type": "string",
+                        "description": "受保护操作（建图、删除、增删虚拟墙/轨道/区域/POI等）所需的密码，初始密码为 123456",
+                        "default": "123456",
+                        "format": "password",
+                        "scope": "shared",
+                    },
+                },
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -202,10 +260,9 @@ class ControlledSpatialPlugin:
                             "start_mapping", "stop_mapping",
                             "tag_place", "untag_place", "list_tags",
                             "list_maps", "delete_map",
-                            "load_map",
+                            "load_map", "unload_map",
                             "navigate_to_tag", "navigate_to_pose",
-                            "wait_navigation_done",
-                            "pause_nav", "stop_nav",
+                            "stop_nav",
                             # Artifact — 虚拟墙
                             "list_walls", "add_wall", "remove_wall", "clear_walls",
                             # Artifact — 虚拟轨道
@@ -265,43 +322,47 @@ class ControlledSpatialPlugin:
                     "sensor_type": {"type": "string", "description": "Sensor disable area: sensor types e.g. '[0,3]' (0=bump,1=fall,2=ultrasonic,3=depth)"},
                     "restricted_robots_number_limit": {"type": "integer", "description": "Restricted area: max simultaneous robots"},
                     "restricted_scheduling_points": {"type": "string", "description": "Restricted area: scheduling points JSON string"},
+                    "password": {"type": "string", "description": "🔒 向操作者索取密码后传入。执行受保护操作（start_mapping, untag_place, delete_map, add_wall, remove_wall, clear_walls, add_track, remove_track, clear_tracks, add_area, edit_area, remove_area, clear_areas, add_artifact_poi, remove_artifact_poi, clear_artifact_pois）时必须提供。"},
                 },
                 "required": ["action"],
+                "x-completion": {
+                    "actions": ["navigate_to_tag", "navigate_to_pose"],
+                    "timeout": 180
+                },
                 "x-action-params": {
-                    "start_mapping": {"params": ["map_name"], "description": "Start SLAM mapping with given map name"},
+                    "start_mapping": {"params": ["map_name", "password"], "description": "🔒 向操作者索取密码后传入 password 字段。Start SLAM mapping with given map name."},
                     "stop_mapping": {"params": [], "description": "Stop mapping and save the map"},
                     "tag_place": {"params": ["name", "description"], "description": "Tag current position with a semantic name"},
-                    "untag_place": {"params": ["name"], "description": "Remove a place tag"},
+                    "untag_place": {"params": ["name", "password"], "description": "🔒 向操作者索取密码后传入 password 字段。Remove a place tag."},
                     "list_tags": {"params": [], "description": "List all tags in current map with relative positions"},
                     "list_maps": {"params": [], "description": "List all saved maps"},
-                    "delete_map": {"params": ["map_name"], "description": "Delete a map and its associated data"},
+                    "delete_map": {"params": ["map_name", "password"], "description": "🔒 向操作者索取密码后传入 password 字段。Delete a map and its associated data."},
                     "load_map": {"params": ["map_name"], "description": "Load a map (robot must be at map origin)"},
-                    "navigate_to_tag": {"params": ["tag_name", "speed", "mode", "fail_retry_count", "acceptable_precision", "strategy", "ignore_dynamic_obstacles", "precise"], "description": "Navigate to a tagged place. Returns immediately — call wait_navigation_done to wait for arrival."},
-                    "navigate_to_pose": {"params": ["x", "y", "yaw", "speed", "mode", "fail_retry_count", "acceptable_precision", "strategy", "ignore_dynamic_obstacles", "precise"], "description": "Navigate to coordinates. Returns immediately — call wait_navigation_done to wait for arrival."},
-                    "wait_navigation_done": {"params": ["stall_timeout"], "description": "Block until navigation completes or robot is stuck (no movement for stall_timeout seconds). Must be called after navigate_to_tag or navigate_to_pose."},
-                    "pause_nav": {"params": [], "description": "Pause navigation"},
+                    "unload_map": {"params": [], "description": "Unload current map from chassis, clear map and all artifacts. Sets active map to idle."},
+                    "navigate_to_tag": {"params": ["tag_name", "speed", "mode", "fail_retry_count", "acceptable_precision", "strategy", "ignore_dynamic_obstacles", "precise"], "description": "Navigate to a tagged place. System waits for arrival and notifies upon completion."},
+                    "navigate_to_pose": {"params": ["x", "y", "yaw", "speed", "mode", "fail_retry_count", "acceptable_precision", "strategy", "ignore_dynamic_obstacles", "precise"], "description": "Navigate to coordinates. System waits for arrival and notifies upon completion."},
                     "stop_nav": {"params": [], "description": "Stop and cancel navigation"},
                     # Artifact — 虚拟墙
                     "list_walls": {"params": [], "description": "List all virtual walls on current map"},
-                    "add_wall": {"params": ["start_x", "start_y", "end_x", "end_y"], "description": "Add a virtual wall (forbidden line segment on the map)"},
-                    "remove_wall": {"params": ["artifact_id"], "description": "Remove a virtual wall by ID"},
-                    "clear_walls": {"params": [], "description": "Remove all virtual walls"},
+                    "add_wall": {"params": ["start_x", "start_y", "end_x", "end_y", "password"], "description": "🔒 向操作者索取密码后传入 password 字段。Add a virtual wall (forbidden line segment on the map)."},
+                    "remove_wall": {"params": ["artifact_id", "password"], "description": "🔒 向操作者索取密码后传入 password 字段。Remove a virtual wall by ID."},
+                    "clear_walls": {"params": ["password"], "description": "🔒 向操作者索取密码后传入 password 字段。Remove all virtual walls."},
                     # Artifact — 虚拟轨道
                     "list_tracks": {"params": [], "description": "List all virtual tracks on current map"},
-                    "add_track": {"params": ["start_x", "start_y", "end_x", "end_y"], "description": "Add a virtual track (path constraint line segment)"},
-                    "remove_track": {"params": ["artifact_id"], "description": "Remove a virtual track by ID"},
-                    "clear_tracks": {"params": [], "description": "Remove all virtual tracks"},
+                    "add_track": {"params": ["start_x", "start_y", "end_x", "end_y", "password"], "description": "🔒 向操作者索取密码后传入 password 字段。Add a virtual track (path constraint line segment)."},
+                    "remove_track": {"params": ["artifact_id", "password"], "description": "🔒 向操作者索取密码后传入 password 字段。Remove a virtual track by ID."},
+                    "clear_tracks": {"params": ["password"], "description": "🔒 向操作者索取密码后传入 password 字段。Remove all virtual tracks."},
                     # Artifact — 矩形区域
                     "list_areas": {"params": ["area_usage"], "description": "List rectangle areas of given type (forbidden_area/elevator_area/dangerous_area/coverage_area/maintenance_area/sensor_disable_area/restricted_area)"},
-                    "add_area": {"params": ["area_usage", "start_x", "start_y", "end_x", "end_y", "half_width", "metadata", "escape_distance", "dangerous_area_type", "max_line_speed", "elevator_id", "sensor_type", "restricted_robots_number_limit"], "description": "Add a rectangle area. Metadata auto-built from area-specific params if not provided explicitly."},
-                    "edit_area": {"params": ["area_usage", "artifact_id", "start_x", "start_y", "end_x", "end_y", "half_width", "metadata"], "description": "Edit a rectangle area by ID"},
-                    "remove_area": {"params": ["area_usage", "artifact_id"], "description": "Remove a rectangle area by ID"},
-                    "clear_areas": {"params": ["area_usage"], "description": "Remove all rectangle areas of given type"},
+                    "add_area": {"params": ["area_usage", "start_x", "start_y", "end_x", "end_y", "half_width", "metadata", "escape_distance", "dangerous_area_type", "max_line_speed", "elevator_id", "sensor_type", "restricted_robots_number_limit", "password"], "description": "🔒 向操作者索取密码后传入 password 字段。Add a rectangle area. Metadata auto-built from area-specific params if not provided explicitly."},
+                    "edit_area": {"params": ["area_usage", "artifact_id", "start_x", "start_y", "end_x", "end_y", "half_width", "metadata", "password"], "description": "🔒 向操作者索取密码后传入 password 字段。Edit a rectangle area by ID."},
+                    "remove_area": {"params": ["area_usage", "artifact_id", "password"], "description": "🔒 向操作者索取密码后传入 password 字段。Remove a rectangle area by ID."},
+                    "clear_areas": {"params": ["area_usage", "password"], "description": "🔒 向操作者索取密码后传入 password 字段。Remove all rectangle areas of given type."},
                     # Artifact — 地图POI
                     "list_artifact_pois": {"params": [], "description": "List all POIs on current map (Slamtec artifact POIs, separate from local tag_place tags)"},
-                    "add_artifact_poi": {"params": ["display_name", "poi_type", "x", "y", "yaw"], "description": "Add a POI to the map. If x/y/yaw omitted, chassis uses current robot pose and records sensor data for loop-closure adjustment (recommended during mapping)."},
-                    "remove_artifact_poi": {"params": ["poi_id"], "description": "Remove a POI by UUID"},
-                    "clear_artifact_pois": {"params": [], "description": "Remove all POIs from current map"},
+                    "add_artifact_poi": {"params": ["display_name", "poi_type", "x", "y", "yaw", "password"], "description": "🔒 向操作者索取密码后传入 password 字段。Add a POI to the map. If x/y/yaw omitted, chassis uses current robot pose and records sensor data for loop-closure adjustment (recommended during mapping)."},
+                    "remove_artifact_poi": {"params": ["poi_id", "password"], "description": "🔒 向操作者索取密码后传入 password 字段。Remove a POI by UUID."},
+                    "clear_artifact_pois": {"params": ["password"], "description": "🔒 向操作者索取密码后传入 password 字段。Remove all POIs from current map."},
                     # Pose & Localization
                     "get_pose": {"params": [], "description": "Get current robot pose (x, y, yaw) from Slamtec chassis"},
                     "get_localization_quality": {"params": [], "description": "Get current localization quality (0-100) from Slamtec chassis"},
@@ -365,6 +426,14 @@ class ControlledSpatialPlugin:
                         self._nav_active = False
                         self._nav_lost_count = 0
                         self._map_status = "localized"
+                        # ACP: callback Agent Core
+                        if self._nav_action_id:
+                            elapsed = time.monotonic() - self._nav_start_time
+                            self._acp_callback(str(self._nav_action_id), "completed", {
+                                "pose": self._current_pose,
+                                "elapsed_s": round(elapsed, 1),
+                                "action_id_chassis": str(self._nav_action_id),
+                            })
                     elif action_state == 4 and result_code in (-1, -2):
                         # Done + Failed/Aborted
                         label = "failed" if result_code == -1 else "aborted"
@@ -374,6 +443,17 @@ class ControlledSpatialPlugin:
                         self._nav_active = False
                         self._nav_lost_count = 0
                         self._map_status = "localized"
+                        # ACP: callback Agent Core
+                        if self._nav_action_id:
+                            elapsed = time.monotonic() - self._nav_start_time
+                            self._acp_callback(str(self._nav_action_id), "error", {
+                                "error": self._nav_error,
+                                "result_code": result_code,
+                                "reason": reason,
+                                "elapsed_s": round(elapsed, 1),
+                                "pose": self._current_pose,
+                                "action_id_chassis": str(self._nav_action_id),
+                            })
                     elif action_state == 3:
                         # Paused — still active, don't treat as lost
                         self._nav_lost_count = 0
@@ -382,6 +462,34 @@ class ControlledSpatialPlugin:
                         # NewBorn or Working
                         self._nav_lost_count = 0
                         self._map_status = "navigating"
+                        # Stall detection: if pose hasn't changed for stall_timeout, fail
+                        if self._nav_active and self._current_pose:
+                            if self._nav_last_pose is None:
+                                self._nav_last_pose = dict(self._current_pose)
+                                self._nav_last_move_time = time.monotonic()
+                            else:
+                                dx = abs(self._current_pose.get('x', 0) - self._nav_last_pose.get('x', 0))
+                                dy = abs(self._current_pose.get('y', 0) - self._nav_last_pose.get('y', 0))
+                                if dx > 0.02 or dy > 0.02:
+                                    self._nav_last_pose = dict(self._current_pose)
+                                    self._nav_last_move_time = time.monotonic()
+                                elif time.monotonic() - self._nav_last_move_time > self._nav_stall_timeout:
+                                    print(f"[ControlledSpatial] STALL detected: no movement for {self._nav_stall_timeout}s")
+                                    self._nav_error = f"Navigation stalled: no movement for {self._nav_stall_timeout:.0f}s"
+                                    self._nav_arrived.set()
+                                    self._nav_active = False
+                                    self._nav_lost_count = 0
+                                    # ACP: report stall as error
+                                    if self._nav_action_id:
+                                        elapsed = time.monotonic() - self._nav_start_time
+                                        self._acp_callback(str(self._nav_action_id), "error", {
+                                            "error": self._nav_error,
+                                            "type": "stall",
+                                            "stall_timeout_s": self._nav_stall_timeout,
+                                            "elapsed_s": round(elapsed, 1),
+                                            "pose": self._current_pose,
+                                            "action_id_chassis": str(self._nav_action_id),
+                                        })
                         # Verify the current action matches our expected action_id.
                         # If load_map left a RecoverLocalizationAction running,
                         # we'd see action_state=1 but for the WRONG action.
@@ -419,6 +527,15 @@ class ControlledSpatialPlugin:
                                     self._nav_active = False
                                     self._nav_lost_count = 0
                                     self._map_status = "localized"
+                                    # ACP callback
+                                    if self._nav_action_id:
+                                        elapsed = time.monotonic() - self._nav_start_time
+                                        self._acp_callback(str(self._nav_action_id), "completed", {
+                                            "pose": self._current_pose,
+                                            "elapsed_s": round(elapsed, 1),
+                                            "action_id_chassis": str(self._nav_action_id),
+                                            "detection": "query_by_id",
+                                        })
                                 elif final_action_state == 4 and final_result in (-1, -2):
                                     # Done + Failed/Aborted
                                     label = "failed" if final_result == -1 else "aborted"
@@ -428,15 +545,30 @@ class ControlledSpatialPlugin:
                                     self._nav_active = False
                                     self._nav_lost_count = 0
                                     self._map_status = "localized"
+                                    # ACP callback
+                                    if self._nav_action_id:
+                                        elapsed = time.monotonic() - self._nav_start_time
+                                        self._acp_callback(str(self._nav_action_id), "error", {
+                                            "error": self._nav_error,
+                                            "result_code": final_result,
+                                            "elapsed_s": round(elapsed, 1),
+                                            "pose": self._current_pose,
+                                            "detection": "query_by_id",
+                                        })
                                 else:
                                     # Action exists but not done yet — shouldn't happen
-                                    # since :current returned 404, but handle gracefully
                                     self._nav_lost_count += 1
                                     if self._nav_lost_count >= 5:
                                         self._nav_error = "Action lost on chassis"
                                         self._nav_arrived.set()
                                         self._nav_active = False
                                         self._nav_lost_count = 0
+                                        # ACP callback
+                                        if self._nav_action_id:
+                                            self._acp_callback(str(self._nav_action_id), "error", {
+                                                "error": "Action lost on chassis (query returned non-done state 5 times)",
+                                                "detection": "lost_count",
+                                            })
                             else:
                                 # Can't query action by ID either — truly lost
                                 self._nav_lost_count += 1
@@ -445,6 +577,12 @@ class ControlledSpatialPlugin:
                                     self._nav_arrived.set()
                                     self._nav_active = False
                                     self._nav_lost_count = 0
+                                    # ACP callback
+                                    if self._nav_action_id:
+                                        self._acp_callback(str(self._nav_action_id), "error", {
+                                            "error": "Action truly lost (can't query by ID)",
+                                            "detection": "truly_lost",
+                                        })
                 else:
                     # HTTP error from chassis — don't count as "action lost"
                     # Could be transient network issue; just skip this poll cycle
@@ -476,17 +614,17 @@ class ControlledSpatialPlugin:
             q = 0
         return q
 
-    def _wait_for_localization(self, timeout: float = 30.0) -> bool:
-        """Wait until SLAM reports localization with sufficient quality (>= 50).
+    def _wait_for_localization(self, timeout: float = 10.0) -> bool:
+        """Wait until SLAM reports localization with sufficient quality (>= 30).
 
-        Returns True if quality >= 50, False if timeout but quality >= 30.
+        Returns True if quality >= 30, False if timeout.
         Quality < 30 means the robot likely isn't at the expected position on the map.
         """
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if self._map_status == "localized":
                 q = self._get_localization_quality()
-                if q >= 50:
+                if q >= 30:
                     print(f"[ControlledSpatial] localization quality={q} ✓")
                     return True
                 print(f"[ControlledSpatial] localization quality={q}, waiting...")
@@ -496,7 +634,37 @@ class ControlledSpatialPlugin:
         print(f"[ControlledSpatial] localization quality final={q}")
         return q >= 30
 
+    def _clear_chassis_artifacts(self):
+        """Clear all artifact data (walls, tracks, areas, POIs) from chassis.
+        Best-effort: errors are logged but not propagated."""
+        for usage in ("walls", "tracks"):
+            result = self._slamtec.clear_lines(usage)
+            if result.get("error"):
+                print(f"[ControlledSpatial] clear_lines({usage}) warning: {result.get('error')}")
+        for usage in ("forbidden_area", "elevator_area", "dangerous_area",
+                      "coverage_area", "maintenance_area", "sensor_disable_area",
+                      "restricted_area"):
+            result = self._slamtec.clear_rectangle_areas(usage)
+            if result.get("error"):
+                print(f"[ControlledSpatial] clear_rectangle_areas({usage}) warning: {result.get('error')}")
+        result = self._slamtec.clear_pois()
+        if result.get("error"):
+            print(f"[ControlledSpatial] clear_pois warning: {result.get('error')}")
+
     # ── Dispatch ─────────────────────────────────────────────────────────────
+
+    def _check_password(self, args: dict) -> str | None:
+        """Check password for protected actions. Returns error string or None if OK."""
+        password = args.get("password", "")
+        if not password:
+            return (
+                "此操作需要密码。请向操作者索取密码后，在 password 参数中传入。"
+                "(This operation requires a password. Please ask the operator for the password "
+                "and provide it via the 'password' parameter.)"
+            )
+        if password != self._password:
+            return "密码错误 (Incorrect password)"
+        return None
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
@@ -506,6 +674,12 @@ class ControlledSpatialPlugin:
         if action == "info":
             return {"state": "running"}
 
+        # Password check for protected actions
+        if action in self._protected_actions:
+            err = self._check_password(args)
+            if err:
+                return {"error": err, "action": action}
+
         # ── Mapping ────────────────────────────────────────────────────────
 
         elif action == "start_mapping":
@@ -514,6 +688,19 @@ class ControlledSpatialPlugin:
                 return {"error": "map_name is required"}
             if self._is_mapping:
                 return {"error": "Mapping already active"}
+            # Cancel any running navigation before starting mapping
+            if self._nav_active:
+                self._slamtec.cancel_current_action()
+                self._nav_active = False
+                self._nav_action_id = None
+                self._nav_arrived.clear()
+            # Stop mapping mode first (defensive: chassis might still be in
+            # mapping mode e.g. after driver restart), then clear map and
+            # artifacts to start with a clean slate.
+            self._slamtec.stop_mapping()
+            self._slamtec.clear_map()
+            self._clear_chassis_artifacts()
+
             result = self._slamtec.start_mapping()
             if result.get("error"):
                 return {"error": f"Start mapping failed: {result.get('error')}", "api_result": result}
@@ -526,7 +713,7 @@ class ControlledSpatialPlugin:
             return {"status": "mapping", "map_name": map_name, "map_path": map_path}
 
         elif action == "stop_mapping":
-            if not self._active_map:
+            if not self._is_mapping:
                 return {"error": "No active mapping session"}
             map_name = self._active_map
             map_path = f"{self._pcd_dir}/controlled_{map_name}.stcm"
@@ -635,7 +822,7 @@ class ControlledSpatialPlugin:
             if not map_name:
                 return {"error": "map_name is required"}
             if self._active_map == map_name:
-                return {"error": f"Cannot delete active map '{map_name}'. Stop mapping or unload first."}
+                return {"error": f"Cannot delete active map '{map_name}'. Unload it first with unload_map."}
             if self._db.delete_map(map_name):
                 return {"status": "deleted", "map_name": map_name}
             return {"error": f"Map '{map_name}' not found"}
@@ -646,6 +833,12 @@ class ControlledSpatialPlugin:
                 return {"error": "map_name is required"}
             if self._is_mapping:
                 return {"error": "Cannot load map while mapping is active. Stop mapping first."}
+            # Cancel any running navigation before loading a new map
+            if self._nav_active:
+                self._slamtec.cancel_current_action()
+                self._nav_active = False
+                self._nav_action_id = None
+                self._nav_arrived.clear()
             map_info = self._db.get_map(map_name)
             if not map_info:
                 return {"error": f"Map '{map_name}' not found"}
@@ -656,6 +849,9 @@ class ControlledSpatialPlugin:
             if clear_result.get("error"):
                 # Non-fatal: chassis may have no map to clear
                 print(f"[ControlledSpatial] clear_map warning: {clear_result.get('error')}")
+
+            # 1.5 Clear all artifact data from previous map to avoid cross-map contamination
+            self._clear_chassis_artifacts()
 
             # 2. Upload saved map file to chassis
             if not os.path.isfile(map_path):
@@ -692,9 +888,12 @@ class ControlledSpatialPlugin:
             self._active_map = map_name
             self._map_status = "localizing"
 
-            # Wait for localization to converge (up to 30s)
-            if not self._wait_for_localization(timeout=30.0):
+            # Wait for localization to converge (up to 10s)
+            if not self._wait_for_localization(timeout=10.0):
                 q = self._get_localization_quality()
+                if q >= 30:
+                    self._map_status = "localized"
+                    return {"status": "loaded", "map_name": map_name, "map_path": map_path}
                 if q < 30:
                     return {
                         "status": "loaded_poor",
@@ -702,12 +901,6 @@ class ControlledSpatialPlugin:
                         "map_path": map_path,
                         "error": f"Localization quality too low ({q}/100). Robot may not be at the map origin, or the map may be outdated. Try: 1) move robot to map origin and reload, 2) rebuild the map.",
                     }
-                return {
-                    "status": "loaded",
-                    "map_name": map_name,
-                    "map_path": map_path,
-                    "warning": f"Localization quality is marginal ({q}/100). Navigation may fail. Consider moving robot to map origin or rebuilding the map.",
-                }
             self._map_status = "localized"
             return {"status": "loaded", "map_name": map_name, "map_path": map_path}
 
@@ -742,6 +935,11 @@ class ControlledSpatialPlugin:
 
             self._slamtec.set_motion_strategy(strategy)
 
+            # Disable poll thread's nav monitoring BEFORE cancel, to prevent
+            # race where poll sees action_state=-1 and sets _nav_arrived.
+            self._nav_active = False
+            self._nav_action_id = None
+
             # Cancel any existing action (e.g. RecoverLocalizationAction from load_map)
             # before creating a new MoveToAction, to avoid monitoring the wrong action.
             cancel_result = self._slamtec.cancel_current_action()
@@ -754,6 +952,8 @@ class ControlledSpatialPlugin:
             self._nav_active = True
             self._nav_start_time = time.monotonic()
             self._nav_lost_count = 0
+            self._nav_last_pose = None
+            self._nav_last_move_time = time.monotonic()
             result = self._slamtec.move_to(poi["x"], poi["y"], yaw=yaw, speed_ratio=speed, mode=mode,
                                            fail_retry_count=fail_retry_count,
                                            acceptable_precision=acceptable_precision,
@@ -792,6 +992,7 @@ class ControlledSpatialPlugin:
 
             return {
                 "status": "navigating",
+                "action_id": str(self._nav_action_id) if self._nav_action_id else None,
                 "target": tag_name,
                 "pose": {"x": poi["x"], "y": poi["y"], "yaw": yaw},
             }
@@ -817,6 +1018,10 @@ class ControlledSpatialPlugin:
 
             self._slamtec.set_motion_strategy(strategy)
 
+            # Disable poll thread's nav monitoring BEFORE cancel
+            self._nav_active = False
+            self._nav_action_id = None
+
             # Cancel any existing action before creating a new MoveToAction
             cancel_result = self._slamtec.cancel_current_action()
             print(f"[ControlledSpatial] cancel before navigate: {cancel_result}")
@@ -827,6 +1032,8 @@ class ControlledSpatialPlugin:
             self._nav_active = True
             self._nav_start_time = time.monotonic()
             self._nav_lost_count = 0
+            self._nav_last_pose = None
+            self._nav_last_move_time = time.monotonic()
             result = self._slamtec.move_to(x, y, yaw=yaw, speed_ratio=speed, mode=mode,
                                            fail_retry_count=fail_retry_count, acceptable_precision=acceptable_precision,
                                            ignore_dynamic_obstacles=ignore_dynamic,
@@ -864,71 +1071,28 @@ class ControlledSpatialPlugin:
 
             return {
                 "status": "navigating",
+                "action_id": str(self._nav_action_id) if self._nav_action_id else None,
                 "target_pose": {"x": x, "y": y, "yaw": yaw},
             }
 
-        elif action == "wait_navigation_done":
-            stall_timeout = float(args.get("stall_timeout", 60))
-            poll_interval = 0.5
-            last_pose = self._get_pose()
-            stall_start = time.monotonic()
-
-            while True:
-                if self._nav_arrived.is_set():
-                    if self._nav_error:
-                        error = self._nav_error
-                        self._nav_error = None
-                        self._nav_active = False
-                        return {"status": "error", "error": error}
-                    self._nav_active = False
-                    return {"status": "arrived", "pose": self._get_pose()}
-
-                # If nav is active but no action on chassis, query by ID
-                if self._nav_active and self._nav_action_id is not None:
-                    nav_status = self._slamtec.get_nav_status()
-                    if isinstance(nav_status, dict) and nav_status.get("action_state") == -1:
-                        final = self._slamtec.get_action_status(str(self._nav_action_id))
-                        if isinstance(final, dict) and not final.get("error"):
-                            fs = final.get("state") if isinstance(final.get("state"), dict) else None
-                            if isinstance(fs, dict):
-                                final_status = int(fs.get("status", -1))
-                                final_result = int(fs.get("result", 0))
-                                reason = fs.get("reason", "")
-                                if final_status == 4:
-                                    if final_result == 0:
-                                        self._nav_active = False
-                                        return {"status": "arrived", "pose": self._get_pose()}
-                                    else:
-                                        label = "failed" if final_result == -1 else "aborted"
-                                        self._nav_active = False
-                                        return {"status": "error", "error": f"Action {label}: result={final_result}, reason={reason}"}
-
-                time.sleep(poll_interval)
-
-                # Stall detection: no movement for stall_timeout seconds
-                current_pose = self._get_pose()
-                if current_pose and last_pose:
-                    dx = current_pose["x"] - last_pose["x"]
-                    dy = current_pose["y"] - last_pose["y"]
-                    moved = math.sqrt(dx * dx + dy * dy)
-                    dyaw = abs(current_pose.get("yaw", 0) - last_pose.get("yaw", 0))
-                    # Normalize yaw difference to [0, pi]
-                    if dyaw > math.pi:
-                        dyaw = 2 * math.pi - dyaw
-                    if moved > 0.05 or dyaw > 0.05:
-                        stall_start = time.monotonic()
-                        last_pose = current_pose
-
-                if time.monotonic() - stall_start > stall_timeout:
-                    self._slamtec.cancel_current_action()
-                    self._nav_active = False
-                    return {"status": "timeout", "error": f"No movement for {stall_timeout}s, navigation cancelled"}
-
-        elif action == "pause_nav":
-            result = self._slamtec.cancel_current_action()
-            if result.get("error"):
-                return {"error": f"PauseNav failed: {result.get('error')}", "api_result": result}
-            return {"status": "paused"}
+        elif action == "unload_map":
+            if not self._active_map:
+                return {"error": "No active map to unload"}
+            if self._is_mapping:
+                return {"error": "Cannot unload map while mapping is active. Stop mapping first."}
+            # Cancel any running navigation
+            if self._nav_active:
+                self._slamtec.cancel_current_action()
+                self._nav_active = False
+                self._nav_action_id = None
+                self._nav_arrived.clear()
+            # Clear chassis map and all artifacts
+            self._slamtec.clear_map()
+            self._clear_chassis_artifacts()
+            unloaded = self._active_map
+            self._active_map = None
+            self._map_status = "idle"
+            return {"status": "unloaded", "map_name": unloaded}
 
         elif action == "stop_nav":
             result = self._slamtec.cancel_current_action()

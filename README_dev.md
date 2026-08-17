@@ -387,7 +387,8 @@ The Agent Core Web Dashboard automatically selects a renderer based on the `form
 | `audio/*` (e.g. `audio/pcm-16k`) | Audio waveform | `hint.startsWith('audio/')` |
 | `video/*` (e.g. `video/mjpeg`) | Video stream | `hint.startsWith('video/')` |
 | `image/jpeg` | Camera image | `hint === 'image/jpeg'` |
-| `image/depth-z16` | Depth colormap | `hint === 'image/depth-z16'` |
+| `image/depth-z16` | Depth colormap (raw) | `hint === 'image/depth-z16'` |
+| `image/depth-zlib` | Depth colormap (zlib compressed) | `hint === 'image/depth-zlib'` |
 | `image` | Generic image | `hint === 'image'` |
 | `data/json` | Text / KV panel | `hint === 'data/json'` |
 | `text/*` | Text display | `hint.startsWith('text/')` |
@@ -397,6 +398,36 @@ The Agent Core Web Dashboard automatically selects a renderer based on the `form
 | `sensor/mapping` | 2D Occupancy map | `hint === 'sensor/mapping'` |
 | `sensor/htmsg` | HT structured message | `hint === 'sensor/htmsg'` |
 | (no hint) | Activity stream | Fallback when no format specified |
+
+### Depth Rendering — `image/depth-z16` vs `image/depth-zlib`
+
+Two depth formats are supported:
+
+- **`image/depth-z16`**: Raw uint16 buffer (640×480 = 614KB/frame). Uses `sensor_msgs/Image`. Simple but high bandwidth — causes CPU saturation on ARM64 due to DDS serialization of large messages.
+
+- **`image/depth-zlib`** (recommended): Zlib-compressed uint16 buffer (~10-15KB/frame). Uses `sensor_msgs/CompressedImage` with `format="16UC1; compressedDepth zlib"`. 47× smaller, negligible publish overhead. Dashboard decompresses in browser using native `DecompressionStream`.
+
+**Driver-side usage (Python):**
+```python
+import zlib
+import numpy as np
+from sensor_msgs.msg import CompressedImage
+
+depth_image = np.asanyarray(depth_frame.get_data())  # uint16, 640×480
+compressed = zlib.compress(depth_image.tobytes(), 1)  # level=1 fastest
+
+msg = CompressedImage()
+msg.format = "16UC1; compressedDepth zlib"
+msg.data = compressed
+publisher.publish(msg)
+```
+
+**Tool definition:**
+```yaml
+topic_out:
+  - topic: /{namespace}/camera/depth
+    format: image/depth-zlib
+```
 
 ### Skeleton Rendering (`sensor/skeleton`) — Full Spec
 
@@ -523,6 +554,7 @@ Each driver must include a `deploy/service.yml` file that defines its Docker Com
 
 ```yaml
 unitree-g1:                      # Service name (must be unique)
+  container_name: embodied-unitree-g1  # Recommended: embodied-{provider}-{model}
   image: __IMAGE__               # Placeholder, replaced by Agent Core at deploy time
   privileged: true               # Required: access to /dev and hardware
   volumes:
@@ -542,7 +574,284 @@ unitree-g1:                      # Service name (must be unique)
 
 **Notes:**
 
+- **`container_name` 命名建议**: 推荐使用 `embodied-{provider}-{model}` 格式（如 `embodied-dji-matrice300`）。Agent Core 会自动从 service.yml 中读取 `container_name` 并用于容器状态查询/停止/删除。如果不指定 `container_name`，Agent Core 会回退到 `embodied-{driver_id}` 作为默认值。自定义名称（如 `dji-m300`）也可以正常工作。
 - `privileged: true` and `/dev:/dev` are mandatory for any driver that accesses hardware (cameras, USB devices, GPIO)
 - `network_mode`, `ipc`, `pid` are injected by Agent Core during deployment — do not specify them in service.yml
 - The `__IMAGE__` placeholder is automatically replaced with the actual image reference
 - Service name should follow the pattern `{provider}-{model}` (e.g. `unitree-g1`, `phanthy-remote-control`)
+
+---
+
+## Action Completion Protocol (ACP)
+
+When a tool performs a long-running physical action (TTS playback, navigation, arm gesture), the LLM agent needs to know when it finishes. ACP solves this at the **harness level** — Agent Core transparently tracks async actions via an automatic barrier. The LLM is unaware of the async machinery.
+
+### How It Works
+
+```
+LLM calls speak("hello world")
+  → Driver dispatch() returns {"state":"speaking", "action_id":"tts_speak_a7f3c"}
+  → Agent Core registers pending action (from x-completion + action_id in result)
+  → LLM sees immediate result, continues reasoning
+
+LLM calls navigate_to_tag("P3")
+  → Agent Core BARRIER: waits until speak-a7f3c completes before dispatching
+  → ...TTS finishes, driver POSTs /api/acp/complete → pending cleared...
+  → BARRIER releases, navigate dispatched
+  → Driver returns {"state":"navigating", "action_id":"nav_b2e8d"}
+  → LLM continues reasoning (can pre-plan next speech)
+
+LLM calls speak("welcome to P3")
+  → BARRIER: waits until nav_b2e8d completes
+  → ...navigation arrives, driver POSTs completion...
+  → speak dispatched
+```
+
+**Key**: The barrier is automatic and transparent. No `sync()` tool needed. The LLM just calls tools normally — the harness ensures physical actions execute sequentially.
+
+### Barrier Scope
+
+The barrier blocks **actuator** and **processor** type tools while pending actions exist. It does NOT block:
+- **sensor** tools (camera, lidar, battery queries) — always instant
+- **resource** tools (list_tags, list_maps, get_status) — read-only
+
+### Driver Implementation Guide
+
+#### 1. Declare `x-completion` in tool schema
+
+Add to your tool's `inputSchema`:
+
+```python
+"inputSchema": {
+    "type": "object",
+    "properties": { ... },
+    "required": ["action"],
+    "x-completion": {
+        "actions": ["speak", "navigate_to_tag"],  # which actions are async
+        "timeout": 120                             # max wait seconds (fallback)
+    }
+}
+```
+
+Only declare actions that are genuinely long-running (>3s). Short blocking calls (1-2s service calls) should remain synchronous.
+
+#### 2. Return `action_id` in async action responses
+
+When an async action is dispatched, include `action_id` in the return dict:
+
+```python
+from uuid import uuid4
+
+def dispatch(self, action, args):
+    if action == "speak":
+        action_id = f"tts_speak_{uuid4().hex[:8]}"
+        threading.Thread(target=self._do_speak, args=(args["text"], action_id), daemon=True).start()
+        return {"state": "speaking", "action_id": action_id}
+```
+
+The `action_id` must be unique — it's the correlation key for completion.
+
+#### 3. POST completion to Agent Core
+
+When the action finishes, POST to Agent Core's ACP endpoint:
+
+```python
+def _acp_callback(self, action_id: str, status: str, result: dict):
+    """POST action completion to Agent Core."""
+    import urllib.request as _urllib
+    import ssl as _ssl
+    import json
+    import os as _os
+
+    agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+    ctx = _ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = _ssl.CERT_NONE
+    payload = json.dumps({
+        "action_id": action_id,
+        "status": status,       # "completed" | "error" | "cancelled"
+        "result": result,       # task-specific data
+        "tool": self.PREFIX,    # tool name for logging
+        "ts": __import__('time').time(),
+    }).encode()
+    try:
+        req = _urllib.Request(
+            f"{agent_core_url}/api/acp/complete",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        _urllib.urlopen(req, timeout=5, context=ctx)
+    except Exception as e:
+        import sys
+        print(f"[ACP] callback failed for {action_id}: {e}", file=sys.stderr)
+```
+
+**Important**: Use `import os as _os` inside the callback function — nested functions and threads may not see module-level `os` in some contexts.
+
+Call this from your worker thread when the action finishes. `AGENT_CORE_URL` env var is set in all driver containers.
+
+#### 4. No SSE endpoint needed
+
+Drivers do NOT need to implement an `/sse` endpoint. The completion notification is a simple HTTP POST.
+
+### Advanced Patterns
+
+#### Dynamic Timeout (TTS)
+
+For text-to-speech, timeout should scale with text length:
+
+```python
+timeout = len(text) / 3.0 + 10  # ~3 chars/sec + buffer
+```
+
+If actual playback duration is known (e.g. from a progress callback):
+
+```python
+timeout = reported_duration + 5.0  # actual duration + small buffer
+```
+
+#### Race Condition Buffer (Event-Based Completion)
+
+When completion depends on an external event (e.g. ROS2 PlayEvent topic), the event may arrive BEFORE your pending wait is registered. Use a buffer:
+
+```python
+class TtsPlugin:
+    def __init__(self):
+        self._play_event_buffer: dict[str, int] = {}   # sid → event_code
+        self._pending_play: dict[str, threading.Event] = {}
+
+    def _on_play_event(self, msg):
+        """ROS2 callback — may fire before _pending_play[sid] exists."""
+        sid = msg.sid
+        event_code = msg.event_code
+        # Always buffer
+        self._play_event_buffer[sid] = event_code
+        # Also signal if pending exists
+        if sid in self._pending_play:
+            self._pending_play[sid].set()
+
+    def _wait_for_completion(self, sid, action_id, timeout):
+        # Check buffer first (event already arrived)
+        buffered = self._play_event_buffer.pop(sid, None)
+        if buffered is not None:
+            status = "completed" if buffered == 1 else "error"
+            self._acp_callback(action_id, status, {})
+            return
+        # Not buffered yet — register and wait
+        ev = threading.Event()
+        self._pending_play[sid] = ev
+        ev.wait(timeout=timeout)
+        self._pending_play.pop(sid, None)
+        buffered = self._play_event_buffer.pop(sid, None)
+        status = "completed" if buffered == 1 else "error"
+        self._acp_callback(action_id, status, {})
+```
+
+#### Stall Detection (Navigation)
+
+For navigation actions, detect when the robot stops moving but hasn't arrived:
+
+```python
+def _nav_poll_thread(self, action_id, target, stall_timeout=60):
+    last_pose = self._get_current_pose()
+    last_move_time = time.time()
+
+    while True:
+        time.sleep(1.0)
+        pose = self._get_current_pose()
+
+        if self._has_arrived(pose, target):
+            self._acp_callback(action_id, "completed", {"pose": pose})
+            return
+
+        if self._distance(pose, last_pose) > 0.05:  # moved
+            last_pose = pose
+            last_move_time = time.time()
+        elif time.time() - last_move_time > stall_timeout:
+            self._acp_callback(action_id, "error", {"error": "stall timeout"})
+            return
+```
+
+### Backward Compatibility
+
+- Tools without `x-completion` → unchanged behavior (sync return)
+- Tools that don't return `action_id` → no pending registered, barrier passes through
+- Drivers that don't POST completion → barrier will timeout gracefully (uses `x-completion.timeout`)
+
+---
+
+## System Hooks (`x-hooks`)
+
+System hooks enable **instant, bypass-LLM actions** triggered by framework events. Unlike normal tool calls (which require LLM decision + ACP barrier), hooks fire directly and immediately (<50ms).
+
+### Use Cases
+
+- **LED feedback**: blink on hearing, breathe while thinking, flash red on error
+- **Interrupt**: stop TTS/motion instantly on user barge-in (no barrier wait)
+- **Status indicators**: hardware signals for robot state
+
+### How It Works
+
+```
+Driver declares x-hooks in tool schema
+  → Agent Core registers bindings at device init/heartbeat
+  → System event occurs (ASR arrives, LLM starts, error...)
+  → Agent Core fires hook: call_tool_direct() → bypasses barrier + ACP
+  → Driver executes action immediately
+```
+
+### Driver Implementation
+
+Add `x-hooks` to your tool's `inputSchema`:
+
+```python
+"inputSchema": {
+    "type": "object",
+    "properties": { ... },
+    "required": ["action"],
+    "x-hooks": {
+        "on_hearing":    {"action": "effect", "params": {"effect": "blink_blue"}},
+        "on_thinking":   {"action": "effect", "params": {"effect": "breathe_rainbow"}},
+        "on_error":      {"action": "effect", "params": {"effect": "blink_red_5s"}},
+        "on_kws_wakeup": {"action": "effect", "params": {"effect": "solid_blue_2s"}},
+        "on_interrupt_all": {"action": "interrupt_all"},
+    }
+}
+```
+
+Each hook entry maps a `hook_id` to an action + params that will be called directly.
+
+### Available Hook IDs
+
+| Hook ID | Fired When | Typical Binding |
+|---------|-----------|-----------------|
+| `on_hearing` | ASR detects voice activity | LED blink / pause TTS |
+| `on_kws_wakeup` | Wake word detected | LED solid / chime |
+| `on_thinking` | LLM turn starts | LED breathe animation |
+| `on_error` | LLM call fails after retries | LED red flash |
+| `on_interrupt_speak` | User barge-in (speech) | Stop TTS |
+| `on_interrupt_motion` | Emergency stop | Stop locomotion |
+| `on_interrupt_all` | Full interrupt | Stop all outputs |
+
+### Key Differences from Normal Tools
+
+| Aspect | Normal Tool Call | Hook Call |
+|--------|----------------|-----------|
+| Triggered by | LLM decision | System event |
+| Barrier | Waits for pending | Bypasses |
+| ACP | Registers pending | Does not |
+| Latency | 1-5s (LLM round) | <50ms |
+| Schema validation | Yes | No |
+
+### Manual Triggering (API)
+
+```bash
+# Fire a hook manually
+curl -X POST https://localhost:15678/api/hooks/fire \
+  -H 'Content-Type: application/json' \
+  -d '{"hook": "on_interrupt_all"}'
+
+# List registered hooks
+curl https://localhost:15678/api/hooks
+```

@@ -1,0 +1,7 @@
+# 请求部分：输入目标模式
+int16 controller_mode #切换不同的policy
+int16 sub_mode #同一policy内部不同的模式
+---
+# 响应部分：返回执行结果
+bool success
+string message
