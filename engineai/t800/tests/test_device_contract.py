@@ -798,7 +798,7 @@ class DevicePluginContractTests(unittest.TestCase):
         import struct
 
         # 无 plugins.vision 配置时默认源为 slam（odom 标准坐标系，z 轴朝上），
-        # raw 传感器坐标系数据默认被忽略——直接渲染会上下颠倒。
+        # raw 传感器坐标系数据默认被忽略。
         plugin = self.device.VisionPlugin(CONFIG, "robot", self.ros)
         self.assertEqual("slam", plugin._source)
         plugin.start()
@@ -812,6 +812,38 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual(1, plugin._frames["pointcloud"])
         tools = {tool["name"]: tool for tool in plugin.get_tools()}
         self.assertIn("slam", tools["pointcloud"]["description"])
+
+    def test_vision_pointcloud_negates_z_for_platform_renderer(self):
+        import struct
+
+        # 渲染端 pointcloud.js 默认轴映射按 G1/Livox 约定：屏幕向上 = -z_data。
+        # slam 云 z 朝上，发布前对 z 分量取反，渲染才直立。
+        plugin = self.device.VisionPlugin(CONFIG, "robot", self.ros)
+        plugin.start()
+        fields = [
+            types.SimpleNamespace(name="x", offset=0),
+            types.SimpleNamespace(name="y", offset=4),
+            types.SimpleNamespace(name="z", offset=8),
+            types.SimpleNamespace(name="rgb", offset=12),
+        ]
+        data = struct.pack("<4f4f", 1.0, 2.0, 3.0, 0.5, 4.0, 5.0, 6.0, 0.5)
+        plugin._on_cloud_slam(types.SimpleNamespace(point_step=16, data=data, fields=fields))
+        out = plugin._cloud_pub.messages[-1]
+        self.assertEqual(struct.pack("<II", 16, 2), bytes(out.data[:8]))
+        body = bytes(out.data[8:])
+        x0, y0, z0 = struct.unpack("<3f", body[0:12])
+        x1, y1, z1 = struct.unpack("<3f", body[16:28])
+        self.assertEqual((1.0, 2.0, -3.0), (x0, y0, z0))  # z 取反
+        self.assertEqual((4.0, 5.0, -6.0), (x1, y1, z1))
+        self.assertEqual(0.5, struct.unpack("<f", body[28:32])[0])  # 其余字段原样
+
+    def test_vision_pointcloud_passthrough_without_z_field(self):
+        plugin = self.device.VisionPlugin(CONFIG, "robot", self.ros)
+        plugin.start()
+        data = bytes(range(32))  # 2 点 × 16 字节,无 fields → 原样透传
+        plugin._on_cloud_slam(types.SimpleNamespace(point_step=16, data=data))
+        out = plugin._cloud_pub.messages[-1]
+        self.assertEqual(bytes(range(32)), bytes(out.data[8:]))
 
     def test_vision_config_source_override_and_select_source(self):
         config = dict(CONFIG, plugins={"vision": {"enabled": True, "source": "raw"}})
