@@ -237,8 +237,9 @@ class VoiceGesturePlugin:
     def _match_motion(self, text: str) -> str | None:
         normalised = _normalise_text(text)
         for motion_id, definition in self._motions.items():
-            if normalised in definition["phrases"]:
-                return motion_id
+            for phrase in definition["phrases"]:
+                if phrase and phrase in normalised:
+                    return motion_id
         return None
 
     def _start_motion(self, motion_id: str, text: str) -> None:
