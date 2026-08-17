@@ -1833,6 +1833,10 @@ class LocomotionPlugin:
             float(limits.get("accel_vy", 1.0)),
             float(limits.get("accel_vyaw", 1.0)),
         )
+        # 流发布看门狗：发布线程疑似死亡（超过 gap 上限未发布）时立即停流归零。
+        self._watchdog_period = float(limits.get("stream_watchdog_period_sec", 0.5))
+        self._stream_gap_limit_sec = max(5.0 / float(limits["velocity_rate_hz"]), 0.5)
+        self._watchdog_timer = None
         self._stream = RepeatingCommand(
             self._publish_payload,
             self._publish_zero,
@@ -1879,11 +1883,40 @@ class LocomotionPlugin:
         self._publisher = self._node.create_publisher(
             BodyVelCmd, self._config["topics"]["body_velocity"], _RELIABLE
         )
+        self._watchdog_timer = self._node.create_timer(
+            self._watchdog_period, self._stream_health_check
+        )
 
     def stop(self) -> None:
         self._stream.stop()
 
     def dispatch(self, action: str, args: dict) -> dict:
+        try:
+            return self._dispatch(action, args)
+        except Exception:
+            # fail-closed：任何异常都先归零再抛出，绝不让异常路径留下运动中的流。
+            self._stop_fail_closed()
+            raise
+
+    def _stop_fail_closed(self) -> None:
+        try:
+            self._stream.stop()
+        except Exception:
+            pass
+        try:
+            self._publish_zero()
+        except Exception:
+            pass
+
+    def _stream_health_check(self) -> None:
+        snapshot = self._stream.snapshot()
+        if not snapshot.active or snapshot.last_publish_at is None:
+            return
+        if time.monotonic() - snapshot.last_publish_at > self._stream_gap_limit_sec:
+            # 发布线程疑似死亡：立即停流并发布零速度（固件 2s 超时是最后防线）。
+            self._stream.stop()
+
+    def _dispatch(self, action: str, args: dict) -> dict:
         if action == "start":
             return {"state": "ready"}
         if action == "stop":

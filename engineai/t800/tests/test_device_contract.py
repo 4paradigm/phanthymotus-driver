@@ -541,6 +541,37 @@ class DevicePluginContractTests(unittest.TestCase):
         time.sleep(0.12)  # 100Hz × 1.0 m/s² 加速度：≥5 tick 即可到 0.05 后封顶
         self.assertAlmostEqual(0.05, plugin._publisher.messages[-1].linear_velocity[0], places=3)
 
+    def test_locomotion_dispatch_failure_publishes_zero_and_raises(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        original = plugin._stream.start
+
+        def boom(command, duration, ramp=None):
+            raise RuntimeError("simulated publish failure")
+
+        plugin._stream.start = boom
+        with self.assertRaises(RuntimeError):
+            plugin.dispatch("move", {"vx": 0.2, "duration": 1.0, "force": True})
+        self.assertEqual([0.0, 0.0], plugin._publisher.messages[-1].linear_velocity)
+
+    def test_locomotion_watchdog_zeros_stale_stream(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        plugin.dispatch("move", {"vx": 0.2, "duration": -1, "force": True})
+        time.sleep(0.03)
+        plugin._stream_gap_limit_sec = -1.0  # 强制判陈旧（模拟 worker 线程死亡）
+        plugin._stream_health_check()
+        self.assertFalse(plugin._stream.snapshot().active)
+        self.assertEqual([0.0, 0.0], plugin._publisher.messages[-1].linear_velocity)
+
+    def test_locomotion_watchdog_keeps_healthy_stream(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        plugin.dispatch("move", {"vx": 0.2, "duration": -1, "force": True})
+        time.sleep(0.03)
+        plugin._stream_health_check()
+        self.assertTrue(plugin._stream.snapshot().active)
+
     def test_locomotion_gate_accepts_walk_states(self):
         plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
         plugin.start()
