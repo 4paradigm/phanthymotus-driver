@@ -25,7 +25,7 @@ try:
     _LATCHED_QOS = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
                               history=HistoryPolicy.KEEP_LAST, depth=1,
                               durability=DurabilityPolicy.TRANSIENT_LOCAL)
-    _DIAG_QOS = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
+    _DIAG_QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                             history=HistoryPolicy.KEEP_LAST, depth=10)
 except Exception:
     _HAS_ROS2 = False
