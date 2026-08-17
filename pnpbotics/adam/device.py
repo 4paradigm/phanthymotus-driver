@@ -9,8 +9,14 @@ Plugins:
 """
 
 import json
+import io
+import math
+import os
+import struct
+import sys
 import threading
 import time
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -111,6 +117,14 @@ ROS2_UPPER_BODY_JOINTS = [
     "dof_pos/hand_middle_Right", "dof_pos/hand_index_Right",
     "dof_pos/hand_thumb_1_Right", "dof_pos/hand_thumb_2_Right",
 ]
+
+
+def _best_effort_qos():
+    return QoSProfile(
+        reliability=ReliabilityPolicy.BEST_EFFORT,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=1,
+    )
 
 
 # ===========================================================================
@@ -721,9 +735,588 @@ class HandPlugin:
         return None
 
 
-# ===========================================================================
-# ModelPlugin — URDF resource
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# Local ZED Mini camera cards
+# ---------------------------------------------------------------------------
+
+class ZedCameraPlugin:
+    """Publish the Adam ZED Mini through the local ZED Python SDK.
+
+    The camera is physically attached to the Jetson running this container, so
+    there is no reason to consume the separate ZED network-stream sender.  One
+    capture thread owns the SDK camera and feeds four lightweight ROS2 topics:
+    JPEG RGB, zlib-compressed uint16 depth, JSON camera information, and an
+    optional point cloud for the native Phanthymotus renderer.
+    """
+
+    _FORMATS = {
+        "camera_head": "image/jpeg",
+        "camera_depth": "image/depth-zlib",
+        "camera_info": "data/json",
+        "camera_pointcloud": "sensor/pointcloud",
+    }
+
+    def __init__(self, plugin_config, namespace, executor):
+        self._config = dict(plugin_config or {})
+        self._namespace = namespace
+        self._topics = {
+            "camera_head": f"/{namespace}/camera/head",
+            "camera_depth": f"/{namespace}/camera/head/depth",
+            "camera_info": f"/{namespace}/camera/head/info",
+            "camera_pointcloud": f"/{namespace}/camera/head/points",
+        }
+
+        pointcloud_config = self._config.get("pointcloud", {})
+        if not isinstance(pointcloud_config, dict):
+            pointcloud_config = {}
+        self._pointcloud_config = pointcloud_config
+        self._pointcloud_enabled = bool(
+            pointcloud_config.get(
+                "enabled", self._config.get("pointcloud_enabled", False)))
+        self._rgb_hz = max(1.0, min(float(self._config.get("rgb_hz", 15)), 30.0))
+        self._depth_hz = max(1.0, min(float(self._config.get("depth_hz", 8)), 15.0))
+        self._info_hz = max(0.2, min(float(self._config.get("info_hz", 1)), 5.0))
+        self._pointcloud_hz = max(
+            0.2, min(float(pointcloud_config.get("hz", 2)), 10.0))
+        self._jpeg_quality = max(
+            20, min(int(self._config.get("jpeg_quality", 70)), 95))
+        self._max_points = max(
+            1000, min(int(pointcloud_config.get("max_points", 10000)), 40000))
+        self._max_point_distance_m = max(
+            1.0, min(float(pointcloud_config.get("max_distance_m", 8.0)), 30.0))
+        mount_rotation = pointcloud_config.get("mount_rotation_deg", {})
+        if not isinstance(mount_rotation, dict):
+            mount_rotation = {}
+        self._pointcloud_mount_rotation_deg = {
+            axis: float(mount_rotation.get(axis, 0.0))
+            for axis in ("x", "y", "z")
+        }
+        self._pointcloud_mount_rotation = self._rotation_matrix_xyz(
+            *(math.radians(self._pointcloud_mount_rotation_deg[axis])
+              for axis in ("x", "y", "z")))
+        mount_translation = pointcloud_config.get("mount_translation_m", {})
+        if not isinstance(mount_translation, dict):
+            mount_translation = {}
+        self._pointcloud_mount_translation_m = {
+            axis: float(mount_translation.get(axis, 0.0))
+            for axis in ("x", "y", "z")
+        }
+        self._resolution_name = str(self._config.get("resolution", "VGA")).upper()
+        self._depth_mode_name = str(
+            self._config.get("depth_mode", "PERFORMANCE")).upper()
+        self._camera_fps = max(1, min(int(self._config.get("fps", 15)), 60))
+        # The ZED Mini on Adam's head is physically mounted upside down.  Let
+        # the SDK rotate the complete camera data path (RGB, depth and point
+        # cloud) together so the three outputs remain pixel/geometry aligned.
+        self._camera_flip = bool(self._config.get("camera_flip", True))
+
+        self._running = False
+        self._available = False
+        self._camera = None
+        self._capture_thread = None
+        self._info_timer = None
+        self._lock = threading.Lock()
+        self._state = {
+            "state": "idle",
+            "available": False,
+            "source": "zed-sdk-local",
+            "model": None,
+            "serial_number": None,
+            "error": None,
+            "last_frame_ts_ms": None,
+            "last_rgb_ts_ms": None,
+            "last_depth_ts_ms": None,
+            "last_pointcloud_ts_ms": None,
+            "pointcloud_enabled": self._pointcloud_enabled,
+            "camera_flip": self._camera_flip,
+            "pointcloud_mount_rotation_deg": dict(
+                self._pointcloud_mount_rotation_deg),
+            "pointcloud_mount_translation_m": dict(
+                self._pointcloud_mount_translation_m),
+        }
+
+        self._pub_node = Node("adam_zed_camera")
+        executor.add_node(self._pub_node)
+
+    @staticmethod
+    def _tool(name, description, topic, fmt, input_schema=None):
+        return {
+            "name": name,
+            "type": "sensor",
+            "multiInstance": False,
+            "description": description,
+            "inputSchema": input_schema or {"type": "object", "properties": {}},
+            "topic_out": [{"topic": topic, "format": fmt}],
+        }
+
+    def get_tools(self):
+        return [
+            self._tool(
+                "camera_head",
+                "Adam ZED Mini left RGB image from the local Jetson ZED SDK",
+                self._topics["camera_head"], self._FORMATS["camera_head"]),
+            self._tool(
+                "camera_depth",
+                "Adam ZED Mini depth image, zlib-compressed little-endian uint16 millimetres",
+                self._topics["camera_depth"], self._FORMATS["camera_depth"]),
+            self._tool(
+                "camera_info",
+                "Adam ZED Mini connection status, stream settings, calibration and intrinsics",
+                self._topics["camera_info"], self._FORMATS["camera_info"]),
+            self._tool(
+                "camera_pointcloud",
+                "Adam ZED Mini XYZ point cloud for the Phanthymotus 3D renderer; runtime-toggleable",
+                self._topics["camera_pointcloud"], self._FORMATS["camera_pointcloud"],
+                {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["start", "stop", "info"],
+                            "description": "Enable or disable point-cloud publishing without reopening the camera",
+                        },
+                    },
+                }),
+        ]
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        try:
+            from sensor_msgs.msg import CompressedImage
+            from std_msgs.msg import String, UInt8MultiArray
+
+            qos = _best_effort_qos()
+            self._CompressedImage = CompressedImage
+            self._UInt8MultiArray = UInt8MultiArray
+            self._rgb_pub = self._pub_node.create_publisher(
+                CompressedImage, self._topics["camera_head"], qos)
+            self._depth_pub = self._pub_node.create_publisher(
+                CompressedImage, self._topics["camera_depth"], qos)
+            self._info_pub = self._pub_node.create_publisher(
+                String, self._topics["camera_info"], qos)
+            self._pointcloud_pub = self._pub_node.create_publisher(
+                UInt8MultiArray, self._topics["camera_pointcloud"], qos)
+            self._info_timer = self._pub_node.create_timer(
+                1.0 / self._info_hz, self._publish_info)
+        except Exception as exc:
+            self._running = False
+            self._set_error(f"ROS2 camera publisher setup failed: {exc}")
+            return
+
+        self._publish_info()
+        self._capture_thread = threading.Thread(
+            target=self._capture_loop, daemon=True, name="adam_zed_capture")
+        self._capture_thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._info_timer is not None:
+            try:
+                self._info_timer.cancel()
+            except Exception:
+                pass
+            self._info_timer = None
+        if self._capture_thread is not None:
+            self._capture_thread.join(timeout=3.0)
+            self._capture_thread = None
+        camera = self._camera
+        self._camera = None
+        if camera is not None:
+            try:
+                camera.close()
+            except Exception:
+                pass
+        self._available = False
+        with self._lock:
+            self._state.update({
+                "state": "idle",
+                "available": False,
+                "pointcloud_enabled": self._pointcloud_enabled,
+            })
+        self._publish_info()
+
+    def _set_error(self, message):
+        with self._lock:
+            self._available = False
+            self._state.update({
+                "state": "error",
+                "available": False,
+                "error": str(message),
+            })
+        print(f"[ZedCameraPlugin] {message}", flush=True)
+
+    @staticmethod
+    def _enum_name(value):
+        name = getattr(value, "name", None)
+        return str(name if name is not None else value)
+
+    @staticmethod
+    def _resolution_dict(resolution):
+        return {
+            "width": int(getattr(resolution, "width", 0)),
+            "height": int(getattr(resolution, "height", 0)),
+        }
+
+    @staticmethod
+    def _float_list(value):
+        try:
+            return [float(item) for item in value]
+        except (TypeError, ValueError):
+            return []
+
+    def _camera_metadata(self, camera_info, params):
+        configuration = camera_info.camera_configuration
+        calibration = configuration.calibration_parameters
+        left = calibration.left_cam
+        right = calibration.right_cam
+        translation = calibration.stereo_transform.get_translation().get()
+        return {
+            "state": "running",
+            "available": True,
+            "connected": True,
+            "source": "zed-sdk-local",
+            "sdk": "ZED SDK",
+            "model": str(camera_info.camera_model),
+            "serial_number": int(camera_info.serial_number),
+            "firmware_version": int(configuration.firmware_version),
+            "resolution": self._resolution_dict(configuration.resolution),
+            "fps": int(configuration.fps),
+            "depth_mode": self._enum_name(params.depth_mode),
+            "coordinate_units": self._enum_name(params.coordinate_units),
+            "calibration": {
+                "left": {
+                    "fx": float(left.fx), "fy": float(left.fy),
+                    "cx": float(left.cx), "cy": float(left.cy),
+                    "distortion": self._float_list(left.disto),
+                },
+                "right": {
+                    "fx": float(right.fx), "fy": float(right.fy),
+                    "cx": float(right.cx), "cy": float(right.cy),
+                    "distortion": self._float_list(right.disto),
+                },
+                "baseline_m": float(calibration.get_camera_baseline()),
+                "stereo_translation_m": self._float_list(translation),
+            },
+            "error": None,
+            "pointcloud_enabled": self._pointcloud_enabled,
+            "camera_flip": self._camera_flip,
+            "pointcloud_mount_rotation_deg": dict(
+                self._pointcloud_mount_rotation_deg),
+        }
+
+    @staticmethod
+    def _load_zed_module():
+        try:
+            import pyzed.sl as sl
+            return sl
+        except ImportError as first_error:
+            # The deployment mounts the host's architecture-specific pyzed
+            # extension at /opt/pyzed instead of baking a licensed SDK into
+            # the driver image.
+            candidate = os.environ.get("ZED_PYTHON_PATH", "/opt/pyzed")
+            if candidate:
+                candidate_path = Path(candidate)
+                search_paths = [candidate_path]
+                # When the package directory itself is mounted at
+                # /opt/pyzed, Python needs its parent (/opt) on sys.path.
+                if (candidate_path / "__init__.py").exists() or list(candidate_path.glob("sl*.so")):
+                    search_paths.append(candidate_path.parent)
+                for search_path in reversed(search_paths):
+                    if search_path.exists() and str(search_path) not in sys.path:
+                        sys.path.insert(0, str(search_path))
+            try:
+                import pyzed.sl as sl
+                return sl
+            except ImportError as second_error:
+                raise ImportError(
+                    "pyzed.sl is unavailable; mount the Jetson ZED SDK and set "
+                    "ZED_PYTHON_PATH (or PYTHONPATH) accordingly"
+                ) from second_error
+            except Exception:
+                raise first_error
+
+    def _capture_loop(self):
+        try:
+            import numpy as np
+            from PIL import Image as PillowImage
+            sl = self._load_zed_module()
+        except Exception as exc:
+            self._running = False
+            self._set_error(f"local ZED SDK import failed: {exc}")
+            return
+
+        params = sl.InitParameters()
+        params.camera_resolution = getattr(
+            sl.RESOLUTION, self._resolution_name, sl.RESOLUTION.VGA)
+        depth_mode = getattr(sl.DEPTH_MODE, self._depth_mode_name, None)
+        if depth_mode is None:
+            depth_mode = getattr(sl.DEPTH_MODE, "NEURAL_LIGHT", sl.DEPTH_MODE.PERFORMANCE)
+        params.depth_mode = depth_mode
+        params.camera_fps = self._camera_fps
+        params.coordinate_units = sl.UNIT.METER
+        if self._camera_flip:
+            if hasattr(params, "camera_image_flip"):
+                flip_modes = getattr(sl, "FLIP_MODE", None)
+                params.camera_image_flip = getattr(flip_modes, "ON", 1)
+            else:
+                print(
+                    "[ZedCameraPlugin] camera_flip requested but this ZED SDK "
+                    "does not expose camera_image_flip",
+                    flush=True,
+                )
+        if hasattr(params, "depth_maximum_distance"):
+            params.depth_maximum_distance = self._max_point_distance_m
+
+        camera = sl.Camera()
+        try:
+            status = camera.open(params)
+        except Exception as exc:
+            self._running = False
+            self._set_error(f"ZED camera open failed: {exc}")
+            return
+        if status != sl.ERROR_CODE.SUCCESS:
+            self._running = False
+            self._set_error(f"ZED camera open failed: {status}")
+            try:
+                camera.close()
+            except Exception:
+                pass
+            return
+
+        self._camera = camera
+        self._available = True
+        with self._lock:
+            self._state = self._camera_metadata(
+                camera.get_camera_information(), params)
+        self._publish_info()
+
+        runtime = sl.RuntimeParameters()
+        image = sl.Mat()
+        depth = sl.Mat()
+        pointcloud = sl.Mat()
+        next_rgb = 0.0
+        next_depth = 0.0
+        next_pointcloud = 0.0
+        last_grab_error = None
+
+        try:
+            while self._running:
+                status = camera.grab(runtime)
+                if status != sl.ERROR_CODE.SUCCESS:
+                    if status != last_grab_error:
+                        print(f"[ZedCameraPlugin] grab status: {status}", flush=True)
+                        last_grab_error = status
+                    time.sleep(0.01)
+                    continue
+                last_grab_error = None
+                now = time.monotonic()
+                now_ms = int(time.time() * 1000)
+                with self._lock:
+                    self._state["last_frame_ts_ms"] = now_ms
+
+                if now >= next_rgb:
+                    try:
+                        camera.retrieve_image(image, sl.VIEW.LEFT, sl.MEM.CPU)
+                        jpeg = self._encode_jpeg(
+                            np.array(image.get_data(), copy=True), np, PillowImage)
+                        msg = self._CompressedImage()
+                        msg.format = "jpeg"
+                        msg.data = jpeg
+                        self._rgb_pub.publish(msg)
+                        with self._lock:
+                            self._state["last_rgb_ts_ms"] = now_ms
+                    except Exception as exc:
+                        self._set_error(f"RGB publish failed: {exc}")
+                    next_rgb = now + 1.0 / self._rgb_hz
+
+                need_depth = now >= next_depth
+                with self._lock:
+                    pointcloud_enabled = self._pointcloud_enabled
+                need_pointcloud = pointcloud_enabled and now >= next_pointcloud
+
+                if need_depth:
+                    try:
+                        camera.retrieve_measure(depth, sl.MEASURE.DEPTH, sl.MEM.CPU)
+                        depth_mm = self._normalize_depth(
+                            np.array(depth.get_data(), copy=True), np)
+                        msg = self._CompressedImage()
+                        msg.format = "16UC1; compressedDepth zlib"
+                        msg.data = zlib.compress(
+                            depth_mm.astype("<u2", copy=False).tobytes(), level=1)
+                        self._depth_pub.publish(msg)
+                        with self._lock:
+                            self._state["last_depth_ts_ms"] = now_ms
+                    except Exception as exc:
+                        self._set_error(f"depth publish failed: {exc}")
+                    next_depth = now + 1.0 / self._depth_hz
+
+                if need_pointcloud:
+                    try:
+                        camera.retrieve_measure(
+                            pointcloud, sl.MEASURE.XYZRGBA, sl.MEM.CPU)
+                        payload = self._pack_pointcloud(
+                            np.array(pointcloud.get_data(), copy=True), np)
+                        if payload is not None:
+                            msg = self._UInt8MultiArray()
+                            msg.data = list(payload)
+                            self._pointcloud_pub.publish(msg)
+                            with self._lock:
+                                self._state["last_pointcloud_ts_ms"] = now_ms
+                    except Exception as exc:
+                        self._set_error(f"pointcloud publish failed: {exc}")
+                    next_pointcloud = now + 1.0 / self._pointcloud_hz
+        finally:
+            self._available = False
+            if self._running:
+                self._running = False
+                self._set_error("ZED capture loop stopped unexpectedly")
+
+    def _encode_jpeg(self, image, np, pillow_image):
+        if image.ndim == 3 and image.shape[2] >= 3:
+            # ZED's default U8_C4 CPU image is BGRA.  The dashboard expects
+            # ordinary RGB JPEG bytes, so drop alpha and reverse BGR->RGB.
+            rgb = image[:, :, :3][:, :, ::-1]
+        elif image.ndim == 2:
+            rgb = np.repeat(image[:, :, None], 3, axis=2)
+        else:
+            raise ValueError(f"unexpected ZED image shape {image.shape}")
+        output = io.BytesIO()
+        pillow_image.fromarray(np.ascontiguousarray(rgb), "RGB").save(
+            output, format="JPEG", quality=self._jpeg_quality, optimize=False)
+        return output.getvalue()
+
+    @staticmethod
+    def _normalize_depth(depth, np):
+        if depth.ndim == 3:
+            depth = depth[:, :, 0]
+        valid = np.isfinite(depth) & (depth > 0.0)
+        millimetres = np.zeros(depth.shape, dtype=np.uint16)
+        millimetres[valid] = np.clip(
+            depth[valid] * 1000.0, 0.0, 65535.0).astype(np.uint16)
+
+        # The stock Phanthymotus depth renderer consumes a fixed 640x480
+        # matrix.  Crop the ZED 16:9 image centrally, then nearest-neighbour
+        # resample without introducing an OpenCV dependency.
+        height, width = millimetres.shape
+        if width * 3 > height * 4:
+            crop_width = max(1, (height * 4) // 3)
+            left = max(0, (width - crop_width) // 2)
+            millimetres = millimetres[:, left:left + crop_width]
+        elif width * 3 < height * 4:
+            crop_height = max(1, (width * 3) // 4)
+            top = max(0, (height - crop_height) // 2)
+            millimetres = millimetres[top:top + crop_height, :]
+        source_height, source_width = millimetres.shape
+        rows = (np.arange(480) * source_height / 480).astype(np.int64)
+        cols = (np.arange(640) * source_width / 640).astype(np.int64)
+        return millimetres[rows[:, None], cols[None, :]]
+
+    @staticmethod
+    def _rotation_matrix_xyz(x_rad, y_rad, z_rad):
+        """Return a renderer-frame rotation that applies X, then Y, then Z."""
+        sx, cx = math.sin(x_rad), math.cos(x_rad)
+        sy, cy = math.sin(y_rad), math.cos(y_rad)
+        sz, cz = math.sin(z_rad), math.cos(z_rad)
+        # Column-vector convention: Rz @ Ry @ Rx.
+        return (
+            (cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx),
+            (sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx),
+            (-sy, cy * sx, cy * cx),
+        )
+
+    def _pack_pointcloud(self, points, np):
+        if points.ndim != 3 or points.shape[2] < 3:
+            raise ValueError(f"unexpected ZED point-cloud shape {points.shape}")
+        xyz = points[:, :, :3].reshape(-1, 3)
+        valid = np.isfinite(xyz).all(axis=1)
+        valid &= xyz[:, 2] > 0.05
+        valid &= xyz[:, 2] <= self._max_point_distance_m
+        xyz = xyz[valid]
+        if xyz.size == 0:
+            return None
+        if xyz.shape[0] > self._max_points:
+            stride = int(math.ceil(xyz.shape[0] / self._max_points))
+            xyz = xyz[::stride][:self._max_points]
+
+        # First express the optical ZED frame in the renderer's default frame:
+        # (right, down, forward) -> (right, up, backward).  Correct the fixed
+        # camera mounting angle in that frame, then invert the renderer's
+        # configurable default mapping display=(packed_y,-packed_z,-packed_x).
+        rotation = self._pointcloud_mount_rotation
+        display = np.empty_like(xyz, dtype="<f4")
+        camera_x = xyz[:, 0]
+        camera_y = -xyz[:, 1]
+        camera_z = -xyz[:, 2]
+        display[:, 0] = (
+            rotation[0][0] * camera_x
+            + rotation[0][1] * camera_y
+            + rotation[0][2] * camera_z)
+        display[:, 1] = (
+            rotation[1][0] * camera_x
+            + rotation[1][1] * camera_y
+            + rotation[1][2] * camera_z)
+        display[:, 2] = (
+            rotation[2][0] * camera_x
+            + rotation[2][1] * camera_y
+            + rotation[2][2] * camera_z)
+        display[:, 0] += self._pointcloud_mount_translation_m["x"]
+        display[:, 1] += self._pointcloud_mount_translation_m["y"]
+        display[:, 2] += self._pointcloud_mount_translation_m["z"]
+        packed_xyz = np.empty((xyz.shape[0], 3), dtype="<f4")
+        packed_xyz[:, 0] = -display[:, 2]
+        packed_xyz[:, 1] = display[:, 0]
+        packed_xyz[:, 2] = -display[:, 1]
+        return struct.pack("<II", 12, int(packed_xyz.shape[0])) + packed_xyz.tobytes()
+
+    def _publish_info(self):
+        publisher = getattr(self, "_info_pub", None)
+        if publisher is None:
+            return
+        with self._lock:
+            payload = dict(self._state)
+            payload["pointcloud_enabled"] = self._pointcloud_enabled
+        message = String()
+        message.data = json.dumps(payload, separators=(",", ":"))
+        publisher.publish(message)
+
+    def dispatch(self, action, args):
+        tool_name = args.get("_tool_name", action)
+        if tool_name == "camera_pointcloud" and action in ("start", "enable"):
+            with self._lock:
+                self._pointcloud_enabled = True
+                self._state["pointcloud_enabled"] = True
+            self._publish_info()
+            return {"state": "running" if self._available else self._state["state"], "pointcloud_enabled": True}
+        if tool_name == "camera_pointcloud" and action in ("stop", "disable"):
+            with self._lock:
+                self._pointcloud_enabled = False
+                self._state["pointcloud_enabled"] = False
+            self._publish_info()
+            return {"state": "disabled", "pointcloud_enabled": False}
+        if action in ("read", "get") and tool_name == "camera_info":
+            with self._lock:
+                return dict(self._state)
+        if action in ("info", "start", "stop", tool_name):
+            state = self._state.get("state", "idle")
+            if tool_name == "camera_pointcloud" and not self._pointcloud_enabled:
+                state = "disabled"
+            return {
+                "state": state,
+                "topic_out": [{
+                    "topic": self._topics[tool_name],
+                    "format": self._FORMATS[tool_name],
+                }],
+                **({"pointcloud_enabled": self._pointcloud_enabled}
+                   if tool_name == "camera_pointcloud" else {}),
+            }
+        return {"state": self._state.get("state", "idle")}
+
+
+# ---------------------------------------------------------------------------
+# Resource card and bundle
+# ---------------------------------------------------------------------------
 
 class ModelPlugin:
     """Returns URDF for 3D skeleton visualization on dashboard."""
@@ -808,6 +1401,12 @@ class AdamDeviceBundle:
                 plugins_cfg.get("loco", {}), namespace, executor,
                 grpc_client=grpc_client,
             )
+            self._plugins.append(p)
+
+        # CameraPlugin
+        if plugins_cfg.get("camera", {}).get("enabled", False):
+            p = ZedCameraPlugin(
+                plugins_cfg.get("camera", {}), namespace, executor)
             self._plugins.append(p)
 
         # ArmPlugin
