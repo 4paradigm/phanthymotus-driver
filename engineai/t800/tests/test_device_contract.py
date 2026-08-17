@@ -531,7 +531,28 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("requested", result["state"])
         self.assertEqual("vendor_future_mode", plugin._publisher.messages[-1].target_motion_name)
         plugin.dispatch("get_up", {"force": True, "wait": False})
-        self.assertEqual("supine_to_stance", plugin._publisher.messages[-1].target_motion_name)
+        self.assertEqual("rl_mimic_supine_to_stance", plugin._publisher.messages[-1].target_motion_name)
+
+    def test_motion_mode_shortcuts_map_to_official_states(self):
+        self.assertEqual(
+            {
+                "idle": "idle",
+                "passive": "passive",
+                "stand": "pd_stand",
+                "walk": "rl_basic",
+                "dance": "dance",
+                "get_up": "rl_mimic_supine_to_stance",
+                "lie_down": "rl_mimic_stance_to_supine",
+            },
+            self.device.MotionModePlugin._SHORTCUTS,
+        )
+
+    def test_stop_dance_defaults_to_rl_basic(self):
+        mode = self.device.MotionModePlugin(CONFIG, "robot", self.ros, self.state)
+        mode.start()
+        dance = self.device.DancePlugin(mode, self.state)
+        dance.dispatch("stop_dance", {"force": True, "wait": False})
+        self.assertEqual("rl_basic", mode._publisher.messages[-1].target_motion_name)
 
     def test_dance_facade_lists_and_plays_official_dance(self):
         mode = self.device.MotionModePlugin(CONFIG, "robot", self.ros, self.state)

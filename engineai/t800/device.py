@@ -1956,10 +1956,10 @@ class MotionModePlugin:
         "idle": "idle",
         "passive": "passive",
         "stand": "pd_stand",
-        "walk": "walk",
+        "walk": "rl_basic",
         "dance": "dance",
-        "get_up": "supine_to_stance",
-        "lie_down": "stance_to_supine",
+        "get_up": "rl_mimic_supine_to_stance",
+        "lie_down": "rl_mimic_stance_to_supine",
     }
     def __init__(self, config: dict, namespace: str, ros2, state: StatePlugin):
         self._config = config
@@ -2046,12 +2046,12 @@ class DancePlugin:
                 {
                     "list": ([], "列出官方内置和固件动态发现的舞蹈 motion states"),
                     "play": (["name", "force", "wait"], "播放指定舞蹈，默认 dance"),
-                    "stop_dance": (["target", "force", "wait"], "停止舞蹈并切换到 walk 或指定状态"),
+                    "stop_dance": (["target", "force", "wait"], "停止舞蹈并切换到 rl_basic 或指定状态"),
                     "status": ([], "查询当前是否处于舞蹈状态"),
                 },
                 {
                     "name": {"type": "string", "description": "舞蹈 motion state 名，默认 dance"},
-                    "target": {"type": "string", "description": "停止后的状态，默认 walk"},
+                    "target": {"type": "string", "description": "停止后的状态，默认 rl_basic"},
                     "force": {"type": "boolean"},
                     "wait": {"type": "boolean"},
                 },
@@ -2083,7 +2083,7 @@ class DancePlugin:
         if action == "play":
             target = str(args.get("name", "dance"))
         elif action == "stop_dance":
-            target = str(args.get("target", "walk"))
+            target = str(args.get("target", "rl_basic"))
         else:
             return {"error": f"unknown dance action: {action}"}
         forwarded = dict(args)
