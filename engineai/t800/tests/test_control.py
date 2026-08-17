@@ -150,6 +150,39 @@ class RepeatingCommandTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duration"):
             stream.start({}, -2)
 
+    def test_renew_retargets_active_stream_without_restart(self):
+        published = []
+        stream = RepeatingCommand(published.append, lambda: None, rate_hz=100)
+        first = stream.start({"value": 1}, 0.2)
+        time.sleep(0.03)
+        count_before = len(published)
+        snapshot = stream.renew({"value": 2}, 0.2)
+        self.assertTrue(snapshot.active)
+        self.assertEqual(first.started_at, snapshot.started_at)  # 未重启：起始时刻不变
+        time.sleep(0.05)
+        # renew 无零发布、无重启：后续 tick 直接到达新目标
+        self.assertGreater(len(published), count_before)
+        for message in published[count_before:]:
+            self.assertNotEqual(0, message["value"])
+        self.assertIn({"value": 2}, published[count_before:])
+        self.assertGreater(stream.snapshot().deadline, time.monotonic())
+
+    def test_renew_falls_back_to_start_when_inactive(self):
+        published = []
+        stream = RepeatingCommand(published.append, lambda: None, rate_hz=100)
+        snapshot = stream.renew({"value": 1}, 0.05)
+        self.assertTrue(snapshot.active)
+        self.assertEqual({"value": 1}, published[0])  # start 回退的同步首发
+
+    def test_renew_after_expiry_still_activates_stream(self):
+        published = []
+        stream = RepeatingCommand(published.append, lambda: None, rate_hz=100)
+        stream.start({"value": 1}, 0.03)
+        time.sleep(0.035)  # 越过原截止时间：worker 到期收流
+        snapshot = stream.renew({"value": 1}, 0.05)
+        self.assertTrue(snapshot.active)
+        self.assertGreaterEqual(snapshot.deadline, time.monotonic() + 0.04)
+
 
 class RampTests(unittest.TestCase):
     def test_ramped_step_steps_toward_target(self):

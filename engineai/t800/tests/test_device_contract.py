@@ -1063,6 +1063,51 @@ class LocomotionVelocityProposalTests(unittest.TestCase):
         self.assertEqual([0.10, 0.02], self.plugin._publisher.messages[-1].linear_velocity)
         self.assertAlmostEqual(0.15, self.plugin._publisher.messages[-1].yaw_velocity)
 
+    def test_proposal_burst_keeps_single_stream_without_zero_dip(self):
+        """Nav2 40Hz 连发 execute 提案时，100Hz 命令流不得出现零值振荡。
+
+        修复前每次提案都走 start()，其首行 stop() 会发布一个零速度 tick，
+        命令线上出现 0,目标,0,目标 的 40Hz 停-启振荡。修复后应走 renew：
+        单条流续延、不重启、无零发布。
+        """
+        self._bind()
+        self._send(self._proposal(sequence=1))
+        first_idx = len(self.plugin._publisher.messages) - 1  # 首个目标的同步发布
+        self.assertNotEqual([0.0, 0.0], self.plugin._publisher.messages[first_idx].linear_velocity)
+        first_snapshot = self.plugin._stream.snapshot()
+        self.assertTrue(first_snapshot.active)
+
+        # 按 Nav2 40Hz 节奏（25ms 间隔）连发后续 execute 提案
+        time.sleep(0.025)
+        self._send(self._proposal(sequence=2, velocity={"x": 0.11, "y": 0.03, "yaw": 0.16}))
+        time.sleep(0.025)
+        self._send(self._proposal(sequence=3, velocity={"x": 0.12, "y": 0.04, "yaw": 0.17}))
+
+        # 最后一次决策后留出时间让 100Hz 工作线程继续发布
+        time.sleep(0.03)
+        after = self.plugin._publisher.messages[first_idx:]
+        self.assertGreaterEqual(len(after), 4, "提案边界之间 100Hz 流必须持续发布")
+        for message in after:
+            self.assertNotEqual([0.0, 0.0], message.linear_velocity,
+                                "execute 决策之间出现零速度：提案流被重启（start 首行 stop）")
+
+        last_snapshot = self.plugin._stream.snapshot()
+        self.assertTrue(last_snapshot.active)
+        # 全程单条流：started_at 不变（未重启）、publish_count 单调增长
+        self.assertEqual(first_snapshot.started_at, last_snapshot.started_at)
+        self.assertGreater(last_snapshot.publish_count, first_snapshot.publish_count)
+        # 截止时间随每次提案从当前时刻续延（TTL=200ms，断言时仍余 ≥0.15s）
+        self.assertGreaterEqual(last_snapshot.deadline, time.monotonic() + 0.15)
+
+    def test_bind_stops_running_manual_stream(self):
+        """绑定导航端口时若手动 move 流仍在跑，必须立即停流归零（与错误路径对称）。"""
+        self.plugin.dispatch("move", {"vx": 0.2, "duration": -1, "force": True})
+        time.sleep(0.03)
+        self.assertTrue(self.plugin._stream.snapshot().active)
+        self._bind()
+        self.assertFalse(self.plugin._stream.snapshot().active)
+        self.assertEqual([0.0, 0.0], self.plugin._publisher.messages[-1].linear_velocity)
+
     def test_sequence_replay_disarms_and_stops(self):
         self._bind()
         self._send(self._proposal())
