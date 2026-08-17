@@ -27,6 +27,7 @@ RUN test -s /usr/share/keyrings/ros2-archive-keyring.gpg || \
         python3-colcon-common-extensions \
         python3-pip \
         ros-humble-rmw-cyclonedds-cpp \
+        ros-humble-nav-msgs \
         ros-humble-sensor-msgs \
         pulseaudio-utils \
         build-essential \
@@ -66,9 +67,9 @@ RUN echo "[t800] checking ROS interface build dependencies" && \
     cd /t800_ws && \
     colcon build --packages-select interface_protocol && \
     . /t800_ws/install/setup.sh && \
-    python3 -c "from interface_protocol.msg import BodyVelCmd, MotionStateRequest; from sensor_msgs.msg import CompressedImage, Image, PointCloud2; print('T800 ROS imports ok')"
+    python3 -c "from interface_protocol.msg import BodyVelCmd, Heartbeat, LinkInfo, MotionStateRequest; from nav_msgs.msg import Odometry; from sensor_msgs.msg import CompressedImage, Image, PointCloud2; print('T800 ROS imports ok')"
 
-COPY main.py device.py control.py native_sdk.py virtual_gamepad.py config.yaml driver.yaml /work/
+COPY main.py device.py control.py native_sdk.py virtual_gamepad.py config.yaml driver.yaml controlled_spatial_map.py /work/
 COPY resource/ /work/resource/
 COPY deploy/ /deploy/
 RUN . /opt/ros/humble/setup.sh && \

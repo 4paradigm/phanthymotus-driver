@@ -56,9 +56,10 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 joint override 和 joint bridge 的 motion-state 门禁；完整高风险能力没有从
 MCP schema 中隐藏。
 
-`loco.move_displacement`、`turn_angle` 和 `arc` 由速度乘时间换算。当前官方
-T800 协议没有里程计/定位反馈，因此它们是开环动作，返回结果会明确携带
-`open_loop: true`，不能当作闭环导航精度承诺。
+`loco.move_displacement`、`turn_angle` 和 `arc` 由速度乘时间换算。T800
+基础运动协议没有供控制闭环使用的定位反馈，因此它们仍是开环动作并返回
+`open_loop: true`。若 Odin2 固件提供配置中的 odometry topic，
+`motion_command_trace` 会把它用于状态显示，但不会据此闭环控制动作。
 
 `gesture.play` 与旧的 `joint_plan.preset` 不同：前者执行官方示例里的完整多步
 动作（挥手包含准备、举手、5 次摆动和复位；握手包含伸手、收手和复位），
@@ -93,9 +94,9 @@ cd engineai/t800
 docker build -t engineai-t800-driver .
 docker run --rm --network host --privileged \
   -v /dev:/dev \
-  -v /opt/engineai/native_sdk:/opt/engineai/native_sdk \
-  -v /run/user/1000/pulse:/run/user/1000/pulse \
-  -v /home/ubuntu/.config/pulse:/root/.config/pulse:ro \
+  -v ${T800_NATIVE_SDK_DIR:-/opt/engineai/native_sdk}:/opt/engineai/native_sdk \
+  -v ${T800_PULSE_RUNTIME_DIR:-/run/user/1000/pulse}:/run/user/1000/pulse \
+  -v ${T800_PULSE_CONFIG_DIR:-/home/ubuntu/.config/pulse}:/root/.config/pulse:ro \
   -e NETWORK_INTERFACE=${T800_NETWORK_INTERFACE:-eth1} \
   -e PULSE_SERVER=unix:/run/user/1000/pulse/native \
   engineai-t800-driver

@@ -28,6 +28,7 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   TtsPlugin           (actuator)           — 语音合成
   VoicePlayActuatorPlugin (actuator)      — 音频播放控制(文件/URL/TTS)
   NavPlugin           (actuator)           — 底盘导航控制
+  HomePlugin          (actuator)           — 充电桩管理与回桩
   ChatPlugin          (actuator)           — 语音交互开关
   VoiceChatActuatorPlugin (actuator)      — 语音对话开关
   MotorStatePlugin    (sensor)             — 全身21电机状态(2Hz)
@@ -65,6 +66,7 @@ import struct
 import threading
 import time
 from pathlib import Path
+from uuid import uuid4
 
 import rclpy
 from rclpy.node import Node
@@ -2621,6 +2623,7 @@ class ArmPlugin:
         self._pos_publisher = None
         self._ctrl_publisher = None
         self._feedback = _JointCommandFeedback("arm", "/arm/status")
+        self._sequence = _ActionSequence("ArmPlugin")
 
     def get_tool(self) -> dict:
         return {
@@ -2635,12 +2638,38 @@ class ArmPlugin:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["move_pos", "move_ctrl"],
+                    "action": {"type": "string", "enum": ["move_pos", "move_ctrl", "move_traj"],
                                "default": "move_pos",
                                "description": (
                                    "模式选择：抬手、弯肘、摆姿势、回零等普通操作选move_pos；"
-                                   "只有需要调节手臂保持力度或减少晃动时才选move_ctrl"
+                                   "只有需要调节手臂保持力度或减少晃动时才选move_ctrl；"
+                                   "连贯多段动作（如太极、舞蹈）选move_traj"
                                )},
+                    "waypoints": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "left_positions": {
+                                    "type": "array", "items": {"type": "number", "minimum": -170, "maximum": 170},
+                                    "minItems": 7, "maxItems": 7,
+                                    "description": "左臂7关节角度(度)，顺序[肩pitch,肩roll,肩yaw,肘pitch,腕yaw,腕pitch,腕roll]，缺失时继承上一个路径点"
+                                },
+                                "right_positions": {
+                                    "type": "array", "items": {"type": "number", "minimum": -170, "maximum": 170},
+                                    "minItems": 7, "maxItems": 7,
+                                    "description": "右臂7关节角度(度)，顺序同左臂，缺失时继承上一个路径点"
+                                },
+                                "time_from_start": {
+                                    "type": "number", "minimum": 0,
+                                    "description": "从轨迹开始到此点的秒数，必须递增"
+                                },
+                            },
+                            "required": ["time_from_start"],
+                        },
+                        "minItems": 2,
+                        "description": "轨迹路径点列表（≥2个），按time_from_start升序排列。每点可只指定left或right，缺失的一侧继承上一个路径点"
+                    },
                     "left_positions": {
                         "type": "array", "items": {"type": "number", "minimum": -170, "maximum": 170},
                         "minItems": 7, "maxItems": 7,
@@ -2656,8 +2685,11 @@ class ArmPlugin:
                     "speed": {"type": "number", "minimum": 0.2, "maximum": 1.5,
                               "default": 0.5,
                               "description": (
-                                  "仅move_pos使用：决定手臂移动到目标姿势时有多快。"
-                                  "范围[0.2,1.5]rad/s，默认0.5。move_ctrl不能用它来减速"
+                                  "关节角速度，可设置范围[0.2,1.5]rad/s，推荐默认值0.5。"
+                                  "move_pos：决定手臂移动到目标姿势有多快；常规动作用0.5，"
+                                  "想要更慢更稳可降到0.3左右，想要更快更利落可提到0.8左右。"
+                                  "move_traj：整条轨迹执行时关节移动的快慢，实际节奏由waypoints的"
+                                  "time_from_start控制。move_ctrl不使用此参数（不能靠它减速）"
                               )},
                     "kp": {"type": "array", "items": {"type": "number", "minimum": 10, "maximum": 200},
                            "minItems": 7, "maxItems": 7,
@@ -2690,6 +2722,19 @@ class ArmPlugin:
                                       "力度，KD决定减少晃动的力度。适用于手臂被负载压偏、到位后晃动，"
                                       "或已确认安全的轻推柔顺实验。它没有可设置的移动速度，同一角度在"
                                       "不同KP/KD下也可能停在不同位置；普通摆姿势或大幅移动请用move_pos"
+                                  )},
+                    "move_traj": {"params": ["waypoints", "speed"],
+                                  "description": (
+                                      "轨迹模式：一次下发完整路径点序列，驱动侧以50Hz线性插值连续下发"
+                                      "CmdSetMotorPosition，消除多段move_pos之间的LLM调度停顿。适合太极、"
+                                      "舞蹈、连贯手势等多段连续动作。参数格式："
+                                      "waypoints为数组(至少2个点，按time_from_start升序)，每个点包含："
+                                      "time_from_start(秒，从轨迹开始到此点的时间，必填且必须递增)、"
+                                      "left_positions/right_positions(7关节角度，单位度，两者可省略其一，"
+                                      "缺失的一侧自动继承上一个路径点；第一个点若缺失某侧则该侧默认全0)。"
+                                      "关节顺序为[肩pitch,肩roll,肩yaw,肘pitch,腕yaw,腕pitch,腕roll]，"
+                                      "负pitch=向前。speed为关节角速度[0.2,1.5]rad/s，推荐0.5。"
+                                      "轨迹总时长>3秒时异步执行并返回action_id，≤3秒同步返回completed"
                                   )},
                 },
             },
@@ -2734,6 +2779,8 @@ class ArmPlugin:
             result["feedback_verified"] = True
             result["feedback"] = feedback
             return result
+        elif action == "move_traj":
+            return self._handle_move_traj(args)
         elif action == "move_ctrl":
             poses = self._requested_poses(args)
             kp = args.get("kp", [self._DEFAULT_KP] * 7)
@@ -2934,6 +2981,132 @@ class ArmPlugin:
             return {"state": "moving", "side": "both", "joints": len(cmds)}
         except Exception as e:
             return {"error": str(e)}
+
+    def _handle_move_traj(self, args: dict) -> dict:
+        waypoints_raw = args.get("waypoints")
+        if waypoints_raw is None:
+            return {"state": "error", "error": "waypoints is required for move_traj and must have at least 2 points",
+                    "code": "invalid_arm_waypoints"}
+        if isinstance(waypoints_raw, str):
+            try:
+                waypoints_raw = json.loads(waypoints_raw)
+            except json.JSONDecodeError as exc:
+                return {"state": "error", "error": f"waypoints must be valid JSON: {exc}",
+                        "code": "invalid_arm_waypoints"}
+        if not isinstance(waypoints_raw, list) or len(waypoints_raw) < 2:
+            return {"state": "error", "error": "waypoints is required for move_traj and must have at least 2 points",
+                    "code": "invalid_arm_waypoints"}
+        speed = args.get("speed", 0.5)
+        try:
+            speed = float(speed)
+        except (TypeError, ValueError):
+            return {"state": "error", "error": "speed must be numeric"}
+        if speed < 0.2 or speed > 1.5:
+            return {"state": "error", "error": "speed must be in [0.2, 1.5] rad/s"}
+        prev_left = None
+        prev_right = None
+        resolved = []
+        for i, wp in enumerate(waypoints_raw):
+            if not isinstance(wp, dict):
+                return {"state": "error", "error": f"waypoint {i} must be an object"}
+            tfs = wp.get("time_from_start")
+            if tfs is None:
+                return {"state": "error", "error": f"waypoint {i} missing time_from_start"}
+            try:
+                tfs = float(tfs)
+            except (TypeError, ValueError):
+                return {"state": "error", "error": f"waypoint {i} time_from_start must be numeric"}
+            left = wp.get("left_positions")
+            right = wp.get("right_positions")
+            if left is not None:
+                left, err = self._decode_array_argument(left, "left_positions")
+                if err:
+                    return err
+                if not isinstance(left, (list, tuple)) or len(left) != 7:
+                    return {"state": "error", "error": f"waypoint {i} left_positions must have 7 values"}
+                left = [float(v) for v in left]
+                prev_left = left
+            else:
+                left = prev_left
+            if right is not None:
+                right, err = self._decode_array_argument(right, "right_positions")
+                if err:
+                    return err
+                if not isinstance(right, (list, tuple)) or len(right) != 7:
+                    return {"state": "error", "error": f"waypoint {i} right_positions must have 7 values"}
+                right = [float(v) for v in right]
+                prev_right = right
+            else:
+                right = prev_right
+            if left is None and right is None:
+                return {"state": "error", "error": f"waypoint {i} has no arm target and no prior point to inherit"}
+            if left is None:
+                left = [0.0] * 7
+            if right is None:
+                right = [0.0] * 7
+            poses = {"left": left, "right": right}
+            violations = self._pose_violations(poses)
+            if violations:
+                return {"state": "error", "error": f"waypoint {i} pose exceeds URDF joint limits",
+                        "violations": violations}
+            resolved.append((tfs, left, right))
+        if len(resolved) < 2:
+            return {"state": "error", "error": "need at least 2 valid waypoints"}
+        for i in range(1, len(resolved)):
+            if resolved[i][0] <= resolved[i - 1][0]:
+                return {"state": "error", "error": f"waypoint {i} time_from_start must be greater than previous"}
+        motor_ids = self._motor_ids()
+        check = self._feedback.preflight(self._pos_publisher, motor_ids)
+        if check is not None:
+            return check
+        action_id = f"arm_traj_{uuid4().hex[:8]}"
+        duration = resolved[-1][0]
+        if duration <= 3.0:
+            cancel_event = threading.Event()
+            self._run_trajectory(resolved, speed, cancel_event)
+            return {
+                "state": "completed",
+                "action_id": action_id,
+                "waypoints": len(resolved),
+                "duration_s": duration,
+            }
+        else:
+            def _worker(cancel_event):
+                self._run_trajectory(resolved, speed, cancel_event)
+            self._sequence.start(_worker)
+            return {
+                "state": "moving",
+                "action_id": action_id,
+                "waypoints": len(resolved),
+                "duration_s": duration,
+                "async": True,
+            }
+
+    def _run_trajectory(self, resolved: list, speed: float, cancel_event: threading.Event):
+        rate = 0.02
+        total_time = resolved[-1][0]
+        t = 0.0
+        while t < total_time:
+            if cancel_event.is_set():
+                break
+            idx = 0
+            for i in range(len(resolved) - 1):
+                if resolved[i][0] <= t <= resolved[i + 1][0]:
+                    idx = i
+                    break
+            else:
+                idx = len(resolved) - 2
+            t0, left0, right0 = resolved[idx]
+            t1, left1, right1 = resolved[idx + 1]
+            dt = t1 - t0
+            alpha = (t - t0) / dt if dt > 0 else 0.0
+            alpha = max(0.0, min(1.0, alpha))
+            interp_left = [left0[j] + (left1[j] - left0[j]) * alpha for j in range(7)]
+            interp_right = [right0[j] + (right1[j] - right0[j]) * alpha for j in range(7)]
+            poses = {"left": interp_left, "right": interp_right}
+            self._send_pos(poses, speed)
+            time.sleep(rate)
+            t += rate
 
     def _send_ctrl(self, poses: dict[str, list[float]], kp: list, kd: list) -> dict:
         if not self._ctrl_publisher:
@@ -4598,9 +4771,9 @@ class VoicePlayActuatorPlugin:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class NavPlugin:
-    """底盘导航控制 — 自主导航/遥控/旋转/回桩"""
+    """底盘导航控制 — 自主导航/遥控/旋转"""
 
-    _ACP_ACTIONS = frozenset(("move_to", "rotate", "rotate_to", "go_home"))
+    _ACP_ACTIONS = frozenset(("move_to", "rotate", "rotate_to"))
     _POLL_INTERVAL = 1.0
     _STALL_TIMEOUT = 60.0
 
@@ -4608,6 +4781,8 @@ class NavPlugin:
         self._ns = namespace
         self._ros2 = ros2
         self._slamtec = slamtec_client
+        self._poll_lock = threading.Lock()
+        self._active_poll: str | None = None
 
         # cmd_vel publisher for direct velocity control (domain 0)
         self._vel_node = Node("tianyi2_nav_vel", context=ros2.ctx_tianyi)
@@ -4618,12 +4793,12 @@ class NavPlugin:
         return {
             "name": "nav",
             "type": "actuator",
-            "description": "天轶2.0 底盘导航 — 自主导航到目标点/方向遥控/旋转/回桩充电 (Slamtec轮式底盘)",
+            "description": "天轶2.0 底盘导航 — 自主导航到目标点/方向遥控/旋转 (Slamtec轮式底盘)",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string",
-                               "enum": ["move_to", "move_by", "rotate", "rotate_to", "go_home", "cancel", "get_pose"],
+                               "enum": ["move_to", "move_by", "rotate", "rotate_to", "cancel", "get_pose"],
                                "description": "导航动作"},
                     "x": {"type": "number", "description": "目标x坐标(米)"},
                     "y": {"type": "number", "description": "目标y坐标(米)"},
@@ -4638,7 +4813,7 @@ class NavPlugin:
                 },
                 "required": ["action"],
                 "x-completion": {
-                    "actions": ["move_to", "rotate", "rotate_to", "go_home"],
+                    "actions": ["move_to", "rotate", "rotate_to"],
                     "timeout": 180,
                 },
                 "x-action-params": {
@@ -4650,8 +4825,6 @@ class NavPlugin:
                                "description": "原地旋转指定角度(度)，系统自动等待完成"},
                     "rotate_to": {"params": ["angle"],
                                   "description": "原地旋转到绝对角度(度)，系统自动等待完成"},
-                    "go_home": {"params": [],
-                                "description": "自主导航回充电桩，系统自动等待到达"},
                     "cancel": {"params": [],
                              "description": "取消当前导航动作"},
                     "get_pose": {"params": [],
@@ -4680,6 +4853,8 @@ class NavPlugin:
             y = args.get("y", 0)
             speed = args.get("speed")
             result = self._slamtec.move_to(x, y, speed_ratio=speed)
+            if result.get("error"):
+                return {"state": "error", "api_result": result}
             action_id = self._start_poll(action, result, {"x": x, "y": y})
             resp = {"state": "navigating", "target": {"x": x, "y": y}, "api_result": result}
             if action_id:
@@ -4697,6 +4872,8 @@ class NavPlugin:
             angle_deg = args.get("angle", 0)
             angle_rad = _deg2rad(angle_deg)
             result = self._slamtec.rotate(angle_rad)
+            if result.get("error"):
+                return {"state": "error", "api_result": result}
             action_id = self._start_poll(action, result, {"angle": angle_deg})
             resp = {"state": "rotating", "angle": angle_deg, "api_result": result}
             if action_id:
@@ -4707,22 +4884,18 @@ class NavPlugin:
             angle_deg = args.get("angle", 0)
             angle_rad = _deg2rad(angle_deg)
             result = self._slamtec.rotate_to(angle_rad)
+            if result.get("error"):
+                return {"state": "error", "api_result": result}
             action_id = self._start_poll(action, result, {"angle": angle_deg})
             resp = {"state": "rotating_to", "angle": angle_deg, "api_result": result}
             if action_id:
                 resp["action_id"] = action_id
             return resp
 
-        elif action == "go_home":
-            result = self._slamtec.go_home()
-            action_id = self._start_poll(action, result, {})
-            resp = {"state": "going_home", "api_result": result}
-            if action_id:
-                resp["action_id"] = action_id
-            return resp
-
         elif action == "cancel":
             result = self._slamtec.cancel_current_action()
+            with self._poll_lock:
+                self._active_poll = None
             # Also stop cmd_vel
             if self._vel_pub:
                 try:
@@ -4744,6 +4917,8 @@ class NavPlugin:
         """Start ACP polling thread for a Slamtec action. Returns action_id or None."""
         from uuid import uuid4
         action_id = f"nav_{action}_{uuid4().hex[:8]}"
+        with self._poll_lock:
+            self._active_poll = action_id
         threading.Thread(
             target=self._poll_loop,
             args=(action_id, action, context),
@@ -4759,19 +4934,30 @@ class NavPlugin:
 
         while True:
             time.sleep(self._POLL_INTERVAL)
+            with self._poll_lock:
+                if self._active_poll != action_id:
+                    return
             elapsed = time.time() - t0
 
             # Check if action is still running
             try:
-                current = self._slamtec.get_current_action()
-            except Exception:
-                current = {}
+                current = self._slamtec.get_nav_status()
+            except Exception as exc:
+                current = {"error": str(exc)}
 
-            # Slamtec status: action_status 0=waiting, 1=running, 2=finished, 3=paused, 4=error
-            status = current.get("action_status") if current else None
+            if current.get("error"):
+                if elapsed > 180:
+                    _acp_notify(action_id, "error", {
+                        "action": action, "error": current["error"],
+                        "elapsed": round(elapsed, 1), **context,
+                    }, "nav")
+                    return
+                continue
 
-            if status == 2:  # finished
-                result_code = current.get("result", 0)
+            # Slamtec ActionState: 0=NewBorn, 1=Working, 3=Paused, 4=Done.
+            status = current.get("action_state")
+            if status == 4:
+                result_code = current.get("result")
                 if result_code == 0:
                     _acp_notify(action_id, "completed", {
                         "action": action, "elapsed": round(elapsed, 1), **context,
@@ -4783,22 +4969,17 @@ class NavPlugin:
                     }, "nav")
                 return
 
-            if status == 4:  # error
+            if status is None or status == -1:
+                if elapsed <= 3.0:
+                    continue
                 _acp_notify(action_id, "error", {
-                    "action": action, "error": "action_error",
+                    "action": action, "error": "action_disappeared",
                     "elapsed": round(elapsed, 1), **context,
                 }, "nav")
                 return
 
-            if status is None and elapsed > 3.0:
-                # No current action — may have completed between polls
-                _acp_notify(action_id, "completed", {
-                    "action": action, "elapsed": round(elapsed, 1), **context,
-                }, "nav")
-                return
-
-            # Stall detection (move_to/go_home only)
-            if action in ("move_to", "go_home"):
+            # Stall detection for position navigation only.
+            if action == "move_to":
                 try:
                     pose = self._slamtec.get_pose()
                     if last_pose:
@@ -4824,6 +5005,215 @@ class NavPlugin:
                 _acp_notify(action_id, "error", {
                     "action": action, "error": "timeout", "elapsed": 180, **context,
                 }, "nav")
+                return
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HomePlugin (actuator)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class HomePlugin:
+    """充电桩管理与回桩控制。回桩动作通过 ACP 异步报告最终结果。"""
+
+    _POLL_INTERVAL = 1.0
+    _STALL_TIMEOUT = 60.0
+    _ACTION_TIMEOUT = 180.0
+    _MISSING_ACTION_TIMEOUT = 3.0
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2, slamtec_client):
+        self._ns = namespace
+        self._slamtec = slamtec_client
+        self._poll_lock = threading.Lock()
+        self._active_poll: str | None = None
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "home",
+            "type": "actuator",
+            "description": "天轶2.0 充电桩管理与回桩。简单流程：机器人停在充电桩对接位置并定位正常后执行 register_dock；新桩会自动设为当前回桩目标，随后可直接执行 go_home 回桩充电。要切换到已有充电桩时，先用 list_docks 获取 dock_id，再执行 set_dock。回桩前需加载地图并保持定位正常。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": [
+                        "list_docks", "register_dock", "set_dock", "delete_dock",
+                        "clear_docks", "get_dock", "go_home", "cancel",
+                    ], "description": "充电桩管理或回桩动作"},
+                    "display_name": {"type": "string", "description": "注册时使用的充电桩名称，例如 main_dock"},
+                    "dock_id": {"type": "string", "description": "充电桩 UUID，由 list_docks 返回，用于选定或删除该充电桩"},
+                    "pose": {"type": "object", "description": "直接设定当前充电桩的 Pose3D（x,y,z,yaw,pitch,roll），必须属于当前地图坐标系"},
+                    "back_to_landing": {"type": "boolean", "description": "上桩失败后是否回到对接前的上桩点"},
+                    "charging_retry_count": {"type": "integer", "description": "上桩失败时的额外重试次数"},
+                    "move_mode": {"type": "integer", "enum": [0, 2], "description": "回桩路径模式：0 为自由导航，2 为轨道优先（需底盘固件支持）"},
+                },
+                "required": ["action"],
+                "x-completion": {
+                    "actions": ["go_home"],
+                    "timeout": 180,
+                },
+                "x-action-params": {
+                    "list_docks": {"params": [], "description": "列出当前地图已注册的全部充电桩，返回名称、dock_id 与位姿；可据此选择或删除充电桩"},
+                    "register_dock": {"params": ["display_name"], "description": "将机器人当前定位位姿保存为一个新充电桩，并自动设为当前回桩目标。执行前应让机器人停在实际充电桩的对接位置并确认定位正常；成功后可直接执行 go_home"},
+                    "set_dock": {"params": ["dock_id", "pose"], "description": "设置本次及后续回桩使用的当前目标。填写 dock_id 时读取已注册充电桩的位姿；也可直接填写 pose。二者任选其一，位姿必须匹配当前地图"},
+                    "delete_dock": {"params": ["dock_id"], "description": "删除 list_docks 返回的指定充电桩记录，不会移动机器人"},
+                    "clear_docks": {"params": [], "description": "删除全部已注册充电桩记录，不会移动机器人，操作不可恢复"},
+                    "get_dock": {"params": [], "description": "读取当前回桩目标的位姿；返回为空或 404 表示尚未设置"},
+                    "go_home": {"params": [], "description": "在当前地图中导航到已设置的充电桩并尝试对接充电。需地图已加载、机器人定位正常且当前充电桩已设置"},
+                    "cancel": {"params": [], "description": "取消当前回桩请求；机器人将停止等待该回桩动作完成"},
+                },
+                "x-hooks": {"on_interrupt_motion": {"action": "cancel"}},
+            },
+        }
+
+    def start(self):
+        pass
+
+    def stop(self):
+        with self._poll_lock:
+            self._active_poll = None
+
+    @staticmethod
+    def _error(result: dict) -> bool:
+        return isinstance(result, dict) and bool(result.get("error"))
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "list_docks":
+            return {"docks": self._slamtec.get_home_docks()}
+        if action == "register_dock":
+            name = str(args.get("display_name", "")).strip()
+            if not name:
+                return {"error": "display_name is required"}
+            dock = self._slamtec.register_home_dock(name)
+            if self._error(dock):
+                return {"state": "error", "dock": dock}
+            pose = dock.get("pose") if isinstance(dock, dict) else None
+            if not isinstance(pose, dict):
+                return {
+                    "state": "registered_not_selected",
+                    "dock": dock,
+                    "error": "registered dock response does not contain pose",
+                }
+            selected = self._slamtec.set_home_pose(pose)
+            if self._error(selected):
+                return {
+                    "state": "registered_not_selected",
+                    "dock": dock,
+                    "pose": pose,
+                    "selection_result": selected,
+                }
+            return {
+                "state": "registered_and_selected",
+                "dock": dock,
+                "pose": pose,
+                "selection_result": selected,
+            }
+        if action == "set_dock":
+            dock_id = str(args.get("dock_id", "")).strip()
+            pose = args.get("pose")
+            if dock_id:
+                docks = self._slamtec.get_home_docks()
+                entries = docks.get("raw", docks) if isinstance(docks, dict) else docks
+                if isinstance(entries, list):
+                    selected = next((d for d in entries if str(d.get("id")) == dock_id), None)
+                    if selected and selected.get("pose"):
+                        pose = selected["pose"]
+            if not isinstance(pose, dict):
+                return {"error": "dock_id or pose is required"}
+            return {"api_result": self._slamtec.set_home_pose(pose), "pose": pose}
+        if action == "delete_dock":
+            dock_id = str(args.get("dock_id", "")).strip()
+            if not dock_id:
+                return {"error": "dock_id is required"}
+            return {"api_result": self._slamtec.delete_home_dock(dock_id)}
+        if action == "clear_docks":
+            return {"api_result": self._slamtec.clear_home_docks()}
+        if action == "get_dock":
+            return {"pose": self._slamtec.get_home_pose()}
+        if action == "go_home":
+            result = self._slamtec.go_home(
+                back_to_landing=args.get("back_to_landing"),
+                charging_retry_count=args.get("charging_retry_count"),
+                move_mode=args.get("move_mode"),
+            )
+            if self._error(result):
+                return {"state": "error", "api_result": result}
+            action_id = self._start_poll(action, result, {})
+            response = {"state": "going_home", "api_result": result}
+            if action_id:
+                response["action_id"] = action_id
+            return response
+        if action == "cancel":
+            result = self._slamtec.cancel_action()
+            with self._poll_lock:
+                self._active_poll = None
+            return {"state": "cancelled", "api_result": result}
+        if action in ("start", "info"):
+            return {"state": "ready"}
+        return {"error": f"unknown action: {action}"}
+
+    def _start_poll(self, action: str, api_result: dict, context: dict) -> str:
+        from uuid import uuid4
+        action_id = f"home_{action}_{uuid4().hex[:8]}"
+        with self._poll_lock:
+            self._active_poll = action_id
+        threading.Thread(target=self._poll_loop, args=(action_id, action, context), daemon=True).start()
+        return action_id
+
+    def _poll_loop(self, action_id: str, action: str, context: dict):
+        t0 = time.time()
+        last_pose = None
+        last_move_time = t0
+        while True:
+            time.sleep(self._POLL_INTERVAL)
+            with self._poll_lock:
+                if self._active_poll != action_id:
+                    return
+            elapsed = time.time() - t0
+            try:
+                current = self._slamtec.get_nav_status()
+            except Exception as exc:
+                current = {"error": str(exc)}
+            if current.get("error"):
+                if elapsed > self._ACTION_TIMEOUT:
+                    _acp_notify(action_id, "error", {"action": action, "error": current["error"], **context}, "home")
+                    return
+                continue
+
+            state = current.get("action_state")
+            result_code = current.get("result")
+            if state == 4:
+                if result_code == 0:
+                    _acp_notify(action_id, "completed", {"action": action, "elapsed": round(elapsed, 1), **context}, "home")
+                else:
+                    _acp_notify(action_id, "error", {"action": action, "error": current.get("reason") or f"result_code={result_code}", "elapsed": round(elapsed, 1), **context}, "home")
+                return
+            if state == 3:
+                if elapsed > self._ACTION_TIMEOUT:
+                    _acp_notify(action_id, "error", {"action": action, "error": "timeout", "elapsed": self._ACTION_TIMEOUT, **context}, "home")
+                    return
+                continue
+            if state is None or state == -1:
+                # A successful action is reported as Done/result=0. Never infer
+                # success merely because the chassis no longer exposes an action.
+                if elapsed > self._MISSING_ACTION_TIMEOUT:
+                    _acp_notify(action_id, "error", {"action": action, "error": "action_disappeared", "elapsed": round(elapsed, 1), **context}, "home")
+                    return
+            if action == "go_home":
+                try:
+                    pose = self._slamtec.get_pose()
+                    if last_pose is None:
+                        last_pose = pose
+                    dx = pose.get("x", 0) - last_pose.get("x", 0)
+                    dy = pose.get("y", 0) - last_pose.get("y", 0)
+                    if dx * dx + dy * dy > 0.01:
+                        last_pose = pose
+                        last_move_time = time.time()
+                    elif time.time() - last_move_time > self._STALL_TIMEOUT:
+                        _acp_notify(action_id, "error", {"action": action, "error": "stall_timeout", "elapsed": round(elapsed, 1), **context}, "home")
+                        return
+                except Exception:
+                    pass
+            if elapsed > self._ACTION_TIMEOUT:
+                _acp_notify(action_id, "error", {"action": action, "error": "timeout", "elapsed": self._ACTION_TIMEOUT, **context}, "home")
                 return
 
 

@@ -57,6 +57,8 @@ plugins:
     enabled: true
   nav:
     enabled: true
+  home:
+    enabled: true
   chat:
     enabled: true
   voice_chat:
@@ -65,6 +67,7 @@ plugins:
     enabled: true
     native_slam_pcd_dir: "/opt/phanthy-motus/data/maps"
     native_slam_db_path: "/opt/phanthy-motus/data/controlled_spatial.db"
+    password: "123456"
   controlled_spatial_map:
     enabled: true
     native_slam_db_path: "/opt/phanthy-motus/data/controlled_spatial.db"

@@ -1,0 +1,8 @@
+string cmd
+string arg
+---
+bool ack
+string error_info
+---
+string feedback
+string feedback_arg

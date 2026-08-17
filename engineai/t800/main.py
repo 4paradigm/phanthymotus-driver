@@ -100,11 +100,16 @@ class T800DeviceBundle:
             JointBridgePlugin,
             JointOverridePlugin,
             JointPlanPlugin,
+            HeartbeatStatusPlugin,
             LedPlugin,
             LocomotionPlugin,
+            ControlledSpatialPlugin,
+            MotionCommandTracePlugin,
+            MotionEventsPlugin,
             MicPlugin,
             MotionModePlugin,
             MotorPowerPlugin,
+            NativeInterfaceProbePlugin,
             NativeNodeControlPlugin,
             NativeSdkPlugin,
             SafetyControlPlugin,
@@ -120,11 +125,21 @@ class T800DeviceBundle:
         self._started = False
         plugins = config.get("plugins", {})
 
-        state = StatePlugin(config, namespace, ros2)
+        motion_events = None
+        if plugins.get("motion_events", {}).get("enabled", False):
+            motion_events = MotionEventsPlugin(config, namespace, ros2)
+        self._motion_events = motion_events
+
+        state = StatePlugin(config, namespace, ros2, motion_events=motion_events)
         if plugins.get("state", {}).get("enabled", True):
             self._plugins.append(state)
+        if motion_events is not None:
+            self._plugins.append(motion_events)
 
         plugin_types = (
+            ("heartbeat_status", HeartbeatStatusPlugin, (config, namespace, ros2)),
+            ("motion_command_trace", MotionCommandTracePlugin, (config, namespace, ros2)),
+            ("native_interface_probe", NativeInterfaceProbePlugin, (config, namespace, ros2)),
             ("locomotion", LocomotionPlugin, (config, namespace, ros2, state)),
             ("motion_mode", MotionModePlugin, (config, namespace, ros2, state)),
             ("joint_plan", JointPlanPlugin, (config, namespace, ros2, state)),
@@ -160,6 +175,24 @@ class T800DeviceBundle:
             instance = VirtualGamepadPlugin(virtual_gamepad_config, namespace, ros2)
             instances["virtual_gamepad"] = instance
             self._plugins.append(instance)
+
+        controlled_spatial_config = plugins.get("controlled_spatial", {})
+        if controlled_spatial_config.get("enabled", False):
+            try:
+                instance = ControlledSpatialPlugin(controlled_spatial_config, namespace, ros2)
+                instances["controlled_spatial"] = instance
+                self._plugins.append(instance)
+            except Exception as exc:
+                print(f"[bundle] ControlledSpatialPlugin init failed, controlled_spatial disabled: {exc}", flush=True)
+
+        if plugins.get("controlled_spatial_map", {}).get("enabled", False):
+            try:
+                from controlled_spatial_map import make_plugin as make_map_plugin
+                map_cfg = dict(plugins["controlled_spatial_map"])
+                self._plugins.append(make_map_plugin(map_cfg, namespace, ros2))
+                print("[bundle] ControlledSpatialMapPlugin loaded")
+            except Exception as e:
+                print(f"[bundle] ControlledSpatialMapPlugin load skipped: {e}", flush=True)
 
         if "safety" in instances:
             instances["safety"].set_controls(
@@ -244,10 +277,21 @@ class T800DeviceBundle:
                     continue
                 args = dict(arguments)
                 if definition["type"] == "resource":
-                    return plugin.dispatch(tool_name, args)
+                    result = plugin.dispatch(tool_name, args)
+                    if self._motion_events is not None:
+                        self._motion_events.record_tool_call(tool_name, tool_name, args, result)
+                    return result
                 action = args.pop("action", tool_name)
                 args["_tool_name"] = tool_name
-                return plugin.dispatch(action, args)
+                try:
+                    result = plugin.dispatch(action, args)
+                except Exception as exc:
+                    if self._motion_events is not None:
+                        self._motion_events.record_exception(tool_name, action, args, exc)
+                    raise
+                if self._motion_events is not None:
+                    self._motion_events.record_tool_call(tool_name, action, args, result)
+                return result
         return None
 
 

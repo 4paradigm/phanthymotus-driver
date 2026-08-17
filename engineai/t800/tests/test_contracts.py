@@ -248,6 +248,10 @@ class VendoredContractTests(unittest.TestCase):
                                  if line.startswith("port:")))
         self.assertEqual(config_port, metadata_port)
         self.assertIn(f":{config_port}/mcp", metadata_text)
+        self.assertIn('hardware_model: "t800"', metadata_text)
+        self.assertNotIn("t800-dev", metadata_text)
+        deploy_text = (ROOT / "deploy" / "service.yml").read_text()
+        self.assertNotIn("RMW_IMPLEMENTATION=rmw_cyclonedds_cpp", deploy_text)
 
 
 if __name__ == "__main__":

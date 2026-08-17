@@ -226,12 +226,23 @@ class RepeatingCommand:
             self._stop_event = stop_event
             self._started_at = started_at
             self._deadline = deadline
-            self._last_publish_at = None
-            self._publish_count = 0
+            self._last_publish_at = started_at
+            self._publish_count = 1
+        try:
+            # Publish once before handing off to the worker. This guarantees a
+            # short command is not lost if the scheduler starts the thread late.
+            self._publisher(command)
+        except Exception:
+            with self._lock:
+                if self._stop_event is stop_event:
+                    self._stop_event = None
+                    self._publish_count = 0
+                    self._last_publish_at = None
+            raise
 
         def run() -> None:
             try:
-                while not stop_event.is_set():
+                while not stop_event.wait(self._period):
                     now = self._clock()
                     if deadline is not None and now >= deadline:
                         break
@@ -297,6 +308,20 @@ def action_schema(
     }
 
 
+def sensor_action_schema() -> dict:
+    """Lifecycle schema used by Agent Core to start and resolve sensor topics."""
+    actions = {
+        "start": ([], "启动卡片数据流"),
+        "info": ([], "返回卡片状态和实际输出 topic"),
+        "stop": ([], "停止卡片数据流"),
+        "status": ([], "返回最新传感器状态"),
+    }
+    schema = action_schema(actions, {}, "传感器生命周期动作")
+    # Reading a sensor directly without an action remains supported.
+    schema.pop("required", None)
+    return schema
+
+
 def array_property(description: str, *, item_type: str = "number") -> dict:
     return {
         "type": "array",
@@ -312,7 +337,7 @@ def sensor_tool(name: str, description: str, topic: str, fmt: str) -> dict:
         "multiInstance": False,
         "readOnly": True,
         "description": description,
-        "inputSchema": {"type": "object", "properties": {}},
+        "inputSchema": sensor_action_schema(),
         "topic_out": [{"topic": topic, "format": fmt}],
     }
 

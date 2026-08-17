@@ -1,0 +1,97 @@
+name: "RobotEra Q5 (Bundle)"
+mcp_port: 15793
+ros_namespace: ""
+# `sensor_msgs/JointState` and the Q5 command interface use radians. Change
+# this only after verifying a vendor-specific deviation from a raw ROS sample.
+joint_state_position_unit: "radians"
+
+plugins:
+  base_drive:
+    enabled: true
+    max_linear_x_mps: 0.20
+    max_angular_z_radps: 0.40
+    max_duration_s: 2.0
+    publish_rate_hz: 10.0
+    stop_repetitions: 3
+  joints:
+    enabled: true
+  joints_state:
+    enabled: true
+  robot_ready:
+    enabled: true
+  battery:
+    enabled: true
+  system_health:
+    enabled: true
+  hand_state:
+    enabled: true
+  estop:
+    enabled: true
+  diagnostics:
+    enabled: true
+  imu:
+    enabled: false
+  simple_action:
+    enabled: false
+  mic:
+    enabled: true
+    sample_rate_hz: 16000
+    channels: 1
+  speaker:
+    enabled: true
+    device: "hw:2,0"
+    sample_rate_hz: 16000
+    channels: 1
+    output_sample_rate_hz: 48000
+    output_channels: 2
+  audio:
+    enabled: true
+    device: "plughw:2,0"
+  camera_rgb:
+    enabled: true
+    source_topic: "/camera/camera/color/image_raw"
+    max_hz: 15.0
+    jpeg_quality: 60
+    remote_start:
+      enabled: true
+      host: "192.168.8.100"
+      user: "developer"
+      password: "developer"
+      port: 2222
+      depth_profile: "848x480x30"
+      color_profile: "848x480x30"
+  camera_depth:
+    enabled: true
+    source_topic: "/camera/camera/aligned_depth_to_color/image_raw"
+    max_hz: 15.0
+  arm_control:
+    enabled: true
+    hardware_enable: true
+    # Q5 vendor sample: at most +0.05 rad from current, in 0.01-rad samples
+    # spaced 0.3 s apart. URDF hard limits alone are not a safe move envelope.
+    max_target_delta_rad: 0.050
+    max_step_rad: 0.010
+    publish_rate_hz: 20.0
+    hold_repetitions: 3
+    # Keep the final arm target published until feedback has caught up.
+    settle_tolerance_rad: 0.035
+    settle_timeout_s: 1.5
+  q5_control_mode:
+    enabled: true
+  hand_control:
+    enabled: true
+    min_position_rad: 0.0
+    max_position_rad: 1.0
+    max_step_rad: 0.04
+    max_duration_s: 2.0
+    publish_rate_hz: 20.0
+    hold_repetitions: 3
+  hand_gesture:
+    enabled: true
+    max_duration_s: 2.0
+    publish_rate_hz: 20.0
+  head_control:
+    enabled: true
+    max_step_rad: 0.025
+    publish_rate_hz: 20.0
+    hold_repetitions: 3

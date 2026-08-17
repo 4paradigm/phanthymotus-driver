@@ -277,12 +277,53 @@ class SlamtecClient:
             "options": {"angle": angle_rad},
         })
 
-    def go_home(self) -> dict:
-        """自主回桩充电"""
+    def go_home(self, *, back_to_landing: Optional[bool] = None,
+                charging_retry_count: Optional[int] = None,
+                move_mode: Optional[int] = None) -> dict:
+        """回到充电桩并尝试上桩充电。"""
+        gohome_options: dict = {"flags": "dock"}
+        if back_to_landing is not None:
+            gohome_options["back_to_landing"] = bool(back_to_landing)
+        if charging_retry_count is not None:
+            gohome_options["charging_retry_count"] = int(charging_retry_count)
+        if move_mode is not None:
+            gohome_options["move_options"] = {"mode": int(move_mode)}
         return self._post("/api/core/motion/v1/actions", {
             "action_name": "slamtec.agent.actions.GoHomeAction",
-            "options": {"gohome_options": {"flags": "dock"}},
+            "options": {"gohome_options": gohome_options},
         })
+
+    # ── Home docks ───────────────────────────────────────────────────────────
+
+    def get_home_pose(self) -> dict:
+        """Get the currently selected dock pose (404 when no dock is set)."""
+        return self._get("/api/core/slam/v1/homepose")
+
+    def set_home_pose(self, pose: dict) -> dict:
+        """Set the currently selected dock pose (Pose3D)."""
+        pose3d = {
+            "x": pose.get("x", 0), "y": pose.get("y", 0), "z": pose.get("z", 0),
+            "yaw": pose.get("yaw", 0), "pitch": pose.get("pitch", 0), "roll": pose.get("roll", 0),
+        }
+        return self._put("/api/core/slam/v1/homepose", pose3d)
+
+    def get_home_docks(self) -> dict:
+        """List all registered docks (requires Slamtec firmware >= 4.3.2)."""
+        return self._get("/api/core/slam/v1/homedocks")
+
+    def register_home_dock(self, display_name: str) -> dict:
+        """Register a dock at the robot's current position."""
+        return self._post("/api/core/slam/v1/homedocks/:register", {
+            "metadata": {"display_name": display_name},
+        })
+
+    def delete_home_dock(self, dock_id: str) -> dict:
+        """Delete one registered dock by UUID."""
+        return self._delete(f"/api/core/slam/v1/homedocks/{dock_id}")
+
+    def clear_home_docks(self) -> dict:
+        """Delete all registered docks."""
+        return self._delete("/api/core/slam/v1/homedocks")
 
     # ── System ────────────────────────────────────────────────────────────────
 

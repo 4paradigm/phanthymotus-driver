@@ -1,9 +1,8 @@
 """Optional T800 ASR-to-official-motion-plan extension.
 
 The extension subscribes to final Perception ASR events and executes only the
-T800 motion-plan YAML files supplied by EngineAI's ROS2 workspace.  It does not
-use the driver's custom GesturePlugin or accept arbitrary joint values from
-ASR text.
+T800 motion plans embedded in its configuration. It does not use the driver's
+custom GesturePlugin or accept arbitrary joint values from ASR text.
 """
 
 from __future__ import annotations
@@ -12,9 +11,7 @@ import json
 import re
 import threading
 import time
-from pathlib import Path
 
-import yaml
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
@@ -69,8 +66,6 @@ class VoiceGesturePlugin:
         self._events_topic = str(
             plugin_config.get("events_topic") or f"/{namespace}/voice_gesture/events"
         )
-        self._motion_dir = Path(plugin_config.get("motion_dir", "/official-motions"))
-        self._bundled_motion_dir = Path(__file__).resolve().parent / "motions"
         self._require_wake_word = bool(plugin_config.get("require_wake_word", True))
         self._cooldown_sec = max(0.0, float(plugin_config.get("cooldown_sec", 3.0)))
         self._ready_timeout = max(1.0, float(plugin_config.get("planner_ready_timeout_sec", 10.0)))
@@ -109,16 +104,14 @@ class VoiceGesturePlugin:
         for motion_id, definition in definitions.items():
             if not isinstance(definition, dict):
                 continue
-            filename = str(definition.get("file", ""))
-            if not filename or Path(filename).name != filename or not filename.endswith((".yaml", ".yml")):
-                continue
             phrases = definition.get("phrases", [])
-            if not isinstance(phrases, list):
+            motion_plan = definition.get("motion_plan")
+            if not isinstance(phrases, list) or not isinstance(motion_plan, list):
                 continue
             catalog[str(motion_id)] = {
                 "description": str(definition.get("description", motion_id)),
-                "file": filename,
                 "phrases": [_normalise_text(str(item)) for item in phrases if str(item).strip()],
+                "motion_plan": motion_plan,
             }
         return catalog
 
@@ -257,28 +250,20 @@ class VoiceGesturePlugin:
 
     def _load_official_motion(self, motion_id: str) -> list[dict]:
         definition = self._motions[motion_id]
-        path = self._motion_dir / definition["file"]
-        if not path.is_file():
-            bundled_path = self._bundled_motion_dir / definition["file"]
-            if bundled_path.is_file():
-                path = bundled_path
-            else:
-                raise FileNotFoundError(f"official motion file not found: {path}")
-        payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        motion_plan = payload.get("motion_plan")
+        motion_plan = definition["motion_plan"]
         if not isinstance(motion_plan, list) or len(motion_plan) < 2:
-            raise ValueError("official motion file has no motion_plan tasks")
+            raise ValueError(f"motion {motion_id} has no motion_plan tasks")
         header = motion_plan[0]
         indices = header.get("joint_indices") if isinstance(header, dict) else None
         if not isinstance(indices, list) or not indices:
-            raise ValueError("official motion file has no joint_indices")
+            raise ValueError(f"motion {motion_id} has no joint_indices")
         indices = [int(index) for index in indices]
         if len(set(indices)) != len(indices) or any(index < 0 or index > 24 for index in indices):
-            raise ValueError("official motion file has invalid joint_indices")
+            raise ValueError(f"motion {motion_id} has invalid joint_indices")
         steps = []
         for item in motion_plan[1:]:
             if not isinstance(item, dict) or "motion" not in item:
-                raise ValueError("official motion file contains an invalid task")
+                raise ValueError(f"motion {motion_id} contains an invalid task")
             if str(item.get("request_type", "")).upper() == "RESET":
                 steps.append({"reset": True, "name": str(item["motion"])})
                 continue
@@ -380,7 +365,11 @@ class VoiceGesturePlugin:
 
     def _motion_catalog(self) -> list[dict]:
         return [
-            {"motion_id": motion_id, "description": definition["description"], "file": definition["file"]}
+            {
+                "motion_id": motion_id,
+                "description": definition["description"],
+                "steps": len(definition["motion_plan"]) - 1,
+            }
             for motion_id, definition in self._motions.items()
         ]
 
@@ -392,7 +381,7 @@ class VoiceGesturePlugin:
         return {
             **status,
             "motions": self._motion_catalog(),
-            "motion_dir": str(self._motion_dir),
+            "motion_source": "embedded_config",
             "require_wake_word": self._require_wake_word,
             "planner_state": planner_state,
             "planner_request_id": planner_request_id,

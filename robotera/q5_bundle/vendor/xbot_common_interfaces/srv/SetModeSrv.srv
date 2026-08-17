@@ -1,0 +1,6 @@
+# 请求部分：输入目标模式，0行走 1跑步 2站立锁定
+int16 mode
+---
+# 响应部分：返回执行结果
+bool success
+string message

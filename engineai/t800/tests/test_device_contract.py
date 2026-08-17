@@ -80,6 +80,24 @@ class FakeNode:
     def get_clock(self):
         return types.SimpleNamespace(now=lambda: types.SimpleNamespace(to_msg=lambda: "stamp"))
 
+    def get_topic_names_and_types(self):
+        return []
+
+    def get_service_names_and_types(self):
+        return []
+
+    def count_publishers(self, _name):
+        return 0
+
+    def count_subscribers(self, _name):
+        return 0
+
+    def count_services(self, _name):
+        return 0
+
+    def count_clients(self, _name):
+        return 0
+
 
 class FakeExecutor:
     def __init__(self):
@@ -120,6 +138,10 @@ def install_ros_stubs():
     sensor_msgs.Image = type("Image", (Message,), {})
     sys.modules["sensor_msgs.msg"] = sensor_msgs
 
+    nav_msgs = types.ModuleType("nav_msgs.msg")
+    nav_msgs.Odometry = type("Odometry", (Message,), {})
+    sys.modules["nav_msgs.msg"] = nav_msgs
+
     audio_msgs = types.ModuleType("audio_msgs.msg")
     audio_msgs.AudioChunk = type(
         "AudioChunk",
@@ -133,7 +155,7 @@ def install_ros_stubs():
     for name in (
         "BodyVelCmd", "GamepadKeys", "ImuInfo", "JointCommand", "JointMotionPlanState",
         "JointOverrideCommand", "JointState", "LedControl", "MotionState", "MotionStateRequest",
-        "MotorDebug", "NodeControl", "PowerInfo", "Tts",
+        "Heartbeat", "LinkInfo", "MotorDebug", "NodeControl", "PowerInfo", "Tts",
     ):
         setattr(protocol_msg, name, type(name, (Message,), {}))
     protocol_msg.JointMotionPlanRequest = JointMotionPlanRequest
@@ -170,6 +192,8 @@ CONFIG = {
         "joint_plan_state": "/motion/joint_motion_plan/state",
         "joint_override": "/motion/joint_override_command", "joint_command": "/hardware/joint_command",
         "tts": "/hardware/tts", "native_node_control": "/motion/node_control",
+        "heartbeat": "/heartbeat",
+        "odometry": "/manifold/ODIN2/device0/odometry",
         "vision_cloud_raw": "/manifold/ODIN2/device0/cloud/raw",
         "vision_cloud_slam": "/manifold/ODIN2/device0/cloud/slam",
         "vision_camera_left": "/manifold/ODIN2/device0/camera0/compressed",
@@ -177,6 +201,7 @@ CONFIG = {
         "vision_depth": "/manifold/ODIN2/device0/depth",
     },
     "services": {"enable_motor": "/hardware/enable_motor"},
+    "diagnostics": {"command_trace_capacity": 20, "motion_events_capacity": 100},
 }
 
 
@@ -211,23 +236,238 @@ class DevicePluginContractTests(unittest.TestCase):
             self.device.NativeNodeControlPlugin(CONFIG, "robot", self.ros),
             self.device.SafetyControlPlugin(CONFIG, "robot", self.ros, self.state),
             self.device.NativeSdkPlugin({"mode": "external"}, "robot", self.ros),
+            self.device.HeartbeatStatusPlugin(CONFIG, "robot", self.ros),
+            self.device.MotionCommandTracePlugin(CONFIG, "robot", self.ros),
+            self.device.MotionEventsPlugin(CONFIG, "robot", self.ros),
+            self.device.NativeInterfaceProbePlugin(CONFIG, "robot", self.ros),
             VirtualGamepadPlugin({}, "robot", self.ros),
         ]
         names = set()
+        definitions = []
         for plugin in plugins:
             tools = plugin.get_tools() if hasattr(plugin, "get_tools") else [plugin.get_tool()]
+            definitions.extend(tools)
             names.update(tool["name"] for tool in tools)
         self.assertEqual(
             {"joints", "imu", "battery", "motor_health", "motor_state", "motor_command", "joint_command_feedback",
              "gamepad", "motion_state", "driver_health", "model",
              "robot_snapshot", "fault_summary", "stability", "joint_groups", "capabilities", "ros_graph",
+             "mainboard", "heartbeat_status", "motion_command_trace", "motion_events",
+             "native_interface_probe",
              "loco", "motion_mode", "dance", "joint_plan", "joint_plan_state", "gesture",
              "joint_override", "joint_bridge",
              "led", "tts", "mic", "pointcloud", "camera", "depth",
              "motor_power", "native_node_control", "virtual_gamepad", "safety", "native_sdk"},
             names,
         )
-        self.assertEqual(36, len(names))
+        self.assertEqual(41, len(names))
+        self.assertEqual(41, len(definitions), "tool names must be unique")
+        for tool in definitions:
+            schema = tool.get("inputSchema")
+            self.assertEqual("object", schema.get("type"), tool["name"])
+            properties = schema.get("properties", {})
+            action = properties.get("action")
+            if not action:
+                continue
+            enum = action.get("enum", [])
+            self.assertEqual(len(enum), len(set(enum)), tool["name"])
+            for action_name, detail in schema.get("x-action-params", {}).items():
+                self.assertIn(action_name, enum, tool["name"])
+                for parameter in detail.get("params", []):
+                    self.assertIn(parameter, properties, f"{tool['name']}.{action_name}")
+
+    def test_sensor_lifecycle_schemas_and_info_topics_match_agent_core(self):
+        plugins = [
+            self.state,
+            self.device.HeartbeatStatusPlugin(CONFIG, "robot", self.ros),
+            self.device.MotionCommandTracePlugin(CONFIG, "robot", self.ros),
+            self.device.MotionEventsPlugin(CONFIG, "robot", self.ros),
+            self.device.NativeInterfaceProbePlugin(CONFIG, "robot", self.ros),
+            self.device.VisionPlugin(CONFIG, "robot", self.ros),
+            self.device.JointPlanPlugin(CONFIG, "robot", self.ros),
+        ]
+        for plugin in plugins:
+            tools = plugin.get_tools() if hasattr(plugin, "get_tools") else [plugin.get_tool()]
+            for tool in tools:
+                if tool["type"] != "sensor":
+                    continue
+                action = tool["inputSchema"]["properties"]["action"]
+                self.assertTrue({"start", "info", "stop"}.issubset(action["enum"]), tool["name"])
+                info = plugin.dispatch("info", {"_tool_name": tool["name"]})
+                self.assertTrue(info.get("topic_out"), tool["name"])
+
+    def test_new_status_plugins_can_start_with_declared_ros_dependencies(self):
+        plugins = [
+            self.device.HeartbeatStatusPlugin(CONFIG, "robot", self.ros),
+            self.device.MotionCommandTracePlugin(CONFIG, "robot", self.ros),
+            self.device.MotionEventsPlugin(CONFIG, "robot", self.ros),
+            self.device.NativeInterfaceProbePlugin(CONFIG, "robot", self.ros),
+        ]
+        for plugin in plugins:
+            plugin.start()
+            plugin.stop()
+
+    def test_motion_trace_prefers_fresh_command_over_stale_odometry(self):
+        plugin = self.device.MotionCommandTracePlugin(CONFIG, "robot", self.ros)
+        plugin._on_odometry(types.SimpleNamespace(
+            header=types.SimpleNamespace(frame_id="odom"),
+            child_frame_id="base",
+            twist=types.SimpleNamespace(twist=types.SimpleNamespace(
+                linear=types.SimpleNamespace(x=0.1, y=0.0, z=0.0),
+                angular=types.SimpleNamespace(x=0.0, y=0.0, z=0.0),
+            )),
+        ))
+        plugin._odometry_updated = time.monotonic() - 5.0
+        plugin._on_velocity(types.SimpleNamespace(linear_velocity=[0.8, 0.0, 0.0], yaw_velocity=0.0))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("body_velocity_command", snapshot["source"])
+        self.assertEqual("0.80 m/s", snapshot["speed"])
+
+    def test_motion_trace_rejects_implausible_odin_odometry(self):
+        plugin = self.device.MotionCommandTracePlugin(CONFIG, "robot", self.ros)
+        plugin._on_odometry(types.SimpleNamespace(
+            header=types.SimpleNamespace(frame_id="device0/odom"),
+            child_frame_id="device0/base_link",
+            twist=types.SimpleNamespace(twist=types.SimpleNamespace(
+                linear=types.SimpleNamespace(x=-10057.9, y=-27579.0, z=-17383.9),
+                angular=types.SimpleNamespace(x=0.0, y=0.0, z=0.0),
+            )),
+        ))
+        plugin._on_gamepad(types.SimpleNamespace(
+            hardware_connected=True,
+            digital_states=[],
+            analog_states=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("gamepad_analog", snapshot["source"])
+        self.assertEqual("0.00 m/s", snapshot["speed"])
+        self.assertEqual("stopped", snapshot["motion_state"])
+        self.assertEqual("none", snapshot["direction"])
+
+    def test_motion_trace_recognizes_gamepad_analog_speed(self):
+        plugin = self.device.MotionCommandTracePlugin(CONFIG, "robot", self.ros)
+        plugin._on_gamepad(types.SimpleNamespace(
+            hardware_connected=False,
+            digital_states=[],
+            analog_states=[0.0, 0.0, -0.4, 0.3, 0.0, 0.0],
+        ))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("gamepad_analog", snapshot["source"])
+        self.assertEqual("moving", snapshot["motion_state"])
+        self.assertEqual("forward_left", snapshot["direction"])
+        self.assertEqual("0.98 m/s", snapshot["speed"])
+
+    def test_motion_events_ignore_implausible_odin_odometry(self):
+        plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
+        plugin._on_odometry(types.SimpleNamespace(
+            twist=types.SimpleNamespace(twist=types.SimpleNamespace(
+                linear=types.SimpleNamespace(x=-10057.9, y=-27579.0, z=-17383.9),
+            )),
+        ))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("no_data", snapshot["state"])
+
+    def test_motion_events_detect_gamepad_motion_transitions(self):
+        plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
+        plugin._on_gamepad(types.SimpleNamespace(
+            hardware_connected=False,
+            digital_states=[],
+            analog_states=[0.0, 0.0, 0.0, 0.5, 0.0, 0.0],
+        ))
+        moving = plugin.dispatch("status", {})
+        self.assertEqual("running", moving["state"])
+        self.assertEqual("moving", moving["motion_state"])
+        self.assertEqual("gamepad", moving["speed_source"])
+        self.assertEqual("gamepad_analog", moving["control_source"])
+        self.assertEqual("move", moving["action"])
+        self.assertEqual("forward", moving["direction"])
+        self.assertEqual([], moving["buttons"])
+        self.assertEqual("1.50 m/s", moving["speed"])
+        self.assertEqual("motion_start", moving["event"])
+
+        plugin._on_gamepad(types.SimpleNamespace(
+            hardware_connected=False,
+            digital_states=[],
+            analog_states=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ))
+        stopped = plugin.dispatch("status", {})
+        self.assertEqual("stopped", stopped["motion_state"])
+        self.assertEqual("0.00 m/s", stopped["speed"])
+        self.assertEqual("motion_stop", stopped["event"])
+
+    def test_motion_events_identify_gamepad_macro_and_motion_state(self):
+        plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
+        digital = [0] * 12
+        digital[0] = 1  # LB
+        digital[2] = 1  # A
+        plugin._on_gamepad(types.SimpleNamespace(
+            hardware_connected=True,
+            digital_states=digital,
+            analog_states=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("stand", snapshot["action"])
+        self.assertEqual("gamepad_analog", snapshot["control_source"])
+        self.assertEqual("none", snapshot["direction"])
+        self.assertEqual(["LB", "A"], snapshot["buttons"])
+        self.assertEqual("gamepad_action", snapshot["event"])
+
+        plugin._on_motion_state(types.SimpleNamespace(current_motion_task="pd_stand"))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("pd_stand", snapshot["current_motion_state"])
+        self.assertEqual("stand", snapshot["action"])
+        self.assertEqual("motion_state", snapshot["control_source"])
+        self.assertEqual("motion_state_changed", snapshot["event"])
+
+    def test_motion_events_normalize_screen_motion_states(self):
+        plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
+        for raw, action in (
+            ("sit_down", "sit"),
+            ("boxing_combo", "punch"),
+            ("screen_punch", "punch"),
+        ):
+            with self.subTest(raw=raw):
+                plugin._on_motion_state(types.SimpleNamespace(current_motion_task=raw))
+                snapshot = plugin.dispatch("status", {})
+                self.assertEqual(raw, snapshot["current_motion_state"])
+                self.assertEqual(action, snapshot["action"])
+                self.assertEqual("motion_state", snapshot["control_source"])
+                self.assertEqual("motion_state_changed", snapshot["event"])
+
+    def test_motion_events_keep_screen_state_visible_after_idle_gamepad(self):
+        plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
+        plugin._on_motion_state(types.SimpleNamespace(current_motion_task="sit_down"))
+        plugin._on_gamepad(types.SimpleNamespace(
+            hardware_connected=True,
+            digital_states=[0] * 12,
+            analog_states=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("sit", snapshot["action"])
+        self.assertEqual("motion_state", snapshot["control_source"])
+        self.assertEqual("sit_down", snapshot["current_motion_state"])
+
+    def test_motion_events_accept_ros_array_like_gamepad_states(self):
+        class RosArrayLike:
+            def __init__(self, values):
+                self._values = list(values)
+
+            def __iter__(self):
+                return iter(self._values)
+
+            def __bool__(self):
+                raise ValueError("ambiguous truth value")
+
+        plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
+        digital = RosArrayLike([1, 0, 1] + [0] * 9)
+        plugin._on_gamepad(types.SimpleNamespace(
+            hardware_connected=True,
+            digital_states=digital,
+            analog_states=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("stand", snapshot["action"])
+        self.assertEqual(["LB", "A"], snapshot["buttons"])
 
     def test_derived_diagnostics_and_capability_resources(self):
         self.state._set("imu", {
@@ -370,6 +610,10 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertFalse(result["enabled"])
 
+        motor._client = types.SimpleNamespace(service_is_ready=lambda: False)
+        unavailable = motor.dispatch("start", {})
+        self.assertEqual("error", unavailable["state"])
+
     def test_mic_uses_pulseaudio_capture_and_publishes_pcm_chunks(self):
         plugin = self.device.MicPlugin(CONFIG, "robot", self.ros)
 
@@ -460,6 +704,30 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("slam", info["source"])
         self.assertEqual(4, len(info["topic_out"]))
         self.assertEqual("sensor/pointcloud", info["topic_out"][0]["format"])
+
+    def test_vision_lifecycle_resolves_and_stops_only_the_requested_card(self):
+        plugin = self.device.VisionPlugin(CONFIG, "robot", self.ros)
+        plugin.start()
+        tools = {tool["name"]: tool for tool in plugin.get_tools()}
+        cloud_schema = tools["pointcloud"]["inputSchema"]
+        self.assertIn("select_source", cloud_schema["properties"]["action"]["enum"])
+        self.assertEqual(["raw", "slam"], cloud_schema["properties"]["source"]["enum"])
+
+        for tool_name, tool in tools.items():
+            info = plugin.dispatch("info", {"_tool_name": tool_name})
+            self.assertEqual(tool["topic_out"], info["topic_out"], tool_name)
+
+        stopped = plugin.dispatch("stop", {"_tool_name": "depth"})
+        camera = plugin.dispatch("info", {"_tool_name": "camera"})
+        self.assertEqual("idle", stopped["state"])
+        self.assertEqual("running", camera["state"])
+        self.assertTrue(plugin._running)
+        self.assertNotIn("depth", plugin._enabled_tools)
+
+        plugin.stop()
+        restarted = plugin.dispatch("start", {"_tool_name": "pointcloud"})
+        self.assertEqual("running", restarted["state"])
+        self.assertEqual({"pointcloud"}, plugin._enabled_tools)
 
     def test_vision_camera_passthrough_and_native_depth_conversion(self):
         plugin = self.device.VisionPlugin(CONFIG, "robot", self.ros)
