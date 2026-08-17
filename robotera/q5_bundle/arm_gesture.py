@@ -6,6 +6,10 @@ from __future__ import annotations
 import math
 import threading
 import time
+import json
+import urllib.request
+import ssl
+import os
 
 try:
     from arm_control import ArmControlPlugin
@@ -14,6 +18,15 @@ except ImportError:
 
 from body_command import get_router as _get_body_router, BodyCommandRouter
 from control_contract import q5_active_status, q5_is_control_ready
+from joint_limits import JOINT_LIMITS, limits_for
+
+_Q5_ARM_JOINTS = (
+    "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_arm_yaw_joint",
+    "left_elbow_pitch_joint", "left_elbow_yaw_joint", "left_wrist_pitch_joint",
+    "left_wrist_roll_joint", "right_shoulder_pitch_joint", "right_shoulder_roll_joint",
+    "right_arm_yaw_joint", "right_elbow_pitch_joint", "right_elbow_yaw_joint",
+    "right_wrist_pitch_joint", "right_wrist_roll_joint",
+)
 
 CARD = "arm_gesture"
 TYPE = "actuator"
@@ -111,6 +124,31 @@ def _failure(code: str, message: str, **details) -> dict:
     return {"ok": False, "code": code, "message": message, "details": details}
 
 
+def _acp_notify(action_id: str, status: str, result: dict, tool: str = ""):
+    """POST action completion to Agent Core (module-level ACP helper)."""
+    agent_core_url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    payload = json.dumps({
+        "action_id": action_id,
+        "status": status,
+        "result": result,
+        "tool": tool,
+        "ts": time.time(),
+    }).encode()
+    try:
+        req = urllib.request.Request(
+            f"{agent_core_url}/api/acp/complete",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=5, context=ctx)
+    except Exception:
+        pass  # ACP failure must not block gesture execution
+
+
 # ── Frame builder ────────────────────────────────────────────────────────────
 
 def _build_frames(gesture: str, cycles: int) -> list:
@@ -143,42 +181,6 @@ def _build_frames(gesture: str, cycles: int) -> list:
 
 
 # ── Pose validation ─────────────────────────────────────────────────────────
-
-_Q5_ARM_LIMITS = {
-    "left_shoulder_pitch_joint": (-2.79, 2.79),
-    "left_shoulder_roll_joint": (-0.24, 1.83),
-    "left_arm_yaw_joint": (-2.62, 2.62),
-    "left_elbow_pitch_joint": (-2.27, 0.09),
-    "left_elbow_yaw_joint": (-2.62, 2.62),
-    "left_wrist_pitch_joint": (-1.05, 1.05),
-    "left_wrist_roll_joint": (-1.05, 1.05),
-    "right_shoulder_pitch_joint": (-2.79, 2.79),
-    "right_shoulder_roll_joint": (-1.83, 0.24),
-    "right_arm_yaw_joint": (-2.62, 2.62),
-    "right_elbow_pitch_joint": (-2.27, 0.09),
-    "right_elbow_yaw_joint": (-2.62, 2.62),
-    "right_wrist_pitch_joint": (-1.05, 1.05),
-    "right_wrist_roll_joint": (-1.05, 1.05),
-}
-
-
-def _validate_pose_rad(positions: dict[str, float]) -> list[dict]:
-    """Return a list of violation dicts for positions that exceed Q5 limits."""
-    violations: list[dict] = []
-    for name, rad in positions.items():
-        limit = _Q5_ARM_LIMITS.get(name)
-        if limit is None:
-            continue
-        lo, hi = limit
-        if rad < lo or rad > hi:
-            violations.append({
-                "joint": name,
-                "value_rad": rad,
-                "min_rad": lo,
-                "max_rad": hi,
-            })
-    return violations
-
 
 # ── Plugin ───────────────────────────────────────────────────────────────────
 
@@ -282,6 +284,10 @@ class Plugin:
                     "start": {"params": [], "description": "检查 ROS 连接和机器人状态"},
                     "info": {"params": [], "description": "查看当前运动和安全条件"},
                 },
+                "x-completion": {
+                    "actions": ["salute", "welcome", "raise", "shake_hands", "high_five"],
+                    "timeout": 60,
+                },
             },
         }
 
@@ -345,6 +351,16 @@ class Plugin:
             return _failure("Q5_FSM_NOT_READY", "Q5 /xbot_state must be fresh and READY or ACTIVE",
                             status={**status, "q5_fsm": q5_fsm})
 
+        # Check position-control preparation (same gate as arm_control).
+        if self._arm_control is not None:
+            arm_ctrl_prep = self._arm_control._client.q5_position_control_prepared
+            if not arm_ctrl_prep:
+                return _failure(
+                    "DIRECT_CONTROL_NOT_PREPARED",
+                    "Run q5_control_mode action=prepare_position_control first",
+                    status=status,
+                )
+
         if not status["joint_state_fresh"]:
             return _failure("JOINT_STATE_UNAVAILABLE", "Refusing gesture without fresh /joint_states",
                             status=status)
@@ -382,8 +398,10 @@ class Plugin:
 
     # ── Move worker ───────────────────────────────────────────────────────
 
-    def _run_move(self, stop_event: threading.Event, frames, speed: float, side: str):
+    def _run_move(self, stop_event: threading.Event, frames, speed: float, side: str,
+                  gesture: str, action_id: str | None):
         """Interpolate through gesture frames, honoring stop_event and commanded side."""
+        cancelled = True  # default: cancelled on any error/exception
         try:
             previous_positions = dict(self._hold_current())  # start from current pose
 
@@ -448,7 +466,19 @@ class Plugin:
 
                 if not stop_event.wait(delay):
                     pass  # normal hold completed
+            cancelled = False  # all frames completed successfully
+        except Exception:
+            pass
         finally:
+            # ACP completion callback
+            if action_id:
+                if cancelled and not stop_event.is_set():
+                    _acp_notify(action_id, "error", {"gesture": gesture, "error": "unexpected_failure"}, CARD)
+                elif stop_event.is_set():
+                    _acp_notify(action_id, "cancelled", {"gesture": gesture, "side": side}, CARD)
+                else:
+                    _acp_notify(action_id, "completed", {"gesture": gesture, "side": side}, CARD)
+
             with self._lock:
                 if self._status.get("state") != "error":
                     self._status["state"] = "idle"
@@ -566,13 +596,18 @@ class Plugin:
                                 "Semantic arm pose exceeds Q5 joint limits",
                                 gesture=action, violations=violations)
 
+        # ACP: generate action_id and completion callback for long gestures
+        action_id = None
+        if action in _GESTURES_DEG:
+            action_id = f"arm_gesture_{action}_{int(time.time()*1000)}"
+
         # Start motion thread
         stop_event = threading.Event()
         with self._lock:
             self._stop_event = stop_event
             self._motion_thread = threading.Thread(
                 target=self._run_move,
-                args=(stop_event, frames, speed, side),
+                args=(stop_event, frames, speed, side, action, action_id),
                 daemon=True,
                 name="q5_arm_gesture",
             )
@@ -583,7 +618,8 @@ class Plugin:
                         "updated_at_ms": int(time.time() * 1000)}
 
         return {"ok": True, "state": "running", "gesture": action,
-                "side": side, "cycles": cycles, "speed": speed}
+                "side": side, "cycles": cycles, "speed": speed,
+                "action_id": action_id}
 
 
 def make_plugin(plugin_config, namespace, executor, client):
