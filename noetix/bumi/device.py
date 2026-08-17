@@ -386,35 +386,25 @@ class LocoPlugin:
                     "vx": {
                         "type": "number",
                         "default": 0.0,
-                        "description": (
-                            "Allowed range: -1 to -0.5, 0, or 0.5 to 1; default 0."
-                        ),
+                        "description": "default: 0, [-1.0,-0.5]U[0.5,1.0]",
                         "minimum": -1, "maximum": 1,
                     },
                     "vy": {
                         "type": "number",
                         "default": 0.0,
-                        "description": (
-                            "Allowed range: -1 to -0.5, 0, or 0.5 to 1; default 0."
-                        ),
+                        "description": "default: 0, [-1.0,-0.5]U[0.5,1.0]",
                         "minimum": -1, "maximum": 1,
                     },
                     "vyaw": {
                         "type": "number",
                         "default": 0.0,
-                        "description": (
-                            "Allowed range: -1 to -0.5, 0, or 0.5 to 1; default 0."
-                        ),
+                        "description": "default: 0, [-1.0,-0.5]U[0.5,1.0]",
                         "minimum": -1, "maximum": 1,
                     },
                     "duration": {
                         "type": "number",
                         "default": self._MOVE_DEFAULT_DURATION_S,
-                        "description": (
-                        "Movement duration in seconds, from 1 to 10; default 2.0. Shorter pulses "
-                        "can end before Bumi's walking policy starts a visible gait. The card "
-                        "automatically sends zero velocity when this time expires."
-                        ),
+                        "description": "default: 2.0, [1.0,10.0] seconds",
                         "minimum": self._MOVE_MIN_DURATION_S,
                         "maximum": self._MOVE_MAX_DURATION_S,
                     },
