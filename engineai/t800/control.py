@@ -244,6 +244,7 @@ class RepeatingCommand:
         self._publish_count = 0
         self._ramp = None
         self._current: dict = {}
+        self._target: dict = {}
 
     def start(self, command: dict, duration: float, ramp=None) -> StreamSnapshot:
         duration = float(duration)
@@ -264,6 +265,7 @@ class RepeatingCommand:
             self._publish_count = 1
             self._ramp = ramp
             self._current = {key: 0.0 for key in command}
+            self._target = command
         try:
             # Publish once before handing off to the worker. This guarantees a
             # short command is not lost if the scheduler starts the thread late.
@@ -282,9 +284,14 @@ class RepeatingCommand:
                 last_step_at = started_at
                 while not stop_event.wait(self._period):
                     now = self._clock()
+                    with self._lock:
+                        # 每次 tick 重新读取目标与截止时间：renew 续延/换目标
+                        # 无需重启流即可在下一个 tick 生效。
+                        target = self._target
+                        deadline = self._deadline
                     if deadline is not None and now >= deadline:
                         break
-                    self._publisher(self._step(command, now - last_step_at))
+                    self._publisher(self._step(target, now - last_step_at))
                     last_step_at = now
                     with self._lock:
                         self._last_publish_at = now
@@ -301,6 +308,24 @@ class RepeatingCommand:
                     self._stop_publisher()
 
         threading.Thread(target=run, daemon=True, name="t800-command-stream").start()
+        return self.snapshot()
+
+    def renew(self, command: dict, duration: float) -> StreamSnapshot:
+        """不重启地续延一条活跃流：更新目标命令并把截止时间从当前时刻起
+        延长 duration 秒。不调用 stop()、不发布任何值、不触碰工作线程
+        （下一 tick 生效；用于 Nav2 40Hz 提案流，避免每次提案都停-启一次
+        造成 100Hz 命令线上的零值振荡）。流已不活跃时退化为 start()，
+        调用方绝不会因一次续延请求留下死流。"""
+        duration = float(duration)
+        if not math.isfinite(duration) or duration < -1:
+            raise ValueError("duration must be -1 or a non-negative finite number")
+        with self._lock:
+            active = self._stop_event is not None
+            if active:
+                self._deadline = None if duration == -1 else self._clock() + duration
+                self._target = command
+        if not active:
+            return self.start(command, duration, ramp=None)
         return self.snapshot()
 
     def _step(self, command: dict, dt: float) -> dict:

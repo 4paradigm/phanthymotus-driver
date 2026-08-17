@@ -948,7 +948,8 @@ class MotionCommandTracePlugin:
 
     def _max_reasonable_speed(self) -> float:
         control = self._config.get("control", {})
-        max_vx = abs(float(control.get("max_vx", 3.0)))
+        # 缺失配置键回退到官方限幅 ±1（与 LocomotionPlugin._limits 同约定）。
+        max_vx = abs(float(control.get("max_vx", 1.0)))
         max_vy = abs(float(control.get("max_vy", 1.0)))
         # Leave a small margin for measured odometry noise while still rejecting
         # ODIN2-internal values that are not robot m/s velocity on T800.
@@ -1030,7 +1031,8 @@ class MotionCommandTracePlugin:
 
     def _on_gamepad(self, msg) -> None:
         analog = [float(value) for value in msg.analog_states]
-        max_vx = abs(float(self._config.get("control", {}).get("max_vx", 3.0)))
+        # 缺失配置键回退到官方限幅 ±1（与 LocomotionPlugin._limits 同约定）。
+        max_vx = abs(float(self._config.get("control", {}).get("max_vx", 1.0)))
         max_vy = abs(float(self._config.get("control", {}).get("max_vy", 1.0)))
         stick_x = analog[2] if len(analog) > 2 else 0.0
         stick_y = analog[3] if len(analog) > 3 else 0.0
@@ -1218,7 +1220,8 @@ class MotionEventsPlugin:
 
     def _max_reasonable_speed(self) -> float:
         control = self._config.get("control", {})
-        max_vx = abs(float(control.get("max_vx", 3.0)))
+        # 缺失配置键回退到官方限幅 ±1（与 LocomotionPlugin._limits 同约定）。
+        max_vx = abs(float(control.get("max_vx", 1.0)))
         max_vy = abs(float(control.get("max_vy", 1.0)))
         return max(1.0, math.hypot(max_vx, max_vy) * 1.5)
 
@@ -1349,7 +1352,8 @@ class MotionEventsPlugin:
 
     def _on_gamepad(self, msg) -> None:
         analog = [float(value) for value in msg.analog_states]
-        max_vx = abs(float(self._config.get("control", {}).get("max_vx", 3.0)))
+        # 缺失配置键回退到官方限幅 ±1（与 LocomotionPlugin._limits 同约定）。
+        max_vx = abs(float(self._config.get("control", {}).get("max_vx", 1.0)))
         max_vy = abs(float(self._config.get("control", {}).get("max_vy", 1.0)))
         stick_x = analog[2] if len(analog) > 2 else 0.0
         stick_y = analog[3] if len(analog) > 3 else 0.0
@@ -2054,6 +2058,9 @@ class LocomotionPlugin:
             self._publish_zero()
             return {"state": "error", "connected": False, "error": str(exc),
                     "topic_in": [self._velocity_proposal_port()]}
+        # 绑定成功即移交导航控制：若手动 move 流仍在跑，立即停流归零，
+        # 与各错误路径对称——任何进入导航态的路径都不允许残留手动脉流。
+        self._stream.stop()
         self._destroy_proposal_subscription()
         self._proposal_subscription = self._node.create_subscription(
             String, topic, self._on_velocity_proposal, _RELIABLE
@@ -2088,15 +2095,22 @@ class LocomotionPlugin:
         if decision.stop:
             self._stream.stop()  # 发布零速度
             return
-        self._stream.start(
-            {
-                "vx": decision.proposal.x,
-                "vy": decision.proposal.y,
-                "vyaw": decision.proposal.yaw,
-            },
-            decision.duration,
-            ramp=None,  # Nav2 40Hz 自带平滑；TTL 内必须瞬时达速
-        )
+        command = {
+            "vx": decision.proposal.x,
+            "vy": decision.proposal.y,
+            "vyaw": decision.proposal.yaw,
+        }
+        if self._stream.snapshot().active:
+            # 流已活跃：只续延目标与截止时间，绝不停-启（否则 Nav2 40Hz
+            # 提案会在 100Hz 命令线上制造 0,目标,0,目标 振荡）。TTL 过期
+            # 后的收流由 _watchdog_proposal 负责，这里不加第二条停流路径。
+            self._stream.renew(command, decision.duration)
+        else:
+            self._stream.start(
+                command,
+                decision.duration,
+                ramp=None,  # Nav2 40Hz 自带平滑；TTL 内必须瞬时达速
+            )
 
     def _watchdog_proposal(self) -> None:
         decision = self._gate.watchdog(time.monotonic())
