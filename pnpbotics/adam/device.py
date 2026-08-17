@@ -749,6 +749,15 @@ class ZedCameraPlugin:
     optional point cloud for the native Phanthymotus renderer.
     """
 
+    PREFIX = "camera"
+
+    _CARD_NAMES = (
+        "camera_head",
+        "camera_depth",
+        "camera_info",
+        "camera_pointcloud",
+    )
+
     _FORMATS = {
         "camera_head": "image/jpeg",
         "camera_depth": "image/depth-zlib",
@@ -773,6 +782,16 @@ class ZedCameraPlugin:
         self._pointcloud_enabled = bool(
             pointcloud_config.get(
                 "enabled", self._config.get("pointcloud_enabled", False)))
+        # The four cards share one ZED capture thread, but each card has its
+        # own publication lifecycle.  Preserve the existing behaviour of
+        # publishing RGB, depth and info at startup; point cloud remains
+        # opt-in because it is more expensive.
+        self._card_enabled = {
+            "camera_head": True,
+            "camera_depth": True,
+            "camera_info": True,
+            "camera_pointcloud": self._pointcloud_enabled,
+        }
         self._rgb_hz = max(1.0, min(float(self._config.get("rgb_hz", 15)), 30.0))
         self._depth_hz = max(1.0, min(float(self._config.get("depth_hz", 8)), 15.0))
         self._info_hz = max(0.2, min(float(self._config.get("info_hz", 1)), 5.0))
@@ -815,6 +834,10 @@ class ZedCameraPlugin:
         self._camera = None
         self._capture_thread = None
         self._info_timer = None
+        self._rgb_pub = None
+        self._depth_pub = None
+        self._info_pub = None
+        self._pointcloud_pub = None
         self._lock = threading.Lock()
         self._state = {
             "state": "idle",
@@ -881,7 +904,13 @@ class ZedCameraPlugin:
 
     def start(self):
         if self._running:
-            return
+            return True
+
+        # A capture loop can stop unexpectedly after opening the camera.  Do
+        # the normal cleanup before creating a replacement thread/publishers.
+        if self._capture_thread is not None or self._camera is not None:
+            self.stop()
+
         self._running = True
         try:
             from sensor_msgs.msg import CompressedImage
@@ -902,13 +931,35 @@ class ZedCameraPlugin:
                 1.0 / self._info_hz, self._publish_info)
         except Exception as exc:
             self._running = False
+            self._destroy_publishers()
             self._set_error(f"ROS2 camera publisher setup failed: {exc}")
-            return
+            return False
 
         self._publish_info()
         self._capture_thread = threading.Thread(
             target=self._capture_loop, daemon=True, name="adam_zed_capture")
         self._capture_thread.start()
+        return True
+
+    def _destroy_publishers(self):
+        timer = self._info_timer
+        self._info_timer = None
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+
+        for attr in (
+                "_rgb_pub", "_depth_pub", "_info_pub", "_pointcloud_pub"):
+            publisher = getattr(self, attr, None)
+            setattr(self, attr, None)
+            if publisher is None:
+                continue
+            try:
+                self._pub_node.destroy_publisher(publisher)
+            except Exception:
+                pass
 
     def stop(self):
         self._running = False
@@ -936,6 +987,7 @@ class ZedCameraPlugin:
                 "pointcloud_enabled": self._pointcloud_enabled,
             })
         self._publish_info()
+        self._destroy_publishers()
 
     def _set_error(self, message):
         with self._lock:
@@ -1116,7 +1168,14 @@ class ZedCameraPlugin:
                 with self._lock:
                     self._state["last_frame_ts_ms"] = now_ms
 
-                if now >= next_rgb:
+                with self._lock:
+                    rgb_enabled = self._card_enabled["camera_head"]
+                    depth_enabled = self._card_enabled["camera_depth"]
+                    pointcloud_enabled = (
+                        self._card_enabled["camera_pointcloud"]
+                        and self._pointcloud_enabled)
+
+                if rgb_enabled and now >= next_rgb:
                     try:
                         camera.retrieve_image(image, sl.VIEW.LEFT, sl.MEM.CPU)
                         jpeg = self._encode_jpeg(
@@ -1131,9 +1190,7 @@ class ZedCameraPlugin:
                         self._set_error(f"RGB publish failed: {exc}")
                     next_rgb = now + 1.0 / self._rgb_hz
 
-                need_depth = now >= next_depth
-                with self._lock:
-                    pointcloud_enabled = self._pointcloud_enabled
+                need_depth = depth_enabled and now >= next_depth
                 need_pointcloud = pointcloud_enabled and now >= next_pointcloud
 
                 if need_depth:
@@ -1275,42 +1332,95 @@ class ZedCameraPlugin:
         if publisher is None:
             return
         with self._lock:
+            if not self._card_enabled["camera_info"]:
+                return
             payload = dict(self._state)
             payload["pointcloud_enabled"] = self._pointcloud_enabled
         message = String()
         message.data = json.dumps(payload, separators=(",", ":"))
         publisher.publish(message)
 
+    def _card_state(self, tool_name):
+        with self._lock:
+            enabled = self._card_enabled[tool_name]
+            state = self._state.get("state", "idle")
+            running = self._running
+
+        if tool_name == "camera_pointcloud" and not enabled:
+            return "disabled"
+        if not enabled:
+            return "idle"
+        # start() launches the SDK capture loop asynchronously.  Report the
+        # card as running during that short opening window; an SDK failure is
+        # reported asynchronously through the shared error state.
+        if state == "idle" and running:
+            return "running"
+        return state
+
+    def _card_response(self, tool_name):
+        response = {
+            "state": self._card_state(tool_name),
+            "topic_out": [{
+                "topic": self._topics[tool_name],
+                "format": self._FORMATS[tool_name],
+            }],
+        }
+        if tool_name == "camera_pointcloud":
+            response["pointcloud_enabled"] = self._pointcloud_enabled
+        return response
+
+    def _stop_if_no_cards_enabled(self):
+        with self._lock:
+            should_stop = not any(self._card_enabled.values())
+        if should_stop:
+            self.stop()
+
     def dispatch(self, action, args):
         tool_name = args.get("_tool_name", action)
+        if tool_name not in self._CARD_NAMES:
+            return {"state": self._state.get("state", "idle")}
+
         if tool_name == "camera_pointcloud" and action in ("start", "enable"):
             with self._lock:
+                self._card_enabled[tool_name] = True
                 self._pointcloud_enabled = True
                 self._state["pointcloud_enabled"] = True
+            if not self._running:
+                self.start()
             self._publish_info()
-            return {"state": "running" if self._available else self._state["state"], "pointcloud_enabled": True}
+            return self._card_response(tool_name)
+
         if tool_name == "camera_pointcloud" and action in ("stop", "disable"):
             with self._lock:
+                self._card_enabled[tool_name] = False
                 self._pointcloud_enabled = False
                 self._state["pointcloud_enabled"] = False
             self._publish_info()
-            return {"state": "disabled", "pointcloud_enabled": False}
+            self._stop_if_no_cards_enabled()
+            return self._card_response(tool_name)
+
+        if action == "start":
+            with self._lock:
+                self._card_enabled[tool_name] = True
+            if not self._running:
+                self.start()
+            if tool_name == "camera_info":
+                self._publish_info()
+            return self._card_response(tool_name)
+
+        if action == "stop":
+            with self._lock:
+                self._card_enabled[tool_name] = False
+            self._stop_if_no_cards_enabled()
+            return self._card_response(tool_name)
+
         if action in ("read", "get") and tool_name == "camera_info":
             with self._lock:
-                return dict(self._state)
-        if action in ("info", "start", "stop", tool_name):
-            state = self._state.get("state", "idle")
-            if tool_name == "camera_pointcloud" and not self._pointcloud_enabled:
-                state = "disabled"
-            return {
-                "state": state,
-                "topic_out": [{
-                    "topic": self._topics[tool_name],
-                    "format": self._FORMATS[tool_name],
-                }],
-                **({"pointcloud_enabled": self._pointcloud_enabled}
-                   if tool_name == "camera_pointcloud" else {}),
-            }
+                state = dict(self._state)
+                state["pointcloud_enabled"] = self._pointcloud_enabled
+                return state
+        if action in ("info", tool_name):
+            return self._card_response(tool_name)
         return {"state": self._state.get("state", "idle")}
 
 
