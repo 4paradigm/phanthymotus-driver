@@ -1093,6 +1093,50 @@ class DevicePluginContractTests(unittest.TestCase):
         plugin._run_command = lambda command: "unparseable"
         self.assertIn("error", plugin.dispatch("get_volume", {}))
 
+    def test_speaker_aplay_command_flags_for_low_latency(self):
+        # 真机延迟根因:aplay 默认 500ms 读前缓冲 + ALSA dmix ~341ms 缓冲。
+        # aplay 需带 --buffer-time/--period-time;默认设备经 /etc/asound.conf
+        # 路由到 PulseAudio(pactl 音量才能作用于播放输出)。
+        plugin = self.device.SpeakerPlugin(CONFIG, "robot", self.ros)
+        calls = []
+
+        class FakeProc:
+            def __init__(self):
+                self.stdin = types.SimpleNamespace(
+                    write=lambda data: None, flush=lambda: None, close=lambda: None)
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = 0
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        def fake_popen(argv, **kwargs):
+            calls.append(argv)
+            return FakeProc()
+
+        original = self.device.subprocess.Popen
+        self.device.subprocess.Popen = fake_popen
+        try:
+            plugin._check_pulse = lambda: None
+            plugin._run_command = lambda command: ""
+            result = plugin.dispatch("start", {"input_topic": "/test/pcm"})
+        finally:
+            self.device.subprocess.Popen = original
+        self.assertEqual("ready", result["state"])
+        self.assertEqual(
+            ["aplay", "-q", "-t", "raw", "-f", "S16_LE", "-r", "16000", "-c", "1",
+             "--buffer-time=100000", "--period-time=20000", "-"],
+            calls[-1],
+        )
+
     def test_speaker_aplay_exit_sets_error(self):
         plugin = self.device.SpeakerPlugin(CONFIG, "robot", self.ros)
 

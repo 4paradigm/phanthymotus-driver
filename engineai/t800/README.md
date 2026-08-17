@@ -94,6 +94,13 @@ Sobel 边缘抑制和最近邻上采样均由众擎节点完成。使用 `depth`
 utterance 结束的 8 字节 EOF magic），driver 只负责流式播放。镜像已含
 `alsa-utils`；容器经 `-v /dev:/dev` 挂载声卡节点。
 
+实时性：镜像内置 `/etc/asound.conf` 把 ALSA 默认设备路由到宿主
+PulseAudio——这是官方「aplay 播放 + pactl 音量」模型成立的前提
+（dmix 直通硬件时 pactl 音量不作用于播放输出，且 dmix 默认 ~341ms
+缓冲会造成明显延迟）。`aplay` 带 `--buffer-time=100000 --period-time=20000`
+压低读前缓冲；部署侧设置 `PULSE_LATENCY_MSEC=40` 控制 PulseAudio
+tsched 延迟上限（见 `deploy/service.yml`）。
+
 ## 运行
 
 机器人必须通过主机内置以太网口访问；官方默认 ROS Domain 为 69。
