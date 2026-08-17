@@ -524,6 +524,25 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertAlmostEqual(arc["vx"], arc["vyaw"])
         plugin.dispatch("stop_move", {})
 
+    def test_locomotion_gate_accepts_walk_states(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        for motion in ("rl_basic", "lower_body_balance"):
+            self.state._on_motion(types.SimpleNamespace(
+                current_motion_task=motion, available_transition_motions=["idle"]))
+            result = plugin.dispatch("move", {"vx": 0.2, "duration": 0.01})
+            self.assertEqual("running", result["state"])
+
+    def test_locomotion_gate_rejects_non_walk_states_without_force(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="idle", available_transition_motions=[]))
+        result = plugin.dispatch("move", {"vx": 0.2, "duration": 0.01})
+        self.assertTrue(result["error"].startswith("move requires motion state"))
+        self.assertIn("rl_basic", result["error"])
+        self.assertEqual("idle", self.state.current_motion()[0])
+
     def test_motion_mode_force_path_publishes_custom_state(self):
         plugin = self.device.MotionModePlugin(CONFIG, "robot", self.ros, self.state)
         plugin.start()
