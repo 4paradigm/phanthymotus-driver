@@ -31,11 +31,15 @@ Every published state identifies `Noetix HighController/CycloneDDS` as its sourc
 
 Uses only `HighController` to send bounded normalized forward, lateral and
 turning commands. A move is accepted only in workmode 2 (`walking`), requires
-at least one non-zero velocity, defaults to 1 second and is limited to 5
-seconds. The driver sends commands at 100 Hz and automatically sends zero
-velocity when the duration expires, `stop_move` is called, or the observed
-workmode leaves walking. It does not automatically promote another mode into
-walking because the SDK cannot verify that the robot is physically standing.
+at least one non-zero velocity, defaults to 2 seconds and is limited to 1-5
+seconds. Before the first stream, the card sends one `WALK` edge to activate
+this SDK client's walking policy and then follows the vendor example by sending
+`DEFAULT` velocity frames at 100 Hz. Joint feedback must confirm that locomotion
+started; otherwise the card sends zero velocity and returns an error instead of
+reporting a false `running` state. It also sends zero velocity when the duration
+expires, `stop_move` is called, or the observed workmode leaves walking. It does
+not automatically promote another mode into walking because the SDK cannot
+verify that the robot is physically standing.
 
 The former `switch_mode` tool is split into three user-facing cards. Internal
 `enable`, `ready` and `walk` transitions are completed automatically and are no

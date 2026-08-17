@@ -318,9 +318,12 @@ class StatePlugin:
 
 class LocoPlugin:
     PREFIX = "loco"
-    _MOVE_MIN_DURATION_S = 0.1
-    _MOVE_DEFAULT_DURATION_S = 1.0
+    _MOVE_MIN_DURATION_S = 1.0
+    _MOVE_DEFAULT_DURATION_S = 2.0
     _MOVE_MAX_DURATION_S = 5.0
+    _MOVE_CONFIRM_TIMEOUT_S = 1.0
+    _MOVE_CONFIRM_MIN_JOINT_VELOCITY = 0.30
+    _MOVE_CONFIRM_BASELINE_MARGIN = 0.15
 
     def __init__(self, plugin_config: dict, namespace: str, executor, high_ctrl):
         self._high_ctrl = high_ctrl
@@ -334,6 +337,7 @@ class LocoPlugin:
         self._control_preroll_s = 0.3     # refresh an already active DDS writer path
         self._control_cold_preroll_s = 3.0
         self._control_channel_warmed = False
+        self._walking_stream_armed = False
         self._auto_exit_lock = threading.Lock()
         self._auto_exit_timers: dict[str, threading.Timer] = {}
         self._playback_monitor_stop: threading.Event | None = None
@@ -355,10 +359,13 @@ class LocoPlugin:
             "description": (
                 "Move Bumi with bounded HighController walking commands or stop an active "
                 "move. The card uses only the vendor HighController; it does not initialize "
-                "LowController. move is accepted only when workmode=2 (walking), and every "
-                "move automatically sends zero velocity after at most 5 seconds. Values are "
-                "normalized SDK commands, not metres per second. Before moving, confirm that "
-                "Bumi is standing steadily on a flat non-slip floor and that its path is clear."
+                "LowController. move is accepted only when workmode=2 (walking). Before the "
+                "first velocity stream, the card sends one WALK edge to activate this SDK "
+                "client, then follows the vendor example by continuously sending DEFAULT with "
+                "the requested velocity. Every move automatically sends zero velocity after at "
+                "most 5 seconds. Values are normalized SDK commands, not metres per second. "
+                "Before moving, confirm that Bumi is standing steadily on a flat non-slip floor "
+                "and that its path is clear."
             ),
             "inputSchema": {
                 "type": "object",
@@ -403,8 +410,9 @@ class LocoPlugin:
                         "type": "number",
                         "default": self._MOVE_DEFAULT_DURATION_S,
                         "description": (
-                            "Movement duration in seconds, from 0.1 to 5; default 1.0. The card "
-                            "automatically sends zero velocity when this time expires."
+                        "Movement duration in seconds, from 1 to 5; default 2.0. Shorter pulses "
+                        "can end before Bumi's walking policy starts a visible gait. The card "
+                        "automatically sends zero velocity when this time expires."
                         ),
                         "minimum": self._MOVE_MIN_DURATION_S,
                         "maximum": self._MOVE_MAX_DURATION_S,
@@ -415,9 +423,10 @@ class LocoPlugin:
                     "move": {
                         "params": ["vx", "vy", "vyaw", "duration"],
                         "description": (
-                            "Move with normalized HighController commands for a bounded time. "
+                            "Move with normalized HighController commands for 1-5 seconds. "
                             "At least one velocity must be non-zero and the robot must already "
-                            "be in walking mode."
+                            "be in walking mode. For the first low-risk test, use forward=0.3, "
+                            "lateral=0, turn=0 and duration=2 in a clear area."
                         ),
                     },
                     "stop_move": {
@@ -562,6 +571,17 @@ class LocoPlugin:
             self._high_ctrl.publish_cmd(x, y, z, action_cmd, index)
             self._last_cmd_time = time.monotonic()
 
+    def _sample_max_joint_velocity(self) -> float:
+        joints = self._high_ctrl.get_joint_state()
+        if len(joints) != len(_BUMI_JOINT_NAMES):
+            raise RuntimeError(
+                f"HighController returned {len(joints)} joints; "
+                f"expected {len(_BUMI_JOINT_NAMES)}")
+        velocities = [abs(float(joint.vel)) for joint in joints]
+        if not all(math.isfinite(value) for value in velocities):
+            raise RuntimeError("HighController returned a non-finite joint velocity")
+        return max(velocities)
+
     def _do_move(self, args: dict) -> dict:
         values = {}
         limits = {
@@ -642,11 +662,55 @@ class LocoPlugin:
                     "error": "The previous loco command did not stop within 1 second",
                 }
 
+        # The vendor HighController example sends WALK once to enter/activate
+        # the walking policy and then streams DEFAULT frames with x/y/z. A
+        # workmode value of 2 alone does not prove that this SDK publisher has
+        # activated the current walking command path (the app may have done it).
+        walking_policy_refreshed = False
+        if not self._walking_stream_armed:
+            observed = self._send_edge_and_wait(
+                _get_control_cmd("WALK"), {2, 26}, timeout_s=1.0)
+            if observed == 26:
+                self._walking_stream_armed = False
+                return self._protection_error(
+                    "move", [], observed,
+                    "Keep the robot standing on a flat non-slip floor with a clear path.",
+                    command_sent=True)
+            if observed != 2:
+                self._walking_stream_armed = False
+                return {
+                    "state": "error", "command_sent": True,
+                    "current_workmode": observed,
+                    "current_workmode_name": _WORKMODE_NAMES.get(observed, "unknown"),
+                    "error": (
+                        "The WALK activation edge was sent, but workmode=2 was not observed. "
+                        "No velocity stream was started."
+                    ),
+                }
+            self._walking_stream_armed = True
+            walking_policy_refreshed = True
+
+        try:
+            baseline_samples = []
+            for sample_index in range(3):
+                baseline_samples.append(self._sample_max_joint_velocity())
+                if sample_index < 2:
+                    time.sleep(0.05)
+            baseline_joint_velocity = max(baseline_samples)
+        except Exception as exc:
+            return {
+                "state": "error", "command_sent": walking_policy_refreshed,
+                "error": f"Cannot verify pre-move joint feedback: {exc}",
+                "message": "No non-zero walking velocity was sent.",
+            }
+
         self._move_stop_event.clear()
         default_cmd = _get_default_cmd()
 
         # Send the first frame synchronously so command_sent=True is truthful.
         self._publish_cmd(vx, vy, vyaw, default_cmd, 0)
+
+        move_observation = {"stop_reason": "duration_elapsed"}
 
         def _move_timed():
             end_time = time.monotonic() + duration
@@ -654,32 +718,128 @@ class LocoPlugin:
             try:
                 while (not self._move_stop_event.is_set()
                        and time.monotonic() < end_time):
-                    if int(self._high_ctrl.get_mode()) != 2:
+                    current_mode = int(self._high_ctrl.get_mode())
+                    if current_mode != 2:
+                        move_observation["stop_reason"] = "workmode_left_walking"
+                        move_observation["observed_workmode"] = current_mode
+                        self._walking_stream_armed = False
                         break
                     time.sleep(max(0.0, next_send - time.monotonic()))
                     if self._move_stop_event.is_set() or time.monotonic() >= end_time:
+                        if self._move_stop_event.is_set():
+                            move_observation["stop_reason"] = "stop_requested"
                         break
-                    if int(self._high_ctrl.get_mode()) != 2:
+                    current_mode = int(self._high_ctrl.get_mode())
+                    if current_mode != 2:
+                        move_observation["stop_reason"] = "workmode_left_walking"
+                        move_observation["observed_workmode"] = current_mode
+                        self._walking_stream_armed = False
                         break
                     self._publish_cmd(vx, vy, vyaw, default_cmd, 0)
                     next_send += self._control_period
+                if (self._move_stop_event.is_set()
+                        and move_observation["stop_reason"] == "duration_elapsed"):
+                    move_observation["stop_reason"] = "stop_requested"
             finally:
                 self._publish_cmd(0, 0, 0, default_cmd, 0)
+                print(
+                    f"[loco] velocity stream stopped: "
+                    f"{json.dumps(move_observation, ensure_ascii=False)}",
+                    flush=True,
+                )
 
         self._move_thread = threading.Thread(
             target=_move_timed, daemon=True, name="bumi_move")
         self._move_thread.start()
+
+        confirmation_threshold = max(
+            self._MOVE_CONFIRM_MIN_JOINT_VELOCITY,
+            baseline_joint_velocity + self._MOVE_CONFIRM_BASELINE_MARGIN,
+        )
+        confirmation_deadline = time.monotonic() + min(
+            self._MOVE_CONFIRM_TIMEOUT_S, duration)
+        observed_peak_joint_velocity = baseline_joint_velocity
+        confirmation_samples = 0
+        confirmation_error = None
+        while (self._move_thread.is_alive()
+               and time.monotonic() < confirmation_deadline):
+            try:
+                observed_peak_joint_velocity = max(
+                    observed_peak_joint_velocity,
+                    self._sample_max_joint_velocity(),
+                )
+                confirmation_samples += 1
+                if observed_peak_joint_velocity >= confirmation_threshold:
+                    break
+            except Exception as exc:
+                confirmation_error = str(exc)
+                break
+            time.sleep(0.05)
+
+        confirmed_started = (
+            confirmation_error is None
+            and observed_peak_joint_velocity >= confirmation_threshold
+        )
+        if not confirmed_started:
+            # Re-arm the WALK edge on the next request because this publisher's
+            # walking stream was not accepted or could not be verified.
+            self._walking_stream_armed = False
+            self._move_stop_event.set()
+            self._move_thread.join(timeout=1)
+            observed_mode = int(self._high_ctrl.get_mode())
+            if observed_mode != 2:
+                self._walking_stream_armed = False
+            return {
+                "state": "error",
+                "command_sent": True,
+                "confirmed_started": False,
+                "workmode": observed_mode,
+                "workmode_name": _WORKMODE_NAMES.get(observed_mode, "unknown"),
+                "normalized_command": {
+                    "forward": vx, "lateral": vy, "turn": vyaw},
+                "duration_s": duration,
+                "walking_policy_refreshed": walking_policy_refreshed,
+                "baseline_max_joint_velocity_rad_s": round(
+                    baseline_joint_velocity, 4),
+                "observed_peak_joint_velocity_rad_s": round(
+                    observed_peak_joint_velocity, 4),
+                "motion_confirmation_threshold_rad_s": round(
+                    confirmation_threshold, 4),
+                "confirmation_samples": confirmation_samples,
+                "confirmation_error": confirmation_error,
+                "error": (
+                    "The HighController command stream was sent, but joint feedback did not "
+                    "confirm that locomotion started. Zero velocity was sent."
+                ),
+                "possible_causes": [
+                    "The requested normalized velocity is inside the firmware deadband.",
+                    "Another Bumi app, driver container, SDK process, or remote controller is "
+                    "publishing zero velocity and overriding this driver.",
+                    "The firmware reports walking mode but is not accepting this SDK client's "
+                    "velocity stream.",
+                ],
+            }
+
         return {
             "state": "running",
             "command_sent": True,
+            "confirmed_started": True,
             "workmode": mode,
             "workmode_name": "walking",
             "normalized_command": {"forward": vx, "lateral": vy, "turn": vyaw},
             "duration_s": duration,
             "control_rate_hz": round(1.0 / self._control_period),
+            "walking_policy_refreshed": walking_policy_refreshed,
+            "baseline_max_joint_velocity_rad_s": round(
+                baseline_joint_velocity, 4),
+            "observed_peak_joint_velocity_rad_s": round(
+                observed_peak_joint_velocity, 4),
+            "motion_confirmation_threshold_rad_s": round(
+                confirmation_threshold, 4),
             "message": (
-                "The bounded walking command is running. Zero velocity will be sent when "
-                "duration_s expires, stop_move is called, or workmode leaves walking."
+                "Joint feedback confirms that locomotion started. The bounded walking command "
+                "is running; zero velocity will be sent when duration_s expires, stop_move is "
+                "called, or workmode leaves walking."
             ),
         }
 
