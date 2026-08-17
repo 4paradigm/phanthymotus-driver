@@ -157,7 +157,9 @@ class LynxM20ContractTests(unittest.TestCase):
                 "imu": {"robot_topic": "/IMU", "topic": "/host/lynx_m20/imu", "format": "data/json"},
                 "lidar": {"robot_topic": "/LIDAR/POINTS", "topic": "/host/lynx_m20/lidar", "format": "pointcloud/ros2"},
             }
-            rtsp_streams = {}
+            rtsp_streams = {
+                "camera_front": {"url": "rtsp://10.21.31.103:8554/video1", "format": "video/h265"},
+            }
 
         plugin = m20.M20StatePlugin(FakeStateNodes())
         static_topics = {
@@ -166,7 +168,7 @@ class LynxM20ContractTests(unittest.TestCase):
             if "topic_out" in definition
         }
 
-        for name in FakeStateNodes.streams:
+        for name in (*FakeStateNodes.streams, *FakeStateNodes.rtsp_streams):
             info = plugin.dispatch("info", {"_tool_name": name})
             self.assertEqual("ready", info["state"])
             self.assertEqual(static_topics[name], info["topic_out"])
