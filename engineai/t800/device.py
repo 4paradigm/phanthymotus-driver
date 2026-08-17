@@ -3536,6 +3536,7 @@ class SpeakerPlugin:
                 "x-action-params": {
                     "start": {"params": ["input_topic"], "description": "订阅画布音频 topic 并开始流式播放"},
                     "stop": {"params": [], "description": "停止播放并释放订阅"},
+                    "info": {"params": [], "description": "查询播放状态、缓冲与计数"},
                     "get_volume": {"params": [], "description": "查询机器人喇叭系统音量（官方 pactl 接口）"},
                     "set_volume": {"params": ["volume"], "description": "设置机器人喇叭系统音量 0-100（官方 pactl 接口）"},
                 },
@@ -3867,24 +3868,30 @@ class VisionPlugin:
         buf = bytearray(8 + len(data))
         buf[:8] = header
         buf[8:] = data
-        z_offset = next(
-            (int(field.offset) for field in getattr(msg, "fields", []) if field.name == "z"),
+        z_field = next(
+            (field for field in getattr(msg, "fields", []) if field.name == "z"),
             None,
         )
-        if z_offset is not None and z_offset + 4 <= point_step:
-            self._negate_z_inplace(buf, 8, point_step, z_offset)
+        if z_field is not None and int(getattr(z_field, "datatype", 7)) == 7 \
+                and int(z_field.offset) + 4 <= point_step:
+            # 仅当 z 是 FLOAT32 时取反;其他 datatype 或大端布局跳过,避免损坏
+            self._negate_z_inplace(buf, 8, point_step, int(z_field.offset),
+                                   is_bigendian=bool(getattr(msg, "is_bigendian", False)))
         out = self._multi_type()
         out.data = self._array.array("B", buf)
         self._cloud_pub.publish(out)
         self._frames["pointcloud"] += 1
 
     @staticmethod
-    def _negate_z_inplace(buf: bytearray, start: int, point_step: int, z_offset: int) -> None:
+    def _negate_z_inplace(buf: bytearray, start: int, point_step: int, z_offset: int,
+                          is_bigendian: bool = False) -> None:
         import numpy as np
 
         total = (len(buf) - start) // point_step
         if total <= 0:
             return
+        if is_bigendian:
+            return  # 大端布局与 <f4 取反不兼容,跳过(透传原数据)避免损坏
         raw = np.frombuffer(buf, dtype=np.uint8, count=total * point_step, offset=start)
         raw = raw.reshape(total, point_step)
         # 注意：不能用 ravel()——不连续视图上 ravel 会拷贝，原地乘法写不回去
