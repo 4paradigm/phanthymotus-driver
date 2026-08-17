@@ -185,7 +185,7 @@ def load_device():
 CONFIG = {
     "ros": {"robot_domain_id": 69, "core_domain_id": 42, "source_timeout_sec": 1.0},
     "control": {"velocity_rate_hz": 100.0, "low_level_rate_hz": 200.0, "override_rate_hz": 100.0,
-                "max_vx": 3.0, "max_vy": 1.0, "max_vyaw": 3.14, "mode_transition_timeout_sec": 0.1},
+                "max_vx": 1.0, "max_vy": 1.0, "max_vyaw": 1.0, "mode_transition_timeout_sec": 0.1},
     "topics": {
         "joint_state": "/hardware/joint_state", "imu": "/hardware/imu_info",
         "gamepad": "/hardware/gamepad_keys", "motor_debug": "/hardware/motor_debug",
@@ -361,7 +361,7 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("gamepad_analog", snapshot["source"])
         self.assertEqual("moving", snapshot["motion_state"])
         self.assertEqual("forward_left", snapshot["direction"])
-        self.assertEqual("0.98 m/s", snapshot["speed"])
+        self.assertEqual("0.50 m/s", snapshot["speed"])
 
     def test_motion_events_ignore_implausible_odin_odometry(self):
         plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
@@ -388,7 +388,7 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("move", moving["action"])
         self.assertEqual("forward", moving["direction"])
         self.assertEqual([], moving["buttons"])
-        self.assertEqual("1.50 m/s", moving["speed"])
+        self.assertEqual("0.50 m/s", moving["speed"])
         self.assertEqual("motion_start", moving["event"])
 
         plugin._on_gamepad(types.SimpleNamespace(
@@ -497,11 +497,20 @@ class DevicePluginContractTests(unittest.TestCase):
         plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
         plugin.start()
         result = plugin.dispatch("move", {"vx": 9, "vy": -9, "vyaw": 9, "duration": 0.03, "force": True})
-        self.assertEqual(3.0, result["vx"])
+        self.assertEqual(1.0, result["vx"])
         self.assertEqual(-1.0, result["vy"])
         time.sleep(0.08)
         self.assertGreaterEqual(len(plugin._publisher.messages), 2)
         self.assertEqual(0.0, plugin._publisher.messages[-1].yaw_velocity)
+
+    def test_locomotion_limits_default_to_official_unit(self):
+        config = {**CONFIG, "control": {
+            k: v for k, v in CONFIG["control"].items() if k not in ("max_vx", "max_vyaw")}}
+        plugin = self.device.LocomotionPlugin(config, "robot", self.ros, self.state)
+        plugin.start()
+        result = plugin.dispatch("move", {"vx": 5.0, "vyaw": -5.0, "duration": 0.01, "force": True})
+        self.assertEqual(1.0, result["vx"])
+        self.assertEqual(-1.0, result["vyaw"])
 
     def test_locomotion_open_loop_composites(self):
         plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)

@@ -1818,11 +1818,13 @@ class LocomotionPlugin:
         self._node = Node("t800_locomotion", context=ros2.ctx_robot)
         ros2.executor_robot.add_node(self._node)
         self._publisher = None
-        limits = config["control"]
+        limits = config.get("control", {})
+        # 官方 body_vel_cmd 限幅：|vx|, |vy|, |vyaw| ≤ 1.0。缺失配置键时按官方
+        # 上限回退（宁可更保守，也不放宽到未校验值）。
         self._limits = (
-            float(limits["max_vx"]),
-            float(limits["max_vy"]),
-            float(limits["max_vyaw"]),
+            float(limits.get("max_vx", 1.0)),
+            float(limits.get("max_vy", 1.0)),
+            float(limits.get("max_vyaw", 1.0)),
         )
         self._stream = RepeatingCommand(
             self._publish_payload,
@@ -1835,7 +1837,7 @@ class LocomotionPlugin:
             "name": "loco",
             "type": "actuator",
             "multiInstance": False,
-            "description": "T800 全向速度控制，支持定时和持续运动",
+            "description": "T800 全向速度控制（官方限幅 ±1 m/s、±1 rad/s），支持定时和持续运动",
             "inputSchema": action_schema(
                 {
                     "move": (["vx", "vy", "vyaw", "duration", "force"], "按速度移动；duration=-1 持续到 stop_move"),
@@ -1846,9 +1848,9 @@ class LocomotionPlugin:
                     "status": ([], "查询速度控制刷新状态"),
                 },
                 {
-                    "vx": {"type": "number", "description": "前向速度 m/s"},
-                    "vy": {"type": "number", "description": "侧向速度 m/s"},
-                    "vyaw": {"type": "number", "description": "偏航角速度 rad/s"},
+                    "vx": {"type": "number", "description": "前向速度 m/s（官方限幅 ±1）"},
+                    "vy": {"type": "number", "description": "侧向速度 m/s（官方限幅 ±1）"},
+                    "vyaw": {"type": "number", "description": "偏航角速度 rad/s（官方限幅 ±1）"},
                     "duration": {"type": "number", "description": "秒；-1=持续，0=停止"},
                     "force": {"type": "boolean", "description": "忽略必须处于 rl_basic/lower_body_balance 行走模式的状态门禁（默认拒绝）"},
                     "x_m": {"type": "number", "description": "机身坐标系前向位移，米"},
