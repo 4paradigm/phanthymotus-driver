@@ -16,7 +16,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 
-from control import action_schema
+from control import LED_MODES, action_schema
 
 
 _BEST_EFFORT = QoSProfile(
@@ -54,6 +54,11 @@ def _flatten(values: object) -> list[float]:
     return flattened
 
 
+def _led_mode(value: object, default: str = "") -> str:
+    mode = str(value or "").strip()
+    return mode if mode in LED_MODES else default
+
+
 class VoiceGesturePlugin:
     """Execute configured official T800 motion plans after wake-word ASR."""
 
@@ -71,15 +76,26 @@ class VoiceGesturePlugin:
         self._ready_timeout = max(1.0, float(plugin_config.get("planner_ready_timeout_sec", 10.0)))
         self._step_timeout = max(1.0, float(plugin_config.get("planner_step_timeout_sec", 15.0)))
         self._motions = self._load_motion_catalog(plugin_config.get("motions", {}) or {})
+        led_config = plugin_config.get("led_feedback", {}) or {}
+        self._led_enabled = bool(led_config.get("enabled", True))
+        self._led_wake_mode = _led_mode(led_config.get("wake_mode"), "blink_green")
+        self._led_error_mode = _led_mode(led_config.get("error_mode"), "blink_red")
+        self._led_restore_mode = _led_mode(led_config.get("restore_mode"), "constant_white")
+        self._led_duration = max(0.0, float(led_config.get("duration_sec", 1.0)))
+        self._led_cooldown = max(0.0, float(led_config.get("cooldown_sec", 0.5)))
 
         self._core_node = Node("t800_voice_gesture", context=ros2.ctx_core)
         self._plan_node = Node("t800_voice_gesture_plan", context=ros2.ctx_robot)
+        self._led_node = Node("t800_voice_gesture_led", context=ros2.ctx_robot)
         ros2.executor_core.add_node(self._core_node)
         ros2.executor_robot.add_node(self._plan_node)
+        ros2.executor_robot.add_node(self._led_node)
         self._events_pub = None
         self._request_pub = None
+        self._led_pub = None
         self._request_type = None
         self._state_type = None
+        self._led_message_type = None
         self._started = False
         self._enabled = False
         self._planner_state = None
@@ -90,11 +106,15 @@ class VoiceGesturePlugin:
         self._cancel = threading.Event()
         self._lock = threading.RLock()
         self._planner_changed = threading.Condition(self._lock)
+        self._led_timer: threading.Timer | None = None
+        self._last_led_at = 0.0
         self._status = {
             "state": "idle",
             "last_text": "",
             "last_motion": "",
             "last_error": "",
+            "last_led_mode": "",
+            "last_led_error": "",
             "events_published": 0,
         }
 
@@ -150,6 +170,13 @@ class VoiceGesturePlugin:
         self._plan_node.create_subscription(
             JointMotionPlanState, self._topics["joint_plan_state"], self._on_planner_state, _BEST_EFFORT
         )
+        if self._led_enabled:
+            from interface_protocol.msg import LedControl
+
+            self._led_message_type = LedControl
+            self._led_pub = self._led_node.create_publisher(
+                LedControl, self._topics["led"], _RELIABLE_ONE
+            )
         self._started = True
         self._enabled = True
         self._set_status(state="running", last_error="")
@@ -159,6 +186,7 @@ class VoiceGesturePlugin:
         self._enabled = False
         self._cancel.set()
         self._cancel_active_request()
+        self._cancel_led_restore()
         self._set_status(state="idle")
 
     def dispatch(self, action: str, _args: dict) -> dict:
@@ -176,6 +204,7 @@ class VoiceGesturePlugin:
         try:
             payload = json.loads(message.data)
         except (TypeError, json.JSONDecodeError):
+            self._flash_led(self._led_error_mode, "asr_invalid_json")
             self._reject("invalid_asr_json")
             return
         if not isinstance(payload, dict) or payload.get("is_final") is False or payload.get("final") is False:
@@ -190,6 +219,9 @@ class VoiceGesturePlugin:
         if not self._enabled:
             self._reject("voice_gesture_stopped", text=text)
             return
+        if bool(payload.get("kws_triggered", False)):
+            self._flash_led(self._led_wake_mode, "wake_word_confirmed")
+            self._publish_event("wake_word_confirmed", text=text)
         motion_id = self._match_motion(text)
         if motion_id is None:
             self._reject("no_motion_match", text=text)
@@ -363,6 +395,57 @@ class VoiceGesturePlugin:
         message.damping = []
         self._request_pub.publish(message)
 
+    def _flash_led(self, mode: str, reason: str) -> None:
+        if not mode or self._led_pub is None or self._led_message_type is None:
+            return
+        now = time.monotonic()
+        with self._lock:
+            if now - self._last_led_at < self._led_cooldown:
+                return
+            self._last_led_at = now
+            if self._led_timer is not None:
+                self._led_timer.cancel()
+                self._led_timer = None
+        try:
+            message = self._led_message_type()
+            message.color = LED_MODES[mode]
+            self._led_pub.publish(message)
+        except Exception as exc:  # noqa: BLE001
+            self._set_status(last_led_error=str(exc))
+            self._publish_event("led_error", reason=reason, error=str(exc))
+            return
+        self._set_status(last_led_mode=mode, last_led_error="")
+        self._publish_event("led_feedback", mode=mode, reason=reason)
+        if self._led_restore_mode and self._led_duration > 0:
+            timer = threading.Timer(self._led_duration, self._restore_led)
+            timer.daemon = True
+            with self._lock:
+                self._led_timer = timer
+            timer.start()
+
+    def _restore_led(self) -> None:
+        mode = self._led_restore_mode
+        if not mode or self._led_pub is None or self._led_message_type is None:
+            return
+        try:
+            message = self._led_message_type()
+            message.color = LED_MODES[mode]
+            self._led_pub.publish(message)
+        except Exception as exc:  # noqa: BLE001
+            self._set_status(last_led_error=str(exc))
+            self._publish_event("led_error", reason="restore", error=str(exc))
+            return
+        with self._lock:
+            self._led_timer = None
+        self._set_status(last_led_mode=mode, last_led_error="")
+        self._publish_event("led_feedback", mode=mode, reason="restore")
+
+    def _cancel_led_restore(self) -> None:
+        with self._lock:
+            if self._led_timer is not None:
+                self._led_timer.cancel()
+                self._led_timer = None
+
     def _motion_catalog(self) -> list[dict]:
         return [
             {
@@ -383,6 +466,15 @@ class VoiceGesturePlugin:
             "motions": self._motion_catalog(),
             "motion_source": "embedded_config",
             "require_wake_word": self._require_wake_word,
+            "led_feedback": {
+                "enabled": self._led_enabled,
+                "wake_mode": self._led_wake_mode,
+                "error_mode": self._led_error_mode,
+                "restore_mode": self._led_restore_mode,
+                "duration_sec": self._led_duration,
+                "last_mode": status["last_led_mode"],
+                "last_error": status["last_led_error"],
+            },
             "planner_state": planner_state,
             "planner_request_id": planner_request_id,
             "topic_in": [{"topic": self._asr_topic, "format": "data/json"}],

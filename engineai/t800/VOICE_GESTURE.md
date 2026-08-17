@@ -24,6 +24,11 @@ Perception 当前输出形如：
 只有包含文本、不是显式非最终结果、并且（默认）`kws_triggered: true` 的事件才会
 被处理。`cooldown_sec` 防止一句话或重复回声触发多次动作。
 
+`led_feedback.enabled` 默认为启用：当最终 ASR 结果带有 `kws_triggered: true` 时，
+Driver 直接向官方 `LedControl` Topic 发布 `blink_green`；默认一秒后改为
+`constant_white`。这不依赖 Dashboard，也不调用 `GesturePlugin`。该信号是在整句识别
+完成后确认唤醒成功，不是说出唤醒词瞬间的指示。
+
 ## 规则动作
 
 从 `voice_gesture.example.yaml` 把 `voice_gesture:` 段复制到独立的

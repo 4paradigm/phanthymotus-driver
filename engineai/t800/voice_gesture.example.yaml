@@ -9,6 +9,14 @@ voice_gesture:
   cooldown_sec: 3.0
   planner_ready_timeout_sec: 10.0
   planner_step_timeout_sec: 15.0
+  # 最终 ASR 结果确认 kws_triggered: true 时闪绿灯；不依赖 Dashboard 连线。
+  led_feedback:
+    enabled: true
+    wake_mode: blink_green
+    error_mode: blink_red
+    duration_sec: 1.0
+    restore_mode: constant_white
+    cooldown_sec: 0.5
 
   # ASR 文本只能选择下方固定的嵌入式关节规划，不能指定任意关节或参数。
   motions:
