@@ -32,7 +32,7 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 | `capabilities` | sensor | Driver 能力发现、原生状态和已知限制 |
 | `ros_graph` | sensor | 实时发现固件节点、topic、service 和尚未映射的新接口 |
 | `model` | resource | 官方 `serial_t800.urdf` |
-| `loco` | actuator | 100 Hz 速度控制；定时/持续、相对位移、转角和圆弧开环动作 |
+| `loco` | actuator | 100 Hz 速度控制（官方限幅 ±1、渐变 ramp、fail-closed 看门狗）；定时/持续、相对位移、转角和圆弧开环动作；action=start 绑定 Nav2 velocity_proposal 导航端口 |
 | `motion_mode` | actuator | 任意状态切换及 idle/passive/站立/行走/舞蹈/起身/躺下快捷动作 |
 | `dance` | actuator | 舞蹈列表、播放、停止和状态；官方基线为 `dance.mnn` + `dance.npz` |
 | `joint_plan` | actuator | 索引/名称关节轨迹、头部/单臂姿态、当前位置保持、取消、复位和预置动作 |
@@ -55,7 +55,8 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 
 所有动作差异通过 `x-action-params` 声明。`force=true` 可绕过 locomotion、
 joint override 和 joint bridge 的 motion-state 门禁；完整高风险能力没有从
-MCP schema 中隐藏。
+MCP schema 中隐藏。`force=true` 可绕过 locomotion 的 rl_basic/lower_body_balance
+行走门禁（默认拒绝），仅用于真机调试。
 
 `loco.move_displacement`、`turn_angle` 和 `arc` 由速度乘时间换算。T800
 基础运动协议没有供控制闭环使用的定位反馈，因此它们仍是开环动作并返回
@@ -69,8 +70,9 @@ MCP schema 中隐藏。
 
 `virtual_gamepad` 使用 Native SDK 官方通道
 `virtual_gamepad/gamepad_keys`，默认连接 `udpm://239.255.76.67:7667?ttl=1`。
-除了原始按键/摇杆外，提供 idle、passive、stand、walk、dance、get_up、
-lie_down 组合键。LCM 输入会覆盖实体手柄输入，发送完成后 Driver 自动发布
+除了原始按键/摇杆外，提供 idle、passive、stand、walk(→rl_basic)、dance、
+get_up(→rl_mimic_supine_to_stance)、lie_down(→rl_mimic_stance_to_supine)
+组合键。LCM 输入会覆盖实体手柄输入，发送完成后 Driver 自动发布
 全零包释放控制权。
 
 `pointcloud`、`camera`、`depth` 桥接 T800-Odin2 激光雷达相机（飞书文档
@@ -149,3 +151,10 @@ docker run --rm --network host --privileged \
 
 低层控制要求机器人处于对应 Native SDK 状态。测试 joint bridge、覆盖控制、
 起身或躺下时，应先悬挂机器人并由现场人员持有急停遥控器。
+
+## velocity_proposal 导航端口
+
+画布经 `loco action=start`（携带 `input_topic` 与 `expected_nav_id`）绑定 Nav2
+速度提案端口（`/ubuntu/navigation/nav2/velocity_proposal`，schema
+`phanthy.navigation.velocity_proposal.v1`）。提案经租约/序列/TTL 校验后直接驱动
+100Hz BodyVelCmd 流；手动 move/stop_move 或任何校验失败都会解武装并立即归零。

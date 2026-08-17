@@ -12,9 +12,13 @@ control:
   velocity_rate_hz: 100.0
   low_level_rate_hz: 500.0
   override_rate_hz: 100.0
-  max_vx: 3.0
+  max_vx: 1.0
   max_vy: 1.0
-  max_vyaw: 3.141592653589793
+  max_vyaw: 1.0
+  accel_vx: 1.0
+  accel_vy: 1.0
+  accel_vyaw: 1.0
+  stream_watchdog_period_sec: 0.5
   mode_transition_timeout_sec: 5.0
   motor_warning_temperature_c: 70.0
   tilt_warning_rad: 0.45
@@ -32,6 +36,7 @@ topics:
   power: "/hardware/power_info"
   motion_state: "/motion/motion_state"
   body_velocity: "/motion/body_vel_cmd"
+  velocity_proposal: "/ubuntu/navigation/nav2/velocity_proposal"
   motion_request: "/motion/set_motion_state"
   led: "/hardware/led_control"
   joint_plan_request: "/motion/joint_motion_plan/request"
@@ -70,6 +75,14 @@ plugins:
     enabled: true
   locomotion:
     enabled: true
+    # Nav2 导航端口（画布经 loco action=start 绑定）。限值只能收紧、不能放宽。
+    velocity_proposal_enabled: true
+    velocity_proposal_max_ttl_ms: 250
+    velocity_proposal_min_x: -0.05
+    velocity_proposal_max_x: 0.15
+    velocity_proposal_max_abs_y: 0.12
+    velocity_proposal_max_abs_yaw: 0.35
+    velocity_proposal_max_planar_speed: 0.18
   motion_mode:
     enabled: true
   dance:
