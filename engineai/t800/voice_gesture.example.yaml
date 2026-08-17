@@ -7,28 +7,19 @@ voice_gesture:
   asr_topic: ""
   require_wake_word: true
   cooldown_sec: 3.0
+  # 将众擎官方 ROS2 workspace 的 config/t800 目录只读挂载到此路径。
+  # 未挂载时，镜像内置的 motion_plan_shake_hand.yaml 会作为握手动作的回退配置。
+  motion_dir: /official-motions
+  planner_ready_timeout_sec: 10.0
+  planner_step_timeout_sec: 15.0
 
-  # ASR 文本只能匹配以下固定短语，不能直接指定任意 Driver 工具或参数。
-  actions:
+  # ASR 文本只能选择官方 T800 姿势 YAML，不能直接指定任意关节或参数。
+  motions:
     wave:
       description: "举手挥手打招呼"
       phrases: ["你好", "您好", "打招呼"]
-      target:
-        tool: gesture
-        action: play
-        arguments:
-          name: wave_hands
-          repetitions: 1
-          reset_after: true
-          wait: false
+      file: motion_plan_wave_hands.yaml
     shake_hand:
       description: "伸手握手"
       phrases: ["握手", "握个手"]
-      target:
-        tool: gesture
-        action: play
-        arguments:
-          name: shake_hand
-          repetitions: 1
-          reset_after: true
-          wait: false
+      file: motion_plan_shake_hand.yaml

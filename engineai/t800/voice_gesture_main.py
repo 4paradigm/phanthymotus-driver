@@ -20,14 +20,7 @@ class VoiceGestureBundle(driver_main.T800DeviceBundle):
         plugin_config = config.get("plugins", {}).get("voice_gesture", {}) or {}
         if not plugin_config.get("enabled", False):
             return
-        targets = {}
-        for plugin in self._plugins:
-            definitions = plugin.get_tools() if hasattr(plugin, "get_tools") else [plugin.get_tool()]
-            for definition in definitions:
-                name = definition.get("name")
-                if name in ("gesture", "motion_mode"):
-                    targets[name] = plugin
-        self._plugins.append(VoiceGesturePlugin(config, namespace, ros2, targets))
+        self._plugins.append(VoiceGesturePlugin(config, namespace, ros2))
 
 
 def main() -> None:
