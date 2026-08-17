@@ -106,6 +106,24 @@ def clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, value))
 
 
+def ramped_step(
+    current: dict, target: dict, ramp: tuple[float, float, float] | None, dt: float
+) -> dict:
+    """Move current toward target by at most ramp[i]*dt per axis; None = instant."""
+    if ramp is None:
+        return dict(target)
+    if dt <= 0:
+        return dict(current)
+    stepped = {}
+    for index, axis in enumerate(("vx", "vy", "vyaw")):
+        stepped[axis] = current.get(axis, 0.0) + clamp(
+            target.get(axis, 0.0) - current.get(axis, 0.0),
+            -ramp[index] * dt,
+            ramp[index] * dt,
+        )
+    return stepped
+
+
 def float_list(
     value: object,
     name: str,
@@ -224,8 +242,10 @@ class RepeatingCommand:
         self._deadline: float | None = None
         self._last_publish_at: float | None = None
         self._publish_count = 0
+        self._ramp = None
+        self._current: dict = {}
 
-    def start(self, command: dict, duration: float) -> StreamSnapshot:
+    def start(self, command: dict, duration: float, ramp=None) -> StreamSnapshot:
         duration = float(duration)
         if not math.isfinite(duration) or duration < -1:
             raise ValueError("duration must be -1 or a non-negative finite number")
@@ -242,10 +262,13 @@ class RepeatingCommand:
             self._deadline = deadline
             self._last_publish_at = started_at
             self._publish_count = 1
+            self._ramp = ramp
+            self._current = {key: 0.0 for key in command}
         try:
             # Publish once before handing off to the worker. This guarantees a
             # short command is not lost if the scheduler starts the thread late.
-            self._publisher(command)
+            # dt=0 keeps the first publish at zero when ramping (safe start).
+            self._publisher(self._step(command, 0.0))
         except Exception:
             with self._lock:
                 if self._stop_event is stop_event:
@@ -256,11 +279,13 @@ class RepeatingCommand:
 
         def run() -> None:
             try:
+                last_step_at = started_at
                 while not stop_event.wait(self._period):
                     now = self._clock()
                     if deadline is not None and now >= deadline:
                         break
-                    self._publisher(command)
+                    self._publisher(self._step(command, now - last_step_at))
+                    last_step_at = now
                     with self._lock:
                         self._last_publish_at = now
                         self._publish_count += 1
@@ -277,6 +302,12 @@ class RepeatingCommand:
 
         threading.Thread(target=run, daemon=True, name="t800-command-stream").start()
         return self.snapshot()
+
+    def _step(self, command: dict, dt: float) -> dict:
+        with self._lock:
+            stepped = ramped_step(self._current, command, self._ramp, dt)
+            self._current = stepped
+        return stepped
 
     def stop(self) -> bool:
         with self._lock:

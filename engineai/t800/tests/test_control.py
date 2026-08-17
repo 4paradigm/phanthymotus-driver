@@ -19,6 +19,7 @@ from control import (  # noqa: E402
     clamp,
     float_list,
     joint_payload,
+    ramped_step,
     sensor_tool,
     validate_joint_indices,
 )
@@ -135,6 +136,31 @@ class RepeatingCommandTests(unittest.TestCase):
         stream = RepeatingCommand(lambda _: None, lambda: None, rate_hz=10)
         with self.assertRaisesRegex(ValueError, "duration"):
             stream.start({}, -2)
+
+
+class RampTests(unittest.TestCase):
+    def test_ramped_step_steps_toward_target(self):
+        stepped = ramped_step(
+            {"vx": 0.0, "vy": 0.0, "vyaw": 0.0},
+            {"vx": 1.0, "vy": 0.0, "vyaw": -0.5},
+            (1.0, 1.0, 1.0), 0.01)
+        self.assertAlmostEqual(0.01, stepped["vx"])
+        self.assertAlmostEqual(-0.01, stepped["vyaw"])
+
+    def test_ramped_step_never_overshoots(self):
+        stepped = ramped_step(
+            {"vx": 0.99, "vy": 0.0, "vyaw": 0.0},
+            {"vx": 1.0, "vy": 0.0, "vyaw": 0.0},
+            (1.0, 1.0, 1.0), 0.05)
+        self.assertAlmostEqual(1.0, stepped["vx"])
+
+    def test_ramped_step_none_is_instant(self):
+        target = {"vx": 0.2, "vy": -0.1, "vyaw": 0.3}
+        self.assertEqual(target, ramped_step({"vx": 0.0, "vy": 0.0, "vyaw": 0.0}, target, None, 0.5))
+
+    def test_ramped_step_nonpositive_dt_keeps_current(self):
+        current = {"vx": 0.5, "vy": 0.0, "vyaw": 0.0}
+        self.assertEqual(current, ramped_step(current, {"vx": 1.0, "vy": 0.0, "vyaw": 0.0}, (1.0, 1.0, 1.0), 0.0))
 
 
 class NativeSdkManagerTests(unittest.TestCase):

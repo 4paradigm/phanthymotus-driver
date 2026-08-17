@@ -1826,6 +1826,13 @@ class LocomotionPlugin:
             float(limits.get("max_vy", 1.0)),
             float(limits.get("max_vyaw", 1.0)),
         )
+        # 官方建议速度渐变；accel_* 为每轴最大加速度（m/s²、rad/s²），
+        # 每次 100Hz tick 步进 accel/rate。提案执行（Task 10）不走 ramp。
+        self._ramp = (
+            float(limits.get("accel_vx", 1.0)),
+            float(limits.get("accel_vy", 1.0)),
+            float(limits.get("accel_vyaw", 1.0)),
+        )
         self._stream = RepeatingCommand(
             self._publish_payload,
             self._publish_zero,
@@ -1935,7 +1942,7 @@ class LocomotionPlugin:
             vyaw = math.copysign(angular_speed, angle)
             duration = abs(angle) / angular_speed
             vy = 0.0
-        snapshot = self._stream.start({"vx": vx, "vy": vy, "vyaw": vyaw}, duration)
+        snapshot = self._stream.start({"vx": vx, "vy": vy, "vyaw": vyaw}, duration, ramp=self._ramp)
         return {"state": "running" if duration else "stopped", "vx": vx, "vy": vy, "vyaw": vyaw,
                 "duration": duration, "open_loop": open_loop, "stream": asdict(snapshot)}
 
