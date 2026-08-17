@@ -100,6 +100,7 @@ class VoiceGesturePlugin:
         self._enabled = False
         self._planner_state = None
         self._planner_request_id = None
+        self._request_sequence = 0
         self._active_request_id = None
         self._last_action_at = 0.0
         self._thread: threading.Thread | None = None
@@ -232,6 +233,7 @@ class VoiceGesturePlugin:
         with self._planner_changed:
             self._planner_state = int(message.status)
             self._planner_request_id = int(message.request_id)
+            self._request_sequence = max(self._request_sequence, self._planner_request_id)
             self._planner_changed.notify_all()
 
     def _match_motion(self, text: str) -> str | None:
@@ -263,7 +265,8 @@ class VoiceGesturePlugin:
     def _run_motion(self, motion_id: str, text: str) -> None:
         try:
             steps = self._load_official_motion(motion_id)
-            self._wait_for_idle(self._ready_timeout)
+            if self._planner_request_id is not None:
+                self._wait_for_idle(self._ready_timeout)
             for step in steps:
                 if self._cancel.is_set():
                     raise RuntimeError("motion cancelled")
@@ -348,9 +351,9 @@ class VoiceGesturePlugin:
 
     def _publish_step(self, step: dict) -> int:
         with self._planner_changed:
-            if self._planner_request_id is None:
-                raise RuntimeError("planner request_id is unavailable")
-            request_id = self._planner_request_id + 1
+            latest_request_id = self._planner_request_id or 0
+            request_id = max(self._request_sequence, latest_request_id) + 1
+            self._request_sequence = request_id
         message = self._request_type()
         message.request_id = request_id
         if step.get("reset"):
@@ -381,9 +384,10 @@ class VoiceGesturePlugin:
         if self._request_pub is None or self._request_type is None:
             return
         with self._lock:
-            if self._active_request_id is None or self._planner_request_id is None:
+            if self._active_request_id is None:
                 return
-            request_id = self._planner_request_id + 1
+            request_id = max(self._request_sequence, self._planner_request_id or 0) + 1
+            self._request_sequence = request_id
         message = self._request_type()
         message.request_id = request_id
         message.request_type = self._request_type.REQUEST_CANCEL
