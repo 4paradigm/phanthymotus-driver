@@ -1,6 +1,0 @@
-ARG BASE_IMAGE=engineai-t800-driver:latest
-FROM ${BASE_IMAGE}
-
-COPY voice_gesture.py voice_gesture_main.py config.voice-gesture.yaml /work/
-
-CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && source /t800_ws/install/setup.bash && if [ -n \"${RMW_IMPLEMENTATION:-}\" ] && ! ros2 pkg prefix \"${RMW_IMPLEMENTATION}\" >/dev/null 2>&1; then echo \"[t800] ignoring unavailable RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION}\"; unset RMW_IMPLEMENTATION; fi && if [ -n \"${T800_PREFERRED_RMW:-}\" ] && ros2 pkg prefix \"${T800_PREFERRED_RMW}\" >/dev/null 2>&1; then export RMW_IMPLEMENTATION=\"${T800_PREFERRED_RMW}\"; fi && if [ -z \"${CYCLONEDDS_URI:-}\" ]; then export CYCLONEDDS_URI=\"<CycloneDDS><Domain><General><Interfaces><NetworkInterface name='${NETWORK_INTERFACE:-eth1}'/></Interfaces></General></Domain></CycloneDDS>\"; fi && exec python3 /work/voice_gesture_main.py"]

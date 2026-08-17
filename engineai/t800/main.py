@@ -194,11 +194,24 @@ class T800DeviceBundle:
             except Exception as e:
                 print(f"[bundle] ControlledSpatialMapPlugin load skipped: {e}", flush=True)
 
+        voice_gesture_config = plugins.get("voice_gesture", {}) or {}
+        if voice_gesture_config.get("enabled", False):
+            from voice_gesture import VoiceGesturePlugin
+
+            instance = VoiceGesturePlugin(
+                config, namespace, ros2, tts_plugin=instances.get("tts")
+            )
+            instances["voice_gesture"] = instance
+            self._plugins.append(instance)
+
         if "safety" in instances:
             instances["safety"].set_controls(
                 [
                     instances[key]
-                    for key in ("locomotion", "joint_override", "joint_bridge", "virtual_gamepad", "gesture")
+                    for key in (
+                        "locomotion", "joint_override", "joint_bridge", "virtual_gamepad",
+                        "gesture", "voice_gesture",
+                    )
                     if key in instances
                 ]
             )

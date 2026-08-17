@@ -69,7 +69,7 @@ RUN echo "[t800] checking ROS interface build dependencies" && \
     . /t800_ws/install/setup.sh && \
     python3 -c "from interface_protocol.msg import BodyVelCmd, Heartbeat, LinkInfo, MotionStateRequest; from nav_msgs.msg import Odometry; from sensor_msgs.msg import CompressedImage, Image, PointCloud2; print('T800 ROS imports ok')"
 
-COPY main.py device.py control.py native_sdk.py virtual_gamepad.py config.yaml driver.yaml controlled_spatial_map.py /work/
+COPY main.py device.py control.py native_sdk.py virtual_gamepad.py voice_gesture.py config.yaml driver.yaml controlled_spatial_map.py /work/
 COPY resource/ /work/resource/
 COPY deploy/ /deploy/
 RUN . /opt/ros/humble/setup.sh && \
@@ -78,7 +78,7 @@ RUN . /opt/ros/humble/setup.sh && \
     command -v pactl >/dev/null && \
     command -v parec >/dev/null && \
     ros2 pkg prefix rmw_cyclonedds_cpp >/dev/null && \
-    python3 -c "import main; from audio_msgs.msg import AudioChunk; import lcm, numpy, yaml; print('T800 runtime imports ok')"
+    python3 -c "import main, voice_gesture; from audio_msgs.msg import AudioChunk; import lcm, numpy, yaml; print('T800 runtime imports ok')"
 
 ENV T800_PREFERRED_RMW=rmw_cyclonedds_cpp
 ENV ROS_LOCALHOST_ONLY=0
