@@ -15,7 +15,7 @@ try:
     from std_msgs.msg import String
 
     _HAS_ROS2 = True
-    _QOS = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
+    _QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                       history=HistoryPolicy.KEEP_LAST, depth=10)
 except Exception:
     _HAS_ROS2 = False
