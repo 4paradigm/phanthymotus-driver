@@ -72,6 +72,17 @@ requires the operator to place the robot face-up before calling it. `lie_prone` 
 the operator to confirm stable standing through the card instructions and is
 accepted only from walking mode. These
 guards prevent a standing robot from receiving the get-up trajectory.
+`lie_prone` treats workmode 28 as the action start; a direct transition to
+disabled is not reported as `running`. Whole-body joint displacement must also
+confirm that the physical action started.
+
+`wipe_tears` similarly requires arm-joint displacement after tear mode is
+observed. Its five-second automatic return timer starts only after physical arm
+motion is confirmed. If either action mode is observed without the required
+joint motion, the result reports an error and includes only the documented BMS
+SOC and alarm fields. A non-zero BMS alarm is reported as a possible low-charge or
+battery-condition cause; no undocumented SOC threshold is invented by the
+driver.
 
 `play_recording` returns `running` after play-teach mode is observed, then
 monitors workmode and all 21 joint velocities. Once joint motion has started and

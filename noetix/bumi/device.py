@@ -58,7 +58,8 @@ _BUMI_JOINT_NAMES = [
 
 _POSTURE_ACTIONS = {
     "stand_up": ("FALLTOSTAND", {27}),
-    "lie_prone": ("STANDTOFALL", {28, 30}),
+    # disabled(30) is the terminal state, not proof that STANDTOFALL started.
+    "lie_prone": ("STANDTOFALL", {28}),
 }
 
 _PRESET_ACTIONS = {
@@ -81,6 +82,13 @@ _TEACHING_ACTIONS = {
 
 _SEMANTIC_ACTION_WORKMODES = {5, 8, 9, 10, 31, 32, 33}
 _TEAR_AUTO_EXIT_S = 5.0
+_ACTION_MOTION_SAMPLE_INTERVAL_S = 0.05
+_LIE_PRONE_MOTION_START_TIMEOUT_S = 4.0
+_LIE_PRONE_MIN_JOINT_DISPLACEMENT_RAD = 0.15
+_LIE_PRONE_MIN_MOVED_JOINT_COUNT = 3
+_WIPE_TEARS_MOTION_START_TIMEOUT_S = 3.0
+_WIPE_TEARS_MIN_ARM_DISPLACEMENT_RAD = 0.08
+_ARM_JOINT_INDICES = tuple(range(4)) + tuple(range(10, 14))
 _PLAYBACK_MOVING_THRESHOLD = 0.15
 _PLAYBACK_STATIONARY_THRESHOLD = 0.15
 _PLAYBACK_STATIONARY_CONFIRM_S = 3.0
@@ -439,7 +447,7 @@ class LocoPlugin:
             "name": "stand_up_lie_prone",
             "type": "actuator",
             "multiInstance": False,
-            "description": "让 Bumi 从仰面平躺自主起身，或从正常站立姿态趴下收纳。stand_up 会先用 IMU 和 21 个关节状态检查仰面方向、静止状态及四肢姿态，不通过时不发送任何控制命令；通过后在必要时自动使能，并直接执行自主起身，不会进入仅适用于人工扶站的准备模式。传感器无法检查地面、脚下异物和周围空间，用户仍须完成 action 描述中的现场安全检查。",
+            "description": "让 Bumi 从仰面平躺自主起身，或从正常站立姿态趴下收纳。stand_up 会先用 IMU 和 21 个关节状态检查仰面方向、静止状态及四肢姿态，不通过时不发送任何控制命令；通过后在必要时自动使能，并直接执行自主起身，不会进入仅适用于人工扶站的准备模式。lie_prone 只有在进入动作模式且关节位移确认身体实际开始运动后才返回 running；未启动时会返回电池 SOC 与 alarm 诊断。传感器无法检查地面、脚下异物和周围空间，用户仍须完成 action 描述中的现场安全检查。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -457,7 +465,7 @@ class LocoPlugin:
                     },
                     "lie_prone": {
                         "params": [],
-                        "description": "仅从 walking 状态趴下收纳。调用前必须由用户确认机器人稳定站立且周围 3m×3m 安全；其他工作模式不会发送动作命令。",
+                        "description": "仅从 walking 状态趴下收纳。调用前必须由用户确认机器人稳定站立且周围 3m×3m 安全；其他工作模式不会发送动作命令。进入动作模式后还会检查全身关节是否产生实际位移，未启动时返回电池诊断。",
                     },
                 },
             },
@@ -486,13 +494,13 @@ class LocoPlugin:
                         "dance_1": "执行舞蹈 1。机器人属于盲舞，至少留出 3m×3m 平坦防滑空间。",
                         "dance_2": "执行舞蹈 2。机器人属于盲舞，至少留出 3m×3m 平坦防滑空间。",
                         "dance_3": "执行舞蹈 3。机器人属于盲舞，至少留出 3m×3m 平坦防滑空间。",
-                        "wipe_tears": "执行擦眼泪动作，固定 5 秒后自动返回 walking。确认机器人稳定站立且手臂周围无障碍物。",
+                        "wipe_tears": "执行擦眼泪动作。检测到手臂实际运动后开始 5 秒计时并自动返回 walking；未启动时返回电池诊断。确认机器人稳定站立且手臂周围无障碍物。",
                         "reset": "结束当前语义动作并返回 workmode=2（walking），用于动作后复位。",
                     }.items()
                 } | {
                     "wipe_tears": {
                         "params": [],
-                        "description": "执行擦眼泪动作，固定 5 秒后自动返回 walking，无需填写时长或调用 reset。",
+                        "description": "执行擦眼泪动作。手臂关节位移确认动作启动后固定 5 秒自动返回 walking；未启动时返回电池 SOC 与 alarm，无需填写时长或调用 reset。",
                     },
                 },
             },
@@ -574,6 +582,122 @@ class LocoPlugin:
         if not all(math.isfinite(value) for value in velocities):
             raise RuntimeError("HighController returned a non-finite joint velocity")
         return max(velocities)
+
+    def _read_battery_status(self) -> dict:
+        """Return only the battery percentage and documented BMS alarm value."""
+        try:
+            bms = self._high_ctrl.get_robot_bms_data()
+            return {
+                "soc_percent": int(bms.battery_soc),
+                "alarm": int(bms.battery_alarm),
+            }
+        except Exception:
+            return {
+                "soc_percent": None,
+                "alarm": None,
+            }
+
+    def _attach_battery_failure_diagnostic(self, result: dict) -> dict:
+        battery = self._read_battery_status()
+        result["battery_status"] = battery
+        alarm = battery.get("alarm")
+        if alarm:
+            result["battery_alarm_present"] = True
+            result["low_battery_may_have_prevented_action"] = True
+            result["battery_diagnosis"] = (
+                "The BMS reports a non-zero battery alarm. Low charge or another battery "
+                "condition may have prevented the firmware from starting the physical action. "
+                "Charge and inspect Bumi before retrying. The SDK does not document the alarm "
+                "bit meanings, so this driver cannot identify the exact battery fault."
+            )
+        elif alarm == 0:
+            result["battery_alarm_present"] = False
+            result["low_battery_may_have_prevented_action"] = None
+            result["battery_diagnosis"] = (
+                "The BMS did not report a battery alarm when the action failure was checked. "
+                "Review the returned SOC value: the SDK does not document a low-SOC action "
+                "threshold, so this driver cannot confirm or exclude low charge as the cause."
+            )
+        else:
+            result["battery_alarm_present"] = None
+            result["low_battery_may_have_prevented_action"] = None
+            result["battery_diagnosis"] = (
+                "Battery state could not be read, so low charge could not be evaluated."
+            )
+        return result
+
+    def _capture_joint_positions(self, indices: tuple[int, ...]) -> list[float]:
+        joints = self._high_ctrl.get_joint_state()
+        if len(joints) != len(_BUMI_JOINT_NAMES):
+            raise RuntimeError(
+                f"HighController returned {len(joints)} joints; "
+                f"expected {len(_BUMI_JOINT_NAMES)}")
+        positions = [float(joints[index].pos) for index in indices]
+        if not all(math.isfinite(value) for value in positions):
+            raise RuntimeError("HighController returned a non-finite joint position")
+        return positions
+
+    def _confirm_joint_displacement(
+            self, baseline: list[float], indices: tuple[int, ...],
+            minimum_displacement_rad: float, timeout_s: float,
+            active_modes: set[int], minimum_moved_joint_count: int = 1) -> dict:
+        """Confirm physical action start independently from workmode feedback."""
+        deadline = time.monotonic() + timeout_s
+        peak_displacement = 0.0
+        most_moved_index = indices[0]
+        maximum_moved_joint_count = 0
+        observed_mode = int(self._high_ctrl.get_mode())
+        sample_count = 0
+        error = None
+
+        while time.monotonic() < deadline:
+            observed_mode = int(self._high_ctrl.get_mode())
+            if observed_mode == 26 or observed_mode not in active_modes:
+                break
+            try:
+                current = self._capture_joint_positions(indices)
+            except Exception as exc:
+                error = str(exc)
+                break
+            sample_count += 1
+            moved_joint_count = 0
+            for list_index, (start, now) in enumerate(zip(baseline, current)):
+                displacement = abs(now - start)
+                if displacement >= minimum_displacement_rad:
+                    moved_joint_count += 1
+                if displacement > peak_displacement:
+                    peak_displacement = displacement
+                    most_moved_index = indices[list_index]
+            maximum_moved_joint_count = max(
+                maximum_moved_joint_count, moved_joint_count)
+            if moved_joint_count >= minimum_moved_joint_count:
+                return {
+                    "confirmed": True,
+                    "sample_count": sample_count,
+                    "observed_workmode": observed_mode,
+                    "observed_workmode_name": _WORKMODE_NAMES.get(
+                        observed_mode, "unknown"),
+                    "peak_joint_displacement_rad": round(peak_displacement, 5),
+                    "most_moved_joint": _BUMI_JOINT_NAMES[most_moved_index],
+                    "minimum_required_displacement_rad": minimum_displacement_rad,
+                    "moved_joint_count": moved_joint_count,
+                    "minimum_required_moved_joint_count": (
+                        minimum_moved_joint_count),
+                }
+            time.sleep(_ACTION_MOTION_SAMPLE_INTERVAL_S)
+
+        return {
+            "confirmed": False,
+            "sample_count": sample_count,
+            "observed_workmode": observed_mode,
+            "observed_workmode_name": _WORKMODE_NAMES.get(observed_mode, "unknown"),
+            "peak_joint_displacement_rad": round(peak_displacement, 5),
+            "most_moved_joint": _BUMI_JOINT_NAMES[most_moved_index],
+            "minimum_required_displacement_rad": minimum_displacement_rad,
+            "moved_joint_count": maximum_moved_joint_count,
+            "minimum_required_moved_joint_count": minimum_moved_joint_count,
+            "error": error,
+        }
 
     def _do_move(self, args: dict) -> dict:
         values = {}
@@ -901,6 +1025,20 @@ class LocoPlugin:
                 ),
                 "safety_requirements": safety,
             }
+        motion_indices = tuple(range(len(_BUMI_JOINT_NAMES)))
+        motion_baseline = None
+        if action == "lie_prone":
+            try:
+                motion_baseline = self._capture_joint_positions(motion_indices)
+            except Exception as exc:
+                return {
+                    "state": "error",
+                    "command_sent": False,
+                    "requested_action": action,
+                    "error": f"Cannot capture pre-action joint state: {exc}",
+                    "message": "No STANDTOFALL command was sent.",
+                    "safety_requirements": safety,
+                }
         pose_check = None
         if action == "stand_up":
             pose_check = self._check_face_up_stand_pose()
@@ -929,6 +1067,57 @@ class LocoPlugin:
         command_name, expected_modes = _POSTURE_ACTIONS[action]
         result = self._trigger_user_action(
             action, command_name, expected_modes, prepared["steps"], safety)
+        if action == "lie_prone" and not result.get("confirmed_started"):
+            result["state"] = "error"
+            result["error"] = (
+                "STANDTOFALL was sent, but workmode=28 was not observed, so the "
+                "lie-prone action did not confirm startup."
+            )
+        if (action == "lie_prone" and result.get("confirmed_started")
+                and motion_baseline is not None):
+            motion_confirmation = self._confirm_joint_displacement(
+                motion_baseline, motion_indices,
+                _LIE_PRONE_MIN_JOINT_DISPLACEMENT_RAD,
+                _LIE_PRONE_MOTION_START_TIMEOUT_S, {28},
+                _LIE_PRONE_MIN_MOVED_JOINT_COUNT)
+            result["physical_motion_confirmation"] = motion_confirmation
+            if not motion_confirmation["confirmed"]:
+                observed_mode = motion_confirmation["observed_workmode"]
+                if observed_mode == 26:
+                    protection_result = self._protection_error(
+                        action, prepared["steps"], observed_mode, safety,
+                        command_sent=True)
+                    protection_result["physical_motion_confirmation"] = (
+                        motion_confirmation)
+                    return self._attach_battery_failure_diagnostic(
+                        protection_result)
+                recovery_result = None
+                if observed_mode == 28:
+                    recovery_result = self._send_walk_exit(
+                        "lie_prone_start_failed", safety)
+                result.update({
+                    "state": "error",
+                    "confirmed_started": False,
+                    "mode_start_confirmed": True,
+                    "physical_motion_confirmed": False,
+                    "current_workmode": observed_mode,
+                    "current_workmode_name": _WORKMODE_NAMES.get(
+                        observed_mode, "unknown"),
+                    "error": (
+                        "STANDTOFALL mode was observed, but whole-body joint feedback did not "
+                        "confirm that the physical lie-prone action started."
+                    ),
+                    "message": (
+                        "The robot may have rejected or aborted the physical action. Check the "
+                        "battery result, charge Bumi if an alarm is present, and inspect the "
+                        "standing pose and floor before retrying."
+                    ),
+                })
+                if recovery_result is not None:
+                    result["walking_recovery"] = recovery_result
+                self._attach_battery_failure_diagnostic(result)
+            else:
+                result["physical_motion_confirmed"] = True
         if pose_check is not None:
             result["pose_check"] = pose_check
             result["pose_verification"] = (
@@ -1118,10 +1307,73 @@ class LocoPlugin:
         if prepared["state"] == "error":
             prepared["safety_requirements"] = safety
             return prepared
+        motion_baseline = None
+        if action == "wipe_tears":
+            try:
+                # Capture after preparation so enable/ready/walking transitions
+                # cannot be mistaken for physical TEAR motion.
+                motion_baseline = self._capture_joint_positions(_ARM_JOINT_INDICES)
+            except Exception as exc:
+                return {
+                    "state": "error",
+                    "command_sent": bool(prepared["steps"]),
+                    "requested_action": action,
+                    "preparation_steps": prepared["steps"],
+                    "error": f"Cannot capture pre-action arm state: {exc}",
+                    "message": "No TEAR command was sent.",
+                    "safety_requirements": safety,
+                }
         command_name, expected_modes = _PRESET_ACTIONS[action]
         result = self._trigger_user_action(
             action, command_name, expected_modes, prepared["steps"], safety)
+        if action == "wipe_tears" and not result.get("confirmed_started"):
+            result["state"] = "error"
+            result["error"] = (
+                "TEAR was sent, but workmode=33 was not observed, so the wipe-tears "
+                "action did not confirm startup."
+            )
         if action == "wipe_tears" and result.get("confirmed_started"):
+            motion_confirmation = self._confirm_joint_displacement(
+                motion_baseline, _ARM_JOINT_INDICES,
+                _WIPE_TEARS_MIN_ARM_DISPLACEMENT_RAD,
+                _WIPE_TEARS_MOTION_START_TIMEOUT_S, {33})
+            result["physical_motion_confirmation"] = motion_confirmation
+            if not motion_confirmation["confirmed"]:
+                observed_mode = motion_confirmation["observed_workmode"]
+                if observed_mode == 26:
+                    protection_result = self._protection_error(
+                        action, prepared["steps"], observed_mode, safety,
+                        command_sent=True)
+                    protection_result["physical_motion_confirmation"] = (
+                        motion_confirmation)
+                    return self._attach_battery_failure_diagnostic(
+                        protection_result)
+                recovery_result = None
+                if observed_mode == 33:
+                    recovery_result = self._send_walk_exit(
+                        "wipe_tears_start_failed", safety)
+                result.update({
+                    "state": "error",
+                    "confirmed_started": False,
+                    "mode_start_confirmed": True,
+                    "physical_motion_confirmed": False,
+                    "auto_return_to_walk": False,
+                    "current_workmode": observed_mode,
+                    "current_workmode_name": _WORKMODE_NAMES.get(
+                        observed_mode, "unknown"),
+                    "error": (
+                        "TEAR mode was observed, but arm joint feedback did not confirm that "
+                        "the physical wipe-tears action started."
+                    ),
+                    "message": (
+                        "The robot may have rejected the physical action. Check the battery "
+                        "result and charge Bumi before retrying if a battery alarm is present."
+                    ),
+                })
+                if recovery_result is not None:
+                    result["walking_recovery"] = recovery_result
+                return self._attach_battery_failure_diagnostic(result)
+            result["physical_motion_confirmed"] = True
             self._schedule_auto_walk_exit(
                 "wipe_tears", 33, _TEAR_AUTO_EXIT_S, safety)
             result.update({
@@ -1506,6 +1758,9 @@ class LocoPlugin:
         }
         if recording_id is not None:
             result["recording_id"] = recording_id
+        if not confirmed:
+            result["physical_motion_confirmed"] = False
+            self._attach_battery_failure_diagnostic(result)
         return result
 
     @staticmethod
