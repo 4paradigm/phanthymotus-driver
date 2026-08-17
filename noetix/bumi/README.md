@@ -73,11 +73,13 @@ the operator to confirm stable standing through the card instructions and is
 accepted only from walking mode. These
 guards prevent a standing robot from receiving the get-up trajectory.
 
-`play_recording` remains `running` after play-teach mode is observed. The SDK
-does not document a physical playback-completion event, so the driver does not
-send `WALK` on a guessed timeout. After visible completion, or to interrupt
-playback, use `action_recording.stop_playback`; it is accepted only from
-play-teach mode and confirms the return to walking.
+`play_recording` returns `running` after play-teach mode is observed, then
+monitors workmode and all 21 joint velocities. Once joint motion has started and
+subsequently remained stationary for the configured confirmation window, the
+driver sends `WALK` to return automatically to workmode 2. No duration or manual
+stop parameter is exposed. The monitor also has no-motion and maximum-runtime
+safeguards because the SDK does not expose a dedicated physical playback-
+completion event.
 
 `finish_and_save_recording` maps to the supported `SAVETEACH` command. The
 vendor-deprecated `ENDTEACH` command and unavailable `RUN` command remain
