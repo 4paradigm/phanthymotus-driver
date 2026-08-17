@@ -12,6 +12,8 @@ import json
 import math
 import numbers
 import os
+import queue
+import re
 import sqlite3
 import subprocess
 import threading
@@ -71,6 +73,12 @@ _RELIABLE_ONE = QoSProfile(
     reliability=ReliabilityPolicy.RELIABLE,
     history=HistoryPolicy.KEEP_LAST,
     depth=1,
+    durability=DurabilityPolicy.VOLATILE,
+)
+_AUDIO_QOS = QoSProfile(
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=200,
     durability=DurabilityPolicy.VOLATILE,
 )
 
@@ -3146,6 +3154,217 @@ class MicPlugin:
         return {"error": f"unknown mic action: {action}"}
 
 
+class SpeakerPlugin:
+    """Canvas PCM sink that plays through the T800 built-in speaker.
+
+    按众擎飞书《ROS2 接口开发文档》第8章实现：回放走官方 ALSA 接口
+    ``aplay``（8.2.2，``-t raw`` 从 stdin 流式播放 PCM-16 16 kHz 单声道），
+    系统音量走官方 ``pactl`` 接口（8.2.3 / 8.3.1，0-100）。画布 / Agent
+    Core 把音频文件与用户 mic 统一转成 ``audio/pcm-16k`` 块流（与 G1
+    speaker 契约一致）发布到 topic_in，本卡写入 aplay stdin 经内置喇叭
+    播放。
+    """
+
+    _EOF_MAGIC = b"\x01\x00\xff\xff\x01\x00\xff\xff"  # G1 契约：utterance 结束标记
+
+    def __init__(self, config: dict, namespace: str, ros2):
+        self._node = Node("t800_speaker", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._node)
+        self._subscription = None
+        self._input_topic = ""
+        self._state = "idle"
+        self._last_error = ""
+        self._process = None
+        self._queue = queue.Queue(maxsize=200)
+        self._thread = None
+        self._running = False
+        self._chunks_played = 0
+        self._last_chunk_time = 0.0
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "speaker",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "T800 speaker — 订阅画布连接的 PCM-16k 音频流，经官方 ALSA aplay "
+                           "接口流式播放到机器人喇叭；音量经官方 pactl 接口控制",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["start", "stop", "info", "get_volume", "set_volume"],
+                    },
+                    "input_topic": {
+                        "type": "string",
+                        "description": "画布连接提供的 ROS2 PCM 音频 topic",
+                    },
+                    "volume": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": "系统音量 0-100（官方 pactl 接口）",
+                    },
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "start": {"params": ["input_topic"], "description": "订阅画布音频 topic 并开始流式播放"},
+                    "stop": {"params": [], "description": "停止播放并释放订阅"},
+                    "get_volume": {"params": [], "description": "查询机器人喇叭系统音量（官方 pactl 接口）"},
+                    "set_volume": {"params": ["volume"], "description": "设置机器人喇叭系统音量 0-100（官方 pactl 接口）"},
+                },
+            },
+            "topic_in": [{"format": "audio/pcm-16k"}],
+        }
+
+    def start(self) -> None:
+        pass  # 播放经 dispatch(start) 按画布连接的 input_topic 启动
+
+    def stop(self) -> None:
+        self._running = False
+        if self._subscription is not None:
+            self._node.destroy_subscription(self._subscription)
+            self._subscription = None
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+        process = self._process
+        self._process = None
+        if process is not None:
+            try:
+                if process.stdin is not None:
+                    process.stdin.close()
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=1)
+            except Exception:
+                process.kill()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1)
+        self._thread = None
+        self._input_topic = ""
+        self._state = "idle"
+
+    def _spawn_player(self):
+        # 官方 8.2.2：aplay 回放；-t raw 表示从 stdin 流式读原始 PCM
+        return subprocess.Popen(
+            ["aplay", "-q", "-t", "raw", "-f", "S16_LE", "-r", "16000", "-c", "1", "-"],
+            stdin=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
+        )
+
+    def _check_pulse(self) -> None:
+        subprocess.run(["pactl", "info"], capture_output=True, text=True, timeout=3, check=True)
+
+    def _run_command(self, command: list[str]) -> str:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=10, check=True)
+        return result.stdout.strip()
+
+    def _get_volume(self) -> int:
+        out = self._run_command(["pactl", "get-sink-volume", "@DEFAULT_SINK@"])
+        match = re.search(r"(\d+)%", out)
+        if match is None:
+            raise RuntimeError(f"cannot parse pactl volume output: {out!r}")
+        return int(match.group(1))
+
+    def _set_volume(self, volume) -> int:
+        value = int(clamp(volume, 0, 100))
+        self._run_command(["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{value}%"])
+        return value
+
+    def _start_play(self, topic: str) -> dict:
+        self.stop()
+        from audio_msgs.msg import AudioChunk
+        try:
+            self._check_pulse()
+            self._run_command(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "0"])
+            self._process = self._spawn_player()
+            self._input_topic = topic
+            self._subscription = self._node.create_subscription(
+                AudioChunk, topic, self._on_chunk, _AUDIO_QOS
+            )
+        except Exception as exc:
+            self.stop()
+            self._last_error = str(exc)
+            return {"state": "error", "message": f"speaker playback failed: {exc}"}
+        if self._process is None or self._process.poll() is not None:
+            code = self._process.returncode if self._process is not None else "unknown"
+            self._last_error = f"aplay exited with code {code}"
+            self.stop()
+            return {"state": "error", "message": self._last_error}
+        self._running = True
+        self._state = "ready"
+        self._thread = threading.Thread(target=self._play_loop, daemon=True, name="t800-speaker")
+        self._thread.start()
+        return {"state": "ready", "topic_in": [{"topic": topic, "format": "audio/pcm-16k"}]}
+
+    def _on_chunk(self, msg) -> None:
+        pcm = bytes(msg.data)
+        if pcm == self._EOF_MAGIC or not pcm:
+            return
+        if getattr(msg, "format", "audio/pcm-16k") not in ("audio/pcm-16k", "pcm_16k_16bit_mono"):
+            self._last_error = f"unsupported audio format: {msg.format}"
+            return
+        try:
+            self._queue.put_nowait(pcm)
+            self._last_chunk_time = time.monotonic()
+        except queue.Full:
+            self._last_error = "speaker buffer full; audio chunk dropped"
+
+    def _play_loop(self) -> None:
+        while self._running:
+            try:
+                pcm = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                if self._state == "playing" and time.monotonic() - self._last_chunk_time >= 0.3:
+                    self._state = "ready"
+                continue
+            process = self._process
+            try:
+                if process is None or process.poll() is not None or process.stdin is None:
+                    raise RuntimeError("aplay is not running")
+                process.stdin.write(pcm)
+                process.stdin.flush()
+                self._chunks_played += 1
+                self._state = "playing"
+            except Exception as exc:  # noqa: BLE001
+                self._last_error = str(exc)
+                self._state = "error"
+                self._running = False
+                break
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "play"):
+            topic = str(args.get("input_topic", "")).strip()
+            if not topic:
+                return {"state": "error", "message": "Missing input_topic", "error": "Missing input_topic"}
+            return self._start_play(topic)
+        if action == "stop":
+            self.stop()
+            return {"state": "idle"}
+        if action == "get_volume":
+            try:
+                return {"state": self._state, "volume": self._get_volume()}
+            except Exception as exc:
+                return {"state": self._state, "error": f"get_volume failed: {exc}"}
+        if action == "set_volume":
+            try:
+                return {"state": self._state, "volume": self._set_volume(args.get("volume", 100))}
+            except Exception as exc:
+                return {"state": self._state, "error": f"set_volume failed: {exc}"}
+        if action == "info":
+            topic_in = ([{"topic": self._input_topic, "format": "audio/pcm-16k"}]
+                        if self._input_topic else [{"format": "audio/pcm-16k"}])
+            return {"state": self._state, "topic_in": topic_in,
+                    "buffer_chunks": self._queue.qsize(), "chunks_played": self._chunks_played,
+                    "last_error": self._last_error}
+        return {"error": f"unknown speaker action: {action}"}
+
+
 class VisionPlugin:
     """T800-Odin2 激光雷达相机视觉数据桥接（飞书文档 7.2 节）。
 
@@ -3156,6 +3375,11 @@ class VisionPlugin:
     (``sensor/pointcloud``, ``image/jpeg``, ``image/depth-z16``).  Topic names
     follow the per-device prefix ``/{topic_prefix}/{model}/device{N}/`` and
     must be calibrated against ``ros_graph`` on the real robot.
+
+    点云默认转发 SLAM 云（``cloud/slam``）：它位于 odom 标准坐标系
+    （z 轴朝上、重力对齐），满足渲染端 ``sensor/pointcloud`` 的坐标系契约。
+    ``raw`` 是 Odin2 传感器坐标系（z 轴朝下前方、随头部俯仰倾斜），直接
+    渲染会上下颠倒，仅作为调试源经 ``select_source`` 显式切换。
     """
 
     _SOURCES = ("raw", "slam")
@@ -3168,9 +3392,9 @@ class VisionPlugin:
         self._ns = namespace
         self._topics = config["topics"]
         vision_config = config.get("plugins", {}).get("vision", {}) or {}
-        self._source = vision_config.get("source", "raw")
+        self._source = vision_config.get("source", "slam")
         if self._source not in self._SOURCES:
-            self._source = "raw"
+            self._source = "slam"
         self._cloud_topic = f"/{namespace}/vision/cloud"
         self._cam_left_topic = f"/{namespace}/vision/camera_left"
         self._cam_right_topic = f"/{namespace}/vision/camera_right"
@@ -3191,7 +3415,8 @@ class VisionPlugin:
     def _cloud_tool(self) -> dict:
         tool = sensor_tool(
             "pointcloud",
-            f"T800-Odin2 {self._source} 点云转发（256×192）；二进制 [uint32 point_step][uint32 total_points]"
+            f"T800-Odin2 {self._source} 点云转发（slam=odom 标准坐标系 z 轴朝上，"
+            f"raw=传感器坐标系仅调试用）；二进制 [uint32 point_step][uint32 total_points]"
             f"[PointCloud2 bytes]，发布到 {self._cloud_topic}",
             self._cloud_topic,
             "sensor/pointcloud",
@@ -3199,7 +3424,7 @@ class VisionPlugin:
         schema = action_schema(
             _with_lifecycle({
                 "status": ([], "返回点云流状态"),
-                "select_source": (["source"], "切换 Odin2 raw 或 SLAM 点云源"),
+                "select_source": (["source"], "切换 Odin2 SLAM（标准坐标系）或 raw（传感器坐标系）点云源"),
             }),
             {"source": {"type": "string", "enum": list(self._SOURCES)}},
             "点云生命周期和数据源选择",
@@ -3283,6 +3508,9 @@ class VisionPlugin:
         self._on_cloud(msg, "slam")
 
     def _on_cloud(self, msg, source: str) -> None:
+        # 字节级透传：坐标系由源决定。默认源 slam 已处于 odom 标准坐标系
+        # （z 轴朝上），满足渲染端契约；raw 为传感器坐标系（z 轴随头部俯仰
+        # 倾斜），直接渲染会上下颠倒，仅作调试源使用。
         if not self._running or "pointcloud" not in self._enabled_tools or source != self._source:
             return
         data = bytes(msg.data)

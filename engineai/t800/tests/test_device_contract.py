@@ -71,6 +71,11 @@ class FakeNode:
         self.subscriptions.append(subscription)
         return subscription
 
+    def destroy_subscription(self, subscription):
+        if subscription in self.subscriptions:
+            self.subscriptions.remove(subscription)
+        return True
+
     def create_timer(self, period, callback):
         return types.SimpleNamespace(period=period, callback=callback)
 
@@ -231,6 +236,7 @@ class DevicePluginContractTests(unittest.TestCase):
             self.device.LedPlugin(CONFIG, "robot", self.ros),
             self.device.TtsPlugin(CONFIG, "robot", self.ros),
             self.device.MicPlugin(CONFIG, "robot", self.ros),
+            self.device.SpeakerPlugin(CONFIG, "robot", self.ros),
             self.device.VisionPlugin(CONFIG, "robot", self.ros),
             self.device.MotorPowerPlugin(CONFIG, "robot", self.ros),
             self.device.NativeNodeControlPlugin(CONFIG, "robot", self.ros),
@@ -256,12 +262,12 @@ class DevicePluginContractTests(unittest.TestCase):
              "native_interface_probe",
              "loco", "motion_mode", "dance", "joint_plan", "joint_plan_state", "gesture",
              "joint_override", "joint_bridge",
-             "led", "tts", "mic", "pointcloud", "camera", "depth",
+             "led", "tts", "mic", "speaker", "pointcloud", "camera", "depth",
              "motor_power", "native_node_control", "virtual_gamepad", "safety", "native_sdk"},
             names,
         )
-        self.assertEqual(41, len(names))
-        self.assertEqual(41, len(definitions), "tool names must be unique")
+        self.assertEqual(42, len(names))
+        self.assertEqual(42, len(definitions), "tool names must be unique")
         for tool in definitions:
             schema = tool.get("inputSchema")
             self.assertEqual("object", schema.get("type"), tool["name"])
@@ -652,6 +658,116 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual(1024, len(plugin._publisher.messages[0].data))
         self.assertEqual("idle", plugin.dispatch("stop", {})["state"])
 
+    def test_speaker_is_a_canvas_pcm_sink_per_official_audio_interface(self):
+        plugin = self.device.SpeakerPlugin(CONFIG, "robot", self.ros)
+        tool = plugin.get_tool()
+        self.assertEqual([{"format": "audio/pcm-16k"}], tool["topic_in"])
+        self.assertEqual(
+            ["start", "stop", "info", "get_volume", "set_volume"],
+            tool["inputSchema"]["properties"]["action"]["enum"],
+        )
+        self.assertIn("set_volume", tool["inputSchema"]["x-action-params"])
+        missing = plugin.dispatch("start", {})
+        self.assertEqual("error", missing["state"])
+        self.assertEqual("Missing input_topic", missing["error"])
+
+        class FakeStdin:
+            def __init__(self):
+                self.writes = []
+
+            def write(self, data):
+                self.writes.append(data)
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+
+        class FakeProcess:
+            def __init__(self):
+                self.stdin = FakeStdin()
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = 0
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        process = FakeProcess()
+        commands = []
+        plugin._check_pulse = lambda: None
+        plugin._run_command = lambda command: commands.append(command) or ""
+        plugin._spawn_player = lambda: process
+        started = plugin.dispatch("start", {"input_topic": "/perception/tts"})
+        self.assertEqual("ready", started["state"])
+        self.assertEqual("/perception/tts", started["topic_in"][0]["topic"])
+        # 启动时按官方接口解除静音
+        self.assertIn(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "0"], commands)
+
+        # 画布 PCM 块经 aplay stdin 流式播放；EOF magic 不入流
+        plugin._on_chunk(types.SimpleNamespace(format="audio/pcm-16k", data=[1, 2, 3, 4]))
+        plugin._on_chunk(types.SimpleNamespace(format="audio/pcm-16k",
+                                               data=list(plugin._EOF_MAGIC)))
+        deadline = time.monotonic() + 1
+        while not process.stdin.writes and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual([b"\x01\x02\x03\x04"], process.stdin.writes)
+        self.assertEqual("playing", plugin.dispatch("info", {})["state"])
+        time.sleep(0.35)
+        self.assertEqual("ready", plugin.dispatch("info", {})["state"])
+        self.assertEqual("idle", plugin.dispatch("stop", {})["state"])
+        self.assertEqual([], plugin._node.subscriptions)
+
+    def test_speaker_volume_uses_official_pactl_interface(self):
+        plugin = self.device.SpeakerPlugin(CONFIG, "robot", self.ros)
+        commands = []
+        plugin._run_command = lambda command: commands.append(command) or "Volume: front-left: 32768 /  50% / -18.06 dB"
+        result = plugin.dispatch("get_volume", {})
+        self.assertEqual(50, result["volume"])
+        self.assertEqual(["pactl", "get-sink-volume", "@DEFAULT_SINK@"], commands[-1])
+        result = plugin.dispatch("set_volume", {"volume": 80})
+        self.assertEqual(80, result["volume"])
+        self.assertEqual(["pactl", "set-sink-volume", "@DEFAULT_SINK@", "80%"], commands[-1])
+        # 越界值收敛到 0-100；解析失败走 error 路径
+        self.assertEqual(100, plugin.dispatch("set_volume", {"volume": 999})["volume"])
+        plugin._run_command = lambda command: "unparseable"
+        self.assertIn("error", plugin.dispatch("get_volume", {}))
+
+    def test_speaker_aplay_exit_sets_error(self):
+        plugin = self.device.SpeakerPlugin(CONFIG, "robot", self.ros)
+
+        class DeadProcess:
+            def __init__(self):
+                self.stdin = None
+                self.returncode = 1
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def kill(self):
+                pass
+
+        plugin._check_pulse = lambda: None
+        plugin._run_command = lambda command: ""
+        plugin._spawn_player = lambda: DeadProcess()
+        started = plugin.dispatch("start", {"input_topic": "/perception/tts"})
+        self.assertEqual("error", started["state"])
+        self.assertIn("aplay exited", started["message"])
+
     def test_native_node_control_and_composed_safety(self):
         native = self.device.NativeNodeControlPlugin(CONFIG, "robot", self.ros)
         native.start()
@@ -678,19 +794,30 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual([1.0] * 25, safety._joint_pub.messages[-1].damping)
         self.assertTrue(all(control.stopped for control in active_controls))
 
-    def test_vision_pointcloud_passthrough_binary_header(self):
+    def test_vision_pointcloud_defaults_to_slam_standard_frame(self):
         import struct
 
+        # 无 plugins.vision 配置时默认源为 slam（odom 标准坐标系，z 轴朝上），
+        # raw 传感器坐标系数据默认被忽略——直接渲染会上下颠倒。
         plugin = self.device.VisionPlugin(CONFIG, "robot", self.ros)
+        self.assertEqual("slam", plugin._source)
         plugin.start()
         data = bytes(range(64))  # 4 点 × 16 字节 point_step
-        plugin._on_cloud_raw(types.SimpleNamespace(point_step=16, data=data))
+        plugin._on_cloud_raw(types.SimpleNamespace(point_step=16, data=data))  # raw 默认忽略
+        self.assertEqual(0, len(plugin._cloud_pub.messages))
+        plugin._on_cloud_slam(types.SimpleNamespace(point_step=16, data=data))
         out = plugin._cloud_pub.messages[-1]
         self.assertEqual(struct.pack("<II", 16, 4), bytes(out.data[:8]))
         self.assertEqual(bytes(range(64)), bytes(out.data[8:]))
         self.assertEqual(1, plugin._frames["pointcloud"])
+        tools = {tool["name"]: tool for tool in plugin.get_tools()}
+        self.assertIn("slam", tools["pointcloud"]["description"])
 
-    def test_vision_select_source_switches_cloud(self):
+    def test_vision_config_source_override_and_select_source(self):
+        config = dict(CONFIG, plugins={"vision": {"enabled": True, "source": "raw"}})
+        plugin = self.device.VisionPlugin(config, "robot", self.ros)
+        self.assertEqual("raw", plugin._source)  # 显式配置 raw 仍受尊重
+
         plugin = self.device.VisionPlugin(CONFIG, "robot", self.ros)
         plugin.start()
         plugin.dispatch("select_source", {"source": "slam"})
@@ -700,8 +827,12 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual(0, len(plugin._cloud_pub.messages))
         plugin._on_cloud_slam(types.SimpleNamespace(point_step=16, data=data))
         self.assertEqual(1, len(plugin._cloud_pub.messages))
+        # 切回 raw（调试源）后 raw 帧被转发
+        plugin.dispatch("select_source", {"source": "raw"})
+        plugin._on_cloud_raw(types.SimpleNamespace(point_step=16, data=data))
+        self.assertEqual(2, len(plugin._cloud_pub.messages))
         info = plugin.dispatch("info", {})
-        self.assertEqual("slam", info["source"])
+        self.assertEqual("raw", info["source"])
         self.assertEqual(4, len(info["topic_out"]))
         self.assertEqual("sensor/pointcloud", info["topic_out"][0]["format"])
 
