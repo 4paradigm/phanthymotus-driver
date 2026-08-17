@@ -182,6 +182,20 @@ def _build_frames(gesture: str, cycles: int) -> list:
 
 # ── Pose validation ─────────────────────────────────────────────────────────
 
+def _validate_pose_rad(positions: dict) -> list[str]:
+    """Check *positions* against URDF-derived JOINT_LIMITS. Returns violation list."""
+    violations = []
+    for name, rad in positions.items():
+        lim = JOINT_LIMITS.get(name)
+        if lim is None:
+            continue  # non-arm joint, skip
+        if rad < lim.min - 1e-6:
+            violations.append(f"{name}: {rad:.4f} < {lim.min:.4f}")
+        if rad > lim.max + 1e-6:
+            violations.append(f"{name}: {rad:.4f} > {lim.max:.4f}")
+    return violations
+
+
 # ── Plugin ───────────────────────────────────────────────────────────────────
 
 class Plugin:
