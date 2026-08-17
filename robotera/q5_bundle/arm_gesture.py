@@ -189,10 +189,11 @@ def _validate_pose_rad(positions: dict) -> list[str]:
         lim = JOINT_LIMITS.get(name)
         if lim is None:
             continue  # non-arm joint, skip
-        if rad < lim.min - 1e-6:
-            violations.append(f"{name}: {rad:.4f} < {lim.min:.4f}")
-        if rad > lim.max + 1e-6:
-            violations.append(f"{name}: {rad:.4f} > {lim.max:.4f}")
+        lo, hi = lim
+        if rad < lo - 1e-6:
+            violations.append(f"{name}: {rad:.4f} < {lo:.4f}")
+        if rad > hi + 1e-6:
+            violations.append(f"{name}: {rad:.4f} > {hi:.4f}")
     return violations
 
 
