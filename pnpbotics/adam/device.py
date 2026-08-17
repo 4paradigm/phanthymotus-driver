@@ -783,12 +783,12 @@ class ZedCameraPlugin:
             pointcloud_config.get(
                 "enabled", self._config.get("pointcloud_enabled", False)))
         # The four cards share one ZED capture thread, but each card has its
-        # own publication lifecycle.  Preserve the existing behaviour of
-        # publishing RGB, depth and info at startup; point cloud remains
-        # opt-in because it is more expensive.
+        # own publication lifecycle.  Metadata remains available at startup;
+        # RGB and depth are opt-in because they are expensive image streams,
+        # matching the point-cloud card's on-demand behaviour.
         self._card_enabled = {
-            "camera_head": True,
-            "camera_depth": True,
+            "camera_head": False,
+            "camera_depth": False,
             "camera_info": True,
             "camera_pointcloud": self._pointcloud_enabled,
         }
