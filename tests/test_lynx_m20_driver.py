@@ -141,6 +141,7 @@ class LynxM20ContractTests(unittest.TestCase):
         command = calls[0][0]
         self.assertEqual("mapping", result["state"])
         self.assertIn("BatchMode=yes", command)
+        self.assertIn("HostKeyAlgorithms=ssh-ed25519", command)
         self.assertIn("StrictHostKeyChecking=yes", command)
         self.assertIn("UserKnownHostsFile=/secrets/known_hosts", command)
         self.assertEqual(

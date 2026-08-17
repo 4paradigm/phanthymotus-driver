@@ -29,6 +29,7 @@ class NOSMappingClient:
             "-i", self.identity_file,
             "-o", "BatchMode=yes",
             "-o", "IdentitiesOnly=yes",
+            "-o", "HostKeyAlgorithms=ssh-ed25519",
             "-o", "StrictHostKeyChecking=yes",
             "-o", f"UserKnownHostsFile={self.known_hosts_file}",
             "-o", "ConnectTimeout=5",
