@@ -83,8 +83,8 @@ _TEACHING_ACTIONS = {
 _SEMANTIC_ACTION_WORKMODES = {5, 8, 9, 10, 31, 32, 33}
 _TEAR_AUTO_EXIT_S = 5.0
 _PLAYBACK_MOVING_THRESHOLD = 0.15
-_PLAYBACK_STATIONARY_THRESHOLD = 0.10
-_PLAYBACK_STATIONARY_CONFIRM_S = 2.0
+_PLAYBACK_STATIONARY_THRESHOLD = 0.15
+_PLAYBACK_STATIONARY_CONFIRM_S = 3.0
 _PLAYBACK_MOTION_START_TIMEOUT_S = 10.0
 _PLAYBACK_MAX_MONITOR_S = 120.0
 
@@ -112,9 +112,9 @@ _FACE_UP_JOINT_REFERENCES = (
 )
 _FACE_UP_JOINT_TOLERANCES = (
     0.65, 0.45, 0.45, 0.55,
-    0.40, 0.30, 0.35, 0.40, 0.45, 0.45,
+    0.40, 0.30, 0.35, 0.40, 0.60, 0.60,
     0.65, 0.45, 0.45, 0.55,
-    0.40, 0.30, 0.35, 0.40, 0.45, 0.45,
+    0.40, 0.30, 0.35, 0.40, 0.60, 0.60,
     0.45,
 )
 
@@ -396,7 +396,7 @@ class LocoPlugin:
             "name": "stand_up_lie_prone",
             "type": "actuator",
             "multiInstance": False,
-            "description": "让 Bumi 从仰面平躺自主起身，或从正常站立姿态趴下收纳。stand_up 会先用 IMU 和 21 个关节状态检查仰面方向、静止状态及四肢姿态，不通过时不发送任何控制命令；通过后自动完成内部使能/准备切换。传感器无法检查地面、脚下异物和周围空间，用户仍须完成 action 描述中的现场安全检查。",
+            "description": "让 Bumi 从仰面平躺自主起身，或从正常站立姿态趴下收纳。stand_up 会先用 IMU 和 21 个关节状态检查仰面方向、静止状态及四肢姿态，不通过时不发送任何控制命令；通过后在必要时自动使能，并直接执行自主起身，不会进入仅适用于人工扶站的准备模式。传感器无法检查地面、脚下异物和周围空间，用户仍须完成 action 描述中的现场安全检查。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -410,7 +410,7 @@ class LocoPlugin:
                 "x-action-params": {
                     "stand_up": {
                         "params": [],
-                        "description": "仅从 disabled/enabled 状态自主起身。卡片先自动检查机器人是否静止、躯干是否仰面及 21 个关节是否接近安全平躺姿态；检查失败时不会使能或起身。用户仍须确认平坦防滑地面、脚底无异物且周围 3m×3m 安全。",
+                        "description": "仅从 disabled/enabled 状态自主起身。卡片先自动检查机器人是否静止、躯干是否仰面及 21 个关节是否接近安全平躺姿态；检查失败时不会使能或起身。检查通过后直接调用 FALLTOSTAND，不会调用用于人工扶站的 SWITCH/ready。用户仍须确认平坦防滑地面、脚底无异物且周围 3m×3m 安全。",
                     },
                     "lie_prone": {
                         "params": [],
@@ -621,8 +621,11 @@ class LocoPlugin:
                     "message": "Place the robot face-up with both legs straight and all limbs naturally positioned, wait until it is still, then try again.",
                     "safety_requirements": safety,
                 }
-        target_mode = 1 if action == "stand_up" else 2
-        prepared = self._prepare_workmode(target_mode, action)
+        prepared = (
+            self._prepare_stand_up(action)
+            if action == "stand_up" else
+            self._prepare_workmode(2, action)
+        )
         if prepared["state"] == "error":
             prepared["safety_requirements"] = safety
             if pose_check is not None:
@@ -639,6 +642,30 @@ class LocoPlugin:
                 "clearance still require visual confirmation by the user."
             )
         return result
+
+    def _prepare_stand_up(self, requested_action: str) -> dict:
+        """Reach enabled mode without entering ready, which assumes assisted standing."""
+        self._move_stop_event.set()
+        if self._move_thread and self._move_thread.is_alive():
+            self._move_thread.join(timeout=1)
+
+        steps = []
+        mode = int(self._high_ctrl.get_mode())
+        if mode == 26:
+            return self._protection_error(requested_action, steps, mode)
+        if mode == 30:
+            mode = self._run_preparation_step("enable", "START", {0}, steps)
+            if mode == 26:
+                return self._protection_error(requested_action, steps, mode)
+            if mode != 0:
+                return self._preparation_error(
+                    requested_action, steps, mode,
+                    "The robot did not enter enabled mode. FALLTOSTAND was not sent.")
+        if mode != 0:
+            return self._preparation_error(
+                requested_action, steps, mode,
+                "Autonomous stand-up requires disabled or enabled mode. FALLTOSTAND was not sent.")
+        return {"state": "completed", "steps": steps, "workmode": mode}
 
     def _check_face_up_stand_pose(self) -> dict:
         """Fail-closed sensor check before any stand-up preparation command."""
@@ -851,7 +878,9 @@ class LocoPlugin:
                 "completion_detection": "inferred_from_workmode_and_joint_velocity",
                 "auto_return_condition": (
                     "After joint motion has been observed, WALK is sent when all joints "
-                    "remain stationary for 2 seconds while the robot is still in play_teach mode."
+                    "remain below the motion_state activity threshold for a sustained "
+                    "3-second score while the robot is still in play_teach mode; isolated "
+                    "encoder-noise spikes reduce the score instead of resetting it."
                 ),
                 "completion_detection_note": (
                     "The SDK exposes no explicit playback-completion event; completion is "
@@ -940,7 +969,7 @@ class LocoPlugin:
         def _monitor() -> None:
             started_at = time.monotonic()
             motion_seen = False
-            stationary_since = None
+            stationary_score_s = 0.0
             exit_reason = None
 
             while not stop_event.wait(0.05):
@@ -979,15 +1008,19 @@ class LocoPlugin:
 
                 if max_velocity >= _PLAYBACK_MOVING_THRESHOLD:
                     motion_seen = True
-                    stationary_since = None
+                    stationary_score_s = max(0.0, stationary_score_s - 0.25)
                 elif motion_seen and max_velocity <= _PLAYBACK_STATIONARY_THRESHOLD:
-                    if stationary_since is None:
-                        stationary_since = now
-                    elif now - stationary_since >= _PLAYBACK_STATIONARY_CONFIRM_S:
+                    # Disabled Bumi joints occasionally report isolated velocity
+                    # spikes around the activity threshold. Accumulate a sustained
+                    # stationary score instead of resetting a multi-second timer
+                    # after every single noisy sample.
+                    stationary_score_s = min(
+                        _PLAYBACK_STATIONARY_CONFIRM_S,
+                        stationary_score_s + 0.05,
+                    )
+                    if stationary_score_s >= _PLAYBACK_STATIONARY_CONFIRM_S:
                         exit_reason = "joint_motion_completed"
                         break
-                elif motion_seen:
-                    stationary_since = None
 
                 elapsed = now - started_at
                 if not motion_seen and elapsed >= _PLAYBACK_MOTION_START_TIMEOUT_S:
