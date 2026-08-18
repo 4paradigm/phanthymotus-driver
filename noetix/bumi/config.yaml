@@ -8,6 +8,9 @@ plugins:
     enabled: true
   mic:
     enabled: true
+    # 采样增益：默认 50（SDK 信号约 8-bit 动态，放大到 16-bit 可用电平）。
+    # 回环测试/近距离用低增益（5~15）抑制声学正反馈啸叫；正常语音识别用 50。
+    gain: 50
   speaker:
     enabled: true
   camera:
@@ -18,3 +21,5 @@ plugins:
     poll_interval_s: 0.5
     # Activity classification only; this is not a motor safety or command limit.
     activity_velocity_threshold: 0.15
+  robot_status:
+    enabled: true

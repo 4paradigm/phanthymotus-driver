@@ -82,6 +82,11 @@ class BumiDeviceBundle:
                 plugins_cfg["motion_state"], namespace, executor, high_ctrl))
             print("[bundle] MotionStatePlugin loaded")
 
+        if plugins_cfg.get("robot_status", {}).get("enabled", False) and high_ctrl is not None:
+            from device import RobotStatusPlugin
+            self._plugins.append(RobotStatusPlugin(plugins_cfg["robot_status"], namespace, executor, high_ctrl))
+            print("[bundle] RobotStatusPlugin loaded")
+
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
             try:

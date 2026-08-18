@@ -1,11 +1,17 @@
 ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 ARG PYPI_MIRROR=https://pypi.org/simple/
+ARG APT_MIRROR_HOST=mirrors.tuna.tsinghua.edu.cn
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
+ARG APT_MIRROR_HOST
 
 WORKDIR /work
 
-RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
+# 基础镜像内置腾讯内网 apt 源(mirrors.tencentyun.com)，非内网机器无法解析。
+# 构建时统一替换为公网镜像（默认清华 tuna，可通过 --build-arg APT_MIRROR_HOST 覆盖）。
+RUN sed -i "s|mirrors\.tencentyun\.com|${APT_MIRROR_HOST}|g" \
+        /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null; \
+    apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
         python3-pip \
         python3-dev \
@@ -22,7 +28,9 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     rm -rf /var/lib/apt/lists/*
 
 # Realsense SDK (D435i camera)
-RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
+RUN sed -i "s|mirrors\.tencentyun\.com|${APT_MIRROR_HOST}|g" \
+        /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null; \
+    apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
         librealsense2-dev \
         librealsense2-utils || true && \
