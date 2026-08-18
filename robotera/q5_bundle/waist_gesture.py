@@ -337,6 +337,7 @@ class Plugin:
 
                 acquired = self._router.acquire(CARD)
                 if not acquired:
+                    cancelled = True
                     break
 
                 try:
