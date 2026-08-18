@@ -1599,3 +1599,278 @@ class MotionStatePlugin:
         if action == "stop":
             return {"state": "idle"}
         return None
+# ── RobotStatusPlugin (sensor) ──────────────────────────────────────────────
+
+class RobotStatusPlugin:
+    """Bumi 综合状态卡 robot_status —— 参照 Q5 robot_status 的返回格式，
+    聚合 workmode / 关节故障与温度 / 电池 / IMU / DDS 连接，附一句操作建议。
+
+    与 robot_diagnostic（一次性 summary）不同：本卡是 sensor，2Hz 持续发布到
+    /{ns}/state/robot_status，Agent Core 可订阅实时监控，也可 info 取快照。
+    """
+
+    PREFIX = "robot_status"
+
+    _ERROR_DESC = {
+        0x02: "over_voltage", 0x03: "under_voltage", 0x04: "over_current",
+        0x06: "hall_error", 0x07: "over_temp", 0x08: "encoder_error",
+        0x09: "phase_loss", 0x0A: "comm_fault", 0x0B: "motor_blocked",
+        0x0C: "memory_error", 0x0D: "calib_error", 0x0E: "driver_fault",
+    }
+
+    _WORKMODE_NAMES = {
+        0: "enabled", 1: "ready", 2: "walking",
+        5: "dance", 8: "greet", 9: "shake", 10: "cheer",
+        11: "start_teach", 12: "end_teach", 23: "play_teach",
+        26: "protection", 27: "fall_to_stand", 28: "stand_to_fall",
+        30: "disabled", 31: "dance1", 32: "dance2", 33: "tear",
+    }
+
+    _HOT_THRESHOLD = 70  # °C
+
+    def __init__(self, plugin_config: dict, namespace: str, executor, high_ctrl):
+        self._namespace = namespace
+        self._high_ctrl = high_ctrl
+        self._topic = f"/{namespace}/state/robot_status"
+        self._node = Node("bumi_robot_status")
+        self._pub = self._node.create_publisher(String, self._topic, _LOW_LAT_QOS)
+        executor.add_node(self._node)
+        self._lock = threading.Lock()
+        self._last: dict | None = None
+        self._running = False
+        self._thread: threading.Thread | None = None
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "robot_status",
+            "type": "sensor",
+            "multiInstance": False,
+            "description": "Bumi 综合状态卡：聚合 workmode、关节故障与温度、电池、IMU、DDS 连接，附一句操作建议。2Hz 发布到 topic，可 info 取快照。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["info", "start", "stop"], "default": "info"},
+                },
+                "required": ["action"],
+            },
+            "topic_out": [{"topic": self._topic, "format": "data/json"}],
+        }
+
+    def start(self) -> None:
+        self._running = True
+        self._thread = threading.Thread(target=self._poll_loop, daemon=True, name="bumi_robot_status")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._running = False
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        args.pop('_tool_name', None)
+        if action == "start":
+            self.start()
+            return {"state": "running"}
+        if action == "stop":
+            self.stop()
+            return {"state": "idle"}
+        if action in ("info", "read", "get"):
+            with self._lock:
+                data = self._last
+            if data is None:
+                data = self._collect()
+                with self._lock:
+                    self._last = data
+            return {"state": "running", "data": data,
+                    "topic_out": [{"topic": self._topic, "format": "data/json"}]}
+        return None
+
+    def _poll_loop(self):
+        while self._running:
+            try:
+                data = self._collect()
+                with self._lock:
+                    self._last = data
+                msg = String()
+                msg.data = json.dumps(data, ensure_ascii=False)
+                self._pub.publish(msg)
+            except Exception as e:
+                print(f"[robot_status] poll error: {e}", flush=True)
+            time.sleep(0.5)  # 2 Hz
+
+    def _collect(self) -> dict:
+        now_ms = int(time.time() * 1000)
+
+        # ── 取数 ──
+        try:
+            workmode = self._high_ctrl.get_mode()
+        except Exception:
+            workmode = -1
+        try:
+            joint_list = self._high_ctrl.get_joint_state()
+        except Exception:
+            joint_list = []
+        try:
+            bms = self._high_ctrl.get_robot_bms_data()
+        except Exception:
+            bms = None
+        try:
+            self._high_ctrl.get_imu_data()
+            imu_ok = True
+        except Exception:
+            imu_ok = False
+
+        # ── 判定 ──
+        is_protection = (workmode == 26)
+        dds_ok = (len(joint_list) > 0)
+        wm_name = self._WORKMODE_NAMES.get(workmode, f"unknown({workmode})")
+
+        # ── 关节故障 + 温度 ──
+        joint_faults = []
+        hot_joints = []
+        temps = []
+        for i, js in enumerate(joint_list):
+            name = _BUMI_JOINT_NAMES[i] if i < len(_BUMI_JOINT_NAMES) else f"joint_{i}"
+            err = int(js.error)
+            temp = int(js.temperature)
+            temps.append((name, temp))
+            if err > 1:  # 跳过 0x01 保护模式锁定伪故障
+                desc = self._ERROR_DESC.get(err, f"0x{err:02X}")
+                joint_faults.append({"joint": name, "error_code": err, "error": desc})
+            if temp > self._HOT_THRESHOLD:
+                hot_joints.append({"joint": name, "temperature": temp})
+
+        temp_summary = None
+        if temps:
+            hottest = max(temps, key=lambda x: x[1])
+            coldest = min(temps, key=lambda x: x[1])
+            temp_summary = {
+                "max": hottest[1], "max_joint": hottest[0],
+                "min": coldest[1], "min_joint": coldest[0],
+                "avg": round(sum(t for _, t in temps) / len(temps), 1),
+            }
+
+        # ── 电池 ──
+        battery = None
+        if bms is not None:
+            battery = {
+                "ok": True,
+                "soc": int(bms.battery_soc),
+                "soh": int(bms.battery_soh),
+                "temperature": int(bms.battery_temp),
+                "alarm": int(bms.battery_alarm),
+            }
+
+        # ── ready 判定（对齐 robot_diagnostic 的 can_operate） ──
+        ready = (not is_protection) and dds_ok and (len(joint_faults) <= 5) \
+            and (workmode not in (30, -1))
+
+        message, advice = self._summarize(
+            workmode, wm_name, is_protection, dds_ok,
+            joint_faults, hot_joints, battery, imu_ok,
+        )
+
+        return {
+            "timestamp_ms": now_ms,
+            "fresh": dds_ok,
+            "available": dds_ok,
+            "ready": ready,
+            "message": message,
+            "advice": advice,
+
+            "robot_status": {
+                "state": wm_name,
+                "state_code": workmode,
+                "fresh": dds_ok,
+                "ready": workmode in (1, 2),
+                "message": None,
+                "source": "HighController.get_mode",
+            },
+
+            "estop": {
+                "active": is_protection,
+                "reported": is_protection,
+                "fresh": dds_ok,
+                "state_code": workmode,
+                "message": "保护模式激活" if is_protection else None,
+                "source": "workmode==26",
+            },
+
+            "system_health": {
+                "joints": {
+                    "online": dds_ok,
+                    "fault_count": len(joint_faults),
+                    "hot_count": len(hot_joints),
+                    "faults": joint_faults,
+                    "hot": hot_joints,
+                    "temperature": temp_summary,
+                    "source": "HighController.get_joint_state",
+                },
+                "battery": {
+                    "ok": bms is not None,
+                    "data": battery,
+                    "source": "HighController.get_robot_bms_data",
+                },
+                "imu": {
+                    "ok": imu_ok,
+                    "source": "HighController.get_imu_data",
+                },
+            },
+
+            "diagnostics": {
+                "connected": dds_ok,
+                "online_joint_count": len(joint_list),
+                "source": "DDS heartbeat (joint_state availability)",
+            },
+
+            "source_methods": {
+                "workmode": "get_mode",
+                "joints": "get_joint_state",
+                "battery": "get_robot_bms_data",
+                "imu": "get_imu_data",
+            },
+        }
+
+    def _summarize(self, workmode, wm_name, is_protection, dds_ok,
+                   joint_faults, hot_joints, battery, imu_ok):
+        # ── message：一句话状态摘要 ──
+        if workmode == -1:
+            message = "状态未知：无法读取 workmode"
+        elif is_protection:
+            message = "状态: protection（保护模式，关节已锁定）"
+        elif workmode == 30:
+            message = "状态: disabled（失能，需使能后操作）"
+        else:
+            message = f"状态: {wm_name}"
+
+        extra = []
+        if not dds_ok:
+            extra.append("DDS 失联")
+        if joint_faults:
+            extra.append(f"{len(joint_faults)} 个关节故障")
+        if hot_joints:
+            extra.append(f"{len(hot_joints)} 个关节过热")
+        if battery is not None and battery["soc"] < 20:
+            extra.append(f"电量 {battery['soc']}%")
+        if extra:
+            message += " | " + " / ".join(extra)
+
+        # ── advice：一句建议（按严重程度取一条） ──
+        if is_protection:
+            advice = "执行 switch_mode mode=fall_to_stand 恢复站立"
+        elif workmode == 30:
+            advice = "执行 switch_mode mode=enable 使能机器人"
+        elif workmode == -1:
+            advice = "检查 DDS 连接是否正常"
+        elif not dds_ok:
+            advice = "DDS 失联，检查运控板连接"
+        elif hot_joints:
+            advice = "关节过热，建议暂停高强度动作降温"
+        elif battery is not None and battery["soc"] < 10:
+            advice = "电量极低，立即充电"
+        elif battery is not None and battery["soc"] < 20:
+            advice = "电量偏低，尽快充电"
+        elif joint_faults:
+            advice = f"{len(joint_faults)} 个关节故障，需排查电机"
+        else:
+            advice = "状态正常，可以操作"
+
+        return message, advice
