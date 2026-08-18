@@ -2085,6 +2085,7 @@ class DancePlugin:
 
 
 class JointPlanPlugin:
+    _LIMIT_MARGIN_RAD = 0.0
     _PRESETS = {
         "shake_hand": {
             "indices": list(range(12, 25)),
@@ -2329,8 +2330,11 @@ class JointPlanPlugin:
                 self._request_type.REQUEST_RESET if action == "reset" else self._request_type.REQUEST_PLAN_EXECUTE
             )
         if action == "plan":
-            indices = validate_joint_indices(args.get("joint_indices"))
-            positions = float_list(args.get("target_positions"), "target_positions", size=len(indices))
+            indices, positions = validate_joint_positions(
+                args.get("joint_indices"),
+                args.get("target_positions"),
+                limit_margin_rad=self._LIMIT_MARGIN_RAD,
+            )
             velocities = optional_floats(args, "target_velocities", len(indices))
             stiffness = optional_floats(args, "stiffness", len(indices))
             damping = optional_floats(args, "damping", len(indices))
@@ -2435,14 +2439,16 @@ class GesturePlugin:
         }
 
     def get_tool(self) -> dict:
+        actions = _with_lifecycle({
+            "list": ([], "列出内置手势及步数"),
+            "play": (["name", "repetitions", "reset_after", "force"], "异步播放一次实机验证手势"),
+            "sequence": (["steps", "reset_after", "force"], "异步执行经过关节限位校验的自定义序列"),
+            "stop_gesture": (["reset_after"], "取消当前步骤并停止手势"),
+            "status": ([], "查询手势、步骤和错误"),
+        })
+        actions["stop"] = (["reset_after"], "停止当前手势并进入空闲状态")
         schema = action_schema(
-            _with_lifecycle({
-                "list": ([], "列出内置手势及步数"),
-                "play": (["name", "repetitions", "reset_after", "force"], "异步播放一次实机验证手势"),
-                "sequence": (["steps", "reset_after", "force"], "异步执行经过关节限位校验的自定义序列"),
-                "stop_gesture": (["reset_after"], "取消当前步骤并停止手势"),
-                "status": ([], "查询手势、步骤和错误"),
-            }),
+            actions,
             {
                 "name": {"type": "string", "enum": list(self._GESTURES)},
                 "repetitions": {"type": "integer", "minimum": 1, "maximum": 1,
