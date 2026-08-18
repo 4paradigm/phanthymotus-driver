@@ -484,14 +484,14 @@ class SpeakerPlugin:
                 "input_topic": {"type": "string", "description": "PCM 16 kHz AudioChunk topic from the canvas connection"},
                 "volume": {"type": "integer", "title": "Speaker 音量", "minimum": 0, "maximum": 100,
                            "default": self._volume},
-            }, "required": ["action"], "additionalProperties": False},
+            }, "required": ["action"], "additionalProperties": False,
             "x-action-params": {
                 "start": {"params": ["input_topic"], "description": "连接并开始实时播放 PCM。"},
                 "set_volume": {"params": ["volume"], "description": "设置实时 PCM 音量并请求 Q5 系统音量，0 静音，100 最大。"},
                 "get_volume": {"params": [], "description": "读取当前 speaker 音量和最近一次 XOS 系统音量设置结果。"},
                 "stop": {"params": [], "description": "停止实时播放。"},
                 "info": {"params": [], "description": "查看 speaker 状态。"},
-            },
+            }},
             # Leave the topic unresolved until canvas supplies input_topic.
             "topic_in": [{"format": "audio/pcm-16k"}],
         }
@@ -1132,6 +1132,9 @@ class AudioPlugin:
         self._xos_http_base = str(plugin_config.get("xos_http_base", "http://192.168.8.100:1888")).rstrip("/")
         self._agent_core_url = str(plugin_config.get(
             "agent_core_url", os.environ.get("AGENT_CORE_URL", "https://localhost:15678"))).rstrip("/")
+        self._agent_core_token = str(plugin_config.get(
+            "agent_core_token", os.environ.get(
+                "AGENT_CORE_TOKEN", os.environ.get("AGENT_CORE_ACCESS_TOKEN", ""))))
         self._upload_dir = str(plugin_config.get("agent_core_upload_dir", "/tmp/uploads"))
         self._volume = max(0, min(100, int(plugin_config.get("volume", 50))))
         # XOS chat owns the vendor audio route. Serialize play/launch/quit so
@@ -1313,7 +1316,9 @@ class AudioPlugin:
         query = urllib.parse.urlencode({"path": normalized})
         request = urllib.request.Request(
             f"{self._agent_core_url}/api/file/download?{query}",
-            headers={"Accept": "application/octet-stream"})
+            headers={"Accept": "application/octet-stream",
+                     **({"Authorization": f"Bearer {self._agent_core_token}"}
+                        if self._agent_core_token else {})})
         context = ssl._create_unverified_context() if self._agent_core_url.startswith("https://") else None
         try:
             with urllib.request.urlopen(request, timeout=45.0, context=context) as reply:
