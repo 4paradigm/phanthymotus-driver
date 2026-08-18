@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import struct
 import sys
 import threading
 import time
@@ -44,6 +45,7 @@ class FakeNodes:
         self.last_velocity = None
         self.motion_event_topic = "/host/lynx_m20/motion_events"
         self.events = []
+        self.mapping_events = []
     def publish_motion_event(self, event, **data):
         payload = {"event": event, **data}
         self.events.append(payload)
@@ -60,6 +62,11 @@ class FakeNodes:
         self.last_velocity = ("stopped", reason)
         self.publish_motion_event("motion_stopped", reason=reason)
     def motion_summary(self): return {"state": 17}
+    def begin_mapping_view(self, name): self.mapping_events.append(("begin", name))
+    def mark_mapping_started(self): self.mapping_events.append(("started",))
+    def mark_mapping_saving(self): self.mapping_events.append(("saving",))
+    def finish_mapping_view(self, active_map=None): self.mapping_events.append(("finished", active_map))
+    def fail_mapping_view(self, error): self.mapping_events.append(("failed", str(error)))
 
 
 class LynxM20ContractTests(unittest.TestCase):
@@ -115,7 +122,7 @@ class LynxM20ContractTests(unittest.TestCase):
         tool_def = plugin.get_tool()
         self.assertEqual(("mapping", "actuator"), (tool_def["name"], tool_def["type"]))
         self.assertEqual(
-            {"actions": ["start_mapping", "stop_mapping"], "timeout": 90},
+            {"actions": ["start_mapping", "stop_mapping"], "timeout": 180},
             tool_def["inputSchema"]["x-completion"],
         )
         self.assertEqual(
@@ -138,6 +145,10 @@ class LynxM20ContractTests(unittest.TestCase):
             [("start", "floor_1", False), ("stop",), ("list",)],
             client.calls,
         )
+        self.assertEqual(
+            [("begin", "floor_1"), ("started",), ("saving",), ("finished", None)],
+            plugin.nodes.mapping_events,
+        )
         with self.assertRaisesRegex(ValueError, "boolean"):
             plugin.dispatch("start_mapping", {"map_name": "floor_1", "activate": "false"})
 
@@ -156,6 +167,108 @@ class LynxM20ContractTests(unittest.TestCase):
         self.assertTrue(completed.wait(1))
         self.assertEqual((accepted["action_id"], "failed"), completions[0][:2])
         self.assertIn("ssh failed", completions[0][2]["error"])
+        self.assertEqual(("failed", "ssh failed"), plugin.nodes.mapping_events[-1])
+
+    def test_live_mapping_pointcloud_layout_and_map_transform(self):
+        fields = [
+            SimpleNamespace(name="x", offset=0, datatype=7, count=1),
+            SimpleNamespace(name="y", offset=4, datatype=7, count=1),
+            SimpleNamespace(name="z", offset=8, datatype=7, count=1),
+        ]
+        raw = struct.pack("<fffIfffI", 1.0, 2.0, 3.0, 99, -1.0, 0.5, 0.0, 42)
+        cloud = SimpleNamespace(
+            fields=fields, point_step=16, width=2, height=1,
+            is_bigendian=False, data=raw,
+        )
+        self.assertEqual([(1.0, 2.0, 3.0), (-1.0, 0.5, 0.0)], m20._pointcloud_xyz(cloud))
+
+        half = 2 ** -0.5
+        pose = {"x": 10.0, "y": 20.0, "z": 0.0, "qx": 0.0, "qy": 0.0, "qz": half, "qw": half}
+        transformed = m20._transform_point((1.0, 0.0, 0.0), pose)
+        self.assertAlmostEqual(10.0, transformed[0], places=6)
+        self.assertAlmostEqual(21.0, transformed[1], places=6)
+        self.assertAlmostEqual(0.0, transformed[2], places=6)
+
+    def test_mapping_packet_carries_map_name_and_runtime_metadata(self):
+        metadata = {
+            "version": 3,
+            "state": "live_mapping",
+            "requested_map": "floor_1",
+            "active_map": None,
+        }
+        packet = m20._mapping_packet([(1, 2, 3)], {"x": 4, "y": 5, "yaw": 0.25}, metadata)
+        _, _, _, flags, point_count = struct.unpack_from("<fffBI", packet)
+        self.assertEqual((0x07, 1), (flags, point_count))
+        metadata_offset = 17 + point_count * 12
+        metadata_size = struct.unpack_from("<I", packet, metadata_offset)[0]
+        decoded = json.loads(packet[metadata_offset + 4:metadata_offset + 4 + metadata_size])
+        self.assertEqual("floor_1", decoded["requested_map"])
+        self.assertEqual("live_mapping", decoded["state"])
+
+    def test_live_mapping_callback_accumulates_transformed_points(self):
+        class FakePublisher:
+            def __init__(self): self.messages = []
+            def publish(self, message): self.messages.append(message)
+
+        class FakeUInt8:
+            def __init__(self): self.data = []
+
+        nodes = object.__new__(m20.M20Nodes)
+        nodes.config = {"mapping_visualization": {
+            "voxel_size": 0.08, "max_buffer_points": 100, "max_points": 100, "publish_hz": 100,
+        }}
+        nodes.lock = threading.Lock()
+        nodes.values = {}
+        nodes._mapping_lock = threading.Lock()
+        nodes._mapping_pose = None
+        nodes._mapping_voxels = {}
+        nodes._mapping_last_points = []
+        nodes._mapping_last_grid_msg = None
+        nodes._mapping_uint8_type = FakeUInt8
+        nodes._mapping_last_publish = 0.0
+        nodes._mapping_runtime = {
+            "state": "idle", "requested_map": None, "active_map": None,
+            "source": None, "source_frame": None, "target_frame": "map",
+            "update_count": 0, "point_count": 0, "buffer_point_count": 0,
+            "last_update_time": None,
+        }
+        nodes.mapping_pub = FakePublisher()
+        nodes.begin_mapping_view("floor_2")
+
+        quaternion = SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0)
+        pose = SimpleNamespace(
+            position=SimpleNamespace(x=10.0, y=20.0, z=0.0),
+            orientation=quaternion,
+        )
+        odometry = SimpleNamespace(
+            header=SimpleNamespace(frame_id="map"),
+            pose=SimpleNamespace(pose=pose),
+        )
+        nodes._slam_odometry_callback(odometry)
+
+        fields = [
+            SimpleNamespace(name="x", offset=0, datatype=7, count=1),
+            SimpleNamespace(name="y", offset=4, datatype=7, count=1),
+            SimpleNamespace(name="z", offset=8, datatype=7, count=1),
+        ]
+        cloud = SimpleNamespace(
+            header=SimpleNamespace(frame_id="base_link"), fields=fields,
+            point_step=16, width=1, height=1, is_bigendian=False,
+            data=struct.pack("<fffI", 1.0, 2.0, 3.0, 0),
+        )
+        nodes._live_mapping_callback(FakeUInt8)(cloud)
+
+        self.assertEqual(1, len(nodes.mapping_pub.messages))
+        packet = bytes(nodes.mapping_pub.messages[0].data)
+        _, _, _, flags, count = struct.unpack_from("<fffBI", packet)
+        self.assertEqual((0x07, 1), (flags, count))
+        self.assertEqual((11.0, 22.0, 3.0), struct.unpack_from("<fff", packet, 17))
+        metadata_offset = 17 + count * 12
+        metadata_size = struct.unpack_from("<I", packet, metadata_offset)[0]
+        metadata = json.loads(packet[metadata_offset + 4:metadata_offset + 4 + metadata_size])
+        self.assertEqual(("live_mapping", "floor_2", "grid_map_3d"), (
+            metadata["state"], metadata["requested_map"], metadata["source"],
+        ))
 
     def test_mapping_view_encodes_supported_canvas_packet(self):
         quaternion = SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0)
@@ -175,10 +288,15 @@ class LynxM20ContractTests(unittest.TestCase):
     def test_mapping_view_static_and_dynamic_contract_match(self):
         nodes = FakeNodes()
         nodes.mapping_topic = "/host/lynx_m20/mapping_view"
+        nodes.mapping_view_snapshot = lambda: {
+            "state": "live_mapping", "requested_map": "floor_1", "point_count": 123,
+        }
         plugin = m20.M20MappingViewPlugin(nodes)
         expected = [{"topic": nodes.mapping_topic, "format": "sensor/mapping"}]
         self.assertEqual(expected, plugin.get_tool()["topic_out"])
-        self.assertEqual(expected, plugin.dispatch("info", {})["topic_out"])
+        info = plugin.dispatch("info", {})
+        self.assertEqual(expected, info["topic_out"])
+        self.assertEqual(("live_mapping", "floor_1", 123), (info["state"], info["requested_map"], info["point_count"]))
         self.assertEqual({"state": "idle"}, plugin.dispatch("stop", {}))
 
     def test_mapping_view_supports_live_and_latched_grid_publishers(self):

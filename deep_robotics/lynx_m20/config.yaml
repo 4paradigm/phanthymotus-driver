@@ -24,6 +24,9 @@ mapping:
 mapping_visualization:
   occupied_threshold: 50
   max_points: 50000
+  max_buffer_points: 200000
+  voxel_size: 0.08
+  publish_hz: 2.0
 topics:
   motion_info: "/MOTION_INFO"
   motion_state: "/MOTION_STATE"
@@ -39,3 +42,5 @@ topics:
   joints: "/JOINTS_DATA"
   odometry: "/ODOM"
   grid_map: "/GRID_MAP"
+  grid_map_3d: "/grid_map_3d"
+  slam_odometry: "/SLAM_ODOM"
