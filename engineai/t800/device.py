@@ -2453,8 +2453,8 @@ class HeadActuatorPlugin:
                 {
                     "nod": (["times", "speed"], "点头：下、上、回中，重复指定次数"),
                     "shake": (["times", "speed"], "摇头：左、右、回中，重复指定次数"),
-                    "look": (["direction", "duration"], "看向前、左、右、上或下的预设方向"),
-                    "move_to": (["pitch_deg", "yaw_deg", "duration"], "转到指定俯仰和偏航角度（度）"),
+                    "look": (["direction", "rotation_time"], "看向前、左、右、上或下的预设方向"),
+                    "rotate_to": (["pitch_deg", "yaw_deg", "rotation_time"], "转到指定俯仰和偏航角度（度）"),
                     "reset": ([], "头部回正到 pitch=0、yaw=0"),
                     "status": ([], "查询头部角度和当前动作状态"),
                 },
@@ -2479,10 +2479,10 @@ class HeadActuatorPlugin:
                         "type": "number", "minimum": math.degrees(-self._YAW_LIMIT), "maximum": math.degrees(self._YAW_LIMIT),
                         "description": "-57.30–57.30°，默认 0",
                     },
-                    "duration": {
+                    "rotation_time": {
                         "type": "number", "minimum": 0.05, "maximum": 120.0,
                         "default": self._config.get("step_duration_sec", 0.35),
-                        "description": "秒；0.05–120，默认 0.35",
+                        "description": "旋转执行时间，秒；0.05–120，默认 0.35",
                     },
                 },
                 "头部动作",
@@ -2535,10 +2535,10 @@ class HeadActuatorPlugin:
             if not isinstance(pose, dict):
                 return {"error": "direction must be forward, left, right, up, or down"}
             return self._start_sequence("look", [self._step(pose["pitch_rad"], pose["yaw_rad"], args)], args)
-        if action == "move_to":
+        if action == "rotate_to":
             if "pitch_deg" not in args or "yaw_deg" not in args:
                 return {"error": "pitch_deg and yaw_deg are required"}
-            return self._start_sequence("move_to", [self._step(
+            return self._start_sequence("rotate_to", [self._step(
                 math.radians(float(args["pitch_deg"])), math.radians(float(args["yaw_deg"])), args
             )], args)
         if action == "reset":
@@ -2552,7 +2552,7 @@ class HeadActuatorPlugin:
         return {
             "pitch_rad": clamp(pitch, -self._PITCH_LIMIT, self._PITCH_LIMIT),
             "yaw_rad": clamp(yaw, -self._YAW_LIMIT, self._YAW_LIMIT),
-            "duration": clamp(args.get("duration", self._config.get("step_duration_sec", 0.35)), 0.05, 120.0),
+            "duration": clamp(args.get("rotation_time", self._config.get("step_duration_sec", 0.35)), 0.05, 120.0),
         }
 
     def _sequence_args(self, args: dict) -> tuple[int, float]:
@@ -2570,9 +2570,9 @@ class HeadActuatorPlugin:
         amplitude = float(self._config.get("nod_amplitude_rad", 0.3))
         steps = []
         for _ in range(times):
-            steps.extend([self._step(amplitude, 0.0, {"duration": duration}),
-                          self._step(-amplitude, 0.0, {"duration": duration}),
-                          self._step(0.0, 0.0, {"duration": duration})])
+            steps.extend([self._step(amplitude, 0.0, {"rotation_time": duration}),
+                          self._step(-amplitude, 0.0, {"rotation_time": duration}),
+                          self._step(0.0, 0.0, {"rotation_time": duration})])
         return steps
 
     def _shake_steps(self, args: dict) -> list[dict]:
@@ -2581,9 +2581,9 @@ class HeadActuatorPlugin:
         amplitude = float(self._config.get("shake_amplitude_rad", 0.6))
         steps = []
         for _ in range(times):
-            steps.extend([self._step(0.0, amplitude, {"duration": duration}),
-                          self._step(0.0, -amplitude, {"duration": duration}),
-                          self._step(0.0, 0.0, {"duration": duration})])
+            steps.extend([self._step(0.0, amplitude, {"rotation_time": duration}),
+                          self._step(0.0, -amplitude, {"rotation_time": duration}),
+                          self._step(0.0, 0.0, {"rotation_time": duration})])
         return steps
 
     def _start_sequence(self, action: str, steps: list[dict], args: dict) -> dict:
