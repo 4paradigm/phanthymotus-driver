@@ -264,8 +264,9 @@ class Plugin:
     # ── Tool definition ──────────────────────────────────────────────────
 
     def get_tool(self) -> dict:
-        actions = ["salute", "welcome", "raise", "shake_hands", "high_five", "reset",
-                    "cancel", "stop", "start", "prepare", "info"]
+        actions = ["salute", "welcome", "raise", "shake_hands", "high_five",
+                   "fist_bump", "cross_arms", "reset",
+                   "cancel", "stop", "start", "prepare", "info"]
         one_of_actions = [
             {"const": "start", "title": "检查连接状态"},
             *[{"const": name, "title": label} for name, label in _GESTURE_LABELS.items()],
