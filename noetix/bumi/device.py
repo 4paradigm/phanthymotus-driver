@@ -329,7 +329,11 @@ class LocoPlugin:
     _MOVE_MIN_DURATION_S = 1.0
     _MOVE_DEFAULT_DURATION_S = 2.0
     _MOVE_MAX_DURATION_S = 10.0
-    _MOVE_MIN_NONZERO_AXIS = 0.5
+    _MOVE_MIN_NONZERO_BY_AXIS = {
+        "vx": 0.5,
+        "vy": 0.6,
+        "vyaw": 0.5,
+    }
     _MOVE_CONFIRM_TIMEOUT_S = 2.0
     # Stationary feedback on the tested robot can peak around 0.16 rad/s, while
     # a real low-amplitude gait can start below the former fixed 0.30 rad/s
@@ -400,7 +404,7 @@ class LocoPlugin:
                     "vy": {
                         "type": "number",
                         "default": 0.0,
-                        "description": "default: 0, [-1.0,-0.5]U[0.5,1.0]",
+                        "description": "default: 0, [-1.0,-0.6]U[0.6,1.0]",
                         "minimum": -1, "maximum": 1,
                     },
                     "vyaw": {
@@ -426,7 +430,8 @@ class LocoPlugin:
                             "At least one velocity must be non-zero and the robot must already "
                             "be upright, stable and in walking mode (motion_state must report "
                             "workmode.code=2). If it is not, the card returns an error without "
-                            "sending WALK or velocity commands. For the first low-risk test, use "
+                            "sending WALK or velocity commands. Non-zero vx and vy together "
+                            "request diagonal translation. For the first low-risk test, use "
                             "forward=0.5, lateral=0, turn=0 and duration=2 in a clear area."
                         ),
                     },
@@ -730,19 +735,20 @@ class LocoPlugin:
         vx, vy, vyaw = values["vx"], values["vy"], values["vyaw"]
         duration = values["duration"]
         for field, value in (("vx", vx), ("vy", vy), ("vyaw", vyaw)):
-            if value != 0.0 and abs(value) < self._MOVE_MIN_NONZERO_AXIS:
+            minimum_nonzero = self._MOVE_MIN_NONZERO_BY_AXIS[field]
+            if value != 0.0 and abs(value) < minimum_nonzero:
                 return {
                     "state": "error",
                     "command_sent": False,
                     "error": (
                         f"{field} must be 0 or have an absolute value from "
-                        f"{self._MOVE_MIN_NONZERO_AXIS} to 1.0"
+                        f"{minimum_nonzero} to 1.0"
                     ),
                     "received": args.get(field),
                     "allowed_ranges": [
-                        [-1.0, -self._MOVE_MIN_NONZERO_AXIS],
+                        [-1.0, -minimum_nonzero],
                         [0.0, 0.0],
-                        [self._MOVE_MIN_NONZERO_AXIS, 1.0],
+                        [minimum_nonzero, 1.0],
                     ],
                 }
         if vx == 0.0 and vy == 0.0 and vyaw == 0.0:
@@ -948,13 +954,8 @@ class LocoPlugin:
                     "confirm that locomotion started. Zero velocity was sent."
                 ),
                 "possible_causes": [
-                    (
-                        "The requested normalized velocity may be inside a direction-dependent "
-                        "firmware startup deadband. On the tested robot, forward 0.3 and lateral "
-                        "0.5 could fail to start, while forward 0.5, lateral 0.7 and turn 0.3 "
-                        "started in low-risk tests. Do not assume both signs have identical "
-                        "deadbands."
-                    ),
+                    "The requested normalized velocity may be inside a firmware startup "
+                    "deadband.",
                     "Another Bumi app, driver container, SDK process, or remote controller is "
                     "publishing zero velocity and overriding this driver.",
                     "The firmware reports walking mode but is not accepting this SDK client's "
