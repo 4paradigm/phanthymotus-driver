@@ -4,6 +4,7 @@ import tempfile
 import threading
 import time
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 
@@ -11,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from control import (  # noqa: E402
+    T800_JOINT_POSITION_LIMITS,
     T800_JOINT_NAMES,
     RepeatingCommand,
     action_schema,
@@ -19,6 +21,7 @@ from control import (  # noqa: E402
     joint_payload,
     sensor_tool,
     validate_joint_indices,
+    validate_joint_positions,
 )
 from native_sdk import NativeSdkManager  # noqa: E402
 
@@ -29,6 +32,7 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(25, len(set(T800_JOINT_NAMES)))
         self.assertEqual("J00_HIP_PITCH_L", T800_JOINT_NAMES[0])
         self.assertEqual("J24_HEAD_YAW", T800_JOINT_NAMES[-1])
+        self.assertEqual(25, len(T800_JOINT_POSITION_LIMITS))
 
     def test_joint_payload_uses_official_index_mapping(self):
         payload = joint_payload([0.1, 0.2], [1.0, 2.0], [3.0, 4.0], timestamp_ms=123)
@@ -66,6 +70,28 @@ class ValidationTests(unittest.TestCase):
             validate_joint_indices([25])
         with self.assertRaisesRegex(ValueError, "integers"):
             validate_joint_indices([1.5])
+
+    def test_joint_positions_enforce_urdf_limits_and_margin(self):
+        indices, positions = validate_joint_positions(
+            [13, 16], [-1.2, -1.8], limit_margin_rad=0.02
+        )
+        self.assertEqual([13, 16], indices)
+        self.assertEqual([-1.2, -1.8], positions)
+        with self.assertRaisesRegex(ValueError, "J16_ELBOW_PITCH_L"):
+            validate_joint_positions([16], [-2.28], limit_margin_rad=0.02)
+
+    def test_joint_position_limits_match_vendored_urdf(self):
+        root = ET.parse(ROOT / "resource" / "serial_t800.urdf").getroot()
+        urdf_limits = {
+            joint.attrib["name"]: (
+                float(joint.find("limit").attrib["lower"]),
+                float(joint.find("limit").attrib["upper"]),
+            )
+            for joint in root.findall("joint")
+            if joint.find("limit") is not None
+        }
+        for index, name in enumerate(T800_JOINT_NAMES):
+            self.assertEqual(urdf_limits[name], T800_JOINT_POSITION_LIMITS[index])
 
     def test_action_schema_splits_action_parameters(self):
         schema = action_schema(
