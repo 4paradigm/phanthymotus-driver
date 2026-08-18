@@ -610,6 +610,7 @@ class DevicePluginContractTests(unittest.TestCase):
         actions = set(schema["properties"]["action"]["enum"])
         self.assertTrue({"start", "info", "stop"}.issubset(actions))
         self.assertNotIn("wait", schema["properties"])
+        self.assertEqual(gesture._MAX_SEQUENCE_STEPS, schema["properties"]["steps"]["maxItems"])
         rejected = gesture.dispatch("sequence", {
             "steps": [{"joint_indices": [23], "target_positions": [0.0]}],
             "wait": True,
@@ -650,6 +651,76 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual(result["action_id"], completions[0][0])
         self.assertEqual("completed", completions[0][1])
         self.assertEqual(request_id, completions[0][2]["request_id"])
+
+    def test_gesture_reset_fails_when_exact_request_is_superseded(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        gesture = self.device.GesturePlugin(plan)
+        completions = []
+        gesture._acp_notify = lambda action_id, status, result: completions.append(
+            (action_id, status, result)
+        )
+        result = gesture.dispatch("sequence", {
+            "steps": [{"joint_indices": [23], "target_positions": [0.1], "duration": 0.05}],
+            "reset_after": True,
+            "force": True,
+        })
+
+        deadline = time.monotonic() + 1.0
+        while not plan._publisher.messages and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertTrue(plan._publisher.messages)
+        step_request_id = plan._publisher.messages[-1].request_id
+        plan._on_state(JointMotionPlanState(
+            step_request_id, JointMotionPlanState.EXECUTING, 0.5
+        ))
+        plan._on_state(JointMotionPlanState(
+            step_request_id, JointMotionPlanState.IDLE, 1.0
+        ))
+
+        deadline = time.monotonic() + 1.0
+        while len(plan._publisher.messages) < 2 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertGreaterEqual(len(plan._publisher.messages), 2)
+        reset_request = plan._publisher.messages[-1]
+        self.assertEqual(JointMotionPlanRequest.REQUEST_RESET, reset_request.request_type)
+        plan._on_state(JointMotionPlanState(
+            reset_request.request_id + 1, JointMotionPlanState.IDLE, 1.0
+        ))
+        gesture._thread.join(timeout=1.0)
+
+        status = gesture.dispatch("status", {})
+        self.assertEqual("error", status["state"])
+        self.assertIn("superseded", status["error"])
+        self.assertEqual(result["action_id"], completions[0][0])
+        self.assertEqual("error", completions[0][1])
+
+    def test_gesture_rejects_sequence_beyond_acp_runtime_budget(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        gesture = self.device.GesturePlugin(plan)
+        long_step = {
+            "joint_indices": [23],
+            "target_positions": [0.1],
+            "duration": 120.0,
+            "hold_after_sec": 30.0,
+        }
+        over_budget = gesture.dispatch("sequence", {
+            "steps": [long_step, long_step],
+            "reset_after": False,
+            "force": True,
+        })
+        self.assertIn("exceeds ACP completion timeout", over_budget["error"])
+        self.assertNotIn("action_id", over_budget)
+        self.assertIsNone(gesture._thread)
+
+        too_many = gesture.dispatch("sequence", {
+            "steps": [long_step] * (gesture._MAX_SEQUENCE_STEPS + 1),
+            "reset_after": False,
+            "force": True,
+        })
+        self.assertIn("cannot contain more than", too_many["error"])
+        self.assertIsNone(gesture._thread)
 
     def test_gesture_stop_preserves_cancelled_and_reports_acp(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
