@@ -1,10 +1,13 @@
 import importlib.util
+import json
+import os
 import struct
 import sys
 import threading
 import time
 import types
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
@@ -594,6 +597,151 @@ class DevicePluginContractTests(unittest.TestCase):
         })
         self.assertEqual("completed", result["state"])
         self.assertEqual([23, 24], plan._publisher.messages[-1].joint_indices)
+
+    def test_gesture_declares_async_completion_and_lifecycle_actions(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        gesture = self.device.GesturePlugin(plan)
+        schema = gesture.get_tool()["inputSchema"]
+        self.assertEqual(["play", "sequence"], schema["x-completion"]["actions"])
+        self.assertGreaterEqual(schema["x-completion"]["timeout"], 60)
+        actions = set(schema["properties"]["action"]["enum"])
+        self.assertTrue({"start", "info", "stop"}.issubset(actions))
+
+    def test_gesture_async_acp_uses_real_planner_state_transitions(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        gesture = self.device.GesturePlugin(plan)
+        completions = []
+        gesture._acp_notify = lambda action_id, status, result: completions.append(
+            (action_id, status, result)
+        )
+
+        result = gesture.dispatch("sequence", {
+            "steps": [{"joint_indices": [23], "target_positions": [0.1], "duration": 0.05}],
+            "reset_after": False,
+            "wait": False,
+            "force": True,
+        })
+        self.assertEqual("running", result["state"])
+        self.assertTrue(result["action_id"].startswith("t800_gesture_"))
+
+        deadline = time.monotonic() + 1.0
+        while not plan._publisher.messages and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertTrue(plan._publisher.messages)
+        request_id = plan._publisher.messages[-1].request_id
+        plan._on_state(JointMotionPlanState(request_id, JointMotionPlanState.EXECUTING, 0.5))
+        plan._on_state(JointMotionPlanState(request_id, JointMotionPlanState.IDLE, 1.0))
+        gesture._thread.join(timeout=1.0)
+
+        self.assertFalse(gesture._thread.is_alive())
+        self.assertEqual("completed", gesture.dispatch("status", {})["state"])
+        self.assertEqual(result["action_id"], completions[0][0])
+        self.assertEqual("completed", completions[0][1])
+        self.assertEqual(request_id, completions[0][2]["request_id"])
+
+    def test_gesture_stop_preserves_cancelled_and_reports_acp(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        entered_wait = threading.Event()
+        release_wait = threading.Event()
+        plan.wait_until_idle = lambda *_args, **_kwargs: {}
+
+        def wait_for_request(*_args, **_kwargs):
+            entered_wait.set()
+            release_wait.wait(timeout=1.0)
+            return {}
+
+        plan.wait_for_request = wait_for_request
+        gesture = self.device.GesturePlugin(plan)
+        completions = []
+        gesture._acp_notify = lambda action_id, status, result: completions.append(
+            (action_id, status, result)
+        )
+        result = gesture.dispatch("sequence", {
+            "steps": [{"joint_indices": [23], "target_positions": [0.1], "duration": 0.05}],
+            "reset_after": False,
+            "wait": False,
+            "force": True,
+        })
+        self.assertTrue(entered_wait.wait(timeout=1.0))
+        busy = gesture.dispatch("sequence", {
+            "steps": [{"joint_indices": [23], "target_positions": [0.0]}],
+            "wait": False,
+            "force": True,
+        })
+        self.assertIn("already running", busy["error"])
+        self.assertNotIn("action_id", busy)
+        stopped = gesture.dispatch("stop_gesture", {})
+        self.assertEqual("cancelled", stopped["state"])
+        release_wait.set()
+        gesture._thread.join(timeout=1.0)
+
+        self.assertEqual("cancelled", gesture.dispatch("status", {})["state"])
+        self.assertEqual(result["action_id"], completions[0][0])
+        self.assertEqual("cancelled", completions[0][1])
+        self.assertEqual({"state": "idle"}, gesture.dispatch("stop", {}))
+
+    def test_gesture_async_error_reports_acp(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        plan.wait_until_idle = lambda *_args, **_kwargs: {}
+        plan.wait_for_request = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("planner failed")
+        )
+        gesture = self.device.GesturePlugin(plan)
+        completions = []
+        gesture._acp_notify = lambda action_id, status, result: completions.append(
+            (action_id, status, result)
+        )
+        result = gesture.dispatch("sequence", {
+            "steps": [{"joint_indices": [23], "target_positions": [0.1], "duration": 0.05}],
+            "reset_after": False,
+            "wait": False,
+            "force": True,
+        })
+        gesture._thread.join(timeout=1.0)
+
+        self.assertEqual(result["action_id"], completions[0][0])
+        self.assertEqual("error", completions[0][1])
+        self.assertIn("planner failed", completions[0][2]["error"])
+
+    def test_gesture_acp_notify_posts_completion_payload(self):
+        received = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                received.append((self.path, json.loads(self.rfile.read(length))))
+                self.send_response(204)
+                self.end_headers()
+
+            def log_message(self, _format, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        previous = os.environ.get("AGENT_CORE_URL")
+        os.environ["AGENT_CORE_URL"] = f"http://127.0.0.1:{server.server_port}"
+        try:
+            self.device.GesturePlugin._acp_notify(
+                "t800_gesture_test", "completed", {"gesture": "wave_hands"}
+            )
+        finally:
+            if previous is None:
+                os.environ.pop("AGENT_CORE_URL", None)
+            else:
+                os.environ["AGENT_CORE_URL"] = previous
+            server.shutdown()
+            server.server_close()
+
+        self.assertEqual("/api/acp/complete", received[0][0])
+        payload = received[0][1]
+        self.assertEqual("t800_gesture_test", payload["action_id"])
+        self.assertEqual("completed", payload["status"])
+        self.assertEqual("gesture", payload["tool"])
+        self.assertEqual("wave_hands", payload["result"]["gesture"])
 
     def test_gesture_uses_validated_real_device_trajectories(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)

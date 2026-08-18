@@ -2431,34 +2431,39 @@ class GesturePlugin:
         }
 
     def get_tool(self) -> dict:
+        schema = action_schema(
+            _with_lifecycle({
+                "list": ([], "列出内置手势及步数"),
+                "play": (["name", "repetitions", "reset_after", "wait", "force"], "播放一次实机验证手势"),
+                "sequence": (["steps", "reset_after", "wait", "force"], "执行经过关节限位校验的自定义序列"),
+                "stop_gesture": (["reset_after"], "取消当前步骤并停止手势"),
+                "status": ([], "查询手势、步骤和错误"),
+            }),
+            {
+                "name": {"type": "string", "enum": list(self._GESTURES)},
+                "repetitions": {"type": "integer", "minimum": 1, "maximum": 1,
+                                "description": "安全限制：内置手势每次只执行一次"},
+                "reset_after": {"type": "boolean"},
+                "wait": {"type": "boolean", "description": "等待整套动作完成"},
+                "force": {"type": "boolean", "description": "忽略 lower_body_balance 状态门禁"},
+                "steps": {
+                    "type": "array",
+                    "description": "每步支持 joint_indices 或 joint_names、target_positions、duration、hold_after_sec、stiffness、damping",
+                    "items": {"type": "object"},
+                },
+            },
+            "手势动作",
+        )
+        schema["x-completion"] = {
+            "actions": ["play", "sequence"],
+            "timeout": 300,
+        }
         return {
             "name": "gesture",
             "type": "actuator",
             "multiInstance": False,
             "description": "T800 完整多步手势编排；内置官方挥手和握手序列，也支持任意关节动作队列",
-            "inputSchema": action_schema(
-                {
-                    "list": ([], "列出内置手势及步数"),
-                    "play": (["name", "repetitions", "reset_after", "wait", "force"], "播放一次实机验证手势"),
-                    "sequence": (["steps", "reset_after", "wait", "force"], "执行经过关节限位校验的自定义序列"),
-                    "stop_gesture": (["reset_after"], "取消当前步骤并停止手势"),
-                    "status": ([], "查询手势、步骤和错误"),
-                },
-                {
-                    "name": {"type": "string", "enum": list(self._GESTURES)},
-                    "repetitions": {"type": "integer", "minimum": 1, "maximum": 1,
-                                    "description": "安全限制：内置手势每次只执行一次"},
-                    "reset_after": {"type": "boolean"},
-                    "wait": {"type": "boolean", "description": "等待整套动作完成"},
-                    "force": {"type": "boolean", "description": "忽略 lower_body_balance 状态门禁"},
-                    "steps": {
-                        "type": "array",
-                        "description": "每步支持 joint_indices 或 joint_names、target_positions、duration、hold_after_sec、stiffness、damping",
-                        "items": {"type": "object"},
-                    },
-                },
-                "手势动作",
-            ),
+            "inputSchema": schema,
         }
 
     def start(self) -> None:
@@ -2494,7 +2499,10 @@ class GesturePlugin:
                         0.0, self._COOLDOWN_SEC - (time.monotonic() - self._last_finished_at)
                     )
                 return result
-        if action in ("stop", "stop_gesture"):
+        if action == "stop":
+            self._stop(reset_after=bool(args.get("reset_after", False)))
+            return {"state": "idle"}
+        if action == "stop_gesture":
             return self._stop(reset_after=bool(args.get("reset_after", False)))
         if action == "play":
             name = str(args.get("name", ""))
@@ -2595,12 +2603,19 @@ class GesturePlugin:
     def _start_sequence(self, label: str, steps: list[dict], *, reset_after: bool, wait: bool) -> dict:
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
-                return {"error": "another gesture sequence is already running", **self._status}
+                current = dict(self._status)
+                current.pop("action_id", None)
+                return {**current, "error": "another gesture sequence is already running"}
+            action_id = None
+            if not wait:
+                from uuid import uuid4
+
+                action_id = f"t800_gesture_{uuid4().hex[:12]}"
             self._cancel = threading.Event()
             self._status = {
                 "state": "running", "gesture": label, "step": 0,
                 "step_name": None, "total_steps": len(steps),
-                "request_id": None, "error": None,
+                "request_id": None, "action_id": action_id, "error": None,
             }
 
         def run() -> None:
@@ -2644,7 +2659,11 @@ class GesturePlugin:
                         minimum_request_id=request_id,
                     )
                 with self._lock:
-                    self._status["state"] = "completed"
+                    if self._cancel.is_set() or self._status.get("state") == "cancelled":
+                        self._status["state"] = "cancelled"
+                        self._status["error"] = ""
+                    else:
+                        self._status["state"] = "completed"
             except Exception as exc:
                 cancelled = self._cancel.is_set()
                 if request_id is not None:
@@ -2655,6 +2674,17 @@ class GesturePlugin:
             finally:
                 with self._lock:
                     self._last_finished_at = time.monotonic()
+                    final_status = str(self._status.get("state", "error"))
+                    final_result = {
+                        "gesture": label,
+                        "step": self._status.get("step"),
+                        "step_name": self._status.get("step_name"),
+                        "total_steps": self._status.get("total_steps"),
+                        "request_id": self._status.get("request_id"),
+                        "error": self._status.get("error"),
+                    }
+                if action_id is not None:
+                    self._acp_notify(action_id, final_status, final_result)
 
         thread = threading.Thread(target=run, daemon=True, name="t800-gesture-sequence")
         with self._lock:
@@ -2664,19 +2694,63 @@ class GesturePlugin:
             thread.join()
             with self._lock:
                 return dict(self._status)
-        return {"state": "running", "gesture": label, "total_steps": len(steps)}
+        return {
+            "state": "running",
+            "gesture": label,
+            "total_steps": len(steps),
+            "action_id": action_id,
+        }
 
     def _stop(self, *, reset_after: bool) -> dict:
-        self._cancel.set()
         with self._lock:
-            request_id = self._status.get("request_id")
+            active = (
+                self._status.get("state") == "running"
+                and self._thread is not None
+                and self._thread.is_alive()
+            )
+            if active:
+                self._cancel.set()
+                self._status["state"] = "cancelled"
+                self._status["error"] = ""
+                request_id = self._status.get("request_id")
+            else:
+                request_id = None
+            result = dict(self._status)
         if request_id is not None:
             self._joint_plan.dispatch("cancel", {"request_id": request_id})
         if reset_after:
             self._joint_plan.dispatch("reset", {})
-        with self._lock:
-            self._status["state"] = "cancelled"
-            return dict(self._status)
+        return result
+
+    @staticmethod
+    def _acp_notify(action_id: str, status: str, result: dict) -> None:
+        """Report asynchronous gesture completion to Agent Core."""
+        import json as _json
+        import os as _os
+        import ssl as _ssl
+        import urllib.request as _urllib
+
+        agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+        context = _ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = _ssl.CERT_NONE
+        payload = _json.dumps({
+            "action_id": action_id,
+            "status": status,
+            "result": result,
+            "tool": "gesture",
+            "ts": time.time(),
+        }).encode()
+        try:
+            request = _urllib.Request(
+                f"{agent_core_url}/api/acp/complete",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            _urllib.urlopen(request, timeout=5, context=context)
+        except Exception as exc:
+            print(f"[gesture] ACP callback failed for {action_id}: {exc}", flush=True)
 
 
 class _JointStreamBase:
