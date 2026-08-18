@@ -57,6 +57,7 @@ COPY hand_control.py /work/hand_control.py
 COPY hand_gesture.py /work/hand_gesture.py
 COPY arm_gesture.py /work/arm_gesture.py
 COPY head_control.py /work/head_control.py
+COPY waist.py /work/waist.py
 COPY mic.py /work/mic.py
 COPY speaker.py /work/speaker.py
 COPY audio.py /work/audio.py
@@ -69,6 +70,8 @@ COPY q5_media_bridge.py /work/q5_media_bridge.py
 COPY odom.py /work/odom.py
 COPY teleop_state.py /work/teleop_state.py
 COPY robot_status.py /work/robot_status.py
+COPY grasp.py /work/grasp.py
+COPY trajectory.py /work/trajectory.py
 COPY config.yaml /work/config.yaml
 COPY resource/q5_model.urdf /work/resource/q5_model.urdf
 COPY resource/fastdds_udp_only.xml /work/resource/fastdds_udp_only.xml
