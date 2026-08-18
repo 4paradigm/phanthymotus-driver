@@ -3,9 +3,13 @@
 
 from __future__ import annotations
 
+import json
 import math
+import os
+import ssl
 import threading
 import time
+import urllib.request
 
 from body_command import get_router as _get_body_router, BodyCommandRouter
 from control_contract import q5_active_status, q5_is_control_ready
@@ -25,6 +29,32 @@ NODE = "q5_waist_gesture"
 DESC = "Q5 腰部语义手势：扭腰致意、左右摆腰、画圈，由 waist_control 绝对关节插补驱动"
 
 WAIST_JOINT = "waist_yaw_joint"
+
+
+def _acp_notify(action_id: str, status: str, result: dict, tool: str = ""):
+    """POST action completion to Agent Core (module-level ACP helper)."""
+    agent_core_url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    payload = json.dumps({
+        "action_id": action_id,
+        "status": status,
+        "result": result,
+        "tool": tool,
+        "ts": time.time(),
+    }).encode()
+    try:
+        req = urllib.request.Request(
+            f"{agent_core_url}/api/acp/complete",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=5, context=ctx)
+    except Exception:
+        pass  # ACP failure must not block gesture execution
+
 
 # ── Gesture definitions (degrees) ────────────────────────────────────────────
 # waist_yaw range: [-90, 90] degrees (URDF: -1.57~1.57 rad)
@@ -78,8 +108,8 @@ def _build_frames(gesture: str, cycles: int) -> list:
             frames.append(([angle], 0.35, 0.85))
         frames.append((_NEUTRAL_DEG, 0.5, 1.0))
     elif gesture == "circle":
-        # 画圈：分8个相位点
-        for i in range(8):
+        # 画圈：8 个相位点 × cycles 圈
+        for i in range(cycles * 8):
             angle = int(30 * math.sin(2 * math.pi * i / 8))
             frames.append(([angle], 0.2, 0.9))
         frames.append((_NEUTRAL_DEG, 0.5, 1.0))
@@ -329,9 +359,18 @@ class Plugin:
                 if not stop_event.wait(delay):
                     pass
             cancelled = False
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[waist_gesture] _run_move error: {e}", flush=True)
         finally:
+            # ACP completion callback
+            if action_id:
+                if cancelled and not stop_event.is_set():
+                    _acp_notify(action_id, "error", {"gesture": gesture, "error": "unexpected_failure"}, CARD)
+                elif stop_event.is_set():
+                    _acp_notify(action_id, "cancelled", {"gesture": gesture}, CARD)
+                else:
+                    _acp_notify(action_id, "completed", {"gesture": gesture}, CARD)
+
             with self._lock:
                 if self._status.get("state") != "error":
                     self._status["state"] = "idle"
