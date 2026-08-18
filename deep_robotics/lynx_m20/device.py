@@ -4,8 +4,15 @@
 from __future__ import annotations
 
 import json
+import math
+import os
+import ssl
+import struct
 import threading
 import time
+import urllib.request
+from array import array
+from uuid import uuid4
 
 from basic_server import BasicServerClient
 from common.vendor_runtime import action_schema, jsonable, tool
@@ -16,12 +23,91 @@ GAITS = {"basic": 0x1001, "standard_stairs": 0x1003, "agile_flat": 0x3002, "agil
 MOTION_STATES = {"idle": 0, "stand": 1, "soft_estop": 2, "damping": 3, "lie": 4, "rl_control": 17}
 
 
+def _acp_notify(action_id: str, status: str, result: dict, tool_name: str = "mapping") -> None:
+    """Report an asynchronous tool result to Agent Core's completion endpoint."""
+    agent_core_url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    payload = json.dumps({
+        "action_id": action_id,
+        "status": status,
+        "result": result,
+        "tool": tool_name,
+        "ts": time.time(),
+    }).encode()
+    try:
+        request = urllib.request.Request(
+            f"{agent_core_url}/api/acp/complete",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(request, timeout=5, context=context)
+    except Exception as exc:
+        print(f"[ACP] mapping callback failed for {action_id}: {exc}", flush=True)
+
+
+def _yaw_from_quaternion(quaternion) -> float:
+    x = float(getattr(quaternion, "x", 0.0))
+    y = float(getattr(quaternion, "y", 0.0))
+    z = float(getattr(quaternion, "z", 0.0))
+    w = float(getattr(quaternion, "w", 1.0))
+    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
+def encode_occupancy_grid(msg, pose=None, *, occupied_threshold=50, max_points=50000) -> bytes:
+    """Convert nav_msgs/OccupancyGrid into the Canvas sensor/mapping v2 packet."""
+    width = int(msg.info.width)
+    height = int(msg.info.height)
+    resolution = float(msg.info.resolution)
+    if width <= 0 or height <= 0 or resolution <= 0 or len(msg.data) < width * height:
+        raise ValueError("invalid occupancy grid dimensions")
+
+    if not 0 <= occupied_threshold <= 100:
+        raise ValueError("occupied_threshold must be between 0 and 100")
+    if max_points <= 0:
+        raise ValueError("max_points must be positive")
+    cell_count = width * height
+    occupied_count = sum(1 for value in msg.data[:cell_count] if int(value) >= occupied_threshold)
+    stride = max(1, math.ceil(occupied_count / max_points))
+    origin = msg.info.origin
+    origin_yaw = _yaw_from_quaternion(origin.orientation)
+    cos_yaw, sin_yaw = math.cos(origin_yaw), math.sin(origin_yaw)
+    points = array("f")
+    occupied_index = 0
+    for index, value in enumerate(msg.data[:cell_count]):
+        if int(value) < occupied_threshold:
+            continue
+        selected = occupied_index % stride == 0
+        occupied_index += 1
+        if not selected:
+            continue
+        column, row = index % width, index // width
+        local_x = (column + 0.5) * resolution
+        local_y = (row + 0.5) * resolution
+        points.extend((
+            float(origin.position.x) + cos_yaw * local_x - sin_yaw * local_y,
+            float(origin.position.y) + sin_yaw * local_x + cos_yaw * local_y,
+            0.0,
+        ))
+    if points.itemsize != 4:
+        raise RuntimeError("sensor/mapping requires 32-bit floats")
+    if os.sys.byteorder != "little":
+        points.byteswap()
+    robot_x = float((pose or {}).get("x", 0.0))
+    robot_y = float((pose or {}).get("y", 0.0))
+    robot_yaw = -float((pose or {}).get("yaw", 0.0))
+    point_count = len(points) // 3
+    return struct.pack("<fffBI", robot_x, robot_y, robot_yaw, 0x03, point_count) + points.tobytes()
+
+
 class M20Nodes:
     def __init__(self, config, namespace, ros2):
         from drdds.msg import Gait, JointsData, MotionInfo, MotionState, NavCmd, NavSat, StdMsgInt32, StdStatus
-        from nav_msgs.msg import Odometry
+        from nav_msgs.msg import OccupancyGrid, Odometry
         from sensor_msgs.msg import Imu, PointCloud2
-        from std_msgs.msg import String
+        from std_msgs.msg import String, UInt8MultiArray
         from rclpy.node import Node
 
         self.config = config
@@ -42,6 +128,7 @@ class M20Nodes:
         self._header_lock = threading.Lock()
         self.values = {}
         self.streams = {}
+        self._mapping_pose = None
         self.frame_id = 0
         self.native_velocity_command = 25
         self._motion_condition = threading.Condition(threading.Lock())
@@ -89,9 +176,25 @@ class M20Nodes:
                 depth,
             )
             self.streams[key] = {"robot_topic": robot_topic, "topic": core_topic, "format": fmt}
+        if self.is_pro:
+            self.mapping_topic = f"/{namespace}/lynx_m20/mapping_view"
+            self.mapping_pub = self.core.create_publisher(UInt8MultiArray, self.mapping_topic, 1)
+            self.robot.create_subscription(
+                OccupancyGrid,
+                topics.get("grid_map", "/GRID_MAP"),
+                self._mapping_callback(UInt8MultiArray),
+                1,
+            )
 
     def _callback(self, key, publisher, *, as_json=False, string_type=None):
         def callback(msg):
+            if key == "odometry":
+                pose = msg.pose.pose
+                self._mapping_pose = {
+                    "x": float(pose.position.x),
+                    "y": float(pose.position.y),
+                    "yaw": _yaw_from_quaternion(pose.orientation),
+                }
             if key.startswith("lidar"):
                 header = getattr(msg, "header", None)
                 value = {"received": True, "frame_id": getattr(header, "frame_id", ""), "timestamp": time.time()}
@@ -119,6 +222,32 @@ class M20Nodes:
                     previous = self._last_gait
                     self._last_gait = gait
                     self.publish_motion_event("gait_changed", previous=previous, current=gait, confirmed=True)
+        return callback
+
+    def _mapping_callback(self, uint8_type):
+        def callback(msg):
+            try:
+                config = self.config.get("mapping_visualization", {})
+                payload = encode_occupancy_grid(
+                    msg,
+                    self._mapping_pose,
+                    occupied_threshold=int(config.get("occupied_threshold", 50)),
+                    max_points=int(config.get("max_points", 50000)),
+                )
+                output = uint8_type()
+                try:
+                    output.data = array("B", payload)
+                except TypeError:
+                    output.data = list(payload)
+                self.mapping_pub.publish(output)
+                with self.lock:
+                    self.values["mapping_view"] = {
+                        "received": True,
+                        "points": struct.unpack_from("<I", payload, 13)[0],
+                        "timestamp": time.time(),
+                    }
+            except Exception as exc:
+                print(f"[mapping_view] skipped invalid grid: {exc}", flush=True)
         return callback
 
     def publish_motion_event(self, event: str, **data) -> dict:
@@ -534,12 +663,14 @@ class M20ProNavigationPlugin:
 
 
 class M20ProMappingPlugin:
-    def __init__(self, nodes, client=None):
+    def __init__(self, nodes, client=None, notifier=None):
         self.nodes = nodes
         self.client = client or NOSMappingClient(nodes.config.get("mapping", {}))
+        self.notifier = notifier or _acp_notify
+        self._operation_lock = threading.Lock()
 
     def get_tool(self):
-        return tool("mapping", "actuator", "仅 M20 Pro：通过 NOS 的 drmap 开始、保存建图并查询地图状态", action_schema(
+        schema = action_schema(
             {
                 "start_mapping": (["map_name", "activate"], "开始新地图建图；需人工遥控机器人巡视环境"),
                 "stop_mapping": ([], "停止建图并保存地图"),
@@ -553,10 +684,46 @@ class M20ProMappingPlugin:
                 },
                 "activate": {"type": "boolean", "default": True},
             },
-        ))
+        )
+        schema["x-completion"] = {"actions": ["start_mapping", "stop_mapping"], "timeout": 90}
+        return tool("mapping", "actuator", "仅 M20 Pro：通过 NOS 的 drmap 开始、保存建图并查询地图状态", schema)
 
     def start(self): pass
     def stop(self): pass
+
+    def _run_operation(self, action_id, action, kwargs):
+        try:
+            with self._operation_lock:
+                if action == "start_mapping":
+                    result = self.client.start_mapping(**kwargs)
+                    expected_state = "mapping"
+                else:
+                    result = self.client.stop_mapping()
+                    expected_state = "idle"
+                deadline = time.monotonic() + 15
+                while True:
+                    status = self.client.status()
+                    if status.get("state") == expected_state:
+                        break
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(
+                            f"mapping service did not reach {expected_state}: {status}"
+                        )
+                    time.sleep(0.5)
+                result["status"] = status
+            self.notifier(action_id, "completed", result, "mapping")
+        except Exception as exc:
+            self.notifier(action_id, "failed", {"error": str(exc), "action": action}, "mapping")
+
+    def _start_operation(self, action, **kwargs):
+        action_id = f"m20_mapping_{uuid4().hex[:12]}"
+        threading.Thread(
+            target=self._run_operation,
+            args=(action_id, action, kwargs),
+            daemon=True,
+            name=f"{action}-{action_id[-6:]}",
+        ).start()
+        return {"state": "accepted", "action": action, "action_id": action_id}
 
     def dispatch(self, action, args):
         if action == "start":
@@ -566,9 +733,13 @@ class M20ProMappingPlugin:
         if action == "info":
             return {"state": "ready"}
         if action == "start_mapping":
-            return self.client.start_mapping(args["map_name"], activate=bool(args.get("activate", True)))
+            map_name = self.client.validate_map_name(args.get("map_name"))
+            activate = args.get("activate", True)
+            if not isinstance(activate, bool):
+                raise ValueError("activate 必须是 boolean")
+            return self._start_operation("start_mapping", map_name=map_name, activate=activate)
         if action == "stop_mapping":
-            return self.client.stop_mapping()
+            return self._start_operation("stop_mapping")
         if action == "status":
             return self.client.status()
         if action == "list_maps":
@@ -576,11 +747,36 @@ class M20ProMappingPlugin:
         raise ValueError(f"unsupported mapping action: {action}")
 
 
+class M20MappingViewPlugin:
+    def __init__(self, nodes):
+        self.nodes = nodes
+        self.topic_out = [{"topic": nodes.mapping_topic, "format": "sensor/mapping"}]
+
+    def get_tool(self):
+        return tool(
+            "mapping_view",
+            "sensor",
+            "仅 M20 Pro：将 /GRID_MAP 占据栅格和 /ODOM 位姿转换为 Canvas 建图结果视图",
+            topic_out=self.topic_out,
+        )
+
+    def start(self): pass
+    def stop(self): pass
+
+    def dispatch(self, action, args):
+        if action == "stop":
+            return {"state": "idle"}
+        if action in ("start", "info"):
+            return {"state": "ready", "topic_out": self.topic_out}
+        raise ValueError(f"unsupported mapping_view action: {action}")
+
+
 def build_plugins(config, namespace, ros2):
     nodes = M20Nodes(config, namespace, ros2)
     plugins = [M20StatePlugin(nodes), M20MotionPlugin(nodes), M20MotionEventsPlugin(nodes), M20ChargePlugin(nodes), M20DevicePlugin(nodes)]
     if nodes.is_pro:
         plugins.append(M20ProNavigationPlugin(nodes))
+        plugins.append(M20MappingViewPlugin(nodes))
         if config.get("mapping", {}).get("enabled", False):
             plugins.append(M20ProMappingPlugin(nodes))
     return plugins

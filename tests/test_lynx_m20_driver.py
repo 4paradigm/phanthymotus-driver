@@ -7,6 +7,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -96,17 +97,27 @@ class LynxM20ContractTests(unittest.TestCase):
 
     def test_mapping_card_uses_only_documented_drmap_commands(self):
         class FakeMappingClient:
-            def __init__(self): self.calls = []
-            def start_mapping(self, name, activate=True):
-                self.calls.append(("start", name, activate)); return {"state": "mapping"}
-            def stop_mapping(self): self.calls.append(("stop",)); return {"state": "saved"}
-            def status(self): self.calls.append(("status",)); return {"state": "idle"}
+            def __init__(self): self.calls = []; self.state = "idle"
+            def validate_map_name(self, name): return nos_mapping.NOSMappingClient.validate_map_name(name)
+            def start_mapping(self, map_name, activate=True):
+                self.calls.append(("start", map_name, activate)); self.state = "mapping"; return {"state": "mapping"}
+            def stop_mapping(self): self.calls.append(("stop",)); self.state = "idle"; return {"state": "saved"}
+            def status(self): return {"state": self.state}
             def list_maps(self): self.calls.append(("list",)); return {"maps": []}
 
         client = FakeMappingClient()
-        plugin = m20.M20ProMappingPlugin(FakeNodes(), client=client)
+        completions = []
+        completed = threading.Event()
+        def notify(*args):
+            completions.append(args)
+            completed.set()
+        plugin = m20.M20ProMappingPlugin(FakeNodes(), client=client, notifier=notify)
         tool_def = plugin.get_tool()
         self.assertEqual(("mapping", "actuator"), (tool_def["name"], tool_def["type"]))
+        self.assertEqual(
+            {"actions": ["start_mapping", "stop_mapping"], "timeout": 90},
+            tool_def["inputSchema"]["x-completion"],
+        )
         self.assertEqual(
             ["map_name", "activate"],
             tool_def["inputSchema"]["x-action-params"]["start_mapping"]["params"],
@@ -114,14 +125,61 @@ class LynxM20ContractTests(unittest.TestCase):
         self.assertEqual({"state": "ready"}, plugin.dispatch("start", {}))
         self.assertEqual({"state": "idle"}, plugin.dispatch("stop", {}))
         self.assertEqual({"state": "ready"}, plugin.dispatch("info", {}))
-        plugin.dispatch("start_mapping", {"map_name": "floor_1", "activate": False})
+        accepted = plugin.dispatch("start_mapping", {"map_name": "floor_1", "activate": False})
+        self.assertEqual("accepted", accepted["state"])
+        self.assertTrue(accepted["action_id"].startswith("m20_mapping_"))
+        self.assertTrue(completed.wait(1))
+        self.assertEqual("completed", completions[-1][1])
+        completed.clear()
         plugin.dispatch("stop_mapping", {})
-        plugin.dispatch("status", {})
+        self.assertTrue(completed.wait(1))
         plugin.dispatch("list_maps", {})
         self.assertEqual(
-            [("start", "floor_1", False), ("stop",), ("status",), ("list",)],
+            [("start", "floor_1", False), ("stop",), ("list",)],
             client.calls,
         )
+        with self.assertRaisesRegex(ValueError, "boolean"):
+            plugin.dispatch("start_mapping", {"map_name": "floor_1", "activate": "false"})
+
+    def test_mapping_worker_reports_failure_to_acp(self):
+        class FailingClient:
+            @staticmethod
+            def validate_map_name(name): return name
+            def start_mapping(self, **kwargs): raise RuntimeError("ssh failed")
+
+        completions = []
+        completed = threading.Event()
+        def notify(*args): completions.append(args); completed.set()
+        plugin = m20.M20ProMappingPlugin(FakeNodes(), client=FailingClient(), notifier=notify)
+        accepted = plugin.dispatch("start_mapping", {"map_name": "floor1", "activate": True})
+        self.assertEqual("accepted", accepted["state"])
+        self.assertTrue(completed.wait(1))
+        self.assertEqual((accepted["action_id"], "failed"), completions[0][:2])
+        self.assertIn("ssh failed", completions[0][2]["error"])
+
+    def test_mapping_view_encodes_supported_canvas_packet(self):
+        quaternion = SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0)
+        origin = SimpleNamespace(position=SimpleNamespace(x=-1.0, y=2.0), orientation=quaternion)
+        grid = SimpleNamespace(
+            info=SimpleNamespace(width=3, height=2, resolution=0.5, origin=origin),
+            data=[0, 50, -1, 100, 49, 80],
+        )
+        packet = m20.encode_occupancy_grid(grid, {"x": 1, "y": 2, "yaw": 0.25})
+        robot_x, robot_y, robot_yaw, flags, count = m20.struct.unpack_from("<fffBI", packet)
+        self.assertEqual((1.0, 2.0, -0.25, 0x03, 3), (robot_x, robot_y, robot_yaw, flags, count))
+        points = m20.struct.unpack_from("<9f", packet, 17)
+        self.assertEqual((-0.25, 2.25, 0.0), points[:3])
+        self.assertEqual((-0.75, 2.75, 0.0), points[3:6])
+        self.assertEqual((0.25, 2.75, 0.0), points[6:9])
+
+    def test_mapping_view_static_and_dynamic_contract_match(self):
+        nodes = FakeNodes()
+        nodes.mapping_topic = "/host/lynx_m20/mapping_view"
+        plugin = m20.M20MappingViewPlugin(nodes)
+        expected = [{"topic": nodes.mapping_topic, "format": "sensor/mapping"}]
+        self.assertEqual(expected, plugin.get_tool()["topic_out"])
+        self.assertEqual(expected, plugin.dispatch("info", {})["topic_out"])
+        self.assertEqual({"state": "idle"}, plugin.dispatch("stop", {}))
 
     def test_mapping_ssh_is_pinned_noninteractive_and_rejects_shell_input(self):
         class Completed:

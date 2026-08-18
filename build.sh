@@ -66,7 +66,7 @@ select_mirror() {
             ;;
     esac
 
-    echo "Mirror: ${MIRROR} | PyPI: ${PYPI_MIRROR}"
+    echo "Mirror: ${MIRROR} | PyPI: ${PYPI_MIRROR} | APT: ${APT_MIRROR}"
     echo ""
 }
 

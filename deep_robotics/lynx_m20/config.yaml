@@ -21,6 +21,9 @@ mapping:
   identity_file: "/run/secrets/m20_nos_ssh_key"
   known_hosts_file: "/run/secrets/m20_nos_known_hosts"
   timeout: 15
+mapping_visualization:
+  occupied_threshold: 50
+  max_points: 50000
 topics:
   motion_info: "/MOTION_INFO"
   motion_state: "/MOTION_STATE"
@@ -35,3 +38,4 @@ topics:
   gps: "/GPS"
   joints: "/JOINTS_DATA"
   odometry: "/ODOM"
+  grid_map: "/GRID_MAP"
