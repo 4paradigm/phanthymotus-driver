@@ -84,6 +84,10 @@ proposal topic 时，Driver 会在保持物理停止的同时成功启动，并�
 RPC p50/p95/p99/max、逐原因拒绝统计及最近一次已确认停车。
 `last_set_velocity_duration_ms` 表示实测 RPC 耗时，不是 proposal TTL 余量。
 
+velocity proposal 合同与 `loco.move` 输入边界保持一致：前后和横向速度
+均限制为 `[-1.0, 1.0] m/s`，偏航角速度限制为
+`[-2.0, 2.0] rad/s`。Driver 仍会在运动 RPC 之前拒绝非有限数或超界值。
+
 ## 开发新驱动
 
 想要为新硬件添加驱动？请参阅 **[驱动开发指南](README_dev.md)** 获取完整规范，包括：

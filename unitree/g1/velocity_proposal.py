@@ -54,11 +54,11 @@ class ProposalLimits:
     schema: str = VELOCITY_PROPOSAL_SCHEMA
     frame: str = "base_link"
     max_ttl_ms: int = 250
-    min_x: float = -0.05
-    max_x: float = 0.15
-    max_abs_y: float = 0.12
-    max_abs_yaw: float = 0.35
-    max_planar_speed: float = 0.18
+    min_x: float = -1.0
+    max_x: float = 1.0
+    max_abs_y: float = 1.0
+    max_abs_yaw: float = 2.0
+    max_planar_speed: float = math.sqrt(2.0)
 
 
 @dataclass(frozen=True)

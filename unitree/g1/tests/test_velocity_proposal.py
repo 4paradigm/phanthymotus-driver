@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 import unittest
+
+import yaml
 
 from velocity_proposal import (
     DEFAULT_VELOCITY_PROPOSAL_TOPIC,
@@ -17,6 +20,7 @@ from velocity_proposal import (
 
 
 EXPECTED_TOPIC = "/ubuntu/navigation/nav2/velocity_proposal"
+G1_DIR = Path(__file__).resolve().parents[1]
 
 
 def proposal(**changes):
@@ -121,6 +125,42 @@ class ProposalValidationTest(unittest.TestCase):
         self.assertEqual(result.ttl_ms, 200)
         self.assertFalse(result.is_zero)
 
+    def test_default_config_matches_loco_contract_velocity_limits(self):
+        config = yaml.safe_load((G1_DIR / "config.yaml").read_text())
+        loco = config["plugins"]["loco"]
+
+        self.assertEqual(loco["velocity_proposal_min_x"], self.limits.min_x)
+        self.assertEqual(loco["velocity_proposal_max_x"], self.limits.max_x)
+        self.assertEqual(
+            loco["velocity_proposal_max_abs_y"],
+            self.limits.max_abs_y,
+        )
+        self.assertEqual(
+            loco["velocity_proposal_max_abs_yaw"],
+            self.limits.max_abs_yaw,
+        )
+        self.assertEqual(
+            loco["velocity_proposal_max_planar_speed"],
+            self.limits.max_planar_speed,
+        )
+
+    def test_accepts_loco_contract_velocity_boundaries(self):
+        for velocity in (
+            {"x": 1.0, "y": 0.0, "yaw": 2.0},
+            {"x": -1.0, "y": 0.0, "yaw": -2.0},
+            {"x": 0.0, "y": 1.0, "yaw": 0.0},
+            {"x": 0.0, "y": -1.0, "yaw": 0.0},
+            {"x": 1.0, "y": 1.0, "yaw": 0.0},
+        ):
+            with self.subTest(velocity=velocity):
+                result = validate_velocity_proposal(
+                    proposal(velocity=velocity),
+                    self.limits,
+                )
+                self.assertEqual(result.x, velocity["x"])
+                self.assertEqual(result.y, velocity["y"])
+                self.assertEqual(result.yaw, velocity["yaw"])
+
     def test_rejects_wrong_schema_frame_or_flags(self):
         cases = (
             {"schema": "other"},
@@ -146,14 +186,13 @@ class ProposalValidationTest(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(VelocityProposalValidationError):
                 validate_velocity_proposal(proposal(**changes), self.limits)
 
-    def test_rejects_nonfinite_and_each_speed_limit(self):
+    def test_rejects_nonfinite_and_independent_speed_limits(self):
         velocities = (
             {"x": math.nan, "y": 0.0, "yaw": 0.0},
-            {"x": 0.151, "y": 0.0, "yaw": 0.0},
-            {"x": -0.051, "y": 0.0, "yaw": 0.0},
-            {"x": 0.0, "y": 0.121, "yaw": 0.0},
-            {"x": 0.0, "y": 0.0, "yaw": 0.351},
-            {"x": 0.15, "y": 0.11, "yaw": 0.0},
+            {"x": 1.001, "y": 0.0, "yaw": 0.0},
+            {"x": -1.001, "y": 0.0, "yaw": 0.0},
+            {"x": 0.0, "y": 1.001, "yaw": 0.0},
+            {"x": 0.0, "y": 0.0, "yaw": 2.001},
         )
         for velocity in velocities:
             with self.subTest(velocity=velocity), self.assertRaises(VelocityProposalValidationError):

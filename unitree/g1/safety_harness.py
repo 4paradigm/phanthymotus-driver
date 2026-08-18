@@ -1412,14 +1412,53 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
     )
     expected_proposal_topic = DEFAULT_VELOCITY_PROPOSAL_TOPIC
     # Deployment configuration may tighten, but never loosen, N5 limits.
+    contract_limits = ProposalLimits()
     proposal_limits = ProposalLimits(
-        frame="base_link",
-        max_ttl_ms=min(250, int(proposal_config.get("velocity_proposal_max_ttl_ms", 250))),
-        min_x=max(-0.05, float(proposal_config.get("velocity_proposal_min_x", -0.05))),
-        max_x=min(0.15, float(proposal_config.get("velocity_proposal_max_x", 0.15))),
-        max_abs_y=min(0.12, float(proposal_config.get("velocity_proposal_max_abs_y", 0.12))),
-        max_abs_yaw=min(0.35, float(proposal_config.get("velocity_proposal_max_abs_yaw", 0.35))),
-        max_planar_speed=min(0.18, float(proposal_config.get("velocity_proposal_max_planar_speed", 0.18))),
+        frame=contract_limits.frame,
+        max_ttl_ms=min(
+            contract_limits.max_ttl_ms,
+            int(
+                proposal_config.get(
+                    "velocity_proposal_max_ttl_ms",
+                    contract_limits.max_ttl_ms,
+                )
+            ),
+        ),
+        min_x=max(
+            contract_limits.min_x,
+            float(proposal_config.get("velocity_proposal_min_x", contract_limits.min_x)),
+        ),
+        max_x=min(
+            contract_limits.max_x,
+            float(proposal_config.get("velocity_proposal_max_x", contract_limits.max_x)),
+        ),
+        max_abs_y=min(
+            contract_limits.max_abs_y,
+            float(
+                proposal_config.get(
+                    "velocity_proposal_max_abs_y",
+                    contract_limits.max_abs_y,
+                )
+            ),
+        ),
+        max_abs_yaw=min(
+            contract_limits.max_abs_yaw,
+            float(
+                proposal_config.get(
+                    "velocity_proposal_max_abs_yaw",
+                    contract_limits.max_abs_yaw,
+                )
+            ),
+        ),
+        max_planar_speed=min(
+            contract_limits.max_planar_speed,
+            float(
+                proposal_config.get(
+                    "velocity_proposal_max_planar_speed",
+                    contract_limits.max_planar_speed,
+                )
+            ),
+        ),
     )
     proposal_gate = VelocityProposalGate(proposal_limits)
     proposal_odom_timeout = float(proposal_config.get("velocity_proposal_odom_timeout", 0.5))

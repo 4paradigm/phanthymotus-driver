@@ -88,6 +88,11 @@ queue latency, rolling RPC p50/p95/p99/max values, rejection reasons, and the
 last confirmed proposal stop. The `last_set_velocity_duration_ms` value is
 measured RPC time, not the proposal TTL budget.
 
+The velocity proposal contract matches the `loco.move` input bounds: forward
+and lateral velocity are each limited to `[-1.0, 1.0] m/s`, and yaw velocity is
+limited to `[-2.0, 2.0] rad/s`. The Driver still rejects non-finite or
+out-of-range values before any motion RPC.
+
 ### G1 Navigation Sensors
 
 The read-only `navigation_sensors` Driver plugin launches an isolated worker
