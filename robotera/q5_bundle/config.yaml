@@ -18,17 +18,17 @@ plugins:
   joints_state:
     enabled: true
   robot_ready:
-    enabled: true
+    enabled: false  # merged into robot_status
   battery:
     enabled: true
   system_health:
-    enabled: true
+    enabled: false  # merged into robot_status
   hand_state:
     enabled: true
   estop:
-    enabled: true
+    enabled: false  # merged into robot_status
   diagnostics:
-    enabled: true
+    enabled: false  # merged into robot_status
   imu:
     enabled: false
   simple_action:
@@ -90,8 +90,19 @@ plugins:
     enabled: true
     max_duration_s: 2.0
     publish_rate_hz: 20.0
+  arm_gesture:
+    enabled: true
+    max_step_rad: 0.010
+    publish_rate_hz: 20.0
+    hold_repetitions: 3
   head_control:
     enabled: true
     max_step_rad: 0.025
     publish_rate_hz: 20.0
     hold_repetitions: 3
+  odom:
+    enabled: true
+  teleop_state:
+    enabled: true
+  robot_status:
+    enabled: true
