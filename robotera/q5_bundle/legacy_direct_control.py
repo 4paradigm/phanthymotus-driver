@@ -63,8 +63,9 @@ def _arm_limit_summary() -> str:
 
 ARM_DESC = (
     "关节绝对角度范围：" + _arm_limit_summary() + "。"
-    "Q5 手臂单关节位置控制；每个关节动作使用自己的绝对角度参数（不是增量），"
-    "需由 q5_control_mode 完成位置直控准备后使用。每步最多 0.010 rad、20 Hz，最大约 0.20 rad/s。"
+    "Q5 手臂单关节位置控制；每个关节动作使用自己的绝对角度参数（不是增量）。"
+    "首次执行 arm_control 会自动完成位置直控准备；准备标志仍有效时后续动作直接执行。"
+    "每步最多 0.010 rad、20 Hz，最大约 0.20 rad/s。"
 )
 
 
@@ -81,13 +82,13 @@ def _arm_number(value, field: str) -> float:
     return value
 
 
-class Q5ControlModePlugin:
-    """Vendor Q5 control-mode transitions, kept separate from joint movement."""
+class PositionControlPreparer:
+    """Private vendor position-control preparation helper for arm_control."""
 
     def __init__(self, plugin_config, namespace, executor, client):
         del plugin_config, namespace
         self._client = client
-        self._node = Node("q5_control_mode")
+        self._node = Node("q5_position_control_preparer")
         executor.add_node(self._node)
         self._dynamic = self._node.create_client(DynamicLaunch, "/dynamic_launch")
         self._ready = self._node.create_client(Trigger, "/ready_service")
@@ -99,7 +100,7 @@ class Q5ControlModePlugin:
 
     def get_tool(self):
         return {
-            "name": "q5_control_mode", "type": "actuator", "multiInstance": False,
+            "name": "q5_position_control_preparer", "type": "actuator", "multiInstance": False,
             "description": "Q5 模式切换：位置直控准备、READY 与 ACTIVE。完整准备会实际垂手并抬臂。",
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["start", "prepare_position_control", "ready", "active", "info"], "oneOf": [
@@ -227,6 +228,9 @@ class ArmControlPlugin:
     def __init__(self, plugin_config, namespace, executor, client):
         self._client = client
         self._router = _get_body_router(client, executor)
+        # Keep vendor mode transitions private to arm_control. This node is an
+        # implementation helper and is not exposed as a separate MCP card.
+        self._preparer = PositionControlPreparer({}, namespace, executor, client)
         self._max_step = float(plugin_config.get("max_step_rad", 0.010))
         self._publish_rate = float(plugin_config.get("publish_rate_hz", 20.0))
         self._hold_repetitions = int(plugin_config.get("hold_repetitions", 3))
@@ -262,8 +266,9 @@ class ArmControlPlugin:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["start", *action_details, "cancel", "info"], "oneOf": [
+                    "action": {"type": "string", "enum": ["start", "prepare", *action_details, "cancel", "info"], "oneOf": [
                         {"const": "start", "title": "检查连接状态"},
+                        {"const": "prepare", "title": "准备位置直控"},
                         *[{"const": name, "title": detail["title"]}
                           for name, detail in action_details.items()],
                         {"const": "cancel", "title": "取消并保持当前角度"},
@@ -275,6 +280,7 @@ class ArmControlPlugin:
                 "additionalProperties": False,
                 "x-action-params": {
                     "start": {"params": [], "description": "检查 ROS 连接和机器人状态。"},
+                    "prepare": {"params": [], "description": "自动执行 pos、READY、垂手、抬臂、ACTIVE 位置直控准备流程。"},
                     **{name: {"params": [detail["field"]],
                                 "description": f"{detail['title']}；范围[{detail['limits'][0]:g},{detail['limits'][1]:g}]rad；最大速度约 0.20 rad/s。"}
                        for name, detail in action_details.items()},
@@ -292,11 +298,24 @@ class ArmControlPlugin:
             "lifecycle_state": self._client.get_lifecycle_state(),
             "joint_state_fresh": bool(self._client.snapshot().get("fresh", False)),
             "q5_fsm": q5_active_status(self._client),
+            "position_control_prepared": bool(getattr(self._client, "q5_position_control_prepared", False)),
             "limits": {"max_step_rad": self._max_step,
                        "joint_position_limits": limits_for(ARM_JOINTS),
                        "joint_names_source": "q5_model.urdf"},
         })
         return status
+
+    def _ensure_prepared(self):
+        if bool(getattr(self._client, "q5_position_control_prepared", False)):
+            return None
+        result = self._preparer._prepare()
+        if isinstance(result, dict) and result.get("ok"):
+            return None
+        return _arm_failure(
+            "ARM_PREPARE_FAILED",
+            "Q5 position-control prepare sequence failed",
+            prepare=result,
+        )
 
     def _publish(self, joint_name: str, position: float) -> bool:
         return self._router.publish({joint_name: position})
@@ -371,12 +390,9 @@ class ArmControlPlugin:
         # vendor MPC endpoint. ROS graph discovery only proves an endpoint
         # exists, not that it is actively emitting commands, so report it in
         # `info` but do not reject a bounded single-joint interpolation here.
-        if not bool(getattr(self._client, "q5_position_control_prepared", False)):
-            return _arm_failure(
-                "DIRECT_CONTROL_NOT_PREPARED",
-                "Run q5_control_mode action=prepare_position_control first; vendor position-control sequence has not completed in this driver session",
-                status=status,
-            )
+        prepare_error = self._ensure_prepared()
+        if prepare_error:
+            return {**prepare_error, "details": {**prepare_error.get("details", {}), "status": status}}
         # Direct HybridJointCommand control is owned by the vendor body
         # controller after arm_control preparation completes. motion_manager is a
         # separate lifecycle node and may legitimately remain inactive.
@@ -420,6 +436,10 @@ class ArmControlPlugin:
                 active = dict(self._active_command) if self._active_command else None
             return {"ok": True, "state": "moving" if active else "idle", "active_command": active,
                     "safety": self._safety()}
+        if action == "prepare":
+            result = self._ensure_prepared()
+            return result or {"ok": True, "state": "active", "position_control_prepared": True,
+                              "prepare": "already_prepared"}
         if action not in ARM_JOINTS:
             return None
 
