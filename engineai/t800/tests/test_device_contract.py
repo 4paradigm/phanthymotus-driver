@@ -565,6 +565,31 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual([12, 23], sent.joint_indices)
         self.assertEqual([0.1, -0.2], sent.target_positions)
 
+    def test_joint_plan_rejects_urdf_limit_violations_on_every_plan_facade(self):
+        plugin = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        unsafe_calls = [
+            ("plan", {"joint_indices": [16], "target_positions": [-3.0]}),
+            ("plan_named", {
+                "joint_names": ["J16_ELBOW_PITCH_L"],
+                "target_positions": [-3.0],
+            }),
+            ("head_pose", {"pitch_rad": 1.0, "yaw_rad": 0.0}),
+            ("arm_pose", {
+                "side": "left",
+                "target_positions": [0.0, 0.0, 0.0, -3.0, 0.0],
+            }),
+        ]
+        for action, arguments in unsafe_calls:
+            with self.subTest(action=action):
+                with self.assertRaisesRegex(ValueError, "safe position limit"):
+                    plugin.dispatch(action, arguments)
+
+        self.state._last_joint_positions[16] = -3.0
+        with self.assertRaisesRegex(ValueError, "safe position limit"):
+            plugin.dispatch("hold_current", {})
+        self.assertEqual([], plugin._publisher.messages)
+
     def test_joint_plan_named_head_arm_and_hold_actions(self):
         plugin = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
         plugin.start()
@@ -609,6 +634,17 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertGreaterEqual(schema["x-completion"]["timeout"], 60)
         actions = set(schema["properties"]["action"]["enum"])
         self.assertTrue({"start", "info", "stop"}.issubset(actions))
+        action_params = schema["x-action-params"]
+        self.assertEqual(
+            ["name", "repetitions", "reset_after", "force"],
+            action_params["play"]["params"],
+        )
+        self.assertEqual(
+            ["steps", "reset_after", "force"],
+            action_params["sequence"]["params"],
+        )
+        self.assertEqual(["reset_after"], action_params["stop"]["params"])
+        self.assertEqual(["reset_after"], action_params["stop_gesture"]["params"])
         self.assertNotIn("wait", schema["properties"])
         self.assertEqual(gesture._MAX_SEQUENCE_STEPS, schema["properties"]["steps"]["maxItems"])
         rejected = gesture.dispatch("sequence", {
