@@ -2461,30 +2461,28 @@ class HeadActuatorPlugin:
                 {
                     "times": {
                         "type": "integer", "minimum": 1, "maximum": 5, "default": 1,
-                        "placeholder": "1-5",
-                        "description": "重复次数，范围 1–5 次，默认 1 次",
+                        "description": "1–5，默认 1",
                     },
                     "speed": {
                         "type": "number", "minimum": 0.5, "maximum": 2.0, "default": 1.0,
-                        "placeholder": "0.5-2.0",
-                        "description": "动作速度倍率，范围 0.5–2.0，默认 1.0；数值越大动作越快",
+                        "description": "0.5–2.0，默认 1.0",
                     },
                     "direction": {
                         "type": "string", "enum": ["forward", "left", "right", "up", "down"],
-                        "description": "预设视线方向：forward、left、right、up 或 down",
+                        "description": "forward / left / right / up / down",
                     },
                     "pitch_deg": {
                         "type": "number", "minimum": math.degrees(-self._PITCH_LIMIT), "maximum": math.degrees(self._PITCH_LIMIT),
-                        "description": "俯仰角，单位度，范围 −28.65–28.65°",
+                        "description": "-28.65–28.65°，默认 0",
                     },
                     "yaw_deg": {
                         "type": "number", "minimum": math.degrees(-self._YAW_LIMIT), "maximum": math.degrees(self._YAW_LIMIT),
-                        "description": "偏航角，单位度，范围 −57.30–57.30°",
+                        "description": "-57.30–57.30°，默认 0",
                     },
                     "duration": {
                         "type": "number", "minimum": 0.05, "maximum": 120.0,
                         "default": self._config.get("step_duration_sec", 0.35),
-                        "description": "执行时间，单位秒，范围 0.05–120，默认使用动作步长",
+                        "description": "秒；0.05–120，默认 0.35",
                     },
                 },
                 "头部动作",
