@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import ssl
 import struct
 import sys
 import threading
@@ -586,16 +587,18 @@ class DevicePluginContractTests(unittest.TestCase):
         plan.wait_until_idle = lambda *_args, **_kwargs: {}
         plan.wait_for_request = lambda *_args, **_kwargs: {}
         gesture = self.device.GesturePlugin(plan)
+        gesture._acp_notify = lambda *_args: None
         listed = {item["name"]: item["steps"] for item in gesture.dispatch("list", {})["gestures"]}
         self.assertEqual(8, listed["wave_hands"])
         self.assertEqual(2, listed["shake_hand"])
         result = gesture.dispatch("sequence", {
             "steps": [{"joint_indices": [23, 24], "target_positions": [0.1, -0.1], "duration": 0.05}],
             "reset_after": False,
-            "wait": True,
             "force": True,
         })
-        self.assertEqual("completed", result["state"])
+        self.assertEqual("running", result["state"])
+        gesture._thread.join(timeout=1.0)
+        self.assertEqual("completed", gesture.dispatch("status", {})["state"])
         self.assertEqual([23, 24], plan._publisher.messages[-1].joint_indices)
 
     def test_gesture_declares_async_completion_and_lifecycle_actions(self):
@@ -606,6 +609,15 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertGreaterEqual(schema["x-completion"]["timeout"], 60)
         actions = set(schema["properties"]["action"]["enum"])
         self.assertTrue({"start", "info", "stop"}.issubset(actions))
+        self.assertNotIn("wait", schema["properties"])
+        rejected = gesture.dispatch("sequence", {
+            "steps": [{"joint_indices": [23], "target_positions": [0.0]}],
+            "wait": True,
+            "force": True,
+        })
+        self.assertIn("wait=true is not supported", rejected["error"])
+        self.assertNotIn("action_id", rejected)
+        self.assertIsNone(gesture._thread)
 
     def test_gesture_async_acp_uses_real_planner_state_transitions(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
@@ -619,7 +631,6 @@ class DevicePluginContractTests(unittest.TestCase):
         result = gesture.dispatch("sequence", {
             "steps": [{"joint_indices": [23], "target_positions": [0.1], "duration": 0.05}],
             "reset_after": False,
-            "wait": False,
             "force": True,
         })
         self.assertEqual("running", result["state"])
@@ -661,13 +672,11 @@ class DevicePluginContractTests(unittest.TestCase):
         result = gesture.dispatch("sequence", {
             "steps": [{"joint_indices": [23], "target_positions": [0.1], "duration": 0.05}],
             "reset_after": False,
-            "wait": False,
             "force": True,
         })
         self.assertTrue(entered_wait.wait(timeout=1.0))
         busy = gesture.dispatch("sequence", {
             "steps": [{"joint_indices": [23], "target_positions": [0.0]}],
-            "wait": False,
             "force": True,
         })
         self.assertIn("already running", busy["error"])
@@ -697,7 +706,6 @@ class DevicePluginContractTests(unittest.TestCase):
         result = gesture.dispatch("sequence", {
             "steps": [{"joint_indices": [23], "target_positions": [0.1], "duration": 0.05}],
             "reset_after": False,
-            "wait": False,
             "force": True,
         })
         gesture._thread.join(timeout=1.0)
@@ -723,6 +731,16 @@ class DevicePluginContractTests(unittest.TestCase):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         previous = os.environ.get("AGENT_CORE_URL")
+        previous_ca = os.environ.pop("AGENT_CORE_CA_CERT", None)
+        original_create_default_context = ssl.create_default_context
+        contexts = []
+
+        def create_default_context(*args, **kwargs):
+            context = original_create_default_context(*args, **kwargs)
+            contexts.append(context)
+            return context
+
+        ssl.create_default_context = create_default_context
         os.environ["AGENT_CORE_URL"] = f"http://127.0.0.1:{server.server_port}"
         try:
             self.device.GesturePlugin._acp_notify(
@@ -733,6 +751,9 @@ class DevicePluginContractTests(unittest.TestCase):
                 os.environ.pop("AGENT_CORE_URL", None)
             else:
                 os.environ["AGENT_CORE_URL"] = previous
+            if previous_ca is not None:
+                os.environ["AGENT_CORE_CA_CERT"] = previous_ca
+            ssl.create_default_context = original_create_default_context
             server.shutdown()
             server.server_close()
 
@@ -742,6 +763,8 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("completed", payload["status"])
         self.assertEqual("gesture", payload["tool"])
         self.assertEqual("wave_hands", payload["result"]["gesture"])
+        self.assertTrue(contexts[0].check_hostname)
+        self.assertEqual(ssl.CERT_REQUIRED, contexts[0].verify_mode)
 
     def test_gesture_uses_validated_real_device_trajectories(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
@@ -750,6 +773,7 @@ class DevicePluginContractTests(unittest.TestCase):
         plan.wait_until_idle = lambda *_args, **kwargs: waits.append(("idle", kwargs)) or {}
         plan.wait_for_request = lambda request_id, *_args: waits.append(("request", request_id)) or {}
         gesture = self.device.GesturePlugin(plan)
+        gesture._acp_notify = lambda *_args: None
 
         wave = gesture._prepare_steps(gesture._official_steps("wave_hands"))
         self.assertEqual("return_to_neutral", wave[-1]["name"])
@@ -761,9 +785,11 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual(gesture._HAND_WITHDRAWN, handshake[-1]["target_positions"])
 
         result = gesture.dispatch("play", {
-            "name": "wave_hands", "wait": True, "reset_after": False, "force": True,
+            "name": "wave_hands", "reset_after": False, "force": True,
         })
-        self.assertEqual("completed", result["state"])
+        self.assertEqual("running", result["state"])
+        gesture._thread.join(timeout=1.0)
+        self.assertEqual("completed", gesture.dispatch("status", {})["state"])
         self.assertEqual(8, len([item for item in waits if item[0] == "request"]))
         self.assertEqual(gesture._NEUTRAL, plan._publisher.messages[-1].target_positions)
 

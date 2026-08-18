@@ -2434,8 +2434,8 @@ class GesturePlugin:
         schema = action_schema(
             _with_lifecycle({
                 "list": ([], "列出内置手势及步数"),
-                "play": (["name", "repetitions", "reset_after", "wait", "force"], "播放一次实机验证手势"),
-                "sequence": (["steps", "reset_after", "wait", "force"], "执行经过关节限位校验的自定义序列"),
+                "play": (["name", "repetitions", "reset_after", "force"], "异步播放一次实机验证手势"),
+                "sequence": (["steps", "reset_after", "force"], "异步执行经过关节限位校验的自定义序列"),
                 "stop_gesture": (["reset_after"], "取消当前步骤并停止手势"),
                 "status": ([], "查询手势、步骤和错误"),
             }),
@@ -2444,7 +2444,6 @@ class GesturePlugin:
                 "repetitions": {"type": "integer", "minimum": 1, "maximum": 1,
                                 "description": "安全限制：内置手势每次只执行一次"},
                 "reset_after": {"type": "boolean"},
-                "wait": {"type": "boolean", "description": "等待整套动作完成"},
                 "force": {"type": "boolean", "description": "忽略 lower_body_balance 状态门禁"},
                 "steps": {
                     "type": "array",
@@ -2504,6 +2503,11 @@ class GesturePlugin:
             return {"state": "idle"}
         if action == "stop_gesture":
             return self._stop(reset_after=bool(args.get("reset_after", False)))
+        if action in ("play", "sequence") and bool(args.get("wait", False)):
+            return {
+                "error": "wait=true is not supported for asynchronous gesture actions; "
+                         "use action_id completion or status instead"
+            }
         if action == "play":
             name = str(args.get("name", ""))
             if name not in self._GESTURES:
@@ -2543,7 +2547,6 @@ class GesturePlugin:
             label,
             steps,
             reset_after=bool(args.get("reset_after", True)),
-            wait=bool(args.get("wait", False)),
         )
 
     def _official_steps(self, name: str) -> list[dict]:
@@ -2600,17 +2603,15 @@ class GesturePlugin:
             prepared.append(step)
         return prepared
 
-    def _start_sequence(self, label: str, steps: list[dict], *, reset_after: bool, wait: bool) -> dict:
+    def _start_sequence(self, label: str, steps: list[dict], *, reset_after: bool) -> dict:
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 current = dict(self._status)
                 current.pop("action_id", None)
                 return {**current, "error": "another gesture sequence is already running"}
-            action_id = None
-            if not wait:
-                from uuid import uuid4
+            from uuid import uuid4
 
-                action_id = f"t800_gesture_{uuid4().hex[:12]}"
+            action_id = f"t800_gesture_{uuid4().hex[:12]}"
             self._cancel = threading.Event()
             self._status = {
                 "state": "running", "gesture": label, "step": 0,
@@ -2690,10 +2691,6 @@ class GesturePlugin:
         with self._lock:
             self._thread = thread
         thread.start()
-        if wait:
-            thread.join()
-            with self._lock:
-                return dict(self._status)
         return {
             "state": "running",
             "gesture": label,
@@ -2728,20 +2725,28 @@ class GesturePlugin:
         import json as _json
         import os as _os
         import ssl as _ssl
+        import urllib.parse as _urlparse
         import urllib.request as _urllib
 
         agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
-        context = _ssl.create_default_context()
-        context.check_hostname = False
-        context.verify_mode = _ssl.CERT_NONE
-        payload = _json.dumps({
-            "action_id": action_id,
-            "status": status,
-            "result": result,
-            "tool": "gesture",
-            "ts": time.time(),
-        }).encode()
+        ca_cert = _os.environ.get("AGENT_CORE_CA_CERT")
         try:
+            parsed_url = _urlparse.urlparse(agent_core_url)
+            if parsed_url.scheme not in ("http", "https"):
+                raise ValueError("AGENT_CORE_URL must use http or https")
+            if (
+                parsed_url.scheme == "http"
+                and parsed_url.hostname not in ("localhost", "127.0.0.1", "::1")
+            ):
+                raise ValueError("unencrypted AGENT_CORE_URL is only allowed on loopback")
+            context = _ssl.create_default_context(cafile=ca_cert or None)
+            payload = _json.dumps({
+                "action_id": action_id,
+                "status": status,
+                "result": result,
+                "tool": "gesture",
+                "ts": time.time(),
+            }).encode()
             request = _urllib.Request(
                 f"{agent_core_url}/api/acp/complete",
                 data=payload,
