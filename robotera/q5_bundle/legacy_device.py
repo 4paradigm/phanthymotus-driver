@@ -14,11 +14,13 @@ import json
 import os
 import re
 import shlex
+import ssl
 import struct
 import subprocess
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from rclpy.action import ActionClient
@@ -1128,41 +1130,46 @@ class AudioPlugin:
             "library_dir", "/opt/phanthy-motus/data/audios")))
         self._upload_max_bytes = max(1, int(plugin_config.get("upload_max_bytes", 20 * 1024 * 1024)))
         self._xos_http_base = str(plugin_config.get("xos_http_base", "http://192.168.8.100:1888")).rstrip("/")
+        self._agent_core_url = str(plugin_config.get(
+            "agent_core_url", os.environ.get("AGENT_CORE_URL", "https://localhost:15678"))).rstrip("/")
+        self._upload_dir = str(plugin_config.get("agent_core_upload_dir", "/tmp/uploads"))
+        self._volume = max(0, min(100, int(plugin_config.get("volume", 50))))
         # XOS chat owns the vendor audio route. Serialize play/launch/quit so
         # two MCP calls cannot tear down one another's playback session.
         self._chat_poll_timeout = max(1.0, float(plugin_config.get("chat_poll_timeout_s", 8.0)))
         self._chat_route_settle = max(0.0, float(plugin_config.get("chat_route_settle_s", 1.5)))
 
     def get_tool(self):
-        play_actions = {
-            "play_by_id": {"mode": 0, "title": "按内置音频 ID 播放", "param": "id"},
-            "play_by_path": {"mode": 1, "title": "按设备路径播放", "param": "path"},
-            "play_by_item": {"mode": 2, "title": "按 item JSON 播放", "param": "item"},
-            "play_by_file_name": {"mode": 3, "title": "按文件名播放", "param": "file_name"},
-        }
         return {
             "name": "audio", "type": "actuator", "multiInstance": False,
-            "description": "Q5 XOS audio-library playback, upload, listing, volume, stop, and status. Live PCM speaker volume is controlled on the speaker card.",
+            "description": "Q5 XOS audio playback. Play an uploaded local file, a mounted library file, or an existing XOS resource. Local and library files are uploaded to XOS automatically before playback.",
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": [
-                    *play_actions, "list_library", "list_robot_audio_files", "upload_from_library", "upload_base64", "delete_audio", "set_volume", "stop_audio", "is_play", "stop"],
+                    "play_local_file", "play_library_file", "play_robot_file", "play_id",
+                    "list_library", "list_robot_audio_files", "upload_local_file",
+                    "upload_from_library", "upload_base64", "delete_audio", "set_volume",
+                    "get_volume", "stop_audio", "is_play", "stop"],
                     "oneOf": [
-                        *[{"const": action, "title": detail["title"]}
-                          for action, detail in play_actions.items()],
+                        {"const": "play_local_file", "title": "播放本地音频文件"},
+                        {"const": "play_library_file", "title": "播放挂载音频库文件"},
+                        {"const": "play_robot_file", "title": "播放机器人已有文件"},
+                        {"const": "play_id", "title": "播放内置音频 ID"},
                         {"const": "list_library", "title": "查看挂载音频库"},
                         {"const": "list_robot_audio_files", "title": "查看机器人音频文件"},
+                        {"const": "upload_local_file", "title": "上传本地音频文件"},
                         {"const": "upload_from_library", "title": "从挂载音频库上传"},
                         {"const": "upload_base64", "title": "上传音频到机器人"},
                         {"const": "delete_audio", "title": "从 XOS 音频库删除"},
                         {"const": "set_volume", "title": "设置音量"},
+                        {"const": "get_volume", "title": "查看音量"},
                         {"const": "stop_audio", "title": "停止播放"},
                         {"const": "is_play", "title": "查询播放状态"},
                         {"const": "stop", "title": "停止音频卡"},
                     ]},
                 "id": {"type": "integer", "title": "内置音频 ID"},
-                "path": {"type": "string", "title": "设备音频路径", "minLength": 1},
-                "item": {"type": "string", "title": "item JSON", "minLength": 1},
                 "file_name": {"type": "string", "title": "音频文件名", "minLength": 1},
+                "local_file": {"type": "string", "format": "file", "accept": "audio/*",
+                               "title": "本地音频文件"},
                 "content_base64": {"type": "string", "title": "WAV/MP3 文件内容 (Base64)", "minLength": 1},
                 "force_play": {"type": "boolean", "title": "强制打断当前播放"},
                 "timeout": {"type": "integer", "title": "超时 (s)", "minimum": 0},
@@ -1172,18 +1179,25 @@ class AudioPlugin:
                 "volume": {"type": "integer", "title": "音量", "minimum": 0, "maximum": 100},
             }, "required": ["action"], "additionalProperties": False,
                 "x-action-params": {
-                    **{action: {"params": [detail["param"], "force_play", "timeout", "channel", "version"],
-                                  "description": f"模式 {detail['mode']}；只接受 {detail['param']} 作为播放来源。"}
-                       for action, detail in play_actions.items()},
-                    "list_library": {"params": [], "description": "列出 /opt/phanthy-motus/data/audios 中可上传的 WAV/MP3 文件。"},
-                    "list_robot_audio_files": {"params": [], "description": "列出 XOS 音频库；返回的 audio_name 可作为 file_name 调用 play_by_file_name。"},
+                    "play_local_file": {"params": ["local_file", "force_play", "timeout", "channel", "version"],
+                                        "description": "选择本地 WAV/MP3；自动从 Agent Core 读取、上传至 XOS 并播放。"},
+                    "play_library_file": {"params": ["file_name", "force_play", "timeout", "channel", "version"],
+                                         "description": "从挂载音频库读取 WAV/MP3，自动上传至 XOS 并播放。"},
+                    "play_robot_file": {"params": ["file_name", "force_play", "timeout", "channel", "version"],
+                                        "description": "直接播放 XOS 音频库已有的 audio_name。"},
+                    "play_id": {"params": ["id", "force_play", "timeout", "channel", "version"],
+                                "description": "播放厂商预装音频 ID；XOS 不提供 ID 枚举。"},
+                    "list_library": {"params": [], "description": "列出挂载音频库；返回 library_dir 供预置文件管理使用。"},
+                    "list_robot_audio_files": {"params": [], "description": "列出 XOS 音频库；返回的 audio_name 可用于播放机器人已有文件。"},
+                    "upload_local_file": {"params": ["local_file"], "description": "选择本地 WAV/MP3 并上传到 XOS，不播放。"},
                     "upload_from_library": {"params": ["file_name"],
-                                            "description": "通过 XOS HTTP 音频库接口上传 WAV/MP3；上传后使用返回的 audio_name 调用 play_by_file_name。"},
+                                            "description": "从挂载音频库上传 WAV/MP3 到 XOS，不播放。"},
                     "upload_base64": {"params": ["file_name", "content_base64"],
-                                      "description": "通过 XOS HTTP 音频库接口上传 WAV/MP3；上传后使用 file_name 播放。当前 XOS 列表接口不返回数字 ID。"},
+                                      "description": "上传 Base64 WAV/MP3 到 XOS，不播放。"},
                     "delete_audio": {"params": ["file_name"],
                                      "description": "从 XOS 音频库删除指定 audio_name。"},
                     "set_volume": {"params": ["volume"], "description": "设置厂商 AudioPlay 音量 0 到 100；不控制 live speaker。"},
+                    "get_volume": {"params": [], "description": "查看本卡最近设置的 XOS 播放音量。"},
                     "stop_audio": {"params": [], "description": "停止当前厂商音频播放。"},
                     "is_play": {"params": [], "description": "查询当前是否正在播放。"},
                     "stop": {"params": [], "description": "停止音频卡并停止当前播放。"},
@@ -1198,7 +1212,19 @@ class AudioPlugin:
 
     def dispatch(self, action, args):
         if action in ("start", "info"):
-            return {"state": "ready", "action_server": "/audio_player/play", "device": self._device}
+            return {"state": "ready", "action_server": "/audio_player/play", "device": self._device,
+                    "library_dir": self._library_dir, "agent_core_upload_dir": self._upload_dir}
+        if action == "play_local_file":
+            return self._play_uploaded_local_file(args)
+        if action == "play_library_file":
+            return self._play_library_file(args)
+        if action == "play_robot_file":
+            return self._play(args, 3)
+        if action == "play_id":
+            return self._play(args, 0)
+        # Compatibility-only entry points. `path` and `item` are vendor
+        # advanced modes with no public resource-discovery contract, so they
+        # are intentionally absent from the normal card schema.
         play_modes = {"play_by_id": 0, "play_by_path": 1,
                       "play_by_item": 2, "play_by_file_name": 3}
         if action in play_modes:
@@ -1209,12 +1235,17 @@ class AudioPlugin:
             return self._list_robot_audio_files()
         if action == "upload_from_library":
             return self._upload_from_library(args)
+        if action == "upload_local_file":
+            return self._upload_local_file(args)
         if action == "upload_base64":
             return self._upload_base64(args)
         if action == "delete_audio":
             return self._delete_audio(args)
         if action == "set_volume":
             return self._set_volume(args.get("volume", 50))
+        if action == "get_volume":
+            return {"state": "ok", "volume": self._volume,
+                    "note": "XOS exposes set_volume but no volume-read service; this is the most recent requested value."}
         if action == "stop_audio":
             return self._stop_audio()
         if action == "is_play":
@@ -1226,8 +1257,11 @@ class AudioPlugin:
 
     @staticmethod
     def _valid_upload_name(file_name) -> bool:
-        return (isinstance(file_name, str) and file_name == os.path.basename(file_name) and
-                bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_. -]*\.(?:wav|mp3)", file_name, re.IGNORECASE)))
+        if not isinstance(file_name, str) or file_name != os.path.basename(file_name):
+            return False
+        if not file_name or file_name.startswith(".") or any(ord(char) < 32 for char in file_name):
+            return False
+        return os.path.splitext(file_name)[1].lower() in (".wav", ".mp3")
 
     def _list_library(self):
         try:
@@ -1236,7 +1270,8 @@ class AudioPlugin:
                 if entry.is_file() and self._valid_upload_name(entry.name):
                     entries.append({"file_name": entry.name, "bytes": entry.stat().st_size})
             return {"state": "ok", "library_dir": self._library_dir, "files": entries[:100],
-                    "truncated": len(entries) > 100}
+                    "truncated": len(entries) > 100,
+                    "play_action": "play_library_file"}
         except FileNotFoundError:
             return {"state": "ok", "library_dir": self._library_dir, "files": [],
                     "message": "audio library directory does not exist yet"}
@@ -1264,6 +1299,62 @@ class AudioPlugin:
             return {"state": "error", "message": f"cannot read audio file: {exc}"}
         return self._upload_payload(file_name, payload)
 
+    def _agent_core_file_payload(self, local_file):
+        """Read a canvas-selected file through Agent Core's existing file API."""
+        if not isinstance(local_file, str) or not local_file:
+            return None, None, "local_file is required"
+        normalized = os.path.normpath(local_file)
+        upload_root = os.path.normpath(self._upload_dir)
+        if os.path.dirname(normalized) != upload_root:
+            return None, None, f"local_file must be selected from {upload_root}"
+        file_name = os.path.basename(normalized)
+        if not self._valid_upload_name(file_name):
+            return None, None, "local_file must have a .wav or .mp3 filename"
+        query = urllib.parse.urlencode({"path": normalized})
+        request = urllib.request.Request(
+            f"{self._agent_core_url}/api/file/download?{query}",
+            headers={"Accept": "application/octet-stream"})
+        context = ssl._create_unverified_context() if self._agent_core_url.startswith("https://") else None
+        try:
+            with urllib.request.urlopen(request, timeout=45.0, context=context) as reply:
+                declared = reply.headers.get("Content-Length")
+                if declared and int(declared) > self._upload_max_bytes:
+                    return None, None, f"audio file exceeds {self._upload_max_bytes} byte upload limit"
+                payload = reply.read(self._upload_max_bytes + 1)
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+            return None, None, f"cannot read selected Agent Core file: {exc}"
+        if len(payload) > self._upload_max_bytes:
+            return None, None, f"audio file exceeds {self._upload_max_bytes} byte upload limit"
+        if not payload:
+            return None, None, "audio file is empty"
+        return file_name, payload, None
+
+    def _upload_local_file(self, args):
+        file_name, payload, error = self._agent_core_file_payload(args.get("local_file"))
+        if error:
+            return {"state": "error", "message": error}
+        return self._upload_payload(file_name, payload)
+
+    def _play_uploaded(self, upload_result, args, source):
+        if upload_result.get("state") != "ok":
+            return upload_result
+        play_args = {
+            "file_name": upload_result["file_name"],
+            "force_play": args.get("force_play", True),
+            "timeout": args.get("timeout", 0),
+            "channel": args.get("channel", "default"),
+            "version": args.get("version", "v1"),
+        }
+        result = self._play(play_args, 3)
+        return {**result, "source": source, "file_name": upload_result["file_name"],
+                "bytes_uploaded": upload_result.get("bytes_uploaded")}
+
+    def _play_uploaded_local_file(self, args):
+        return self._play_uploaded(self._upload_local_file(args), args, "local_file")
+
+    def _play_library_file(self, args):
+        return self._play_uploaded(self._upload_from_library(args), args, "library")
+
     def _list_robot_audio_files(self):
         response = self._xos_json_request(self._xos_audio_list_path)
         if response.get("code") != 200:
@@ -1277,7 +1368,7 @@ class AudioPlugin:
                           "duration_ms": entry.get("duration_ms"),
                           "duration_s": entry.get("duration_s"),
                           "create_time": entry.get("create_time")})
-        return {"state": "ok", "files": files, "play_action": "play_by_file_name",
+        return {"state": "ok", "files": files, "play_action": "play_robot_file",
                 "id_mapping_available": False,
                 "note": "XOS exposes audio_name but no numeric audio-library ID in this endpoint."}
 
@@ -1336,7 +1427,7 @@ class AudioPlugin:
             return {"state": "error", "message": response.get("msg", "XOS audio upload failed")}
         return {
             "state": "ok", "file_name": file_name, "audio_name": file_name,
-            "bytes_uploaded": len(payload), "next_action": "play_by_file_name",
+            "bytes_uploaded": len(payload), "next_action": "play_robot_file",
             "play_args": {"file_name": file_name, "force_play": True, "timeout": 0},
             "already_exists": already_exists,
             "note": "Registered through the XOS audio-library API. XOS exposes audio_name, not a numeric ID.",
@@ -1495,6 +1586,8 @@ class AudioPlugin:
         response = _wait_for_future(self._srv_volume.call_async(req), 2.0)
         if response is None:
             return {"state": "error", "message": "set-volume request timed out"}
+        if response.success:
+            self._volume = req.volume
         return {"state": "ok" if response.success else "error", "volume": req.volume, "message": response.message}
 
     def _stop_audio(self):

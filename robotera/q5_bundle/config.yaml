@@ -52,6 +52,10 @@ plugins:
     enabled: true
     device: "plughw:2,0"
     library_dir: "/opt/phanthy-motus/data/audios"
+    # Agent Core writes files selected in the canvas here, then the driver
+    # retrieves them through AGENT_CORE_URL's existing file-download endpoint.
+    agent_core_upload_dir: "/tmp/uploads"
+    volume: 50
     upload_max_bytes: 20971520
     xos_http_base: "http://192.168.8.100:1888"
   camera_rgb:
