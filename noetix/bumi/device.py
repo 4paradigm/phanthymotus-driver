@@ -158,7 +158,12 @@ def _acp_notify(action_id: str, status: str, result: dict,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        _urllib.urlopen(request, timeout=5, context=context)
+        with _urllib.urlopen(request, timeout=5, context=context):
+            pass
+        print(
+            f"[ACP] {status}: action_id={action_id} tool={tool}",
+            flush=True,
+        )
     except Exception as exc:
         print(
             f"[ACP] callback failed for {action_id}: {exc}",
@@ -734,7 +739,8 @@ class LocoPlugin:
         return {
             "state": "accepted",
             "action_id": action_id,
-            "command_sent": False,
+            "execution_phase": "queued",
+            "command_will_be_sent_after_checks": True,
             "requested_action": action,
             "safety_requirements": safety,
             "message": (
@@ -2026,8 +2032,10 @@ class LocoPlugin:
         # Prime that transition every time instead of only once per process.
         neutral_preroll_s = (
             self._control_cold_preroll_s if command_name == "START" else None)
+        observation_timeout_s = 6.0 if command_name == "START" else 3.0
         observed = self._send_edge_and_wait(
-            _get_control_cmd(command_name), expected_modes | {26}, timeout_s=3.0,
+            _get_control_cmd(command_name), expected_modes | {26},
+            timeout_s=observation_timeout_s,
             preroll_override_s=neutral_preroll_s)
         step_result = {
             "step": step,
@@ -2036,6 +2044,7 @@ class LocoPlugin:
             "observed_workmode": observed,
             "observed_workmode_name": _WORKMODE_NAMES.get(observed, "unknown"),
             "confirmed": observed in expected_modes,
+            "observation_timeout_s": observation_timeout_s,
         }
         if neutral_preroll_s is not None:
             step_result["neutral_preroll_s"] = neutral_preroll_s

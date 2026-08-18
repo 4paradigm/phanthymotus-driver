@@ -51,6 +51,12 @@ workers report `completed`, `error`, or `cancelled` to `/api/acp/complete`.
 This keeps Agent Core's actuator barrier active until the bounded move or action
 really terminates. Stopping the plugin cancels pending timers and playback
 monitoring before reporting the affected ACP actions as cancelled.
+Posture calls initially return `execution_phase=queued`; no `command_sent`
+claim is made until the background worker has completed its safety checks. A
+disabled-to-enabled `START` edge is still sent exactly once because it is a
+toggle, but its workmode observation window is six seconds to tolerate delayed
+firmware state feedback. Successful and failed ACP callbacks are logged with
+their `action_id` for field diagnosis.
 
 The former `switch_mode` tool is split into three user-facing cards. Internal
 `enable`, `ready` and `walk` transitions are completed automatically and are no
