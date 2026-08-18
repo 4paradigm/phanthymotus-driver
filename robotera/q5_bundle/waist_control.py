@@ -14,6 +14,11 @@ from body_command import get_router
 from control_contract import q5_active_status, q5_is_control_ready
 from joint_limits import JOINT_LIMITS, limits_for
 
+try:
+    from legacy_direct_control import Q5ControlModePlugin
+except ImportError:
+    Q5ControlModePlugin = None
+
 CARD = "waist_control"
 TYPE = "actuator"
 TOPIC = "/wr1_controller/commands"
@@ -75,6 +80,21 @@ class Plugin:
         self._lock = threading.Lock()
         self._stop_event = self._thread = self._active = None
 
+        # Embedded Q5 control-mode helper so waist_control can self-prepare.
+        self._control_mode = None
+        if Q5ControlModePlugin is not None:
+            try:
+                self._control_mode = Q5ControlModePlugin(plugin_config, namespace, executor, client)
+            except Exception:
+                self._control_mode = None
+
+    def prepare(self):
+        """Delegate to embedded Q5ControlModePlugin for position-control preparation."""
+        if self._control_mode is None:
+            return _failure("CONTROL_MODE_UNAVAILABLE",
+                            "Q5 control-mode helper is not initialized")
+        return self._control_mode.dispatch("prepare_position_control", {})
+
     def get_tool(self):
         position_fields = {}
         for detail in WAIST_ACTIONS.values():
@@ -86,10 +106,11 @@ class Plugin:
             }
         return {"name": CARD, "type": TYPE, "multiInstance": False, "description": DESC,
                 "inputSchema": {"type": "object", "properties": {
-                    "action": {"type": "string", "enum": ["start", *WAIST_ACTIONS, "cancel", "info"], "oneOf": [
+                    "action": {"type": "string", "enum": ["start", *WAIST_ACTIONS, "prepare", "cancel", "info"], "oneOf": [
                         {"const": "start", "title": "检查连接状态"},
                         *[{"const": action, "title": detail["title"], "description": detail["description"]}
                           for action, detail in WAIST_ACTIONS.items()],
+                        {"const": "prepare", "title": "准备位置直控"},
                         {"const": "cancel", "title": "取消并保持"},
                         {"const": "info", "title": "查看状态"},
                     ]},
@@ -99,6 +120,7 @@ class Plugin:
                     "start": {"params": [], "description": "检查 ROS 连接和机器人状态。"},
                     **{action: {"params": [detail["field"]], "description": detail["description"]}
                        for action, detail in WAIST_ACTIONS.items()},
+                    "prepare": {"params": [], "description": "执行位置直控准备：pos→READY→垂手→抬臂→ACTIVE，解锁控制"},
                     "cancel": {"params": [], "description": "取消当前微调，并保持当前位置。"},
                     "info": {"params": [], "description": "查看运动状态与安全条件。"},
                 },
@@ -197,6 +219,8 @@ class Plugin:
             return {"ok": True, "state": "moving" if active else "idle", "active_command": active, "safety": self._safety()}
         if action in ("cancel", "stop"):
             return self._stop("command")
+        if action == "prepare":
+            return self.prepare()
         detail = WAIST_ACTIONS.get(action)
         if detail is None:
             return None

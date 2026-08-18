@@ -66,8 +66,6 @@ _GESTURES_DEG = {
     "raise":           [-10, 95, 0, -15, 0, 0, 0],
     "shake_hands":     [-55, 15, 5, -35, 0, 0, 0],
     "high_five":       [-40, 40, -20, -80, 0, 0, 50],
-    "fist_bump":       [-50, 20, 10, -40, 0, 0, 0],
-    "cross_arms":      [-30, 30, 60, -100, 0, 0, 0],
 }
 
 _PREPARE_DEG = {
@@ -76,8 +74,6 @@ _PREPARE_DEG = {
     "raise":           [-10, 70, 0, -30, 0, 0, 0],
     "shake_hands":     [-30, 10, 0, -20, 0, 0, 0],
     "high_five":       [-25, 25, -10, -45, 0, 0, 10],
-    "fist_bump":       [-30, 15, 5, -25, 0, 0, 0],
-    "cross_arms":      [-20, 20, 45, -70, 0, 0, 0],
 }
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -85,7 +81,6 @@ _PREPARE_DEG = {
 _GESTURE_LABELS = {
     "salute": "敬礼", "welcome": "欢迎", "raise": "举手",
     "shake_hands": "握手", "high_five": "击掌",
-    "fist_bump": "碰拳", "cross_arms": "交叉双臂",
 }
 
 # Neutral pose: shoulder_pitch -30° (~-0.52 rad) so arms rest naturally in
@@ -264,8 +259,7 @@ class Plugin:
     # ── Tool definition ──────────────────────────────────────────────────
 
     def get_tool(self) -> dict:
-        actions = ["salute", "welcome", "raise", "shake_hands", "high_five",
-                   "fist_bump", "cross_arms", "reset",
+        actions = ["salute", "welcome", "raise", "shake_hands", "high_five", "reset",
                    "cancel", "stop", "start", "prepare", "info"]
         one_of_actions = [
             {"const": "start", "title": "检查连接状态"},
@@ -323,8 +317,6 @@ class Plugin:
                     "raise": {"params": ["side", "speed"], "description": "将手臂高举到头部上方后回正"},
                     "shake_hands": {"params": ["side", "cycles", "speed"], "description": "向前伸手并轻柔上下摆动，做出握手动作"},
                     "high_five": {"params": ["side", "speed"], "description": "将手掌伸到身体前方并保持在肩部附近，做出击掌等待姿势"},
-                    "fist_bump": {"params": ["side", "speed"], "description": "轻握拳头向前伸出，做出碰拳姿势"},
-                    "cross_arms": {"params": ["side", "speed"], "description": "双臂在胸前交叉后回正"},
                     "reset": {"params": ["speed"], "description": "取消序列并回到中性姿态"},
                     "cancel": {"params": [], "description": "取消尚未发送的后续动作帧，并保持当前位置"},
                     "stop": {"params": [], "description": "停止当前手势并回到中性姿态（归零）"},
@@ -333,8 +325,7 @@ class Plugin:
                     "info": {"params": [], "description": "查看当前运动和安全条件"},
                 },
                 "x-completion": {
-                    "actions": ["salute", "welcome", "raise", "shake_hands", "high_five",
-                                "fist_bump", "cross_arms"],
+                    "actions": ["salute", "welcome", "raise", "shake_hands", "high_five"],
                     "timeout": 60,
                 },
             },
