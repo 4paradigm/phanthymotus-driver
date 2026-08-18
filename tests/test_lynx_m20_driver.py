@@ -181,6 +181,13 @@ class LynxM20ContractTests(unittest.TestCase):
         self.assertEqual(expected, plugin.dispatch("info", {})["topic_out"])
         self.assertEqual({"state": "idle"}, plugin.dispatch("stop", {}))
 
+    def test_mapping_view_supports_live_and_latched_grid_publishers(self):
+        source = (DRIVER / "device.py").read_text()
+        self.assertIn("DurabilityPolicy.VOLATILE", source)
+        self.assertIn("DurabilityPolicy.TRANSIENT_LOCAL", source)
+        self.assertIn("ReliabilityPolicy.BEST_EFFORT", source)
+        self.assertIn("ReliabilityPolicy.RELIABLE", source)
+
     def test_mapping_ssh_is_pinned_noninteractive_and_rejects_shell_input(self):
         class Completed:
             returncode = 0

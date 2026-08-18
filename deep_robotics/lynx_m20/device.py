@@ -106,6 +106,7 @@ class M20Nodes:
     def __init__(self, config, namespace, ros2):
         from drdds.msg import Gait, JointsData, MotionInfo, MotionState, NavCmd, NavSat, StdMsgInt32, StdStatus
         from nav_msgs.msg import OccupancyGrid, Odometry
+        from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
         from sensor_msgs.msg import Imu, PointCloud2
         from std_msgs.msg import String, UInt8MultiArray
         from rclpy.node import Node
@@ -179,11 +180,30 @@ class M20Nodes:
         if self.is_pro:
             self.mapping_topic = f"/{namespace}/lynx_m20/mapping_view"
             self.mapping_pub = self.core.create_publisher(UInt8MultiArray, self.mapping_topic, 1)
+            mapping_callback = self._mapping_callback(UInt8MultiArray)
+            live_qos = QoSProfile(
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                durability=DurabilityPolicy.VOLATILE,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=1,
+            )
+            latched_qos = QoSProfile(
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=1,
+            )
             self.robot.create_subscription(
                 OccupancyGrid,
                 topics.get("grid_map", "/GRID_MAP"),
-                self._mapping_callback(UInt8MultiArray),
-                1,
+                mapping_callback,
+                live_qos,
+            )
+            self.robot.create_subscription(
+                OccupancyGrid,
+                topics.get("grid_map", "/GRID_MAP"),
+                mapping_callback,
+                latched_qos,
             )
 
     def _callback(self, key, publisher, *, as_json=False, string_type=None):
