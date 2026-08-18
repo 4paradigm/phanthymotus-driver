@@ -36,7 +36,10 @@ class BridgeWorker:
         self._ctx = mp.get_context("spawn")
         self._cmd_q = self._ctx.Queue()
         self._sensor_q = self._ctx.Queue()
-        self._media_q = self._ctx.Queue(maxsize=4)
+        # Keep independent latest frames for RGB, depth, and pointcloud. The
+        # worker dispatches them by kind; a single tiny queue otherwise lets a
+        # 15 Hz RGB stream overwrite slower depth/pointcloud frames.
+        self._media_q = self._ctx.Queue(maxsize=16)
         self._audio_q = self._ctx.Queue(maxsize=100)
         self._speaker_q = self._ctx.Queue(maxsize=64)
         self._proc = None
@@ -119,7 +122,7 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
     import rclpy.qos
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-    from std_msgs.msg import String
+    from std_msgs.msg import String, UInt8MultiArray
     from sensor_msgs.msg import CompressedImage, Image
     from audio_msgs.msg import AudioChunk
 
@@ -165,6 +168,7 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
     pub_rgb = node.create_publisher(CompressedImage, f"{prefix}/camera/rgb", QOS_MEDIA)
     pub_depth = node.create_publisher(Image, f"{prefix}/camera/depth", QOS_MEDIA)
     pub_depth_preview = node.create_publisher(CompressedImage, f"{prefix}/camera/depth_preview", QOS_MEDIA)
+    pub_pointcloud = node.create_publisher(UInt8MultiArray, f"{prefix}/camera/pointcloud", QOS_MEDIA)
     # Audio is a live lossy stream. Match the audio cards used by the other
     # drivers so Agent Core/FastDDS subscribers can request BEST_EFFORT without
     # a reliability negotiation mismatch or unnecessary retransmission delay.
@@ -308,6 +312,12 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
             out.step = int(media["step"])
             out.data = media["data"]
             pub_depth.publish(out)
+        elif kind == "pointcloud":
+            # Agent Core's point-cloud renderer consumes this compact binary
+            # envelope: uint32 point_step, uint32 count, float32 xyz * count.
+            out = UInt8MultiArray()
+            out.data = list(media["data"])
+            pub_pointcloud.publish(out)
 
     # ── Main loop ──────────────────────────────────────────────────────────────
     running = True
@@ -351,14 +361,16 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
         except Exception:
             pass
 
-        newest_media = None
+        newest_media = {}
         while True:
             try:
-                newest_media = media_q.get_nowait()
+                media = media_q.get_nowait()
+                if isinstance(media, dict) and media.get("kind"):
+                    newest_media[media["kind"]] = media
             except Exception:
                 break
-        if newest_media is not None:
-            _dispatch_media(newest_media)
+        for media in newest_media.values():
+            _dispatch_media(media)
 
         # Unlike images, PCM frames must preserve their order. Drain the
         # bounded queue so short bridge delays do not produce audible gaps.
