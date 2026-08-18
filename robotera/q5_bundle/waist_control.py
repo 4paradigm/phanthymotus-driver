@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import math
+import os
+import ssl
 import threading
 import time
+import urllib.request
 
 from body_command import get_router
 from control_contract import q5_active_status, q5_is_control_ready
@@ -22,6 +26,31 @@ WAIST_ACTIONS = {
     },
 }
 DESC = "Q5 腰部控制：偏航（左右扭腰）"
+
+
+def _acp_notify(action_id: str, status: str, result: dict, tool: str = ""):
+    """POST action completion to Agent Core (module-level ACP helper)."""
+    agent_core_url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    payload = json.dumps({
+        "action_id": action_id,
+        "status": status,
+        "result": result,
+        "tool": tool,
+        "ts": time.time(),
+    }).encode()
+    try:
+        req = urllib.request.Request(
+            f"{agent_core_url}/api/acp/complete",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=5, context=ctx)
+    except Exception:
+        pass  # ACP failure must not block motion
 
 
 def _failure(code, message, **details):
@@ -72,7 +101,12 @@ class Plugin:
                        for action, detail in WAIST_ACTIONS.items()},
                     "cancel": {"params": [], "description": "取消当前微调，并保持当前位置。"},
                     "info": {"params": [], "description": "查看运动状态与安全条件。"},
-                }}}
+                },
+                "x-completion": {
+                    "actions": list(WAIST_ACTIONS.keys()),
+                    "timeout": 15,
+                },
+            }}
 
     def _safety(self):
         status = self._router.status()
@@ -95,6 +129,10 @@ class Plugin:
         if not q5_ready:
             return _failure("Q5_FSM_NOT_READY", "Q5 /xbot_state must be fresh and READY or ACTIVE before waist control",
                             status={**status, "q5_fsm": q5_status})
+        if not bool(getattr(self._client, "q5_position_control_prepared", False)):
+            return _failure("DIRECT_CONTROL_NOT_PREPARED",
+                            "Run q5_control_mode action=prepare_position_control first; vendor position-control sequence has not completed in this driver session",
+                            status=status)
         if joint_name is not None and joint_name not in self._client.snapshot().get("joints", {}):
             return _failure("WAIST_MODEL_MISMATCH", "Configured waist joint is absent from /joint_states", joint_name=joint_name)
         return status
@@ -118,20 +156,27 @@ class Plugin:
             return False
         return self._hold_position(name, value)
 
-    def _run(self, event, name, current, target, duration):
+    def _run(self, event, name, current, target, duration, action_id=None):
         steps = max(int(math.ceil(abs(target - current) / self._max_step)), int(math.ceil(duration * self._rate)), 1)
+        cancelled = True
         try:
             for index in range(1, steps + 1):
                 if event.is_set():
                     break
                 self._publish(name, current + (target - current) * index / steps)
                 event.wait(duration / steps)
+            cancelled = event.is_set()
         finally:
             self._hold_position(name, target) if not event.is_set() else self._hold_current(name)
             self._router.release(CARD)
             with self._lock:
                 if self._stop_event is event:
                     self._stop_event = self._thread = self._active = None
+            if action_id:
+                if cancelled:
+                    _acp_notify(action_id, "cancelled", {"joint_name": name}, CARD)
+                else:
+                    _acp_notify(action_id, "completed", {"joint_name": name, "target_rad": target}, CARD)
 
     def _stop(self, reason):
         with self._lock:
@@ -177,12 +222,14 @@ class Plugin:
                 self._router.release(CARD)
                 return _failure("MOTION_IN_PROGRESS", "A waist adjustment is already active; call stop first")
             event = threading.Event()
+            action_id = f"waist_control_{action}_{int(time.time()*1000)}"
             self._stop_event = event
             self._active = {"joint_name": name, "start_position_rad": current, "target_position_rad": target, "duration_s": duration, "started_at_ms": int(time.time() * 1000)}
-            self._thread = threading.Thread(target=self._run, args=(event, name, current, target, duration), daemon=True, name="q5_waist_control")
+            self._thread = threading.Thread(target=self._run, args=(event, name, current, target, duration, action_id), daemon=True, name="q5_waist_control")
             self._thread.start()
         return {"ok": True, "state": "moving", "waist_action": action,
                 "joint_name": name, "command": dict(self._active),
+                "action_id": action_id,
                 "stops_by_holding_current_position": True}
 
     def stop(self):
