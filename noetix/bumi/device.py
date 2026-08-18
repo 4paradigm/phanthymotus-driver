@@ -898,8 +898,12 @@ class LocoPlugin:
 
 # ── MicPlugin (sensor, subprocess) ────────────────────────────────────────────
 
-def _mic_subprocess(namespace: str):
-    """Mic capture subprocess — polls MediaController, publishes AudioChunk."""
+def _mic_subprocess(namespace: str, gain: float = 50.0):
+    """Mic capture subprocess — polls MediaController, publishes AudioChunk.
+
+    gain: 采样增益。默认 50（SDK 信号约 8-bit 动态，需放大到 16-bit 可用电平）。
+          回环测试/近距离使用时可调低（如 5~15）抑制声学正反馈啸叫。
+    """
     import os as _os
     _os.environ.setdefault('CYCLONEDDS_URI', 'file:///work/noetix_sdk_bumi/config/dds.xml')
     import sys as _sys
@@ -930,7 +934,7 @@ def _mic_subprocess(namespace: str):
     topic = f"/{namespace}/mic/audio"
     pub = node.create_publisher(_AudioChunk, topic, _QOS)
 
-    print(f"[mic_subprocess] publishing to {topic}", flush=True)
+    print(f"[mic_subprocess] publishing to {topic} (gain={gain})", flush=True)
 
     frame_count = 0
     t_start = _time.monotonic()
@@ -950,7 +954,7 @@ def _mic_subprocess(namespace: str):
 
             # SDK returns low-amplitude signal (~8-bit dynamic range in 16-bit container)
             # Apply moderate gain to reach usable 16-bit level without clipping
-            mono = _np.clip(mono.astype(_np.int32) * 50, -32768, 32767).astype(_np.int16)
+            mono = _np.clip(mono.astype(_np.int32) * gain, -32768, 32767).astype(_np.int16)
 
             # Accumulate until we have enough for a proper chunk
             buffer = _np.concatenate([buffer, mono])
@@ -977,6 +981,7 @@ class MicPlugin:
     def __init__(self, plugin_config: dict, namespace: str, executor, media_ctrl):
         self._namespace = namespace
         self._topic = f"/{namespace}/mic/audio"
+        self._gain = float(plugin_config.get("gain", 50.0))
         self._proc: subprocess.Popen | None = None
 
     def get_tool(self) -> dict:
@@ -993,7 +998,7 @@ class MicPlugin:
         import sys
         self._proc = subprocess.Popen(
             [sys.executable, "-c",
-             f"import sys; sys.path.insert(0, '/work'); from device import _mic_subprocess; _mic_subprocess({self._namespace!r})"],
+             f"import sys; sys.path.insert(0, '/work'); from device import _mic_subprocess; _mic_subprocess({self._namespace!r}, gain={self._gain})"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         )
         # Forward subprocess stdout in background
