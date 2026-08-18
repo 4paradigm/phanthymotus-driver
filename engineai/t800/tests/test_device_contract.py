@@ -399,7 +399,7 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("gamepad", moving["speed_source"])
         self.assertEqual("gamepad_analog", moving["control_source"])
         self.assertEqual("move", moving["action"])
-        self.assertEqual("forward", moving["direction"])
+        self.assertNotIn("direction", moving)
         self.assertEqual([], moving["buttons"])
         self.assertEqual("1.50 m/s", moving["speed"])
         self.assertEqual("motion_start", moving["event"])
@@ -427,7 +427,7 @@ class DevicePluginContractTests(unittest.TestCase):
         snapshot = plugin.dispatch("status", {})
         self.assertEqual("stand", snapshot["action"])
         self.assertEqual("gamepad_analog", snapshot["control_source"])
-        self.assertEqual("none", snapshot["direction"])
+        self.assertNotIn("direction", snapshot)
         self.assertEqual(["LB", "A"], snapshot["buttons"])
         self.assertEqual("gamepad_action", snapshot["event"])
 
@@ -442,6 +442,8 @@ class DevicePluginContractTests(unittest.TestCase):
         plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
         for raw, action in (
             ("sit_down", "sit"),
+            ("stance_to_sitdown", "sit"),
+            ("kneeling_pose", "kneel"),
             ("boxing_combo", "punch"),
             ("screen_punch", "punch"),
         ):
@@ -487,6 +489,134 @@ class DevicePluginContractTests(unittest.TestCase):
         snapshot = plugin.dispatch("status", {})
         self.assertEqual("stand", snapshot["action"])
         self.assertEqual(["LB", "A"], snapshot["buttons"])
+
+    def test_motion_events_show_rl_basic_as_stand_when_stationary(self):
+        plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
+        plugin._on_motion_state(types.SimpleNamespace(current_motion_task="rl_basic"))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("rl_basic", snapshot["current_motion_state"])
+        self.assertEqual("stand", snapshot["action"])
+        self.assertEqual("stopped", snapshot["motion_state"])
+
+    def test_motion_events_locomotion_states_show_stand_when_stationary(self):
+        plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
+        for raw in ("walk", "walk_server", "lower_body_balance", "loco", "rl_terrain"):
+            with self.subTest(raw=raw):
+                plugin._on_motion_state(types.SimpleNamespace(current_motion_task=raw))
+                snapshot = plugin.dispatch("status", {})
+                self.assertEqual(raw, snapshot["current_motion_state"])
+                self.assertEqual("stand", snapshot["action"])
+                self.assertEqual("stopped", snapshot["motion_state"])
+
+    def test_motion_events_locomotion_state_shows_move_while_gamepad_moving(self):
+        plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
+        plugin._on_gamepad(types.SimpleNamespace(
+            hardware_connected=True,
+            digital_states=[0] * 12,
+            analog_states=[0.0, 0.0, 0.0, 0.5, 0.0, 0.0],
+        ))
+        plugin._on_motion_state(types.SimpleNamespace(current_motion_task="rl_basic"))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("move", snapshot["action"])
+        self.assertEqual("moving", snapshot["motion_state"])
+
+    def test_motion_events_stale_speed_treated_as_stationary(self):
+        plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
+        plugin._on_gamepad(types.SimpleNamespace(
+            hardware_connected=True,
+            digital_states=[0] * 12,
+            analog_states=[0.0, 0.0, 0.0, 0.5, 0.0, 0.0],
+        ))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("move", snapshot["action"])
+        self.assertEqual("moving", snapshot["motion_state"])
+        # If the gamepad/odometry topic stops publishing, the latest speed sample
+        # becomes stale and a stationary robot must not keep showing as moving.
+        with plugin._lock:
+            plugin._latest_speed_updated = time.monotonic() - 2.0
+        plugin._on_motion_state(types.SimpleNamespace(current_motion_task="walk_server"))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("stand", snapshot["action"])
+        self.assertEqual("stopped", snapshot["motion_state"])
+
+    def test_motion_events_transitions_map_to_target(self):
+        plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
+        for raw, action in (
+            ("rl_mimic_stance_to_sitdown", "sit"),
+            ("stance_to_sitdown", "sit"),
+            ("rl_mimic_sitdown_to_stance", "stand"),
+            ("sitdown_to_stance", "stand"),
+            ("supine_to_stance", "get_up"),
+            ("rl_mimic_prone_to_stance", "get_up"),
+            ("rl_mimic_stance_to_supine", "lie_down"),
+            ("rl_mimic_stance_to_kneeling", "kneel"),
+            ("rl_mimic_kneeling_to_stance", "stand"),
+        ):
+            with self.subTest(raw=raw):
+                plugin._on_motion_state(types.SimpleNamespace(current_motion_task=raw))
+                snapshot = plugin.dispatch("status", {})
+                self.assertEqual(raw, snapshot["current_motion_state"])
+                self.assertEqual(action, snapshot["action"])
+                self.assertEqual("motion_state", snapshot["control_source"])
+                self.assertEqual("motion_state_changed", snapshot["event"])
+
+    def test_motion_events_punch_buttons_map_to_punch_names(self):
+        plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
+        # 左直拳 A + CROSS_Y_RIGHT
+        left = [0] * 12
+        left[2] = 1  # A
+        left[11] = 1  # CROSS_Y_RIGHT
+        plugin._on_gamepad(types.SimpleNamespace(
+            hardware_connected=True,
+            digital_states=left,
+            analog_states=[0.0] * 6,
+        ))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("left_straight", snapshot["action"])
+        self.assertEqual("gamepad_analog", snapshot["control_source"])
+        self.assertEqual(["A", "CROSS_Y_RIGHT"], snapshot["buttons"])
+
+        # 右直拳 A + CROSS_Y_LEFT
+        right = [0] * 12
+        right[2] = 1  # A
+        right[10] = 1  # CROSS_Y_LEFT
+        plugin._on_gamepad(types.SimpleNamespace(
+            hardware_connected=True,
+            digital_states=right,
+            analog_states=[0.0] * 6,
+        ))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("right_straight", snapshot["action"])
+        self.assertEqual(["A", "CROSS_Y_LEFT"], snapshot["buttons"])
+
+    def test_motion_events_punch_action_survives_same_motion_state_republish(self):
+        plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
+        # Enter the boxing motion state, then throw a left straight punch.
+        plugin._on_motion_state(types.SimpleNamespace(current_motion_task="rl_mimic_boxing"))
+        left = [0] * 12
+        left[2] = 1  # A
+        left[11] = 1  # CROSS_Y_RIGHT
+        plugin._on_gamepad(types.SimpleNamespace(
+            hardware_connected=True,
+            digital_states=left,
+            analog_states=[0.0] * 6,
+        ))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("left_straight", snapshot["action"])
+        # T800 keeps the same current_motion_task while punching; re-publishing the
+        # same boxing state must not override the fresher gamepad action.
+        plugin._on_motion_state(types.SimpleNamespace(current_motion_task="rl_mimic_boxing"))
+        plugin._on_motion_state(types.SimpleNamespace(current_motion_task="rl_mimic_boxing"))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("left_straight", snapshot["action"])
+        # Releasing the buttons falls back to the boxing motion state action.
+        plugin._on_gamepad(types.SimpleNamespace(
+            hardware_connected=True,
+            digital_states=[0] * 12,
+            analog_states=[0.0] * 6,
+        ))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("punch", snapshot["action"])
 
     def test_derived_diagnostics_and_capability_resources(self):
         self.state._set("imu", {
