@@ -72,6 +72,9 @@ COPY hand_control.py /work/hand_control.py
 COPY hand_gesture.py /work/hand_gesture.py
 COPY arm_gesture.py /work/arm_gesture.py
 COPY head_control.py /work/head_control.py
+COPY waist_control.py /work/waist_control.py
+COPY waist_gesture.py /work/waist_gesture.py
+COPY imu.py /work/imu.py
 COPY mic.py /work/mic.py
 COPY speaker.py /work/speaker.py
 COPY audio.py /work/audio.py
