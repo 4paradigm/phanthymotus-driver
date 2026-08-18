@@ -71,7 +71,7 @@ def _led_mode(value: object, default: str = "") -> str:
 class VoiceGesturePlugin:
     """Execute configured official T800 motion plans after wake-word ASR."""
 
-    def __init__(self, config: dict, namespace: str, ros2, tts_plugin=None):
+    def __init__(self, config: dict, namespace: str, ros2):
         plugin_config = config.get("plugins", {}).get("voice_gesture", {}) or {}
         self._config = plugin_config
         self._namespace = namespace
@@ -105,13 +105,6 @@ class VoiceGesturePlugin:
         self._led_restore_mode = _led_mode(led_config.get("restore_mode"), "constant_white")
         self._led_duration = max(0.0, float(led_config.get("duration_sec", 1.0)))
         self._led_cooldown = max(0.0, float(led_config.get("cooldown_sec", 0.5)))
-        tts_config = plugin_config.get("tts_feedback", {}) or {}
-        self._tts_enabled = bool(tts_config.get("enabled", True))
-        self._tts_language = str(tts_config.get("language", "zh"))
-        self._tts_speaker = str(tts_config.get("speaker", "default"))
-        self._tts_rate = max(50, min(300, int(tts_config.get("rate", 150))))
-        self._tts_plugin = tts_plugin
-
         self._core_node = Node("t800_voice_gesture", context=ros2.ctx_core)
         self._plan_node = Node("t800_voice_gesture_plan", context=ros2.ctx_robot)
         self._led_node = Node("t800_voice_gesture_led", context=ros2.ctx_robot)
@@ -163,7 +156,6 @@ class VoiceGesturePlugin:
             catalog[str(motion_id)] = {
                 "description": str(definition.get("description", motion_id)),
                 "phrases": [_normalise_text(str(item)) for item in phrases if str(item).strip()],
-                "reply_text": str(definition.get("reply_text", "")).strip(),
                 "motion_plan": motion_plan,
             }
         return catalog
@@ -173,7 +165,7 @@ class VoiceGesturePlugin:
             "name": "voice_gesture",
             "type": "actuator",
             "multiInstance": False,
-            "description": "T800 语音触发的官方关节动作与 TTS 回复",
+            "description": "T800 语音触发的官方关节动作",
             "inputSchema": action_schema(
                 {
                     "start": ([], "开始处理 ASR 最终结果"),
@@ -361,7 +353,6 @@ class VoiceGesturePlugin:
             )
             self._thread.start()
         self._publish_event("motion_started", motion_id=motion_id, text=text)
-        self._speak_reply(motion_id, text)
 
     def _run_motion(self, motion_id: str, text: str) -> None:
         try:
@@ -440,36 +431,6 @@ class VoiceGesturePlugin:
             "motion_hold_completed", request_id=request_id, step=step["name"],
             duration_sec=hold_after,
         )
-
-    def _speak_reply(self, motion_id: str, text: str) -> None:
-        if not self._tts_enabled:
-            return
-        reply = str(self._motions[motion_id].get("reply_text", "")).strip()
-        if not reply:
-            return
-        if self._tts_plugin is None:
-            self._publish_event(
-                "tts_reply_error", motion_id=motion_id, text=text, reply=reply,
-                error="TTS actuator is unavailable",
-            )
-            return
-        try:
-            result = self._tts_plugin.dispatch("speak", {
-                "text": reply,
-                "language": self._tts_language,
-                "speaker": self._tts_speaker,
-                "rate": self._tts_rate,
-            })
-            if isinstance(result, dict) and "error" in result:
-                raise RuntimeError(str(result["error"]))
-            self._publish_event(
-                "tts_reply_published", motion_id=motion_id, text=text, reply=reply,
-            )
-        except Exception as exc:  # noqa: BLE001
-            self._publish_event(
-                "tts_reply_error", motion_id=motion_id, text=text, reply=reply,
-                error=str(exc),
-            )
 
     def _wait_for_idle(self, timeout: float, *, minimum_request_id: int | None = None) -> None:
         idle = int(self._state_type.IDLE)

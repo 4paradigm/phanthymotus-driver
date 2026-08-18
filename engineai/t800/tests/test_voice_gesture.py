@@ -41,16 +41,6 @@ class FakeUnavailableClient:
         return False
 
 
-class FakeTtsPlugin:
-    def __init__(self, result=None):
-        self.calls = []
-        self.result = result or {"state": "published"}
-
-    def dispatch(self, action, args):
-        self.calls.append((action, args))
-        return self.result
-
-
 class VoiceGestureMotorEnableTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -124,14 +114,9 @@ class VoiceGestureActuatorTests(unittest.TestCase):
         plugin = self.module.VoiceGesturePlugin.__new__(self.module.VoiceGesturePlugin)
         plugin._asr_topic = "/ubuntu/mic/audio/asr"
         plugin._events_topic = "/ubuntu/voice_gesture/events"
-        plugin._tts_enabled = True
-        plugin._tts_language = "zh"
-        plugin._tts_speaker = "default"
-        plugin._tts_rate = 150
-        plugin._tts_plugin = FakeTtsPlugin()
         plugin._motions = {
-            "wave": {"reply_text": "你好", "motion_plan": []},
-            "shake_hand": {"reply_text": "好的", "motion_plan": []},
+            "wave": {"motion_plan": []},
+            "shake_hand": {"motion_plan": []},
         }
         plugin._cancel = threading.Event()
         plugin.events = []
@@ -159,19 +144,6 @@ class VoiceGestureActuatorTests(unittest.TestCase):
             resolve("/custom/asr", "robot_alpha", "mic/audio/asr"),
         )
 
-    def test_wave_and_handshake_reuse_tts_actuator(self):
-        plugin = self.make_plugin()
-
-        plugin._speak_reply("wave", "小范小范你好")
-        plugin._speak_reply("shake_hand", "小范小范握手")
-
-        self.assertEqual("你好", plugin._tts_plugin.calls[0][1]["text"])
-        self.assertEqual("好的", plugin._tts_plugin.calls[1][1]["text"])
-        self.assertEqual(
-            ["tts_reply_published", "tts_reply_published"],
-            [event for event, _fields in plugin.events],
-        )
-
     def test_handshake_hold_is_cancel_aware(self):
         plugin = self.make_plugin()
 
@@ -193,8 +165,6 @@ class VoiceGestureDeploymentConfigTests(unittest.TestCase):
         self.assertIn('asr_topic: "mic/audio/asr"', config)
         self.assertIn('events_topic: "voice_gesture/events"', config)
         self.assertIn("motor_enable_required: false", config)
-        self.assertIn('reply_text: "你好"', config)
-        self.assertIn('reply_text: "好的"', config)
         self.assertIn("hold_after_sec: 2.0", config)
 
     def test_standard_image_contains_integrated_voice_gesture(self):
@@ -204,7 +174,6 @@ class VoiceGestureDeploymentConfigTests(unittest.TestCase):
         self.assertIn("voice_gesture.py config.yaml", dockerfile)
         self.assertIn("import main, voice_gesture", dockerfile)
         self.assertIn("from voice_gesture import VoiceGesturePlugin", main)
-        self.assertIn('instances.get("tts")', main)
 
     def test_no_voice_gesture_specific_deployment_files_remain(self):
         for name in (

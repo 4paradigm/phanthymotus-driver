@@ -198,9 +198,7 @@ class T800DeviceBundle:
         if voice_gesture_config.get("enabled", False):
             from voice_gesture import VoiceGesturePlugin
 
-            instance = VoiceGesturePlugin(
-                config, namespace, ros2, tts_plugin=instances.get("tts")
-            )
+            instance = VoiceGesturePlugin(config, namespace, ros2)
             instances["voice_gesture"] = instance
             self._plugins.append(instance)
 
