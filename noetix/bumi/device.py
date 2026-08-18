@@ -19,6 +19,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import rclpy
 from rclpy.node import Node
@@ -127,6 +128,43 @@ _FACE_UP_JOINT_TOLERANCES = (
 )
 
 _ControlCmd = None  # Lazy-loaded enum module
+
+
+def _acp_notify(action_id: str, status: str, result: dict,
+                tool: str) -> None:
+    """Report an asynchronous physical-action terminal state to Agent Core."""
+    import json as _json
+    import os as _os
+    import ssl as _ssl
+    import sys as _sys
+    import urllib.request as _urllib
+
+    agent_core_url = _os.environ.get(
+        "AGENT_CORE_URL", "https://localhost:15678")
+    context = _ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = _ssl.CERT_NONE
+    payload = _json.dumps({
+        "action_id": action_id,
+        "status": status,
+        "result": result,
+        "tool": tool,
+        "ts": time.time(),
+    }).encode()
+    try:
+        request = _urllib.Request(
+            f"{agent_core_url}/api/acp/complete",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        _urllib.urlopen(request, timeout=5, context=context)
+    except Exception as exc:
+        print(
+            f"[ACP] callback failed for {action_id}: {exc}",
+            file=_sys.stderr,
+            flush=True,
+        )
 
 
 def _get_control_cmd(name: str):
@@ -349,6 +387,7 @@ class LocoPlugin:
         self._action_lock = threading.Lock()
         self._last_cmd_time: float = 0.0
         self._move_thread: threading.Thread | None = None
+        self._move_observation: dict | None = None
         self._move_stop_event = threading.Event()
         self._control_period = 0.01       # 100 Hz, matching the vendor demo
         self._control_preroll_s = 0.3     # refresh an already active DDS writer path
@@ -356,8 +395,13 @@ class LocoPlugin:
         self._control_channel_warmed = False
         self._auto_exit_lock = threading.Lock()
         self._auto_exit_timers: dict[str, threading.Timer] = {}
+        self._auto_exit_action_ids: dict[str, str] = {}
         self._playback_monitor_stop: threading.Event | None = None
         self._playback_monitor_thread: threading.Thread | None = None
+        self._playback_action_id: str | None = None
+        self._acp_lock = threading.Lock()
+        self._active_acp: dict[str, dict] = {}
+        self._lifecycle_stop_event = threading.Event()
 
     def get_tools(self) -> list:
         return [
@@ -422,6 +466,10 @@ class LocoPlugin:
                     },
                 },
                 "required": ["action"],
+                "x-completion": {
+                    "actions": ["move"],
+                    "timeout": 20,
+                },
                 "x-action-params": {
                     "move": {
                         "params": ["vx", "vy", "vyaw", "duration"],
@@ -463,6 +511,10 @@ class LocoPlugin:
                     },
                 },
                 "required": ["action"],
+                "x-completion": {
+                    "actions": ["stand_up", "lie_prone"],
+                    "timeout": 120,
+                },
                 "x-action-params": {
                     "stand_up": {
                         "params": [],
@@ -490,6 +542,10 @@ class LocoPlugin:
                     },
                 },
                 "required": ["action"],
+                "x-completion": {
+                    "actions": ["wipe_tears"],
+                    "timeout": 30,
+                },
                 "x-action-params": {
                     name: {"params": [], "description": description}
                     for name, description in {
@@ -529,6 +585,10 @@ class LocoPlugin:
                     },
                 },
                 "required": ["action"],
+                "x-completion": {
+                    "actions": ["play_recording"],
+                    "timeout": 150,
+                },
                 "x-action-params": {
                     "start_recording": {"params": [], "description": "自动准备模式后开始示教录制。确认机器人稳定站立；缓慢引导关节，禁止强推至机械限位。"},
                     "finish_and_save_recording": {"params": ["recording_id"], "description": "结束当前示教并保存到 recording_id。若尚未开始录制，则不会发送命令。"},
@@ -539,33 +599,200 @@ class LocoPlugin:
         }
 
     def start(self) -> None:
-        pass
+        self._lifecycle_stop_event.clear()
 
     def stop(self) -> None:
+        self._lifecycle_stop_event.set()
         self._cancel_all_auto_exits()
         self._cancel_playback_monitor()
         self._stop_move()
+        self._cancel_all_acp("Bumi actuator plugin stopped")
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
+            self._lifecycle_stop_event.clear()
             return {"state": "ready"}
         if action == "stop":
+            self._lifecycle_stop_event.set()
+            self._cancel_all_auto_exits()
+            self._cancel_playback_monitor()
             self._stop_move()
+            self._cancel_all_acp("Bumi actuator plugin stopped")
             return {"state": "idle"}
 
         tool_name = args.pop('_tool_name', '')
 
         if tool_name == "loco" and action == "move":
-            return self._do_move(args)
+            result = self._do_move(args)
+            if result.get("state") == "running":
+                action_id, _ = self._register_acp("loco", action)
+                result["action_id"] = action_id
+                move_thread = self._move_thread
+                move_observation = self._move_observation
+                threading.Thread(
+                    target=self._complete_move_acp,
+                    args=(action_id, move_thread, move_observation, dict(result)),
+                    daemon=True,
+                    name=f"bumi_move_acp_{action_id[-8:]}",
+                ).start()
+            return result
         if tool_name == "loco" and action == "stop_move":
             return self._stop_move()
         if tool_name == "stand_up_lie_prone" and action in _POSTURE_ACTIONS:
-            return self._do_posture_action(action, args)
+            return self._start_posture_acp(action, args)
         if tool_name == "semantic_action" and action in _PRESET_ACTIONS:
-            return self._do_preset_action(action, args)
+            result = self._do_preset_action(action, args)
+            if (action == "wipe_tears" and result.get("state") == "running"
+                    and result.get("confirmed_started")):
+                action_id, _ = self._register_acp(
+                    "semantic_action", action)
+                result["action_id"] = action_id
+                self._schedule_auto_walk_exit(
+                    "wipe_tears", 33, _TEAR_AUTO_EXIT_S,
+                    self._safety_requirements(action), action_id=action_id)
+            return result
         if tool_name == "action_recording" and action in _TEACHING_ACTIONS:
-            return self._do_teaching_action(action, args)
+            result = self._do_teaching_action(action, args)
+            if (action == "play_recording" and result.get("state") == "running"
+                    and result.get("confirmed_started")):
+                action_id, _ = self._register_acp(
+                    "action_recording", action)
+                result["action_id"] = action_id
+                self._schedule_playback_completion_monitor(
+                    self._safety_requirements(action), action_id=action_id)
+            return result
         return None
+
+    def _register_acp(self, tool: str, action: str,
+                      action_id: str | None = None) -> tuple[str, threading.Event]:
+        action_id = action_id or f"bumi_{action}_{uuid4().hex[:8]}"
+        cancel_event = threading.Event()
+        with self._acp_lock:
+            self._active_acp[action_id] = {
+                "tool": tool,
+                "action": action,
+                "cancel_event": cancel_event,
+            }
+        return action_id, cancel_event
+
+    def _finish_acp(self, action_id: str, status: str, result: dict) -> bool:
+        with self._acp_lock:
+            active = self._active_acp.pop(action_id, None)
+        if active is None:
+            return False
+        _acp_notify(action_id, status, result, active["tool"])
+        return True
+
+    def _cancel_all_acp(self, reason: str) -> None:
+        with self._acp_lock:
+            active_items = list(self._active_acp.items())
+            self._active_acp.clear()
+        for action_id, active in active_items:
+            active["cancel_event"].set()
+            _acp_notify(
+                action_id,
+                "cancelled",
+                {"action": active["action"], "reason": reason},
+                active["tool"],
+            )
+
+    def _complete_move_acp(self, action_id: str,
+                           move_thread: threading.Thread | None,
+                           observation: dict | None,
+                           start_result: dict) -> None:
+        if move_thread is not None:
+            move_thread.join()
+        # The MCP response must reach Agent Core before a very short move can
+        # complete and post its terminal callback.
+        time.sleep(0.1)
+        observation = dict(observation or {})
+        reason = observation.get("stop_reason", "unknown")
+        if reason == "duration_elapsed":
+            status = "completed"
+        elif reason == "stop_requested":
+            status = "cancelled"
+        else:
+            status = "error"
+        terminal_result = {
+            **start_result,
+            "state": status,
+            "reason": reason,
+            **observation,
+        }
+        self._finish_acp(action_id, status, terminal_result)
+
+    def _start_posture_acp(self, action: str, args: dict) -> dict:
+        action_id, cancel_event = self._register_acp(
+            "stand_up_lie_prone", action)
+        safety = self._safety_requirements(action)
+        threading.Thread(
+            target=self._run_posture_acp,
+            args=(action_id, cancel_event, action, dict(args)),
+            daemon=True,
+            name=f"bumi_posture_acp_{action_id[-8:]}",
+        ).start()
+        return {
+            "state": "accepted",
+            "action_id": action_id,
+            "command_sent": False,
+            "requested_action": action,
+            "safety_requirements": safety,
+            "message": (
+                "The request was accepted for asynchronous pose validation, preparation, "
+                "action startup and completion monitoring. Agent Core will keep the actuator "
+                "completion barrier until the action completes, fails or is cancelled."
+            ),
+        }
+
+    def _run_posture_acp(self, action_id: str, cancel_event: threading.Event,
+                         action: str, args: dict) -> None:
+        # Leave enough time for Agent Core to register the action_id returned by
+        # the MCP response before an immediate validation failure is reported.
+        if cancel_event.wait(0.25):
+            return
+        try:
+            result = self._do_posture_action(action, args)
+            if cancel_event.is_set():
+                return
+            if (result.get("state") == "error"
+                    or not result.get("confirmed_started")):
+                self._finish_acp(action_id, "error", result)
+                return
+
+            active_mode = 27 if action == "stand_up" else 28
+            deadline = time.monotonic() + 90.0
+            while not cancel_event.wait(0.1):
+                mode = int(self._high_ctrl.get_mode())
+                if mode == 26:
+                    result.update({
+                        "state": "error",
+                        "final_workmode": mode,
+                        "final_workmode_name": "protection",
+                        "error": "The robot entered protection mode before the posture action completed.",
+                    })
+                    self._finish_acp(action_id, "error", result)
+                    return
+                if mode != active_mode:
+                    result.update({
+                        "state": "completed",
+                        "final_workmode": mode,
+                        "final_workmode_name": _WORKMODE_NAMES.get(mode, "unknown"),
+                        "completion_detection": "workmode_left_posture_action",
+                    })
+                    self._finish_acp(action_id, "completed", result)
+                    return
+                if time.monotonic() >= deadline:
+                    result.update({
+                        "state": "error",
+                        "error": "The posture action did not leave its active workmode within 90 seconds.",
+                    })
+                    self._finish_acp(action_id, "error", result)
+                    return
+        except Exception as exc:
+            self._finish_acp(action_id, "error", {
+                "requested_action": action,
+                "error": str(exc),
+            })
 
     def _publish_cmd(self, x: float, y: float, z: float, action_cmd, index: int = 0):
         """Send command with rate limiting (≥2ms between calls). action_cmd is ControlCmd enum."""
@@ -860,6 +1087,7 @@ class LocoPlugin:
         self._publish_cmd(vx, vy, vyaw, default_cmd, 0)
 
         move_observation = {"stop_reason": "duration_elapsed"}
+        self._move_observation = move_observation
 
         def _move_timed():
             end_time = time.monotonic() + duration
@@ -1375,8 +1603,6 @@ class LocoPlugin:
                     result["walking_recovery"] = recovery_result
                 return self._attach_battery_failure_diagnostic(result)
             result["physical_motion_confirmed"] = True
-            self._schedule_auto_walk_exit(
-                "wipe_tears", 33, _TEAR_AUTO_EXIT_S, safety)
             result.update({
                 "auto_return_to_walk": True,
                 "auto_return_after_s": _TEAR_AUTO_EXIT_S,
@@ -1430,7 +1656,6 @@ class LocoPlugin:
             action, command_name, expected_modes, steps, safety,
             index=recording_id or 0, recording_id=recording_id)
         if action == "play_recording" and result.get("confirmed_started"):
-            self._schedule_playback_completion_monitor(safety)
             result.update({
                 "auto_return_to_walk": True,
                 "completion_detection": "inferred_from_workmode_and_joint_velocity",
@@ -1492,7 +1717,8 @@ class LocoPlugin:
         return self._send_walk_exit("reset", safety)
 
     def _schedule_auto_walk_exit(self, key: str, expected_mode: int,
-                                 delay_s: float, safety: str) -> None:
+                                 delay_s: float, safety: str,
+                                 action_id: str | None = None) -> None:
         self._cancel_auto_exit(key)
 
         def _auto_exit() -> None:
@@ -1500,6 +1726,7 @@ class LocoPlugin:
                 if self._auto_exit_timers.get(key) is not timer:
                     return
                 self._auto_exit_timers.pop(key, None)
+                timer_action_id = self._auto_exit_action_ids.pop(key, None)
             current_mode = int(self._high_ctrl.get_mode())
             if current_mode != expected_mode:
                 print(
@@ -1507,24 +1734,47 @@ class LocoPlugin:
                     f"({_WORKMODE_NAMES.get(current_mode, 'unknown')})",
                     flush=True,
                 )
+                if timer_action_id is not None:
+                    status = "completed" if current_mode == 2 else "error"
+                    self._finish_acp(timer_action_id, status, {
+                        "action": key,
+                        "final_workmode": current_mode,
+                        "final_workmode_name": _WORKMODE_NAMES.get(
+                            current_mode, "unknown"),
+                        "reason": (
+                            "firmware_already_returned_to_walking"
+                            if current_mode == 2 else
+                            "workmode_changed_before_auto_return"
+                        ),
+                    })
                 return
             result = self._send_walk_exit(f"{key}_auto_return", safety)
             print(
                 f"[loco] {key} auto-return result: {json.dumps(result)}",
                 flush=True,
             )
+            if timer_action_id is not None:
+                status = "completed" if result.get("confirmed") else "error"
+                self._finish_acp(timer_action_id, status, result)
 
         timer = threading.Timer(delay_s, _auto_exit)
         timer.daemon = True
         with self._auto_exit_lock:
             self._auto_exit_timers[key] = timer
+            if action_id is not None:
+                self._auto_exit_action_ids[key] = action_id
         timer.start()
 
-    def _schedule_playback_completion_monitor(self, safety: str) -> None:
+    def _schedule_playback_completion_monitor(
+            self, safety: str, action_id: str | None = None) -> None:
         self._cancel_playback_monitor()
         stop_event = threading.Event()
 
         def _monitor() -> None:
+            # Avoid posting completion before Agent Core has registered the
+            # action_id from the MCP response for a very short recording.
+            if stop_event.wait(0.25):
+                return
             started_at = time.monotonic()
             motion_seen = False
             stationary_score_s = 0.0
@@ -1538,12 +1788,26 @@ class LocoPlugin:
                         "[loco] play_recording completed: firmware already returned to walking",
                         flush=True,
                     )
+                    if action_id is not None:
+                        self._finish_acp(action_id, "completed", {
+                            "action": "play_recording",
+                            "final_workmode": 2,
+                            "final_workmode_name": "walking",
+                            "reason": "firmware_returned_to_walking",
+                        })
                     return
                 if mode == 26:
                     print(
                         "[loco] play_recording monitor stopped: robot entered protection mode",
                         flush=True,
                     )
+                    if action_id is not None:
+                        self._finish_acp(action_id, "error", {
+                            "action": "play_recording",
+                            "final_workmode": 26,
+                            "final_workmode_name": "protection",
+                            "error": "The robot entered protection mode during playback.",
+                        })
                     return
                 if mode != 23:
                     print(
@@ -1551,6 +1815,14 @@ class LocoPlugin:
                         f"({_WORKMODE_NAMES.get(mode, 'unknown')})",
                         flush=True,
                     )
+                    if action_id is not None:
+                        self._finish_acp(action_id, "error", {
+                            "action": "play_recording",
+                            "final_workmode": mode,
+                            "final_workmode_name": _WORKMODE_NAMES.get(
+                                mode, "unknown"),
+                            "error": "Playback left play_teach mode unexpectedly.",
+                        })
                     return
 
                 try:
@@ -1598,6 +1870,25 @@ class LocoPlugin:
                 f"[loco] play_recording auto-return result: {json.dumps(result)}",
                 flush=True,
             )
+            if action_id is not None:
+                completed = (
+                    exit_reason == "joint_motion_completed"
+                    and result.get("confirmed")
+                )
+                if exit_reason == "no_joint_motion_detected":
+                    result["error"] = (
+                        "No joint motion was detected after playback was triggered."
+                    )
+                elif exit_reason == "maximum_monitor_time_reached":
+                    result["error"] = (
+                        "Playback did not complete within the 120-second monitor limit."
+                    )
+                elif not result.get("confirmed"):
+                    result["error"] = (
+                        "Playback motion ended, but walking-mode recovery was not confirmed."
+                    )
+                self._finish_acp(
+                    action_id, "completed" if completed else "error", result)
 
         monitor_thread = threading.Thread(
             target=_monitor,
@@ -1607,28 +1898,49 @@ class LocoPlugin:
         with self._auto_exit_lock:
             self._playback_monitor_stop = stop_event
             self._playback_monitor_thread = monitor_thread
+            self._playback_action_id = action_id
         monitor_thread.start()
 
     def _cancel_playback_monitor(self) -> None:
         with self._auto_exit_lock:
             stop_event = self._playback_monitor_stop
+            action_id = self._playback_action_id
             self._playback_monitor_stop = None
             self._playback_monitor_thread = None
+            self._playback_action_id = None
         if stop_event is not None:
             stop_event.set()
+        if action_id is not None:
+            self._finish_acp(action_id, "cancelled", {
+                "action": "play_recording",
+                "reason": "playback monitor cancelled",
+            })
 
     def _cancel_auto_exit(self, key: str) -> None:
         with self._auto_exit_lock:
             timer = self._auto_exit_timers.pop(key, None)
+            action_id = self._auto_exit_action_ids.pop(key, None)
         if timer is not None:
             timer.cancel()
+        if action_id is not None:
+            self._finish_acp(action_id, "cancelled", {
+                "action": key,
+                "reason": "automatic return timer cancelled",
+            })
 
     def _cancel_all_auto_exits(self) -> None:
         with self._auto_exit_lock:
             timers = list(self._auto_exit_timers.values())
+            action_ids = list(self._auto_exit_action_ids.items())
             self._auto_exit_timers.clear()
+            self._auto_exit_action_ids.clear()
         for timer in timers:
             timer.cancel()
+        for key, action_id in action_ids:
+            self._finish_acp(action_id, "cancelled", {
+                "action": key,
+                "reason": "automatic return timers cancelled",
+            })
 
     def _send_walk_exit(self, requested_action: str, safety: str) -> dict:
         observed = self._send_edge_and_wait(
@@ -1858,9 +2170,14 @@ class LocoPlugin:
             # changing workmode or requesting motion.
             preroll_deadline = time.monotonic() + preroll_s
             while time.monotonic() < preroll_deadline:
+                if self._lifecycle_stop_event.is_set():
+                    return int(self._high_ctrl.get_mode())
                 self._publish_cmd(0, 0, 0, default_cmd, 0)
                 time.sleep(self._control_period)
             self._control_channel_warmed = True
+
+            if self._lifecycle_stop_event.is_set():
+                return int(self._high_ctrl.get_mode())
 
             # Actions such as START and PLAYTEACH are edge-triggered. Never
             # retry them automatically: START is a toggle and repeated actions
@@ -1872,6 +2189,8 @@ class LocoPlugin:
             deadline = time.monotonic() + timeout_s
             observed = int(self._high_ctrl.get_mode())
             while observed not in expected_modes and time.monotonic() < deadline:
+                if self._lifecycle_stop_event.is_set():
+                    return observed
                 self._publish_cmd(0, 0, 0, default_cmd, 0)
                 time.sleep(self._control_period)
                 observed = int(self._high_ctrl.get_mode())

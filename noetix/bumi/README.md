@@ -44,6 +44,14 @@ the observed workmode leaves walking. It does not automatically promote another
 mode into walking because the SDK cannot verify that the robot is physically
 standing.
 
+Long-running physical operations use Agent Core's Action Completion Protocol
+(ACP). `loco.move`, both posture actions, `semantic_action.wipe_tears`, and
+`action_recording.play_recording` return a unique `action_id`; their background
+workers report `completed`, `error`, or `cancelled` to `/api/acp/complete`.
+This keeps Agent Core's actuator barrier active until the bounded move or action
+really terminates. Stopping the plugin cancels pending timers and playback
+monitoring before reporting the affected ACP actions as cancelled.
+
 The former `switch_mode` tool is split into three user-facing cards. Internal
 `enable`, `ready` and `walk` transitions are completed automatically and are no
 longer exposed as user choices:
