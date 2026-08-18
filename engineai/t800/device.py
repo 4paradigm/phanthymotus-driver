@@ -2184,7 +2184,7 @@ class JointPlanPlugin:
             return {"state": "running" if args.get("_tool_name") == "joint_plan_state" else "ready"}
         if action in ("info", "status", "joint_plan_state"):
             with self._state_lock:
-                snapshot = dict(self._last_state)
+                snapshot = {**self._last_state, "last_request": dict(self._last_request)}
             if args.get("_tool_name") == "joint_plan_state" or action == "joint_plan_state":
                 return _with_topic_out(snapshot, self._core_topic)
             return snapshot
@@ -2386,16 +2386,29 @@ class JointPlanPlugin:
             msg.stiffness = []
             msg.damping = []
         self._publisher.publish(msg)
+        request = {
+            "state": "published",
+            "request_id": int(msg.request_id),
+            "request_type": int(msg.request_type),
+            "topic": self._config["topics"]["joint_plan_request"],
+            "joint_indices": list(msg.joint_indices),
+            "target_positions": list(msg.target_positions),
+            "execution_time": float(msg.execution_time),
+            "timestamp_ms": _now_ms(),
+        }
+        with self._state_lock:
+            self._last_request = request
         if controls_head:
             with self._head_lock:
                 self._head_request_id = msg.request_id
-        return {"state": "requested", "request_id": msg.request_id, "request_type": int(msg.request_type)}
+        return {**request, "state": "requested", "published": True}
 
     def _on_state(self, msg) -> None:
         payload = {
             "request_id": int(msg.request_id),
             "status": int(msg.status),
             "progress": float(msg.progress),
+            "topic": self._config["topics"]["joint_plan_state"],
             "timestamp_ms": _now_ms(),
         }
         with self._state_changed:
@@ -2446,12 +2459,31 @@ class HeadActuatorPlugin:
                     "status": ([], "查询头部角度和当前动作状态"),
                 },
                 {
-                    "times": {"type": "integer", "minimum": 1, "maximum": 5, "default": 1},
-                    "speed": {"type": "number", "minimum": 0.5, "maximum": 2.0, "default": 1.0},
-                    "direction": {"type": "string", "enum": ["forward", "left", "right", "up", "down"]},
-                    "pitch_deg": {"type": "number", "minimum": math.degrees(-self._PITCH_LIMIT), "maximum": math.degrees(self._PITCH_LIMIT)},
-                    "yaw_deg": {"type": "number", "minimum": math.degrees(-self._YAW_LIMIT), "maximum": math.degrees(self._YAW_LIMIT)},
-                    "duration": {"type": "number", "description": "执行时间，秒"},
+                    "times": {
+                        "type": "integer", "minimum": 1, "maximum": 5, "default": 1,
+                        "description": "重复次数，范围 1–5 次，默认 1 次",
+                    },
+                    "speed": {
+                        "type": "number", "minimum": 0.5, "maximum": 2.0, "default": 1.0,
+                        "description": "动作速度倍率，范围 0.5–2.0，默认 1.0；数值越大动作越快",
+                    },
+                    "direction": {
+                        "type": "string", "enum": ["forward", "left", "right", "up", "down"],
+                        "description": "预设视线方向：forward、left、right、up 或 down",
+                    },
+                    "pitch_deg": {
+                        "type": "number", "minimum": math.degrees(-self._PITCH_LIMIT), "maximum": math.degrees(self._PITCH_LIMIT),
+                        "description": "俯仰角，单位度，范围 −28.65–28.65°",
+                    },
+                    "yaw_deg": {
+                        "type": "number", "minimum": math.degrees(-self._YAW_LIMIT), "maximum": math.degrees(self._YAW_LIMIT),
+                        "description": "偏航角，单位度，范围 −57.30–57.30°",
+                    },
+                    "duration": {
+                        "type": "number", "minimum": 0.05, "maximum": 120.0,
+                        "default": self._config.get("step_duration_sec", 0.35),
+                        "description": "执行时间，单位秒，范围 0.05–120，默认使用动作步长",
+                    },
                 },
                 "头部动作",
             ),
@@ -2577,6 +2609,7 @@ class HeadActuatorPlugin:
                         raise ValueError(result["error"])
                     with self._lock:
                         self._status["request_id"] = result["request_id"]
+                        self._status["request"] = result
                     timeout = step["duration"] + float(self._config.get("feedback_grace_sec", 1.0))
                     result = self._joint_plan.wait_for_request(result["request_id"], timeout, self._cancel)
                     if result["state"] != "completed":
@@ -2601,7 +2634,13 @@ class HeadActuatorPlugin:
         except Exception:
             self._joint_plan.release_head("head")
             raise
-        return {"state": "running", "action": action, "total_steps": len(steps)}
+        return {
+            "state": "running",
+            "action": action,
+            "total_steps": len(steps),
+            "accepted": True,
+            "detail": "head sequence started; use status to confirm planner feedback and completion",
+        }
 
 
 class GesturePlugin:
