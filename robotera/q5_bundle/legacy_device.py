@@ -478,7 +478,7 @@ class SpeakerPlugin:
             "name": "speaker", "type": "actuator", "multiInstance": False,
             "description": "Q5 speaker. Connect any audio/pcm-16k output (TTS, microphone, or other PCM source) to play it live. set_volume controls live PCM gain and requests the Q5 system volume.",
             "inputSchema": {"type": "object", "properties": {
-                "action": {"type": "string", "enum": ["start", "set_volume", "stop", "info"]},
+                "action": {"type": "string", "enum": ["start", "set_volume", "get_volume", "stop", "info"]},
                 "input_topic": {"type": "string", "description": "PCM 16 kHz AudioChunk topic from the canvas connection"},
                 "volume": {"type": "integer", "title": "Speaker 音量", "minimum": 0, "maximum": 100,
                            "default": self._volume},
@@ -486,6 +486,7 @@ class SpeakerPlugin:
             "x-action-params": {
                 "start": {"params": ["input_topic"], "description": "连接并开始实时播放 PCM。"},
                 "set_volume": {"params": ["volume"], "description": "设置实时 PCM 音量并请求 Q5 系统音量，0 静音，100 最大。"},
+                "get_volume": {"params": [], "description": "读取当前 speaker 音量和最近一次 XOS 系统音量设置结果。"},
                 "stop": {"params": [], "description": "停止实时播放。"},
                 "info": {"params": [], "description": "查看 speaker 状态。"},
             },
@@ -658,6 +659,10 @@ class SpeakerPlugin:
                 return {"ok": False, "code": "INVALID_VOLUME", "message": "volume must be an integer from 0 to 100"}
             self._volume = value
             self._set_system_volume(value)
+        elif action == "get_volume":
+            return {"state": "running" if self._running else "idle",
+                    "volume": self._volume, "input_gain": self._input_gain,
+                    "system_volume": self._system_volume}
         elif action == "stop":
             self.stop()
         if action in ("start", "set_volume", "stop", "info"):
@@ -902,7 +907,7 @@ class CameraDepthPlugin(_Q5MediaPlugin):
     def get_tool(self):
         return {
             "name": "camera_depth", "type": "sensor", "multiInstance": False,
-            "description": "Q5 D455 aligned depth preview. Adaptive ice-blue distance colors: near is bright, far is deep blue; invalid depth is black.",
+            "description": "Q5 D455 aligned depth preview. Adaptive sunrise/seafoam distance colors: near is warm and bright, far is muted teal; invalid depth is black.",
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["start", "stop", "info"]},
             }, "required": ["action"], "additionalProperties": False},
@@ -960,11 +965,11 @@ class CameraDepthPlugin(_Q5MediaPlugin):
                 (depth - low) / (high - low), 0.0, 1.0)
             normalized = normalized ** self._depth_gamma
             stops = self._np.array([
-                # A single cold-depth scale reads like a depth instrument,
-                # not a decorative pseudo-color image: close is ice-white,
-                # then cyan, then deep blue in the distance.
-                (246, 251, 250), (169, 215, 222), (89, 164, 181),
-                (40, 95, 132), (13, 32, 61),
+                # Keep the preview light and legible: warm near-field tones
+                # provide separation, while distant geometry fades to a
+                # muted seafoam instead of a heavy indigo background.
+                (255, 248, 220), (255, 216, 157), (239, 151, 119),
+                (137, 202, 181), (72, 145, 151),
             ], dtype=self._np.float32)
             scaled = normalized * (len(stops) - 1)
             lower = self._np.floor(scaled).astype(self._np.intp)
