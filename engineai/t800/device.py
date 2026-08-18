@@ -2376,6 +2376,10 @@ class GesturePlugin:
     _READY_TIMEOUT_SEC = 10.0
     _STEP_TIMEOUT_SEC = 15.0
     _COOLDOWN_SEC = 3.0
+    _ACP_TIMEOUT_SEC = 300.0
+    _ACP_CALLBACK_TIMEOUT_SEC = 5.0
+    _ACP_SAFETY_MARGIN_SEC = 5.0
+    _MAX_SEQUENCE_STEPS = 16
     _NEUTRAL = [0.0, 0.028, 0.084, -0.001, -0.066, 0.0, 0.024, -0.081, 0.001, -0.069, 0.0, 0.0, 0.0]
     _RAISED = [0.0, -1.29568, 1.17971, 0.0757227, -1.06603, -0.0989933,
                -0.0211716, -0.322156, 0.0440607, -0.0871668, 0.0196457, 0.0, 0.0]
@@ -2448,6 +2452,7 @@ class GesturePlugin:
                 "steps": {
                     "type": "array",
                     "description": "每步支持 joint_indices 或 joint_names、target_positions、duration、hold_after_sec、stiffness、damping",
+                    "maxItems": self._MAX_SEQUENCE_STEPS,
                     "items": {"type": "object"},
                 },
             },
@@ -2455,7 +2460,7 @@ class GesturePlugin:
         )
         schema["x-completion"] = {
             "actions": ["play", "sequence"],
-            "timeout": 300,
+            "timeout": int(self._ACP_TIMEOUT_SEC),
         }
         return {
             "name": "gesture",
@@ -2486,6 +2491,8 @@ class GesturePlugin:
                     "planner_state_synchronised": True,
                     "cooldown_sec": self._COOLDOWN_SEC,
                     "maximum_repetitions": 1,
+                    "maximum_sequence_steps": self._MAX_SEQUENCE_STEPS,
+                    "acp_timeout_sec": self._ACP_TIMEOUT_SEC,
                 },
             }
         if action == "status":
@@ -2527,6 +2534,8 @@ class GesturePlugin:
             steps = args.get("steps")
             if not isinstance(steps, list) or not steps:
                 return {"error": "steps must be a non-empty array"}
+            if len(steps) > self._MAX_SEQUENCE_STEPS:
+                return {"error": f"steps cannot contain more than {self._MAX_SEQUENCE_STEPS} items"}
             if any(not isinstance(step, dict) for step in steps):
                 return {"error": "every gesture step must be an object"}
             steps = [dict(step) for step in steps]
@@ -2539,14 +2548,16 @@ class GesturePlugin:
                 "error": "gesture requires motion state 'lower_body_balance' "
                          f"(current: {motion or 'unknown'})"
             }
+        reset_after = bool(args.get("reset_after", True))
         try:
             steps = self._prepare_steps(steps)
+            self._validate_completion_budget(steps, reset_after=reset_after)
         except (TypeError, ValueError) as exc:
             return {"error": str(exc)}
         return self._start_sequence(
             label,
             steps,
-            reset_after=bool(args.get("reset_after", True)),
+            reset_after=reset_after,
         )
 
     def _official_steps(self, name: str) -> list[dict]:
@@ -2603,6 +2614,23 @@ class GesturePlugin:
             prepared.append(step)
         return prepared
 
+    def _validate_completion_budget(self, steps: list[dict], *, reset_after: bool) -> None:
+        worst_case = self._READY_TIMEOUT_SEC + self._ACP_CALLBACK_TIMEOUT_SEC
+        worst_case += self._ACP_SAFETY_MARGIN_SEC
+        for step in steps:
+            worst_case += max(
+                self._STEP_TIMEOUT_SEC,
+                float(step["duration"]) + 5.0,
+            )
+            worst_case += float(step.get("hold_after_sec", 0.0))
+        if reset_after:
+            worst_case += self._STEP_TIMEOUT_SEC
+        if worst_case > self._ACP_TIMEOUT_SEC:
+            raise ValueError(
+                f"gesture worst-case runtime {worst_case:.1f}s exceeds "
+                f"ACP completion timeout {self._ACP_TIMEOUT_SEC:.0f}s"
+            )
+
     def _start_sequence(self, label: str, steps: list[dict], *, reset_after: bool) -> dict:
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
@@ -2654,10 +2682,10 @@ class GesturePlugin:
                     with self._lock:
                         self._status["request_id"] = request_id
                         self._status["step_name"] = "reset"
-                    self._joint_plan.wait_until_idle(
+                    self._joint_plan.wait_for_request(
+                        request_id,
                         self._STEP_TIMEOUT_SEC,
                         self._cancel,
-                        minimum_request_id=request_id,
                     )
                 with self._lock:
                     if self._cancel.is_set() or self._status.get("state") == "cancelled":
@@ -2753,7 +2781,11 @@ class GesturePlugin:
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            _urllib.urlopen(request, timeout=5, context=context)
+            _urllib.urlopen(
+                request,
+                timeout=GesturePlugin._ACP_CALLBACK_TIMEOUT_SEC,
+                context=context,
+            )
         except Exception as exc:
             print(f"[gesture] ACP callback failed for {action_id}: {exc}", flush=True)
 
