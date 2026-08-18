@@ -1,6 +1,7 @@
 import importlib.util
 import struct
 import sys
+import threading
 import time
 import types
 import unittest
@@ -20,6 +21,19 @@ class JointMotionPlanRequest(Message):
     REQUEST_PLAN_EXECUTE = 0
     REQUEST_CANCEL = 1
     REQUEST_RESET = 2
+
+
+class JointMotionPlanState(Message):
+    STATUS_DISABLED = 0
+    IDLE = 1
+    EXECUTING = 2
+    EXITING = 3
+
+    def __init__(self, request_id=0, status=STATUS_DISABLED, progress=0.0):
+        super().__init__()
+        self.request_id = request_id
+        self.status = status
+        self.progress = progress
 
 
 class EnableMotor:
@@ -153,12 +167,13 @@ def install_ros_stubs():
 
     protocol_msg = types.ModuleType("interface_protocol.msg")
     for name in (
-        "BodyVelCmd", "GamepadKeys", "ImuInfo", "JointCommand", "JointMotionPlanState",
+        "BodyVelCmd", "GamepadKeys", "ImuInfo", "JointCommand",
         "JointOverrideCommand", "JointState", "LedControl", "MotionState", "MotionStateRequest",
         "Heartbeat", "LinkInfo", "MotorDebug", "NodeControl", "PowerInfo", "Tts",
     ):
         setattr(protocol_msg, name, type(name, (Message,), {}))
     protocol_msg.JointMotionPlanRequest = JointMotionPlanRequest
+    protocol_msg.JointMotionPlanState = JointMotionPlanState
     protocol_srv = types.ModuleType("interface_protocol.srv")
     protocol_srv.EnableMotor = EnableMotor
     protocol = types.ModuleType("interface_protocol")
@@ -565,17 +580,73 @@ class DevicePluginContractTests(unittest.TestCase):
     def test_gesture_exposes_complete_official_sequences_and_custom_queue(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
         plan.start()
+        plan.wait_until_idle = lambda *_args, **_kwargs: {}
+        plan.wait_for_request = lambda *_args, **_kwargs: {}
         gesture = self.device.GesturePlugin(plan)
         listed = {item["name"]: item["steps"] for item in gesture.dispatch("list", {})["gestures"]}
-        self.assertEqual(7, listed["wave_hands"])
+        self.assertEqual(8, listed["wave_hands"])
         self.assertEqual(2, listed["shake_hand"])
         result = gesture.dispatch("sequence", {
             "steps": [{"joint_indices": [23, 24], "target_positions": [0.1, -0.1], "duration": 0.05}],
             "reset_after": False,
             "wait": True,
+            "force": True,
         })
         self.assertEqual("completed", result["state"])
         self.assertEqual([23, 24], plan._publisher.messages[-1].joint_indices)
+
+    def test_gesture_uses_validated_real_device_trajectories(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        waits = []
+        plan.wait_until_idle = lambda *_args, **kwargs: waits.append(("idle", kwargs)) or {}
+        plan.wait_for_request = lambda request_id, *_args: waits.append(("request", request_id)) or {}
+        gesture = self.device.GesturePlugin(plan)
+
+        wave = gesture._prepare_steps(gesture._official_steps("wave_hands"))
+        self.assertEqual("return_to_neutral", wave[-1]["name"])
+        self.assertEqual(gesture._NEUTRAL, wave[-1]["target_positions"])
+        self.assertTrue(all(not step["stiffness"] for step in wave))
+
+        handshake = gesture._prepare_steps(gesture._official_steps("shake_hand"))
+        self.assertEqual(2.0, handshake[0]["hold_after_sec"])
+        self.assertEqual(gesture._HAND_WITHDRAWN, handshake[-1]["target_positions"])
+
+        result = gesture.dispatch("play", {
+            "name": "wave_hands", "wait": True, "reset_after": False, "force": True,
+        })
+        self.assertEqual("completed", result["state"])
+        self.assertEqual(8, len([item for item in waits if item[0] == "request"]))
+        self.assertEqual(gesture._NEUTRAL, plan._publisher.messages[-1].target_positions)
+
+    def test_gesture_rejects_unsafe_state_repetition_and_joint_target(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        gesture = self.device.GesturePlugin(plan)
+        self.assertIn(
+            "lower_body_balance",
+            gesture.dispatch("play", {"name": "wave_hands"})["error"],
+        )
+        self.assertIn(
+            "thermal safety",
+            gesture.dispatch("play", {
+                "name": "wave_hands", "repetitions": 2, "force": True,
+            })["error"],
+        )
+        result = gesture.dispatch("sequence", {
+            "steps": [{"joint_indices": [16], "target_positions": [-2.28]}],
+            "force": True,
+        })
+        self.assertIn("safe position limit", result["error"])
+
+    def test_joint_plan_waits_for_exact_executing_then_idle_request(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        plan._on_state(JointMotionPlanState(7, JointMotionPlanState.EXECUTING, 0.5))
+        plan._on_state(JointMotionPlanState(7, JointMotionPlanState.IDLE, 1.0))
+        state = plan.wait_for_request(7, 0.1, threading.Event())
+        self.assertEqual(7, state["request_id"])
+        self.assertEqual(JointMotionPlanState.IDLE, state["status"])
 
     def test_joint_override_force_path_and_release(self):
         plugin = self.device.JointOverridePlugin(CONFIG, "robot", self.ros, self.state)

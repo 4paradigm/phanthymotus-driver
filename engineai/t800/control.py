@@ -57,6 +57,38 @@ T800_JOINT_GROUPS = {
 
 T800_JOINT_INDEX = {name: index for index, name in enumerate(T800_JOINT_NAMES)}
 
+# Hard position limits copied from resource/serial_t800.urdf.  Gesture
+# choreography validates every requested target against this table before it
+# reaches the robot-facing planner; keeping the layout next to the canonical
+# joint names makes index drift visible in the pure control tests.
+T800_JOINT_POSITION_LIMITS = (
+    (-3.316, 2.269),
+    (-1.082, 2.059),
+    (-1.42244667, 3.6022778),
+    (0.0, 2.355),
+    (-0.68068, 0.68068),
+    (-0.3491, 0.1745),
+    (-3.316, 2.269),
+    (-2.059, 1.082),
+    (-3.6022778, 1.42244667),
+    (0.0, 2.355),
+    (-0.68068, 0.68068),
+    (-0.1745, 0.3491),
+    (-4.381, 1.2392),
+    (-2.967, 2.793),
+    (-0.384, 2.443),
+    (-2.618, 2.618),
+    (-2.286, 0.262),
+    (-2.618, 2.618),
+    (-2.967, 2.793),
+    (-2.443, 0.384),
+    (-2.618, 2.618),
+    (-2.286, 0.262),
+    (-2.618, 2.618),
+    (-0.523, 0.523),
+    (-1.222, 1.222),
+)
+
 MOTION_STATES = (
     "idle",
     "passive",
@@ -143,6 +175,35 @@ def validate_joint_indices(indices: object, *, allow_empty: bool = False) -> lis
     if invalid:
         raise ValueError(f"joint_indices out of range: {invalid}")
     return result
+
+
+def validate_joint_positions(
+    indices: object,
+    positions: object,
+    *,
+    limit_margin_rad: float = 0.0,
+) -> tuple[list[int], list[float]]:
+    """Validate finite targets against the T800 URDF joint limits."""
+    validated_indices = validate_joint_indices(indices)
+    validated_positions = float_list(
+        positions, "target_positions", size=len(validated_indices)
+    )
+    margin = float(limit_margin_rad)
+    if not math.isfinite(margin) or margin < 0:
+        raise ValueError("limit_margin_rad must be a non-negative finite number")
+    violations = []
+    for index, position in zip(validated_indices, validated_positions):
+        hard_lower, hard_upper = T800_JOINT_POSITION_LIMITS[index]
+        lower = hard_lower + margin
+        upper = hard_upper - margin
+        if lower > upper or position < lower or position > upper:
+            violations.append(
+                f"{T800_JOINT_NAMES[index]}={position:.6g} outside "
+                f"[{lower:.6g}, {upper:.6g}]"
+            )
+    if violations:
+        raise ValueError("joint target exceeds safe position limit: " + "; ".join(violations))
+    return validated_indices, validated_positions
 
 
 def validate_parallel_arrays(indices: Sequence[int], **arrays: Sequence[float]) -> None:
