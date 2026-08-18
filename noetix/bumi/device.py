@@ -727,9 +727,38 @@ class LocoPlugin:
         self._finish_acp(action_id, status, terminal_result)
 
     def _start_posture_acp(self, action: str, args: dict) -> dict:
+        safety = self._safety_requirements(action)
+        current_mode = int(self._high_ctrl.get_mode())
+        mode_error = self._posture_workmode_error(
+            action, current_mode, safety)
+        if mode_error is not None:
+            return mode_error
+
+        pose_check = None
+        if action == "stand_up":
+            pose_check = self._check_face_up_stand_pose()
+            if not pose_check["safe_to_stand"]:
+                return {
+                    "state": "error",
+                    "command_sent": False,
+                    "requested_action": action,
+                    "current_workmode": current_mode,
+                    "current_workmode_name": _WORKMODE_NAMES.get(
+                        current_mode, "unknown"),
+                    "error": (
+                        "Automatic pose check failed. No enable or stand-up "
+                        "command was sent."
+                    ),
+                    "pose_check": pose_check,
+                    "message": (
+                        "Place the robot face-up with both legs straight and all limbs "
+                        "naturally positioned, wait until it is still, then try again."
+                    ),
+                    "safety_requirements": safety,
+                }
+
         action_id, cancel_event = self._register_acp(
             "stand_up_lie_prone", action)
-        safety = self._safety_requirements(action)
         threading.Thread(
             target=self._run_posture_acp,
             args=(action_id, cancel_event, action, dict(args)),
@@ -739,14 +768,13 @@ class LocoPlugin:
         return {
             "state": "accepted",
             "action_id": action_id,
-            "execution_phase": "queued",
-            "command_will_be_sent_after_checks": True,
             "requested_action": action,
             "safety_requirements": safety,
             "message": (
-                "The request was accepted for asynchronous pose validation, preparation, "
-                "action startup and completion monitoring. Agent Core will keep the actuator "
-                "completion barrier until the action completes, fails or is cancelled."
+                "The workmode and available pose checks passed. Preparation, action startup "
+                "and completion monitoring will continue asynchronously. Agent Core will "
+                "keep the actuator completion barrier until the action completes, fails or "
+                "is cancelled."
             ),
         }
 
@@ -1240,26 +1268,10 @@ class LocoPlugin:
     def _do_posture_action(self, action: str, args: dict) -> dict:
         safety = self._safety_requirements(action)
         current_mode = int(self._high_ctrl.get_mode())
-        if current_mode == 26:
-            return self._protection_error(action, [], current_mode, safety)
-        allowed_modes = {0, 30} if action == "stand_up" else {2}
-        if current_mode not in allowed_modes:
-            return {
-                "state": "error", "command_sent": False,
-                "requested_action": action,
-                "current_workmode": current_mode,
-                "current_workmode_name": _WORKMODE_NAMES.get(current_mode, "unknown"),
-                "allowed_workmodes": [
-                    {"code": mode, "name": _WORKMODE_NAMES.get(mode, "unknown")}
-                    for mode in sorted(allowed_modes)
-                ],
-                "error": (
-                    "stand_up is allowed only from disabled or enabled mode after the robot has been placed face-up. It is blocked from ready, walking, and action modes to prevent a standing robot from collapsing."
-                    if action == "stand_up" else
-                    "lie_prone is allowed only from walking mode after stable standing has been confirmed."
-                ),
-                "safety_requirements": safety,
-            }
+        mode_error = self._posture_workmode_error(
+            action, current_mode, safety)
+        if mode_error is not None:
+            return mode_error
         motion_indices = tuple(range(len(_BUMI_JOINT_NAMES)))
         motion_baseline = None
         if action == "lie_prone":
@@ -1276,6 +1288,8 @@ class LocoPlugin:
                 }
         pose_check = None
         if action == "stand_up":
+            # Re-check in the worker because the robot may have been moved
+            # after the synchronous MCP validation but before commands begin.
             pose_check = self._check_face_up_stand_pose()
             if not pose_check["safe_to_stand"]:
                 return {
@@ -1362,14 +1376,62 @@ class LocoPlugin:
             )
         return result
 
+    def _posture_workmode_error(self, action: str, current_mode: int,
+                                safety: str) -> dict | None:
+        if current_mode == 26:
+            return self._protection_error(
+                action, [], current_mode, safety)
+        allowed_modes = {0, 30} if action == "stand_up" else {2}
+        if current_mode in allowed_modes:
+            return None
+        return {
+            "state": "error",
+            "command_sent": False,
+            "requested_action": action,
+            "current_workmode": current_mode,
+            "current_workmode_name": _WORKMODE_NAMES.get(
+                current_mode, "unknown"),
+            "allowed_workmodes": [
+                {"code": mode, "name": _WORKMODE_NAMES.get(mode, "unknown")}
+                for mode in sorted(allowed_modes)
+            ],
+            "error": (
+                "stand_up is allowed only when the robot is face-up on the floor in "
+                "disabled or enabled mode. It is blocked while the robot is already "
+                "standing, ready, walking, or executing another action."
+                if action == "stand_up" else
+                "lie_prone is allowed only from walking mode after stable standing has "
+                "been confirmed."
+            ),
+            "message": (
+                "Do not call stand_up while Bumi is already standing. To lie down, "
+                "use lie_prone after confirming stable walking mode."
+                if action == "stand_up" else
+                "Enter walking mode with Bumi standing steadily before requesting "
+                "lie_prone."
+            ),
+            "safety_requirements": safety,
+        }
+
     def _prepare_stand_up(self, requested_action: str) -> dict:
         """Reach enabled mode without entering ready, which assumes assisted standing."""
-        self._move_stop_event.set()
-        if self._move_thread and self._move_thread.is_alive():
-            self._move_thread.join(timeout=1)
-
-        steps = []
-        mode = int(self._high_ctrl.get_mode())
+        # The tested firmware can consume the first START edge only as a late
+        # wake-up when stale walking velocity remains on the control path. The
+        # previously verified workaround is an explicit stop_move zero frame,
+        # followed by the sustained START preroll below. START itself remains a
+        # single edge because repeating this toggle could disable the robot.
+        stop_result = self._stop_move()
+        mode = stop_result.get("workmode")
+        if mode is None:
+            mode = int(self._high_ctrl.get_mode())
+        steps = [{
+            "step": "clear_motion",
+            "command": "DEFAULT",
+            "zero_velocity_sent": bool(stop_result.get("command_sent")),
+            "observed_workmode": mode,
+            "observed_workmode_name": _WORKMODE_NAMES.get(mode, "unknown"),
+            "confirmed": bool(stop_result.get("command_sent")),
+        }]
         if mode == 26:
             return self._protection_error(requested_action, steps, mode)
         if mode == 30:
