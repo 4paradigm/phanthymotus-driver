@@ -2461,10 +2461,12 @@ class HeadActuatorPlugin:
                 {
                     "times": {
                         "type": "integer", "minimum": 1, "maximum": 5, "default": 1,
+                        "placeholder": "1-5",
                         "description": "重复次数，范围 1–5 次，默认 1 次",
                     },
                     "speed": {
                         "type": "number", "minimum": 0.5, "maximum": 2.0, "default": 1.0,
+                        "placeholder": "0.5-2.0",
                         "description": "动作速度倍率，范围 0.5–2.0，默认 1.0；数值越大动作越快",
                     },
                     "direction": {
