@@ -99,6 +99,15 @@ class Q5BasicSensorTests(unittest.TestCase):
         self.assertEqual(data["groups"]["left_hand"]["joint_names"], ["left_hand_index_joint1"])
         self.assertEqual(data["groups"]["right_hand"]["joint_names"], ["right_hand_index_joint1"])
 
+    def test_skeleton_uses_standard_index_name_and_position_fields(self):
+        data = joints.build(FRESH_JOINT_SNAPSHOT)
+        self.assertEqual(data["format"], "sensor/skeleton")
+        self.assertEqual(data["joint_count"], 3)
+        self.assertEqual(data["joints"][0], {"idx": 0, "name": "hip_joint", "q": 0.1,
+                                             "dq": 0.0, "tau": 1.0})
+        self.assertEqual(data["joints"][1]["name"], "left_hand_index_joint1")
+        self.assertEqual(data["joints"][1]["idx"], 1)
+
     def test_joint_cards_preserve_received_but_stale_data_as_unavailable_for_live_use(self):
         stale = dict(FRESH_JOINT_SNAPSHOT, available=True, fresh=False, stale=True, age_ms=5001)
         skeleton = joints.build(stale)

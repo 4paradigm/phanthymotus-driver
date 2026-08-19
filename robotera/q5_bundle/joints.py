@@ -33,6 +33,19 @@ MODEL_PATH = Path(__file__).parent / "resource" / "q5_model.urdf"
 def build(snap: dict) -> dict:
     positions = snap.get("joints", {})
     names = snap.get("joint_names", [])
+    # The skeleton contract requires a stable index as well as the exact URDF
+    # joint name.  Keep the incoming JointState order: it is the robot's
+    # authoritative ordering and avoids reordering hand/body joints in the UI.
+    joints = []
+    for idx, name in enumerate(names):
+        if name not in positions:
+            continue
+        item = {"idx": idx, "name": name, "q": positions[name]}
+        if name in snap.get("velocities", {}):
+            item["dq"] = snap["velocities"][name]
+        if name in snap.get("efforts", {}):
+            item["tau"] = snap["efforts"][name]
+        joints.append(item)
     return {
         "timestamp_ms": int(time.time() * 1000),
         "received_at_ms": snap.get("received_at_ms"),
@@ -41,11 +54,9 @@ def build(snap: dict) -> dict:
         "available": bool(snap.get("available", False)),
         "age_ms": snap.get("age_ms"),
         "stale": bool(snap.get("stale", False)),
-        "joints": [
-            {"name": name, "q": positions[name]}
-            for name in names if name in positions
-        ],
-        "joint_count": len(names),
+        "format": FMT,
+        "joints": joints,
+        "joint_count": len(joints),
         "position_unit": snap.get("position_unit", "rad"),
         "source_topic": "/joint_states",
         "message": (
