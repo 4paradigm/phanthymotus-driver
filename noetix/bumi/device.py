@@ -1146,6 +1146,8 @@ class SpeakerPlugin:
                 stream = AudioStream()
                 stream.channels = 2
                 stream.sample_rate = 16000
+                stream.format = 2
+                stream.audio_data = stereo_samples
                 self._media_ctrl.publish_external_audio_playback_stream(stream)
             except Exception as e:
                 self._node.get_logger().warn(f"Speaker playback error: {e}")
@@ -1230,11 +1232,11 @@ def _camera_subprocess(namespace: str):
         from turbojpeg import TurboJPEG, TJPF_BGR
         _tj = TurboJPEG()
         def encode_jpeg(bgr_image):
-            return _tj.encode(bgr_image, pixel_format=TJPF_BGR, quality=65)
+            return _tj.encode(bgr_image, pixel_format=TJPF_BGR, quality=80)
         print("[camera_subprocess] using TurboJPEG encoder", flush=True)
     except Exception:
         def encode_jpeg(bgr_image):
-            _, buf = cv2.imencode('.jpg', bgr_image, [cv2.IMWRITE_JPEG_QUALITY, 65])
+            _, buf = cv2.imencode('.jpg', bgr_image, [cv2.IMWRITE_JPEG_QUALITY, 80])
             return buf.tobytes()
         print("[camera_subprocess] using cv2 JPEG encoder", flush=True)
 
