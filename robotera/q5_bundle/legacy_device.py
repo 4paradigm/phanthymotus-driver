@@ -543,10 +543,27 @@ class SpeakerPlugin:
 
     def _prepare_xos_route(self):
         """Release XOS chat's route before taking ownership with live ALSA."""
+        # Stop a queued/stale XOS clip before changing the chat state.  XOS can
+        # report chat OFF while its player still owns the PCM handle; stopping
+        # first makes the subsequent route transition deterministic.
+        try:
+            stopped = _q5_remote_command(
+                "source /opt/ros/humble/setup.bash; "
+                "export ROS_DOMAIN_ID=211 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp; "
+                "timeout 2 ros2 service call /audio_player/stop_play std_srvs/srv/Trigger '{}'",
+                timeout=4.0)
+            if stopped.returncode:
+                detail = (stopped.stderr or stopped.stdout).decode(errors="replace").strip()
+                print(f"[SpeakerPlugin] vendor player stop returned an error: {detail}", flush=True)
+        except Exception as exc:
+            print(f"[SpeakerPlugin] vendor player stop unavailable: {exc}", flush=True)
         state, error = _q5_xos_chat_is_on(self._xos_http_base)
         if error:
             raise RuntimeError(f"cannot query XOS chat state: {error}")
         if not state:
+            released, holders = _wait_remote_playback_released()
+            if not released:
+                raise RuntimeError(f"XOS playback route is still occupied: {holders}")
             return
         ok, error = _q5_xos_chat_set(
             self._xos_http_base, "/robot/chat/quit_chat?lang=zh")
@@ -561,25 +578,13 @@ class SpeakerPlugin:
         # opening the direct speaker stream.
         if self._chat_route_settle:
             time.sleep(self._chat_route_settle)
+        released, holders = _wait_remote_playback_released()
+        if not released:
+            raise RuntimeError(f"XOS playback route is still occupied: {holders}")
 
     def _start_playback(self, requested: str) -> None:
         self._topic = requested
         self._set_system_volume(self._volume)
-        # XOS owns the hardware mixer while its player is active.  This call
-        # runs on the developer container, which is on the robot's ROS domain
-        # and uses Cyclone DDS; inheriting the bridge's Domain 42/Fast DDS
-        # environment made the call target no valid context.
-        try:
-            stopped = _q5_remote_command(
-                "source /opt/ros/humble/setup.bash; "
-                "export ROS_DOMAIN_ID=211 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp; "
-                "timeout 2 ros2 service call /audio_player/stop_play std_srvs/srv/Trigger '{}'",
-                timeout=4.0)
-            if stopped.returncode:
-                detail = (stopped.stderr or stopped.stdout).decode(errors="replace").strip()
-                print(f"[SpeakerPlugin] vendor player was not stopped: {detail}", flush=True)
-        except Exception as exc:
-            print(f"[SpeakerPlugin] vendor player stop timed out; continuing with ALSA: {exc}", flush=True)
         _stop_remote_speaker_playback()
         command = _q5_alsa_speaker_command(
             self._device, self._output_rate, self._output_channels)
