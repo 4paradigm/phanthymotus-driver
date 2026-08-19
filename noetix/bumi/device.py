@@ -466,22 +466,22 @@ class LocoPlugin:
                             "other parameters."
                         ),
                     },
-                    "vx": {
-                        "type": "number",
-                        "default": 0.0,
-                        "description": "default: 0, [-1.0,-0.5]U[0.5,1.0]",
-                        "minimum": -1, "maximum": 1,
+                    "velocity_channel": {
+                        "type": "string",
+                        "enum": ["vx", "vy", "vyaw"],
+                        "description": (
+                            "Select exactly one velocity channel: vx=forward/backward, "
+                            "vy=left/right, vyaw=turn left/right. The two unselected "
+                            "channels are always sent as 0."
+                        ),
                     },
-                    "vy": {
+                    "velocity": {
                         "type": "number",
-                        "default": 0.0,
-                        "description": "default: 0, [-1.0,-0.6]U[0.6,1.0]",
-                        "minimum": -1, "maximum": 1,
-                    },
-                    "vyaw": {
-                        "type": "number",
-                        "default": 0.0,
-                        "description": "default: 0, [-1.0,-0.5]U[0.5,1.0]",
+                        "description": (
+                            "Normalized speed for the selected channel. vx/vyaw: "
+                            "[-1.0,-0.5]U[0.5,1.0]; vy: "
+                            "[-1.0,-0.6]U[0.6,1.0]."
+                        ),
                         "minimum": -1, "maximum": 1,
                     },
                     "duration": {
@@ -499,15 +499,15 @@ class LocoPlugin:
                 },
                 "x-action-params": {
                     "move": {
-                        "params": ["vx", "vy", "vyaw", "duration"],
+                        "params": ["velocity_channel", "velocity", "duration"],
                         "description": (
                             "Move with normalized HighController commands for 1-10 seconds. "
-                            "At least one velocity must be non-zero and the robot must already "
+                            "Choose exactly one of vx, vy or vyaw, then provide its non-zero "
+                            "velocity; the other two channels are forced to zero. The robot must already "
                             "be upright, stable and in walking mode (motion_state must report "
                             "workmode.code=2). If it is not, the card returns an error without "
-                            "sending WALK or velocity commands. Non-zero vx and vy together "
-                            "request diagonal translation. For the first low-risk test, use "
-                            "forward=0.5, lateral=0, turn=0 and duration=2 in a clear area."
+                            "sending WALK or velocity commands. For the first low-risk test, "
+                            "select vx, use velocity=0.5 and duration=2 in a clear area."
                         ),
                     },
                     "stop_move": {
@@ -1230,60 +1230,80 @@ class LocoPlugin:
         }
 
     def _do_move(self, args: dict) -> dict:
-        values = {}
-        limits = {
-            "vx": (-1.0, 1.0, 0.0),
-            "vy": (-1.0, 1.0, 0.0),
-            "vyaw": (-1.0, 1.0, 0.0),
-            "duration": (
-                self._MOVE_MIN_DURATION_S,
-                self._MOVE_MAX_DURATION_S,
-                self._MOVE_DEFAULT_DURATION_S,
-            ),
-        }
-        for field, (minimum, maximum, default) in limits.items():
-            value = args.get(field, default)
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                return {
-                    "state": "error", "command_sent": False,
-                    "error": f"{field} must be a number from {minimum} to {maximum}",
-                }
-            value = float(value)
-            if not math.isfinite(value) or value < minimum or value > maximum:
-                return {
-                    "state": "error", "command_sent": False,
-                    "error": f"{field} must be a finite number from {minimum} to {maximum}",
-                    "received": args.get(field),
-                }
-            values[field] = value
-
-        vx, vy, vyaw = values["vx"], values["vy"], values["vyaw"]
-        duration = values["duration"]
-        for field, value in (("vx", vx), ("vy", vy), ("vyaw", vyaw)):
-            minimum_nonzero = self._MOVE_MIN_NONZERO_BY_AXIS[field]
-            if value != 0.0 and abs(value) < minimum_nonzero:
-                return {
-                    "state": "error",
-                    "command_sent": False,
-                    "error": (
-                        f"{field} must be 0 or have an absolute value from "
-                        f"{minimum_nonzero} to 1.0"
-                    ),
-                    "received": args.get(field),
-                    "allowed_ranges": [
-                        [-1.0, -minimum_nonzero],
-                        [0.0, 0.0],
-                        [minimum_nonzero, 1.0],
-                    ],
-                }
-        if vx == 0.0 and vy == 0.0 and vyaw == 0.0:
+        legacy_fields = [
+            field for field in ("vx", "vy", "vyaw") if field in args]
+        if legacy_fields:
             return {
                 "state": "error", "command_sent": False,
                 "error": (
-                    "move requires at least one non-zero velocity; use stop_move to send "
-                    "a zero-velocity stop command"
+                    "loco.move no longer accepts separate vx, vy or vyaw values. Select "
+                    "one velocity_channel and provide one velocity value."
+                ),
+                "unsupported_fields": legacy_fields,
+            }
+
+        velocity_channel = args.get("velocity_channel")
+        if (not isinstance(velocity_channel, str)
+                or velocity_channel not in self._MOVE_MIN_NONZERO_BY_AXIS):
+            return {
+                "state": "error", "command_sent": False,
+                "error": "velocity_channel must be one of: vx, vy, vyaw",
+                "received": velocity_channel,
+            }
+        velocity = args.get("velocity")
+        if isinstance(velocity, bool) or not isinstance(
+                velocity, (int, float)):
+            return {
+                "state": "error", "command_sent": False,
+                "error": "velocity must be a number from -1.0 to 1.0",
+                "received": velocity,
+            }
+        velocity = float(velocity)
+        minimum_nonzero = self._MOVE_MIN_NONZERO_BY_AXIS[velocity_channel]
+        if (not math.isfinite(velocity) or abs(velocity) < minimum_nonzero
+                or abs(velocity) > 1.0):
+            return {
+                "state": "error", "command_sent": False,
+                "error": (
+                    f"velocity for {velocity_channel} must be in "
+                    f"[-1.0, -{minimum_nonzero}] or "
+                    f"[{minimum_nonzero}, 1.0]"
+                ),
+                "received": args.get("velocity"),
+                "allowed_ranges": [
+                    [-1.0, -minimum_nonzero],
+                    [minimum_nonzero, 1.0],
+                ],
+            }
+
+        duration = args.get("duration", self._MOVE_DEFAULT_DURATION_S)
+        if isinstance(duration, bool) or not isinstance(
+                duration, (int, float)):
+            return {
+                "state": "error", "command_sent": False,
+                "error": (
+                    f"duration must be a number from {self._MOVE_MIN_DURATION_S} "
+                    f"to {self._MOVE_MAX_DURATION_S}"
                 ),
             }
+        duration = float(duration)
+        if (not math.isfinite(duration)
+                or duration < self._MOVE_MIN_DURATION_S
+                or duration > self._MOVE_MAX_DURATION_S):
+            return {
+                "state": "error", "command_sent": False,
+                "error": (
+                    f"duration must be a finite number from "
+                    f"{self._MOVE_MIN_DURATION_S} to {self._MOVE_MAX_DURATION_S}"
+                ),
+                "received": args.get("duration"),
+            }
+
+        channel_values = {"vx": 0.0, "vy": 0.0, "vyaw": 0.0}
+        channel_values[velocity_channel] = velocity
+        vx = channel_values["vx"]
+        vy = channel_values["vy"]
+        vyaw = channel_values["vyaw"]
 
         mode = int(self._high_ctrl.get_mode())
         if mode == 26:
@@ -1480,6 +1500,8 @@ class LocoPlugin:
                 "confirmed_started": False,
                 "workmode": observed_mode,
                 "workmode_name": _WORKMODE_NAMES.get(observed_mode, "unknown"),
+                "velocity_channel": velocity_channel,
+                "velocity": velocity,
                 "normalized_command": {
                     "forward": vx, "lateral": vy, "turn": vyaw},
                 "duration_s": duration,
@@ -1512,6 +1534,8 @@ class LocoPlugin:
             "confirmed_started": True,
             "workmode": mode,
             "workmode_name": "walking",
+            "velocity_channel": velocity_channel,
+            "velocity": velocity,
             "normalized_command": {"forward": vx, "lateral": vy, "turn": vyaw},
             "duration_s": duration,
             "control_rate_hz": round(1.0 / self._control_period),

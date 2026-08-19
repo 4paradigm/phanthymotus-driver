@@ -31,10 +31,11 @@ Every published state identifies `Noetix HighController/CycloneDDS` as its sourc
 
 Uses only `HighController` to send bounded normalized forward, lateral and
 turning commands. A move is accepted only in workmode 2 (`walking`), requires
-at least one non-zero velocity (`vx`/`vyaw`: magnitude 0.5-1.0; `vy`: magnitude
-0.6-1.0), defaults to 2 seconds and is limited to 1-10 seconds. The SDK interface
-does not document `vx` and `vy` as mutually exclusive, so using both requests
-diagonal translation. Before every bounded move, the card sends one `WALK`
+the caller to select exactly one `velocity_channel` (`vx`, `vy` or `vyaw`) and
+provide one non-zero `velocity` (`vx`/`vyaw`: magnitude 0.5-1.0; `vy`: magnitude
+0.6-1.0). The two unselected channels are always forced to zero, so one MCP
+call cannot combine translation and turning. Duration defaults to 2 seconds and
+is limited to 1-10 seconds. Before every bounded move, the card sends one `WALK`
 edge to activate this SDK client's walking command path and then follows the
 vendor example by sending `DEFAULT` velocity frames at 100 Hz. Adaptive joint
 feedback must confirm that locomotion started; otherwise the card sends zero
