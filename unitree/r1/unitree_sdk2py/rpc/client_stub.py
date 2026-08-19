@@ -28,6 +28,7 @@ class ClientStub:
     def Init(self):
         factory = ChannelFactory()
         self.__futureQueue = RequestFutureQueue()
+        self.__fail_warns = 0
 
         # create channel
         self.__sendChannel = factory.CreateSendChannel(GetClientChannelName(self.__serviceName, ChannelType.SEND), Request)
@@ -40,7 +41,10 @@ class ClientStub:
         if self.__sendChannel.Write(request, timeout):
             return True
         else:
-            _log.warning("[ClientStub] send error. id: %s", request.header.identity.id)
+            self.__fail_warns += 1
+            if self.__fail_warns == 1 or self.__fail_warns % 100 == 0:
+                _log.warning("[ClientStub] send error. id: %s (occurrence %d)",
+                             request.header.identity.id, self.__fail_warns)
             return False
 
     def SendRequest(self, request: Request, timeout: float):
@@ -51,9 +55,13 @@ class ClientStub:
         self.__futureQueue.Set(id, future)
 
         if self.__sendChannel.Write(request, timeout):
+            self.__fail_warns = 0
             return future
         else:
-            _log.warning("[ClientStub] send request error. id: %s", request.header.identity.id)
+            self.__fail_warns += 1
+            if self.__fail_warns == 1 or self.__fail_warns % 100 == 0:
+                _log.warning("[ClientStub] send request error. id: %s (occurrence %d)",
+                             request.header.identity.id, self.__fail_warns)
             self.__futureQueue.Remove(id)
             return None
 
