@@ -352,7 +352,13 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("sensor", tool["type"])
         self.assertTrue(tool["readOnly"])
         self.assertEqual(
-            [{"topic": "/runtime_robot/state/odometer", "format": "data/json"}],
+            [
+                {"topic": "/runtime_robot/state/odometer", "format": "data/json"},
+                {
+                    "topic": "/runtime_robot/state/odometer/trajectory",
+                    "format": "sensor/mapping",
+                },
+            ],
             tool["topic_out"],
         )
         actions = tool["inputSchema"]["properties"]["action"]["enum"]
@@ -373,6 +379,8 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual({"x": 1.25, "y": -0.18, "z": 0.02}, status["position_m"])
         self.assertEqual(0.0, status["distance_total_m"])
         self.assertEqual(0.0, status["trip_distance_m"])
+        self.assertEqual({"x": 0.0, "y": 0.0}, status["trajectory_position_m"])
+        self.assertEqual(1, status["trajectory_point_count"])
         self.assertTrue(status["baseline_reset"])
 
     def test_odometer_accumulates_planar_distance_and_ignores_z(self):
@@ -391,6 +399,8 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertTrue(reset["trip_reset"])
         self.assertEqual(0.4, reset["distance_total_m"])
         self.assertEqual(0.0, reset["trip_distance_m"])
+        self.assertEqual({"x": 0.0, "y": 0.0}, reset["trajectory_position_m"])
+        self.assertEqual(1, reset["trajectory_point_count"])
         plugin._on_odometry(odometry_message(x=0.6, stamp=3.0))
         status = plugin.dispatch("status", {})
         self.assertEqual(0.6, status["distance_total_m"])
@@ -449,6 +459,7 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual(0.0, rejected["distance_total_m"])
         self.assertTrue(rejected["jump_rejected"])
         self.assertEqual(1, rejected["sample_count"]["jump_rejected"])
+        self.assertEqual({"x": 0.0, "y": 0.0}, rejected["trajectory_position_m"])
         plugin._on_odometry(odometry_message(x=20.1, stamp=3.0))
         self.assertAlmostEqual(0.1, plugin.dispatch("status", {})["distance_total_m"])
 
@@ -478,6 +489,7 @@ class DevicePluginContractTests(unittest.TestCase):
         changed = plugin.dispatch("status", {})
         self.assertEqual(0.0, changed["distance_total_m"])
         self.assertEqual(1, changed["sample_count"]["frame_resets"])
+        self.assertEqual({"x": 0.0, "y": 0.0}, changed["trajectory_position_m"])
         plugin._on_odometry(odometry_message(x=1.2, stamp=3.0, frame_id="map"))
         self.assertAlmostEqual(0.2, plugin.dispatch("status", {})["distance_total_m"])
 
@@ -496,6 +508,37 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertIn("orientation", payload)
         self.assertIn("distance_total_m", payload)
         self.assertIn("stationary_sec", payload)
+        self.assertEqual(1, len(plugin._visual_publisher.messages))
+
+    def test_odometer_mapping_payload_renders_relative_trajectory_and_heading(self):
+        plugin = self.device.OdometerPlugin(CONFIG, "robot", self.ros)
+        plugin._on_odometry(odometry_message(x=10.0, y=20.0, stamp=1.0))
+        half_yaw = math.pi / 4.0
+        plugin._on_odometry(odometry_message(
+            x=10.3,
+            y=20.4,
+            quaternion=(0.0, 0.0, math.sin(half_yaw), math.cos(half_yaw)),
+            stamp=2.0,
+        ))
+        raw = plugin._visual_payload()
+        robot_x, robot_y, display_yaw, flags, point_count = struct.unpack_from(
+            "<fffBI", raw, 0
+        )
+        self.assertAlmostEqual(0.3, robot_x, places=5)
+        self.assertAlmostEqual(0.4, robot_y, places=5)
+        self.assertAlmostEqual(-math.pi / 2.0, display_yaw, places=5)
+        self.assertEqual(7, flags)
+        self.assertGreater(point_count, plugin.dispatch("status", {})["trajectory_point_count"])
+
+        metadata_offset = struct.calcsize("<fffBI") + point_count * 12
+        metadata_length = struct.unpack_from("<I", raw, metadata_offset)[0]
+        metadata = json.loads(raw[
+            metadata_offset + 4:metadata_offset + 4 + metadata_length
+        ].decode("utf-8"))
+        self.assertEqual("odometer", metadata["point_source"])
+        self.assertTrue(metadata["robot"]["pose_available"])
+        self.assertGreater(metadata["trajectory_points"], 1)
+        self.assertAlmostEqual(math.pi / 2.0, metadata["robot"]["yaw"])
 
     def test_motion_trace_prefers_fresh_command_over_stale_odometry(self):
         plugin = self.device.MotionCommandTracePlugin(CONFIG, "robot", self.ros)

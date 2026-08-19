@@ -72,6 +72,9 @@ plugins:
     stationary_enter_m_s: 0.03
     stationary_exit_m_s: 0.05
     jump_tolerance_m: 0.25
+    trajectory_spacing_m: 0.025
+    trajectory_max_points: 4000
+    trajectory_view_extent_m: 5.0
   native_interface_probe:
     enabled: true
   locomotion:

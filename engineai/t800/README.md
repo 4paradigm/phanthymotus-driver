@@ -24,7 +24,7 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 | `joint_command_feedback` | sensor | Native SDK 最近关节控制命令反馈 |
 | `gamepad` | sensor | 遥控器连接、按键和摇杆状态 |
 | `motion_state` | sensor | 当前 Native SDK motion state 和允许转换 |
-| `odometer` | sensor | Odin2 位置、航向、速度、累计/单次里程、静止时长及断流/跳变诊断 |
+| `odometer` | sensor | Odin2 位置、航向、速度、累计/单次里程，以及运动轨迹和朝向鸟瞰画面 |
 | `driver_health` | sensor | 各 ROS2 数据源连接与新鲜度 |
 | `robot_snapshot` | sensor | 运动、关节、IMU、电源和电机健康聚合快照 |
 | `fault_summary` | sensor | 电机掉线/禁用/错误/过温及电源错误摘要 |
@@ -61,6 +61,10 @@ MCP schema 中隐藏。
 基础运动协议没有供控制闭环使用的定位反馈，因此它们仍是开环动作并返回
 `open_loop: true`。若 Odin2 固件提供配置中的 odometry topic，
 `motion_command_trace` 会把它用于状态显示，但不会据此闭环控制动作。
+
+`odometer` 同时发布 `data/json` 状态面板和 `sensor/mapping` 鸟瞰画面。画面以
+当前单次行程起点为原点，显示运动轨迹、当前位置和朝向箭头；`reset_trip` 会
+清零单次里程并清空画面轨迹，但不会修改 Odin2 原始坐标或累计总里程。
 
 `gesture.play` 与旧的 `joint_plan.preset` 不同：前者执行官方示例里的完整多步
 动作（挥手包含准备、举手、5 次摆动和复位；握手包含伸手、收手和复位），

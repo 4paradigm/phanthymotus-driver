@@ -13,9 +13,11 @@ import math
 import numbers
 import os
 import sqlite3
+import struct
 import subprocess
 import threading
 import time
+from array import array
 from collections import deque
 from dataclasses import asdict
 from pathlib import Path
@@ -23,7 +25,7 @@ from pathlib import Path
 import numpy as np
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-from std_msgs.msg import String
+from std_msgs.msg import String, UInt8MultiArray
 
 # Open3D is optional; fall back to numpy-only PCD writing when unavailable.
 try:
@@ -1189,6 +1191,7 @@ class OdometerPlugin:
         self._config = config
         self._ns = namespace
         self._topic = f"/{namespace}/state/odometer"
+        self._visual_topic = f"/{namespace}/state/odometer/trajectory"
         plugin_config = config.get("plugins", {}).get("odometer", {})
         self._timeout = max(
             0.1,
@@ -1208,6 +1211,14 @@ class OdometerPlugin:
         self._jump_tolerance = max(
             0.0, float(plugin_config.get("jump_tolerance_m", 0.25))
         )
+        self._trajectory_spacing = max(
+            0.005, float(plugin_config.get("trajectory_spacing_m", 0.025))
+        )
+        trajectory_capacity = int(plugin_config.get("trajectory_max_points", 4000))
+        self._trajectory_capacity = max(50, min(trajectory_capacity, 20000))
+        self._visual_extent = max(
+            2.0, min(float(plugin_config.get("trajectory_view_extent_m", 5.0)), 50.0)
+        )
         self._max_speed = _max_reasonable_odometry_speed(config)
 
         self._node = Node("t800_odometer", context=ros2.ctx_robot)
@@ -1215,6 +1226,9 @@ class OdometerPlugin:
         ros2.executor_robot.add_node(self._node)
         ros2.executor_core.add_node(self._pub_node)
         self._publisher = self._pub_node.create_publisher(String, self._topic, _RELIABLE)
+        self._visual_publisher = self._pub_node.create_publisher(
+            UInt8MultiArray, self._visual_topic, _RELIABLE_ONE
+        )
 
         self._lock = threading.RLock()
         self._latest: dict | None = None
@@ -1231,12 +1245,21 @@ class OdometerPlugin:
         self._timestamp_rejected_count = 0
         self._frame_reset_count = 0
         self._last_rejection: str | None = None
+        self._visual_origin: tuple[float, float] | None = None
+        self._visual_pose: tuple[float, float, float] | None = None
+        self._trajectory = deque(maxlen=self._trajectory_capacity)
+
+    def _topic_out(self) -> list[dict]:
+        return [
+            {"topic": self._topic, "format": "data/json"},
+            {"topic": self._visual_topic, "format": "sensor/mapping"},
+        ]
 
     def get_tool(self) -> dict:
         schema = action_schema(
             _with_lifecycle({
                 "status": ([], "返回最新里程计、行程和数据健康状态"),
-                "reset_trip": ([], "清零 Driver 内部单次行程，不修改 Odin2 坐标系"),
+                "reset_trip": ([], "清零单次行程和画面轨迹，不修改 Odin2 坐标系"),
             }),
             {},
             "里程计传感器动作",
@@ -1248,9 +1271,9 @@ class OdometerPlugin:
             "type": "sensor",
             "multiInstance": False,
             "readOnly": True,
-            "description": "T800 Odin2 位置、航向、速度、累计里程、单次行程与静止状态可视化",
+            "description": "T800 Odin2 里程状态，以及机器人运动轨迹和朝向的鸟瞰可视化",
             "inputSchema": schema,
-            "topic_out": [{"topic": self._topic, "format": "data/json"}],
+            "topic_out": self._topic_out(),
         }
 
     def start(self) -> None:
@@ -1267,12 +1290,20 @@ class OdometerPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "info":
-            return _with_topic_out(self._snapshot(), self._topic)
+            return {**self._snapshot(), "topic_out": self._topic_out()}
         if action in ("odometer", "status", "start"):
             return self._snapshot()
         if action == "reset_trip":
             with self._lock:
                 self._trip_distance_m = 0.0
+                if self._latest is None:
+                    self._visual_origin = None
+                    self._visual_pose = None
+                    self._trajectory.clear()
+                else:
+                    position = self._latest["position_m"]
+                    yaw = float(self._latest["orientation"]["yaw_rad"])
+                    self._reset_visual_locked(float(position["x"]), float(position["y"]), yaw)
             return {**self._snapshot(), "trip_reset": True}
         if action == "stop":
             return {"state": "idle"}
@@ -1379,6 +1410,14 @@ class OdometerPlugin:
                 "received_at": received_at,
             }
 
+            if baseline_reset or self._visual_origin is None:
+                self._reset_visual_locked(position[0], position[1], yaw)
+            else:
+                relative_x = position[0] - self._visual_origin[0]
+                relative_y = position[1] - self._visual_origin[1]
+                self._visual_pose = (relative_x, relative_y, yaw)
+                self._append_trajectory_locked(relative_x, relative_y, yaw)
+
             if self._stationary is None:
                 self._stationary = speed <= self._stationary_enter
                 self._stationary_since = received_at if self._stationary else None
@@ -1431,6 +1470,8 @@ class OdometerPlugin:
                 "frame_resets": self._frame_reset_count,
             }
             last_rejection = self._last_rejection
+            trajectory_count = len(self._trajectory)
+            visual_pose = self._visual_pose
 
         if latest is None or updated is None:
             return {
@@ -1439,6 +1480,7 @@ class OdometerPlugin:
                 "age_sec": None,
                 "distance_total_m": round(total, 6),
                 "trip_distance_m": round(trip, 6),
+                "trajectory_point_count": trajectory_count,
                 "sample_count": counts,
                 "last_rejection": last_rejection,
                 "timestamp_ms": _now_ms(),
@@ -1456,6 +1498,11 @@ class OdometerPlugin:
             **latest,
             "distance_total_m": round(total, 6),
             "trip_distance_m": round(trip, 6),
+            "trajectory_position_m": None if visual_pose is None else {
+                "x": round(visual_pose[0], 6),
+                "y": round(visual_pose[1], 6),
+            },
+            "trajectory_point_count": trajectory_count,
             "stationary_sec": round(stationary_sec, 3),
             "age_sec": round(age_sec, 3),
             "stale": stale,
@@ -1467,6 +1514,118 @@ class OdometerPlugin:
 
     def _publish(self) -> None:
         self._publisher.publish(_json_message(self._snapshot()))
+        self._publish_visual()
+
+    def _reset_visual_locked(self, x: float, y: float, yaw: float) -> None:
+        self._visual_origin = (x, y)
+        self._visual_pose = (0.0, 0.0, yaw)
+        self._trajectory.clear()
+        self._trajectory.append((0.0, 0.0, yaw))
+
+    def _append_trajectory_locked(self, x: float, y: float, yaw: float) -> None:
+        if not self._trajectory:
+            self._trajectory.append((x, y, yaw))
+            return
+        old_x, old_y, _old_yaw = self._trajectory[-1]
+        distance = math.hypot(x - old_x, y - old_y)
+        if distance < self._trajectory_spacing:
+            return
+        steps = min(
+            self._trajectory_capacity,
+            max(1, int(math.ceil(distance / self._trajectory_spacing))),
+        )
+        for index in range(1, steps + 1):
+            ratio = index / steps
+            self._trajectory.append((
+                old_x + (x - old_x) * ratio,
+                old_y + (y - old_y) * ratio,
+                yaw,
+            ))
+
+    def _visual_reference_points(self) -> list[tuple[float, float, float]]:
+        extent = self._visual_extent
+        step = 0.25
+        count = int((2.0 * extent) / step) + 1
+        points: list[tuple[float, float, float]] = []
+        for index in range(count):
+            value = -extent + index * step
+            points.append((value, 0.0, 0.0))
+            points.append((0.0, value, 0.0))
+            if index % 2 == 0:
+                points.append((value, -extent, -0.02))
+                points.append((value, extent, -0.02))
+                points.append((-extent, value, -0.02))
+                points.append((extent, value, -0.02))
+        return points
+
+    @staticmethod
+    def _heading_arrow_points(x: float, y: float, yaw: float) -> list[tuple[float, float, float]]:
+        points: list[tuple[float, float, float]] = []
+        length = 0.55
+        for index in range(24):
+            distance = length * index / 23.0
+            points.append((
+                x + math.cos(yaw) * distance,
+                y + math.sin(yaw) * distance,
+                0.28,
+            ))
+        tip_x = x + math.cos(yaw) * length
+        tip_y = y + math.sin(yaw) * length
+        for angle in (yaw + 2.55, yaw - 2.55):
+            for index in range(10):
+                distance = 0.025 * index
+                points.append((
+                    tip_x + math.cos(angle) * distance,
+                    tip_y + math.sin(angle) * distance,
+                    0.28,
+                ))
+        return points
+
+    def _visual_payload(self) -> bytes:
+        with self._lock:
+            pose = self._visual_pose
+            trajectory = list(self._trajectory)
+            frame_id = None if self._latest is None else self._latest.get("frame_id")
+            stale = self._updated is None or time.monotonic() - self._updated > self._timeout
+
+        robot_x, robot_y, robot_yaw = pose or (0.0, 0.0, 0.0)
+        points = self._visual_reference_points()
+        points.extend((x, y, 0.14) for x, y, _yaw in trajectory)
+        if pose is not None:
+            points.extend(self._heading_arrow_points(robot_x, robot_y, robot_yaw))
+        point_array = np.asarray(points, dtype=np.float32).reshape(-1, 3)
+        metadata = {
+            "version": 3,
+            "active_map": "odometer_trajectory",
+            "point_source": "odometer",
+            "frame_id": frame_id,
+            "stale": stale,
+            "trajectory_points": len(trajectory),
+            "robot": {
+                "x": robot_x,
+                "y": robot_y,
+                "yaw": robot_yaw,
+                "pose_available": pose is not None,
+            },
+            "maps": [],
+            "tags": [],
+        }
+        metadata_bytes = json.dumps(metadata, ensure_ascii=False).encode("utf-8")
+        flags = 0x03 | 0x04
+        header = struct.pack(
+            "<fffBI", robot_x, robot_y, -robot_yaw, flags, len(point_array)
+        )
+        return (
+            header
+            + point_array.tobytes()
+            + struct.pack("<I", len(metadata_bytes))
+            + metadata_bytes
+        )
+
+    def _publish_visual(self) -> None:
+        message = UInt8MultiArray()
+        message.data = array("B", self._visual_payload())
+        self._visual_publisher.publish(message)
 
 
 class MotionEventsPlugin:
