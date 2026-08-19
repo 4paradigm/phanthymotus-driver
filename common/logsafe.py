@@ -25,8 +25,9 @@ and does not inherit the parent's `sys.stdout` object.
     import logsafe; logsafe.install()          # agent-core, drivers
     from utils import logsafe; logsafe.install()  # perception
 
-`sys.stderr` is deliberately left alone so tracebacks stay intact and readable;
-individual traceback writes are far below `PIPE_BUF`.
+`sys.stderr` is wrapped too, by default — see install(). Tracebacks survive:
+each line becomes its own atomic record, which is how `docker logs` frames them
+anyway. Pass `stderr=False` to opt out.
 
 NOTE ON SCOPE: this is a safety net, not a root-cause fix. It prevents *Python*
 writers from producing torn or control-laden records. It does not repair a log
@@ -105,27 +106,28 @@ def _truncate(payload: bytes) -> bytes:
     return cut + f'…[truncated {dropped} bytes]'.encode('utf-8')
 
 
-def _emit(line: str) -> None:
-    """Write one complete line as a single atomic os.write."""
+def _emit(fd: int, line: str) -> None:
+    """Write one complete line to `fd` as a single atomic os.write."""
     payload = _truncate(scrub(line).encode('utf-8', errors='replace')) + b'\n'
     with _write_lock:
         offset = 0
         while offset < len(payload):
             try:
-                offset += os.write(1, payload[offset:])
+                offset += os.write(fd, payload[offset:])
             except (BrokenPipeError, OSError):
                 return  # log consumer went away; never let logging kill the process
 
 
-class LineAtomicStdout(io.TextIOBase):
-    """Line-buffered stdout that emits each line in one atomic write.
+class LineAtomicStream(io.TextIOBase):
+    """Line-buffered stream that emits each line in one atomic write.
 
     `print(x)` issues two writes — the text, then the newline — so buffering
     must happen here rather than relying on the caller. The buffer is
     thread-local: two threads mid-line must not splice into each other.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, fd: int) -> None:
+        self._fd = fd
         self._local = threading.local()
 
     @property
@@ -147,7 +149,7 @@ class LineAtomicStdout(io.TextIOBase):
             if nl < 0:
                 break
             buf.append(s[start:nl])
-            _emit(''.join(buf))
+            _emit(self._fd, ''.join(buf))
             buf.clear()
             start = nl + 1
         if start < len(s):
@@ -155,17 +157,17 @@ class LineAtomicStdout(io.TextIOBase):
         return len(s)
 
     def flush(self) -> None:
-        """Emit any partial line. stdout is unbuffered at the fd level."""
+        """Emit any partial line. The fd itself is unbuffered."""
         buf = self._buf
         if buf:
-            _emit(''.join(buf))
+            _emit(self._fd, ''.join(buf))
             buf.clear()
 
     def writable(self) -> bool:
         return True
 
     def fileno(self) -> int:
-        return 1
+        return self._fd
 
     def isatty(self) -> bool:
         return False
@@ -182,8 +184,12 @@ class LineAtomicStdout(io.TextIOBase):
 _installed = False
 
 
-def install(check_fd: bool = True) -> None:
-    """Replace sys.stdout with the line-atomic writer. Idempotent.
+def install(check_fd: bool = True, stderr: bool = True) -> None:
+    """Replace sys.stdout (and by default sys.stderr) with line-atomic writers.
+
+    Idempotent. `stderr` defaults to True because anything using the `logging`
+    module writes there: measured on a robot, perception emitted 364 B on stdout
+    against 39 KB on stderr, so protecting only stdout guards the wrong stream.
 
     When `check_fd` is set, warn if fd 1 is not what sys.stdout points at —
     a tripwire for code that shuffles file descriptors and silently detaches
@@ -207,5 +213,7 @@ def install(check_fd: bool = True) -> None:
                 )
         except (AttributeError, OSError, io.UnsupportedOperation):
             pass  # already redirected to a non-fd object; nothing useful to check
-    sys.stdout = LineAtomicStdout()
+    sys.stdout = LineAtomicStream(1)
+    if stderr:
+        sys.stderr = LineAtomicStream(2)
     _installed = True
