@@ -28,6 +28,10 @@ RPC_DEBUG = bool(os.environ.get('UNITREE_RPC_DEBUG'))
 class ClientBase:
     def __init__(self, serviceName: str):
         self.__timeout = 1.0
+        # Repeated-failure counter: a peer service that is simply not running makes
+        # every call fail, and logging each one buries the log. Warn on the first
+        # and every 100th, and say so when it recovers.
+        self.__fail_warns = 0
         self.__stub = ClientStub(serviceName)
         self.__stub.Init()
 
@@ -45,7 +49,10 @@ class ClientBase:
         t0 = time.monotonic()
         future = self.__stub.SendRequest(request, self.__timeout)
         if future is None:
-            _log.warning("[CallBase] SendRequest failed (send error), elapsed=%.3fs", time.monotonic() - t0)
+            self.__fail_warns += 1
+            if self.__fail_warns == 1 or self.__fail_warns % 100 == 0:
+                _log.warning("[CallBase] SendRequest failed (send error), elapsed=%.3fs "
+                             "(occurrence %d)", time.monotonic() - t0, self.__fail_warns)
             return RPC_ERR_CLIENT_SEND, None
 
         if RPC_DEBUG:
@@ -56,11 +63,17 @@ class ClientBase:
         if result.code != FutureResult.FUTURE_SUCC:
             self.__stub.RemoveFuture(request.header.identity.id)
             code = RPC_ERR_CLIENT_API_TIMEOUT if result.code == FutureResult.FUTUTE_ERR_TIMEOUT else RPC_ERR_UNKNOWN
-            _log.warning("[CallBase] failed: result.code=%s, rpc_code=%s, elapsed=%.3fs",
-                         result.code, code, elapsed)
+            self.__fail_warns += 1
+            if self.__fail_warns == 1 or self.__fail_warns % 100 == 0:
+                _log.warning("[CallBase] failed: result.code=%s, rpc_code=%s, elapsed=%.3fs "
+                             "(occurrence %d)", result.code, code, elapsed, self.__fail_warns)
             return code, None
 
         response = result.value
+        if self.__fail_warns:
+            _log.warning("[CallBase] RPC recovered after %d consecutive failures",
+                         self.__fail_warns)
+            self.__fail_warns = 0
         if RPC_DEBUG:
             _log.debug("[CallBase] success: apiId=%s, status=%s, elapsed=%.3fs",
                        response.header.identity.api_id, response.header.status.code, elapsed)
