@@ -366,6 +366,58 @@ class ArmControlPlugin:
                     self._motion_thread = None
                     self._active_command = None
 
+    def _run_arm_action(self, stop_event, joint_name: str, current: float, target: float,
+                        duration_s: float, action_id: str):
+        """Prepare the vendor stack in the background, then execute the move."""
+        try:
+            prepare_error = self._ensure_prepared()
+            if stop_event.is_set():
+                _acp_notify(action_id, "cancelled", {"phase": "prepare"}, ARM_CARD)
+                return
+            if prepare_error:
+                _acp_notify(action_id, "error", prepare_error, ARM_CARD)
+                return
+            q5_ready, q5_status = q5_is_control_ready(self._client)
+            if not q5_ready or q5_status.get("state") != 4:
+                _acp_notify(action_id, "error", _arm_failure(
+                    "Q5_FSM_NOT_ACTIVE",
+                    "Q5 must be fresh and ACTIVE after position-control preparation",
+                    q5_fsm=q5_status,
+                ), ARM_CARD)
+                return
+            if stop_event.is_set():
+                _acp_notify(action_id, "cancelled", {"phase": "prepare"}, ARM_CARD)
+                return
+            if not self._router.acquire(ARM_CARD):
+                _acp_notify(action_id, "error", _arm_failure(
+                    "COMMAND_IN_PROGRESS",
+                    "Another Q5 body card currently owns the command publisher",
+                    status=self._router.status(),
+                ), ARM_CARD)
+                return
+            with self._lock:
+                active = self._active_command
+                if active is not None and active.get("action_id") == action_id:
+                    active["state"] = "moving"
+                    active["prepare"] = "completed"
+            if stop_event.is_set():
+                self._router.release(ARM_CARD)
+                _acp_notify(action_id, "cancelled", {"phase": "before_motion"}, ARM_CARD)
+                return
+            self._run_move(stop_event, joint_name, current, target, duration_s, action_id)
+        except Exception as exc:
+            # Keep an unexpected preparation/transition failure asynchronous too.
+            self._router.release(ARM_CARD)
+            _acp_notify(action_id, "error", _arm_failure(
+                "ARM_ACTION_FAILED", "Q5 arm action failed", error=str(exc)
+            ), ARM_CARD)
+        finally:
+            with self._lock:
+                if self._motion_stop is stop_event:
+                    self._motion_stop = None
+                    self._motion_thread = None
+                    self._active_command = None
+
     def _stop(self, reason: str) -> dict:
         with self._lock:
             stop_event = self._motion_stop
@@ -390,16 +442,6 @@ class ArmControlPlugin:
         # several DDS endpoints on this topic. Endpoint count is therefore a
         # diagnostic only, not proof of a competing driver. The shared router
         # below enforces ownership between our body-control cards.
-        prepare_error = self._ensure_prepared()
-        if prepare_error:
-            return {**prepare_error, "details": {**prepare_error.get("details", {}), "status": status}}
-        # Direct HybridJointCommand control is owned by the vendor body
-        # controller after arm_control preparation completes. motion_manager is a
-        # separate lifecycle node and may legitimately remain inactive.
-        q5_ready, q5_status = q5_is_control_ready(self._client)
-        if not q5_ready or q5_status.get("state") != 4:
-            return _arm_failure("Q5_FSM_NOT_ACTIVE", "Q5 must remain fresh and ACTIVE after position-control preparation before arm control",
-                            status={**status, "q5_fsm": q5_status})
         snap = self._client.snapshot()
         if not snap.get("fresh"):
             return _arm_failure("JOINT_STATE_UNAVAILABLE", "Refusing arm control without fresh /joint_states")
@@ -448,26 +490,24 @@ class ArmControlPlugin:
             return command
         joint_name, current, target, duration_s = command
         action_id = str(args.get("action_id") or f"arm_control_{joint_name}_{int(time.time() * 1000)}")
-        if not self._router.acquire(ARM_CARD):
-            return _arm_failure("COMMAND_IN_PROGRESS", "Another Q5 body card currently owns the command publisher",
-                            status=self._router.status())
         with self._lock:
             if self._motion_thread is not None and self._motion_thread.is_alive():
-                self._router.release(ARM_CARD)
                 return _arm_failure("MOTION_IN_PROGRESS", "An arm movement is already active; call stop before another move")
             stop_event = threading.Event()
             self._motion_stop = stop_event
             self._active_command = {
+                "action_id": action_id, "state": "queued", "prepare": "pending",
                 "joint_name": joint_name, "start_position_rad": current,
                 "target_position_rad": target, "duration_s": duration_s,
                 "started_at_ms": int(time.time() * 1000),
             }
+            queued_command = dict(self._active_command)
             self._motion_thread = threading.Thread(
-                target=self._run_move,
+                target=self._run_arm_action,
                 args=(stop_event, joint_name, current, target, duration_s, action_id),
                 daemon=True,
                 name="q5_arm_control",
             )
             self._motion_thread.start()
-        return {"ok": True, "state": "moving", "command": dict(self._active_command),
+        return {"ok": True, "state": "queued", "prepare": "pending", "command": queued_command,
                 "stops_by_holding_current_position": True, "action_id": action_id}
