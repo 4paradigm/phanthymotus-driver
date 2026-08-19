@@ -1025,7 +1025,15 @@ class M20MappingViewPlugin:
     def dispatch(self, action, args):
         if action == "stop":
             return {"state": "idle"}
-        if action in ("start", "info"):
+        if action == "start":
+            snapshot = getattr(self.nodes, "mapping_view_snapshot", lambda: {"state": "ready"})()
+            return {
+                **snapshot,
+                "state": "running",
+                "mapping_state": snapshot.get("state", "ready"),
+                "topic_out": self.topic_out,
+            }
+        if action == "info":
             snapshot = getattr(self.nodes, "mapping_view_snapshot", lambda: {"state": "ready"})()
             return {**snapshot, "topic_out": self.topic_out}
         raise ValueError(f"unsupported mapping_view action: {action}")

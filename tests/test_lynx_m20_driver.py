@@ -294,10 +294,27 @@ class LynxM20ContractTests(unittest.TestCase):
         plugin = m20.M20MappingViewPlugin(nodes)
         expected = [{"topic": nodes.mapping_topic, "format": "sensor/mapping"}]
         self.assertEqual(expected, plugin.get_tool()["topic_out"])
+        started = plugin.dispatch("start", {})
+        self.assertEqual(expected, started["topic_out"])
+        self.assertEqual(
+            ("running", "live_mapping", "floor_1", 123),
+            (started["state"], started["mapping_state"], started["requested_map"], started["point_count"]),
+        )
         info = plugin.dispatch("info", {})
         self.assertEqual(expected, info["topic_out"])
         self.assertEqual(("live_mapping", "floor_1", 123), (info["state"], info["requested_map"], info["point_count"]))
         self.assertEqual({"state": "idle"}, plugin.dispatch("stop", {}))
+
+    def test_mapping_view_start_reports_running_when_mapping_is_idle(self):
+        nodes = FakeNodes()
+        nodes.mapping_topic = "/host/lynx_m20/mapping_view"
+        nodes.mapping_view_snapshot = lambda: {
+            "state": "idle", "requested_map": None, "point_count": 0,
+        }
+        started = m20.M20MappingViewPlugin(nodes).dispatch("start", {})
+        self.assertEqual("running", started["state"])
+        self.assertEqual("idle", started["mapping_state"])
+        self.assertEqual(0, started["point_count"])
 
     def test_mapping_view_supports_live_and_latched_grid_publishers(self):
         source = (DRIVER / "device.py").read_text()
