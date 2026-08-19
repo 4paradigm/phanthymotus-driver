@@ -7,6 +7,7 @@ import time
 import re
 import math
 import threading
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import base_drive
@@ -107,6 +108,15 @@ class Q5BasicSensorTests(unittest.TestCase):
                                              "dq": 0.0, "tau": 1.0})
         self.assertEqual(data["joints"][1]["name"], "left_hand_index_joint1")
         self.assertEqual(data["joints"][1]["idx"], 1)
+
+    def test_skeleton_model_excludes_non_kinematic_ros_control_joint_duplicates(self):
+        root = ET.fromstring(joints._skeleton_urdf())
+        kinematic_joints = root.findall("joint")
+        self.assertEqual(len(kinematic_joints), 93)
+        self.assertEqual(len({joint.get("name") for joint in kinematic_joints}), 93)
+        self.assertFalse(root.findall("ros2_control"))
+        self.assertTrue(all(joint.find("parent") is not None for joint in kinematic_joints))
+        self.assertTrue(all(joint.find("child") is not None for joint in kinematic_joints))
 
     def test_joint_cards_preserve_received_but_stale_data_as_unavailable_for_live_use(self):
         stale = dict(FRESH_JOINT_SNAPSHOT, available=True, fresh=False, stale=True, age_ms=5001)
