@@ -150,7 +150,7 @@ _ControlCmd = None  # Lazy-loaded enum module
 
 
 def _acp_notify(action_id: str, status: str, result: dict,
-                tool: str) -> None:
+                tool: str) -> bool:
     """Report an asynchronous physical-action terminal state to Agent Core."""
     import json as _json
     import os as _os
@@ -177,18 +177,20 @@ def _acp_notify(action_id: str, status: str, result: dict,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with _urllib.urlopen(request, timeout=5, context=context):
-            pass
+        with _urllib.urlopen(request, timeout=5, context=context) as response:
+            response.read()
         print(
             f"[ACP] {status}: action_id={action_id} tool={tool}",
             flush=True,
         )
+        return True
     except Exception as exc:
         print(
             f"[ACP] callback failed for {action_id}: {exc}",
             file=_sys.stderr,
             flush=True,
         )
+        return False
 
 
 def _get_control_cmd(name: str):
@@ -598,7 +600,7 @@ class LocoPlugin:
     def _action_recording_tool(self) -> dict:
         return {
             "name": "action_recording", "type": "actuator", "multiInstance": False,
-            "description": "录制、结束并保存或播放 Bumi 示教动作。start_recording 和 play_recording 会自动进入所需行走模式；finish_and_save_recording 只能在已开始录制后使用；play_recording 会用关节位移和滚动速度中位数判断播放结束，并通过最多两次受保护的 WALK 尝试自动返回 walking。",
+            "description": "录制、结束并保存或播放 Bumi 示教动作。三个选项均使用 ACP 并返回 action_id；start_recording 和 finish_and_save_recording 在目标工作模式被确认后上报命令完成，play_recording 在检测到实际播放结束并恢复 walking 后上报完成。start_recording 和 play_recording 会自动进入所需行走模式；finish_and_save_recording 只能在已开始录制后使用。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -613,7 +615,7 @@ class LocoPlugin:
                 },
                 "required": ["action"],
                 "x-completion": {
-                    "actions": ["play_recording"],
+                    "actions": list(_TEACHING_ACTIONS),
                     "timeout": 150,
                 },
                 "x-action-params": {
@@ -673,15 +675,7 @@ class LocoPlugin:
         if tool_name == "semantic_action" and action in _PRESET_ACTIONS:
             return self._start_semantic_acp(action, args)
         if tool_name == "action_recording" and action in _TEACHING_ACTIONS:
-            result = self._do_teaching_action(action, args)
-            if (action == "play_recording" and result.get("state") == "running"
-                    and result.get("confirmed_started")):
-                action_id, _ = self._register_acp(
-                    "action_recording", action)
-                result["action_id"] = action_id
-                self._schedule_playback_completion_monitor(
-                    self._safety_requirements(action), action_id=action_id)
-            return result
+            return self._start_teaching_acp(action, args)
         return None
 
     def _register_acp(self, tool: str, action: str,
@@ -698,13 +692,49 @@ class LocoPlugin:
 
     def _finish_acp(self, action_id: str, status: str, result: dict) -> bool:
         with self._acp_lock:
-            active = self._active_acp.pop(action_id, None)
+            active = self._active_acp.get(action_id)
+            if active is not None and active.get("terminal_pending"):
+                return False
+            if active is not None:
+                active["terminal_pending"] = True
         if active is None:
             return False
         terminal_result = self._format_acp_terminal(
             action_id, active["action"], status, result)
-        _acp_notify(action_id, status, terminal_result, active["tool"])
+        threading.Thread(
+            target=self._deliver_acp_terminal,
+            args=(action_id, status, terminal_result, active["tool"]),
+            daemon=True,
+            name=f"bumi_acp_delivery_{action_id[-8:]}",
+        ).start()
         return True
+
+    def _deliver_acp_terminal(self, action_id: str, status: str,
+                              result: dict, tool: str) -> None:
+        # Agent Core registers the action_id after receiving the MCP response.
+        # Retry locally so a fast action or transient localhost failure cannot
+        # permanently lose its terminal callback.
+        delays = (0.5, 0.5, 1.0, 1.0, 2.0, 2.0, 4.0, 4.0)
+        for attempt, delay_s in enumerate(delays, start=1):
+            if _acp_notify(action_id, status, result, tool):
+                with self._acp_lock:
+                    self._active_acp.pop(action_id, None)
+                return
+            print(
+                f"[ACP] delivery retry {attempt}/{len(delays)} for "
+                f"action_id={action_id} in {delay_s:.1f}s",
+                flush=True,
+            )
+            time.sleep(delay_s)
+        with self._acp_lock:
+            active = self._active_acp.get(action_id)
+            if active is not None:
+                active["terminal_pending"] = False
+        print(
+            f"[ACP] terminal callback exhausted retries: action_id={action_id} "
+            f"tool={tool} status={status}",
+            flush=True,
+        )
 
     @staticmethod
     def _format_acp_terminal(action_id: str, action: str, status: str,
@@ -738,18 +768,9 @@ class LocoPlugin:
     def _cancel_all_acp(self, reason: str) -> None:
         with self._acp_lock:
             active_items = list(self._active_acp.items())
-            self._active_acp.clear()
         for action_id, active in active_items:
             active["cancel_event"].set()
-            result = self._format_acp_terminal(
-                action_id, active["action"], "cancelled",
-                {"reason": reason})
-            _acp_notify(
-                action_id,
-                "cancelled",
-                result,
-                active["tool"],
-            )
+            self._finish_acp(action_id, "cancelled", {"reason": reason})
 
     def _complete_move_acp(self, action_id: str,
                            move_thread: threading.Thread | None,
@@ -796,6 +817,75 @@ class LocoPlugin:
                 "receive a completed, error or cancelled terminal result."
             ),
         }
+
+    def _start_teaching_acp(self, action: str, args: dict) -> dict:
+        # Validate request-only fields synchronously so malformed IDs do not
+        # create an ACP action that can never issue a vendor command.
+        if action in ("finish_and_save_recording", "play_recording"):
+            recording_id = args.get("recording_id")
+            if type(recording_id) is not int:
+                return {
+                    "state": "error", "command_sent": False,
+                    "error": "recording_id must be an integer",
+                    "safety_requirements": self._safety_requirements(action),
+                }
+            if not 0 <= recording_id <= 65535:
+                return {
+                    "state": "error", "command_sent": False,
+                    "error": "recording_id must be in the range 0 to 65535",
+                    "safety_requirements": self._safety_requirements(action),
+                }
+        action_id, cancel_event = self._register_acp(
+            "action_recording", action)
+        threading.Thread(
+            target=self._run_teaching_acp,
+            args=(action_id, cancel_event, action, dict(args)),
+            daemon=True,
+            name=f"bumi_teaching_acp_{action_id[-8:]}",
+        ).start()
+        response = {
+            "state": "accepted",
+            "action_id": action_id,
+            "requested_action": action,
+            "safety_requirements": self._safety_requirements(action),
+            "message": (
+                "The recording action was accepted. Agent Core will receive a completed, "
+                "error or cancelled terminal result after command confirmation."
+            ),
+        }
+        if "recording_id" in args:
+            response["recording_id"] = args["recording_id"]
+        return response
+
+    def _run_teaching_acp(self, action_id: str,
+                          cancel_event: threading.Event, action: str,
+                          args: dict) -> None:
+        if cancel_event.wait(0.5):
+            return
+        try:
+            result = self._do_teaching_action(action, args)
+            if cancel_event.is_set():
+                return
+            if (result.get("state") == "error"
+                    or not result.get("confirmed_started")):
+                if "error" not in result:
+                    result["error"] = (
+                        "The recording command was sent, but its target workmode was "
+                        "not observed."
+                    )
+                self._finish_acp(action_id, "error", result)
+                return
+            if action == "play_recording":
+                self._schedule_playback_completion_monitor(
+                    self._safety_requirements(action), action_id=action_id)
+                return
+            result["completion_detection"] = "target_workmode_observed"
+            self._finish_acp(action_id, "completed", result)
+        except Exception as exc:
+            self._finish_acp(action_id, "error", {
+                "requested_action": action,
+                "error": str(exc),
+            })
 
     def _run_semantic_acp(self, action_id: str, cancel_event: threading.Event,
                           action: str, args: dict) -> None:

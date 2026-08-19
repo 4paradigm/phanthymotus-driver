@@ -50,12 +50,15 @@ mode into walking because the SDK cannot verify that the robot is physically
 standing.
 
 Long-running physical operations use Agent Core's Action Completion Protocol
-(ACP). `loco.move`, both posture actions, every `semantic_action`, and
-`action_recording.play_recording` return a unique `action_id`; their background
+(ACP). `loco.move`, both posture actions, every `semantic_action`, and every
+`action_recording` action return a unique `action_id`; their background
 workers report `completed`, `error`, or `cancelled` to `/api/acp/complete`.
 Every terminal result includes the same `action_id`, action name, terminal
 `state`, a boolean `success`, and a plain-language completion message; failures
 also include a concrete `error` reason.
+Terminal callbacks use bounded retries and remain registered in the driver
+until Agent Core acknowledges delivery, preventing a fast completion or a
+transient localhost/registration race from silently losing the result.
 This keeps Agent Core's actuator barrier active until the bounded move or action
 really terminates. Stopping the plugin cancels pending timers and playback
 monitoring before reporting the affected ACP actions as cancelled.
@@ -66,6 +69,10 @@ completion; protection, unexpected workmode changes, missing physical motion,
 feedback errors and monitor timeouts are reported as ACP errors. `wipe_tears`
 keeps its guarded five-second return-to-walking behavior, while `reset` is
 complete only after walking mode is confirmed.
+For action recording, starting and saving report completion after the vendor
+target workmode is confirmed; this completes the requested command, not the
+open-ended user-guided recording session. Playback remains pending until joint
+feedback indicates the motion ended and walking-mode recovery is confirmed.
 Posture workmode and stand-up pose checks run before the asynchronous request is
 accepted, so invalid requests such as calling `stand_up` while already standing
 return an immediate plain-language error. A valid request returns only its ACP
