@@ -16,11 +16,6 @@ try:
 except ImportError:
     ArmControlPlugin = None
 
-try:
-    from legacy_direct_control import Q5ControlModePlugin
-except ImportError:
-    Q5ControlModePlugin = None
-
 from body_command import get_router as _get_body_router, BodyCommandRouter
 from control_contract import q5_active_status, q5_is_control_ready
 from joint_limits import JOINT_LIMITS, limits_for
@@ -161,35 +156,43 @@ def _acp_notify(action_id: str, status: str, result: dict, tool: str = ""):
 # ── Frame builder ────────────────────────────────────────────────────────────
 
 def _build_frames(gesture: str, cycles: int) -> list:
-    """Return a list of (pose_deg, hold_seconds, transition_ratio) tuples."""
+    """Return a list of (pose_deg, hold_seconds, transition_ratio) tuples.
+
+    transition_ratio scales the interpolation time for each frame:
+      < 1.0 → faster transition, creates natural blend with next frame
+      == 1.0 → full-speed transition with explicit hold
+    This mirrors tianyi's _PREPARE_POSES + frame-blending approach.
+    """
     frames: list[tuple[list[float], float, float]] = []
 
     prepare = _PREPARE_DEG.get(gesture, _GESTURES_DEG[gesture])
     target = _GESTURES_DEG[gesture]
 
-    frames.append((prepare, 0.25, 0.90))
+    # Prepare frame: move quickly through prepare pose (ratio < 1 blends into next)
+    frames.append((prepare, 0.0, 0.55))
 
     if gesture == "salute":
-        frames.append((target, 1.1, 1.0))
+        frames.append((target, 0.4, 0.85))
     else:
-        frames.append((target, 0.8, 0.90))
+        frames.append((target, 0.3, 0.80))
 
     if gesture == "shake_hands":
         for i in range(cycles * 2):
             pose = list(target)
             pose[3] = -28 if i % 2 == 0 else -42
-            frames.append((pose, 0.30, 0.85))
+            frames.append((pose, 0.0, 0.65))
     elif gesture == "welcome":
         for i in range(cycles * 2):
             pose = list(target)
             pose[3] = -110 if i % 2 == 0 else -90
-            frames.append((pose, 0.35, 0.85))
+            frames.append((pose, 0.0, 0.65))
     elif gesture == "wave":
         for i in range(cycles * 2):
             pose = list(target)
             pose[5] = 35 if i % 2 == 0 else 5
-            frames.append((pose, 0.30, 0.85))
+            frames.append((pose, 0.0, 0.65))
 
+    # Return to neutral: full-speed transition with hold
     frames.append((_NEUTRAL_DEG, 1.0, 1.0))
     return frames
 
@@ -231,15 +234,6 @@ class Plugin:
                 self._arm_control = ArmControlPlugin(ctrl_cfg, namespace, executor, client)
             except Exception:
                 self._arm_control = None
-
-        # Embedded Q5 control-mode helper so arm_gesture can self-prepare
-        # position control without requiring the separate q5_control_mode card.
-        self._control_mode: Q5ControlModePlugin | None = None
-        if Q5ControlModePlugin is not None:
-            try:
-                self._control_mode = Q5ControlModePlugin(plugin_config, namespace, executor, client)
-            except Exception:
-                self._control_mode = None
 
         # Shared body publisher (single-router pattern).
         self._router: BodyCommandRouter = _get_body_router(client, executor)
@@ -345,11 +339,13 @@ class Plugin:
         return {"state": "idle"}
 
     def prepare(self) -> dict:
-        """Delegate to embedded Q5ControlModePlugin for position-control preparation."""
-        if self._control_mode is None:
+        """Delegate to arm_control's position-control preparation."""
+        if self._arm_control is None:
             return _failure("CONTROL_MODE_UNAVAILABLE",
-                            "Q5 control-mode helper is not initialized")
-        result = self._control_mode.dispatch("prepare_position_control", {})
+                            "arm_control helper is not initialized")
+        result = self._arm_control._ensure_prepared()
+        if result is None:
+            return {"ok": True, "state": "active", "position_control_prepared": True}
         return result
 
     # ── Safety ────────────────────────────────────────────────────────────
@@ -395,8 +391,7 @@ class Plugin:
             return _failure("Q5_FSM_NOT_READY", "Q5 /xbot_state must be fresh and READY or ACTIVE",
                             status={**status, "q5_fsm": q5_fsm})
 
-        # Share arm_control's private preparation path; preparation is no
-        # longer exposed as a separate card.
+        # Auto-prepare: delegate to arm_control's preparation path.
         if self._arm_control is not None:
             prepare_error = self._arm_control._ensure_prepared()
             if prepare_error:
@@ -441,7 +436,12 @@ class Plugin:
 
     def _run_move(self, stop_event: threading.Event, frames, speed: float, side: str,
                   gesture: str, action_id: str | None):
-        """Interpolate through gesture frames, honoring stop_event and commanded side."""
+        """Interpolate through gesture frames, honoring stop_event and commanded side.
+
+        transition_ratio scales the interpolation time per frame:
+          ratio < 1.0 → shorter transition, blends naturally into next frame
+          ratio == 1.0 → full-speed transition with explicit hold
+        """
         cancelled = True  # default: cancelled on any error/exception
         acquired = False
         try:
@@ -474,8 +474,9 @@ class Plugin:
                         delta = abs(positions[name] - previous_positions[name])
                         max_delta_rad = max(max_delta_rad, delta)
 
-                transition_s = max_delta_rad / speed if speed > 0 else 0.5
-                delay = max(0.12, transition_s * transition_ratio) + hold_s
+                # transition_ratio scales the interpolation time for natural blending
+                transition_s = (max_delta_rad / speed if speed > 0 else 0.5) * transition_ratio
+                transition_s = max(0.05, transition_s)  # minimum transition time
 
                 # Interpolate
                 steps = max(
@@ -508,8 +509,9 @@ class Plugin:
                     if name in positions
                 }
 
-                if not stop_event.wait(delay):
-                    pass  # normal hold completed
+                # Hold for the specified duration
+                if hold_s > 0 and not stop_event.is_set():
+                    stop_event.wait(hold_s)
             cancelled = False  # all frames completed successfully
         except Exception:
             pass

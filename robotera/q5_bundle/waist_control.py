@@ -2,22 +2,19 @@
 
 from __future__ import annotations
 
-import json
 import math
-import os
-import ssl
 import threading
 import time
-import urllib.request
 
 from body_command import get_router
 from control_contract import q5_active_status, q5_is_control_ready
 from joint_limits import JOINT_LIMITS, limits_for
+from q5_acp import notify as _acp_notify
 
 try:
-    from legacy_direct_control import Q5ControlModePlugin
+    from legacy_direct_control import PositionControlPreparer
 except ImportError:
-    Q5ControlModePlugin = None
+    PositionControlPreparer = None
 
 CARD = "waist_control"
 TYPE = "actuator"
@@ -31,31 +28,6 @@ WAIST_ACTIONS = {
     },
 }
 DESC = "Q5 腰部控制：偏航（左右扭腰）"
-
-
-def _acp_notify(action_id: str, status: str, result: dict, tool: str = ""):
-    """POST action completion to Agent Core (module-level ACP helper)."""
-    agent_core_url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    payload = json.dumps({
-        "action_id": action_id,
-        "status": status,
-        "result": result,
-        "tool": tool,
-        "ts": time.time(),
-    }).encode()
-    try:
-        req = urllib.request.Request(
-            f"{agent_core_url}/api/acp/complete",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        urllib.request.urlopen(req, timeout=5, context=ctx)
-    except Exception:
-        pass  # ACP failure must not block motion
 
 
 def _failure(code, message, **details):
@@ -80,20 +52,39 @@ class Plugin:
         self._lock = threading.Lock()
         self._stop_event = self._thread = self._active = None
 
-        # Embedded Q5 control-mode helper so waist_control can self-prepare.
-        self._control_mode = None
-        if Q5ControlModePlugin is not None:
+        # Embedded position-control preparer so waist_control can self-prepare.
+        self._preparer = None
+        if PositionControlPreparer is not None:
             try:
-                self._control_mode = Q5ControlModePlugin(plugin_config, namespace, executor, client)
+                self._preparer = PositionControlPreparer(plugin_config, namespace, executor, client)
             except Exception:
-                self._control_mode = None
+                self._preparer = None
 
     def prepare(self):
-        """Delegate to embedded Q5ControlModePlugin for position-control preparation."""
-        if self._control_mode is None:
+        """Delegate to embedded PositionControlPreparer for position-control preparation."""
+        if self._preparer is None:
             return _failure("CONTROL_MODE_UNAVAILABLE",
-                            "Q5 control-mode helper is not initialized")
-        return self._control_mode.dispatch("prepare_position_control", {})
+                            "Position-control preparer is not initialized")
+        return self._preparer._prepare()
+
+    def _ensure_prepared(self) -> dict | None:
+        """Auto-prepare position control if not already prepared.
+
+        Returns None on success (or already prepared), or an error dict on failure.
+        """
+        if bool(getattr(self._client, "q5_position_control_prepared", False)):
+            return None
+        if self._preparer is None:
+            return _failure("CONTROL_MODE_UNAVAILABLE",
+                            "Position-control preparer is not initialized; cannot auto-prepare")
+        print("[waist_control] position control not prepared, auto-preparing...")
+        result = self._preparer._prepare()
+        if isinstance(result, dict) and result.get("ok") is False:
+            return result
+        if not bool(getattr(self._client, "q5_position_control_prepared", False)):
+            return _failure("PREPARE_FAILED", "Auto-prepare did not set q5_position_control_prepared",
+                            prepare_result=result)
+        return None
 
     def _reset(self, args):
         """Interpolate all waist joints back to 0 rad."""
@@ -231,10 +222,10 @@ class Plugin:
         if not q5_ready:
             return _failure("Q5_FSM_NOT_READY", "Q5 /xbot_state must be fresh and READY or ACTIVE before waist control",
                             status={**status, "q5_fsm": q5_status})
-        if not bool(getattr(self._client, "q5_position_control_prepared", False)):
-            return _failure("DIRECT_CONTROL_NOT_PREPARED",
-                            "Run q5_control_mode action=prepare_position_control first; vendor position-control sequence has not completed in this driver session",
-                            status=status)
+        # Auto-prepare: if position control is not prepared, prepare it now.
+        prep_error = self._ensure_prepared()
+        if prep_error is not None:
+            return prep_error
         if joint_name is not None and joint_name not in self._client.snapshot().get("joints", {}):
             return _failure("WAIST_MODEL_MISMATCH", "Configured waist joint is absent from /joint_states", joint_name=joint_name)
         return status
