@@ -2813,16 +2813,19 @@ class LocoPlugin:
                              expected_modes: set[int], preparation_steps: list[dict],
                              safety_requirements: str, index: int = 0,
                              recording_id: int | None = None) -> dict:
+        send_status = {}
         observed = self._send_edge_and_wait(
-            _get_control_cmd(command_name), expected_modes | {26}, index=index, timeout_s=3.0)
+            _get_control_cmd(command_name), expected_modes | {26}, index=index,
+            timeout_s=3.0, send_status=send_status)
+        command_sent = bool(send_status.get("command_sent"))
         if observed == 26:
             return self._protection_error(
                 requested_action, preparation_steps, observed, safety_requirements,
-                command_sent=True)
+                command_sent=command_sent)
         confirmed = observed in expected_modes
         result = {
             "state": "running" if confirmed else "accepted",
-            "command_sent": True,
+            "command_sent": command_sent,
             "requested_action": requested_action,
             "confirmed_started": confirmed,
             "workmode": observed,
@@ -2859,10 +2862,10 @@ class LocoPlugin:
     @staticmethod
     def _protection_error(requested_action: str, steps: list[dict], mode: int,
                           safety_requirements: str | None = None,
-                          command_sent: bool = False) -> dict:
+                          command_sent: bool | None = None) -> dict:
         result = {
             "state": "error",
-            "command_sent": command_sent or bool(steps),
+            "command_sent": (bool(steps) if command_sent is None else command_sent),
             "requested_action": requested_action,
             "current_workmode": mode,
             "current_workmode_name": "protection",
