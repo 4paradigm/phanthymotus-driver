@@ -29,8 +29,6 @@ plugins:
     enabled: false  # merged into robot_status
   diagnostics:
     enabled: false  # merged into robot_status
-  imu:
-    enabled: true
   simple_action:
     enabled: true
   mic:
