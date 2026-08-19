@@ -2659,10 +2659,12 @@ class HeadActuatorPlugin:
         }
 
     def _sequence_args(self, args: dict) -> tuple[int, float]:
-        times = int(args.get("times", 1))
-        speed = float(args.get("speed", 1.0))
+        times = args.get("times", 1)
+        if isinstance(times, bool) or not isinstance(times, int):
+            raise ValueError("times must be an integer")
         if not 1 <= times <= 5:
             raise ValueError("times must be between 1 and 5")
+        speed = float(args.get("speed", 1.0))
         if not 0.5 <= speed <= 2.0:
             raise ValueError("speed must be between 0.5 and 2.0")
         return times, speed
