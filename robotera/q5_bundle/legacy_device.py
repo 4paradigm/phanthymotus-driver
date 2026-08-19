@@ -1351,13 +1351,12 @@ class AudioPlugin:
             "description": "Q5 XOS audio playback. Audio ensures XOS conversation is ON and leaves it ON; speaker owns the OFF/live-ALSA route.",
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": [
-                    "play_local_file", "play_library_file", "play_id",
+                    "play_local_file", "play_library_file",
                     "list_library", "upload_local_file", "delete_audio", "set_volume",
                     "get_volume", "stop_audio", "is_play", "stop"],
                     "oneOf": [
                         {"const": "play_local_file", "title": "播放本地音频文件"},
                         {"const": "play_library_file", "title": "播放机器人音频库文件"},
-                        {"const": "play_id", "title": "播放内置音频 ID"},
                         {"const": "list_library", "title": "查看挂载音频库"},
                         {"const": "upload_local_file", "title": "上传本地音频文件"},
                         {"const": "delete_audio", "title": "从 XOS 音频库删除"},
@@ -1367,7 +1366,6 @@ class AudioPlugin:
                         {"const": "is_play", "title": "查询播放状态"},
                         {"const": "stop", "title": "停止音频卡"},
                     ]},
-                "id": {"type": "integer", "title": "内置音频 ID"},
                 "file_name": {"type": "string", "title": "音频文件名", "minLength": 1},
                 "local_file": {"type": "string", "format": "file", "accept": "audio/*",
                                "title": "本地音频文件"},
@@ -1384,8 +1382,6 @@ class AudioPlugin:
                                         "description": "选择本地 WAV/MP3；自动从 Agent Core 读取、上传至 XOS 并播放。"},
                     "play_library_file": {"params": ["file_name", "force_play", "timeout", "channel", "version"],
                                          "description": "直接播放机器人 XOS 音频库已有的 audio_name。"},
-                    "play_id": {"params": ["id", "force_play", "timeout", "channel", "version"],
-                                "description": "播放厂商预装音频 ID；XOS 不提供 ID 枚举。"},
                     "list_library": {"params": [], "description": "列出机器人 XOS 音频库；返回的 file_name 可用于 play_library_file。"},
                     "upload_local_file": {"params": ["local_file"], "description": "选择本地 WAV/MP3 并上传到 XOS，不播放。"},
                     "delete_audio": {"params": ["file_name"],
@@ -1408,14 +1404,13 @@ class AudioPlugin:
         if action in ("start", "info"):
             return {"state": "ready", "action_server": "/audio_player/play", "device": self._device,
                     "agent_core_upload_dir": self._upload_dir}
-        if action in ("play_local_file", "play_library_file", "play_id"):
-            mode = {"play_local_file": None, "play_library_file": 3, "play_id": 0}[action]
+        if action in ("play_local_file", "play_library_file"):
+            mode = {"play_local_file": None, "play_library_file": 3}[action]
             return self._queue_play(args, mode, action)
         # Compatibility-only entry points. `path` and `item` are vendor
         # advanced modes with no public resource-discovery contract, so they
         # are intentionally absent from the normal card schema.
-        play_modes = {"play_by_id": 0, "play_by_path": 1,
-                      "play_by_item": 2, "play_by_file_name": 3}
+        play_modes = {"play_by_path": 1, "play_by_item": 2, "play_by_file_name": 3}
         if action in play_modes:
             return self._play(args, play_modes[action])
         if action == "list_library":
@@ -1674,25 +1669,16 @@ class AudioPlugin:
             return self._play_with_chat(args, mode)
 
     def _play_with_chat(self, args, mode: int):
-        source_fields = {0: "id", 1: "path", 2: "item", 3: "file_name"}
+        source_fields = {1: "path", 2: "item", 3: "file_name"}
         source_field = source_fields[mode]
         if source_field not in args:
             return {"state": "error", "message": f"mode {mode} requires {source_field}"}
         # Canvas forms may serialize every optional field with an empty
-        # default (or id=0). Ignore those defaults; reject only a genuinely
-        # populated alternate source field.
+        # default. Ignore those defaults; reject a populated alternate source.
         def _populated(field):
             if field not in args:
                 return False
             candidate = args.get(field)
-            if field == "id":
-                # The card form commonly keeps an id control in the payload
-                # even for PATH/ITEM/FILE_NAME actions. It is not part of
-                # those goals and must not make an otherwise valid request
-                # fail validation.
-                if mode != 0:
-                    return False
-                return isinstance(candidate, int) and not isinstance(candidate, bool) and candidate != 0
             return isinstance(candidate, str) and bool(candidate.strip())
 
         unrelated = sorted(field for field in source_fields.values()
@@ -1701,10 +1687,7 @@ class AudioPlugin:
             return {"state": "error", "message": (
                 f"mode {mode} only accepts {source_field}; do not provide {', '.join(unrelated)}")}
         value = args.get(source_field)
-        if mode == 0:
-            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                return {"state": "error", "message": "id must be an integer greater than 0"}
-        elif not isinstance(value, str) or not value.strip():
+        if not isinstance(value, str) or not value.strip():
             return {"state": "error", "message": f"{source_field} must be a non-empty string"}
         # XOS conversation uses the Q5 full-duplex route.  Release both
         # direct-ALSA cards before enabling it; their normal streams are
@@ -1727,7 +1710,7 @@ class AudioPlugin:
             # Send precisely one source field. Besides making the action contract
             # unambiguous, this shields XOS from controls retained by a previous
             # card-mode selection.
-            goal.id = int(value) if mode == 0 else 0
+            goal.id = 0
             goal.path = str(value) if mode == 1 else ""
             goal.item = str(value) if mode == 2 else ""
             goal.file_name = str(value) if mode == 3 else ""
