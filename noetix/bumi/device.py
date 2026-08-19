@@ -1035,8 +1035,8 @@ class SpeakerPlugin:
         executor.add_node(self._node)
         self._playing = False
         self._sub = None
-        # 输入音频 topic：收到音频流后立即自动播放（配合 agent-core 的 remote_audio 工具）
-        self._input_topic = plugin_config.get("input_topic", "/remote_control/audio")
+        # 输入音频 topic：默认跟随本机 mic 直连；如需接 remote_audio，可在 config 中覆写。
+        self._input_topic = plugin_config.get("input_topic") or f"/{namespace}/mic/audio"
 
     def get_tool(self) -> dict:
         return {
