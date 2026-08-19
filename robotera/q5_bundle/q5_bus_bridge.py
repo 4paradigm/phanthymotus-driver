@@ -74,7 +74,7 @@ def select_sensor_tools(tools: Any) -> dict[str, list[str]]:
             # Live media has a dedicated typed bridge. Publishing it here as
             # std_msgs/String would claim the same DDS topic with a different
             # type and prevent Agent Core from receiving AudioChunk/Image.
-            if (isinstance(topic, str) and topic and fmt == "data/json"
+            if (isinstance(topic, str) and topic and fmt in {"data/json", "sensor/skeleton"}
                     and topic not in topics):
                 topics.append(topic)
         if topics:
