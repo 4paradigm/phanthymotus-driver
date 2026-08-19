@@ -71,6 +71,19 @@ _Q5_MIC_PIDFILE = "/tmp/phanthymotus-q5-mic-capture.pid"
 _Q5_SPEAKER_PIDFILE = "/tmp/phanthymotus-q5-speaker-playback.pid"
 _Q5_DEVELOPER_SUDO_PASSWORD = "developer"
 _Q5_XOS_CHAT_LOCK = threading.RLock()
+_Q5_SPEAKER_PLUGIN = None
+
+
+def _stop_active_speaker_plugin() -> None:
+    """Release both the local speaker pump and its remote ALSA process."""
+    plugin = _Q5_SPEAKER_PLUGIN
+    if plugin is not None:
+        try:
+            plugin.stop()
+            return
+        except Exception as exc:
+            print(f"[AudioPlugin] speaker cleanup failed: {exc}", flush=True)
+    _stop_remote_speaker_playback()
 
 
 def _q5_xos_json_request(base: str, path: str, method: str = "POST", payload=None):
@@ -445,6 +458,7 @@ class SpeakerPlugin:
     """Play any canvas-connected PCM AudioChunk stream on Q5 ALSA output."""
 
     def __init__(self, plugin_config, namespace, executor, client):
+        global _Q5_SPEAKER_PLUGIN
         del namespace
         self._client = client
         self._topic = ""
@@ -470,6 +484,7 @@ class SpeakerPlugin:
         self._running = False
         self._frames_received = 0
         self._frames_written = 0
+        _Q5_SPEAKER_PLUGIN = self
         if self._rate != 16000 or self._channels != 1:
             raise ValueError("Q5 speaker only supports the shared 16 kHz mono PCM contract")
         if self._output_rate not in (44100, 48000) or self._output_channels != 2:
@@ -1571,10 +1586,11 @@ class AudioPlugin:
                 return {"state": "error", "message": "id must be an integer greater than 0"}
         elif not isinstance(value, str) or not value.strip():
             return {"state": "error", "message": f"{source_field} must be a non-empty string"}
-        # A live speaker process owns the same ALSA playback endpoint as XOS.
-        # Release only the process created by this driver before handing the
-        # route back to XOS chat; unrelated vendor playback is left untouched.
-        _stop_remote_speaker_playback()
+        # A live speaker card owns the same ALSA endpoint as XOS. Stop its
+        # local pump as well as the tagged remote process before switching
+        # routes; otherwise the card remains marked running and can keep a
+        # stale pipe/handle across this playback request.
+        _stop_active_speaker_plugin()
         started_chat, chat_error = self._xos_chat_start_for_playback()
         if started_chat is None:
             return {"state": "error", "message": f"cannot enable XOS chat for playback: {chat_error}"}
