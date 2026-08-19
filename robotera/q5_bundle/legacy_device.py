@@ -72,6 +72,7 @@ _Q5_SPEAKER_PIDFILE = "/tmp/phanthymotus-q5-speaker-playback.pid"
 _Q5_DEVELOPER_SUDO_PASSWORD = "developer"
 _Q5_XOS_CHAT_LOCK = threading.RLock()
 _Q5_SPEAKER_PLUGIN = None
+_Q5_MIC_PLUGIN = None
 
 
 def _stop_active_speaker_plugin() -> None:
@@ -84,6 +85,28 @@ def _stop_active_speaker_plugin() -> None:
         except Exception as exc:
             print(f"[AudioPlugin] speaker cleanup failed: {exc}", flush=True)
     _stop_remote_speaker_playback()
+
+
+def _stop_active_mic_plugin() -> None:
+    """Release Q5 capture before handing the full-duplex route to XOS/live PCM."""
+    plugin = _Q5_MIC_PLUGIN
+    if plugin is not None:
+        try:
+            plugin.stop()
+            return
+        except Exception as exc:
+            print(f"[Q5AudioRoute] mic cleanup failed: {exc}", flush=True)
+    _stop_remote_mic_capture()
+
+
+def _start_active_mic_plugin() -> None:
+    """Restore the bundle's normal microphone stream after a route handoff."""
+    plugin = _Q5_MIC_PLUGIN
+    if plugin is not None:
+        try:
+            plugin.start()
+        except Exception as exc:
+            print(f"[Q5AudioRoute] mic restore failed: {exc}", flush=True)
 
 
 def _q5_xos_json_request(base: str, path: str, method: str = "POST", payload=None):
@@ -372,6 +395,7 @@ class MicPlugin:
     """Q5 developer-container microphone as a 16 kHz PCM stream."""
 
     def __init__(self, plugin_config, namespace, executor, client):
+        global _Q5_MIC_PLUGIN
         del executor
         self._client = client
         self._topic = f"/{namespace}/mic/audio"
@@ -384,11 +408,17 @@ class MicPlugin:
         )
         self._rate = int(plugin_config.get("sample_rate_hz", 16000))
         self._channels = int(plugin_config.get("channels", 1))
+        self._xos_http_base = str(plugin_config.get(
+            "xos_http_base", "http://192.168.8.100:1888")).rstrip("/")
         self._process = None
         self._thread = None
         self._running = False
+        self._wanted = False
+        self._retry_thread = None
+        self._retry_wakeup = threading.Event()
         self._frames_sent = 0
         self._lock = threading.RLock()
+        _Q5_MIC_PLUGIN = self
         if self._rate != 16000 or self._channels != 1:
             raise ValueError("Q5 mic only supports the shared 16 kHz mono PCM contract")
 
@@ -404,8 +434,16 @@ class MicPlugin:
         # The bundle start and a canvas sensor-start request may arrive nearly
         # simultaneously. ALSA allows only one capture owner for hw:1,0.
         with self._lock:
+            self._wanted = True
             if self._running:
                 return
+            chat_on, chat_error = _q5_xos_chat_is_on(self._xos_http_base)
+            if chat_on:
+                print("[MicPlugin] capture deferred while XOS chat owns the audio route", flush=True)
+                self._schedule_retry()
+                return
+            if chat_error:
+                print(f"[MicPlugin] cannot query XOS chat state: {chat_error}; attempting capture", flush=True)
             try:
                 device = self._device if self._device is not None else _find_remote_mic_device()
                 command = _q5_alsa_mic_command(device, self._rate, self._channels)
@@ -420,8 +458,38 @@ class MicPlugin:
                 self._thread.start()
                 print(f"[MicPlugin] capture started from device {device} -> {self._topic}", flush=True)
             except Exception as exc:
-                self.stop()
+                self._stop_capture()
                 print(f"[MicPlugin] capture unavailable: {exc}", flush=True)
+                self._schedule_retry()
+
+    def _schedule_retry(self):
+        if self._retry_thread is not None and self._retry_thread.is_alive():
+            return
+        self._retry_wakeup.clear()
+        self._retry_thread = threading.Thread(
+            target=self._retry_after_chat_releases, daemon=True, name="q5_mic_route_retry")
+        self._retry_thread.start()
+
+    def _retry_after_chat_releases(self):
+        while self._wanted and not self._running:
+            self._retry_wakeup.wait(1.0)
+            self._retry_wakeup.clear()
+            if not self._wanted or self._running:
+                return
+            chat_on, _ = _q5_xos_chat_is_on(self._xos_http_base)
+            if chat_on is False:
+                self.start()
+
+    def _stop_capture(self):
+        self._running = False
+        _stop_remote_mic_capture()
+        if self._process is not None:
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+            self._process = None
 
     def _pump(self):
         # 100 ms frames are the same size emitted by perception TTS.
@@ -442,15 +510,9 @@ class MicPlugin:
 
     def stop(self):
         with self._lock:
-            self._running = False
-            _stop_remote_mic_capture()
-            if self._process is not None:
-                self._process.terminate()
-                try:
-                    self._process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    self._process.kill()
-                self._process = None
+            self._wanted = False
+            self._retry_wakeup.set()
+            self._stop_capture()
 
     def dispatch(self, action, args):
         del args
@@ -694,7 +756,7 @@ class SpeakerPlugin:
                 self._process.wait(timeout=3)
             except (subprocess.TimeoutExpired, OSError):
                 self._process.terminate()
-            self._process = None
+        self._process = None
         _stop_remote_speaker_playback()
 
     def dispatch(self, action, args):
@@ -1614,14 +1676,14 @@ class AudioPlugin:
                 return {"state": "error", "message": "id must be an integer greater than 0"}
         elif not isinstance(value, str) or not value.strip():
             return {"state": "error", "message": f"{source_field} must be a non-empty string"}
-        # A live speaker card owns the same ALSA endpoint as XOS. Stop its
-        # local pump before handing the route back to XOS conversation.
+        # XOS conversation uses the Q5 full-duplex route.  Release both
+        # direct-ALSA cards before enabling it; their normal streams are
+        # restored after this request returns and chat is closed again.
         _stop_active_speaker_plugin()
-        released, holders = _wait_remote_playback_released()
-        if not released:
-            return {"state": "error", "message": f"speaker ALSA route is still occupied: {holders}"}
+        _stop_active_mic_plugin()
         chat_ready, chat_error = self._xos_chat_start_for_playback()
         if chat_ready is None:
+            _start_active_mic_plugin()
             return {"state": "error", "message": f"cannot enable XOS chat for playback: {chat_error}"}
         try:
             if not self._action_client.wait_for_server(timeout_sec=3.0):
@@ -1663,9 +1725,15 @@ class AudioPlugin:
                     return {"state": "error", "message": "audio playback status timed out"}
             return {"state": "ok" if response.result.success else "error", "message": response.result.message}
         finally:
-            # Audio deliberately leaves XOS conversation ON. The speaker card
-            # is responsible for quitting conversation before live ALSA use.
-            pass
+            # Do not leave XOS holding the duplex route between audio calls.
+            # This gives mic and direct speaker a stable OFF-state baseline,
+            # regardless of whether the container started with chat ON/OFF.
+            stopped, stop_error = self._xos_chat_stop_after_playback()
+            if not stopped:
+                print(f"[AudioPlugin] XOS chat did not close after playback: {stop_error}", flush=True)
+            elif self._chat_route_settle:
+                time.sleep(self._chat_route_settle)
+            _start_active_mic_plugin()
 
     def _set_volume(self, value):
         if not self._srv_volume.service_is_ready():
