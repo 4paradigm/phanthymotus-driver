@@ -40,7 +40,11 @@ vendor example by sending `DEFAULT` velocity frames at 100 Hz. Adaptive joint
 feedback must confirm that locomotion started; otherwise the card sends zero
 velocity and returns an error instead of reporting a false `running` state. It
 also sends zero velocity when the duration expires, `stop_move` is called, or
-the observed workmode leaves walking. It does not automatically promote another
+the observed workmode leaves walking. Move replacement, thread assignment and
+ACP binding are serialized as one session, so concurrent MCP requests cannot
+create two velocity publishers over the shared stop event. Every command
+preroll checks workmode before each frame and aborts before the action edge if
+protection mode is observed. The card does not automatically promote another
 mode into walking because the SDK cannot verify that the robot is physically
 standing.
 

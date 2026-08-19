@@ -402,6 +402,9 @@ class LocoPlugin:
         self._namespace = namespace
         self._lock = threading.Lock()
         self._action_lock = threading.Lock()
+        # Serializes the complete bounded-move session setup, including ACP
+        # binding.  The per-frame publish lock above is intentionally separate.
+        self._move_session_lock = threading.RLock()
         self._last_cmd_time: float = 0.0
         self._move_thread: threading.Thread | None = None
         self._move_observation: dict | None = None
@@ -640,19 +643,22 @@ class LocoPlugin:
         tool_name = args.pop('_tool_name', '')
 
         if tool_name == "loco" and action == "move":
-            result = self._do_move(args)
-            if result.get("state") == "running":
-                action_id, _ = self._register_acp("loco", action)
-                result["action_id"] = action_id
-                move_thread = self._move_thread
-                move_observation = self._move_observation
-                threading.Thread(
-                    target=self._complete_move_acp,
-                    args=(action_id, move_thread, move_observation, dict(result)),
-                    daemon=True,
-                    name=f"bumi_move_acp_{action_id[-8:]}",
-                ).start()
-            return result
+            with self._move_session_lock:
+                result = self._do_move(args)
+                if result.get("state") == "running":
+                    action_id, _ = self._register_acp("loco", action)
+                    result["action_id"] = action_id
+                    move_thread = self._move_thread
+                    move_observation = self._move_observation
+                    threading.Thread(
+                        target=self._complete_move_acp,
+                        args=(
+                            action_id, move_thread, move_observation,
+                            dict(result)),
+                        daemon=True,
+                        name=f"bumi_move_acp_{action_id[-8:]}",
+                    ).start()
+                return result
         if tool_name == "loco" and action == "stop_move":
             return self._stop_move()
         if tool_name == "stand_up_lie_prone" and action in _POSTURE_ACTIONS:
@@ -1120,18 +1126,35 @@ class LocoPlugin:
         # command. A fresh, non-toggle WALK edge makes separate MCP calls
         # deterministic while DEFAULT remains the continuous velocity frame,
         # matching the vendor example and the successful host-side A/B test.
+        activation_status = {}
         observed = self._send_edge_and_wait(
             _get_control_cmd("WALK"), {2, 26}, timeout_s=1.0,
-            command_values=(vx, vy, vyaw))
-        walking_policy_refreshed = True
+            command_values=(vx, vy, vyaw),
+            required_mode_before_send=2,
+            send_status=activation_status)
+        walking_policy_refreshed = bool(
+            activation_status.get("command_sent"))
         if observed == 26:
             return self._protection_error(
                 "move", [], observed,
                 "Keep the robot standing on a flat non-slip floor with a clear path.",
-                command_sent=True)
+                command_sent=walking_policy_refreshed)
+        if not walking_policy_refreshed:
+            return {
+                "state": "error", "command_sent": False,
+                "current_workmode": observed,
+                "current_workmode_name": _WORKMODE_NAMES.get(
+                    observed, "unknown"),
+                "error": (
+                    "The WALK activation edge was not sent because the driver stopped or "
+                    "workmode left walking during command preparation. No velocity stream "
+                    "was started."
+                ),
+            }
         if observed != 2:
             return {
-                "state": "error", "command_sent": True,
+                "state": "error",
+                "command_sent": walking_policy_refreshed,
                 "current_workmode": observed,
                 "current_workmode_name": _WORKMODE_NAMES.get(observed, "unknown"),
                 "error": (
@@ -1275,21 +1298,25 @@ class LocoPlugin:
         }
 
     def _stop_move(self) -> dict:
-        self._move_stop_event.set()
-        was_running = bool(self._move_thread and self._move_thread.is_alive())
-        if self._move_thread and self._move_thread.is_alive():
-            self._move_thread.join(timeout=1)
-        if self._high_ctrl is not None:
-            self._publish_cmd(0, 0, 0, _get_default_cmd(), 0)
-        mode = int(self._high_ctrl.get_mode()) if self._high_ctrl is not None else None
-        return {
-            "state": "completed",
-            "command_sent": self._high_ctrl is not None,
-            "was_running": was_running,
-            "workmode": mode,
-            "workmode_name": _WORKMODE_NAMES.get(mode, "unknown"),
-            "message": "Zero forward, lateral and turning velocity was sent.",
-        }
+        with self._move_session_lock:
+            self._move_stop_event.set()
+            was_running = bool(
+                self._move_thread and self._move_thread.is_alive())
+            if self._move_thread and self._move_thread.is_alive():
+                self._move_thread.join(timeout=1)
+            if self._high_ctrl is not None:
+                self._publish_cmd(0, 0, 0, _get_default_cmd(), 0)
+            mode = (
+                int(self._high_ctrl.get_mode())
+                if self._high_ctrl is not None else None)
+            return {
+                "state": "completed",
+                "command_sent": self._high_ctrl is not None,
+                "was_running": was_running,
+                "workmode": mode,
+                "workmode_name": _WORKMODE_NAMES.get(mode, "unknown"),
+                "message": "Zero forward, lateral and turning velocity was sent.",
+            }
 
     def _do_posture_action(self, action: str, args: dict) -> dict:
         safety = self._safety_requirements(action)
@@ -2529,8 +2556,12 @@ class LocoPlugin:
             while time.monotonic() < preroll_deadline:
                 if self._lifecycle_stop_event.is_set():
                     return int(self._high_ctrl.get_mode())
+                observed = int(self._high_ctrl.get_mode())
+                if observed == 26:
+                    if send_status is not None:
+                        send_status["blocked_by_protection"] = True
+                    return observed
                 if required_mode_before_send is not None:
-                    observed = int(self._high_ctrl.get_mode())
                     if observed != required_mode_before_send:
                         if send_status is not None:
                             send_status["blocked_by_mode_change"] = True
@@ -2541,8 +2572,12 @@ class LocoPlugin:
 
             if self._lifecycle_stop_event.is_set():
                 return int(self._high_ctrl.get_mode())
+            observed = int(self._high_ctrl.get_mode())
+            if observed == 26:
+                if send_status is not None:
+                    send_status["blocked_by_protection"] = True
+                return observed
             if required_mode_before_send is not None:
-                observed = int(self._high_ctrl.get_mode())
                 if observed != required_mode_before_send:
                     if send_status is not None:
                         send_status["blocked_by_mode_change"] = True
@@ -2558,8 +2593,12 @@ class LocoPlugin:
 
             deadline = time.monotonic() + timeout_s
             observed = int(self._high_ctrl.get_mode())
-            while observed not in expected_modes and time.monotonic() < deadline:
+            while (observed not in expected_modes and observed != 26
+                   and time.monotonic() < deadline):
                 if self._lifecycle_stop_event.is_set():
+                    return observed
+                observed = int(self._high_ctrl.get_mode())
+                if observed == 26 or observed in expected_modes:
                     return observed
                 self._publish_cmd(0, 0, 0, default_cmd, 0)
                 time.sleep(self._control_period)

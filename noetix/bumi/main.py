@@ -322,8 +322,7 @@ def main():
     rclpy.init()
     executor = rclpy.executors.MultiThreadedExecutor()
 
-    _bundle = BumiDeviceBundle(
-        cfg, namespace, executor, high_ctrl, media_ctrl)
+    _bundle = BumiDeviceBundle(cfg, namespace, executor, high_ctrl, media_ctrl)
     _bundle.start_all()
 
     def _spin():
