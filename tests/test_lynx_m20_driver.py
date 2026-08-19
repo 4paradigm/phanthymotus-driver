@@ -150,6 +150,34 @@ class LynxM20ContractTests(unittest.TestCase):
             tool_def["topic_out"],
         )
 
+    def test_continuous_state_stream_info_returns_authoritative_topic_out(self):
+        class FakeStateNodes:
+            streams = {
+                "motion_info": {"robot_topic": "/MOTION_INFO", "topic": "/host/lynx_m20/motion_info", "format": "data/json"},
+                "imu": {"robot_topic": "/IMU", "topic": "/host/lynx_m20/imu", "format": "data/json"},
+                "lidar": {"robot_topic": "/LIDAR/POINTS", "topic": "/host/lynx_m20/lidar", "format": "sensor/pointcloud"},
+            }
+            rtsp_streams = {
+                "camera_front": {"url": "rtsp://10.21.31.103:8554/video1", "format": "video/h265"},
+            }
+
+        plugin = m20.M20StatePlugin(FakeStateNodes())
+        static_topics = {
+            definition["name"]: definition["topic_out"]
+            for definition in plugin.get_tools()
+            if "topic_out" in definition
+        }
+        canvas_formats = {"data/json", "data/odometry", "sensor/pointcloud", "video/h265"}
+
+        for topic_out in static_topics.values():
+            for output in topic_out:
+                self.assertIn(output["format"], canvas_formats)
+
+        for name in (*FakeStateNodes.streams, *FakeStateNodes.rtsp_streams):
+            info = plugin.dispatch("info", {"_tool_name": name})
+            self.assertEqual("ready", info["state"])
+            self.assertEqual(static_topics[name], info["topic_out"])
+
     def test_json_state_stream_publishes_string_payload_and_keeps_snapshot_value(self):
         class FakePublisher:
             def __init__(self): self.messages = []
