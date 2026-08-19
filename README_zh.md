@@ -59,9 +59,10 @@ cp .env.example .env  # 填写镜像仓库凭据
 输入时才设置 `REPO_URL`、`SOURCE_REF`、`EXPECTED_COMMIT`、`REMOTE_REPO`
 或 `IMAGE`。`DRY_RUN=1` 只校验并打印最终来源，不连接机器人。
 
-G1 Dockerfile 会在安装构建依赖前，把基础镜像遗留且已不可解析的腾讯云
-Ubuntu Ports 源替换为 `ports.ubuntu.com`。这使非腾讯云网络中的机器人也能
-从源码构建，同时不改变运行时基础镜像来源。
+G1 Dockerfile 默认同时使用阿里云 Ubuntu Ports 和 PyPI 国内镜像，并在安装
+构建依赖前替换基础镜像遗留且已不可解析的腾讯云 Ubuntu 源。直接执行
+Docker 构建时可通过 `UBUNTU_PORTS_MIRROR` 和 `PYPI_MIRROR` build arg 覆盖
+默认值；运行时基础镜像来源不变。
 
 ### 本地运行（无需 Docker）
 

@@ -1,13 +1,18 @@
 ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
-ARG PYPI_MIRROR=https://pypi.org/simple/
+ARG UBUNTU_PORTS_MIRROR=https://mirrors.aliyun.com/ubuntu-ports
+ARG PYPI_MIRROR=https://mirrors.aliyun.com/pypi/simple/
 FROM ${ROS_BASE_IMAGE}
+ARG UBUNTU_PORTS_MIRROR
 ARG PYPI_MIRROR
 
 WORKDIR /work
 
 RUN find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) \
         -exec sed -i \
-            's|mirrors.tencentyun.com/ubuntu-ports|ports.ubuntu.com/ubuntu-ports|g' \
+            -e "s|http://mirrors.tencentyun.com/ubuntu-ports|${UBUNTU_PORTS_MIRROR}|g" \
+            -e "s|https://mirrors.tencentyun.com/ubuntu-ports|${UBUNTU_PORTS_MIRROR}|g" \
+            -e "s|http://ports.ubuntu.com/ubuntu-ports|${UBUNTU_PORTS_MIRROR}|g" \
+            -e "s|https://ports.ubuntu.com/ubuntu-ports|${UBUNTU_PORTS_MIRROR}|g" \
             {} + && \
     apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \

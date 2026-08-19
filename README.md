@@ -61,10 +61,11 @@ match the exact commit, and builds with the repository's G1 Dockerfile. Set
 when overriding those explicit deployment inputs. `DRY_RUN=1` validates and
 prints the resolved provenance without connecting to the robot.
 
-The G1 Dockerfile replaces the obsolete Tencent Cloud Ubuntu Ports source
-inherited from the base image with `ports.ubuntu.com` before installing build
-dependencies. This keeps source builds working on robots outside Tencent
-Cloud without changing the runtime image source.
+The G1 Dockerfile uses the Aliyun mirrors for both Ubuntu Ports and PyPI by
+default. It replaces the obsolete Tencent Cloud Ubuntu source inherited from
+the base image before installing build dependencies. Direct Docker builds can
+override these defaults with the `UBUNTU_PORTS_MIRROR` and `PYPI_MIRROR` build
+arguments; the runtime base image remains unchanged.
 
 ### Run Locally (without Docker)
 
