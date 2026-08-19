@@ -7,6 +7,7 @@ import time
 import re
 import math
 import threading
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import base_drive
@@ -99,6 +100,50 @@ class Q5BasicSensorTests(unittest.TestCase):
         self.assertEqual(data["groups"]["left_hand"]["joint_names"], ["left_hand_index_joint1"])
         self.assertEqual(data["groups"]["right_hand"]["joint_names"], ["right_hand_index_joint1"])
 
+    def test_skeleton_uses_standard_index_name_and_position_fields(self):
+        data = joints.build(FRESH_JOINT_SNAPSHOT)
+        self.assertEqual(data["format"], "sensor/skeleton")
+        self.assertEqual(data["joint_count"], 3)
+        self.assertEqual(data["joints"][0], {"idx": 2, "name": "hip_joint", "q": 0.1,
+                                             "dq": 0.0, "tau": 1.0})
+        self.assertEqual(data["joints"][1]["name"], "left_hand_index_rota_joint1")
+        self.assertEqual(data["joints"][1]["source_name"], "left_hand_index_joint1")
+        self.assertEqual(data["joints"][1]["idx"], joints._model_joint_indices()["left_hand_index_rota_joint1"])
+
+    def test_skeleton_model_excludes_non_kinematic_ros_control_joint_duplicates(self):
+        root = ET.fromstring(joints._skeleton_urdf())
+        kinematic_joints = root.findall("joint")
+        self.assertEqual(len(kinematic_joints), 93)
+        self.assertEqual(len({joint.get("name") for joint in kinematic_joints}), 93)
+        self.assertFalse(root.findall("ros2_control"))
+        self.assertTrue(all(joint.find("parent") is not None for joint in kinematic_joints))
+        self.assertTrue(all(joint.find("child") is not None for joint in kinematic_joints))
+
+    def test_skeleton_indices_follow_urdf_order_not_jointstate_message_order(self):
+        data = joints.build(FRESH_JOINT_SNAPSHOT)
+        # q5_model starts with ankle, knee, hip; hip is therefore index 2 even
+        # though it is the first item in this intentionally shuffled snapshot.
+        self.assertEqual(data["joints"][0]["name"], "hip_joint")
+        self.assertEqual(data["joints"][0]["idx"], 2)
+
+    def test_skeleton_maps_vendor_index_finger_names_to_urdf_names(self):
+        data = joints.build(FRESH_JOINT_SNAPSHOT)
+        item = data["joints"][1]
+        self.assertEqual(item["name"], "left_hand_index_rota_joint1")
+        self.assertIn(item["name"], joints._model_joint_indices())
+
+    def test_skeleton_derives_missing_distal_hand_joints_from_active_finger_state(self):
+        data = joints.build({
+            "fresh": True,
+            "joint_names": ["left_hand_index_joint1"],
+            "joints": {"left_hand_index_joint1": 0.8},
+        })
+        names = {item["name"] for item in data["joints"]}
+        self.assertIn("left_hand_index_rota_joint1", names)
+        self.assertIn("left_hand_index_rota_joint2", names)
+        distal = next(item for item in data["joints"] if item["name"] == "left_hand_index_rota_joint2")
+        self.assertEqual(distal["q"], 0.8)
+
     def test_joint_cards_preserve_received_but_stale_data_as_unavailable_for_live_use(self):
         stale = dict(FRESH_JOINT_SNAPSHOT, available=True, fresh=False, stale=True, age_ms=5001)
         skeleton = joints.build(stale)
@@ -167,6 +212,13 @@ class Q5BasicSensorTests(unittest.TestCase):
     def test_base_drive_declares_reliable_qos_for_the_verified_q5_controller(self):
         with open(base_drive.__file__, encoding="utf-8") as source:
             self.assertIn("reliability=ReliabilityPolicy.RELIABLE", source.read())
+
+    def test_hand_control_does_not_expose_raw_multi_joint_set_action(self):
+        plugin = hand_control.Plugin.__new__(hand_control.Plugin)
+        plugin._min_position, plugin._max_position = 0.0, 1.0
+        schema = plugin.get_tool()["inputSchema"]
+        self.assertNotIn("set", schema["properties"]["action"]["enum"])
+        self.assertNotIn("targets", schema["properties"])
 
     def test_joint_state_subscription_accepts_vendor_best_effort_stream(self):
         with open(q5_sdk_client.__file__, encoding="utf-8") as source:
