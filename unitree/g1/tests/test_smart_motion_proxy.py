@@ -554,6 +554,12 @@ class SmartMotionParentLocoSequenceTest(unittest.TestCase):
         self.assertNotIn("fsm_loco_client", source)
         self.assertIn("apply_parent_velocity_proposal", source)
         self.assertIn("proposal_apply_loop", source)
+        proposal_qos_source = source[
+            source.index("_PROPOSAL_QOS = QoSProfile("):
+            source.index("# ── Initialize DDS ──")
+        ]
+        self.assertIn("depth=1", proposal_qos_source)
+        self.assertNotIn("depth=10", proposal_qos_source)
         self.assertIn("query_parent_fsm_id", source)
         self.assertIn("stop_parent_velocity_proposal", source)
         self.assertEqual(

@@ -83,11 +83,12 @@ python main.py
 ### G1 受控导航速度执行
 
 G1 `loco` actuator 接收由导航 lease 约束的
-`phanthy.navigation.velocity_proposal.v1` 输入。有效 proposal 通过容量为 1
-的 latest-only 队列执行：已等待的旧速度会被新速度合并替换，不会积压。
-proposal TTL 失效会立即触发 `StopMove`；只有在返回后用新的 odometry
-样本确认零速，同一导航 lease 才能保留并接受下一条新鲜 proposal。安全、
-身份、序列、RPC 和停车确认类硬故障仍会解除武装。
+`phanthy.navigation.velocity_proposal.v1` 输入。订阅端使用可靠的
+`KEEP_LAST(depth=1)`，执行端使用容量为 1 的 latest-only 队列：未读取
+或已等待的旧速度都会被新速度替换，不会积压。proposal TTL 失效会立即
+触发 `StopMove`；只有在返回后用新的 odometry 样本确认零速，同一导航
+lease 才能保留并接受下一条新鲜 proposal。安全、身份、序列、RPC 和停车确认类
+硬故障仍会解除武装。
 
 `loco.start` 只订阅唯一 proposal topic，并保持物理停止。Driver 空闲时会先
 完整校验首条新鲜、合法、非零 proposal，再原子绑定其 `nav_id` 并执行该帧。

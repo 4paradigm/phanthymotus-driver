@@ -36,7 +36,7 @@ def velocity_proposal_port(topic: str) -> dict:
         "topic": topic,
         "format": "data/json",
         "ros_type": "std_msgs/msg/String",
-        "qos": "RELIABLE + KEEP_LAST(depth=10) + VOLATILE",
+        "qos": "RELIABLE + KEEP_LAST(depth=1) + VOLATILE",
         "schema": VELOCITY_PROPOSAL_SCHEMA,
     }
 

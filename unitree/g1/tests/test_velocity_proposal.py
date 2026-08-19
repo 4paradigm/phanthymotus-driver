@@ -52,7 +52,7 @@ class TopicResolutionTest(unittest.TestCase):
                 "topic": EXPECTED_TOPIC,
                 "format": "data/json",
                 "ros_type": "std_msgs/msg/String",
-                "qos": "RELIABLE + KEEP_LAST(depth=10) + VOLATILE",
+                "qos": "RELIABLE + KEEP_LAST(depth=1) + VOLATILE",
                 "schema": "phanthy.navigation.velocity_proposal.v1",
             },
         )

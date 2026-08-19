@@ -1299,7 +1299,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
     _PROPOSAL_QOS = QoSProfile(
         reliability=ReliabilityPolicy.RELIABLE,
         history=HistoryPolicy.KEEP_LAST,
-        depth=10,
+        depth=1,
         durability=DurabilityPolicy.VOLATILE,
     )
 

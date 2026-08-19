@@ -87,11 +87,12 @@ python main.py
 
 The G1 `loco` actuator accepts a lease-bound
 `phanthy.navigation.velocity_proposal.v1` input. Valid proposals are executed
-through a capacity-one latest-only queue, so an older pending velocity is
-coalesced instead of backlogged. A proposal TTL lapse immediately triggers
-`StopMove`; only a successful post-call zero-odometry confirmation keeps the
-same navigation lease recoverable for the next fresh proposal. Hard safety,
-identity, sequence, RPC, and stop-confirmation faults still disarm the lease.
+through a reliable `KEEP_LAST(depth=1)` subscription and a capacity-one
+latest-only execution queue, so older unread or pending velocities are replaced
+instead of backlogged. A proposal TTL lapse immediately triggers `StopMove`;
+only a successful post-call zero-odometry confirmation keeps the same navigation
+lease recoverable for the next fresh proposal. Hard safety, identity, sequence,
+RPC, and stop-confirmation faults still disarm the lease.
 
 `loco.start` connects the sole proposal topic and remains physically stopped.
 While idle, the Driver validates the first fresh, legal, nonzero proposal and
