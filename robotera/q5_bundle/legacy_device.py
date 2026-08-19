@@ -1547,6 +1547,21 @@ class AudioPlugin:
             return False, error
         return self._xos_chat_wait(False)
 
+    def _wait_audio_finished(self, timeout: float) -> bool:
+        """Wait for the vendor player, not merely the action goal, to finish."""
+        deadline = time.monotonic() + max(2.0, min(180.0, timeout))
+        # The action server can report success as soon as playback is queued.
+        # Poll the vendor status service before tearing down XOS chat.
+        time.sleep(0.2)
+        while time.monotonic() < deadline:
+            if not self._srv_is_play.service_is_ready():
+                return True
+            response = _wait_for_future(self._srv_is_play.call_async(Trigger.Request()), 1.0)
+            if response is not None and not response.success:
+                return True
+            time.sleep(0.2)
+        return False
+
     def _play(self, args, mode: int):
         # XOS refuses vendor playback while its chat session is stopped. Keep
         # the session scoped to this request, unless the user had it enabled.
@@ -1621,6 +1636,12 @@ class AudioPlugin:
             response = _wait_for_future(goal_handle.get_result_async(), max(10.0, goal.timeout + 2.0))
             if response is None:
                 return {"state": "error", "message": "audio result timed out"}
+            if response.result.success:
+                # timeout=0 means vendor default; allow enough time for normal
+                # XOS clips while avoiding an unbounded MCP request.
+                wait_timeout = goal.timeout if goal.timeout > 0 else 180.0
+                if not self._wait_audio_finished(wait_timeout):
+                    return {"state": "error", "message": "audio playback status timed out"}
             return {"state": "ok" if response.result.success else "error", "message": response.result.message}
         finally:
             if started_chat:
