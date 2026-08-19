@@ -905,6 +905,13 @@ class ControlledSpatialPlugin:
 
 def _controlled_spatial_process(plugin_config: dict, namespace: str, command_queue, result_queue):
     """Subprocess entry: runs ControlledSpatialPlugin with its own DDS + GIL."""
+    # Spawned child: fresh interpreter, does not inherit the parent's sys.stdout.
+    try:
+        from common import logsafe
+        logsafe.install(check_fd=False)
+    except ImportError:
+        pass
+
     import os as _os
     _os.setsid()
 
@@ -913,13 +920,9 @@ def _controlled_spatial_process(plugin_config: dict, namespace: str, command_que
         network_iface = plugin_config.get("network_iface", "eth0")
         ChannelFactoryInitialize(0, network_iface)
 
-        # Suppress C++ stdout in subprocess
-        _orig_fd = _os.dup(1)
-        _devnull = _os.open(_os.devnull, _os.O_WRONLY)
-        _os.dup2(_devnull, 1)
-        _os.close(_devnull)
-        import sys
-        sys.stdout = _os.fdopen(_orig_fd, 'w', buffering=1)
+        # NOTE: a fd-1 -> /dev/null shuffle used to live here. Removed: it made this
+        # subprocess a second unsynchronised writer on the parent's log pipe, which
+        # is how torn records were produced. SDK prints are gated at source now.
 
         child_config = dict(plugin_config)
         child_config["isolated_process"] = False

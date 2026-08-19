@@ -1,3 +1,4 @@
+import logging
 import time
 
 from enum import Enum
@@ -9,6 +10,8 @@ from ..idl.unitree_api.msg.dds_ import Response_ as Response
 from ..core.channel import ChannelFactory
 from ..core.channel_name import ChannelType, GetClientChannelName
 from .request_future import RequestFuture, RequestFutureQueue
+
+_log = logging.getLogger(__name__)
 
 
 """
@@ -37,7 +40,7 @@ class ClientStub:
         if self.__sendChannel.Write(request, timeout):
             return True
         else:
-            print("[ClientStub] send error. id:", request.header.identity.id)
+            _log.warning("[ClientStub] send error. id: %s", request.header.identity.id)
             return False
 
     def SendRequest(self, request: Request, timeout: float):
@@ -50,7 +53,7 @@ class ClientStub:
         if self.__sendChannel.Write(request, timeout):
             return future
         else:
-            print("[ClientStub] send request error. id:", request.header.identity.id)
+            _log.warning("[ClientStub] send request error. id: %s", request.header.identity.id)
             self.__futureQueue.Remove(id)
             return None
 
@@ -64,4 +67,4 @@ class ClientStub:
         if future is None:
             pass  # expected for fire-and-forget sport commands
         elif not future.Ready(response):
-            print("[ClientStub] set future ready error.")
+            _log.warning("[ClientStub] set future ready error.")

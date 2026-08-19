@@ -306,7 +306,11 @@ def make_handler():
         def log_message(self, fmt, *args):
             msg = fmt % args
             if '"POST /mcp' not in msg or "200" not in msg:
-                print(f"[mcp] {self.address_string()} {msg}")
+                # Escape and cap: msg embeds the raw request line, which on host
+                # networking is remote-controlled bytes going straight into the
+                # Docker log framer (log injection / control-byte corruption).
+                safe = msg.encode("unicode_escape").decode("ascii")[:200]
+                print(f"[mcp] {self.address_string()} {safe}")
 
         def _send_json(self, status: int, payload: dict) -> None:
             body = json.dumps(payload, ensure_ascii=False).encode()

@@ -131,7 +131,11 @@ def make_handler():
             msg = fmt % args
             if '"POST /mcp' in msg and '200' in msg:
                 return
-            print(f"[mcp] {self.address_string()} {msg}")
+            # Escape and cap: msg embeds the raw request line, which on host
+            # networking is remote-controlled bytes going straight into the
+            # Docker log framer (log injection / control-byte corruption).
+            safe = msg.encode("unicode_escape").decode("ascii")[:200]
+            print(f"[mcp] {self.address_string()} {safe}")
 
         def _send(self, status: int, body: str):
             encoded = body.encode()
