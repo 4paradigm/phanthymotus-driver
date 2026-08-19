@@ -80,6 +80,7 @@ COPY camera_pointcloud.py /work/camera_pointcloud.py
 COPY legacy_device.py /work/legacy_device.py
 COPY legacy_direct_control.py /work/legacy_direct_control.py
 COPY q5_media_bridge.py /work/q5_media_bridge.py
+COPY q5_camera_worker.py /work/q5_camera_worker.py
 COPY odom.py /work/odom.py
 COPY teleop_state.py /work/teleop_state.py
 COPY robot_status.py /work/robot_status.py

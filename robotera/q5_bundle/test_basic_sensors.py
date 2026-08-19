@@ -211,7 +211,7 @@ class Q5BasicSensorTests(unittest.TestCase):
 
     def test_base_drive_declares_reliable_qos_for_the_verified_q5_controller(self):
         with open(base_drive.__file__, encoding="utf-8") as source:
-        self.assertIn("reliability=ReliabilityPolicy.RELIABLE", source.read())
+            self.assertIn("reliability=ReliabilityPolicy.RELIABLE", source.read())
 
     def test_hand_control_does_not_expose_raw_multi_joint_set_action(self):
         plugin = hand_control.Plugin.__new__(hand_control.Plugin)
