@@ -90,6 +90,13 @@ _LIE_PRONE_MIN_MOVED_JOINT_COUNT = 3
 _WIPE_TEARS_MOTION_START_TIMEOUT_S = 3.0
 _WIPE_TEARS_MIN_ARM_DISPLACEMENT_RAD = 0.08
 _ARM_JOINT_INDICES = tuple(range(4)) + tuple(range(10, 14))
+_SEMANTIC_MOVING_THRESHOLD = 0.15
+_SEMANTIC_STATIONARY_THRESHOLD = 0.15
+_SEMANTIC_STATIONARY_CONFIRM_S = 3.0
+_SEMANTIC_MOTION_START_TIMEOUT_S = 10.0
+_SEMANTIC_MAX_MONITOR_S = 120.0
+_SEMANTIC_VELOCITY_WINDOW_SIZE = 5
+_SEMANTIC_MIN_JOINT_DISPLACEMENT_RAD = 0.08
 _PLAYBACK_MOVING_THRESHOLD = 0.15
 _PLAYBACK_STATIONARY_THRESHOLD = 0.15
 _PLAYBACK_STATIONARY_CONFIRM_S = 3.0
@@ -552,7 +559,7 @@ class LocoPlugin:
     def _semantic_action_tool(self) -> dict:
         return {
             "name": "semantic_action", "type": "actuator", "multiInstance": False,
-            "description": "执行 Bumi 出厂预设的挥手、握手、欢呼、三种舞蹈和擦眼泪动作。卡片会自动进入动作所需的行走模式。执行前必须确认机器人已正常站立、双脚着地，地面平坦防滑且周围无人和障碍物；舞蹈建议至少留出 3m×3m 空间。",
+            "description": "执行 Bumi 出厂预设的挥手、握手、欢呼、三种舞蹈和擦眼泪动作。所有选项均使用 ACP：首次返回 accepted 和 action_id，随后根据工作模式与关节反馈再次返回 completed、error 或 cancelled，并明确说明成功或失败原因。卡片会自动进入动作所需的行走模式。执行前必须确认机器人已正常站立、双脚着地，地面平坦防滑且周围无人和障碍物；舞蹈建议至少留出 3m×3m 空间。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -563,8 +570,8 @@ class LocoPlugin:
                 },
                 "required": ["action"],
                 "x-completion": {
-                    "actions": ["wipe_tears"],
-                    "timeout": 30,
+                    "actions": list(_PRESET_ACTIONS),
+                    "timeout": 150,
                 },
                 "x-action-params": {
                     name: {"params": [], "description": description}
@@ -664,16 +671,7 @@ class LocoPlugin:
         if tool_name == "stand_up_lie_prone" and action in _POSTURE_ACTIONS:
             return self._start_posture_acp(action, args)
         if tool_name == "semantic_action" and action in _PRESET_ACTIONS:
-            result = self._do_preset_action(action, args)
-            if (action == "wipe_tears" and result.get("state") == "running"
-                    and result.get("confirmed_started")):
-                action_id, _ = self._register_acp(
-                    "semantic_action", action)
-                result["action_id"] = action_id
-                self._schedule_auto_walk_exit(
-                    "wipe_tears", 33, _TEAR_AUTO_EXIT_S,
-                    self._safety_requirements(action), action_id=action_id)
-            return result
+            return self._start_semantic_acp(action, args)
         if tool_name == "action_recording" and action in _TEACHING_ACTIONS:
             result = self._do_teaching_action(action, args)
             if (action == "play_recording" and result.get("state") == "running"
@@ -703,8 +701,39 @@ class LocoPlugin:
             active = self._active_acp.pop(action_id, None)
         if active is None:
             return False
-        _acp_notify(action_id, status, result, active["tool"])
+        terminal_result = self._format_acp_terminal(
+            action_id, active["action"], status, result)
+        _acp_notify(action_id, status, terminal_result, active["tool"])
         return True
+
+    @staticmethod
+    def _format_acp_terminal(action_id: str, action: str, status: str,
+                             result: dict) -> dict:
+        """Return one consistent, user-readable terminal ACP result."""
+        terminal = dict(result)
+        terminal.update({
+            "action_id": action_id,
+            "action": action,
+            "state": status,
+            "success": status == "completed",
+        })
+        if status == "completed":
+            terminal["message"] = (
+                f"The {action} action completed successfully."
+            )
+        elif status == "cancelled":
+            reason = str(terminal.get("reason") or "The action was cancelled.")
+            terminal["reason"] = reason
+            terminal["message"] = f"The {action} action was cancelled: {reason}"
+        else:
+            error = str(
+                terminal.get("error")
+                or terminal.get("reason")
+                or "The action failed for an unknown reason."
+            )
+            terminal["error"] = error
+            terminal["message"] = f"The {action} action failed: {error}"
+        return terminal
 
     def _cancel_all_acp(self, reason: str) -> None:
         with self._acp_lock:
@@ -712,10 +741,13 @@ class LocoPlugin:
             self._active_acp.clear()
         for action_id, active in active_items:
             active["cancel_event"].set()
+            result = self._format_acp_terminal(
+                action_id, active["action"], "cancelled",
+                {"reason": reason})
             _acp_notify(
                 action_id,
                 "cancelled",
-                {"action": active["action"], "reason": reason},
+                result,
                 active["tool"],
             )
 
@@ -743,6 +775,200 @@ class LocoPlugin:
             **observation,
         }
         self._finish_acp(action_id, status, terminal_result)
+
+    def _start_semantic_acp(self, action: str, args: dict) -> dict:
+        action_id, cancel_event = self._register_acp(
+            "semantic_action", action)
+        threading.Thread(
+            target=self._run_semantic_acp,
+            args=(action_id, cancel_event, action, dict(args)),
+            daemon=True,
+            name=f"bumi_semantic_acp_{action_id[-8:]}",
+        ).start()
+        return {
+            "state": "accepted",
+            "action_id": action_id,
+            "requested_action": action,
+            "safety_requirements": self._safety_requirements(action),
+            "message": (
+                "The semantic action was accepted. Preparation, startup and physical "
+                "completion monitoring will continue asynchronously. Agent Core will "
+                "receive a completed, error or cancelled terminal result."
+            ),
+        }
+
+    def _run_semantic_acp(self, action_id: str, cancel_event: threading.Event,
+                          action: str, args: dict) -> None:
+        # Give Agent Core time to register the action_id from the MCP response.
+        if cancel_event.wait(0.25):
+            return
+        try:
+            result = self._do_preset_action(action, args)
+            motion_baseline = result.pop("_acp_motion_baseline", None)
+            if cancel_event.is_set():
+                return
+            if result.get("state") == "error":
+                self._finish_acp(action_id, "error", result)
+                return
+
+            if action == "reset":
+                status = (
+                    "completed"
+                    if result.get("state") == "completed"
+                    and result.get("confirmed")
+                    else "error"
+                )
+                if status == "error" and "error" not in result:
+                    result["error"] = "Walking-mode reset was not confirmed."
+                self._finish_acp(action_id, status, result)
+                return
+
+            if not result.get("confirmed_started"):
+                result["error"] = result.get("error") or (
+                    "The requested semantic-action workmode was not observed."
+                )
+                self._finish_acp(action_id, "error", result)
+                return
+
+            if action == "wipe_tears":
+                self._schedule_auto_walk_exit(
+                    "wipe_tears", 33, _TEAR_AUTO_EXIT_S,
+                    self._safety_requirements(action), action_id=action_id)
+                return
+
+            if motion_baseline is None:
+                result["error"] = (
+                    "The semantic action started, but its pre-action joint state was "
+                    "not available for completion monitoring."
+                )
+                self._finish_acp(action_id, "error", result)
+                return
+            self._monitor_semantic_acp(
+                action_id, cancel_event, action, result, motion_baseline)
+        except Exception as exc:
+            self._finish_acp(action_id, "error", {
+                "requested_action": action,
+                "error": str(exc),
+            })
+
+    def _monitor_semantic_acp(self, action_id: str,
+                              cancel_event: threading.Event, action: str,
+                              result: dict,
+                              baseline_positions: list[float]) -> None:
+        active_modes = _PRESET_ACTIONS[action][1]
+        started_at = time.monotonic()
+        motion_seen = False
+        stationary_score_s = 0.0
+        velocity_window: list[float] = []
+        peak_joint_velocity = 0.0
+        peak_joint_displacement = 0.0
+        sample_count = 0
+
+        while not cancel_event.wait(_ACTION_MOTION_SAMPLE_INTERVAL_S):
+            mode = int(self._high_ctrl.get_mode())
+            if mode == 26:
+                result.update({
+                    "final_workmode": 26,
+                    "final_workmode_name": "protection",
+                    "error": "The robot entered protection mode during the semantic action.",
+                })
+                self._finish_acp(action_id, "error", result)
+                return
+            if mode == 2:
+                result.update({
+                    "final_workmode": 2,
+                    "final_workmode_name": "walking",
+                    "completion_detection": "firmware_returned_to_walking",
+                })
+                self._finish_acp(action_id, "completed", result)
+                return
+            if mode not in active_modes:
+                result.update({
+                    "final_workmode": mode,
+                    "final_workmode_name": _WORKMODE_NAMES.get(mode, "unknown"),
+                    "error": "The robot left the semantic-action mode unexpectedly.",
+                })
+                self._finish_acp(action_id, "error", result)
+                return
+
+            try:
+                joints = self._high_ctrl.get_joint_state()
+                if len(joints) != len(_BUMI_JOINT_NAMES):
+                    raise RuntimeError(
+                        f"HighController returned {len(joints)} joints; expected "
+                        f"{len(_BUMI_JOINT_NAMES)}")
+                positions = [float(joint.pos) for joint in joints]
+                max_velocity = max(abs(float(joint.vel)) for joint in joints)
+                max_displacement = max(
+                    abs(position - baseline)
+                    for position, baseline in zip(
+                        positions, baseline_positions))
+            except Exception as exc:
+                result["error"] = (
+                    f"Semantic-action completion feedback could not be read: {exc}"
+                )
+                self._finish_acp(action_id, "error", result)
+                return
+
+            sample_count += 1
+            peak_joint_velocity = max(peak_joint_velocity, max_velocity)
+            peak_joint_displacement = max(
+                peak_joint_displacement, max_displacement)
+            velocity_window.append(max_velocity)
+            if len(velocity_window) > _SEMANTIC_VELOCITY_WINDOW_SIZE:
+                velocity_window.pop(0)
+            if len(velocity_window) == _SEMANTIC_VELOCITY_WINDOW_SIZE:
+                ordered = sorted(velocity_window)
+                median_velocity = ordered[len(ordered) // 2]
+                if (median_velocity >= _SEMANTIC_MOVING_THRESHOLD
+                        or max_displacement
+                        >= _SEMANTIC_MIN_JOINT_DISPLACEMENT_RAD):
+                    motion_seen = True
+                if (motion_seen
+                        and median_velocity <= _SEMANTIC_STATIONARY_THRESHOLD):
+                    stationary_score_s += _ACTION_MOTION_SAMPLE_INTERVAL_S
+                    if stationary_score_s >= _SEMANTIC_STATIONARY_CONFIRM_S:
+                        result.update({
+                            "final_workmode": mode,
+                            "final_workmode_name": _WORKMODE_NAMES.get(
+                                mode, "unknown"),
+                            "completion_detection": "joint_motion_completed",
+                            "physical_motion_confirmed": True,
+                            "completion_observation": {
+                                "sample_count": sample_count,
+                                "peak_abs_joint_velocity_rad_s": round(
+                                    peak_joint_velocity, 4),
+                                "peak_joint_displacement_rad": round(
+                                    peak_joint_displacement, 4),
+                                "stationary_confirm_s": round(
+                                    stationary_score_s, 2),
+                            },
+                        })
+                        self._finish_acp(action_id, "completed", result)
+                        return
+                elif median_velocity > _SEMANTIC_STATIONARY_THRESHOLD:
+                    stationary_score_s = 0.0
+
+            elapsed = time.monotonic() - started_at
+            if (not motion_seen
+                    and elapsed >= _SEMANTIC_MOTION_START_TIMEOUT_S):
+                result.update({
+                    "physical_motion_confirmed": False,
+                    "error": (
+                        "The semantic-action workmode was observed, but joint feedback "
+                        "did not confirm that physical motion started."
+                    ),
+                })
+                self._attach_battery_failure_diagnostic(result)
+                self._finish_acp(action_id, "error", result)
+                return
+            if elapsed >= _SEMANTIC_MAX_MONITOR_S:
+                result["error"] = (
+                    "The semantic action did not reach a confirmed stationary completion "
+                    "within 120 seconds."
+                )
+                self._finish_acp(action_id, "error", result)
+                return
 
     def _start_posture_acp(self, action: str, args: dict) -> dict:
         safety = self._safety_requirements(action)
@@ -825,7 +1051,7 @@ class LocoPlugin:
                 self._finish_acp(action_id, "error", result)
                 return
 
-            active_mode = 27 if action == "stand_up" else 28
+            terminal_mode = 2 if action == "stand_up" else 30
             deadline = time.monotonic() + 90.0
             while not cancel_event.wait(0.1):
                 mode = int(self._high_ctrl.get_mode())
@@ -838,19 +1064,25 @@ class LocoPlugin:
                     })
                     self._finish_acp(action_id, "error", result)
                     return
-                if mode != active_mode:
+                if mode == terminal_mode:
                     result.update({
                         "state": "completed",
                         "final_workmode": mode,
                         "final_workmode_name": _WORKMODE_NAMES.get(mode, "unknown"),
-                        "completion_detection": "workmode_left_posture_action",
+                        "completion_detection": "expected_terminal_workmode_observed",
                     })
                     self._finish_acp(action_id, "completed", result)
                     return
                 if time.monotonic() >= deadline:
                     result.update({
                         "state": "error",
-                        "error": "The posture action did not leave its active workmode within 90 seconds.",
+                        "final_workmode": mode,
+                        "final_workmode_name": _WORKMODE_NAMES.get(
+                            mode, "unknown"),
+                        "error": (
+                            "The posture action did not reach its expected terminal "
+                            f"workmode ({terminal_mode}) within 90 seconds."
+                        ),
                     })
                     self._finish_acp(action_id, "error", result)
                     return
@@ -1780,12 +2012,19 @@ class LocoPlugin:
             prepared["safety_requirements"] = safety
             return prepared
         motion_baseline = None
-        if action == "wipe_tears":
-            try:
-                # Capture after preparation so enable/ready/walking transitions
-                # cannot be mistaken for physical TEAR motion.
-                motion_baseline = self._capture_joint_positions(_ARM_JOINT_INDICES)
-            except Exception as exc:
+        try:
+            # Capture after preparation so enable/ready/walking transitions
+            # cannot be mistaken for semantic-action motion.
+            completion_baseline = self._capture_joint_positions(
+                tuple(range(len(_BUMI_JOINT_NAMES))))
+            if action == "wipe_tears":
+                motion_baseline = [
+                    completion_baseline[index]
+                    for index in _ARM_JOINT_INDICES
+                ]
+        except Exception as exc:
+            completion_baseline = None
+            if action == "wipe_tears":
                 return {
                     "state": "error",
                     "command_sent": bool(prepared["steps"]),
@@ -1798,6 +2037,8 @@ class LocoPlugin:
         command_name, expected_modes = _PRESET_ACTIONS[action]
         result = self._trigger_user_action(
             action, command_name, expected_modes, prepared["steps"], safety)
+        if completion_baseline is not None:
+            result["_acp_motion_baseline"] = completion_baseline
         if action == "wipe_tears" and not result.get("confirmed_started"):
             result["state"] = "error"
             result["error"] = (

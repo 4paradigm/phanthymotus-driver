@@ -49,12 +49,22 @@ mode into walking because the SDK cannot verify that the robot is physically
 standing.
 
 Long-running physical operations use Agent Core's Action Completion Protocol
-(ACP). `loco.move`, both posture actions, `semantic_action.wipe_tears`, and
+(ACP). `loco.move`, both posture actions, every `semantic_action`, and
 `action_recording.play_recording` return a unique `action_id`; their background
 workers report `completed`, `error`, or `cancelled` to `/api/acp/complete`.
+Every terminal result includes the same `action_id`, action name, terminal
+`state`, a boolean `success`, and a plain-language completion message; failures
+also include a concrete `error` reason.
 This keeps Agent Core's actuator barrier active until the bounded move or action
 really terminates. Stopping the plugin cancels pending timers and playback
 monitoring before reporting the affected ACP actions as cancelled.
+Preset semantic actions use workmode feedback plus joint displacement and a
+rolling joint-velocity window to distinguish physical completion from command
+acceptance. A firmware return to walking is also treated as successful
+completion; protection, unexpected workmode changes, missing physical motion,
+feedback errors and monitor timeouts are reported as ACP errors. `wipe_tears`
+keeps its guarded five-second return-to-walking behavior, while `reset` is
+complete only after walking mode is confirmed.
 Posture workmode and stand-up pose checks run before the asynchronous request is
 accepted, so invalid requests such as calling `stand_up` while already standing
 return an immediate plain-language error. A valid request returns only its ACP
