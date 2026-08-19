@@ -380,16 +380,10 @@ class ArmControlPlugin:
         status = self._safety()
         if not status["ros_publisher_available"]:
             return _arm_failure("ROS_UNAVAILABLE", "Q5 arm command publisher is unavailable", status=status)
-        if status["same_name_publisher_count"] > 1:
-            return _arm_failure(
-                "DUPLICATE_BODY_PUBLISHER",
-                "Refusing arm motion: multiple q5_body_command publishers are active on /wr1_controller/commands",
-                status=status,
-            )
-        # Head control uses this same body router and works alongside the
-        # vendor MPC endpoint. ROS graph discovery only proves an endpoint
-        # exists, not that it is actively emitting commands, so report it in
-        # `info` but do not reject a bounded single-joint interpolation here.
+        # Q5's vendor MPC stack and components in this process can expose
+        # several DDS endpoints on this topic. Endpoint count is therefore a
+        # diagnostic only, not proof of a competing driver. The shared router
+        # below enforces ownership between our body-control cards.
         prepare_error = self._ensure_prepared()
         if prepare_error:
             return {**prepare_error, "details": {**prepare_error.get("details", {}), "status": status}}
