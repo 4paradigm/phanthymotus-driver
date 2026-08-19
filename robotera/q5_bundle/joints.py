@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 import xml.etree.ElementTree as ET
+from functools import lru_cache
 from pathlib import Path
 
 from sensor_contract import topic_out
@@ -30,6 +31,14 @@ NODE = "q5_joints"
 DESC = "Q5 实时身体与双手骨架：由 /joint_states 驱动的实机 URDF 可视化"
 MODEL_PATH = Path(__file__).parent / "resource" / "q5_model.urdf"
 
+# The Q5 JointState stream omits ``rota`` from its two index-finger motor
+# names.  The URDF uses the full kinematic names, which the skeleton contract
+# requires verbatim.
+_SKELETON_NAME_ALIASES = {
+    "left_hand_index_joint1": "left_hand_index_rota_joint1",
+    "right_hand_index_joint1": "right_hand_index_rota_joint1",
+}
+
 
 def _skeleton_urdf() -> str:
     """Return only the URDF kinematic tree understood by the skeleton viewer.
@@ -46,17 +55,35 @@ def _skeleton_urdf() -> str:
     return ET.tostring(root, encoding="unicode")
 
 
+@lru_cache(maxsize=1)
+def _model_joint_indices() -> dict[str, int]:
+    """Return the renderer's stable index for each kinematic URDF joint."""
+    root = ET.fromstring(_skeleton_urdf())
+    return {
+        joint.get("name"): index
+        for index, joint in enumerate(root.findall("joint"))
+        if joint.get("name")
+    }
+
+
 def build(snap: dict) -> dict:
     positions = snap.get("joints", {})
     names = snap.get("joint_names", [])
+    model_indices = _model_joint_indices()
     # The skeleton contract requires a stable index as well as the exact URDF
     # joint name.  Keep the incoming JointState order: it is the robot's
     # authoritative ordering and avoids reordering hand/body joints in the UI.
     joints = []
-    for idx, name in enumerate(names):
+    for message_idx, name in enumerate(names):
         if name not in positions:
             continue
-        item = {"idx": idx, "name": name, "q": positions[name]}
+        # idx is the URDF/model index, not the arbitrary order of one
+        # JointState message.  The latter changes between publishers and
+        # causes renderers that use idx to apply angles to the wrong joints.
+        model_name = _SKELETON_NAME_ALIASES.get(name, name)
+        item = {"idx": model_indices.get(model_name, message_idx), "name": model_name, "q": positions[name]}
+        if model_name != name:
+            item["source_name"] = name
         if name in snap.get("velocities", {}):
             item["dq"] = snap["velocities"][name]
         if name in snap.get("efforts", {}):
