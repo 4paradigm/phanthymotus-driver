@@ -160,10 +160,9 @@ def _acp_notify(action_id: str, status: str, result: dict,
 
     agent_core_url = _os.environ.get(
         "AGENT_CORE_URL", "https://localhost:15678")
-    if _os.environ.get("AGENT_CORE_INSECURE_TLS") == "1":
-        context = _ssl._create_unverified_context()
-    else:
-        context = _ssl.create_default_context()
+    context = _ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = _ssl.CERT_NONE
     payload = _json.dumps({
         "action_id": action_id,
         "status": status,
@@ -797,18 +796,27 @@ class LocoPlugin:
         # Agent Core registers the action_id after receiving the MCP response.
         # Retry locally so a fast action or transient localhost failure cannot
         # permanently lose its terminal callback.
-        attempt = 0
-        delay_s = 0.5
-        while True:
-            attempt += 1
+        delays = (0.5, 0.5, 1.0, 1.0, 2.0, 2.0, 4.0, 4.0)
+        for attempt, delay_s in enumerate(delays, start=1):
             if _acp_notify(action_id, status, result, tool):
                 with self._acp_lock:
                     self._active_acp.pop(action_id, None)
                 return
-            print(f"[ACP] delivery retry {attempt} for action_id={action_id} "
-                  f"in {delay_s:.1f}s", flush=True)
+            print(
+                f"[ACP] delivery retry {attempt}/{len(delays)} for "
+                f"action_id={action_id} in {delay_s:.1f}s",
+                flush=True,
+            )
             time.sleep(delay_s)
-            delay_s = min(delay_s * 2.0, 60.0)
+        with self._acp_lock:
+            active = self._active_acp.get(action_id)
+            if active is not None:
+                active["terminal_pending"] = False
+        print(
+            f"[ACP] terminal callback exhausted retries: action_id={action_id} "
+            f"tool={tool} status={status}",
+            flush=True,
+        )
 
     @staticmethod
     def _format_acp_terminal(action_id: str, action: str, status: str,
