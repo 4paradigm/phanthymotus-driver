@@ -1251,7 +1251,7 @@ class AudioFilePlayerPlugin:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["play", "stop", "list", "delete", "upload"],
+                        "enum": ["start", "play", "stop", "list", "delete", "upload", "info"],
                     },
                     "file_id": {
                         "type": "string",
@@ -1278,6 +1278,10 @@ class AudioFilePlayerPlugin:
                 },
                 "required": ["action"],
                 "x-action-params": {
+                    "start": {
+                        "params": [],
+                        "description": "Initialize the card (called by canvas on project start)",
+                    },
                     "play": {
                         "params": ["file_id"],
                         "optional": ["filename", "file_path", "volume", "loop"],
@@ -1299,6 +1303,10 @@ class AudioFilePlayerPlugin:
                         "params": ["file_path"],
                         "description": "Register a container-side wav file into the audio library",
                     },
+                    "info": {
+                        "params": [],
+                        "description": "Query current playback state",
+                    },
                 },
             },
             "topic_in": [],
@@ -1314,6 +1322,8 @@ class AudioFilePlayerPlugin:
     # ── dispatch ──
     def dispatch(self, action: str, args: dict) -> dict | None:
         args.pop('_tool_name', None)
+        if action == "start":
+            return {"state": "ready", "audio_dir": str(self._audio_dir)}
         if action == "play":
             return self._do_play(args)
         if action == "stop":
