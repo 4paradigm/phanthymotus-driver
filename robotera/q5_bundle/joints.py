@@ -39,6 +39,22 @@ _SKELETON_NAME_ALIASES = {
     "right_hand_index_joint1": "right_hand_index_rota_joint1",
 }
 
+# XHand Lite publishes one actuator state per finger. The URDF contains the
+# passive distal revolute joint separately, so mirror the actuator angle into
+# that joint for a faithful curled-finger visualization.
+_HAND_DISTAL_JOINTS = {
+    "left_hand_index_rota_joint1": "left_hand_index_rota_joint2",
+    "left_hand_mid_joint1": "left_hand_mid_joint2",
+    "left_hand_ring_joint1": "left_hand_ring_joint2",
+    "left_hand_pinky_joint1": "left_hand_pinky_joint2",
+    "right_hand_index_rota_joint1": "right_hand_index_rota_joint2",
+    "right_hand_mid_joint1": "right_hand_mid_joint2",
+    "right_hand_ring_joint1": "right_hand_ring_joint2",
+    "right_hand_pinky_joint1": "right_hand_pinky_joint2",
+    "left_hand_thumb_rota_joint1": "left_hand_thumb_rota_joint2",
+    "right_hand_thumb_rota_joint1": "right_hand_thumb_rota_joint2",
+}
+
 
 def _skeleton_urdf() -> str:
     """Return only the URDF kinematic tree understood by the skeleton viewer.
@@ -66,6 +82,18 @@ def _model_joint_indices() -> dict[str, int]:
     }
 
 
+@lru_cache(maxsize=1)
+def _model_joint_limits() -> dict[str, tuple[float, float]]:
+    root = ET.fromstring(_skeleton_urdf())
+    limits = {}
+    for joint in root.findall("joint"):
+        limit = joint.find("limit")
+        if limit is None or limit.get("lower") is None or limit.get("upper") is None:
+            continue
+        limits[joint.get("name")] = (float(limit.get("lower")), float(limit.get("upper")))
+    return limits
+
+
 def build(snap: dict) -> dict:
     positions = snap.get("joints", {})
     names = snap.get("joint_names", [])
@@ -89,6 +117,12 @@ def build(snap: dict) -> dict:
         if name in snap.get("efforts", {}):
             item["tau"] = snap["efforts"][name]
         joints.append(item)
+        distal_name = _HAND_DISTAL_JOINTS.get(model_name)
+        if distal_name and distal_name not in positions and distal_name in model_indices:
+            lower, upper = _model_joint_limits().get(distal_name, (float("-inf"), float("inf")))
+            distal_q = max(lower, min(upper, float(positions[name])))
+            joints.append({"idx": model_indices[distal_name], "name": distal_name,
+                           "q": distal_q, "source_name": name, "derived_from": model_name})
     return {
         "timestamp_ms": int(time.time() * 1000),
         "received_at_ms": snap.get("received_at_ms"),

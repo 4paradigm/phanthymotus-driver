@@ -40,6 +40,9 @@ class _Mcp:
 
 
 class Q5BusBridgeTests(unittest.TestCase):
+    def test_skeleton_polling_defaults_to_driver_publish_rate(self):
+        self.assertEqual(q5_bus_bridge.DEFAULT_POLL_HZ, 10.0)
+
     def test_sensor_topic_contract_does_not_depend_on_vendor_side_publisher(self):
         declared = topic_out("/nvidia_desktop/q5/battery", "data/json")
         self.assertEqual(declared, [{
