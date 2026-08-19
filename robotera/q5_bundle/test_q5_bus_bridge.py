@@ -22,6 +22,9 @@ class _Mcp:
                 {"topic": "/q5/battery", "format": "data/json"},
                 {"topic": "/q5/battery_alias", "format": "data/json"},
             ]},
+            {"name": "joints", "type": "sensor", "topic_out": [
+                {"topic": "/q5/joints", "format": "sensor/skeleton"},
+            ]},
             {"name": "base_drive", "type": "actuator", "topic_out": [
                 {"topic": "/q5/base_drive", "format": "data/json"},
             ]},
@@ -77,6 +80,7 @@ class Q5BusBridgeTests(unittest.TestCase):
         selected = q5_bus_bridge.select_sensor_tools(_Mcp().list_tools())
         self.assertEqual(selected, {
             "battery": ["/q5/battery", "/q5/battery_alias"],
+            "joints": ["/q5/joints"],
         })
 
     def test_media_topics_are_reserved_for_the_typed_bridge(self):
@@ -99,10 +103,15 @@ class Q5BusBridgeTests(unittest.TestCase):
         mcp = _Mcp()
         messages = []
         bridge = q5_bus_bridge.SensorBusBridge(mcp, lambda topic, data: messages.append((topic, data)))
-        self.assertEqual(bridge.refresh(), {"battery": ["/q5/battery", "/q5/battery_alias"]})
-        self.assertEqual(bridge.poll_once(), 2)
-        self.assertEqual(mcp.info_calls, ["battery"])
-        self.assertEqual([topic for topic, _ in messages], ["/q5/battery", "/q5/battery_alias"])
+        self.assertEqual(bridge.refresh(), {
+            "battery": ["/q5/battery", "/q5/battery_alias"],
+            "joints": ["/q5/joints"],
+        })
+        self.assertEqual(bridge.poll_once(), 3)
+        self.assertEqual(mcp.info_calls, ["battery", "joints"])
+        self.assertEqual([topic for topic, _ in messages], [
+            "/q5/battery", "/q5/battery_alias", "/q5/joints",
+        ])
         self.assertEqual(json.loads(messages[0][1]), {"name": "battery", "percentage": 63.0})
 
 
