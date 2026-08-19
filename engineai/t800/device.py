@@ -2516,16 +2516,17 @@ class HeadActuatorPlugin:
         self._status = {"state": "idle", "action": None, "step": 0, "total_steps": 0}
 
     def get_tool(self) -> dict:
+        actions = _with_lifecycle({
+            "nod": (["times", "speed"], "点头：下、上、回中，重复指定次数"),
+            "shake": (["times", "speed"], "摇头：左、右、回中，重复指定次数"),
+            "look": (["direction", "rotation_time"], "看向前、左、右、上或下的预设方向"),
+            "rotate_to": (["pitch_deg", "yaw_deg", "rotation_time", "duration"], "转到指定俯仰和偏航角度（度）"),
+            "reset": ([], "头部回正到 pitch=0、yaw=0"),
+            "status": ([], "查询头部角度和当前动作状态"),
+        })
+        actions["stop"] = ([], "停止当前头部动作并保持当前位置，不自动回正")
         schema = action_schema(
-            {
-                "nod": (["times", "speed"], "点头：下、上、回中，重复指定次数"),
-                "shake": (["times", "speed"], "摇头：左、右、回中，重复指定次数"),
-                "look": (["direction", "rotation_time"], "看向前、左、右、上或下的预设方向"),
-                "rotate_to": (["pitch_deg", "yaw_deg", "rotation_time", "duration"], "转到指定俯仰和偏航角度（度）"),
-                "reset": ([], "头部回正到 pitch=0、yaw=0"),
-                "stop": ([], "停止当前头部动作并保持当前位置，不自动回正"),
-                "status": ([], "查询头部角度和当前动作状态"),
-            },
+            actions,
             {
                 "times": {
                     "type": "integer", "minimum": 1, "maximum": 5, "default": 1,
@@ -2759,7 +2760,10 @@ class HeadActuatorPlugin:
                         "error": self._status.get("error"),
                     }
                 self._joint_plan.release_head("head")
-                self._acp_notify(action_id, final_status, final_result)
+                _notify_acp_completion(
+                    "head", action_id, final_status, final_result,
+                    HeadActuatorPlugin._ACP_CALLBACK_TIMEOUT_SEC,
+                )
 
         thread = threading.Thread(target=run, daemon=True, name="t800-head-sequence")
         with self._lock:
@@ -2790,48 +2794,6 @@ class HeadActuatorPlugin:
             self._joint_plan._dispatch_owned("head", "cancel", {"request_id": request_id})
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=2.0)
-
-    @staticmethod
-    def _acp_notify(action_id: str, status: str, result: dict) -> None:
-        """Report asynchronous head completion to Agent Core."""
-        import json as _json
-        import os as _os
-        import ssl as _ssl
-        import urllib.parse as _urlparse
-        import urllib.request as _urllib
-
-        agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
-        ca_cert = _os.environ.get("AGENT_CORE_CA_CERT")
-        try:
-            parsed_url = _urlparse.urlparse(agent_core_url)
-            if parsed_url.scheme not in ("http", "https"):
-                raise ValueError("AGENT_CORE_URL must use http or https")
-            if (
-                parsed_url.scheme == "http"
-                and parsed_url.hostname not in ("localhost", "127.0.0.1", "::1")
-            ):
-                raise ValueError("unencrypted AGENT_CORE_URL is only allowed on loopback")
-            context = _ssl.create_default_context(cafile=ca_cert or None)
-            payload = _json.dumps({
-                "action_id": action_id,
-                "status": status,
-                "result": result,
-                "tool": "head",
-                "ts": time.time(),
-            }).encode()
-            request = _urllib.Request(
-                f"{agent_core_url}/api/acp/complete",
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            _urllib.urlopen(
-                request,
-                timeout=HeadActuatorPlugin._ACP_CALLBACK_TIMEOUT_SEC,
-                context=context,
-            )
-        except Exception as exc:
-            print(f"[head] ACP callback failed for {action_id}: {exc}", flush=True)
 
 
 class GesturePlugin:
@@ -3147,7 +3109,10 @@ class GesturePlugin:
                         "error": self._status.get("error"),
                     }
                 if action_id is not None:
-                    self._acp_notify(action_id, final_status, final_result)
+                    _notify_acp_completion(
+                        "gesture", action_id, final_status, final_result,
+                        GesturePlugin._ACP_CALLBACK_TIMEOUT_SEC,
+                    )
                 if controls_head:
                     self._joint_plan.release_head("gesture")
 
@@ -3191,48 +3156,6 @@ class GesturePlugin:
         with self._lock:
             self._status["state"] = "cancelled"
             return dict(self._status)
-
-    @staticmethod
-    def _acp_notify(action_id: str, status: str, result: dict) -> None:
-        """Report asynchronous gesture completion to Agent Core."""
-        import json as _json
-        import os as _os
-        import ssl as _ssl
-        import urllib.parse as _urlparse
-        import urllib.request as _urllib
-
-        agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
-        ca_cert = _os.environ.get("AGENT_CORE_CA_CERT")
-        try:
-            parsed_url = _urlparse.urlparse(agent_core_url)
-            if parsed_url.scheme not in ("http", "https"):
-                raise ValueError("AGENT_CORE_URL must use http or https")
-            if (
-                parsed_url.scheme == "http"
-                and parsed_url.hostname not in ("localhost", "127.0.0.1", "::1")
-            ):
-                raise ValueError("unencrypted AGENT_CORE_URL is only allowed on loopback")
-            context = _ssl.create_default_context(cafile=ca_cert or None)
-            payload = _json.dumps({
-                "action_id": action_id,
-                "status": status,
-                "result": result,
-                "tool": "gesture",
-                "ts": time.time(),
-            }).encode()
-            request = _urllib.Request(
-                f"{agent_core_url}/api/acp/complete",
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            _urllib.urlopen(
-                request,
-                timeout=GesturePlugin._ACP_CALLBACK_TIMEOUT_SEC,
-                context=context,
-            )
-        except Exception as exc:
-            print(f"[gesture] ACP callback failed for {action_id}: {exc}", flush=True)
 
 
 class _JointStreamBase:
