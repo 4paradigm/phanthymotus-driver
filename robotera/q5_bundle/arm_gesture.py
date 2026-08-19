@@ -353,11 +353,6 @@ class Plugin:
         if not status["ros_publisher_available"]:
             return _failure("ROS_UNAVAILABLE", "Q5 arm command publisher is unavailable", status=status)
 
-        if status.get("same_name_publisher_count", 0) > 1:
-            return _failure("DUPLICATE_BODY_PUBLISHER",
-                            "Multiple q5_body_command publishers detected on /wr1_controller/commands",
-                            status=status)
-
         if status["lifecycle_state"] != "active":
             return _failure("LIFECYCLE_NOT_ACTIVE", "Q5 motion_manager must be active", status=status)
 
