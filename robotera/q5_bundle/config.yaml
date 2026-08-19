@@ -30,7 +30,7 @@ plugins:
   diagnostics:
     enabled: false  # merged into robot_status
   simple_action:
-    enabled: true
+    enabled: false
   mic:
     enabled: true
     sample_rate_hz: 16000
