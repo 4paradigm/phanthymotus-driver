@@ -2501,6 +2501,7 @@ class HeadActuatorPlugin:
     _HOLD_DURATION_MAX_SEC = 30.0
     _ACP_TIMEOUT_SEC = 60.0
     _ACP_CALLBACK_TIMEOUT_SEC = 5.0
+    _READY_TIMEOUT_SEC = 10.0
 
     def __init__(self, config: dict, joint_plan: JointPlanPlugin, state: StatePlugin):
         self._config = config
@@ -2620,9 +2621,21 @@ class HeadActuatorPlugin:
             if "pitch_deg" not in args or "yaw_deg" not in args:
                 return {"error": "pitch_deg and yaw_deg are required"}
             try:
-                target = self._step(
-                    math.radians(float(args["pitch_deg"])), math.radians(float(args["yaw_deg"])), args
-                )
+                pitch_rad = math.radians(float(args["pitch_deg"]))
+                yaw_rad = math.radians(float(args["yaw_deg"]))
+                if not (math.isfinite(pitch_rad) and math.isfinite(yaw_rad)):
+                    raise ValueError("pitch_deg and yaw_deg must be finite")
+                if not (-self._PITCH_LIMIT <= pitch_rad <= self._PITCH_LIMIT):
+                    raise ValueError(
+                        f"pitch_deg must be between {math.degrees(-self._PITCH_LIMIT):.2f} "
+                        f"and {math.degrees(self._PITCH_LIMIT):.2f}"
+                    )
+                if not (-self._YAW_LIMIT <= yaw_rad <= self._YAW_LIMIT):
+                    raise ValueError(
+                        f"yaw_deg must be between {math.degrees(-self._YAW_LIMIT):.2f} "
+                        f"and {math.degrees(self._YAW_LIMIT):.2f}"
+                    )
+                target = self._step(pitch_rad, yaw_rad, args)
                 steps = [target]
                 if "duration" in args:
                     hold_duration = float(args["duration"])
@@ -2708,6 +2721,9 @@ class HeadActuatorPlugin:
 
         def run() -> None:
             try:
+                self._joint_plan.wait_until_idle(
+                    self._READY_TIMEOUT_SEC, self._cancel
+                )
                 for index, step in enumerate(steps, start=1):
                     if self._cancel.is_set():
                         break
