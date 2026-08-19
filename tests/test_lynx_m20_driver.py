@@ -27,7 +27,6 @@ def load(name, path):
 
 protocol = load("lynx_m20_basic_server", DRIVER / "basic_server.py")
 m20 = load("lynx_m20_contract", DRIVER / "device.py")
-nos_mapping = load("lynx_m20_nos_mapping", DRIVER / "nos_mapping.py")
 
 
 class FakeNative:
@@ -105,7 +104,7 @@ class LynxM20ContractTests(unittest.TestCase):
     def test_mapping_card_uses_only_documented_drmap_commands(self):
         class FakeMappingClient:
             def __init__(self): self.calls = []; self.state = "idle"
-            def validate_map_name(self, name): return nos_mapping.NOSMappingClient.validate_map_name(name)
+            def validate_map_name(self, name): return m20.NOSMappingClient.validate_map_name(name)
             def start_mapping(self, map_name, activate=True):
                 self.calls.append(("start", map_name, activate)); self.state = "mapping"; return {"state": "mapping"}
             def stop_mapping(self): self.calls.append(("stop",)); self.state = "idle"; return {"state": "saved"}
@@ -334,7 +333,7 @@ class LynxM20ContractTests(unittest.TestCase):
             calls.append((command, kwargs))
             return Completed()
 
-        client = nos_mapping.NOSMappingClient({
+        client = m20.NOSMappingClient({
             "host": "10.21.31.106",
             "user": "user",
             "identity_file": "/secrets/key",
@@ -363,7 +362,7 @@ class LynxM20ContractTests(unittest.TestCase):
         )
 
     def test_nos_helper_has_a_strict_command_allowlist(self):
-        helper = (DRIVER / "nos_mapping_helper.sh").read_text()
+        helper = (DRIVER / "README.md").read_text()
         self.assertIn('case "${action}" in', helper)
         self.assertIn('^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$', helper)
         self.assertIn('exec /usr/local/bin/drmap mapping -s -n "${map_name}"', helper)
@@ -379,7 +378,7 @@ class LynxM20ContractTests(unittest.TestCase):
             code, stdout = next(responses)
             return type("Completed", (), {"returncode": code, "stdout": stdout, "stderr": ""})()
 
-        client = nos_mapping.NOSMappingClient({}, runner=runner)
+        client = m20.NOSMappingClient({}, runner=runner)
         status = client.status()
         maps = client.list_maps()
         self.assertEqual(("mapping", "/var/opt/robot/data/maps/floor-1"), (status["state"], status["active_map"]))

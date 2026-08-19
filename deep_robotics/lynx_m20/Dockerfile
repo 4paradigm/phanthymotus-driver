@@ -17,7 +17,7 @@ RUN echo "${DEEP_ROBOTICS_MSG_SHA256}  /tmp/deep-robotics-msg.zip" | sha256sum -
     rm -rf /tmp/deep-robotics-msg.zip /tmp/deep-robotics-msg-unpacked
 WORKDIR /work
 COPY common/ /work/common/
-COPY main.py device.py basic_server.py nos_mapping.py config.yaml driver.yaml /work/deep_robotics/lynx_m20/
+COPY main.py device.py basic_server.py config.yaml driver.yaml /work/deep_robotics/lynx_m20/
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp ROS_LOCALHOST_ONLY=0 PYTHONUNBUFFERED=1 PYTHONPATH=/work
 EXPOSE 15716
 CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /lynx_m20_ws/install/setup.bash && python3 /work/deep_robotics/lynx_m20/main.py"]

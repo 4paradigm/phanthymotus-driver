@@ -36,14 +36,49 @@ Dockerfile 会在解压和编译前再次校验 SHA256。归档内保留上游 `
 
 默认 `model_variant: standard`。供应商文档明确建图、定位和内置导航仅 M20 Pro 支持，因此标准版不会注册导航工具。
 
-M20 Pro 的建图控制卡片默认关闭。启用后，Driver 使用专用 SSH 密钥连接 NOS，并通过根用户安装的 `nos_mapping_helper.sh` 只调用固定的 `drmap mapping`、`drmap stop_mapping` 及只读状态命令；密码和私钥不会写入配置或镜像。`start_mapping` 和 `stop_mapping` 会立即返回 `action_id`，实际 SSH 操作在后台执行，最终结果通过 Agent Core ACP completion 回调返回。
+M20 Pro 的建图控制卡片默认关闭。启用后，Driver 使用专用 SSH 密钥连接 NOS，并通过根用户安装的受限入口 `/usr/local/sbin/phanthy-m20-mapping` 只调用固定的 `drmap mapping`、`drmap stop_mapping` 及只读状态命令；密码和私钥不会写入配置或镜像。`start_mapping` 和 `stop_mapping` 会立即返回 `action_id`，实际 SSH 操作在后台执行，最终结果通过 Agent Core ACP completion 回调返回。
 
-在 NOS 上安装仓库内助手，并只放行该固定入口（请按实际仓库路径替换第一条命令的源文件）：
+在 NOS 上创建受限助手，并只放行该固定入口：
 
 ```bash
-sudo install -o root -g root -m 0755 \
-  deep_robotics/lynx_m20/nos_mapping_helper.sh \
-  /usr/local/sbin/phanthy-m20-mapping
+sudo tee /usr/local/sbin/phanthy-m20-mapping >/dev/null <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+usage() {
+    echo "usage: phanthy-m20-mapping start <map_name> <true|false> | stop" >&2
+    exit 64
+}
+
+action="${1:-}"
+case "${action}" in
+    start)
+        [ "$#" -eq 3 ] || usage
+        map_name="$2"
+        activate="$3"
+        [[ "${map_name}" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || {
+            echo "invalid map name" >&2
+            exit 65
+        }
+        case "${activate}" in
+            true)
+                exec /usr/local/bin/drmap mapping -s -n "${map_name}"
+                ;;
+            false)
+                exec /usr/local/bin/drmap mapping -s -n "${map_name}" -b
+                ;;
+            *) usage ;;
+        esac
+        ;;
+    stop)
+        [ "$#" -eq 1 ] || usage
+        exec /usr/local/bin/drmap stop_mapping
+        ;;
+    *) usage ;;
+esac
+EOF
+sudo chown root:root /usr/local/sbin/phanthy-m20-mapping
+sudo chmod 0755 /usr/local/sbin/phanthy-m20-mapping
 echo 'user ALL=(root) NOPASSWD: /usr/local/sbin/phanthy-m20-mapping *' \
   | sudo tee /etc/sudoers.d/phanthy-m20-mapping >/dev/null
 sudo chmod 0440 /etc/sudoers.d/phanthy-m20-mapping
