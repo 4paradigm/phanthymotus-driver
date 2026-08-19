@@ -45,10 +45,11 @@ class Q5BusBridgeTests(unittest.TestCase):
 
     def test_media_bridge_keeps_a_bounded_latest_frame_queue(self):
         source = Path(q5_bus_bridge.__file__.replace("q5_bus_bridge.py", "q5_media_bridge.py")).read_text()
-        self.assertIn("self._media_q = self._ctx.Queue(maxsize=16)", source)
-        self.assertIn("newest_media = {}", source)
-        self.assertIn('newest_media[media["kind"]] = media', source)
-        self.assertIn("for media in newest_media.values():", source)
+        self.assertIn('"rgb": self._ctx.Queue(maxsize=2)', source)
+        self.assertIn('"depth_jpeg": self._ctx.Queue(maxsize=2)', source)
+        self.assertIn('"pointcloud": self._ctx.Queue(maxsize=2)', source)
+        self.assertIn("for media_q in media_qs.values():", source)
+        self.assertIn("media_q.get_nowait()", source)
 
     def test_sensor_topic_contract_does_not_depend_on_vendor_side_publisher(self):
         declared = topic_out("/nvidia_desktop/q5/battery", "data/json")
