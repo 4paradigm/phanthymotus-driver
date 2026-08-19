@@ -89,13 +89,13 @@ proposal TTL 失效会立即触发 `StopMove`；只有在返回后用新的 odom
 样本确认零速，同一导航 lease 才能保留并接受下一条新鲜 proposal。安全、
 身份、序列、RPC 和停车确认类硬故障仍会解除武装。
 
-`loco.start` 只连接 proposal topic，保持物理停止且不授权任何任务。
-每次启动 Nav2 前，控制面必须调用 `authorize_navigation`，明确传入
-`nav_id`、`proposal_topic` 和 `proposal_schema`。同一活动任务的重复授权
-是幂等的，不能用新 ID 覆盖另一个活动任务。终止零速 proposal 会退役
-当前 ID；无需重启 Driver 或 Canvas 项目即可授权下一任务。
-`revoke_navigation` 用于授权失败、任务启动失败、取消或终态清理，会
-明确停车、确认零速并撤销任务授权。未授权 proposal 不会再自行建立 lease。
+`loco.start` 只订阅唯一 proposal topic，并保持物理停止。Driver 空闲时会先
+完整校验首条新鲜、合法、非零 proposal，再原子绑定其 `nav_id` 并执行该帧。
+当前任务期间，其他 ID 既不能替换 lease，也不能中断当前任务。终态零速
+proposal 或已确认的显式停止会退役当前 ID，但保留订阅以等待下一任务的
+首条 proposal。格式错误、过期、零速首包、终态首包、已退役 ID 和任务中
+异 ID proposal 都不能建立或替换 lease，因此连续导航不需要 Agent Core
+执行逐任务授权 action。
 
 `loco info` 会返回 proposal 计数、合并数、实测 RPC/队列时延、滚动
 RPC p50/p95/p99/max、逐原因拒绝统计及最近一次已确认停车。

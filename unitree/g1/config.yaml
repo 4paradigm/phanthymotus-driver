@@ -13,8 +13,8 @@ plugins:
     enabled: true
   loco:
     enabled: true
-    # Canvas start only subscribes to the N5 proposal topic. Each navigation
-    # task must call loco.authorize_navigation before proposals may execute.
+    # Canvas start subscribes to the sole N5 proposal topic. While idle, the
+    # first fresh legal nonzero proposal atomically binds its nav_id.
     velocity_proposal_enabled: true
     velocity_proposal_driver_authorized: true
     velocity_proposal_max_ttl_ms: 250

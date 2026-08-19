@@ -38,10 +38,8 @@ from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
 from pointcloud_utils import gravity_align_inplace
 from velocity_proposal import (
     DEFAULT_VELOCITY_PROPOSAL_TOPIC,
-    VELOCITY_PROPOSAL_SCHEMA,
     resolve_input_topic,
-    resolve_navigation_authorization,
-    resolve_navigation_nav_id,
+    resolve_optional_expected_nav_id,
     velocity_proposal_port,
 )
 
@@ -1308,13 +1306,13 @@ class LocoPlugin:
             "name": "loco",
             "type": "actuator",
             "multiInstance": False,
-            "description": "G1 locomotion control — explicit per-task navigation authorization, move, stop, set height, get state, wave/shake hand",
+            "description": "G1 locomotion control — move, stop, set height, get state, wave/shake hand",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["authorize_navigation", "revoke_navigation", "move", "stop_move", "set_stand_height", "get_fsm_id", "get_fsm_mode", "get_balance_mode", "get_swing_height", "get_stand_height", "get_phase", "wave_hand", "shake_hand"],
+                        "enum": ["move", "stop_move", "set_stand_height", "get_fsm_id", "get_fsm_mode", "get_balance_mode", "get_swing_height", "get_stand_height", "get_phase", "wave_hand", "shake_hand"],
                         "description": "Action to perform",
                     },
                     "vx":         {"type": "number", "description": "Forward velocity m/s [-1, 1]"},
@@ -1323,9 +1321,6 @@ class LocoPlugin:
                     "duration":   {"type": "number", "description": "Move duration in seconds. 0 or negative = move until explicit stop (default 0)"},
                     "height":     {"type": "number", "description": "Normalized height 0.0-1.0"},
                     "turn":       {"type": "boolean", "description": "Turn while waving (default false)"},
-                    "nav_id":     {"type": "string", "maxLength": 128, "description": "Unique navigation task authorization ID"},
-                    "proposal_topic": {"type": "string", "enum": [self._velocity_proposal_topic], "description": "Authorized velocity proposal topic"},
-                    "proposal_schema": {"type": "string", "enum": [VELOCITY_PROPOSAL_SCHEMA], "description": "Authorized velocity proposal schema"},
                 },
                 "required": ["action"],
                 "x-completion": {
@@ -1333,8 +1328,6 @@ class LocoPlugin:
                     "timeout": 60,
                 },
                 "x-action-params": {
-                    "authorize_navigation": {"params": ["nav_id", "proposal_topic", "proposal_schema"], "description": "Idempotently authorize one navigation task before Nav2 starts"},
-                    "revoke_navigation":    {"params": ["nav_id"], "description": "Revoke one navigation task and confirm physical stop"},
                     "move":             {"params": ["vx", "vy", "vyaw", "duration"], "description": "Move with specified velocities. duration>0 for timed move, 0 or negative for continuous until stop."},
                     "stop_move":        {"params": [],                                 "description": "Stop all movement immediately"},
                     "set_stand_height": {"params": ["height"],                         "description": "Set the robot's standing height (0.0-1.0)"},
@@ -1417,8 +1410,8 @@ class LocoPlugin:
         }
 
     def start(self) -> None:
-        # Driver startup remains disarmed. Canvas start only subscribes;
-        # authorize_navigation is the only per-task proposal arm path.
+        # Driver startup remains disarmed. Canvas action=start subscribes to
+        # the only proposal topic; the first fresh legal motion binds nav_id.
         pass
 
     def stop(self) -> None:
@@ -1428,13 +1421,10 @@ class LocoPlugin:
                 self._move_timer = None
             self._disconnect_velocity_proposal("driver_stop")
 
-    def _connect_velocity_proposal(
-        self,
-        args: dict,
-        expected_nav_id: str | None = None,
-    ) -> dict:
+    def _connect_velocity_proposal(self, args: dict) -> dict:
         try:
             topic = resolve_input_topic(args, self._velocity_proposal_topic)
+            expected_nav_id = resolve_optional_expected_nav_id(args)
         except ValueError as exc:
             self._client.StopMove()
             if self._smart_motion:
@@ -1454,7 +1444,10 @@ class LocoPlugin:
                 "topic_in": [self._velocity_proposal_port()],
             }
         result = self._smart_motion.bind_velocity_proposal(topic, expected_nav_id)
-        connected_ready = bool(result.get("connected"))
+        connected_ready = bool(
+            result.get("connected")
+            and (result.get("armed") or result.get("awaiting_nav_id"))
+        )
         if result.get("error") or not connected_ready:
             result = dict(result)
             fallback_stop_ret = None
@@ -1469,118 +1462,6 @@ class LocoPlugin:
             **result,
             "state": "ready" if connected_ready else "error",
             "topic_in": [self._velocity_proposal_port()],
-        }
-
-    def _authorize_navigation(self, args: dict) -> dict:
-        try:
-            nav_id, topic, schema = resolve_navigation_authorization(args)
-        except ValueError as exc:
-            return {
-                "state": "error",
-                "authorized": False,
-                "error": str(exc),
-                "topic_in": [self._velocity_proposal_port()],
-            }
-        if not self._smart_motion:
-            self._client.StopMove()
-            return {
-                "state": "error",
-                "authorized": False,
-                "error": "SmartMotion safety harness is required for navigation authorization",
-                "topic_in": [self._velocity_proposal_port()],
-            }
-        status = self._smart_motion.get_velocity_proposal_status()
-        active_nav_id = status.get("active_nav_id")
-        if active_nav_id == nav_id:
-            authorized = bool(status.get("driver_authorized"))
-            return {
-                **status,
-                "state": "ready" if authorized else "error",
-                "authorized": authorized,
-                "idempotent": True,
-                "nav_id": nav_id,
-                "proposal_topic": topic,
-                "proposal_schema": schema,
-                "topic_in": [self._velocity_proposal_port()],
-                **(
-                    {}
-                    if authorized
-                    else {"error": "navigation_authorization_transition_active"}
-                ),
-            }
-        if active_nav_id and active_nav_id != nav_id:
-            return {
-                **status,
-                "state": "error",
-                "authorized": False,
-                "error": "navigation_already_authorized",
-                "requested_nav_id": nav_id,
-                "topic_in": [self._velocity_proposal_port()],
-            }
-        result = self._connect_velocity_proposal(
-            {"input_topic": topic},
-            expected_nav_id=nav_id,
-        )
-        authorized = bool(
-            not result.get("error")
-            and result.get("driver_authorized")
-            and result.get("active_nav_id") == nav_id
-        )
-        return {
-            **result,
-            "state": "ready" if authorized else "error",
-            "authorized": authorized,
-            "idempotent": False,
-            "nav_id": nav_id,
-            "proposal_topic": topic,
-            "proposal_schema": schema,
-        }
-
-    def _revoke_navigation(self, args: dict) -> dict:
-        try:
-            nav_id = resolve_navigation_nav_id(args)
-        except ValueError as exc:
-            return {
-                "state": "error",
-                "revoked": False,
-                "error": str(exc),
-                "topic_in": [self._velocity_proposal_port()],
-            }
-        if not self._smart_motion:
-            stopped = self._disconnect_velocity_proposal("navigation_revoked")
-            return {**stopped, "revoked": not stopped.get("error"), "nav_id": nav_id}
-        status = self._smart_motion.get_velocity_proposal_status()
-        active_nav_id = status.get("active_nav_id")
-        if active_nav_id and active_nav_id != nav_id:
-            return {
-                **status,
-                "state": "error",
-                "revoked": False,
-                "error": "navigation_authorization_mismatch",
-                "requested_nav_id": nav_id,
-                "topic_in": [self._velocity_proposal_port()],
-            }
-        if not status.get("connected"):
-            return {
-                **status,
-                "state": "idle",
-                "revoked": True,
-                "already_revoked": True,
-                "nav_id": nav_id,
-                "topic_in": [self._velocity_proposal_port()],
-            }
-        result = self._disconnect_velocity_proposal("navigation_revoked")
-        revoked = bool(
-            not result.get("error")
-            and result.get("stop_confirmed") is True
-            and not result.get("connected")
-        )
-        return {
-            **result,
-            "state": "idle" if revoked else "error",
-            "revoked": revoked,
-            "already_revoked": False,
-            "nav_id": nav_id,
         }
 
     def _disconnect_velocity_proposal(self, reason: str) -> dict:
@@ -1680,10 +1561,6 @@ class LocoPlugin:
                 "topic_in": [self._velocity_proposal_port()],
                 **result,
             }
-        if action == "authorize_navigation":
-            return self._authorize_navigation(args)
-        if action == "revoke_navigation":
-            return self._revoke_navigation(args)
         if action == "move":
             vx   = float(args.get("vx",   0))
             vy   = float(args.get("vy",   0))

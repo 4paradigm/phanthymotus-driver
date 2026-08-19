@@ -220,17 +220,17 @@ class ProposalApplyDiagnosticsTest(unittest.TestCase):
         self.assertEqual(reset["watchdog_faults_by_reason"], {})
         self.assertIsNone(reset["first_rejection_reason"])
 
-    def test_explicit_new_lease_session_resets_unarmed_diagnostics(self):
+    def test_implicit_lease_session_starts_with_first_valid_proposal(self):
         diagnostics = ProposalApplyDiagnostics()
         diagnostics.begin_session(None)
         diagnostics.record_received(9.0)
         diagnostics.record_rejected("frame_mismatch")
-        diagnostics.begin_session("nav-explicit")
+        diagnostics.begin_session("nav-implicit")
         diagnostics.record_received(10.0)
 
         status = diagnostics.snapshot()
 
-        self.assertEqual(status["session_nav_id"], "nav-explicit")
+        self.assertEqual(status["session_nav_id"], "nav-implicit")
         self.assertEqual(status["received"], 1)
         self.assertEqual(status["first_received_monotonic"], 10.0)
         self.assertEqual(status["rejected"], 0)
@@ -381,6 +381,17 @@ class ObstacleRecoveryPolicyTest(unittest.TestCase):
                 has_proposal=True,
                 proposal_motion_active=True,
                 newly_disarmed=True,
+                recoverable_stop_active=False,
+            )
+        )
+
+    def test_idle_bootstrap_rejection_does_not_issue_redundant_stop(self):
+        self.assertFalse(
+            proposal_decision_requires_physical_stop(
+                "retired_nav_id_replay",
+                has_proposal=False,
+                proposal_motion_active=False,
+                newly_disarmed=False,
                 recoverable_stop_active=False,
             )
         )

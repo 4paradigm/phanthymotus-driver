@@ -172,7 +172,7 @@ class SmartMotionParentStopSequenceTest(unittest.TestCase):
             56,
         )
 
-    def test_unarmed_subscription_bind_forwards_missing_nav_id_to_child(self):
+    def test_implicit_subscription_bind_forwards_missing_nav_id_to_child(self):
         calls = []
         proxy = self.make_proxy(lambda: 0)
 
@@ -183,7 +183,7 @@ class SmartMotionParentStopSequenceTest(unittest.TestCase):
             return {
                 "connected": True,
                 "armed": False,
-                "awaiting_nav_id": False,
+                "awaiting_nav_id": True,
             }
 
         proxy._call = fake_call
@@ -193,7 +193,7 @@ class SmartMotionParentStopSequenceTest(unittest.TestCase):
         self.assertEqual(bind_call[0], "bind_velocity_proposal")
         self.assertIsNone(bind_call[1]["expected_nav_id"])
         self.assertTrue(result["connected"])
-        self.assertFalse(result["awaiting_nav_id"])
+        self.assertTrue(result["awaiting_nav_id"])
 
     def test_parent_stop_exception_is_forwarded_for_fail_closed_confirmation(self):
         def fail_stop():

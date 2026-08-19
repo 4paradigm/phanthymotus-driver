@@ -2819,6 +2819,17 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
             now,
             now_unix_ms=received_unix_ms,
         )
+        if not was_armed and proposal_gate.armed:
+            proposal_apply_diagnostics.begin_session(
+                proposal_gate.expected_nav_id
+            )
+            # begin_session resets pre-task counters. Preserve the proposal
+            # that atomically established this task as its first sample.
+            proposal_apply_diagnostics.record_received(now)
+            proposal_apply_diagnostics.record_proposal_arrival(
+                payload,
+                received_unix_ms,
+            )
         if decision.stop:
             if decision.reason != "proposal_zero":
                 proposal_apply_diagnostics.record_rejected(decision.reason)
@@ -2828,7 +2839,9 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
             newly_disarmed = was_armed and not proposal_gate.armed
             if proposal_decision_requires_physical_stop(
                 decision.reason,
-                decision.proposal is not None,
+                # Rejected bootstrap/replay samples arrive while already
+                # stopped and must not create a blocking StopMove backlog.
+                decision.proposal is not None and was_armed,
                 is_proposal_motion,
                 newly_disarmed,
                 proposal_gate.recoverable_stop_active,
@@ -3254,10 +3267,15 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                     )
             elif method == "stop":
                 with motion_command_lock:
-                    proposal_gate.disarm("manual_stop")
                     if state in (MotionState.NAVIGATING, MotionState.NAV_PAUSED):
                         do_stop_nav()
                     result = do_stop(cmd.get("reason", "command"))
+                    if result.get("stop_confirmed"):
+                        proposal_gate.release_after_confirmed_stop(
+                            "manual_stop"
+                        )
+                    else:
+                        proposal_gate.disarm("manual_stop_unconfirmed")
             elif method == "navigate_to":
                 with motion_command_lock:
                     proposal_gate.disarm("native_navigation_override")

@@ -123,12 +123,15 @@ class FakeSmartMotion:
         self.bound_topic = topic
         self.expected_nav_id = expected_nav_id or ""
         armed = expected_nav_id is not None
+        awaiting_nav_id = expected_nav_id is None
         return {
             "state": "connected",
             "connected": True,
             "armed": armed,
-            "awaiting_nav_id": False,
-            "nav_id_binding_mode": "explicit_authorization",
+            "awaiting_nav_id": awaiting_nav_id,
+            "nav_id_binding_mode": (
+                "control_plane" if armed else "first_valid_proposal"
+            ),
             "driver_authorized": armed,
             "topic": topic,
             "expected_nav_id": expected_nav_id,
@@ -145,10 +148,11 @@ class FakeSmartMotion:
         return result
 
     def get_velocity_proposal_status(self):
+        awaiting_nav_id = bool(self.bound_topic and not self.expected_nav_id)
         return {
             "connected": bool(self.bound_topic),
             "armed": bool(self.bound_topic and self.expected_nav_id),
-            "awaiting_nav_id": False,
+            "awaiting_nav_id": awaiting_nav_id,
             "driver_authorized": bool(
                 self.bound_topic and self.expected_nav_id
             ),
@@ -156,7 +160,11 @@ class FakeSmartMotion:
             "expected_nav_id": self.expected_nav_id or None,
             "active_nav_id": self.expected_nav_id or None,
             "nav_id_binding_mode": (
-                "explicit_authorization" if self.bound_topic else None
+                "control_plane"
+                if self.expected_nav_id
+                else "first_valid_proposal"
+                if self.bound_topic
+                else None
             ),
             "last_reason": self.last_reason,
             "proposal_execution": dict(self.proposal_execution),
@@ -184,22 +192,11 @@ class LocoTopicLifecycleTest(unittest.TestCase):
         self.assertEqual(
             tool["inputSchema"]["properties"]["action"]["enum"],
             [
-                "authorize_navigation", "revoke_navigation",
                 "move", "stop_move", "set_stand_height", "get_fsm_id",
                 "get_fsm_mode", "get_balance_mode", "get_swing_height",
                 "get_stand_height", "get_phase", "wave_hand", "shake_hand",
             ],
         )
-        action_params = tool["inputSchema"]["x-action-params"]
-        self.assertEqual(
-            action_params["authorize_navigation"]["params"],
-            ["nav_id", "proposal_topic", "proposal_schema"],
-        )
-        self.assertEqual(
-            action_params["revoke_navigation"]["params"],
-            ["nav_id"],
-        )
-
     def test_start_info_stop_owns_real_subscription_lifecycle(self):
         started = self.plugin.dispatch(
             "start",
@@ -250,56 +247,43 @@ class LocoTopicLifecycleTest(unittest.TestCase):
         self.assertTrue(started["connected"])
         self.assertEqual(self.smart_motion.bound_topic, self.topic)
 
-    def test_start_subscribes_but_does_not_authorize_navigation(self):
+    def test_start_subscribes_and_waits_for_first_valid_proposal(self):
         result = self.plugin.dispatch("start", {"input_topic": self.topic})
 
         self.assertEqual(result["state"], "ready")
         self.assertTrue(result["connected"])
         self.assertFalse(result["armed"])
-        self.assertFalse(result["awaiting_nav_id"])
+        self.assertTrue(result["awaiting_nav_id"])
         self.assertEqual(
             result["nav_id_binding_mode"],
-            "explicit_authorization",
+            "first_valid_proposal",
         )
         self.assertEqual(self.smart_motion.bound_topic, self.topic)
         self.assertEqual(self.smart_motion.expected_nav_id, "")
         self.assertEqual(self.client.stop_count, 0)
 
-    def test_legacy_start_expected_nav_id_cannot_authorize_a_task(self):
+    def test_explicit_start_expected_nav_id_remains_strictly_prebound(self):
         result = self.plugin.dispatch(
             "start",
             {"input_topic": self.topic, "expected_nav_id": self.nav_id},
         )
 
         self.assertTrue(result["connected"])
-        self.assertFalse(result["armed"])
-        self.assertFalse(result["driver_authorized"])
-        self.assertIsNone(result["active_nav_id"])
-        self.assertEqual(self.smart_motion.expected_nav_id, "")
+        self.assertTrue(result["armed"])
+        self.assertTrue(result["driver_authorized"])
+        self.assertEqual(result["active_nav_id"], self.nav_id)
+        self.assertEqual(result["nav_id_binding_mode"], "control_plane")
+        self.assertEqual(self.smart_motion.expected_nav_id, self.nav_id)
 
     def test_fake_smart_motion_matches_internal_subscription_contract(self):
         empty = self.smart_motion.bind_velocity_proposal(self.topic, "")
 
         self.assertTrue(empty["connected"])
         self.assertFalse(empty["armed"])
-        self.assertFalse(empty["awaiting_nav_id"])
+        self.assertTrue(empty["awaiting_nav_id"])
+        self.assertEqual(empty["nav_id_binding_mode"], "first_valid_proposal")
         with self.assertRaises(ValueError):
             self.smart_motion.bind_velocity_proposal(self.topic, 123)
-
-    def test_authorize_navigation_rejects_invalid_nav_id(self):
-        self.plugin.dispatch("start", {"input_topic": self.topic})
-        result = self.plugin.dispatch(
-            "authorize_navigation",
-            {
-                "nav_id": 123,
-                "proposal_topic": self.topic,
-                "proposal_schema": "phanthy.navigation.velocity_proposal.v1",
-            },
-        )
-
-        self.assertEqual(result["state"], "error")
-        self.assertFalse(result["authorized"])
-        self.assertEqual(result["error"], "invalid_nav_id")
 
     def test_start_preserves_stop_confirmation_diagnostics_on_failure(self):
         diagnostics = {
@@ -313,7 +297,6 @@ class LocoTopicLifecycleTest(unittest.TestCase):
             "odometry_callbacks_since_confirmation": 1,
             "confirmation_timed_out": True,
         }
-        self.plugin.dispatch("start", {"input_topic": self.topic})
         self.smart_motion.bind_result = {
             "error": "StopMove/odometry stop was not confirmed before proposal bind",
             "connected": False,
@@ -325,11 +308,10 @@ class LocoTopicLifecycleTest(unittest.TestCase):
         }
 
         result = self.plugin.dispatch(
-            "authorize_navigation",
+            "start",
             {
-                "nav_id": self.nav_id,
-                "proposal_topic": self.topic,
-                "proposal_schema": "phanthy.navigation.velocity_proposal.v1",
+                "input_topic": self.topic,
+                "expected_nav_id": self.nav_id,
             },
         )
 
@@ -347,7 +329,6 @@ class LocoTopicLifecycleTest(unittest.TestCase):
             "stop_move_error": None,
             "confirmation_timed_out": False,
         }
-        self.plugin.dispatch("start", {"input_topic": self.topic})
         self.smart_motion.bind_result = {
             "error": "StopMove/odometry stop was not confirmed before proposal bind",
             "connected": False,
@@ -360,11 +341,10 @@ class LocoTopicLifecycleTest(unittest.TestCase):
         self.client.stop_error = RuntimeError("fallback unavailable")
 
         result = self.plugin.dispatch(
-            "authorize_navigation",
+            "start",
             {
-                "nav_id": self.nav_id,
-                "proposal_topic": self.topic,
-                "proposal_schema": "phanthy.navigation.velocity_proposal.v1",
+                "input_topic": self.topic,
+                "expected_nav_id": self.nav_id,
             },
         )
 
@@ -412,144 +392,6 @@ class LocoTopicLifecycleTest(unittest.TestCase):
         self.assertEqual(result["state"], "error")
         self.assertFalse(result["connected"])
         self.assertEqual(self.client.stop_count, 1)
-
-    def _authorize(self, nav_id=None, **changes):
-        args = {
-            "nav_id": nav_id or self.nav_id,
-            "proposal_topic": self.topic,
-            "proposal_schema": "phanthy.navigation.velocity_proposal.v1",
-        }
-        args.update(changes)
-        return self.plugin.dispatch("authorize_navigation", args)
-
-    def test_explicit_authorization_is_idempotent_and_does_not_rebind(self):
-        self.plugin.dispatch("start", {"input_topic": self.topic})
-
-        first = self._authorize()
-        bind_count = len(self.smart_motion.bind_calls)
-        second = self._authorize()
-
-        self.assertTrue(first["authorized"])
-        self.assertFalse(first["idempotent"])
-        self.assertTrue(second["authorized"])
-        self.assertTrue(second["idempotent"])
-        self.assertEqual(len(self.smart_motion.bind_calls), bind_count)
-
-    def test_duplicate_authorization_during_stop_transition_does_not_rebind(self):
-        self.plugin.dispatch("start", {"input_topic": self.topic})
-        self.assertTrue(self._authorize()["authorized"])
-        bind_count = len(self.smart_motion.bind_calls)
-        original_status = self.smart_motion.get_velocity_proposal_status
-
-        def transition_status():
-            status = original_status()
-            status["driver_authorized"] = False
-            status["stop_transition_active"] = True
-            return status
-
-        self.smart_motion.get_velocity_proposal_status = transition_status
-        result = self._authorize()
-
-        self.assertEqual(result["state"], "error")
-        self.assertFalse(result["authorized"])
-        self.assertTrue(result["idempotent"])
-        self.assertEqual(
-            result["error"],
-            "navigation_authorization_transition_active",
-        )
-        self.assertEqual(len(self.smart_motion.bind_calls), bind_count)
-
-    def test_authorization_requires_exact_topic_and_schema(self):
-        self.plugin.dispatch("start", {"input_topic": self.topic})
-
-        missing_schema = self.plugin.dispatch(
-            "authorize_navigation",
-            {"nav_id": self.nav_id, "proposal_topic": self.topic},
-        )
-        wrong_topic = self._authorize(proposal_topic="/other")
-
-        self.assertEqual(missing_schema["error"], "proposal_schema_required")
-        self.assertEqual(wrong_topic["error"], "unexpected_velocity_proposal_topic")
-        self.assertFalse(self.smart_motion.expected_nav_id)
-
-    def test_new_nav_id_requires_revoke_while_another_task_is_active(self):
-        self.plugin.dispatch("start", {"input_topic": self.topic})
-        self.assertTrue(self._authorize()["authorized"])
-
-        rejected = self._authorize("nav-002")
-
-        self.assertEqual(rejected["error"], "navigation_already_authorized")
-        self.assertEqual(rejected["active_nav_id"], self.nav_id)
-        self.assertEqual(self.smart_motion.expected_nav_id, self.nav_id)
-
-    def test_terminal_task_can_be_followed_by_new_explicit_authorization(self):
-        self.plugin.dispatch("start", {"input_topic": self.topic})
-        self.assertTrue(self._authorize()["authorized"])
-        self.smart_motion.expected_nav_id = ""
-        self.smart_motion.last_reason = "nav_task_terminal"
-
-        next_task = self._authorize("nav-002")
-
-        self.assertTrue(next_task["authorized"])
-        self.assertEqual(next_task["active_nav_id"], "nav-002")
-        self.assertEqual(self.smart_motion.expected_nav_id, "nav-002")
-
-    def test_revoke_navigation_is_idempotent_and_checks_active_identity(self):
-        self.plugin.dispatch("start", {"input_topic": self.topic})
-        self.assertTrue(self._authorize()["authorized"])
-
-        mismatch = self.plugin.dispatch(
-            "revoke_navigation", {"nav_id": "nav-002"}
-        )
-        revoked = self.plugin.dispatch(
-            "revoke_navigation", {"nav_id": self.nav_id}
-        )
-        repeated = self.plugin.dispatch(
-            "revoke_navigation", {"nav_id": self.nav_id}
-        )
-
-        self.assertEqual(mismatch["error"], "navigation_authorization_mismatch")
-        self.assertFalse(mismatch["revoked"])
-        self.assertTrue(revoked["revoked"])
-        self.assertFalse(revoked["already_revoked"])
-        self.assertTrue(repeated["revoked"])
-        self.assertTrue(repeated["already_revoked"])
-
-    def test_terminal_cleanup_can_explicitly_revoke_remaining_subscription(self):
-        self.plugin.dispatch("start", {"input_topic": self.topic})
-        self.assertTrue(self._authorize()["authorized"])
-        self.smart_motion.expected_nav_id = ""
-        self.smart_motion.last_reason = "nav_task_terminal"
-
-        result = self.plugin.dispatch(
-            "revoke_navigation", {"nav_id": self.nav_id}
-        )
-
-        self.assertTrue(result["revoked"])
-        self.assertFalse(result["connected"])
-        self.assertTrue(result["stop_confirmed"])
-
-    def test_unconfirmed_revoke_reports_failure_and_retains_subscription(self):
-        self.plugin.dispatch("start", {"input_topic": self.topic})
-        self.assertTrue(self._authorize()["authorized"])
-        self.smart_motion.unbind_result = {
-            "state": "error",
-            "connected": True,
-            "stop_confirmed": False,
-            "error": "fresh zero-odometry stop was not confirmed",
-        }
-
-        result = self.plugin.dispatch(
-            "revoke_navigation", {"nav_id": self.nav_id}
-        )
-
-        self.assertFalse(result["revoked"])
-        self.assertEqual(result["state"], "error")
-        self.assertTrue(result["connected"])
-        self.assertEqual(
-            result["error"],
-            "fresh zero-odometry stop was not confirmed",
-        )
 
     def test_unconfirmed_stop_falls_back_and_blocks_mode_switch(self):
         self.smart_motion.bound_topic = self.topic

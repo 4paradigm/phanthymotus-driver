@@ -93,15 +93,15 @@ coalesced instead of backlogged. A proposal TTL lapse immediately triggers
 same navigation lease recoverable for the next fresh proposal. Hard safety,
 identity, sequence, RPC, and stop-confirmation faults still disarm the lease.
 
-`loco.start` only connects the proposal topic and remains physically stopped
-and unauthorized. Before each Nav2 task, the control plane must call
-`authorize_navigation` with `nav_id`, `proposal_topic`, and `proposal_schema`.
-The action is idempotent for the same active task and rejects attempts to
-replace another active task. A terminal zero proposal retires that ID; the
-next task can be authorized without restarting the Driver or Canvas project.
-`revoke_navigation` explicitly stops, confirms zero odometry, and removes the
-task authorization on authorization failure, task-start failure, cancellation,
-or terminal cleanup. Unarmed proposals never establish a lease by themselves.
+`loco.start` connects the sole proposal topic and remains physically stopped.
+While idle, the Driver validates the first fresh, legal, nonzero proposal and
+atomically binds its `nav_id` before executing that same proposal. Another ID
+cannot replace or interrupt the active task. A terminal zero proposal or a
+confirmed explicit stop retires the active ID while keeping the subscription
+ready for the next task's first proposal. Invalid, stale, zero bootstrap,
+terminal bootstrap, retired-ID, and mid-task mismatched-ID proposals never
+establish or replace a lease, so Agent Core needs no per-task authorization
+action for consecutive navigation tasks.
 
 `loco info` exposes proposal counters, the coalesced count, measured RPC and
 queue latency, rolling RPC p50/p95/p99/max values, rejection reasons, and the

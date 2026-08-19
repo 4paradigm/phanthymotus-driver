@@ -13,8 +13,6 @@ from velocity_proposal import (
     VelocityProposalValidationError,
     resolve_expected_nav_id,
     resolve_input_topic,
-    resolve_navigation_authorization,
-    resolve_navigation_nav_id,
     resolve_optional_expected_nav_id,
     validate_velocity_proposal,
     velocity_proposal_port,
@@ -102,7 +100,7 @@ class TopicResolutionTest(unittest.TestCase):
             with self.subTest(args=args), self.assertRaises(ValueError):
                 resolve_expected_nav_id(args)
 
-    def test_optional_internal_nav_id_supports_unarmed_subscription(self):
+    def test_optional_control_plane_nav_id_supports_implicit_subscription(self):
         self.assertIsNone(resolve_optional_expected_nav_id({}))
         self.assertIsNone(
             resolve_optional_expected_nav_id({"expected_nav_id": ""})
@@ -115,35 +113,6 @@ class TopicResolutionTest(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             resolve_optional_expected_nav_id({"expected_nav_id": 123})
-
-    def test_resolves_public_navigation_authorization_contract(self):
-        self.assertEqual(
-            resolve_navigation_authorization({
-                "nav_id": " nav-001 ",
-                "proposal_topic": EXPECTED_TOPIC,
-                "proposal_schema": "phanthy.navigation.velocity_proposal.v1",
-            }),
-            (
-                "nav-001",
-                EXPECTED_TOPIC,
-                "phanthy.navigation.velocity_proposal.v1",
-            ),
-        )
-        self.assertEqual(resolve_navigation_nav_id({"nav_id": " nav-2 "}), "nav-2")
-
-    def test_rejects_incomplete_or_mismatched_navigation_authorization(self):
-        cases = (
-            ({}, "nav_id_required"),
-            ({"nav_id": 1}, "invalid_nav_id"),
-            ({"nav_id": "nav-1"}, "proposal_topic_required"),
-            ({"nav_id": "nav-1", "proposal_topic": "/other"}, "unexpected_velocity_proposal_topic"),
-            ({"nav_id": "nav-1", "proposal_topic": EXPECTED_TOPIC}, "proposal_schema_required"),
-            ({"nav_id": "nav-1", "proposal_topic": EXPECTED_TOPIC, "proposal_schema": "v2"}, "unexpected_velocity_proposal_schema"),
-        )
-        for args, reason in cases:
-            with self.subTest(args=args), self.assertRaisesRegex(ValueError, reason):
-                resolve_navigation_authorization(args)
-
 
 class ProposalValidationTest(unittest.TestCase):
     def setUp(self):
@@ -248,40 +217,148 @@ class ProposalGateTest(unittest.TestCase):
         self.gate = VelocityProposalGate(ProposalLimits())
         self.gate.bind(EXPECTED_TOPIC, "nav-001")
 
-    def test_first_packet_must_match_control_plane_nav_lease(self):
+    def test_mismatched_packet_cannot_replace_control_plane_nav_lease(self):
         rejected = self.gate.accept(
             proposal(nav_id="attacker-selected", sequence=1), now=10.0
         )
-        self.assertTrue(rejected.stop)
+        self.assertFalse(rejected.stop)
+        self.assertFalse(rejected.execute)
         self.assertEqual(rejected.reason, "nav_id_mismatch")
-        self.assertFalse(self.gate.armed)
+        self.assertTrue(self.gate.armed)
+        self.assertEqual(self.gate.expected_nav_id, "nav-001")
 
-    def test_subscription_without_authorization_rejects_all_proposals(self):
+    def test_first_fresh_legal_nonzero_proposal_binds_and_executes(self):
         gate = VelocityProposalGate(ProposalLimits())
         gate.bind(EXPECTED_TOPIC)
 
         waiting = gate.snapshot(10.0)
         self.assertTrue(waiting["connected"])
         self.assertFalse(waiting["armed"])
-        self.assertFalse(waiting["awaiting_nav_id"])
+        self.assertTrue(waiting["awaiting_nav_id"])
         self.assertEqual(
             waiting["nav_id_binding_mode"],
-            "explicit_authorization",
+            "first_valid_proposal",
         )
 
-        rejected = gate.accept(
+        accepted = gate.accept(
             proposal(sequence=7, issued_at_unix_ms=1_000),
             now=10.0,
             now_unix_ms=1_050,
         )
 
-        self.assertFalse(rejected.execute)
-        self.assertTrue(rejected.stop)
-        self.assertEqual(rejected.reason, "navigation_not_authorized")
-        self.assertEqual(gate.expected_nav_id, "")
-        self.assertFalse(gate.armed)
+        self.assertTrue(accepted.execute)
+        self.assertEqual(gate.expected_nav_id, "nav-001")
+        self.assertTrue(gate.armed)
         self.assertFalse(gate.awaiting_nav_id)
-        self.assertEqual(gate.last_sequence, -1)
+        self.assertEqual(gate.last_sequence, 7)
+
+    def test_invalid_stale_zero_and_terminal_bootstrap_do_not_bind(self):
+        gate = VelocityProposalGate(ProposalLimits())
+        gate.bind(EXPECTED_TOPIC)
+
+        cases = (
+            (
+                gate.accept(proposal(frame="map"), now=10.0),
+                "frame_mismatch",
+            ),
+            (
+                gate.accept(
+                    proposal(issued_at_unix_ms=1_000),
+                    now=10.1,
+                    now_unix_ms=1_201,
+                ),
+                "proposal_ttl_expired",
+            ),
+            (
+                gate.accept(
+                    proposal(
+                        sequence=2,
+                        velocity={"x": 0.0, "y": 0.0, "yaw": 0.0},
+                    ),
+                    now=10.2,
+                ),
+                "bootstrap_nonzero_proposal_required",
+            ),
+            (
+                gate.accept(
+                    proposal(
+                        sequence=3,
+                        nav_status="arrived",
+                        velocity={"x": 0.0, "y": 0.0, "yaw": 0.0},
+                    ),
+                    now=10.3,
+                ),
+                "bootstrap_nonzero_proposal_required",
+            ),
+        )
+        for decision, reason in cases:
+            with self.subTest(reason=reason):
+                self.assertTrue(decision.stop)
+                self.assertEqual(decision.reason, reason)
+                self.assertFalse(gate.armed)
+                self.assertTrue(gate.awaiting_nav_id)
+
+    def test_mid_task_other_nav_id_is_rejected_without_interrupting_active_task(self):
+        gate = VelocityProposalGate(ProposalLimits())
+        gate.bind(EXPECTED_TOPIC)
+        self.assertTrue(gate.accept(proposal(sequence=1), now=10.0).execute)
+
+        rejected = gate.accept(
+            proposal(nav_id="nav-002", sequence=2),
+            now=10.1,
+        )
+
+        self.assertFalse(rejected.stop)
+        self.assertFalse(rejected.execute)
+        self.assertEqual(rejected.reason, "nav_id_mismatch")
+        self.assertTrue(gate.armed)
+        self.assertEqual(gate.expected_nav_id, "nav-001")
+        self.assertEqual(gate.last_sequence, 1)
+
+    def test_terminal_releases_for_next_new_nav_id_and_rejects_replay(self):
+        gate = VelocityProposalGate(ProposalLimits())
+        gate.bind(EXPECTED_TOPIC)
+        self.assertTrue(gate.accept(proposal(sequence=1), now=10.0).execute)
+
+        terminal = gate.accept(
+            proposal(
+                sequence=2,
+                nav_status="arrived",
+                velocity={"x": 0.0, "y": 0.0, "yaw": 0.0},
+            ),
+            now=10.1,
+        )
+        self.assertTrue(terminal.stop)
+        self.assertFalse(gate.armed)
+        self.assertTrue(gate.awaiting_nav_id)
+
+        replay = gate.accept(proposal(sequence=3), now=10.2)
+        self.assertEqual(replay.reason, "retired_nav_id_replay")
+        self.assertTrue(gate.awaiting_nav_id)
+
+        next_task = gate.accept(
+            proposal(nav_id="nav-002", sequence=1),
+            now=10.3,
+        )
+        self.assertTrue(next_task.execute)
+        self.assertEqual(gate.expected_nav_id, "nav-002")
+
+    def test_confirmed_manual_stop_releases_for_next_task(self):
+        gate = VelocityProposalGate(ProposalLimits())
+        gate.bind(EXPECTED_TOPIC)
+        self.assertTrue(gate.accept(proposal(sequence=1), now=10.0).execute)
+
+        gate.release_after_confirmed_stop()
+
+        self.assertFalse(gate.armed)
+        self.assertTrue(gate.awaiting_nav_id)
+        self.assertIn("nav-001", gate.retired_nav_ids)
+        self.assertTrue(
+            gate.accept(
+                proposal(nav_id="nav-002", sequence=1),
+                now=10.1,
+            ).execute
+        )
 
     def test_sequence_must_strictly_increase_for_active_nav(self):
         first = self.gate.accept(proposal(sequence=10), now=100.0)
@@ -296,8 +373,10 @@ class ProposalGateTest(unittest.TestCase):
     def test_nav_id_cannot_change_mid_task(self):
         self.assertTrue(self.gate.accept(proposal(), now=10.0).execute)
         rejected = self.gate.accept(proposal(nav_id="nav-002", sequence=2), now=10.1)
-        self.assertTrue(rejected.stop)
+        self.assertFalse(rejected.stop)
+        self.assertFalse(rejected.execute)
         self.assertEqual(rejected.reason, "nav_id_mismatch")
+        self.assertTrue(self.gate.armed)
 
     def test_terminal_zero_retires_and_disarms_nav_lease(self):
         self.assertTrue(self.gate.accept(proposal(), now=10.0).execute)
