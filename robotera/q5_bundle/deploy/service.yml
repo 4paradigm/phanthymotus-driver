@@ -3,6 +3,8 @@ robotera-q5:
   container_name: embodied-robotera-q5
   network_mode: host
   privileged: true
+  env_file:
+    - /opt/phanthy-motus/.env
   volumes:
     - /opt/phanthy-motus/data:/opt/phanthy-motus/data
     - /home/nvidia/teleop_client/install:/opt/teleop_client/install:ro
@@ -10,8 +12,6 @@ robotera-q5:
   environment:
     - Q5_ROS_DOMAIN_ID=211
     - AGENT_CORE_ROS_DOMAIN_ID=42
-    # Pass through the Agent Core access token when API authentication is enabled.
-    - ACCESS_TOKEN=${ACCESS_TOKEN:-}
     - Q5_CYCLONEDDS_URI=file:///etc/cyclonedds/q5.xml
     - ROS_LOCALHOST_ONLY=0
     - PYTHONUNBUFFERED=1
