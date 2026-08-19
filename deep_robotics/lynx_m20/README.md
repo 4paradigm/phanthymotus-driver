@@ -24,7 +24,7 @@ Dockerfile 会在解压和编译前再次校验 SHA256。归档内保留上游 `
 ## 已实现接口
 
 - `basic_server` 原生协议：TCP `10.21.31.103:30001` 可靠指令与 1 Hz 心跳，UDP `10.21.31.103:30000` 高频运动指令；包含官方 16 字节帧头、JSON ASDU、响应关联与状态上报缓存。
-- ROS 2 / Fast DDS：`/MOTION_STATE`、`/GAIT`、`/NAV_CMD`、`/MOTION_INFO`、`/IMU`、前后雷达、硬急停、选配充电和 GNSS。
+- ROS 2 / Fast DDS：`/MOTION_STATE`、`/GAIT`、`/NAV_CMD`、`/MOTION_INFO`、`/IMU`、融合雷达点云、硬急停、选配充电和 GNSS。当前固件的前后原始雷达使用无法与 rclpy 匹配的 vendor DDS writer，因此 `lidar` 使用实时 ROS 兼容话题 `/grid_map_3d`，不虚构两路独立输出。
 - 运动：起立、趴下、软急停、4 种官方步态、归一化轴控制、导航速度与停止。`axis`/`velocity` 支持 `duration`：留空默认 1 秒，大于 0 时持续刷新并到期自动归零，明确设为 0 时持续到独立 `stop`；底层 0.5 秒失联看门狗保持生效。ROS 2 起立会按文档等待反馈后执行 `state=1 → state=17`。
 - 运动事件：新增只读 `motion_events` Sensor，发布动作请求/接受、真实运动状态与步态变化、运动开始/更新/停止、定时结束和命令失败；请求接受与真实反馈确认分开记录。
 - 选配自主充电：开始、退出和异常强制复位。

@@ -157,7 +157,7 @@ class LynxM20ContractTests(unittest.TestCase):
             streams = {
                 "motion_info": {"robot_topic": "/MOTION_INFO", "topic": "/host/lynx_m20/motion_info", "format": "data/json"},
                 "imu": {"robot_topic": "/IMU", "topic": "/host/lynx_m20/imu", "format": "data/json"},
-                "lidar": {"robot_topic": "/LIDAR/POINTS", "topic": "/host/lynx_m20/lidar", "format": "sensor/pointcloud"},
+                "lidar": {"robot_topic": "/grid_map_3d", "topic": "/host/lynx_m20/lidar", "format": "sensor/pointcloud"},
             }
             rtsp_streams = {
                 "camera_front": {"url": "rtsp://10.21.31.103:8554/video1", "format": "video/h265"},
@@ -209,10 +209,10 @@ class LynxM20ContractTests(unittest.TestCase):
         self.assertIn('("imu", Imu, "/IMU", "data/json"', source)
         self.assertIn("core_msg_type = String if as_json else UInt8MultiArray if as_pointcloud else msg_type", source)
 
-    def test_lidar_streams_use_canvas_pointcloud_format(self):
+    def test_fused_lidar_stream_uses_live_ros_compatible_topic(self):
         source = (DRIVER / "device.py").read_text()
-        self.assertIn('("lidar", PointCloud2, "/LIDAR/POINTS", "sensor/pointcloud"', source)
-        self.assertIn('("lidar_rear", PointCloud2, "/LIDAR/POINTS2", "sensor/pointcloud"', source)
+        self.assertIn('("lidar", PointCloud2, "/grid_map_3d", "sensor/pointcloud"', source)
+        self.assertNotIn('("lidar_rear", PointCloud2', source)
         self.assertNotIn('"pointcloud/ros2"', source)
 
     def test_lidar_pointcloud_is_encoded_for_canvas_renderer(self):
@@ -351,7 +351,7 @@ class LynxM20ContractTests(unittest.TestCase):
     def test_ros2_uses_official_fastdds_topics_and_pinned_drdds(self):
         config = (DRIVER / "config.yaml").read_text()
         dockerfile = (DRIVER / "Dockerfile").read_text()
-        for topic in ("/MOTION_STATE", "/GAIT", "/NAV_CMD", "/MOTION_INFO", "/IMU", "/LIDAR/POINTS", "/HES_STATUS", "/CHARGE", "/JOINTS_DATA"):
+        for topic in ("/MOTION_STATE", "/GAIT", "/NAV_CMD", "/MOTION_INFO", "/IMU", "/grid_map_3d", "/HES_STATUS", "/CHARGE", "/JOINTS_DATA"):
             self.assertIn(topic, config)
         self.assertIn("rmw_fastrtps_cpp", dockerfile)
         self.assertIn("a0d1a29eec5c4db5a9107595bb51e3be8122b86c", dockerfile)
