@@ -13,7 +13,11 @@ plugins:
     gain: 50
   speaker:
     enabled: true
-    # 输入音频 topic：不写则默认接 /{namespace}/mic/audio；如需接 remote_audio，可在此显式覆写。
+    # 输入音频 topic 列表：默认同时订阅 /{namespace}/mic/audio（mic 直连）和
+    # /remote_control/audio（remote_audio 上传），画布两条线都能接，收到即播。
+    # 如需自定义，可在此显式覆写：
+    # input_topics: ["/bumi/mic/audio", "/remote_control/audio"]
+    # 单 topic 也兼容旧写法 input_topic: "/remote_control/audio"
   camera:
     enabled: true
   motion_state:

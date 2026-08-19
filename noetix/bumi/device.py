@@ -1034,9 +1034,19 @@ class SpeakerPlugin:
         self._executor = executor
         executor.add_node(self._node)
         self._playing = False
-        self._sub = None
-        # 输入音频 topic：默认跟随本机 mic 直连；如需接 remote_audio，可在 config 中覆写。
-        self._input_topic = plugin_config.get("input_topic") or f"/{namespace}/mic/audio"
+        self._subs = []
+        # 输入音频 topic 列表：默认同时订阅 mic 直连 + remote_audio，两条链路都能播。
+        # config 可用 input_topics（列表）覆写；input_topic（单串）兼容旧写法。
+        raw = (
+            plugin_config.get("input_topics")
+            or ([plugin_config["input_topic"]] if plugin_config.get("input_topic") else [])
+            or [f"/{namespace}/mic/audio", "/remote_control/audio"]
+        )
+        topics: list[str] = []
+        for t in raw:
+            if t and t not in topics:
+                topics.append(t)
+        self._input_topics = topics
 
     def get_tool(self) -> dict:
         return {
@@ -1044,7 +1054,7 @@ class SpeakerPlugin:
             "type": "actuator",
             "multiInstance": False,
             "description": (
-                "Bumi speaker — auto-plays audio stream received on the input topic "
+                "Bumi speaker — auto-plays audio stream received on any subscribed input topic "
                 "(no play button; start() subscribes and plays immediately on data). "
                 "Volume control, wake/sleep."
             ),
@@ -1089,12 +1099,12 @@ class SpeakerPlugin:
                     },
                 },
             },
-            "topic_in": [{"topic": self._input_topic, "format": "audio/pcm-16k"}],
+            "topic_in": [{"topic": t, "format": "audio/pcm-16k"} for t in self._input_topics],
             "topic_out": [],
         }
 
     def start(self) -> None:
-        """启动即订阅输入 topic，收到音频流立即播放（不再需要手动 play）。"""
+        """启动即订阅所有输入 topic，收到任何一路音频流立即播放（不再需要手动 play）。"""
         self._playing = True
 
         # Wake up the audio agent before playback (per SDK test_media.py)
@@ -1113,7 +1123,7 @@ class SpeakerPlugin:
             self._audio_queue = queue.Queue()
             self._start_play_loop()
 
-        # 订阅输入 topic，收到数据立即入队播放
+        # 订阅所有输入 topic，收到任何一路数据立即入队播放
         def _on_audio(msg):
             if not self._playing:
                 return
@@ -1122,18 +1132,23 @@ class SpeakerPlugin:
             except Exception as e:
                 self._node.get_logger().warn(f"Speaker enqueue error: {e}")
 
-        if self._sub is None:
-            self._sub = self._node.create_subscription(AudioChunk, self._input_topic, _on_audio, _LOW_LAT_QOS)
+        if not self._subs:
+            for t in self._input_topics:
+                sub = self._node.create_subscription(AudioChunk, t, _on_audio, _LOW_LAT_QOS)
+                self._subs.append(sub)
 
     def stop(self) -> None:
         self._playing = False
+        for sub in self._subs:
+            self._node.destroy_subscription(sub)
+        self._subs = []
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         args.pop('_tool_name', None)
 
         if action == "start":
             self.start()
-            return {"state": "playing", "input_topic": self._input_topic}
+            return {"state": "playing", "input_topics": self._input_topics}
         if action == "stop":
             self._playing = False
             self._media_ctrl.pause_audio_playback()
