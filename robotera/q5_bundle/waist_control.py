@@ -106,12 +106,13 @@ class Plugin:
             }
         return {"name": CARD, "type": TYPE, "multiInstance": False, "description": DESC,
                 "inputSchema": {"type": "object", "properties": {
-                    "action": {"type": "string", "enum": ["start", *WAIST_ACTIONS, "prepare", "cancel", "info"], "oneOf": [
+                    "action": {"type": "string", "enum": ["start", *WAIST_ACTIONS, "prepare", "cancel", "stop", "info"], "oneOf": [
                         {"const": "start", "title": "检查连接状态"},
                         *[{"const": action, "title": detail["title"], "description": detail["description"]}
                           for action, detail in WAIST_ACTIONS.items()],
                         {"const": "prepare", "title": "准备位置直控"},
                         {"const": "cancel", "title": "取消并保持"},
+                        {"const": "stop", "title": "停止并保持当前位置"},
                         {"const": "info", "title": "查看状态"},
                     ]},
                     **position_fields,
@@ -122,6 +123,7 @@ class Plugin:
                        for action, detail in WAIST_ACTIONS.items()},
                     "prepare": {"params": [], "description": "执行位置直控准备：pos→READY→垂手→抬臂→ACTIVE，解锁控制"},
                     "cancel": {"params": [], "description": "取消当前微调，并保持当前位置。"},
+                    "stop": {"params": [], "description": "停止当前运动并保持当前位置。"},
                     "info": {"params": [], "description": "查看运动状态与安全条件。"},
                 },
                 "x-completion": {

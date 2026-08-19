@@ -87,6 +87,7 @@ class Plugin:
         self._topic = TOPIC.format(ns=namespace)
         self._node = None
         self._pub = None
+        self._executor = executor
         if _HAS_ROS2 and executor is not None:
             try:
                 self._node = Node(NODE)
@@ -126,6 +127,22 @@ class Plugin:
             return {"state": "running" if self._pub else "unavailable", "data": self._data(),
                     "topic_out": topic_out(self._topic, FMT)}
         return None
+
+    def stop(self):
+        """Remove the ROS2 node from the executor and destroy it on shutdown."""
+        if self._node is not None and self._executor is not None:
+            try:
+                self._executor.remove_node(self._node)
+            except Exception:
+                pass
+        if self._node is not None:
+            try:
+                self._node.destroy_node()
+            except Exception:
+                pass
+            finally:
+                self._node = None
+                self._pub = None
 
 
 def make_plugin(plugin_config, namespace, executor, client):
