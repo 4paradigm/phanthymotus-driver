@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from sensor_contract import topic_out
@@ -28,6 +29,21 @@ HZ = 10.0
 NODE = "q5_joints"
 DESC = "Q5 实时身体与双手骨架：由 /joint_states 驱动的实机 URDF 可视化"
 MODEL_PATH = Path(__file__).parent / "resource" / "q5_model.urdf"
+
+
+def _skeleton_urdf() -> str:
+    """Return only the URDF kinematic tree understood by the skeleton viewer.
+
+    The vendor file also embeds a ``ros2_control`` block.  Its actuator and
+    transmission declarations repeat the same joint names but have no parent
+    or child links.  That is valid for ROS control, but it corrupts browser
+    kinematics when all ``<joint>`` elements are indexed by name.
+    """
+    root = ET.parse(MODEL_PATH).getroot()
+    for element in list(root):
+        if element.tag in {"mujoco", "ros2_control"}:
+            root.remove(element)
+    return ET.tostring(root, encoding="unicode")
 
 
 def build(snap: dict) -> dict:
@@ -122,7 +138,7 @@ class Plugin:
             if not MODEL_PATH.exists():
                 return {"error": "Q5 visual URDF model not found"}
             return {
-                "urdf": MODEL_PATH.read_text(),
+                "urdf": _skeleton_urdf(),
                 "model": "RobotEra Q5",
                 "geometry": "q5_wr1_lite_robot_description",
                 "source_topic": "/robot_description",
