@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Run the Q5 vendor-facing driver and Agent Core's JSON sensor bridge. The
 # driver starts a separate typed media/audio bridge; q5_bus_bridge forwards
-# only data/json topics, so it cannot claim camera/audio DDS topic types.
+# JSON state and skeleton topics only, so it cannot claim camera/audio DDS
+# topic types.
 # ROS setup scripts intentionally read optional variables that may be unset;
 # nounset would abort while sourcing /opt/ros/humble/setup.bash.
 set -Ee -o pipefail
