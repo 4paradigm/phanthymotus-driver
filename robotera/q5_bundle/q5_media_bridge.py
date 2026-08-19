@@ -25,7 +25,9 @@ q5_bridge_worker.py — 独立子进程 DDS bridge，将 Q5 sensor snapshot 发�
 
 import multiprocessing as mp
 import os
+import queue
 import sys
+import threading
 import time
 
 
@@ -36,10 +38,15 @@ class BridgeWorker:
         self._ctx = mp.get_context("spawn")
         self._cmd_q = self._ctx.Queue()
         self._sensor_q = self._ctx.Queue()
-        # Keep one recent frame for each media kind in the worker loop. RGB
-        # runs at a higher rate than depth and point clouds, so a single
-        # global latest-frame slot starves the slower streams.
-        self._media_q = self._ctx.Queue(maxsize=16)
+        # Each stream owns its own latest-frame lane. A shared FIFO lets the
+        # 15 Hz RGB stream evict slower depth/pointcloud packets before the
+        # bridge has a chance to classify them.
+        self._media_qs = {
+            "rgb": self._ctx.Queue(maxsize=2),
+            "depth_jpeg": self._ctx.Queue(maxsize=2),
+            "pointcloud": self._ctx.Queue(maxsize=2),
+        }
+        self._media_lock = threading.Lock()
         self._audio_q = self._ctx.Queue(maxsize=100)
         self._speaker_q = self._ctx.Queue(maxsize=64)
         self._proc = None
@@ -50,7 +57,7 @@ class BridgeWorker:
         """Spawn the bridge subprocess."""
         self._proc = self._ctx.Process(
             target=_run_bridge_subprocess,
-            args=(self._cmd_q, self._sensor_q, self._media_q, self._audio_q, self._speaker_q,
+            args=(self._cmd_q, self._sensor_q, self._media_qs, self._audio_q, self._speaker_q,
                   self._debug, self._namespace),
             name="q5_bridge_worker", daemon=True,
         )
@@ -65,11 +72,28 @@ class BridgeWorker:
             pass
 
     def push_media(self, media: dict):
-        """Queue a processed media frame without blocking control state updates."""
-        try:
-            self._media_q.put_nowait(media)
-        except Exception:
-            pass
+        """Replace only an older frame from the same media stream."""
+        kind = media.get("kind") if isinstance(media, dict) else None
+        media_q = self._media_qs.get(kind)
+        if media_q is None:
+            return
+        with self._media_lock:
+            try:
+                media_q.put_nowait(media)
+                return
+            except queue.Full:
+                pass
+            # Discard stale data from this stream only, then retry once. The
+            # queue remains bounded even if Agent Core is temporarily slower
+            # than the camera.
+            try:
+                media_q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                media_q.put_nowait(media)
+            except queue.Full:
+                pass
 
     def push_audio(self, audio: bytes):
         """Queue ordered PCM audio independently of lossy latest-frame media."""
@@ -103,7 +127,7 @@ class BridgeWorker:
         print("[BridgeWorker] subprocess stopped")
 
 
-def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queue,
+def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_qs: dict[str, mp.Queue],
                            audio_q: mp.Queue, speaker_q: mp.Queue, debug: bool, namespace: str):
     """Subprocess entry point — runs in separate process with own DDS domain."""
     # ── Environment: Force Domain 42 + FastDDS in subprocess ────────────────────
@@ -361,16 +385,15 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
         except Exception:
             pass
 
-        newest_media = {}
-        while True:
-            try:
-                media = media_q.get_nowait()
-                if isinstance(media, dict) and media.get("kind"):
-                    newest_media[media["kind"]] = media
-            except Exception:
-                break
-        for media in newest_media.values():
-            _dispatch_media(media)
+        for media_q in media_qs.values():
+            newest_media = None
+            while True:
+                try:
+                    newest_media = media_q.get_nowait()
+                except Exception:
+                    break
+            if newest_media is not None:
+                _dispatch_media(newest_media)
 
         # Unlike images, PCM frames must preserve their order. Drain the
         # bounded queue so short bridge delays do not produce audible gaps.

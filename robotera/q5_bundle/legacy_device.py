@@ -1071,6 +1071,9 @@ class CameraDepthPlugin(_Q5MediaPlugin):
         self._display_range_mm = None
         self._frames_received = 0
         self._frames_sent = 0
+        self._latest = None
+        self._lock = threading.Lock()
+        self._encoder = None
         super().__init__(plugin_config, namespace, executor, client)
 
     def get_tool(self):
@@ -1095,14 +1098,31 @@ class CameraDepthPlugin(_Q5MediaPlugin):
         if self._subscription is None:
             self._subscription = self._node.create_subscription(
                 Image, self._source_topic, self._on_depth, _LATEST_QOS)
+        self._encoder = threading.Thread(target=self._encode_loop, daemon=True, name="q5_depth_encoder")
+        self._encoder.start()
         print(f"[CameraDepthPlugin] subscribed {self._source_topic} -> {self._topic} <= {self._max_hz:g}Hz", flush=True)
 
     def _on_depth(self, msg):
         if not self._running:
             return
-        self._frames_received += 1
-        if (msg.encoding not in ("16UC1", "mono16") or
-                time.monotonic() - self._last_sent < 1.0 / self._max_hz):
+        # Do no image work on the ROS executor. Pointcloud shares this depth
+        # source, and callback-side JPEG/XYZ work otherwise causes both cards
+        # to miss source frames under a constrained container CPU quota.
+        with self._lock:
+            self._latest = msg
+            self._frames_received += 1
+
+    def _encode_loop(self):
+        while self._running:
+            with self._lock:
+                msg, self._latest = self._latest, None
+            if msg is None or time.monotonic() - self._last_sent < 1.0 / self._max_hz:
+                time.sleep(0.005)
+                continue
+            self._encode_depth(msg)
+
+    def _encode_depth(self, msg):
+        if msg.encoding not in ("16UC1", "mono16"):
             return
         needed = int(msg.height) * int(msg.step)
         if msg.width <= 0 or msg.height <= 0 or msg.step < msg.width * 2 or len(msg.data) < needed:
@@ -1180,6 +1200,9 @@ class CameraPointCloudPlugin(_Q5MediaPlugin):
         self._frames_received = 0
         self._frames_sent = 0
         self._info_subscription = None
+        self._latest = None
+        self._lock = threading.Lock()
+        self._encoder = None
         super().__init__(plugin_config, namespace, executor, client)
 
     def get_tool(self):
@@ -1205,20 +1228,36 @@ class CameraPointCloudPlugin(_Q5MediaPlugin):
         if self._info_subscription is None:
             self._info_subscription = self._node.create_subscription(
                 CameraInfo, self._info_topic, self._on_info, _RELIABLE_QOS)
+        self._encoder = threading.Thread(target=self._encode_loop, daemon=True, name="q5_pointcloud_encoder")
+        self._encoder.start()
         print(f"[CameraPointCloudPlugin] subscribed {self._source_topic} + {self._info_topic} -> {self._topic} <= {self._max_hz:g}Hz", flush=True)
 
     def _on_info(self, msg):
         fx, fy, cx, cy = float(msg.k[0]), float(msg.k[4]), float(msg.k[2]), float(msg.k[5])
         if fx > 0.0 and fy > 0.0:
-            self._intrinsics = (fx, fy, cx, cy)
+            with self._lock:
+                self._intrinsics = (fx, fy, cx, cy)
 
     def _on_depth(self, msg):
         if not self._running:
             return
-        self._frames_received += 1
-        intrinsics = self._intrinsics
-        if (intrinsics is None or msg.encoding not in ("16UC1", "mono16") or
-                time.monotonic() - self._last_sent < 1.0 / self._max_hz):
+        with self._lock:
+            self._latest = msg
+            self._frames_received += 1
+
+    def _encode_loop(self):
+        while self._running:
+            with self._lock:
+                msg, self._latest = self._latest, None
+                intrinsics = self._intrinsics
+            if (msg is None or intrinsics is None or
+                    time.monotonic() - self._last_sent < 1.0 / self._max_hz):
+                time.sleep(0.005)
+                continue
+            self._encode_pointcloud(msg, intrinsics)
+
+    def _encode_pointcloud(self, msg, intrinsics):
+        if msg.encoding not in ("16UC1", "mono16"):
             return
         needed = int(msg.height) * int(msg.step)
         if msg.width <= 0 or msg.height <= 0 or msg.step < msg.width * 2 or len(msg.data) < needed:
