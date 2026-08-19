@@ -107,7 +107,7 @@ _STAND_POSE_ACCELERATION_RANGE = (9.2, 10.4)
 _STAND_POSE_MAX_ANGULAR_VELOCITY = 0.10
 _STAND_POSE_MAX_JOINT_VELOCITY = 0.15
 _STAND_POSE_MAX_JOINT_VELOCITY_SPIKE = 0.30
-_STAND_ENABLE_MODE_TIMEOUT_S = 15.0
+_STAND_ENABLE_MODE_TIMEOUT_S = 10.0
 _STAND_ENABLE_MAX_ATTEMPTS = 2
 _STAND_ENABLE_SETTLE_TIMEOUT_S = 12.0
 _STAND_ENABLE_MIN_DWELL_S = 3.0
@@ -772,7 +772,7 @@ class LocoPlugin:
             daemon=True,
             name=f"bumi_posture_acp_{action_id[-8:]}",
         ).start()
-        return {
+        response = {
             "state": "accepted",
             "action_id": action_id,
             "requested_action": action,
@@ -784,6 +784,15 @@ class LocoPlugin:
                 "is cancelled."
             ),
         }
+        if action == "stand_up":
+            response["user_guidance"] = (
+                "Please wait patiently for about 20 seconds while Bumi enables its motors, "
+                "settles its joints, and starts standing up. Do not send another stand_up "
+                "request while this action is still running. If the robot still does not "
+                "respond after this action reports an error, check its face-up pose, battery, "
+                "workmode, and surrounding clearance before retrying."
+            )
+        return response
 
     def _run_posture_acp(self, action_id: str, cancel_event: threading.Event,
                          action: str, args: dict) -> None:
