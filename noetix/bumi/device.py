@@ -1259,11 +1259,15 @@ class AudioFilePlayerPlugin:
                     },
                     "filename": {
                         "type": "string",
-                        "description": "Original filename (fallback lookup)",
+                        "description": "Original filename (fallback lookup, or used with data_base64)",
                     },
                     "file_path": {
                         "type": "string",
                         "description": "Container-side absolute path to a .wav file (upload action or direct play)",
+                    },
+                    "data_base64": {
+                        "type": "string",
+                        "description": "Base64-encoded wav file content. upload action: pass this instead of file_path to upload local file content directly",
                     },
                     "volume": {
                         "type": "integer",
@@ -1301,7 +1305,8 @@ class AudioFilePlayerPlugin:
                     },
                     "upload": {
                         "params": ["file_path"],
-                        "description": "Register a container-side wav file into the audio library",
+                        "optional": ["data_base64", "filename"],
+                        "description": "Register a wav into the audio library: pass file_path (container-side path) OR data_base64 (base64 file content, e.g. from user's local file)",
                     },
                     "get_state": {
                         "params": [],
@@ -1372,9 +1377,19 @@ class AudioFilePlayerPlugin:
         }
 
     def _do_upload(self, args: dict) -> dict:
+        import base64
+        data_b64 = args.get("data_base64") or args.get("data")
+        if data_b64:
+            # base64 上传：LLM/用户把 wav 文件内容转 base64 传入，卡片解码存盘
+            filename = args.get("filename") or "audio.wav"
+            try:
+                data = base64.b64decode(data_b64)
+            except Exception as e:
+                return {"error": f"base64 decode failed: {e}"}
+            return self.upload(filename, data)
         file_path = args.get("file_path") or args.get("path")
         if not file_path:
-            return {"error": "file_path is required (container-side absolute path)"}
+            return {"error": "file_path or data_base64 is required"}
         p = Path(file_path)
         if not p.exists():
             return {"error": f"file not found: {file_path}"}
