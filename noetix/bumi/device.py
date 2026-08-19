@@ -1417,7 +1417,7 @@ class LocoPlugin:
                 })
                 if recovery_result is not None:
                     result["walking_recovery"] = recovery_result
-                self._attach_battery_failure_diagnostic(result)
+                return self._attach_battery_failure_diagnostic(result)
             else:
                 result["physical_motion_confirmed"] = True
         if pose_check is not None:
@@ -1867,11 +1867,11 @@ class LocoPlugin:
                     "error": f"{action} requires recording_id in the range 0 to 65535",
                     "safety_requirements": safety,
                 }
-            try:
-                recording_id = int(args["recording_id"])
-            except (TypeError, ValueError):
+            recording_id_value = args["recording_id"]
+            if type(recording_id_value) is not int:
                 return {"state": "error", "command_sent": False,
                         "error": "recording_id must be an integer", "safety_requirements": safety}
+            recording_id = recording_id_value
             if not 0 <= recording_id <= 65535:
                 return {"state": "error", "command_sent": False,
                         "error": "recording_id must be in the range 0 to 65535", "safety_requirements": safety}
