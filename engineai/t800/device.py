@@ -1582,7 +1582,9 @@ class OdometerPlugin:
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "info":
             return {**self._snapshot(), "topic_out": self._topic_out()}
-        if action in ("odometer", "status", "start"):
+        if action == "start":
+            return {"state": "running"}
+        if action in ("odometer", "status"):
             return self._snapshot()
         if action == "reset_trip":
             with self._lock:

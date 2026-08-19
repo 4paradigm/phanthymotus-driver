@@ -492,6 +492,8 @@ class DevicePluginContractTests(unittest.TestCase):
     def test_odometer_starts_with_configured_source_and_no_data_status(self):
         plugin = self.device.OdometerPlugin(CONFIG, "robot", self.ros)
         self.assertEqual("no_data", plugin.dispatch("status", {})["state"])
+        self.assertEqual({"state": "running"}, plugin.dispatch("start", {}))
+        self.assertEqual("no_data", plugin.dispatch("status", {})["state"])
         plugin.start()
         self.assertEqual(CONFIG["topics"]["odometry"], plugin._node.subscriptions[0].topic)
 
