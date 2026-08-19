@@ -211,6 +211,17 @@ print('; '.join(holders) or 'none')"""
     return "unavailable"
 
 
+def _wait_remote_playback_released(timeout: float = 5.0) -> tuple[bool, str]:
+    deadline = time.monotonic() + timeout
+    holders = "none"
+    while time.monotonic() < deadline:
+        holders = _q5_remote_playback_holders()
+        if holders == "none":
+            return True, holders
+        time.sleep(0.2)
+    return False, holders
+
+
 def _raise_if_remote_process_exited(process, label: str) -> None:
     """Surface setup failures before a card falsely reports a running stream."""
     time.sleep(0.25)
@@ -1599,6 +1610,9 @@ class AudioPlugin:
         # A live speaker card owns the same ALSA endpoint as XOS. Stop its
         # local pump before handing the route back to XOS conversation.
         _stop_active_speaker_plugin()
+        released, holders = _wait_remote_playback_released()
+        if not released:
+            return {"state": "error", "message": f"speaker ALSA route is still occupied: {holders}"}
         chat_ready, chat_error = self._xos_chat_start_for_playback()
         if chat_ready is None:
             return {"state": "error", "message": f"cannot enable XOS chat for playback: {chat_error}"}
