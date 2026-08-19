@@ -486,6 +486,7 @@ class SpeakerPlugin:
         self._xos_http_base = str(plugin_config.get(
             "xos_http_base", "http://192.168.8.100:1888")).rstrip("/")
         self._chat_poll_timeout = max(1.0, float(plugin_config.get("chat_poll_timeout_s", 8.0)))
+        self._chat_route_settle = max(0.0, float(plugin_config.get("chat_route_settle_s", 1.5)))
         self._system_volume = None
         self._node = Node("q5_speaker")
         executor.add_node(self._node)
@@ -1161,6 +1162,10 @@ class AudioPlugin:
     _xos_audio_upload_path = "/robot/replay/tts/upload_audio?lang=zh"
     _xos_audio_check_path = "/robot/replay/tts/check_audio_exist?lang=zh"
     _xos_audio_delete_path = "/robot/replay/tts/delete?lang=zh"
+    # This is the same endpoint used by the XOS audio-library web page's
+    # play button.  It is more reliable for uploaded/audio_name files than
+    # issuing AudioPlay mode=3 directly across DDS.
+    _xos_audio_play_path = "/robot/replay/do_replay_tts_audio?lang=zh"
     _xos_chat_launch_path = "/robot/chat/launch_chat?lang=zh"
     _xos_chat_state_path = "/robot/chat/get_chat_launch_state?lang=zh"
     _xos_chat_quit_path = "/robot/chat/quit_chat?lang=zh"
@@ -1622,6 +1627,18 @@ class AudioPlugin:
         if chat_ready is None:
             return {"state": "error", "message": f"cannot enable XOS chat for playback: {chat_error}"}
         try:
+            if mode == 3:
+                response = self._xos_json_request(
+                    self._xos_audio_play_path, method="POST",
+                    payload={"audio_name": value})
+                if response.get("code") != 200:
+                    return {"state": "error", "message": response.get(
+                        "msg", "XOS audio-library playback failed")}
+                # The webpage starts the same player asynchronously.  Poll
+                # briefly so an immediately failed request is not reported as
+                # successful, but do not wait for the whole clip here.
+                time.sleep(0.2)
+                return {"state": "ok", "message": response.get("msg", "Playback started")}
             if not self._action_client.wait_for_server(timeout_sec=3.0):
                 return {"state": "error", "message": "/audio_player/play is unavailable"}
             goal = AudioPlay.Goal()
