@@ -132,6 +132,18 @@ class Q5BasicSensorTests(unittest.TestCase):
         self.assertEqual(item["name"], "left_hand_index_rota_joint1")
         self.assertIn(item["name"], joints._model_joint_indices())
 
+    def test_skeleton_derives_missing_distal_hand_joints_from_active_finger_state(self):
+        data = joints.build({
+            "fresh": True,
+            "joint_names": ["left_hand_index_joint1"],
+            "joints": {"left_hand_index_joint1": 0.8},
+        })
+        names = {item["name"] for item in data["joints"]}
+        self.assertIn("left_hand_index_rota_joint1", names)
+        self.assertIn("left_hand_index_rota_joint2", names)
+        distal = next(item for item in data["joints"] if item["name"] == "left_hand_index_rota_joint2")
+        self.assertEqual(distal["q"], 0.8)
+
     def test_joint_cards_preserve_received_but_stale_data_as_unavailable_for_live_use(self):
         stale = dict(FRESH_JOINT_SNAPSHOT, available=True, fresh=False, stale=True, age_ms=5001)
         skeleton = joints.build(stale)
