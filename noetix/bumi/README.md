@@ -50,8 +50,9 @@ mode into walking because the SDK cannot verify that the robot is physically
 standing.
 
 Long-running physical operations use Agent Core's Action Completion Protocol
-(ACP). `loco.move`, both posture actions, every `semantic_action`, and every
-`action_recording` action return a unique `action_id`; their background
+(ACP). `loco.move`, both posture actions, every `semantic_action`, and
+`action_recording.finish_and_save_recording`/`play_recording` return a unique
+`action_id`; their background
 workers report `completed`, `error`, or `cancelled` to `/api/acp/complete`.
 Every terminal result includes the same `action_id`, action name, terminal
 `state`, a boolean `success`, and a plain-language completion message; failures
@@ -69,10 +70,11 @@ completion; protection, unexpected workmode changes, missing physical motion,
 feedback errors and monitor timeouts are reported as ACP errors. `wipe_tears`
 keeps its guarded five-second return-to-walking behavior, while `reset` is
 complete only after walking mode is confirmed.
-For action recording, starting and saving report completion after the vendor
-target workmode is confirmed; this completes the requested command, not the
-open-ended user-guided recording session. Playback remains pending until joint
-feedback indicates the motion ended and walking-mode recovery is confirmed.
+For action recording, `start_recording` synchronously confirms entry into the
+open-ended user-guided recording state and does not use ACP. Saving reports ACP
+completion after its vendor target workmode is confirmed. Playback remains
+pending until joint feedback indicates the motion ended and walking-mode
+recovery is confirmed.
 Posture workmode and stand-up pose checks run before the asynchronous request is
 accepted, so invalid requests such as calling `stand_up` while already standing
 return an immediate plain-language error. A valid request returns only its ACP

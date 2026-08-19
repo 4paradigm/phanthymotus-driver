@@ -178,7 +178,9 @@ def _acp_notify(action_id: str, status: str, result: dict,
             method="POST",
         )
         with _urllib.urlopen(request, timeout=5, context=context) as response:
-            response.read()
+            if not 200 <= response.status < 300:
+                raise RuntimeError(
+                    f"Agent Core returned HTTP {response.status}")
         print(
             f"[ACP] {status}: action_id={action_id} tool={tool}",
             flush=True,
@@ -479,11 +481,7 @@ class LocoPlugin:
                     },
                     "velocity": {
                         "type": "number",
-                        "description": (
-                            "Normalized speed for the selected channel. vx/vyaw: "
-                            "[-1.0,-0.5]U[0.5,1.0]; vy: "
-                            "[-1.0,-0.6]U[0.6,1.0]."
-                        ),
+                        "description": "[-1.0,-0.5]U[0.5,1.0]",
                         "minimum": -1, "maximum": 1,
                     },
                     "duration": {
@@ -495,6 +493,40 @@ class LocoPlugin:
                     },
                 },
                 "required": ["action"],
+                "allOf": [
+                    {
+                        "if": {
+                            "properties": {
+                                "velocity_channel": {"const": "vy"},
+                            },
+                            "required": ["velocity_channel"],
+                        },
+                        "then": {
+                            "properties": {
+                                "velocity": {
+                                    "description": "[-1.0,-0.6]U[0.6,1.0]",
+                                },
+                            },
+                        },
+                    },
+                    {
+                        "if": {
+                            "properties": {
+                                "velocity_channel": {
+                                    "enum": ["vx", "vyaw"],
+                                },
+                            },
+                            "required": ["velocity_channel"],
+                        },
+                        "then": {
+                            "properties": {
+                                "velocity": {
+                                    "description": "[-1.0,-0.5]U[0.5,1.0]",
+                                },
+                            },
+                        },
+                    },
+                ],
                 "x-completion": {
                     "actions": ["move"],
                     "timeout": 20,
@@ -600,7 +632,7 @@ class LocoPlugin:
     def _action_recording_tool(self) -> dict:
         return {
             "name": "action_recording", "type": "actuator", "multiInstance": False,
-            "description": "录制、结束并保存或播放 Bumi 示教动作。三个选项均使用 ACP 并返回 action_id；start_recording 和 finish_and_save_recording 在目标工作模式被确认后上报命令完成，play_recording 在检测到实际播放结束并恢复 walking 后上报完成。start_recording 和 play_recording 会自动进入所需行走模式；finish_and_save_recording 只能在已开始录制后使用。",
+            "description": "录制、结束并保存或播放 Bumi 示教动作。start_recording 只负责进入开放式示教录制状态，因此同步返回而不使用 ACP；finish_and_save_recording 和 play_recording 返回 action_id，前者在保存工作模式确认后上报终态，后者在检测到实际播放结束并恢复 walking 后上报终态。start_recording 和 play_recording 会自动进入所需行走模式；finish_and_save_recording 只能在已开始录制后使用。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -615,7 +647,8 @@ class LocoPlugin:
                 },
                 "required": ["action"],
                 "x-completion": {
-                    "actions": list(_TEACHING_ACTIONS),
+                    "actions": [
+                        "finish_and_save_recording", "play_recording"],
                     "timeout": 150,
                 },
                 "x-action-params": {
@@ -675,6 +708,8 @@ class LocoPlugin:
         if tool_name == "semantic_action" and action in _PRESET_ACTIONS:
             return self._start_semantic_acp(action, args)
         if tool_name == "action_recording" and action in _TEACHING_ACTIONS:
+            if action == "start_recording":
+                return self._do_teaching_action(action, args)
             return self._start_teaching_acp(action, args)
         return None
 
