@@ -46,6 +46,19 @@ cp .env.example .env  # 填写镜像仓库凭据
 
 驱动容器启动后会自动向 Agent Core（`http://<agent-core>:15678/api/mcp`）发送注册请求。注册成功后即可在 Web Dashboard 中看到设备及其工具。
 
+开发版 G1 使用仓库内的 Git 部署入口。请先把当前分支推送到远程，并确保
+本地工作树干净：
+
+```bash
+./unitree/g1/deploy/deploy-from-git.sh g1-bj-wifi
+```
+
+脚本不会把本地工作树复制到机器人。它会记录本地分支和提交，在目标机器的
+`~/hanzebei/phanthymotus-driver` 中拉取该分支，要求远程分支 tip 与固定提交
+完全一致，再使用仓库自带的 G1 Dockerfile 构建镜像。只有明确需要覆盖部署
+输入时才设置 `REPO_URL`、`SOURCE_REF`、`EXPECTED_COMMIT`、`REMOTE_REPO`
+或 `IMAGE`。`DRY_RUN=1` 只校验并打印最终来源，不连接机器人。
+
 ### 本地运行（无需 Docker）
 
 ```bash
