@@ -1251,7 +1251,7 @@ class AudioFilePlayerPlugin:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["start", "play", "stop", "list", "delete", "upload", "info"],
+                        "enum": ["start", "play", "stop_playback", "list", "delete", "upload", "get_state"],
                     },
                     "file_id": {
                         "type": "string",
@@ -1287,7 +1287,7 @@ class AudioFilePlayerPlugin:
                         "optional": ["filename", "file_path", "volume", "loop"],
                         "description": "Play an uploaded wav file asynchronously; returns action_id",
                     },
-                    "stop": {
+                    "stop_playback": {
                         "params": [],
                         "description": "Stop current playback immediately",
                     },
@@ -1303,7 +1303,7 @@ class AudioFilePlayerPlugin:
                         "params": ["file_path"],
                         "description": "Register a container-side wav file into the audio library",
                     },
-                    "info": {
+                    "get_state": {
                         "params": [],
                         "description": "Query current playback state",
                     },
@@ -1326,7 +1326,7 @@ class AudioFilePlayerPlugin:
             return {"state": "ready", "audio_dir": str(self._audio_dir)}
         if action == "play":
             return self._do_play(args)
-        if action == "stop":
+        if action in ("stop", "stop_playback"):
             self._stop_internal()
             return {"state": "idle"}
         if action == "list":
@@ -1335,7 +1335,7 @@ class AudioFilePlayerPlugin:
             return self._do_delete(args)
         if action == "upload":
             return self._do_upload(args)
-        if action == "info":
+        if action in ("info", "get_state"):
             return dict(self._play_state)
         return None
 
@@ -1502,9 +1502,11 @@ class AudioFilePlayerPlugin:
         manifest = self._load_manifest()
         items = []
         for fid, meta in manifest.items():
+            p = self._audio_dir / f"{fid}.wav"
             items.append({
                 "file_id": fid,
                 "filename": meta.get("filename"),
+                "path": str(p),
                 "size_bytes": meta.get("size_bytes"),
                 "duration_s": meta.get("duration_s"),
                 "uploaded_at": meta.get("uploaded_at"),
