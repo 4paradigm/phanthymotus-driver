@@ -327,6 +327,22 @@ class ArmControlPlugin:
             prepare=result,
         )
 
+    @staticmethod
+    def _trace(action_id: str | None, phase: str, started_at: float | None = None, **details) -> None:
+        """Emit phase timing for diagnosing vendor control-stack stalls."""
+        elapsed_ms = None if started_at is None else int((time.monotonic() - started_at) * 1000)
+        fields = [f"action_id={action_id or '-'}", f"phase={phase}"]
+        if elapsed_ms is not None:
+            fields.append(f"elapsed_ms={elapsed_ms}")
+        fields.extend(f"{key}={value}" for key, value in details.items())
+        print("[ArmControlPlugin] " + " ".join(fields), flush=True)
+
+    def _notify_completion(self, action_id: str | None, status: str, result: dict) -> None:
+        started_at = time.monotonic()
+        self._trace(action_id, "acp_callback_start", status=status)
+        _acp_notify(action_id, status, result, ARM_CARD)
+        self._trace(action_id, "acp_callback_end", started_at, status=status)
+
     def _publish(self, joint_name: str, position: float) -> bool:
         return self._router.publish({joint_name: position})
 
@@ -352,6 +368,9 @@ class ArmControlPlugin:
             int(math.ceil(duration_s * self._publish_rate)),
             1,
         )
+        motion_started_at = time.monotonic()
+        self._trace(action_id, "motion_start", joint_name=joint_name,
+                    current_rad=current, target_rad=target, duration_s=duration_s, steps=steps)
         try:
             for index in range(1, steps + 1):
                 if stop_event.is_set():
@@ -360,15 +379,21 @@ class ArmControlPlugin:
                 self._publish(joint_name, position)
                 stop_event.wait(duration_s / steps)
         finally:
+            self._trace(action_id, "motion_interpolation_end", motion_started_at,
+                        cancelled=stop_event.is_set())
             # The joint-state stream may still contain the pre-command angle
             # when the final interpolation point is sent. Hold the target on
             # successful completion; cancellation continues to hold feedback.
+            hold_started_at = time.monotonic()
             self._hold_position(joint_name, target) if not stop_event.is_set() else self._hold_current(joint_name)
+            self._trace(action_id, "motion_hold_end", hold_started_at,
+                        cancelled=stop_event.is_set())
             self._router.release(ARM_CARD)
-            _acp_notify(action_id, "cancelled" if stop_event.is_set() else "completed", {
+            self._trace(action_id, "router_released")
+            self._notify_completion(action_id, "cancelled" if stop_event.is_set() else "completed", {
                 "joint_name": joint_name, "target_position_rad": target,
                 "duration_s": duration_s,
-            }, ARM_CARD)
+            })
             with self._lock:
                 if self._motion_stop is stop_event:
                     self._motion_stop = None
@@ -379,31 +404,37 @@ class ArmControlPlugin:
                         duration_s: float, action_id: str):
         """Prepare the vendor stack in the background, then execute the move."""
         try:
+            prepared_before = bool(getattr(self._client, "q5_position_control_prepared", False))
+            prepare_started_at = time.monotonic()
+            self._trace(action_id, "prepare_start", cache_hit=prepared_before)
             prepare_error = self._ensure_prepared()
+            self._trace(action_id, "prepare_end", prepare_started_at,
+                        cache_hit=prepared_before, ok=prepare_error is None)
             if stop_event.is_set():
-                _acp_notify(action_id, "cancelled", {"phase": "prepare"}, ARM_CARD)
+                self._notify_completion(action_id, "cancelled", {"phase": "prepare"})
                 return
             if prepare_error:
-                _acp_notify(action_id, "error", prepare_error, ARM_CARD)
+                self._notify_completion(action_id, "error", prepare_error)
                 return
             q5_ready, q5_status = q5_is_control_ready(self._client)
             if not q5_ready or q5_status.get("state") != 4:
-                _acp_notify(action_id, "error", _arm_failure(
+                self._notify_completion(action_id, "error", _arm_failure(
                     "Q5_FSM_NOT_ACTIVE",
                     "Q5 must be fresh and ACTIVE after position-control preparation",
                     q5_fsm=q5_status,
-                ), ARM_CARD)
+                ))
                 return
             if stop_event.is_set():
-                _acp_notify(action_id, "cancelled", {"phase": "prepare"}, ARM_CARD)
+                self._notify_completion(action_id, "cancelled", {"phase": "prepare"})
                 return
             if not self._router.acquire(ARM_CARD):
-                _acp_notify(action_id, "error", _arm_failure(
+                self._notify_completion(action_id, "error", _arm_failure(
                     "COMMAND_IN_PROGRESS",
                     "Another Q5 body card currently owns the command publisher",
                     status=self._router.status(),
-                ), ARM_CARD)
+                ))
                 return
+            self._trace(action_id, "router_acquired")
             with self._lock:
                 active = self._active_command
                 if active is not None and active.get("action_id") == action_id:
@@ -411,21 +442,24 @@ class ArmControlPlugin:
                     active["prepare"] = "completed"
             if stop_event.is_set():
                 self._router.release(ARM_CARD)
-                _acp_notify(action_id, "cancelled", {"phase": "before_motion"}, ARM_CARD)
+                self._trace(action_id, "router_released_before_motion")
+                self._notify_completion(action_id, "cancelled", {"phase": "before_motion"})
                 return
             self._run_move(stop_event, joint_name, current, target, duration_s, action_id)
         except Exception as exc:
             # Keep an unexpected preparation/transition failure asynchronous too.
             self._router.release(ARM_CARD)
-            _acp_notify(action_id, "error", _arm_failure(
+            self._trace(action_id, "unexpected_exception", error=repr(exc))
+            self._notify_completion(action_id, "error", _arm_failure(
                 "ARM_ACTION_FAILED", "Q5 arm action failed", error=str(exc)
-            ), ARM_CARD)
+            ))
         finally:
             with self._lock:
                 if self._motion_stop is stop_event:
                     self._motion_stop = None
                     self._motion_thread = None
                     self._active_command = None
+            self._trace(action_id, "worker_cleanup")
 
     def _stop(self, reason: str) -> dict:
         with self._lock:
@@ -517,6 +551,8 @@ class ArmControlPlugin:
                 daemon=True,
                 name="q5_arm_control",
             )
+            self._trace(action_id, "queued", joint_name=joint_name, target_rad=target,
+                        duration_s=duration_s)
             self._motion_thread.start()
         return {"ok": True, "state": "queued", "prepare": "pending", "command": queued_command,
                 "stops_by_holding_current_position": True, "action_id": action_id}
