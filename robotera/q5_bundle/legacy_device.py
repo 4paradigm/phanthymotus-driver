@@ -1352,13 +1352,13 @@ class AudioPlugin:
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": [
                     "play_local_file", "play_library_file",
-                    "list_library", "upload_local_file", "delete_audio", "set_volume",
+                    "list_library", "upload_to_library", "delete_audio", "set_volume",
                     "get_volume", "stop_audio", "is_play", "stop"],
                     "oneOf": [
                         {"const": "play_local_file", "title": "播放本地音频文件"},
                         {"const": "play_library_file", "title": "播放机器人音频库文件"},
                         {"const": "list_library", "title": "查看挂载音频库"},
-                        {"const": "upload_local_file", "title": "上传本地音频文件"},
+                        {"const": "upload_to_library", "title": "上传音频到机器人库"},
                         {"const": "delete_audio", "title": "从 XOS 音频库删除"},
                         {"const": "set_volume", "title": "设置音量"},
                         {"const": "get_volume", "title": "查看音量"},
@@ -1383,7 +1383,7 @@ class AudioPlugin:
                     "play_library_file": {"params": ["file_name", "force_play", "timeout", "channel", "version"],
                                          "description": "直接播放机器人 XOS 音频库已有的 audio_name。"},
                     "list_library": {"params": [], "description": "列出机器人 XOS 音频库；返回的 file_name 可用于 play_library_file。"},
-                    "upload_local_file": {"params": ["local_file"], "description": "选择本地 WAV/MP3 并上传到 XOS，不播放。"},
+                    "upload_to_library": {"params": ["local_file"], "description": "选择本地 WAV/MP3 并上传到机器人音频库，不播放。"},
                     "delete_audio": {"params": ["file_name"],
                                      "description": "从 XOS 音频库删除指定 audio_name。"},
                     "set_volume": {"params": ["volume"], "description": "设置厂商 AudioPlay 音量 0 到 100；不控制 live speaker。"},
@@ -1415,7 +1415,7 @@ class AudioPlugin:
             return self._play(args, play_modes[action])
         if action == "list_library":
             return self._list_robot_audio_files()
-        if action == "upload_local_file":
+        if action == "upload_to_library":
             return self._upload_local_file(args)
         if action == "delete_audio":
             return self._delete_audio(args)
