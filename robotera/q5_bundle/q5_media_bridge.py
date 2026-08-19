@@ -36,10 +36,10 @@ class BridgeWorker:
         self._ctx = mp.get_context("spawn")
         self._cmd_q = self._ctx.Queue()
         self._sensor_q = self._ctx.Queue()
-        # Keep the original small latest-frame queue. Large JPEG/point-cloud
-        # packets can otherwise accumulate in multiprocessing's feeder and
-        # make the dashboard appear frozen on an old frame.
-        self._media_q = self._ctx.Queue(maxsize=4)
+        # Keep one recent frame for each media kind in the worker loop. RGB
+        # runs at a higher rate than depth and point clouds, so a single
+        # global latest-frame slot starves the slower streams.
+        self._media_q = self._ctx.Queue(maxsize=16)
         self._audio_q = self._ctx.Queue(maxsize=100)
         self._speaker_q = self._ctx.Queue(maxsize=64)
         self._proc = None
@@ -361,14 +361,16 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
         except Exception:
             pass
 
-        newest_media = None
+        newest_media = {}
         while True:
             try:
-                newest_media = media_q.get_nowait()
+                media = media_q.get_nowait()
+                if isinstance(media, dict) and media.get("kind"):
+                    newest_media[media["kind"]] = media
             except Exception:
                 break
-        if newest_media is not None:
-            _dispatch_media(newest_media)
+        for media in newest_media.values():
+            _dispatch_media(media)
 
         # Unlike images, PCM frames must preserve their order. Drain the
         # bounded queue so short bridge delays do not produce audible gaps.
