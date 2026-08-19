@@ -57,9 +57,15 @@ workers report `completed`, `error`, or `cancelled` to `/api/acp/complete`.
 Every terminal result includes the same `action_id`, action name, terminal
 `state`, a boolean `success`, and a plain-language completion message; failures
 also include a concrete `error` reason.
-Terminal callbacks use bounded retries and remain registered in the driver
+Only one ACP-managed physical-action session may be active at a time; conflicting
+locomotion, posture, semantic-action, save, or playback requests are rejected
+until the current action reaches a terminal state. Terminal callbacks retry with
+exponential backoff capped at 60 seconds and remain registered in the driver
 until Agent Core acknowledges delivery, preventing a fast completion or a
-transient localhost/registration race from silently losing the result.
+transient Agent Core outage from silently losing the result. HTTPS certificate
+and hostname validation are enabled by default. A local self-signed deployment
+may explicitly set `AGENT_CORE_INSECURE_TLS=1`; this must not be used for a
+non-loopback Agent Core endpoint.
 This keeps Agent Core's actuator barrier active until the bounded move or action
 really terminates. Stopping the plugin cancels pending timers and playback
 monitoring before reporting the affected ACP actions as cancelled.

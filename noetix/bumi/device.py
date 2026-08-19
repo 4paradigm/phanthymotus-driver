@@ -160,9 +160,10 @@ def _acp_notify(action_id: str, status: str, result: dict,
 
     agent_core_url = _os.environ.get(
         "AGENT_CORE_URL", "https://localhost:15678")
-    context = _ssl.create_default_context()
-    context.check_hostname = False
-    context.verify_mode = _ssl.CERT_NONE
+    if _os.environ.get("AGENT_CORE_INSECURE_TLS") == "1":
+        context = _ssl._create_unverified_context()
+    else:
+        context = _ssl.create_default_context()
     payload = _json.dumps({
         "action_id": action_id,
         "status": status,
@@ -432,6 +433,8 @@ class LocoPlugin:
         self._playback_action_id: str | None = None
         self._acp_lock = threading.Lock()
         self._active_acp: dict[str, dict] = {}
+        self._action_session_lock = threading.Lock()
+        self._active_action_session: dict[str, str] | None = None
         self._lifecycle_stop_event = threading.Event()
 
     def get_tools(self) -> list:
@@ -686,9 +689,13 @@ class LocoPlugin:
 
         if tool_name == "loco" and action == "move":
             with self._move_session_lock:
+                conflict = self._reserve_action_session("loco", action)
+                if conflict is not None:
+                    return conflict
                 result = self._do_move(args)
                 if result.get("state") == "running":
                     action_id, _ = self._register_acp("loco", action)
+                    self._bind_action_session(action_id)
                     result["action_id"] = action_id
                     move_thread = self._move_thread
                     move_observation = self._move_observation
@@ -700,6 +707,8 @@ class LocoPlugin:
                         daemon=True,
                         name=f"bumi_move_acp_{action_id[-8:]}",
                     ).start()
+                else:
+                    self._clear_unbound_action_session("loco", action)
                 return result
         if tool_name == "loco" and action == "stop_move":
             return self._stop_move()
@@ -725,6 +734,44 @@ class LocoPlugin:
             }
         return action_id, cancel_event
 
+    def _reserve_action_session(self, tool: str, action: str) -> dict | None:
+        with self._action_session_lock:
+            if self._active_action_session is not None:
+                active = self._active_action_session
+                return {
+                    "state": "error",
+                    "command_sent": False,
+                    "requested_action": action,
+                    "error": (
+                        f"Another physical action is already active: "
+                        f"{active['tool']}.{active['action']}."
+                    ),
+                    "active_action": active,
+                    "message": "Wait for the active action to finish before sending another command.",
+                }
+            self._active_action_session = {"tool": tool, "action": action}
+        return None
+
+    def _release_action_session(self, action_id: str) -> None:
+        with self._acp_lock:
+            active = self._active_acp.get(action_id)
+        if active is None:
+            return
+        with self._action_session_lock:
+            if (self._active_action_session is not None
+                    and self._active_action_session.get("action_id") == action_id):
+                self._active_action_session = None
+
+    def _bind_action_session(self, action_id: str) -> None:
+        with self._action_session_lock:
+            if self._active_action_session is not None:
+                self._active_action_session["action_id"] = action_id
+
+    def _clear_unbound_action_session(self, tool: str, action: str) -> None:
+        with self._action_session_lock:
+            if self._active_action_session == {"tool": tool, "action": action}:
+                self._active_action_session = None
+
     def _finish_acp(self, action_id: str, status: str, result: dict) -> bool:
         with self._acp_lock:
             active = self._active_acp.get(action_id)
@@ -734,6 +781,7 @@ class LocoPlugin:
                 active["terminal_pending"] = True
         if active is None:
             return False
+        self._release_action_session(action_id)
         terminal_result = self._format_acp_terminal(
             action_id, active["action"], status, result)
         threading.Thread(
@@ -749,27 +797,18 @@ class LocoPlugin:
         # Agent Core registers the action_id after receiving the MCP response.
         # Retry locally so a fast action or transient localhost failure cannot
         # permanently lose its terminal callback.
-        delays = (0.5, 0.5, 1.0, 1.0, 2.0, 2.0, 4.0, 4.0)
-        for attempt, delay_s in enumerate(delays, start=1):
+        attempt = 0
+        delay_s = 0.5
+        while True:
+            attempt += 1
             if _acp_notify(action_id, status, result, tool):
                 with self._acp_lock:
                     self._active_acp.pop(action_id, None)
                 return
-            print(
-                f"[ACP] delivery retry {attempt}/{len(delays)} for "
-                f"action_id={action_id} in {delay_s:.1f}s",
-                flush=True,
-            )
+            print(f"[ACP] delivery retry {attempt} for action_id={action_id} "
+                  f"in {delay_s:.1f}s", flush=True)
             time.sleep(delay_s)
-        with self._acp_lock:
-            active = self._active_acp.get(action_id)
-            if active is not None:
-                active["terminal_pending"] = False
-        print(
-            f"[ACP] terminal callback exhausted retries: action_id={action_id} "
-            f"tool={tool} status={status}",
-            flush=True,
-        )
+            delay_s = min(delay_s * 2.0, 60.0)
 
     @staticmethod
     def _format_acp_terminal(action_id: str, action: str, status: str,
@@ -833,8 +872,12 @@ class LocoPlugin:
         self._finish_acp(action_id, status, terminal_result)
 
     def _start_semantic_acp(self, action: str, args: dict) -> dict:
+        conflict = self._reserve_action_session("semantic_action", action)
+        if conflict is not None:
+            return conflict
         action_id, cancel_event = self._register_acp(
             "semantic_action", action)
+        self._bind_action_session(action_id)
         threading.Thread(
             target=self._run_semantic_acp,
             args=(action_id, cancel_event, action, dict(args)),
@@ -870,8 +913,12 @@ class LocoPlugin:
                     "error": "recording_id must be in the range 0 to 65535",
                     "safety_requirements": self._safety_requirements(action),
                 }
+        conflict = self._reserve_action_session("action_recording", action)
+        if conflict is not None:
+            return conflict
         action_id, cancel_event = self._register_acp(
             "action_recording", action)
+        self._bind_action_session(action_id)
         threading.Thread(
             target=self._run_teaching_acp,
             args=(action_id, cancel_event, action, dict(args)),
@@ -1126,8 +1173,12 @@ class LocoPlugin:
                     "safety_requirements": safety,
                 }
 
+        conflict = self._reserve_action_session("stand_up_lie_prone", action)
+        if conflict is not None:
+            return conflict
         action_id, cancel_event = self._register_acp(
             "stand_up_lie_prone", action)
+        self._bind_action_session(action_id)
         threading.Thread(
             target=self._run_posture_acp,
             args=(action_id, cancel_event, action, dict(args)),
