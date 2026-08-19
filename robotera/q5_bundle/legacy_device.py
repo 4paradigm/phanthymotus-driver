@@ -530,6 +530,11 @@ class SpeakerPlugin:
             self._xos_http_base, False, self._chat_poll_timeout)
         if not ok:
             raise RuntimeError(f"XOS chat did not release speaker route: {error}")
+        # XOS reports chat OFF before its vendor ALSA player has necessarily
+        # closed the PCM handle. Give that process a short grace period before
+        # opening the direct speaker stream.
+        if self._chat_route_settle:
+            time.sleep(self._chat_route_settle)
 
     def _start_playback(self, requested: str) -> None:
         self._topic = requested
@@ -552,14 +557,26 @@ class SpeakerPlugin:
         _stop_remote_speaker_playback()
         command = _q5_alsa_speaker_command(
             self._device, self._output_rate, self._output_channels)
-        self._process = subprocess.Popen(
-            _q5_ssh_args(_q5_speaker_playback_shell(command)), stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, bufsize=0)
-        try:
-            _raise_if_remote_process_exited(self._process, "speaker")
-        except RuntimeError as exc:
+        last_error = None
+        for attempt in range(3):
+            self._process = subprocess.Popen(
+                _q5_ssh_args(_q5_speaker_playback_shell(command)), stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, bufsize=0)
+            try:
+                _raise_if_remote_process_exited(self._process, "speaker")
+                break
+            except RuntimeError as exc:
+                last_error = exc
+                try:
+                    self._process.kill()
+                    self._process.wait(timeout=1.0)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+                if attempt < 2:
+                    time.sleep(0.8)
+        else:
             holders = _q5_remote_playback_holders()
-            raise RuntimeError(f"{exc}; playback device holders: {holders}") from exc
+            raise RuntimeError(f"{last_error}; playback device holders: {holders}") from last_error
         configure = getattr(self._client, "configure_speaker", None)
         if callable(configure):
             configure(self._topic)
