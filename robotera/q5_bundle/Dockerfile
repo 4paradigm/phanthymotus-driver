@@ -33,6 +33,7 @@ COPY vendor/xbot_common_interfaces /q5_ws/src/xbot_common_interfaces
 COPY vendor/audio_msgs /q5_ws/src/audio_msgs
 RUN cd /q5_ws && . /opt/ros/humble/setup.sh && \
     colcon build --packages-select xbot_common_interfaces audio_msgs
+COPY common/ /work/common/
 COPY main.py /work/main.py
 COPY q5_bus_bridge.py /work/q5_bus_bridge.py
 COPY q5_bundle_entrypoint.sh /work/q5_bundle_entrypoint.sh

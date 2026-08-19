@@ -34,6 +34,7 @@ RUN cd /opt/unitree_legged_sdk && mkdir -p build && cd build && \
     cmake -DPYTHON_BUILD=ON .. && make -j"$(nproc)" && \
     find /opt/unitree_legged_sdk/lib/python -name 'robot_interface*.so' -exec cp -v {} /work/ \; || true
 
+COPY common/ /work/common/
 COPY main.py           /work/main.py
 COPY go1_sdk_client.py /work/go1_sdk_client.py
 COPY sdk_proxy.py      /work/sdk_proxy.py
