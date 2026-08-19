@@ -68,6 +68,12 @@ plugins:
     enabled: true
   motion_command_trace:
     enabled: true
+  odometer:
+    enabled: true
+    publish_rate_hz: 5.0
+    stationary_enter_m_s: 0.03
+    stationary_exit_m_s: 0.05
+    jump_tolerance_m: 0.25
   native_interface_probe:
     enabled: true
   locomotion:
