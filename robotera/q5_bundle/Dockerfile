@@ -52,6 +52,7 @@ COPY q5_bundle_entrypoint.sh /work/q5_bundle_entrypoint.sh
 COPY sensor_contract.py /work/sensor_contract.py
 COPY control_contract.py /work/control_contract.py
 COPY q5_sdk_client.py /work/q5_sdk_client.py
+COPY q5_acp.py /work/q5_acp.py
 COPY base_drive.py /work/base_drive.py
 COPY joints_state.py /work/joints_state.py
 COPY joints.py /work/joints.py
@@ -85,12 +86,12 @@ COPY robot_status.py /work/robot_status.py
 COPY config.yaml /work/config.yaml
 COPY resource/q5_model.urdf /work/resource/q5_model.urdf
 COPY resource/fastdds_udp_only.xml /work/resource/fastdds_udp_only.xml
+COPY resource/startup_beep.pcm /work/resource/startup_beep.pcm
 COPY deploy/ /deploy/
 
 ENV PYTHONPATH=/work
 
-RUN chmod +x /work/q5_bundle_entrypoint.sh && \
-    mkdir -p /opt/phanthy-motus/data/audios
+RUN chmod +x /work/q5_bundle_entrypoint.sh
 
 EXPOSE 15793
 

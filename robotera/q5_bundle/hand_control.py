@@ -12,6 +12,7 @@ import time
 
 from hand_command import HAND_JOINTS, failure, finite_number, get_router
 from control_contract import q5_active_status, q5_is_control_ready
+from q5_acp import notify as _acp_notify
 
 CARD = "hand_control"
 TYPE = "actuator"
@@ -211,7 +212,7 @@ class Plugin:
                     targets.append({"joint_name": name, "position_rad": value})
         return self._targets({"targets": targets, "duration_s": args.get("duration_s")})
 
-    def _start_motion(self, command, source):
+    def _start_motion(self, command, source, action_id=None):
         if not self._router.acquire(CARD):
             return failure("COMMAND_IN_PROGRESS", "Another Q5 hand card currently owns the command publisher", status=self._router.status())
         with self._lock:
@@ -222,11 +223,12 @@ class Plugin:
             self._motion_stop = event
             self._active_command = {"source": source, "targets_rad": dict(command["targets"]),
                                     "duration_s": command["duration_s"], "started_at_ms": int(time.time() * 1000)}
-            self._motion_thread = threading.Thread(target=self._run, args=(event, command), daemon=True, name="q5_hand_control")
+            self._motion_thread = threading.Thread(target=self._run, args=(event, command, action_id), daemon=True, name="q5_hand_control")
             self._motion_thread.start()
-        return {"ok": True, "state": "moving", "command": dict(self._active_command), "stops_by_holding_current_position": True}
+        return {"ok": True, "state": "moving", "command": dict(self._active_command),
+                "stops_by_holding_current_position": True, "action_id": action_id}
 
-    def _run(self, stop_event, command):
+    def _run(self, stop_event, command, action_id=None):
         current, targets, duration = command["current"], command["targets"], command["duration_s"]
         steps = max(int(math.ceil(duration * self._publish_rate)),
                     max(int(math.ceil(abs(targets[name] - current[name]) / self._max_step)) for name in targets), 1)
@@ -239,6 +241,9 @@ class Plugin:
                 stop_event.wait(duration / steps)
         finally:
             self._router.release(CARD)
+            _acp_notify(action_id, "cancelled" if stop_event.is_set() else "completed", {
+                "targets_rad": dict(targets), "duration_s": duration,
+            }, CARD)
             with self._lock:
                 if self._motion_stop is stop_event:
                     self._motion_stop = self._motion_thread = self._active_command = None
@@ -291,7 +296,8 @@ class Plugin:
         command = self._targets(args) if action == "set" else self._profile_targets(action, args)
         if command.get("ok") is False:
             return command
-        return self._start_motion(command, action)
+        action_id = str(args.get("action_id") or f"hand_control_{action}_{int(time.time() * 1000)}")
+        return self._start_motion(command, action, action_id)
 
     def stop(self):
         self._stop("driver_shutdown")
