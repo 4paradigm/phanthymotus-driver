@@ -198,6 +198,32 @@ class LynxM20ContractTests(unittest.TestCase):
             metadata["state"], metadata["requested_map"], metadata["source"],
         ))
 
+        quaternion = SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0)
+        grid = SimpleNamespace(
+            header=SimpleNamespace(frame_id="map"),
+            info=SimpleNamespace(
+                width=2, height=1, resolution=0.5,
+                origin=SimpleNamespace(
+                    position=SimpleNamespace(x=0.0, y=0.0),
+                    orientation=quaternion,
+                ),
+            ),
+            data=[100, 0],
+        )
+        nodes._final_mapping_callback(FakeUInt8)(grid)
+        self.assertIs(grid, nodes._mapping_last_grid_msg)
+        self.assertEqual(1, len(nodes.mapping_pub.messages))
+
+        nodes.stop_mapping_view()
+        self.assertEqual(2, len(nodes.mapping_pub.messages))
+        packet = bytes(nodes.mapping_pub.messages[-1].data)
+        _, _, _, flags, count = struct.unpack_from("<fffBI", packet)
+        self.assertEqual((0x07, 1), (flags, count))
+        metadata_offset = 17 + count * 12
+        metadata_size = struct.unpack_from("<I", packet, metadata_offset)[0]
+        metadata = json.loads(packet[metadata_offset + 4:metadata_offset + 4 + metadata_size])
+        self.assertEqual(("saved_map", "GRID_MAP"), (metadata["state"], metadata["source"]))
+
     def test_mapping_view_encodes_supported_canvas_packet(self):
         quaternion = SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0)
         origin = SimpleNamespace(position=SimpleNamespace(x=-1.0, y=2.0), orientation=quaternion)

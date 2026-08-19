@@ -86,13 +86,18 @@ def _transform_point(point, pose):
     )
 
 
-def encode_occupancy_grid(msg, pose=None, *, occupied_threshold=50, max_points=50000, metadata=None) -> bytes:
-    """Convert nav_msgs/OccupancyGrid into the Canvas sensor/mapping packet."""
+def _validate_occupancy_grid(msg):
     width = int(msg.info.width)
     height = int(msg.info.height)
     resolution = float(msg.info.resolution)
     if width <= 0 or height <= 0 or resolution <= 0 or len(msg.data) < width * height:
         raise ValueError("invalid occupancy grid dimensions")
+    return width, height, resolution
+
+
+def encode_occupancy_grid(msg, pose=None, *, occupied_threshold=50, max_points=50000, metadata=None) -> bytes:
+    """Convert nav_msgs/OccupancyGrid into the Canvas sensor/mapping packet."""
+    width, height, resolution = _validate_occupancy_grid(msg)
 
     if not 0 <= occupied_threshold <= 100:
         raise ValueError("occupied_threshold must be between 0 and 100")
@@ -381,7 +386,9 @@ class M20Nodes:
         def callback(msg):
             try:
                 config = self.config.get("mapping_visualization", {})
+                _validate_occupancy_grid(msg)
                 with self._mapping_lock:
+                    self._mapping_last_grid_msg = msg
                     if self._mapping_runtime["state"] in ("starting", "live_mapping"):
                         return
                     pose = dict(self._mapping_pose) if self._mapping_pose else None
@@ -394,7 +401,6 @@ class M20Nodes:
                         "last_update_time": time.time(),
                     })
                     metadata = self._mapping_metadata_locked()
-                    self._mapping_last_grid_msg = msg
                 payload = encode_occupancy_grid(
                     msg,
                     pose,
