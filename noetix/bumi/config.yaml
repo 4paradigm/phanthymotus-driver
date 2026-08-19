@@ -23,9 +23,3 @@ plugins:
     activity_velocity_threshold: 0.15
   robot_status:
     enabled: true
-  audio_file_player:
-    enabled: true
-    # 上传音频文件的存储目录（容器内）
-    audio_dir: /work/audio
-    # 单个上传文件大小上限（字节，默认 50MB）
-    max_file_bytes: 52428800
