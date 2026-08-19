@@ -2153,6 +2153,7 @@ class JointPlanPlugin:
         self._state_lock = threading.RLock()
         self._state_changed = threading.Condition(self._state_lock)
         self._last_state = {"state": "no_data"}
+        self._last_request = {}
         self._executing_requests: set[int] = set()
         self._request_states: dict[int, dict] = {}
         self._request_id = 0
