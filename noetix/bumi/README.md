@@ -57,12 +57,15 @@ return an immediate plain-language error. A valid request returns only its ACP
 acknowledgement, `action_id`, requested action, and safety context. Before a
 disabled robot is enabled for stand-up, the driver explicitly sends zero
 velocity and then sustains a neutral DDS preroll. The `START` edge is still sent
-exactly once because it is a toggle. Stand-up allows up to 15 seconds for the
-firmware to report enabled mode, then requires enabled mode and rolling joint
-velocity feedback to remain stable before sending `FALLTOSTAND`; this avoids
-treating policy selection as proof that motor-enable initialization has
-finished. Successful and failed posture startup results and ACP callbacks are
-logged with their `action_id` for field diagnosis.
+only while workmode is confirmed disabled. If the first edge is not
+acknowledged after 15 seconds, stand-up makes one bounded retry. The full
+preroll continuously guards workmode, so a delayed first transition cancels the
+retry instead of toggling the robot back to disabled. After enabled mode is
+observed, rolling joint velocity feedback must remain stable before
+`FALLTOSTAND` is sent; this avoids treating policy selection as proof that
+motor-enable initialization has finished. Successful and failed posture
+startup results and ACP callbacks are logged with their `action_id` for field
+diagnosis.
 
 The former `switch_mode` tool is split into three user-facing cards. Internal
 `enable`, `ready` and `walk` transitions are completed automatically and are no

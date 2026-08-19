@@ -108,6 +108,7 @@ _STAND_POSE_MAX_ANGULAR_VELOCITY = 0.10
 _STAND_POSE_MAX_JOINT_VELOCITY = 0.15
 _STAND_POSE_MAX_JOINT_VELOCITY_SPIKE = 0.30
 _STAND_ENABLE_MODE_TIMEOUT_S = 15.0
+_STAND_ENABLE_MAX_ATTEMPTS = 2
 _STAND_ENABLE_SETTLE_TIMEOUT_S = 12.0
 _STAND_ENABLE_MIN_DWELL_S = 3.0
 _STAND_ENABLE_STATIONARY_CONFIRM_S = 2.0
@@ -1446,15 +1447,22 @@ class LocoPlugin:
         if mode == 26:
             return self._protection_error(requested_action, steps, mode)
         if mode == 30:
-            mode = self._run_preparation_step(
-                "enable", "START", {0}, steps,
-                observation_timeout_s=_STAND_ENABLE_MODE_TIMEOUT_S)
+            for attempt in range(1, _STAND_ENABLE_MAX_ATTEMPTS + 1):
+                if mode != 30:
+                    break
+                mode = self._run_preparation_step(
+                    f"enable_attempt_{attempt}", "START", {0}, steps,
+                    observation_timeout_s=_STAND_ENABLE_MODE_TIMEOUT_S,
+                    required_mode_before_send=30)
+                if mode == 0 or mode == 26:
+                    break
             if mode == 26:
                 return self._protection_error(requested_action, steps, mode)
             if mode != 0:
                 return self._preparation_error(
                     requested_action, steps, mode,
-                    "The robot did not enter enabled mode. FALLTOSTAND was not sent.")
+                    "The robot did not enter enabled mode after two guarded START attempts. "
+                    "FALLTOSTAND was not sent.")
         if mode != 0:
             return self._preparation_error(
                 requested_action, steps, mode,
@@ -2214,22 +2222,27 @@ class LocoPlugin:
 
     def _run_preparation_step(self, step: str, command_name: str,
                               expected_modes: set[int], steps: list[dict],
-                              observation_timeout_s: float | None = None) -> int:
-        # START is a toggle, so it must never be retried.  On the tested Bumi,
-        # however, the disabled state reached after STANDTOFALL can ignore a
-        # START edge until it has first received a sustained neutral stream.
-        # Prime that transition every time instead of only once per process.
+                              observation_timeout_s: float | None = None,
+                              required_mode_before_send: int | None = None) -> int:
+        # START is a toggle, so every edge must be guarded by the current mode.
+        # On the tested Bumi, the disabled state reached after STANDTOFALL can
+        # ignore a START edge until it has first received a sustained neutral
+        # stream. Prime each guarded attempt instead of only once per process.
         neutral_preroll_s = (
             self._control_cold_preroll_s if command_name == "START" else None)
         if observation_timeout_s is None:
             observation_timeout_s = 6.0 if command_name == "START" else 3.0
+        send_status = {}
         observed = self._send_edge_and_wait(
             _get_control_cmd(command_name), expected_modes | {26},
             timeout_s=observation_timeout_s,
-            preroll_override_s=neutral_preroll_s)
+            preroll_override_s=neutral_preroll_s,
+            required_mode_before_send=required_mode_before_send,
+            send_status=send_status)
         step_result = {
             "step": step,
             "command": command_name,
+            "command_sent": bool(send_status.get("command_sent")),
             "expected_workmodes": sorted(expected_modes),
             "observed_workmode": observed,
             "observed_workmode_name": _WORKMODE_NAMES.get(observed, "unknown"),
@@ -2238,6 +2251,11 @@ class LocoPlugin:
         }
         if neutral_preroll_s is not None:
             step_result["neutral_preroll_s"] = neutral_preroll_s
+        if send_status.get("blocked_by_mode_change"):
+            step_result["send_skipped_reason"] = (
+                "Workmode changed before the edge command was sent; the command was "
+                "skipped to avoid reversing the transition."
+            )
         steps.append(step_result)
         print(
             "[posture] preparation_step "
@@ -2339,16 +2357,23 @@ class LocoPlugin:
     def _send_edge_and_wait(self, cmd_enum, expected_modes: set[int],
                             index: int = 0, timeout_s: float = 2.0,
                             preroll_override_s: float | None = None,
-                            command_values: tuple[float, float, float] | None = None) -> int:
+                            command_values: tuple[float, float, float] | None = None,
+                            required_mode_before_send: int | None = None,
+                            send_status: dict | None = None) -> int:
         """Prime DDS, send one action edge, then maintain neutral control frames."""
         with self._action_lock:
             default_cmd = _get_default_cmd()
+            if send_status is not None:
+                send_status.clear()
+                send_status["command_sent"] = False
 
             # The vendor examples keep publishing at 100 Hz. Use a longer
             # DEFAULT-only pre-roll for a new DDS writer and whenever the caller
             # explicitly requests it for a state transition such as START.
-            # Never retry the action itself: START is a toggle and a delayed
-            # duplicate could immediately disable the robot again.
+            # This method sends at most one action edge. A higher-level caller
+            # may make a bounded retry only while required_mode_before_send is
+            # continuously confirmed, preventing a delayed START transition
+            # from being toggled back to disabled.
             if preroll_override_s is not None:
                 preroll_s = preroll_override_s
             else:
@@ -2376,18 +2401,31 @@ class LocoPlugin:
             while time.monotonic() < preroll_deadline:
                 if self._lifecycle_stop_event.is_set():
                     return int(self._high_ctrl.get_mode())
+                if required_mode_before_send is not None:
+                    observed = int(self._high_ctrl.get_mode())
+                    if observed != required_mode_before_send:
+                        if send_status is not None:
+                            send_status["blocked_by_mode_change"] = True
+                        return observed
                 self._publish_cmd(0, 0, 0, default_cmd, 0)
                 time.sleep(self._control_period)
             self._control_channel_warmed = True
 
             if self._lifecycle_stop_event.is_set():
                 return int(self._high_ctrl.get_mode())
+            if required_mode_before_send is not None:
+                observed = int(self._high_ctrl.get_mode())
+                if observed != required_mode_before_send:
+                    if send_status is not None:
+                        send_status["blocked_by_mode_change"] = True
+                    return observed
 
-            # Actions such as START and PLAYTEACH are edge-triggered. Never
-            # retry them automatically: START is a toggle and repeated actions
-            # can reverse a transition or restart an active policy.
+            # Actions such as START and PLAYTEACH are edge-triggered. Send this
+            # edge exactly once; any bounded retry is a separate guarded call.
             command_x, command_y, command_z = command_values or (0.0, 0.0, 0.0)
             self._publish_cmd(command_x, command_y, command_z, cmd_enum, index)
+            if send_status is not None:
+                send_status["command_sent"] = True
             time.sleep(self._control_period)
 
             deadline = time.monotonic() + timeout_s
