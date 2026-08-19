@@ -315,7 +315,7 @@ class ProposalGateTest(unittest.TestCase):
         self.assertEqual(gate.expected_nav_id, "nav-001")
         self.assertEqual(gate.last_sequence, 1)
 
-    def test_terminal_releases_for_next_new_nav_id_and_rejects_replay(self):
+    def test_failed_terminal_stop_then_success_releases_for_next_nav_id(self):
         gate = VelocityProposalGate(ProposalLimits())
         gate.bind(EXPECTED_TOPIC)
         self.assertTrue(gate.accept(proposal(sequence=1), now=10.0).execute)
@@ -330,15 +330,38 @@ class ProposalGateTest(unittest.TestCase):
         )
         self.assertTrue(terminal.stop)
         self.assertFalse(gate.armed)
-        self.assertTrue(gate.awaiting_nav_id)
+        self.assertFalse(gate.awaiting_nav_id)
+        self.assertTrue(gate.terminal_pending_stop)
+        self.assertEqual(gate.last_reason, "terminal_pending_stop")
+        self.assertEqual(gate.snapshot(10.1)["active_nav_id"], "nav-001")
 
-        replay = gate.accept(proposal(sequence=3), now=10.2)
+        self.assertFalse(gate.record_terminal_stop_result(False))
+        self.assertFalse(gate.armed)
+        self.assertFalse(gate.awaiting_nav_id)
+        self.assertTrue(gate.terminal_pending_stop)
+        self.assertEqual(gate.last_reason, "terminal_stop_unconfirmed")
+
+        blocked = gate.accept(
+            proposal(nav_id="nav-002", sequence=1),
+            now=10.2,
+        )
+        self.assertFalse(blocked.stop)
+        self.assertFalse(blocked.execute)
+        self.assertEqual(blocked.reason, "terminal_stop_unconfirmed")
+
+        self.assertTrue(gate.record_terminal_stop_result(True))
+        self.assertFalse(gate.armed)
+        self.assertTrue(gate.awaiting_nav_id)
+        self.assertFalse(gate.terminal_pending_stop)
+        self.assertEqual(gate.last_reason, "awaiting_first_valid_proposal")
+
+        replay = gate.accept(proposal(sequence=3), now=10.3)
         self.assertEqual(replay.reason, "retired_nav_id_replay")
         self.assertTrue(gate.awaiting_nav_id)
 
         next_task = gate.accept(
             proposal(nav_id="nav-002", sequence=1),
-            now=10.3,
+            now=10.4,
         )
         self.assertTrue(next_task.execute)
         self.assertEqual(gate.expected_nav_id, "nav-002")
@@ -378,7 +401,7 @@ class ProposalGateTest(unittest.TestCase):
         self.assertEqual(rejected.reason, "nav_id_mismatch")
         self.assertTrue(self.gate.armed)
 
-    def test_terminal_zero_retires_and_disarms_nav_lease(self):
+    def test_control_plane_terminal_waits_for_confirmation_before_rebind(self):
         self.assertTrue(self.gate.accept(proposal(), now=10.0).execute)
         terminal = self.gate.accept(
             proposal(
@@ -390,10 +413,13 @@ class ProposalGateTest(unittest.TestCase):
         )
         self.assertTrue(terminal.stop)
         self.assertFalse(self.gate.armed)
+        self.assertTrue(self.gate.terminal_pending_stop)
         next_task = self.gate.accept(proposal(nav_id="nav-002", sequence=1), now=10.2)
         self.assertFalse(next_task.execute)
-        self.assertTrue(next_task.stop)
+        self.assertFalse(next_task.stop)
+        self.assertEqual(next_task.reason, "terminal_pending_stop")
 
+        self.assertTrue(self.gate.record_terminal_stop_result(True))
         self.gate.bind(EXPECTED_TOPIC, "nav-002")
         self.assertTrue(
             self.gate.accept(proposal(nav_id="nav-002", sequence=1), now=10.3).execute
@@ -409,6 +435,7 @@ class ProposalGateTest(unittest.TestCase):
             ),
             now=10.1,
         )
+        self.assertTrue(self.gate.record_terminal_stop_result(True))
         with self.assertRaises(ValueError):
             self.gate.bind(EXPECTED_TOPIC, "nav-001")
 
@@ -520,7 +547,7 @@ class ProposalGateTest(unittest.TestCase):
         self.assertFalse(self.gate.armed)
         self.assertFalse(self.gate.recoverable_stop_active)
 
-    def test_terminal_zero_retires_recoverable_obstacle_lease(self):
+    def test_terminal_zero_pending_clears_recoverable_obstacle_hold(self):
         self.assertTrue(self.gate.accept(proposal(sequence=1), now=10.0).execute)
         self.gate.hold_for_obstacle()
 
@@ -536,6 +563,8 @@ class ProposalGateTest(unittest.TestCase):
         self.assertTrue(terminal.stop)
         self.assertFalse(self.gate.armed)
         self.assertFalse(self.gate.recoverable_stop_active)
+        self.assertTrue(self.gate.terminal_pending_stop)
+        self.assertTrue(self.gate.record_terminal_stop_result(True))
 
     def test_end_to_end_ttl_uses_only_remaining_producer_lease(self):
         accepted = self.gate.accept(

@@ -239,6 +239,7 @@ class VelocityProposalGate:
         self.deadline_monotonic = 0.0
         self.last_reason = "not_connected"
         self.recoverable_stop_active = False
+        self.terminal_pending_stop = False
 
     def bind(self, topic: str, expected_nav_id: Optional[str] = None) -> None:
         nav_id = resolve_optional_expected_nav_id(
@@ -262,6 +263,7 @@ class VelocityProposalGate:
             "" if nav_id is not None else "awaiting_first_valid_proposal"
         )
         self.recoverable_stop_active = False
+        self.terminal_pending_stop = False
 
     def unbind(self, reason: str = "canvas_stop") -> None:
         self._retire_expected_nav_id()
@@ -275,6 +277,7 @@ class VelocityProposalGate:
         self.deadline_monotonic = 0.0
         self.last_reason = reason
         self.recoverable_stop_active = False
+        self.terminal_pending_stop = False
 
     def disarm(self, reason: str) -> None:
         self._retire_expected_nav_id()
@@ -283,6 +286,7 @@ class VelocityProposalGate:
         self.deadline_monotonic = 0.0
         self.last_reason = reason
         self.recoverable_stop_active = False
+        self.terminal_pending_stop = False
 
     def hold_for_obstacle(self) -> None:
         """Keep the nav lease armed after a confirmed local obstacle stop."""
@@ -363,6 +367,7 @@ class VelocityProposalGate:
         self.last_sequence = -1
         self.deadline_monotonic = 0.0
         self.recoverable_stop_active = False
+        self.terminal_pending_stop = False
         if self.connected_topic and self.nav_id_binding_mode == "first_valid_proposal":
             self.awaiting_nav_id = True
             self.last_reason = "awaiting_first_valid_proposal"
@@ -370,9 +375,27 @@ class VelocityProposalGate:
             self.awaiting_nav_id = False
             self.last_reason = reason
 
-    def _complete_nav_task(self) -> None:
-        """Retire the task and remain ready for the next task."""
-        self.release_after_confirmed_stop("nav_task_terminal")
+    def begin_terminal_stop(self) -> None:
+        """Block execution while retaining the task until stop is confirmed."""
+        self.armed = False
+        self.awaiting_nav_id = False
+        self.deadline_monotonic = 0.0
+        self.recoverable_stop_active = False
+        self.terminal_pending_stop = True
+        self.last_reason = "terminal_pending_stop"
+
+    def record_terminal_stop_result(self, stop_confirmed: bool) -> bool:
+        """Release a terminal task only after a measured stop succeeds."""
+        if not self.terminal_pending_stop:
+            return False
+        if stop_confirmed:
+            self.release_after_confirmed_stop("nav_task_terminal")
+            return True
+        self.armed = False
+        self.awaiting_nav_id = False
+        self.deadline_monotonic = 0.0
+        self.last_reason = "terminal_stop_unconfirmed"
+        return False
 
     def accept(
         self,
@@ -382,6 +405,8 @@ class VelocityProposalGate:
     ) -> ProposalDecision:
         if not self.connected_topic:
             return ProposalDecision(stop=True, reason="proposal_not_connected")
+        if self.terminal_pending_stop:
+            return ProposalDecision(reason=self.last_reason or "terminal_pending_stop")
         bootstrap = self.awaiting_nav_id
         if not self.armed and not bootstrap:
             return ProposalDecision(stop=True, reason=self.last_reason or "proposal_not_armed")
@@ -455,7 +480,7 @@ class VelocityProposalGate:
         if proposal.is_zero:
             self.deadline_monotonic = 0.0
             if proposal.is_terminal:
-                self._complete_nav_task()
+                self.begin_terminal_stop()
             else:
                 self.last_reason = proposal.status
             return ProposalDecision(stop=True, reason="proposal_zero", proposal=proposal)
@@ -479,9 +504,14 @@ class VelocityProposalGate:
             "armed": self.armed,
             "topic": self.connected_topic or None,
             "expected_nav_id": self.expected_nav_id or None,
-            "active_nav_id": self.expected_nav_id if self.armed else None,
+            "active_nav_id": (
+                self.expected_nav_id
+                if self.armed or self.terminal_pending_stop
+                else None
+            ),
             "awaiting_nav_id": self.awaiting_nav_id,
             "nav_id_binding_mode": self.nav_id_binding_mode or None,
+            "terminal_pending_stop": self.terminal_pending_stop,
             "last_sequence": self.last_sequence if self.last_sequence >= 0 else None,
             "last_message_age_ms": age_ms,
             "last_reason": self.last_reason or None,

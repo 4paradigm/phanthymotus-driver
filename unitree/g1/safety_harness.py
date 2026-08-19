@@ -1681,7 +1681,9 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
             and (was_proposal_motion or reason_str == "proposal_ttl_expired")
         )
         proposal_stop_context = bool(
-            was_proposal_motion or recoverable_stop_requested
+            was_proposal_motion
+            or recoverable_stop_requested
+            or proposal_gate.terminal_pending_stop
         )
         retry_proposal_stop = (
             proposal_stop_context and not confirm_physical_stop
@@ -1830,6 +1832,35 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
             last_stop_result = dict(result)
             if proposal_stop_context:
                 last_proposal_stop_result = dict(result)
+        if proposal_gate.terminal_pending_stop:
+            proposal_gate.record_terminal_stop_result(
+                result.get("stop_confirmed") is True
+            )
+        return result
+
+    @motion_synchronized
+    def retry_terminal_stop_confirmation():
+        """Retry a failed terminal stop and release only after fresh zero odom."""
+        nonlocal last_stop_result, last_proposal_stop_result, stop_repeat_count
+        if not proposal_gate.terminal_pending_stop:
+            return None
+        result = issue_stop_and_confirm(
+            issue_stop_move,
+            odom_stop_monitor,
+            proposal_stop_confirm_timeout,
+            proposal_odom_timeout,
+            proposal_stop_linear_epsilon,
+            proposal_stop_yaw_epsilon,
+        )
+        result.update({"state": "idle", "reason": "terminal_stop_retry"})
+        last_stop_result = dict(result)
+        last_proposal_stop_result = dict(result)
+        proposal_gate.record_terminal_stop_result(
+            result.get("stop_confirmed") is True
+        )
+        stop_repeat_count = 0 if result.get("stop_confirmed") else max(
+            0, stop_repeat_count - 1
+        )
         return result
 
     @motion_synchronized
@@ -2846,13 +2877,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                 newly_disarmed,
                 proposal_gate.recoverable_stop_active,
             ):
-                stopped = do_stop(decision.reason)
-                if (
-                    decision.proposal is not None
-                    and decision.proposal.is_terminal
-                    and stopped.get("stop_confirmed") is not True
-                ):
-                    proposal_gate.disarm("terminal_stop_unconfirmed")
+                do_stop(decision.reason)
             return
         if not decision.execute or decision.proposal is None:
             proposal_apply_diagnostics.record_rejected(
@@ -3274,7 +3299,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                         proposal_gate.release_after_confirmed_stop(
                             "manual_stop"
                         )
-                    else:
+                    elif not proposal_gate.terminal_pending_stop:
                         proposal_gate.disarm("manual_stop_unconfirmed")
             elif method == "navigate_to":
                 with motion_command_lock:
@@ -3391,11 +3416,14 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
 
             # Repeat StopMove after emergency_stop to ensure controller receives it
             if stop_repeat_count > 0 and state == MotionState.IDLE:
-                try:
-                    stop_loco_client.StopMove()
-                except Exception:
-                    pass
-                stop_repeat_count -= 1
+                if proposal_gate.terminal_pending_stop:
+                    retry_terminal_stop_confirmation()
+                else:
+                    try:
+                        stop_loco_client.StopMove()
+                    except Exception:
+                        pass
+                    stop_repeat_count -= 1
 
         # Periodic health log: verify slam_info subscription is working
         if now - last_slam_info_log >= 10.0:

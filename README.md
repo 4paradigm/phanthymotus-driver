@@ -96,9 +96,11 @@ identity, sequence, RPC, and stop-confirmation faults still disarm the lease.
 `loco.start` connects the sole proposal topic and remains physically stopped.
 While idle, the Driver validates the first fresh, legal, nonzero proposal and
 atomically binds its `nav_id` before executing that same proposal. Another ID
-cannot replace or interrupt the active task. A terminal zero proposal or a
-confirmed explicit stop retires the active ID while keeping the subscription
-ready for the next task's first proposal. Invalid, stale, zero bootstrap,
+cannot replace or interrupt the active task. A terminal zero proposal first
+enters `terminal_pending_stop`; only a successful zero-odometry stop
+confirmation retires the active ID and keeps the subscription ready for the
+next task. A failed confirmation stays fail-closed, and a later successful
+retry restores `awaiting_first_valid_proposal`. Invalid, stale, zero bootstrap,
 terminal bootstrap, retired-ID, and mid-task mismatched-ID proposals never
 establish or replace a lease, so Agent Core needs no per-task authorization
 action for consecutive navigation tasks.

@@ -563,6 +563,13 @@ class SmartMotionParentLocoSequenceTest(unittest.TestCase):
         self.assertIn("last_proposal_stop_result = dict(result)", source)
         self.assertIn('"last_proposal_stop": (', source)
         self.assertIn("last_proposal_stop_result = None", source)
+        self.assertIn("def retry_terminal_stop_confirmation", source)
+        self.assertIn("proposal_gate.record_terminal_stop_result(", source)
+        self.assertIn("if proposal_gate.terminal_pending_stop:", source)
+        self.assertNotIn(
+            'proposal_gate.disarm("terminal_stop_unconfirmed")',
+            source,
+        )
         self.assertIn("parent_loco_rpc_lock", source)
         self.assertIn("proposal_ros_spin_loop", source)
         callback_source = source[
