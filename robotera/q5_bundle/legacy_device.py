@@ -1506,6 +1506,10 @@ class AudioPlugin:
         if error:
             return None, error
         if state:
+            # Chat may already report ON while the previous direct speaker
+            # process is still draining its ALSA handle.
+            if self._chat_route_settle:
+                time.sleep(self._chat_route_settle)
             return True, None
         ok, error = self._xos_chat_set(self._xos_chat_launch_path)
         if not ok:
@@ -1604,7 +1608,9 @@ class AudioPlugin:
             return {"state": "ok" if response.result.success else "error", "message": response.result.message}
         finally:
             if started_chat:
-                self._xos_chat_stop_after_playback()
+                cleanup_ok, cleanup_error = self._xos_chat_stop_after_playback()
+                if not cleanup_ok:
+                    print(f"[AudioPlugin] XOS chat cleanup failed: {cleanup_error}", flush=True)
 
     def _set_volume(self, value):
         if not self._srv_volume.service_is_ready():
