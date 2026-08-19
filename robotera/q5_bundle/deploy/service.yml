@@ -10,6 +10,8 @@ robotera-q5:
   environment:
     - Q5_ROS_DOMAIN_ID=211
     - AGENT_CORE_ROS_DOMAIN_ID=42
+    # Pass through the Agent Core access token when API authentication is enabled.
+    - ACCESS_TOKEN=${ACCESS_TOKEN:-}
     - Q5_CYCLONEDDS_URI=file:///etc/cyclonedds/q5.xml
     - ROS_LOCALHOST_ONLY=0
     - PYTHONUNBUFFERED=1

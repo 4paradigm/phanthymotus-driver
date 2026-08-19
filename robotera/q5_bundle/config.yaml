@@ -55,7 +55,8 @@ plugins:
     # Agent Core writes files selected in the canvas here, then the driver
     # retrieves them through AGENT_CORE_URL's existing file-download endpoint.
     agent_core_upload_dir: "/tmp/uploads"
-    # Set AGENT_CORE_TOKEN (or AGENT_CORE_ACCESS_TOKEN) when Agent Core auth is enabled.
+    # Set AGENT_CORE_TOKEN, AGENT_CORE_ACCESS_TOKEN, or Agent Core's native
+    # ACCESS_TOKEN when Agent Core auth is enabled.
     volume: 50
     upload_max_bytes: 20971520
     xos_http_base: "http://192.168.8.100:1888"
