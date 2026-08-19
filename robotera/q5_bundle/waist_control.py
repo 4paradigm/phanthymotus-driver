@@ -205,7 +205,7 @@ class Plugin:
                     "info": {"params": [], "description": "查看运动状态与安全条件。"},
                 },
                 "x-completion": {
-                    "actions": list(WAIST_ACTIONS.keys()),
+                    "actions": [*WAIST_ACTIONS.keys(), "reset"],
                     "timeout": 15,
                 },
             }}

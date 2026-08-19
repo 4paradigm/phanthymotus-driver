@@ -325,7 +325,7 @@ class Plugin:
                     "info": {"params": [], "description": "查看当前运动和安全条件"},
                 },
                 "x-completion": {
-                    "actions": ["salute", "welcome", "raise", "shake_hands", "high_five"],
+                    "actions": ["salute", "welcome", "raise", "shake_hands", "high_five", "reset"],
                     "timeout": 60,
                 },
             },
