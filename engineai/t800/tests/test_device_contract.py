@@ -1058,6 +1058,7 @@ class DevicePluginContractTests(unittest.TestCase):
         plugin._check_pulse = lambda: None
         plugin._run_command = lambda command: commands.append(command) or ""
         plugin._spawn_player = lambda: process
+        plugin._play_startup_sound = lambda: None  # 跳过开机音（不需要在测试中跑 aplay）
         started = plugin.dispatch("start", {"input_topic": "/perception/tts"})
         self.assertEqual("ready", started["state"])
         self.assertEqual("/perception/tts", started["topic_in"][0]["topic"])
@@ -1198,9 +1199,55 @@ class DevicePluginContractTests(unittest.TestCase):
         plugin._check_pulse = lambda: None
         plugin._run_command = lambda command: ""
         plugin._spawn_player = lambda: DeadProcess()
+        plugin._play_startup_sound = lambda: None  # 跳过开机音（DeadProcess.stdin 是 None）
         started = plugin.dispatch("start", {"input_topic": "/perception/tts"})
         self.assertEqual("error", started["state"])
         self.assertIn("aplay exited", started["message"])
+
+    def test_speaker_startup_sound_plays_on_dispatch_start(self):
+        plugin = self.device.SpeakerPlugin(CONFIG, "robot", self.ros)
+
+        class FakeStdin:
+            def __init__(self):
+                self.writes = []
+                self.closed = False
+
+            def write(self, data):
+                self.writes.append(data)
+
+            def flush(self):
+                pass
+
+            def close(self):
+                self.closed = True
+
+        class FakeProcess:
+            def __init__(self):
+                self.stdin = FakeStdin()
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = 0
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        process = FakeProcess()
+        plugin._check_pulse = lambda: None
+        plugin._run_command = lambda command: ""
+        plugin._spawn_player = lambda: process
+        started = plugin.dispatch("start", {"input_topic": "/perception/tts"})
+        self.assertEqual("ready", started["state"])
+        # 开机音 PCM 已在创建订阅前写入 aplay stdin
+        self.assertTrue(process.stdin.writes)
+        self.assertTrue(process.stdin.closed)
+        # 播放线程应正常运行，不因开机音而阻塞
 
     def test_native_node_control_and_composed_safety(self):
         native = self.device.NativeNodeControlPlugin(CONFIG, "robot", self.ros)
@@ -1258,7 +1305,7 @@ class DevicePluginContractTests(unittest.TestCase):
         data = bytes(range(64))  # 4 点 × 16 字节 point_step
         plugin._on_cloud_raw(types.SimpleNamespace(point_step=16, data=data))
         out = plugin._cloud_pub.messages[-1]
-self.assertEqual(struct.pack("<II", 16, 4), bytes(out.data[:8]))
+        self.assertEqual(struct.pack("<II", 16, 4), bytes(out.data[:8]))
         self.assertEqual(bytes(range(64)), bytes(out.data[8:]))
         self.assertEqual(1, plugin._frames["pointcloud"])
 
