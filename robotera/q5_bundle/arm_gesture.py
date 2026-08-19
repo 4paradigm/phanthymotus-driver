@@ -443,8 +443,15 @@ class Plugin:
                   gesture: str, action_id: str | None):
         """Interpolate through gesture frames, honoring stop_event and commanded side."""
         cancelled = True  # default: cancelled on any error/exception
+        acquired = False
         try:
             previous_positions = dict(self._hold_current())  # start from current pose
+
+            # Acquire the router once for the entire gesture so no other body
+            # card can interleave commands between frames.
+            acquired = self._router.acquire(CARD)
+            if not acquired:
+                return
 
             for frame_deg, hold_s, transition_ratio in frames:
                 if stop_event.is_set():
@@ -477,30 +484,24 @@ class Plugin:
                     1,
                 )
 
-                acquired = self._router.acquire(CARD)
-                if not acquired:
-                    break
-
-                try:
-                    for step in range(1, steps + 1):
-                        if stop_event.is_set():
-                            break
-                        t = step / steps
-                        interp_positions = {}
-                        for name in ARM_JOINT_NAMES:
-                            if name in positions and name in previous_positions:
-                                prev = previous_positions[name]
-                                tgt = positions[name]
-                                interp_positions[name] = prev + (tgt - prev) * t
-                        if interp_positions:
-                            self._publish_positions(interp_positions)
-                        stop_event.wait(transition_s / steps)
-                finally:
+                for step in range(1, steps + 1):
                     if stop_event.is_set():
-                        self._hold_current()
-                    else:
-                        self._hold_positions(positions)
-                    self._router.release(CARD)
+                        break
+                    t = step / steps
+                    interp_positions = {}
+                    for name in ARM_JOINT_NAMES:
+                        if name in positions and name in previous_positions:
+                            prev = previous_positions[name]
+                            tgt = positions[name]
+                            interp_positions[name] = prev + (tgt - prev) * t
+                    if interp_positions:
+                        self._publish_positions(interp_positions)
+                    stop_event.wait(transition_s / steps)
+
+                if stop_event.is_set():
+                    self._hold_current()
+                else:
+                    self._hold_positions(positions)
 
                 previous_positions = {
                     name: positions[name] for name in ARM_JOINT_NAMES
@@ -513,6 +514,8 @@ class Plugin:
         except Exception:
             pass
         finally:
+            if acquired:
+                self._router.release(CARD)
             # ACP completion callback
             if action_id:
                 if cancelled and not stop_event.is_set():
@@ -575,62 +578,37 @@ class Plugin:
 
         if action == "reset":
             speed = _clamp(args.get("speed", 0.8), 0.2, 1.5)
-            # reset bypasses gesture validation; check side/robot safety instead
             side = "both"
             check = self._validate_run("", side)
             if isinstance(check, dict):
                 return check
-            # Check for active motion outside the lock to avoid deadlock:
-            # _stop() also acquires self._lock, so we peek first then call
-            # _stop() only if needed (and _stop() will re-acquire the lock).
             need_cancel = False
             with self._lock:
                 if self._motion_thread is not None and self._motion_thread.is_alive():
                     need_cancel = True
             if need_cancel:
                 self._stop("preempt")
-            # Build neutral pose for both arms with proper mirroring
             neutral = _mirrored_positions("_neutral", "both", _NEUTRAL_DEG)
             violations = _validate_pose_rad(neutral)
             if violations:
                 return _failure("LIMIT_EXCEEDED", "Neutral pose out of range", violations=violations)
-            acquired = self._router.acquire(CARD)
-            if not acquired:
-                return _failure("COMMAND_IN_PROGRESS", "Another arm card owns the command path")
-            try:
-                # Interpolate from current to neutral like a gesture frame
-                snap = self._client.snapshot()
-                current = {}
-                if snap.get("fresh"):
-                    joints = snap.get("joints", {})
-                    for name in ARM_JOINT_NAMES:
-                        v = joints.get(name)
-                        if v is not None:
-                            current[name] = float(v)
-                if current:
-                    max_delta = max(
-                        (abs(neutral.get(name, 0.0) - current.get(name, 0.0))
-                         for name in ARM_JOINT_NAMES if name in neutral and name in current),
-                        default=0.0,
-                    )
-                    transition_s = max_delta / speed if speed > 0 else 1.0
-                    steps = max(int(math.ceil(max_delta / self._max_step)),
-                               int(math.ceil(transition_s * self._publish_rate)), 1)
-                    for step in range(1, steps + 1):
-                        t = step / steps
-                        interp = {}
-                        for name in ARM_JOINT_NAMES:
-                            if name in neutral and name in current:
-                                interp[name] = current[name] + (neutral[name] - current[name]) * t
-                        if interp:
-                            self._publish_positions(interp)
-                        time.sleep(transition_s / steps)
-                self._hold_positions(neutral)
-            finally:
-                self._router.release(CARD)
-            self._status = {"state": "idle", "gesture": "reset",
+            # Run reset as async worker with ACP completion
+            action_id = f"arm_gesture_reset_{int(time.time()*1000)}"
+            frames = [(_NEUTRAL_DEG, 1.0, 1.0)]
+            stop_event = threading.Event()
+            with self._lock:
+                self._stop_event = stop_event
+                self._motion_thread = threading.Thread(
+                    target=self._run_move,
+                    args=(stop_event, frames, speed, side, "reset", action_id),
+                    daemon=True,
+                    name="q5_arm_gesture_reset",
+                )
+                self._motion_thread.start()
+            self._status = {"state": "running", "gesture": "reset", "side": side,
                             "updated_at_ms": int(time.time() * 1000)}
-            return {"ok": True, "state": "stopped", "gesture": "reset"}
+            return {"ok": True, "state": "running", "gesture": "reset",
+                    "side": side, "action_id": action_id}
 
         # Gesture actions
         if action not in _GESTURES_DEG:
