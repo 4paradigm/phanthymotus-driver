@@ -1035,23 +1035,25 @@ class SpeakerPlugin:
         executor.add_node(self._node)
         self._playing = False
         self._sub = None
+        # 输入音频 topic：收到音频流后立即自动播放（配合 agent-core 的 remote_audio 工具）
+        self._input_topic = plugin_config.get("input_topic", "/remote_control/audio")
 
     def get_tool(self) -> dict:
         return {
             "name": "speaker",
             "type": "actuator",
             "multiInstance": False,
-            "description": "Bumi speaker — play audio from ROS2 topic on robot speaker, volume control, wake/sleep.",
+            "description": (
+                "Bumi speaker — auto-plays audio stream received on the input topic "
+                "(no play button; start() subscribes and plays immediately on data). "
+                "Volume control, wake/sleep."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["play", "stop", "get_volume", "set_volume", "wakeup", "sleep"],
-                    },
-                    "input_topic": {
-                        "type": "string",
-                        "description": "ROS2 topic to subscribe for PCM audio data",
+                        "enum": ["start", "stop", "get_volume", "set_volume", "wakeup", "sleep"],
                     },
                     "volume": {
                         "type": "integer",
@@ -1061,9 +1063,9 @@ class SpeakerPlugin:
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "play": {
-                        "params": ["input_topic"],
-                        "description": "Subscribe to audio topic and play through robot speaker",
+                    "start": {
+                        "params": [],
+                        "description": "Subscribe to input topic and auto-play on incoming audio",
                     },
                     "stop": {
                         "params": [],
@@ -1087,12 +1089,41 @@ class SpeakerPlugin:
                     },
                 },
             },
-            "topic_in": [{"format": "audio/pcm-16k"}],
+            "topic_in": [{"topic": self._input_topic, "format": "audio/pcm-16k"}],
             "topic_out": [],
         }
 
     def start(self) -> None:
-        pass
+        """启动即订阅输入 topic，收到音频流立即播放（不再需要手动 play）。"""
+        self._playing = True
+
+        # Wake up the audio agent before playback (per SDK test_media.py)
+        try:
+            self._media_ctrl.wakeup()
+            time.sleep(1.0)
+        except Exception as e:
+            self._node.get_logger().warn(f"Speaker wakeup failed: {e}")
+        try:
+            self._media_ctrl.resume_audio_playback()
+        except Exception as e:
+            self._node.get_logger().warn(f"Speaker resume_audio_playback failed: {e}")
+
+        import queue
+        if getattr(self, "_audio_queue", None) is None:
+            self._audio_queue = queue.Queue()
+            self._start_play_loop()
+
+        # 订阅输入 topic，收到数据立即入队播放
+        def _on_audio(msg):
+            if not self._playing:
+                return
+            try:
+                self._audio_queue.put(bytes(msg.data))
+            except Exception as e:
+                self._node.get_logger().warn(f"Speaker enqueue error: {e}")
+
+        if self._sub is None:
+            self._sub = self._node.create_subscription(AudioChunk, self._input_topic, _on_audio, _LOW_LAT_QOS)
 
     def stop(self) -> None:
         self._playing = False
@@ -1101,13 +1132,12 @@ class SpeakerPlugin:
         args.pop('_tool_name', None)
 
         if action == "start":
-            return {"state": "ready"}
+            self.start()
+            return {"state": "playing", "input_topic": self._input_topic}
         if action == "stop":
             self._playing = False
             self._media_ctrl.pause_audio_playback()
             return {"state": "idle"}
-        if action == "play":
-            return self._do_play(args)
         if action == "get_volume":
             vol = self._media_ctrl.get_volume()
             return {"volume": vol}
@@ -1122,41 +1152,6 @@ class SpeakerPlugin:
             self._media_ctrl.sleep()
             return {"state": "sleeping"}
         return None
-
-    def _do_play(self, args: dict) -> dict:
-        input_topic = args.get("input_topic", "")
-        if not input_topic:
-            return {"error": "input_topic is required"}
-
-        self._playing = True
-
-        # Wake up the audio agent before playback (per SDK test_media.py)
-        try:
-            self._media_ctrl.wakeup()
-            time.sleep(1.0)
-        except Exception as e:
-            self._node.get_logger().warn(f"Speaker wakeup failed: {e}")
-        self._media_ctrl.resume_audio_playback()
-
-        import queue
-        if getattr(self, "_audio_queue", None) is None:
-            self._audio_queue = queue.Queue()
-            self._start_play_loop()
-
-        # Subscribe to the audio topic (AudioChunk: raw mono PCM bytes)
-        def _on_audio(msg):
-            if not self._playing:
-                return
-            try:
-                self._audio_queue.put(bytes(msg.data))
-            except Exception as e:
-                self._node.get_logger().warn(f"Speaker enqueue error: {e}")
-
-        if self._sub is not None:
-            self._node.destroy_subscription(self._sub)
-        self._sub = self._node.create_subscription(AudioChunk, input_topic, _on_audio, _LOW_LAT_QOS)
-
-        return {"state": "playing", "input_topic": input_topic}
 
     def _start_play_loop(self) -> None:
         """Background thread: mono PCM -> stereo, stream 10ms frames to the robot speaker.

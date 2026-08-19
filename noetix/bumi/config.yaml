@@ -13,6 +13,9 @@ plugins:
     gain: 50
   speaker:
     enabled: true
+    # 输入音频 topic：收到音频流后立即自动播放（配合 agent-core 的 remote_audio 工具，
+    # 该工具把浏览器上传的音频转成 PCM 发布到这个 topic）。
+    input_topic: "/remote_control/audio"
   camera:
     enabled: true
   motion_state:
