@@ -1162,10 +1162,6 @@ class AudioPlugin:
     _xos_audio_upload_path = "/robot/replay/tts/upload_audio?lang=zh"
     _xos_audio_check_path = "/robot/replay/tts/check_audio_exist?lang=zh"
     _xos_audio_delete_path = "/robot/replay/tts/delete?lang=zh"
-    # This is the same endpoint used by the XOS audio-library web page's
-    # play button.  It is more reliable for uploaded/audio_name files than
-    # issuing AudioPlay mode=3 directly across DDS.
-    _xos_audio_play_path = "/robot/replay/do_replay_tts_audio?lang=zh"
     _xos_chat_launch_path = "/robot/chat/launch_chat?lang=zh"
     _xos_chat_state_path = "/robot/chat/get_chat_launch_state?lang=zh"
     _xos_chat_quit_path = "/robot/chat/quit_chat?lang=zh"
@@ -1231,7 +1227,8 @@ class AudioPlugin:
                 "force_play": {"type": "boolean", "title": "强制打断当前播放"},
                 "timeout": {"type": "integer", "title": "超时 (s)", "minimum": 0},
                 "channel": {"type": "string", "title": "播放通道",
-                            "enum": ["default", "channel1", "channel2", "channel3"]},
+                            "enum": ["default", "channel1", "channel2", "channel3"],
+                            "default": "channel1"},
                 "version": {"type": "string", "title": "音频版本", "enum": ["v1", "v2"]},
                 "volume": {"type": "integer", "title": "音量", "minimum": 0, "maximum": 100},
             }, "required": ["action"], "additionalProperties": False,
@@ -1401,7 +1398,7 @@ class AudioPlugin:
             "file_name": upload_result["file_name"],
             "force_play": args.get("force_play", True),
             "timeout": args.get("timeout", 0),
-            "channel": args.get("channel", "default"),
+            "channel": args.get("channel", "channel1"),
             "version": args.get("version", "v1"),
         }
         result = self._play(play_args, 3)
@@ -1627,18 +1624,6 @@ class AudioPlugin:
         if chat_ready is None:
             return {"state": "error", "message": f"cannot enable XOS chat for playback: {chat_error}"}
         try:
-            if mode == 3:
-                response = self._xos_json_request(
-                    self._xos_audio_play_path, method="POST",
-                    payload={"audio_name": value})
-                if response.get("code") != 200:
-                    return {"state": "error", "message": response.get(
-                        "msg", "XOS audio-library playback failed")}
-                # The webpage starts the same player asynchronously.  Poll
-                # briefly so an immediately failed request is not reported as
-                # successful, but do not wait for the whole clip here.
-                time.sleep(0.2)
-                return {"state": "ok", "message": response.get("msg", "Playback started")}
             if not self._action_client.wait_for_server(timeout_sec=3.0):
                 return {"state": "error", "message": "/audio_player/play is unavailable"}
             goal = AudioPlay.Goal()
@@ -1654,7 +1639,12 @@ class AudioPlugin:
             goal.path = str(value) if mode == 1 else ""
             goal.item = str(value) if mode == 2 else ""
             goal.file_name = str(value) if mode == 3 else ""
-            goal.channel = str(args.get("channel", "default"))
+            # Q5's AudioPlay definition documents channel1 as the hardware
+            # default.  Sending the UI-only literal "default" is accepted by
+            # some firmware revisions but can produce a successful, silent
+            # action, so normalize it before crossing the ROS boundary.
+            channel = str(args.get("channel", "channel1")).strip()
+            goal.channel = "channel1" if not channel or channel == "default" else channel
             goal.timeout = int(args.get("timeout", 0))
             goal.version = str(args.get("version", "v1"))
             goal_handle = _wait_for_future(self._action_client.send_goal_async(goal), 5.0)
