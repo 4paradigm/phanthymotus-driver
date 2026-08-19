@@ -1178,7 +1178,7 @@ class AudioPlugin:
     def get_tool(self):
         return {
             "name": "audio", "type": "actuator", "multiInstance": False,
-            "description": "Q5 XOS audio playback. Play an uploaded local file, a mounted library file, or an existing XOS resource. Local and library files are uploaded to XOS automatically before playback.",
+            "description": "Q5 XOS audio playback while XOS conversation is enabled. Speaker owns the OFF/live-ALSA route; audio does not change conversation state.",
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": [
                     "play_local_file", "play_library_file", "play_robot_file", "play_id",
@@ -1602,13 +1602,13 @@ class AudioPlugin:
         elif not isinstance(value, str) or not value.strip():
             return {"state": "error", "message": f"{source_field} must be a non-empty string"}
         # A live speaker card owns the same ALSA endpoint as XOS. Stop its
-        # local pump as well as the tagged remote process before switching
-        # routes; otherwise the card remains marked running and can keep a
-        # stale pipe/handle across this playback request.
+        # local pump before checking the conversation route.
         _stop_active_speaker_plugin()
-        started_chat, chat_error = self._xos_chat_start_for_playback()
-        if started_chat is None:
-            return {"state": "error", "message": f"cannot enable XOS chat for playback: {chat_error}"}
+        chat_on, chat_error = self._xos_chat_is_on()
+        if chat_error:
+            return {"state": "error", "message": f"cannot query XOS chat state: {chat_error}"}
+        if not chat_on:
+            return {"state": "error", "message": "XOS conversation is OFF; enable conversation before using audio"}
         try:
             if not self._action_client.wait_for_server(timeout_sec=3.0):
                 return {"state": "error", "message": "/audio_player/play is unavailable"}
@@ -1644,10 +1644,9 @@ class AudioPlugin:
                     return {"state": "error", "message": "audio playback status timed out"}
             return {"state": "ok" if response.result.success else "error", "message": response.result.message}
         finally:
-            if started_chat:
-                cleanup_ok, cleanup_error = self._xos_chat_stop_after_playback()
-                if not cleanup_ok:
-                    print(f"[AudioPlugin] XOS chat cleanup failed: {cleanup_error}", flush=True)
+            # Audio deliberately leaves XOS conversation ON. The speaker card
+            # is responsible for quitting conversation before live ALSA use.
+            pass
 
     def _set_volume(self, value):
         if not self._srv_volume.service_is_ready():
