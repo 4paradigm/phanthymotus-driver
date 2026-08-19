@@ -1496,12 +1496,17 @@ class AudioPlugin:
         return False, last_error or ("XOS chat did not reach " + ("ON" if wanted_on else "OFF"))
 
     def _xos_chat_start_for_playback(self):
-        """Return whether this call started chat, preserving pre-existing chat."""
+        """Ensure chat is available and request cleanup after playback.
+
+        Audio playback is an explicit, bounded use of the XOS chat route. Even
+        when chat was already ON before this call, the route must be released
+        afterwards so the live speaker card can take ownership.
+        """
         state, error = self._xos_chat_is_on()
         if error:
             return None, error
         if state:
-            return False, None
+            return True, None
         ok, error = self._xos_chat_set(self._xos_chat_launch_path)
         if not ok:
             return None, error
