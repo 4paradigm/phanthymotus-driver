@@ -107,6 +107,12 @@ _STAND_POSE_ACCELERATION_RANGE = (9.2, 10.4)
 _STAND_POSE_MAX_ANGULAR_VELOCITY = 0.10
 _STAND_POSE_MAX_JOINT_VELOCITY = 0.15
 _STAND_POSE_MAX_JOINT_VELOCITY_SPIKE = 0.30
+_STAND_ENABLE_MODE_TIMEOUT_S = 15.0
+_STAND_ENABLE_SETTLE_TIMEOUT_S = 12.0
+_STAND_ENABLE_MIN_DWELL_S = 3.0
+_STAND_ENABLE_STATIONARY_CONFIRM_S = 2.0
+_STAND_ENABLE_SAMPLE_INTERVAL_S = 0.05
+_STAND_ENABLE_VELOCITY_WINDOW_SIZE = 5
 
 # Median joint references from the verified face-up sample.  Tolerances are
 # deliberately wider than its sensor noise, while still rejecting the supplied
@@ -786,6 +792,11 @@ class LocoPlugin:
             return
         try:
             result = self._do_posture_action(action, args)
+            print(
+                "[posture] startup_result "
+                + json.dumps(result, ensure_ascii=True, separators=(",", ":")),
+                flush=True,
+            )
             if cancel_event.is_set():
                 return
             if (result.get("state") == "error"
@@ -1435,7 +1446,9 @@ class LocoPlugin:
         if mode == 26:
             return self._protection_error(requested_action, steps, mode)
         if mode == 30:
-            mode = self._run_preparation_step("enable", "START", {0}, steps)
+            mode = self._run_preparation_step(
+                "enable", "START", {0}, steps,
+                observation_timeout_s=_STAND_ENABLE_MODE_TIMEOUT_S)
             if mode == 26:
                 return self._protection_error(requested_action, steps, mode)
             if mode != 0:
@@ -1446,7 +1459,120 @@ class LocoPlugin:
             return self._preparation_error(
                 requested_action, steps, mode,
                 "Autonomous stand-up requires disabled or enabled mode. FALLTOSTAND was not sent.")
+        settle_result = self._wait_for_enabled_stable()
+        steps.append(settle_result)
+        mode = settle_result["observed_workmode"]
+        if mode == 26:
+            return self._protection_error(requested_action, steps, mode)
+        if not settle_result["confirmed"]:
+            return self._preparation_error(
+                requested_action, steps, mode,
+                "Enabled mode was observed, but the mode and joint feedback did not become "
+                "stable before the stand-up timeout. FALLTOSTAND was not sent.")
         return {"state": "completed", "steps": steps, "workmode": mode}
+
+    def _wait_for_enabled_stable(self) -> dict:
+        """Wait for motor-enable initialization to settle before FALLTOSTAND."""
+        started_at = time.monotonic()
+        deadline = started_at + _STAND_ENABLE_SETTLE_TIMEOUT_S
+        stable_since = None
+        velocity_window = []
+        sample_count = 0
+        peak_joint_velocity = 0.0
+        last_window_median = None
+        observed_mode = int(self._high_ctrl.get_mode())
+        error = None
+
+        while time.monotonic() < deadline:
+            observed_mode = int(self._high_ctrl.get_mode())
+            if observed_mode != 0:
+                error = (
+                    "The robot left enabled mode while waiting for motor initialization "
+                    "to settle."
+                )
+                break
+            try:
+                max_velocity = self._sample_max_joint_velocity()
+            except Exception as exc:
+                error = f"Cannot read joint feedback while enabled mode settles: {exc}"
+                break
+
+            sample_count += 1
+            peak_joint_velocity = max(peak_joint_velocity, max_velocity)
+            velocity_window.append(max_velocity)
+            if len(velocity_window) > _STAND_ENABLE_VELOCITY_WINDOW_SIZE:
+                velocity_window.pop(0)
+
+            now = time.monotonic()
+            window_stationary = False
+            if len(velocity_window) == _STAND_ENABLE_VELOCITY_WINDOW_SIZE:
+                ordered = sorted(velocity_window)
+                last_window_median = ordered[len(ordered) // 2]
+                window_stationary = (
+                    last_window_median <= _STAND_POSE_MAX_JOINT_VELOCITY
+                    and max(velocity_window)
+                    <= _STAND_POSE_MAX_JOINT_VELOCITY_SPIKE
+                )
+            if window_stationary:
+                if stable_since is None:
+                    stable_since = now
+            else:
+                stable_since = None
+
+            dwell_s = now - started_at
+            stable_s = 0.0 if stable_since is None else now - stable_since
+            if (dwell_s >= _STAND_ENABLE_MIN_DWELL_S
+                    and stable_s >= _STAND_ENABLE_STATIONARY_CONFIRM_S):
+                return {
+                    "step": "settle_enabled",
+                    "command": None,
+                    "observed_workmode": observed_mode,
+                    "observed_workmode_name": _WORKMODE_NAMES.get(
+                        observed_mode, "unknown"),
+                    "confirmed": True,
+                    "sample_count": sample_count,
+                    "settle_elapsed_s": round(dwell_s, 3),
+                    "stationary_confirmed_s": round(stable_s, 3),
+                    "peak_abs_joint_velocity_rad_s": round(
+                        peak_joint_velocity, 4),
+                    "final_window_median_velocity_rad_s": round(
+                        last_window_median, 4),
+                    "meaning": (
+                        "Enabled mode remained active and joint feedback settled before "
+                        "FALLTOSTAND was sent."
+                    ),
+                }
+            time.sleep(_STAND_ENABLE_SAMPLE_INTERVAL_S)
+
+        elapsed_s = time.monotonic() - started_at
+        return {
+            "step": "settle_enabled",
+            "command": None,
+            "observed_workmode": observed_mode,
+            "observed_workmode_name": _WORKMODE_NAMES.get(
+                observed_mode, "unknown"),
+            "confirmed": False,
+            "sample_count": sample_count,
+            "settle_elapsed_s": round(elapsed_s, 3),
+            "peak_abs_joint_velocity_rad_s": round(peak_joint_velocity, 4),
+            "final_window_median_velocity_rad_s": (
+                None if last_window_median is None
+                else round(last_window_median, 4)
+            ),
+            "error": error or (
+                "Enabled mode did not produce sufficiently stable joint feedback before "
+                "the settle timeout."
+            ),
+            "thresholds": {
+                "minimum_enabled_dwell_s": _STAND_ENABLE_MIN_DWELL_S,
+                "stationary_confirmation_s": (
+                    _STAND_ENABLE_STATIONARY_CONFIRM_S),
+                "median_maximum_joint_velocity_rad_s": (
+                    _STAND_POSE_MAX_JOINT_VELOCITY),
+                "maximum_joint_velocity_spike_rad_s": (
+                    _STAND_POSE_MAX_JOINT_VELOCITY_SPIKE),
+            },
+        }
 
     def _check_face_up_stand_pose(self) -> dict:
         """Fail-closed sensor check before any stand-up preparation command."""
@@ -2087,14 +2213,16 @@ class LocoPlugin:
         return {"state": "completed", "steps": steps, "workmode": mode}
 
     def _run_preparation_step(self, step: str, command_name: str,
-                              expected_modes: set[int], steps: list[dict]) -> int:
+                              expected_modes: set[int], steps: list[dict],
+                              observation_timeout_s: float | None = None) -> int:
         # START is a toggle, so it must never be retried.  On the tested Bumi,
         # however, the disabled state reached after STANDTOFALL can ignore a
         # START edge until it has first received a sustained neutral stream.
         # Prime that transition every time instead of only once per process.
         neutral_preroll_s = (
             self._control_cold_preroll_s if command_name == "START" else None)
-        observation_timeout_s = 6.0 if command_name == "START" else 3.0
+        if observation_timeout_s is None:
+            observation_timeout_s = 6.0 if command_name == "START" else 3.0
         observed = self._send_edge_and_wait(
             _get_control_cmd(command_name), expected_modes | {26},
             timeout_s=observation_timeout_s,
@@ -2111,6 +2239,11 @@ class LocoPlugin:
         if neutral_preroll_s is not None:
             step_result["neutral_preroll_s"] = neutral_preroll_s
         steps.append(step_result)
+        print(
+            "[posture] preparation_step "
+            + json.dumps(step_result, ensure_ascii=True, separators=(",", ":")),
+            flush=True,
+        )
         return observed
 
     def _trigger_user_action(self, requested_action: str, command_name: str,
