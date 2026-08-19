@@ -368,7 +368,7 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
             except Exception:
                 break
         if newest_media is not None:
-            _dispatch_media(media)
+            _dispatch_media(newest_media)
 
         # Unlike images, PCM frames must preserve their order. Drain the
         # bounded queue so short bridge delays do not produce audible gaps.

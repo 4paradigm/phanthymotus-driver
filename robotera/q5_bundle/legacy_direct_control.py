@@ -98,6 +98,8 @@ class PositionControlPreparer:
         # Q5 exposes no service that tells us which DynamicLaunch mode owns
         # ACTIVE. Do not infer direct-position ownership from ACTIVE alone.
         self._client.q5_position_control_prepared = False
+        self._prepared = False
+        self._prepare_lock = threading.Lock()
 
     def get_tool(self):
         return {
@@ -176,28 +178,34 @@ class PositionControlPreparer:
         return None if success else self._failure("ACTIVATE_FAILED", "Q5 activation failed", steps=steps)
 
     def _prepare(self):
-        steps = []
-        self._client.q5_position_control_prepared = False
-        error = self._to_ready(steps)
-        if error:
-            return error
-        if not self._actions.wait_for_server(timeout_sec=5.0):
-            return self._failure("SIMPLE_ACTIONS_UNAVAILABLE", "Q5 /simple_actions is unavailable", steps=steps)
-        for name in ("initpose_handsdown", "lift_up"):
-            goal = SimpleActions.Goal()
-            goal.action_name, goal.time_cost = name, 4.0
-            handle = self._wait_future(self._actions.send_goal_async(goal), 8.0)
-            result = self._wait_future(handle.get_result_async(), 35.0) if handle and handle.accepted else None
-            success = bool(result and getattr(result.result, "result", 2) == 0)
-            steps.append({"step": name, "success": success,
-                          "message": getattr(result.result, "message", "timeout") if result else "timeout"})
-            if not success:
-                return self._failure("SIMPLE_ACTION_FAILED", f"Q5 action {name} failed", steps=steps)
-        error = self._to_active(steps)
-        if error:
-            return error
-        self._client.q5_position_control_prepared = True
-        return {"ok": True, "state": "active", "position_control_prepared": True, "steps": steps}
+        with self._prepare_lock:
+            if self._prepared and bool(getattr(self._client, "q5_position_control_prepared", False)):
+                return {"ok": True, "state": "active", "position_control_prepared": True,
+                        "prepare": "already_prepared"}
+            steps = []
+            self._prepared = False
+            self._client.q5_position_control_prepared = False
+            error = self._to_ready(steps)
+            if error:
+                return error
+            if not self._actions.wait_for_server(timeout_sec=5.0):
+                return self._failure("SIMPLE_ACTIONS_UNAVAILABLE", "Q5 /simple_actions is unavailable", steps=steps)
+            for name in ("initpose_handsdown", "lift_up"):
+                goal = SimpleActions.Goal()
+                goal.action_name, goal.time_cost = name, 4.0
+                handle = self._wait_future(self._actions.send_goal_async(goal), 8.0)
+                result = self._wait_future(handle.get_result_async(), 35.0) if handle and handle.accepted else None
+                success = bool(result and getattr(result.result, "result", 2) == 0)
+                steps.append({"step": name, "success": success,
+                              "message": getattr(result.result, "message", "timeout") if result else "timeout"})
+                if not success:
+                    return self._failure("SIMPLE_ACTION_FAILED", f"Q5 action {name} failed", steps=steps)
+            error = self._to_active(steps)
+            if error:
+                return error
+            self._client.q5_position_control_prepared = True
+            self._prepared = True
+            return {"ok": True, "state": "active", "position_control_prepared": True, "steps": steps}
 
     def start(self):
         return {"state": "ready", "status": self._status()}
@@ -212,6 +220,7 @@ class PositionControlPreparer:
         if action == "prepare_position_control":
             return self._prepare()
         if action == "ready":
+            self._prepared = False
             self._client.q5_position_control_prepared = False
             steps = []
             error = self._to_ready(steps)
