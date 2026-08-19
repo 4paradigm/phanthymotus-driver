@@ -5,6 +5,8 @@ ARG PYPI_MIRROR
 
 WORKDIR /work
 
+RUN sed -i "s#mirrors.tencentyun.com/ubuntu-ports#ports.ubuntu.com/ubuntu-ports#g" /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null || true
+
 RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
         python3-pip \
