@@ -2155,7 +2155,6 @@ class JointPlanPlugin:
         self._last_state = {"state": "no_data"}
         self._last_request = {}
         self._executing_requests: set[int] = set()
-        self._request_states: dict[int, dict] = {}
         self._request_id = 0
         self._state_type = None
         self._head_lock = threading.Lock()
@@ -2482,9 +2481,6 @@ class JointPlanPlugin:
             self._last_state = payload
             if self._state_type is not None and int(msg.status) == int(self._state_type.EXECUTING):
                 self._executing_requests.add(int(msg.request_id))
-            self._request_states[payload["request_id"]] = payload
-            while len(self._request_states) > 64:
-                del self._request_states[next(iter(self._request_states))]
             self._state_changed.notify_all()
         if payload["status"] in (0, 1, 3):
             with self._head_lock:
