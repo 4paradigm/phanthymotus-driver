@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import struct
 import sys
 import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -205,13 +207,45 @@ class LynxM20ContractTests(unittest.TestCase):
         source = (DRIVER / "device.py").read_text()
         self.assertNotIn('("imu", Imu, "/IMU", "data/imu"', source)
         self.assertIn('("imu", Imu, "/IMU", "data/json"', source)
-        self.assertIn("core_msg_type = String if as_json else msg_type", source)
+        self.assertIn("core_msg_type = String if as_json else UInt8MultiArray if as_pointcloud else msg_type", source)
 
     def test_lidar_streams_use_canvas_pointcloud_format(self):
         source = (DRIVER / "device.py").read_text()
         self.assertIn('("lidar", PointCloud2, "/LIDAR/POINTS", "sensor/pointcloud"', source)
         self.assertIn('("lidar_rear", PointCloud2, "/LIDAR/POINTS2", "sensor/pointcloud"', source)
         self.assertNotIn('"pointcloud/ros2"', source)
+
+    def test_lidar_pointcloud_is_encoded_for_canvas_renderer(self):
+        class Field:
+            def __init__(self, name, offset):
+                self.name = name
+                self.offset = offset
+                self.datatype = 7
+
+        first = struct.pack("<fffI", 1.0, 2.0, 3.0, 10)
+        second = struct.pack("<fffI", 4.0, 5.0, 6.0, 20)
+        msg = SimpleNamespace(
+            point_step=16,
+            width=1,
+            height=2,
+            row_step=20,
+            fields=[Field("x", 0), Field("y", 4), Field("z", 8)],
+            data=first + b"pad!" + second,
+        )
+        payload, point_count = m20.encode_pointcloud(msg)
+        self.assertEqual((16, 2), struct.unpack_from("<II", payload))
+        self.assertEqual(2, point_count)
+        self.assertEqual(first + second, payload[8:])
+
+    def test_lidar_pointcloud_rejects_unsupported_xyz_layout(self):
+        field = lambda name, offset: SimpleNamespace(name=name, offset=offset, datatype=7)
+        msg = SimpleNamespace(
+            point_step=16, width=1, height=1, row_step=16,
+            fields=[field("x", 4), field("y", 8), field("z", 12)],
+            data=bytes(16),
+        )
+        with self.assertRaisesRegex(ValueError, "offsets 0/4/8"):
+            m20.encode_pointcloud(msg)
 
     def test_motion_events_separate_request_acceptance_from_feedback(self):
         nodes = FakeNodes()

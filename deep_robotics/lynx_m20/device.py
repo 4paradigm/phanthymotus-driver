@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import json
+import struct
 import threading
 import time
+from array import array
 
 from basic_server import BasicServerClient
 from common.vendor_runtime import action_schema, jsonable, tool
@@ -15,12 +17,46 @@ GAITS = {"basic": 0x1001, "standard_stairs": 0x1003, "agile_flat": 0x3002, "agil
 MOTION_STATES = {"idle": 0, "stand": 1, "soft_estop": 2, "damping": 3, "lie": 4, "rl_control": 17}
 
 
+def encode_pointcloud(msg):
+    """Encode ROS PointCloud2 for the Canvas sensor/pointcloud renderer."""
+    point_step = int(getattr(msg, "point_step", 0))
+    width = int(getattr(msg, "width", 0))
+    height = int(getattr(msg, "height", 0))
+    if point_step <= 0 or width <= 0 or height <= 0:
+        raise ValueError("PointCloud2 layout must have positive point_step, width and height")
+
+    fields = {getattr(field, "name", ""): field for field in getattr(msg, "fields", ())}
+    for name, offset in (("x", 0), ("y", 4), ("z", 8)):
+        field = fields.get(name)
+        if field is None or int(getattr(field, "offset", -1)) != offset or int(getattr(field, "datatype", -1)) != 7:
+            raise ValueError("sensor/pointcloud requires float32 x/y/z fields at offsets 0/4/8")
+
+    data = bytes(getattr(msg, "data", b""))
+    row_size = width * point_step
+    row_step = int(getattr(msg, "row_step", 0)) or row_size
+    if row_step < row_size:
+        raise ValueError("PointCloud2 row_step is smaller than its packed row")
+    required = (height - 1) * row_step + row_size
+    if len(data) < required:
+        raise ValueError("PointCloud2 data is shorter than its declared layout")
+
+    if row_step == row_size:
+        points = data[:required]
+    else:
+        points = b"".join(
+            data[row * row_step:row * row_step + row_size]
+            for row in range(height)
+        )
+    point_count = width * height
+    return struct.pack("<II", point_step, point_count) + points, point_count
+
+
 class M20Nodes:
     def __init__(self, config, namespace, ros2):
         from drdds.msg import Gait, JointsData, MotionInfo, MotionState, NavCmd, NavSat, StdMsgInt32, StdStatus
         from nav_msgs.msg import Odometry
         from sensor_msgs.msg import Imu, PointCloud2
-        from std_msgs.msg import String
+        from std_msgs.msg import String, UInt8MultiArray
         from rclpy.node import Node
 
         self.config = config
@@ -79,24 +115,60 @@ class M20Nodes:
             robot_topic = topics.get(key, default)
             core_topic = f"/{namespace}/lynx_m20/{key}"
             as_json = fmt == "data/json"
-            core_msg_type = String if as_json else msg_type
+            as_pointcloud = fmt == "sensor/pointcloud"
+            core_msg_type = String if as_json else UInt8MultiArray if as_pointcloud else msg_type
             pub = self.core.create_publisher(core_msg_type, core_topic, depth)
             self.robot.create_subscription(
                 msg_type,
                 robot_topic,
-                self._callback(key, pub, as_json=as_json, string_type=String),
+                self._callback(
+                    key,
+                    pub,
+                    as_json=as_json,
+                    string_type=String,
+                    as_pointcloud=as_pointcloud,
+                    pointcloud_type=UInt8MultiArray,
+                ),
                 depth,
             )
             self.streams[key] = {"robot_topic": robot_topic, "topic": core_topic, "format": fmt}
 
-    def _callback(self, key, publisher, *, as_json=False, string_type=None):
+    def _callback(
+        self,
+        key,
+        publisher,
+        *,
+        as_json=False,
+        string_type=None,
+        as_pointcloud=False,
+        pointcloud_type=None,
+    ):
         def callback(msg):
-            if key.startswith("lidar"):
+            if as_pointcloud:
+                if pointcloud_type is None:
+                    raise RuntimeError("point cloud streams require std_msgs/msg/UInt8MultiArray")
+                try:
+                    payload, point_count = encode_pointcloud(msg)
+                except ValueError as exc:
+                    with self.lock:
+                        self.values[key] = {"received": False, "error": str(exc), "timestamp": time.time()}
+                    return
+                output = pointcloud_type()
+                output.data = array("B", payload)
+                publisher.publish(output)
                 header = getattr(msg, "header", None)
-                value = {"received": True, "frame_id": getattr(header, "frame_id", ""), "timestamp": time.time()}
+                value = {
+                    "received": True,
+                    "frame_id": getattr(header, "frame_id", ""),
+                    "point_count": point_count,
+                    "point_step": int(msg.point_step),
+                    "timestamp": time.time(),
+                }
             else:
                 value = jsonable(msg)
-            if as_json:
+            if as_pointcloud:
+                pass
+            elif as_json:
                 if string_type is None:
                     raise RuntimeError("JSON state streams require std_msgs/msg/String")
                 output = string_type()
