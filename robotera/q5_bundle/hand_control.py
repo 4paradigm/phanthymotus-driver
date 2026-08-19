@@ -12,6 +12,7 @@ import time
 
 from hand_command import HAND_JOINTS, failure, finite_number, get_router
 from control_contract import q5_active_status, q5_is_control_ready
+from q5_acp import notify as _acp_notify
 
 CARD = "hand_control"
 TYPE = "actuator"
@@ -50,20 +51,14 @@ class Plugin:
         self._active_command = None
 
     def get_tool(self):
-        target = {"type": "object", "properties": {
-            "joint_name": {"type": "string", "enum": list(HAND_JOINTS), "description": "XHand Lite 执行关节名称"},
-            "position_rad": {"type": "number", "minimum": self._min_position, "maximum": self._max_position,
-                             "description": f"范围[{self._min_position:g},{self._max_position:g}]rad"},
-        }, "required": ["joint_name", "position_rad"], "additionalProperties": False}
         return {"name": CARD, "type": TYPE, "multiInstance": False, "description": DESC,
                 "inputSchema": {"type": "object", "properties": {
-                    "action": {"type": "string", "enum": ["start", "open_hand", "close_hand", "set_hand", "set_finger", "set", "cancel", "info"], "oneOf": [
+                    "action": {"type": "string", "enum": ["start", "open_hand", "close_hand", "set_hand", "set_finger", "cancel", "info"], "oneOf": [
                         {"const": "start", "title": "检查连接状态"},
                         {"const": "open_hand", "title": "张开整手"},
                         {"const": "close_hand", "title": "合拢整手"},
                         {"const": "set_hand", "title": "设置整手弯曲程度"},
                         {"const": "set_finger", "title": "设置单指弯曲程度"},
-                        {"const": "set", "title": "高级：指定关节目标"},
                         {"const": "cancel", "title": "取消并保持"},
                         {"const": "info", "title": "查看状态"},
                     ]},
@@ -82,10 +77,6 @@ class Plugin:
                                      "minimum": self._min_position, "maximum": self._max_position,
                                      "multipleOf": 0.01,
                                      "description": f"范围[{self._min_position:g},{self._max_position:g}]rad"},
-                    "targets": {"type": "array", "title": "关节目标", "items": target,
-                                "minItems": 1, "maxItems": len(HAND_JOINTS), "x-widget": "json",
-                                "x-example": '[{"joint_name":"left_hand_index_joint1","position_rad":0.10}]',
-                                "description": "每项：关节名+目标角度。"},
                 }, "required": ["action"], "additionalProperties": False,
                 "x-action-params": {
                     "start": {"params": [], "description": "检查 ROS 连接和机器人状态。"},
@@ -93,7 +84,6 @@ class Plugin:
                     "close_hand": {"params": ["side"], "description": f"将选中手完整合拢到 {self._max_position:g} rad。"},
                     "set_hand": {"params": ["side", "curl_rad"], "description": "为整只手设定统一的弯曲程度。"},
                     "set_finger": {"params": ["side", "finger", "curl_rad", "rotation_rad"], "description": "thumb可填弯曲+旋转"},
-                    "set": {"params": ["targets"], "description": "高级模式：用 JSON 指定多个关节的绝对目标。"},
                     "cancel": {"params": [], "description": "取消当前插补，并保持当前位置。"},
                     "info": {"params": [], "description": "查看运动状态与安全条件。"},
                 }}}
@@ -211,7 +201,7 @@ class Plugin:
                     targets.append({"joint_name": name, "position_rad": value})
         return self._targets({"targets": targets, "duration_s": args.get("duration_s")})
 
-    def _start_motion(self, command, source):
+    def _start_motion(self, command, source, action_id=None):
         if not self._router.acquire(CARD):
             return failure("COMMAND_IN_PROGRESS", "Another Q5 hand card currently owns the command publisher", status=self._router.status())
         with self._lock:
@@ -222,11 +212,12 @@ class Plugin:
             self._motion_stop = event
             self._active_command = {"source": source, "targets_rad": dict(command["targets"]),
                                     "duration_s": command["duration_s"], "started_at_ms": int(time.time() * 1000)}
-            self._motion_thread = threading.Thread(target=self._run, args=(event, command), daemon=True, name="q5_hand_control")
+            self._motion_thread = threading.Thread(target=self._run, args=(event, command, action_id), daemon=True, name="q5_hand_control")
             self._motion_thread.start()
-        return {"ok": True, "state": "moving", "command": dict(self._active_command), "stops_by_holding_current_position": True}
+        return {"ok": True, "state": "moving", "command": dict(self._active_command),
+                "stops_by_holding_current_position": True, "action_id": action_id}
 
-    def _run(self, stop_event, command):
+    def _run(self, stop_event, command, action_id=None):
         current, targets, duration = command["current"], command["targets"], command["duration_s"]
         steps = max(int(math.ceil(duration * self._publish_rate)),
                     max(int(math.ceil(abs(targets[name] - current[name]) / self._max_step)) for name in targets), 1)
@@ -239,6 +230,9 @@ class Plugin:
                 stop_event.wait(duration / steps)
         finally:
             self._router.release(CARD)
+            _acp_notify(action_id, "cancelled" if stop_event.is_set() else "completed", {
+                "targets_rad": dict(targets), "duration_s": duration,
+            }, CARD)
             with self._lock:
                 if self._motion_stop is stop_event:
                     self._motion_stop = self._motion_thread = self._active_command = None
@@ -283,15 +277,16 @@ class Plugin:
             if allowed.get("ok") is False:
                 return allowed
             return {"ok": self._hold_current(), "state": "held"}
-        if action not in ("set", "open_hand", "close_hand", "set_hand", "set_finger"):
+        if action not in ("open_hand", "close_hand", "set_hand", "set_finger"):
             return None
         allowed = self._allowed(args)
         if allowed.get("ok") is False:
             return allowed
-        command = self._targets(args) if action == "set" else self._profile_targets(action, args)
+        command = self._profile_targets(action, args)
         if command.get("ok") is False:
             return command
-        return self._start_motion(command, action)
+        action_id = str(args.get("action_id") or f"hand_control_{action}_{int(time.time() * 1000)}")
+        return self._start_motion(command, action, action_id)
 
     def stop(self):
         self._stop("driver_shutdown")

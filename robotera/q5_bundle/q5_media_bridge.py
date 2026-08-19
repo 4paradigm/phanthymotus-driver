@@ -25,7 +25,9 @@ q5_bridge_worker.py — 独立子进程 DDS bridge，将 Q5 sensor snapshot 发�
 
 import multiprocessing as mp
 import os
+import queue
 import sys
+import threading
 import time
 
 
@@ -36,7 +38,15 @@ class BridgeWorker:
         self._ctx = mp.get_context("spawn")
         self._cmd_q = self._ctx.Queue()
         self._sensor_q = self._ctx.Queue()
-        self._media_q = self._ctx.Queue(maxsize=4)
+        # Each stream owns its own latest-frame lane. A shared FIFO lets the
+        # 15 Hz RGB stream evict slower depth/pointcloud packets before the
+        # bridge has a chance to classify them.
+        self._media_qs = {
+            "rgb": self._ctx.Queue(maxsize=2),
+            "depth_jpeg": self._ctx.Queue(maxsize=2),
+            "pointcloud": self._ctx.Queue(maxsize=2),
+        }
+        self._media_lock = threading.Lock()
         self._audio_q = self._ctx.Queue(maxsize=100)
         self._speaker_q = self._ctx.Queue(maxsize=64)
         self._proc = None
@@ -47,7 +57,7 @@ class BridgeWorker:
         """Spawn the bridge subprocess."""
         self._proc = self._ctx.Process(
             target=_run_bridge_subprocess,
-            args=(self._cmd_q, self._sensor_q, self._media_q, self._audio_q, self._speaker_q,
+            args=(self._cmd_q, self._sensor_q, self._media_qs, self._audio_q, self._speaker_q,
                   self._debug, self._namespace),
             name="q5_bridge_worker", daemon=True,
         )
@@ -62,11 +72,28 @@ class BridgeWorker:
             pass
 
     def push_media(self, media: dict):
-        """Queue a processed media frame without blocking control state updates."""
-        try:
-            self._media_q.put_nowait(media)
-        except Exception:
-            pass
+        """Replace only an older frame from the same media stream."""
+        kind = media.get("kind") if isinstance(media, dict) else None
+        media_q = self._media_qs.get(kind)
+        if media_q is None:
+            return
+        with self._media_lock:
+            try:
+                media_q.put_nowait(media)
+                return
+            except queue.Full:
+                pass
+            # Discard stale data from this stream only, then retry once. The
+            # queue remains bounded even if Agent Core is temporarily slower
+            # than the camera.
+            try:
+                media_q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                media_q.put_nowait(media)
+            except queue.Full:
+                pass
 
     def push_audio(self, audio: bytes):
         """Queue ordered PCM audio independently of lossy latest-frame media."""
@@ -100,7 +127,7 @@ class BridgeWorker:
         print("[BridgeWorker] subprocess stopped")
 
 
-def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queue,
+def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_qs: dict[str, mp.Queue],
                            audio_q: mp.Queue, speaker_q: mp.Queue, debug: bool, namespace: str):
     """Subprocess entry point — runs in separate process with own DDS domain."""
     # ── Environment: Force Domain 42 + FastDDS in subprocess ────────────────────
@@ -119,7 +146,7 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
     import rclpy.qos
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-    from std_msgs.msg import String
+    from std_msgs.msg import String, UInt8MultiArray
     from sensor_msgs.msg import CompressedImage, Image
     from audio_msgs.msg import AudioChunk
 
@@ -165,6 +192,7 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
     pub_rgb = node.create_publisher(CompressedImage, f"{prefix}/camera/rgb", QOS_MEDIA)
     pub_depth = node.create_publisher(Image, f"{prefix}/camera/depth", QOS_MEDIA)
     pub_depth_preview = node.create_publisher(CompressedImage, f"{prefix}/camera/depth_preview", QOS_MEDIA)
+    pub_pointcloud = node.create_publisher(UInt8MultiArray, f"{prefix}/camera/pointcloud", QOS_MEDIA)
     # Audio is a live lossy stream. Match the audio cards used by the other
     # drivers so Agent Core/FastDDS subscribers can request BEST_EFFORT without
     # a reliability negotiation mismatch or unnecessary retransmission delay.
@@ -308,6 +336,12 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
             out.step = int(media["step"])
             out.data = media["data"]
             pub_depth.publish(out)
+        elif kind == "pointcloud":
+            # Agent Core's point-cloud renderer consumes this compact binary
+            # envelope: uint32 point_step, uint32 count, float32 xyz * count.
+            out = UInt8MultiArray()
+            out.data = list(media["data"])
+            pub_pointcloud.publish(out)
 
     # ── Main loop ──────────────────────────────────────────────────────────────
     running = True
@@ -351,14 +385,15 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_q: mp.Queu
         except Exception:
             pass
 
-        newest_media = None
-        while True:
-            try:
-                newest_media = media_q.get_nowait()
-            except Exception:
-                break
-        if newest_media is not None:
-            _dispatch_media(newest_media)
+        for media_q in media_qs.values():
+            newest_media = None
+            while True:
+                try:
+                    newest_media = media_q.get_nowait()
+                except Exception:
+                    break
+            if newest_media is not None:
+                _dispatch_media(newest_media)
 
         # Unlike images, PCM frames must preserve their order. Drain the
         # bounded queue so short bridge delays do not produce audible gaps.
