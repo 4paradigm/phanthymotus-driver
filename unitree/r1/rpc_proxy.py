@@ -17,6 +17,13 @@ import time
 def _rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.Queue,
                 network_iface: str):
     """Subprocess: holds dedicated RPC clients, processes commands sequentially."""
+    # Spawned child: fresh interpreter, does not inherit the parent's sys.stdout.
+    try:
+        from common import logsafe
+        logsafe.install(check_fd=False)
+    except ImportError:
+        pass
+
     from unitree_sdk2py.core.channel import ChannelFactoryInitialize
     from unitree_sdk2py.h2.loco.h2_loco_client import LocoClient
     from unitree_sdk2py.r1.arm.r1_arm_client import ArmClient
