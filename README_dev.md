@@ -372,6 +372,32 @@ prints are gated behind `UNITREE_RPC_DEBUG=1`. Set it when chasing RPC timeouts
 (error 3104); leave it unset in production, where those prints cost 3–5 lines per
 RPC call.
 
+### Logging checklist for a new driver
+
+All 13 existing drivers satisfy this; a new one is expected to as well.
+
+- [ ] `driver.yaml` has `build_context_extras: [../../common]`
+- [ ] `Dockerfile` has `COPY common/ /work/common/`
+- [ ] `main.py` calls `logsafe.install()` before anything prints (or routes
+      through `common.vendor_runtime.run_driver()`, which installs it for you)
+- [ ] every `multiprocessing` child entry point calls `logsafe.install(check_fd=False)`
+- [ ] no `os.dup(1)` / `dup2(..., 1)` anywhere
+- [ ] `log_message` escapes and caps the request line
+- [ ] no unthrottled `print` inside a per-frame / per-message callback
+- [ ] `Dockerfile` sets `PYTHONUNBUFFERED=1` and `RCUTILS_COLORIZED_OUTPUT=0`,
+      plus `CYCLONEDDS_URI` tracing to `/dev/null` if the driver uses CycloneDDS
+- [ ] `deploy/service.yml` declares `logging: {driver: local, max-size: 10m, max-file: 3}`
+
+A quick self-check before opening a PR:
+
+```bash
+grep -rn "os\.dup(1)" --include="*.py" .            # must be empty
+grep -rlF 'print(f"[mcp] {self.address_string()} {msg}")' --include=main.py .   # must be empty
+```
+
+Reviewers apply these as `agents/pr_review/rules/driver.md` in the phanthymotus
+repo.
+
 ---
 
 ## driver.yaml Metadata

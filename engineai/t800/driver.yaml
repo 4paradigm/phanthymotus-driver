@@ -7,3 +7,5 @@ image_name: engineai-t800
 port: 15708
 mcp_url: "http://localhost:15708/mcp"
 description: "EngineAI T800 开发版 — ROS2/Native SDK、全身状态、舞蹈/手势、虚拟手柄、高低层运动、LED 与语音控制"
+build_context_extras:
+  - ../../common

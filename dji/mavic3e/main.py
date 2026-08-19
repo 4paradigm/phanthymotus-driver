@@ -13,6 +13,16 @@ dji/mavic3e/main.py — DJI Mavic 3E 无人机设备 bundle 统一入口。
     AGENT_CORE_URL — Agent Core 地址（默认 https://localhost:15678）
 """
 
+# Make every log line one atomic, control-character-free write, so concurrent
+# writers cannot tear a Docker log record. Must run before anything prints.
+try:
+    from common import logsafe
+    logsafe.install()
+except ImportError as _e:  # running outside the container image
+    import sys as _sys
+    _sys.stderr.write(f"[bundle] logsafe unavailable ({_e}); stdout unprotected\n")
+
+
 import json
 import os
 import re
