@@ -19,6 +19,8 @@ MOTION_STATES = {"idle": 0, "stand": 1, "soft_estop": 2, "damping": 3, "lie": 4,
 
 def encode_pointcloud(msg):
     """Encode ROS PointCloud2 for the Canvas sensor/pointcloud renderer."""
+    if bool(getattr(msg, "is_bigendian", False)):
+        raise ValueError("sensor/pointcloud requires little-endian PointCloud2 data")
     point_step = int(getattr(msg, "point_step", 0))
     width = int(getattr(msg, "width", 0))
     height = int(getattr(msg, "height", 0))
@@ -433,7 +435,10 @@ class M20StatePlugin:
                     "topic_out": [{"topic": stream["url"], "format": stream["format"]}],
                 }
             return {"state": "ready"}
-        if action in ("start", "stop"): return {"state": "ready" if action == "start" else "idle"}
+        if action == "start":
+            return {"state": "running" if name in self.nodes.streams else "ready"}
+        if action == "stop":
+            return {"state": "idle"}
         if name == "state": return self.nodes.snapshot()
         if name in self.nodes.streams: return {"state": "running", **self.nodes.streams[name]}
         if name in self.nodes.rtsp_streams: return {"state": "ready", **self.nodes.rtsp_streams[name]}

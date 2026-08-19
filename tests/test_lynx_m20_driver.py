@@ -179,6 +179,8 @@ class LynxM20ContractTests(unittest.TestCase):
             info = plugin.dispatch("info", {"_tool_name": name})
             self.assertEqual("ready", info["state"])
             self.assertEqual(static_topics[name], info["topic_out"])
+        self.assertEqual("running", plugin.dispatch("start", {"_tool_name": "lidar"})["state"])
+        self.assertEqual("ready", plugin.dispatch("start", {"_tool_name": "camera_front"})["state"])
 
     def test_json_state_stream_publishes_string_payload_and_keeps_snapshot_value(self):
         class FakePublisher:
@@ -246,6 +248,47 @@ class LynxM20ContractTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "offsets 0/4/8"):
             m20.encode_pointcloud(msg)
+
+    def test_lidar_pointcloud_rejects_big_endian_data(self):
+        field = lambda name, offset: SimpleNamespace(name=name, offset=offset, datatype=7)
+        msg = SimpleNamespace(
+            point_step=16, width=1, height=1, row_step=16, is_bigendian=True,
+            fields=[field("x", 0), field("y", 4), field("z", 8)],
+            data=struct.pack(">fffI", 1.0, 2.0, 3.0, 0),
+        )
+        with self.assertRaisesRegex(ValueError, "little-endian"):
+            m20.encode_pointcloud(msg)
+
+    def test_lidar_callback_publishes_encoded_canvas_payload(self):
+        class FakePublisher:
+            def __init__(self): self.messages = []
+            def publish(self, message): self.messages.append(message)
+
+        class FakeUInt8MultiArray:
+            def __init__(self): self.data = []
+
+        field = lambda name, offset: SimpleNamespace(name=name, offset=offset, datatype=7)
+        msg = SimpleNamespace(
+            header=SimpleNamespace(frame_id="base_link"),
+            point_step=16, width=1, height=1, row_step=16, is_bigendian=False,
+            fields=[field("x", 0), field("y", 4), field("z", 8)],
+            data=struct.pack("<fffI", 1.0, 2.0, 3.0, 0),
+        )
+        nodes = object.__new__(m20.M20Nodes)
+        nodes.lock = threading.Lock()
+        nodes.values = {}
+        publisher = FakePublisher()
+        callback = nodes._callback(
+            "lidar", publisher, as_pointcloud=True,
+            pointcloud_type=FakeUInt8MultiArray,
+        )
+        callback(msg)
+
+        self.assertEqual(1, len(publisher.messages))
+        payload = bytes(publisher.messages[0].data)
+        self.assertEqual((16, 1), struct.unpack_from("<II", payload))
+        self.assertEqual((1.0, 2.0, 3.0), struct.unpack_from("<fff", payload, 8))
+        self.assertEqual(1, nodes.values["lidar"]["point_count"])
 
     def test_motion_events_separate_request_acceptance_from_feedback(self):
         nodes = FakeNodes()
