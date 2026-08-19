@@ -8,8 +8,6 @@ from __future__ import annotations
 
 import io
 import audioop
-import base64
-import binascii
 import json
 import os
 import re
@@ -1354,7 +1352,7 @@ class AudioPlugin:
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": [
                     "play_local_file", "play_library_file", "play_id",
-                    "list_library", "upload_local_file", "upload_base64", "delete_audio", "set_volume",
+                    "list_library", "upload_local_file", "delete_audio", "set_volume",
                     "get_volume", "stop_audio", "is_play", "stop"],
                     "oneOf": [
                         {"const": "play_local_file", "title": "播放本地音频文件"},
@@ -1362,7 +1360,6 @@ class AudioPlugin:
                         {"const": "play_id", "title": "播放内置音频 ID"},
                         {"const": "list_library", "title": "查看挂载音频库"},
                         {"const": "upload_local_file", "title": "上传本地音频文件"},
-                        {"const": "upload_base64", "title": "上传音频到机器人"},
                         {"const": "delete_audio", "title": "从 XOS 音频库删除"},
                         {"const": "set_volume", "title": "设置音量"},
                         {"const": "get_volume", "title": "查看音量"},
@@ -1374,7 +1371,6 @@ class AudioPlugin:
                 "file_name": {"type": "string", "title": "音频文件名", "minLength": 1},
                 "local_file": {"type": "string", "format": "file", "accept": "audio/*",
                                "title": "本地音频文件"},
-                "content_base64": {"type": "string", "title": "WAV/MP3 文件内容 (Base64)", "minLength": 1},
                 "force_play": {"type": "boolean", "title": "强制打断当前播放"},
                 "timeout": {"type": "integer", "title": "超时 (s)", "minimum": 0},
                 "channel": {"type": "string", "title": "播放通道",
@@ -1392,8 +1388,6 @@ class AudioPlugin:
                                 "description": "播放厂商预装音频 ID；XOS 不提供 ID 枚举。"},
                     "list_library": {"params": [], "description": "列出机器人 XOS 音频库；返回的 file_name 可用于 play_library_file。"},
                     "upload_local_file": {"params": ["local_file"], "description": "选择本地 WAV/MP3 并上传到 XOS，不播放。"},
-                    "upload_base64": {"params": ["file_name", "content_base64"],
-                                      "description": "上传 Base64 WAV/MP3 到 XOS，不播放。"},
                     "delete_audio": {"params": ["file_name"],
                                      "description": "从 XOS 音频库删除指定 audio_name。"},
                     "set_volume": {"params": ["volume"], "description": "设置厂商 AudioPlay 音量 0 到 100；不控制 live speaker。"},
@@ -1428,8 +1422,6 @@ class AudioPlugin:
             return self._list_robot_audio_files()
         if action == "upload_local_file":
             return self._upload_local_file(args)
-        if action == "upload_base64":
-            return self._upload_base64(args)
         if action == "delete_audio":
             return self._delete_audio(args)
         if action == "set_volume":
@@ -1540,19 +1532,6 @@ class AudioPlugin:
         return {"state": "ok", "files": files, "play_action": "play_library_file",
                 "id_mapping_available": False,
                 "note": "XOS exposes audio_name but no numeric audio-library ID in this endpoint."}
-
-    def _upload_base64(self, args):
-        file_name = args.get("file_name")
-        encoded = args.get("content_base64")
-        if not self._valid_upload_name(file_name):
-            return {"state": "error", "message": "file_name must be a simple .wav or .mp3 filename"}
-        if not isinstance(encoded, str) or not encoded:
-            return {"state": "error", "message": "content_base64 is required"}
-        try:
-            payload = base64.b64decode(encoded, validate=True)
-        except (binascii.Error, ValueError):
-            return {"state": "error", "message": "content_base64 is not valid Base64"}
-        return self._upload_payload(file_name, payload)
 
     def _delete_audio(self, args):
         file_name = args.get("file_name")
