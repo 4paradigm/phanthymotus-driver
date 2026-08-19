@@ -1178,7 +1178,7 @@ class AudioPlugin:
     def get_tool(self):
         return {
             "name": "audio", "type": "actuator", "multiInstance": False,
-            "description": "Q5 XOS audio playback while XOS conversation is enabled. Speaker owns the OFF/live-ALSA route; audio does not change conversation state.",
+            "description": "Q5 XOS audio playback. Audio ensures XOS conversation is ON and leaves it ON; speaker owns the OFF/live-ALSA route.",
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": [
                     "play_local_file", "play_library_file", "play_robot_file", "play_id",
@@ -1511,12 +1511,7 @@ class AudioPlugin:
         return False, last_error or ("XOS chat did not reach " + ("ON" if wanted_on else "OFF"))
 
     def _xos_chat_start_for_playback(self):
-        """Ensure chat is available and request cleanup after playback.
-
-        Audio playback is an explicit, bounded use of the XOS chat route. Even
-        when chat was already ON before this call, the route must be released
-        afterwards so the live speaker card can take ownership.
-        """
+        """Ensure XOS conversation owns the route for stored-audio playback."""
         state, error = self._xos_chat_is_on()
         if error:
             return None, error
@@ -1602,13 +1597,11 @@ class AudioPlugin:
         elif not isinstance(value, str) or not value.strip():
             return {"state": "error", "message": f"{source_field} must be a non-empty string"}
         # A live speaker card owns the same ALSA endpoint as XOS. Stop its
-        # local pump before checking the conversation route.
+        # local pump before handing the route back to XOS conversation.
         _stop_active_speaker_plugin()
-        chat_on, chat_error = self._xos_chat_is_on()
-        if chat_error:
-            return {"state": "error", "message": f"cannot query XOS chat state: {chat_error}"}
-        if not chat_on:
-            return {"state": "error", "message": "XOS conversation is OFF; enable conversation before using audio"}
+        chat_ready, chat_error = self._xos_chat_start_for_playback()
+        if chat_ready is None:
+            return {"state": "error", "message": f"cannot enable XOS chat for playback: {chat_error}"}
         try:
             if not self._action_client.wait_for_server(timeout_sec=3.0):
                 return {"state": "error", "message": "/audio_player/play is unavailable"}
