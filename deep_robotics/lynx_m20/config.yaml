@@ -1,7 +1,7 @@
 mcp_port: 15716
 ros_namespace: ""
 name: "云深处山猫 M20"
-model_variant: "standard"
+model_variant: "pro"
 velocity_command_timeout: 0.5
 ros:
   robot_domain_id: 0
@@ -14,7 +14,7 @@ basic_server:
   tcp_port: 30001
   timeout: 1.5
 mapping:
-  enabled: false
+  enabled: true
   host: "10.21.31.106"
   user: "user"
   port: 22

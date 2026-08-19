@@ -30,13 +30,13 @@ Dockerfile 会在解压和编译前再次校验 SHA256。归档内保留上游 `
 - 选配自主充电：开始、退出和异常强制复位。
 - 设备与状态：前后灯、常规/导航/辅助模式、休眠与自动休眠、16 关节反馈、双电池、温度和错误列表。
 - 双路相机：返回官方 H.265 RTSP 地址 `video1`/`video2`；文档明确相机不发布 ROS 2/DDS 话题。
-- M20 Pro：将 `model_variant` 改为 `pro` 后，额外开放里程计、定位初始化、单点导航、取消、状态查询，以及 `mapping_view` 建图视图。建图期间将 `/grid_map_3d` 的 `base_link` 点云通过 `/SLAM_ODOM` 转换并累积到 `map` 坐标，停止后切换到最终 `/GRID_MAP`。
+- M20 Pro：默认开放里程计、定位初始化、单点导航、取消、状态查询，以及 `mapping_view` 建图视图。建图期间将 `/grid_map_3d` 的 `base_link` 点云通过 `/SLAM_ODOM` 转换并累积到 `map` 坐标，停止后切换到最终 `/GRID_MAP`。
 
 ## 型号边界
 
-默认 `model_variant: standard`。供应商文档明确建图、定位和内置导航仅 M20 Pro 支持，因此标准版不会注册导航工具。
+本镜像面向当前 M20 Pro Web Console 部署，默认使用 `model_variant: pro`。供应商文档明确建图、定位和内置导航仅 M20 Pro 支持；部署到标准版 M20 时必须通过外部配置显式覆盖为 `model_variant: standard`，此时不会注册导航和建图工具。
 
-M20 Pro 的建图控制卡片默认关闭。启用后，Driver 使用专用 SSH 密钥连接 NOS，并通过根用户安装的受限入口 `/usr/local/sbin/phanthy-m20-mapping` 只调用固定的 `drmap mapping`、`drmap stop_mapping` 及只读状态命令；密码和私钥不会写入配置或镜像。`start_mapping` 和 `stop_mapping` 会立即返回 `action_id`，实际 SSH 操作在后台执行，最终结果通过 Agent Core ACP completion 回调返回。
+M20 Pro 的建图控制卡片默认启用，以便不挂载外部配置的 Web Console 部署也能发现 `mapping` 与 `mapping_view`。Driver 使用专用 SSH 密钥连接 NOS，并通过根用户安装的受限入口 `/usr/local/sbin/phanthy-m20-mapping` 只调用固定的 `drmap mapping`、`drmap stop_mapping` 及只读状态命令；密码和私钥不会写入配置或镜像。缺少 SSH Secret 时卡片仍会显示，但控制调用会明确失败。`start_mapping` 和 `stop_mapping` 会立即返回 `action_id`，实际 SSH 操作在后台执行，最终结果通过 Agent Core ACP completion 回调返回。
 
 在 NOS 上创建受限助手，并只放行该固定入口：
 
