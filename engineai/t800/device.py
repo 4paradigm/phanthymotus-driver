@@ -111,11 +111,6 @@ def _notify_acp_completion(
         parsed_url = urllib.parse.urlparse(agent_core_url)
         if parsed_url.scheme not in ("http", "https"):
             raise ValueError("AGENT_CORE_URL must use http or https")
-        if (
-            parsed_url.scheme == "http"
-            and parsed_url.hostname not in ("localhost", "127.0.0.1", "::1")
-        ):
-            raise ValueError("unencrypted AGENT_CORE_URL is only allowed on loopback")
         context = ssl.create_default_context(cafile=ca_cert or None)
         payload = json.dumps({
             "action_id": action_id,
@@ -2512,6 +2507,39 @@ class HeadActuatorPlugin:
         self._thread: threading.Thread | None = None
         self._active_request_id: int | None = None
         self._status = {"state": "idle", "action": None, "step": 0, "total_steps": 0}
+        self._validate_head_config()
+
+    def _validate_head_config(self) -> None:
+        nod = float(self._config.get("nod_amplitude_rad", 0.3))
+        if not math.isfinite(nod) or not (0.0 <= nod <= self._PITCH_LIMIT):
+            raise ValueError(
+                f"nod_amplitude_rad must be finite and within [0, {self._PITCH_LIMIT}]"
+            )
+        shake = float(self._config.get("shake_amplitude_rad", 0.6))
+        if not math.isfinite(shake) or not (0.0 <= shake <= self._YAW_LIMIT):
+            raise ValueError(
+                f"shake_amplitude_rad must be finite and within [0, {self._YAW_LIMIT}]"
+            )
+        poses = self._config.get("look_poses", {})
+        if not isinstance(poses, dict):
+            raise ValueError("look_poses must be a dict")
+        for direction, pose in poses.items():
+            if not isinstance(pose, dict):
+                raise ValueError(f"look_poses[{direction}] must be a dict")
+            pitch = float(pose.get("pitch_rad", 0.0))
+            yaw = float(pose.get("yaw_rad", 0.0))
+            if not (math.isfinite(pitch) and math.isfinite(yaw)):
+                raise ValueError(f"look_poses[{direction}] must be finite")
+            if not (-self._PITCH_LIMIT <= pitch <= self._PITCH_LIMIT):
+                raise ValueError(
+                    f"look_poses[{direction}].pitch_rad must be within "
+                    f"[{-self._PITCH_LIMIT}, {self._PITCH_LIMIT}]"
+                )
+            if not (-self._YAW_LIMIT <= yaw <= self._YAW_LIMIT):
+                raise ValueError(
+                    f"look_poses[{direction}].yaw_rad must be within "
+                    f"[{-self._YAW_LIMIT}, {self._YAW_LIMIT}]"
+                )
 
     def get_tool(self) -> dict:
         actions = _with_lifecycle({

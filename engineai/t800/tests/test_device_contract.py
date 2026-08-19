@@ -1175,6 +1175,17 @@ class DevicePluginContractTests(unittest.TestCase):
             self.assertIn("times must be an integer", rejected["error"])
             self.assertIsNone(head._thread)
 
+    def test_head_rejects_unsafe_config_at_init(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        with self.assertRaises(ValueError):
+            self.device.HeadActuatorPlugin({"nod_amplitude_rad": 2.0}, plan, self.state)
+        with self.assertRaises(ValueError):
+            self.device.HeadActuatorPlugin(
+                {"look_poses": {"forward": {"pitch_rad": 0.9, "yaw_rad": 0.0}}},
+                plan,
+                self.state,
+            )
+
     def test_head_ownership_blocks_joint_plan_head_pose(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
         head = self.device.HeadActuatorPlugin(CONFIG, plan, self.state)
