@@ -18,6 +18,7 @@ import struct
 import subprocess
 import threading
 import time
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -1145,8 +1146,6 @@ class SpeakerPlugin:
                 stream = AudioStream()
                 stream.channels = 2
                 stream.sample_rate = 16000
-                stream.format = 2
-                stream.audio_data = stereo_samples
                 self._media_ctrl.publish_external_audio_playback_stream(stream)
             except Exception as e:
                 self._node.get_logger().warn(f"Speaker playback error: {e}")
@@ -1160,6 +1159,50 @@ class SpeakerPlugin:
 
 # ── CameraPlugin (sensor, subprocess) ────────────────────────────────────────
 
+_CAMERA_STATUS_PATH = Path(tempfile.gettempdir()) / "bumi_camera_status.json"
+_POINTCLOUD_CONTROL_PATH = Path(tempfile.gettempdir()) / "bumi_pointcloud_control"
+_CAMERA_PITCH_DEG = -10.263
+_CAMERA_ROLL_DEG = 0.853
+_CAMERA_HEIGHT_M = 1.10
+
+
+def _apply_camera_extrinsics(points, np):
+    """Apply the fixed RealSense-to-Bumi mounting rotation for display only."""
+    pitch = math.radians(_CAMERA_PITCH_DEG)
+    roll = math.radians(_CAMERA_ROLL_DEG)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cr, sr = math.cos(roll), math.sin(roll)
+    pitch_matrix = np.array(
+        [[1.0, 0.0, 0.0], [0.0, cp, -sp], [0.0, sp, cp]],
+        dtype=np.float32,
+    )
+    roll_matrix = np.array(
+        [[cr, -sr, 0.0], [sr, cr, 0.0], [0.0, 0.0, 1.0]],
+        dtype=np.float32,
+    )
+    return points @ (roll_matrix @ pitch_matrix).T
+
+
+def _write_camera_control(enabled: bool) -> None:
+    """Toggle point-cloud computation without opening a second camera pipeline."""
+    try:
+        _POINTCLOUD_CONTROL_PATH.write_text("1" if enabled else "0")
+    except OSError:
+        pass
+
+
+def _read_camera_status() -> dict:
+    try:
+        return json.loads(_CAMERA_STATUS_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {
+            "connected": False,
+            "rgb_ok": False,
+            "depth_ok": False,
+            "error": "camera status is not available",
+            "pointcloud_enabled": False,
+        }
+
 def _camera_subprocess(namespace: str):
     """Camera subprocess — captures Realsense D435i color+depth, publishes to ROS2."""
     import time as _time
@@ -1170,6 +1213,7 @@ def _camera_subprocess(namespace: str):
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
     from sensor_msgs.msg import CompressedImage as _CompressedImage
     from sensor_msgs.msg import Image as _SensorImage
+    from std_msgs.msg import UInt8MultiArray as _UInt8MultiArray
 
     _QOS = QoSProfile(
         reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -1186,11 +1230,11 @@ def _camera_subprocess(namespace: str):
         from turbojpeg import TurboJPEG, TJPF_BGR
         _tj = TurboJPEG()
         def encode_jpeg(bgr_image):
-            return _tj.encode(bgr_image, pixel_format=TJPF_BGR, quality=80)
+            return _tj.encode(bgr_image, pixel_format=TJPF_BGR, quality=65)
         print("[camera_subprocess] using TurboJPEG encoder", flush=True)
     except Exception:
         def encode_jpeg(bgr_image):
-            _, buf = cv2.imencode('.jpg', bgr_image, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            _, buf = cv2.imencode('.jpg', bgr_image, [cv2.IMWRITE_JPEG_QUALITY, 65])
             return buf.tobytes()
         print("[camera_subprocess] using cv2 JPEG encoder", flush=True)
 
@@ -1198,31 +1242,67 @@ def _camera_subprocess(namespace: str):
     node = _Node("bumi_camera_sub")
     color_topic = f"/{namespace}/camera/color"
     depth_topic = f"/{namespace}/camera/depth"
+    info_topic = f"/{namespace}/camera/info"
+    pointcloud_topic = f"/{namespace}/camera/pointcloud"
     color_pub = node.create_publisher(_CompressedImage, color_topic, _QOS)
     depth_pub = node.create_publisher(_CompressedImage, depth_topic, _QOS)
+    info_pub = node.create_publisher(String, info_topic, _QOS)
+    # AgentCore's sensor/pointcloud stream uses a UInt8MultiArray envelope:
+    # <uint32 point_step><uint32 point_count><XYZ float32 bytes>.
+    pointcloud_pub = node.create_publisher(_UInt8MultiArray, pointcloud_topic, _QOS)
 
     pipeline = rs.pipeline()
+    pointcloud = rs.pointcloud()
     config = rs.config()
     config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
     config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
 
+    status = {
+        "connected": False, "rgb_ok": False, "depth_ok": False,
+        "resolution": {"width": 640, "height": 480},
+        "configured_fps": 30, "actual_fps": 0.0, "frames": 0,
+        "dropped_frames": 0, "last_frame_time": None,
+        "error": None, "device_busy": False, "pointcloud_enabled": False,
+        "pointcloud_fps": 0.0, "pointcloud_frames": 0,
+        "pointcloud_valid_points": 0, "pointcloud_range_m": None,
+        "pointcloud_nearest_obstacle_m": None, "pointcloud_frame_id": "bumi_camera_depth",
+    }
+    _CAMERA_STATUS_PATH.write_text(json.dumps(status))
     try:
         pipeline.start(config)
     except Exception as e:
+        status.update({"error": str(e), "device_busy": "busy" in str(e).lower()})
+        _CAMERA_STATUS_PATH.write_text(json.dumps(status))
         print(f"[camera_subprocess] Realsense pipeline start failed: {e}", flush=True)
         return
 
+    status.update({"connected": True, "rgb_ok": True, "depth_ok": True, "error": None})
+    _CAMERA_STATUS_PATH.write_text(json.dumps(status))
     print(f"[camera_subprocess] publishing color→{color_topic} depth→{depth_topic}", flush=True)
 
     frame_count = 0
     t_start = _time.monotonic()
+    last_status = _time.monotonic()
+    last_pointcloud_frames = 0
+    previous_frames = 0
+    last_rs_frame_number = None
+    real_dropped_frames = 0
     try:
         while True:
             t0 = _time.monotonic()
             frames = pipeline.wait_for_frames(timeout_ms=1000)
             t_wait = _time.monotonic() - t0
+            rs_frame_number = frames.get_frame_number()
+            if last_rs_frame_number is not None:
+                gap = rs_frame_number - last_rs_frame_number - 1
+                if gap > 0:
+                    real_dropped_frames += gap
+            last_rs_frame_number = rs_frame_number
 
             color_frame = frames.get_color_frame()
+            depth_frame = frames.get_depth_frame()
+            status["rgb_ok"] = bool(color_frame)
+            status["depth_ok"] = bool(depth_frame)
             if color_frame:
                 color_image = _np.asanyarray(color_frame.get_data())
                 t1 = _time.monotonic()
@@ -1234,7 +1314,6 @@ def _camera_subprocess(namespace: str):
                 msg.data = jpeg_bytes
                 color_pub.publish(msg)
 
-            depth_frame = frames.get_depth_frame()
             if depth_frame:
                 depth_image = _np.asanyarray(depth_frame.get_data())
                 import zlib as _zlib
@@ -1245,6 +1324,69 @@ def _camera_subprocess(namespace: str):
                 msg.data = compressed
                 depth_pub.publish(msg)
 
+            try:
+                pointcloud_enabled = _POINTCLOUD_CONTROL_PATH.read_text().strip() == "1"
+            except OSError:
+                pointcloud_enabled = False
+            was_pointcloud_enabled = status["pointcloud_enabled"]
+            if was_pointcloud_enabled and not pointcloud_enabled:
+                status.update({
+                    "pointcloud_frames": 0,
+                    "pointcloud_valid_points": 0,
+                    "pointcloud_range_m": None,
+                    "pointcloud_nearest_obstacle_m": None,
+                    "pointcloud_fps": 0.0,
+                })
+                last_pointcloud_frames = 0
+            status["pointcloud_enabled"] = pointcloud_enabled
+            if pointcloud_enabled and color_frame and depth_frame:
+                points = pointcloud.calculate(depth_frame)
+                vertices = _np.asanyarray(points.get_vertices()).view(_np.float32).reshape(-1, 3)
+                finite = _np.isfinite(vertices).all(axis=1)
+                valid = vertices[finite]
+                valid = valid[_np.linalg.norm(valid, axis=1) > 0.05]
+                if len(valid):
+                    # Match the existing Tianyi/G1 AgentCore point-cloud
+                    # protocol and cap the payload to keep the UI responsive.
+                    max_points = 10000
+                    count = min(len(valid), max_points)
+                    stride = max(1, len(valid) // count)
+                    sampled = valid[::stride][:count]
+                    # Apply the physical camera mounting correction while the
+                    # points are still in the RealSense optical frame.
+                    sampled = _apply_camera_extrinsics(sampled, _np)
+                    # Then convert RealSense XYZ to the AgentCore/Tianyi frame.
+                    # Keep `valid` unchanged below for distance statistics.
+                    sampled = sampled[:, [2, 0, 1]]
+                    # Translate the display cloud so the calibrated floor is
+                    # approximately at the AgentCore ground plane.
+                    sampled[:, 2] -= _CAMERA_HEIGHT_M
+                    blob = sampled.astype("<f4", copy=False).tobytes()
+                    payload = struct.pack("<II", 12, len(sampled)) + blob
+                    msg = _UInt8MultiArray()
+                    msg.data = list(payload)
+                    pointcloud_pub.publish(msg)
+                    distances = _np.linalg.norm(valid, axis=1)
+                    status["pointcloud_valid_points"] = int(len(valid))
+                    status["pointcloud_range_m"] = [float(distances.min()), float(distances.max())]
+                    status["pointcloud_nearest_obstacle_m"] = float(distances.min())
+                    status["pointcloud_frames"] += 1
+
+            now = _time.monotonic()
+            if now - last_status >= 1.0:
+                elapsed = max(now - last_status, 1e-6)
+                status["actual_fps"] = round((frame_count - previous_frames) / elapsed, 2)
+                status["pointcloud_fps"] = round((status["pointcloud_frames"] - last_pointcloud_frames) / elapsed, 2)
+                status["last_frame_time"] = int(_time.time() * 1000)
+                status["frames"] = frame_count
+                status["dropped_frames"] = real_dropped_frames
+                info = String()
+                info.data = json.dumps(status, separators=(",", ":"))
+                info_pub.publish(info)
+                _CAMERA_STATUS_PATH.write_text(json.dumps(status, separators=(",", ":")))
+                last_status, previous_frames = now, frame_count
+                last_pointcloud_frames = status["pointcloud_frames"]
+
             frame_count += 1
             # Log every 300 frames (~15s at 20fps)
             if frame_count % 300 == 0:
@@ -1254,8 +1396,14 @@ def _camera_subprocess(namespace: str):
 
             _time.sleep(0.001)  # yield CPU
     except Exception as e:
+        status.update({"error": str(e), "rgb_ok": False, "depth_ok": False})
         print(f"[camera_subprocess] error: {e}", flush=True)
     finally:
+        status.update({"connected": False, "rgb_ok": False, "depth_ok": False, "pointcloud_enabled": False})
+        try:
+            _CAMERA_STATUS_PATH.write_text(json.dumps(status))
+        except OSError:
+            pass
         pipeline.stop()
 
 
@@ -1266,10 +1414,29 @@ class CameraPlugin:
         self._namespace = namespace
         self._color_topic = f"/{namespace}/camera/color"
         self._depth_topic = f"/{namespace}/camera/depth"
+        self._info_topic = f"/{namespace}/camera/info"
+        self._pointcloud_topic = f"/{namespace}/camera/pointcloud"
         self._proc: subprocess.Popen | None = None
 
     def get_tools(self) -> list:
         return [
+            {
+                "name": "camera_info",
+                "type": "sensor",
+                "multiInstance": False,
+                "description": "Bumi RealSense camera health: connection, RGB/depth status, resolution, actual FPS, dropped frames, last frame, errors and device-busy state.",
+                "inputSchema": {"type": "object", "properties": {}},
+                "topic_out": [{"topic": self._info_topic, "format": "data/json"}],
+            },
+            {
+                "name": "pointcloud",
+                "type": "sensor",
+                "multiInstance": False,
+                "description": "Bumi RealSense point cloud. Disabled by default; start enables computation and stop releases point-cloud work. Publishes AgentCore sensor/pointcloud binary only while enabled.",
+                "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["start", "stop", "info"]}}},
+                "x-action-params": {"start": {"params": []}, "stop": {"params": []}, "info": {"params": []}},
+                "topic_out": [{"topic": self._pointcloud_topic, "format": "sensor/pointcloud"}],
+            },
             {
                 "name": "camera",
                 "type": "sensor",
@@ -1290,6 +1457,8 @@ class CameraPlugin:
 
     def start(self) -> None:
         import sys
+        # A previous crash must not leave point-cloud processing enabled on restart.
+        _write_camera_control(False)
         self._proc = subprocess.Popen(
             [sys.executable, "-c",
              f"import sys; sys.path.insert(0, '/work'); from device import _camera_subprocess; _camera_subprocess({self._namespace!r})"],
@@ -1301,11 +1470,29 @@ class CameraPlugin:
         threading.Thread(target=_fwd, daemon=True).start()
 
     def stop(self) -> None:
+        _write_camera_control(False)
         if self._proc:
             self._proc.terminate()
             self._proc = None
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        tool_name = args.get('_tool_name', '')
+        if tool_name == "camera_info":
+            return _read_camera_status()
+        if tool_name == "pointcloud":
+            if action in ("start", "enable"):
+                _write_camera_control(True)
+                status = _read_camera_status()
+                status.update({"pointcloud_enabled": True, "state": "running", "topic_out": [{"topic": self._pointcloud_topic, "format": "sensor/pointcloud"}]})
+                return status
+            if action in ("stop", "disable"):
+                _write_camera_control(False)
+                status = _read_camera_status()
+                status.update({"pointcloud_enabled": False, "state": "idle"})
+                return status
+            if action == "info":
+                return _read_camera_status()
+            return None
         if action == "start":
             return {"state": "running"}
         if action == "stop":
