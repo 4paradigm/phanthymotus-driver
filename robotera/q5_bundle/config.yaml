@@ -51,9 +51,7 @@ plugins:
   audio:
     enabled: true
     device: "plughw:2,0"
-    library_dir: "/opt/phanthy-motus/data/audios"
-    # Agent Core writes files selected in the canvas here, then the driver
-    # retrieves them through AGENT_CORE_URL's existing file-download endpoint.
+    # Agent Core files selected in the canvas are read through its download endpoint.
     agent_core_upload_dir: "/tmp/uploads"
     # Set AGENT_CORE_TOKEN, AGENT_CORE_ACCESS_TOKEN, or Agent Core's native
     # ACCESS_TOKEN when Agent Core auth is enabled.

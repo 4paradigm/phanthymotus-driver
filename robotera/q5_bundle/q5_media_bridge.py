@@ -39,7 +39,10 @@ class BridgeWorker:
         # Keep independent latest frames for RGB, depth, and pointcloud. The
         # worker dispatches them by kind; a single tiny queue otherwise lets a
         # 15 Hz RGB stream overwrite slower depth/pointcloud frames.
-        self._media_q = self._ctx.Queue(maxsize=16)
+        # Camera callbacks must never block. A deeper queue tolerates brief
+        # DDS scheduling stalls; the worker still coalesces by media kind and
+        # publishes only the latest frame for each stream.
+        self._media_q = self._ctx.Queue(maxsize=128)
         self._audio_q = self._ctx.Queue(maxsize=100)
         self._speaker_q = self._ctx.Queue(maxsize=64)
         self._proc = None

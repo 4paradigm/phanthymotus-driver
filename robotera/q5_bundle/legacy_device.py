@@ -19,6 +19,7 @@ import struct
 import subprocess
 import threading
 import time
+from pathlib import Path
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -36,6 +37,20 @@ from xbot_common_interfaces.srv import SetVolume
 from legacy_direct_control import (
     ArmControlPlugin,
 )
+
+
+def _acp_notify(action_id: str, status: str, result: dict, tool: str) -> None:
+    """Report completion of a long-running Q5 card action to Agent Core."""
+    payload = json.dumps({"action_id": action_id, "status": status,
+                          "result": result, "tool": tool, "ts": time.time()}).encode()
+    url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
+    request = urllib.request.Request(f"{url}/api/acp/complete", data=payload,
+                                     headers={"Content-Type": "application/json"}, method="POST")
+    context = ssl._create_unverified_context() if url.startswith("https://") else None
+    try:
+        urllib.request.urlopen(request, timeout=5, context=context).read()
+    except Exception as exc:
+        print(f"[Q5 ACP] callback failed for {action_id}: {exc}", flush=True)
 
 
 _RELIABLE_QOS = QoSProfile(
@@ -598,11 +613,36 @@ class SpeakerPlugin:
             self.stop()
             try:
                 self._prepare_xos_route()
+                self._play_startup_sound()
                 self._start_playback(requested)
                 print(f"[SpeakerPlugin] playback subscribed <- {self._topic}", flush=True)
             except Exception as exc:
                 self.stop()
                 print(f"[SpeakerPlugin] playback unavailable: {exc}", flush=True)
+
+    def _play_startup_sound(self) -> None:
+        """Play a short PCM self-check before subscribing to the live stream."""
+        path = Path(__file__).parent / "resource" / "startup_beep.pcm"
+        try:
+            pcm = path.read_bytes()
+            command = _q5_alsa_speaker_command(self._device, self._output_rate, self._output_channels)
+            proc = subprocess.Popen(_q5_ssh_args(command), stdin=subprocess.PIPE,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, bufsize=0)
+            # The remote ALSA helper accepts the public 16 kHz mono contract
+            # and converts it at the hardware boundary.
+            block_size = 8000  # 250 ms at 16 kHz mono PCM16
+            for offset in range(0, len(pcm), block_size):
+                block = pcm[offset:offset + block_size]
+                if proc.stdin:
+                    proc.stdin.write(block)
+                    proc.stdin.flush()
+                time.sleep(len(block) / 32000.0)
+            if proc.stdin:
+                proc.stdin.close()
+            proc.wait(timeout=3)
+            print(f"[SpeakerPlugin] startup self-check OK ({len(pcm)} bytes)", flush=True)
+        except Exception as exc:
+            print(f"[SpeakerPlugin] startup self-check failed: {exc}", flush=True)
 
     def _prepare_xos_route(self):
         """Release XOS chat's route before taking ownership with live ALSA."""
@@ -1237,8 +1277,6 @@ class AudioPlugin:
         self._srv_stop = self._node.create_client(Trigger, "/audio_player/stop_play")
         self._srv_is_play = self._node.create_client(Trigger, "/audio_player/is_play")
         self._device = plugin_config.get("device", "plughw:2,0")
-        self._library_dir = os.path.realpath(str(plugin_config.get(
-            "library_dir", "/opt/phanthy-motus/data/audios")))
         self._upload_max_bytes = max(1, int(plugin_config.get("upload_max_bytes", 20 * 1024 * 1024)))
         self._xos_http_base = str(plugin_config.get("xos_http_base", "http://192.168.8.100:1888")).rstrip("/")
         self._agent_core_url = str(plugin_config.get(
@@ -1260,19 +1298,15 @@ class AudioPlugin:
             "description": "Q5 XOS audio playback. Audio ensures XOS conversation is ON and leaves it ON; speaker owns the OFF/live-ALSA route.",
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": [
-                    "play_local_file", "play_library_file", "play_robot_file", "play_id",
-                    "list_library", "list_robot_audio_files", "upload_local_file",
-                    "upload_from_library", "upload_base64", "delete_audio", "set_volume",
+                    "play_local_file", "play_library_file", "play_id",
+                    "list_library", "upload_local_file", "upload_base64", "delete_audio", "set_volume",
                     "get_volume", "stop_audio", "is_play", "stop"],
                     "oneOf": [
                         {"const": "play_local_file", "title": "播放本地音频文件"},
-                        {"const": "play_library_file", "title": "播放挂载音频库文件"},
-                        {"const": "play_robot_file", "title": "播放机器人已有文件"},
+                        {"const": "play_library_file", "title": "播放机器人音频库文件"},
                         {"const": "play_id", "title": "播放内置音频 ID"},
                         {"const": "list_library", "title": "查看挂载音频库"},
-                        {"const": "list_robot_audio_files", "title": "查看机器人音频文件"},
                         {"const": "upload_local_file", "title": "上传本地音频文件"},
-                        {"const": "upload_from_library", "title": "从挂载音频库上传"},
                         {"const": "upload_base64", "title": "上传音频到机器人"},
                         {"const": "delete_audio", "title": "从 XOS 音频库删除"},
                         {"const": "set_volume", "title": "设置音量"},
@@ -1298,16 +1332,11 @@ class AudioPlugin:
                     "play_local_file": {"params": ["local_file", "force_play", "timeout", "channel", "version"],
                                         "description": "选择本地 WAV/MP3；自动从 Agent Core 读取、上传至 XOS 并播放。"},
                     "play_library_file": {"params": ["file_name", "force_play", "timeout", "channel", "version"],
-                                         "description": "从挂载音频库读取 WAV/MP3，自动上传至 XOS 并播放。"},
-                    "play_robot_file": {"params": ["file_name", "force_play", "timeout", "channel", "version"],
-                                        "description": "直接播放 XOS 音频库已有的 audio_name。"},
+                                         "description": "直接播放机器人 XOS 音频库已有的 audio_name。"},
                     "play_id": {"params": ["id", "force_play", "timeout", "channel", "version"],
                                 "description": "播放厂商预装音频 ID；XOS 不提供 ID 枚举。"},
-                    "list_library": {"params": [], "description": "列出挂载音频库；返回 library_dir 供预置文件管理使用。"},
-                    "list_robot_audio_files": {"params": [], "description": "列出 XOS 音频库；返回的 audio_name 可用于播放机器人已有文件。"},
+                    "list_library": {"params": [], "description": "列出机器人 XOS 音频库；返回的 file_name 可用于 play_library_file。"},
                     "upload_local_file": {"params": ["local_file"], "description": "选择本地 WAV/MP3 并上传到 XOS，不播放。"},
-                    "upload_from_library": {"params": ["file_name"],
-                                            "description": "从挂载音频库上传 WAV/MP3 到 XOS，不播放。"},
                     "upload_base64": {"params": ["file_name", "content_base64"],
                                       "description": "上传 Base64 WAV/MP3 到 XOS，不播放。"},
                     "delete_audio": {"params": ["file_name"],
@@ -1329,15 +1358,10 @@ class AudioPlugin:
     def dispatch(self, action, args):
         if action in ("start", "info"):
             return {"state": "ready", "action_server": "/audio_player/play", "device": self._device,
-                    "library_dir": self._library_dir, "agent_core_upload_dir": self._upload_dir}
-        if action == "play_local_file":
-            return self._play_uploaded_local_file(args)
-        if action == "play_library_file":
-            return self._play_library_file(args)
-        if action == "play_robot_file":
-            return self._play(args, 3)
-        if action == "play_id":
-            return self._play(args, 0)
+                    "agent_core_upload_dir": self._upload_dir}
+        if action in ("play_local_file", "play_library_file", "play_id"):
+            mode = {"play_local_file": None, "play_library_file": 3, "play_id": 0}[action]
+            return self._queue_play(args, mode, action)
         # Compatibility-only entry points. `path` and `item` are vendor
         # advanced modes with no public resource-discovery contract, so they
         # are intentionally absent from the normal card schema.
@@ -1346,11 +1370,7 @@ class AudioPlugin:
         if action in play_modes:
             return self._play(args, play_modes[action])
         if action == "list_library":
-            return self._list_library()
-        if action == "list_robot_audio_files":
             return self._list_robot_audio_files()
-        if action == "upload_from_library":
-            return self._upload_from_library(args)
         if action == "upload_local_file":
             return self._upload_local_file(args)
         if action == "upload_base64":
@@ -1371,6 +1391,21 @@ class AudioPlugin:
             return {"state": "idle"}
         return None
 
+    def _queue_play(self, args, mode, action):
+        action_id = str(args.get("action_id") or f"audio_{action}_{int(time.time() * 1000)}")
+        def run():
+            try:
+                if action == "play_local_file":
+                    result = self._play_uploaded_local_file(args)
+                else:
+                    result = self._play(args, mode)
+                _acp_notify(action_id, "completed" if result.get("state") in ("ok", "running") else "error",
+                            result, "audio")
+            except Exception as exc:
+                _acp_notify(action_id, "error", {"state": "error", "message": str(exc)}, "audio")
+        threading.Thread(target=run, daemon=True, name=f"q5_audio_{action}").start()
+        return {"status": "queued", "action_id": action_id, "source": action}
+
     @staticmethod
     def _valid_upload_name(file_name) -> bool:
         if not isinstance(file_name, str) or file_name != os.path.basename(file_name):
@@ -1378,42 +1413,6 @@ class AudioPlugin:
         if not file_name or file_name.startswith(".") or any(ord(char) < 32 for char in file_name):
             return False
         return os.path.splitext(file_name)[1].lower() in (".wav", ".mp3")
-
-    def _list_library(self):
-        try:
-            entries = []
-            for entry in sorted(os.scandir(self._library_dir), key=lambda item: item.name.lower()):
-                if entry.is_file() and self._valid_upload_name(entry.name):
-                    entries.append({"file_name": entry.name, "bytes": entry.stat().st_size})
-            return {"state": "ok", "library_dir": self._library_dir, "files": entries[:100],
-                    "truncated": len(entries) > 100,
-                    "play_action": "play_library_file"}
-        except FileNotFoundError:
-            return {"state": "ok", "library_dir": self._library_dir, "files": [],
-                    "message": "audio library directory does not exist yet"}
-        except OSError as exc:
-            return {"state": "error", "message": f"cannot read audio library: {exc}"}
-
-    def _upload_from_library(self, args):
-        file_name = args.get("file_name")
-        if not self._valid_upload_name(file_name):
-            return {"state": "error", "message": "file_name must be a simple .wav or .mp3 filename"}
-        source_path = os.path.realpath(os.path.join(self._library_dir, file_name))
-        if os.path.commonpath((self._library_dir, source_path)) != self._library_dir:
-            return {"state": "error", "message": "file_name is outside the configured audio library"}
-        try:
-            size = os.path.getsize(source_path)
-            if size <= 0:
-                return {"state": "error", "message": "audio file is empty"}
-            if size > self._upload_max_bytes:
-                return {"state": "error", "message": f"audio file exceeds {self._upload_max_bytes} byte upload limit"}
-            with open(source_path, "rb") as source:
-                payload = source.read()
-        except FileNotFoundError:
-            return {"state": "error", "message": f"audio file not found in library: {file_name}"}
-        except OSError as exc:
-            return {"state": "error", "message": f"cannot read audio file: {exc}"}
-        return self._upload_payload(file_name, payload)
 
     def _agent_core_file_payload(self, local_file):
         """Read a canvas-selected file through Agent Core's existing file API."""
@@ -1470,9 +1469,6 @@ class AudioPlugin:
     def _play_uploaded_local_file(self, args):
         return self._play_uploaded(self._upload_local_file(args), args, "local_file")
 
-    def _play_library_file(self, args):
-        return self._play_uploaded(self._upload_from_library(args), args, "library")
-
     def _list_robot_audio_files(self):
         response = self._xos_json_request(self._xos_audio_list_path)
         if response.get("code") != 200:
@@ -1486,7 +1482,7 @@ class AudioPlugin:
                           "duration_ms": entry.get("duration_ms"),
                           "duration_s": entry.get("duration_s"),
                           "create_time": entry.get("create_time")})
-        return {"state": "ok", "files": files, "play_action": "play_robot_file",
+        return {"state": "ok", "files": files, "play_action": "play_library_file",
                 "id_mapping_available": False,
                 "note": "XOS exposes audio_name but no numeric audio-library ID in this endpoint."}
 
@@ -1545,7 +1541,7 @@ class AudioPlugin:
             return {"state": "error", "message": response.get("msg", "XOS audio upload failed")}
         return {
             "state": "ok", "file_name": file_name, "audio_name": file_name,
-            "bytes_uploaded": len(payload), "next_action": "play_robot_file",
+            "bytes_uploaded": len(payload), "next_action": "play_library_file",
             "play_args": {"file_name": file_name, "force_play": True, "timeout": 0},
             "already_exists": already_exists,
             "note": "Registered through the XOS audio-library API. XOS exposes audio_name, not a numeric ID.",

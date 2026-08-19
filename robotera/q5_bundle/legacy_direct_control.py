@@ -15,6 +15,7 @@ from xbot_common_interfaces.srv import DynamicLaunch
 from body_command import get_router as _get_body_router
 from control_contract import q5_active_status, q5_is_control_ready
 from joint_limits import JOINT_LIMITS, limits_for
+from q5_acp import notify as _acp_notify
 
 
 # ── Arm control ──────────────────────────────────────────────────────────────
@@ -335,7 +336,8 @@ class ArmControlPlugin:
         position = snap.get("joints", {}).get(joint_name)
         return self._hold_position(joint_name, position) if snap.get("fresh") else False
 
-    def _run_move(self, stop_event, joint_name: str, current: float, target: float, duration_s: float):
+    def _run_move(self, stop_event, joint_name: str, current: float, target: float, duration_s: float,
+                  action_id: str | None = None):
         steps = max(
             int(math.ceil(abs(target - current) / self._max_step)),
             int(math.ceil(duration_s * self._publish_rate)),
@@ -354,6 +356,10 @@ class ArmControlPlugin:
             # successful completion; cancellation continues to hold feedback.
             self._hold_position(joint_name, target) if not stop_event.is_set() else self._hold_current(joint_name)
             self._router.release(ARM_CARD)
+            _acp_notify(action_id, "cancelled" if stop_event.is_set() else "completed", {
+                "joint_name": joint_name, "target_position_rad": target,
+                "duration_s": duration_s,
+            }, ARM_CARD)
             with self._lock:
                 if self._motion_stop is stop_event:
                     self._motion_stop = None
@@ -441,6 +447,7 @@ class ArmControlPlugin:
         if isinstance(command, dict):
             return command
         joint_name, current, target, duration_s = command
+        action_id = str(args.get("action_id") or f"arm_control_{joint_name}_{int(time.time() * 1000)}")
         if not self._router.acquire(ARM_CARD):
             return _arm_failure("COMMAND_IN_PROGRESS", "Another Q5 body card currently owns the command publisher",
                             status=self._router.status())
@@ -457,10 +464,10 @@ class ArmControlPlugin:
             }
             self._motion_thread = threading.Thread(
                 target=self._run_move,
-                args=(stop_event, joint_name, current, target, duration_s),
+                args=(stop_event, joint_name, current, target, duration_s, action_id),
                 daemon=True,
                 name="q5_arm_control",
             )
             self._motion_thread.start()
         return {"ok": True, "state": "moving", "command": dict(self._active_command),
-                "stops_by_holding_current_position": True}
+                "stops_by_holding_current_position": True, "action_id": action_id}
