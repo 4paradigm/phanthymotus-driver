@@ -467,15 +467,19 @@ class Plugin:
                         delta = abs(positions[name] - previous_positions[name])
                         max_delta_rad = max(max_delta_rad, delta)
 
-                transition_s = max_delta_rad / speed if speed > 0 else 0.5
-                delay = max(0.12, transition_s * transition_ratio) + hold_s
-
-                # Interpolate
+                # Step count is bounded below by the maximum-step constraint so
+                # a single frame never moves a joint more than max_step_rad.
                 steps = max(
-                    int(math.ceil(max_delta_rad / self._max_step)),
-                    int(math.ceil(transition_s * self._publish_rate)),
+                    int(math.ceil(max_delta_rad / self._max_step)) if max_delta_rad > 0 else 1,
                     1,
                 )
+                # The transition must last long enough to publish every
+                # interpolation step at publish_rate_hz; otherwise the vendor
+                # command topic is flooded beyond the configured rate.
+                min_transition_s = steps / self._publish_rate if self._publish_rate > 0 else 0.0
+                user_transition_s = max_delta_rad / speed if speed > 0 else 0.5
+                transition_s = max(min_transition_s, user_transition_s)
+                delay = max(0.12, transition_s * transition_ratio) + hold_s
 
                 acquired = self._router.acquire(CARD)
                 if not acquired:
@@ -613,9 +617,10 @@ class Plugin:
                          for name in ARM_JOINT_NAMES if name in neutral and name in current),
                         default=0.0,
                     )
-                    transition_s = max_delta / speed if speed > 0 else 1.0
-                    steps = max(int(math.ceil(max_delta / self._max_step)),
-                               int(math.ceil(transition_s * self._publish_rate)), 1)
+                    steps = max(int(math.ceil(max_delta / self._max_step)) if max_delta > 0 else 1, 1)
+                    min_transition_s = steps / self._publish_rate if self._publish_rate > 0 else 0.0
+                    user_transition_s = max_delta / speed if speed > 0 else 1.0
+                    transition_s = max(min_transition_s, user_transition_s)
                     for step in range(1, steps + 1):
                         t = step / steps
                         interp = {}
