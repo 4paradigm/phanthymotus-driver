@@ -2588,35 +2588,11 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                 "stop_confirmation": diagnostics,
             }
         if proposal_gate.is_bound_to(topic, expected_nav_id):
-            stopped = do_stop(
-                "proposal_bind_existing",
-                confirm_physical_stop=True,
-                external_stop_attempt=external_stop_attempt,
-            )
-            if not stopped.get("stop_confirmed"):
-                proposal_gate.disarm("stop_unconfirmed")
-                diagnostics = stopped.get("stop_confirmation") or {}
-                return {
-                    "error": "StopMove/odometry stop was not confirmed before proposal bind",
-                    "connected": bool(proposal_node.topic),
-                    "armed": False,
-                    "stop_confirmed": False,
-                    "stop_move_ret": diagnostics.get("stop_move_ret"),
-                    "stop_move_error": diagnostics.get("stop_move_error"),
-                    "stop_confirmation": diagnostics,
-                }
             proposal_connected.set()
             proposal_stop_transition.clear()
             result = handle_get_velocity_proposal_status()
             result["state"] = "connected"
-            result["stop_confirmed"] = True
-            result["stop_move_ret"] = stopped.get("ret")
-            result["stop_move_error"] = (
-                (stopped.get("stop_confirmation") or {}).get(
-                    "stop_move_error"
-                )
-            )
-            result["stop_confirmation"] = stopped.get("stop_confirmation")
+            result["idempotent"] = True
             return result
         if proposal_gate.connected_topic or proposal_node.topic:
             stopped = handle_unbind_velocity_proposal(
@@ -2843,18 +2819,6 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
             now,
             now_unix_ms=received_unix_ms,
         )
-        if not was_armed and proposal_gate.armed:
-            proposal_apply_diagnostics.begin_session(
-                proposal_gate.expected_nav_id
-            )
-            # begin_session resets the counters accumulated while no task was
-            # authorized. Preserve this first executable proposal as the
-            # first sample of the newly adopted lease.
-            proposal_apply_diagnostics.record_received(now)
-            proposal_apply_diagnostics.record_proposal_arrival(
-                payload,
-                received_unix_ms,
-            )
         if decision.stop:
             if decision.reason != "proposal_zero":
                 proposal_apply_diagnostics.record_rejected(decision.reason)
