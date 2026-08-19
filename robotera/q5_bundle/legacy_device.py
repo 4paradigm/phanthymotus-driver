@@ -1134,7 +1134,8 @@ class AudioPlugin:
             "agent_core_url", os.environ.get("AGENT_CORE_URL", "https://localhost:15678"))).rstrip("/")
         self._agent_core_token = str(plugin_config.get(
             "agent_core_token", os.environ.get(
-                "AGENT_CORE_TOKEN", os.environ.get("AGENT_CORE_ACCESS_TOKEN", ""))))
+                "AGENT_CORE_TOKEN", os.environ.get(
+                    "AGENT_CORE_ACCESS_TOKEN", os.environ.get("ACCESS_TOKEN", "")))))
         self._upload_dir = str(plugin_config.get("agent_core_upload_dir", "/tmp/uploads"))
         self._volume = max(0, min(100, int(plugin_config.get("volume", 50))))
         # XOS chat owns the vendor audio route. Serialize play/launch/quit so
