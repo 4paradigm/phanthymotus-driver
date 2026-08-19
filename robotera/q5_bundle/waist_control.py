@@ -95,6 +95,82 @@ class Plugin:
                             "Q5 control-mode helper is not initialized")
         return self._control_mode.dispatch("prepare_position_control", {})
 
+    def _reset(self, args):
+        """Interpolate all waist joints back to 0 rad."""
+        allowed = self._allowed(args)
+        if allowed.get("ok") is False:
+            return allowed
+        snap = self._client.snapshot()
+        if not snap.get("fresh"):
+            return _failure("JOINT_STATE_UNAVAILABLE", "No fresh /joint_states for reset")
+        targets = {}
+        for name in WAIST_JOINTS:
+            v = snap.get("joints", {}).get(name)
+            if v is not None:
+                targets[name] = 0.0
+        if not targets:
+            return _failure("WAIST_MODEL_MISMATCH", "No waist joints found in /joint_states")
+        if not self._router.acquire(CARD):
+            return _failure("COMMAND_IN_PROGRESS", "Another Q5 body card currently owns the command publisher")
+        action_id = f"waist_control_reset_{int(time.time()*1000)}"
+        # Use the first joint's delta for duration estimation
+        first_name = WAIST_JOINTS[0]
+        current = float(snap["joints"][first_name])
+        duration = max(0.5, abs(current) / (self._max_step * self._rate))
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                self._router.release(CARD)
+                return _failure("MOTION_IN_PROGRESS", "A waist adjustment is already active; call stop first")
+            event = threading.Event()
+            self._stop_event = event
+            self._active = {"joint_name": "all", "start_position_rad": current,
+                            "target_position_rad": 0.0, "duration_s": duration,
+                            "started_at_ms": int(time.time() * 1000)}
+            self._thread = threading.Thread(
+                target=self._run_reset, args=(event, targets, snap, duration, action_id),
+                daemon=True, name="q5_waist_reset")
+            self._thread.start()
+        return {"ok": True, "state": "moving", "waist_action": "reset",
+                "command": dict(self._active), "action_id": action_id}
+
+    def _run_reset(self, event, targets, snap, duration, action_id):
+        """Interpolate all waist joints from current to 0 rad."""
+        cancelled = True
+        try:
+            currents = {}
+            for name in WAIST_JOINTS:
+                v = snap.get("joints", {}).get(name)
+                if v is not None:
+                    currents[name] = float(v)
+            steps = max(
+                max(int(math.ceil(abs(currents[n] - 0.0) / self._max_step)) for n in currents) if currents else 1,
+                int(math.ceil(duration * self._rate)),
+                1,
+            )
+            for index in range(1, steps + 1):
+                if event.is_set():
+                    break
+                for name in currents:
+                    self._publish(name, currents[name] * (1.0 - index / steps))
+                event.wait(duration / steps)
+            cancelled = event.is_set()
+        finally:
+            if not event.is_set():
+                for name in targets:
+                    self._hold_position(name, 0.0)
+            else:
+                for name in WAIST_JOINTS:
+                    self._hold_current(name)
+            self._router.release(CARD)
+            with self._lock:
+                if self._stop_event is event:
+                    self._stop_event = self._thread = self._active = None
+            if action_id:
+                if cancelled:
+                    _acp_notify(action_id, "cancelled", {"joints": list(targets.keys())}, CARD)
+                else:
+                    _acp_notify(action_id, "completed", {"joints": list(targets.keys()), "target_rad": 0.0}, CARD)
+
     def get_tool(self):
         position_fields = {}
         for detail in WAIST_ACTIONS.values():
@@ -106,11 +182,12 @@ class Plugin:
             }
         return {"name": CARD, "type": TYPE, "multiInstance": False, "description": DESC,
                 "inputSchema": {"type": "object", "properties": {
-                    "action": {"type": "string", "enum": ["start", *WAIST_ACTIONS, "prepare", "cancel", "stop", "info"], "oneOf": [
+                    "action": {"type": "string", "enum": ["start", *WAIST_ACTIONS, "prepare", "reset", "cancel", "stop", "info"], "oneOf": [
                         {"const": "start", "title": "检查连接状态"},
                         *[{"const": action, "title": detail["title"], "description": detail["description"]}
                           for action, detail in WAIST_ACTIONS.items()],
                         {"const": "prepare", "title": "准备位置直控"},
+                        {"const": "reset", "title": "归零"},
                         {"const": "cancel", "title": "取消并保持"},
                         {"const": "stop", "title": "停止并保持当前位置"},
                         {"const": "info", "title": "查看状态"},
@@ -122,6 +199,7 @@ class Plugin:
                     **{action: {"params": [detail["field"]], "description": detail["description"]}
                        for action, detail in WAIST_ACTIONS.items()},
                     "prepare": {"params": [], "description": "执行位置直控准备：pos→READY→垂手→抬臂→ACTIVE，解锁控制"},
+                    "reset": {"params": [], "description": "归零：将腰部 yaw 关节插补回 0 rad。"},
                     "cancel": {"params": [], "description": "取消当前微调，并保持当前位置。"},
                     "stop": {"params": [], "description": "停止当前运动并保持当前位置。"},
                     "info": {"params": [], "description": "查看运动状态与安全条件。"},
@@ -223,6 +301,8 @@ class Plugin:
             return self._stop("command")
         if action == "prepare":
             return self.prepare()
+        if action == "reset":
+            return self._reset(args)
         detail = WAIST_ACTIONS.get(action)
         if detail is None:
             return None
