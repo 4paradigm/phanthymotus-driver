@@ -1804,22 +1804,29 @@ class NativeInterfaceProbePlugin:
         return "low"
 
 class LocomotionPlugin:
+    STOP_PRIORITY = 0
+
     def __init__(self, config: dict, namespace: str, ros2, state: StatePlugin):
         self._config = config
         self._state = state
         self._node = Node("t800_locomotion", context=ros2.ctx_robot)
         ros2.executor_robot.add_node(self._node)
         self._publisher = None
-        limits = config["control"]
+        self._watchdog_timer = None
+        limits = config.get("control", {})
         self._limits = (
-            float(limits["max_vx"]),
-            float(limits["max_vy"]),
-            float(limits["max_vyaw"]),
+            abs(float(limits.get("max_vx", 1.0))),
+            abs(float(limits.get("max_vy", 1.0))),
+            abs(float(limits.get("max_vyaw", 1.0))),
         )
         self._stream = RepeatingCommand(
             self._publish_payload,
             self._publish_zero,
-            rate_hz=float(limits["velocity_rate_hz"]),
+            rate_hz=float(limits.get("velocity_rate_hz", 100)),
+        )
+        self._watchdog_period = float(limits.get("stream_watchdog_period_sec", 0.5))
+        self._stream_gap_limit_sec = max(
+            5.0 / float(limits.get("velocity_rate_hz", 100)), 0.5
         )
 
     def get_tool(self) -> dict:
@@ -1852,6 +1859,7 @@ class LocomotionPlugin:
                     "linear_speed_m_s": {"type": "number", "description": "圆弧线速度，m/s；负数为后退"},
                 },
                 "运动动作",
+                completion=(["move"], 60),
             ),
         }
 
@@ -1862,11 +1870,31 @@ class LocomotionPlugin:
         self._publisher = self._node.create_publisher(
             BodyVelCmd, self._config["topics"]["body_velocity"], _RELIABLE
         )
+        self._watchdog_timer = self._node.create_timer(
+            self._watchdog_period, self._stream_health_check
+        )
+
+    def _stream_health_check(self):
+        """流发布看门狗：active 且超过 gap 上限无发布 → 停流归零"""
+        s = self._stream.snapshot()
+        if s.active and s.last_publish_at is not None:
+            gap = time.monotonic() - s.last_publish_at
+            if gap > self._stream_gap_limit_sec:
+                self._stream.stop()
+                self._publish_zero()
 
     def stop(self) -> None:
         self._stream.stop()
 
     def dispatch(self, action: str, args: dict) -> dict:
+        try:
+            return self._dispatch(action, args)
+        except Exception:
+            self._stream.stop()
+            self._publish_zero()
+            raise
+
+    def _dispatch(self, action: str, args: dict) -> dict:
         if action == "start":
             return {"state": "ready"}
         if action == "stop":
@@ -1949,10 +1977,10 @@ class MotionModePlugin:
         "idle": "idle",
         "passive": "passive",
         "stand": "pd_stand",
-        "walk": "walk",
+        "walk": "rl_basic",
         "dance": "dance",
-        "get_up": "supine_to_stance",
-        "lie_down": "stance_to_supine",
+        "get_up": "rl_mimic_supine_to_stance",
+        "lie_down": "rl_mimic_stance_to_supine",
     }
     def __init__(self, config: dict, namespace: str, ros2, state: StatePlugin):
         self._config = config
@@ -2076,7 +2104,7 @@ class DancePlugin:
         if action == "play":
             target = str(args.get("name", "dance"))
         elif action == "stop_dance":
-            target = str(args.get("target", "walk"))
+            target = str(args.get("target", "rl_basic"))
         else:
             return {"error": f"unknown dance action: {action}"}
         forwarded = dict(args)
