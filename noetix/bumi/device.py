@@ -95,6 +95,11 @@ _PLAYBACK_STATIONARY_THRESHOLD = 0.15
 _PLAYBACK_STATIONARY_CONFIRM_S = 3.0
 _PLAYBACK_MOTION_START_TIMEOUT_S = 10.0
 _PLAYBACK_MAX_MONITOR_S = 120.0
+_PLAYBACK_VELOCITY_WINDOW_SIZE = 5
+_PLAYBACK_MOTION_RESET_THRESHOLD = 0.20
+_PLAYBACK_MIN_JOINT_DISPLACEMENT_RAD = 0.08
+_WALK_EXIT_MAX_ATTEMPTS = 2
+_WALK_EXIT_CONFIRM_TIMEOUT_S = 3.0
 
 # Face-up stand-up safety gate, calibrated from the supplied Bumi samples.
 # Linear acceleration is expressed in the robot IMU frame.  Comparing its
@@ -583,7 +588,7 @@ class LocoPlugin:
     def _action_recording_tool(self) -> dict:
         return {
             "name": "action_recording", "type": "actuator", "multiInstance": False,
-            "description": "录制、结束并保存或播放 Bumi 示教动作。start_recording 和 play_recording 会自动进入所需行走模式；finish_and_save_recording 只能在已开始录制后使用；play_recording 会根据关节运动状态判断播放结束并自动返回 walking。",
+            "description": "录制、结束并保存或播放 Bumi 示教动作。start_recording 和 play_recording 会自动进入所需行走模式；finish_and_save_recording 只能在已开始录制后使用；play_recording 会用关节位移和滚动速度中位数判断播放结束，并通过最多两次受保护的 WALK 尝试自动返回 walking。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -604,7 +609,7 @@ class LocoPlugin:
                 "x-action-params": {
                     "start_recording": {"params": [], "description": "自动准备模式后开始示教录制。确认机器人稳定站立；缓慢引导关节，禁止强推至机械限位。"},
                     "finish_and_save_recording": {"params": ["recording_id"], "description": "结束当前示教并保存到 recording_id。若尚未开始录制，则不会发送命令。"},
-                    "play_recording": {"params": ["recording_id"], "description": "自动准备并播放 recording_id；卡片根据 workmode 和 21 个关节速度推断动作完成，随后自动返回 walking，无需填写时长或手动停止。"},
+                    "play_recording": {"params": ["recording_id"], "description": "自动准备并播放 recording_id；卡片根据 workmode、21 个关节位移和滚动速度中位数推断动作完成，随后通过带确认的 WALK 退出自动返回 walking，无需填写时长或手动停止。"},
                 },
             },
             "topic_out": [],
@@ -1818,7 +1823,9 @@ class LocoPlugin:
                 "auto_return_to_walk": True,
                 "auto_return_after_s": _TEAR_AUTO_EXIT_S,
                 "auto_return_condition": (
-                    "WALK will be sent only if the robot is still in tear mode when the timer expires."
+                    "If the robot is still in tear mode when the timer expires, the card "
+                    "uses at most two guarded WALK attempts and stops as soon as walking "
+                    "mode is observed."
                 ),
             })
         return result
@@ -1871,10 +1878,10 @@ class LocoPlugin:
                 "auto_return_to_walk": True,
                 "completion_detection": "inferred_from_workmode_and_joint_velocity",
                 "auto_return_condition": (
-                    "After joint motion has been observed, WALK is sent when all joints "
-                    "remain below the motion_state activity threshold for a sustained "
-                    "3-second score while the robot is still in play_teach mode; isolated "
-                    "encoder-noise spikes reduce the score instead of resetting it."
+                    "After joint motion or displacement has been observed, a rolling "
+                    "five-sample velocity median must remain stationary for a sustained "
+                    "3-second score while the robot is still in play_teach mode. The card "
+                    "then uses at most two guarded WALK attempts to confirm walking mode."
                 ),
                 "completion_detection_note": (
                     "The SDK exposes no explicit playback-completion event; completion is "
@@ -1990,6 +1997,12 @@ class LocoPlugin:
             motion_seen = False
             stationary_score_s = 0.0
             exit_reason = None
+            velocity_window = []
+            initial_positions = None
+            peak_joint_velocity = 0.0
+            peak_joint_displacement = 0.0
+            final_window_median_velocity = None
+            sample_count = 0
 
             while not stop_event.wait(0.05):
                 now = time.monotonic()
@@ -2038,8 +2051,19 @@ class LocoPlugin:
 
                 try:
                     joint_states = self._high_ctrl.get_joint_state()
+                    if len(joint_states) != len(_BUMI_JOINT_NAMES):
+                        raise RuntimeError(
+                            f"HighController returned {len(joint_states)} joints; expected "
+                            f"{len(_BUMI_JOINT_NAMES)}")
+                    positions = [float(state.pos) for state in joint_states]
                     max_velocity = max(
                         abs(float(state.vel)) for state in joint_states)
+                    if initial_positions is None:
+                        initial_positions = positions
+                    max_displacement = max(
+                        abs(position - initial)
+                        for position, initial in zip(
+                            positions, initial_positions))
                 except Exception as exc:
                     print(
                         f"[loco] play_recording completion sample failed: {exc}",
@@ -2047,14 +2071,26 @@ class LocoPlugin:
                     )
                     continue
 
-                if max_velocity >= _PLAYBACK_MOVING_THRESHOLD:
+                sample_count += 1
+                peak_joint_velocity = max(peak_joint_velocity, max_velocity)
+                peak_joint_displacement = max(
+                    peak_joint_displacement, max_displacement)
+                velocity_window.append(max_velocity)
+                if len(velocity_window) > _PLAYBACK_VELOCITY_WINDOW_SIZE:
+                    velocity_window.pop(0)
+                if len(velocity_window) < _PLAYBACK_VELOCITY_WINDOW_SIZE:
+                    continue
+                ordered_velocities = sorted(velocity_window)
+                median_velocity = ordered_velocities[
+                    len(ordered_velocities) // 2]
+                final_window_median_velocity = median_velocity
+
+                if (median_velocity >= _PLAYBACK_MOVING_THRESHOLD
+                        or max_displacement
+                        >= _PLAYBACK_MIN_JOINT_DISPLACEMENT_RAD):
                     motion_seen = True
-                    stationary_score_s = max(0.0, stationary_score_s - 0.25)
-                elif motion_seen and max_velocity <= _PLAYBACK_STATIONARY_THRESHOLD:
-                    # Disabled Bumi joints occasionally report isolated velocity
-                    # spikes around the activity threshold. Accumulate a sustained
-                    # stationary score instead of resetting a multi-second timer
-                    # after every single noisy sample.
+                if (motion_seen
+                        and median_velocity <= _PLAYBACK_STATIONARY_THRESHOLD):
                     stationary_score_s = min(
                         _PLAYBACK_STATIONARY_CONFIRM_S,
                         stationary_score_s + 0.05,
@@ -2062,6 +2098,12 @@ class LocoPlugin:
                     if stationary_score_s >= _PLAYBACK_STATIONARY_CONFIRM_S:
                         exit_reason = "joint_motion_completed"
                         break
+                elif (motion_seen and median_velocity
+                      >= _PLAYBACK_MOTION_RESET_THRESHOLD):
+                    # The rolling median requires a majority of recent samples
+                    # to be moving, so an isolated encoder spike cannot erase
+                    # the stationary score.
+                    stationary_score_s = 0.0
 
                 elapsed = now - started_at
                 if not motion_seen and elapsed >= _PLAYBACK_MOTION_START_TIMEOUT_S:
@@ -2077,6 +2119,19 @@ class LocoPlugin:
                 return
             result = self._send_walk_exit("play_recording_auto_return", safety)
             result["completion_inference"] = exit_reason
+            result["playback_observation"] = {
+                "sample_count": sample_count,
+                "peak_abs_joint_velocity_rad_s": round(
+                    peak_joint_velocity, 4),
+                "peak_joint_displacement_rad": round(
+                    peak_joint_displacement, 4),
+                "final_window_median_velocity_rad_s": (
+                    None if final_window_median_velocity is None
+                    else round(final_window_median_velocity, 4)
+                ),
+                "stationary_score_s": round(stationary_score_s, 3),
+                "velocity_window_size": _PLAYBACK_VELOCITY_WINDOW_SIZE,
+            }
             print(
                 f"[loco] play_recording auto-return result: {json.dumps(result)}",
                 flush=True,
@@ -2154,25 +2209,89 @@ class LocoPlugin:
             })
 
     def _send_walk_exit(self, requested_action: str, safety: str) -> dict:
-        observed = self._send_edge_and_wait(
-            _get_control_cmd("WALK"), {2, 26}, timeout_s=3.0)
-        if observed == 26:
+        source_mode = int(self._high_ctrl.get_mode())
+        if source_mode == 26:
             return self._protection_error(
-                requested_action, [], observed, safety, command_sent=True)
+                requested_action, [], source_mode, safety,
+                command_sent=False)
+        if source_mode == 2:
+            return {
+                "state": "completed",
+                "command_sent": False,
+                "requested_action": requested_action,
+                "confirmed": True,
+                "workmode": 2,
+                "workmode_name": "walking",
+                "exit_attempts": [],
+                "safety_requirements": safety,
+                "message": (
+                    "The robot had already returned to walking mode; no WALK command "
+                    "was sent."
+                ),
+            }
+
+        attempts = []
+        observed = source_mode
+        for attempt in range(1, _WALK_EXIT_MAX_ATTEMPTS + 1):
+            if observed != source_mode:
+                break
+            send_status = {}
+            observed = self._send_edge_and_wait(
+                _get_control_cmd("WALK"), {2, 26},
+                timeout_s=_WALK_EXIT_CONFIRM_TIMEOUT_S,
+                required_mode_before_send=source_mode,
+                send_status=send_status)
+            attempt_result = {
+                "attempt": attempt,
+                "source_workmode": source_mode,
+                "source_workmode_name": _WORKMODE_NAMES.get(
+                    source_mode, "unknown"),
+                "command_sent": bool(send_status.get("command_sent")),
+                "observed_workmode": observed,
+                "observed_workmode_name": _WORKMODE_NAMES.get(
+                    observed, "unknown"),
+                "confirmed": observed == 2,
+            }
+            if send_status.get("blocked_by_mode_change"):
+                attempt_result["send_skipped_reason"] = (
+                    "Workmode changed before WALK was sent. The retry was skipped."
+                )
+            attempts.append(attempt_result)
+            print(
+                "[loco] walk_exit_attempt "
+                + json.dumps(
+                    attempt_result, ensure_ascii=True,
+                    separators=(",", ":")),
+                flush=True,
+            )
+            if observed in {2, 26}:
+                break
+
+        if observed == 26:
+            result = self._protection_error(
+                requested_action, attempts, observed, safety,
+                command_sent=any(
+                    item["command_sent"] for item in attempts))
+            result["exit_attempts"] = attempts
+            return result
         confirmed = observed == 2
         return {
-            "state": "completed" if confirmed else "accepted",
-            "command_sent": True,
+            "state": "completed" if confirmed else "error",
+            "command_sent": any(
+                item["command_sent"] for item in attempts),
             "requested_action": requested_action,
             "confirmed": confirmed,
             "workmode": observed,
             "workmode_name": _WORKMODE_NAMES.get(observed, "unknown"),
             "preparation_steps": [],
+            "exit_attempts": attempts,
             "safety_requirements": safety,
             "message": (
                 "The active action was exited and walking mode was confirmed."
                 if confirmed else
-                "The WALK exit command was sent, but walking mode was not observed within 3 seconds."
+                "Walking mode was not confirmed during the guarded WALK exit. Check "
+                "exit_attempts, robot workmode, and battery before retrying or restarting "
+                "the robot."
             ),
         }
 

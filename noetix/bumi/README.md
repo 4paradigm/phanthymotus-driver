@@ -105,19 +105,22 @@ confirm that the physical action started.
 
 `wipe_tears` similarly requires arm-joint displacement after tear mode is
 observed. Its five-second automatic return timer starts only after physical arm
-motion is confirmed. If either action mode is observed without the required
-joint motion, the result reports an error and includes only the documented BMS
-SOC and alarm fields. A non-zero BMS alarm is reported as a possible low-charge or
-battery-condition cause; no undocumented SOC threshold is invented by the
-driver.
+motion is confirmed. Automatic return uses at most two guarded `WALK` edges and
+stops retrying as soon as workmode changes, so a missed first edge can recover
+without sending another command after walking mode is reached. If either action
+mode is observed without the required joint motion, the result reports an error
+and includes only the documented BMS SOC and alarm fields. A non-zero BMS alarm
+is reported as a possible low-charge or battery-condition cause; no
+undocumented SOC threshold is invented by the driver.
 
 `play_recording` returns `running` after play-teach mode is observed, then
-monitors workmode and all 21 joint velocities. Once joint motion has started and
-subsequently remained stationary for the configured confirmation window, the
-driver sends `WALK` to return automatically to workmode 2. No duration or manual
-stop parameter is exposed. The monitor also has no-motion and maximum-runtime
-safeguards because the SDK does not expose a dedicated physical playback-
-completion event.
+monitors workmode, all 21 joint velocities, and displacement from the playback
+starting pose. A five-sample rolling velocity median filters isolated encoder
+spikes; sustained movement resets the stationary score, while three seconds of
+stationary feedback completes playback. The same guarded two-attempt `WALK`
+exit then returns the robot to workmode 2. No duration or manual stop parameter
+is exposed. The monitor also has no-motion and maximum-runtime safeguards
+because the SDK does not expose a dedicated physical playback-completion event.
 
 `finish_and_save_recording` maps to the supported `SAVETEACH` command. The
 vendor-deprecated `ENDTEACH` command and unavailable `RUN` command remain
