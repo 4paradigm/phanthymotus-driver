@@ -87,6 +87,11 @@ class BumiDeviceBundle:
             self._plugins.append(RobotStatusPlugin(plugins_cfg["robot_status"], namespace, executor, high_ctrl))
             print("[bundle] RobotStatusPlugin loaded")
 
+        if plugins_cfg.get("audio_file_player", {}).get("enabled", False) and media_ctrl is not None:
+            from device import AudioFilePlayerPlugin
+            self._plugins.append(AudioFilePlayerPlugin(plugins_cfg["audio_file_player"], namespace, executor, media_ctrl))
+            print("[bundle] AudioFilePlayerPlugin loaded")
+
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
             try:
@@ -111,6 +116,13 @@ class BumiDeviceBundle:
                 tools.append(p.get_tool())
         return tools
 
+    def upload_audio(self, filename: str, data: bytes) -> dict | None:
+        """Upload a wav file into the audio_file_player plugin's library."""
+        for p in self._plugins:
+            if getattr(p, 'PREFIX', '') == 'audio_file_player' and hasattr(p, 'upload'):
+                return p.upload(filename, data)
+        return None
+
     def dispatch(self, tool_name: str, args: dict) -> dict | None:
         for p in self._plugins:
             plugin_tools = p.get_tools() if hasattr(p, 'get_tools') else [p.get_tool()]
@@ -128,6 +140,32 @@ class BumiDeviceBundle:
 # ── MCP HTTP server ───────────────────────────────────────────────────────────
 
 _bundle: BumiDeviceBundle | None = None
+
+
+def _parse_multipart(body: bytes, boundary: str) -> dict:
+    """极简 multipart/form-data 解析 → {field_name: (filename, content_bytes)}。"""
+    parts = {}
+    delim = b"--" + boundary.encode()
+    for chunk in body.split(delim):
+        chunk = chunk.strip(b"\r\n")
+        if not chunk or chunk in (b"--", b""):
+            continue
+        if b"\r\n\r\n" in chunk:
+            header, content = chunk.split(b"\r\n\r\n", 1)
+        elif b"\n\n" in chunk:
+            header, content = chunk.split(b"\n\n", 1)
+        else:
+            continue
+        content = content.rstrip(b"\r\n")
+        header_text = header.decode(errors="replace")
+        name_m = re.search(r'name="([^"]+)"', header_text)
+        if not name_m:
+            continue
+        name = name_m.group(1)
+        fn_m = re.search(r'filename="([^"]*)"', header_text)
+        filename = fn_m.group(1) if fn_m else ""
+        parts[name] = (filename, content)
+    return parts
 
 
 def make_handler():
@@ -157,10 +195,53 @@ def make_handler():
             self.send_response(204)
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type, Accept")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Accept, X-Filename")
             self.end_headers()
 
+        def _handle_upload(self):
+            """POST /api/audio/upload — multipart/form-data 或 raw bytes 上传 wav 文件。"""
+            ctype = self.headers.get("Content-Type", "")
+            length = int(self.headers.get("Content-Length", 0))
+            filename = None
+            data = None
+
+            if "multipart/form-data" in ctype:
+                m = re.search(r'boundary=(?:"([^"]+)"|([^;]+))', ctype)
+                boundary = (m.group(1) or m.group(2)).strip() if m else None
+                if boundary:
+                    body = self.rfile.read(length)
+                    parts = _parse_multipart(body, boundary)
+                    for _fname, (_orig, content) in parts.items():
+                        if _orig or content:
+                            filename = _orig or _fname
+                            data = content
+                            break
+
+            if data is None:
+                # raw body，文件名从 X-Filename header 或 query 取
+                body = self.rfile.read(length)
+                data = body
+                filename = self.headers.get("X-Filename")
+                if not filename:
+                    from urllib.parse import urlparse, parse_qs
+                    q = parse_qs(urlparse(self.path).query)
+                    filename = (q.get("filename") or ["audio.wav"])[0]
+
+            filename = filename or "audio.wav"
+
+            result = _bundle.upload_audio(filename, data) if _bundle else None
+            if result is None:
+                self._send(400, json.dumps({"error": "audio_file_player plugin not available"}))
+                return
+            if "error" in result:
+                self._send(400, json.dumps(result))
+            else:
+                self._send(200, json.dumps(result))
+
         def do_POST(self):
+            if self.path.startswith("/api/audio/upload"):
+                self._handle_upload()
+                return
             length = int(self.headers.get("Content-Length", 0))
             raw = self.rfile.read(length)
             try:
