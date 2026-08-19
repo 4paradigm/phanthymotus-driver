@@ -46,6 +46,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /work
 COPY --from=interface-builder /q5_ws/install /q5_ws/install
+COPY common/ /work/common/
 COPY main.py /work/main.py
 COPY q5_bus_bridge.py /work/q5_bus_bridge.py
 COPY q5_bundle_entrypoint.sh /work/q5_bundle_entrypoint.sh
