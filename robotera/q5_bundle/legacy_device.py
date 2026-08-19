@@ -623,11 +623,15 @@ class SpeakerPlugin:
     def _play_startup_sound(self) -> None:
         """Play a short PCM self-check before subscribing to the live stream."""
         path = Path(__file__).parent / "resource" / "startup_beep.pcm"
+        proc = None
         try:
             pcm = path.read_bytes()
             command = _q5_alsa_speaker_command(self._device, self._output_rate, self._output_channels)
-            proc = subprocess.Popen(_q5_ssh_args(command), stdin=subprocess.PIPE,
+            # Use the exact tagged shell used by the live speaker. The bare
+            # helper exited before SSH's stdin pipe was ready on Q5.
+            proc = subprocess.Popen(_q5_ssh_args(_q5_speaker_playback_shell(command)), stdin=subprocess.PIPE,
                                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, bufsize=0)
+            _raise_if_remote_process_exited(proc, "speaker self-check")
             # The remote ALSA helper accepts the public 16 kHz mono contract
             # and converts it at the hardware boundary.
             block_size = 8000  # 250 ms at 16 kHz mono PCM16
@@ -642,7 +646,13 @@ class SpeakerPlugin:
             proc.wait(timeout=3)
             print(f"[SpeakerPlugin] startup self-check OK ({len(pcm)} bytes)", flush=True)
         except Exception as exc:
-            print(f"[SpeakerPlugin] startup self-check failed: {exc}", flush=True)
+            detail = ""
+            if proc is not None and proc.stderr:
+                try:
+                    detail = proc.stderr.read().decode(errors="replace").strip()
+                except Exception:
+                    pass
+            print(f"[SpeakerPlugin] startup self-check failed: {exc}{': ' + detail if detail else ''}", flush=True)
 
     def _prepare_xos_route(self):
         """Release XOS chat's route before taking ownership with live ALSA."""
@@ -916,7 +926,13 @@ class CameraRgbPlugin(_Q5MediaPlugin):
         from PIL import Image as PilImage
         from sensor_msgs.msg import Image
 
-        self._start_remote_realsense_if_configured()
+        try:
+            self._start_remote_realsense_if_configured()
+        except Exception as exc:
+            # The D455 may already be owned by XOS or take longer than the
+            # remote readiness probe.  Do not turn that into a permanently
+            # stopped RGB card: subscribe locally and let DDS discovery win.
+            print(f"[CameraRgbPlugin] remote D455 verification warning: {exc}", flush=True)
         self._pil_image, self._np = PilImage, np
         self._running = True
         if self._subscription is None:

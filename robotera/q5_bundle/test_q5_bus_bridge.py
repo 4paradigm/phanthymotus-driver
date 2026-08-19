@@ -43,6 +43,11 @@ class Q5BusBridgeTests(unittest.TestCase):
     def test_skeleton_polling_defaults_to_driver_publish_rate(self):
         self.assertEqual(q5_bus_bridge.DEFAULT_POLL_HZ, 10.0)
 
+    def test_media_bridge_keeps_a_bounded_latest_frame_queue(self):
+        source = Path(q5_bus_bridge.__file__.replace("q5_bus_bridge.py", "q5_media_bridge.py")).read_text()
+        self.assertIn("self._media_q = self._ctx.Queue(maxsize=4)", source)
+        self.assertIn("newest_media = None", source)
+
     def test_sensor_topic_contract_does_not_depend_on_vendor_side_publisher(self):
         declared = topic_out("/nvidia_desktop/q5/battery", "data/json")
         self.assertEqual(declared, [{
