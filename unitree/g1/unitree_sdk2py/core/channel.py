@@ -1,3 +1,4 @@
+import logging
 import time
 from typing import Any, Callable
 import threading
@@ -28,6 +29,9 @@ from ..utils.bqueue import BQueue
 """
 " class Channel
 """
+
+_log = logging.getLogger(__name__)
+
 class Channel:
     
     """
@@ -63,11 +67,11 @@ class Channel:
                 else:
                     sample = self.__reader.take_one(timeout=duration(seconds=timeout))
             except DDSException as e:
-                print("[Reader] catch DDSException msg:", e.msg)
+                _log.warning("[Reader] DDSException: %s", e.msg)
             except TimeoutError as e:
-                print("[Reader] take sample timeout")
+                _log.debug("[Reader] take sample timeout")
             except:
-                print("[Reader] take sample error")
+                _log.warning("[Reader] take sample error", exc_info=True)
 
             return sample
 
@@ -86,13 +90,13 @@ class Channel:
             try:
                 samples = reader.take(1)
             except DDSException as e:
-                print("[Reader] catch DDSException error. msg:", e.msg)
+                _log.warning("[Reader] DDSException: %s", e.msg)
                 return
             except TimeoutError as e:
-                print("[Reader] take sample timeout")
+                _log.debug("[Reader] take sample timeout")
                 return
             except:
-                print("[Reader] take sample error")
+                _log.warning("[Reader] take sample error", exc_info=True)
                 return
 
             if samples is None:
@@ -143,10 +147,10 @@ class Channel:
             try:
                 self.__writer.write(sample)
             except DDSException as e:
-                print("[Writer] catch DDSException error. msg:", e.msg)
+                _log.warning("[Writer] DDSException: %s", e.msg)
                 return False
             except Exception as e:
-                print("[Writer] write sample error. msg:", e.args())
+                _log.warning("[Writer] write sample error: %r", e)
                 return False
 
             return True
@@ -217,19 +221,19 @@ class ChannelFactory(Singleton):
             try:
                 self.__class__.__domain = Domain(id, config)
             except DDSException as e:
-                print("[ChannelFactory] create domain error. msg:", e.msg)
+                _log.error("[ChannelFactory] create domain error: %s", e.msg)
                 return False
             except:
-                print("[ChannelFactory] create domain error.")
+                _log.error("[ChannelFactory] create domain error")
                 return False
 
             try:
                 self.__class__.__participant = DomainParticipant(id)
             except DDSException as e:
-                print("[ChannelFactory] create domain participant error. msg:", e.msg)
+                _log.error("[ChannelFactory] create domain participant error: %s", e.msg)
                 return False
             except:
-                print("[ChannelFactory] create domain participant error")
+                _log.error("[ChannelFactory] create domain participant error")
                 return False
 
             self.__class__.__qos = qos

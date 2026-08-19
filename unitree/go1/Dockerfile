@@ -56,6 +56,11 @@ ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ENV FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
 ENV PYTHONPATH=/work
 ENV PYTHONUNBUFFERED=1
+# ANSI colour codes are control bytes; in a non-tty container log they are
+# exactly the "garbage characters" that make `docker logs` unreadable.
+ENV RCUTILS_COLORIZED_OUTPUT=0
+# Keep CycloneDDS tracing out of stdout (oversized log messages).
+ENV CYCLONEDDS_URI='<CycloneDDS><Domain><Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>'
 ENV PCL_ENABLE=1
 ENV DEPTH_ENABLE=1
 
