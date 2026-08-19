@@ -30,14 +30,16 @@ Dockerfile 会在解压和编译前再次校验 SHA256。归档内保留上游 `
 - 选配自主充电：开始、退出和异常强制复位。
 - 设备与状态：前后灯、常规/导航/辅助模式、休眠与自动休眠、16 关节反馈、双电池、温度和错误列表。
 - 双路相机：返回官方 H.265 RTSP 地址 `video1`/`video2`；文档明确相机不发布 ROS 2/DDS 话题。
-- M20 Pro：将 `model_variant` 改为 `pro` 后，额外开放里程计、定位初始化、单点导航、取消和状态查询。
+- M20 Pro：默认开放里程计、定位初始化、单点导航、取消、状态查询，以及 `mapping_view` 建图视图。建图期间将 `/grid_map_3d` 的 `base_link` 点云通过 `/SLAM_ODOM` 转换并累积到 `map` 坐标，停止后切换到最终 `/GRID_MAP`。
 
 ## 型号边界
 
-默认 `model_variant: standard`。供应商文档明确建图、定位和内置导航仅 M20 Pro 支持，因此标准版不会注册导航工具。建图由 Pro 机载 `drmap` 命令管理，不通过本 Driver 远程执行高权限 shell。
+默认 `model_variant: pro`，用于当前 M20 Pro 的 Web Console 无外部配置部署。供应商文档明确建图、定位和内置导航仅 M20 Pro 支持；部署到标准版时必须将该值改为 `standard`，标准版不会注册这些工具。
+
+`mapping_view` 是不依赖 SSH 的只读 Sensor，仅在 M20 Pro 上注册。启动卡片后，它将 `/grid_map_3d` 的 `base_link` 点云通过 `/SLAM_ODOM` 转换并累积到 `map` 坐标；停止卡片后，如果收到过 `/GRID_MAP`，则切换到最终占据栅格视图。实时点云按 `voxel_size` 去重、受 `max_buffer_points` 约束，并按 `publish_hz` 和 `max_points` 限制 Canvas 负载。数据包元数据和 `mapping_view.info` 会公布状态、数据源、坐标系、更新时间、更新次数及点数。最终二维地图只发布占据值大于等于 `occupied_threshold` 的栅格中心点。本 Driver 不负责启动、停止或保存 NOS 建图任务。
 
 供应商文档未提供舞蹈、自定义特技或关节位置控制接口，本 Driver 不虚构这些能力。
 
 ## 验证状态
 
-机器人目前还没到位。协议编解码、能力契约、配置和 Python 语法已在开发机验证；Fast DDS 发现、真实状态机、速度方向、选配件存在性、充电及 Pro 导航仍需真机验真。首次联调前请确认系统版本为 V1.1.8、外接主机接入 `10.21.31.x` 或 `10.21.33.x` 网段，并确保没有与 `planner` 或 `charge_manager` 并发发布 `/NAV_CMD`。
+已在 M20 Pro 真机确认 `/grid_map_3d` 与 `/SLAM_ODOM` 均约 10 Hz，并确认 `/grid_map_3d` 为 `base_link` 坐标、XYZ float32、16 字节点步长，`/SLAM_ODOM` 为 `map` 坐标。实时坐标转换、点云累积、最终栅格编码和 Canvas 生命周期契约已通过开发机测试；仍需用本分支镜像在 Agent Core/Canvas 上复测独立启停和最终地图切换。速度方向、选配件存在性、充电及 Pro 导航仍未完成真机验证。首次联调前请确认系统版本为 V1.1.8、外接主机接入 `10.21.31.x` 或 `10.21.33.x` 网段，并确保没有与 `planner` 或 `charge_manager` 并发发布 `/NAV_CMD`。
