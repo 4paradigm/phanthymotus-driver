@@ -151,8 +151,11 @@ is exposed. The monitor also has no-motion and maximum-runtime safeguards
 because the SDK does not expose a dedicated physical playback-completion event.
 
 `finish_and_save_recording` maps to the supported `SAVETEACH` command. The
-driver waits for the documented save sequence to reach workmode 29
-(`save_teach_2`) before atomically adding the ID and name to
+firmware reports a short sequence through workmodes 12, 14 and 29, but clients
+are not guaranteed to sample every transient state. After any documented save
+workmode confirms that `SAVETEACH` started, the driver follows the vendor
+example's two-second save interval while continuously checking for protection,
+then atomically adds the ID and name to
 `/opt/phanthy-motus/data/noetix/bumi/action_recordings.json`. The deployment
 bind-mounts `/opt/phanthy-motus/data`, so this directory survives container and
 robot restarts while the corresponding trajectory remains in the Bumi firmware

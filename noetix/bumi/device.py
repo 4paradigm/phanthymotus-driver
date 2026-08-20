@@ -1160,6 +1160,10 @@ class LocoPlugin:
                     return registry_error
                 args["recording_name"] = recording_name
             else:
+                # The canvas may retain hidden values from a previous
+                # finish-and-save selection. Playback accepts only the ID;
+                # never present a stale client-supplied name as registry data.
+                args.pop("recording_name", None)
                 recording_entry, registry_error = (
                     self._check_recording_for_playback(recording_id))
                 if registry_error is not None:
@@ -1246,7 +1250,7 @@ class LocoPlugin:
                 "recording_name": entry["recording_name"],
                 "persisted": True,
                 "registry_path": str(self._recording_registry_path),
-                "completion_detection": "final_save_workmode_and_registry_write",
+                "completion_detection": "save_settle_period_and_registry_write",
             })
             self._finish_acp(action_id, "completed", result)
         except Exception as exc:
@@ -1258,30 +1262,30 @@ class LocoPlugin:
     def _wait_recording_save_completion(
             self, cancel_event: threading.Event,
             initially_observed_mode: int | None) -> dict:
-        # The Bumi document defines SAVETEACH as a sequence through
-        # end_teach(12), save_teach_1(14), then save_teach_2(29). Register the
-        # metadata only after the final save mode is observed.
-        if initially_observed_mode == 29:
+        # SAVETEACH passes through end_teach(12), save_teach_1(14), and
+        # save_teach_2(29), but those states can be shorter than this SDK
+        # client's polling window. The vendor example therefore waits two
+        # seconds after SAVETEACH instead of requiring the client to observe
+        # every transient state. Once _trigger_user_action has confirmed one
+        # save state, preserve that documented settle period and fail only on
+        # protection/cancellation. The SDK exposes no file-exists query.
+        save_modes = {12, 14, 29}
+        if initially_observed_mode not in save_modes:
             return {
-                "confirmed": True,
-                "final_workmode": 29,
-                "final_workmode_name": "save_teach_2",
-                "detection": "final_save_workmode_observed",
+                "confirmed": False,
+                "final_workmode": initially_observed_mode,
+                "final_workmode_name": _WORKMODE_NAMES.get(
+                    initially_observed_mode, "unknown"),
+                "error": "SAVETEACH did not enter a documented save workmode.",
             }
-        deadline = time.monotonic() + 12.0
-        observed_modes = []
+        settle_s = 2.0
+        deadline = time.monotonic() + settle_s
+        observed_modes = [initially_observed_mode]
+        mode = initially_observed_mode
         while not cancel_event.wait(0.05):
             mode = int(self._high_ctrl.get_mode())
             if not observed_modes or observed_modes[-1] != mode:
                 observed_modes.append(mode)
-            if mode == 29:
-                return {
-                    "confirmed": True,
-                    "final_workmode": 29,
-                    "final_workmode_name": "save_teach_2",
-                    "observed_workmodes": observed_modes,
-                    "detection": "final_save_workmode_observed",
-                }
             if mode == 26:
                 return {
                     "confirmed": False,
@@ -1292,13 +1296,16 @@ class LocoPlugin:
                 }
             if time.monotonic() >= deadline:
                 return {
-                    "confirmed": False,
+                    "confirmed": True,
                     "final_workmode": mode,
                     "final_workmode_name": _WORKMODE_NAMES.get(mode, "unknown"),
                     "observed_workmodes": observed_modes,
-                    "error": (
-                        "The final save_teach_2 workmode (29) was not observed within "
-                        "12 seconds, so persistence was not confirmed."
+                    "settle_time_s": settle_s,
+                    "detection": "save_workmode_confirmed_and_settle_period_elapsed",
+                    "meaning": (
+                        "A documented SAVETEACH workmode was observed and the vendor's "
+                        "two-second save interval elapsed without protection. The SDK "
+                        "does not expose a query to verify the firmware file directly."
                     ),
                 }
         return {
