@@ -315,6 +315,22 @@ class DevicePluginContractTests(unittest.TestCase):
                 info = plugin.dispatch("info", {"_tool_name": tool["name"]})
                 self.assertTrue(info.get("topic_out"), tool["name"])
 
+    def test_driver_health_is_one_shot_actuator_without_topic_stream(self):
+        tool = {item["name"]: item for item in self.state.get_tools()}["driver_health"]
+        self.assertEqual("actuator", tool["type"])
+        self.assertNotIn("topic_out", tool)
+        self.assertEqual(
+            ["status"], tool["inputSchema"]["properties"]["action"]["enum"]
+        )
+        self.assertEqual(["action"], tool["inputSchema"]["required"])
+        self.assertNotIn("driver_health", self.state._publishers)
+
+        direct = self.state.dispatch("driver_health", {})
+        queried = self.state.dispatch("status", {"_tool_name": "driver_health"})
+        self.assertEqual("waiting", direct["state"])
+        self.assertEqual("0/9 路数据流正常", direct["health_summary"])
+        self.assertEqual(direct["total_sources"], queried["total_sources"])
+
     def test_new_status_plugins_can_start_with_declared_ros_dependencies(self):
         plugins = [
             self.device.HeartbeatStatusPlugin(CONFIG, "robot", self.ros),

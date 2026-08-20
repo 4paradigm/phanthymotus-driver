@@ -208,7 +208,6 @@ class StatePlugin:
         "joint_command_feedback": ("state/joint_command_feedback", "data/json", "T800 Native SDK 最近关节控制命令反馈"),
         "gamepad": ("state/gamepad", "data/json", "T800 遥控器连接、按键和摇杆状态"),
         "motion_state": ("state/motion", "data/json", "T800 当前运动状态和允许转换状态"),
-        "driver_health": ("state/driver_health", "data/json", "T800 driver 各数据源连接与新鲜度"),
     }
     _DERIVED_STREAMS = {
         "robot_snapshot": ("state/robot_snapshot", "T800 运动、关节、IMU、电源和电机状态聚合快照"),
@@ -270,6 +269,19 @@ class StatePlugin:
             sensor_tool(name, description, f"/{self._ns}/{relative}", fmt)
             for name, (relative, fmt, description) in self._STREAMS.items()
         ]
+        tools.append(
+            {
+                "name": "driver_health",
+                "type": "actuator",
+                "multiInstance": False,
+                "description": "执行一次并返回 T800 机器人、麦克风与 Odin2 数据流的最新健康 JSON",
+                "inputSchema": action_schema(
+                    {"status": ([], "获取一次最新 Driver Health JSON")},
+                    {},
+                    "一次性健康检查动作",
+                ),
+            }
+        )
         tools.append(
             {
                 "name": "model",
@@ -351,10 +363,14 @@ class StatePlugin:
                 return {"error": "T800 URDF not found"}
         if action_or_tool in self._DERIVED_STREAMS:
             return self._derived_snapshot(action_or_tool)
+        if action_or_tool == "driver_health":
+            return self._health()
         if action_or_tool in self._STREAMS:
             return self._snapshot(action_or_tool)
         if action_or_tool == "status":
             name = args.get("_tool_name", "driver_health")
+            if name == "driver_health":
+                return self._health()
             if name in self._DERIVED_STREAMS:
                 return self._derived_snapshot(name)
             if name in self._STREAMS:
@@ -645,8 +661,6 @@ class StatePlugin:
             self._updated[name] = time.monotonic()
 
     def _snapshot(self, name: str) -> dict:
-        if name == "driver_health":
-            return self._health()
         with self._lock:
             payload = dict(self._cache.get(name, {"state": "no_data"}))
             updated = self._updated.get(name)
@@ -665,7 +679,6 @@ class StatePlugin:
                     "label": self._SOURCE_LABELS.get(name, name),
                 }
                 for name in self._STREAMS
-                if name != "driver_health"
             }
             providers = dict(self._health_providers)
         for value in sources.values():
@@ -881,12 +894,11 @@ class StatePlugin:
             "motor_command": 4,
             "joint_command_feedback": 4,
             "battery": 20,
-            "driver_health": 20,
         }
         for name, divisor in schedules.items():
             if tick % divisor:
                 continue
-            if name != "driver_health" and name not in self._cache:
+            if name not in self._cache:
                 continue
             self._publishers[name].publish(_json_message(self._snapshot(name)))
         if tick % 20 == 0:
