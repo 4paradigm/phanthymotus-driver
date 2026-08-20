@@ -287,6 +287,8 @@ class LynxM20ContractTests(unittest.TestCase):
         nodes._pointcloud_lock = threading.Lock()
         nodes._pointcloud_frames = {}
         nodes._pointcloud_last_publish = {}
+        nodes._lidar_pose = None
+        nodes._lidar_voxels = {}
         publisher = FakePublisher()
         callback = nodes._callback(
             "lidar", publisher, as_pointcloud=True,
@@ -309,6 +311,29 @@ class LynxM20ContractTests(unittest.TestCase):
             (-1.0, 2.0, -3.0, -4.0, 5.0, -6.0),
             struct.unpack_from("<ffffff", payload, 8),
         )
+
+        nodes._lidar_pose = {
+            "x": 10.0, "y": 20.0, "z": 0.0,
+            "qx": 0.0, "qy": 0.0, "qz": 0.0, "qw": 1.0,
+        }
+        nodes._pointcloud_last_publish["lidar"] = float("-inf")
+        msg.data = struct.pack("<fffI", 1.0, 2.0, 3.0, 0)
+        callback(msg)
+        payload = bytes(publisher.messages[-1].data)
+        self.assertEqual((12, 1), struct.unpack_from("<II", payload))
+        self.assertEqual((-11.0, 22.0, -3.0), struct.unpack_from("<fff", payload, 8))
+        self.assertEqual("map", nodes.values["lidar"]["frame_id"])
+
+    def test_lidar_slam_transform_rotates_points_into_map(self):
+        half = 2 ** -0.5
+        pose = {
+            "x": 10.0, "y": 20.0, "z": 0.0,
+            "qx": 0.0, "qy": 0.0, "qz": half, "qw": half,
+        }
+        transformed = m20.transform_point((1.0, 0.0, 0.0), pose)
+        self.assertAlmostEqual(10.0, transformed[0], places=6)
+        self.assertAlmostEqual(21.0, transformed[1], places=6)
+        self.assertAlmostEqual(0.0, transformed[2], places=6)
 
     def test_lidar_pointcloud_rejects_frames_without_valid_points(self):
         field = lambda name, offset: SimpleNamespace(name=name, offset=offset, datatype=7)

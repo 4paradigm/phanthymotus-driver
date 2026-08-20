@@ -16,8 +16,9 @@ basic_server:
 lidar_visualization:
   accumulate_frames: 5
   min_points: 32
-  max_points: 10000
-  publish_hz: 5.0
+  max_points: 50000
+  publish_hz: 3.0
+  voxel_size: 0.05
 topics:
   motion_info: "/MOTION_INFO"
   motion_state: "/MOTION_STATE"
@@ -31,3 +32,4 @@ topics:
   gps: "/GPS"
   joints: "/JOINTS_DATA"
   odometry: "/ODOM"
+  slam_odometry: "/SLAM_ODOM"
