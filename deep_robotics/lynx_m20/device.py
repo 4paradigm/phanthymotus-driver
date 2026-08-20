@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 import struct
 import threading
 import time
@@ -18,7 +19,7 @@ MOTION_STATES = {"idle": 0, "stand": 1, "soft_estop": 2, "damping": 3, "lie": 4,
 
 
 def encode_pointcloud(msg):
-    """Encode ROS PointCloud2 for the Canvas sensor/pointcloud renderer."""
+    """Filter and encode ROS PointCloud2 in the Canvas XYZ coordinate frame."""
     if bool(getattr(msg, "is_bigendian", False)):
         raise ValueError("sensor/pointcloud requires little-endian PointCloud2 data")
     point_step = int(getattr(msg, "point_step", 0))
@@ -42,15 +43,23 @@ def encode_pointcloud(msg):
     if len(data) < required:
         raise ValueError("PointCloud2 data is shorter than its declared layout")
 
-    if row_step == row_size:
-        points = data[:required]
-    else:
-        points = b"".join(
-            data[row * row_step:row * row_step + row_size]
-            for row in range(height)
-        )
-    point_count = width * height
-    return struct.pack("<II", point_step, point_count) + points, point_count
+    points = bytearray()
+    for row in range(height):
+        row_base = row * row_step
+        for column in range(width):
+            base = row_base + column * point_step
+            x, y, z = struct.unpack_from("<fff", data, base)
+            if not all(math.isfinite(value) for value in (x, y, z)):
+                continue
+            if abs(x) + abs(y) + abs(z) < 1e-6:
+                continue
+            # ROS base_link is X-forward/Y-left/Z-up. Canvas uses the same
+            # display convention as the existing G1/Go2 cards: X-back/Z-down.
+            points.extend(struct.pack("<fff", -x, y, -z))
+    point_count = len(points) // 12
+    if point_count == 0:
+        raise ValueError("PointCloud2 contains no finite non-zero XYZ points")
+    return struct.pack("<II", 12, point_count) + points, point_count
 
 
 class M20Nodes:
@@ -79,6 +88,9 @@ class M20Nodes:
         self._header_lock = threading.Lock()
         self.values = {}
         self.streams = {}
+        self._pointcloud_lock = threading.Lock()
+        self._pointcloud_frames = {}
+        self._pointcloud_last_publish = {}
         self.frame_id = 0
         self.native_velocity_command = 25
         self._motion_condition = threading.Condition(threading.Lock())
@@ -157,6 +169,33 @@ class M20Nodes:
                     with self.lock:
                         self.values[key] = {"received": False, "error": str(exc), "timestamp": time.time()}
                     return
+                visualization = self.config.get("lidar_visualization", {})
+                min_points = max(1, int(visualization.get("min_points", 32)))
+                if point_count < min_points:
+                    with self.lock:
+                        self.values[key] = {
+                            "received": False,
+                            "error": f"only {point_count} valid points",
+                            "timestamp": time.time(),
+                        }
+                    return
+                frame_count = max(1, int(visualization.get("accumulate_frames", 5)))
+                max_points = max(min_points, int(visualization.get("max_points", 10000)))
+                publish_hz = max(0.1, float(visualization.get("publish_hz", 5.0)))
+                now = time.monotonic()
+                with self._pointcloud_lock:
+                    frames = self._pointcloud_frames.setdefault(key, [])
+                    frames.append(payload[8:])
+                    del frames[:-frame_count]
+                    if now - self._pointcloud_last_publish.get(key, float("-inf")) < 1.0 / publish_hz:
+                        return
+                    merged = b"".join(frames)
+                    accumulated_count = len(merged) // 12
+                    if accumulated_count > max_points:
+                        merged = merged[-max_points * 12:]
+                        accumulated_count = max_points
+                    self._pointcloud_last_publish[key] = now
+                payload = struct.pack("<II", 12, accumulated_count) + merged
                 output = pointcloud_type()
                 output.data = array("B", payload)
                 publisher.publish(output)
@@ -164,8 +203,9 @@ class M20Nodes:
                 value = {
                     "received": True,
                     "frame_id": getattr(header, "frame_id", ""),
-                    "point_count": point_count,
-                    "point_step": int(msg.point_step),
+                    "point_count": accumulated_count,
+                    "source_point_count": point_count,
+                    "point_step": 12,
                     "timestamp": time.time(),
                 }
             else:

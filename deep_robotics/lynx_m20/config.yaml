@@ -13,6 +13,11 @@ basic_server:
   udp_port: 30000
   tcp_port: 30001
   timeout: 1.5
+lidar_visualization:
+  accumulate_frames: 5
+  min_points: 32
+  max_points: 10000
+  publish_hz: 5.0
 topics:
   motion_info: "/MOTION_INFO"
   motion_state: "/MOTION_STATE"

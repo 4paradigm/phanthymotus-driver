@@ -235,9 +235,12 @@ class LynxM20ContractTests(unittest.TestCase):
             data=first + b"pad!" + second,
         )
         payload, point_count = m20.encode_pointcloud(msg)
-        self.assertEqual((16, 2), struct.unpack_from("<II", payload))
+        self.assertEqual((12, 2), struct.unpack_from("<II", payload))
         self.assertEqual(2, point_count)
-        self.assertEqual(first + second, payload[8:])
+        self.assertEqual(
+            (-1.0, 2.0, -3.0, -4.0, 5.0, -6.0),
+            struct.unpack_from("<ffffff", payload, 8),
+        )
 
     def test_lidar_pointcloud_rejects_unsupported_xyz_layout(self):
         field = lambda name, offset: SimpleNamespace(name=name, offset=offset, datatype=7)
@@ -275,8 +278,15 @@ class LynxM20ContractTests(unittest.TestCase):
             data=struct.pack("<fffI", 1.0, 2.0, 3.0, 0),
         )
         nodes = object.__new__(m20.M20Nodes)
+        nodes.config = {"lidar_visualization": {
+            "accumulate_frames": 5, "min_points": 1,
+            "max_points": 100, "publish_hz": 5.0,
+        }}
         nodes.lock = threading.Lock()
         nodes.values = {}
+        nodes._pointcloud_lock = threading.Lock()
+        nodes._pointcloud_frames = {}
+        nodes._pointcloud_last_publish = {}
         publisher = FakePublisher()
         callback = nodes._callback(
             "lidar", publisher, as_pointcloud=True,
@@ -286,9 +296,29 @@ class LynxM20ContractTests(unittest.TestCase):
 
         self.assertEqual(1, len(publisher.messages))
         payload = bytes(publisher.messages[0].data)
-        self.assertEqual((16, 1), struct.unpack_from("<II", payload))
-        self.assertEqual((1.0, 2.0, 3.0), struct.unpack_from("<fff", payload, 8))
+        self.assertEqual((12, 1), struct.unpack_from("<II", payload))
+        self.assertEqual((-1.0, 2.0, -3.0), struct.unpack_from("<fff", payload, 8))
         self.assertEqual(1, nodes.values["lidar"]["point_count"])
+
+        nodes._pointcloud_last_publish["lidar"] = float("-inf")
+        msg.data = struct.pack("<fffI", 4.0, 5.0, 6.0, 0)
+        callback(msg)
+        payload = bytes(publisher.messages[-1].data)
+        self.assertEqual((12, 2), struct.unpack_from("<II", payload))
+        self.assertEqual(
+            (-1.0, 2.0, -3.0, -4.0, 5.0, -6.0),
+            struct.unpack_from("<ffffff", payload, 8),
+        )
+
+    def test_lidar_pointcloud_rejects_frames_without_valid_points(self):
+        field = lambda name, offset: SimpleNamespace(name=name, offset=offset, datatype=7)
+        msg = SimpleNamespace(
+            point_step=16, width=2, height=1, row_step=32, is_bigendian=False,
+            fields=[field("x", 0), field("y", 4), field("z", 8)],
+            data=struct.pack("<fffIfffI", 0.0, 0.0, 0.0, 0, float("nan"), 1.0, 2.0, 0),
+        )
+        with self.assertRaisesRegex(ValueError, "no finite non-zero"):
+            m20.encode_pointcloud(msg)
 
     def test_motion_events_separate_request_acceptance_from_feedback(self):
         nodes = FakeNodes()
