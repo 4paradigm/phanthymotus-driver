@@ -350,10 +350,10 @@ class LynxM20ContractTests(unittest.TestCase):
         nodes._lidar_odometry_callback(msg)
         self.assertEqual("odom", nodes._lidar_pose["frame_id"])
 
-    def test_default_lidar_odometry_source_is_continuous_lio_odom(self):
+    def test_default_lidar_odometry_source_is_continuous_odom(self):
         config_path = Path(m20.__file__).with_name("config.yaml")
         self.assertIn(
-            'slam_odometry: "/LIO_ODOM"',
+            'slam_odometry: "/ODOM"',
             config_path.read_text(encoding="utf-8"),
         )
 
