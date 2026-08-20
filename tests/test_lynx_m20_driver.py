@@ -371,6 +371,13 @@ class LynxM20ContractTests(unittest.TestCase):
             config_text,
         )
         self.assertIn("max_points: 500000", config_text)
+        self.assertIn("publish_max_points: 80000", config_text)
+
+    def test_lidar_canvas_sampling_covers_complete_accumulation(self):
+        points = list(range(20))
+        self.assertEqual(points, m20.evenly_sample_points(iter(points), 20, 20))
+        sampled = m20.evenly_sample_points(iter(points), 20, 5)
+        self.assertEqual([0, 4, 8, 12, 16], sampled)
 
     def test_lidar_pointcloud_rejects_frames_without_valid_points(self):
         field = lambda name, offset: SimpleNamespace(name=name, offset=offset, datatype=7)

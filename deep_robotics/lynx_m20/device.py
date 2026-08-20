@@ -74,6 +74,20 @@ def encode_pointcloud(msg):
     return encode_xyz_points(pointcloud_xyz(msg))
 
 
+def evenly_sample_points(points, total, limit):
+    """Select at most limit points across the complete insertion-ordered map."""
+    if total <= limit:
+        return list(points)
+    selected = []
+    for index, point in enumerate(points):
+        target = len(selected) * total // limit
+        if index == target:
+            selected.append(point)
+            if len(selected) == limit:
+                break
+    return selected
+
+
 def transform_point(point, pose):
     """Transform a base_link point into the fixed map frame."""
     x, y, z = point
@@ -242,6 +256,10 @@ class M20Nodes:
                     return
                 frame_count = max(1, int(visualization.get("accumulate_frames", 5)))
                 max_points = max(min_points, int(visualization.get("max_points", 500000)))
+                publish_max_points = max(
+                    min_points,
+                    min(max_points, int(visualization.get("publish_max_points", 80000))),
+                )
                 publish_hz = max(0.1, float(visualization.get("publish_hz", 5.0)))
                 voxel_size = max(0.01, float(visualization.get("voxel_size", 0.08)))
                 now = time.monotonic()
@@ -256,7 +274,10 @@ class M20Nodes:
                             if len(self._lidar_voxels) >= max_points:
                                 break
                             self._lidar_voxels[voxel] = mapped
-                        output_points = list(self._lidar_voxels.values())
+                        accumulated_count = len(self._lidar_voxels)
+                        output_points = evenly_sample_points(
+                            self._lidar_voxels.values(), accumulated_count, publish_max_points,
+                        )
                         output_frame = str(pose.get("frame_id", "map"))
                     else:
                         payload, _ = encode_xyz_points(points)
@@ -270,11 +291,12 @@ class M20Nodes:
                             (-x, y, -z)
                             for x, y, z in struct.iter_unpack("<fff", merged)
                         ]
+                        accumulated_count = len(output_points)
                         output_frame = str(getattr(getattr(msg, "header", None), "frame_id", ""))
                     if now - self._pointcloud_last_publish.get(key, float("-inf")) < 1.0 / publish_hz:
                         return
                     self._pointcloud_last_publish[key] = now
-                payload, accumulated_count = encode_xyz_points(output_points)
+                payload, published_count = encode_xyz_points(output_points)
                 output = pointcloud_type()
                 output.data = array("B", payload)
                 publisher.publish(output)
@@ -283,6 +305,7 @@ class M20Nodes:
                     "received": True,
                     "frame_id": output_frame,
                     "point_count": accumulated_count,
+                    "published_point_count": published_count,
                     "source_point_count": point_count,
                     "point_step": 12,
                     "timestamp": time.time(),
