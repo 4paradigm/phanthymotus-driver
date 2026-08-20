@@ -3616,7 +3616,10 @@ class SpeakerPlugin:
             self._check_pulse()
             self._run_command(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "0"])
             self._process = self._spawn_player()
-            self._play_startup_sound()
+            # 开机音在同一 aplay 播放进程上写入，播完后再启动播放线程。
+            # 不分出独立 aplay 进程避免 PulseAudio sink 独占/竞争导致
+            # 正式流式播放的 aplay 连接失败。
+            self._play_startup_sound(self._process)
             self._input_topic = topic
             self._subscription = self._node.create_subscription(
                 AudioChunk, topic, lambda msg: self._on_chunk(msg, session), _AUDIO_QOS
@@ -3639,38 +3642,27 @@ class SpeakerPlugin:
         self._thread.start()
         return {"state": "ready", "topic_in": [{"topic": topic, "format": "audio/pcm-16k"}]}
 
-    def _play_startup_sound(self) -> None:
-        """播放开机音效，经 aplay stdin 写入，不在回放期间跑以免竞态。
+    def _play_startup_sound(self, player) -> None:
+        """播放开机音效到指定 aplay 进程，不在回放期间跑以免与播放线程竞态。
 
-        开机音复用 G1 的 startup_beep.pcm（PCM-16 16kHz 单声道），通过
-        _spawn_player 启动临时 aplay 进程播放，播完后进程自动退出。
+        开机音复用 G1 的 startup_beep.pcm（PCM-16 16kHz 单声道），
+        写入调用方准备好的 aplay stdin，播完后不关闭程序（调用方
+        负责继续用同一进程流式播放）。
         """
         import pathlib
 
         pcm_path = pathlib.Path(__file__).parent / "resource" / "startup_beep.pcm"
         try:
             pcm = pcm_path.read_bytes()
-        except (OSError, IOError) as exc:
-            # 开机音缺文件不影响音频播放能力，静默降级
+        except (OSError, IOError):
             return
-        if not pcm:
+        if not pcm or player is None or player.poll() is not None or player.stdin is None:
             return
-        player = self._spawn_player()
         try:
             player.stdin.write(pcm)
             player.stdin.flush()
         except (BrokenPipeError, OSError):
             pass
-        finally:
-            try:
-                player.stdin.close()
-            except OSError:
-                pass
-            try:
-                player.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                player.kill()
-                player.wait(timeout=1)
 
     def _on_chunk(self, msg, session: int | None = None) -> None:
         # 丢弃不属于当前会话的回调:stop() 后残留的 ROS 回调若在新会话
