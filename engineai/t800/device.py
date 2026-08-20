@@ -3486,6 +3486,7 @@ class SpeakerPlugin:
     播放。
     """
 
+    _PREFIX = "speaker"
     _EOF_MAGIC = b"\x01\x00\xff\xff\x01\x00\xff\xff"  # G1 契约：utterance 结束标记
 
     def __init__(self, config: dict, namespace: str, ros2):
@@ -3638,8 +3639,9 @@ class SpeakerPlugin:
         self._running = True
         self._state = "ready"
         session = self._session
+        process = self._process  # 捕获当前进程供播放线程独占持有
         self._thread = threading.Thread(
-            target=self._play_loop, args=(session,), daemon=True, name="t800-speaker"
+            target=self._play_loop, args=(session, process), daemon=True, name="t800-speaker"
         )
         self._thread.start()
         # 开机音在订阅和播放线程就绪后异步入队——不阻塞 dispatch(start)，
@@ -3652,8 +3654,9 @@ class SpeakerPlugin:
 
         不直接写 aplay stdin（会因管道/ALSA 缓冲回压阻塞调用线程），
         也不 spawn 独立 aplay 进程（会与主播放进程竞争 PulseAudio sink）。
-        分块入队后由 _play_loop 统一消费。首个 live chunk 到达时，
-        _on_chunk 会清空队列中剩余开机音块——beep 让位于实时音频。
+        分块在后台 daemon 线程中用阻塞式 put(timeout) 写入队列，
+        由 _play_loop 统一消费——不丢任何块，不阻塞 dispatch(start)。
+        首个 live chunk 到达或 stop() 时后台线程自行退出。
         """
         import pathlib
 
@@ -3665,20 +3668,32 @@ class SpeakerPlugin:
         if not pcm:
             return
         self._startup_beep_active = True
-        chunk_size = 1024  # PCM-16k 下每块 32ms
+        threading.Thread(
+            target=self._enqueue_beep_blocks,
+            args=(pcm,),
+            daemon=True,
+            name="t800-beep-enqueue",
+        ).start()
+
+    def _enqueue_beep_blocks(self, pcm: bytes) -> None:
+        """后台线程：分块阻塞入队开机音，不丢数据。
+
+        用阻塞式 put(timeout) 代替 put_nowait+drop-oldest，
+        队列满时等待播放线程消费，自然节流到实时播放速度。
+        当 stop() 或首个 live chunk 到达时，检查标志退出。
+        """
+        session = self._session
+        chunk_size = 1024
         for offset in range(0, len(pcm), chunk_size):
+            if self._session != session:
+                return  # 新会话已开始，旧开机音线程退出
+            if not self._startup_beep_active:
+                return  # live chunk 已到达，drain_beep 处理剩余队列块
             block = pcm[offset:offset + chunk_size]
             try:
-                self._queue.put_nowait(block)
+                self._queue.put(block, timeout=1.0)
             except queue.Full:
-                try:
-                    self._queue.get_nowait()
-                except queue.Empty:
-                    pass
-                try:
-                    self._queue.put_nowait(block)
-                except queue.Full:
-                    break
+                return  # 队列满超时——播放滞后，丢弃剩余开机音
 
     def _drain_beep(self) -> None:
         """清空队列中剩余的开机音块——首个 live chunk 到达时调用。"""
@@ -3727,9 +3742,11 @@ class SpeakerPlugin:
             self._last_chunk_time = time.monotonic()
             self._dropped += 1
 
-    def _play_loop(self, session: int) -> None:
+    def _play_loop(self, session: int, process: subprocess.Popen | None) -> None:
         # 会话隔离：stop() 会递增 _session 并关闭 aplay stdin，旧线程随后
         # 在写失败/队列超时处退出，其状态更新不得覆盖新会话。
+        # 每个线程独占持有自己的 process 引用，防止旧线程在 stop/start
+        # 之后写入新会话的 aplay stdin。
         while self._running and self._session == session:
             try:
                 pcm = self._queue.get(timeout=0.1)
@@ -3744,7 +3761,6 @@ class SpeakerPlugin:
             # 若不重检 session，会把旧队列残留 PCM 写到新会话的 aplay stdin。
             if self._session != session:
                 return
-            process = self._process
             try:
                 if process is None or process.poll() is not None or process.stdin is None:
                     raise RuntimeError("aplay is not running")
