@@ -167,10 +167,11 @@ directory feature remain playable by ID but cannot be listed by name.
 The vendor SDK exposes no command for enumerating, exporting, or physically
 erasing a recorded firmware slot. Therefore `delete_recording` atomically
 removes the ID/name entry, stores a deletion marker, and blocks that ID from
-future card playback. Its result explicitly reports `firmware_slot_erased:
-false`; recording a new action under the same ID removes the marker and makes
-the ID available again. The vendor-deprecated `ENDTEACH` command and unavailable
-`RUN` command remain unexposed.
+future card playback. Recording a new action under the same ID removes the
+marker and makes the ID available again. Action-recording results omit the
+low-level `command_sent` flag because it is not meaningful for directory-only
+operations such as list and delete. The vendor-deprecated `ENDTEACH` command
+and unavailable `RUN` command remain unexposed.
 
 Useful observations while the driver is running:
 

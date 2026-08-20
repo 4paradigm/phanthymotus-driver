@@ -737,13 +737,28 @@ class LocoPlugin:
         if (tool_name == "action_recording"
                 and action in _ACTION_RECORDING_ACTIONS):
             if action == "start_recording":
-                return self._do_teaching_action(action, args)
-            if action == "list_recordings":
-                return self._list_recordings()
-            if action == "delete_recording":
-                return self._delete_recording(args)
-            return self._start_teaching_acp(action, args)
+                result = self._do_teaching_action(action, args)
+            elif action == "list_recordings":
+                result = self._list_recordings()
+            elif action == "delete_recording":
+                result = self._delete_recording(args)
+            else:
+                result = self._start_teaching_acp(action, args)
+            return self._without_command_sent(result)
         return None
+
+    @classmethod
+    def _without_command_sent(cls, value):
+        """Remove transport-level command flags from recording-card results."""
+        if isinstance(value, dict):
+            return {
+                key: cls._without_command_sent(item)
+                for key, item in value.items()
+                if key != "command_sent"
+            }
+        if isinstance(value, list):
+            return [cls._without_command_sent(item) for item in value]
+        return value
 
     def _register_acp(self, tool: str, action: str,
                       action_id: str | None = None) -> tuple[str, threading.Event]:
@@ -805,6 +820,8 @@ class LocoPlugin:
         if active is None:
             return False
         self._release_action_session(action_id)
+        if active["tool"] == "action_recording":
+            result = self._without_command_sent(result)
         terminal_result = self._format_acp_terminal(
             action_id, active["action"], status, result)
         threading.Thread(
@@ -1067,13 +1084,6 @@ class LocoPlugin:
             "recording_name": removed["recording_name"],
             "directory_entry_deleted": True,
             "playback_blocked": True,
-            "firmware_slot_erased": False,
-            "message": (
-                "The recording was removed from the persistent directory and this card "
-                "will reject playback of that ID. The vendor SDK has no command for "
-                "physically erasing the motion-controller slot. Saving a new action to "
-                "the same ID makes the ID available again."
-            ),
         }
 
     def _check_recording_for_save(self, recording_id: int) -> dict | None:
