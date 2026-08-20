@@ -221,6 +221,17 @@ class StatePlugin:
     }
     _MAINBOARD_KEYWORDS = ("mainboard", "main_board", "board", "thermal", "temperature", "fan", "diagnostic")
     _MAINBOARD_STRONG_KEYWORDS = ("mainboard", "main_board", "board")
+    _SOURCE_LABELS = {
+        "joints": "关节状态",
+        "imu": "机身 IMU",
+        "battery": "电池",
+        "motor_health": "电机健康",
+        "motor_state": "电机状态",
+        "motor_command": "电机命令",
+        "joint_command_feedback": "关节命令反馈",
+        "gamepad": "遥控器",
+        "motion_state": "运动状态",
+    }
 
     def __init__(self, config: dict, namespace: str, ros2, motion_events=None):
         self._config = config
@@ -236,6 +247,7 @@ class StatePlugin:
         self._last_joint_positions = [0.0] * len(T800_JOINT_NAMES)
         self._current_motion = ""
         self._available_motions: list[str] = []
+        self._health_providers: dict[str, object] = {}
 
         self._sub_node = Node("t800_state_sub", context=ros2.ctx_robot)
         self._pub_node = Node("t800_state_pub", context=ros2.ctx_core)
@@ -325,6 +337,11 @@ class StatePlugin:
     def joint_positions(self) -> list[float]:
         with self._lock:
             return list(self._last_joint_positions)
+
+    def register_health_provider(self, name: str, callback) -> None:
+        """Add non-StatePlugin streams to the driver_health aggregation."""
+        with self._lock:
+            self._health_providers[str(name)] = callback
 
     def dispatch(self, action_or_tool: str, args: dict) -> dict:
         if action_or_tool == "model":
@@ -644,24 +661,109 @@ class StatePlugin:
                 name: {
                     "connected": name in self._updated,
                     "age_sec": None if name not in self._updated else max(0.0, now - self._updated[name]),
+                    "category": "robot",
+                    "label": self._SOURCE_LABELS.get(name, name),
                 }
                 for name in self._STREAMS
                 if name != "driver_health"
             }
+            providers = dict(self._health_providers)
         for value in sources.values():
             value["stale"] = value["age_sec"] is None or value["age_sec"] > self._timeout
+            value["state"] = (
+                "running" if value["connected"] and not value["stale"]
+                else "stale" if value["connected"]
+                else "waiting"
+            )
+        for provider_name, callback in providers.items():
+            try:
+                provided = callback()
+                if not isinstance(provided, dict):
+                    raise TypeError("health provider must return an object")
+                for source_name, value in provided.items():
+                    if isinstance(value, dict):
+                        sources[str(source_name)] = dict(value)
+            except Exception as exc:
+                sources[provider_name] = {
+                    "connected": False,
+                    "age_sec": None,
+                    "stale": True,
+                    "state": "error",
+                    "category": "internal",
+                    "label": provider_name,
+                    "error": str(exc),
+                }
+        for value in sources.values():
+            value.setdefault("connected", False)
+            value.setdefault("age_sec", None)
+            value.setdefault(
+                "stale", value["age_sec"] is None or float(value["age_sec"]) > self._timeout
+            )
+            value.setdefault("state", "running" if value["connected"] and not value["stale"] else "waiting")
+            value.setdefault("category", "other")
+            value.setdefault("label", "未命名数据流")
+            if value["age_sec"] is not None:
+                value["age_sec"] = round(float(value["age_sec"]), 3)
         connected = sum(1 for value in sources.values() if value["connected"])
         fresh = sum(1 for value in sources.values() if value["connected"] and not value["stale"])
-        if fresh:
+        total = len(sources)
+        if total and fresh == total:
             state = "running"
-        elif connected:
+        elif connected or fresh:
             state = "degraded"
         else:
             state = "waiting"
+        groups = {}
+        for category in ("robot", "audio", "odin2", "internal", "other"):
+            names = [name for name, value in sources.items() if value["category"] == category]
+            if not names:
+                continue
+            group_connected = sum(1 for name in names if sources[name]["connected"])
+            group_fresh = sum(
+                1 for name in names if sources[name]["connected"] and not sources[name]["stale"]
+            )
+            if group_fresh == len(names):
+                group_state = "running"
+            elif group_connected or group_fresh:
+                group_state = "degraded"
+            else:
+                states = {sources[name]["state"] for name in names}
+                group_state = "error" if "error" in states else "waiting"
+            groups[category] = {
+                "state": group_state,
+                "connected": group_connected,
+                "fresh": group_fresh,
+                "total": len(names),
+                "sources": names,
+            }
+        issues = [
+            f"{value['label']}: {value['state']}"
+            for value in sources.values()
+            if value["state"] != "running"
+        ]
+        group_summary = {
+            category: f"{group['state']} · {group['fresh']}/{group['total']} 路正常"
+            for category, group in groups.items()
+        }
         return {
             "state": state,
+            "health_summary": f"{fresh}/{total} 路数据流正常",
+            "robot_summary": group_summary.get("robot", "unavailable"),
+            "audio_summary": group_summary.get("audio", "unavailable"),
+            "odin2_summary": group_summary.get("odin2", "unavailable"),
+            "microphone_state": sources.get("microphone", {}).get("state", "unavailable"),
+            "odin2_pointcloud_state": sources.get("odin2_pointcloud", {}).get("state", "unavailable"),
+            "odin2_camera_left_state": sources.get("odin2_camera_left", {}).get("state", "unavailable"),
+            "odin2_camera_right_state": sources.get("odin2_camera_right", {}).get("state", "unavailable"),
+            "odin2_depth_state": sources.get("odin2_depth", {}).get("state", "unavailable"),
             "connected_sources": connected,
             "fresh_sources": fresh,
+            "total_sources": total,
+            "robot_state": groups.get("robot", {}).get("state", "unavailable"),
+            "audio_state": groups.get("audio", {}).get("state", "unavailable"),
+            "odin2_state": groups.get("odin2", {}).get("state", "unavailable"),
+            "issues": issues,
+            "groups": groups,
             "sources": sources,
             "robot_domain_id": self._config["ros"]["robot_domain_id"],
             "core_domain_id": self._config["ros"]["core_domain_id"],
@@ -3353,7 +3455,12 @@ class MicPlugin:
         self._process = None
         self._thread = None
         self._samples_published = 0
+        self._chunks_published = 0
+        self._last_chunk_at: float | None = None
         self._last_error = ""
+        self._stop_requested = False
+        self._timeout = float(config["ros"].get("source_timeout_sec", 1.0))
+        self._lock = threading.RLock()
 
     def get_tool(self) -> dict:
         return sensor_tool(
@@ -3384,7 +3491,11 @@ class MicPlugin:
             self._last_error = f"parec exited with code {self._process.returncode}"
             self._process = None
             raise RuntimeError(self._last_error)
-        self._running = True
+        with self._lock:
+            self._running = True
+            self._last_chunk_at = None
+            self._last_error = ""
+            self._stop_requested = False
         self._thread = threading.Thread(target=self._capture_loop, daemon=True, name="t800-mic")
         self._thread.start()
 
@@ -3401,7 +3512,9 @@ class MicPlugin:
         subprocess.run(["pactl", "info"], capture_output=True, text=True, timeout=3, check=True)
 
     def stop(self) -> None:
-        self._running = False
+        with self._lock:
+            self._running = False
+            self._stop_requested = True
         process = self._process
         self._process = None
         if process is not None and process.poll() is None:
@@ -3430,7 +3543,9 @@ class MicPlugin:
                     self._publish_chunk(bytes(pending))
                     pending.clear()
         except Exception as exc:  # noqa: BLE001
-            self._last_error = str(exc)
+            with self._lock:
+                self._last_error = str(exc)
+                self._running = False
         finally:
             if self._running and process is not None and process.poll() is not None:
                 self._last_error = f"parec exited with code {process.returncode}"
@@ -3443,7 +3558,49 @@ class MicPlugin:
         msg.format = "audio/pcm-16k"
         msg.data = list(chunk)
         self._publisher.publish(msg)
-        self._samples_published += len(chunk) // 2
+        with self._lock:
+            self._samples_published += len(chunk) // 2
+            self._chunks_published += 1
+            self._last_chunk_at = time.monotonic()
+
+    def health_sources(self) -> dict:
+        now = time.monotonic()
+        with self._lock:
+            running = self._running
+            updated = self._last_chunk_at
+            samples = self._samples_published
+            chunks = self._chunks_published
+            error = self._last_error
+            stop_requested = self._stop_requested
+        age = None if updated is None else max(0.0, now - updated)
+        connected = updated is not None
+        stale = (not running) or age is None or age > self._timeout
+        if error and not running and not stop_requested:
+            state = "error"
+        elif not running:
+            state = "idle"
+        elif not connected:
+            state = "waiting"
+        elif stale:
+            state = "stale"
+        else:
+            state = "running"
+        return {
+            "microphone": {
+                "category": "audio",
+                "label": "麦克风音频",
+                "state": state,
+                "connected": connected,
+                "age_sec": age,
+                "stale": stale,
+                "process_running": running,
+                "samples_published": samples,
+                "chunks_published": chunks,
+                "topic": self._topic,
+                "format": "audio/pcm-16k",
+                "error": error or None,
+            }
+        }
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "start":
@@ -3460,9 +3617,9 @@ class MicPlugin:
             self.stop()
             return {"state": "idle"}
         if action in ("info", "status"):
-            return {"state": "running" if self._running else "idle",
+            source = self.health_sources()["microphone"]
+            return {**source,
                     "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}],
-                    "samples_published": self._samples_published,
                     "last_error": self._last_error}
         return {"error": f"unknown mic action: {action}"}
 
@@ -3505,6 +3662,8 @@ class VisionPlugin:
         self._enabled_tools: set[str] = set()
         self._lock = threading.RLock()
         self._frames = {"pointcloud": 0, "camera_left": 0, "camera_right": 0, "depth": 0}
+        self._updated: dict[str, float] = {}
+        self._timeout = float(config["ros"].get("source_timeout_sec", 1.0))
 
     def get_tools(self) -> list[dict]:
         return [self._cloud_tool(), self._camera_tool(), self._depth_tool()]
@@ -3617,19 +3776,19 @@ class VisionPlugin:
         out = self._multi_type()
         out.data = self._array.array("B", buf)
         self._cloud_pub.publish(out)
-        self._frames["pointcloud"] += 1
+        self._record_frame("pointcloud")
 
     def _on_camera_left(self, msg) -> None:
         if not self._running or "camera" not in self._enabled_tools:
             return
         self._cam_left_pub.publish(msg)
-        self._frames["camera_left"] += 1
+        self._record_frame("camera_left")
 
     def _on_camera_right(self, msg) -> None:
         if not self._running or "camera" not in self._enabled_tools:
             return
         self._cam_right_pub.publish(msg)
-        self._frames["camera_right"] += 1
+        self._record_frame("camera_right")
 
     def _on_depth(self, msg) -> None:
         if not self._running or "depth" not in self._enabled_tools:
@@ -3697,7 +3856,80 @@ class VisionPlugin:
         out.step = target_width * 2
         out.data = depth_mm.tobytes(order="C")
         self._depth_pub.publish(out)
-        self._frames["depth"] += 1
+        self._record_frame("depth")
+
+    def _record_frame(self, name: str) -> None:
+        with self._lock:
+            self._frames[name] += 1
+            self._updated[name] = time.monotonic()
+
+    def health_sources(self) -> dict:
+        now = time.monotonic()
+        with self._lock:
+            running = self._running
+            enabled_tools = set(self._enabled_tools)
+            frames = dict(self._frames)
+            updated = dict(self._updated)
+            source = self._source
+        definitions = {
+            "odin2_pointcloud": {
+                "frame_key": "pointcloud",
+                "tool": "pointcloud",
+                "label": f"Odin2 {source.upper()} 点云",
+                "topic": self._topics[f"vision_cloud_{source}"],
+                "format": "sensor/pointcloud",
+            },
+            "odin2_camera_left": {
+                "frame_key": "camera_left",
+                "tool": "camera",
+                "label": "Odin2 左相机",
+                "topic": self._topics["vision_camera_left"],
+                "format": "image/jpeg",
+            },
+            "odin2_camera_right": {
+                "frame_key": "camera_right",
+                "tool": "camera",
+                "label": "Odin2 右相机",
+                "topic": self._topics["vision_camera_right"],
+                "format": "image/jpeg",
+            },
+            "odin2_depth": {
+                "frame_key": "depth",
+                "tool": "depth",
+                "label": "Odin2 深度图",
+                "topic": self._topics["vision_depth"],
+                "format": "image/depth-z16",
+            },
+        }
+        health = {}
+        for name, definition in definitions.items():
+            frame_key = definition["frame_key"]
+            enabled = running and definition["tool"] in enabled_tools
+            last_update = updated.get(frame_key)
+            age = None if last_update is None else max(0.0, now - last_update)
+            connected = last_update is not None
+            stale = (not enabled) or age is None or age > self._timeout
+            if not enabled:
+                state = "idle"
+            elif not connected:
+                state = "waiting"
+            elif stale:
+                state = "stale"
+            else:
+                state = "running"
+            health[name] = {
+                "category": "odin2",
+                "label": definition["label"],
+                "state": state,
+                "connected": connected,
+                "age_sec": age,
+                "stale": stale,
+                "bridge_running": enabled,
+                "frames": frames[frame_key],
+                "topic": definition["topic"],
+                "format": definition["format"],
+            }
+        return health
 
     def dispatch(self, action: str, args: dict) -> dict:
         tool_name = str(args.get("_tool_name", ""))
@@ -3742,13 +3974,15 @@ class VisionPlugin:
             return {"state": "running" if is_running else "idle",
                     "source": self._source,
                     "topic_out": topic_out,
-                    "frames": dict(self._frames)}
+                    "frames": dict(self._frames),
+                    "health": self.health_sources()}
         if action == "select_source":
             source = str(args.get("source", "")).strip()
             if source not in self._SOURCES:
                 raise ValueError(f"invalid pointcloud source: {source}; expected {'|'.join(self._SOURCES)}")
             with self._lock:
                 self._source = source
+                self._updated.pop("pointcloud", None)
             return {"state": "running" if self._running else "idle", "source": source}
         return {"error": f"unknown vision action: {action}"}
 
