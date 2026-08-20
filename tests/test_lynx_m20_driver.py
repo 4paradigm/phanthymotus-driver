@@ -162,6 +162,10 @@ class LynxM20ContractTests(unittest.TestCase):
             rtsp_streams = {
                 "camera_front": {"url": "rtsp://10.21.31.103:8554/video1", "format": "video/h265"},
             }
+            reset_called = False
+
+            def reset_lidar_accumulation(self):
+                self.reset_called = True
 
         plugin = m20.M20StatePlugin(FakeStateNodes())
         static_topics = {
@@ -180,6 +184,7 @@ class LynxM20ContractTests(unittest.TestCase):
             self.assertEqual("ready", info["state"])
             self.assertEqual(static_topics[name], info["topic_out"])
         self.assertEqual("running", plugin.dispatch("start", {"_tool_name": "lidar"})["state"])
+        self.assertTrue(plugin.nodes.reset_called)
         self.assertEqual("ready", plugin.dispatch("start", {"_tool_name": "camera_front"})["state"])
 
     def test_json_state_stream_publishes_string_payload_and_keeps_snapshot_value(self):
@@ -323,6 +328,14 @@ class LynxM20ContractTests(unittest.TestCase):
         self.assertEqual((12, 1), struct.unpack_from("<II", payload))
         self.assertEqual((-11.0, 22.0, -3.0), struct.unpack_from("<fff", payload, 8))
         self.assertEqual("map", nodes.values["lidar"]["frame_id"])
+
+        nodes.config["lidar_visualization"]["max_points"] = 1
+        nodes._pointcloud_last_publish["lidar"] = float("-inf")
+        msg.data = struct.pack("<fffI", 4.0, 5.0, 6.0, 0)
+        callback(msg)
+        payload = bytes(publisher.messages[-1].data)
+        self.assertEqual((12, 1), struct.unpack_from("<II", payload))
+        self.assertEqual((-11.0, 22.0, -3.0), struct.unpack_from("<fff", payload, 8))
 
     def test_lidar_slam_transform_rotates_points_into_map(self):
         half = 2 ** -0.5

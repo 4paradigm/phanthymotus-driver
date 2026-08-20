@@ -203,6 +203,12 @@ class M20Nodes:
         with self._pointcloud_lock:
             self._lidar_pose = value
 
+    def reset_lidar_accumulation(self):
+        with self._pointcloud_lock:
+            self._lidar_voxels.clear()
+            self._pointcloud_frames.pop("lidar", None)
+            self._pointcloud_last_publish.pop("lidar", None)
+
     def _callback(
         self,
         key,
@@ -237,7 +243,7 @@ class M20Nodes:
                 frame_count = max(1, int(visualization.get("accumulate_frames", 5)))
                 max_points = max(min_points, int(visualization.get("max_points", 10000)))
                 publish_hz = max(0.1, float(visualization.get("publish_hz", 5.0)))
-                voxel_size = max(0.01, float(visualization.get("voxel_size", 0.05)))
+                voxel_size = max(0.01, float(visualization.get("voxel_size", 0.08)))
                 now = time.monotonic()
                 with self._pointcloud_lock:
                     pose = dict(self._lidar_pose) if self._lidar_pose else None
@@ -245,11 +251,11 @@ class M20Nodes:
                         for point in points:
                             mapped = transform_point(point, pose)
                             voxel = tuple(math.floor(value / voxel_size) for value in mapped)
+                            if voxel in self._lidar_voxels:
+                                continue
+                            if len(self._lidar_voxels) >= max_points:
+                                break
                             self._lidar_voxels[voxel] = mapped
-                        excess = len(self._lidar_voxels) - max_points
-                        if excess > 0:
-                            for voxel in list(self._lidar_voxels)[:excess]:
-                                self._lidar_voxels.pop(voxel, None)
                         output_points = list(self._lidar_voxels.values())
                         output_frame = str(pose.get("frame_id", "map"))
                     else:
@@ -549,6 +555,8 @@ class M20StatePlugin:
                 }
             return {"state": "ready"}
         if action == "start":
+            if name == "lidar":
+                self.nodes.reset_lidar_accumulation()
             return {"state": "running" if name in self.nodes.streams else "ready"}
         if action == "stop":
             return {"state": "idle"}
