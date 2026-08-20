@@ -6,6 +6,8 @@ FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
 ARG ROS_APT_MIRROR
 ARG UBUNTU_APT_MIRROR
+ARG STARTUP_BEEP_URL=https://raw.githubusercontent.com/4paradigm/phanthymotus-driver/9935a6533a1c1b4842826f8eead47086c0bd6f39/unitree/g1/resource/startup_beep.pcm
+ARG STARTUP_BEEP_SHA256=e634d402feeead175e7a669a77fa8d6aa5770e162fbd3c867503d4897dc2f166
 
 WORKDIR /work
 
@@ -73,6 +75,10 @@ RUN echo "[t800] checking ROS interface build dependencies" && \
 
 COPY main.py device.py control.py native_sdk.py virtual_gamepad.py config.yaml driver.yaml controlled_spatial_map.py /work/
 COPY resource/ /work/resource/
+# 启动音复用仓库已有的规范资源，不在每个 driver 目录重复提交二进制。
+# URL 可在构建时切换到 COS；固定 SHA-256 防止下载内容静默变化。
+RUN STARTUP_BEEP_URL="${STARTUP_BEEP_URL}" STARTUP_BEEP_SHA256="${STARTUP_BEEP_SHA256}" \
+    python3 -c 'import hashlib, os, pathlib, urllib.request; data = urllib.request.urlopen(os.environ["STARTUP_BEEP_URL"], timeout=30).read(); actual = hashlib.sha256(data).hexdigest(); expected = os.environ["STARTUP_BEEP_SHA256"]; assert actual == expected, f"startup beep sha256 mismatch: {actual}"; pathlib.Path("/work/resource/startup_beep.pcm").write_bytes(data)'
 # aplay 默认设备经 PulseAudio 路由（官方音量接口 pactl 才能作用于播放输出，
 # 且避免 ALSA dmix 默认 ~341ms 大缓冲带来的流式播放延迟）
 COPY resource/asound.conf /etc/asound.conf

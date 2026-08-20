@@ -53,6 +53,50 @@ class FakePublisher:
         self.messages.append(message)
 
 
+class FakeAudioStdin:
+    def __init__(self):
+        self.writes = []
+
+    def write(self, data):
+        self.writes.append(data)
+
+    def flush(self):
+        pass
+
+    def close(self):
+        pass
+
+
+class FakeAudioProcess:
+    def __init__(self):
+        self.stdin = FakeAudioStdin()
+        self.returncode = None
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.returncode = 0
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def kill(self):
+        self.returncode = -9
+
+
+class DeferredThread:
+    def __init__(self, target, args):
+        self.target = target
+        self.args = args
+
+    def start(self):
+        pass
+
+    def join(self, timeout=None):
+        pass
+
+
 class FakeFuture:
     def done(self):
         return True
@@ -1058,7 +1102,7 @@ class DevicePluginContractTests(unittest.TestCase):
         plugin._check_pulse = lambda: None
         plugin._run_command = lambda command: commands.append(command) or ""
         plugin._spawn_player = lambda: process
-        plugin._enqueue_startup_sound = lambda: None  # 跳过开机音
+        plugin._enqueue_startup_sound = lambda *args: None  # 跳过开机音
         started = plugin.dispatch("start", {"input_topic": "/perception/tts"})
         self.assertEqual("ready", started["state"])
         self.assertEqual("/perception/tts", started["topic_in"][0]["topic"])
@@ -1176,6 +1220,13 @@ class DevicePluginContractTests(unittest.TestCase):
             calls[-1],
         )
 
+    def test_speaker_startup_asset_is_fetched_and_verified_at_image_build(self):
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        self.assertIn("ARG STARTUP_BEEP_URL=", dockerfile)
+        self.assertIn("ARG STARTUP_BEEP_SHA256=", dockerfile)
+        self.assertIn("STARTUP_BEEP_SHA256", dockerfile)
+        self.assertFalse((ROOT / "resource" / "startup_beep.pcm").exists())
+
     def test_speaker_aplay_exit_sets_error(self):
         plugin = self.device.SpeakerPlugin(CONFIG, "robot", self.ros)
 
@@ -1199,10 +1250,36 @@ class DevicePluginContractTests(unittest.TestCase):
         plugin._check_pulse = lambda: None
         plugin._run_command = lambda command: ""
         plugin._spawn_player = lambda: DeadProcess()
-        plugin._enqueue_startup_sound = lambda: None  # 跳过开机音
+        plugin._enqueue_startup_sound = lambda *args: None  # 跳过开机音
         started = plugin.dispatch("start", {"input_topic": "/perception/tts"})
         self.assertEqual("error", started["state"])
         self.assertIn("aplay exited", started["message"])
+
+    def test_speaker_stop_is_idempotent_when_player_already_exited(self):
+        plugin = self.device.SpeakerPlugin(CONFIG, "robot", self.ros)
+
+        class ClosedStdin:
+            def close(self):
+                raise BrokenPipeError("aplay pipe is already closed")
+
+        class ReapedProcess:
+            def __init__(self):
+                self.stdin = ClosedStdin()
+                self.kill_calls = 0
+
+            def poll(self):
+                return 0
+
+            def kill(self):
+                self.kill_calls += 1
+                raise ProcessLookupError("aplay is already reaped")
+
+        process = ReapedProcess()
+        plugin._process = process
+        plugin._running = True
+        self.assertEqual("idle", plugin.dispatch("stop", {})["state"])
+        self.assertEqual(0, process.kill_calls)
+        self.assertEqual("idle", plugin.dispatch("stop", {})["state"])
 
     def test_speaker_startup_sound_plays_on_dispatch_start(self):
         plugin = self.device.SpeakerPlugin(CONFIG, "robot", self.ros)
@@ -1242,7 +1319,7 @@ class DevicePluginContractTests(unittest.TestCase):
         # _enqueue_startup_sound 分块推入 _beep_queue，测试用假 PCM 模拟
         real_startup = plugin._enqueue_startup_sound
         startup_queued = []
-        def fake_enqueue():
+        def fake_enqueue(*args):
             for _ in range(3):
                 plugin._beep_queue.put_nowait(b"\x01\x02\x03")
             startup_queued.append(True)
@@ -1252,6 +1329,90 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertTrue(startup_queued)
         self.assertEqual(3, plugin._beep_queue.qsize())
         # dispatch(start) 先返回再异步入队，播放线程已就绪
+
+    def test_speaker_live_audio_preempts_racing_startup_beep_block(self):
+        # review 反馈:beep producer 可能在 active 检查后、put 前暂停；live
+        # callback drain 完毕后它再放入一块。播放器必须丢弃该迟到 beep，
+        # 让首个 live PCM 成为下一块输出。
+        real_queue = self.device.queue.Queue
+        real_thread = self.device.threading.Thread
+        real_read_bytes = Path.read_bytes
+        beep_queues = []
+
+        class GatePutQueue(real_queue):
+            def __init__(self):
+                super().__init__(maxsize=256)
+                self.put_started = threading.Event()
+                self.release_put = threading.Event()
+                self._gated = False
+
+            def put(self, item, block=True, timeout=None):
+                if not self._gated:
+                    self._gated = True
+                    self.put_started.set()
+                    self.release_put.wait(timeout=2)
+                return super().put(item, block=block, timeout=timeout)
+
+        def queue_factory(maxsize=0):
+            if maxsize == 256:
+                result = GatePutQueue()
+                beep_queues.append(result)
+                return result
+            return real_queue(maxsize=maxsize)
+
+        deferred_player = []
+
+        def thread_factory(*args, **kwargs):
+            if kwargs.get("name") == "t800-speaker":
+                thread = DeferredThread(kwargs["target"], kwargs.get("args", ()))
+                deferred_player.append(thread)
+                return thread
+            return real_thread(*args, **kwargs)
+
+        self.device.queue.Queue = queue_factory
+        self.device.threading.Thread = thread_factory
+        Path.read_bytes = lambda path: b"\x00" * 2048
+        plugin = None
+        player_runner = None
+        try:
+            plugin = self.device.SpeakerPlugin(CONFIG, "robot", self.ros)
+            process = FakeAudioProcess()
+            plugin._check_pulse = lambda: None
+            plugin._run_command = lambda command: ""
+            plugin._spawn_player = lambda: process
+            self.assertEqual(
+                "ready",
+                plugin.dispatch("start", {"input_topic": "/perception/tts"})["state"],
+            )
+            self.assertEqual(1, len(deferred_player))
+            active_beep_queue = plugin._beep_queue
+            self.assertTrue(active_beep_queue.put_started.wait(timeout=1))
+
+            live_pcm = b"\x55\x66\x77\x88"
+            plugin._subscription.callback(types.SimpleNamespace(
+                format="audio/pcm-16k", data=list(live_pcm)))
+            active_beep_queue.release_put.set()
+            deadline = time.monotonic() + 1
+            while active_beep_queue.qsize() == 0 and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+            deferred = deferred_player[0]
+            player_runner = real_thread(target=deferred.target, args=deferred.args)
+            player_runner.start()
+            deadline = time.monotonic() + 0.5
+            while not process.stdin.writes and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(live_pcm, process.stdin.writes[0])
+        finally:
+            for beep_queue in beep_queues:
+                beep_queue.release_put.set()
+            if plugin is not None:
+                plugin.stop()
+            if player_runner is not None:
+                player_runner.join(timeout=1)
+            Path.read_bytes = real_read_bytes
+            self.device.queue.Queue = real_queue
+            self.device.threading.Thread = real_thread
 
     def test_speaker_stale_startup_thread_cannot_write_into_restarted_session(self):
         # review 反馈:旧会话的开机音线程若延迟到 stop/start 后才运行，不能把
@@ -1301,6 +1462,7 @@ class DevicePluginContractTests(unittest.TestCase):
         plugin._spawn_player = spawn_player
 
         real_thread = self.device.threading.Thread
+        real_read_bytes = Path.read_bytes
         deferred_beep_threads = []
 
         class DeferredThread:
@@ -1319,6 +1481,7 @@ class DevicePluginContractTests(unittest.TestCase):
             return real_thread(*args, **kwargs)
 
         self.device.threading.Thread = controlled_thread
+        Path.read_bytes = lambda path: b"\x00" * 2048
         try:
             self.assertEqual(
                 "ready",
@@ -1338,8 +1501,108 @@ class DevicePluginContractTests(unittest.TestCase):
                 time.sleep(0.01)
             self.assertEqual([], processes[-1].stdin.writes)
         finally:
+            Path.read_bytes = real_read_bytes
             self.device.threading.Thread = real_thread
             plugin.stop()
+
+    def test_speaker_old_player_cannot_consume_restarted_session_audio(self):
+        # review 反馈:旧播放线程可能已阻塞在 queue.get() 中；stop() 的 join
+        # 超时后若新会话复用同一队列，旧线程会取走并丢弃新会话首块音频。
+        real_queue = self.device.queue.Queue
+        real_thread = self.device.threading.Thread
+
+        class BlockingGetQueue(real_queue):
+            def __init__(self):
+                super().__init__(maxsize=50)
+                self.get_started = threading.Event()
+                self.release_get = threading.Event()
+
+            def get(self, block=True, timeout=None):
+                self.get_started.set()
+                self.release_get.wait(timeout=2)
+                return super().get(block=block, timeout=timeout)
+
+        blocking_queue = BlockingGetQueue()
+        live_queue_count = 0
+
+        def queue_factory(maxsize=0):
+            nonlocal live_queue_count
+            if maxsize == 50:
+                live_queue_count += 1
+                # 当前实现只在 __init__ 创建一次；per-session 实现会在首个
+                # start 再创建一次。两种情况下旧会话都使用这个受控队列。
+                if live_queue_count <= 2:
+                    return blocking_queue
+            return real_queue(maxsize=maxsize)
+
+        speaker_thread_count = 0
+        deferred_player = []
+
+        def thread_factory(*args, **kwargs):
+            nonlocal speaker_thread_count
+            if kwargs.get("name") == "t800-speaker":
+                speaker_thread_count += 1
+                if speaker_thread_count == 2:
+                    thread = DeferredThread(kwargs["target"], kwargs.get("args", ()))
+                    deferred_player.append(thread)
+                    return thread
+            return real_thread(*args, **kwargs)
+
+        self.device.queue.Queue = queue_factory
+        self.device.threading.Thread = thread_factory
+        plugin = None
+        old_player = None
+        new_player_runner = None
+        try:
+            plugin = self.device.SpeakerPlugin(CONFIG, "robot", self.ros)
+            processes = []
+            plugin._check_pulse = lambda: None
+            plugin._run_command = lambda command: ""
+            plugin._enqueue_startup_sound = lambda *args: None
+
+            def spawn_player():
+                process = FakeAudioProcess()
+                processes.append(process)
+                return process
+
+            plugin._spawn_player = spawn_player
+            self.assertEqual(
+                "ready",
+                plugin.dispatch("start", {"input_topic": "/perception/tts/old"})["state"],
+            )
+            old_player = plugin._thread
+            self.assertTrue(blocking_queue.get_started.wait(timeout=1))
+
+            self.assertEqual("idle", plugin.dispatch("stop", {})["state"])
+            self.assertEqual(
+                "ready",
+                plugin.dispatch("start", {"input_topic": "/perception/tts/new"})["state"],
+            )
+            self.assertEqual(1, len(deferred_player))
+
+            live_pcm = b"\x11\x22\x33\x44"
+            plugin._subscription.callback(types.SimpleNamespace(
+                format="audio/pcm-16k", data=list(live_pcm)))
+            blocking_queue.release_get.set()
+            old_player.join(timeout=1)
+
+            deferred = deferred_player[0]
+            new_player_runner = real_thread(target=deferred.target, args=deferred.args)
+            new_player_runner.start()
+            deadline = time.monotonic() + 0.3
+            while not processes[-1].stdin.writes and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual([live_pcm], processes[-1].stdin.writes)
+        finally:
+            blocking_queue.release_get.set()
+            if plugin is not None:
+                plugin.stop()
+            if old_player is not None:
+                old_player.join(timeout=1)
+            if new_player_runner is not None:
+                new_player_runner.join(timeout=1)
+            self.device.queue.Queue = real_queue
+            self.device.threading.Thread = real_thread
 
     def test_native_node_control_and_composed_safety(self):
         native = self.device.NativeNodeControlPlugin(CONFIG, "robot", self.ros)
