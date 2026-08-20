@@ -42,4 +42,4 @@ Dockerfile 会在解压和编译前再次校验 SHA256。归档内保留上游 `
 
 ## 验证状态
 
-已在 M20 Pro 真机确认 `/grid_map_3d` 与 `/SLAM_ODOM` 均约 10 Hz，并确认 `/grid_map_3d` 为 `base_link` 坐标、XYZ float32、16 字节点步长，`/SLAM_ODOM` 为 `map` 坐标。实时坐标转换、点云累积、最终栅格编码和 Canvas 生命周期契约已通过开发机测试；仍需用本分支镜像在 Agent Core/Canvas 上复测独立启停和最终地图切换。速度方向、选配件存在性、充电及 Pro 导航仍未完成真机验证。首次联调前请确认系统版本为 V1.1.8、外接主机接入 `10.21.31.x` 或 `10.21.33.x` 网段，并确保没有与 `planner` 或 `charge_manager` 并发发布 `/NAV_CMD`。
+已在 M20 Pro 真机确认 `/grid_map_3d` 与 `/SLAM_ODOM` 均约 10 Hz，并确认 `/grid_map_3d` 为 `base_link` 坐标、XYZ float32、16 字节点步长，`/SLAM_ODOM` 为 `map` 坐标。通过 103 手动 SSH 启动 106 的 `mapping.service` 后，已确认 Agent Core/Canvas 中 `mapping_view` 可显示实时建图；最终 `/GRID_MAP` 切换仍需单独验真。实时坐标转换、点云累积、最终栅格编码和 Canvas 生命周期契约已通过开发机测试。速度方向、选配件存在性、充电及 Pro 导航仍未完成真机验证。首次联调前请确认系统版本为 V1.1.8、外接主机接入 `10.21.31.x` 或 `10.21.33.x` 网段，并确保没有与 `planner` 或 `charge_manager` 并发发布 `/NAV_CMD`。
