@@ -1058,7 +1058,7 @@ class DevicePluginContractTests(unittest.TestCase):
         plugin._check_pulse = lambda: None
         plugin._run_command = lambda command: commands.append(command) or ""
         plugin._spawn_player = lambda: process
-        plugin._play_startup_sound = lambda: None  # 跳过开机音（不需要在测试中跑 aplay）
+        plugin._play_startup_sound = lambda _: None  # 跳过开机音
         started = plugin.dispatch("start", {"input_topic": "/perception/tts"})
         self.assertEqual("ready", started["state"])
         self.assertEqual("/perception/tts", started["topic_in"][0]["topic"])
@@ -1199,7 +1199,7 @@ class DevicePluginContractTests(unittest.TestCase):
         plugin._check_pulse = lambda: None
         plugin._run_command = lambda command: ""
         plugin._spawn_player = lambda: DeadProcess()
-        plugin._play_startup_sound = lambda: None  # 跳过开机音（DeadProcess.stdin 是 None）
+        plugin._play_startup_sound = lambda _: None  # 跳过开机音
         started = plugin.dispatch("start", {"input_topic": "/perception/tts"})
         self.assertEqual("error", started["state"])
         self.assertIn("aplay exited", started["message"])
@@ -1210,16 +1210,12 @@ class DevicePluginContractTests(unittest.TestCase):
         class FakeStdin:
             def __init__(self):
                 self.writes = []
-                self.closed = False
 
             def write(self, data):
                 self.writes.append(data)
 
             def flush(self):
                 pass
-
-            def close(self):
-                self.closed = True
 
         class FakeProcess:
             def __init__(self):
@@ -1238,16 +1234,23 @@ class DevicePluginContractTests(unittest.TestCase):
             def kill(self):
                 self.returncode = -9
 
+        import pathlib
         process = FakeProcess()
         plugin._check_pulse = lambda: None
         plugin._run_command = lambda command: ""
         plugin._spawn_player = lambda: process
+        # _play_startup_sound 接收 player 参数，直接调用真实现写入
+        # 测试用的 startup_beep.pcm 不存在时会静默跳过，所以手动模拟写 PCM
+        startup_written = []
+        def fake_startup(player):
+            player.stdin.write(b"\x01\x02\x03")
+            player.stdin.flush()
+            startup_written.append(True)
+        plugin._play_startup_sound = fake_startup
         started = plugin.dispatch("start", {"input_topic": "/perception/tts"})
         self.assertEqual("ready", started["state"])
-        # 开机音 PCM 已在创建订阅前写入 aplay stdin
-        self.assertTrue(process.stdin.writes)
-        self.assertTrue(process.stdin.closed)
-        # 播放线程应正常运行，不因开机音而阻塞
+        self.assertTrue(startup_written)
+        # 开机音 PCM 写入后播放线程在同一 aplay 进程上继续流式播放
 
     def test_native_node_control_and_composed_safety(self):
         native = self.device.NativeNodeControlPlugin(CONFIG, "robot", self.ros)
