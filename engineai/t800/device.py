@@ -3506,6 +3506,10 @@ class SpeakerPlugin:
         self._chunks_played = 0
         self._dropped = 0
         self._last_chunk_time = 0.0
+        # 开机音仍在入队/播放中时，首个 live chunk 到达即清空队列中剩余
+        # 开机音块——避免 8 秒 beep 排在实时流前面造成延迟。
+        self._startup_beep_active = False
+        self._live_audio_started = False
 
     def get_tool(self) -> dict:
         return {
@@ -3549,6 +3553,8 @@ class SpeakerPlugin:
 
     def stop(self) -> None:
         self._running = False
+        self._startup_beep_active = False
+        self._live_audio_started = False
         self._session += 1  # 使旧播放线程失效，防止其状态更新覆盖新会话
         if self._subscription is not None:
             self._node.destroy_subscription(self._subscription)
@@ -3646,7 +3652,8 @@ class SpeakerPlugin:
 
         不直接写 aplay stdin（会因管道/ALSA 缓冲回压阻塞调用线程），
         也不 spawn 独立 aplay 进程（会与主播放进程竞争 PulseAudio sink）。
-        分块入队后由 _play_loop 统一消费，开机音播完自然过渡到实时音频流。
+        分块入队后由 _play_loop 统一消费。首个 live chunk 到达时，
+        _on_chunk 会清空队列中剩余开机音块——beep 让位于实时音频。
         """
         import pathlib
 
@@ -3657,6 +3664,7 @@ class SpeakerPlugin:
             return
         if not pcm:
             return
+        self._startup_beep_active = True
         chunk_size = 1024  # PCM-16k 下每块 32ms
         for offset in range(0, len(pcm), chunk_size):
             block = pcm[offset:offset + chunk_size]
@@ -3672,6 +3680,16 @@ class SpeakerPlugin:
                 except queue.Full:
                     break
 
+    def _drain_beep(self) -> None:
+        """清空队列中剩余的开机音块——首个 live chunk 到达时调用。"""
+        drained = 0
+        while drained < 60:  # 安全上限，防止无限循环
+            try:
+                self._queue.get_nowait()
+                drained += 1
+            except queue.Empty:
+                break
+
     def _on_chunk(self, msg, session: int | None = None) -> None:
         # 丢弃不属于当前会话的回调:stop() 后残留的 ROS 回调若在新会话
         # 播放器已就绪后执行,会把旧 topic 的 PCM 入队泄漏到新连接。
@@ -3685,6 +3703,12 @@ class SpeakerPlugin:
         if getattr(msg, "format", "audio/pcm-16k") not in ("audio/pcm-16k", "pcm_16k_16bit_mono"):
             self._last_error = f"unsupported audio format: {msg.format}"
             return
+        # 首个 live chunk 到达时清空队列中剩余开机音块——避免
+        # 8 秒 beep 排在实时音频流前面造成明显延迟。
+        if self._startup_beep_active and not self._live_audio_started:
+            self._live_audio_started = True
+            self._startup_beep_active = False
+            self._drain_beep()
         try:
             self._queue.put_nowait(pcm)
             self._last_chunk_time = time.monotonic()
@@ -3704,8 +3728,8 @@ class SpeakerPlugin:
             self._dropped += 1
 
     def _play_loop(self, session: int) -> None:
-        # 会话隔离：stop() 会递增 _session 并关闭 aplay stdin，旧线程随后在
-        # 写失败/队列超时处退出，其状态更新不得覆盖新会话。
+        # 会话隔离：stop() 会递增 _session 并关闭 aplay stdin，旧线程随后
+        # 在写失败/队列超时处退出，其状态更新不得覆盖新会话。
         while self._running and self._session == session:
             try:
                 pcm = self._queue.get(timeout=0.1)
@@ -3715,6 +3739,11 @@ class SpeakerPlugin:
                 if self._state == "playing" and time.monotonic() - self._last_chunk_time >= 0.3:
                     self._state = "ready"
                 continue
+            # 队列 get() 与写入之间必须重新检查 session：
+            # stop() 仅 join 旧线程 1 秒，阻塞在 get() 上的旧线程醒来后
+            # 若不重检 session，会把旧队列残留 PCM 写到新会话的 aplay stdin。
+            if self._session != session:
+                return
             process = self._process
             try:
                 if process is None or process.poll() is not None or process.stdin is None:
@@ -3723,10 +3752,7 @@ class SpeakerPlugin:
                 process.stdin.flush()
                 self._chunks_played += 1
                 self._state = "playing"
-                # 注意：不要再加 sleep 节流——aplay 消费速率即硬件实时速率，
-                # write 在管道/ALSA 缓冲满时自然阻塞（背压限速）；人为 sleep
-                # 会与背压阻塞叠加成半速播放（实测 remote_mic 流 7.8kHz 半速）。
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 if self._session == session:
                     self._last_error = str(exc)
                     self._state = "error"
