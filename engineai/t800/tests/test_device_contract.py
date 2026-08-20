@@ -506,6 +506,61 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual([23, 24], [item["index"] for item in
                                    self.state.dispatch("joint_groups", {})["groups"]["head"]])
 
+    def test_driver_health_aggregates_audio_and_odin2_stream_freshness(self):
+        mic = self.device.MicPlugin(CONFIG, "robot", self.ros)
+        vision = self.device.VisionPlugin(CONFIG, "robot", self.ros)
+        now = time.monotonic()
+        mic._running = True
+        mic._last_chunk_at = now
+        mic._samples_published = 512
+        mic._chunks_published = 1
+        vision._running = True
+        vision._enabled_tools.update(vision._TOOL_NAMES)
+        vision._updated = {
+            "pointcloud": now,
+            "camera_left": now,
+            "camera_right": now,
+            "depth": now,
+        }
+        vision._frames = {
+            "pointcloud": 3,
+            "camera_left": 4,
+            "camera_right": 4,
+            "depth": 2,
+        }
+        self.state.register_health_provider("mic", mic.health_sources)
+        self.state.register_health_provider("vision", vision.health_sources)
+        for name in self.state._STREAMS:
+            if name != "driver_health":
+                self.state._set(name, {})
+
+        health = self.state.dispatch("driver_health", {})
+        self.assertEqual("running", health["state"])
+        self.assertEqual((14, 14, 14), (
+            health["connected_sources"], health["fresh_sources"], health["total_sources"],
+        ))
+        self.assertEqual("running", health["robot_state"])
+        self.assertEqual("running", health["audio_state"])
+        self.assertEqual("running", health["odin2_state"])
+        self.assertEqual("14/14 路数据流正常", health["health_summary"])
+        self.assertEqual("running · 9/9 路正常", health["robot_summary"])
+        self.assertEqual("running · 1/1 路正常", health["audio_summary"])
+        self.assertEqual("running · 4/4 路正常", health["odin2_summary"])
+        self.assertEqual("running", health["microphone_state"])
+        self.assertEqual("running", health["odin2_camera_right_state"])
+        self.assertEqual([], health["issues"])
+        self.assertEqual(512, health["sources"]["microphone"]["samples_published"])
+        self.assertEqual(3, health["sources"]["odin2_pointcloud"]["frames"])
+
+        vision._updated["camera_right"] = time.monotonic() - 2.0
+        degraded = self.state.dispatch("driver_health", {})
+        self.assertEqual("degraded", degraded["state"])
+        self.assertEqual("degraded", degraded["odin2_state"])
+        self.assertEqual("stale", degraded["odin2_camera_right_state"])
+        self.assertEqual("degraded · 3/4 路正常", degraded["odin2_summary"])
+        self.assertEqual("stale", degraded["sources"]["odin2_camera_right"]["state"])
+        self.assertIn("Odin2 右相机: stale", degraded["issues"])
+
     def test_locomotion_force_path_publishes_and_stops(self):
         plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
         plugin.start()
@@ -974,7 +1029,7 @@ class DevicePluginContractTests(unittest.TestCase):
                 self.reads = [b"\x01\x00" * 512, b""]
 
             def read(self, _size):
-                return self.reads.pop(0)
+                return self.reads.pop(0) if self.reads else b""
 
         class FakeProcess:
             def __init__(self):
@@ -1002,7 +1057,14 @@ class DevicePluginContractTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertEqual("audio/pcm-16k", plugin._publisher.messages[0].format)
         self.assertEqual(1024, len(plugin._publisher.messages[0].data))
+        health = plugin.health_sources()["microphone"]
+        self.assertEqual("running", health["state"])
+        self.assertFalse(health["stale"])
+        self.assertEqual(1, health["chunks_published"])
         self.assertEqual("idle", plugin.dispatch("stop", {})["state"])
+        stopped_health = plugin.health_sources()["microphone"]
+        self.assertEqual("idle", stopped_health["state"])
+        self.assertTrue(stopped_health["stale"])
 
     def test_native_node_control_and_composed_safety(self):
         native = self.device.NativeNodeControlPlugin(CONFIG, "robot", self.ros)
@@ -1041,6 +1103,9 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual(struct.pack("<II", 16, 4), bytes(out.data[:8]))
         self.assertEqual(bytes(range(64)), bytes(out.data[8:]))
         self.assertEqual(1, plugin._frames["pointcloud"])
+        health = plugin.health_sources()["odin2_pointcloud"]
+        self.assertEqual("running", health["state"])
+        self.assertFalse(health["stale"])
 
     def test_vision_select_source_switches_cloud(self):
         plugin = self.device.VisionPlugin(CONFIG, "robot", self.ros)
@@ -1069,9 +1134,12 @@ class DevicePluginContractTests(unittest.TestCase):
             info = plugin.dispatch("info", {"_tool_name": tool_name})
             self.assertEqual(tool["topic_out"], info["topic_out"], tool_name)
 
+        plugin._updated["depth"] = time.monotonic()
         stopped = plugin.dispatch("stop", {"_tool_name": "depth"})
         camera = plugin.dispatch("info", {"_tool_name": "camera"})
         self.assertEqual("idle", stopped["state"])
+        self.assertEqual("idle", stopped["health"]["odin2_depth"]["state"])
+        self.assertTrue(stopped["health"]["odin2_depth"]["stale"])
         self.assertEqual("running", camera["state"])
         self.assertTrue(plugin._running)
         self.assertNotIn("depth", plugin._enabled_tools)
