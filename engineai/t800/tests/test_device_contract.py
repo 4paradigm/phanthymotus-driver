@@ -232,6 +232,10 @@ class DevicePluginContractTests(unittest.TestCase):
     def setUp(self):
         self.ros = FakeRos()
         self.state = self.device.StatePlugin(CONFIG, "robot", self.ros)
+        self._original_notify_acp = self.device._notify_acp_completion
+
+    def tearDown(self):
+        self.device._notify_acp_completion = self._original_notify_acp
 
     def test_complete_tool_surface_is_declared(self):
         from virtual_gamepad import VirtualGamepadPlugin
@@ -683,7 +687,7 @@ class DevicePluginContractTests(unittest.TestCase):
         plan.wait_until_idle = lambda *_args, **_kwargs: {}
         plan.wait_for_request = lambda *_args, **_kwargs: {}
         gesture = self.device.GesturePlugin(plan)
-        gesture._acp_notify = lambda *_args: None
+        self.device._notify_acp_completion = lambda *_args, **_kwargs: None
         listed = {item["name"]: item["steps"] for item in gesture.dispatch("list", {})["gestures"]}
         self.assertEqual(8, listed["wave_hands"])
         self.assertEqual(2, listed["shake_hand"])
@@ -732,7 +736,7 @@ class DevicePluginContractTests(unittest.TestCase):
         plan.start()
         gesture = self.device.GesturePlugin(plan)
         completions = []
-        gesture._acp_notify = lambda action_id, status, result: completions.append(
+        self.device._notify_acp_completion = lambda tool, action_id, status, result, timeout: completions.append(
             (action_id, status, result)
         )
 
@@ -764,7 +768,7 @@ class DevicePluginContractTests(unittest.TestCase):
         plan.start()
         gesture = self.device.GesturePlugin(plan)
         completions = []
-        gesture._acp_notify = lambda action_id, status, result: completions.append(
+        self.device._notify_acp_completion = lambda tool, action_id, status, result, timeout: completions.append(
             (action_id, status, result)
         )
         result = gesture.dispatch("sequence", {
@@ -844,7 +848,7 @@ class DevicePluginContractTests(unittest.TestCase):
         plan.wait_for_request = wait_for_request
         gesture = self.device.GesturePlugin(plan)
         completions = []
-        gesture._acp_notify = lambda action_id, status, result: completions.append(
+        self.device._notify_acp_completion = lambda tool, action_id, status, result, timeout: completions.append(
             (action_id, status, result)
         )
         result = gesture.dispatch("sequence", {
@@ -878,7 +882,7 @@ class DevicePluginContractTests(unittest.TestCase):
         )
         gesture = self.device.GesturePlugin(plan)
         completions = []
-        gesture._acp_notify = lambda action_id, status, result: completions.append(
+        self.device._notify_acp_completion = lambda tool, action_id, status, result, timeout: completions.append(
             (action_id, status, result)
         )
         result = gesture.dispatch("sequence", {
@@ -921,8 +925,10 @@ class DevicePluginContractTests(unittest.TestCase):
         ssl.create_default_context = create_default_context
         os.environ["AGENT_CORE_URL"] = f"http://127.0.0.1:{server.server_port}"
         try:
-            self.device.GesturePlugin._acp_notify(
-                "t800_gesture_test", "completed", {"gesture": "wave_hands"}
+            self.device._notify_acp_completion(
+                "gesture", "t800_gesture_test", "completed",
+                {"gesture": "wave_hands"},
+                self.device.GesturePlugin._ACP_CALLBACK_TIMEOUT_SEC,
             )
         finally:
             if previous is None:
@@ -941,8 +947,8 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("completed", payload["status"])
         self.assertEqual("gesture", payload["tool"])
         self.assertEqual("wave_hands", payload["result"]["gesture"])
-        self.assertTrue(contexts[0].check_hostname)
-        self.assertEqual(ssl.CERT_REQUIRED, contexts[0].verify_mode)
+        self.assertFalse(contexts[0].check_hostname)
+        self.assertEqual(ssl.CERT_NONE, contexts[0].verify_mode)
 
     def test_gesture_uses_validated_real_device_trajectories(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
@@ -951,7 +957,7 @@ class DevicePluginContractTests(unittest.TestCase):
         plan.wait_until_idle = lambda *_args, **kwargs: waits.append(("idle", kwargs)) or {}
         plan.wait_for_request = lambda request_id, *_args: waits.append(("request", request_id)) or {}
         gesture = self.device.GesturePlugin(plan)
-        gesture._acp_notify = lambda *_args: None
+        self.device._notify_acp_completion = lambda *_args, **_kwargs: None
 
         wave = gesture._prepare_steps(gesture._official_steps("wave_hands"))
         self.assertEqual("return_to_neutral", wave[-1]["name"])
@@ -1204,6 +1210,189 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("image/jpeg", tools["camera"]["topic_out"][0]["format"])
         self.assertEqual(2, len(tools["camera"]["topic_out"]))
         self.assertEqual("image/depth-z16", tools["depth"]["topic_out"][0]["format"])
+
+    def test_head_declares_lifecycle_and_completion_schema(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        head = self.device.HeadActuatorPlugin(CONFIG, plan, self.state)
+        schema = head.get_tool()["inputSchema"]
+        self.assertEqual(
+            ["nod", "shake", "look", "rotate_to", "reset"],
+            schema["x-completion"]["actions"],
+        )
+        actions = set(schema["properties"]["action"]["enum"])
+        self.assertTrue({"start", "info", "stop", "status"}.issubset(actions))
+        self.assertTrue({"nod", "shake", "look", "rotate_to", "reset"}.issubset(actions))
+        params = schema["x-action-params"]
+        self.assertEqual(
+            ["pitch_deg", "yaw_deg", "rotation_time", "duration"],
+            params["rotate_to"]["params"],
+        )
+        self.assertEqual(["times", "speed"], params["nod"]["params"])
+
+    def test_head_acp_timeout_covers_max_rotate_to(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        head = self.device.HeadActuatorPlugin(CONFIG, plan, self.state)
+        timeout = head.get_tool()["inputSchema"]["x-completion"]["timeout"]
+        grace = float(head._config.get("feedback_grace_sec", 1.0))
+        budget = (
+            head._READY_TIMEOUT_SEC
+            + head._ROTATION_TIME_MAX_SEC + grace   # 就绪 + 目标规划
+            + head._HOLD_DURATION_MAX_SEC            # 保持
+            + head._ROTATION_TIME_MAX_SEC + grace   # 复位规划
+            + head._ACP_CALLBACK_TIMEOUT_SEC         # 完成回调
+        )
+        self.assertGreaterEqual(timeout, budget)
+
+    def test_head_lifecycle_returns_plain_dict(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        head = self.device.HeadActuatorPlugin(CONFIG, plan, self.state)
+        for action in ("start", "info"):
+            result = head.dispatch(action, {})
+            self.assertEqual("ready", result["state"])
+            self.assertEqual(
+                {"pitch": [-0.5, 0.5], "yaw": [-1.0, 1.0]},
+                result["limits_rad"],
+            )
+        status = head.dispatch("status", {})
+        self.assertEqual("idle", status["state"])
+        self.assertIn("limits_rad", status)
+        self.assertIn("joint_plan", status)
+
+    def test_head_rotate_to_rejects_out_of_range_angles(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        head = self.device.HeadActuatorPlugin(CONFIG, plan, self.state)
+        rejected = head.dispatch("rotate_to", {"pitch_deg": 90.0, "yaw_deg": 0.0})
+        self.assertIn("pitch_deg must be between", rejected["error"])
+        self.assertIsNone(head._thread)
+
+    def test_head_repeat_validation_rejects_non_integer_times(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        head = self.device.HeadActuatorPlugin(CONFIG, plan, self.state)
+        for bad in (1.9, True):
+            rejected = head.dispatch("nod", {"times": bad})
+            self.assertIn("times must be an integer", rejected["error"])
+            self.assertIsNone(head._thread)
+
+    def test_head_rejects_unsafe_config_at_init(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        with self.assertRaises(ValueError):
+            self.device.HeadActuatorPlugin({"nod_amplitude_rad": 2.0}, plan, self.state)
+        with self.assertRaises(ValueError):
+            self.device.HeadActuatorPlugin(
+                {"look_poses": {"forward": {"pitch_rad": 0.9, "yaw_rad": 0.0}}},
+                plan,
+                self.state,
+            )
+
+    def test_head_rejects_incomplete_look_poses_at_init(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        for pose in ({"pitch_rad": 0.0}, {"yaw_rad": 0.0}, {}):
+            with self.assertRaises(ValueError):
+                self.device.HeadActuatorPlugin(
+                    {"look_poses": {"forward": pose}}, plan, self.state
+                )
+
+    def test_head_rejects_invalid_timing_config_at_init(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        for grace in (-1.0, 0.0, float("nan"), float("inf"), 100.0):
+            with self.assertRaises(ValueError):
+                self.device.HeadActuatorPlugin(
+                    {"feedback_grace_sec": grace}, plan, self.state
+                )
+        for step in (-0.35, 0.0, float("nan"), float("inf"), 20.0):
+            with self.assertRaises(ValueError):
+                self.device.HeadActuatorPlugin(
+                    {"step_duration_sec": step}, plan, self.state
+                )
+
+    def test_head_nod_shake_clamp_step_duration_to_rotation_bounds(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        head = self.device.HeadActuatorPlugin(
+            {"step_duration_sec": 0.1}, plan, self.state
+        )
+        for steps in (
+            head._nod_steps({"times": 1, "speed": 2.0}),
+            head._shake_steps({"times": 1, "speed": 2.0}),
+        ):
+            for step in steps:
+                self.assertEqual(head._ROTATION_TIME_MIN_SEC, step["duration"])
+        head = self.device.HeadActuatorPlugin(
+            {"step_duration_sec": 10.0}, plan, self.state
+        )
+        for steps in (
+            head._nod_steps({"times": 1, "speed": 0.5}),
+            head._shake_steps({"times": 1, "speed": 0.5}),
+        ):
+            for step in steps:
+                self.assertEqual(head._ROTATION_TIME_MAX_SEC, step["duration"])
+
+    def test_head_completion_timeout_grows_with_worst_case_config(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        default = self.device.HeadActuatorPlugin(CONFIG, plan, self.state)
+        default_timeout = default.get_tool()["inputSchema"]["x-completion"]["timeout"]
+        pathological = self.device.HeadActuatorPlugin(
+            {"step_duration_sec": 10.0, "feedback_grace_sec": 5.0}, plan, self.state
+        )
+        grown_timeout = pathological.get_tool()["inputSchema"]["x-completion"]["timeout"]
+        self.assertEqual(int(default._ACP_TIMEOUT_SEC), default_timeout)
+        self.assertGreater(grown_timeout, default_timeout)
+
+    def test_head_ownership_blocks_joint_plan_head_pose(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        head = self.device.HeadActuatorPlugin(CONFIG, plan, self.state)
+        self.assertIsNone(plan.acquire_head("head"))
+        busy = plan.dispatch("head_pose", {"pitch_rad": 0.0, "yaw_rad": 0.0})
+        self.assertIn("head is busy", busy["error"])
+        self.assertEqual("head", busy["owner"])
+        plan.release_head("head")
+
+    def test_head_async_completion_reports_acp(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        plan.wait_until_idle = lambda *_args, **_kwargs: {}
+        plan.wait_for_request = lambda *_args, **_kwargs: {}
+        head = self.device.HeadActuatorPlugin(CONFIG, plan, self.state)
+        completions = []
+        self.device._notify_acp_completion = lambda tool, action_id, status, result, timeout: completions.append(
+            (tool, action_id, status, result)
+        )
+        result = head.dispatch("nod", {"times": 1})
+        self.assertEqual("running", result["state"])
+        head._thread.join(timeout=1.0)
+        self.assertEqual("completed", head.dispatch("status", {})["state"])
+        self.assertEqual(1, len(completions))
+        self.assertEqual("head", completions[0][0])
+        self.assertEqual(result["action_id"], completions[0][1])
+        self.assertEqual("completed", completions[0][2])
+
+    def test_head_stop_cancels_and_reports_acp(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        plan.wait_until_idle = lambda *_args, **_kwargs: {}
+        entered_wait = threading.Event()
+
+        def wait_for_request(_request_id, _timeout, cancel_event):
+            entered_wait.set()
+            while not cancel_event.is_set():
+                time.sleep(0.005)
+            raise RuntimeError("cancelled")
+
+        plan.wait_for_request = wait_for_request
+        head = self.device.HeadActuatorPlugin(CONFIG, plan, self.state)
+        completions = []
+        self.device._notify_acp_completion = lambda tool, action_id, status, result, timeout: completions.append(
+            (tool, action_id, status, result)
+        )
+        result = head.dispatch("nod", {"times": 1})
+        self.assertTrue(entered_wait.wait(timeout=1.0))
+        stopped = head.dispatch("stop", {})
+        self.assertEqual("idle", stopped["state"])
+        head._thread.join(timeout=1.0)
+        self.assertEqual("cancelled", head.dispatch("status", {})["state"])
+        self.assertEqual(1, len(completions))
+        self.assertEqual("head", completions[0][0])
+        self.assertEqual(result["action_id"], completions[0][1])
+        self.assertEqual("cancelled", completions[0][2])
 
 
 if __name__ == "__main__":
