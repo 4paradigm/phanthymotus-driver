@@ -1210,7 +1210,7 @@ class DevicePluginContractTests(unittest.TestCase):
 
     def test_head_rejects_invalid_timing_config_at_init(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
-        for grace in (-1.0, 0.0, float("nan"), float("inf")):
+        for grace in (-1.0, 0.0, float("nan"), float("inf"), 100.0):
             with self.assertRaises(ValueError):
                 self.device.HeadActuatorPlugin(
                     {"feedback_grace_sec": grace}, plan, self.state
@@ -1220,6 +1220,38 @@ class DevicePluginContractTests(unittest.TestCase):
                 self.device.HeadActuatorPlugin(
                     {"step_duration_sec": step}, plan, self.state
                 )
+
+    def test_head_nod_shake_clamp_step_duration_to_rotation_bounds(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        head = self.device.HeadActuatorPlugin(
+            {"step_duration_sec": 0.1}, plan, self.state
+        )
+        for steps in (
+            head._nod_steps({"times": 1, "speed": 2.0}),
+            head._shake_steps({"times": 1, "speed": 2.0}),
+        ):
+            for step in steps:
+                self.assertEqual(head._ROTATION_TIME_MIN_SEC, step["duration"])
+        head = self.device.HeadActuatorPlugin(
+            {"step_duration_sec": 10.0}, plan, self.state
+        )
+        for steps in (
+            head._nod_steps({"times": 1, "speed": 0.5}),
+            head._shake_steps({"times": 1, "speed": 0.5}),
+        ):
+            for step in steps:
+                self.assertEqual(head._ROTATION_TIME_MAX_SEC, step["duration"])
+
+    def test_head_completion_timeout_grows_with_worst_case_config(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        default = self.device.HeadActuatorPlugin(CONFIG, plan, self.state)
+        default_timeout = default.get_tool()["inputSchema"]["x-completion"]["timeout"]
+        pathological = self.device.HeadActuatorPlugin(
+            {"step_duration_sec": 10.0, "feedback_grace_sec": 5.0}, plan, self.state
+        )
+        grown_timeout = pathological.get_tool()["inputSchema"]["x-completion"]["timeout"]
+        self.assertEqual(int(default._ACP_TIMEOUT_SEC), default_timeout)
+        self.assertGreater(grown_timeout, default_timeout)
 
     def test_head_ownership_blocks_joint_plan_head_pose(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)

@@ -2499,9 +2499,11 @@ class HeadActuatorPlugin:
     _ROTATION_TIME_MAX_SEC = 10.0
     _HOLD_DURATION_MIN_SEC = 0.1
     _HOLD_DURATION_MAX_SEC = 30.0
-    _ACP_TIMEOUT_SEC = 90.0
+    _ACP_TIMEOUT_SEC = 90.0          # 对外完成超时下限；实际值按最坏序列推导
     _ACP_CALLBACK_TIMEOUT_SEC = 5.0
     _READY_TIMEOUT_SEC = 10.0
+    _FEEDBACK_GRACE_MAX_SEC = 5.0    # 每个运动步的反馈等待余量上限
+    _ACP_SAFETY_MARGIN_SEC = 5.0     # 最坏序列之上的安全余量
 
     def __init__(self, config: dict, joint_plan: JointPlanPlugin, state: StatePlugin):
         self._config = config
@@ -2534,8 +2536,11 @@ class HeadActuatorPlugin:
                 f"[{self._ROTATION_TIME_MIN_SEC}, {self._ROTATION_TIME_MAX_SEC}]"
             )
         grace = float(self._config.get("feedback_grace_sec", 1.0))
-        if not math.isfinite(grace) or grace <= 0.0:
-            raise ValueError("feedback_grace_sec must be a finite positive duration")
+        if not math.isfinite(grace) or not (0.0 < grace <= self._FEEDBACK_GRACE_MAX_SEC):
+            raise ValueError(
+                "feedback_grace_sec must be finite and within "
+                f"(0, {self._FEEDBACK_GRACE_MAX_SEC}]"
+            )
         poses = self._config.get("look_poses", {})
         if not isinstance(poses, dict):
             raise ValueError("look_poses must be a dict")
@@ -2565,6 +2570,28 @@ class HeadActuatorPlugin:
                     f"look_poses[{direction}].yaw_rad must be within "
                     f"[{-self._YAW_LIMIT}, {self._YAW_LIMIT}]"
                 )
+
+    def _worst_case_duration_sec(self) -> float:
+        """最坏情况序列总时长：就绪 + 完成回调 + 最长动作的逐段等待之和。"""
+        step = float(self._config.get("step_duration_sec", 0.35))
+        grace = float(self._config.get("feedback_grace_sec", 1.0))
+        # nod/shake：最多 5 次 × 3 步 = 15 个运动步；最慢 speed=0.5 → 单步最长
+        motion = clamp(
+            step / 0.5, self._ROTATION_TIME_MIN_SEC, self._ROTATION_TIME_MAX_SEC
+        )
+        nod_shake = 15 * (motion + grace)
+        rotate_to = (
+            (self._ROTATION_TIME_MAX_SEC + grace)
+            + self._HOLD_DURATION_MAX_SEC
+            + (self._ROTATION_TIME_MAX_SEC + grace)
+        )
+        look = self._ROTATION_TIME_MAX_SEC + grace
+        reset = step + grace
+        return (
+            self._READY_TIMEOUT_SEC
+            + self._ACP_CALLBACK_TIMEOUT_SEC
+            + max(nod_shake, rotate_to, look, reset)
+        )
 
     def get_tool(self) -> dict:
         actions = _with_lifecycle({
@@ -2615,7 +2642,10 @@ class HeadActuatorPlugin:
         )
         schema["x-completion"] = {
             "actions": ["nod", "shake", "look", "rotate_to", "reset"],
-            "timeout": int(self._ACP_TIMEOUT_SEC),
+            "timeout": max(
+                int(self._ACP_TIMEOUT_SEC),
+                math.ceil(self._worst_case_duration_sec() + self._ACP_SAFETY_MARGIN_SEC),
+            ),
         }
         return {
             "name": "head",
@@ -2733,7 +2763,11 @@ class HeadActuatorPlugin:
 
     def _nod_steps(self, args: dict) -> list[dict]:
         times, speed = self._sequence_args(args)
-        duration = self._config.get("step_duration_sec", 0.35) / speed
+        duration = clamp(
+            self._config.get("step_duration_sec", 0.35) / speed,
+            self._ROTATION_TIME_MIN_SEC,
+            self._ROTATION_TIME_MAX_SEC,
+        )
         amplitude = float(self._config.get("nod_amplitude_rad", 0.3))
         steps = []
         for _ in range(times):
@@ -2744,7 +2778,11 @@ class HeadActuatorPlugin:
 
     def _shake_steps(self, args: dict) -> list[dict]:
         times, speed = self._sequence_args(args)
-        duration = self._config.get("step_duration_sec", 0.35) / speed
+        duration = clamp(
+            self._config.get("step_duration_sec", 0.35) / speed,
+            self._ROTATION_TIME_MIN_SEC,
+            self._ROTATION_TIME_MAX_SEC,
+        )
         amplitude = float(self._config.get("shake_amplitude_rad", 0.6))
         steps = []
         for _ in range(times):
