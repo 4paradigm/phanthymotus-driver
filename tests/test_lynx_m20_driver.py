@@ -335,6 +335,21 @@ class LynxM20ContractTests(unittest.TestCase):
         self.assertAlmostEqual(21.0, transformed[1], places=6)
         self.assertAlmostEqual(0.0, transformed[2], places=6)
 
+    def test_lidar_odometry_accepts_fixed_odom_frame(self):
+        nodes = object.__new__(m20.M20Nodes)
+        nodes._pointcloud_lock = threading.Lock()
+        nodes._lidar_pose = None
+        pose = SimpleNamespace(
+            position=SimpleNamespace(x=1.0, y=2.0, z=3.0),
+            orientation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0),
+        )
+        msg = SimpleNamespace(
+            header=SimpleNamespace(frame_id="odom"),
+            pose=SimpleNamespace(pose=pose),
+        )
+        nodes._lidar_odometry_callback(msg)
+        self.assertEqual("odom", nodes._lidar_pose["frame_id"])
+
     def test_default_lidar_odometry_source_is_continuous_lio_odom(self):
         config_path = Path(m20.__file__).with_name("config.yaml")
         self.assertIn(

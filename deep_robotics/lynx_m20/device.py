@@ -186,7 +186,7 @@ class M20Nodes:
 
     def _lidar_odometry_callback(self, msg):
         frame_id = str(getattr(msg.header, "frame_id", ""))
-        if frame_id and frame_id != "map":
+        if not frame_id or frame_id in {"base_link", "base_footprint"}:
             return
         pose = msg.pose.pose
         orientation = pose.orientation
@@ -198,6 +198,7 @@ class M20Nodes:
             "qy": float(orientation.y),
             "qz": float(orientation.z),
             "qw": float(orientation.w),
+            "frame_id": frame_id,
         }
         with self._pointcloud_lock:
             self._lidar_pose = value
@@ -250,7 +251,7 @@ class M20Nodes:
                             for voxel in list(self._lidar_voxels)[:excess]:
                                 self._lidar_voxels.pop(voxel, None)
                         output_points = list(self._lidar_voxels.values())
-                        output_frame = "map"
+                        output_frame = str(pose.get("frame_id", "map"))
                     else:
                         payload, _ = encode_xyz_points(points)
                         frames = self._pointcloud_frames.setdefault(key, [])
