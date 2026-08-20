@@ -3674,21 +3674,23 @@ class SpeakerPlugin:
         if not pcm:
             return
         self._startup_beep_active = True
+        # 在线程创建前绑定会话，不能在线程真正获得调度时再读取
+        # self._session；否则快速 stop/start 会让旧线程误认成新会话。
+        session = self._session
         threading.Thread(
             target=self._enqueue_beep_blocks,
-            args=(pcm,),
+            args=(pcm, session),
             daemon=True,
             name="t800-beep-enqueue",
         ).start()
 
-    def _enqueue_beep_blocks(self, pcm: bytes) -> None:
+    def _enqueue_beep_blocks(self, pcm: bytes, session: int) -> None:
         """后台线程：分块阻塞入队开机音到 _beep_queue。
 
         用独立 _beep_queue（maxsize=256=整块开机音），队列容量
         足以容纳整段开机音，不会因满而丢块。当 stop() 或首个
         live chunk 到达时检查标志退出。
         """
-        session = self._session
         chunk_size = 1024
         for offset in range(0, len(pcm), chunk_size):
             if self._session != session:
