@@ -1253,6 +1253,94 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual(3, plugin._beep_queue.qsize())
         # dispatch(start) 先返回再异步入队，播放线程已就绪
 
+    def test_speaker_stale_startup_thread_cannot_write_into_restarted_session(self):
+        # review 反馈:旧会话的开机音线程若延迟到 stop/start 后才运行，不能把
+        # 旧开机音写进新会话。通过延迟线程调度稳定复现该竞态，并从新 aplay
+        # 进程的输出边界验证没有跨会话音频泄漏。
+        plugin = self.device.SpeakerPlugin(CONFIG, "robot", self.ros)
+
+        class FakeStdin:
+            def __init__(self):
+                self.writes = []
+
+            def write(self, data):
+                self.writes.append(data)
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+
+        class FakeProcess:
+            def __init__(self):
+                self.stdin = FakeStdin()
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = 0
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        processes = []
+        plugin._check_pulse = lambda: None
+        plugin._run_command = lambda command: ""
+
+        def spawn_player():
+            process = FakeProcess()
+            processes.append(process)
+            return process
+
+        plugin._spawn_player = spawn_player
+
+        real_thread = self.device.threading.Thread
+        deferred_beep_threads = []
+
+        class DeferredThread:
+            def __init__(self, target, args):
+                self.target = target
+                self.args = args
+
+            def start(self):
+                pass
+
+        def controlled_thread(*args, **kwargs):
+            if kwargs.get("name") == "t800-beep-enqueue":
+                thread = DeferredThread(kwargs["target"], kwargs.get("args", ()))
+                deferred_beep_threads.append(thread)
+                return thread
+            return real_thread(*args, **kwargs)
+
+        self.device.threading.Thread = controlled_thread
+        try:
+            self.assertEqual(
+                "ready",
+                plugin.dispatch("start", {"input_topic": "/perception/tts/old"})["state"],
+            )
+            self.assertEqual("idle", plugin.dispatch("stop", {})["state"])
+            self.assertEqual(
+                "ready",
+                plugin.dispatch("start", {"input_topic": "/perception/tts/new"})["state"],
+            )
+            self.assertEqual(2, len(deferred_beep_threads))
+
+            stale_thread = deferred_beep_threads[0]
+            stale_thread.target(*stale_thread.args)
+            deadline = time.monotonic() + 0.2
+            while not processes[-1].stdin.writes and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual([], processes[-1].stdin.writes)
+        finally:
+            self.device.threading.Thread = real_thread
+            plugin.stop()
+
     def test_native_node_control_and_composed_safety(self):
         native = self.device.NativeNodeControlPlugin(CONFIG, "robot", self.ros)
         native.start()
