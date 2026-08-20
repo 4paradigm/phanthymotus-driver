@@ -103,8 +103,9 @@ longer exposed as user choices:
 - `stand_up_lie_prone`: `stand_up` from a face-up lying pose, or `lie_prone`
   from a stable standing pose into the prone storage posture;
 - `semantic_action`: wave, handshake, cheer, three dances and wipe-tears;
-- `action_recording`: start recording, finish and save a recording, or play a
-  saved recording by `recording_id`.
+- `action_recording`: start recording; finish and persist it with a unique
+  `recording_id` and `recording_name`; list persisted recordings; play using
+  only `recording_id`; or logically delete a managed recording.
 
 Every result reports the automatically executed preparation steps, the observed
 workmode, whether the requested action start was confirmed, plain-language
@@ -150,8 +151,23 @@ is exposed. The monitor also has no-motion and maximum-runtime safeguards
 because the SDK does not expose a dedicated physical playback-completion event.
 
 `finish_and_save_recording` maps to the supported `SAVETEACH` command. The
-vendor-deprecated `ENDTEACH` command and unavailable `RUN` command remain
-unexposed.
+driver waits for the documented save sequence to reach workmode 29
+(`save_teach_2`) before atomically adding the ID and name to
+`/opt/phanthy-motus/data/noetix/bumi/action_recordings.json`. The deployment
+bind-mounts `/opt/phanthy-motus/data`, so this directory survives container and
+robot restarts while the corresponding trajectory remains in the Bumi firmware
+slot selected by `recording_id`. An existing managed ID is never silently
+overwritten. `list_recordings` reads this persistent directory, and
+`play_recording` needs only the ID; legacy firmware slots created before the
+directory feature remain playable by ID but cannot be listed by name.
+
+The vendor SDK exposes no command for enumerating, exporting, or physically
+erasing a recorded firmware slot. Therefore `delete_recording` atomically
+removes the ID/name entry, stores a deletion marker, and blocks that ID from
+future card playback. Its result explicitly reports `firmware_slot_erased:
+false`; recording a new action under the same ID removes the marker and makes
+the ID available again. The vendor-deprecated `ENDTEACH` command and unavailable
+`RUN` command remain unexposed.
 
 Useful observations while the driver is running:
 

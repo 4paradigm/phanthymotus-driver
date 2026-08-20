@@ -80,6 +80,12 @@ _TEACHING_ACTIONS = {
     "finish_and_save_recording": ("SAVETEACH", {12, 14, 29}),
     "play_recording": ("PLAYTEACH", {23}),
 }
+_ACTION_RECORDING_ACTIONS = tuple(_TEACHING_ACTIONS) + (
+    "list_recordings", "delete_recording")
+_RECORDING_NAME_MAX_LENGTH = 80
+_RECORDING_REGISTRY_VERSION = 1
+_DEFAULT_RECORDING_REGISTRY_PATH = (
+    "/opt/phanthy-motus/data/noetix/bumi/action_recordings.json")
 
 _SEMANTIC_ACTION_WORKMODES = {5, 8, 9, 10, 31, 32, 33}
 _TEAR_AUTO_EXIT_S = 5.0
@@ -435,6 +441,12 @@ class LocoPlugin:
         self._action_session_lock = threading.Lock()
         self._active_action_session: dict[str, str] | None = None
         self._lifecycle_stop_event = threading.Event()
+        registry_path = plugin_config.get(
+            "recording_registry_path", _DEFAULT_RECORDING_REGISTRY_PATH)
+        if not isinstance(registry_path, str) or not registry_path.strip():
+            raise ValueError("recording_registry_path must be a non-empty path")
+        self._recording_registry_path = Path(registry_path)
+        self._recording_registry_lock = threading.RLock()
 
     def get_tools(self) -> list:
         return [
@@ -634,17 +646,22 @@ class LocoPlugin:
     def _action_recording_tool(self) -> dict:
         return {
             "name": "action_recording", "type": "actuator", "multiInstance": False,
-            "description": "录制、结束并保存或播放 Bumi 示教动作。start_recording 只负责进入开放式示教录制状态，因此同步返回而不使用 ACP；finish_and_save_recording 和 play_recording 返回 action_id，前者在保存工作模式确认后上报终态，后者在检测到实际播放结束并恢复 walking 后上报终态。start_recording 和 play_recording 会自动进入所需行走模式；finish_and_save_recording 只能在已开始录制后使用。",
+            "description": "录制、持久化管理和播放 Bumi 示教动作。机器人固件通过 recording_id 保存动作轨迹；驱动在持久卷中保存编号与名称目录，因此容器和机器人重启后仍可按编号列出并播放。start_recording 只负责进入开放式示教录制状态；finish_and_save_recording 需要编号和名称，并在固件完成保存后写入目录；play_recording 只需要编号；list_recordings 列出目录；delete_recording 注销编号并阻止卡片继续播放。SDK 未提供擦除固件槽位的命令，因此删除属于目录级逻辑删除。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
-                        "type": "string", "enum": list(_TEACHING_ACTIONS),
-                        "description": "start_recording=开始录制示教；finish_and_save_recording=结束当前录制并保存；play_recording=播放已保存动作，检测到动作完成后自动返回 walking。",
+                        "type": "string", "enum": list(_ACTION_RECORDING_ACTIONS),
+                        "description": "start_recording=开始录制；finish_and_save_recording=按编号和名称持久化保存；play_recording=按编号播放；list_recordings=列出已保存编号和名称；delete_recording=逻辑删除目录记录并阻止卡片继续播放。",
                     },
                     "recording_id": {
                         "type": "integer", "minimum": 0, "maximum": 65535,
-                        "description": "动作记录编号，范围 0～65535。结束并保存、播放时必须填写；开始录制时无需填写。保存与播放同一动作时使用相同编号。",
+                        "description": "动作记录编号，范围 0～65535。保存、播放或删除时填写；播放和删除只需要该编号。",
+                    },
+                    "recording_name": {
+                        "type": "string", "minLength": 1,
+                        "maxLength": _RECORDING_NAME_MAX_LENGTH,
+                        "description": "动作名称，去除首尾空格后长度为 1～80 个字符。仅 finish_and_save_recording 保存时填写。",
                     },
                 },
                 "required": ["action"],
@@ -655,8 +672,10 @@ class LocoPlugin:
                 },
                 "x-action-params": {
                     "start_recording": {"params": [], "description": "自动准备模式后开始示教录制。确认机器人稳定站立；缓慢引导关节，禁止强推至机械限位。"},
-                    "finish_and_save_recording": {"params": ["recording_id"], "description": "结束当前示教并保存到 recording_id。若尚未开始录制，则不会发送命令。"},
-                    "play_recording": {"params": ["recording_id"], "description": "自动准备并播放 recording_id；卡片根据 workmode、21 个关节位移和滚动速度中位数推断动作完成，随后通过带确认的 WALK 退出自动返回 walking，无需填写时长或手动停止。"},
+                    "finish_and_save_recording": {"params": ["recording_id", "recording_name"], "description": "结束当前示教并保存到 recording_id，同时把名称持久化到目录。编号已存在时不会覆盖，需先删除或换编号；若尚未开始录制，则不会发送命令。"},
+                    "play_recording": {"params": ["recording_id"], "description": "仅填写 recording_id。自动准备并播放该编号；已逻辑删除的编号会被拒绝。卡片检测实际播放结束后自动返回 walking。"},
+                    "list_recordings": {"params": [], "description": "列出持久目录中所有可用动作的 recording_id 和 recording_name，不发送机器人控制命令。"},
+                    "delete_recording": {"params": ["recording_id"], "description": "按 recording_id 从持久目录删除并禁止卡片继续播放。SDK 不提供固件槽位擦除接口，因此底层轨迹可能仍留在运动控制板，重新用同一编号保存会覆盖/恢复该编号。"},
                 },
             },
             "topic_out": [],
@@ -715,9 +734,14 @@ class LocoPlugin:
             return self._start_posture_acp(action, args)
         if tool_name == "semantic_action" and action in _PRESET_ACTIONS:
             return self._start_semantic_acp(action, args)
-        if tool_name == "action_recording" and action in _TEACHING_ACTIONS:
+        if (tool_name == "action_recording"
+                and action in _ACTION_RECORDING_ACTIONS):
             if action == "start_recording":
                 return self._do_teaching_action(action, args)
+            if action == "list_recordings":
+                return self._list_recordings()
+            if action == "delete_recording":
+                return self._delete_recording(args)
             return self._start_teaching_acp(action, args)
         return None
 
@@ -904,7 +928,206 @@ class LocoPlugin:
             ),
         }
 
+    @staticmethod
+    def _empty_recording_registry() -> dict:
+        return {
+            "version": _RECORDING_REGISTRY_VERSION,
+            "recordings": {},
+            "deleted_recording_ids": [],
+        }
+
+    def _load_recording_registry_locked(self) -> dict:
+        path = self._recording_registry_path
+        if not path.exists():
+            return self._empty_recording_registry()
+        try:
+            registry = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(
+                f"Cannot read recording registry {path}: {exc}") from exc
+        if (not isinstance(registry, dict)
+                or registry.get("version") != _RECORDING_REGISTRY_VERSION
+                or not isinstance(registry.get("recordings"), dict)
+                or not isinstance(
+                    registry.get("deleted_recording_ids", []), list)):
+            raise RuntimeError(
+                f"Recording registry {path} has an unsupported or invalid format")
+        recordings = registry["recordings"]
+        for key, entry in recordings.items():
+            if (not isinstance(key, str) or not key.isdigit()
+                    or not isinstance(entry, dict)
+                    or type(entry.get("recording_id")) is not int
+                    or str(entry["recording_id"]) != key
+                    or not isinstance(entry.get("recording_name"), str)):
+                raise RuntimeError(
+                    f"Recording registry {path} contains an invalid entry")
+        deleted_ids = registry.get("deleted_recording_ids", [])
+        if any(type(value) is not int or not 0 <= value <= 65535
+               for value in deleted_ids):
+            raise RuntimeError(
+                f"Recording registry {path} contains an invalid deleted ID")
+        registry["deleted_recording_ids"] = sorted(set(deleted_ids))
+        return registry
+
+    def _write_recording_registry_locked(self, registry: dict) -> None:
+        path = self._recording_registry_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = path.with_name(
+            f".{path.name}.{os.getpid()}.{uuid4().hex}.tmp")
+        try:
+            with temporary_path.open("x", encoding="utf-8") as stream:
+                json.dump(
+                    registry, stream, ensure_ascii=False,
+                    indent=2, sort_keys=True)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary_path, path)
+        finally:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _validate_recording_name(value) -> tuple[str | None, str | None]:
+        if not isinstance(value, str):
+            return None, "recording_name must be a string"
+        name = value.strip()
+        if not 1 <= len(name) <= _RECORDING_NAME_MAX_LENGTH:
+            return None, (
+                f"recording_name must contain 1 to "
+                f"{_RECORDING_NAME_MAX_LENGTH} characters after trimming")
+        if any(ord(character) < 32 or ord(character) == 127
+               for character in name):
+            return None, "recording_name must not contain control characters"
+        return name, None
+
+    def _recording_registry_error(self, error: str) -> dict:
+        return {
+            "state": "error",
+            "command_sent": False,
+            "error": error,
+            "registry_path": str(self._recording_registry_path),
+        }
+
+    def _list_recordings(self) -> dict:
+        try:
+            with self._recording_registry_lock:
+                registry = self._load_recording_registry_locked()
+        except Exception as exc:
+            return self._recording_registry_error(str(exc))
+        recordings = sorted(
+            registry["recordings"].values(),
+            key=lambda entry: entry["recording_id"],
+        )
+        return {
+            "state": "completed",
+            "command_sent": False,
+            "recording_count": len(recordings),
+            "recordings": [
+                {
+                    "recording_id": entry["recording_id"],
+                    "recording_name": entry["recording_name"],
+                }
+                for entry in recordings
+            ],
+            "persistence": (
+                "The number/name directory is stored on the persistent host volume. "
+                "Motion data is stored by Bumi firmware in the corresponding index."
+            ),
+            "message": (
+                f"Found {len(recordings)} persisted action recording(s)."
+            ),
+        }
+
+    def _delete_recording(self, args: dict) -> dict:
+        recording_id = args.get("recording_id")
+        if type(recording_id) is not int or not 0 <= recording_id <= 65535:
+            return self._recording_registry_error(
+                "recording_id must be an integer in the range 0 to 65535")
+        try:
+            with self._recording_registry_lock:
+                registry = self._load_recording_registry_locked()
+                key = str(recording_id)
+                removed = registry["recordings"].pop(key, None)
+                if removed is None:
+                    return self._recording_registry_error(
+                        f"recording_id {recording_id} is not in the persisted directory")
+                deleted_ids = set(registry["deleted_recording_ids"])
+                deleted_ids.add(recording_id)
+                registry["deleted_recording_ids"] = sorted(deleted_ids)
+                self._write_recording_registry_locked(registry)
+        except Exception as exc:
+            return self._recording_registry_error(str(exc))
+        return {
+            "state": "completed",
+            "command_sent": False,
+            "recording_id": recording_id,
+            "recording_name": removed["recording_name"],
+            "directory_entry_deleted": True,
+            "playback_blocked": True,
+            "firmware_slot_erased": False,
+            "message": (
+                "The recording was removed from the persistent directory and this card "
+                "will reject playback of that ID. The vendor SDK has no command for "
+                "physically erasing the motion-controller slot. Saving a new action to "
+                "the same ID makes the ID available again."
+            ),
+        }
+
+    def _check_recording_for_save(self, recording_id: int) -> dict | None:
+        try:
+            with self._recording_registry_lock:
+                registry = self._load_recording_registry_locked()
+                existing = registry["recordings"].get(str(recording_id))
+                # Verify the persistent mount is writable before SAVETEACH can
+                # commit a firmware slot that would otherwise lack metadata.
+                self._write_recording_registry_locked(registry)
+        except Exception as exc:
+            return self._recording_registry_error(str(exc))
+        if existing is not None:
+            return self._recording_registry_error(
+                f"recording_id {recording_id} already exists as "
+                f"'{existing['recording_name']}'. Delete it first or choose another ID")
+        return None
+
+    def _check_recording_for_playback(self, recording_id: int) -> tuple[dict | None, dict | None]:
+        try:
+            with self._recording_registry_lock:
+                registry = self._load_recording_registry_locked()
+                if recording_id in registry["deleted_recording_ids"]:
+                    return None, self._recording_registry_error(
+                        f"recording_id {recording_id} was deleted and is blocked from playback")
+                entry = registry["recordings"].get(str(recording_id))
+        except Exception as exc:
+            return None, self._recording_registry_error(str(exc))
+        # Preserve access to recordings created before this directory feature.
+        # Such firmware slots are playable by ID but cannot be listed by name.
+        return entry, None
+
+    def _persist_recording_metadata(self, recording_id: int,
+                                    recording_name: str) -> dict:
+        with self._recording_registry_lock:
+            registry = self._load_recording_registry_locked()
+            key = str(recording_id)
+            if key in registry["recordings"]:
+                raise RuntimeError(
+                    f"recording_id {recording_id} was registered concurrently")
+            registry["recordings"][key] = {
+                "recording_id": recording_id,
+                "recording_name": recording_name,
+                "saved_at_epoch_s": round(time.time(), 3),
+            }
+            registry["deleted_recording_ids"] = [
+                value for value in registry["deleted_recording_ids"]
+                if value != recording_id
+            ]
+            self._write_recording_registry_locked(registry)
+        return registry["recordings"][key]
+
     def _start_teaching_acp(self, action: str, args: dict) -> dict:
+        args = dict(args)
         # Validate request-only fields synchronously so malformed IDs do not
         # create an ACP action that can never issue a vendor command.
         if action in ("finish_and_save_recording", "play_recording"):
@@ -921,6 +1144,30 @@ class LocoPlugin:
                     "error": "recording_id must be in the range 0 to 65535",
                     "safety_requirements": self._safety_requirements(action),
                 }
+            if action == "finish_and_save_recording":
+                recording_name, name_error = self._validate_recording_name(
+                    args.get("recording_name"))
+                if name_error is not None:
+                    return {
+                        "state": "error", "command_sent": False,
+                        "error": name_error,
+                        "safety_requirements": self._safety_requirements(action),
+                    }
+                registry_error = self._check_recording_for_save(recording_id)
+                if registry_error is not None:
+                    registry_error["safety_requirements"] = (
+                        self._safety_requirements(action))
+                    return registry_error
+                args["recording_name"] = recording_name
+            else:
+                recording_entry, registry_error = (
+                    self._check_recording_for_playback(recording_id))
+                if registry_error is not None:
+                    registry_error["safety_requirements"] = (
+                        self._safety_requirements(action))
+                    return registry_error
+                if recording_entry is not None:
+                    args["recording_name"] = recording_entry["recording_name"]
         conflict = self._reserve_action_session("action_recording", action)
         if conflict is not None:
             return conflict
@@ -945,6 +1192,8 @@ class LocoPlugin:
         }
         if "recording_id" in args:
             response["recording_id"] = args["recording_id"]
+        if "recording_name" in args:
+            response["recording_name"] = args["recording_name"]
         return response
 
     def _run_teaching_acp(self, action_id: str,
@@ -969,13 +1218,94 @@ class LocoPlugin:
                 self._schedule_playback_completion_monitor(
                     self._safety_requirements(action), action_id=action_id)
                 return
-            result["completion_detection"] = "target_workmode_observed"
+            save_completion = self._wait_recording_save_completion(
+                cancel_event, result.get("workmode"))
+            if cancel_event.is_set():
+                return
+            result["save_completion"] = save_completion
+            if not save_completion["confirmed"]:
+                result["error"] = save_completion["error"]
+                self._finish_acp(action_id, "error", result)
+                return
+            try:
+                entry = self._persist_recording_metadata(
+                    args["recording_id"], args["recording_name"])
+            except Exception as exc:
+                result.update({
+                    "error": (
+                        "Bumi reported that the recording reached its final save mode, "
+                        f"but the persistent number/name directory could not be written: {exc}"
+                    ),
+                    "firmware_recording_may_exist": True,
+                    "registry_path": str(self._recording_registry_path),
+                })
+                self._finish_acp(action_id, "error", result)
+                return
+            result.update({
+                "recording_id": entry["recording_id"],
+                "recording_name": entry["recording_name"],
+                "persisted": True,
+                "registry_path": str(self._recording_registry_path),
+                "completion_detection": "final_save_workmode_and_registry_write",
+            })
             self._finish_acp(action_id, "completed", result)
         except Exception as exc:
             self._finish_acp(action_id, "error", {
                 "requested_action": action,
                 "error": str(exc),
             })
+
+    def _wait_recording_save_completion(
+            self, cancel_event: threading.Event,
+            initially_observed_mode: int | None) -> dict:
+        # The Bumi document defines SAVETEACH as a sequence through
+        # end_teach(12), save_teach_1(14), then save_teach_2(29). Register the
+        # metadata only after the final save mode is observed.
+        if initially_observed_mode == 29:
+            return {
+                "confirmed": True,
+                "final_workmode": 29,
+                "final_workmode_name": "save_teach_2",
+                "detection": "final_save_workmode_observed",
+            }
+        deadline = time.monotonic() + 12.0
+        observed_modes = []
+        while not cancel_event.wait(0.05):
+            mode = int(self._high_ctrl.get_mode())
+            if not observed_modes or observed_modes[-1] != mode:
+                observed_modes.append(mode)
+            if mode == 29:
+                return {
+                    "confirmed": True,
+                    "final_workmode": 29,
+                    "final_workmode_name": "save_teach_2",
+                    "observed_workmodes": observed_modes,
+                    "detection": "final_save_workmode_observed",
+                }
+            if mode == 26:
+                return {
+                    "confirmed": False,
+                    "final_workmode": 26,
+                    "final_workmode_name": "protection",
+                    "observed_workmodes": observed_modes,
+                    "error": "The robot entered protection mode while saving the recording.",
+                }
+            if time.monotonic() >= deadline:
+                return {
+                    "confirmed": False,
+                    "final_workmode": mode,
+                    "final_workmode_name": _WORKMODE_NAMES.get(mode, "unknown"),
+                    "observed_workmodes": observed_modes,
+                    "error": (
+                        "The final save_teach_2 workmode (29) was not observed within "
+                        "12 seconds, so persistence was not confirmed."
+                    ),
+                }
+        return {
+            "confirmed": False,
+            "error": "Recording save monitoring was cancelled.",
+            "observed_workmodes": observed_modes,
+        }
 
     def _run_semantic_acp(self, action_id: str, cancel_event: threading.Event,
                           action: str, args: dict) -> None:
@@ -2309,6 +2639,7 @@ class LocoPlugin:
     def _do_teaching_action(self, action: str, args: dict) -> dict:
         safety = self._safety_requirements(action)
         recording_id = None
+        recording_name = None
         if action in ("finish_and_save_recording", "play_recording"):
             if "recording_id" not in args:
                 return {
@@ -2324,6 +2655,14 @@ class LocoPlugin:
             if not 0 <= recording_id <= 65535:
                 return {"state": "error", "command_sent": False,
                         "error": "recording_id must be in the range 0 to 65535", "safety_requirements": safety}
+        if action == "finish_and_save_recording":
+            recording_name, name_error = self._validate_recording_name(
+                args.get("recording_name"))
+            if name_error is not None:
+                return {
+                    "state": "error", "command_sent": False,
+                    "error": name_error, "safety_requirements": safety,
+                }
         if action == "finish_and_save_recording":
             mode = int(self._high_ctrl.get_mode())
             if mode == 26:
@@ -2349,6 +2688,10 @@ class LocoPlugin:
         result = self._trigger_user_action(
             action, command_name, expected_modes, steps, safety,
             index=recording_id or 0, recording_id=recording_id)
+        if recording_name is not None:
+            result["recording_name"] = recording_name
+        elif action == "play_recording" and args.get("recording_name"):
+            result["recording_name"] = args["recording_name"]
         if action == "play_recording" and result.get("confirmed_started"):
             result.update({
                 "auto_return_to_walk": True,
