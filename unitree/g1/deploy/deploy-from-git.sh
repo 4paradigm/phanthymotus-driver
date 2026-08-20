@@ -113,18 +113,32 @@ docker build --pull=false \
 built_commit="$(docker image inspect "$image" --format '{{ index .Config.Labels "phanthy.source_commit" }}')"
 [[ "$built_commit" == "$expected_commit" ]]
 
-cat > "$remote_compose" <<EOF
-services:
-  unitree-g1:
-    image: $image
-EOF
+service_template="$remote_repo/unitree/g1/deploy/service.yml"
+[[ -f "$service_template" ]] || {
+  echo "Driver Compose service template is missing: $service_template" >&2
+  exit 1
+}
+{
+  echo "services:"
+  sed "s|__IMAGE__|$image|" "$service_template" | sed 's/^/  /'
+} > "$remote_compose"
+grep -Fq "image: $image" "$remote_compose"
+! grep -Fq '__IMAGE__' "$remote_compose"
 
 docker compose -p phanthy-motus \
   -f "$compose_base" -f "$remote_compose" \
   up -d --no-deps --force-recreate unitree-g1
 
-actual_image="$(docker inspect embodied-unitree-g1 --format '{{.Config.Image}}')"
-status="$(docker inspect embodied-unitree-g1 --format '{{.State.Status}}')"
+container_id="$(docker compose -p phanthy-motus \
+  -f "$compose_base" -f "$remote_compose" \
+  ps -q unitree-g1)"
+[[ -n "$container_id" ]] || {
+  echo "Compose did not return a container for service unitree-g1" >&2
+  exit 1
+}
+
+actual_image="$(docker inspect "$container_id" --format '{{.Config.Image}}')"
+status="$(docker inspect "$container_id" --format '{{.State.Status}}')"
 [[ "$status" == "running" && "$actual_image" == "$image" ]]
 
 for _ in $(seq 1 30); do
@@ -134,7 +148,7 @@ for _ in $(seq 1 30); do
   if grep -Fq '"navigation_lidar"' <<<"$response" \
     && grep -Fq '"navigation_imu"' <<<"$response" \
     && grep -Fq '/ubuntu/navigation/nav2/velocity_proposal' <<<"$response"; then
-    docker exec -w /work embodied-unitree-g1 python3 -c '
+    docker exec -w /work "$container_id" python3 -c '
 from velocity_proposal import ProposalLimits
 
 limits = ProposalLimits()
@@ -151,7 +165,7 @@ print("VELOCITY_CONTRACT=PASS vx=[-1,1] vy=[-1,1] vyaw=[-2,2]")
   sleep 1
 done
 
-docker logs --tail 80 embodied-unitree-g1 >&2
+docker logs --tail 80 "$container_id" >&2
 echo "Driver started but expected G1 navigation tools were not ready" >&2
 exit 1
 REMOTE_DEPLOY
