@@ -1200,6 +1200,27 @@ class DevicePluginContractTests(unittest.TestCase):
                 self.state,
             )
 
+    def test_head_rejects_incomplete_look_poses_at_init(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        for pose in ({"pitch_rad": 0.0}, {"yaw_rad": 0.0}, {}):
+            with self.assertRaises(ValueError):
+                self.device.HeadActuatorPlugin(
+                    {"look_poses": {"forward": pose}}, plan, self.state
+                )
+
+    def test_head_rejects_invalid_timing_config_at_init(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        for grace in (-1.0, 0.0, float("nan"), float("inf")):
+            with self.assertRaises(ValueError):
+                self.device.HeadActuatorPlugin(
+                    {"feedback_grace_sec": grace}, plan, self.state
+                )
+        for step in (-0.35, 0.0, float("nan"), float("inf"), 20.0):
+            with self.assertRaises(ValueError):
+                self.device.HeadActuatorPlugin(
+                    {"step_duration_sec": step}, plan, self.state
+                )
+
     def test_head_ownership_blocks_joint_plan_head_pose(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
         head = self.device.HeadActuatorPlugin(CONFIG, plan, self.state)

@@ -2525,14 +2525,34 @@ class HeadActuatorPlugin:
             raise ValueError(
                 f"shake_amplitude_rad must be finite and within [0, {self._YAW_LIMIT}]"
             )
+        step_duration = float(self._config.get("step_duration_sec", 0.35))
+        if not math.isfinite(step_duration) or not (
+            self._ROTATION_TIME_MIN_SEC <= step_duration <= self._ROTATION_TIME_MAX_SEC
+        ):
+            raise ValueError(
+                "step_duration_sec must be finite and within "
+                f"[{self._ROTATION_TIME_MIN_SEC}, {self._ROTATION_TIME_MAX_SEC}]"
+            )
+        grace = float(self._config.get("feedback_grace_sec", 1.0))
+        if not math.isfinite(grace) or grace <= 0.0:
+            raise ValueError("feedback_grace_sec must be a finite positive duration")
         poses = self._config.get("look_poses", {})
         if not isinstance(poses, dict):
             raise ValueError("look_poses must be a dict")
         for direction, pose in poses.items():
             if not isinstance(pose, dict):
                 raise ValueError(f"look_poses[{direction}] must be a dict")
-            pitch = float(pose.get("pitch_rad", 0.0))
-            yaw = float(pose.get("yaw_rad", 0.0))
+            if "pitch_rad" not in pose or "yaw_rad" not in pose:
+                raise ValueError(
+                    f"look_poses[{direction}] must specify both pitch_rad and yaw_rad"
+                )
+            try:
+                pitch = float(pose["pitch_rad"])
+                yaw = float(pose["yaw_rad"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"look_poses[{direction}].pitch_rad and yaw_rad must be numbers"
+                ) from exc
             if not (math.isfinite(pitch) and math.isfinite(yaw)):
                 raise ValueError(f"look_poses[{direction}] must be finite")
             if not (-self._PITCH_LIMIT <= pitch <= self._PITCH_LIMIT):
