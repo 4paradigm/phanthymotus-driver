@@ -1145,6 +1145,20 @@ class DevicePluginContractTests(unittest.TestCase):
         )
         self.assertEqual(["times", "speed"], params["nod"]["params"])
 
+    def test_head_acp_timeout_covers_max_rotate_to(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        head = self.device.HeadActuatorPlugin(CONFIG, plan, self.state)
+        timeout = head.get_tool()["inputSchema"]["x-completion"]["timeout"]
+        grace = float(head._config.get("feedback_grace_sec", 1.0))
+        budget = (
+            head._READY_TIMEOUT_SEC
+            + head._ROTATION_TIME_MAX_SEC + grace   # 就绪 + 目标规划
+            + head._HOLD_DURATION_MAX_SEC            # 保持
+            + head._ROTATION_TIME_MAX_SEC + grace   # 复位规划
+            + head._ACP_CALLBACK_TIMEOUT_SEC         # 完成回调
+        )
+        self.assertGreaterEqual(timeout, budget)
+
     def test_head_lifecycle_returns_plain_dict(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
         head = self.device.HeadActuatorPlugin(CONFIG, plan, self.state)
