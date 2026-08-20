@@ -1239,18 +1239,18 @@ class DevicePluginContractTests(unittest.TestCase):
         plugin._check_pulse = lambda: None
         plugin._run_command = lambda command: ""
         plugin._spawn_player = lambda: process
-        # _enqueue_startup_sound 分块推入队列，测试用假 PCM 模拟
+        # _enqueue_startup_sound 分块推入 _beep_queue，测试用假 PCM 模拟
         real_startup = plugin._enqueue_startup_sound
         startup_queued = []
         def fake_enqueue():
             for _ in range(3):
-                plugin._queue.put_nowait(b"\x01\x02\x03")
+                plugin._beep_queue.put_nowait(b"\x01\x02\x03")
             startup_queued.append(True)
         plugin._enqueue_startup_sound = fake_enqueue
         started = plugin.dispatch("start", {"input_topic": "/perception/tts"})
         self.assertEqual("ready", started["state"])
         self.assertTrue(startup_queued)
-        self.assertEqual(3, plugin._queue.qsize())
+        self.assertEqual(3, plugin._beep_queue.qsize())
         # dispatch(start) 先返回再异步入队，播放线程已就绪
 
     def test_native_node_control_and_composed_safety(self):
