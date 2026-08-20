@@ -3505,14 +3505,13 @@ class SpeakerPlugin:
         self._thread = None
         self._running = False
         self._session = 0
+        self._lifecycle_lock = threading.RLock()
         self._chunks_played = 0
         self._dropped = 0
         self._last_chunk_time = 0.0
-        # 开机音通过独立 _beep_queue 入队，_drain_beep() 只清空 _beep_queue，
-        # 不碰 _queue——与 _on_chunk 的 put_nowait(_queue) 无竞争，不会误丢 live PCM。
-        # _play_loop 优先消费 _beep_queue（非阻塞），空时回退到 _queue。
-        self._startup_beep_active = False
-        self._live_audio_started = False
+        # 每个会话用独立 Event 标记 live PCM 已到达。它既终止开机音生产，
+        # 也让播放器拒绝在 drain 竞态后迟到的开机音块。
+        self._beep_cancel = threading.Event()
 
     def get_tool(self) -> dict:
         return {
@@ -3555,9 +3554,12 @@ class SpeakerPlugin:
         pass  # 播放经 dispatch(start) 按画布连接的 input_topic 启动
 
     def stop(self) -> None:
+        with self._lifecycle_lock:
+            self._stop_locked()
+
+    def _stop_locked(self) -> None:
         self._running = False
-        self._startup_beep_active = False
-        self._live_audio_started = False
+        self._beep_cancel.set()
         self._session += 1  # 使旧播放线程失效，防止其状态更新覆盖新会话
         if self._subscription is not None:
             self._node.destroy_subscription(self._subscription)
@@ -3578,11 +3580,18 @@ class SpeakerPlugin:
             try:
                 if process.stdin is not None:
                     process.stdin.close()
+            except Exception:
+                pass  # 已退出的 aplay 可能已关闭/回收 stdin
+            try:
                 if process.poll() is None:
                     process.terminate()
                     process.wait(timeout=1)
             except Exception:
-                process.kill()
+                try:
+                    if process.poll() is None:
+                        process.kill()
+                except Exception:
+                    pass  # stop 必须对已消失或已回收的进程幂等
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=1)
@@ -3623,8 +3632,20 @@ class SpeakerPlugin:
         return value
 
     def _start_play(self, topic: str) -> dict:
-        self.stop()
+        with self._lifecycle_lock:
+            return self._start_play_locked(topic)
+
+    def _start_play_locked(self, topic: str) -> dict:
+        self._stop_locked()
         from audio_msgs.msg import AudioChunk
+        # 每个播放会话拥有独立队列。旧回调/播放线程/开机音线程即使在
+        # stop() 后才恢复执行，也只能访问旧队列，不能污染或消费新会话。
+        self._queue = queue.Queue(maxsize=50)
+        self._beep_queue = queue.Queue(maxsize=256)
+        self._beep_cancel = threading.Event()
+        live_queue = self._queue
+        beep_queue = self._beep_queue
+        beep_cancel = self._beep_cancel
         session = self._session  # stop() 已递增,捕获当前会话
         try:
             self._check_pulse()
@@ -3632,37 +3653,48 @@ class SpeakerPlugin:
             self._process = self._spawn_player()
             self._input_topic = topic
             self._subscription = self._node.create_subscription(
-                AudioChunk, topic, lambda msg: self._on_chunk(msg, session), _AUDIO_QOS
+                AudioChunk, topic,
+                lambda msg: self._on_chunk(
+                    msg, session, live_queue, beep_queue, beep_cancel
+                ),
+                _AUDIO_QOS,
             )
         except Exception as exc:
-            self.stop()
+            self._stop_locked()
             self._last_error = str(exc)
             return {"state": "error", "message": f"speaker playback failed: {exc}"}
         if self._process is None or self._process.poll() is not None:
             code = self._process.returncode if self._process is not None else "unknown"
             self._last_error = f"aplay exited with code {code}"
-            self.stop()
+            self._stop_locked()
             return {"state": "error", "message": self._last_error}
         self._running = True
         self._state = "ready"
-        session = self._session
         process = self._process  # 捕获当前进程供播放线程独占持有
         self._thread = threading.Thread(
-            target=self._play_loop, args=(session, process), daemon=True, name="t800-speaker"
+            target=self._play_loop,
+            args=(session, process, live_queue, beep_queue, beep_cancel),
+            daemon=True,
+            name="t800-speaker",
         )
         self._thread.start()
         # 开机音在订阅和播放线程就绪后异步入队——不阻塞 dispatch(start)，
-        # 且期间传入的音频块排在开机音之后播放，不丢数据。
-        self._enqueue_startup_sound()
+        # 首个 live PCM 到达时会原子取消并抢占剩余开机音。
+        self._enqueue_startup_sound(session, beep_queue, beep_cancel)
         return {"state": "ready", "topic_in": [{"topic": topic, "format": "audio/pcm-16k"}]}
 
-    def _enqueue_startup_sound(self) -> None:
+    def _enqueue_startup_sound(
+        self,
+        session: int | None = None,
+        beep_queue: queue.Queue | None = None,
+        beep_cancel: threading.Event | None = None,
+    ) -> None:
         """把 startup_beep.pcm 分块异步推入 _beep_queue。
 
         使用独立 _beep_queue 与实时音频 _queue 隔离，防止
-        drain/drop 误操作实时 PCM。_play_loop 优先消费 _beep_queue，
-        空时回退到 _queue。首个 live chunk 到达时 _startup_beep_active
-        设为 False，_drain_beep() 只清空 _beep_queue。
+        drain/drop 误操作实时 PCM。_play_loop 始终优先实时队列；首个
+        live chunk 到达时设置本会话的取消事件，_drain_beep() 只清空
+        _beep_queue。
         """
         import pathlib
 
@@ -3673,18 +3705,28 @@ class SpeakerPlugin:
             return
         if not pcm:
             return
-        self._startup_beep_active = True
-        # 在线程创建前绑定会话，不能在线程真正获得调度时再读取
-        # self._session；否则快速 stop/start 会让旧线程误认成新会话。
-        session = self._session
+        # 正常路径由 _start_play_locked 显式传入会话资源；默认值只供直接
+        # 调用兼容。线程不能在真正获得调度时再读取“当前会话”。
+        if session is None:
+            session = self._session
+        if beep_queue is None:
+            beep_queue = self._beep_queue
+        if beep_cancel is None:
+            beep_cancel = self._beep_cancel
         threading.Thread(
             target=self._enqueue_beep_blocks,
-            args=(pcm, session),
+            args=(pcm, session, beep_queue, beep_cancel),
             daemon=True,
             name="t800-beep-enqueue",
         ).start()
 
-    def _enqueue_beep_blocks(self, pcm: bytes, session: int) -> None:
+    def _enqueue_beep_blocks(
+        self,
+        pcm: bytes,
+        session: int,
+        beep_queue: queue.Queue,
+        beep_cancel: threading.Event,
+    ) -> None:
         """后台线程：分块阻塞入队开机音到 _beep_queue。
 
         用独立 _beep_queue（maxsize=256=整块开机音），队列容量
@@ -3695,25 +3737,34 @@ class SpeakerPlugin:
         for offset in range(0, len(pcm), chunk_size):
             if self._session != session:
                 return  # 新会话已开始，旧开机音线程退出
-            if not self._startup_beep_active:
+            if beep_cancel.is_set():
                 return  # live chunk 已到达
             block = pcm[offset:offset + chunk_size]
-            self._beep_queue.put(block)  # 队列容量充足，阻塞等待消耗
+            beep_queue.put(block)  # 队列容量充足，阻塞等待消耗
 
-    def _drain_beep(self) -> None:
+    def _drain_beep(self, beep_queue: queue.Queue | None = None) -> None:
         """清空 _beep_queue 中剩余的开机音块——首个 live chunk 到达时调用。
 
         只清空独立开机音 _beep_queue，不影响 _queue 中的 live PCM。
         """
+        if beep_queue is None:
+            beep_queue = self._beep_queue
         drained = 0
         while drained < 256:  # 安全上限（_beep_queue maxsize）
             try:
-                self._beep_queue.get_nowait()
+                beep_queue.get_nowait()
                 drained += 1
             except queue.Empty:
                 break
 
-    def _on_chunk(self, msg, session: int | None = None) -> None:
+    def _on_chunk(
+        self,
+        msg,
+        session: int | None = None,
+        live_queue: queue.Queue | None = None,
+        beep_queue: queue.Queue | None = None,
+        beep_cancel: threading.Event | None = None,
+    ) -> None:
         # 丢弃不属于当前会话的回调:stop() 后残留的 ROS 回调若在新会话
         # 播放器已就绪后执行,会把旧 topic 的 PCM 入队泄漏到新连接。
         if session is not None and session != self._session:
@@ -3726,49 +3777,74 @@ class SpeakerPlugin:
         if getattr(msg, "format", "audio/pcm-16k") not in ("audio/pcm-16k", "pcm_16k_16bit_mono"):
             self._last_error = f"unsupported audio format: {msg.format}"
             return
+        if live_queue is None:
+            live_queue = self._queue
+        if beep_queue is None:
+            beep_queue = self._beep_queue
+        if beep_cancel is None:
+            beep_cancel = self._beep_cancel
         # 首个 live chunk 到达时清空队列中剩余开机音块——避免
         # 8 秒 beep 排在实时音频流前面造成明显延迟。
-        if self._startup_beep_active and not self._live_audio_started:
-            self._live_audio_started = True
-            self._startup_beep_active = False
-            self._drain_beep()
+        if not beep_cancel.is_set():
+            # 先设置取消标记，再 drain/入 live 队列。播放器观察到标记后
+            # 会拒绝任何已取出或在 drain 之后迟到的 beep 块。
+            beep_cancel.set()
+            self._drain_beep(beep_queue)
         try:
-            self._queue.put_nowait(pcm)
+            live_queue.put_nowait(pcm)
             self._last_chunk_time = time.monotonic()
         except queue.Full:
             # 滑动窗口：丢弃最旧的块，腾出位置放新块——持续实时流下
             # 播放始终跟随最新输入，而不是永远滞后的积压音频。
             try:
-                self._queue.get_nowait()
+                live_queue.get_nowait()
             except queue.Empty:
                 pass
             try:
-                self._queue.put_nowait(pcm)
+                live_queue.put_nowait(pcm)
             except queue.Full:
                 self._last_error = "speaker buffer full; audio chunk dropped"
                 return
             self._last_chunk_time = time.monotonic()
             self._dropped += 1
 
-    def _play_loop(self, session: int, process: subprocess.Popen | None) -> None:
+    def _play_loop(
+        self,
+        session: int,
+        process: subprocess.Popen | None,
+        live_queue: queue.Queue,
+        beep_queue: queue.Queue,
+        beep_cancel: threading.Event,
+    ) -> None:
         # 会话隔离：stop() 会递增 _session 并关闭 aplay stdin，旧线程随后
         # 在写失败/队列超时处退出，其状态更新不得覆盖新会话。
         # 每个线程独占持有自己的 process 引用，防止旧线程在 stop/start
         # 之后写入新会话的 aplay stdin。
         while self._running and self._session == session:
-            # 优先消费 _beep_queue（开机音），非阻塞检查后回退到实时 _queue。
-            # 两个队列由独立的生产者写入，不存在跨源竞争。
+            # live PCM 始终优先。首个 live chunk 设置 beep_cancel 后，已取出
+            # 或 drain 之后迟到的 beep 块也会在写 aplay 前被丢弃。
+            from_beep = False
             try:
-                pcm = self._beep_queue.get_nowait()
+                pcm = live_queue.get_nowait()
             except queue.Empty:
-                try:
-                    pcm = self._queue.get(timeout=0.1)
-                except queue.Empty:
-                    if self._session != session:
-                        return
-                    if self._state == "playing" and time.monotonic() - self._last_chunk_time >= 0.3:
-                        self._state = "ready"
-                    continue
+                pcm = None
+                if not beep_cancel.is_set():
+                    try:
+                        pcm = beep_queue.get_nowait()
+                        from_beep = True
+                    except queue.Empty:
+                        pass
+                if pcm is None:
+                    try:
+                        pcm = live_queue.get(timeout=0.1)
+                    except queue.Empty:
+                        if self._session != session:
+                            return
+                        if self._state == "playing" and time.monotonic() - self._last_chunk_time >= 0.3:
+                            self._state = "ready"
+                        continue
+            if from_beep and beep_cancel.is_set():
+                continue
             # 队列 get() 与写入之间必须重新检查 session：
             # stop() 仅 join 旧线程 1 秒，阻塞在 get() 上的旧线程醒来后
             # 若不重检 session，会把旧队列残留 PCM 写到新会话的 aplay stdin。
