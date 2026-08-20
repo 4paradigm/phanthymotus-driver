@@ -122,6 +122,7 @@ class T800DeviceBundle:
             NativeInterfaceProbePlugin,
             NativeNodeControlPlugin,
             NativeSdkPlugin,
+            OdometerPlugin,
             SafetyControlPlugin,
             StatePlugin,
             TtsPlugin,
@@ -149,6 +150,7 @@ class T800DeviceBundle:
         plugin_types = (
             ("heartbeat_status", HeartbeatStatusPlugin, (config, namespace, ros2)),
             ("motion_command_trace", MotionCommandTracePlugin, (config, namespace, ros2)),
+            ("odometer", OdometerPlugin, (config, namespace, ros2)),
             ("native_interface_probe", NativeInterfaceProbePlugin, (config, namespace, ros2)),
             ("locomotion", LocomotionPlugin, (config, namespace, ros2, state)),
             ("motion_mode", MotionModePlugin, (config, namespace, ros2, state)),
