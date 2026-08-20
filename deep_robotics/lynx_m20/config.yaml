@@ -16,7 +16,7 @@ basic_server:
 lidar_visualization:
   accumulate_frames: 5
   min_points: 32
-  max_points: 50000
+  max_points: 500000
   publish_hz: 3.0
   voxel_size: 0.08
 topics:

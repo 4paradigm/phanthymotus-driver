@@ -365,10 +365,12 @@ class LynxM20ContractTests(unittest.TestCase):
 
     def test_default_lidar_odometry_source_is_continuous_odom(self):
         config_path = Path(m20.__file__).with_name("config.yaml")
+        config_text = config_path.read_text(encoding="utf-8")
         self.assertIn(
             'slam_odometry: "/ODOM"',
-            config_path.read_text(encoding="utf-8"),
+            config_text,
         )
+        self.assertIn("max_points: 500000", config_text)
 
     def test_lidar_pointcloud_rejects_frames_without_valid_points(self):
         field = lambda name, offset: SimpleNamespace(name=name, offset=offset, datatype=7)

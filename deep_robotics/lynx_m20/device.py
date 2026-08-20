@@ -241,7 +241,7 @@ class M20Nodes:
                         }
                     return
                 frame_count = max(1, int(visualization.get("accumulate_frames", 5)))
-                max_points = max(min_points, int(visualization.get("max_points", 10000)))
+                max_points = max(min_points, int(visualization.get("max_points", 500000)))
                 publish_hz = max(0.1, float(visualization.get("publish_hz", 5.0)))
                 voxel_size = max(0.01, float(visualization.get("voxel_size", 0.08)))
                 now = time.monotonic()
