@@ -88,6 +88,18 @@ def evenly_sample_points(points, total, limit):
     return selected
 
 
+def lidar_point_limits(visualization, min_points):
+    """Resolve limits while migrating the legacy 50000-point configuration."""
+    configured_max = int(visualization.get("max_points", 500000))
+    legacy_migrated = configured_max == 50000 and "publish_max_points" not in visualization
+    max_points = max(min_points, 500000 if legacy_migrated else configured_max)
+    publish_max_points = max(
+        min_points,
+        min(max_points, int(visualization.get("publish_max_points", 80000))),
+    )
+    return max_points, publish_max_points, legacy_migrated
+
+
 def transform_point(point, pose):
     """Transform a base_link point into the fixed map frame."""
     x, y, z = point
@@ -255,10 +267,8 @@ class M20Nodes:
                         }
                     return
                 frame_count = max(1, int(visualization.get("accumulate_frames", 5)))
-                max_points = max(min_points, int(visualization.get("max_points", 500000)))
-                publish_max_points = max(
-                    min_points,
-                    min(max_points, int(visualization.get("publish_max_points", 80000))),
+                max_points, publish_max_points, legacy_migrated = lidar_point_limits(
+                    visualization, min_points,
                 )
                 publish_hz = max(0.1, float(visualization.get("publish_hz", 5.0)))
                 voxel_size = max(0.01, float(visualization.get("voxel_size", 0.08)))
@@ -306,6 +316,9 @@ class M20Nodes:
                     "frame_id": output_frame,
                     "point_count": accumulated_count,
                     "published_point_count": published_count,
+                    "accumulation_max_points": max_points,
+                    "publish_max_points": publish_max_points,
+                    "legacy_config_migrated": legacy_migrated,
                     "source_point_count": point_count,
                     "point_step": 12,
                     "timestamp": time.time(),

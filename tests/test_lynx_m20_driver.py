@@ -379,6 +379,18 @@ class LynxM20ContractTests(unittest.TestCase):
         sampled = m20.evenly_sample_points(iter(points), 20, 5)
         self.assertEqual([0, 4, 8, 12, 16], sampled)
 
+    def test_lidar_legacy_external_limit_is_migrated(self):
+        self.assertEqual(
+            (500000, 80000, True),
+            m20.lidar_point_limits({"max_points": 50000}, 32),
+        )
+        self.assertEqual(
+            (50000, 40000, False),
+            m20.lidar_point_limits(
+                {"max_points": 50000, "publish_max_points": 40000}, 32,
+            ),
+        )
+
     def test_lidar_pointcloud_rejects_frames_without_valid_points(self):
         field = lambda name, offset: SimpleNamespace(name=name, offset=offset, datatype=7)
         msg = SimpleNamespace(
