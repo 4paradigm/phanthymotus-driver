@@ -285,15 +285,24 @@ class M20Nodes:
                                 break
                             self._lidar_voxels[voxel] = mapped
                         accumulated_count = len(self._lidar_voxels)
-                        output_points = evenly_sample_points(
-                            self._lidar_voxels.values(), accumulated_count, publish_max_points,
-                        )
                         output_frame = str(pose.get("frame_id", "map"))
                     else:
                         payload, _ = encode_xyz_points(points)
                         frames = self._pointcloud_frames.setdefault(key, [])
                         frames.append(payload[8:])
                         del frames[:-frame_count]
+                        accumulated_count = min(
+                            max_points, sum(len(frame) // 12 for frame in frames),
+                        )
+                        output_frame = str(getattr(getattr(msg, "header", None), "frame_id", ""))
+                    if now - self._pointcloud_last_publish.get(key, float("-inf")) < 1.0 / publish_hz:
+                        return
+                    self._pointcloud_last_publish[key] = now
+                    if pose is not None:
+                        output_points = evenly_sample_points(
+                            self._lidar_voxels.values(), accumulated_count, publish_max_points,
+                        )
+                    else:
                         merged = b"".join(frames)
                         if len(merged) // 12 > max_points:
                             merged = merged[-max_points * 12:]
@@ -301,11 +310,6 @@ class M20Nodes:
                             (-x, y, -z)
                             for x, y, z in struct.iter_unpack("<fff", merged)
                         ]
-                        accumulated_count = len(output_points)
-                        output_frame = str(getattr(getattr(msg, "header", None), "frame_id", ""))
-                    if now - self._pointcloud_last_publish.get(key, float("-inf")) < 1.0 / publish_hz:
-                        return
-                    self._pointcloud_last_publish[key] = now
                 payload, published_count = encode_xyz_points(output_points)
                 output = pointcloud_type()
                 output.data = array("B", payload)

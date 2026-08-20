@@ -327,6 +327,17 @@ class LynxM20ContractTests(unittest.TestCase):
         payload = bytes(publisher.messages[-1].data)
         self.assertEqual((12, 1), struct.unpack_from("<II", payload))
         self.assertEqual((-11.0, 22.0, -3.0), struct.unpack_from("<fff", payload, 8))
+
+        published = len(publisher.messages)
+        original_sampler = m20.evenly_sample_points
+        try:
+            m20.evenly_sample_points = lambda *args: self.fail(
+                "throttled lidar callback must not sample the accumulated map"
+            )
+            callback(msg)
+        finally:
+            m20.evenly_sample_points = original_sampler
+        self.assertEqual(published, len(publisher.messages))
         self.assertEqual("map", nodes.values["lidar"]["frame_id"])
 
         nodes.config["lidar_visualization"]["max_points"] = 1
