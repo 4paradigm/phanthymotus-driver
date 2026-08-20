@@ -32,4 +32,4 @@ topics:
   gps: "/GPS"
   joints: "/JOINTS_DATA"
   odometry: "/ODOM"
-  slam_odometry: "/SLAM_ODOM"
+  slam_odometry: "/LIO_ODOM"

@@ -335,6 +335,13 @@ class LynxM20ContractTests(unittest.TestCase):
         self.assertAlmostEqual(21.0, transformed[1], places=6)
         self.assertAlmostEqual(0.0, transformed[2], places=6)
 
+    def test_default_lidar_odometry_source_is_continuous_lio_odom(self):
+        config_path = Path(m20.__file__).with_name("config.yaml")
+        self.assertIn(
+            'slam_odometry: "/LIO_ODOM"',
+            config_path.read_text(encoding="utf-8"),
+        )
+
     def test_lidar_pointcloud_rejects_frames_without_valid_points(self):
         field = lambda name, offset: SimpleNamespace(name=name, offset=offset, datatype=7)
         msg = SimpleNamespace(

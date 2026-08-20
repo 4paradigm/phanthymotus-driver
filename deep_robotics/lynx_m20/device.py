@@ -179,7 +179,7 @@ class M20Nodes:
         if self.is_pro:
             self.robot.create_subscription(
                 Odometry,
-                topics.get("slam_odometry", "/SLAM_ODOM"),
+                topics.get("slam_odometry", "/LIO_ODOM"),
                 self._lidar_odometry_callback,
                 10,
             )
