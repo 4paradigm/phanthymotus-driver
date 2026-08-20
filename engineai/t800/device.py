@@ -3616,10 +3616,6 @@ class SpeakerPlugin:
             self._check_pulse()
             self._run_command(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "0"])
             self._process = self._spawn_player()
-            # 开机音在同一 aplay 播放进程上写入，播完后再启动播放线程。
-            # 不分出独立 aplay 进程避免 PulseAudio sink 独占/竞争导致
-            # 正式流式播放的 aplay 连接失败。
-            self._play_startup_sound(self._process)
             self._input_topic = topic
             self._subscription = self._node.create_subscription(
                 AudioChunk, topic, lambda msg: self._on_chunk(msg, session), _AUDIO_QOS
@@ -3640,14 +3636,17 @@ class SpeakerPlugin:
             target=self._play_loop, args=(session,), daemon=True, name="t800-speaker"
         )
         self._thread.start()
+        # 开机音在订阅和播放线程就绪后异步入队——不阻塞 dispatch(start)，
+        # 且期间传入的音频块排在开机音之后播放，不丢数据。
+        self._enqueue_startup_sound()
         return {"state": "ready", "topic_in": [{"topic": topic, "format": "audio/pcm-16k"}]}
 
-    def _play_startup_sound(self, player) -> None:
-        """播放开机音效到指定 aplay 进程，不在回放期间跑以免与播放线程竞态。
+    def _enqueue_startup_sound(self) -> None:
+        """把 startup_beep.pcm 分块异步推入播放队列。
 
-        开机音复用 G1 的 startup_beep.pcm（PCM-16 16kHz 单声道），
-        写入调用方准备好的 aplay stdin，播完后不关闭程序（调用方
-        负责继续用同一进程流式播放）。
+        不直接写 aplay stdin（会因管道/ALSA 缓冲回压阻塞调用线程），
+        也不 spawn 独立 aplay 进程（会与主播放进程竞争 PulseAudio sink）。
+        分块入队后由 _play_loop 统一消费，开机音播完自然过渡到实时音频流。
         """
         import pathlib
 
@@ -3656,13 +3655,22 @@ class SpeakerPlugin:
             pcm = pcm_path.read_bytes()
         except (OSError, IOError):
             return
-        if not pcm or player is None or player.poll() is not None or player.stdin is None:
+        if not pcm:
             return
-        try:
-            player.stdin.write(pcm)
-            player.stdin.flush()
-        except (BrokenPipeError, OSError):
-            pass
+        chunk_size = 1024  # PCM-16k 下每块 32ms
+        for offset in range(0, len(pcm), chunk_size):
+            block = pcm[offset:offset + chunk_size]
+            try:
+                self._queue.put_nowait(block)
+            except queue.Full:
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self._queue.put_nowait(block)
+                except queue.Full:
+                    break
 
     def _on_chunk(self, msg, session: int | None = None) -> None:
         # 丢弃不属于当前会话的回调:stop() 后残留的 ROS 回调若在新会话
