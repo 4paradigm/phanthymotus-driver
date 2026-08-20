@@ -76,12 +76,15 @@ class NOSMappingClient:
 
     def start_mapping(self, map_name, *, activate=True):
         name = self.validate_map_name(map_name)
-        remote = f"sudo -n /usr/local/sbin/phanthy-m20-mapping start {name} {'true' if activate else 'false'}"
+        remote = f"TERM=xterm sudo -n /usr/local/sbin/phanthy-m20-mapping start {name} {'true' if activate else 'false'}"
         output, _ = self._ssh(remote, timeout=max(self.timeout, 30))
         return {"state": "mapping", "map_name": name, "activate_on_stop": bool(activate), "output": output[-1000:]}
 
     def stop_mapping(self):
-        output, _ = self._ssh("sudo -n /usr/local/sbin/phanthy-m20-mapping stop", timeout=max(self.timeout, 60))
+        output, _ = self._ssh(
+            "TERM=xterm sudo -n /usr/local/sbin/phanthy-m20-mapping stop",
+            timeout=max(self.timeout, 60),
+        )
         return {"state": "saved", "output": output[-1000:]}
 
     def status(self):

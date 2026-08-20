@@ -85,7 +85,17 @@ sudo chmod 0440 /etc/sudoers.d/phanthy-m20-mapping
 sudo visudo -cf /etc/sudoers.d/phanthy-m20-mapping
 ```
 
-部署 Driver 时还必须以只读方式挂载专用私钥和预先人工核验的 `known_hosts` 文件。助手会再次校验动作、参数数量和地图名。不要给 SSH 用户放行 `drmap`、shell 或其他任意 sudo 命令。
+该 SSH 控制方式定位为单台真机预配置测试：每台机器都必须在 103 单独生成专用私钥，并在对应 106 的 `authorized_keys` 中安装公钥。私钥不得提交到 Git 或复制进 Driver 镜像。部署 Driver 时必须以只读方式挂载专用私钥和预先人工核验的 `known_hosts` 文件，例如 Compose 覆盖项：
+
+```yaml
+services:
+  m20-driver:
+    volumes:
+      - /home/user/.ssh/m20_mapping_ed25519:/run/secrets/m20_nos_ssh_key:ro
+      - /home/user/.ssh/m20_nos_known_hosts:/run/secrets/m20_nos_known_hosts:ro
+```
+
+助手会再次校验动作、参数数量和地图名，并为非交互 SSH 设置 `TERM=xterm`，避免 `drmap` 输出无终端警告。不要给 SSH 用户放行 `drmap`、shell 或其他任意 sudo 命令。测试结束后，应从 106 的 `authorized_keys` 删除该专用公钥并删除 103 上的测试私钥。
 
 `mapping_view` 不依赖 SSH 开关；Pro 型号会始终注册该只读 Sensor。实时点云按 `voxel_size` 去重、受 `max_buffer_points` 约束，并按 `publish_hz` 和 `max_points` 限制 Canvas 负载。数据包元数据和 `mapping_view.info` 会公布 `state`、`requested_map`、`active_map`、数据源、坐标系、更新时间、更新次数及点数。最终二维地图只发布占据值大于等于 `occupied_threshold` 的栅格中心点。
 

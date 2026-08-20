@@ -347,7 +347,7 @@ class LynxM20ContractTests(unittest.TestCase):
         self.assertIn("StrictHostKeyChecking=yes", command)
         self.assertIn("UserKnownHostsFile=/secrets/known_hosts", command)
         self.assertEqual(
-            "sudo -n /usr/local/sbin/phanthy-m20-mapping start floor-1 false",
+            "TERM=xterm sudo -n /usr/local/sbin/phanthy-m20-mapping start floor-1 false",
             command[-1],
         )
         self.assertFalse(calls[0][1]["check"])
@@ -357,7 +357,7 @@ class LynxM20ContractTests(unittest.TestCase):
 
         client.stop_mapping()
         self.assertEqual(
-            "sudo -n /usr/local/sbin/phanthy-m20-mapping stop",
+            "TERM=xterm sudo -n /usr/local/sbin/phanthy-m20-mapping stop",
             calls[-1][0][-1],
         )
 
