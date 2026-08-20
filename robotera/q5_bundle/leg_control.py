@@ -23,27 +23,23 @@ TYPE = "actuator"
 TOPIC = "/wr1_controller/commands"
 
 # Wheel-legged joints present in the bundled URDF (resource/q5_model.urdf).
-LEG_JOINTS = ("hip_joint", "knee_joint", "ankle_joint",
-              "left_drv_hang_joint", "right_drv_hang_joint")
+# Note: the drv_hang (wheel arm) joints exist in the URDF but are NOT published
+# on /joint_states by the vendor motion controller (verified on robot 2026-08-20),
+# so they are excluded: without feedback the incremental interp/hold safety
+# model cannot run.
+LEG_JOINTS = ("hip_joint", "knee_joint", "ankle_joint")
 
 # Safe semantic presets (rad).  Values stay inside the URDF limits; presets
 # are deliberately conservative for the wheel-legged balance model.
 LEG_PRESETS = {
-    "stand": {
-        "hip_joint": 0.0, "knee_joint": 0.0, "ankle_joint": 0.0,
-        "left_drv_hang_joint": 0.0, "right_drv_hang_joint": 0.0,
-    },
+    "stand": {"hip_joint": 0.0, "knee_joint": 0.0, "ankle_joint": 0.0},
     "knee_bend": {"knee_joint": -0.30},
-    "hang_up": {"left_drv_hang_joint": 0.30, "right_drv_hang_joint": 0.30},
-    "hang_down": {"left_drv_hang_joint": -0.30, "right_drv_hang_joint": -0.30},
 }
 PRESET_LABELS = {
-    "stand": "站立位（各关节回 URDF 零位）",
+    "stand": "站立位（髋/膝/踝回 URDF 零位）",
     "knee_bend": "微蹲（膝微屈 -0.30 rad）",
-    "hang_up": "轮腿摆臂抬升（+0.30 rad）",
-    "hang_down": "轮腿摆臂下降（-0.30 rad）",
 }
-DESC = "Q5 腿部控制：髋/膝/踝 + 轮腿摆臂关节（预设姿态 + 白名单关节自由控制）"
+DESC = "Q5 腿部控制：髋/膝/踝关节（预设姿态 + 白名单关节自由控制；轮腿摆臂 vendor 未开放）"
 
 
 def _failure(code, message, **details):
