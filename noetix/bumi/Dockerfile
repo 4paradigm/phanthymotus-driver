@@ -5,8 +5,6 @@ ARG PYPI_MIRROR
 
 WORKDIR /work
 
-RUN sed -i "s#mirrors.tencentyun.com/ubuntu-ports#ports.ubuntu.com/ubuntu-ports#g" /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null || true
-
 RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
         python3-pip \
@@ -66,6 +64,7 @@ ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ENV FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
 
 COPY resource/ /work/resource/
+COPY common/ /work/common/
 COPY main.py   /work/main.py
 COPY device.py /work/device.py
 COPY config.yaml /work/config.yaml
