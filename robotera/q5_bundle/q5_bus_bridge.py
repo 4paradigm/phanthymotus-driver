@@ -24,7 +24,9 @@ from typing import Any, Callable
 
 
 DEFAULT_DRIVER_URL = "http://127.0.0.1:15793/mcp"
-DEFAULT_POLL_HZ = 2.0
+# Skeleton motion should feel live in the dashboard. The Q5 driver publishes
+# at 10Hz, so keep the cross-domain polling rate at the same cadence.
+DEFAULT_POLL_HZ = 10.0
 DEFAULT_REFRESH_SECONDS = 30.0
 DEFAULT_TIMEOUT_SECONDS = 2.0
 DEFAULT_FASTDDS_PROFILE = Path(__file__).with_name("resource") / "fastdds_udp_only.xml"
@@ -74,7 +76,7 @@ def select_sensor_tools(tools: Any) -> dict[str, list[str]]:
             # Live media has a dedicated typed bridge. Publishing it here as
             # std_msgs/String would claim the same DDS topic with a different
             # type and prevent Agent Core from receiving AudioChunk/Image.
-            if (isinstance(topic, str) and topic and fmt == "data/json"
+            if (isinstance(topic, str) and topic and fmt in {"data/json", "sensor/skeleton"}
                     and topic not in topics):
                 topics.append(topic)
         if topics:

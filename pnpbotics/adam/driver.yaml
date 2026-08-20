@@ -7,3 +7,5 @@ image_name: pnpbotics-adam
 port: 15702
 mcp_url: "http://localhost:15702/mcp"
 description: "PNPbotics Adam — 状态感知 + 步行运动 + 手臂控制 + 灵巧手 + 3D模型"
+build_context_extras:
+  - ../../common
