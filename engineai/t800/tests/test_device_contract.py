@@ -1058,7 +1058,7 @@ class DevicePluginContractTests(unittest.TestCase):
         plugin._check_pulse = lambda: None
         plugin._run_command = lambda command: commands.append(command) or ""
         plugin._spawn_player = lambda: process
-        plugin._play_startup_sound = lambda _: None  # 跳过开机音
+        plugin._enqueue_startup_sound = lambda: None  # 跳过开机音
         started = plugin.dispatch("start", {"input_topic": "/perception/tts"})
         self.assertEqual("ready", started["state"])
         self.assertEqual("/perception/tts", started["topic_in"][0]["topic"])
@@ -1199,7 +1199,7 @@ class DevicePluginContractTests(unittest.TestCase):
         plugin._check_pulse = lambda: None
         plugin._run_command = lambda command: ""
         plugin._spawn_player = lambda: DeadProcess()
-        plugin._play_startup_sound = lambda _: None  # 跳过开机音
+        plugin._enqueue_startup_sound = lambda: None  # 跳过开机音
         started = plugin.dispatch("start", {"input_topic": "/perception/tts"})
         self.assertEqual("error", started["state"])
         self.assertIn("aplay exited", started["message"])
@@ -1239,18 +1239,19 @@ class DevicePluginContractTests(unittest.TestCase):
         plugin._check_pulse = lambda: None
         plugin._run_command = lambda command: ""
         plugin._spawn_player = lambda: process
-        # _play_startup_sound 接收 player 参数，直接调用真实现写入
-        # 测试用的 startup_beep.pcm 不存在时会静默跳过，所以手动模拟写 PCM
-        startup_written = []
-        def fake_startup(player):
-            player.stdin.write(b"\x01\x02\x03")
-            player.stdin.flush()
-            startup_written.append(True)
-        plugin._play_startup_sound = fake_startup
+        # _enqueue_startup_sound 分块推入队列，测试用假 PCM 模拟
+        real_startup = plugin._enqueue_startup_sound
+        startup_queued = []
+        def fake_enqueue():
+            for _ in range(3):
+                plugin._queue.put_nowait(b"\x01\x02\x03")
+            startup_queued.append(True)
+        plugin._enqueue_startup_sound = fake_enqueue
         started = plugin.dispatch("start", {"input_topic": "/perception/tts"})
         self.assertEqual("ready", started["state"])
-        self.assertTrue(startup_written)
-        # 开机音 PCM 写入后播放线程在同一 aplay 进程上继续流式播放
+        self.assertTrue(startup_queued)
+        self.assertEqual(3, plugin._queue.qsize())
+        # dispatch(start) 先返回再异步入队，播放线程已就绪
 
     def test_native_node_control_and_composed_safety(self):
         native = self.device.NativeNodeControlPlugin(CONFIG, "robot", self.ros)
