@@ -170,6 +170,11 @@ class T800DeviceBundle:
                 instances[key] = instance
                 self._plugins.append(instance)
 
+        for key in ("mic", "vision"):
+            provider = instances.get(key)
+            if provider is not None and hasattr(provider, "health_sources"):
+                state.register_health_provider(key, provider.health_sources)
+
         if plugins.get("dance", {}).get("enabled", True) and "motion_mode" in instances:
             instance = DancePlugin(instances["motion_mode"], state)
             instances["dance"] = instance
