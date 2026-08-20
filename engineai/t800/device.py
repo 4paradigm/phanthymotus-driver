@@ -3486,7 +3486,7 @@ class SpeakerPlugin:
     播放。
     """
 
-    _PREFIX = "speaker"
+    PREFIX = "speaker"
     _EOF_MAGIC = b"\x01\x00\xff\xff\x01\x00\xff\xff"  # G1 契约：utterance 结束标记
 
     def __init__(self, config: dict, namespace: str, ros2):
@@ -3501,14 +3501,16 @@ class SpeakerPlugin:
         # remote_mic 等持续流若发布速率高于播放速率，满时丢最旧块而非新块，
         # 保证播放的是最新内容而非永远滞后的积压数据。
         self._queue = queue.Queue(maxsize=50)
+        self._beep_queue = queue.Queue(maxsize=256)  # 开机音独立队列，与 live _queue 隔离
         self._thread = None
         self._running = False
         self._session = 0
         self._chunks_played = 0
         self._dropped = 0
         self._last_chunk_time = 0.0
-        # 开机音仍在入队/播放中时，首个 live chunk 到达即清空队列中剩余
-        # 开机音块——避免 8 秒 beep 排在实时流前面造成延迟。
+        # 开机音通过独立 _beep_queue 入队，_drain_beep() 只清空 _beep_queue，
+        # 不碰 _queue——与 _on_chunk 的 put_nowait(_queue) 无竞争，不会误丢 live PCM。
+        # _play_loop 优先消费 _beep_queue（非阻塞），空时回退到 _queue。
         self._startup_beep_active = False
         self._live_audio_started = False
 
@@ -3563,6 +3565,11 @@ class SpeakerPlugin:
         while not self._queue.empty():
             try:
                 self._queue.get_nowait()
+            except queue.Empty:
+                break
+        while not self._beep_queue.empty():
+            try:
+                self._beep_queue.get_nowait()
             except queue.Empty:
                 break
         process = self._process
@@ -3650,13 +3657,12 @@ class SpeakerPlugin:
         return {"state": "ready", "topic_in": [{"topic": topic, "format": "audio/pcm-16k"}]}
 
     def _enqueue_startup_sound(self) -> None:
-        """把 startup_beep.pcm 分块异步推入播放队列。
+        """把 startup_beep.pcm 分块异步推入 _beep_queue。
 
-        不直接写 aplay stdin（会因管道/ALSA 缓冲回压阻塞调用线程），
-        也不 spawn 独立 aplay 进程（会与主播放进程竞争 PulseAudio sink）。
-        分块在后台 daemon 线程中用阻塞式 put(timeout) 写入队列，
-        由 _play_loop 统一消费——不丢任何块，不阻塞 dispatch(start)。
-        首个 live chunk 到达或 stop() 时后台线程自行退出。
+        使用独立 _beep_queue 与实时音频 _queue 隔离，防止
+        drain/drop 误操作实时 PCM。_play_loop 优先消费 _beep_queue，
+        空时回退到 _queue。首个 live chunk 到达时 _startup_beep_active
+        设为 False，_drain_beep() 只清空 _beep_queue。
         """
         import pathlib
 
@@ -3676,11 +3682,11 @@ class SpeakerPlugin:
         ).start()
 
     def _enqueue_beep_blocks(self, pcm: bytes) -> None:
-        """后台线程：分块阻塞入队开机音，不丢数据。
+        """后台线程：分块阻塞入队开机音到 _beep_queue。
 
-        用阻塞式 put(timeout) 代替 put_nowait+drop-oldest，
-        队列满时等待播放线程消费，自然节流到实时播放速度。
-        当 stop() 或首个 live chunk 到达时，检查标志退出。
+        用独立 _beep_queue（maxsize=256=整块开机音），队列容量
+        足以容纳整段开机音，不会因满而丢块。当 stop() 或首个
+        live chunk 到达时检查标志退出。
         """
         session = self._session
         chunk_size = 1024
@@ -3688,19 +3694,19 @@ class SpeakerPlugin:
             if self._session != session:
                 return  # 新会话已开始，旧开机音线程退出
             if not self._startup_beep_active:
-                return  # live chunk 已到达，drain_beep 处理剩余队列块
+                return  # live chunk 已到达
             block = pcm[offset:offset + chunk_size]
-            try:
-                self._queue.put(block, timeout=1.0)
-            except queue.Full:
-                return  # 队列满超时——播放滞后，丢弃剩余开机音
+            self._beep_queue.put(block)  # 队列容量充足，阻塞等待消耗
 
     def _drain_beep(self) -> None:
-        """清空队列中剩余的开机音块——首个 live chunk 到达时调用。"""
+        """清空 _beep_queue 中剩余的开机音块——首个 live chunk 到达时调用。
+
+        只清空独立开机音 _beep_queue，不影响 _queue 中的 live PCM。
+        """
         drained = 0
-        while drained < 60:  # 安全上限，防止无限循环
+        while drained < 256:  # 安全上限（_beep_queue maxsize）
             try:
-                self._queue.get_nowait()
+                self._beep_queue.get_nowait()
                 drained += 1
             except queue.Empty:
                 break
@@ -3748,14 +3754,19 @@ class SpeakerPlugin:
         # 每个线程独占持有自己的 process 引用，防止旧线程在 stop/start
         # 之后写入新会话的 aplay stdin。
         while self._running and self._session == session:
+            # 优先消费 _beep_queue（开机音），非阻塞检查后回退到实时 _queue。
+            # 两个队列由独立的生产者写入，不存在跨源竞争。
             try:
-                pcm = self._queue.get(timeout=0.1)
+                pcm = self._beep_queue.get_nowait()
             except queue.Empty:
-                if self._session != session:
-                    return
-                if self._state == "playing" and time.monotonic() - self._last_chunk_time >= 0.3:
-                    self._state = "ready"
-                continue
+                try:
+                    pcm = self._queue.get(timeout=0.1)
+                except queue.Empty:
+                    if self._session != session:
+                        return
+                    if self._state == "playing" and time.monotonic() - self._last_chunk_time >= 0.3:
+                        self._state = "ready"
+                    continue
             # 队列 get() 与写入之间必须重新检查 session：
             # stop() 仅 join 旧线程 1 秒，阻塞在 get() 上的旧线程醒来后
             # 若不重检 session，会把旧队列残留 PCM 写到新会话的 aplay stdin。
