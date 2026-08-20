@@ -50,23 +50,23 @@ ARM_JOINTS_RIGHT = (
 )
 ARM_JOINT_NAMES = ARM_JOINTS_LEFT + ARM_JOINTS_RIGHT
 
-# Mirrored index: shoulder_roll(1), arm_yaw(2), elbow_yaw(4) flip sign
-_MIRROR_MASK = [1, 2, 4]
+# Mirrored index: shoulder_roll(1), arm_yaw(2), elbow_yaw(4), wrist_roll(6) flip sign
+_MIRROR_MASK = [1, 2, 4, 6]
 
 # ── Gesture definitions (degrees) ────────────────────────────────────────────
 
 _GESTURES_DEG = {
-    "salute":          [-10, 90, 60, -110, 50, 0, 0],
-    "welcome":         [-10, 65, 75, -100, 0, 0, 0],
-    "raise":           [0, 103, 0, -15, 0, 0, 0],
+    "salute":          [10, 90, 60, -110, 50, 0, 0],
+    "welcome":         [10, 65, 75, -100, 0, 0, 0],
+    "raise":           [-10, 95, 0, -15, 0, 0, 0],
     "shake_hands":     [-55, 15, 5, -35, 0, 0, 0],
     "high_five":       [-40, 40, -20, -80, 0, 0, 50],
 }
 
 _PREPARE_DEG = {
-    "salute":          [-10, 40, 35, -45, 25, 0, 0],
-    "welcome":         [-10, 45, 45, -60, 0, 0, 0],
-    "raise":           [0, 75, 0, -30, 0, 0, 0],
+    "salute":          [10, 40, 35, -45, 25, 0, 0],
+    "welcome":         [10, 45, 45, -60, 0, 0, 0],
+    "raise":           [-10, 70, 0, -30, 0, 0, 0],
     "shake_hands":     [-30, 10, 0, -20, 0, 0, 0],
     "high_five":       [-25, 25, -10, -45, 0, 0, 10],
 }
@@ -77,6 +77,10 @@ _GESTURE_LABELS = {
     "salute": "敬礼", "welcome": "欢迎", "raise": "举手",
     "shake_hands": "握手", "high_five": "击掌",
 }
+
+# Neutral pose: shoulder_pitch -30° (~-0.52 rad) so arms rest naturally in
+# front of body. Positive shoulder_pitch rotates arms backward on Q5.
+_NEUTRAL_DEG = [-30, 0, 0, 0, 0, 0, 0]
 
 
 def _deg2rad(deg: float) -> float:
@@ -152,31 +156,44 @@ def _acp_notify(action_id: str, status: str, result: dict, tool: str = ""):
 # ── Frame builder ────────────────────────────────────────────────────────────
 
 def _build_frames(gesture: str, cycles: int) -> list:
-    """Return a list of (pose_deg, hold_seconds, transition_ratio) tuples."""
+    """Return a list of (pose_deg, hold_seconds, transition_ratio) tuples.
+
+    transition_ratio scales the interpolation time for each frame:
+      < 1.0 → faster transition, creates natural blend with next frame
+      == 1.0 → full-speed transition with explicit hold
+    This mirrors tianyi's _PREPARE_POSES + frame-blending approach.
+    """
     frames: list[tuple[list[float], float, float]] = []
 
     prepare = _PREPARE_DEG.get(gesture, _GESTURES_DEG[gesture])
     target = _GESTURES_DEG[gesture]
 
-    frames.append((prepare, 0.25, 0.90))
+    # Prepare frame: move quickly through prepare pose (ratio < 1 blends into next)
+    frames.append((prepare, 0.0, 0.55))
 
     if gesture == "salute":
-        frames.append((target, 1.1, 1.0))
+        frames.append((target, 0.4, 0.85))
     else:
-        frames.append((target, 0.8, 0.90))
+        frames.append((target, 0.3, 0.80))
 
     if gesture == "shake_hands":
         for i in range(cycles * 2):
             pose = list(target)
             pose[3] = -28 if i % 2 == 0 else -42
-            frames.append((pose, 0.30, 0.85))
+            frames.append((pose, 0.0, 0.65))
     elif gesture == "welcome":
         for i in range(cycles * 2):
             pose = list(target)
             pose[3] = -110 if i % 2 == 0 else -90
-            frames.append((pose, 0.35, 0.85))
+            frames.append((pose, 0.0, 0.65))
+    elif gesture == "wave":
+        for i in range(cycles * 2):
+            pose = list(target)
+            pose[5] = 35 if i % 2 == 0 else 5
+            frames.append((pose, 0.0, 0.65))
 
-    frames.append(([0.0] * 7, 1.0, 1.0))
+    # Return to neutral: full-speed transition with hold
+    frames.append((_NEUTRAL_DEG, 1.0, 1.0))
     return frames
 
 
@@ -211,7 +228,7 @@ class Plugin:
         if ArmControlPlugin is not None:
             ctrl_cfg = dict(plugin_config)
             ctrl_cfg.setdefault("max_step_rad", 0.010)
-            ctrl_cfg.setdefault("publish_rate_hz", 20.0)
+            ctrl_cfg.setdefault("publish_rate_hz", 3.33)
             ctrl_cfg.setdefault("hold_repetitions", 3)
             try:
                 self._arm_control = ArmControlPlugin(ctrl_cfg, namespace, executor, client)
@@ -223,7 +240,7 @@ class Plugin:
 
         # Motion parameters.
         self._max_step = float(plugin_config.get("max_step_rad", 0.010))
-        self._publish_rate = float(plugin_config.get("publish_rate_hz", 20.0))
+        self._publish_rate = float(plugin_config.get("publish_rate_hz", 3.33))
         self._hold_repetitions = int(plugin_config.get("hold_repetitions", 3))
         self._settle_tolerance = float(plugin_config.get("settle_tolerance_rad", 0.02))
 
@@ -237,13 +254,14 @@ class Plugin:
 
     def get_tool(self) -> dict:
         actions = ["salute", "welcome", "raise", "shake_hands", "high_five", "reset",
-                    "cancel", "stop", "start", "info"]
+                   "cancel", "stop", "start", "prepare", "info"]
         one_of_actions = [
             {"const": "start", "title": "检查连接状态"},
             *[{"const": name, "title": label} for name, label in _GESTURE_LABELS.items()],
             {"const": "reset", "title": "归零"},
             {"const": "cancel", "title": "取消并保持"},
             {"const": "stop", "title": "停止并归零"},
+            {"const": "prepare", "title": "准备位置直控"},
             {"const": "info", "title": "查看状态"},
         ]
         return {
@@ -281,8 +299,8 @@ class Plugin:
                     },
                     "speed": {
                         "type": "number", "title": "关节速度(rad/s)",
-                        "minimum": 0.2, "maximum": 1.5, "default": 0.5,
-                        "description": "关节插补速度，范围[0.2,1.5]，默认0.5。",
+                        "minimum": 0.2, "maximum": 1.5, "default": 0.8,
+                        "description": "关节插补速度，范围[0.2,1.5]，默认0.8。",
                     },
                 },
                 "required": ["action"],
@@ -296,11 +314,12 @@ class Plugin:
                     "reset": {"params": ["speed"], "description": "取消序列并回到中性姿态"},
                     "cancel": {"params": [], "description": "取消尚未发送的后续动作帧，并保持当前位置"},
                     "stop": {"params": [], "description": "停止当前手势并回到中性姿态（归零）"},
+                    "prepare": {"params": [], "description": "执行位置直控准备：pos→READY→垂手→抬臂→ACTIVE，解锁 arm_control"},
                     "start": {"params": [], "description": "检查 ROS 连接和机器人状态"},
                     "info": {"params": [], "description": "查看当前运动和安全条件"},
                 },
                 "x-completion": {
-                    "actions": ["salute", "welcome", "raise", "shake_hands", "high_five"],
+                    "actions": ["salute", "welcome", "raise", "shake_hands", "high_five", "reset"],
                     "timeout": 60,
                 },
             },
@@ -319,6 +338,16 @@ class Plugin:
             self._arm_control.stop()
         return {"state": "idle"}
 
+    def prepare(self) -> dict:
+        """Delegate to arm_control's position-control preparation."""
+        if self._arm_control is None:
+            return _failure("CONTROL_MODE_UNAVAILABLE",
+                            "arm_control helper is not initialized")
+        result = self._arm_control._ensure_prepared()
+        if result is None:
+            return {"ok": True, "state": "active", "position_control_prepared": True}
+        return result
+
     # ── Safety ────────────────────────────────────────────────────────────
 
     def _safety(self) -> dict:
@@ -330,6 +359,7 @@ class Plugin:
             "lifecycle_state": self._client.get_lifecycle_state(),
             "joint_state_fresh": bool(self._client.snapshot().get("fresh", False)),
             "q5_fsm": q5_active_status(self._client),
+            "position_control_prepared": bool(getattr(self._client, "q5_position_control_prepared", False)),
             "limits": {"max_step_rad": self._max_step,
                         "publish_rate_hz": self._publish_rate,
                         "hold_repetitions": self._hold_repetitions},
@@ -361,8 +391,7 @@ class Plugin:
             return _failure("Q5_FSM_NOT_READY", "Q5 /xbot_state must be fresh and READY or ACTIVE",
                             status={**status, "q5_fsm": q5_fsm})
 
-        # Share arm_control's private preparation path; preparation is no
-        # longer exposed as a separate card.
+        # Auto-prepare: delegate to arm_control's preparation path.
         if self._arm_control is not None:
             prepare_error = self._arm_control._ensure_prepared()
             if prepare_error:
@@ -407,10 +436,22 @@ class Plugin:
 
     def _run_move(self, stop_event: threading.Event, frames, speed: float, side: str,
                   gesture: str, action_id: str | None):
-        """Interpolate through gesture frames, honoring stop_event and commanded side."""
+        """Interpolate through gesture frames, honoring stop_event and commanded side.
+
+        transition_ratio scales the interpolation time per frame:
+          ratio < 1.0 → shorter transition, blends naturally into next frame
+          ratio == 1.0 → full-speed transition with explicit hold
+        """
         cancelled = True  # default: cancelled on any error/exception
+        acquired = False
         try:
             previous_positions = dict(self._hold_current())  # start from current pose
+
+            # Acquire the router once for the entire gesture so no other body
+            # card can interleave commands between frames.
+            acquired = self._router.acquire(CARD)
+            if not acquired:
+                return
 
             for frame_deg, hold_s, transition_ratio in frames:
                 if stop_event.is_set():
@@ -433,8 +474,9 @@ class Plugin:
                         delta = abs(positions[name] - previous_positions[name])
                         max_delta_rad = max(max_delta_rad, delta)
 
-                transition_s = max_delta_rad / speed if speed > 0 else 0.5
-                delay = max(0.12, transition_s * transition_ratio) + hold_s
+                # transition_ratio scales the interpolation time for natural blending
+                transition_s = (max_delta_rad / speed if speed > 0 else 0.5) * transition_ratio
+                transition_s = max(0.05, transition_s)  # minimum transition time
 
                 # Interpolate
                 steps = max(
@@ -443,40 +485,39 @@ class Plugin:
                     1,
                 )
 
-                acquired = self._router.acquire(CARD)
-                if not acquired:
-                    break
-
-                try:
-                    for step in range(1, steps + 1):
-                        if stop_event.is_set():
-                            break
-                        t = step / steps
-                        for name in ARM_JOINT_NAMES:
-                            if name in positions and name in previous_positions:
-                                prev = previous_positions[name]
-                                tgt = positions[name]
-                                interp = prev + (tgt - prev) * t
-                                self._publish_positions({name: interp})
-                        stop_event.wait(transition_s / steps)
-                finally:
+                for step in range(1, steps + 1):
                     if stop_event.is_set():
-                        self._hold_current()
-                    else:
-                        self._hold_positions(positions)
-                    self._router.release(CARD)
+                        break
+                    t = step / steps
+                    interp_positions = {}
+                    for name in ARM_JOINT_NAMES:
+                        if name in positions and name in previous_positions:
+                            prev = previous_positions[name]
+                            tgt = positions[name]
+                            interp_positions[name] = prev + (tgt - prev) * t
+                    if interp_positions:
+                        self._publish_positions(interp_positions)
+                    stop_event.wait(transition_s / steps)
+
+                if stop_event.is_set():
+                    self._hold_current()
+                else:
+                    self._hold_positions(positions)
 
                 previous_positions = {
                     name: positions[name] for name in ARM_JOINT_NAMES
                     if name in positions
                 }
 
-                if not stop_event.wait(delay):
-                    pass  # normal hold completed
+                # Hold for the specified duration
+                if hold_s > 0 and not stop_event.is_set():
+                    stop_event.wait(hold_s)
             cancelled = False  # all frames completed successfully
         except Exception:
             pass
         finally:
+            if acquired:
+                self._router.release(CARD)
             # ACP completion callback
             if action_id:
                 if cancelled and not stop_event.is_set():
@@ -515,15 +556,18 @@ class Plugin:
     # ── Dispatch ──────────────────────────────────────────────────────────
 
     def dispatch(self, action: str, args: dict) -> dict:
-        if action in ("start", "info"):
-            if self._arm_control is not None:
-                return self._arm_control.dispatch(action, args)
+        if action == "info":
             result = {"state": "ready" if self._router is not None else "unavailable",
                       "safety": self._safety()}
-            if action == "info":
-                with self._lock:
-                    result["status"] = dict(self._status)
+            with self._lock:
+                result["status"] = dict(self._status)
             return result
+
+        if action == "start":
+            if self._arm_control is not None:
+                return self._arm_control.dispatch(action, args)
+            return {"state": "ready" if self._router is not None else "unavailable",
+                    "safety": self._safety()}
 
         if action == "cancel":
             return self._stop("command")
@@ -531,37 +575,42 @@ class Plugin:
         if action == "stop":
             return self.stop()
 
+        if action == "prepare":
+            return self.prepare()
+
         if action == "reset":
-            speed = _clamp(args.get("speed", 0.5), 0.2, 1.5)
-            # reset bypasses gesture validation; check side/robot safety instead
-            side = "right"
+            speed = _clamp(args.get("speed", 0.8), 0.2, 1.5)
+            side = "both"
             check = self._validate_run("", side)
             if isinstance(check, dict):
                 return check
-            # Check for active motion outside the lock to avoid deadlock:
-            # _stop() also acquires self._lock, so we peek first then call
-            # _stop() only if needed (and _stop() will re-acquire the lock).
             need_cancel = False
             with self._lock:
                 if self._motion_thread is not None and self._motion_thread.is_alive():
                     need_cancel = True
             if need_cancel:
                 self._stop("preempt")
-            # Publish neutral to all arm joints
-            neutral = {name: 0.0 for name in ARM_JOINT_NAMES}
+            neutral = _mirrored_positions("_neutral", "both", _NEUTRAL_DEG)
             violations = _validate_pose_rad(neutral)
             if violations:
                 return _failure("LIMIT_EXCEEDED", "Neutral pose out of range", violations=violations)
-            acquired = self._router.acquire(CARD)
-            if not acquired:
-                return _failure("COMMAND_IN_PROGRESS", "Another arm card owns the command path")
-            try:
-                self._hold_positions(neutral)
-            finally:
-                self._router.release(CARD)
-            self._status = {"state": "idle", "gesture": "reset",
+            # Run reset as async worker with ACP completion
+            action_id = f"arm_gesture_reset_{int(time.time()*1000)}"
+            frames = [(_NEUTRAL_DEG, 1.0, 1.0)]
+            stop_event = threading.Event()
+            with self._lock:
+                self._stop_event = stop_event
+                self._motion_thread = threading.Thread(
+                    target=self._run_move,
+                    args=(stop_event, frames, speed, side, "reset", action_id),
+                    daemon=True,
+                    name="q5_arm_gesture_reset",
+                )
+                self._motion_thread.start()
+            self._status = {"state": "running", "gesture": "reset", "side": side,
                             "updated_at_ms": int(time.time() * 1000)}
-            return {"ok": True, "state": "stopped", "gesture": "reset"}
+            return {"ok": True, "state": "running", "gesture": "reset",
+                    "side": side, "action_id": action_id}
 
         # Gesture actions
         if action not in _GESTURES_DEG:
@@ -577,7 +626,7 @@ class Plugin:
             return _failure("UNSAFE_BILATERAL_SALUTE",
                             "salute only supports one arm at a time to avoid head/arm interference")
 
-        speed = _clamp(args.get("speed", 0.5), 0.2, 1.5)
+        speed = _clamp(args.get("speed", 0.8), 0.2, 1.5)
         cycles = int(_clamp(args.get("cycles", 2), 1, 5))
 
         # Validate pre-flight
