@@ -267,6 +267,8 @@ def resample_joint_trajectory(
         raise ValueError("each frame must contain all requested joint positions")
     if not np.all(np.isfinite(positions)):
         raise ValueError("joint positions must be finite")
+    if len(current_positions) <= max(indices):
+        raise ValueError("current joint state is unavailable for entry blend")
     current = np.asarray([float(current_positions[index]) for index in indices], dtype=float)
     if current.shape != (len(indices),) or not np.all(np.isfinite(current)):
         raise ValueError("current joint state is unavailable for entry blend")
