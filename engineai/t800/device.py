@@ -108,6 +108,10 @@ _GAMEPAD_ACTIONS = {
     frozenset({"RB", "B"}): "dance",
     frozenset({"START", "CROSS_X_UP"}): "get_up",
     frozenset({"START", "CROSS_X_DOWN"}): "lie_down",
+    # Boxing punches (T800 keeps the same motion state during punches, so the
+    # action is derived from the gamepad combo only).
+    frozenset({"A", "CROSS_Y_RIGHT"}): "left_straight",
+    frozenset({"A", "CROSS_Y_LEFT"}): "right_straight",
 }
 
 
@@ -138,26 +142,87 @@ def _motion_direction(stick_x: float, stick_y: float, yaw_x: float = 0.0) -> str
     return "_".join(parts) if parts else "none"
 
 
+_SPEED_STALE_SECONDS = 0.5
+
+# T800 reports motion transitions as ``<source>_to_<target>`` (or
+# ``rl_mimic_<source>_to_<target>``). Resolve them to the stable *target* action
+# so the canvas sees a clean stand<->sit switch instead of a transient
+# intermediate state (e.g. ``rl_mimic_stance_to_sitdown`` -> sit,
+# ``rl_mimic_sitdown_to_stance`` -> stand).
+_TRANSITION_TARGETS = (
+    ("rl_mimic_stance_to_sitdown", "sit"),
+    ("stance_to_sitdown", "sit"),
+    ("rl_mimic_sitdown_to_stance", "stand"),
+    ("sitdown_to_stance", "stand"),
+    ("rl_mimic_supine_to_stance", "get_up"),
+    ("rl_mimic_prone_to_stance", "get_up"),
+    ("supine_to_stance", "get_up"),
+    ("prone_to_stance", "get_up"),
+    ("rl_mimic_stance_to_supine", "lie_down"),
+    ("stance_to_supine", "lie_down"),
+    ("rl_mimic_stance_to_kneeling", "kneel"),
+    ("rl_mimic_kneeling_to_stance", "stand"),
+)
+
+_MOTION_ALIASES = (
+    ("punch", ("punch", "boxing", "box", "fight", "fist", "打拳")),
+    ("dance", ("dance",)),
+    ("get_up", ("get_up", "getup", "supine_to_stance", "prone_to_stance")),
+    ("lie_down", ("lie_down", "liedown", "supine", "stance_to_supine")),
+    ("sit", ("sit_down", "sitdown", "sit", "sitting", "seated", "seat", "squat")),
+    ("kneel", ("kneel", "kneeling", "knee", "跪")),
+    ("walk", ("walk", "loco", "rl_basic", "rl_terrain", "lower_body_balance", "walk_server")),
+    ("stand", ("stand", "pd_stand", "stance")),
+    ("idle", ("idle",)),
+    ("passive", ("passive", "damping")),
+)
+
+
+def _transition_target_action(name: str) -> str | None:
+    """Resolve a T800 ``*_to_*`` transition state to its stable target action."""
+    lowered = str(name or "").strip().lower()
+    if not lowered:
+        return None
+    for exact, action in _TRANSITION_TARGETS:
+        if lowered == exact:
+            return action
+    marker = "_to_"
+    if marker not in lowered:
+        return None
+    target = lowered.rsplit(marker, 1)[-1]
+    for normalized, tokens in _MOTION_ALIASES:
+        if any(token in target for token in tokens):
+            return normalized
+    return None
+
+
 def _normalize_motion_action(name: str) -> str:
     value = str(name or "").strip()
     lowered = value.lower()
     if not lowered or lowered == "unknown":
         return "unknown"
-    aliases = (
-        ("stand", ("stand", "pd_stand", "stance")),
-        ("sit", ("sit", "sitting", "seated", "seat", "squat")),
-        ("punch", ("punch", "boxing", "box", "fight", "fist", "打拳")),
-        ("dance", ("dance",)),
-        ("walk", ("walk", "loco")),
-        ("get_up", ("get_up", "getup")),
-        ("lie_down", ("lie_down", "liedown", "supine")),
-        ("idle", ("idle",)),
-        ("passive", ("passive", "damping")),
-    )
-    for normalized, tokens in aliases:
+    transition = _transition_target_action(lowered)
+    if transition:
+        return transition
+    # Match the more specific transition/screen states before broad terms such
+    # as "stance"; otherwise names like stance_to_sitdown are misclassified as
+    # stand on the canvas.
+    for normalized, tokens in _MOTION_ALIASES:
         if any(token in lowered for token in tokens):
             return normalized
     return value
+
+
+def _display_motion_action(name: str, *, moving: bool = False) -> str:
+    action = _normalize_motion_action(name)
+    # Any locomotion-capable state (rl_basic / walk_server / lower_body_balance /
+    # walk / loco / rl_terrain) describes a walking-ready pose: show "move" only
+    # while the robot is actually moving, otherwise "stand". ``moving`` must be
+    # freshness-aware so a stale speed sample never reports a stationary robot
+    # as walking.
+    if action == "walk":
+        return "move" if moving else "stand"
+    return action
 
 
 def _json_message(payload: dict) -> String:
@@ -1320,6 +1385,20 @@ class MotionEventsPlugin:
         max_vy = abs(float(control.get("max_vy", 1.0)))
         return max(1.0, math.hypot(max_vx, max_vy) * 1.5)
 
+    def _freshly_moving(self, now: float | None = None) -> bool:
+        """Whether the robot is currently moving based on a fresh speed sample.
+
+        ``_moving`` is only reset when a new sample arrives, so it can stay True
+        if the gamepad/odometry topic stops publishing. Requiring the latest
+        sample to be recent keeps a stationary robot from being reported as
+        moving (e.g. standing still in a walking-ready state).
+        """
+        now = time.monotonic() if now is None else now
+        updated = self._latest_speed_updated
+        if updated is None:
+            return False
+        return self._moving and (now - updated) <= _SPEED_STALE_SECONDS
+
     def _classify_gamepad_action(self, buttons: list[str], speed: float) -> str:
         button_set = frozenset(buttons)
         if button_set in _GAMEPAD_ACTIONS:
@@ -1498,14 +1577,21 @@ class MotionEventsPlugin:
 
     def _on_motion_state(self, msg) -> None:
         current = str(getattr(msg, "current_motion_task", "") or "unknown")
-        action = _normalize_motion_action(current)
         with self._lock:
             previous = self._current_motion_state
             self._last_motion_state = previous
             self._current_motion_state = current
-            self._latest_action = action
-            self._latest_control_source = "motion_state"
-            self._latest_direction = "none"
+            action = self._latest_action
+            # Refresh the displayed action only when the state actually changes.
+            # A periodic re-publish of the same state must not override a fresher
+            # gamepad action (e.g. a punch button mapped to left_straight while
+            # the robot stays in the boxing motion state).
+            if current != previous:
+                moving = self._freshly_moving()
+                action = _display_motion_action(current, moving=moving)
+                self._latest_action = action
+                self._latest_control_source = "motion_state"
+                self._latest_direction = "none"
         if current and current != "unknown" and current != previous:
             self.record_event(
                 source_tool="motion_state",
@@ -1634,22 +1720,27 @@ class MotionEventsPlugin:
             latest_action = self._latest_action
             latest_buttons = list(self._latest_buttons)
             latest_control_source = self._latest_control_source
-            latest_direction = self._latest_direction
             current_motion_state = self._current_motion_state
         speed_age = None if latest_speed_updated is None else max(0.0, now - latest_speed_updated)
+        fresh_moving = (
+            moving
+            and speed_age is not None
+            and speed_age <= _SPEED_STALE_SECONDS
+        )
         display_action = latest_action
         display_control_source = latest_control_source
         if display_action == "none" and current_motion_state not in ("", "unknown"):
-            display_action = _normalize_motion_action(current_motion_state)
+            display_action = _display_motion_action(current_motion_state, moving=fresh_moving)
             display_control_source = "motion_state"
+        if display_action == "walk" and not fresh_moving:
+            display_action = "stand"
         return {
             "state": "running" if latest_event or latest_speed_updated is not None else "no_data",
-            "motion_state": "moving" if moving else "stopped",
+            "motion_state": "moving" if fresh_moving else "stopped",
             "speed": f"{round(latest_speed, 2):.2f} m/s",
             "speed_source": latest_speed_source,
             "control_source": display_control_source,
             "action": display_action,
-            "direction": latest_direction,
             "buttons": latest_buttons,
             "current_motion_state": current_motion_state,
             "event": None if latest_event is None else latest_event.get("type"),
