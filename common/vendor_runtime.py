@@ -307,6 +307,14 @@ def run_driver(
     server_name: str,
     build_plugins: Callable[[dict, str, DualDomainROS2], Iterable[Any]],
 ) -> None:
+    # Every driver routed through this helper gets the atomic line writer, so a
+    # noisy plugin cannot tear a Docker log record. Idempotent if main.py already
+    # installed it.
+    try:
+        from common import logsafe
+        logsafe.install()
+    except ImportError:
+        pass
     config = load_config(driver_file)
     namespace = resolve_namespace(config)
     interface = configure_cyclonedds(config)
