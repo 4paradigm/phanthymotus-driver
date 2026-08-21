@@ -273,6 +273,12 @@ class Q5BasicSensorTests(unittest.TestCase):
         self.assertEqual((forward["linear_x"], forward["angular_z_degps"]), (0.1, 0.0))
         self.assertEqual((right["linear_x"], right["angular_z_degps"]), (0.0, -10.0))
 
+    def test_base_drive_allows_continuous_motion_until_cancelled(self):
+        plugin = base_drive.Plugin({}, "test", None, _Client())
+        result = plugin._validate_move({"linear_x": 0.1, "angular_z_degps": 0.0, "duration_s": -1})
+        self.assertEqual(result[2], 0.0)
+        self.assertEqual(result[3], -1.0)
+
     def test_lifecycle_poll_reads_active_without_side_effects(self):
         client = q5_sdk_client.Q5SdkClient()
         client._lifecycle_client = _LifecycleService()
