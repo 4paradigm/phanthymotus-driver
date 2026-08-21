@@ -145,6 +145,33 @@ valid substitute for the MID360 built-in IMU. Before accepting a navigation
 run, verify the isolated worker delivers approximately 10 Hz LiDAR and 200 Hz
 IMU; materially lower rates or repeated source-stamp gaps invalidate the run.
 
+### G1 Versioned Camera Sensors
+
+The RealSense plugin keeps the legacy `/ubuntu/camera/rgb` compressed image,
+`/ubuntu/camera/depth` image, and distance topics unchanged. It additionally
+exposes two latest-only, BEST_EFFORT versioned streams:
+
+- `/ubuntu/navigation/camera/rgb` — `phanthy.sensor.camera_rgb.v2`;
+- `/ubuntu/navigation/camera/depth` — `phanthy.sensor.camera_depth.v2`.
+
+Both use `std_msgs/msg/UInt8MultiArray` as a transport for the `PSE2` binary
+envelope: a fixed little-endian header (`magic`, JSON metadata length, binary
+payload length), canonical JSON metadata, then JPEG or little-endian Z16 bytes.
+Every frame repeats its active-profile intrinsics, stable `calibration_id`,
+RealSense Depth-to-RGB transform, source/Driver-receive timing, and the
+configured LiDAR-to-RGB calibration. Invalid, warming-up, reset, or
+out-of-order source timestamps are published as explicitly unavailable; the
+Driver does not replace them with publish time.
+
+The bundled LiDAR-to-camera transform is derived from the pinned official G1
+URDF and is intentionally marked `factory_nominal`. It is not a measured
+per-robot calibration and must not be relabeled `validated_on_device` until a
+projection overlay and pixel-residual acceptance run has been recorded on that
+G1. Missing or invalid calibration is represented as `unavailable`, never as
+an identity transform. Camera reconnects rebuild the profile calibration and
+therefore update `calibration_id` when serial, resolution, intrinsics, depth
+scale, or extrinsics change.
+
 ## Writing a New Driver
 
 Want to add support for new hardware? See the **[Driver Development Guide](README_dev.md)** for the full specification, including:

@@ -3716,14 +3716,26 @@ class RealSensePlugin:
     PREFIX = "camera"
 
     def __init__(self, plugin_config: dict, namespace: str, executor):
+        self._config = dict(plugin_config or {})
         self._namespace   = namespace
         self._color_topic = f"/{namespace}/camera/rgb"
         self._depth_topic = f"/{namespace}/camera/depth"
         self._dist_topic  = f"/{namespace}/camera/distance"
+        self._rgb_v2_topic = self._config.get(
+            "rgb_v2_topic", f"/{namespace}/navigation/camera/rgb"
+        )
+        self._depth_v2_topic = self._config.get(
+            "depth_v2_topic", f"/{namespace}/navigation/camera/depth"
+        )
         self._proc = None
+        self._status_q = None
+        self._status = {"state": "idle"}
 
     def get_tools(self) -> list:
-        return [self._color_tool(), self._depth_tool(), self._dist_tool()]
+        tools = [self._color_tool(), self._depth_tool(), self._dist_tool()]
+        if self._config.get("v2_enabled", True):
+            tools.extend([self._rgb_v2_tool(), self._depth_v2_tool()])
+        return tools
 
     def _color_tool(self) -> dict:
         return {
@@ -3755,13 +3767,67 @@ class RealSensePlugin:
             "topic_out": [{"topic": self._dist_topic, "format": "data/json"}],
         }
 
+    def _rgb_v2_tool(self) -> dict:
+        from camera_v2 import ENVELOPE_FORMAT, RGB_SCHEMA
+
+        return {
+            "name": "camera_rgb_v2",
+            "type": "sensor",
+            "multiInstance": False,
+            "description": "Versioned RealSense RGB frames with source/receive timing, "
+                           "intrinsics, and LiDAR-to-camera calibration metadata.",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{
+                "topic": self._rgb_v2_topic,
+                "format": ENVELOPE_FORMAT,
+                "ros_type": "std_msgs/msg/UInt8MultiArray",
+                "schema": RGB_SCHEMA,
+            }],
+        }
+
+    def _depth_v2_tool(self) -> dict:
+        from camera_v2 import DEPTH_SCHEMA, ENVELOPE_FORMAT
+
+        return {
+            "name": "camera_depth_v2",
+            "type": "sensor",
+            "multiInstance": False,
+            "description": "Versioned RealSense depth frames with source/receive timing, "
+                           "depth scale, intrinsics, and RGB/LiDAR extrinsics.",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{
+                "topic": self._depth_v2_topic,
+                "format": ENVELOPE_FORMAT,
+                "ros_type": "std_msgs/msg/UInt8MultiArray",
+                "schema": DEPTH_SCHEMA,
+            }],
+        }
+
+    def _drain_status(self) -> dict:
+        if self._status_q is not None:
+            while True:
+                try:
+                    value = self._status_q.get_nowait()
+                except queue.Empty:
+                    break
+                if isinstance(value, dict):
+                    self._status = value
+        result = dict(self._status)
+        if self._proc is not None and not self._proc.is_alive():
+            result["state"] = "error"
+            result.setdefault("error", "RealSense subprocess exited")
+        return result
+
     def start(self) -> None:
         import multiprocessing as mp
         if self._proc is not None and self._proc.is_alive():
             return
         ctx = mp.get_context("spawn")
+        self._status_q = ctx.Queue(maxsize=1)
+        self._status = {"state": "starting"}
         self._proc = ctx.Process(
-            target=run_realsense_process, args=(self._namespace,),
+            target=run_realsense_process,
+            args=(self._namespace, self._config, self._status_q),
             name="realsense", daemon=True,
         )
         self._proc.start()
@@ -3775,6 +3841,10 @@ class RealSensePlugin:
                 self._proc.kill()
                 self._proc.join(timeout=2.0)
         self._proc = None
+        if self._status_q is not None:
+            self._status_q.close()
+            self._status_q = None
+        self._status = {"state": "idle"}
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
@@ -3783,20 +3853,30 @@ class RealSensePlugin:
             return {"state": "idle"}
         if action == "info":
             tool_name = args.get('_tool_name', '')
+            status = self._drain_status()
             if tool_name == 'camera_depth':
-                return {"state": "running", "topic_out": [{"topic": self._depth_topic, "format": "image/depth-z16"}]}
+                return {**status, "topic_out": [{"topic": self._depth_topic, "format": "image/depth-z16"}]}
             if tool_name == 'camera_distance':
-                return {"state": "running", "topic_out": [{"topic": self._dist_topic, "format": "data/json"}]}
-            return {"state": "running", "topic_out": [{"topic": self._color_topic, "format": "image/jpeg"}]}
+                return {**status, "topic_out": [{"topic": self._dist_topic, "format": "data/json"}]}
+            if tool_name == 'camera_rgb_v2':
+                return {**status, "topic_out": self._rgb_v2_tool()["topic_out"]}
+            if tool_name == 'camera_depth_v2':
+                return {**status, "topic_out": self._depth_v2_tool()["topic_out"]}
+            return {**status, "topic_out": [{"topic": self._color_topic, "format": "image/jpeg"}]}
         return None
 
 
-def run_realsense_process(namespace: str) -> None:
+def run_realsense_process(
+    namespace: str,
+    plugin_config: dict | None = None,
+    status_q=None,
+) -> None:
     """RealSense subprocess entry — independent GIL for full 1080p@15fps throughput.
 
     All heavy imports (cv2, numpy, pyrealsense2, sensor_msgs) happen here
     so the main process is not affected if these packages are missing.
     """
+    from array import array
     import os
     import cv2
     import numpy as np
@@ -3805,8 +3885,28 @@ def run_realsense_process(namespace: str) -> None:
     from rclpy.node import Node as _Node
     from rclpy.executors import SingleThreadedExecutor
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-    from std_msgs.msg import String as _String
+    from std_msgs.msg import String as _String, UInt8MultiArray
     from sensor_msgs.msg import Image, CompressedImage
+    from camera_v2 import (
+        DEPTH_SCHEMA,
+        RGB_SCHEMA,
+        RealSenseClockNormalizer,
+        build_calibrations,
+        build_frame_metadata,
+        build_intrinsics,
+        encode_envelope,
+        load_lidar_camera_calibration,
+        realsense_extrinsics_transform,
+    )
+
+    config_values = dict(plugin_config or {})
+    v2_enabled = bool(config_values.get("v2_enabled", True))
+    rgb_v2_topic = config_values.get(
+        "rgb_v2_topic", f"/{namespace}/navigation/camera/rgb"
+    )
+    depth_v2_topic = config_values.get(
+        "depth_v2_topic", f"/{namespace}/navigation/camera/depth"
+    )
 
     _QOS = QoSProfile(
         reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -3821,10 +3921,39 @@ def run_realsense_process(namespace: str) -> None:
             self._color_pub = self.create_publisher(CompressedImage, color_topic, _QOS)
             self._depth_pub = self.create_publisher(Image, depth_topic, _QOS)
             self._dist_pub  = self.create_publisher(_String, dist_topic, _QOS)
+            self._rgb_v2_pub = (
+                self.create_publisher(UInt8MultiArray, rgb_v2_topic, _QOS)
+                if v2_enabled else None
+            )
+            self._depth_v2_pub = (
+                self.create_publisher(UInt8MultiArray, depth_v2_topic, _QOS)
+                if v2_enabled else None
+            )
 
             self._pipeline = None
+            self._shutting_down = False
+            self._last_frame_monotonic = 0.0
             self._last_ts        = 0.0
             self._last_dist_time = 0.0
+            self._last_status_time = 0.0
+            self._serial = None
+            self._rgb_calibration = None
+            self._depth_calibration = None
+            self._sequence = {"rgb": 0, "depth": 0}
+            self._diagnostics = {
+                "reconnect_count": 0,
+                "framesets": 0,
+                "rgb_v2_published": 0,
+                "depth_v2_published": 0,
+                "invalid_source_stamps": 0,
+                "out_of_order_source_stamps": 0,
+                "color_coalesced": 0,
+                "depth_coalesced": 0,
+                "legacy_publish_errors": 0,
+                "v2_publish_errors": 0,
+                "jpeg_encode_errors": 0,
+            }
+            self._clock = self._new_clock_normalizer()
 
             self._depth_q = queue.Queue(maxsize=1)
             self._depth_worker = None
@@ -3833,38 +3962,187 @@ def run_realsense_process(namespace: str) -> None:
             self._color_worker = None
 
             self._worker_stop = threading.Event()
+            self._reconnect_interval = max(
+                0.2, float(config_values.get("reconnect_interval_sec", 1.0))
+            )
+            self._stale_frame_timeout = max(
+                self._reconnect_interval,
+                float(config_values.get("stale_frame_timeout_sec", 2.5)),
+            )
+            self._capture_timer = self.create_timer(
+                self._reconnect_interval, self._ensure_capture
+            )
 
             self.get_logger().info(
-                f"RealSenseNode ready — color:{color_topic} depth:{depth_topic} dist:{dist_topic}"
+                f"RealSenseNode ready — color:{color_topic} depth:{depth_topic} "
+                f"dist:{dist_topic} rgb_v2:{rgb_v2_topic if v2_enabled else 'disabled'} "
+                f"depth_v2:{depth_v2_topic if v2_enabled else 'disabled'}"
             )
+            self._publish_status("starting")
+
+        def _new_clock_normalizer(self):
+            return RealSenseClockNormalizer(
+                warmup_samples=int(config_values.get("clock_warmup_samples", 8)),
+                window_samples=int(config_values.get("clock_window_samples", 300)),
+                reset_threshold_ns=int(
+                    float(config_values.get("clock_reset_threshold_ms", 1000)) * 1_000_000
+                ),
+                reset_confirm_samples=int(
+                    config_values.get("clock_reset_confirm_samples", 5)
+                ),
+            )
+
+        def _publish_status(self, state, error=None, force=False):
+            now = time.monotonic()
+            if not force and now - self._last_status_time < 1.0:
+                return
+            self._last_status_time = now
+            value = {
+                "state": state,
+                "device_serial": self._serial,
+                "v2_enabled": v2_enabled,
+                "diagnostics": dict(self._diagnostics),
+            }
+            if self._rgb_calibration:
+                value["calibration_id"] = self._rgb_calibration["calibration_id"]
+                value["lidar_camera_status"] = self._rgb_calibration[
+                    "lidar_to_camera"
+                ].get("status")
+            if error:
+                value["error"] = str(error)
+            if status_q is None:
+                return
+            try:
+                while True:
+                    status_q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                status_q.put_nowait(value)
+            except queue.Full:
+                pass
+
+        def _frame_domain(self, frame):
+            try:
+                return str(frame.get_frame_timestamp_domain())
+            except Exception:
+                return "unknown"
+
+        def _timing(self, frame, stream, receive_unix_ns):
+            try:
+                source_ms = frame.get_timestamp()
+            except Exception:
+                source_ms = None
+            timing = self._clock.normalize(
+                source_timestamp_ms=source_ms,
+                source_domain=self._frame_domain(frame),
+                driver_receive_stamp_ns=receive_unix_ns,
+                stream=stream,
+            )
+            if not timing.available:
+                self._diagnostics["invalid_source_stamps"] += 1
+            if timing.out_of_order:
+                self._diagnostics["out_of_order_source_stamps"] += 1
+            return timing
+
+        @staticmethod
+        def _intrinsics(profile):
+            intrinsics = profile.get_intrinsics()
+            return build_intrinsics(
+                width=intrinsics.width,
+                height=intrinsics.height,
+                fx=intrinsics.fx,
+                fy=intrinsics.fy,
+                cx=intrinsics.ppx,
+                cy=intrinsics.ppy,
+                coefficients=list(intrinsics.coeffs),
+                realsense_model=str(intrinsics.model),
+            )
+
+        def _configure_profile(self, profile):
+            color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
+            depth_profile = profile.get_stream(rs.stream.depth).as_video_stream_profile()
+            depth_sensor = profile.get_device().first_depth_sensor()
+            depth_scale_m = float(depth_sensor.get_depth_scale())
+            depth_to_color_rs = depth_profile.get_extrinsics_to(color_profile)
+            depth_to_rgb = realsense_extrinsics_transform(
+                source_frame="camera_depth_optical_frame",
+                target_frame="camera_color_optical_frame",
+                rotation_column_major=list(depth_to_color_rs.rotation),
+                translation_m=list(depth_to_color_rs.translation),
+            )
+            lidar_to_rgb, calibration_error = load_lidar_camera_calibration(
+                config_values.get(
+                    "lidar_camera_calibration",
+                    "/work/calibration/g1_factory_nominal_lidar_camera.yaml",
+                )
+            )
+            self._rgb_calibration, self._depth_calibration = build_calibrations(
+                serial=self._serial,
+                rgb_intrinsics=self._intrinsics(color_profile),
+                depth_intrinsics=self._intrinsics(depth_profile),
+                depth_to_rgb=depth_to_rgb,
+                lidar_to_rgb=lidar_to_rgb,
+                depth_scale_m=depth_scale_m,
+            )
+            if calibration_error:
+                self.get_logger().warn(
+                    f"LiDAR-camera calibration unavailable: {calibration_error}"
+                )
 
         def start_capture(self):
             if self._pipeline is not None:
                 return
-            ctx = rs.context()
-            devs = ctx.query_devices()
-            if len(devs) == 0:
-                self.get_logger().warn("RealSenseNode: no device connected")
+            try:
+                ctx = rs.context()
+                devs = ctx.query_devices()
+                if len(devs) == 0:
+                    self._publish_status("not_ready", "no RealSense device connected")
+                    return
+                self._serial = devs[0].get_info(rs.camera_info.serial_number)
+
+                pipeline = rs.pipeline()
+                config = rs.config()
+                config.enable_device(self._serial)
+                config.enable_stream(rs.stream.depth, RS_DEPTH_W, RS_DEPTH_H, rs.format.z16, RS_DEPTH_FPS)
+                config.enable_stream(rs.stream.color, RS_COLOR_W, RS_COLOR_H, rs.format.bgr8, RS_COLOR_FPS)
+                profile = pipeline.start(config, self._on_frame)
+                self._configure_profile(profile)
+                self._clock = self._new_clock_normalizer()
+                self._sequence = {"rgb": 0, "depth": 0}
+                self._last_frame_monotonic = time.monotonic()
+                self._worker_stop.clear()
+                self._depth_worker = threading.Thread(target=self._depth_loop, name="rs_depth", daemon=True)
+                self._depth_worker.start()
+                self._color_worker = threading.Thread(target=self._color_loop, name="rs_color", daemon=True)
+                self._color_worker.start()
+                self._pipeline = pipeline
+                self._diagnostics["reconnect_count"] += 1
+                self._publish_status("running", force=True)
+                self.get_logger().info(
+                    f"RealSense capture started — device {self._serial}"
+                )
+            except Exception as exc:
+                try:
+                    pipeline.stop()
+                except Exception:
+                    pass
+                self._pipeline = None
+                self._publish_status("not_ready", exc, force=True)
+                self.get_logger().warn(f"RealSense start failed; will retry: {exc}")
+
+        def _ensure_capture(self):
+            if self._shutting_down:
                 return
-            serial = devs[0].get_info(rs.camera_info.serial_number)
+            if self._pipeline is None:
+                self.start_capture()
+                return
+            if time.monotonic() - self._last_frame_monotonic > self._stale_frame_timeout:
+                self.get_logger().warn("RealSense frame stream stale; reconnecting")
+                self.stop_capture(reconnecting=True)
+                self.start_capture()
 
-            pipeline = rs.pipeline()
-            config = rs.config()
-            config.enable_device(serial)
-            config.enable_stream(rs.stream.depth, RS_DEPTH_W, RS_DEPTH_H, rs.format.z16, RS_DEPTH_FPS)
-            config.enable_stream(rs.stream.color, RS_COLOR_W, RS_COLOR_H, rs.format.bgr8, RS_COLOR_FPS)
-
-            self._worker_stop.clear()
-            self._depth_worker = threading.Thread(target=self._depth_loop, name="rs_depth", daemon=True)
-            self._depth_worker.start()
-            self._color_worker = threading.Thread(target=self._color_loop, name="rs_color", daemon=True)
-            self._color_worker.start()
-
-            pipeline.start(config, self._on_frame)
-            self._pipeline = pipeline
-            self.get_logger().info(f"RealSense capture started — device {serial}")
-
-        def stop_capture(self):
+        def stop_capture(self, reconnecting=False):
             if self._pipeline is not None:
                 try:
                     self._pipeline.stop()
@@ -3878,12 +4156,24 @@ def run_realsense_process(namespace: str) -> None:
             if self._color_worker is not None:
                 self._color_worker.join(timeout=2.0)
                 self._color_worker = None
+            self._drain_frame_queue(self._color_q)
+            self._drain_frame_queue(self._depth_q)
+            if not reconnecting:
+                self._publish_status("idle", force=True)
             self.get_logger().info("RealSense capture stopped")
+
+        @staticmethod
+        def _drain_frame_queue(frame_queue):
+            try:
+                while True:
+                    frame_queue.get_nowait()
+            except queue.Empty:
+                pass
 
         def _depth_loop(self):
             while not self._worker_stop.is_set():
                 try:
-                    depth_np, stamp = self._depth_q.get(timeout=0.5)
+                    depth_np, stamp, timing, receive_mono_ns, calibration, sequence = self._depth_q.get(timeout=0.5)
                 except queue.Empty:
                     continue
                 try:
@@ -3898,25 +4188,87 @@ def run_realsense_process(namespace: str) -> None:
                     msg.data = depth_np.tobytes()
                     self._depth_pub.publish(msg)
                 except Exception as e:
-                    self.get_logger().error(f"[realsense] depth publish error: {e}")
+                    self._diagnostics["legacy_publish_errors"] += 1
+                    self.get_logger().error(f"[realsense] depth legacy publish error: {e}")
+                    continue
+                if self._depth_v2_pub is None or calibration is None:
+                    continue
+                try:
+                    payload = depth_np.astype("<u2", copy=False).tobytes()
+                    metadata = build_frame_metadata(
+                        schema=DEPTH_SCHEMA,
+                        frame_id="camera_depth_optical_frame",
+                        timing=timing,
+                        driver_receive_monotonic_ns=receive_mono_ns,
+                        sequence=sequence,
+                        image={
+                            "encoding": "z16_le",
+                            "width": int(depth_np.shape[1]),
+                            "height": int(depth_np.shape[0]),
+                            "step_bytes": int(depth_np.shape[1] * 2),
+                            "payload_size": len(payload),
+                            "unit": "meter",
+                            "depth_scale_m": calibration["depth_scale_m"],
+                            "aligned_to_rgb": False,
+                        },
+                        calibration=calibration,
+                    )
+                    envelope = encode_envelope(metadata, payload)
+                    v2_msg = UInt8MultiArray()
+                    v2_msg.data = array("B", envelope)
+                    self._depth_v2_pub.publish(v2_msg)
+                    self._diagnostics["depth_v2_published"] += 1
+                except Exception as e:
+                    self._diagnostics["v2_publish_errors"] += 1
+                    self.get_logger().error(f"[realsense] depth v2 publish error: {e}")
 
         def _color_loop(self):
             while not self._worker_stop.is_set():
                 try:
-                    color_np, stamp = self._color_q.get(timeout=0.5)
+                    color_np, stamp, timing, receive_mono_ns, calibration, sequence = self._color_q.get(timeout=0.5)
                 except queue.Empty:
                     continue
                 try:
                     ok, jpg = cv2.imencode(".jpg", color_np, [cv2.IMWRITE_JPEG_QUALITY, RS_JPEG_QUALITY])
-                    if ok:
-                        cmsg = CompressedImage()
-                        cmsg.header.stamp = stamp
-                        cmsg.header.frame_id = "camera_color_optical_frame"
-                        cmsg.format = "jpeg"
-                        cmsg.data = jpg.tobytes()
-                        self._color_pub.publish(cmsg)
+                    if not ok:
+                        self._diagnostics["jpeg_encode_errors"] += 1
+                        continue
+                    payload = jpg.tobytes()
+                    cmsg = CompressedImage()
+                    cmsg.header.stamp = stamp
+                    cmsg.header.frame_id = "camera_color_optical_frame"
+                    cmsg.format = "jpeg"
+                    cmsg.data = payload
+                    self._color_pub.publish(cmsg)
                 except Exception as e:
-                    self.get_logger().error(f"[realsense] color publish error: {e}")
+                    self._diagnostics["legacy_publish_errors"] += 1
+                    self.get_logger().error(f"[realsense] color legacy publish error: {e}")
+                    continue
+                if self._rgb_v2_pub is None or calibration is None:
+                    continue
+                try:
+                    metadata = build_frame_metadata(
+                        schema=RGB_SCHEMA,
+                        frame_id="camera_color_optical_frame",
+                        timing=timing,
+                        driver_receive_monotonic_ns=receive_mono_ns,
+                        sequence=sequence,
+                        image={
+                            "encoding": "jpeg",
+                            "width": int(color_np.shape[1]),
+                            "height": int(color_np.shape[0]),
+                            "payload_size": len(payload),
+                        },
+                        calibration=calibration,
+                    )
+                    envelope = encode_envelope(metadata, payload)
+                    v2_msg = UInt8MultiArray()
+                    v2_msg.data = array("B", envelope)
+                    self._rgb_v2_pub.publish(v2_msg)
+                    self._diagnostics["rgb_v2_published"] += 1
+                except Exception as e:
+                    self._diagnostics["v2_publish_errors"] += 1
+                    self.get_logger().error(f"[realsense] color v2 publish error: {e}")
 
         def _on_frame(self, frame):
             try:
@@ -3925,15 +4277,25 @@ def run_realsense_process(namespace: str) -> None:
                 fs = frame.as_frameset()
                 color_frame = fs.get_color_frame()
                 depth_frame = fs.get_depth_frame()
+                receive_unix_ns = time.time_ns()
+                receive_mono_ns = time.monotonic_ns()
                 stamp = self.get_clock().now().to_msg()
+                self._last_frame_monotonic = time.monotonic()
+                self._diagnostics["framesets"] += 1
 
                 if color_frame:
                     color_np = np.asanyarray(color_frame.get_data())
+                    color_timing = self._timing(color_frame, "rgb", receive_unix_ns)
+                    self._sequence["rgb"] += 1
                     try:
                         self._color_q.get_nowait()
+                        self._diagnostics["color_coalesced"] += 1
                     except queue.Empty:
                         pass
-                    self._color_q.put((color_np, stamp))
+                    self._color_q.put_nowait((
+                        color_np, stamp, color_timing, receive_mono_ns,
+                        self._rgb_calibration, self._sequence["rgb"],
+                    ))
 
                 dist = 0.0
                 if depth_frame:
@@ -3942,11 +4304,17 @@ def run_realsense_process(namespace: str) -> None:
                         depth_frame.get_height() // 2,
                     )
                     depth_np = np.array(depth_frame.get_data())
+                    depth_timing = self._timing(depth_frame, "depth", receive_unix_ns)
+                    self._sequence["depth"] += 1
                     try:
                         self._depth_q.get_nowait()
+                        self._diagnostics["depth_coalesced"] += 1
                     except queue.Empty:
                         pass
-                    self._depth_q.put((depth_np, stamp))
+                    self._depth_q.put_nowait((
+                        depth_np, stamp, depth_timing, receive_mono_ns,
+                        self._depth_calibration, self._sequence["depth"],
+                    ))
 
                 now = time.monotonic()
                 if now - self._last_dist_time >= RS_DIST_INTERVAL:
@@ -3958,6 +4326,7 @@ def run_realsense_process(namespace: str) -> None:
                     self._dist_pub.publish(out)
                 else:
                     self._last_ts = now
+                self._publish_status("running")
             except Exception as e:
                 self.get_logger().error(f"[realsense] frame error: {e}")
 
@@ -3981,6 +4350,7 @@ def run_realsense_process(namespace: str) -> None:
         if rclpy.ok():
             print(f"[realsense-proc] executor stopped: {e}", flush=True)
     finally:
+        node._shutting_down = True
         node.stop_capture()
         try:
             node.destroy_node()

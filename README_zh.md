@@ -107,6 +107,29 @@ velocity proposal 合同与 `loco.move` 输入边界保持一致：前后和横�
 均限制为 `[-1.0, 1.0] m/s`，偏航角速度限制为
 `[-2.0, 2.0] rad/s`。Driver 仍会在运动 RPC 之前拒绝非有限数或超界值。
 
+### G1 版本化相机传感器
+
+RealSense 插件保留现有 `/ubuntu/camera/rgb` 压缩图、
+`/ubuntu/camera/depth` 深度图和距离 topic 的消息语义，同时新增两个
+BEST_EFFORT + KEEP_LAST(1) 数据流：
+
+- `/ubuntu/navigation/camera/rgb`：`phanthy.sensor.camera_rgb.v2`；
+- `/ubuntu/navigation/camera/depth`：`phanthy.sensor.camera_depth.v2`。
+
+两者以 `std_msgs/msg/UInt8MultiArray` 承载 `PSE2` 二进制 envelope：固定
+小端头（magic、JSON 元数据长度、二进制载荷长度）之后依次是规范 JSON
+元数据和 JPEG/Z16 小端载荷。每帧完整携带当前 RealSense profile 内参、
+稳定 `calibration_id`、Depth→RGB 外参、源时间/Driver 接收时间，以及配置的
+LiDAR→RGB 外参。源时间无效、尚在预热、发生时钟重置或倒序时仍发布该帧，
+但明确标记为 `unavailable`，不会用发布时刻伪造采集时间。
+
+仓库内置的 LiDAR→Camera 变换来自固定版本的宇树官方 G1 URDF，状态只能是
+`factory_nominal`：它不是北京 G1 的实测外参。在该机器人上完成点云投影叠加
+与像素残差验收并保存证据前，不得改成 `validated_on_device`。配置缺失或非法
+时输出 `unavailable`，不会用单位矩阵冒充有效标定。相机重连后会重新读取
+活动 profile；序列号、分辨率、内参、depth scale 或外参变化都会生成新的
+`calibration_id`。
+
 ## 开发新驱动
 
 想要为新硬件添加驱动？请参阅 **[驱动开发指南](README_dev.md)** 获取完整规范，包括：
