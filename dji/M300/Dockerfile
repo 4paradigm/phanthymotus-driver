@@ -35,6 +35,7 @@ RUN mkdir -p /work/psdk_bridge/build && \
     cp psdk_bridge /usr/local/bin/psdk_bridge
 
 # ── Application code (changes frequently) ──────────────────────────
+COPY common/ /work/common/
 COPY main.py         /work/main.py
 COPY device.py       /work/device.py
 COPY bridge_client.py /work/bridge_client.py

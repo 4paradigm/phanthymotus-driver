@@ -73,6 +73,7 @@ RUN echo "[t800] checking ROS interface build dependencies" && \
     . /t800_ws/install/setup.sh && \
     python3 -c "from interface_protocol.msg import BodyVelCmd, Heartbeat, LinkInfo, MotionStateRequest; from nav_msgs.msg import Odometry; from sensor_msgs.msg import CompressedImage, Image, PointCloud2; print('T800 ROS imports ok')"
 
+COPY common/ /work/common/
 COPY main.py device.py control.py native_sdk.py virtual_gamepad.py config.yaml driver.yaml controlled_spatial_map.py /work/
 COPY resource/ /work/resource/
 # 启动音复用仓库已有的规范资源，不在每个 driver 目录重复提交二进制。

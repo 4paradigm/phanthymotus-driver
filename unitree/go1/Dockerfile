@@ -34,6 +34,7 @@ RUN cd /opt/unitree_legged_sdk && mkdir -p build && cd build && \
     cmake -DPYTHON_BUILD=ON .. && make -j"$(nproc)" && \
     find /opt/unitree_legged_sdk/lib/python -name 'robot_interface*.so' -exec cp -v {} /work/ \; || true
 
+COPY common/ /work/common/
 COPY main.py           /work/main.py
 COPY go1_sdk_client.py /work/go1_sdk_client.py
 COPY sdk_proxy.py      /work/sdk_proxy.py
@@ -56,6 +57,11 @@ ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ENV FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
 ENV PYTHONPATH=/work
 ENV PYTHONUNBUFFERED=1
+# ANSI colour codes are control bytes; in a non-tty container log they are
+# exactly the "garbage characters" that make `docker logs` unreadable.
+ENV RCUTILS_COLORIZED_OUTPUT=0
+# Keep CycloneDDS tracing out of stdout (oversized log messages).
+ENV CYCLONEDDS_URI='<CycloneDDS><Domain><Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>'
 ENV PCL_ENABLE=1
 ENV DEPTH_ENABLE=1
 

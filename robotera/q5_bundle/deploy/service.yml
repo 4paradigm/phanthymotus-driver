@@ -3,7 +3,10 @@ robotera-q5:
   container_name: embodied-robotera-q5
   network_mode: host
   privileged: true
+  env_file:
+    - /opt/phanthy-motus/.env
   volumes:
+    - /opt/phanthy-motus/data:/opt/phanthy-motus/data
     - /home/nvidia/teleop_client/install:/opt/teleop_client/install:ro
     - /home/nvidia/cyclonedds-orin.xml:/etc/cyclonedds/q5.xml:ro
   environment:
