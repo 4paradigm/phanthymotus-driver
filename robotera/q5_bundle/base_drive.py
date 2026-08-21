@@ -4,10 +4,9 @@ This card publishes finite-duration TwistStamped commands via a separate
 subprocess running on rmw_fastrtps_cpp (FastDDS) / Domain 211, because the
 vendor Wr1 base controller only accepts messages on that RMW.
 
-The vendor SDK starts its control sequence by calling /activate_service before
-publishing base velocity.  That service is discovered through CycloneDDS,
-while the controller accepts TwistStamped through FastDDS, so activation and
-velocity publishing intentionally use separate short-lived processes.
+The controller accepts its velocity stream through FastDDS.  On deployed Q5
+hardware, the vendor remote publishes a ``base_link`` frame at roughly 100 Hz;
+match that wire contract rather than the older SDK demo's empty frame/10 Hz.
 The parent process (main.py, CycloneDDS) stays untouched.
 """
 
@@ -16,7 +15,6 @@ from __future__ import annotations
 import math
 import multiprocessing as mp
 import os
-import subprocess
 import threading
 import time
 
@@ -55,45 +53,16 @@ def _number(value, field: str):
 
 # ── Subprocess launcher (FastDDS only — publishes TwistStamped) ──────────────
 
-def _activate_vendor_control() -> dict:
-    """Run the non-motion portion of the vendor SDK startup sequence once.
-
-    Q5's published ``start_sdk`` procedure ends with this service.  Do not
-    invoke dynamic_launch, ready_service, or trajectories here: those actions
-    can reset posture and are not safe as an implicit prerequisite for a
-    finite base velocity request.
-    """
-    env = os.environ.copy()
-    env["ROS_DOMAIN_ID"] = "211"
-    env["RMW_IMPLEMENTATION"] = "rmw_cyclonedds_cpp"
-    env.setdefault("PYTHONUNBUFFERED", "1")
-    try:
-        result = subprocess.run(
-            ["ros2", "service", "call", "/activate_service", "std_srvs/srv/Trigger"],
-            capture_output=True, text=True, timeout=15, env=env,
-        )
-    except subprocess.TimeoutExpired:
-        return _failure("ACTIVATE_SERVICE_TIMEOUT", "Q5 control activation timed out after 15 seconds")
-    except Exception as exc:
-        return _failure("ACTIVATE_SERVICE_ERROR", f"Cannot activate Q5 base control: {exc}")
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "unknown error").strip()
-        return _failure("ACTIVATE_SERVICE_FAILED", f"Q5 control activation failed: {detail}")
-    output = (result.stdout or "").strip()
-    if "success: false" in output.lower():
-        return _failure("ACTIVATE_SERVICE_REJECTED", f"Q5 control activation was rejected: {output}")
-    print("[base_drive] vendor control activated", flush=True)
-    return {"ok": True, "activated": True}
-
 class _SubprocDriver:
     """Spawn a FastDDS subprocess and send it commands via a Queue."""
 
-    def __init__(self, publish_rate: float, stop_repetitions: int, enabled: bool = True):
+    def __init__(self, publish_rate: float, stop_repetitions: int, frame_id: str, enabled: bool = True):
         self._ctx = mp.get_context("spawn")
         self._cmd_q = self._ctx.Queue()
         self._ready = self._ctx.Event()
         self._publish_rate = publish_rate
         self._stop_repetitions = stop_repetitions
+        self._frame_id = frame_id
         self._enabled = enabled
         self._proc = None
         self._lock = threading.Lock()
@@ -108,7 +77,7 @@ class _SubprocDriver:
             self._ready.clear()
             self._proc = self._ctx.Process(
                 target=_subproc_main,
-                args=(self._cmd_q, self._ready, self._publish_rate, self._stop_repetitions),
+                args=(self._cmd_q, self._ready, self._publish_rate, self._stop_repetitions, self._frame_id),
                 name="q5_base_drive_subproc", daemon=True,
             )
             self._proc.start()
@@ -149,7 +118,8 @@ class _SubprocDriver:
         }
 
 
-def _subproc_main(cmd_q: mp.Queue, ready: mp.Event, publish_rate: float, stop_repetitions: int):
+def _subproc_main(cmd_q: mp.Queue, ready: mp.Event, publish_rate: float, stop_repetitions: int,
+                  frame_id: str):
     """Subprocess entry — FastDDS + Domain 211, publishes TwistStamped."""
     os.environ["ROS_DOMAIN_ID"] = "211"
     os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
@@ -193,6 +163,7 @@ def _subproc_main(cmd_q: mp.Queue, ready: mp.Event, publish_rate: float, stop_re
     def _publish(linear_x: float, angular_z: float):
         msg = TwistStamped()
         msg.header.stamp = node.get_clock().now().to_msg()
+        msg.header.frame_id = frame_id
         msg.twist.linear.x = linear_x
         msg.twist.angular.z = angular_z
         pub.publish(msg)
@@ -258,18 +229,19 @@ class Plugin:
         self._max_linear = float(plugin_config.get("max_linear_x_mps", 0.20))
         self._max_angular = float(plugin_config.get("max_angular_z_radps", 0.40))
         self._max_duration = float(plugin_config.get("max_duration_s", 2.0))
-        self._publish_rate = float(plugin_config.get("publish_rate_hz", 10.0))
+        self._publish_rate = float(plugin_config.get("publish_rate_hz", 100.0))
         self._stop_repetitions = int(plugin_config.get("stop_repetitions", 3))
+        self._frame_id = str(plugin_config.get("frame_id", "base_link"))
         self._driver = _SubprocDriver(
-            self._publish_rate, self._stop_repetitions, enabled=executor is not None,
+            self._publish_rate, self._stop_repetitions, self._frame_id, enabled=executor is not None,
         )
-        self._activation_lock = threading.Lock()
-        self._activated = False
 
         if min(self._max_linear, self._max_angular, self._max_duration, self._publish_rate) <= 0:
             raise ValueError("base_drive limits and publish_rate_hz must be positive")
         if self._stop_repetitions < 1:
             raise ValueError("base_drive stop_repetitions must be at least 1")
+        if not self._frame_id:
+            raise ValueError("base_drive frame_id must not be empty")
 
     def get_tool(self):
         return {
@@ -345,9 +317,9 @@ class Plugin:
         return {
             "ros_publisher_available": True,  # via subproc
             "control_mode": "direct_velocity_interface",
-            "vendor_control_activated": self._activated,
             "q5_fsm": q5_active_status(self._client),
             "topic": TOPIC,
+            "frame_id": self._frame_id,
             "limits": {
                 "max_linear_x_mps": self._max_linear,
                 "max_angular_z_radps": self._max_angular,
@@ -411,15 +383,6 @@ class Plugin:
     def stop(self):
         self._driver.stop()
 
-    def _ensure_vendor_control(self) -> dict:
-        with self._activation_lock:
-            if self._activated:
-                return {"ok": True, "activated": True}
-            result = _activate_vendor_control()
-            if result.get("ok"):
-                self._activated = True
-            return result
-
     def dispatch(self, action, args):
         if action == "start":
             return self.start()
@@ -442,10 +405,6 @@ class Plugin:
             return command
 
         linear_x, angular_z, duration_s = command
-
-        activated = self._ensure_vendor_control()
-        if not activated.get("ok"):
-            return activated
 
         if not self._driver.move(linear_x, angular_z, duration_s):
             return _failure("ROS_UNAVAILABLE",
