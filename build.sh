@@ -331,11 +331,17 @@ if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
             hw_model="${DRIVER_MODELS[$idx]:-}"
             FULL_IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/${hw_provider}/${hw_model}:${TAG}"
 
+            # 架构 facet（resource-center 据此过滤目录，见 resource-center/lib/arch.ts）。
+            # driver 是普通 ROS 容器，没有 L4T / CUDA base，所以不绑定加速器；镜像统一
+            # --platform linux/arm64 构建。将来某个 driver 真需要 Jetson，从它的
+            # driver.yaml 读一个 acc_arch 覆盖这里即可。
             payload="{
   \"imageRef\": \"${FULL_IMAGE}\",
   \"registryImage\": \"${img}\",
   \"tag\": \"${TAG}\",
   \"category\": \"${cat}\",
+  \"acc_arch\": \"agnostic\",
+  \"cpu_arch\": \"arm64\",
   \"hardware_provider\": \"${hw_provider}\",
   \"hardware_model\": \"${hw_model}\",
   \"name\": \"${name}\",
