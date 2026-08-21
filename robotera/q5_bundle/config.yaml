@@ -8,8 +8,7 @@ joint_state_position_unit: "radians"
 plugins:
   base_drive:
     enabled: true
-    # Per the vendor SDK, TwistStamped base control is independent of
-    # /activate_service, which is reserved for algorithm/MPC control.
+    # The vendor SDK activates Q5 control once before accepting base velocity.
     max_linear_x_mps: 0.20
     max_angular_z_radps: 0.40
     max_duration_s: 2.0
