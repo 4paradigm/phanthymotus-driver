@@ -134,6 +134,7 @@ plugins:
     record_hz: 20.0
     playback_rate_hz: 100.0
     entry_blend_sec: 0.5
+    reset_timeout_sec: 15.0
     # Official T800 upper-body gains: torso, left arm, right arm, head.
     playback_stiffness: [200.0, 30.0, 30.0, 15.0, 30.0, 15.0, 40.0, 40.0, 20.0, 40.0, 20.0, 100.0, 100.0]
     playback_damping: [3.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 3.0, 3.0]

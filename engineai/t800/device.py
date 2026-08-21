@@ -21,6 +21,7 @@ import time
 from collections import deque
 from dataclasses import asdict
 from pathlib import Path
+from uuid import uuid4
 
 import numpy as np
 from rclpy.node import Node
@@ -49,6 +50,7 @@ from control import (
     joint_payload,
     list_or_default,
     optional_floats,
+    resample_joint_trajectory,
     sensor_action_schema,
     sensor_tool,
     validate_joint_indices,
@@ -82,6 +84,34 @@ _AUDIO_QOS = QoSProfile(
     depth=200,
     durability=DurabilityPolicy.VOLATILE,
 )
+
+
+def _t800_acp_notify(action_id: str, status: str, result: dict, tool: str) -> None:
+    """Post asynchronous actuator completion to Agent Core."""
+    import ssl
+    import urllib.request
+
+    agent_core_url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    payload = json.dumps({
+        "action_id": action_id,
+        "status": status,
+        "result": result,
+        "tool": tool,
+        "ts": time.time(),
+    }).encode()
+    try:
+        request = urllib.request.Request(
+            f"{agent_core_url}/api/acp/complete",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(request, timeout=5, context=context)
+    except Exception as exc:
+        print(f"[motion_recorder] ACP notify failed for {action_id}: {exc}", flush=True)
 
 _LIFECYCLE_ACTIONS = {
     "start": ([], "启动卡片数据流"),
@@ -5149,7 +5179,6 @@ class MotionRecorderPlugin:
     # for smooth playback without overwhelming the trajectory buffer.
     _DEFAULT_RECORD_HZ = 20.0
     _MAX_FRAMES = 6000  # 5 minutes at 20 Hz
-    _UPPER_INDICES = tuple(range(12, 25))
     _DEFAULT_PLAYBACK_STIFFNESS = (
         200.0, 30.0, 30.0, 15.0, 30.0, 15.0,
         40.0, 40.0, 20.0, 40.0, 20.0, 100.0, 100.0,
@@ -5175,21 +5204,25 @@ class MotionRecorderPlugin:
             raise ValueError("motion_recorder.record_hz must be a positive finite number")
         self._record_period_sec = 1.0 / self._record_hz
         recorder_config = config.get("plugins", {}).get("motion_recorder", {})
+        self._upper_indices = tuple(T800_JOINT_GROUPS["upper_body"])
         self._playback_rate_hz = clamp(
             recorder_config.get("playback_rate_hz", 100.0), 50.0, 200.0
         )
         self._entry_blend_sec = clamp(
             recorder_config.get("entry_blend_sec", 0.5), 0.1, 3.0
         )
+        self._reset_timeout_sec = clamp(
+            recorder_config.get("reset_timeout_sec", 15.0), 1.0, 120.0
+        )
         self._playback_stiffness = float_list(
             recorder_config.get("playback_stiffness", self._DEFAULT_PLAYBACK_STIFFNESS),
             "playback_stiffness",
-            size=len(self._UPPER_INDICES),
+            size=len(self._upper_indices),
         )
         self._playback_damping = float_list(
             recorder_config.get("playback_damping", self._DEFAULT_PLAYBACK_DAMPING),
             "playback_damping",
-            size=len(self._UPPER_INDICES),
+            size=len(self._upper_indices),
         )
         record_dir = (
             config.get("plugins", {})
@@ -5217,6 +5250,7 @@ class MotionRecorderPlugin:
         self._motion_mode = None
         self._needs_reset = False
         self._reset_request_id: int | None = None
+        self._reset_action_id: str | None = None
         self._last_reset: dict | None = None
 
         # Playback state
@@ -5225,13 +5259,56 @@ class MotionRecorderPlugin:
         self._playing = False
         self._playback_label = ""
         self._playback_frame = 0
+        self._playback_action_id: str | None = None
+        self._last_playback_error: str | None = None
         self._override_publisher = None
         self._override_message_type = None
+        self._acp_notify = _t800_acp_notify
 
         # Latest joint state cache
         self._latest_joint_positions: list[float] | None = None
 
     def get_tool(self) -> dict:
+        input_schema = action_schema(
+            {
+                "record_start": (["label", "duration"], "开始录制关节轨迹"),
+                "record_stop": ([], "停止录制并自动保存"),
+                "play": (["name", "speed_scale"], "100Hz 平滑回放指定录制文件"),
+                "stop_playback": ([], "停止回放"),
+                "reset": ([], "恢复 lower_body_balance 默认姿态，完成后允许下一次录制"),
+                "save": (["name", "label"], "将当前录制保存到文件"),
+                "load": (["name"], "从文件加载录制到内存"),
+                "list": ([], "列出所有已保存的录制文件"),
+                "delete": (["name"], "删除指定录制文件"),
+                "status": ([], "查询录制/回放状态"),
+                "info": ([], "同 status"),
+            },
+            {
+                "label": {
+                    "type": "string",
+                    "description": "录制或保存的标签名",
+                },
+                "name": {
+                    "type": "string",
+                    "description": "录制文件名（不含 .json）",
+                },
+                "duration": {
+                    "type": "number",
+                    "description": "自动停止时间（秒），0=持续录制直到手动停止",
+                },
+                "speed_scale": {
+                    "type": "number",
+                    "minimum": 0.1,
+                    "maximum": 5.0,
+                    "description": "回放速度倍率，1.0=原速",
+                },
+            },
+            "运动录制/回放动作",
+        )
+        input_schema["x-completion"] = {
+            "actions": ["play", "reset"],
+            "timeout": 3600,
+        }
         return {
             "name": self.PREFIX,
             "type": "actuator",
@@ -5241,42 +5318,7 @@ class MotionRecorderPlugin:
                 "以 100Hz 平滑回放已录制的上肢轨迹。支持录制/停止/回放/复位/管理。"
                 "录制与回放均需 lower_body_balance；每段动作后需复位才可继续录制。"
             ),
-            "inputSchema": action_schema(
-                {
-                    "record_start": (["label", "duration"], "开始录制关节轨迹"),
-                    "record_stop": ([], "停止录制并自动保存"),
-                    "play": (["name", "speed_scale"], "100Hz 平滑回放指定录制文件"),
-                    "stop_playback": ([], "停止回放"),
-                    "reset": ([], "恢复 lower_body_balance 默认姿态，完成后允许下一次录制"),
-                    "save": (["name", "label"], "将当前录制保存到文件"),
-                    "load": (["name"], "从文件加载录制到内存"),
-                    "list": ([], "列出所有已保存的录制文件"),
-                    "delete": (["name"], "删除指定录制文件"),
-                    "status": ([], "查询录制/回放状态"),
-                    "info": ([], "同 status"),
-                },
-                {
-                    "label": {
-                        "type": "string",
-                        "description": "录制或保存的标签名",
-                    },
-                    "name": {
-                        "type": "string",
-                        "description": "录制文件名（不含 .json）",
-                    },
-                    "duration": {
-                        "type": "number",
-                        "description": "自动停止时间（秒），0=持续录制直到手动停止",
-                    },
-                    "speed_scale": {
-                        "type": "number",
-                        "minimum": 0.1,
-                        "maximum": 5.0,
-                        "description": "回放速度倍率，1.0=原速",
-                    },
-                },
-                "运动录制/回放动作",
-            ),
+            "inputSchema": input_schema,
         }
 
     def start(self) -> None:
@@ -5312,8 +5354,17 @@ class MotionRecorderPlugin:
 
     def stop(self) -> None:
         self._finalize_recording(stop_reason="shutdown")
-        self._playback_stop.set()
-        self._publish_override_release()
+        self._stop_playback()
+        with self._lock:
+            reset_action_id = self._reset_action_id
+            reset_request_id = self._reset_request_id
+            self._reset_action_id = None
+            self._reset_request_id = None
+        if reset_action_id:
+            self._acp_notify(reset_action_id, "cancelled", {
+                "request_id": reset_request_id,
+                "reason": "plugin_stopped",
+            }, self.PREFIX)
         if self._node:
             try:
                 self._node.destroy_node()
@@ -5328,6 +5379,11 @@ class MotionRecorderPlugin:
         sampled_at = time.monotonic()
         with self._lock:
             self._latest_joint_positions = list(positions)
+            recording = self._recording
+        if recording and self._lower_body_balance_error("recording"):
+            self._finalize_recording(stop_reason="motion_state_changed")
+            return
+        with self._lock:
             if not self._recording or len(self._frames) >= self._MAX_FRAMES:
                 return
             if (
@@ -5576,15 +5632,27 @@ class MotionRecorderPlugin:
 
         speed_scale = clamp(float(args.get("speed_scale", 1.0)), 0.1, 5.0)
         try:
-            samples = self._resample_playback(frames, speed_scale)
+            with self._lock:
+                current_positions = list(self._latest_joint_positions or [])
+            samples = resample_joint_trajectory(
+                frames,
+                joint_indices=self._upper_indices,
+                current_positions=current_positions,
+                playback_rate_hz=self._playback_rate_hz,
+                speed_scale=speed_scale,
+                entry_blend_sec=self._entry_blend_sec,
+            )
         except (TypeError, ValueError) as exc:
             return {"error": f"invalid recording: {exc}"}
         self._playback_stop.clear()
+        action_id = f"t800_motion_play_{uuid4().hex[:12]}"
 
         with self._lock:
             self._playing = True
             self._playback_label = label
             self._playback_frame = 0
+            self._playback_action_id = action_id
+            self._last_playback_error = None
 
         def run():
             published = 0
@@ -5594,6 +5662,12 @@ class MotionRecorderPlugin:
                 for i, (position, velocity) in enumerate(samples):
                     if self._playback_stop.is_set():
                         break
+                    mode_error = self._lower_body_balance_error("playback")
+                    if mode_error:
+                        raise RuntimeError(mode_error["error"])
+                    now = time.monotonic()
+                    if now - deadline > period:
+                        deadline = now
                     wait_time = deadline - time.monotonic()
                     if wait_time > 0 and self._playback_stop.wait(wait_time):
                         break
@@ -5607,20 +5681,40 @@ class MotionRecorderPlugin:
                     self._publish_override(position, velocity, weight=1.0)
                     published += 1
                     deadline += period
-            finally:
-                self._publish_override_release()
+            except Exception as exc:
                 with self._lock:
-                    if published:
-                        self._needs_reset = True
-                        self._reset_request_id = None
-                    self._playing = False
-                    self._playback_label = ""
+                    self._last_playback_error = str(exc)
+            finally:
+                try:
+                    self._publish_override_release()
+                finally:
+                    with self._lock:
+                        if published:
+                            self._needs_reset = True
+                            self._reset_request_id = None
+                        self._playing = False
+                        self._playback_label = ""
+                        error = self._last_playback_error
+                        if self._playback_action_id == action_id:
+                            self._playback_action_id = None
+                    completion = (
+                        "cancelled"
+                        if self._playback_stop.is_set()
+                        else ("error" if error else "completed")
+                    )
+                    self._acp_notify(action_id, completion, {
+                        "label": label,
+                        "frames": len(frames),
+                        "samples_published": published,
+                        "error": error,
+                    }, self.PREFIX)
 
         self._playback_thread = threading.Thread(target=run, daemon=True, name="t800-motion-playback")
         self._playback_thread.start()
 
         return {
             "state": "playing",
+            "action_id": action_id,
             "label": label,
             "frames": len(frames),
             "samples": len(samples),
@@ -5635,98 +5729,6 @@ class MotionRecorderPlugin:
             ),
         }
 
-    def _resample_playback(self, frames: list[dict], speed_scale: float) -> list[tuple[list[float], list[float]]]:
-        timestamps = np.asarray([float(frame["timestamp"]) for frame in frames], dtype=float)
-        if timestamps.ndim != 1 or len(timestamps) < 2:
-            raise ValueError("at least two timestamped frames are required")
-        timestamps = (timestamps - timestamps[0]) / 1000.0 / speed_scale
-        if np.any(np.diff(timestamps) <= 0):
-            raise ValueError("frame timestamps must be strictly increasing")
-
-        positions = np.asarray(
-            [
-                [float(frame["positions"][index]) for index in self._UPPER_INDICES]
-                for frame in frames
-            ],
-            dtype=float,
-        )
-        if positions.shape != (len(frames), len(self._UPPER_INDICES)):
-            raise ValueError("each frame must contain all 25 T800 joint positions")
-        if not np.all(np.isfinite(positions)):
-            raise ValueError("joint positions must be finite")
-
-        duration = float(timestamps[-1])
-        sample_count = max(2, int(math.ceil(duration * self._playback_rate_hz)) + 1)
-        sample_times = np.linspace(0.0, duration, sample_count)
-        tangents = np.gradient(positions, timestamps, axis=0)
-        segments = np.searchsorted(timestamps, sample_times, side="right") - 1
-        segments = np.clip(segments, 0, len(timestamps) - 2)
-        left_time = timestamps[segments]
-        segment_duration = timestamps[segments + 1] - left_time
-        phase = (sample_times - left_time) / segment_duration
-        phase2 = phase * phase
-        phase3 = phase2 * phase
-        h00 = 2.0 * phase3 - 3.0 * phase2 + 1.0
-        h10 = phase3 - 2.0 * phase2 + phase
-        h01 = -2.0 * phase3 + 3.0 * phase2
-        h11 = phase3 - phase2
-        left_position = positions[segments]
-        right_position = positions[segments + 1]
-        sampled_positions = (
-            h00[:, None] * left_position
-            + h10[:, None] * segment_duration[:, None] * tangents[segments]
-            + h01[:, None] * right_position
-            + h11[:, None] * segment_duration[:, None] * tangents[segments + 1]
-        )
-        sampled_positions = np.clip(
-            sampled_positions,
-            np.minimum(left_position, right_position),
-            np.maximum(left_position, right_position),
-        )
-        sampled_velocities = np.gradient(sampled_positions, sample_times, axis=0)
-
-        with self._lock:
-            latest = list(self._latest_joint_positions or [])
-        if len(latest) < max(self._UPPER_INDICES) + 1:
-            raise ValueError("current joint state is unavailable for entry blend")
-        current = np.asarray([latest[index] for index in self._UPPER_INDICES], dtype=float)
-        blend_count = max(2, int(math.ceil(self._entry_blend_sec * self._playback_rate_hz)) + 1)
-        blend_times = np.linspace(0.0, self._entry_blend_sec, blend_count)
-        blend_duration = self._entry_blend_sec
-        delta = sampled_positions[0] - current
-        initial_velocity = np.zeros_like(current)
-        final_velocity = sampled_velocities[0]
-        a0 = current
-        a1 = initial_velocity
-        a2 = np.zeros_like(current)
-        a3 = (
-            20.0 * delta
-            - (8.0 * final_velocity + 12.0 * initial_velocity) * blend_duration
-        ) / (2.0 * blend_duration**3)
-        a4 = (
-            -30.0 * delta
-            + (14.0 * final_velocity + 16.0 * initial_velocity) * blend_duration
-        ) / (2.0 * blend_duration**4)
-        a5 = (
-            12.0 * delta
-            - 6.0 * (final_velocity + initial_velocity) * blend_duration
-        ) / (2.0 * blend_duration**5)
-        t = blend_times[:, None]
-        blend_positions = a0 + a1 * t + a2 * t**2 + a3 * t**3 + a4 * t**4 + a5 * t**5
-        blend_positions = np.clip(
-            blend_positions,
-            np.minimum(current, sampled_positions[0]),
-            np.maximum(current, sampled_positions[0]),
-        )
-        blend_velocities = np.gradient(blend_positions, blend_times, axis=0)
-        sampled_positions = np.vstack((blend_positions, sampled_positions[1:]))
-        sampled_velocities = np.vstack((blend_velocities, sampled_velocities[1:]))
-        sample_count = len(sampled_positions)
-        return [
-            (sampled_positions[index].tolist(), sampled_velocities[index].tolist())
-            for index in range(sample_count)
-        ]
-
     def _publish_override(self, position: list[float], velocity: list[float], *, weight: float) -> None:
         if self._override_publisher is None or self._override_message_type is None:
             raise RuntimeError("joint override publisher is not initialized")
@@ -5734,11 +5736,11 @@ class MotionRecorderPlugin:
         msg.header.stamp = self._node.get_clock().now().to_msg()
         msg.header.frame_id = ""
         msg.weight = float(weight)
-        msg.joint_indices = list(self._UPPER_INDICES)
+        msg.joint_indices = list(self._upper_indices)
         msg.position = list(position)
         msg.velocity = list(velocity)
-        msg.feed_forward_torque = [0.0] * len(self._UPPER_INDICES)
-        msg.torque = [0.0] * len(self._UPPER_INDICES)
+        msg.feed_forward_torque = [0.0] * len(self._upper_indices)
+        msg.torque = [0.0] * len(self._upper_indices)
         msg.stiffness = list(self._playback_stiffness)
         msg.damping = list(self._playback_damping)
         self._override_publisher.publish(msg)
@@ -5746,8 +5748,12 @@ class MotionRecorderPlugin:
     def _publish_override_release(self) -> None:
         if self._override_publisher is None:
             return
-        zeros = [0.0] * len(self._UPPER_INDICES)
-        self._publish_override(zeros, zeros, weight=0.0)
+        zeros = [0.0] * len(self._upper_indices)
+        try:
+            self._publish_override(zeros, zeros, weight=0.0)
+        except Exception as exc:
+            with self._lock:
+                self._last_playback_error = str(exc)
 
     def _stop_playback(self) -> dict:
         self._playback_stop.set()
@@ -5893,6 +5899,7 @@ class MotionRecorderPlugin:
                 "record_session_id": self._record_session if self._recording else None,
                 "playback_label": self._playback_label if self._playing else "",
                 "playback_frame": self._playback_frame if self._playing else 0,
+                "playback_error": self._last_playback_error,
                 "recordings_dir": str(self._recordings_dir),
                 "joint_data_available": self._latest_joint_positions is not None,
                 "last_recording": dict(self._last_recording) if self._last_recording else None,
@@ -5914,7 +5921,10 @@ class MotionRecorderPlugin:
 
     def _lower_body_balance_error(self, operation: str) -> dict | None:
         if self._state is None:
-            return None
+            return {
+                "error": f"{operation} blocked: motion state is unavailable",
+                "current_motion_state": None,
+            }
         current, _ = self._state.current_motion()
         if current == "lower_body_balance":
             return None
@@ -5934,6 +5944,8 @@ class MotionRecorderPlugin:
         if joint_plan is None or self._state is None or self._motion_mode is None:
             return {"error": "reset controls are unavailable"}
 
+        # Release any active upper-body override before changing the robot FSM.
+        self._stop_playback()
         current, available = self._state.current_motion()
         if current != "lower_body_balance":
             if "lower_body_balance" not in available:
@@ -5956,20 +5968,31 @@ class MotionRecorderPlugin:
                     "mode_result": mode_result,
                 }
 
-        self._stop_playback()
         result = joint_plan.dispatch("reset", {})
         if "error" in result:
             return result
         request_id = result.get("request_id")
+        if request_id is None:
+            return {"error": "joint planner reset did not return request_id"}
+        action_id = f"t800_motion_reset_{uuid4().hex[:12]}"
         with self._lock:
             self._needs_reset = True
-            self._reset_request_id = int(request_id) if request_id is not None else None
+            self._reset_request_id = int(request_id)
+            self._reset_action_id = action_id
             self._last_reset = {
                 "state": "resetting",
                 "request_id": self._reset_request_id,
+                "action_id": action_id,
                 "motion_state": current,
             }
-            return dict(self._last_reset)
+            response = dict(self._last_reset)
+        threading.Thread(
+            target=self._monitor_reset,
+            args=(int(request_id), action_id),
+            daemon=True,
+            name="t800-motion-reset-monitor",
+        ).start()
+        return response
 
     def _refresh_reset_state(self) -> None:
         with self._lock:
@@ -5982,12 +6005,53 @@ class MotionRecorderPlugin:
             int(status.get("request_id", -1)) == request_id
             and int(status.get("status", -1)) == 1
         ):
+            completed_action_id = None
             with self._lock:
                 if self._reset_request_id == request_id:
+                    completed_action_id = self._reset_action_id
                     self._reset_request_id = None
+                    self._reset_action_id = None
                     self._needs_reset = False
                     self._last_reset = {
                         "state": "completed",
                         "request_id": request_id,
+                        "action_id": completed_action_id,
                         "motion_state": "lower_body_balance",
                     }
+            if completed_action_id:
+                self._acp_notify(completed_action_id, "completed", {
+                    "request_id": request_id,
+                    "motion_state": "lower_body_balance",
+                }, self.PREFIX)
+
+    def _monitor_reset(self, request_id: int, action_id: str) -> None:
+        deadline = time.monotonic() + self._reset_timeout_sec
+        while time.monotonic() < deadline:
+            with self._lock:
+                if (
+                    self._reset_request_id != request_id
+                    or self._reset_action_id != action_id
+                ):
+                    return
+            self._refresh_reset_state()
+            time.sleep(0.05)
+        with self._lock:
+            if (
+                self._reset_request_id != request_id
+                or self._reset_action_id != action_id
+            ):
+                return
+            self._reset_request_id = None
+            self._reset_action_id = None
+            self._needs_reset = True
+            self._last_reset = {
+                "state": "error",
+                "request_id": request_id,
+                "action_id": action_id,
+                "motion_state": "lower_body_balance",
+                "error": "reset timeout",
+            }
+        self._acp_notify(action_id, "error", {
+            "request_id": request_id,
+            "error": "reset timeout",
+        }, self.PREFIX)
