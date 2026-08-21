@@ -69,8 +69,7 @@ def _ensure_activated() -> dict:
 
     try:
         result = subprocess.run(
-            ["ros2", "service", "call", "/activate_service",
-             "std_srvs/srv/Trigger", "--conn-state-timeout", "5"],
+            ["ros2", "service", "call", "/activate_service", "std_srvs/srv/Trigger"],
             capture_output=True, text=True, timeout=15, env=env,
         )
         if result.returncode != 0:
