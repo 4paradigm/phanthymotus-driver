@@ -93,14 +93,23 @@ MOTION_STATES = (
     "idle",
     "passive",
     "pd_stand",
-    "walk",
-    "dance",
-    "supine_to_stance",
-    "stance_to_supine",
-    "joint_bridge",
+    "rl_basic",
     "lower_body_balance",
+    "joint_bridge",
+    "pd_sitground",
+    "walk_server",
+    "rl_mimic_supine_to_stance",
+    "rl_mimic_stance_to_supine",
+    "rl_mimic_left_to_right",
+    "rl_mimic_right_to_left",
+    "rl_amp",
     "rl_terrain",
+    "rl_recover_prone",
+    "rl_floor_sitting",
+    "dance",
 )
+
+WALK_MOTION_STATES = ("rl_basic", "lower_body_balance")
 
 LED_MODES = {
     "blink_red": 0x1,
@@ -350,8 +359,10 @@ def action_schema(
     actions: dict[str, tuple[list[str], str]],
     properties: dict,
     description: str,
+    *,
+    completion: tuple[list[str], int] | None = None,
 ) -> dict:
-    return {
+    schema = {
         "type": "object",
         "properties": {
             "action": {
@@ -367,6 +378,12 @@ def action_schema(
             for name, (params, action_description) in actions.items()
         },
     }
+    if completion is not None:
+        schema["x-completion"] = {
+            "actions": completion[0],
+            "timeout": completion[1],
+        }
+    return schema
 
 
 def sensor_action_schema() -> dict:

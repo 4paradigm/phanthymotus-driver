@@ -12,6 +12,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from control import (  # noqa: E402
+    MOTION_STATES,
+    WALK_MOTION_STATES,
     T800_JOINT_POSITION_LIMITS,
     T800_JOINT_NAMES,
     RepeatingCommand,
@@ -107,6 +109,34 @@ class ValidationTests(unittest.TestCase):
         self.assertTrue(tool["readOnly"])
         self.assertEqual("sensor", tool["type"])
         self.assertEqual("/robot/state/imu", tool["topic_out"][0]["topic"])
+
+    def test_action_schema_with_completion(self):
+        schema = action_schema(
+            {"move": (["vx"], "move"), "stop": ([], "stop")},
+            {"vx": {"type": "number"}},
+            "action",
+            completion=(["move"], 60),
+        )
+        self.assertEqual(["move"], schema["x-completion"]["actions"])
+        self.assertEqual(60, schema["x-completion"]["timeout"])
+
+    def test_action_schema_without_completion_omits_key(self):
+        schema = action_schema(
+            {"move": (["vx"], "move")},
+            {"vx": {"type": "number"}},
+            "action",
+        )
+        self.assertNotIn("x-completion", schema)
+
+    def test_motion_states_has_17_official_values(self):
+        self.assertEqual(17, len(MOTION_STATES))
+        self.assertIn("rl_basic", MOTION_STATES)
+        self.assertIn("lower_body_balance", MOTION_STATES)
+        self.assertIn("rl_mimic_supine_to_stance", MOTION_STATES)
+        self.assertIn("rl_mimic_stance_to_supine", MOTION_STATES)
+
+    def test_walk_motion_states_matches_official_walking_modes(self):
+        self.assertEqual(("rl_basic", "lower_body_balance"), WALK_MOTION_STATES)
 
 
 class RepeatingCommandTests(unittest.TestCase):
