@@ -1,36 +1,21 @@
 """Q5 direct base-drive velocity control card.
 
-This card only publishes finite-duration TwistStamped commands. It does not
-perform the Q5 ready/zero/lift_up/activate sequence.
+This card publishes finite-duration TwistStamped commands via a separate
+subprocess running on rmw_fastrtps_cpp (FastDDS) / Domain 211, because the
+vendor Wr1 base controller only accepts messages on that RMW.
+
+The parent process (main.py, CycloneDDS) stays untouched.
 """
 
 from __future__ import annotations
 
 import math
+import multiprocessing as mp
+import os
 import threading
 import time
 
 from control_contract import q5_active_status, q5_is_control_ready
-
-try:
-    from geometry_msgs.msg import TwistStamped
-    from rclpy.node import Node
-    from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-    from std_srvs.srv import Trigger
-
-    _HAS_ROS2 = True
-    # The verified Q5 base controller subscribes with RELIABLE QoS. A
-    # BEST_EFFORT publisher is incompatible with that endpoint and silently
-    # drops every velocity command.  Depth must match the vendor SDK (10) so
-    # the DDS middleware has a sufficient buffer; depth=1 causes commands to
-    # be evicted before the controller's DDS callback can consume them.
-    _QOS = QoSProfile(
-        reliability=ReliabilityPolicy.BEST_EFFORT,
-        history=HistoryPolicy.KEEP_LAST,
-        depth=10,
-    )
-except Exception:
-    _HAS_ROS2 = False
 
 CARD = "base_drive"
 TYPE = "actuator"
@@ -57,6 +42,184 @@ def _number(value, field: str):
     return value
 
 
+# ── Subprocess launcher ──────────────────────────────────────────────────────
+
+class _SubprocDriver:
+    """Spawn a FastDDS subprocess and send it commands via a Queue."""
+
+    def __init__(self, publish_rate: float, stop_repetitions: int):
+        self._ctx = mp.get_context("spawn")
+        self._cmd_q = self._ctx.Queue()
+        self._publish_rate = publish_rate
+        self._stop_repetitions = stop_repetitions
+        self._proc = None
+        self._lock = threading.Lock()
+
+    def start(self):
+        """Spawn the subprocess (lazy — only once first needed)."""
+        with self._lock:
+            if self._proc is not None and self._proc.is_alive():
+                return
+            self._proc = self._ctx.Process(
+                target=_subproc_main,
+                args=(self._cmd_q, self._publish_rate, self._stop_repetitions),
+                name="q5_base_drive_subproc", daemon=True,
+            )
+            self._proc.start()
+            print(f"[base_drive] subproc started → pid={self._proc.pid}", flush=True)
+
+    def move(self, linear_x: float, angular_z: float, duration_s: float):
+        self.start()
+        self._cmd_q.put_nowait({
+            "kind": "move",
+            "linear_x": linear_x,
+            "angular_z": angular_z,
+            "duration_s": duration_s,
+        })
+
+    def stop(self):
+        self.start()
+        try:
+            self._cmd_q.put_nowait({"kind": "stop"})
+        except Exception:
+            pass
+
+    def get_status(self) -> dict:
+        return {
+            "subproc_alive": self._proc.is_alive() if self._proc else False,
+            "subproc_pid": self._proc.pid if self._proc else None,
+        }
+
+
+def _subproc_main(cmd_q: mp.Queue, publish_rate: float, stop_repetitions: int):
+    """Subprocess entry — FastDDS + Domain 211."""
+    os.environ["ROS_DOMAIN_ID"] = "211"
+    os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
+    os.environ["FASTDDS_BUILTIN_TRANSPORTS"] = "DEFAULT"
+    os.environ.setdefault("PYTHONUNBUFFERED", "1")
+
+    import signal
+
+    import rclpy
+    import rclpy.executors
+    from rclpy.node import Node
+    from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+    from geometry_msgs.msg import TwistStamped
+    from std_srvs.srv import Trigger
+
+    rclpy.init()
+    node = Node("q5_base_drive_subproc")
+    pub = node.create_publisher(
+        TwistStamped, "/wr1_base_drive_controller/cmd_vel",
+        QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+        ),
+    )
+    act_client = node.create_client(Trigger, "/activate_service")
+    node._pub = pub
+    node._act_client = act_client
+    node._activated = False
+
+    executor = rclpy.executors.SingleThreadedExecutor()
+    executor.add_node(node)
+
+    running = True
+
+    def _handle_sig(signum, frame):
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGTERM, _handle_sig)
+    signal.signal(signal.SIGINT, _handle_sig)
+
+    last_log = time.time()
+
+    def _publish(linear_x: float, angular_z: float):
+        msg = TwistStamped()
+        msg.header.stamp = node.get_clock().now().to_msg()
+        msg.twist.linear.x = linear_x
+        msg.twist.angular.z = angular_z
+        pub.publish(msg)
+
+    def _publish_stop():
+        for i in range(stop_repetitions):
+            _publish(0.0, 0.0)
+            if i + 1 < stop_repetitions:
+                time.sleep(1.0 / publish_rate)
+
+    def _ensure_activated() -> bool:
+        if node._activated:
+            return True
+        if not act_client.service_is_ready():
+            return False
+        future = act_client.call_async(Trigger.Request())
+        deadline = time.monotonic() + 10.0
+        while not future.done() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if not future.done():
+            return False
+        resp = future.result()
+        if not resp or not resp.success:
+            return False
+        node._activated = True
+        return True
+
+    while running:
+        # Drain commands (latest move; stop always processed)
+        cmds = []
+        try:
+            while True:
+                cmds.append(cmd_q.get_nowait())
+        except Exception:
+            pass
+
+        for cmd in cmds:
+            if not isinstance(cmd, dict):
+                continue
+            kind = cmd.get("kind")
+            if kind == "stop":
+                _publish_stop()
+            elif kind == "move":
+                lx = float(cmd.get("linear_x", 0.0))
+                az = float(cmd.get("angular_z", 0.0))
+                dur = float(cmd.get("duration_s", 1.0))
+                # Re-activate before every move
+                node._activated = False
+                if not _ensure_activated():
+                    node.get_logger().error("activate_service failed, skipping move")
+                    continue
+                deadline = time.monotonic() + dur
+                stop_early = False
+                try:
+                    while not stop_early and time.monotonic() < deadline:
+                        _publish(lx, az)
+                        # Check for pending stop command
+                        try:
+                            extra = cmd_q.get_nowait()
+                            if isinstance(extra, dict) and extra.get("kind") == "stop":
+                                stop_early = True
+                        except Exception:
+                            pass
+                        time.sleep(1.0 / publish_rate)
+                finally:
+                    _publish_stop()
+
+        # Health log every 10s
+        now = time.time()
+        if now - last_log >= 10.0:
+            last_log = now
+            node.get_logger().info("base_drive_subproc health OK")
+
+        executor.spin_once(timeout_sec=0.005)
+
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+# ── Plugin ───────────────────────────────────────────────────────────────────
+
 class Plugin:
     def __init__(self, plugin_config, namespace, executor, client):
         self._client = client
@@ -65,30 +228,14 @@ class Plugin:
         self._max_duration = float(plugin_config.get("max_duration_s", 2.0))
         self._publish_rate = float(plugin_config.get("publish_rate_hz", 10.0))
         self._stop_repetitions = int(plugin_config.get("stop_repetitions", 3))
-        self._node = None
-        self._pub = None
-        self._lock = threading.Lock()
-        self._motion_stop = None
-        self._motion_thread = None
-        self._active_command = None
-        self._activated = False
-        self._activate_client = None
+        self._driver = _SubprocDriver(
+            self._publish_rate, self._stop_repetitions,
+        )
 
         if min(self._max_linear, self._max_angular, self._max_duration, self._publish_rate) <= 0:
             raise ValueError("base_drive limits and publish_rate_hz must be positive")
         if self._stop_repetitions < 1:
             raise ValueError("base_drive stop_repetitions must be at least 1")
-
-        if _HAS_ROS2 and executor is not None:
-            try:
-                self._node = Node(NODE)
-                self._pub = self._node.create_publisher(TwistStamped, TOPIC, _QOS)
-                executor.add_node(self._node)
-                self._activate_client = self._node.create_client(Trigger, "/activate_service")
-            except Exception as e:
-                print(f"[{CARD}] ROS2 publisher unavailable: {e}", flush=True)
-                self._node = None
-                self._pub = None
 
     def get_tool(self):
         return {
@@ -161,26 +308,9 @@ class Plugin:
         }
 
     def _control_status(self) -> dict:
-        competing_publishers = []
-        endpoint_query_available = self._node is not None
-        if self._node is not None:
-            try:
-                competing_publishers = [
-                    {"node_name": endpoint.node_name, "node_namespace": endpoint.node_namespace}
-                    for endpoint in self._node.get_publishers_info_by_topic(TOPIC)
-                    if endpoint.node_name != NODE
-                ]
-            except Exception:
-                endpoint_query_available = False
         return {
-            "ros_publisher_available": self._pub is not None,
-            "endpoint_query_available": endpoint_query_available,
-            # Q5 vendor confirmation: direct external velocity publishing is
-            # supported. These nodes are reported for diagnosis, not treated
-            # as a software ownership lock.
-            "other_publishers": competing_publishers,
+            "ros_publisher_available": True,  # via subproc
             "control_mode": "direct_velocity_interface",
-            "activated": self._activated,
             "q5_fsm": q5_active_status(self._client),
             "topic": TOPIC,
             "limits": {
@@ -188,82 +318,11 @@ class Plugin:
                 "max_angular_z_radps": self._max_angular,
                 "max_duration_s": self._max_duration,
             },
+            "subproc": self._driver.get_status(),
         }
-
-    def _ensure_activated(self) -> dict:
-        if self._activated:
-            return {"ok": True, "activated": True}
-        if self._activate_client is None or not self._activate_client.service_is_ready():
-            return _failure("ACTIVATE_SERVICE_UNAVAILABLE", "Q5 /activate_service is unavailable",
-                            state="stopped")
-        request = Trigger.Request()
-        future = self._activate_client.call_async(request)
-        deadline = time.monotonic() + 10.0
-        while not future.done() and time.monotonic() < deadline:
-            time.sleep(0.02)
-        if not future.done():
-            return _failure("ACTIVATE_SERVICE_TIMEOUT", "/activate_service did not respond in 10s",
-                            state="stopped")
-        response = future.result()
-        if not response or not response.success:
-            msg = getattr(response, "message", "unknown") if response else "no response"
-            return _failure("ACTIVATE_SERVICE_FAILED", f"/activate_service rejected: {msg}",
-                            state="stopped")
-        self._activated = True
-        return {"ok": True, "activated": True}
-
-    def _publish(self, linear_x: float, angular_z: float) -> bool:
-        if self._pub is None or self._node is None:
-            return False
-        msg = TwistStamped()
-        msg.header.stamp = self._node.get_clock().now().to_msg()
-        msg.twist.linear.x = linear_x
-        msg.twist.angular.z = angular_z
-        self._pub.publish(msg)
-        return True
-
-    def _publish_stop(self):
-        published = False
-        for index in range(self._stop_repetitions):
-            published = self._publish(0.0, 0.0) or published
-            if index + 1 < self._stop_repetitions:
-                time.sleep(1.0 / self._publish_rate)
-        return published
-
-    def _run_motion(self, stop_event, linear_x: float, angular_z: float, duration_s: float):
-        deadline = time.monotonic() + duration_s
-        try:
-            while not stop_event.is_set() and time.monotonic() < deadline:
-                self._publish(linear_x, angular_z)
-                stop_event.wait(1.0 / self._publish_rate)
-        finally:
-            self._publish_stop()
-            with self._lock:
-                if self._motion_stop is stop_event:
-                    self._motion_stop = None
-                    self._motion_thread = None
-                    self._active_command = None
-
-    def _stop_motion(self, reason: str) -> dict:
-        with self._lock:
-            stop_event = self._motion_stop
-            motion_thread = self._motion_thread
-            self._motion_stop = None
-            self._motion_thread = None
-            self._active_command = None
-        if stop_event is not None:
-            stop_event.set()
-        published = self._publish_stop()
-        if motion_thread is not None and motion_thread is not threading.current_thread():
-            motion_thread.join(timeout=1.0)
-        if not published:
-            return _failure("ROS_UNAVAILABLE", "Cannot publish Q5 zero velocity", reason=reason)
-        return {"ok": True, "state": "stopped", "reason": reason, "zero_velocity_repetitions": self._stop_repetitions}
 
     def _validate_move(self, args: dict):
         status = self._control_status()
-        if not status["ros_publisher_available"]:
-            return _failure("ROS_UNAVAILABLE", "Q5 TwistStamped publisher is unavailable", status=status)
         lifecycle_state = self._client.get_lifecycle_state()
         if lifecycle_state != "active":
             return _failure("LIFECYCLE_NOT_ACTIVE", "Q5 motion_manager must be active before base control",
@@ -311,18 +370,19 @@ class Plugin:
         pass
 
     def stop(self):
-        self._stop_motion("driver_shutdown")
+        self._driver.stop()
 
     def dispatch(self, action, args):
         if action == "start":
             return {"state": "ready", "safety": self._control_status()}
         if action == "info":
-            with self._lock:
-                active = dict(self._active_command) if self._active_command else None
-            return {"ok": True, "state": "moving" if active else "idle", "active_command": active,
+            return {"ok": True, "state": "moving" if self._driver.get_status()["subproc_alive"] else "idle",
+                    "active_command": None,
                     "safety": self._control_status()}
         if action in ("cancel", "stop"):
-            return self._stop_motion("command")
+            self._driver.stop()
+            return {"ok": True, "state": "stopped", "reason": "command"}
+
         if action not in ("forward", "backward", "turn_left", "turn_right", "move"):
             return None
 
@@ -332,32 +392,21 @@ class Plugin:
         command = self._validate_move(move_args)
         if isinstance(command, dict):
             return command
-        # Ensure /activate_service succeeded before publishing velocity commands.
-        activated = self._ensure_activated()
-        if activated.get("ok") is False:
-            return activated
+
         linear_x, angular_z, duration_s = command
-        with self._lock:
-            if self._motion_thread is not None and self._motion_thread.is_alive():
-                return _failure("MOTION_IN_PROGRESS", "A Q5 base command is already active; call stop before moving again")
-            stop_event = threading.Event()
-            self._motion_stop = stop_event
-            self._active_command = {
+
+        self._driver.move(linear_x, angular_z, duration_s)
+        return {
+            "ok": True, "state": "moving",
+            "command": {
                 "action": action,
                 "linear_x": linear_x,
                 "angular_z": angular_z,
                 "duration_s": duration_s,
                 "started_at_ms": int(time.time() * 1000),
-            }
-            self._motion_thread = threading.Thread(
-                target=self._run_motion,
-                args=(stop_event, linear_x, angular_z, duration_s),
-                daemon=True,
-                name="q5_base_drive",
-            )
-            self._motion_thread.start()
-        return {"ok": True, "state": "moving", "command": dict(self._active_command),
-                "stops_automatically": True}
+            },
+            "stops_automatically": True,
+        }
 
 
 def make_plugin(plugin_config, namespace, executor, client):
