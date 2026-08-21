@@ -46,11 +46,11 @@ plugins:
     enabled: true
   camera:
     enabled: true
-    # Versioned binary envelopes are published beside the untouched legacy
+    # Self-describing binary frames are published beside the untouched legacy
     # CompressedImage/Image topics. Camera failures remain isolated from loco.
-    v2_enabled: true
-    rgb_v2_topic: /ubuntu/navigation/camera/rgb
-    depth_v2_topic: /ubuntu/navigation/camera/depth
+    frame_enabled: true
+    rgb_frame_topic: /ubuntu/camera/rgb_frame
+    depth_frame_topic: /ubuntu/camera/depth_frame
     lidar_camera_calibration: /work/calibration/g1_factory_nominal_lidar_camera.yaml
     clock_warmup_samples: 8
     clock_window_samples: 300

@@ -4,8 +4,10 @@ import unittest
 
 import yaml
 
-from camera_v2 import (
+from camera_frame import (
     DEPTH_SCHEMA,
+    ENVELOPE_FORMAT,
+    ENVELOPE_MAGIC,
     RGB_SCHEMA,
     CameraFrameTiming,
     RealSenseClockNormalizer,
@@ -37,6 +39,14 @@ def make_intrinsics(width=640, height=480, fx=600.0):
 
 
 class CameraEnvelopeTest(unittest.TestCase):
+    def test_public_contract_uses_frame_v1_names(self):
+        self.assertEqual(ENVELOPE_MAGIC, b"PSE1")
+        self.assertEqual(
+            ENVELOPE_FORMAT, "application/vnd.phanthy.sensor-envelope.v1"
+        )
+        self.assertEqual(RGB_SCHEMA, "phanthy.sensor.camera_rgb_frame.v1")
+        self.assertEqual(DEPTH_SCHEMA, "phanthy.sensor.camera_depth_frame.v1")
+
     def test_binary_envelope_round_trip(self):
         metadata = {"schema": RGB_SCHEMA, "header": {"stamp_ns": None}}
         payload = b"\xff\xd8jpeg\xff\xd9"
@@ -201,12 +211,14 @@ class CameraCalibrationTest(unittest.TestCase):
 
 
 class DriverCameraContractTest(unittest.TestCase):
-    def test_driver_registers_v2_topics_without_replacing_legacy(self):
+    def test_driver_registers_frame_topics_without_replacing_legacy(self):
         source = (G1_DIR / "device.py").read_text(encoding="utf-8")
         self.assertIn('self._color_topic = f"/{namespace}/camera/rgb"', source)
         self.assertIn('self._depth_topic = f"/{namespace}/camera/depth"', source)
-        self.assertIn('"name": "camera_rgb_v2"', source)
-        self.assertIn('"name": "camera_depth_v2"', source)
+        self.assertIn('"name": "camera_rgb_frame"', source)
+        self.assertIn('"name": "camera_depth_frame"', source)
+        self.assertNotIn('"name": "camera_rgb_v2"', source)
+        self.assertNotIn('"name": "camera_depth_v2"', source)
         self.assertIn('"ros_type": "std_msgs/msg/UInt8MultiArray"', source)
         self.assertIn('depth=1', source)
 
@@ -222,13 +234,13 @@ class DriverCameraContractTest(unittest.TestCase):
         self.assertIn('self._sequence = {"rgb": 0, "depth": 0}', start_capture)
         self.assertIn("self.stop_capture(reconnecting=True)", start_capture)
 
-    def test_container_and_config_include_v2_runtime_files(self):
+    def test_container_and_config_include_frame_runtime_files(self):
         config = yaml.safe_load((G1_DIR / "config.yaml").read_text(encoding="utf-8"))
         camera = config["plugins"]["camera"]
-        self.assertEqual(camera["rgb_v2_topic"], "/ubuntu/navigation/camera/rgb")
-        self.assertEqual(camera["depth_v2_topic"], "/ubuntu/navigation/camera/depth")
+        self.assertEqual(camera["rgb_frame_topic"], "/ubuntu/camera/rgb_frame")
+        self.assertEqual(camera["depth_frame_topic"], "/ubuntu/camera/depth_frame")
         dockerfile = (G1_DIR / "Dockerfile").read_text(encoding="utf-8")
-        self.assertIn("COPY camera_v2.py /work/camera_v2.py", dockerfile)
+        self.assertIn("COPY camera_frame.py /work/camera_frame.py", dockerfile)
         self.assertIn("COPY calibration/ /work/calibration/", dockerfile)
 
 

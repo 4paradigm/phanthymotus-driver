@@ -1,4 +1,4 @@
-"""Versioned RealSense RGB/depth envelopes and calibration helpers.
+"""Self-describing RealSense RGB/depth frame and calibration helpers.
 
 This module has no ROS or RealSense imports so the public wire contract,
 timestamp policy, and calibration validation can be tested off-robot.
@@ -20,11 +20,11 @@ import yaml
 from navigation_time import ClockOffsetEstimator
 
 
-ENVELOPE_MAGIC = b"PSE2"
+ENVELOPE_MAGIC = b"PSE1"
 ENVELOPE_HEADER = struct.Struct("<4sII")
-ENVELOPE_FORMAT = "application/vnd.phanthy.sensor-envelope.v2"
-RGB_SCHEMA = "phanthy.sensor.camera_rgb.v2"
-DEPTH_SCHEMA = "phanthy.sensor.camera_depth.v2"
+ENVELOPE_FORMAT = "application/vnd.phanthy.sensor-envelope.v1"
+RGB_SCHEMA = "phanthy.sensor.camera_rgb_frame.v1"
+DEPTH_SCHEMA = "phanthy.sensor.camera_depth_frame.v1"
 
 _DIRECT_CLOCK_DOMAINS = ("system_time", "global_time")
 _MAX_DIRECT_CLOCK_ERROR_NS = 24 * 60 * 60 * 1_000_000_000

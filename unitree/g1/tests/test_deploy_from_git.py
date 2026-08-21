@@ -39,6 +39,11 @@ class DeployFromGitContractTest(unittest.TestCase):
         self.assertIn('docker inspect "$container_id"', source)
         self.assertIn('docker exec -w /work "$container_id"', source)
         self.assertIn('docker logs --tail 80 "$container_id"', source)
+        self.assertIn('"camera_rgb_frame"', source)
+        self.assertIn('"camera_depth_frame"', source)
+        self.assertIn("phanthy.sensor.camera_rgb_frame.v1", source)
+        self.assertIn("phanthy.sensor.camera_depth_frame.v1", source)
+        self.assertIn("CAMERA_FRAME_CONTRACT=PASS", source)
         self.assertNotIn("docker inspect embodied-unitree-g1", source)
 
     def test_script_syntax_and_real_dry_run(self):

@@ -3721,11 +3721,11 @@ class RealSensePlugin:
         self._color_topic = f"/{namespace}/camera/rgb"
         self._depth_topic = f"/{namespace}/camera/depth"
         self._dist_topic  = f"/{namespace}/camera/distance"
-        self._rgb_v2_topic = self._config.get(
-            "rgb_v2_topic", f"/{namespace}/navigation/camera/rgb"
+        self._rgb_frame_topic = self._config.get(
+            "rgb_frame_topic", f"/{namespace}/camera/rgb_frame"
         )
-        self._depth_v2_topic = self._config.get(
-            "depth_v2_topic", f"/{namespace}/navigation/camera/depth"
+        self._depth_frame_topic = self._config.get(
+            "depth_frame_topic", f"/{namespace}/camera/depth_frame"
         )
         self._proc = None
         self._status_q = None
@@ -3733,8 +3733,8 @@ class RealSensePlugin:
 
     def get_tools(self) -> list:
         tools = [self._color_tool(), self._depth_tool(), self._dist_tool()]
-        if self._config.get("v2_enabled", True):
-            tools.extend([self._rgb_v2_tool(), self._depth_v2_tool()])
+        if self._config.get("frame_enabled", True):
+            tools.extend([self._rgb_frame_tool(), self._depth_frame_tool()])
         return tools
 
     def _color_tool(self) -> dict:
@@ -3767,36 +3767,36 @@ class RealSensePlugin:
             "topic_out": [{"topic": self._dist_topic, "format": "data/json"}],
         }
 
-    def _rgb_v2_tool(self) -> dict:
-        from camera_v2 import ENVELOPE_FORMAT, RGB_SCHEMA
+    def _rgb_frame_tool(self) -> dict:
+        from camera_frame import ENVELOPE_FORMAT, RGB_SCHEMA
 
         return {
-            "name": "camera_rgb_v2",
+            "name": "camera_rgb_frame",
             "type": "sensor",
             "multiInstance": False,
-            "description": "Versioned RealSense RGB frames with source/receive timing, "
+            "description": "Self-describing RealSense RGB frames with source/receive timing, "
                            "intrinsics, and LiDAR-to-camera calibration metadata.",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{
-                "topic": self._rgb_v2_topic,
+                "topic": self._rgb_frame_topic,
                 "format": ENVELOPE_FORMAT,
                 "ros_type": "std_msgs/msg/UInt8MultiArray",
                 "schema": RGB_SCHEMA,
             }],
         }
 
-    def _depth_v2_tool(self) -> dict:
-        from camera_v2 import DEPTH_SCHEMA, ENVELOPE_FORMAT
+    def _depth_frame_tool(self) -> dict:
+        from camera_frame import DEPTH_SCHEMA, ENVELOPE_FORMAT
 
         return {
-            "name": "camera_depth_v2",
+            "name": "camera_depth_frame",
             "type": "sensor",
             "multiInstance": False,
-            "description": "Versioned RealSense depth frames with source/receive timing, "
+            "description": "Self-describing RealSense depth frames with source/receive timing, "
                            "depth scale, intrinsics, and RGB/LiDAR extrinsics.",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{
-                "topic": self._depth_v2_topic,
+                "topic": self._depth_frame_topic,
                 "format": ENVELOPE_FORMAT,
                 "ros_type": "std_msgs/msg/UInt8MultiArray",
                 "schema": DEPTH_SCHEMA,
@@ -3858,10 +3858,10 @@ class RealSensePlugin:
                 return {**status, "topic_out": [{"topic": self._depth_topic, "format": "image/depth-z16"}]}
             if tool_name == 'camera_distance':
                 return {**status, "topic_out": [{"topic": self._dist_topic, "format": "data/json"}]}
-            if tool_name == 'camera_rgb_v2':
-                return {**status, "topic_out": self._rgb_v2_tool()["topic_out"]}
-            if tool_name == 'camera_depth_v2':
-                return {**status, "topic_out": self._depth_v2_tool()["topic_out"]}
+            if tool_name == 'camera_rgb_frame':
+                return {**status, "topic_out": self._rgb_frame_tool()["topic_out"]}
+            if tool_name == 'camera_depth_frame':
+                return {**status, "topic_out": self._depth_frame_tool()["topic_out"]}
             return {**status, "topic_out": [{"topic": self._color_topic, "format": "image/jpeg"}]}
         return None
 
@@ -3887,7 +3887,7 @@ def run_realsense_process(
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
     from std_msgs.msg import String as _String, UInt8MultiArray
     from sensor_msgs.msg import Image, CompressedImage
-    from camera_v2 import (
+    from camera_frame import (
         DEPTH_SCHEMA,
         RGB_SCHEMA,
         RealSenseClockNormalizer,
@@ -3900,12 +3900,12 @@ def run_realsense_process(
     )
 
     config_values = dict(plugin_config or {})
-    v2_enabled = bool(config_values.get("v2_enabled", True))
-    rgb_v2_topic = config_values.get(
-        "rgb_v2_topic", f"/{namespace}/navigation/camera/rgb"
+    frame_enabled = bool(config_values.get("frame_enabled", True))
+    rgb_frame_topic = config_values.get(
+        "rgb_frame_topic", f"/{namespace}/camera/rgb_frame"
     )
-    depth_v2_topic = config_values.get(
-        "depth_v2_topic", f"/{namespace}/navigation/camera/depth"
+    depth_frame_topic = config_values.get(
+        "depth_frame_topic", f"/{namespace}/camera/depth_frame"
     )
 
     _QOS = QoSProfile(
@@ -3921,13 +3921,13 @@ def run_realsense_process(
             self._color_pub = self.create_publisher(CompressedImage, color_topic, _QOS)
             self._depth_pub = self.create_publisher(Image, depth_topic, _QOS)
             self._dist_pub  = self.create_publisher(_String, dist_topic, _QOS)
-            self._rgb_v2_pub = (
-                self.create_publisher(UInt8MultiArray, rgb_v2_topic, _QOS)
-                if v2_enabled else None
+            self._rgb_frame_pub = (
+                self.create_publisher(UInt8MultiArray, rgb_frame_topic, _QOS)
+                if frame_enabled else None
             )
-            self._depth_v2_pub = (
-                self.create_publisher(UInt8MultiArray, depth_v2_topic, _QOS)
-                if v2_enabled else None
+            self._depth_frame_pub = (
+                self.create_publisher(UInt8MultiArray, depth_frame_topic, _QOS)
+                if frame_enabled else None
             )
 
             self._pipeline = None
@@ -3943,14 +3943,14 @@ def run_realsense_process(
             self._diagnostics = {
                 "reconnect_count": 0,
                 "framesets": 0,
-                "rgb_v2_published": 0,
-                "depth_v2_published": 0,
+                "rgb_frame_published": 0,
+                "depth_frame_published": 0,
                 "invalid_source_stamps": 0,
                 "out_of_order_source_stamps": 0,
                 "color_coalesced": 0,
                 "depth_coalesced": 0,
                 "legacy_publish_errors": 0,
-                "v2_publish_errors": 0,
+                "frame_publish_errors": 0,
                 "jpeg_encode_errors": 0,
             }
             # Do not shadow rclpy.node.Node._clock: get_clock() relies on the
@@ -3977,8 +3977,8 @@ def run_realsense_process(
 
             self.get_logger().info(
                 f"RealSenseNode ready — color:{color_topic} depth:{depth_topic} "
-                f"dist:{dist_topic} rgb_v2:{rgb_v2_topic if v2_enabled else 'disabled'} "
-                f"depth_v2:{depth_v2_topic if v2_enabled else 'disabled'}"
+                f"dist:{dist_topic} rgb_frame:{rgb_frame_topic if frame_enabled else 'disabled'} "
+                f"depth_frame:{depth_frame_topic if frame_enabled else 'disabled'}"
             )
             self._publish_status("starting")
 
@@ -4002,7 +4002,7 @@ def run_realsense_process(
             value = {
                 "state": state,
                 "device_serial": self._serial,
-                "v2_enabled": v2_enabled,
+                "frame_enabled": frame_enabled,
                 "diagnostics": dict(self._diagnostics),
             }
             if self._rgb_calibration:
@@ -4193,7 +4193,7 @@ def run_realsense_process(
                     self._diagnostics["legacy_publish_errors"] += 1
                     self.get_logger().error(f"[realsense] depth legacy publish error: {e}")
                     continue
-                if self._depth_v2_pub is None or calibration is None:
+                if self._depth_frame_pub is None or calibration is None:
                     continue
                 try:
                     payload = depth_np.astype("<u2", copy=False).tobytes()
@@ -4216,13 +4216,13 @@ def run_realsense_process(
                         calibration=calibration,
                     )
                     envelope = encode_envelope(metadata, payload)
-                    v2_msg = UInt8MultiArray()
-                    v2_msg.data = array("B", envelope)
-                    self._depth_v2_pub.publish(v2_msg)
-                    self._diagnostics["depth_v2_published"] += 1
+                    frame_msg = UInt8MultiArray()
+                    frame_msg.data = array("B", envelope)
+                    self._depth_frame_pub.publish(frame_msg)
+                    self._diagnostics["depth_frame_published"] += 1
                 except Exception as e:
-                    self._diagnostics["v2_publish_errors"] += 1
-                    self.get_logger().error(f"[realsense] depth v2 publish error: {e}")
+                    self._diagnostics["frame_publish_errors"] += 1
+                    self.get_logger().error(f"[realsense] depth frame publish error: {e}")
 
         def _color_loop(self):
             while not self._worker_stop.is_set():
@@ -4246,7 +4246,7 @@ def run_realsense_process(
                     self._diagnostics["legacy_publish_errors"] += 1
                     self.get_logger().error(f"[realsense] color legacy publish error: {e}")
                     continue
-                if self._rgb_v2_pub is None or calibration is None:
+                if self._rgb_frame_pub is None or calibration is None:
                     continue
                 try:
                     metadata = build_frame_metadata(
@@ -4264,13 +4264,13 @@ def run_realsense_process(
                         calibration=calibration,
                     )
                     envelope = encode_envelope(metadata, payload)
-                    v2_msg = UInt8MultiArray()
-                    v2_msg.data = array("B", envelope)
-                    self._rgb_v2_pub.publish(v2_msg)
-                    self._diagnostics["rgb_v2_published"] += 1
+                    frame_msg = UInt8MultiArray()
+                    frame_msg.data = array("B", envelope)
+                    self._rgb_frame_pub.publish(frame_msg)
+                    self._diagnostics["rgb_frame_published"] += 1
                 except Exception as e:
-                    self._diagnostics["v2_publish_errors"] += 1
-                    self.get_logger().error(f"[realsense] color v2 publish error: {e}")
+                    self._diagnostics["frame_publish_errors"] += 1
+                    self.get_logger().error(f"[realsense] color frame publish error: {e}")
 
         def _on_frame(self, frame):
             try:

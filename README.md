@@ -145,16 +145,19 @@ valid substitute for the MID360 built-in IMU. Before accepting a navigation
 run, verify the isolated worker delivers approximately 10 Hz LiDAR and 200 Hz
 IMU; materially lower rates or repeated source-stamp gaps invalidate the run.
 
-### G1 Versioned Camera Sensors
+### G1 Self-Describing Camera Frames
 
 The RealSense plugin keeps the legacy `/ubuntu/camera/rgb` compressed image,
 `/ubuntu/camera/depth` image, and distance topics unchanged. It additionally
-exposes two latest-only, BEST_EFFORT versioned streams:
+exposes two latest-only, BEST_EFFORT self-describing frame streams. They are
+general sensor/data-collection outputs and are not coupled to navigation:
 
-- `/ubuntu/navigation/camera/rgb` — `phanthy.sensor.camera_rgb.v2`;
-- `/ubuntu/navigation/camera/depth` — `phanthy.sensor.camera_depth.v2`.
+- `camera_rgb_frame` → `/ubuntu/camera/rgb_frame` —
+  `phanthy.sensor.camera_rgb_frame.v1`;
+- `camera_depth_frame` → `/ubuntu/camera/depth_frame` —
+  `phanthy.sensor.camera_depth_frame.v1`.
 
-Both use `std_msgs/msg/UInt8MultiArray` as a transport for the `PSE2` binary
+Both use `std_msgs/msg/UInt8MultiArray` as a transport for the `PSE1` binary
 envelope: a fixed little-endian header (`magic`, JSON metadata length, binary
 payload length), canonical JSON metadata, then JPEG or little-endian Z16 bytes.
 Every frame repeats its active-profile intrinsics, stable `calibration_id`,

@@ -147,6 +147,12 @@ for _ in $(seq 1 30); do
     http://127.0.0.1:15701 2>/dev/null || true)"
   if grep -Fq '"navigation_lidar"' <<<"$response" \
     && grep -Fq '"navigation_imu"' <<<"$response" \
+    && grep -Fq '"camera_rgb_frame"' <<<"$response" \
+    && grep -Fq '"camera_depth_frame"' <<<"$response" \
+    && grep -Fq '/ubuntu/camera/rgb_frame' <<<"$response" \
+    && grep -Fq '/ubuntu/camera/depth_frame' <<<"$response" \
+    && grep -Fq 'phanthy.sensor.camera_rgb_frame.v1' <<<"$response" \
+    && grep -Fq 'phanthy.sensor.camera_depth_frame.v1' <<<"$response" \
     && grep -Fq '/ubuntu/navigation/nav2/velocity_proposal' <<<"$response"; then
     docker exec -w /work "$container_id" python3 -c '
 from velocity_proposal import ProposalLimits
@@ -158,8 +164,17 @@ assert limits.max_abs_y == 1.0
 assert limits.max_abs_yaw == 2.0
 print("VELOCITY_CONTRACT=PASS vx=[-1,1] vy=[-1,1] vyaw=[-2,2]")
 '
+    docker exec -w /work "$container_id" python3 -c '
+from camera_frame import DEPTH_SCHEMA, ENVELOPE_FORMAT, ENVELOPE_MAGIC, RGB_SCHEMA
+
+assert ENVELOPE_MAGIC == b"PSE1"
+assert ENVELOPE_FORMAT == "application/vnd.phanthy.sensor-envelope.v1"
+assert RGB_SCHEMA == "phanthy.sensor.camera_rgb_frame.v1"
+assert DEPTH_SCHEMA == "phanthy.sensor.camera_depth_frame.v1"
+print("CAMERA_FRAME_CONTRACT=PASS envelope=PSE1 schemas=frame.v1")
+'
     echo "DEPLOYMENT=PASS status=$status image=$actual_image source_commit=$built_commit"
-    echo "TOOLS=PASS navigation_lidar navigation_imu loco.velocity_proposal"
+    echo "TOOLS=PASS navigation_lidar navigation_imu camera_rgb_frame camera_depth_frame loco.velocity_proposal"
     exit 0
   fi
   sleep 1

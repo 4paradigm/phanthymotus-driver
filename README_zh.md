@@ -107,16 +107,19 @@ velocity proposal 合同与 `loco.move` 输入边界保持一致：前后和横�
 均限制为 `[-1.0, 1.0] m/s`，偏航角速度限制为
 `[-2.0, 2.0] rad/s`。Driver 仍会在运动 RPC 之前拒绝非有限数或超界值。
 
-### G1 版本化相机传感器
+### G1 相机自描述帧
 
 RealSense 插件保留现有 `/ubuntu/camera/rgb` 压缩图、
 `/ubuntu/camera/depth` 深度图和距离 topic 的消息语义，同时新增两个
-BEST_EFFORT + KEEP_LAST(1) 数据流：
+BEST_EFFORT + KEEP_LAST(1) 自描述帧数据流。它们是通用传感器/数采输出，
+不与导航算法绑定：
 
-- `/ubuntu/navigation/camera/rgb`：`phanthy.sensor.camera_rgb.v2`；
-- `/ubuntu/navigation/camera/depth`：`phanthy.sensor.camera_depth.v2`。
+- `camera_rgb_frame` → `/ubuntu/camera/rgb_frame`：
+  `phanthy.sensor.camera_rgb_frame.v1`；
+- `camera_depth_frame` → `/ubuntu/camera/depth_frame`：
+  `phanthy.sensor.camera_depth_frame.v1`。
 
-两者以 `std_msgs/msg/UInt8MultiArray` 承载 `PSE2` 二进制 envelope：固定
+两者以 `std_msgs/msg/UInt8MultiArray` 承载 `PSE1` 二进制 envelope：固定
 小端头（magic、JSON 元数据长度、二进制载荷长度）之后依次是规范 JSON
 元数据和 JPEG/Z16 小端载荷。每帧完整携带当前 RealSense profile 内参、
 稳定 `calibration_id`、Depth→RGB 外参、源时间/Driver 接收时间，以及配置的
