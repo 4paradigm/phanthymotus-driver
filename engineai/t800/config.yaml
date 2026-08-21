@@ -124,7 +124,7 @@ plugins:
     enabled: true
   vision:
     enabled: true
-    source: "slam"           # raw | slam —— 转发哪个点云源
+    source: "raw"            # raw | slam —— 转发哪个点云源
   gait:
     enabled: true
     # Native SDK releases use either rl_basic or walk for basic locomotion.

@@ -217,8 +217,26 @@ class RepeatingCommandTests(unittest.TestCase):
 
     def test_invalid_duration_is_rejected(self):
         stream = RepeatingCommand(lambda _: None, lambda: None, rate_hz=10)
-        with self.assertRaisesRegex(ValueError, "duration"):
-            stream.start({}, -2)
+        for duration in (-2, -0.5):
+            with self.subTest(duration=duration):
+                with self.assertRaisesRegex(ValueError, "duration"):
+                    stream.start({}, duration)
+
+    def test_background_publish_failure_is_exposed_and_stops_stream(self):
+        published = []
+        stopped = threading.Event()
+
+        def publish(command):
+            published.append(command)
+            if len(published) > 1:
+                raise RuntimeError("publisher failed")
+
+        stream = RepeatingCommand(publish, stopped.set, rate_hz=100)
+        stream.start({"value": 1}, 1.0)
+        self.assertTrue(stopped.wait(0.5))
+        snapshot = stream.snapshot()
+        self.assertFalse(snapshot.active)
+        self.assertEqual("publisher failed", snapshot.error)
 
 
 class NativeSdkManagerTests(unittest.TestCase):

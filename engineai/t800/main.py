@@ -254,8 +254,19 @@ class T800DeviceBundle:
     def stop_all(self) -> None:
         if not self._started:
             return
-        for plugin in sorted(self._active_plugins,
-                             key=lambda p: getattr(p, "STOP_PRIORITY", 100)):
+        # Phase 1: stop every physical output before any potentially slow
+        # resource teardown (for example speaker process shutdown).
+        for plugin in self._active_plugins:
+            halt = getattr(plugin, "halt", None)
+            if not callable(halt):
+                continue
+            try:
+                halt()
+            except Exception as exc:
+                print(f"[bundle] {type(plugin).__name__} halt failed: {exc}", flush=True)
+        # Phase 2: release resources in reverse construction order so dependent
+        # plugins are torn down before the services they reference.
+        for plugin in reversed(self._active_plugins):
             try:
                 plugin.stop()
             except Exception as exc:
