@@ -61,11 +61,10 @@ def _ensure_activated() -> dict:
     """
     env = os.environ.copy()
     env["ROS_DOMAIN_ID"] = "211"
-    env["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
-    env["FASTDDS_BUILTIN_TRANSPORTS"] = "DEFAULT"
-    env["ROS_LOCALHOST_ONLY"] = "0"
+    env["RMW_IMPLEMENTATION"] = "rmw_cyclonedds_cpp"
     env.setdefault("PYTHONUNBUFFERED", "1")
-    env.pop("CYCLONEDDS_URI", None)
+    if "CYCLONEDDS_URI" not in env:
+        env.pop("CYCLONEDDS_URI", None)
 
     try:
         result = subprocess.run(
