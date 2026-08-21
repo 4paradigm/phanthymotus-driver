@@ -16,15 +16,18 @@ try:
     from geometry_msgs.msg import TwistStamped
     from rclpy.node import Node
     from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+    from std_srvs.srv import Trigger
 
     _HAS_ROS2 = True
     # The verified Q5 base controller subscribes with RELIABLE QoS. A
     # BEST_EFFORT publisher is incompatible with that endpoint and silently
-    # drops every velocity command.
+    # drops every velocity command.  Depth must match the vendor SDK (10) so
+    # the DDS middleware has a sufficient buffer; depth=1 causes commands to
+    # be evicted before the controller's DDS callback can consume them.
     _QOS = QoSProfile(
         reliability=ReliabilityPolicy.RELIABLE,
         history=HistoryPolicy.KEEP_LAST,
-        depth=1,
+        depth=10,
         durability=DurabilityPolicy.VOLATILE,
     )
 except Exception:
@@ -69,6 +72,8 @@ class Plugin:
         self._motion_stop = None
         self._motion_thread = None
         self._active_command = None
+        self._activated = False
+        self._activate_client = None
 
         if min(self._max_linear, self._max_angular, self._max_duration, self._publish_rate) <= 0:
             raise ValueError("base_drive limits and publish_rate_hz must be positive")
@@ -80,6 +85,7 @@ class Plugin:
                 self._node = Node(NODE)
                 self._pub = self._node.create_publisher(TwistStamped, TOPIC, _QOS)
                 executor.add_node(self._node)
+                self._activate_client = self._node.create_client(Trigger, "/activate_service")
             except Exception as e:
                 print(f"[{CARD}] ROS2 publisher unavailable: {e}", flush=True)
                 self._node = None
@@ -175,6 +181,7 @@ class Plugin:
             # as a software ownership lock.
             "other_publishers": competing_publishers,
             "control_mode": "direct_velocity_interface",
+            "activated": self._activated,
             "q5_fsm": q5_active_status(self._client),
             "topic": TOPIC,
             "limits": {
@@ -183,6 +190,28 @@ class Plugin:
                 "max_duration_s": self._max_duration,
             },
         }
+
+    def _ensure_activated(self) -> dict:
+        if self._activated:
+            return {"ok": True, "activated": True}
+        if self._activate_client is None or not self._activate_client.service_is_ready():
+            return _failure("ACTIVATE_SERVICE_UNAVAILABLE", "Q5 /activate_service is unavailable",
+                            state="stopped")
+        request = Trigger.Request()
+        future = self._activate_client.call_async(request)
+        deadline = time.monotonic() + 10.0
+        while not future.done() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if not future.done():
+            return _failure("ACTIVATE_SERVICE_TIMEOUT", "/activate_service did not respond in 10s",
+                            state="stopped")
+        response = future.result()
+        if not response or not response.success:
+            msg = getattr(response, "message", "unknown") if response else "no response"
+            return _failure("ACTIVATE_SERVICE_FAILED", f"/activate_service rejected: {msg}",
+                            state="stopped")
+        self._activated = True
+        return {"ok": True, "activated": True}
 
     def _publish(self, linear_x: float, angular_z: float) -> bool:
         if self._pub is None or self._node is None:
@@ -304,6 +333,10 @@ class Plugin:
         command = self._validate_move(move_args)
         if isinstance(command, dict):
             return command
+        # Ensure /activate_service succeeded before publishing velocity commands.
+        activated = self._ensure_activated()
+        if activated.get("ok") is False:
+            return activated
         linear_x, angular_z, duration_s = command
         with self._lock:
             if self._motion_thread is not None and self._motion_thread.is_alive():
