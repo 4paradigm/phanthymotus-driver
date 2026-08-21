@@ -4,6 +4,9 @@ This card publishes finite-duration TwistStamped commands via a separate
 subprocess running on rmw_fastrtps_cpp (FastDDS) / Domain 211, because the
 vendor Wr1 base controller only accepts messages on that RMW.
 
+Parent process (CycloneDDS) handles /activate_service discovery and call.
+Subprocess (FastDDS) only publishes TwistStamped velocity commands.
+
 The parent process (main.py, CycloneDDS) stays untouched.
 """
 
@@ -42,7 +45,7 @@ def _number(value, field: str):
     return value
 
 
-# ── Subprocess launcher ──────────────────────────────────────────────────────
+# ── Subprocess launcher (FastDDS only — publishes TwistStamped) ──────────────
 
 class _SubprocDriver:
     """Spawn a FastDDS subprocess and send it commands via a Queue."""
@@ -92,7 +95,7 @@ class _SubprocDriver:
 
 
 def _subproc_main(cmd_q: mp.Queue, publish_rate: float, stop_repetitions: int):
-    """Subprocess entry — FastDDS + Domain 211."""
+    """Subprocess entry — FastDDS only, publishes TwistStamped. No activation."""
     os.environ["ROS_DOMAIN_ID"] = "211"
     os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
     os.environ["FASTDDS_BUILTIN_TRANSPORTS"] = "DEFAULT"
@@ -117,10 +120,7 @@ def _subproc_main(cmd_q: mp.Queue, publish_rate: float, stop_repetitions: int):
             depth=10,
         ),
     )
-    act_client = node.create_client(Trigger, "/activate_service")
-    node._pub = pub
-    node._act_client = act_client
-    node._activated = False
+    # No /activate_service client here — parent handles activation via CycloneDDS
 
     executor = rclpy.executors.SingleThreadedExecutor()
     executor.add_node(node)
@@ -149,25 +149,8 @@ def _subproc_main(cmd_q: mp.Queue, publish_rate: float, stop_repetitions: int):
             if i + 1 < stop_repetitions:
                 time.sleep(1.0 / publish_rate)
 
-    def _ensure_activated() -> bool:
-        if node._activated:
-            return True
-        if not act_client.service_is_ready():
-            return False
-        future = act_client.call_async(Trigger.Request())
-        deadline = time.monotonic() + 10.0
-        while not future.done() and time.monotonic() < deadline:
-            time.sleep(0.02)
-        if not future.done():
-            return False
-        resp = future.result()
-        if not resp or not resp.success:
-            return False
-        node._activated = True
-        return True
-
     while running:
-        # Drain commands (latest move; stop always processed)
+        # Drain commands
         cmds = []
         try:
             while True:
@@ -185,11 +168,6 @@ def _subproc_main(cmd_q: mp.Queue, publish_rate: float, stop_repetitions: int):
                 lx = float(cmd.get("linear_x", 0.0))
                 az = float(cmd.get("angular_z", 0.0))
                 dur = float(cmd.get("duration_s", 1.0))
-                # Re-activate before every move
-                node._activated = False
-                if not _ensure_activated():
-                    node.get_logger().error("activate_service failed, skipping move")
-                    continue
                 deadline = time.monotonic() + dur
                 stop_early = False
                 try:
@@ -221,6 +199,8 @@ def _subproc_main(cmd_q: mp.Queue, publish_rate: float, stop_repetitions: int):
 # ── Plugin ───────────────────────────────────────────────────────────────────
 
 class Plugin:
+    """Handles validation, activation (via FastDDS temp node), and dispatch."""
+
     def __init__(self, plugin_config, namespace, executor, client):
         self._client = client
         self._max_linear = float(plugin_config.get("max_linear_x_mps", 0.20))
@@ -236,6 +216,50 @@ class Plugin:
             raise ValueError("base_drive limits and publish_rate_hz must be positive")
         if self._stop_repetitions < 1:
             raise ValueError("base_drive stop_repetitions must be at least 1")
+
+        # Activation handled by parent — spawn a temporary FastDDS node to
+        # call /activate_service (which is only discoverable on FastDDS).
+        self._activated = False
+        self._activate_lock = threading.Lock()
+        self._ensure_activation()
+
+    def _ensure_activation(self) -> dict:
+        """Call /activate_service using a temporary FastDDS ROS2 node.
+
+        The vendor's /activate_service Trigger is published on the same
+        FastDDS / Domain 211 stack that the base controller listens on.
+        The parent process uses CycloneDDS and cannot discover it, so we
+        spin up a short-lived FastDDS node solely for this one call.
+        """
+        with self._activate_lock:
+            if self._activated:
+                return {"ok": True, "activated": True}
+
+            # Save parent's DDS env
+            saved_domain = os.environ.get("ROS_DOMAIN_ID")
+            saved_rmw = os.environ.get("RMW_IMPLEMENTATION")
+
+            # Temporarily switch parent process to FastDDS
+            os.environ["ROS_DOMAIN_ID"] = "211"
+            os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
+            os.environ["FASTDDS_BUILTIN_TRANSPORTS"] = "DEFAULT"
+
+            result = _call_activate_service()
+
+            # Restore parent's CycloneDDS env
+            if saved_domain is not None:
+                os.environ["ROS_DOMAIN_ID"] = saved_domain
+            else:
+                os.environ.pop("ROS_DOMAIN_ID", None)
+            if saved_rmw is not None:
+                os.environ["RMW_IMPLEMENTATION"] = saved_rmw
+            else:
+                os.environ.pop("RMW_IMPLEMENTATION", None)
+            os.environ.pop("FASTDDS_BUILTIN_TRANSPORTS", None)
+
+            if result.get("ok"):
+                self._activated = True
+            return result
 
     def get_tool(self):
         return {
@@ -319,6 +343,7 @@ class Plugin:
                 "max_duration_s": self._max_duration,
             },
             "subproc": self._driver.get_status(),
+            "activated": self._activated,
         }
 
     def _validate_move(self, args: dict):
@@ -386,6 +411,11 @@ class Plugin:
         if action not in ("forward", "backward", "turn_left", "turn_right", "move"):
             return None
 
+        # Ensure activation before every movement
+        activation_result = self._ensure_activation()
+        if activation_result.get("ok") is False:
+            return activation_result
+
         move_args = self._directional_args(action, args) if action != "move" else args
         if isinstance(move_args, dict) and move_args.get("ok") is False:
             return move_args
@@ -407,6 +437,50 @@ class Plugin:
             },
             "stops_automatically": True,
         }
+
+
+def _call_activate_service() -> dict:
+    """Create a temporary FastDDS node and call /activate_service.
+
+    Returns {"ok": True} on success or a failure dict on error.
+    """
+    import rclpy
+    from rclpy.node import Node
+    from std_srvs.srv import Trigger
+
+    try:
+        if not rclpy.ok():
+            rclpy.init()
+        node = Node("q5_base_drive_activate_temp")
+        client = node.create_client(Trigger, "/activate_service")
+
+        if not client.service_is_ready():
+            node.destroy_node()
+            return _failure("ACTIVATE_SERVICE_UNAVAILABLE",
+                            "/activate_service not available on FastDDS/Domain 211")
+
+        future = client.call_async(Trigger.Request())
+        deadline = time.monotonic() + 10.0
+        while not future.done() and time.monotonic() < deadline:
+            rclpy.spin_once(node, timeout_sec=0.02)
+
+        if not future.done():
+            node.destroy_node()
+            return _failure("ACTIVATE_SERVICE_TIMEOUT",
+                            "/activate_service did not respond within 10s")
+
+        resp = future.result()
+        node.destroy_node()
+
+        if not resp or not resp.success:
+            return _failure("ACTIVATE_SERVICE_FAILED",
+                            resp.reason if resp and resp.reason else "unknown error")
+
+        print("[base_drive] /activate_service succeeded", flush=True)
+        return {"ok": True, "activated": True}
+
+    except Exception as e:
+        return _failure("ACTIVATE_SERVICE_ERROR", str(e))
 
 
 def make_plugin(plugin_config, namespace, executor, client):
