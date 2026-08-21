@@ -78,8 +78,9 @@ lie_down 组合键。LCM 输入会覆盖实体手柄输入，发送完成后 Dri
 `gait` 不会写入自定义 `gait.json`。官方 T800 Native SDK 的行走
 策略配置位于 `assets/config/t800/.../*.yaml`，且不提供 `step_height`、
 `stride_length` 等通用运行时调参契约。因此卡片只通过官方
-`/motion/set_motion_state` 接口切换 `basic` / `balanced` / `terrain`，
-并以 `/motion/motion_state` 返回的可转换状态为准。
+`/motion/set_motion_state` 接口切换 `basic` / `balanced`，并以
+`/motion/motion_state` 返回的可转换状态为准。`rl_terrain` 不属于当前 T800
+状态机，因此不会作为可选项暴露；terrain 接口示例不能视为 T800 固件能力。
 
 `motion_recorder.record_start` 是幂等的：录制中重复调用只返回当前会话，
 不会意外停止。`record_stop` 同样可重复调用；设置 `duration > 0`

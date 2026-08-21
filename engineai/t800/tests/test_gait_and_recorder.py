@@ -179,9 +179,10 @@ class GaitPluginContractTests(unittest.TestCase):
         actions = tool["inputSchema"]["properties"]["action"]["enum"]
         self.assertEqual(["start", "stop", "info", "status", "list", "select"], actions)
         self.assertEqual(
-            ["basic", "balanced", "terrain"],
+            ["basic", "balanced"],
             tool["inputSchema"]["properties"]["gait"]["enum"],
         )
+        self.assertNotIn("terrain", tool["inputSchema"]["properties"]["gait"]["enum"])
 
     def test_start_is_actuator_lifecycle_ready(self):
         self.assertEqual("ready", self.plugin.dispatch("start", {})["state"])
@@ -192,7 +193,7 @@ class GaitPluginContractTests(unittest.TestCase):
         profiles = {item["name"]: item for item in result["profiles"]}
         self.assertEqual("rl_basic", profiles["basic"]["resolved_motion_state"])
         self.assertTrue(profiles["basic"]["available"])
-        self.assertFalse(profiles["terrain"]["available"])
+        self.assertNotIn("terrain", profiles)
 
     def test_select_basic_prefers_runtime_available_rl_basic(self):
         result = self.plugin.dispatch("select", {"gait": "basic", "wait": False})
@@ -208,15 +209,10 @@ class GaitPluginContractTests(unittest.TestCase):
         self.assertEqual("requested", result["state"])
         self.assertEqual("walk", self.motion_mode.calls[-1][1]["target"])
 
-    def test_select_rejects_unavailable_profile_before_publish(self):
+    def test_select_rejects_unpublished_profile_before_publish(self):
         result = self.plugin.dispatch("select", {"gait": "terrain"})
         self.assertIn("error", result)
         self.assertEqual([], self.motion_mode.calls)
-
-    def test_force_allows_unreported_profile(self):
-        result = self.plugin.dispatch("select", {"gait": "terrain", "force": True, "wait": False})
-        self.assertEqual("requested", result["state"])
-        self.assertEqual("rl_terrain", self.motion_mode.calls[-1][1]["target"])
 
     def test_status_reflects_current_gait(self):
         self.state.current = "lower_body_balance"

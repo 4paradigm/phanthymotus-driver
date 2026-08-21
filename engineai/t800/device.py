@@ -4985,10 +4985,6 @@ GAIT_PROFILES: dict[str, dict] = {
         "motion_states": ("lower_body_balance",),
         "description": "下肢平衡步态",
     },
-    "terrain": {
-        "motion_states": ("rl_terrain",),
-        "description": "地形步态（仅在当前固件公开该状态时可用）",
-    },
 }
 
 
@@ -5029,7 +5025,7 @@ class GaitPlugin:
             "multiInstance": False,
             "description": (
                 "T800 步态选择，通过官方 motion state 接口切换基础行走、"
-                "下肢平衡或地形步态；会按固件返回的 available transitions 判定可用性。"
+                "下肢平衡步态；会按固件返回的 available transitions 判定可用性。"
             ),
             "inputSchema": action_schema(
                 {
