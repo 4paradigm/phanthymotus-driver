@@ -219,6 +219,7 @@ class Q5BasicSensorTests(unittest.TestCase):
         self.assertIn('os.environ["RMW_IMPLEMENTATION"] = "rmw_cyclonedds_cpp"', text)
         self.assertIn('plugin_config.get("publish_rate_hz", 10.0)', text)
         self.assertIn('plugin_config.get("frame_id", "")', text)
+        self.assertNotIn("msg.header.stamp =", text)
 
     def test_hand_control_does_not_expose_raw_multi_joint_set_action(self):
         plugin = hand_control.Plugin.__new__(hand_control.Plugin)

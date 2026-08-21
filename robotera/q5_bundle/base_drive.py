@@ -2,8 +2,9 @@
 
 This card publishes finite-duration TwistStamped commands via a separate
 subprocess running on rmw_cyclonedds_cpp / Domain 211.  The deployed Q5 base
-controller accepts the vendor SDK's CycloneDDS stream (empty frame id, 10 Hz);
-the similarly shaped FastDDS remote-control stream is not a direct SDK route.
+controller accepts the verified direct stream (empty frame id, zero timestamp,
+10 Hz); the similarly shaped FastDDS remote-control stream is not a direct SDK
+route.
 
 The parent process stays untouched so the base publisher cannot block sensor
 or media callbacks.
@@ -161,7 +162,8 @@ def _subproc_main(cmd_q: mp.Queue, ready: mp.Event, publish_rate: float, stop_re
 
     def _publish(linear_x: float, angular_z: float):
         msg = TwistStamped()
-        msg.header.stamp = node.get_clock().now().to_msg()
+        # This Q5 controller rejects host-clock-stamped direct commands; its
+        # vendor CLI accepts the ROS zero timestamp and applies receipt time.
         msg.header.frame_id = frame_id
         msg.twist.linear.x = linear_x
         msg.twist.angular.z = angular_z
