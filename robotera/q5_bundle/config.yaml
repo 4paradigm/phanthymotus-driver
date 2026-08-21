@@ -8,12 +8,12 @@ joint_state_position_unit: "radians"
 plugins:
   base_drive:
     enabled: true
-    # Match the live Q5 remote-control stream accepted by the base controller.
-    frame_id: "base_link"
+    # Match the vendor SDK's direct base-drive contract, not the remote-control stream.
+    frame_id: ""
     max_linear_x_mps: 0.20
     max_angular_z_radps: 0.40
     max_duration_s: 2.0
-    publish_rate_hz: 100.0
+    publish_rate_hz: 10.0
     stop_repetitions: 3
   joints:
     enabled: true

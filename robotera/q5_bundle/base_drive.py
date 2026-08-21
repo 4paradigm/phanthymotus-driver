@@ -1,13 +1,12 @@
 """Q5 direct base-drive velocity control card.
 
 This card publishes finite-duration TwistStamped commands via a separate
-subprocess running on rmw_fastrtps_cpp (FastDDS) / Domain 211, because the
-vendor Wr1 base controller only accepts messages on that RMW.
+subprocess running on rmw_cyclonedds_cpp / Domain 211.  The deployed Q5 base
+controller accepts the vendor SDK's CycloneDDS stream (empty frame id, 10 Hz);
+the similarly shaped FastDDS remote-control stream is not a direct SDK route.
 
-The controller accepts its velocity stream through FastDDS.  On deployed Q5
-hardware, the vendor remote publishes a ``base_link`` frame at roughly 100 Hz;
-match that wire contract rather than the older SDK demo's empty frame/10 Hz.
-The parent process (main.py, CycloneDDS) stays untouched.
+The parent process stays untouched so the base publisher cannot block sensor
+or media callbacks.
 """
 
 from __future__ import annotations
@@ -51,10 +50,10 @@ def _number(value, field: str):
     return value
 
 
-# ── Subprocess launcher (FastDDS only — publishes TwistStamped) ──────────────
+# ── Subprocess launcher (CycloneDDS only — publishes TwistStamped) ───────────
 
 class _SubprocDriver:
-    """Spawn a FastDDS subprocess and send it commands via a Queue."""
+    """Spawn a CycloneDDS subprocess and send it commands via a Queue."""
 
     def __init__(self, publish_rate: float, stop_repetitions: int, frame_id: str, enabled: bool = True):
         self._ctx = mp.get_context("spawn")
@@ -120,10 +119,10 @@ class _SubprocDriver:
 
 def _subproc_main(cmd_q: mp.Queue, ready: mp.Event, publish_rate: float, stop_repetitions: int,
                   frame_id: str):
-    """Subprocess entry — FastDDS + Domain 211, publishes TwistStamped."""
+    """Subprocess entry — CycloneDDS + Domain 211, publishes TwistStamped."""
     os.environ["ROS_DOMAIN_ID"] = "211"
-    os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
-    os.environ["FASTDDS_BUILTIN_TRANSPORTS"] = "DEFAULT"
+    os.environ["RMW_IMPLEMENTATION"] = "rmw_cyclonedds_cpp"
+    os.environ.pop("FASTDDS_BUILTIN_TRANSPORTS", None)
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
     import signal
@@ -229,9 +228,9 @@ class Plugin:
         self._max_linear = float(plugin_config.get("max_linear_x_mps", 0.20))
         self._max_angular = float(plugin_config.get("max_angular_z_radps", 0.40))
         self._max_duration = float(plugin_config.get("max_duration_s", 2.0))
-        self._publish_rate = float(plugin_config.get("publish_rate_hz", 100.0))
+        self._publish_rate = float(plugin_config.get("publish_rate_hz", 10.0))
         self._stop_repetitions = int(plugin_config.get("stop_repetitions", 3))
-        self._frame_id = str(plugin_config.get("frame_id", "base_link"))
+        self._frame_id = str(plugin_config.get("frame_id", ""))
         self._driver = _SubprocDriver(
             self._publish_rate, self._stop_repetitions, self._frame_id, enabled=executor is not None,
         )
@@ -240,8 +239,6 @@ class Plugin:
             raise ValueError("base_drive limits and publish_rate_hz must be positive")
         if self._stop_repetitions < 1:
             raise ValueError("base_drive stop_repetitions must be at least 1")
-        if not self._frame_id:
-            raise ValueError("base_drive frame_id must not be empty")
 
     def get_tool(self):
         return {
