@@ -25,10 +25,9 @@ try:
     # the DDS middleware has a sufficient buffer; depth=1 causes commands to
     # be evicted before the controller's DDS callback can consume them.
     _QOS = QoSProfile(
-        reliability=ReliabilityPolicy.RELIABLE,
+        reliability=ReliabilityPolicy.BEST_EFFORT,
         history=HistoryPolicy.KEEP_LAST,
         depth=10,
-        durability=DurabilityPolicy.VOLATILE,
     )
 except Exception:
     _HAS_ROS2 = False
