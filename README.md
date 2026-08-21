@@ -55,6 +55,29 @@ When run without arguments, `build.sh` shows an interactive multi-select menu to
 
 Once the driver container starts, it registers itself with Agent Core at `http://<agent-core>:15678/api/mcp`. You can then see the device and its tools in the Web Dashboard.
 
+For a G1 development deployment, run the versioned Git deployment entry from
+a clean, pushed branch:
+
+```bash
+./unitree/g1/deploy/deploy-from-git.sh g1-bj-wifi
+```
+
+The script does not copy the local working tree to the robot. It records the
+local branch and commit, fetches that branch in
+`~/hanzebei/phanthymotus-driver` on the target, requires the fetched tip to
+match the exact commit, builds with the repository's G1 Dockerfile, and applies
+the complete `unitree/g1/deploy/service.yml` runtime contract on top of the
+target's Agent Core Compose file. Set
+`REPO_URL`, `SOURCE_REF`, `EXPECTED_COMMIT`, `REMOTE_REPO`, or `IMAGE` only
+when overriding those explicit deployment inputs. `DRY_RUN=1` validates and
+prints the resolved provenance without connecting to the robot.
+
+The G1 Dockerfile uses the Aliyun mirrors for both Ubuntu Ports and PyPI by
+default. It replaces the obsolete Tencent Cloud Ubuntu source inherited from
+the base image before installing build dependencies. Direct Docker builds can
+override these defaults with the `UBUNTU_PORTS_MIRROR` and `PYPI_MIRROR` build
+arguments; the runtime base image remains unchanged.
+
 ### Run Locally (without Docker)
 
 ```bash
@@ -70,6 +93,96 @@ python main.py
 3. Agent Core discovers the driver's tools via MCP `initialize` and `tools/list`
 4. Tools become available to the LLM agent and appear in the Web Dashboard
 5. The LLM agent can invoke tools via MCP `tools/call`
+
+### G1 Controlled Navigation Velocity
+
+The G1 `loco` actuator accepts a lease-bound
+`phanthy.navigation.velocity_proposal.v1` input. Valid proposals are executed
+through a reliable `KEEP_LAST(depth=1)` subscription and a capacity-one
+latest-only execution queue, so older unread or pending velocities are replaced
+instead of backlogged. A proposal TTL lapse immediately triggers `StopMove`;
+only a successful post-call zero-odometry confirmation keeps the same navigation
+lease recoverable for the next fresh proposal. Hard safety, identity, sequence,
+RPC, and stop-confirmation faults still disarm the lease.
+
+`loco.start` connects the sole proposal topic and remains physically stopped.
+While idle, the Driver validates the first fresh, legal, nonzero proposal and
+atomically binds its `nav_id` before executing that same proposal. Another ID
+cannot replace or interrupt the active task. A terminal zero proposal first
+enters `terminal_pending_stop`; only a successful zero-odometry stop
+confirmation retires the active ID and keeps the subscription ready for the
+next task. A failed confirmation stays fail-closed, and a later successful
+retry restores `awaiting_first_valid_proposal`. Invalid, stale, zero bootstrap,
+terminal bootstrap, retired-ID, and mid-task mismatched-ID proposals never
+establish or replace a lease, so Agent Core needs no per-task authorization
+action for consecutive navigation tasks.
+
+`loco info` exposes proposal counters, the coalesced count, measured RPC and
+queue latency, rolling RPC p50/p95/p99/max values, rejection reasons, and the
+last confirmed proposal stop. The `last_set_velocity_duration_ms` value is
+measured RPC time, not the proposal TTL budget.
+
+The velocity proposal contract matches the `loco.move` input bounds: forward
+and lateral velocity are each limited to `[-1.0, 1.0] m/s`, and yaw velocity is
+limited to `[-2.0, 2.0] rad/s`. The Driver still rejects non-finite or
+out-of-range values before any motion RPC.
+
+### G1 Navigation Sensors
+
+The read-only `navigation_sensors` Driver plugin launches an isolated worker
+process which subscribes directly to the MID360 raw DDS streams instead of
+converting the body `/ubuntu/state/imu` JSON. Keeping raw LiDAR conversion and
+IMU forwarding out of the full Driver process prevents the legacy LiDAR,
+camera, and MCP threads from starving navigation input callbacks. The worker
+publishes two algorithm-independent navigation sensor topics:
+
+- `/ubuntu/navigation/lidar` — `sensor_msgs/msg/PointCloud2`,
+  RELIABLE + KEEP_LAST(2), with `x/y/z/intensity/tag/line/timestamp` fields;
+- `/ubuntu/navigation/imu` — `sensor_msgs/msg/Imu`, RELIABLE + KEEP_LAST(200);
+
+LiDAR and IMU retain their shared MID360 source clock and are normalized into
+one ROS system-time domain. Samples are dropped while clock offset estimation
+is not ready or after an invalid/reset observation; the Driver never invents a
+source timestamp. The fixed upside-down mounting rotation is applied equally
+to cloud and IMU. The existing `/ubuntu/lidar/cloud` legacy card remains
+enabled for Canvas and safety consumers.
+
+Navigation consumers such as LiDAR-inertial mapping and path planning can bind
+to these topics without the Driver naming or selecting a specific algorithm.
+The body IMU JSON is approximately 20 Hz, has no source timestamp, and is not a
+valid substitute for the MID360 built-in IMU. Before accepting a navigation
+run, verify the isolated worker delivers approximately 10 Hz LiDAR and 200 Hz
+IMU; materially lower rates or repeated source-stamp gaps invalidate the run.
+
+### G1 Self-Describing Camera Frames
+
+The RealSense plugin keeps the legacy `/ubuntu/camera/rgb` compressed image,
+`/ubuntu/camera/depth` image, and distance topics unchanged. It additionally
+exposes two latest-only, BEST_EFFORT self-describing frame streams. They are
+general sensor/data-collection outputs and are not coupled to navigation:
+
+- `camera_rgb_frame` → `/ubuntu/camera/rgb_frame` —
+  `phanthy.sensor.camera_rgb_frame.v1`;
+- `camera_depth_frame` → `/ubuntu/camera/depth_frame` —
+  `phanthy.sensor.camera_depth_frame.v1`.
+
+Both use `std_msgs/msg/UInt8MultiArray` as a transport for the `PSE1` binary
+envelope: a fixed little-endian header (`magic`, JSON metadata length, binary
+payload length), canonical JSON metadata, then JPEG or little-endian Z16 bytes.
+Every frame repeats its active-profile intrinsics, stable `calibration_id`,
+RealSense Depth-to-RGB transform, source/Driver-receive timing, and the
+configured LiDAR-to-RGB calibration. Invalid, warming-up, reset, or
+out-of-order source timestamps are published as explicitly unavailable; the
+Driver does not replace them with publish time.
+
+The bundled LiDAR-to-camera transform is derived from the pinned official G1
+URDF and is intentionally marked `factory_nominal`. It is not a measured
+per-robot calibration and must not be relabeled `validated_on_device` until a
+projection overlay and pixel-residual acceptance run has been recorded on that
+G1. Missing or invalid calibration is represented as `unavailable`, never as
+an identity transform. Camera reconnects rebuild the profile calibration and
+therefore update `calibration_id` when serial, resolution, intrinsics, depth
+scale, or extrinsics change.
 
 ## Writing a New Driver
 

@@ -1,11 +1,20 @@
 ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
-ARG PYPI_MIRROR=https://pypi.org/simple/
+ARG UBUNTU_PORTS_MIRROR=https://mirrors.aliyun.com/ubuntu-ports
+ARG PYPI_MIRROR=https://mirrors.aliyun.com/pypi/simple/
 FROM ${ROS_BASE_IMAGE}
+ARG UBUNTU_PORTS_MIRROR
 ARG PYPI_MIRROR
 
 WORKDIR /work
 
-RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
+RUN find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) \
+        -exec sed -i \
+            -e "s|http://mirrors.tencentyun.com/ubuntu-ports|${UBUNTU_PORTS_MIRROR}|g" \
+            -e "s|https://mirrors.tencentyun.com/ubuntu-ports|${UBUNTU_PORTS_MIRROR}|g" \
+            -e "s|http://ports.ubuntu.com/ubuntu-ports|${UBUNTU_PORTS_MIRROR}|g" \
+            -e "s|https://ports.ubuntu.com/ubuntu-ports|${UBUNTU_PORTS_MIRROR}|g" \
+            {} + && \
+    apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
         python3-pip \
         python3-colcon-common-extensions \
@@ -51,10 +60,17 @@ COPY device.py /work/device.py
 COPY rpc_proxy.py /work/rpc_proxy.py
 COPY ext_devices.py /work/ext_devices.py
 COPY safety_harness.py /work/safety_harness.py
+COPY velocity_proposal.py /work/velocity_proposal.py
 COPY scan_context.py /work/scan_context.py
 COPY controlled_spatial.py /work/controlled_spatial.py
 COPY controlled_spatial_map.py /work/controlled_spatial_map.py
 COPY pointcloud_utils.py /work/pointcloud_utils.py
+COPY navigation_sensor_bridge.py /work/navigation_sensor_bridge.py
+COPY navigation_sensor_bridge_main.py /work/navigation_sensor_bridge_main.py
+COPY navigation_pointcloud.py /work/navigation_pointcloud.py
+COPY navigation_time.py /work/navigation_time.py
+COPY camera_frame.py /work/camera_frame.py
+COPY calibration/ /work/calibration/
 COPY test_slam_rpc.py /work/test_slam_rpc.py
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
