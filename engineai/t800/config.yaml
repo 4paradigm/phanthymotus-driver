@@ -123,4 +123,13 @@ plugins:
     enabled: true
   vision:
     enabled: true
-    source: "raw"            # raw | slam —— 转发哪个点云源
+    source: "slam"           # raw | slam —— 转发哪个点云源
+  gait:
+    enabled: true
+    # Native SDK releases use either rl_basic or walk for basic locomotion.
+    # The gait card resolves the first state advertised by the robot runtime.
+    basic_motion_states: ["walk", "rl_basic"]
+  motion_recorder:
+    enabled: true
+    record_hz: 20.0
+    recordings_dir: "/opt/phanthy-motus/data/recordings"
