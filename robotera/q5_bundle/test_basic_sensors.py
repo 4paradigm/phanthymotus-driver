@@ -205,7 +205,7 @@ class Q5BasicSensorTests(unittest.TestCase):
     def test_base_drive_requires_a_live_ros_publisher_not_confirmation(self):
         plugin = base_drive.Plugin({}, "test", None, _Client())
         start = plugin.dispatch("start", {})
-        move = plugin.dispatch("move", {"linear_x": 0.1, "angular_z": 0.0, "duration_s": 1.0})
+        move = plugin.dispatch("move", {"linear_x": 0.1, "angular_z_degps": 0.0, "duration_s": 1.0})
         self.assertFalse(start["ok"])
         self.assertEqual(move["code"], "ROS_UNAVAILABLE")
 
@@ -269,9 +269,9 @@ class Q5BasicSensorTests(unittest.TestCase):
     def test_base_drive_direction_actions_normalize_to_guarded_velocity(self):
         plugin = base_drive.Plugin({}, "test", None, _Client())
         forward = plugin._directional_args("forward", {"speed_mps": 0.1, "duration_s": 0.5})
-        right = plugin._directional_args("turn_right", {"turn_speed_radps": 0.2, "duration_s": 0.5})
-        self.assertEqual((forward["linear_x"], forward["angular_z"]), (0.1, 0.0))
-        self.assertEqual((right["linear_x"], right["angular_z"]), (0.0, -0.2))
+        right = plugin._directional_args("turn_right", {"turn_speed_degps": 10.0, "duration_s": 0.5})
+        self.assertEqual((forward["linear_x"], forward["angular_z_degps"]), (0.1, 0.0))
+        self.assertEqual((right["linear_x"], right["angular_z_degps"]), (0.0, -10.0))
 
     def test_lifecycle_poll_reads_active_without_side_effects(self):
         client = q5_sdk_client.Q5SdkClient()

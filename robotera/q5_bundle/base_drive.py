@@ -229,6 +229,7 @@ class Plugin:
         self._client = client
         self._max_linear = float(plugin_config.get("max_linear_x_mps", 0.20))
         self._max_angular = float(plugin_config.get("max_angular_z_radps", 0.40))
+        self._max_angular_deg = math.degrees(self._max_angular)
         self._max_duration = float(plugin_config.get("max_duration_s", 2.0))
         self._publish_rate = float(plugin_config.get("publish_rate_hz", 10.0))
         self._stop_repetitions = int(plugin_config.get("stop_repetitions", 3))
@@ -272,11 +273,11 @@ class Plugin:
                         "default": min(0.10, self._max_linear),
                         "description": f"范围[0.01,{self._max_linear:g}]m/s",
                     },
-                    "turn_speed_radps": {
-                        "type": "number", "title": "转向速度 (rad/s)", "minimum": 0.01,
-                        "maximum": self._max_angular, "multipleOf": 0.01,
-                        "default": min(0.20, self._max_angular),
-                        "description": f"范围[0.01,{self._max_angular:g}]rad/s",
+                    "turn_speed_degps": {
+                        "type": "number", "title": "转向速度 (deg/s)", "minimum": 1.0,
+                        "maximum": self._max_angular_deg, "multipleOf": 1.0,
+                        "default": min(10.0, self._max_angular_deg),
+                        "description": f"范围[1,{self._max_angular_deg:g}]deg/s",
                     },
                     "linear_x": {
                         "type": "number",
@@ -284,11 +285,11 @@ class Plugin:
                         "maximum": self._max_linear, "multipleOf": 0.01, "default": 0.10,
                         "description": f"范围[-{self._max_linear:g},{self._max_linear:g}]m/s",
                     },
-                    "angular_z": {
+                    "angular_z_degps": {
                         "type": "number",
-                        "title": "转向速度 (rad/s)", "minimum": -self._max_angular,
-                        "maximum": self._max_angular, "multipleOf": 0.01, "default": 0.0,
-                        "description": f"范围[-{self._max_angular:g},{self._max_angular:g}]rad/s",
+                        "title": "转向速度 (deg/s)", "minimum": -self._max_angular_deg,
+                        "maximum": self._max_angular_deg, "multipleOf": 1.0, "default": 0.0,
+                        "description": f"范围[-{self._max_angular_deg:g},{self._max_angular_deg:g}]deg/s",
                     },
                     "duration_s": {
                         "type": "number",
@@ -303,9 +304,9 @@ class Plugin:
                     "start": {"params": [], "description": "检查控制锁、发布者冲突和当前限制。"},
                     "forward": {"params": ["speed_mps", "duration_s"], "description": "以设定速度直线前进，到时自动停车。"},
                     "backward": {"params": ["speed_mps", "duration_s"], "description": "以设定速度直线后退，到时自动停车。"},
-                    "turn_left": {"params": ["turn_speed_radps", "duration_s"], "description": "以设定速度原地左转，到时自动停车。"},
-                    "turn_right": {"params": ["turn_speed_radps", "duration_s"], "description": "以设定速度原地右转，到时自动停车。"},
-                    "move": {"params": ["linear_x", "angular_z", "duration_s"], "description": "高级模式：同时设置前后与转向速度，到时自动停车。"},
+                    "turn_left": {"params": ["turn_speed_degps", "duration_s"], "description": "以设定角度速度原地左转，到时自动停车。"},
+                    "turn_right": {"params": ["turn_speed_degps", "duration_s"], "description": "以设定角度速度原地右转，到时自动停车。"},
+                    "move": {"params": ["linear_x", "angular_z_degps", "duration_s"], "description": "高级模式：同时设置前后与转向速度，到时自动停车。"},
                     "cancel": {"params": [], "description": "立即发送零速度。"},
                     "info": {"params": [], "description": "查看当前命令和安全条件。"},
                 },
@@ -321,6 +322,7 @@ class Plugin:
             "frame_id": self._frame_id,
             "limits": {
                 "max_linear_x_mps": self._max_linear,
+                "max_angular_z_degps": self._max_angular_deg,
                 "max_angular_z_radps": self._max_angular,
                 "max_duration_s": self._max_duration,
             },
@@ -341,17 +343,17 @@ class Plugin:
             return _failure("JOINT_STATE_UNAVAILABLE", "Refusing motion without fresh /joint_states")
         try:
             linear_x = _number(args.get("linear_x"), "linear_x")
-            angular_z = _number(args.get("angular_z"), "angular_z")
+            angular_z_degps = _number(args.get("angular_z_degps"), "angular_z_degps")
             duration_s = _number(args.get("duration_s"), "duration_s")
         except ValueError as e:
             return _failure("INVALID_ARGUMENT", str(e))
-        if linear_x == 0.0 and angular_z == 0.0:
+        if linear_x == 0.0 and angular_z_degps == 0.0:
             return _failure("INVALID_ARGUMENT", "Use action=stop for zero velocity")
-        if abs(linear_x) > self._max_linear or abs(angular_z) > self._max_angular:
+        if abs(linear_x) > self._max_linear or abs(angular_z_degps) > self._max_angular_deg:
             return _failure("LIMIT_EXCEEDED", "Requested velocity exceeds configured deployment guardrails", limits=status["limits"])
         if not 0.0 < duration_s <= self._max_duration:
             return _failure("INVALID_ARGUMENT", "duration_s is outside the configured safe interval", max_duration_s=self._max_duration)
-        return linear_x, angular_z, duration_s
+        return linear_x, math.radians(angular_z_degps), angular_z_degps, duration_s
 
     def _directional_args(self, action: str, args: dict):
         try:
@@ -361,13 +363,13 @@ class Plugin:
                 if not 0.0 < speed <= self._max_linear:
                     return _failure("LIMIT_EXCEEDED", "speed_mps is outside the configured base-drive limit",
                                     max_linear_x_mps=self._max_linear)
-                return {"linear_x": speed if action == "forward" else -speed, "angular_z": 0.0,
+                return {"linear_x": speed if action == "forward" else -speed, "angular_z_degps": 0.0,
                         "duration_s": duration_s}
-            speed = _number(args.get("turn_speed_radps"), "turn_speed_radps")
-            if not 0.0 < speed <= self._max_angular:
-                return _failure("LIMIT_EXCEEDED", "turn_speed_radps is outside the configured base-drive limit",
-                                max_angular_z_radps=self._max_angular)
-            return {"linear_x": 0.0, "angular_z": speed if action == "turn_left" else -speed,
+            speed = _number(args.get("turn_speed_degps"), "turn_speed_degps")
+            if not 0.0 < speed <= self._max_angular_deg:
+                return _failure("LIMIT_EXCEEDED", "turn_speed_degps is outside the configured base-drive limit",
+                                max_angular_z_degps=self._max_angular_deg)
+            return {"linear_x": 0.0, "angular_z_degps": speed if action == "turn_left" else -speed,
                     "duration_s": duration_s}
         except ValueError as e:
             return _failure("INVALID_ARGUMENT", str(e))
@@ -403,7 +405,7 @@ class Plugin:
         if isinstance(command, dict):
             return command
 
-        linear_x, angular_z, duration_s = command
+        linear_x, angular_z, angular_z_degps, duration_s = command
 
         if not self._driver.move(linear_x, angular_z, duration_s):
             return _failure("ROS_UNAVAILABLE",
@@ -414,7 +416,8 @@ class Plugin:
             "command": {
                 "action": action,
                 "linear_x": linear_x,
-                "angular_z": angular_z,
+                "angular_z_degps": angular_z_degps,
+                "angular_z_radps": angular_z,
                 "duration_s": duration_s,
                 "started_at_ms": int(time.time() * 1000),
             },
