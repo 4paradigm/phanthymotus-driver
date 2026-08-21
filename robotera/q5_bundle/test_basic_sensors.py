@@ -213,6 +213,13 @@ class Q5BasicSensorTests(unittest.TestCase):
         with open(base_drive.__file__, encoding="utf-8") as source:
             self.assertIn("reliability=ReliabilityPolicy.RELIABLE", source.read())
 
+    def test_base_drive_uses_the_verified_vendor_sdk_transport_contract(self):
+        with open(base_drive.__file__, encoding="utf-8") as source:
+            text = source.read()
+        self.assertIn('os.environ["RMW_IMPLEMENTATION"] = "rmw_cyclonedds_cpp"', text)
+        self.assertIn('plugin_config.get("publish_rate_hz", 10.0)', text)
+        self.assertIn('plugin_config.get("frame_id", "")', text)
+
     def test_hand_control_does_not_expose_raw_multi_joint_set_action(self):
         plugin = hand_control.Plugin.__new__(hand_control.Plugin)
         plugin._min_position, plugin._max_position = 0.0, 1.0
