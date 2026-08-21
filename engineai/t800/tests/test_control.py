@@ -141,6 +141,20 @@ class ValidationTests(unittest.TestCase):
                 entry_blend_sec=0.5,
             )
 
+    def test_resample_joint_trajectory_rejects_missing_current_state(self):
+        with self.assertRaisesRegex(ValueError, "current joint state is unavailable"):
+            resample_joint_trajectory(
+                [
+                    {"timestamp": 0, "positions": [0.0] * 25},
+                    {"timestamp": 50, "positions": [0.1] * 25},
+                ],
+                joint_indices=list(range(12, 25)),
+                current_positions=[],
+                playback_rate_hz=100.0,
+                speed_scale=1.0,
+                entry_blend_sec=0.5,
+            )
+
 
 class RepeatingCommandTests(unittest.TestCase):
     def test_timed_stream_publishes_and_stops(self):

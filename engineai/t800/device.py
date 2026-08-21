@@ -5940,6 +5940,8 @@ class MotionRecorderPlugin:
         with self._lock:
             if self._recording:
                 return {"error": "stop recording before reset"}
+            if self._reset_request_id is not None and self._last_reset is not None:
+                return {**self._last_reset, "already_resetting": True}
         joint_plan = getattr(self, "_joint_plan", None)
         if joint_plan is None or self._state is None or self._motion_mode is None:
             return {"error": "reset controls are unavailable"}

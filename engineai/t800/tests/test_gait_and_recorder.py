@@ -343,6 +343,10 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
         resetting = self.plugin.dispatch("reset", {})
         self.assertEqual("resetting", resetting["state"])
         self.assertIn(("reset", {}), joint_plan.calls)
+        repeated = self.plugin.dispatch("reset", {})
+        self.assertEqual(resetting["action_id"], repeated["action_id"])
+        self.assertTrue(repeated["already_resetting"])
+        self.assertEqual(1, sum(action == "reset" for action, _ in joint_plan.calls))
         pending = self.plugin.dispatch("status", {})
         self.assertTrue(pending["needs_reset"])
         self.assertTrue(pending["reset_pending"])
@@ -675,6 +679,31 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
         status = self.plugin.dispatch("status", {})
         self.assertFalse(status["playing"])
         self.assertIn("lower_body_balance", status["playback_error"])
+        publisher = next(
+            publisher
+            for publisher in self.plugin._node.publishers
+            if publisher.topic == "/motion/joint_override_command"
+        )
+        self.assertEqual(0.0, publisher.messages[-1].weight)
+
+    def test_stop_playback_releases_override_and_completes_acp_as_cancelled(self):
+        current = self._make_joint_state()
+        current.position = [0.0] * 25
+        current.velocity = [0.0] * 25
+        self.plugin._on_joint_state(current)
+        self.plugin._frames = [
+            {"timestamp": 0, "positions": [0.0] * 25, "velocities": [0.0] * 25},
+            {"timestamp": 2000, "positions": [0.5] * 25, "velocities": [0.0] * 25},
+        ]
+
+        started = self.plugin.dispatch("play", {})
+        time.sleep(0.05)
+        stopped = self.plugin.dispatch("stop_playback", {})
+        self.assertEqual("stopped", stopped["state"])
+        self.assertTrue(any(
+            call[0] == started["action_id"] and call[1] == "cancelled"
+            for call in self.acp_calls
+        ))
         publisher = next(
             publisher
             for publisher in self.plugin._node.publishers
