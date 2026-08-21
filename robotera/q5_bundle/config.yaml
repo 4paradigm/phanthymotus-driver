@@ -10,9 +10,9 @@ plugins:
     enabled: true
     # Match the vendor SDK's direct base-drive contract, not the remote-control stream.
     frame_id: ""
-    max_linear_x_mps: 0.20
-    max_angular_z_radps: 0.40
-    max_duration_s: 2.0
+    max_linear_x_mps: 0.50
+    max_angular_z_radps: 0.7853981634  # 45 deg/s
+    max_duration_s: 5.0
     publish_rate_hz: 10.0
     stop_repetitions: 3
   joints:

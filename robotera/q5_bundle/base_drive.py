@@ -194,10 +194,11 @@ def _subproc_main(cmd_q: mp.Queue, ready: mp.Event, publish_rate: float, stop_re
                 lx = float(cmd.get("linear_x", 0.0))
                 az = float(cmd.get("angular_z", 0.0))
                 dur = float(cmd.get("duration_s", 1.0))
+                continuous = dur == -1.0
                 deadline = time.monotonic() + dur
                 stop_early = False
                 try:
-                    while not stop_early and time.monotonic() < deadline:
+                    while not stop_early and (continuous or time.monotonic() < deadline):
                         _publish(lx, az)
                         # Check for pending stop command
                         try:
@@ -227,10 +228,10 @@ def _subproc_main(cmd_q: mp.Queue, ready: mp.Event, publish_rate: float, stop_re
 class Plugin:
     def __init__(self, plugin_config, namespace, executor, client):
         self._client = client
-        self._max_linear = float(plugin_config.get("max_linear_x_mps", 0.20))
-        self._max_angular = float(plugin_config.get("max_angular_z_radps", 0.40))
+        self._max_linear = float(plugin_config.get("max_linear_x_mps", 0.50))
+        self._max_angular = float(plugin_config.get("max_angular_z_radps", math.radians(45.0)))
         self._max_angular_deg = math.degrees(self._max_angular)
-        self._max_duration = float(plugin_config.get("max_duration_s", 2.0))
+        self._max_duration = float(plugin_config.get("max_duration_s", 5.0))
         self._publish_rate = float(plugin_config.get("publish_rate_hz", 10.0))
         self._stop_repetitions = int(plugin_config.get("stop_repetitions", 3))
         self._frame_id = str(plugin_config.get("frame_id", ""))
@@ -270,19 +271,19 @@ class Plugin:
                     "speed_mps": {
                         "type": "number", "title": "移动速度 (m/s)", "minimum": 0.01,
                         "maximum": self._max_linear, "multipleOf": 0.01,
-                        "default": min(0.10, self._max_linear),
+                        "default": min(0.20, self._max_linear),
                         "description": f"范围[0.01,{self._max_linear:g}]m/s",
                     },
                     "turn_speed_degps": {
                         "type": "number", "title": "转向速度 (deg/s)", "minimum": 1.0,
                         "maximum": self._max_angular_deg, "multipleOf": 1.0,
-                        "default": min(10.0, self._max_angular_deg),
+                        "default": min(15.0, self._max_angular_deg),
                         "description": f"范围[1,{self._max_angular_deg:g}]deg/s",
                     },
                     "linear_x": {
                         "type": "number",
                         "title": "前后速度 (m/s)", "minimum": -self._max_linear,
-                        "maximum": self._max_linear, "multipleOf": 0.01, "default": 0.10,
+                        "maximum": self._max_linear, "multipleOf": 0.01, "default": min(0.20, self._max_linear),
                         "description": f"范围[-{self._max_linear:g},{self._max_linear:g}]m/s",
                     },
                     "angular_z_degps": {
@@ -292,21 +293,23 @@ class Plugin:
                         "description": f"范围[-{self._max_angular_deg:g},{self._max_angular_deg:g}]deg/s",
                     },
                     "duration_s": {
-                        "type": "number",
-                        "title": "持续时间 (秒)", "minimum": 0.1, "maximum": self._max_duration,
-                        "multipleOf": 0.1, "default": min(0.5, self._max_duration),
-                        "description": f"范围[0.1,{self._max_duration:g}]秒",
+                        "type": "number", "title": "持续时间 (秒)", "default": min(1.0, self._max_duration),
+                        "anyOf": [
+                            {"const": -1.0, "title": "持续运动（需取消）"},
+                            {"minimum": 0.1, "maximum": self._max_duration, "multipleOf": 0.1},
+                        ],
+                        "description": f"范围[0.1,{self._max_duration:g}]秒；-1 表示持续运动，需调用 cancel 停止。",
                     },
                 },
                 "required": ["action"],
                 "additionalProperties": False,
                 "x-action-params": {
                     "start": {"params": [], "description": "检查控制锁、发布者冲突和当前限制。"},
-                    "forward": {"params": ["speed_mps", "duration_s"], "description": "以设定速度直线前进，到时自动停车。"},
-                    "backward": {"params": ["speed_mps", "duration_s"], "description": "以设定速度直线后退，到时自动停车。"},
-                    "turn_left": {"params": ["turn_speed_degps", "duration_s"], "description": "以设定角度速度原地左转，到时自动停车。"},
-                    "turn_right": {"params": ["turn_speed_degps", "duration_s"], "description": "以设定角度速度原地右转，到时自动停车。"},
-                    "move": {"params": ["linear_x", "angular_z_degps", "duration_s"], "description": "高级模式：同时设置前后与转向速度，到时自动停车。"},
+                    "forward": {"params": ["speed_mps", "duration_s"], "description": "以设定速度直线前进；duration_s=-1 时持续至 cancel。"},
+                    "backward": {"params": ["speed_mps", "duration_s"], "description": "以设定速度直线后退；duration_s=-1 时持续至 cancel。"},
+                    "turn_left": {"params": ["turn_speed_degps", "duration_s"], "description": "以设定角度速度原地左转；duration_s=-1 时持续至 cancel。"},
+                    "turn_right": {"params": ["turn_speed_degps", "duration_s"], "description": "以设定角度速度原地右转；duration_s=-1 时持续至 cancel。"},
+                    "move": {"params": ["linear_x", "angular_z_degps", "duration_s"], "description": "高级模式：duration_s=-1 时持续至 cancel。"},
                     "cancel": {"params": [], "description": "立即发送零速度。"},
                     "info": {"params": [], "description": "查看当前命令和安全条件。"},
                 },
@@ -351,7 +354,7 @@ class Plugin:
             return _failure("INVALID_ARGUMENT", "Use action=stop for zero velocity")
         if abs(linear_x) > self._max_linear or abs(angular_z_degps) > self._max_angular_deg:
             return _failure("LIMIT_EXCEEDED", "Requested velocity exceeds configured deployment guardrails", limits=status["limits"])
-        if not 0.0 < duration_s <= self._max_duration:
+        if duration_s != -1.0 and not 0.0 < duration_s <= self._max_duration:
             return _failure("INVALID_ARGUMENT", "duration_s is outside the configured safe interval", max_duration_s=self._max_duration)
         return linear_x, math.radians(angular_z_degps), angular_z_degps, duration_s
 
@@ -421,7 +424,7 @@ class Plugin:
                 "duration_s": duration_s,
                 "started_at_ms": int(time.time() * 1000),
             },
-            "stops_automatically": True,
+            "stops_automatically": duration_s != -1.0,
         }
 
 
