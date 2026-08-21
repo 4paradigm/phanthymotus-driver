@@ -34,8 +34,10 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 | `model` | resource | 官方 `serial_t800.urdf` |
 | `loco` | actuator | 100 Hz 速度控制；定时/持续、相对位移、转角和圆弧开环动作 |
 | `motion_mode` | actuator | 任意状态切换及 idle/passive/站立/行走/舞蹈/起身/躺下快捷动作 |
+| `gait` | actuator | 基于 Native SDK motion state 的步态选择；自动适配 `rl_basic`/`walk` 版本差异 |
 | `dance` | actuator | 舞蹈列表、播放、停止和状态；官方基线为 `dance.mnn` + `dance.npz` |
 | `joint_plan` | actuator | 索引/名称关节轨迹、头部/单臂姿态、当前位置保持、取消、复位和预置动作 |
+| `motion_recorder` | actuator | 按指定采样率录制关节轨迹，手动/定时停止均自动落盘，并支持管理与回放 |
 | `joint_plan_state` | sensor | 规划 request id、状态和进度 |
 | `gesture` | actuator | 官方完整挥手/握手多步序列及任意自定义关节动作队列 |
 | `joint_override` | actuator | 指定关节 100 Hz 覆盖控制 |
@@ -72,6 +74,17 @@ MCP schema 中隐藏。
 除了原始按键/摇杆外，提供 idle、passive、stand、walk、dance、get_up、
 lie_down 组合键。LCM 输入会覆盖实体手柄输入，发送完成后 Driver 自动发布
 全零包释放控制权。
+
+`gait` 不会写入自定义 `gait.json`。官方 T800 Native SDK 的行走
+策略配置位于 `assets/config/t800/.../*.yaml`，且不提供 `step_height`、
+`stride_length` 等通用运行时调参契约。因此卡片只通过官方
+`/motion/set_motion_state` 接口切换 `basic` / `balanced` / `terrain`，
+并以 `/motion/motion_state` 返回的可转换状态为准。
+
+`motion_recorder.record_start` 是幂等的：录制中重复调用只返回当前会话，
+不会意外停止。`record_stop` 同样可重复调用；设置 `duration > 0`
+时超时会走与手动停止相同的落盘路径。状态中的 `last_recording`
+可用于确认最近一次保存文件、停止原因和帧数。
 
 `pointcloud`、`camera`、`depth` 桥接 T800-Odin2 激光雷达相机（飞书文档
 7.2 节）在 Orin 主板上发布的 `odin_ros_driver` topic。点云按

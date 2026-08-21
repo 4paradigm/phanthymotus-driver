@@ -4944,3 +4944,788 @@ class ControlledSpatialPlugin:
             f.write(header)
             for p in points:
                 f.write(f"{p[0]:.6f} {p[1]:.6f} {p[2]:.6f}\n")
+
+
+GAIT_PROFILES: dict[str, dict] = {
+    "basic": {
+        "motion_states": ("walk", "rl_basic"),
+        "description": "基础行走（自动适配新版 rl_basic 与旧版 walk 状态名）",
+    },
+    "balanced": {
+        "motion_states": ("lower_body_balance",),
+        "description": "下肢平衡步态",
+    },
+    "terrain": {
+        "motion_states": ("rl_terrain",),
+        "description": "地形步态（仅在当前固件公开该状态时可用）",
+    },
+}
+
+
+class GaitPlugin:
+    """Version-adaptive gait selector over the public motion-state API.
+
+    The public T800 Native SDK stores walking policy settings under
+    ``assets/config/t800/.../*.yaml``.  It does not define the historical
+    ``config/rl_basic/gait.json`` contract or fields such as ``step_height``.
+    Exposing those guessed files produced successful-looking writes that the
+    robot never consumed.  This plugin only uses the documented ROS motion
+    state interface and resolves the ``rl_basic``/``walk`` version difference
+    from the robot's advertised transitions.
+    """
+
+    PREFIX = "gait"
+
+    def __init__(self, config: dict, motion_mode: "MotionModePlugin", state: StatePlugin):
+        self._motion_mode = motion_mode
+        self._state = state
+        plugin_config = config.get("plugins", {}).get("gait", {})
+        configured_basic = plugin_config.get("basic_motion_states", ["walk", "rl_basic"])
+        if not isinstance(configured_basic, (list, tuple)) or not configured_basic:
+            configured_basic = ["walk", "rl_basic"]
+        basic_states = tuple(str(item) for item in configured_basic if str(item))
+        self._profiles = {
+            name: {
+                **definition,
+                "motion_states": basic_states if name == "basic" else definition["motion_states"],
+            }
+            for name, definition in GAIT_PROFILES.items()
+        }
+
+    def get_tool(self) -> dict:
+        return {
+            "name": self.PREFIX,
+            "type": "actuator",
+            "multiInstance": False,
+            "description": (
+                "T800 步态选择，通过官方 motion state 接口切换基础行走、"
+                "下肢平衡或地形步态；会按固件返回的 available transitions 判定可用性。"
+            ),
+            "inputSchema": action_schema(
+                {
+                    "start": ([], "启动卡片（actuator 生命周期）"),
+                    "stop": ([], "停止卡片（不强制改变机器人状态）"),
+                    "info": ([], "查询当前步态与可用性"),
+                    "status": ([], "查询当前步态与可用性"),
+                    "list": ([], "列出步态档位与当前固件的可用性"),
+                    "select": (["gait", "force", "wait"], "选择步态档位"),
+                },
+                {
+                    "gait": {
+                        "type": "string",
+                        "enum": list(self._profiles),
+                        "description": "步态档位",
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "固件未声明该转换时仍发送（默认 false）",
+                    },
+                    "wait": {
+                        "type": "boolean",
+                        "description": "等待 motion state 反馈（默认 true）",
+                    },
+                },
+                "步态动作",
+            ),
+        }
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "start":
+            status = self._status()
+            status["gait_state"] = status.pop("state")
+            status["state"] = "ready"
+            return status
+        if action in ("info", "status"):
+            return self._status()
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "list":
+            return self._list_profiles()
+        if action == "select":
+            return self._select(args)
+        return {"error": f"unknown gait action: {action}"}
+
+    def _resolve(self, profile: str, current: str, available: list[str]) -> str | None:
+        candidates = self._profiles[profile]["motion_states"]
+        if current in candidates:
+            return current
+        for candidate in candidates:
+            if candidate in available:
+                return candidate
+        return None
+
+    def _profile_for_motion(self, motion: str) -> str | None:
+        for name, definition in self._profiles.items():
+            if motion in definition["motion_states"]:
+                return name
+        return None
+
+    def _status(self) -> dict:
+        current, available = self._state.current_motion()
+        profile = self._profile_for_motion(current)
+        return {
+            "state": "active" if profile else "inactive",
+            "gait": profile,
+            "motion_state": current,
+            "available_motion_states": available,
+            "available_gaits": [
+                name
+                for name in self._profiles
+                if self._resolve(name, current, available) is not None
+            ],
+        }
+
+    def _list_profiles(self) -> dict:
+        current, available = self._state.current_motion()
+        profiles = []
+        for name, definition in self._profiles.items():
+            resolved = self._resolve(name, current, available)
+            profiles.append({
+                "name": name,
+                "description": definition["description"],
+                "motion_states": list(definition["motion_states"]),
+                "resolved_motion_state": resolved,
+                "available": resolved is not None,
+                "active": current in definition["motion_states"],
+            })
+        return {
+            "state": "ready",
+            "current_motion_state": current,
+            "available_motion_states": available,
+            "profiles": profiles,
+        }
+
+    def _select(self, args: dict) -> dict:
+        profile = str(args.get("gait", ""))
+        if profile not in self._profiles:
+            return {"error": f"unknown gait: {profile}", "gaits": list(self._profiles)}
+        current, available = self._state.current_motion()
+        force = bool(args.get("force", False))
+        target = self._resolve(profile, current, available)
+        if target is None:
+            if not force:
+                return {
+                    "error": f"gait {profile} is not available from {current or 'unknown'}",
+                    "available_motion_states": available,
+                    "candidate_motion_states": list(self._profiles[profile]["motion_states"]),
+                }
+            target = self._profiles[profile]["motion_states"][0]
+
+        if current == target:
+            return {
+                "state": "completed",
+                "gait": profile,
+                "current": current,
+                "available": available,
+            }
+
+        result = self._motion_mode.dispatch("switch", {
+            "target": target,
+            "force": force,
+            "wait": bool(args.get("wait", True)),
+        })
+        return {"gait": profile, "motion_state": target, **result}
+
+
+class MotionRecorderPlugin:
+    """Record, save, and replay T800 joint trajectories.
+
+    Recording captures joint positions from the robot's joint state topic
+    at a configurable rate.  Playback sends the recorded trajectory through
+    the joint planner's step-by-step plan interface.
+
+    ⚠  Playback requires the robot to be in ``lower_body_balance`` mode.
+    """
+
+    PREFIX = "motion_recorder"
+
+    # Default recording rate (Hz) — 20 Hz captures 50ms intervals, enough
+    # for smooth playback without overwhelming the trajectory buffer.
+    _DEFAULT_RECORD_HZ = 20.0
+    _MAX_FRAMES = 6000  # 5 minutes at 20 Hz
+
+    def __init__(self, config: dict, namespace: str, ros2):
+        self._config = config
+        self._ns = namespace
+        self._node = None
+        self._ros2 = ros2
+
+        # Recording state
+        self._record_hz = float(
+            config.get("plugins", {})
+            .get("motion_recorder", {})
+            .get("record_hz", self._DEFAULT_RECORD_HZ)
+        )
+        if not math.isfinite(self._record_hz) or self._record_hz <= 0:
+            raise ValueError("motion_recorder.record_hz must be a positive finite number")
+        self._record_period_sec = 1.0 / self._record_hz
+        record_dir = (
+            config.get("plugins", {})
+            .get("motion_recorder", {})
+            .get("recordings_dir", "")
+        )
+        self._recordings_dir = Path(
+            record_dir if record_dir else
+            os.path.join(os.path.dirname(__file__), RECORDINGS_DIR)
+        )
+        self._recordings_dir.mkdir(parents=True, exist_ok=True)
+
+        self._lock = threading.RLock()
+        self._frames: list[dict] = []
+        self._recording = False
+        self._record_thread: threading.Thread | None = None
+        self._record_stop = threading.Event()
+        self._record_label = ""
+        self._record_start_ms = 0
+        self._record_session = 0
+        self._last_sample_at: float | None = None
+        self._last_recording: dict | None = None
+        self._joint_state_sub = None
+
+        # Playback state
+        self._playback_thread: threading.Thread | None = None
+        self._playback_stop = threading.Event()
+        self._playing = False
+        self._playback_label = ""
+        self._playback_frame = 0
+
+        # Latest joint state cache
+        self._latest_joint_positions: list[float] | None = None
+
+    def get_tool(self) -> dict:
+        return {
+            "name": self.PREFIX,
+            "type": "actuator",
+            "multiInstance": False,
+            "description": (
+                "T800 全身运动录制与回放 — 录制关节轨迹到文件，"
+                "回放已录制的轨迹。支持录制/停止/回放/保存/加载/管理。"
+                "回放需 lower_body_balance 模式。"
+            ),
+            "inputSchema": action_schema(
+                {
+                    "record_start": (["label", "duration"], "开始录制关节轨迹"),
+                    "record_stop": ([], "停止录制并自动保存"),
+                    "play": (["name", "speed_scale"], "回放指定录制文件"),
+                    "stop_playback": ([], "停止回放"),
+                    "save": (["name", "label"], "将当前录制保存到文件"),
+                    "load": (["name"], "从文件加载录制到内存"),
+                    "list": ([], "列出所有已保存的录制文件"),
+                    "delete": (["name"], "删除指定录制文件"),
+                    "status": ([], "查询录制/回放状态"),
+                    "info": ([], "同 status"),
+                },
+                {
+                    "label": {
+                        "type": "string",
+                        "description": "录制或保存的标签名",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "录制文件名（不含 .json）",
+                    },
+                    "duration": {
+                        "type": "number",
+                        "description": "自动停止时间（秒），0=持续录制直到手动停止",
+                    },
+                    "speed_scale": {
+                        "type": "number",
+                        "minimum": 0.1,
+                        "maximum": 5.0,
+                        "description": "回放速度倍率，1.0=原速",
+                    },
+                },
+                "运动录制/回放动作",
+            ),
+        }
+
+    def start(self) -> None:
+        from rclpy.node import Node
+        from interface_protocol.msg import JointState
+
+        self._node = Node("t800_motion_recorder", context=self._ros2.ctx_robot)
+        self._ros2.executor_robot.add_node(self._node)
+
+        # Subscribe to joint state for recording
+        topic = self._config.get("topics", {}).get("joint_state", "/hardware/joint_state")
+        self._joint_state_sub = self._node.create_subscription(
+            JointState, topic, self._on_joint_state,
+            self._best_effort_qos(),
+        )
+
+    def _best_effort_qos(self):
+        from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+        return QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=3,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+
+    def stop(self) -> None:
+        self._finalize_recording(stop_reason="shutdown")
+        self._playback_stop.set()
+        if self._node:
+            try:
+                self._node.destroy_node()
+            except Exception:
+                pass
+
+    # ── ROS2 callbacks ────────────────────────────────────────────────────────
+
+    def _on_joint_state(self, msg) -> None:
+        positions = [float(p) for p in msg.position]
+        velocities = [float(v) for v in msg.velocity]
+        sampled_at = time.monotonic()
+        with self._lock:
+            self._latest_joint_positions = list(positions)
+            if not self._recording or len(self._frames) >= self._MAX_FRAMES:
+                return
+            if (
+                self._last_sample_at is not None
+                and sampled_at - self._last_sample_at < self._record_period_sec
+            ):
+                return
+            self._last_sample_at = sampled_at
+            self._frames.append({
+                "timestamp": _now_ms() - self._record_start_ms,
+                "positions": positions,
+                "velocities": velocities,
+            })
+
+    # ── Dispatch ──────────────────────────────────────────────────────────────
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "start":
+            status = self._status()
+            status["activity_state"] = status.pop("state")
+            status["state"] = "ready"
+            return status
+        if action in ("info", "status"):
+            return self._status()
+        if action == "stop":
+            recording_result = self._finalize_recording(stop_reason="lifecycle")
+            self._playback_stop.set()
+            result = {"state": "idle"}
+            if recording_result.get("state") == "saved":
+                result["recording_result"] = recording_result
+            return result
+        if action == "record_start":
+            with self._lock:
+                if self._recording:
+                    return {
+                        "state": "recording",
+                        "recording": True,
+                        "already_recording": True,
+                        "label": self._record_label,
+                        "frames": len(self._frames),
+                        "session_id": self._record_session,
+                    }
+                if self._playing:
+                    return {"error": "cannot record while playing"}
+            return self._record_start(args)
+        if action == "record_stop":
+            return self._record_stop_action()
+        if action == "play":
+            return self._play(args)
+        if action == "stop_playback":
+            return self._stop_playback()
+        if action == "save":
+            return self._save(args)
+        if action == "load":
+            return self._load(args)
+        if action == "list":
+            return self._list_recordings()
+        if action == "delete":
+            return self._delete(args)
+        return {"error": f"unknown motion_recorder action: {action}"}
+
+    # ── Recording ─────────────────────────────────────────────────────────────
+
+    def _record_start(self, args: dict) -> dict:
+        try:
+            duration = float(args.get("duration", 0.0))
+        except (TypeError, ValueError):
+            return {"error": "duration must be a non-negative finite number"}
+        if not math.isfinite(duration) or duration < 0:
+            return {"error": "duration must be a non-negative finite number"}
+
+        with self._lock:
+            if self._recording:
+                return {
+                    "state": "recording",
+                    "recording": True,
+                    "already_recording": True,
+                    "label": self._record_label,
+                    "frames": len(self._frames),
+                    "session_id": self._record_session,
+                }
+            self._frames = []
+            self._recording = True
+            label = str(args.get("label", "")).strip()
+            self._record_label = label or f"recording_{int(time.time())}"
+            self._record_start_ms = _now_ms()
+            self._last_sample_at = None
+            self._record_session += 1
+            session_id = self._record_session
+            self._record_stop.clear()
+
+        # Auto-stop timer if duration specified
+        if duration > 0:
+            def auto_stop():
+                if not self._record_stop.wait(duration):
+                    self._finalize_recording(
+                        expected_session=session_id,
+                        stop_reason="duration",
+                    )
+            self._record_thread = threading.Thread(
+                target=auto_stop,
+                daemon=True,
+                name=f"t800-motion-record-{session_id}",
+            )
+            self._record_thread.start()
+
+        return {
+            "state": "recording",
+            "recording": True,
+            "label": self._record_label,
+            "duration": duration if duration > 0 else "unlimited",
+            "record_hz": self._record_hz,
+            "session_id": session_id,
+            "joint_data_available": self._latest_joint_positions is not None,
+            "note": "recording started; use record_stop to stop and save",
+        }
+
+    def _record_stop_action(self) -> dict:
+        return self._finalize_recording(stop_reason="manual")
+
+    def _finalize_recording(
+        self,
+        *,
+        expected_session: int | None = None,
+        stop_reason: str,
+    ) -> dict:
+        with self._lock:
+            if not self._recording or (
+                expected_session is not None
+                and expected_session != self._record_session
+            ):
+                return {
+                    "state": "idle",
+                    "recording": False,
+                    "already_stopped": True,
+                    "last_recording": dict(self._last_recording) if self._last_recording else None,
+                }
+            self._recording = False
+            self._record_stop.set()
+            frames = list(self._frames)
+            label = self._record_label
+            session_id = self._record_session
+
+        # Auto-save
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", label).strip("._")
+        safe_name = safe_name or f"recording_{int(time.time())}"
+        save_path = self._recordings_dir / f"{safe_name}.json"
+        frame_count = len(frames)
+        metadata = {
+            "label": label,
+            "frames": frame_count,
+            "duration_ms": frames[-1]["timestamp"] if frames else 0,
+            "recorded_at": _now_ms(),
+            "record_hz": self._record_hz,
+            "stop_reason": stop_reason,
+            "session_id": session_id,
+        }
+        recording = {
+            "metadata": metadata,
+            "frames": frames,
+        }
+        try:
+            save_path.write_text(
+                json.dumps(recording, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            result = {
+                "state": "error",
+                "recording": False,
+                "error": f"save failed: {exc}",
+                "label": label,
+                "frames": frame_count,
+                "stop_reason": stop_reason,
+                "session_id": session_id,
+            }
+            with self._lock:
+                self._last_recording = dict(result)
+            return result
+
+        result = {
+            "state": "saved",
+            "recording": False,
+            "label": label,
+            "frames": frame_count,
+            "duration_ms": metadata["duration_ms"],
+            "file": str(save_path),
+            "stop_reason": stop_reason,
+            "session_id": session_id,
+        }
+        with self._lock:
+            self._last_recording = dict(result)
+        return result
+
+    # ── Playback ──────────────────────────────────────────────────────────────
+
+    def _play(self, args: dict) -> dict:
+        with self._lock:
+            if self._playing:
+                return {"error": "already playing; stop first"}
+            if self._recording:
+                return {"error": "cannot play while recording"}
+
+        name = str(args.get("name", ""))
+        if not name:
+            # Try to use current buffer
+            with self._lock:
+                if not self._frames:
+                    return {"error": "no recording loaded; specify name or record first"}
+                frames = list(self._frames)
+                label = "buffer"
+        else:
+            safe_name = name.replace(" ", "_").replace("/", "_")
+            file_path = self._recordings_dir / f"{safe_name}.json"
+            if not file_path.exists():
+                return {"error": f"recording not found: {name}"}
+            try:
+                data = json.loads(file_path.read_text(encoding="utf-8"))
+                frames = data.get("frames", [])
+                label = data.get("metadata", {}).get("label", name)
+            except (json.JSONDecodeError, OSError) as exc:
+                return {"error": f"failed to load recording: {exc}"}
+
+        if not frames:
+            return {"error": "recording is empty"}
+
+        speed_scale = clamp(float(args.get("speed_scale", 1.0)), 0.1, 5.0)
+        self._playback_stop.clear()
+
+        # Get the joint planner reference
+        joint_plan = getattr(self, "_joint_plan", None)
+        if joint_plan is None:
+            # Fallback: we'll need the joint_plan plugin registered
+            return {"error": "joint_plan plugin required for playback"}
+
+        with self._lock:
+            self._playing = True
+            self._playback_label = label
+            self._playback_frame = 0
+
+        def run():
+            try:
+                playback_frames = list(frames)
+
+                for i, frame in enumerate(playback_frames):
+                    if self._playback_stop.is_set():
+                        break
+
+                    # Calculate delay from previous frame
+                    if i == 0:
+                        delay = 0.0
+                    else:
+                        dt = (frame["timestamp"] - playback_frames[i - 1]["timestamp"]) / 1000.0
+                        delay = dt / speed_scale
+
+                    if delay > 0:
+                        if self._playback_stop.wait(delay):
+                            break
+
+                    with self._lock:
+                        self._playback_frame = i
+                        self._playback_label = label
+
+                    # Send joint position via joint_plan
+                    positions = frame.get("positions", [])
+                    if not positions:
+                        continue
+
+                    # Use the upper_body joint indices (12-24) for playback
+                    upper_indices = list(range(12, min(len(positions), 25)))
+                    upper_positions = [positions[j] for j in upper_indices]
+
+                    try:
+                        joint_plan.dispatch("plan", {
+                            "joint_indices": upper_indices,
+                            "target_positions": upper_positions,
+                            "duration": max(delay, 0.05),
+                            "gravity_compensation": True,
+                        })
+                    except Exception:
+                        pass
+
+                with self._lock:
+                    self._playing = False
+                    self._playback_label = ""
+            except Exception:
+                with self._lock:
+                    self._playing = False
+
+        self._playback_thread = threading.Thread(target=run, daemon=True, name="t800-motion-playback")
+        self._playback_thread.start()
+
+        return {
+            "state": "playing",
+            "label": label,
+            "frames": len(frames),
+            "speed_scale": speed_scale,
+            "estimated_duration_s": round((frames[-1]["timestamp"] - frames[0]["timestamp"]) / 1000.0 / speed_scale, 1),
+        }
+
+    def _stop_playback(self) -> dict:
+        self._playback_stop.set()
+        with self._lock:
+            was_playing = self._playing
+            self._playing = False
+            frame = self._playback_frame
+        return {
+            "state": "stopped" if was_playing else "idle",
+            "frames_played": frame,
+        }
+
+    # ── Save/Load ─────────────────────────────────────────────────────────────
+
+    def _save(self, args: dict) -> dict:
+        name = str(args.get("name", ""))
+        if not name:
+            return {"error": "name is required"}
+        label = str(args.get("label", name))
+        safe_name = name.replace(" ", "_").replace("/", "_")
+        file_path = self._recordings_dir / f"{safe_name}.json"
+
+        with self._lock:
+            if not self._frames:
+                return {"error": "no frames in buffer to save"}
+            frames = list(self._frames)
+            metadata = {
+                "label": label,
+                "frames": len(frames),
+                "duration_ms": frames[-1]["timestamp"] if frames else 0,
+                "recorded_at": _now_ms(),
+            }
+
+        recording = {"metadata": metadata, "frames": frames}
+        try:
+            file_path.write_text(json.dumps(recording, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError as exc:
+            return {"error": f"save failed: {exc}"}
+
+        return {
+            "state": "saved",
+            "name": name,
+            "file": str(file_path),
+            "frames": len(frames),
+            "duration_ms": metadata["duration_ms"],
+        }
+
+    def _load(self, args: dict) -> dict:
+        name = str(args.get("name", ""))
+        if not name:
+            return {"error": "name is required"}
+        safe_name = name.replace(" ", "_").replace("/", "_")
+        file_path = self._recordings_dir / f"{safe_name}.json"
+        if not file_path.exists():
+            return {"error": f"recording not found: {name}"}
+
+        try:
+            data = json.loads(file_path.read_text(encoding="utf-8"))
+            frames = data.get("frames", [])
+            meta = data.get("metadata", {})
+        except (json.JSONDecodeError, OSError) as exc:
+            return {"error": f"load failed: {exc}"}
+
+        with self._lock:
+            self._frames = list(frames)
+            self._record_label = meta.get("label", name)
+
+        return {
+            "state": "loaded",
+            "name": name,
+            "label": meta.get("label", name),
+            "frames": len(frames),
+            "duration_ms": meta.get("duration_ms", 0),
+        }
+
+    def _list_recordings(self) -> dict:
+        recordings = []
+        for fpath in sorted(self._recordings_dir.glob("*.json")):
+            try:
+                data = json.loads(fpath.read_text(encoding="utf-8"))
+                meta = data.get("metadata", {})
+                recordings.append({
+                    "name": fpath.stem,
+                    "label": meta.get("label", fpath.stem),
+                    "frames": meta.get("frames", len(data.get("frames", []))),
+                    "duration_ms": meta.get("duration_ms", 0),
+                    "file": str(fpath),
+                })
+            except (json.JSONDecodeError, OSError):
+                recordings.append({
+                    "name": fpath.stem,
+                    "error": "corrupt file",
+                    "file": str(fpath),
+                })
+
+        return {
+            "state": "ready",
+            "recordings": recordings,
+            "count": len(recordings),
+            "directory": str(self._recordings_dir),
+        }
+
+    def _delete(self, args: dict) -> dict:
+        name = str(args.get("name", ""))
+        if not name:
+            return {"error": "name is required"}
+        safe_name = name.replace(" ", "_").replace("/", "_")
+        file_path = self._recordings_dir / f"{safe_name}.json"
+        if not file_path.exists():
+            return {"error": f"recording not found: {name}"}
+        try:
+            file_path.unlink()
+        except OSError as exc:
+            return {"error": f"delete failed: {exc}"}
+        return {"state": "deleted", "name": name}
+
+    # ── Status ────────────────────────────────────────────────────────────────
+
+    def _status(self) -> dict:
+        with self._lock:
+            elapsed_ms = (
+                max(0, _now_ms() - self._record_start_ms)
+                if self._recording else 0
+            )
+            return {
+                "state": "recording" if self._recording else ("playing" if self._playing else "idle"),
+                "recording": self._recording,
+                "playing": self._playing,
+                "buffer_frames": len(self._frames),
+                "record_label": self._record_label if self._recording else "",
+                "record_elapsed_ms": elapsed_ms,
+                "record_hz": self._record_hz,
+                "record_session_id": self._record_session if self._recording else None,
+                "playback_label": self._playback_label if self._playing else "",
+                "playback_frame": self._playback_frame if self._playing else 0,
+                "recordings_dir": str(self._recordings_dir),
+                "joint_data_available": self._latest_joint_positions is not None,
+                "last_recording": dict(self._last_recording) if self._last_recording else None,
+            }
+
+    # ── Plugin compatibility ──────────────────────────────────────────────────
+
+    def set_joint_plan(self, joint_plan):
+        """Inject the JointPlanPlugin reference for playback."""
+        self._joint_plan = joint_plan

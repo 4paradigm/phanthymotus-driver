@@ -96,6 +96,7 @@ class T800DeviceBundle:
     def __init__(self, config: dict, namespace: str, ros2: DualDomainROS2):
         from device import (
             DancePlugin,
+            GaitPlugin,
             GesturePlugin,
             JointBridgePlugin,
             JointOverridePlugin,
@@ -106,6 +107,7 @@ class T800DeviceBundle:
             ControlledSpatialPlugin,
             MotionCommandTracePlugin,
             MotionEventsPlugin,
+            MotionRecorderPlugin,
             MicPlugin,
             MotionModePlugin,
             MotorPowerPlugin,
@@ -172,6 +174,24 @@ class T800DeviceBundle:
             instances["gesture"] = instance
             self._plugins.append(instance)
 
+        # Gait selector — delegates to the public Native SDK motion-state API.
+        if (
+            plugins.get("gait", {}).get("enabled", False)
+            and "motion_mode" in instances
+        ):
+            instance = GaitPlugin(config, instances["motion_mode"], state)
+            instances["gait"] = instance
+            self._plugins.append(instance)
+
+        # Motion recorder — record and replay joint trajectories
+        motion_recorder = None
+        if plugins.get("motion_recorder", {}).get("enabled", False):
+            motion_recorder = MotionRecorderPlugin(config, namespace, ros2)
+            instances["motion_recorder"] = motion_recorder
+            self._plugins.append(motion_recorder)
+            if "joint_plan" in instances:
+                motion_recorder.set_joint_plan(instances["joint_plan"])
+
         virtual_gamepad_config = plugins.get("virtual_gamepad", {})
         if virtual_gamepad_config.get("enabled", False):
             instance = VirtualGamepadPlugin(virtual_gamepad_config, namespace, ros2)
@@ -200,7 +220,7 @@ class T800DeviceBundle:
             instances["safety"].set_controls(
                 [
                     instances[key]
-                    for key in ("locomotion", "joint_override", "joint_bridge", "virtual_gamepad", "gesture")
+                    for key in ("locomotion", "joint_override", "joint_bridge", "virtual_gamepad", "gesture", "motion_recorder")
                     if key in instances
                 ]
             )
