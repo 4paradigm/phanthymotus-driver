@@ -3953,7 +3953,9 @@ def run_realsense_process(
                 "v2_publish_errors": 0,
                 "jpeg_encode_errors": 0,
             }
-            self._clock = self._new_clock_normalizer()
+            # Do not shadow rclpy.node.Node._clock: get_clock() relies on the
+            # ROS Clock object's handle when stamping the legacy messages.
+            self._camera_clock_normalizer = self._new_clock_normalizer()
 
             self._depth_q = queue.Queue(maxsize=1)
             self._depth_worker = None
@@ -4033,7 +4035,7 @@ def run_realsense_process(
                 source_ms = frame.get_timestamp()
             except Exception:
                 source_ms = None
-            timing = self._clock.normalize(
+            timing = self._camera_clock_normalizer.normalize(
                 source_timestamp_ms=source_ms,
                 source_domain=self._frame_domain(frame),
                 driver_receive_stamp_ns=receive_unix_ns,
@@ -4108,7 +4110,7 @@ def run_realsense_process(
                 config.enable_stream(rs.stream.color, RS_COLOR_W, RS_COLOR_H, rs.format.bgr8, RS_COLOR_FPS)
                 profile = pipeline.start(config, self._on_frame)
                 self._configure_profile(profile)
-                self._clock = self._new_clock_normalizer()
+                self._camera_clock_normalizer = self._new_clock_normalizer()
                 self._sequence = {"rgb": 0, "depth": 0}
                 self._last_frame_monotonic = time.monotonic()
                 self._worker_stop.clear()

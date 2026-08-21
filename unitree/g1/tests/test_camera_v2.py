@@ -214,7 +214,11 @@ class DriverCameraContractTest(unittest.TestCase):
         source = (G1_DIR / "device.py").read_text(encoding="utf-8")
         start_capture = source[source.index("        def start_capture(self):"):]
         self.assertIn("self._configure_profile(profile)", start_capture)
-        self.assertIn("self._clock = self._new_clock_normalizer()", start_capture)
+        self.assertIn(
+            "self._camera_clock_normalizer = self._new_clock_normalizer()",
+            start_capture,
+        )
+        self.assertNotIn("self._clock = self._new_clock_normalizer()", source)
         self.assertIn('self._sequence = {"rgb": 0, "depth": 0}', start_capture)
         self.assertIn("self.stop_capture(reconnecting=True)", start_capture)
 
