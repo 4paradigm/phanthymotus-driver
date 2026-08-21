@@ -15,6 +15,7 @@ from __future__ import annotations
 import math
 import multiprocessing as mp
 import os
+import queue
 import threading
 import time
 
@@ -50,6 +51,48 @@ def _number(value, field: str):
     if not math.isfinite(value):
         raise ValueError(f"{field} must be finite")
     return value
+
+
+class _CommandScheduler:
+    """Apply ordered drive commands without losing a stop behind a move."""
+
+    def __init__(self, publish_rate: float, stop_repetitions: int):
+        self._period_s = 1.0 / publish_rate
+        self._stop_repetitions = stop_repetitions
+        self._active = None
+        self._stop_remaining = 0
+        self._next_publish_at = 0.0
+
+    def accept(self, command: dict, now: float):
+        kind = command.get("kind") if isinstance(command, dict) else None
+        if kind == "stop":
+            self._active = None
+            self._stop_remaining = self._stop_repetitions
+            self._next_publish_at = now
+        elif kind == "move":
+            duration_s = float(command.get("duration_s", 1.0))
+            self._active = {
+                "linear_x": float(command.get("linear_x", 0.0)),
+                "angular_z": float(command.get("angular_z", 0.0)),
+                "deadline": None if duration_s == -1.0 else now + duration_s,
+            }
+            self._stop_remaining = 0
+            self._next_publish_at = now
+
+    def next_output(self, now: float):
+        if now < self._next_publish_at:
+            return None
+        if self._active is not None:
+            if self._active["deadline"] is None or now < self._active["deadline"]:
+                self._next_publish_at = now + self._period_s
+                return self._active["linear_x"], self._active["angular_z"]
+            self._active = None
+            self._stop_remaining = self._stop_repetitions
+        if self._stop_remaining:
+            self._stop_remaining -= 1
+            self._next_publish_at = now + self._period_s
+            return 0.0, 0.0
+        return None
 
 
 # ── Subprocess launcher (CycloneDDS only — publishes TwistStamped) ───────────
@@ -170,47 +213,20 @@ def _subproc_main(cmd_q: mp.Queue, ready: mp.Event, publish_rate: float, stop_re
         msg.twist.angular.z = angular_z
         pub.publish(msg)
 
-    def _publish_stop():
-        for i in range(stop_repetitions):
-            _publish(0.0, 0.0)
-            if i + 1 < stop_repetitions:
-                time.sleep(1.0 / publish_rate)
+    scheduler = _CommandScheduler(publish_rate, stop_repetitions)
 
     while running:
-        # Drain commands
-        cmds = []
+        now = time.monotonic()
+        # Apply every queued command in arrival order before publishing. This
+        # makes move(-1) followed by stop resolve to zero velocity immediately.
         try:
             while True:
-                cmds.append(cmd_q.get_nowait())
-        except Exception:
+                scheduler.accept(cmd_q.get_nowait(), now)
+        except queue.Empty:
             pass
-
-        for cmd in cmds:
-            if not isinstance(cmd, dict):
-                continue
-            kind = cmd.get("kind")
-            if kind == "stop":
-                _publish_stop()
-            elif kind == "move":
-                lx = float(cmd.get("linear_x", 0.0))
-                az = float(cmd.get("angular_z", 0.0))
-                dur = float(cmd.get("duration_s", 1.0))
-                continuous = dur == -1.0
-                deadline = time.monotonic() + dur
-                stop_early = False
-                try:
-                    while not stop_early and (continuous or time.monotonic() < deadline):
-                        _publish(lx, az)
-                        # Check for pending stop command
-                        try:
-                            extra = cmd_q.get_nowait()
-                            if isinstance(extra, dict) and extra.get("kind") == "stop":
-                                stop_early = True
-                        except Exception:
-                            pass
-                        time.sleep(1.0 / publish_rate)
-                finally:
-                    _publish_stop()
+        output = scheduler.next_output(now)
+        if output is not None:
+            _publish(*output)
 
         # Health log every 10s
         now = time.time()
@@ -219,6 +235,10 @@ def _subproc_main(cmd_q: mp.Queue, ready: mp.Event, publish_rate: float, stop_re
             node.get_logger().info("base_drive_subproc health OK")
 
         executor.spin_once(timeout_sec=0.005)
+
+    for _ in range(stop_repetitions):
+        _publish(0.0, 0.0)
+        time.sleep(1.0 / publish_rate)
 
     node.destroy_node()
     rclpy.shutdown()
@@ -316,6 +336,10 @@ class Plugin:
                     "cancel": {"params": [], "description": "立即发送零速度。"},
                     "info": {"params": [], "description": "查看当前命令和安全条件。"},
                 },
+                "x-completion": {
+                    "actions": ["forward", "backward", "turn_left", "turn_right", "move"],
+                    "timeout": self._max_duration + (self._stop_repetitions / self._publish_rate) + 1.0,
+                },
             },
         }
 
@@ -383,13 +407,14 @@ class Plugin:
     def start(self):
         if not self._driver.start():
             return _failure("ROS_UNAVAILABLE",
-                            "Q5 base-drive Fast DDS publisher did not become ready within 5 seconds",
+                            "Q5 base-drive CycloneDDS publisher did not become ready within 5 seconds",
                             status=self._control_status())
         return {"state": "ready", "safety": self._control_status()}
 
     def stop(self):
         self._driver.stop()
         self._finish_active("cancelled", {"reason": "plugin_stopped"})
+        return {"state": "idle"}
 
     def _finish_active(self, status: str, result: dict, action_id: str | None = None):
         with self._action_lock:
@@ -449,13 +474,15 @@ class Plugin:
         if action == "start":
             return self.start()
         if action == "info":
-            return {"ok": True, "state": "moving" if self._driver.get_status()["subproc_alive"] else "idle",
-                    "active_command": None,
+            with self._action_lock:
+                active = self._active_action
+            return {"ok": True, "state": "moving" if active else "idle",
+                    "active_command": active["command"] if active else None,
                     "safety": self._control_status()}
         if action in ("cancel", "stop"):
             self._driver.stop()
             active = self._finish_active("cancelled", {"reason": "cancelled_by_request"})
-            return {"ok": True, "state": "stopped", "reason": "command",
+            return {"ok": True, "state": "idle", "reason": "command",
                     "action_id": active["action_id"] if active else None}
 
         if action not in ("forward", "backward", "turn_left", "turn_right", "move"):
