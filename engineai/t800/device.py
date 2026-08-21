@@ -39,6 +39,7 @@ except ImportError:
 from control import (
     LED_MODES,
     MOTION_STATES,
+    WALK_MOTION_STATES,
     T800_JOINT_GROUPS,
     T800_JOINT_INDEX,
     T800_JOINT_NAMES,
@@ -1887,7 +1888,10 @@ class LocomotionPlugin:
                     "vy": {"type": "number", "description": "侧向速度 m/s"},
                     "vyaw": {"type": "number", "description": "偏航角速度 rad/s"},
                     "duration": {"type": "number", "description": "秒；-1=持续，0=停止"},
-                    "force": {"type": "boolean", "description": "忽略当前必须为 walk 的状态门禁"},
+                    "force": {
+                        "type": "boolean",
+                        "description": "忽略必须处于 rl_basic/lower_body_balance 的状态门禁",
+                    },
                     "x_m": {"type": "number", "description": "机身坐标系前向位移，米"},
                     "y_m": {"type": "number", "description": "机身坐标系侧向位移，米"},
                     "speed_m_s": {"type": "number", "description": "平移速度绝对值，m/s"},
@@ -1948,8 +1952,13 @@ class LocomotionPlugin:
             return {"error": f"unknown locomotion action: {action}"}
 
         motion, _ = self._state.current_motion()
-        if motion != "walk" and not bool(args.get("force", False)):
-            return {"error": f"move requires motion state 'walk' (current: {motion or 'unknown'})"}
+        if motion not in WALK_MOTION_STATES and not bool(args.get("force", False)):
+            return {
+                "error": (
+                    f"move requires motion state in {WALK_MOTION_STATES} "
+                    f"(current: {motion or 'unknown'})"
+                )
+            }
         open_loop = action != "move"
         if action == "move":
             vx = clamp(args.get("vx", 0), -self._limits[0], self._limits[0])
