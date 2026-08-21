@@ -4,9 +4,10 @@ This card publishes finite-duration TwistStamped commands via a separate
 subprocess running on rmw_fastrtps_cpp (FastDDS) / Domain 211, because the
 vendor Wr1 base controller only accepts messages on that RMW.
 
-The vendor SDK's base-control example publishes directly to this controller.
-It does *not* call /activate_service: that service activates algorithm/MPC
-control for ServoPose, and can take authority away from base velocity control.
+The vendor SDK starts its control sequence by calling /activate_service before
+publishing base velocity.  That service is discovered through CycloneDDS,
+while the controller accepts TwistStamped through FastDDS, so activation and
+velocity publishing intentionally use separate short-lived processes.
 The parent process (main.py, CycloneDDS) stays untouched.
 """
 
@@ -15,6 +16,7 @@ from __future__ import annotations
 import math
 import multiprocessing as mp
 import os
+import subprocess
 import threading
 import time
 
@@ -52,6 +54,36 @@ def _number(value, field: str):
 
 
 # ── Subprocess launcher (FastDDS only — publishes TwistStamped) ──────────────
+
+def _activate_vendor_control() -> dict:
+    """Run the non-motion portion of the vendor SDK startup sequence once.
+
+    Q5's published ``start_sdk`` procedure ends with this service.  Do not
+    invoke dynamic_launch, ready_service, or trajectories here: those actions
+    can reset posture and are not safe as an implicit prerequisite for a
+    finite base velocity request.
+    """
+    env = os.environ.copy()
+    env["ROS_DOMAIN_ID"] = "211"
+    env["RMW_IMPLEMENTATION"] = "rmw_cyclonedds_cpp"
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    try:
+        result = subprocess.run(
+            ["ros2", "service", "call", "/activate_service", "std_srvs/srv/Trigger"],
+            capture_output=True, text=True, timeout=15, env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return _failure("ACTIVATE_SERVICE_TIMEOUT", "Q5 control activation timed out after 15 seconds")
+    except Exception as exc:
+        return _failure("ACTIVATE_SERVICE_ERROR", f"Cannot activate Q5 base control: {exc}")
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "unknown error").strip()
+        return _failure("ACTIVATE_SERVICE_FAILED", f"Q5 control activation failed: {detail}")
+    output = (result.stdout or "").strip()
+    if "success: false" in output.lower():
+        return _failure("ACTIVATE_SERVICE_REJECTED", f"Q5 control activation was rejected: {output}")
+    print("[base_drive] vendor control activated", flush=True)
+    return {"ok": True, "activated": True}
 
 class _SubprocDriver:
     """Spawn a FastDDS subprocess and send it commands via a Queue."""
@@ -231,6 +263,8 @@ class Plugin:
         self._driver = _SubprocDriver(
             self._publish_rate, self._stop_repetitions, enabled=executor is not None,
         )
+        self._activation_lock = threading.Lock()
+        self._activated = False
 
         if min(self._max_linear, self._max_angular, self._max_duration, self._publish_rate) <= 0:
             raise ValueError("base_drive limits and publish_rate_hz must be positive")
@@ -311,6 +345,7 @@ class Plugin:
         return {
             "ros_publisher_available": True,  # via subproc
             "control_mode": "direct_velocity_interface",
+            "vendor_control_activated": self._activated,
             "q5_fsm": q5_active_status(self._client),
             "topic": TOPIC,
             "limits": {
@@ -376,6 +411,15 @@ class Plugin:
     def stop(self):
         self._driver.stop()
 
+    def _ensure_vendor_control(self) -> dict:
+        with self._activation_lock:
+            if self._activated:
+                return {"ok": True, "activated": True}
+            result = _activate_vendor_control()
+            if result.get("ok"):
+                self._activated = True
+            return result
+
     def dispatch(self, action, args):
         if action == "start":
             return self.start()
@@ -398,6 +442,10 @@ class Plugin:
             return command
 
         linear_x, angular_z, duration_s = command
+
+        activated = self._ensure_vendor_control()
+        if not activated.get("ok"):
+            return activated
 
         if not self._driver.move(linear_x, angular_z, duration_s):
             return _failure("ROS_UNAVAILABLE",
