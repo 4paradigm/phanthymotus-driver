@@ -4,11 +4,9 @@ This card publishes finite-duration TwistStamped commands via a separate
 subprocess running on rmw_fastrtps_cpp (FastDDS) / Domain 211, because the
 vendor Wr1 base controller only accepts messages on that RMW.
 
-Activation is handled separately — /activate_service is only discoverable on
-CycloneDDS, but the controller only accepts TwistStamped on FastDDS.  The
-solution: call `ros2 service call /activate_service` from a subprocess with
-CycloneDDS env, then spawn the FastDDS publisher subprocess separately.
-
+The vendor SDK's base-control example publishes directly to this controller.
+It does *not* call /activate_service: that service activates algorithm/MPC
+control for ServoPose, and can take authority away from base velocity control.
 The parent process (main.py, CycloneDDS) stays untouched.
 """
 
@@ -17,11 +15,16 @@ from __future__ import annotations
 import math
 import multiprocessing as mp
 import os
-import subprocess
 import threading
 import time
 
 from control_contract import q5_active_status, q5_is_control_ready
+
+try:
+    import rclpy as _rclpy  # Verify availability before spawning the publisher process.
+    _HAS_RCLPY = True
+except Exception:
+    _HAS_RCLPY = False
 
 CARD = "base_drive"
 TYPE = "actuator"
@@ -48,92 +51,73 @@ def _number(value, field: str):
     return value
 
 
-# ── Activation helper ────────────────────────────────────────────────────────
-
-def _ensure_activated() -> dict:
-    """Activate external control authority via `ros2 service call`.
-
-    /activate_service is only discoverable on CycloneDDS.  The FastDDS
-    subprocess cannot find it, and switching RMW at runtime in the parent
-    process doesn't work because rclpy locks the RMW implementation during
-    init.  We spawn a short-lived subprocess with CycloneDDS env vars to call
-    the ros2 CLI — minimal, isolated, zero impact on the main process.
-    """
-    env = os.environ.copy()
-    env["ROS_DOMAIN_ID"] = "211"
-    env["RMW_IMPLEMENTATION"] = "rmw_cyclonedds_cpp"
-    env.setdefault("PYTHONUNBUFFERED", "1")
-    if "CYCLONEDDS_URI" not in env:
-        env.pop("CYCLONEDDS_URI", None)
-
-    try:
-        result = subprocess.run(
-            ["ros2", "service", "call", "/activate_service", "std_srvs/srv/Trigger"],
-            capture_output=True, text=True, timeout=15, env=env,
-        )
-        if result.returncode != 0:
-            err = (result.stderr or "").strip()
-            return _failure("ACTIVATE_SERVICE_FAILED",
-                            f"ros2 service call failed (rc={result.returncode}): {err or 'unknown error'}")
-        print("[base_drive] /activate_service succeeded", flush=True)
-        return {"ok": True, "activated": True}
-    except subprocess.TimeoutExpired:
-        return _failure("ACTIVATE_SERVICE_TIMEOUT",
-                        "/activate_service did not respond within 15s")
-    except Exception as e:
-        return _failure("ACTIVATE_SERVICE_ERROR", str(e))
-
-
 # ── Subprocess launcher (FastDDS only — publishes TwistStamped) ──────────────
 
 class _SubprocDriver:
     """Spawn a FastDDS subprocess and send it commands via a Queue."""
 
-    def __init__(self, publish_rate: float, stop_repetitions: int):
+    def __init__(self, publish_rate: float, stop_repetitions: int, enabled: bool = True):
         self._ctx = mp.get_context("spawn")
         self._cmd_q = self._ctx.Queue()
+        self._ready = self._ctx.Event()
         self._publish_rate = publish_rate
         self._stop_repetitions = stop_repetitions
+        self._enabled = enabled
         self._proc = None
         self._lock = threading.Lock()
 
     def start(self):
-        """Spawn the subprocess (lazy — only once first needed)."""
+        """Spawn the publisher and wait until its ROS endpoint exists."""
+        if not self._enabled or not _HAS_RCLPY:
+            return False
         with self._lock:
             if self._proc is not None and self._proc.is_alive():
-                return
+                return self._ready.is_set()
+            self._ready.clear()
             self._proc = self._ctx.Process(
                 target=_subproc_main,
-                args=(self._cmd_q, self._publish_rate, self._stop_repetitions),
+                args=(self._cmd_q, self._ready, self._publish_rate, self._stop_repetitions),
                 name="q5_base_drive_subproc", daemon=True,
             )
             self._proc.start()
             print(f"[base_drive] subproc started → pid={self._proc.pid}", flush=True)
+        if self._ready.wait(timeout=5.0):
+            return True
+        with self._lock:
+            if self._proc is not None and self._proc.is_alive():
+                self._proc.terminate()
+                self._proc.join(timeout=1.0)
+        return False
 
     def move(self, linear_x: float, angular_z: float, duration_s: float):
-        self.start()
+        if not self.start():
+            return False
         self._cmd_q.put_nowait({
             "kind": "move",
             "linear_x": linear_x,
             "angular_z": angular_z,
             "duration_s": duration_s,
         })
+        return True
 
     def stop(self):
-        self.start()
+        if not self.start():
+            return False
         try:
             self._cmd_q.put_nowait({"kind": "stop"})
         except Exception:
-            pass
+            return False
+        return True
 
     def get_status(self) -> dict:
         return {
             "subproc_alive": self._proc.is_alive() if self._proc else False,
             "subproc_pid": self._proc.pid if self._proc else None,
+            "publisher_ready": self._ready.is_set(),
         }
 
 
-def _subproc_main(cmd_q: mp.Queue, publish_rate: float, stop_repetitions: int):
+def _subproc_main(cmd_q: mp.Queue, ready: mp.Event, publish_rate: float, stop_repetitions: int):
     """Subprocess entry — FastDDS + Domain 211, publishes TwistStamped."""
     os.environ["ROS_DOMAIN_ID"] = "211"
     os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
@@ -158,6 +142,7 @@ def _subproc_main(cmd_q: mp.Queue, publish_rate: float, stop_repetitions: int):
             depth=10,
         ),
     )
+    ready.set()
 
     executor = rclpy.executors.SingleThreadedExecutor()
     executor.add_node(node)
@@ -244,7 +229,7 @@ class Plugin:
         self._publish_rate = float(plugin_config.get("publish_rate_hz", 10.0))
         self._stop_repetitions = int(plugin_config.get("stop_repetitions", 3))
         self._driver = _SubprocDriver(
-            self._publish_rate, self._stop_repetitions,
+            self._publish_rate, self._stop_repetitions, enabled=executor is not None,
         )
 
         if min(self._max_linear, self._max_angular, self._max_duration, self._publish_rate) <= 0:
@@ -382,14 +367,18 @@ class Plugin:
             return _failure("INVALID_ARGUMENT", str(e))
 
     def start(self):
-        pass
+        if not self._driver.start():
+            return _failure("ROS_UNAVAILABLE",
+                            "Q5 base-drive Fast DDS publisher did not become ready within 5 seconds",
+                            status=self._control_status())
+        return {"state": "ready", "safety": self._control_status()}
 
     def stop(self):
         self._driver.stop()
 
     def dispatch(self, action, args):
         if action == "start":
-            return {"state": "ready", "safety": self._control_status()}
+            return self.start()
         if action == "info":
             return {"ok": True, "state": "moving" if self._driver.get_status()["subproc_alive"] else "idle",
                     "active_command": None,
@@ -401,11 +390,6 @@ class Plugin:
         if action not in ("forward", "backward", "turn_left", "turn_right", "move"):
             return None
 
-        # Activate external control authority before any movement
-        activation_result = _ensure_activated()
-        if activation_result.get("ok") is False:
-            return activation_result
-
         move_args = self._directional_args(action, args) if action != "move" else args
         if isinstance(move_args, dict) and move_args.get("ok") is False:
             return move_args
@@ -415,7 +399,10 @@ class Plugin:
 
         linear_x, angular_z, duration_s = command
 
-        self._driver.move(linear_x, angular_z, duration_s)
+        if not self._driver.move(linear_x, angular_z, duration_s):
+            return _failure("ROS_UNAVAILABLE",
+                            "Q5 base-drive Fast DDS publisher is unavailable; no velocity command was sent",
+                            status=self._control_status())
         return {
             "ok": True, "state": "moving",
             "command": {

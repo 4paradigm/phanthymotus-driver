@@ -206,7 +206,7 @@ class Q5BasicSensorTests(unittest.TestCase):
         plugin = base_drive.Plugin({}, "test", None, _Client())
         start = plugin.dispatch("start", {})
         move = plugin.dispatch("move", {"linear_x": 0.1, "angular_z": 0.0, "duration_s": 1.0})
-        self.assertEqual(start["state"], "ready")
+        self.assertFalse(start["ok"])
         self.assertEqual(move["code"], "ROS_UNAVAILABLE")
 
     def test_base_drive_declares_reliable_qos_for_the_verified_q5_controller(self):
