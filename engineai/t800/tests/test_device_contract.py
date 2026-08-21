@@ -4,6 +4,7 @@ import os
 import ssl
 import struct
 import sys
+import tempfile
 import threading
 import time
 import types
@@ -345,6 +346,28 @@ class DevicePluginContractTests(unittest.TestCase):
                 for parameter in detail.get("params", []):
                     self.assertIn(parameter, properties, f"{tool['name']}.{action_name}")
 
+    def test_speaker_loco_gait_and_recorder_are_available_together(self):
+        self.assertTrue(hasattr(self.device, "GaitPlugin"))
+        self.assertTrue(hasattr(self.device, "MotionRecorderPlugin"))
+        motion_mode = self.device.MotionModePlugin(CONFIG, "robot", self.ros, self.state)
+        gait = self.device.GaitPlugin(CONFIG, motion_mode, self.state)
+        with tempfile.TemporaryDirectory() as recordings_dir:
+            config = {
+                **CONFIG,
+                "plugins": {
+                    **CONFIG.get("plugins", {}),
+                    "motion_recorder": {"recordings_dir": recordings_dir},
+                },
+            }
+            recorder = self.device.MotionRecorderPlugin(config, "robot", self.ros)
+            names = {
+                self.device.SpeakerPlugin(CONFIG, "robot", self.ros).get_tool()["name"],
+                self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state).get_tool()["name"],
+                gait.get_tool()["name"],
+                recorder.get_tool()["name"],
+            }
+        self.assertEqual({"speaker", "loco", "gait", "motion_recorder"}, names)
+
     def test_sensor_lifecycle_schemas_and_info_topics_match_agent_core(self):
         plugins = [
             self.state,
@@ -565,6 +588,30 @@ class DevicePluginContractTests(unittest.TestCase):
         time.sleep(0.08)
         self.assertGreaterEqual(len(plugin._publisher.messages), 2)
         self.assertEqual(0.0, plugin._publisher.messages[-1].yaw_velocity)
+
+    def test_locomotion_accepts_official_walk_states_without_force(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        for motion in ("rl_basic", "lower_body_balance"):
+            with self.subTest(motion=motion):
+                self.state._on_motion(types.SimpleNamespace(
+                    current_motion_task=motion,
+                    available_transition_motions=["passive"],
+                ))
+                result = plugin.dispatch("move", {
+                    "vx": 2.0,
+                    "duration": 0.01,
+                })
+                self.assertEqual("running", result["state"])
+                self.assertEqual(1.0, result["vx"])
+                plugin.dispatch("stop_move", {})
+
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="idle",
+            available_transition_motions=["passive"],
+        ))
+        rejected = plugin.dispatch("move", {"vx": 0.1, "duration": 0.01})
+        self.assertIn("rl_basic", rejected["error"])
 
     def test_locomotion_open_loop_composites(self):
         plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
