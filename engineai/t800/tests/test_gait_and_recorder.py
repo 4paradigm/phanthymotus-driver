@@ -254,7 +254,7 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
         self.assertEqual("motion_recorder", tool["name"])
         actions = tool["inputSchema"]["properties"]["action"]["enum"]
         expected = {"record_start", "record_stop", "play", "stop_playback",
-                    "save", "load", "list", "delete", "status", "info"}
+                    "reset", "save", "load", "list", "delete", "status", "info"}
         for action in expected:
             self.assertIn(action, actions)
 
@@ -296,6 +296,99 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
         result = self.plugin.dispatch("record_stop", {})
         self.assertEqual("idle", result["state"])
         self.assertFalse(result["recording"])
+
+    def test_next_recording_waits_for_default_pose_reset_to_finish(self):
+        class ResetJointPlan:
+            def __init__(self):
+                self.calls = []
+                self.status = {"request_id": 7, "status": 2, "progress": 0.2}
+
+            def dispatch(self, action, args):
+                self.calls.append((action, dict(args)))
+                if action == "reset":
+                    return {"state": "requested", "request_id": 7, "request_type": 2}
+                if action == "status":
+                    return dict(self.status)
+                return {"error": f"unexpected action: {action}"}
+
+        state = FakeMotionState(
+            current="lower_body_balance",
+            available=["pd_stand"],
+        )
+        motion_mode = FakeMotionMode(state)
+        joint_plan = ResetJointPlan()
+        self.plugin.set_joint_plan(joint_plan)
+        self.plugin.set_reset_controls(state, motion_mode)
+
+        self.plugin.dispatch("record_start", {"label": "first_action"})
+        self.plugin._on_joint_state(self._make_joint_state())
+        stopped = self.plugin.dispatch("record_stop", {})
+        self.assertEqual("saved", stopped["state"])
+
+        blocked = self.plugin.dispatch("record_start", {"label": "too_early"})
+        self.assertIn("reset required", blocked["error"])
+
+        resetting = self.plugin.dispatch("reset", {})
+        self.assertEqual("resetting", resetting["state"])
+        self.assertEqual(("reset", {}), joint_plan.calls[-1])
+        pending = self.plugin.dispatch("status", {})
+        self.assertTrue(pending["needs_reset"])
+        self.assertTrue(pending["reset_pending"])
+
+        joint_plan.status = {"request_id": 7, "status": 1, "progress": 1.0}
+        ready = self.plugin.dispatch("status", {})
+        self.assertFalse(ready["needs_reset"])
+        self.assertFalse(ready["reset_pending"])
+        started = self.plugin.dispatch("record_start", {"label": "second_action"})
+        self.assertEqual("recording", started["state"])
+
+    def test_reset_safely_enters_lower_body_balance_before_default_pose(self):
+        class ResetJointPlan:
+            def __init__(self):
+                self.calls = []
+
+            def dispatch(self, action, args):
+                self.calls.append((action, dict(args)))
+                if action == "reset":
+                    return {"state": "requested", "request_id": 9, "request_type": 2}
+                if action == "status":
+                    return {"request_id": 9, "status": 2, "progress": 0.1}
+                return {"error": f"unexpected action: {action}"}
+
+        state = FakeMotionState(
+            current="pd_stand",
+            available=["lower_body_balance"],
+        )
+        motion_mode = FakeMotionMode(state)
+        joint_plan = ResetJointPlan()
+        self.plugin.set_joint_plan(joint_plan)
+        self.plugin.set_reset_controls(state, motion_mode)
+
+        blocked = self.plugin.dispatch("record_start", {"label": "unsafe_mode"})
+        self.assertIn("lower_body_balance", blocked["error"])
+        current = self._make_joint_state()
+        current.position = [0.0] * 25
+        current.velocity = [0.0] * 25
+        self.plugin._on_joint_state(current)
+        self.plugin._frames = [
+            {"timestamp": 0, "positions": [0.0] * 25, "velocities": [0.0] * 25},
+            {"timestamp": 50, "positions": [0.1] * 25, "velocities": [0.0] * 25},
+        ]
+        blocked_play = self.plugin.dispatch("play", {})
+        self.assertIn("lower_body_balance", blocked_play["error"])
+
+        result = self.plugin.dispatch("reset", {})
+        self.assertEqual("resetting", result["state"])
+        self.assertEqual(
+            ("switch", {
+                "target": "lower_body_balance",
+                "force": False,
+                "wait": True,
+            }),
+            motion_mode.calls[-1],
+        )
+        self.assertEqual("lower_body_balance", state.current)
+        self.assertEqual(("reset", {}), joint_plan.calls[-1])
 
     def test_record_start_is_idempotent_instead_of_toggling_off(self):
         first = self.plugin.dispatch("record_start", {"label": "first"})
@@ -401,21 +494,118 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
 
     def test_playback_state_after_play_with_joint_plan(self):
         class FakeJointPlan:
+            def __init__(self):
+                self.calls = []
+
             def dispatch(self, action, args):
+                self.calls.append((action, dict(args)))
                 return {"state": "requested", "request_id": 1}
 
-        self.plugin.set_joint_plan(FakeJointPlan())
-        self.plugin.dispatch("record_start", {"label": "play_test2"})
-        for _ in range(3):
-            self.plugin._on_joint_state(self._make_joint_state())
-            time.sleep(0.06)
-        self.plugin.dispatch("record_stop", {})
-        self.plugin.dispatch("save", {"name": "play_test_rec2"})
-        result = self.plugin.dispatch("play", {"name": "play_test_rec2", "speed_scale": 2.0})
+        joint_plan = FakeJointPlan()
+        self.plugin.set_joint_plan(joint_plan)
+        current = self._make_joint_state()
+        current.position = [0.0] * 25
+        current.velocity = [0.0] * 25
+        self.plugin._on_joint_state(current)
+        self.plugin._frames = [
+            {
+                "timestamp": index * 50,
+                "positions": [0.0] * 12 + [0.12 * index] * 13,
+                "velocities": [0.0] * 25,
+            }
+            for index in range(5)
+        ]
+
+        result = self.plugin.dispatch("play", {"speed_scale": 1.0})
         self.assertEqual("playing", result["state"])
-        self.assertGreater(result["frames"], 0)
-        result = self.plugin.dispatch("stop_playback", {})
-        self.assertEqual("stopped", result["state"])
+        deadline = time.monotonic() + 2.0
+        while self.plugin.dispatch("status", {})["playing"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        self.assertEqual([], joint_plan.calls, "playback must not restart joint_plan for every frame")
+        override_publishers = [
+            publisher
+            for publisher in self.plugin._node.publishers
+            if publisher.topic == "/motion/joint_override_command"
+        ]
+        self.assertEqual(1, len(override_publishers))
+        messages = override_publishers[0].messages
+        self.assertGreater(len(messages), len(self.plugin._frames))
+        self.assertEqual(0.0, messages[-1].weight)
+        self.assertTrue(any(message.weight == 1.0 for message in messages[:-1]))
+        self.assertTrue(self.plugin.dispatch("status", {})["needs_reset"])
+
+    def test_playback_blends_from_current_pose_before_recorded_trajectory(self):
+        current = self._make_joint_state()
+        current.position = [0.0] * 12 + [-0.5] * 13
+        current.velocity = [0.0] * 25
+        self.plugin._on_joint_state(current)
+        self.plugin._frames = [
+            {
+                "timestamp": index * 50,
+                "positions": [0.0] * 12 + [0.5 + 0.05 * index] * 13,
+                "velocities": [0.0] * 25,
+            }
+            for index in range(3)
+        ]
+
+        result = self.plugin.dispatch("play", {"speed_scale": 1.0})
+        deadline = time.monotonic() + 2.0
+        while self.plugin.dispatch("status", {})["playing"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        publisher = next(
+            publisher
+            for publisher in self.plugin._node.publishers
+            if publisher.topic == "/motion/joint_override_command"
+        )
+        controlled = [message for message in publisher.messages if message.weight == 1.0]
+        self.assertEqual(0.5, result["entry_blend_sec"])
+        self.assertAlmostEqual(-0.5, controlled[0].position[0], places=3)
+        max_step = max(
+            abs(right.position[0] - left.position[0])
+            for left, right in zip(controlled, controlled[1:])
+        )
+        self.assertLess(max_step, 0.05)
+        blend_end = int(result["entry_blend_sec"] * result["playback_rate_hz"])
+        velocity_join = abs(
+            controlled[blend_end].velocity[0]
+            - controlled[blend_end + 1].velocity[0]
+        )
+        self.assertLess(velocity_join, 0.25)
+
+    def test_playback_smooths_velocity_across_recorded_frame_boundaries(self):
+        current = self._make_joint_state()
+        current.position = [0.0] * 25
+        current.velocity = [0.0] * 25
+        self.plugin._on_joint_state(current)
+        self.plugin._frames = [
+            {
+                "timestamp": index * 100,
+                "positions": [0.0] * 12 + [position] * 13,
+                "velocities": [0.0] * 25,
+            }
+            for index, position in enumerate((0.0, 1.0, 0.0))
+        ]
+
+        self.plugin.dispatch("play", {"speed_scale": 1.0})
+        deadline = time.monotonic() + 2.0
+        while self.plugin.dispatch("status", {})["playing"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        publisher = next(
+            publisher
+            for publisher in self.plugin._node.publishers
+            if publisher.topic == "/motion/joint_override_command"
+        )
+        controlled = [message for message in publisher.messages if message.weight == 1.0]
+        trajectory = controlled[int(0.5 * 100.0) + 1:]
+        max_velocity_step = max(
+            abs(right.velocity[0] - left.velocity[0])
+            for left, right in zip(trajectory, trajectory[1:])
+        )
+        self.assertLess(max_velocity_step, 5.0)
+        self.assertTrue(all(0.0 <= message.position[0] <= 1.0 for message in trajectory))
 
     def test_unknown_action_returns_error(self):
         result = self.plugin.dispatch("foobar", {})

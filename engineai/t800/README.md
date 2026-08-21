@@ -86,6 +86,13 @@ lie_down 组合键。LCM 输入会覆盖实体手柄输入，发送完成后 Dri
 时超时会走与手动停止相同的落盘路径。状态中的 `last_recording`
 可用于确认最近一次保存文件、停止原因和帧数。
 
+录制与回放仅在 `lower_body_balance` 状态开放。回放不再把每个 20Hz 录制帧
+提交为独立 joint plan，而是先用 0.5 秒五次曲线从当前位置平滑接入，再以
+三次 Hermite 插值重采样为 100Hz `JointOverrideCommand` 连续轨迹；停止、
+异常和完成路径都会发布 `weight=0` 释放覆盖。录制或回放完成后，状态返回
+`needs_reset=true`，必须执行 `reset`：安全进入 `lower_body_balance` 并发送
+官方 `REQUEST_RESET` 默认姿态请求。规划器确认回到 `IDLE` 后才允许下一次录制。
+
 `pointcloud`、`camera`、`depth` 桥接 T800-Odin2 激光雷达相机（飞书文档
 7.2 节）在 Orin 主板上发布的 `odin_ros_driver` topic。点云按
 `[uint32 point_step][uint32 total_points][PointCloud2 bytes]` 二进制格式
