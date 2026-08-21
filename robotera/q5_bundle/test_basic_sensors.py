@@ -302,8 +302,17 @@ class Q5BasicSensorTests(unittest.TestCase):
             stopped = plugin.dispatch("cancel", {})
         finally:
             base_drive._acp_notify = original_notify
-        self.assertEqual(stopped["state"], "stopped")
+        self.assertEqual(stopped["state"], "idle")
         self.assertEqual(notifications[-1][1], "cancelled")
+
+    def test_base_drive_stop_behind_continuous_move_publishes_zero(self):
+        scheduler = base_drive._CommandScheduler(publish_rate=10.0, stop_repetitions=3)
+        scheduler.accept({"kind": "move", "linear_x": 0.2, "angular_z": 0.0, "duration_s": -1}, 0.0)
+        scheduler.accept({"kind": "stop"}, 0.0)
+        self.assertEqual(scheduler.next_output(0.0), (0.0, 0.0))
+        self.assertEqual(scheduler.next_output(0.1), (0.0, 0.0))
+        self.assertEqual(scheduler.next_output(0.2), (0.0, 0.0))
+        self.assertIsNone(scheduler.next_output(0.3))
 
     def test_lifecycle_poll_reads_active_without_side_effects(self):
         client = q5_sdk_client.Q5SdkClient()
