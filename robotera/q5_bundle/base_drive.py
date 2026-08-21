@@ -19,6 +19,7 @@ import threading
 import time
 
 from control_contract import q5_active_status, q5_is_control_ready
+from q5_acp import notify as _acp_notify
 
 try:
     import rclpy as _rclpy  # Verify availability before spawning the publisher process.
@@ -238,6 +239,8 @@ class Plugin:
         self._driver = _SubprocDriver(
             self._publish_rate, self._stop_repetitions, self._frame_id, enabled=executor is not None,
         )
+        self._action_lock = threading.Lock()
+        self._active_action = None
 
         if min(self._max_linear, self._max_angular, self._max_duration, self._publish_rate) <= 0:
             raise ValueError("base_drive limits and publish_rate_hz must be positive")
@@ -386,6 +389,61 @@ class Plugin:
 
     def stop(self):
         self._driver.stop()
+        self._finish_active("cancelled", {"reason": "plugin_stopped"})
+
+    def _finish_active(self, status: str, result: dict, action_id: str | None = None):
+        with self._action_lock:
+            active = self._active_action
+            if active is None or (action_id is not None and active["action_id"] != action_id):
+                return None
+            self._active_action = None
+            active["stop_event"].set()
+        _acp_notify(active["action_id"], status, {**active["command"], **result}, CARD)
+        return active
+
+    def _complete_after_duration(self, action_id: str, duration_s: float):
+        with self._action_lock:
+            active = self._active_action
+            if active is None or active["action_id"] != action_id:
+                return
+            stop_event = active["stop_event"]
+        stop_settle_s = self._stop_repetitions / self._publish_rate
+        if stop_event.wait(duration_s + stop_settle_s):
+            return
+        self._finish_active("completed", {"duration_s": duration_s, "stopped_automatically": True}, action_id)
+
+    def _cancel_for_replacement(self):
+        active = self._finish_active("cancelled", {"reason": "replaced_by_new_command"})
+        if active is not None:
+            self._driver.stop()
+
+    def _start_async_action(self, action: str, linear_x: float, angular_z: float,
+                            angular_z_degps: float, duration_s: float, supplied_action_id=None):
+        self._cancel_for_replacement()
+        if not self._driver.move(linear_x, angular_z, duration_s):
+            return _failure("ROS_UNAVAILABLE",
+            "Q5 base-drive CycloneDDS publisher is unavailable; no velocity command was sent",
+                            status=self._control_status())
+
+        action_id = str(supplied_action_id or f"base_drive_{action}_{int(time.time() * 1000)}")
+        command = {
+            "action": action,
+            "linear_x": linear_x,
+            "angular_z_degps": angular_z_degps,
+            "angular_z_radps": angular_z,
+            "duration_s": duration_s,
+        }
+        active = {"action_id": action_id, "command": command, "stop_event": threading.Event()}
+        with self._action_lock:
+            self._active_action = active
+        if duration_s != -1.0:
+            threading.Thread(target=self._complete_after_duration, args=(action_id, duration_s),
+                             daemon=True, name="q5_base_drive_completion").start()
+        return {
+            "ok": True, "state": "queued", "action_id": action_id, "command": command,
+            "stops_automatically": duration_s != -1.0,
+            "cancel_action": "cancel" if duration_s == -1.0 else None,
+        }
 
     def dispatch(self, action, args):
         if action == "start":
@@ -396,7 +454,9 @@ class Plugin:
                     "safety": self._control_status()}
         if action in ("cancel", "stop"):
             self._driver.stop()
-            return {"ok": True, "state": "stopped", "reason": "command"}
+            active = self._finish_active("cancelled", {"reason": "cancelled_by_request"})
+            return {"ok": True, "state": "stopped", "reason": "command",
+                    "action_id": active["action_id"] if active else None}
 
         if action not in ("forward", "backward", "turn_left", "turn_right", "move"):
             return None
@@ -410,22 +470,8 @@ class Plugin:
 
         linear_x, angular_z, angular_z_degps, duration_s = command
 
-        if not self._driver.move(linear_x, angular_z, duration_s):
-            return _failure("ROS_UNAVAILABLE",
-                            "Q5 base-drive Fast DDS publisher is unavailable; no velocity command was sent",
-                            status=self._control_status())
-        return {
-            "ok": True, "state": "moving",
-            "command": {
-                "action": action,
-                "linear_x": linear_x,
-                "angular_z_degps": angular_z_degps,
-                "angular_z_radps": angular_z,
-                "duration_s": duration_s,
-                "started_at_ms": int(time.time() * 1000),
-            },
-            "stops_automatically": duration_s != -1.0,
-        }
+        return self._start_async_action(action, linear_x, angular_z, angular_z_degps, duration_s,
+                                        args.get("action_id"))
 
 
 def make_plugin(plugin_config, namespace, executor, client):
