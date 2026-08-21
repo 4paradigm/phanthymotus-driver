@@ -276,6 +276,15 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
         self.assertEqual("idle", result["activity_state"])
         self.assertFalse(result["recording"])
 
+    def test_halt_releases_activity_without_destroying_recorder(self):
+        node = self.plugin._node
+
+        self.plugin.halt()
+
+        self.assertIs(node, self.plugin._node)
+        started = self.plugin.dispatch("record_start", {"label": "after_safety"})
+        self.assertEqual("recording", started["state"])
+
     def test_invalid_record_hz_is_rejected_at_startup(self):
         with self.assertRaises(ValueError):
             self.dev.MotionRecorderPlugin(

@@ -350,6 +350,7 @@ class StreamSnapshot:
     deadline: float | None
     last_publish_at: float | None
     publish_count: int
+    error: str | None
 
 
 class RepeatingCommand:
@@ -375,10 +376,11 @@ class RepeatingCommand:
         self._deadline: float | None = None
         self._last_publish_at: float | None = None
         self._publish_count = 0
+        self._last_error: str | None = None
 
     def start(self, command: dict, duration: float) -> StreamSnapshot:
         duration = float(duration)
-        if not math.isfinite(duration) or duration < -1:
+        if not math.isfinite(duration) or (duration < 0 and duration != -1):
             raise ValueError("duration must be -1 or a non-negative finite number")
         self.stop()
         if duration == 0:
@@ -393,16 +395,18 @@ class RepeatingCommand:
             self._deadline = deadline
             self._last_publish_at = started_at
             self._publish_count = 1
+            self._last_error = None
         try:
             # Publish once before handing off to the worker. This guarantees a
             # short command is not lost if the scheduler starts the thread late.
             self._publisher(command)
-        except Exception:
+        except Exception as exc:
             with self._lock:
                 if self._stop_event is stop_event:
                     self._stop_event = None
                     self._publish_count = 0
                     self._last_publish_at = None
+                    self._last_error = str(exc)
             raise
 
         def run() -> None:
@@ -416,6 +420,10 @@ class RepeatingCommand:
                         self._last_publish_at = now
                         self._publish_count += 1
                     stop_event.wait(self._period)
+            except Exception as exc:
+                with self._lock:
+                    if self._stop_event is stop_event:
+                        self._last_error = str(exc)
             finally:
                 with self._lock:
                     owns_stream = self._stop_event is stop_event
@@ -424,7 +432,12 @@ class RepeatingCommand:
                 # A replaced stream was already stopped before its replacement
                 # started.  It must not inject a late zero into the new stream.
                 if owns_stream:
-                    self._stop_publisher()
+                    try:
+                        self._stop_publisher()
+                    except Exception as exc:
+                        with self._lock:
+                            if self._last_error is None:
+                                self._last_error = f"stop publish failed: {exc}"
 
         threading.Thread(target=run, daemon=True, name="t800-command-stream").start()
         return self.snapshot()
@@ -447,6 +460,7 @@ class RepeatingCommand:
                 deadline=self._deadline,
                 last_publish_at=self._last_publish_at,
                 publish_count=self._publish_count,
+                error=self._last_error,
             )
 
 

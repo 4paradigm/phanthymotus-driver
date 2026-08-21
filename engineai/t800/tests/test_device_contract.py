@@ -580,10 +580,14 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual([23, 24], [item["index"] for item in
                                    self.state.dispatch("joint_groups", {})["groups"]["head"]])
 
-    def test_locomotion_force_path_publishes_and_stops(self):
+    def test_locomotion_allowed_state_publishes_and_stops(self):
         plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
         plugin.start()
-        result = plugin.dispatch("move", {"vx": 9, "vy": -9, "vyaw": 9, "duration": 0.03, "force": True})
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
+        result = plugin.dispatch("move", {"vx": 9, "vy": -9, "vyaw": 9, "duration": 0.03})
         self.assertEqual(1.0, result["vx"])
         self.assertEqual(-1.0, result["vy"])
         time.sleep(0.08)
@@ -593,6 +597,9 @@ class DevicePluginContractTests(unittest.TestCase):
     def test_locomotion_accepts_official_walk_states_without_force(self):
         plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
         plugin.start()
+        schema = plugin.get_tool()["inputSchema"]
+        self.assertNotIn("x-completion", schema)
+        self.assertNotIn("force", schema["properties"])
         for motion in ("rl_basic", "lower_body_balance"):
             with self.subTest(motion=motion):
                 self.state._on_motion(types.SimpleNamespace(
@@ -614,23 +621,170 @@ class DevicePluginContractTests(unittest.TestCase):
         rejected = plugin.dispatch("move", {"vx": 0.1, "duration": 0.01})
         self.assertIn("rl_basic", rejected["error"])
 
+    def test_locomotion_continuous_move_does_not_block_manual_stop(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
+
+        result = plugin.dispatch("move", {"vx": 0.1, "duration": -1})
+
+        self.assertNotIn("action_id", result)
+        self.assertEqual("stopped", plugin.dispatch("stop_move", {})["state"])
+
+    def test_locomotion_timed_move_stops_and_zeroes_velocity(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
+
+        result = plugin.dispatch("move", {"vx": 0.1, "duration": 0.03})
+
+        self.assertNotIn("action_id", result)
+        time.sleep(0.08)
+        self.assertEqual(0.0, plugin._publisher.messages[-1].yaw_velocity)
+
+    def test_locomotion_manual_stop_zeroes_active_timed_action(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
+        plugin.dispatch("move", {"vx": 0.1, "duration": 0.5})
+
+        stopped = plugin.dispatch("stop_move", {})
+
+        self.assertEqual("stopped", stopped["state"])
+        self.assertEqual(0.0, plugin._publisher.messages[-1].yaw_velocity)
+
+    def test_locomotion_watchdog_zeroes_velocity(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
+        plugin.dispatch("move", {"vx": 0.1, "duration": 0.5})
+        plugin._stream._last_publish_at = time.monotonic() - 2.0
+
+        plugin._stream_health_check()
+
+        self.assertEqual(0.0, plugin._publisher.messages[-1].yaw_velocity)
+
+    def test_locomotion_background_publish_failure_is_visible_and_zeroes(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
+        real_publish = plugin._stream._publisher
+        publish_count = 0
+
+        def fail_after_first(payload):
+            nonlocal publish_count
+            publish_count += 1
+            if publish_count > 1:
+                raise RuntimeError("velocity publisher failed")
+            real_publish(payload)
+
+        plugin._stream._publisher = fail_after_first
+        plugin.dispatch("move", {"vx": 0.1, "duration": 0.5})
+
+        deadline = time.monotonic() + 0.5
+        while plugin._stream.snapshot().active and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual("velocity publisher failed", plugin._stream.snapshot().error)
+        self.assertEqual(0.0, plugin._publisher.messages[-1].yaw_velocity)
+
+    def test_locomotion_rejected_command_stops_existing_stream(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
+        plugin.dispatch("move", {"vx": 0.1, "duration": -1})
+
+        rejected = plugin.dispatch("move_displacement", {"x_m": 0, "y_m": 0})
+
+        self.assertIn("non-zero", rejected["error"])
+        self.assertFalse(plugin._stream.snapshot().active)
+        self.assertEqual(0.0, plugin._publisher.messages[-1].yaw_velocity)
+
+    def test_locomotion_motion_state_transition_stops_active_stream(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
+        plugin.dispatch("move", {"vx": 0.1, "duration": -1})
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="passive",
+            available_transition_motions=["pd_stand"],
+        ))
+
+        plugin._stream_health_check()
+
+        self.assertFalse(plugin._stream.snapshot().active)
+        self.assertEqual(0.0, plugin._publisher.messages[-1].yaw_velocity)
+
+    def test_locomotion_force_cannot_bypass_motion_state_gate(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="passive",
+            available_transition_motions=["pd_stand"],
+        ))
+
+        rejected = plugin.dispatch("move", {
+            "vx": 0.1, "duration": 0.1, "force": True,
+        })
+
+        self.assertIn("rl_basic", rejected["error"])
+        self.assertFalse(plugin._stream.snapshot().active)
+        self.assertEqual(0.0, plugin._publisher.messages[-1].yaw_velocity)
+
+    def test_locomotion_rejects_timed_commands_beyond_safety_limit(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
+        with self.assertRaisesRegex(ValueError, "3s safety limit"):
+            plugin.dispatch("move", {
+                "vx": 0.1,
+                "duration": plugin._MAX_TIMED_DURATION_SEC + 0.1,
+            })
+
     def test_locomotion_open_loop_composites(self):
         plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
         plugin.start()
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
         move = plugin.dispatch("move_displacement", {
-            "x_m": 1.0, "y_m": 0.0, "speed_m_s": 0.5, "force": True,
+            "x_m": 1.0, "y_m": 0.0, "speed_m_s": 0.5,
         })
         self.assertTrue(move["open_loop"])
         self.assertAlmostEqual(0.5, move["vx"])
         self.assertAlmostEqual(2.0, move["duration"])
         plugin.dispatch("stop_move", {})
         turn = plugin.dispatch("turn_angle", {
-            "angle_rad": -1.0, "angular_speed_rad_s": 0.5, "force": True,
+            "angle_rad": -1.0, "angular_speed_rad_s": 0.5,
         })
         self.assertAlmostEqual(-0.5, turn["vyaw"])
         plugin.dispatch("stop_move", {})
         arc = plugin.dispatch("arc", {
-            "radius_m": 1.0, "angle_rad": 1.0, "linear_speed_m_s": 0.5, "force": True,
+            "radius_m": 1.0, "angle_rad": 1.0, "linear_speed_m_s": 0.5,
         })
         self.assertAlmostEqual(arc["vx"], arc["vyaw"])
         plugin.dispatch("stop_move", {})
@@ -1677,6 +1831,28 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual(0.0, safety._override_pub.messages[-1].weight)
         self.assertEqual([1.0] * 25, safety._joint_pub.messages[-1].damping)
         self.assertTrue(all(control.stopped for control in active_controls))
+
+    def test_safety_prefers_non_destructive_halt_over_lifecycle_stop(self):
+        class ActiveControl:
+            def __init__(self):
+                self.halted = False
+                self.stopped = False
+
+            def halt(self):
+                self.halted = True
+
+            def stop(self):
+                self.stopped = True
+
+        control = ActiveControl()
+        safety = self.device.SafetyControlPlugin(CONFIG, "robot", self.ros, self.state)
+        safety.set_controls([control])
+        safety.start()
+
+        safety.dispatch("emergency_passive", {})
+
+        self.assertTrue(control.halted)
+        self.assertFalse(control.stopped)
 
     def test_vision_pointcloud_passthrough_binary_header(self):
         import struct

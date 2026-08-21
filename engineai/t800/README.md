@@ -55,14 +55,16 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 | `safety` | actuator | 零速度、覆盖释放、关节阻尼及 passive/idle/stand 组合动作 |
 | `native_sdk` | actuator | Native SDK status/start/stop/restart |
 
-所有动作差异通过 `x-action-params` 声明。`force=true` 可绕过 locomotion、
-joint override 和 joint bridge 的 motion-state 门禁；完整高风险能力没有从
-MCP schema 中隐藏。
+所有动作差异通过 `x-action-params` 声明。`loco` 始终要求机器人处于
+`rl_basic` 或 `lower_body_balance`，运行中一旦离开这两个状态会立即归零停流。
+`force=true` 仅保留给 joint override 和 joint bridge 的专家级接口。
 
 `loco.move_displacement`、`turn_angle` 和 `arc` 由速度乘时间换算。T800
 基础运动协议没有供控制闭环使用的定位反馈，因此它们仍是开环动作并返回
 `open_loop: true`。若 Odin2 固件提供配置中的 odometry topic，
 `motion_command_trace` 会把它用于状态显示，但不会据此闭环控制动作。
+有限时长动作最多运行 3 秒且不建立 ACP 屏障；更长运动请拆分命令，或使用
+`duration=-1` 持续发送并通过 `stop_move` 手动停止。这样停止动作不会被屏障拦截。
 
 `gesture.play` 与旧的 `joint_plan.preset` 不同：前者执行官方示例里的完整多步
 动作（挥手包含准备、举手、5 次摆动和复位；握手包含伸手、收手和复位），

@@ -89,10 +89,11 @@ _AUDIO_QOS = QoSProfile(
 
 def _t800_acp_notify(action_id: str, status: str, result: dict, tool: str) -> None:
     """Post asynchronous actuator completion to Agent Core."""
+    import os as _os
     import ssl
     import urllib.request
 
-    agent_core_url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+    agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
     context = ssl.create_default_context()
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
@@ -112,7 +113,7 @@ def _t800_acp_notify(action_id: str, status: str, result: dict, tool: str) -> No
         )
         urllib.request.urlopen(request, timeout=5, context=context)
     except Exception as exc:
-        print(f"[motion_recorder] ACP notify failed for {action_id}: {exc}", flush=True)
+        print(f"[{tool}] ACP notify failed for {action_id}: {exc}", flush=True)
 
 _LIFECYCLE_ACTIONS = {
     "start": ([], "启动卡片数据流"),
@@ -1843,7 +1844,7 @@ class NativeInterfaceProbePlugin:
         return "low"
 
 class LocomotionPlugin:
-    STOP_PRIORITY = 0
+    _MAX_TIMED_DURATION_SEC = 3.0
 
     def __init__(self, config: dict, namespace: str, ros2, state: StatePlugin):
         self._config = config
@@ -1876,10 +1877,10 @@ class LocomotionPlugin:
             "description": "T800 全向速度控制，支持定时和持续运动",
             "inputSchema": action_schema(
                 {
-                    "move": (["vx", "vy", "vyaw", "duration", "force"], "按速度移动；duration=-1 持续到 stop_move"),
-                    "move_displacement": (["x_m", "y_m", "speed_m_s", "force"], "按时间积分估算相对位移（开环，无里程计反馈）"),
-                    "turn_angle": (["angle_rad", "angular_speed_rad_s", "force"], "按时间积分估算原地转角（开环）"),
-                    "arc": (["radius_m", "angle_rad", "linear_speed_m_s", "force"], "按给定半径和角度走圆弧（开环）"),
+                    "move": (["vx", "vy", "vyaw", "duration"], "按速度移动；duration=-1 持续到 stop_move"),
+                    "move_displacement": (["x_m", "y_m", "speed_m_s"], "按时间积分估算相对位移（开环，无里程计反馈）"),
+                    "turn_angle": (["angle_rad", "angular_speed_rad_s"], "按时间积分估算原地转角（开环）"),
+                    "arc": (["radius_m", "angle_rad", "linear_speed_m_s"], "按给定半径和角度走圆弧（开环）"),
                     "stop_move": ([], "立即发布零速度并停止刷新"),
                     "status": ([], "查询速度控制刷新状态"),
                 },
@@ -1887,10 +1888,11 @@ class LocomotionPlugin:
                     "vx": {"type": "number", "description": "前向速度 m/s"},
                     "vy": {"type": "number", "description": "侧向速度 m/s"},
                     "vyaw": {"type": "number", "description": "偏航角速度 rad/s"},
-                    "duration": {"type": "number", "description": "秒；-1=持续，0=停止"},
-                    "force": {
-                        "type": "boolean",
-                        "description": "忽略必须处于 rl_basic/lower_body_balance 的状态门禁",
+                    "duration": {
+                        "type": "number",
+                        "minimum": -1,
+                        "maximum": self._MAX_TIMED_DURATION_SEC,
+                        "description": "秒；-1=持续到 stop_move，0=停止",
                     },
                     "x_m": {"type": "number", "description": "机身坐标系前向位移，米"},
                     "y_m": {"type": "number", "description": "机身坐标系侧向位移，米"},
@@ -1901,7 +1903,6 @@ class LocomotionPlugin:
                     "linear_speed_m_s": {"type": "number", "description": "圆弧线速度，m/s；负数为后退"},
                 },
                 "运动动作",
-                completion=(["move"], 60),
             ),
         }
 
@@ -1917,23 +1918,31 @@ class LocomotionPlugin:
         )
 
     def _stream_health_check(self):
-        """流发布看门狗：active 且超过 gap 上限无发布 → 停流归零"""
+        """Fail closed if the mode changes or the velocity stream stalls."""
         s = self._stream.snapshot()
-        if s.active and s.last_publish_at is not None:
+        if not s.active:
+            return
+        motion, _ = self._state.current_motion()
+        if motion not in WALK_MOTION_STATES:
+            self._halt_stream()
+            return
+        if s.last_publish_at is not None:
             gap = time.monotonic() - s.last_publish_at
             if gap > self._stream_gap_limit_sec:
-                self._stream.stop()
-                self._publish_zero()
+                self._halt_stream()
 
     def stop(self) -> None:
-        self._stream.stop()
+        self.halt()
+
+    def halt(self) -> None:
+        """Stop physical output without tearing down the plugin."""
+        self._halt_stream()
 
     def dispatch(self, action: str, args: dict) -> dict:
         try:
             return self._dispatch(action, args)
         except Exception:
-            self._stream.stop()
-            self._publish_zero()
+            self._halt_stream()
             raise
 
     def _dispatch(self, action: str, args: dict) -> dict:
@@ -1943,22 +1952,22 @@ class LocomotionPlugin:
             self.stop()
             return {"state": "idle"}
         if action == "status" or action == "info":
-            return {"state": "ready", "stream": asdict(self._stream.snapshot())}
+            return {
+                "state": "ready",
+                "stream": asdict(self._stream.snapshot()),
+            }
         if action == "stop_move":
-            stopped = self._stream.stop()
-            self._publish_zero()
+            stopped = self._halt_stream()
             return {"state": "stopped", "was_active": stopped}
         if action not in ("move", "move_displacement", "turn_angle", "arc"):
-            return {"error": f"unknown locomotion action: {action}"}
+            return self._reject_and_halt(f"unknown locomotion action: {action}")
 
         motion, _ = self._state.current_motion()
-        if motion not in WALK_MOTION_STATES and not bool(args.get("force", False)):
-            return {
-                "error": (
-                    f"move requires motion state in {WALK_MOTION_STATES} "
-                    f"(current: {motion or 'unknown'})"
-                )
-            }
+        if motion not in WALK_MOTION_STATES:
+            return self._reject_and_halt(
+                f"move requires motion state in {WALK_MOTION_STATES} "
+                f"(current: {motion or 'unknown'})"
+            )
         open_loop = action != "move"
         if action == "move":
             vx = clamp(args.get("vx", 0), -self._limits[0], self._limits[0])
@@ -1970,7 +1979,9 @@ class LocomotionPlugin:
             y_m = float(args.get("y_m", 0.0))
             distance = math.hypot(x_m, y_m)
             if not math.isfinite(distance) or distance == 0:
-                return {"error": "x_m and y_m must define a non-zero finite displacement"}
+                return self._reject_and_halt(
+                    "x_m and y_m must define a non-zero finite displacement"
+                )
             speed = clamp(abs(args.get("speed_m_s", 0.3)), 0.01, math.hypot(*self._limits[:2]))
             duration = max(
                 distance / speed,
@@ -1983,7 +1994,7 @@ class LocomotionPlugin:
         elif action == "turn_angle":
             angle = float(args.get("angle_rad", 0.0))
             if not math.isfinite(angle) or angle == 0:
-                return {"error": "angle_rad must be non-zero and finite"}
+                return self._reject_and_halt("angle_rad must be non-zero and finite")
             speed = clamp(abs(args.get("angular_speed_rad_s", 0.5)), 0.01, self._limits[2])
             vyaw = math.copysign(speed, angle)
             duration = abs(angle) / speed
@@ -1993,16 +2004,41 @@ class LocomotionPlugin:
             angle = float(args.get("angle_rad", 0.0))
             linear = float(args.get("linear_speed_m_s", 0.3))
             if not all(math.isfinite(value) for value in (radius, angle, linear)) or radius <= 0 or angle == 0 or linear == 0:
-                return {"error": "radius_m, angle_rad and linear_speed_m_s must be finite and non-zero"}
+                return self._reject_and_halt(
+                    "radius_m, angle_rad and linear_speed_m_s must be finite and non-zero"
+                )
             requested_vx = clamp(linear, -self._limits[0], self._limits[0])
             angular_speed = min(abs(requested_vx) / radius, self._limits[2])
             vx = math.copysign(angular_speed * radius, requested_vx)
             vyaw = math.copysign(angular_speed, angle)
             duration = abs(angle) / angular_speed
             vy = 0.0
+        if duration != -1 and duration > self._MAX_TIMED_DURATION_SEC:
+            raise ValueError(
+                f"timed locomotion duration {duration:.3f}s exceeds "
+                f"{self._MAX_TIMED_DURATION_SEC:.0f}s safety limit; "
+                "split the command or use move duration=-1 with stop_move"
+            )
         snapshot = self._stream.start({"vx": vx, "vy": vy, "vyaw": vyaw}, duration)
-        return {"state": "running" if duration else "stopped", "vx": vx, "vy": vy, "vyaw": vyaw,
-                "duration": duration, "open_loop": open_loop, "stream": asdict(snapshot)}
+        return {
+            "state": "running" if duration else "stopped",
+            "vx": vx,
+            "vy": vy,
+            "vyaw": vyaw,
+            "duration": duration,
+            "open_loop": open_loop,
+            "stream": asdict(snapshot),
+        }
+
+    def _reject_and_halt(self, error: str) -> dict:
+        self._halt_stream()
+        return {"error": error}
+
+    def _halt_stream(self) -> bool:
+        stopped = self._stream.stop()
+        if not stopped:
+            self._publish_zero()
+        return stopped
 
     def _publish_payload(self, payload: dict) -> None:
         if self._publisher is None:
@@ -2557,6 +2593,10 @@ class GesturePlugin:
     def stop(self) -> None:
         self._stop(reset_after=False)
 
+    def halt(self) -> None:
+        """Cancel the active motion without tearing down the plugin."""
+        self._stop(reset_after=False)
+
     def dispatch(self, action: str, args: dict) -> dict:
         if action in ("start", "info", "list"):
             return {
@@ -2874,6 +2914,9 @@ class GesturePlugin:
 class _JointStreamBase:
     def stop(self) -> None:
         self._stream.stop()
+
+    def halt(self) -> None:
+        self.stop()
 
     def _status(self) -> dict:
         return {"state": "ready", "stream": asdict(self._stream.snapshot())}
@@ -3358,7 +3401,11 @@ class SafetyControlPlugin:
         for control in self._controls:
             if action == "soft_stop" and not isinstance(control, LocomotionPlugin):
                 continue
-            control.stop()
+            halt = getattr(control, "halt", None)
+            if callable(halt):
+                halt()
+            else:
+                control.stop()
             stopped_streams.append(type(control).__name__)
         self._publish_zero_velocity()
         if action == "soft_stop":
@@ -5386,6 +5433,20 @@ class MotionRecorderPlugin:
         )
 
     def stop(self) -> None:
+        self.halt()
+        if self._node:
+            try:
+                self._ros2.executor_robot.remove_node(self._node)
+            except Exception:
+                pass
+            try:
+                self._node.destroy_node()
+            except Exception:
+                pass
+            self._node = None
+
+    def halt(self) -> None:
+        """Stop recording/playback while keeping ROS resources reusable."""
         self._finalize_recording(stop_reason="shutdown")
         self._stop_playback()
         with self._lock:
@@ -5398,11 +5459,6 @@ class MotionRecorderPlugin:
                 "request_id": reset_request_id,
                 "reason": "plugin_stopped",
             }, self.PREFIX)
-        if self._node:
-            try:
-                self._node.destroy_node()
-            except Exception:
-                pass
 
     # ── ROS2 callbacks ────────────────────────────────────────────────────────
 
