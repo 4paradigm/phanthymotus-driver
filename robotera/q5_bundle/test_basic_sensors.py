@@ -279,6 +279,32 @@ class Q5BasicSensorTests(unittest.TestCase):
         self.assertEqual(result[2], 0.0)
         self.assertEqual(result[3], -1.0)
 
+    def test_base_drive_continuous_motion_uses_acp_cancel_completion(self):
+        class Driver:
+            def move(self, *args):
+                return True
+
+            def stop(self):
+                return True
+
+            def get_status(self):
+                return {"subproc_alive": True, "publisher_ready": True}
+
+        plugin = base_drive.Plugin({}, "test", None, _Client())
+        plugin._driver = Driver()
+        notifications = []
+        original_notify = base_drive._acp_notify
+        base_drive._acp_notify = lambda *args: notifications.append(args)
+        try:
+            queued = plugin.dispatch("forward", {"speed_mps": 0.2, "duration_s": -1})
+            self.assertEqual(queued["state"], "queued")
+            self.assertFalse(queued["stops_automatically"])
+            stopped = plugin.dispatch("cancel", {})
+        finally:
+            base_drive._acp_notify = original_notify
+        self.assertEqual(stopped["state"], "stopped")
+        self.assertEqual(notifications[-1][1], "cancelled")
+
     def test_lifecycle_poll_reads_active_without_side_effects(self):
         client = q5_sdk_client.Q5SdkClient()
         client._lifecycle_client = _LifecycleService()
