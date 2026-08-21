@@ -19,6 +19,7 @@ from control import (  # noqa: E402
     clamp,
     float_list,
     joint_payload,
+    resample_joint_trajectory,
     sensor_tool,
     validate_joint_indices,
     validate_joint_positions,
@@ -107,6 +108,38 @@ class ValidationTests(unittest.TestCase):
         self.assertTrue(tool["readOnly"])
         self.assertEqual("sensor", tool["type"])
         self.assertEqual("/robot/state/imu", tool["topic_out"][0]["topic"])
+
+    def test_resample_joint_trajectory_adds_smooth_entry_and_high_rate_samples(self):
+        frames = [
+            {"timestamp": 0, "positions": [0.0] * 25},
+            {"timestamp": 100, "positions": [0.0] * 12 + [1.0] * 13},
+            {"timestamp": 200, "positions": [0.0] * 25},
+        ]
+        samples = resample_joint_trajectory(
+            frames,
+            joint_indices=list(range(12, 25)),
+            current_positions=[0.0] * 12 + [-0.5] * 13,
+            playback_rate_hz=100.0,
+            speed_scale=1.0,
+            entry_blend_sec=0.5,
+        )
+        self.assertGreater(len(samples), len(frames))
+        self.assertAlmostEqual(-0.5, samples[0][0][0], places=3)
+        self.assertTrue(all(0.0 <= position[0] <= 1.0 for position, _ in samples[51:]))
+
+    def test_resample_joint_trajectory_rejects_non_monotonic_timestamps(self):
+        with self.assertRaisesRegex(ValueError, "strictly increasing"):
+            resample_joint_trajectory(
+                [
+                    {"timestamp": 0, "positions": [0.0] * 25},
+                    {"timestamp": 0, "positions": [0.1] * 25},
+                ],
+                joint_indices=list(range(12, 25)),
+                current_positions=[0.0] * 25,
+                playback_rate_hz=100.0,
+                speed_scale=1.0,
+                entry_blend_sec=0.5,
+            )
 
 
 class RepeatingCommandTests(unittest.TestCase):

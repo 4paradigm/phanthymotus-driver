@@ -239,11 +239,19 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
 
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
+        self.state = FakeMotionState(
+            current="lower_body_balance",
+            available=["pd_stand"],
+        )
+        self.motion_mode = FakeMotionMode(self.state)
         self.plugin = self.dev.MotionRecorderPlugin(
             {"plugins": {"motion_recorder": {"recordings_dir": self.tmpdir.name}}},
             "t800", FakeRos(),
         )
         self.plugin.start()
+        self.plugin.set_reset_controls(self.state, self.motion_mode)
+        self.acp_calls = []
+        self.plugin._acp_notify = lambda *args: self.acp_calls.append(args)
 
     def tearDown(self):
         self.plugin.stop()
@@ -257,6 +265,10 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
                     "reset", "save", "load", "list", "delete", "status", "info"}
         for action in expected:
             self.assertIn(action, actions)
+        self.assertEqual(
+            {"actions": ["play", "reset"], "timeout": 3600},
+            tool["inputSchema"]["x-completion"],
+        )
 
     def test_status_returns_idle_initially(self):
         result = self.plugin.dispatch("status", {})
@@ -330,7 +342,7 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
 
         resetting = self.plugin.dispatch("reset", {})
         self.assertEqual("resetting", resetting["state"])
-        self.assertEqual(("reset", {}), joint_plan.calls[-1])
+        self.assertIn(("reset", {}), joint_plan.calls)
         pending = self.plugin.dispatch("status", {})
         self.assertTrue(pending["needs_reset"])
         self.assertTrue(pending["reset_pending"])
@@ -339,6 +351,10 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
         ready = self.plugin.dispatch("status", {})
         self.assertFalse(ready["needs_reset"])
         self.assertFalse(ready["reset_pending"])
+        self.assertTrue(any(
+            call[0] == resetting["action_id"] and call[1] == "completed"
+            for call in self.acp_calls
+        ))
         started = self.plugin.dispatch("record_start", {"label": "second_action"})
         self.assertEqual("recording", started["state"])
 
@@ -388,7 +404,7 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
             motion_mode.calls[-1],
         )
         self.assertEqual("lower_body_balance", state.current)
-        self.assertEqual(("reset", {}), joint_plan.calls[-1])
+        self.assertIn(("reset", {}), joint_plan.calls)
 
     def test_record_start_is_idempotent_instead_of_toggling_off(self):
         first = self.plugin.dispatch("record_start", {"label": "first"})
@@ -484,13 +500,13 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
         result = self.plugin.dispatch("play", {"name": "nonexistent"})
         self.assertIn("error", result)
 
-    def test_play_without_joint_plan_returns_error(self):
+    def test_play_rejects_single_frame_recording(self):
         self.plugin.dispatch("record_start", {"label": "play_test"})
         self.plugin._on_joint_state(self._make_joint_state())
         self.plugin.dispatch("record_stop", {})
         self.plugin.dispatch("save", {"name": "play_test_rec"})
         result = self.plugin.dispatch("play", {"name": "play_test_rec"})
-        self.assertIn("error", result)
+        self.assertIn("at least two", result["error"])
 
     def test_playback_state_after_play_with_joint_plan(self):
         class FakeJointPlan:
@@ -534,6 +550,10 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
         self.assertEqual(0.0, messages[-1].weight)
         self.assertTrue(any(message.weight == 1.0 for message in messages[:-1]))
         self.assertTrue(self.plugin.dispatch("status", {})["needs_reset"])
+        self.assertTrue(any(
+            call[0] == result["action_id"] and call[1] == "completed"
+            for call in self.acp_calls
+        ))
 
     def test_playback_blends_from_current_pose_before_recorded_trajectory(self):
         current = self._make_joint_state()
@@ -606,6 +626,73 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
         )
         self.assertLess(max_velocity_step, 5.0)
         self.assertTrue(all(0.0 <= message.position[0] <= 1.0 for message in trajectory))
+
+    def test_playback_publish_failure_clears_playing_state(self):
+        current = self._make_joint_state()
+        current.position = [0.0] * 25
+        current.velocity = [0.0] * 25
+        self.plugin._on_joint_state(current)
+        self.plugin._frames = [
+            {"timestamp": 0, "positions": [0.0] * 25, "velocities": [0.0] * 25},
+            {"timestamp": 50, "positions": [0.1] * 25, "velocities": [0.0] * 25},
+        ]
+        publisher = next(
+            publisher
+            for publisher in self.plugin._node.publishers
+            if publisher.topic == "/motion/joint_override_command"
+        )
+
+        def fail_publish(_message):
+            raise RuntimeError("publisher unavailable")
+
+        publisher.publish = fail_publish
+        result = self.plugin.dispatch("play", {})
+        self.assertEqual("playing", result["state"])
+        deadline = time.monotonic() + 1.0
+        while self.plugin.dispatch("status", {})["playing"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(self.plugin.dispatch("status", {})["playing"])
+
+    def test_playback_releases_override_if_motion_mode_changes(self):
+        state = FakeMotionState(current="lower_body_balance", available=["pd_stand"])
+        self.plugin.set_reset_controls(state, FakeMotionMode(state))
+        current = self._make_joint_state()
+        current.position = [0.0] * 25
+        current.velocity = [0.0] * 25
+        self.plugin._on_joint_state(current)
+        self.plugin._frames = [
+            {"timestamp": 0, "positions": [0.0] * 25, "velocities": [0.0] * 25},
+            {"timestamp": 1000, "positions": [0.5] * 25, "velocities": [0.0] * 25},
+        ]
+
+        self.plugin.dispatch("play", {})
+        time.sleep(0.05)
+        state.current = "pd_stand"
+        deadline = time.monotonic() + 1.0
+        while self.plugin.dispatch("status", {})["playing"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        status = self.plugin.dispatch("status", {})
+        self.assertFalse(status["playing"])
+        self.assertIn("lower_body_balance", status["playback_error"])
+        publisher = next(
+            publisher
+            for publisher in self.plugin._node.publishers
+            if publisher.topic == "/motion/joint_override_command"
+        )
+        self.assertEqual(0.0, publisher.messages[-1].weight)
+
+    def test_recording_auto_stops_if_motion_mode_changes(self):
+        state = FakeMotionState(current="lower_body_balance", available=["pd_stand"])
+        self.plugin.set_reset_controls(state, FakeMotionMode(state))
+        self.plugin.dispatch("record_start", {"label": "mode_guard"})
+        self.plugin._on_joint_state(self._make_joint_state())
+        state.current = "pd_stand"
+        self.plugin._on_joint_state(self._make_joint_state())
+
+        status = self.plugin.dispatch("status", {})
+        self.assertFalse(status["recording"])
+        self.assertEqual("motion_state_changed", status["last_recording"]["stop_reason"])
 
     def test_unknown_action_returns_error(self):
         result = self.plugin.dispatch("foobar", {})

@@ -191,8 +191,7 @@ class T800DeviceBundle:
             self._plugins.append(motion_recorder)
             if "joint_plan" in instances:
                 motion_recorder.set_joint_plan(instances["joint_plan"])
-            if "motion_mode" in instances:
-                motion_recorder.set_reset_controls(state, instances["motion_mode"])
+            motion_recorder.set_reset_controls(state, instances.get("motion_mode"))
 
         virtual_gamepad_config = plugins.get("virtual_gamepad", {})
         if virtual_gamepad_config.get("enabled", False):
