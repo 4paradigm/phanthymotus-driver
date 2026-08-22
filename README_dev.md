@@ -540,7 +540,6 @@ The Agent Core Web Dashboard automatically selects a renderer based on the `form
 | `sensor/lidar*` | Lidar scan | `hint.startsWith('sensor/lidar')` |
 | `sensor/pointcloud` | 3D Point cloud | `hint === 'sensor/pointcloud'` |
 | `sensor/mapping` | 2D Occupancy map | `hint === 'sensor/mapping'` |
-| `sensor/htmsg` | HT structured message | `hint === 'sensor/htmsg'` |
 | (no hint) | Activity stream | Fallback when no format specified |
 
 ### Depth Rendering — `image/depth-z16` vs `image/depth-zlib`
