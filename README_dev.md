@@ -133,6 +133,10 @@ endpoint and personal identifier. Fields that were blanked are reported to the
 loading user as "needs configuration", so marking a field does not break the
 solution — it just makes the recipient fill in their own value.
 
+Two formats are cleared automatically and need no marking, because their values
+only mean something on the machine they were set on: `channel-select` (a local
+channel id) and `audio-input-device` (a local sound-card device).
+
 ---
 
 ## x-action-params Specification
