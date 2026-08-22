@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import struct
 import sys
 import threading
 import time
@@ -218,6 +219,61 @@ class McpHttpContractTests(unittest.TestCase):
         bundle.stop_all()
         self.assertEqual(1, good.stops)
 
+    def test_bundle_halts_physical_outputs_before_reverse_teardown(self):
+        events = []
+
+        class Plugin:
+            def __init__(self, name, physical=False):
+                self.name = name
+                if physical:
+                    self.halt = lambda: events.append(f"halt:{name}")
+
+            def stop(self):
+                events.append(f"stop:{self.name}")
+
+        head = Plugin("head")
+        motion = Plugin("motion", physical=True)
+        tail = Plugin("tail")
+        bundle = self.module.T800DeviceBundle.__new__(self.module.T800DeviceBundle)
+        bundle._active_plugins = [head, motion, tail]
+        bundle._started = True
+
+        bundle.stop_all()
+
+        self.assertEqual(
+            ["halt:motion", "stop:tail", "stop:motion", "stop:head"],
+            events,
+        )
+
+    def test_bundle_releases_real_virtual_gamepad_in_phase_one(self):
+        sys.path.insert(0, str(ROOT))
+        from virtual_gamepad import VirtualGamepadPlugin
+
+        events = []
+
+        class Lcm:
+            def publish(self, _channel, payload):
+                events.append(("gamepad", payload))
+
+        class SlowTail:
+            def stop(self):
+                events.append(("tail_stop", None))
+
+        gamepad = VirtualGamepadPlugin({}, "robot", None)
+        gamepad._lcm = Lcm()
+        gamepad.dispatch("sticks", {"left_y": 0.5, "duration": -1})
+        events.clear()
+        bundle = self.module.T800DeviceBundle.__new__(self.module.T800DeviceBundle)
+        bundle._active_plugins = [gamepad, SlowTail()]
+        bundle._started = True
+
+        bundle.stop_all()
+
+        self.assertEqual("gamepad", events[0][0])
+        released = struct.unpack(">Qq12i6d", events[0][1])
+        self.assertEqual((0,) * 12, released[2:14])
+        self.assertEqual("tail_stop", events[1][0])
+
 
 class VendoredContractTests(unittest.TestCase):
     def test_urdf_contains_every_driver_joint_name(self):
@@ -252,6 +308,22 @@ class VendoredContractTests(unittest.TestCase):
         self.assertNotIn("t800-dev", metadata_text)
         deploy_text = (ROOT / "deploy" / "service.yml").read_text()
         self.assertNotIn("RMW_IMPLEMENTATION=rmw_cyclonedds_cpp", deploy_text)
+
+    def test_cyclonedds_container_logs_are_muzzled_without_losing_interface_selection(self):
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        self.assertIn("ENV RCUTILS_COLORIZED_OUTPUT=0", dockerfile)
+        self.assertIn("<Tracing><Verbosity>severe</Verbosity>", dockerfile)
+        self.assertIn("<OutputFile>/dev/null</OutputFile></Tracing>", dockerfile)
+        self.assertIn("NetworkInterface name='${NETWORK_INTERFACE:-eth1}'", dockerfile)
+
+    def test_acp_uses_agent_core_certificate_and_matching_hostname(self):
+        service = (ROOT / "deploy" / "service.yml").read_text()
+        self.assertIn('"phanthy-motus:127.0.0.1"', service)
+        self.assertIn("AGENT_CORE_URL=https://phanthy-motus:15678", service)
+        self.assertIn(
+            "AGENT_CORE_CA_CERT=/opt/phanthy-motus/data/certs/cert.pem",
+            service,
+        )
 
 
 if __name__ == "__main__":

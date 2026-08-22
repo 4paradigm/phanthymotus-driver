@@ -12,6 +12,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from control import (  # noqa: E402
+    MOTION_STATES,
+    WALK_MOTION_STATES,
     T800_JOINT_POSITION_LIMITS,
     T800_JOINT_NAMES,
     RepeatingCommand,
@@ -19,6 +21,7 @@ from control import (  # noqa: E402
     clamp,
     float_list,
     joint_payload,
+    resample_joint_trajectory,
     sensor_tool,
     validate_joint_indices,
     validate_joint_positions,
@@ -108,6 +111,79 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual("sensor", tool["type"])
         self.assertEqual("/robot/state/imu", tool["topic_out"][0]["topic"])
 
+    def test_resample_joint_trajectory_adds_smooth_entry_and_high_rate_samples(self):
+        frames = [
+            {"timestamp": 0, "positions": [0.0] * 25},
+            {"timestamp": 100, "positions": [0.0] * 12 + [1.0] * 13},
+            {"timestamp": 200, "positions": [0.0] * 25},
+        ]
+        samples = resample_joint_trajectory(
+            frames,
+            joint_indices=list(range(12, 25)),
+            current_positions=[0.0] * 12 + [-0.5] * 13,
+            playback_rate_hz=100.0,
+            speed_scale=1.0,
+            entry_blend_sec=0.5,
+        )
+        self.assertGreater(len(samples), len(frames))
+        self.assertAlmostEqual(-0.5, samples[0][0][0], places=3)
+        self.assertTrue(all(0.0 <= position[0] <= 1.0 for position, _ in samples[51:]))
+
+    def test_resample_joint_trajectory_rejects_non_monotonic_timestamps(self):
+        with self.assertRaisesRegex(ValueError, "strictly increasing"):
+            resample_joint_trajectory(
+                [
+                    {"timestamp": 0, "positions": [0.0] * 25},
+                    {"timestamp": 0, "positions": [0.1] * 25},
+                ],
+                joint_indices=list(range(12, 25)),
+                current_positions=[0.0] * 25,
+                playback_rate_hz=100.0,
+                speed_scale=1.0,
+                entry_blend_sec=0.5,
+            )
+
+    def test_resample_joint_trajectory_rejects_missing_current_state(self):
+        with self.assertRaisesRegex(ValueError, "current joint state is unavailable"):
+            resample_joint_trajectory(
+                [
+                    {"timestamp": 0, "positions": [0.0] * 25},
+                    {"timestamp": 50, "positions": [0.1] * 25},
+                ],
+                joint_indices=list(range(12, 25)),
+                current_positions=[],
+                playback_rate_hz=100.0,
+                speed_scale=1.0,
+                entry_blend_sec=0.5,
+            )
+    def test_action_schema_with_completion(self):
+        schema = action_schema(
+            {"move": (["vx"], "move"), "stop": ([], "stop")},
+            {"vx": {"type": "number"}},
+            "action",
+            completion=(["move"], 60),
+        )
+        self.assertEqual(["move"], schema["x-completion"]["actions"])
+        self.assertEqual(60, schema["x-completion"]["timeout"])
+
+    def test_action_schema_without_completion_omits_key(self):
+        schema = action_schema(
+            {"move": (["vx"], "move")},
+            {"vx": {"type": "number"}},
+            "action",
+        )
+        self.assertNotIn("x-completion", schema)
+
+    def test_motion_states_has_17_official_values(self):
+        self.assertEqual(17, len(MOTION_STATES))
+        self.assertIn("rl_basic", MOTION_STATES)
+        self.assertIn("lower_body_balance", MOTION_STATES)
+        self.assertIn("rl_mimic_supine_to_stance", MOTION_STATES)
+        self.assertIn("rl_mimic_stance_to_supine", MOTION_STATES)
+
+    def test_walk_motion_states_matches_official_walking_modes(self):
+        self.assertEqual(("rl_basic", "lower_body_balance"), WALK_MOTION_STATES)
+
 
 class RepeatingCommandTests(unittest.TestCase):
     def test_timed_stream_publishes_and_stops(self):
@@ -141,8 +217,26 @@ class RepeatingCommandTests(unittest.TestCase):
 
     def test_invalid_duration_is_rejected(self):
         stream = RepeatingCommand(lambda _: None, lambda: None, rate_hz=10)
-        with self.assertRaisesRegex(ValueError, "duration"):
-            stream.start({}, -2)
+        for duration in (-2, -0.5):
+            with self.subTest(duration=duration):
+                with self.assertRaisesRegex(ValueError, "duration"):
+                    stream.start({}, duration)
+
+    def test_background_publish_failure_is_exposed_and_stops_stream(self):
+        published = []
+        stopped = threading.Event()
+
+        def publish(command):
+            published.append(command)
+            if len(published) > 1:
+                raise RuntimeError("publisher failed")
+
+        stream = RepeatingCommand(publish, stopped.set, rate_hz=100)
+        stream.start({"value": 1}, 1.0)
+        self.assertTrue(stopped.wait(0.5))
+        snapshot = stream.snapshot()
+        self.assertFalse(snapshot.active)
+        self.assertEqual("publisher failed", snapshot.error)
 
 
 class NativeSdkManagerTests(unittest.TestCase):

@@ -34,8 +34,10 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 | `model` | resource | 官方 `serial_t800.urdf` |
 | `loco` | actuator | 100 Hz 速度控制；定时/持续、相对位移、转角和圆弧开环动作 |
 | `motion_mode` | actuator | 任意状态切换及 idle/passive/站立/行走/舞蹈/起身/躺下快捷动作 |
+| `gait` | actuator | 基于 Native SDK motion state 的步态选择；自动适配 `rl_basic`/`walk` 版本差异 |
 | `dance` | actuator | 舞蹈列表、播放、停止和状态；官方基线为 `dance.mnn` + `dance.npz` |
 | `joint_plan` | actuator | 索引/名称关节轨迹、头部/单臂姿态、当前位置保持、取消、复位和预置动作 |
+| `motion_recorder` | actuator | 按指定采样率录制关节轨迹，手动/定时停止均自动落盘，并支持管理与回放 |
 | `joint_plan_state` | sensor | 规划 request id、状态和进度 |
 | `gesture` | actuator | 官方完整挥手/握手多步序列及任意自定义关节动作队列 |
 | `joint_override` | actuator | 指定关节 100 Hz 覆盖控制 |
@@ -43,6 +45,7 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 | `led` | actuator | 众擎协议定义的 11 种灯效 |
 | `tts` | actuator | 众擎 TTS 消息；topic 可配置 |
 | `mic` | sensor | 内置麦克风 PCM-16 16kHz 采集，缓冲 1024 字节发布（满足 perception ASR 协议） |
+| `speaker` | actuator | 订阅画布连接的 `audio/pcm-16k` 流，经官方 ALSA `aplay` 接口播放到机器人喇叭；音量经官方 `pactl` 接口控制 |
 | `pointcloud` | sensor | Odin2 原始/SLAM 点云转发（`sensor/pointcloud` 二进制渲染流） |
 | `camera` | sensor | Odin2 双目 JPEG 图像转发（左/右目 `image/jpeg` 流） |
 | `depth` | sensor | Odin2 官方标定深度图转 640×480 毫米 16UC1（`image/depth-z16`） |
@@ -52,14 +55,16 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 | `safety` | actuator | 零速度、覆盖释放、关节阻尼及 passive/idle/stand 组合动作 |
 | `native_sdk` | actuator | Native SDK status/start/stop/restart |
 
-所有动作差异通过 `x-action-params` 声明。`force=true` 可绕过 locomotion、
-joint override 和 joint bridge 的 motion-state 门禁；完整高风险能力没有从
-MCP schema 中隐藏。
+所有动作差异通过 `x-action-params` 声明。`loco` 始终要求机器人处于
+`rl_basic` 或 `lower_body_balance`，运行中一旦离开这两个状态会立即归零停流。
+`force=true` 仅保留给 joint override 和 joint bridge 的专家级接口。
 
 `loco.move_displacement`、`turn_angle` 和 `arc` 由速度乘时间换算。T800
 基础运动协议没有供控制闭环使用的定位反馈，因此它们仍是开环动作并返回
 `open_loop: true`。若 Odin2 固件提供配置中的 odometry topic，
 `motion_command_trace` 会把它用于状态显示，但不会据此闭环控制动作。
+有限时长动作最多运行 3 秒且不建立 ACP 屏障；更长运动请拆分命令，或使用
+`duration=-1` 持续发送并通过 `stop_move` 手动停止。这样停止动作不会被屏障拦截。
 
 `gesture.play` 与旧的 `joint_plan.preset` 不同：前者执行官方示例里的完整多步
 动作（挥手包含准备、举手、5 次摆动和复位；握手包含伸手、收手和复位），
@@ -71,6 +76,25 @@ MCP schema 中隐藏。
 除了原始按键/摇杆外，提供 idle、passive、stand、walk、dance、get_up、
 lie_down 组合键。LCM 输入会覆盖实体手柄输入，发送完成后 Driver 自动发布
 全零包释放控制权。
+
+`gait` 不会写入自定义 `gait.json`。官方 T800 Native SDK 的行走
+策略配置位于 `assets/config/t800/.../*.yaml`，且不提供 `step_height`、
+`stride_length` 等通用运行时调参契约。因此卡片只通过官方
+`/motion/set_motion_state` 接口切换 `basic` / `balanced`，并以
+`/motion/motion_state` 返回的可转换状态为准。`rl_terrain` 不属于当前 T800
+状态机，因此不会作为可选项暴露；terrain 接口示例不能视为 T800 固件能力。
+
+`motion_recorder.record_start` 是幂等的：录制中重复调用只返回当前会话，
+不会意外停止。`record_stop` 同样可重复调用；设置 `duration > 0`
+时超时会走与手动停止相同的落盘路径。状态中的 `last_recording`
+可用于确认最近一次保存文件、停止原因和帧数。
+
+录制与回放仅在 `lower_body_balance` 状态开放。回放不再把每个 20Hz 录制帧
+提交为独立 joint plan，而是先用 0.5 秒五次曲线从当前位置平滑接入，再以
+三次 Hermite 插值重采样为 100Hz `JointOverrideCommand` 连续轨迹；停止、
+异常和完成路径都会发布 `weight=0` 释放覆盖。录制或回放完成后，状态返回
+`needs_reset=true`，必须执行 `reset`：安全进入 `lower_body_balance` 并发送
+官方 `REQUEST_RESET` 默认姿态请求。规划器确认回到 `IDLE` 后才允许下一次录制。
 
 `pointcloud`、`camera`、`depth` 桥接 T800-Odin2 激光雷达相机（飞书文档
 7.2 节）在 Orin 主板上发布的 `odin_ros_driver` topic。点云按
@@ -84,6 +108,28 @@ Sobel 边缘抑制和最近邻上采样均由众擎节点完成。使用 `depth`
 之间切换。Odin2 topic 带逐设备前缀 `/{topic_prefix}/{model}/device{N}/`，
 默认按 `config.yaml:topics.vision_*` 的 `/manifold/ODIN2/device0` 订阅，
 上机前请用 `ros_graph` 工具核对实际前缀。
+
+`speaker` 按众擎飞书《ROS2 接口开发文档》第8章实现：播放走官方 ALSA
+接口 `aplay`（`-t raw -f S16_LE -r 16000 -c 1`，从 stdin 流式播放），
+系统音量走官方 `pactl` 接口（`get-sink-volume`/`set-sink-volume
+@DEFAULT_SINK@`，0-100）。画布把音频文件解码与用户 mic 采集统一转为
+`audio/pcm-16k` 块流发布到 `topic_in`（与 G1 speaker 契约一致，含
+utterance 结束的 8 字节 EOF magic），driver 只负责流式播放。镜像已含
+`alsa-utils`；容器经 `-v /dev:/dev` 挂载声卡节点。
+
+开机音与 `unitree/g1` 使用同一份 256,000 字节 PCM 资源（SHA256
+`e634d402feeead175e7a669a77fa8d6aa5770e162fbd3c867503d4897dc2f166`），
+通过 `COPY resource/` 随 driver 镜像打包，不依赖 GitHub/COS 等外部下载。
+`alsa-utils` 提供 `aplay`，`libasound2-plugins` 提供 `/etc/asound.conf`
+所需的 PulseAudio PCM backend；构建日志确认二者不在固定的 ros-base 中，
+因此对应包体增长是该官方播放路径的必要运行时成本。
+
+实时性：镜像内置 `/etc/asound.conf` 把 ALSA 默认设备路由到宿主
+PulseAudio——这是官方「aplay 播放 + pactl 音量」模型成立的前提
+（dmix 直通硬件时 pactl 音量不作用于播放输出，且 dmix 默认 ~341ms
+缓冲会造成明显延迟）。`aplay` 带 `--buffer-time=100000 --period-time=20000`
+压低读前缓冲；部署侧设置 `PULSE_LATENCY_MSEC=40` 控制 PulseAudio
+tsched 延迟上限（见 `deploy/service.yml`）。
 
 ## 运行
 

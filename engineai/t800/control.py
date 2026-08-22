@@ -13,6 +13,8 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Iterable, Sequence
 
+import numpy as np
+
 
 T800_JOINT_NAMES = (
     "J00_HIP_PITCH_L",
@@ -93,14 +95,23 @@ MOTION_STATES = (
     "idle",
     "passive",
     "pd_stand",
-    "walk",
-    "dance",
-    "supine_to_stance",
-    "stance_to_supine",
-    "joint_bridge",
+    "rl_basic",
     "lower_body_balance",
+    "joint_bridge",
+    "pd_sitground",
+    "walk_server",
+    "rl_mimic_supine_to_stance",
+    "rl_mimic_stance_to_supine",
+    "rl_mimic_left_to_right",
+    "rl_mimic_right_to_left",
+    "rl_amp",
     "rl_terrain",
+    "rl_recover_prone",
+    "rl_floor_sitting",
+    "dance",
 )
+
+WALK_MOTION_STATES = ("rl_basic", "lower_body_balance")
 
 LED_MODES = {
     "blink_red": 0x1,
@@ -239,6 +250,99 @@ def joint_payload(
     }
 
 
+def resample_joint_trajectory(
+    frames: list[dict],
+    *,
+    joint_indices: Sequence[int],
+    current_positions: Sequence[float],
+    playback_rate_hz: float,
+    speed_scale: float,
+    entry_blend_sec: float,
+) -> list[tuple[list[float], list[float]]]:
+    """Build a bounded C1 trajectory with a quintic entry blend."""
+    indices = validate_joint_indices(joint_indices)
+    timestamps = np.asarray([float(frame["timestamp"]) for frame in frames], dtype=float)
+    if timestamps.ndim != 1 or len(timestamps) < 2:
+        raise ValueError("at least two timestamped frames are required")
+    timestamps = (timestamps - timestamps[0]) / 1000.0 / float(speed_scale)
+    if np.any(np.diff(timestamps) <= 0):
+        raise ValueError("frame timestamps must be strictly increasing")
+
+    positions = np.asarray(
+        [[float(frame["positions"][index]) for index in indices] for frame in frames],
+        dtype=float,
+    )
+    if positions.shape != (len(frames), len(indices)):
+        raise ValueError("each frame must contain all requested joint positions")
+    if not np.all(np.isfinite(positions)):
+        raise ValueError("joint positions must be finite")
+    if len(current_positions) <= max(indices):
+        raise ValueError("current joint state is unavailable for entry blend")
+    current = np.asarray([float(current_positions[index]) for index in indices], dtype=float)
+    if current.shape != (len(indices),) or not np.all(np.isfinite(current)):
+        raise ValueError("current joint state is unavailable for entry blend")
+
+    duration = float(timestamps[-1])
+    sample_count = max(2, int(math.ceil(duration * playback_rate_hz)) + 1)
+    sample_times = np.linspace(0.0, duration, sample_count)
+    tangents = np.gradient(positions, timestamps, axis=0)
+    segments = np.searchsorted(timestamps, sample_times, side="right") - 1
+    segments = np.clip(segments, 0, len(timestamps) - 2)
+    left_time = timestamps[segments]
+    segment_duration = timestamps[segments + 1] - left_time
+    phase = (sample_times - left_time) / segment_duration
+    phase2 = phase * phase
+    phase3 = phase2 * phase
+    left_position = positions[segments]
+    right_position = positions[segments + 1]
+    sampled_positions = (
+        (2.0 * phase3 - 3.0 * phase2 + 1.0)[:, None] * left_position
+        + (phase3 - 2.0 * phase2 + phase)[:, None]
+        * segment_duration[:, None] * tangents[segments]
+        + (-2.0 * phase3 + 3.0 * phase2)[:, None] * right_position
+        + (phase3 - phase2)[:, None]
+        * segment_duration[:, None] * tangents[segments + 1]
+    )
+    sampled_positions = np.clip(
+        sampled_positions,
+        np.minimum(left_position, right_position),
+        np.maximum(left_position, right_position),
+    )
+    sampled_velocities = np.gradient(sampled_positions, sample_times, axis=0)
+
+    blend_count = max(2, int(math.ceil(entry_blend_sec * playback_rate_hz)) + 1)
+    blend_times = np.linspace(0.0, entry_blend_sec, blend_count)
+    delta = sampled_positions[0] - current
+    initial_velocity = np.zeros_like(current)
+    final_velocity = sampled_velocities[0]
+    a0 = current
+    a1 = initial_velocity
+    a2 = np.zeros_like(current)
+    a3 = (
+        20.0 * delta - (8.0 * final_velocity + 12.0 * initial_velocity) * entry_blend_sec
+    ) / (2.0 * entry_blend_sec**3)
+    a4 = (
+        -30.0 * delta + (14.0 * final_velocity + 16.0 * initial_velocity) * entry_blend_sec
+    ) / (2.0 * entry_blend_sec**4)
+    a5 = (
+        12.0 * delta - 6.0 * (final_velocity + initial_velocity) * entry_blend_sec
+    ) / (2.0 * entry_blend_sec**5)
+    t = blend_times[:, None]
+    blend_positions = a0 + a1 * t + a2 * t**2 + a3 * t**3 + a4 * t**4 + a5 * t**5
+    blend_positions = np.clip(
+        blend_positions,
+        np.minimum(current, sampled_positions[0]),
+        np.maximum(current, sampled_positions[0]),
+    )
+    blend_velocities = np.gradient(blend_positions, blend_times, axis=0)
+    sampled_positions = np.vstack((blend_positions, sampled_positions[1:]))
+    sampled_velocities = np.vstack((blend_velocities, sampled_velocities[1:]))
+    return [
+        (sampled_positions[index].tolist(), sampled_velocities[index].tolist())
+        for index in range(len(sampled_positions))
+    ]
+
+
 @dataclass(frozen=True)
 class StreamSnapshot:
     active: bool
@@ -246,6 +350,7 @@ class StreamSnapshot:
     deadline: float | None
     last_publish_at: float | None
     publish_count: int
+    error: str | None
 
 
 class RepeatingCommand:
@@ -271,10 +376,11 @@ class RepeatingCommand:
         self._deadline: float | None = None
         self._last_publish_at: float | None = None
         self._publish_count = 0
+        self._last_error: str | None = None
 
     def start(self, command: dict, duration: float) -> StreamSnapshot:
         duration = float(duration)
-        if not math.isfinite(duration) or duration < -1:
+        if not math.isfinite(duration) or (duration < 0 and duration != -1):
             raise ValueError("duration must be -1 or a non-negative finite number")
         self.stop()
         if duration == 0:
@@ -289,16 +395,18 @@ class RepeatingCommand:
             self._deadline = deadline
             self._last_publish_at = started_at
             self._publish_count = 1
+            self._last_error = None
         try:
             # Publish once before handing off to the worker. This guarantees a
             # short command is not lost if the scheduler starts the thread late.
             self._publisher(command)
-        except Exception:
+        except Exception as exc:
             with self._lock:
                 if self._stop_event is stop_event:
                     self._stop_event = None
                     self._publish_count = 0
                     self._last_publish_at = None
+                    self._last_error = str(exc)
             raise
 
         def run() -> None:
@@ -312,6 +420,10 @@ class RepeatingCommand:
                         self._last_publish_at = now
                         self._publish_count += 1
                     stop_event.wait(self._period)
+            except Exception as exc:
+                with self._lock:
+                    if self._stop_event is stop_event:
+                        self._last_error = str(exc)
             finally:
                 with self._lock:
                     owns_stream = self._stop_event is stop_event
@@ -320,7 +432,12 @@ class RepeatingCommand:
                 # A replaced stream was already stopped before its replacement
                 # started.  It must not inject a late zero into the new stream.
                 if owns_stream:
-                    self._stop_publisher()
+                    try:
+                        self._stop_publisher()
+                    except Exception as exc:
+                        with self._lock:
+                            if self._last_error is None:
+                                self._last_error = f"stop publish failed: {exc}"
 
         threading.Thread(target=run, daemon=True, name="t800-command-stream").start()
         return self.snapshot()
@@ -343,6 +460,7 @@ class RepeatingCommand:
                 deadline=self._deadline,
                 last_publish_at=self._last_publish_at,
                 publish_count=self._publish_count,
+                error=self._last_error,
             )
 
 
@@ -350,8 +468,10 @@ def action_schema(
     actions: dict[str, tuple[list[str], str]],
     properties: dict,
     description: str,
+    *,
+    completion: tuple[list[str], int] | None = None,
 ) -> dict:
-    return {
+    schema = {
         "type": "object",
         "properties": {
             "action": {
@@ -367,6 +487,12 @@ def action_schema(
             for name, (params, action_description) in actions.items()
         },
     }
+    if completion is not None:
+        schema["x-completion"] = {
+            "actions": completion[0],
+            "timeout": completion[1],
+        }
+    return schema
 
 
 def sensor_action_schema() -> dict:
