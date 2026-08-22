@@ -1197,6 +1197,55 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertTrue(contexts[0].check_hostname)
         self.assertEqual(ssl.CERT_REQUIRED, contexts[0].verify_mode)
 
+    def test_motion_recorder_acp_notify_verifies_tls_with_configured_ca(self):
+        import urllib.request as urllib_request
+
+        previous_url = os.environ.get("AGENT_CORE_URL")
+        previous_ca = os.environ.get("AGENT_CORE_CA_CERT")
+        original_create_default_context = ssl.create_default_context
+        original_urlopen = urllib_request.urlopen
+        contexts = []
+        cafiles = []
+        requests = []
+
+        def create_default_context(*args, **kwargs):
+            cafiles.append(kwargs.get("cafile"))
+            context = original_create_default_context()
+            contexts.append(context)
+            return context
+
+        def urlopen(request, *, timeout, context):
+            requests.append((request.full_url, timeout, context))
+            return types.SimpleNamespace(close=lambda: None)
+
+        ssl.create_default_context = create_default_context
+        urllib_request.urlopen = urlopen
+        os.environ["AGENT_CORE_URL"] = "https://phanthy-motus:15678"
+        os.environ["AGENT_CORE_CA_CERT"] = "/opt/phanthy-motus/data/certs/cert.pem"
+        try:
+            self.device._t800_acp_notify(
+                "t800_motion_test", "completed", {"frames": 10}, "motion_recorder"
+            )
+        finally:
+            if previous_url is None:
+                os.environ.pop("AGENT_CORE_URL", None)
+            else:
+                os.environ["AGENT_CORE_URL"] = previous_url
+            if previous_ca is None:
+                os.environ.pop("AGENT_CORE_CA_CERT", None)
+            else:
+                os.environ["AGENT_CORE_CA_CERT"] = previous_ca
+            ssl.create_default_context = original_create_default_context
+            urllib_request.urlopen = original_urlopen
+
+        self.assertEqual(
+            ["/opt/phanthy-motus/data/certs/cert.pem"],
+            cafiles,
+        )
+        self.assertTrue(contexts[0].check_hostname)
+        self.assertEqual(ssl.CERT_REQUIRED, contexts[0].verify_mode)
+        self.assertEqual("https://phanthy-motus:15678/api/acp/complete", requests[0][0])
+
     def test_gesture_uses_validated_real_device_trajectories(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
         plan.start()
@@ -1511,6 +1560,12 @@ class DevicePluginContractTests(unittest.TestCase):
             hashlib.sha256(startup_beep.read_bytes()).hexdigest(),
         )
         self.assertIn("COPY resource/ /work/resource/", dockerfile)
+        self.assertIn(
+            "e634d402feeead175e7a669a77fa8d6aa5770e162fbd3c867503d4897dc2f166  "
+            "/work/resource/startup_beep.pcm",
+            dockerfile,
+        )
+        self.assertIn("sha256sum -c -", dockerfile)
         self.assertNotIn("STARTUP_BEEP_URL", dockerfile)
         self.assertNotIn("raw.githubusercontent.com", dockerfile)
 
