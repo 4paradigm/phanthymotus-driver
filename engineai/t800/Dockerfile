@@ -76,6 +76,8 @@ COPY main.py device.py control.py native_sdk.py virtual_gamepad.py config.yaml d
 # 与 unitree/g1 一致：开机音作为小型规范资源随 driver 构建上下文打包，
 # 不依赖运行时或镜像构建时的外部网络。
 COPY resource/ /work/resource/
+RUN echo "e634d402feeead175e7a669a77fa8d6aa5770e162fbd3c867503d4897dc2f166  /work/resource/startup_beep.pcm" \
+    | sha256sum -c -
 # aplay 默认设备经 PulseAudio 路由（官方音量接口 pactl 才能作用于播放输出，
 # 且避免 ALSA dmix 默认 ~341ms 大缓冲带来的流式播放延迟）
 COPY resource/asound.conf /etc/asound.conf

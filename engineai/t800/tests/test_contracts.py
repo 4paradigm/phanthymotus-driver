@@ -316,6 +316,15 @@ class VendoredContractTests(unittest.TestCase):
         self.assertIn("<OutputFile>/dev/null</OutputFile></Tracing>", dockerfile)
         self.assertIn("NetworkInterface name='${NETWORK_INTERFACE:-eth1}'", dockerfile)
 
+    def test_acp_uses_agent_core_certificate_and_matching_hostname(self):
+        service = (ROOT / "deploy" / "service.yml").read_text()
+        self.assertIn('"phanthy-motus:127.0.0.1"', service)
+        self.assertIn("AGENT_CORE_URL=https://phanthy-motus:15678", service)
+        self.assertIn(
+            "AGENT_CORE_CA_CERT=/opt/phanthy-motus/data/certs/cert.pem",
+            service,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

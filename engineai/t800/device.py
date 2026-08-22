@@ -91,20 +91,28 @@ def _t800_acp_notify(action_id: str, status: str, result: dict, tool: str) -> No
     """Post asynchronous actuator completion to Agent Core."""
     import os as _os
     import ssl
+    import urllib.parse
     import urllib.request
 
-    agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
-    context = ssl.create_default_context()
-    context.check_hostname = False
-    context.verify_mode = ssl.CERT_NONE
-    payload = json.dumps({
-        "action_id": action_id,
-        "status": status,
-        "result": result,
-        "tool": tool,
-        "ts": time.time(),
-    }).encode()
+    agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://phanthy-motus:15678")
+    ca_cert = _os.environ.get("AGENT_CORE_CA_CERT")
     try:
+        parsed_url = urllib.parse.urlparse(agent_core_url)
+        if parsed_url.scheme not in ("http", "https"):
+            raise ValueError("AGENT_CORE_URL must use http or https")
+        if (
+            parsed_url.scheme == "http"
+            and parsed_url.hostname not in ("localhost", "127.0.0.1", "::1")
+        ):
+            raise ValueError("unencrypted AGENT_CORE_URL is only allowed on loopback")
+        context = ssl.create_default_context(cafile=ca_cert or None)
+        payload = json.dumps({
+            "action_id": action_id,
+            "status": status,
+            "result": result,
+            "tool": tool,
+            "ts": time.time(),
+        }).encode()
         request = urllib.request.Request(
             f"{agent_core_url}/api/acp/complete",
             data=payload,
@@ -2985,44 +2993,7 @@ class GesturePlugin:
     @staticmethod
     def _acp_notify(action_id: str, status: str, result: dict) -> None:
         """Report asynchronous gesture completion to Agent Core."""
-        import json as _json
-        import os as _os
-        import ssl as _ssl
-        import urllib.parse as _urlparse
-        import urllib.request as _urllib
-
-        agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
-        ca_cert = _os.environ.get("AGENT_CORE_CA_CERT")
-        try:
-            parsed_url = _urlparse.urlparse(agent_core_url)
-            if parsed_url.scheme not in ("http", "https"):
-                raise ValueError("AGENT_CORE_URL must use http or https")
-            if (
-                parsed_url.scheme == "http"
-                and parsed_url.hostname not in ("localhost", "127.0.0.1", "::1")
-            ):
-                raise ValueError("unencrypted AGENT_CORE_URL is only allowed on loopback")
-            context = _ssl.create_default_context(cafile=ca_cert or None)
-            payload = _json.dumps({
-                "action_id": action_id,
-                "status": status,
-                "result": result,
-                "tool": "gesture",
-                "ts": time.time(),
-            }).encode()
-            request = _urllib.Request(
-                f"{agent_core_url}/api/acp/complete",
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            _urllib.urlopen(
-                request,
-                timeout=GesturePlugin._ACP_CALLBACK_TIMEOUT_SEC,
-                context=context,
-            )
-        except Exception as exc:
-            print(f"[gesture] ACP callback failed for {action_id}: {exc}", flush=True)
+        _t800_acp_notify(action_id, status, result, "gesture")
 
 
 class _JointStreamBase:
