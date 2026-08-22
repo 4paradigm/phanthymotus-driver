@@ -102,6 +102,37 @@ For `multiInstance: true` tools, `scope` determines whether a config field is se
 }
 ```
 
+#### Marking sensitive fields (`x-sensitive`)
+
+Canvas configuration is packaged into shareable **Solutions** (Agent Core's
+`/api/solutions/pack`), which are uploaded to the Resource Center marketplace.
+Packaging blanks out sensitive values, but it can only do that for fields the
+tool **declares** as sensitive — there is no field-name blocklist, because a
+guessing heuristic would both miss real secrets and wrongly clear innocent
+fields. A field counts as sensitive when either holds:
+
+| Declaration | Also does |
+|-------------|-----------|
+| `"format": "password"` | Frontend renders a masked password input |
+| `"x-sensitive": true`  | Nothing visually — use when the field must stay visible while typing |
+
+```python
+"configSchema": {
+    "type": "object",
+    "properties": {
+        "api_key":     {"type": "string", "format": "password"},        # masked + never packaged
+        "device_token":{"type": "string", "x-sensitive": True},         # visible + never packaged
+        "endpoint":    {"type": "string"},                             # packaged as-is
+    },
+}
+```
+
+Anything you don't mark is packaged verbatim and becomes readable by everyone
+who downloads the solution. Mark every credential, token, license key, private
+endpoint and personal identifier. Fields that were blanked are reported to the
+loading user as "needs configuration", so marking a field does not break the
+solution — it just makes the recipient fill in their own value.
+
 ---
 
 ## x-action-params Specification

@@ -91,6 +91,22 @@ Tool naming convention: `{device}_{action}` (e.g., `loco_move`, `mic_start`, `ar
 3. Test the driver locally with a running Agent Core instance
 4. Submit a PR with a clear description
 
+### Review Checklist
+
+Reviewers should confirm each of these before approving a driver change:
+
+- [ ] **Sensitive config fields are declared.** Every `configSchema` property holding
+      a credential, token, license key, private endpoint or personal identifier
+      declares `"format": "password"` or `"x-sensitive": true`. Canvas config is
+      packaged into shareable Solutions and uploaded to the Resource Center;
+      packaging can only blank what the tool declares, so an unmarked secret is
+      published in clear text. See [README_dev.md](README_dev.md#marking-sensitive-fields-x-sensitive).
+- [ ] `dispatch()` returns a plain dict, never a pre-wrapped `[{"type": "text", ...}]`
+- [ ] Per-instance state is guarded per the concurrency rules (`tools/call` runs on
+      its own thread); `stop` can cancel a concurrent `start`
+- [ ] `topic_out[].format` matches the intended dashboard renderer
+- [ ] Actuator tools are actuator-typed, so Agent Core's safety confirmation applies
+
 ## Code Style
 
 - Python: Follow PEP 8, use type hints where practical
