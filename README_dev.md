@@ -115,6 +115,7 @@ fields. A field counts as sensitive when either holds:
 |-------------|-----------|
 | `"format": "password"` | Frontend renders a masked password input |
 | `"x-sensitive": true`  | Nothing visually — use when the field must stay visible while typing |
+| `"x-sensitive": false` | Opts **out** of packaging redaction even though `format: password` masks it |
 
 ```python
 "configSchema": {
@@ -122,10 +123,18 @@ fields. A field counts as sensitive when either holds:
     "properties": {
         "api_key":     {"type": "string", "format": "password"},        # masked + never packaged
         "device_token":{"type": "string", "x-sensitive": True},         # visible + never packaged
+        # Fixed factory password — masked in the UI, but not a user secret. Blanking it
+        # would only make the recipient retype the same default.
+        "ssh_pass":    {"type": "string", "format": "password", "x-sensitive": False},
         "endpoint":    {"type": "string"},                             # packaged as-is
     },
 }
 ```
+
+`format: password` defaults to sensitive on purpose — an unmarked password box is
+assumed to be a real secret, so drivers written before this convention stay safe.
+Use `"x-sensitive": false` only when the value is a fixed, publicly documented
+default; if an operator can put a real credential in that field, leave it sensitive.
 
 Anything you don't mark is packaged verbatim and becomes readable by everyone
 who downloads the solution. Mark every credential, token, license key, private
