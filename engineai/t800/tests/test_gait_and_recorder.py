@@ -3,6 +3,7 @@
 import importlib.util
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -715,6 +716,58 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
             if publisher.topic == "/motion/joint_override_command"
         )
         self.assertEqual(0.0, publisher.messages[-1].weight)
+
+    def test_new_play_waits_until_blocked_previous_worker_is_cancelled(self):
+        current = self._make_joint_state()
+        current.position = [0.0] * 25
+        current.velocity = [0.0] * 25
+        self.plugin._on_joint_state(current)
+        self.plugin._frames = [
+            {"timestamp": 0, "positions": [0.0] * 25, "velocities": [0.0] * 25},
+            {"timestamp": 2000, "positions": [0.5] * 25, "velocities": [0.0] * 25},
+        ]
+        publisher = next(
+            publisher
+            for publisher in self.plugin._node.publishers
+            if publisher.topic == "/motion/joint_override_command"
+        )
+        publish_started = threading.Event()
+        release_publish = threading.Event()
+        original_publish = publisher.publish
+        blocked_once = False
+
+        def block_first_override(message):
+            nonlocal blocked_once
+            if message.weight == 1.0 and not blocked_once:
+                blocked_once = True
+                publish_started.set()
+                release_publish.wait(timeout=3.0)
+            original_publish(message)
+
+        publisher.publish = block_first_override
+        first = self.plugin.dispatch("play", {})
+        self.assertTrue(publish_started.wait(timeout=1.0))
+
+        try:
+            stopped = self.plugin.dispatch("stop_playback", {})
+            rejected = self.plugin.dispatch("play", {})
+            self.assertEqual("stopping", stopped["state"])
+            self.assertIn("previous playback is still stopping", rejected["error"])
+        finally:
+            release_publish.set()
+
+        deadline = time.monotonic() + 1.0
+        while self.plugin.dispatch("status", {})["playing"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(any(
+            call[0] == first["action_id"] and call[1] == "cancelled"
+            for call in self.acp_calls
+        ))
+
+        restarted = self.plugin.dispatch("play", {})
+        self.assertEqual("playing", restarted["state"])
+        self.assertNotEqual(first["action_id"], restarted["action_id"])
+        self.plugin.dispatch("stop_playback", {})
 
     def test_recording_auto_stops_if_motion_mode_changes(self):
         state = FakeMotionState(current="lower_body_balance", available=["pd_stand"])
