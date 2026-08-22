@@ -6,6 +6,9 @@ plugins:
     enabled: true
   loco:
     enabled: true
+    # Persistent recording ID/name directory. The deployment mounts
+    # /opt/phanthy-motus/data from the robot host, so it survives container and robot restarts.
+    recording_registry_path: /opt/phanthy-motus/data/noetix/bumi/action_recordings.json
   mic:
     enabled: true
   speaker:
