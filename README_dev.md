@@ -102,6 +102,50 @@ For `multiInstance: true` tools, `scope` determines whether a config field is se
 }
 ```
 
+#### Marking sensitive fields (`x-sensitive`)
+
+Canvas configuration is packaged into shareable **Solutions** (Agent Core's
+`/api/solutions/pack`), which are uploaded to the Resource Center marketplace.
+Packaging blanks out sensitive values, but it can only do that for fields the
+tool **declares** as sensitive — there is no field-name blocklist, because a
+guessing heuristic would both miss real secrets and wrongly clear innocent
+fields. A field counts as sensitive when either holds:
+
+| Declaration | Also does |
+|-------------|-----------|
+| `"format": "password"` | Frontend renders a masked password input |
+| `"x-sensitive": true`  | Nothing visually — use when the field must stay visible while typing |
+| `"x-sensitive": false` | Opts **out** of packaging redaction even though `format: password` masks it |
+
+```python
+"configSchema": {
+    "type": "object",
+    "properties": {
+        "api_key":     {"type": "string", "format": "password"},        # masked + never packaged
+        "device_token":{"type": "string", "x-sensitive": True},         # visible + never packaged
+        # Fixed factory password — masked in the UI, but not a user secret. Blanking it
+        # would only make the recipient retype the same default.
+        "ssh_pass":    {"type": "string", "format": "password", "x-sensitive": False},
+        "endpoint":    {"type": "string"},                             # packaged as-is
+    },
+}
+```
+
+`format: password` defaults to sensitive on purpose — an unmarked password box is
+assumed to be a real secret, so drivers written before this convention stay safe.
+Use `"x-sensitive": false` only when the value is a fixed, publicly documented
+default; if an operator can put a real credential in that field, leave it sensitive.
+
+Anything you don't mark is packaged verbatim and becomes readable by everyone
+who downloads the solution. Mark every credential, token, license key, private
+endpoint and personal identifier. Fields that were blanked are reported to the
+loading user as "needs configuration", so marking a field does not break the
+solution — it just makes the recipient fill in their own value.
+
+Two formats are cleared automatically and need no marking, because their values
+only mean something on the machine they were set on: `channel-select` (a local
+channel id) and `audio-input-device` (a local sound-card device).
+
 ---
 
 ## x-action-params Specification
