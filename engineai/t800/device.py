@@ -5582,6 +5582,7 @@ class MotionRecorderPlugin:
         # Playback state
         self._playback_thread: threading.Thread | None = None
         self._playback_stop = threading.Event()
+        self._playback_generation = 0
         self._playing = False
         self._playback_label = ""
         self._playback_frame = 0
@@ -5745,8 +5746,8 @@ class MotionRecorderPlugin:
             return self._status()
         if action == "stop":
             recording_result = self._finalize_recording(stop_reason="lifecycle")
-            self._playback_stop.set()
-            result = {"state": "idle"}
+            playback_result = self._stop_playback()
+            result = {"state": "idle", "playback_result": playback_result}
             if recording_result.get("state") == "saved":
                 result["recording_result"] = recording_result
             return result
@@ -5937,6 +5938,11 @@ class MotionRecorderPlugin:
         if gate_error:
             return gate_error
         with self._lock:
+            active_thread = self._playback_thread
+            if active_thread is not None and active_thread.is_alive():
+                if self._playback_stop.is_set():
+                    return {"error": "previous playback is still stopping"}
+                return {"error": "already playing; stop first"}
             if self._playing:
                 return {"error": "already playing; stop first"}
             if self._recording:
@@ -5979,10 +5985,20 @@ class MotionRecorderPlugin:
             )
         except (TypeError, ValueError) as exc:
             return {"error": f"invalid recording: {exc}"}
-        self._playback_stop.clear()
         action_id = f"t800_motion_play_{uuid4().hex[:12]}"
 
         with self._lock:
+            active_thread = self._playback_thread
+            if active_thread is not None and active_thread.is_alive():
+                if self._playback_stop.is_set():
+                    return {"error": "previous playback is still stopping"}
+                return {"error": "already playing; stop first"}
+            if self._playing:
+                return {"error": "already playing; stop first"}
+            self._playback_generation += 1
+            generation = self._playback_generation
+            stop_event = threading.Event()
+            self._playback_stop = stop_event
             self._playing = True
             self._playback_label = label
             self._playback_frame = 0
@@ -5995,7 +6011,7 @@ class MotionRecorderPlugin:
                 period = 1.0 / self._playback_rate_hz
                 deadline = time.monotonic()
                 for i, (position, velocity) in enumerate(samples):
-                    if self._playback_stop.is_set():
+                    if stop_event.is_set():
                         break
                     mode_error = self._lower_body_balance_error("playback")
                     if mode_error:
@@ -6004,15 +6020,19 @@ class MotionRecorderPlugin:
                     if now - deadline > period:
                         deadline = now
                     wait_time = deadline - time.monotonic()
-                    if wait_time > 0 and self._playback_stop.wait(wait_time):
+                    if wait_time > 0 and stop_event.wait(wait_time):
                         break
 
                     with self._lock:
+                        if generation != self._playback_generation:
+                            break
                         self._playback_frame = min(
                             len(frames) - 1,
                             int(i * len(frames) / max(1, len(samples))),
                         )
                         self._playback_label = label
+                    if stop_event.is_set():
+                        break
                     self._publish_override(position, velocity, weight=1.0)
                     published += 1
                     deadline += period
@@ -6020,21 +6040,26 @@ class MotionRecorderPlugin:
                 with self._lock:
                     self._last_playback_error = str(exc)
             finally:
+                with self._lock:
+                    owns_generation = generation == self._playback_generation
                 try:
-                    self._publish_override_release()
+                    if owns_generation:
+                        self._publish_override_release()
                 finally:
                     with self._lock:
-                        if published:
+                        owns_generation = generation == self._playback_generation
+                        if owns_generation and published:
                             self._needs_reset = True
                             self._reset_request_id = None
-                        self._playing = False
-                        self._playback_label = ""
+                        if owns_generation:
+                            self._playing = False
+                            self._playback_label = ""
                         error = self._last_playback_error
-                        if self._playback_action_id == action_id:
+                        if owns_generation and self._playback_action_id == action_id:
                             self._playback_action_id = None
                     completion = (
                         "cancelled"
-                        if self._playback_stop.is_set()
+                        if stop_event.is_set()
                         else ("error" if error else "completed")
                     )
                     self._acp_notify(action_id, completion, {
@@ -6091,22 +6116,29 @@ class MotionRecorderPlugin:
                 self._last_playback_error = str(exc)
 
     def _stop_playback(self) -> dict:
-        self._playback_stop.set()
         with self._lock:
+            stop_event = self._playback_stop
             was_playing = self._playing
             frame = self._playback_frame
             thread = self._playback_thread
+        stop_event.set()
         if (
             thread is not None
             and thread is not threading.current_thread()
             and thread.is_alive()
         ):
             thread.join(timeout=1.0)
+        still_stopping = thread is not None and thread.is_alive()
         with self._lock:
-            self._playing = False
+            if not still_stopping and thread is self._playback_thread:
+                self._playing = False
         self._publish_override_release()
         return {
-            "state": "stopped" if was_playing else "idle",
+            "state": (
+                "stopping"
+                if was_playing and still_stopping
+                else ("stopped" if was_playing else "idle")
+            ),
             "frames_played": frame,
         }
 
