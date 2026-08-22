@@ -6,8 +6,6 @@ FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
 ARG ROS_APT_MIRROR
 ARG UBUNTU_APT_MIRROR
-ARG STARTUP_BEEP_URL=https://raw.githubusercontent.com/4paradigm/phanthymotus-driver/9935a6533a1c1b4842826f8eead47086c0bd6f39/unitree/g1/resource/startup_beep.pcm
-ARG STARTUP_BEEP_SHA256=e634d402feeead175e7a669a77fa8d6aa5770e162fbd3c867503d4897dc2f166
 
 WORKDIR /work
 
@@ -75,11 +73,9 @@ RUN echo "[t800] checking ROS interface build dependencies" && \
 
 COPY common/ /work/common/
 COPY main.py device.py control.py native_sdk.py virtual_gamepad.py config.yaml driver.yaml controlled_spatial_map.py /work/
+# 与 unitree/g1 一致：开机音作为小型规范资源随 driver 构建上下文打包，
+# 不依赖运行时或镜像构建时的外部网络。
 COPY resource/ /work/resource/
-# 启动音复用仓库已有的规范资源，不在每个 driver 目录重复提交二进制。
-# URL 可在构建时切换到 COS；固定 SHA-256 防止下载内容静默变化。
-RUN STARTUP_BEEP_URL="${STARTUP_BEEP_URL}" STARTUP_BEEP_SHA256="${STARTUP_BEEP_SHA256}" \
-    python3 -c 'import hashlib, os, pathlib, urllib.request; data = urllib.request.urlopen(os.environ["STARTUP_BEEP_URL"], timeout=30).read(); actual = hashlib.sha256(data).hexdigest(); expected = os.environ["STARTUP_BEEP_SHA256"]; assert actual == expected, f"startup beep sha256 mismatch: {actual}"; pathlib.Path("/work/resource/startup_beep.pcm").write_bytes(data)'
 # aplay 默认设备经 PulseAudio 路由（官方音量接口 pactl 才能作用于播放输出，
 # 且避免 ALSA dmix 默认 ~341ms 大缓冲带来的流式播放延迟）
 COPY resource/asound.conf /etc/asound.conf
@@ -95,8 +91,9 @@ RUN . /opt/ros/humble/setup.sh && \
 ENV T800_PREFERRED_RMW=rmw_cyclonedds_cpp
 ENV ROS_LOCALHOST_ONLY=0
 ENV PYTHONUNBUFFERED=1
+ENV RCUTILS_COLORIZED_OUTPUT=0
 ENV PYTHONPATH=/work
 
 EXPOSE 15708
 
-CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && source /t800_ws/install/setup.bash && if [ -n \"${RMW_IMPLEMENTATION:-}\" ] && ! ros2 pkg prefix \"${RMW_IMPLEMENTATION}\" >/dev/null 2>&1; then echo \"[t800] ignoring unavailable RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION}\"; unset RMW_IMPLEMENTATION; fi && if [ -n \"${T800_PREFERRED_RMW:-}\" ] && ros2 pkg prefix \"${T800_PREFERRED_RMW}\" >/dev/null 2>&1; then export RMW_IMPLEMENTATION=\"${T800_PREFERRED_RMW}\"; fi && if [ -z \"${CYCLONEDDS_URI:-}\" ]; then export CYCLONEDDS_URI=\"<CycloneDDS><Domain><General><Interfaces><NetworkInterface name='${NETWORK_INTERFACE:-eth1}'/></Interfaces></General></Domain></CycloneDDS>\"; fi && exec python3 /work/main.py"]
+CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && source /t800_ws/install/setup.bash && if [ -n \"${RMW_IMPLEMENTATION:-}\" ] && ! ros2 pkg prefix \"${RMW_IMPLEMENTATION}\" >/dev/null 2>&1; then echo \"[t800] ignoring unavailable RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION}\"; unset RMW_IMPLEMENTATION; fi && if [ -n \"${T800_PREFERRED_RMW:-}\" ] && ros2 pkg prefix \"${T800_PREFERRED_RMW}\" >/dev/null 2>&1; then export RMW_IMPLEMENTATION=\"${T800_PREFERRED_RMW}\"; fi && if [ -z \"${CYCLONEDDS_URI:-}\" ]; then export CYCLONEDDS_URI=\"<CycloneDDS><Domain><General><Interfaces><NetworkInterface name='${NETWORK_INTERFACE:-eth1}'/></Interfaces></General><Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>\"; fi && exec python3 /work/main.py"]

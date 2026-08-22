@@ -309,6 +309,13 @@ class VendoredContractTests(unittest.TestCase):
         deploy_text = (ROOT / "deploy" / "service.yml").read_text()
         self.assertNotIn("RMW_IMPLEMENTATION=rmw_cyclonedds_cpp", deploy_text)
 
+    def test_cyclonedds_container_logs_are_muzzled_without_losing_interface_selection(self):
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        self.assertIn("ENV RCUTILS_COLORIZED_OUTPUT=0", dockerfile)
+        self.assertIn("<Tracing><Verbosity>severe</Verbosity>", dockerfile)
+        self.assertIn("<OutputFile>/dev/null</OutputFile></Tracing>", dockerfile)
+        self.assertIn("NetworkInterface name='${NETWORK_INTERFACE:-eth1}'", dockerfile)
+
 
 if __name__ == "__main__":
     unittest.main()

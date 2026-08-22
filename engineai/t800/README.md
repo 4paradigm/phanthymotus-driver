@@ -117,6 +117,13 @@ Sobel 边缘抑制和最近邻上采样均由众擎节点完成。使用 `depth`
 utterance 结束的 8 字节 EOF magic），driver 只负责流式播放。镜像已含
 `alsa-utils`；容器经 `-v /dev:/dev` 挂载声卡节点。
 
+开机音与 `unitree/g1` 使用同一份 256,000 字节 PCM 资源（SHA256
+`e634d402feeead175e7a669a77fa8d6aa5770e162fbd3c867503d4897dc2f166`），
+通过 `COPY resource/` 随 driver 镜像打包，不依赖 GitHub/COS 等外部下载。
+`alsa-utils` 提供 `aplay`，`libasound2-plugins` 提供 `/etc/asound.conf`
+所需的 PulseAudio PCM backend；构建日志确认二者不在固定的 ros-base 中，
+因此对应包体增长是该官方播放路径的必要运行时成本。
+
 实时性：镜像内置 `/etc/asound.conf` 把 ALSA 默认设备路由到宿主
 PulseAudio——这是官方「aplay 播放 + pactl 音量」模型成立的前提
 （dmix 直通硬件时 pactl 音量不作用于播放输出，且 dmix 默认 ~341ms
