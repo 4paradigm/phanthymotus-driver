@@ -1,3 +1,4 @@
+import hashlib
 import importlib.util
 import json
 import os
@@ -1500,12 +1501,18 @@ class DevicePluginContractTests(unittest.TestCase):
             calls[-1],
         )
 
-    def test_speaker_startup_asset_is_fetched_and_verified_at_image_build(self):
+    def test_speaker_startup_asset_is_packaged_like_g1_without_external_fetch(self):
         dockerfile = (ROOT / "Dockerfile").read_text()
-        self.assertIn("ARG STARTUP_BEEP_URL=", dockerfile)
-        self.assertIn("ARG STARTUP_BEEP_SHA256=", dockerfile)
-        self.assertIn("STARTUP_BEEP_SHA256", dockerfile)
-        self.assertFalse((ROOT / "resource" / "startup_beep.pcm").exists())
+        startup_beep = ROOT / "resource" / "startup_beep.pcm"
+        self.assertTrue(startup_beep.is_file())
+        self.assertEqual(256000, startup_beep.stat().st_size)
+        self.assertEqual(
+            "e634d402feeead175e7a669a77fa8d6aa5770e162fbd3c867503d4897dc2f166",
+            hashlib.sha256(startup_beep.read_bytes()).hexdigest(),
+        )
+        self.assertIn("COPY resource/ /work/resource/", dockerfile)
+        self.assertNotIn("STARTUP_BEEP_URL", dockerfile)
+        self.assertNotIn("raw.githubusercontent.com", dockerfile)
 
     def test_speaker_aplay_exit_sets_error(self):
         plugin = self.device.SpeakerPlugin(CONFIG, "robot", self.ros)
