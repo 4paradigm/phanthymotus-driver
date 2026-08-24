@@ -253,7 +253,6 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
     # travel direction instead of reusing the wider manual-motion cone.
     nav_stop_threshold = config.get("nav_stop_threshold", stop_threshold)
     nav_cone_half_angle = math.radians(config.get("nav_cone_half_angle", 15))
-    lidar_timeout = config.get("lidar_timeout", 0.5)
     cone_half_angle = math.radians(config.get("cone_half_angle", 30))
     z_min = config.get("z_min", 0.1)
     z_max = config.get("z_max", 1.8)
@@ -273,7 +272,6 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
     lateral_obstacle = False
     nav_obstacle_dist = float("inf")
     nav_obstacle_angle = 0.0
-    last_lidar_time = 0.0
     fwd_log_n = 0
     nav_pause_reason = None
 
@@ -343,8 +341,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
 
     # ── LiDAR DDS Subscription ──
     def on_cloud(msg):
-        nonlocal obstacle_dist, obstacle_angle, lateral_obstacle, nav_obstacle_dist, nav_obstacle_angle, last_lidar_time, fwd_log_n
-        last_lidar_time = time.monotonic()
+        nonlocal obstacle_dist, obstacle_angle, lateral_obstacle, nav_obstacle_dist, nav_obstacle_angle, fwd_log_n
 
         # Get heading
         if state == MotionState.MOVING and current_cmd:
@@ -897,14 +894,6 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
             nav_dist = nav_obstacle_dist
             nav_angle = nav_obstacle_angle
 
-        lidar_age = time.monotonic() - last_lidar_time
-        if state == MotionState.NAVIGATING and lidar_age > lidar_timeout:
-            if speed_zone != SpeedZone.STOPPED:
-                speed_zone = SpeedZone.STOPPED
-                print(f"[SmartMotion:nav_safety] PAUSE — LiDAR stale for {lidar_age:.2f}s", flush=True)
-                handle_pause_nav("lidar_timeout")
-            return
-
         if state == MotionState.MOVING:
             cmd = current_cmd  # snapshot to avoid race condition
             if dist <= stop_threshold:
@@ -949,11 +938,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
 
         elif state == MotionState.NAV_PAUSED:
             # Obstacle cleared — resume navigation.
-            # A LiDAR timeout is fail-closed: only a new navigation command or
-            # explicit resume may clear it. Do not let one intermittent frame
-            # restart the robot.
             if (nav_pause_reason == "obstacle"
-                    and lidar_age <= lidar_timeout
                     and nav_dist > decel_threshold):
                 try:
                     code, _ = slam_client.ResumeNav()

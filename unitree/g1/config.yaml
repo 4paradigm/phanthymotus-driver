@@ -51,7 +51,6 @@ safety_harness:
   # in this narrower cone pauses the route.
   nav_stop_threshold: 0.35
   nav_cone_half_angle: 15
-  lidar_timeout: 0.5
   cone_half_angle: 30
   z_min: 0.1
   z_max: 1.0
