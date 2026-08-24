@@ -816,11 +816,23 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
         return {"status": "stopped", "state": state.value}
 
     def handle_pause_nav(reason_str):
-        nonlocal state, nav_pause_reason
+        nonlocal state, nav_pause_reason, stop_repeat_count
         if state != MotionState.NAVIGATING:
             return {"error": f"Cannot pause nav: state is {state.value}"}
-        code, _ = slam_client.PauseNav()
-        if code == 0:
+        # mode=0 lets the SLAM service drive the body directly.  PauseNav alone
+        # updates its route state but is not a sufficiently prompt physical
+        # brake on all G1 firmware versions, so always stop the locomotion
+        # controller as part of a local obstacle pause.
+        try:
+            code, _ = slam_client.PauseNav()
+        except Exception:
+            code = -1
+        try:
+            loco_client.StopMove()
+            stop_repeat_count = 3
+        except Exception:
+            pass
+        if code == 0 or reason_str == "obstacle":
             state = MotionState.NAV_PAUSED
             nav_pause_reason = reason_str
         event_data = {"reason": reason_str}
@@ -828,16 +840,20 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
             with obstacle_lock:
                 event_data["obstacle_distance"] = round(obstacle_dist, 2)
         publish_event("nav_paused", event_data)
-        return {"status": "paused"} if code == 0 else {"error": f"PauseNav failed, code={code}"}
+        return {"status": "paused"} if code == 0 else {
+            "status": "paused",
+            "warning": f"PauseNav failed, code={code}; local StopMove applied",
+        }
 
     def handle_resume_nav():
-        nonlocal state, nav_pause_reason
+        nonlocal state, nav_pause_reason, stop_repeat_count
         if state != MotionState.NAV_PAUSED:
             return {"error": f"Cannot resume nav: state is {state.value}"}
         code, _ = slam_client.ResumeNav()
         if code == 0:
             state = MotionState.NAVIGATING
             nav_pause_reason = None
+            stop_repeat_count = 0
         publish_event("nav_resumed", {})
         return {"status": "resumed"} if code == 0 else {"error": f"ResumeNav failed, code={code}"}
 
@@ -858,7 +874,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
 
     # ── Safety checks (inline in main loop) ──
     def process_safety_checks():
-        nonlocal state, speed_zone, nav_pause_reason
+        nonlocal state, speed_zone, nav_pause_reason, stop_repeat_count
 
         # 1. Communication timeout
         with safety_lock:
@@ -948,6 +964,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
                     state = MotionState.NAVIGATING
                     speed_zone = SpeedZone.NORMAL
                     nav_pause_reason = None
+                    stop_repeat_count = 0
                     publish_event("nav_resumed", {})
                     print(f"[SmartMotion:nav_obstacle] RESUME NAV — "
                           f"dist={dist:.2f}m, obstacle cleared", flush=True)
@@ -1028,7 +1045,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
             process_safety_checks()
 
             # Repeat StopMove after emergency_stop to ensure controller receives it
-            if stop_repeat_count > 0 and state == MotionState.IDLE:
+            if stop_repeat_count > 0 and state in (MotionState.IDLE, MotionState.NAV_PAUSED):
                 loco_client.StopMove()
                 stop_repeat_count -= 1
 
