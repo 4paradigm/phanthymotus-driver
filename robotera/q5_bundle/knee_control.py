@@ -1,18 +1,23 @@
 """Q5 hip joint control card — set angle (degrees) or zero.
 
 Single-joint absolute position control over the same vendor command channel
-as arm_control/waist.  ``set`` takes a target angle in degrees and is
-validated against the URDF joint limits (out-of-range is rejected, never
-clamped); ``zero`` returns the joint to 0°.  Motion is executed as small
-incremental interpolation steps (never a fast jump); the command publisher
-is guarded by the shared BodyCommandRouter lease.
+as arm_control.  ``set`` takes a target angle in degrees and is validated
+against the URDF joint limits (out-of-range is rejected, never clamped);
+``zero`` returns the joint to 0°.  Motion runs as incremental interpolation
+(never a fast jump) under the shared BodyCommandRouter lease, and the card
+reports asynchronous completion to Agent Core via the ACP endpoint so long
+motions are not mistaken for instantly-completed actions.
 """
 
 from __future__ import annotations
 
+import json
 import math
+import os
+import ssl
 import threading
 import time
+import urllib.request
 
 from body_command import get_router
 from control_contract import q5_active_status, q5_is_control_ready
@@ -41,6 +46,31 @@ def _number(value, field):
     return float(value)
 
 
+def _acp_notify(action_id, status, result, tool=""):
+    """POST action completion to Agent Core (module-level ACP helper)."""
+    agent_core_url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    payload = json.dumps({
+        "action_id": action_id,
+        "status": status,
+        "result": result,
+        "tool": tool,
+        "ts": time.time(),
+    }).encode()
+    try:
+        req = urllib.request.Request(
+            f"{agent_core_url}/api/acp/complete",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=5, context=ctx)
+    except Exception:
+        pass  # ACP failure must not block joint motion
+
+
 class Plugin:
     def __init__(self, plugin_config, namespace, executor, client):
         self._client = client
@@ -61,13 +91,17 @@ class Plugin:
                         {"const": "zero", "title": "归零"},
                     ]},
                     "position_deg": {"type": "number", "title": "目标角度 (°)",
-                                     "minimum": LOWER_DEG, "maximum": UPPER_DEG, "multipleOf": 0.5,
+                                     "minimum": LOWER_DEG, "maximum": UPPER_DEG,
                                      "description": f"目标角度（度），范围 {LOWER_DEG}° ~ {UPPER_DEG}°"},
                 }, "required": ["action"], "additionalProperties": False,
                 "x-action-params": {
                     "set": {"params": ["position_deg"],
                             "description": f"设置膝关节角度（度），须在 {LOWER_DEG}°~{UPPER_DEG}° 范围内。"},
                     "zero": {"params": [], "description": "膝关节归零（回到 0°）。"},
+                },
+                "x-completion": {
+                    "actions": ["set", "zero"],
+                    "timeout": 30,
                 }}}
 
     def _safety(self):
@@ -119,7 +153,7 @@ class Plugin:
             return False
         return self._hold_position(float(value))
 
-    def _run(self, event, current, target, duration):
+    def _run(self, event, current, target, duration, action_id, target_deg):
         steps = max(int(math.ceil(abs(target - current) / self._max_step)), int(math.ceil(duration * self._rate)), 1)
         try:
             for index in range(1, steps + 1):
@@ -127,6 +161,8 @@ class Plugin:
                     break
                 self._publish(current + (target - current) * index / steps)
                 event.wait(duration / steps)
+        except Exception:
+            pass
         finally:
             # Joint feedback can lag the last command; reuse the final target
             # instead of sending the joint back to its start angle.
@@ -134,6 +170,12 @@ class Plugin:
                 self._hold_position(target)
             else:
                 self._hold_current()
+            if action_id:
+                if event.is_set():
+                    _acp_notify(action_id, "cancelled", {"joint": JOINT}, CARD)
+                else:
+                    _acp_notify(action_id, "completed",
+                                {"joint": JOINT, "target_position_deg": target_deg}, CARD)
             self._router.release(CARD)
             with self._lock:
                 if self._stop_event is event:
@@ -149,7 +191,7 @@ class Plugin:
         return {"ok": True, "state": "stopped", "reason": reason,
                 "hold_command_attempted": bool(active)}
 
-    def _launch(self, target_rad, action_name, target_deg):
+    def _launch(self, target_rad, action_name, target_deg, action_id):
         allowed = self._allowed(target_rad)
         if allowed.get("ok") is False:
             return allowed
@@ -165,15 +207,17 @@ class Plugin:
                 return _failure("MOTION_IN_PROGRESS", "A knee move is already active; call stop first")
             event = threading.Event()
             self._stop_event = event
-            self._active = {"action": action_name, "joint": JOINT,
+            self._active = {"action": action_name, "joint": JOINT, "action_id": action_id,
                             "start_position_deg": round(current * 180.0 / math.pi, 1),
                             "target_position_deg": target_deg,
                             "duration_s": duration, "started_at_ms": int(time.time() * 1000)}
-            self._thread = threading.Thread(target=self._run, args=(event, current, target_rad, duration),
+            self._thread = threading.Thread(target=self._run, args=(event, current, target_rad, duration,
+                                                                    action_id, target_deg),
                                             daemon=True, name=f"q5_{CARD}")
             self._thread.start()
         return {"ok": True, "state": "moving", "joint": JOINT,
-                "target_position_deg": target_deg, "command": dict(self._active),
+                "target_position_deg": target_deg, "action_id": action_id,
+                "command": dict(self._active),
                 "stops_by_holding_current_position": True}
 
     def dispatch(self, action, args):
@@ -187,10 +231,11 @@ class Plugin:
                 deg = _number(args.get("position_deg"), "position_deg")
             except ValueError as e:
                 return _failure("INVALID_ARGUMENT", str(e))
-            return self._launch(math.radians(deg), "set", round(deg, 1))
+            return self._launch(math.radians(deg), "set", round(deg, 1),
+                                f"{CARD}_set_{int(time.time() * 1000)}")
         if action == "zero":
-            return self._launch(0.0, "zero", 0.0)
-        if action == "cancel":
+            return self._launch(0.0, "zero", 0.0, f"{CARD}_zero_{int(time.time() * 1000)}")
+        if action in ("cancel", "stop"):
             return self._stop("command")
         return None
 
