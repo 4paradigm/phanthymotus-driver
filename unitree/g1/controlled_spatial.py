@@ -502,7 +502,13 @@ class ControlledSpatialPlugin:
 
     # ── ACP completion thread ────────────────────────────────────────────────
 
-    def _acp_wait_nav(self, action_id: str, target: str, stall_timeout: float = 90):
+    def _acp_wait_nav(
+        self,
+        action_id: str,
+        target: str,
+        stall_timeout: float = 90,
+        target_pose: dict | None = None,
+    ):
         """Wait for navigation to complete, then fire ACP callback."""
         self._nav_action_id = action_id
         t0 = time.time()
@@ -555,9 +561,26 @@ class ControlledSpatialPlugin:
                     _acp_notify(action_id, "completed", {
                         "target": target, "pose": pose, "elapsed": elapsed,
                     })
+                if self._nav_action_id == action_id:
+                    self._nav_action_id = None
                 return
 
             current_pose = self._get_pose()
+            if current_pose and target_pose:
+                dx = current_pose["x"] - target_pose["x"]
+                dy = current_pose["y"] - target_pose["y"]
+                distance = math.sqrt(dx * dx + dy * dy)
+                if distance < 0.3:
+                    elapsed = round(time.time() - t0, 1)
+                    _acp_notify(action_id, "completed", {
+                        "target": target,
+                        "pose": current_pose,
+                        "distance": round(distance, 3),
+                        "elapsed": elapsed,
+                    })
+                    if self._nav_action_id == action_id:
+                        self._nav_action_id = None
+                    return
             if current_pose and last_pose:
                 dx = current_pose["x"] - last_pose["x"]
                 dy = current_pose["y"] - last_pose["y"]
@@ -577,6 +600,8 @@ class ControlledSpatialPlugin:
                     "error": f"stall_timeout ({stall_timeout}s)",
                     "elapsed": round(time.time() - t0, 1),
                 })
+                if self._nav_action_id == action_id:
+                    self._nav_action_id = None
                 return
 
             if time.time() - t0 > 180:
@@ -584,6 +609,8 @@ class ControlledSpatialPlugin:
                     "target": target, "error": "timeout_180s",
                     "elapsed": 180,
                 })
+                if self._nav_action_id == action_id:
+                    self._nav_action_id = None
                 return
 
     # ── Dispatch ─────────────────────────────────────────────────────────────
@@ -770,6 +797,7 @@ class ControlledSpatialPlugin:
                 threading.Thread(
                     target=self._acp_wait_nav,
                     args=(action_id, tag_name, float(args.get("stall_timeout", 90))),
+                    kwargs={"target_pose": {"x": poi["x"], "y": poi["y"]}},
                     daemon=True,
                 ).start()
                 return result
@@ -790,6 +818,7 @@ class ControlledSpatialPlugin:
                 threading.Thread(
                     target=self._acp_wait_nav,
                     args=(action_id, tag_name, float(args.get("stall_timeout", 90))),
+                    kwargs={"target_pose": {"x": poi["x"], "y": poi["y"]}},
                     daemon=True,
                 ).start()
                 return {"status": "navigating", "target": tag_name,
@@ -820,6 +849,7 @@ class ControlledSpatialPlugin:
                 threading.Thread(
                     target=self._acp_wait_nav,
                     args=(action_id, f"pose({x},{y})", float(args.get("stall_timeout", 90))),
+                    kwargs={"target_pose": {"x": x, "y": y}},
                     daemon=True,
                 ).start()
                 return result
@@ -837,6 +867,7 @@ class ControlledSpatialPlugin:
                 threading.Thread(
                     target=self._acp_wait_nav,
                     args=(action_id, f"pose({x},{y})", float(args.get("stall_timeout", 90))),
+                    kwargs={"target_pose": {"x": x, "y": y}},
                     daemon=True,
                 ).start()
                 return {"status": "navigating", "target_pose": {"x": x, "y": y, "yaw": yaw},
@@ -1032,4 +1063,3 @@ class ControlledSpatialIsolatedProxy:
                         return result.get("result")
             except _q.Empty:
                 return {"error": f"controlled_spatial action '{action}' timed out (120s)"}
-
