@@ -3,6 +3,16 @@
 
 from __future__ import annotations
 
+# Make every log line one atomic, control-character-free write, so concurrent
+# writers cannot tear a Docker log record. Must run before anything prints.
+try:
+    from common import logsafe
+    logsafe.install()
+except ImportError as _e:  # running outside the container image
+    import sys as _sys
+    _sys.stderr.write(f"[bundle] logsafe unavailable ({_e}); stdout unprotected\n")
+
+
 import json
 import os
 import re
@@ -160,6 +170,11 @@ class T800DeviceBundle:
                 instances[key] = instance
                 self._plugins.append(instance)
 
+        for key in ("mic", "vision"):
+            provider = instances.get(key)
+            if provider is not None and hasattr(provider, "health_sources"):
+                state.register_health_provider(key, provider.health_sources)
+
         if plugins.get("dance", {}).get("enabled", True) and "motion_mode" in instances:
             instance = DancePlugin(instances["motion_mode"], state)
             instances["dance"] = instance
@@ -306,7 +321,11 @@ def make_handler():
         def log_message(self, fmt, *args):
             msg = fmt % args
             if '"POST /mcp' not in msg or "200" not in msg:
-                print(f"[mcp] {self.address_string()} {msg}")
+                # Escape and cap: msg embeds the raw request line, which on host
+                # networking is remote-controlled bytes going straight into the
+                # Docker log framer (log injection / control-byte corruption).
+                safe = msg.encode("unicode_escape").decode("ascii")[:200]
+                print(f"[mcp] {self.address_string()} {safe}")
 
         def _send_json(self, status: int, payload: dict) -> None:
             body = json.dumps(payload, ensure_ascii=False).encode()

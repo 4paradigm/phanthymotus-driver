@@ -17,6 +17,16 @@ x-humanoid/tianyi2.0/main.py — 天轶2.0 Pro 设备 bundle 统一入口。
     SLAMTEC_URL — Slamtec底盘API地址（默认 http://192.168.11.1:1448）
 """
 
+# Make every log line one atomic, control-character-free write, so concurrent
+# writers cannot tear a Docker log record. Must run before anything prints.
+try:
+    from common import logsafe
+    logsafe.install()
+except ImportError as _e:  # running outside the container image
+    import sys as _sys
+    _sys.stderr.write(f"[bundle] logsafe unavailable ({_e}); stdout unprotected\n")
+
+
 import json
 import os
 import queue as _queue
@@ -533,7 +543,11 @@ def make_handler():
             msg = fmt % args
             if '"POST /mcp' in msg and '200' in msg:
                 return
-            print(f"[mcp] {self.address_string()} {msg}")
+            # Escape and cap: msg embeds the raw request line, which on host
+            # networking is remote-controlled bytes going straight into the
+            # Docker log framer (log injection / control-byte corruption).
+            safe = msg.encode("unicode_escape").decode("ascii")[:200]
+            print(f"[mcp] {self.address_string()} {safe}")
 
         def _send(self, status: int, body: str):
             encoded = body.encode()

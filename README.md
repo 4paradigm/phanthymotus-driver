@@ -133,7 +133,6 @@ The Agent Core Web Dashboard renders live data streams based on the `format` fie
 | `sensor/lidar*` | Lidar scan | 2D/3D lidar point visualization |
 | `sensor/pointcloud` | Point cloud | 3D point cloud renderer |
 | `sensor/mapping` | 2D Map | Occupancy grid / SLAM map |
-| `sensor/htmsg` | HT message | Custom structured message |
 
 ### Skeleton Rendering (`sensor/skeleton`)
 

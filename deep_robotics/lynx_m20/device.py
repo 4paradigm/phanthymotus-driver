@@ -345,7 +345,21 @@ class M20StatePlugin:
     def stop(self): self.nodes.close()
     def dispatch(self, action, args):
         name = args.get("_tool_name")
-        if action in ("info", "start", "stop"): return {"state": "ready" if action != "stop" else "idle"}
+        if action == "info":
+            if name in self.nodes.streams:
+                stream = self.nodes.streams[name]
+                return {
+                    "state": "ready",
+                    "topic_out": [{"topic": stream["topic"], "format": stream["format"]}],
+                }
+            if name in self.nodes.rtsp_streams:
+                stream = self.nodes.rtsp_streams[name]
+                return {
+                    "state": "ready",
+                    "topic_out": [{"topic": stream["url"], "format": stream["format"]}],
+                }
+            return {"state": "ready"}
+        if action in ("start", "stop"): return {"state": "ready" if action == "start" else "idle"}
         if name == "state": return self.nodes.snapshot()
         if name in self.nodes.streams: return {"state": "running", **self.nodes.streams[name]}
         if name in self.nodes.rtsp_streams: return {"state": "ready", **self.nodes.rtsp_streams[name]}

@@ -37,6 +37,7 @@ RUN pip3 install --no-cache-dir --no-deps /tmp/pnd_sdk_python && \
 # Application files
 COPY proto/         /work/proto/
 COPY resource/      /work/resource/
+COPY common/ /work/common/
 COPY main.py        /work/main.py
 COPY device.py      /work/device.py
 COPY grpc_client.py /work/grpc_client.py

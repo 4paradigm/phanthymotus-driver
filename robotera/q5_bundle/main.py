@@ -14,6 +14,16 @@ q5_bundle/main.py — RobotEra Q5 只读状态驱动入口。
 
 from __future__ import annotations
 
+# Make every log line one atomic, control-character-free write, so concurrent
+# writers cannot tear a Docker log record. Must run before anything prints.
+try:
+    from common import logsafe
+    logsafe.install()
+except ImportError as _e:  # running outside the container image
+    import sys as _sys
+    _sys.stderr.write(f"[bundle] logsafe unavailable ({_e}); stdout unprotected\n")
+
+
 import importlib
 import json
 import os
@@ -113,7 +123,11 @@ def make_handler():
             msg = fmt % args
             if '"POST /mcp' in msg and "200" in msg:
                 return
-            print(f"[mcp] {self.address_string()} {msg}")
+            # Escape and cap: msg embeds the raw request line, which on host
+            # networking is remote-controlled bytes going straight into the
+            # Docker log framer (log injection / control-byte corruption).
+            safe = msg.encode("unicode_escape").decode("ascii")[:200]
+            print(f"[mcp] {self.address_string()} {safe}")
 
         def _send(self, status, body):
             enc = body.encode()
@@ -237,6 +251,8 @@ def main():
     # dynamic plugin factory. The bridge owns Domain 42/FastDDS; the bundle
     # process remains on the vendor Q5 domain.
     bridge = None
+    camera_worker = None
+    camera_forwarder = None
     try:
         from q5_media_bridge import BridgeWorker
         bridge = BridgeWorker(namespace, debug=False)
@@ -248,6 +264,31 @@ def main():
         print("[bundle] Q5 media/audio bridge started (Domain 42/FastDDS)", flush=True)
     except Exception as exc:
         print(f"[bundle] media/audio bridge unavailable: {exc}", flush=True)
+
+    # Camera subscriptions and NumPy/Pillow work run in a separate ROS2
+    # process so D455 processing cannot starve control-card callbacks.
+    try:
+        from q5_camera_worker import CameraWorker
+        camera_configs = {"namespace": namespace, "plugins": {
+            name: dict(cfg.get("plugins", {}).get(name) or {})
+            for name in ("camera_rgb", "camera_depth", "camera_pointcloud")
+            if cfg.get("plugins", {}).get(name, {}).get("enabled")
+        }}
+        camera_worker = CameraWorker(camera_configs)
+        camera_worker.start()
+        client.camera_worker = camera_worker
+        if bridge is not None:
+            def _forward_camera_media():
+                while camera_worker and camera_worker._running:
+                    camera_worker.drain(bridge.push_media)
+                    time.sleep(0.005)
+            import time
+            camera_forwarder = threading.Thread(target=_forward_camera_media,
+                                                daemon=True, name="q5_camera_forwarder")
+            camera_forwarder.start()
+        print("[bundle] Q5 camera worker started", flush=True)
+    except Exception as exc:
+        print(f"[bundle] camera worker unavailable, using in-process cards: {exc}", flush=True)
 
     _bundle = Q5Bundle(cfg, namespace, executor, client)
     _bundle.start_all()
@@ -266,6 +307,8 @@ def main():
     def _shutdown(signum, frame):
         print(f"[bundle] signal {signum}, shutting down")
         _bundle.stop_all()
+        if camera_worker is not None:
+            camera_worker.stop()
         if bridge is not None:
             bridge.shutdown()
         client.stop()
@@ -277,6 +320,8 @@ def main():
         server.serve_forever()
     finally:
         _bundle.stop_all()
+        if camera_worker is not None:
+            camera_worker.stop()
         if bridge is not None:
             bridge.shutdown()
         client.stop()
