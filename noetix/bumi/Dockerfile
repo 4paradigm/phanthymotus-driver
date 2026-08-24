@@ -1,11 +1,15 @@
 ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 ARG PYPI_MIRROR=https://pypi.org/simple/
+ARG UBUNTU_MIRROR=https://ports.ubuntu.com/ubuntu-ports
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
+ARG UBUNTU_MIRROR
 
 WORKDIR /work
 
-RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
+RUN find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) \
+        -exec sed -i -E "s#https?://[^/]+/ubuntu-ports#${UBUNTU_MIRROR}#g" {} + && \
+    apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
         python3-pip \
         python3-dev \

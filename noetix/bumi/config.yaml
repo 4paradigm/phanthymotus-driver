@@ -18,3 +18,11 @@ plugins:
     poll_interval_s: 0.5
     # Activity classification only; this is not a motor safety or command limit.
     activity_velocity_threshold: 0.15
+  motion_events:
+    enabled: true
+    # Detect state transitions at 2 Hz; this is observation, not motor safety control.
+    poll_interval_s: 0.5
+    # Recent events are kept in memory only and cleared when the driver restarts.
+    history_size: 100
+    # Must match motion_state so both cards classify joint activity consistently.
+    activity_velocity_threshold: 0.15

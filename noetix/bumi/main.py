@@ -12,6 +12,8 @@ drivers/noetix/bumi/main.py — Noetix Bumi-EDU 设备 bundle 统一入口。
     CONFIG_PATH — config.yaml 路径（默认同目录下）
 """
 
+from __future__ import annotations
+
 # Make every log line one atomic, control-character-free write, so concurrent
 # writers cannot tear a Docker log record. Must run before anything prints.
 try:
@@ -91,6 +93,11 @@ class BumiDeviceBundle:
             self._plugins.append(MotionStatePlugin(
                 plugins_cfg["motion_state"], namespace, executor, high_ctrl))
             print("[bundle] MotionStatePlugin loaded")
+        if plugins_cfg.get("motion_events", {}).get("enabled", False) and high_ctrl is not None:
+            from device import MotionEventsPlugin
+            self._plugins.append(MotionEventsPlugin(
+                plugins_cfg["motion_events"], namespace, executor, high_ctrl))
+            print("[bundle] MotionEventsPlugin loaded")
 
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
