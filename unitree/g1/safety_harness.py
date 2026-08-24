@@ -105,15 +105,14 @@ class SmartMotionProxy:
             try:
                 item = self._result_queue.get(timeout=1.0)
                 req_id = item.pop("_req_id", None) if isinstance(item, dict) else None
-                if req_id and req_id in self._pending:
-                    self._pending[req_id].put(item)
+                with self._dispatch_lock:
+                    target = self._pending.get(req_id) if req_id else None
+                if target:
+                    target.put(item)
                 else:
-                    # Fallback: shouldn't happen, but don't lose the result
-                    # Put it in any waiting queue (legacy behavior)
-                    with self._dispatch_lock:
-                        for q in self._pending.values():
-                            q.put(item)
-                            break
+                    # A caller can time out before the child finishes. Never
+                    # deliver that late result to an unrelated newer command.
+                    print(f"[SmartMotionProxy] dropping late/unmatched result req_id={req_id}", flush=True)
             except queue.Empty:
                 continue
             except Exception:
@@ -144,7 +143,7 @@ class SmartMotionProxy:
     def navigate_to(self, x: float, y: float, yaw: float, target_name: str = "",
                     speed: float = 0.5, mode: int = 1) -> dict:
         return self._call("navigate_to", x=x, y=y, yaw=yaw, target_name=target_name,
-                          speed=speed, mode=mode)
+                          speed=speed, mode=mode, timeout=30.0)
 
     def pause_nav(self, reason: str = "command") -> dict:
         return self._call("pause_nav", reason=reason)
@@ -153,7 +152,7 @@ class SmartMotionProxy:
         return self._call("resume_nav")
 
     def stop_nav(self) -> dict:
-        return self._call("stop_nav")
+        return self._call("stop_nav", timeout=30.0)
 
     def wait_nav_done(self, stall_timeout: float = 60) -> dict:
         return self._call("wait_nav_done", stall_timeout=stall_timeout,

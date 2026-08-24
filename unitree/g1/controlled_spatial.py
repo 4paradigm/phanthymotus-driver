@@ -519,6 +519,7 @@ class ControlledSpatialPlugin:
         if self._smart_motion:
             last_pose = None
             last_move_time = time.monotonic()
+            poll_interval = 0.1
             while True:
                 if self._nav_action_id != action_id:
                     print(f'[ControlledSpatial] _acp_wait_nav {action_id} superseded, skipping notify')
@@ -527,7 +528,7 @@ class ControlledSpatialPlugin:
                 result = self._smart_motion.get_state()
                 if result.get("error"):
                     # A transient proxy timeout must not cancel a live route.
-                    time.sleep(0.5)
+                    time.sleep(poll_interval)
                     continue
 
                 pose = result.get("pose")
@@ -537,10 +538,13 @@ class ControlledSpatialPlugin:
                     distance = math.sqrt(dx * dx + dy * dy)
                     if distance < 0.3:
                         self._nav_action_id = None
+                        elapsed = round(time.time() - t0, 1)
+                        print(f"[ControlledSpatial] nav arrived target={target} "
+                              f"distance={distance:.3f}m elapsed={elapsed}s", flush=True)
                         _acp_notify(action_id, "completed", {
                             "target": target, "pose": pose,
                             "distance": round(distance, 3),
-                            "elapsed": round(time.time() - t0, 1),
+                            "elapsed": elapsed,
                         })
                         return
                     if last_pose:
@@ -571,7 +575,7 @@ class ControlledSpatialPlugin:
                         })
                     return
 
-                time.sleep(0.5)
+                time.sleep(poll_interval)
 
         # Fallback: no SmartMotion — poll local DDS callback + stall detection
         last_pose = self._get_pose()
