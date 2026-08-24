@@ -248,6 +248,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
     # ── Config ──
     decel_threshold = config.get("decel_threshold", 2.0)
     stop_threshold = config.get("stop_threshold", 0.8)
+    lateral_threshold = config.get("lateral_threshold", stop_threshold)
     cone_half_angle = math.radians(config.get("cone_half_angle", 30))
     z_min = config.get("z_min", 0.1)
     z_max = config.get("z_max", 1.8)
@@ -411,10 +412,10 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
                 # Left the decel zone — reset so re-entry logs immediately.
                 self._fwd_log_n = 0
 
-        # Lateral (45°-90°, within stop_threshold)
+        # Lateral (45°-90°, within its independently configurable threshold)
         lat_mask = (angle_diffs >= math.radians(45)) & \
                    (angle_diffs <= math.radians(90)) & \
-                   (vdist < stop_threshold)
+                   (vdist < lateral_threshold)
         lat_detected = bool(np.any(lat_mask))
 
         with obstacle_lock:
@@ -887,9 +888,13 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
                         publish_event("motion_resume", {"speed": {"vx": cvx, "vy": cvy, "vyaw": cvyaw}})
 
         elif state == MotionState.NAVIGATING:
-            # In mode=1 (stop-on-obstacle), SLAM service handles obstacle stopping.
-            # No local PauseNav/ResumeNav needed — avoids conflicts with SLAM state.
-            pass
+            # SLAM navigation uses mode=0; local LiDAR safety owns stopping.
+            if dist <= stop_threshold or lateral:
+                if speed_zone != SpeedZone.STOPPED:
+                    speed_zone = SpeedZone.STOPPED
+                    print(f"[SmartMotion:nav_obstacle] PAUSE — dist={dist:.2f}m "
+                          f"angle={math.degrees(obstacle_angle):.1f}° lateral={lateral}", flush=True)
+                    handle_pause_nav("obstacle")
 
         elif state == MotionState.NAV_PAUSED:
             # Obstacle cleared — resume navigation.

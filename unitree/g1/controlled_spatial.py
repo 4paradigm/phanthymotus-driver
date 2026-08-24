@@ -399,7 +399,6 @@ class ControlledSpatialPlugin:
                     "y": {"type": "number", "description": "Target Y coordinate (meters)"},
                     "yaw": {"type": "number", "description": "Target yaw (radians)"},
                     "speed": {"type": "number", "description": "Navigation speed 0.2-0.8 m/s (default 0.5)"},
-                    "mode": {"type": "integer", "description": "Obstacle mode: 1=stop(default), 0=detour"},
                     "stall_timeout": {"type": "number", "description": "Seconds without movement before declaring timeout (default 90)"},
                 },
                 "required": ["action"],
@@ -416,8 +415,8 @@ class ControlledSpatialPlugin:
                     "list_maps": {"params": [], "description": "List all saved maps"},
                     "delete_map": {"params": ["map_name"], "description": "Delete a map and its associated data"},
                     "load_map": {"params": ["map_name"], "description": "Load a map (robot must be at map origin)"},
-                    "navigate_to_tag": {"params": ["tag_name", "speed", "mode"], "description": "Navigate to a tagged place. System automatically waits for arrival via ACP barrier."},
-                    "navigate_to_pose": {"params": ["x", "y", "yaw", "speed", "mode"], "description": "Navigate to coordinates. System automatically waits for arrival via ACP barrier."},
+                    "navigate_to_tag": {"params": ["tag_name", "speed"], "description": "Navigate to a tagged place. SLAM obstacle mode is disabled; the local safety harness pauses navigation on LiDAR obstacles."},
+                    "navigate_to_pose": {"params": ["x", "y", "yaw", "speed"], "description": "Navigate to coordinates. SLAM obstacle mode is disabled; the local safety harness pauses navigation on LiDAR obstacles."},
                     "pause_nav": {"params": [], "description": "Pause navigation"},
                     "resume_nav": {"params": [], "description": "Resume navigation"},
                     "stop_nav": {"params": [], "description": "Stop and cancel navigation"},
@@ -783,9 +782,7 @@ class ControlledSpatialPlugin:
 
             if self._smart_motion:
                 speed = max(0.2, min(0.8, float(args.get("speed", 0.5))))
-                mode = int(args.get("mode", 1))
-                if mode != 1:
-                    mode = 1  # 强制停障模式，不允许绕障
+                mode = 0  # Local safety harness owns LiDAR-based pause/resume.
                 self._nav_arrived.clear()
                 self._nav_error = None
                 result = self._smart_motion.navigate_to(poi["x"], poi["y"], yaw, tag_name,
@@ -806,9 +803,7 @@ class ControlledSpatialPlugin:
             q_z = math.sin(yaw / 2)
             q_w = math.cos(yaw / 2)
             speed = max(0.2, min(0.8, float(args.get("speed", 0.5))))
-            mode = int(args.get("mode", 1))
-            if mode != 1:
-                mode = 1  # 强制停障模式，不允许绕障
+            mode = 0  # Local safety harness owns LiDAR-based pause/resume.
             self._nav_arrived.clear()
             self._nav_error = None
             code, resp = self._client.NavigateTo(poi["x"], poi["y"], 0, 0, 0, q_z, q_w, speed=speed, mode=mode)
@@ -837,9 +832,7 @@ class ControlledSpatialPlugin:
 
             if self._smart_motion:
                 speed = max(0.2, min(0.8, float(args.get("speed", 0.5))))
-                mode = int(args.get("mode", 1))
-                if mode != 1:
-                    mode = 1  # 强制停障模式，不允许绕障
+                mode = 0  # Local safety harness owns LiDAR-based pause/resume.
                 self._nav_arrived.clear()
                 self._nav_error = None
                 result = self._smart_motion.navigate_to(x, y, yaw, speed=speed, mode=mode)
@@ -857,7 +850,7 @@ class ControlledSpatialPlugin:
             q_z = math.sin(yaw / 2)
             q_w = math.cos(yaw / 2)
             speed = max(0.2, min(0.8, float(args.get("speed", 0.5))))
-            mode = int(args.get("mode", 1))
+            mode = 0  # Local safety harness owns LiDAR-based pause/resume.
             self._nav_arrived.clear()
             self._nav_error = None
             code, resp = self._client.NavigateTo(x, y, 0, 0, 0, q_z, q_w, speed=speed, mode=mode)
