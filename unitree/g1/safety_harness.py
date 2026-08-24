@@ -907,7 +907,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
 
     # ── Safety checks (inline in main loop) ──
     def process_safety_checks():
-        nonlocal state, speed_zone, nav_pause_reason, stop_repeat_count
+        nonlocal state, speed_zone, nav_pause_reason, stop_repeat_count, nav_confirm_frames
 
         # 1. Communication timeout
         with safety_lock:
