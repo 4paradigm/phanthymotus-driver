@@ -823,15 +823,21 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
         # updates its route state but is not a sufficiently prompt physical
         # brake on all G1 firmware versions, so always stop the locomotion
         # controller as part of a local obstacle pause.
+        brake_started = time.monotonic()
         try:
             code, _ = slam_client.PauseNav()
         except Exception:
             code = -1
+        stop_code = None
+        stop_error = None
         try:
-            loco_client.StopMove()
+            stop_code = loco_client.StopMove()
             stop_repeat_count = 3
-        except Exception:
-            pass
+        except Exception as exc:
+            stop_error = str(exc)
+        print(f"[SmartMotion:nav_brake] PauseNav={code} StopMove={stop_code} "
+              f"elapsed_ms={round((time.monotonic() - brake_started) * 1000)}"
+              + (f" StopMove_error={stop_error}" if stop_error else ""), flush=True)
         if code == 0 or reason_str == "obstacle":
             state = MotionState.NAV_PAUSED
             nav_pause_reason = reason_str
