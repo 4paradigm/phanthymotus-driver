@@ -917,8 +917,10 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
 
         elif state == MotionState.NAV_PAUSED:
             # Obstacle cleared — resume navigation.
-            # Only automatically resume a local safety pause with fresh LiDAR.
-            if (nav_pause_reason in ("obstacle", "lidar_timeout")
+            # A LiDAR timeout is fail-closed: only a new navigation command or
+            # explicit resume may clear it. Do not let one intermittent frame
+            # restart the robot.
+            if (nav_pause_reason == "obstacle"
                     and lidar_age <= lidar_timeout
                     and dist > decel_threshold
                     and not lateral):
