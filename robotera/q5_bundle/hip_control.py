@@ -177,6 +177,11 @@ class Plugin:
                 "stops_by_holding_current_position": True}
 
     def dispatch(self, action, args):
+        if action in ("start", "info"):
+            # Hidden lifecycle actions: not exposed in the enum (canvas shows
+            # only set/zero) but required by the canvas startup sequence.
+            return {"state": "ready" if self._router.status()["ros_publisher_available"] else "unavailable",
+                    "safety": self._safety()}
         if action == "set":
             try:
                 deg = _number(args.get("position_deg"), "position_deg")
