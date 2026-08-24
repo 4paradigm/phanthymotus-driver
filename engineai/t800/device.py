@@ -12,6 +12,7 @@ import json
 import math
 import numbers
 import os
+import queue
 import sqlite3
 import subprocess
 import threading
@@ -3634,6 +3635,251 @@ class MicPlugin:
                     "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}],
                     "last_error": self._last_error}
         return {"error": f"unknown mic action: {action}"}
+
+
+# ── AsrPlugin (sensor) — sherpa-onnx 离线流式语音识别 ────────────────────────
+
+class AsrPlugin:
+    """订阅 MicPlugin 的 PCM-16k 单声道音频流，用 sherpa-onnx 做离线流式识别。
+
+    输入:  /{ns}/mic/audio  (audio_msgs/AudioChunk, 512 samples int16)
+    输出:  /{ns}/asr/result (std_msgs/String, JSON)
+    线程:  ROS2 callback 只把 PCM 塞入队列；独立解码线程跑 VAD + OnlineRecognizer。
+    """
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._config = plugin_config
+        self._ns = namespace
+        self._mic_topic = f"/{namespace}/mic/audio"
+        self._result_topic = f"/{namespace}/asr/result"
+
+        self._node = Node("t800_asr", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._node)
+        self._publisher = self._node.create_publisher(String, self._result_topic, _RELIABLE)
+        self._subscription = None
+
+        self._running = False
+        self._audio_queue: queue.Queue = queue.Queue(maxsize=400)  # ~12.8s @32ms/chunk
+        self._decode_thread: threading.Thread | None = None
+        self._recognizer = None
+        self._stream = None
+        self._load_error = ""
+
+        self._utterances = 0
+        self._last_text = ""
+        self._last_error = ""
+        self._last_chunk_mono = 0.0
+        self._lock = threading.Lock()
+
+    # ── 模型加载 ────────────────────────────────────────────────────────────
+
+    def _model_path(self, key: str, default_name: str) -> str:
+        explicit = str(self._config.get(key, "")).strip()
+        if explicit:
+            return explicit
+        return str(Path(self._config.get("model_dir", "/opt/phanthy-motus/models/sherpa-onnx/paraformer-zh")) / default_name)
+
+    def _load_recognizer(self):
+        try:
+            import sherpa_onnx
+        except ImportError as exc:
+            raise RuntimeError("sherpa_onnx python package not installed") from exc
+
+        model_dir = str(self._config.get("model_dir", "/opt/phanthy-motus/models/sherpa-onnx/paraformer-zh"))
+        tokens = self._model_path("tokens_file", "tokens.txt")
+        encoder = self._model_path("encoder_file", "encoder.onnx")
+        decoder = self._model_path("decoder_file", "decoder.onnx")
+        for path in (tokens, encoder, decoder):
+            if not os.path.isfile(path):
+                raise RuntimeError(f"model file missing: {path}")
+
+        recognizer = sherpa_onnx.OnlineRecognizer.from_paraformer(
+            tokens=tokens,
+            encoder=encoder,
+            decoder=decoder,
+            num_threads=1,
+            sample_rate=int(self._config.get("sample_rate", 16000)),
+            feature_dim=80,
+            decoding_method="greedy_search",
+            debug=False,
+        )
+        self._recognizer = recognizer
+        self._stream = recognizer.create_stream()
+        self._load_error = ""
+        return recognizer
+
+    def _release_recognizer(self) -> None:
+        self._recognizer = None
+        self._stream = None
+
+    # ── 生命周期 ────────────────────────────────────────────────────────────
+
+    def start(self) -> None:
+        """bundle 启动钩子：不抛异常，模型缺失等延迟到 start action 时报错。"""
+        pass
+
+    def stop(self) -> None:
+        self._teardown()
+
+    def _teardown(self) -> None:
+        self._running = False
+        thread = self._decode_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2)
+        self._decode_thread = None
+        if self._subscription is not None:
+            try:
+                self._node.destroy_subscription(self._subscription)
+            except Exception:
+                pass
+            self._subscription = None
+        self._release_recognizer()
+        while not self._audio_queue.empty():
+            try:
+                self._audio_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    # ── 音频回调 ────────────────────────────────────────────────────────────
+
+    def _on_audio(self, msg) -> None:
+        if not self._running:
+            return
+        try:
+            pcm = bytes(msg.data)
+        except Exception:
+            return
+        self._last_chunk_mono = time.monotonic()
+        try:
+            self._audio_queue.put_nowait(pcm)
+        except queue.Full:
+            # 解码跟不上就丢最旧的，保持实时性
+            try:
+                self._audio_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._audio_queue.put_nowait(pcm)
+            except queue.Full:
+                pass
+
+    # ── 解码线程 ────────────────────────────────────────────────────────────
+
+    def _decode_loop(self) -> None:
+        sample_rate = int(self._config.get("sample_rate", 16000))
+        stream = self._stream
+        recognizer = self._recognizer
+        if stream is None or recognizer is None:
+            return
+        try:
+            while self._running:
+                try:
+                    chunk = self._audio_queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if not chunk:
+                    continue
+                samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
+                stream.accept_waveform(sample_rate, samples)
+                while recognizer.is_ready(stream):
+                    recognizer.decode_stream(stream)
+                if recognizer.is_endpoint(stream):
+                    text = recognizer.get_result(stream).strip()
+                    recognizer.reset(stream)
+                    if text:
+                        self._utterances += 1
+                        self._last_text = text
+                        self._publish_result(text)
+        except Exception as exc:  # noqa: BLE001
+            self._last_error = str(exc)
+        finally:
+            self._running = False
+
+    def _publish_result(self, text: str) -> None:
+        payload = {
+            "text": text,
+            "is_final": True,
+            "timestamp_ms": _now_ms(),
+            "confidence": 1.0,
+        }
+        out = String()
+        out.data = json.dumps(payload, ensure_ascii=False)
+        try:
+            self._publisher.publish(out)
+        except Exception as exc:  # noqa: BLE001
+            self._last_error = str(exc)
+
+    # ── Tool 定义 / dispatch ────────────────────────────────────────────────
+
+    def get_tool(self) -> dict:
+        actions = _with_lifecycle({
+            "status": ([], "返回识别运行状态、统计与模型信息"),
+        })
+        return {
+            "name": "asr",
+            "type": "sensor",
+            "multiInstance": False,
+            "readOnly": False,
+            "description": (
+                "T800 离线流式语音识别（sherpa-onnx OnlineRecognizer + 内置 endpoint 检测）。"
+                f"输入订阅 {self._mic_topic}（需先启动 mic），识别结果发布到 {self._result_topic}。"
+            ),
+            "inputSchema": action_schema(actions, {}, "语音识别生命周期动作"),
+            "topic_in": [{"topic": self._mic_topic, "format": "audio/pcm-16k"}],
+            "topic_out": [{"topic": self._result_topic, "format": "text/asr"}],
+        }
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "start":
+            return self._action_start()
+        if action == "stop":
+            self._teardown()
+            return {"state": "idle"}
+        if action in ("info", "status"):
+            return self._status_payload()
+        return {"error": f"unknown asr action: {action}"}
+
+    def _action_start(self) -> dict:
+        if self._running:
+            return {"state": "running", **self._status_payload()}
+
+        if self._node.count_publishers(self._mic_topic) == 0:
+            error = f"no publisher on {self._mic_topic}; start mic first"
+            self._last_error = error
+            return {"state": "error", "error": error, "message": error}
+
+        try:
+            self._load_recognizer()
+        except RuntimeError as exc:
+            self._last_error = str(exc)
+            return {"state": "error", "error": self._last_error, "message": self._last_error}
+
+        from audio_msgs.msg import AudioChunk
+
+        self._utterances = 0
+        self._last_text = ""
+        self._last_error = ""
+        self._running = True
+        self._subscription = self._node.create_subscription(
+            AudioChunk, self._mic_topic, self._on_audio, _BEST_EFFORT,
+        )
+        self._decode_thread = threading.Thread(
+            target=self._decode_loop, daemon=True, name="t800-asr-decode",
+        )
+        self._decode_thread.start()
+        return {"state": "running", **self._status_payload()}
+
+    def _status_payload(self) -> dict:
+        return {
+            "state": "running" if self._running else "idle",
+            "topic_in": [{"topic": self._mic_topic, "format": "audio/pcm-16k"}],
+            "topic_out": [{"topic": self._result_topic, "format": "text/asr"}],
+            "utterances": self._utterances,
+            "last_text": self._last_text,
+            "last_error": self._last_error or self._load_error,
+            "model_dir": str(self._config.get("model_dir", "/opt/phanthy-motus/models/sherpa-onnx/paraformer-zh")),
+            "sample_rate": int(self._config.get("sample_rate", 16000)),
+        }
 
 
 class VisionPlugin:

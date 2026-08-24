@@ -105,6 +105,7 @@ class DualDomainROS2:
 class T800DeviceBundle:
     def __init__(self, config: dict, namespace: str, ros2: DualDomainROS2):
         from device import (
+            AsrPlugin,
             DancePlugin,
             GesturePlugin,
             JointBridgePlugin,
@@ -158,8 +159,7 @@ class T800DeviceBundle:
             ("led", LedPlugin, (config, namespace, ros2)),
             ("tts", TtsPlugin, (config, namespace, ros2)),
             ("mic", MicPlugin, (config, namespace, ros2)),
-            ("vision", VisionPlugin, (config, namespace, ros2)),
-            ("motor_power", MotorPowerPlugin, (config, namespace, ros2)),
+            ("vision", VisionPlugin, (config, namespace, ros2)),            ("motor_power", MotorPowerPlugin, (config, namespace, ros2)),
             ("native_node_control", NativeNodeControlPlugin, (config, namespace, ros2)),
             ("safety", SafetyControlPlugin, (config, namespace, ros2, state)),
         )
@@ -183,6 +183,12 @@ class T800DeviceBundle:
         if plugins.get("gesture", {}).get("enabled", True) and "joint_plan" in instances:
             instance = GesturePlugin(instances["joint_plan"])
             instances["gesture"] = instance
+            self._plugins.append(instance)
+
+        asr_config = plugins.get("asr", {})
+        if asr_config.get("enabled", False):
+            instance = AsrPlugin(asr_config, namespace, ros2)
+            instances["asr"] = instance
             self._plugins.append(instance)
 
         virtual_gamepad_config = plugins.get("virtual_gamepad", {})

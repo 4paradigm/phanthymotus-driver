@@ -119,6 +119,13 @@ plugins:
     stop_timeout: 10
   mic:
     enabled: true
+  asr:
+    enabled: true
+    model_dir: "/opt/phanthy-motus/models/sherpa-onnx/paraformer-zh"
+    tokens_file: ""     # 留空则用 model_dir 下的 tokens.txt
+    encoder_file: ""    # 留空则用 model_dir 下的 encoder.onnx
+    decoder_file: ""    # 留空则用 model_dir 下的 decoder.onnx
+    sample_rate: 16000  # 必须与 mic 输出一致
   vision:
     enabled: true
     source: "raw"            # raw | slam —— 转发哪个点云源
