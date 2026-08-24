@@ -105,6 +105,7 @@ class DualDomainROS2:
 class T800DeviceBundle:
     def __init__(self, config: dict, namespace: str, ros2: DualDomainROS2):
         from device import (
+            ArmActuatorPlugin,
             DancePlugin,
             GesturePlugin,
             JointBridgePlugin,
@@ -180,6 +181,11 @@ class T800DeviceBundle:
             instances["dance"] = instance
             self._plugins.append(instance)
 
+        if plugins.get("arm", {}).get("enabled", True) and "joint_plan" in instances:
+            instance = ArmActuatorPlugin(config, instances["joint_plan"], state)
+            instances["arm"] = instance
+            self._plugins.append(instance)
+
         if plugins.get("gesture", {}).get("enabled", True) and "joint_plan" in instances:
             instance = GesturePlugin(instances["joint_plan"])
             instances["gesture"] = instance
@@ -213,7 +219,7 @@ class T800DeviceBundle:
             instances["safety"].set_controls(
                 [
                     instances[key]
-                    for key in ("locomotion", "joint_override", "joint_bridge", "virtual_gamepad", "gesture")
+                    for key in ("locomotion", "joint_override", "joint_bridge", "virtual_gamepad", "arm", "gesture")
                     if key in instances
                 ]
             )

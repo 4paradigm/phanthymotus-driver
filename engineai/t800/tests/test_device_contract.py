@@ -244,6 +244,7 @@ class DevicePluginContractTests(unittest.TestCase):
             motion_mode,
             self.device.DancePlugin(motion_mode, self.state),
             joint_plan,
+            self.device.ArmActuatorPlugin(CONFIG, joint_plan, self.state),
             self.device.GesturePlugin(joint_plan),
             self.device.JointOverridePlugin(CONFIG, "robot", self.ros, self.state),
             self.device.JointBridgePlugin(CONFIG, "robot", self.ros, self.state),
@@ -273,14 +274,14 @@ class DevicePluginContractTests(unittest.TestCase):
              "robot_snapshot", "fault_summary", "stability", "joint_groups", "capabilities", "ros_graph",
              "mainboard", "heartbeat_status", "motion_command_trace", "motion_events",
              "native_interface_probe",
-             "loco", "motion_mode", "dance", "joint_plan", "joint_plan_state", "gesture",
+             "loco", "motion_mode", "dance", "joint_plan", "joint_plan_state", "arm", "gesture",
              "joint_override", "joint_bridge",
              "led", "tts", "mic", "pointcloud", "camera", "depth",
              "motor_power", "native_node_control", "virtual_gamepad", "safety", "native_sdk"},
             names,
         )
-        self.assertEqual(41, len(names))
-        self.assertEqual(41, len(definitions), "tool names must be unique")
+        self.assertEqual(42, len(names))
+        self.assertEqual(42, len(definitions), "tool names must be unique")
         for tool in definitions:
             schema = tool.get("inputSchema")
             self.assertEqual("object", schema.get("type"), tool["name"])
@@ -677,7 +678,50 @@ class DevicePluginContractTests(unittest.TestCase):
         plugin.dispatch("hold_current", {})
         self.assertEqual(list(range(25)), plugin._publisher.messages[-1].joint_indices)
 
-    def test_gesture_exposes_complete_official_sequences_and_custom_queue(self):
+    def test_arm_declares_async_position_only_actions(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        arm = self.device.ArmActuatorPlugin(CONFIG, plan, self.state)
+        schema = arm.get_tool()["inputSchema"]
+        actions = set(schema["properties"]["action"]["enum"])
+        self.assertTrue({"move_pos", "reset", "raise", "lower", "wave", "clap", "point", "fold", "shrug", "status"}.issubset(actions))
+        self.assertNotIn("move_ctrl", actions)
+        self.assertEqual(
+            ["wave", "clap", "raise", "lower", "point", "fold", "shrug", "reset", "move_pos"],
+            schema["x-completion"]["actions"],
+        )
+        self.assertGreaterEqual(schema["x-completion"]["timeout"], arm._ACP_TIMEOUT_SEC)
+
+    def test_arm_move_pos_and_status_use_planner_and_state(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        plan.wait_until_idle = lambda *_args, **_kwargs: {}
+        plan.wait_for_request = lambda *_args, **_kwargs: {}
+        arm = self.device.ArmActuatorPlugin(CONFIG, plan, self.state)
+        arm._acp_notify = lambda *_args: None
+        self.state._last_joint_positions = [0.0] * 25
+        result = arm.dispatch("move_pos", {
+            "side": "left",
+            "target_positions": [0.02, 0.08, 0.0, -0.07, 0.0],
+            "duration": 0.05,
+        })
+        self.assertEqual("running", result["state"])
+        self.assertTrue(result["action_id"].startswith("t800_arm_"))
+        arm._thread.join(timeout=1.0)
+        self.assertEqual(list(self.device.T800_JOINT_GROUPS["left_arm"]), plan._publisher.messages[-1].joint_indices)
+        status = arm.dispatch("status", {})
+        self.assertEqual("completed", status["state"])
+        self.assertEqual([0.0] * 5, status["left_positions"])
+
+    def test_arm_gesture_mutex_blocks_conflicting_upper_body_actions(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        arm = self.device.ArmActuatorPlugin(CONFIG, plan, self.state)
+        self.assertIsNone(plan.acquire_arm("gesture"))
+        busy = arm.dispatch("raise", {"side": "right", "duration": 0.05})
+        self.assertEqual("arm is busy", busy["error"])
+        self.assertEqual("gesture", busy["owner"])
+        plan.release_arm("gesture")
+
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
         plan.start()
         plan.wait_until_idle = lambda *_args, **_kwargs: {}

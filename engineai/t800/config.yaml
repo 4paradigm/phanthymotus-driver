@@ -57,6 +57,13 @@ diagnostics:
   command_trace_capacity: 20
   motion_events_capacity: 100
 
+arm:
+  step_duration_sec: 0.5
+  feedback_grace_sec: 1.0
+  wave_amplitude_rad: 0.4
+  clap_amplitude_rad: 0.3
+  shrug_amplitude_rad: 0.2
+
 plugins:
   state:
     enabled: true
@@ -75,6 +82,8 @@ plugins:
   dance:
     enabled: true
   joint_plan:
+    enabled: true
+  arm:
     enabled: true
   gesture:
     enabled: true
