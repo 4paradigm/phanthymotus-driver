@@ -682,7 +682,7 @@ class ControlledSpatialPlugin:
 
         # ── Mapping ────────────────────────────────────────────────────────
 
-        elif action == "start_mapping":
+        if action == "start_mapping":
             map_name = args.get("map_name", "")
             if not map_name:
                 return {"error": "map_name is required"}
