@@ -349,6 +349,7 @@ class ControlledSpatialPlugin:
         self._nav_arrived = threading.Event()
         self._nav_error: str | None = None
         self._nav_action_id: str | None = None  # current navigate ACP action_id
+        self._nav_target: str | None = None
         self._last_db_map_status: str | None = None
         self._lock = threading.Lock()
 
@@ -509,7 +510,6 @@ class ControlledSpatialPlugin:
         target_pose: dict | None = None,
     ):
         """Wait for navigation to complete, then fire ACP callback."""
-        self._nav_action_id = action_id
         t0 = time.time()
 
         # Poll SmartMotion state instead of calling its blocking
@@ -537,7 +537,10 @@ class ControlledSpatialPlugin:
                     dy = pose["y"] - target_pose["y"]
                     distance = math.sqrt(dx * dx + dy * dy)
                     if distance < 0.3:
+                        if self._nav_action_id != action_id:
+                            return
                         self._nav_action_id = None
+                        self._nav_target = None
                         elapsed = round(time.time() - t0, 1)
                         completion = self._smart_motion.complete_nav()
                         if completion.get("error"):
@@ -559,7 +562,10 @@ class ControlledSpatialPlugin:
                     last_pose = pose
 
                 if result.get("state") == "idle":
+                    if self._nav_action_id != action_id:
+                        return
                     self._nav_action_id = None
+                    self._nav_target = None
                     _acp_notify(action_id, "error", {
                         "target": target, "error": "navigation stopped",
                         "elapsed": round(time.time() - t0, 1),
@@ -571,6 +577,7 @@ class ControlledSpatialPlugin:
                     self._smart_motion.stop_nav()
                     if self._nav_action_id == action_id:
                         self._nav_action_id = None
+                        self._nav_target = None
                         _acp_notify(action_id, "error", {
                             "target": target,
                             "error": f"stall_timeout ({stall_timeout}s)",
@@ -585,7 +592,13 @@ class ControlledSpatialPlugin:
         last_move_time = time.time()
 
         while True:
+            if self._nav_action_id != action_id:
+                print(f'[ControlledSpatial] _acp_wait_nav {action_id} superseded, skipping notify')
+                return
             if self._nav_arrived.wait(timeout=1.0):
+                if self._nav_action_id != action_id:
+                    print(f'[ControlledSpatial] _acp_wait_nav {action_id} superseded, skipping notify')
+                    return
                 elapsed = round(time.time() - t0, 1)
                 if self._nav_error:
                     error = self._nav_error
@@ -600,6 +613,7 @@ class ControlledSpatialPlugin:
                     })
                 if self._nav_action_id == action_id:
                     self._nav_action_id = None
+                    self._nav_target = None
                 return
 
             current_pose = self._get_pose()
@@ -617,6 +631,7 @@ class ControlledSpatialPlugin:
                     })
                     if self._nav_action_id == action_id:
                         self._nav_action_id = None
+                        self._nav_target = None
                     return
             if current_pose and last_pose:
                 dx = current_pose["x"] - last_pose["x"]
@@ -639,6 +654,7 @@ class ControlledSpatialPlugin:
                 })
                 if self._nav_action_id == action_id:
                     self._nav_action_id = None
+                    self._nav_target = None
                 return
 
             if time.time() - t0 > 180:
@@ -648,6 +664,7 @@ class ControlledSpatialPlugin:
                 })
                 if self._nav_action_id == action_id:
                     self._nav_action_id = None
+                    self._nav_target = None
                 return
 
     # ── Dispatch ─────────────────────────────────────────────────────────────
@@ -805,10 +822,16 @@ class ControlledSpatialPlugin:
             tag_name = args.get("tag_name", "")
             if not tag_name:
                 return {"error": "tag_name is required"}
+            # Decision models may repeat a tool call after seeing a
+            # "navigating" result. Keep the original route and ACP action.
+            if self._nav_action_id and self._nav_target == tag_name:
+                return {"status": "navigating", "target": tag_name,
+                        "action_id": self._nav_action_id, "duplicate": True}
             # Cancel any in-flight navigation ACP
             if self._nav_action_id:
                 _acp_notify(self._nav_action_id, "cancelled", {"reason": "superseded by new navigate"})
                 self._nav_action_id = None
+                self._nav_target = None
             active_map = self._active_map
             if not active_map:
                 return {"error": "No active map. Load a map first."}
@@ -829,6 +852,8 @@ class ControlledSpatialPlugin:
                 from uuid import uuid4
                 action_id = f"g1_nav_{uuid4().hex[:8]}"
                 result["action_id"] = action_id
+                self._nav_action_id = action_id
+                self._nav_target = tag_name
                 threading.Thread(
                     target=self._acp_wait_nav,
                     args=(action_id, tag_name, float(args.get("stall_timeout", 90))),
@@ -848,6 +873,8 @@ class ControlledSpatialPlugin:
             if code == 0:
                 from uuid import uuid4
                 action_id = f"g1_nav_{uuid4().hex[:8]}"
+                self._nav_action_id = action_id
+                self._nav_target = tag_name
                 threading.Thread(
                     target=self._acp_wait_nav,
                     args=(action_id, tag_name, float(args.get("stall_timeout", 90))),
@@ -863,10 +890,15 @@ class ControlledSpatialPlugin:
             x = float(args.get("x", 0))
             y = float(args.get("y", 0))
             yaw = float(args.get("yaw", 0))
+            target = f"pose({x},{y})"
+            if self._nav_action_id and self._nav_target == target:
+                return {"status": "navigating", "target": target,
+                        "action_id": self._nav_action_id, "duplicate": True}
             # Cancel any in-flight navigation ACP
             if self._nav_action_id:
                 _acp_notify(self._nav_action_id, "cancelled", {"reason": "superseded by new navigate"})
                 self._nav_action_id = None
+                self._nav_target = None
 
             if self._smart_motion:
                 speed = max(0.2, min(0.8, float(args.get("speed", 0.5))))
@@ -877,9 +909,11 @@ class ControlledSpatialPlugin:
                 from uuid import uuid4
                 action_id = f"g1_nav_{uuid4().hex[:8]}"
                 result["action_id"] = action_id
+                self._nav_action_id = action_id
+                self._nav_target = target
                 threading.Thread(
                     target=self._acp_wait_nav,
-                    args=(action_id, f"pose({x},{y})", float(args.get("stall_timeout", 90))),
+                    args=(action_id, target, float(args.get("stall_timeout", 90))),
                     kwargs={"target_pose": {"x": x, "y": y}},
                     daemon=True,
                 ).start()
@@ -895,9 +929,11 @@ class ControlledSpatialPlugin:
             if code == 0:
                 from uuid import uuid4
                 action_id = f"g1_nav_{uuid4().hex[:8]}"
+                self._nav_action_id = action_id
+                self._nav_target = target
                 threading.Thread(
                     target=self._acp_wait_nav,
-                    args=(action_id, f"pose({x},{y})", float(args.get("stall_timeout", 90))),
+                    args=(action_id, target, float(args.get("stall_timeout", 90))),
                     kwargs={"target_pose": {"x": x, "y": y}},
                     daemon=True,
                 ).start()
