@@ -50,6 +50,7 @@ from control import (
     sensor_action_schema,
     sensor_tool,
     validate_joint_indices,
+    validate_joint_positions,
     validate_parallel_arrays,
 )
 from native_sdk import NativeSdkManager
@@ -207,7 +208,6 @@ class StatePlugin:
         "joint_command_feedback": ("state/joint_command_feedback", "data/json", "T800 Native SDK 最近关节控制命令反馈"),
         "gamepad": ("state/gamepad", "data/json", "T800 遥控器连接、按键和摇杆状态"),
         "motion_state": ("state/motion", "data/json", "T800 当前运动状态和允许转换状态"),
-        "driver_health": ("state/driver_health", "data/json", "T800 driver 各数据源连接与新鲜度"),
     }
     _DERIVED_STREAMS = {
         "robot_snapshot": ("state/robot_snapshot", "T800 运动、关节、IMU、电源和电机状态聚合快照"),
@@ -220,6 +220,17 @@ class StatePlugin:
     }
     _MAINBOARD_KEYWORDS = ("mainboard", "main_board", "board", "thermal", "temperature", "fan", "diagnostic")
     _MAINBOARD_STRONG_KEYWORDS = ("mainboard", "main_board", "board")
+    _SOURCE_LABELS = {
+        "joints": "关节状态",
+        "imu": "机身 IMU",
+        "battery": "电池",
+        "motor_health": "电机健康",
+        "motor_state": "电机状态",
+        "motor_command": "电机命令",
+        "joint_command_feedback": "关节命令反馈",
+        "gamepad": "遥控器",
+        "motion_state": "运动状态",
+    }
 
     def __init__(self, config: dict, namespace: str, ros2, motion_events=None):
         self._config = config
@@ -235,6 +246,7 @@ class StatePlugin:
         self._last_joint_positions = [0.0] * len(T800_JOINT_NAMES)
         self._current_motion = ""
         self._available_motions: list[str] = []
+        self._health_providers: dict[str, object] = {}
 
         self._sub_node = Node("t800_state_sub", context=ros2.ctx_robot)
         self._pub_node = Node("t800_state_pub", context=ros2.ctx_core)
@@ -257,6 +269,19 @@ class StatePlugin:
             sensor_tool(name, description, f"/{self._ns}/{relative}", fmt)
             for name, (relative, fmt, description) in self._STREAMS.items()
         ]
+        tools.append(
+            {
+                "name": "driver_health",
+                "type": "actuator",
+                "multiInstance": False,
+                "description": "执行一次并返回 T800 机器人、麦克风与 Odin2 数据流的最新健康 JSON",
+                "inputSchema": action_schema(
+                    {"status": ([], "获取一次最新 Driver Health JSON")},
+                    {},
+                    "一次性健康检查动作",
+                ),
+            }
+        )
         tools.append(
             {
                 "name": "model",
@@ -325,6 +350,11 @@ class StatePlugin:
         with self._lock:
             return list(self._last_joint_positions)
 
+    def register_health_provider(self, name: str, callback) -> None:
+        """Add non-StatePlugin streams to the driver_health aggregation."""
+        with self._lock:
+            self._health_providers[str(name)] = callback
+
     def dispatch(self, action_or_tool: str, args: dict) -> dict:
         if action_or_tool == "model":
             try:
@@ -333,10 +363,14 @@ class StatePlugin:
                 return {"error": "T800 URDF not found"}
         if action_or_tool in self._DERIVED_STREAMS:
             return self._derived_snapshot(action_or_tool)
+        if action_or_tool == "driver_health":
+            return self._health()
         if action_or_tool in self._STREAMS:
             return self._snapshot(action_or_tool)
         if action_or_tool == "status":
             name = args.get("_tool_name", "driver_health")
+            if name == "driver_health":
+                return self._health()
             if name in self._DERIVED_STREAMS:
                 return self._derived_snapshot(name)
             if name in self._STREAMS:
@@ -627,8 +661,6 @@ class StatePlugin:
             self._updated[name] = time.monotonic()
 
     def _snapshot(self, name: str) -> dict:
-        if name == "driver_health":
-            return self._health()
         with self._lock:
             payload = dict(self._cache.get(name, {"state": "no_data"}))
             updated = self._updated.get(name)
@@ -643,24 +675,108 @@ class StatePlugin:
                 name: {
                     "connected": name in self._updated,
                     "age_sec": None if name not in self._updated else max(0.0, now - self._updated[name]),
+                    "category": "robot",
+                    "label": self._SOURCE_LABELS.get(name, name),
                 }
                 for name in self._STREAMS
-                if name != "driver_health"
             }
+            providers = dict(self._health_providers)
         for value in sources.values():
             value["stale"] = value["age_sec"] is None or value["age_sec"] > self._timeout
+            value["state"] = (
+                "running" if value["connected"] and not value["stale"]
+                else "stale" if value["connected"]
+                else "waiting"
+            )
+        for provider_name, callback in providers.items():
+            try:
+                provided = callback()
+                if not isinstance(provided, dict):
+                    raise TypeError("health provider must return an object")
+                for source_name, value in provided.items():
+                    if isinstance(value, dict):
+                        sources[str(source_name)] = dict(value)
+            except Exception as exc:
+                sources[provider_name] = {
+                    "connected": False,
+                    "age_sec": None,
+                    "stale": True,
+                    "state": "error",
+                    "category": "internal",
+                    "label": provider_name,
+                    "error": str(exc),
+                }
+        for value in sources.values():
+            value.setdefault("connected", False)
+            value.setdefault("age_sec", None)
+            value.setdefault(
+                "stale", value["age_sec"] is None or float(value["age_sec"]) > self._timeout
+            )
+            value.setdefault("state", "running" if value["connected"] and not value["stale"] else "waiting")
+            value.setdefault("category", "other")
+            value.setdefault("label", "未命名数据流")
+            if value["age_sec"] is not None:
+                value["age_sec"] = round(float(value["age_sec"]), 3)
         connected = sum(1 for value in sources.values() if value["connected"])
         fresh = sum(1 for value in sources.values() if value["connected"] and not value["stale"])
-        if fresh:
+        total = len(sources)
+        if total and fresh == total:
             state = "running"
-        elif connected:
+        elif connected or fresh:
             state = "degraded"
         else:
             state = "waiting"
+        groups = {}
+        for category in ("robot", "audio", "odin2", "internal", "other"):
+            names = [name for name, value in sources.items() if value["category"] == category]
+            if not names:
+                continue
+            group_connected = sum(1 for name in names if sources[name]["connected"])
+            group_fresh = sum(
+                1 for name in names if sources[name]["connected"] and not sources[name]["stale"]
+            )
+            if group_fresh == len(names):
+                group_state = "running"
+            elif group_connected or group_fresh:
+                group_state = "degraded"
+            else:
+                states = {sources[name]["state"] for name in names}
+                group_state = "error" if "error" in states else "waiting"
+            groups[category] = {
+                "state": group_state,
+                "connected": group_connected,
+                "fresh": group_fresh,
+                "total": len(names),
+                "sources": names,
+            }
+        issues = [
+            f"{value['label']}: {value['state']}"
+            for value in sources.values()
+            if value["state"] != "running"
+        ]
+        group_summary = {
+            category: f"{group['state']} · {group['fresh']}/{group['total']} 路正常"
+            for category, group in groups.items()
+        }
         return {
             "state": state,
+            "health_summary": f"{fresh}/{total} 路数据流正常",
+            "robot_summary": group_summary.get("robot", "unavailable"),
+            "audio_summary": group_summary.get("audio", "unavailable"),
+            "odin2_summary": group_summary.get("odin2", "unavailable"),
+            "microphone_state": sources.get("microphone", {}).get("state", "unavailable"),
+            "odin2_pointcloud_state": sources.get("odin2_pointcloud", {}).get("state", "unavailable"),
+            "odin2_camera_left_state": sources.get("odin2_camera_left", {}).get("state", "unavailable"),
+            "odin2_camera_right_state": sources.get("odin2_camera_right", {}).get("state", "unavailable"),
+            "odin2_depth_state": sources.get("odin2_depth", {}).get("state", "unavailable"),
             "connected_sources": connected,
             "fresh_sources": fresh,
+            "total_sources": total,
+            "robot_state": groups.get("robot", {}).get("state", "unavailable"),
+            "audio_state": groups.get("audio", {}).get("state", "unavailable"),
+            "odin2_state": groups.get("odin2", {}).get("state", "unavailable"),
+            "issues": issues,
+            "groups": groups,
             "sources": sources,
             "robot_domain_id": self._config["ros"]["robot_domain_id"],
             "core_domain_id": self._config["ros"]["core_domain_id"],
@@ -778,12 +894,11 @@ class StatePlugin:
             "motor_command": 4,
             "joint_command_feedback": 4,
             "battery": 20,
-            "driver_health": 20,
         }
         for name, divisor in schedules.items():
             if tick % divisor:
                 continue
-            if name != "driver_health" and name not in self._cache:
+            if name not in self._cache:
                 continue
             self._publishers[name].publish(_json_message(self._snapshot(name)))
         if tick % 20 == 0:
@@ -2084,6 +2199,7 @@ class DancePlugin:
 
 
 class JointPlanPlugin:
+    _LIMIT_MARGIN_RAD = 0.0
     _PRESETS = {
         "shake_hand": {
             "indices": list(range(12, 25)),
@@ -2106,9 +2222,12 @@ class JointPlanPlugin:
         ros2.executor_robot.add_node(self._sub_node)
         ros2.executor_core.add_node(self._pub_node)
         self._publisher = None
-        self._state_lock = threading.Lock()
+        self._state_lock = threading.RLock()
+        self._state_changed = threading.Condition(self._state_lock)
         self._last_state = {"state": "no_data"}
+        self._executing_requests: set[int] = set()
         self._request_id = 0
+        self._state_type = None
         self._state = state
         self._core_topic = f"/{namespace}/state/joint_plan"
         self._core_pub = self._pub_node.create_publisher(String, self._core_topic, _BEST_EFFORT)
@@ -2159,6 +2278,7 @@ class JointPlanPlugin:
         from interface_protocol.msg import JointMotionPlanRequest, JointMotionPlanState
 
         self._request_type = JointMotionPlanRequest
+        self._state_type = JointMotionPlanState
         self._publisher = self._sub_node.create_publisher(
             JointMotionPlanRequest, self._config["topics"]["joint_plan_request"], _RELIABLE_ONE
         )
@@ -2235,6 +2355,79 @@ class JointPlanPlugin:
             return self._publish_request("plan", args)
         return {"error": f"unknown joint plan action: {action}"}
 
+    def current_motion(self) -> tuple[str, list[str]]:
+        if self._state is None:
+            return "", []
+        return self._state.current_motion()
+
+    def wait_until_idle(
+        self,
+        timeout: float,
+        cancel_event: threading.Event,
+        *,
+        minimum_request_id: int | None = None,
+    ) -> dict:
+        """Wait for an IDLE planner state without inventing time-based progress."""
+        if self._state_type is None:
+            raise RuntimeError("joint planner is not started")
+        deadline = time.monotonic() + float(timeout)
+        idle = int(self._state_type.IDLE)
+        with self._state_changed:
+            while True:
+                if cancel_event.is_set():
+                    raise RuntimeError("gesture cancelled")
+                state = dict(self._last_state)
+                request_id = state.get("request_id")
+                # The official planner may not publish until it receives its
+                # first request. Allow that first request, then require an
+                # observed state for every subsequent transition.
+                if request_id is None and minimum_request_id is None:
+                    return state
+                if (
+                    request_id is not None
+                    and int(state.get("status", -1)) == idle
+                    and (minimum_request_id is None or int(request_id) >= minimum_request_id)
+                ):
+                    return state
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("joint planner did not become IDLE")
+                self._state_changed.wait(timeout=min(remaining, 0.2))
+
+    def wait_for_request(
+        self,
+        request_id: int,
+        timeout: float,
+        cancel_event: threading.Event,
+    ) -> dict:
+        """Require the planner to execute and finish the exact request."""
+        if self._state_type is None:
+            raise RuntimeError("joint planner is not started")
+        target = int(request_id)
+        deadline = time.monotonic() + float(timeout)
+        idle = int(self._state_type.IDLE)
+        with self._state_changed:
+            while True:
+                if cancel_event.is_set():
+                    raise RuntimeError("gesture cancelled")
+                state = dict(self._last_state)
+                current_id = state.get("request_id")
+                status = int(state.get("status", -1))
+                if (
+                    current_id is not None
+                    and int(current_id) == target
+                    and target in self._executing_requests
+                    and status == idle
+                ):
+                    self._executing_requests.discard(target)
+                    return state
+                if current_id is not None and int(current_id) > target:
+                    raise RuntimeError(f"joint planner request {target} was superseded")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"joint planner did not complete request {target}")
+                self._state_changed.wait(timeout=min(remaining, 0.2))
+
     def _next_request_id(self) -> int:
         with self._state_lock:
             self._request_id += 1
@@ -2251,8 +2444,11 @@ class JointPlanPlugin:
                 self._request_type.REQUEST_RESET if action == "reset" else self._request_type.REQUEST_PLAN_EXECUTE
             )
         if action == "plan":
-            indices = validate_joint_indices(args.get("joint_indices"))
-            positions = float_list(args.get("target_positions"), "target_positions", size=len(indices))
+            indices, positions = validate_joint_positions(
+                args.get("joint_indices"),
+                args.get("target_positions"),
+                limit_margin_rad=self._LIMIT_MARGIN_RAD,
+            )
             velocities = optional_floats(args, "target_velocities", len(indices))
             stiffness = optional_floats(args, "stiffness", len(indices))
             damping = optional_floats(args, "damping", len(indices))
@@ -2281,16 +2477,27 @@ class JointPlanPlugin:
             "progress": float(msg.progress),
             "timestamp_ms": _now_ms(),
         }
-        with self._state_lock:
+        with self._state_changed:
             self._request_id = max(self._request_id, int(msg.request_id))
             self._last_state = payload
+            if self._state_type is not None and int(msg.status) == int(self._state_type.EXECUTING):
+                self._executing_requests.add(int(msg.request_id))
+            self._state_changed.notify_all()
         self._core_pub.publish(_json_message(payload))
 
 
 class GesturePlugin:
-    """Multi-step gesture choreography using the official joint planner."""
+    """Planner-synchronised upper-body gestures validated against URDF limits."""
 
     _INDICES = list(range(12, 25))
+    _LIMIT_MARGIN_RAD = 0.02
+    _READY_TIMEOUT_SEC = 10.0
+    _STEP_TIMEOUT_SEC = 15.0
+    _COOLDOWN_SEC = 3.0
+    _ACP_TIMEOUT_SEC = 300.0
+    _ACP_CALLBACK_TIMEOUT_SEC = 5.0
+    _ACP_SAFETY_MARGIN_SEC = 5.0
+    _MAX_SEQUENCE_STEPS = 16
     _NEUTRAL = [0.0, 0.028, 0.084, -0.001, -0.066, 0.0, 0.024, -0.081, 0.001, -0.069, 0.0, 0.0, 0.0]
     _RAISED = [0.0, -1.29568, 1.17971, 0.0757227, -1.06603, -0.0989933,
                -0.0211716, -0.322156, 0.0440607, -0.0871668, 0.0196457, 0.0, 0.0]
@@ -2300,24 +2507,37 @@ class GesturePlugin:
                       -0.47, 0.255, 0.161, -0.731, 0.028, 0.0, 0.0]
     _HAND_WITHDRAWN = [0.0, 0.024, 0.081, -0.001, -0.069, 0.0,
                        0.028, -0.084, 0.001, -0.066, 0.0, 0.0, 0.0]
-    _BASE_STIFFNESS = [200.0, 30.0, 30.0, 15.0, 30.0, 15.0,
-                       40.0, 40.0, 20.0, 40.0, 20.0, 100.0, 100.0]
-    _WAVE_STIFFNESS = [500.0, 30.0, 30.0, 15.0, 30.0, 15.0,
-                       40.0, 40.0, 20.0, 40.0, 20.0, 100.0, 100.0]
     _SHAKE_STIFFNESS = [400.0, 40.0, 40.0, 20.0, 40.0, 20.0,
                         40.0, 40.0, 20.0, 40.0, 20.0, 100.0, 100.0]
-    _BASE_DAMPING = [3.0, 1.0, 1.0, 1.0, 1.0, 1.0,
-                     1.0, 1.0, 1.0, 1.0, 1.0, 3.0, 3.0]
+    _SHAKE_DAMPING = [3.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+                      1.0, 1.0, 1.0, 1.0, 1.0, 3.0, 3.0]
     _GESTURES = {
         "wave_hands": [
-            (_NEUTRAL, 1.0, _BASE_STIFFNESS), (_RAISED, 2.0, _BASE_STIFFNESS),
-            (_WAVE, 0.3, _WAVE_STIFFNESS), (_RAISED, 0.3, _WAVE_STIFFNESS),
-            (_WAVE, 0.3, _WAVE_STIFFNESS), (_RAISED, 0.3, _WAVE_STIFFNESS),
-            (_WAVE, 0.3, _BASE_STIFFNESS),
+            {"name": "neutral", "positions": _NEUTRAL, "duration": 1.0},
+            {"name": "raise_hand", "positions": _RAISED, "duration": 2.0},
+            {"name": "wave_left", "positions": _WAVE, "duration": 0.3},
+            {"name": "wave_right", "positions": _RAISED, "duration": 0.3},
+            {"name": "wave_left_again", "positions": _WAVE, "duration": 0.3},
+            {"name": "wave_right_again", "positions": _RAISED, "duration": 0.3},
+            {"name": "wave_finish", "positions": _WAVE, "duration": 0.3},
+            {"name": "return_to_neutral", "positions": _NEUTRAL, "duration": 2.0},
         ],
         "shake_hand": [
-            (_HAND_EXTENDED, 2.0, _SHAKE_STIFFNESS),
-            (_HAND_WITHDRAWN, 2.0, _SHAKE_STIFFNESS),
+            {
+                "name": "extend_right_hand",
+                "positions": _HAND_EXTENDED,
+                "duration": 2.0,
+                "hold_after_sec": 2.0,
+                "stiffness": _SHAKE_STIFFNESS,
+                "damping": _SHAKE_DAMPING,
+            },
+            {
+                "name": "withdraw_right_hand",
+                "positions": _HAND_WITHDRAWN,
+                "duration": 2.0,
+                "stiffness": _SHAKE_STIFFNESS,
+                "damping": _SHAKE_DAMPING,
+            },
         ],
     }
 
@@ -2326,35 +2546,48 @@ class GesturePlugin:
         self._lock = threading.Lock()
         self._cancel = threading.Event()
         self._thread: threading.Thread | None = None
-        self._status = {"state": "idle", "gesture": None, "step": 0, "total_steps": 0}
+        self._last_finished_at: float | None = None
+        self._status = {
+            "state": "idle", "gesture": None, "step": 0, "step_name": None,
+            "total_steps": 0, "request_id": None, "error": None,
+        }
 
     def get_tool(self) -> dict:
+        actions = _with_lifecycle({
+            "list": ([], "列出内置手势及步数"),
+            "play": (["name", "repetitions", "reset_after", "force"], "异步播放一次实机验证手势"),
+            "sequence": (["steps", "reset_after", "force"], "异步执行经过关节限位校验的自定义序列"),
+            "stop_gesture": (["reset_after"], "取消当前步骤并停止手势"),
+            "status": ([], "查询手势、步骤和错误"),
+        })
+        actions["stop"] = (["reset_after"], "停止当前手势并进入空闲状态")
+        schema = action_schema(
+            actions,
+            {
+                "name": {"type": "string", "enum": list(self._GESTURES)},
+                "repetitions": {"type": "integer", "minimum": 1, "maximum": 1,
+                                "description": "安全限制：内置手势每次只执行一次"},
+                "reset_after": {"type": "boolean"},
+                "force": {"type": "boolean", "description": "忽略 lower_body_balance 状态门禁"},
+                "steps": {
+                    "type": "array",
+                    "description": "每步支持 joint_indices 或 joint_names、target_positions、duration、hold_after_sec、stiffness、damping",
+                    "maxItems": self._MAX_SEQUENCE_STEPS,
+                    "items": {"type": "object"},
+                },
+            },
+            "手势动作",
+        )
+        schema["x-completion"] = {
+            "actions": ["play", "sequence"],
+            "timeout": int(self._ACP_TIMEOUT_SEC),
+        }
         return {
             "name": "gesture",
             "type": "actuator",
             "multiInstance": False,
             "description": "T800 完整多步手势编排；内置官方挥手和握手序列，也支持任意关节动作队列",
-            "inputSchema": action_schema(
-                {
-                    "list": ([], "列出内置手势及步数"),
-                    "play": (["name", "repetitions", "reset_after", "wait"], "播放内置完整手势"),
-                    "sequence": (["steps", "reset_after", "wait"], "执行自定义多步关节规划序列"),
-                    "stop_gesture": (["reset_after"], "取消当前步骤并停止手势"),
-                    "status": ([], "查询手势、步骤和错误"),
-                },
-                {
-                    "name": {"type": "string", "enum": list(self._GESTURES)},
-                    "repetitions": {"type": "integer", "minimum": 1, "maximum": 20},
-                    "reset_after": {"type": "boolean"},
-                    "wait": {"type": "boolean", "description": "等待整套动作完成"},
-                    "steps": {
-                        "type": "array",
-                        "description": "每步支持 joint_indices 或 joint_names、target_positions、duration、stiffness、damping",
-                        "items": {"type": "object"},
-                    },
-                },
-                "手势动作",
-            ),
+            "inputSchema": schema,
         }
 
     def start(self) -> None:
@@ -2368,111 +2601,313 @@ class GesturePlugin:
             return {
                 "state": "ready",
                 "gestures": [
-                    {"name": name, "steps": len(steps), "source": "EngineAI T800 official example"}
+                    {"name": name, "steps": len(steps), "source": "T800 real-device validated trajectory"}
                     for name, steps in self._GESTURES.items()
                 ],
                 "custom_sequence": True,
+                "safety": {
+                    "required_motion_state": "lower_body_balance",
+                    "position_limit_margin_rad": self._LIMIT_MARGIN_RAD,
+                    "planner_state_synchronised": True,
+                    "cooldown_sec": self._COOLDOWN_SEC,
+                    "maximum_repetitions": 1,
+                    "maximum_sequence_steps": self._MAX_SEQUENCE_STEPS,
+                    "acp_timeout_sec": self._ACP_TIMEOUT_SEC,
+                },
             }
         if action == "status":
             with self._lock:
-                return dict(self._status)
-        if action in ("stop", "stop_gesture"):
+                result = dict(self._status)
+                if self._last_finished_at is None:
+                    result["cooldown_remaining_sec"] = 0.0
+                else:
+                    result["cooldown_remaining_sec"] = max(
+                        0.0, self._COOLDOWN_SEC - (time.monotonic() - self._last_finished_at)
+                    )
+                return result
+        if action == "stop":
+            self._stop(reset_after=bool(args.get("reset_after", False)))
+            return {"state": "idle"}
+        if action == "stop_gesture":
             return self._stop(reset_after=bool(args.get("reset_after", False)))
+        if action in ("play", "sequence") and bool(args.get("wait", False)):
+            return {
+                "error": "wait=true is not supported for asynchronous gesture actions; "
+                         "use action_id completion or status instead"
+            }
         if action == "play":
             name = str(args.get("name", ""))
             if name not in self._GESTURES:
                 return {"error": f"unknown gesture: {name}"}
             repetitions = int(args.get("repetitions", 1))
-            if repetitions < 1 or repetitions > 20:
-                return {"error": "repetitions must be between 1 and 20"}
-            steps = []
-            for _ in range(repetitions):
-                steps.extend(self._official_steps(name))
+            if repetitions != 1:
+                return {"error": "repetitions must be 1 for thermal safety"}
+            with self._lock:
+                if (
+                    self._last_finished_at is not None
+                    and time.monotonic() - self._last_finished_at < self._COOLDOWN_SEC
+                ):
+                    return {"error": "gesture cooldown is active"}
+            steps = self._official_steps(name)
             label = name
         elif action == "sequence":
             steps = args.get("steps")
             if not isinstance(steps, list) or not steps:
                 return {"error": "steps must be a non-empty array"}
+            if len(steps) > self._MAX_SEQUENCE_STEPS:
+                return {"error": f"steps cannot contain more than {self._MAX_SEQUENCE_STEPS} items"}
+            if any(not isinstance(step, dict) for step in steps):
+                return {"error": "every gesture step must be an object"}
             steps = [dict(step) for step in steps]
             label = "custom"
         else:
             return {"error": f"unknown gesture action: {action}"}
+        motion, _available_motions = self._joint_plan.current_motion()
+        if motion != "lower_body_balance" and not bool(args.get("force", False)):
+            return {
+                "error": "gesture requires motion state 'lower_body_balance' "
+                         f"(current: {motion or 'unknown'})"
+            }
+        reset_after = bool(args.get("reset_after", True))
+        try:
+            steps = self._prepare_steps(steps)
+            self._validate_completion_budget(steps, reset_after=reset_after)
+        except (TypeError, ValueError) as exc:
+            return {"error": str(exc)}
         return self._start_sequence(
             label,
             steps,
-            reset_after=bool(args.get("reset_after", True)),
-            wait=bool(args.get("wait", False)),
+            reset_after=reset_after,
         )
 
     def _official_steps(self, name: str) -> list[dict]:
         steps = []
-        for positions, duration, stiffness in self._GESTURES[name]:
-            steps.append({
+        for definition in self._GESTURES[name]:
+            step = {
+                "name": definition["name"],
                 "joint_indices": list(self._INDICES),
-                "target_positions": list(positions),
-                "duration": duration,
-                "stiffness": list(stiffness),
-                "damping": list(self._BASE_DAMPING),
+                "target_positions": list(definition["positions"]),
+                "duration": definition["duration"],
+                "hold_after_sec": definition.get("hold_after_sec", 0.0),
+                "stiffness": list(definition.get("stiffness", [])),
+                "damping": list(definition.get("damping", [])),
                 "gravity_compensation": True,
-            })
+            }
+            steps.append(step)
         return steps
 
-    def _start_sequence(self, label: str, steps: list[dict], *, reset_after: bool, wait: bool) -> dict:
+    def _prepare_steps(self, steps: list[dict]) -> list[dict]:
+        prepared = []
+        for offset, source in enumerate(steps, start=1):
+            step = dict(source)
+            if "joint_names" in step:
+                names = step.get("joint_names")
+                if not isinstance(names, (list, tuple)) or not names:
+                    raise ValueError("joint_names must be a non-empty array")
+                unknown = [str(name) for name in names if str(name) not in T800_JOINT_INDEX]
+                if unknown:
+                    raise ValueError(f"unknown joint names: {unknown}")
+                indices = [T800_JOINT_INDEX[str(name)] for name in names]
+            else:
+                indices = step.get("joint_indices")
+            validated_indices, positions = validate_joint_positions(
+                indices,
+                step.get("target_positions"),
+                limit_margin_rad=self._LIMIT_MARGIN_RAD,
+            )
+            duration = float(step.get("duration", 2.0))
+            if not math.isfinite(duration) or not 0.05 <= duration <= 120.0:
+                raise ValueError(f"gesture step {offset} duration must be between 0.05 and 120 seconds")
+            hold_after = float(step.get("hold_after_sec", 0.0))
+            if not math.isfinite(hold_after) or not 0.0 <= hold_after <= 30.0:
+                raise ValueError(f"gesture step {offset} hold_after_sec must be between 0 and 30 seconds")
+            count = len(validated_indices)
+            step["target_positions"] = positions
+            step["duration"] = duration
+            step["hold_after_sec"] = hold_after
+            step["stiffness"] = optional_floats(step, "stiffness", count)
+            step["damping"] = optional_floats(step, "damping", count)
+            step["gravity_compensation"] = bool(step.get("gravity_compensation", True))
+            step["name"] = str(step.get("name", f"step_{offset}"))
+            if "joint_names" not in step:
+                step["joint_indices"] = validated_indices
+            prepared.append(step)
+        return prepared
+
+    def _validate_completion_budget(self, steps: list[dict], *, reset_after: bool) -> None:
+        worst_case = self._READY_TIMEOUT_SEC + self._ACP_CALLBACK_TIMEOUT_SEC
+        worst_case += self._ACP_SAFETY_MARGIN_SEC
+        for step in steps:
+            worst_case += max(
+                self._STEP_TIMEOUT_SEC,
+                float(step["duration"]) + 5.0,
+            )
+            worst_case += float(step.get("hold_after_sec", 0.0))
+        if reset_after:
+            worst_case += self._STEP_TIMEOUT_SEC
+        if worst_case > self._ACP_TIMEOUT_SEC:
+            raise ValueError(
+                f"gesture worst-case runtime {worst_case:.1f}s exceeds "
+                f"ACP completion timeout {self._ACP_TIMEOUT_SEC:.0f}s"
+            )
+
+    def _start_sequence(self, label: str, steps: list[dict], *, reset_after: bool) -> dict:
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
-                return {"error": "another gesture sequence is already running", **self._status}
+                current = dict(self._status)
+                current.pop("action_id", None)
+                return {**current, "error": "another gesture sequence is already running"}
+            from uuid import uuid4
+
+            action_id = f"t800_gesture_{uuid4().hex[:12]}"
             self._cancel = threading.Event()
-            self._status = {"state": "running", "gesture": label, "step": 0,
-                            "total_steps": len(steps), "error": None}
+            self._status = {
+                "state": "running", "gesture": label, "step": 0,
+                "step_name": None, "total_steps": len(steps),
+                "request_id": None, "action_id": action_id, "error": None,
+            }
 
         def run() -> None:
+            request_id = None
             try:
+                self._joint_plan.wait_until_idle(
+                    self._READY_TIMEOUT_SEC, self._cancel
+                )
                 for index, step in enumerate(steps, start=1):
                     if self._cancel.is_set():
-                        break
+                        raise RuntimeError("gesture cancelled")
                     with self._lock:
                         self._status["step"] = index
+                        self._status["step_name"] = step["name"]
                     action = "plan_named" if "joint_names" in step else "plan"
                     result = self._joint_plan.dispatch(action, step)
                     if "error" in result:
                         raise ValueError(result["error"])
+                    request_id = int(result["request_id"])
                     with self._lock:
-                        self._status["request_id"] = result.get("request_id")
-                    duration = clamp(step.get("duration", 2.0), 0.05, 120.0)
-                    if self._cancel.wait(duration):
-                        break
+                        self._status["request_id"] = request_id
+                    self._joint_plan.wait_for_request(
+                        request_id,
+                        max(self._STEP_TIMEOUT_SEC, float(step["duration"]) + 5.0),
+                        self._cancel,
+                    )
+                    hold_after = float(step.get("hold_after_sec", 0.0))
+                    if hold_after > 0 and self._cancel.wait(hold_after):
+                        raise RuntimeError("gesture cancelled")
                 if not self._cancel.is_set() and reset_after:
                     result = self._joint_plan.dispatch("reset", {})
+                    if "error" in result:
+                        raise ValueError(result["error"])
+                    request_id = int(result["request_id"])
                     with self._lock:
-                        self._status["request_id"] = result.get("request_id")
+                        self._status["request_id"] = request_id
+                        self._status["step_name"] = "reset"
+                    self._joint_plan.wait_for_request(
+                        request_id,
+                        self._STEP_TIMEOUT_SEC,
+                        self._cancel,
+                    )
                 with self._lock:
-                    self._status["state"] = "cancelled" if self._cancel.is_set() else "completed"
+                    if self._cancel.is_set() or self._status.get("state") == "cancelled":
+                        self._status["state"] = "cancelled"
+                        self._status["error"] = ""
+                    else:
+                        self._status["state"] = "completed"
             except Exception as exc:
+                cancelled = self._cancel.is_set()
+                if request_id is not None:
+                    self._joint_plan.dispatch("cancel", {"request_id": request_id})
                 with self._lock:
-                    self._status["state"] = "error"
-                    self._status["error"] = str(exc)
+                    self._status["state"] = "cancelled" if cancelled else "error"
+                    self._status["error"] = "" if cancelled else str(exc)
+            finally:
+                with self._lock:
+                    self._last_finished_at = time.monotonic()
+                    final_status = str(self._status.get("state", "error"))
+                    final_result = {
+                        "gesture": label,
+                        "step": self._status.get("step"),
+                        "step_name": self._status.get("step_name"),
+                        "total_steps": self._status.get("total_steps"),
+                        "request_id": self._status.get("request_id"),
+                        "error": self._status.get("error"),
+                    }
+                if action_id is not None:
+                    self._acp_notify(action_id, final_status, final_result)
 
         thread = threading.Thread(target=run, daemon=True, name="t800-gesture-sequence")
         with self._lock:
             self._thread = thread
         thread.start()
-        if wait:
-            thread.join()
-            with self._lock:
-                return dict(self._status)
-        return {"state": "running", "gesture": label, "total_steps": len(steps)}
+        return {
+            "state": "running",
+            "gesture": label,
+            "total_steps": len(steps),
+            "action_id": action_id,
+        }
 
     def _stop(self, *, reset_after: bool) -> dict:
-        self._cancel.set()
         with self._lock:
-            request_id = self._status.get("request_id")
+            active = (
+                self._status.get("state") == "running"
+                and self._thread is not None
+                and self._thread.is_alive()
+            )
+            if active:
+                self._cancel.set()
+                self._status["state"] = "cancelled"
+                self._status["error"] = ""
+                request_id = self._status.get("request_id")
+            else:
+                request_id = None
+            result = dict(self._status)
         if request_id is not None:
             self._joint_plan.dispatch("cancel", {"request_id": request_id})
         if reset_after:
             self._joint_plan.dispatch("reset", {})
-        with self._lock:
-            self._status["state"] = "cancelled"
-            return dict(self._status)
+        return result
+
+    @staticmethod
+    def _acp_notify(action_id: str, status: str, result: dict) -> None:
+        """Report asynchronous gesture completion to Agent Core."""
+        import json as _json
+        import os as _os
+        import ssl as _ssl
+        import urllib.parse as _urlparse
+        import urllib.request as _urllib
+
+        agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+        ca_cert = _os.environ.get("AGENT_CORE_CA_CERT")
+        try:
+            parsed_url = _urlparse.urlparse(agent_core_url)
+            if parsed_url.scheme not in ("http", "https"):
+                raise ValueError("AGENT_CORE_URL must use http or https")
+            if (
+                parsed_url.scheme == "http"
+                and parsed_url.hostname not in ("localhost", "127.0.0.1", "::1")
+            ):
+                raise ValueError("unencrypted AGENT_CORE_URL is only allowed on loopback")
+            context = _ssl.create_default_context(cafile=ca_cert or None)
+            payload = _json.dumps({
+                "action_id": action_id,
+                "status": status,
+                "result": result,
+                "tool": "gesture",
+                "ts": time.time(),
+            }).encode()
+            request = _urllib.Request(
+                f"{agent_core_url}/api/acp/complete",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            _urllib.urlopen(
+                request,
+                timeout=GesturePlugin._ACP_CALLBACK_TIMEOUT_SEC,
+                context=context,
+            )
+        except Exception as exc:
+            print(f"[gesture] ACP callback failed for {action_id}: {exc}", flush=True)
 
 
 class _JointStreamBase:
@@ -3032,7 +3467,12 @@ class MicPlugin:
         self._process = None
         self._thread = None
         self._samples_published = 0
+        self._chunks_published = 0
+        self._last_chunk_at: float | None = None
         self._last_error = ""
+        self._stop_requested = False
+        self._timeout = float(config["ros"].get("source_timeout_sec", 1.0))
+        self._lock = threading.RLock()
 
     def get_tool(self) -> dict:
         return sensor_tool(
@@ -3063,7 +3503,11 @@ class MicPlugin:
             self._last_error = f"parec exited with code {self._process.returncode}"
             self._process = None
             raise RuntimeError(self._last_error)
-        self._running = True
+        with self._lock:
+            self._running = True
+            self._last_chunk_at = None
+            self._last_error = ""
+            self._stop_requested = False
         self._thread = threading.Thread(target=self._capture_loop, daemon=True, name="t800-mic")
         self._thread.start()
 
@@ -3080,7 +3524,9 @@ class MicPlugin:
         subprocess.run(["pactl", "info"], capture_output=True, text=True, timeout=3, check=True)
 
     def stop(self) -> None:
-        self._running = False
+        with self._lock:
+            self._running = False
+            self._stop_requested = True
         process = self._process
         self._process = None
         if process is not None and process.poll() is None:
@@ -3109,7 +3555,9 @@ class MicPlugin:
                     self._publish_chunk(bytes(pending))
                     pending.clear()
         except Exception as exc:  # noqa: BLE001
-            self._last_error = str(exc)
+            with self._lock:
+                self._last_error = str(exc)
+                self._running = False
         finally:
             if self._running and process is not None and process.poll() is not None:
                 self._last_error = f"parec exited with code {process.returncode}"
@@ -3122,7 +3570,49 @@ class MicPlugin:
         msg.format = "audio/pcm-16k"
         msg.data = list(chunk)
         self._publisher.publish(msg)
-        self._samples_published += len(chunk) // 2
+        with self._lock:
+            self._samples_published += len(chunk) // 2
+            self._chunks_published += 1
+            self._last_chunk_at = time.monotonic()
+
+    def health_sources(self) -> dict:
+        now = time.monotonic()
+        with self._lock:
+            running = self._running
+            updated = self._last_chunk_at
+            samples = self._samples_published
+            chunks = self._chunks_published
+            error = self._last_error
+            stop_requested = self._stop_requested
+        age = None if updated is None else max(0.0, now - updated)
+        connected = updated is not None
+        stale = (not running) or age is None or age > self._timeout
+        if error and not running and not stop_requested:
+            state = "error"
+        elif not running:
+            state = "idle"
+        elif not connected:
+            state = "waiting"
+        elif stale:
+            state = "stale"
+        else:
+            state = "running"
+        return {
+            "microphone": {
+                "category": "audio",
+                "label": "麦克风音频",
+                "state": state,
+                "connected": connected,
+                "age_sec": age,
+                "stale": stale,
+                "process_running": running,
+                "samples_published": samples,
+                "chunks_published": chunks,
+                "topic": self._topic,
+                "format": "audio/pcm-16k",
+                "error": error or None,
+            }
+        }
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "start":
@@ -3139,9 +3629,9 @@ class MicPlugin:
             self.stop()
             return {"state": "idle"}
         if action in ("info", "status"):
-            return {"state": "running" if self._running else "idle",
+            source = self.health_sources()["microphone"]
+            return {**source,
                     "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}],
-                    "samples_published": self._samples_published,
                     "last_error": self._last_error}
         return {"error": f"unknown mic action: {action}"}
 
@@ -3184,6 +3674,8 @@ class VisionPlugin:
         self._enabled_tools: set[str] = set()
         self._lock = threading.RLock()
         self._frames = {"pointcloud": 0, "camera_left": 0, "camera_right": 0, "depth": 0}
+        self._updated: dict[str, float] = {}
+        self._timeout = float(config["ros"].get("source_timeout_sec", 1.0))
 
     def get_tools(self) -> list[dict]:
         return [self._cloud_tool(), self._camera_tool(), self._depth_tool()]
@@ -3296,19 +3788,19 @@ class VisionPlugin:
         out = self._multi_type()
         out.data = self._array.array("B", buf)
         self._cloud_pub.publish(out)
-        self._frames["pointcloud"] += 1
+        self._record_frame("pointcloud")
 
     def _on_camera_left(self, msg) -> None:
         if not self._running or "camera" not in self._enabled_tools:
             return
         self._cam_left_pub.publish(msg)
-        self._frames["camera_left"] += 1
+        self._record_frame("camera_left")
 
     def _on_camera_right(self, msg) -> None:
         if not self._running or "camera" not in self._enabled_tools:
             return
         self._cam_right_pub.publish(msg)
-        self._frames["camera_right"] += 1
+        self._record_frame("camera_right")
 
     def _on_depth(self, msg) -> None:
         if not self._running or "depth" not in self._enabled_tools:
@@ -3376,7 +3868,80 @@ class VisionPlugin:
         out.step = target_width * 2
         out.data = depth_mm.tobytes(order="C")
         self._depth_pub.publish(out)
-        self._frames["depth"] += 1
+        self._record_frame("depth")
+
+    def _record_frame(self, name: str) -> None:
+        with self._lock:
+            self._frames[name] += 1
+            self._updated[name] = time.monotonic()
+
+    def health_sources(self) -> dict:
+        now = time.monotonic()
+        with self._lock:
+            running = self._running
+            enabled_tools = set(self._enabled_tools)
+            frames = dict(self._frames)
+            updated = dict(self._updated)
+            source = self._source
+        definitions = {
+            "odin2_pointcloud": {
+                "frame_key": "pointcloud",
+                "tool": "pointcloud",
+                "label": f"Odin2 {source.upper()} 点云",
+                "topic": self._topics[f"vision_cloud_{source}"],
+                "format": "sensor/pointcloud",
+            },
+            "odin2_camera_left": {
+                "frame_key": "camera_left",
+                "tool": "camera",
+                "label": "Odin2 左相机",
+                "topic": self._topics["vision_camera_left"],
+                "format": "image/jpeg",
+            },
+            "odin2_camera_right": {
+                "frame_key": "camera_right",
+                "tool": "camera",
+                "label": "Odin2 右相机",
+                "topic": self._topics["vision_camera_right"],
+                "format": "image/jpeg",
+            },
+            "odin2_depth": {
+                "frame_key": "depth",
+                "tool": "depth",
+                "label": "Odin2 深度图",
+                "topic": self._topics["vision_depth"],
+                "format": "image/depth-z16",
+            },
+        }
+        health = {}
+        for name, definition in definitions.items():
+            frame_key = definition["frame_key"]
+            enabled = running and definition["tool"] in enabled_tools
+            last_update = updated.get(frame_key)
+            age = None if last_update is None else max(0.0, now - last_update)
+            connected = last_update is not None
+            stale = (not enabled) or age is None or age > self._timeout
+            if not enabled:
+                state = "idle"
+            elif not connected:
+                state = "waiting"
+            elif stale:
+                state = "stale"
+            else:
+                state = "running"
+            health[name] = {
+                "category": "odin2",
+                "label": definition["label"],
+                "state": state,
+                "connected": connected,
+                "age_sec": age,
+                "stale": stale,
+                "bridge_running": enabled,
+                "frames": frames[frame_key],
+                "topic": definition["topic"],
+                "format": definition["format"],
+            }
+        return health
 
     def dispatch(self, action: str, args: dict) -> dict:
         tool_name = str(args.get("_tool_name", ""))
@@ -3421,13 +3986,15 @@ class VisionPlugin:
             return {"state": "running" if is_running else "idle",
                     "source": self._source,
                     "topic_out": topic_out,
-                    "frames": dict(self._frames)}
+                    "frames": dict(self._frames),
+                    "health": self.health_sources()}
         if action == "select_source":
             source = str(args.get("source", "")).strip()
             if source not in self._SOURCES:
                 raise ValueError(f"invalid pointcloud source: {source}; expected {'|'.join(self._SOURCES)}")
             with self._lock:
                 self._source = source
+                self._updated.pop("pointcloud", None)
             return {"state": "running" if self._running else "idle", "source": source}
         return {"error": f"unknown vision action: {action}"}
 

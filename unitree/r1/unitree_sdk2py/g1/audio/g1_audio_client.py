@@ -1,7 +1,15 @@
 import json
+import logging
+import os
 
 from ...rpc.client import Client
 from .g1_audio_api import *
+
+_log = logging.getLogger(__name__)
+
+# PlayStream is called once per PCM chunk of every TTS utterance, so anything
+# logged here is a hot path. Off by default; UNITREE_RPC_DEBUG=1 re-enables.
+_AUDIO_DEBUG = bool(os.environ.get('UNITREE_RPC_DEBUG'))
 
 """
 " class SportClient
@@ -63,9 +71,16 @@ class AudioClient(Client):
     def PlayStream(self, app_name: str, stream_id: str, pcm_data: bytes):
         param = json.dumps({"app_name": app_name, "stream_id": stream_id})
         pcm_list = list(pcm_data)
-        print(f"[AudioClient] PlayStream app={app_name} id={stream_id} pcm_bytes={len(pcm_data)} list_len={len(pcm_list)}")
+        if _AUDIO_DEBUG:
+            _log.debug("[AudioClient] PlayStream app=%s id=%s pcm_bytes=%d",
+                       app_name, stream_id, len(pcm_data))
         result = self._CallRequestWithParamAndBin(ROBOT_API_ID_AUDIO_START_PLAY, param, pcm_list)
-        print(f"[AudioClient] PlayStream result={result}")
+        # Deliberately log only the status code, never `result` itself: it is
+        # (code, response.data) and response.data is a DDS string field that can
+        # carry non-UTF-8 bytes straight into the log framer.
+        if _AUDIO_DEBUG:
+            code = result[0] if isinstance(result, tuple) else result
+            _log.debug("[AudioClient] PlayStream code=%s", code)
         return result
     
     def PlayStop(self, app_name: str):

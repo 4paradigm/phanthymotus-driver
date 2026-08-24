@@ -64,6 +64,7 @@ ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ENV FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
 
 COPY resource/ /work/resource/
+COPY common/ /work/common/
 COPY main.py   /work/main.py
 COPY device.py /work/device.py
 COPY config.yaml /work/config.yaml

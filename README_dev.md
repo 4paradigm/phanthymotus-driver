@@ -102,6 +102,50 @@ For `multiInstance: true` tools, `scope` determines whether a config field is se
 }
 ```
 
+#### Marking sensitive fields (`x-sensitive`)
+
+Canvas configuration is packaged into shareable **Solutions** (Agent Core's
+`/api/solutions/pack`), which are uploaded to the Resource Center marketplace.
+Packaging blanks out sensitive values, but it can only do that for fields the
+tool **declares** as sensitive — there is no field-name blocklist, because a
+guessing heuristic would both miss real secrets and wrongly clear innocent
+fields. A field counts as sensitive when either holds:
+
+| Declaration | Also does |
+|-------------|-----------|
+| `"format": "password"` | Frontend renders a masked password input |
+| `"x-sensitive": true`  | Nothing visually — use when the field must stay visible while typing |
+| `"x-sensitive": false` | Opts **out** of packaging redaction even though `format: password` masks it |
+
+```python
+"configSchema": {
+    "type": "object",
+    "properties": {
+        "api_key":     {"type": "string", "format": "password"},        # masked + never packaged
+        "device_token":{"type": "string", "x-sensitive": True},         # visible + never packaged
+        # Fixed factory password — masked in the UI, but not a user secret. Blanking it
+        # would only make the recipient retype the same default.
+        "ssh_pass":    {"type": "string", "format": "password", "x-sensitive": False},
+        "endpoint":    {"type": "string"},                             # packaged as-is
+    },
+}
+```
+
+`format: password` defaults to sensitive on purpose — an unmarked password box is
+assumed to be a real secret, so drivers written before this convention stay safe.
+Use `"x-sensitive": false` only when the value is a fixed, publicly documented
+default; if an operator can put a real credential in that field, leave it sensitive.
+
+Anything you don't mark is packaged verbatim and becomes readable by everyone
+who downloads the solution. Mark every credential, token, license key, private
+endpoint and personal identifier. Fields that were blanked are reported to the
+loading user as "needs configuration", so marking a field does not break the
+solution — it just makes the recipient fill in their own value.
+
+Two formats are cleared automatically and need no marking, because their values
+only mean something on the machine they were set on: `channel-select` (a local
+channel id) and `audio-input-device` (a local sound-card device).
+
 ---
 
 ## x-action-params Specification
@@ -297,6 +341,107 @@ def dispatch(self, action: str, args: dict) -> dict | None:
     return None
 ```
 
+### Logging: keep stdout usable (Required)
+
+A driver's stdout **is** its Docker log. The daemon frames every write into a
+record (`local` = length-prefixed protobuf, `json-file` = JSON), and two things
+break that framing so badly that `docker logs` returns nothing at all:
+
+```
+Error grabbing logs: invalid character '\x00' looking for beginning of value
+Error grabbing logs: error unmarshalling log entry: proto: illegal tag 0 (wire type 6)
+```
+
+**1. Never redirect fd 1.** `fd 1 == the container log` is an invariant. A
+`dup2(devnull, 1)` + `sys.stdout = os.fdopen(os.dup(1))` shuffle looks like a way
+to silence a noisy native library, but it:
+
+- leaves two buffered writers (`sys.stdout` and the still-live `sys.__stdout__`)
+  on one pipe — writes above `PIPE_BUF` (4096 B on Linux) are **not atomic**, so
+  concurrent lines interleave and tear a record in half;
+- costs every `multiprocessing`/`subprocess` child its stdout, because
+  `os.dup()` returns a non-inheritable fd and the child inherits fd 1 =
+  `/dev/null`.
+
+Silence the source instead: gate the prints, or set the library's own env var
+(`CYCLONEDDS_URI` tracing to `/dev/null`, `RCUTILS_COLORIZED_OUTPUT=0`).
+
+**2. Never truncate a live container's log file.** `truncate -s 0` resets the
+file size but not the daemon's write offset, so the next write lands past EOF and
+the kernel NUL-fills the gap — producing exactly the errors above. To reclaim
+space use `docker restart <container>`; the daemon then reopens its writer
+cleanly. Rotation is already declared in every `deploy/service.yml`.
+
+**3. Install the atomic writer.** `common/logsafe.py` replaces `sys.stdout` with
+a writer that emits each complete line in one `os.write`, capped below
+`PIPE_BUF`, with C0 control characters and ANSI escape sequences stripped. Import
+it first, and again at the top of every spawned child entry point — a spawned
+child does not inherit the parent's `sys.stdout` object:
+
+```python
+from common import logsafe
+logsafe.install()
+```
+
+Add `common` to the build context via `driver.yaml`, and copy it in:
+
+```yaml
+build_context_extras:
+  - ../../common
+```
+```dockerfile
+COPY common/ /work/common/
+```
+
+**4. Throttle per-frame logs.** Anything inside a sensor callback runs at 10–30 Hz.
+Log the *state transition* unthrottled and sample the steady state:
+
+```python
+self._n = getattr(self, '_n', 0) + 1
+if self._n == 1 or self._n % 100 == 0:
+    print(f"[lidar] closest={d:.2f}m (n={self._n})", flush=True)
+```
+
+**5. Escape anything remote-controlled.** With `network_mode: host` the MCP port
+is reachable, so an HTTP request line is attacker-controlled bytes. Escape and
+cap before printing:
+
+```python
+safe = msg.encode("unicode_escape").decode("ascii")[:200]
+print(f"[mcp] {self.address_string()} {safe}")
+```
+
+**Debugging escape hatch:** the vendored Unitree SDK's per-RPC and per-PCM-chunk
+prints are gated behind `UNITREE_RPC_DEBUG=1`. Set it when chasing RPC timeouts
+(error 3104); leave it unset in production, where those prints cost 3–5 lines per
+RPC call.
+
+### Logging checklist for a new driver
+
+All 13 existing drivers satisfy this; a new one is expected to as well.
+
+- [ ] `driver.yaml` has `build_context_extras: [../../common]`
+- [ ] `Dockerfile` has `COPY common/ /work/common/`
+- [ ] `main.py` calls `logsafe.install()` before anything prints (or routes
+      through `common.vendor_runtime.run_driver()`, which installs it for you)
+- [ ] every `multiprocessing` child entry point calls `logsafe.install(check_fd=False)`
+- [ ] no `os.dup(1)` / `dup2(..., 1)` anywhere
+- [ ] `log_message` escapes and caps the request line
+- [ ] no unthrottled `print` inside a per-frame / per-message callback
+- [ ] `Dockerfile` sets `PYTHONUNBUFFERED=1` and `RCUTILS_COLORIZED_OUTPUT=0`,
+      plus `CYCLONEDDS_URI` tracing to `/dev/null` if the driver uses CycloneDDS
+- [ ] `deploy/service.yml` declares `logging: {driver: local, max-size: 10m, max-file: 3}`
+
+A quick self-check before opening a PR:
+
+```bash
+grep -rn "os\.dup(1)" --include="*.py" .            # must be empty
+grep -rlF 'print(f"[mcp] {self.address_string()} {msg}")' --include=main.py .   # must be empty
+```
+
+Reviewers apply these as `agents/pr_review/rules/driver.md` in the phanthymotus
+repo.
+
 ---
 
 ## driver.yaml Metadata
@@ -395,7 +540,6 @@ The Agent Core Web Dashboard automatically selects a renderer based on the `form
 | `sensor/lidar*` | Lidar scan | `hint.startsWith('sensor/lidar')` |
 | `sensor/pointcloud` | 3D Point cloud | `hint === 'sensor/pointcloud'` |
 | `sensor/mapping` | 2D Occupancy map | `hint === 'sensor/mapping'` |
-| `sensor/htmsg` | HT structured message | `hint === 'sensor/htmsg'` |
 | (no hint) | Activity stream | Fallback when no format specified |
 
 ### Depth Rendering — `image/depth-z16` vs `image/depth-zlib`

@@ -24,7 +24,7 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 | `joint_command_feedback` | sensor | Native SDK 最近关节控制命令反馈 |
 | `gamepad` | sensor | 遥控器连接、按键和摇杆状态 |
 | `motion_state` | sensor | 当前 Native SDK motion state 和允许转换 |
-| `driver_health` | sensor | 各 ROS2 数据源连接与新鲜度 |
+| `driver_health` | actuator | 每次执行返回一次机器人、麦克风与 Odin2 点云/双目/深度数据流的最新健康 JSON，不持续发布 |
 | `robot_snapshot` | sensor | 运动、关节、IMU、电源和电机健康聚合快照 |
 | `fault_summary` | sensor | 电机掉线/禁用/错误/过温及电源错误摘要 |
 | `stability` | sensor | 基于 IMU 的倾斜和跌倒风险估计 |
