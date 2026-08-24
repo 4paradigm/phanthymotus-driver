@@ -249,6 +249,10 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
     decel_threshold = config.get("decel_threshold", 2.0)
     stop_threshold = config.get("stop_threshold", 0.8)
     lateral_threshold = config.get("lateral_threshold", stop_threshold)
+    # Navigation must pass doorway frames.  Keep its stop zone centered on the
+    # travel direction instead of reusing the wider manual-motion cone.
+    nav_stop_threshold = config.get("nav_stop_threshold", stop_threshold)
+    nav_cone_half_angle = math.radians(config.get("nav_cone_half_angle", 15))
     lidar_timeout = config.get("lidar_timeout", 0.5)
     cone_half_angle = math.radians(config.get("cone_half_angle", 30))
     z_min = config.get("z_min", 0.1)
@@ -267,6 +271,8 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
     obstacle_dist = float("inf")
     obstacle_angle = 0.0
     lateral_obstacle = False
+    nav_obstacle_dist = float("inf")
+    nav_obstacle_angle = 0.0
     last_lidar_time = 0.0
     fwd_log_n = 0
     nav_pause_reason = None
@@ -337,7 +343,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
 
     # ── LiDAR DDS Subscription ──
     def on_cloud(msg):
-        nonlocal obstacle_dist, obstacle_angle, lateral_obstacle, last_lidar_time, fwd_log_n
+        nonlocal obstacle_dist, obstacle_angle, lateral_obstacle, nav_obstacle_dist, nav_obstacle_angle, last_lidar_time, fwd_log_n
         last_lidar_time = time.monotonic()
 
         # Get heading
@@ -378,6 +384,8 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
                 obstacle_dist = float("inf")
                 obstacle_angle = 0.0
                 lateral_obstacle = False
+                nav_obstacle_dist = float("inf")
+                nav_obstacle_angle = 0.0
             return
 
         vx_pts = px[valid]
@@ -418,7 +426,21 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
                 # Left the decel zone — reset so re-entry logs immediately.
                 fwd_log_n = 0
 
-        # Lateral (45°-90°, within its independently configurable threshold)
+        # Navigation has a separate, narrower center corridor.  Do not derive
+        # this from min_fwd_dist: a closer door frame at 20-30 degrees must not
+        # hide an object directly in front of the robot.
+        nav_forward_mask = angle_diffs <= nav_cone_half_angle
+        min_nav_dist = float("inf")
+        min_nav_angle = 0.0
+        if np.any(nav_forward_mask):
+            nav_dists = vdist[nav_forward_mask]
+            nav_idx = np.argmin(nav_dists)
+            min_nav_dist = float(nav_dists[nav_idx])
+            min_nav_angle = float(point_angles[nav_forward_mask][nav_idx])
+
+        # Lateral (45°-90°, within its independently configurable threshold).
+        # This remains relevant for manually commanded motion, but deliberately
+        # does not stop SLAM navigation: doorway frames belong in this region.
         lat_mask = (angle_diffs >= math.radians(45)) & \
                    (angle_diffs <= math.radians(90)) & \
                    (vdist < lateral_threshold)
@@ -428,6 +450,8 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
             obstacle_dist = min_fwd_dist
             obstacle_angle = min_fwd_angle
             lateral_obstacle = lat_detected
+            nav_obstacle_dist = min_nav_dist
+            nav_obstacle_angle = min_nav_angle
 
     try:
         event_node.create_subscription(
@@ -826,9 +850,13 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
             result["motion"] = current_cmd.copy()
         if nav_cmd and state in (MotionState.NAVIGATING, MotionState.NAV_PAUSED):
             result["navigation"] = nav_cmd.copy()
+        with slam_info_lock:
+            if nav_current_pose:
+                result["pose"] = dict(nav_current_pose)
         with obstacle_lock:
             result["obstacle_distance"] = round(obstacle_dist, 2) if obstacle_dist != float("inf") else None
             result["lateral_obstacle"] = lateral_obstacle
+            result["nav_obstacle_distance"] = round(nav_obstacle_dist, 2) if nav_obstacle_dist != float("inf") else None
         return result
 
     # ── Safety checks (inline in main loop) ──
@@ -866,6 +894,8 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
         with obstacle_lock:
             dist = obstacle_dist
             lateral = lateral_obstacle
+            nav_dist = nav_obstacle_dist
+            nav_angle = nav_obstacle_angle
 
         lidar_age = time.monotonic() - last_lidar_time
         if state == MotionState.NAVIGATING and lidar_age > lidar_timeout:
@@ -908,11 +938,13 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
 
         elif state == MotionState.NAVIGATING:
             # SLAM navigation uses mode=0; local LiDAR safety owns stopping.
-            if dist <= stop_threshold or lateral:
+            # A narrow, centered cone catches an obstacle in the robot's path
+            # while allowing close side walls and doorway frames to pass.
+            if nav_dist <= nav_stop_threshold:
                 if speed_zone != SpeedZone.STOPPED:
                     speed_zone = SpeedZone.STOPPED
-                    print(f"[SmartMotion:nav_obstacle] PAUSE — dist={dist:.2f}m "
-                          f"angle={math.degrees(obstacle_angle):.1f}° lateral={lateral}", flush=True)
+                    print(f"[SmartMotion:nav_obstacle] PAUSE — dist={nav_dist:.2f}m "
+                          f"angle={math.degrees(nav_angle):.1f}°", flush=True)
                     handle_pause_nav("obstacle")
 
         elif state == MotionState.NAV_PAUSED:
@@ -922,8 +954,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
             # restart the robot.
             if (nav_pause_reason == "obstacle"
                     and lidar_age <= lidar_timeout
-                    and dist > decel_threshold
-                    and not lateral):
+                    and nav_dist > decel_threshold):
                 try:
                     code, _ = slam_client.ResumeNav()
                 except Exception:

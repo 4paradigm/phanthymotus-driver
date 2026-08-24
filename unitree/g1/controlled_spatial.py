@@ -512,35 +512,66 @@ class ControlledSpatialPlugin:
         self._nav_action_id = action_id
         t0 = time.time()
 
-        # Primary: delegate to SmartMotion subprocess which has reliable
-        # pose-based arrival detection (dist < 0.3m from target).
-        # The main process DDS callback for ctrl_info.is_arrived is unreliable
-        # (SLAM service never publishes ctrl_info in practice).
+        # Poll SmartMotion state instead of calling its blocking
+        # ``wait_nav_done`` command.  That command occupied the subprocess's
+        # only command loop until arrival, so a replacement target and stop_nav
+        # could not be processed and timed out at the MCP boundary.
         if self._smart_motion:
-            result = self._smart_motion.wait_nav_done(stall_timeout=stall_timeout)
-            elapsed = round(time.time() - t0, 1)
-            # Guard: if this nav was superseded, don't fire stale ACP
-            if self._nav_action_id != action_id:
-                print(f'[ControlledSpatial] _acp_wait_nav {action_id} superseded, skipping notify')
-                return
-            self._nav_action_id = None
-            status = result.get("status", "error")
-            if status == "arrived":
-                _acp_notify(action_id, "completed", {
-                    "target": target, "pose": result.get("pose"), "elapsed": elapsed,
-                })
-            else:
-                # Validate: if status is unexpected (e.g. "navigating" from queue race),
-                # treat as error with full result for debugging
-                error_msg = result.get("error", status)
-                if status not in ("error", "timeout", "stopped"):
-                    print(f'[ControlledSpatial] _acp_wait_nav unexpected status: {result}')
-                _acp_notify(action_id, "error", {
-                    "target": target,
-                    "error": error_msg,
-                    "elapsed": elapsed,
-                })
-            return
+            last_pose = None
+            last_move_time = time.monotonic()
+            while True:
+                if self._nav_action_id != action_id:
+                    print(f'[ControlledSpatial] _acp_wait_nav {action_id} superseded, skipping notify')
+                    return
+
+                result = self._smart_motion.get_state()
+                if result.get("error"):
+                    # A transient proxy timeout must not cancel a live route.
+                    time.sleep(0.5)
+                    continue
+
+                pose = result.get("pose")
+                if pose and target_pose:
+                    dx = pose["x"] - target_pose["x"]
+                    dy = pose["y"] - target_pose["y"]
+                    distance = math.sqrt(dx * dx + dy * dy)
+                    if distance < 0.3:
+                        self._nav_action_id = None
+                        _acp_notify(action_id, "completed", {
+                            "target": target, "pose": pose,
+                            "distance": round(distance, 3),
+                            "elapsed": round(time.time() - t0, 1),
+                        })
+                        return
+                    if last_pose:
+                        moved = math.hypot(pose["x"] - last_pose["x"], pose["y"] - last_pose["y"])
+                        if moved > 0.05:
+                            last_move_time = time.monotonic()
+                    else:
+                        last_move_time = time.monotonic()
+                    last_pose = pose
+
+                if result.get("state") == "idle":
+                    self._nav_action_id = None
+                    _acp_notify(action_id, "error", {
+                        "target": target, "error": "navigation stopped",
+                        "elapsed": round(time.time() - t0, 1),
+                    })
+                    return
+
+                if (result.get("state") == "navigating"
+                        and time.monotonic() - last_move_time > stall_timeout):
+                    self._smart_motion.stop_nav()
+                    if self._nav_action_id == action_id:
+                        self._nav_action_id = None
+                        _acp_notify(action_id, "error", {
+                            "target": target,
+                            "error": f"stall_timeout ({stall_timeout}s)",
+                            "elapsed": round(time.time() - t0, 1),
+                        })
+                    return
+
+                time.sleep(0.5)
 
         # Fallback: no SmartMotion — poll local DDS callback + stall detection
         last_pose = self._get_pose()
