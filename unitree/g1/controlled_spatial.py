@@ -539,6 +539,9 @@ class ControlledSpatialPlugin:
                     if distance < 0.3:
                         self._nav_action_id = None
                         elapsed = round(time.time() - t0, 1)
+                        completion = self._smart_motion.complete_nav()
+                        if completion.get("error"):
+                            print(f"[ControlledSpatial] failed to mark {target} complete: {completion}", flush=True)
                         print(f"[ControlledSpatial] nav arrived target={target} "
                               f"distance={distance:.3f}m elapsed={elapsed}s", flush=True)
                         _acp_notify(action_id, "completed", {

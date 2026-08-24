@@ -154,6 +154,10 @@ class SmartMotionProxy:
     def stop_nav(self) -> dict:
         return self._call("stop_nav", timeout=30.0)
 
+    def complete_nav(self) -> dict:
+        """Mark a pose-confirmed route as complete without another SLAM RPC."""
+        return self._call("complete_nav", timeout=2.0)
+
     def wait_nav_done(self, stall_timeout: float = 60) -> dict:
         return self._call("wait_nav_done", stall_timeout=stall_timeout,
                           timeout=stall_timeout + 30)
@@ -716,9 +720,10 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
     def handle_navigate_to(x, y, yaw, target_name, speed=0.5, mode=1, stall_timeout=60):
         nonlocal state, nav_cmd, speed_zone, nav_arrived_flag, nav_arrived_error, nav_pause_reason, nav_confirm_frames
 
+        resume_required = state in (MotionState.NAVIGATING, MotionState.NAV_PAUSED)
         if state == MotionState.MOVING:
             do_stop("command")
-        elif state in (MotionState.NAVIGATING, MotionState.NAV_PAUSED):
+        elif resume_required:
             do_stop_nav()
 
         # Reset arrival state for this navigation session
@@ -728,11 +733,13 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
 
         q_z = math.sin(yaw / 2)
         q_w = math.cos(yaw / 2)
-        # Clear any paused state before starting new navigation.
-        try:
-            slam_client.ResumeNav()
-        except Exception:
-            pass
+        # A route replaced while it is active needs a resume after PauseNav.
+        # A route marked complete is already IDLE and must start directly.
+        if resume_required:
+            try:
+                slam_client.ResumeNav()
+            except Exception:
+                pass
         code, resp = slam_client.NavigateTo(x, y, 0, 0, 0, q_z, q_w,
                                               speed=speed, mode=mode)
 
@@ -889,6 +896,17 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
             "status": "paused",
             "warning": f"PauseNav failed, code={code}; local StopMove applied",
         }
+
+    def handle_complete_nav():
+        nonlocal state, nav_cmd, speed_zone, nav_pause_reason, nav_confirm_frames
+        if state not in (MotionState.NAVIGATING, MotionState.NAV_PAUSED):
+            return {"status": "ignored", "state": state.value}
+        state = MotionState.IDLE
+        nav_cmd = None
+        speed_zone = SpeedZone.NORMAL
+        nav_pause_reason = None
+        nav_confirm_frames = 0
+        return {"status": "completed"}
 
     def handle_resume_nav():
         nonlocal state, nav_pause_reason, stop_repeat_count, nav_confirm_frames
@@ -1052,6 +1070,8 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
                 result = handle_resume_nav()
             elif method == "stop_nav":
                 result = do_stop_nav()
+            elif method == "complete_nav":
+                result = handle_complete_nav()
             elif method == "wait_nav_done":
                 result = handle_wait_nav_done(cmd.get("stall_timeout", 60))
             elif method == "get_state":
