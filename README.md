@@ -58,10 +58,13 @@ local branch and commit, fetches that branch in
 `~/hanzebei/phanthymotus-driver` on the target, requires the fetched tip to
 match the exact commit, builds with the repository's G1 Dockerfile, and applies
 the complete `unitree/g1/deploy/service.yml` runtime contract on top of the
-target's Agent Core Compose file. Set
-`REPO_URL`, `SOURCE_REF`, `EXPECTED_COMMIT`, `REMOTE_REPO`, or `IMAGE` only
-when overriding those explicit deployment inputs. `DRY_RUN=1` validates and
-prints the resolved provenance without connecting to the robot.
+target's Agent Core Compose file. If GitHub's Git endpoint is unavailable, a
+GitHub repository automatically falls back to the official `codeload.github.com`
+archive for the same pinned commit; third-party source mirrors are not used.
+Set `REPO_URL`, `SOURCE_ARCHIVE_URL`, `SOURCE_REF`, `EXPECTED_COMMIT`,
+`REMOTE_REPO`, or `IMAGE` only when overriding those explicit deployment
+inputs. `DRY_RUN=1` validates and prints the resolved provenance without
+connecting to the robot.
 
 The G1 Dockerfile uses the Aliyun mirrors for both Ubuntu Ports and PyPI by
 default. It replaces the obsolete Tencent Cloud Ubuntu source inherited from

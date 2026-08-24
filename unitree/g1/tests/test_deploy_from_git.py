@@ -34,7 +34,10 @@ class DeployFromGitContractTest(unittest.TestCase):
     def test_deploy_script_uses_the_template_and_compose_service_identity(self):
         source = DEPLOY_SCRIPT.read_text()
 
-        self.assertIn('service_template="$remote_repo/unitree/g1/deploy/service.yml"', source)
+        self.assertIn('service_template="$source_dir/unitree/g1/deploy/service.yml"', source)
+        self.assertIn("https://codeload.github.com/", source)
+        self.assertIn("SOURCE_MODE=github_archive", source)
+        self.assertIn('timeout 45 git clone', source)
         self.assertIn('ps -q unitree-g1)', source)
         self.assertIn('docker inspect "$container_id"', source)
         self.assertIn('docker exec -w /work "$container_id"', source)
@@ -80,7 +83,7 @@ class DeployFromGitContractTest(unittest.TestCase):
             env.update(
                 {
                     "DRY_RUN": "1",
-                    "REPO_URL": "git@github.com:NBStarry/phanthymotus-driver.git",
+                    "REPO_URL": "https://github.com/NBStarry/phanthymotus-driver.git",
                 }
             )
             result = subprocess.run(
@@ -92,6 +95,14 @@ class DeployFromGitContractTest(unittest.TestCase):
             )
 
         self.assertIn("DRY_RUN=PASS target=g1-bj-wifi", result.stdout)
+        self.assertIn(
+            "repo=https://github.com/NBStarry/phanthymotus-driver.git",
+            result.stdout,
+        )
+        self.assertIn(
+            "archive=https://codeload.github.com/NBStarry/phanthymotus-driver/tar.gz/",
+            result.stdout,
+        )
         self.assertIn("remote_repo=~/hanzebei/phanthymotus-driver", result.stdout)
 
 

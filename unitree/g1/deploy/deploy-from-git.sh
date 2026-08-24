@@ -28,14 +28,26 @@ if [[ -z "${REPO_URL:-}" ]]; then
     REPO_URL="$(git -C "$LOCAL_REPO" remote get-url origin)"
   fi
 fi
+github_repo_path=""
 case "$REPO_URL" in
   https://github.com/*)
-    REPO_URL="git@github.com:${REPO_URL#https://github.com/}"
+    github_repo_path="${REPO_URL#https://github.com/}"
+    ;;
+  https://github.com:443/*)
+    github_repo_path="${REPO_URL#https://github.com:443/}"
+    ;;
+  git@github.com:*)
+    github_repo_path="${REPO_URL#git@github.com:}"
     ;;
 esac
+github_repo_path="${github_repo_path%.git}"
+if [[ -z "${SOURCE_ARCHIVE_URL:-}" && -n "$github_repo_path" ]]; then
+  SOURCE_ARCHIVE_URL="https://codeload.github.com/$github_repo_path/tar.gz/$EXPECTED_COMMIT"
+fi
+SOURCE_ARCHIVE_URL="${SOURCE_ARCHIVE_URL:-}"
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
-  echo "DRY_RUN=PASS target=$TARGET repo=$REPO_URL ref=$SOURCE_REF commit=$EXPECTED_COMMIT base=$ROS_BASE_IMAGE image=$IMAGE remote_repo=$REMOTE_REPO"
+  echo "DRY_RUN=PASS target=$TARGET repo=$REPO_URL ref=$SOURCE_REF commit=$EXPECTED_COMMIT base=$ROS_BASE_IMAGE image=$IMAGE remote_repo=$REMOTE_REPO archive=$SOURCE_ARCHIVE_URL"
   exit 0
 fi
 
@@ -46,7 +58,8 @@ ssh "$TARGET" bash -s -- \
   "$ROS_BASE_IMAGE" \
   "$IMAGE" \
   "$REMOTE_REPO" \
-  "$COMPOSE_BASE" <<'REMOTE_DEPLOY'
+  "$COMPOSE_BASE" \
+  "$SOURCE_ARCHIVE_URL" <<'REMOTE_DEPLOY'
 set -euo pipefail
 
 repo_url="$1"
@@ -56,6 +69,7 @@ ros_base_image="$4"
 image="$5"
 remote_repo_arg="$6"
 compose_base="$7"
+source_archive_url="$8"
 
 if [[ "$remote_repo_arg" == "~/"* ]]; then
   remote_repo="$HOME/${remote_repo_arg:2}"
@@ -63,6 +77,14 @@ else
   remote_repo="$remote_repo_arg"
 fi
 remote_compose="${remote_repo}.compose.${expected_commit:0:7}.yml"
+temporary_source_root=""
+
+cleanup_temporary_source() {
+  if [[ -n "$temporary_source_root" && -d "$temporary_source_root" ]]; then
+    rm -rf -- "$temporary_source_root"
+  fi
+}
+trap cleanup_temporary_source EXIT
 
 command -v git >/dev/null
 command -v docker >/dev/null
@@ -73,6 +95,7 @@ if [[ -e "$remote_repo" && ! -d "$remote_repo/.git" ]]; then
   exit 1
 fi
 
+source_dir=""
 if [[ -d "$remote_repo/.git" ]]; then
   [[ -z "$(git -C "$remote_repo" status --porcelain)" ]] || {
     echo "Remote checkout is dirty: $remote_repo" >&2
@@ -88,32 +111,79 @@ if [[ -d "$remote_repo/.git" ]]; then
       git -C "$remote_repo" remote add "$source_remote" "$repo_url"
     fi
   fi
+  if timeout 45 git -C "$remote_repo" fetch --prune --no-tags "$source_remote" \
+    "refs/heads/$source_ref:refs/remotes/$source_remote/$source_ref"; then
+    remote_commit="$(git -C "$remote_repo" rev-parse "refs/remotes/$source_remote/$source_ref")"
+    [[ "$remote_commit" == "$expected_commit" ]] || {
+      echo "Remote source mismatch: expected=$expected_commit actual=$remote_commit" >&2
+      exit 1
+    }
+    git -C "$remote_repo" checkout --detach "$expected_commit"
+    source_dir="$remote_repo"
+    echo "SOURCE_MODE=git commit=$expected_commit"
+  fi
 else
-  git clone --filter=blob:none --no-checkout "$repo_url" "$remote_repo"
-  source_remote="origin"
+  temporary_source_root="$(mktemp -d /tmp/g1-driver-source.XXXXXX)"
+  if timeout 45 git clone --filter=blob:none --no-checkout \
+    "$repo_url" "$temporary_source_root/git"; then
+    git -C "$temporary_source_root/git" fetch --prune --no-tags origin \
+      "refs/heads/$source_ref:refs/remotes/origin/$source_ref"
+    remote_commit="$(git -C "$temporary_source_root/git" rev-parse "refs/remotes/origin/$source_ref")"
+    [[ "$remote_commit" == "$expected_commit" ]] || {
+      echo "Remote source mismatch: expected=$expected_commit actual=$remote_commit" >&2
+      exit 1
+    }
+    git -C "$temporary_source_root/git" checkout --detach "$expected_commit"
+    mv "$temporary_source_root/git" "$remote_repo"
+    source_dir="$remote_repo"
+    echo "SOURCE_MODE=git commit=$expected_commit"
+  fi
 fi
 
-git -C "$remote_repo" fetch --prune --no-tags "$source_remote" \
-  "refs/heads/$source_ref:refs/remotes/$source_remote/$source_ref"
-remote_commit="$(git -C "$remote_repo" rev-parse "refs/remotes/$source_remote/$source_ref")"
-[[ "$remote_commit" == "$expected_commit" ]] || {
-  echo "Remote source mismatch: expected=$expected_commit actual=$remote_commit" >&2
-  exit 1
-}
-git -C "$remote_repo" checkout --detach "$expected_commit"
+if [[ -z "$source_dir" ]]; then
+  [[ -n "$source_archive_url" ]] || {
+    echo "Git source unavailable and SOURCE_ARCHIVE_URL is empty" >&2
+    exit 1
+  }
+  command -v curl >/dev/null
+  command -v tar >/dev/null
+  if [[ -z "$temporary_source_root" ]]; then
+    temporary_source_root="$(mktemp -d /tmp/g1-driver-source.XXXXXX)"
+  fi
+  archive_file="$temporary_source_root/source.tar.gz"
+  archive_ready=false
+  for attempt in 1 2 3; do
+    rm -f -- "$archive_file"
+    echo "Git source unavailable; downloading official source archive attempt=$attempt"
+    if curl -4 -fsSL --connect-timeout 15 --max-time 600 \
+      -o "$archive_file" "$source_archive_url"; then
+      archive_ready=true
+      break
+    fi
+  done
+  [[ "$archive_ready" == true ]] || {
+    echo "Source archive download failed after 3 attempts: $source_archive_url" >&2
+    exit 1
+  }
+  mkdir "$temporary_source_root/archive"
+  tar -xzf "$archive_file" --strip-components=1 \
+    -C "$temporary_source_root/archive"
+  source_dir="$temporary_source_root/archive"
+  echo "SOURCE_MODE=github_archive commit=$expected_commit"
+fi
 
 docker build --pull=false \
   --build-arg "ROS_BASE_IMAGE=$ros_base_image" \
   --label "phanthy.source_commit=$expected_commit" \
   --label "phanthy.source_ref=$source_ref" \
-  -f "$remote_repo/unitree/g1/Dockerfile" \
+  -f "$source_dir/unitree/g1/Dockerfile" \
   -t "$image" \
-  "$remote_repo/unitree/g1"
+  "$source_dir/unitree/g1"
 
 built_commit="$(docker image inspect "$image" --format '{{ index .Config.Labels "phanthy.source_commit" }}')"
 [[ "$built_commit" == "$expected_commit" ]]
 
-service_template="$remote_repo/unitree/g1/deploy/service.yml"
+service_template="$source_dir/unitree/g1/deploy/service.yml"
 [[ -f "$service_template" ]] || {
   echo "Driver Compose service template is missing: $service_template" >&2
   exit 1

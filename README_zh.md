@@ -55,9 +55,11 @@ cp .env.example .env  # 填写镜像仓库凭据
 
 脚本不会把本地工作树复制到机器人。它会记录本地分支和提交，在目标机器的
 `~/hanzebei/phanthymotus-driver` 中拉取该分支，要求远程分支 tip 与固定提交
-完全一致，再使用仓库自带的 G1 Dockerfile 构建镜像。只有明确需要覆盖部署
-输入时才设置 `REPO_URL`、`SOURCE_REF`、`EXPECTED_COMMIT`、`REMOTE_REPO`
-或 `IMAGE`。`DRY_RUN=1` 只校验并打印最终来源，不连接机器人。
+完全一致，再使用仓库自带的 G1 Dockerfile 构建镜像。当 GitHub Git 端点不可用时，
+GitHub 仓库会自动回退到官方 `codeload.github.com` 上的同一固定提交归档，
+不使用第三方源码镜像。只有明确需要覆盖部署输入时才设置 `REPO_URL`、
+`SOURCE_ARCHIVE_URL`、`SOURCE_REF`、`EXPECTED_COMMIT`、`REMOTE_REPO` 或
+`IMAGE`。`DRY_RUN=1` 只校验并打印最终来源，不连接机器人。
 
 G1 Dockerfile 默认同时使用阿里云 Ubuntu Ports 和 PyPI 国内镜像，并在安装
 构建依赖前替换基础镜像遗留且已不可解析的腾讯云 Ubuntu 源。直接执行
