@@ -53,6 +53,10 @@ class SpeedZone(enum.Enum):
     STOPPED = "stopped"
 
 
+# unitree_sdk2py.rpc.internal.RPC_ERR_CLIENT_API_TIMEOUT
+RPC_ERR_CLIENT_API_TIMEOUT = 3104
+
+
 @dataclass
 class SpeedLimits:
     vx_normal: float = 1.0
@@ -726,8 +730,6 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
         q_z = math.sin(yaw / 2)
         q_w = math.cos(yaw / 2)
         # Clear any paused state before starting new navigation.
-        # If previous nav was paused (by obstacle or user), SLAM service may still
-        # be in paused state — NavigateTo would fail with code=3104.
         try:
             slam_client.ResumeNav()
         except Exception:
@@ -735,7 +737,12 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
         code, resp = slam_client.NavigateTo(x, y, 0, 0, 0, q_z, q_w,
                                               speed=speed, mode=mode)
 
-        if code != 0:
+        # On this firmware NavigateTo can execute successfully while the DDS
+        # response misses the 10s client deadline. Treat that response timeout
+        # as an accepted-but-unconfirmed command so safety and arrival tracking
+        # remain active; a route that never starts still fails via stall timeout.
+        rpc_timeout = code == RPC_ERR_CLIENT_API_TIMEOUT
+        if code != 0 and not rpc_timeout:
             return {"error": f"NavigateTo failed, code={code}", "response": resp}
 
         label = target_name or f"({x:.1f}, {y:.1f})"
@@ -745,9 +752,17 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
         nav_pause_reason = None
         nav_confirm_frames = 0
 
-        publish_event("nav_start", {"target_name": label, "target_pose": {"x": x, "y": y, "yaw": yaw}})
+        event_data = {"target_name": label, "target_pose": {"x": x, "y": y, "yaw": yaw}}
+        if rpc_timeout:
+            event_data["warning"] = "NavigateTo response timed out; monitoring command as active"
+            print(f"[SmartMotion] NavigateTo response timeout for {label}; "
+                  "treating command as active", flush=True)
+        publish_event("nav_start", event_data)
         # Return immediately — non-blocking. wait_navigation_done handles arrival detection.
-        return {"status": "navigating", "target": label, "pose": {"x": x, "y": y, "yaw": yaw}}
+        result = {"status": "navigating", "target": label, "pose": {"x": x, "y": y, "yaw": yaw}}
+        if rpc_timeout:
+            result["warning"] = "NavigateTo response timed out; command may already be running"
+        return result
 
     def handle_wait_nav_done(stall_timeout=60):
         """Block until navigation completes or robot is stuck.
