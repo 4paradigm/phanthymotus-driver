@@ -1038,10 +1038,20 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertNotIn("action_id", busy)
         stopped = gesture.dispatch("stop_gesture", {})
         self.assertEqual("cancelled", stopped["state"])
+        self.assertTrue(gesture._thread.is_alive())
+        self.assertEqual("gesture", plan.arm_status()["owner"])
+
+        arm = self.device.ArmActuatorPlugin(CONFIG, plan, self.state)
+        blocked = arm.dispatch("raise", {"side": "right", "duration": 0.05})
+        self.assertEqual("arm is busy", blocked["error"])
+        self.assertEqual("gesture", blocked["owner"])
+
         release_wait.set()
         gesture._thread.join(timeout=1.0)
+        self.assertFalse(gesture._thread.is_alive())
 
         self.assertEqual("cancelled", gesture.dispatch("status", {})["state"])
+        self.assertIsNone(plan.arm_status()["owner"])
         self.assertEqual(result["action_id"], completions[0][0])
         self.assertEqual("cancelled", completions[0][1])
         self.assertEqual({"state": "idle"}, gesture.dispatch("stop", {}))

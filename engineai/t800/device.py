@@ -2946,7 +2946,6 @@ class GesturePlugin:
             self._joint_plan._dispatch_owned("gesture", "cancel", {"request_id": request_id})
         if reset_after:
             self._joint_plan._dispatch_owned("gesture", "reset", {})
-        self._joint_plan.release_arm("gesture")
         return result
 
     @staticmethod
