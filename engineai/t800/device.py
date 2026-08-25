@@ -3069,6 +3069,8 @@ class ArmSwingPlugin:
     _OWNER = "arm_swing"
     _INDICES = [13, 16, 18, 21]
     _BASE = [0.028, -0.066, 0.024, -0.069]
+    _ACP_TIMEOUT_SEC = 86400.0
+    _ACP_CALLBACK_TIMEOUT_SEC = 5.0
 
     def __init__(self, config: dict, joint_plan: JointPlanPlugin, state: StatePlugin):
         cfg = config.get("plugins", {}).get("arm_swing", {})
@@ -3084,11 +3086,12 @@ class ArmSwingPlugin:
         self._started_at: float | None = None
         self._publish_count = 0
         self._request_id: int | None = None
+        self._action_id: str | None = None
         self._last_reason = "not_started"
         self._validate_parameters(self._amplitude_deg, self._frequency_hz)
 
     def get_tool(self) -> dict:
-        return {
+        tool = {
             "name": "arm_swing",
             "type": "actuator",
             "multiInstance": False,
@@ -3109,6 +3112,11 @@ class ArmSwingPlugin:
                 "持续摆臂动作",
             ),
         }
+        tool["inputSchema"]["x-completion"] = {
+            "actions": ["start_swing"],
+            "timeout": int(self._ACP_TIMEOUT_SEC),
+        }
+        return tool
 
     def start(self) -> None:
         pass
@@ -3141,17 +3149,21 @@ class ArmSwingPlugin:
             self._frequency_hz = frequency
             if running:
                 return self._status_locked()
-        motion, available = self._state.current_motion()
-        if motion != "lower_body_balance":
-            return {
-                "error": f"arm_swing requires lower_body_balance (current: {motion or 'unknown'})",
-                "available_transition_motions": available,
-            }
-        with self._lock:
+            # Keep the idle check, motion-state gate and worker installation
+            # atomic so concurrent MCP calls cannot create two workers.
+            motion, available = self._state.current_motion()
+            if motion != "lower_body_balance":
+                return {
+                    "error": f"arm_swing requires lower_body_balance (current: {motion or 'unknown'})",
+                    "available_transition_motions": available,
+                }
+            from uuid import uuid4
+
             self._halt = threading.Event()
             self._started_at = time.monotonic()
             self._publish_count = 0
             self._request_id = None
+            self._action_id = f"t800_arm_swing_{uuid4().hex[:12]}"
             self._last_reason = "running"
             self._thread = threading.Thread(target=self._run, daemon=True, name="t800-arm-swing")
             self._thread.start()
@@ -3214,10 +3226,20 @@ class ArmSwingPlugin:
                 request_id = self._request_id
                 self._last_reason = reason
                 self._request_id = None
+                action_id = self._action_id
+                final_status = "error" if reason.startswith("error:") else "cancelled"
+                final_result = {
+                    "reason": reason,
+                    "publish_count": self._publish_count,
+                    "request_id": request_id,
+                    "control_backend": "joint_plan",
+                }
             # A request can still be live when the worker is interrupted or
             # errors. Always cancel it before declaring the card idle.
             if request_id is not None:
                 self._joint_plan.dispatch("cancel", {"request_id": request_id})
+            if action_id is not None:
+                self._acp_notify(action_id, final_status, final_result)
 
     def _motion_state_abort_reason(self) -> str | None:
         motion, _ = self._state.current_motion()
@@ -3273,6 +3295,7 @@ class ArmSwingPlugin:
             "frequency_hz": self._frequency_hz,
             "publish_count": self._publish_count,
             "request_id": self._request_id,
+            "action_id": self._action_id,
             "reason": self._last_reason,
             "required_motion_state": "lower_body_balance",
             "joint_indices": list(self._INDICES),
@@ -3285,6 +3308,48 @@ class ArmSwingPlugin:
             raise ValueError("amplitude_deg must be between 2 and 30")
         if not math.isfinite(frequency) or not 0.2 <= frequency <= 1.2:
             raise ValueError("frequency_hz must be between 0.2 and 1.2")
+
+    @staticmethod
+    def _acp_notify(action_id: str, status: str, result: dict) -> None:
+        """Report asynchronous arm-swing completion to Agent Core."""
+        import json as _json
+        import os as _os
+        import ssl as _ssl
+        import urllib.parse as _urlparse
+        import urllib.request as _urllib
+
+        agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+        ca_cert = _os.environ.get("AGENT_CORE_CA_CERT")
+        try:
+            parsed_url = _urlparse.urlparse(agent_core_url)
+            if parsed_url.scheme not in ("http", "https"):
+                raise ValueError("AGENT_CORE_URL must use http or https")
+            if (
+                parsed_url.scheme == "http"
+                and parsed_url.hostname not in ("localhost", "127.0.0.1", "::1")
+            ):
+                raise ValueError("unencrypted AGENT_CORE_URL is only allowed on loopback")
+            context = _ssl.create_default_context(cafile=ca_cert or None)
+            payload = _json.dumps({
+                "action_id": action_id,
+                "status": status,
+                "result": result,
+                "tool": "arm_swing",
+                "ts": time.time(),
+            }).encode()
+            request = _urllib.Request(
+                f"{agent_core_url}/api/acp/complete",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            _urllib.urlopen(
+                request,
+                timeout=ArmSwingPlugin._ACP_CALLBACK_TIMEOUT_SEC,
+                context=context,
+            )
+        except Exception as exc:
+            print(f"[arm_swing] ACP callback failed for {action_id}: {exc}", flush=True)
 
 
 class JointBridgePlugin(_JointStreamBase):
