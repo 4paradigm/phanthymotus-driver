@@ -3207,10 +3207,10 @@ class ArmActuatorPlugin:
     def _start_sequence(self, action: str, steps: list[dict]) -> dict:
         if len(steps) > self._MAX_SEQUENCE_STEPS:
             return {"error": f"arm sequence cannot contain more than {self._MAX_SEQUENCE_STEPS} steps"}
-        busy = self._joint_plan.acquire_arm("arm")
-        if busy is not None:
-            return busy
         with self._lock:
+            busy = self._joint_plan.acquire_arm("arm")
+            if busy is not None:
+                return busy
             if self._thread is not None and self._thread.is_alive():
                 self._joint_plan.release_arm("arm")
                 return {"error": "another arm action is already running"}
@@ -3223,59 +3223,58 @@ class ArmActuatorPlugin:
                 "total_steps": len(steps), "request_id": None, "action_id": action_id, "error": None,
             }
 
-        def run() -> None:
-            request_id = None
-            try:
-                self._joint_plan.wait_until_idle(self._READY_TIMEOUT_SEC, self._cancel)
-                for index, step in enumerate(steps, start=1):
-                    if self._cancel.is_set():
-                        raise RuntimeError("arm action cancelled")
+            def run() -> None:
+                request_id = None
+                try:
+                    self._joint_plan.wait_until_idle(self._READY_TIMEOUT_SEC, self._cancel)
+                    for index, step in enumerate(steps, start=1):
+                        if self._cancel.is_set():
+                            raise RuntimeError("arm action cancelled")
+                        with self._lock:
+                            self._status["step"] = index
+                            self._status["step_name"] = step["name"]
+                        result = self._joint_plan._dispatch_owned("arm", "plan", step)
+                        if "error" in result:
+                            raise ValueError(result["error"])
+                        request_id = int(result["request_id"])
+                        with self._lock:
+                            self._status["request_id"] = request_id
+                        self._joint_plan.wait_for_request(
+                            request_id,
+                            max(self._STEP_TIMEOUT_SEC, float(step["duration"]) + self._feedback_grace()),
+                            self._cancel,
+                        )
                     with self._lock:
-                        self._status["step"] = index
-                        self._status["step_name"] = step["name"]
-                    result = self._joint_plan._dispatch_owned("arm", "plan", step)
-                    if "error" in result:
-                        raise ValueError(result["error"])
-                    request_id = int(result["request_id"])
+                        self._status["state"] = "cancelled" if self._cancel.is_set() else "completed"
+                        self._status["error"] = ""
+                except Exception as exc:
+                    cancelled = self._cancel.is_set()
+                    if request_id is not None:
+                        self._joint_plan._dispatch_owned("arm", "cancel", {"request_id": request_id})
                     with self._lock:
-                        self._status["request_id"] = request_id
-                    self._joint_plan.wait_for_request(
-                        request_id,
-                        max(self._STEP_TIMEOUT_SEC, float(step["duration"]) + self._feedback_grace()),
-                        self._cancel,
-                    )
-                with self._lock:
-                    self._status["state"] = "cancelled" if self._cancel.is_set() else "completed"
-                    self._status["error"] = ""
-            except Exception as exc:
-                cancelled = self._cancel.is_set()
-                if request_id is not None:
-                    self._joint_plan._dispatch_owned("arm", "cancel", {"request_id": request_id})
-                with self._lock:
-                    self._status["state"] = "cancelled" if cancelled else "error"
-                    self._status["error"] = "" if cancelled else str(exc)
-            finally:
-                with self._lock:
-                    final_status = str(self._status.get("state", "error"))
-                    final_result = {
-                        "action": action,
-                        "step": self._status.get("step"),
-                        "step_name": self._status.get("step_name"),
-                        "total_steps": self._status.get("total_steps"),
-                        "request_id": self._status.get("request_id"),
-                        "error": self._status.get("error"),
-                    }
-                self._acp_notify(action_id, final_status, final_result)
-                self._joint_plan.release_arm("arm")
+                        self._status["state"] = "cancelled" if cancelled else "error"
+                        self._status["error"] = "" if cancelled else str(exc)
+                finally:
+                    with self._lock:
+                        final_status = str(self._status.get("state", "error"))
+                        final_result = {
+                            "action": action,
+                            "step": self._status.get("step"),
+                            "step_name": self._status.get("step_name"),
+                            "total_steps": self._status.get("total_steps"),
+                            "request_id": self._status.get("request_id"),
+                            "error": self._status.get("error"),
+                        }
+                    self._acp_notify(action_id, final_status, final_result)
+                    self._joint_plan.release_arm("arm")
 
-        thread = threading.Thread(target=run, daemon=True, name="t800-arm-action")
-        with self._lock:
+            thread = threading.Thread(target=run, daemon=True, name="t800-arm-action")
             self._thread = thread
-        try:
-            thread.start()
-        except Exception:
-            self._joint_plan.release_arm("arm")
-            raise
+            try:
+                thread.start()
+            except Exception:
+                self._joint_plan.release_arm("arm")
+                raise
         return {"state": "running", "action": action, "total_steps": len(steps), "action_id": action_id}
 
     def _stop(self) -> dict:

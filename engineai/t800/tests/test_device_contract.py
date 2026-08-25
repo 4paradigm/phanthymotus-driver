@@ -800,6 +800,35 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual(6, status["step"])
         self.assertEqual("wave_finish_right", status["step_name"])
 
+    def test_arm_concurrent_dispatch_keeps_mutex_owned_by_active_worker(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros)
+        plan.start()
+        arm = self.device.ArmActuatorPlugin(CONFIG, plan, self.state)
+        arm._acp_notify = lambda *_args: None
+        entered = threading.Event()
+        release = threading.Event()
+        plan.wait_until_idle = lambda *_args, **_kwargs: entered.set() or release.wait(timeout=1.0)
+        results = []
+        barrier = threading.Barrier(2)
+
+        def dispatch():
+            barrier.wait()
+            results.append(arm.dispatch("raise", {"side": "right", "duration": 0.05, "force": True}))
+
+        threads = [threading.Thread(target=dispatch) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=1.0)
+        self.assertEqual(1, sum(result.get("state") == "running" for result in results))
+        self.assertEqual(1, sum("another arm action is already running" in result.get("error", "") for result in results))
+        self.assertTrue(entered.wait(timeout=1.0))
+        self.assertEqual("arm", plan.arm_status()["owner"])
+        release.set()
+        arm._thread.join(timeout=1.0)
+        self.assertFalse(arm._thread.is_alive())
+        self.assertIsNone(plan.arm_status()["owner"])
+
     def test_arm_stop_cancels_request_and_releases_mutex(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros)
         plan.start()
