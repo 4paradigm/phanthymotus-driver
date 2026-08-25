@@ -3034,15 +3034,15 @@ class ArmActuatorPlugin:
     def get_tool(self) -> dict:
         schema = action_schema(
             _with_lifecycle({
-                "move_pos": (["side", "target_positions", "duration"], "异步控制单臂或双臂到指定 5/10 关节位置"),
-                "reset": ([], "双臂回到中立姿态"),
-                "raise": (["side", "duration"], "抬起单臂或双臂"),
-                "lower": (["side", "duration"], "放下单臂或双臂"),
-                "wave": (["side", "times", "speed"], "单臂挥手，多步异步序列"),
-                "clap": (["times", "speed"], "双臂鼓掌，多步异步序列"),
-                "point": (["side", "duration"], "单臂指向前方"),
-                "fold": (["duration"], "双臂抱臂姿态"),
-                "shrug": (["duration"], "耸肩表达动作"),
+                "move_pos": (["side", "target_positions", "duration", "force"], "异步控制单臂或双臂到指定 5/10 关节位置"),
+                "reset": (["force"], "双臂回到中立姿态"),
+                "raise": (["side", "duration", "force"], "抬起单臂或双臂"),
+                "lower": (["side", "duration", "force"], "放下单臂或双臂"),
+                "wave": (["side", "times", "speed", "force"], "单臂挥手，多步异步序列"),
+                "clap": (["times", "speed", "force"], "双臂鼓掌，多步异步序列"),
+                "point": (["side", "duration", "force"], "单臂指向前方"),
+                "fold": (["duration", "force"], "双臂抱臂姿态"),
+                "shrug": (["duration", "force"], "耸肩表达动作"),
                 "status": ([], "查询双臂角度、动作状态和 planner 互斥状态"),
             }),
             {
@@ -3051,6 +3051,7 @@ class ArmActuatorPlugin:
                 "duration": {"type": "number", "description": "执行时间，秒"},
                 "times": {"type": "integer", "minimum": 1, "maximum": 5},
                 "speed": {"type": "number", "minimum": 0.5, "maximum": 2.0},
+                "force": {"type": "boolean", "description": "忽略 lower_body_balance 状态门禁"},
             },
             "手臂动作",
         )
@@ -3078,11 +3079,17 @@ class ArmActuatorPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action in ("start", "info"):
-            return {"state": "ready", "position_mode_only": True, "arm_joints": self._arm_joint_names()}
+            return {
+                "state": "ready",
+                "position_mode_only": True,
+                "arm_joints": self._arm_joint_names(),
+                "safety": {"required_motion_state": "lower_body_balance"},
+            }
         if action == "status":
             return self._status_snapshot()
         if action == "stop":
-            return self._stop()
+            self._stop()
+            return {"state": "idle"}
         try:
             if action == "move_pos":
                 side = self._side(args.get("side", "both"), allow_both=True)
@@ -3120,6 +3127,12 @@ class ArmActuatorPlugin:
                 return {"error": f"unknown arm action: {action}"}
         except (TypeError, ValueError) as exc:
             return {"error": str(exc)}
+        motion, _available_motions = self._joint_plan.current_motion()
+        if motion != "lower_body_balance" and not bool(args.get("force", False)):
+            return {
+                "error": "arm action requires motion state 'lower_body_balance' "
+                         f"(current: {motion or 'unknown'})"
+            }
         return self._start_sequence(action, steps)
 
     def _side(self, value, *, allow_both: bool) -> str:

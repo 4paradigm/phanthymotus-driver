@@ -690,6 +690,36 @@ class DevicePluginContractTests(unittest.TestCase):
             schema["x-completion"]["actions"],
         )
         self.assertGreaterEqual(schema["x-completion"]["timeout"], arm._ACP_TIMEOUT_SEC)
+        self.assertEqual(
+            ["side", "duration", "force"],
+            schema["x-action-params"]["raise"]["params"],
+        )
+        self.assertEqual(
+            "忽略 lower_body_balance 状态门禁",
+            schema["properties"]["force"]["description"],
+        )
+        self.assertEqual(
+            "lower_body_balance",
+            arm.dispatch("info", {})["safety"]["required_motion_state"],
+        )
+
+    def test_arm_rejects_unsafe_motion_unless_forced(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros)
+        plan.start()
+        arm = self.device.ArmActuatorPlugin(CONFIG, plan, self.state)
+        plan.current_motion = lambda: ("walking", [])
+        rejected = arm.dispatch("raise", {"side": "right", "duration": 0.05})
+        self.assertIn("lower_body_balance", rejected["error"])
+        self.assertIn("walking", rejected["error"])
+        self.assertEqual([], plan._publisher.messages)
+
+        plan.current_motion = lambda: ("walking", [])
+        plan.wait_until_idle = lambda *_args, **_kwargs: {}
+        plan.wait_for_request = lambda *_args, **_kwargs: {}
+        arm._acp_notify = lambda *_args: None
+        forced = arm.dispatch("raise", {"side": "right", "duration": 0.05, "force": True})
+        self.assertEqual("running", forced["state"])
+        arm._thread.join(timeout=1.0)
 
     def test_arm_move_pos_and_status_use_planner_and_state(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
@@ -703,6 +733,7 @@ class DevicePluginContractTests(unittest.TestCase):
             "side": "left",
             "target_positions": [0.02, 0.08, 0.0, -0.07, 0.0],
             "duration": 0.05,
+            "force": True,
         })
         self.assertEqual("running", result["state"])
         self.assertTrue(result["action_id"].startswith("t800_arm_"))
@@ -719,7 +750,7 @@ class DevicePluginContractTests(unittest.TestCase):
         plan.wait_for_request = lambda *_args, **_kwargs: {}
         arm = self.device.ArmActuatorPlugin({**CONFIG, "arm": {"shrug_amplitude_rad": 0.4}}, plan, self.state)
         arm._acp_notify = lambda *_args: None
-        result = arm.dispatch("shrug", {"duration": 0.05})
+        result = arm.dispatch("shrug", {"duration": 0.05, "force": True})
         self.assertEqual("running", result["state"])
         arm._thread.join(timeout=1.0)
         self.assertFalse(arm._thread.is_alive())
@@ -733,7 +764,7 @@ class DevicePluginContractTests(unittest.TestCase):
         plan.start()
         arm = self.device.ArmActuatorPlugin(CONFIG, plan, self.state)
         arm._acp_notify = lambda *_args: None
-        result = arm.dispatch("wave", {"side": "right", "times": 2, "speed": 1.0})
+        result = arm.dispatch("wave", {"side": "right", "times": 2, "speed": 1.0, "force": True})
         self.assertEqual("running", result["state"])
         expected_names = [
             "wave_start_right", "wave_out_1_right", "wave_in_1_right",
@@ -778,6 +809,7 @@ class DevicePluginContractTests(unittest.TestCase):
             "side": "left",
             "target_positions": [0.02, 0.08, 0.0, -0.07, 0.0],
             "duration": 10.0,
+            "force": True,
         })
         self.assertEqual("running", result["state"])
         deadline = time.monotonic() + 1.0
@@ -786,7 +818,7 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertTrue(plan._publisher.messages)
         request_id = plan._publisher.messages[0].request_id
         stopped = arm.dispatch("stop", {})
-        self.assertEqual("cancelled", stopped["state"])
+        self.assertEqual("idle", stopped["state"])
         arm._thread.join(timeout=1.0)
         self.assertFalse(arm._thread.is_alive())
         self.assertEqual("cancelled", arm.dispatch("status", {})["state"])
@@ -818,6 +850,7 @@ class DevicePluginContractTests(unittest.TestCase):
             "side": "left",
             "target_positions": [0.02, 0.08, 0.0, -0.07, 0.0],
             "duration": 0.05,
+            "force": True,
         })
         self.assertEqual("running", first["state"])
         deadline = time.monotonic() + 1.0
@@ -826,15 +859,15 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual(1, len(wait_calls))
 
         stopped = arm.dispatch("stop", {})
-        self.assertEqual("cancelled", stopped["state"])
-        busy = arm.dispatch("raise", {"side": "right", "duration": 0.05})
+        self.assertEqual("idle", stopped["state"])
+        busy = arm.dispatch("raise", {"side": "right", "duration": 0.05, "force": True})
         self.assertEqual("arm is busy", busy["error"])
 
         first_gate.set()
         arm._thread.join(timeout=1.0)
         self.assertFalse(arm._thread.is_alive())
 
-        second = arm.dispatch("raise", {"side": "right", "duration": 0.05})
+        second = arm.dispatch("raise", {"side": "right", "duration": 0.05, "force": True})
         self.assertEqual("running", second["state"])
         self.assertEqual("arm", plan.arm_status()["owner"])
         second_request_id = plan.arm_status()["request_id"]
@@ -850,7 +883,7 @@ class DevicePluginContractTests(unittest.TestCase):
         plan.start()
         arm = self.device.ArmActuatorPlugin(CONFIG, plan, self.state)
         self.assertIsNone(plan.acquire_arm("gesture"))
-        busy = arm.dispatch("raise", {"side": "right", "duration": 0.05})
+        busy = arm.dispatch("raise", {"side": "right", "duration": 0.05, "force": True})
         self.assertEqual("arm is busy", busy["error"])
         self.assertEqual("gesture", busy["owner"])
         plan.release_arm("gesture")
@@ -1042,7 +1075,7 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("gesture", plan.arm_status()["owner"])
 
         arm = self.device.ArmActuatorPlugin(CONFIG, plan, self.state)
-        blocked = arm.dispatch("raise", {"side": "right", "duration": 0.05})
+        blocked = arm.dispatch("raise", {"side": "right", "duration": 0.05, "force": True})
         self.assertEqual("arm is busy", blocked["error"])
         self.assertEqual("gesture", blocked["owner"])
 
