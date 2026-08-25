@@ -2227,6 +2227,8 @@ class JointPlanPlugin:
         self._last_state = {"state": "no_data"}
         self._executing_requests: set[int] = set()
         self._request_id = 0
+        self._owner_lock = threading.Lock()
+        self._owner: str | None = None
         self._state_type = None
         self._state = state
         self._core_topic = f"/{namespace}/state/joint_plan"
@@ -2300,10 +2302,15 @@ class JointPlanPlugin:
             return snapshot
         if action == "stop":
             return {"state": "idle"}
-        if action == "reset":
-            return self._publish_request("reset", {})
         if action == "cancel":
             return self._publish_request("cancel", args)
+        owner = args.get("_owner")
+        with self._owner_lock:
+            active_owner = self._owner
+        if active_owner is not None and owner != active_owner:
+            return {"error": f"joint planner is owned by {active_owner}"}
+        if action == "reset":
+            return self._publish_request("reset", args)
         if action == "preset":
             preset = self._PRESETS.get(str(args.get("preset", "")))
             if preset is None:
@@ -2354,6 +2361,24 @@ class JointPlanPlugin:
         if action == "plan":
             return self._publish_request("plan", args)
         return {"error": f"unknown joint plan action: {action}"}
+
+    def acquire(self, owner: str) -> bool:
+        with self._owner_lock:
+            if self._owner not in (None, owner):
+                return False
+            self._owner = owner
+            return True
+
+    def release(self, owner: str) -> bool:
+        with self._owner_lock:
+            if self._owner != owner:
+                return False
+            self._owner = None
+            return True
+
+    def owner(self) -> str | None:
+        with self._owner_lock:
+            return self._owner
 
     def current_motion(self) -> tuple[str, list[str]]:
         if self._state is None:
@@ -2762,6 +2787,8 @@ class GesturePlugin:
                 current = dict(self._status)
                 current.pop("action_id", None)
                 return {**current, "error": "another gesture sequence is already running"}
+            if not self._joint_plan.acquire("gesture"):
+                return {"error": f"joint planner is owned by {self._joint_plan.owner()}"}
             from uuid import uuid4
 
             action_id = f"t800_gesture_{uuid4().hex[:12]}"
@@ -2785,7 +2812,7 @@ class GesturePlugin:
                         self._status["step"] = index
                         self._status["step_name"] = step["name"]
                     action = "plan_named" if "joint_names" in step else "plan"
-                    result = self._joint_plan.dispatch(action, step)
+                    result = self._joint_plan.dispatch(action, {**step, "_owner": "gesture"})
                     if "error" in result:
                         raise ValueError(result["error"])
                     request_id = int(result["request_id"])
@@ -2800,7 +2827,7 @@ class GesturePlugin:
                     if hold_after > 0 and self._cancel.wait(hold_after):
                         raise RuntimeError("gesture cancelled")
                 if not self._cancel.is_set() and reset_after:
-                    result = self._joint_plan.dispatch("reset", {})
+                    result = self._joint_plan.dispatch("reset", {"_owner": "gesture"})
                     if "error" in result:
                         raise ValueError(result["error"])
                     request_id = int(result["request_id"])
@@ -2837,6 +2864,7 @@ class GesturePlugin:
                         "request_id": self._status.get("request_id"),
                         "error": self._status.get("error"),
                     }
+                self._joint_plan.release("gesture")
                 if action_id is not None:
                     self._acp_notify(action_id, final_status, final_result)
 
@@ -2869,7 +2897,7 @@ class GesturePlugin:
         if request_id is not None:
             self._joint_plan.dispatch("cancel", {"request_id": request_id})
         if reset_after:
-            self._joint_plan.dispatch("reset", {})
+            self._joint_plan.dispatch("reset", {"_owner": "gesture"})
         return result
 
     @staticmethod
@@ -3124,6 +3152,8 @@ class ArmSwingPlugin:
                     "error": f"arm_swing requires lower_body_balance (current: {motion or 'unknown'})",
                     "available_transition_motions": available,
                 }
+            if not self._joint_plan.acquire(self._OWNER):
+                return {"error": f"joint planner is owned by {self._joint_plan.owner()}"}
             from uuid import uuid4
 
             self._halt = threading.Event()
@@ -3165,6 +3195,7 @@ class ArmSwingPlugin:
                         ],
                         "duration": step_duration,
                         "gravity_compensation": True,
+                        "_owner": self._OWNER,
                     })
                     if "error" in result:
                         raise RuntimeError(str(result["error"]))
@@ -3205,6 +3236,7 @@ class ArmSwingPlugin:
             # errors. Always cancel it before declaring the card idle.
             if request_id is not None:
                 self._joint_plan.dispatch("cancel", {"request_id": request_id})
+            self._joint_plan.release(self._OWNER)
             if action_id is not None:
                 self._notify_completion(action_id, final_status, final_result)
 
@@ -3243,6 +3275,8 @@ class ArmSwingPlugin:
                     "error": f"arm_swing requires lower_body_balance (current: {motion or 'unknown'})",
                     "available_transition_motions": available,
                 }
+            if not self._joint_plan.acquire(self._OWNER):
+                return {"error": f"joint planner is owned by {self._joint_plan.owner()}"}
             from uuid import uuid4
 
             self._halt = threading.Event()
@@ -3281,6 +3315,7 @@ class ArmSwingPlugin:
                     "target_positions": self._BASE,
                     "duration": duration,
                     "gravity_compensation": True,
+                    "_owner": self._OWNER,
                 })
                 if "error" in result:
                     raise RuntimeError(str(result["error"]))
@@ -3324,6 +3359,7 @@ class ArmSwingPlugin:
                 }
             if live_request_id is not None:
                 self._joint_plan.dispatch("cancel", {"request_id": live_request_id})
+            self._joint_plan.release(self._OWNER)
             if action_id is not None:
                 self._notify_completion(action_id, final_status, final_result)
 
