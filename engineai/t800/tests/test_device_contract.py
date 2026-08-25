@@ -238,6 +238,7 @@ class DevicePluginContractTests(unittest.TestCase):
 
         motion_mode = self.device.MotionModePlugin(CONFIG, "robot", self.ros, self.state)
         joint_plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros)
+        joint_override = self.device.JointOverridePlugin(CONFIG, "robot", self.ros, self.state)
         plugins = [
             self.state,
             self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state),
@@ -245,7 +246,8 @@ class DevicePluginContractTests(unittest.TestCase):
             self.device.DancePlugin(motion_mode, self.state),
             joint_plan,
             self.device.GesturePlugin(joint_plan),
-            self.device.JointOverridePlugin(CONFIG, "robot", self.ros, self.state),
+            joint_override,
+            self.device.ArmSwingPlugin(CONFIG, joint_plan, self.state),
             self.device.JointBridgePlugin(CONFIG, "robot", self.ros, self.state),
             self.device.LedPlugin(CONFIG, "robot", self.ros),
             self.device.TtsPlugin(CONFIG, "robot", self.ros),
@@ -274,13 +276,13 @@ class DevicePluginContractTests(unittest.TestCase):
              "mainboard", "heartbeat_status", "motion_command_trace", "motion_events",
              "native_interface_probe",
              "loco", "motion_mode", "dance", "joint_plan", "joint_plan_state", "gesture",
-             "joint_override", "joint_bridge",
+             "joint_override", "arm_swing", "joint_bridge",
              "led", "tts", "mic", "pointcloud", "camera", "depth",
              "motor_power", "native_node_control", "virtual_gamepad", "safety", "native_sdk"},
             names,
         )
-        self.assertEqual(41, len(names))
-        self.assertEqual(41, len(definitions), "tool names must be unique")
+        self.assertEqual(42, len(names))
+        self.assertEqual(42, len(definitions), "tool names must be unique")
         for tool in definitions:
             schema = tool.get("inputSchema")
             self.assertEqual("object", schema.get("type"), tool["name"])
@@ -1007,6 +1009,60 @@ class DevicePluginContractTests(unittest.TestCase):
         time.sleep(0.03)
         plugin.dispatch("release", {})
         self.assertEqual(0.0, plugin._publisher.messages[-1].weight)
+
+    def test_arm_swing_plans_bounded_shoulders_and_halts_with_cancel(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        swing = self.device.ArmSwingPlugin(CONFIG, plan, self.state)
+        self.state._current_motion = "lower_body_balance"
+        result = swing.dispatch("start_swing", {"amplitude_deg": 6, "frequency_hz": 0.5})
+        self.assertEqual("running", result["state"])
+        time.sleep(0.06)
+        halted = swing.dispatch("halt", {})
+        self.assertEqual("idle", halted["state"])
+        self.assertGreater(halted["publish_count"], 0)
+        self.assertEqual("joint_plan", halted["control_backend"])
+        self.assertEqual([13, 16, 18, 21], plan._publisher.messages[0].joint_indices)
+        self.assertEqual(plan._request_type.REQUEST_CANCEL, plan._publisher.messages[-1].request_type)
+
+    def test_arm_swing_gates_state_and_parameters(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        swing = self.device.ArmSwingPlugin(CONFIG, plan, self.state)
+        self.assertIn("lower_body_balance", swing.dispatch("start_swing", {})["error"])
+        self.state._current_motion = "lower_body_balance"
+        self.assertIn("between 2 and 30", swing.dispatch("start_swing", {"amplitude_deg": 31})["error"])
+        actions = swing.get_tool()["inputSchema"]["properties"]["action"]["enum"]
+        self.assertNotIn("set_parameters", actions)
+        self.assertIn("return_neutral", actions)
+        self.assertIn("halt_and_return", actions)
+
+    def test_arm_swing_return_neutral_uses_joint_plan(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        swing = self.device.ArmSwingPlugin(CONFIG, plan, self.state)
+        self.state._current_motion = "lower_body_balance"
+        result = swing.dispatch("return_neutral", {"duration": 2.0})
+        self.assertEqual("requested", result["state"])
+        self.assertEqual("neutral", result["target"])
+        message = plan._publisher.messages[-1]
+        self.assertEqual([13, 16, 18, 21], message.joint_indices)
+        self.assertEqual(list(swing._BASE), message.target_positions)
+        self.assertEqual(2.0, message.execution_time)
+
+    def test_arm_swing_cancels_when_motion_state_changes(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        plan.wait_for_request = lambda *_args, **_kwargs: time.sleep(0.03)
+        swing = self.device.ArmSwingPlugin(CONFIG, plan, self.state)
+        self.state._current_motion = "lower_body_balance"
+        swing.dispatch("start_swing", {})
+        time.sleep(0.01)
+        self.state._current_motion = "rl_basic"
+        swing._thread.join(timeout=1.0)
+        status = swing.dispatch("status", {})
+        self.assertEqual("idle", status["state"])
+        self.assertIn("motion_state_changed", status["reason"])
 
     def test_joint_bridge_force_path_and_damping_stop(self):
         plugin = self.device.JointBridgePlugin(CONFIG, "robot", self.ros, self.state)
