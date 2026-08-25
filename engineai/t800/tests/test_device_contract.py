@@ -1113,20 +1113,147 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertAlmostEqual(arc["vx"], arc["vyaw"])
         plugin.dispatch("stop_move", {})
 
-    def test_motion_mode_force_path_publishes_custom_state(self):
+    def test_motion_mode_exposes_only_verified_actions(self):
+        plugin = self.device.MotionModePlugin(CONFIG, "robot", self.ros, self.state)
+        enum = plugin.get_tool()["inputSchema"]["properties"]["action"]["enum"]
+        self.assertEqual(["stand", "sit", "lie", "idle", "passive"], enum)
+
+    def test_motion_mode_force_path_uses_default_stand_target(self):
         plugin = self.device.MotionModePlugin(CONFIG, "robot", self.ros, self.state)
         plugin.start()
-        result = plugin.dispatch("switch", {"target": "vendor_future_mode", "force": True, "wait": False})
+        self.state._current_motion = "unknown"
+        self.state._available_motions = []
+        result = plugin.dispatch("stand", {"force": True, "wait": False})
         self.assertEqual("requested", result["state"])
-        self.assertEqual("vendor_future_mode", plugin._publisher.messages[-1].target_motion_name)
-        plugin.dispatch("get_up", {"force": True, "wait": False})
+        self.assertEqual("pd_stand", plugin._publisher.messages[-1].target_motion_name)
+
+    def test_motion_mode_selects_firmware_transition_for_each_posture(self):
+        plugin = self.device.MotionModePlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+
+        self.state._current_motion = "sit_down"
+        self.state._available_motions = ["rl_mimic_sitdown_to_stance"]
+        result = plugin.dispatch("stand", {"wait": False})
+        self.assertEqual("requested", result["state"])
+        self.assertEqual("rl_mimic_sitdown_to_stance", plugin._publisher.messages[-1].target_motion_name)
+
+        self.state._current_motion = "rl_mimic_stance_to_supine"
+        self.state._available_motions = ["rl_mimic_supine_to_stance"]
+        result = plugin.dispatch("stand", {"wait": False})
+        self.assertEqual("requested", result["state"])
         self.assertEqual("rl_mimic_supine_to_stance", plugin._publisher.messages[-1].target_motion_name)
+
+        self.state._current_motion = "pd_stand"
+        self.state._available_motions = ["rl_mimic_stance_to_sitdown"]
+        result = plugin.dispatch("sit", {"wait": False})
+        self.assertEqual("requested", result["state"])
+        self.assertEqual("rl_mimic_stance_to_sitdown", plugin._publisher.messages[-1].target_motion_name)
+
+        self.state._available_motions = ["rl_mimic_stance_to_supine"]
+        result = plugin.dispatch("lie", {"wait": False})
+        self.assertEqual("requested", result["state"])
+        self.assertEqual("rl_mimic_stance_to_supine", plugin._publisher.messages[-1].target_motion_name)
+
+    def test_motion_mode_same_mode_is_noop(self):
+        plugin = self.device.MotionModePlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        self.state._current_motion = "sit_down"
+        self.state._available_motions = ["rl_mimic_sitdown_to_stance"]
+        result = plugin.dispatch("sit", {"wait": False})
+        self.assertEqual("completed", result["state"])
+        self.assertEqual([], plugin._publisher.messages)
+
+    def test_motion_mode_sit_to_lie_chains_stand_first(self):
+        plugin = self.device.MotionModePlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        self.state._current_motion = "sit_down"
+        self.state._available_motions = ["rl_mimic_sitdown_to_stance"]
+
+        def robot_executes():
+            time.sleep(0.10)
+            plugin._state._current_motion = "pd_stand"
+            plugin._state._available_motions = ["rl_mimic_stance_to_supine"]
+            time.sleep(0.10)
+            plugin._state._current_motion = "rl_mimic_stance_to_supine"
+
+        thread = threading.Thread(target=robot_executes)
+        thread.start()
+        result = plugin.dispatch("lie", {
+            "wait": True, "timeout_sec": 1.0, "stand_stabilize_sec": 0,
+        })
+        thread.join()
+        self.assertEqual("completed", result["state"])
+        targets = [msg.target_motion_name for msg in plugin._publisher.messages]
+        self.assertEqual(["rl_mimic_sitdown_to_stance", "rl_mimic_stance_to_supine"], targets)
+
+    def test_motion_mode_lie_to_sit_chains_stand_first(self):
+        plugin = self.device.MotionModePlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        self.state._current_motion = "rl_mimic_stance_to_supine"
+        self.state._available_motions = ["rl_mimic_supine_to_stance"]
+
+        def robot_executes():
+            time.sleep(0.10)
+            plugin._state._current_motion = "pd_stand"
+            plugin._state._available_motions = ["rl_mimic_stance_to_sitdown"]
+            time.sleep(0.10)
+            plugin._state._current_motion = "rl_mimic_stance_to_sitdown"
+
+        thread = threading.Thread(target=robot_executes)
+        thread.start()
+        result = plugin.dispatch("sit", {
+            "wait": True, "timeout_sec": 1.0, "stand_stabilize_sec": 0,
+        })
+        thread.join()
+        self.assertEqual("completed", result["state"])
+        targets = [msg.target_motion_name for msg in plugin._publisher.messages]
+        self.assertEqual(["rl_mimic_supine_to_stance", "rl_mimic_stance_to_sitdown"], targets)
+
+    def test_motion_mode_rejects_missing_or_unavailable_transition(self):
+        plugin = self.device.MotionModePlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        self.state._current_motion = "unknown"
+        self.state._available_motions = []
+        result = plugin.dispatch("stand", {"wait": False})
+        self.assertEqual("rejected", result["state"])
+        self.assertEqual("no_transition_data", result["error"])
+
+        self.state._current_motion = "pd_stand"
+        self.state._available_motions = ["rl_mimic_stance_to_supine"]
+        result = plugin.dispatch("sit", {"wait": False})
+        self.assertEqual("rejected", result["state"])
+        self.assertIn("no available transition", result["error"])
+
+    def test_motion_mode_idle_and_passive_posture_matrix(self):
+        plugin = self.device.MotionModePlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+
+        self.state._current_motion = "pd_stand"
+        self.state._available_motions = ["idle", "passive"]
+        self.assertEqual("rejected", plugin.dispatch("idle", {"wait": False})["state"])
+        self.assertEqual("rejected", plugin.dispatch("passive", {"wait": False})["state"])
+
+        allowed = (
+            ("pd_sitdown", "idle", "idle"),
+            ("rl_mimic_stance_to_supine", "passive", "passive"),
+            ("passive", "idle", "idle"),
+            ("idle", "passive", "passive"),
+        )
+        for current, action, target in allowed:
+            with self.subTest(current=current, action=action):
+                self.state._current_motion = current
+                self.state._available_motions = []
+                result = plugin.dispatch(action, {"wait": False})
+                self.assertEqual("requested", result["state"])
+                self.assertEqual(target, plugin._publisher.messages[-1].target_motion_name)
 
     def test_dance_facade_lists_and_plays_official_dance(self):
         mode = self.device.MotionModePlugin(CONFIG, "robot", self.ros, self.state)
         mode.start()
         dance = self.device.DancePlugin(mode, self.state)
         self.assertEqual("dance.mnn", dance.dispatch("list", {})["built_in"][0]["policy"])
+        self.state._current_motion = "pd_stand"
+        self.state._available_motions = ["dance"]
         result = dance.dispatch("play", {"name": "dance", "force": True, "wait": False})
         self.assertEqual("requested", result["state"])
         self.assertEqual("dance", mode._publisher.messages[-1].target_motion_name)
