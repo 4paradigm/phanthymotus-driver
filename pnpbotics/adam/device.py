@@ -155,7 +155,7 @@ def _coerce_hand_positions(values, *, limit: int, expected: int = HAND_POSITION_
     return result
 
 
-def _hand_state_payload(position, reserve, received_at_ms: int) -> dict:
+def _hand_state_payload(position, received_at_ms: int) -> dict:
     """Convert HandState_ into the JSON payload published by hand_state."""
     try:
         positions = [int(value) for value in list(position)[:HAND_POSITION_COUNT]]
@@ -175,7 +175,6 @@ def _hand_state_payload(position, reserve, received_at_ms: int) -> dict:
 
     now_ms = int(time.time() * 1000)
     return {
-        "source_topic": "rt/handstate",
         "timestamp_ms": now_ms,
         "received_at_ms": int(received_at_ms),
         "age_ms": max(0, now_ms - int(received_at_ms)),
@@ -183,7 +182,6 @@ def _hand_state_payload(position, reserve, received_at_ms: int) -> dict:
         "position": positions,
         "left": side(positions[:6]),
         "right": side(positions[6:12]),
-        "reserve": int(reserve),
     }
 
 # ROS2 JointState joint names for upper body control (used by ArmPlugin)
@@ -310,25 +308,22 @@ class _HandStatePublisherNode(Node):
         )
         self._pub = self.create_publisher(String, self._topic, qos)
         self._latest_position = None
-        self._latest_reserve = 0
         self._received_at_ms = 0
         self._lock = threading.Lock()
         self._timer = self.create_timer(1.0 / publish_rate_hz, self._publish)
 
-    def update(self, position, reserve, received_at_ms: int):
+    def update(self, position, received_at_ms: int):
         with self._lock:
             self._latest_position = list(position)
-            self._latest_reserve = int(reserve)
             self._received_at_ms = int(received_at_ms)
 
     def snapshot(self) -> dict | None:
         with self._lock:
             position = self._latest_position
-            reserve = self._latest_reserve
             received_at_ms = self._received_at_ms
         if position is None:
             return None
-        return _hand_state_payload(position, reserve, received_at_ms)
+        return _hand_state_payload(position, received_at_ms)
 
     def _publish(self):
         payload = self.snapshot()
@@ -474,11 +469,7 @@ class HandStatePlugin:
                 msg = self._handstate_sub.Read(timeout=1)
                 if msg:
                     received_at_ms = int(time.time() * 1000)
-                    self._node.update(
-                        getattr(msg, "position", []),
-                        getattr(msg, "reserve", 0),
-                        received_at_ms,
-                    )
+                    self._node.update(getattr(msg, "position", []), received_at_ms)
             except Exception:
                 # DDS can be unavailable while the robot is powered off.  The
                 # card remains registered and reports that no feedback exists.
