@@ -1015,7 +1015,7 @@ class DevicePluginContractTests(unittest.TestCase):
         plan.start()
         swing = self.device.ArmSwingPlugin(CONFIG, plan, self.state)
         completions = []
-        swing._acp_notify = lambda action_id, status, result: completions.append(
+        swing._notify_completion = lambda action_id, status, result: completions.append(
             (action_id, status, result)
         )
         self.state._current_motion = "lower_body_balance"
@@ -1041,7 +1041,10 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertIn("between 2 and 30", swing.dispatch("start_swing", {"amplitude_deg": 31})["error"])
         actions = swing.get_tool()["inputSchema"]["properties"]["action"]["enum"]
         completion = swing.get_tool()["inputSchema"]["x-completion"]
-        self.assertEqual(["start_swing"], completion["actions"])
+        self.assertEqual(
+            ["start_swing", "return_neutral", "halt_and_return"],
+            completion["actions"],
+        )
         self.assertGreater(completion["timeout"], 3)
         self.assertTrue({"start", "info", "stop"}.issubset(actions))
         self.assertNotIn("set_parameters", actions)
@@ -1055,22 +1058,77 @@ class DevicePluginContractTests(unittest.TestCase):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
         plan.start()
         swing = self.device.ArmSwingPlugin(CONFIG, plan, self.state)
-        swing._acp_notify = lambda *_args: None
+        completions = []
+        swing._notify_completion = lambda action_id, status, result: completions.append(
+            (action_id, status, result)
+        )
         self.state._current_motion = "lower_body_balance"
         result = swing.dispatch("return_neutral", {"duration": 2.0})
-        self.assertEqual("requested", result["state"])
+        self.assertEqual("running", result["state"])
         self.assertEqual("neutral", result["target"])
-        message = plan._publisher.messages[-1]
+        deadline = time.monotonic() + 1.0
+        while not plan._publisher.messages and time.monotonic() < deadline:
+            time.sleep(0.01)
+        message = plan._publisher.messages[0]
         self.assertEqual([13, 16, 18, 21], message.joint_indices)
         self.assertEqual(list(swing._BASE), message.target_positions)
         self.assertEqual(2.0, message.execution_time)
+        plan._on_state(JointMotionPlanState(
+            message.request_id, JointMotionPlanState.EXECUTING, 0.5,
+        ))
+        plan._on_state(JointMotionPlanState(
+            message.request_id, JointMotionPlanState.IDLE, 1.0,
+        ))
+        swing._thread.join(timeout=1.0)
+        self.assertEqual(result["action_id"], completions[0][0])
+        self.assertEqual("completed", completions[0][1])
+
+    def test_arm_swing_stop_cancels_monitored_neutral_return(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        swing = self.device.ArmSwingPlugin(CONFIG, plan, self.state)
+        completions = []
+        swing._notify_completion = lambda action_id, status, result: completions.append(
+            (action_id, status, result)
+        )
+        self.state._current_motion = "lower_body_balance"
+        started = swing.dispatch("halt_and_return", {"duration": 5.0})
+        deadline = time.monotonic() + 1.0
+        while not plan._publisher.messages and time.monotonic() < deadline:
+            time.sleep(0.01)
+        request_id = plan._publisher.messages[0].request_id
+        stopped = swing.dispatch("stop", {})
+        self.assertEqual("idle", stopped["state"])
+        cancels = [msg for msg in plan._publisher.messages
+                   if msg.request_type == plan._request_type.REQUEST_CANCEL]
+        self.assertTrue(any(msg.request_id == request_id for msg in cancels))
+        self.assertEqual(started["action_id"], completions[0][0])
+        self.assertEqual("cancelled", completions[0][1])
+
+    def test_arm_swing_motion_exit_cancels_monitored_neutral_return(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        swing = self.device.ArmSwingPlugin(CONFIG, plan, self.state)
+        swing._notify_completion = lambda *_args: None
+        self.state._current_motion = "lower_body_balance"
+        swing.dispatch("return_neutral", {"duration": 5.0})
+        deadline = time.monotonic() + 1.0
+        while not plan._publisher.messages and time.monotonic() < deadline:
+            time.sleep(0.01)
+        request_id = plan._publisher.messages[0].request_id
+        self.state._current_motion = "rl_basic"
+        swing._thread.join(timeout=1.0)
+        cancels = [msg for msg in plan._publisher.messages
+                   if msg.request_type == plan._request_type.REQUEST_CANCEL]
+        self.assertTrue(any(msg.request_id == request_id for msg in cancels))
+        self.assertIn("motion_state_changed", swing.dispatch("status", {})["reason"])
 
     def test_arm_swing_cancels_when_motion_state_changes(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
         plan.start()
         swing = self.device.ArmSwingPlugin(CONFIG, plan, self.state)
         completions = []
-        swing._acp_notify = lambda action_id, status, result: completions.append(
+        swing._notify_completion = lambda action_id, status, result: completions.append(
             (action_id, status, result)
         )
         self.state._current_motion = "lower_body_balance"
@@ -1107,7 +1165,7 @@ class DevicePluginContractTests(unittest.TestCase):
 
         plan.dispatch = delayed_dispatch
         swing = self.device.ArmSwingPlugin(CONFIG, plan, self.state)
-        swing._acp_notify = lambda *_args: None
+        swing._notify_completion = lambda *_args: None
         self.state._current_motion = "lower_body_balance"
         swing.dispatch("start_swing", {})
         self.assertTrue(published.wait(timeout=1.0))
@@ -1132,7 +1190,7 @@ class DevicePluginContractTests(unittest.TestCase):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
         plan.start()
         swing = self.device.ArmSwingPlugin(CONFIG, plan, self.state)
-        swing._acp_notify = lambda *_args: None
+        swing._notify_completion = lambda *_args: None
         self.state._current_motion = "lower_body_balance"
         original_current_motion = self.state.current_motion
         entered_gate = threading.Event()
