@@ -22,6 +22,8 @@ import urllib.request
 from body_command import get_router
 from control_contract import q5_active_status, q5_is_control_ready
 from joint_limits import JOINT_LIMITS
+from rclpy.node import Node
+from std_srvs.srv import Trigger
 
 CARD = "hip_control"
 TYPE = "actuator"
@@ -75,6 +77,9 @@ class Plugin:
     def __init__(self, plugin_config, namespace, executor, client):
         self._client = client
         self._router = get_router(client, executor)
+        self._node = Node(f"q5_{CARD}")
+        executor.add_node(self._node)
+        self._activate_client = None
         self._max_step = float(plugin_config.get("max_step_rad", 0.02))
         self._rate = float(plugin_config.get("publish_rate_hz", 20.0))
         self._hold_repetitions = int(plugin_config.get("hold_repetitions", 3))
@@ -103,6 +108,37 @@ class Plugin:
                     "actions": ["set", "zero"],
                     "timeout": 30,
                 }}}
+
+    @staticmethod
+    def _wait_future(future, timeout):
+        deadline = time.monotonic() + timeout
+        while not future.done() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        return future.result() if future.done() else None
+
+    def _ensure_active(self):
+        """Bring Q5 from READY to ACTIVE before motion; None on success else failure dict."""
+        fsm = q5_active_status(self._client)
+        if fsm.get("state_label") == "ACTIVE":
+            return None
+        if self._activate_client is None:
+            self._activate_client = self._node.create_client(Trigger, "/activate_service")
+        if not self._activate_client.wait_for_service(timeout_sec=5.0):
+            return _failure("ACTIVATE_UNAVAILABLE", "Q5 /activate_service is unavailable", q5_fsm=fsm)
+        future = self._activate_client.call_async(Trigger.Request())
+        response = self._wait_future(future, 15.0)
+        if response is None or not response.success:
+            return _failure("ACTIVATE_FAILED", "Q5 activate_service did not confirm activation",
+                            message=getattr(response, "message", "timeout") if response else "timeout")
+        # Wait for FSM ACTIVE and fresh /joint_states (feedback resumes after activation).
+        for _ in range(20):
+            time.sleep(0.5)
+            fsm = q5_active_status(self._client)
+            fresh = bool(self._client.snapshot().get("fresh", False))
+            if fsm.get("state_label") == "ACTIVE" and fresh:
+                return None
+        return _failure("ACTIVATE_TIMEOUT", "Q5 did not reach ACTIVE with fresh /joint_states",
+                        q5_fsm=fsm)
 
     def _safety(self):
         status = self._router.status()
@@ -192,6 +228,11 @@ class Plugin:
                 "hold_command_attempted": bool(active)}
 
     def _launch(self, target_rad, action_name, target_deg, action_id):
+        # READY -> ACTIVE automatically before motion (joint feedback only
+        # exists in ACTIVE; without it the incremental move cannot start).
+        activate_error = self._ensure_active()
+        if activate_error is not None:
+            return activate_error
         allowed = self._allowed(target_rad)
         if allowed.get("ok") is False:
             return allowed
