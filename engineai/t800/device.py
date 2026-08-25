@@ -2931,8 +2931,6 @@ class JointOverridePlugin(_JointStreamBase):
         ros2.executor_robot.add_node(self._node)
         self._publisher = None
         self._last_indices: list[int] = []
-        self._owner_lock = threading.Lock()
-        self._owner: str | None = None
         self._stream = RepeatingCommand(
             self._publish,
             self._publish_release,
@@ -2981,9 +2979,6 @@ class JointOverridePlugin(_JointStreamBase):
             return {"state": "released" if action == "release" else "idle"}
         if action != "command":
             return {"error": f"unknown joint override action: {action}"}
-        with self._owner_lock:
-            if self._owner is not None:
-                return {"error": f"joint override is owned by {self._owner}"}
         motion, _ = self._state.current_motion()
         if motion != "lower_body_balance" and not bool(args.get("force", False)):
             return {"error": f"joint override requires lower_body_balance (current: {motion or 'unknown'})"}
@@ -3003,43 +2998,6 @@ class JointOverridePlugin(_JointStreamBase):
         self._last_indices = indices
         duration = float(args.get("duration", 1.0))
         return {"state": "running", "stream": asdict(self._stream.start(payload, duration)), "duration": duration}
-
-    def acquire(self, owner: str) -> bool:
-        with self._owner_lock:
-            if self._owner not in (None, owner):
-                return False
-            if self._stream.snapshot().active:
-                return False
-            self._owner = owner
-            return True
-
-    def publish_owned(self, owner: str, payload: dict) -> None:
-        with self._owner_lock:
-            if self._owner != owner:
-                raise RuntimeError("joint override ownership was lost")
-        indices, positions = validate_joint_positions(
-            payload.get("indices"), payload.get("position"), limit_margin_rad=0.02
-        )
-        size = len(indices)
-        self._last_indices = indices
-        self._publish({
-            "indices": indices,
-            "position": positions,
-            "velocity": optional_floats(payload, "velocity", size),
-            "feed_forward_torque": [],
-            "torque": [],
-            "stiffness": optional_floats(payload, "stiffness", size),
-            "damping": optional_floats(payload, "damping", size),
-            "weight": clamp(payload.get("weight", 0.5), 0.0, 1.0),
-        })
-
-    def release_owned(self, owner: str) -> bool:
-        with self._owner_lock:
-            if self._owner != owner:
-                return False
-            self._owner = None
-        self._publish_release()
-        return True
 
     def _publish(self, payload: dict) -> None:
         msg = self._message_type()
@@ -3079,6 +3037,7 @@ class ArmSwingPlugin:
         self._default_amplitude_deg = float(cfg.get("default_amplitude_deg", 8.0))
         self._default_frequency_hz = float(cfg.get("default_frequency_hz", 0.7))
         self._lock = threading.RLock()
+        self._command_lock = threading.Lock()
         self._halt = threading.Event()
         self._thread: threading.Thread | None = None
         self._amplitude_deg = self._default_amplitude_deg
@@ -3113,7 +3072,7 @@ class ArmSwingPlugin:
             ),
         }
         tool["inputSchema"]["x-completion"] = {
-            "actions": ["start_swing"],
+            "actions": ["start_swing", "return_neutral", "halt_and_return"],
             "timeout": int(self._ACP_TIMEOUT_SEC),
         }
         return tool
@@ -3122,21 +3081,29 @@ class ArmSwingPlugin:
         pass
 
     def stop(self) -> None:
-        self._halt_swing("driver_stopped")
+        with self._command_lock:
+            self._halt_swing("driver_stopped")
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action in ("start", "info"):
             return {**self._status(), "state": "ready"}
         if action == "stop":
-            return self._halt_swing("lifecycle_stop")
+            with self._command_lock:
+                return self._halt_swing("lifecycle_stop")
         if action == "status":
             return self._status()
         if action == "halt":
-            return self._halt_swing("user_halt")
+            with self._command_lock:
+                return self._halt_swing("user_halt")
         if action in ("return_neutral", "halt_and_return"):
-            return self._return_neutral(args, action)
+            with self._command_lock:
+                return self._return_neutral(args, action)
         if action != "start_swing":
             return {"error": f"unknown arm swing action: {action}"}
+        with self._command_lock:
+            return self._start_swing(args)
+
+    def _start_swing(self, args: dict) -> dict:
         try:
             amplitude = float(args.get("amplitude_deg", self._amplitude_deg))
             frequency = float(args.get("frequency_hz", self._frequency_hz))
@@ -3239,7 +3206,7 @@ class ArmSwingPlugin:
             if request_id is not None:
                 self._joint_plan.dispatch("cancel", {"request_id": request_id})
             if action_id is not None:
-                self._acp_notify(action_id, final_status, final_result)
+                self._notify_completion(action_id, final_status, final_result)
 
     def _motion_state_abort_reason(self) -> str | None:
         motion, _ = self._state.current_motion()
@@ -3264,24 +3231,109 @@ class ArmSwingPlugin:
         return self._status()
 
     def _return_neutral(self, args: dict, action: str) -> dict:
-        motion, available = self._state.current_motion()
-        if motion != "lower_body_balance":
-            return {
-                "error": f"arm_swing requires lower_body_balance (current: {motion or 'unknown'})",
-                "available_transition_motions": available,
-            }
         try:
             duration = clamp(args.get("duration", 1.5), 0.5, 5.0)
         except (TypeError, ValueError) as exc:
             return {"error": str(exc)}
         self._halt_swing(action)
-        result = self._joint_plan.dispatch("plan", {
-            "joint_indices": self._INDICES,
-            "target_positions": self._BASE,
-            "duration": duration,
-            "gravity_compensation": True,
-        })
-        return {**result, "action": action, "duration": duration, "target": "neutral"}
+        with self._lock:
+            motion, available = self._state.current_motion()
+            if motion != "lower_body_balance":
+                return {
+                    "error": f"arm_swing requires lower_body_balance (current: {motion or 'unknown'})",
+                    "available_transition_motions": available,
+                }
+            from uuid import uuid4
+
+            self._halt = threading.Event()
+            self._started_at = time.monotonic()
+            self._publish_count = 0
+            self._request_id = None
+            self._action_id = f"t800_arm_swing_{uuid4().hex[:12]}"
+            self._last_reason = "running"
+            self._thread = threading.Thread(
+                target=self._run_neutral,
+                args=(duration, action),
+                daemon=True,
+                name="t800-arm-swing-neutral",
+            )
+            self._thread.start()
+            return {
+                "state": "running",
+                "action": action,
+                "action_id": self._action_id,
+                "duration": duration,
+                "target": "neutral",
+            }
+
+    def _run_neutral(self, duration: float, action: str) -> None:
+        reason = "completed"
+        request_id = None
+        try:
+            with self._lock:
+                if self._halt.is_set():
+                    raise RuntimeError("neutral return cancelled")
+                abort_reason = self._motion_state_abort_reason()
+                if abort_reason:
+                    raise RuntimeError(abort_reason)
+                result = self._joint_plan.dispatch("plan", {
+                    "joint_indices": self._INDICES,
+                    "target_positions": self._BASE,
+                    "duration": duration,
+                    "gravity_compensation": True,
+                })
+                if "error" in result:
+                    raise RuntimeError(str(result["error"]))
+                request_id = int(result["request_id"])
+                self._request_id = request_id
+                self._publish_count += 1
+            self._joint_plan.wait_for_request(
+                request_id,
+                max(5.0, duration + 3.0),
+                self._halt,
+                abort_check=self._motion_state_abort_reason,
+            )
+            with self._lock:
+                if self._request_id == request_id:
+                    self._request_id = None
+            request_id = None
+        except Exception as exc:
+            message = str(exc)
+            if message.startswith("motion_state_changed:"):
+                reason = message
+            else:
+                reason = self._last_reason if self._halt.is_set() else f"error:{exc}"
+        finally:
+            with self._lock:
+                live_request_id = self._request_id if self._request_id is not None else request_id
+                self._request_id = None
+                self._last_reason = reason
+                action_id = self._action_id
+                final_status = (
+                    "completed" if reason == "completed"
+                    else "error" if reason.startswith("error:")
+                    else "cancelled"
+                )
+                final_result = {
+                    "action": action,
+                    "target": "neutral",
+                    "duration": duration,
+                    "reason": reason,
+                    "request_id": live_request_id,
+                    "control_backend": "joint_plan",
+                }
+            if live_request_id is not None:
+                self._joint_plan.dispatch("cancel", {"request_id": live_request_id})
+            if action_id is not None:
+                self._notify_completion(action_id, final_status, final_result)
+
+    def _notify_completion(self, action_id: str, status: str, result: dict) -> None:
+        threading.Thread(
+            target=self._acp_notify,
+            args=(action_id, status, result),
+            daemon=True,
+            name="t800-arm-swing-acp",
+        ).start()
 
     def _status(self) -> dict:
         with self._lock:
