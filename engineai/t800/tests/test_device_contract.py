@@ -1223,6 +1223,56 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual(1, len(execute_requests))
         swing.dispatch("halt", {})
 
+    def test_arm_swing_rejects_start_while_gesture_owns_planner(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        gesture = self.device.GesturePlugin(plan)
+        gesture._acp_notify = lambda *_args: None
+        swing = self.device.ArmSwingPlugin(CONFIG, plan, self.state)
+        swing._notify_completion = lambda *_args: None
+        self.state._current_motion = "lower_body_balance"
+        started = gesture.dispatch("sequence", {
+            "steps": [{"joint_indices": [23], "target_positions": [0.1], "duration": 1.0}],
+            "reset_after": False,
+        })
+        self.assertEqual("running", started["state"])
+        deadline = time.monotonic() + 1.0
+        while not plan._publisher.messages and time.monotonic() < deadline:
+            time.sleep(0.01)
+        request_count = len(plan._publisher.messages)
+        blocked = swing.dispatch("start_swing", {})
+        self.assertIn("owned by gesture", blocked["error"])
+        direct = plan.dispatch("head_pose", {"pitch_rad": 0.0, "yaw_rad": 0.0})
+        self.assertIn("owned by gesture", direct["error"])
+        self.assertEqual(request_count, len(plan._publisher.messages))
+        gesture.dispatch("stop_gesture", {})
+        gesture._thread.join(timeout=1.0)
+        self.assertIsNone(plan.owner())
+
+    def test_gesture_rejects_start_while_arm_swing_owns_planner(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        swing = self.device.ArmSwingPlugin(CONFIG, plan, self.state)
+        swing._notify_completion = lambda *_args: None
+        gesture = self.device.GesturePlugin(plan)
+        gesture._acp_notify = lambda *_args: None
+        self.state._current_motion = "lower_body_balance"
+        started = swing.dispatch("start_swing", {})
+        self.assertEqual("running", started["state"])
+        deadline = time.monotonic() + 1.0
+        while not plan._publisher.messages and time.monotonic() < deadline:
+            time.sleep(0.01)
+        request_count = len(plan._publisher.messages)
+        blocked = gesture.dispatch("sequence", {
+            "steps": [{"joint_indices": [23], "target_positions": [0.1], "duration": 1.0}],
+            "reset_after": False,
+        })
+        self.assertIn("owned by arm_swing", blocked["error"])
+        self.assertNotIn("action_id", blocked)
+        self.assertEqual(request_count, len(plan._publisher.messages))
+        swing.dispatch("halt", {})
+        self.assertIsNone(plan.owner())
+
     def test_joint_bridge_force_path_and_damping_stop(self):
         plugin = self.device.JointBridgePlugin(CONFIG, "robot", self.ros, self.state)
         plugin.start()
