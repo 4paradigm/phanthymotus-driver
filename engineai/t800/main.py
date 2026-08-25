@@ -106,6 +106,7 @@ class T800DeviceBundle:
     def __init__(self, config: dict, namespace: str, ros2: DualDomainROS2):
         from device import (
             DancePlugin,
+            ArmSwingPlugin,
             GesturePlugin,
             JointBridgePlugin,
             JointOverridePlugin,
@@ -185,6 +186,11 @@ class T800DeviceBundle:
             instances["gesture"] = instance
             self._plugins.append(instance)
 
+        if plugins.get("arm_swing", {}).get("enabled", True) and "joint_plan" in instances:
+            instance = ArmSwingPlugin(config, instances["joint_plan"], state)
+            instances["arm_swing"] = instance
+            self._plugins.append(instance)
+
         virtual_gamepad_config = plugins.get("virtual_gamepad", {})
         if virtual_gamepad_config.get("enabled", False):
             instance = VirtualGamepadPlugin(virtual_gamepad_config, namespace, ros2)
@@ -213,7 +219,7 @@ class T800DeviceBundle:
             instances["safety"].set_controls(
                 [
                     instances[key]
-                    for key in ("locomotion", "joint_override", "joint_bridge", "virtual_gamepad", "gesture")
+                    for key in ("locomotion", "joint_override", "joint_bridge", "virtual_gamepad", "gesture", "arm_swing")
                     if key in instances
                 ]
             )

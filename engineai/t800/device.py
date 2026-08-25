@@ -2926,6 +2926,8 @@ class JointOverridePlugin(_JointStreamBase):
         ros2.executor_robot.add_node(self._node)
         self._publisher = None
         self._last_indices: list[int] = []
+        self._owner_lock = threading.Lock()
+        self._owner: str | None = None
         self._stream = RepeatingCommand(
             self._publish,
             self._publish_release,
@@ -2974,6 +2976,9 @@ class JointOverridePlugin(_JointStreamBase):
             return {"state": "released" if action == "release" else "idle"}
         if action != "command":
             return {"error": f"unknown joint override action: {action}"}
+        with self._owner_lock:
+            if self._owner is not None:
+                return {"error": f"joint override is owned by {self._owner}"}
         motion, _ = self._state.current_motion()
         if motion != "lower_body_balance" and not bool(args.get("force", False)):
             return {"error": f"joint override requires lower_body_balance (current: {motion or 'unknown'})"}
@@ -2993,6 +2998,43 @@ class JointOverridePlugin(_JointStreamBase):
         self._last_indices = indices
         duration = float(args.get("duration", 1.0))
         return {"state": "running", "stream": asdict(self._stream.start(payload, duration)), "duration": duration}
+
+    def acquire(self, owner: str) -> bool:
+        with self._owner_lock:
+            if self._owner not in (None, owner):
+                return False
+            if self._stream.snapshot().active:
+                return False
+            self._owner = owner
+            return True
+
+    def publish_owned(self, owner: str, payload: dict) -> None:
+        with self._owner_lock:
+            if self._owner != owner:
+                raise RuntimeError("joint override ownership was lost")
+        indices, positions = validate_joint_positions(
+            payload.get("indices"), payload.get("position"), limit_margin_rad=0.02
+        )
+        size = len(indices)
+        self._last_indices = indices
+        self._publish({
+            "indices": indices,
+            "position": positions,
+            "velocity": optional_floats(payload, "velocity", size),
+            "feed_forward_torque": [],
+            "torque": [],
+            "stiffness": optional_floats(payload, "stiffness", size),
+            "damping": optional_floats(payload, "damping", size),
+            "weight": clamp(payload.get("weight", 0.5), 0.0, 1.0),
+        })
+
+    def release_owned(self, owner: str) -> bool:
+        with self._owner_lock:
+            if self._owner != owner:
+                return False
+            self._owner = None
+        self._publish_release()
+        return True
 
     def _publish(self, payload: dict) -> None:
         msg = self._message_type()
@@ -3014,6 +3056,198 @@ class JointOverridePlugin(_JointStreamBase):
         size = len(self._last_indices)
         self._publish({"weight": 0.0, "indices": self._last_indices, "position": [0.0] * size,
                        "velocity": [], "feed_forward_torque": [], "torque": [], "stiffness": [], "damping": []})
+
+
+class ArmSwingPlugin:
+    """Bounded alternating arm plans layered on the proven joint planner."""
+
+    _OWNER = "arm_swing"
+    _INDICES = [13, 16, 18, 21]
+    _BASE = [0.028, -0.066, 0.024, -0.069]
+
+    def __init__(self, config: dict, joint_plan: JointPlanPlugin, state: StatePlugin):
+        cfg = config.get("plugins", {}).get("arm_swing", {})
+        self._joint_plan = joint_plan
+        self._state = state
+        self._default_amplitude_deg = float(cfg.get("default_amplitude_deg", 8.0))
+        self._default_frequency_hz = float(cfg.get("default_frequency_hz", 0.7))
+        self._lock = threading.RLock()
+        self._halt = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._amplitude_deg = self._default_amplitude_deg
+        self._frequency_hz = self._default_frequency_hz
+        self._started_at: float | None = None
+        self._publish_count = 0
+        self._request_id: int | None = None
+        self._last_reason = "not_started"
+        self._validate_parameters(self._amplitude_deg, self._frequency_hz)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "arm_swing",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "T800 lower_body_balance 下通过 joint_plan 持续交替摆臂",
+            "inputSchema": action_schema(
+                {
+                    "start_swing": (["amplitude_deg", "frequency_hz"], "开始左右交替摆臂"),
+                    "halt": ([], "取消当前规划并停止摆臂"),
+                    "return_neutral": (["duration"], "平滑回到自然姿态"),
+                    "halt_and_return": (["duration"], "取消当前规划并平滑回到自然姿态"),
+                    "status": ([], "查询摆臂状态和发布计数"),
+                },
+                {
+                    "amplitude_deg": {"type": "number", "minimum": 2.0, "maximum": 30.0, "description": "肩部摆幅，默认 8 度"},
+                    "frequency_hz": {"type": "number", "minimum": 0.2, "maximum": 1.2, "description": "摆动频率，默认 0.7 Hz"},
+                    "duration": {"type": "number", "minimum": 0.5, "maximum": 5.0, "description": "回正时间，默认 1.5 秒"},
+                },
+                "持续摆臂动作",
+            ),
+        }
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        self._halt_swing("driver_stopped")
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "status":
+            return self._status()
+        if action == "halt":
+            return self._halt_swing("user_halt")
+        if action in ("return_neutral", "halt_and_return"):
+            return self._return_neutral(args, action)
+        if action != "start_swing":
+            return {"error": f"unknown arm swing action: {action}"}
+        try:
+            amplitude = float(args.get("amplitude_deg", self._amplitude_deg))
+            frequency = float(args.get("frequency_hz", self._frequency_hz))
+            self._validate_parameters(amplitude, frequency)
+        except (TypeError, ValueError) as exc:
+            return {"error": str(exc)}
+        with self._lock:
+            running = self._thread is not None and self._thread.is_alive()
+            self._amplitude_deg = amplitude
+            self._frequency_hz = frequency
+            if running:
+                return self._status_locked()
+        motion, available = self._state.current_motion()
+        if motion != "lower_body_balance":
+            return {
+                "error": f"arm_swing requires lower_body_balance (current: {motion or 'unknown'})",
+                "available_transition_motions": available,
+            }
+        with self._lock:
+            self._halt = threading.Event()
+            self._started_at = time.monotonic()
+            self._publish_count = 0
+            self._request_id = None
+            self._last_reason = "running"
+            self._thread = threading.Thread(target=self._run, daemon=True, name="t800-arm-swing")
+            self._thread.start()
+            return self._status_locked()
+
+    def _run(self) -> None:
+        reason = "user_halt"
+        direction = 1.0
+        try:
+            while not self._halt.is_set():
+                motion, _ = self._state.current_motion()
+                if motion != "lower_body_balance":
+                    reason = f"motion_state_changed:{motion or 'unknown'}"
+                    break
+                with self._lock:
+                    amplitude = math.radians(self._amplitude_deg)
+                    frequency = self._frequency_hz
+                step_duration = 0.5 / frequency
+                offset = direction * amplitude
+                result = self._joint_plan.dispatch("plan", {
+                    "joint_indices": self._INDICES,
+                    "target_positions": [
+                        self._BASE[0] + offset,
+                        self._BASE[1],
+                        self._BASE[2] - offset,
+                        self._BASE[3],
+                    ],
+                    "duration": step_duration,
+                    "gravity_compensation": True,
+                })
+                if "error" in result:
+                    raise RuntimeError(str(result["error"]))
+                request_id = int(result["request_id"])
+                with self._lock:
+                    self._request_id = request_id
+                    self._publish_count += 1
+                self._joint_plan.wait_for_request(
+                    request_id,
+                    max(5.0, step_duration + 3.0),
+                    self._halt,
+                )
+                direction *= -1.0
+        except Exception as exc:
+            reason = "user_halt" if self._halt.is_set() else f"error:{exc}"
+        finally:
+            with self._lock:
+                self._last_reason = reason
+                self._request_id = None
+
+    def _halt_swing(self, reason: str) -> dict:
+        with self._lock:
+            thread = self._thread
+            request_id = self._request_id
+            self._last_reason = reason
+            self._halt.set()
+        if request_id is not None:
+            self._joint_plan.dispatch("cancel", {"request_id": request_id})
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+        return self._status()
+
+    def _return_neutral(self, args: dict, action: str) -> dict:
+        motion, available = self._state.current_motion()
+        if motion != "lower_body_balance":
+            return {
+                "error": f"arm_swing requires lower_body_balance (current: {motion or 'unknown'})",
+                "available_transition_motions": available,
+            }
+        try:
+            duration = clamp(args.get("duration", 1.5), 0.5, 5.0)
+        except (TypeError, ValueError) as exc:
+            return {"error": str(exc)}
+        self._halt_swing(action)
+        result = self._joint_plan.dispatch("plan", {
+            "joint_indices": self._INDICES,
+            "target_positions": self._BASE,
+            "duration": duration,
+            "gravity_compensation": True,
+        })
+        return {**result, "action": action, "duration": duration, "target": "neutral"}
+
+    def _status(self) -> dict:
+        with self._lock:
+            return self._status_locked()
+
+    def _status_locked(self) -> dict:
+        running = self._thread is not None and self._thread.is_alive() and not self._halt.is_set()
+        return {
+            "state": "running" if running else "idle",
+            "amplitude_deg": self._amplitude_deg,
+            "frequency_hz": self._frequency_hz,
+            "publish_count": self._publish_count,
+            "request_id": self._request_id,
+            "reason": self._last_reason,
+            "required_motion_state": "lower_body_balance",
+            "joint_indices": list(self._INDICES),
+            "control_backend": "joint_plan",
+        }
+
+    @staticmethod
+    def _validate_parameters(amplitude: float, frequency: float) -> None:
+        if not math.isfinite(amplitude) or not 2.0 <= amplitude <= 30.0:
+            raise ValueError("amplitude_deg must be between 2 and 30")
+        if not math.isfinite(frequency) or not 0.2 <= frequency <= 1.2:
+            raise ValueError("frequency_hz must be between 0.2 and 1.2")
 
 
 class JointBridgePlugin(_JointStreamBase):
