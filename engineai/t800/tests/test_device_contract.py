@@ -712,6 +712,90 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("completed", status["state"])
         self.assertEqual([0.0] * 5, status["left_positions"])
 
+    def test_arm_shrug_uses_configured_amplitude(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        plan.wait_until_idle = lambda *_args, **_kwargs: {}
+        plan.wait_for_request = lambda *_args, **_kwargs: {}
+        arm = self.device.ArmActuatorPlugin({**CONFIG, "arm": {"shrug_amplitude_rad": 0.4}}, plan, self.state)
+        arm._acp_notify = lambda *_args: None
+        result = arm.dispatch("shrug", {"duration": 0.05})
+        self.assertEqual("running", result["state"])
+        arm._thread.join(timeout=1.0)
+        first = plan._publisher.messages[0]
+        self.assertEqual(0.65, first.target_positions[14])
+        self.assertEqual(-0.65, first.target_positions[19])
+
+    def test_arm_wave_advances_through_all_sequence_steps(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros)
+        plan.start()
+        arm = self.device.ArmActuatorPlugin(CONFIG, plan, self.state)
+        arm._acp_notify = lambda *_args: None
+        result = arm.dispatch("wave", {"side": "right", "times": 2, "speed": 1.0})
+        self.assertEqual("running", result["state"])
+        expected_names = [
+            "wave_start_right", "wave_out_1_right", "wave_in_1_right",
+            "wave_out_2_right", "wave_in_2_right", "wave_finish_right",
+        ]
+        processed = 0
+        observed_names = []
+        deadline = time.monotonic() + 1.0
+        while arm._thread.is_alive() and time.monotonic() < deadline:
+            status = arm.dispatch("status", {})
+            step_name = status["step_name"]
+            if step_name and (not observed_names or observed_names[-1] != step_name):
+                observed_names.append(step_name)
+            messages = plan._publisher.messages
+            while processed < len(messages):
+                request = messages[processed]
+                processed += 1
+                plan._on_state(JointMotionPlanState(
+                    request.request_id, JointMotionPlanState.EXECUTING, 0.5
+                ))
+                plan._on_state(JointMotionPlanState(
+                    request.request_id, JointMotionPlanState.IDLE, 1.0
+                ))
+            time.sleep(0.001)
+        arm._thread.join(timeout=1.0)
+        self.assertFalse(arm._thread.is_alive())
+        observed_names.append(arm.dispatch("status", {})["step_name"])
+        self.assertEqual(expected_names, list(dict.fromkeys(observed_names)))
+        status = arm.dispatch("status", {})
+        self.assertEqual("completed", status["state"])
+        self.assertEqual(6, status["total_steps"])
+        self.assertEqual(6, len(plan._publisher.messages))
+        self.assertEqual(6, status["step"])
+        self.assertEqual("wave_finish_right", status["step_name"])
+
+    def test_arm_stop_cancels_request_and_releases_mutex(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros)
+        plan.start()
+        arm = self.device.ArmActuatorPlugin(CONFIG, plan, self.state)
+        arm._acp_notify = lambda *_args: None
+        result = arm.dispatch("move_pos", {
+            "side": "left",
+            "target_positions": [0.02, 0.08, 0.0, -0.07, 0.0],
+            "duration": 10.0,
+        })
+        self.assertEqual("running", result["state"])
+        deadline = time.monotonic() + 1.0
+        while not plan._publisher.messages and time.monotonic() < deadline:
+            time.sleep(0.001)
+        self.assertTrue(plan._publisher.messages)
+        request_id = plan._publisher.messages[0].request_id
+        stopped = arm.dispatch("stop", {})
+        self.assertEqual("cancelled", stopped["state"])
+        arm._thread.join(timeout=1.0)
+        self.assertFalse(arm._thread.is_alive())
+        self.assertEqual("cancelled", arm.dispatch("status", {})["state"])
+        self.assertIsNone(plan.arm_status()["owner"])
+        cancel_requests = [
+            message for message in plan._publisher.messages
+            if message.request_type == JointMotionPlanRequest.REQUEST_CANCEL
+        ]
+        self.assertTrue(cancel_requests)
+        self.assertTrue(any(message.request_id == request_id for message in cancel_requests))
+
     def test_arm_gesture_mutex_blocks_conflicting_upper_body_actions(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
         plan.start()

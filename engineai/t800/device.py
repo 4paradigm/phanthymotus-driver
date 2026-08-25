@@ -3103,8 +3103,13 @@ class ArmActuatorPlugin:
                 steps = [self._step_both("fold", self._FOLD_LEFT, self._FOLD_RIGHT, self._duration(args))]
             elif action == "shrug":
                 duration = self._duration(args)
+                amp = clamp(self._config.get("shrug_amplitude_rad", 0.2), 0.05, 0.6)
+                shrug_left = list(self._SHRUG_LEFT)
+                shrug_right = list(self._SHRUG_RIGHT)
+                shrug_left[1] += amp
+                shrug_right[1] -= amp
                 steps = [
-                    self._step_both("shrug_up", self._SHRUG_LEFT, self._SHRUG_RIGHT, duration),
+                    self._step_both("shrug_up", shrug_left, shrug_right, duration),
                     self._step_both("shrug_down", self._NEUTRAL_LEFT, self._NEUTRAL_RIGHT, duration),
                 ]
             elif action == "wave":
@@ -3163,13 +3168,11 @@ class ArmActuatorPlugin:
         duration = clamp(self._config.get("step_duration_sec", 0.5) / speed, 0.05, 10.0)
         amp = clamp(self._config.get("wave_amplitude_rad", 0.4), 0.05, 0.8)
         base = list(self._RAISED_LEFT if side == "left" else self._RAISED_RIGHT)
-        left = list(base)
-        right = list(base)
-        left[4] = -amp
-        right[4] = amp
+        wave_out = list(base)
+        wave_out[4] = -amp if side == "left" else amp
         steps = [self._preset_side_step("wave_start", side, self._RAISED_LEFT, self._RAISED_RIGHT, duration)]
         for index in range(times):
-            steps.append(self._preset_side_step(f"wave_out_{index + 1}", side, left, right, duration))
+            steps.append(self._step_for_side(side, wave_out, duration) | {"name": f"wave_out_{index + 1}_{side}"})
             steps.append(self._preset_side_step(f"wave_in_{index + 1}", side, self._RAISED_LEFT, self._RAISED_RIGHT, duration))
         steps.append(self._preset_side_step("wave_finish", side, self._NEUTRAL_LEFT, self._NEUTRAL_RIGHT, duration))
         return steps
