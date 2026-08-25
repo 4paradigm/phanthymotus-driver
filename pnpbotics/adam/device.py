@@ -122,7 +122,7 @@ HAND_DEFAULT_OPEN = [
     1800, 1800, 1800, 1800, 1600, 0,
 ]
 HAND_DEFAULT_CLOSED = [0] * HAND_POSITION_COUNT
-HAND_DEFAULT_THUMB_CLOSE = [500, 0, 500, 0]
+HAND_DEFAULT_THUMB_CLOSE = [100, 1000, 100, 1000]
 
 
 def _coerce_hand_positions(values, *, limit: int, expected: int = HAND_POSITION_COUNT) -> list[int]:
@@ -850,9 +850,9 @@ class HandPlugin:
             expected=4,
         )
         try:
-            thumb_min = int(plugin_config.get("thumb_close_min_flex_position", 500))
+            thumb_min = int(plugin_config.get("thumb_close_min_flex_position", 100))
         except (TypeError, ValueError):
-            thumb_min = 500
+            thumb_min = 100
         self._thumb_close_min_flex_position = max(0, min(self._max_val, thumb_min))
         try:
             self._close_stage_delay_sec = float(plugin_config.get("close_stage_delay_sec", 0.8))
@@ -1092,18 +1092,19 @@ class HandPlugin:
             self._wake_event.clear()
 
     def _staged_close_targets(self) -> tuple[list[int], list[int]]:
-        """Build safe two-stage targets: non-thumb fingers first, thumb second."""
+        """Build two-stage targets: rotate the thumb, then flex it closed."""
         first_stage = list(self._close_positions)
         final_stage = list(self._close_positions)
         for side_offset, thumb_offset in ((0, 0), (6, 2)):
-            # Keep both thumb motors in the configured open pose while the
-            # pinky/ring/middle/index channels close first.
+            # Close the four non-thumb fingers first while rotating the thumb
+            # into the configured 1000-position grip angle. Keep thumb flexion
+            # open until the other fingers have finished closing.
             first_stage[side_offset + 4] = self._open_positions[side_offset + 4]
-            first_stage[side_offset + 5] = self._open_positions[side_offset + 5]
+            first_stage[side_offset + 5] = self._thumb_close_positions[thumb_offset + 1]
 
             # The current Adam client mapping becomes more closed as the
-            # flexion position decreases.  Enforce a conservative lower bound
-            # so a close command cannot drive the thumb into the index finger.
+            # flexion position decreases. After the rotation stage, flex the
+            # thumb to the configured final position.
             final_stage[side_offset + 4] = max(
                 self._thumb_close_positions[thumb_offset],
                 self._thumb_close_min_flex_position,
