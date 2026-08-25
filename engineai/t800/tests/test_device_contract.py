@@ -722,6 +722,8 @@ class DevicePluginContractTests(unittest.TestCase):
         result = arm.dispatch("shrug", {"duration": 0.05})
         self.assertEqual("running", result["state"])
         arm._thread.join(timeout=1.0)
+        self.assertFalse(arm._thread.is_alive())
+        self.assertIsNone(plan.arm_status()["owner"])
         first = plan._publisher.messages[0]
         self.assertEqual(0.65, first.target_positions[14])
         self.assertEqual(-0.65, first.target_positions[19])
@@ -795,6 +797,53 @@ class DevicePluginContractTests(unittest.TestCase):
         ]
         self.assertTrue(cancel_requests)
         self.assertTrue(any(message.request_id == request_id for message in cancel_requests))
+
+    def test_arm_stop_keeps_mutex_until_worker_exits(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros)
+        plan.start()
+        arm = self.device.ArmActuatorPlugin(CONFIG, plan, self.state)
+        arm._acp_notify = lambda *_args: None
+        first_gate = threading.Event()
+        second_gate = threading.Event()
+        wait_calls = []
+
+        def wait_for_request(_request_id, _timeout, _cancel):
+            wait_calls.append(_request_id)
+            gate = first_gate if len(wait_calls) == 1 else second_gate
+            gate.wait(timeout=1.0)
+
+        plan.wait_until_idle = lambda *_args, **_kwargs: {}
+        plan.wait_for_request = wait_for_request
+        first = arm.dispatch("move_pos", {
+            "side": "left",
+            "target_positions": [0.02, 0.08, 0.0, -0.07, 0.0],
+            "duration": 0.05,
+        })
+        self.assertEqual("running", first["state"])
+        deadline = time.monotonic() + 1.0
+        while len(wait_calls) < 1 and time.monotonic() < deadline:
+            time.sleep(0.001)
+        self.assertEqual(1, len(wait_calls))
+
+        stopped = arm.dispatch("stop", {})
+        self.assertEqual("cancelled", stopped["state"])
+        busy = arm.dispatch("raise", {"side": "right", "duration": 0.05})
+        self.assertEqual("arm is busy", busy["error"])
+
+        first_gate.set()
+        arm._thread.join(timeout=1.0)
+        self.assertFalse(arm._thread.is_alive())
+
+        second = arm.dispatch("raise", {"side": "right", "duration": 0.05})
+        self.assertEqual("running", second["state"])
+        self.assertEqual("arm", plan.arm_status()["owner"])
+        second_request_id = plan.arm_status()["request_id"]
+        self.assertIsNotNone(second_request_id)
+        second_gate.set()
+        arm._thread.join(timeout=1.0)
+        self.assertFalse(arm._thread.is_alive())
+        self.assertIsNone(plan.arm_status()["owner"])
+        self.assertNotEqual(first.get("action_id"), second.get("action_id"))
 
     def test_arm_gesture_mutex_blocks_conflicting_upper_body_actions(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)

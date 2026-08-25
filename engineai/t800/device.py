@@ -3279,7 +3279,6 @@ class ArmActuatorPlugin:
             result = dict(self._status)
         if request_id is not None:
             self._joint_plan._dispatch_owned("arm", "cancel", {"request_id": request_id})
-        self._joint_plan.release_arm("arm")
         return result if active else {"state": "idle"}
 
     def _status_snapshot(self) -> dict:
