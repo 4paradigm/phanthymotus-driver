@@ -1014,9 +1014,14 @@ class DevicePluginContractTests(unittest.TestCase):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
         plan.start()
         swing = self.device.ArmSwingPlugin(CONFIG, plan, self.state)
+        completions = []
+        swing._acp_notify = lambda action_id, status, result: completions.append(
+            (action_id, status, result)
+        )
         self.state._current_motion = "lower_body_balance"
         result = swing.dispatch("start_swing", {"amplitude_deg": 6, "frequency_hz": 0.5})
         self.assertEqual("running", result["state"])
+        self.assertTrue(result["action_id"].startswith("t800_arm_swing_"))
         time.sleep(0.06)
         halted = swing.dispatch("halt", {})
         self.assertEqual("idle", halted["state"])
@@ -1024,6 +1029,8 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("joint_plan", halted["control_backend"])
         self.assertEqual([13, 16, 18, 21], plan._publisher.messages[0].joint_indices)
         self.assertEqual(plan._request_type.REQUEST_CANCEL, plan._publisher.messages[-1].request_type)
+        self.assertEqual(result["action_id"], completions[0][0])
+        self.assertEqual("cancelled", completions[0][1])
 
     def test_arm_swing_gates_state_and_parameters(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
@@ -1033,6 +1040,9 @@ class DevicePluginContractTests(unittest.TestCase):
         self.state._current_motion = "lower_body_balance"
         self.assertIn("between 2 and 30", swing.dispatch("start_swing", {"amplitude_deg": 31})["error"])
         actions = swing.get_tool()["inputSchema"]["properties"]["action"]["enum"]
+        completion = swing.get_tool()["inputSchema"]["x-completion"]
+        self.assertEqual(["start_swing"], completion["actions"])
+        self.assertGreater(completion["timeout"], 3)
         self.assertTrue({"start", "info", "stop"}.issubset(actions))
         self.assertNotIn("set_parameters", actions)
         self.assertIn("return_neutral", actions)
@@ -1045,6 +1055,7 @@ class DevicePluginContractTests(unittest.TestCase):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
         plan.start()
         swing = self.device.ArmSwingPlugin(CONFIG, plan, self.state)
+        swing._acp_notify = lambda *_args: None
         self.state._current_motion = "lower_body_balance"
         result = swing.dispatch("return_neutral", {"duration": 2.0})
         self.assertEqual("requested", result["state"])
@@ -1058,8 +1069,12 @@ class DevicePluginContractTests(unittest.TestCase):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
         plan.start()
         swing = self.device.ArmSwingPlugin(CONFIG, plan, self.state)
+        completions = []
+        swing._acp_notify = lambda action_id, status, result: completions.append(
+            (action_id, status, result)
+        )
         self.state._current_motion = "lower_body_balance"
-        swing.dispatch("start_swing", {})
+        started = swing.dispatch("start_swing", {})
         deadline = time.monotonic() + 1.0
         while not plan._publisher.messages and time.monotonic() < deadline:
             time.sleep(0.01)
@@ -1072,6 +1087,9 @@ class DevicePluginContractTests(unittest.TestCase):
         cancels = [msg for msg in plan._publisher.messages
                    if msg.request_type == plan._request_type.REQUEST_CANCEL]
         self.assertTrue(any(msg.request_id == request_id for msg in cancels))
+        self.assertEqual(started["action_id"], completions[0][0])
+        self.assertEqual("cancelled", completions[0][1])
+        self.assertIn("motion_state_changed", completions[0][2]["reason"])
 
     def test_arm_swing_halt_cancels_request_published_before_id_storage(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
@@ -1089,6 +1107,7 @@ class DevicePluginContractTests(unittest.TestCase):
 
         plan.dispatch = delayed_dispatch
         swing = self.device.ArmSwingPlugin(CONFIG, plan, self.state)
+        swing._acp_notify = lambda *_args: None
         self.state._current_motion = "lower_body_balance"
         swing.dispatch("start_swing", {})
         self.assertTrue(published.wait(timeout=1.0))
@@ -1108,6 +1127,43 @@ class DevicePluginContractTests(unittest.TestCase):
         cancels = [msg for msg in plan._publisher.messages
                    if msg.request_type == plan._request_type.REQUEST_CANCEL]
         self.assertTrue(any(msg.request_id == request_id for msg in cancels))
+
+    def test_arm_swing_concurrent_start_creates_one_worker(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        swing = self.device.ArmSwingPlugin(CONFIG, plan, self.state)
+        swing._acp_notify = lambda *_args: None
+        self.state._current_motion = "lower_body_balance"
+        original_current_motion = self.state.current_motion
+        entered_gate = threading.Event()
+        release_gate = threading.Event()
+
+        def delayed_current_motion():
+            if not entered_gate.is_set():
+                entered_gate.set()
+                release_gate.wait(timeout=1.0)
+            return original_current_motion()
+
+        self.state.current_motion = delayed_current_motion
+        results = []
+        first = threading.Thread(target=lambda: results.append(swing.dispatch("start_swing", {})))
+        second = threading.Thread(target=lambda: results.append(swing.dispatch("start_swing", {})))
+        first.start()
+        self.assertTrue(entered_gate.wait(timeout=1.0))
+        second.start()
+        time.sleep(0.02)
+        release_gate.set()
+        first.join(timeout=1.0)
+        second.join(timeout=1.0)
+        deadline = time.monotonic() + 1.0
+        while not plan._publisher.messages and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(2, len(results))
+        self.assertEqual(1, len({result["action_id"] for result in results}))
+        execute_requests = [msg for msg in plan._publisher.messages
+                            if msg.request_type == plan._request_type.REQUEST_PLAN_EXECUTE]
+        self.assertEqual(1, len(execute_requests))
+        swing.dispatch("halt", {})
 
     def test_joint_bridge_force_path_and_damping_stop(self):
         plugin = self.device.JointBridgePlugin(CONFIG, "robot", self.ros, self.state)
