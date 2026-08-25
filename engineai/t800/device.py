@@ -2552,16 +2552,94 @@ class LocomotionPlugin:
             self._publish_payload({"vx": 0.0, "vy": 0.0, "vyaw": 0.0})
 
 
+_MOTION_MODE_TRANSITION_TARGETS = (
+    ("rl_mimic_stance_to_sitdown", "sit"),
+    ("stance_to_sitdown", "sit"),
+    ("rl_mimic_sitdown_to_stance", "stand"),
+    ("sitdown_to_stance", "stand"),
+    ("rl_mimic_supine_to_stance", "get_up"),
+    ("rl_mimic_prone_to_stance", "get_up"),
+    ("supine_to_stance", "get_up"),
+    ("prone_to_stance", "get_up"),
+    ("rl_mimic_stance_to_supine", "lie_down"),
+    ("stance_to_supine", "lie_down"),
+)
+
+_MOTION_MODE_STATE_ALIASES = (
+    ("get_up", ("get_up", "getup", "supine_to_stance", "prone_to_stance")),
+    ("lie_down", ("lie_down", "liedown", "supine", "stance_to_supine")),
+    ("sit", ("sit_down", "sitdown", "pd_sitdown", "sit", "sitting", "seated", "seat", "squat")),
+    ("walk", ("walk", "loco", "rl_basic", "rl_terrain", "lower_body_balance", "walk_server")),
+    ("stand", ("stand", "pd_stand", "stance")),
+    ("idle", ("idle",)),
+    ("passive", ("passive", "damping")),
+)
+
+
+def _motion_mode_action(name: str) -> str:
+    """Normalize firmware-specific motion names for transition decisions."""
+    value = str(name or "").strip()
+    lowered = value.lower()
+    if not lowered or lowered == "unknown":
+        return "unknown"
+    for exact, action in _MOTION_MODE_TRANSITION_TARGETS:
+        if lowered == exact:
+            return action
+    for action, aliases in _MOTION_MODE_STATE_ALIASES:
+        if any(alias in lowered for alias in aliases):
+            return action
+    return value
+
+
+def _motion_mode_matches_any(name: str, candidates) -> bool:
+    lowered = str(name or "").strip().lower()
+    if not lowered:
+        return False
+    normalized = _motion_mode_action(lowered)
+    for candidate in candidates:
+        candidate_lowered = str(candidate or "").strip().lower()
+        if lowered == candidate_lowered or normalized == _motion_mode_action(candidate_lowered):
+            return True
+    return False
+
+
+def _first_available_motion(candidates, available: list[str]) -> str | None:
+    for candidate in candidates:
+        for item in available:
+            if _motion_mode_matches_any(item, (candidate,)):
+                return item
+    return None
+
+
 class MotionModePlugin:
-    _SHORTCUTS = {
+    """Verified T800 posture transitions over the public ROS motion FSM."""
+
+    _ALIASES = {
+        "stand": (
+            "pd_stand", "stand", "stance",
+            "rl_mimic_sitdown_to_stance", "rl_mimic_supine_to_stance",
+            "rl_mimic_prone_to_stance",
+        ),
+        "sit": (
+            "rl_mimic_stance_to_sitdown", "pd_sitdown", "sit_down", "sitdown", "sit", "sitting",
+            "seated", "seat", "squat",
+        ),
+        "lie": (
+            "rl_mimic_stance_to_supine", "stance_to_supine", "lie_down", "liedown", "supine",
+        ),
+        "idle": ("idle",),
+        "passive": ("passive",),
+    }
+    _STANDING_ACTIONS = frozenset({"stand", "walk"})
+    _STAND_FIRST_TARGETS = frozenset({"stand", "sit", "lie"})
+    _MODE_ACTIONS = {
+        "stand": "stand",
+        "sit": "sit",
+        "lie": "lie_down",
         "idle": "idle",
         "passive": "passive",
-        "stand": "pd_stand",
-        "walk": "rl_basic",
-        "dance": "dance",
-        "get_up": "rl_mimic_supine_to_stance",
-        "lie_down": "rl_mimic_stance_to_supine",
     }
+
     def __init__(self, config: dict, namespace: str, ros2, state: StatePlugin):
         self._config = config
         self._state = state
@@ -2574,17 +2652,17 @@ class MotionModePlugin:
             "name": "motion_mode",
             "type": "actuator",
             "multiInstance": False,
-            "description": "T800 运动状态机切换，包含站立、行走、舞蹈、起身、躺下及桥接模式",
+            "description": "T800 运动状态切换：站立/坐下/躺下/空闲/阻力；"
+                           "非站立姿态切换到其他姿态会自动先起身到站立，passive 支持 idle 切入",
             "inputSchema": action_schema(
-                {"switch": (["target", "force", "wait"], "请求切换到目标 Native SDK motion state"),
-                 **{name: (["force", "wait"], f"快捷切换到 {target}") for name, target in self._SHORTCUTS.items()},
-                 "status": ([], "查询当前和可转换状态")},
+                {name: (["force", "wait", "stand_stabilize_sec"], f"切换到 {name}") for name in self._ALIASES},
                 {
-                    "target": {"type": "string", "description": "目标 motion state；支持固件返回的自定义状态名"},
-                    "force": {"type": "boolean", "description": "目标不在 available transitions 时仍发送"},
                     "wait": {"type": "boolean", "description": "等待状态反馈，默认 true"},
+                    "force": {"type": "boolean", "description": "目标不在 available transitions 时仍发送（需人工确认安全）"},
+                    "timeout_sec": {"type": "number", "description": "等待状态反馈超时时间；默认使用 config.yaml"},
+                    "stand_stabilize_sec": {"type": "number", "description": "起身完成后的站立稳定等待时间；默认 5 秒"},
                 },
-                "状态机动作",
+                "运动状态动作",
             ),
         }
 
@@ -2600,34 +2678,220 @@ class MotionModePlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict:
+        mode = str(action or "")
+        if mode not in self._ALIASES:
+            return {"error": f"unknown motion mode action: {mode}"}
+        args = dict(args or {})
+        force = bool(args.get("force", False))
+        wait = bool(args.get("wait", True))
+        timeout = float(args.get("timeout_sec", self._config["control"]["mode_transition_timeout_sec"]))
+        stabilize_sec = float(args.get(
+            "stand_stabilize_sec",
+            self._config.get("control", {}).get("mode_stand_stabilize_sec", 5.0),
+        ))
+
         current, available = self._state.current_motion()
-        if action in ("start", "info", "status"):
-            return {"state": "ready", "current": current, "available": available}
-        if action == "stop":
-            return {"state": "idle"}
-        if action in self._SHORTCUTS:
-            args = dict(args)
-            args["target"] = self._SHORTCUTS[action]
-            action = "switch"
-        if action != "switch":
-            return {"error": f"unknown motion mode action: {action}"}
-        target = str(args.get("target", ""))
+        current_action = _motion_mode_action(current)
+        steps: list[dict] = []
+
+        if self._mode_matches_current(mode, current_action):
+            return {
+                "state": "completed",
+                "mode": mode,
+                "current": current,
+                "available": available,
+                "steps": [{"state": "completed", "target": f"already {mode}", "current": current}],
+            }
+
+        if mode == "idle" and current_action not in ("sit", "lie_down", "passive"):
+            return {
+                "state": "rejected",
+                "error": f"{mode} only allowed from sit, lie or passive (current: {current_action})",
+                "mode": mode,
+                "current": current,
+                "available": available,
+                "suggested_action": "switch to sit, lie or passive first",
+            }
+        if mode == "passive" and current_action not in ("sit", "lie_down", "idle"):
+            return {
+                "state": "rejected",
+                "error": f"{mode} only allowed from sit, lie or idle (current: {current_action})",
+                "mode": mode,
+                "current": current,
+                "available": available,
+                "suggested_action": "switch to sit, lie or idle first",
+            }
+
+        if mode in self._STAND_FIRST_TARGETS and current_action not in self._STANDING_ACTIONS:
+            stand_target = self._pick_target("stand", available, force, current_action=current_action)
+            if stand_target is None:
+                return self._reject(mode, current, available, "stand")
+            step = self._request_and_wait(
+                stand_target,
+                expected=self._STANDING_ACTIONS,
+                wait=(True if mode != "stand" else wait),
+                timeout=timeout,
+            )
+            steps.append(step)
+            if step["state"] != "completed":
+                result = {
+                    "state": step["state"],
+                    "mode": mode,
+                    "target": stand_target,
+                    "current": step.get("current", current),
+                    "available": step.get("available", available),
+                    "steps": steps,
+                }
+                if step["state"] == "timeout":
+                    result["error"] = "could not stand up before " + mode
+                return result
+            if mode == "stand":
+                return {
+                    "state": "completed",
+                    "mode": mode,
+                    "target": stand_target,
+                    "current": step.get("current", current),
+                    "available": step.get("available", available),
+                    "steps": steps,
+                }
+            if stabilize_sec > 0:
+                time.sleep(stabilize_sec)
+            current, available = self._state.current_motion()
+            current_action = _motion_mode_action(current)
+
+        if mode == "stand" and current_action in self._STANDING_ACTIONS:
+            return {
+                "state": "completed",
+                "mode": mode,
+                "current": current,
+                "available": available,
+                "steps": [{"state": "completed", "target": "already standing", "current": current}],
+            }
+
+        target = self._pick_target(mode, available, force, current_action=current_action)
+        if target is None:
+            return self._reject(mode, current, available, mode)
+        expected = frozenset(_motion_mode_action(alias) for alias in self._ALIASES[mode])
+        final = self._request_and_wait(target, expected=expected, wait=wait, timeout=timeout)
+        steps.append(final)
+        return {
+            "state": final["state"],
+            "mode": mode,
+            "target": target,
+            "current": final.get("current", current),
+            "available": final.get("available", available),
+            "steps": steps,
+        }
+
+    def request_target(self, target: str, args: dict, *, expected_actions=None) -> dict:
+        """Request a raw firmware state for a dedicated facade tool."""
+        args = dict(args or {})
+        force = bool(args.get("force", False))
+        wait = bool(args.get("wait", True))
+        timeout = float(args.get("timeout_sec", self._config["control"]["mode_transition_timeout_sec"]))
+        current, available = self._state.current_motion()
+        target = str(target or "")
         if not target:
-            return {"error": "target motion is required"}
-        if available and target not in available and not bool(args.get("force", False)):
-            return {"error": f"{target} is not available from {current}", "available": available}
+            return {"state": "rejected", "error": "target motion is required", "current": current}
+        if not available and not force:
+            return self._reject(target, current, available, target)
+        if available and not _motion_mode_matches_any(target, available) and not force:
+            return self._reject(target, current, available, target)
+        expected = frozenset(expected_actions or {_motion_mode_action(target)})
+        result = self._request_and_wait(target, expected=expected, wait=wait, timeout=timeout)
+        return {
+            "state": result["state"],
+            "target": target,
+            "current": result.get("current", current),
+            "available": result.get("available", available),
+        }
+
+    def _mode_matches_current(self, mode: str, current_action: str) -> bool:
+        expected = self._MODE_ACTIONS.get(mode, mode)
+        if mode == "stand":
+            return current_action in self._STANDING_ACTIONS
+        return current_action == expected
+
+    def _target_candidates(self, mode: str, current_action: str) -> list[str]:
+        if mode == "stand":
+            if current_action == "sit":
+                return [
+                    "rl_mimic_sitdown_to_stance", "sitdown_to_stance",
+                    "pd_stand", "stand", "stance",
+                ]
+            if current_action in ("lie_down", "passive"):
+                return [
+                    "rl_mimic_supine_to_stance", "rl_mimic_prone_to_stance",
+                    "supine_to_stance", "prone_to_stance",
+                    "pd_stand", "stand", "stance",
+                ]
+        return list(self._ALIASES[mode])
+
+    def _pick_target(
+        self,
+        mode: str,
+        available: list[str],
+        force: bool,
+        *,
+        current_action: str,
+    ) -> str | None:
+        candidates = self._target_candidates(mode, current_action)
+        if mode == "idle" and current_action in ("sit", "lie_down", "passive"):
+            return "idle"
+        if mode == "passive" and current_action in ("sit", "lie_down", "idle"):
+            return "passive"
+        if not available and not force:
+            return None
+        requested = _first_available_motion(candidates, available)
+        if requested is None and force:
+            requested = candidates[0]
+        return requested
+
+    def _request_and_wait(self, target: str, *, expected, wait: bool, timeout: float) -> dict:
         msg = self._message_type()
         msg.target_motion_name = target
         self._publisher.publish(msg)
-        if not bool(args.get("wait", True)):
-            return {"state": "requested", "target": target, "previous": current}
-        deadline = time.monotonic() + float(self._config["control"]["mode_transition_timeout_sec"])
+        result = self._wait_for_motion(target, expected=expected, wait=wait, timeout=timeout)
+        result["control_source"] = "ros_motion_request"
+        return result
+
+    def _wait_for_motion(self, target: str, *, expected, wait: bool, timeout: float) -> dict:
+        if not wait:
+            return {"state": "requested", "target": target}
+        deadline = time.monotonic() + timeout
+        current, available = "", []
         while time.monotonic() < deadline:
             current, available = self._state.current_motion()
-            if current == target:
-                return {"state": "completed", "current": current, "available": available}
+            motion = _motion_mode_action(current)
+            if motion in expected:
+                return {
+                    "state": "completed",
+                    "target": target,
+                    "current": current,
+                    "available": available,
+                    "motion": motion,
+                }
             time.sleep(0.05)
         return {"state": "timeout", "target": target, "current": current, "available": available}
+
+    def _reject(self, mode: str, current: str, available: list[str], need: str) -> dict:
+        if not available:
+            return {
+                "state": "rejected",
+                "error": "no_transition_data",
+                "mode": mode,
+                "current": current,
+                "available": available,
+                "suggested_action": "wait for motion_state data or retry with force=true only after manual safety check",
+            }
+        return {
+            "state": "rejected",
+            "error": f"no available transition for {need} from {current}",
+            "mode": mode,
+            "current": current,
+            "available": available,
+            "suggested_action": f"use one of: {', '.join(available)}",
+        }
 
 
 class DancePlugin:
@@ -2683,13 +2947,21 @@ class DancePlugin:
             return {"state": "idle"}
         if action == "play":
             target = str(args.get("name", "dance"))
-        elif action == "stop_dance":
-            target = str(args.get("target", "rl_basic"))
-        else:
-            return {"error": f"unknown dance action: {action}"}
-        forwarded = dict(args)
-        forwarded["target"] = target
-        return self._motion_mode.dispatch("switch", forwarded)
+            current_action = _motion_mode_action(current)
+            steps: list[dict] = []
+            if current_action not in MotionModePlugin._STANDING_ACTIONS:
+                stand = self._motion_mode.dispatch("stand", dict(args))
+                steps.append(stand)
+                if stand.get("state") != "completed":
+                    return {**stand, "dance_target": target, "steps": steps}
+            dance = self._motion_mode.request_target(target, dict(args), expected_actions={"dance"})
+            steps.append(dance)
+            return {**dance, "steps": steps}
+        if action == "stop_dance":
+            forwarded = dict(args)
+            forwarded.pop("target", None)
+            return self._motion_mode.dispatch("stand", forwarded)
+        return {"error": f"unknown dance action: {action}"}
 
 
 _JOINT_PLAN_COMPLETED_PROGRESS_MIN = 0.999

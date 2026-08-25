@@ -33,7 +33,7 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 | `ros_graph` | sensor | 实时发现固件节点、topic、service 和尚未映射的新接口 |
 | `model` | resource | 官方 `serial_t800.urdf` |
 | `loco` | actuator | 100 Hz 速度控制；定时/持续、相对位移、转角和圆弧开环动作 |
-| `motion_mode` | actuator | 任意状态切换及 idle/passive/站立/行走/舞蹈/起身/躺下快捷动作 |
+| `motion_mode` | actuator | 5 个已验证运动状态：站立/坐下/躺下/空闲/阻力；基于固件返回的可转换列表选择目标，姿态互切时自动先起身并稳定 5 秒 |
 | `gait` | actuator | 基于 Native SDK motion state 的步态选择；自动适配 `rl_basic`/`walk` 版本差异 |
 | `dance` | actuator | 舞蹈列表、播放、停止和状态；官方基线为 `dance.mnn` + `dance.npz` |
 | `joint_plan` | actuator | 索引/名称关节轨迹、头部/单臂姿态、当前位置保持、取消、复位和预置动作 |
