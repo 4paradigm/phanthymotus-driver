@@ -58,7 +58,6 @@ services:
 
 diagnostics:
   command_trace_capacity: 20
-  motion_events_capacity: 100
 
 plugins:
   state:
@@ -73,7 +72,7 @@ plugins:
     enabled: true
   locomotion:
     enabled: true
-  motion_mode:
+  safe_motion_mode:
     enabled: true
   dance:
     enabled: true

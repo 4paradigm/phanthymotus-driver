@@ -397,10 +397,18 @@ def _display_motion_action_from_state(
     *,
     moving: bool = False,
 ) -> str:
-    # ``available`` is retained in the interface because the firmware publishes
-    # it alongside the current state and it may be needed for future aliases.
-    del available
+    available = [str(item or "").strip().lower() for item in list(available or [])]
     action = _normalize_motion_action(name)
+    # The T800 firmware may settle on the raw state ``passive`` after a posture
+    # transition.  The recovery transition advertised at the same time is the
+    # reliable posture signal: supine/prone recovery means lying, while
+    # sitdown recovery means sitting.
+    if action in ("passive", "idle"):
+        if any("supine_to_stance" in item or "prone_to_stance" in item for item in available):
+            return "lie"
+        if any("sitdown_to_stance" in item for item in available):
+            return "sit"
+        return "unknown"
     if action == "walk":
         return "move" if moving else "stand"
     if action == "lie_down":
@@ -1525,11 +1533,11 @@ class MotionCommandTracePlugin:
         self._publisher.publish(_json_message(self._snapshot()))
 
 class MotionEventsPlugin:
-    """Read-only event timeline for T800 motion-related MCP calls and feedback."""
+    """On-demand compact T800 motion status for the embodied model."""
 
     _MOTION_TOOLS = {
         "loco",
-        "motion_mode",
+        "safe_motion_mode",
         "dance",
         "joint_plan",
         "joint_plan_state",
@@ -1546,18 +1554,9 @@ class MotionEventsPlugin:
     def __init__(self, config: dict, namespace: str, ros2):
         self._config = config
         self._ns = namespace
-        capacity = int(config.get("diagnostics", {}).get("motion_events_capacity", 100))
-        self._capacity = max(1, min(capacity, 1000))
         self._robot_node = Node("t800_motion_events_sub", context=ros2.ctx_robot)
-        self._node = Node("t800_motion_events_pub", context=ros2.ctx_core)
         ros2.executor_robot.add_node(self._robot_node)
-        ros2.executor_core.add_node(self._node)
-        self._publisher = self._node.create_publisher(
-            String, f"/{namespace}/state/motion_events", _RELIABLE
-        )
         self._lock = threading.RLock()
-        self._events = deque(maxlen=self._capacity)
-        self._sequence = 0
         self._moving = False
         self._latest_speed = 0.0
         self._latest_speed_source = "none"
@@ -1568,6 +1567,7 @@ class MotionEventsPlugin:
         self._latest_direction = "none"
         self._current_motion_state = "unknown"
         self._available_motion_states: list[str] = []
+        self._last_known_posture = "unknown"
         self._last_motion_state = "unknown"
         self._last_gamepad_signature = ""
         self._motion_start_threshold = 0.05
@@ -1606,39 +1606,22 @@ class MotionEventsPlugin:
     def get_tool(self) -> dict:
         return {
             "name": "motion_events",
-            "type": "sensor",
+            "type": "actuator",
             "multiInstance": False,
             "readOnly": True,
-            "description": "T800 motion event stream — motion state changes and motion command lifecycle events",
-            "inputSchema": action_schema(
-                _with_lifecycle({
-                    "status": ([], "返回最新事件摘要"),
-                    "debug": (["limit", "since_event_id", "source_tool", "severity"], "返回筛选后的事件时间线"),
-                }),
-                {
-                    "limit": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 200,
-                        "description": "最多返回事件条数",
-                    },
-                    "since_event_id": {
+            "description": "按需返回 T800 当前动作、运动/停止状态、速度和固件运动状态",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
                         "type": "string",
-                        "description": "只返回该事件之后的新事件",
-                    },
-                    "source_tool": {
-                        "type": "string",
-                        "description": "按来源 tool 过滤",
-                    },
-                    "severity": {
-                        "type": "string",
-                        "enum": ["debug", "info", "warning", "error"],
-                        "description": "按事件级别过滤",
+                        "enum": ["status"],
+                        "description": "查询当前运动状态",
                     },
                 },
-                "运动事件查询动作",
-            ),
-            "topic_out": [{"topic": f"/{self._ns}/state/motion_events", "format": "data/json"}],
+                "required": ["action"],
+                "additionalProperties": False,
+            },
         }
 
     def start(self) -> None:
@@ -1672,20 +1655,13 @@ class MotionEventsPlugin:
             self._robot_node.create_subscription(
                 Odometry, odometry_topic, self._on_odometry, _BEST_EFFORT
             )
-        self._node.create_timer(0.2, self._publish)
 
     def stop(self) -> None:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict:
-        if action == "info":
-            return _with_topic_out(self._summary_snapshot(), f"/{self._ns}/state/motion_events")
-        if action in ("motion_events", "status", "start"):
+        if action == "status":
             return self._summary_snapshot()
-        if action in ("debug", "list"):
-            return self._debug_snapshot(args)
-        if action == "stop":
-            return {"state": "idle"}
         return {"error": f"unknown motion events action: {action}"}
 
     def _on_velocity(self, msg) -> None:
@@ -1702,6 +1678,8 @@ class MotionEventsPlugin:
         motion_name = str(msg.target_motion_name)
         action = _normalize_motion_action(motion_name)
         with self._lock:
+            if action in ("passive", "idle"):
+                action = self._last_known_posture
             self._latest_action = action
             self._latest_control_source = "motion_request"
             self._latest_direction = "none"
@@ -1785,10 +1763,21 @@ class MotionEventsPlugin:
             if current != previous:
                 moving = self._freshly_moving()
                 raw_action = _normalize_motion_action(current)
-                if raw_action == "passive":
-                    action = "lie" if action in ("lie", "lie_down") else "passive"
+                if raw_action in ("passive", "idle"):
+                    inferred = _display_motion_action_from_state(current, available, moving=moving)
+                    if inferred in ("stand", "sit", "lie"):
+                        action = inferred
+                    else:
+                        requested_posture = "lie" if action == "lie_down" else action
+                        action = (
+                            requested_posture
+                            if requested_posture in ("stand", "sit", "lie")
+                            else self._last_known_posture
+                        )
                 else:
                     action = _display_motion_action_from_state(current, available, moving=moving)
+                if action in ("stand", "sit", "lie"):
+                    self._last_known_posture = action
                 self._latest_action = action
                 self._latest_control_source = "motion_state"
                 self._latest_direction = "none"
@@ -1888,40 +1877,27 @@ class MotionEventsPlugin:
         summary: str,
         detail: dict | None = None,
     ) -> dict:
-        with self._lock:
-            self._sequence += 1
-            event_id = f"t800-motion-{self._sequence:06d}"
-            timestamp_ms = _now_ms()
-            event = {
-                "type": event_type,
-                "timestamp": round(timestamp_ms / 1000.0, 3),
-                "event_id": event_id,
-                "timestamp_ms": timestamp_ms,
-                "source_tool": source_tool,
-                "event_type": event_type,
-                "severity": severity,
-                "phase": phase,
-                "summary": summary,
-                "detail": detail or {},
-            }
-            self._events.append(event)
-            return dict(event)
+        # Kept as a compatibility hook for the bundle dispatcher.  Events are
+        # deliberately not buffered or streamed; status is computed on demand.
+        return {
+            "source_tool": source_tool,
+            "event_type": event_type,
+            "severity": severity,
+            "phase": phase,
+            "summary": summary,
+            "detail": detail or {},
+        }
 
     def _summary_snapshot(self) -> dict:
         now = time.monotonic()
         with self._lock:
-            latest_event = dict(self._events[-1]) if self._events else None
-            events = [dict(event) for event in self._events]
-            total_recorded = self._sequence
             moving = self._moving
             latest_speed = self._latest_speed
-            latest_speed_source = self._latest_speed_source
             latest_speed_updated = self._latest_speed_updated
             latest_action = self._latest_action
-            latest_buttons = list(self._latest_buttons)
-            latest_control_source = self._latest_control_source
             current_motion_state = self._current_motion_state
             available_motion_states = list(self._available_motion_states)
+            last_known_posture = self._last_known_posture
         speed_age = None if latest_speed_updated is None else max(0.0, now - latest_speed_updated)
         fresh_moving = (
             moving
@@ -1929,74 +1905,24 @@ class MotionEventsPlugin:
             and speed_age <= _SPEED_STALE_SECONDS
         )
         display_action = latest_action
-        display_control_source = latest_control_source
         if display_action == "none" and current_motion_state not in ("", "unknown"):
             display_action = _display_motion_action_from_state(
                 current_motion_state, available_motion_states, moving=fresh_moving
             )
-            display_control_source = "motion_state"
-        if display_action == "walk" and not fresh_moving:
+        if display_action in ("passive", "idle", "none"):
+            display_action = last_known_posture if last_known_posture in ("stand", "sit", "lie") else "unknown"
+        if display_action in ("walk", "move") and not fresh_moving:
             display_action = "stand"
+        display_current_state = current_motion_state
+        if _normalize_motion_action(current_motion_state) in ("passive", "idle"):
+            display_current_state = display_action if display_action in ("stand", "sit", "lie") else "unknown"
         return {
-            "state": "running" if latest_event or latest_speed_updated is not None else "no_data",
+            "state": "running" if current_motion_state != "unknown" or latest_speed_updated is not None else "no_data",
+            "action": display_action,
             "motion_state": "moving" if fresh_moving else "stopped",
             "speed": f"{round(latest_speed, 2):.2f} m/s",
-            "speed_source": latest_speed_source,
-            "control_source": display_control_source,
-            "action": display_action,
-            "buttons": latest_buttons,
-            "current_motion_state": current_motion_state,
-            "event": None if latest_event is None else latest_event.get("type"),
-            "summary": None if latest_event is None else latest_event.get("summary"),
-            "event_id": None if latest_event is None else latest_event.get("event_id"),
-            "event_count": total_recorded,
+            "current_motion_state": display_current_state,
         }
-
-    def _debug_snapshot(self, args: dict | None = None) -> dict:
-        args = args or {}
-        limit = int(args.get("limit", 50))
-        limit = max(1, min(limit, 200))
-        since_event_id = str(args.get("since_event_id", "") or "")
-        source_tool = str(args.get("source_tool", "") or "")
-        severity = str(args.get("severity", "") or "")
-        with self._lock:
-            events = [dict(event) for event in self._events]
-            total_buffered = len(self._events)
-            latest_event_id = events[-1]["event_id"] if events else None
-            total_recorded = self._sequence
-        if since_event_id:
-            events = self._after_event(events, since_event_id)
-        if source_tool:
-            events = [event for event in events if event["source_tool"] == source_tool]
-        if severity:
-            events = [event for event in events if event["severity"] == severity]
-        events = events[-limit:]
-        warning_count = sum(1 for event in events if event["severity"] == "warning")
-        error_count = sum(1 for event in events if event["severity"] == "error")
-        return {
-            "state": "running" if events else "no_data",
-            "ok": True,
-            "robot": "t800",
-            "tool": "motion_events",
-            "events": events,
-            "summary": {
-                "capacity": self._capacity,
-                "total_recorded": total_recorded,
-                "total_buffered": total_buffered,
-                "returned": len(events),
-                "latest_event_id": latest_event_id,
-                "warning_count": warning_count,
-                "error_count": error_count,
-            },
-            "timestamp_ms": _now_ms(),
-        }
-
-    @staticmethod
-    def _after_event(events: list[dict], since_event_id: str) -> list[dict]:
-        for index, event in enumerate(events):
-            if event["event_id"] == since_event_id:
-                return events[index + 1:]
-        return events
 
     @staticmethod
     def _classify(tool_name: str, action: str, result: dict) -> tuple[str, str, str]:
@@ -2039,9 +1965,6 @@ class MotionEventsPlugin:
         if isinstance(value, (str, int, float, bool)) or value is None:
             return value
         return str(value)
-
-    def _publish(self) -> None:
-        self._publisher.publish(_json_message(self._summary_snapshot()))
 
 class NativeInterfaceProbePlugin:
     _NAME_KEYWORDS = ("engineai", "motion", "hardware")
@@ -2729,8 +2652,30 @@ def _first_available_motion(candidates, available: list[str]) -> str | None:
     return None
 
 
-class MotionModePlugin:
-    """Verified T800 posture transitions over the public ROS motion FSM."""
+def _safe_motion_mode_action(
+    name: str,
+    available: list[str] | tuple[str, ...] | None = None,
+    fallback: str | None = None,
+) -> str:
+    """Return one of the three safe semantic postures from firmware feedback."""
+    action = _motion_mode_action(name)
+    if action in ("stand", "walk", "get_up"):
+        return "stand"
+    if action == "sit":
+        return "sit"
+    if action == "lie_down":
+        return "lie"
+    if action == "passive":
+        inferred = _display_motion_action_from_state(name, available)
+        if inferred in ("sit", "lie"):
+            return inferred
+        if fallback in ("sit", "lie"):
+            return str(fallback)
+    return "unknown"
+
+
+class SafeMotionModePlugin:
+    """Safe T800 posture transitions over the public ROS motion FSM."""
 
     _ALIASES = {
         "stand": (
@@ -2745,43 +2690,35 @@ class MotionModePlugin:
         "lie": (
             "rl_mimic_stance_to_supine", "stance_to_supine", "lie_down", "liedown", "supine",
         ),
-        "idle": ("idle",),
-        "passive": ("passive",),
     }
-    _STANDING_ACTIONS = frozenset({"stand", "walk"})
-    _STAND_FIRST_TARGETS = frozenset({"stand", "sit", "lie"})
-    _MODE_ACTIONS = {
-        "stand": "stand",
-        "sit": "sit",
-        "lie": "lie_down",
-        "idle": "idle",
-        "passive": "passive",
-    }
+    _ACTIONS = ("stand", "sit", "lie")
 
     def __init__(self, config: dict, namespace: str, ros2, state: StatePlugin):
         self._config = config
         self._state = state
-        self._node = Node("t800_motion_mode", context=ros2.ctx_robot)
+        self._node = Node("t800_safe_motion_mode", context=ros2.ctx_robot)
         ros2.executor_robot.add_node(self._node)
         self._publisher = None
+        self._last_confirmed_mode: str | None = None
 
     def get_tool(self) -> dict:
         return {
-            "name": "motion_mode",
+            "name": "safe_motion_mode",
             "type": "actuator",
             "multiInstance": False,
-            "description": "T800 运动状态切换：站立/坐下/躺下/空闲/阻力；"
-                           "非站立姿态切换到其他姿态会自动先起身到站立，passive 支持 idle 切入",
-            "inputSchema": action_schema(
-                {name: (["force", "wait", "stand_stabilize_sec"], f"切换到 {name}") for name in self._ALIASES},
-                {
-                    "wait": {"type": "boolean", "description": "等待状态反馈，默认 true"},
-                    "force": {"type": "boolean", "description": "目标不在 available transitions 时仍发送（需人工确认安全）"},
-                    "timeout_sec": {"type": "number", "description": "等待状态反馈超时时间；默认使用 config.yaml"},
-                    "stand_stabilize_sec": {"type": "number", "description": "起身完成后的站立稳定等待时间；默认 5 秒"},
+            "description": "安全切换 T800 的 stand、sit、lie；非站立姿态互切会自动经过 stand",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": list(self._ACTIONS),
+                        "description": "目标安全姿态",
+                    },
                 },
-                "运动状态动作",
-            ),
+                "required": ["action"],
+                "additionalProperties": False,
+            },
         }
 
     def start(self) -> None:
@@ -2797,112 +2734,62 @@ class MotionModePlugin:
 
     def dispatch(self, action: str, args: dict) -> dict:
         mode = str(action or "")
-        if mode not in self._ALIASES:
-            return {"error": f"unknown motion mode action: {mode}"}
-        args = dict(args or {})
-        force = bool(args.get("force", False))
-        wait = bool(args.get("wait", True))
-        timeout = float(args.get("timeout_sec", self._config["control"]["mode_transition_timeout_sec"]))
-        stabilize_sec = float(args.get(
-            "stand_stabilize_sec",
-            self._config.get("control", {}).get("mode_stand_stabilize_sec", 5.0),
-        ))
+        if mode not in self._ACTIONS:
+            return {"state": "rejected", "error": f"unknown safe motion action: {mode}"}
+        del args
+        timeout = float(self._config["control"]["mode_transition_timeout_sec"])
+        stabilize_sec = float(self._config.get("control", {}).get("mode_stand_stabilize_sec", 5.0))
 
         current, available = self._state.current_motion()
-        current_action = _motion_mode_action(current)
-        steps: list[dict] = []
+        current_mode = _safe_motion_mode_action(current, available, self._last_confirmed_mode)
+        origin = current_mode
+        path = [origin] if origin in self._ACTIONS else []
 
-        if self._mode_matches_current(mode, current_action):
-            return {
-                "state": "completed",
-                "mode": mode,
-                "current": current,
-                "available": available,
-                "steps": [{"state": "completed", "target": f"already {mode}", "current": current}],
-            }
+        if current_mode not in self._ACTIONS:
+            return self._failure(
+                "rejected", mode, origin, path, current, "current posture is not safely identifiable"
+            )
+        if mode == current_mode:
+            self._last_confirmed_mode = mode
+            return self._completed(mode, origin, [mode], current, changed=False)
 
-        if mode == "idle" and current_action not in ("sit", "lie_down", "passive"):
-            return {
-                "state": "rejected",
-                "error": f"{mode} only allowed from sit, lie or passive (current: {current_action})",
-                "mode": mode,
-                "current": current,
-                "available": available,
-                "suggested_action": "switch to sit, lie or passive first",
-            }
-        if mode == "passive" and current_action not in ("sit", "lie_down", "idle"):
-            return {
-                "state": "rejected",
-                "error": f"{mode} only allowed from sit, lie or idle (current: {current_action})",
-                "mode": mode,
-                "current": current,
-                "available": available,
-                "suggested_action": "switch to sit, lie or idle first",
-            }
-
-        if mode in self._STAND_FIRST_TARGETS and current_action not in self._STANDING_ACTIONS:
-            stand_target = self._pick_target("stand", available, force, current_action=current_action)
+        if current_mode != "stand":
+            stand_target = self._pick_target("stand", available, current_mode)
             if stand_target is None:
-                return self._reject(mode, current, available, "stand")
+                return self._reject(mode, origin, path, current, available, "stand")
             step = self._request_and_wait(
                 stand_target,
-                expected=self._STANDING_ACTIONS,
-                wait=(True if mode != "stand" else wait),
+                desired_mode="stand",
                 timeout=timeout,
             )
-            steps.append(step)
+            path.append("stand")
             if step["state"] != "completed":
-                result = {
-                    "state": step["state"],
-                    "mode": mode,
-                    "target": stand_target,
-                    "current": step.get("current", current),
-                    "available": step.get("available", available),
-                    "steps": steps,
-                }
-                if step["state"] == "timeout":
-                    result["error"] = "could not stand up before " + mode
-                return result
+                return self._failure(
+                    step["state"], mode, origin, path, step.get("current", current),
+                    f"could not reach stand before {mode}",
+                )
+            self._last_confirmed_mode = "stand"
             if mode == "stand":
-                return {
-                    "state": "completed",
-                    "mode": mode,
-                    "target": stand_target,
-                    "current": step.get("current", current),
-                    "available": step.get("available", available),
-                    "steps": steps,
-                }
+                return self._completed(mode, origin, path, step.get("current", current), changed=True)
             if stabilize_sec > 0:
                 time.sleep(stabilize_sec)
             current, available = self._state.current_motion()
-            current_action = _motion_mode_action(current)
 
-        if mode == "stand" and current_action in self._STANDING_ACTIONS:
-            return {
-                "state": "completed",
-                "mode": mode,
-                "current": current,
-                "available": available,
-                "steps": [{"state": "completed", "target": "already standing", "current": current}],
-            }
-
-        target = self._pick_target(mode, available, force, current_action=current_action)
+        target = self._pick_target(mode, available, "stand")
         if target is None:
-            return self._reject(mode, current, available, mode)
-        expected = frozenset(_motion_mode_action(alias) for alias in self._ALIASES[mode])
-        final = self._request_and_wait(target, expected=expected, wait=wait, timeout=timeout)
-        steps.append(final)
-        return {
-            "state": final["state"],
-            "mode": mode,
-            "target": target,
-            "current": final.get("current", current),
-            "available": final.get("available", available),
-            "steps": steps,
-        }
+            return self._reject(mode, origin, path, current, available, mode)
+        final = self._request_and_wait(target, desired_mode=mode, timeout=timeout)
+        path.append(mode)
+        if final["state"] != "completed":
+            return self._failure(
+                final["state"], mode, origin, path, final.get("current", current),
+                f"could not reach {mode}",
+            )
+        self._last_confirmed_mode = mode
+        return self._completed(mode, origin, path, final.get("current", current), changed=True)
 
     def request_target(self, target: str, args: dict, *, expected_actions=None) -> dict:
-        """Request a raw firmware state for a dedicated facade tool."""
+        """Internal raw-state request used by the separate dance facade."""
         args = dict(args or {})
         force = bool(args.get("force", False))
         wait = bool(args.get("wait", True))
@@ -2911,33 +2798,40 @@ class MotionModePlugin:
         target = str(target or "")
         if not target:
             return {"state": "rejected", "error": "target motion is required", "current": current}
-        if not available and not force:
-            return self._reject(target, current, available, target)
-        if available and not _motion_mode_matches_any(target, available) and not force:
-            return self._reject(target, current, available, target)
+        if (not available or not _motion_mode_matches_any(target, available)) and not force:
+            return {
+                "state": "rejected",
+                "error": f"no available transition for {target} from {current}",
+                "current": current,
+            }
         expected = frozenset(expected_actions or {_motion_mode_action(target)})
-        result = self._request_and_wait(target, expected=expected, wait=wait, timeout=timeout)
+        msg = self._message_type()
+        msg.target_motion_name = target
+        self._publisher.publish(msg)
+        if not wait:
+            return {"state": "requested", "target": target, "current": current}
+        deadline = time.monotonic() + timeout
+        result = {"state": "timeout", "target": target, "current": current}
+        while time.monotonic() < deadline:
+            current, _ = self._state.current_motion()
+            if _motion_mode_action(current) in expected:
+                result = {"state": "completed", "target": target, "current": current}
+                break
+            time.sleep(0.05)
         return {
             "state": result["state"],
             "target": target,
             "current": result.get("current", current),
-            "available": result.get("available", available),
         }
 
-    def _mode_matches_current(self, mode: str, current_action: str) -> bool:
-        expected = self._MODE_ACTIONS.get(mode, mode)
+    def _target_candidates(self, mode: str, current_mode: str) -> list[str]:
         if mode == "stand":
-            return current_action in self._STANDING_ACTIONS
-        return current_action == expected
-
-    def _target_candidates(self, mode: str, current_action: str) -> list[str]:
-        if mode == "stand":
-            if current_action == "sit":
+            if current_mode == "sit":
                 return [
                     "rl_mimic_sitdown_to_stance", "sitdown_to_stance",
                     "pd_stand", "stand", "stance",
                 ]
-            if current_action in ("lie_down", "passive"):
+            if current_mode == "lie":
                 return [
                     "rl_mimic_supine_to_stance", "rl_mimic_prone_to_stance",
                     "supine_to_stance", "prone_to_stance",
@@ -2949,39 +2843,23 @@ class MotionModePlugin:
         self,
         mode: str,
         available: list[str],
-        force: bool,
-        *,
-        current_action: str,
+        current_mode: str,
     ) -> str | None:
-        candidates = self._target_candidates(mode, current_action)
-        if mode == "idle" and current_action in ("sit", "lie_down", "passive"):
-            return "idle"
-        if mode == "passive" and current_action in ("sit", "lie_down", "idle"):
-            return "passive"
-        if not available and not force:
+        candidates = self._target_candidates(mode, current_mode)
+        if not available:
             return None
-        requested = _first_available_motion(candidates, available)
-        if requested is None and force:
-            requested = candidates[0]
-        return requested
+        return _first_available_motion(candidates, available)
 
-    def _request_and_wait(self, target: str, *, expected, wait: bool, timeout: float) -> dict:
+    def _request_and_wait(self, target: str, *, desired_mode: str, timeout: float) -> dict:
         msg = self._message_type()
         msg.target_motion_name = target
         self._publisher.publish(msg)
-        result = self._wait_for_motion(target, expected=expected, wait=wait, timeout=timeout)
-        result["control_source"] = "ros_motion_request"
-        return result
-
-    def _wait_for_motion(self, target: str, *, expected, wait: bool, timeout: float) -> dict:
-        if not wait:
-            return {"state": "requested", "target": target}
         deadline = time.monotonic() + timeout
         current, available = "", []
         while time.monotonic() < deadline:
             current, available = self._state.current_motion()
-            motion = _motion_mode_action(current)
-            if motion in expected:
+            motion = _safe_motion_mode_action(current, available, desired_mode)
+            if motion == desired_mode:
                 return {
                     "state": "completed",
                     "target": target,
@@ -2992,30 +2870,59 @@ class MotionModePlugin:
             time.sleep(0.05)
         return {"state": "timeout", "target": target, "current": current, "available": available}
 
-    def _reject(self, mode: str, current: str, available: list[str], need: str) -> dict:
-        if not available:
-            return {
-                "state": "rejected",
-                "error": "no_transition_data",
-                "mode": mode,
-                "current": current,
-                "available": available,
-                "suggested_action": "wait for motion_state data or retry with force=true only after manual safety check",
-            }
+    @staticmethod
+    def _completed(mode: str, origin: str, path: list[str], firmware_state: str, *, changed: bool) -> dict:
         return {
-            "state": "rejected",
-            "error": f"no available transition for {need} from {current}",
-            "mode": mode,
-            "current": current,
-            "available": available,
-            "suggested_action": f"use one of: {', '.join(available)}",
+            "state": "completed",
+            "action": mode,
+            "from": origin,
+            "to": mode,
+            "transition_path": path,
+            "transition": f"already {mode}" if not changed else " -> ".join(path),
+            "changed": changed,
+            "current": mode,
+            "firmware_state": firmware_state,
         }
+
+    @staticmethod
+    def _failure(
+        state: str,
+        mode: str,
+        origin: str,
+        path: list[str],
+        firmware_state: str,
+        error: str,
+    ) -> dict:
+        return {
+            "state": state,
+            "action": mode,
+            "from": origin,
+            "to": mode,
+            "transition_path": path,
+            "transition": " -> ".join(path) if path else "not started",
+            "changed": False,
+            "current": _safe_motion_mode_action(firmware_state),
+            "firmware_state": firmware_state,
+            "error": error,
+        }
+
+    def _reject(
+        self,
+        mode: str,
+        origin: str,
+        path: list[str],
+        current: str,
+        available: list[str],
+        need: str,
+    ) -> dict:
+        error = "no_transition_data" if not available else f"no available transition for {need} from {current}"
+        return self._failure("rejected", mode, origin, path, current, error)
 
 
 class DancePlugin:
     """Discoverable dance facade over Native SDK motion states."""
 
-    def __init__(self, motion_mode: MotionModePlugin, state: StatePlugin):
+    def __init__(self, motion_mode: SafeMotionModePlugin, state: StatePlugin):
         self._motion_mode = motion_mode
         self._state = state
 
@@ -3065,9 +2972,9 @@ class DancePlugin:
             return {"state": "idle"}
         if action == "play":
             target = str(args.get("name", "dance"))
-            current_action = _motion_mode_action(current)
+            current_action = _safe_motion_mode_action(current, available, self._motion_mode._last_confirmed_mode)
             steps: list[dict] = []
-            if current_action not in MotionModePlugin._STANDING_ACTIONS:
+            if current_action != "stand":
                 stand = self._motion_mode.dispatch("stand", dict(args))
                 steps.append(stand)
                 if stand.get("state") != "completed":
