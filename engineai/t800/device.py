@@ -2399,6 +2399,7 @@ class JointPlanPlugin:
         request_id: int,
         timeout: float,
         cancel_event: threading.Event,
+        abort_check=None,
     ) -> dict:
         """Require the planner to execute and finish the exact request."""
         if self._state_type is None:
@@ -2408,6 +2409,10 @@ class JointPlanPlugin:
         idle = int(self._state_type.IDLE)
         with self._state_changed:
             while True:
+                if abort_check is not None:
+                    abort_reason = abort_check()
+                    if abort_reason:
+                        raise RuntimeError(str(abort_reason))
                 if cancel_event.is_set():
                     raise RuntimeError("gesture cancelled")
                 state = dict(self._last_state)
@@ -3089,13 +3094,13 @@ class ArmSwingPlugin:
             "multiInstance": False,
             "description": "T800 lower_body_balance 下通过 joint_plan 持续交替摆臂",
             "inputSchema": action_schema(
-                {
+                _with_lifecycle({
                     "start_swing": (["amplitude_deg", "frequency_hz"], "开始左右交替摆臂"),
                     "halt": ([], "取消当前规划并停止摆臂"),
                     "return_neutral": (["duration"], "平滑回到自然姿态"),
                     "halt_and_return": (["duration"], "取消当前规划并平滑回到自然姿态"),
                     "status": ([], "查询摆臂状态和发布计数"),
-                },
+                }),
                 {
                     "amplitude_deg": {"type": "number", "minimum": 2.0, "maximum": 30.0, "description": "肩部摆幅，默认 8 度"},
                     "frequency_hz": {"type": "number", "minimum": 0.2, "maximum": 1.2, "description": "摆动频率，默认 0.7 Hz"},
@@ -3112,6 +3117,10 @@ class ArmSwingPlugin:
         self._halt_swing("driver_stopped")
 
     def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "info"):
+            return {**self._status(), "state": "ready"}
+        if action == "stop":
+            return self._halt_swing("lifecycle_stop")
         if action == "status":
             return self._status()
         if action == "halt":
@@ -3162,35 +3171,63 @@ class ArmSwingPlugin:
                     frequency = self._frequency_hz
                 step_duration = 0.5 / frequency
                 offset = direction * amplitude
-                result = self._joint_plan.dispatch("plan", {
-                    "joint_indices": self._INDICES,
-                    "target_positions": [
-                        self._BASE[0] + offset,
-                        self._BASE[1],
-                        self._BASE[2] - offset,
-                        self._BASE[3],
-                    ],
-                    "duration": step_duration,
-                    "gravity_compensation": True,
-                })
-                if "error" in result:
-                    raise RuntimeError(str(result["error"]))
-                request_id = int(result["request_id"])
                 with self._lock:
+                    # Keep publication and ID storage in one critical section.
+                    # halt either wins before publication or observes the ID.
+                    if self._halt.is_set():
+                        break
+                    result = self._joint_plan.dispatch("plan", {
+                        "joint_indices": self._INDICES,
+                        "target_positions": [
+                            self._BASE[0] + offset,
+                            self._BASE[1],
+                            self._BASE[2] - offset,
+                            self._BASE[3],
+                        ],
+                        "duration": step_duration,
+                        "gravity_compensation": True,
+                    })
+                    if "error" in result:
+                        raise RuntimeError(str(result["error"]))
+                    request_id = int(result["request_id"])
                     self._request_id = request_id
                     self._publish_count += 1
                 self._joint_plan.wait_for_request(
                     request_id,
                     max(5.0, step_duration + 3.0),
                     self._halt,
+                    abort_check=self._motion_state_abort_reason,
                 )
+                with self._lock:
+                    if self._request_id == request_id:
+                        self._request_id = None
                 direction *= -1.0
         except Exception as exc:
-            reason = "user_halt" if self._halt.is_set() else f"error:{exc}"
+            message = str(exc)
+            if message.startswith("motion_state_changed:"):
+                reason = message
+            else:
+                reason = self._last_reason if self._halt.is_set() else f"error:{exc}"
         finally:
+            request_id = None
             with self._lock:
+                request_id = self._request_id
                 self._last_reason = reason
                 self._request_id = None
+            # A request can still be live when the worker is interrupted or
+            # errors. Always cancel it before declaring the card idle.
+            if request_id is not None:
+                self._joint_plan.dispatch("cancel", {"request_id": request_id})
+
+    def _motion_state_abort_reason(self) -> str | None:
+        motion, _ = self._state.current_motion()
+        if motion == "lower_body_balance":
+            return None
+        reason = f"motion_state_changed:{motion or 'unknown'}"
+        with self._lock:
+            self._last_reason = reason
+            self._halt.set()
+        return reason
 
     def _halt_swing(self, reason: str) -> dict:
         with self._lock:

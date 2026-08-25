@@ -1033,9 +1033,13 @@ class DevicePluginContractTests(unittest.TestCase):
         self.state._current_motion = "lower_body_balance"
         self.assertIn("between 2 and 30", swing.dispatch("start_swing", {"amplitude_deg": 31})["error"])
         actions = swing.get_tool()["inputSchema"]["properties"]["action"]["enum"]
+        self.assertTrue({"start", "info", "stop"}.issubset(actions))
         self.assertNotIn("set_parameters", actions)
         self.assertIn("return_neutral", actions)
         self.assertIn("halt_and_return", actions)
+        self.assertEqual("ready", swing.dispatch("start", {})["state"])
+        self.assertEqual("ready", swing.dispatch("info", {})["state"])
+        self.assertEqual("idle", swing.dispatch("stop", {})["state"])
 
     def test_arm_swing_return_neutral_uses_joint_plan(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
@@ -1053,16 +1057,57 @@ class DevicePluginContractTests(unittest.TestCase):
     def test_arm_swing_cancels_when_motion_state_changes(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
         plan.start()
-        plan.wait_for_request = lambda *_args, **_kwargs: time.sleep(0.03)
         swing = self.device.ArmSwingPlugin(CONFIG, plan, self.state)
         self.state._current_motion = "lower_body_balance"
         swing.dispatch("start_swing", {})
-        time.sleep(0.01)
+        deadline = time.monotonic() + 1.0
+        while not plan._publisher.messages and time.monotonic() < deadline:
+            time.sleep(0.01)
+        request_id = plan._publisher.messages[0].request_id
         self.state._current_motion = "rl_basic"
         swing._thread.join(timeout=1.0)
         status = swing.dispatch("status", {})
         self.assertEqual("idle", status["state"])
         self.assertIn("motion_state_changed", status["reason"])
+        cancels = [msg for msg in plan._publisher.messages
+                   if msg.request_type == plan._request_type.REQUEST_CANCEL]
+        self.assertTrue(any(msg.request_id == request_id for msg in cancels))
+
+    def test_arm_swing_halt_cancels_request_published_before_id_storage(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        original_dispatch = plan.dispatch
+        published = threading.Event()
+        allow_return = threading.Event()
+
+        def delayed_dispatch(action, args):
+            result = original_dispatch(action, args)
+            if action == "plan":
+                published.set()
+                allow_return.wait(timeout=1.0)
+            return result
+
+        plan.dispatch = delayed_dispatch
+        swing = self.device.ArmSwingPlugin(CONFIG, plan, self.state)
+        self.state._current_motion = "lower_body_balance"
+        swing.dispatch("start_swing", {})
+        self.assertTrue(published.wait(timeout=1.0))
+        halted = {}
+
+        def halt():
+            halted.update(swing.dispatch("halt", {}))
+
+        halt_thread = threading.Thread(target=halt)
+        halt_thread.start()
+        time.sleep(0.02)
+        allow_return.set()
+        halt_thread.join(timeout=1.0)
+        self.assertEqual("idle", halted["state"])
+        request_id = next(msg.request_id for msg in plan._publisher.messages
+                          if msg.request_type == plan._request_type.REQUEST_PLAN_EXECUTE)
+        cancels = [msg for msg in plan._publisher.messages
+                   if msg.request_type == plan._request_type.REQUEST_CANCEL]
+        self.assertTrue(any(msg.request_id == request_id for msg in cancels))
 
     def test_joint_bridge_force_path_and_damping_stop(self):
         plugin = self.device.JointBridgePlugin(CONFIG, "robot", self.ros, self.state)
