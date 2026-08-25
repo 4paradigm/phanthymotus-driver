@@ -108,13 +108,21 @@ VARIANT_DOF = {"lite": 23, "sp": 29, "pro": 31}
 HAND_CHANNEL_NAMES = (
     "pinky", "ring", "middle", "index", "thumb_flex", "thumb_rotate",
 )
+HAND_CHANNEL_LABELS = {
+    "pinky": "小指",
+    "ring": "无名指",
+    "middle": "中指",
+    "index": "食指",
+    "thumb_flex": "拇指屈伸",
+    "thumb_rotate": "拇指旋转",
+}
 HAND_POSITION_COUNT = 12
 HAND_DEFAULT_OPEN = [
     1800, 1800, 1800, 1800, 1600, 0,
     1800, 1800, 1800, 1800, 1600, 0,
 ]
 HAND_DEFAULT_CLOSED = [0] * HAND_POSITION_COUNT
-HAND_DEFAULT_THUMB_CLOSE = [1000, 0, 1000, 0]
+HAND_DEFAULT_THUMB_CLOSE = [500, 0, 500, 0]
 
 
 def _coerce_hand_positions(values, *, limit: int, expected: int = HAND_POSITION_COUNT) -> list[int]:
@@ -145,10 +153,6 @@ def _coerce_hand_positions(values, *, limit: int, expected: int = HAND_POSITION_
             raise ValueError("hand positions must be finite numbers")
         result.append(int(max(0, min(limit, round(value)))))
     return result
-
-
-def _coerce_hand_side(values, *, limit: int) -> list[int]:
-    return _coerce_hand_positions(values, limit=limit, expected=6)
 
 
 def _hand_state_payload(position, reserve, received_at_ms: int) -> dict:
@@ -450,8 +454,6 @@ class HandStatePlugin:
         return {
             "name": "hand_state",
             "type": "sensor",
-            "multiInstance": False,
-            "readOnly": True,
             "description": (
                 "Adam dexterous hand feedback from DDS rt/handstate. "
                 "Each hand has 5 fingers and 6 motor channels (the thumb has "
@@ -461,12 +463,7 @@ class HandStatePlugin:
             ),
             "inputSchema": {
                 "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["info", "read", "get_state", "start", "stop"],
-                    },
-                },
+                "properties": {},
             },
             "topic_out": [{"topic": self._topic, "format": "data/json"}],
         }
@@ -505,16 +502,6 @@ class HandStatePlugin:
         return {"state": "idle", "topic_out": [{"topic": self._topic, "format": "data/json"}]}
 
     def dispatch(self, action: str, args: dict) -> dict:
-        if action in ("read", "get_state", "hand_state"):
-            payload = self._node.snapshot()
-            if payload is None:
-                return {
-                    "state": "unknown",
-                    "fresh": False,
-                    "source_topic": "rt/handstate",
-                    "message": "No hand state received yet",
-                }
-            return payload
         if action == "start":
             return self.start()
         if action == "stop":
@@ -863,9 +850,9 @@ class HandPlugin:
             expected=4,
         )
         try:
-            thumb_min = int(plugin_config.get("thumb_close_min_flex_position", 1000))
+            thumb_min = int(plugin_config.get("thumb_close_min_flex_position", 500))
         except (TypeError, ValueError):
-            thumb_min = 1000
+            thumb_min = 500
         self._thumb_close_min_flex_position = max(0, min(self._max_val, thumb_min))
         try:
             self._close_stage_delay_sec = float(plugin_config.get("close_stage_delay_sec", 0.8))
@@ -962,23 +949,35 @@ class HandPlugin:
                     "action": {
                         "type": "string",
                         "enum": [
-                            "open", "close", "set_fingers", "get_state",
-                            "start", "stop", "info",
+                            "open", "close", "set_fingers", "start", "stop", "info",
                         ],
                     },
-                    "left": {
-                        "type": "array",
-                        "minItems": 6,
-                        "maxItems": 6,
-                        "items": {"type": "integer", "minimum": 0, "maximum": self._max_val},
-                        "description": "6 motor channels for 5 fingers [pinky, ring, middle, index, thumb_flex, thumb_rotate]",
+                    "side": {
+                        "type": "string",
+                        "title": "手",
+                        "enum": ["left", "right"],
+                        "oneOf": [
+                            {"const": "left", "title": "左手"},
+                            {"const": "right", "title": "右手"},
+                        ],
+                        "description": "选择要控制的手",
                     },
-                    "right": {
-                        "type": "array",
-                        "minItems": 6,
-                        "maxItems": 6,
-                        "items": {"type": "integer", "minimum": 0, "maximum": self._max_val},
-                        "description": "6 motor channels for 5 fingers [pinky, ring, middle, index, thumb_flex, thumb_rotate]",
+                    "channel": {
+                        "type": "string",
+                        "title": "通道",
+                        "enum": list(HAND_CHANNEL_NAMES),
+                        "oneOf": [
+                            {"const": name, "title": HAND_CHANNEL_LABELS[name]}
+                            for name in HAND_CHANNEL_NAMES
+                        ],
+                        "description": "每只手 6 个电机通道；左右手合计 12 个通道",
+                    },
+                    "value": {
+                        "type": "integer",
+                        "title": "目标值",
+                        "minimum": 0,
+                        "maximum": self._max_val,
+                        "description": f"该通道的目标位置值，范围 0-{self._max_val}",
                     },
                 },
                 "required": ["action"],
@@ -995,15 +994,10 @@ class HandPlugin:
                         ),
                     },
                     "set_fingers": {
-                        "params": ["left", "right"],
+                        "params": ["side", "channel", "value"],
                         "description": (
-                            "Set either hand's six motor channels; an omitted side keeps "
-                            "the current target or fresh feedback position"
+                            "选择左手或右手的一个通道，持续下发该通道的目标位置值"
                         ),
-                    },
-                    "get_state": {
-                        "params": [],
-                        "description": "Read current finger positions",
                     },
                     "start": {"params": [], "description": "Enable the hand control worker"},
                     "stop": {"params": [], "description": "Stop sending new hand targets"},
@@ -1140,13 +1134,6 @@ class HandPlugin:
             name="adam_hand_staged_close",
         )
         self._close_sequence_thread.start()
-        result.update({
-            "sequence": "staged_close",
-            "stage": "non_thumb_first",
-            "stage_delay_sec": self._close_stage_delay_sec,
-            "first_stage_target": first_stage,
-            "thumb_stage_target": final_stage,
-        })
         return result
 
     def _activate(self, positions: list[int]) -> dict:
@@ -1169,23 +1156,6 @@ class HandPlugin:
             "control_rate_hz": self._control_rate_hz,
         }
 
-    def _state_result(self) -> dict:
-        with self._lock:
-            state = self._latest_hand_state
-            received_at_ms = self._latest_state_received_ms
-        if state is None:
-            result = {"state": "unknown", "fresh": False,
-                      "message": "No hand state received yet"}
-        else:
-            result = _hand_state_payload(
-                getattr(state, "position", []),
-                getattr(state, "reserve", 0),
-                received_at_ms,
-            )
-            result["fresh"] = self._fresh_state_positions() is not None
-        result["control"] = self._status()
-        return result
-
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "start":
             return self.start()
@@ -1196,35 +1166,42 @@ class HandPlugin:
         if action == "close":
             return self._staged_close()
         if action == "set_fingers":
-            left_raw = args.get("left")
-            right_raw = args.get("right")
-            if left_raw is None and right_raw is None:
+            side = args.get("side")
+            channel = args.get("channel")
+            if side not in ("left", "right"):
                 return {
                     "state": "error",
                     "error": "INVALID_ARGUMENT",
-                    "message": "at least one of left or right is required",
+                    "message": "side must be either left or right",
                 }
-            base = self._base_positions()
-            if base is None and (left_raw is None or right_raw is None):
+            if channel not in HAND_CHANNEL_NAMES:
                 return {
                     "state": "error",
-                    "error": "NO_FEEDBACK",
-                    "message": "fresh handstate is required when only one side is provided",
+                    "error": "INVALID_ARGUMENT",
+                    "message": f"channel must be one of {list(HAND_CHANNEL_NAMES)}",
+                }
+            if "value" not in args:
+                return {
+                    "state": "error",
+                    "error": "INVALID_ARGUMENT",
+                    "message": "value is required",
                 }
             try:
-                left = (
-                    _coerce_hand_side(left_raw, limit=self._max_val)
-                    if left_raw is not None else base[:6]
-                )
-                right = (
-                    _coerce_hand_side(right_raw, limit=self._max_val)
-                    if right_raw is not None else base[6:12]
-                )
+                value = _coerce_hand_positions(
+                    [args.get("value")], limit=self._max_val, expected=1,
+                )[0]
             except ValueError as exc:
                 return {"state": "error", "error": "INVALID_ARGUMENT", "message": str(exc)}
-            return self._activate(left + right)
-        if action == "get_state":
-            return self._state_result()
+
+            base = self._base_positions()
+            if base is None:
+                # Keep all unspecified channels in the configured safe open
+                # pose when feedback has not arrived yet.
+                base = list(self._open_positions)
+            positions = list(base)
+            offset = 0 if side == "left" else 6
+            positions[offset + HAND_CHANNEL_NAMES.index(channel)] = value
+            return self._activate(positions)
         if action == "info":
             return self._status()
         return None
