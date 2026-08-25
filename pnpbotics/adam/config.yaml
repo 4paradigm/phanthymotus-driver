@@ -8,13 +8,16 @@ variant: "pro"
 grpc_host: "10.10.20.127"
 grpc_port: 6666
 
-# DDS domain ID (must match robot's domain)
-dds_domain_id: 0
+# DDS domain ID (must match robot's domain; Adam developer-mode DDS is domain 1)
+dds_domain_id: 1
 
 plugins:
   state:
     enabled: true
     publish_rate_hz: 50
+  hand_state:
+    enabled: true
+    publish_rate_hz: 10
   loco:
     enabled: true
   camera:
@@ -51,6 +54,19 @@ plugins:
     publish_rate_hz: 100
   hand:
     enabled: true
-    hand_type: "pnd"  # "pnd" (0-1000) or "inspire" (0-1800)
+    # Verified on Adam: HandState_ reports the 12 channels in this range and
+    # this pose opens both hands without changing the body joints.
+    hand_type: "adam_client"
+    position_max: 1800
+    control_rate_hz: 400
+    state_timeout_sec: 1.0
+    # Close non-thumb fingers first; after this delay the thumb moves only to
+    # the limited position below. On this client mapping, lower flexion values
+    # mean more closed, so keep the minimum at a conservative 1000.
+    close_stage_delay_sec: 0.8
+    thumb_close_positions: [1000, 0, 1000, 0]  # left flex/rotate, right flex/rotate
+    thumb_close_min_flex_position: 1000
+    open_positions: [1800, 1800, 1800, 1800, 1600, 0, 1800, 1800, 1800, 1800, 1600, 0]
+    close_positions: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
   model:
     enabled: true

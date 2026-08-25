@@ -1,7 +1,8 @@
 """PNPbotics Adam driver — plugin classes.
 
 Plugins:
-  StatePlugin  — DDS rt/lowstate + rt/handstate → ROS2 skeleton/IMU/battery
+  StatePlugin  — DDS rt/lowstate → ROS2 skeleton/IMU/battery
+  HandStatePlugin — DDS rt/handstate → ROS2 hand feedback JSON
   LocoPlugin   — gRPC locomotion control
   ArmPlugin    — ROS2 JointState upper body control
   HandPlugin   — DDS rt/handcmd finger control
@@ -101,6 +102,86 @@ VARIANT_JOINTS = {
 
 VARIANT_DOF = {"lite": 23, "sp": 29, "pro": 31}
 
+# Adam hand indices are the same for the two hands.  Each hand has five
+# physical fingers but six motor channels: the thumb has flexion and rotation
+# channels.  The first six values are the left hand and the last six are right.
+HAND_CHANNEL_NAMES = (
+    "pinky", "ring", "middle", "index", "thumb_flex", "thumb_rotate",
+)
+HAND_POSITION_COUNT = 12
+HAND_DEFAULT_OPEN = [
+    1800, 1800, 1800, 1800, 1600, 0,
+    1800, 1800, 1800, 1800, 1600, 0,
+]
+HAND_DEFAULT_CLOSED = [0] * HAND_POSITION_COUNT
+HAND_DEFAULT_THUMB_CLOSE = [1000, 0, 1000, 0]
+
+
+def _coerce_hand_positions(values, *, limit: int, expected: int = HAND_POSITION_COUNT) -> list[int]:
+    """Validate and clamp a raw hand position vector.
+
+    The SDK message uses uint32 values, but accepting arbitrary JSON numbers at
+    the MCP boundary would otherwise allow NaN, strings, or a wrong-length
+    vector to reach the DDS writer.
+    """
+    if values is None:
+        raise ValueError("hand position vector is required")
+    try:
+        raw_values = list(values)
+    except TypeError as exc:
+        raise ValueError("hand position vector must be an array") from exc
+    if len(raw_values) != expected:
+        raise ValueError(f"hand position vector must contain {expected} values")
+
+    result = []
+    for raw in raw_values:
+        if isinstance(raw, bool):
+            raise ValueError("hand positions must be numbers")
+        try:
+            value = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("hand positions must be numbers") from exc
+        if not math.isfinite(value):
+            raise ValueError("hand positions must be finite numbers")
+        result.append(int(max(0, min(limit, round(value)))))
+    return result
+
+
+def _coerce_hand_side(values, *, limit: int) -> list[int]:
+    return _coerce_hand_positions(values, limit=limit, expected=6)
+
+
+def _hand_state_payload(position, reserve, received_at_ms: int) -> dict:
+    """Convert HandState_ into the JSON payload published by hand_state."""
+    try:
+        positions = [int(value) for value in list(position)[:HAND_POSITION_COUNT]]
+    except (TypeError, ValueError):
+        positions = []
+    if len(positions) < HAND_POSITION_COUNT:
+        positions.extend([0] * (HAND_POSITION_COUNT - len(positions)))
+    positions = positions[:HAND_POSITION_COUNT]
+
+    def side(values):
+        return {
+            "position": values,
+            "channels": dict(zip(HAND_CHANNEL_NAMES, values)),
+            "finger_count": 5,
+            "motor_channel_count": 6,
+        }
+
+    now_ms = int(time.time() * 1000)
+    return {
+        "source_topic": "rt/handstate",
+        "timestamp_ms": now_ms,
+        "received_at_ms": int(received_at_ms),
+        "age_ms": max(0, now_ms - int(received_at_ms)),
+        "fresh": True,
+        "position": positions,
+        "left": side(positions[:6]),
+        "right": side(positions[6:12]),
+        "reserve": int(reserve),
+    }
+
 # ROS2 JointState joint names for upper body control (used by ArmPlugin)
 ROS2_UPPER_BODY_JOINTS = [
     "dof_pos/waistRoll", "dof_pos/waistPitch", "dof_pos/waistYaw",
@@ -156,7 +237,6 @@ class _StatePublisherNode(Node):
         self._pub_battery = self.create_publisher(String, self._topic_battery, qos)
 
         self._latest_state = None
-        self._latest_hand = None
         self._lock = threading.Lock()
 
         interval = 1.0 / publish_rate_hz
@@ -166,14 +246,9 @@ class _StatePublisherNode(Node):
         with self._lock:
             self._latest_state = state
 
-    def update_hand(self, hand):
-        with self._lock:
-            self._latest_hand = hand
-
     def _publish(self):
         with self._lock:
             state = self._latest_state
-            hand = self._latest_hand
 
         if state is None:
             return
@@ -218,13 +293,55 @@ class _StatePublisherNode(Node):
         self._pub_battery.publish(msg_bat)
 
 
+class _HandStatePublisherNode(Node):
+    """ROS2 JSON publisher for the DDS rt/handstate snapshot."""
+
+    def __init__(self, namespace: str, publish_rate_hz: float):
+        super().__init__("adam_hand_state_publisher")
+        self._topic = f"/{namespace}/state/hand"
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+        self._pub = self.create_publisher(String, self._topic, qos)
+        self._latest_position = None
+        self._latest_reserve = 0
+        self._received_at_ms = 0
+        self._lock = threading.Lock()
+        self._timer = self.create_timer(1.0 / publish_rate_hz, self._publish)
+
+    def update(self, position, reserve, received_at_ms: int):
+        with self._lock:
+            self._latest_position = list(position)
+            self._latest_reserve = int(reserve)
+            self._received_at_ms = int(received_at_ms)
+
+    def snapshot(self) -> dict | None:
+        with self._lock:
+            position = self._latest_position
+            reserve = self._latest_reserve
+            received_at_ms = self._received_at_ms
+        if position is None:
+            return None
+        return _hand_state_payload(position, reserve, received_at_ms)
+
+    def _publish(self):
+        payload = self.snapshot()
+        if payload is None:
+            return
+        msg = String()
+        msg.data = json.dumps(payload, ensure_ascii=False)
+        self._pub.publish(msg)
+
+
 class StatePlugin:
-    """Subscribes DDS rt/lowstate and rt/handstate, publishes to ROS2."""
+    """Subscribes DDS rt/lowstate and publishes body state to ROS2."""
 
     PREFIX = "state"
 
     def __init__(self, plugin_config: dict, namespace: str, executor,
-                 variant: str, dds_lowstate_sub=None, dds_handstate_sub=None, **kwargs):
+                 variant: str, dds_lowstate_sub=None, **kwargs):
         self._namespace = namespace
         self._variant = variant
         self._running = False
@@ -235,10 +352,8 @@ class StatePlugin:
 
         # DDS subscribers (pre-created in main.py before rclpy.init to avoid conflict)
         self._lowstate_sub = dds_lowstate_sub
-        self._handstate_sub = dds_handstate_sub
-
         # Start polling thread for DDS data
-        if self._lowstate_sub or self._handstate_sub:
+        if self._lowstate_sub:
             self._poll_thread = threading.Thread(target=self._poll_dds, daemon=True)
             self._poll_thread.start()
 
@@ -252,14 +367,6 @@ class StatePlugin:
                         self._node.update_state(msg)
                 except Exception:
                     pass
-            if self._handstate_sub:
-                try:
-                    msg = self._handstate_sub.Read(timeout=0)
-                    if msg:
-                        self._node.update_hand(msg)
-                except Exception:
-                    pass
-
     def get_tools(self) -> list:
         return [
             {
@@ -314,6 +421,109 @@ class StatePlugin:
                         "topic_out": [{"topic": self._node._topic_battery, "format": "data/json"}]}
             return {"state": "running" if self._running else "idle",
                     "topic_out": [{"topic": self._node._topic_skeleton, "format": "sensor/skeleton"}]}
+        return None
+
+
+# ===========================================================================
+# HandStatePlugin — DDS rt/handstate → ROS2 JSON sensor card
+# ===========================================================================
+
+class HandStatePlugin:
+    """Publishes the actual 12-channel hand feedback as the ``hand_state`` card."""
+
+    PREFIX = "hand_state"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor,
+                 dds_handstate_sub=None, **kwargs):
+        rate = float(plugin_config.get("publish_rate_hz", 10))
+        if rate <= 0:
+            rate = 10.0
+        self._topic = f"/{namespace}/state/hand"
+        self._handstate_sub = dds_handstate_sub
+        self._running = False
+        self._stop_event = threading.Event()
+        self._node = _HandStatePublisherNode(namespace, rate)
+        executor.add_node(self._node)
+        self._poll_thread = None
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "hand_state",
+            "type": "sensor",
+            "multiInstance": False,
+            "readOnly": True,
+            "description": (
+                "Adam dexterous hand feedback from DDS rt/handstate. "
+                "Each hand has 5 fingers and 6 motor channels (the thumb has "
+                "flexion and rotation). Returns 12 raw positions: left[0:6] "
+                "and right[0:6], in the order pinky, ring, middle, index, "
+                "thumb_flex, thumb_rotate."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["info", "read", "get_state", "start", "stop"],
+                    },
+                },
+            },
+            "topic_out": [{"topic": self._topic, "format": "data/json"}],
+        }
+
+    def _poll_dds(self):
+        while not self._stop_event.is_set():
+            try:
+                msg = self._handstate_sub.Read(timeout=1)
+                if msg:
+                    received_at_ms = int(time.time() * 1000)
+                    self._node.update(
+                        getattr(msg, "position", []),
+                        getattr(msg, "reserve", 0),
+                        received_at_ms,
+                    )
+            except Exception:
+                # DDS can be unavailable while the robot is powered off.  The
+                # card remains registered and reports that no feedback exists.
+                continue
+
+    def start(self):
+        if self._running:
+            return {"state": "running", "topic_out": [{"topic": self._topic, "format": "data/json"}]}
+        self._running = True
+        self._stop_event.clear()
+        if self._handstate_sub is not None:
+            self._poll_thread = threading.Thread(
+                target=self._poll_dds, daemon=True, name="adam_hand_state_poll",
+            )
+            self._poll_thread.start()
+        return {"state": "running", "topic_out": [{"topic": self._topic, "format": "data/json"}]}
+
+    def stop(self):
+        self._running = False
+        self._stop_event.set()
+        return {"state": "idle", "topic_out": [{"topic": self._topic, "format": "data/json"}]}
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("read", "get_state", "hand_state"):
+            payload = self._node.snapshot()
+            if payload is None:
+                return {
+                    "state": "unknown",
+                    "fresh": False,
+                    "source_topic": "rt/handstate",
+                    "message": "No hand state received yet",
+                }
+            return payload
+        if action == "start":
+            return self.start()
+        if action == "stop":
+            return self.stop()
+        if action == "info":
+            return {
+                "state": "running" if self._running else "idle",
+                "topic_out": [{"topic": self._topic, "format": "data/json"}],
+            }
         return None
 
 
@@ -611,128 +821,412 @@ class ArmPlugin:
 # ===========================================================================
 
 class HandPlugin:
-    """Finger control via DDS rt/handcmd (PND hand: 0-1000, Inspire: 0-1800)."""
+    """Continuous finger position control via DDS ``rt/handcmd``.
+
+    Adam's hand controller expects the target to be refreshed continuously.
+    The old implementation sent one message per MCP call, which made a
+    command look successful while leaving the robot without a control stream.
+    This plugin keeps the latest target and writes it at the configured rate.
+    """
 
     PREFIX = "hand"
 
     def __init__(self, plugin_config: dict, namespace: str, executor,
                  dds_hand_pub=None, dds_hand_sub=None, **kwargs):
         self._namespace = namespace
-        self._hand_type = plugin_config.get("hand_type", "pnd")
-        self._max_val = 1000 if self._hand_type == "pnd" else 1800
+        self._hand_type = str(plugin_config.get("hand_type", "pnd")).lower()
+        try:
+            configured_max = int(plugin_config.get("position_max", 0))
+        except (TypeError, ValueError):
+            configured_max = 0
+        if configured_max <= 0:
+            configured_max = (
+                1800 if self._hand_type in {"adam", "adam_client", "inspire"}
+                else 1000
+            )
+        self._max_val = configured_max
+
+        default_open = (
+            HAND_DEFAULT_OPEN
+            if self._hand_type in {"adam", "adam_client"}
+            else [self._max_val] * HAND_POSITION_COUNT
+        )
+        self._open_positions = self._load_profile(
+            plugin_config.get("open_positions"), default_open,
+        )
+        self._close_positions = self._load_profile(
+            plugin_config.get("close_positions"), HAND_DEFAULT_CLOSED,
+        )
+        self._thumb_close_positions = self._load_profile(
+            plugin_config.get("thumb_close_positions"),
+            HAND_DEFAULT_THUMB_CLOSE,
+            expected=4,
+        )
+        try:
+            thumb_min = int(plugin_config.get("thumb_close_min_flex_position", 1000))
+        except (TypeError, ValueError):
+            thumb_min = 1000
+        self._thumb_close_min_flex_position = max(0, min(self._max_val, thumb_min))
+        try:
+            self._close_stage_delay_sec = float(plugin_config.get("close_stage_delay_sec", 0.8))
+        except (TypeError, ValueError):
+            self._close_stage_delay_sec = 0.8
+        if self._close_stage_delay_sec < 0:
+            self._close_stage_delay_sec = 0.8
+        try:
+            self._control_rate_hz = float(plugin_config.get("control_rate_hz", 400))
+        except (TypeError, ValueError):
+            self._control_rate_hz = 400.0
+        if self._control_rate_hz <= 0:
+            self._control_rate_hz = 400.0
+        try:
+            self._state_timeout_sec = float(plugin_config.get("state_timeout_sec", 1.0))
+        except (TypeError, ValueError):
+            self._state_timeout_sec = 1.0
+        if self._state_timeout_sec <= 0:
+            self._state_timeout_sec = 1.0
 
         self._hand_pub = dds_hand_pub
         self._hand_sub = dds_hand_sub
         self._latest_hand_state = None
+        self._latest_state_received_ms = 0
+        self._latest_state_monotonic = 0.0
         self._lock = threading.Lock()
+        self._target_positions = None
+        self._active = False
+        self._shutdown_event = threading.Event()
+        self._poll_stop_event = threading.Event()
+        self._wake_event = threading.Event()
+        self._control_thread = None
+        self._hand_poll_thread = None
+        self._close_sequence_thread = None
+        self._command_generation = 0
+        self._last_write_ok = None
+        self._last_write_at_ms = None
+        self._last_write_error = None
 
-        # Poll hand state in background
-        if self._hand_sub:
-            threading.Thread(target=self._poll_hand, daemon=True).start()
+    def _load_profile(self, configured, fallback: list[int], *, expected: int = HAND_POSITION_COUNT) -> list[int]:
+        if configured is None:
+            return _coerce_hand_positions(fallback, limit=self._max_val, expected=expected)
+        try:
+            return _coerce_hand_positions(configured, limit=self._max_val, expected=expected)
+        except ValueError as exc:
+            print(f"[hand] invalid position profile ({exc}); using default", flush=True)
+            return _coerce_hand_positions(fallback, limit=self._max_val, expected=expected)
 
     def _poll_hand(self):
-        while True:
+        while not self._poll_stop_event.is_set():
             try:
                 msg = self._hand_sub.Read(timeout=1)
                 if msg:
                     with self._lock:
                         self._latest_hand_state = msg
+                        self._latest_state_received_ms = int(time.time() * 1000)
+                        self._latest_state_monotonic = time.monotonic()
             except Exception:
                 pass
+
+    def _fresh_state_positions(self):
+        with self._lock:
+            state = self._latest_hand_state
+            received_at = self._latest_state_monotonic
+        if state is None or not received_at:
+            return None
+        if time.monotonic() - received_at > self._state_timeout_sec:
+            return None
+        try:
+            return _coerce_hand_positions(
+                getattr(state, "position", []), limit=self._max_val,
+            )
+        except ValueError:
+            return None
+
+    def _base_positions(self):
+        with self._lock:
+            target = list(self._target_positions) if self._target_positions is not None else None
+        return target if target is not None else self._fresh_state_positions()
 
     def get_tool(self) -> dict:
         return {
             "name": "hand",
             "type": "actuator",
-            "description": f"Adam hand control — per-finger position (0=closed, {self._max_val}=open)",
+            "description": (
+                f"Adam hand control via DDS rt/handcmd — continuous 12-motor-channel "
+                f"position stream, range 0-{self._max_val}. "
+                "Each hand has 5 fingers; the thumb uses flexion and rotation "
+                "channels. The default Adam open pose is configurable per robot."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["open", "close", "set_fingers", "get_state"],
+                        "enum": [
+                            "open", "close", "set_fingers", "get_state",
+                            "start", "stop", "info",
+                        ],
                     },
                     "left": {
                         "type": "array",
-                        "items": {"type": "integer"},
-                        "description": "6 values [pinky, ring, middle, index, thumb1, thumb2]",
+                        "minItems": 6,
+                        "maxItems": 6,
+                        "items": {"type": "integer", "minimum": 0, "maximum": self._max_val},
+                        "description": "6 motor channels for 5 fingers [pinky, ring, middle, index, thumb_flex, thumb_rotate]",
                     },
                     "right": {
                         "type": "array",
-                        "items": {"type": "integer"},
-                        "description": "6 values [pinky, ring, middle, index, thumb1, thumb2]",
+                        "minItems": 6,
+                        "maxItems": 6,
+                        "items": {"type": "integer", "minimum": 0, "maximum": self._max_val},
+                        "description": "6 motor channels for 5 fingers [pinky, ring, middle, index, thumb_flex, thumb_rotate]",
                     },
                 },
                 "required": ["action"],
                 "x-action-params": {
                     "open": {
                         "params": [],
-                        "description": "Open all fingers fully",
+                        "description": "Apply the configured open pose to both hands",
                     },
                     "close": {
                         "params": [],
-                        "description": "Close all fingers (make fist)",
+                        "description": (
+                            "Close in two stages: first pinky/ring/middle/index, "
+                            "then move the thumb to its limited safe target"
+                        ),
                     },
                     "set_fingers": {
                         "params": ["left", "right"],
-                        "description": "Set individual finger positions",
+                        "description": (
+                            "Set either hand's six motor channels; an omitted side keeps "
+                            "the current target or fresh feedback position"
+                        ),
                     },
                     "get_state": {
                         "params": [],
                         "description": "Read current finger positions",
                     },
+                    "start": {"params": [], "description": "Enable the hand control worker"},
+                    "stop": {"params": [], "description": "Stop sending new hand targets"},
+                    "info": {"params": [], "description": "Return hand card status and configuration"},
                 },
             },
         }
 
     def start(self):
-        pass
+        self._shutdown_event.clear()
+        self._poll_stop_event.clear()
+        if self._hand_sub is not None and (
+                self._hand_poll_thread is None or not self._hand_poll_thread.is_alive()):
+            self._hand_poll_thread = threading.Thread(
+                target=self._poll_hand, daemon=True, name="adam_hand_poll",
+            )
+            self._hand_poll_thread.start()
+        if self._control_thread is None or not self._control_thread.is_alive():
+            self._control_thread = threading.Thread(
+                target=self._control_loop, daemon=True, name="adam_hand_control",
+            )
+            self._control_thread.start()
+        return self._status("ready")
 
     def stop(self):
-        pass
+        with self._lock:
+            self._active = False
+            self._command_generation += 1
+        self._shutdown_event.set()
+        self._poll_stop_event.set()
+        self._wake_event.set()
+        return self._status("idle")
 
-    def _send_hand_cmd(self, positions: list):
+    def _status(self, state: str | None = None) -> dict:
+        with self._lock:
+            active = self._active
+            target = list(self._target_positions) if self._target_positions is not None else None
+            last_write_ok = self._last_write_ok
+            last_write_at_ms = self._last_write_at_ms
+            last_write_error = self._last_write_error
+        result = {
+            "state": state or ("active" if active else "idle"),
+            "control_active": active,
+            "publisher_available": bool(HAS_PND_SDK and self._hand_pub is not None),
+            "control_rate_hz": self._control_rate_hz,
+            "position_max": self._max_val,
+            "open_positions": list(self._open_positions),
+            "close_positions": list(self._close_positions),
+            "thumb_close_positions": list(self._thumb_close_positions),
+            "thumb_close_min_flex_position": self._thumb_close_min_flex_position,
+            "close_stage_delay_sec": self._close_stage_delay_sec,
+            "target": target,
+            "last_write_ok": last_write_ok,
+            "last_write_at_ms": last_write_at_ms,
+        }
+        if last_write_error:
+            result["last_write_error"] = last_write_error
+        return result
+
+    def _send_hand_cmd(self, positions: list[int]) -> bool:
         if not HAS_PND_SDK or self._hand_pub is None:
-            return
+            with self._lock:
+                self._last_write_ok = False
+                self._last_write_error = "DDS hand publisher is unavailable"
+            return False
         cmd = pnd_adam_msg_dds__HandCmd_()
-        for i in range(min(12, len(positions))):
-            cmd.position[i] = int(max(0, min(self._max_val, positions[i])))
-        self._hand_pub.Write(cmd)
+        for i, value in enumerate(positions):
+            cmd.position[i] = value
+        try:
+            write_result = self._hand_pub.Write(cmd)
+            ok = write_result is not False
+        except Exception as exc:
+            ok = False
+            with self._lock:
+                self._last_write_error = str(exc)
+        with self._lock:
+            self._last_write_ok = ok
+            self._last_write_at_ms = int(time.time() * 1000)
+            if ok:
+                self._last_write_error = None
+        return ok
+
+    def _control_loop(self):
+        period = 1.0 / self._control_rate_hz
+        while not self._shutdown_event.is_set():
+            with self._lock:
+                active = self._active
+                target = list(self._target_positions) if self._target_positions is not None else None
+            if active and target is not None:
+                self._send_hand_cmd(target)
+            self._wake_event.wait(period)
+            self._wake_event.clear()
+
+    def _staged_close_targets(self) -> tuple[list[int], list[int]]:
+        """Build safe two-stage targets: non-thumb fingers first, thumb second."""
+        first_stage = list(self._close_positions)
+        final_stage = list(self._close_positions)
+        for side_offset, thumb_offset in ((0, 0), (6, 2)):
+            # Keep both thumb motors in the configured open pose while the
+            # pinky/ring/middle/index channels close first.
+            first_stage[side_offset + 4] = self._open_positions[side_offset + 4]
+            first_stage[side_offset + 5] = self._open_positions[side_offset + 5]
+
+            # The current Adam client mapping becomes more closed as the
+            # flexion position decreases.  Enforce a conservative lower bound
+            # so a close command cannot drive the thumb into the index finger.
+            final_stage[side_offset + 4] = max(
+                self._thumb_close_positions[thumb_offset],
+                self._thumb_close_min_flex_position,
+            )
+            final_stage[side_offset + 5] = self._thumb_close_positions[thumb_offset + 1]
+        return first_stage, final_stage
+
+    def _finish_staged_close(self, generation: int, final_stage: list[int]):
+        if self._shutdown_event.wait(self._close_stage_delay_sec):
+            return
+        with self._lock:
+            if generation != self._command_generation or not self._active:
+                return
+            self._target_positions = list(final_stage)
+        self._wake_event.set()
+
+    def _staged_close(self) -> dict:
+        first_stage, final_stage = self._staged_close_targets()
+        result = self._activate(first_stage)
+        if result.get("state") == "error":
+            return result
+        with self._lock:
+            generation = self._command_generation
+        self._close_sequence_thread = threading.Thread(
+            target=self._finish_staged_close,
+            args=(generation, final_stage),
+            daemon=True,
+            name="adam_hand_staged_close",
+        )
+        self._close_sequence_thread.start()
+        result.update({
+            "sequence": "staged_close",
+            "stage": "non_thumb_first",
+            "stage_delay_sec": self._close_stage_delay_sec,
+            "first_stage_target": first_stage,
+            "thumb_stage_target": final_stage,
+        })
+        return result
+
+    def _activate(self, positions: list[int]) -> dict:
+        if not HAS_PND_SDK or self._hand_pub is None:
+            return {
+                "state": "error",
+                "error": "DDS_UNAVAILABLE",
+                "message": "rt/handcmd publisher is unavailable",
+            }
+        if self._shutdown_event.is_set() or self._control_thread is None or not self._control_thread.is_alive():
+            self.start()
+        with self._lock:
+            self._command_generation += 1
+            self._target_positions = list(positions)
+            self._active = True
+        self._wake_event.set()
+        return {
+            "state": "active",
+            "target": list(positions),
+            "control_rate_hz": self._control_rate_hz,
+        }
+
+    def _state_result(self) -> dict:
+        with self._lock:
+            state = self._latest_hand_state
+            received_at_ms = self._latest_state_received_ms
+        if state is None:
+            result = {"state": "unknown", "fresh": False,
+                      "message": "No hand state received yet"}
+        else:
+            result = _hand_state_payload(
+                getattr(state, "position", []),
+                getattr(state, "reserve", 0),
+                received_at_ms,
+            )
+            result["fresh"] = self._fresh_state_positions() is not None
+        result["control"] = self._status()
+        return result
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "start":
-            return {"state": "ready"}
+            return self.start()
         if action == "stop":
-            return {"state": "idle"}
+            return self.stop()
         if action == "open":
-            positions = [self._max_val] * 12
-            self._send_hand_cmd(positions)
-            return {"state": "done", "message": "All fingers opened"}
+            return self._activate(self._open_positions)
         if action == "close":
-            positions = [0] * 12
-            self._send_hand_cmd(positions)
-            return {"state": "done", "message": "All fingers closed"}
+            return self._staged_close()
         if action == "set_fingers":
-            left = args.get("left", [self._max_val] * 6)
-            right = args.get("right", [self._max_val] * 6)
-            positions = list(left[:6]) + list(right[:6])
-            # Pad if incomplete
-            while len(positions) < 12:
-                positions.append(self._max_val)
-            self._send_hand_cmd(positions)
-            return {"state": "done", "left": left[:6], "right": right[:6]}
+            left_raw = args.get("left")
+            right_raw = args.get("right")
+            if left_raw is None and right_raw is None:
+                return {
+                    "state": "error",
+                    "error": "INVALID_ARGUMENT",
+                    "message": "at least one of left or right is required",
+                }
+            base = self._base_positions()
+            if base is None and (left_raw is None or right_raw is None):
+                return {
+                    "state": "error",
+                    "error": "NO_FEEDBACK",
+                    "message": "fresh handstate is required when only one side is provided",
+                }
+            try:
+                left = (
+                    _coerce_hand_side(left_raw, limit=self._max_val)
+                    if left_raw is not None else base[:6]
+                )
+                right = (
+                    _coerce_hand_side(right_raw, limit=self._max_val)
+                    if right_raw is not None else base[6:12]
+                )
+            except ValueError as exc:
+                return {"state": "error", "error": "INVALID_ARGUMENT", "message": str(exc)}
+            return self._activate(left + right)
         if action == "get_state":
-            with self._lock:
-                state = self._latest_hand_state
-            if state is None:
-                return {"state": "unknown", "message": "No hand state received yet"}
-            return {
-                "state": "ok",
-                "left": list(state.position[:6]),
-                "right": list(state.position[6:12]),
-            }
+            return self._state_result()
         if action == "info":
-            return {"state": "ready"}
+            return self._status()
         return None
 
 
@@ -1712,6 +2206,14 @@ class AdamDeviceBundle:
                 plugins_cfg.get("state", {}), namespace, executor,
                 variant=variant,
                 dds_lowstate_sub=dds_lowstate_sub,
+            )
+            self._plugins.append(p)
+
+        # Hand state is a dedicated sensor card.  Keep it separate from the
+        # body state card so Agent Core can wire/read hand feedback directly.
+        if plugins_cfg.get("hand_state", {}).get("enabled", True):
+            p = HandStatePlugin(
+                plugins_cfg.get("hand_state", {}), namespace, executor,
                 dds_handstate_sub=dds_handstate_sub,
             )
             self._plugins.append(p)
