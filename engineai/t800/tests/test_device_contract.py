@@ -895,8 +895,9 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("completed", payload["status"])
         self.assertEqual("gesture", payload["tool"])
         self.assertEqual("wave_hands", payload["result"]["gesture"])
-        self.assertFalse(contexts[0].check_hostname)
-        self.assertEqual(ssl.CERT_NONE, contexts[0].verify_mode)
+        # 未设置 AGENT_CORE_CA_CERT 时应使用系统默认 CA，保持 TLS 验证开启
+        self.assertTrue(contexts[0].check_hostname)
+        self.assertEqual(ssl.CERT_REQUIRED, contexts[0].verify_mode)
 
     def test_gesture_uses_validated_real_device_trajectories(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)

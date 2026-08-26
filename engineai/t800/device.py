@@ -111,12 +111,12 @@ def _notify_acp_completion(
         parsed_url = urllib.parse.urlparse(agent_core_url)
         if parsed_url.scheme not in ("http", "https"):
             raise ValueError("AGENT_CORE_URL must use http or https")
-        context = ssl.create_default_context()
-        if ca_cert:
-            context.load_verify_locations(ca_cert)
-        else:
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
+        if (
+            parsed_url.scheme == "http"
+            and parsed_url.hostname not in ("localhost", "127.0.0.1", "::1")
+        ):
+            raise ValueError("unencrypted AGENT_CORE_URL is only allowed on loopback")
+        context = ssl.create_default_context(cafile=ca_cert or None)
         payload = json.dumps({
             "action_id": action_id,
             "status": status,
