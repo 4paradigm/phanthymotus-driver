@@ -2566,12 +2566,12 @@ class WaistPlugin:
             "multiInstance": False,
             "description": "安全控制 T800 腰部 J12 偏航；使用绝对角度并限制在正负 30 度内",
             "inputSchema": action_schema(
-                {
+                _with_lifecycle({
                     "set_angle": (["angle_deg", "duration"], "设置腰部绝对偏航角度"),
                     "center": (["duration"], "将腰部回正到 0 度"),
                     "status": ([], "读取当前腰部角度和运动状态"),
                     "list": ([], "查看控制范围、关节和状态要求"),
-                },
+                }),
                 {
                     "angle_deg": {
                         "type": "number",

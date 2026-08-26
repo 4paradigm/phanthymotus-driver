@@ -718,6 +718,10 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertIsNone(waist.dispatch("unsupported", {}))
         self.assertEqual([], plan._publisher.messages)
         schema = waist.get_tool()["inputSchema"]
+        lifecycle = {"start", "info", "stop"}
+        self.assertTrue(lifecycle.issubset(schema["properties"]["action"]["enum"]))
+        self.assertTrue(lifecycle.issubset(schema["x-action-params"]))
+        self.assertEqual([], schema["x-action-params"]["stop"]["params"])
         self.assertEqual(["set_angle", "center"], schema["x-completion"]["actions"])
         self.assertEqual(15, schema["x-completion"]["timeout"])
         self.assertEqual({"action": "stop"}, schema["x-hooks"]["on_interrupt_all"])
