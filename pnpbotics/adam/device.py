@@ -31,8 +31,20 @@ try:
     from std_msgs.msg import String
 
     HAS_ROS2 = True
-except ImportError:
+except Exception:
     HAS_ROS2 = False
+
+    class Node:
+        """Import-time fallback so DDS-only cards can load without ROS2."""
+
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("ROS2 is unavailable")
+
+    QoSProfile = None
+    ReliabilityPolicy = None
+    HistoryPolicy = None
+    JointState = None
+    String = None
 
 try:
     from pndbotics_sdk_py.core.channel import (
@@ -51,7 +63,7 @@ try:
     )
 
     HAS_PND_SDK = True
-except ImportError:
+except Exception:
     HAS_PND_SDK = False
 
 
@@ -185,6 +197,185 @@ def _hand_state_payload(position, received_at_ms: int, *, fresh: bool) -> dict:
         "right": side(positions[6:12]),
     }
 
+
+def _destroy_ros_node(executor, node):
+    if node is None:
+        return
+    if executor is not None:
+        try:
+            executor.remove_node(node)
+        except Exception:
+            pass
+    try:
+        node.destroy_node()
+    except Exception:
+        pass
+
+
+class HandStateCache:
+    """Own one DDS hand-state reader and fan its samples out to plugins."""
+
+    def __init__(self, subscriber=None):
+        self._subscriber = subscriber
+        self._closed = False
+        self._lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
+        self._thread = None
+        self._stop_event = None
+        self._latest_position = None
+        self._received_at_ms = 0
+        self._received_monotonic = None
+        self._last_read_error = None
+
+    @property
+    def reader_available(self) -> bool:
+        with self._lock:
+            return self._subscriber is not None and not self._closed
+
+    def start(self) -> bool:
+        with self._lifecycle_lock:
+            with self._lock:
+                if self._closed or self._subscriber is None:
+                    return False
+                thread = self._thread
+                stop_event = self._stop_event
+            if thread is not None and thread.is_alive():
+                if stop_event is None or not stop_event.is_set():
+                    return True
+                thread.join(1.5)
+                if thread.is_alive():
+                    return False
+                with self._lock:
+                    if self._thread is thread:
+                        self._thread = None
+                        self._stop_event = None
+            with self._lock:
+                if self._closed or self._subscriber is None:
+                    return False
+                stop_event = threading.Event()
+                self._stop_event = stop_event
+                self._thread = threading.Thread(
+                    target=self._poll_loop,
+                    args=(stop_event,),
+                    daemon=True,
+                    name="adam_hand_state_poll",
+                )
+                self._thread.start()
+                return True
+
+    def stop(self, timeout: float = 1.5) -> bool:
+        with self._lifecycle_lock:
+            thread = self._thread
+            stop_event = self._stop_event
+            if stop_event is not None:
+                stop_event.set()
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(timeout)
+            stopped = thread is None or not thread.is_alive()
+            if stopped and self._thread is thread:
+                self._thread = None
+                self._stop_event = None
+            return stopped
+
+    def close(self):
+        with self._lifecycle_lock:
+            with self._lock:
+                if self._closed:
+                    return
+                self._closed = True
+                subscriber = self._subscriber
+        self.stop()
+        if subscriber is not None:
+            try:
+                subscriber.Close()
+            except Exception as exc:
+                print(f"[adam] WARNING: hand-state reader close failed: {exc}", flush=True)
+            # A normal SDK Read is timeout-bounded, but closing the underlying
+            # reader also gives an implementation that is blocked in Read a
+            # chance to wake up before we return from close().
+            with self._lock:
+                thread = self._thread
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(0.5)
+        with self._lock:
+            self._subscriber = None
+
+    def _poll_loop(self, stop_event: threading.Event):
+        while not stop_event.is_set():
+            with self._lock:
+                subscriber = self._subscriber
+            if subscriber is None:
+                break
+            try:
+                msg = subscriber.Read(timeout=0.2)
+                if msg:
+                    position = list(getattr(msg, "position", []))
+                    with self._lock:
+                        self._latest_position = position
+                        self._received_at_ms = int(time.time() * 1000)
+                        self._received_monotonic = time.monotonic()
+                        self._last_read_error = None
+                elif stop_event.wait(0.01):
+                    break
+            except Exception as exc:
+                with self._lock:
+                    self._last_read_error = str(exc)
+                # Do not spin if a broken DDS handle fails immediately.
+                if stop_event.wait(0.1):
+                    break
+        with self._lock:
+            if self._thread is threading.current_thread():
+                self._thread = None
+                self._stop_event = None
+
+    def _fresh(self, received_monotonic, timeout_sec: float) -> bool:
+        return (
+            received_monotonic is not None
+            and time.monotonic() - received_monotonic <= timeout_sec
+        )
+
+    def fresh_positions(self, timeout_sec: float) -> list[int] | None:
+        with self._lock:
+            position = list(self._latest_position) if self._latest_position is not None else None
+            received_monotonic = self._received_monotonic
+        if position is None or not self._fresh(received_monotonic, timeout_sec):
+            return None
+        return position
+
+    def snapshot(self, timeout_sec: float) -> dict | None:
+        with self._lock:
+            position = list(self._latest_position) if self._latest_position is not None else None
+            received_at_ms = self._received_at_ms
+            received_monotonic = self._received_monotonic
+        if position is None:
+            return None
+        return _hand_state_payload(
+            position,
+            received_at_ms,
+            fresh=self._fresh(received_monotonic, timeout_sec),
+        )
+
+    def status(self, timeout_sec: float) -> dict:
+        with self._lock:
+            reader_available = self._subscriber is not None and not self._closed
+            received_at_ms = self._received_at_ms
+            received_monotonic = self._received_monotonic
+            last_read_error = self._last_read_error
+            reader_running = self._thread is not None and self._thread.is_alive()
+        fresh = self._fresh(received_monotonic, timeout_sec)
+        result = {
+            "reader_available": reader_available,
+            "reader_running": reader_running,
+            "fresh": fresh,
+            "last_sample_age_ms": (
+                max(0, int(time.time() * 1000) - received_at_ms)
+                if received_monotonic is not None else None
+            ),
+        }
+        if last_read_error:
+            result["last_read_error"] = last_read_error
+        return result
+
 # ROS2 JointState joint names for upper body control (used by ArmPlugin)
 ROS2_UPPER_BODY_JOINTS = [
     "dof_pos/waistRoll", "dof_pos/waistPitch", "dof_pos/waistYaw",
@@ -240,6 +431,7 @@ class _StatePublisherNode(Node):
         self._pub_battery = self.create_publisher(String, self._topic_battery, qos)
 
         self._latest_state = None
+        self._active = False
         self._lock = threading.Lock()
 
         interval = 1.0 / publish_rate_hz
@@ -249,11 +441,16 @@ class _StatePublisherNode(Node):
         with self._lock:
             self._latest_state = state
 
+    def set_active(self, active: bool):
+        with self._lock:
+            self._active = bool(active)
+
     def _publish(self):
         with self._lock:
             state = self._latest_state
+            active = self._active
 
-        if state is None:
+        if not active or state is None:
             return
 
         # Skeleton (joints)
@@ -297,44 +494,36 @@ class _StatePublisherNode(Node):
 
 
 class _HandStatePublisherNode(Node):
-    """ROS2 JSON publisher for the DDS rt/handstate snapshot."""
+    """ROS2 JSON publisher backed by the shared hand-state cache."""
 
-    def __init__(self, namespace: str, publish_rate_hz: float, stale_timeout_sec: float):
+    def __init__(self, namespace: str, publish_rate_hz: float,
+                 stale_timeout_sec: float, state_cache: HandStateCache):
         super().__init__("adam_hand_state_publisher")
         self._topic = f"/{namespace}/state/hand"
         self._stale_timeout_sec = stale_timeout_sec
+        self._state_cache = state_cache
+        self._active = False
         qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
         )
         self._pub = self.create_publisher(String, self._topic, qos)
-        self._latest_position = None
-        self._received_at_ms = 0
-        self._received_monotonic = None
         self._lock = threading.Lock()
         self._timer = self.create_timer(1.0 / publish_rate_hz, self._publish)
 
-    def update(self, position, received_at_ms: int):
+    def set_active(self, active: bool):
         with self._lock:
-            self._latest_position = list(position)
-            self._received_at_ms = int(received_at_ms)
-            self._received_monotonic = time.monotonic()
+            self._active = bool(active)
 
     def snapshot(self) -> dict | None:
-        with self._lock:
-            position = self._latest_position
-            received_at_ms = self._received_at_ms
-            received_monotonic = self._received_monotonic
-        if position is None:
-            return None
-        fresh = (
-            received_monotonic is not None
-            and time.monotonic() - received_monotonic <= self._stale_timeout_sec
-        )
-        return _hand_state_payload(position, received_at_ms, fresh=fresh)
+        return self._state_cache.snapshot(self._stale_timeout_sec)
 
     def _publish(self):
+        with self._lock:
+            active = self._active
+        if not active:
+            return
         payload = self.snapshot()
         if payload is None:
             return
@@ -353,6 +542,10 @@ class StatePlugin:
         self._namespace = namespace
         self._variant = variant
         self._running = False
+        self._executor = executor
+        self._poll_lifecycle_lock = threading.Lock()
+        self._poll_thread = None
+        self._poll_stop_event = None
 
         rate = plugin_config.get("publish_rate_hz", 50)
         self._node = _StatePublisherNode(namespace, variant, rate)
@@ -360,21 +553,19 @@ class StatePlugin:
 
         # DDS subscribers (pre-created in main.py before rclpy.init to avoid conflict)
         self._lowstate_sub = dds_lowstate_sub
-        # Start polling thread for DDS data
-        if self._lowstate_sub:
-            self._poll_thread = threading.Thread(target=self._poll_dds, daemon=True)
-            self._poll_thread.start()
 
-    def _poll_dds(self):
+    def _poll_dds(self, stop_event: threading.Event):
         """Poll DDS subscribers in a background thread."""
-        while True:
-            if self._lowstate_sub:
-                try:
-                    msg = self._lowstate_sub.Read(timeout=1)
-                    if msg:
-                        self._node.update_state(msg)
-                except Exception:
-                    pass
+        while not stop_event.is_set():
+            try:
+                msg = self._lowstate_sub.Read(timeout=0.2)
+                if msg:
+                    self._node.update_state(msg)
+                elif stop_event.wait(0.01):
+                    break
+            except Exception:
+                if stop_event.wait(0.1):
+                    break
     def get_tools(self) -> list:
         return [
             {
@@ -408,16 +599,44 @@ class StatePlugin:
 
     def start(self):
         self._running = True
+        self._node.set_active(True)
+        if self._lowstate_sub:
+            with self._poll_lifecycle_lock:
+                if self._poll_thread is None or not self._poll_thread.is_alive():
+                    stop_event = threading.Event()
+                    self._poll_stop_event = stop_event
+                    self._poll_thread = threading.Thread(
+                        target=self._poll_dds,
+                        args=(stop_event,),
+                        daemon=True,
+                        name="adam_lowstate_poll",
+                    )
+                    self._poll_thread.start()
 
     def stop(self):
         self._running = False
+        self._node.set_active(False)
+        with self._poll_lifecycle_lock:
+            thread = self._poll_thread
+            stop_event = self._poll_stop_event
+            if stop_event is not None:
+                stop_event.set()
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(1.5)
+            if thread is None or not thread.is_alive():
+                self._poll_thread = None
+                self._poll_stop_event = None
+
+    def close(self):
+        self.stop()
+        _destroy_ros_node(self._executor, self._node)
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "start":
-            self._running = True
+            self.start()
             return {"state": "running"}
         if action == "stop":
-            self._running = False
+            self.stop()
             return {"state": "idle"}
         if action == "info":
             tool_name = args.get("_tool_name", "joints")
@@ -442,7 +661,8 @@ class HandStatePlugin:
     PREFIX = "hand_state"
 
     def __init__(self, plugin_config: dict, namespace: str, executor,
-                 dds_handstate_sub=None, **kwargs):
+                 dds_handstate_sub=None, state_cache=None,
+                 ros2_enabled: bool | None = None, **kwargs):
         rate = float(plugin_config.get("publish_rate_hz", 10))
         if rate <= 0:
             rate = 10.0
@@ -453,12 +673,22 @@ class HandStatePlugin:
         if not math.isfinite(stale_timeout_sec) or stale_timeout_sec <= 0:
             stale_timeout_sec = 1.0
         self._topic = f"/{namespace}/state/hand"
-        self._handstate_sub = dds_handstate_sub
+        self._stale_timeout_sec = stale_timeout_sec
+        self._state_cache = state_cache or HandStateCache(dds_handstate_sub)
+        self._owns_state_cache = state_cache is None
+        self._ros2_available = bool(
+            HAS_ROS2
+            and executor is not None
+            and (ros2_enabled is None or ros2_enabled)
+        )
+        self._executor = executor
         self._running = False
-        self._stop_event = threading.Event()
-        self._node = _HandStatePublisherNode(namespace, rate, stale_timeout_sec)
-        executor.add_node(self._node)
-        self._poll_thread = None
+        self._node = None
+        if self._ros2_available:
+            self._node = _HandStatePublisherNode(
+                namespace, rate, stale_timeout_sec, self._state_cache,
+            )
+            executor.add_node(self._node)
 
     def get_tool(self) -> dict:
         return {
@@ -473,50 +703,87 @@ class HandStatePlugin:
             ),
             "inputSchema": {
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["info", "read", "get_state", "start", "stop"],
+                    },
+                },
             },
             "topic_out": [{"topic": self._topic, "format": "data/json"}],
         }
 
-    def _poll_dds(self):
-        while not self._stop_event.is_set():
-            try:
-                msg = self._handstate_sub.Read(timeout=1)
-                if msg:
-                    received_at_ms = int(time.time() * 1000)
-                    self._node.update(getattr(msg, "position", []), received_at_ms)
-            except Exception:
-                # DDS can be unavailable while the robot is powered off.  The
-                # card remains registered and reports that no feedback exists.
-                continue
+    def _status(self, state: str | None = None) -> dict:
+        cache_status = self._state_cache.status(self._stale_timeout_sec)
+        if state is None:
+            if not self._ros2_available or not cache_status["reader_available"]:
+                state = "unavailable"
+            else:
+                state = "running" if self._running else "idle"
+        result = {
+            "state": state,
+            "ros2_available": self._ros2_available,
+            "reader_available": cache_status["reader_available"],
+            "reader_running": cache_status.get("reader_running", False),
+            "fresh": cache_status["fresh"],
+            "last_sample_age_ms": cache_status["last_sample_age_ms"],
+            "topic_out": [{"topic": self._topic, "format": "data/json"}],
+        }
+        if cache_status.get("last_read_error"):
+            result["last_read_error"] = cache_status["last_read_error"]
+        if not self._ros2_available:
+            result["error"] = "ROS2_UNAVAILABLE"
+        elif not cache_status["reader_available"]:
+            result["error"] = "DDS_UNAVAILABLE"
+        return result
 
     def start(self):
-        if self._running:
-            return {"state": "running", "topic_out": [{"topic": self._topic, "format": "data/json"}]}
         self._running = True
-        self._stop_event.clear()
-        if self._handstate_sub is not None:
-            self._poll_thread = threading.Thread(
-                target=self._poll_dds, daemon=True, name="adam_hand_state_poll",
-            )
-            self._poll_thread.start()
-        return {"state": "running", "topic_out": [{"topic": self._topic, "format": "data/json"}]}
+        reader_started = self._state_cache.start()
+        if self._node is not None:
+            self._node.set_active(True)
+        result = self._status()
+        if not reader_started and result.get("reader_available"):
+            result["state"] = "stopping"
+            result["error"] = "HAND_STATE_READER_STOPPING"
+        return result
 
     def stop(self):
         self._running = False
-        self._stop_event.set()
-        return {"state": "idle", "topic_out": [{"topic": self._topic, "format": "data/json"}]}
+        if self._node is not None:
+            self._node.set_active(False)
+        return self._status("idle")
+
+    def close(self):
+        self.stop()
+        _destroy_ros_node(self._executor, self._node)
+        if self._owns_state_cache:
+            self._state_cache.close()
 
     def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("read", "get_state", "hand_state"):
+            payload = self._state_cache.snapshot(self._stale_timeout_sec)
+            if payload is not None:
+                return payload
+            cache_status = self._state_cache.status(self._stale_timeout_sec)
+            return {
+                "state": "unavailable" if not cache_status["reader_available"] else "waiting",
+                "fresh": False,
+                "reader_available": cache_status["reader_available"],
+                "reader_running": cache_status.get("reader_running", False),
+                "source_topic": "rt/handstate",
+                "message": (
+                    "DDS hand state reader is unavailable"
+                    if not cache_status["reader_available"]
+                    else "No fresh hand state received yet"
+                ),
+            }
         if action == "start":
             return self.start()
         if action == "stop":
             return self.stop()
         if action == "info":
-            return {
-                "state": "running" if self._running else "idle",
-                "topic_out": [{"topic": self._topic, "format": "data/json"}],
-            }
+            return self._status()
         return None
 
 
@@ -825,7 +1092,7 @@ class HandPlugin:
     PREFIX = "hand"
 
     def __init__(self, plugin_config: dict, namespace: str, executor,
-                 dds_hand_pub=None, dds_hand_sub=None, **kwargs):
+                 dds_hand_pub=None, state_cache=None, **kwargs):
         self._namespace = namespace
         self._hand_type = str(plugin_config.get("hand_type", "pnd")).lower()
         try:
@@ -874,19 +1141,16 @@ class HandPlugin:
             self._state_timeout_sec = 1.0
 
         self._hand_pub = dds_hand_pub
-        self._hand_sub = dds_hand_sub
-        self._latest_hand_state = None
-        self._latest_state_received_ms = 0
-        self._latest_state_monotonic = 0.0
+        self._state_cache = state_cache or HandStateCache()
+        self._owns_state_cache = state_cache is None
         self._lock = threading.Lock()
         self._target_positions = None
         self._active = False
-        self._shutdown_event = threading.Event()
-        self._poll_stop_event = threading.Event()
+        self._lifecycle_lock = threading.Lock()
+        self._control_stop_event = None
         self._wake_event = threading.Event()
         self._control_thread = None
-        self._hand_poll_thread = None
-        self._command_generation = 0
+        self._closed = False
         self._last_write_ok = None
         self._last_write_at_ms = None
         self._last_write_error = None
@@ -900,37 +1164,14 @@ class HandPlugin:
             print(f"[hand] invalid position profile ({exc}); using default", flush=True)
             return _coerce_hand_positions(fallback, limit=self._max_val, expected=expected)
 
-    def _poll_hand(self):
-        while not self._poll_stop_event.is_set():
-            try:
-                msg = self._hand_sub.Read(timeout=1)
-                if msg:
-                    with self._lock:
-                        self._latest_hand_state = msg
-                        self._latest_state_received_ms = int(time.time() * 1000)
-                        self._latest_state_monotonic = time.monotonic()
-            except Exception:
-                pass
-
-    def _fresh_state_positions(self):
-        with self._lock:
-            state = self._latest_hand_state
-            received_at = self._latest_state_monotonic
-        if state is None or not received_at:
-            return None
-        if time.monotonic() - received_at > self._state_timeout_sec:
-            return None
-        try:
-            return _coerce_hand_positions(
-                getattr(state, "position", []), limit=self._max_val,
-            )
-        except ValueError:
-            return None
-
     def _base_positions(self):
-        with self._lock:
-            target = list(self._target_positions) if self._target_positions is not None else None
-        return target if target is not None else self._fresh_state_positions()
+        positions = self._state_cache.fresh_positions(self._state_timeout_sec)
+        if positions is None:
+            return list(self._open_positions)
+        try:
+            return _coerce_hand_positions(positions, limit=self._max_val)
+        except ValueError:
+            return list(self._open_positions)
 
     def get_tool(self) -> dict:
         return {
@@ -1005,18 +1246,70 @@ class HandPlugin:
             },
         }
 
+    def _publisher_available(self) -> bool:
+        if not HAS_PND_SDK or self._hand_pub is None:
+            return False
+        is_matched = getattr(self._hand_pub, "IsMatched", None)
+        if not callable(is_matched):
+            return True
+        try:
+            return bool(is_matched())
+        except Exception:
+            return False
+
     def start(self):
-        self._shutdown_event.clear()
-        self._poll_stop_event.clear()
-        if self._hand_sub is not None and (
-                self._hand_poll_thread is None or not self._hand_poll_thread.is_alive()):
-            self._hand_poll_thread = threading.Thread(
-                target=self._poll_hand, daemon=True, name="adam_hand_poll",
-            )
-            self._hand_poll_thread.start()
-        if self._control_thread is None or not self._control_thread.is_alive():
+        with self._lifecycle_lock:
+            if self._closed:
+                return {
+                    "state": "error",
+                    "error": "HAND_CLOSED",
+                    "message": "hand worker has been closed",
+                }
+            thread = self._control_thread
+            stop_event = self._control_stop_event
+            if thread is not None and thread.is_alive():
+                if stop_event is None or not stop_event.is_set():
+                    return self._status("ready")
+                thread.join(1.5)
+                if thread.is_alive():
+                    return {
+                        "state": "stopping",
+                        "action": "start",
+                        "control_active": False,
+                        "worker_alive": True,
+                    }
+                if self._control_thread is thread:
+                    self._control_thread = None
+                    self._control_stop_event = None
+        self._state_cache.start()
+        with self._lifecycle_lock:
+            if self._closed:
+                return {
+                    "state": "error",
+                    "error": "HAND_CLOSED",
+                    "message": "hand worker has been closed",
+                }
+            thread = self._control_thread
+            stop_event = self._control_stop_event
+            if thread is not None and thread.is_alive():
+                if stop_event is None or not stop_event.is_set():
+                    return self._status("ready")
+                return {
+                    "state": "stopping",
+                    "action": "start",
+                    "control_active": False,
+                    "worker_alive": True,
+                }
+            if not self._publisher_available():
+                return self._status("unavailable")
+            self._wake_event.clear()
+            stop_event = threading.Event()
+            self._control_stop_event = stop_event
             self._control_thread = threading.Thread(
-                target=self._control_loop, daemon=True, name="adam_hand_control",
+                target=self._control_loop,
+                args=(stop_event,),
+                daemon=True,
+                name="adam_hand_control",
             )
             self._control_thread.start()
         return self._status("ready")
@@ -1024,70 +1317,112 @@ class HandPlugin:
     def stop(self):
         with self._lock:
             self._active = False
-            self._command_generation += 1
-        self._shutdown_event.set()
-        self._poll_stop_event.set()
-        self._wake_event.set()
-        return self._status("idle")
+            self._target_positions = None
+        with self._lifecycle_lock:
+            thread = self._control_thread
+            stop_event = self._control_stop_event
+            if stop_event is not None:
+                stop_event.set()
+            self._wake_event.set()
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(1.5)
+            worker_alive = thread is not None and thread.is_alive()
+            if not worker_alive:
+                self._control_thread = None
+                self._control_stop_event = None
+        return {
+            "state": "stopping" if worker_alive else "stopped",
+            "action": "stop",
+            "control_active": False,
+            "worker_alive": worker_alive,
+        }
+
+    def close(self):
+        with self._lifecycle_lock:
+            self._closed = True
+        self.stop()
+        if self._owns_state_cache:
+            self._state_cache.close()
 
     def _status(self, state: str | None = None) -> dict:
         with self._lock:
             active = self._active
-            target = list(self._target_positions) if self._target_positions is not None else None
             last_write_ok = self._last_write_ok
             last_write_at_ms = self._last_write_at_ms
             last_write_error = self._last_write_error
+        cache_status = self._state_cache.status(self._state_timeout_sec)
         result = {
             "state": state or ("active" if active else "idle"),
             "control_active": active,
-            "publisher_available": bool(HAS_PND_SDK and self._hand_pub is not None),
-            "control_rate_hz": self._control_rate_hz,
-            "position_max": self._max_val,
-            "open_positions": list(self._open_positions),
-            "close_positions": list(self._close_positions),
-            "thumb_close_positions": list(self._thumb_close_positions),
-            "thumb_close_min_flex_position": self._thumb_close_min_flex_position,
-            "target": target,
+            "worker_alive": (
+                self._control_thread is not None
+                and self._control_thread.is_alive()
+            ),
+            "closed": self._closed,
+            "publisher_available": self._publisher_available(),
+            "state_reader_available": cache_status["reader_available"],
+            "state_reader_running": cache_status.get("reader_running", False),
+            "state_fresh": cache_status["fresh"],
             "last_write_ok": last_write_ok,
             "last_write_at_ms": last_write_at_ms,
         }
+        if not result["publisher_available"]:
+            result["error"] = "DDS_UNAVAILABLE"
         if last_write_error:
             result["last_write_error"] = last_write_error
         return result
 
+    def _record_write_failure(self, message: str):
+        with self._lock:
+            self._last_write_ok = False
+            self._last_write_at_ms = int(time.time() * 1000)
+            self._last_write_error = message
+
     def _send_hand_cmd(self, positions: list[int]) -> bool:
-        if not HAS_PND_SDK or self._hand_pub is None:
-            with self._lock:
-                self._last_write_ok = False
-                self._last_write_error = "DDS hand publisher is unavailable"
+        if not self._publisher_available():
+            self._record_write_failure("DDS hand publisher is unavailable")
             return False
-        cmd = pnd_adam_msg_dds__HandCmd_()
-        for i, value in enumerate(positions):
-            cmd.position[i] = value
         try:
-            write_result = self._hand_pub.Write(cmd)
+            cmd = pnd_adam_msg_dds__HandCmd_()
+            for i, value in enumerate(positions):
+                cmd.position[i] = value
+            # Keep a broken/disconnected DDS writer from holding the worker
+            # forever.  ChannelPublisher.Write supports this timeout and older
+            # wrappers simply ignore it at the underlying DataWriter call.
+            write_result = self._hand_pub.Write(cmd, timeout=0.2)
             ok = write_result is not False
+            error = None if ok else "DDS hand command write returned false"
         except Exception as exc:
             ok = False
-            with self._lock:
-                self._last_write_error = str(exc)
+            error = str(exc)
         with self._lock:
             self._last_write_ok = ok
             self._last_write_at_ms = int(time.time() * 1000)
-            if ok:
-                self._last_write_error = None
+            self._last_write_error = error
         return ok
 
-    def _control_loop(self):
+    def _control_loop(self, stop_event: threading.Event):
         period = 1.0 / self._control_rate_hz
-        while not self._shutdown_event.is_set():
-            with self._lock:
-                active = self._active
-                target = list(self._target_positions) if self._target_positions is not None else None
-            if active and target is not None:
-                self._send_hand_cmd(target)
-            self._wake_event.wait(period)
-            self._wake_event.clear()
+        while not stop_event.is_set():
+            try:
+                with self._lock:
+                    active = self._active
+                    target = list(self._target_positions) if self._target_positions is not None else None
+                if active and target is not None:
+                    if stop_event.is_set():
+                        break
+                    if not self._send_hand_cmd(target):
+                        if self._wake_event.wait(0.1):
+                            self._wake_event.clear()
+                        continue
+                if self._wake_event.wait(period):
+                    self._wake_event.clear()
+                    if stop_event.is_set():
+                        break
+            except Exception as exc:
+                self._record_write_failure(str(exc))
+                if self._wake_event.wait(0.1):
+                    self._wake_event.clear()
 
     def _close_target(self) -> list[int]:
         """Build one close target for all four fingers and both thumb axes."""
@@ -1103,24 +1438,31 @@ class HandPlugin:
             target[side_offset + 5] = self._thumb_close_positions[thumb_offset + 1]
         return target
 
-    def _activate(self, positions: list[int]) -> dict:
-        if not HAS_PND_SDK or self._hand_pub is None:
+    def _activate(self, positions: list[int], action: str) -> dict:
+        with self._lifecycle_lock:
+            if self._closed:
+                return {
+                    "state": "error",
+                    "error": "HAND_CLOSED",
+                    "message": "hand worker has been closed",
+                }
+        if not self._publisher_available():
             return {
                 "state": "error",
                 "error": "DDS_UNAVAILABLE",
                 "message": "rt/handcmd publisher is unavailable",
             }
-        if self._shutdown_event.is_set() or self._control_thread is None or not self._control_thread.is_alive():
-            self.start()
+        result = self.start()
+        if result.get("state") not in ("ready",):
+            return result
         with self._lock:
-            self._command_generation += 1
             self._target_positions = list(positions)
             self._active = True
         self._wake_event.set()
         return {
             "state": "active",
-            "target": list(positions),
-            "control_rate_hz": self._control_rate_hz,
+            "action": action,
+            "success": True,
         }
 
     def dispatch(self, action: str, args: dict) -> dict:
@@ -1129,9 +1471,9 @@ class HandPlugin:
         if action == "stop":
             return self.stop()
         if action == "open":
-            return self._activate(self._open_positions)
+            return self._activate(self._open_positions, "open")
         if action == "close":
-            return self._activate(self._close_target())
+            return self._activate(self._close_target(), "close")
         if action == "set_fingers":
             side = args.get("side")
             channel = args.get("channel")
@@ -1161,14 +1503,10 @@ class HandPlugin:
                 return {"state": "error", "error": "INVALID_ARGUMENT", "message": str(exc)}
 
             base = self._base_positions()
-            if base is None:
-                # Keep all unspecified channels in the configured safe open
-                # pose when feedback has not arrived yet.
-                base = list(self._open_positions)
             positions = list(base)
             offset = 0 if side == "left" else 6
             positions[offset + HAND_CHANNEL_NAMES.index(channel)] = value
-            return self._activate(positions)
+            return self._activate(positions, "set_fingers")
         if action == "info":
             return self._status()
         return None
@@ -2137,15 +2475,26 @@ class AdamDeviceBundle:
 
     def __init__(self, config: dict, namespace: str, executor, grpc_client,
                  dds_lowstate_sub=None, dds_handstate_sub=None,
-                 dds_hand_pub=None, dds_hand_sub=None):
+                 dds_hand_pub=None, ros2_enabled: bool | None = None):
         self._plugins = []
         self._tool_map = {}  # tool_name → plugin
 
         variant = config.get("variant", "sp")
         plugins_cfg = config.get("plugins", {})
+        self._ros2_enabled = bool(
+            HAS_ROS2
+            and executor is not None
+            and (ros2_enabled is None or ros2_enabled)
+        )
+        hand_state_enabled = plugins_cfg.get("hand_state", {}).get("enabled", True)
+        hand_enabled = plugins_cfg.get("hand", {}).get("enabled", True)
+        self._hand_state_cache = (
+            HandStateCache(dds_handstate_sub)
+            if hand_state_enabled or hand_enabled else None
+        )
 
         # StatePlugin
-        if plugins_cfg.get("state", {}).get("enabled", True):
+        if plugins_cfg.get("state", {}).get("enabled", True) and self._ros2_enabled:
             p = StatePlugin(
                 plugins_cfg.get("state", {}), namespace, executor,
                 variant=variant,
@@ -2155,10 +2504,12 @@ class AdamDeviceBundle:
 
         # Hand state is a dedicated sensor card.  Keep it separate from the
         # body state card so Agent Core can wire/read hand feedback directly.
-        if plugins_cfg.get("hand_state", {}).get("enabled", True):
+        if hand_state_enabled:
             p = HandStatePlugin(
                 plugins_cfg.get("hand_state", {}), namespace, executor,
                 dds_handstate_sub=dds_handstate_sub,
+                state_cache=self._hand_state_cache,
+                ros2_enabled=self._ros2_enabled,
             )
             self._plugins.append(p)
 
@@ -2171,13 +2522,13 @@ class AdamDeviceBundle:
             self._plugins.append(p)
 
         # CameraPlugin
-        if plugins_cfg.get("camera", {}).get("enabled", False):
+        if plugins_cfg.get("camera", {}).get("enabled", False) and self._ros2_enabled:
             p = ZedCameraPlugin(
                 plugins_cfg.get("camera", {}), namespace, executor)
             self._plugins.append(p)
 
         # ArmPlugin
-        if plugins_cfg.get("arm", {}).get("enabled", True):
+        if plugins_cfg.get("arm", {}).get("enabled", True) and self._ros2_enabled:
             p = ArmPlugin(
                 plugins_cfg.get("arm", {}), namespace, executor,
                 grpc_client=grpc_client,
@@ -2185,9 +2536,10 @@ class AdamDeviceBundle:
             self._plugins.append(p)
 
         # HandPlugin
-        if plugins_cfg.get("hand", {}).get("enabled", True):
+        if hand_enabled:
             p = HandPlugin(plugins_cfg.get("hand", {}), namespace, executor,
-                           dds_hand_pub=dds_hand_pub, dds_hand_sub=dds_hand_sub)
+                           dds_hand_pub=dds_hand_pub,
+                           state_cache=self._hand_state_cache)
             self._plugins.append(p)
 
         # ModelPlugin
@@ -2208,12 +2560,31 @@ class AdamDeviceBundle:
                 self._tool_map[tool["name"]] = plugin
 
     def start_all(self):
+        if self._hand_state_cache is not None:
+            self._hand_state_cache.start()
         for p in self._plugins:
             p.start()
 
     def stop_all(self):
-        for p in self._plugins:
-            p.stop()
+        for p in reversed(self._plugins):
+            try:
+                p.stop()
+            except Exception as exc:
+                print(f"[adam] WARNING: plugin stop failed: {exc}", flush=True)
+        if self._hand_state_cache is not None:
+            self._hand_state_cache.stop()
+
+    def close_all(self):
+        self.stop_all()
+        for p in reversed(self._plugins):
+            close = getattr(p, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except Exception as exc:
+                    print(f"[adam] WARNING: plugin close failed: {exc}", flush=True)
+        if self._hand_state_cache is not None:
+            self._hand_state_cache.close()
 
     def get_all_tools(self) -> list:
         tools = []
