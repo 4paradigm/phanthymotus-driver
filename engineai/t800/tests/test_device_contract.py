@@ -1638,6 +1638,39 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual(result["action_id"], completions[0][1])
         self.assertEqual("cancelled", completions[0][2])
 
+    def test_head_timeout_cancels_active_request_before_releasing_lease(self):
+        """wait_for_request 超时时必须先 cancel 在飞请求，再释放 head 锁。"""
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        plan.wait_until_idle = lambda *_a, **_kw: {}
+
+        def wait_for_request(_request_id, _timeout, cancel_event):
+            # planner 已报告 EXECUTING 但在超时时间内未完成（反馈超时）
+            raise TimeoutError("joint planner did not complete request")
+
+        plan.wait_for_request = wait_for_request
+        head = self.device.HeadActuatorPlugin(CONFIG, plan, self.state)
+        self.device._notify_acp_completion = lambda *_a, **_kw: None
+
+        result = head.dispatch("nod", {"times": 1})
+        self.assertIn("action_id", result)
+        head._thread.join(timeout=2.0)
+        self.assertFalse(head._thread.is_alive())
+
+        # 超时后应已发布 cancel 消息
+        cancel_msgs = [
+            m for m in plan._publisher.messages
+            if int(m.request_type) == JointMotionPlanRequest.REQUEST_CANCEL
+        ]
+        self.assertTrue(cancel_msgs, "timeout path must publish a cancel request")
+        # head 锁应已释放
+        self.assertIsNone(plan.head_status()["owner"])
+        # 下一个 head 动作应能正常获取锁
+        plan.wait_for_request = lambda *_a, **_kw: {}
+        again = head.dispatch("nod", {"times": 1})
+        self.assertIn("action_id", again)
+        head._thread.join(timeout=2.0)
+
 
 if __name__ == "__main__":
     unittest.main()
