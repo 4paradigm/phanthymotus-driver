@@ -2937,10 +2937,10 @@ class UpperBodyActionsPlugin:
             "left": [-0.47, -0.255, -0.161, -0.731, -0.028, 0.024, -0.081, 0.001, -0.069, 0.0],
             "right": [0.028, 0.084, -0.001, -0.066, 0.0, -0.47, 0.255, 0.161, -0.731, 0.028],
         },
-        "guard": [-0.35, 0.22, -0.15, -1.05, 0.0, -0.35, -0.22, 0.15, -1.05, 0.0],
-        "chest_open": [0.05, 0.75, 0.0, -0.25, 0.0, 0.05, -0.75, 0.0, -0.25, 0.0],
+        # Raise both upper arms and deepen the elbow bend so the hands sit
+        # closer to the face instead of hanging in front of the torso.
+        "guard": [-0.75, 0.18, -0.10, -1.35, 0.0, -0.75, -0.18, 0.10, -1.35, 0.0],
         "arm_raise": [-1.0, 0.18, 0.0, -0.2, 0.0, -1.0, -0.18, 0.0, -0.2, 0.0],
-        "side_reach": [0.0, 1.0, 0.0, -0.15, 0.0, 0.0, -1.0, 0.0, -0.15, 0.0],
     }
 
     def __init__(self, gesture: GesturePlugin):
@@ -2973,7 +2973,7 @@ class UpperBodyActionsPlugin:
             "name": "upper_body_actions",
             "type": "actuator",
             "multiInstance": False,
-            "description": "T800 Driver 预设的指向、防守和热身动作；非官方动作资源",
+            "description": "T800 Driver 预设的指向、近脸防守和举臂动作；非官方动作资源",
             "inputSchema": schema,
         }
 

@@ -725,7 +725,17 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual({"action": "halt"}, schema["x-hooks"]["on_interrupt_motion"])
         self.assertEqual({"action": "halt"}, schema["x-hooks"]["on_interrupt_all"])
         listed = plugin.dispatch("list", {})
+        self.assertEqual(
+            {"point_forward", "guard", "arm_raise"},
+            {item["name"] for item in listed["actions"]},
+        )
         self.assertTrue(all(not item["hardware_validated"] for item in listed["actions"]))
+        self.assertEqual(
+            [-0.75, 0.18, -0.10, -1.35, 0.0, -0.75, -0.18, 0.10, -1.35, 0.0],
+            plugin._POSES["guard"],
+        )
+        self.assertNotIn("chest_open", plugin._POSES)
+        self.assertNotIn("side_reach", plugin._POSES)
         self.assertIn("lower_body_balance", plugin.dispatch("play", {"name": "guard"})["error"])
 
     def test_gesture_declares_async_completion_and_lifecycle_actions(self):
