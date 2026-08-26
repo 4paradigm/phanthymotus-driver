@@ -1042,9 +1042,10 @@ class DevicePluginContractTests(unittest.TestCase):
         actions = swing.get_tool()["inputSchema"]["properties"]["action"]["enum"]
         completion = swing.get_tool()["inputSchema"]["x-completion"]
         self.assertEqual(
-            ["start_swing", "return_neutral", "halt_and_return"],
+            ["return_neutral", "halt_and_return"],
             completion["actions"],
         )
+        self.assertNotIn("start_swing", completion["actions"])
         self.assertGreater(completion["timeout"], 3)
         self.assertTrue({"start", "info", "stop"}.issubset(actions))
         self.assertNotIn("set_parameters", actions)
@@ -1271,6 +1272,20 @@ class DevicePluginContractTests(unittest.TestCase):
             result = plan.dispatch(action, {**args, "_owner": "arm_swing"})
             self.assertIn("reserved for internal driver use", result["error"])
         self.assertEqual([], plan._publisher.messages)
+
+    def test_joint_plan_public_cancel_bypasses_active_owner(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        self.assertTrue(plan.acquire("arm_swing"))
+        blocked = plan.dispatch("reset", {})
+        self.assertIn("owned by arm_swing", blocked["error"])
+        self.assertEqual([], plan._publisher.messages)
+        result = plan.dispatch("cancel", {"request_id": 12})
+        self.assertEqual("requested", result["state"])
+        sent = plan._publisher.messages[-1]
+        self.assertEqual(plan._request_type.REQUEST_CANCEL, sent.request_type)
+        self.assertEqual(12, sent.request_id)
+        self.assertEqual("arm_swing", plan.owner())
 
     def test_gesture_rejects_start_while_arm_swing_owns_planner(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
