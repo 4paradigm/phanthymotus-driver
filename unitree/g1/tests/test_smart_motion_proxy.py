@@ -592,6 +592,8 @@ class SmartMotionParentLocoSequenceTest(unittest.TestCase):
         )
         self.assertIn('name="g1_loco_proposal_ros"', source)
         self.assertEqual(source.count("executor.spin_once"), 2)
+        self.assertIn("nonlocal forward_obstacle_log_count", source)
+        self.assertNotIn("self._fwd_log_n", source)
 
     def test_main_wires_parent_rpc_proxy_loco_calls(self):
         main_source = Path(__file__).resolve().parents[1].joinpath(

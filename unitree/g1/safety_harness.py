@@ -1631,6 +1631,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
     obstacle_angle = 0.0
     lateral_obstacle = False
     obstacle_scan_heading = None
+    forward_obstacle_log_count = 0
 
     # Nav arrival state (updated by rt/slam_info DDS callback in this subprocess)
     slam_info_lock = threading.Lock()
@@ -1895,6 +1896,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
     def on_cloud(msg):
         nonlocal obstacle_dist, obstacle_angle, lateral_obstacle
         nonlocal obstacle_scan_heading, last_cloud_time
+        nonlocal forward_obstacle_log_count
 
         # Get heading
         if state == MotionState.MOVING and current_cmd:
@@ -1972,17 +1974,20 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                 # as long as an obstacle stays in range, so log the *entry* into
                 # that state unthrottled — that is the operationally interesting
                 # event — and then sample the steady-state readout.
-                self._fwd_log_n = getattr(self, '_fwd_log_n', 0) + 1
-                if self._fwd_log_n == 1 or self._fwd_log_n % 100 == 0:
+                forward_obstacle_log_count += 1
+                if (
+                    forward_obstacle_log_count == 1
+                    or forward_obstacle_log_count % 100 == 0
+                ):
                     print(f"[SmartMotion:lidar] closest_fwd: dist={min_fwd_dist:.2f}m "
                           f"xyz=({fwd_x:.2f},{fwd_y:.2f},{fwd_z:.2f}) "
                           f"angle={math.degrees(min_fwd_angle):.1f}° "
                           f"total_fwd_pts={int(forward_mask.sum())} "
                           f"heading={math.degrees(heading):.1f}° "
-                          f"(n={self._fwd_log_n})", flush=True)
+                          f"(n={forward_obstacle_log_count})", flush=True)
             else:
                 # Left the decel zone — reset so re-entry logs immediately.
-                self._fwd_log_n = 0
+                forward_obstacle_log_count = 0
 
         # Lateral (45°-90°, within stop_threshold)
         lat_mask = (angle_diffs >= math.radians(45)) & \
