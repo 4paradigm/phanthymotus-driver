@@ -1225,6 +1225,46 @@ class DevicePluginContractTests(unittest.TestCase):
                    if msg.request_type == plan._request_type.REQUEST_CANCEL]
         self.assertTrue(any(msg.request_id == request_id for msg in cancels))
 
+    def test_arm_swing_rejects_neutral_replacement_while_worker_is_stopping(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        original_dispatch_owned = plan.dispatch_owned
+        published = threading.Event()
+        allow_return = threading.Event()
+
+        def delayed_dispatch_owned(owner, action, args):
+            result = original_dispatch_owned(owner, action, args)
+            if action == "plan":
+                published.set()
+                allow_return.wait(timeout=2.0)
+            return result
+
+        plan.dispatch_owned = delayed_dispatch_owned
+        swing = self.device.ArmSwingPlugin(CONFIG, plan, self.state)
+        swing._notify_completion = lambda *_args: None
+        self.state._current_motion = "lower_body_balance"
+        started = swing.dispatch("start_swing", {})
+        self.assertTrue(published.wait(timeout=1.0))
+        worker = swing._thread
+        original_join = worker.join
+        worker.join = lambda timeout=None: None
+        try:
+            result = swing.dispatch("return_neutral", {"duration": 1.5})
+            self.assertEqual("stopping", result["state"])
+            self.assertIn("still stopping", result["error"])
+            self.assertEqual(started["action_id"], result["action_id"])
+            plans = [msg for msg in plan._publisher.messages
+                     if msg.request_type == plan._request_type.REQUEST_PLAN_EXECUTE]
+            self.assertEqual(1, len(plans))
+            self.assertIs(worker, swing._thread)
+            self.assertEqual("arm_swing", plan.owner())
+        finally:
+            worker.join = original_join
+            allow_return.set()
+            original_join(timeout=1.0)
+        self.assertFalse(worker.is_alive())
+        self.assertIsNone(plan.owner())
+
     def test_arm_swing_concurrent_start_creates_one_worker(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
         plan.start()
