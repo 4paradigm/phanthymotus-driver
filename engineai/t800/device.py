@@ -116,7 +116,15 @@ def _notify_acp_completion(
             and parsed_url.hostname not in ("localhost", "127.0.0.1", "::1")
         ):
             raise ValueError("unencrypted AGENT_CORE_URL is only allowed on loopback")
-        context = ssl.create_default_context(cafile=ca_cert or None)
+        # 与 main 分支 g1 driver 及 t800 注册循环保持一致：未配置 CA 证书时
+        # 接受自签证书（Agent Core 在机器人上通常使用自签证书）；显式配置了
+        # AGENT_CORE_CA_CERT 时则使用指定 CA 进行验证。
+        if ca_cert:
+            context = ssl.create_default_context(cafile=ca_cert)
+        else:
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
         payload = json.dumps({
             "action_id": action_id,
             "status": status,
