@@ -247,6 +247,9 @@ class ControlledSpatialPlugin:
                         "description": "受保护操作（建图、删除、增删虚拟墙/轨道/区域/POI等）所需的密码，初始密码为 123456",
                         "default": "123456",
                         "format": "password",
+                        # 底盘的固定初始密码，不是用户秘密：打包成解决方案时保留，
+                        # 清空只会让载入方重新敲一遍同一个默认值。
+                        "x-sensitive": False,
                         "scope": "shared",
                     },
                 },

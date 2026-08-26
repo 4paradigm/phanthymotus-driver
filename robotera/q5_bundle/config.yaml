@@ -42,11 +42,22 @@ plugins:
     device: "hw:2,0"
     sample_rate_hz: 16000
     channels: 1
-    output_sample_rate_hz: 48000
+    # The verified Q5 amplifier route is S16_LE stereo at 44.1 kHz.
+    output_sample_rate_hz: 44100
     output_channels: 2
+    volume: 100
+    input_gain: 6.0
+    xos_http_base: "http://192.168.8.100:1888"
   audio:
     enabled: true
     device: "plughw:2,0"
+    # Agent Core files selected in the canvas are read through its download endpoint.
+    agent_core_upload_dir: "/tmp/uploads"
+    # Set AGENT_CORE_TOKEN, AGENT_CORE_ACCESS_TOKEN, or Agent Core's native
+    # ACCESS_TOKEN when Agent Core auth is enabled.
+    volume: 50
+    upload_max_bytes: 20971520
+    xos_http_base: "http://192.168.8.100:1888"
   camera_rgb:
     enabled: true
     source_topic: "/camera/camera/color/image_raw"
@@ -64,6 +75,21 @@ plugins:
     enabled: true
     source_topic: "/camera/camera/aligned_depth_to_color/image_raw"
     max_hz: 15.0
+    near_depth_m: 0.25
+    far_depth_m: 4.0
+    gamma: 0.70
+    jpeg_quality: 88
+    auto_contrast: true
+  camera_pointcloud:
+    enabled: true
+    source_topic: "/camera/camera/aligned_depth_to_color/image_raw"
+    camera_info_topic: "/camera/camera/color/camera_info"
+    max_hz: 5.0
+    max_points: 10000
+    min_depth_m: 0.25
+    max_depth_m: 5.0
+    camera_mount_pitch_rad: 0.14655
+    floor_offset_m: 1.15
   arm_control:
     enabled: true
     hardware_enable: true
@@ -76,8 +102,6 @@ plugins:
     # Keep the final arm target published until feedback has caught up.
     settle_tolerance_rad: 0.035
     settle_timeout_s: 1.5
-  q5_control_mode:
-    enabled: true
   hand_control:
     enabled: true
     min_position_rad: 0.0

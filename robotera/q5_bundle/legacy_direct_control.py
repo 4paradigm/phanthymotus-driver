@@ -15,6 +15,7 @@ from xbot_common_interfaces.srv import DynamicLaunch
 from body_command import get_router as _get_body_router
 from control_contract import q5_active_status, q5_is_control_ready
 from joint_limits import JOINT_LIMITS, limits_for
+from q5_acp import notify as _acp_notify
 
 
 # ── Arm control ──────────────────────────────────────────────────────────────
@@ -63,8 +64,9 @@ def _arm_limit_summary() -> str:
 
 ARM_DESC = (
     "关节绝对角度范围：" + _arm_limit_summary() + "。"
-    "Q5 手臂单关节位置控制；每个关节动作使用自己的绝对角度参数（不是增量），"
-    "需由 q5_control_mode 完成位置直控准备后使用。每步最多 0.010 rad、20 Hz，最大约 0.20 rad/s。"
+    "Q5 手臂单关节位置控制；每个关节动作使用自己的绝对角度参数（不是增量）。"
+    "首次执行 arm_control 会自动完成位置直控准备；准备标志仍有效时后续动作直接执行。"
+    "每步最多 0.010 rad、20 Hz，最大约 0.20 rad/s。"
 )
 
 
@@ -81,13 +83,13 @@ def _arm_number(value, field: str) -> float:
     return value
 
 
-class Q5ControlModePlugin:
-    """Vendor Q5 control-mode transitions, kept separate from joint movement."""
+class PositionControlPreparer:
+    """Private vendor position-control preparation helper for arm_control."""
 
     def __init__(self, plugin_config, namespace, executor, client):
         del plugin_config, namespace
         self._client = client
-        self._node = Node("q5_control_mode")
+        self._node = Node("q5_position_control_preparer")
         executor.add_node(self._node)
         self._dynamic = self._node.create_client(DynamicLaunch, "/dynamic_launch")
         self._ready = self._node.create_client(Trigger, "/ready_service")
@@ -96,10 +98,12 @@ class Q5ControlModePlugin:
         # Q5 exposes no service that tells us which DynamicLaunch mode owns
         # ACTIVE. Do not infer direct-position ownership from ACTIVE alone.
         self._client.q5_position_control_prepared = False
+        self._prepared = False
+        self._prepare_lock = threading.Lock()
 
     def get_tool(self):
         return {
-            "name": "q5_control_mode", "type": "actuator", "multiInstance": False,
+            "name": "q5_position_control_preparer", "type": "actuator", "multiInstance": False,
             "description": "Q5 模式切换：位置直控准备、READY 与 ACTIVE。完整准备会实际垂手并抬臂。",
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["start", "prepare_position_control", "ready", "active", "info"], "oneOf": [
@@ -174,28 +178,34 @@ class Q5ControlModePlugin:
         return None if success else self._failure("ACTIVATE_FAILED", "Q5 activation failed", steps=steps)
 
     def _prepare(self):
-        steps = []
-        self._client.q5_position_control_prepared = False
-        error = self._to_ready(steps)
-        if error:
-            return error
-        if not self._actions.wait_for_server(timeout_sec=5.0):
-            return self._failure("SIMPLE_ACTIONS_UNAVAILABLE", "Q5 /simple_actions is unavailable", steps=steps)
-        for name in ("initpose_handsdown", "lift_up"):
-            goal = SimpleActions.Goal()
-            goal.action_name, goal.time_cost = name, 4.0
-            handle = self._wait_future(self._actions.send_goal_async(goal), 8.0)
-            result = self._wait_future(handle.get_result_async(), 35.0) if handle and handle.accepted else None
-            success = bool(result and getattr(result.result, "result", 2) == 0)
-            steps.append({"step": name, "success": success,
-                          "message": getattr(result.result, "message", "timeout") if result else "timeout"})
-            if not success:
-                return self._failure("SIMPLE_ACTION_FAILED", f"Q5 action {name} failed", steps=steps)
-        error = self._to_active(steps)
-        if error:
-            return error
-        self._client.q5_position_control_prepared = True
-        return {"ok": True, "state": "active", "position_control_prepared": True, "steps": steps}
+        with self._prepare_lock:
+            if self._prepared and bool(getattr(self._client, "q5_position_control_prepared", False)):
+                return {"ok": True, "state": "active", "position_control_prepared": True,
+                        "prepare": "already_prepared"}
+            steps = []
+            self._prepared = False
+            self._client.q5_position_control_prepared = False
+            error = self._to_ready(steps)
+            if error:
+                return error
+            if not self._actions.wait_for_server(timeout_sec=5.0):
+                return self._failure("SIMPLE_ACTIONS_UNAVAILABLE", "Q5 /simple_actions is unavailable", steps=steps)
+            for name in ("initpose_handsdown", "lift_up"):
+                goal = SimpleActions.Goal()
+                goal.action_name, goal.time_cost = name, 4.0
+                handle = self._wait_future(self._actions.send_goal_async(goal), 8.0)
+                result = self._wait_future(handle.get_result_async(), 35.0) if handle and handle.accepted else None
+                success = bool(result and getattr(result.result, "result", 2) == 0)
+                steps.append({"step": name, "success": success,
+                              "message": getattr(result.result, "message", "timeout") if result else "timeout"})
+                if not success:
+                    return self._failure("SIMPLE_ACTION_FAILED", f"Q5 action {name} failed", steps=steps)
+            error = self._to_active(steps)
+            if error:
+                return error
+            self._client.q5_position_control_prepared = True
+            self._prepared = True
+            return {"ok": True, "state": "active", "position_control_prepared": True, "steps": steps}
 
     def start(self):
         return {"state": "ready", "status": self._status()}
@@ -210,6 +220,7 @@ class Q5ControlModePlugin:
         if action == "prepare_position_control":
             return self._prepare()
         if action == "ready":
+            self._prepared = False
             self._client.q5_position_control_prepared = False
             steps = []
             error = self._to_ready(steps)
@@ -227,6 +238,9 @@ class ArmControlPlugin:
     def __init__(self, plugin_config, namespace, executor, client):
         self._client = client
         self._router = _get_body_router(client, executor)
+        # Keep vendor mode transitions private to arm_control. This node is an
+        # implementation helper and is not exposed as a separate MCP card.
+        self._preparer = PositionControlPreparer({}, namespace, executor, client)
         self._max_step = float(plugin_config.get("max_step_rad", 0.010))
         self._publish_rate = float(plugin_config.get("publish_rate_hz", 20.0))
         self._hold_repetitions = int(plugin_config.get("hold_repetitions", 3))
@@ -262,8 +276,9 @@ class ArmControlPlugin:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["start", *action_details, "cancel", "info"], "oneOf": [
+                    "action": {"type": "string", "enum": ["start", "prepare", *action_details, "cancel", "info"], "oneOf": [
                         {"const": "start", "title": "检查连接状态"},
+                        {"const": "prepare", "title": "准备位置直控"},
                         *[{"const": name, "title": detail["title"]}
                           for name, detail in action_details.items()],
                         {"const": "cancel", "title": "取消并保持当前角度"},
@@ -275,6 +290,7 @@ class ArmControlPlugin:
                 "additionalProperties": False,
                 "x-action-params": {
                     "start": {"params": [], "description": "检查 ROS 连接和机器人状态。"},
+                    "prepare": {"params": [], "description": "自动执行 pos、READY、垂手、抬臂、ACTIVE 位置直控准备流程。"},
                     **{name: {"params": [detail["field"]],
                                 "description": f"{detail['title']}；范围[{detail['limits'][0]:g},{detail['limits'][1]:g}]rad；最大速度约 0.20 rad/s。"}
                        for name, detail in action_details.items()},
@@ -292,11 +308,40 @@ class ArmControlPlugin:
             "lifecycle_state": self._client.get_lifecycle_state(),
             "joint_state_fresh": bool(self._client.snapshot().get("fresh", False)),
             "q5_fsm": q5_active_status(self._client),
+            "position_control_prepared": bool(getattr(self._client, "q5_position_control_prepared", False)),
             "limits": {"max_step_rad": self._max_step,
                        "joint_position_limits": limits_for(ARM_JOINTS),
                        "joint_names_source": "q5_model.urdf"},
         })
         return status
+
+    def _ensure_prepared(self):
+        if bool(getattr(self._client, "q5_position_control_prepared", False)):
+            return None
+        result = self._preparer._prepare()
+        if isinstance(result, dict) and result.get("ok"):
+            return None
+        return _arm_failure(
+            "ARM_PREPARE_FAILED",
+            "Q5 position-control prepare sequence failed",
+            prepare=result,
+        )
+
+    @staticmethod
+    def _trace(action_id: str | None, phase: str, started_at: float | None = None, **details) -> None:
+        """Emit phase timing for diagnosing vendor control-stack stalls."""
+        elapsed_ms = None if started_at is None else int((time.monotonic() - started_at) * 1000)
+        fields = [f"action_id={action_id or '-'}", f"phase={phase}"]
+        if elapsed_ms is not None:
+            fields.append(f"elapsed_ms={elapsed_ms}")
+        fields.extend(f"{key}={value}" for key, value in details.items())
+        print("[ArmControlPlugin] " + " ".join(fields), flush=True)
+
+    def _notify_completion(self, action_id: str | None, status: str, result: dict) -> None:
+        started_at = time.monotonic()
+        self._trace(action_id, "acp_callback_start", status=status)
+        _acp_notify(action_id, status, result, ARM_CARD)
+        self._trace(action_id, "acp_callback_end", started_at, status=status)
 
     def _publish(self, joint_name: str, position: float) -> bool:
         return self._router.publish({joint_name: position})
@@ -316,12 +361,16 @@ class ArmControlPlugin:
         position = snap.get("joints", {}).get(joint_name)
         return self._hold_position(joint_name, position) if snap.get("fresh") else False
 
-    def _run_move(self, stop_event, joint_name: str, current: float, target: float, duration_s: float):
+    def _run_move(self, stop_event, joint_name: str, current: float, target: float, duration_s: float,
+                  action_id: str | None = None):
         steps = max(
             int(math.ceil(abs(target - current) / self._max_step)),
             int(math.ceil(duration_s * self._publish_rate)),
             1,
         )
+        motion_started_at = time.monotonic()
+        self._trace(action_id, "motion_start", joint_name=joint_name,
+                    current_rad=current, target_rad=target, duration_s=duration_s, steps=steps)
         try:
             for index in range(1, steps + 1):
                 if stop_event.is_set():
@@ -330,16 +379,87 @@ class ArmControlPlugin:
                 self._publish(joint_name, position)
                 stop_event.wait(duration_s / steps)
         finally:
+            self._trace(action_id, "motion_interpolation_end", motion_started_at,
+                        cancelled=stop_event.is_set())
             # The joint-state stream may still contain the pre-command angle
             # when the final interpolation point is sent. Hold the target on
             # successful completion; cancellation continues to hold feedback.
+            hold_started_at = time.monotonic()
             self._hold_position(joint_name, target) if not stop_event.is_set() else self._hold_current(joint_name)
+            self._trace(action_id, "motion_hold_end", hold_started_at,
+                        cancelled=stop_event.is_set())
             self._router.release(ARM_CARD)
+            self._trace(action_id, "router_released")
+            self._notify_completion(action_id, "cancelled" if stop_event.is_set() else "completed", {
+                "joint_name": joint_name, "target_position_rad": target,
+                "duration_s": duration_s,
+            })
             with self._lock:
                 if self._motion_stop is stop_event:
                     self._motion_stop = None
                     self._motion_thread = None
                     self._active_command = None
+
+    def _run_arm_action(self, stop_event, joint_name: str, current: float, target: float,
+                        duration_s: float, action_id: str):
+        """Prepare the vendor stack in the background, then execute the move."""
+        try:
+            prepared_before = bool(getattr(self._client, "q5_position_control_prepared", False))
+            prepare_started_at = time.monotonic()
+            self._trace(action_id, "prepare_start", cache_hit=prepared_before)
+            prepare_error = self._ensure_prepared()
+            self._trace(action_id, "prepare_end", prepare_started_at,
+                        cache_hit=prepared_before, ok=prepare_error is None)
+            if stop_event.is_set():
+                self._notify_completion(action_id, "cancelled", {"phase": "prepare"})
+                return
+            if prepare_error:
+                self._notify_completion(action_id, "error", prepare_error)
+                return
+            q5_ready, q5_status = q5_is_control_ready(self._client)
+            if not q5_ready or q5_status.get("state") != 4:
+                self._notify_completion(action_id, "error", _arm_failure(
+                    "Q5_FSM_NOT_ACTIVE",
+                    "Q5 must be fresh and ACTIVE after position-control preparation",
+                    q5_fsm=q5_status,
+                ))
+                return
+            if stop_event.is_set():
+                self._notify_completion(action_id, "cancelled", {"phase": "prepare"})
+                return
+            if not self._router.acquire(ARM_CARD):
+                self._notify_completion(action_id, "error", _arm_failure(
+                    "COMMAND_IN_PROGRESS",
+                    "Another Q5 body card currently owns the command publisher",
+                    status=self._router.status(),
+                ))
+                return
+            self._trace(action_id, "router_acquired")
+            with self._lock:
+                active = self._active_command
+                if active is not None and active.get("action_id") == action_id:
+                    active["state"] = "moving"
+                    active["prepare"] = "completed"
+            if stop_event.is_set():
+                self._router.release(ARM_CARD)
+                self._trace(action_id, "router_released_before_motion")
+                self._notify_completion(action_id, "cancelled", {"phase": "before_motion"})
+                return
+            self._run_move(stop_event, joint_name, current, target, duration_s, action_id)
+        except Exception as exc:
+            # Keep an unexpected preparation/transition failure asynchronous too.
+            self._router.release(ARM_CARD)
+            self._trace(action_id, "unexpected_exception", error=repr(exc))
+            self._notify_completion(action_id, "error", _arm_failure(
+                "ARM_ACTION_FAILED", "Q5 arm action failed", error=str(exc)
+            ))
+        finally:
+            with self._lock:
+                if self._motion_stop is stop_event:
+                    self._motion_stop = None
+                    self._motion_thread = None
+                    self._active_command = None
+            self._trace(action_id, "worker_cleanup")
 
     def _stop(self, reason: str) -> dict:
         with self._lock:
@@ -361,29 +481,10 @@ class ArmControlPlugin:
         status = self._safety()
         if not status["ros_publisher_available"]:
             return _arm_failure("ROS_UNAVAILABLE", "Q5 arm command publisher is unavailable", status=status)
-        if status["same_name_publisher_count"] > 1:
-            return _arm_failure(
-                "DUPLICATE_BODY_PUBLISHER",
-                "Refusing arm motion: multiple q5_body_command publishers are active on /wr1_controller/commands",
-                status=status,
-            )
-        # Head control uses this same body router and works alongside the
-        # vendor MPC endpoint. ROS graph discovery only proves an endpoint
-        # exists, not that it is actively emitting commands, so report it in
-        # `info` but do not reject a bounded single-joint interpolation here.
-        if not bool(getattr(self._client, "q5_position_control_prepared", False)):
-            return _arm_failure(
-                "DIRECT_CONTROL_NOT_PREPARED",
-                "Run q5_control_mode action=prepare_position_control first; vendor position-control sequence has not completed in this driver session",
-                status=status,
-            )
-        # Direct HybridJointCommand control is owned by the vendor body
-        # controller after arm_control preparation completes. motion_manager is a
-        # separate lifecycle node and may legitimately remain inactive.
-        q5_ready, q5_status = q5_is_control_ready(self._client)
-        if not q5_ready or q5_status.get("state") != 4:
-            return _arm_failure("Q5_FSM_NOT_ACTIVE", "Q5 must remain fresh and ACTIVE after position-control preparation before arm control",
-                            status={**status, "q5_fsm": q5_status})
+        # Q5's vendor MPC stack and components in this process can expose
+        # several DDS endpoints on this topic. Endpoint count is therefore a
+        # diagnostic only, not proof of a competing driver. The shared router
+        # below enforces ownership between our body-control cards.
         snap = self._client.snapshot()
         if not snap.get("fresh"):
             return _arm_failure("JOINT_STATE_UNAVAILABLE", "Refusing arm control without fresh /joint_states")
@@ -420,6 +521,10 @@ class ArmControlPlugin:
                 active = dict(self._active_command) if self._active_command else None
             return {"ok": True, "state": "moving" if active else "idle", "active_command": active,
                     "safety": self._safety()}
+        if action == "prepare":
+            result = self._ensure_prepared()
+            return result or {"ok": True, "state": "active", "position_control_prepared": True,
+                              "prepare": "already_prepared"}
         if action not in ARM_JOINTS:
             return None
 
@@ -427,26 +532,27 @@ class ArmControlPlugin:
         if isinstance(command, dict):
             return command
         joint_name, current, target, duration_s = command
-        if not self._router.acquire(ARM_CARD):
-            return _arm_failure("COMMAND_IN_PROGRESS", "Another Q5 body card currently owns the command publisher",
-                            status=self._router.status())
+        action_id = str(args.get("action_id") or f"arm_control_{joint_name}_{int(time.time() * 1000)}")
         with self._lock:
             if self._motion_thread is not None and self._motion_thread.is_alive():
-                self._router.release(ARM_CARD)
                 return _arm_failure("MOTION_IN_PROGRESS", "An arm movement is already active; call stop before another move")
             stop_event = threading.Event()
             self._motion_stop = stop_event
             self._active_command = {
+                "action_id": action_id, "state": "queued", "prepare": "pending",
                 "joint_name": joint_name, "start_position_rad": current,
                 "target_position_rad": target, "duration_s": duration_s,
                 "started_at_ms": int(time.time() * 1000),
             }
+            queued_command = dict(self._active_command)
             self._motion_thread = threading.Thread(
-                target=self._run_move,
-                args=(stop_event, joint_name, current, target, duration_s),
+                target=self._run_arm_action,
+                args=(stop_event, joint_name, current, target, duration_s, action_id),
                 daemon=True,
                 name="q5_arm_control",
             )
+            self._trace(action_id, "queued", joint_name=joint_name, target_rad=target,
+                        duration_s=duration_s)
             self._motion_thread.start()
-        return {"ok": True, "state": "moving", "command": dict(self._active_command),
-                "stops_by_holding_current_position": True}
+        return {"ok": True, "state": "queued", "prepare": "pending", "command": queued_command,
+                "stops_by_holding_current_position": True, "action_id": action_id}

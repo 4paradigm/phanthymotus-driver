@@ -353,11 +353,6 @@ class Plugin:
         if not status["ros_publisher_available"]:
             return _failure("ROS_UNAVAILABLE", "Q5 arm command publisher is unavailable", status=status)
 
-        if status.get("same_name_publisher_count", 0) > 1:
-            return _failure("DUPLICATE_BODY_PUBLISHER",
-                            "Multiple q5_body_command publishers detected on /wr1_controller/commands",
-                            status=status)
-
         if status["lifecycle_state"] != "active":
             return _failure("LIFECYCLE_NOT_ACTIVE", "Q5 motion_manager must be active", status=status)
 
@@ -366,15 +361,12 @@ class Plugin:
             return _failure("Q5_FSM_NOT_READY", "Q5 /xbot_state must be fresh and READY or ACTIVE",
                             status={**status, "q5_fsm": q5_fsm})
 
-        # Check position-control preparation (same gate as arm_control).
+        # Share arm_control's private preparation path; preparation is no
+        # longer exposed as a separate card.
         if self._arm_control is not None:
-            arm_ctrl_prep = self._arm_control._client.q5_position_control_prepared
-            if not arm_ctrl_prep:
-                return _failure(
-                    "DIRECT_CONTROL_NOT_PREPARED",
-                    "Run q5_control_mode action=prepare_position_control first",
-                    status=status,
-                )
+            prepare_error = self._arm_control._ensure_prepared()
+            if prepare_error:
+                return {**prepare_error, "status": status}
 
         if not status["joint_state_fresh"]:
             return _failure("JOINT_STATE_UNAVAILABLE", "Refusing gesture without fresh /joint_states",

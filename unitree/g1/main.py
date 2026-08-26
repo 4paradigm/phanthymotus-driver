@@ -14,7 +14,18 @@ MCP 工具命名规则：直接使用 tool name（mic, tts, led, loco, loco_stat
     CONFIG_PATH — config.yaml 路径（默认同目录下）
 """
 
+
+
 from __future__ import annotations
+
+# Make every log line one atomic, control-character-free write, so concurrent
+# writers cannot tear a Docker log record. Must run before anything prints.
+try:
+    from common import logsafe
+    logsafe.install()
+except ImportError as _e:  # running outside the container image
+    import sys as _sys
+    _sys.stderr.write(f"[bundle] logsafe unavailable ({_e}); stdout unprotected\n")
 
 import json
 import os
@@ -232,7 +243,11 @@ def make_handler():
             msg = fmt % args
             if '"POST /mcp' in msg and '200' in msg:
                 return
-            print(f"[mcp] {self.address_string()} {msg}")
+            # Escape and cap: msg embeds the raw request line, which on host
+            # networking is remote-controlled bytes going straight into the
+            # Docker log framer (log injection / control-byte corruption).
+            safe = msg.encode("unicode_escape").decode("ascii")[:200]
+            print(f"[mcp] {self.address_string()} {safe}")
 
         def _send(self, status: int, body: str):
             encoded = body.encode()
@@ -359,13 +374,12 @@ def main():
     ChannelFactoryInitialize(0, network_iface)
     print(f"[bundle] DDS initialized on interface: {network_iface}")
 
-    # Suppress C++ layer stdout (ClientStub recv/future logs) while keeping Python print working.
-    # C++ writes to fd 1 directly; we redirect fd 1 to /dev/null and give Python a dup of the original.
-    _orig_fd = os.dup(1)
-    _devnull = os.open(os.devnull, os.O_WRONLY)
-    os.dup2(_devnull, 1)
-    os.close(_devnull)
-    sys.stdout = os.fdopen(_orig_fd, 'w', buffering=1)
+    # NOTE: a fd-1 -> /dev/null shuffle used to live here to "suppress C++ layer
+    # stdout". The noise was actually Python `print()` in the vendored SDK, and
+    # the shuffle broke the "fd 1 is the docker log" invariant: two buffered
+    # writers on one pipe (non-atomic above PIPE_BUF -> torn log records) and
+    # every spawned subprocess silently lost stdout. SDK prints are now gated at
+    # source (UNITREE_RPC_DEBUG), so no redirection is needed.
 
     # AudioClient (shared by tts + led)
     audio_client = AudioClient()
