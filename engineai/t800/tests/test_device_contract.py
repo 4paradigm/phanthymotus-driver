@@ -1002,6 +1002,26 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual(7, state["request_id"])
         self.assertEqual(JointMotionPlanState.IDLE, state["status"])
 
+    def test_joint_plan_runs_abort_check_outside_state_lock(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+
+        def abort_check():
+            acquired = threading.Event()
+
+            def acquire_state_lock():
+                with plan._state_lock:
+                    acquired.set()
+
+            contender = threading.Thread(target=acquire_state_lock, daemon=True)
+            contender.start()
+            self.assertTrue(acquired.wait(0.2), "abort_check ran under planner state lock")
+            contender.join(timeout=0.2)
+            return "motion_state_changed:test"
+
+        with self.assertRaisesRegex(RuntimeError, "motion_state_changed:test"):
+            plan.wait_for_request(7, 0.5, threading.Event(), abort_check=abort_check)
+
     def test_joint_override_force_path_and_release(self):
         plugin = self.device.JointOverridePlugin(CONFIG, "robot", self.ros, self.state)
         plugin.start()
