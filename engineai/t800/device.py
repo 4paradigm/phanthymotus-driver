@@ -3297,6 +3297,13 @@ class ArmSwingPlugin:
             return {"error": "duration must be finite and between 0.5 and 5.0 seconds"}
         self._halt_swing(action)
         with self._lock:
+            previous_thread = self._thread
+            if previous_thread is not None and previous_thread.is_alive():
+                return {
+                    "error": "previous arm_swing action is still stopping; retry",
+                    "state": "stopping",
+                    "action_id": self._action_id,
+                }
             motion, available = self._state.current_motion()
             if motion != "lower_body_balance":
                 return {
