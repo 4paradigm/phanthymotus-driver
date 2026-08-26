@@ -18,6 +18,9 @@ plugins:
   hand_state:
     enabled: true
     publish_rate_hz: 10
+    # Continue publishing the last sample, but mark it stale after this delay
+    # if rt/handstate stops delivering feedback.
+    stale_timeout_sec: 1.0
   loco:
     enabled: true
   camera:

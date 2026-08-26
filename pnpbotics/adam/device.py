@@ -155,7 +155,7 @@ def _coerce_hand_positions(values, *, limit: int, expected: int = HAND_POSITION_
     return result
 
 
-def _hand_state_payload(position, received_at_ms: int) -> dict:
+def _hand_state_payload(position, received_at_ms: int, *, fresh: bool) -> dict:
     """Convert HandState_ into the JSON payload published by hand_state."""
     try:
         positions = [int(value) for value in list(position)[:HAND_POSITION_COUNT]]
@@ -174,11 +174,12 @@ def _hand_state_payload(position, received_at_ms: int) -> dict:
         }
 
     now_ms = int(time.time() * 1000)
+    age_ms = max(0, now_ms - int(received_at_ms))
     return {
         "timestamp_ms": now_ms,
         "received_at_ms": int(received_at_ms),
-        "age_ms": max(0, now_ms - int(received_at_ms)),
-        "fresh": True,
+        "age_ms": age_ms,
+        "fresh": bool(fresh),
         "position": positions,
         "left": side(positions[:6]),
         "right": side(positions[6:12]),
@@ -298,9 +299,10 @@ class _StatePublisherNode(Node):
 class _HandStatePublisherNode(Node):
     """ROS2 JSON publisher for the DDS rt/handstate snapshot."""
 
-    def __init__(self, namespace: str, publish_rate_hz: float):
+    def __init__(self, namespace: str, publish_rate_hz: float, stale_timeout_sec: float):
         super().__init__("adam_hand_state_publisher")
         self._topic = f"/{namespace}/state/hand"
+        self._stale_timeout_sec = stale_timeout_sec
         qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
@@ -309,6 +311,7 @@ class _HandStatePublisherNode(Node):
         self._pub = self.create_publisher(String, self._topic, qos)
         self._latest_position = None
         self._received_at_ms = 0
+        self._received_monotonic = None
         self._lock = threading.Lock()
         self._timer = self.create_timer(1.0 / publish_rate_hz, self._publish)
 
@@ -316,14 +319,20 @@ class _HandStatePublisherNode(Node):
         with self._lock:
             self._latest_position = list(position)
             self._received_at_ms = int(received_at_ms)
+            self._received_monotonic = time.monotonic()
 
     def snapshot(self) -> dict | None:
         with self._lock:
             position = self._latest_position
             received_at_ms = self._received_at_ms
+            received_monotonic = self._received_monotonic
         if position is None:
             return None
-        return _hand_state_payload(position, received_at_ms)
+        fresh = (
+            received_monotonic is not None
+            and time.monotonic() - received_monotonic <= self._stale_timeout_sec
+        )
+        return _hand_state_payload(position, received_at_ms, fresh=fresh)
 
     def _publish(self):
         payload = self.snapshot()
@@ -437,11 +446,17 @@ class HandStatePlugin:
         rate = float(plugin_config.get("publish_rate_hz", 10))
         if rate <= 0:
             rate = 10.0
+        try:
+            stale_timeout_sec = float(plugin_config.get("stale_timeout_sec", 1.0))
+        except (TypeError, ValueError):
+            stale_timeout_sec = 1.0
+        if not math.isfinite(stale_timeout_sec) or stale_timeout_sec <= 0:
+            stale_timeout_sec = 1.0
         self._topic = f"/{namespace}/state/hand"
         self._handstate_sub = dds_handstate_sub
         self._running = False
         self._stop_event = threading.Event()
-        self._node = _HandStatePublisherNode(namespace, rate)
+        self._node = _HandStatePublisherNode(namespace, rate, stale_timeout_sec)
         executor.add_node(self._node)
         self._poll_thread = None
 
