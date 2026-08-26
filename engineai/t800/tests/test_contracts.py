@@ -274,6 +274,58 @@ class McpHttpContractTests(unittest.TestCase):
         self.assertEqual((0,) * 12, released[2:14])
         self.assertEqual("tail_stop", events[1][0])
 
+    def test_bundle_blocks_new_motion_while_interrupt_is_settling(self):
+        class MotionPlugin:
+            def __init__(self):
+                self.calls = []
+
+            def get_tool(self):
+                return {
+                    "name": "gesture",
+                    "type": "actuator",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"action": {"type": "string"}},
+                        "x-hooks": {
+                            "on_interrupt_motion": {"action": "stop_gesture"},
+                        },
+                    },
+                }
+
+            def dispatch(self, action, args):
+                self.calls.append((action, dict(args)))
+                return {"state": "called"}
+
+        class InterruptGroup:
+            def blocking_outputs(self):
+                return ["motion_recorder"]
+
+        plugin = MotionPlugin()
+        bundle = self.module.T800DeviceBundle.__new__(self.module.T800DeviceBundle)
+        bundle._active_plugins = [plugin]
+        bundle._motion_events = None
+        bundle._motion_interrupt_group = InterruptGroup()
+        self.assertTrue(
+            {"loco", "gait", "gesture", "motion_recorder"}.issubset(
+                bundle._MOTION_OUTPUT_TOOLS
+            )
+        )
+
+        blocked = bundle.dispatch("gesture", {"action": "sequence"})
+        self.assertIn("active or still settling", blocked["error"])
+        self.assertEqual(["motion_recorder"], blocked["blocking_outputs"])
+        self.assertEqual([], plugin.calls)
+
+        blocked_reset = bundle.dispatch(
+            "gesture", {"action": "stop", "reset_after": True}
+        )
+        self.assertIn("active or still settling", blocked_reset["error"])
+        self.assertEqual([], plugin.calls)
+
+        stopped = bundle.dispatch("gesture", {"action": "stop_gesture"})
+        self.assertEqual("called", stopped["state"])
+        self.assertEqual("stop_gesture", plugin.calls[-1][0])
+
 
 class VendoredContractTests(unittest.TestCase):
     def test_urdf_contains_every_driver_joint_name(self):

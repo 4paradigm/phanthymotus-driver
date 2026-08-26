@@ -956,6 +956,10 @@ class DevicePluginContractTests(unittest.TestCase):
         schema = gesture.get_tool()["inputSchema"]
         self.assertEqual(["play", "sequence"], schema["x-completion"]["actions"])
         self.assertGreaterEqual(schema["x-completion"]["timeout"], 60)
+        self.assertEqual(
+            {"on_interrupt_motion": {"action": "stop_gesture"}},
+            schema["x-hooks"],
+        )
         actions = set(schema["properties"]["action"]["enum"])
         self.assertTrue({"start", "info", "stop"}.issubset(actions))
         action_params = schema["x-action-params"]
@@ -1112,8 +1116,15 @@ class DevicePluginContractTests(unittest.TestCase):
         })
         self.assertIn("already running", busy["error"])
         self.assertNotIn("action_id", busy)
+        stop_started = time.monotonic()
         stopped = gesture.dispatch("stop_gesture", {})
+        stop_elapsed = time.monotonic() - stop_started
         self.assertEqual("cancelled", stopped["state"])
+        self.assertLess(stop_elapsed, 0.02)
+        self.assertEqual(
+            JointMotionPlanRequest.REQUEST_CANCEL,
+            plan._publisher.messages[-1].request_type,
+        )
         release_wait.set()
         gesture._thread.join(timeout=1.0)
 
@@ -1121,6 +1132,80 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual(result["action_id"], completions[0][0])
         self.assertEqual("cancelled", completions[0][1])
         self.assertEqual({"state": "idle"}, gesture.dispatch("stop", {}))
+        message_count = len(plan._publisher.messages)
+        ignored_reset = gesture.dispatch("stop", {"reset_after": True})
+        self.assertTrue(ignored_reset["reset_after_ignored"])
+        self.assertEqual(message_count, len(plan._publisher.messages))
+
+    def test_gesture_cancel_transport_failure_stays_gated_until_retry(self):
+        class FlakyJointPlan:
+            def __init__(self):
+                self.fail_cancel = True
+                self.cancel_attempts = 0
+                self.entered_wait = threading.Event()
+                self.release_wait = threading.Event()
+                self.status = {"request_id": 41, "status": 2, "progress": 0.4}
+
+            def current_motion(self):
+                return "lower_body_balance", []
+
+            def wait_until_idle(self, *_args, **_kwargs):
+                return {}
+
+            def wait_for_request(self, *_args, **_kwargs):
+                self.entered_wait.set()
+                self.release_wait.wait(timeout=1.0)
+                return {}
+
+            def dispatch(self, action, _args):
+                if action in ("plan", "plan_named"):
+                    return {"state": "requested", "request_id": 41}
+                if action == "cancel":
+                    self.cancel_attempts += 1
+                    if self.fail_cancel:
+                        raise RuntimeError("gesture cancel publish failed")
+                    return {"state": "requested", "request_id": 41}
+                if action == "status":
+                    return dict(self.status)
+                return {"error": f"unexpected action: {action}"}
+
+        plan = FlakyJointPlan()
+        gesture = self.device.GesturePlugin(plan)
+        gesture._acp_notify = lambda *_args: None
+        interrupt_group = self.device.MotionInterruptGroup()
+        interrupt_group.register("gesture", gesture.halt, gesture.motion_active)
+        gesture.set_interrupt_group(interrupt_group)
+        gesture.dispatch("sequence", {
+            "steps": [{
+                "joint_indices": [23],
+                "target_positions": [0.1],
+                "duration": 0.05,
+            }],
+            "reset_after": False,
+            "force": True,
+        })
+        self.assertTrue(plan.entered_wait.wait(timeout=1.0))
+
+        stopped = gesture.dispatch("stop_gesture", {})
+        self.assertIn("gesture cancel publish failed", str(stopped))
+        plan.release_wait.set()
+        gesture._thread.join(timeout=1.0)
+        self.assertTrue(gesture.dispatch("status", {})["cancel_failed"])
+        self.assertEqual(["gesture"], interrupt_group.blocking_outputs())
+
+        plan.fail_cancel = False
+        retried = gesture.dispatch("stop_gesture", {})
+        self.assertEqual("", retried["error"])
+        self.assertNotIn("error", retried["cancel_result"])
+        self.assertEqual(2, plan.cancel_attempts)
+        self.assertTrue(gesture.dispatch("status", {})["cancel_pending"])
+        plan.status = {"request_id": 41, "status": 1, "progress": 1.0}
+        deadline = time.monotonic() + 1.0
+        while gesture.dispatch("status", {})["cancel_pending"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(gesture.dispatch("status", {})["cancel_failed"])
+        self.assertFalse(gesture.dispatch("status", {})["cancel_pending"])
+        self.assertEqual([], interrupt_group.blocking_outputs())
 
     def test_gesture_async_error_reports_acp(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
