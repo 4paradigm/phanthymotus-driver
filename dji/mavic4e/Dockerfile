@@ -34,6 +34,7 @@ RUN mkdir -p /work/psdk_bridge/build && \
     cp startup_bulk /usr/local/bin/startup_bulk
 
 # ── Application code (changes frequently) ──────────────────────────
+COPY common/ /work/common/
 COPY main.py         /work/main.py
 COPY device.py       /work/device.py
 COPY bridge_client.py /work/bridge_client.py

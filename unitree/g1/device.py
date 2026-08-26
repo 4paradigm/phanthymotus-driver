@@ -632,6 +632,13 @@ def _speaker_process(network_iface: str, namespace: str, plugin_config: dict,
     Owns an independent AudioClient whose PlayStream RPC is not blocked by
     the main process's lidar/SLAM DDS traffic.
     """
+    # Spawned child: fresh interpreter, does not inherit the parent's sys.stdout.
+    try:
+        from common import logsafe
+        logsafe.install(check_fd=False)
+    except ImportError:
+        pass
+
     import os as _os
     import sys as _sys
     _os.setsid()
@@ -640,12 +647,9 @@ def _speaker_process(network_iface: str, namespace: str, plugin_config: dict,
         from unitree_sdk2py.core.channel import ChannelFactoryInitialize
         ChannelFactoryInitialize(0, network_iface)
 
-        # Suppress C++ stdout
-        _orig_fd = _os.dup(1)
-        _devnull = _os.open(_os.devnull, _os.O_WRONLY)
-        _os.dup2(_devnull, 1)
-        _os.close(_devnull)
-        _sys.stdout = _os.fdopen(_orig_fd, 'w', buffering=1)
+        # NOTE: a fd-1 -> /dev/null shuffle used to live here. Removed: it made this
+        # subprocess a second unsynchronised writer on the parent's log pipe, which
+        # is how torn records were produced. SDK prints are gated at source now.
 
         audio_client = AudioClient()
         audio_client.SetTimeout(10.0)
