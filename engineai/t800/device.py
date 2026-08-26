@@ -2317,8 +2317,15 @@ class JointPlanPlugin:
             return self._publish_request("cancel", args)
         with self._owner_lock:
             active_owner = self._owner
-        if active_owner is not None and owner != active_owner:
-            return {"error": f"joint planner is owned by {active_owner}"}
+            if active_owner is not None and owner != active_owner:
+                return {"error": f"joint planner is owned by {active_owner}"}
+            # Keep arbitration and publication in the same critical section.
+            # Otherwise an owner can be acquired after this check but before a
+            # public request is allocated and published.
+            return self._dispatch_exclusive(action, args)
+
+    def _dispatch_exclusive(self, action: str, args: dict) -> dict:
+        """Publish a non-cancel request while the ownership lock is held."""
         if action == "reset":
             return self._publish_request("reset", args)
         if action == "preset":
@@ -3073,8 +3080,16 @@ class ArmSwingPlugin:
     _OWNER = "arm_swing"
     _INDICES = [13, 16, 18, 21]
     _BASE = [0.028, -0.066, 0.024, -0.069]
-    _ACP_TIMEOUT_SEC = 86400.0
+    _MAX_NEUTRAL_DURATION_SEC = 5.0
+    _NEUTRAL_WAIT_MARGIN_SEC = 3.0
     _ACP_CALLBACK_TIMEOUT_SEC = 5.0
+    _ACP_SAFETY_MARGIN_SEC = 2.0
+    _ACP_TIMEOUT_SEC = (
+        _MAX_NEUTRAL_DURATION_SEC
+        + _NEUTRAL_WAIT_MARGIN_SEC
+        + _ACP_CALLBACK_TIMEOUT_SEC
+        + _ACP_SAFETY_MARGIN_SEC
+    )
 
     def __init__(self, config: dict, joint_plan: JointPlanPlugin, state: StatePlugin):
         cfg = config.get("plugins", {}).get("arm_swing", {})
@@ -3296,7 +3311,7 @@ class ArmSwingPlugin:
             duration = float(args.get("duration", 1.5))
         except (TypeError, ValueError) as exc:
             return {"error": str(exc)}
-        if not math.isfinite(duration) or not 0.5 <= duration <= 5.0:
+        if not math.isfinite(duration) or not 0.5 <= duration <= self._MAX_NEUTRAL_DURATION_SEC:
             return {"error": "duration must be finite and between 0.5 and 5.0 seconds"}
         self._halt_swing(action)
         with self._lock:
@@ -3361,7 +3376,7 @@ class ArmSwingPlugin:
                 self._publish_count += 1
             self._joint_plan.wait_for_request(
                 request_id,
-                max(5.0, duration + 3.0),
+                max(5.0, duration + self._NEUTRAL_WAIT_MARGIN_SEC),
                 self._halt,
                 abort_check=self._motion_state_abort_reason,
             )
