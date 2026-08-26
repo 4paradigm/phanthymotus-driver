@@ -3113,12 +3113,6 @@ class ArmSwingPlugin:
                 "持续摆臂动作",
             ),
         }
-        tool["inputSchema"]["x-completion"] = {
-            # start_swing is continuous and must not hold Agent Core's ACP
-            # actuator barrier; halt and runtime updates need to remain callable.
-            "actions": ["return_neutral", "halt_and_return"],
-            "timeout": int(self._ACP_TIMEOUT_SEC),
-        }
         return tool
 
     def start(self) -> None:

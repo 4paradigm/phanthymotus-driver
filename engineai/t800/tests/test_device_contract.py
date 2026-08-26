@@ -1039,14 +1039,9 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertIn("lower_body_balance", swing.dispatch("start_swing", {})["error"])
         self.state._current_motion = "lower_body_balance"
         self.assertIn("between 2 and 30", swing.dispatch("start_swing", {"amplitude_deg": 31})["error"])
-        actions = swing.get_tool()["inputSchema"]["properties"]["action"]["enum"]
-        completion = swing.get_tool()["inputSchema"]["x-completion"]
-        self.assertEqual(
-            ["return_neutral", "halt_and_return"],
-            completion["actions"],
-        )
-        self.assertNotIn("start_swing", completion["actions"])
-        self.assertGreater(completion["timeout"], 3)
+        schema = swing.get_tool()["inputSchema"]
+        actions = schema["properties"]["action"]["enum"]
+        self.assertNotIn("x-completion", schema)
         self.assertTrue({"start", "info", "stop"}.issubset(actions))
         self.assertNotIn("set_parameters", actions)
         self.assertIn("return_neutral", actions)
