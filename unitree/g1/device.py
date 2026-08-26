@@ -4114,6 +4114,7 @@ def run_realsense_process(
         def start_capture(self):
             if self._pipeline is not None:
                 return
+            pipeline = None
             try:
                 ctx = rs.context()
                 devs = ctx.query_devices()
@@ -4144,10 +4145,11 @@ def run_realsense_process(
                     f"RealSense capture started — device {self._serial}"
                 )
             except Exception as exc:
-                try:
-                    pipeline.stop()
-                except Exception:
-                    pass
+                if pipeline is not None:
+                    try:
+                        pipeline.stop()
+                    except Exception:
+                        pass
                 self._pipeline = None
                 self._publish_status("not_ready", exc, force=True)
                 self.get_logger().warn(f"RealSense start failed; will retry: {exc}")

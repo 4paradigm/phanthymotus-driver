@@ -284,6 +284,8 @@ class DriverCameraContractTest(unittest.TestCase):
         )
         self.assertNotIn("self._clock = self._new_clock_normalizer()", source)
         self.assertIn('self._sequence = {"rgb": 0, "depth": 0}', start_capture)
+        self.assertIn("pipeline = None", start_capture)
+        self.assertIn("if pipeline is not None:", start_capture)
         self.assertIn("self.stop_capture(reconnecting=True)", start_capture)
 
     def test_camera_worker_installs_logsafe_compresses_depth_and_samples_errors(self):
