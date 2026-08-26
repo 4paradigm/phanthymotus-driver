@@ -442,6 +442,8 @@ class _NavigationSensorMonitorNode(Node):
         prefix = f"/{namespace}/navigation"
         self.cloud_topic = _absolute_topic(config.get("cloud_topic"), f"{prefix}/lidar")
         self.imu_topic = _absolute_topic(config.get("imu_topic"), f"{prefix}/imu")
+        self.lidar_frame = config.get("lidar_frame", "livox_frame")
+        self.imu_frame = config.get("imu_frame", self.lidar_frame)
         self._status_topic = f"{prefix}/_bridge_status"
         self._lock = threading.RLock()
         self._last_status = None
@@ -516,7 +518,7 @@ class NavigationSensorPlugin:
                 "sensor/pointcloud",
                 "sensor_msgs/msg/PointCloud2",
                 "RELIABLE + KEEP_LAST(depth=2) + VOLATILE",
-                "livox_frame",
+                self._status_node.lidar_frame,
             ),
             self._tool(
                 "navigation_imu",
@@ -525,7 +527,7 @@ class NavigationSensorPlugin:
                 "sensor/imu",
                 "sensor_msgs/msg/Imu",
                 "RELIABLE + KEEP_LAST(depth=200) + VOLATILE",
-                "livox_frame",
+                self._status_node.imu_frame,
             ),
         ]
 
@@ -607,11 +609,16 @@ class NavigationSensorPlugin:
             tool_name = args.get("_tool_name", "")
             tools = {tool["name"]: tool for tool in self.get_tools()}
             selected = tools.get(tool_name, tools["navigation_lidar"])
-            status = self._status_node.status(self._worker_running())
+            worker_running = self._worker_running()
+            status = self._status_node.status(worker_running)
+            if action == "start":
+                state = "running" if worker_running else "error"
+            else:
+                state = "ready" if status["ready"] else "not_ready"
             return {
-                "state": "ready" if status["ready"] else "not_ready",
+                "state": state,
                 "topic_out": selected["topic_out"],
-                "worker_pid": self._proc.pid if self._worker_running() else None,
+                "worker_pid": self._proc.pid if worker_running else None,
                 **status,
             }
         if action == "stop":

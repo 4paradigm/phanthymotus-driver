@@ -100,7 +100,7 @@ class NavigationSensorCardContractTest(unittest.TestCase):
             '"sensor_msgs/msg/Imu"',
             '"RELIABLE + KEEP_LAST(depth=2) + VOLATILE"',
             '"RELIABLE + KEEP_LAST(depth=200) + VOLATILE"',
-            '"state": "ready" if status["ready"] else "not_ready"',
+            'state = "running" if worker_running else "error"',
             'blockers.append("clock_not_ready")',
             'blockers.append("cloud_stale")',
             'blockers.append("imu_stale")',
@@ -117,6 +117,8 @@ class NavigationSensorCardContractTest(unittest.TestCase):
         plugin._status_node = types.SimpleNamespace(
             cloud_topic="/ubuntu/navigation/lidar",
             imu_topic="/ubuntu/navigation/imu",
+            lidar_frame="custom_lidar_frame",
+            imu_frame="custom_imu_frame",
             status=lambda worker_running: {
                 "ready": False,
                 "blockers": ["clock_not_ready"],
@@ -134,13 +136,34 @@ class NavigationSensorCardContractTest(unittest.TestCase):
         self.assertEqual(lidar["format"], "sensor/pointcloud")
         self.assertEqual(lidar["ros_type"], "sensor_msgs/msg/PointCloud2")
         self.assertEqual(lidar["qos"], "RELIABLE + KEEP_LAST(depth=2) + VOLATILE")
+        self.assertEqual(lidar["frame_id"], "custom_lidar_frame")
         self.assertEqual(imu["format"], "sensor/imu")
         self.assertEqual(imu["ros_type"], "sensor_msgs/msg/Imu")
         self.assertEqual(imu["qos"], "RELIABLE + KEEP_LAST(depth=200) + VOLATILE")
+        self.assertEqual(imu["frame_id"], "custom_imu_frame")
 
         info = plugin.dispatch("info", {"_tool_name": "navigation_lidar"})
         self.assertEqual(info["state"], "not_ready")
         self.assertEqual(info["blockers"], ["clock_not_ready"])
+
+    def test_monitor_preserves_configured_sensor_frames(self):
+        module = self.load_bridge_module()
+        with mock.patch.object(module.Node, "__init__", return_value=None), mock.patch.object(
+            module.Node,
+            "create_subscription",
+            return_value=object(),
+            create=True,
+        ):
+            monitor = module._NavigationSensorMonitorNode(
+                {
+                    "lidar_frame": "configured_lidar_frame",
+                    "imu_frame": "configured_imu_frame",
+                },
+                "ubuntu",
+            )
+
+        self.assertEqual(monitor.lidar_frame, "configured_lidar_frame")
+        self.assertEqual(monitor.imu_frame, "configured_imu_frame")
 
     def test_driver_image_contains_the_sensor_card_runtime(self):
         dockerfile = (G1_DIR / "Dockerfile").read_text()
@@ -206,7 +229,12 @@ class NavigationSensorCardContractTest(unittest.TestCase):
                 plugin._status_node = types.SimpleNamespace(
                     cloud_topic="/ubuntu/navigation/lidar",
                     imu_topic="/ubuntu/navigation/imu",
-                    status=lambda running: {"ready": running},
+                    lidar_frame="livox_frame",
+                    imu_frame="livox_frame",
+                    status=lambda running: {
+                        "ready": False,
+                        "blockers": ["clock_not_ready"],
+                    },
                 )
                 first = mock.Mock(pid=1001)
                 second = mock.Mock(pid=1002)
@@ -235,7 +263,9 @@ class NavigationSensorCardContractTest(unittest.TestCase):
                 first.terminate.assert_called_once_with()
                 first.wait.assert_called_once_with(timeout=5.0)
                 self.assertEqual(popen.call_count, 2)
-                self.assertEqual(restarted["state"], "ready")
+                self.assertEqual(restarted["state"], "running")
+                self.assertFalse(restarted["ready"])
+                self.assertEqual(restarted["blockers"], ["clock_not_ready"])
                 self.assertEqual(restarted["worker_pid"], 1002)
 
     def test_status_monitor_fails_closed_for_dead_or_stale_worker(self):
