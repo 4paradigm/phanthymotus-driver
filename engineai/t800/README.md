@@ -69,7 +69,17 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 `gesture.play` 与旧的 `joint_plan.preset` 不同：前者执行官方示例里的完整多步
 动作（挥手包含准备、举手、5 次摆动和复位；握手包含伸手、收手和复位），
 后者保留为兼容接口，只发送单个目标姿势。`gesture.sequence` 可提交任意多步
-关节动作队列。
+关节动作队列。`stop_gesture` 注册为 `on_interrupt_motion` hook，因此即使
+`play` / `sequence` 正在等待 ACP completion，Agent Core 也会绕过 actuator
+barrier 立即下发停止请求，并由 Driver 以 `cancelled` 完成原 action id。
+Bundle 将 Gesture 与 Motion Recorder 注册到同一个设备级 interrupt group；
+任一 `on_interrupt_motion` action 都会同时请求停止两者，避免 Agent Core 清除
+全局 pending 时遗漏同一 T800 MCP 内的兄弟动作。若旧线程仍在完成最终释放，
+Bundle 会暂时拒绝新的运动输出 action；stop/status/safety 路径保持可用，待
+Gesture 与 Recorder 均静止后自动解除。Gesture 的 planner cancel 无论发布
+成功还是重试，都会保留 request-id 门禁直到 planner 反馈 `IDLE`；发布失败
+可再次调用 `stop_gesture` 重试。interrupt/stop 路径不会因
+`reset_after=true` 启动一个未纳入 ACP 的新复位动作。
 
 `virtual_gamepad` 使用 Native SDK 官方通道
 `virtual_gamepad/gamepad_keys`，默认连接 `udpm://239.255.76.67:7667?ttl=1`。
@@ -95,6 +105,14 @@ lie_down 组合键。LCM 输入会覆盖实体手柄输入，发送完成后 Dri
 异常和完成路径都会发布 `weight=0` 释放覆盖。录制或回放完成后，状态返回
 `needs_reset=true`，必须执行 `reset`：安全进入 `lower_body_balance` 并发送
 官方 `REQUEST_RESET` 默认姿态请求。规划器确认回到 `IDLE` 后才允许下一次录制。
+`stop_playback` 注册为 `on_interrupt_motion` hook；它不会被 `play` 的 ACP
+barrier 阻塞，停止时会立即设置取消事件并发布 joint override release，后台
+回放线程退出时再以 `cancelled` 完成对应的 action id。在 `reset` pending 时
+调用该 interrupt action 也会向 joint planner 发送 cancel，并保持 settling
+直到 planner 反馈 `IDLE`；cancel 超时或 joint override release 发布失败时均
+保持 fail-closed 门禁，可通过 status 查看并重试 stop，避免 Agent Core 清除
+全局 pending 后实体动作仍继续运行。同一次设备级 interrupt 也会取消仍在
+执行的 Gesture。
 
 `pointcloud`、`camera`、`depth` 桥接 T800-Odin2 激光雷达相机（飞书文档
 7.2 节）在 Orin 主板上发布的 `odin_ros_driver` topic。点云按

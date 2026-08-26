@@ -103,6 +103,17 @@ class DualDomainROS2:
 
 
 class T800DeviceBundle:
+    _MOTION_OUTPUT_TOOLS = frozenset({
+        "loco", "motion_mode", "dance", "joint_plan", "gesture",
+        "joint_override", "joint_bridge", "virtual_gamepad", "gait",
+        "motion_recorder",
+    })
+    _SAFE_WHILE_MOTION_SETTLING = frozenset({
+        "start", "stop", "info", "status", "list", "stop_move",
+        "stop_dance", "stop_gesture", "stop_playback", "cancel",
+        "release", "stop_command", "record_stop",
+    })
+
     def __init__(self, config: dict, namespace: str, ros2: DualDomainROS2):
         from device import (
             DancePlugin,
@@ -117,6 +128,7 @@ class T800DeviceBundle:
             ControlledSpatialPlugin,
             MotionCommandTracePlugin,
             MotionEventsPlugin,
+            MotionInterruptGroup,
             MotionRecorderPlugin,
             MicPlugin,
             MotionModePlugin,
@@ -137,6 +149,8 @@ class T800DeviceBundle:
         self._startup_errors: dict[str, str] = {}
         self._started = False
         plugins = config.get("plugins", {})
+        motion_interrupt_group = MotionInterruptGroup()
+        self._motion_interrupt_group = motion_interrupt_group
 
         motion_events = None
         if plugins.get("motion_events", {}).get("enabled", False):
@@ -186,6 +200,10 @@ class T800DeviceBundle:
 
         if plugins.get("gesture", {}).get("enabled", True) and "joint_plan" in instances:
             instance = GesturePlugin(instances["joint_plan"])
+            instance.set_interrupt_group(motion_interrupt_group)
+            motion_interrupt_group.register(
+                "gesture", instance.halt, instance.motion_active
+            )
             instances["gesture"] = instance
             self._plugins.append(instance)
 
@@ -207,6 +225,12 @@ class T800DeviceBundle:
             if "joint_plan" in instances:
                 motion_recorder.set_joint_plan(instances["joint_plan"])
             motion_recorder.set_reset_controls(state, instances.get("motion_mode"))
+            motion_recorder.set_interrupt_group(motion_interrupt_group)
+            motion_interrupt_group.register(
+                "motion_recorder",
+                motion_recorder.interrupt_motion,
+                motion_recorder.motion_active,
+            )
 
         virtual_gamepad_config = plugins.get("virtual_gamepad", {})
         if virtual_gamepad_config.get("enabled", False):
@@ -333,6 +357,37 @@ class T800DeviceBundle:
                     return result
                 action = args.pop("action", tool_name)
                 args["_tool_name"] = tool_name
+                interrupt_group = getattr(self, "_motion_interrupt_group", None)
+                if (
+                    interrupt_group is not None
+                    and definition["type"] == "actuator"
+                    and tool_name in self._MOTION_OUTPUT_TOOLS
+                ):
+                    interrupt_actions = {
+                        binding.get("action")
+                        for hook_id, binding in definition["inputSchema"]
+                        .get("x-hooks", {}).items()
+                        if hook_id.startswith("on_interrupt")
+                    }
+                    safe_action = (
+                        action in interrupt_actions
+                        or action in self._SAFE_WHILE_MOTION_SETTLING
+                    )
+                    if (
+                        tool_name == "gesture"
+                        and action == "stop"
+                        and bool(args.get("reset_after", False))
+                    ):
+                        safe_action = False
+                    if not safe_action:
+                        blocking_outputs = interrupt_group.blocking_outputs()
+                        if blocking_outputs:
+                            return {
+                                "error": "motion output is active or still settling",
+                                "tool": tool_name,
+                                "action": action,
+                                "blocking_outputs": blocking_outputs,
+                            }
                 try:
                     result = plugin.dispatch(action, args)
                 except Exception as exc:

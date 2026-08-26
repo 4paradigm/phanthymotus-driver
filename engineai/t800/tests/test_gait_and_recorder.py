@@ -78,6 +78,57 @@ class FakeRos:
         self.executor_core = FakeExecutor()
 
 
+class AgentCoreBarrierContractHarness:
+    """Faithful model of Agent Core's device-global, serialized ACP gate."""
+
+    def __init__(self):
+        self._dispatch = {}
+        self._completion_actions = set()
+        self._interrupt_actions = set()
+        self._lock = threading.Lock()
+        self._pending: set[str] = set()
+
+    def register(self, tool: dict, dispatch) -> None:
+        schema = tool["inputSchema"]
+        tool_name = str(tool["name"])
+        self._dispatch[tool_name] = dispatch
+        self._completion_actions.update(
+            (tool_name, action)
+            for action in schema.get("x-completion", {}).get("actions", [])
+        )
+        self._interrupt_actions.update(
+            (tool_name, binding.get("action"))
+            for hook_id, binding in schema.get("x-hooks", {}).items()
+            if hook_id.startswith("on_interrupt")
+        )
+
+    def call(self, tool_name: str, action: str, args: dict) -> dict:
+        action_key = (tool_name, action)
+        with self._lock:
+            barrier_blocks = (
+                bool(self._pending)
+                and action_key not in self._interrupt_actions
+            )
+        if barrier_blocks:
+            return {
+                "state": "barrier_waiting",
+                "tool": tool_name,
+                "action": action,
+            }
+
+        result = self._dispatch[tool_name](action, args)
+        with self._lock:
+            if action_key in self._completion_actions and result.get("action_id"):
+                self._pending.add(str(result["action_id"]))
+            if action_key in self._interrupt_actions:
+                self._pending.clear()
+        return result
+
+    def pending_actions(self) -> set[str]:
+        with self._lock:
+            return set(self._pending)
+
+
 def install_ros_stubs():
     if 'rclpy.node' in sys.modules:
         return
@@ -266,6 +317,10 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
             {"actions": ["play", "reset"], "timeout": 3600},
             tool["inputSchema"]["x-completion"],
         )
+        self.assertEqual(
+            {"on_interrupt_motion": {"action": "stop_playback"}},
+            tool["inputSchema"]["x-hooks"],
+        )
 
     def test_status_returns_idle_initially(self):
         result = self.plugin.dispatch("status", {})
@@ -415,6 +470,38 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
         )
         self.assertEqual("lower_body_balance", state.current)
         self.assertIn(("reset", {}), joint_plan.calls)
+
+    def test_reset_monitor_survives_transient_status_error(self):
+        class FlakyStatusJointPlan:
+            def __init__(self):
+                self.status_calls = 0
+
+            def dispatch(self, action, _args):
+                if action == "reset":
+                    return {"state": "requested", "request_id": 55}
+                if action == "status":
+                    self.status_calls += 1
+                    if self.status_calls == 1:
+                        raise RuntimeError("temporary status transport error")
+                    return {"request_id": 55, "status": 1, "progress": 1.0}
+                return {"error": f"unexpected action: {action}"}
+
+        joint_plan = FlakyStatusJointPlan()
+        self.plugin.set_joint_plan(joint_plan)
+        resetting = self.plugin.dispatch("reset", {})
+        deadline = time.monotonic() + 1.0
+        while not any(
+            call[0] == resetting["action_id"] and call[1] == "completed"
+            for call in self.acp_calls
+        ) and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        self.assertGreaterEqual(joint_plan.status_calls, 2)
+        self.assertTrue(any(
+            call[0] == resetting["action_id"] and call[1] == "completed"
+            for call in self.acp_calls
+        ))
+        self.assertFalse(self.plugin.dispatch("status", {})["reset_pending"])
 
     def test_record_start_is_idempotent_instead_of_toggling_off(self):
         first = self.plugin.dispatch("record_start", {"label": "first"})
@@ -705,7 +792,13 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
         started = self.plugin.dispatch("play", {})
         time.sleep(0.05)
         stopped = self.plugin.dispatch("stop_playback", {})
-        self.assertEqual("stopped", stopped["state"])
+        self.assertIn(stopped["state"], ("stopped", "stopping"))
+        deadline = time.monotonic() + 1.0
+        while not any(
+            call[0] == started["action_id"] and call[1] == "cancelled"
+            for call in self.acp_calls
+        ) and time.monotonic() < deadline:
+            time.sleep(0.01)
         self.assertTrue(any(
             call[0] == started["action_id"] and call[1] == "cancelled"
             for call in self.acp_calls
@@ -717,7 +810,7 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
         )
         self.assertEqual(0.0, publisher.messages[-1].weight)
 
-    def test_new_play_waits_until_blocked_previous_worker_is_cancelled(self):
+    def test_agent_core_interrupt_bypasses_barrier_and_requests_immediate_release(self):
         current = self._make_joint_state()
         current.position = [0.0] * 25
         current.velocity = [0.0] * 25
@@ -745,29 +838,396 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
             original_publish(message)
 
         publisher.publish = block_first_override
-        first = self.plugin.dispatch("play", {})
+        interrupt_group = self.dev.MotionInterruptGroup()
+        interrupt_group.register(
+            "motion_recorder",
+            self.plugin.interrupt_motion,
+            self.plugin.motion_active,
+        )
+        self.plugin.set_interrupt_group(interrupt_group)
+        harness = AgentCoreBarrierContractHarness()
+        harness.register(self.plugin.get_tool(), self.plugin.dispatch)
+        first = harness.call("motion_recorder", "play", {})
         self.assertTrue(publish_started.wait(timeout=1.0))
+        stopped_result = {}
+        stop_finished = threading.Event()
+
+        def stop_through_agent_core():
+            stopped_result.update(
+                harness.call("motion_recorder", "stop_playback", {})
+            )
+            stop_finished.set()
+
+        stop_thread = threading.Thread(target=stop_through_agent_core, daemon=True)
+        stop_thread.start()
 
         try:
-            stopped = self.plugin.dispatch("stop_playback", {})
-            rejected = self.plugin.dispatch("play", {})
-            self.assertEqual("stopping", stopped["state"])
-            self.assertIn("previous playback is still stopping", rejected["error"])
+            returned_promptly = stop_finished.wait(timeout=0.02)
+            pending_after_stop = harness.pending_actions()
+            blocking_before_release = interrupt_group.blocking_outputs()
+            released_promptly = bool(
+                publisher.messages and publisher.messages[-1].weight == 0.0
+            )
         finally:
             release_publish.set()
+            stop_thread.join(timeout=2.0)
 
+        self.assertTrue(returned_promptly)
+        self.assertEqual(set(), pending_after_stop)
+        self.assertEqual(["motion_recorder"], blocking_before_release)
+        self.assertTrue(released_promptly)
+        self.assertEqual("stopping", stopped_result["state"])
         deadline = time.monotonic() + 1.0
-        while self.plugin.dispatch("status", {})["playing"] and time.monotonic() < deadline:
+        while not any(
+            call[0] == first["action_id"] and call[1] == "cancelled"
+            for call in self.acp_calls
+        ) and time.monotonic() < deadline:
             time.sleep(0.01)
         self.assertTrue(any(
             call[0] == first["action_id"] and call[1] == "cancelled"
             for call in self.acp_calls
         ))
+        self.assertEqual(0.0, publisher.messages[-1].weight)
+        self.assertEqual([], interrupt_group.blocking_outputs())
 
         restarted = self.plugin.dispatch("play", {})
         self.assertEqual("playing", restarted["state"])
         self.assertNotEqual(first["action_id"], restarted["action_id"])
         self.plugin.dispatch("stop_playback", {})
+
+    def test_agent_core_playback_interrupt_cancels_pending_reset(self):
+        class ResetJointPlan:
+            def __init__(self):
+                self.calls = []
+                self.status = {"request_id": 17, "status": 2, "progress": 0.2}
+
+            def dispatch(self, action, args):
+                self.calls.append((action, dict(args)))
+                if action == "reset":
+                    return {"state": "requested", "request_id": 17}
+                if action == "status":
+                    return dict(self.status)
+                if action == "cancel":
+                    return {"state": "requested", "request_id": 17}
+                return {"error": f"unexpected action: {action}"}
+
+        joint_plan = ResetJointPlan()
+        self.plugin.set_joint_plan(joint_plan)
+        self.plugin._reset_timeout_sec = 0.05
+        interrupt_group = self.dev.MotionInterruptGroup()
+        interrupt_group.register(
+            "motion_recorder",
+            self.plugin.interrupt_motion,
+            self.plugin.motion_active,
+        )
+        self.plugin.set_interrupt_group(interrupt_group)
+        harness = AgentCoreBarrierContractHarness()
+        harness.register(self.plugin.get_tool(), self.plugin.dispatch)
+
+        resetting = harness.call("motion_recorder", "reset", {})
+        self.assertEqual({resetting["action_id"]}, harness.pending_actions())
+        interrupted = harness.call("motion_recorder", "stop_playback", {})
+
+        self.assertEqual(set(), harness.pending_actions())
+        self.assertEqual(
+            ("cancel", {"request_id": resetting["request_id"]}),
+            joint_plan.calls[-1],
+        )
+        self.assertEqual("cancelling", interrupted["reset_result"]["state"])
+        status = self.plugin.dispatch("status", {})
+        self.assertTrue(status["reset_pending"])
+        self.assertEqual("cancelling", status["last_reset"]["state"])
+        self.assertEqual(["motion_recorder"], interrupt_group.blocking_outputs())
+        deadline = time.monotonic() + 0.5
+        while (
+            self.plugin.dispatch("status", {})["last_reset"]["state"]
+            != "cancel_timeout"
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        cancel_timeout = self.plugin.dispatch("status", {})
+        self.assertTrue(cancel_timeout["reset_pending"])
+        self.assertEqual("cancel_timeout", cancel_timeout["last_reset"]["state"])
+        self.assertEqual(["motion_recorder"], interrupt_group.blocking_outputs())
+        retried_cancel = self.plugin.dispatch("stop_playback", {})
+        self.assertTrue(retried_cancel["reset_result"]["cancel_retry"])
+        self.assertEqual(
+            ("cancel", {"request_id": resetting["request_id"]}),
+            joint_plan.calls[-1],
+        )
+        joint_plan.status = {"request_id": 17, "status": 1, "progress": 1.0}
+        deadline = time.monotonic() + 1.0
+        while self.plugin.dispatch("status", {})["reset_pending"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+        settled = self.plugin.dispatch("status", {})
+        self.assertFalse(settled["reset_pending"])
+        self.assertEqual("cancelled", settled["last_reset"]["state"])
+        self.assertEqual([], interrupt_group.blocking_outputs())
+        self.assertTrue(any(
+            call[0] == resetting["action_id"] and call[1] == "cancelled"
+            for call in self.acp_calls
+        ))
+
+    def test_release_failure_keeps_motion_gate_settling_until_retry_succeeds(self):
+        current = self._make_joint_state()
+        current.position = [0.0] * 25
+        current.velocity = [0.0] * 25
+        self.plugin._on_joint_state(current)
+        self.plugin._frames = [
+            {"timestamp": 0, "positions": [0.0] * 25, "velocities": [0.0] * 25},
+            {"timestamp": 2000, "positions": [0.5] * 25, "velocities": [0.0] * 25},
+        ]
+        publisher = next(
+            publisher
+            for publisher in self.plugin._node.publishers
+            if publisher.topic == "/motion/joint_override_command"
+        )
+        original_publish = publisher.publish
+        fail_release = True
+
+        def fail_zero_weight(message):
+            if message.weight == 0.0 and fail_release:
+                raise RuntimeError("release transport failed")
+            original_publish(message)
+
+        publisher.publish = fail_zero_weight
+        interrupt_group = self.dev.MotionInterruptGroup()
+        interrupt_group.register(
+            "motion_recorder",
+            self.plugin.interrupt_motion,
+            self.plugin.motion_active,
+        )
+        self.plugin.set_interrupt_group(interrupt_group)
+        started = self.plugin.dispatch("play", {})
+        time.sleep(0.05)
+        self.plugin.dispatch("stop_playback", {})
+        deadline = time.monotonic() + 1.0
+        while self.plugin.dispatch("status", {})["playing"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        self.assertEqual(["motion_recorder"], interrupt_group.blocking_outputs())
+        self.assertTrue(self.plugin.dispatch("status", {})["override_release_failed"])
+        self.assertTrue(any(
+            call[0] == started["action_id"] and call[1] == "cancelled"
+            for call in self.acp_calls
+        ))
+
+        fail_release = False
+        retried = self.plugin.dispatch("stop_playback", {})
+        self.assertEqual("idle", retried["state"])
+        self.assertFalse(self.plugin.dispatch("status", {})["override_release_failed"])
+        self.assertEqual([], interrupt_group.blocking_outputs())
+
+    def test_reset_cancel_transport_failure_is_fail_closed_and_retryable(self):
+        class FlakyResetJointPlan:
+            def __init__(self):
+                self.cancel_attempts = 0
+                self.status = {"request_id": 23, "status": 2, "progress": 0.3}
+
+            def dispatch(self, action, _args):
+                if action == "reset":
+                    return {"state": "requested", "request_id": 23}
+                if action == "status":
+                    return dict(self.status)
+                if action == "cancel":
+                    self.cancel_attempts += 1
+                    if self.cancel_attempts == 1:
+                        raise RuntimeError("cancel publish failed")
+                    return {"state": "requested", "request_id": 23}
+                return {"error": f"unexpected action: {action}"}
+
+        joint_plan = FlakyResetJointPlan()
+        self.plugin.set_joint_plan(joint_plan)
+        interrupt_group = self.dev.MotionInterruptGroup()
+        interrupt_group.register(
+            "motion_recorder",
+            self.plugin.interrupt_motion,
+            self.plugin.motion_active,
+        )
+        self.plugin.set_interrupt_group(interrupt_group)
+        harness = AgentCoreBarrierContractHarness()
+        harness.register(self.plugin.get_tool(), self.plugin.dispatch)
+
+        resetting = harness.call("motion_recorder", "reset", {})
+        first_stop = harness.call("motion_recorder", "stop_playback", {})
+        self.assertEqual(set(), harness.pending_actions())
+        self.assertIn(
+            "cancel publish failed",
+            first_stop["reset_result"]["cancel_result"]["error"],
+        )
+        status = self.plugin.dispatch("status", {})
+        self.assertTrue(status["reset_pending"])
+        self.assertTrue(status["reset_cancel_pending"])
+        self.assertEqual(["motion_recorder"], interrupt_group.blocking_outputs())
+
+        retried = self.plugin.dispatch("stop_playback", {})
+        self.assertTrue(retried["reset_result"]["cancel_retry"])
+        self.assertEqual(2, joint_plan.cancel_attempts)
+        joint_plan.status = {"request_id": 23, "status": 1, "progress": 1.0}
+        deadline = time.monotonic() + 1.0
+        while self.plugin.dispatch("status", {})["reset_pending"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual([], interrupt_group.blocking_outputs())
+        self.assertTrue(any(
+            call[0] == resetting["action_id"] and call[1] == "cancelled"
+            for call in self.acp_calls
+        ))
+
+    def test_natural_completion_release_failure_is_also_fail_closed(self):
+        current = self._make_joint_state()
+        current.position = [0.0] * 25
+        current.velocity = [0.0] * 25
+        self.plugin._on_joint_state(current)
+        self.plugin._frames = [
+            {"timestamp": 0, "positions": [0.0] * 25, "velocities": [0.0] * 25},
+            {"timestamp": 50, "positions": [0.1] * 25, "velocities": [0.0] * 25},
+        ]
+        publisher = next(
+            publisher
+            for publisher in self.plugin._node.publishers
+            if publisher.topic == "/motion/joint_override_command"
+        )
+        original_publish = publisher.publish
+        fail_release = True
+
+        def fail_zero_weight(message):
+            if message.weight == 0.0 and fail_release:
+                raise RuntimeError("natural release failed")
+            original_publish(message)
+
+        publisher.publish = fail_zero_weight
+        interrupt_group = self.dev.MotionInterruptGroup()
+        interrupt_group.register(
+            "motion_recorder",
+            self.plugin.interrupt_motion,
+            self.plugin.motion_active,
+        )
+        self.plugin.set_interrupt_group(interrupt_group)
+        self.plugin.dispatch("play", {})
+        deadline = time.monotonic() + 1.0
+        while self.plugin.dispatch("status", {})["playing"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        self.assertTrue(self.plugin.dispatch("status", {})["override_release_failed"])
+        self.assertEqual(["motion_recorder"], interrupt_group.blocking_outputs())
+
+        fail_release = False
+        self.plugin.dispatch("stop_playback", {})
+        self.assertFalse(self.plugin.dispatch("status", {})["override_release_failed"])
+        self.assertEqual([], interrupt_group.blocking_outputs())
+
+    def test_device_interrupt_group_cancels_cross_plugin_pending_motion(self):
+        class BlockingJointPlan:
+            def __init__(self):
+                self.calls = []
+                self.entered_wait = threading.Event()
+                self.release_wait = threading.Event()
+                self.status = {"request_id": 31, "status": 2, "progress": 0.5}
+
+            def current_motion(self):
+                return "lower_body_balance", []
+
+            def wait_until_idle(self, *_args, **_kwargs):
+                return {}
+
+            def wait_for_request(self, *_args, **_kwargs):
+                self.entered_wait.set()
+                self.release_wait.wait(timeout=1.0)
+                return {}
+
+            def dispatch(self, action, args):
+                self.calls.append((action, dict(args)))
+                if action in ("plan", "plan_named"):
+                    return {"state": "requested", "request_id": 31}
+                if action == "cancel":
+                    return {"state": "requested", "request_id": 31}
+                if action == "status":
+                    return dict(self.status)
+                return {"error": f"unexpected action: {action}"}
+
+        plan = BlockingJointPlan()
+        gesture = self.dev.GesturePlugin(plan)
+        gesture_acp_calls = []
+        gesture._acp_notify = lambda *args: gesture_acp_calls.append(args)
+        interrupt_group = self.dev.MotionInterruptGroup()
+        interrupt_group.register("gesture", gesture.halt, gesture.motion_active)
+        interrupt_group.register(
+            "motion_recorder",
+            self.plugin.interrupt_motion,
+            self.plugin.motion_active,
+        )
+        gesture.set_interrupt_group(interrupt_group)
+        self.plugin.set_interrupt_group(interrupt_group)
+        harness = AgentCoreBarrierContractHarness()
+        harness.register(gesture.get_tool(), gesture.dispatch)
+        harness.register(self.plugin.get_tool(), self.plugin.dispatch)
+
+        gesture_started = harness.call("gesture", "sequence", {
+            "steps": [{
+                "joint_indices": [23],
+                "target_positions": [0.1],
+                "duration": 0.05,
+            }],
+            "reset_after": False,
+            "force": True,
+        })
+        self.assertTrue(plan.entered_wait.wait(timeout=1.0))
+        self.assertEqual(
+            {gesture_started["action_id"]},
+            harness.pending_actions(),
+        )
+        recorder_interrupt = harness.call(
+            "motion_recorder", "stop_playback", {}
+        )
+        self.assertEqual(set(), harness.pending_actions())
+        self.assertEqual("cancelled", gesture.dispatch("status", {})["state"])
+        self.assertIn("gesture", recorder_interrupt["interrupted_outputs"])
+        self.assertTrue(any(action == "cancel" for action, _ in plan.calls))
+        plan.status = {"request_id": 31, "status": 1, "progress": 1.0}
+        plan.release_wait.set()
+        gesture._thread.join(timeout=1.0)
+        deadline = time.monotonic() + 1.0
+        while gesture.dispatch("status", {})["cancel_pending"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(any(
+            call[0] == gesture_started["action_id"] and call[1] == "cancelled"
+            for call in gesture_acp_calls
+        ))
+        self.assertEqual([], interrupt_group.blocking_outputs())
+
+        current = self._make_joint_state()
+        current.position = [0.0] * 25
+        current.velocity = [0.0] * 25
+        self.plugin._on_joint_state(current)
+        self.plugin._frames = [
+            {"timestamp": 0, "positions": [0.0] * 25, "velocities": [0.0] * 25},
+            {"timestamp": 2000, "positions": [0.5] * 25, "velocities": [0.0] * 25},
+        ]
+        playback_started = harness.call("motion_recorder", "play", {})
+        time.sleep(0.05)
+        gesture_interrupt = harness.call(
+            "gesture", "stop_gesture", {"reset_after": True}
+        )
+        self.assertEqual(set(), harness.pending_actions())
+        self.assertIn("motion_recorder", gesture_interrupt["interrupted_outputs"])
+        self.assertTrue(gesture_interrupt["reset_after_ignored"])
+        self.assertFalse(any(action == "reset" for action, _ in plan.calls))
+        deadline = time.monotonic() + 1.0
+        while not any(
+            call[0] == playback_started["action_id"] and call[1] == "cancelled"
+            for call in self.acp_calls
+        ) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(any(
+            call[0] == playback_started["action_id"] and call[1] == "cancelled"
+            for call in self.acp_calls
+        ))
+        publisher = next(
+            publisher
+            for publisher in self.plugin._node.publishers
+            if publisher.topic == "/motion/joint_override_command"
+        )
+        self.assertEqual(0.0, publisher.messages[-1].weight)
 
     def test_recording_auto_stops_if_motion_mode_changes(self):
         state = FakeMotionState(current="lower_body_balance", available=["pd_stand"])
