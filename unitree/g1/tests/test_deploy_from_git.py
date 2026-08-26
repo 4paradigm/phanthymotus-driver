@@ -37,6 +37,8 @@ class DeployFromGitContractTest(unittest.TestCase):
         self.assertIn('service_template="$source_dir/unitree/g1/deploy/service.yml"', source)
         self.assertIn("https://codeload.github.com/", source)
         self.assertIn("SOURCE_MODE=github_archive", source)
+        self.assertIn('archive_tree="$(git -C "$temporary_source_root/archive" write-tree)"', source)
+        self.assertIn("Source archive tree mismatch", source)
         self.assertIn('timeout 45 git clone', source)
         self.assertIn('ps -q unitree-g1)', source)
         self.assertIn('docker inspect "$container_id"', source)
@@ -83,6 +85,9 @@ class DeployFromGitContractTest(unittest.TestCase):
             subprocess.run(
                 ["git", "-C", tmp, "commit", "-q", "-m", "test"], check=True
             )
+            expected_tree = subprocess.check_output(
+                ["git", "-C", tmp, "rev-parse", "HEAD^{tree}"], text=True
+            ).strip()
 
             env = os.environ.copy()
             env.update(
@@ -100,6 +105,7 @@ class DeployFromGitContractTest(unittest.TestCase):
             )
 
         self.assertIn("DRY_RUN=PASS target=g1-bj-wifi", result.stdout)
+        self.assertIn(f"tree={expected_tree}", result.stdout)
         self.assertIn(
             "repo=https://github.com/NBStarry/phanthymotus-driver.git",
             result.stdout,
@@ -109,6 +115,73 @@ class DeployFromGitContractTest(unittest.TestCase):
             result.stdout,
         )
         self.assertIn("remote_repo=~/hanzebei/phanthymotus-driver", result.stdout)
+
+    def test_archive_tree_reconstruction_detects_content_changes(self):
+        with tempfile.TemporaryDirectory(prefix="g1-driver-archive-test.") as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "-C", repo, "init", "-q", "-b", "main"], check=True)
+            (repo / "payload.txt").write_text("expected\n")
+            subprocess.run(["git", "-C", repo, "add", "payload.txt"], check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    repo,
+                    "-c",
+                    "user.name=codex-test",
+                    "-c",
+                    "user.email=codex-test@example.invalid",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "test",
+                ],
+                check=True,
+            )
+            commit = subprocess.check_output(
+                ["git", "-C", repo, "rev-parse", "HEAD"], text=True
+            ).strip()
+            expected_tree = subprocess.check_output(
+                ["git", "-C", repo, "rev-parse", "HEAD^{tree}"], text=True
+            ).strip()
+            archive = root / "source.tar.gz"
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    repo,
+                    "archive",
+                    "--format=tar.gz",
+                    f"--prefix=repo-{commit}/",
+                    f"--output={archive}",
+                    commit,
+                ],
+                check=True,
+            )
+            extracted = root / "extracted"
+            extracted.mkdir()
+            subprocess.run(
+                ["tar", "-xzf", archive, "--strip-components=1", "-C", extracted],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", extracted, "init", "-q", "--object-format=sha1"],
+                check=True,
+            )
+            subprocess.run(["git", "-C", extracted, "add", "-f", "-A"], check=True)
+            actual_tree = subprocess.check_output(
+                ["git", "-C", extracted, "write-tree"], text=True
+            ).strip()
+            self.assertEqual(actual_tree, expected_tree)
+
+            (extracted / "payload.txt").write_text("changed\n")
+            subprocess.run(["git", "-C", extracted, "add", "-f", "-A"], check=True)
+            changed_tree = subprocess.check_output(
+                ["git", "-C", extracted, "write-tree"], text=True
+            ).strip()
+            self.assertNotEqual(changed_tree, expected_tree)
 
 
 if __name__ == "__main__":

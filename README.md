@@ -69,7 +69,9 @@ match the exact commit, builds with the repository's G1 Dockerfile, and applies
 the complete `unitree/g1/deploy/service.yml` runtime contract on top of the
 target's Agent Core Compose file. If GitHub's Git endpoint is unavailable, a
 GitHub repository automatically falls back to the official `codeload.github.com`
-archive for the same pinned commit; third-party source mirrors are not used.
+archive for the same pinned commit; the extracted archive must reproduce the
+Git tree recorded by that commit before it can be built. Third-party source
+mirrors are not used.
 Set `REPO_URL`, `SOURCE_ARCHIVE_URL`, `SOURCE_REF`, `EXPECTED_COMMIT`,
 `REMOTE_REPO`, or `IMAGE` only when overriding those explicit deployment
 inputs. `DRY_RUN=1` validates and prints the resolved provenance without
@@ -148,6 +150,10 @@ publishes two algorithm-independent navigation sensor topics:
 - `/ubuntu/navigation/lidar` — `sensor_msgs/msg/PointCloud2`,
   RELIABLE + KEEP_LAST(2), with `x/y/z/intensity/tag/line/timestamp` fields;
 - `/ubuntu/navigation/imu` — `sensor_msgs/msg/Imu`, RELIABLE + KEEP_LAST(200);
+
+The MID360 converter accepts only tightly packed PointCloud2 rows
+(`row_step == width * point_step`). Organized clouds with row padding or an
+undersized row are dropped instead of being decoded with incorrect offsets.
 
 The `navigation_imu` tool declares `format=sensor/imu`. Its native ROS message
 uses quaternion orientation, angular velocity in rad/s, linear acceleration in

@@ -215,16 +215,13 @@ class _NavigationSensorNode(Node):
                 data,
                 is_dense,
             ) = item
-            expected_size = row_step * height
-            if point_step <= 0 or height <= 0 or width <= 0 or len(data) < expected_size:
-                self._counters["cloud_dropped"] += 1
-                continue
-
             try:
                 converted = unitree_mid360_to_navigation_cloud(
                     data=data,
-                    point_count=height * width,
+                    height=height,
+                    width=width,
                     point_step=point_step,
+                    row_step=row_step,
                     fields=fields,
                     header_stamp_ns=corrected_ns,
                     rotation_matrix=self._sensor_rotation,

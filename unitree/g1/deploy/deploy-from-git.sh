@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 LOCAL_REPO="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
 SOURCE_REF="${SOURCE_REF:-$(git -C "$LOCAL_REPO" branch --show-current)}"
 EXPECTED_COMMIT="${EXPECTED_COMMIT:-$(git -C "$LOCAL_REPO" rev-parse HEAD)}"
+EXPECTED_TREE="$(git -C "$LOCAL_REPO" rev-parse "$EXPECTED_COMMIT^{tree}")"
 ROS_BASE_IMAGE="${ROS_BASE_IMAGE:-bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest}"
 IMAGE="${IMAGE:-phanthy-g1-driver:git-${EXPECTED_COMMIT:0:7}}"
 REMOTE_REPO="${REMOTE_REPO:-~/hanzebei/phanthymotus-driver}"
@@ -47,7 +48,7 @@ fi
 SOURCE_ARCHIVE_URL="${SOURCE_ARCHIVE_URL:-}"
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
-  echo "DRY_RUN=PASS target=$TARGET repo=$REPO_URL ref=$SOURCE_REF commit=$EXPECTED_COMMIT base=$ROS_BASE_IMAGE image=$IMAGE remote_repo=$REMOTE_REPO archive=$SOURCE_ARCHIVE_URL"
+  echo "DRY_RUN=PASS target=$TARGET repo=$REPO_URL ref=$SOURCE_REF commit=$EXPECTED_COMMIT tree=$EXPECTED_TREE base=$ROS_BASE_IMAGE image=$IMAGE remote_repo=$REMOTE_REPO archive=$SOURCE_ARCHIVE_URL"
   exit 0
 fi
 
@@ -59,7 +60,8 @@ ssh "$TARGET" bash -s -- \
   "$IMAGE" \
   "$REMOTE_REPO" \
   "$COMPOSE_BASE" \
-  "$SOURCE_ARCHIVE_URL" <<'REMOTE_DEPLOY'
+  "$SOURCE_ARCHIVE_URL" \
+  "$EXPECTED_TREE" <<'REMOTE_DEPLOY'
 set -euo pipefail
 
 repo_url="$1"
@@ -70,6 +72,7 @@ image="$5"
 remote_repo_arg="$6"
 compose_base="$7"
 source_archive_url="$8"
+expected_tree="$9"
 
 if [[ "$remote_repo_arg" == "~/"* ]]; then
   remote_repo="$HOME/${remote_repo_arg:2}"
@@ -169,11 +172,49 @@ if [[ -z "$source_dir" ]]; then
     echo "Source archive download failed after 3 attempts: $source_archive_url" >&2
     exit 1
   }
+  repo_name="${repo_url##*/}"
+  repo_name="${repo_name%.git}"
+  expected_archive_root="${repo_name}-${expected_commit}"
+  archive_root=""
+  while IFS= read -r entry; do
+    [[ "$entry" != /* && "$entry" != ../* && "$entry" != */../* ]] || {
+      echo "Source archive contains an unsafe path: $entry" >&2
+      exit 1
+    }
+    entry_root="${entry%%/*}"
+    [[ -n "$entry_root" ]] || {
+      echo "Source archive contains an empty top-level path" >&2
+      exit 1
+    }
+    if [[ -z "$archive_root" ]]; then
+      archive_root="$entry_root"
+    elif [[ "$entry_root" != "$archive_root" ]]; then
+      echo "Source archive contains multiple top-level paths" >&2
+      exit 1
+    fi
+  done < <(tar -tzf "$archive_file")
+  [[ "$archive_root" == "$expected_archive_root" ]] || {
+    echo "Source archive root mismatch: expected=$expected_archive_root actual=$archive_root" >&2
+    exit 1
+  }
   mkdir "$temporary_source_root/archive"
   tar -xzf "$archive_file" --strip-components=1 \
     -C "$temporary_source_root/archive"
+  [[ ! -e "$temporary_source_root/archive/.git" ]] || {
+    echo "Source archive unexpectedly contains Git metadata" >&2
+    exit 1
+  }
+  git -C "$temporary_source_root/archive" init -q --object-format=sha1
+  git -C "$temporary_source_root/archive" \
+    -c core.autocrlf=false -c core.excludesFile=/dev/null add -f -A
+  archive_tree="$(git -C "$temporary_source_root/archive" write-tree)"
+  rm -rf -- "$temporary_source_root/archive/.git"
+  [[ "$archive_tree" == "$expected_tree" ]] || {
+    echo "Source archive tree mismatch: expected=$expected_tree actual=$archive_tree" >&2
+    exit 1
+  }
   source_dir="$temporary_source_root/archive"
-  echo "SOURCE_MODE=github_archive commit=$expected_commit"
+  echo "SOURCE_MODE=github_archive commit=$expected_commit tree=$archive_tree"
 fi
 
 [[ -d "$source_dir/common" ]] || {

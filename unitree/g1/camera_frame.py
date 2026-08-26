@@ -29,7 +29,7 @@ DEPTH_SCHEMA = "phanthy.sensor.camera_depth_frame.v1"
 DEPTH_COMPRESSION = "zlib"
 DEPTH_COMPRESSION_LEVEL = 1
 
-_DIRECT_CLOCK_DOMAINS = ("system_time", "global_time")
+_DIRECT_CLOCK_DOMAINS = frozenset({"system_time", "global_time"})
 _MAX_DIRECT_CLOCK_ERROR_NS = 24 * 60 * 60 * 1_000_000_000
 
 
@@ -189,7 +189,7 @@ class RealSenseClockNormalizer:
                 )
             self._last_source_by_stream[stream] = source_raw_ns
 
-        if any(name in domain for name in _DIRECT_CLOCK_DOMAINS):
+        if domain in _DIRECT_CLOCK_DOMAINS:
             if abs(receive_ns - source_raw_ns) > _MAX_DIRECT_CLOCK_ERROR_NS:
                 return self._unavailable(
                     domain=domain,

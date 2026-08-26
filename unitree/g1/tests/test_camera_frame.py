@@ -117,6 +117,21 @@ class CameraTimingTest(unittest.TestCase):
         self.assertEqual(timing.clock_domain, "ros_system_time")
         self.assertEqual(timing.normalization_status, "source_system_time")
 
+    def test_direct_clock_domain_matching_is_exact(self):
+        for domain in ("not_system_time", "hardware_global_time"):
+            with self.subTest(domain=domain):
+                timing = RealSenseClockNormalizer(
+                    warmup_samples=2, window_samples=4
+                ).normalize(
+                    source_timestamp_ms=1000.0,
+                    source_domain=domain,
+                    driver_receive_stamp_ns=20_001_000_000,
+                    stream="rgb",
+                )
+                self.assertIsNone(timing.source_stamp_ns)
+                self.assertEqual(timing.clock_domain, "unavailable")
+                self.assertEqual(timing.normalization_status, "source_clock_warmup")
+
     def test_hardware_clock_warms_up_without_faking_receive_time(self):
         normalizer = RealSenseClockNormalizer(warmup_samples=2, window_samples=4)
         first = normalizer.normalize(

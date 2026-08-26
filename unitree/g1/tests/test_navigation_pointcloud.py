@@ -56,8 +56,10 @@ class Mid360ConversionTest(unittest.TestCase):
         header_ns = 1_785_811_000_000_000_000
         converted = unitree_mid360_to_navigation_cloud(
             data=self.make_cloud(),
-            point_count=2,
+            height=1,
+            width=2,
             point_step=22,
+            row_step=44,
             fields=UNITREE_FIELDS,
             header_stamp_ns=header_ns,
         )
@@ -78,18 +80,46 @@ class Mid360ConversionTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing MID360 field: time"):
             unitree_mid360_to_navigation_cloud(
                 data=self.make_cloud(),
-                point_count=2,
+                height=1,
+                width=2,
                 point_step=22,
+                row_step=44,
                 fields=[field for field in UNITREE_FIELDS if field[0] != "time"],
                 header_stamp_ns=1_000_000_000,
             )
 
     def test_rejects_short_data(self):
-        with self.assertRaisesRegex(ValueError, "shorter"):
+        with self.assertRaisesRegex(ValueError, "size must equal"):
             unitree_mid360_to_navigation_cloud(
                 data=b"short",
-                point_count=2,
+                height=1,
+                width=2,
                 point_step=22,
+                row_step=44,
+                fields=UNITREE_FIELDS,
+                header_stamp_ns=1_000_000_000,
+            )
+
+    def test_rejects_organized_cloud_row_padding(self):
+        with self.assertRaisesRegex(ValueError, "tightly packed"):
+            unitree_mid360_to_navigation_cloud(
+                data=self.make_cloud() + b"\0" * 4,
+                height=2,
+                width=1,
+                point_step=22,
+                row_step=24,
+                fields=UNITREE_FIELDS,
+                header_stamp_ns=1_000_000_000,
+            )
+
+    def test_rejects_row_step_smaller_than_one_row(self):
+        with self.assertRaisesRegex(ValueError, "tightly packed"):
+            unitree_mid360_to_navigation_cloud(
+                data=self.make_cloud()[:40],
+                height=1,
+                width=2,
+                point_step=22,
+                row_step=40,
                 fields=UNITREE_FIELDS,
                 header_stamp_ns=1_000_000_000,
             )
@@ -111,8 +141,10 @@ class Mid360ConversionTest(unittest.TestCase):
         header_ns = 1_785_811_000_000_000_000
         converted = unitree_mid360_to_navigation_cloud(
             data=self.make_cloud(),
-            point_count=2,
+            height=1,
+            width=2,
             point_step=22,
+            row_step=44,
             fields=UNITREE_FIELDS,
             header_stamp_ns=header_ns,
             rotation_matrix=rotation,

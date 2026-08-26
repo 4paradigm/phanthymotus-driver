@@ -171,8 +171,10 @@ def rotate_orientation_xyzw(
 def unitree_mid360_to_navigation_cloud(
     *,
     data: bytes,
-    point_count: int,
+    height: int,
+    width: int,
     point_step: int,
+    row_step: int,
     fields: list[tuple[str, int, int, int]],
     header_stamp_ns: int,
     rotation_matrix: np.ndarray | None = None,
@@ -183,13 +185,28 @@ def unitree_mid360_to_navigation_cloud(
     preserves it as an absolute nanosecond ``timestamp`` in the same normalized
     clock domain as the ROS header and navigation IMU.
     """
-    point_count = int(point_count)
+    height = int(height)
+    width = int(width)
     point_step = int(point_step)
+    row_step = int(row_step)
     header_stamp_ns = int(header_stamp_ns)
-    if point_count < 1 or point_step < 1 or header_stamp_ns <= 0:
-        raise ValueError("point_count, point_step and header_stamp_ns must be positive")
-    if len(data) < point_count * point_step:
-        raise ValueError("point cloud data is shorter than point_count * point_step")
+    if min(height, width, point_step, row_step, header_stamp_ns) < 1:
+        raise ValueError(
+            "height, width, point_step, row_step and header_stamp_ns must be positive"
+        )
+    expected_row_step = width * point_step
+    if row_step != expected_row_step:
+        raise ValueError(
+            "MID360 PointCloud2 rows must be tightly packed: "
+            f"row_step={row_step}, expected={expected_row_step}"
+        )
+    expected_size = height * row_step
+    if len(data) != expected_size:
+        raise ValueError(
+            f"point cloud data size must equal row_step * height: "
+            f"expected={expected_size}, actual={len(data)}"
+        )
+    point_count = height * width
 
     field_map = {name: (int(offset), int(datatype), int(count)) for name, offset, datatype, count in fields}
     for name, expected_type in _EXPECTED_INPUT_TYPES.items():

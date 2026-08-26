@@ -58,7 +58,8 @@ cp .env.example .env  # 填写镜像仓库凭据
 `~/hanzebei/phanthymotus-driver` 中拉取该分支，要求远程分支 tip 与固定提交
 完全一致，再使用仓库自带的 G1 Dockerfile 构建镜像。当 GitHub Git 端点不可用时，
 GitHub 仓库会自动回退到官方 `codeload.github.com` 上的同一固定提交归档，
-不使用第三方源码镜像。只有明确需要覆盖部署输入时才设置 `REPO_URL`、
+解压后的文件必须能重建出该提交记录的 Git tree 才允许构建，且不使用
+第三方源码镜像。只有明确需要覆盖部署输入时才设置 `REPO_URL`、
 `SOURCE_ARCHIVE_URL`、`SOURCE_REF`、`EXPECTED_COMMIT`、`REMOTE_REPO` 或
 `IMAGE`。`DRY_RUN=1` 只校验并打印最终来源，不连接机器人。
 
@@ -121,6 +122,8 @@ velocity proposal 合同与 `loco.move` 输入边界保持一致：前后和横�
 `/ubuntu/navigation/imu`（`Imu`）。两路数据保留 MID360 共享源时钟并统一
 归一化到 ROS system time；时钟未就绪、重置或样本无效时直接丢弃，不伪造
 源时间戳。
+点云转换只接受 `row_step == width * point_step` 的紧凑行布局；
+带行 padding 或行长不足的有组织点云会被丢弃，避免按错误偏移解码。
 
 `navigation_lidar` 与 `navigation_imu` 两张卡共享同一个 worker。停止任意一张
 卡都会停止两路数据并释放 MID360 worker；再次启动任意一张卡会创建新的共享
