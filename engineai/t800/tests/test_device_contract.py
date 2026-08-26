@@ -939,6 +939,54 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("cancelled", completions[0][1])
         self.assertEqual({"state": "idle"}, gesture.dispatch("stop", {}))
 
+    def test_gesture_stop_joins_worker_before_releasing_head(self):
+        """stop 必须等 worker 退出后才释放 head 锁，避免迟到的 _dispatch_owned 竞态。"""
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        plan.wait_until_idle = lambda *_a, **_kw: {}
+
+        dispatch_entered = threading.Event()
+        release_dispatch = threading.Event()
+        real_dispatch = plan._dispatch_owned
+
+        def tracked_dispatch(owner, action, args):
+            if action == "plan":
+                # worker 已通过取消检查、正卡在 _dispatch_owned 前
+                dispatch_entered.set()
+                release_dispatch.wait(timeout=2.0)
+            return real_dispatch(owner, action, args)
+
+        plan._dispatch_owned = tracked_dispatch
+
+        gesture = self.device.GesturePlugin(plan)
+        result = gesture.dispatch("sequence", {
+            "steps": [{"joint_indices": [23], "target_positions": [0.1], "duration": 0.05}],
+            "reset_after": False,
+            "force": True,
+        })
+        self.assertTrue(dispatch_entered.wait(timeout=1.0))
+        self.assertEqual("gesture", plan.head_status()["owner"])
+
+        stop_done = threading.Event()
+
+        def do_stop():
+            gesture.dispatch("stop_gesture", {})
+            stop_done.set()
+
+        stop_thread = threading.Thread(target=do_stop)
+        stop_thread.start()
+        # stop 应在 join 上阻塞，不能提前释放锁
+        self.assertFalse(stop_done.wait(timeout=0.2))
+        self.assertEqual("gesture", plan.head_status()["owner"])
+
+        release_dispatch.set()
+        self.assertTrue(stop_done.wait(timeout=2.0))
+        stop_thread.join(timeout=1.0)
+        gesture._thread.join(timeout=1.0)
+
+        self.assertFalse(gesture._thread.is_alive())
+        self.assertIsNone(plan.head_status()["owner"])
+
     def test_gesture_async_error_reports_acp(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
         plan.start()
@@ -1485,6 +1533,34 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertIsNone(plan.head_status()["owner"])
         # 后续请求应能正常获取锁
         again = plan.dispatch("head_pose", {"pitch_rad": 0.2, "yaw_rad": 0.0})
+        self.assertEqual("requested", again["state"])
+
+    def test_direct_head_request_released_on_exiting_before_executing(self):
+        """直接 head 请求在 EXECUTING 前收到 EXITING（故障/拒绝）时应释放锁。"""
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        result = plan.dispatch("head_pose", {"pitch_rad": 0.1, "yaw_rad": 0.0})
+        req_id = result["request_id"]
+        self.assertEqual("joint_plan", plan.head_status()["owner"])
+        # planner 在 EXECUTING 前发布 EXITING（拒绝/故障）
+        plan._on_state(JointMotionPlanState(req_id, JointMotionPlanState.EXITING, 0.0))
+        self.assertIsNone(plan.head_status()["owner"])
+        # 后续 head 动作不应被永久阻塞
+        again = plan.dispatch("head_pose", {"pitch_rad": 0.2, "yaw_rad": 0.0})
+        self.assertEqual("requested", again["state"])
+
+    def test_direct_reset_released_on_fault_before_executing(self):
+        """直接 reset 在 EXECUTING 前被 planner 拒绝/故障时应释放 head 锁。"""
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        result = plan.dispatch("reset", {})
+        req_id = result["request_id"]
+        self.assertEqual("joint_plan", plan.head_status()["owner"])
+        # planner 在 EXECUTING 前发布 DISABLED（故障/禁用）
+        plan._on_state(JointMotionPlanState(req_id, JointMotionPlanState.STATUS_DISABLED, 0.0))
+        self.assertIsNone(plan.head_status()["owner"])
+        # 后续 head 动作不应被永久阻塞
+        again = plan.dispatch("head_pose", {"pitch_rad": 0.1, "yaw_rad": 0.0})
         self.assertEqual("requested", again["state"])
 
     def test_head_nod_shake_rejects_invalid_speed_types(self):
