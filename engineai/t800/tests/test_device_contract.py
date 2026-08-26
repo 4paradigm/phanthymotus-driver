@@ -249,6 +249,7 @@ class DevicePluginContractTests(unittest.TestCase):
             self.device.DancePlugin(motion_mode, self.state),
             joint_plan,
             self.device.GesturePlugin(joint_plan),
+            self.device.HeadActuatorPlugin(CONFIG, joint_plan, self.state),
             self.device.JointOverridePlugin(CONFIG, "robot", self.ros, self.state),
             self.device.JointBridgePlugin(CONFIG, "robot", self.ros, self.state),
             self.device.LedPlugin(CONFIG, "robot", self.ros),
@@ -277,14 +278,14 @@ class DevicePluginContractTests(unittest.TestCase):
              "robot_snapshot", "fault_summary", "stability", "joint_groups", "capabilities", "ros_graph",
              "mainboard", "heartbeat_status", "motion_command_trace", "motion_events",
              "native_interface_probe",
-             "loco", "motion_mode", "dance", "joint_plan", "joint_plan_state", "gesture",
+             "loco", "motion_mode", "dance", "joint_plan", "joint_plan_state", "gesture", "head",
              "joint_override", "joint_bridge",
              "led", "tts", "mic", "pointcloud", "camera", "depth",
              "motor_power", "native_node_control", "virtual_gamepad", "safety", "native_sdk"},
             names,
         )
-        self.assertEqual(41, len(names))
-        self.assertEqual(41, len(definitions), "tool names must be unique")
+        self.assertEqual(42, len(names))
+        self.assertEqual(42, len(definitions), "tool names must be unique")
         for tool in definitions:
             schema = tool.get("inputSchema")
             self.assertEqual("object", schema.get("type"), tool["name"])
@@ -617,8 +618,17 @@ class DevicePluginContractTests(unittest.TestCase):
         })
         self.assertEqual("requested", named["state"])
         self.assertEqual([23, 24], plugin._publisher.messages[-1].joint_indices)
+        # head 请求持有锁，模拟完成后释放
+        req_id = plugin._publisher.messages[-1].request_id
+        plugin._on_state(JointMotionPlanState(req_id, JointMotionPlanState.EXECUTING, 0.5))
+        plugin._on_state(JointMotionPlanState(req_id, JointMotionPlanState.IDLE, 1.0))
+
         plugin.dispatch("head_pose", {"pitch_rad": 0.2, "yaw_rad": 0.3})
         self.assertEqual([23, 24], plugin._publisher.messages[-1].joint_indices)
+        req_id = plugin._publisher.messages[-1].request_id
+        plugin._on_state(JointMotionPlanState(req_id, JointMotionPlanState.EXECUTING, 0.5))
+        plugin._on_state(JointMotionPlanState(req_id, JointMotionPlanState.IDLE, 1.0))
+
         plugin.dispatch("arm_pose", {"side": "left", "target_positions": [0.0] * 5})
         self.assertEqual([13, 14, 15, 16, 17], plugin._publisher.messages[-1].joint_indices)
         plugin.dispatch("hold_current", {})
@@ -1346,6 +1356,36 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("head", busy["owner"])
         head.dispatch("stop", {})
         head._thread.join(timeout=1.0)
+
+    def test_direct_joint_plan_head_pose_blocks_subsequent_non_head_plan(self):
+        """直接 joint_plan.head_pose 持有锁后，后续非 head plan 应被拒绝（owner=joint_plan 不重入）。"""
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        # 直接调用 head_pose，owner="joint_plan" 获取锁
+        result = plan.dispatch("head_pose", {"pitch_rad": 0.1, "yaw_rad": 0.0})
+        self.assertEqual("requested", result["state"])
+        self.assertEqual("joint_plan", plan.head_status()["owner"])
+        # 后续非 head plan 应被拒绝（同一个外部 owner 不允许重入）
+        busy = plan.dispatch("plan", {
+            "joint_indices": [13, 14, 15, 16, 17],
+            "target_positions": [0.0] * 5,
+        })
+        self.assertIn("head is busy", busy["error"])
+        self.assertEqual("joint_plan", busy["owner"])
+
+    def test_direct_head_request_not_released_by_initial_idle(self):
+        """直接 head 请求在初始 IDLE 确认时不应释放锁，必须等 EXECUTING→终态。"""
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        result = plan.dispatch("head_pose", {"pitch_rad": 0.1, "yaw_rad": 0.0})
+        req_id = result["request_id"]
+        # 初始 IDLE（planner 在 EXECUTING 前发布）不应释放锁
+        plan._on_state(JointMotionPlanState(req_id, JointMotionPlanState.IDLE, 0.0))
+        self.assertEqual("joint_plan", plan.head_status()["owner"])
+        # EXECUTING 后再 IDLE 才释放
+        plan._on_state(JointMotionPlanState(req_id, JointMotionPlanState.EXECUTING, 0.5))
+        plan._on_state(JointMotionPlanState(req_id, JointMotionPlanState.IDLE, 1.0))
+        self.assertIsNone(plan.head_status()["owner"])
 
     def test_head_nod_shake_rejects_invalid_speed_types(self):
         """speed 为 null/数组/对象时应返回 error，而非 TypeError 逃逸。"""
