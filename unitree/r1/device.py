@@ -302,8 +302,33 @@ APP_NAME = "r1_speaker"
 
 
 class _SpeakerNode(Node):
-    PREFILL = 3       # buffer 3 chunks (~300ms) before starting playback
+    # Prefill is counted in bytes, not chunks: the upstream chunk size is the
+    # TTS's choice (perception sends 3200B/100ms, README.md allows down to
+    # 1024B), so "3 chunks ≈ 300ms" silently became 96ms on a conforming
+    # producer — starting the drain already starved of the 300ms block it is
+    # about to try to assemble.
+    PREFILL_BYTES = 9600  # ~300ms @ 16k/16bit/mono before playback starts
     MERGE_BYTES = 9600  # merge into ~300ms blocks before calling PlayStream
+    EMPTY_POLL_S = 0.1  # _buf.get timeout — one unit of "idle"
+    # Idle tolerance. Only EXIT_AFTER_IDLE moved: it used to be 3 (300ms), so a
+    # stall of one text chunk's synthesis on the TTS side tore the drain thread
+    # down, and restarting it cost another PREFILL_BYTES on top of the stall.
+    # That is why a gap upstream was always audibly *longer* on the robot than
+    # the stall that caused it. FLUSH_AFTER_IDLE stays short on purpose: when
+    # the stream goes quiet mid-utterance the MCU holds at most MAX_LEAD_S, so
+    # pushing the partial block out early is what shortens the silence.
+    FLUSH_AFTER_IDLE = 2  # 200ms with no data → push out the partial block
+    EXIT_AFTER_IDLE = 15  # 1.5s with nothing at all → drain thread may exit
+    # How far ahead of the audio timeline PlayStream may run. The old code did
+    # `duration - elapsed - 0.08` per block with no cumulative deadline, so it
+    # ran 220ms of wall clock per 300ms of audio — a permanent, compounding
+    # +80ms/block overrun of the MCU's queue. On R1 every call additionally
+    # crosses rpc_proxy's IPC queue, so the per-block cost is less predictable
+    # still and a bounded deadline matters more.
+    MAX_LEAD_S = 0.24
+
+    # Sentinel meaning "utterance finished, flush what you have now".
+    _END_OF_UTTERANCE = object()
 
     # EOF magic: 8 bytes (4 samples [1,-1,1,-1])，标记 utterance 结束
     AUDIO_EOF_MAGIC = b'\x01\x00\xff\xff\x01\x00\xff\xff'
@@ -316,6 +341,7 @@ class _SpeakerNode(Node):
         self._idx    = 0
         self.state   = "idle"
         self._buf = queue.Queue()
+        self._pending_bytes = 0  # bytes buffered since the last drain start
         self._draining = threading.Event()
         self._drain_thread: threading.Thread | None = None
         self._last_chunk_time = 0.0
@@ -364,6 +390,7 @@ class _SpeakerNode(Node):
                 self._buf.get_nowait()
             except queue.Empty:
                 break
+        self._pending_bytes = 0
         try:
             self._client.PlayStop(APP_NAME)
         except Exception as e:
@@ -379,6 +406,7 @@ class _SpeakerNode(Node):
                     self._buf.get_nowait()
                 except queue.Empty:
                     break
+            self._pending_bytes = 0
             try:
                 self._client.PlayStop(APP_NAME)
             except Exception as e:
@@ -431,6 +459,14 @@ class _SpeakerNode(Node):
             if self._muted:
                 self._muted = False
                 self.get_logger().info("[speaker] unmuted — received EOF marker")
+                return
+            # EOF 是明确的「本句结束」信号。用它立刻冲出残块，就不必靠空等超时
+            # 来发现句尾 —— 否则放宽 FLUSH_AFTER_IDLE 会给每句尾都加上几百 ms。
+            self._last_chunk_time = now
+            if self._draining.is_set():
+                self._buf.put(self._END_OF_UTTERANCE)
+            elif not self._buf.empty() and self.state == "playing":
+                self._start_drain()
             return
 
         # Muted 状态：interrupt 后丢弃来自旧 utterance 的 chunks
@@ -439,10 +475,12 @@ class _SpeakerNode(Node):
             return
 
         self._buf.put(pcm)
+        self._pending_bytes += len(pcm)
         self._last_chunk_time = now
         if self.state == "ready":
             self.state = "playing"
-        if not self._draining.is_set() and self.state == "playing" and self._buf.qsize() >= self.PREFILL:
+        if (not self._draining.is_set() and self.state == "playing"
+                and self._pending_bytes >= self.PREFILL_BYTES):
             self._start_drain()
         elif not self._draining.is_set() and self.state == "playing" and self._flush_timer is None:
             self._flush_timer = self.create_timer(0.2, self._check_flush)
@@ -452,6 +490,7 @@ class _SpeakerNode(Node):
             self._flush_timer.cancel()
             self.destroy_timer(self._flush_timer)
             self._flush_timer = None
+        self._pending_bytes = 0
         self._draining.set()
         self._drain_thread = threading.Thread(target=self._drain, daemon=True)
         self._drain_thread.start()
@@ -469,7 +508,9 @@ class _SpeakerNode(Node):
     def _drain(self) -> None:
         play_idx = 0
         merged = b''
-        empty_count = 0
+        idle = 0
+        max_idle = 0
+        deadline = None
         while self._draining.is_set():
             if self._interrupt_flag.is_set():
                 return
@@ -477,33 +518,46 @@ class _SpeakerNode(Node):
                 continue
 
             try:
-                pcm = self._buf.get(timeout=0.1)
-                merged += pcm
-                empty_count = 0
+                item = self._buf.get(timeout=self.EMPTY_POLL_S)
+                idle = 0
             except queue.Empty:
-                empty_count += 1
-                if merged and empty_count >= 2:
+                idle += 1
+                max_idle = max(max_idle, idle)
+                if merged and idle >= self.FLUSH_AFTER_IDLE:
                     play_idx += 1
-                    self._play_merged(merged, play_idx)
+                    deadline = self._play_merged(merged, play_idx, deadline)
                     merged = b''
-                elif not merged and empty_count >= 3:
+                elif not merged and idle >= self.EXIT_AFTER_IDLE:
                     break
                 continue
+            if item is self._END_OF_UTTERANCE:
+                # 句尾：立刻把残块播完，但不退出线程 —— 下一句马上就来，
+                # 重建线程要重新攒满 PREFILL_BYTES，那就是可听的空洞。
+                if merged:
+                    play_idx += 1
+                    deadline = self._play_merged(merged, play_idx, deadline)
+                    merged = b''
+                continue
+            merged += item
             if len(merged) >= self.MERGE_BYTES:
                 play_idx += 1
-                self._play_merged(merged, play_idx)
+                deadline = self._play_merged(merged, play_idx, deadline)
                 merged = b''
         if merged and not self._interrupt_flag.is_set():
             play_idx += 1
-            self._play_merged(merged, play_idx)
+            self._play_merged(merged, play_idx, deadline)
         self._draining.clear()
         if self.state == "playing":
             self.state = "ready"
-        self.get_logger().info("[speaker] drain finished")
+        self.get_logger().info(
+            f"[speaker] drain finished: blocks={play_idx} "
+            f"max_idle={max_idle * self.EMPTY_POLL_S:.1f}s"
+        )
 
-    def _play_merged(self, pcm: bytes, idx: int) -> None:
+    def _play_merged(self, pcm: bytes, idx: int, deadline: float | None) -> float | None:
+        """Send one block; return the wall-clock deadline for the next one."""
         if self._interrupt_flag.is_set():
-            return
+            return deadline
         duration = len(pcm) / 32000
         t0 = time.monotonic()
         try:
@@ -512,10 +566,22 @@ class _SpeakerNode(Node):
                 self.get_logger().error(f"[speaker] PlayStream error code={code}")
         except Exception as e:
             self.get_logger().error(f"[speaker] PlayStream error: {e}")
-        elapsed = time.monotonic() - t0
-        remaining = duration - elapsed - 0.08
-        if remaining > 0 and not self._interrupt_flag.is_set():
-            time.sleep(remaining)
+        now = time.monotonic()
+        # Cumulative deadline rather than a per-block `- 0.08`: the old form had
+        # no way to give back the lead it took, so it drifted 80ms further ahead
+        # of the MCU on every block. Here the lead is bounded by MAX_LEAD_S no
+        # matter how long the utterance runs.
+        if deadline is None:
+            deadline = t0
+        deadline += duration
+        if deadline < now:
+            # PlayStream (plus rpc_proxy) is the bottleneck — stop accruing a
+            # debt we cannot pay off and re-anchor on the current time.
+            deadline = now
+        wake = deadline - self.MAX_LEAD_S
+        if wake > now and not self._interrupt_flag.is_set():
+            time.sleep(wake - now)
+        return deadline
 
 
 class SpeakerPlugin:
@@ -559,16 +625,24 @@ class SpeakerPlugin:
         try:
             pcm = pcm_path.read_bytes()
             block_size = 9600
+            deadline = None
             for offset in range(0, len(pcm), block_size):
                 block = pcm[offset:offset + block_size]
+                t0 = time.monotonic()
                 code, _ = self._node._client.PlayStream(APP_NAME, "0", block)
                 if code != 0:
                     self._node.get_logger().warn(f"[speaker] startup sound stopped at offset {offset}: code={code}")
                     return
-                duration = len(block) / 32000
-                remaining = duration - 0.08
-                if remaining > 0:
-                    time.sleep(remaining)
+                # Same bounded cumulative deadline as _SpeakerNode._play_merged.
+                # This loop did not even subtract the PlayStream call's own cost,
+                # so it ran further ahead of the MCU than the streaming path.
+                now = time.monotonic()
+                deadline = (t0 if deadline is None else deadline) + len(block) / 32000
+                if deadline < now:
+                    deadline = now
+                wake = deadline - _SpeakerNode.MAX_LEAD_S
+                if wake > now:
+                    time.sleep(wake - now)
             self._node.get_logger().info(f"[speaker] startup sound OK ({len(pcm)} bytes)")
         except Exception as e:
             self._node.get_logger().warn(f"[speaker] startup sound error: {e}")
