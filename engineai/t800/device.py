@@ -2546,6 +2546,10 @@ class WaistPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "info"):
+            return {**self._metadata(), "state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
         if action == "list":
             return self._metadata()
         if action == "status":

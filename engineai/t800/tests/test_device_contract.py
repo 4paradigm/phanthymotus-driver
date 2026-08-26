@@ -696,6 +696,18 @@ class DevicePluginContractTests(unittest.TestCase):
         waist.dispatch("center", {})
         self.assertEqual([0.0], plan._publisher.messages[-1].target_positions)
 
+    def test_waist_dispatch_handles_actuator_lifecycle_actions(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        waist = self.device.WaistPlugin(CONFIG, plan)
+
+        started = waist.dispatch("start", {})
+        self.assertEqual("ready", started["state"])
+        self.assertEqual("J12_TORSO_YAW", started["joint_name"])
+        self.assertEqual("ready", waist.dispatch("info", {})["state"])
+        self.assertEqual({"state": "idle"}, waist.dispatch("stop", {}))
+        self.assertEqual([], plan._publisher.messages)
+
     def test_waist_rejects_unsafe_state_angle_and_duration(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
         plan.start()
