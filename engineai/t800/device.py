@@ -2442,12 +2442,16 @@ class JointPlanPlugin:
         target = int(request_id)
         deadline = time.monotonic() + float(timeout)
         idle = int(self._state_type.IDLE)
-        with self._state_changed:
-            while True:
-                if abort_check is not None:
-                    abort_reason = abort_check()
-                    if abort_reason:
-                        raise RuntimeError(str(abort_reason))
+        while True:
+            # abort_check may acquire plugin-local locks. Run it outside the
+            # planner condition lock to avoid lock-order inversions with halt.
+            if abort_check is not None:
+                abort_reason = abort_check()
+                if abort_reason:
+                    raise RuntimeError(str(abort_reason))
+            if cancel_event.is_set():
+                raise RuntimeError("gesture cancelled")
+            with self._state_changed:
                 if cancel_event.is_set():
                     raise RuntimeError("gesture cancelled")
                 state = dict(self._last_state)
