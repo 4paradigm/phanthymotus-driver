@@ -255,6 +255,29 @@ class NavigationSensorCardContractTest(unittest.TestCase):
         self.assertFalse(dead["ready"])
         self.assertIn("worker_not_running", dead["blockers"])
 
+    def test_invalid_timestamp_warnings_are_sampled_per_stream(self):
+        module = self.load_bridge_module()
+        node = module._NavigationSensorNode.__new__(module._NavigationSensorNode)
+        node._counters = {
+            "cloud_invalid_timestamps": 0,
+            "imu_invalid_timestamps": 0,
+        }
+        logger = mock.Mock()
+        node.get_logger = lambda: logger
+
+        for _ in range(201):
+            self.assertIsNone(node._correct_stamp(object(), "imu"))
+        self.assertIsNone(node._correct_stamp(object(), "cloud"))
+
+        self.assertEqual(node._counters["imu_invalid_timestamps"], 201)
+        self.assertEqual(node._counters["cloud_invalid_timestamps"], 1)
+        self.assertEqual(logger.warning.call_count, 4)
+        messages = [call.args[0] for call in logger.warning.call_args_list]
+        self.assertIn("invalid imu timestamp count=1", messages[0])
+        self.assertIn("invalid imu timestamp count=100", messages[1])
+        self.assertIn("invalid imu timestamp count=200", messages[2])
+        self.assertIn("invalid cloud timestamp count=1", messages[3])
+
 
 if __name__ == "__main__":
     unittest.main()

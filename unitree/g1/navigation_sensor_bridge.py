@@ -118,6 +118,8 @@ class _NavigationSensorNode(Node):
             "imu_received": 0,
             "imu_published": 0,
             "imu_dropped": 0,
+            "cloud_invalid_timestamps": 0,
+            "imu_invalid_timestamps": 0,
             "stamp_clamped": 0,
         }
         self._last_receive_monotonic = {"cloud": 0.0, "imu": 0.0}
@@ -142,7 +144,13 @@ class _NavigationSensorNode(Node):
             host_ns = self.get_clock().now().nanoseconds
             corrected_ns = self._clock_offset.correct_observation(source_ns, host_ns)
         except (AttributeError, TypeError, ValueError) as exc:
-            self.get_logger().warning(f"invalid {stream} timestamp: {exc}")
+            counter = f"{stream}_invalid_timestamps"
+            self._counters[counter] += 1
+            count = self._counters[counter]
+            if count == 1 or count % 100 == 0:
+                self.get_logger().warning(
+                    f"invalid {stream} timestamp count={count}: {exc}"
+                )
             return None
 
         if corrected_ns is None:
