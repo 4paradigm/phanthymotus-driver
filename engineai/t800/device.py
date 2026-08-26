@@ -2229,6 +2229,7 @@ class JointPlanPlugin:
         self._request_id = 0
         self._owner_lock = threading.Lock()
         self._owner: str | None = None
+        self._owner_cancel_handlers = {}
         self._state_type = None
         self._state = state
         self._core_topic = f"/{namespace}/state/joint_plan"
@@ -2314,7 +2315,15 @@ class JointPlanPlugin:
         # Cancellation is a safety/operator escape hatch: it must remain
         # available even while an in-process plugin owns the planner.
         if action == "cancel":
-            return self._publish_request("cancel", args)
+            with self._owner_lock:
+                active_owner = self._owner
+                handler = self._owner_cancel_handlers.get(active_owner)
+                result = self._publish_request("cancel", args)
+            # Owner callbacks can acquire plugin-local locks. Invoke them only
+            # after releasing the planner ownership lock.
+            if handler is not None:
+                handler(int(result["request_id"]))
+            return result
         with self._owner_lock:
             active_owner = self._owner
             if active_owner is not None and owner != active_owner:
@@ -2385,6 +2394,10 @@ class JointPlanPlugin:
                 return False
             self._owner = owner
             return True
+
+    def register_owner_cancel_handler(self, owner: str, handler) -> None:
+        with self._owner_lock:
+            self._owner_cancel_handlers[str(owner)] = handler
 
     def release(self, owner: str) -> bool:
         with self._owner_lock:
@@ -3109,6 +3122,9 @@ class ArmSwingPlugin:
         self._action_id: str | None = None
         self._last_reason = "not_started"
         self._validate_parameters(self._amplitude_deg, self._frequency_hz)
+        self._joint_plan.register_owner_cancel_handler(
+            self._OWNER, self._on_planner_cancel
+        )
 
     def get_tool(self) -> dict:
         tool = {
@@ -3186,9 +3202,9 @@ class ArmSwingPlugin:
                     "error": "previous arm_swing action is still stopping; retry",
                     "state": "stopping",
                 }
-            self._amplitude_deg = amplitude
-            self._frequency_hz = frequency
             if running:
+                self._amplitude_deg = amplitude
+                self._frequency_hz = frequency
                 return self._status_locked()
             # Keep the idle check, motion-state gate and worker installation
             # atomic so concurrent MCP calls cannot create two workers.
@@ -3201,6 +3217,8 @@ class ArmSwingPlugin:
             if not self._joint_plan.acquire(self._OWNER):
                 return {"error": f"joint planner is owned by {self._joint_plan.owner()}"}
 
+            self._amplitude_deg = amplitude
+            self._frequency_hz = frequency
             self._halt = threading.Event()
             self._started_at = time.monotonic()
             self._publish_count = 0
@@ -3212,6 +3230,13 @@ class ArmSwingPlugin:
             self._thread = threading.Thread(target=self._run, daemon=True, name="t800-arm-swing")
             self._thread.start()
             return self._status_locked()
+
+    def _on_planner_cancel(self, request_id: int) -> None:
+        with self._lock:
+            if self._request_id is None or int(self._request_id) != int(request_id):
+                return
+            self._last_reason = "planner_cancelled"
+            self._halt.set()
 
     def _run(self) -> None:
         reason = "user_halt"

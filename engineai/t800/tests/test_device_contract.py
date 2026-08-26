@@ -1055,9 +1055,24 @@ class DevicePluginContractTests(unittest.TestCase):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
         plan.start()
         swing = self.device.ArmSwingPlugin(CONFIG, plan, self.state)
-        self.assertIn("lower_body_balance", swing.dispatch("start_swing", {})["error"])
+        rejected_state = swing.dispatch("start_swing", {
+            "amplitude_deg": 20.0,
+            "frequency_hz": 1.0,
+        })
+        self.assertIn("lower_body_balance", rejected_state["error"])
+        self.assertEqual(8.0, swing._amplitude_deg)
+        self.assertEqual(0.7, swing._frequency_hz)
         self.state._current_motion = "lower_body_balance"
         self.assertIn("between 2 and 30", swing.dispatch("start_swing", {"amplitude_deg": 31})["error"])
+        self.assertTrue(plan.acquire("gesture"))
+        rejected_owner = swing.dispatch("start_swing", {
+            "amplitude_deg": 18.0,
+            "frequency_hz": 0.9,
+        })
+        self.assertIn("owned by gesture", rejected_owner["error"])
+        self.assertEqual(8.0, swing._amplitude_deg)
+        self.assertEqual(0.7, swing._frequency_hz)
+        self.assertTrue(plan.release("gesture"))
         schema = swing.get_tool()["inputSchema"]
         actions = schema["properties"]["action"]["enum"]
         self.assertEqual(
@@ -1224,6 +1239,31 @@ class DevicePluginContractTests(unittest.TestCase):
         cancels = [msg for msg in plan._publisher.messages
                    if msg.request_type == plan._request_type.REQUEST_CANCEL]
         self.assertTrue(any(msg.request_id == request_id for msg in cancels))
+
+    def test_public_joint_plan_cancel_stops_active_arm_swing_worker(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        swing = self.device.ArmSwingPlugin(CONFIG, plan, self.state)
+        swing._notify_completion = lambda *_args: None
+        self.state._current_motion = "lower_body_balance"
+        started = swing.dispatch("start_swing", {})
+        self.assertEqual("running", started["state"])
+        deadline = time.monotonic() + 1.0
+        while swing._request_id is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        request_id = swing._request_id
+        self.assertIsNotNone(request_id)
+
+        cancelled = plan.dispatch("cancel", {"request_id": request_id})
+        self.assertEqual("requested", cancelled["state"])
+        swing._thread.join(timeout=1.0)
+        self.assertFalse(swing._thread.is_alive())
+        self.assertTrue(swing._halt.is_set())
+        self.assertEqual("planner_cancelled", swing._last_reason)
+        execute_requests = [msg for msg in plan._publisher.messages
+                            if msg.request_type == plan._request_type.REQUEST_PLAN_EXECUTE]
+        self.assertEqual(1, len(execute_requests))
+        self.assertIsNone(plan.owner())
 
     def test_arm_swing_rejects_neutral_replacement_while_worker_is_stopping(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
