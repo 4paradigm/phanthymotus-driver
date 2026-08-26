@@ -2433,6 +2433,41 @@ class JointPlanPlugin:
                     raise TimeoutError(f"joint planner did not complete request {target}")
                 self._state_changed.wait(timeout=min(remaining, 0.2))
 
+    def wait_for_terminal_request(
+        self,
+        request_id: int,
+        timeout: float,
+        cancel_event: threading.Event,
+    ) -> dict:
+        """Wait for an exact request's terminal IDLE state.
+
+        Unlike gesture sequencing, bounded one-shot actions do not require an
+        observed EXECUTING sample. The planner-state subscription is best
+        effort, so a matching terminal IDLE is authoritative even when the
+        intermediate EXECUTING sample was dropped.
+        """
+        if self._state_type is None:
+            raise RuntimeError("joint planner is not started")
+        target = int(request_id)
+        deadline = time.monotonic() + float(timeout)
+        idle = int(self._state_type.IDLE)
+        with self._state_changed:
+            while True:
+                if cancel_event.is_set():
+                    raise RuntimeError(f"joint planner request {target} cancelled")
+                state = dict(self._last_state)
+                current_id = state.get("request_id")
+                status = int(state.get("status", -1))
+                if current_id is not None and int(current_id) == target and status == idle:
+                    self._executing_requests.discard(target)
+                    return state
+                if current_id is not None and int(current_id) > target:
+                    raise RuntimeError(f"joint planner request {target} was superseded")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"joint planner did not complete request {target}")
+                self._state_changed.wait(timeout=min(remaining, 0.2))
+
     def _next_request_id(self) -> int:
         with self._state_lock:
             self._request_id += 1
@@ -2582,16 +2617,32 @@ class WaistPlugin:
             motion, available = self._joint_plan.current_motion()
             positions = self._joint_plan.joint_positions()
             angle_rad = positions[self._JOINT_INDEX] if positions is not None else None
-            return {
+            with self._lock:
+                active = (
+                    self._thread is not None
+                    and self._thread.is_alive()
+                    and self._action_id is not None
+                )
+                action_id = self._action_id
+                request_id = self._request_id
+            status = {
                 **self._metadata(),
-                "state": "ready" if motion == self._REQUIRED_MOTION else "unavailable",
+                "state": (
+                    "running" if active
+                    else "ready" if motion == self._REQUIRED_MOTION
+                    else "unavailable"
+                ),
                 "current_motion": motion,
                 "available_transition_motions": available,
                 "angle_rad": angle_rad,
                 "angle_deg": math.degrees(angle_rad) if angle_rad is not None else None,
             }
+            if active:
+                status["action_id"] = action_id
+                status["request_id"] = request_id
+            return status
         if action not in ("set_angle", "center"):
-            return {"error": f"unknown waist action: {action}"}
+            return None
 
         with self._command_lock:
             return self._start_motion(action, args)
@@ -2661,7 +2712,7 @@ class WaistPlugin:
         status = "completed"
         error = ""
         try:
-            self._joint_plan.wait_for_request(
+            self._joint_plan.wait_for_terminal_request(
                 request_id,
                 duration + self._WAIT_MARGIN_SEC,
                 self._cancel,

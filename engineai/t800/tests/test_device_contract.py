@@ -682,7 +682,7 @@ class DevicePluginContractTests(unittest.TestCase):
     def test_waist_controls_only_j12_with_conservative_absolute_angle(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
         plan.start()
-        plan.wait_for_request = lambda *_args, **_kwargs: {}
+        plan.wait_for_terminal_request = lambda *_args, **_kwargs: {}
         waist = self.device.WaistPlugin(CONFIG, plan)
         completions = []
         waist._notify_completion = lambda *args: completions.append(args)
@@ -715,6 +715,7 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("J12_TORSO_YAW", started["joint_name"])
         self.assertEqual("ready", waist.dispatch("info", {})["state"])
         self.assertEqual({"state": "idle"}, waist.dispatch("stop", {}))
+        self.assertIsNone(waist.dispatch("unsupported", {}))
         self.assertEqual([], plan._publisher.messages)
         schema = waist.get_tool()["inputSchema"]
         self.assertEqual(["set_angle", "center"], schema["x-completion"]["actions"])
@@ -760,6 +761,38 @@ class DevicePluginContractTests(unittest.TestCase):
         cancels = [msg for msg in plan._publisher.messages
                    if msg.request_type == plan._request_type.REQUEST_CANCEL]
         self.assertTrue(any(msg.request_id == request_id for msg in cancels))
+
+    def test_waist_completes_from_matching_idle_when_executing_sample_is_dropped(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        waist = self.device.WaistPlugin(CONFIG, plan)
+        completions = []
+        waist._notify_completion = lambda *args: completions.append(args)
+        self.state._current_motion = "lower_body_balance"
+
+        started = waist.dispatch("set_angle", {"angle_deg": 5.0, "duration": 1.0})
+        active = waist.dispatch("status", {})
+        self.assertEqual("running", active["state"])
+        self.assertEqual(started["action_id"], active["action_id"])
+        self.assertEqual(started["request_id"], active["request_id"])
+
+        # Deliver only the exact terminal state. No EXECUTING sample is sent.
+        plan._on_state(JointMotionPlanState(
+            request_id=started["request_id"],
+            status=JointMotionPlanState.IDLE,
+            progress=1.0,
+        ))
+        waist._thread.join(timeout=1.0)
+        self.assertFalse(waist._thread.is_alive())
+        self.assertEqual("completed", completions[0][1])
+        self.assertEqual(started["request_id"], completions[0][2]["request_id"])
+        cancels = [msg for msg in plan._publisher.messages
+                   if msg.request_type == plan._request_type.REQUEST_CANCEL]
+        self.assertEqual([], cancels)
+        ready = waist.dispatch("status", {})
+        self.assertEqual("ready", ready["state"])
+        self.assertNotIn("action_id", ready)
+        self.assertNotIn("request_id", ready)
 
     def test_waist_status_reports_current_j12_without_publishing(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
