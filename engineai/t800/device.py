@@ -2415,10 +2415,14 @@ class JointPlanPlugin:
             indices = []
         controls_head = action == "reset" or bool(set(indices) & set(T800_JOINT_GROUPS["head"]))
         owner = owner or "joint_plan"
-        if controls_head:
-            busy = self.acquire_head(owner)
-            if busy is not None:
-                return busy
+        # head 执行期间独占整个 planner：任何非所属请求一律拒绝，
+        # 避免非 head 关节的 plan 抬高 request_id 导致 head 被 superseded
+        with self._head_lock:
+            if self._head_owner not in (None, owner):
+                return {"error": "head is busy", "owner": self._head_owner,
+                        "request_id": self._head_request_id}
+            if controls_head:
+                self._head_owner = owner
         msg = self._request_type()
         if action == "cancel":
             target_request_id = int(args.get("request_id", self._request_id))
@@ -2518,9 +2522,21 @@ class HeadActuatorPlugin:
     _READY_TIMEOUT_SEC = 10.0
     _FEEDBACK_GRACE_MAX_SEC = 5.0    # 每个运动步的反馈等待余量上限
     _ACP_SAFETY_MARGIN_SEC = 5.0     # 最坏序列之上的安全余量
+    _DEFAULT_LOOK_POSES = {
+        "forward": {"pitch_rad": 0.0, "yaw_rad": 0.0},
+        "left": {"pitch_rad": 0.0, "yaw_rad": 0.6},
+        "right": {"pitch_rad": 0.0, "yaw_rad": -0.6},
+        "up": {"pitch_rad": -0.3, "yaw_rad": 0.0},
+        "down": {"pitch_rad": 0.3, "yaw_rad": 0.0},
+    }
 
     def __init__(self, config: dict, joint_plan: JointPlanPlugin, state: StatePlugin):
-        self._config = config
+        # 合并默认 look_poses，避免旧配置缺失 head 块时 look 动作全部失效
+        look_poses = dict(self._DEFAULT_LOOK_POSES)
+        configured_poses = config.get("look_poses")
+        if isinstance(configured_poses, dict):
+            look_poses.update(configured_poses)
+        self._config = {**config, "look_poses": look_poses}
         self._joint_plan = joint_plan
         self._state = state
         self._lock = threading.Lock()
@@ -2694,13 +2710,13 @@ class HeadActuatorPlugin:
         if action == "nod":
             try:
                 steps = self._nod_steps(args)
-            except ValueError as exc:
+            except (TypeError, ValueError) as exc:
                 return {"error": str(exc)}
             return self._start_sequence("nod", steps, args)
         if action == "shake":
             try:
                 steps = self._shake_steps(args)
-            except ValueError as exc:
+            except (TypeError, ValueError) as exc:
                 return {"error": str(exc)}
             return self._start_sequence("shake", steps, args)
         if action == "look":
@@ -2771,6 +2787,8 @@ class HeadActuatorPlugin:
         if not 1 <= times <= 5:
             raise ValueError("times must be between 1 and 5")
         speed = float(args.get("speed", 1.0))
+        if not math.isfinite(speed):
+            raise ValueError("speed must be a finite number")
         if not 0.5 <= speed <= 2.0:
             raise ValueError("speed must be between 0.5 and 2.0")
         return times, speed
