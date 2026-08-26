@@ -2360,6 +2360,11 @@ class JointPlanPlugin:
             return "", []
         return self._state.current_motion()
 
+    def joint_positions(self) -> list[float] | None:
+        if self._state is None:
+            return None
+        return self._state.joint_positions()
+
     def wait_until_idle(
         self,
         timeout: float,
@@ -2484,6 +2489,130 @@ class JointPlanPlugin:
                 self._executing_requests.add(int(msg.request_id))
             self._state_changed.notify_all()
         self._core_pub.publish(_json_message(payload))
+
+
+class WaistPlugin:
+    """Conservative absolute-yaw facade for the T800 torso joint."""
+
+    _JOINT_INDEX = T800_JOINT_INDEX["J12_TORSO_YAW"]
+    _JOINT_NAME = "J12_TORSO_YAW"
+    _REQUIRED_MOTION = "lower_body_balance"
+
+    def __init__(self, config: dict, joint_plan: JointPlanPlugin):
+        waist_config = config.get("plugins", {}).get("waist", {})
+        self._joint_plan = joint_plan
+        self._max_abs_angle_deg = float(waist_config.get("max_abs_angle_deg", 30.0))
+        self._default_duration = float(waist_config.get("default_duration", 1.5))
+        if not math.isfinite(self._max_abs_angle_deg) or not 0 < self._max_abs_angle_deg <= 30.0:
+            raise ValueError("waist.max_abs_angle_deg must be between 0 and 30")
+        if not math.isfinite(self._default_duration) or not 0.5 <= self._default_duration <= 5.0:
+            raise ValueError("waist.default_duration must be between 0.5 and 5 seconds")
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "waist",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "安全控制 T800 腰部 J12 偏航；使用绝对角度并限制在正负 30 度内",
+            "inputSchema": action_schema(
+                {
+                    "set_angle": (["angle_deg", "duration"], "设置腰部绝对偏航角度"),
+                    "center": (["duration"], "将腰部回正到 0 度"),
+                    "status": ([], "读取当前腰部角度和运动状态"),
+                    "list": ([], "查看控制范围、关节和状态要求"),
+                },
+                {
+                    "angle_deg": {
+                        "type": "number",
+                        "minimum": -self._max_abs_angle_deg,
+                        "maximum": self._max_abs_angle_deg,
+                        "description": "J12 绝对目标角度；正负方向以机器人坐标系为准",
+                    },
+                    "duration": {
+                        "type": "number",
+                        "minimum": 0.5,
+                        "maximum": 5.0,
+                        "description": "执行时间，秒；默认 1.5",
+                    },
+                },
+                "腰部控制动作",
+            ),
+        }
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "list":
+            return self._metadata()
+        if action == "status":
+            motion, available = self._joint_plan.current_motion()
+            positions = self._joint_plan.joint_positions()
+            angle_rad = positions[self._JOINT_INDEX] if positions is not None else None
+            return {
+                **self._metadata(),
+                "state": "ready" if motion == self._REQUIRED_MOTION else "unavailable",
+                "current_motion": motion,
+                "available_transition_motions": available,
+                "angle_rad": angle_rad,
+                "angle_deg": math.degrees(angle_rad) if angle_rad is not None else None,
+            }
+        if action not in ("set_angle", "center"):
+            return {"error": f"unknown waist action: {action}"}
+
+        motion, available = self._joint_plan.current_motion()
+        if motion != self._REQUIRED_MOTION:
+            return {
+                "error": f"waist requires motion state '{self._REQUIRED_MOTION}' (current: {motion or 'unknown'})",
+                "current_motion": motion,
+                "available_transition_motions": available,
+            }
+
+        angle_deg = 0.0 if action == "center" else self._finite_number(args.get("angle_deg"), "angle_deg")
+        if abs(angle_deg) > self._max_abs_angle_deg:
+            return {"error": f"angle_deg must be between {-self._max_abs_angle_deg:g} and {self._max_abs_angle_deg:g}"}
+        duration = self._finite_number(args.get("duration", self._default_duration), "duration")
+        if not 0.5 <= duration <= 5.0:
+            return {"error": "duration must be between 0.5 and 5 seconds"}
+
+        angle_rad = math.radians(angle_deg)
+        result = self._joint_plan.dispatch("plan", {
+            "joint_indices": [self._JOINT_INDEX],
+            "target_positions": [angle_rad],
+            "duration": duration,
+            "gravity_compensation": True,
+        })
+        return {
+            **result,
+            "joint_index": self._JOINT_INDEX,
+            "joint_name": self._JOINT_NAME,
+            "target_angle_deg": angle_deg,
+            "target_angle_rad": angle_rad,
+            "duration": duration,
+        }
+
+    def _metadata(self) -> dict:
+        return {
+            "joint_index": self._JOINT_INDEX,
+            "joint_name": self._JOINT_NAME,
+            "control_mode": "absolute",
+            "min_angle_deg": -self._max_abs_angle_deg,
+            "max_angle_deg": self._max_abs_angle_deg,
+            "required_motion_state": self._REQUIRED_MOTION,
+            "default_duration": self._default_duration,
+        }
+
+    @staticmethod
+    def _finite_number(value, name: str) -> float:
+        if isinstance(value, bool) or not isinstance(value, numbers.Real):
+            raise ValueError(f"{name} must be a finite number")
+        converted = float(value)
+        if not math.isfinite(converted):
+            raise ValueError(f"{name} must be a finite number")
+        return converted
 
 
 class GesturePlugin:

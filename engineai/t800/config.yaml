@@ -78,6 +78,10 @@ plugins:
     enabled: true
   gesture:
     enabled: true
+  waist:
+    enabled: true
+    max_abs_angle_deg: 30.0
+    default_duration: 1.5
   joint_override:
     enabled: true
   joint_bridge:

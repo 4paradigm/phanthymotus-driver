@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import math
 import os
 import ssl
 import struct
@@ -245,6 +246,7 @@ class DevicePluginContractTests(unittest.TestCase):
             self.device.DancePlugin(motion_mode, self.state),
             joint_plan,
             self.device.GesturePlugin(joint_plan),
+            self.device.WaistPlugin(CONFIG, joint_plan),
             self.device.JointOverridePlugin(CONFIG, "robot", self.ros, self.state),
             self.device.JointBridgePlugin(CONFIG, "robot", self.ros, self.state),
             self.device.LedPlugin(CONFIG, "robot", self.ros),
@@ -273,14 +275,14 @@ class DevicePluginContractTests(unittest.TestCase):
              "robot_snapshot", "fault_summary", "stability", "joint_groups", "capabilities", "ros_graph",
              "mainboard", "heartbeat_status", "motion_command_trace", "motion_events",
              "native_interface_probe",
-             "loco", "motion_mode", "dance", "joint_plan", "joint_plan_state", "gesture",
+             "loco", "motion_mode", "dance", "joint_plan", "joint_plan_state", "gesture", "waist",
              "joint_override", "joint_bridge",
              "led", "tts", "mic", "pointcloud", "camera", "depth",
              "motor_power", "native_node_control", "virtual_gamepad", "safety", "native_sdk"},
             names,
         )
-        self.assertEqual(41, len(names))
-        self.assertEqual(41, len(definitions), "tool names must be unique")
+        self.assertEqual(42, len(names))
+        self.assertEqual(42, len(definitions), "tool names must be unique")
         for tool in definitions:
             schema = tool.get("inputSchema")
             self.assertEqual("object", schema.get("type"), tool["name"])
@@ -676,6 +678,53 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual([13, 14, 15, 16, 17], plugin._publisher.messages[-1].joint_indices)
         plugin.dispatch("hold_current", {})
         self.assertEqual(list(range(25)), plugin._publisher.messages[-1].joint_indices)
+
+    def test_waist_controls_only_j12_with_conservative_absolute_angle(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        waist = self.device.WaistPlugin(CONFIG, plan)
+        self.state._current_motion = "lower_body_balance"
+
+        result = waist.dispatch("set_angle", {"angle_deg": 30, "duration": 2.0})
+        sent = plan._publisher.messages[-1]
+        self.assertEqual("requested", result["state"])
+        self.assertEqual([12], sent.joint_indices)
+        self.assertAlmostEqual(math.pi / 6, sent.target_positions[0])
+        self.assertEqual(2.0, sent.execution_time)
+        self.assertTrue(sent.use_gravity_compensation)
+
+        waist.dispatch("center", {})
+        self.assertEqual([0.0], plan._publisher.messages[-1].target_positions)
+
+    def test_waist_rejects_unsafe_state_angle_and_duration(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        waist = self.device.WaistPlugin(CONFIG, plan)
+
+        blocked = waist.dispatch("set_angle", {"angle_deg": 10})
+        self.assertIn("lower_body_balance", blocked["error"])
+        self.assertEqual([], plan._publisher.messages)
+
+        self.state._current_motion = "lower_body_balance"
+        self.assertIn("between -30 and 30", waist.dispatch("set_angle", {"angle_deg": 31})["error"])
+        self.assertIn("between 0.5 and 5", waist.dispatch("set_angle", {"angle_deg": 0, "duration": 0.1})["error"])
+        with self.assertRaisesRegex(ValueError, "finite number"):
+            waist.dispatch("set_angle", {"angle_deg": float("nan")})
+        self.assertEqual([], plan._publisher.messages)
+
+    def test_waist_status_reports_current_j12_without_publishing(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        waist = self.device.WaistPlugin(CONFIG, plan)
+        self.state._current_motion = "lower_body_balance"
+        self.state._last_joint_positions[12] = 0.25
+
+        status = waist.dispatch("status", {})
+        self.assertEqual("ready", status["state"])
+        self.assertEqual("J12_TORSO_YAW", status["joint_name"])
+        self.assertAlmostEqual(0.25, status["angle_rad"])
+        self.assertAlmostEqual(math.degrees(0.25), status["angle_deg"])
+        self.assertEqual([], plan._publisher.messages)
 
     def test_gesture_exposes_complete_official_sequences_and_custom_queue(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
