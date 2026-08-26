@@ -149,6 +149,12 @@ publishes two algorithm-independent navigation sensor topics:
   RELIABLE + KEEP_LAST(2), with `x/y/z/intensity/tag/line/timestamp` fields;
 - `/ubuntu/navigation/imu` — `sensor_msgs/msg/Imu`, RELIABLE + KEEP_LAST(200);
 
+The `navigation_imu` tool declares `format=sensor/imu`. Its native ROS message
+uses quaternion orientation, angular velocity in rad/s, linear acceleration in
+m/s², and the three standard 3×3 covariance arrays. PhanthyMotus PR #141
+subscribes to this native type and converts it to the versioned
+`phanthy.sensor.imu.v1` dashboard payload without changing the ROS topic.
+
 Both cards share this single worker. Stopping either `navigation_lidar` or
 `navigation_imu` stops both streams and releases the MID360 worker; starting
 either card starts a fresh shared worker again.
@@ -184,7 +190,11 @@ envelope: a fixed little-endian header (`magic`, JSON metadata length, binary
 payload length), canonical JSON metadata, then JPEG or zlib level-1 losslessly
 compressed little-endian Z16 bytes. Depth metadata declares the codec in
 `image.compression` and includes compressed and uncompressed byte counts; zlib
-decompression restores the original Z16 payload.
+decompression restores the original Z16 payload. These uint16 samples use
+`unit=realsense_depth_unit`, not meters; convert each sample with
+`distance_m = raw_value * depth_scale_m`. The
+`depth_scale_semantics=meters_per_realsense_depth_unit` field makes that
+conversion explicit for consumers.
 Every frame repeats its active-profile intrinsics, stable `calibration_id`,
 RealSense Depth-to-RGB transform, source/Driver-receive timing, and the
 configured LiDAR-to-RGB calibration. Invalid, warming-up, reset, or

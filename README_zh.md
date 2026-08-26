@@ -126,6 +126,12 @@ velocity proposal 合同与 `loco.move` 输入边界保持一致：前后和横�
 卡都会停止两路数据并释放 MID360 worker；再次启动任意一张卡会创建新的共享
 worker。
 
+`navigation_imu` 声明 `format=sensor/imu`，原生 ROS 消息为
+`sensor_msgs/msg/Imu`：姿态使用四元数，角速度单位为 rad/s，线加速度
+单位为 m/s²，并保留三组标准 3×3 协方差。PhanthyMotus PR #141
+会按原生类型订阅，再转成版本化的 `phanthy.sensor.imu.v1` 面板载荷，
+不修改 ROS topic 本身。
+
 ### G1 相机自描述帧
 
 RealSense 插件保留现有 `/ubuntu/camera/rgb` 压缩图、
@@ -142,7 +148,11 @@ BEST_EFFORT + KEEP_LAST(1) 自描述帧数据流。它们是通用传感器/数�
 小端头（magic、JSON 元数据长度、二进制载荷长度）之后依次是规范 JSON
 元数据和 JPEG 或 zlib level 1 无损压缩的 Z16 小端载荷。Depth 元数据通过
 `image.compression` 描述压缩方式，并同时记录压缩前后的字节数；消费者先用
-zlib 解压即可恢复原始 Z16。每帧完整携带当前 RealSense profile 内参、
+zlib 解压即可恢复原始 Z16。Z16 的 `uint16` 值单位是
+`realsense_depth_unit`，不是米；换算公式为
+`distance_m = raw_value * depth_scale_m`，并用
+`depth_scale_semantics=meters_per_realsense_depth_unit` 明确比例语义。
+每帧完整携带当前 RealSense profile 内参、
 稳定 `calibration_id`、Depth→RGB 外参、源时间/Driver 接收时间，以及配置的
 LiDAR→RGB 外参。源时间无效、尚在预热、发生时钟重置或倒序时仍发布该帧，
 但明确标记为 `unavailable`，不会用发布时刻伪造采集时间。

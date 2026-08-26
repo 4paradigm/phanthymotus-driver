@@ -80,6 +80,35 @@ def compress_depth_payload(payload: bytes | bytearray | memoryview) -> bytes:
     return zlib.compress(bytes(payload), level=DEPTH_COMPRESSION_LEVEL)
 
 
+def build_depth_image_metadata(
+    *,
+    width: int,
+    height: int,
+    uncompressed_size: int,
+    payload_size: int,
+    depth_scale_m: float,
+) -> dict:
+    scale = float(depth_scale_m)
+    if not math.isfinite(scale) or scale <= 0:
+        raise ValueError("depth_scale_m must be positive and finite")
+    return {
+        "encoding": "z16_le",
+        "width": int(width),
+        "height": int(height),
+        "step_bytes": int(width) * 2,
+        "compression": {
+            "codec": DEPTH_COMPRESSION,
+            "level": DEPTH_COMPRESSION_LEVEL,
+        },
+        "uncompressed_size": int(uncompressed_size),
+        "payload_size": int(payload_size),
+        "unit": "realsense_depth_unit",
+        "depth_scale_m": scale,
+        "depth_scale_semantics": "meters_per_realsense_depth_unit",
+        "aligned_to_rgb": False,
+    }
+
+
 @dataclass(frozen=True)
 class CameraFrameTiming:
     source_stamp_ns: int | None

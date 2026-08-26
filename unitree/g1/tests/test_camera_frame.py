@@ -1,5 +1,6 @@
 import math
 from pathlib import Path
+import struct
 import unittest
 import zlib
 
@@ -15,6 +16,7 @@ from camera_frame import (
     CameraFrameTiming,
     RealSenseClockNormalizer,
     build_calibrations,
+    build_depth_image_metadata,
     build_frame_metadata,
     build_intrinsics,
     compress_depth_payload,
@@ -75,6 +77,28 @@ class CameraEnvelopeTest(unittest.TestCase):
         self.assertEqual(DEPTH_COMPRESSION_LEVEL, 1)
         self.assertLess(len(compressed), len(raw))
         self.assertEqual(zlib.decompress(compressed), raw)
+
+    def test_depth_envelope_declares_raw_units_and_meter_scale(self):
+        raw = struct.pack("<H", 1000)
+        payload = compress_depth_payload(raw)
+        image = build_depth_image_metadata(
+            width=1,
+            height=1,
+            uncompressed_size=len(raw),
+            payload_size=len(payload),
+            depth_scale_m=0.001,
+        )
+        metadata, decoded_payload = decode_envelope(
+            encode_envelope({"schema": DEPTH_SCHEMA, "image": image}, payload)
+        )
+
+        raw_value = struct.unpack("<H", zlib.decompress(decoded_payload))[0]
+        self.assertEqual(metadata["image"]["unit"], "realsense_depth_unit")
+        self.assertEqual(
+            metadata["image"]["depth_scale_semantics"],
+            "meters_per_realsense_depth_unit",
+        )
+        self.assertEqual(raw_value * metadata["image"]["depth_scale_m"], 1.0)
 
 
 class CameraTimingTest(unittest.TestCase):
@@ -255,7 +279,8 @@ class DriverCameraContractTest(unittest.TestCase):
             worker.index("from array import array"),
         )
         self.assertIn("payload = compress_depth_payload(raw_payload)", worker)
-        self.assertIn('"uncompressed_size": len(raw_payload)', worker)
+        self.assertIn("image=build_depth_image_metadata(", worker)
+        self.assertIn("uncompressed_size=len(raw_payload)", worker)
         self.assertIn("if count == 1 or count % 100 == 0:", worker)
         self.assertIn('"frameset_errors": 0', worker)
 

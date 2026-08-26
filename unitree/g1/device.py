@@ -3898,12 +3898,11 @@ def run_realsense_process(
     from std_msgs.msg import String as _String, UInt8MultiArray
     from sensor_msgs.msg import Image, CompressedImage
     from camera_frame import (
-        DEPTH_COMPRESSION,
-        DEPTH_COMPRESSION_LEVEL,
         DEPTH_SCHEMA,
         RGB_SCHEMA,
         RealSenseClockNormalizer,
         build_calibrations,
+        build_depth_image_metadata,
         build_frame_metadata,
         build_intrinsics,
         compress_depth_payload,
@@ -4226,21 +4225,13 @@ def run_realsense_process(
                         timing=timing,
                         driver_receive_monotonic_ns=receive_mono_ns,
                         sequence=sequence,
-                        image={
-                            "encoding": "z16_le",
-                            "width": int(depth_np.shape[1]),
-                            "height": int(depth_np.shape[0]),
-                            "step_bytes": int(depth_np.shape[1] * 2),
-                            "compression": {
-                                "codec": DEPTH_COMPRESSION,
-                                "level": DEPTH_COMPRESSION_LEVEL,
-                            },
-                            "uncompressed_size": len(raw_payload),
-                            "payload_size": len(payload),
-                            "unit": "meter",
-                            "depth_scale_m": calibration["depth_scale_m"],
-                            "aligned_to_rgb": False,
-                        },
+                        image=build_depth_image_metadata(
+                            width=depth_np.shape[1],
+                            height=depth_np.shape[0],
+                            uncompressed_size=len(raw_payload),
+                            payload_size=len(payload),
+                            depth_scale_m=calibration["depth_scale_m"],
+                        ),
                         calibration=calibration,
                     )
                     envelope = encode_envelope(metadata, payload)
