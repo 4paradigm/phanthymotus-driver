@@ -594,6 +594,20 @@ class DevicePluginContractTests(unittest.TestCase):
             plugin.dispatch("hold_current", {})
         self.assertEqual([], plugin._publisher.messages)
 
+    def test_joint_plan_validation_failure_does_not_leak_head_ownership(self):
+        plugin = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        # head joints [23, 24] 但 target_positions 只给 1 个，验证失败
+        with self.assertRaises(ValueError):
+            plugin.dispatch("plan", {
+                "joint_indices": [23, 24],
+                "target_positions": [0.0],
+            })
+        # 验证失败后 head 不应被占有，head_pose 应能正常执行
+        result = plugin.dispatch("head_pose", {"pitch_rad": 0.1, "yaw_rad": 0.0})
+        self.assertEqual("requested", result["state"])
+        self.assertEqual([23, 24], plugin._publisher.messages[-1].joint_indices)
+
     def test_joint_plan_named_head_arm_and_hold_actions(self):
         plugin = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
         plugin.start()

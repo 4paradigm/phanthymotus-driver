@@ -2390,7 +2390,29 @@ class JointPlanPlugin:
             return self._request_id
 
     def _publish_request(self, action: str, args: dict, *, owner: str | None = None) -> dict:
-        indices = validate_joint_indices(args.get("joint_indices")) if action == "plan" else []
+        # 先完成所有验证，再获取 head 所有权，避免验证失败导致所有权泄漏
+        plan_payload: dict | None = None
+        if action == "plan":
+            indices, positions = validate_joint_positions(
+                args.get("joint_indices"),
+                args.get("target_positions"),
+                limit_margin_rad=self._LIMIT_MARGIN_RAD,
+            )
+            velocities = optional_floats(args, "target_velocities", len(indices))
+            stiffness = optional_floats(args, "stiffness", len(indices))
+            damping = optional_floats(args, "damping", len(indices))
+            duration = clamp(args.get("duration", 2.0), 0.05, 120.0)
+            plan_payload = {
+                "indices": indices,
+                "positions": positions,
+                "velocities": velocities,
+                "stiffness": stiffness,
+                "damping": damping,
+                "duration": duration,
+                "gravity_compensation": bool(args.get("gravity_compensation", True)),
+            }
+        else:
+            indices = []
         controls_head = action == "reset" or bool(set(indices) & set(T800_JOINT_GROUPS["head"]))
         owner = owner or "joint_plan"
         if controls_head:
@@ -2418,22 +2440,14 @@ class JointPlanPlugin:
             msg.request_type = (
                 self._request_type.REQUEST_RESET if action == "reset" else self._request_type.REQUEST_PLAN_EXECUTE
             )
-        if action == "plan":
-            indices, positions = validate_joint_positions(
-                args.get("joint_indices"),
-                args.get("target_positions"),
-                limit_margin_rad=self._LIMIT_MARGIN_RAD,
-            )
-            velocities = optional_floats(args, "target_velocities", len(indices))
-            stiffness = optional_floats(args, "stiffness", len(indices))
-            damping = optional_floats(args, "damping", len(indices))
-            msg.use_gravity_compensation = bool(args.get("gravity_compensation", True))
-            msg.joint_indices = indices
-            msg.target_positions = positions
-            msg.target_velocities = velocities
-            msg.execution_time = clamp(args.get("duration", 2.0), 0.05, 120.0)
-            msg.stiffness = stiffness
-            msg.damping = damping
+        if plan_payload is not None:
+            msg.use_gravity_compensation = plan_payload["gravity_compensation"]
+            msg.joint_indices = plan_payload["indices"]
+            msg.target_positions = plan_payload["positions"]
+            msg.target_velocities = plan_payload["velocities"]
+            msg.execution_time = plan_payload["duration"]
+            msg.stiffness = plan_payload["stiffness"]
+            msg.damping = plan_payload["damping"]
         else:
             msg.use_gravity_compensation = False
             msg.joint_indices = []
