@@ -2634,15 +2634,22 @@ class JointPlanPlugin:
             self._state_changed.notify_all()
         if payload["status"] in (0, 1, 3):
             with self._head_lock:
-                # 仅在该请求已观察到 EXECUTING 后，终态才释放直接请求锁
-                # 避免 planner 在 EXECUTING 前发布的初始 IDLE 导致过早释放
                 if (
                     self._head_owner == "joint_plan"
                     and self._head_request_id == payload["request_id"]
-                    and payload["request_id"] in self._executing_requests
                 ):
-                    self._head_owner = None
-                    self._head_request_id = None
+                    # IDLE 仅在该请求已观察到 EXECUTING 后才释放，避免 planner
+                    # 在 EXECUTING 前发布的初始 IDLE 确认帧导致过早释放。
+                    # EXITING / DISABLED 是异常终态（拒绝/故障/禁用），planner
+                    # 不会将其作为执行前确认帧发送，即使未见过 EXECUTING 也必须
+                    # 释放，否则锁会永久泄漏，后续所有 head 动作都报 head is busy。
+                    if (
+                        payload["status"] in (0, 3)
+                        or payload["request_id"] in self._executing_requests
+                    ):
+                        self._head_owner = None
+                        self._head_request_id = None
+                        self._executing_requests.discard(payload["request_id"])
         self._core_pub.publish(_json_message(payload))
 
 
@@ -3079,6 +3086,7 @@ class GesturePlugin:
     _LIMIT_MARGIN_RAD = 0.02
     _READY_TIMEOUT_SEC = 10.0
     _STEP_TIMEOUT_SEC = 15.0
+    _STOP_JOIN_TIMEOUT_SEC = 3.0
     _COOLDOWN_SEC = 3.0
     _ACP_TIMEOUT_SEC = 300.0
     _ACP_CALLBACK_TIMEOUT_SEC = 5.0
@@ -3450,10 +3458,11 @@ class GesturePlugin:
 
     def _stop(self, *, reset_after: bool) -> dict:
         with self._lock:
+            thread = self._thread
             active = (
                 self._status.get("state") == "running"
-                and self._thread is not None
-                and self._thread.is_alive()
+                and thread is not None
+                and thread.is_alive()
             )
             if active:
                 self._cancel.set()
@@ -3465,9 +3474,19 @@ class GesturePlugin:
             result = dict(self._status)
         if request_id is not None:
             self._joint_plan._dispatch_owned("gesture", "cancel", {"request_id": request_id})
+        # 必须等 worker 退出后再释放 head 锁，否则 worker 可能已通过取消检查、
+        # 正准备调用 _dispatch_owned，与新拿到锁的 head 动作竞态（迟到的手势
+        # 请求会报 head is busy 或与新动作并发）。head 锁统一由 worker 的
+        # finally 块释放，这里不提前 release。
+        if active and thread is not threading.current_thread():
+            thread.join(timeout=self._STOP_JOIN_TIMEOUT_SEC)
+            if thread.is_alive():
+                # worker 卡死（极端情况），兜底释放避免永久死锁；release_head
+                # 有 owner 校验，worker 之后迟到的释放不会误伤新 owner。
+                self._joint_plan.release_head("gesture")
         if reset_after:
-            self._joint_plan._dispatch_owned("gesture", "reset", {})
-        self._joint_plan.release_head("gesture")
+            # worker 已退出，reset 作为直接请求派发，由 _on_state 终态释放锁
+            self._joint_plan.dispatch("reset", {})
         with self._lock:
             self._status["state"] = "cancelled"
             return dict(self._status)
