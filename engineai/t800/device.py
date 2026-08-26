@@ -3096,6 +3096,44 @@ class GesturePlugin:
             reset_after=reset_after,
         )
 
+    def _prepare_steps(self, steps: list[dict]) -> list[dict]:
+        prepared = []
+        for offset, source in enumerate(steps, start=1):
+            step = dict(source)
+            if "joint_names" in step:
+                names = step.get("joint_names")
+                if not isinstance(names, (list, tuple)) or not names:
+                    raise ValueError("joint_names must be a non-empty array")
+                unknown = [str(name) for name in names if str(name) not in T800_JOINT_INDEX]
+                if unknown:
+                    raise ValueError(f"unknown joint names: {unknown}")
+                indices = [T800_JOINT_INDEX[str(name)] for name in names]
+            else:
+                indices = step.get("joint_indices")
+            validated_indices, positions = validate_joint_positions(
+                indices,
+                step.get("target_positions"),
+                limit_margin_rad=self._LIMIT_MARGIN_RAD,
+            )
+            duration = float(step.get("duration", 2.0))
+            if not math.isfinite(duration) or not 0.05 <= duration <= 120.0:
+                raise ValueError(f"gesture step {offset} duration must be between 0.05 and 120 seconds")
+            hold_after = float(step.get("hold_after_sec", 0.0))
+            if not math.isfinite(hold_after) or not 0.0 <= hold_after <= 30.0:
+                raise ValueError(f"gesture step {offset} hold_after_sec must be between 0 and 30 seconds")
+            count = len(validated_indices)
+            step["target_positions"] = positions
+            step["duration"] = duration
+            step["hold_after_sec"] = hold_after
+            step["stiffness"] = optional_floats(step, "stiffness", count)
+            step["damping"] = optional_floats(step, "damping", count)
+            step["gravity_compensation"] = bool(step.get("gravity_compensation", True))
+            step["name"] = str(step.get("name", f"step_{offset}"))
+            if "joint_names" not in step:
+                step["joint_indices"] = validated_indices
+            prepared.append(step)
+        return prepared
+
     def _official_steps(self, name: str) -> list[dict]:
         steps = []
         for definition in self._GESTURES[name]:
@@ -3181,6 +3219,7 @@ class GesturePlugin:
                     result = self._joint_plan._dispatch_owned("gesture", "reset", {})
                     if "error" in result:
                         raise ValueError(result["error"])
+                    request_id = int(result["request_id"])
                     with self._lock:
                         self._status["request_id"] = request_id
                         self._status["step_name"] = "reset"

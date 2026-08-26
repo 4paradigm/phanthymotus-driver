@@ -692,7 +692,7 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("completed", completions[0][1])
         self.assertEqual(request_id, completions[0][2]["request_id"])
 
-    def test_gesture_reset_fails_when_exact_request_is_superseded(self):
+    def test_gesture_reset_after_completes_successfully(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
         plan.start()
         gesture = self.device.GesturePlugin(plan)
@@ -725,15 +725,20 @@ class DevicePluginContractTests(unittest.TestCase):
         reset_request = plan._publisher.messages[-1]
         self.assertEqual(JointMotionPlanRequest.REQUEST_RESET, reset_request.request_type)
         plan._on_state(JointMotionPlanState(
-            reset_request.request_id + 1, JointMotionPlanState.IDLE, 1.0
+            reset_request.request_id, JointMotionPlanState.EXECUTING, 0.5
+        ))
+        plan._on_state(JointMotionPlanState(
+            reset_request.request_id, JointMotionPlanState.IDLE, 1.0
         ))
         gesture._thread.join(timeout=1.0)
 
         status = gesture.dispatch("status", {})
-        self.assertEqual("error", status["state"])
-        self.assertIn("superseded", status["error"])
+        self.assertEqual("completed", status["state"])
+        self.assertIsNone(status["error"])
+        self.assertEqual(reset_request.request_id, status["request_id"])
         self.assertEqual(result["action_id"], completions[0][0])
-        self.assertEqual("error", completions[0][1])
+        self.assertEqual("completed", completions[0][1])
+        self.assertEqual(reset_request.request_id, completions[0][2]["request_id"])
 
     def test_gesture_rejects_sequence_beyond_acp_runtime_budget(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
