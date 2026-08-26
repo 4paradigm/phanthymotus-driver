@@ -1067,7 +1067,7 @@ class DevicePluginContractTests(unittest.TestCase):
         )
         self.assertNotIn("start_swing", schema["x-completion"]["actions"])
         self.assertNotIn("halt", schema["x-completion"]["actions"])
-        self.assertGreater(schema["x-completion"]["timeout"], 3)
+        self.assertEqual(15, schema["x-completion"]["timeout"])
         self.assertEqual(
             {"action": "halt"},
             schema["x-hooks"]["on_interrupt_motion"],
@@ -1342,6 +1342,47 @@ class DevicePluginContractTests(unittest.TestCase):
             result = plan.dispatch(action, {**args, "_owner": "arm_swing"})
             self.assertIn("reserved for internal driver use", result["error"])
         self.assertEqual([], plan._publisher.messages)
+
+    def test_joint_plan_owner_acquire_waits_for_public_plan_publication(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        original_publish_request = plan._publish_request
+        publication_entered = threading.Event()
+        allow_publication = threading.Event()
+        owner_acquired = threading.Event()
+        plan_results = []
+        acquire_results = []
+
+        def delayed_publish_request(action, args):
+            if action == "plan":
+                publication_entered.set()
+                allow_publication.wait(timeout=1.0)
+            return original_publish_request(action, args)
+
+        plan._publish_request = delayed_publish_request
+        direct = threading.Thread(target=lambda: plan_results.append(plan.dispatch("plan", {
+            "joint_indices": [23],
+            "target_positions": [0.1],
+            "duration": 1.0,
+        })))
+
+        def acquire_owner():
+            acquire_results.append(plan.acquire("arm_swing"))
+            owner_acquired.set()
+
+        owner = threading.Thread(target=acquire_owner)
+        direct.start()
+        self.assertTrue(publication_entered.wait(timeout=1.0))
+        owner.start()
+        self.assertFalse(owner_acquired.wait(timeout=0.05))
+        allow_publication.set()
+        direct.join(timeout=1.0)
+        owner.join(timeout=1.0)
+        self.assertFalse(direct.is_alive())
+        self.assertFalse(owner.is_alive())
+        self.assertEqual("requested", plan_results[0]["state"])
+        self.assertEqual([True], acquire_results)
+        self.assertTrue(plan.release("arm_swing"))
 
     def test_joint_plan_public_cancel_bypasses_active_owner(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
