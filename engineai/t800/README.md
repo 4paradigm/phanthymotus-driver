@@ -69,8 +69,9 @@ MCP schema 中隐藏。
 
 `arm_swing.start_swing` 支持 2–30 度摆幅；运行中再次调用会更新后续规划。
 `halt` 仅取消并停在当前位置，`return_neutral` 与 `halt_and_return` 会通过
-`joint_plan` 在可配置时间内平滑回到自然姿态。三个异步动作均通过 ACP 报告完成；
-`on_interrupt_motion` 和 `on_interrupt_all` 系统 hook 会绕过 ACP barrier 直接执行 `halt`。
+`joint_plan` 在可配置时间内平滑回到自然姿态。两个有界回正动作通过 ACP 报告完成；
+持续运行的 `start_swing` 不进入 ACP barrier，因此普通 `halt` 和运行时参数更新始终可调用。
+`on_interrupt_motion` 和 `on_interrupt_all` 系统 hook 也会直接执行 `halt`。
 
 `virtual_gamepad` 使用 Native SDK 官方通道
 `virtual_gamepad/gamepad_keys`，默认连接 `udpm://239.255.76.67:7667?ttl=1`。
