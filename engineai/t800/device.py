@@ -2418,6 +2418,10 @@ class JointPlanPlugin:
         # head 执行期间独占整个 planner：任何非所属请求一律拒绝，
         # 避免非 head 关节的 plan 抬高 request_id 导致 head 被 superseded
         with self._head_lock:
+            # 外部 joint_plan 直接调用共享 owner="joint_plan"，持有锁时不允许重入
+            if self._head_owner == "joint_plan" and action != "cancel":
+                return {"error": "head is busy", "owner": self._head_owner,
+                        "request_id": self._head_request_id}
             if self._head_owner not in (None, owner):
                 return {"error": "head is busy", "owner": self._head_owner,
                         "request_id": self._head_request_id}
@@ -2502,7 +2506,13 @@ class JointPlanPlugin:
             self._state_changed.notify_all()
         if payload["status"] in (0, 1, 3):
             with self._head_lock:
-                if self._head_owner == "joint_plan" and self._head_request_id == payload["request_id"]:
+                # 仅在该请求已观察到 EXECUTING 后，终态才释放直接请求锁
+                # 避免 planner 在 EXECUTING 前发布的初始 IDLE 导致过早释放
+                if (
+                    self._head_owner == "joint_plan"
+                    and self._head_request_id == payload["request_id"]
+                    and payload["request_id"] in self._executing_requests
+                ):
                     self._head_owner = None
                     self._head_request_id = None
         self._core_pub.publish(_json_message(payload))
