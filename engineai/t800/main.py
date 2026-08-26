@@ -125,6 +125,7 @@ class T800DeviceBundle:
             SafetyControlPlugin,
             StatePlugin,
             TtsPlugin,
+            UpperBodyActionsPlugin,
             VisionPlugin,
         )
         from virtual_gamepad import VirtualGamepadPlugin
@@ -183,6 +184,11 @@ class T800DeviceBundle:
         if plugins.get("gesture", {}).get("enabled", True) and "joint_plan" in instances:
             instance = GesturePlugin(instances["joint_plan"])
             instances["gesture"] = instance
+            self._plugins.append(instance)
+
+        if plugins.get("upper_body_actions", {}).get("enabled", True) and "gesture" in instances:
+            instance = UpperBodyActionsPlugin(instances["gesture"])
+            instances["upper_body_actions"] = instance
             self._plugins.append(instance)
 
         virtual_gamepad_config = plugins.get("virtual_gamepad", {})

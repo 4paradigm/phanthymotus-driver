@@ -2751,7 +2751,15 @@ class GesturePlugin:
                 f"ACP completion timeout {self._ACP_TIMEOUT_SEC:.0f}s"
             )
 
-    def _start_sequence(self, label: str, steps: list[dict], *, reset_after: bool) -> dict:
+    def _start_sequence(
+        self,
+        label: str,
+        steps: list[dict],
+        *,
+        reset_after: bool,
+        tool_name: str = "gesture",
+        action_id_prefix: str = "t800_gesture",
+    ) -> dict:
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 current = dict(self._status)
@@ -2759,7 +2767,7 @@ class GesturePlugin:
                 return {**current, "error": "another gesture sequence is already running"}
             from uuid import uuid4
 
-            action_id = f"t800_gesture_{uuid4().hex[:12]}"
+            action_id = f"{action_id_prefix}_{uuid4().hex[:12]}"
             self._cancel = threading.Event()
             self._status = {
                 "state": "running", "gesture": label, "step": 0,
@@ -2833,7 +2841,10 @@ class GesturePlugin:
                         "error": self._status.get("error"),
                     }
                 if action_id is not None:
-                    self._acp_notify(action_id, final_status, final_result)
+                    if tool_name == "gesture":
+                        self._acp_notify(action_id, final_status, final_result)
+                    else:
+                        self._acp_notify(action_id, final_status, final_result, tool_name=tool_name)
 
         thread = threading.Thread(target=run, daemon=True, name="t800-gesture-sequence")
         with self._lock:
@@ -2868,7 +2879,13 @@ class GesturePlugin:
         return result
 
     @staticmethod
-    def _acp_notify(action_id: str, status: str, result: dict) -> None:
+    def _acp_notify(
+        action_id: str,
+        status: str,
+        result: dict,
+        *,
+        tool_name: str = "gesture",
+    ) -> None:
         """Report asynchronous gesture completion to Agent Core."""
         import json as _json
         import os as _os
@@ -2892,7 +2909,7 @@ class GesturePlugin:
                 "action_id": action_id,
                 "status": status,
                 "result": result,
-                "tool": "gesture",
+                "tool": tool_name,
                 "ts": time.time(),
             }).encode()
             request = _urllib.Request(
@@ -2908,6 +2925,134 @@ class GesturePlugin:
             )
         except Exception as exc:
             print(f"[gesture] ACP callback failed for {action_id}: {exc}", flush=True)
+
+
+class UpperBodyActionsPlugin:
+    """Driver-defined semantic upper-body poses executed by the joint planner."""
+
+    _INDICES = list(T800_JOINT_GROUPS["arms"])
+    _NEUTRAL = [0.028, 0.084, -0.001, -0.066, 0.0, 0.024, -0.081, 0.001, -0.069, 0.0]
+    _POSES = {
+        "point_forward": {
+            "left": [-0.47, -0.255, -0.161, -0.731, -0.028, 0.024, -0.081, 0.001, -0.069, 0.0],
+            "right": [0.028, 0.084, -0.001, -0.066, 0.0, -0.47, 0.255, 0.161, -0.731, 0.028],
+        },
+        "guard": [-0.35, 0.22, -0.15, -1.05, 0.0, -0.35, -0.22, 0.15, -1.05, 0.0],
+        "chest_open": [0.05, 0.75, 0.0, -0.25, 0.0, 0.05, -0.75, 0.0, -0.25, 0.0],
+        "arm_raise": [-1.0, 0.18, 0.0, -0.2, 0.0, -1.0, -0.18, 0.0, -0.2, 0.0],
+        "side_reach": [0.0, 1.0, 0.0, -0.15, 0.0, 0.0, -1.0, 0.0, -0.15, 0.0],
+    }
+
+    def __init__(self, gesture: GesturePlugin):
+        self._gesture = gesture
+
+    def get_tool(self) -> dict:
+        schema = action_schema(
+            {
+                "play": (["name", "side", "duration", "hold_sec", "return_neutral"], "执行 Driver 预设上肢动作"),
+                "return_neutral": (["duration"], "双臂回到自然姿态"),
+                "halt": ([], "请求取消当前规划；实际响应取决于固件 planner"),
+                "status": ([], "查询当前动作与规划步骤"),
+                "list": ([], "列出 Driver 预设动作及验证状态"),
+            },
+            {
+                "name": {"type": "string", "enum": list(self._POSES)},
+                "side": {"type": "string", "enum": ["left", "right"], "description": "point_forward 使用；默认 right"},
+                "duration": {"type": "number", "minimum": 0.8, "maximum": 4.0, "description": "到达姿态时间，默认 1.5 秒"},
+                "hold_sec": {"type": "number", "minimum": 0.0, "maximum": 5.0, "description": "保持时间，默认 0.5 秒"},
+                "return_neutral": {"type": "boolean", "description": "动作后回自然姿态，默认 true"},
+            },
+            "语义化上肢动作",
+        )
+        schema["x-completion"] = {"actions": ["play", "return_neutral"], "timeout": 60}
+        schema["x-hooks"] = {
+            "on_interrupt_motion": {"action": "halt"},
+            "on_interrupt_all": {"action": "halt"},
+        }
+        return {
+            "name": "upper_body_actions",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "T800 Driver 预设的指向、防守和热身动作；非官方动作资源",
+            "inputSchema": schema,
+        }
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        self._gesture._stop(reset_after=False)
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "list":
+            return {
+                "state": "ready",
+                "actions": [{"name": name, "source": "driver_preset", "hardware_validated": False} for name in self._POSES],
+                "required_motion_state": "lower_body_balance",
+            }
+        if action == "status":
+            status = self._gesture.dispatch("status", {})
+            return {**status, "tool": "upper_body_actions"}
+        if action == "halt":
+            return {**self._gesture._stop(reset_after=False), "cancel_is_best_effort": True}
+        if action not in ("play", "return_neutral"):
+            return {"error": f"unknown upper body action: {action}"}
+
+        motion, _ = self._gesture._joint_plan.current_motion()
+        if motion != "lower_body_balance":
+            return {"error": f"upper_body_actions requires lower_body_balance (current: {motion or 'unknown'})"}
+        try:
+            duration = float(args.get("duration", 1.5))
+            hold_sec = float(args.get("hold_sec", 0.5))
+        except (TypeError, ValueError):
+            return {"error": "duration and hold_sec must be numbers"}
+        if not math.isfinite(duration) or not 0.8 <= duration <= 4.0:
+            return {"error": "duration must be between 0.8 and 4 seconds"}
+        if not math.isfinite(hold_sec) or not 0.0 <= hold_sec <= 5.0:
+            return {"error": "hold_sec must be between 0 and 5 seconds"}
+
+        if action == "return_neutral":
+            label = "return_neutral"
+            positions = list(self._NEUTRAL)
+            steps = [self._step(label, positions, duration, 0.0)]
+        else:
+            label = str(args.get("name", ""))
+            pose = self._POSES.get(label)
+            if pose is None:
+                return {"error": f"unknown upper body preset: {label}"}
+            if isinstance(pose, dict):
+                side = str(args.get("side", "right"))
+                if side not in pose:
+                    return {"error": "side must be left or right"}
+                positions = list(pose[side])
+                label = f"{label}_{side}"
+            else:
+                positions = list(pose)
+            steps = [self._step(label, positions, duration, hold_sec)]
+            if bool(args.get("return_neutral", True)):
+                steps.append(self._step("return_neutral", list(self._NEUTRAL), duration, 0.0))
+        try:
+            prepared = self._gesture._prepare_steps(steps)
+            self._gesture._validate_completion_budget(prepared, reset_after=False)
+        except (TypeError, ValueError) as exc:
+            return {"error": str(exc)}
+        return self._gesture._start_sequence(
+            label,
+            prepared,
+            reset_after=False,
+            tool_name="upper_body_actions",
+            action_id_prefix="t800_upper_body",
+        )
+
+    def _step(self, name: str, positions: list[float], duration: float, hold_sec: float) -> dict:
+        return {
+            "name": name,
+            "joint_indices": list(self._INDICES),
+            "target_positions": positions,
+            "duration": duration,
+            "hold_after_sec": hold_sec,
+            "gravity_compensation": True,
+        }
 
 
 class _JointStreamBase:
