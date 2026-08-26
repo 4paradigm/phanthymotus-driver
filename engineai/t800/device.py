@@ -2542,6 +2542,7 @@ class JointPlanPlugin:
             if controls_head:
                 self._head_owner = owner
         msg = self._request_type()
+        cancels_direct_head_lease = False
         if action == "cancel":
             target_request_id = int(args.get("request_id", self._request_id))
             with self._head_lock:
@@ -2555,6 +2556,13 @@ class JointPlanPlugin:
                         "owner": self._head_owner,
                         "request_id": target_request_id,
                     }
+                # cancel 外部直接 head 请求时，标记稍后释放锁
+                # 避免请求在 EXECUTING 前被 cancel 时，_on_state 因未看到 EXECUTING 而永久持有锁
+                if (
+                    self._head_owner == "joint_plan"
+                    and self._head_request_id == target_request_id
+                ):
+                    cancels_direct_head_lease = True
             msg.request_id = target_request_id
             msg.request_type = self._request_type.REQUEST_CANCEL
         else:
@@ -2590,6 +2598,12 @@ class JointPlanPlugin:
                         self._head_request_id = None
                         self._head_owner = None
             raise
+        # cancel 外部直接 head 请求后立即释放锁，无需等待 EXECUTING→终态
+        if cancels_direct_head_lease:
+            with self._head_lock:
+                if self._head_owner == "joint_plan" and self._head_request_id == target_request_id:
+                    self._head_owner = None
+                    self._head_request_id = None
         request = {
             "state": "published",
             "request_id": int(msg.request_id),

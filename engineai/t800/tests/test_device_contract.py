@@ -1471,6 +1471,22 @@ class DevicePluginContractTests(unittest.TestCase):
         plan._on_state(JointMotionPlanState(req_id, JointMotionPlanState.IDLE, 1.0))
         self.assertIsNone(plan.head_status()["owner"])
 
+    def test_direct_head_request_released_on_cancel_before_executing(self):
+        """直接 head 请求在 EXECUTING 前被 cancel 时，锁应立即释放，不永久持有。"""
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        result = plan.dispatch("head_pose", {"pitch_rad": 0.1, "yaw_rad": 0.0})
+        req_id = result["request_id"]
+        self.assertEqual("joint_plan", plan.head_status()["owner"])
+        # 未发布 EXECUTING，直接 cancel
+        cancelled = plan.dispatch("cancel", {"request_id": req_id})
+        self.assertEqual("requested", cancelled["state"])
+        # cancel 后锁应立即释放
+        self.assertIsNone(plan.head_status()["owner"])
+        # 后续请求应能正常获取锁
+        again = plan.dispatch("head_pose", {"pitch_rad": 0.2, "yaw_rad": 0.0})
+        self.assertEqual("requested", again["state"])
+
     def test_head_nod_shake_rejects_invalid_speed_types(self):
         """speed 为 null/数组/对象时应返回 error，而非 TypeError 逃逸。"""
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
