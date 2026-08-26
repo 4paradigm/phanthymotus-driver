@@ -3113,6 +3113,15 @@ class ArmSwingPlugin:
                 "持续摆臂动作",
             ),
         }
+        schema = tool["inputSchema"]
+        schema["x-completion"] = {
+            "actions": ["start_swing", "return_neutral", "halt_and_return"],
+            "timeout": int(self._ACP_TIMEOUT_SEC),
+        }
+        schema["x-hooks"] = {
+            "on_interrupt_motion": {"action": "halt"},
+            "on_interrupt_all": {"action": "halt"},
+        }
         return tool
 
     def start(self) -> None:
