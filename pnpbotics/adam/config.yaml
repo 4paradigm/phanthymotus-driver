@@ -63,9 +63,8 @@ plugins:
     position_max: 1800
     control_rate_hz: 400
     state_timeout_sec: 1.0
-    # Close the four non-thumb fingers while rotating the thumb to 1000, then
-    # flex the thumb to 100. Lower flexion values mean more closed on Adam.
-    close_stage_delay_sec: 0.8
+    # Close the four non-thumb fingers while rotating the thumb to 1000 and
+    # flexing it to 100 at the same time. Lower flexion values mean more closed.
     thumb_close_positions: [100, 1000, 100, 1000]  # left flex/rotate, right flex/rotate
     thumb_close_min_flex_position: 100
     open_positions: [1800, 1800, 1800, 1800, 1600, 0, 1800, 1800, 1800, 1800, 1600, 0]

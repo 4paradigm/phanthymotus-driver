@@ -861,12 +861,6 @@ class HandPlugin:
             thumb_min = 100
         self._thumb_close_min_flex_position = max(0, min(self._max_val, thumb_min))
         try:
-            self._close_stage_delay_sec = float(plugin_config.get("close_stage_delay_sec", 0.8))
-        except (TypeError, ValueError):
-            self._close_stage_delay_sec = 0.8
-        if self._close_stage_delay_sec < 0:
-            self._close_stage_delay_sec = 0.8
-        try:
             self._control_rate_hz = float(plugin_config.get("control_rate_hz", 400))
         except (TypeError, ValueError):
             self._control_rate_hz = 400.0
@@ -892,7 +886,6 @@ class HandPlugin:
         self._wake_event = threading.Event()
         self._control_thread = None
         self._hand_poll_thread = None
-        self._close_sequence_thread = None
         self._command_generation = 0
         self._last_write_ok = None
         self._last_write_at_ms = None
@@ -995,8 +988,8 @@ class HandPlugin:
                     "close": {
                         "params": [],
                         "description": (
-                            "Close in two stages: first pinky/ring/middle/index, "
-                            "then move the thumb to its limited safe target"
+                            "Close pinky/ring/middle/index while simultaneously "
+                            "rotating and flexing the thumb to its safe target"
                         ),
                     },
                     "set_fingers": {
@@ -1054,7 +1047,6 @@ class HandPlugin:
             "close_positions": list(self._close_positions),
             "thumb_close_positions": list(self._thumb_close_positions),
             "thumb_close_min_flex_position": self._thumb_close_min_flex_position,
-            "close_stage_delay_sec": self._close_stage_delay_sec,
             "target": target,
             "last_write_ok": last_write_ok,
             "last_write_at_ms": last_write_at_ms,
@@ -1097,51 +1089,19 @@ class HandPlugin:
             self._wake_event.wait(period)
             self._wake_event.clear()
 
-    def _staged_close_targets(self) -> tuple[list[int], list[int]]:
-        """Build two-stage targets: rotate the thumb, then flex it closed."""
-        first_stage = list(self._close_positions)
-        final_stage = list(self._close_positions)
+    def _close_target(self) -> list[int]:
+        """Build one close target for all four fingers and both thumb axes."""
+        target = list(self._close_positions)
         for side_offset, thumb_offset in ((0, 0), (6, 2)):
-            # Close the four non-thumb fingers first while rotating the thumb
-            # into the configured 1000-position grip angle. Keep thumb flexion
-            # open until the other fingers have finished closing.
-            first_stage[side_offset + 4] = self._open_positions[side_offset + 4]
-            first_stage[side_offset + 5] = self._thumb_close_positions[thumb_offset + 1]
-
             # The current Adam client mapping becomes more closed as the
-            # flexion position decreases. After the rotation stage, flex the
-            # thumb to the configured final position.
-            final_stage[side_offset + 4] = max(
+            # flexion position decreases. Send both thumb axes in the same
+            # target as the four non-thumb fingers so they move concurrently.
+            target[side_offset + 4] = max(
                 self._thumb_close_positions[thumb_offset],
                 self._thumb_close_min_flex_position,
             )
-            final_stage[side_offset + 5] = self._thumb_close_positions[thumb_offset + 1]
-        return first_stage, final_stage
-
-    def _finish_staged_close(self, generation: int, final_stage: list[int]):
-        if self._shutdown_event.wait(self._close_stage_delay_sec):
-            return
-        with self._lock:
-            if generation != self._command_generation or not self._active:
-                return
-            self._target_positions = list(final_stage)
-        self._wake_event.set()
-
-    def _staged_close(self) -> dict:
-        first_stage, final_stage = self._staged_close_targets()
-        result = self._activate(first_stage)
-        if result.get("state") == "error":
-            return result
-        with self._lock:
-            generation = self._command_generation
-        self._close_sequence_thread = threading.Thread(
-            target=self._finish_staged_close,
-            args=(generation, final_stage),
-            daemon=True,
-            name="adam_hand_staged_close",
-        )
-        self._close_sequence_thread.start()
-        return result
+            target[side_offset + 5] = self._thumb_close_positions[thumb_offset + 1]
+        return target
 
     def _activate(self, positions: list[int]) -> dict:
         if not HAS_PND_SDK or self._hand_pub is None:
@@ -1171,7 +1131,7 @@ class HandPlugin:
         if action == "open":
             return self._activate(self._open_positions)
         if action == "close":
-            return self._staged_close()
+            return self._activate(self._close_target())
         if action == "set_fingers":
             side = args.get("side")
             channel = args.get("channel")
