@@ -2292,6 +2292,15 @@ class JointPlanPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict:
+        if "_owner" in args:
+            return {"error": "_owner is reserved for internal driver use"}
+        return self._dispatch(action, args, owner=None)
+
+    def dispatch_owned(self, owner: str, action: str, args: dict) -> dict:
+        """Dispatch for an in-process plugin that already owns the planner."""
+        return self._dispatch(action, args, owner=owner)
+
+    def _dispatch(self, action: str, args: dict, *, owner: str | None) -> dict:
         if action == "start":
             return {"state": "running" if args.get("_tool_name") == "joint_plan_state" else "ready"}
         if action in ("info", "status", "joint_plan_state"):
@@ -2302,13 +2311,12 @@ class JointPlanPlugin:
             return snapshot
         if action == "stop":
             return {"state": "idle"}
-        if action == "cancel":
-            return self._publish_request("cancel", args)
-        owner = args.get("_owner")
         with self._owner_lock:
             active_owner = self._owner
         if active_owner is not None and owner != active_owner:
             return {"error": f"joint planner is owned by {active_owner}"}
+        if action == "cancel":
+            return self._publish_request("cancel", args)
         if action == "reset":
             return self._publish_request("reset", args)
         if action == "preset":
@@ -2812,7 +2820,7 @@ class GesturePlugin:
                         self._status["step"] = index
                         self._status["step_name"] = step["name"]
                     action = "plan_named" if "joint_names" in step else "plan"
-                    result = self._joint_plan.dispatch(action, {**step, "_owner": "gesture"})
+                    result = self._joint_plan.dispatch_owned("gesture", action, step)
                     if "error" in result:
                         raise ValueError(result["error"])
                     request_id = int(result["request_id"])
@@ -2827,7 +2835,7 @@ class GesturePlugin:
                     if hold_after > 0 and self._cancel.wait(hold_after):
                         raise RuntimeError("gesture cancelled")
                 if not self._cancel.is_set() and reset_after:
-                    result = self._joint_plan.dispatch("reset", {"_owner": "gesture"})
+                    result = self._joint_plan.dispatch_owned("gesture", "reset", {})
                     if "error" in result:
                         raise ValueError(result["error"])
                     request_id = int(result["request_id"])
@@ -2848,7 +2856,9 @@ class GesturePlugin:
             except Exception as exc:
                 cancelled = self._cancel.is_set()
                 if request_id is not None:
-                    self._joint_plan.dispatch("cancel", {"request_id": request_id})
+                    self._joint_plan.dispatch_owned(
+                        "gesture", "cancel", {"request_id": request_id}
+                    )
                 with self._lock:
                     self._status["state"] = "cancelled" if cancelled else "error"
                     self._status["error"] = "" if cancelled else str(exc)
@@ -2895,9 +2905,11 @@ class GesturePlugin:
                 request_id = None
             result = dict(self._status)
         if request_id is not None:
-            self._joint_plan.dispatch("cancel", {"request_id": request_id})
+            self._joint_plan.dispatch_owned(
+                "gesture", "cancel", {"request_id": request_id}
+            )
         if reset_after:
-            self._joint_plan.dispatch("reset", {"_owner": "gesture"})
+            self._joint_plan.dispatch_owned("gesture", "reset", {})
         return result
 
     @staticmethod
@@ -3185,7 +3197,7 @@ class ArmSwingPlugin:
                     # halt either wins before publication or observes the ID.
                     if self._halt.is_set():
                         break
-                    result = self._joint_plan.dispatch("plan", {
+                    result = self._joint_plan.dispatch_owned(self._OWNER, "plan", {
                         "joint_indices": self._INDICES,
                         "target_positions": [
                             self._BASE[0] + offset,
@@ -3195,7 +3207,6 @@ class ArmSwingPlugin:
                         ],
                         "duration": step_duration,
                         "gravity_compensation": True,
-                        "_owner": self._OWNER,
                     })
                     if "error" in result:
                         raise RuntimeError(str(result["error"]))
@@ -3235,7 +3246,9 @@ class ArmSwingPlugin:
             # A request can still be live when the worker is interrupted or
             # errors. Always cancel it before declaring the card idle.
             if request_id is not None:
-                self._joint_plan.dispatch("cancel", {"request_id": request_id})
+                self._joint_plan.dispatch_owned(
+                    self._OWNER, "cancel", {"request_id": request_id}
+                )
             self._joint_plan.release(self._OWNER)
             if action_id is not None:
                 self._notify_completion(action_id, final_status, final_result)
@@ -3257,16 +3270,20 @@ class ArmSwingPlugin:
             self._last_reason = reason
             self._halt.set()
         if request_id is not None:
-            self._joint_plan.dispatch("cancel", {"request_id": request_id})
+            self._joint_plan.dispatch_owned(
+                self._OWNER, "cancel", {"request_id": request_id}
+            )
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=1.0)
         return self._status()
 
     def _return_neutral(self, args: dict, action: str) -> dict:
         try:
-            duration = clamp(args.get("duration", 1.5), 0.5, 5.0)
+            duration = float(args.get("duration", 1.5))
         except (TypeError, ValueError) as exc:
             return {"error": str(exc)}
+        if not math.isfinite(duration) or not 0.5 <= duration <= 5.0:
+            return {"error": "duration must be finite and between 0.5 and 5.0 seconds"}
         self._halt_swing(action)
         with self._lock:
             motion, available = self._state.current_motion()
@@ -3310,12 +3327,11 @@ class ArmSwingPlugin:
                 abort_reason = self._motion_state_abort_reason()
                 if abort_reason:
                     raise RuntimeError(abort_reason)
-                result = self._joint_plan.dispatch("plan", {
+                result = self._joint_plan.dispatch_owned(self._OWNER, "plan", {
                     "joint_indices": self._INDICES,
                     "target_positions": self._BASE,
                     "duration": duration,
                     "gravity_compensation": True,
-                    "_owner": self._OWNER,
                 })
                 if "error" in result:
                     raise RuntimeError(str(result["error"]))
@@ -3358,7 +3374,9 @@ class ArmSwingPlugin:
                     "control_backend": "joint_plan",
                 }
             if live_request_id is not None:
-                self._joint_plan.dispatch("cancel", {"request_id": live_request_id})
+                self._joint_plan.dispatch_owned(
+                    self._OWNER, "cancel", {"request_id": live_request_id}
+                )
             self._joint_plan.release(self._OWNER)
             if action_id is not None:
                 self._notify_completion(action_id, final_status, final_result)
