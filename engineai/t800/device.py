@@ -3119,7 +3119,10 @@ class ArmSwingPlugin:
         }
         schema = tool["inputSchema"]
         schema["x-completion"] = {
-            "actions": ["start_swing", "return_neutral", "halt_and_return"],
+            # start_swing is intentionally continuous. Registering it here
+            # would hold Agent Core's actuator barrier and make its ordinary
+            # halt and runtime parameter updates unreachable.
+            "actions": ["return_neutral", "halt_and_return"],
             "timeout": int(self._ACP_TIMEOUT_SEC),
         }
         schema["x-hooks"] = {

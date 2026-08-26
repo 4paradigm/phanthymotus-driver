@@ -1062,9 +1062,11 @@ class DevicePluginContractTests(unittest.TestCase):
         schema = swing.get_tool()["inputSchema"]
         actions = schema["properties"]["action"]["enum"]
         self.assertEqual(
-            ["start_swing", "return_neutral", "halt_and_return"],
+            ["return_neutral", "halt_and_return"],
             schema["x-completion"]["actions"],
         )
+        self.assertNotIn("start_swing", schema["x-completion"]["actions"])
+        self.assertNotIn("halt", schema["x-completion"]["actions"])
         self.assertGreater(schema["x-completion"]["timeout"], 3)
         self.assertEqual(
             {"action": "halt"},
