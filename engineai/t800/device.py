@@ -4336,24 +4336,12 @@ class _MappingDB:
             self._conn.execute("ALTER TABLE maps ADD COLUMN cloud_path TEXT")
         except sqlite3.OperationalError:
             pass  # column already exists
-        # Add origin columns (建图起始时刻的 odometry 位姿，用于 load_map 时重定位校验)
-        for col, ddl in [
-            ("origin_x", "ALTER TABLE maps ADD COLUMN origin_x REAL DEFAULT 0"),
-            ("origin_y", "ALTER TABLE maps ADD COLUMN origin_y REAL DEFAULT 0"),
-            ("origin_yaw", "ALTER TABLE maps ADD COLUMN origin_yaw REAL DEFAULT 0"),
-        ]:
-            try:
-                self._conn.execute(ddl)
-            except sqlite3.OperationalError:
-                pass  # column already exists
         self._conn.commit()
 
-    def add_map(self, name: str, pcd_path: str, point_count: int,
-                origin_x: float = 0.0, origin_y: float = 0.0, origin_yaw: float = 0.0) -> None:
+    def add_map(self, name: str, pcd_path: str, point_count: int) -> None:
         self._conn.execute(
-            "INSERT OR REPLACE INTO maps (name, pcd_path, point_count, origin_x, origin_y, origin_yaw) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (name, pcd_path, point_count, origin_x, origin_y, origin_yaw),
+            "INSERT OR REPLACE INTO maps (name, pcd_path, point_count) VALUES (?, ?, ?)",
+            (name, pcd_path, point_count),
         )
         self._conn.commit()
 
@@ -4467,8 +4455,6 @@ class ControlledSpatialPlugin:
         db_path = plugin_config.get("db_path", "/opt/phanthy-motus/data/mapping.db")
         self._voxel_size = float(plugin_config.get("voxel_size", 0.05))
         self._max_points = int(plugin_config.get("max_points", 5_000_000))
-        self._load_origin_position_tolerance_m = float(plugin_config.get("load_origin_position_tolerance_m", 0.5))
-        self._load_origin_yaw_tolerance_rad = float(plugin_config.get("load_origin_yaw_tolerance_rad", math.radians(30)))
         self._odometry_topic = plugin_config.get(
             "odometry_topic", "/manifold/ODIN2/device0/odometry"
         )
@@ -4487,7 +4473,6 @@ class ControlledSpatialPlugin:
         self._start_time: float | None = None
         self._frame_count = 0
         self._lock = threading.Lock()
-        self._mapping_origin: dict | None = None  # 建图起始时刻的 odometry 位姿（地图原点）
 
         # 启动时从 DB 恢复上次的 active_map（持久化）
         saved_active = self._db.get_state("active_map")
@@ -4618,7 +4603,6 @@ class ControlledSpatialPlugin:
             self._global_points = None
             self._start_time = time.monotonic()
             self._frame_count = 0
-            self._mapping_origin = None  # 将在第一帧 odometry 到达时记录
 
         try:
             self._db.set_state("map_status", "mapping")
@@ -4687,7 +4671,6 @@ class ControlledSpatialPlugin:
             self._start_time = None
             self._frame_count = 0
             self._active_map = None
-            self._mapping_origin = None
 
         try:
             self._db.set_state("map_status", "idle")
@@ -4815,59 +4798,15 @@ class ControlledSpatialPlugin:
         map_info = self._db.get_map(map_name)
         if not map_info:
             return {"error": f"map '{map_name}' not found"}
-
-        # 读取建图时记录的起始 odometry 位姿（地图原点）
-        origin_x = float(map_info.get("origin_x", 0.0))
-        origin_y = float(map_info.get("origin_y", 0.0))
-        origin_yaw = float(map_info.get("origin_yaw", 0.0))
-
-        # 读取当前 odometry 位姿
-        pose = self._get_pose()
-        if pose is None:
-            return {"error": "no odometry pose available yet; wait for robot to publish odometry and retry"}
-
-        cur_x = float(pose["x"])
-        cur_y = float(pose["y"])
-        cur_yaw = float(pose.get("yaw", 0.0))
-
-        # 计算偏差
-        dx = cur_x - origin_x
-        dy = cur_y - origin_y
-        pos_dist = math.sqrt(dx * dx + dy * dy)
-        # 最短角距离（处理 ±π 翻转）
-        yaw_diff = abs(math.atan2(math.sin(cur_yaw - origin_yaw), math.cos(cur_yaw - origin_yaw)))
-
-        if pos_dist > self._load_origin_position_tolerance_m or yaw_diff > self._load_origin_yaw_tolerance_rad:
-            return {
-                "error": "robot is not at map origin",
-                "map_name": map_name,
-                "origin": {"x": round(origin_x, 3), "y": round(origin_y, 3), "yaw": round(origin_yaw, 3)},
-                "current": {"x": round(cur_x, 3), "y": round(cur_y, 3), "yaw": round(cur_yaw, 3)},
-                "deviation": {
-                    "position_m": round(pos_dist, 3),
-                    "yaw_deg": round(math.degrees(yaw_diff), 1),
-                },
-                "threshold": {
-                    "position_m": self._load_origin_position_tolerance_m,
-                    "yaw_deg": round(math.degrees(self._load_origin_yaw_tolerance_rad), 1),
-                },
-                "hint": "请将机器人移动到建图起始位置（原点），朝向与建图时一致后再次调用 load_map",
-            }
-
-        # 位置接近，加载成功
         self._active_map = map_name
-        self._loaded_points = None  # 不加载点云到内存，仅设置活动地图
+        self._loaded_points = None  # 第一期不加载点云到内存，仅设置活动地图
         self._db.set_state("active_map", map_name)
-        print(
-            f"[controlled_spatial] loaded map '{map_name}' as active "
-            f"(pos_dev={pos_dist:.3f}m, yaw_dev={math.degrees(yaw_diff):.1f}°)",
-            flush=True,
-        )
+        print(f"[controlled_spatial] loaded map '{map_name}' as active", flush=True)
         return {
             "status": "loaded",
             "map_name": map_name,
             "pcd_path": map_info["pcd_path"],
-            "deviation": {"position_m": round(pos_dist, 3), "yaw_deg": round(math.degrees(yaw_diff), 1)},
+            "note": "T800 无 SLAM 重定位服务，请手动将机器人放置在地图原点附近",
         }
 
     # ── Helpers ──────────────────────────────────────────────────────
@@ -4948,12 +4887,6 @@ class ControlledSpatialPlugin:
                 "qw": float(orientation.w),
                 "yaw": round(yaw, 4),
             }
-            # 建图开始后，记录第一帧 odometry 作为地图原点参考
-            if self._is_mapping and self._mapping_origin is None:
-                self._mapping_origin = dict(self._current_pose)
-                print(f"[controlled_spatial] mapping origin recorded: "
-                      f"x={self._mapping_origin['x']:.3f} y={self._mapping_origin['y']:.3f} "
-                      f"yaw={self._mapping_origin['yaw']:.3f}", flush=True)
 
     def _on_pointcloud(self, msg) -> None:
         with self._lock:
@@ -5065,13 +4998,7 @@ class ControlledSpatialPlugin:
             return {"error": f"failed to write PCD: {exc}"}
 
         try:
-            origin = self._mapping_origin or {}
-            self._db.add_map(
-                map_name, pcd_path, point_count,
-                origin_x=origin.get("x", 0.0),
-                origin_y=origin.get("y", 0.0),
-                origin_yaw=origin.get("yaw", 0.0),
-            )
+            self._db.add_map(map_name, pcd_path, point_count)
         except Exception as exc:
             return {"error": f"failed to update database: {exc}", "pcd_path": pcd_path, "point_count": point_count}
 

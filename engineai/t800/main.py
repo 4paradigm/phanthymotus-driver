@@ -90,10 +90,6 @@ class DualDomainROS2:
             rclpy.shutdown(context=self.ctx_robot)
         if rclpy.ok(context=self.ctx_core):
             rclpy.shutdown(context=self.ctx_core)
-        for thread in self._threads:
-            if thread is not threading.current_thread():
-                thread.join(timeout=2.0)
-        self._threads.clear()
 
 
 class T800DeviceBundle:
