@@ -3181,6 +3181,11 @@ class ArmSwingPlugin:
             return {"error": str(exc)}
         with self._lock:
             running = self._thread is not None and self._thread.is_alive()
+            if running and self._halt.is_set():
+                return {
+                    "error": "previous arm_swing action is still stopping; retry",
+                    "state": "stopping",
+                }
             self._amplitude_deg = amplitude
             self._frequency_hz = frequency
             if running:
@@ -3195,13 +3200,14 @@ class ArmSwingPlugin:
                 }
             if not self._joint_plan.acquire(self._OWNER):
                 return {"error": f"joint planner is owned by {self._joint_plan.owner()}"}
-            from uuid import uuid4
 
             self._halt = threading.Event()
             self._started_at = time.monotonic()
             self._publish_count = 0
             self._request_id = None
-            self._action_id = f"t800_arm_swing_{uuid4().hex[:12]}"
+            # Continuous actions are deliberately outside x-completion and do
+            # not allocate an ACP action ID.
+            self._action_id = None
             self._last_reason = "running"
             self._thread = threading.Thread(target=self._run, daemon=True, name="t800-arm-swing")
             self._thread.start()
@@ -3264,14 +3270,6 @@ class ArmSwingPlugin:
                 request_id = self._request_id
                 self._last_reason = reason
                 self._request_id = None
-                action_id = self._action_id
-                final_status = "error" if reason.startswith("error:") else "cancelled"
-                final_result = {
-                    "reason": reason,
-                    "publish_count": self._publish_count,
-                    "request_id": request_id,
-                    "control_backend": "joint_plan",
-                }
             # A request can still be live when the worker is interrupted or
             # errors. Always cancel it before declaring the card idle.
             if request_id is not None:
@@ -3279,8 +3277,6 @@ class ArmSwingPlugin:
                     self._OWNER, "cancel", {"request_id": request_id}
                 )
             self._joint_plan.release(self._OWNER)
-            if action_id is not None:
-                self._notify_completion(action_id, final_status, final_result)
 
     def _motion_state_abort_reason(self) -> str | None:
         motion, _ = self._state.current_motion()
@@ -3317,11 +3313,13 @@ class ArmSwingPlugin:
         with self._lock:
             previous_thread = self._thread
             if previous_thread is not None and previous_thread.is_alive():
-                return {
+                result = {
                     "error": "previous arm_swing action is still stopping; retry",
                     "state": "stopping",
-                    "action_id": self._action_id,
                 }
+                if self._action_id is not None:
+                    result["action_id"] = self._action_id
+                return result
             motion, available = self._state.current_motion()
             if motion != "lower_body_balance":
                 return {
@@ -3431,18 +3429,20 @@ class ArmSwingPlugin:
 
     def _status_locked(self) -> dict:
         running = self._thread is not None and self._thread.is_alive() and not self._halt.is_set()
-        return {
+        status = {
             "state": "running" if running else "idle",
             "amplitude_deg": self._amplitude_deg,
             "frequency_hz": self._frequency_hz,
             "publish_count": self._publish_count,
             "request_id": self._request_id,
-            "action_id": self._action_id,
             "reason": self._last_reason,
             "required_motion_state": "lower_body_balance",
             "joint_indices": list(self._INDICES),
             "control_backend": "joint_plan",
         }
+        if self._action_id is not None:
+            status["action_id"] = self._action_id
+        return status
 
     @staticmethod
     def _validate_parameters(amplitude: float, frequency: float) -> None:
