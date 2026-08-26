@@ -219,7 +219,7 @@ class T800DeviceBundle:
             instances["safety"].set_controls(
                 [
                     instances[key]
-                    for key in ("locomotion", "joint_override", "joint_bridge", "virtual_gamepad", "gesture")
+                    for key in ("locomotion", "joint_override", "joint_bridge", "virtual_gamepad", "gesture", "waist")
                     if key in instances
                 ]
             )

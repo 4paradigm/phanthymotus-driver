@@ -2497,10 +2497,26 @@ class WaistPlugin:
     _JOINT_INDEX = T800_JOINT_INDEX["J12_TORSO_YAW"]
     _JOINT_NAME = "J12_TORSO_YAW"
     _REQUIRED_MOTION = "lower_body_balance"
+    _MAX_DURATION_SEC = 5.0
+    _WAIT_MARGIN_SEC = 3.0
+    _ACP_CALLBACK_TIMEOUT_SEC = 5.0
+    _ACP_SAFETY_MARGIN_SEC = 2.0
+    _ACP_TIMEOUT_SEC = (
+        _MAX_DURATION_SEC
+        + _WAIT_MARGIN_SEC
+        + _ACP_CALLBACK_TIMEOUT_SEC
+        + _ACP_SAFETY_MARGIN_SEC
+    )
 
     def __init__(self, config: dict, joint_plan: JointPlanPlugin):
         waist_config = config.get("plugins", {}).get("waist", {})
         self._joint_plan = joint_plan
+        self._lock = threading.RLock()
+        self._command_lock = threading.Lock()
+        self._cancel = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._request_id: int | None = None
+        self._action_id: str | None = None
         self._max_abs_angle_deg = float(waist_config.get("max_abs_angle_deg", 30.0))
         self._default_duration = float(waist_config.get("default_duration", 1.5))
         if not math.isfinite(self._max_abs_angle_deg) or not 0 < self._max_abs_angle_deg <= 30.0:
@@ -2509,7 +2525,7 @@ class WaistPlugin:
             raise ValueError("waist.default_duration must be between 0.5 and 5 seconds")
 
     def get_tool(self) -> dict:
-        return {
+        tool = {
             "name": "waist",
             "type": "actuator",
             "multiInstance": False,
@@ -2538,18 +2554,28 @@ class WaistPlugin:
                 "腰部控制动作",
             ),
         }
+        tool["inputSchema"]["x-completion"] = {
+            "actions": ["set_angle", "center"],
+            "timeout": int(self._ACP_TIMEOUT_SEC),
+        }
+        tool["inputSchema"]["x-hooks"] = {
+            "on_interrupt_motion": {"action": "stop"},
+            "on_interrupt_all": {"action": "stop"},
+        }
+        return tool
 
     def start(self) -> None:
         pass
 
-    def stop(self) -> None:
-        pass
+    def stop(self) -> dict:
+        with self._command_lock:
+            return self._stop_motion()
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action in ("start", "info"):
             return {**self._metadata(), "state": "ready"}
         if action == "stop":
-            return {"state": "idle"}
+            return self.stop()
         if action == "list":
             return self._metadata()
         if action == "status":
@@ -2567,6 +2593,10 @@ class WaistPlugin:
         if action not in ("set_angle", "center"):
             return {"error": f"unknown waist action: {action}"}
 
+        with self._command_lock:
+            return self._start_motion(action, args)
+
+    def _start_motion(self, action: str, args: dict) -> dict:
         motion, available = self._joint_plan.current_motion()
         if motion != self._REQUIRED_MOTION:
             return {
@@ -2579,24 +2609,99 @@ class WaistPlugin:
         if abs(angle_deg) > self._max_abs_angle_deg:
             return {"error": f"angle_deg must be between {-self._max_abs_angle_deg:g} and {self._max_abs_angle_deg:g}"}
         duration = self._finite_number(args.get("duration", self._default_duration), "duration")
-        if not 0.5 <= duration <= 5.0:
+        if not 0.5 <= duration <= self._MAX_DURATION_SEC:
             return {"error": "duration must be between 0.5 and 5 seconds"}
 
         angle_rad = math.radians(angle_deg)
-        result = self._joint_plan.dispatch("plan", {
-            "joint_indices": [self._JOINT_INDEX],
-            "target_positions": [angle_rad],
-            "duration": duration,
-            "gravity_compensation": True,
-        })
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return {"error": "another waist action is already running"}
+            result = self._joint_plan.dispatch("plan", {
+                "joint_indices": [self._JOINT_INDEX],
+                "target_positions": [angle_rad],
+                "duration": duration,
+                "gravity_compensation": True,
+            })
+            if "error" in result:
+                return result
+            from uuid import uuid4
+
+            request_id = int(result["request_id"])
+            action_id = f"t800_waist_{uuid4().hex[:12]}"
+            self._cancel = threading.Event()
+            self._request_id = request_id
+            self._action_id = action_id
+            self._thread = threading.Thread(
+                target=self._monitor_motion,
+                args=(action_id, request_id, action, angle_deg, angle_rad, duration),
+                daemon=True,
+                name="t800-waist-motion",
+            )
+            self._thread.start()
         return {
             **result,
+            "state": "running",
+            "action_id": action_id,
             "joint_index": self._JOINT_INDEX,
             "joint_name": self._JOINT_NAME,
             "target_angle_deg": angle_deg,
             "target_angle_rad": angle_rad,
             "duration": duration,
         }
+
+    def _monitor_motion(
+        self,
+        action_id: str,
+        request_id: int,
+        action: str,
+        angle_deg: float,
+        angle_rad: float,
+        duration: float,
+    ) -> None:
+        status = "completed"
+        error = ""
+        try:
+            self._joint_plan.wait_for_request(
+                request_id,
+                duration + self._WAIT_MARGIN_SEC,
+                self._cancel,
+            )
+        except Exception as exc:
+            status = "cancelled" if self._cancel.is_set() else "error"
+            error = "" if status == "cancelled" else str(exc)
+            if status == "error":
+                self._joint_plan.dispatch("cancel", {"request_id": request_id})
+        finally:
+            with self._lock:
+                if self._action_id == action_id:
+                    self._request_id = None
+                    self._action_id = None
+            self._notify_completion(action_id, status, {
+                "action": action,
+                "request_id": request_id,
+                "target_angle_deg": angle_deg,
+                "target_angle_rad": angle_rad,
+                "duration": duration,
+                "error": error,
+            })
+
+    def _stop_motion(self) -> dict:
+        with self._lock:
+            self._cancel.set()
+            request_id = self._request_id
+            thread = self._thread
+        if request_id is not None:
+            self._joint_plan.dispatch("cancel", {"request_id": request_id})
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+        result = {"state": "idle"}
+        if request_id is not None:
+            result["request_id"] = request_id
+        return result
+
+    @staticmethod
+    def _notify_completion(action_id: str, status: str, result: dict) -> None:
+        GesturePlugin._acp_notify(action_id, status, result, tool="waist")
 
     def _metadata(self) -> dict:
         return {
@@ -3001,7 +3106,7 @@ class GesturePlugin:
         return result
 
     @staticmethod
-    def _acp_notify(action_id: str, status: str, result: dict) -> None:
+    def _acp_notify(action_id: str, status: str, result: dict, tool: str = "gesture") -> None:
         """Report asynchronous gesture completion to Agent Core."""
         import json as _json
         import os as _os
@@ -3025,7 +3130,7 @@ class GesturePlugin:
                 "action_id": action_id,
                 "status": status,
                 "result": result,
-                "tool": "gesture",
+                "tool": tool,
                 "ts": time.time(),
             }).encode()
             request = _urllib.Request(
@@ -3040,7 +3145,7 @@ class GesturePlugin:
                 context=context,
             )
         except Exception as exc:
-            print(f"[gesture] ACP callback failed for {action_id}: {exc}", flush=True)
+            print(f"[{tool}] ACP callback failed for {action_id}: {exc}", flush=True)
 
 
 class _JointStreamBase:

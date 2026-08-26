@@ -67,6 +67,9 @@ MCP schema 中隐藏。
 后者保留为兼容接口，只发送单个目标姿势。`gesture.sequence` 可提交任意多步
 关节动作队列。
 
+`waist.set_angle` 和 `waist.center` 通过 ACP 跟踪对应的 planner request 直到完成；
+`waist.stop` 会取消活动 request，并已接入 `safety` 的 emergency/idle 停止链路。
+
 `virtual_gamepad` 使用 Native SDK 官方通道
 `virtual_gamepad/gamepad_keys`，默认连接 `udpm://239.255.76.67:7667?ttl=1`。
 除了原始按键/摇杆外，提供 idle、passive、stand、walk、dance、get_up、

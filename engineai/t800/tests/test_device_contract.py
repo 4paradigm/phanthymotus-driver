@@ -682,18 +682,27 @@ class DevicePluginContractTests(unittest.TestCase):
     def test_waist_controls_only_j12_with_conservative_absolute_angle(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
         plan.start()
+        plan.wait_for_request = lambda *_args, **_kwargs: {}
         waist = self.device.WaistPlugin(CONFIG, plan)
+        completions = []
+        waist._notify_completion = lambda *args: completions.append(args)
         self.state._current_motion = "lower_body_balance"
 
         result = waist.dispatch("set_angle", {"angle_deg": 30, "duration": 2.0})
+        waist._thread.join(timeout=1.0)
         sent = plan._publisher.messages[-1]
-        self.assertEqual("requested", result["state"])
+        self.assertEqual("running", result["state"])
+        self.assertTrue(result["action_id"].startswith("t800_waist_"))
         self.assertEqual([12], sent.joint_indices)
         self.assertAlmostEqual(math.pi / 6, sent.target_positions[0])
         self.assertEqual(2.0, sent.execution_time)
         self.assertTrue(sent.use_gravity_compensation)
+        self.assertEqual(result["action_id"], completions[0][0])
+        self.assertEqual("completed", completions[0][1])
 
-        waist.dispatch("center", {})
+        centered = waist.dispatch("center", {})
+        waist._thread.join(timeout=1.0)
+        self.assertEqual("running", centered["state"])
         self.assertEqual([0.0], plan._publisher.messages[-1].target_positions)
 
     def test_waist_dispatch_handles_actuator_lifecycle_actions(self):
@@ -707,6 +716,10 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("ready", waist.dispatch("info", {})["state"])
         self.assertEqual({"state": "idle"}, waist.dispatch("stop", {}))
         self.assertEqual([], plan._publisher.messages)
+        schema = waist.get_tool()["inputSchema"]
+        self.assertEqual(["set_angle", "center"], schema["x-completion"]["actions"])
+        self.assertEqual(15, schema["x-completion"]["timeout"])
+        self.assertEqual({"action": "stop"}, schema["x-hooks"]["on_interrupt_all"])
 
     def test_waist_rejects_unsafe_state_angle_and_duration(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
@@ -722,7 +735,31 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertIn("between 0.5 and 5", waist.dispatch("set_angle", {"angle_deg": 0, "duration": 0.1})["error"])
         with self.assertRaisesRegex(ValueError, "finite number"):
             waist.dispatch("set_angle", {"angle_deg": float("nan")})
+        with self.assertRaisesRegex(ValueError, "finite number"):
+            waist.dispatch("set_angle", {"angle_deg": True})
+        with self.assertRaisesRegex(ValueError, "finite number"):
+            waist.dispatch("set_angle", {"angle_deg": 0, "duration": float("nan")})
         self.assertEqual([], plan._publisher.messages)
+
+    def test_safety_emergency_cancels_active_waist_request(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        waist = self.device.WaistPlugin(CONFIG, plan)
+        waist._notify_completion = lambda *_args: None
+        self.state._current_motion = "lower_body_balance"
+        started = waist.dispatch("set_angle", {"angle_deg": 5.0, "duration": 5.0})
+        request_id = started["request_id"]
+
+        safety = self.device.SafetyControlPlugin(CONFIG, "robot", self.ros, self.state)
+        safety.set_controls([waist])
+        safety.start()
+        result = safety.dispatch("emergency_passive", {})
+        self.assertIn("WaistPlugin", result["stopped_streams"])
+        waist._thread.join(timeout=1.0)
+        self.assertFalse(waist._thread.is_alive())
+        cancels = [msg for msg in plan._publisher.messages
+                   if msg.request_type == plan._request_type.REQUEST_CANCEL]
+        self.assertTrue(any(msg.request_id == request_id for msg in cancels))
 
     def test_waist_status_reports_current_j12_without_publishing(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
