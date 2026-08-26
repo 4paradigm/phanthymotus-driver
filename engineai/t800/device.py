@@ -3285,13 +3285,13 @@ class GesturePlugin:
                         "request_id": self._status.get("request_id"),
                         "error": self._status.get("error"),
                     }
+                if controls_head:
+                    self._joint_plan.release_head("gesture")
                 if action_id is not None:
                     _notify_acp_completion(
                         "gesture", action_id, final_status, final_result,
                         GesturePlugin._ACP_CALLBACK_TIMEOUT_SEC,
                     )
-                if controls_head:
-                    self._joint_plan.release_head("gesture")
 
         thread = threading.Thread(target=run, daemon=True, name="t800-gesture-sequence")
         with self._lock:
