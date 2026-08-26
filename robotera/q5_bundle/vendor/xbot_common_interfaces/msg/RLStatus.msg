@@ -1,0 +1,6 @@
+int16 controller_mode_status #当前处于的policy状态
+int16 sub_mode_status #同一policy内部不同的模式的状态
+string controller_mode_name_str  #当前处于的policy名字
+LocoStatus loco_status
+MimicStatus mimic_status
+

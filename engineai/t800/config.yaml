@@ -5,7 +5,7 @@ name: "EngineAI T800 Development Edition"
 ros:
   robot_domain_id: 69
   core_domain_id: 42
-  robot_interface: "eth0"
+  robot_interface: "eth1"
   source_timeout_sec: 1.0
 
 control:
@@ -40,12 +40,33 @@ topics:
   joint_command: "/hardware/joint_command"
   tts: "/hardware/tts"
   native_node_control: "/motion/node_control"
+  heartbeat: "/heartbeat"
+  odometry: "/manifold/ODIN2/device0/odometry"
+  # T800-Odin2 激光雷达相机（飞书文档 7.2 节）；实机按 ros_graph 发现的
+  # /{topic_prefix}/{model}/device{N}/ 前缀校准
+  vision_cloud_raw: "/manifold/ODIN2/device0/cloud/raw"
+  vision_cloud_slam: "/manifold/ODIN2/device0/cloud/slam"
+  vision_camera_left: "/manifold/ODIN2/device0/camera0/compressed"
+  vision_camera_right: "/manifold/ODIN2/device0/camera1/compressed"
+  vision_depth: "/manifold/ODIN2/device0/depth"
 
 services:
   enable_motor: "/hardware/enable_motor"
 
+diagnostics:
+  command_trace_capacity: 20
+  motion_events_capacity: 100
+
 plugins:
   state:
+    enabled: true
+  motion_events:
+    enabled: true
+  heartbeat_status:
+    enabled: true
+  motion_command_trace:
+    enabled: true
+  native_interface_probe:
     enabled: true
   locomotion:
     enabled: true
@@ -74,6 +95,18 @@ plugins:
     url: "udpm://239.255.76.67:7667?ttl=1"
     channel: "virtual_gamepad/gamepad_keys"
     rate_hz: 20.0
+  controlled_spatial:
+    enabled: true
+    map_save_dir: /opt/phanthy-motus/data/maps
+    db_path: /opt/phanthy-motus/data/mapping.db
+    voxel_size: 0.05
+    max_points: 5000000
+    odometry_topic: /manifold/ODIN2/device0/odometry
+    pointcloud_topic: /manifold/ODIN2/device0/cloud/slam
+  controlled_spatial_map:
+    enabled: true
+    db_path: /opt/phanthy-motus/data/mapping.db
+    cloud_dir: /opt/phanthy-motus/data/controlled_spatial_clouds
   safety:
     enabled: true
   native_sdk:
@@ -84,3 +117,8 @@ plugins:
     command: ["./run_robot.sh", "t800"]
     service: "robotics.service"
     stop_timeout: 10
+  mic:
+    enabled: true
+  vision:
+    enabled: true
+    source: "raw"            # raw | slam —— 转发哪个点云源

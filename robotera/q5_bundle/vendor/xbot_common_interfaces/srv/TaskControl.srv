@@ -1,0 +1,9 @@
+string task_name
+string[] args
+int32 task_operation
+int32 START_TASK = 1
+int32 STOP_TASK = 0
+
+---
+bool success
+string message

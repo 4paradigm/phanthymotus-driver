@@ -1,0 +1,56 @@
+mcp_port: 15702
+ros_namespace: ""  # auto-detect from hostname
+
+# Robot variant: "lite" (23 DOF), "sp" (29 DOF), "pro" (31 DOF)
+variant: "pro"
+
+# gRPC endpoint for locomotion control (PC1)
+grpc_host: "10.10.20.127"
+grpc_port: 6666
+
+# DDS domain ID (must match robot's domain)
+dds_domain_id: 0
+
+plugins:
+  state:
+    enabled: true
+    publish_rate_hz: 50
+  loco:
+    enabled: true
+  camera:
+    enabled: true
+    # The ZED Mini is connected to this Jetson. Keep the local SDK path; the
+    # separate network streaming sender is not required.
+    resolution: "VGA"
+    fps: 15
+    depth_mode: "PERFORMANCE"
+    # The head-mounted ZED Mini is installed upside down. Keep RGB, depth and
+    # point-cloud data aligned by applying the SDK's native image flip.
+    camera_flip: true
+    rgb_hz: 15
+    depth_hz: 8
+    jpeg_quality: 70
+    pointcloud:
+      # Discover the card without continuously consuming GPU/bandwidth.
+      enabled: false
+      hz: 2
+      max_points: 10000
+      max_distance_m: 8.0
+      # Static camera-mount compensation in the renderer frame, applied after
+      # camera_flip. Values are calibrated for Adam's current ZED Mini mount.
+      mount_rotation_deg:
+        x: -14.2
+        y: 0.0
+        z: 0.8
+      mount_translation_m:
+        x: 0.0
+        y: 1.8
+        z: 0.0
+  arm:
+    enabled: true
+    publish_rate_hz: 100
+  hand:
+    enabled: true
+    hand_type: "pnd"  # "pnd" (0-1000) or "inspire" (0-1800)
+  model:
+    enabled: true

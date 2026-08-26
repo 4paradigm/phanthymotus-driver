@@ -7,12 +7,22 @@ engineai-t800:
   privileged: true
   volumes:
     - /dev:/dev
-    - /opt/engineai/native_sdk:/opt/engineai/native_sdk
+    - /opt/phanthy-motus/data:/opt/phanthy-motus/data
+    - ${T800_NATIVE_SDK_DIR:-/opt/engineai/native_sdk}:/opt/engineai/native_sdk
+    # T800 厂商 PulseAudio 已独占机身麦克风，mic 通过宿主音频服务采集。
+    - ${T800_PULSE_RUNTIME_DIR:-/run/user/1000/pulse}:/run/user/1000/pulse
+    - ${T800_PULSE_CONFIG_DIR:-/home/ubuntu/.config/pulse}:/root/.config/pulse:ro
   environment:
-    - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
     - ROS_LOCALHOST_ONLY=0
-    - NETWORK_INTERFACE=eth0
+    - NETWORK_INTERFACE=${T800_NETWORK_INTERFACE:-eth1}
+    - PULSE_SERVER=unix:/run/user/1000/pulse/native
     - PYTHONUNBUFFERED=1
+  healthcheck:
+    test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:15708/health', timeout=2)"]
+    interval: 10s
+    timeout: 3s
+    retries: 6
+    start_period: 15s
   logging:
     driver: local
     options:
