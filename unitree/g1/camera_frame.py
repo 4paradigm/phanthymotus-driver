@@ -14,6 +14,7 @@ from pathlib import Path
 import struct
 import threading
 from typing import Any
+import zlib
 
 import yaml
 
@@ -25,6 +26,8 @@ ENVELOPE_HEADER = struct.Struct("<4sII")
 ENVELOPE_FORMAT = "application/vnd.phanthy.sensor-envelope.v1"
 RGB_SCHEMA = "phanthy.sensor.camera_rgb_frame.v1"
 DEPTH_SCHEMA = "phanthy.sensor.camera_depth_frame.v1"
+DEPTH_COMPRESSION = "zlib"
+DEPTH_COMPRESSION_LEVEL = 1
 
 _DIRECT_CLOCK_DOMAINS = ("system_time", "global_time")
 _MAX_DIRECT_CLOCK_ERROR_NS = 24 * 60 * 60 * 1_000_000_000
@@ -71,6 +74,10 @@ def decode_envelope(data: bytes | bytearray | memoryview) -> tuple[dict, bytes]:
     if not isinstance(metadata, dict):
         raise ValueError("camera envelope metadata must be a JSON object")
     return metadata, raw[metadata_end:]
+
+
+def compress_depth_payload(payload: bytes | bytearray | memoryview) -> bytes:
+    return zlib.compress(bytes(payload), level=DEPTH_COMPRESSION_LEVEL)
 
 
 @dataclass(frozen=True)

@@ -3880,6 +3880,12 @@ def run_realsense_process(
     All heavy imports (cv2, numpy, pyrealsense2, sensor_msgs) happen here
     so the main process is not affected if these packages are missing.
     """
+    try:
+        from common import logsafe
+        logsafe.install(check_fd=False)
+    except ImportError:
+        pass
+
     from array import array
     import os
     import cv2
@@ -3892,12 +3898,15 @@ def run_realsense_process(
     from std_msgs.msg import String as _String, UInt8MultiArray
     from sensor_msgs.msg import Image, CompressedImage
     from camera_frame import (
+        DEPTH_COMPRESSION,
+        DEPTH_COMPRESSION_LEVEL,
         DEPTH_SCHEMA,
         RGB_SCHEMA,
         RealSenseClockNormalizer,
         build_calibrations,
         build_frame_metadata,
         build_intrinsics,
+        compress_depth_payload,
         encode_envelope,
         load_lidar_camera_calibration,
         realsense_extrinsics_transform,
@@ -3956,6 +3965,7 @@ def run_realsense_process(
                 "legacy_publish_errors": 0,
                 "frame_publish_errors": 0,
                 "jpeg_encode_errors": 0,
+                "frameset_errors": 0,
             }
             # Do not shadow rclpy.node.Node._clock: get_clock() relies on the
             # ROS Clock object's handle when stamping the legacy messages.
@@ -3997,6 +4007,12 @@ def run_realsense_process(
                     config_values.get("clock_reset_confirm_samples", 5)
                 ),
             )
+
+        def _record_error(self, counter, message):
+            count = self._diagnostics[counter] + 1
+            self._diagnostics[counter] = count
+            if count == 1 or count % 100 == 0:
+                self.get_logger().error(f"{message} (count={count})")
 
         def _publish_status(self, state, error=None, force=False):
             now = time.monotonic()
@@ -4194,13 +4210,16 @@ def run_realsense_process(
                     msg.data = depth_np.tobytes()
                     self._depth_pub.publish(msg)
                 except Exception as e:
-                    self._diagnostics["legacy_publish_errors"] += 1
-                    self.get_logger().error(f"[realsense] depth legacy publish error: {e}")
+                    self._record_error(
+                        "legacy_publish_errors",
+                        f"[realsense] depth legacy publish error: {e}",
+                    )
                     continue
                 if self._depth_frame_pub is None or calibration is None:
                     continue
                 try:
-                    payload = depth_np.astype("<u2", copy=False).tobytes()
+                    raw_payload = depth_np.astype("<u2", copy=False).tobytes()
+                    payload = compress_depth_payload(raw_payload)
                     metadata = build_frame_metadata(
                         schema=DEPTH_SCHEMA,
                         frame_id="camera_depth_optical_frame",
@@ -4212,6 +4231,11 @@ def run_realsense_process(
                             "width": int(depth_np.shape[1]),
                             "height": int(depth_np.shape[0]),
                             "step_bytes": int(depth_np.shape[1] * 2),
+                            "compression": {
+                                "codec": DEPTH_COMPRESSION,
+                                "level": DEPTH_COMPRESSION_LEVEL,
+                            },
+                            "uncompressed_size": len(raw_payload),
                             "payload_size": len(payload),
                             "unit": "meter",
                             "depth_scale_m": calibration["depth_scale_m"],
@@ -4225,8 +4249,10 @@ def run_realsense_process(
                     self._depth_frame_pub.publish(frame_msg)
                     self._diagnostics["depth_frame_published"] += 1
                 except Exception as e:
-                    self._diagnostics["frame_publish_errors"] += 1
-                    self.get_logger().error(f"[realsense] depth frame publish error: {e}")
+                    self._record_error(
+                        "frame_publish_errors",
+                        f"[realsense] depth frame publish error: {e}",
+                    )
 
         def _color_loop(self):
             while not self._worker_stop.is_set():
@@ -4237,7 +4263,10 @@ def run_realsense_process(
                 try:
                     ok, jpg = cv2.imencode(".jpg", color_np, [cv2.IMWRITE_JPEG_QUALITY, RS_JPEG_QUALITY])
                     if not ok:
-                        self._diagnostics["jpeg_encode_errors"] += 1
+                        self._record_error(
+                            "jpeg_encode_errors",
+                            "[realsense] JPEG encode failed",
+                        )
                         continue
                     payload = jpg.tobytes()
                     cmsg = CompressedImage()
@@ -4247,8 +4276,10 @@ def run_realsense_process(
                     cmsg.data = payload
                     self._color_pub.publish(cmsg)
                 except Exception as e:
-                    self._diagnostics["legacy_publish_errors"] += 1
-                    self.get_logger().error(f"[realsense] color legacy publish error: {e}")
+                    self._record_error(
+                        "legacy_publish_errors",
+                        f"[realsense] color legacy publish error: {e}",
+                    )
                     continue
                 if self._rgb_frame_pub is None or calibration is None:
                     continue
@@ -4273,8 +4304,10 @@ def run_realsense_process(
                     self._rgb_frame_pub.publish(frame_msg)
                     self._diagnostics["rgb_frame_published"] += 1
                 except Exception as e:
-                    self._diagnostics["frame_publish_errors"] += 1
-                    self.get_logger().error(f"[realsense] color frame publish error: {e}")
+                    self._record_error(
+                        "frame_publish_errors",
+                        f"[realsense] color frame publish error: {e}",
+                    )
 
         def _on_frame(self, frame):
             try:
@@ -4334,7 +4367,10 @@ def run_realsense_process(
                     self._last_ts = now
                 self._publish_status("running")
             except Exception as e:
-                self.get_logger().error(f"[realsense] frame error: {e}")
+                self._record_error(
+                    "frameset_errors",
+                    f"[realsense] frame error: {e}",
+                )
 
     color_topic = f"/{namespace}/camera/rgb"
     depth_topic = f"/{namespace}/camera/depth"

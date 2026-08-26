@@ -1,10 +1,13 @@
 import math
 from pathlib import Path
 import unittest
+import zlib
 
 import yaml
 
 from camera_frame import (
+    DEPTH_COMPRESSION,
+    DEPTH_COMPRESSION_LEVEL,
     DEPTH_SCHEMA,
     ENVELOPE_FORMAT,
     ENVELOPE_MAGIC,
@@ -14,6 +17,7 @@ from camera_frame import (
     build_calibrations,
     build_frame_metadata,
     build_intrinsics,
+    compress_depth_payload,
     decode_envelope,
     encode_envelope,
     load_lidar_camera_calibration,
@@ -62,6 +66,15 @@ class CameraEnvelopeTest(unittest.TestCase):
         envelope = encode_envelope({"schema": DEPTH_SCHEMA}, b"depth")
         with self.assertRaisesRegex(ValueError, "length mismatch"):
             decode_envelope(envelope[:-1])
+
+    def test_depth_payload_compression_is_lossless(self):
+        raw = b"\x00\x00\x10\x00" * 1024
+        compressed = compress_depth_payload(raw)
+
+        self.assertEqual(DEPTH_COMPRESSION, "zlib")
+        self.assertEqual(DEPTH_COMPRESSION_LEVEL, 1)
+        self.assertLess(len(compressed), len(raw))
+        self.assertEqual(zlib.decompress(compressed), raw)
 
 
 class CameraTimingTest(unittest.TestCase):
@@ -233,6 +246,18 @@ class DriverCameraContractTest(unittest.TestCase):
         self.assertNotIn("self._clock = self._new_clock_normalizer()", source)
         self.assertIn('self._sequence = {"rgb": 0, "depth": 0}', start_capture)
         self.assertIn("self.stop_capture(reconnecting=True)", start_capture)
+
+    def test_camera_worker_installs_logsafe_compresses_depth_and_samples_errors(self):
+        source = (G1_DIR / "device.py").read_text(encoding="utf-8")
+        worker = source[source.index("def run_realsense_process("):]
+        self.assertLess(
+            worker.index("logsafe.install(check_fd=False)"),
+            worker.index("from array import array"),
+        )
+        self.assertIn("payload = compress_depth_payload(raw_payload)", worker)
+        self.assertIn('"uncompressed_size": len(raw_payload)', worker)
+        self.assertIn("if count == 1 or count % 100 == 0:", worker)
+        self.assertIn('"frameset_errors": 0', worker)
 
     def test_container_and_config_include_frame_runtime_files(self):
         config = yaml.safe_load((G1_DIR / "config.yaml").read_text(encoding="utf-8"))

@@ -47,6 +47,11 @@ class DeployFromGitContractTest(unittest.TestCase):
         self.assertIn("phanthy.sensor.camera_rgb_frame.v1", source)
         self.assertIn("phanthy.sensor.camera_depth_frame.v1", source)
         self.assertIn("CAMERA_FRAME_CONTRACT=PASS", source)
+        self.assertIn('DEPTH_COMPRESSION == "zlib"', source)
+        self.assertIn('cp -a "$source_dir/unitree/g1/." "$build_context/"', source)
+        self.assertIn('cp -a "$source_dir/common" "$build_context/common"', source)
+        self.assertIn('-f "$build_context/Dockerfile"', source)
+        self.assertIn('\n  "$build_context"\n', source)
         self.assertNotIn("docker inspect embodied-unitree-g1", source)
 
     def test_script_syntax_and_real_dry_run(self):

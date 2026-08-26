@@ -78,13 +78,17 @@ else
 fi
 remote_compose="${remote_repo}.compose.${expected_commit:0:7}.yml"
 temporary_source_root=""
+build_context=""
 
-cleanup_temporary_source() {
+cleanup_temporary_paths() {
   if [[ -n "$temporary_source_root" && -d "$temporary_source_root" ]]; then
     rm -rf -- "$temporary_source_root"
   fi
+  if [[ -n "$build_context" && -d "$build_context" ]]; then
+    rm -rf -- "$build_context"
+  fi
 }
-trap cleanup_temporary_source EXIT
+trap cleanup_temporary_paths EXIT
 
 command -v git >/dev/null
 command -v docker >/dev/null
@@ -172,13 +176,21 @@ if [[ -z "$source_dir" ]]; then
   echo "SOURCE_MODE=github_archive commit=$expected_commit"
 fi
 
+[[ -d "$source_dir/common" ]] || {
+  echo "Shared Python package is missing: $source_dir/common" >&2
+  exit 1
+}
+build_context="$(mktemp -d /tmp/g1-driver-build.XXXXXX)"
+cp -a "$source_dir/unitree/g1/." "$build_context/"
+cp -a "$source_dir/common" "$build_context/common"
+
 docker build --pull=false \
   --build-arg "ROS_BASE_IMAGE=$ros_base_image" \
   --label "phanthy.source_commit=$expected_commit" \
   --label "phanthy.source_ref=$source_ref" \
-  -f "$source_dir/unitree/g1/Dockerfile" \
+  -f "$build_context/Dockerfile" \
   -t "$image" \
-  "$source_dir/unitree/g1"
+  "$build_context"
 
 built_commit="$(docker image inspect "$image" --format '{{ index .Config.Labels "phanthy.source_commit" }}')"
 [[ "$built_commit" == "$expected_commit" ]]
@@ -235,13 +247,15 @@ assert limits.max_abs_yaw == 2.0
 print("VELOCITY_CONTRACT=PASS vx=[-1,1] vy=[-1,1] vyaw=[-2,2]")
 '
     docker exec -w /work "$container_id" python3 -c '
-from camera_frame import DEPTH_SCHEMA, ENVELOPE_FORMAT, ENVELOPE_MAGIC, RGB_SCHEMA
+from camera_frame import DEPTH_COMPRESSION, DEPTH_COMPRESSION_LEVEL, DEPTH_SCHEMA, ENVELOPE_FORMAT, ENVELOPE_MAGIC, RGB_SCHEMA
 
 assert ENVELOPE_MAGIC == b"PSE1"
 assert ENVELOPE_FORMAT == "application/vnd.phanthy.sensor-envelope.v1"
 assert RGB_SCHEMA == "phanthy.sensor.camera_rgb_frame.v1"
 assert DEPTH_SCHEMA == "phanthy.sensor.camera_depth_frame.v1"
-print("CAMERA_FRAME_CONTRACT=PASS envelope=PSE1 schemas=frame.v1")
+assert DEPTH_COMPRESSION == "zlib"
+assert DEPTH_COMPRESSION_LEVEL == 1
+print("CAMERA_FRAME_CONTRACT=PASS envelope=PSE1 schemas=frame.v1 depth=zlib1")
 '
     echo "DEPLOYMENT=PASS status=$status image=$actual_image source_commit=$built_commit"
     echo "TOOLS=PASS navigation_lidar navigation_imu camera_rgb_frame camera_depth_frame loco.velocity_proposal"

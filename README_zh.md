@@ -140,7 +140,9 @@ BEST_EFFORT + KEEP_LAST(1) 自描述帧数据流。它们是通用传感器/数�
 
 两者以 `std_msgs/msg/UInt8MultiArray` 承载 `PSE1` 二进制 envelope：固定
 小端头（magic、JSON 元数据长度、二进制载荷长度）之后依次是规范 JSON
-元数据和 JPEG/Z16 小端载荷。每帧完整携带当前 RealSense profile 内参、
+元数据和 JPEG 或 zlib level 1 无损压缩的 Z16 小端载荷。Depth 元数据通过
+`image.compression` 描述压缩方式，并同时记录压缩前后的字节数；消费者先用
+zlib 解压即可恢复原始 Z16。每帧完整携带当前 RealSense profile 内参、
 稳定 `calibration_id`、Depth→RGB 外参、源时间/Driver 接收时间，以及配置的
 LiDAR→RGB 外参。源时间无效、尚在预热、发生时钟重置或倒序时仍发布该帧，
 但明确标记为 `unavailable`，不会用发布时刻伪造采集时间。

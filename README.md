@@ -181,7 +181,10 @@ general sensor/data-collection outputs and are not coupled to navigation:
 
 Both use `std_msgs/msg/UInt8MultiArray` as a transport for the `PSE1` binary
 envelope: a fixed little-endian header (`magic`, JSON metadata length, binary
-payload length), canonical JSON metadata, then JPEG or little-endian Z16 bytes.
+payload length), canonical JSON metadata, then JPEG or zlib level-1 losslessly
+compressed little-endian Z16 bytes. Depth metadata declares the codec in
+`image.compression` and includes compressed and uncompressed byte counts; zlib
+decompression restores the original Z16 payload.
 Every frame repeats its active-profile intrinsics, stable `calibration_id`,
 RealSense Depth-to-RGB transform, source/Driver-receive timing, and the
 configured LiDAR-to-RGB calibration. Invalid, warming-up, reset, or
