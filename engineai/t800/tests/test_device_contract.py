@@ -754,6 +754,43 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("completed", completions[0][1])
         self.assertEqual(reset_request.request_id, completions[0][2]["request_id"])
 
+    def test_gesture_completion_releases_head_before_acp_callback(self):
+        """ACP 回调触发时 head 所有权必须已释放，否则连续动作会返回 head is busy。"""
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        gesture = self.device.GesturePlugin(plan)
+        head_owner_during_callback = []
+
+        def notify(tool, action_id, status, result, timeout):
+            # 模拟 Agent Core 收到回调后立即尝试获取 head
+            head_owner_during_callback.append(plan.head_status().get("owner"))
+
+        self.device._notify_acp_completion = notify
+        gesture.dispatch("sequence", {
+            "steps": [{"joint_indices": [23], "target_positions": [0.1], "duration": 0.05}],
+            "reset_after": True,
+            "force": True,
+        })
+
+        deadline = time.monotonic() + 1.0
+        while not plan._publisher.messages and time.monotonic() < deadline:
+            time.sleep(0.005)
+        step_request_id = plan._publisher.messages[-1].request_id
+        plan._on_state(JointMotionPlanState(step_request_id, JointMotionPlanState.EXECUTING, 0.5))
+        plan._on_state(JointMotionPlanState(step_request_id, JointMotionPlanState.IDLE, 1.0))
+
+        deadline = time.monotonic() + 1.0
+        while len(plan._publisher.messages) < 2 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        reset_request = plan._publisher.messages[-1]
+        plan._on_state(JointMotionPlanState(reset_request.request_id, JointMotionPlanState.EXECUTING, 0.5))
+        plan._on_state(JointMotionPlanState(reset_request.request_id, JointMotionPlanState.IDLE, 1.0))
+        gesture._thread.join(timeout=1.0)
+
+        # 回调触发时 head 所有权应为 None（已释放），而非 "gesture"
+        self.assertEqual(1, len(head_owner_during_callback))
+        self.assertIsNone(head_owner_during_callback[0])
+
     def test_gesture_rejects_sequence_beyond_acp_runtime_budget(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
         plan.start()
