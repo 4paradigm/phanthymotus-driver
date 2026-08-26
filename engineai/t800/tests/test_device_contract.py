@@ -1282,6 +1282,61 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("head", busy["owner"])
         plan.release_head("head")
 
+    def test_head_ownership_blocks_non_head_joint_plan_during_execution(self):
+        """head 执行期间，非 head 关节的 joint_plan.plan 也应被拒绝，避免 superseded。"""
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        plan.wait_until_idle = lambda *_args, **_kwargs: {}
+        entered_wait = threading.Event()
+
+        def wait_for_request(_request_id, _timeout, cancel_event):
+            entered_wait.set()
+            while not cancel_event.is_set():
+                time.sleep(0.005)
+            raise RuntimeError("cancelled")
+
+        plan.wait_for_request = wait_for_request
+        head = self.device.HeadActuatorPlugin(CONFIG, plan, self.state)
+        self.device._notify_acp_completion = lambda *_args, **_kwargs: None
+        head.dispatch("nod", {"times": 1})
+        self.assertTrue(entered_wait.wait(timeout=1.0))
+        # head 执行中，针对手臂关节的 plan 应被拒绝
+        busy = plan.dispatch("plan", {
+            "joint_indices": [13, 14, 15, 16, 17],
+            "target_positions": [0.0] * 5,
+        })
+        self.assertIn("head is busy", busy["error"])
+        self.assertEqual("head", busy["owner"])
+        head.dispatch("stop", {})
+        head._thread.join(timeout=1.0)
+
+    def test_head_nod_shake_rejects_invalid_speed_types(self):
+        """speed 为 null/数组/对象时应返回 error，而非 TypeError 逃逸。"""
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        head = self.device.HeadActuatorPlugin(CONFIG, plan, self.state)
+        for speed in (None, [], {}):
+            with self.subTest(speed=speed):
+                result = head.dispatch("nod", {"times": 1, "speed": speed})
+                self.assertIn("error", result)
+                result = head.dispatch("shake", {"times": 1, "speed": speed})
+                self.assertIn("error", result)
+
+    def test_head_look_works_without_configured_look_poses(self):
+        """配置中没有 look_poses 时，应使用内置默认值，look 动作正常可用。"""
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        plan.wait_until_idle = lambda *_args, **_kwargs: {}
+        plan.wait_for_request = lambda *_args, **_kwargs: {}
+        # 不传 look_poses 的配置
+        minimal_config = {"enabled": True, "step_duration_sec": 0.35}
+        head = self.device.HeadActuatorPlugin(minimal_config, plan, self.state)
+        self.device._notify_acp_completion = lambda *_args, **_kwargs: None
+        result = head.dispatch("look", {"direction": "forward"})
+        self.assertEqual("running", result["state"])
+        head._thread.join(timeout=1.0)
+        self.assertEqual("completed", head.dispatch("status", {})["state"])
+
     def test_head_async_completion_reports_acp(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
         plan.start()
