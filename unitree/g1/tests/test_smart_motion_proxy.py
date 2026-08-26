@@ -550,6 +550,10 @@ class SmartMotionParentLocoSequenceTest(unittest.TestCase):
     def test_proposal_execution_has_no_child_loco_setvelocity(self):
         source = inspect.getsource(_run_smart_motion_process)
 
+        self.assertLess(
+            source.index("logsafe.install(check_fd=False)"),
+            source.index("import numpy as np"),
+        )
         self.assertNotIn("proposal_loco_client", source)
         self.assertNotIn("fsm_loco_client", source)
         self.assertIn("apply_parent_velocity_proposal", source)
@@ -601,6 +605,17 @@ class SmartMotionParentLocoSequenceTest(unittest.TestCase):
         self.assertIn(
             "parent_get_fsm_id=loco_client.GetFsmId",
             main_source,
+        )
+
+    def test_spawned_rpc_worker_installs_logsafe_before_dds(self):
+        source = Path(__file__).resolve().parents[1].joinpath(
+            "rpc_proxy.py"
+        ).read_text(encoding="utf-8")
+        worker = source[source.index("def _rpc_worker"):source.index("class RpcProxy")]
+
+        self.assertLess(
+            worker.index("logsafe.install(check_fd=False)"),
+            worker.index("ChannelFactoryInitialize(0, network_iface)"),
         )
 
 

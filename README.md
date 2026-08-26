@@ -120,6 +120,12 @@ terminal bootstrap, retired-ID, and mid-task mismatched-ID proposals never
 establish or replace a lease, so Agent Core needs no per-task authorization
 action for consecutive navigation tasks.
 
+`nav_id` provides task isolation and replay protection; it is not publisher
+authentication. First-proposal binding therefore assumes the robot ROS 2/DDS
+network is trusted and isolated. An untrusted participant that can publish to
+the proposal topic could claim an idle lease, so that topic must not be exposed
+to untrusted publishers.
+
 `loco info` exposes proposal counters, the coalesced count, measured RPC and
 queue latency, rolling RPC p50/p95/p99/max values, rejection reasons, and the
 last confirmed proposal stop. The `last_set_velocity_duration_ms` value is
@@ -142,6 +148,10 @@ publishes two algorithm-independent navigation sensor topics:
 - `/ubuntu/navigation/lidar` — `sensor_msgs/msg/PointCloud2`,
   RELIABLE + KEEP_LAST(2), with `x/y/z/intensity/tag/line/timestamp` fields;
 - `/ubuntu/navigation/imu` — `sensor_msgs/msg/Imu`, RELIABLE + KEEP_LAST(200);
+
+Both cards share this single worker. Stopping either `navigation_lidar` or
+`navigation_imu` stops both streams and releases the MID360 worker; starting
+either card starts a fresh shared worker again.
 
 LiDAR and IMU retain their shared MID360 source clock and are normalized into
 one ROS system-time domain. Samples are dropped while clock offset estimation

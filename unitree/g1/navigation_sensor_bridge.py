@@ -574,14 +574,21 @@ class NavigationSensorPlugin:
     def _worker_running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
-    def stop(self) -> None:
-        if self._worker_running():
-            self._proc.terminate()
+    def _stop_worker(self) -> None:
+        proc = self._proc
+        if proc is None:
+            return
+        if proc.poll() is None:
+            proc.terminate()
             try:
-                self._proc.wait(timeout=5.0)
+                proc.wait(timeout=5.0)
             except subprocess.TimeoutExpired:
-                self._proc.kill()
-                self._proc.wait(timeout=2.0)
+                proc.kill()
+                proc.wait(timeout=2.0)
+        self._proc = None
+
+    def stop(self) -> None:
+        self._stop_worker()
         try:
             self._executor.remove_node(self._status_node)
             self._status_node.destroy_node()
@@ -603,5 +610,6 @@ class NavigationSensorPlugin:
                 **status,
             }
         if action == "stop":
-            return {"state": "idle"}
+            self._stop_worker()
+            return {"state": "idle", "worker_running": False, "worker_pid": None}
         return None

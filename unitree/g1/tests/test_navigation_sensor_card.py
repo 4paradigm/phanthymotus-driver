@@ -156,6 +156,10 @@ class NavigationSensorCardContractTest(unittest.TestCase):
         source = (G1_DIR / "navigation_sensor_bridge_main.py").read_text()
         self.assertIn("_NavigationSensorNode(plugin_config, namespace)", source)
         self.assertIn("ChannelFactoryInitialize(0, network_interface)", source)
+        self.assertLess(
+            source.index("logsafe.install(check_fd=False)"),
+            source.index("import rclpy"),
+        )
         self.assertNotIn("NavigationSensorPlugin(", source)
         ast.parse(source)
 
@@ -183,8 +187,56 @@ class NavigationSensorCardContractTest(unittest.TestCase):
         plugin.stop()
         proc.terminate.assert_called_once_with()
         proc.wait.assert_called_once_with(timeout=5.0)
+        self.assertIsNone(plugin._proc)
         plugin._executor.remove_node.assert_called_once_with(plugin._status_node)
         plugin._status_node.destroy_node.assert_called_once_with()
+
+    def test_either_card_stop_terminates_shared_worker_and_allows_restart(self):
+        module = self.load_bridge_module()
+
+        for tool_name in ("navigation_lidar", "navigation_imu"):
+            with self.subTest(tool_name=tool_name):
+                plugin = module.NavigationSensorPlugin.__new__(
+                    module.NavigationSensorPlugin
+                )
+                plugin._namespace = "ubuntu"
+                plugin._network_iface = "eth0"
+                plugin._worker_path = G1_DIR / "navigation_sensor_bridge_main.py"
+                plugin._proc = None
+                plugin._status_node = types.SimpleNamespace(
+                    cloud_topic="/ubuntu/navigation/lidar",
+                    imu_topic="/ubuntu/navigation/imu",
+                    status=lambda running: {"ready": running},
+                )
+                first = mock.Mock(pid=1001)
+                second = mock.Mock(pid=1002)
+                first.poll.return_value = None
+                second.poll.return_value = None
+
+                with mock.patch.object(
+                    module.subprocess,
+                    "Popen",
+                    side_effect=(first, second),
+                ) as popen:
+                    plugin.start()
+                    stopped = plugin.dispatch("stop", {"_tool_name": tool_name})
+                    stopped_again = plugin.dispatch(
+                        "stop", {"_tool_name": tool_name}
+                    )
+                    restarted = plugin.dispatch(
+                        "start", {"_tool_name": tool_name}
+                    )
+
+                self.assertEqual(
+                    stopped,
+                    {"state": "idle", "worker_running": False, "worker_pid": None},
+                )
+                self.assertEqual(stopped_again, stopped)
+                first.terminate.assert_called_once_with()
+                first.wait.assert_called_once_with(timeout=5.0)
+                self.assertEqual(popen.call_count, 2)
+                self.assertEqual(restarted["state"], "ready")
+                self.assertEqual(restarted["worker_pid"], 1002)
 
     def test_status_monitor_fails_closed_for_dead_or_stale_worker(self):
         module = self.load_bridge_module()

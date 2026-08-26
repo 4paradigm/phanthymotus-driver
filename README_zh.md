@@ -102,6 +102,10 @@ proposal 会先进入 `terminal_pending_stop`；只有零速停车确认成功�
 零速首包、终态首包、已退役 ID 和任务中异 ID proposal 都不能建立或替换
 lease，因此连续导航不需要 Agent Core 执行逐任务授权 action。
 
+`nav_id` 只用于任务隔离和防重放，不是发布者身份认证。首包绑定模式以机器人
+ROS 2/DDS 网络受信且已隔离为前提；能向 proposal topic 发布消息的非受信
+参与者可能在空闲时抢占 lease，因此不得把该 topic 暴露给非受信发布者。
+
 `loco info` 会返回 proposal 计数、合并数、实测 RPC/队列时延、滚动
 RPC p50/p95/p99/max、逐原因拒绝统计及最近一次已确认停车。
 `last_set_velocity_duration_ms` 表示实测 RPC 耗时，不是 proposal TTL 余量。
@@ -109,6 +113,18 @@ RPC p50/p95/p99/max、逐原因拒绝统计及最近一次已确认停车。
 velocity proposal 合同与 `loco.move` 输入边界保持一致：前后和横向速度
 均限制为 `[-1.0, 1.0] m/s`，偏航角速度限制为
 `[-2.0, 2.0] rad/s`。Driver 仍会在运动 RPC 之前拒绝非有限数或超界值。
+
+### G1 导航传感器
+
+只读 `navigation_sensors` 插件使用一个隔离 worker 直接订阅 MID360 原始 DDS，
+并发布算法无关的 `/ubuntu/navigation/lidar`（`PointCloud2`）和
+`/ubuntu/navigation/imu`（`Imu`）。两路数据保留 MID360 共享源时钟并统一
+归一化到 ROS system time；时钟未就绪、重置或样本无效时直接丢弃，不伪造
+源时间戳。
+
+`navigation_lidar` 与 `navigation_imu` 两张卡共享同一个 worker。停止任意一张
+卡都会停止两路数据并释放 MID360 worker；再次启动任意一张卡会创建新的共享
+worker。
 
 ### G1 相机自描述帧
 

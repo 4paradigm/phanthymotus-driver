@@ -3,6 +3,12 @@
 
 from __future__ import annotations
 
+try:
+    from common import logsafe
+    logsafe.install(check_fd=False)
+except ImportError:
+    pass
+
 import os
 import re
 import signal
