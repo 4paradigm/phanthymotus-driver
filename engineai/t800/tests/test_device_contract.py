@@ -1041,7 +1041,19 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertIn("between 2 and 30", swing.dispatch("start_swing", {"amplitude_deg": 31})["error"])
         schema = swing.get_tool()["inputSchema"]
         actions = schema["properties"]["action"]["enum"]
-        self.assertNotIn("x-completion", schema)
+        self.assertEqual(
+            ["start_swing", "return_neutral", "halt_and_return"],
+            schema["x-completion"]["actions"],
+        )
+        self.assertGreater(schema["x-completion"]["timeout"], 3)
+        self.assertEqual(
+            {"action": "halt"},
+            schema["x-hooks"]["on_interrupt_motion"],
+        )
+        self.assertEqual(
+            {"action": "halt"},
+            schema["x-hooks"]["on_interrupt_all"],
+        )
         self.assertTrue({"start", "info", "stop"}.issubset(actions))
         self.assertNotIn("set_parameters", actions)
         self.assertIn("return_neutral", actions)
@@ -1089,7 +1101,7 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual(result["action_id"], completions[0][0])
         self.assertEqual("completed", completions[0][1])
 
-    def test_arm_swing_stop_cancels_monitored_neutral_return(self):
+    def test_arm_swing_interrupt_hook_cancels_monitored_neutral_return(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
         plan.start()
         swing = self.device.ArmSwingPlugin(CONFIG, plan, self.state)
@@ -1103,7 +1115,8 @@ class DevicePluginContractTests(unittest.TestCase):
         while not plan._publisher.messages and time.monotonic() < deadline:
             time.sleep(0.01)
         request_id = plan._publisher.messages[0].request_id
-        stopped = swing.dispatch("stop", {})
+        hook = swing.get_tool()["inputSchema"]["x-hooks"]["on_interrupt_motion"]
+        stopped = swing.dispatch(hook["action"], {})
         self.assertEqual("idle", stopped["state"])
         cancels = [msg for msg in plan._publisher.messages
                    if msg.request_type == plan._request_type.REQUEST_CANCEL]
