@@ -3038,8 +3038,16 @@ class HeadActuatorPlugin:
             except Exception as exc:
                 cancelled = self._cancel.is_set()
                 with self._lock:
+                    active_request_id = self._active_request_id
                     self._status["state"] = "cancelled" if cancelled else "error"
                     self._status["error"] = "" if cancelled else str(exc)
+                # 超时/故障路径必须先取消在飞的 planner 请求，否则释放 head 锁后
+                # 下一个 head 动作可能拿到锁并与仍在执行的轨迹并发。
+                # cancelled=True 时 cancel 已由 _stop_action 或 worker 自身发出。
+                if not cancelled and active_request_id is not None:
+                    self._joint_plan._dispatch_owned(
+                        "head", "cancel", {"request_id": active_request_id}
+                    )
             finally:
                 with self._lock:
                     final_status = str(self._status.get("state", "error"))
