@@ -2311,12 +2311,14 @@ class JointPlanPlugin:
             return snapshot
         if action == "stop":
             return {"state": "idle"}
+        # Cancellation is a safety/operator escape hatch: it must remain
+        # available even while an in-process plugin owns the planner.
+        if action == "cancel":
+            return self._publish_request("cancel", args)
         with self._owner_lock:
             active_owner = self._owner
         if active_owner is not None and owner != active_owner:
             return {"error": f"joint planner is owned by {active_owner}"}
-        if action == "cancel":
-            return self._publish_request("cancel", args)
         if action == "reset":
             return self._publish_request("reset", args)
         if action == "preset":
@@ -3112,7 +3114,9 @@ class ArmSwingPlugin:
             ),
         }
         tool["inputSchema"]["x-completion"] = {
-            "actions": ["start_swing", "return_neutral", "halt_and_return"],
+            # start_swing is continuous and must not hold Agent Core's ACP
+            # actuator barrier; halt and runtime updates need to remain callable.
+            "actions": ["return_neutral", "halt_and_return"],
             "timeout": int(self._ACP_TIMEOUT_SEC),
         }
         return tool
