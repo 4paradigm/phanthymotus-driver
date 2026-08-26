@@ -1054,6 +1054,16 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("ready", swing.dispatch("info", {})["state"])
         self.assertEqual("idle", swing.dispatch("stop", {})["state"])
 
+    def test_arm_swing_rejects_invalid_neutral_return_duration(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        swing = self.device.ArmSwingPlugin(CONFIG, plan, self.state)
+        self.state._current_motion = "lower_body_balance"
+        for duration in (0.01, 100, float("inf"), float("nan")):
+            result = swing.dispatch("return_neutral", {"duration": duration})
+            self.assertIn("duration must be finite", result["error"])
+        self.assertEqual([], plan._publisher.messages)
+
     def test_arm_swing_return_neutral_uses_joint_plan(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
         plan.start()
@@ -1152,18 +1162,18 @@ class DevicePluginContractTests(unittest.TestCase):
     def test_arm_swing_halt_cancels_request_published_before_id_storage(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
         plan.start()
-        original_dispatch = plan.dispatch
+        original_dispatch_owned = plan.dispatch_owned
         published = threading.Event()
         allow_return = threading.Event()
 
-        def delayed_dispatch(action, args):
-            result = original_dispatch(action, args)
+        def delayed_dispatch_owned(owner, action, args):
+            result = original_dispatch_owned(owner, action, args)
             if action == "plan":
                 published.set()
                 allow_return.wait(timeout=1.0)
             return result
 
-        plan.dispatch = delayed_dispatch
+        plan.dispatch_owned = delayed_dispatch_owned
         swing = self.device.ArmSwingPlugin(CONFIG, plan, self.state)
         swing._notify_completion = lambda *_args: None
         self.state._current_motion = "lower_body_balance"
@@ -1248,6 +1258,19 @@ class DevicePluginContractTests(unittest.TestCase):
         gesture.dispatch("stop_gesture", {})
         gesture._thread.join(timeout=1.0)
         self.assertIsNone(plan.owner())
+
+    def test_joint_plan_rejects_forged_owner_from_public_dispatch(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        self.assertTrue(plan.acquire("arm_swing"))
+        for action, args in (
+            ("head_pose", {"pitch_rad": 0.0, "yaw_rad": 0.0}),
+            ("reset", {}),
+            ("cancel", {"request_id": 12}),
+        ):
+            result = plan.dispatch(action, {**args, "_owner": "arm_swing"})
+            self.assertIn("reserved for internal driver use", result["error"])
+        self.assertEqual([], plan._publisher.messages)
 
     def test_gesture_rejects_start_while_arm_swing_owns_planner(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
