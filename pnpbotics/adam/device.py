@@ -177,14 +177,6 @@ def _hand_state_payload(position, received_at_ms: int, *, fresh: bool) -> dict:
         positions.extend([0] * (HAND_POSITION_COUNT - len(positions)))
     positions = positions[:HAND_POSITION_COUNT]
 
-    def side(values):
-        return {
-            "position": values,
-            "channels": dict(zip(HAND_CHANNEL_NAMES, values)),
-            "finger_count": 5,
-            "motor_channel_count": 6,
-        }
-
     now_ms = int(time.time() * 1000)
     age_ms = max(0, now_ms - int(received_at_ms))
     return {
@@ -193,8 +185,8 @@ def _hand_state_payload(position, received_at_ms: int, *, fresh: bool) -> dict:
         "age_ms": age_ms,
         "fresh": bool(fresh),
         "position": positions,
-        "left": side(positions[:6]),
-        "right": side(positions[6:12]),
+        "left": positions[:6],
+        "right": positions[6:12],
     }
 
 
@@ -226,11 +218,6 @@ class HandStateCache:
         self._received_at_ms = 0
         self._received_monotonic = None
         self._last_read_error = None
-
-    @property
-    def reader_available(self) -> bool:
-        with self._lock:
-            return self._subscriber is not None and not self._closed
 
     def start(self) -> bool:
         with self._lifecycle_lock:
@@ -361,11 +348,9 @@ class HandStateCache:
             received_at_ms = self._received_at_ms
             received_monotonic = self._received_monotonic
             last_read_error = self._last_read_error
-            reader_running = self._thread is not None and self._thread.is_alive()
         fresh = self._fresh(received_monotonic, timeout_sec)
         result = {
             "reader_available": reader_available,
-            "reader_running": reader_running,
             "fresh": fresh,
             "last_sample_age_ms": (
                 max(0, int(time.time() * 1000) - received_at_ms)
@@ -724,7 +709,6 @@ class HandStatePlugin:
             "state": state,
             "ros2_available": self._ros2_available,
             "reader_available": cache_status["reader_available"],
-            "reader_running": cache_status.get("reader_running", False),
             "fresh": cache_status["fresh"],
             "last_sample_age_ms": cache_status["last_sample_age_ms"],
             "topic_out": [{"topic": self._topic, "format": "data/json"}],
@@ -770,7 +754,6 @@ class HandStatePlugin:
                 "state": "unavailable" if not cache_status["reader_available"] else "waiting",
                 "fresh": False,
                 "reader_available": cache_status["reader_available"],
-                "reader_running": cache_status.get("reader_running", False),
                 "source_topic": "rt/handstate",
                 "message": (
                     "DDS hand state reader is unavailable"
@@ -1278,28 +1261,10 @@ class HandPlugin:
                         "control_active": False,
                         "worker_alive": True,
                     }
-                if self._control_thread is thread:
-                    self._control_thread = None
-                    self._control_stop_event = None
-        self._state_cache.start()
-        with self._lifecycle_lock:
-            if self._closed:
-                return {
-                    "state": "error",
-                    "error": "HAND_CLOSED",
-                    "message": "hand worker has been closed",
-                }
-            thread = self._control_thread
-            stop_event = self._control_stop_event
-            if thread is not None and thread.is_alive():
-                if stop_event is None or not stop_event.is_set():
-                    return self._status("ready")
-                return {
-                    "state": "stopping",
-                    "action": "start",
-                    "control_active": False,
-                    "worker_alive": True,
-                }
+                self._control_thread = None
+                self._control_stop_event = None
+
+            self._state_cache.start()
             if not self._publisher_available():
                 return self._status("unavailable")
             self._wake_event.clear()
@@ -1361,7 +1326,6 @@ class HandPlugin:
             "closed": self._closed,
             "publisher_available": self._publisher_available(),
             "state_reader_available": cache_status["reader_available"],
-            "state_reader_running": cache_status.get("reader_running", False),
             "state_fresh": cache_status["fresh"],
             "last_write_ok": last_write_ok,
             "last_write_at_ms": last_write_at_ms,
@@ -1462,7 +1426,6 @@ class HandPlugin:
         return {
             "state": "active",
             "action": action,
-            "success": True,
         }
 
     def dispatch(self, action: str, args: dict) -> dict:
