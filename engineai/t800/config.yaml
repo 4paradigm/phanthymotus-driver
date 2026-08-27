@@ -82,6 +82,18 @@ plugins:
     enabled: true
     default_amplitude_deg: 8.0
     default_frequency_hz: 0.7
+  head:
+    enabled: true
+    step_duration_sec: 0.35
+    feedback_grace_sec: 1.0
+    nod_amplitude_rad: 0.3
+    shake_amplitude_rad: 0.6
+    look_poses:
+      forward: {pitch_rad: 0.0, yaw_rad: 0.0}
+      left: {pitch_rad: 0.0, yaw_rad: 0.6}
+      right: {pitch_rad: 0.0, yaw_rad: -0.6}
+      up: {pitch_rad: -0.3, yaw_rad: 0.0}
+      down: {pitch_rad: 0.3, yaw_rad: 0.0}
   joint_override:
     enabled: true
   joint_bridge:
