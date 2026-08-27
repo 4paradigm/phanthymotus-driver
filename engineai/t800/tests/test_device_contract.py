@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import math
 import os
 import ssl
 import struct
@@ -245,6 +246,7 @@ class DevicePluginContractTests(unittest.TestCase):
             self.device.DancePlugin(motion_mode, self.state),
             joint_plan,
             self.device.GesturePlugin(joint_plan),
+            self.device.WaistPlugin(CONFIG, joint_plan),
             self.device.JointOverridePlugin(CONFIG, "robot", self.ros, self.state),
             self.device.JointBridgePlugin(CONFIG, "robot", self.ros, self.state),
             self.device.LedPlugin(CONFIG, "robot", self.ros),
@@ -273,14 +275,14 @@ class DevicePluginContractTests(unittest.TestCase):
              "robot_snapshot", "fault_summary", "stability", "joint_groups", "capabilities", "ros_graph",
              "mainboard", "heartbeat_status", "motion_command_trace", "motion_events",
              "native_interface_probe",
-             "loco", "motion_mode", "dance", "joint_plan", "joint_plan_state", "gesture",
+             "loco", "motion_mode", "dance", "joint_plan", "joint_plan_state", "gesture", "waist",
              "joint_override", "joint_bridge",
              "led", "tts", "mic", "pointcloud", "camera", "depth",
              "motor_power", "native_node_control", "virtual_gamepad", "safety", "native_sdk"},
             names,
         )
-        self.assertEqual(41, len(names))
-        self.assertEqual(41, len(definitions), "tool names must be unique")
+        self.assertEqual(42, len(names))
+        self.assertEqual(42, len(definitions), "tool names must be unique")
         for tool in definitions:
             schema = tool.get("inputSchema")
             self.assertEqual("object", schema.get("type"), tool["name"])
@@ -676,6 +678,239 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual([13, 14, 15, 16, 17], plugin._publisher.messages[-1].joint_indices)
         plugin.dispatch("hold_current", {})
         self.assertEqual(list(range(25)), plugin._publisher.messages[-1].joint_indices)
+
+    def test_waist_controls_only_j12_with_conservative_absolute_angle(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        plan.wait_for_terminal_request = lambda request_id, *_args, **_kwargs: plan._on_state(
+            JointMotionPlanState(request_id=request_id, status=JointMotionPlanState.IDLE, progress=1.0)
+        )
+        waist = self.device.WaistPlugin(CONFIG, plan)
+        completions = []
+        waist._notify_completion = lambda *args: completions.append(args)
+        self.state._current_motion = "lower_body_balance"
+
+        result = waist.dispatch("set_angle", {"angle_deg": 30, "duration": 2.0})
+        waist._thread.join(timeout=1.0)
+        sent = plan._publisher.messages[-1]
+        self.assertEqual("running", result["state"])
+        self.assertTrue(result["action_id"].startswith("t800_waist_"))
+        self.assertEqual([12], sent.joint_indices)
+        self.assertAlmostEqual(math.pi / 6, sent.target_positions[0])
+        self.assertEqual(2.0, sent.execution_time)
+        self.assertTrue(sent.use_gravity_compensation)
+        self.assertEqual(result["action_id"], completions[0][0])
+        self.assertEqual("completed", completions[0][1])
+
+        centered = waist.dispatch("center", {})
+        waist._thread.join(timeout=1.0)
+        self.assertEqual("running", centered["state"])
+        self.assertEqual([0.0], plan._publisher.messages[-1].target_positions)
+
+    def test_waist_dispatch_handles_actuator_lifecycle_actions(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        waist = self.device.WaistPlugin(CONFIG, plan)
+
+        started = waist.dispatch("start", {})
+        self.assertEqual("ready", started["state"])
+        self.assertEqual("J12_TORSO_YAW", started["joint_name"])
+        self.assertEqual("ready", waist.dispatch("info", {})["state"])
+        self.assertEqual({"state": "idle"}, waist.dispatch("stop", {}))
+        self.assertIsNone(waist.dispatch("unsupported", {}))
+        self.assertEqual([], plan._publisher.messages)
+        schema = waist.get_tool()["inputSchema"]
+        lifecycle = {"start", "info", "stop"}
+        self.assertTrue(lifecycle.issubset(schema["properties"]["action"]["enum"]))
+        self.assertTrue(lifecycle.issubset(schema["x-action-params"]))
+        self.assertEqual([], schema["x-action-params"]["stop"]["params"])
+        self.assertEqual(["set_angle", "center"], schema["x-completion"]["actions"])
+        self.assertEqual(15, schema["x-completion"]["timeout"])
+        self.assertEqual({"action": "stop"}, schema["x-hooks"]["on_interrupt_all"])
+
+    def test_waist_rejects_unsafe_state_angle_and_duration(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        waist = self.device.WaistPlugin(CONFIG, plan)
+
+        blocked = waist.dispatch("set_angle", {"angle_deg": 10})
+        self.assertIn("lower_body_balance", blocked["error"])
+        self.assertEqual([], plan._publisher.messages)
+
+        self.state._current_motion = "lower_body_balance"
+        self.assertIn("between -30 and 30", waist.dispatch("set_angle", {"angle_deg": 31})["error"])
+        self.assertIn("between 0.5 and 5", waist.dispatch("set_angle", {"angle_deg": 0, "duration": 0.1})["error"])
+        with self.assertRaisesRegex(ValueError, "finite number"):
+            waist.dispatch("set_angle", {"angle_deg": float("nan")})
+        with self.assertRaisesRegex(ValueError, "finite number"):
+            waist.dispatch("set_angle", {"angle_deg": True})
+        with self.assertRaisesRegex(ValueError, "finite number"):
+            waist.dispatch("set_angle", {"angle_deg": 0, "duration": float("nan")})
+        self.assertEqual([], plan._publisher.messages)
+
+    def test_safety_emergency_cancels_active_waist_request(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        waist = self.device.WaistPlugin(CONFIG, plan)
+        waist._notify_completion = lambda *_args: None
+        self.state._current_motion = "lower_body_balance"
+        started = waist.dispatch("set_angle", {"angle_deg": 5.0, "duration": 5.0})
+        request_id = started["request_id"]
+
+        safety = self.device.SafetyControlPlugin(CONFIG, "robot", self.ros, self.state)
+        safety.set_controls([waist])
+        safety.start()
+        result = safety.dispatch("emergency_passive", {})
+        self.assertIn("WaistPlugin", result["stopped_streams"])
+        waist._thread.join(timeout=1.0)
+        self.assertFalse(waist._thread.is_alive())
+        cancels = [msg for msg in plan._publisher.messages
+                   if msg.request_type == plan._request_type.REQUEST_CANCEL]
+        self.assertTrue(any(msg.request_id == request_id for msg in cancels))
+
+    def test_waist_rejects_while_gesture_owns_shared_planner(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        gate = threading.Event()
+        plan.wait_until_idle = lambda *_args, **_kwargs: gate.wait(timeout=1.0)
+        gesture = self.device.GesturePlugin(plan)
+        gesture._acp_notify = lambda *_args, **_kwargs: None
+        waist = self.device.WaistPlugin(CONFIG, plan)
+        self.state._current_motion = "lower_body_balance"
+
+        started = gesture.dispatch("sequence", {
+            "steps": [{
+                "joint_indices": [23],
+                "target_positions": [0.1],
+                "duration": 0.05,
+            }],
+            "reset_after": False,
+        })
+        self.assertEqual("running", started["state"])
+        self.assertEqual("gesture", plan.owner())
+        blocked = waist.dispatch("set_angle", {"angle_deg": 5.0})
+        self.assertIn("owned by gesture", blocked["error"])
+        self.assertEqual([], plan._publisher.messages)
+
+        gesture.dispatch("stop_gesture", {"reset_after": False})
+        gate.set()
+        gesture._thread.join(timeout=1.0)
+        self.assertFalse(gesture._thread.is_alive())
+        self.assertIsNone(plan.owner())
+
+    def test_waist_loses_race_to_atomic_direct_plan_publication(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        waist = self.device.WaistPlugin(CONFIG, plan)
+        waist._notify_completion = lambda *_args: None
+        self.state._current_motion = "lower_body_balance"
+        original_publish_request = plan._publish_request
+        publication_entered = threading.Event()
+        allow_publication = threading.Event()
+        direct_results = []
+        waist_results = []
+
+        def delayed_publish_request(action, args):
+            if action == "plan" and not publication_entered.is_set():
+                publication_entered.set()
+                allow_publication.wait(timeout=1.0)
+            return original_publish_request(action, args)
+
+        plan._publish_request = delayed_publish_request
+        direct = threading.Thread(target=lambda: direct_results.append(plan.dispatch("plan", {
+            "joint_indices": [23],
+            "target_positions": [0.1],
+            "duration": 1.0,
+        })))
+        competing_waist = threading.Thread(target=lambda: waist_results.append(
+            waist.dispatch("set_angle", {"angle_deg": 5.0})
+        ))
+        direct.start()
+        self.assertTrue(publication_entered.wait(timeout=1.0))
+        competing_waist.start()
+        self.assertTrue(competing_waist.is_alive())
+        allow_publication.set()
+        direct.join(timeout=1.0)
+        competing_waist.join(timeout=1.0)
+
+        self.assertEqual("requested", direct_results[0]["state"])
+        self.assertIn("joint planner is busy", waist_results[0]["error"])
+        execute_requests = [msg for msg in plan._publisher.messages
+                            if msg.request_type == plan._request_type.REQUEST_PLAN_EXECUTE]
+        self.assertEqual(1, len(execute_requests))
+        plan.dispatch("cancel", {"request_id": direct_results[0]["request_id"]})
+
+    def test_waist_owner_blocks_new_public_plans_but_not_public_cancel(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        waist = self.device.WaistPlugin(CONFIG, plan)
+        waist._notify_completion = lambda *_args: None
+        self.state._current_motion = "lower_body_balance"
+        started = waist.dispatch("set_angle", {"angle_deg": 5.0, "duration": 5.0})
+        self.assertEqual("waist", plan.owner())
+
+        blocked = plan.dispatch("plan", {
+            "joint_indices": [23],
+            "target_positions": [0.1],
+            "duration": 1.0,
+        })
+        self.assertIn("owned by waist", blocked["error"])
+        forged = plan.dispatch("reset", {"_owner": "waist"})
+        self.assertIn("reserved", forged["error"])
+        cancelled = plan.dispatch("cancel", {"request_id": started["request_id"]})
+        self.assertEqual("requested", cancelled["state"])
+        self.assertEqual("waist", plan.owner())
+
+        waist.stop()
+        waist._thread.join(timeout=1.0)
+        self.assertFalse(waist._thread.is_alive())
+        self.assertIsNone(plan.owner())
+
+    def test_waist_completes_from_matching_idle_when_executing_sample_is_dropped(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        waist = self.device.WaistPlugin(CONFIG, plan)
+        completions = []
+        waist._notify_completion = lambda *args: completions.append(args)
+        self.state._current_motion = "lower_body_balance"
+
+        started = waist.dispatch("set_angle", {"angle_deg": 5.0, "duration": 1.0})
+        active = waist.dispatch("status", {})
+        self.assertEqual("running", active["state"])
+        self.assertEqual(started["action_id"], active["action_id"])
+        self.assertEqual(started["request_id"], active["request_id"])
+
+        # Deliver only the exact terminal state. No EXECUTING sample is sent.
+        plan._on_state(JointMotionPlanState(
+            request_id=started["request_id"],
+            status=JointMotionPlanState.IDLE,
+            progress=1.0,
+        ))
+        waist._thread.join(timeout=1.0)
+        self.assertFalse(waist._thread.is_alive())
+        self.assertEqual("completed", completions[0][1])
+        self.assertEqual(started["request_id"], completions[0][2]["request_id"])
+        cancels = [msg for msg in plan._publisher.messages
+                   if msg.request_type == plan._request_type.REQUEST_CANCEL]
+        self.assertEqual([], cancels)
+        ready = waist.dispatch("status", {})
+        self.assertEqual("ready", ready["state"])
+        self.assertNotIn("action_id", ready)
+        self.assertNotIn("request_id", ready)
+
+    def test_waist_status_reports_current_j12_without_publishing(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        waist = self.device.WaistPlugin(CONFIG, plan)
+        self.state._current_motion = "lower_body_balance"
+        self.state._last_joint_positions[12] = 0.25
+
+        status = waist.dispatch("status", {})
+        self.assertEqual("ready", status["state"])
+        self.assertEqual("J12_TORSO_YAW", status["joint_name"])
+        self.assertAlmostEqual(0.25, status["angle_rad"])
+        self.assertAlmostEqual(math.degrees(0.25), status["angle_deg"])
+        self.assertEqual([], plan._publisher.messages)
 
     def test_gesture_exposes_complete_official_sequences_and_custom_queue(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)

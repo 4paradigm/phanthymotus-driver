@@ -2227,6 +2227,9 @@ class JointPlanPlugin:
         self._last_state = {"state": "no_data"}
         self._executing_requests: set[int] = set()
         self._request_id = 0
+        self._pending_request_id: int | None = None
+        self._owner_lock = threading.Lock()
+        self._owner: str | None = None
         self._state_type = None
         self._state = state
         self._core_topic = f"/{namespace}/state/joint_plan"
@@ -2290,6 +2293,14 @@ class JointPlanPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict:
+        if "_owner" in args:
+            return {"error": "_owner is reserved for internal driver use"}
+        return self._dispatch(action, args, owner=None)
+
+    def dispatch_owned(self, owner: str, action: str, args: dict) -> dict:
+        return self._dispatch(action, args, owner=owner)
+
+    def _dispatch(self, action: str, args: dict, *, owner: str | None) -> dict:
         if action == "start":
             return {"state": "running" if args.get("_tool_name") == "joint_plan_state" else "ready"}
         if action in ("info", "status", "joint_plan_state"):
@@ -2300,10 +2311,21 @@ class JointPlanPlugin:
             return snapshot
         if action == "stop":
             return {"state": "idle"}
-        if action == "reset":
-            return self._publish_request("reset", {})
+        # Cancellation remains an owner-independent safety/operator path.
         if action == "cancel":
             return self._publish_request("cancel", args)
+        with self._owner_lock:
+            active_owner = self._owner
+            if owner is not None and active_owner != owner:
+                return {"error": f"joint planner is owned by {active_owner or 'nobody'}"}
+            if owner is None and active_owner is not None:
+                return {"error": f"joint planner is owned by {active_owner}"}
+            return self._dispatch_exclusive(action, args)
+
+    def _dispatch_exclusive(self, action: str, args: dict) -> dict:
+        """Allocate and publish while the planner ownership lock is held."""
+        if action == "reset":
+            return self._publish_request("reset", {})
         if action == "preset":
             preset = self._PRESETS.get(str(args.get("preset", "")))
             if preset is None:
@@ -2355,10 +2377,38 @@ class JointPlanPlugin:
             return self._publish_request("plan", args)
         return {"error": f"unknown joint plan action: {action}"}
 
+    def acquire(self, owner: str) -> bool:
+        with self._owner_lock:
+            if self._owner == owner:
+                return True
+            if self._owner is not None:
+                return False
+            with self._state_lock:
+                if self._pending_request_id is not None:
+                    return False
+            self._owner = owner
+            return True
+
+    def release(self, owner: str) -> bool:
+        with self._owner_lock:
+            if self._owner != owner:
+                return False
+            self._owner = None
+            return True
+
+    def owner(self) -> str | None:
+        with self._owner_lock:
+            return self._owner
+
     def current_motion(self) -> tuple[str, list[str]]:
         if self._state is None:
             return "", []
         return self._state.current_motion()
+
+    def joint_positions(self) -> list[float] | None:
+        if self._state is None:
+            return None
+        return self._state.joint_positions()
 
     def wait_until_idle(
         self,
@@ -2428,6 +2478,41 @@ class JointPlanPlugin:
                     raise TimeoutError(f"joint planner did not complete request {target}")
                 self._state_changed.wait(timeout=min(remaining, 0.2))
 
+    def wait_for_terminal_request(
+        self,
+        request_id: int,
+        timeout: float,
+        cancel_event: threading.Event,
+    ) -> dict:
+        """Wait for an exact request's terminal IDLE state.
+
+        Unlike gesture sequencing, bounded one-shot actions do not require an
+        observed EXECUTING sample. The planner-state subscription is best
+        effort, so a matching terminal IDLE is authoritative even when the
+        intermediate EXECUTING sample was dropped.
+        """
+        if self._state_type is None:
+            raise RuntimeError("joint planner is not started")
+        target = int(request_id)
+        deadline = time.monotonic() + float(timeout)
+        idle = int(self._state_type.IDLE)
+        with self._state_changed:
+            while True:
+                if cancel_event.is_set():
+                    raise RuntimeError(f"joint planner request {target} cancelled")
+                state = dict(self._last_state)
+                current_id = state.get("request_id")
+                status = int(state.get("status", -1))
+                if current_id is not None and int(current_id) == target and status == idle:
+                    self._executing_requests.discard(target)
+                    return state
+                if current_id is not None and int(current_id) > target:
+                    raise RuntimeError(f"joint planner request {target} was superseded")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"joint planner did not complete request {target}")
+                self._state_changed.wait(timeout=min(remaining, 0.2))
+
     def _next_request_id(self) -> int:
         with self._state_lock:
             self._request_id += 1
@@ -2468,6 +2553,12 @@ class JointPlanPlugin:
             msg.stiffness = []
             msg.damping = []
         self._publisher.publish(msg)
+        with self._state_lock:
+            if action == "cancel":
+                if self._pending_request_id == int(msg.request_id):
+                    self._pending_request_id = None
+            else:
+                self._pending_request_id = int(msg.request_id)
         return {"state": "requested", "request_id": msg.request_id, "request_type": int(msg.request_type)}
 
     def _on_state(self, msg) -> None:
@@ -2482,8 +2573,268 @@ class JointPlanPlugin:
             self._last_state = payload
             if self._state_type is not None and int(msg.status) == int(self._state_type.EXECUTING):
                 self._executing_requests.add(int(msg.request_id))
+            if (
+                self._state_type is not None
+                and int(msg.status) == int(self._state_type.IDLE)
+                and self._pending_request_id == int(msg.request_id)
+            ):
+                self._pending_request_id = None
             self._state_changed.notify_all()
         self._core_pub.publish(_json_message(payload))
+
+
+class WaistPlugin:
+    """Conservative absolute-yaw facade for the T800 torso joint."""
+
+    _JOINT_INDEX = T800_JOINT_INDEX["J12_TORSO_YAW"]
+    _JOINT_NAME = "J12_TORSO_YAW"
+    _REQUIRED_MOTION = "lower_body_balance"
+    _MAX_DURATION_SEC = 5.0
+    _WAIT_MARGIN_SEC = 3.0
+    _ACP_CALLBACK_TIMEOUT_SEC = 5.0
+    _ACP_SAFETY_MARGIN_SEC = 2.0
+    _ACP_TIMEOUT_SEC = (
+        _MAX_DURATION_SEC
+        + _WAIT_MARGIN_SEC
+        + _ACP_CALLBACK_TIMEOUT_SEC
+        + _ACP_SAFETY_MARGIN_SEC
+    )
+
+    def __init__(self, config: dict, joint_plan: JointPlanPlugin):
+        waist_config = config.get("plugins", {}).get("waist", {})
+        self._joint_plan = joint_plan
+        self._lock = threading.RLock()
+        self._command_lock = threading.Lock()
+        self._cancel = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._request_id: int | None = None
+        self._action_id: str | None = None
+        self._max_abs_angle_deg = float(waist_config.get("max_abs_angle_deg", 30.0))
+        self._default_duration = float(waist_config.get("default_duration", 1.5))
+        if not math.isfinite(self._max_abs_angle_deg) or not 0 < self._max_abs_angle_deg <= 30.0:
+            raise ValueError("waist.max_abs_angle_deg must be between 0 and 30")
+        if not math.isfinite(self._default_duration) or not 0.5 <= self._default_duration <= 5.0:
+            raise ValueError("waist.default_duration must be between 0.5 and 5 seconds")
+
+    def get_tool(self) -> dict:
+        tool = {
+            "name": "waist",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "安全控制 T800 腰部 J12 偏航；使用绝对角度并限制在正负 30 度内",
+            "inputSchema": action_schema(
+                _with_lifecycle({
+                    "set_angle": (["angle_deg", "duration"], "设置腰部绝对偏航角度"),
+                    "center": (["duration"], "将腰部回正到 0 度"),
+                    "status": ([], "读取当前腰部角度和运动状态"),
+                    "list": ([], "查看控制范围、关节和状态要求"),
+                }),
+                {
+                    "angle_deg": {
+                        "type": "number",
+                        "minimum": -self._max_abs_angle_deg,
+                        "maximum": self._max_abs_angle_deg,
+                        "description": "J12 绝对目标角度；正负方向以机器人坐标系为准",
+                    },
+                    "duration": {
+                        "type": "number",
+                        "minimum": 0.5,
+                        "maximum": 5.0,
+                        "description": "执行时间，秒；默认 1.5",
+                    },
+                },
+                "腰部控制动作",
+            ),
+        }
+        tool["inputSchema"]["x-completion"] = {
+            "actions": ["set_angle", "center"],
+            "timeout": int(self._ACP_TIMEOUT_SEC),
+        }
+        tool["inputSchema"]["x-hooks"] = {
+            "on_interrupt_motion": {"action": "stop"},
+            "on_interrupt_all": {"action": "stop"},
+        }
+        return tool
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> dict:
+        with self._command_lock:
+            return self._stop_motion()
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "info"):
+            return {**self._metadata(), "state": "ready"}
+        if action == "stop":
+            return self.stop()
+        if action == "list":
+            return self._metadata()
+        if action == "status":
+            motion, available = self._joint_plan.current_motion()
+            positions = self._joint_plan.joint_positions()
+            angle_rad = positions[self._JOINT_INDEX] if positions is not None else None
+            with self._lock:
+                active = (
+                    self._thread is not None
+                    and self._thread.is_alive()
+                    and self._action_id is not None
+                )
+                action_id = self._action_id
+                request_id = self._request_id
+            status = {
+                **self._metadata(),
+                "state": (
+                    "running" if active
+                    else "ready" if motion == self._REQUIRED_MOTION
+                    else "unavailable"
+                ),
+                "current_motion": motion,
+                "available_transition_motions": available,
+                "angle_rad": angle_rad,
+                "angle_deg": math.degrees(angle_rad) if angle_rad is not None else None,
+            }
+            if active:
+                status["action_id"] = action_id
+                status["request_id"] = request_id
+            return status
+        if action not in ("set_angle", "center"):
+            return None
+
+        with self._command_lock:
+            return self._start_motion(action, args)
+
+    def _start_motion(self, action: str, args: dict) -> dict:
+        motion, available = self._joint_plan.current_motion()
+        if motion != self._REQUIRED_MOTION:
+            return {
+                "error": f"waist requires motion state '{self._REQUIRED_MOTION}' (current: {motion or 'unknown'})",
+                "current_motion": motion,
+                "available_transition_motions": available,
+            }
+
+        angle_deg = 0.0 if action == "center" else self._finite_number(args.get("angle_deg"), "angle_deg")
+        if abs(angle_deg) > self._max_abs_angle_deg:
+            return {"error": f"angle_deg must be between {-self._max_abs_angle_deg:g} and {self._max_abs_angle_deg:g}"}
+        duration = self._finite_number(args.get("duration", self._default_duration), "duration")
+        if not 0.5 <= duration <= self._MAX_DURATION_SEC:
+            return {"error": "duration must be between 0.5 and 5 seconds"}
+
+        angle_rad = math.radians(angle_deg)
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return {"error": "another waist action is already running"}
+            if not self._joint_plan.acquire("waist"):
+                owner = self._joint_plan.owner()
+                return {"error": f"joint planner is busy{f' (owned by {owner})' if owner else ''}"}
+            result = self._joint_plan.dispatch_owned("waist", "plan", {
+                "joint_indices": [self._JOINT_INDEX],
+                "target_positions": [angle_rad],
+                "duration": duration,
+                "gravity_compensation": True,
+            })
+            if "error" in result:
+                self._joint_plan.release("waist")
+                return result
+            from uuid import uuid4
+
+            request_id = int(result["request_id"])
+            action_id = f"t800_waist_{uuid4().hex[:12]}"
+            self._cancel = threading.Event()
+            self._request_id = request_id
+            self._action_id = action_id
+            self._thread = threading.Thread(
+                target=self._monitor_motion,
+                args=(action_id, request_id, action, angle_deg, angle_rad, duration),
+                daemon=True,
+                name="t800-waist-motion",
+            )
+            self._thread.start()
+        return {
+            **result,
+            "state": "running",
+            "action_id": action_id,
+            "joint_index": self._JOINT_INDEX,
+            "joint_name": self._JOINT_NAME,
+            "target_angle_deg": angle_deg,
+            "target_angle_rad": angle_rad,
+            "duration": duration,
+        }
+
+    def _monitor_motion(
+        self,
+        action_id: str,
+        request_id: int,
+        action: str,
+        angle_deg: float,
+        angle_rad: float,
+        duration: float,
+    ) -> None:
+        status = "completed"
+        error = ""
+        try:
+            self._joint_plan.wait_for_terminal_request(
+                request_id,
+                duration + self._WAIT_MARGIN_SEC,
+                self._cancel,
+            )
+        except Exception as exc:
+            status = "cancelled" if self._cancel.is_set() else "error"
+            error = "" if status == "cancelled" else str(exc)
+            if status == "error":
+                self._joint_plan.dispatch_owned("waist", "cancel", {"request_id": request_id})
+        finally:
+            with self._lock:
+                if self._action_id == action_id:
+                    self._request_id = None
+                    self._action_id = None
+            self._joint_plan.release("waist")
+            self._notify_completion(action_id, status, {
+                "action": action,
+                "request_id": request_id,
+                "target_angle_deg": angle_deg,
+                "target_angle_rad": angle_rad,
+                "duration": duration,
+                "error": error,
+            })
+
+    def _stop_motion(self) -> dict:
+        with self._lock:
+            self._cancel.set()
+            request_id = self._request_id
+            thread = self._thread
+        if request_id is not None:
+            self._joint_plan.dispatch_owned("waist", "cancel", {"request_id": request_id})
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+        result = {"state": "idle"}
+        if request_id is not None:
+            result["request_id"] = request_id
+        return result
+
+    @staticmethod
+    def _notify_completion(action_id: str, status: str, result: dict) -> None:
+        GesturePlugin._acp_notify(action_id, status, result, tool="waist")
+
+    def _metadata(self) -> dict:
+        return {
+            "joint_index": self._JOINT_INDEX,
+            "joint_name": self._JOINT_NAME,
+            "control_mode": "absolute",
+            "min_angle_deg": -self._max_abs_angle_deg,
+            "max_angle_deg": self._max_abs_angle_deg,
+            "required_motion_state": self._REQUIRED_MOTION,
+            "default_duration": self._default_duration,
+        }
+
+    @staticmethod
+    def _finite_number(value, name: str) -> float:
+        if isinstance(value, bool) or not isinstance(value, numbers.Real):
+            raise ValueError(f"{name} must be a finite number")
+        converted = float(value)
+        if not math.isfinite(converted):
+            raise ValueError(f"{name} must be a finite number")
+        return converted
 
 
 class GesturePlugin:
@@ -2757,6 +3108,9 @@ class GesturePlugin:
                 current = dict(self._status)
                 current.pop("action_id", None)
                 return {**current, "error": "another gesture sequence is already running"}
+            if not self._joint_plan.acquire("gesture"):
+                owner = self._joint_plan.owner()
+                return {"error": f"joint planner is busy{f' (owned by {owner})' if owner else ''}"}
             from uuid import uuid4
 
             action_id = f"t800_gesture_{uuid4().hex[:12]}"
@@ -2780,7 +3134,7 @@ class GesturePlugin:
                         self._status["step"] = index
                         self._status["step_name"] = step["name"]
                     action = "plan_named" if "joint_names" in step else "plan"
-                    result = self._joint_plan.dispatch(action, step)
+                    result = self._joint_plan.dispatch_owned("gesture", action, step)
                     if "error" in result:
                         raise ValueError(result["error"])
                     request_id = int(result["request_id"])
@@ -2795,7 +3149,7 @@ class GesturePlugin:
                     if hold_after > 0 and self._cancel.wait(hold_after):
                         raise RuntimeError("gesture cancelled")
                 if not self._cancel.is_set() and reset_after:
-                    result = self._joint_plan.dispatch("reset", {})
+                    result = self._joint_plan.dispatch_owned("gesture", "reset", {})
                     if "error" in result:
                         raise ValueError(result["error"])
                     request_id = int(result["request_id"])
@@ -2816,11 +3170,12 @@ class GesturePlugin:
             except Exception as exc:
                 cancelled = self._cancel.is_set()
                 if request_id is not None:
-                    self._joint_plan.dispatch("cancel", {"request_id": request_id})
+                    self._joint_plan.dispatch_owned("gesture", "cancel", {"request_id": request_id})
                 with self._lock:
                     self._status["state"] = "cancelled" if cancelled else "error"
                     self._status["error"] = "" if cancelled else str(exc)
             finally:
+                self._joint_plan.release("gesture")
                 with self._lock:
                     self._last_finished_at = time.monotonic()
                     final_status = str(self._status.get("state", "error"))
@@ -2862,13 +3217,13 @@ class GesturePlugin:
                 request_id = None
             result = dict(self._status)
         if request_id is not None:
-            self._joint_plan.dispatch("cancel", {"request_id": request_id})
+            self._joint_plan.dispatch_owned("gesture", "cancel", {"request_id": request_id})
         if reset_after:
-            self._joint_plan.dispatch("reset", {})
+            self._joint_plan.dispatch_owned("gesture", "reset", {})
         return result
 
     @staticmethod
-    def _acp_notify(action_id: str, status: str, result: dict) -> None:
+    def _acp_notify(action_id: str, status: str, result: dict, tool: str = "gesture") -> None:
         """Report asynchronous gesture completion to Agent Core."""
         import json as _json
         import os as _os
@@ -2892,7 +3247,7 @@ class GesturePlugin:
                 "action_id": action_id,
                 "status": status,
                 "result": result,
-                "tool": "gesture",
+                "tool": tool,
                 "ts": time.time(),
             }).encode()
             request = _urllib.Request(
@@ -2907,7 +3262,7 @@ class GesturePlugin:
                 context=context,
             )
         except Exception as exc:
-            print(f"[gesture] ACP callback failed for {action_id}: {exc}", flush=True)
+            print(f"[{tool}] ACP callback failed for {action_id}: {exc}", flush=True)
 
 
 class _JointStreamBase:
