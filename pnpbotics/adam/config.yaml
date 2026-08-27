@@ -57,17 +57,17 @@ plugins:
     publish_rate_hz: 100
   hand:
     enabled: true
-    # Verified on Adam: HandState_ reports the 12 channels in this range and
-    # this pose opens both hands without changing the body joints.
+    # Verified on Adam: all 12 hand channels move in the effective 0..1000
+    # range. Values from 1000..1800 are a dead band; 1800 equals 1000.
     hand_type: "adam_client"
-    position_max: 1800
+    position_max: 1000
     control_rate_hz: 400
     state_timeout_sec: 1.0
     # Close the four non-thumb fingers while rotating the thumb to 1000 and
     # flexing it to 100 at the same time. Lower flexion values mean more closed.
     thumb_close_positions: [100, 1000, 100, 1000]  # left flex/rotate, right flex/rotate
     thumb_close_min_flex_position: 100
-    open_positions: [1800, 1800, 1800, 1800, 1600, 0, 1800, 1800, 1800, 1800, 1600, 0]
+    open_positions: [1000, 1000, 1000, 1000, 1000, 0, 1000, 1000, 1000, 1000, 1000, 0]
     close_positions: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
   model:
     enabled: true
