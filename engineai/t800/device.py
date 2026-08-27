@@ -2227,6 +2227,9 @@ class JointPlanPlugin:
         self._last_state = {"state": "no_data"}
         self._executing_requests: set[int] = set()
         self._request_id = 0
+        self._pending_request_id: int | None = None
+        self._owner_lock = threading.Lock()
+        self._owner: str | None = None
         self._state_type = None
         self._state = state
         self._core_topic = f"/{namespace}/state/joint_plan"
@@ -2290,6 +2293,14 @@ class JointPlanPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict:
+        if "_owner" in args:
+            return {"error": "_owner is reserved for internal driver use"}
+        return self._dispatch(action, args, owner=None)
+
+    def dispatch_owned(self, owner: str, action: str, args: dict) -> dict:
+        return self._dispatch(action, args, owner=owner)
+
+    def _dispatch(self, action: str, args: dict, *, owner: str | None) -> dict:
         if action == "start":
             return {"state": "running" if args.get("_tool_name") == "joint_plan_state" else "ready"}
         if action in ("info", "status", "joint_plan_state"):
@@ -2300,10 +2311,21 @@ class JointPlanPlugin:
             return snapshot
         if action == "stop":
             return {"state": "idle"}
-        if action == "reset":
-            return self._publish_request("reset", {})
+        # Cancellation remains an owner-independent safety/operator path.
         if action == "cancel":
             return self._publish_request("cancel", args)
+        with self._owner_lock:
+            active_owner = self._owner
+            if owner is not None and active_owner != owner:
+                return {"error": f"joint planner is owned by {active_owner or 'nobody'}"}
+            if owner is None and active_owner is not None:
+                return {"error": f"joint planner is owned by {active_owner}"}
+            return self._dispatch_exclusive(action, args)
+
+    def _dispatch_exclusive(self, action: str, args: dict) -> dict:
+        """Allocate and publish while the planner ownership lock is held."""
+        if action == "reset":
+            return self._publish_request("reset", {})
         if action == "preset":
             preset = self._PRESETS.get(str(args.get("preset", "")))
             if preset is None:
@@ -2354,6 +2376,29 @@ class JointPlanPlugin:
         if action == "plan":
             return self._publish_request("plan", args)
         return {"error": f"unknown joint plan action: {action}"}
+
+    def acquire(self, owner: str) -> bool:
+        with self._owner_lock:
+            if self._owner == owner:
+                return True
+            if self._owner is not None:
+                return False
+            with self._state_lock:
+                if self._pending_request_id is not None:
+                    return False
+            self._owner = owner
+            return True
+
+    def release(self, owner: str) -> bool:
+        with self._owner_lock:
+            if self._owner != owner:
+                return False
+            self._owner = None
+            return True
+
+    def owner(self) -> str | None:
+        with self._owner_lock:
+            return self._owner
 
     def current_motion(self) -> tuple[str, list[str]]:
         if self._state is None:
@@ -2508,6 +2553,12 @@ class JointPlanPlugin:
             msg.stiffness = []
             msg.damping = []
         self._publisher.publish(msg)
+        with self._state_lock:
+            if action == "cancel":
+                if self._pending_request_id == int(msg.request_id):
+                    self._pending_request_id = None
+            else:
+                self._pending_request_id = int(msg.request_id)
         return {"state": "requested", "request_id": msg.request_id, "request_type": int(msg.request_type)}
 
     def _on_state(self, msg) -> None:
@@ -2522,6 +2573,12 @@ class JointPlanPlugin:
             self._last_state = payload
             if self._state_type is not None and int(msg.status) == int(self._state_type.EXECUTING):
                 self._executing_requests.add(int(msg.request_id))
+            if (
+                self._state_type is not None
+                and int(msg.status) == int(self._state_type.IDLE)
+                and self._pending_request_id == int(msg.request_id)
+            ):
+                self._pending_request_id = None
             self._state_changed.notify_all()
         self._core_pub.publish(_json_message(payload))
 
@@ -2667,13 +2724,17 @@ class WaistPlugin:
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 return {"error": "another waist action is already running"}
-            result = self._joint_plan.dispatch("plan", {
+            if not self._joint_plan.acquire("waist"):
+                owner = self._joint_plan.owner()
+                return {"error": f"joint planner is busy{f' (owned by {owner})' if owner else ''}"}
+            result = self._joint_plan.dispatch_owned("waist", "plan", {
                 "joint_indices": [self._JOINT_INDEX],
                 "target_positions": [angle_rad],
                 "duration": duration,
                 "gravity_compensation": True,
             })
             if "error" in result:
+                self._joint_plan.release("waist")
                 return result
             from uuid import uuid4
 
@@ -2721,12 +2782,13 @@ class WaistPlugin:
             status = "cancelled" if self._cancel.is_set() else "error"
             error = "" if status == "cancelled" else str(exc)
             if status == "error":
-                self._joint_plan.dispatch("cancel", {"request_id": request_id})
+                self._joint_plan.dispatch_owned("waist", "cancel", {"request_id": request_id})
         finally:
             with self._lock:
                 if self._action_id == action_id:
                     self._request_id = None
                     self._action_id = None
+            self._joint_plan.release("waist")
             self._notify_completion(action_id, status, {
                 "action": action,
                 "request_id": request_id,
@@ -2742,7 +2804,7 @@ class WaistPlugin:
             request_id = self._request_id
             thread = self._thread
         if request_id is not None:
-            self._joint_plan.dispatch("cancel", {"request_id": request_id})
+            self._joint_plan.dispatch_owned("waist", "cancel", {"request_id": request_id})
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=1.0)
         result = {"state": "idle"}
@@ -3046,6 +3108,9 @@ class GesturePlugin:
                 current = dict(self._status)
                 current.pop("action_id", None)
                 return {**current, "error": "another gesture sequence is already running"}
+            if not self._joint_plan.acquire("gesture"):
+                owner = self._joint_plan.owner()
+                return {"error": f"joint planner is busy{f' (owned by {owner})' if owner else ''}"}
             from uuid import uuid4
 
             action_id = f"t800_gesture_{uuid4().hex[:12]}"
@@ -3069,7 +3134,7 @@ class GesturePlugin:
                         self._status["step"] = index
                         self._status["step_name"] = step["name"]
                     action = "plan_named" if "joint_names" in step else "plan"
-                    result = self._joint_plan.dispatch(action, step)
+                    result = self._joint_plan.dispatch_owned("gesture", action, step)
                     if "error" in result:
                         raise ValueError(result["error"])
                     request_id = int(result["request_id"])
@@ -3084,7 +3149,7 @@ class GesturePlugin:
                     if hold_after > 0 and self._cancel.wait(hold_after):
                         raise RuntimeError("gesture cancelled")
                 if not self._cancel.is_set() and reset_after:
-                    result = self._joint_plan.dispatch("reset", {})
+                    result = self._joint_plan.dispatch_owned("gesture", "reset", {})
                     if "error" in result:
                         raise ValueError(result["error"])
                     request_id = int(result["request_id"])
@@ -3105,11 +3170,12 @@ class GesturePlugin:
             except Exception as exc:
                 cancelled = self._cancel.is_set()
                 if request_id is not None:
-                    self._joint_plan.dispatch("cancel", {"request_id": request_id})
+                    self._joint_plan.dispatch_owned("gesture", "cancel", {"request_id": request_id})
                 with self._lock:
                     self._status["state"] = "cancelled" if cancelled else "error"
                     self._status["error"] = "" if cancelled else str(exc)
             finally:
+                self._joint_plan.release("gesture")
                 with self._lock:
                     self._last_finished_at = time.monotonic()
                     final_status = str(self._status.get("state", "error"))
@@ -3151,9 +3217,9 @@ class GesturePlugin:
                 request_id = None
             result = dict(self._status)
         if request_id is not None:
-            self._joint_plan.dispatch("cancel", {"request_id": request_id})
+            self._joint_plan.dispatch_owned("gesture", "cancel", {"request_id": request_id})
         if reset_after:
-            self._joint_plan.dispatch("reset", {})
+            self._joint_plan.dispatch_owned("gesture", "reset", {})
         return result
 
     @staticmethod
