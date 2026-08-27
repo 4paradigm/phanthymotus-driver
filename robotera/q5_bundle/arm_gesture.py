@@ -59,16 +59,8 @@ _GESTURES_DEG = {
     "salute":          [10, 90, 60, -110, 50, 0, 0],
     "welcome":         [10, 65, 75, -100, 0, 0, 0],
     "raise":           [-10, 95, 0, -15, 0, 0, 0],
-    "shake_hands":     [-55, 15, 5, -35, 0, 0, 0],
+    "shake_hands":     [-55, 15, 5, -20, 0, 0, 0],
     "high_five":       [-40, 40, -20, -80, 0, 0, 50],
-}
-
-_PREPARE_DEG = {
-    "salute":          [10, 40, 35, -45, 25, 0, 0],
-    "welcome":         [10, 45, 45, -60, 0, 0, 0],
-    "raise":           [-10, 70, 0, -30, 0, 0, 0],
-    "shake_hands":     [-30, 10, 0, -20, 0, 0, 0],
-    "high_five":       [-25, 25, -10, -45, 0, 0, 10],
 }
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -161,16 +153,16 @@ def _build_frames(gesture: str, cycles: int) -> list:
     transition_ratio scales the interpolation time for each frame:
       < 1.0 → faster transition, creates natural blend with next frame
       == 1.0 → full-speed transition with explicit hold
-    This mirrors tianyi's _PREPARE_POSES + frame-blending approach.
+
+    No separate PREPARE frame — the gesture target is reached in a single
+    smooth interpolation from the current pose, eliminating the "two-step"
+    feel reported in review.
     """
     frames: list[tuple[list[float], float, float]] = []
 
-    prepare = _PREPARE_DEG.get(gesture, _GESTURES_DEG[gesture])
     target = _GESTURES_DEG[gesture]
 
-    # Prepare frame: move quickly through prepare pose (ratio < 1 blends into next)
-    frames.append((prepare, 0.0, 0.55))
-
+    # Single smooth transition to the gesture target
     if gesture == "salute":
         frames.append((target, 0.4, 0.85))
     else:
@@ -179,17 +171,12 @@ def _build_frames(gesture: str, cycles: int) -> list:
     if gesture == "shake_hands":
         for i in range(cycles * 2):
             pose = list(target)
-            pose[3] = -28 if i % 2 == 0 else -42
+            pose[3] = -13 if i % 2 == 0 else -27
             frames.append((pose, 0.0, 0.65))
     elif gesture == "welcome":
         for i in range(cycles * 2):
             pose = list(target)
             pose[3] = -110 if i % 2 == 0 else -90
-            frames.append((pose, 0.0, 0.65))
-    elif gesture == "wave":
-        for i in range(cycles * 2):
-            pose = list(target)
-            pose[5] = 35 if i % 2 == 0 else 5
             frames.append((pose, 0.0, 0.65))
 
     # Return to neutral: full-speed transition with hold
@@ -254,14 +241,13 @@ class Plugin:
 
     def get_tool(self) -> dict:
         actions = ["salute", "welcome", "raise", "shake_hands", "high_five", "reset",
-                   "cancel", "stop", "start", "prepare", "info"]
+                   "cancel", "stop", "start", "info"]
         one_of_actions = [
             {"const": "start", "title": "检查连接状态"},
             *[{"const": name, "title": label} for name, label in _GESTURE_LABELS.items()],
             {"const": "reset", "title": "归零"},
             {"const": "cancel", "title": "取消并保持"},
             {"const": "stop", "title": "停止并归零"},
-            {"const": "prepare", "title": "准备位置直控"},
             {"const": "info", "title": "查看状态"},
         ]
         return {
@@ -314,7 +300,6 @@ class Plugin:
                     "reset": {"params": ["speed"], "description": "取消序列并回到中性姿态"},
                     "cancel": {"params": [], "description": "取消尚未发送的后续动作帧，并保持当前位置"},
                     "stop": {"params": [], "description": "停止当前手势并回到中性姿态（归零）"},
-                    "prepare": {"params": [], "description": "执行位置直控准备：pos→READY→垂手→抬臂→ACTIVE，解锁 arm_control"},
                     "start": {"params": [], "description": "检查 ROS 连接和机器人状态"},
                     "info": {"params": [], "description": "查看当前运动和安全条件"},
                 },
@@ -337,16 +322,6 @@ class Plugin:
         if self._arm_control is not None:
             self._arm_control.stop()
         return {"state": "idle"}
-
-    def prepare(self) -> dict:
-        """Delegate to arm_control's position-control preparation."""
-        if self._arm_control is None:
-            return _failure("CONTROL_MODE_UNAVAILABLE",
-                            "arm_control helper is not initialized")
-        result = self._arm_control._ensure_prepared()
-        if result is None:
-            return {"ok": True, "state": "active", "position_control_prepared": True}
-        return result
 
     # ── Safety ────────────────────────────────────────────────────────────
 
@@ -574,9 +549,6 @@ class Plugin:
 
         if action == "stop":
             return self.stop()
-
-        if action == "prepare":
-            return self.prepare()
 
         if action == "reset":
             speed = _clamp(args.get("speed", 0.8), 0.2, 1.5)
