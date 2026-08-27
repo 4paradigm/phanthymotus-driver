@@ -60,13 +60,6 @@ class Plugin:
             except Exception:
                 self._preparer = None
 
-    def prepare(self):
-        """Delegate to embedded PositionControlPreparer for position-control preparation."""
-        if self._preparer is None:
-            return _failure("CONTROL_MODE_UNAVAILABLE",
-                            "Position-control preparer is not initialized")
-        return self._preparer._prepare()
-
     def _ensure_prepared(self) -> dict | None:
         """Auto-prepare position control if not already prepared.
 
@@ -173,11 +166,10 @@ class Plugin:
             }
         return {"name": CARD, "type": TYPE, "multiInstance": False, "description": DESC,
                 "inputSchema": {"type": "object", "properties": {
-                    "action": {"type": "string", "enum": ["start", *WAIST_ACTIONS, "prepare", "reset", "cancel", "stop", "info"], "oneOf": [
+                    "action": {"type": "string", "enum": ["start", *WAIST_ACTIONS, "reset", "cancel", "stop", "info"], "oneOf": [
                         {"const": "start", "title": "检查连接状态"},
                         *[{"const": action, "title": detail["title"], "description": detail["description"]}
                           for action, detail in WAIST_ACTIONS.items()],
-                        {"const": "prepare", "title": "准备位置直控"},
                         {"const": "reset", "title": "归零"},
                         {"const": "cancel", "title": "取消并保持"},
                         {"const": "stop", "title": "停止并保持当前位置"},
@@ -189,7 +181,6 @@ class Plugin:
                     "start": {"params": [], "description": "检查 ROS 连接和机器人状态。"},
                     **{action: {"params": [detail["field"]], "description": detail["description"]}
                        for action, detail in WAIST_ACTIONS.items()},
-                    "prepare": {"params": [], "description": "执行位置直控准备：pos→READY→垂手→抬臂→ACTIVE，解锁控制"},
                     "reset": {"params": [], "description": "归零：将腰部 yaw 关节插补回 0 rad。"},
                     "cancel": {"params": [], "description": "取消当前微调，并保持当前位置。"},
                     "stop": {"params": [], "description": "停止当前运动并保持当前位置。"},
@@ -290,8 +281,6 @@ class Plugin:
             return {"ok": True, "state": "moving" if active else "idle", "active_command": active, "safety": self._safety()}
         if action in ("cancel", "stop"):
             return self._stop("command")
-        if action == "prepare":
-            return self.prepare()
         if action == "reset":
             return self._reset(args)
         detail = WAIST_ACTIONS.get(action)
