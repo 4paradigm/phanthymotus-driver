@@ -175,6 +175,8 @@ def validate_locomotion_request(
     values = {}
     for name, default in defaults[action].items():
         raw_value = arguments.get(name, default)
+        if raw_value is None and action == "move":
+            raw_value = default
         if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
             raise ControlValidationError(
                 "INVALID_ARGUMENT", f"{name} must be a JSON number"

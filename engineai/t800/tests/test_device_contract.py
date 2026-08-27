@@ -689,6 +689,32 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual([0.0, 0.0], plugin._publisher.messages[-1].linear_velocity)
         self.assertEqual(0.0, plugin._publisher.messages[-1].yaw_velocity)
 
+    def test_locomotion_treats_optional_nulls_as_omitted_defaults(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
+
+        result = plugin.dispatch("move", {
+            "vx": 0.1,
+            "vy": None,
+            "vyaw": None,
+            "duration": None,
+        })
+
+        self.assertEqual("running", result["state"])
+        self.assertEqual(0.1, result["vx"])
+        self.assertEqual(0.0, result["vy"])
+        self.assertEqual(0.0, result["vyaw"])
+        self.assertEqual(1.0, result["duration"])
+        plugin.dispatch("stop_move", {})
+        properties = plugin.get_tool()["inputSchema"]["properties"]
+        self.assertEqual(0.0, properties["vy"]["default"])
+        self.assertEqual(0.0, properties["vyaw"]["default"])
+        self.assertEqual(1.0, properties["duration"]["default"])
+
     def test_locomotion_rejects_invalid_and_composite_safety_limits(self):
         plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
         plugin.start()
@@ -704,6 +730,7 @@ class DevicePluginContractTests(unittest.TestCase):
             ("move", {"vx": 0.1, "duration": -0.5}, "INVALID_ARGUMENT"),
             ("move", {"vx": 0.1, "duration": 3.1}, "SAFETY_LIMIT"),
             ("move_displacement", {"x_m": 0.1, "y_m": 0, "speed_m_s": 10}, "SAFETY_LIMIT"),
+            ("move_displacement", {"x_m": 0.1, "y_m": 0, "speed_m_s": None}, "INVALID_ARGUMENT"),
             ("move_displacement", {"x_m": 0.1, "y_m": 0, "speed_m_s": 0}, "INVALID_ARGUMENT"),
             ("turn_angle", {"angle_rad": 0.1, "angular_speed_rad_s": 10}, "SAFETY_LIMIT"),
             ("turn_angle", {"angle_rad": 0.1, "angular_speed_rad_s": 0}, "INVALID_ARGUMENT"),

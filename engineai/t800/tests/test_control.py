@@ -128,6 +128,16 @@ class ValidationTests(unittest.TestCase):
                 max_timed_duration_sec=3,
             )
         self.assertEqual("SAFETY_LIMIT", limit_error.exception.code)
+        defaults = validate_locomotion_request(
+            "move",
+            {"vx": 0.1, "vy": None, "vyaw": None, "duration": None},
+            limits=(1, 1, 1),
+            max_timed_duration_sec=3,
+        )
+        self.assertEqual(
+            {"vx": 0.1, "vy": 0.0, "vyaw": 0.0, "duration": 1.0},
+            {key: defaults[key] for key in ("vx", "vy", "vyaw", "duration")},
+        )
         command = validate_locomotion_request(
             "arc",
             {"radius_m": 1, "angle_rad": -0.5, "linear_speed_m_s": -0.2},
