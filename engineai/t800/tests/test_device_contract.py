@@ -675,6 +675,9 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual([23, 24], plugin._publisher.messages[-1].joint_indices)
         plugin.dispatch("arm_pose", {"side": "left", "target_positions": [0.0] * 5})
         self.assertEqual([13, 14, 15, 16, 17], plugin._publisher.messages[-1].joint_indices)
+        # Simulate arm_pose completing so the arm lock is released before hold_current.
+        plugin._on_state(JointMotionPlanState(
+            plugin._publisher.messages[-1].request_id, JointMotionPlanState.IDLE, 1.0))
         plugin.dispatch("hold_current", {})
         self.assertEqual(list(range(25)), plugin._publisher.messages[-1].joint_indices)
 
@@ -691,12 +694,16 @@ class DevicePluginContractTests(unittest.TestCase):
         )
         self.assertGreaterEqual(schema["x-completion"]["timeout"], arm._ACP_TIMEOUT_SEC)
         self.assertEqual(
-            ["side", "duration", "force"],
+            ["side", "duration", "force", "confirm"],
             schema["x-action-params"]["raise"]["params"],
         )
-        self.assertEqual(
-            "忽略 lower_body_balance 状态门禁",
+        self.assertIn(
+            "危险",
             schema["properties"]["force"]["description"],
+        )
+        self.assertIn(
+            "确认",
+            schema["properties"]["confirm"]["description"],
         )
         self.assertEqual(
             "lower_body_balance",
@@ -717,9 +724,21 @@ class DevicePluginContractTests(unittest.TestCase):
         plan.wait_until_idle = lambda *_args, **_kwargs: {}
         plan.wait_for_request = lambda *_args, **_kwargs: {}
         arm._acp_notify = lambda *_args: None
-        forced = arm.dispatch("raise", {"side": "right", "duration": 0.05, "force": True})
+        forced = arm.dispatch("raise", {"side": "right", "duration": 0.05, "force": True, "confirm": True})
         self.assertEqual("running", forced["state"])
         arm._thread.join(timeout=1.0)
+
+    def test_arm_force_without_confirm_is_rejected(self):
+        """force=true bypassing the safety gate must also require confirm=true."""
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros)
+        plan.start()
+        arm = self.device.ArmActuatorPlugin(CONFIG, plan, self.state)
+        plan.current_motion = lambda: ("walking", [])
+
+        result = arm.dispatch("raise", {"side": "right", "duration": 0.05, "force": True})
+        self.assertIn("error", result)
+        self.assertIn("confirm", result["error"])
+        self.assertEqual([], plan._publisher.messages)
 
     def test_arm_move_pos_and_status_use_planner_and_state(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
@@ -734,6 +753,7 @@ class DevicePluginContractTests(unittest.TestCase):
             "target_positions": [0.02, 0.08, 0.0, -0.07, 0.0],
             "duration": 0.05,
             "force": True,
+            "confirm": True,
         })
         self.assertEqual("running", result["state"])
         self.assertTrue(result["action_id"].startswith("t800_arm_"))
@@ -759,6 +779,30 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertIsNone(plan.acquire_arm("probe"))
         plan.release_arm("probe")
 
+    def test_concurrent_direct_joint_plan_arm_requests_are_mutex(self):
+        """Two independent direct joint_plan arm requests must not both acquire the lock."""
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+
+        # First direct arm plan acquires the lock as joint_plan.
+        first = plan.dispatch("plan", {"joint_indices": [16], "target_positions": [0.1], "duration": 1.0})
+        self.assertEqual("requested", first["state"])
+        self.assertEqual("joint_plan", plan.arm_status()["owner"])
+        self.assertEqual(first["request_id"], plan.arm_status()["request_id"])
+
+        # Second independent direct arm plan must be rejected, not reenter.
+        second = plan.dispatch("plan", {"joint_indices": [17], "target_positions": [-0.1], "duration": 1.0})
+        self.assertIn("error", second)
+        self.assertEqual("arm is busy", second["error"])
+        self.assertEqual("joint_plan", second["owner"])
+
+        # The first request's tracking must not have been overwritten.
+        self.assertEqual(first["request_id"], plan.arm_status()["request_id"])
+
+        # Simulate first request completing IDLE — lock should auto-release.
+        plan._on_state(JointMotionPlanState(first["request_id"], JointMotionPlanState.IDLE, 1.0))
+        self.assertIsNone(plan.arm_status()["owner"])
+
     def test_concurrent_arm_request_does_not_release_active_lock(self):
         """A second arm request while one is running must be rejected without releasing the first lock."""
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
@@ -776,13 +820,13 @@ class DevicePluginContractTests(unittest.TestCase):
         plan.wait_for_request = blocking_wait
 
         self.state._last_joint_positions = [0.0] * 25
-        first = arm.dispatch("raise", {"side": "right", "duration": 0.05, "force": True})
+        first = arm.dispatch("raise", {"side": "right", "duration": 0.05, "force": True, "confirm": True})
         self.assertEqual("running", first["state"])
         time.sleep(0.05)
         self.assertEqual("arm", plan.arm_status()["owner"])
 
         # Second arm request arrives while the first is still running.
-        second = arm.dispatch("raise", {"side": "left", "duration": 0.05, "force": True})
+        second = arm.dispatch("raise", {"side": "left", "duration": 0.05, "force": True, "confirm": True})
         self.assertIn("error", second)
         self.assertIn("already running", second["error"])
 
@@ -801,7 +845,7 @@ class DevicePluginContractTests(unittest.TestCase):
         plan.wait_for_request = lambda *_args, **_kwargs: {}
         arm = self.device.ArmActuatorPlugin({**CONFIG, "arm": {"shrug_amplitude_rad": 0.4}}, plan, self.state)
         arm._acp_notify = lambda *_args: None
-        result = arm.dispatch("shrug", {"duration": 0.05, "force": True})
+        result = arm.dispatch("shrug", {"duration": 0.05, "force": True, "confirm": True})
         self.assertEqual("running", result["state"])
         arm._thread.join(timeout=1.0)
         self.assertFalse(arm._thread.is_alive())
@@ -815,7 +859,7 @@ class DevicePluginContractTests(unittest.TestCase):
         plan.start()
         arm = self.device.ArmActuatorPlugin(CONFIG, plan, self.state)
         arm._acp_notify = lambda *_args: None
-        result = arm.dispatch("wave", {"side": "right", "times": 2, "speed": 1.0, "force": True})
+        result = arm.dispatch("wave", {"side": "right", "times": 2, "speed": 1.0, "force": True, "confirm": True})
         self.assertEqual("running", result["state"])
         expected_names = [
             "wave_start_right", "wave_out_1_right", "wave_in_1_right",
@@ -890,6 +934,7 @@ class DevicePluginContractTests(unittest.TestCase):
             "target_positions": [0.02, 0.08, 0.0, -0.07, 0.0],
             "duration": 10.0,
             "force": True,
+            "confirm": True,
         })
         self.assertEqual("running", result["state"])
         deadline = time.monotonic() + 1.0
@@ -931,6 +976,7 @@ class DevicePluginContractTests(unittest.TestCase):
             "target_positions": [0.02, 0.08, 0.0, -0.07, 0.0],
             "duration": 0.05,
             "force": True,
+            "confirm": True,
         })
         self.assertEqual("running", first["state"])
         deadline = time.monotonic() + 1.0
@@ -963,7 +1009,7 @@ class DevicePluginContractTests(unittest.TestCase):
         plan.start()
         arm = self.device.ArmActuatorPlugin(CONFIG, plan, self.state)
         self.assertIsNone(plan.acquire_arm("gesture"))
-        busy = arm.dispatch("raise", {"side": "right", "duration": 0.05, "force": True})
+        busy = arm.dispatch("raise", {"side": "right", "duration": 0.05, "force": True, "confirm": True})
         self.assertEqual("arm is busy", busy["error"])
         self.assertEqual("gesture", busy["owner"])
         plan.release_arm("gesture")
