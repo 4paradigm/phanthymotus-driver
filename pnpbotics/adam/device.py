@@ -177,6 +177,14 @@ def _hand_state_payload(position, received_at_ms: int, *, fresh: bool) -> dict:
         positions.extend([0] * (HAND_POSITION_COUNT - len(positions)))
     positions = positions[:HAND_POSITION_COUNT]
 
+    def side(values):
+        return {
+            "position": values,
+            "channels": dict(zip(HAND_CHANNEL_NAMES, values)),
+            "finger_count": 5,
+            "motor_channel_count": 6,
+        }
+
     now_ms = int(time.time() * 1000)
     age_ms = max(0, now_ms - int(received_at_ms))
     return {
@@ -185,8 +193,8 @@ def _hand_state_payload(position, received_at_ms: int, *, fresh: bool) -> dict:
         "age_ms": age_ms,
         "fresh": bool(fresh),
         "position": positions,
-        "left": positions[:6],
-        "right": positions[6:12],
+        "left": side(positions[:6]),
+        "right": side(positions[6:12]),
     }
 
 
@@ -688,12 +696,7 @@ class HandStatePlugin:
             ),
             "inputSchema": {
                 "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["info", "read", "get_state", "start", "stop"],
-                    },
-                },
+                "properties": {},
             },
             "topic_out": [{"topic": self._topic, "format": "data/json"}],
         }
@@ -745,7 +748,7 @@ class HandStatePlugin:
             self._state_cache.close()
 
     def dispatch(self, action: str, args: dict) -> dict:
-        if action in ("read", "get_state", "hand_state"):
+        if action in ("read", "get", "get_state", "hand_state"):
             payload = self._state_cache.snapshot(self._stale_timeout_sec)
             if payload is not None:
                 return payload
@@ -1148,6 +1151,15 @@ class HandPlugin:
             return _coerce_hand_positions(fallback, limit=self._max_val, expected=expected)
 
     def _base_positions(self):
+        # Preserve the last commanded full target when applying a partial
+        # update. Feedback may lag the command stream or be temporarily
+        # unavailable; using it unconditionally would restore the other 11
+        # channels from an old sample/open fallback on every set_fingers call.
+        with self._lock:
+            target = list(self._target_positions) if self._target_positions is not None else None
+        if target is not None:
+            return target
+
         positions = self._state_cache.fresh_positions(self._state_timeout_sec)
         if positions is None:
             return list(self._open_positions)
@@ -1282,7 +1294,6 @@ class HandPlugin:
     def stop(self):
         with self._lock:
             self._active = False
-            self._target_positions = None
         with self._lifecycle_lock:
             thread = self._control_thread
             stop_event = self._control_stop_event
@@ -1312,6 +1323,7 @@ class HandPlugin:
     def _status(self, state: str | None = None) -> dict:
         with self._lock:
             active = self._active
+            target = list(self._target_positions) if self._target_positions is not None else None
             last_write_ok = self._last_write_ok
             last_write_at_ms = self._last_write_at_ms
             last_write_error = self._last_write_error
@@ -1325,8 +1337,15 @@ class HandPlugin:
             ),
             "closed": self._closed,
             "publisher_available": self._publisher_available(),
+            "control_rate_hz": self._control_rate_hz,
+            "position_max": self._max_val,
+            "open_positions": list(self._open_positions),
+            "close_positions": list(self._close_positions),
+            "thumb_close_positions": list(self._thumb_close_positions),
+            "thumb_close_min_flex_position": self._thumb_close_min_flex_position,
             "state_reader_available": cache_status["reader_available"],
             "state_fresh": cache_status["fresh"],
+            "target": target,
             "last_write_ok": last_write_ok,
             "last_write_at_ms": last_write_at_ms,
         }
@@ -1426,6 +1445,8 @@ class HandPlugin:
         return {
             "state": "active",
             "action": action,
+            "target": list(positions),
+            "control_rate_hz": self._control_rate_hz,
         }
 
     def dispatch(self, action: str, args: dict) -> dict:
