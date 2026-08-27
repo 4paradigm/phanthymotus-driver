@@ -1507,7 +1507,7 @@ class LocoPlugin:
 
             elif mode == "get_current_mode":
                 FSM_DESCRIPTIONS = {
-                    0: "lying down, zero torque (零力矩, no resistance)",
+                    0: "squatting, zero torque (下蹲零力矩, no resistance)",
                     1: "squatting, damping (下蹲阻尼, resists movement)",
                     2: "squatting (下蹲, position hold, stable)",
                     3: "sitting (落座, needs external support, unstable)",
