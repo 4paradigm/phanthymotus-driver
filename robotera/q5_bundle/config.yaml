@@ -124,21 +124,9 @@ plugins:
     max_step_rad: 0.025
     publish_rate_hz: 20.0
     hold_repetitions: 3
-  hip_control:
+  leg_control:
     enabled: true
-    # 髋关节控制：set 角度(°) + zero 归零。限位从 URDF 读取，超限直接报错。
-    max_step_rad: 0.02
-    publish_rate_hz: 20.0
-    hold_repetitions: 3
-  knee_control:
-    enabled: true
-    # 膝关节控制：set 角度(°) + zero 归零。限位从 URDF 读取，超限直接报错。
-    max_step_rad: 0.02
-    publish_rate_hz: 20.0
-    hold_repetitions: 3
-  ankle_control:
-    enabled: true
-    # 踝关节控制：set 角度(°) + zero 归零。限位从 URDF 读取，超限直接报错。
+    # 腿部控制：set 同时设置髋/膝/踝三关节角度(°) + zero 三关节归零。限位从 URDF 读取，超限直接报错。
     max_step_rad: 0.02
     publish_rate_hz: 20.0
     hold_repetitions: 3
