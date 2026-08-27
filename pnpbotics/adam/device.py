@@ -129,9 +129,13 @@ HAND_CHANNEL_LABELS = {
     "thumb_rotate": "拇指旋转",
 }
 HAND_POSITION_COUNT = 12
+HAND_POSITION_MIN = 0
+HAND_POSITION_MAX = 1000
 HAND_DEFAULT_OPEN = [
-    1800, 1800, 1800, 1800, 1600, 0,
-    1800, 1800, 1800, 1800, 1600, 0,
+    HAND_POSITION_MAX, HAND_POSITION_MAX, HAND_POSITION_MAX, HAND_POSITION_MAX,
+    HAND_POSITION_MAX, HAND_POSITION_MIN,
+    HAND_POSITION_MAX, HAND_POSITION_MAX, HAND_POSITION_MAX, HAND_POSITION_MAX,
+    HAND_POSITION_MAX, HAND_POSITION_MIN,
 ]
 HAND_DEFAULT_CLOSED = [0] * HAND_POSITION_COUNT
 HAND_DEFAULT_THUMB_CLOSE = [100, 1000, 100, 1000]
@@ -163,19 +167,33 @@ def _coerce_hand_positions(values, *, limit: int, expected: int = HAND_POSITION_
             raise ValueError("hand positions must be numbers") from exc
         if not math.isfinite(value):
             raise ValueError("hand positions must be finite numbers")
-        result.append(int(max(0, min(limit, round(value)))))
+        result.append(int(max(HAND_POSITION_MIN, min(limit, round(value)))))
     return result
+
+
+def _normalize_hand_state_positions(position) -> list[int]:
+    """Return HandState_ positions in Adam's effective 0..1000 range."""
+    try:
+        raw_positions = list(position)[:HAND_POSITION_COUNT]
+    except (TypeError, ValueError):
+        raw_positions = []
+
+    try:
+        positions = _coerce_hand_positions(
+            raw_positions,
+            limit=HAND_POSITION_MAX,
+            expected=len(raw_positions),
+        )
+    except ValueError:
+        positions = []
+    if len(positions) < HAND_POSITION_COUNT:
+        positions.extend([HAND_POSITION_MIN] * (HAND_POSITION_COUNT - len(positions)))
+    return positions[:HAND_POSITION_COUNT]
 
 
 def _hand_state_payload(position, received_at_ms: int, *, fresh: bool) -> dict:
     """Convert HandState_ into the JSON payload published by hand_state."""
-    try:
-        positions = [int(value) for value in list(position)[:HAND_POSITION_COUNT]]
-    except (TypeError, ValueError):
-        positions = []
-    if len(positions) < HAND_POSITION_COUNT:
-        positions.extend([0] * (HAND_POSITION_COUNT - len(positions)))
-    positions = positions[:HAND_POSITION_COUNT]
+    positions = _normalize_hand_state_positions(position)
 
     def side(values):
         return {
@@ -192,6 +210,7 @@ def _hand_state_payload(position, received_at_ms: int, *, fresh: bool) -> dict:
         "received_at_ms": int(received_at_ms),
         "age_ms": age_ms,
         "fresh": bool(fresh),
+        "position_max": HAND_POSITION_MAX,
         "position": positions,
         "left": side(positions[:6]),
         "right": side(positions[6:12]),
@@ -690,9 +709,11 @@ class HandStatePlugin:
             "description": (
                 "Adam dexterous hand feedback from DDS rt/handstate. "
                 "Each hand has 5 fingers and 6 motor channels (the thumb has "
-                "flexion and rotation). Returns 12 raw positions: left[0:6] "
-                "and right[0:6], in the order pinky, ring, middle, index, "
-                "thumb_flex, thumb_rotate."
+                "flexion and rotation). Returns 12 normalized positions in "
+                "the effective hardware range 0-1000: left[0:6] and "
+                "right[0:6], in the order pinky, ring, middle, index, "
+                "thumb_flex, thumb_rotate. Values above 1000 are reported "
+                "as 1000 because the 1000-1800 interval is a dead band."
             ),
             "inputSchema": {
                 "type": "object",
@@ -714,6 +735,7 @@ class HandStatePlugin:
             "reader_available": cache_status["reader_available"],
             "fresh": cache_status["fresh"],
             "last_sample_age_ms": cache_status["last_sample_age_ms"],
+            "position_max": HAND_POSITION_MAX,
             "topic_out": [{"topic": self._topic, "format": "data/json"}],
         }
         if cache_status.get("last_read_error"):
@@ -1086,11 +1108,11 @@ class HandPlugin:
         except (TypeError, ValueError):
             configured_max = 0
         if configured_max <= 0:
-            configured_max = (
-                1800 if self._hand_type in {"adam", "adam_client", "inspire"}
-                else 1000
-            )
-        self._max_val = configured_max
+            configured_max = HAND_POSITION_MAX
+        # Adam's firmware only moves through 0..1000. Values above 1000 are
+        # accepted by the uint32 DDS field but map to the same endpoint and
+        # do not produce any additional motion.
+        self._max_val = min(configured_max, HAND_POSITION_MAX)
 
         default_open = (
             HAND_DEFAULT_OPEN
@@ -1176,7 +1198,9 @@ class HandPlugin:
                 f"Adam hand control via DDS rt/handcmd — continuous 12-motor-channel "
                 f"position stream, range 0-{self._max_val}. "
                 "Each hand has 5 fingers; the thumb uses flexion and rotation "
-                "channels. The default Adam open pose is configurable per robot."
+                "channels. Adam moves only in the 0-1000 range; values above "
+                "1000 are saturated. The default open pose is configurable "
+                "per robot."
             ),
             "inputSchema": {
                 "type": "object",
