@@ -15,7 +15,9 @@ from control import (  # noqa: E402
     MOTION_STATES,
     WALK_MOTION_STATES,
     T800_JOINT_POSITION_LIMITS,
+    T800_JOINT_VELOCITY_LIMITS,
     T800_JOINT_NAMES,
+    ControlValidationError,
     RepeatingCommand,
     action_schema,
     clamp,
@@ -25,8 +27,16 @@ from control import (  # noqa: E402
     sensor_tool,
     validate_joint_indices,
     validate_joint_positions,
+    validate_locomotion_request,
+    validate_recording_document,
+    validate_recording_frames,
 )
 from native_sdk import NativeSdkManager  # noqa: E402
+
+SAFE_T800_POSITIONS = [
+    (lower + upper) / 2.0
+    for lower, upper in T800_JOINT_POSITION_LIMITS
+]
 
 
 class ValidationTests(unittest.TestCase):
@@ -83,6 +93,127 @@ class ValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "J16_ELBOW_PITCH_L"):
             validate_joint_positions([16], [-2.28], limit_margin_rad=0.02)
 
+    def test_recording_frames_are_normalized_and_bounded(self):
+        frames = validate_recording_frames(
+            [
+                {"timestamp": 0, "positions": SAFE_T800_POSITIONS},
+                {"timestamp": 50, "positions": SAFE_T800_POSITIONS},
+            ],
+            max_frames=2,
+            minimum_frames=2,
+        )
+        self.assertEqual(0.0, frames[0]["timestamp"])
+        self.assertEqual(SAFE_T800_POSITIONS, frames[0]["positions"])
+        with self.assertRaisesRegex(ValueError, "maximum frame count"):
+            validate_recording_frames(frames * 2, max_frames=2)
+        with self.assertRaisesRegex(ValueError, "strictly increasing"):
+            validate_recording_frames(
+                [
+                    {"timestamp": 0, "positions": SAFE_T800_POSITIONS},
+                    {"timestamp": 0, "positions": SAFE_T800_POSITIONS},
+                ],
+                max_frames=2,
+            )
+
+    def test_locomotion_validation_rejects_schema_bypass_types(self):
+        with self.assertRaises(ControlValidationError) as boolean_error:
+            validate_locomotion_request(
+                "move", {"vx": True}, limits=(1, 1, 1),
+                max_timed_duration_sec=3,
+            )
+        self.assertEqual("INVALID_ARGUMENT", boolean_error.exception.code)
+        with self.assertRaises(ControlValidationError) as limit_error:
+            validate_locomotion_request(
+                "move", {"vx": 2}, limits=(1, 1, 1),
+                max_timed_duration_sec=3,
+            )
+        self.assertEqual("SAFETY_LIMIT", limit_error.exception.code)
+        command = validate_locomotion_request(
+            "arc",
+            {"radius_m": 1, "angle_rad": -0.5, "linear_speed_m_s": -0.2},
+            limits=(1, 1, 1),
+            max_timed_duration_sec=3,
+        )
+        self.assertEqual(-0.2, command["vx"])
+        self.assertEqual(-0.2, command["vyaw"])
+
+    def test_recording_document_drops_unknown_payload_and_caps_duration(self):
+        frames, metadata = validate_recording_document(
+            {
+                "metadata": {"label": "legacy"},
+                "frames": [
+                    {"timestamp": 0, "positions": SAFE_T800_POSITIONS, "unknown": {"large": "ignored"}},
+                    {"timestamp": 50, "positions": SAFE_T800_POSITIONS},
+                ],
+            },
+            max_frames=2,
+            minimum_frames=2,
+            max_duration_ms=100,
+        )
+        self.assertEqual({"timestamp", "positions"}, set(frames[0]))
+        self.assertEqual("legacy", metadata["label"])
+        with self.assertRaisesRegex(ValueError, "duration"):
+            validate_recording_document(
+                {"frames": [
+                    {"timestamp": 0, "positions": SAFE_T800_POSITIONS},
+                    {"timestamp": 101, "positions": SAFE_T800_POSITIONS},
+                ]},
+                max_frames=2,
+                minimum_frames=2,
+                max_duration_ms=100,
+            )
+
+    def test_resampler_rejects_excessive_sample_allocation(self):
+        with self.assertRaisesRegex(ValueError, "sample count"):
+            resample_joint_trajectory(
+                [
+                    {"timestamp": 0, "positions": [0.0] * 25},
+                    {"timestamp": 10_000, "positions": [0.1] * 25},
+                ],
+                joint_indices=list(range(12, 25)),
+                current_positions=[0.0] * 25,
+                playback_rate_hz=100,
+                speed_scale=1.0,
+                entry_blend_sec=0.5,
+                max_samples=100,
+            )
+
+    def test_resampler_rejects_derived_velocity_over_urdf_limit(self):
+        start = list(SAFE_T800_POSITIONS)
+        finish = list(SAFE_T800_POSITIONS)
+        start[12] = -1.0
+        finish[12] = 1.0
+        with self.assertRaisesRegex(ValueError, "derived joint velocity"):
+            resample_joint_trajectory(
+                [
+                    {"timestamp": 0, "positions": start},
+                    {"timestamp": 10, "positions": finish},
+                ],
+                joint_indices=list(range(12, 25)),
+                current_positions=start,
+                playback_rate_hz=100,
+                speed_scale=1.0,
+                entry_blend_sec=0.5,
+                max_samples=1000,
+            )
+
+    def test_resampler_rejects_single_sample_position_spike(self):
+        frames = []
+        for index, torso_yaw in enumerate((0.0, 0.0, 0.4, 0.0, 0.0)):
+            positions = list(SAFE_T800_POSITIONS)
+            positions[12] = torso_yaw
+            frames.append({"timestamp": index * 10, "positions": positions})
+        with self.assertRaisesRegex(ValueError, "target-step velocity"):
+            resample_joint_trajectory(
+                frames,
+                joint_indices=list(range(12, 25)),
+                current_positions=frames[0]["positions"],
+                playback_rate_hz=100,
+                speed_scale=1.0,
+                entry_blend_sec=0.5,
+                max_samples=1000,
+            )
+
     def test_joint_position_limits_match_vendored_urdf(self):
         root = ET.parse(ROOT / "resource" / "serial_t800.urdf").getroot()
         urdf_limits = {
@@ -95,6 +226,16 @@ class ValidationTests(unittest.TestCase):
         }
         for index, name in enumerate(T800_JOINT_NAMES):
             self.assertEqual(urdf_limits[name], T800_JOINT_POSITION_LIMITS[index])
+        urdf_velocity_limits = {
+            joint.attrib["name"]: float(joint.find("limit").attrib["velocity"])
+            for joint in root.findall("joint")
+            if joint.find("limit") is not None
+        }
+        for index, name in enumerate(T800_JOINT_NAMES):
+            self.assertEqual(
+                urdf_velocity_limits[name],
+                T800_JOINT_VELOCITY_LIMITS[index],
+            )
 
     def test_action_schema_splits_action_parameters(self):
         schema = action_schema(

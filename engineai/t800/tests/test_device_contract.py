@@ -659,12 +659,75 @@ class DevicePluginContractTests(unittest.TestCase):
             current_motion_task="rl_basic",
             available_transition_motions=["passive"],
         ))
-        result = plugin.dispatch("move", {"vx": 9, "vy": -9, "vyaw": 9, "duration": 0.03})
-        self.assertEqual(1.0, result["vx"])
-        self.assertEqual(-1.0, result["vy"])
+        result = plugin.dispatch("move", {"vx": 0.9, "vy": -0.9, "vyaw": 0.9, "duration": 0.03})
+        self.assertEqual(0.9, result["vx"])
+        self.assertEqual(-0.9, result["vy"])
         time.sleep(0.08)
         self.assertGreaterEqual(len(plugin._publisher.messages), 2)
         self.assertEqual(0.0, plugin._publisher.messages[-1].yaw_velocity)
+
+    def test_locomotion_rejects_direct_velocity_outside_safety_limits(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
+        plugin.dispatch("move", {"vx": 0.1, "duration": -1})
+
+        rejected = plugin.dispatch("move", {
+            "vx": 100.0,
+            "vy": 0.0,
+            "vyaw": 100.0,
+            "duration": 0.1,
+        })
+
+        self.assertEqual("SAFETY_LIMIT", rejected["code"])
+        self.assertIn("vx", rejected["error"])
+        self.assertIn("vyaw", rejected["error"])
+        self.assertFalse(plugin._stream.snapshot().active)
+        self.assertEqual([0.0, 0.0], plugin._publisher.messages[-1].linear_velocity)
+        self.assertEqual(0.0, plugin._publisher.messages[-1].yaw_velocity)
+
+    def test_locomotion_rejects_invalid_and_composite_safety_limits(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
+        cases = [
+            ("move", {"vx": True, "duration": 0.1}, "INVALID_ARGUMENT"),
+            ("move", {"vx": "0.1", "duration": 0.1}, "INVALID_ARGUMENT"),
+            ("move", {"vx": 10**400, "duration": 0.1}, "INVALID_ARGUMENT"),
+            ("move", {"vx": float("nan"), "duration": 0.1}, "INVALID_ARGUMENT"),
+            ("move", {"vx": 0.1, "duration": -0.5}, "INVALID_ARGUMENT"),
+            ("move", {"vx": 0.1, "duration": 3.1}, "SAFETY_LIMIT"),
+            ("move_displacement", {"x_m": 0.1, "y_m": 0, "speed_m_s": 10}, "SAFETY_LIMIT"),
+            ("move_displacement", {"x_m": 0.1, "y_m": 0, "speed_m_s": 0}, "INVALID_ARGUMENT"),
+            ("turn_angle", {"angle_rad": 0.1, "angular_speed_rad_s": 10}, "SAFETY_LIMIT"),
+            ("turn_angle", {"angle_rad": 0.1, "angular_speed_rad_s": 0}, "INVALID_ARGUMENT"),
+            ("arc", {"radius_m": 1, "angle_rad": 0.1, "linear_speed_m_s": 10}, "SAFETY_LIMIT"),
+            ("arc", {"radius_m": 0.1, "angle_rad": 0.1, "linear_speed_m_s": 0.2}, "SAFETY_LIMIT"),
+        ]
+        for action, arguments, expected_code in cases:
+            with self.subTest(action=action, arguments=arguments):
+                plugin.dispatch("move", {"vx": 0.1, "duration": -1})
+                rejected = plugin.dispatch(action, arguments)
+                self.assertEqual(expected_code, rejected["code"])
+                self.assertIn("error", rejected)
+                self.assertFalse(plugin._stream.snapshot().active)
+                self.assertEqual([0.0, 0.0], plugin._publisher.messages[-1].linear_velocity)
+                self.assertEqual(0.0, plugin._publisher.messages[-1].yaw_velocity)
+
+        duration_schema = plugin.get_tool()["inputSchema"]["properties"]["duration"]
+        self.assertEqual(
+            [
+                {"type": "number", "const": -1},
+                {"type": "number", "minimum": 0, "maximum": 3.0},
+            ],
+            duration_schema["anyOf"],
+        )
 
     def test_locomotion_accepts_official_walk_states_without_force(self):
         plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
@@ -679,11 +742,11 @@ class DevicePluginContractTests(unittest.TestCase):
                     available_transition_motions=["passive"],
                 ))
                 result = plugin.dispatch("move", {
-                    "vx": 2.0,
+                    "vx": 0.2,
                     "duration": 0.01,
                 })
                 self.assertEqual("running", result["state"])
-                self.assertEqual(1.0, result["vx"])
+                self.assertEqual(0.2, result["vx"])
                 plugin.dispatch("stop_move", {})
 
         self.state._on_motion(types.SimpleNamespace(
@@ -830,11 +893,12 @@ class DevicePluginContractTests(unittest.TestCase):
             current_motion_task="rl_basic",
             available_transition_motions=["passive"],
         ))
-        with self.assertRaisesRegex(ValueError, "3s safety limit"):
-            plugin.dispatch("move", {
-                "vx": 0.1,
-                "duration": plugin._MAX_TIMED_DURATION_SEC + 0.1,
-            })
+        rejected = plugin.dispatch("move", {
+            "vx": 0.1,
+            "duration": plugin._MAX_TIMED_DURATION_SEC + 0.1,
+        })
+        self.assertEqual("SAFETY_LIMIT", rejected["code"])
+        self.assertIn("3s safety limit", rejected["error"])
 
     def test_locomotion_open_loop_composites(self):
         plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
