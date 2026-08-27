@@ -205,13 +205,21 @@ class Q5BasicSensorTests(unittest.TestCase):
     def test_base_drive_requires_a_live_ros_publisher_not_confirmation(self):
         plugin = base_drive.Plugin({}, "test", None, _Client())
         start = plugin.dispatch("start", {})
-        move = plugin.dispatch("move", {"linear_x": 0.1, "angular_z": 0.0, "duration_s": 1.0})
-        self.assertEqual(start["state"], "ready")
+        move = plugin.dispatch("move", {"linear_x": 0.1, "angular_z_degps": 0.0, "duration_s": 1.0})
+        self.assertFalse(start["ok"])
         self.assertEqual(move["code"], "ROS_UNAVAILABLE")
 
     def test_base_drive_declares_reliable_qos_for_the_verified_q5_controller(self):
         with open(base_drive.__file__, encoding="utf-8") as source:
             self.assertIn("reliability=ReliabilityPolicy.RELIABLE", source.read())
+
+    def test_base_drive_uses_the_verified_vendor_sdk_transport_contract(self):
+        with open(base_drive.__file__, encoding="utf-8") as source:
+            text = source.read()
+        self.assertIn('os.environ["RMW_IMPLEMENTATION"] = "rmw_cyclonedds_cpp"', text)
+        self.assertIn('plugin_config.get("publish_rate_hz", 10.0)', text)
+        self.assertIn('plugin_config.get("frame_id", "")', text)
+        self.assertNotIn("msg.header.stamp =", text)
 
     def test_hand_control_does_not_expose_raw_multi_joint_set_action(self):
         plugin = hand_control.Plugin.__new__(hand_control.Plugin)
@@ -261,9 +269,50 @@ class Q5BasicSensorTests(unittest.TestCase):
     def test_base_drive_direction_actions_normalize_to_guarded_velocity(self):
         plugin = base_drive.Plugin({}, "test", None, _Client())
         forward = plugin._directional_args("forward", {"speed_mps": 0.1, "duration_s": 0.5})
-        right = plugin._directional_args("turn_right", {"turn_speed_radps": 0.2, "duration_s": 0.5})
-        self.assertEqual((forward["linear_x"], forward["angular_z"]), (0.1, 0.0))
-        self.assertEqual((right["linear_x"], right["angular_z"]), (0.0, -0.2))
+        right = plugin._directional_args("turn_right", {"turn_speed_degps": 10.0, "duration_s": 0.5})
+        self.assertEqual((forward["linear_x"], forward["angular_z_degps"]), (0.1, 0.0))
+        self.assertEqual((right["linear_x"], right["angular_z_degps"]), (0.0, -10.0))
+
+    def test_base_drive_allows_continuous_motion_until_cancelled(self):
+        plugin = base_drive.Plugin({}, "test", None, _Client())
+        result = plugin._validate_move({"linear_x": 0.1, "angular_z_degps": 0.0, "duration_s": -1})
+        self.assertEqual(result[2], 0.0)
+        self.assertEqual(result[3], -1.0)
+
+    def test_base_drive_continuous_motion_uses_acp_cancel_completion(self):
+        class Driver:
+            def move(self, *args):
+                return True
+
+            def stop(self):
+                return True
+
+            def get_status(self):
+                return {"subproc_alive": True, "publisher_ready": True}
+
+        plugin = base_drive.Plugin({}, "test", None, _Client())
+        plugin._driver = Driver()
+        notifications = []
+        original_notify = base_drive._acp_notify
+        base_drive._acp_notify = lambda *args: notifications.append(args)
+        try:
+            queued = plugin.dispatch("forward", {"speed_mps": 0.2, "duration_s": -1})
+            self.assertEqual(queued["state"], "queued")
+            self.assertFalse(queued["stops_automatically"])
+            stopped = plugin.dispatch("cancel", {})
+        finally:
+            base_drive._acp_notify = original_notify
+        self.assertEqual(stopped["state"], "idle")
+        self.assertEqual(notifications[-1][1], "cancelled")
+
+    def test_base_drive_stop_behind_continuous_move_publishes_zero(self):
+        scheduler = base_drive._CommandScheduler(publish_rate=10.0, stop_repetitions=3)
+        scheduler.accept({"kind": "move", "linear_x": 0.2, "angular_z": 0.0, "duration_s": -1}, 0.0)
+        scheduler.accept({"kind": "stop"}, 0.0)
+        self.assertEqual(scheduler.next_output(0.0), (0.0, 0.0))
+        self.assertEqual(scheduler.next_output(0.1), (0.0, 0.0))
+        self.assertEqual(scheduler.next_output(0.2), (0.0, 0.0))
+        self.assertIsNone(scheduler.next_output(0.3))
 
     def test_lifecycle_poll_reads_active_without_side_effects(self):
         client = q5_sdk_client.Q5SdkClient()
