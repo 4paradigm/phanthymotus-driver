@@ -11,6 +11,16 @@ plugins:
     enabled: true
   loco:
     enabled: true
+    velocity_proposal_topic: /ubuntu/navigation/nav2/velocity_proposal
+    velocity_proposal_max_ttl_ms: 250
+    velocity_proposal_min_x: -1.0
+    velocity_proposal_max_x: 1.0
+    velocity_proposal_max_abs_y: 1.0
+    velocity_proposal_max_abs_yaw: 2.0
+    velocity_proposal_max_planar_speed: 1.4142135623730951
+    velocity_proposal_stop_confirm_timeout: 1.0
+    velocity_proposal_stop_linear_epsilon: 0.04
+    velocity_proposal_stop_yaw_epsilon: 0.08
   obstacles_avoid:
     enabled: true
   camera:
@@ -24,6 +34,19 @@ plugins:
     enabled: true
   lidar:
     enabled: true
+  navigation_sensors:
+    enabled: true
+    raw_cloud_topic: rt/utlidar/cloud
+    raw_imu_topic: rt/utlidar/imu
+    cloud_topic: /ubuntu/navigation/lidar
+    imu_topic: /ubuntu/navigation/imu
+    lidar_frame: utlidar_lidar
+    imu_frame: utlidar_imu
+    sensor_rotation_matrix: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+    clock_warmup_samples: 32
+    clock_window_samples: 400
+    clock_reset_threshold_ms: 1000
+    clock_reset_confirm_samples: 8
   controlled_spatial:
     enabled: false
     native_slam_pcd_dir: /home/unitree/maps

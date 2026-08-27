@@ -63,6 +63,22 @@ python main.py
 4. 工具对 LLM Agent 可用，并显示在 Web Dashboard 中
 5. LLM Agent 通过 MCP `tools/call` 调用工具
 
+### Go2 Nav2 Driver 输入
+
+Go2 Driver 复用同一套 lease 约束的
+`phanthy.navigation.velocity_proposal.v1` 合同，固定订阅
+`/ubuntu/navigation/nav2/velocity_proposal`。ROS 订阅和执行队列均为
+latest-only；合法速度以 m/s 和 rad/s 原样交给 `SportClient.Move`。
+终态或 TTL 超时调用 `StopMove`，并用调用后新的零速 `loco/state` 样本确认
+停车后才释放任务或保留可恢复 lease。直接调用 loco、步态、动作或特技时，
+会先撤销 Nav2 控制权，并在确认停车后才执行对应 RPC。
+
+只读 `navigation_lidar` 和 `navigation_imu` 卡片把 Go2 原生
+`rt/utlidar/cloud` 与 `rt/utlidar/imu` DDS 流转换为同样的
+`/ubuntu/navigation/lidar` `PointCloud2` 和 `/ubuntu/navigation/imu` `Imu`
+合同。Go2 使用配置中的单位安装旋转；隔离 worker、源时钟归一化、fail-closed
+就绪检查和两张卡共享生命周期与 G1 导航传感器路径一致。
+
 ## 开发新驱动
 
 想要为新硬件添加驱动？请参阅 **[驱动开发指南](README_dev.md)** 获取完整规范，包括：

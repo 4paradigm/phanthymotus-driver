@@ -37,6 +37,13 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from std_msgs.msg import String
 from audio_msgs.msg import AudioChunk
 
+from proposal_controller import Go2VelocityProposalController
+from velocity_proposal import (
+    resolve_input_topic,
+    resolve_optional_expected_nav_id,
+    velocity_proposal_port,
+)
+
 # ── 常量 ──────────────────────────────────────────────────────────────────────
 
 MIC_GROUP_IP = "239.168.123.161"
@@ -543,11 +550,18 @@ _GO2_STATE_CODES = {
 class LocoPlugin:
     """Go2 locomotion control via SportClient RPC — exposes 4 tools."""
     PREFIX = "loco"
+    STOP_PRIORITY = 0
 
     def __init__(self, plugin_config: dict, namespace: str, executor, rpc_proxy):
         self._proxy = rpc_proxy
+        self._executor = executor
         self._continuous_move_lock = threading.Lock()
         self._continuous_move_stop: threading.Event | None = None
+        self._proposal = Go2VelocityProposalController(
+            plugin_config, namespace, rpc_proxy
+        )
+        executor.add_node(self._proposal)
+        self._closed = False
 
     def get_tools(self) -> list:
         return [self._loco_tool(), self._switch_gait_tool(), self._gesture_tool(), self._acrobatics_tool()]
@@ -594,6 +608,7 @@ class LocoPlugin:
                     "auto_recovery_get": {"params": [],                       "description": "Query auto-recovery status"},
                 },
             },
+            "topic_in": [velocity_proposal_port(self._proposal.topic)],
         }
 
     def _switch_gait_tool(self) -> dict:
@@ -694,11 +709,49 @@ class LocoPlugin:
         }
 
     def start(self) -> None:
+        # Driver startup remains disarmed. Canvas start owns the subscription.
         pass
 
     def stop(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         self._stop_continuous_move()
-        self._proxy.StopMove()
+        self._proposal.close()
+        try:
+            self._executor.remove_node(self._proposal)
+            self._proposal.destroy_node()
+        except Exception:
+            pass
+
+    def _connect_velocity_proposal(self, args: dict) -> dict:
+        try:
+            topic = resolve_input_topic(args, self._proposal.topic)
+            expected_nav_id = resolve_optional_expected_nav_id(args)
+        except ValueError as exc:
+            self._proxy.StopMove()
+            return {
+                "state": "error",
+                "connected": False,
+                "error": str(exc),
+                "topic_in": [velocity_proposal_port(self._proposal.topic)],
+            }
+        result = self._proposal.connect(topic, expected_nav_id)
+        connected = bool(
+            result.get("connected")
+            and (result.get("armed") or result.get("awaiting_nav_id"))
+        )
+        return {
+            **result,
+            "state": "ready" if connected else "error",
+            "topic_in": [velocity_proposal_port(self._proposal.topic)],
+        }
+
+    def _disconnect_velocity_proposal(self, reason: str) -> dict:
+        return {
+            "topic_in": [velocity_proposal_port(self._proposal.topic)],
+            **self._proposal.disconnect(reason),
+        }
 
     def _stop_continuous_move(self) -> bool:
         with self._continuous_move_lock:
@@ -735,10 +788,26 @@ class LocoPlugin:
         return {"ret": 0, "status": "running", "vx": vx, "vy": vy, "vyaw": vyaw_dps, "duration": -1}
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        tool_name = args.get("_tool_name", "loco")
         if action == "start":
+            if tool_name == "loco":
+                return self._connect_velocity_proposal(args)
             return {"state": "ready"}
         if action == "stop":
+            if tool_name == "loco":
+                return self._disconnect_velocity_proposal("canvas_stop")
             return {"state": "idle"}
+        if action == "info":
+            if tool_name != "loco":
+                return {"state": "ready"}
+            return {
+                "topic_in": [velocity_proposal_port(self._proposal.topic)],
+                **self._proposal.status(),
+            }
+
+        # Direct locomotion/gait/gesture actions take authority away from Nav2.
+        if not self._proposal.manual_override():
+            return {"ret": -1, "error": "manual_override_stop_unconfirmed"}
 
         # ── loco tool actions ──
         if action == "move":
