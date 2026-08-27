@@ -851,8 +851,9 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertFalse(arm._thread.is_alive())
         self.assertIsNone(plan.arm_status()["owner"])
         first = plan._publisher.messages[0]
-        self.assertEqual(0.65, first.target_positions[14])
-        self.assertEqual(-0.65, first.target_positions[19])
+        first_positions = dict(zip(first.joint_indices, first.target_positions))
+        self.assertEqual(0.65, first_positions[14])
+        self.assertEqual(-0.65, first_positions[19])
 
     def test_arm_wave_advances_through_all_sequence_steps(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros)
@@ -903,12 +904,13 @@ class DevicePluginContractTests(unittest.TestCase):
         entered = threading.Event()
         release = threading.Event()
         plan.wait_until_idle = lambda *_args, **_kwargs: entered.set() or release.wait(timeout=1.0)
+        plan.wait_for_request = lambda *_args, **_kwargs: {}
         results = []
         barrier = threading.Barrier(2)
 
         def dispatch():
             barrier.wait()
-            results.append(arm.dispatch("raise", {"side": "right", "duration": 0.05, "force": True}))
+            results.append(arm.dispatch("raise", {"side": "right", "duration": 0.05, "force": True, "confirm": True}))
 
         threads = [threading.Thread(target=dispatch) for _ in range(2)]
         for thread in threads:
@@ -942,10 +944,11 @@ class DevicePluginContractTests(unittest.TestCase):
             time.sleep(0.001)
         self.assertTrue(plan._publisher.messages)
         request_id = plan._publisher.messages[0].request_id
+        worker_thread = arm._thread
         stopped = arm.dispatch("stop", {})
         self.assertEqual("idle", stopped["state"])
-        arm._thread.join(timeout=1.0)
-        self.assertFalse(arm._thread.is_alive())
+        worker_thread.join(timeout=1.0)
+        self.assertFalse(worker_thread.is_alive())
         self.assertEqual("cancelled", arm.dispatch("status", {})["state"])
         self.assertIsNone(plan.arm_status()["owner"])
         cancel_requests = [
@@ -984,23 +987,29 @@ class DevicePluginContractTests(unittest.TestCase):
             time.sleep(0.001)
         self.assertEqual(1, len(wait_calls))
 
+        first_worker = arm._thread
         stopped = arm.dispatch("stop", {})
         self.assertEqual("idle", stopped["state"])
-        busy = arm.dispatch("raise", {"side": "right", "duration": 0.05, "force": True})
+        busy = arm.dispatch("raise", {"side": "right", "duration": 0.05, "force": True, "confirm": True})
         self.assertEqual("arm is busy", busy["error"])
 
         first_gate.set()
-        arm._thread.join(timeout=1.0)
-        self.assertFalse(arm._thread.is_alive())
+        first_worker.join(timeout=1.0)
+        self.assertFalse(first_worker.is_alive())
 
-        second = arm.dispatch("raise", {"side": "right", "duration": 0.05, "force": True})
+        second = arm.dispatch("raise", {"side": "right", "duration": 0.05, "force": True, "confirm": True})
         self.assertEqual("running", second["state"])
+        deadline = time.monotonic() + 1.0
+        while len(wait_calls) < 2 and time.monotonic() < deadline:
+            time.sleep(0.001)
+        self.assertEqual(2, len(wait_calls))
         self.assertEqual("arm", plan.arm_status()["owner"])
         second_request_id = plan.arm_status()["request_id"]
         self.assertIsNotNone(second_request_id)
+        second_worker = arm._thread
         second_gate.set()
-        arm._thread.join(timeout=1.0)
-        self.assertFalse(arm._thread.is_alive())
+        second_worker.join(timeout=1.0)
+        self.assertFalse(second_worker.is_alive())
         self.assertIsNone(plan.arm_status()["owner"])
         self.assertNotEqual(first.get("action_id"), second.get("action_id"))
 
@@ -1032,6 +1041,31 @@ class DevicePluginContractTests(unittest.TestCase):
         gesture._thread.join(timeout=1.0)
         self.assertEqual("completed", gesture.dispatch("status", {})["state"])
         self.assertEqual([23, 24], plan._publisher.messages[-1].joint_indices)
+
+    def test_gesture_non_arm_sequence_with_joint_names_publishes_correct_plan(self):
+        # Regression: a head-only custom gesture using joint_names must not be
+        # rejected by arm ownership checks, and must publish the resolved joints
+        # instead of an empty plan.
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        plan.wait_until_idle = lambda *_args, **_kwargs: {}
+        plan.wait_for_request = lambda *_args, **_kwargs: {}
+        gesture = self.device.GesturePlugin(plan)
+        gesture._acp_notify = lambda *_args: None
+        result = gesture.dispatch("sequence", {
+            "steps": [{
+                "joint_names": ["J23_HEAD_PITCH", "J24_HEAD_YAW"],
+                "target_positions": [0.1, -0.1],
+                "duration": 0.05,
+            }],
+            "reset_after": False,
+            "force": True,
+        })
+        self.assertEqual("running", result["state"])
+        gesture._thread.join(timeout=1.0)
+        self.assertEqual("completed", gesture.dispatch("status", {})["state"])
+        self.assertEqual([23, 24], list(plan._publisher.messages[-1].joint_indices))
+        self.assertIsNone(plan.arm_status()["owner"])
 
     def test_gesture_declares_async_completion_and_lifecycle_actions(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
@@ -1184,30 +1218,31 @@ class DevicePluginContractTests(unittest.TestCase):
             (action_id, status, result)
         )
         result = gesture.dispatch("sequence", {
-            "steps": [{"joint_indices": [23], "target_positions": [0.1], "duration": 0.05}],
+            "steps": [{"joint_indices": [16], "target_positions": [0.1], "duration": 0.05}],
             "reset_after": False,
             "force": True,
         })
         self.assertTrue(entered_wait.wait(timeout=1.0))
         busy = gesture.dispatch("sequence", {
-            "steps": [{"joint_indices": [23], "target_positions": [0.0]}],
+            "steps": [{"joint_indices": [16], "target_positions": [0.0]}],
             "force": True,
         })
         self.assertIn("already running", busy["error"])
         self.assertNotIn("action_id", busy)
+        worker_thread = gesture._thread
         stopped = gesture.dispatch("stop_gesture", {})
         self.assertEqual("cancelled", stopped["state"])
-        self.assertTrue(gesture._thread.is_alive())
+        self.assertTrue(worker_thread.is_alive())
         self.assertEqual("gesture", plan.arm_status()["owner"])
 
         arm = self.device.ArmActuatorPlugin(CONFIG, plan, self.state)
-        blocked = arm.dispatch("raise", {"side": "right", "duration": 0.05, "force": True})
+        blocked = arm.dispatch("raise", {"side": "right", "duration": 0.05, "force": True, "confirm": True})
         self.assertEqual("arm is busy", blocked["error"])
         self.assertEqual("gesture", blocked["owner"])
 
         release_wait.set()
-        gesture._thread.join(timeout=1.0)
-        self.assertFalse(gesture._thread.is_alive())
+        worker_thread.join(timeout=1.0)
+        self.assertFalse(worker_thread.is_alive())
 
         self.assertEqual("cancelled", gesture.dispatch("status", {})["state"])
         self.assertIsNone(plan.arm_status()["owner"])

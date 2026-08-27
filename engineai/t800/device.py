@@ -2464,6 +2464,19 @@ class JointPlanPlugin:
             return {"owner": self._arm_owner, "request_id": self._arm_request_id}
 
     def _dispatch_owned(self, owner: str, action: str, args: dict) -> dict:
+        # Worker sub-requests must resolve named joints the same way the public
+        # dispatch() does; otherwise plan_named reaches _publish_request with no
+        # joint_indices and publishes an empty plan.
+        if action == "plan_named":
+            names = args.get("joint_names")
+            if not isinstance(names, (list, tuple)) or not names:
+                return {"error": "joint_names must be a non-empty array"}
+            unknown = [str(name) for name in names if str(name) not in T800_JOINT_INDEX]
+            if unknown:
+                return {"error": f"unknown joint names: {unknown}"}
+            args = dict(args)
+            args["joint_indices"] = [T800_JOINT_INDEX[str(name)] for name in names]
+            return self._publish_request("plan", args, owner=owner)
         return self._publish_request(action, args, owner=owner)
 
     def _publish_request(self, action: str, args: dict, *, owner: str | None = None) -> dict:
@@ -2854,6 +2867,13 @@ class GesturePlugin:
 
         def run() -> None:
             request_id = None
+            def _dispatch(action: str, args: dict) -> dict:
+                # Only claim gesture ownership when the sequence holds the arm
+                # lock; non-arm steps (e.g. head-only joints 23/24) go through
+                # the public dispatch path so they don't trip ownership checks.
+                if controls_arm:
+                    return self._joint_plan._dispatch_owned("gesture", action, args)
+                return self._joint_plan.dispatch(action, args)
             try:
                 self._joint_plan.wait_until_idle(
                     self._READY_TIMEOUT_SEC, self._cancel
@@ -2865,7 +2885,7 @@ class GesturePlugin:
                         self._status["step"] = index
                         self._status["step_name"] = step["name"]
                     action = "plan_named" if "joint_names" in step else "plan"
-                    result = self._joint_plan._dispatch_owned("gesture", action, step)
+                    result = _dispatch(action, step)
                     if "error" in result:
                         raise ValueError(result["error"])
                     request_id = int(result["request_id"])
@@ -2880,7 +2900,7 @@ class GesturePlugin:
                     if hold_after > 0 and self._cancel.wait(hold_after):
                         raise RuntimeError("gesture cancelled")
                 if not self._cancel.is_set() and reset_after:
-                    result = self._joint_plan._dispatch_owned("gesture", "reset", {})
+                    result = _dispatch("reset", {})
                     if "error" in result:
                         raise ValueError(result["error"])
                     request_id = int(result["request_id"])
@@ -2901,7 +2921,7 @@ class GesturePlugin:
             except Exception as exc:
                 cancelled = self._cancel.is_set()
                 if request_id is not None:
-                    self._joint_plan._dispatch_owned("gesture", "cancel", {"request_id": request_id})
+                    _dispatch("cancel", {"request_id": request_id})
                 with self._lock:
                     self._status["state"] = "cancelled" if cancelled else "error"
                     self._status["error"] = "" if cancelled else str(exc)
@@ -2956,6 +2976,10 @@ class GesturePlugin:
                 self._status["state"] = "cancelled"
                 self._status["error"] = ""
                 request_id = self._status.get("request_id")
+                # Clear the thread reference so new dispatches reach the arm
+                # mutex; the exiting worker still holds the lock until its
+                # finally block runs.
+                self._thread = None
             else:
                 request_id = None
             result = dict(self._status)
@@ -3312,6 +3336,11 @@ class ArmActuatorPlugin:
                 self._status["state"] = "cancelled"
                 self._status["error"] = ""
                 request_id = self._status.get("request_id")
+                # Clear the thread reference so new dispatches reach the arm
+                # mutex; the exiting worker still holds the lock until its
+                # finally block runs, so callers get "arm is busy" rather than
+                # "another arm action is already running".
+                self._thread = None
             else:
                 request_id = None
             result = dict(self._status)
