@@ -65,6 +65,9 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 `motion_command_trace` 会把它用于状态显示，但不会据此闭环控制动作。
 有限时长动作最多运行 3 秒且不建立 ACP 屏障；更长运动请拆分命令，或使用
 `duration=-1` 持续发送并通过 `stop_move` 手动停止。这样停止动作不会被屏障拦截。
+所有速度、角速度、复合动作速度和 duration 都必须是有限值并落在配置安全
+范围内；越界输入返回 `INVALID_ARGUMENT` / `SAFETY_LIMIT` 并立即归零旧速度流，
+不会静默截断后继续执行。
 
 `gesture.play` 与旧的 `joint_plan.preset` 不同：前者执行官方示例里的完整多步
 动作（挥手包含准备、举手、5 次摆动和复位；握手包含伸手、收手和复位），
@@ -98,6 +101,11 @@ lie_down 组合键。LCM 输入会覆盖实体手柄输入，发送完成后 Dri
 不会意外停止。`record_stop` 同样可重复调用；设置 `duration > 0`
 时超时会走与手动停止相同的落盘路径。状态中的 `last_recording`
 可用于确认最近一次保存文件、停止原因和帧数。
+主机持久化录制在 load/play 前会校验 JSON 根结构、metadata、帧数量上限、
+文件字节数、录制总时长、回放采样数、最小帧间隔、严格递增且有限的时间戳，
+以及完整有限且符合 URDF 限位的 25 关节 position 数组；插值后派生速度也必须
+落在 URDF velocity 限位内。旧录制可省略 velocity，若提供则同样校验；
+无效文件返回 `INVALID_ARGUMENT`，不会污染当前录制 buffer 或抛出内部异常。
 
 录制与回放仅在 `lower_body_balance` 状态开放。回放不再把每个 20Hz 录制帧
 提交为独立 joint plan，而是先用 0.5 秒五次曲线从当前位置平滑接入，再以

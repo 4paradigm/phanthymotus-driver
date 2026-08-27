@@ -44,6 +44,7 @@ from control import (
     T800_JOINT_GROUPS,
     T800_JOINT_INDEX,
     T800_JOINT_NAMES,
+    ControlValidationError,
     RepeatingCommand,
     action_schema,
     array_property,
@@ -57,7 +58,10 @@ from control import (
     sensor_tool,
     validate_joint_indices,
     validate_joint_positions,
+    validate_locomotion_request,
     validate_parallel_arrays,
+    validate_recording_document,
+    validate_recording_frames,
 )
 from native_sdk import NativeSdkManager
 
@@ -79,6 +83,14 @@ _RELIABLE_ONE = QoSProfile(
     history=HistoryPolicy.KEEP_LAST,
     depth=1,
     durability=DurabilityPolicy.VOLATILE,
+)
+_RECORDING_FILE_ERRORS = (
+    json.JSONDecodeError,
+    OSError,
+    RecursionError,
+    TypeError,
+    UnicodeError,
+    ValueError,
 )
 _AUDIO_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -2008,22 +2020,61 @@ class LocomotionPlugin:
                     "status": ([], "查询速度控制刷新状态"),
                 },
                 {
-                    "vx": {"type": "number", "description": "前向速度 m/s"},
-                    "vy": {"type": "number", "description": "侧向速度 m/s"},
-                    "vyaw": {"type": "number", "description": "偏航角速度 rad/s"},
-                    "duration": {
+                    "vx": {
                         "type": "number",
-                        "minimum": -1,
-                        "maximum": self._MAX_TIMED_DURATION_SEC,
+                        "minimum": -self._limits[0],
+                        "maximum": self._limits[0],
+                        "description": "前向速度 m/s",
+                    },
+                    "vy": {
+                        "type": "number",
+                        "minimum": -self._limits[1],
+                        "maximum": self._limits[1],
+                        "description": "侧向速度 m/s",
+                    },
+                    "vyaw": {
+                        "type": "number",
+                        "minimum": -self._limits[2],
+                        "maximum": self._limits[2],
+                        "description": "偏航角速度 rad/s",
+                    },
+                    "duration": {
+                        "anyOf": [
+                            {"type": "number", "const": -1},
+                            {
+                                "type": "number",
+                                "minimum": 0,
+                                "maximum": self._MAX_TIMED_DURATION_SEC,
+                            },
+                        ],
                         "description": "秒；-1=持续到 stop_move，0=停止",
                     },
                     "x_m": {"type": "number", "description": "机身坐标系前向位移，米"},
                     "y_m": {"type": "number", "description": "机身坐标系侧向位移，米"},
-                    "speed_m_s": {"type": "number", "description": "平移速度绝对值，m/s"},
+                    "speed_m_s": {
+                        "type": "number",
+                        "minimum": 0.01,
+                        "maximum": math.hypot(*self._limits[:2]),
+                        "description": "平移速度绝对值，m/s",
+                    },
                     "angle_rad": {"type": "number", "description": "偏航角或圆弧夹角，rad"},
-                    "angular_speed_rad_s": {"type": "number", "description": "角速度绝对值，rad/s"},
-                    "radius_m": {"type": "number", "description": "圆弧半径绝对值，米"},
-                    "linear_speed_m_s": {"type": "number", "description": "圆弧线速度，m/s；负数为后退"},
+                    "angular_speed_rad_s": {
+                        "type": "number",
+                        "minimum": 0.01,
+                        "maximum": self._limits[2],
+                        "description": "角速度绝对值，rad/s",
+                    },
+                    "radius_m": {
+                        "type": "number",
+                        "exclusiveMinimum": 0,
+                        "description": "圆弧半径绝对值，米",
+                    },
+                    "linear_speed_m_s": {
+                        "type": "number",
+                        "minimum": -self._limits[0],
+                        "maximum": self._limits[0],
+                        "description": "圆弧线速度，m/s；负数为后退",
+                    },
                 },
                 "运动动作",
             ),
@@ -2091,57 +2142,22 @@ class LocomotionPlugin:
                 f"move requires motion state in {WALK_MOTION_STATES} "
                 f"(current: {motion or 'unknown'})"
             )
-        open_loop = action != "move"
-        if action == "move":
-            vx = clamp(args.get("vx", 0), -self._limits[0], self._limits[0])
-            vy = clamp(args.get("vy", 0), -self._limits[1], self._limits[1])
-            vyaw = clamp(args.get("vyaw", 0), -self._limits[2], self._limits[2])
-            duration = float(args.get("duration", 1.0))
-        elif action == "move_displacement":
-            x_m = float(args.get("x_m", 0.0))
-            y_m = float(args.get("y_m", 0.0))
-            distance = math.hypot(x_m, y_m)
-            if not math.isfinite(distance) or distance == 0:
-                return self._reject_and_halt(
-                    "x_m and y_m must define a non-zero finite displacement"
-                )
-            speed = clamp(abs(args.get("speed_m_s", 0.3)), 0.01, math.hypot(*self._limits[:2]))
-            duration = max(
-                distance / speed,
-                abs(x_m) / self._limits[0] if x_m else 0.0,
-                abs(y_m) / self._limits[1] if y_m else 0.0,
+        try:
+            command = validate_locomotion_request(
+                action,
+                args,
+                limits=self._limits,
+                max_timed_duration_sec=self._MAX_TIMED_DURATION_SEC,
             )
-            vx = x_m / duration
-            vy = y_m / duration
-            vyaw = 0.0
-        elif action == "turn_angle":
-            angle = float(args.get("angle_rad", 0.0))
-            if not math.isfinite(angle) or angle == 0:
-                return self._reject_and_halt("angle_rad must be non-zero and finite")
-            speed = clamp(abs(args.get("angular_speed_rad_s", 0.5)), 0.01, self._limits[2])
-            vyaw = math.copysign(speed, angle)
-            duration = abs(angle) / speed
-            vx = vy = 0.0
-        else:
-            radius = abs(float(args.get("radius_m", 0.0)))
-            angle = float(args.get("angle_rad", 0.0))
-            linear = float(args.get("linear_speed_m_s", 0.3))
-            if not all(math.isfinite(value) for value in (radius, angle, linear)) or radius <= 0 or angle == 0 or linear == 0:
-                return self._reject_and_halt(
-                    "radius_m, angle_rad and linear_speed_m_s must be finite and non-zero"
-                )
-            requested_vx = clamp(linear, -self._limits[0], self._limits[0])
-            angular_speed = min(abs(requested_vx) / radius, self._limits[2])
-            vx = math.copysign(angular_speed * radius, requested_vx)
-            vyaw = math.copysign(angular_speed, angle)
-            duration = abs(angle) / angular_speed
-            vy = 0.0
-        if duration != -1 and duration > self._MAX_TIMED_DURATION_SEC:
-            raise ValueError(
-                f"timed locomotion duration {duration:.3f}s exceeds "
-                f"{self._MAX_TIMED_DURATION_SEC:.0f}s safety limit; "
-                "split the command or use move duration=-1 with stop_move"
+        except ControlValidationError as exc:
+            return self._reject_and_halt(
+                str(exc), code=exc.code
             )
+        vx = command["vx"]
+        vy = command["vy"]
+        vyaw = command["vyaw"]
+        duration = command["duration"]
+        open_loop = command["open_loop"]
         snapshot = self._stream.start({"vx": vx, "vy": vy, "vyaw": vyaw}, duration)
         return {
             "state": "running" if duration else "stopped",
@@ -2153,9 +2169,9 @@ class LocomotionPlugin:
             "stream": asdict(snapshot),
         }
 
-    def _reject_and_halt(self, error: str) -> dict:
+    def _reject_and_halt(self, error: str, *, code: str = "INVALID_ARGUMENT") -> dict:
         self._halt_stream()
-        return {"error": error}
+        return {"error": error, "code": code}
 
     def _halt_stream(self) -> bool:
         stopped = self._stream.stop()
@@ -5661,6 +5677,9 @@ class MotionRecorderPlugin:
     # for smooth playback without overwhelming the trajectory buffer.
     _DEFAULT_RECORD_HZ = 20.0
     _MAX_FRAMES = 6000  # 5 minutes at 20 Hz
+    _MAX_RECORDING_DURATION_MS = 5 * 60 * 1000
+    _MAX_RECORDING_FILE_BYTES = 32 * 1024 * 1024
+    _MAX_PLAYBACK_SAMPLES = 60_000
     _DEFAULT_PLAYBACK_STIFFNESS = (
         200.0, 30.0, 30.0, 15.0, 30.0, 15.0,
         40.0, 40.0, 20.0, 40.0, 20.0, 100.0, 100.0,
@@ -6121,17 +6140,43 @@ class MotionRecorderPlugin:
             if not file_path.exists():
                 return {"error": f"recording not found: {name}"}
             try:
-                data = json.loads(file_path.read_text(encoding="utf-8"))
-                frames = data.get("frames", [])
-                label = data.get("metadata", {}).get("label", name)
-            except (json.JSONDecodeError, OSError) as exc:
-                return {"error": f"failed to load recording: {exc}"}
+                frames, metadata = self._read_recording_file(
+                    file_path, minimum_frames=2
+                )
+                label = str(metadata.get("label", name))
+            except _RECORDING_FILE_ERRORS as exc:
+                return {
+                    "error": f"invalid recording: {exc}",
+                    "code": "INVALID_ARGUMENT",
+                }
 
-        if not frames:
-            return {"error": "recording is empty"}
-
-        speed_scale = clamp(float(args.get("speed_scale", 1.0)), 0.1, 5.0)
+        raw_speed_scale = args.get("speed_scale", 1.0)
+        if isinstance(raw_speed_scale, bool) or not isinstance(
+            raw_speed_scale, numbers.Real
+        ):
+            return {
+                "error": "speed_scale must be a JSON number",
+                "code": "INVALID_ARGUMENT",
+            }
+        speed_scale = float(raw_speed_scale)
+        if not math.isfinite(speed_scale):
+            return {
+                "error": "speed_scale must be finite",
+                "code": "INVALID_ARGUMENT",
+            }
+        if not 0.1 <= speed_scale <= 5.0:
+            return {
+                "error": "speed_scale must be within [0.1, 5.0]",
+                "code": "SAFETY_LIMIT",
+            }
         try:
+            frames = validate_recording_frames(
+                frames,
+                max_frames=self._MAX_FRAMES,
+                minimum_frames=2,
+                max_duration_ms=self._MAX_RECORDING_DURATION_MS,
+                minimum_interval_ms=1000.0 / self._playback_rate_hz,
+            )
             with self._lock:
                 current_positions = list(self._latest_joint_positions or [])
             samples = resample_joint_trajectory(
@@ -6141,9 +6186,13 @@ class MotionRecorderPlugin:
                 playback_rate_hz=self._playback_rate_hz,
                 speed_scale=speed_scale,
                 entry_blend_sec=self._entry_blend_sec,
+                max_samples=self._MAX_PLAYBACK_SAMPLES,
             )
-        except (TypeError, ValueError) as exc:
-            return {"error": f"invalid recording: {exc}"}
+        except (IndexError, KeyError, TypeError, ValueError) as exc:
+            return {
+                "error": f"invalid recording: {exc}",
+                "code": "INVALID_ARGUMENT",
+            }
         action_id = f"t800_motion_play_{uuid4().hex[:12]}"
 
         with self._lock:
@@ -6345,6 +6394,28 @@ class MotionRecorderPlugin:
 
     # ── Save/Load ─────────────────────────────────────────────────────────────
 
+    def _read_recording_file(
+        self,
+        file_path: Path,
+        *,
+        minimum_frames: int,
+    ) -> tuple[list[dict], dict]:
+        with file_path.open("rb") as stream:
+            raw_data = stream.read(self._MAX_RECORDING_FILE_BYTES + 1)
+        if len(raw_data) > self._MAX_RECORDING_FILE_BYTES:
+            raise ValueError(
+                f"recording file size exceeds maximum "
+                f"{self._MAX_RECORDING_FILE_BYTES} bytes"
+            )
+        data = json.loads(raw_data.decode("utf-8"))
+        return validate_recording_document(
+            data,
+            max_frames=self._MAX_FRAMES,
+            minimum_frames=minimum_frames,
+            max_duration_ms=self._MAX_RECORDING_DURATION_MS,
+            minimum_interval_ms=1000.0 / self._playback_rate_hz,
+        )
+
     def _save(self, args: dict) -> dict:
         name = str(args.get("name", ""))
         if not name:
@@ -6388,41 +6459,54 @@ class MotionRecorderPlugin:
             return {"error": f"recording not found: {name}"}
 
         try:
-            data = json.loads(file_path.read_text(encoding="utf-8"))
-            frames = data.get("frames", [])
-            meta = data.get("metadata", {})
-        except (json.JSONDecodeError, OSError) as exc:
-            return {"error": f"load failed: {exc}"}
+            frames, meta = self._read_recording_file(
+                file_path, minimum_frames=1
+            )
+        except _RECORDING_FILE_ERRORS as exc:
+            return {
+                "error": f"invalid recording: {exc}",
+                "code": "INVALID_ARGUMENT",
+            }
 
         with self._lock:
-            self._frames = list(frames)
-            self._record_label = meta.get("label", name)
+            self._frames = frames
+            self._record_label = str(meta.get("label", name))
+        duration_ms = (
+            frames[-1]["timestamp"] - frames[0]["timestamp"]
+            if len(frames) > 1 else 0
+        )
 
         return {
             "state": "loaded",
             "name": name,
-            "label": meta.get("label", name),
+            "label": str(meta.get("label", name)),
             "frames": len(frames),
-            "duration_ms": meta.get("duration_ms", 0),
+            "duration_ms": duration_ms,
         }
 
     def _list_recordings(self) -> dict:
         recordings = []
         for fpath in sorted(self._recordings_dir.glob("*.json")):
             try:
-                data = json.loads(fpath.read_text(encoding="utf-8"))
-                meta = data.get("metadata", {})
+                frames, meta = self._read_recording_file(
+                    fpath, minimum_frames=1
+                )
+                duration_ms = (
+                    frames[-1]["timestamp"] - frames[0]["timestamp"]
+                    if len(frames) > 1 else 0
+                )
                 recordings.append({
                     "name": fpath.stem,
-                    "label": meta.get("label", fpath.stem),
-                    "frames": meta.get("frames", len(data.get("frames", []))),
-                    "duration_ms": meta.get("duration_ms", 0),
+                    "label": str(meta.get("label", fpath.stem)),
+                    "frames": len(frames),
+                    "duration_ms": duration_ms,
                     "file": str(fpath),
                 })
-            except (json.JSONDecodeError, OSError):
+            except _RECORDING_FILE_ERRORS as exc:
                 recordings.append({
                     "name": fpath.stem,
-                    "error": "corrupt file",
+                    "error": f"invalid recording: {exc}",
+                    "code": "INVALID_ARGUMENT",
                     "file": str(fpath),
                 })
 

@@ -1,6 +1,7 @@
 """Contract tests for the GaitPlugin and MotionRecorderPlugin (from device.py)."""
 
 import importlib.util
+import json
 import sys
 import tempfile
 import threading
@@ -12,6 +13,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+from control import T800_JOINT_POSITION_LIMITS  # noqa: E402
+
+
+def safe_positions(*, torso_yaw=0.0):
+    positions = [
+        (lower + upper) / 2.0
+        for lower, upper in T800_JOINT_POSITION_LIMITS
+    ]
+    positions[12] = float(torso_yaw)
+    return positions
 
 
 class Message:
@@ -448,12 +460,12 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
         blocked = self.plugin.dispatch("record_start", {"label": "unsafe_mode"})
         self.assertIn("lower_body_balance", blocked["error"])
         current = self._make_joint_state()
-        current.position = [0.0] * 25
+        current.position = safe_positions(torso_yaw=0.0)
         current.velocity = [0.0] * 25
         self.plugin._on_joint_state(current)
         self.plugin._frames = [
-            {"timestamp": 0, "positions": [0.0] * 25, "velocities": [0.0] * 25},
-            {"timestamp": 50, "positions": [0.1] * 25, "velocities": [0.0] * 25},
+            {"timestamp": 0, "positions": safe_positions(), "velocities": [0.0] * 25},
+            {"timestamp": 50, "positions": safe_positions(torso_yaw=0.1), "velocities": [0.0] * 25},
         ]
         blocked_play = self.plugin.dispatch("play", {})
         self.assertIn("lower_body_balance", blocked_play["error"])
@@ -578,6 +590,149 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
         self.assertEqual("loaded", result["state"])
         self.assertGreater(result["frames"], 0)
 
+    def test_load_and_play_reject_missing_frame_fields_as_invalid_recording(self):
+        malformed = Path(self.tmpdir.name) / "malformed.json"
+        malformed.write_text(json.dumps({
+            "metadata": {"label": "malformed"},
+            "frames": [
+                {"positions": safe_positions()},
+                {"positions": safe_positions(torso_yaw=0.1)},
+            ],
+        }), encoding="utf-8")
+
+        loaded = self.plugin.dispatch("load", {"name": "malformed"})
+        played = self.plugin.dispatch("play", {"name": "malformed"})
+
+        self.assertEqual("INVALID_ARGUMENT", loaded["code"])
+        self.assertIn("timestamp", loaded["error"])
+        self.assertEqual("INVALID_ARGUMENT", played["code"])
+        self.assertIn("timestamp", played["error"])
+        self.assertEqual(0, self.plugin.dispatch("status", {})["buffer_frames"])
+
+    def test_load_rejects_malformed_recording_matrix_without_mutating_buffer(self):
+        def frame(timestamp, positions=None, **extra):
+            return {
+                "timestamp": timestamp,
+                "positions": safe_positions() if positions is None else positions,
+                **extra,
+            }
+
+        valid_path = Path(self.tmpdir.name) / "valid_buffer.json"
+        valid_path.write_text(json.dumps({
+            "metadata": {"label": "valid"},
+            "frames": [frame(0), frame(50)],
+        }), encoding="utf-8")
+        self.assertEqual(
+            "loaded",
+            self.plugin.dispatch("load", {"name": "valid_buffer"})["state"],
+        )
+
+        cases = [
+            ("root_array", [], "root"),
+            ("metadata_array", {"metadata": [], "frames": [frame(0)]}, "metadata"),
+            ("frames_string", {"frames": "bad"}, "JSON array"),
+            ("frames_empty", {"frames": []}, "at least"),
+            ("frame_string", {"frames": ["bad"]}, "must be an object"),
+            ("timestamp_bool", {"frames": [frame(True)]}, "timestamp must be a number"),
+            ("timestamp_nan", {"frames": [frame(float("nan"))]}, "finite"),
+            ("timestamp_overflow", {"frames": [frame(10**400)]}, "finite"),
+            ("timestamp_negative", {"frames": [frame(-1)]}, "non-negative"),
+            ("timestamp_duplicate", {"frames": [frame(0), frame(0)]}, "strictly increasing"),
+            ("positions_missing", {"frames": [{"timestamp": 0}]}, "positions"),
+            ("positions_short", {"frames": [frame(0, safe_positions()[:24])]}, "exactly 25"),
+            ("positions_string", {"frames": [frame(0, safe_positions()[:24] + ["bad"])]}, "only numbers"),
+            ("positions_inf", {"frames": [frame(0, safe_positions()[:24] + [float("inf")])]}, "finite"),
+            ("positions_overflow", {"frames": [frame(0, safe_positions()[:24] + [10**400])]}, "finite"),
+            ("velocities_short", {"frames": [frame(0, velocities=[0.0] * 24)]}, "velocities"),
+            ("velocities_nan", {"frames": [frame(0, velocities=[0.0] * 24 + [float("nan")])]}, "finite"),
+            (
+                "frames_oversized",
+                {"frames": [frame(index * 50) for index in range(self.plugin._MAX_FRAMES + 1)]},
+                "maximum frame count",
+            ),
+        ]
+        for name, payload, expected_error in cases:
+            with self.subTest(name=name):
+                (Path(self.tmpdir.name) / f"{name}.json").write_text(
+                    json.dumps(payload), encoding="utf-8"
+                )
+                result = self.plugin.dispatch("load", {"name": name})
+                self.assertEqual("INVALID_ARGUMENT", result["code"])
+                self.assertIn(expected_error, result["error"])
+                self.assertEqual(
+                    2,
+                    self.plugin.dispatch("status", {})["buffer_frames"],
+                )
+
+    def test_recording_resource_and_joint_limits_are_fail_closed(self):
+        huge_path = Path(self.tmpdir.name) / "huge.json"
+        with huge_path.open("wb") as stream:
+            stream.truncate(32 * 1024 * 1024 + 1)
+        huge = self.plugin.dispatch("load", {"name": "huge"})
+        self.assertEqual("INVALID_ARGUMENT", huge["code"])
+        self.assertIn("file size", huge["error"])
+
+        long_path = Path(self.tmpdir.name) / "long_duration.json"
+        long_path.write_text(json.dumps({
+            "frames": [
+                {"timestamp": 0, "positions": safe_positions()},
+                {"timestamp": 300001, "positions": safe_positions()},
+            ],
+        }), encoding="utf-8")
+        long_duration = self.plugin.dispatch("load", {"name": "long_duration"})
+        self.assertEqual("INVALID_ARGUMENT", long_duration["code"])
+        self.assertIn("duration", long_duration["error"])
+
+        fast_start = safe_positions(torso_yaw=-1.0)
+        fast_end = safe_positions(torso_yaw=1.0)
+        fast_path = Path(self.tmpdir.name) / "fast_frames.json"
+        fast_path.write_text(json.dumps({
+            "frames": [
+                {"timestamp": 0, "positions": fast_start},
+                {"timestamp": 1, "positions": fast_end},
+            ],
+        }), encoding="utf-8")
+        fast_frames = self.plugin.dispatch("load", {"name": "fast_frames"})
+        self.assertEqual("INVALID_ARGUMENT", fast_frames["code"])
+        self.assertIn("frame interval", fast_frames["error"])
+
+        sample_heavy_path = Path(self.tmpdir.name) / "sample_heavy.json"
+        sample_heavy_path.write_text(json.dumps({
+            "frames": [
+                {"timestamp": 0, "positions": safe_positions()},
+                {"timestamp": 300000, "positions": safe_positions()},
+            ],
+        }), encoding="utf-8")
+        self.plugin._on_joint_state(self._make_joint_state())
+        sample_heavy = self.plugin.dispatch(
+            "play", {"name": "sample_heavy", "speed_scale": 0.1}
+        )
+        self.assertEqual("INVALID_ARGUMENT", sample_heavy["code"])
+        self.assertIn("sample count", sample_heavy["error"])
+
+        unsafe_positions = safe_positions()
+        unsafe_positions[16] = -3.0
+        unsafe_path = Path(self.tmpdir.name) / "unsafe_joint.json"
+        unsafe_path.write_text(json.dumps({
+            "frames": [
+                {"timestamp": 0, "positions": unsafe_positions},
+                {"timestamp": 50, "positions": unsafe_positions},
+            ],
+        }), encoding="utf-8")
+        unsafe = self.plugin.dispatch("load", {"name": "unsafe_joint"})
+        self.assertEqual("INVALID_ARGUMENT", unsafe["code"])
+        self.assertIn("safe position limit", unsafe["error"])
+
+        malformed_path = Path(self.tmpdir.name) / "list_malformed.json"
+        malformed_path.write_text("[]", encoding="utf-8")
+        listed = self.plugin.dispatch("list", {})
+        malformed_entry = next(
+            item for item in listed["recordings"]
+            if item["name"] == "list_malformed"
+        )
+        self.assertEqual("INVALID_ARGUMENT", malformed_entry["code"])
+        self.assertIn("root", malformed_entry["error"])
+
     def test_delete_removes_recording_file(self):
         self.plugin.dispatch("record_start", {"label": "del_test"})
         self.plugin._on_joint_state(self._make_joint_state())
@@ -592,6 +747,25 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
     def test_play_without_name_or_buffer_returns_error(self):
         result = self.plugin.dispatch("play", {})
         self.assertIn("error", result)
+
+    def test_play_rejects_speed_scale_outside_schema_bounds(self):
+        current = self._make_joint_state()
+        self.plugin._on_joint_state(current)
+        self.plugin._frames = [
+            {"timestamp": 0, "positions": safe_positions(), "velocities": [0.0] * 25},
+            {"timestamp": 50, "positions": safe_positions(torso_yaw=0.1), "velocities": [0.0] * 25},
+        ]
+
+        too_fast = self.plugin.dispatch("play", {"speed_scale": 10})
+        non_finite = self.plugin.dispatch("play", {"speed_scale": float("nan")})
+        boolean = self.plugin.dispatch("play", {"speed_scale": True})
+        numeric_string = self.plugin.dispatch("play", {"speed_scale": "1"})
+
+        self.assertEqual("SAFETY_LIMIT", too_fast["code"])
+        self.assertEqual("INVALID_ARGUMENT", non_finite["code"])
+        self.assertEqual("INVALID_ARGUMENT", boolean["code"])
+        self.assertEqual("INVALID_ARGUMENT", numeric_string["code"])
+        self.assertFalse(self.plugin.dispatch("status", {})["playing"])
 
     def test_play_without_buffer_and_unknown_name_returns_error(self):
         result = self.plugin.dispatch("play", {"name": "nonexistent"})
@@ -617,13 +791,13 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
         joint_plan = FakeJointPlan()
         self.plugin.set_joint_plan(joint_plan)
         current = self._make_joint_state()
-        current.position = [0.0] * 25
+        current.position = safe_positions(torso_yaw=0.0)
         current.velocity = [0.0] * 25
         self.plugin._on_joint_state(current)
         self.plugin._frames = [
             {
                 "timestamp": index * 50,
-                "positions": [0.0] * 12 + [0.12 * index] * 13,
+                "positions": safe_positions(torso_yaw=0.12 * index),
                 "velocities": [0.0] * 25,
             }
             for index in range(5)
@@ -654,13 +828,13 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
 
     def test_playback_blends_from_current_pose_before_recorded_trajectory(self):
         current = self._make_joint_state()
-        current.position = [0.0] * 12 + [-0.5] * 13
+        current.position = safe_positions(torso_yaw=-0.5)
         current.velocity = [0.0] * 25
         self.plugin._on_joint_state(current)
         self.plugin._frames = [
             {
                 "timestamp": index * 50,
-                "positions": [0.0] * 12 + [0.5 + 0.05 * index] * 13,
+                "positions": safe_positions(torso_yaw=0.5 + 0.05 * index),
                 "velocities": [0.0] * 25,
             }
             for index in range(3)
@@ -693,13 +867,13 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
 
     def test_playback_smooths_velocity_across_recorded_frame_boundaries(self):
         current = self._make_joint_state()
-        current.position = [0.0] * 25
+        current.position = safe_positions(torso_yaw=0.0)
         current.velocity = [0.0] * 25
         self.plugin._on_joint_state(current)
         self.plugin._frames = [
             {
                 "timestamp": index * 100,
-                "positions": [0.0] * 12 + [position] * 13,
+                "positions": safe_positions(torso_yaw=position),
                 "velocities": [0.0] * 25,
             }
             for index, position in enumerate((0.0, 1.0, 0.0))
@@ -726,12 +900,12 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
 
     def test_playback_publish_failure_clears_playing_state(self):
         current = self._make_joint_state()
-        current.position = [0.0] * 25
+        current.position = safe_positions(torso_yaw=0.0)
         current.velocity = [0.0] * 25
         self.plugin._on_joint_state(current)
         self.plugin._frames = [
-            {"timestamp": 0, "positions": [0.0] * 25, "velocities": [0.0] * 25},
-            {"timestamp": 50, "positions": [0.1] * 25, "velocities": [0.0] * 25},
+            {"timestamp": 0, "positions": safe_positions(), "velocities": [0.0] * 25},
+            {"timestamp": 50, "positions": safe_positions(torso_yaw=0.1), "velocities": [0.0] * 25},
         ]
         publisher = next(
             publisher
@@ -754,12 +928,12 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
         state = FakeMotionState(current="lower_body_balance", available=["pd_stand"])
         self.plugin.set_reset_controls(state, FakeMotionMode(state))
         current = self._make_joint_state()
-        current.position = [0.0] * 25
+        current.position = safe_positions(torso_yaw=0.0)
         current.velocity = [0.0] * 25
         self.plugin._on_joint_state(current)
         self.plugin._frames = [
-            {"timestamp": 0, "positions": [0.0] * 25, "velocities": [0.0] * 25},
-            {"timestamp": 1000, "positions": [0.5] * 25, "velocities": [0.0] * 25},
+            {"timestamp": 0, "positions": safe_positions(), "velocities": [0.0] * 25},
+            {"timestamp": 1000, "positions": safe_positions(torso_yaw=0.5), "velocities": [0.0] * 25},
         ]
 
         self.plugin.dispatch("play", {})
@@ -781,12 +955,12 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
 
     def test_stop_playback_releases_override_and_completes_acp_as_cancelled(self):
         current = self._make_joint_state()
-        current.position = [0.0] * 25
+        current.position = safe_positions(torso_yaw=0.0)
         current.velocity = [0.0] * 25
         self.plugin._on_joint_state(current)
         self.plugin._frames = [
-            {"timestamp": 0, "positions": [0.0] * 25, "velocities": [0.0] * 25},
-            {"timestamp": 2000, "positions": [0.5] * 25, "velocities": [0.0] * 25},
+            {"timestamp": 0, "positions": safe_positions(), "velocities": [0.0] * 25},
+            {"timestamp": 2000, "positions": safe_positions(torso_yaw=0.5), "velocities": [0.0] * 25},
         ]
 
         started = self.plugin.dispatch("play", {})
@@ -812,12 +986,12 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
 
     def test_agent_core_interrupt_bypasses_barrier_and_requests_immediate_release(self):
         current = self._make_joint_state()
-        current.position = [0.0] * 25
+        current.position = safe_positions(torso_yaw=0.0)
         current.velocity = [0.0] * 25
         self.plugin._on_joint_state(current)
         self.plugin._frames = [
-            {"timestamp": 0, "positions": [0.0] * 25, "velocities": [0.0] * 25},
-            {"timestamp": 2000, "positions": [0.5] * 25, "velocities": [0.0] * 25},
+            {"timestamp": 0, "positions": safe_positions(), "velocities": [0.0] * 25},
+            {"timestamp": 2000, "positions": safe_positions(torso_yaw=0.5), "velocities": [0.0] * 25},
         ]
         publisher = next(
             publisher
@@ -970,12 +1144,12 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
 
     def test_release_failure_keeps_motion_gate_settling_until_retry_succeeds(self):
         current = self._make_joint_state()
-        current.position = [0.0] * 25
+        current.position = safe_positions(torso_yaw=0.0)
         current.velocity = [0.0] * 25
         self.plugin._on_joint_state(current)
         self.plugin._frames = [
-            {"timestamp": 0, "positions": [0.0] * 25, "velocities": [0.0] * 25},
-            {"timestamp": 2000, "positions": [0.5] * 25, "velocities": [0.0] * 25},
+            {"timestamp": 0, "positions": safe_positions(), "velocities": [0.0] * 25},
+            {"timestamp": 2000, "positions": safe_positions(torso_yaw=0.5), "velocities": [0.0] * 25},
         ]
         publisher = next(
             publisher
@@ -1075,12 +1249,12 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
 
     def test_natural_completion_release_failure_is_also_fail_closed(self):
         current = self._make_joint_state()
-        current.position = [0.0] * 25
+        current.position = safe_positions(torso_yaw=0.0)
         current.velocity = [0.0] * 25
         self.plugin._on_joint_state(current)
         self.plugin._frames = [
-            {"timestamp": 0, "positions": [0.0] * 25, "velocities": [0.0] * 25},
-            {"timestamp": 50, "positions": [0.1] * 25, "velocities": [0.0] * 25},
+            {"timestamp": 0, "positions": safe_positions(), "velocities": [0.0] * 25},
+            {"timestamp": 50, "positions": safe_positions(torso_yaw=0.1), "velocities": [0.0] * 25},
         ]
         publisher = next(
             publisher
@@ -1196,12 +1370,12 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
         self.assertEqual([], interrupt_group.blocking_outputs())
 
         current = self._make_joint_state()
-        current.position = [0.0] * 25
+        current.position = safe_positions(torso_yaw=0.0)
         current.velocity = [0.0] * 25
         self.plugin._on_joint_state(current)
         self.plugin._frames = [
-            {"timestamp": 0, "positions": [0.0] * 25, "velocities": [0.0] * 25},
-            {"timestamp": 2000, "positions": [0.5] * 25, "velocities": [0.0] * 25},
+            {"timestamp": 0, "positions": safe_positions(), "velocities": [0.0] * 25},
+            {"timestamp": 2000, "positions": safe_positions(torso_yaw=0.5), "velocities": [0.0] * 25},
         ]
         playback_started = harness.call("motion_recorder", "play", {})
         time.sleep(0.05)
@@ -1252,7 +1426,7 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
 
     def _make_joint_state(self):
         msg = Message()
-        msg.position = [float(i) * 0.1 for i in range(25)]
+        msg.position = safe_positions()
         msg.velocity = [float(i) * 0.01 for i in range(25)]
         return msg
 

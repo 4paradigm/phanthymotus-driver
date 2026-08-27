@@ -91,6 +91,14 @@ T800_JOINT_POSITION_LIMITS = (
     (-1.222, 1.222),
 )
 
+# Hard velocity limits copied from the same URDF, in rad/s.
+T800_JOINT_VELOCITY_LIMITS = (
+    25.96, 25.31, 23.19, 25.96, 33.51, 33.51,
+    25.96, 25.31, 23.19, 25.96, 33.51, 33.51,
+    23.19, 33.51, 33.51, 33.51, 33.51, 35.2,
+    33.51, 33.51, 33.51, 33.51, 35.2, 35.2, 35.2,
+)
+
 MOTION_STATES = (
     "idle",
     "passive",
@@ -133,6 +141,168 @@ def clamp(value: float, lower: float, upper: float) -> float:
     if not math.isfinite(value):
         raise ValueError("value must be finite")
     return max(lower, min(upper, value))
+
+
+class ControlValidationError(ValueError):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = str(code)
+
+
+def validate_locomotion_request(
+    action: str,
+    arguments: dict,
+    *,
+    limits: Sequence[float],
+    max_timed_duration_sec: float,
+) -> dict:
+    """Validate a loco action without coercing non-JSON-number inputs."""
+    if len(limits) != 3 or any(
+        not math.isfinite(float(limit)) or float(limit) <= 0 for limit in limits
+    ):
+        raise ValueError("locomotion limits must contain three positive finite values")
+    max_vx, max_vy, max_vyaw = [float(limit) for limit in limits]
+    defaults = {
+        "move": {"vx": 0.0, "vy": 0.0, "vyaw": 0.0, "duration": 1.0},
+        "move_displacement": {"x_m": 0.0, "y_m": 0.0, "speed_m_s": 0.3},
+        "turn_angle": {"angle_rad": 0.0, "angular_speed_rad_s": 0.5},
+        "arc": {"radius_m": 0.0, "angle_rad": 0.0, "linear_speed_m_s": 0.3},
+    }
+    if action not in defaults:
+        raise ControlValidationError(
+            "INVALID_ARGUMENT", f"unknown locomotion action: {action}"
+        )
+    values = {}
+    for name, default in defaults[action].items():
+        raw_value = arguments.get(name, default)
+        if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+            raise ControlValidationError(
+                "INVALID_ARGUMENT", f"{name} must be a JSON number"
+            )
+        try:
+            value = float(raw_value)
+        except OverflowError:
+            raise ControlValidationError(
+                "INVALID_ARGUMENT", f"{name} must be finite"
+            ) from None
+        if not math.isfinite(value):
+            raise ControlValidationError(
+                "INVALID_ARGUMENT", f"{name} must be finite"
+            )
+        values[name] = value
+
+    if action == "move":
+        vx = values["vx"]
+        vy = values["vy"]
+        vyaw = values["vyaw"]
+        duration = values["duration"]
+        violations = [
+            f"{name}={value:.6g} outside [{-limit:.6g}, {limit:.6g}]"
+            for name, value, limit in (
+                ("vx", vx, max_vx),
+                ("vy", vy, max_vy),
+                ("vyaw", vyaw, max_vyaw),
+            )
+            if value < -limit or value > limit
+        ]
+        if violations:
+            raise ControlValidationError("SAFETY_LIMIT", "; ".join(violations))
+    elif action == "move_displacement":
+        x_m = values["x_m"]
+        y_m = values["y_m"]
+        speed = values["speed_m_s"]
+        distance = math.hypot(x_m, y_m)
+        if distance == 0:
+            raise ControlValidationError(
+                "INVALID_ARGUMENT",
+                "x_m and y_m must define a non-zero displacement",
+            )
+        if speed < 0.01:
+            raise ControlValidationError(
+                "INVALID_ARGUMENT", "speed_m_s must be at least 0.01"
+            )
+        minimum_duration = max(
+            abs(x_m) / max_vx if x_m else 0.0,
+            abs(y_m) / max_vy if y_m else 0.0,
+        )
+        maximum_speed = distance / minimum_duration
+        if speed > maximum_speed:
+            raise ControlValidationError(
+                "SAFETY_LIMIT",
+                f"speed_m_s={speed:.6g} exceeds directional safety limit "
+                f"{maximum_speed:.6g}",
+            )
+        duration = distance / speed
+        vx = x_m / duration
+        vy = y_m / duration
+        vyaw = 0.0
+    elif action == "turn_angle":
+        angle = values["angle_rad"]
+        speed = values["angular_speed_rad_s"]
+        if angle == 0:
+            raise ControlValidationError(
+                "INVALID_ARGUMENT", "angle_rad must be non-zero"
+            )
+        if speed < 0.01:
+            raise ControlValidationError(
+                "INVALID_ARGUMENT", "angular_speed_rad_s must be at least 0.01"
+            )
+        if speed > max_vyaw:
+            raise ControlValidationError(
+                "SAFETY_LIMIT",
+                f"angular_speed_rad_s={speed:.6g} exceeds safety limit "
+                f"{max_vyaw:.6g}",
+            )
+        vx = vy = 0.0
+        vyaw = math.copysign(speed, angle)
+        duration = abs(angle) / speed
+    else:
+        radius = values["radius_m"]
+        angle = values["angle_rad"]
+        linear = values["linear_speed_m_s"]
+        if radius <= 0 or angle == 0 or linear == 0:
+            raise ControlValidationError(
+                "INVALID_ARGUMENT",
+                "radius_m must be positive; angle_rad and linear_speed_m_s "
+                "must be non-zero",
+            )
+        if abs(linear) > max_vx:
+            raise ControlValidationError(
+                "SAFETY_LIMIT",
+                f"linear_speed_m_s={linear:.6g} outside "
+                f"[{-max_vx:.6g}, {max_vx:.6g}]",
+            )
+        angular_speed = abs(linear) / radius
+        if angular_speed > max_vyaw:
+            raise ControlValidationError(
+                "SAFETY_LIMIT",
+                f"arc angular speed {angular_speed:.6g} exceeds safety limit "
+                f"{max_vyaw:.6g}",
+            )
+        vx = linear
+        vy = 0.0
+        vyaw = math.copysign(angular_speed, angle)
+        duration = abs(angle) / angular_speed
+
+    if duration < 0 and duration != -1:
+        raise ControlValidationError(
+            "INVALID_ARGUMENT",
+            "duration must be -1 or a non-negative finite number",
+        )
+    if duration != -1 and duration > float(max_timed_duration_sec):
+        raise ControlValidationError(
+            "SAFETY_LIMIT",
+            f"timed locomotion duration {duration:.3f}s exceeds "
+            f"{float(max_timed_duration_sec):.0f}s safety limit; "
+            "split the command or use move duration=-1 with stop_move",
+        )
+    return {
+        "vx": vx,
+        "vy": vy,
+        "vyaw": vyaw,
+        "duration": duration,
+        "open_loop": action != "move",
+    }
 
 
 def float_list(
@@ -250,6 +420,168 @@ def joint_payload(
     }
 
 
+def validate_recording_frames(
+    frames: object,
+    *,
+    max_frames: int,
+    joint_count: int = len(T800_JOINT_NAMES),
+    minimum_frames: int = 1,
+    max_duration_ms: float | None = None,
+    minimum_interval_ms: float | None = None,
+) -> list[dict]:
+    """Validate and normalize persisted motion-recorder frames."""
+    if not isinstance(frames, list):
+        raise ValueError("frames must be a JSON array")
+    if len(frames) < int(minimum_frames):
+        if int(minimum_frames) == 2:
+            raise ValueError("at least two timestamped frames are required")
+        raise ValueError(f"recording must contain at least {minimum_frames} frame(s)")
+    if len(frames) > int(max_frames):
+        raise ValueError(f"recording exceeds maximum frame count {max_frames}")
+    if joint_count != len(T800_JOINT_NAMES):
+        raise ValueError(
+            f"joint_count must match the T800 layout ({len(T800_JOINT_NAMES)})"
+        )
+    if minimum_interval_ms is not None and (
+        not math.isfinite(float(minimum_interval_ms))
+        or float(minimum_interval_ms) <= 0
+    ):
+        raise ValueError("minimum_interval_ms must be positive and finite")
+
+    normalized = []
+    previous_timestamp = None
+    for frame_index, frame in enumerate(frames):
+        if not isinstance(frame, dict):
+            raise ValueError(f"frame {frame_index} must be an object")
+        if "timestamp" not in frame:
+            raise ValueError(f"frame {frame_index} is missing timestamp")
+        timestamp_value = frame["timestamp"]
+        if isinstance(timestamp_value, bool) or not isinstance(
+            timestamp_value, (int, float)
+        ):
+            raise ValueError(f"frame {frame_index} timestamp must be a number")
+        try:
+            timestamp = float(timestamp_value)
+        except OverflowError:
+            raise ValueError(
+                f"frame {frame_index} timestamp must be finite"
+            ) from None
+        if not math.isfinite(timestamp) or timestamp < 0:
+            raise ValueError(
+                f"frame {frame_index} timestamp must be finite and non-negative"
+            )
+        if previous_timestamp is not None and timestamp <= previous_timestamp:
+            raise ValueError("frame timestamps must be strictly increasing")
+        if (
+            previous_timestamp is not None
+            and minimum_interval_ms is not None
+            and timestamp - previous_timestamp < float(minimum_interval_ms)
+        ):
+            raise ValueError(
+                f"frame interval {timestamp - previous_timestamp:.6g}ms is below "
+                f"minimum {float(minimum_interval_ms):.6g}ms"
+            )
+        previous_timestamp = timestamp
+
+        positions_value = frame.get("positions")
+        if not isinstance(positions_value, list):
+            raise ValueError(f"frame {frame_index} positions must be an array")
+        if len(positions_value) != joint_count:
+            raise ValueError(
+                f"frame {frame_index} positions must contain exactly "
+                f"{joint_count} joints"
+            )
+        if any(
+            isinstance(value, bool) or not isinstance(value, (int, float))
+            for value in positions_value
+        ):
+            raise ValueError(
+                f"frame {frame_index} positions must contain only numbers"
+            )
+        try:
+            positions = [float(value) for value in positions_value]
+        except OverflowError:
+            raise ValueError(
+                f"frame {frame_index} positions must be finite"
+            ) from None
+        if not all(math.isfinite(value) for value in positions):
+            raise ValueError(f"frame {frame_index} positions must be finite")
+        limit_violations = []
+        for joint_index, position in enumerate(positions):
+            lower, upper = T800_JOINT_POSITION_LIMITS[joint_index]
+            if position < lower or position > upper:
+                joint_name = T800_JOINT_NAMES[joint_index]
+                limit_violations.append(
+                    f"{joint_name}={position:.6g} outside "
+                    f"[{lower:.6g}, {upper:.6g}]"
+                )
+        if limit_violations:
+            raise ValueError(
+                f"frame {frame_index} exceeds safe position limit: "
+                + "; ".join(limit_violations)
+            )
+
+        normalized_frame = {
+            "timestamp": timestamp,
+            "positions": positions,
+        }
+        velocities_value = frame.get("velocities")
+        if velocities_value is not None:
+            if not isinstance(velocities_value, list) or len(velocities_value) != joint_count:
+                raise ValueError(
+                    f"frame {frame_index} velocities must contain exactly "
+                    f"{joint_count} joints"
+                )
+            if any(
+                isinstance(value, bool) or not isinstance(value, (int, float))
+                for value in velocities_value
+            ):
+                raise ValueError(
+                    f"frame {frame_index} velocities must contain only numbers"
+                )
+            try:
+                velocities = [float(value) for value in velocities_value]
+            except OverflowError:
+                raise ValueError(
+                    f"frame {frame_index} velocities must be finite"
+                ) from None
+            if not all(math.isfinite(value) for value in velocities):
+                raise ValueError(f"frame {frame_index} velocities must be finite")
+            normalized_frame["velocities"] = velocities
+        normalized.append(normalized_frame)
+    if normalized and max_duration_ms is not None:
+        duration_ms = normalized[-1]["timestamp"] - normalized[0]["timestamp"]
+        if duration_ms > float(max_duration_ms):
+            raise ValueError(
+                f"recording duration {duration_ms:.6g}ms exceeds maximum "
+                f"{float(max_duration_ms):.6g}ms"
+            )
+    return normalized
+
+
+def validate_recording_document(
+    data: object,
+    *,
+    max_frames: int,
+    minimum_frames: int,
+    max_duration_ms: float,
+    minimum_interval_ms: float | None = None,
+) -> tuple[list[dict], dict]:
+    if not isinstance(data, dict):
+        raise ValueError("recording root must be an object")
+    metadata = data.get("metadata", {})
+    if not isinstance(metadata, dict):
+        raise ValueError("recording metadata must be an object")
+    frames = validate_recording_frames(
+        data.get("frames"),
+        max_frames=max_frames,
+        minimum_frames=minimum_frames,
+        max_duration_ms=max_duration_ms,
+        minimum_interval_ms=minimum_interval_ms,
+    )
+    return frames, dict(metadata)
+
+
 def resample_joint_trajectory(
     frames: list[dict],
     *,
@@ -258,8 +590,18 @@ def resample_joint_trajectory(
     playback_rate_hz: float,
     speed_scale: float,
     entry_blend_sec: float,
+    max_samples: int | None = None,
 ) -> list[tuple[list[float], list[float]]]:
     """Build a bounded C1 trajectory with a quintic entry blend."""
+    playback_rate_hz = float(playback_rate_hz)
+    speed_scale = float(speed_scale)
+    entry_blend_sec = float(entry_blend_sec)
+    if not math.isfinite(playback_rate_hz) or playback_rate_hz <= 0:
+        raise ValueError("playback_rate_hz must be positive and finite")
+    if not math.isfinite(speed_scale) or speed_scale <= 0:
+        raise ValueError("speed_scale must be positive and finite")
+    if not math.isfinite(entry_blend_sec) or entry_blend_sec <= 0:
+        raise ValueError("entry_blend_sec must be positive and finite")
     indices = validate_joint_indices(joint_indices)
     timestamps = np.asarray([float(frame["timestamp"]) for frame in frames], dtype=float)
     if timestamps.ndim != 1 or len(timestamps) < 2:
@@ -284,6 +626,13 @@ def resample_joint_trajectory(
 
     duration = float(timestamps[-1])
     sample_count = max(2, int(math.ceil(duration * playback_rate_hz)) + 1)
+    blend_count = max(2, int(math.ceil(entry_blend_sec * playback_rate_hz)) + 1)
+    total_sample_count = sample_count + blend_count - 1
+    if max_samples is not None and total_sample_count > int(max_samples):
+        raise ValueError(
+            f"playback sample count {total_sample_count} exceeds maximum "
+            f"{int(max_samples)}"
+        )
     sample_times = np.linspace(0.0, duration, sample_count)
     tangents = np.gradient(positions, timestamps, axis=0)
     segments = np.searchsorted(timestamps, sample_times, side="right") - 1
@@ -310,7 +659,6 @@ def resample_joint_trajectory(
     )
     sampled_velocities = np.gradient(sampled_positions, sample_times, axis=0)
 
-    blend_count = max(2, int(math.ceil(entry_blend_sec * playback_rate_hz)) + 1)
     blend_times = np.linspace(0.0, entry_blend_sec, blend_count)
     delta = sampled_positions[0] - current
     initial_velocity = np.zeros_like(current)
@@ -337,6 +685,41 @@ def resample_joint_trajectory(
     blend_velocities = np.gradient(blend_positions, blend_times, axis=0)
     sampled_positions = np.vstack((blend_positions, sampled_positions[1:]))
     sampled_velocities = np.vstack((blend_velocities, sampled_velocities[1:]))
+    velocity_limits = np.asarray(
+        [T800_JOINT_VELOCITY_LIMITS[index] for index in indices],
+        dtype=float,
+    )
+    feedforward_peak = np.max(np.abs(sampled_velocities), axis=0)
+    combined_times = np.concatenate(
+        (blend_times, entry_blend_sec + sample_times[1:])
+    )
+    target_intervals = np.diff(combined_times)
+    if np.any(target_intervals <= 0):
+        raise ValueError("playback target intervals must be strictly positive")
+    target_step_peak = np.max(
+        np.abs(np.diff(sampled_positions, axis=0))
+        / target_intervals[:, None],
+        axis=0,
+    )
+    violations = []
+    for index, feedforward, target_step, limit in zip(
+        indices, feedforward_peak, target_step_peak, velocity_limits
+    ):
+        if target_step > limit + 1e-6:
+            violations.append(
+                f"target-step velocity {T800_JOINT_NAMES[index]}="
+                f"{target_step:.6g}rad/s exceeds {limit:.6g}rad/s"
+            )
+        elif feedforward > limit + 1e-6:
+            violations.append(
+                f"feedforward velocity {T800_JOINT_NAMES[index]}="
+                f"{feedforward:.6g}rad/s exceeds {limit:.6g}rad/s"
+            )
+    if violations:
+        raise ValueError(
+            "derived joint velocity exceeds URDF safety limit: "
+            + "; ".join(violations)
+        )
     return [
         (sampled_positions[index].tolist(), sampled_velocities[index].tolist())
         for index in range(len(sampled_positions))

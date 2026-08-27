@@ -358,6 +358,8 @@ class VendoredContractTests(unittest.TestCase):
         self.assertIn(f":{config_port}/mcp", metadata_text)
         self.assertIn('hardware_model: "t800"', metadata_text)
         self.assertNotIn("t800-dev", metadata_text)
+        for capability in ("speaker", "loco", "gait", "motion_recorder"):
+            self.assertIn(capability, metadata_text)
         deploy_text = (ROOT / "deploy" / "service.yml").read_text()
         self.assertNotIn("RMW_IMPLEMENTATION=rmw_cyclonedds_cpp", deploy_text)
 
