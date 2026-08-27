@@ -4055,8 +4055,14 @@ class ArmSwingPlugin:
 
     def _notify_completion(self, action_id: str, status: str, result: dict) -> None:
         threading.Thread(
-            target=self._acp_notify,
-            args=(action_id, status, result),
+            target=_notify_acp_completion,
+            args=(
+                "arm_swing",
+                action_id,
+                status,
+                result,
+                self._ACP_CALLBACK_TIMEOUT_SEC,
+            ),
             daemon=True,
             name="t800-arm-swing-acp",
         ).start()
@@ -4088,49 +4094,6 @@ class ArmSwingPlugin:
             raise ValueError("amplitude_deg must be between 2 and 30")
         if not math.isfinite(frequency) or not 0.2 <= frequency <= 1.2:
             raise ValueError("frequency_hz must be between 0.2 and 1.2")
-
-    @staticmethod
-    def _acp_notify(action_id: str, status: str, result: dict) -> None:
-        """Report asynchronous arm-swing completion to Agent Core."""
-        import json as _json
-        import os as _os
-        import ssl as _ssl
-        import urllib.parse as _urlparse
-        import urllib.request as _urllib
-
-        agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
-        ca_cert = _os.environ.get("AGENT_CORE_CA_CERT")
-        try:
-            parsed_url = _urlparse.urlparse(agent_core_url)
-            if parsed_url.scheme not in ("http", "https"):
-                raise ValueError("AGENT_CORE_URL must use http or https")
-            if (
-                parsed_url.scheme == "http"
-                and parsed_url.hostname not in ("localhost", "127.0.0.1", "::1")
-            ):
-                raise ValueError("unencrypted AGENT_CORE_URL is only allowed on loopback")
-            context = _ssl.create_default_context(cafile=ca_cert or None)
-            payload = _json.dumps({
-                "action_id": action_id,
-                "status": status,
-                "result": result,
-                "tool": "arm_swing",
-                "ts": time.time(),
-            }).encode()
-            request = _urllib.Request(
-                f"{agent_core_url}/api/acp/complete",
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            _urllib.urlopen(
-                request,
-                timeout=ArmSwingPlugin._ACP_CALLBACK_TIMEOUT_SEC,
-                context=context,
-            )
-        except Exception as exc:
-            print(f"[arm_swing] ACP callback failed for {action_id}: {exc}", flush=True)
-
 
 class JointBridgePlugin(_JointStreamBase):
     def __init__(self, config: dict, namespace: str, ros2, state: StatePlugin):

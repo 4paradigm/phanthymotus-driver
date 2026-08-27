@@ -1172,6 +1172,31 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual(plan._request_type.REQUEST_CANCEL, plan._publisher.messages[-1].request_type)
         self.assertEqual([], completions)
 
+    def test_arm_swing_completion_reuses_shared_acp_notifier(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        swing = self.device.ArmSwingPlugin(CONFIG, plan, self.state)
+        calls = []
+        notified = threading.Event()
+
+        def notify(*args):
+            calls.append(args)
+            notified.set()
+
+        self.device._notify_acp_completion = notify
+        swing._notify_completion("t800_arm_swing_test", "completed", {"action": "return_neutral"})
+
+        self.assertTrue(notified.wait(1.0))
+        self.assertEqual(
+            (
+                "arm_swing",
+                "t800_arm_swing_test",
+                "completed",
+                {"action": "return_neutral"},
+                swing._ACP_CALLBACK_TIMEOUT_SEC,
+            ),
+            calls[0],
+        )
+
     def test_arm_swing_gates_state_and_parameters(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
         plan.start()
