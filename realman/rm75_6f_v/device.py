@@ -499,30 +499,33 @@ class RM75MotionPlugin:
         return None
 
 
-class RM75JointPlugin:
+class RM75JointControlPlugin:
     ACTIONS = {
-        "set": (["target", "speed", "block", "wait_result", "timeout"], "把当前关节移动到指定弧度位置"),
-        "nudge": (["delta", "speed", "block", "wait_result", "timeout"], "在当前关节角基础上小幅增减，单位 rad"),
+        "set": (["joint", "target", "speed", "block", "wait_result", "timeout"], "选择 joint1..joint7，并移动到指定弧度位置"),
+        "nudge": (["joint", "delta", "speed", "block", "wait_result", "timeout"], "选择 joint1..joint7，并在当前角度基础上小幅增减，单位 rad"),
         "stopmotion": (["block"], "立即停止机械臂运动"),
     }
 
-    def __init__(self, nodes, joint_index):
+    def __init__(self, nodes):
         self.nodes = nodes
-        self.joint_index = int(joint_index)
-        self.name = f"joint{self.joint_index}"
 
     def get_tool(self):
-        return tool(self.name, "actuator", f"RM75-6F-V {self.name} 单关节控制卡片", action_schema(self.ACTIONS, {
+        return tool("joint_control", "actuator", "RM75-6F-V 单关节控制卡片：选择 joint1..joint7 后执行 set/nudge", action_schema(self.ACTIONS, {
+            "joint": {
+                "type": "string",
+                "enum": [f"joint{idx}" for idx in range(1, self.nodes.dof + 1)],
+                "description": "要控制的关节",
+            },
             "target": {
                 "type": "number",
-                "description": f"{self.name} 目标角度，单位 rad；其他关节保持当前 /joint_states 位置",
+                "description": "目标关节角，单位 rad；其他关节保持当前 /joint_states 位置",
             },
             "delta": {
                 "type": "number",
                 "minimum": -0.2,
                 "maximum": 0.2,
                 "default": 0.02,
-                "description": f"{self.name} 相对移动量，单位 rad；建议首次测试使用 +/-0.02",
+                "description": "相对移动量，单位 rad；建议首次测试使用 +/-0.02",
             },
             "speed": {"type": "integer", "minimum": 1, "maximum": 30, "default": 5, "description": "单关节测试速度百分比，默认 5，最高限制 30"},
             "block": {"type": "boolean", "default": False, "description": "是否使用 rm_driver 阻塞模式"},
@@ -542,10 +545,10 @@ class RM75JointPlugin:
         if action == "stop":
             return {"state": "idle"}
         if action == "info":
-            return {"state": "ready", "joint": self.name}
+            return {"state": "ready", "joints": [f"joint{idx}" for idx in range(1, self.nodes.dof + 1)]}
         if action == "set":
             return self.nodes.move_single_joint(
-                self.joint_index,
+                self._joint_index(args),
                 mode="absolute",
                 value=args["target"],
                 speed=args.get("speed", 5),
@@ -555,7 +558,7 @@ class RM75JointPlugin:
             )
         if action == "nudge":
             return self.nodes.move_single_joint(
-                self.joint_index,
+                self._joint_index(args),
                 mode="relative",
                 value=args.get("delta", 0.02),
                 speed=args.get("speed", 5),
@@ -567,11 +570,19 @@ class RM75JointPlugin:
             return self.nodes.publish_stop(block=args.get("block", False))
         return None
 
+    def _joint_index(self, args):
+        joint = str(args.get("joint", "")).strip().lower()
+        if joint.startswith("joint") and joint[5:].isdigit():
+            index = int(joint[5:])
+            if 1 <= index <= self.nodes.dof:
+                return index
+        raise ValueError(f"joint must be one of joint1..joint{self.nodes.dof}")
+
 
 def build_plugins(config, namespace, ros2):
     nodes = RM75Nodes(config, namespace, ros2)
     return [
         RM75StatePlugin(nodes),
         RM75MotionPlugin(nodes),
-        *(RM75JointPlugin(nodes, idx) for idx in range(1, nodes.dof + 1)),
+        RM75JointControlPlugin(nodes),
     ]
