@@ -208,6 +208,59 @@ class RM75Nodes:
             )
         return result
 
+    def current_joint_positions(self):
+        latest = self._latest("joint_states")
+        if latest is None:
+            raise ValueError("No /joint_states data has been received yet")
+        joints = latest.get("data", {}).get("joints", [])
+        positions = [0.0] * self.dof
+        found = set()
+        for item in joints:
+            idx = item.get("idx")
+            name = str(item.get("name", ""))
+            if isinstance(idx, int) and 0 <= idx < self.dof:
+                target_idx = idx
+            elif name.startswith("joint") and name[5:].isdigit():
+                target_idx = int(name[5:]) - 1
+            else:
+                continue
+            if 0 <= target_idx < self.dof:
+                positions[target_idx] = float(item.get("q", 0.0))
+                found.add(target_idx)
+        if len(found) < self.dof:
+            missing = [idx + 1 for idx in range(self.dof) if idx not in found]
+            raise ValueError(f"/joint_states is missing joint positions: {missing}")
+        return positions
+
+    def move_single_joint(self, joint_index, *, mode, value, speed=5, block=False, wait_result=False, timeout=None):
+        joint_index = int(joint_index)
+        if joint_index < 1 or joint_index > self.dof:
+            raise ValueError(f"joint_index must be in [1, {self.dof}]")
+        current = self.current_joint_positions()
+        before = current[joint_index - 1]
+        if mode == "absolute":
+            target = float(value)
+        elif mode == "relative":
+            target = before + float(value)
+        else:
+            raise ValueError("mode must be 'absolute' or 'relative'")
+        current[joint_index - 1] = target
+        result = self.publish_movej(
+            current,
+            speed=speed,
+            block=block,
+            trajectory_connect=0,
+            wait_result=wait_result,
+            timeout=timeout,
+        )
+        result.update({
+            "controlled_joint": f"joint{joint_index}",
+            "mode": mode,
+            "previous_position_rad": before,
+            "target_position_rad": target,
+        })
+        return result
+
     def publish_stop(self, block=False):
         baseline = self._sequence("move_stop_result")
         msg = self._Stop()
@@ -446,6 +499,79 @@ class RM75MotionPlugin:
         return None
 
 
+class RM75JointPlugin:
+    ACTIONS = {
+        "set": (["target", "speed", "block", "wait_result", "timeout"], "把当前关节移动到指定弧度位置"),
+        "nudge": (["delta", "speed", "block", "wait_result", "timeout"], "在当前关节角基础上小幅增减，单位 rad"),
+        "stopmotion": (["block"], "立即停止机械臂运动"),
+    }
+
+    def __init__(self, nodes, joint_index):
+        self.nodes = nodes
+        self.joint_index = int(joint_index)
+        self.name = f"joint{self.joint_index}"
+
+    def get_tool(self):
+        return tool(self.name, "actuator", f"RM75-6F-V {self.name} 单关节控制卡片", action_schema(self.ACTIONS, {
+            "target": {
+                "type": "number",
+                "description": f"{self.name} 目标角度，单位 rad；其他关节保持当前 /joint_states 位置",
+            },
+            "delta": {
+                "type": "number",
+                "minimum": -0.2,
+                "maximum": 0.2,
+                "default": 0.02,
+                "description": f"{self.name} 相对移动量，单位 rad；建议首次测试使用 +/-0.02",
+            },
+            "speed": {"type": "integer", "minimum": 1, "maximum": 30, "default": 5, "description": "单关节测试速度百分比，默认 5，最高限制 30"},
+            "block": {"type": "boolean", "default": False, "description": "是否使用 rm_driver 阻塞模式"},
+            "wait_result": {"type": "boolean", "default": False, "description": "是否等待 movej_result 返回"},
+            "timeout": {"type": "number", "minimum": 0.1, "maximum": 30, "default": 10, "description": "等待结果超时时间，单位秒"},
+        }))
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready", "joint": self.name}
+        if action == "set":
+            return self.nodes.move_single_joint(
+                self.joint_index,
+                mode="absolute",
+                value=args["target"],
+                speed=args.get("speed", 5),
+                block=args.get("block", False),
+                wait_result=args.get("wait_result", False),
+                timeout=args.get("timeout"),
+            )
+        if action == "nudge":
+            return self.nodes.move_single_joint(
+                self.joint_index,
+                mode="relative",
+                value=args.get("delta", 0.02),
+                speed=args.get("speed", 5),
+                block=args.get("block", False),
+                wait_result=args.get("wait_result", False),
+                timeout=args.get("timeout"),
+            )
+        if action in ("stopmotion", "stop"):
+            return self.nodes.publish_stop(block=args.get("block", False))
+        return None
+
+
 def build_plugins(config, namespace, ros2):
     nodes = RM75Nodes(config, namespace, ros2)
-    return [RM75StatePlugin(nodes), RM75MotionPlugin(nodes)]
+    return [
+        RM75StatePlugin(nodes),
+        RM75MotionPlugin(nodes),
+        *(RM75JointPlugin(nodes, idx) for idx in range(1, nodes.dof + 1)),
+    ]

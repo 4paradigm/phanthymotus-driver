@@ -51,5 +51,6 @@ Use `state`, `joint_states`, `joint_error`, and `rm_error` first. The `arm_motio
 - MCP resources: `model` returns a simplified URDF for skeleton rendering.
 - MCP sensors: `state`, `joint_states`, `arm_state`, `arm_original_state`, `arm_current_status`, `joint_error`, `rm_error`, plus optional command result streams when matching `rm_ros_interfaces` message types are available.
 - MCP actuator: `arm_motion` supports `movej`, `stopmotion`, and `clear_joint_error`.
+- MCP single-joint actuators: `joint1` through `joint7` each support `set`, `nudge`, and `stopmotion`. These cards read the latest `/joint_states`, replace only the selected joint target, and publish a full 7-DOF `movej` command.
 
 `movej` performs a conservative preflight before publishing: recent `/joint_states` required, configured joint limits checked, and active error topics rejected. Set `safety.require_*` fields in `config.yaml` only when deliberately testing around those guards.
