@@ -1335,8 +1335,8 @@ class LocoPlugin:
         }
 
     # ── FSM state groups for safety checks ──────────────────────────────────────
-    _GROUND_STATES = {0}               # zero_torque — lying on ground
-    _LOW_STATES = {1, 2, 702}          # damped squat, squat, prep — stable low stance
+    _GROUND_STATES = {0, 1}            # zero_torque, damp — ground/damped state
+    _LOW_STATES = {2, 702}             # squat, prep — stable low stance
     _STANDING_STATES = {500, 501, 801} # normal_loco, 3dof_waist, run — active balance
     _UNSAFE_STATES = {3, 706}          # sit, balance_stand — not directly switchable
 
