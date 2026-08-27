@@ -1526,12 +1526,13 @@ class LocoPlugin:
                     return {"info": "Robot is already standing", "fsm_id": current_fsm}
                 if current_fsm in self._UNSAFE_STATES:
                     return {"error": f"Robot is in unsafe state (FSM={current_fsm}). Use emergency_stop first."}
-                # From ground: damp → lie2stand(702) → auto到500
+                # From ground: damp → FSM=706 transition → Start(FSM=500)
                 if current_fsm in self._GROUND_STATES:
                     steps = []
                     if current_fsm == 0:
                         steps.append(("Damp", 1, "damp"))
-                    steps.append(("Lie2StandUp", 500, "lie2standup"))
+                    steps.append(("Lie2StandUp", 706, "lie2standup_transition"))
+                    steps.append(("Start", 500, "start"))
                     return self._async_fsm(mode, steps)
                 # From low states (squat/prep): start(500)
                 if current_fsm in self._LOW_STATES:
