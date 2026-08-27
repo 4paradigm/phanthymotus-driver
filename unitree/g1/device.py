@@ -1335,8 +1335,8 @@ class LocoPlugin:
         }
 
     # ── FSM state groups for safety checks ──────────────────────────────────────
-    _GROUND_STATES = {0, 1}            # zero_torque, damp — lying on ground
-    _LOW_STATES = {2, 702}             # squat, prep — stable low stance
+    _GROUND_STATES = {0}               # zero_torque — lying on ground
+    _LOW_STATES = {1, 2, 702}          # damped squat, squat, prep — stable low stance
     _STANDING_STATES = {500, 501, 801} # normal_loco, 3dof_waist, run — active balance
     _UNSAFE_STATES = {3, 706}          # sit, balance_stand — not directly switchable
 
@@ -1346,7 +1346,7 @@ class LocoPlugin:
             "type": "actuator",
             "multiInstance": False,
             "description": "G1 safe locomotion mode switch. "
-                           "lie2standup=安全起立(ground→主运控), standup2lie=安全躺下(standing→阻尼), "
+                           "lie2standup=安全起立(ground→主运控), "
                            "standup2squat=站到蹲(standing→下蹲), squat2standup=蹲到站(下蹲→主运控), "
                            "damp=阻尼(ground only), zero_torque=零力矩(ground only), "
                            "emergency_stop=紧急阻尼(any state), get_current_mode=查询当前状态",
@@ -1355,19 +1355,18 @@ class LocoPlugin:
                 "properties": {
                     "mode": {
                         "type": "string",
-                        "enum": ["lie2standup", "standup2lie", "standup2squat", "squat2standup",
+                        "enum": ["lie2standup", "standup2squat", "squat2standup",
                                  "damp", "zero_torque", "emergency_stop", "get_current_mode"],
                         "description": "Target mode",
                     },
                 },
                 "required": ["mode"],
                 "x-completion": {
-                    "actions": ["lie2standup", "standup2lie", "standup2squat", "squat2standup"],
+                    "actions": ["lie2standup", "standup2squat", "squat2standup"],
                     "timeout": 90,
                 },
                 "x-action-params": {
                     "lie2standup":     {"params": [], "description": "安全起立 (ground/squat → standing)"},
-                    "standup2lie":     {"params": [], "description": "安全躺下 (standing → damping on ground)"},
                     "standup2squat":   {"params": [], "description": "站到蹲 (standing → squat)"},
                     "squat2standup":   {"params": [], "description": "蹲到站 (squat → standing)"},
                     "damp":            {"params": [], "description": "阻尼模式 (ground only)"},
@@ -1491,7 +1490,7 @@ class LocoPlugin:
                     pass
             ret = self._client.StopMove()
             return {"ret": ret}
-        elif action in ("switch_mode", "lie2standup", "standup2lie", "standup2squat",
+        elif action in ("switch_mode", "lie2standup", "standup2squat",
                         "squat2standup", "damp", "zero_torque", "emergency_stop", "get_current_mode"):
             # x-action-params split: action is the mode directly
             # Legacy: action == "switch_mode" with mode in args
@@ -1509,7 +1508,7 @@ class LocoPlugin:
             elif mode == "get_current_mode":
                 FSM_DESCRIPTIONS = {
                     0: "lying down, zero torque (零力矩, no resistance)",
-                    1: "lying down, damping (阻尼, resists movement)",
+                    1: "squatting, damping (下蹲阻尼, resists movement)",
                     2: "squatting (下蹲, position hold, stable)",
                     3: "sitting (落座, needs external support, unstable)",
                     500: "standing, normal locomotion (主运控, balanced)",
@@ -1526,33 +1525,20 @@ class LocoPlugin:
                     return {"info": "Robot is already standing", "fsm_id": current_fsm}
                 if current_fsm in self._UNSAFE_STATES:
                     return {"error": f"Robot is in unsafe state (FSM={current_fsm}). Use emergency_stop first."}
-                # From ground: damp → FSM=706 transition → stable FSM=801 → Start(FSM=500)
+                # From ground: damp → Lie2StandUp(FSM=702) → stable FSM=500
                 if current_fsm in self._GROUND_STATES:
                     steps = []
                     if current_fsm == 0:
                         steps.append(("Damp", 1, "damp"))
-                    steps.append(("Lie2StandUp", 801, "lie2standup_transition"))
-                    steps.append(("Start", 500, "start"))
+                    steps.append(("Lie2StandUp", 500, "lie2standup"))
                     return self._async_fsm(mode, steps)
                 # From low states (squat/prep): start(500)
-                if current_fsm in self._LOW_STATES:
+                if current_fsm in {2, 702}:
                     steps = [("Start", 500, "start")]
                     return self._async_fsm(mode, steps)
+                if current_fsm == 1:
+                    return {"error": "Robot is in squat damping (FSM=1). Use squat2standup instead."}
                 return {"error": f"Cannot stand up from FSM={current_fsm}"}
-
-            elif mode == "standup2lie":
-                if current_fsm in self._GROUND_STATES:
-                    return {"info": "Robot is already on the ground", "fsm_id": current_fsm}
-                if current_fsm in self._STANDING_STATES:
-                    # Stop movement first, wait for stabilization
-                    self._client.StopMove()
-                    import time as _time; _time.sleep(1.0)
-                    steps = [("StandUp2Squat", 1, "standup2lie")]
-                    return self._async_fsm(mode, steps)
-                if current_fsm in self._LOW_STATES:
-                    steps = [("Damp", 1, "damp")]
-                    return self._async_fsm(mode, steps)
-                return {"error": f"Cannot lie down from FSM={current_fsm}. Use emergency_stop if needed."}
 
             elif mode == "standup2squat":
                 if current_fsm in self._GROUND_STATES or current_fsm in self._LOW_STATES:
@@ -1577,7 +1563,7 @@ class LocoPlugin:
             elif mode in ("damp", "zero_torque"):
                 if current_fsm in self._STANDING_STATES or current_fsm in self._LOW_STATES:
                     return {"error": f"Cannot enter {mode} from upright/low state (FSM={current_fsm}). "
-                                     f"Robot will collapse. Use standup2lie first."}
+                                     f"Robot will collapse. Use squat2standup or lie2standup first."}
                 if current_fsm in self._UNSAFE_STATES:
                     return {"error": f"Cannot enter {mode} from unsafe state (FSM={current_fsm}). "
                                      f"Use emergency_stop first."}
@@ -1586,7 +1572,7 @@ class LocoPlugin:
                 return {"ret": ret, "mode": mode}
 
             else:
-                return {"error": f"Unknown mode: {mode}. Available: lie2standup, standup2lie, "
+                return {"error": f"Unknown mode: {mode}. Available: lie2standup, "
                                  f"standup2squat, squat2standup, damp, zero_torque, "
                                  f"emergency_stop, get_current_mode"}
         elif action == "switch_mode_expert":

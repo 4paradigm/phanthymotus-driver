@@ -82,7 +82,7 @@ class LocoClient(Client):
         return self.SetFsmId(706)
 
     def Lie2StandUp(self):
-        return self.SetFsmId(706)
+        return self.SetFsmId(702)
 
     def Sit(self):
         return self.SetFsmId(3)
