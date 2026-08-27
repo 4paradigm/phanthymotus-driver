@@ -743,6 +743,57 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("completed", status["state"])
         self.assertEqual([0.0] * 5, status["left_positions"])
 
+    def test_invalid_joint_plan_arm_input_does_not_leak_arm_lock(self):
+        """An out-of-limit arm plan must be rejected before the arm lock is acquired."""
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+
+        # J16_ELBOW_PITCH_L is an arm joint; -3.0 is far beyond the safe limit.
+        with self.assertRaisesRegex(ValueError, "safe position limit"):
+            plan.dispatch("plan", {"joint_indices": [16], "target_positions": [-3.0], "duration": 1.0})
+
+        # The lock must not be left owned by joint_plan.
+        self.assertIsNone(plan.arm_status()["owner"])
+
+        # A subsequent arm/gesture request must not be blocked.
+        self.assertIsNone(plan.acquire_arm("probe"))
+        plan.release_arm("probe")
+
+    def test_concurrent_arm_request_does_not_release_active_lock(self):
+        """A second arm request while one is running must be rejected without releasing the first lock."""
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        arm = self.device.ArmActuatorPlugin(CONFIG, plan, self.state)
+        arm._acp_notify = lambda *_args: None
+
+        # Block the first worker so it stays alive and holds the lock.
+        release_worker = threading.Event()
+
+        def blocking_wait(*_args, **_kwargs):
+            release_worker.wait(timeout=5.0)
+
+        plan.wait_until_idle = blocking_wait
+        plan.wait_for_request = blocking_wait
+
+        self.state._last_joint_positions = [0.0] * 25
+        first = arm.dispatch("raise", {"side": "right", "duration": 0.05, "force": True})
+        self.assertEqual("running", first["state"])
+        time.sleep(0.05)
+        self.assertEqual("arm", plan.arm_status()["owner"])
+
+        # Second arm request arrives while the first is still running.
+        second = arm.dispatch("raise", {"side": "left", "duration": 0.05, "force": True})
+        self.assertIn("error", second)
+        self.assertIn("already running", second["error"])
+
+        # The first action's lock must still be held.
+        self.assertEqual("arm", plan.arm_status()["owner"])
+
+        # Clean up: unblock the worker and wait for completion.
+        release_worker.set()
+        arm._thread.join(timeout=2.0)
+        self.assertIsNone(plan.arm_status()["owner"])
+
     def test_arm_shrug_uses_configured_amplitude(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
         plan.start()

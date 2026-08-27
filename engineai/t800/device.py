@@ -2461,10 +2461,8 @@ class JointPlanPlugin:
         indices = validate_joint_indices(args.get("joint_indices")) if action == "plan" else []
         controls_arm = action == "reset" or bool(set(indices) & set(T800_JOINT_GROUPS["arms"]))
         owner = owner or "joint_plan"
-        if controls_arm and action != "cancel":
-            busy = self.acquire_arm(owner)
-            if busy is not None:
-                return busy
+        # Build and validate the message BEFORE acquiring the arm lock so that a
+        # rejected plan never leaves ownership stuck with joint_plan.
         msg = self._request_type()
         if action == "cancel":
             target_request_id = int(args.get("request_id", self._request_id))
@@ -2510,7 +2508,11 @@ class JointPlanPlugin:
             msg.execution_time = 0.0
             msg.stiffness = []
             msg.damping = []
+        # Acquire ownership only after validation has succeeded.
         if controls_arm and action != "cancel":
+            busy = self.acquire_arm(owner)
+            if busy is not None:
+                return busy
             with self._arm_lock:
                 self._arm_request_id = msg.request_id
         try:
@@ -3208,12 +3210,11 @@ class ArmActuatorPlugin:
         if len(steps) > self._MAX_SEQUENCE_STEPS:
             return {"error": f"arm sequence cannot contain more than {self._MAX_SEQUENCE_STEPS} steps"}
         with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return {"error": "another arm action is already running"}
             busy = self._joint_plan.acquire_arm("arm")
             if busy is not None:
                 return busy
-            if self._thread is not None and self._thread.is_alive():
-                self._joint_plan.release_arm("arm")
-                return {"error": "another arm action is already running"}
             from uuid import uuid4
 
             action_id = f"t800_arm_{uuid4().hex[:12]}"
