@@ -8,8 +8,8 @@ variant: "pro"
 grpc_host: "10.10.20.127"
 grpc_port: 6666
 
-# DDS domain ID (must match robot's domain)
-dds_domain_id: 0
+# DDS domain ID (must match robot's domain; Adam developer-mode DDS is domain 1)
+dds_domain_id: 1
 
 plugins:
   state:
@@ -51,6 +51,17 @@ plugins:
     publish_rate_hz: 100
   hand:
     enabled: true
-    hand_type: "pnd"  # "pnd" (0-1000) or "inspire" (0-1800)
+    # Verified on Adam: all 12 hand channels move in the effective 0..1000
+    # range. Values from 1000..1800 are a dead band; 1800 equals 1000.
+    hand_type: "adam_client"
+    position_max: 1000
+    control_rate_hz: 400
+    state_timeout_sec: 1.0
+    # Close the four non-thumb fingers while rotating the thumb to 1000 and
+    # flexing it to 100 at the same time. Lower flexion values mean more closed.
+    thumb_close_positions: [100, 1000, 100, 1000]  # left flex/rotate, right flex/rotate
+    thumb_close_min_flex_position: 100
+    open_positions: [1000, 1000, 1000, 1000, 1000, 0, 1000, 1000, 1000, 1000, 1000, 0]
+    close_positions: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
   model:
     enabled: true

@@ -63,8 +63,10 @@ class Channel:
                     sample = self.__reader.take_one(timeout=duration(seconds=timeout))
             except DDSException as e:
                 print("[Reader] catch DDSException msg:", e.msg)
-            except TimeoutError as e:
-                print("[Reader] take sample timeout")
+            except TimeoutError:
+                # Polling readers commonly time out while feedback is absent;
+                # initialization status is logged by the caller instead.
+                pass
             except:
                 print("[Reader] take sample error")
 
@@ -87,8 +89,10 @@ class Channel:
             except DDSException as e:
                 print("[Reader] catch DDSException error. msg:", e.msg)
                 return
-            except TimeoutError as e:
-                print("[Reader] take sample timeout")
+            except TimeoutError:
+                # A callback can race with sample consumption; a timeout is
+                # not actionable and should not add noise to the container log.
+                pass
                 return
             except:
                 print("[Reader] take sample error")
@@ -149,6 +153,9 @@ class Channel:
                 return False
 
             return True
+
+        def IsMatched(self):
+            return self.__publication_matched_count > 0
         
         def Close(self):
             if self.__writer is not None:
@@ -182,6 +189,9 @@ class Channel:
 
     def CloseWriter(self):
         self.__writer.Close()
+
+    def IsWriterMatched(self):
+        return self.__writer.IsMatched()
 
 
 """
@@ -269,6 +279,11 @@ class ChannelPublisher:
 
     def Write(self, sample: Any, timeout: float = None):
         return self.__channel.Write(sample, timeout)
+
+    def IsMatched(self):
+        if not self.__inited:
+            return False
+        return self.__channel.IsWriterMatched()
 
 """
 " class ChannelSubscriber
