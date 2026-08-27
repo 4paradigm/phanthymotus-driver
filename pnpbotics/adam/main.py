@@ -209,17 +209,14 @@ def main():
         print(f"[adam] WARNING: DDS init unavailable, DDS features disabled: {exc}")
 
     # Pre-create DDS channels before rclpy.init() to avoid CycloneDDS/FastDDS
-    # participant conflicts. One shared rt/handstate reader feeds both the
-    # hand-state sensor card and the hand actuator's partial-command logic.
+    # participant conflicts. One shared rt/handstate reader feeds the hand
+    # card's get_state action and its partial-command logic.
     dds_lowstate_sub = None
     dds_handstate_sub = None
     dds_hand_pub = None
     plugins_cfg = cfg.get("plugins", {})
     need_lowstate = plugins_cfg.get("state", {}).get("enabled", True)
-    need_handstate = (
-        plugins_cfg.get("hand_state", {}).get("enabled", True)
-        or plugins_cfg.get("hand", {}).get("enabled", True)
-    )
+    need_handstate = plugins_cfg.get("hand", {}).get("enabled", True)
     need_hand_pub = plugins_cfg.get("hand", {}).get("enabled", True)
     try:
         from pndbotics_sdk_py.core.channel import ChannelSubscriber, ChannelPublisher

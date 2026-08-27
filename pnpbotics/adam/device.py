@@ -2,10 +2,9 @@
 
 Plugins:
   StatePlugin  — DDS rt/lowstate → ROS2 skeleton/IMU/battery
-  HandStatePlugin — DDS rt/handstate → ROS2 hand feedback JSON
   LocoPlugin   — gRPC locomotion control
   ArmPlugin    — ROS2 JointState upper body control
-  HandPlugin   — DDS rt/handcmd finger control
+  HandPlugin   — DDS rt/handcmd finger control and hand-state query
   ModelPlugin  — URDF resource for 3D visualization
 """
 
@@ -56,7 +55,6 @@ try:
         LowState_,
         LowCmd_,
         HandCmd_,
-        HandState_,
     )
     from pndbotics_sdk_py.idl.default import (
         pnd_adam_msg_dds__HandCmd_,
@@ -192,7 +190,7 @@ def _normalize_hand_state_positions(position) -> list[int]:
 
 
 def _hand_state_payload(position, received_at_ms: int, *, fresh: bool) -> dict:
-    """Convert HandState_ into the JSON payload published by hand_state."""
+    """Convert HandState_ into the payload returned by hand.get_state."""
     positions = _normalize_hand_state_positions(position)
 
     def side(values):
@@ -505,45 +503,6 @@ class _StatePublisherNode(Node):
         self._pub_battery.publish(msg_bat)
 
 
-class _HandStatePublisherNode(Node):
-    """ROS2 JSON publisher backed by the shared hand-state cache."""
-
-    def __init__(self, namespace: str, publish_rate_hz: float,
-                 stale_timeout_sec: float, state_cache: HandStateCache):
-        super().__init__("adam_hand_state_publisher")
-        self._topic = f"/{namespace}/state/hand"
-        self._stale_timeout_sec = stale_timeout_sec
-        self._state_cache = state_cache
-        self._active = False
-        qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1,
-        )
-        self._pub = self.create_publisher(String, self._topic, qos)
-        self._lock = threading.Lock()
-        self._timer = self.create_timer(1.0 / publish_rate_hz, self._publish)
-
-    def set_active(self, active: bool):
-        with self._lock:
-            self._active = bool(active)
-
-    def snapshot(self) -> dict | None:
-        return self._state_cache.snapshot(self._stale_timeout_sec)
-
-    def _publish(self):
-        with self._lock:
-            active = self._active
-        if not active:
-            return
-        payload = self.snapshot()
-        if payload is None:
-            return
-        msg = String()
-        msg.data = json.dumps(payload, ensure_ascii=False)
-        self._pub.publish(msg)
-
-
 class StatePlugin:
     """Subscribes DDS rt/lowstate and publishes body state to ROS2."""
 
@@ -660,138 +619,6 @@ class StatePlugin:
                         "topic_out": [{"topic": self._node._topic_battery, "format": "data/json"}]}
             return {"state": "running" if self._running else "idle",
                     "topic_out": [{"topic": self._node._topic_skeleton, "format": "sensor/skeleton"}]}
-        return None
-
-
-# ===========================================================================
-# HandStatePlugin — DDS rt/handstate → ROS2 JSON sensor card
-# ===========================================================================
-
-class HandStatePlugin:
-    """Publishes the actual 12-channel hand feedback as the ``hand_state`` card."""
-
-    PREFIX = "hand_state"
-
-    def __init__(self, plugin_config: dict, namespace: str, executor,
-                 dds_handstate_sub=None, state_cache=None,
-                 ros2_enabled: bool | None = None, **kwargs):
-        rate = float(plugin_config.get("publish_rate_hz", 10))
-        if rate <= 0:
-            rate = 10.0
-        try:
-            stale_timeout_sec = float(plugin_config.get("stale_timeout_sec", 1.0))
-        except (TypeError, ValueError):
-            stale_timeout_sec = 1.0
-        if not math.isfinite(stale_timeout_sec) or stale_timeout_sec <= 0:
-            stale_timeout_sec = 1.0
-        self._topic = f"/{namespace}/state/hand"
-        self._stale_timeout_sec = stale_timeout_sec
-        self._state_cache = state_cache or HandStateCache(dds_handstate_sub)
-        self._owns_state_cache = state_cache is None
-        self._ros2_available = bool(
-            HAS_ROS2
-            and executor is not None
-            and (ros2_enabled is None or ros2_enabled)
-        )
-        self._executor = executor
-        self._running = False
-        self._node = None
-        if self._ros2_available:
-            self._node = _HandStatePublisherNode(
-                namespace, rate, stale_timeout_sec, self._state_cache,
-            )
-            executor.add_node(self._node)
-
-    def get_tool(self) -> dict:
-        return {
-            "name": "hand_state",
-            "type": "sensor",
-            "description": (
-                "Adam dexterous hand feedback from DDS rt/handstate. "
-                "Each hand has 5 fingers and 6 motor channels (the thumb has "
-                "flexion and rotation). Returns 12 normalized positions in "
-                "the effective hardware range 0-1000: left[0:6] and "
-                "right[0:6], in the order pinky, ring, middle, index, "
-                "thumb_flex, thumb_rotate. Values above 1000 are reported "
-                "as 1000 because the 1000-1800 interval is a dead band."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {},
-            },
-            "topic_out": [{"topic": self._topic, "format": "data/json"}],
-        }
-
-    def _status(self, state: str | None = None) -> dict:
-        cache_status = self._state_cache.status(self._stale_timeout_sec)
-        if state is None:
-            if not self._ros2_available or not cache_status["reader_available"]:
-                state = "unavailable"
-            else:
-                state = "running" if self._running else "idle"
-        result = {
-            "state": state,
-            "ros2_available": self._ros2_available,
-            "reader_available": cache_status["reader_available"],
-            "fresh": cache_status["fresh"],
-            "last_sample_age_ms": cache_status["last_sample_age_ms"],
-            "position_max": HAND_POSITION_MAX,
-            "topic_out": [{"topic": self._topic, "format": "data/json"}],
-        }
-        if cache_status.get("last_read_error"):
-            result["last_read_error"] = cache_status["last_read_error"]
-        if not self._ros2_available:
-            result["error"] = "ROS2_UNAVAILABLE"
-        elif not cache_status["reader_available"]:
-            result["error"] = "DDS_UNAVAILABLE"
-        return result
-
-    def start(self):
-        self._running = True
-        reader_started = self._state_cache.start()
-        if self._node is not None:
-            self._node.set_active(True)
-        result = self._status()
-        if not reader_started and result.get("reader_available"):
-            result["state"] = "stopping"
-            result["error"] = "HAND_STATE_READER_STOPPING"
-        return result
-
-    def stop(self):
-        self._running = False
-        if self._node is not None:
-            self._node.set_active(False)
-        return self._status("idle")
-
-    def close(self):
-        self.stop()
-        _destroy_ros_node(self._executor, self._node)
-        if self._owns_state_cache:
-            self._state_cache.close()
-
-    def dispatch(self, action: str, args: dict) -> dict:
-        if action in ("read", "get", "get_state", "hand_state"):
-            payload = self._state_cache.snapshot(self._stale_timeout_sec)
-            if payload is not None:
-                return payload
-            cache_status = self._state_cache.status(self._stale_timeout_sec)
-            return {
-                "state": "unavailable" if not cache_status["reader_available"] else "waiting",
-                "fresh": False,
-                "reader_available": cache_status["reader_available"],
-                "source_topic": "rt/handstate",
-                "message": (
-                    "DDS hand state reader is unavailable"
-                    if not cache_status["reader_available"]
-                    else "No fresh hand state received yet"
-                ),
-            }
-        if action == "start":
-            return self.start()
-        if action == "stop":
-            return self.stop()
-        if action == "info":
-            return self._status()
         return None
 
 
@@ -1209,6 +1036,7 @@ class HandPlugin:
                         "type": "string",
                         "enum": [
                             "open", "close", "set_fingers", "start", "stop", "info",
+                            "get_state",
                         ],
                     },
                     "side": {
@@ -1236,7 +1064,7 @@ class HandPlugin:
                         "title": "目标值",
                         "minimum": 0,
                         "maximum": self._max_val,
-                        "description": f"该通道的目标位置值，范围 0-{self._max_val}",
+                        "description": "该通道的目标位置值，0为合上，1000为张开。",
                     },
                 },
                 "required": ["action"],
@@ -1261,8 +1089,29 @@ class HandPlugin:
                     "start": {"params": [], "description": "Enable the hand control worker"},
                     "stop": {"params": [], "description": "Stop sending new hand targets"},
                     "info": {"params": [], "description": "Return hand card status and configuration"},
+                    "get_state": {
+                        "params": [],
+                        "description": "获取左右手全部通道的当前 position",
+                    },
                 },
             },
+        }
+
+    def _get_state(self) -> dict:
+        payload = self._state_cache.snapshot(self._state_timeout_sec)
+        if payload is not None:
+            return payload
+        cache_status = self._state_cache.status(self._state_timeout_sec)
+        return {
+            "state": "unavailable" if not cache_status["reader_available"] else "waiting",
+            "fresh": False,
+            "reader_available": cache_status["reader_available"],
+            "source_topic": "rt/handstate",
+            "message": (
+                "DDS hand state reader is unavailable"
+                if not cache_status["reader_available"]
+                else "No hand state received yet"
+            ),
         }
 
     def _publisher_available(self) -> bool:
@@ -1478,6 +1327,8 @@ class HandPlugin:
             return self.start()
         if action == "stop":
             return self.stop()
+        if action == "get_state":
+            return self._get_state()
         if action == "open":
             return self._activate(self._open_positions, "open")
         if action == "close":
@@ -2494,11 +2345,10 @@ class AdamDeviceBundle:
             and executor is not None
             and (ros2_enabled is None or ros2_enabled)
         )
-        hand_state_enabled = plugins_cfg.get("hand_state", {}).get("enabled", True)
         hand_enabled = plugins_cfg.get("hand", {}).get("enabled", True)
         self._hand_state_cache = (
             HandStateCache(dds_handstate_sub)
-            if hand_state_enabled or hand_enabled else None
+            if hand_enabled else None
         )
 
         # StatePlugin
@@ -2507,17 +2357,6 @@ class AdamDeviceBundle:
                 plugins_cfg.get("state", {}), namespace, executor,
                 variant=variant,
                 dds_lowstate_sub=dds_lowstate_sub,
-            )
-            self._plugins.append(p)
-
-        # Hand state is a dedicated sensor card.  Keep it separate from the
-        # body state card so Agent Core can wire/read hand feedback directly.
-        if hand_state_enabled:
-            p = HandStatePlugin(
-                plugins_cfg.get("hand_state", {}), namespace, executor,
-                dds_handstate_sub=dds_handstate_sub,
-                state_cache=self._hand_state_cache,
-                ros2_enabled=self._ros2_enabled,
             )
             self._plugins.append(p)
 
