@@ -2024,21 +2024,26 @@ class LocomotionPlugin:
                         "type": "number",
                         "minimum": -self._limits[0],
                         "maximum": self._limits[0],
+                        "default": 0.0,
                         "description": "前向速度 m/s",
                     },
                     "vy": {
                         "type": "number",
                         "minimum": -self._limits[1],
                         "maximum": self._limits[1],
+                        "default": 0.0,
                         "description": "侧向速度 m/s",
                     },
                     "vyaw": {
                         "type": "number",
                         "minimum": -self._limits[2],
                         "maximum": self._limits[2],
+                        "default": 0.0,
                         "description": "偏航角速度 rad/s",
                     },
                     "duration": {
+                        "type": "number",
+                        "default": 1.0,
                         "anyOf": [
                             {"type": "number", "const": -1},
                             {

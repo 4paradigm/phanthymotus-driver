@@ -68,6 +68,8 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 所有速度、角速度、复合动作速度和 duration 都必须是有限值并落在配置安全
 范围内；越界输入返回 `INVALID_ARGUMENT` / `SAFETY_LIMIT` 并立即归零旧速度流，
 不会静默截断后继续执行。
+卡片 UI 对未填写的 move 可选字段可能发送 `null`；Driver 将其等同于省略，
+使用 `vy=0`、`vyaw=0`、`duration=1s` 默认值，布尔值和字符串仍严格拒绝。
 
 `gesture.play` 与旧的 `joint_plan.preset` 不同：前者执行官方示例里的完整多步
 动作（挥手包含准备、举手、5 次摆动和复位；握手包含伸手、收手和复位），
