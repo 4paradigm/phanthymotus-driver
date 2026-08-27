@@ -1291,6 +1291,21 @@ class DevicePluginContractTests(unittest.TestCase):
         })
         self.assertIn("safe position limit", result["error"])
 
+    def test_gesture_stop_with_reset_when_inactive_does_not_leak_arm_lock(self):
+        """stop_gesture(reset_after=True) with no active gesture must not acquire the arm lock."""
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        gesture = self.device.GesturePlugin(plan)
+
+        # No gesture is running; reset_after must be a no-op rather than dispatching
+        # an owned reset that would leave _arm_owner == "gesture" permanently.
+        gesture.dispatch("stop_gesture", {"reset_after": True})
+
+        self.assertIsNone(plan.arm_status()["owner"])
+        # A subsequent arm request must not be blocked.
+        self.assertIsNone(plan.acquire_arm("probe"))
+        plan.release_arm("probe")
+
     def test_joint_plan_waits_for_exact_executing_then_idle_request(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
         plan.start()

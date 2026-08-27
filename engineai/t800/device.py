@@ -2946,7 +2946,10 @@ class GesturePlugin:
             result = dict(self._status)
         if request_id is not None:
             self._joint_plan._dispatch_owned("gesture", "cancel", {"request_id": request_id})
-        if reset_after:
+        # Only dispatch the owned reset when a gesture was active; otherwise there
+        # is no worker finally-block to release the gesture-owned arm lock, and
+        # _on_state() only auto-releases joint_plan ownership.
+        if reset_after and active:
             self._joint_plan._dispatch_owned("gesture", "reset", {})
         return result
 
