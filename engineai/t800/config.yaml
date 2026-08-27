@@ -78,6 +78,8 @@ plugins:
     enabled: true
   gesture:
     enabled: true
+  upper_body_actions:
+    enabled: true
   joint_override:
     enabled: true
   joint_bridge:

@@ -238,13 +238,15 @@ class DevicePluginContractTests(unittest.TestCase):
 
         motion_mode = self.device.MotionModePlugin(CONFIG, "robot", self.ros, self.state)
         joint_plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros)
+        gesture = self.device.GesturePlugin(joint_plan)
         plugins = [
             self.state,
             self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state),
             motion_mode,
             self.device.DancePlugin(motion_mode, self.state),
             joint_plan,
-            self.device.GesturePlugin(joint_plan),
+            gesture,
+            self.device.UpperBodyActionsPlugin(gesture),
             self.device.JointOverridePlugin(CONFIG, "robot", self.ros, self.state),
             self.device.JointBridgePlugin(CONFIG, "robot", self.ros, self.state),
             self.device.LedPlugin(CONFIG, "robot", self.ros),
@@ -273,14 +275,14 @@ class DevicePluginContractTests(unittest.TestCase):
              "robot_snapshot", "fault_summary", "stability", "joint_groups", "capabilities", "ros_graph",
              "mainboard", "heartbeat_status", "motion_command_trace", "motion_events",
              "native_interface_probe",
-             "loco", "motion_mode", "dance", "joint_plan", "joint_plan_state", "gesture",
+             "loco", "motion_mode", "dance", "joint_plan", "joint_plan_state", "gesture", "upper_body_actions",
              "joint_override", "joint_bridge",
              "led", "tts", "mic", "pointcloud", "camera", "depth",
              "motor_power", "native_node_control", "virtual_gamepad", "safety", "native_sdk"},
             names,
         )
-        self.assertEqual(41, len(names))
-        self.assertEqual(41, len(definitions), "tool names must be unique")
+        self.assertEqual(42, len(names))
+        self.assertEqual(42, len(definitions), "tool names must be unique")
         for tool in definitions:
             schema = tool.get("inputSchema")
             self.assertEqual("object", schema.get("type"), tool["name"])
@@ -696,6 +698,45 @@ class DevicePluginContractTests(unittest.TestCase):
         gesture._thread.join(timeout=1.0)
         self.assertEqual("completed", gesture.dispatch("status", {})["state"])
         self.assertEqual([23, 24], plan._publisher.messages[-1].joint_indices)
+
+    def test_upper_body_actions_use_validated_arm_only_sequences(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        plan.wait_until_idle = lambda *_args, **_kwargs: {}
+        plan.wait_for_request = lambda *_args, **_kwargs: {}
+        gesture = self.device.GesturePlugin(plan)
+        gesture._acp_notify = lambda *_args, **_kwargs: None
+        plugin = self.device.UpperBodyActionsPlugin(gesture)
+        self.state._current_motion = "lower_body_balance"
+
+        result = plugin.dispatch("play", {"name": "point_forward", "side": "right"})
+        self.assertEqual("running", result["state"])
+        self.assertTrue(result["action_id"].startswith("t800_upper_body_"))
+        gesture._thread.join(timeout=1.0)
+        self.assertEqual([13, 14, 15, 16, 17, 18, 19, 20, 21, 22], plan._publisher.messages[0].joint_indices)
+        self.assertEqual(plugin._NEUTRAL, plan._publisher.messages[-1].target_positions)
+
+    def test_upper_body_actions_gate_state_and_label_unvalidated_presets(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        gesture = self.device.GesturePlugin(plan)
+        plugin = self.device.UpperBodyActionsPlugin(gesture)
+        schema = plugin.get_tool()["inputSchema"]
+        self.assertEqual(["play", "return_neutral"], schema["x-completion"]["actions"])
+        self.assertEqual({"action": "halt"}, schema["x-hooks"]["on_interrupt_motion"])
+        self.assertEqual({"action": "halt"}, schema["x-hooks"]["on_interrupt_all"])
+        listed = plugin.dispatch("list", {})
+        self.assertEqual(
+            {"point_forward", "guard", "arm_raise"},
+            {item["name"] for item in listed["actions"]},
+        )
+        self.assertTrue(all(not item["hardware_validated"] for item in listed["actions"]))
+        self.assertEqual(
+            [-0.75, 0.18, -0.10, -1.35, 0.0, -0.75, -0.18, 0.10, -1.35, 0.0],
+            plugin._POSES["guard"],
+        )
+        self.assertNotIn("chest_open", plugin._POSES)
+        self.assertNotIn("side_reach", plugin._POSES)
+        self.assertIn("lower_body_balance", plugin.dispatch("play", {"name": "guard"})["error"])
 
     def test_gesture_declares_async_completion_and_lifecycle_actions(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
