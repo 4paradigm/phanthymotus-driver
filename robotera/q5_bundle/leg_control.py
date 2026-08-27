@@ -20,6 +20,7 @@ import ssl
 import threading
 import time
 import urllib.request
+import uuid
 
 from body_command import get_router
 from control_contract import q5_active_status, q5_is_control_ready
@@ -143,7 +144,7 @@ class Plugin:
         response = self._wait_future(future, 15.0)
         if response is None or not response.success:
             return _failure("ACTIVATE_FAILED", "Q5 activate_service did not confirm activation",
-                            message=getattr(response, "message", "timeout") if response else "timeout")
+                            activation_message=getattr(response, "message", "timeout") if response else "timeout")
         # Wait for FSM ACTIVE and fresh /joint_states (feedback resumes after activation).
         for _ in range(20):
             time.sleep(0.5)
@@ -212,23 +213,27 @@ class Plugin:
     def _run(self, event, current, targets, duration, action_id, targets_deg):
         steps = max(max(int(math.ceil(abs(targets[j] - current[j]) / self._max_step)) for j in JOINTS),
                     int(math.ceil(duration * self._rate)), 1)
+        error = None
         try:
             for index in range(1, steps + 1):
                 if event.is_set():
                     break
                 self._publish({j: current[j] + (targets[j] - current[j]) * index / steps for j in JOINTS})
                 event.wait(duration / steps)
-        except Exception:
-            pass
+        except Exception as exc:  # publish/interpolation failure: never report success
+            error = f"{type(exc).__name__}: {exc}"
         finally:
             # Joint feedback can lag the last command; reuse the final targets
             # instead of sending the joints back to their start angles.
-            if not event.is_set():
+            if error is None and not event.is_set():
                 self._hold_position(targets)
             else:
                 self._hold_current()
             if action_id:
-                if event.is_set():
+                if error is not None:
+                    _acp_notify(action_id, "error",
+                                {"joints": list(JOINTS), "error": error}, CARD)
+                elif event.is_set():
                     _acp_notify(action_id, "cancelled", {"joints": list(JOINTS)}, CARD)
                 else:
                     _acp_notify(action_id, "completed",
@@ -245,7 +250,7 @@ class Plugin:
             event.set()
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=1.0)
-        return {"ok": True, "state": "stopped", "reason": reason,
+        return {"ok": True, "state": "idle", "stopped": reason,
                 "hold_command_attempted": bool(active)}
 
     def _launch(self, targets, action_name, targets_deg, action_id):
@@ -308,11 +313,11 @@ class Plugin:
                     targets_deg[joint] = round(deg, 1)
             if not targets:
                 return _failure("INVALID_ARGUMENT", "at least one of hip_deg/knee_deg/ankle_deg is required")
-            return self._launch(targets, "set", targets_deg, f"{CARD}_set_{int(time.time() * 1000)}")
+            return self._launch(targets, "set", targets_deg, f"{CARD}_set_{uuid.uuid4().hex[:12]}")
         if action == "zero":
             targets = {j: 0.0 for j in JOINTS}
             targets_deg = {j: 0.0 for j in JOINTS}
-            return self._launch(targets, "zero", targets_deg, f"{CARD}_zero_{int(time.time() * 1000)}")
+            return self._launch(targets, "zero", targets_deg, f"{CARD}_zero_{uuid.uuid4().hex[:12]}")
         if action in ("cancel", "stop"):
             return self._stop("command")
         return None
