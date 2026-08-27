@@ -36,6 +36,7 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 | `motion_mode` | actuator | 任意状态切换及 idle/passive/站立/行走/舞蹈/起身/躺下快捷动作 |
 | `dance` | actuator | 舞蹈列表、播放、停止和状态；官方基线为 `dance.mnn` + `dance.npz` |
 | `joint_plan` | actuator | 索引/名称关节轨迹、头部/单臂姿态、当前位置保持、取消、复位和预置动作 |
+| `head` | actuator | 头部语义控制：点头、摇头、预设视线与 rotate_to 绝对角度 |
 | `joint_plan_state` | sensor | 规划 request id、状态和进度 |
 | `gesture` | actuator | 官方完整挥手/握手多步序列及任意自定义关节动作队列 |
 | `arm_swing` | actuator | `lower_body_balance` 下通过 `joint_plan` 持续交替摆臂，状态变化或 `halt` 时取消当前规划 |
