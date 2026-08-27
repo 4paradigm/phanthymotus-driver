@@ -1553,14 +1553,20 @@ class LocoPlugin:
             elif mode == "squat2standup":
                 if current_fsm in self._STANDING_STATES:
                     return {"info": "Robot is already standing", "fsm_id": current_fsm}
+                if current_fsm in self._GROUND_STATES:
+                    steps = [("Damp", 1, "damp")]
+                    steps.extend([
+                        ("Squat2StandUp", 801, "squat2standup_transition"),
+                        ("Start", 500, "start"),
+                    ])
+                    return self._async_fsm(mode, steps)
                 if current_fsm in self._LOW_STATES:
                     steps = [
                         ("Squat2StandUp", 801, "squat2standup_transition"),
                         ("Start", 500, "start"),
                     ]
                     return self._async_fsm(mode, steps)
-                if current_fsm in self._GROUND_STATES:
-                    return {"error": f"Robot is on ground (FSM={current_fsm}). Use lie2standup instead."}
+
                 return {"error": f"Cannot stand from FSM={current_fsm}"}
 
             elif mode in ("damp", "zero_torque"):
