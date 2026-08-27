@@ -1,0 +1,451 @@
+#!/usr/bin/env python3
+"""Upper-level adapter for RealMan RM75-6F-V through the official ROS2 driver."""
+
+from __future__ import annotations
+
+import json
+import threading
+import time
+from pathlib import Path
+
+from common.vendor_runtime import action_schema, jsonable, tool
+
+
+ARM_STATUS = {
+    0: "idle",
+    1: "move_l",
+    2: "move_j",
+    3: "move_c",
+    4: "move_s",
+    5: "joint_pass_through",
+    6: "pose_pass_through",
+    7: "force_pose_pass_through",
+    8: "current_pass_through",
+    9: "emergency_stop",
+    10: "slow_stop",
+    11: "pause",
+    12: "current_drag",
+    13: "force_drag",
+    14: "teach",
+}
+
+
+class RM75Nodes:
+    def __init__(self, config, namespace, ros2):
+        from rclpy.node import Node
+        from sensor_msgs.msg import JointState
+        from std_msgs.msg import Empty, String
+        from rm_ros_interfaces import msg as rm_msg
+
+        self.config = config
+        self.namespace = namespace
+        self.dof = int(config.get("arm_dof", 7))
+        self.safety = config.get("safety", {})
+        self.topics = config.get("topics", {})
+        self.lock = threading.Lock()
+        self.condition = threading.Condition(self.lock)
+        self.values = {}
+        self.sequences = {}
+        self.streams = {}
+        self.robot = Node("rm75_adapter_robot", context=ros2.ctx_robot)
+        self.core = Node("rm75_adapter_core", context=ros2.ctx_core)
+        ros2.executor_robot.add_node(self.robot)
+        ros2.executor_core.add_node(self.core)
+
+        self._String = String
+        self._Movej = self._message_type(rm_msg, "Movej")
+        self._Stop = self._message_type(rm_msg, "Stop")
+        self._Jointerrclear = self._message_type(rm_msg, "Jointerrclear")
+        self.arm_state_request_pub = self.robot.create_publisher(Empty, self.topics["arm_state_cmd"], 10)
+        self.movej_pub = self.robot.create_publisher(self._Movej, self.topics["movej_cmd"], 10)
+        self.stop_pub = self.robot.create_publisher(self._Stop, self.topics["move_stop_cmd"], 10)
+        self.clear_joint_error_pub = self.robot.create_publisher(self._Jointerrclear, self.topics["joint_error_clear_cmd"], 10)
+
+        self._bridge("joint_states", JointState, self.topics["joint_states"], "sensor/skeleton", self._joint_state_payload)
+        self._bridge("arm_state", self._message_type(rm_msg, "Armstate"), self.topics["arm_state"], "data/json")
+        self._bridge("arm_original_state", self._message_type(rm_msg, "Armoriginalstate"), self.topics["arm_original_state"], "data/json")
+        self._bridge("arm_current_status", self._message_type(rm_msg, "Armcurrentstatus"), self.topics["arm_current_status"], "data/json")
+        self._bridge("joint_error", self._message_type(rm_msg, "Jointerrorcode"), self.topics["joint_error"], "data/json")
+        self._bridge("rm_error", self._message_type(rm_msg, "Rmerr"), self.topics["rm_error"], "data/json")
+        self._optional_bridge(rm_msg, "movej_result", self.topics.get("movej_result"), ["Movejresult", "MovejResult", "Planstate", "PlanState"])
+        self._optional_bridge(rm_msg, "move_stop_result", self.topics.get("move_stop_result"), ["Moveresult", "MoveResult", "Stopresult", "StopResult"])
+        self._optional_bridge(rm_msg, "joint_error_clear_result", self.topics.get("joint_error_clear_result"), ["Jointerrclearresult", "JointerrclearResult"])
+
+    @staticmethod
+    def _message_type(module, name):
+        if hasattr(module, name):
+            return getattr(module, name)
+        available = [item for item in dir(module) if item.lower() == name.lower()]
+        if available:
+            return getattr(module, available[0])
+        raise ImportError(f"rm_ros_interfaces.msg.{name} is unavailable; check the sourced ros2_rm_robot workspace")
+
+    def _optional_bridge(self, module, key, topic_name, candidates):
+        if not topic_name:
+            return
+        for candidate in candidates:
+            try:
+                msg_type = self._message_type(module, candidate)
+                self._bridge(key, msg_type, topic_name, "data/json")
+                return
+            except ImportError:
+                continue
+        print(f"[rm75] skip optional result topic {topic_name}: no matching message type for {candidates}", flush=True)
+
+    def _bridge(self, key, msg_type, robot_topic, fmt, transform=None):
+        core_topic = f"/{self.namespace}/realman/rm75/{key}"
+        publisher = self.core.create_publisher(self._String, core_topic, 20)
+        self.robot.create_subscription(
+            msg_type,
+            robot_topic,
+            self._callback(key, publisher, transform=transform),
+            20,
+        )
+        self.streams[key] = {"robot_topic": robot_topic, "topic": core_topic, "format": fmt}
+
+    def _callback(self, key, publisher, transform=None):
+        def callback(msg):
+            value = transform(msg) if transform else jsonable(msg)
+            out = self._String()
+            out.data = json.dumps(value, ensure_ascii=False)
+            publisher.publish(out)
+            with self.lock:
+                self.values[key] = {"timestamp": time.time(), "data": value}
+                self.sequences[key] = self.sequences.get(key, 0) + 1
+                self.condition.notify_all()
+        return callback
+
+    @staticmethod
+    def _joint_state_payload(msg):
+        names = list(msg.name)
+        positions = list(msg.position)
+        velocities = list(msg.velocity)
+        efforts = list(msg.effort)
+        joints = []
+        for idx, name in enumerate(names):
+            joints.append({
+                "idx": idx,
+                "name": name,
+                "q": positions[idx] if idx < len(positions) else 0.0,
+                "dq": velocities[idx] if idx < len(velocities) else 0.0,
+                "tau": efforts[idx] if idx < len(efforts) else 0.0,
+            })
+        return {"joints": joints, "timestamp": time.time()}
+
+    def snapshot(self):
+        with self.lock:
+            values = dict(self.values)
+        status = values.get("arm_current_status", {}).get("data", {}).get("arm_current_status")
+        if status is not None:
+            values["arm_current_status_name"] = ARM_STATUS.get(int(status), "unknown")
+        values["configured_arm"] = {
+            "model": "RM75-6F-V",
+            "dof": self.dof,
+            "arm_ip": self.config.get("arm_ip"),
+            "tcp_port": self.config.get("tcp_port"),
+        }
+        values["health"] = self.health_summary(values)
+        return values
+
+    def health_summary(self, values=None):
+        values = values if values is not None else self.snapshot()
+        now = time.time()
+        max_age = float(self.safety.get("max_state_age_seconds", 2.0))
+        stale = []
+        for key in ("joint_states", "joint_error", "rm_error"):
+            item = values.get(key)
+            if not item:
+                stale.append({"key": key, "reason": "missing"})
+                continue
+            age = now - float(item.get("timestamp", 0))
+            if age > max_age:
+                stale.append({"key": key, "reason": "stale", "age_seconds": age})
+        errors = self._active_errors(values)
+        return {
+            "can_move": not stale and not errors,
+            "stale_inputs": stale,
+            "active_errors": errors,
+        }
+
+    def request_arm_state(self):
+        from std_msgs.msg import Empty
+
+        self.arm_state_request_pub.publish(Empty())
+        return {"state": "requested", "topic": self.topics["arm_state_cmd"]}
+
+    def publish_movej(self, joints, speed=20, block=False, trajectory_connect=0, wait_result=False, timeout=None):
+        if len(joints) != self.dof:
+            raise ValueError(f"movej requires exactly {self.dof} joint angles in radians")
+        speed = int(speed)
+        if speed < 1 or speed > 100:
+            raise ValueError("speed must be in [1, 100]")
+        preflight = self.preflight_movej(joints)
+        if preflight:
+            return preflight
+        baseline = self._sequence("movej_result")
+        msg = self._Movej()
+        msg.joint = [float(value) for value in joints]
+        msg.speed = speed
+        msg.block = bool(block)
+        msg.trajectory_connect = int(trajectory_connect)
+        msg.dof = self.dof
+        self.movej_pub.publish(msg)
+        result = {
+            "state": "published",
+            "topic": self.topics["movej_cmd"],
+            "result_topic": self.topics.get("movej_result"),
+            "joint": msg.joint,
+            "speed": msg.speed,
+            "block": msg.block,
+            "trajectory_connect": msg.trajectory_connect,
+            "dof": msg.dof,
+        }
+        if wait_result:
+            result["result"] = self.wait_for_update(
+                "movej_result",
+                baseline,
+                timeout if timeout is not None else self.safety.get("max_result_wait_seconds", 10.0),
+            )
+        return result
+
+    def publish_stop(self, block=False):
+        baseline = self._sequence("move_stop_result")
+        msg = self._Stop()
+        if hasattr(msg, "block"):
+            msg.block = bool(block)
+        self.stop_pub.publish(msg)
+        result = {"state": "stopped", "topic": self.topics["move_stop_cmd"], "result_topic": self.topics.get("move_stop_result")}
+        update = self.wait_for_update("move_stop_result", baseline, 1.0)
+        if update.get("state") != "timeout":
+            result["result"] = update
+        return result
+
+    def clear_joint_error(self, joint_num):
+        joint_num = int(joint_num)
+        if joint_num < 1 or joint_num > self.dof:
+            raise ValueError(f"joint_num must be in [1, {self.dof}]")
+        msg = self._Jointerrclear()
+        msg.joint_num = joint_num
+        baseline = self._sequence("joint_error_clear_result")
+        self.clear_joint_error_pub.publish(msg)
+        result = {"state": "published", "topic": self.topics["joint_error_clear_cmd"], "joint_num": joint_num}
+        update = self.wait_for_update("joint_error_clear_result", baseline, 1.0)
+        if update.get("state") != "timeout":
+            result["result"] = update
+        return result
+
+    def _sequence(self, key):
+        with self.lock:
+            return self.sequences.get(key, 0)
+
+    def wait_for_update(self, key, baseline, timeout):
+        deadline = time.monotonic() + float(timeout)
+        with self.condition:
+            while self.sequences.get(key, 0) <= baseline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return {"state": "timeout", "topic": self.topics.get(key)}
+                self.condition.wait(remaining)
+            return {"state": "received", **self.values.get(key, {})}
+
+    def preflight_movej(self, joints):
+        now = time.time()
+        max_age = float(self.safety.get("max_state_age_seconds", 2.0))
+        if self.safety.get("require_fresh_joint_state", True):
+            latest = self._latest("joint_states")
+            if latest is None:
+                return self._reject("joint_state_missing", "No /joint_states data has been received yet")
+            age = now - latest["timestamp"]
+            if age > max_age:
+                return self._reject("joint_state_stale", f"/joint_states is stale ({age:.2f}s)")
+        limits = self.safety.get("joint_limits_rad") or []
+        for idx, value in enumerate(joints):
+            if idx >= len(limits):
+                continue
+            lower, upper = limits[idx]
+            if float(value) < float(lower) or float(value) > float(upper):
+                return self._reject(
+                    "joint_limit",
+                    f"joint{idx + 1} target {float(value):.4f} rad is outside [{float(lower):.4f}, {float(upper):.4f}]",
+                )
+        if self.safety.get("require_no_errors", True):
+            with self.lock:
+                values = dict(self.values)
+            errors = self._active_errors(values)
+            if errors:
+                return self._reject("active_robot_error", "RM75 reports active errors; clear or diagnose before moving", errors=errors)
+        return None
+
+    def _latest(self, key):
+        with self.lock:
+            return self.values.get(key)
+
+    @staticmethod
+    def _reject(code, message, **details):
+        return {"state": "rejected", "code": code, "error": message, **details}
+
+    def _active_errors(self, values):
+        errors = []
+        for key in ("joint_error", "rm_error"):
+            item = values.get(key)
+            if not item:
+                continue
+            data = item.get("data", {})
+            if key == "rm_error" and self._rm_error_is_empty(data):
+                continue
+            numbers = self._error_numbers(data)
+            nonzero = [number for number in numbers if abs(number) > 1e-9]
+            if nonzero:
+                errors.append({"key": key, "data": data})
+        status = values.get("arm_current_status", {}).get("data", {}).get("arm_current_status")
+        if status is not None and int(status) == 9:
+            errors.append({"key": "arm_current_status", "status": int(status), "status_name": "emergency_stop"})
+        return errors
+
+    @classmethod
+    def _numbers(cls, value):
+        if isinstance(value, bool):
+            return [int(value)]
+        if isinstance(value, (int, float)):
+            return [float(value)]
+        if isinstance(value, dict):
+            numbers = []
+            for item in value.values():
+                numbers.extend(cls._numbers(item))
+            return numbers
+        if isinstance(value, list):
+            numbers = []
+            for item in value:
+                numbers.extend(cls._numbers(item))
+            return numbers
+        return []
+
+    @classmethod
+    def _error_numbers(cls, value):
+        if isinstance(value, dict):
+            if "joint_error" in value and isinstance(value["joint_error"], list):
+                return cls._numbers(value["joint_error"])
+            if "err" in value and isinstance(value["err"], list):
+                return cls._numbers(value["err"])
+            numbers = []
+            for key, item in value.items():
+                if key in ("header", "stamp", "timestamp", "seq", "frame_id", "dof", "err_len"):
+                    continue
+                numbers.extend(cls._error_numbers(item))
+            return numbers
+        return cls._numbers(value)
+
+    @staticmethod
+    def _rm_error_is_empty(data):
+        if not isinstance(data, dict):
+            return False
+        err_len = data.get("err_len")
+        return err_len == 0 or err_len == "0"
+
+    def close(self):
+        self.robot.destroy_node()
+        self.core.destroy_node()
+
+
+class RM75StatePlugin:
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def get_tools(self):
+        definitions = [
+            tool("state", "sensor", "RM75-6F-V 聚合状态快照"),
+            tool("refresh_state", "actuator", "请求睿尔曼 rm_driver 发布当前机械臂状态"),
+            tool("model", "resource", "RM75-6F-V 简化 URDF 模型，用于卡片系统骨架渲染"),
+        ]
+        definitions.extend(
+            tool(key, "sensor", f"RM75-6F-V {key} 数据流", topic_out=[{"topic": item["topic"], "format": item["format"]}])
+            for key, item in self.nodes.streams.items()
+        )
+        return definitions
+
+    def start(self):
+        pass
+
+    def stop(self):
+        self.nodes.close()
+
+    def dispatch(self, action, args):
+        name = args.get("_tool_name")
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            if name in self.nodes.streams:
+                item = self.nodes.streams[name]
+                return {"state": "running", "topic_out": [{"topic": item["topic"], "format": item["format"]}]}
+            return {"state": "ready"}
+        if name == "state":
+            return self.nodes.snapshot()
+        if name == "refresh_state":
+            return self.nodes.request_arm_state()
+        if name == "model":
+            urdf_path = Path(__file__).with_name("resource") / "rm75_6f_v.urdf"
+            return {"urdf": urdf_path.read_text(encoding="utf-8")}
+        if name in self.nodes.streams:
+            return {"state": "running", **self.nodes.streams[name]}
+        return None
+
+
+class RM75MotionPlugin:
+    ACTIONS = {
+        "movej": (["joints", "speed", "block", "trajectory_connect", "wait_result", "timeout"], "关节空间 MoveJ；joints 为 7 个弧度值"),
+        "stopmotion": (["block"], "立即向 rm_driver 发布 move_stop_cmd"),
+        "clear_joint_error": (["joint_num"], "清除指定关节错误码"),
+    }
+
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def get_tool(self):
+        return tool("arm_motion", "actuator", "RM75-6F-V 基础机械臂运动控制", action_schema(self.ACTIONS, {
+            "joints": {
+                "type": "array",
+                "items": {"type": "number"},
+                "minItems": 7,
+                "maxItems": 7,
+                "description": "目标关节角，单位 rad，顺序 joint1..joint7",
+            },
+            "speed": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20, "description": "速度百分比"},
+            "block": {"type": "boolean", "default": False, "description": "是否使用 rm_driver 阻塞模式"},
+            "trajectory_connect": {"type": "integer", "enum": [0, 1], "default": 0, "description": "0 立即规划，1 与下一轨迹连接"},
+            "wait_result": {"type": "boolean", "default": False, "description": "是否等待 movej_result 返回"},
+            "timeout": {"type": "number", "minimum": 0.1, "maximum": 30, "default": 10, "description": "等待结果超时时间，单位秒"},
+            "joint_num": {"type": "integer", "minimum": 1, "maximum": 7, "description": "待清错关节编号，1..7"},
+        }))
+
+    def start(self):
+        pass
+
+    def stop(self):
+        self.nodes.publish_stop()
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "movej":
+            return self.nodes.publish_movej(
+                args["joints"],
+                speed=args.get("speed", 20),
+                block=args.get("block", False),
+                trajectory_connect=args.get("trajectory_connect", 0),
+                wait_result=args.get("wait_result", False),
+                timeout=args.get("timeout"),
+            )
+        if action in ("stopmotion", "stop"):
+            return self.nodes.publish_stop(block=args.get("block", False))
+        if action == "clear_joint_error":
+            return self.nodes.clear_joint_error(args["joint_num"])
+        return None
+
+
+def build_plugins(config, namespace, ros2):
+    nodes = RM75Nodes(config, namespace, ros2)
+    return [RM75StatePlugin(nodes), RM75MotionPlugin(nodes)]

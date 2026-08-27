@@ -1,0 +1,11 @@
+id: realman-rm75-6f-v-driver
+name: RealMan RM75-6F-V Driver
+category: driver
+hardware_provider: realman
+hardware_model: "rm75-6f-v"
+image_name: realman-rm75-6f-v
+port: 15721
+mcp_url: "http://localhost:15721/mcp"
+description: "Upper-level Phanthy Motus MCP adapter for a RealMan RM75-6F-V arm through the official ROS2 rm_driver topics"
+build_context_extras:
+  - ../../common
