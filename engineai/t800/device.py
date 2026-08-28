@@ -2278,6 +2278,9 @@ class JointPlanPlugin:
         self._last_request = {}
         self._executing_requests: set[int] = set()
         self._request_id = 0
+        self._owner_lock = threading.Lock()
+        self._owner: str | None = None
+        self._owner_cancel_handlers = {}
         self._state_type = None
         self._head_lock = threading.Lock()
         self._head_owner: str | None = None
@@ -2344,9 +2347,19 @@ class JointPlanPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict:
-        return self._dispatch_owned("joint_plan", action, args)
+        if "_owner" in args:
+            return {"error": "_owner is reserved for internal driver use"}
+        return self._dispatch(action, args, owner=None)
+
+    def dispatch_owned(self, owner: str, action: str, args: dict) -> dict:
+        """Dispatch for an in-process plugin that already owns the planner."""
+        return self._dispatch(action, args, owner=owner)
 
     def _dispatch_owned(self, owner: str, action: str, args: dict) -> dict:
+        """Compatibility entry point for in-process head/gesture clients."""
+        return self.dispatch_owned(owner, action, args)
+
+    def _dispatch(self, action: str, args: dict, *, owner: str | None) -> dict:
         if action == "start":
             return {"state": "running" if args.get("_tool_name") == "joint_plan_state" else "ready"}
         if action in ("info", "status", "joint_plan_state"):
@@ -2357,10 +2370,37 @@ class JointPlanPlugin:
             return snapshot
         if action == "stop":
             return {"state": "idle"}
-        if action == "reset":
-            return self._publish_request("reset", {}, owner=owner)
+        # Cancellation is a safety/operator escape hatch: it must remain
+        # available even while an in-process plugin owns the planner.
         if action == "cancel":
-            return self._publish_request("cancel", args, owner=owner)
+            with self._owner_lock:
+                active_owner = self._owner
+                handler = self._owner_cancel_handlers.get(active_owner)
+                result = self._publish_request(
+                    "cancel", args, owner=owner or active_owner
+                )
+            # Owner callbacks can acquire plugin-local locks. Invoke them only
+            # after releasing the planner ownership lock.
+            if handler is not None:
+                handler(int(result["request_id"]))
+            return result
+        with self._owner_lock:
+            active_owner = self._owner
+            if active_owner is not None and owner != active_owner:
+                if active_owner == "head":
+                    return {"error": "head is busy", "owner": active_owner}
+                return {"error": f"joint planner is owned by {active_owner}"}
+            # Keep arbitration and publication in the same critical section.
+            # Otherwise an owner can be acquired after this check but before a
+            # public request is allocated and published.
+            return self._dispatch_exclusive(action, args, owner=owner)
+
+    def _dispatch_exclusive(self, action: str, args: dict, *, owner: str | None) -> dict:
+        """Publish a non-cancel request while the ownership lock is held."""
+        if action == "reset":
+            if owner is None:
+                return self._publish_request("reset", args)
+            return self._publish_request("reset", args, owner=owner)
         if action == "preset":
             preset = self._PRESETS.get(str(args.get("preset", "")))
             if preset is None:
@@ -2371,7 +2411,7 @@ class JointPlanPlugin:
                 "duration": preset["duration"],
                 "gravity_compensation": True,
             }
-            return self._publish_request("plan", args)
+            return self._publish_request("plan", args, owner=owner)
         if action == "plan_named":
             names = args.get("joint_names")
             if not isinstance(names, (list, tuple)) or not names:
@@ -2398,7 +2438,7 @@ class JointPlanPlugin:
                 "target_positions": args.get("target_positions"),
                 "duration": args.get("duration", 1.5),
                 "gravity_compensation": True,
-            })
+            }, owner=owner)
         if action == "hold_current":
             if self._state is None:
                 return {"error": "joint state is unavailable"}
@@ -2407,10 +2447,32 @@ class JointPlanPlugin:
                 "target_positions": self._state.joint_positions(),
                 "duration": args.get("duration", 0.5),
                 "gravity_compensation": True,
-            })
+            }, owner=owner)
         if action == "plan":
             return self._dispatch_plan(args, owner)
         return {"error": f"unknown joint plan action: {action}"}
+
+    def acquire(self, owner: str) -> bool:
+        with self._owner_lock:
+            if self._owner not in (None, owner):
+                return False
+            self._owner = owner
+            return True
+
+    def register_owner_cancel_handler(self, owner: str, handler) -> None:
+        with self._owner_lock:
+            self._owner_cancel_handlers[str(owner)] = handler
+
+    def release(self, owner: str) -> bool:
+        with self._owner_lock:
+            if self._owner != owner:
+                return False
+            self._owner = None
+            return True
+
+    def owner(self) -> str | None:
+        with self._owner_lock:
+            return self._owner
 
     def current_motion(self) -> tuple[str, list[str]]:
         if self._state is None:
@@ -2456,6 +2518,7 @@ class JointPlanPlugin:
         request_id: int,
         timeout: float,
         cancel_event: threading.Event,
+        abort_check=None,
     ) -> dict:
         """Require the planner to execute and finish the exact request."""
         if self._state_type is None:
@@ -2463,8 +2526,16 @@ class JointPlanPlugin:
         target = int(request_id)
         deadline = time.monotonic() + float(timeout)
         idle = int(self._state_type.IDLE)
-        with self._state_changed:
-            while True:
+        while True:
+            # abort_check may acquire plugin-local locks. Run it outside the
+            # planner condition lock to avoid lock-order inversions with halt.
+            if abort_check is not None:
+                abort_reason = abort_check()
+                if abort_reason:
+                    raise RuntimeError(str(abort_reason))
+            if cancel_event.is_set():
+                raise RuntimeError("gesture cancelled")
+            with self._state_changed:
                 if cancel_event.is_set():
                     raise RuntimeError("gesture cancelled")
                 state = dict(self._last_state)
@@ -2486,8 +2557,11 @@ class JointPlanPlugin:
                 self._state_changed.wait(timeout=min(remaining, 0.2))
 
     def acquire_head(self, owner: str) -> dict | None:
+        if not self.acquire(owner):
+            return {"error": f"joint planner is owned by {self.owner()}", "owner": self.owner()}
         with self._head_lock:
             if self._head_owner not in (None, owner):
+                self.release(owner)
                 return {"error": "head is busy", "owner": self._head_owner,
                         "request_id": self._head_request_id}
             self._head_owner = owner
@@ -2498,12 +2572,15 @@ class JointPlanPlugin:
             if self._head_owner == owner:
                 self._head_owner = None
                 self._head_request_id = None
+        self.release(owner)
 
     def head_status(self) -> dict:
         with self._head_lock:
             return {"owner": self._head_owner, "request_id": self._head_request_id}
 
     def _dispatch_plan(self, args: dict, owner: str) -> dict:
+        if owner is None:
+            return self._publish_request("plan", args)
         return self._publish_request("plan", args, owner=owner)
 
     def _next_request_id(self) -> int:
@@ -3368,9 +3445,12 @@ class GesturePlugin:
                 current = dict(self._status)
                 current.pop("action_id", None)
                 return {**current, "error": "another gesture sequence is already running"}
+            if not self._joint_plan.acquire("gesture"):
+                return {"error": f"joint planner is owned by {self._joint_plan.owner()}"}
             if controls_head:
                 busy = self._joint_plan.acquire_head("gesture")
                 if busy is not None:
+                    self._joint_plan.release("gesture")
                     return busy
             from uuid import uuid4
 
@@ -3431,7 +3511,9 @@ class GesturePlugin:
             except Exception as exc:
                 cancelled = self._cancel.is_set()
                 if request_id is not None:
-                    self._joint_plan._dispatch_owned("gesture", "cancel", {"request_id": request_id})
+                    self._joint_plan._dispatch_owned(
+                        "gesture", "cancel", {"request_id": request_id}
+                    )
                 with self._lock:
                     self._status["state"] = "cancelled" if cancelled else "error"
                     self._status["error"] = "" if cancelled else str(exc)
@@ -3449,6 +3531,8 @@ class GesturePlugin:
                     }
                 if controls_head:
                     self._joint_plan.release_head("gesture")
+                else:
+                    self._joint_plan.release("gesture")
                 if action_id is not None:
                     _notify_acp_completion(
                         "gesture", action_id, final_status, final_result,
@@ -3489,7 +3573,9 @@ class GesturePlugin:
                 request_id = None
             result = dict(self._status)
         if request_id is not None:
-            self._joint_plan._dispatch_owned("gesture", "cancel", {"request_id": request_id})
+            self._joint_plan._dispatch_owned(
+                "gesture", "cancel", {"request_id": request_id}
+            )
         # 必须等 worker 退出后再释放 head 锁，否则 worker 可能已通过取消检查、
         # 正准备调用 _dispatch_owned，与新拿到锁的 head 动作竞态（迟到的手势
         # 请求会报 head is busy 或与新动作并发）。head 锁统一由 worker 的
@@ -3613,6 +3699,401 @@ class JointOverridePlugin(_JointStreamBase):
         self._publish({"weight": 0.0, "indices": self._last_indices, "position": [0.0] * size,
                        "velocity": [], "feed_forward_torque": [], "torque": [], "stiffness": [], "damping": []})
 
+
+class ArmSwingPlugin:
+    """Bounded alternating arm plans layered on the proven joint planner."""
+
+    _OWNER = "arm_swing"
+    _INDICES = [13, 16, 18, 21]
+    _BASE = [0.028, -0.066, 0.024, -0.069]
+    _MAX_NEUTRAL_DURATION_SEC = 5.0
+    _NEUTRAL_WAIT_MARGIN_SEC = 3.0
+    _ACP_CALLBACK_TIMEOUT_SEC = 5.0
+    _ACP_SAFETY_MARGIN_SEC = 2.0
+    _ACP_TIMEOUT_SEC = (
+        _MAX_NEUTRAL_DURATION_SEC
+        + _NEUTRAL_WAIT_MARGIN_SEC
+        + _ACP_CALLBACK_TIMEOUT_SEC
+        + _ACP_SAFETY_MARGIN_SEC
+    )
+
+    def __init__(self, config: dict, joint_plan: JointPlanPlugin, state: StatePlugin):
+        cfg = config.get("plugins", {}).get("arm_swing", {})
+        self._joint_plan = joint_plan
+        self._state = state
+        self._default_amplitude_deg = float(cfg.get("default_amplitude_deg", 8.0))
+        self._default_frequency_hz = float(cfg.get("default_frequency_hz", 0.7))
+        self._lock = threading.RLock()
+        self._command_lock = threading.Lock()
+        self._halt = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._amplitude_deg = self._default_amplitude_deg
+        self._frequency_hz = self._default_frequency_hz
+        self._started_at: float | None = None
+        self._publish_count = 0
+        self._request_id: int | None = None
+        self._action_id: str | None = None
+        self._last_reason = "not_started"
+        self._validate_parameters(self._amplitude_deg, self._frequency_hz)
+        self._joint_plan.register_owner_cancel_handler(
+            self._OWNER, self._on_planner_cancel
+        )
+
+    def get_tool(self) -> dict:
+        tool = {
+            "name": "arm_swing",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "T800 lower_body_balance 下通过 joint_plan 持续交替摆臂",
+            "inputSchema": action_schema(
+                _with_lifecycle({
+                    "start_swing": (["amplitude_deg", "frequency_hz"], "开始左右交替摆臂"),
+                    "halt": ([], "取消当前规划并停止摆臂"),
+                    "return_neutral": (["duration"], "平滑回到自然姿态"),
+                    "halt_and_return": (["duration"], "取消当前规划并平滑回到自然姿态"),
+                    "status": ([], "查询摆臂状态和发布计数"),
+                }),
+                {
+                    "amplitude_deg": {"type": "number", "minimum": 2.0, "maximum": 30.0, "description": "肩部摆幅，默认 8 度"},
+                    "frequency_hz": {"type": "number", "minimum": 0.2, "maximum": 1.2, "description": "摆动频率，默认 0.7 Hz"},
+                    "duration": {"type": "number", "minimum": 0.5, "maximum": 5.0, "description": "回正时间，默认 1.5 秒"},
+                },
+                "持续摆臂动作",
+            ),
+        }
+        schema = tool["inputSchema"]
+        schema["x-completion"] = {
+            # start_swing is intentionally continuous. Registering it here
+            # would hold Agent Core's actuator barrier and make its ordinary
+            # halt and runtime parameter updates unreachable.
+            "actions": ["return_neutral", "halt_and_return"],
+            "timeout": int(self._ACP_TIMEOUT_SEC),
+        }
+        schema["x-hooks"] = {
+            "on_interrupt_motion": {"action": "halt"},
+            "on_interrupt_all": {"action": "halt"},
+        }
+        return tool
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        with self._command_lock:
+            self._halt_swing("driver_stopped")
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "info"):
+            return {**self._status(), "state": "ready"}
+        if action == "stop":
+            with self._command_lock:
+                return self._halt_swing("lifecycle_stop")
+        if action == "status":
+            return self._status()
+        if action == "halt":
+            with self._command_lock:
+                return self._halt_swing("user_halt")
+        if action in ("return_neutral", "halt_and_return"):
+            with self._command_lock:
+                return self._return_neutral(args, action)
+        if action != "start_swing":
+            return {"error": f"unknown arm swing action: {action}"}
+        with self._command_lock:
+            return self._start_swing(args)
+
+    def _start_swing(self, args: dict) -> dict:
+        try:
+            amplitude = float(args.get("amplitude_deg", self._amplitude_deg))
+            frequency = float(args.get("frequency_hz", self._frequency_hz))
+            self._validate_parameters(amplitude, frequency)
+        except (TypeError, ValueError) as exc:
+            return {"error": str(exc)}
+        with self._lock:
+            running = self._thread is not None and self._thread.is_alive()
+            if running and self._halt.is_set():
+                return {
+                    "error": "previous arm_swing action is still stopping; retry",
+                    "state": "stopping",
+                }
+            if running:
+                self._amplitude_deg = amplitude
+                self._frequency_hz = frequency
+                return self._status_locked()
+            # Keep the idle check, motion-state gate and worker installation
+            # atomic so concurrent MCP calls cannot create two workers.
+            motion, available = self._state.current_motion()
+            if motion != "lower_body_balance":
+                return {
+                    "error": f"arm_swing requires lower_body_balance (current: {motion or 'unknown'})",
+                    "available_transition_motions": available,
+                }
+            if not self._joint_plan.acquire(self._OWNER):
+                return {"error": f"joint planner is owned by {self._joint_plan.owner()}"}
+
+            self._amplitude_deg = amplitude
+            self._frequency_hz = frequency
+            self._halt = threading.Event()
+            self._started_at = time.monotonic()
+            self._publish_count = 0
+            self._request_id = None
+            # Continuous actions are deliberately outside x-completion and do
+            # not allocate an ACP action ID.
+            self._action_id = None
+            self._last_reason = "running"
+            self._thread = threading.Thread(target=self._run, daemon=True, name="t800-arm-swing")
+            self._thread.start()
+            return self._status_locked()
+
+    def _on_planner_cancel(self, request_id: int) -> None:
+        with self._lock:
+            if self._request_id is None or int(self._request_id) != int(request_id):
+                return
+            self._last_reason = "planner_cancelled"
+            self._halt.set()
+
+    def _run(self) -> None:
+        reason = "user_halt"
+        direction = 1.0
+        try:
+            while not self._halt.is_set():
+                motion, _ = self._state.current_motion()
+                if motion != "lower_body_balance":
+                    reason = f"motion_state_changed:{motion or 'unknown'}"
+                    break
+                with self._lock:
+                    amplitude = math.radians(self._amplitude_deg)
+                    frequency = self._frequency_hz
+                step_duration = 0.5 / frequency
+                offset = direction * amplitude
+                with self._lock:
+                    # Keep publication and ID storage in one critical section.
+                    # halt either wins before publication or observes the ID.
+                    if self._halt.is_set():
+                        break
+                    result = self._joint_plan.dispatch_owned(self._OWNER, "plan", {
+                        "joint_indices": self._INDICES,
+                        "target_positions": [
+                            self._BASE[0] + offset,
+                            self._BASE[1],
+                            self._BASE[2] - offset,
+                            self._BASE[3],
+                        ],
+                        "duration": step_duration,
+                        "gravity_compensation": True,
+                    })
+                    if "error" in result:
+                        raise RuntimeError(str(result["error"]))
+                    request_id = int(result["request_id"])
+                    self._request_id = request_id
+                    self._publish_count += 1
+                self._joint_plan.wait_for_request(
+                    request_id,
+                    max(5.0, step_duration + 3.0),
+                    self._halt,
+                    abort_check=self._motion_state_abort_reason,
+                )
+                with self._lock:
+                    if self._request_id == request_id:
+                        self._request_id = None
+                direction *= -1.0
+        except Exception as exc:
+            message = str(exc)
+            if message.startswith("motion_state_changed:"):
+                reason = message
+            else:
+                reason = self._last_reason if self._halt.is_set() else f"error:{exc}"
+        finally:
+            request_id = None
+            with self._lock:
+                request_id = self._request_id
+                self._last_reason = reason
+                self._request_id = None
+            # A request can still be live when the worker is interrupted or
+            # errors. Always cancel it before declaring the card idle.
+            if request_id is not None:
+                self._joint_plan.dispatch_owned(
+                    self._OWNER, "cancel", {"request_id": request_id}
+                )
+            self._joint_plan.release(self._OWNER)
+
+    def _motion_state_abort_reason(self) -> str | None:
+        motion, _ = self._state.current_motion()
+        if motion == "lower_body_balance":
+            return None
+        reason = f"motion_state_changed:{motion or 'unknown'}"
+        with self._lock:
+            self._last_reason = reason
+            self._halt.set()
+        return reason
+
+    def _halt_swing(self, reason: str) -> dict:
+        with self._lock:
+            thread = self._thread
+            request_id = self._request_id
+            self._last_reason = reason
+            self._halt.set()
+        if request_id is not None:
+            self._joint_plan.dispatch_owned(
+                self._OWNER, "cancel", {"request_id": request_id}
+            )
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+        return self._status()
+
+    def _return_neutral(self, args: dict, action: str) -> dict:
+        try:
+            duration = float(args.get("duration", 1.5))
+        except (TypeError, ValueError) as exc:
+            return {"error": str(exc)}
+        if not math.isfinite(duration) or not 0.5 <= duration <= self._MAX_NEUTRAL_DURATION_SEC:
+            return {"error": "duration must be finite and between 0.5 and 5.0 seconds"}
+        self._halt_swing(action)
+        with self._lock:
+            previous_thread = self._thread
+            if previous_thread is not None and previous_thread.is_alive():
+                result = {
+                    "error": "previous arm_swing action is still stopping; retry",
+                    "state": "stopping",
+                }
+                if self._action_id is not None:
+                    result["action_id"] = self._action_id
+                return result
+            motion, available = self._state.current_motion()
+            if motion != "lower_body_balance":
+                return {
+                    "error": f"arm_swing requires lower_body_balance (current: {motion or 'unknown'})",
+                    "available_transition_motions": available,
+                }
+            if not self._joint_plan.acquire(self._OWNER):
+                return {"error": f"joint planner is owned by {self._joint_plan.owner()}"}
+            from uuid import uuid4
+
+            self._halt = threading.Event()
+            self._started_at = time.monotonic()
+            self._publish_count = 0
+            self._request_id = None
+            self._action_id = f"t800_arm_swing_{uuid4().hex[:12]}"
+            self._last_reason = "running"
+            self._thread = threading.Thread(
+                target=self._run_neutral,
+                args=(duration, action),
+                daemon=True,
+                name="t800-arm-swing-neutral",
+            )
+            self._thread.start()
+            return {
+                "state": "running",
+                "action": action,
+                "action_id": self._action_id,
+                "duration": duration,
+                "target": "neutral",
+            }
+
+    def _run_neutral(self, duration: float, action: str) -> None:
+        reason = "completed"
+        request_id = None
+        try:
+            with self._lock:
+                if self._halt.is_set():
+                    raise RuntimeError("neutral return cancelled")
+                abort_reason = self._motion_state_abort_reason()
+                if abort_reason:
+                    raise RuntimeError(abort_reason)
+                result = self._joint_plan.dispatch_owned(self._OWNER, "plan", {
+                    "joint_indices": self._INDICES,
+                    "target_positions": self._BASE,
+                    "duration": duration,
+                    "gravity_compensation": True,
+                })
+                if "error" in result:
+                    raise RuntimeError(str(result["error"]))
+                request_id = int(result["request_id"])
+                self._request_id = request_id
+                self._publish_count += 1
+            self._joint_plan.wait_for_request(
+                request_id,
+                max(5.0, duration + self._NEUTRAL_WAIT_MARGIN_SEC),
+                self._halt,
+                abort_check=self._motion_state_abort_reason,
+            )
+            with self._lock:
+                if self._request_id == request_id:
+                    self._request_id = None
+            request_id = None
+        except Exception as exc:
+            message = str(exc)
+            if message.startswith("motion_state_changed:"):
+                reason = message
+            else:
+                reason = self._last_reason if self._halt.is_set() else f"error:{exc}"
+        finally:
+            with self._lock:
+                live_request_id = self._request_id if self._request_id is not None else request_id
+                self._request_id = None
+                self._last_reason = reason
+                action_id = self._action_id
+                final_status = (
+                    "completed" if reason == "completed"
+                    else "error" if reason.startswith("error:")
+                    else "cancelled"
+                )
+                final_result = {
+                    "action": action,
+                    "target": "neutral",
+                    "duration": duration,
+                    "reason": reason,
+                    "request_id": live_request_id,
+                    "control_backend": "joint_plan",
+                }
+            if live_request_id is not None:
+                self._joint_plan.dispatch_owned(
+                    self._OWNER, "cancel", {"request_id": live_request_id}
+                )
+            self._joint_plan.release(self._OWNER)
+            if action_id is not None:
+                self._notify_completion(action_id, final_status, final_result)
+
+    def _notify_completion(self, action_id: str, status: str, result: dict) -> None:
+        threading.Thread(
+            target=_notify_acp_completion,
+            args=(
+                "arm_swing",
+                action_id,
+                status,
+                result,
+                self._ACP_CALLBACK_TIMEOUT_SEC,
+            ),
+            daemon=True,
+            name="t800-arm-swing-acp",
+        ).start()
+
+    def _status(self) -> dict:
+        with self._lock:
+            return self._status_locked()
+
+    def _status_locked(self) -> dict:
+        running = self._thread is not None and self._thread.is_alive() and not self._halt.is_set()
+        status = {
+            "state": "running" if running else "idle",
+            "amplitude_deg": self._amplitude_deg,
+            "frequency_hz": self._frequency_hz,
+            "publish_count": self._publish_count,
+            "request_id": self._request_id,
+            "reason": self._last_reason,
+            "required_motion_state": "lower_body_balance",
+            "joint_indices": list(self._INDICES),
+            "control_backend": "joint_plan",
+        }
+        if self._action_id is not None:
+            status["action_id"] = self._action_id
+        return status
+
+    @staticmethod
+    def _validate_parameters(amplitude: float, frequency: float) -> None:
+        if not math.isfinite(amplitude) or not 2.0 <= amplitude <= 30.0:
+            raise ValueError("amplitude_deg must be between 2 and 30")
+        if not math.isfinite(frequency) or not 0.2 <= frequency <= 1.2:
+            raise ValueError("frequency_hz must be between 0.2 and 1.2")
 
 class JointBridgePlugin(_JointStreamBase):
     def __init__(self, config: dict, namespace: str, ros2, state: StatePlugin):
