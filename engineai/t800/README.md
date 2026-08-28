@@ -110,6 +110,9 @@ lie_down 组合键。LCM 输入会覆盖实体手柄输入，发送完成后 Dri
 `/motion/set_motion_state` 接口切换“拟人步态”/“下肢平衡”，并以
 `/motion/motion_state` 返回的可转换状态为准。`rl_terrain` 不属于当前 T800
 状态机，因此不会作为可选项暴露；terrain 接口示例不能视为 T800 固件能力。
+对外 API 使用稳定 key `basic`/`balanced`；JSON Schema 通过 `oneOf.title`
+把它们在卡片下拉框中显示为“拟人步态”/“下肢平衡”，因此 UI 友好性不会
+改变 MCP 调用契约。旧中文值仍作为未公开兼容别名接受。
 卡片不再暴露 `force`/`wait`：内部固定使用 `force=false`、`wait=true`，避免
 用户绕过固件可用转换或在状态尚未确认时继续下一个动作。真实切换通过 ACP
 完成。Driver 实际以非阻塞 motion-state request 加反馈轮询实现该等待，使
@@ -160,11 +163,16 @@ worker 永久挂起；超时会先发一次 ACP error，同时本地门禁继续
 或 joint override release 发布失败均可通过 status 查看并重试 stop，避免
 Agent Core 清除全局 pending 后实体动作仍继续运行。同一次设备级 interrupt 也会
 取消仍在执行的 Gait、Gesture 与 Head。
-ACP 使用 `AGENT_CORE_URL=https://phanthy-motus:15678`，并要求宿主已生成
-`/opt/phanthy-motus/data/certs/cert.pem`（由 `deploy/service.yml` 挂载给
-Driver）。Driver 启动时校验 URL/CA；证书缺失、无效或 completion POST 失败
-都会在 `/health` 和 `motion_recorder.status.acp` 中显示为 error/degraded，
-回调恢复成功后自动恢复 ready。
+MCP registration 与 ACP completion 共用同一套严格验证 transport。容器内
+必须显式设置 `AGENT_CORE_URL`；HTTPS 还必须设置 `AGENT_CORE_CA_CERT`，并且
+URL hostname 必须出现在 Agent Core 服务端证书的 SAN 中。默认部署约定为
+`https://phanthy-motus:15678`、hostname `phanthy-motus` 映射到
+`127.0.0.1`、CA `/opt/phanthy-motus/data/certs/cert.pem`。可在部署前通过
+`T800_AGENT_CORE_URL`、`T800_AGENT_CORE_CA_CERT`、
+`T800_AGENT_CORE_HOSTNAME`、`T800_AGENT_CORE_ADDRESS` 覆盖，四者必须彼此
+一致；不再使用 `CERT_NONE`。配置缺失、CA/hostname 验证失败、registration
+或 completion POST 失败都会在 `/health` 和卡片 `status.acp` 中显示为
+error/degraded，成功重试后恢复 ready。
 
 `pointcloud`、`camera`、`depth` 桥接 T800-Odin2 激光雷达相机（飞书文档
 7.2 节）在 Orin 主板上发布的 `odin_ros_driver` topic。点云按
@@ -198,7 +206,10 @@ utterance 结束的 8 字节 EOF magic），driver 只负责流式播放。镜�
 Docker 构建仍按固定 SHA256 校验内容完整性。
 `alsa-utils` 提供 `aplay`，`libasound2-plugins` 提供 `/etc/asound.conf`
 所需的 PulseAudio PCM backend；构建日志确认二者不在固定的 ros-base 中，
-因此对应包体增长是该官方播放路径的必要运行时成本。
+因此对应包体增长是该官方播放路径的必要运行时成本。ARM64 APT 构建事务报告
+两个直接包的 `Installed-Size` 分别为 2,420 KiB 与 282 KiB（合计 2,702 KiB，
+镜像层还会包含固定基础镜像缺失的共享库依赖）；安装已用
+`--no-install-recommends` 且清理 `/var/lib/apt/lists`，没有额外推荐包或缓存可删。
 
 实时性：镜像内置 `/etc/asound.conf` 把 ALSA 默认设备路由到宿主
 PulseAudio——这是官方「aplay 播放 + pactl 音量」模型成立的前提
@@ -212,22 +223,23 @@ tsched 延迟上限（见 `deploy/service.yml`）。
 机器人必须通过主机内置以太网口访问；官方默认 ROS Domain 为 69。
 
 ```bash
-cd engineai/t800
-docker build -t engineai-t800-driver .
+# 在仓库根目录构建；build.sh 会把 driver.yaml 声明的 ../../common
+# 一并放入临时 Docker context。把 <TAG> 替换为构建输出中的 release tag。
+REGISTRY= REGISTRY_USER= REGISTRY_PASSWORD= IMAGE_NAMESPACE= \
+  MIRROR=tuna bash build.sh engineai/t800
+T800_IMAGE=local/phanthy-motus/drivers/engineai/t800:<TAG>
 docker run --rm --network host --privileged \
+  --add-host "${T800_AGENT_CORE_HOSTNAME:-phanthy-motus}:${T800_AGENT_CORE_ADDRESS:-127.0.0.1}" \
   -v /dev:/dev \
+  -v /opt/phanthy-motus/data:/opt/phanthy-motus/data \
   -v ${T800_NATIVE_SDK_DIR:-/opt/engineai/native_sdk}:/opt/engineai/native_sdk \
   -v ${T800_PULSE_RUNTIME_DIR:-/run/user/1000/pulse}:/run/user/1000/pulse \
   -v ${T800_PULSE_CONFIG_DIR:-/home/ubuntu/.config/pulse}:/root/.config/pulse:ro \
   -e NETWORK_INTERFACE=${T800_NETWORK_INTERFACE:-eth1} \
+  -e AGENT_CORE_URL=${T800_AGENT_CORE_URL:-https://phanthy-motus:15678} \
+  -e AGENT_CORE_CA_CERT=${T800_AGENT_CORE_CA_CERT:-/opt/phanthy-motus/data/certs/cert.pem} \
   -e PULSE_SERVER=unix:/run/user/1000/pulse/native \
-  engineai-t800-driver
-```
-
-或在仓库根目录执行：
-
-```bash
-./build.sh engineai/t800
+  "${T800_IMAGE}"
 ```
 
 健康检查：`GET http://localhost:15708/health`；MCP 入口：

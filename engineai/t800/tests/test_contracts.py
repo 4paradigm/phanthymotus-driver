@@ -41,7 +41,24 @@ class FakeBundle:
         self.state = state
 
     def get_all_tools(self):
-        return [{"name": "echo", "type": "actuator", "inputSchema": {"type": "object"}}]
+        return [
+            {"name": "echo", "type": "actuator", "inputSchema": {"type": "object"}},
+            {
+                "name": "gait",
+                "type": "actuator",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "gait": {
+                            "oneOf": [
+                                {"const": "basic", "title": "拟人步态"},
+                                {"const": "balanced", "title": "下肢平衡"},
+                            ]
+                        }
+                    },
+                },
+            },
+        ]
 
     def health(self):
         return {"state": self.state, "driver": "engineai-t800"}
@@ -49,6 +66,8 @@ class FakeBundle:
     def dispatch(self, name, arguments):
         if name == "echo":
             return {"echo": arguments}
+        if name == "gait":
+            return {"selected_gait": arguments.get("gait")}
         return None
 
 
@@ -90,6 +109,17 @@ class McpHttpContractTests(unittest.TestCase):
         content = response["result"]["content"]
         self.assertEqual({"echo": {"value": 7}}, json.loads(content[0]["text"]))
 
+    def test_gait_stable_key_survives_actual_mcp_tools_call_envelope(self):
+        response = self.rpc("tools/call", {
+            "name": "gait",
+            "arguments": {"action": "select", "gait": "basic"},
+        })
+        content = response["result"]["content"]
+        self.assertEqual(
+            {"selected_gait": "basic"},
+            json.loads(content[0]["text"]),
+        )
+
     def test_unknown_tool_returns_json_rpc_error(self):
         response = self.rpc("tools/call", {"name": "missing"})
         self.assertEqual(-32601, response["error"]["code"])
@@ -99,6 +129,110 @@ class McpHttpContractTests(unittest.TestCase):
             payload = json.loads(response.read())
             self.assertEqual("engineai-t800", payload["driver"])
             self.assertEqual("running", payload["state"])
+
+    def test_registration_uses_shared_validated_agent_core_transport(self):
+        transport_calls = []
+        started_threads = []
+        fake_context = object()
+        fake_device = types.ModuleType("device")
+        def transport(path):
+            transport_calls.append(path)
+            if len(transport_calls) == 1:
+                raise ValueError("CA not provisioned yet")
+            return (
+                "https://phanthy-motus:15678/api/mcp",
+                fake_context,
+                "/certs/agent-core-ca.pem",
+            )
+        fake_device._t800_agent_core_transport = transport
+
+        class DeferredThread:
+            def __init__(self, *, target, daemon, name):
+                self.target = target
+                self.daemon = daemon
+                self.name = name
+
+            def start(self):
+                started_threads.append(self)
+
+        previous_device = sys.modules.get("device")
+        original_thread = self.module.threading.Thread
+        original_sleep = self.module.time.sleep
+        original_urlopen = urllib.request.urlopen
+        sleep_calls = []
+        states_during_post = []
+
+        class StopLoop(BaseException):
+            pass
+
+        def controlled_sleep(_seconds):
+            sleep_calls.append(_seconds)
+            if len(sleep_calls) >= 2:
+                raise StopLoop()
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        def urlopen(*_args, **_kwargs):
+            states_during_post.append(
+                self.module._registration_status()["state"]
+            )
+            return Response()
+
+        sys.modules["device"] = fake_device
+        self.module.threading.Thread = DeferredThread
+        self.module.time.sleep = controlled_sleep
+        urllib.request.urlopen = urlopen
+        try:
+            self.module._start_registration(15708, {"name": "T800"})
+            with self.assertRaises(StopLoop):
+                started_threads[0].target()
+        finally:
+            self.module.threading.Thread = original_thread
+            self.module.time.sleep = original_sleep
+            urllib.request.urlopen = original_urlopen
+            if previous_device is None:
+                sys.modules.pop("device", None)
+            else:
+                sys.modules["device"] = previous_device
+
+        self.assertEqual(["/api/mcp", "/api/mcp"], transport_calls)
+        self.assertEqual(1, len(started_threads))
+        self.assertEqual("register", started_threads[0].name)
+        self.assertEqual(["error"], states_during_post)
+        self.assertEqual("ready", self.module._registration_status()["state"])
+
+    def test_registration_failure_degrades_bundle_health_without_stopping_it(self):
+        previous = self.module._registration_status()
+        bundle = self.module.T800DeviceBundle.__new__(
+            self.module.T800DeviceBundle
+        )
+        bundle._plugins = []
+        bundle._active_plugins = []
+        bundle._startup_errors = {}
+        bundle._started = True
+        bundle._acp_status = lambda: {
+            "state": "ready",
+            "configured": True,
+            "last_error": None,
+        }
+        try:
+            self.module._update_registration_status(
+                state="error",
+                configured=False,
+                last_error="AGENT_CORE_CA_CERT is required",
+            )
+            health = bundle.health()
+        finally:
+            self.module._update_registration_status(**previous)
+
+        self.assertEqual("degraded", health["state"])
+        self.assertEqual("error", health["registration"]["state"])
+        self.assertIn("AGENT_CORE_CA_CERT", health["registration"]["last_error"])
 
     def test_degraded_health_is_not_reported_as_healthy(self):
         previous = self.module._bundle
@@ -405,10 +539,18 @@ class VendoredContractTests(unittest.TestCase):
 
     def test_acp_uses_agent_core_certificate_and_matching_hostname(self):
         service = (ROOT / "deploy" / "service.yml").read_text()
-        self.assertIn('"phanthy-motus:127.0.0.1"', service)
-        self.assertIn("AGENT_CORE_URL=https://phanthy-motus:15678", service)
         self.assertIn(
-            "AGENT_CORE_CA_CERT=/opt/phanthy-motus/data/certs/cert.pem",
+            '"${T800_AGENT_CORE_HOSTNAME:-phanthy-motus}:'
+            '${T800_AGENT_CORE_ADDRESS:-127.0.0.1}"',
+            service,
+        )
+        self.assertIn(
+            "AGENT_CORE_URL=${T800_AGENT_CORE_URL:-https://phanthy-motus:15678}",
+            service,
+        )
+        self.assertIn(
+            "AGENT_CORE_CA_CERT=${T800_AGENT_CORE_CA_CERT:-"
+            "/opt/phanthy-motus/data/certs/cert.pem}",
             service,
         )
 

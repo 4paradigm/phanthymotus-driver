@@ -1725,6 +1725,15 @@ class DevicePluginContractTests(unittest.TestCase):
             if previous_ca is not None:
                 os.environ["AGENT_CORE_CA_CERT"] = previous_ca
 
+    def test_agent_core_transport_requires_explicit_url(self):
+        previous_url = os.environ.pop("AGENT_CORE_URL", None)
+        try:
+            with self.assertRaisesRegex(ValueError, "AGENT_CORE_URL is required"):
+                self.device._t800_agent_core_transport("/api/mcp")
+        finally:
+            if previous_url is not None:
+                os.environ["AGENT_CORE_URL"] = previous_url
+
     def test_acp_callback_failure_is_visible_and_success_recovers(self):
         import urllib.request as urllib_request
 

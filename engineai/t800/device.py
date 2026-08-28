@@ -117,14 +117,14 @@ def _update_acp_status(**updates) -> dict:
         return dict(_ACP_STATUS)
 
 
-def _t800_acp_transport():
+def _t800_agent_core_transport(endpoint_path: str):
     import os as _os
     import ssl
     import urllib.parse
 
-    agent_core_url = _os.environ.get(
-        "AGENT_CORE_URL", "https://phanthy-motus:15678"
-    ).rstrip("/")
+    agent_core_url = _os.environ.get("AGENT_CORE_URL", "").strip().rstrip("/")
+    if not agent_core_url:
+        raise ValueError("AGENT_CORE_URL is required")
     ca_cert = _os.environ.get("AGENT_CORE_CA_CERT")
     parsed_url = urllib.parse.urlparse(agent_core_url)
     if parsed_url.scheme not in ("http", "https") or not parsed_url.hostname:
@@ -143,15 +143,18 @@ def _t800_acp_transport():
             "AGENT_CORE_CA_CERT is required for https ACP callbacks"
         )
     context = ssl.create_default_context(cafile=ca_cert or None)
-    return f"{agent_core_url}/api/acp/complete", context, ca_cert
+    path = "/" + str(endpoint_path).lstrip("/")
+    return f"{agent_core_url}{path}", context, ca_cert
+
+
+def _t800_acp_transport():
+    return _t800_agent_core_transport("/api/acp/complete")
 
 
 def _t800_acp_preflight() -> dict:
     import os as _os
 
-    agent_core_url = _os.environ.get(
-        "AGENT_CORE_URL", "https://phanthy-motus:15678"
-    ).rstrip("/")
+    agent_core_url = _os.environ.get("AGENT_CORE_URL", "").strip().rstrip("/")
     try:
         _endpoint, _context, ca_cert = _t800_acp_transport()
     except Exception as exc:
@@ -6622,14 +6625,22 @@ class ControlledSpatialPlugin:
 
 
 GAIT_PROFILES: dict[str, dict] = {
-    "拟人步态": {
+    "basic": {
+        "title": "拟人步态",
         "motion_states": ("walk", "rl_basic"),
         "description": "拟人步态（自动适配新版 rl_basic 与旧版 walk 状态名）",
     },
-    "下肢平衡": {
+    "balanced": {
+        "title": "下肢平衡",
         "motion_states": ("lower_body_balance",),
         "description": "下肢平衡步态",
     },
+}
+
+GAIT_PROFILE_ALIASES = {
+    "拟人步态": "basic",
+    "下肢平衡": "balanced",
+    "balance": "balanced",
 }
 
 
@@ -6661,7 +6672,7 @@ class GaitPlugin:
                 **definition,
                 "motion_states": (
                     basic_states
-                    if name == "拟人步态"
+                    if name == "basic"
                     else definition["motion_states"]
                 ),
             }
@@ -6715,7 +6726,13 @@ class GaitPlugin:
             {
                 "gait": {
                     "type": "string",
-                    "enum": list(self._profiles),
+                    "oneOf": [
+                        {
+                            "const": name,
+                            "title": definition["title"],
+                        }
+                        for name, definition in self._profiles.items()
+                    ],
                     "description": "步态档位",
                 },
             },
@@ -6804,6 +6821,7 @@ class GaitPlugin:
             resolved = self._resolve(name, current, available)
             profiles.append({
                 "name": name,
+                "title": definition["title"],
                 "description": definition["description"],
                 "motion_states": list(definition["motion_states"]),
                 "resolved_motion_state": resolved,
@@ -6818,7 +6836,10 @@ class GaitPlugin:
         }
 
     def _select(self, args: dict) -> dict:
-        profile = str(args.get("gait", ""))
+        requested_profile = str(args.get("gait", ""))
+        profile = GAIT_PROFILE_ALIASES.get(
+            requested_profile, requested_profile
+        )
         if profile not in self._profiles:
             return {"error": f"unknown gait: {profile}", "gaits": list(self._profiles)}
         current, available = self._state.current_motion()

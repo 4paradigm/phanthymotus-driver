@@ -31,6 +31,29 @@ import yaml
 from rclpy.context import Context
 
 
+_REGISTRATION_STATUS_LOCK = threading.Lock()
+_REGISTRATION_STATUS = {
+    "state": "starting",
+    "configured": False,
+    "url": None,
+    "ca_cert": None,
+    "last_error": None,
+    "last_success_at": None,
+    "last_failure_at": None,
+}
+
+
+def _update_registration_status(**updates) -> dict:
+    with _REGISTRATION_STATUS_LOCK:
+        _REGISTRATION_STATUS.update(updates)
+        return dict(_REGISTRATION_STATUS)
+
+
+def _registration_status() -> dict:
+    with _REGISTRATION_STATUS_LOCK:
+        return dict(_REGISTRATION_STATUS)
+
+
 def _load_config() -> dict:
     path = os.environ.get("CONFIG_PATH", str(Path(__file__).parent / "config.yaml"))
     with open(path, encoding="utf-8") as handle:
@@ -372,6 +395,7 @@ class T800DeviceBundle:
             lambda: {"state": "ready", "configured": True, "last_error": None},
         )
         acp_status = acp_status_fn()
+        registration_status = _registration_status()
         if not self._started:
             state = "starting"
         elif self._startup_errors and not self._active_plugins:
@@ -379,6 +403,8 @@ class T800DeviceBundle:
         elif self._startup_errors:
             state = "degraded"
         elif acp_status.get("state") == "error":
+            state = "degraded"
+        elif registration_status.get("state") == "error":
             state = "degraded"
         else:
             state = "running"
@@ -391,6 +417,7 @@ class T800DeviceBundle:
             "active_tools": active_tools,
             "startup_errors": dict(self._startup_errors),
             "acp": acp_status,
+            "registration": registration_status,
         }
 
     def dispatch(self, tool_name: str, arguments: dict) -> dict | None:
@@ -593,11 +620,10 @@ def make_handler():
 
 
 def _start_registration(port: int, config: dict) -> None:
-    import ssl
     import time
     import urllib.request
+    from device import _t800_agent_core_transport
 
-    agent_core_url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
     payload = json.dumps({
         "id": "engineai-t800-driver",
         "name": config.get("name", "EngineAI T800 Development Edition"),
@@ -605,21 +631,51 @@ def _start_registration(port: int, config: dict) -> None:
         "transport": "http",
         "category": "driver",
     }).encode()
-    context = ssl.create_default_context()
-    context.check_hostname = False
-    context.verify_mode = ssl.CERT_NONE
-
     def register_loop():
         while True:
+            transport_ready = False
             try:
+                endpoint, context, ca_cert = (
+                    _t800_agent_core_transport("/api/mcp")
+                )
+                transport_ready = True
+                agent_core_url = endpoint.removesuffix("/api/mcp")
+                current_status = _registration_status()
+                status_updates = {
+                    "configured": True,
+                    "url": agent_core_url,
+                    "ca_cert": ca_cert,
+                }
+                if current_status.get("state") != "error":
+                    status_updates.update(
+                        state="starting",
+                        last_error=None,
+                    )
+                _update_registration_status(**status_updates)
                 request = urllib.request.Request(
-                    f"{agent_core_url}/api/mcp", data=payload,
+                    endpoint, data=payload,
                     headers={"Content-Type": "application/json"}, method="POST"
                 )
                 with urllib.request.urlopen(request, timeout=3, context=context):
                     pass
+                _update_registration_status(
+                    state="ready",
+                    configured=True,
+                    url=agent_core_url,
+                    ca_cert=ca_cert,
+                    last_error=None,
+                    last_success_at=time.time(),
+                )
                 time.sleep(30)
             except Exception as exc:
+                _update_registration_status(
+                    state="error",
+                    configured=transport_ready,
+                    url=os.environ.get("AGENT_CORE_URL"),
+                    ca_cert=os.environ.get("AGENT_CORE_CA_CERT"),
+                    last_error=f"registration failed: {exc}",
+                    last_failure_at=time.time(),
+                )
                 print(f"[register] failed: {exc}; retrying in 5s", flush=True)
                 time.sleep(5)
 
