@@ -482,6 +482,8 @@ class _LocoStateNode(Node):
             imu = msg.imu_state
             data = {
                 "mode": int(msg.error_code) if hasattr(msg, 'error_code') else 0,
+                "sport_mode": int(msg.mode),
+                "gait_type": int(msg.gait_type),
                 "position": [round(float(p), 4) for p in msg.position],
                 "velocity": [round(float(v), 4) for v in msg.velocity],
                 "body_height": round(float(msg.body_height), 4),

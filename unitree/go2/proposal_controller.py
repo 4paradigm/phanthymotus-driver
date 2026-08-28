@@ -65,6 +65,8 @@ class Go2VelocityProposalController(Node):
         self._state_condition = threading.Condition()
         self._last_state_monotonic = 0.0
         self._last_velocity = (float("inf"), float("inf"), float("inf"))
+        self._last_sport_mode = None
+        self._last_gait_type = None
         self._stop_timeout = max(
             0.2, float(config.get("velocity_proposal_stop_confirm_timeout", 1.0))
         )
@@ -133,10 +135,14 @@ class Go2VelocityProposalController(Node):
                 float(velocity[1]),
                 float(payload["yaw_speed"]),
             )
+            sport_mode = int(payload["sport_mode"])
+            gait_type = int(payload["gait_type"])
         except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
             return
         with self._state_condition:
             self._last_velocity = sample
+            self._last_sport_mode = sport_mode
+            self._last_gait_type = gait_type
             self._last_state_monotonic = time.monotonic()
             self._state_condition.notify_all()
 
@@ -268,7 +274,7 @@ class Go2VelocityProposalController(Node):
                     ret = self._rpc.StopMove()
             except Exception as exc:  # hardware boundary: fail closed
                 return None, False, str(exc)
-            if ret != 0:
+            if ret not in (0, -1):
                 return ret, False, None
             deadline = time.monotonic() + self._stop_timeout
             with self._state_condition:
@@ -278,6 +284,13 @@ class Go2VelocityProposalController(Node):
                         self._last_state_monotonic >= boundary
                         and math.hypot(vx, vy) <= self._linear_epsilon
                         and abs(vyaw) <= self._yaw_epsilon
+                        and (
+                            ret == 0
+                            or (
+                                self._last_sport_mode == 0
+                                and self._last_gait_type == 0
+                            )
+                        )
                     ):
                         return ret, True, None
                     self._state_condition.wait(

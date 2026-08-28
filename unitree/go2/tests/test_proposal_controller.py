@@ -58,6 +58,7 @@ class FakeRpc:
         self.stops = 0
         self.on_stop = None
         self.move_delay = 0.0
+        self.stop_ret = 0
 
     def Move(self, vx, vy, vyaw):
         time.sleep(self.move_delay)
@@ -68,7 +69,7 @@ class FakeRpc:
         self.stops += 1
         if self.on_stop:
             self.on_stop()
-        return 0
+        return self.stop_ret
 
 
 def proposal(nav_id="nav-1", sequence=1, **changes):
@@ -104,6 +105,8 @@ class ProposalControllerTest(unittest.TestCase):
         controller._state_condition = threading.Condition()
         controller._last_state_monotonic = 0.0
         controller._last_velocity = (float("inf"),) * 3
+        controller._last_sport_mode = None
+        controller._last_gait_type = None
         controller._stop_timeout = 0.05
         controller._linear_epsilon = 0.04
         controller._yaw_epsilon = 0.08
@@ -182,6 +185,46 @@ class ProposalControllerTest(unittest.TestCase):
         self.assertTrue(confirmed)
         self.assertIsNone(error)
         self.assertEqual(controller._rpc.stops, 1)
+
+    def test_minus_one_stop_accepts_only_a_fresh_idle_zero_state(self):
+        controller = self.make_controller()
+        controller._rpc.stop_ret = -1
+
+        def publish_idle_zero():
+            with controller._state_condition:
+                controller._last_velocity = (0.01, 0.01, 0.02)
+                controller._last_sport_mode = 0
+                controller._last_gait_type = 0
+                controller._last_state_monotonic = time.monotonic()
+                controller._state_condition.notify_all()
+
+        controller._rpc.on_stop = publish_idle_zero
+        ret, confirmed, error = controller._stop_and_confirm()
+
+        self.assertEqual(ret, -1)
+        self.assertTrue(confirmed)
+        self.assertIsNone(error)
+        self.assertEqual(controller._rpc.stops, 1)
+
+    def test_minus_one_stop_fails_closed_outside_idle(self):
+        controller = self.make_controller()
+        controller._rpc.stop_ret = -1
+
+        def publish_non_idle_zero():
+            with controller._state_condition:
+                controller._last_velocity = (0.0, 0.0, 0.0)
+                controller._last_sport_mode = 3
+                controller._last_gait_type = 1
+                controller._last_state_monotonic = time.monotonic()
+                controller._state_condition.notify_all()
+
+        controller._rpc.on_stop = publish_non_idle_zero
+        ret, confirmed, error = controller._stop_and_confirm()
+
+        self.assertEqual(ret, -1)
+        self.assertFalse(confirmed)
+        self.assertIsNone(error)
+        self.assertEqual(controller._rpc.stops, 2)
 
     def test_repeated_connect_rejects_a_conflicting_explicit_lease(self):
         controller = self.make_controller()
