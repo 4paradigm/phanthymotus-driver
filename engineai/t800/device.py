@@ -409,6 +409,7 @@ class StatePlugin:
         self._last_joint_positions = [0.0] * len(T800_JOINT_NAMES)
         self._current_motion = ""
         self._available_motions: list[str] = []
+        self._motion_generation = 0
         self._health_providers: dict[str, object] = {}
 
         self._sub_node = Node("t800_state_sub", context=ros2.ctx_robot)
@@ -508,6 +509,14 @@ class StatePlugin:
     def current_motion(self) -> tuple[str, list[str]]:
         with self._lock:
             return self._current_motion, list(self._available_motions)
+
+    def motion_snapshot(self) -> tuple[str, list[str], int]:
+        with self._lock:
+            return (
+                self._current_motion,
+                list(self._available_motions),
+                self._motion_generation,
+            )
 
     def joint_positions(self) -> list[float]:
         with self._lock:
@@ -1040,6 +1049,7 @@ class StatePlugin:
         with self._lock:
             self._current_motion = msg.current_motion_task
             self._available_motions = list(msg.available_transition_motions)
+            self._motion_generation += 1
         self._set("motion_state", payload)
 
     def _publish_tick(self) -> None:
@@ -2679,13 +2689,16 @@ class DancePlugin:
         return self._motion_mode.dispatch("switch", forwarded)
 
 
+_JOINT_PLAN_COMPLETED_PROGRESS_MIN = 0.999
+
+
 class JointPlanPlugin:
     _LIMIT_MARGIN_RAD = 0.0
     # The native planner converges to values such as 0.999838584 instead of
     # publishing an exact 1.0.  Treat that as complete only together with the
     # exact request id and IDLE status, so the initial progress=0 IDLE echo
     # cannot complete a request before it executes.
-    _COMPLETED_PROGRESS_MIN = 0.999
+    _COMPLETED_PROGRESS_MIN = _JOINT_PLAN_COMPLETED_PROGRESS_MIN
     _PRESETS = {
         "shake_hand": {
             "indices": list(range(12, 25)),
@@ -2713,6 +2726,7 @@ class JointPlanPlugin:
         self._last_state = {"state": "no_data"}
         self._last_request = {}
         self._executing_requests: set[int] = set()
+        self._quiescent_requests: deque[int] = deque(maxlen=128)
         self._request_id = 0
         self._state_type = None
         self._head_lock = threading.Lock()
@@ -2920,6 +2934,21 @@ class JointPlanPlugin:
                     raise TimeoutError(f"joint planner did not complete request {target}")
                 self._state_changed.wait(timeout=min(remaining, 0.2))
 
+    def request_is_quiescent(self, request_id: int, state: dict) -> bool:
+        """Return whether exact feedback proves the request is no longer active."""
+        target = int(request_id)
+        with self._state_lock:
+            saw_executing = (
+                target in self._executing_requests
+                or target in self._quiescent_requests
+            )
+        return self._is_completed_idle_feedback(
+            state,
+            request_id=target,
+            idle_status=int(self._state_type.IDLE),
+            saw_executing=saw_executing,
+        )
+
     @classmethod
     def _is_completed_idle_feedback(
         cls,
@@ -3101,6 +3130,19 @@ class JointPlanPlugin:
             self._last_state = payload
             if self._state_type is not None and int(msg.status) == int(self._state_type.EXECUTING):
                 self._executing_requests.add(int(msg.request_id))
+            if (
+                self._state_type is not None
+                and self._is_completed_idle_feedback(
+                    payload,
+                    request_id=payload["request_id"],
+                    idle_status=int(self._state_type.IDLE),
+                    saw_executing=(
+                        payload["request_id"] in self._executing_requests
+                    ),
+                )
+                and payload["request_id"] not in self._quiescent_requests
+            ):
+                self._quiescent_requests.append(payload["request_id"])
             self._state_changed.notify_all()
         if payload["status"] in (0, 1, 3):
             with self._head_lock:
@@ -6604,6 +6646,7 @@ class GaitPlugin:
     """
 
     PREFIX = "gait"
+    _RESTORE_TIMEOUT_SEC = 2.0
 
     def __init__(self, config: dict, motion_mode: "MotionModePlugin", state: StatePlugin):
         self._motion_mode = motion_mode
@@ -6627,7 +6670,25 @@ class GaitPlugin:
         self._selection_lock = threading.Lock()
         self._selection_thread: threading.Thread | None = None
         self._selection_action_id: str | None = None
+        self._selection_cancel = threading.Event()
+        self._selection_origin = ""
+        self._selection_target = ""
+        self._selection_restore_requested = False
+        self._selection_restore_generation = -1
+        self._selection_settling = False
+        self._selection_settle_origin = ""
+        self._transition_timeout_sec = clamp(
+            config.get("control", {}).get(
+                "mode_transition_timeout_sec", 10.0
+            ),
+            0.1,
+            14.0,
+        )
+        self._restore_timeout_sec = min(
+            self._transition_timeout_sec, self._RESTORE_TIMEOUT_SEC
+        )
         self._acp_notify = _t800_acp_notify
+        self._interrupt_group: MotionInterruptGroup | None = None
 
     def get_tool(self) -> dict:
         return {
@@ -6643,31 +6704,34 @@ class GaitPlugin:
 
     def _input_schema(self) -> dict:
         schema = action_schema(
-                {
-                    "start": ([], "启动卡片（actuator 生命周期）"),
-                    "stop": ([], "停止卡片（不强制改变机器人状态）"),
-                    "info": ([], "查询当前步态与可用性"),
-                    "status": ([], "查询当前步态与可用性"),
-                    "list": ([], "列出步态档位与当前固件的可用性"),
-                    "select": (["gait"], "选择步态档位"),
+            {
+                "start": ([], "启动卡片（actuator 生命周期）"),
+                "stop": ([], "停止卡片（不强制改变机器人状态）"),
+                "info": ([], "查询当前步态与可用性"),
+                "status": ([], "查询当前步态与可用性"),
+                "list": ([], "列出步态档位与当前固件的可用性"),
+                "select": (["gait"], "选择步态档位"),
+            },
+            {
+                "gait": {
+                    "type": "string",
+                    "enum": list(self._profiles),
+                    "description": "步态档位",
                 },
-                {
-                    "gait": {
-                        "type": "string",
-                        "enum": list(self._profiles),
-                        "description": "步态档位",
-                    },
-                },
-                "步态动作",
-            )
+            },
+            "步态动作",
+        )
         schema["x-completion"] = {"actions": ["select"], "timeout": 15}
+        schema["x-hooks"] = {
+            "on_interrupt_gait": {"action": "stop"},
+        }
         return schema
 
     def start(self) -> None:
         pass
 
     def stop(self) -> None:
-        pass
+        self.halt()
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "start":
@@ -6678,7 +6742,14 @@ class GaitPlugin:
         if action in ("info", "status"):
             return self._status()
         if action == "stop":
-            return {"state": "idle"}
+            if self._interrupt_group is not None:
+                group_result = self._interrupt_group.interrupt()
+                result = dict(group_result["outputs"].get("gait") or {
+                    "state": group_result["state"],
+                })
+                result["interrupted_outputs"] = group_result["outputs"]
+                return result
+            return self.halt()
         if action == "list":
             return self._list_profiles()
         if action == "select":
@@ -6701,15 +6772,21 @@ class GaitPlugin:
         return None
 
     def _status(self) -> dict:
+        settling = self._refresh_selection_settling()
         current, available = self._state.current_motion()
         profile = self._profile_for_motion(current)
         with self._selection_lock:
-            selecting = (
-                self._selection_thread is not None
-                and self._selection_thread.is_alive()
-            )
+            selecting = self._selection_action_id is not None
         return {
-            "state": "switching" if selecting else ("active" if profile else "inactive"),
+            "state": (
+                "switching"
+                if selecting
+                else (
+                    "settling"
+                    if settling
+                    else ("active" if profile else "inactive")
+                )
+            ),
             "gait": profile,
             "motion_state": current,
             "available_motion_states": available,
@@ -6761,63 +6838,324 @@ class GaitPlugin:
                 "available": available,
             }
 
-        with self._selection_lock:
-            if (
-                self._selection_thread is not None
-                and self._selection_thread.is_alive()
-            ):
-                return {
-                    "error": "another gait transition is already running",
-                    "action_id": self._selection_action_id,
-                }
-            action_id = f"t800_gait_{uuid4().hex[:12]}"
-            self._selection_action_id = action_id
+        action_id = ""
+        cancel_event = threading.Event()
 
         def switch() -> None:
             try:
-                result = self._motion_mode.dispatch("switch", {
-                    "target": target,
-                    "force": False,
-                    "wait": True,
-                })
-                if "error" in result or result.get("state") in (
-                    "error", "failed", "timeout"
-                ):
+                with self._selection_lock:
+                    if cancel_event.is_set():
+                        result = {"state": "cancelled"}
+                    else:
+                        result = self._motion_mode.dispatch("switch", {
+                            "target": target,
+                            "force": False,
+                            "wait": False,
+                        })
+                if "error" in result:
                     completion = "error"
                 else:
-                    completion = "completed"
+                    deadline = (
+                        time.monotonic() + self._transition_timeout_sec
+                    )
+                    while (
+                        result.get("state") != "cancelled"
+                        and time.monotonic() < deadline
+                    ):
+                        if cancel_event.is_set():
+                            result = {"state": "cancelled"}
+                            break
+                        current_motion, available_motion = (
+                            self._state.current_motion()
+                        )
+                        if current_motion == target:
+                            result = {
+                                "state": "completed",
+                                "current": current_motion,
+                                "available": available_motion,
+                            }
+                            break
+                        cancel_event.wait(timeout=0.05)
+                    else:
+                        if result.get("state") != "cancelled":
+                            current_motion, available_motion = (
+                                self._state.current_motion()
+                            )
+                            result = {
+                                "state": "timeout",
+                                "target": target,
+                                "current": current_motion,
+                                "available": available_motion,
+                            }
+                    if result.get("state") == "timeout":
+                        with self._selection_lock:
+                            if self._selection_action_id == action_id:
+                                cancel_event.set()
+                                _, _, restore_generation = (
+                                    self._motion_feedback_snapshot()
+                                )
+                                try:
+                                    restore_result = (
+                                        self._motion_mode.dispatch("switch", {
+                                            "target": self._selection_origin,
+                                            "force": True,
+                                            "wait": False,
+                                        })
+                                        if self._selection_origin
+                                        else {"state": "not_requested"}
+                                    )
+                                except Exception as exc:
+                                    restore_result = {"error": str(exc)}
+                                self._selection_restore_requested = (
+                                    bool(self._selection_origin)
+                                    and "error" not in restore_result
+                                )
+                                self._selection_restore_generation = (
+                                    restore_generation
+                                )
+                    if result.get("state") == "cancelled":
+                        completion = "cancelled"
+                    elif result.get("state") in (
+                        "error", "failed", "timeout"
+                    ):
+                        completion = "error"
+                    else:
+                        completion = "completed"
                 completion_result = {
                     "gait": profile,
                     "motion_state": target,
                     **result,
                 }
             except Exception as exc:
-                completion = "error"
+                completion = (
+                    "cancelled" if cancel_event.is_set() else "error"
+                )
                 completion_result = {
                     "gait": profile,
                     "motion_state": target,
                     "error": str(exc),
                 }
             finally:
-                with self._selection_lock:
-                    if self._selection_action_id == action_id:
-                        self._selection_action_id = None
+                restore_checked = False
+                restore_confirmed = False
+                while True:
+                    with self._selection_lock:
+                        cancelled = cancel_event.is_set()
+                        if not cancelled or restore_checked:
+                            if cancelled:
+                                if restore_confirmed:
+                                    if completion_result.get("state") == "timeout":
+                                        completion = "error"
+                                        completion_result = {
+                                            **completion_result,
+                                            "state": "timeout_recovered",
+                                            "restore_motion_state": (
+                                                self._selection_origin
+                                            ),
+                                            "error": (
+                                                "gait transition timed out; "
+                                                "origin state restored"
+                                            ),
+                                        }
+                                    else:
+                                        completion = "cancelled"
+                                        completion_result = {
+                                            **completion_result,
+                                            "state": "cancelled",
+                                            "restore_motion_state": (
+                                                self._selection_origin
+                                            ),
+                                        }
+                                else:
+                                    completion = "error"
+                                    completion_result = {
+                                        **completion_result,
+                                        "state": "settling_after_cancel",
+                                        "restore_motion_state": (
+                                            self._selection_origin
+                                        ),
+                                        "error": (
+                                            "gait cancellation was not "
+                                            "confirmed by motion-state feedback"
+                                        ),
+                                    }
+                                    self._selection_settling = True
+                                    self._selection_settle_origin = (
+                                        self._selection_origin
+                                    )
+                            if self._selection_action_id == action_id:
+                                self._selection_action_id = None
+                            break
+                        restore_requested = (
+                            self._selection_restore_requested
+                        )
+                        restore_generation = (
+                            self._selection_restore_generation
+                        )
+                        restore_origin = self._selection_origin
+                    restore_confirmed = self._wait_for_restore(
+                        restore_origin,
+                        restore_requested=restore_requested,
+                        after_generation=restore_generation,
+                    )
+                    restore_checked = True
                 self._acp_notify(
                     action_id, completion, completion_result, self.PREFIX
                 )
 
-        self._selection_thread = threading.Thread(
-            target=switch,
-            daemon=True,
-            name="t800-gait-select",
-        )
-        self._selection_thread.start()
+        with self._selection_lock:
+            if (
+                self._selection_action_id is not None
+                or self._selection_settling
+            ):
+                return {
+                    "error": (
+                        "another gait transition is already running"
+                        if self._selection_action_id is not None
+                        else "previous gait transition is still settling"
+                    ),
+                    "action_id": self._selection_action_id,
+                }
+            action_id = f"t800_gait_{uuid4().hex[:12]}"
+            self._selection_action_id = action_id
+            self._selection_cancel = cancel_event
+            self._selection_origin = current
+            self._selection_target = target
+            self._selection_restore_requested = False
+            self._selection_restore_generation = -1
+            thread = threading.Thread(
+                target=switch,
+                daemon=True,
+                name="t800-gait-select",
+            )
+            self._selection_thread = thread
+        thread.start()
         return {
             "state": "switching",
             "gait": profile,
             "motion_state": target,
             "action_id": action_id,
         }
+
+    def halt(self) -> dict:
+        with self._selection_lock:
+            action_id = self._selection_action_id
+            if action_id is None:
+                if not self._selection_settling:
+                    return {"state": "idle"}
+                origin = self._selection_settle_origin
+                _, _, restore_generation = self._motion_feedback_snapshot()
+                try:
+                    restore_result = self._motion_mode.dispatch("switch", {
+                        "target": origin,
+                        "force": True,
+                        "wait": False,
+                    })
+                except Exception as exc:
+                    restore_result = {"error": str(exc)}
+                self._selection_restore_requested = (
+                    "error" not in restore_result
+                )
+                self._selection_restore_generation = restore_generation
+                retrying_settle = True
+            else:
+                retrying_settle = False
+                cancel_event = self._selection_cancel
+                origin = self._selection_origin
+                target = self._selection_target
+                cancel_event.set()
+                _, _, restore_generation = self._motion_feedback_snapshot()
+                try:
+                    restore_result = (
+                        self._motion_mode.dispatch("switch", {
+                            "target": origin,
+                            "force": True,
+                            "wait": False,
+                        })
+                        if origin
+                        else {"state": "not_requested"}
+                    )
+                except Exception as exc:
+                    restore_result = {"error": str(exc)}
+                self._selection_restore_requested = (
+                    bool(origin) and "error" not in restore_result
+                )
+                self._selection_restore_generation = restore_generation
+        if retrying_settle:
+            settling = self._refresh_selection_settling()
+            return {
+                "state": "settling" if settling else "idle",
+                "restore_motion_state": origin,
+                "restore_result": restore_result,
+            }
+        return {
+            "state": "cancelling",
+            "action_id": action_id,
+            "target": target,
+            "restore_motion_state": origin,
+            "restore_result": restore_result,
+        }
+
+    def motion_active(self) -> bool:
+        self._refresh_selection_settling()
+        with self._selection_lock:
+            return (
+                self._selection_action_id is not None
+                or self._selection_settling
+            )
+
+    def set_interrupt_group(self, group: MotionInterruptGroup) -> None:
+        self._interrupt_group = group
+
+    def _wait_for_restore(
+        self,
+        origin: str,
+        *,
+        restore_requested: bool,
+        after_generation: int,
+    ) -> bool:
+        if not origin or not restore_requested:
+            return False
+        deadline = time.monotonic() + self._restore_timeout_sec
+        while time.monotonic() < deadline:
+            current, _, generation = self._motion_feedback_snapshot()
+            if current == origin and generation > after_generation:
+                return True
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        return False
+
+    def _refresh_selection_settling(self) -> bool:
+        with self._selection_lock:
+            settling = self._selection_settling
+            origin = self._selection_settle_origin
+            restore_requested = self._selection_restore_requested
+            restore_generation = self._selection_restore_generation
+        if not settling:
+            return False
+        current, _, generation = self._motion_feedback_snapshot()
+        if (
+            restore_requested
+            and current == origin
+            and generation > restore_generation
+        ):
+            with self._selection_lock:
+                if (
+                    self._selection_settling
+                    and self._selection_settle_origin == origin
+                    and self._selection_restore_requested
+                ):
+                    self._selection_settling = False
+                    self._selection_settle_origin = ""
+                    return False
+        return True
+
+    def _motion_feedback_snapshot(self) -> tuple[str, list[str], int]:
+        snapshot = getattr(self._state, "motion_snapshot", None)
+        if callable(snapshot):
+            current, available, generation = snapshot()
+            return str(current), list(available), int(generation)
+        current, available = self._state.current_motion()
+        return str(current), list(available), -1
 
 
 class MotionRecorderPlugin:
@@ -6839,6 +7177,7 @@ class MotionRecorderPlugin:
     _MAX_RECORDING_DURATION_MS = 5 * 60 * 1000
     _MAX_RECORDING_FILE_BYTES = 32 * 1024 * 1024
     _MAX_PLAYBACK_SAMPLES = 60_000
+    _RESET_SETTLE_TIMEOUT_SEC = 2.0
     _DEFAULT_PLAYBACK_STIFFNESS = (
         200.0, 30.0, 30.0, 15.0, 30.0, 15.0,
         40.0, 40.0, 20.0, 40.0, 20.0, 100.0, 100.0,
@@ -6874,6 +7213,9 @@ class MotionRecorderPlugin:
         self._reset_timeout_sec = clamp(
             recorder_config.get("reset_timeout_sec", 15.0), 1.0, 120.0
         )
+        self._reset_settle_timeout_sec = min(
+            self._reset_timeout_sec, self._RESET_SETTLE_TIMEOUT_SEC
+        )
         self._playback_stiffness = float_list(
             recorder_config.get("playback_stiffness", self._DEFAULT_PLAYBACK_STIFFNESS),
             "playback_stiffness",
@@ -6899,10 +7241,12 @@ class MotionRecorderPlugin:
         self._frames: list[dict] = []
         self._recording = False
         self._record_thread: threading.Thread | None = None
+        self._record_finalize_threads: set[threading.Thread] = set()
         self._record_stop = threading.Event()
         self._record_label = ""
         self._record_start_ms = 0
         self._record_session = 0
+        self._record_action_id: str | None = None
         self._last_sample_at: float | None = None
         self._last_recording: dict | None = None
         self._joint_state_sub = None
@@ -6975,6 +7319,7 @@ class MotionRecorderPlugin:
         }
         input_schema["x-hooks"] = {
             "on_interrupt_motion": {"action": "stop_playback"},
+            "on_interrupt_recording": {"action": "record_stop"},
         }
         return {
             "name": self.PREFIX,
@@ -7021,6 +7366,13 @@ class MotionRecorderPlugin:
 
     def stop(self) -> None:
         self.halt()
+        while True:
+            with self._lock:
+                finalize_threads = list(self._record_finalize_threads)
+            if not finalize_threads:
+                break
+            for finalize_thread in finalize_threads:
+                finalize_thread.join()
         if self._node:
             try:
                 self._ros2.executor_robot.remove_node(self._node)
@@ -7035,7 +7387,9 @@ class MotionRecorderPlugin:
     def halt(self) -> None:
         """Stop recording/playback while keeping ROS resources reusable."""
         self._prepare_cancel.set()
-        self._finalize_recording(stop_reason="shutdown")
+        self._finalize_recording(
+            stop_reason="shutdown", async_persist=True
+        )
         self._stop_playback()
 
     # ── ROS2 callbacks ────────────────────────────────────────────────────────
@@ -7140,6 +7494,7 @@ class MotionRecorderPlugin:
         if claimed is None:
             with self._lock:
                 active_action_id = self._prepare_action_id
+                saving = bool(self._record_finalize_threads)
                 if self._recording:
                     return {
                         "state": "recording",
@@ -7151,6 +7506,10 @@ class MotionRecorderPlugin:
                     }
                 if self._playing:
                     return {"error": "cannot record while playing"}
+                if saving:
+                    return {
+                        "error": "previous recording is still saving"
+                    }
             return {
                 "error": "another recorder action is preparing",
                 "action_id": active_action_id,
@@ -7158,20 +7517,33 @@ class MotionRecorderPlugin:
         action_id, cancel_event = claimed
 
         def prepare() -> None:
+            notify_from_prepare = True
             completion = "completed"
             try:
                 self._reset_before_action(
                     "recording", action_id, cancel_event
                 )
-                result = self._begin_recording(args, duration)
+                with self._lock:
+                    if cancel_event.is_set():
+                        raise RuntimeError(
+                            "recording preparation cancelled"
+                        )
+                    result = self._begin_recording(
+                        args, duration, action_id=action_id
+                    )
                 if "error" in result:
                     completion = "error"
+                else:
+                    notify_from_prepare = False
             except Exception as exc:
                 completion = "cancelled" if cancel_event.is_set() else "error"
                 result = {"error": str(exc)}
             finally:
                 self._release_prepare(action_id)
-                self._acp_notify(action_id, completion, result, self.PREFIX)
+                if notify_from_prepare:
+                    self._acp_notify(
+                        action_id, completion, result, self.PREFIX
+                    )
 
         thread = threading.Thread(
             target=prepare,
@@ -7194,6 +7566,8 @@ class MotionRecorderPlugin:
     ) -> tuple[str, threading.Event] | None:
         with self._lock:
             if self._prepare_action_id is not None:
+                return None
+            if self._record_finalize_threads:
                 return None
             if (
                 self._playback_thread is not None
@@ -7276,14 +7650,38 @@ class MotionRecorderPlugin:
             joint_plan.wait_for_request(
                 request_id, self._reset_timeout_sec, cancel_event
             )
-        except Exception:
+        except Exception as reset_exc:
             try:
                 joint_plan.dispatch("cancel", {"request_id": request_id})
             except Exception:
                 pass
             # Fail closed: do not complete the parent ACP action until the
-            # exact planner request is physically quiescent.
-            self._wait_reset_idle(request_id, joint_plan)
+            # exact planner request is physically quiescent.  Bound this
+            # confirmation wait so the worker can still post an ACP error;
+            # the local motion gate remains closed until late IDLE feedback
+            # is observed by _refresh_reset_state().
+            try:
+                self._wait_reset_idle(
+                    request_id,
+                    joint_plan,
+                    timeout=self._reset_settle_timeout_sec,
+                )
+            except TimeoutError as settle_exc:
+                with self._lock:
+                    if self._reset_request_id == request_id:
+                        self._reset_action_id = None
+                        self._reset_cancelling = True
+                        self._needs_reset = True
+                        self._last_reset = {
+                            **dict(self._last_reset or {}),
+                            "state": "settling_after_error",
+                            "error": str(reset_exc),
+                            "settle_error": str(settle_exc),
+                        }
+                raise RuntimeError(
+                    f"reset request {request_id} failed and did not become "
+                    "IDLE after cancellation"
+                ) from reset_exc
             with self._lock:
                 if self._reset_request_id == request_id:
                     self._reset_request_id = None
@@ -7312,21 +7710,59 @@ class MotionRecorderPlugin:
                 }
         return dict(self._last_reset)
 
-    def _wait_reset_idle(self, request_id: int, joint_plan) -> None:
-        while True:
+    def _wait_reset_idle(
+        self,
+        request_id: int,
+        joint_plan,
+        *,
+        timeout: float,
+    ) -> None:
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while time.monotonic() < deadline:
             try:
                 status = joint_plan.dispatch("status", {})
             except Exception:
-                time.sleep(0.05)
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
                 continue
-            if (
-                int(status.get("request_id", -1)) == int(request_id)
-                and int(status.get("status", -1)) == 1
+            if self._reset_status_is_quiescent(
+                request_id, status, joint_plan
             ):
                 return
-            time.sleep(0.05)
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        raise TimeoutError(
+            f"joint planner request {request_id} did not become IDLE after cancel"
+        )
 
-    def _begin_recording(self, args: dict, duration: float) -> dict:
+    @staticmethod
+    def _reset_status_is_quiescent(
+        request_id: int,
+        status: dict,
+        joint_plan,
+    ) -> bool:
+        checker = getattr(joint_plan, "request_is_quiescent", None)
+        if callable(checker):
+            try:
+                return bool(checker(request_id, status))
+            except Exception:
+                return False
+        try:
+            return (
+                int(status.get("request_id", -1)) == int(request_id)
+                and int(status.get("status", -1)) == 1
+                and math.isfinite(float(status.get("progress", 0.0)))
+                and float(status.get("progress", 0.0))
+                >= _JOINT_PLAN_COMPLETED_PROGRESS_MIN
+            )
+        except (TypeError, ValueError):
+            return False
+
+    def _begin_recording(
+        self,
+        args: dict,
+        duration: float,
+        *,
+        action_id: str,
+    ) -> dict:
 
         with self._lock:
             if self._recording:
@@ -7345,6 +7781,7 @@ class MotionRecorderPlugin:
             self._record_start_ms = _now_ms()
             self._last_sample_at = None
             self._record_session += 1
+            self._record_action_id = action_id
             session_id = self._record_session
             self._record_stop.clear()
 
@@ -7376,12 +7813,16 @@ class MotionRecorderPlugin:
 
     def _record_stop_action(self) -> dict:
         with self._lock:
+            recording = self._recording
             preparing_record = (
                 self._prepare_operation == "record_start"
                 and self._prepare_action_id is not None
             )
+            if preparing_record and not recording:
+                self._prepare_cancel.set()
+        if recording:
+            return self._finalize_recording(stop_reason="manual")
         if preparing_record:
-            self._prepare_cancel.set()
             reset_result = self._cancel_reset(reason="record_stop")
             return {
                 "state": "stopping",
@@ -7395,6 +7836,7 @@ class MotionRecorderPlugin:
         *,
         expected_session: int | None = None,
         stop_reason: str,
+        async_persist: bool = False,
     ) -> dict:
         with self._lock:
             if not self._recording or (
@@ -7412,14 +7854,63 @@ class MotionRecorderPlugin:
             frames = list(self._frames)
             label = self._record_label
             session_id = self._record_session
+            action_id = self._record_action_id
+            self._record_action_id = None
             if frames:
                 self._needs_reset = True
                 self._reset_request_id = None
 
-        # Auto-save
+        if async_persist:
+            def persist() -> None:
+                try:
+                    self._persist_recording(
+                        frames,
+                        label,
+                        session_id,
+                        action_id,
+                        stop_reason,
+                    )
+                finally:
+                    with self._lock:
+                        self._record_finalize_threads.discard(
+                            threading.current_thread()
+                        )
+
+            thread = threading.Thread(
+                target=persist,
+                daemon=True,
+                name=f"t800-motion-record-save-{session_id}",
+            )
+            with self._lock:
+                self._record_finalize_threads.add(thread)
+            thread.start()
+            return {
+                "state": "stopping",
+                "recording": False,
+                "label": label,
+                "frames": len(frames),
+                "stop_reason": stop_reason,
+                "session_id": session_id,
+            }
+
+        return self._persist_recording(
+            frames, label, session_id, action_id, stop_reason
+        )
+
+    def _persist_recording(
+        self,
+        frames: list[dict],
+        label: str,
+        session_id: int,
+        action_id: str | None,
+        stop_reason: str,
+    ) -> dict:
         safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", label).strip("._")
         safe_name = safe_name or f"recording_{int(time.time())}"
         save_path = self._recordings_dir / f"{safe_name}.json"
+        temp_path = self._recordings_dir / (
+            f".{safe_name}.{session_id}.{uuid4().hex}.tmp"
+        )
         frame_count = len(frames)
         metadata = {
             "label": label,
@@ -7435,11 +7926,16 @@ class MotionRecorderPlugin:
             "frames": frames,
         }
         try:
-            save_path.write_text(
+            temp_path.write_text(
                 json.dumps(recording, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-        except OSError as exc:
+            os.replace(temp_path, save_path)
+        except (OSError, TypeError, ValueError) as exc:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
             result = {
                 "state": "error",
                 "recording": False,
@@ -7451,6 +7947,9 @@ class MotionRecorderPlugin:
             }
             with self._lock:
                 self._last_recording = dict(result)
+            self._notify_recording_completion(
+                action_id, result, stop_reason=stop_reason
+            )
             return result
 
         result = {
@@ -7465,7 +7964,29 @@ class MotionRecorderPlugin:
         }
         with self._lock:
             self._last_recording = dict(result)
+        self._notify_recording_completion(
+            action_id, result, stop_reason=stop_reason
+        )
         return result
+
+    def _notify_recording_completion(
+        self,
+        action_id: str | None,
+        result: dict,
+        *,
+        stop_reason: str,
+    ) -> None:
+        if action_id is None:
+            return
+        if result.get("state") == "error":
+            completion = "error"
+        elif stop_reason in ("shutdown", "lifecycle", "motion_interrupt"):
+            completion = "cancelled"
+        elif stop_reason == "motion_state_changed":
+            completion = "error"
+        else:
+            completion = "completed"
+        self._acp_notify(action_id, completion, result, self.PREFIX)
 
     # ── Playback ──────────────────────────────────────────────────────────────
 
@@ -7541,10 +8062,15 @@ class MotionRecorderPlugin:
         if claimed is None:
             with self._lock:
                 active_action_id = self._prepare_action_id
+                saving = bool(self._record_finalize_threads)
                 if self._recording:
                     return {"error": "cannot play while recording"}
                 if self._playing:
                     return {"error": "already playing; stop first"}
+                if saving:
+                    return {
+                        "error": "previous recording is still saving"
+                    }
             return {
                 "error": "another recorder action is preparing",
                 "action_id": active_action_id,
@@ -7889,6 +8415,9 @@ class MotionRecorderPlugin:
                 "record_elapsed_ms": elapsed_ms,
                 "record_hz": self._record_hz,
                 "record_session_id": self._record_session if self._recording else None,
+                "record_action_id": self._record_action_id,
+                "saving": bool(self._record_finalize_threads),
+                "save_workers": len(self._record_finalize_threads),
                 "preparing": (
                     self._prepare_action_id is not None
                 ),
@@ -7925,7 +8454,8 @@ class MotionRecorderPlugin:
     def motion_active(self) -> bool:
         with self._lock:
             return (
-                self._playing
+                self._recording
+                or self._playing
                 or self._prepare_action_id is not None
                 or self._reset_request_id is not None
                 or self._override_release_failed
@@ -7933,7 +8463,19 @@ class MotionRecorderPlugin:
 
     def interrupt_motion(self) -> dict:
         """Stop recorder-owned physical output without re-entering the group."""
-        return self._stop_playback()
+        self._prepare_cancel.set()
+        with self._lock:
+            was_recording = self._recording
+        recording_result = self._finalize_recording(
+            stop_reason="motion_interrupt", async_persist=True
+        )
+        playback_result = self._stop_playback()
+        result = dict(playback_result)
+        if was_recording:
+            result["recording_result"] = recording_result
+            if result.get("state") == "idle":
+                result["state"] = "stopped"
+        return result
 
     def _lower_body_balance_error(self, operation: str) -> dict | None:
         if self._state is None:
@@ -7959,6 +8501,7 @@ class MotionRecorderPlugin:
             cancelling = self._reset_cancelling
             if (
                 request_id is not None
+                and self._reset_action_id is not None
                 and self._prepare_action_id == self._reset_action_id
             ):
                 return
@@ -7975,9 +8518,8 @@ class MotionRecorderPlugin:
                         "status_error": str(exc),
                     }
             return
-        if (
-            int(status.get("request_id", -1)) == request_id
-            and int(status.get("status", -1)) == 1
+        if self._reset_status_is_quiescent(
+            request_id, status, joint_plan
         ):
             completed_action_id = None
             completion_status = "completed"

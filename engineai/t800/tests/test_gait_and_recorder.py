@@ -199,11 +199,24 @@ def load_device():
 
 class FakeMotionState:
     def __init__(self, current="pd_stand", available=None):
-        self.current = current
+        self._current = current
+        self._generation = 0
         self.available = list(available or [])
+
+    @property
+    def current(self):
+        return self._current
+
+    @current.setter
+    def current(self, value):
+        self._current = value
+        self._generation += 1
 
     def current_motion(self):
         return self.current, list(self.available)
+
+    def motion_snapshot(self):
+        return self.current, list(self.available), self._generation
 
 
 class FakeMotionMode:
@@ -216,10 +229,11 @@ class FakeMotionMode:
         target = args["target"]
         if self.state.available and target not in self.state.available and not args.get("force", False):
             return {"error": f"{target} is not available", "available": self.state.available}
+        previous = self.state.current
+        self.state.current = target
         if args.get("wait", True):
-            self.state.current = target
             return {"state": "completed", "current": target, "available": self.state.available}
-        return {"state": "requested", "target": target, "previous": self.state.current}
+        return {"state": "requested", "target": target, "previous": previous}
 
 
 class GaitPluginContractTests(unittest.TestCase):
@@ -276,7 +290,7 @@ class GaitPluginContractTests(unittest.TestCase):
         self.assertTrue(result["action_id"].startswith("t800_gait_"))
         self.plugin._selection_thread.join(timeout=1.0)
         self.assertEqual(
-            ("switch", {"target": "rl_basic", "force": False, "wait": True}),
+            ("switch", {"target": "rl_basic", "force": False, "wait": False}),
             self.motion_mode.calls[-1],
         )
         self.assertEqual(result["action_id"], completions[0][0])
@@ -289,6 +303,75 @@ class GaitPluginContractTests(unittest.TestCase):
         self.assertEqual("switching", result["state"])
         self.plugin._selection_thread.join(timeout=1.0)
         self.assertEqual("walk", self.motion_mode.calls[-1][1]["target"])
+
+    def test_concurrent_select_claim_is_atomic_before_thread_assignment(self):
+        class BlockingMotionMode(FakeMotionMode):
+            def __init__(self, state):
+                super().__init__(state)
+                self.release = threading.Event()
+
+            def dispatch(self, action, args):
+                self.calls.append((action, dict(args)))
+                self.release.wait(timeout=1.0)
+                self.state.current = args["target"]
+                return {
+                    "state": "completed",
+                    "current": args["target"],
+                    "available": self.state.available,
+                }
+
+        motion_mode = BlockingMotionMode(self.state)
+        plugin = self.dev.GaitPlugin(
+            {"plugins": {"gait": {
+                "basic_motion_states": ["rl_basic", "walk"]
+            }}},
+            motion_mode,
+            self.state,
+        )
+        plugin._acp_notify = lambda *_args: None
+        original_thread = self.dev.threading.Thread
+        constructor_entered = threading.Event()
+        release_constructor = threading.Event()
+        constructor_calls = 0
+
+        def pausing_thread(*args, **kwargs):
+            nonlocal constructor_calls
+            constructor_calls += 1
+            if constructor_calls == 1:
+                constructor_entered.set()
+                release_constructor.wait(timeout=1.0)
+            return original_thread(*args, **kwargs)
+
+        results = [{}, {}]
+        self.dev.threading.Thread = pausing_thread
+        try:
+            callers = [
+                original_thread(
+                    target=lambda index=index: results[index].update(
+                        plugin.dispatch("select", {"gait": "拟人步态"})
+                    )
+                )
+                for index in range(2)
+            ]
+            callers[0].start()
+            self.assertTrue(constructor_entered.wait(timeout=1.0))
+            callers[1].start()
+            time.sleep(0.02)
+            release_constructor.set()
+            for caller in callers:
+                caller.join(timeout=1.0)
+        finally:
+            self.dev.threading.Thread = original_thread
+            release_constructor.set()
+            motion_mode.release.set()
+
+        switching = [result for result in results if result.get("state") == "switching"]
+        rejected = [result for result in results if "error" in result]
+        self.assertEqual(1, len(switching))
+        self.assertEqual(1, len(rejected))
+        self.assertEqual(
+            switching[0]["action_id"], rejected[0]["action_id"]
+        )
 
     def test_legacy_walk_selected_by_gait_is_accepted_by_loco(self):
         self.state.available = ["walk"]
@@ -357,6 +440,159 @@ class GaitPluginContractTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertEqual(moving["action_id"], completions[0][0])
         self.assertEqual("cancelled", completions[0][1])
+
+    def test_stop_hook_cancels_gait_and_supersedes_pending_transition(self):
+        class PendingMotionMode:
+            def __init__(self, state):
+                self.state = state
+                self.calls = []
+                self.requested = threading.Event()
+
+            def dispatch(self, action, args):
+                self.calls.append((action, dict(args)))
+                if args["target"] == "rl_basic":
+                    self.requested.set()
+                else:
+                    self.state.current = args["target"]
+                return {
+                    "state": "requested",
+                    "target": args["target"],
+                }
+
+        self.state.current = "pd_stand"
+        motion_mode = PendingMotionMode(self.state)
+        plugin = self.dev.GaitPlugin(
+            {
+                "control": {"mode_transition_timeout_sec": 1.0},
+                "plugins": {"gait": {
+                    "basic_motion_states": ["rl_basic", "walk"]
+                }},
+            },
+            motion_mode,
+            self.state,
+        )
+        completions = []
+        plugin._acp_notify = lambda *args: completions.append(args)
+        group = self.dev.MotionInterruptGroup()
+        plugin.set_interrupt_group(group)
+        group.register("gait", plugin.halt, plugin.motion_active)
+        harness = AgentCoreBarrierContractHarness()
+        harness.register(plugin.get_tool(), plugin.dispatch)
+
+        selected = harness.call(
+            "gait", "select", {"gait": "拟人步态"}
+        )
+        self.assertTrue(motion_mode.requested.wait(timeout=1.0))
+        self.assertEqual({selected["action_id"]}, harness.pending_actions())
+
+        stopped = harness.call("gait", "stop", {})
+        self.assertEqual(set(), harness.pending_actions())
+        self.assertIn(stopped["state"], ("cancelling", "cancelled"))
+        plugin._selection_thread.join(timeout=1.0)
+        self.assertFalse(plugin.motion_active())
+        self.assertEqual(selected["action_id"], completions[0][0])
+        self.assertEqual("cancelled", completions[0][1])
+        self.assertTrue(any(
+            action == "switch"
+            and args == {
+                "target": "pd_stand",
+                "force": True,
+                "wait": False,
+            }
+            for action, args in motion_mode.calls
+        ))
+        self.assertEqual([], group.blocking_outputs())
+
+    def test_gait_cancel_stays_fail_closed_until_origin_feedback(self):
+        class LateTargetMotionMode:
+            def __init__(self, state):
+                self.state = state
+                self.requested = threading.Event()
+
+            def dispatch(self, _action, args):
+                if args["target"] == "rl_basic":
+                    self.requested.set()
+                else:
+                    # Simulate the original request taking effect after the
+                    # restore request was already published.
+                    self.state.current = "rl_basic"
+                return {"state": "requested", "target": args["target"]}
+
+        self.state.current = "pd_stand"
+        motion_mode = LateTargetMotionMode(self.state)
+        plugin = self.dev.GaitPlugin(
+            {
+                "control": {"mode_transition_timeout_sec": 1.0},
+                "plugins": {"gait": {
+                    "basic_motion_states": ["rl_basic", "walk"]
+                }},
+            },
+            motion_mode,
+            self.state,
+        )
+        plugin._restore_timeout_sec = 0.02
+        completions = []
+        plugin._acp_notify = lambda *args: completions.append(args)
+        group = self.dev.MotionInterruptGroup()
+        plugin.set_interrupt_group(group)
+        group.register("gait", plugin.halt, plugin.motion_active)
+
+        selected = plugin.dispatch("select", {"gait": "拟人步态"})
+        self.assertTrue(motion_mode.requested.wait(timeout=1.0))
+        stopped = plugin.halt()
+        self.assertEqual("cancelling", stopped["state"])
+        plugin._selection_thread.join(timeout=1.0)
+
+        self.assertEqual(selected["action_id"], completions[0][0])
+        self.assertEqual("error", completions[0][1])
+        self.assertTrue(plugin.motion_active())
+        self.assertEqual(["gait"], group.blocking_outputs())
+        self.assertIn("settling", plugin.dispatch("status", {})["state"])
+
+        self.state.current = "pd_stand"
+        self.assertFalse(plugin.motion_active())
+        self.assertEqual([], group.blocking_outputs())
+
+    def test_gait_timeout_restores_origin_before_releasing_gate(self):
+        class TimeoutMotionMode:
+            def __init__(self, state):
+                self.state = state
+                self.calls = []
+
+            def dispatch(self, _action, args):
+                self.calls.append(dict(args))
+                if args["target"] == "pd_stand":
+                    self.state.current = "pd_stand"
+                return {"state": "requested", "target": args["target"]}
+
+        self.state.current = "pd_stand"
+        motion_mode = TimeoutMotionMode(self.state)
+        plugin = self.dev.GaitPlugin(
+            {
+                "control": {"mode_transition_timeout_sec": 0.1},
+                "plugins": {"gait": {
+                    "basic_motion_states": ["rl_basic", "walk"]
+                }},
+            },
+            motion_mode,
+            self.state,
+        )
+        plugin._transition_timeout_sec = 0.02
+        plugin._restore_timeout_sec = 0.05
+        completions = []
+        plugin._acp_notify = lambda *args: completions.append(args)
+
+        selected = plugin.dispatch("select", {"gait": "拟人步态"})
+        plugin._selection_thread.join(timeout=1.0)
+
+        self.assertTrue(any(
+            call == {"target": "pd_stand", "force": True, "wait": False}
+            for call in motion_mode.calls
+        ))
+        self.assertEqual(selected["action_id"], completions[0][0])
+        self.assertEqual("error", completions[0][1])
+        self.assertEqual("timeout_recovered", completions[0][2]["state"])
+        self.assertFalse(plugin.motion_active())
 
     def test_select_rejects_unpublished_profile_before_publish(self):
         result = self.plugin.dispatch("select", {"gait": "terrain"})
@@ -541,14 +777,17 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
             tool["inputSchema"]["x-completion"],
         )
         self.assertEqual(
-            {"on_interrupt_motion": {"action": "stop_playback"}},
+            {
+                "on_interrupt_motion": {"action": "stop_playback"},
+                "on_interrupt_recording": {"action": "record_stop"},
+            },
             tool["inputSchema"]["x-hooks"],
         )
         for removed in ("reset", "save", "load", "info"):
             with self.subTest(removed=removed):
                 self.assertIn("unknown", self.plugin.dispatch(removed, {})["error"])
 
-    def test_record_start_auto_resets_before_recording_and_completes_acp(self):
+    def test_record_start_acp_completes_only_after_recording_is_saved(self):
         class JointPlan:
             def __init__(self):
                 self.calls = []
@@ -579,8 +818,14 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
         self.assertEqual("recording", self.plugin.dispatch("status", {})["state"])
         self.assertEqual("reset", joint_plan.calls[0][0])
         self.assertEqual("wait_for_request", joint_plan.calls[1][0])
+        self.assertEqual([], self.acp_calls)
+
+        self.plugin._on_joint_state(self._make_joint_state())
+        saved = self.plugin.dispatch("record_stop", {})
+        self.assertEqual("saved", saved["state"])
         self.assertEqual(result["action_id"], self.acp_calls[0][0])
         self.assertEqual("completed", self.acp_calls[0][1])
+        self.assertEqual("saved", self.acp_calls[0][2]["state"])
 
     def test_record_start_auto_enters_lower_body_balance_before_reset(self):
         state = FakeMotionState(
@@ -751,12 +996,131 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
     def test_recording_with_duration_auto_stops(self):
         result = self._record_start({"label": "timed", "duration": 0.1})
         self.assertEqual("recording", result["state"])
+        self.assertEqual([], self.acp_calls)
         self.plugin._on_joint_state(self._make_joint_state())
         time.sleep(0.2)
         status = self.plugin.dispatch("status", {})
         self.assertFalse(status["recording"])
         self.assertEqual("duration", status["last_recording"]["stop_reason"])
         self.assertTrue(Path(status["last_recording"]["file"]).exists())
+        self.assertEqual(result["action_id"], self.acp_calls[0][0])
+        self.assertEqual("completed", self.acp_calls[0][1])
+
+    def test_record_stop_hook_bypasses_acp_barrier_and_completes_parent(self):
+        harness = AgentCoreBarrierContractHarness()
+        harness.register(self.plugin.get_tool(), self.plugin.dispatch)
+
+        started = harness.call(
+            "motion_recorder",
+            "record_start",
+            {"label": "manual_hook"},
+        )
+        self.plugin._prepare_thread.join(timeout=1.0)
+        self.assertEqual({started["action_id"]}, harness.pending_actions())
+        self.plugin._on_joint_state(self._make_joint_state())
+
+        stopped = harness.call("motion_recorder", "record_stop", {})
+        self.assertEqual("saved", stopped["state"])
+        self.assertEqual(set(), harness.pending_actions())
+        self.assertEqual(started["action_id"], self.acp_calls[0][0])
+        self.assertEqual("completed", self.acp_calls[0][1])
+
+    def test_record_stop_during_prepare_release_window_stops_started_recording(self):
+        recording_started = threading.Event()
+        release_begin = threading.Event()
+        original_begin = self.plugin._begin_recording
+
+        def pause_after_begin(*args, **kwargs):
+            result = original_begin(*args, **kwargs)
+            recording_started.set()
+            release_begin.wait(timeout=1.0)
+            return result
+
+        self.plugin._begin_recording = pause_after_begin
+        started = self.plugin.dispatch(
+            "record_start", {"label": "release_window"}
+        )
+        self.assertTrue(recording_started.wait(timeout=1.0))
+        self.plugin._on_joint_state(self._make_joint_state())
+
+        stopped = self.plugin.dispatch("record_stop", {})
+        release_begin.set()
+        self.plugin._prepare_thread.join(timeout=1.0)
+
+        self.assertEqual("saved", stopped["state"])
+        self.assertFalse(self.plugin.dispatch("status", {})["recording"])
+        self.assertEqual(started["action_id"], self.acp_calls[0][0])
+        self.assertEqual("completed", self.acp_calls[0][1])
+
+    def test_record_stop_before_begin_prevents_late_recording_start(self):
+        reset_entered = threading.Event()
+        release_reset = threading.Event()
+
+        def delayed_reset(*_args, **_kwargs):
+            reset_entered.set()
+            release_reset.wait(timeout=1.0)
+            return {"state": "completed"}
+
+        self.plugin._reset_before_action = delayed_reset
+        started = self.plugin.dispatch(
+            "record_start", {"label": "cancel_before_begin"}
+        )
+        self.assertTrue(reset_entered.wait(timeout=1.0))
+
+        stopped = self.plugin.dispatch("record_stop", {})
+        release_reset.set()
+        self.plugin._prepare_thread.join(timeout=1.0)
+
+        self.assertEqual("stopping", stopped["state"])
+        self.assertFalse(self.plugin.dispatch("status", {})["recording"])
+        self.assertEqual(started["action_id"], self.acp_calls[0][0])
+        self.assertEqual("cancelled", self.acp_calls[0][1])
+
+    def test_device_interrupt_stops_later_outputs_before_recording_persist_finishes(self):
+        self._record_start({"label": "slow_persist"})
+        self.plugin._on_joint_state(self._make_joint_state())
+        persist_entered = threading.Event()
+        release_persist = threading.Event()
+        head_stopped = threading.Event()
+        original_write_text = Path.write_text
+
+        def blocking_write_text(path, *args, **kwargs):
+            persist_entered.set()
+            release_persist.wait(timeout=1.0)
+            return original_write_text(path, *args, **kwargs)
+
+        group = self.dev.MotionInterruptGroup()
+        group.register(
+            "motion_recorder",
+            self.plugin.interrupt_motion,
+            self.plugin.motion_active,
+        )
+        group.register(
+            "head",
+            lambda: head_stopped.set() or {"state": "stopped"},
+            lambda: False,
+        )
+        interrupt_result = {}
+        interrupt_thread = threading.Thread(
+            target=lambda: interrupt_result.update(group.interrupt())
+        )
+        Path.write_text = blocking_write_text
+        try:
+            interrupt_thread.start()
+            self.assertTrue(persist_entered.wait(timeout=1.0))
+            later_output_stopped_promptly = head_stopped.wait(timeout=0.05)
+            next_recording = self.plugin.dispatch(
+                "record_start", {"label": "must_wait_for_save"}
+            )
+        finally:
+            release_persist.set()
+            interrupt_thread.join(timeout=1.0)
+            Path.write_text = original_write_text
+
+        self.assertTrue(later_output_stopped_promptly)
+        self.assertIn("saving", next_recording["error"])
+        self.assertFalse(self.plugin.dispatch("status", {})["recording"])
+        self.assertEqual("interrupted", interrupt_result["state"])
 
     def test_old_auto_stop_cannot_stop_new_recording(self):
         self._record_start({"label": "timed", "duration": 0.05})
@@ -1332,6 +1696,88 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
             call[0] == resetting["action_id"] and call[1] == "cancelled"
             for call in self.acp_calls
         ))
+
+    def test_reset_idle_wait_has_a_bounded_timeout(self):
+        class StuckJointPlan:
+            def dispatch(self, action, _args):
+                if action == "status":
+                    return {"request_id": 71, "status": 2, "progress": 0.5}
+                return {"error": f"unexpected action: {action}"}
+
+        started = time.monotonic()
+        with self.assertRaises(TimeoutError):
+            self.plugin._wait_reset_idle(
+                71, StuckJointPlan(), timeout=0.02
+            )
+        self.assertLess(time.monotonic() - started, 0.2)
+
+    def test_reset_settle_rejects_initial_zero_progress_idle(self):
+        class InitialIdleJointPlan:
+            def dispatch(self, action, _args):
+                if action == "status":
+                    return {
+                        "request_id": 73,
+                        "status": 1,
+                        "progress": 0.0,
+                    }
+                return {"error": f"unexpected action: {action}"}
+
+        with self.assertRaises(TimeoutError):
+            self.plugin._wait_reset_idle(
+                73, InitialIdleJointPlan(), timeout=0.02
+            )
+
+    def test_stuck_reset_posts_one_acp_error_and_recovers_on_late_idle(self):
+        class StuckJointPlan:
+            def __init__(self):
+                self.status = {
+                    "request_id": 72,
+                    "status": 2,
+                    "progress": 0.5,
+                }
+
+            def dispatch(self, action, args):
+                if action == "reset":
+                    return {"state": "requested", "request_id": 72}
+                if action == "cancel":
+                    return {
+                        "state": "requested",
+                        "request_id": args["request_id"],
+                    }
+                if action == "status":
+                    return dict(self.status)
+                return {"error": f"unexpected action: {action}"}
+
+            def wait_for_request(self, *_args, **_kwargs):
+                raise TimeoutError("reset feedback timed out")
+
+        joint_plan = StuckJointPlan()
+        self.plugin.set_joint_plan(joint_plan)
+        self.plugin._reset_settle_timeout_sec = 0.02
+
+        started = self.plugin.dispatch(
+            "record_start", {"label": "stuck_reset"}
+        )
+        self.plugin._prepare_thread.join(timeout=0.3)
+
+        self.assertFalse(self.plugin._prepare_thread.is_alive())
+        self.assertEqual(started["action_id"], self.acp_calls[0][0])
+        self.assertEqual("error", self.acp_calls[0][1])
+        status = self.plugin.dispatch("status", {})
+        self.assertFalse(status["preparing"])
+        self.assertTrue(status["reset_pending"])
+        self.assertEqual(
+            "settling_after_error", status["last_reset"]["state"]
+        )
+
+        joint_plan.status = {
+            "request_id": 72,
+            "status": 1,
+            "progress": 1.0,
+        }
+        recovered = self.plugin.dispatch("status", {})
+        self.assertFalse(recovered["reset_pending"])
+        self.assertEqual(1, len(self.acp_calls))
 
     def test_release_failure_keeps_motion_gate_settling_until_retry_succeeds(self):
         current = self._make_joint_state()
