@@ -123,6 +123,11 @@ barrier 阻塞，停止时会立即设置取消事件并发布 joint override re
 保持 fail-closed 门禁，可通过 status 查看并重试 stop，避免 Agent Core 清除
 全局 pending 后实体动作仍继续运行。同一次设备级 interrupt 也会取消仍在
 执行的 Gesture。
+ACP 使用 `AGENT_CORE_URL=https://phanthy-motus:15678`，并要求宿主已生成
+`/opt/phanthy-motus/data/certs/cert.pem`（由 `deploy/service.yml` 挂载给
+Driver）。Driver 启动时校验 URL/CA；证书缺失、无效或 completion POST 失败
+都会在 `/health` 和 `motion_recorder.status.acp` 中显示为 error/degraded，
+回调恢复成功后自动恢复 ready。
 
 `pointcloud`、`camera`、`depth` 桥接 T800-Odin2 激光雷达相机（飞书文档
 7.2 节）在 Orin 主板上发布的 `odin_ros_driver` topic。点云按
@@ -148,6 +153,9 @@ utterance 结束的 8 字节 EOF magic），driver 只负责流式播放。镜�
 开机音与 `unitree/g1` 使用同一份 256,000 字节 PCM 资源（SHA256
 `e634d402feeead175e7a669a77fa8d6aa5770e162fbd3c867503d4897dc2f166`），
 通过 `COPY resource/` 随 driver 镜像打包，不依赖 GitHub/COS 等外部下载。
+该文件低于仓库 500KB 的 COS 阈值，`.pcm` 也不在全局规则明确禁止提交的
+归档/二进制扩展名列表中；T800 路径复用 G1 已存在的同一 Git blob，不新增
+音频对象历史。Docker 构建仍按固定 SHA256 校验内容完整性。
 `alsa-utils` 提供 `aplay`，`libasound2-plugins` 提供 `/etc/asound.conf`
 所需的 PulseAudio PCM backend；构建日志确认二者不在固定的 ros-base 中，
 因此对应包体增长是该官方播放路径的必要运行时成本。

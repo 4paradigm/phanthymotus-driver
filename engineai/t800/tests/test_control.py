@@ -389,6 +389,88 @@ class RepeatingCommandTests(unittest.TestCase):
         self.assertFalse(snapshot.active)
         self.assertEqual("publisher failed", snapshot.error)
 
+    def test_stop_cannot_be_followed_by_inflight_stale_command(self):
+        published = []
+        second_publish_entered = threading.Event()
+        release_second_publish = threading.Event()
+        stop_finished = threading.Event()
+        publish_count = 0
+
+        def publish(command):
+            nonlocal publish_count
+            publish_count += 1
+            if publish_count == 2:
+                second_publish_entered.set()
+                release_second_publish.wait(timeout=1.0)
+            published.append(command["value"])
+
+        stream = RepeatingCommand(
+            publish,
+            lambda: published.append(0),
+            rate_hz=100,
+        )
+        stream.start({"value": 1}, -1)
+        self.assertTrue(second_publish_entered.wait(timeout=0.5))
+
+        stop_thread = threading.Thread(
+            target=lambda: (stream.stop(), stop_finished.set()),
+            daemon=True,
+        )
+        stop_thread.start()
+        try:
+            self.assertFalse(stop_finished.wait(timeout=0.05))
+        finally:
+            release_second_publish.set()
+            stop_thread.join(timeout=1.0)
+
+        self.assertTrue(stop_finished.is_set())
+        self.assertEqual(0, published[-1])
+        last_zero = len(published) - 1 - published[::-1].index(0)
+        self.assertNotIn(1, published[last_zero + 1:])
+
+    def test_replacement_cannot_overlap_inflight_old_command(self):
+        published = []
+        second_old_publish_entered = threading.Event()
+        release_old_publish = threading.Event()
+        replacement_finished = threading.Event()
+        old_publish_count = 0
+
+        def publish(command):
+            nonlocal old_publish_count
+            if command["value"] == 1:
+                old_publish_count += 1
+                if old_publish_count == 2:
+                    second_old_publish_entered.set()
+                    release_old_publish.wait(timeout=1.0)
+            published.append(command["value"])
+
+        stream = RepeatingCommand(
+            publish,
+            lambda: published.append(0),
+            rate_hz=100,
+        )
+        stream.start({"value": 1}, -1)
+        self.assertTrue(second_old_publish_entered.wait(timeout=0.5))
+
+        replacement_thread = threading.Thread(
+            target=lambda: (
+                stream.start({"value": 2}, -1),
+                replacement_finished.set(),
+            ),
+            daemon=True,
+        )
+        replacement_thread.start()
+        try:
+            self.assertFalse(replacement_finished.wait(timeout=0.05))
+        finally:
+            release_old_publish.set()
+            replacement_thread.join(timeout=1.0)
+
+        self.assertTrue(replacement_finished.is_set())
+        first_new = published.index(2)
+        self.assertNotIn(1, published[first_new + 1:])
+        stream.stop()
+
 
 class NativeSdkManagerTests(unittest.TestCase):
     def test_external_mode_is_observation_only(self):

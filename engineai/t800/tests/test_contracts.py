@@ -219,6 +219,26 @@ class McpHttpContractTests(unittest.TestCase):
         bundle.stop_all()
         self.assertEqual(1, good.stops)
 
+    def test_bundle_health_degrades_when_acp_configuration_is_invalid(self):
+        bundle = self.module.T800DeviceBundle.__new__(
+            self.module.T800DeviceBundle
+        )
+        bundle._plugins = []
+        bundle._active_plugins = []
+        bundle._startup_errors = {}
+        bundle._started = True
+        bundle._acp_status = lambda: {
+            "state": "error",
+            "configured": False,
+            "last_error": "AGENT_CORE_CA_CERT is required for https",
+        }
+
+        health = bundle.health()
+
+        self.assertEqual("degraded", health["state"])
+        self.assertEqual("error", health["acp"]["state"])
+        self.assertIn("AGENT_CORE_CA_CERT", health["acp"]["last_error"])
+
     def test_bundle_halts_physical_outputs_before_reverse_teardown(self):
         events = []
 
