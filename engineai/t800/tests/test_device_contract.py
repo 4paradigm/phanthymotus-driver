@@ -1852,6 +1852,23 @@ class DevicePluginContractTests(unittest.TestCase):
         with self.assertRaises(TimeoutError):
             plan.wait_for_request(26, 0.01, threading.Event())
 
+    def test_joint_plan_retains_quiescence_evidence_after_partial_cancel_idle(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        requested = plan.dispatch("reset", {})
+        request_id = requested["request_id"]
+        plan._on_state(JointMotionPlanState(
+            request_id, JointMotionPlanState.EXECUTING, 0.5
+        ))
+        cancelled_idle = JointMotionPlanState(
+            request_id, JointMotionPlanState.IDLE, 0.5
+        )
+        plan._on_state(cancelled_idle)
+        status = plan.dispatch("status", {})
+
+        self.assertNotIn(request_id, plan._executing_requests)
+        self.assertTrue(plan.request_is_quiescent(request_id, status))
+
     def test_motion_recorder_play_starts_after_completed_idle_without_executing_frame(self):
         with tempfile.TemporaryDirectory() as recordings_dir:
             config = {

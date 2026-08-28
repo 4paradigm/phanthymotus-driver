@@ -237,6 +237,10 @@ class T800DeviceBundle:
             and "motion_mode" in instances
         ):
             instance = GaitPlugin(config, instances["motion_mode"], state)
+            instance.set_interrupt_group(motion_interrupt_group)
+            motion_interrupt_group.register(
+                "gait", instance.halt, instance.motion_active
+            )
             instances["gait"] = instance
             self._plugins.append(instance)
 

@@ -112,12 +112,25 @@ lie_down 组合键。LCM 输入会覆盖实体手柄输入，发送完成后 Dri
 状态机，因此不会作为可选项暴露；terrain 接口示例不能视为 T800 固件能力。
 卡片不再暴露 `force`/`wait`：内部固定使用 `force=false`、`wait=true`，避免
 用户绕过固件可用转换或在状态尚未确认时继续下一个动作。真实切换通过 ACP
-完成。
+完成。Driver 实际以非阻塞 motion-state request 加反馈轮询实现该等待，使
+`gait.stop` 能作为 interrupt hook 取消 pending transition；取消时会以后发
+request 恢复切换前状态，并保持本地 settling 门禁直到反馈确认已经恢复；
+确认必须来自 restore request 发布后的新一代 motion-state feedback，不能复用
+请求前仍停留在 origin 的旧快照。恢复请求失败或超时会完成 ACP error 但不会
+fail-open，可通过再次 stop 重试；正常 select 自身超时也走同一恢复路径。
+`gait` 同样加入设备级 motion interrupt group，且并发 `select` 只允许一个
+原子 claim，避免竞争状态切换。
 
 `motion_recorder.record_start` 是幂等的：录制中重复调用只返回当前会话，
 不会意外停止。`record_stop` 同样可重复调用；设置 `duration > 0`
 时超时会走与手动停止相同的落盘路径。状态中的 `last_recording`
-可用于确认最近一次保存文件、停止原因和帧数。
+可用于确认最近一次保存文件、停止原因和帧数。`record_start` 的同一个 ACP
+action 会覆盖自动 reset 和整个录制周期，只有定时停止或 `record_stop` 完成
+落盘后才发 `completed`；`record_stop` 注册为 interrupt hook，因此不会被
+仍在 pending 的录制 action barrier 阻塞。设备级安全 interrupt 会先原子停止
+采样，再异步落盘和完成 ACP，避免大录制文件写盘延迟后续 Head/Gesture 停止；
+落盘采用同目录临时文件加原子替换，完成前拒绝新的 recorder start/play，且
+shutdown phase-2 会完整等待所有 save worker，避免同名文件竞争或半写文件。
 主机持久化录制在 list/play 前会校验 JSON 根结构、metadata、帧数量上限、
 文件字节数、录制总时长、回放采样数、最小帧间隔、严格递增且有限的时间戳，
 以及完整有限且符合 URDF 限位的 25 关节 position 数组；插值后派生速度也必须
@@ -138,10 +151,15 @@ lie_down 组合键。LCM 输入会覆盖实体手柄输入，发送完成后 Dri
 barrier 阻塞，停止时会立即设置取消事件并发布 joint override release，后台
 回放线程退出时再以 `cancelled` 完成对应的 action id。在 `reset` pending 时
 调用该 interrupt action 也会向 joint planner 发送 cancel，并保持 settling
-直到 planner 反馈 `IDLE`；cancel 超时或 joint override release 发布失败时均
-保持 fail-closed 门禁，可通过 status 查看并重试 stop，避免 Agent Core 清除
-全局 pending 后实体动作仍继续运行。同一次设备级 interrupt 也会取消仍在
-执行的 Gesture 与 Head。
+直到 planner 反馈 `IDLE`。cancel 后的同步确认最多等待 2 秒，避免 prepare
+worker 永久挂起；超时会先发一次 ACP error，同时本地门禁继续 fail-closed，
+晚到的同 request-id `IDLE` 还必须具备已执行或完成进度证据，才可自动解除
+门禁且不会重复完成 ACP；已观察到的 EXECUTING/终态证据会跨 lease 释放保留，
+因此 partial-progress cancel 也能恢复，而 `progress=0` 的初始 IDLE 不会被
+误判。cancel 超时
+或 joint override release 发布失败均可通过 status 查看并重试 stop，避免
+Agent Core 清除全局 pending 后实体动作仍继续运行。同一次设备级 interrupt 也会
+取消仍在执行的 Gait、Gesture 与 Head。
 ACP 使用 `AGENT_CORE_URL=https://phanthy-motus:15678`，并要求宿主已生成
 `/opt/phanthy-motus/data/certs/cert.pem`（由 `deploy/service.yml` 挂载给
 Driver）。Driver 启动时校验 URL/CA；证书缺失、无效或 completion POST 失败
