@@ -767,7 +767,7 @@ class DevicePluginContractTests(unittest.TestCase):
         plan.start()
         arm = self.device.ArmActuatorPlugin(CONFIG, plan, self.state)
         plan.current_motion = lambda: ("walking", [])
-        rejected = arm.dispatch("raise", {"side": "right", "duration": 0.05})
+        rejected = arm.dispatch("raise", {"side": "right", "duration": 0.05, "confirm": True})
         self.assertIn("lower_body_balance", rejected["error"])
         self.assertIn("walking", rejected["error"])
         self.assertEqual([], plan._publisher.messages)
