@@ -15,6 +15,13 @@ plugins:
     enabled: true
   camera:
     enabled: true
+  camera_snapshot:
+    enabled: true
+    output_dir: "/opt/phanthy-motus/data/images"
+    # Agent Core maps the same host directory to this path, which is allowed
+    # by channel_reply's outbound file whitelist.
+    channel_output_dir: "/work/resource/images"
+    jpeg_quality: 90
   imu:
     enabled: true
   camera_depth:
