@@ -108,6 +108,7 @@ class T800DeviceBundle:
             ArmActuatorPlugin,
             DancePlugin,
             GesturePlugin,
+            HeadActuatorPlugin,
             JointBridgePlugin,
             JointOverridePlugin,
             JointPlanPlugin,
@@ -191,6 +192,12 @@ class T800DeviceBundle:
             instances["gesture"] = instance
             self._plugins.append(instance)
 
+        head_config = plugins.get("head", {})
+        if head_config.get("enabled", True) and "joint_plan" in instances:
+            instance = HeadActuatorPlugin(head_config, instances["joint_plan"], state)
+            instances["head"] = instance
+            self._plugins.append(instance)
+
         virtual_gamepad_config = plugins.get("virtual_gamepad", {})
         if virtual_gamepad_config.get("enabled", False):
             instance = VirtualGamepadPlugin(virtual_gamepad_config, namespace, ros2)
@@ -219,7 +226,7 @@ class T800DeviceBundle:
             instances["safety"].set_controls(
                 [
                     instances[key]
-                    for key in ("locomotion", "joint_override", "joint_bridge", "virtual_gamepad", "arm", "gesture")
+                    for key in ("locomotion", "joint_override", "joint_bridge", "virtual_gamepad", "arm", "gesture", "head")
                     if key in instances
                 ]
             )
