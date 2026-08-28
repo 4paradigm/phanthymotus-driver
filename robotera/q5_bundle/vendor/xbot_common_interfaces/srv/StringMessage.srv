@@ -1,0 +1,7 @@
+# 请求部分
+string data
+
+---
+# 响应部分
+bool result
+string message

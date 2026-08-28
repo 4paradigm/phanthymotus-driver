@@ -1,0 +1,32 @@
+mcp_port: 15702
+ros_namespace: ""   # 留空则自动使用 hostname
+name: "DJI Matrice 300 RTK"
+
+# PSDK bridge settings
+psdk_bridge:
+  app_name: "PhanthyMotus"
+  app_id: "190076"
+  app_key: "26af38fb6126f58c195b5c8da0b481c"
+  app_license: "Y4wiW8E6tI2TmZoEkAt7jUM0Oqu3gJM1fNBoXKJO/fzlvYhPMUpxTP9qIB0w5KPrJ5XUkL8ImoxiVesgjEJ5FMe43KqbL8YrUQCK8i8xWVmEMQh0+ADPpfmBi7IAm43PzlJezFYSw6CfO1TjLuRNqLFs3y+LnAh95x5g7DCIaKGUSzPBjORgqRL/wbYngLBOedJtTOIq9T0zB1M922ffvubT2RoRCjhFWb9T6l3V3C2W15JlQ0hRCADyvvHhA2qI7ITq8YXTHktc8yAiRtTVC4+IOqQppkJfxvpE+n810/4vt1xfXKLtIuZxaUcMZY/Q3oEvbV4ZL2AKpiuFRwoz5g=="
+  uart0_dev: "/dev/ttyTHS0"
+  uart0_baud_rate: 460800
+  uart1_dev: "/dev/ttyACM0"
+
+plugins:
+  telemetry:
+    enabled: true
+    auto_start: true
+    publish_rate: 10   # Hz
+  camera_stream:
+    enabled: true
+    fps: 10
+    # Verified on the target M300 using hzhy's PSDK 3.8 FPV demo.
+    camera_source: "fpv"
+  perception:
+    enabled: true
+  hms:
+    enabled: true
+  flight:
+    enabled: true
+  time_sync:
+    enabled: true

@@ -1,0 +1,18 @@
+[Unit]
+Description=EngineAI T800 Odin2 calibrated pointcloud-to-depth node
+Wants=network-online.target
+After=network-online.target engineai-odin2.service
+Wants=engineai-odin2.service
+
+[Service]
+Type=simple
+User=ubuntu
+Environment=HOME=/home/ubuntu
+Environment=ROS_DOMAIN_ID=69
+Environment=RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && source /home/ubuntu/odin-depth-ws/install/setup.bash && exec ros2 run odin_ros_driver pcd2depth_ros2_node --ros-args -p calib_file_path:=/home/ubuntu/odin-depth-ws/calib.yaml -p cloud_raw_topic:=/manifold/ODIN2/device0/cloud/raw -p color_raw_topic:=/manifold/ODIN2/device0/camera0/raw -p depth_image_topic:=/manifold/ODIN2/device0/depth -p depth_cloud_topic:=/manifold/ODIN2/device0/depth_cloud'
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

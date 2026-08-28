@@ -45,7 +45,7 @@ RUN cd /work/noetix_sdk_bumi && \
     sed -i '/target_include_directories(example/,/^)/s/^/#/' CMakeLists.txt && \
     sed -i '/target_link_libraries(example/,/^)/s/^/#/' CMakeLists.txt
 
-# Build pybind modules (highcontrol_py, mediacontrol_py)
+# Build the pybind modules used by the current cards
 RUN cd /work/noetix_sdk_bumi && \
     mkdir -p build && cd build && \
     cmake .. \
@@ -64,6 +64,7 @@ ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ENV FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
 
 COPY resource/ /work/resource/
+COPY common/ /work/common/
 COPY main.py   /work/main.py
 COPY device.py /work/device.py
 COPY config.yaml /work/config.yaml

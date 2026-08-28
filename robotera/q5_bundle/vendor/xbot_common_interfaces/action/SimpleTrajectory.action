@@ -1,0 +1,14 @@
+int32 ZERO=0
+int32 SIN_WAVE=1 
+int32 LIFT_UP=2
+int32 MPC_INIT=14
+int32 traj_type
+float32 duration
+---
+int32 SUCCESS=0
+int32 DENIED=1
+int32 FAILED=2
+int32 result
+string message
+---
+float32 progress

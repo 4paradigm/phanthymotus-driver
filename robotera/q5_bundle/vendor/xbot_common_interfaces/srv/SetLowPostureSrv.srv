@@ -1,0 +1,6 @@
+# 请求部分：输入目标姿态参数
+float32[] posture  # 顺序：[高度, roll, pitch, yaw]
+---
+# 响应部分：返回执行结果
+bool success
+string message

@@ -1,0 +1,4 @@
+RobotStatus status
+---
+string msg
+bool success

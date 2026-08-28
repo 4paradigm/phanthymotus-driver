@@ -1,0 +1,12 @@
+# DJI E-Port USB serial device — auto-permission for container access
+# Install on host: cp 99-eport.rules /etc/udev/rules.d/ && udevadm control --reload-rules
+
+# FTDI FT232R on E-Port development board (VID 0403, PID 6001)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", MODE="0666", SYMLINK+="dji_eport"
+
+# DJI USB devices (VID 0x2CA3) — for direct E-Port connection (no FTDI adapter)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="2ca3", MODE="0666", SYMLINK+="dji_eport"
+KERNEL=="ttyACM[0-9]*", ATTRS{idVendor}=="2ca3", MODE="0666", SYMLINK+="dji_eport"
+
+# USB RNDIS/NCM network interface from E-Port (auto-up)
+SUBSYSTEM=="net", ATTRS{idVendor}=="2ca3", ACTION=="add", RUN+="/sbin/ip link set %k up"

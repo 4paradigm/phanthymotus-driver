@@ -1,3 +1,5 @@
+import logging
+import os
 import time
 
 from ..idl.unitree_api.msg.dds_ import Request_ as Request
@@ -11,6 +13,14 @@ from ..utils.future import FutureResult
 from .client_stub import ClientStub
 from .internal import *
 
+_log = logging.getLogger(__name__)
+
+# Locally-added RPC instrumentation. Every locomotion/arm/audio call goes through
+# _CallBase, so printing on the success path costs 3 lines per RPC — enough to
+# dominate the container log on its own. Off by default; set UNITREE_RPC_DEBUG=1
+# to get it back when chasing RPC timeouts (e.g. error 3104).
+RPC_DEBUG = bool(os.environ.get('UNITREE_RPC_DEBUG'))
+
 
 """
 " class ClientBase
@@ -18,6 +28,10 @@ from .internal import *
 class ClientBase:
     def __init__(self, serviceName: str):
         self.__timeout = 1.0
+        # Repeated-failure counter: a peer service that is simply not running makes
+        # every call fail, and logging each one buries the log. Warn on the first
+        # and every 100th, and say so when it recovers.
+        self.__fail_warns = 0
         self.__stub = ClientStub(serviceName)
         self.__stub.Init()
 
@@ -29,26 +43,40 @@ class ClientBase:
         request = Request(header, parameter, [])
         req_id = request.header.identity.id
 
-        print(f"[CallBase] sending apiId={apiId}, id={req_id}, timeout={self.__timeout}", flush=True)
+        if RPC_DEBUG:
+            _log.debug("[CallBase] sending apiId=%s, id=%s, timeout=%s", apiId, req_id, self.__timeout)
 
         t0 = time.monotonic()
         future = self.__stub.SendRequest(request, self.__timeout)
         if future is None:
-            print(f"[CallBase] SendRequest FAILED (send error), elapsed={time.monotonic()-t0:.3f}s", flush=True)
+            self.__fail_warns += 1
+            if self.__fail_warns == 1 or self.__fail_warns % 100 == 0:
+                _log.warning("[CallBase] SendRequest failed (send error), elapsed=%.3fs "
+                             "(occurrence %d)", time.monotonic() - t0, self.__fail_warns)
             return RPC_ERR_CLIENT_SEND, None
 
-        print(f"[CallBase] sent ok, waiting for response...", flush=True)
+        if RPC_DEBUG:
+            _log.debug("[CallBase] sent ok, waiting for response...")
         result = future.GetResult(self.__timeout)
         elapsed = time.monotonic() - t0
 
         if result.code != FutureResult.FUTURE_SUCC:
             self.__stub.RemoveFuture(request.header.identity.id)
             code = RPC_ERR_CLIENT_API_TIMEOUT if result.code == FutureResult.FUTUTE_ERR_TIMEOUT else RPC_ERR_UNKNOWN
-            print(f"[CallBase] FAILED: result.code={result.code}, rpc_code={code}, elapsed={elapsed:.3f}s", flush=True)
+            self.__fail_warns += 1
+            if self.__fail_warns == 1 or self.__fail_warns % 100 == 0:
+                _log.warning("[CallBase] failed: result.code=%s, rpc_code=%s, elapsed=%.3fs "
+                             "(occurrence %d)", result.code, code, elapsed, self.__fail_warns)
             return code, None
 
         response = result.value
-        print(f"[CallBase] SUCCESS: apiId={response.header.identity.api_id}, status={response.header.status.code}, elapsed={elapsed:.3f}s", flush=True)
+        if self.__fail_warns:
+            _log.warning("[CallBase] RPC recovered after %d consecutive failures",
+                         self.__fail_warns)
+            self.__fail_warns = 0
+        if RPC_DEBUG:
+            _log.debug("[CallBase] success: apiId=%s, status=%s, elapsed=%.3fs",
+                       response.header.identity.api_id, response.header.status.code, elapsed)
 
         if response.header.identity.api_id != apiId:
             return RPC_ERR_CLIENT_API_NOT_MATCH, None

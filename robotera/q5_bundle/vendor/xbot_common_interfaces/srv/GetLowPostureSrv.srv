@@ -1,0 +1,6 @@
+# 请求部分：空（无需输入参数）
+---
+# 响应部分：返回当前姿态参数和状态
+float32[] posture  # 顺序与SetPosture一致：[高度, roll, pitch, yaw]
+bool success
+string message

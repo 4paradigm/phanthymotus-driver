@@ -57,6 +57,38 @@ T800_JOINT_GROUPS = {
 
 T800_JOINT_INDEX = {name: index for index, name in enumerate(T800_JOINT_NAMES)}
 
+# Hard position limits copied from resource/serial_t800.urdf.  Gesture
+# choreography validates every requested target against this table before it
+# reaches the robot-facing planner; keeping the layout next to the canonical
+# joint names makes index drift visible in the pure control tests.
+T800_JOINT_POSITION_LIMITS = (
+    (-3.316, 2.269),
+    (-1.082, 2.059),
+    (-1.42244667, 3.6022778),
+    (0.0, 2.355),
+    (-0.68068, 0.68068),
+    (-0.3491, 0.1745),
+    (-3.316, 2.269),
+    (-2.059, 1.082),
+    (-3.6022778, 1.42244667),
+    (0.0, 2.355),
+    (-0.68068, 0.68068),
+    (-0.1745, 0.3491),
+    (-4.381, 1.2392),
+    (-2.967, 2.793),
+    (-0.384, 2.443),
+    (-2.618, 2.618),
+    (-2.286, 0.262),
+    (-2.618, 2.618),
+    (-2.967, 2.793),
+    (-2.443, 0.384),
+    (-2.618, 2.618),
+    (-2.286, 0.262),
+    (-2.618, 2.618),
+    (-0.523, 0.523),
+    (-1.222, 1.222),
+)
+
 MOTION_STATES = (
     "idle",
     "passive",
@@ -145,6 +177,35 @@ def validate_joint_indices(indices: object, *, allow_empty: bool = False) -> lis
     return result
 
 
+def validate_joint_positions(
+    indices: object,
+    positions: object,
+    *,
+    limit_margin_rad: float = 0.0,
+) -> tuple[list[int], list[float]]:
+    """Validate finite targets against the T800 URDF joint limits."""
+    validated_indices = validate_joint_indices(indices)
+    validated_positions = float_list(
+        positions, "target_positions", size=len(validated_indices)
+    )
+    margin = float(limit_margin_rad)
+    if not math.isfinite(margin) or margin < 0:
+        raise ValueError("limit_margin_rad must be a non-negative finite number")
+    violations = []
+    for index, position in zip(validated_indices, validated_positions):
+        hard_lower, hard_upper = T800_JOINT_POSITION_LIMITS[index]
+        lower = hard_lower + margin
+        upper = hard_upper - margin
+        if lower > upper or position < lower or position > upper:
+            violations.append(
+                f"{T800_JOINT_NAMES[index]}={position:.6g} outside "
+                f"[{lower:.6g}, {upper:.6g}]"
+            )
+    if violations:
+        raise ValueError("joint target exceeds safe position limit: " + "; ".join(violations))
+    return validated_indices, validated_positions
+
+
 def validate_parallel_arrays(indices: Sequence[int], **arrays: Sequence[float]) -> None:
     for name, values in arrays.items():
         if len(values) not in (0, len(indices)):
@@ -226,12 +287,23 @@ class RepeatingCommand:
             self._stop_event = stop_event
             self._started_at = started_at
             self._deadline = deadline
-            self._last_publish_at = None
-            self._publish_count = 0
+            self._last_publish_at = started_at
+            self._publish_count = 1
+        try:
+            # Publish once before handing off to the worker. This guarantees a
+            # short command is not lost if the scheduler starts the thread late.
+            self._publisher(command)
+        except Exception:
+            with self._lock:
+                if self._stop_event is stop_event:
+                    self._stop_event = None
+                    self._publish_count = 0
+                    self._last_publish_at = None
+            raise
 
         def run() -> None:
             try:
-                while not stop_event.is_set():
+                while not stop_event.wait(self._period):
                     now = self._clock()
                     if deadline is not None and now >= deadline:
                         break
@@ -297,6 +369,20 @@ def action_schema(
     }
 
 
+def sensor_action_schema() -> dict:
+    """Lifecycle schema used by Agent Core to start and resolve sensor topics."""
+    actions = {
+        "start": ([], "启动卡片数据流"),
+        "info": ([], "返回卡片状态和实际输出 topic"),
+        "stop": ([], "停止卡片数据流"),
+        "status": ([], "返回最新传感器状态"),
+    }
+    schema = action_schema(actions, {}, "传感器生命周期动作")
+    # Reading a sensor directly without an action remains supported.
+    schema.pop("required", None)
+    return schema
+
+
 def array_property(description: str, *, item_type: str = "number") -> dict:
     return {
         "type": "array",
@@ -312,7 +398,7 @@ def sensor_tool(name: str, description: str, topic: str, fmt: str) -> dict:
         "multiInstance": False,
         "readOnly": True,
         "description": description,
-        "inputSchema": {"type": "object", "properties": {}},
+        "inputSchema": sensor_action_schema(),
         "topic_out": [{"topic": topic, "format": fmt}],
     }
 

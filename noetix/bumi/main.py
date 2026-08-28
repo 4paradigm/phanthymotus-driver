@@ -12,11 +12,22 @@ drivers/noetix/bumi/main.py — Noetix Bumi-EDU 设备 bundle 统一入口。
     CONFIG_PATH — config.yaml 路径（默认同目录下）
 """
 
+# Make every log line one atomic, control-character-free write, so concurrent
+# writers cannot tear a Docker log record. Must run before anything prints.
+try:
+    from common import logsafe
+    logsafe.install()
+except ImportError as _e:  # running outside the container image
+    import sys as _sys
+    _sys.stderr.write(f"[bundle] logsafe unavailable ({_e}); stdout unprotected\n")
+
+
 import json
 import os
 import re
 import signal
 import socket
+import subprocess
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -75,6 +86,12 @@ class BumiDeviceBundle:
             self._plugins.append(CameraPlugin(plugins_cfg["camera"], namespace, executor))
             print("[bundle] CameraPlugin loaded")
 
+        if plugins_cfg.get("motion_state", {}).get("enabled", False) and high_ctrl is not None:
+            from device import MotionStatePlugin
+            self._plugins.append(MotionStatePlugin(
+                plugins_cfg["motion_state"], namespace, executor, high_ctrl))
+            print("[bundle] MotionStatePlugin loaded")
+
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
             try:
@@ -124,7 +141,11 @@ def make_handler():
             msg = fmt % args
             if '"POST /mcp' in msg and '200' in msg:
                 return
-            print(f"[mcp] {self.address_string()} {msg}")
+            # Escape and cap: msg embeds the raw request line, which on host
+            # networking is remote-controlled bytes going straight into the
+            # Docker log framer (log injection / control-byte corruption).
+            safe = msg.encode("unicode_escape").decode("ascii")[:200]
+            print(f"[mcp] {self.address_string()} {safe}")
 
         def _send(self, status: int, body: str):
             encoded = body.encode()
@@ -255,7 +276,6 @@ def main():
 
         # init() may block indefinitely if robot is unreachable (GIL held in C++).
         # Use subprocess probe to check if DDS connection is possible first.
-        import subprocess
         probe_code = (
             "import sys; sys.path.insert(0, '/work/noetix_sdk_bumi/build'); "
             "from highcontrol_py import HighController; "

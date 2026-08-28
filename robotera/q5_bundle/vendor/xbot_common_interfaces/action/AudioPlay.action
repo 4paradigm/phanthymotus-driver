@@ -1,0 +1,22 @@
+# AudioPlay.action
+# Goal
+int32 ID=0
+int32 PATH=1
+int32 ITEM=2
+int32 FILE_NAME=3
+int32 mode           # 0: 使用 id, 1: 使用 path, 2: 使用 item（JSON 或字典格式字符串）, 3: 使用 file_name 
+bool force_play      # true： 强制播放，中断正在播放的音频；false：默认逻辑
+int32 id             # 当 mode==0 时使用, id需要大于0
+string path          # 当 mode==1 时使用
+string item          # 当 mode==2 时使用；例如： {"file_name": audio_name, "text": audio_text}
+string file_name     # 当 mode==3 时使用
+string channel       # 不传默认 channel1 可选 default / channel1 / channel2 / channel3
+int32 timeout        # 播放超时时间（单位秒）
+string version       # 不传默认 v1 可选 v1 / v2
+---
+# Result
+bool success
+string message
+---
+# Feedback
+float64 progress   # 播放进度百分比：0 表示刚开始，100 表示播放结束

@@ -1,0 +1,6 @@
+string app_name
+bool sync_control
+string launch_mode
+---
+bool success
+string message
