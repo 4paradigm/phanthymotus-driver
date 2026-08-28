@@ -5005,6 +5005,7 @@ class SpeakerPlugin:
         self._startup_cancel = threading.Event()
         self._startup_action_id: str | None = None
         self._startup_wait = lambda event, seconds: event.wait(seconds)
+        self._clock = time.monotonic
         self._acp_notify = _t800_acp_notify
         self._interrupt_group: MotionInterruptGroup | None = None
         self._running = False
@@ -5290,9 +5291,12 @@ class SpeakerPlugin:
             if cancel_event.is_set() or self._session != session:
                 raise RuntimeError("speaker startup cancelled")
             block = pcm[offset:offset + block_size]
+            write_started = self._clock()
             process.stdin.write(block)
             process.stdin.flush()
-            if self._startup_wait(cancel_event, len(block) / 32000.0):
+            write_elapsed = max(0.0, self._clock() - write_started)
+            remaining = max(0.0, len(block) / 32000.0 - write_elapsed)
+            if remaining > 0 and self._startup_wait(cancel_event, remaining):
                 raise RuntimeError("speaker startup cancelled")
 
     def _on_chunk(
