@@ -1135,6 +1135,7 @@ class CameraSnapshotPlugin:
         self._running = False
         self._latest_frame = None
         self._frame_lock = threading.Lock()
+        self._subscription = None
         self._sub_node = Node("tianyi2_camera_snapshot_sub", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._sub_node)
 
@@ -1178,10 +1179,10 @@ class CameraSnapshotPlugin:
             CameraPlugin._ensure_orbbec_service()
             self._cv2 = cv2
             self._np = np
-            self._sub_node.create_subscription(
+            self._native_dir.mkdir(parents=True, exist_ok=True)
+            self._subscription = self._sub_node.create_subscription(
                 Image, "/ob_camera_head/color/image_raw",
                 self._on_image, _RELIABLE_QOS)
-            self._native_dir.mkdir(parents=True, exist_ok=True)
             self._running = True
             print("[CameraSnapshotPlugin] subscribed to head RGB camera")
         except Exception as e:
@@ -1191,6 +1192,9 @@ class CameraSnapshotPlugin:
         self._running = False
         with self._frame_lock:
             self._latest_frame = None
+        if self._subscription is not None:
+            self._sub_node.destroy_subscription(self._subscription)
+            self._subscription = None
 
     def _on_image(self, msg):
         if not self._running:
@@ -1217,7 +1221,10 @@ class CameraSnapshotPlugin:
         if action != "capture":
             return {"error": f"unknown action: {action}"}
         if not self._running:
-            return {"error": "camera snapshot is not running; call action=start first"}
+            try:
+                self.start()
+            except Exception as e:
+                return {"error": f"camera snapshot initialization failed: {e}"}
 
         with self._frame_lock:
             msg = self._latest_frame
