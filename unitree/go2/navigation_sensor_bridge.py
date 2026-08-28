@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from array import array
 import json
+import math
 import os
 from pathlib import Path
 import queue
@@ -18,10 +19,12 @@ import sys
 import threading
 import time
 
+from geometry_msgs.msg import TransformStamped
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Imu, PointCloud2, PointField
 from std_msgs.msg import String
+from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
 
 from navigation_pointcloud import (
     NAVIGATION_FIELDS,
@@ -65,6 +68,38 @@ def _required_sensor_frame(config: dict) -> str:
     return frame.strip()
 
 
+def _required_static_transform(config: dict, sensor_frame: str) -> tuple:
+    base_frame = config.get("base_frame")
+    if not isinstance(base_frame, str) or not base_frame.strip():
+        raise ValueError("navigation base_frame must be a non-empty string")
+    base_frame = base_frame.strip()
+    if base_frame == sensor_frame:
+        raise ValueError("navigation base_frame and sensor_frame must differ")
+
+    values = []
+    for key in ("base_to_sensor_translation_m", "base_to_sensor_rotation_rpy_rad"):
+        raw = config.get(key)
+        if not isinstance(raw, (list, tuple)) or len(raw) != 3:
+            raise ValueError(f"navigation {key} must contain 3 values")
+        parsed = tuple(float(value) for value in raw)
+        if not all(math.isfinite(value) for value in parsed):
+            raise ValueError(f"navigation {key} contains non-finite values")
+        values.append(parsed)
+    return base_frame, values[0], values[1]
+
+
+def _quaternion_from_rpy(roll: float, pitch: float, yaw: float) -> tuple:
+    cr, sr = math.cos(roll / 2.0), math.sin(roll / 2.0)
+    cp, sp = math.cos(pitch / 2.0), math.sin(pitch / 2.0)
+    cy, sy = math.cos(yaw / 2.0), math.sin(yaw / 2.0)
+    return (
+        sr * cp * cy - cr * sp * sy,
+        cr * sp * cy + sr * cp * sy,
+        cr * cp * sy - sr * sp * cy,
+        cr * cp * cy + sr * sp * sy,
+    )
+
+
 class _NavigationSensorNode(Node):
     def __init__(self, config: dict, namespace: str):
         super().__init__("go2_navigation_sensor_bridge")
@@ -80,6 +115,11 @@ class _NavigationSensorNode(Node):
             "raw_imu_topic", "rt/utlidar/imu"
         )
         self._sensor_frame = _required_sensor_frame(config)
+        (
+            self._base_frame,
+            self._base_to_sensor_translation,
+            self._base_to_sensor_rpy,
+        ) = _required_static_transform(config, self._sensor_frame)
         self._sensor_rotation = validated_rotation_matrix(
             config.get(
                 "device_to_sensor_rotation_matrix",
@@ -105,6 +145,7 @@ class _NavigationSensorNode(Node):
         )
         self._imu_pub = self.create_publisher(Imu, self.imu_topic, _IMU_QOS)
         self._status_pub = self.create_publisher(String, self._status_topic, 10)
+        self._publish_static_transform()
 
         self._cloud_queue: queue.Queue = queue.Queue(maxsize=2)
         self._imu_queue: queue.Queue = queue.Queue(maxsize=4)
@@ -144,8 +185,25 @@ class _NavigationSensorNode(Node):
             f"{self.cloud_topic}; "
             f"{self._raw_imu_topic} -> {self.imu_topic}; "
             f"frame={self._sensor_frame}, "
+            f"static_tf={self._base_frame}->{self._sensor_frame} "
+            f"xyz={self._base_to_sensor_translation} "
+            f"rpy={self._base_to_sensor_rpy}, "
             f"device_to_sensor_rotation={self._sensor_rotation.reshape(9).tolist()}"
         )
+
+    def _publish_static_transform(self) -> None:
+        transform = TransformStamped()
+        transform.header.stamp = self.get_clock().now().to_msg()
+        transform.header.frame_id = self._base_frame
+        transform.child_frame_id = self._sensor_frame
+        translation = transform.transform.translation
+        translation.x, translation.y, translation.z = self._base_to_sensor_translation
+        rotation = transform.transform.rotation
+        rotation.x, rotation.y, rotation.z, rotation.w = _quaternion_from_rpy(
+            *self._base_to_sensor_rpy
+        )
+        self._static_tf_broadcaster = StaticTransformBroadcaster(self)
+        self._static_tf_broadcaster.sendTransform(transform)
 
     def _correct_stamp(self, source_stamp, stream: str) -> int | None:
         try:
@@ -382,9 +440,14 @@ class _NavigationSensorNode(Node):
                     "imu": self._raw_imu_topic,
                 },
                 "frames": {
+                    "base": self._base_frame,
                     "sensor": self._sensor_frame,
                     "lidar": self._sensor_frame,
                     "imu": self._sensor_frame,
+                },
+                "base_to_sensor_transform": {
+                    "translation_m": self._base_to_sensor_translation,
+                    "rotation_rpy_rad": self._base_to_sensor_rpy,
                 },
                 "device_to_sensor_rotation_matrix": [
                     float(value) for value in self._sensor_rotation.reshape(9)

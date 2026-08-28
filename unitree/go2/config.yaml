@@ -40,7 +40,11 @@ plugins:
     raw_imu_topic: rt/utlidar/imu
     cloud_topic: /ubuntu/navigation/lidar
     imu_topic: /ubuntu/navigation/imu
+    base_frame: base_link
     sensor_frame: utlidar_lidar
+    # Unitree Go2 radar_joint factory mount, expressed as base_link -> sensor.
+    base_to_sensor_translation_m: [0.28945, 0.0, -0.046825]
+    base_to_sensor_rotation_rpy_rad: [0.0, 2.8782, 0.0]
     device_to_sensor_rotation_matrix: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
     clock_warmup_samples: 32
     clock_window_samples: 400

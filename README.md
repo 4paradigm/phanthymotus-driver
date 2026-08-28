@@ -95,7 +95,11 @@ REP-145, a stationary upward sensor Z axis reports `+g`; this is not a frame
 inversion. Raw per-point `time` is in seconds and is converted to a strictly
 increasing FLOAT64 absolute nanosecond timestamp. The isolated worker,
 source-clock normalization, fail-closed readiness checks, and shared card
-lifecycle match the G1 navigation sensor path.
+lifecycle match the G1 navigation sensor path. The same worker publishes the
+configured `base_link -> utlidar_lidar` mount through ROS 2's static transform
+broadcaster. Go2 defaults to Unitree's [factory `radar_joint` transform](https://github.com/unitreerobotics/unitree_ros/blob/master/robots/go2_description/urdf/go2_description.urdf)
+(`xyz=[0.28945, 0,-0.046825]`, `rpy=[0,2.8782,0]`); missing or invalid
+extrinsics fail worker startup instead of falling back to identity.
 
 ## Writing a New Driver
 
