@@ -709,6 +709,27 @@ class DevicePluginContractTests(unittest.TestCase):
         plugin.dispatch("hold_current", {})
         self.assertEqual(list(range(25)), plugin._publisher.messages[-1].joint_indices)
 
+    def test_mixed_head_arm_request_busy_arm_does_not_leak_head_lock(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        self.assertIsNone(plan.acquire_arm("arm"))
+
+        rejected = plan.dispatch("plan", {
+            "joint_indices": [23, 16],
+            "target_positions": [0.1, 0.1],
+            "duration": 1.0,
+        })
+        self.assertEqual("arm is busy", rejected["error"])
+        self.assertIsNone(plan.head_status()["owner"])
+        self.assertEqual("arm", plan.arm_status()["owner"])
+
+        head = plan.dispatch("head_pose", {"pitch_rad": 0.1, "yaw_rad": 0.0})
+        self.assertEqual("requested", head["state"])
+        plan.release_head("joint_plan")
+        plan.release_arm("arm")
+        self.assertIsNone(plan.acquire_arm("probe"))
+        plan.release_arm("probe")
+
     def test_arm_declares_async_position_only_actions(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
         arm = self.device.ArmActuatorPlugin(CONFIG, plan, self.state)
@@ -721,6 +742,9 @@ class DevicePluginContractTests(unittest.TestCase):
             schema["x-completion"]["actions"],
         )
         self.assertGreaterEqual(schema["x-completion"]["timeout"], arm._ACP_TIMEOUT_SEC)
+        self.assertTrue(schema["x-is-dangerous"])
+        self.assertEqual(0.05, schema["properties"]["duration"]["minimum"])
+        self.assertEqual(10.0, schema["properties"]["duration"]["maximum"])
         self.assertEqual(
             ["side", "duration", "force", "confirm"],
             schema["x-action-params"]["raise"]["params"],
@@ -755,6 +779,18 @@ class DevicePluginContractTests(unittest.TestCase):
         forced = arm.dispatch("raise", {"side": "right", "duration": 0.05, "force": True, "confirm": True})
         self.assertEqual("running", forced["state"])
         arm._thread.join(timeout=1.0)
+
+    def test_arm_rejects_invalid_duration(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros)
+        plan.start()
+        arm = self.device.ArmActuatorPlugin(CONFIG, plan, self.state)
+        plan.current_motion = lambda: ("lower_body_balance", [])
+
+        for duration in (0.04, 10.01, float("nan"), float("inf")):
+            with self.subTest(duration=duration):
+                result = arm.dispatch("raise", {"side": "right", "duration": duration})
+                self.assertIn("finite number between 0.05 and 10", result["error"])
+        self.assertEqual([], plan._publisher.messages)
 
     def test_arm_force_without_confirm_is_rejected(self):
         """force=true bypassing the safety gate must also require confirm=true."""
@@ -923,6 +959,33 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual(6, len(plan._publisher.messages))
         self.assertEqual(6, status["step"])
         self.assertEqual("wave_finish_right", status["step_name"])
+
+    def test_arm_completion_releases_mutex_before_acp_callback(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        plan.wait_until_idle = lambda *_args, **_kwargs: {}
+        plan.wait_for_request = lambda *_args, **_kwargs: {}
+        arm = self.device.ArmActuatorPlugin(CONFIG, plan, self.state)
+        follow_up = []
+
+        def notify(_tool, _action_id, _status, _result, _timeout):
+            if not follow_up:
+                follow_up.append(arm.dispatch("raise", {
+                    "side": "left", "duration": 0.05, "force": True, "confirm": True,
+                }))
+
+        self.device._notify_acp_completion = notify
+        first = arm.dispatch("raise", {
+            "side": "right", "duration": 0.05, "force": True, "confirm": True,
+        })
+        self.assertEqual("running", first["state"])
+        deadline = time.monotonic() + 1.0
+        while not follow_up and time.monotonic() < deadline:
+            time.sleep(0.001)
+        self.assertEqual("running", follow_up[0]["state"])
+        arm.dispatch("stop", {})
+        if arm._thread is not None:
+            arm._thread.join(timeout=1.0)
 
     def test_arm_concurrent_dispatch_keeps_mutex_owned_by_active_worker(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros)

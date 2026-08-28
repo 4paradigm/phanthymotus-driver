@@ -2656,6 +2656,7 @@ class JointPlanPlugin:
         controls_arm = action == "reset" or bool(set(indices) & set(T800_JOINT_GROUPS["arms"]))
         owner = owner or "joint_plan"
         # head 执行期间独占整个 planner：任何非所属请求一律拒绝
+        acquired_head = False
         with self._head_lock:
             if self._head_owner == "joint_plan" and action != "cancel":
                 return {"error": "head is busy", "owner": self._head_owner,
@@ -2663,8 +2664,9 @@ class JointPlanPlugin:
             if self._head_owner not in (None, owner):
                 return {"error": "head is busy", "owner": self._head_owner,
                         "request_id": self._head_request_id}
-            if controls_head:
+            if controls_head and self._head_owner is None:
                 self._head_owner = owner
+                acquired_head = True
         # arm 互斥：直接调用(joint_plan)严格获取不允许重入，worker 子请求验证已有所有权
         if controls_arm and action != "cancel":
             if owner == "joint_plan":
@@ -2672,6 +2674,8 @@ class JointPlanPlugin:
             else:
                 busy = self.verify_arm_owner(owner)
             if busy is not None:
+                if acquired_head:
+                    self.release_head(owner)
                 return busy
         msg = self._request_type()
         cancels_direct_head_lease = False
@@ -3751,7 +3755,7 @@ class ArmActuatorPlugin:
             {
                 "side": {"type": "string", "enum": ["left", "right", "both"]},
                 "target_positions": array_property("目标关节弧度：单臂 5 个，both 为左 5 + 右 5"),
-                "duration": {"type": "number", "description": "执行时间，秒"},
+                "duration": {"type": "number", "minimum": 0.05, "maximum": 10.0, "description": "执行时间，秒"},
                 "times": {"type": "integer", "minimum": 1, "maximum": 5},
                 "speed": {"type": "number", "minimum": 0.5, "maximum": 2.0},
                 "force": {"type": "boolean", "description": "危险：忽略 lower_body_balance 状态门禁，机器人非平衡时运动手臂可能跌倒"},
@@ -3759,6 +3763,7 @@ class ArmActuatorPlugin:
             },
             "手臂动作",
         )
+        schema["x-is-dangerous"] = True
         schema["x-completion"] = {
             "actions": list(self._ASYNC_ACTIONS),
             "timeout": int(self._worst_case_duration_sec()),
@@ -3854,7 +3859,10 @@ class ArmActuatorPlugin:
         return side
 
     def _duration(self, args: dict) -> float:
-        return clamp(args.get("duration", self._config.get("step_duration_sec", 0.5)), 0.05, 10.0)
+        duration = float(args.get("duration", self._config.get("step_duration_sec", 0.5)))
+        if not math.isfinite(duration) or not 0.05 <= duration <= 10.0:
+            raise ValueError("duration must be a finite number between 0.05 and 10 seconds")
+        return duration
 
     def _feedback_grace(self) -> float:
         return clamp(self._config.get("feedback_grace_sec", 1.0), 0.0, self._FEEDBACK_GRACE_MAX_SEC)
@@ -3919,7 +3927,11 @@ class ArmActuatorPlugin:
         if len(steps) > self._MAX_SEQUENCE_STEPS:
             return {"error": f"arm sequence cannot contain more than {self._MAX_SEQUENCE_STEPS} steps"}
         with self._lock:
-            if self._thread is not None and self._thread.is_alive():
+            if (
+                self._thread is not None
+                and self._thread.is_alive()
+                and self._thread is not threading.current_thread()
+            ):
                 return {"error": "another arm action is already running"}
             busy = self._joint_plan.acquire_arm("arm")
             if busy is not None:
@@ -3975,11 +3987,11 @@ class ArmActuatorPlugin:
                             "request_id": self._status.get("request_id"),
                             "error": self._status.get("error"),
                         }
+                    self._joint_plan.release_arm("arm")
                     _notify_acp_completion(
                         "arm", action_id, final_status, final_result,
                         ArmActuatorPlugin._ACP_CALLBACK_TIMEOUT_SEC,
                     )
-                    self._joint_plan.release_arm("arm")
 
             thread = threading.Thread(target=run, daemon=True, name="t800-arm-action")
             self._thread = thread
