@@ -1422,6 +1422,66 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual(ssl.CERT_REQUIRED, contexts[0].verify_mode)
         self.assertEqual("https://phanthy-motus:15678/api/acp/complete", requests[0][0])
 
+    def test_acp_preflight_exposes_missing_ca_certificate(self):
+        previous_url = os.environ.get("AGENT_CORE_URL")
+        previous_ca = os.environ.pop("AGENT_CORE_CA_CERT", None)
+        os.environ["AGENT_CORE_URL"] = "https://phanthy-motus:15678"
+        try:
+            status = self.device._t800_acp_preflight()
+            self.assertEqual("error", status["state"])
+            self.assertFalse(status["configured"])
+            self.assertIn("AGENT_CORE_CA_CERT", status["last_error"])
+        finally:
+            if previous_url is None:
+                os.environ.pop("AGENT_CORE_URL", None)
+            else:
+                os.environ["AGENT_CORE_URL"] = previous_url
+            if previous_ca is not None:
+                os.environ["AGENT_CORE_CA_CERT"] = previous_ca
+
+    def test_acp_callback_failure_is_visible_and_success_recovers(self):
+        import urllib.request as urllib_request
+
+        previous_url = os.environ.get("AGENT_CORE_URL")
+        previous_ca = os.environ.pop("AGENT_CORE_CA_CERT", None)
+        original_urlopen = urllib_request.urlopen
+        os.environ["AGENT_CORE_URL"] = "http://127.0.0.1:15678"
+        attempts = 0
+
+        def urlopen(*_args, **_kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OSError("agent core unavailable")
+            return types.SimpleNamespace(close=lambda: None)
+
+        urllib_request.urlopen = urlopen
+        try:
+            self.device._t800_acp_preflight()
+            self.assertFalse(self.device._t800_acp_notify(
+                "failed_action", "completed", {}, "motion_recorder"
+            ))
+            failed = self.device._t800_acp_status()
+            self.assertEqual("error", failed["state"])
+            self.assertTrue(failed["configured"])
+            self.assertIn("agent core unavailable", failed["last_error"])
+
+            self.assertTrue(self.device._t800_acp_notify(
+                "recovered_action", "completed", {}, "motion_recorder"
+            ))
+            recovered = self.device._t800_acp_status()
+            self.assertEqual("ready", recovered["state"])
+            self.assertIsNone(recovered["last_error"])
+            self.assertIsNotNone(recovered["last_success_at"])
+        finally:
+            urllib_request.urlopen = original_urlopen
+            if previous_url is None:
+                os.environ.pop("AGENT_CORE_URL", None)
+            else:
+                os.environ["AGENT_CORE_URL"] = previous_url
+            if previous_ca is not None:
+                os.environ["AGENT_CORE_CA_CERT"] = previous_ca
+
     def test_gesture_uses_validated_real_device_trajectories(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
         plan.start()
@@ -1729,8 +1789,20 @@ class DevicePluginContractTests(unittest.TestCase):
     def test_speaker_startup_asset_is_packaged_like_g1_without_external_fetch(self):
         dockerfile = (ROOT / "Dockerfile").read_text()
         startup_beep = ROOT / "resource" / "startup_beep.pcm"
+        g1_startup_beep = (
+            ROOT.parents[1]
+            / "unitree"
+            / "g1"
+            / "resource"
+            / "startup_beep.pcm"
+        )
         self.assertTrue(startup_beep.is_file())
         self.assertEqual(256000, startup_beep.stat().st_size)
+        self.assertLess(startup_beep.stat().st_size, 500 * 1024)
+        self.assertEqual(
+            g1_startup_beep.read_bytes(),
+            startup_beep.read_bytes(),
+        )
         self.assertEqual(
             "e634d402feeead175e7a669a77fa8d6aa5770e162fbd3c867503d4897dc2f166",
             hashlib.sha256(startup_beep.read_bytes()).hexdigest(),

@@ -99,26 +99,100 @@ _AUDIO_QOS = QoSProfile(
     durability=DurabilityPolicy.VOLATILE,
 )
 
+_ACP_STATUS_LOCK = threading.Lock()
+_ACP_STATUS = {
+    "state": "unknown",
+    "configured": False,
+    "url": None,
+    "ca_cert": None,
+    "last_error": "ACP configuration has not been validated",
+    "last_success_at": None,
+    "last_failure_at": None,
+}
 
-def _t800_acp_notify(action_id: str, status: str, result: dict, tool: str) -> None:
-    """Post asynchronous actuator completion to Agent Core."""
+
+def _update_acp_status(**updates) -> dict:
+    with _ACP_STATUS_LOCK:
+        _ACP_STATUS.update(updates)
+        return dict(_ACP_STATUS)
+
+
+def _t800_acp_transport():
     import os as _os
     import ssl
     import urllib.parse
+
+    agent_core_url = _os.environ.get(
+        "AGENT_CORE_URL", "https://phanthy-motus:15678"
+    ).rstrip("/")
+    ca_cert = _os.environ.get("AGENT_CORE_CA_CERT")
+    parsed_url = urllib.parse.urlparse(agent_core_url)
+    if parsed_url.scheme not in ("http", "https") or not parsed_url.hostname:
+        raise ValueError(
+            "AGENT_CORE_URL must be an absolute http or https URL"
+        )
+    if (
+        parsed_url.scheme == "http"
+        and parsed_url.hostname not in ("localhost", "127.0.0.1", "::1")
+    ):
+        raise ValueError(
+            "unencrypted AGENT_CORE_URL is only allowed on loopback"
+        )
+    if parsed_url.scheme == "https" and not ca_cert:
+        raise ValueError(
+            "AGENT_CORE_CA_CERT is required for https ACP callbacks"
+        )
+    context = ssl.create_default_context(cafile=ca_cert or None)
+    return f"{agent_core_url}/api/acp/complete", context, ca_cert
+
+
+def _t800_acp_preflight() -> dict:
+    import os as _os
+
+    agent_core_url = _os.environ.get(
+        "AGENT_CORE_URL", "https://phanthy-motus:15678"
+    ).rstrip("/")
+    try:
+        _endpoint, _context, ca_cert = _t800_acp_transport()
+    except Exception as exc:
+        return _update_acp_status(
+            state="error",
+            configured=False,
+            url=agent_core_url,
+            ca_cert=_os.environ.get("AGENT_CORE_CA_CERT"),
+            last_error=str(exc),
+            last_failure_at=time.time(),
+        )
+    return _update_acp_status(
+        state="ready",
+        configured=True,
+        url=agent_core_url,
+        ca_cert=ca_cert,
+        last_error=None,
+    )
+
+
+def _t800_acp_status() -> dict:
+    with _ACP_STATUS_LOCK:
+        status = dict(_ACP_STATUS)
+    if not status["configured"]:
+        return _t800_acp_preflight()
+    return status
+
+
+def _t800_acp_notify(
+    action_id: str,
+    status: str,
+    result: dict,
+    tool: str,
+) -> bool:
+    """Post asynchronous actuator completion to Agent Core."""
     import urllib.request
 
-    agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://phanthy-motus:15678")
-    ca_cert = _os.environ.get("AGENT_CORE_CA_CERT")
+    transport_ready = False
     try:
-        parsed_url = urllib.parse.urlparse(agent_core_url)
-        if parsed_url.scheme not in ("http", "https"):
-            raise ValueError("AGENT_CORE_URL must use http or https")
-        if (
-            parsed_url.scheme == "http"
-            and parsed_url.hostname not in ("localhost", "127.0.0.1", "::1")
-        ):
-            raise ValueError("unencrypted AGENT_CORE_URL is only allowed on loopback")
-        context = ssl.create_default_context(cafile=ca_cert or None)
+        endpoint, context, ca_cert = _t800_acp_transport()
+        transport_ready = True
         payload = json.dumps({
             "action_id": action_id,
             "status": status,
@@ -127,14 +201,30 @@ def _t800_acp_notify(action_id: str, status: str, result: dict, tool: str) -> No
             "ts": time.time(),
         }).encode()
         request = urllib.request.Request(
-            f"{agent_core_url}/api/acp/complete",
+            endpoint,
             data=payload,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
         urllib.request.urlopen(request, timeout=5, context=context)
+        _update_acp_status(
+            state="ready",
+            configured=True,
+            url=endpoint.removesuffix("/api/acp/complete"),
+            ca_cert=ca_cert,
+            last_error=None,
+            last_success_at=time.time(),
+        )
+        return True
     except Exception as exc:
+        _update_acp_status(
+            state="error",
+            configured=transport_ready,
+            last_error=str(exc),
+            last_failure_at=time.time(),
+        )
         print(f"[{tool}] ACP notify failed for {action_id}: {exc}", flush=True)
+        return False
 
 _LIFECYCLE_ACTIONS = {
     "start": ([], "启动卡片数据流"),
@@ -6565,6 +6655,7 @@ class MotionRecorderPlugin:
                 "reset_pending": self._reset_request_id is not None,
                 "reset_cancel_pending": self._reset_cancelling,
                 "last_reset": dict(self._last_reset) if self._last_reset else None,
+                "acp": _t800_acp_status(),
             }
 
     # ── Plugin compatibility ──────────────────────────────────────────────────

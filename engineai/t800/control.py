@@ -755,6 +755,8 @@ class RepeatingCommand:
         self._stop_publisher = stop_publisher
         self._period = 1.0 / rate_hz
         self._clock = clock
+        self._lifecycle_lock = threading.RLock()
+        self._publish_lock = threading.Lock()
         self._lock = threading.Lock()
         self._stop_event: threading.Event | None = None
         self._started_at: float | None = None
@@ -767,55 +769,78 @@ class RepeatingCommand:
         duration = float(duration)
         if not math.isfinite(duration) or (duration < 0 and duration != -1):
             raise ValueError("duration must be -1 or a non-negative finite number")
-        self.stop()
-        if duration == 0:
+        with self._lifecycle_lock:
+            self._stop_locked()
+            if duration == 0:
+                return self.snapshot()
+
+            stop_event = threading.Event()
+            started_at = self._clock()
+            deadline = None if duration == -1 else started_at + duration
+            with self._publish_lock:
+                with self._lock:
+                    self._stop_event = stop_event
+                    self._started_at = started_at
+                    self._deadline = deadline
+                    self._last_publish_at = started_at
+                    self._publish_count = 1
+                    self._last_error = None
+                try:
+                    # Publish once before handing off to the worker. The lock
+                    # orders this command before a concurrent stop.
+                    self._publisher(command)
+                except Exception as exc:
+                    with self._lock:
+                        if self._stop_event is stop_event:
+                            self._stop_event = None
+                            self._publish_count = 0
+                            self._last_publish_at = None
+                            self._last_error = str(exc)
+                    raise
+
+            thread = threading.Thread(
+                target=self._run,
+                args=(command, stop_event, deadline),
+                daemon=True,
+                name="t800-command-stream",
+            )
+            thread.start()
             return self.snapshot()
 
-        stop_event = threading.Event()
-        started_at = self._clock()
-        deadline = None if duration == -1 else started_at + duration
-        with self._lock:
-            self._stop_event = stop_event
-            self._started_at = started_at
-            self._deadline = deadline
-            self._last_publish_at = started_at
-            self._publish_count = 1
-            self._last_error = None
+    def _run(
+        self,
+        command: dict,
+        stop_event: threading.Event,
+        deadline: float | None,
+    ) -> None:
         try:
-            # Publish once before handing off to the worker. This guarantees a
-            # short command is not lost if the scheduler starts the thread late.
-            self._publisher(command)
-        except Exception as exc:
-            with self._lock:
-                if self._stop_event is stop_event:
-                    self._stop_event = None
-                    self._publish_count = 0
-                    self._last_publish_at = None
-                    self._last_error = str(exc)
-            raise
-
-        def run() -> None:
-            try:
-                while not stop_event.wait(self._period):
-                    now = self._clock()
-                    if deadline is not None and now >= deadline:
+            while not stop_event.wait(self._period):
+                now = self._clock()
+                if deadline is not None and now >= deadline:
+                    break
+                with self._publish_lock:
+                    with self._lock:
+                        owns_stream = (
+                            self._stop_event is stop_event
+                            and not stop_event.is_set()
+                        )
+                    if not owns_stream:
                         break
                     self._publisher(command)
                     with self._lock:
-                        self._last_publish_at = now
-                        self._publish_count += 1
-                    stop_event.wait(self._period)
-            except Exception as exc:
-                with self._lock:
-                    if self._stop_event is stop_event:
-                        self._last_error = str(exc)
-            finally:
+                        if self._stop_event is stop_event:
+                            self._last_publish_at = now
+                            self._publish_count += 1
+        except Exception as exc:
+            with self._lock:
+                if self._stop_event is stop_event:
+                    self._last_error = str(exc)
+        finally:
+            with self._publish_lock:
                 with self._lock:
                     owns_stream = self._stop_event is stop_event
                     if owns_stream:
                         self._stop_event = None
-                # A replaced stream was already stopped before its replacement
-                # started.  It must not inject a late zero into the new stream.
                 if owns_stream:
                     try:
                         self._stop_publisher()
@@ -824,18 +849,20 @@ class RepeatingCommand:
                             if self._last_error is None:
                                 self._last_error = f"stop publish failed: {exc}"
 
-        threading.Thread(target=run, daemon=True, name="t800-command-stream").start()
-        return self.snapshot()
-
     def stop(self) -> bool:
-        with self._lock:
-            stop_event = self._stop_event
-            self._stop_event = None
-        if stop_event is None:
-            return False
-        stop_event.set()
-        self._stop_publisher()
-        return True
+        with self._lifecycle_lock:
+            return self._stop_locked()
+
+    def _stop_locked(self) -> bool:
+        with self._publish_lock:
+            with self._lock:
+                stop_event = self._stop_event
+                if stop_event is None:
+                    return False
+                self._stop_event = None
+                stop_event.set()
+            self._stop_publisher()
+            return True
 
     def snapshot(self) -> StreamSnapshot:
         with self._lock:

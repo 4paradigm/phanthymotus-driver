@@ -141,6 +141,8 @@ class T800DeviceBundle:
             StatePlugin,
             TtsPlugin,
             VisionPlugin,
+            _t800_acp_preflight,
+            _t800_acp_status,
         )
         from virtual_gamepad import VirtualGamepadPlugin
 
@@ -148,6 +150,14 @@ class T800DeviceBundle:
         self._active_plugins: list = []
         self._startup_errors: dict[str, str] = {}
         self._started = False
+        self._acp_status = _t800_acp_status
+        acp_status = _t800_acp_preflight()
+        if acp_status["state"] == "error":
+            error = acp_status["last_error"]
+            print(
+                f"[bundle] ACP configuration error: {error}",
+                flush=True,
+            )
         plugins = config.get("plugins", {})
         motion_interrupt_group = MotionInterruptGroup()
         self._motion_interrupt_group = motion_interrupt_group
@@ -325,11 +335,19 @@ class T800DeviceBundle:
             definitions = plugin.get_tools() if hasattr(plugin, "get_tools") else [plugin.get_tool()]
             configured_tools += len(definitions)
         active_tools = len(self.get_all_tools())
+        acp_status_fn = getattr(
+            self,
+            "_acp_status",
+            lambda: {"state": "ready", "configured": True, "last_error": None},
+        )
+        acp_status = acp_status_fn()
         if not self._started:
             state = "starting"
         elif self._startup_errors and not self._active_plugins:
             state = "failed"
         elif self._startup_errors:
+            state = "degraded"
+        elif acp_status.get("state") == "error":
             state = "degraded"
         else:
             state = "running"
@@ -341,6 +359,7 @@ class T800DeviceBundle:
             "configured_tools": configured_tools,
             "active_tools": active_tools,
             "startup_errors": dict(self._startup_errors),
+            "acp": acp_status,
         }
 
     def dispatch(self, tool_name: str, arguments: dict) -> dict | None:
