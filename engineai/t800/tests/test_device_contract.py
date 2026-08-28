@@ -1,6 +1,7 @@
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import ssl
 import struct
@@ -1953,6 +1954,7 @@ class DevicePluginContractTests(unittest.TestCase):
         plugin._check_pulse = lambda: None
         plugin._run_command = lambda command: commands.append(command) or ""
         plugin._spawn_player = lambda: process
+        plugin._clock = lambda: 0.0
         plugin._startup_wait = lambda _event, _seconds: False
         plugin._acp_notify = lambda *_args: None
         started = plugin.dispatch("start", {"input_topic": "/perception/tts"})
@@ -2202,6 +2204,7 @@ class DevicePluginContractTests(unittest.TestCase):
         plugin._check_pulse = lambda: None
         plugin._run_command = lambda command: ""
         plugin._spawn_player = lambda: process
+        plugin._clock = lambda: 0.0
         plugin._startup_wait = (
             lambda _event, seconds: paced_seconds.append(seconds) or False
         )
@@ -2230,6 +2233,36 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual(started["action_id"], completions[0][0])
         self.assertEqual("completed", completions[0][1])
         plugin.stop()
+
+    def test_speaker_pacing_deducts_pipe_write_backpressure(self):
+        plugin = self.device.SpeakerPlugin(CONFIG, "robot", self.ros)
+        now = [0.0]
+        waits = []
+        plugin._clock = lambda: now[0]
+        plugin._startup_wait = (
+            lambda _event, seconds: waits.append(seconds) or False
+        )
+
+        class Stdin:
+            def write(self, _data):
+                now[0] += 0.05
+
+            def flush(self):
+                pass
+
+        process = types.SimpleNamespace(
+            stdin=Stdin(), poll=lambda: None
+        )
+        plugin._play_full_startup_sound(
+            plugin._session, process, threading.Event()
+        )
+
+        block_count = math.ceil(256000 / 9600)
+        self.assertAlmostEqual(
+            8.0,
+            sum(waits) + block_count * 0.05,
+            places=6,
+        )
 
     def test_speaker_old_player_cannot_consume_restarted_session_audio(self):
         # review 反馈:旧播放线程可能已阻塞在 queue.get() 中；stop() 的 join
