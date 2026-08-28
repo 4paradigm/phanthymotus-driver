@@ -839,8 +839,6 @@ class RepeatingCommand:
             with self._publish_lock:
                 with self._lock:
                     owns_stream = self._stop_event is stop_event
-                    if owns_stream:
-                        self._stop_event = None
                 if owns_stream:
                     try:
                         self._stop_publisher()
@@ -848,6 +846,10 @@ class RepeatingCommand:
                         with self._lock:
                             if self._last_error is None:
                                 self._last_error = f"stop publish failed: {exc}"
+                    finally:
+                        with self._lock:
+                            if self._stop_event is stop_event:
+                                self._stop_event = None
 
     def stop(self) -> bool:
         with self._lifecycle_lock:
@@ -859,9 +861,13 @@ class RepeatingCommand:
                 stop_event = self._stop_event
                 if stop_event is None:
                     return False
-                self._stop_event = None
                 stop_event.set()
-            self._stop_publisher()
+            try:
+                self._stop_publisher()
+            finally:
+                with self._lock:
+                    if self._stop_event is stop_event:
+                        self._stop_event = None
             return True
 
     def snapshot(self) -> StreamSnapshot:

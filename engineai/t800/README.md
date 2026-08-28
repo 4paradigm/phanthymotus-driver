@@ -65,11 +65,19 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 基础运动协议没有供控制闭环使用的定位反馈，因此它们仍是开环动作并返回
 `open_loop: true`。若 Odin2 固件提供配置中的 odometry topic，
 `motion_command_trace` 会把它用于状态显示，但不会据此闭环控制动作。
-有限时长动作最多运行 3 秒且不建立 ACP 屏障；更长运动请拆分命令，或使用
-`duration=-1` 持续发送并通过 `stop_move` 手动停止。这样停止动作不会被屏障拦截。
-所有速度、角速度、复合动作速度和 duration 都必须是有限值并落在配置安全
+有限时长动作的用户有效 `duration` 最多 10 秒；Driver 会先额外发送 1 秒
+预备命令，再完整执行用户填写的时长，因此固件起步准备不再消耗有效行动
+时间。预备+行动总时长超过 3 秒的有限动作返回唯一 `action_id`，并在自然
+结束、异常或取消时发送 ACP completion；短动作保持同步语义，不建立无意义
+pending。
+`stop_move` 是 `on_interrupt_motion` hook，可绕过 barrier 立即归零。
+`duration=-1` 仍持续发送到手动停止且不建立无限期 ACP pending。
+默认护栏为 `vx=±2.0m/s`、`vy=±1.0m/s`、`vyaw=±2.0rad/s`。所有速度、
+角速度、复合动作速度和 duration 都必须是有限值并落在配置安全
 范围内；越界输入返回 `INVALID_ARGUMENT` / `SAFETY_LIMIT` 并立即归零旧速度流，
-不会静默截断后继续执行。
+不会静默截断后继续执行。零速 release 发布失败时，原 action 以 `error` 完成，
+`status.release_failed=true` 并保持设备运动门禁；再次调用 `stop_move` 发布成功后
+才解除。
 卡片 UI 对未填写的 move 可选字段可能发送 `null`；Driver 将其等同于省略，
 使用 `vy=0`、`vyaw=0`、`duration=1s` 默认值，布尔值和字符串仍严格拒绝。
 
@@ -79,11 +87,13 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 关节动作队列。`stop_gesture` 注册为 `on_interrupt_motion` hook，因此即使
 `play` / `sequence` 正在等待 ACP completion，Agent Core 也会绕过 actuator
 barrier 立即下发停止请求，并由 Driver 以 `cancelled` 完成原 action id。
-Bundle 将 Gesture、Motion Recorder 与 Head 注册到同一个设备级 interrupt group；
-任一 `on_interrupt_motion` action 都会同时请求停止三者，避免 Agent Core 清除
+Bundle 将 Speaker、Locomotion、Gesture、Motion Recorder 与 Head 注册到同一个
+设备级 interrupt group；任一 speak/motion interrupt action 都会同时请求停止这些
+输出，避免 Agent Core 清除
 全局 pending 时遗漏同一 T800 MCP 内的兄弟动作。若旧线程仍在完成最终释放，
 Bundle 会暂时拒绝新的运动输出 action；stop/status/safety 路径保持可用，待
-Gesture、Recorder 与 Head 均静止后自动解除。Gesture/Head 的 planner cancel 无论发布
+Speaker startup、Locomotion、Gesture、Recorder 与 Head 均静止后自动解除。
+Gesture/Head 的 planner cancel 无论发布
 成功还是重试，都会保留 request-id 门禁直到 planner 反馈 `IDLE`；发布失败
 可再次调用 `stop_gesture` 重试。interrupt/stop 路径不会因
 `reset_after=true` 启动一个未纳入 ACP 的新复位动作。
@@ -97,26 +107,33 @@ lie_down 组合键。LCM 输入会覆盖实体手柄输入，发送完成后 Dri
 `gait` 不会写入自定义 `gait.json`。官方 T800 Native SDK 的行走
 策略配置位于 `assets/config/t800/.../*.yaml`，且不提供 `step_height`、
 `stride_length` 等通用运行时调参契约。因此卡片只通过官方
-`/motion/set_motion_state` 接口切换 `basic` / `balanced`，并以
+`/motion/set_motion_state` 接口切换“拟人步态”/“下肢平衡”，并以
 `/motion/motion_state` 返回的可转换状态为准。`rl_terrain` 不属于当前 T800
 状态机，因此不会作为可选项暴露；terrain 接口示例不能视为 T800 固件能力。
+卡片不再暴露 `force`/`wait`：内部固定使用 `force=false`、`wait=true`，避免
+用户绕过固件可用转换或在状态尚未确认时继续下一个动作。真实切换通过 ACP
+完成。
 
 `motion_recorder.record_start` 是幂等的：录制中重复调用只返回当前会话，
 不会意外停止。`record_stop` 同样可重复调用；设置 `duration > 0`
 时超时会走与手动停止相同的落盘路径。状态中的 `last_recording`
 可用于确认最近一次保存文件、停止原因和帧数。
-主机持久化录制在 load/play 前会校验 JSON 根结构、metadata、帧数量上限、
+主机持久化录制在 list/play 前会校验 JSON 根结构、metadata、帧数量上限、
 文件字节数、录制总时长、回放采样数、最小帧间隔、严格递增且有限的时间戳，
 以及完整有限且符合 URDF 限位的 25 关节 position 数组；插值后派生速度也必须
 落在 URDF velocity 限位内。旧录制可省略 velocity，若提供则同样校验；
 无效文件返回 `INVALID_ARGUMENT`，不会污染当前录制 buffer 或抛出内部异常。
 
-录制与回放仅在 `lower_body_balance` 状态开放。回放不再把每个 20Hz 录制帧
+卡片 action 精简为 `record_start`、`record_stop`、`play`、`stop_playback`、
+`list`、`delete`、`status`；录制停止即自动保存，play 直接读取命名文件，
+因此不再暴露重复的 `save`/`load`，也不再暴露手动 `reset`。
+每次 `record_start` 与 `play` 都先自动进入 `lower_body_balance`，发送官方
+`REQUEST_RESET` 并等待同一 request id 回到 `IDLE`；该准备阶段和后续动作
+复用父 action 的 ACP 生命周期。回放不再把每个 20Hz 录制帧
 提交为独立 joint plan，而是先用 0.5 秒五次曲线从当前位置平滑接入，再以
 三次 Hermite 插值重采样为 100Hz `JointOverrideCommand` 连续轨迹；停止、
-异常和完成路径都会发布 `weight=0` 释放覆盖。录制或回放完成后，状态返回
-`needs_reset=true`，必须执行 `reset`：安全进入 `lower_body_balance` 并发送
-官方 `REQUEST_RESET` 默认姿态请求。规划器确认回到 `IDLE` 后才允许下一次录制。
+异常和完成路径都会发布 `weight=0` 释放覆盖。录制或回放完成后的
+`needs_reset=true` 会在下一次 record_start/play 的自动准备阶段被处理。
 `stop_playback` 注册为 `on_interrupt_motion` hook；它不会被 `play` 的 ACP
 barrier 阻塞，停止时会立即设置取消事件并发布 joint override release，后台
 回放线程退出时再以 `cancelled` 完成对应的 action id。在 `reset` pending 时
@@ -152,12 +169,15 @@ Sobel 边缘抑制和最近邻上采样均由众擎节点完成。使用 `depth`
 utterance 结束的 8 字节 EOF magic），driver 只负责流式播放。镜像已含
 `alsa-utils`；容器经 `-v /dev:/dev` 挂载声卡节点。
 
-开机音与 `unitree/g1` 使用同一份 256,000 字节 PCM 资源（SHA256
+开机音与 `unitree/g1` 使用同一份 256,000 字节、16kHz 单声道 PCM 资源，
+音频时长严格为 8 秒（SHA256
 `e634d402feeead175e7a669a77fa8d6aa5770e162fbd3c867503d4897dc2f166`），
 通过 `COPY resource/` 随 driver 镜像打包，不依赖 GitHub/COS 等外部下载。
 该文件低于仓库 500KB 的 COS 阈值，`.pcm` 也不在全局规则明确禁止提交的
 归档/二进制扩展名列表中；T800 路径复用 G1 已存在的同一 Git blob，不新增
-音频对象历史。Docker 构建仍按固定 SHA256 校验内容完整性。
+音频对象历史。`speaker.start` 会先按 G1 顺序完整播放 8 秒，再创建 live PCM
+订阅，live 音频不再截断开机音；start 的准备过程通过 ACP completion 串行化。
+Docker 构建仍按固定 SHA256 校验内容完整性。
 `alsa-utils` 提供 `aplay`，`libasound2-plugins` 提供 `/etc/asound.conf`
 所需的 PulseAudio PCM backend；构建日志确认二者不在固定的 ros-base 中，
 因此对应包体增长是该官方播放路径的必要运行时成本。

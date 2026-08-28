@@ -250,7 +250,9 @@ def load_device():
 CONFIG = {
     "ros": {"robot_domain_id": 69, "core_domain_id": 42, "source_timeout_sec": 1.0},
     "control": {"velocity_rate_hz": 100.0, "low_level_rate_hz": 200.0, "override_rate_hz": 100.0,
-                "max_vx": 1.0, "max_vy": 1.0, "max_vyaw": 1.0, "mode_transition_timeout_sec": 0.1,
+                "max_vx": 1.0, "max_vy": 1.0, "max_vyaw": 1.0,
+                "locomotion_prepare_duration_sec": 0.0,
+                "mode_transition_timeout_sec": 0.1,
                 "stream_watchdog_period_sec": 0.5},
     "topics": {
         "joint_state": "/hardware/joint_state", "imu": "/hardware/imu_info",
@@ -673,6 +675,7 @@ class DevicePluginContractTests(unittest.TestCase):
             available_transition_motions=["passive"],
         ))
         result = plugin.dispatch("move", {"vx": 0.9, "vy": -0.9, "vyaw": 0.9, "duration": 0.03})
+        self.assertNotIn("action_id", result)
         self.assertEqual(0.9, result["vx"])
         self.assertEqual(-0.9, result["vy"])
         time.sleep(0.08)
@@ -717,7 +720,7 @@ class DevicePluginContractTests(unittest.TestCase):
             "duration": None,
         })
 
-        self.assertEqual("running", result["state"])
+        self.assertEqual("completed", result["state"])
         self.assertEqual(0.1, result["vx"])
         self.assertEqual(0.0, result["vy"])
         self.assertEqual(0.0, result["vyaw"])
@@ -741,7 +744,7 @@ class DevicePluginContractTests(unittest.TestCase):
             ("move", {"vx": 10**400, "duration": 0.1}, "INVALID_ARGUMENT"),
             ("move", {"vx": float("nan"), "duration": 0.1}, "INVALID_ARGUMENT"),
             ("move", {"vx": 0.1, "duration": -0.5}, "INVALID_ARGUMENT"),
-            ("move", {"vx": 0.1, "duration": 3.1}, "SAFETY_LIMIT"),
+            ("move", {"vx": 0.1, "duration": 10.1}, "SAFETY_LIMIT"),
             ("move_displacement", {"x_m": 0.1, "y_m": 0, "speed_m_s": 10}, "SAFETY_LIMIT"),
             ("move_displacement", {"x_m": 0.1, "y_m": 0, "speed_m_s": None}, "INVALID_ARGUMENT"),
             ("move_displacement", {"x_m": 0.1, "y_m": 0, "speed_m_s": 0}, "INVALID_ARGUMENT"),
@@ -764,7 +767,7 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual(
             [
                 {"type": "number", "const": -1},
-                {"type": "number", "minimum": 0, "maximum": 3.0},
+                {"type": "number", "minimum": 0, "maximum": 10.0},
             ],
             duration_schema["anyOf"],
         )
@@ -773,7 +776,14 @@ class DevicePluginContractTests(unittest.TestCase):
         plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
         plugin.start()
         schema = plugin.get_tool()["inputSchema"]
-        self.assertNotIn("x-completion", schema)
+        self.assertEqual(
+            ["move", "move_displacement", "turn_angle", "arc"],
+            schema["x-completion"]["actions"],
+        )
+        self.assertEqual(
+            {"on_interrupt_motion": {"action": "stop_move"}},
+            schema["x-hooks"],
+        )
         self.assertNotIn("force", schema["properties"])
         for motion in ("rl_basic", "walk", "lower_body_balance"):
             with self.subTest(motion=motion):
@@ -785,7 +795,7 @@ class DevicePluginContractTests(unittest.TestCase):
                     "vx": 0.2,
                     "duration": 0.01,
                 })
-                self.assertEqual("running", result["state"])
+                self.assertEqual("completed", result["state"])
                 self.assertEqual(0.2, result["vx"])
                 plugin.dispatch("stop_move", {})
 
@@ -809,9 +819,19 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertNotIn("action_id", result)
         self.assertEqual("stopped", plugin.dispatch("stop_move", {})["state"])
 
-    def test_locomotion_timed_move_stops_and_zeroes_velocity(self):
-        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+    def test_locomotion_timed_move_separates_preparation_and_reports_acp(self):
+        config = {
+            **CONFIG,
+            "control": {
+                **CONFIG["control"],
+                "locomotion_prepare_duration_sec": 0.04,
+            },
+        }
+        plugin = self.device.LocomotionPlugin(config, "robot", self.ros, self.state)
         plugin.start()
+        plugin._ACP_MIN_DURATION_SEC = 0.05
+        completions = []
+        plugin._acp_notify = lambda *args: completions.append(args)
         self.state._on_motion(types.SimpleNamespace(
             current_motion_task="rl_basic",
             available_transition_motions=["passive"],
@@ -819,9 +839,136 @@ class DevicePluginContractTests(unittest.TestCase):
 
         result = plugin.dispatch("move", {"vx": 0.1, "duration": 0.03})
 
-        self.assertNotIn("action_id", result)
-        time.sleep(0.08)
+        self.assertTrue(result["action_id"].startswith("t800_loco_"))
+        self.assertEqual(0.04, result["preparation_duration"])
+        self.assertEqual(0.03, result["duration"])
+        self.assertEqual(0.07, result["command_duration"])
+        time.sleep(0.045)
+        self.assertTrue(plugin._stream.snapshot().active)
+        time.sleep(0.06)
+        self.assertFalse(plugin._stream.snapshot().active)
         self.assertEqual(0.0, plugin._publisher.messages[-1].yaw_velocity)
+        self.assertEqual(result["action_id"], completions[0][0])
+        self.assertEqual("completed", completions[0][1])
+
+    def test_locomotion_concurrent_starts_complete_every_action_id_once(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        plugin._ACP_MIN_DURATION_SEC = 0.01
+        completions = []
+        plugin._acp_notify = lambda *args: completions.append(args)
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
+        first_publish_entered = threading.Event()
+        allow_first_publish = threading.Event()
+        real_publish = plugin._stream._publisher
+        publish_calls = 0
+
+        def gated_publish(payload):
+            nonlocal publish_calls
+            publish_calls += 1
+            if publish_calls == 1:
+                first_publish_entered.set()
+                allow_first_publish.wait(timeout=1.0)
+            real_publish(payload)
+
+        plugin._stream._publisher = gated_publish
+        results = [{}, {}]
+        first = threading.Thread(target=lambda: results[0].update(
+            plugin.dispatch("move", {"vx": 0.1, "duration": 0.05})
+        ))
+        second = threading.Thread(target=lambda: results[1].update(
+            plugin.dispatch("move", {"vx": 0.2, "duration": 0.05})
+        ))
+        first.start()
+        self.assertTrue(first_publish_entered.wait(timeout=1.0))
+        second.start()
+        allow_first_publish.set()
+        first.join(timeout=1.0)
+        second.join(timeout=1.0)
+        deadline = time.monotonic() + 1.0
+        while len(completions) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        action_ids = {result["action_id"] for result in results}
+        self.assertEqual(2, len(action_ids))
+        self.assertEqual(action_ids, {call[0] for call in completions})
+        self.assertEqual(2, len(completions))
+        self.assertIn("cancelled", {call[1] for call in completions})
+        self.assertIn("completed", {call[1] for call in completions})
+
+    def test_locomotion_release_failure_completes_error_and_stays_gated(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        plugin._ACP_MIN_DURATION_SEC = 0.01
+        completions = []
+        plugin._acp_notify = lambda *args: completions.append(args)
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
+        real_publish = plugin._publisher.publish
+        fail_release = True
+
+        def publish(message):
+            if (
+                fail_release
+                and list(message.linear_velocity) == [0.0, 0.0]
+                and float(message.yaw_velocity) == 0.0
+            ):
+                raise RuntimeError("zero velocity transport failed")
+            real_publish(message)
+
+        plugin._publisher.publish = publish
+        moving = plugin.dispatch("move", {"vx": 0.2, "duration": 0.5})
+        stopped = plugin.dispatch("stop_move", {})
+
+        self.assertEqual("error", stopped["state"])
+        self.assertTrue(stopped["release_failed"])
+        self.assertTrue(plugin.motion_active())
+        deadline = time.monotonic() + 1.0
+        while not completions and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(moving["action_id"], completions[0][0])
+        self.assertEqual("error", completions[0][1])
+
+        fail_release = False
+        retried = plugin.dispatch("stop_move", {})
+        self.assertEqual("stopped", retried["state"])
+        self.assertFalse(plugin.motion_active())
+
+    def test_locomotion_natural_release_failure_also_stays_gated(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        plugin._ACP_MIN_DURATION_SEC = 0.01
+        completions = []
+        plugin._acp_notify = lambda *args: completions.append(args)
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
+        real_publish = plugin._publisher.publish
+
+        def publish(message):
+            if (
+                list(message.linear_velocity) == [0.0, 0.0]
+                and float(message.yaw_velocity) == 0.0
+            ):
+                raise RuntimeError("natural zero transport failed")
+            real_publish(message)
+
+        plugin._publisher.publish = publish
+        moving = plugin.dispatch("move", {"vx": 0.2, "duration": 0.03})
+        deadline = time.monotonic() + 1.0
+        while not completions and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        self.assertEqual(moving["action_id"], completions[0][0])
+        self.assertEqual("error", completions[0][1])
+        self.assertTrue(plugin.motion_active())
+        self.assertTrue(plugin.dispatch("status", {})["release_failed"])
 
     def test_locomotion_manual_stop_zeroes_active_timed_action(self):
         plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
@@ -938,7 +1085,7 @@ class DevicePluginContractTests(unittest.TestCase):
             "duration": plugin._MAX_TIMED_DURATION_SEC + 0.1,
         })
         self.assertEqual("SAFETY_LIMIT", rejected["code"])
-        self.assertIn("3s safety limit", rejected["error"])
+        self.assertIn("10s safety limit", rejected["error"])
 
     def test_locomotion_open_loop_composites(self):
         plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
@@ -1806,12 +1953,16 @@ class DevicePluginContractTests(unittest.TestCase):
         plugin._check_pulse = lambda: None
         plugin._run_command = lambda command: commands.append(command) or ""
         plugin._spawn_player = lambda: process
-        plugin._enqueue_startup_sound = lambda *args: None  # 跳过开机音
+        plugin._startup_wait = lambda _event, _seconds: False
+        plugin._acp_notify = lambda *_args: None
         started = plugin.dispatch("start", {"input_topic": "/perception/tts"})
-        self.assertEqual("ready", started["state"])
+        self.assertEqual("starting", started["state"])
+        plugin._startup_thread.join(timeout=1.0)
+        self.assertEqual("ready", plugin.dispatch("info", {})["state"])
         self.assertEqual("/perception/tts", started["topic_in"][0]["topic"])
         # 启动时按官方接口解除静音
         self.assertIn(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "0"], commands)
+        process.stdin.writes.clear()
 
         # 画布 PCM 块经 aplay stdin 流式播放；EOF magic 不入流
         plugin._on_chunk(types.SimpleNamespace(format="audio/pcm-16k", data=[1, 2, 3, 4]))
@@ -1914,10 +2065,13 @@ class DevicePluginContractTests(unittest.TestCase):
         try:
             plugin._check_pulse = lambda: None
             plugin._run_command = lambda command: ""
+            plugin._startup_wait = lambda _event, _seconds: False
+            plugin._acp_notify = lambda *_args: None
             result = plugin.dispatch("start", {"input_topic": "/test/pcm"})
+            plugin._startup_thread.join(timeout=1.0)
         finally:
             self.device.subprocess.Popen = original
-        self.assertEqual("ready", result["state"])
+        self.assertEqual("starting", result["state"])
         self.assertEqual(
             ["aplay", "-q", "-t", "raw", "-f", "S16_LE", "-r", "16000", "-c", "1",
              "--buffer-time=100000", "--period-time=20000", "-"],
@@ -1978,7 +2132,6 @@ class DevicePluginContractTests(unittest.TestCase):
         plugin._check_pulse = lambda: None
         plugin._run_command = lambda command: ""
         plugin._spawn_player = lambda: DeadProcess()
-        plugin._enqueue_startup_sound = lambda *args: None  # 跳过开机音
         started = plugin.dispatch("start", {"input_topic": "/perception/tts"})
         self.assertEqual("error", started["state"])
         self.assertIn("aplay exited", started["message"])
@@ -2009,143 +2162,7 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual(0, process.kill_calls)
         self.assertEqual("idle", plugin.dispatch("stop", {})["state"])
 
-    def test_speaker_startup_sound_plays_on_dispatch_start(self):
-        plugin = self.device.SpeakerPlugin(CONFIG, "robot", self.ros)
-
-        class FakeStdin:
-            def __init__(self):
-                self.writes = []
-
-            def write(self, data):
-                self.writes.append(data)
-
-            def flush(self):
-                pass
-
-        class FakeProcess:
-            def __init__(self):
-                self.stdin = FakeStdin()
-                self.returncode = None
-
-            def poll(self):
-                return self.returncode
-
-            def terminate(self):
-                self.returncode = 0
-
-            def wait(self, timeout=None):
-                return self.returncode
-
-            def kill(self):
-                self.returncode = -9
-
-        import pathlib
-        process = FakeProcess()
-        plugin._check_pulse = lambda: None
-        plugin._run_command = lambda command: ""
-        plugin._spawn_player = lambda: process
-        # _enqueue_startup_sound 分块推入 _beep_queue，测试用假 PCM 模拟
-        real_startup = plugin._enqueue_startup_sound
-        startup_queued = []
-        def fake_enqueue(*args):
-            for _ in range(3):
-                plugin._beep_queue.put_nowait(b"\x01\x02\x03")
-            startup_queued.append(True)
-        plugin._enqueue_startup_sound = fake_enqueue
-        started = plugin.dispatch("start", {"input_topic": "/perception/tts"})
-        self.assertEqual("ready", started["state"])
-        self.assertTrue(startup_queued)
-        self.assertEqual(3, plugin._beep_queue.qsize())
-        # dispatch(start) 先返回再异步入队，播放线程已就绪
-
-    def test_speaker_live_audio_preempts_racing_startup_beep_block(self):
-        # review 反馈:beep producer 可能在 active 检查后、put 前暂停；live
-        # callback drain 完毕后它再放入一块。播放器必须丢弃该迟到 beep，
-        # 让首个 live PCM 成为下一块输出。
-        real_queue = self.device.queue.Queue
-        real_thread = self.device.threading.Thread
-        real_read_bytes = Path.read_bytes
-        beep_queues = []
-
-        class GatePutQueue(real_queue):
-            def __init__(self):
-                super().__init__(maxsize=256)
-                self.put_started = threading.Event()
-                self.release_put = threading.Event()
-                self._gated = False
-
-            def put(self, item, block=True, timeout=None):
-                if not self._gated:
-                    self._gated = True
-                    self.put_started.set()
-                    self.release_put.wait(timeout=2)
-                return super().put(item, block=block, timeout=timeout)
-
-        def queue_factory(maxsize=0):
-            if maxsize == 256:
-                result = GatePutQueue()
-                beep_queues.append(result)
-                return result
-            return real_queue(maxsize=maxsize)
-
-        deferred_player = []
-
-        def thread_factory(*args, **kwargs):
-            if kwargs.get("name") == "t800-speaker":
-                thread = DeferredThread(kwargs["target"], kwargs.get("args", ()))
-                deferred_player.append(thread)
-                return thread
-            return real_thread(*args, **kwargs)
-
-        self.device.queue.Queue = queue_factory
-        self.device.threading.Thread = thread_factory
-        Path.read_bytes = lambda path: b"\x00" * 2048
-        plugin = None
-        player_runner = None
-        try:
-            plugin = self.device.SpeakerPlugin(CONFIG, "robot", self.ros)
-            process = FakeAudioProcess()
-            plugin._check_pulse = lambda: None
-            plugin._run_command = lambda command: ""
-            plugin._spawn_player = lambda: process
-            self.assertEqual(
-                "ready",
-                plugin.dispatch("start", {"input_topic": "/perception/tts"})["state"],
-            )
-            self.assertEqual(1, len(deferred_player))
-            active_beep_queue = plugin._beep_queue
-            self.assertTrue(active_beep_queue.put_started.wait(timeout=1))
-
-            live_pcm = b"\x55\x66\x77\x88"
-            plugin._subscription.callback(types.SimpleNamespace(
-                format="audio/pcm-16k", data=list(live_pcm)))
-            active_beep_queue.release_put.set()
-            deadline = time.monotonic() + 1
-            while active_beep_queue.qsize() == 0 and time.monotonic() < deadline:
-                time.sleep(0.01)
-
-            deferred = deferred_player[0]
-            player_runner = real_thread(target=deferred.target, args=deferred.args)
-            player_runner.start()
-            deadline = time.monotonic() + 0.5
-            while not process.stdin.writes and time.monotonic() < deadline:
-                time.sleep(0.01)
-            self.assertEqual(live_pcm, process.stdin.writes[0])
-        finally:
-            for beep_queue in beep_queues:
-                beep_queue.release_put.set()
-            if plugin is not None:
-                plugin.stop()
-            if player_runner is not None:
-                player_runner.join(timeout=1)
-            Path.read_bytes = real_read_bytes
-            self.device.queue.Queue = real_queue
-            self.device.threading.Thread = real_thread
-
-    def test_speaker_stale_startup_thread_cannot_write_into_restarted_session(self):
-        # review 反馈:旧会话的开机音线程若延迟到 stop/start 后才运行，不能把
-        # 旧开机音写进新会话。通过延迟线程调度稳定复现该竞态，并从新 aplay
-        # 进程的输出边界验证没有跨会话音频泄漏。
+    def test_speaker_start_completes_full_g1_beep_before_live_subscription(self):
         plugin = self.device.SpeakerPlugin(CONFIG, "robot", self.ros)
 
         class FakeStdin:
@@ -2178,60 +2195,41 @@ class DevicePluginContractTests(unittest.TestCase):
             def kill(self):
                 self.returncode = -9
 
-        processes = []
+        process = FakeProcess()
+        subscription_offsets = []
+        completions = []
+        paced_seconds = []
         plugin._check_pulse = lambda: None
         plugin._run_command = lambda command: ""
+        plugin._spawn_player = lambda: process
+        plugin._startup_wait = (
+            lambda _event, seconds: paced_seconds.append(seconds) or False
+        )
+        plugin._acp_notify = lambda *args: completions.append(args)
+        real_create_subscription = plugin._node.create_subscription
 
-        def spawn_player():
-            process = FakeProcess()
-            processes.append(process)
-            return process
-
-        plugin._spawn_player = spawn_player
-
-        real_thread = self.device.threading.Thread
-        real_read_bytes = Path.read_bytes
-        deferred_beep_threads = []
-
-        class DeferredThread:
-            def __init__(self, target, args):
-                self.target = target
-                self.args = args
-
-            def start(self):
-                pass
-
-        def controlled_thread(*args, **kwargs):
-            if kwargs.get("name") == "t800-beep-enqueue":
-                thread = DeferredThread(kwargs["target"], kwargs.get("args", ()))
-                deferred_beep_threads.append(thread)
-                return thread
-            return real_thread(*args, **kwargs)
-
-        self.device.threading.Thread = controlled_thread
-        Path.read_bytes = lambda path: b"\x00" * 2048
-        try:
-            self.assertEqual(
-                "ready",
-                plugin.dispatch("start", {"input_topic": "/perception/tts/old"})["state"],
+        def create_subscription(*args, **kwargs):
+            subscription_offsets.append(
+                sum(len(chunk) for chunk in process.stdin.writes)
             )
-            self.assertEqual("idle", plugin.dispatch("stop", {})["state"])
-            self.assertEqual(
-                "ready",
-                plugin.dispatch("start", {"input_topic": "/perception/tts/new"})["state"],
-            )
-            self.assertEqual(2, len(deferred_beep_threads))
+            return real_create_subscription(*args, **kwargs)
 
-            stale_thread = deferred_beep_threads[0]
-            stale_thread.target(*stale_thread.args)
-            deadline = time.monotonic() + 0.2
-            while not processes[-1].stdin.writes and time.monotonic() < deadline:
-                time.sleep(0.01)
-            self.assertEqual([], processes[-1].stdin.writes)
-        finally:
-            Path.read_bytes = real_read_bytes
-            self.device.threading.Thread = real_thread
-            plugin.stop()
+        plugin._node.create_subscription = create_subscription
+        started = plugin.dispatch("start", {"input_topic": "/perception/tts"})
+        self.assertEqual("starting", started["state"])
+        self.assertTrue(started["action_id"].startswith("t800_speaker_start_"))
+        plugin._startup_thread.join(timeout=1.0)
+
+        expected_bytes = (ROOT / "resource" / "startup_beep.pcm").read_bytes()
+        self.assertEqual(256000, len(expected_bytes))
+        self.assertEqual(8.0, len(expected_bytes) / 32000.0)
+        self.assertAlmostEqual(8.0, sum(paced_seconds), places=6)
+        self.assertEqual(expected_bytes, b"".join(process.stdin.writes))
+        self.assertEqual([len(expected_bytes)], subscription_offsets)
+        self.assertEqual("ready", plugin.dispatch("info", {})["state"])
+        self.assertEqual(started["action_id"], completions[0][0])
+        self.assertEqual("completed", completions[0][1])
+        plugin.stop()
 
     def test_speaker_old_player_cannot_consume_restarted_session_audio(self):
         # review 反馈:旧播放线程可能已阻塞在 queue.get() 中；stop() 的 join
@@ -2286,7 +2284,8 @@ class DevicePluginContractTests(unittest.TestCase):
             processes = []
             plugin._check_pulse = lambda: None
             plugin._run_command = lambda command: ""
-            plugin._enqueue_startup_sound = lambda *args: None
+            plugin._startup_wait = lambda _event, _seconds: False
+            plugin._acp_notify = lambda *_args: None
 
             def spawn_player():
                 process = FakeAudioProcess()
@@ -2294,18 +2293,22 @@ class DevicePluginContractTests(unittest.TestCase):
                 return process
 
             plugin._spawn_player = spawn_player
-            self.assertEqual(
-                "ready",
-                plugin.dispatch("start", {"input_topic": "/perception/tts/old"})["state"],
+            first = plugin.dispatch(
+                "start", {"input_topic": "/perception/tts/old"}
             )
+            self.assertEqual("starting", first["state"])
+            plugin._startup_thread.join(timeout=1.0)
+            processes[-1].stdin.writes.clear()
             old_player = plugin._thread
             self.assertTrue(blocking_queue.get_started.wait(timeout=1))
 
             self.assertEqual("idle", plugin.dispatch("stop", {})["state"])
-            self.assertEqual(
-                "ready",
-                plugin.dispatch("start", {"input_topic": "/perception/tts/new"})["state"],
+            second = plugin.dispatch(
+                "start", {"input_topic": "/perception/tts/new"}
             )
+            self.assertEqual("starting", second["state"])
+            plugin._startup_thread.join(timeout=1.0)
+            processes[-1].stdin.writes.clear()
             self.assertEqual(1, len(deferred_player))
 
             live_pcm = b"\x11\x22\x33\x44"
