@@ -6726,6 +6726,7 @@ class GaitPlugin:
             {
                 "gait": {
                     "type": "string",
+                    "enum": list(self._profiles),
                     "oneOf": [
                         {
                             "const": name,

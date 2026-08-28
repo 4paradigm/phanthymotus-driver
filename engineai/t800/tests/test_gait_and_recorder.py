@@ -257,6 +257,10 @@ class GaitPluginContractTests(unittest.TestCase):
         actions = tool["inputSchema"]["properties"]["action"]["enum"]
         self.assertEqual(["start", "stop", "info", "status", "list", "select"], actions)
         self.assertEqual(
+            ["basic", "balanced"],
+            tool["inputSchema"]["properties"]["gait"]["enum"],
+        )
+        self.assertEqual(
             [
                 {"const": "basic", "title": "拟人步态"},
                 {"const": "balanced", "title": "下肢平衡"},
