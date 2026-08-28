@@ -303,6 +303,12 @@ class TianyiDeviceBundle:
             self._plugins.append(CameraPlugin(plugins_cfg["camera"], namespace, ros2))
             print("[bundle] CameraPlugin loaded")
 
+        if plugins_cfg.get("camera_snapshot", {}).get("enabled", False):
+            from device import CameraSnapshotPlugin
+            self._plugins.append(CameraSnapshotPlugin(
+                plugins_cfg["camera_snapshot"], namespace, ros2))
+            print("[bundle] CameraSnapshotPlugin loaded")
+
         for config_name, class_name in (("imu", "ImuPlugin"),
                                         ("camera_depth", "DepthCameraPlugin"),
                                         ("camera_pointcloud", "PointCloudPlugin")):
@@ -437,7 +443,10 @@ class TianyiDeviceBundle:
             print("[bundle] LightPlugin loaded")
 
     # 核心插件始终自动启动，其余等 MCP action:start 触发（懒启动）
-    _ALWAYS_START = {'StatePlugin', 'AsrPlugin', 'RemoteStatePlugin', 'TtsPlugin', 'ExtMicPlugin'}
+    _ALWAYS_START = {
+        'StatePlugin', 'AsrPlugin', 'RemoteStatePlugin', 'TtsPlugin',
+        'ExtMicPlugin', 'CameraSnapshotPlugin',
+    }
 
     def start_all(self) -> None:
         self._started_plugins: set = set()

@@ -1121,6 +1121,140 @@ class CameraPlugin:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# CameraSnapshotPlugin (actuator)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class CameraSnapshotPlugin:
+    """保存头部 RGB 相机最新一帧，供 channel_reply 作为 JPEG 附件发送。"""
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._config = plugin_config
+        self._ros2 = ros2
+        self._running = False
+        self._latest_frame = None
+        self._frame_lock = threading.Lock()
+        self._sub_node = Node("tianyi2_camera_snapshot_sub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._sub_node)
+
+        self._native_dir = Path(plugin_config.get(
+            "output_dir", "/opt/phanthy-motus/data/images"))
+        self._channel_dir = plugin_config.get(
+            "channel_output_dir", "/work/resource/images")
+        self._jpeg_quality = max(1, min(100, int(plugin_config.get("jpeg_quality", 90))))
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "camera_snapshot",
+            "type": "actuator",
+            "description": (
+                "拍摄一张天轶2.0头部摄像机当前画面并保存为JPEG。"
+                "拍摄成功后可使用返回的 channel_reply_path 通过消息渠道发送。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["capture", "info", "start", "stop"],
+                        "description": "操作类型",
+                    },
+                },
+                "required": ["action"],
+            },
+        }
+
+    def start(self):
+        if self._running:
+            return
+        try:
+            from sensor_msgs.msg import Image
+            import cv2
+            import numpy as np
+
+            # The raw topic is produced by the host Orbbec service, so make
+            # sure it is available even when the preview card was not started.
+            CameraPlugin._ensure_orbbec_service()
+            self._cv2 = cv2
+            self._np = np
+            self._sub_node.create_subscription(
+                Image, "/ob_camera_head/color/image_raw",
+                self._on_image, _RELIABLE_QOS)
+            self._native_dir.mkdir(parents=True, exist_ok=True)
+            self._running = True
+            print("[CameraSnapshotPlugin] subscribed to head RGB camera")
+        except Exception as e:
+            raise RuntimeError(f"camera snapshot initialization failed: {e}") from e
+
+    def stop(self):
+        self._running = False
+        with self._frame_lock:
+            self._latest_frame = None
+
+    def _on_image(self, msg):
+        if not self._running:
+            return
+        with self._frame_lock:
+            self._latest_frame = msg
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            self.stop()
+            return {"state": "idle"}
+        if action == "info":
+            with self._frame_lock:
+                available = self._latest_frame is not None
+            return {
+                "state": "running" if self._running else "idle",
+                "frame_available": available,
+                "source_topic": "/ob_camera_head/color/image_raw",
+                "output_dir": str(self._native_dir),
+                "channel_output_dir": self._channel_dir,
+            }
+        if action != "capture":
+            return {"error": f"unknown action: {action}"}
+        if not self._running:
+            return {"error": "camera snapshot is not running; call action=start first"}
+
+        with self._frame_lock:
+            msg = self._latest_frame
+        if msg is None:
+            return {
+                "error": "no camera frame received yet",
+                "source_topic": "/ob_camera_head/color/image_raw",
+            }
+
+        try:
+            image = self._np.frombuffer(msg.data, dtype=self._np.uint8)
+            expected = msg.height * msg.width * 3
+            if image.size != expected:
+                return {"error": f"unexpected RGB frame size: {image.size}, expected {expected}"}
+            image = image.reshape(msg.height, msg.width, 3)
+            if msg.encoding.lower() == "rgb8":
+                image = self._cv2.cvtColor(image, self._cv2.COLOR_RGB2BGR)
+            ok, encoded = self._cv2.imencode(
+                ".jpg", image, [self._cv2.IMWRITE_JPEG_QUALITY, self._jpeg_quality])
+            if not ok:
+                return {"error": "JPEG encoding failed"}
+
+            filename = f"head_{time.time_ns()}.jpg"
+            native_path = self._native_dir / filename
+            native_path.write_bytes(encoded.tobytes())
+            channel_path = str(Path(self._channel_dir) / filename)
+            return {
+                "state": "captured",
+                "filename": filename,
+                "path": str(native_path),
+                "channel_reply_path": channel_path,
+                "mime": "image/jpeg",
+                "size": native_path.stat().st_size,
+            }
+        except Exception as e:
+            return {"error": f"failed to save JPEG: {e}"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Additional sensors / indicators
 # ══════════════════════════════════════════════════════════════════════════════
 
