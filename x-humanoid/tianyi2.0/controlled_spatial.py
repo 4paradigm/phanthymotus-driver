@@ -676,6 +676,14 @@ class ControlledSpatialPlugin:
         return None
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "config":
+            # Agent Core replays saved tool configuration before starting a
+            # card. Keep the runtime password in sync with that configuration.
+            password = args.get("password")
+            if password not in (None, ""):
+                self._password = str(password)
+            return {"state": "configured"}
+
         if action == "start":
             return {"state": "ready"}
         if action == "stop":
