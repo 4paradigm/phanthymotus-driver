@@ -1001,7 +1001,8 @@ class CameraPlugin:
         except ImportError as e:
             print(f"[CameraPlugin] WARNING: import failed ({e})")
 
-    def _ensure_orbbec_service(self):
+    @staticmethod
+    def _ensure_orbbec_service():
         """Configure and start the host's Orbbec service through ``nsenter``.
 
         The camera runs on the host because it owns the USB device.  Each
@@ -1013,7 +1014,7 @@ class CameraPlugin:
         """
         import subprocess
         try:
-            changed = self._configure_orbbec_startup()
+            changed = CameraPlugin._configure_orbbec_startup()
             # Use nsenter to run systemctl on host PID 1's namespace
             result = subprocess.run(
                 ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--",
