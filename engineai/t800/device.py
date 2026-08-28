@@ -2488,26 +2488,11 @@ class JointPlanPlugin:
                     raise TimeoutError(f"joint planner did not complete request {target}")
                 self._state_changed.wait(timeout=min(remaining, 0.2))
 
-    def acquire_head(self, owner: str) -> dict | None:
-        with self._head_lock:
-            if self._head_owner not in (None, owner):
-                return {"error": "head is busy", "owner": self._head_owner,
-                        "request_id": self._head_request_id}
-            self._head_owner = owner
-        return None
+    @staticmethod
+    def _new_owner_token(prefix: str) -> str:
+        from uuid import uuid4
 
-    def release_head(self, owner: str) -> None:
-        with self._head_lock:
-            if self._head_owner == owner:
-                self._head_owner = None
-                self._head_request_id = None
-
-    def head_status(self) -> dict:
-        with self._head_lock:
-            return {"owner": self._head_owner, "request_id": self._head_request_id}
-
-    def _dispatch_plan(self, args: dict, owner: str) -> dict:
-        return self._publish_request("plan", args, owner=owner)
+        return f"{prefix}:{uuid4().hex[:12]}"
 
     def _next_request_id(self) -> int:
         with self._state_lock:
@@ -3318,6 +3303,7 @@ class GesturePlugin:
         self._cancel = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_finished_at: float | None = None
+        self._owner: str | None = None
         self._status = {
             "state": "idle", "gesture": None, "step": 0, "step_name": None,
             "total_steps": 0, "request_id": None, "error": None,
@@ -3530,16 +3516,18 @@ class GesturePlugin:
                 current = dict(self._status)
                 current.pop("action_id", None)
                 return {**current, "error": "another gesture sequence is already running"}
+            owner = self._joint_plan._new_owner_token("gesture")
             if controls_arm:
-                busy = self._joint_plan.acquire_arm("gesture")
+                busy = self._joint_plan.acquire_arm(owner)
                 if busy is not None:
                     return busy
             if controls_head:
-                busy = self._joint_plan.acquire_head("gesture")
+                busy = self._joint_plan.acquire_head(owner)
                 if busy is not None:
                     if controls_arm:
-                        self._joint_plan.release_arm("gesture")
+                        self._joint_plan.release_arm(owner)
                     return busy
+            self._owner = owner
             from uuid import uuid4
 
             action_id = f"t800_gesture_{uuid4().hex[:12]}"
@@ -3557,7 +3545,7 @@ class GesturePlugin:
                 # head lock; head lock is planner-exclusive so all steps must
                 # carry the gesture owner while it is held.
                 if controls_arm or controls_head:
-                    return self._joint_plan._dispatch_owned("gesture", action, args)
+                    return self._joint_plan._dispatch_owned(owner, action, args)
                 return self._joint_plan.dispatch(action, args)
             try:
                 self._joint_plan.wait_until_idle(
@@ -3623,9 +3611,11 @@ class GesturePlugin:
                         "error": self._status.get("error"),
                     }
                 if controls_head:
-                    self._joint_plan.release_head("gesture")
+                    self._joint_plan.release_head(owner)
                 if controls_arm:
-                    self._joint_plan.release_arm("gesture")
+                    self._joint_plan.release_arm(owner)
+                with self._lock:
+                    self._owner = None
                 if action_id is not None:
                     _notify_acp_completion(
                         "gesture", action_id, final_status, final_result,
@@ -3639,9 +3629,10 @@ class GesturePlugin:
             thread.start()
         except Exception:
             if controls_head:
-                self._joint_plan.release_head("gesture")
+                self._joint_plan.release_head(owner)
             if controls_arm:
-                self._joint_plan.release_arm("gesture")
+                self._joint_plan.release_arm(owner)
+            self._owner = None
             raise
         return {
             "state": "running",
@@ -3675,20 +3666,21 @@ class GesturePlugin:
                 self._status["state"] = "cancelled"
                 self._status["error"] = ""
                 request_id = self._status.get("request_id")
+                owner = self._owner
             else:
                 request_id = None
+                owner = None
             result = dict(self._status)
-        if request_id is not None:
-            self._joint_plan._dispatch_owned("gesture", "cancel", {"request_id": request_id})
+        if request_id is not None and owner is not None:
+            self._joint_plan._dispatch_owned(owner, "cancel", {"request_id": request_id})
         # 必须等 worker 退出后再释放锁，否则 worker 可能已通过取消检查、
         # 正准备调用 _dispatch_owned，与新拿到锁的动作竞态。
         if active and thread is not threading.current_thread():
             thread.join(timeout=self._STOP_JOIN_TIMEOUT_SEC)
             if thread.is_alive():
-                # worker 卡死（极端情况），兜底释放避免永久死锁；release 有
-                # owner 校验，worker 之后迟到的释放不会误伤新 owner。
-                self._joint_plan.release_head("gesture")
-                self._joint_plan.release_arm("gesture")
+                # worker 卡死（极端情况），不释放锁，让新动作拿不到所有权
+                # 避免旧 worker 与新动作并发发布
+                pass
         if reset_after and active:
             # worker 已退出，reset 作为直接请求派发，由 _on_state 终态释放锁
             self._joint_plan.dispatch("reset", {})
@@ -3733,6 +3725,7 @@ class ArmActuatorPlugin:
         self._lock = threading.Lock()
         self._cancel = threading.Event()
         self._thread: threading.Thread | None = None
+        self._owner: str | None = None
         self._status = {
             "state": "idle", "action": None, "step": 0, "step_name": None,
             "total_steps": 0, "request_id": None, "action_id": None, "error": None,
@@ -3936,9 +3929,11 @@ class ArmActuatorPlugin:
                 and self._thread is not threading.current_thread()
             ):
                 return {"error": "another arm action is already running"}
-            busy = self._joint_plan.acquire_arm("arm")
+            owner = self._joint_plan._new_owner_token("arm")
+            busy = self._joint_plan.acquire_arm(owner)
             if busy is not None:
                 return busy
+            self._owner = owner
             from uuid import uuid4
 
             action_id = f"t800_arm_{uuid4().hex[:12]}"
@@ -3958,7 +3953,7 @@ class ArmActuatorPlugin:
                         with self._lock:
                             self._status["step"] = index
                             self._status["step_name"] = step["name"]
-                        result = self._joint_plan._dispatch_owned("arm", "plan", step)
+                        result = self._joint_plan._dispatch_owned(owner, "plan", step)
                         if "error" in result:
                             raise ValueError(result["error"])
                         request_id = int(result["request_id"])
@@ -3975,7 +3970,7 @@ class ArmActuatorPlugin:
                 except Exception as exc:
                     cancelled = self._cancel.is_set()
                     if request_id is not None:
-                        self._joint_plan._dispatch_owned("arm", "cancel", {"request_id": request_id})
+                        self._joint_plan._dispatch_owned(owner, "cancel", {"request_id": request_id})
                     with self._lock:
                         self._status["state"] = "cancelled" if cancelled else "error"
                         self._status["error"] = "" if cancelled else str(exc)
@@ -3990,7 +3985,9 @@ class ArmActuatorPlugin:
                             "request_id": self._status.get("request_id"),
                             "error": self._status.get("error"),
                         }
-                    self._joint_plan.release_arm("arm")
+                    self._joint_plan.release_arm(owner)
+                    with self._lock:
+                        self._owner = None
                     _notify_acp_completion(
                         "arm", action_id, final_status, final_result,
                         ArmActuatorPlugin._ACP_CALLBACK_TIMEOUT_SEC,
@@ -4001,7 +3998,8 @@ class ArmActuatorPlugin:
             try:
                 thread.start()
             except Exception:
-                self._joint_plan.release_arm("arm")
+                self._joint_plan.release_arm(owner)
+                self._owner = None
                 raise
         return {"state": "running", "action": action, "total_steps": len(steps), "action_id": action_id}
 
@@ -4014,16 +4012,20 @@ class ArmActuatorPlugin:
                 self._status["error"] = ""
                 request_id = self._status.get("request_id")
                 thread = self._thread
+                owner = self._owner
             else:
                 request_id = None
                 thread = None
+                owner = None
             result = dict(self._status)
-        if request_id is not None:
-            self._joint_plan._dispatch_owned("arm", "cancel", {"request_id": request_id})
+        if request_id is not None and owner is not None:
+            self._joint_plan._dispatch_owned(owner, "cancel", {"request_id": request_id})
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=self._STOP_JOIN_TIMEOUT_SEC)
             if thread.is_alive():
-                self._joint_plan.release_arm("arm")
+                # worker 卡死（极端情况），不释放锁，让新动作拿不到所有权
+                # 避免旧 worker 与新动作并发发布
+                pass
         return result if active else {"state": "idle"}
 
     def _status_snapshot(self) -> dict:

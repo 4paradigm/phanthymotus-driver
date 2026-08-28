@@ -1011,7 +1011,9 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual(1, sum(result.get("state") == "running" for result in results))
         self.assertEqual(1, sum("another arm action is already running" in result.get("error", "") for result in results))
         self.assertTrue(entered.wait(timeout=1.0))
-        self.assertEqual("arm", plan.arm_status()["owner"])
+        owner = plan.arm_status()["owner"]
+        self.assertIsInstance(owner, str)
+        self.assertTrue(owner.startswith("arm:"))
         release.set()
         arm._thread.join(timeout=1.0)
         self.assertFalse(arm._thread.is_alive())
@@ -1048,6 +1050,71 @@ class DevicePluginContractTests(unittest.TestCase):
         ]
         self.assertTrue(cancel_requests)
         self.assertTrue(any(message.request_id == request_id for message in cancel_requests))
+
+    def test_arm_stop_timeout_keeps_old_worker_from_publishing(self):
+        """Regression: _stop returns after _STOP_JOIN_TIMEOUT_SEC without releasing
+        the lock; the stuck old worker must not be able to publish afterwards."""
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros)
+        plan.start()
+        arm = self.device.ArmActuatorPlugin(CONFIG, plan, self.state)
+        self.device._notify_acp_completion = lambda *_a, **_kw: None
+        original_timeout = arm._STOP_JOIN_TIMEOUT_SEC
+        arm._STOP_JOIN_TIMEOUT_SEC = 0.05
+        try:
+            release_wait = threading.Event()
+
+            def blocked_wait(_request_id, _timeout, _cancel):
+                release_wait.wait(timeout=5.0)
+
+            plan.wait_until_idle = lambda *_a, **_kw: {}
+            plan.wait_for_request = blocked_wait
+            result = arm.dispatch("raise", {
+                "side": "right", "duration": 0.05, "force": True, "confirm": True,
+            })
+            self.assertEqual("running", result["state"])
+            deadline = time.monotonic() + 1.0
+            while not plan._publisher.messages and time.monotonic() < deadline:
+                time.sleep(0.001)
+            self.assertTrue(plan._publisher.messages)
+            worker = arm._thread
+
+            start = time.monotonic()
+            stopped = arm.dispatch("stop", {})
+            elapsed = time.monotonic() - start
+            self.assertEqual("cancelled", stopped["state"])
+            self.assertLess(elapsed, 1.0)
+            self.assertTrue(worker.is_alive())
+
+            # lock is NOT released: replacement actions stay blocked
+            busy = arm.dispatch("raise", {
+                "side": "left", "duration": 0.05, "force": True, "confirm": True,
+            })
+            self.assertEqual("another arm action is already running", busy["error"])
+            owner = plan.arm_status()["owner"]
+            self.assertIsInstance(owner, str)
+            self.assertTrue(owner.startswith("arm:"))
+
+            # even if the stuck worker woke up now, its owner token no longer
+            # matches any new action's token, so verification must reject it.
+            stale = plan.verify_arm_owner("arm")
+            self.assertIsNotNone(stale)
+            self.assertEqual("arm is busy", stale["error"])
+
+            release_wait.set()
+            worker.join(timeout=2.0)
+            self.assertFalse(worker.is_alive())
+            self.assertIsNone(plan.arm_status()["owner"])
+
+            follow_up = arm.dispatch("raise", {
+                "side": "left", "duration": 0.05, "force": True, "confirm": True,
+            })
+            self.assertEqual("running", follow_up["state"])
+            arm.dispatch("stop", {})
+            if arm._thread is not None:
+                arm._thread.join(timeout=1.0)
+        finally:
+            arm._STOP_JOIN_TIMEOUT_SEC = original_timeout
+            release_wait.set()
 
     def test_arm_stop_keeps_mutex_until_worker_exits(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros)
@@ -1089,7 +1156,9 @@ class DevicePluginContractTests(unittest.TestCase):
         stop_thread.start()
         # While the worker is still blocked, the arm lock must remain held.
         self.assertFalse(stop_done.wait(timeout=0.2))
-        self.assertEqual("arm", plan.arm_status()["owner"])
+        owner = plan.arm_status()["owner"]
+        self.assertIsInstance(owner, str)
+        self.assertTrue(owner.startswith("arm:"))
         busy = arm.dispatch("raise", {"side": "right", "duration": 0.05, "force": True, "confirm": True})
         self.assertIn("error", busy)
 
@@ -1105,7 +1174,9 @@ class DevicePluginContractTests(unittest.TestCase):
         while len(wait_calls) < 2 and time.monotonic() < deadline:
             time.sleep(0.001)
         self.assertEqual(2, len(wait_calls))
-        self.assertEqual("arm", plan.arm_status()["owner"])
+        owner = plan.arm_status()["owner"]
+        self.assertIsInstance(owner, str)
+        self.assertTrue(owner.startswith("arm:"))
         second_request_id = plan.arm_status()["request_id"]
         self.assertIsNotNone(second_request_id)
         second_worker = arm._thread
@@ -1429,7 +1500,9 @@ class DevicePluginContractTests(unittest.TestCase):
             "force": True,
         })
         self.assertTrue(dispatch_entered.wait(timeout=1.0))
-        self.assertEqual("gesture", plan.head_status()["owner"])
+        owner = plan.head_status()["owner"]
+        self.assertIsInstance(owner, str)
+        self.assertTrue(owner.startswith("gesture:"))
 
         stop_done = threading.Event()
 
@@ -1441,7 +1514,9 @@ class DevicePluginContractTests(unittest.TestCase):
         stop_thread.start()
         # stop 应在 join 上阻塞，不能提前释放锁
         self.assertFalse(stop_done.wait(timeout=0.2))
-        self.assertEqual("gesture", plan.head_status()["owner"])
+        owner = plan.head_status()["owner"]
+        self.assertIsInstance(owner, str)
+        self.assertTrue(owner.startswith("gesture:"))
 
         release_dispatch.set()
         self.assertTrue(stop_done.wait(timeout=2.0))
