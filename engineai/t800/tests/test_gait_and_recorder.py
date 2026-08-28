@@ -257,10 +257,12 @@ class GaitPluginContractTests(unittest.TestCase):
         actions = tool["inputSchema"]["properties"]["action"]["enum"]
         self.assertEqual(["start", "stop", "info", "status", "list", "select"], actions)
         self.assertEqual(
-            ["拟人步态", "下肢平衡"],
-            tool["inputSchema"]["properties"]["gait"]["enum"],
+            [
+                {"const": "basic", "title": "拟人步态"},
+                {"const": "balanced", "title": "下肢平衡"},
+            ],
+            tool["inputSchema"]["properties"]["gait"]["oneOf"],
         )
-        self.assertNotIn("terrain", tool["inputSchema"]["properties"]["gait"]["enum"])
         self.assertNotIn("force", tool["inputSchema"]["properties"])
         self.assertNotIn("wait", tool["inputSchema"]["properties"])
         self.assertEqual(
@@ -278,14 +280,15 @@ class GaitPluginContractTests(unittest.TestCase):
         result = self.plugin.dispatch("list", {})
         self.assertEqual("ready", result["state"])
         profiles = {item["name"]: item for item in result["profiles"]}
-        self.assertEqual("rl_basic", profiles["拟人步态"]["resolved_motion_state"])
-        self.assertTrue(profiles["拟人步态"]["available"])
+        self.assertEqual("拟人步态", profiles["basic"]["title"])
+        self.assertEqual("rl_basic", profiles["basic"]["resolved_motion_state"])
+        self.assertTrue(profiles["basic"]["available"])
         self.assertNotIn("terrain", profiles)
 
     def test_select_anthropomorphic_gait_uses_fixed_safe_options_and_acp(self):
         completions = []
         self.plugin._acp_notify = lambda *args: completions.append(args)
-        result = self.plugin.dispatch("select", {"gait": "拟人步态"})
+        result = self.plugin.dispatch("select", {"gait": "basic"})
         self.assertEqual("switching", result["state"])
         self.assertTrue(result["action_id"].startswith("t800_gait_"))
         self.plugin._selection_thread.join(timeout=1.0)
@@ -299,7 +302,7 @@ class GaitPluginContractTests(unittest.TestCase):
     def test_select_anthropomorphic_adapts_to_legacy_walk_state(self):
         self.state.available = ["walk"]
         self.plugin._acp_notify = lambda *_args: None
-        result = self.plugin.dispatch("select", {"gait": "拟人步态"})
+        result = self.plugin.dispatch("select", {"gait": "basic"})
         self.assertEqual("switching", result["state"])
         self.plugin._selection_thread.join(timeout=1.0)
         self.assertEqual("walk", self.motion_mode.calls[-1][1]["target"])
@@ -348,7 +351,7 @@ class GaitPluginContractTests(unittest.TestCase):
             callers = [
                 original_thread(
                     target=lambda index=index: results[index].update(
-                        plugin.dispatch("select", {"gait": "拟人步态"})
+                        plugin.dispatch("select", {"gait": "basic"})
                     )
                 )
                 for index in range(2)
@@ -376,7 +379,7 @@ class GaitPluginContractTests(unittest.TestCase):
     def test_legacy_walk_selected_by_gait_is_accepted_by_loco(self):
         self.state.available = ["walk"]
         self.plugin._acp_notify = lambda *_args: None
-        selected = self.plugin.dispatch("select", {"gait": "拟人步态"})
+        selected = self.plugin.dispatch("select", {"gait": "basic"})
         self.assertEqual("switching", selected["state"])
         self.plugin._selection_thread.join(timeout=1.0)
         self.assertEqual("walk", self.state.current)
@@ -480,7 +483,7 @@ class GaitPluginContractTests(unittest.TestCase):
         harness.register(plugin.get_tool(), plugin.dispatch)
 
         selected = harness.call(
-            "gait", "select", {"gait": "拟人步态"}
+            "gait", "select", {"gait": "basic"}
         )
         self.assertTrue(motion_mode.requested.wait(timeout=1.0))
         self.assertEqual({selected["action_id"]}, harness.pending_actions())
@@ -537,7 +540,7 @@ class GaitPluginContractTests(unittest.TestCase):
         plugin.set_interrupt_group(group)
         group.register("gait", plugin.halt, plugin.motion_active)
 
-        selected = plugin.dispatch("select", {"gait": "拟人步态"})
+        selected = plugin.dispatch("select", {"gait": "basic"})
         self.assertTrue(motion_mode.requested.wait(timeout=1.0))
         stopped = plugin.halt()
         self.assertEqual("cancelling", stopped["state"])
@@ -582,7 +585,7 @@ class GaitPluginContractTests(unittest.TestCase):
         completions = []
         plugin._acp_notify = lambda *args: completions.append(args)
 
-        selected = plugin.dispatch("select", {"gait": "拟人步态"})
+        selected = plugin.dispatch("select", {"gait": "basic"})
         plugin._selection_thread.join(timeout=1.0)
 
         self.assertTrue(any(
@@ -603,7 +606,7 @@ class GaitPluginContractTests(unittest.TestCase):
         self.state.current = "lower_body_balance"
         result = self.plugin.dispatch("status", {})
         self.assertEqual("active", result["state"])
-        self.assertEqual("下肢平衡", result["gait"])
+        self.assertEqual("balanced", result["gait"])
         self.assertEqual("lower_body_balance", result["motion_state"])
 
     def test_unknown_action_returns_error(self):
