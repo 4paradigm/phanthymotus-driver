@@ -12,3 +12,9 @@ plugins:
     enabled: true
   camera:
     enabled: true
+  motion_state:
+    enabled: true
+    # 2 Hz: sufficient for Agent-facing motion telemetry without excessive DDS reads.
+    poll_interval_s: 0.5
+    # Activity classification only; this is not a motor safety or command limit.
+    activity_velocity_threshold: 0.15

@@ -118,6 +118,7 @@ class VirtualGamepadPlugin:
         except Exception as exc:
             self._lcm = None
             self._error = str(exc)
+            raise RuntimeError(f"LCM virtual gamepad initialization failed: {exc}") from exc
 
     def stop(self) -> None:
         self._stream.stop()

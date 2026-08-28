@@ -1,0 +1,11 @@
+string command
+bool auto_start
+---
+int32 CREATE_FAILED = -1
+int32 INVALID_COMMAND = -2
+int32 EXECUTION_FAILED = -3
+int32 SUCCESS = 0
+int32 result
+string message
+---
+string process_info
