@@ -1824,6 +1824,92 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual(7, state["request_id"])
         self.assertEqual(JointMotionPlanState.IDLE, state["status"])
 
+    def test_joint_plan_accepts_exact_completed_idle_when_executing_frame_is_missing(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        requested = plan.dispatch("reset", {})
+
+        # Real T800 reset feedback can omit/drop the transient EXECUTING frame
+        # and finish just below 1.0 due to floating-point convergence.
+        plan._on_state(JointMotionPlanState(
+            requested["request_id"], JointMotionPlanState.IDLE, 0.999838584
+        ))
+
+        state = plan.wait_for_request(
+            requested["request_id"], 0.02, threading.Event()
+        )
+        self.assertEqual(requested["request_id"], state["request_id"])
+        self.assertEqual(JointMotionPlanState.IDLE, state["status"])
+        self.assertIsNone(plan.head_status()["owner"])
+
+    def test_joint_plan_does_not_accept_initial_zero_progress_idle(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        plan._on_state(JointMotionPlanState(
+            26, JointMotionPlanState.IDLE, 0.0
+        ))
+
+        with self.assertRaises(TimeoutError):
+            plan.wait_for_request(26, 0.01, threading.Event())
+
+    def test_motion_recorder_play_starts_after_completed_idle_without_executing_frame(self):
+        with tempfile.TemporaryDirectory() as recordings_dir:
+            config = {
+                **CONFIG,
+                "plugins": {
+                    "motion_recorder": {"recordings_dir": recordings_dir}
+                },
+            }
+            motion_state = types.SimpleNamespace(
+                current_motion=lambda: ("lower_body_balance", [])
+            )
+            plan = self.device.JointPlanPlugin(
+                config, "robot", self.ros, motion_state
+            )
+            plan.start()
+            recorder = self.device.MotionRecorderPlugin(
+                config, "robot", self.ros
+            )
+            recorder.start()
+            recorder.set_joint_plan(plan)
+            recorder.set_reset_controls(motion_state, object())
+            recorder._latest_joint_positions = [0.0] * 25
+            completions = []
+            recorder._acp_notify = lambda *args: completions.append(args)
+            recording = {
+                "metadata": {"label": "final_idle_feedback"},
+                "frames": [
+                    {"timestamp": 0, "positions": [0.0] * 25},
+                    {"timestamp": 50, "positions": [0.0] * 25},
+                ],
+            }
+            (Path(recordings_dir) / "final_idle_feedback.json").write_text(
+                json.dumps(recording), encoding="utf-8"
+            )
+
+            started = recorder.dispatch(
+                "play", {"name": "final_idle_feedback"}
+            )
+            deadline = time.monotonic() + 1.0
+            while not plan._publisher.messages and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertTrue(plan._publisher.messages)
+            request_id = plan._publisher.messages[-1].request_id
+            plan._on_state(JointMotionPlanState(
+                request_id, JointMotionPlanState.IDLE, 0.999838584
+            ))
+            recorder._prepare_thread.join(timeout=1.0)
+            recorder._playback_thread.join(timeout=2.0)
+
+            self.assertEqual("preparing", started["state"])
+            self.assertTrue(any(
+                message.weight == 1.0
+                for message in recorder._override_publisher.messages
+            ))
+            self.assertEqual(started["action_id"], completions[0][0])
+            self.assertEqual("completed", completions[0][1])
+            recorder.stop()
+
     def test_joint_override_force_path_and_release(self):
         plugin = self.device.JointOverridePlugin(CONFIG, "robot", self.ros, self.state)
         plugin.start()

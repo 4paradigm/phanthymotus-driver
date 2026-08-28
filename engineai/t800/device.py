@@ -2681,6 +2681,11 @@ class DancePlugin:
 
 class JointPlanPlugin:
     _LIMIT_MARGIN_RAD = 0.0
+    # The native planner converges to values such as 0.999838584 instead of
+    # publishing an exact 1.0.  Treat that as complete only together with the
+    # exact request id and IDLE status, so the initial progress=0 IDLE echo
+    # cannot complete a request before it executes.
+    _COMPLETED_PROGRESS_MIN = 0.999
     _PRESETS = {
         "shake_hand": {
             "indices": list(range(12, 25)),
@@ -2900,12 +2905,11 @@ class JointPlanPlugin:
                     raise RuntimeError("gesture cancelled")
                 state = dict(self._last_state)
                 current_id = state.get("request_id")
-                status = int(state.get("status", -1))
-                if (
-                    current_id is not None
-                    and int(current_id) == target
-                    and target in self._executing_requests
-                    and status == idle
+                if self._is_completed_idle_feedback(
+                    state,
+                    request_id=target,
+                    idle_status=idle,
+                    saw_executing=target in self._executing_requests,
                 ):
                     self._executing_requests.discard(target)
                     return state
@@ -2915,6 +2919,33 @@ class JointPlanPlugin:
                 if remaining <= 0:
                     raise TimeoutError(f"joint planner did not complete request {target}")
                 self._state_changed.wait(timeout=min(remaining, 0.2))
+
+    @classmethod
+    def _is_completed_idle_feedback(
+        cls,
+        state: dict,
+        *,
+        request_id: int,
+        idle_status: int,
+        saw_executing: bool,
+    ) -> bool:
+        try:
+            exact_request = int(state.get("request_id")) == int(request_id)
+            status = int(state.get("status", -1))
+            progress = float(state.get("progress", 0.0))
+        except (TypeError, ValueError):
+            return False
+        return (
+            exact_request
+            and status == int(idle_status)
+            and (
+                saw_executing
+                or (
+                    math.isfinite(progress)
+                    and progress >= cls._COMPLETED_PROGRESS_MIN
+                )
+            )
+        )
 
     def acquire_head(self, owner: str) -> dict | None:
         with self._head_lock:
@@ -3084,7 +3115,15 @@ class JointPlanPlugin:
                     # 释放，否则锁会永久泄漏，后续所有 head 动作都报 head is busy。
                     if (
                         payload["status"] in (0, 3)
-                        or payload["request_id"] in self._executing_requests
+                        or self._is_completed_idle_feedback(
+                            payload,
+                            request_id=payload["request_id"],
+                            idle_status=int(self._state_type.IDLE),
+                            saw_executing=(
+                                payload["request_id"]
+                                in self._executing_requests
+                            ),
+                        )
                     ):
                         self._head_owner = None
                         self._head_request_id = None
