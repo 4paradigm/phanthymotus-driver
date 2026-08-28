@@ -50,6 +50,7 @@ class FakeBundle:
                     "type": "object",
                     "properties": {
                         "gait": {
+                            "enum": ["basic", "balanced"],
                             "oneOf": [
                                 {"const": "basic", "title": "拟人步态"},
                                 {"const": "balanced", "title": "下肢平衡"},
