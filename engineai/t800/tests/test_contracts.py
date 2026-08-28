@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import struct
 import sys
 import threading
 import time
@@ -40,7 +41,25 @@ class FakeBundle:
         self.state = state
 
     def get_all_tools(self):
-        return [{"name": "echo", "type": "actuator", "inputSchema": {"type": "object"}}]
+        return [
+            {"name": "echo", "type": "actuator", "inputSchema": {"type": "object"}},
+            {
+                "name": "gait",
+                "type": "actuator",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "gait": {
+                            "enum": ["basic", "balanced"],
+                            "oneOf": [
+                                {"const": "basic", "title": "拟人步态"},
+                                {"const": "balanced", "title": "下肢平衡"},
+                            ]
+                        }
+                    },
+                },
+            },
+        ]
 
     def health(self):
         return {"state": self.state, "driver": "engineai-t800"}
@@ -48,6 +67,8 @@ class FakeBundle:
     def dispatch(self, name, arguments):
         if name == "echo":
             return {"echo": arguments}
+        if name == "gait":
+            return {"selected_gait": arguments.get("gait")}
         return None
 
 
@@ -89,6 +110,17 @@ class McpHttpContractTests(unittest.TestCase):
         content = response["result"]["content"]
         self.assertEqual({"echo": {"value": 7}}, json.loads(content[0]["text"]))
 
+    def test_gait_stable_key_survives_actual_mcp_tools_call_envelope(self):
+        response = self.rpc("tools/call", {
+            "name": "gait",
+            "arguments": {"action": "select", "gait": "basic"},
+        })
+        content = response["result"]["content"]
+        self.assertEqual(
+            {"selected_gait": "basic"},
+            json.loads(content[0]["text"]),
+        )
+
     def test_unknown_tool_returns_json_rpc_error(self):
         response = self.rpc("tools/call", {"name": "missing"})
         self.assertEqual(-32601, response["error"]["code"])
@@ -98,6 +130,110 @@ class McpHttpContractTests(unittest.TestCase):
             payload = json.loads(response.read())
             self.assertEqual("engineai-t800", payload["driver"])
             self.assertEqual("running", payload["state"])
+
+    def test_registration_uses_shared_validated_agent_core_transport(self):
+        transport_calls = []
+        started_threads = []
+        fake_context = object()
+        fake_device = types.ModuleType("device")
+        def transport(path):
+            transport_calls.append(path)
+            if len(transport_calls) == 1:
+                raise ValueError("CA not provisioned yet")
+            return (
+                "https://phanthy-motus:15678/api/mcp",
+                fake_context,
+                "/certs/agent-core-ca.pem",
+            )
+        fake_device._t800_agent_core_transport = transport
+
+        class DeferredThread:
+            def __init__(self, *, target, daemon, name):
+                self.target = target
+                self.daemon = daemon
+                self.name = name
+
+            def start(self):
+                started_threads.append(self)
+
+        previous_device = sys.modules.get("device")
+        original_thread = self.module.threading.Thread
+        original_sleep = self.module.time.sleep
+        original_urlopen = urllib.request.urlopen
+        sleep_calls = []
+        states_during_post = []
+
+        class StopLoop(BaseException):
+            pass
+
+        def controlled_sleep(_seconds):
+            sleep_calls.append(_seconds)
+            if len(sleep_calls) >= 2:
+                raise StopLoop()
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        def urlopen(*_args, **_kwargs):
+            states_during_post.append(
+                self.module._registration_status()["state"]
+            )
+            return Response()
+
+        sys.modules["device"] = fake_device
+        self.module.threading.Thread = DeferredThread
+        self.module.time.sleep = controlled_sleep
+        urllib.request.urlopen = urlopen
+        try:
+            self.module._start_registration(15708, {"name": "T800"})
+            with self.assertRaises(StopLoop):
+                started_threads[0].target()
+        finally:
+            self.module.threading.Thread = original_thread
+            self.module.time.sleep = original_sleep
+            urllib.request.urlopen = original_urlopen
+            if previous_device is None:
+                sys.modules.pop("device", None)
+            else:
+                sys.modules["device"] = previous_device
+
+        self.assertEqual(["/api/mcp", "/api/mcp"], transport_calls)
+        self.assertEqual(1, len(started_threads))
+        self.assertEqual("register", started_threads[0].name)
+        self.assertEqual(["error"], states_during_post)
+        self.assertEqual("ready", self.module._registration_status()["state"])
+
+    def test_registration_failure_degrades_bundle_health_without_stopping_it(self):
+        previous = self.module._registration_status()
+        bundle = self.module.T800DeviceBundle.__new__(
+            self.module.T800DeviceBundle
+        )
+        bundle._plugins = []
+        bundle._active_plugins = []
+        bundle._startup_errors = {}
+        bundle._started = True
+        bundle._acp_status = lambda: {
+            "state": "ready",
+            "configured": True,
+            "last_error": None,
+        }
+        try:
+            self.module._update_registration_status(
+                state="error",
+                configured=False,
+                last_error="AGENT_CORE_CA_CERT is required",
+            )
+            health = bundle.health()
+        finally:
+            self.module._update_registration_status(**previous)
+
+        self.assertEqual("degraded", health["state"])
+        self.assertEqual("error", health["registration"]["state"])
+        self.assertIn("AGENT_CORE_CA_CERT", health["registration"]["last_error"])
 
     def test_degraded_health_is_not_reported_as_healthy(self):
         previous = self.module._bundle
@@ -218,8 +354,148 @@ class McpHttpContractTests(unittest.TestCase):
         bundle.stop_all()
         self.assertEqual(1, good.stops)
 
+    def test_bundle_health_degrades_when_acp_configuration_is_invalid(self):
+        bundle = self.module.T800DeviceBundle.__new__(
+            self.module.T800DeviceBundle
+        )
+        bundle._plugins = []
+        bundle._active_plugins = []
+        bundle._startup_errors = {}
+        bundle._started = True
+        bundle._acp_status = lambda: {
+            "state": "error",
+            "configured": False,
+            "last_error": "AGENT_CORE_CA_CERT is required for https",
+        }
+
+        health = bundle.health()
+
+        self.assertEqual("degraded", health["state"])
+        self.assertEqual("error", health["acp"]["state"])
+        self.assertIn("AGENT_CORE_CA_CERT", health["acp"]["last_error"])
+
+    def test_bundle_halts_physical_outputs_before_reverse_teardown(self):
+        events = []
+
+        class Plugin:
+            def __init__(self, name, physical=False):
+                self.name = name
+                if physical:
+                    self.halt = lambda: events.append(f"halt:{name}")
+
+            def stop(self):
+                events.append(f"stop:{self.name}")
+
+        head = Plugin("head")
+        motion = Plugin("motion", physical=True)
+        tail = Plugin("tail")
+        bundle = self.module.T800DeviceBundle.__new__(self.module.T800DeviceBundle)
+        bundle._active_plugins = [head, motion, tail]
+        bundle._started = True
+
+        bundle.stop_all()
+
+        self.assertEqual(
+            ["halt:motion", "stop:tail", "stop:motion", "stop:head"],
+            events,
+        )
+
+    def test_bundle_releases_real_virtual_gamepad_in_phase_one(self):
+        sys.path.insert(0, str(ROOT))
+        from virtual_gamepad import VirtualGamepadPlugin
+
+        events = []
+
+        class Lcm:
+            def publish(self, _channel, payload):
+                events.append(("gamepad", payload))
+
+        class SlowTail:
+            def stop(self):
+                events.append(("tail_stop", None))
+
+        gamepad = VirtualGamepadPlugin({}, "robot", None)
+        gamepad._lcm = Lcm()
+        gamepad.dispatch("sticks", {"left_y": 0.5, "duration": -1})
+        events.clear()
+        bundle = self.module.T800DeviceBundle.__new__(self.module.T800DeviceBundle)
+        bundle._active_plugins = [gamepad, SlowTail()]
+        bundle._started = True
+
+        bundle.stop_all()
+
+        self.assertEqual("gamepad", events[0][0])
+        released = struct.unpack(">Qq12i6d", events[0][1])
+        self.assertEqual((0,) * 12, released[2:14])
+        self.assertEqual("tail_stop", events[1][0])
+
+    def test_bundle_blocks_new_motion_while_interrupt_is_settling(self):
+        class MotionPlugin:
+            def __init__(self):
+                self.calls = []
+
+            def get_tool(self):
+                return {
+                    "name": "gesture",
+                    "type": "actuator",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"action": {"type": "string"}},
+                        "x-hooks": {
+                            "on_interrupt_motion": {"action": "stop_gesture"},
+                        },
+                    },
+                }
+
+            def dispatch(self, action, args):
+                self.calls.append((action, dict(args)))
+                return {"state": "called"}
+
+        class InterruptGroup:
+            def blocking_outputs(self):
+                return ["motion_recorder"]
+
+        plugin = MotionPlugin()
+        bundle = self.module.T800DeviceBundle.__new__(self.module.T800DeviceBundle)
+        bundle._active_plugins = [plugin]
+        bundle._motion_events = None
+        bundle._motion_interrupt_group = InterruptGroup()
+        self.assertTrue(
+            {
+                "speaker", "loco", "gait", "gesture",
+                "motion_recorder", "head",
+            }.issubset(
+                bundle._MOTION_OUTPUT_TOOLS
+            )
+        )
+
+        blocked = bundle.dispatch("gesture", {"action": "sequence"})
+        self.assertIn("active or still settling", blocked["error"])
+        self.assertEqual(["motion_recorder"], blocked["blocking_outputs"])
+        self.assertEqual([], plugin.calls)
+
+        blocked_reset = bundle.dispatch(
+            "gesture", {"action": "stop", "reset_after": True}
+        )
+        self.assertIn("active or still settling", blocked_reset["error"])
+        self.assertEqual([], plugin.calls)
+
+        stopped = bundle.dispatch("gesture", {"action": "stop_gesture"})
+        self.assertEqual("called", stopped["state"])
+        self.assertEqual("stop_gesture", plugin.calls[-1][0])
+
 
 class VendoredContractTests(unittest.TestCase):
+    def test_default_loco_profile_matches_approved_real_device_limits(self):
+        config_text = (ROOT / "config.yaml").read_text()
+        for declaration in (
+            "max_vx: 2.0",
+            "max_vy: 1.0",
+            "max_vyaw: 2.0",
+            "locomotion_prepare_duration_sec: 1.0",
+        ):
+            self.assertIn(declaration, config_text)
+
     def test_urdf_contains_every_driver_joint_name(self):
         sys.path.insert(0, str(ROOT))
         from control import T800_JOINT_NAMES
@@ -250,8 +526,34 @@ class VendoredContractTests(unittest.TestCase):
         self.assertIn(f":{config_port}/mcp", metadata_text)
         self.assertIn('hardware_model: "t800"', metadata_text)
         self.assertNotIn("t800-dev", metadata_text)
+        for capability in ("speaker", "loco", "gait", "motion_recorder", "head"):
+            self.assertIn(capability, metadata_text)
         deploy_text = (ROOT / "deploy" / "service.yml").read_text()
         self.assertNotIn("RMW_IMPLEMENTATION=rmw_cyclonedds_cpp", deploy_text)
+
+    def test_cyclonedds_container_logs_are_muzzled_without_losing_interface_selection(self):
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        self.assertIn("ENV RCUTILS_COLORIZED_OUTPUT=0", dockerfile)
+        self.assertIn("<Tracing><Verbosity>severe</Verbosity>", dockerfile)
+        self.assertIn("<OutputFile>/dev/null</OutputFile></Tracing>", dockerfile)
+        self.assertIn("NetworkInterface name='${NETWORK_INTERFACE:-eth1}'", dockerfile)
+
+    def test_acp_uses_agent_core_certificate_and_matching_hostname(self):
+        service = (ROOT / "deploy" / "service.yml").read_text()
+        self.assertIn(
+            '"${T800_AGENT_CORE_HOSTNAME:-phanthy-motus}:'
+            '${T800_AGENT_CORE_ADDRESS:-127.0.0.1}"',
+            service,
+        )
+        self.assertIn(
+            "AGENT_CORE_URL=${T800_AGENT_CORE_URL:-https://phanthy-motus:15678}",
+            service,
+        )
+        self.assertIn(
+            "AGENT_CORE_CA_CERT=${T800_AGENT_CORE_CA_CERT:-"
+            "/opt/phanthy-motus/data/certs/cert.pem}",
+            service,
+        )
 
 
 if __name__ == "__main__":
