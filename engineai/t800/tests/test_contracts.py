@@ -326,7 +326,7 @@ class McpHttpContractTests(unittest.TestCase):
         bundle._motion_events = None
         bundle._motion_interrupt_group = InterruptGroup()
         self.assertTrue(
-            {"loco", "gait", "gesture", "motion_recorder"}.issubset(
+            {"loco", "gait", "gesture", "motion_recorder", "head"}.issubset(
                 bundle._MOTION_OUTPUT_TOOLS
             )
         )
@@ -378,7 +378,7 @@ class VendoredContractTests(unittest.TestCase):
         self.assertIn(f":{config_port}/mcp", metadata_text)
         self.assertIn('hardware_model: "t800"', metadata_text)
         self.assertNotIn("t800-dev", metadata_text)
-        for capability in ("speaker", "loco", "gait", "motion_recorder"):
+        for capability in ("speaker", "loco", "gait", "motion_recorder", "head"):
             self.assertIn(capability, metadata_text)
         deploy_text = (ROOT / "deploy" / "service.yml").read_text()
         self.assertNotIn("RMW_IMPLEMENTATION=rmw_cyclonedds_cpp", deploy_text)

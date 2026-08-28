@@ -119,7 +119,7 @@ MOTION_STATES = (
     "dance",
 )
 
-WALK_MOTION_STATES = ("rl_basic", "lower_body_balance")
+WALK_MOTION_STATES = ("rl_basic", "walk", "lower_body_balance")
 
 LED_MODES = {
     "blink_red": 0x1,

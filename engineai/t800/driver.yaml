@@ -6,6 +6,6 @@ hardware_model: "t800"
 image_name: engineai-t800
 port: 15708
 mcp_url: "http://localhost:15708/mcp"
-description: "EngineAI T800 开发版 — speaker 音频播放、loco 安全运动、gait 步态切换、motion_recorder 录制回放，以及 ROS2/Native SDK、全身状态、舞蹈/手势、虚拟手柄与 LED 控制"
+description: "EngineAI T800 开发版 — speaker 音频播放、loco 安全运动、gait 步态切换、motion_recorder 录制回放、head 头部控制，以及 ROS2/Native SDK、全身状态、舞蹈/手势、虚拟手柄与 LED 控制"
 build_context_extras:
   - ../../common
