@@ -626,6 +626,11 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
         )
         first_thread.start()
         self.assertTrue(reset_entered.wait(timeout=1.0))
+        # dispatch returns as soon as the prepare worker is launched.  The
+        # worker can reach reset_entered before the caller thread stores that
+        # return value, so synchronise with the caller before comparing ids.
+        first_thread.join(timeout=1.0)
+        self.assertFalse(first_thread.is_alive())
 
         second = self.plugin.dispatch("record_start", {"label": "second"})
 
@@ -633,7 +638,6 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
         self.assertEqual(first_result["action_id"], second["action_id"])
         self.assertEqual(1, len(reset_calls))
         release_reset.set()
-        first_thread.join(timeout=1.0)
         self.plugin._prepare_thread.join(timeout=1.0)
 
     def test_play_auto_resets_before_first_override_under_same_acp_action(self):
