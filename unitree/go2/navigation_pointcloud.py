@@ -68,14 +68,14 @@ def validated_rotation_matrix(values: object | None) -> np.ndarray:
 
     rotation = np.asarray(values, dtype=np.float64)
     if rotation.size != 9:
-        raise ValueError("sensor_rotation_matrix must contain 9 values")
+        raise ValueError("device_to_sensor_rotation_matrix must contain 9 values")
     rotation = rotation.reshape(3, 3)
     if not np.isfinite(rotation).all():
-        raise ValueError("sensor_rotation_matrix contains non-finite values")
+        raise ValueError("device_to_sensor_rotation_matrix contains non-finite values")
     if not np.allclose(rotation @ rotation.T, np.eye(3), atol=1e-6):
-        raise ValueError("sensor_rotation_matrix must be orthonormal")
+        raise ValueError("device_to_sensor_rotation_matrix must be orthonormal")
     if not np.isclose(np.linalg.det(rotation), 1.0, atol=1e-6):
-        raise ValueError("sensor_rotation_matrix must be a proper rotation")
+        raise ValueError("device_to_sensor_rotation_matrix must be a proper rotation")
     return rotation
 
 
@@ -181,8 +181,8 @@ def unitree_mid360_to_navigation_cloud(
 ) -> bytes:
     """Convert Unitree's packed MID360 points to the navigation PCL schema.
 
-    Unitree provides ``time`` as a per-point offset in nanoseconds.  The output
-    preserves it as an absolute nanosecond ``timestamp`` in the same normalized
+    Unitree provides ``time`` as a per-point offset in seconds.  The output
+    converts it to an absolute nanosecond ``timestamp`` in the same normalized
     clock domain as the ROS header and navigation IMU.
     """
     height = int(height)
@@ -234,9 +234,17 @@ def unitree_mid360_to_navigation_cloud(
     if int(ring.max(initial=0)) > 255:
         raise ValueError("MID360 ring value exceeds uint8 line range")
 
-    relative_time_ns = view("time")
-    if not np.isfinite(relative_time_ns).all() or float(relative_time_ns.min()) < 0:
+    relative_time_seconds = view("time")
+    if (
+        not np.isfinite(relative_time_seconds).all()
+        or float(relative_time_seconds.min()) < 0
+    ):
         raise ValueError("MID360 time contains negative or non-finite values")
+    absolute_timestamps_ns = np.float64(header_stamp_ns) + np.rint(
+        relative_time_seconds.astype(np.float64, copy=False) * 1_000_000_000.0
+    )
+    if point_count > 1 and not np.all(np.diff(absolute_timestamps_ns) > 0.0):
+        raise ValueError("MID360 time does not produce increasing timestamps")
 
     rotation = validated_rotation_matrix(rotation_matrix)
     xyz = np.column_stack((view("x"), view("y"), view("z"))).astype(
@@ -252,7 +260,5 @@ def unitree_mid360_to_navigation_cloud(
     converted["intensity"] = view("intensity")
     converted["tag"] = 0x10
     converted["line"] = ring.astype(np.uint8, copy=False)
-    converted["timestamp"] = np.float64(header_stamp_ns) + relative_time_ns.astype(
-        np.float64, copy=False
-    )
+    converted["timestamp"] = absolute_timestamps_ns
     return converted.tobytes(order="C")

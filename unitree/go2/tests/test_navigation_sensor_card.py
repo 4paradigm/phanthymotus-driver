@@ -88,6 +88,8 @@ class NavigationSensorCardContractTest(unittest.TestCase):
             "raw_imu_topic: rt/utlidar/imu",
             "cloud_topic: /ubuntu/navigation/lidar",
             "imu_topic: /ubuntu/navigation/imu",
+            "sensor_frame: utlidar_lidar",
+            "device_to_sensor_rotation_matrix: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]",
         ):
             self.assertIn(expected, config)
 
@@ -118,8 +120,7 @@ class NavigationSensorCardContractTest(unittest.TestCase):
         plugin._status_node = types.SimpleNamespace(
             cloud_topic="/ubuntu/navigation/lidar",
             imu_topic="/ubuntu/navigation/imu",
-            lidar_frame="custom_lidar_frame",
-            imu_frame="custom_imu_frame",
+            sensor_frame="custom_sensor_frame",
             status=lambda worker_running: {
                 "ready": False,
                 "blockers": ["clock_not_ready"],
@@ -137,17 +138,17 @@ class NavigationSensorCardContractTest(unittest.TestCase):
         self.assertEqual(lidar["format"], "sensor/pointcloud")
         self.assertEqual(lidar["ros_type"], "sensor_msgs/msg/PointCloud2")
         self.assertEqual(lidar["qos"], "RELIABLE + KEEP_LAST(depth=2) + VOLATILE")
-        self.assertEqual(lidar["frame_id"], "custom_lidar_frame")
+        self.assertEqual(lidar["frame_id"], "custom_sensor_frame")
         self.assertEqual(imu["format"], "sensor/imu")
         self.assertEqual(imu["ros_type"], "sensor_msgs/msg/Imu")
         self.assertEqual(imu["qos"], "RELIABLE + KEEP_LAST(depth=200) + VOLATILE")
-        self.assertEqual(imu["frame_id"], "custom_imu_frame")
+        self.assertEqual(imu["frame_id"], "custom_sensor_frame")
 
         info = plugin.dispatch("info", {"_tool_name": "navigation_lidar"})
         self.assertEqual(info["state"], "not_ready")
         self.assertEqual(info["blockers"], ["clock_not_ready"])
 
-    def test_monitor_preserves_configured_sensor_frames(self):
+    def test_monitor_requires_one_configured_sensor_frame(self):
         module = self.load_bridge_module()
         with mock.patch.object(module.Node, "__init__", return_value=None), mock.patch.object(
             module.Node,
@@ -156,15 +157,14 @@ class NavigationSensorCardContractTest(unittest.TestCase):
             create=True,
         ):
             monitor = module._NavigationSensorMonitorNode(
-                {
-                    "lidar_frame": "configured_lidar_frame",
-                    "imu_frame": "configured_imu_frame",
-                },
+                {"sensor_frame": "configured_sensor_frame"},
                 "ubuntu",
             )
 
-        self.assertEqual(monitor.lidar_frame, "configured_lidar_frame")
-        self.assertEqual(monitor.imu_frame, "configured_imu_frame")
+        self.assertEqual(monitor.sensor_frame, "configured_sensor_frame")
+
+        with self.assertRaisesRegex(ValueError, "non-empty"):
+            module._required_sensor_frame({"sensor_frame": "  "})
 
     def test_driver_image_contains_the_sensor_card_runtime(self):
         dockerfile = (GO2_DIR / "Dockerfile").read_text()
@@ -230,8 +230,7 @@ class NavigationSensorCardContractTest(unittest.TestCase):
                 plugin._status_node = types.SimpleNamespace(
                     cloud_topic="/ubuntu/navigation/lidar",
                     imu_topic="/ubuntu/navigation/imu",
-                    lidar_frame="utlidar_lidar",
-                    imu_frame="utlidar_imu",
+                    sensor_frame="utlidar_lidar",
                     status=lambda running: {
                         "ready": False,
                         "blockers": ["clock_not_ready"],

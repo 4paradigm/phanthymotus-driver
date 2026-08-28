@@ -38,8 +38,8 @@ class Mid360ConversionTest(unittest.TestCase):
         data = bytearray(2 * UNITREE_POINT_STEP)
         for index, values in enumerate(
             (
-                (1.0, 2.0, 3.0, 42.0, 0, 5_000.0),
-                (-1.0, -2.0, -3.0, 163.0, 3, 100_320_000.0),
+                (1.0, 2.0, 3.0, 42.0, 0, 0.0005),
+                (-1.0, -2.0, -3.0, 163.0, 3, 0.0625),
             )
         ):
             base = index * UNITREE_POINT_STEP
@@ -61,7 +61,7 @@ class Mid360ConversionTest(unittest.TestCase):
         )
         return np.frombuffer(converted, dtype=dtype)
 
-    def test_converts_relative_time_to_absolute_nanoseconds(self):
+    def test_converts_relative_seconds_to_absolute_nanoseconds(self):
         header_ns = 1_785_811_000_000_000_000
         converted = unitree_mid360_to_navigation_cloud(
             data=self.make_cloud(),
@@ -81,9 +81,24 @@ class Mid360ConversionTest(unittest.TestCase):
         np.testing.assert_array_equal(points["line"], [0, 3])
         np.testing.assert_allclose(
             points["timestamp"] - np.float64(header_ns),
-            [5_000.0, 100_320_000.0],
+            [500_000.0, 62_500_000.0],
             atol=256.0,
         )
+        self.assertTrue(np.all(np.diff(points["timestamp"]) > 0.0))
+
+    def test_rejects_non_increasing_relative_seconds(self):
+        data = bytearray(self.make_cloud())
+        struct.pack_into("<f", data, UNITREE_POINT_STEP + 24, 0.0001)
+        with self.assertRaisesRegex(ValueError, "increasing timestamps"):
+            unitree_mid360_to_navigation_cloud(
+                data=bytes(data),
+                height=1,
+                width=2,
+                point_step=UNITREE_POINT_STEP,
+                row_step=2 * UNITREE_POINT_STEP,
+                fields=UNITREE_FIELDS,
+                header_stamp_ns=1_000_000_000,
+            )
 
     def test_rejects_missing_time_field(self):
         with self.assertRaisesRegex(ValueError, "missing MID360 field: time"):
@@ -168,7 +183,7 @@ class Mid360ConversionTest(unittest.TestCase):
         np.testing.assert_array_equal(points["line"], [0, 3])
         np.testing.assert_allclose(
             points["timestamp"] - np.float64(header_ns),
-            [5_000.0, 100_320_000.0],
+            [500_000.0, 62_500_000.0],
             atol=256.0,
         )
 

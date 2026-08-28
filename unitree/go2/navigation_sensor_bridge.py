@@ -2,8 +2,8 @@
 
 The bridge is intentionally independent from the dashboard-oriented LidarPlugin.
 It preserves raw PointCloud2 fields, normalizes LiDAR/IMU timestamps into the
-Jetson ROS clock domain, and applies one fixed mounting rotation to both the
-estimator point cloud and IMU.  It never applies dynamic gravity alignment.
+Jetson ROS clock domain, and transforms both streams into one configured
+REP-103 sensor frame.  It never applies dynamic gravity alignment.
 """
 
 from __future__ import annotations
@@ -58,6 +58,13 @@ def _absolute_topic(value: str | None, fallback: str) -> str:
     return topic if topic.startswith("/") else f"/{topic}"
 
 
+def _required_sensor_frame(config: dict) -> str:
+    frame = config.get("sensor_frame", config.get("lidar_frame", "utlidar_lidar"))
+    if not isinstance(frame, str) or not frame.strip():
+        raise ValueError("navigation sensor_frame must be a non-empty string")
+    return frame.strip()
+
+
 class _NavigationSensorNode(Node):
     def __init__(self, config: dict, namespace: str):
         super().__init__("go2_navigation_sensor_bridge")
@@ -72,10 +79,12 @@ class _NavigationSensorNode(Node):
         self._raw_imu_topic = config.get(
             "raw_imu_topic", "rt/utlidar/imu"
         )
-        self._lidar_frame = config.get("lidar_frame", "utlidar_lidar")
-        self._imu_frame = config.get("imu_frame", self._lidar_frame)
+        self._sensor_frame = _required_sensor_frame(config)
         self._sensor_rotation = validated_rotation_matrix(
-            config.get("sensor_rotation_matrix")
+            config.get(
+                "device_to_sensor_rotation_matrix",
+                config.get("sensor_rotation_matrix"),
+            )
         )
 
         # Do not use ``self._clock``: rclpy.node.Node owns that attribute and
@@ -134,8 +143,8 @@ class _NavigationSensorNode(Node):
             f"Navigation sensors: {self._raw_cloud_topic} -> "
             f"{self.cloud_topic}; "
             f"{self._raw_imu_topic} -> {self.imu_topic}; "
-            f"frame={self._lidar_frame}, "
-            f"sensor_rotation={self._sensor_rotation.reshape(9).tolist()}"
+            f"frame={self._sensor_frame}, "
+            f"device_to_sensor_rotation={self._sensor_rotation.reshape(9).tolist()}"
         )
 
     def _correct_stamp(self, source_stamp, stream: str) -> int | None:
@@ -235,7 +244,7 @@ class _NavigationSensorNode(Node):
                     rotation_matrix=self._sensor_rotation,
                 )
                 out = PointCloud2()
-                self._set_stamp(out.header, corrected_ns, self._lidar_frame)
+                self._set_stamp(out.header, corrected_ns, self._sensor_frame)
                 out.height = 1
                 out.width = height * width
                 out.fields = [
@@ -295,7 +304,7 @@ class _NavigationSensorNode(Node):
             corrected_ns, msg = item
 
             out = Imu()
-            self._set_stamp(out.header, corrected_ns, self._imu_frame)
+            self._set_stamp(out.header, corrected_ns, self._sensor_frame)
 
             q = msg.orientation
             q_norm_sq = (
@@ -373,10 +382,11 @@ class _NavigationSensorNode(Node):
                     "imu": self._raw_imu_topic,
                 },
                 "frames": {
-                    "lidar": self._lidar_frame,
-                    "imu": self._imu_frame,
+                    "sensor": self._sensor_frame,
+                    "lidar": self._sensor_frame,
+                    "imu": self._sensor_frame,
                 },
-                "sensor_rotation_matrix": [
+                "device_to_sensor_rotation_matrix": [
                     float(value) for value in self._sensor_rotation.reshape(9)
                 ],
             },
@@ -442,8 +452,7 @@ class _NavigationSensorMonitorNode(Node):
         prefix = f"/{namespace}/navigation"
         self.cloud_topic = _absolute_topic(config.get("cloud_topic"), f"{prefix}/lidar")
         self.imu_topic = _absolute_topic(config.get("imu_topic"), f"{prefix}/imu")
-        self.lidar_frame = config.get("lidar_frame", "utlidar_lidar")
-        self.imu_frame = config.get("imu_frame", self.lidar_frame)
+        self.sensor_frame = _required_sensor_frame(config)
         self._status_topic = f"{prefix}/_bridge_status"
         self._lock = threading.RLock()
         self._last_status = None
@@ -518,7 +527,7 @@ class NavigationSensorPlugin:
                 "sensor/pointcloud",
                 "sensor_msgs/msg/PointCloud2",
                 "RELIABLE + KEEP_LAST(depth=2) + VOLATILE",
-                self._status_node.lidar_frame,
+                self._status_node.sensor_frame,
             ),
             self._tool(
                 "navigation_imu",
@@ -527,7 +536,7 @@ class NavigationSensorPlugin:
                 "sensor/imu",
                 "sensor_msgs/msg/Imu",
                 "RELIABLE + KEEP_LAST(depth=200) + VOLATILE",
-                self._status_node.imu_frame,
+                self._status_node.sensor_frame,
             ),
         ]
 

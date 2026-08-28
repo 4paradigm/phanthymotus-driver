@@ -86,10 +86,16 @@ RPC.
 The read-only `navigation_lidar` and `navigation_imu` cards convert Go2's
 native `rt/utlidar/cloud` and `rt/utlidar/imu` DDS streams into the
 same standard `/ubuntu/navigation/lidar` `PointCloud2` and
-`/ubuntu/navigation/imu` `Imu` contracts. Go2 uses the configured identity
-mounting rotation; the isolated worker, source-clock normalization, fail-closed
-readiness checks, and shared card lifecycle match the G1 navigation sensor
-path.
+`/ubuntu/navigation/imu` `Imu` contracts. Both outputs use the same non-empty
+REP-103 `sensor_frame`. The configured device-to-sensor rotation is applied to
+cloud xyz and to IMU orientation, angular velocity, linear acceleration, and
+all covariances. Go2 defaults to the identity rotation because the MID360 cloud
+and IMU axes are parallel and the installed sensor is REP-103 aligned. Per
+REP-145, a stationary upward sensor Z axis reports `+g`; this is not a frame
+inversion. Raw per-point `time` is in seconds and is converted to a strictly
+increasing FLOAT64 absolute nanosecond timestamp. The isolated worker,
+source-clock normalization, fail-closed readiness checks, and shared card
+lifecycle match the G1 navigation sensor path.
 
 ## Writing a New Driver
 
