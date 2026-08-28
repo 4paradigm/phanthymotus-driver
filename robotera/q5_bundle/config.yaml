@@ -8,9 +8,11 @@ joint_state_position_unit: "radians"
 plugins:
   base_drive:
     enabled: true
-    max_linear_x_mps: 0.20
-    max_angular_z_radps: 0.40
-    max_duration_s: 2.0
+    # Match the vendor SDK's direct base-drive contract, not the remote-control stream.
+    frame_id: ""
+    max_linear_x_mps: 0.50
+    max_angular_z_radps: 0.7853981634  # 45 deg/s
+    max_duration_s: 5.0
     publish_rate_hz: 10.0
     stop_repetitions: 3
   joints:
@@ -122,6 +124,12 @@ plugins:
   head_control:
     enabled: true
     max_step_rad: 0.025
+    publish_rate_hz: 20.0
+    hold_repetitions: 3
+  leg_control:
+    enabled: true
+    # 腿部控制：set 同时设置髋/膝/踝三关节角度(°) + zero 三关节归零。限位从 URDF 读取，超限直接报错。
+    max_step_rad: 0.02
     publish_rate_hz: 20.0
     hold_repetitions: 3
   odom:

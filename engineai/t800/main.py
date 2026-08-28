@@ -106,7 +106,7 @@ class T800DeviceBundle:
     _MOTION_OUTPUT_TOOLS = frozenset({
         "loco", "motion_mode", "dance", "joint_plan", "gesture",
         "joint_override", "joint_bridge", "virtual_gamepad", "gait",
-        "motion_recorder",
+        "motion_recorder", "head",
     })
     _SAFE_WHILE_MOTION_SETTLING = frozenset({
         "start", "stop", "info", "status", "list", "stop_move",
@@ -119,6 +119,7 @@ class T800DeviceBundle:
             DancePlugin,
             GaitPlugin,
             GesturePlugin,
+            HeadActuatorPlugin,
             JointBridgePlugin,
             JointOverridePlugin,
             JointPlanPlugin,
@@ -242,6 +243,15 @@ class T800DeviceBundle:
                 motion_recorder.motion_active,
             )
 
+        head_config = plugins.get("head", {})
+        if head_config.get("enabled", True) and "joint_plan" in instances:
+            instance = HeadActuatorPlugin(head_config, instances["joint_plan"], state)
+            instance.set_interrupt_group(motion_interrupt_group)
+            motion_interrupt_group.register(
+                "head", instance.halt, instance.motion_active
+            )
+            instances["head"] = instance
+            self._plugins.append(instance)
         virtual_gamepad_config = plugins.get("virtual_gamepad", {})
         if virtual_gamepad_config.get("enabled", False):
             instance = VirtualGamepadPlugin(virtual_gamepad_config, namespace, ros2)
@@ -270,7 +280,10 @@ class T800DeviceBundle:
             instances["safety"].set_controls(
                 [
                     instances[key]
-                    for key in ("locomotion", "joint_override", "joint_bridge", "virtual_gamepad", "gesture", "motion_recorder")
+                    for key in (
+                        "locomotion", "joint_override", "joint_bridge",
+                        "virtual_gamepad", "gesture", "motion_recorder", "head",
+                    )
                     if key in instances
                 ]
             )

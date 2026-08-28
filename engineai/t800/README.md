@@ -38,6 +38,7 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 | `dance` | actuator | 舞蹈列表、播放、停止和状态；官方基线为 `dance.mnn` + `dance.npz` |
 | `joint_plan` | actuator | 索引/名称关节轨迹、头部/单臂姿态、当前位置保持、取消、复位和预置动作 |
 | `motion_recorder` | actuator | 按指定采样率录制关节轨迹，手动/定时停止均自动落盘，并支持管理与回放 |
+| `head` | actuator | 头部语义控制：点头、摇头、预设视线与 rotate_to 绝对角度 |
 | `joint_plan_state` | sensor | 规划 request id、状态和进度 |
 | `gesture` | actuator | 官方完整挥手/握手多步序列及任意自定义关节动作队列 |
 | `joint_override` | actuator | 指定关节 100 Hz 覆盖控制 |
@@ -56,7 +57,8 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 | `native_sdk` | actuator | Native SDK status/start/stop/restart |
 
 所有动作差异通过 `x-action-params` 声明。`loco` 始终要求机器人处于
-`rl_basic` 或 `lower_body_balance`，运行中一旦离开这两个状态会立即归零停流。
+`rl_basic`、旧固件的 `walk` 或 `lower_body_balance`，运行中一旦离开这些
+状态会立即归零停流。
 `force=true` 仅保留给 joint override 和 joint bridge 的专家级接口。
 
 `loco.move_displacement`、`turn_angle` 和 `arc` 由速度乘时间换算。T800
@@ -77,11 +79,11 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 关节动作队列。`stop_gesture` 注册为 `on_interrupt_motion` hook，因此即使
 `play` / `sequence` 正在等待 ACP completion，Agent Core 也会绕过 actuator
 barrier 立即下发停止请求，并由 Driver 以 `cancelled` 完成原 action id。
-Bundle 将 Gesture 与 Motion Recorder 注册到同一个设备级 interrupt group；
-任一 `on_interrupt_motion` action 都会同时请求停止两者，避免 Agent Core 清除
+Bundle 将 Gesture、Motion Recorder 与 Head 注册到同一个设备级 interrupt group；
+任一 `on_interrupt_motion` action 都会同时请求停止三者，避免 Agent Core 清除
 全局 pending 时遗漏同一 T800 MCP 内的兄弟动作。若旧线程仍在完成最终释放，
 Bundle 会暂时拒绝新的运动输出 action；stop/status/safety 路径保持可用，待
-Gesture 与 Recorder 均静止后自动解除。Gesture 的 planner cancel 无论发布
+Gesture、Recorder 与 Head 均静止后自动解除。Gesture/Head 的 planner cancel 无论发布
 成功还是重试，都会保留 request-id 门禁直到 planner 反馈 `IDLE`；发布失败
 可再次调用 `stop_gesture` 重试。interrupt/stop 路径不会因
 `reset_after=true` 启动一个未纳入 ACP 的新复位动作。
@@ -122,7 +124,7 @@ barrier 阻塞，停止时会立即设置取消事件并发布 joint override re
 直到 planner 反馈 `IDLE`；cancel 超时或 joint override release 发布失败时均
 保持 fail-closed 门禁，可通过 status 查看并重试 stop，避免 Agent Core 清除
 全局 pending 后实体动作仍继续运行。同一次设备级 interrupt 也会取消仍在
-执行的 Gesture。
+执行的 Gesture 与 Head。
 ACP 使用 `AGENT_CORE_URL=https://phanthy-motus:15678`，并要求宿主已生成
 `/opt/phanthy-motus/data/certs/cert.pem`（由 `deploy/service.yml` 挂载给
 Driver）。Driver 启动时校验 URL/CA；证书缺失、无效或 completion POST 失败

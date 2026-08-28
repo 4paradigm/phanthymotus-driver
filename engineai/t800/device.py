@@ -245,6 +245,18 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _notify_acp_completion(
+    tool: str,
+    action_id: str,
+    status: str,
+    result: dict,
+    timeout: float,
+) -> bool:
+    # Keep every asynchronous T800 card on the validated transport so TLS
+    # failures are reflected by the shared ACP health/degraded status.
+    return _t800_acp_notify(action_id, status, result, tool)
+
+
 _GAMEPAD_BUTTON_NAMES = {
     0: "LB", 1: "RB", 2: "A", 3: "B", 4: "X", 5: "Y",
     6: "BACK", 7: "START", 8: "CROSS_X_UP", 9: "CROSS_X_DOWN",
@@ -2456,9 +2468,13 @@ class JointPlanPlugin:
         self._state_lock = threading.RLock()
         self._state_changed = threading.Condition(self._state_lock)
         self._last_state = {"state": "no_data"}
+        self._last_request = {}
         self._executing_requests: set[int] = set()
         self._request_id = 0
         self._state_type = None
+        self._head_lock = threading.Lock()
+        self._head_owner: str | None = None
+        self._head_request_id: int | None = None
         self._state = state
         self._core_topic = f"/{namespace}/state/joint_plan"
         self._core_pub = self._pub_node.create_publisher(String, self._core_topic, _BEST_EFFORT)
@@ -2521,20 +2537,23 @@ class JointPlanPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict:
+        return self._dispatch_owned("joint_plan", action, args)
+
+    def _dispatch_owned(self, owner: str, action: str, args: dict) -> dict:
         if action == "start":
             return {"state": "running" if args.get("_tool_name") == "joint_plan_state" else "ready"}
         if action in ("info", "status", "joint_plan_state"):
             with self._state_lock:
-                snapshot = dict(self._last_state)
+                snapshot = {**self._last_state, "last_request": dict(self._last_request)}
             if args.get("_tool_name") == "joint_plan_state" or action == "joint_plan_state":
                 return _with_topic_out(snapshot, self._core_topic)
             return snapshot
         if action == "stop":
             return {"state": "idle"}
         if action == "reset":
-            return self._publish_request("reset", {})
+            return self._publish_request("reset", {}, owner=owner)
         if action == "cancel":
-            return self._publish_request("cancel", args)
+            return self._publish_request("cancel", args, owner=owner)
         if action == "preset":
             preset = self._PRESETS.get(str(args.get("preset", "")))
             if preset is None:
@@ -2555,14 +2574,14 @@ class JointPlanPlugin:
                 return {"error": f"unknown joint names: {unknown}"}
             args = dict(args)
             args["joint_indices"] = [T800_JOINT_INDEX[str(name)] for name in names]
-            return self._publish_request("plan", args)
+            return self._dispatch_plan(args, owner)
         if action == "head_pose":
             return self._publish_request("plan", {
                 "joint_indices": list(T800_JOINT_GROUPS["head"]),
                 "target_positions": [float(args.get("pitch_rad", 0.0)), float(args.get("yaw_rad", 0.0))],
                 "duration": args.get("duration", 1.0),
                 "gravity_compensation": True,
-            })
+            }, owner=owner)
         if action == "arm_pose":
             side = str(args.get("side", ""))
             if side not in ("left", "right"):
@@ -2583,7 +2602,7 @@ class JointPlanPlugin:
                 "gravity_compensation": True,
             })
         if action == "plan":
-            return self._publish_request("plan", args)
+            return self._dispatch_plan(args, owner)
         return {"error": f"unknown joint plan action: {action}"}
 
     def current_motion(self) -> tuple[str, list[str]]:
@@ -2659,21 +2678,35 @@ class JointPlanPlugin:
                     raise TimeoutError(f"joint planner did not complete request {target}")
                 self._state_changed.wait(timeout=min(remaining, 0.2))
 
+    def acquire_head(self, owner: str) -> dict | None:
+        with self._head_lock:
+            if self._head_owner not in (None, owner):
+                return {"error": "head is busy", "owner": self._head_owner,
+                        "request_id": self._head_request_id}
+            self._head_owner = owner
+        return None
+
+    def release_head(self, owner: str) -> None:
+        with self._head_lock:
+            if self._head_owner == owner:
+                self._head_owner = None
+                self._head_request_id = None
+
+    def head_status(self) -> dict:
+        with self._head_lock:
+            return {"owner": self._head_owner, "request_id": self._head_request_id}
+
+    def _dispatch_plan(self, args: dict, owner: str) -> dict:
+        return self._publish_request("plan", args, owner=owner)
+
     def _next_request_id(self) -> int:
         with self._state_lock:
             self._request_id += 1
             return self._request_id
 
-    def _publish_request(self, action: str, args: dict) -> dict:
-        msg = self._request_type()
-        if action == "cancel":
-            msg.request_id = int(args.get("request_id", self._request_id))
-            msg.request_type = self._request_type.REQUEST_CANCEL
-        else:
-            msg.request_id = self._next_request_id()
-            msg.request_type = (
-                self._request_type.REQUEST_RESET if action == "reset" else self._request_type.REQUEST_PLAN_EXECUTE
-            )
+    def _publish_request(self, action: str, args: dict, *, owner: str | None = None) -> dict:
+        # 先完成所有验证，再获取 head 所有权，避免验证失败导致所有权泄漏
+        plan_payload: dict | None = None
         if action == "plan":
             indices, positions = validate_joint_positions(
                 args.get("joint_indices"),
@@ -2683,13 +2716,69 @@ class JointPlanPlugin:
             velocities = optional_floats(args, "target_velocities", len(indices))
             stiffness = optional_floats(args, "stiffness", len(indices))
             damping = optional_floats(args, "damping", len(indices))
-            msg.use_gravity_compensation = bool(args.get("gravity_compensation", True))
-            msg.joint_indices = indices
-            msg.target_positions = positions
-            msg.target_velocities = velocities
-            msg.execution_time = clamp(args.get("duration", 2.0), 0.05, 120.0)
-            msg.stiffness = stiffness
-            msg.damping = damping
+            duration = clamp(args.get("duration", 2.0), 0.05, 120.0)
+            plan_payload = {
+                "indices": indices,
+                "positions": positions,
+                "velocities": velocities,
+                "stiffness": stiffness,
+                "damping": damping,
+                "duration": duration,
+                "gravity_compensation": bool(args.get("gravity_compensation", True)),
+            }
+        else:
+            indices = []
+        controls_head = action == "reset" or bool(set(indices) & set(T800_JOINT_GROUPS["head"]))
+        owner = owner or "joint_plan"
+        # head 执行期间独占整个 planner：任何非所属请求一律拒绝，
+        # 避免非 head 关节的 plan 抬高 request_id 导致 head 被 superseded
+        with self._head_lock:
+            # 外部 joint_plan 直接调用共享 owner="joint_plan"，持有锁时不允许重入
+            if self._head_owner == "joint_plan" and action != "cancel":
+                return {"error": "head is busy", "owner": self._head_owner,
+                        "request_id": self._head_request_id}
+            if self._head_owner not in (None, owner):
+                return {"error": "head is busy", "owner": self._head_owner,
+                        "request_id": self._head_request_id}
+            if controls_head:
+                self._head_owner = owner
+        msg = self._request_type()
+        cancels_direct_head_lease = False
+        if action == "cancel":
+            target_request_id = int(args.get("request_id", self._request_id))
+            with self._head_lock:
+                if (
+                    self._head_request_id == target_request_id
+                    and self._head_owner is not None
+                    and owner != self._head_owner
+                ):
+                    return {
+                        "error": f"request is owned by {self._head_owner}; use its stop action to cancel it",
+                        "owner": self._head_owner,
+                        "request_id": target_request_id,
+                    }
+                # cancel 外部直接 head 请求时，标记稍后释放锁
+                # 避免请求在 EXECUTING 前被 cancel 时，_on_state 因未看到 EXECUTING 而永久持有锁
+                if (
+                    self._head_owner == "joint_plan"
+                    and self._head_request_id == target_request_id
+                ):
+                    cancels_direct_head_lease = True
+            msg.request_id = target_request_id
+            msg.request_type = self._request_type.REQUEST_CANCEL
+        else:
+            msg.request_id = self._next_request_id()
+            msg.request_type = (
+                self._request_type.REQUEST_RESET if action == "reset" else self._request_type.REQUEST_PLAN_EXECUTE
+            )
+        if plan_payload is not None:
+            msg.use_gravity_compensation = plan_payload["gravity_compensation"]
+            msg.joint_indices = plan_payload["indices"]
+            msg.target_positions = plan_payload["positions"]
+            msg.target_velocities = plan_payload["velocities"]
+            msg.execution_time = plan_payload["duration"]
+            msg.stiffness = plan_payload["stiffness"]
+            msg.damping = plan_payload["damping"]
         else:
             msg.use_gravity_compensation = False
             msg.joint_indices = []
@@ -2698,14 +2787,44 @@ class JointPlanPlugin:
             msg.execution_time = 0.0
             msg.stiffness = []
             msg.damping = []
-        self._publisher.publish(msg)
-        return {"state": "requested", "request_id": msg.request_id, "request_type": int(msg.request_type)}
+        if controls_head:
+            with self._head_lock:
+                self._head_request_id = msg.request_id
+        try:
+            self._publisher.publish(msg)
+        except Exception:
+            if controls_head:
+                with self._head_lock:
+                    if self._head_owner == owner and self._head_request_id == msg.request_id:
+                        self._head_request_id = None
+                        self._head_owner = None
+            raise
+        # cancel 外部直接 head 请求后立即释放锁，无需等待 EXECUTING→终态
+        if cancels_direct_head_lease:
+            with self._head_lock:
+                if self._head_owner == "joint_plan" and self._head_request_id == target_request_id:
+                    self._head_owner = None
+                    self._head_request_id = None
+        request = {
+            "state": "published",
+            "request_id": int(msg.request_id),
+            "request_type": int(msg.request_type),
+            "topic": self._config["topics"]["joint_plan_request"],
+            "joint_indices": list(msg.joint_indices),
+            "target_positions": list(msg.target_positions),
+            "execution_time": float(msg.execution_time),
+            "timestamp_ms": _now_ms(),
+        }
+        with self._state_lock:
+            self._last_request = request
+        return {**request, "state": "requested", "published": True}
 
     def _on_state(self, msg) -> None:
         payload = {
             "request_id": int(msg.request_id),
             "status": int(msg.status),
             "progress": float(msg.progress),
+            "topic": self._config["topics"]["joint_plan_state"],
             "timestamp_ms": _now_ms(),
         }
         with self._state_changed:
@@ -2714,6 +2833,24 @@ class JointPlanPlugin:
             if self._state_type is not None and int(msg.status) == int(self._state_type.EXECUTING):
                 self._executing_requests.add(int(msg.request_id))
             self._state_changed.notify_all()
+        if payload["status"] in (0, 1, 3):
+            with self._head_lock:
+                if (
+                    self._head_owner == "joint_plan"
+                    and self._head_request_id == payload["request_id"]
+                ):
+                    # IDLE 仅在该请求已观察到 EXECUTING 后才释放，避免 planner
+                    # 在 EXECUTING 前发布的初始 IDLE 确认帧导致过早释放。
+                    # EXITING / DISABLED 是异常终态（拒绝/故障/禁用），planner
+                    # 不会将其作为执行前确认帧发送，即使未见过 EXECUTING 也必须
+                    # 释放，否则锁会永久泄漏，后续所有 head 动作都报 head is busy。
+                    if (
+                        payload["status"] in (0, 3)
+                        or payload["request_id"] in self._executing_requests
+                    ):
+                        self._head_owner = None
+                        self._head_request_id = None
+                        self._executing_requests.discard(payload["request_id"])
         self._core_pub.publish(_json_message(payload))
 
 
@@ -2776,6 +2913,552 @@ class MotionInterruptGroup:
         return self._active_outputs(callbacks)
 
 
+class HeadActuatorPlugin:
+    """LLM-friendly head semantics backed by the official joint planner."""
+
+    _PITCH_LIMIT = 0.5
+    _YAW_LIMIT = 1.0
+    _ROTATION_TIME_MIN_SEC = 0.1
+    _ROTATION_TIME_MAX_SEC = 10.0
+    _HOLD_DURATION_MIN_SEC = 0.1
+    _HOLD_DURATION_MAX_SEC = 30.0
+    _ACP_TIMEOUT_SEC = 90.0          # 对外完成超时下限；实际值按最坏序列推导
+    _ACP_CALLBACK_TIMEOUT_SEC = 5.0
+    _READY_TIMEOUT_SEC = 10.0
+    _STOP_JOIN_TIMEOUT_SEC = 0.0
+    _FEEDBACK_GRACE_MAX_SEC = 5.0    # 每个运动步的反馈等待余量上限
+    _ACP_SAFETY_MARGIN_SEC = 5.0     # 最坏序列之上的安全余量
+    _DEFAULT_LOOK_POSES = {
+        "forward": {"pitch_rad": 0.0, "yaw_rad": 0.0},
+        "left": {"pitch_rad": 0.0, "yaw_rad": 0.6},
+        "right": {"pitch_rad": 0.0, "yaw_rad": -0.6},
+        "up": {"pitch_rad": -0.3, "yaw_rad": 0.0},
+        "down": {"pitch_rad": 0.3, "yaw_rad": 0.0},
+    }
+
+    def __init__(self, config: dict, joint_plan: JointPlanPlugin, state: StatePlugin):
+        # 合并默认 look_poses，避免旧配置缺失 head 块时 look 动作全部失效
+        look_poses = dict(self._DEFAULT_LOOK_POSES)
+        configured_poses = config.get("look_poses")
+        if isinstance(configured_poses, dict):
+            look_poses.update(configured_poses)
+        self._config = {**config, "look_poses": look_poses}
+        self._joint_plan = joint_plan
+        self._state = state
+        self._lock = threading.Lock()
+        self._cancel = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._active_request_id: int | None = None
+        self._cancel_failed = False
+        self._cancel_pending = False
+        self._cancel_request_id: int | None = None
+        self._cancel_generation = 0
+        self._interrupt_group: MotionInterruptGroup | None = None
+        self._status = {"state": "idle", "action": None, "step": 0, "total_steps": 0}
+        self._validate_head_config()
+
+    def _validate_head_config(self) -> None:
+        nod = float(self._config.get("nod_amplitude_rad", 0.3))
+        if not math.isfinite(nod) or not (0.0 <= nod <= self._PITCH_LIMIT):
+            raise ValueError(
+                f"nod_amplitude_rad must be finite and within [0, {self._PITCH_LIMIT}]"
+            )
+        shake = float(self._config.get("shake_amplitude_rad", 0.6))
+        if not math.isfinite(shake) or not (0.0 <= shake <= self._YAW_LIMIT):
+            raise ValueError(
+                f"shake_amplitude_rad must be finite and within [0, {self._YAW_LIMIT}]"
+            )
+        step_duration = float(self._config.get("step_duration_sec", 0.35))
+        if not math.isfinite(step_duration) or not (
+            self._ROTATION_TIME_MIN_SEC <= step_duration <= self._ROTATION_TIME_MAX_SEC
+        ):
+            raise ValueError(
+                "step_duration_sec must be finite and within "
+                f"[{self._ROTATION_TIME_MIN_SEC}, {self._ROTATION_TIME_MAX_SEC}]"
+            )
+        grace = float(self._config.get("feedback_grace_sec", 1.0))
+        if not math.isfinite(grace) or not (0.0 < grace <= self._FEEDBACK_GRACE_MAX_SEC):
+            raise ValueError(
+                "feedback_grace_sec must be finite and within "
+                f"(0, {self._FEEDBACK_GRACE_MAX_SEC}]"
+            )
+        poses = self._config.get("look_poses", {})
+        if not isinstance(poses, dict):
+            raise ValueError("look_poses must be a dict")
+        for direction, pose in poses.items():
+            if not isinstance(pose, dict):
+                raise ValueError(f"look_poses[{direction}] must be a dict")
+            if "pitch_rad" not in pose or "yaw_rad" not in pose:
+                raise ValueError(
+                    f"look_poses[{direction}] must specify both pitch_rad and yaw_rad"
+                )
+            try:
+                pitch = float(pose["pitch_rad"])
+                yaw = float(pose["yaw_rad"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"look_poses[{direction}].pitch_rad and yaw_rad must be numbers"
+                ) from exc
+            if not (math.isfinite(pitch) and math.isfinite(yaw)):
+                raise ValueError(f"look_poses[{direction}] must be finite")
+            if not (-self._PITCH_LIMIT <= pitch <= self._PITCH_LIMIT):
+                raise ValueError(
+                    f"look_poses[{direction}].pitch_rad must be within "
+                    f"[{-self._PITCH_LIMIT}, {self._PITCH_LIMIT}]"
+                )
+            if not (-self._YAW_LIMIT <= yaw <= self._YAW_LIMIT):
+                raise ValueError(
+                    f"look_poses[{direction}].yaw_rad must be within "
+                    f"[{-self._YAW_LIMIT}, {self._YAW_LIMIT}]"
+                )
+
+    def _worst_case_duration_sec(self) -> float:
+        """最坏情况序列总时长：就绪 + 完成回调 + 最长动作的逐段等待之和。"""
+        step = float(self._config.get("step_duration_sec", 0.35))
+        grace = float(self._config.get("feedback_grace_sec", 1.0))
+        # nod/shake：最多 5 次 × 3 步 = 15 个运动步；最慢 speed=0.5 → 单步最长
+        motion = clamp(
+            step / 0.5, self._ROTATION_TIME_MIN_SEC, self._ROTATION_TIME_MAX_SEC
+        )
+        nod_shake = 15 * (motion + grace)
+        rotate_to = (
+            (self._ROTATION_TIME_MAX_SEC + grace)
+            + self._HOLD_DURATION_MAX_SEC
+            + (self._ROTATION_TIME_MAX_SEC + grace)
+        )
+        look = self._ROTATION_TIME_MAX_SEC + grace
+        reset = step + grace
+        return (
+            self._READY_TIMEOUT_SEC
+            + self._ACP_CALLBACK_TIMEOUT_SEC
+            + max(nod_shake, rotate_to, look, reset)
+        )
+
+    def get_tool(self) -> dict:
+        actions = _with_lifecycle({
+            "nod": (["times", "speed"], "点头：下、上、回中，重复指定次数"),
+            "shake": (["times", "speed"], "摇头：左、右、回中，重复指定次数"),
+            "look": (["direction", "rotation_time"], "看向前、左、右、上或下的预设方向"),
+            "rotate_to": (["pitch_deg", "yaw_deg", "rotation_time", "duration"], "转到指定俯仰和偏航角度（度）"),
+            "reset": ([], "头部回正到 pitch=0、yaw=0"),
+            "status": ([], "查询头部角度和当前动作状态"),
+        })
+        actions["stop"] = ([], "停止当前头部动作并保持当前位置，不自动回正")
+        schema = action_schema(
+            actions,
+            {
+                "times": {
+                    "type": "integer", "minimum": 1, "maximum": 5, "default": 1,
+                    "description": "完整动作的重复次数；1–5，默认 1",
+                },
+                "speed": {
+                    "type": "number", "minimum": 0.5, "maximum": 2.0, "default": 1.0,
+                    "description": "动作速度倍率，数值越大动作越快；0.5–2.0，默认 1.0",
+                },
+                "direction": {
+                    "type": "string", "enum": ["forward", "left", "right", "up", "down"],
+                    "description": "forward / left / right / up / down",
+                },
+                "pitch_deg": {
+                    "type": "number", "minimum": math.degrees(-self._PITCH_LIMIT), "maximum": math.degrees(self._PITCH_LIMIT),
+                    "description": "-28.65–28.65°，默认 0",
+                },
+                "yaw_deg": {
+                    "type": "number", "minimum": math.degrees(-self._YAW_LIMIT), "maximum": math.degrees(self._YAW_LIMIT),
+                    "description": "-57.30–57.30°，默认 0",
+                },
+                "rotation_time": {
+                    "type": "number", "minimum": self._ROTATION_TIME_MIN_SEC,
+                    "maximum": self._ROTATION_TIME_MAX_SEC,
+                    "default": self._config.get("step_duration_sec", 0.35),
+                    "description": "转到目标花费的时间，秒；0.1–10",
+                },
+                "duration": {
+                    "type": "number", "minimum": self._HOLD_DURATION_MIN_SEC,
+                    "maximum": self._HOLD_DURATION_MAX_SEC,
+                    "description": "保持看向目标的时间，秒；不填则保持目标方向不回正；0.1–30",
+                },
+            },
+            "头部动作",
+        )
+        schema["x-completion"] = {
+            "actions": ["nod", "shake", "look", "rotate_to", "reset"],
+            "timeout": max(
+                int(self._ACP_TIMEOUT_SEC),
+                math.ceil(self._worst_case_duration_sec() + self._ACP_SAFETY_MARGIN_SEC),
+            ),
+        }
+        schema["x-hooks"] = {
+            "on_interrupt_motion": {"action": "stop"},
+        }
+        return {
+            "name": "head",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "T800 头部语义控制；支持点头、摇头、预设视线和指定角度控制",
+            "inputSchema": schema,
+        }
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        self._stop_action()
+
+    def halt(self) -> dict:
+        """Cancel head motion without tearing down the plugin."""
+        return self._stop_action()
+
+    def set_interrupt_group(self, group: MotionInterruptGroup) -> None:
+        self._interrupt_group = group
+
+    def motion_active(self) -> bool:
+        with self._lock:
+            return (
+                (self._thread is not None and self._thread.is_alive())
+                or self._cancel_failed
+                or self._cancel_pending
+            )
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "info"):
+            return {"state": "ready", "limits_rad": self._limits()}
+        if action == "status":
+            with self._lock:
+                result = dict(self._status)
+                result["cancel_failed"] = self._cancel_failed
+                result["cancel_pending"] = self._cancel_pending
+                result["cancel_request_id"] = self._cancel_request_id
+            positions = self._state.joint_positions()
+            if len(positions) > 24:
+                result["angles_rad"] = {"pitch": positions[23], "yaw": positions[24]}
+            result["limits_rad"] = self._limits()
+            result["joint_plan"] = self._joint_plan.dispatch("status", {})
+            result.update({key: value for key, value in self._joint_plan.head_status().items() if value is not None})
+            return result
+        if action == "stop":
+            if self._interrupt_group is not None:
+                group_result = self._interrupt_group.interrupt()
+                result = {"state": "idle"}
+                head_result = group_result["outputs"].get("head")
+                if isinstance(head_result, dict) and "cancel_result" in head_result:
+                    result["cancel_result"] = head_result["cancel_result"]
+                result["interrupted_outputs"] = group_result["outputs"]
+                return result
+            self._stop_action()
+            return {"state": "idle"}
+        if action == "nod":
+            try:
+                steps = self._nod_steps(args)
+            except (TypeError, ValueError) as exc:
+                return {"error": str(exc)}
+            return self._start_sequence("nod", steps, args)
+        if action == "shake":
+            try:
+                steps = self._shake_steps(args)
+            except (TypeError, ValueError) as exc:
+                return {"error": str(exc)}
+            return self._start_sequence("shake", steps, args)
+        if action == "look":
+            direction = str(args.get("direction", ""))
+            poses = self._config.get("look_poses", {})
+            pose = poses.get(direction)
+            if not isinstance(pose, dict):
+                return {"error": "direction must be forward, left, right, up, or down"}
+            try:
+                steps = [self._step(pose["pitch_rad"], pose["yaw_rad"], args)]
+            except (TypeError, ValueError) as exc:
+                return {"error": str(exc)}
+            return self._start_sequence("look", steps, args)
+        if action == "rotate_to":
+            if "pitch_deg" not in args or "yaw_deg" not in args:
+                return {"error": "pitch_deg and yaw_deg are required"}
+            try:
+                pitch_rad = math.radians(float(args["pitch_deg"]))
+                yaw_rad = math.radians(float(args["yaw_deg"]))
+                if not (math.isfinite(pitch_rad) and math.isfinite(yaw_rad)):
+                    raise ValueError("pitch_deg and yaw_deg must be finite")
+                if not (-self._PITCH_LIMIT <= pitch_rad <= self._PITCH_LIMIT):
+                    raise ValueError(
+                        f"pitch_deg must be between {math.degrees(-self._PITCH_LIMIT):.2f} "
+                        f"and {math.degrees(self._PITCH_LIMIT):.2f}"
+                    )
+                if not (-self._YAW_LIMIT <= yaw_rad <= self._YAW_LIMIT):
+                    raise ValueError(
+                        f"yaw_deg must be between {math.degrees(-self._YAW_LIMIT):.2f} "
+                        f"and {math.degrees(self._YAW_LIMIT):.2f}"
+                    )
+                target = self._step(pitch_rad, yaw_rad, args)
+                steps = [target]
+                if "duration" in args:
+                    hold_duration = float(args["duration"])
+                    if not math.isfinite(hold_duration) or not (
+                        self._HOLD_DURATION_MIN_SEC <= hold_duration <= self._HOLD_DURATION_MAX_SEC
+                    ):
+                        raise ValueError("duration must be between 0.1 and 30 seconds")
+                    steps.append({"hold_sec": hold_duration})
+                    steps.append(self._step(0.0, 0.0, args))
+            except (TypeError, ValueError) as exc:
+                return {"error": str(exc)}
+            return self._start_sequence("rotate_to", steps, args)
+        if action == "reset":
+            return self._start_sequence("reset", [self._step(0.0, 0.0, {})], args)
+        return {"error": f"unknown head action: {action}"}
+
+    def _limits(self) -> dict:
+        return {"pitch": [-self._PITCH_LIMIT, self._PITCH_LIMIT], "yaw": [-self._YAW_LIMIT, self._YAW_LIMIT]}
+
+    def _step(self, pitch: float, yaw: float, args: dict) -> dict:
+        rotation_time = float(args.get("rotation_time", self._config.get("step_duration_sec", 0.35)))
+        if not math.isfinite(rotation_time) or not (
+            self._ROTATION_TIME_MIN_SEC <= rotation_time <= self._ROTATION_TIME_MAX_SEC
+        ):
+            raise ValueError("rotation_time must be between 0.1 and 10 seconds")
+        return {
+            "pitch_rad": clamp(pitch, -self._PITCH_LIMIT, self._PITCH_LIMIT),
+            "yaw_rad": clamp(yaw, -self._YAW_LIMIT, self._YAW_LIMIT),
+            "duration": rotation_time,
+        }
+
+    def _sequence_args(self, args: dict) -> tuple[int, float]:
+        times = args.get("times", 1)
+        if isinstance(times, bool) or not isinstance(times, int):
+            raise ValueError("times must be an integer")
+        if not 1 <= times <= 5:
+            raise ValueError("times must be between 1 and 5")
+        speed = float(args.get("speed", 1.0))
+        if not math.isfinite(speed):
+            raise ValueError("speed must be a finite number")
+        if not 0.5 <= speed <= 2.0:
+            raise ValueError("speed must be between 0.5 and 2.0")
+        return times, speed
+
+    def _nod_steps(self, args: dict) -> list[dict]:
+        times, speed = self._sequence_args(args)
+        duration = clamp(
+            self._config.get("step_duration_sec", 0.35) / speed,
+            self._ROTATION_TIME_MIN_SEC,
+            self._ROTATION_TIME_MAX_SEC,
+        )
+        amplitude = float(self._config.get("nod_amplitude_rad", 0.3))
+        steps = []
+        for _ in range(times):
+            steps.extend([self._step(amplitude, 0.0, {"rotation_time": duration}),
+                          self._step(-amplitude, 0.0, {"rotation_time": duration}),
+                          self._step(0.0, 0.0, {"rotation_time": duration})])
+        return steps
+
+    def _shake_steps(self, args: dict) -> list[dict]:
+        times, speed = self._sequence_args(args)
+        duration = clamp(
+            self._config.get("step_duration_sec", 0.35) / speed,
+            self._ROTATION_TIME_MIN_SEC,
+            self._ROTATION_TIME_MAX_SEC,
+        )
+        amplitude = float(self._config.get("shake_amplitude_rad", 0.6))
+        steps = []
+        for _ in range(times):
+            steps.extend([self._step(0.0, amplitude, {"rotation_time": duration}),
+                          self._step(0.0, -amplitude, {"rotation_time": duration}),
+                          self._step(0.0, 0.0, {"rotation_time": duration})])
+        return steps
+
+    def _start_sequence(self, action: str, steps: list[dict], args: dict) -> dict:
+        with self._lock:
+            if self._cancel_failed or self._cancel_pending:
+                return {
+                    "error": "previous head cancel is not yet quiescent; retry stop",
+                    "request_id": self._cancel_request_id,
+                }
+            if self._thread is not None and self._thread.is_alive():
+                current = dict(self._status)
+                current.pop("action_id", None)
+                return {"error": "another head action is already running", **current}
+            busy = self._joint_plan.acquire_head("head")
+            if busy is not None:
+                return busy
+            from uuid import uuid4
+
+            action_id = f"t800_head_{uuid4().hex[:12]}"
+            self._cancel = threading.Event()
+            self._status = {
+                "state": "running", "action": action, "step": 0,
+                "total_steps": len(steps), "request_id": None,
+                "action_id": action_id, "error": None,
+            }
+
+        def run() -> None:
+            try:
+                self._joint_plan.wait_until_idle(
+                    self._READY_TIMEOUT_SEC, self._cancel
+                )
+                for index, step in enumerate(steps, start=1):
+                    if self._cancel.is_set():
+                        break
+                    with self._lock:
+                        self._status["step"] = index
+                    if "hold_sec" in step:
+                        if self._cancel.wait(float(step["hold_sec"])):
+                            break
+                        continue
+                    with self._lock:
+                        self._status["target_rad"] = {
+                            "pitch": step["pitch_rad"], "yaw": step["yaw_rad"],
+                        }
+                    result = self._joint_plan._dispatch_owned("head", "head_pose", step)
+                    if "error" in result:
+                        raise ValueError(result["error"])
+                    request_id = int(result["request_id"])
+                    with self._lock:
+                        self._active_request_id = request_id
+                        self._status["request_id"] = request_id
+                        self._status["request"] = result
+                        cancelled = self._cancel.is_set()
+                    if cancelled:
+                        self._request_cancel(request_id)
+                        break
+                    timeout = step["duration"] + float(self._config.get("feedback_grace_sec", 1.0))
+                    self._joint_plan.wait_for_request(request_id, timeout, self._cancel)
+                    with self._lock:
+                        if self._active_request_id == request_id:
+                            self._active_request_id = None
+                with self._lock:
+                    self._status["state"] = "cancelled" if self._cancel.is_set() else "completed"
+                    self._status["error"] = ""
+            except Exception as exc:
+                cancelled = self._cancel.is_set()
+                with self._lock:
+                    active_request_id = self._active_request_id
+                    self._status["state"] = "cancelled" if cancelled else "error"
+                    self._status["error"] = "" if cancelled else str(exc)
+                # 超时/故障路径必须先取消在飞的 planner 请求，否则释放 head 锁后
+                # 下一个 head 动作可能拿到锁并与仍在执行的轨迹并发。
+                # cancelled=True 时 cancel 已由 _stop_action 或 worker 自身发出。
+                if not cancelled and active_request_id is not None:
+                    self._request_cancel(active_request_id)
+            finally:
+                with self._lock:
+                    final_status = str(self._status.get("state", "error"))
+                    final_result = {
+                        "action": action,
+                        "step": self._status.get("step"),
+                        "total_steps": self._status.get("total_steps"),
+                        "request_id": self._status.get("request_id"),
+                        "error": self._status.get("error"),
+                    }
+                self._joint_plan.release_head("head")
+                _notify_acp_completion(
+                    "head", action_id, final_status, final_result,
+                    HeadActuatorPlugin._ACP_CALLBACK_TIMEOUT_SEC,
+                )
+
+        thread = threading.Thread(target=run, daemon=True, name="t800-head-sequence")
+        with self._lock:
+            self._thread = thread
+        try:
+            thread.start()
+        except Exception:
+            self._joint_plan.release_head("head")
+            raise
+        return {
+            "state": "running",
+            "action": action,
+            "total_steps": len(steps),
+            "action_id": action_id,
+            "accepted": True,
+            "detail": "head sequence started; completion is reported by action_id",
+        }
+
+    def _stop_action(self) -> dict:
+        with self._lock:
+            self._cancel.set()
+            request_id = self._active_request_id
+            thread = self._thread
+            if thread is not None and thread.is_alive():
+                self._status["state"] = "cancelled"
+                self._status["error"] = ""
+            elif request_id is None:
+                request_id = self._cancel_request_id
+            result = dict(self._status)
+        if request_id is not None:
+            result["cancel_result"] = self._request_cancel(int(request_id))
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=self._STOP_JOIN_TIMEOUT_SEC)
+        return result
+
+    def _request_cancel(self, request_id: int) -> dict:
+        try:
+            result = self._joint_plan._dispatch_owned(
+                "head", "cancel", {"request_id": int(request_id)}
+            )
+        except Exception as exc:
+            result = {"error": f"head cancel failed: {exc}"}
+        failed = "error" in result
+        with self._lock:
+            self._cancel_failed = failed
+            self._cancel_pending = self._interrupt_group is not None
+            self._cancel_request_id = (
+                int(request_id) if self._cancel_pending else None
+            )
+        if self._interrupt_group is not None:
+            self._start_cancel_monitor(int(request_id))
+        return result
+
+    def _start_cancel_monitor(self, request_id: int) -> None:
+        with self._lock:
+            self._cancel_generation += 1
+            generation = self._cancel_generation
+        threading.Thread(
+            target=self._monitor_cancel,
+            args=(int(request_id), generation),
+            daemon=True,
+            name="t800-head-cancel-monitor",
+        ).start()
+
+    def _monitor_cancel(self, request_id: int, generation: int) -> None:
+        deadline = time.monotonic() + self._READY_TIMEOUT_SEC
+        timeout_reported = False
+        while True:
+            with self._lock:
+                if (
+                    generation != self._cancel_generation
+                    or self._cancel_request_id != request_id
+                    or not self._cancel_pending
+                ):
+                    return
+            try:
+                status = self._joint_plan.dispatch("status", {})
+            except Exception as exc:
+                status = {"error": str(exc)}
+            if (
+                int(status.get("request_id", -1)) == request_id
+                and int(status.get("status", -1)) == 1
+            ):
+                with self._lock:
+                    if (
+                        generation == self._cancel_generation
+                        and self._cancel_request_id == request_id
+                    ):
+                        self._cancel_pending = False
+                        self._cancel_failed = False
+                        self._cancel_request_id = None
+                        if self._status.get("state") == "cancelled":
+                            self._status["error"] = ""
+                return
+            if time.monotonic() >= deadline and not timeout_reported:
+                with self._lock:
+                    if (
+                        generation == self._cancel_generation
+                        and self._cancel_request_id == request_id
+                    ):
+                        self._cancel_failed = True
+                        self._status["error"] = (
+                            "head cancel is still awaiting planner idle"
+                        )
+                timeout_reported = True
+            time.sleep(0.05)
+
+
 class GesturePlugin:
     """Planner-synchronised upper-body gestures validated against URDF limits."""
 
@@ -2783,6 +3466,10 @@ class GesturePlugin:
     _LIMIT_MARGIN_RAD = 0.02
     _READY_TIMEOUT_SEC = 10.0
     _STEP_TIMEOUT_SEC = 15.0
+    # Interrupt hooks must return promptly.  The non-blocking join observes an
+    # already-finished worker only; a live worker retains its planner lease and
+    # keeps the bundle motion gate closed through motion_active().
+    _STOP_JOIN_TIMEOUT_SEC = 0.0
     _COOLDOWN_SEC = 3.0
     _ACP_TIMEOUT_SEC = 300.0
     _ACP_CALLBACK_TIMEOUT_SEC = 5.0
@@ -3018,22 +3705,6 @@ class GesturePlugin:
             reset_after=reset_after,
         )
 
-    def _official_steps(self, name: str) -> list[dict]:
-        steps = []
-        for definition in self._GESTURES[name]:
-            step = {
-                "name": definition["name"],
-                "joint_indices": list(self._INDICES),
-                "target_positions": list(definition["positions"]),
-                "duration": definition["duration"],
-                "hold_after_sec": definition.get("hold_after_sec", 0.0),
-                "stiffness": list(definition.get("stiffness", [])),
-                "damping": list(definition.get("damping", [])),
-                "gravity_compensation": True,
-            }
-            steps.append(step)
-        return steps
-
     def _prepare_steps(self, steps: list[dict]) -> list[dict]:
         prepared = []
         for offset, source in enumerate(steps, start=1):
@@ -3072,6 +3743,22 @@ class GesturePlugin:
             prepared.append(step)
         return prepared
 
+    def _official_steps(self, name: str) -> list[dict]:
+        steps = []
+        for definition in self._GESTURES[name]:
+            step = {
+                "name": definition["name"],
+                "joint_indices": list(self._INDICES),
+                "target_positions": list(definition["positions"]),
+                "duration": definition["duration"],
+                "hold_after_sec": definition.get("hold_after_sec", 0.0),
+                "stiffness": list(definition.get("stiffness", [])),
+                "damping": list(definition.get("damping", [])),
+                "gravity_compensation": True,
+            }
+            steps.append(step)
+        return steps
+
     def _validate_completion_budget(self, steps: list[dict], *, reset_after: bool) -> None:
         worst_case = self._READY_TIMEOUT_SEC + self._ACP_CALLBACK_TIMEOUT_SEC
         worst_case += self._ACP_SAFETY_MARGIN_SEC
@@ -3090,6 +3777,7 @@ class GesturePlugin:
             )
 
     def _start_sequence(self, label: str, steps: list[dict], *, reset_after: bool) -> dict:
+        controls_head = reset_after or any(self._step_controls_head(step) for step in steps)
         with self._lock:
             if self._cancel_failed or self._cancel_pending:
                 return {
@@ -3100,6 +3788,10 @@ class GesturePlugin:
                 current = dict(self._status)
                 current.pop("action_id", None)
                 return {**current, "error": "another gesture sequence is already running"}
+            if controls_head:
+                busy = self._joint_plan.acquire_head("gesture")
+                if busy is not None:
+                    return busy
             from uuid import uuid4
 
             action_id = f"t800_gesture_{uuid4().hex[:12]}"
@@ -3123,7 +3815,7 @@ class GesturePlugin:
                         self._status["step"] = index
                         self._status["step_name"] = step["name"]
                     action = "plan_named" if "joint_names" in step else "plan"
-                    result = self._joint_plan.dispatch(action, step)
+                    result = self._joint_plan._dispatch_owned("gesture", action, step)
                     if "error" in result:
                         raise ValueError(result["error"])
                     request_id = int(result["request_id"])
@@ -3138,7 +3830,7 @@ class GesturePlugin:
                     if hold_after > 0 and self._cancel.wait(hold_after):
                         raise RuntimeError("gesture cancelled")
                 if not self._cancel.is_set() and reset_after:
-                    result = self._joint_plan.dispatch("reset", {})
+                    result = self._joint_plan._dispatch_owned("gesture", "reset", {})
                     if "error" in result:
                         raise ValueError(result["error"])
                     request_id = int(result["request_id"])
@@ -3175,6 +3867,8 @@ class GesturePlugin:
                         "request_id": self._status.get("request_id"),
                         "error": self._status.get("error"),
                     }
+                if controls_head:
+                    self._joint_plan.release_head("gesture")
                 if action_id is not None:
                     self._acp_notify(action_id, final_status, final_result)
 
@@ -3189,12 +3883,19 @@ class GesturePlugin:
             "action_id": action_id,
         }
 
+    @staticmethod
+    def _step_controls_head(step: dict) -> bool:
+        if "joint_names" in step:
+            return any(T800_JOINT_INDEX.get(str(name)) in T800_JOINT_GROUPS["head"] for name in step["joint_names"])
+        return bool(set(step.get("joint_indices", [])) & set(T800_JOINT_GROUPS["head"]))
+
     def _stop(self, *, reset_after: bool) -> dict:
         with self._lock:
+            thread = self._thread
             active = (
                 self._status.get("state") == "running"
-                and self._thread is not None
-                and self._thread.is_alive()
+                and thread is not None
+                and thread.is_alive()
             )
             if active:
                 self._cancel.set()
@@ -3206,14 +3907,21 @@ class GesturePlugin:
             result = dict(self._status)
         if request_id is not None:
             result["cancel_result"] = self._request_cancel(int(request_id))
+        # 必须等 worker 退出后再释放 head 锁，否则 worker 可能已通过取消检查、
+        # 正准备调用 _dispatch_owned，与新拿到锁的 head 动作竞态（迟到的手势
+        # 请求会报 head is busy 或与新动作并发）。这里只做有界等待；若 worker
+        # 尚未退出，不提前释放 head 锁，motion_active 也会继续关闭整机运动门。
+        if active and thread is not threading.current_thread():
+            thread.join(timeout=self._STOP_JOIN_TIMEOUT_SEC)
         if reset_after:
-            self._joint_plan.dispatch("reset", {})
+            # Interrupt/lifecycle stop must not launch untracked reset motion.
+            result["reset_after_ignored"] = True
         return result
 
     def _request_cancel(self, request_id: int) -> dict:
         try:
-            result = self._joint_plan.dispatch(
-                "cancel", {"request_id": int(request_id)}
+            result = self._joint_plan._dispatch_owned(
+                "gesture", "cancel", {"request_id": int(request_id)}
             )
         except Exception as exc:
             result = {"error": f"gesture cancel failed: {exc}"}
@@ -3289,7 +3997,10 @@ class GesturePlugin:
     @staticmethod
     def _acp_notify(action_id: str, status: str, result: dict) -> None:
         """Report asynchronous gesture completion to Agent Core."""
-        _t800_acp_notify(action_id, status, result, "gesture")
+        _notify_acp_completion(
+            "gesture", action_id, status, result,
+            GesturePlugin._ACP_CALLBACK_TIMEOUT_SEC,
+        )
 
 
 class _JointStreamBase:
@@ -5728,8 +6439,15 @@ class GaitPlugin:
         profile = str(args.get("gait", ""))
         if profile not in self._profiles:
             return {"error": f"unknown gait: {profile}", "gaits": list(self._profiles)}
+        for name, default in (("force", False), ("wait", True)):
+            value = args.get(name, default)
+            if not isinstance(value, bool):
+                return {
+                    "error": f"{name} must be a JSON boolean",
+                    "code": "INVALID_ARGUMENT",
+                }
         current, available = self._state.current_motion()
-        force = bool(args.get("force", False))
+        force = args.get("force", False)
         target = self._resolve(profile, current, available)
         if target is None:
             if not force:
@@ -5751,7 +6469,7 @@ class GaitPlugin:
         result = self._motion_mode.dispatch("switch", {
             "target": target,
             "force": force,
-            "wait": bool(args.get("wait", True)),
+            "wait": args.get("wait", True),
         })
         return {"gait": profile, "motion_state": target, **result}
 

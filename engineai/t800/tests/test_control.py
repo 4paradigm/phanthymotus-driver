@@ -333,7 +333,9 @@ class ValidationTests(unittest.TestCase):
         self.assertIn("rl_mimic_stance_to_supine", MOTION_STATES)
 
     def test_walk_motion_states_matches_official_walking_modes(self):
-        self.assertEqual(("rl_basic", "lower_body_balance"), WALK_MOTION_STATES)
+        self.assertEqual(
+            ("rl_basic", "walk", "lower_body_balance"), WALK_MOTION_STATES
+        )
 
 
 class RepeatingCommandTests(unittest.TestCase):

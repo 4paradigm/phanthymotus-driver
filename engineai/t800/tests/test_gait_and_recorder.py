@@ -273,6 +273,42 @@ class GaitPluginContractTests(unittest.TestCase):
         self.assertEqual("requested", result["state"])
         self.assertEqual("walk", self.motion_mode.calls[-1][1]["target"])
 
+    def test_legacy_walk_selected_by_gait_is_accepted_by_loco(self):
+        self.state.available = ["walk"]
+        selected = self.plugin.dispatch("select", {"gait": "basic"})
+        self.assertEqual("completed", selected["state"])
+        self.assertEqual("walk", self.state.current)
+        loco = self.dev.LocomotionPlugin(
+            {
+                "control": {
+                    "max_vx": 1.0,
+                    "max_vy": 1.0,
+                    "max_vyaw": 1.0,
+                    "velocity_rate_hz": 100.0,
+                    "stream_watchdog_period_sec": 0.5,
+                },
+                "topics": {"body_velocity": "/motion/body_vel_cmd"},
+            },
+            "t800",
+            FakeRos(),
+            self.state,
+        )
+        loco.start()
+        moved = loco.dispatch("move", {"vx": 0.1, "duration": 0.01})
+        self.assertEqual("running", moved["state"])
+        loco.dispatch("stop_move", {})
+
+    def test_select_rejects_non_boolean_force_and_wait(self):
+        for parameter in ("force", "wait"):
+            with self.subTest(parameter=parameter):
+                self.motion_mode.calls.clear()
+                result = self.plugin.dispatch(
+                    "select", {"gait": "basic", parameter: "false"}
+                )
+                self.assertEqual("INVALID_ARGUMENT", result["code"])
+                self.assertIn("JSON boolean", result["error"])
+                self.assertEqual([], self.motion_mode.calls)
+
     def test_select_rejects_unpublished_profile_before_publish(self):
         result = self.plugin.dispatch("select", {"gait": "terrain"})
         self.assertIn("error", result)
@@ -1308,6 +1344,15 @@ class MotionRecorderPluginContractTests(unittest.TestCase):
                 self.entered_wait.set()
                 self.release_wait.wait(timeout=1.0)
                 return {}
+
+            def acquire_head(self, _owner):
+                return None
+
+            def release_head(self, _owner):
+                pass
+
+            def _dispatch_owned(self, _owner, action, args):
+                return self.dispatch(action, args)
 
             def dispatch(self, action, args):
                 self.calls.append((action, dict(args)))

@@ -1091,6 +1091,9 @@ class ExtMicPlugin:
                 "ssh_pass": {
                     "type": "string",
                     "format": "password",
+                    "x-sensitive": False,   # 固定的出厂密码，不是用户秘密：打包成
+                                            # 解决方案时不需要清空（清了只会让载入
+                                            # 方重新敲一遍同一个默认值）
                     "description": "SSH password",
                     "default": "123",
                 },
