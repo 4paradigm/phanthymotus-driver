@@ -39,7 +39,6 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 | `head` | actuator | 头部语义控制：点头、摇头、预设视线与 rotate_to 绝对角度 |
 | `joint_plan_state` | sensor | 规划 request id、状态和进度 |
 | `gesture` | actuator | 官方完整挥手/握手多步序列及任意自定义关节动作队列 |
-| `arm_swing` | actuator | `lower_body_balance` 下通过 `joint_plan` 持续交替摆臂，状态变化或 `halt` 时取消当前规划 |
 | `joint_override` | actuator | 指定关节 100 Hz 覆盖控制 |
 | `joint_bridge` | actuator | 全 25 关节最高 500 Hz 底层控制 |
 | `led` | actuator | 众擎协议定义的 11 种灯效 |
@@ -67,12 +66,6 @@ MCP schema 中隐藏。
 动作（挥手包含准备、举手、5 次摆动和复位；握手包含伸手、收手和复位），
 后者保留为兼容接口，只发送单个目标姿势。`gesture.sequence` 可提交任意多步
 关节动作队列。
-
-`arm_swing.start_swing` 支持 2–30 度摆幅；运行中再次调用会更新后续规划。
-`halt` 仅取消并停在当前位置，`return_neutral` 与 `halt_and_return` 会通过
-`joint_plan` 在可配置时间内平滑回到自然姿态。两个有界回正动作通过 ACP 报告完成；
-持续运行的 `start_swing` 不进入 ACP barrier，因此普通 `halt` 和运行时参数更新始终可调用。
-`on_interrupt_motion` 和 `on_interrupt_all` 系统 hook 也会直接执行 `halt`。
 
 `virtual_gamepad` 使用 Native SDK 官方通道
 `virtual_gamepad/gamepad_keys`，默认连接 `udpm://239.255.76.67:7667?ttl=1`。
