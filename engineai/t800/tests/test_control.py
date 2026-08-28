@@ -339,6 +339,48 @@ class ValidationTests(unittest.TestCase):
 
 
 class RepeatingCommandTests(unittest.TestCase):
+    def test_natural_stop_stays_active_until_release_publish_finishes(self):
+        release_started = threading.Event()
+        allow_release = threading.Event()
+
+        def release():
+            release_started.set()
+            allow_release.wait(timeout=1.0)
+
+        stream = RepeatingCommand(lambda _payload: None, release, rate_hz=100)
+        stream.start({"value": 1}, 0.02)
+
+        self.assertTrue(release_started.wait(timeout=1.0))
+        self.assertTrue(stream.snapshot().active)
+        allow_release.set()
+        deadline = time.monotonic() + 1.0
+        while stream.snapshot().active and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(stream.snapshot().active)
+
+    def test_explicit_stop_stays_active_until_release_publish_finishes(self):
+        release_started = threading.Event()
+        allow_release = threading.Event()
+
+        def release():
+            release_started.set()
+            allow_release.wait(timeout=1.0)
+
+        stream = RepeatingCommand(lambda _payload: None, release, rate_hz=100)
+        stream.start({"value": 1}, -1)
+        stopped = threading.Event()
+        thread = threading.Thread(
+            target=lambda: (stream.stop(), stopped.set()), daemon=True
+        )
+        thread.start()
+
+        self.assertTrue(release_started.wait(timeout=1.0))
+        self.assertTrue(stream.snapshot().active)
+        self.assertFalse(stopped.is_set())
+        allow_release.set()
+        self.assertTrue(stopped.wait(timeout=1.0))
+        self.assertFalse(stream.snapshot().active)
+
     def test_timed_stream_publishes_and_stops(self):
         published = []
         stopped = threading.Event()

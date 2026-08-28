@@ -326,7 +326,10 @@ class McpHttpContractTests(unittest.TestCase):
         bundle._motion_events = None
         bundle._motion_interrupt_group = InterruptGroup()
         self.assertTrue(
-            {"loco", "gait", "gesture", "motion_recorder", "head"}.issubset(
+            {
+                "speaker", "loco", "gait", "gesture",
+                "motion_recorder", "head",
+            }.issubset(
                 bundle._MOTION_OUTPUT_TOOLS
             )
         )
@@ -348,6 +351,16 @@ class McpHttpContractTests(unittest.TestCase):
 
 
 class VendoredContractTests(unittest.TestCase):
+    def test_default_loco_profile_matches_approved_real_device_limits(self):
+        config_text = (ROOT / "config.yaml").read_text()
+        for declaration in (
+            "max_vx: 2.0",
+            "max_vy: 1.0",
+            "max_vyaw: 2.0",
+            "locomotion_prepare_duration_sec: 1.0",
+        ):
+            self.assertIn(declaration, config_text)
+
     def test_urdf_contains_every_driver_joint_name(self):
         sys.path.insert(0, str(ROOT))
         from control import T800_JOINT_NAMES

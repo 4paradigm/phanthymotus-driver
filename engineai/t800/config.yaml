@@ -12,9 +12,10 @@ control:
   velocity_rate_hz: 100.0
   low_level_rate_hz: 500.0
   override_rate_hz: 100.0
-  max_vx: 1.0
+  max_vx: 2.0
   max_vy: 1.0
-  max_vyaw: 1.0
+  max_vyaw: 2.0
+  locomotion_prepare_duration_sec: 1.0
   mode_transition_timeout_sec: 5.0
   motor_warning_temperature_c: 70.0
   tilt_warning_rad: 0.45

@@ -106,7 +106,7 @@ class T800DeviceBundle:
     _MOTION_OUTPUT_TOOLS = frozenset({
         "loco", "motion_mode", "dance", "joint_plan", "gesture",
         "joint_override", "joint_bridge", "virtual_gamepad", "gait",
-        "motion_recorder", "head",
+        "motion_recorder", "head", "speaker",
     })
     _SAFE_WHILE_MOTION_SETTLING = frozenset({
         "start", "stop", "info", "status", "list", "stop_move",
@@ -204,6 +204,19 @@ class T800DeviceBundle:
             if provider is not None and hasattr(provider, "health_sources"):
                 state.register_health_provider(key, provider.health_sources)
 
+        locomotion = instances.get("locomotion")
+        if locomotion is not None:
+            locomotion.set_interrupt_group(motion_interrupt_group)
+            motion_interrupt_group.register(
+                "locomotion", locomotion.halt, locomotion.motion_active
+            )
+        speaker = instances.get("speaker")
+        if speaker is not None:
+            speaker.set_interrupt_group(motion_interrupt_group)
+            motion_interrupt_group.register(
+                "speaker", speaker.halt, speaker.motion_active
+            )
+
         if plugins.get("dance", {}).get("enabled", True) and "motion_mode" in instances:
             instance = DancePlugin(instances["motion_mode"], state)
             instances["dance"] = instance
@@ -283,6 +296,7 @@ class T800DeviceBundle:
                     for key in (
                         "locomotion", "joint_override", "joint_bridge",
                         "virtual_gamepad", "gesture", "motion_recorder", "head",
+                        "speaker",
                     )
                     if key in instances
                 ]
