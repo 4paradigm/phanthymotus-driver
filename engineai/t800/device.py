@@ -3836,19 +3836,17 @@ class ArmActuatorPlugin:
                 return {"error": f"unknown arm action: {action}"}
         except (TypeError, ValueError) as exc:
             return {"error": str(exc)}
+        if not bool(args.get("confirm", False)):
+            return {
+                "error": "arm is a dangerous tool; set confirm=true to acknowledge "
+                         "the risk before executing any arm action"
+            }
         motion, _available_motions = self._joint_plan.current_motion()
-        if motion != "lower_body_balance":
-            if not bool(args.get("force", False)):
-                return {
-                    "error": "arm action requires motion state 'lower_body_balance' "
-                             f"(current: {motion or 'unknown'})"
-                }
-            if not bool(args.get("confirm", False)):
-                return {
-                    "error": "force=true bypasses the lower_body_balance safety gate; "
-                             "set confirm=true to acknowledge the risk of moving arms "
-                             "while the robot is not in balance stance"
-                }
+        if motion != "lower_body_balance" and not bool(args.get("force", False)):
+            return {
+                "error": "arm action requires motion state 'lower_body_balance' "
+                         f"(current: {motion or 'unknown'})"
+            }
         return self._start_sequence(action, steps)
 
     def _side(self, value, *, allow_both: bool) -> str:
@@ -3868,7 +3866,12 @@ class ArmActuatorPlugin:
         return clamp(self._config.get("feedback_grace_sec", 1.0), 0.0, self._FEEDBACK_GRACE_MAX_SEC)
 
     def _times_speed(self, args: dict) -> tuple[int, float]:
-        times = int(args.get("times", 1))
+        raw_times = args.get("times", 1)
+        if isinstance(raw_times, bool) or not isinstance(raw_times, (int, float)):
+            raise ValueError("times must be an integer")
+        if isinstance(raw_times, float) and not raw_times.is_integer():
+            raise ValueError("times must be an integer")
+        times = int(raw_times)
         if not 1 <= times <= 5:
             raise ValueError("times must be between 1 and 5")
         speed = clamp(args.get("speed", 1.0), 0.5, 2.0)
