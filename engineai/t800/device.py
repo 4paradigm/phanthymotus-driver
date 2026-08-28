@@ -12,13 +12,17 @@ import json
 import math
 import numbers
 import os
+import queue
+import re
 import sqlite3
 import subprocess
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
+from uuid import uuid4
 
 import numpy as np
 from rclpy.node import Node
@@ -36,9 +40,11 @@ except ImportError:
 from control import (
     LED_MODES,
     MOTION_STATES,
+    WALK_MOTION_STATES,
     T800_JOINT_GROUPS,
     T800_JOINT_INDEX,
     T800_JOINT_NAMES,
+    ControlValidationError,
     RepeatingCommand,
     action_schema,
     array_property,
@@ -47,11 +53,15 @@ from control import (
     joint_payload,
     list_or_default,
     optional_floats,
+    resample_joint_trajectory,
     sensor_action_schema,
     sensor_tool,
     validate_joint_indices,
     validate_joint_positions,
+    validate_locomotion_request,
     validate_parallel_arrays,
+    validate_recording_document,
+    validate_recording_frames,
 )
 from native_sdk import NativeSdkManager
 
@@ -74,6 +84,150 @@ _RELIABLE_ONE = QoSProfile(
     depth=1,
     durability=DurabilityPolicy.VOLATILE,
 )
+_RECORDING_FILE_ERRORS = (
+    json.JSONDecodeError,
+    OSError,
+    RecursionError,
+    TypeError,
+    UnicodeError,
+    ValueError,
+)
+_AUDIO_QOS = QoSProfile(
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=200,
+    durability=DurabilityPolicy.VOLATILE,
+)
+
+_ACP_STATUS_LOCK = threading.Lock()
+_ACP_STATUS = {
+    "state": "unknown",
+    "configured": False,
+    "url": None,
+    "ca_cert": None,
+    "last_error": "ACP configuration has not been validated",
+    "last_success_at": None,
+    "last_failure_at": None,
+}
+
+
+def _update_acp_status(**updates) -> dict:
+    with _ACP_STATUS_LOCK:
+        _ACP_STATUS.update(updates)
+        return dict(_ACP_STATUS)
+
+
+def _t800_agent_core_transport(endpoint_path: str):
+    import os as _os
+    import ssl
+    import urllib.parse
+
+    agent_core_url = _os.environ.get("AGENT_CORE_URL", "").strip().rstrip("/")
+    if not agent_core_url:
+        raise ValueError("AGENT_CORE_URL is required")
+    ca_cert = _os.environ.get("AGENT_CORE_CA_CERT")
+    parsed_url = urllib.parse.urlparse(agent_core_url)
+    if parsed_url.scheme not in ("http", "https") or not parsed_url.hostname:
+        raise ValueError(
+            "AGENT_CORE_URL must be an absolute http or https URL"
+        )
+    if (
+        parsed_url.scheme == "http"
+        and parsed_url.hostname not in ("localhost", "127.0.0.1", "::1")
+    ):
+        raise ValueError(
+            "unencrypted AGENT_CORE_URL is only allowed on loopback"
+        )
+    if parsed_url.scheme == "https" and not ca_cert:
+        raise ValueError(
+            "AGENT_CORE_CA_CERT is required for https ACP callbacks"
+        )
+    context = ssl.create_default_context(cafile=ca_cert or None)
+    path = "/" + str(endpoint_path).lstrip("/")
+    return f"{agent_core_url}{path}", context, ca_cert
+
+
+def _t800_acp_transport():
+    return _t800_agent_core_transport("/api/acp/complete")
+
+
+def _t800_acp_preflight() -> dict:
+    import os as _os
+
+    agent_core_url = _os.environ.get("AGENT_CORE_URL", "").strip().rstrip("/")
+    try:
+        _endpoint, _context, ca_cert = _t800_acp_transport()
+    except Exception as exc:
+        return _update_acp_status(
+            state="error",
+            configured=False,
+            url=agent_core_url,
+            ca_cert=_os.environ.get("AGENT_CORE_CA_CERT"),
+            last_error=str(exc),
+            last_failure_at=time.time(),
+        )
+    return _update_acp_status(
+        state="ready",
+        configured=True,
+        url=agent_core_url,
+        ca_cert=ca_cert,
+        last_error=None,
+    )
+
+
+def _t800_acp_status() -> dict:
+    with _ACP_STATUS_LOCK:
+        status = dict(_ACP_STATUS)
+    if not status["configured"]:
+        return _t800_acp_preflight()
+    return status
+
+
+def _t800_acp_notify(
+    action_id: str,
+    status: str,
+    result: dict,
+    tool: str,
+) -> bool:
+    """Post asynchronous actuator completion to Agent Core."""
+    import urllib.request
+
+    transport_ready = False
+    try:
+        endpoint, context, ca_cert = _t800_acp_transport()
+        transport_ready = True
+        payload = json.dumps({
+            "action_id": action_id,
+            "status": status,
+            "result": result,
+            "tool": tool,
+            "ts": time.time(),
+        }).encode()
+        request = urllib.request.Request(
+            endpoint,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(request, timeout=5, context=context)
+        _update_acp_status(
+            state="ready",
+            configured=True,
+            url=endpoint.removesuffix("/api/acp/complete"),
+            ca_cert=ca_cert,
+            last_error=None,
+            last_success_at=time.time(),
+        )
+        return True
+    except Exception as exc:
+        _update_acp_status(
+            state="error",
+            configured=transport_ready,
+            last_error=str(exc),
+            last_failure_at=time.time(),
+        )
+        print(f"[{tool}] ACP notify failed for {action_id}: {exc}", flush=True)
+        return False
 
 _LIFECYCLE_ACTIONS = {
     "start": ([], "启动卡片数据流"),
@@ -100,48 +254,10 @@ def _notify_acp_completion(
     status: str,
     result: dict,
     timeout: float,
-) -> None:
-    import ssl
-    import urllib.parse
-    import urllib.request
-
-    agent_core_url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
-    ca_cert = os.environ.get("AGENT_CORE_CA_CERT")
-    try:
-        parsed_url = urllib.parse.urlparse(agent_core_url)
-        if parsed_url.scheme not in ("http", "https"):
-            raise ValueError("AGENT_CORE_URL must use http or https")
-        if (
-            parsed_url.scheme == "http"
-            and parsed_url.hostname not in ("localhost", "127.0.0.1", "::1")
-        ):
-            raise ValueError("unencrypted AGENT_CORE_URL is only allowed on loopback")
-        # 与 main 分支 g1 driver 及 t800 注册循环保持一致：未配置 CA 证书时
-        # 接受自签证书（Agent Core 在机器人上通常使用自签证书）；显式配置了
-        # AGENT_CORE_CA_CERT 时则使用指定 CA 进行验证。
-        if ca_cert:
-            context = ssl.create_default_context(cafile=ca_cert)
-        else:
-            context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-        payload = json.dumps({
-            "action_id": action_id,
-            "status": status,
-            "result": result,
-            "tool": tool,
-            "ts": time.time(),
-        }).encode()
-        request = urllib.request.Request(
-            f"{agent_core_url}/api/acp/complete",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=timeout, context=context):
-            pass
-    except Exception as exc:
-        print(f"[{tool}] ACP callback failed for {action_id}: {exc}", flush=True)
+) -> bool:
+    # Keep every asynchronous T800 card on the validated transport so TLS
+    # failures are reflected by the shared ACP health/degraded status.
+    return _t800_acp_notify(action_id, status, result, tool)
 
 
 _GAMEPAD_BUTTON_NAMES = {
@@ -296,6 +412,7 @@ class StatePlugin:
         self._last_joint_positions = [0.0] * len(T800_JOINT_NAMES)
         self._current_motion = ""
         self._available_motions: list[str] = []
+        self._motion_generation = 0
         self._health_providers: dict[str, object] = {}
 
         self._sub_node = Node("t800_state_sub", context=ros2.ctx_robot)
@@ -395,6 +512,14 @@ class StatePlugin:
     def current_motion(self) -> tuple[str, list[str]]:
         with self._lock:
             return self._current_motion, list(self._available_motions)
+
+    def motion_snapshot(self) -> tuple[str, list[str], int]:
+        with self._lock:
+            return (
+                self._current_motion,
+                list(self._available_motions),
+                self._motion_generation,
+            )
 
     def joint_positions(self) -> list[float]:
         with self._lock:
@@ -927,6 +1052,7 @@ class StatePlugin:
         with self._lock:
             self._current_motion = msg.current_motion_task
             self._available_motions = list(msg.available_transition_motions)
+            self._motion_generation += 1
         self._set("motion_state", payload)
 
     def _publish_tick(self) -> None:
@@ -1968,55 +2094,156 @@ class NativeInterfaceProbePlugin:
         return "low"
 
 class LocomotionPlugin:
+    _MAX_TIMED_DURATION_SEC = 10.0
+    _ACP_TIMEOUT_SEC = 30
+    _ACP_MIN_DURATION_SEC = 3.0
+
     def __init__(self, config: dict, namespace: str, ros2, state: StatePlugin):
         self._config = config
         self._state = state
         self._node = Node("t800_locomotion", context=ros2.ctx_robot)
         ros2.executor_robot.add_node(self._node)
         self._publisher = None
-        limits = config["control"]
+        self._watchdog_timer = None
+        limits = config.get("control", {})
         self._limits = (
-            float(limits["max_vx"]),
-            float(limits["max_vy"]),
-            float(limits["max_vyaw"]),
+            abs(float(limits.get("max_vx", 1.0))),
+            abs(float(limits.get("max_vy", 1.0))),
+            abs(float(limits.get("max_vyaw", 1.0))),
         )
         self._stream = RepeatingCommand(
             self._publish_payload,
             self._publish_zero,
-            rate_hz=float(limits["velocity_rate_hz"]),
+            rate_hz=float(limits.get("velocity_rate_hz", 100)),
         )
+        self._watchdog_period = float(limits.get("stream_watchdog_period_sec", 0.5))
+        self._stream_gap_limit_sec = max(
+            5.0 / float(limits.get("velocity_rate_hz", 100)), 0.5
+        )
+        self._prepare_duration_sec = float(
+            limits.get("locomotion_prepare_duration_sec", 1.0)
+        )
+        if (
+            not math.isfinite(self._prepare_duration_sec)
+            or self._prepare_duration_sec < 0
+            or self._prepare_duration_sec > 3.0
+        ):
+            raise ValueError(
+                "locomotion_prepare_duration_sec must be within [0, 3]"
+            )
+        self._action_lock = threading.Lock()
+        self._lifecycle_lock = threading.RLock()
+        self._active_action_id: str | None = None
+        self._active_action_generation = 0
+        self._command_generation = 0
+        self._release_failed = False
+        self._release_error: str | None = None
+        self._acp_notify = _t800_acp_notify
+        self._interrupt_group: MotionInterruptGroup | None = None
 
     def get_tool(self) -> dict:
+        schema = action_schema(
+            {
+                "move": (
+                    ["vx", "vy", "vyaw", "duration"],
+                    "按速度移动；duration=-1 持续到 stop_move",
+                ),
+                "move_displacement": (
+                    ["x_m", "y_m", "speed_m_s"],
+                    "按时间积分估算相对位移（开环，无里程计反馈）",
+                ),
+                "turn_angle": (
+                    ["angle_rad", "angular_speed_rad_s"],
+                    "按时间积分估算原地转角（开环）",
+                ),
+                "arc": (
+                    ["radius_m", "angle_rad", "linear_speed_m_s"],
+                    "按给定半径和角度走圆弧（开环）",
+                ),
+                "stop_move": ([], "立即发布零速度并停止刷新"),
+                "status": ([], "查询速度控制刷新状态"),
+            },
+            {
+                "vx": {
+                    "type": "number",
+                    "minimum": -self._limits[0],
+                    "maximum": self._limits[0],
+                    "default": 0.0,
+                    "description": "前向速度 m/s",
+                },
+                "vy": {
+                    "type": "number",
+                    "minimum": -self._limits[1],
+                    "maximum": self._limits[1],
+                    "default": 0.0,
+                    "description": "侧向速度 m/s",
+                },
+                "vyaw": {
+                    "type": "number",
+                    "minimum": -self._limits[2],
+                    "maximum": self._limits[2],
+                    "default": 0.0,
+                    "description": "偏航角速度 rad/s",
+                },
+                "duration": {
+                    "type": "number",
+                    "default": 1.0,
+                    "anyOf": [
+                        {"type": "number", "const": -1},
+                        {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": self._MAX_TIMED_DURATION_SEC,
+                        },
+                    ],
+                    "description": (
+                        "实际行动时间（秒），不含内部"
+                        f"{self._prepare_duration_sec:g}秒预备补偿；"
+                        "-1=持续到 stop_move，0=停止"
+                    ),
+                },
+                "x_m": {"type": "number", "description": "机身坐标系前向位移，米"},
+                "y_m": {"type": "number", "description": "机身坐标系侧向位移，米"},
+                "speed_m_s": {
+                    "type": "number",
+                    "minimum": 0.01,
+                    "maximum": math.hypot(*self._limits[:2]),
+                    "description": "平移速度绝对值，m/s",
+                },
+                "angle_rad": {"type": "number", "description": "偏航角或圆弧夹角，rad"},
+                "angular_speed_rad_s": {
+                    "type": "number",
+                    "minimum": 0.01,
+                    "maximum": self._limits[2],
+                    "description": "角速度绝对值，rad/s",
+                },
+                "radius_m": {
+                    "type": "number",
+                    "exclusiveMinimum": 0,
+                    "description": "圆弧半径绝对值，米",
+                },
+                "linear_speed_m_s": {
+                    "type": "number",
+                    "minimum": -self._limits[0],
+                    "maximum": self._limits[0],
+                    "description": "圆弧线速度，m/s；负数为后退",
+                },
+            },
+            "运动动作",
+        )
+        schema["x-completion"] = {
+            "actions": ["move", "move_displacement", "turn_angle", "arc"],
+            "timeout": self._ACP_TIMEOUT_SEC,
+        }
+        schema["x-hooks"] = {
+            "on_interrupt_motion": {"action": "stop_move"},
+        }
         return {
             "name": "loco",
             "type": "actuator",
             "multiInstance": False,
             "description": "T800 全向速度控制，支持定时和持续运动",
-            "inputSchema": action_schema(
-                {
-                    "move": (["vx", "vy", "vyaw", "duration", "force"], "按速度移动；duration=-1 持续到 stop_move"),
-                    "move_displacement": (["x_m", "y_m", "speed_m_s", "force"], "按时间积分估算相对位移（开环，无里程计反馈）"),
-                    "turn_angle": (["angle_rad", "angular_speed_rad_s", "force"], "按时间积分估算原地转角（开环）"),
-                    "arc": (["radius_m", "angle_rad", "linear_speed_m_s", "force"], "按给定半径和角度走圆弧（开环）"),
-                    "stop_move": ([], "立即发布零速度并停止刷新"),
-                    "status": ([], "查询速度控制刷新状态"),
-                },
-                {
-                    "vx": {"type": "number", "description": "前向速度 m/s"},
-                    "vy": {"type": "number", "description": "侧向速度 m/s"},
-                    "vyaw": {"type": "number", "description": "偏航角速度 rad/s"},
-                    "duration": {"type": "number", "description": "秒；-1=持续，0=停止"},
-                    "force": {"type": "boolean", "description": "忽略当前必须为 walk 的状态门禁"},
-                    "x_m": {"type": "number", "description": "机身坐标系前向位移，米"},
-                    "y_m": {"type": "number", "description": "机身坐标系侧向位移，米"},
-                    "speed_m_s": {"type": "number", "description": "平移速度绝对值，m/s"},
-                    "angle_rad": {"type": "number", "description": "偏航角或圆弧夹角，rad"},
-                    "angular_speed_rad_s": {"type": "number", "description": "角速度绝对值，rad/s"},
-                    "radius_m": {"type": "number", "description": "圆弧半径绝对值，米"},
-                    "linear_speed_m_s": {"type": "number", "description": "圆弧线速度，m/s；负数为后退"},
-                },
-                "运动动作",
-            ),
+            "inputSchema": schema,
         }
 
     def start(self) -> None:
@@ -2026,72 +2253,289 @@ class LocomotionPlugin:
         self._publisher = self._node.create_publisher(
             BodyVelCmd, self._config["topics"]["body_velocity"], _RELIABLE
         )
+        self._watchdog_timer = self._node.create_timer(
+            self._watchdog_period, self._stream_health_check
+        )
+
+    def _stream_health_check(self):
+        """Fail closed if the mode changes or the velocity stream stalls."""
+        s = self._stream.snapshot()
+        if not s.active:
+            return
+        motion, _ = self._state.current_motion()
+        if motion not in WALK_MOTION_STATES:
+            self.halt()
+            return
+        if s.last_publish_at is not None:
+            gap = time.monotonic() - s.last_publish_at
+            if gap > self._stream_gap_limit_sec:
+                self.halt()
 
     def stop(self) -> None:
-        self._stream.stop()
+        self.halt()
+
+    def halt(self) -> dict:
+        """Stop physical output without tearing down the plugin."""
+        with self._lifecycle_lock:
+            return self._halt_locked()
+
+    def _halt_locked(self) -> dict:
+        snapshot = self._stream.snapshot()
+        action_id = self._take_active_action()
+        self._command_generation += 1
+        try:
+            stopped = self._halt_stream()
+        except Exception as exc:
+            self._release_failed = True
+            self._release_error = str(exc)
+            if action_id is not None:
+                self._notify_action(action_id, "error", {
+                    "reason": "stop release failed",
+                    "error": str(exc),
+                })
+            return {
+                "state": "error",
+                "error": f"zero velocity release failed: {exc}",
+                "release_failed": True,
+            }
+        self._release_failed = False
+        self._release_error = None
+        completion = (
+            "error"
+            if snapshot.error
+            else ("cancelled" if snapshot.active else "completed")
+        )
+        if action_id is not None:
+            self._notify_action(action_id, completion, {
+                "reason": "stopped",
+                "was_active": stopped,
+                "error": snapshot.error,
+            })
+        return {"state": "stopped", "was_active": stopped}
+
+    def set_interrupt_group(self, group: MotionInterruptGroup) -> None:
+        self._interrupt_group = group
+
+    def motion_active(self) -> bool:
+        with self._lifecycle_lock:
+            with self._action_lock:
+                pending = self._active_action_id is not None
+            return (
+                self._stream.snapshot().active
+                or pending
+                or self._release_failed
+            )
 
     def dispatch(self, action: str, args: dict) -> dict:
+        try:
+            return self._dispatch(action, args)
+        except Exception:
+            self.halt()
+            raise
+
+    def _dispatch(self, action: str, args: dict) -> dict:
         if action == "start":
             return {"state": "ready"}
         if action == "stop":
             self.stop()
             return {"state": "idle"}
         if action == "status" or action == "info":
-            return {"state": "ready", "stream": asdict(self._stream.snapshot())}
+            return {
+                "state": "error" if self._release_failed else "ready",
+                "stream": asdict(self._stream.snapshot()),
+                "release_failed": self._release_failed,
+                "release_error": self._release_error,
+            }
         if action == "stop_move":
-            stopped = self._stream.stop()
-            self._publish_zero()
-            return {"state": "stopped", "was_active": stopped}
+            if self._interrupt_group is not None:
+                group_result = self._interrupt_group.interrupt()
+                result = dict(group_result["outputs"].get("locomotion") or {
+                    "state": group_result["state"],
+                })
+                result["interrupted_outputs"] = group_result["outputs"]
+                return result
+            return self.halt()
         if action not in ("move", "move_displacement", "turn_angle", "arc"):
-            return {"error": f"unknown locomotion action: {action}"}
+            return self._reject_and_halt(f"unknown locomotion action: {action}")
 
         motion, _ = self._state.current_motion()
-        if motion != "walk" and not bool(args.get("force", False)):
-            return {"error": f"move requires motion state 'walk' (current: {motion or 'unknown'})"}
-        open_loop = action != "move"
-        if action == "move":
-            vx = clamp(args.get("vx", 0), -self._limits[0], self._limits[0])
-            vy = clamp(args.get("vy", 0), -self._limits[1], self._limits[1])
-            vyaw = clamp(args.get("vyaw", 0), -self._limits[2], self._limits[2])
-            duration = float(args.get("duration", 1.0))
-        elif action == "move_displacement":
-            x_m = float(args.get("x_m", 0.0))
-            y_m = float(args.get("y_m", 0.0))
-            distance = math.hypot(x_m, y_m)
-            if not math.isfinite(distance) or distance == 0:
-                return {"error": "x_m and y_m must define a non-zero finite displacement"}
-            speed = clamp(abs(args.get("speed_m_s", 0.3)), 0.01, math.hypot(*self._limits[:2]))
-            duration = max(
-                distance / speed,
-                abs(x_m) / self._limits[0] if x_m else 0.0,
-                abs(y_m) / self._limits[1] if y_m else 0.0,
+        if motion not in WALK_MOTION_STATES:
+            return self._reject_and_halt(
+                f"move requires motion state in {WALK_MOTION_STATES} "
+                f"(current: {motion or 'unknown'})"
             )
-            vx = x_m / duration
-            vy = y_m / duration
-            vyaw = 0.0
-        elif action == "turn_angle":
-            angle = float(args.get("angle_rad", 0.0))
-            if not math.isfinite(angle) or angle == 0:
-                return {"error": "angle_rad must be non-zero and finite"}
-            speed = clamp(abs(args.get("angular_speed_rad_s", 0.5)), 0.01, self._limits[2])
-            vyaw = math.copysign(speed, angle)
-            duration = abs(angle) / speed
-            vx = vy = 0.0
-        else:
-            radius = abs(float(args.get("radius_m", 0.0)))
-            angle = float(args.get("angle_rad", 0.0))
-            linear = float(args.get("linear_speed_m_s", 0.3))
-            if not all(math.isfinite(value) for value in (radius, angle, linear)) or radius <= 0 or angle == 0 or linear == 0:
-                return {"error": "radius_m, angle_rad and linear_speed_m_s must be finite and non-zero"}
-            requested_vx = clamp(linear, -self._limits[0], self._limits[0])
-            angular_speed = min(abs(requested_vx) / radius, self._limits[2])
-            vx = math.copysign(angular_speed * radius, requested_vx)
-            vyaw = math.copysign(angular_speed, angle)
-            duration = abs(angle) / angular_speed
-            vy = 0.0
-        snapshot = self._stream.start({"vx": vx, "vy": vy, "vyaw": vyaw}, duration)
-        return {"state": "running" if duration else "stopped", "vx": vx, "vy": vy, "vyaw": vyaw,
-                "duration": duration, "open_loop": open_loop, "stream": asdict(snapshot)}
+        try:
+            command = validate_locomotion_request(
+                action,
+                args,
+                limits=self._limits,
+                max_timed_duration_sec=self._MAX_TIMED_DURATION_SEC,
+            )
+        except ControlValidationError as exc:
+            return self._reject_and_halt(
+                str(exc), code=exc.code
+            )
+        vx = command["vx"]
+        vy = command["vy"]
+        vyaw = command["vyaw"]
+        duration = command["duration"]
+        open_loop = command["open_loop"]
+        with self._lifecycle_lock:
+            if self.motion_active():
+                halt_result = self._halt_locked()
+                if "error" in halt_result:
+                    return {
+                        **halt_result,
+                        "code": "RELEASE_FAILED",
+                    }
+            command_duration = (
+                duration
+                if duration in (-1, 0)
+                else duration + self._prepare_duration_sec
+            )
+            self._command_generation += 1
+            command_generation = self._command_generation
+            action_id = None
+            if (
+                duration not in (-1, 0)
+                and command_duration > self._ACP_MIN_DURATION_SEC
+            ):
+                action_id = f"t800_loco_{uuid4().hex[:12]}"
+                with self._action_lock:
+                    self._active_action_generation += 1
+                    generation = self._active_action_generation
+                    self._active_action_id = action_id
+            snapshot = self._stream.start(
+                {"vx": vx, "vy": vy, "vyaw": vyaw}, command_duration
+            )
+        if action_id is not None:
+            threading.Thread(
+                target=self._monitor_action,
+                args=(action_id, generation, duration),
+                daemon=True,
+                name="t800-loco-acp",
+            ).start()
+        result = {
+            "state": "running" if duration else "stopped",
+            "vx": vx,
+            "vy": vy,
+            "vyaw": vyaw,
+            "duration": duration,
+            "preparation_duration": (
+                self._prepare_duration_sec if duration not in (-1, 0) else 0.0
+            ),
+            "command_duration": command_duration,
+            "open_loop": open_loop,
+            "stream": asdict(snapshot),
+        }
+        if action_id is not None:
+            result["action_id"] = action_id
+        elif duration not in (-1, 0):
+            return self._wait_synchronous_action(result, command_generation)
+        return result
+
+    def _reject_and_halt(self, error: str, *, code: str = "INVALID_ARGUMENT") -> dict:
+        self.halt()
+        return {"error": error, "code": code}
+
+    def _halt_stream(self) -> bool:
+        stopped = self._stream.stop()
+        if not stopped:
+            self._publish_zero()
+        return stopped
+
+    def _monitor_action(
+        self,
+        action_id: str,
+        generation: int,
+        effective_duration: float,
+    ) -> None:
+        while True:
+            with self._action_lock:
+                if (
+                    self._active_action_id != action_id
+                    or self._active_action_generation != generation
+                ):
+                    return
+            snapshot = self._stream.snapshot()
+            if not snapshot.active:
+                if (
+                    snapshot.error
+                    and snapshot.error.startswith("stop publish failed:")
+                ):
+                    with self._lifecycle_lock:
+                        self._release_failed = True
+                        self._release_error = snapshot.error
+                status = "error" if snapshot.error else "completed"
+                self._finish_active_action(status, {
+                    "duration": effective_duration,
+                    "preparation_duration": self._prepare_duration_sec,
+                    "error": snapshot.error,
+                }, expected_action_id=action_id)
+                return
+            time.sleep(0.01)
+
+    def _finish_active_action(
+        self,
+        status: str,
+        result: dict,
+        *,
+        expected_action_id: str | None = None,
+    ) -> None:
+        action_id = self._take_active_action(expected_action_id)
+        if action_id is None:
+            return
+        self._notify_action(action_id, status, result)
+
+    def _take_active_action(
+        self, expected_action_id: str | None = None
+    ) -> str | None:
+        with self._action_lock:
+            action_id = self._active_action_id
+            if action_id is None:
+                return None
+            if expected_action_id is not None and action_id != expected_action_id:
+                return None
+            self._active_action_id = None
+            return action_id
+
+    def _notify_action(self, action_id: str, status: str, result: dict) -> None:
+        threading.Thread(
+            target=self._acp_notify,
+            args=(action_id, status, dict(result), "loco"),
+            daemon=True,
+            name="t800-loco-acp-notify",
+        ).start()
+
+    def _wait_synchronous_action(
+        self, result: dict, command_generation: int
+    ) -> dict:
+        while True:
+            with self._lifecycle_lock:
+                if self._command_generation != command_generation:
+                    return {
+                        **result,
+                        "state": "cancelled",
+                        "stream": asdict(self._stream.snapshot()),
+                    }
+            snapshot = self._stream.snapshot()
+            if not snapshot.active:
+                if snapshot.error:
+                    if snapshot.error.startswith("stop publish failed:"):
+                        with self._lifecycle_lock:
+                            self._release_failed = True
+                            self._release_error = snapshot.error
+                    return {
+                        "error": snapshot.error,
+                        "code": "COMMAND_FAILED",
+                        "stream": asdict(snapshot),
+                    }
+                return {
+                    **result,
+                    "state": "completed",
+                    "stream": asdict(snapshot),
+                }
+            time.sleep(0.01)
 
     def _publish_payload(self, payload: dict) -> None:
         if self._publisher is None:
@@ -2113,10 +2557,10 @@ class MotionModePlugin:
         "idle": "idle",
         "passive": "passive",
         "stand": "pd_stand",
-        "walk": "walk",
+        "walk": "rl_basic",
         "dance": "dance",
-        "get_up": "supine_to_stance",
-        "lie_down": "stance_to_supine",
+        "get_up": "rl_mimic_supine_to_stance",
+        "lie_down": "rl_mimic_stance_to_supine",
     }
     def __init__(self, config: dict, namespace: str, ros2, state: StatePlugin):
         self._config = config
@@ -2240,7 +2684,7 @@ class DancePlugin:
         if action == "play":
             target = str(args.get("name", "dance"))
         elif action == "stop_dance":
-            target = str(args.get("target", "walk"))
+            target = str(args.get("target", "rl_basic"))
         else:
             return {"error": f"unknown dance action: {action}"}
         forwarded = dict(args)
@@ -2248,8 +2692,16 @@ class DancePlugin:
         return self._motion_mode.dispatch("switch", forwarded)
 
 
+_JOINT_PLAN_COMPLETED_PROGRESS_MIN = 0.999
+
+
 class JointPlanPlugin:
     _LIMIT_MARGIN_RAD = 0.0
+    # The native planner converges to values such as 0.999838584 instead of
+    # publishing an exact 1.0.  Treat that as complete only together with the
+    # exact request id and IDLE status, so the initial progress=0 IDLE echo
+    # cannot complete a request before it executes.
+    _COMPLETED_PROGRESS_MIN = _JOINT_PLAN_COMPLETED_PROGRESS_MIN
     _PRESETS = {
         "shake_hand": {
             "indices": list(range(12, 25)),
@@ -2277,6 +2729,7 @@ class JointPlanPlugin:
         self._last_state = {"state": "no_data"}
         self._last_request = {}
         self._executing_requests: set[int] = set()
+        self._quiescent_requests: deque[int] = deque(maxlen=128)
         self._request_id = 0
         self._state_type = None
         self._head_lock = threading.Lock()
@@ -2469,12 +2922,11 @@ class JointPlanPlugin:
                     raise RuntimeError("gesture cancelled")
                 state = dict(self._last_state)
                 current_id = state.get("request_id")
-                status = int(state.get("status", -1))
-                if (
-                    current_id is not None
-                    and int(current_id) == target
-                    and target in self._executing_requests
-                    and status == idle
+                if self._is_completed_idle_feedback(
+                    state,
+                    request_id=target,
+                    idle_status=idle,
+                    saw_executing=target in self._executing_requests,
                 ):
                     self._executing_requests.discard(target)
                     return state
@@ -2484,6 +2936,48 @@ class JointPlanPlugin:
                 if remaining <= 0:
                     raise TimeoutError(f"joint planner did not complete request {target}")
                 self._state_changed.wait(timeout=min(remaining, 0.2))
+
+    def request_is_quiescent(self, request_id: int, state: dict) -> bool:
+        """Return whether exact feedback proves the request is no longer active."""
+        target = int(request_id)
+        with self._state_lock:
+            saw_executing = (
+                target in self._executing_requests
+                or target in self._quiescent_requests
+            )
+        return self._is_completed_idle_feedback(
+            state,
+            request_id=target,
+            idle_status=int(self._state_type.IDLE),
+            saw_executing=saw_executing,
+        )
+
+    @classmethod
+    def _is_completed_idle_feedback(
+        cls,
+        state: dict,
+        *,
+        request_id: int,
+        idle_status: int,
+        saw_executing: bool,
+    ) -> bool:
+        try:
+            exact_request = int(state.get("request_id")) == int(request_id)
+            status = int(state.get("status", -1))
+            progress = float(state.get("progress", 0.0))
+        except (TypeError, ValueError):
+            return False
+        return (
+            exact_request
+            and status == int(idle_status)
+            and (
+                saw_executing
+                or (
+                    math.isfinite(progress)
+                    and progress >= cls._COMPLETED_PROGRESS_MIN
+                )
+            )
+        )
 
     def acquire_head(self, owner: str) -> dict | None:
         with self._head_lock:
@@ -2639,6 +3133,19 @@ class JointPlanPlugin:
             self._last_state = payload
             if self._state_type is not None and int(msg.status) == int(self._state_type.EXECUTING):
                 self._executing_requests.add(int(msg.request_id))
+            if (
+                self._state_type is not None
+                and self._is_completed_idle_feedback(
+                    payload,
+                    request_id=payload["request_id"],
+                    idle_status=int(self._state_type.IDLE),
+                    saw_executing=(
+                        payload["request_id"] in self._executing_requests
+                    ),
+                )
+                and payload["request_id"] not in self._quiescent_requests
+            ):
+                self._quiescent_requests.append(payload["request_id"])
             self._state_changed.notify_all()
         if payload["status"] in (0, 1, 3):
             with self._head_lock:
@@ -2653,12 +3160,79 @@ class JointPlanPlugin:
                     # 释放，否则锁会永久泄漏，后续所有 head 动作都报 head is busy。
                     if (
                         payload["status"] in (0, 3)
-                        or payload["request_id"] in self._executing_requests
+                        or self._is_completed_idle_feedback(
+                            payload,
+                            request_id=payload["request_id"],
+                            idle_status=int(self._state_type.IDLE),
+                            saw_executing=(
+                                payload["request_id"]
+                                in self._executing_requests
+                            ),
+                        )
                     ):
                         self._head_owner = None
                         self._head_request_id = None
                         self._executing_requests.discard(payload["request_id"])
         self._core_pub.publish(_json_message(payload))
+
+
+class MotionInterruptGroup:
+    """Coordinate same-device motion hooks before Agent Core clears ACP."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._callbacks: dict[
+            str,
+            tuple[Callable[[], dict], Callable[[], bool] | None],
+        ] = {}
+        self._interrupting = False
+
+    def register(
+        self,
+        name: str,
+        callback: Callable[[], dict],
+        is_active: Callable[[], bool] | None = None,
+    ) -> None:
+        with self._lock:
+            self._callbacks[str(name)] = (callback, is_active)
+
+    def interrupt(self) -> dict:
+        with self._lock:
+            if self._interrupting:
+                return {"state": "already_interrupting", "outputs": {}}
+            self._interrupting = True
+            callbacks = list(self._callbacks.items())
+        results = {}
+        try:
+            for name, (callback, _is_active) in callbacks:
+                try:
+                    results[name] = callback()
+                except Exception as exc:
+                    results[name] = {"error": str(exc)}
+        finally:
+            with self._lock:
+                self._interrupting = False
+        return {"state": "interrupted", "outputs": results}
+
+    @staticmethod
+    def _active_outputs(callbacks: list) -> list[str]:
+        active = []
+        for name, (_callback, is_active) in callbacks:
+            if is_active is None:
+                continue
+            try:
+                if is_active():
+                    active.append(name)
+            except Exception:
+                active.append(name)
+        return active
+
+    def blocking_outputs(self) -> list[str]:
+        with self._lock:
+            if self._interrupting:
+                return list(self._callbacks)
+            callbacks = list(self._callbacks.items())
+        return self._active_outputs(callbacks)
 
 
 class HeadActuatorPlugin:
@@ -2673,6 +3247,7 @@ class HeadActuatorPlugin:
     _ACP_TIMEOUT_SEC = 90.0          # 对外完成超时下限；实际值按最坏序列推导
     _ACP_CALLBACK_TIMEOUT_SEC = 5.0
     _READY_TIMEOUT_SEC = 10.0
+    _STOP_JOIN_TIMEOUT_SEC = 0.0
     _FEEDBACK_GRACE_MAX_SEC = 5.0    # 每个运动步的反馈等待余量上限
     _ACP_SAFETY_MARGIN_SEC = 5.0     # 最坏序列之上的安全余量
     _DEFAULT_LOOK_POSES = {
@@ -2696,6 +3271,11 @@ class HeadActuatorPlugin:
         self._cancel = threading.Event()
         self._thread: threading.Thread | None = None
         self._active_request_id: int | None = None
+        self._cancel_failed = False
+        self._cancel_pending = False
+        self._cancel_request_id: int | None = None
+        self._cancel_generation = 0
+        self._interrupt_group: MotionInterruptGroup | None = None
         self._status = {"state": "idle", "action": None, "step": 0, "total_steps": 0}
         self._validate_head_config()
 
@@ -2830,6 +3410,9 @@ class HeadActuatorPlugin:
                 math.ceil(self._worst_case_duration_sec() + self._ACP_SAFETY_MARGIN_SEC),
             ),
         }
+        schema["x-hooks"] = {
+            "on_interrupt_motion": {"action": "stop"},
+        }
         return {
             "name": "head",
             "type": "actuator",
@@ -2844,12 +3427,30 @@ class HeadActuatorPlugin:
     def stop(self) -> None:
         self._stop_action()
 
+    def halt(self) -> dict:
+        """Cancel head motion without tearing down the plugin."""
+        return self._stop_action()
+
+    def set_interrupt_group(self, group: MotionInterruptGroup) -> None:
+        self._interrupt_group = group
+
+    def motion_active(self) -> bool:
+        with self._lock:
+            return (
+                (self._thread is not None and self._thread.is_alive())
+                or self._cancel_failed
+                or self._cancel_pending
+            )
+
     def dispatch(self, action: str, args: dict) -> dict:
         if action in ("start", "info"):
             return {"state": "ready", "limits_rad": self._limits()}
         if action == "status":
             with self._lock:
                 result = dict(self._status)
+                result["cancel_failed"] = self._cancel_failed
+                result["cancel_pending"] = self._cancel_pending
+                result["cancel_request_id"] = self._cancel_request_id
             positions = self._state.joint_positions()
             if len(positions) > 24:
                 result["angles_rad"] = {"pitch": positions[23], "yaw": positions[24]}
@@ -2858,6 +3459,14 @@ class HeadActuatorPlugin:
             result.update({key: value for key, value in self._joint_plan.head_status().items() if value is not None})
             return result
         if action == "stop":
+            if self._interrupt_group is not None:
+                group_result = self._interrupt_group.interrupt()
+                result = {"state": "idle"}
+                head_result = group_result["outputs"].get("head")
+                if isinstance(head_result, dict) and "cancel_result" in head_result:
+                    result["cancel_result"] = head_result["cancel_result"]
+                result["interrupted_outputs"] = group_result["outputs"]
+                return result
             self._stop_action()
             return {"state": "idle"}
         if action == "nod":
@@ -2978,6 +3587,11 @@ class HeadActuatorPlugin:
 
     def _start_sequence(self, action: str, steps: list[dict], args: dict) -> dict:
         with self._lock:
+            if self._cancel_failed or self._cancel_pending:
+                return {
+                    "error": "previous head cancel is not yet quiescent; retry stop",
+                    "request_id": self._cancel_request_id,
+                }
             if self._thread is not None and self._thread.is_alive():
                 current = dict(self._status)
                 current.pop("action_id", None)
@@ -3023,9 +3637,7 @@ class HeadActuatorPlugin:
                         self._status["request"] = result
                         cancelled = self._cancel.is_set()
                     if cancelled:
-                        self._joint_plan._dispatch_owned(
-                            "head", "cancel", {"request_id": request_id}
-                        )
+                        self._request_cancel(request_id)
                         break
                     timeout = step["duration"] + float(self._config.get("feedback_grace_sec", 1.0))
                     self._joint_plan.wait_for_request(request_id, timeout, self._cancel)
@@ -3045,9 +3657,7 @@ class HeadActuatorPlugin:
                 # 下一个 head 动作可能拿到锁并与仍在执行的轨迹并发。
                 # cancelled=True 时 cancel 已由 _stop_action 或 worker 自身发出。
                 if not cancelled and active_request_id is not None:
-                    self._joint_plan._dispatch_owned(
-                        "head", "cancel", {"request_id": active_request_id}
-                    )
+                    self._request_cancel(active_request_id)
             finally:
                 with self._lock:
                     final_status = str(self._status.get("state", "error"))
@@ -3081,18 +3691,94 @@ class HeadActuatorPlugin:
             "detail": "head sequence started; completion is reported by action_id",
         }
 
-    def _stop_action(self) -> None:
+    def _stop_action(self) -> dict:
         with self._lock:
             self._cancel.set()
-            request_id = self._status.get("request_id")
+            request_id = self._active_request_id
             thread = self._thread
             if thread is not None and thread.is_alive():
                 self._status["state"] = "cancelled"
                 self._status["error"] = ""
+            elif request_id is None:
+                request_id = self._cancel_request_id
+            result = dict(self._status)
         if request_id is not None:
-            self._joint_plan._dispatch_owned("head", "cancel", {"request_id": request_id})
+            result["cancel_result"] = self._request_cancel(int(request_id))
         if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=2.0)
+            thread.join(timeout=self._STOP_JOIN_TIMEOUT_SEC)
+        return result
+
+    def _request_cancel(self, request_id: int) -> dict:
+        try:
+            result = self._joint_plan._dispatch_owned(
+                "head", "cancel", {"request_id": int(request_id)}
+            )
+        except Exception as exc:
+            result = {"error": f"head cancel failed: {exc}"}
+        failed = "error" in result
+        with self._lock:
+            self._cancel_failed = failed
+            self._cancel_pending = self._interrupt_group is not None
+            self._cancel_request_id = (
+                int(request_id) if self._cancel_pending else None
+            )
+        if self._interrupt_group is not None:
+            self._start_cancel_monitor(int(request_id))
+        return result
+
+    def _start_cancel_monitor(self, request_id: int) -> None:
+        with self._lock:
+            self._cancel_generation += 1
+            generation = self._cancel_generation
+        threading.Thread(
+            target=self._monitor_cancel,
+            args=(int(request_id), generation),
+            daemon=True,
+            name="t800-head-cancel-monitor",
+        ).start()
+
+    def _monitor_cancel(self, request_id: int, generation: int) -> None:
+        deadline = time.monotonic() + self._READY_TIMEOUT_SEC
+        timeout_reported = False
+        while True:
+            with self._lock:
+                if (
+                    generation != self._cancel_generation
+                    or self._cancel_request_id != request_id
+                    or not self._cancel_pending
+                ):
+                    return
+            try:
+                status = self._joint_plan.dispatch("status", {})
+            except Exception as exc:
+                status = {"error": str(exc)}
+            if (
+                int(status.get("request_id", -1)) == request_id
+                and int(status.get("status", -1)) == 1
+            ):
+                with self._lock:
+                    if (
+                        generation == self._cancel_generation
+                        and self._cancel_request_id == request_id
+                    ):
+                        self._cancel_pending = False
+                        self._cancel_failed = False
+                        self._cancel_request_id = None
+                        if self._status.get("state") == "cancelled":
+                            self._status["error"] = ""
+                return
+            if time.monotonic() >= deadline and not timeout_reported:
+                with self._lock:
+                    if (
+                        generation == self._cancel_generation
+                        and self._cancel_request_id == request_id
+                    ):
+                        self._cancel_failed = True
+                        self._status["error"] = (
+                            "head cancel is still awaiting planner idle"
+                        )
+                timeout_reported = True
+            time.sleep(0.05)
 
 
 class GesturePlugin:
@@ -3102,7 +3788,10 @@ class GesturePlugin:
     _LIMIT_MARGIN_RAD = 0.02
     _READY_TIMEOUT_SEC = 10.0
     _STEP_TIMEOUT_SEC = 15.0
-    _STOP_JOIN_TIMEOUT_SEC = 3.0
+    # Interrupt hooks must return promptly.  The non-blocking join observes an
+    # already-finished worker only; a live worker retains its planner lease and
+    # keeps the bundle motion gate closed through motion_active().
+    _STOP_JOIN_TIMEOUT_SEC = 0.0
     _COOLDOWN_SEC = 3.0
     _ACP_TIMEOUT_SEC = 300.0
     _ACP_CALLBACK_TIMEOUT_SEC = 5.0
@@ -3155,7 +3844,12 @@ class GesturePlugin:
         self._joint_plan = joint_plan
         self._lock = threading.Lock()
         self._cancel = threading.Event()
+        self._cancel_failed = False
+        self._cancel_pending = False
+        self._cancel_request_id: int | None = None
+        self._cancel_generation = 0
         self._thread: threading.Thread | None = None
+        self._interrupt_group: MotionInterruptGroup | None = None
         self._last_finished_at: float | None = None
         self._status = {
             "state": "idle", "gesture": None, "step": 0, "step_name": None,
@@ -3167,7 +3861,7 @@ class GesturePlugin:
             "list": ([], "列出内置手势及步数"),
             "play": (["name", "repetitions", "reset_after", "force"], "异步播放一次实机验证手势"),
             "sequence": (["steps", "reset_after", "force"], "异步执行经过关节限位校验的自定义序列"),
-            "stop_gesture": (["reset_after"], "取消当前步骤并停止手势"),
+            "stop_gesture": (["reset_after"], "取消当前步骤并停止手势；不会启动新的复位动作"),
             "status": ([], "查询手势、步骤和错误"),
         })
         actions["stop"] = (["reset_after"], "停止当前手势并进入空闲状态")
@@ -3192,6 +3886,9 @@ class GesturePlugin:
             "actions": ["play", "sequence"],
             "timeout": int(self._ACP_TIMEOUT_SEC),
         }
+        schema["x-hooks"] = {
+            "on_interrupt_motion": {"action": "stop_gesture"},
+        }
         return {
             "name": "gesture",
             "type": "actuator",
@@ -3205,6 +3902,21 @@ class GesturePlugin:
 
     def stop(self) -> None:
         self._stop(reset_after=False)
+
+    def halt(self) -> dict:
+        """Cancel the active motion without tearing down the plugin."""
+        return self._stop(reset_after=False)
+
+    def set_interrupt_group(self, group: MotionInterruptGroup) -> None:
+        self._interrupt_group = group
+
+    def motion_active(self) -> bool:
+        with self._lock:
+            return (
+                (self._thread is not None and self._thread.is_alive())
+                or self._cancel_failed
+                or self._cancel_pending
+            )
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action in ("start", "info", "list"):
@@ -3228,6 +3940,9 @@ class GesturePlugin:
         if action == "status":
             with self._lock:
                 result = dict(self._status)
+                result["cancel_failed"] = self._cancel_failed
+                result["cancel_pending"] = self._cancel_pending
+                result["cancel_request_id"] = self._cancel_request_id
                 if self._last_finished_at is None:
                     result["cooldown_remaining_sec"] = 0.0
                 else:
@@ -3236,10 +3951,32 @@ class GesturePlugin:
                     )
                 return result
         if action == "stop":
-            self._stop(reset_after=bool(args.get("reset_after", False)))
-            return {"state": "idle"}
+            stopped = self._stop(reset_after=False)
+            result = {"state": "idle"}
+            if "cancel_result" in stopped:
+                result["cancel_result"] = stopped["cancel_result"]
+            if bool(args.get("reset_after", False)):
+                result["reset_after_ignored"] = True
+                result["reset_after_reason"] = (
+                    "stop actions do not start untracked reset motion"
+                )
+            return result
         if action == "stop_gesture":
-            return self._stop(reset_after=bool(args.get("reset_after", False)))
+            reset_after = bool(args.get("reset_after", False))
+            if self._interrupt_group is not None:
+                group_result = self._interrupt_group.interrupt()
+                result = dict(group_result["outputs"].get("gesture") or {
+                    "state": group_result["state"],
+                })
+                result["interrupted_outputs"] = group_result["outputs"]
+            else:
+                result = self._stop(reset_after=False)
+            if reset_after:
+                result["reset_after_ignored"] = True
+                result["reset_after_reason"] = (
+                    "interrupt actions do not start untracked reset motion"
+                )
+            return result
         if action in ("play", "sequence") and bool(args.get("wait", False)):
             return {
                 "error": "wait=true is not supported for asynchronous gesture actions; "
@@ -3364,6 +4101,11 @@ class GesturePlugin:
     def _start_sequence(self, label: str, steps: list[dict], *, reset_after: bool) -> dict:
         controls_head = reset_after or any(self._step_controls_head(step) for step in steps)
         with self._lock:
+            if self._cancel_failed or self._cancel_pending:
+                return {
+                    "error": "previous gesture cancel is not yet quiescent; retry stop_gesture",
+                    "request_id": self._cancel_request_id,
+                }
             if self._thread is not None and self._thread.is_alive():
                 current = dict(self._status)
                 current.pop("action_id", None)
@@ -3431,7 +4173,7 @@ class GesturePlugin:
             except Exception as exc:
                 cancelled = self._cancel.is_set()
                 if request_id is not None:
-                    self._joint_plan._dispatch_owned("gesture", "cancel", {"request_id": request_id})
+                    self._request_cancel(request_id)
                 with self._lock:
                     self._status["state"] = "cancelled" if cancelled else "error"
                     self._status["error"] = "" if cancelled else str(exc)
@@ -3450,10 +4192,7 @@ class GesturePlugin:
                 if controls_head:
                     self._joint_plan.release_head("gesture")
                 if action_id is not None:
-                    _notify_acp_completion(
-                        "gesture", action_id, final_status, final_result,
-                        GesturePlugin._ACP_CALLBACK_TIMEOUT_SEC,
-                    )
+                    self._acp_notify(action_id, final_status, final_result)
 
         thread = threading.Thread(target=run, daemon=True, name="t800-gesture-sequence")
         with self._lock:
@@ -3486,31 +4225,112 @@ class GesturePlugin:
                 self._status["error"] = ""
                 request_id = self._status.get("request_id")
             else:
-                request_id = None
+                request_id = self._cancel_request_id
             result = dict(self._status)
         if request_id is not None:
-            self._joint_plan._dispatch_owned("gesture", "cancel", {"request_id": request_id})
+            result["cancel_result"] = self._request_cancel(int(request_id))
         # 必须等 worker 退出后再释放 head 锁，否则 worker 可能已通过取消检查、
         # 正准备调用 _dispatch_owned，与新拿到锁的 head 动作竞态（迟到的手势
-        # 请求会报 head is busy 或与新动作并发）。head 锁统一由 worker 的
-        # finally 块释放，这里不提前 release。
+        # 请求会报 head is busy 或与新动作并发）。这里只做有界等待；若 worker
+        # 尚未退出，不提前释放 head 锁，motion_active 也会继续关闭整机运动门。
         if active and thread is not threading.current_thread():
             thread.join(timeout=self._STOP_JOIN_TIMEOUT_SEC)
-            if thread.is_alive():
-                # worker 卡死（极端情况），兜底释放避免永久死锁；release_head
-                # 有 owner 校验，worker 之后迟到的释放不会误伤新 owner。
-                self._joint_plan.release_head("gesture")
         if reset_after:
-            # worker 已退出，reset 作为直接请求派发，由 _on_state 终态释放锁
-            self._joint_plan.dispatch("reset", {})
+            # Interrupt/lifecycle stop must not launch untracked reset motion.
+            result["reset_after_ignored"] = True
+        return result
+
+    def _request_cancel(self, request_id: int) -> dict:
+        try:
+            result = self._joint_plan._dispatch_owned(
+                "gesture", "cancel", {"request_id": int(request_id)}
+            )
+        except Exception as exc:
+            result = {"error": f"gesture cancel failed: {exc}"}
+            with self._lock:
+                self._cancel_failed = True
+                self._cancel_pending = True
+                self._cancel_request_id = int(request_id)
+        else:
+            with self._lock:
+                self._cancel_failed = False
+                self._cancel_pending = self._interrupt_group is not None
+                self._cancel_request_id = (
+                    int(request_id) if self._cancel_pending else None
+                )
+        if self._interrupt_group is not None:
+            self._start_cancel_monitor(int(request_id))
+        return result
+
+    def _start_cancel_monitor(self, request_id: int) -> None:
         with self._lock:
-            self._status["state"] = "cancelled"
-            return dict(self._status)
+            self._cancel_generation += 1
+            generation = self._cancel_generation
+        threading.Thread(
+            target=self._monitor_cancel,
+            args=(int(request_id), generation),
+            daemon=True,
+            name="t800-gesture-cancel-monitor",
+        ).start()
+
+    def _monitor_cancel(self, request_id: int, generation: int) -> None:
+        deadline = time.monotonic() + self._STEP_TIMEOUT_SEC
+        timeout_reported = False
+        while True:
+            with self._lock:
+                if (
+                    generation != self._cancel_generation
+                    or self._cancel_request_id != request_id
+                    or not self._cancel_pending
+                ):
+                    return
+            try:
+                status = self._joint_plan.dispatch("status", {})
+            except Exception as exc:
+                status = {"error": str(exc)}
+            if (
+                int(status.get("request_id", -1)) == request_id
+                and int(status.get("status", -1)) == 1
+            ):
+                with self._lock:
+                    if (
+                        generation == self._cancel_generation
+                        and self._cancel_request_id == request_id
+                    ):
+                        self._cancel_pending = False
+                        self._cancel_failed = False
+                        self._cancel_request_id = None
+                        if self._status.get("state") == "cancelled":
+                            self._status["error"] = ""
+                return
+            if time.monotonic() >= deadline and not timeout_reported:
+                with self._lock:
+                    if (
+                        generation == self._cancel_generation
+                        and self._cancel_request_id == request_id
+                    ):
+                        self._cancel_failed = True
+                        self._status["error"] = (
+                            "gesture cancel is still awaiting planner idle"
+                        )
+                timeout_reported = True
+            time.sleep(0.05)
+
+    @staticmethod
+    def _acp_notify(action_id: str, status: str, result: dict) -> None:
+        """Report asynchronous gesture completion to Agent Core."""
+        _notify_acp_completion(
+            "gesture", action_id, status, result,
+            GesturePlugin._ACP_CALLBACK_TIMEOUT_SEC,
+        )
 
 
 class _JointStreamBase:
     def stop(self) -> None:
         self._stream.stop()
+
+    def halt(self) -> None:
+        self.stop()
 
     def _status(self) -> dict:
         return {"state": "ready", "stream": asdict(self._stream.snapshot())}
@@ -3995,7 +4815,11 @@ class SafetyControlPlugin:
         for control in self._controls:
             if action == "soft_stop" and not isinstance(control, LocomotionPlugin):
                 continue
-            control.stop()
+            halt = getattr(control, "halt", None)
+            if callable(halt):
+                halt()
+            else:
+                control.stop()
             stopped_streams.append(type(control).__name__)
         self._publish_zero_velocity()
         if action == "soft_stop":
@@ -4234,6 +5058,442 @@ class MicPlugin:
         return {"error": f"unknown mic action: {action}"}
 
 
+class SpeakerPlugin:
+    """Canvas PCM sink that plays through the T800 built-in speaker.
+
+    按众擎飞书《ROS2 接口开发文档》第8章实现：回放走官方 ALSA 接口
+    ``aplay``（8.2.2，``-t raw`` 从 stdin 流式播放 PCM-16 16 kHz 单声道），
+    系统音量走官方 ``pactl`` 接口（8.2.3 / 8.3.1，0-100）。画布 / Agent
+    Core 把音频文件与用户 mic 统一转成 ``audio/pcm-16k`` 块流（与 G1
+    speaker 契约一致）发布到 topic_in，本卡写入 aplay stdin 经内置喇叭
+    播放。
+    """
+
+    PREFIX = "speaker"
+    _EOF_MAGIC = b"\x01\x00\xff\xff\x01\x00\xff\xff"  # G1 契约：utterance 结束标记
+
+    def __init__(self, config: dict, namespace: str, ros2):
+        self._node = Node("t800_speaker", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._node)
+        self._subscription = None
+        self._input_topic = ""
+        self._state = "idle"
+        self._last_error = ""
+        self._process = None
+        # 实时音频滑动窗口：队列上限限制最大滞后（50 块 × 1024B ≈ 1.6s）。
+        # remote_mic 等持续流若发布速率高于播放速率，满时丢最旧块而非新块，
+        # 保证播放的是最新内容而非永远滞后的积压数据。
+        self._queue = queue.Queue(maxsize=50)
+        self._thread = None
+        self._startup_thread: threading.Thread | None = None
+        self._startup_cancel = threading.Event()
+        self._startup_action_id: str | None = None
+        self._startup_wait = lambda event, seconds: event.wait(seconds)
+        self._clock = time.monotonic
+        self._acp_notify = _t800_acp_notify
+        self._interrupt_group: MotionInterruptGroup | None = None
+        self._running = False
+        self._session = 0
+        self._lifecycle_lock = threading.RLock()
+        self._chunks_played = 0
+        self._dropped = 0
+        self._last_chunk_time = 0.0
+
+    def get_tool(self) -> dict:
+        schema = {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["start", "stop", "info", "get_volume", "set_volume"],
+                },
+                "input_topic": {
+                    "type": "string",
+                    "description": "画布连接提供的 ROS2 PCM 音频 topic",
+                },
+                "volume": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100,
+                    "description": "系统音量 0-100（官方 pactl 接口）",
+                },
+            },
+            "required": ["action"],
+            "x-action-params": {
+                "start": {
+                    "params": ["input_topic"],
+                    "description": "完整播放 G1 开机音后订阅画布音频 topic",
+                },
+                "stop": {"params": [], "description": "停止播放并释放订阅"},
+                "info": {"params": [], "description": "查询播放状态、缓冲与计数"},
+                "get_volume": {
+                    "params": [],
+                    "description": "查询机器人喇叭系统音量（官方 pactl 接口）",
+                },
+                "set_volume": {
+                    "params": ["volume"],
+                    "description": (
+                        "设置机器人喇叭系统音量 0-100（官方 pactl 接口）"
+                    ),
+                },
+            },
+            "x-completion": {
+                "actions": ["start"],
+                "timeout": 30,
+            },
+            "x-hooks": {
+                "on_interrupt_speak": {"action": "stop"},
+            },
+        }
+        return {
+            "name": "speaker",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "T800 speaker — 订阅画布连接的 PCM-16k 音频流，经官方 ALSA aplay "
+                           "接口流式播放到机器人喇叭；音量经官方 pactl 接口控制",
+            "inputSchema": schema,
+            "topic_in": [{"format": "audio/pcm-16k"}],
+        }
+
+    def start(self) -> None:
+        pass  # 播放经 dispatch(start) 按画布连接的 input_topic 启动
+
+    def stop(self) -> None:
+        with self._lifecycle_lock:
+            self._stop_locked()
+
+    def halt(self) -> dict:
+        self.stop()
+        return {"state": "idle"}
+
+    def set_interrupt_group(self, group: MotionInterruptGroup) -> None:
+        self._interrupt_group = group
+
+    def motion_active(self) -> bool:
+        with self._lifecycle_lock:
+            return self._startup_action_id is not None
+
+    def _stop_locked(self) -> None:
+        self._running = False
+        self._startup_cancel.set()
+        self._session += 1  # 使旧播放线程失效，防止其状态更新覆盖新会话
+        if self._subscription is not None:
+            self._node.destroy_subscription(self._subscription)
+            self._subscription = None
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+        process = self._process
+        self._process = None
+        if process is not None:
+            try:
+                if process.stdin is not None:
+                    process.stdin.close()
+            except Exception:
+                pass  # 已退出的 aplay 可能已关闭/回收 stdin
+            try:
+                if process.poll() is None:
+                    process.terminate()
+            except Exception:
+                try:
+                    if process.poll() is None:
+                        process.kill()
+                except Exception:
+                    pass  # stop 必须对已消失或已回收的进程幂等
+            threading.Thread(
+                target=self._reap_process,
+                args=(process,),
+                daemon=True,
+                name="t800-speaker-reap",
+            ).start()
+        thread = self._thread
+        # Session ownership makes stale player/startup workers harmless; an
+        # interrupt hook must not join them before returning to Agent Core.
+        self._thread = None
+        # Do not join the startup worker while holding _lifecycle_lock: its
+        # final state/ACP cleanup also takes this lock. Session ownership and
+        # startup_cancel prevent it from touching a replacement player.
+        self._startup_thread = None
+        self._startup_action_id = None
+        self._input_topic = ""
+        self._state = "idle"
+
+    @staticmethod
+    def _reap_process(process) -> None:
+        try:
+            process.wait(timeout=1)
+        except Exception:
+            try:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=1)
+            except Exception:
+                pass
+
+    def _spawn_player(self):
+        # 官方 8.2.2：aplay 回放；-t raw 表示从 stdin 流式读原始 PCM。
+        # 默认设备已路由到 PulseAudio（/etc/asound.conf），--buffer-time/
+        # --period-time 压低 aplay 读前缓冲（默认 500ms 会让 remote_mic
+        # 等实时音频源产生明显延迟），PulseAudio 侧延迟由 PULSE_LATENCY_MSEC 控制。
+        return subprocess.Popen(
+            ["aplay", "-q", "-t", "raw", "-f", "S16_LE", "-r", "16000", "-c", "1",
+             "--buffer-time=100000", "--period-time=20000", "-"],
+            stdin=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
+        )
+
+    def _check_pulse(self) -> None:
+        subprocess.run(["pactl", "info"], capture_output=True, text=True, timeout=3, check=True)
+
+    def _run_command(self, command: list[str]) -> str:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=10, check=True)
+        return result.stdout.strip()
+
+    def _get_volume(self) -> int:
+        out = self._run_command(["pactl", "get-sink-volume", "@DEFAULT_SINK@"])
+        match = re.search(r"(\d+)%", out)
+        if match is None:
+            raise RuntimeError(f"cannot parse pactl volume output: {out!r}")
+        return int(match.group(1))
+
+    def _set_volume(self, volume) -> int:
+        value = int(clamp(volume, 0, 100))
+        self._run_command(["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{value}%"])
+        return value
+
+    def _start_play(self, topic: str) -> dict:
+        with self._lifecycle_lock:
+            return self._start_play_locked(topic)
+
+    def _start_play_locked(self, topic: str) -> dict:
+        self._stop_locked()
+        from audio_msgs.msg import AudioChunk
+        # 每个播放会话拥有独立队列。旧回调/播放线程/开机音线程即使在
+        # stop() 后才恢复执行，也只能访问旧队列，不能污染或消费新会话。
+        self._queue = queue.Queue(maxsize=50)
+        live_queue = self._queue
+        session = self._session  # stop() 已递增,捕获当前会话
+        try:
+            self._check_pulse()
+            self._run_command(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "0"])
+            self._process = self._spawn_player()
+            self._input_topic = topic
+        except Exception as exc:
+            self._stop_locked()
+            self._last_error = str(exc)
+            return {"state": "error", "message": f"speaker playback failed: {exc}"}
+        if self._process is None or self._process.poll() is not None:
+            code = self._process.returncode if self._process is not None else "unknown"
+            self._last_error = f"aplay exited with code {code}"
+            self._stop_locked()
+            return {"state": "error", "message": self._last_error}
+        process = self._process  # 捕获当前进程供播放线程独占持有
+        action_id = f"t800_speaker_start_{uuid4().hex[:12]}"
+        self._startup_cancel = threading.Event()
+        startup_cancel = self._startup_cancel
+        self._startup_action_id = action_id
+        self._state = "starting"
+
+        def finish_startup() -> None:
+            completion = "completed"
+            error = None
+            try:
+                self._play_full_startup_sound(
+                    session, process, startup_cancel
+                )
+                with self._lifecycle_lock:
+                    if startup_cancel.is_set() or self._session != session:
+                        completion = "cancelled"
+                        return
+                    self._subscription = self._node.create_subscription(
+                        AudioChunk,
+                        topic,
+                        lambda msg: self._on_chunk(msg, session, live_queue),
+                        _AUDIO_QOS,
+                    )
+                    self._running = True
+                    self._state = "ready"
+                    self._thread = threading.Thread(
+                        target=self._play_loop,
+                        args=(session, process, live_queue),
+                        daemon=True,
+                        name="t800-speaker",
+                    )
+                    self._thread.start()
+            except Exception as exc:
+                completion = "cancelled" if startup_cancel.is_set() else "error"
+                error = str(exc)
+                with self._lifecycle_lock:
+                    if self._session == session:
+                        self._last_error = error
+                        self._state = "error"
+                        self._running = False
+            finally:
+                with self._lifecycle_lock:
+                    if self._startup_action_id == action_id:
+                        self._startup_action_id = None
+                self._acp_notify(
+                    action_id,
+                    completion,
+                    {"topic": topic, "startup_bytes": 256000, "error": error},
+                    self.PREFIX,
+                )
+
+        self._startup_thread = threading.Thread(
+            target=finish_startup,
+            daemon=True,
+            name="t800-speaker-startup",
+        )
+        self._startup_thread.start()
+        return {
+            "state": "starting",
+            "action_id": action_id,
+            "topic_in": [{"topic": topic, "format": "audio/pcm-16k"}],
+            "startup_duration_sec": 8.0,
+        }
+
+    def _play_full_startup_sound(
+        self,
+        session: int,
+        process: subprocess.Popen | None,
+        cancel_event: threading.Event,
+    ) -> None:
+        """Play the exact G1 PCM fully before accepting live audio."""
+        pcm_path = Path(__file__).parent / "resource" / "startup_beep.pcm"
+        pcm = pcm_path.read_bytes()
+        if len(pcm) != 256000:
+            raise RuntimeError(
+                f"unexpected startup sound size: {len(pcm)} bytes"
+            )
+        if process is None or process.poll() is not None or process.stdin is None:
+            raise RuntimeError("aplay is not running")
+        block_size = 9600
+        for offset in range(0, len(pcm), block_size):
+            if cancel_event.is_set() or self._session != session:
+                raise RuntimeError("speaker startup cancelled")
+            block = pcm[offset:offset + block_size]
+            write_started = self._clock()
+            process.stdin.write(block)
+            process.stdin.flush()
+            write_elapsed = max(0.0, self._clock() - write_started)
+            remaining = max(0.0, len(block) / 32000.0 - write_elapsed)
+            if remaining > 0 and self._startup_wait(cancel_event, remaining):
+                raise RuntimeError("speaker startup cancelled")
+
+    def _on_chunk(
+        self,
+        msg,
+        session: int | None = None,
+        live_queue: queue.Queue | None = None,
+    ) -> None:
+        # 丢弃不属于当前会话的回调:stop() 后残留的 ROS 回调若在新会话
+        # 播放器已就绪后执行,会把旧 topic 的 PCM 入队泄漏到新连接。
+        if session is not None and session != self._session:
+            return
+        if not self._running:
+            return
+        pcm = bytes(msg.data)
+        if pcm == self._EOF_MAGIC or not pcm:
+            return
+        if getattr(msg, "format", "audio/pcm-16k") not in ("audio/pcm-16k", "pcm_16k_16bit_mono"):
+            self._last_error = f"unsupported audio format: {msg.format}"
+            return
+        if live_queue is None:
+            live_queue = self._queue
+        try:
+            live_queue.put_nowait(pcm)
+            self._last_chunk_time = time.monotonic()
+        except queue.Full:
+            # 滑动窗口：丢弃最旧的块，腾出位置放新块——持续实时流下
+            # 播放始终跟随最新输入，而不是永远滞后的积压音频。
+            try:
+                live_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                live_queue.put_nowait(pcm)
+            except queue.Full:
+                self._last_error = "speaker buffer full; audio chunk dropped"
+                return
+            self._last_chunk_time = time.monotonic()
+            self._dropped += 1
+
+    def _play_loop(
+        self,
+        session: int,
+        process: subprocess.Popen | None,
+        live_queue: queue.Queue,
+    ) -> None:
+        # 会话隔离：stop() 会递增 _session 并关闭 aplay stdin，旧线程随后
+        # 在写失败/队列超时处退出，其状态更新不得覆盖新会话。
+        # 每个线程独占持有自己的 process 引用，防止旧线程在 stop/start
+        # 之后写入新会话的 aplay stdin。
+        while self._running and self._session == session:
+            try:
+                pcm = live_queue.get(timeout=0.1)
+            except queue.Empty:
+                if self._session != session:
+                    return
+                if self._state == "playing" and time.monotonic() - self._last_chunk_time >= 0.3:
+                    self._state = "ready"
+                continue
+            # 队列 get() 与写入之间必须重新检查 session：
+            # stop() 仅 join 旧线程 1 秒，阻塞在 get() 上的旧线程醒来后
+            # 若不重检 session，会把旧队列残留 PCM 写到新会话的 aplay stdin。
+            if self._session != session:
+                return
+            try:
+                if process is None or process.poll() is not None or process.stdin is None:
+                    raise RuntimeError("aplay is not running")
+                process.stdin.write(pcm)
+                process.stdin.flush()
+                self._chunks_played += 1
+                self._state = "playing"
+            except Exception as exc:
+                if self._session == session:
+                    self._last_error = str(exc)
+                    self._state = "error"
+                    self._running = False
+                break
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "play"):
+            topic = str(args.get("input_topic", "")).strip()
+            if not topic:
+                return {"state": "error", "message": "Missing input_topic", "error": "Missing input_topic"}
+            return self._start_play(topic)
+        if action == "stop":
+            if self._interrupt_group is not None:
+                group_result = self._interrupt_group.interrupt()
+                result = dict(group_result["outputs"].get("speaker") or {
+                    "state": group_result["state"],
+                })
+                result["interrupted_outputs"] = group_result["outputs"]
+                return result
+            return self.halt()
+        if action == "get_volume":
+            try:
+                return {"state": self._state, "volume": self._get_volume()}
+            except Exception as exc:
+                return {"state": self._state, "error": f"get_volume failed: {exc}"}
+        if action == "set_volume":
+            try:
+                return {"state": self._state, "volume": self._set_volume(args.get("volume", 100))}
+            except Exception as exc:
+                return {"state": self._state, "error": f"set_volume failed: {exc}"}
+        if action == "info":
+            topic_in = ([{"topic": self._input_topic, "format": "audio/pcm-16k"}]
+                        if self._input_topic else [{"format": "audio/pcm-16k"}])
+            return {"state": self._state, "topic_in": topic_in,
+                    "buffer_chunks": self._queue.qsize(), "chunks_played": self._chunks_played,
+                    "dropped_old": self._dropped,
+                    "last_error": self._last_error}
+        return {"error": f"unknown speaker action: {action}"}
+
+
 class VisionPlugin:
     """T800-Odin2 激光雷达相机视觉数据桥接（飞书文档 7.2 节）。
 
@@ -4383,10 +5643,35 @@ class VisionPlugin:
         buf = bytearray(8 + len(data))
         buf[:8] = header
         buf[8:] = data
+        z_field = next(
+            (field for field in getattr(msg, "fields", []) if field.name == "z"),
+            None,
+        )
+        if z_field is not None and int(getattr(z_field, "datatype", 7)) == 7 \
+                and int(z_field.offset) + 4 <= point_step:
+            # 仅当 z 是 FLOAT32 时取反;其他 datatype 或大端布局跳过,避免损坏
+            self._negate_z_inplace(buf, 8, point_step, int(z_field.offset),
+                                   is_bigendian=bool(getattr(msg, "is_bigendian", False)))
         out = self._multi_type()
         out.data = self._array.array("B", buf)
         self._cloud_pub.publish(out)
         self._record_frame("pointcloud")
+
+    @staticmethod
+    def _negate_z_inplace(buf: bytearray, start: int, point_step: int, z_offset: int,
+                          is_bigendian: bool = False) -> None:
+        import numpy as np
+
+        total = (len(buf) - start) // point_step
+        if total <= 0:
+            return
+        if is_bigendian:
+            return  # 大端布局与 <f4 取反不兼容,跳过(透传原数据)避免损坏
+        raw = np.frombuffer(buf, dtype=np.uint8, count=total * point_step, offset=start)
+        raw = raw.reshape(total, point_step)
+        # 注意：不能用 ravel()——不连续视图上 ravel 会拷贝，原地乘法写不回去
+        z_values = raw[:, z_offset:z_offset + 4].view("<f4")
+        z_values *= -1
 
     def _on_camera_left(self, msg) -> None:
         if not self._running or "camera" not in self._enabled_tools:
@@ -5337,3 +6622,1969 @@ class ControlledSpatialPlugin:
             f.write(header)
             for p in points:
                 f.write(f"{p[0]:.6f} {p[1]:.6f} {p[2]:.6f}\n")
+
+
+GAIT_PROFILES: dict[str, dict] = {
+    "basic": {
+        "title": "拟人步态",
+        "motion_states": ("walk", "rl_basic"),
+        "description": "拟人步态（自动适配新版 rl_basic 与旧版 walk 状态名）",
+    },
+    "balanced": {
+        "title": "下肢平衡",
+        "motion_states": ("lower_body_balance",),
+        "description": "下肢平衡步态",
+    },
+}
+
+GAIT_PROFILE_ALIASES = {
+    "拟人步态": "basic",
+    "下肢平衡": "balanced",
+    "balance": "balanced",
+}
+
+
+class GaitPlugin:
+    """Version-adaptive gait selector over the public motion-state API.
+
+    The public T800 Native SDK stores walking policy settings under
+    ``assets/config/t800/.../*.yaml``.  It does not define the historical
+    ``config/rl_basic/gait.json`` contract or fields such as ``step_height``.
+    Exposing those guessed files produced successful-looking writes that the
+    robot never consumed.  This plugin only uses the documented ROS motion
+    state interface and resolves the ``rl_basic``/``walk`` version difference
+    from the robot's advertised transitions.
+    """
+
+    PREFIX = "gait"
+    _RESTORE_TIMEOUT_SEC = 2.0
+
+    def __init__(self, config: dict, motion_mode: "MotionModePlugin", state: StatePlugin):
+        self._motion_mode = motion_mode
+        self._state = state
+        plugin_config = config.get("plugins", {}).get("gait", {})
+        configured_basic = plugin_config.get("basic_motion_states", ["walk", "rl_basic"])
+        if not isinstance(configured_basic, (list, tuple)) or not configured_basic:
+            configured_basic = ["walk", "rl_basic"]
+        basic_states = tuple(str(item) for item in configured_basic if str(item))
+        self._profiles = {
+            name: {
+                **definition,
+                "motion_states": (
+                    basic_states
+                    if name == "basic"
+                    else definition["motion_states"]
+                ),
+            }
+            for name, definition in GAIT_PROFILES.items()
+        }
+        self._selection_lock = threading.Lock()
+        self._selection_thread: threading.Thread | None = None
+        self._selection_action_id: str | None = None
+        self._selection_cancel = threading.Event()
+        self._selection_origin = ""
+        self._selection_target = ""
+        self._selection_restore_requested = False
+        self._selection_restore_generation = -1
+        self._selection_settling = False
+        self._selection_settle_origin = ""
+        self._transition_timeout_sec = clamp(
+            config.get("control", {}).get(
+                "mode_transition_timeout_sec", 10.0
+            ),
+            0.1,
+            14.0,
+        )
+        self._restore_timeout_sec = min(
+            self._transition_timeout_sec, self._RESTORE_TIMEOUT_SEC
+        )
+        self._acp_notify = _t800_acp_notify
+        self._interrupt_group: MotionInterruptGroup | None = None
+
+    def get_tool(self) -> dict:
+        return {
+            "name": self.PREFIX,
+            "type": "actuator",
+            "multiInstance": False,
+            "description": (
+                "T800 步态选择，通过官方 motion state 接口切换拟人步态、"
+                "下肢平衡步态；会按固件返回的 available transitions 判定可用性。"
+            ),
+            "inputSchema": self._input_schema(),
+        }
+
+    def _input_schema(self) -> dict:
+        schema = action_schema(
+            {
+                "start": ([], "启动卡片（actuator 生命周期）"),
+                "stop": ([], "停止卡片（不强制改变机器人状态）"),
+                "info": ([], "查询当前步态与可用性"),
+                "status": ([], "查询当前步态与可用性"),
+                "list": ([], "列出步态档位与当前固件的可用性"),
+                "select": (["gait"], "选择步态档位"),
+            },
+            {
+                "gait": {
+                    "type": "string",
+                    "enum": list(self._profiles),
+                    "oneOf": [
+                        {
+                            "const": name,
+                            "title": definition["title"],
+                        }
+                        for name, definition in self._profiles.items()
+                    ],
+                    "description": "步态档位",
+                },
+            },
+            "步态动作",
+        )
+        schema["x-completion"] = {"actions": ["select"], "timeout": 15}
+        schema["x-hooks"] = {
+            "on_interrupt_gait": {"action": "stop"},
+        }
+        return schema
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        self.halt()
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "start":
+            status = self._status()
+            status["gait_state"] = status.pop("state")
+            status["state"] = "ready"
+            return status
+        if action in ("info", "status"):
+            return self._status()
+        if action == "stop":
+            if self._interrupt_group is not None:
+                group_result = self._interrupt_group.interrupt()
+                result = dict(group_result["outputs"].get("gait") or {
+                    "state": group_result["state"],
+                })
+                result["interrupted_outputs"] = group_result["outputs"]
+                return result
+            return self.halt()
+        if action == "list":
+            return self._list_profiles()
+        if action == "select":
+            return self._select(args)
+        return {"error": f"unknown gait action: {action}"}
+
+    def _resolve(self, profile: str, current: str, available: list[str]) -> str | None:
+        candidates = self._profiles[profile]["motion_states"]
+        if current in candidates:
+            return current
+        for candidate in candidates:
+            if candidate in available:
+                return candidate
+        return None
+
+    def _profile_for_motion(self, motion: str) -> str | None:
+        for name, definition in self._profiles.items():
+            if motion in definition["motion_states"]:
+                return name
+        return None
+
+    def _status(self) -> dict:
+        settling = self._refresh_selection_settling()
+        current, available = self._state.current_motion()
+        profile = self._profile_for_motion(current)
+        with self._selection_lock:
+            selecting = self._selection_action_id is not None
+        return {
+            "state": (
+                "switching"
+                if selecting
+                else (
+                    "settling"
+                    if settling
+                    else ("active" if profile else "inactive")
+                )
+            ),
+            "gait": profile,
+            "motion_state": current,
+            "available_motion_states": available,
+            "available_gaits": [
+                name
+                for name in self._profiles
+                if self._resolve(name, current, available) is not None
+            ],
+        }
+
+    def _list_profiles(self) -> dict:
+        current, available = self._state.current_motion()
+        profiles = []
+        for name, definition in self._profiles.items():
+            resolved = self._resolve(name, current, available)
+            profiles.append({
+                "name": name,
+                "title": definition["title"],
+                "description": definition["description"],
+                "motion_states": list(definition["motion_states"]),
+                "resolved_motion_state": resolved,
+                "available": resolved is not None,
+                "active": current in definition["motion_states"],
+            })
+        return {
+            "state": "ready",
+            "current_motion_state": current,
+            "available_motion_states": available,
+            "profiles": profiles,
+        }
+
+    def _select(self, args: dict) -> dict:
+        requested_profile = str(args.get("gait", ""))
+        profile = GAIT_PROFILE_ALIASES.get(
+            requested_profile, requested_profile
+        )
+        if profile not in self._profiles:
+            return {"error": f"unknown gait: {profile}", "gaits": list(self._profiles)}
+        current, available = self._state.current_motion()
+        target = self._resolve(profile, current, available)
+        if target is None:
+            return {
+                "error": f"gait {profile} is not available from {current or 'unknown'}",
+                "available_motion_states": available,
+                "candidate_motion_states": list(self._profiles[profile]["motion_states"]),
+            }
+
+        if current == target:
+            return {
+                "state": "completed",
+                "gait": profile,
+                "current": current,
+                "available": available,
+            }
+
+        action_id = ""
+        cancel_event = threading.Event()
+
+        def switch() -> None:
+            try:
+                with self._selection_lock:
+                    if cancel_event.is_set():
+                        result = {"state": "cancelled"}
+                    else:
+                        result = self._motion_mode.dispatch("switch", {
+                            "target": target,
+                            "force": False,
+                            "wait": False,
+                        })
+                if "error" in result:
+                    completion = "error"
+                else:
+                    deadline = (
+                        time.monotonic() + self._transition_timeout_sec
+                    )
+                    while (
+                        result.get("state") != "cancelled"
+                        and time.monotonic() < deadline
+                    ):
+                        if cancel_event.is_set():
+                            result = {"state": "cancelled"}
+                            break
+                        current_motion, available_motion = (
+                            self._state.current_motion()
+                        )
+                        if current_motion == target:
+                            result = {
+                                "state": "completed",
+                                "current": current_motion,
+                                "available": available_motion,
+                            }
+                            break
+                        cancel_event.wait(timeout=0.05)
+                    else:
+                        if result.get("state") != "cancelled":
+                            current_motion, available_motion = (
+                                self._state.current_motion()
+                            )
+                            result = {
+                                "state": "timeout",
+                                "target": target,
+                                "current": current_motion,
+                                "available": available_motion,
+                            }
+                    if result.get("state") == "timeout":
+                        with self._selection_lock:
+                            if self._selection_action_id == action_id:
+                                cancel_event.set()
+                                _, _, restore_generation = (
+                                    self._motion_feedback_snapshot()
+                                )
+                                try:
+                                    restore_result = (
+                                        self._motion_mode.dispatch("switch", {
+                                            "target": self._selection_origin,
+                                            "force": True,
+                                            "wait": False,
+                                        })
+                                        if self._selection_origin
+                                        else {"state": "not_requested"}
+                                    )
+                                except Exception as exc:
+                                    restore_result = {"error": str(exc)}
+                                self._selection_restore_requested = (
+                                    bool(self._selection_origin)
+                                    and "error" not in restore_result
+                                )
+                                self._selection_restore_generation = (
+                                    restore_generation
+                                )
+                    if result.get("state") == "cancelled":
+                        completion = "cancelled"
+                    elif result.get("state") in (
+                        "error", "failed", "timeout"
+                    ):
+                        completion = "error"
+                    else:
+                        completion = "completed"
+                completion_result = {
+                    "gait": profile,
+                    "motion_state": target,
+                    **result,
+                }
+            except Exception as exc:
+                completion = (
+                    "cancelled" if cancel_event.is_set() else "error"
+                )
+                completion_result = {
+                    "gait": profile,
+                    "motion_state": target,
+                    "error": str(exc),
+                }
+            finally:
+                restore_checked = False
+                restore_confirmed = False
+                while True:
+                    with self._selection_lock:
+                        cancelled = cancel_event.is_set()
+                        if not cancelled or restore_checked:
+                            if cancelled:
+                                if restore_confirmed:
+                                    if completion_result.get("state") == "timeout":
+                                        completion = "error"
+                                        completion_result = {
+                                            **completion_result,
+                                            "state": "timeout_recovered",
+                                            "restore_motion_state": (
+                                                self._selection_origin
+                                            ),
+                                            "error": (
+                                                "gait transition timed out; "
+                                                "origin state restored"
+                                            ),
+                                        }
+                                    else:
+                                        completion = "cancelled"
+                                        completion_result = {
+                                            **completion_result,
+                                            "state": "cancelled",
+                                            "restore_motion_state": (
+                                                self._selection_origin
+                                            ),
+                                        }
+                                else:
+                                    completion = "error"
+                                    completion_result = {
+                                        **completion_result,
+                                        "state": "settling_after_cancel",
+                                        "restore_motion_state": (
+                                            self._selection_origin
+                                        ),
+                                        "error": (
+                                            "gait cancellation was not "
+                                            "confirmed by motion-state feedback"
+                                        ),
+                                    }
+                                    self._selection_settling = True
+                                    self._selection_settle_origin = (
+                                        self._selection_origin
+                                    )
+                            if self._selection_action_id == action_id:
+                                self._selection_action_id = None
+                            break
+                        restore_requested = (
+                            self._selection_restore_requested
+                        )
+                        restore_generation = (
+                            self._selection_restore_generation
+                        )
+                        restore_origin = self._selection_origin
+                    restore_confirmed = self._wait_for_restore(
+                        restore_origin,
+                        restore_requested=restore_requested,
+                        after_generation=restore_generation,
+                    )
+                    restore_checked = True
+                self._acp_notify(
+                    action_id, completion, completion_result, self.PREFIX
+                )
+
+        with self._selection_lock:
+            if (
+                self._selection_action_id is not None
+                or self._selection_settling
+            ):
+                return {
+                    "error": (
+                        "another gait transition is already running"
+                        if self._selection_action_id is not None
+                        else "previous gait transition is still settling"
+                    ),
+                    "action_id": self._selection_action_id,
+                }
+            action_id = f"t800_gait_{uuid4().hex[:12]}"
+            self._selection_action_id = action_id
+            self._selection_cancel = cancel_event
+            self._selection_origin = current
+            self._selection_target = target
+            self._selection_restore_requested = False
+            self._selection_restore_generation = -1
+            thread = threading.Thread(
+                target=switch,
+                daemon=True,
+                name="t800-gait-select",
+            )
+            self._selection_thread = thread
+        thread.start()
+        return {
+            "state": "switching",
+            "gait": profile,
+            "motion_state": target,
+            "action_id": action_id,
+        }
+
+    def halt(self) -> dict:
+        with self._selection_lock:
+            action_id = self._selection_action_id
+            if action_id is None:
+                if not self._selection_settling:
+                    return {"state": "idle"}
+                origin = self._selection_settle_origin
+                _, _, restore_generation = self._motion_feedback_snapshot()
+                try:
+                    restore_result = self._motion_mode.dispatch("switch", {
+                        "target": origin,
+                        "force": True,
+                        "wait": False,
+                    })
+                except Exception as exc:
+                    restore_result = {"error": str(exc)}
+                self._selection_restore_requested = (
+                    "error" not in restore_result
+                )
+                self._selection_restore_generation = restore_generation
+                retrying_settle = True
+            else:
+                retrying_settle = False
+                cancel_event = self._selection_cancel
+                origin = self._selection_origin
+                target = self._selection_target
+                cancel_event.set()
+                _, _, restore_generation = self._motion_feedback_snapshot()
+                try:
+                    restore_result = (
+                        self._motion_mode.dispatch("switch", {
+                            "target": origin,
+                            "force": True,
+                            "wait": False,
+                        })
+                        if origin
+                        else {"state": "not_requested"}
+                    )
+                except Exception as exc:
+                    restore_result = {"error": str(exc)}
+                self._selection_restore_requested = (
+                    bool(origin) and "error" not in restore_result
+                )
+                self._selection_restore_generation = restore_generation
+        if retrying_settle:
+            settling = self._refresh_selection_settling()
+            return {
+                "state": "settling" if settling else "idle",
+                "restore_motion_state": origin,
+                "restore_result": restore_result,
+            }
+        return {
+            "state": "cancelling",
+            "action_id": action_id,
+            "target": target,
+            "restore_motion_state": origin,
+            "restore_result": restore_result,
+        }
+
+    def motion_active(self) -> bool:
+        self._refresh_selection_settling()
+        with self._selection_lock:
+            return (
+                self._selection_action_id is not None
+                or self._selection_settling
+            )
+
+    def set_interrupt_group(self, group: MotionInterruptGroup) -> None:
+        self._interrupt_group = group
+
+    def _wait_for_restore(
+        self,
+        origin: str,
+        *,
+        restore_requested: bool,
+        after_generation: int,
+    ) -> bool:
+        if not origin or not restore_requested:
+            return False
+        deadline = time.monotonic() + self._restore_timeout_sec
+        while time.monotonic() < deadline:
+            current, _, generation = self._motion_feedback_snapshot()
+            if current == origin and generation > after_generation:
+                return True
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        return False
+
+    def _refresh_selection_settling(self) -> bool:
+        with self._selection_lock:
+            settling = self._selection_settling
+            origin = self._selection_settle_origin
+            restore_requested = self._selection_restore_requested
+            restore_generation = self._selection_restore_generation
+        if not settling:
+            return False
+        current, _, generation = self._motion_feedback_snapshot()
+        if (
+            restore_requested
+            and current == origin
+            and generation > restore_generation
+        ):
+            with self._selection_lock:
+                if (
+                    self._selection_settling
+                    and self._selection_settle_origin == origin
+                    and self._selection_restore_requested
+                ):
+                    self._selection_settling = False
+                    self._selection_settle_origin = ""
+                    return False
+        return True
+
+    def _motion_feedback_snapshot(self) -> tuple[str, list[str], int]:
+        snapshot = getattr(self._state, "motion_snapshot", None)
+        if callable(snapshot):
+            current, available, generation = snapshot()
+            return str(current), list(available), int(generation)
+        current, available = self._state.current_motion()
+        return str(current), list(available), -1
+
+
+class MotionRecorderPlugin:
+    """Record, save, and replay T800 joint trajectories.
+
+    Recording captures joint positions from the robot's joint state topic
+    at a configurable rate. Playback resamples the recorded upper-body path
+    and publishes it continuously through the official joint override topic.
+
+    ⚠  Playback requires the robot to be in ``lower_body_balance`` mode.
+    """
+
+    PREFIX = "motion_recorder"
+
+    # Default recording rate (Hz) — 20 Hz captures 50ms intervals, enough
+    # for smooth playback without overwhelming the trajectory buffer.
+    _DEFAULT_RECORD_HZ = 20.0
+    _MAX_FRAMES = 6000  # 5 minutes at 20 Hz
+    _MAX_RECORDING_DURATION_MS = 5 * 60 * 1000
+    _MAX_RECORDING_FILE_BYTES = 32 * 1024 * 1024
+    _MAX_PLAYBACK_SAMPLES = 60_000
+    _RESET_SETTLE_TIMEOUT_SEC = 2.0
+    _DEFAULT_PLAYBACK_STIFFNESS = (
+        200.0, 30.0, 30.0, 15.0, 30.0, 15.0,
+        40.0, 40.0, 20.0, 40.0, 20.0, 100.0, 100.0,
+    )
+    _DEFAULT_PLAYBACK_DAMPING = (
+        3.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0, 1.0, 3.0, 3.0,
+    )
+
+    def __init__(self, config: dict, namespace: str, ros2):
+        self._config = config
+        self._ns = namespace
+        self._node = None
+        self._ros2 = ros2
+
+        # Recording state
+        self._record_hz = float(
+            config.get("plugins", {})
+            .get("motion_recorder", {})
+            .get("record_hz", self._DEFAULT_RECORD_HZ)
+        )
+        if not math.isfinite(self._record_hz) or self._record_hz <= 0:
+            raise ValueError("motion_recorder.record_hz must be a positive finite number")
+        self._record_period_sec = 1.0 / self._record_hz
+        recorder_config = config.get("plugins", {}).get("motion_recorder", {})
+        self._upper_indices = tuple(T800_JOINT_GROUPS["upper_body"])
+        self._playback_rate_hz = clamp(
+            recorder_config.get("playback_rate_hz", 100.0), 50.0, 200.0
+        )
+        self._entry_blend_sec = clamp(
+            recorder_config.get("entry_blend_sec", 0.5), 0.1, 3.0
+        )
+        self._reset_timeout_sec = clamp(
+            recorder_config.get("reset_timeout_sec", 15.0), 1.0, 120.0
+        )
+        self._reset_settle_timeout_sec = min(
+            self._reset_timeout_sec, self._RESET_SETTLE_TIMEOUT_SEC
+        )
+        self._playback_stiffness = float_list(
+            recorder_config.get("playback_stiffness", self._DEFAULT_PLAYBACK_STIFFNESS),
+            "playback_stiffness",
+            size=len(self._upper_indices),
+        )
+        self._playback_damping = float_list(
+            recorder_config.get("playback_damping", self._DEFAULT_PLAYBACK_DAMPING),
+            "playback_damping",
+            size=len(self._upper_indices),
+        )
+        record_dir = (
+            config.get("plugins", {})
+            .get("motion_recorder", {})
+            .get("recordings_dir", "")
+        )
+        self._recordings_dir = Path(
+            record_dir if record_dir else
+            os.path.join(os.path.dirname(__file__), RECORDINGS_DIR)
+        )
+        self._recordings_dir.mkdir(parents=True, exist_ok=True)
+
+        self._lock = threading.RLock()
+        self._frames: list[dict] = []
+        self._recording = False
+        self._record_thread: threading.Thread | None = None
+        self._record_finalize_threads: set[threading.Thread] = set()
+        self._record_stop = threading.Event()
+        self._record_label = ""
+        self._record_start_ms = 0
+        self._record_session = 0
+        self._record_action_id: str | None = None
+        self._last_sample_at: float | None = None
+        self._last_recording: dict | None = None
+        self._joint_state_sub = None
+        self._state = None
+        self._motion_mode = None
+        self._needs_reset = False
+        self._reset_request_id: int | None = None
+        self._reset_action_id: str | None = None
+        self._reset_cancelling = False
+        self._last_reset: dict | None = None
+        self._prepare_thread: threading.Thread | None = None
+        self._prepare_cancel = threading.Event()
+        self._prepare_action_id: str | None = None
+        self._prepare_operation: str | None = None
+
+        # Playback state
+        self._playback_thread: threading.Thread | None = None
+        self._playback_stop = threading.Event()
+        self._playback_generation = 0
+        self._playing = False
+        self._playback_label = ""
+        self._playback_frame = 0
+        self._playback_action_id: str | None = None
+        self._last_playback_error: str | None = None
+        self._override_release_failed = False
+        self._override_publisher = None
+        self._override_message_type = None
+        self._acp_notify = _t800_acp_notify
+        self._interrupt_group: MotionInterruptGroup | None = None
+
+        # Latest joint state cache
+        self._latest_joint_positions: list[float] | None = None
+
+    def get_tool(self) -> dict:
+        input_schema = action_schema(
+            {
+                "record_start": (["label", "duration"], "开始录制关节轨迹"),
+                "record_stop": ([], "停止录制并自动保存"),
+                "play": (["name", "speed_scale"], "100Hz 平滑回放指定录制文件"),
+                "stop_playback": ([], "立即停止回放；若复位进行中则同时取消复位"),
+                "list": ([], "列出所有已保存的录制文件"),
+                "delete": (["name"], "删除指定录制文件"),
+                "status": ([], "查询录制/回放状态"),
+            },
+            {
+                "label": {
+                    "type": "string",
+                    "description": "录制标签名；停止时自动作为文件名保存",
+                },
+                "name": {
+                    "type": "string",
+                    "description": "录制文件名（不含 .json）",
+                },
+                "duration": {
+                    "type": "number",
+                    "description": "自动停止时间（秒），0=持续录制直到手动停止",
+                },
+                "speed_scale": {
+                    "type": "number",
+                    "minimum": 0.1,
+                    "maximum": 5.0,
+                    "description": "回放速度倍率，1.0=原速",
+                },
+            },
+            "运动录制/回放动作",
+        )
+        input_schema["x-completion"] = {
+            "actions": ["record_start", "play"],
+            "timeout": 3600,
+        }
+        input_schema["x-hooks"] = {
+            "on_interrupt_motion": {"action": "stop_playback"},
+            "on_interrupt_recording": {"action": "record_stop"},
+        }
+        return {
+            "name": self.PREFIX,
+            "type": "actuator",
+            "multiInstance": False,
+            "description": (
+                "T800 全身运动录制与回放 — 录制关节轨迹到文件，"
+                "以 100Hz 平滑回放已录制的上肢轨迹。record_start/play 会先自动"
+                "进入 lower_body_balance 并复位默认姿态，无需手动 reset。"
+            ),
+            "inputSchema": input_schema,
+        }
+
+    def start(self) -> None:
+        from rclpy.node import Node
+        from interface_protocol.msg import JointOverrideCommand, JointState
+
+        self._node = Node("t800_motion_recorder", context=self._ros2.ctx_robot)
+        self._ros2.executor_robot.add_node(self._node)
+
+        # Subscribe to joint state for recording
+        topic = self._config.get("topics", {}).get("joint_state", "/hardware/joint_state")
+        self._joint_state_sub = self._node.create_subscription(
+            JointState, topic, self._on_joint_state,
+            self._best_effort_qos(),
+        )
+        self._override_message_type = JointOverrideCommand
+        self._override_publisher = self._node.create_publisher(
+            JointOverrideCommand,
+            self._config.get("topics", {}).get(
+                "joint_override", "/motion/joint_override_command"
+            ),
+            _RELIABLE,
+        )
+
+    def _best_effort_qos(self):
+        from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+        return QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=3,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+
+    def stop(self) -> None:
+        self.halt()
+        while True:
+            with self._lock:
+                finalize_threads = list(self._record_finalize_threads)
+            if not finalize_threads:
+                break
+            for finalize_thread in finalize_threads:
+                finalize_thread.join()
+        if self._node:
+            try:
+                self._ros2.executor_robot.remove_node(self._node)
+            except Exception:
+                pass
+            try:
+                self._node.destroy_node()
+            except Exception:
+                pass
+            self._node = None
+
+    def halt(self) -> None:
+        """Stop recording/playback while keeping ROS resources reusable."""
+        self._prepare_cancel.set()
+        self._finalize_recording(
+            stop_reason="shutdown", async_persist=True
+        )
+        self._stop_playback()
+
+    # ── ROS2 callbacks ────────────────────────────────────────────────────────
+
+    def _on_joint_state(self, msg) -> None:
+        positions = [float(p) for p in msg.position]
+        velocities = [float(v) for v in msg.velocity]
+        sampled_at = time.monotonic()
+        with self._lock:
+            self._latest_joint_positions = list(positions)
+            recording = self._recording
+        if recording and self._lower_body_balance_error("recording"):
+            self._finalize_recording(stop_reason="motion_state_changed")
+            return
+        with self._lock:
+            if not self._recording or len(self._frames) >= self._MAX_FRAMES:
+                return
+            if (
+                self._last_sample_at is not None
+                and sampled_at - self._last_sample_at < self._record_period_sec
+            ):
+                return
+            self._last_sample_at = sampled_at
+            self._frames.append({
+                "timestamp": _now_ms() - self._record_start_ms,
+                "positions": positions,
+                "velocities": velocities,
+            })
+
+    # ── Dispatch ──────────────────────────────────────────────────────────────
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "start":
+            status = self._status()
+            status["activity_state"] = status.pop("state")
+            status["state"] = "ready"
+            return status
+        if action == "status":
+            return self._status()
+        if action == "stop":
+            recording_result = self._finalize_recording(stop_reason="lifecycle")
+            playback_result = self._stop_playback()
+            result = {"state": "idle", "playback_result": playback_result}
+            if recording_result.get("state") == "saved":
+                result["recording_result"] = recording_result
+            return result
+        if action == "record_start":
+            with self._lock:
+                if self._recording:
+                    return {
+                        "state": "recording",
+                        "recording": True,
+                        "already_recording": True,
+                        "label": self._record_label,
+                        "frames": len(self._frames),
+                        "session_id": self._record_session,
+                    }
+                if self._playing:
+                    return {"error": "cannot record while playing"}
+            try:
+                duration = self._record_duration(args)
+            except ValueError as exc:
+                return {"error": str(exc), "code": "INVALID_ARGUMENT"}
+            return self._prepare_record_start(args, duration)
+        if action == "record_stop":
+            return self._record_stop_action()
+        if action == "play":
+            return self._play(args)
+        if action == "stop_playback":
+            if self._interrupt_group is not None:
+                group_result = self._interrupt_group.interrupt()
+                result = dict(group_result["outputs"].get("motion_recorder") or {
+                    "state": group_result["state"],
+                })
+                result["interrupted_outputs"] = group_result["outputs"]
+                return result
+            return self._stop_playback()
+        if action == "list":
+            return self._list_recordings()
+        if action == "delete":
+            return self._delete(args)
+        return {"error": f"unknown motion_recorder action: {action}"}
+
+    # ── Recording ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _record_duration(args: dict) -> float:
+        try:
+            duration = float(args.get("duration", 0.0))
+        except (TypeError, ValueError):
+            raise ValueError(
+                "duration must be a non-negative finite number"
+            ) from None
+        if not math.isfinite(duration) or duration < 0:
+            raise ValueError("duration must be a non-negative finite number")
+        return duration
+
+    def _prepare_record_start(self, args: dict, duration: float) -> dict:
+        claimed = self._claim_prepare(
+            "record_start", "t800_motion_record_start"
+        )
+        if claimed is None:
+            with self._lock:
+                active_action_id = self._prepare_action_id
+                saving = bool(self._record_finalize_threads)
+                if self._recording:
+                    return {
+                        "state": "recording",
+                        "recording": True,
+                        "already_recording": True,
+                        "label": self._record_label,
+                        "frames": len(self._frames),
+                        "session_id": self._record_session,
+                    }
+                if self._playing:
+                    return {"error": "cannot record while playing"}
+                if saving:
+                    return {
+                        "error": "previous recording is still saving"
+                    }
+            return {
+                "error": "another recorder action is preparing",
+                "action_id": active_action_id,
+            }
+        action_id, cancel_event = claimed
+
+        def prepare() -> None:
+            notify_from_prepare = True
+            completion = "completed"
+            try:
+                self._reset_before_action(
+                    "recording", action_id, cancel_event
+                )
+                with self._lock:
+                    if cancel_event.is_set():
+                        raise RuntimeError(
+                            "recording preparation cancelled"
+                        )
+                    result = self._begin_recording(
+                        args, duration, action_id=action_id
+                    )
+                if "error" in result:
+                    completion = "error"
+                else:
+                    notify_from_prepare = False
+            except Exception as exc:
+                completion = "cancelled" if cancel_event.is_set() else "error"
+                result = {"error": str(exc)}
+            finally:
+                self._release_prepare(action_id)
+                if notify_from_prepare:
+                    self._acp_notify(
+                        action_id, completion, result, self.PREFIX
+                    )
+
+        thread = threading.Thread(
+            target=prepare,
+            daemon=True,
+            name="t800-motion-record-prepare",
+        )
+        with self._lock:
+            self._prepare_thread = thread
+        thread.start()
+        return {
+            "state": "preparing",
+            "operation": "record_start",
+            "action_id": action_id,
+        }
+
+    def _claim_prepare(
+        self,
+        operation: str,
+        action_prefix: str,
+    ) -> tuple[str, threading.Event] | None:
+        with self._lock:
+            if self._prepare_action_id is not None:
+                return None
+            if self._record_finalize_threads:
+                return None
+            if (
+                self._playback_thread is not None
+                and self._playback_thread.is_alive()
+            ):
+                return None
+            if operation == "record_start" and (
+                self._recording or self._playing
+            ):
+                return None
+            if operation == "play" and (
+                self._recording or self._playing
+            ):
+                return None
+            action_id = f"{action_prefix}_{uuid4().hex[:12]}"
+            cancel_event = threading.Event()
+            self._prepare_cancel = cancel_event
+            self._prepare_action_id = action_id
+            self._prepare_operation = operation
+            return action_id, cancel_event
+
+    def _release_prepare(self, action_id: str) -> None:
+        with self._lock:
+            if self._prepare_action_id == action_id:
+                self._prepare_action_id = None
+                self._prepare_operation = None
+
+    def _reset_before_action(
+        self,
+        operation: str,
+        action_id: str,
+        cancel_event: threading.Event,
+    ) -> dict:
+        joint_plan = getattr(self, "_joint_plan", None)
+        if joint_plan is None or self._state is None or self._motion_mode is None:
+            raise RuntimeError("automatic reset controls are unavailable")
+
+        current, available = self._state.current_motion()
+        if current != "lower_body_balance":
+            if "lower_body_balance" not in available:
+                raise RuntimeError(
+                    "lower_body_balance is not available from "
+                    f"{current or 'unknown'}"
+                )
+            mode_result = self._motion_mode.dispatch("switch", {
+                "target": "lower_body_balance",
+                "force": False,
+                "wait": True,
+            })
+            if "error" in mode_result:
+                raise RuntimeError(str(mode_result["error"]))
+            current, _ = self._state.current_motion()
+            if current != "lower_body_balance":
+                raise RuntimeError(
+                    "failed to enter lower_body_balance before automatic reset"
+                )
+        if cancel_event.is_set():
+            raise RuntimeError(f"{operation} preparation cancelled")
+
+        reset_result = joint_plan.dispatch("reset", {})
+        if "error" in reset_result:
+            raise RuntimeError(str(reset_result["error"]))
+        request_id = reset_result.get("request_id")
+        if request_id is None:
+            raise RuntimeError("joint planner reset did not return request_id")
+        request_id = int(request_id)
+        with self._lock:
+            self._needs_reset = True
+            self._reset_request_id = request_id
+            self._reset_action_id = action_id
+            self._reset_cancelling = False
+            self._last_reset = {
+                "state": "resetting",
+                "request_id": request_id,
+                "action_id": action_id,
+                "operation": operation,
+                "motion_state": current,
+            }
+        try:
+            joint_plan.wait_for_request(
+                request_id, self._reset_timeout_sec, cancel_event
+            )
+        except Exception as reset_exc:
+            try:
+                joint_plan.dispatch("cancel", {"request_id": request_id})
+            except Exception:
+                pass
+            # Fail closed: do not complete the parent ACP action until the
+            # exact planner request is physically quiescent.  Bound this
+            # confirmation wait so the worker can still post an ACP error;
+            # the local motion gate remains closed until late IDLE feedback
+            # is observed by _refresh_reset_state().
+            try:
+                self._wait_reset_idle(
+                    request_id,
+                    joint_plan,
+                    timeout=self._reset_settle_timeout_sec,
+                )
+            except TimeoutError as settle_exc:
+                with self._lock:
+                    if self._reset_request_id == request_id:
+                        self._reset_action_id = None
+                        self._reset_cancelling = True
+                        self._needs_reset = True
+                        self._last_reset = {
+                            **dict(self._last_reset or {}),
+                            "state": "settling_after_error",
+                            "error": str(reset_exc),
+                            "settle_error": str(settle_exc),
+                        }
+                raise RuntimeError(
+                    f"reset request {request_id} failed and did not become "
+                    "IDLE after cancellation"
+                ) from reset_exc
+            with self._lock:
+                if self._reset_request_id == request_id:
+                    self._reset_request_id = None
+                    self._reset_action_id = None
+                    self._reset_cancelling = False
+                    self._needs_reset = True
+                    self._last_reset = {
+                        **dict(self._last_reset or {}),
+                        "state": (
+                            "cancelled" if cancel_event.is_set() else "error"
+                        ),
+                    }
+            raise
+        with self._lock:
+            if self._reset_request_id == request_id:
+                self._needs_reset = False
+                self._reset_request_id = None
+                self._reset_action_id = None
+                self._reset_cancelling = False
+                self._last_reset = {
+                    "state": "completed",
+                    "request_id": request_id,
+                    "action_id": action_id,
+                    "operation": operation,
+                    "motion_state": current,
+                }
+        return dict(self._last_reset)
+
+    def _wait_reset_idle(
+        self,
+        request_id: int,
+        joint_plan,
+        *,
+        timeout: float,
+    ) -> None:
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while time.monotonic() < deadline:
+            try:
+                status = joint_plan.dispatch("status", {})
+            except Exception:
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+                continue
+            if self._reset_status_is_quiescent(
+                request_id, status, joint_plan
+            ):
+                return
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        raise TimeoutError(
+            f"joint planner request {request_id} did not become IDLE after cancel"
+        )
+
+    @staticmethod
+    def _reset_status_is_quiescent(
+        request_id: int,
+        status: dict,
+        joint_plan,
+    ) -> bool:
+        checker = getattr(joint_plan, "request_is_quiescent", None)
+        if callable(checker):
+            try:
+                return bool(checker(request_id, status))
+            except Exception:
+                return False
+        try:
+            return (
+                int(status.get("request_id", -1)) == int(request_id)
+                and int(status.get("status", -1)) == 1
+                and math.isfinite(float(status.get("progress", 0.0)))
+                and float(status.get("progress", 0.0))
+                >= _JOINT_PLAN_COMPLETED_PROGRESS_MIN
+            )
+        except (TypeError, ValueError):
+            return False
+
+    def _begin_recording(
+        self,
+        args: dict,
+        duration: float,
+        *,
+        action_id: str,
+    ) -> dict:
+
+        with self._lock:
+            if self._recording:
+                return {
+                    "state": "recording",
+                    "recording": True,
+                    "already_recording": True,
+                    "label": self._record_label,
+                    "frames": len(self._frames),
+                    "session_id": self._record_session,
+                }
+            self._frames = []
+            self._recording = True
+            label = str(args.get("label", "")).strip()
+            self._record_label = label or f"recording_{int(time.time())}"
+            self._record_start_ms = _now_ms()
+            self._last_sample_at = None
+            self._record_session += 1
+            self._record_action_id = action_id
+            session_id = self._record_session
+            self._record_stop.clear()
+
+        # Auto-stop timer if duration specified
+        if duration > 0:
+            def auto_stop():
+                if not self._record_stop.wait(duration):
+                    self._finalize_recording(
+                        expected_session=session_id,
+                        stop_reason="duration",
+                    )
+            self._record_thread = threading.Thread(
+                target=auto_stop,
+                daemon=True,
+                name=f"t800-motion-record-{session_id}",
+            )
+            self._record_thread.start()
+
+        return {
+            "state": "recording",
+            "recording": True,
+            "label": self._record_label,
+            "duration": duration if duration > 0 else "unlimited",
+            "record_hz": self._record_hz,
+            "session_id": session_id,
+            "joint_data_available": self._latest_joint_positions is not None,
+            "note": "recording started; use record_stop to stop and save",
+        }
+
+    def _record_stop_action(self) -> dict:
+        with self._lock:
+            recording = self._recording
+            preparing_record = (
+                self._prepare_operation == "record_start"
+                and self._prepare_action_id is not None
+            )
+            if preparing_record and not recording:
+                self._prepare_cancel.set()
+        if recording:
+            return self._finalize_recording(stop_reason="manual")
+        if preparing_record:
+            reset_result = self._cancel_reset(reason="record_stop")
+            return {
+                "state": "stopping",
+                "recording": False,
+                "reset_result": reset_result,
+            }
+        return self._finalize_recording(stop_reason="manual")
+
+    def _finalize_recording(
+        self,
+        *,
+        expected_session: int | None = None,
+        stop_reason: str,
+        async_persist: bool = False,
+    ) -> dict:
+        with self._lock:
+            if not self._recording or (
+                expected_session is not None
+                and expected_session != self._record_session
+            ):
+                return {
+                    "state": "idle",
+                    "recording": False,
+                    "already_stopped": True,
+                    "last_recording": dict(self._last_recording) if self._last_recording else None,
+                }
+            self._recording = False
+            self._record_stop.set()
+            frames = list(self._frames)
+            label = self._record_label
+            session_id = self._record_session
+            action_id = self._record_action_id
+            self._record_action_id = None
+            if frames:
+                self._needs_reset = True
+                self._reset_request_id = None
+
+        if async_persist:
+            def persist() -> None:
+                try:
+                    self._persist_recording(
+                        frames,
+                        label,
+                        session_id,
+                        action_id,
+                        stop_reason,
+                    )
+                finally:
+                    with self._lock:
+                        self._record_finalize_threads.discard(
+                            threading.current_thread()
+                        )
+
+            thread = threading.Thread(
+                target=persist,
+                daemon=True,
+                name=f"t800-motion-record-save-{session_id}",
+            )
+            with self._lock:
+                self._record_finalize_threads.add(thread)
+            thread.start()
+            return {
+                "state": "stopping",
+                "recording": False,
+                "label": label,
+                "frames": len(frames),
+                "stop_reason": stop_reason,
+                "session_id": session_id,
+            }
+
+        return self._persist_recording(
+            frames, label, session_id, action_id, stop_reason
+        )
+
+    def _persist_recording(
+        self,
+        frames: list[dict],
+        label: str,
+        session_id: int,
+        action_id: str | None,
+        stop_reason: str,
+    ) -> dict:
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", label).strip("._")
+        safe_name = safe_name or f"recording_{int(time.time())}"
+        save_path = self._recordings_dir / f"{safe_name}.json"
+        temp_path = self._recordings_dir / (
+            f".{safe_name}.{session_id}.{uuid4().hex}.tmp"
+        )
+        frame_count = len(frames)
+        metadata = {
+            "label": label,
+            "frames": frame_count,
+            "duration_ms": frames[-1]["timestamp"] if frames else 0,
+            "recorded_at": _now_ms(),
+            "record_hz": self._record_hz,
+            "stop_reason": stop_reason,
+            "session_id": session_id,
+        }
+        recording = {
+            "metadata": metadata,
+            "frames": frames,
+        }
+        try:
+            temp_path.write_text(
+                json.dumps(recording, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            os.replace(temp_path, save_path)
+        except (OSError, TypeError, ValueError) as exc:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            result = {
+                "state": "error",
+                "recording": False,
+                "error": f"save failed: {exc}",
+                "label": label,
+                "frames": frame_count,
+                "stop_reason": stop_reason,
+                "session_id": session_id,
+            }
+            with self._lock:
+                self._last_recording = dict(result)
+            self._notify_recording_completion(
+                action_id, result, stop_reason=stop_reason
+            )
+            return result
+
+        result = {
+            "state": "saved",
+            "recording": False,
+            "label": label,
+            "frames": frame_count,
+            "duration_ms": metadata["duration_ms"],
+            "file": str(save_path),
+            "stop_reason": stop_reason,
+            "session_id": session_id,
+        }
+        with self._lock:
+            self._last_recording = dict(result)
+        self._notify_recording_completion(
+            action_id, result, stop_reason=stop_reason
+        )
+        return result
+
+    def _notify_recording_completion(
+        self,
+        action_id: str | None,
+        result: dict,
+        *,
+        stop_reason: str,
+    ) -> None:
+        if action_id is None:
+            return
+        if result.get("state") == "error":
+            completion = "error"
+        elif stop_reason in ("shutdown", "lifecycle", "motion_interrupt"):
+            completion = "cancelled"
+        elif stop_reason == "motion_state_changed":
+            completion = "error"
+        else:
+            completion = "completed"
+        self._acp_notify(action_id, completion, result, self.PREFIX)
+
+    # ── Playback ──────────────────────────────────────────────────────────────
+
+    def _play(self, args: dict) -> dict:
+        with self._lock:
+            active_thread = self._playback_thread
+            if active_thread is not None and active_thread.is_alive():
+                if self._playback_stop.is_set():
+                    return {"error": "previous playback is still stopping"}
+                return {"error": "already playing; stop first"}
+            if self._playing:
+                return {"error": "already playing; stop first"}
+            if self._recording:
+                return {"error": "cannot play while recording"}
+
+        name = str(args.get("name", ""))
+        if not name:
+            # Try to use current buffer
+            with self._lock:
+                if not self._frames:
+                    return {"error": "no recording loaded; specify name or record first"}
+                frames = list(self._frames)
+                label = "buffer"
+        else:
+            safe_name = name.replace(" ", "_").replace("/", "_")
+            file_path = self._recordings_dir / f"{safe_name}.json"
+            if not file_path.exists():
+                return {"error": f"recording not found: {name}"}
+            try:
+                frames, metadata = self._read_recording_file(
+                    file_path, minimum_frames=2
+                )
+                label = str(metadata.get("label", name))
+            except _RECORDING_FILE_ERRORS as exc:
+                return {
+                    "error": f"invalid recording: {exc}",
+                    "code": "INVALID_ARGUMENT",
+                }
+
+        raw_speed_scale = args.get("speed_scale", 1.0)
+        if isinstance(raw_speed_scale, bool) or not isinstance(
+            raw_speed_scale, numbers.Real
+        ):
+            return {
+                "error": "speed_scale must be a JSON number",
+                "code": "INVALID_ARGUMENT",
+            }
+        speed_scale = float(raw_speed_scale)
+        if not math.isfinite(speed_scale):
+            return {
+                "error": "speed_scale must be finite",
+                "code": "INVALID_ARGUMENT",
+            }
+        if not 0.1 <= speed_scale <= 5.0:
+            return {
+                "error": "speed_scale must be within [0.1, 5.0]",
+                "code": "SAFETY_LIMIT",
+            }
+        try:
+            frames = validate_recording_frames(
+                frames,
+                max_frames=self._MAX_FRAMES,
+                minimum_frames=2,
+                max_duration_ms=self._MAX_RECORDING_DURATION_MS,
+                minimum_interval_ms=1000.0 / self._playback_rate_hz,
+            )
+        except (IndexError, KeyError, TypeError, ValueError) as exc:
+            return {
+                "error": f"invalid recording: {exc}",
+                "code": "INVALID_ARGUMENT",
+            }
+        claimed = self._claim_prepare("play", "t800_motion_play")
+        if claimed is None:
+            with self._lock:
+                active_action_id = self._prepare_action_id
+                saving = bool(self._record_finalize_threads)
+                if self._recording:
+                    return {"error": "cannot play while recording"}
+                if self._playing:
+                    return {"error": "already playing; stop first"}
+                if saving:
+                    return {
+                        "error": "previous recording is still saving"
+                    }
+            return {
+                "error": "another recorder action is preparing",
+                "action_id": active_action_id,
+            }
+        action_id, cancel_event = claimed
+        with self._lock:
+            self._playback_stop = cancel_event
+
+        def prepare() -> None:
+            notify_from_prepare = True
+            completion = "completed"
+            try:
+                self._reset_before_action("playback", action_id, cancel_event)
+                self._start_playback_after_reset(
+                    frames, label, speed_scale, action_id, cancel_event
+                )
+                notify_from_prepare = False
+                result = {"state": "playing", "label": label}
+            except Exception as exc:
+                completion = "cancelled" if cancel_event.is_set() else "error"
+                result = {"label": label, "error": str(exc)}
+            finally:
+                self._release_prepare(action_id)
+                if notify_from_prepare:
+                    self._acp_notify(
+                        action_id, completion, result, self.PREFIX
+                    )
+
+        thread = threading.Thread(
+            target=prepare,
+            daemon=True,
+            name="t800-motion-play-prepare",
+        )
+        with self._lock:
+            self._prepare_thread = thread
+        thread.start()
+        return {
+            "state": "preparing",
+            "operation": "play",
+            "action_id": action_id,
+            "label": label,
+            "frames": len(frames),
+            "speed_scale": speed_scale,
+            "playback_rate_hz": self._playback_rate_hz,
+            "entry_blend_sec": self._entry_blend_sec,
+            "control_path": "joint_override",
+            "estimated_duration_s": round(
+                self._entry_blend_sec
+                + (
+                    frames[-1]["timestamp"] - frames[0]["timestamp"]
+                ) / 1000.0 / speed_scale,
+                1,
+            ),
+        }
+
+    def _start_playback_after_reset(
+        self,
+        frames: list[dict],
+        label: str,
+        speed_scale: float,
+        action_id: str,
+        stop_event: threading.Event,
+    ) -> None:
+        with self._lock:
+            current_positions = list(self._latest_joint_positions or [])
+        samples = resample_joint_trajectory(
+            frames,
+            joint_indices=self._upper_indices,
+            current_positions=current_positions,
+            playback_rate_hz=self._playback_rate_hz,
+            speed_scale=speed_scale,
+            entry_blend_sec=self._entry_blend_sec,
+            max_samples=self._MAX_PLAYBACK_SAMPLES,
+        )
+
+        with self._lock:
+            active_thread = self._playback_thread
+            if active_thread is not None and active_thread.is_alive():
+                if self._playback_stop.is_set():
+                    raise RuntimeError("previous playback is still stopping")
+                raise RuntimeError("already playing; stop first")
+            if self._playing:
+                raise RuntimeError("already playing; stop first")
+            self._playback_generation += 1
+            generation = self._playback_generation
+            self._playback_stop = stop_event
+            self._playing = True
+            self._playback_label = label
+            self._playback_frame = 0
+            self._playback_action_id = action_id
+            self._last_playback_error = None
+
+        def run():
+            published = 0
+            try:
+                period = 1.0 / self._playback_rate_hz
+                deadline = time.monotonic()
+                for i, (position, velocity) in enumerate(samples):
+                    if stop_event.is_set():
+                        break
+                    mode_error = self._lower_body_balance_error("playback")
+                    if mode_error:
+                        raise RuntimeError(mode_error["error"])
+                    now = time.monotonic()
+                    if now - deadline > period:
+                        deadline = now
+                    wait_time = deadline - time.monotonic()
+                    if wait_time > 0 and stop_event.wait(wait_time):
+                        break
+
+                    with self._lock:
+                        if generation != self._playback_generation:
+                            break
+                        self._playback_frame = min(
+                            len(frames) - 1,
+                            int(i * len(frames) / max(1, len(samples))),
+                        )
+                        self._playback_label = label
+                    if stop_event.is_set():
+                        break
+                    self._publish_override(position, velocity, weight=1.0)
+                    published += 1
+                    deadline += period
+            except Exception as exc:
+                with self._lock:
+                    self._last_playback_error = str(exc)
+            finally:
+                with self._lock:
+                    owns_generation = generation == self._playback_generation
+                try:
+                    if owns_generation:
+                        self._publish_override_release()
+                finally:
+                    with self._lock:
+                        owns_generation = generation == self._playback_generation
+                        if owns_generation and published:
+                            self._needs_reset = True
+                            self._reset_request_id = None
+                        if owns_generation:
+                            self._playing = False
+                            self._playback_label = ""
+                        error = self._last_playback_error
+                        if owns_generation and self._playback_action_id == action_id:
+                            self._playback_action_id = None
+                    completion = (
+                        "cancelled"
+                        if stop_event.is_set()
+                        else ("error" if error else "completed")
+                    )
+                    self._acp_notify(action_id, completion, {
+                        "label": label,
+                        "frames": len(frames),
+                        "samples_published": published,
+                        "error": error,
+                    }, self.PREFIX)
+
+        self._playback_thread = threading.Thread(target=run, daemon=True, name="t800-motion-playback")
+        self._playback_thread.start()
+
+    def _publish_override(self, position: list[float], velocity: list[float], *, weight: float) -> None:
+        if self._override_publisher is None or self._override_message_type is None:
+            raise RuntimeError("joint override publisher is not initialized")
+        msg = self._override_message_type()
+        msg.header.stamp = self._node.get_clock().now().to_msg()
+        msg.header.frame_id = ""
+        msg.weight = float(weight)
+        msg.joint_indices = list(self._upper_indices)
+        msg.position = list(position)
+        msg.velocity = list(velocity)
+        msg.feed_forward_torque = [0.0] * len(self._upper_indices)
+        msg.torque = [0.0] * len(self._upper_indices)
+        msg.stiffness = list(self._playback_stiffness)
+        msg.damping = list(self._playback_damping)
+        self._override_publisher.publish(msg)
+
+    def _publish_override_release(self) -> bool:
+        if self._override_publisher is None:
+            with self._lock:
+                self._override_release_failed = False
+            return True
+        zeros = [0.0] * len(self._upper_indices)
+        try:
+            self._publish_override(zeros, zeros, weight=0.0)
+        except Exception as exc:
+            with self._lock:
+                self._last_playback_error = str(exc)
+                self._override_release_failed = True
+            return False
+        with self._lock:
+            self._override_release_failed = False
+        return True
+
+    def _stop_playback(self) -> dict:
+        self._prepare_cancel.set()
+        with self._lock:
+            stop_event = self._playback_stop
+            was_playing = self._playing
+            frame = self._playback_frame
+            thread = self._playback_thread
+        stop_event.set()
+        still_stopping = thread is not None and thread.is_alive()
+        with self._lock:
+            if not still_stopping and thread is self._playback_thread:
+                self._playing = False
+        self._publish_override_release()
+        result = {
+            "state": (
+                "stopping"
+                if was_playing and still_stopping
+                else ("stopped" if was_playing else "idle")
+            ),
+            "frames_played": frame,
+        }
+        reset_result = self._cancel_reset(reason="motion_interrupt")
+        if reset_result is not None:
+            result["reset_result"] = reset_result
+        return result
+
+    def _cancel_reset(self, *, reason: str) -> dict | None:
+        with self._lock:
+            request_id = self._reset_request_id
+            action_id = self._reset_action_id
+            already_cancelling = self._reset_cancelling
+        if request_id is None:
+            return None
+
+        joint_plan = getattr(self, "_joint_plan", None)
+        if joint_plan is None:
+            cancel_result = {"error": "joint planner is unavailable"}
+        else:
+            try:
+                cancel_result = joint_plan.dispatch(
+                    "cancel", {"request_id": request_id}
+                )
+            except Exception as exc:
+                cancel_result = {"error": f"joint planner cancel failed: {exc}"}
+        with self._lock:
+            if (
+                self._reset_request_id != request_id
+                or self._reset_action_id != action_id
+            ):
+                return dict(self._last_reset or {})
+            self._reset_cancelling = True
+            self._needs_reset = True
+            self._last_reset = {
+                "state": "cancelling",
+                "request_id": request_id,
+                "action_id": action_id,
+                "reason": reason,
+                "cancel_result": cancel_result,
+                "cancel_retry": already_cancelling,
+            }
+            result = dict(self._last_reset)
+        return result
+
+    # ── Save/Load ─────────────────────────────────────────────────────────────
+
+    def _read_recording_file(
+        self,
+        file_path: Path,
+        *,
+        minimum_frames: int,
+    ) -> tuple[list[dict], dict]:
+        with file_path.open("rb") as stream:
+            raw_data = stream.read(self._MAX_RECORDING_FILE_BYTES + 1)
+        if len(raw_data) > self._MAX_RECORDING_FILE_BYTES:
+            raise ValueError(
+                f"recording file size exceeds maximum "
+                f"{self._MAX_RECORDING_FILE_BYTES} bytes"
+            )
+        data = json.loads(raw_data.decode("utf-8"))
+        return validate_recording_document(
+            data,
+            max_frames=self._MAX_FRAMES,
+            minimum_frames=minimum_frames,
+            max_duration_ms=self._MAX_RECORDING_DURATION_MS,
+            minimum_interval_ms=1000.0 / self._playback_rate_hz,
+        )
+
+    def _list_recordings(self) -> dict:
+        recordings = []
+        for fpath in sorted(self._recordings_dir.glob("*.json")):
+            try:
+                frames, meta = self._read_recording_file(
+                    fpath, minimum_frames=1
+                )
+                duration_ms = (
+                    frames[-1]["timestamp"] - frames[0]["timestamp"]
+                    if len(frames) > 1 else 0
+                )
+                recordings.append({
+                    "name": fpath.stem,
+                    "label": str(meta.get("label", fpath.stem)),
+                    "frames": len(frames),
+                    "duration_ms": duration_ms,
+                    "file": str(fpath),
+                })
+            except _RECORDING_FILE_ERRORS as exc:
+                recordings.append({
+                    "name": fpath.stem,
+                    "error": f"invalid recording: {exc}",
+                    "code": "INVALID_ARGUMENT",
+                    "file": str(fpath),
+                })
+
+        return {
+            "state": "ready",
+            "recordings": recordings,
+            "count": len(recordings),
+            "directory": str(self._recordings_dir),
+        }
+
+    def _delete(self, args: dict) -> dict:
+        name = str(args.get("name", ""))
+        if not name:
+            return {"error": "name is required"}
+        safe_name = name.replace(" ", "_").replace("/", "_")
+        file_path = self._recordings_dir / f"{safe_name}.json"
+        if not file_path.exists():
+            return {"error": f"recording not found: {name}"}
+        try:
+            file_path.unlink()
+        except OSError as exc:
+            return {"error": f"delete failed: {exc}"}
+        return {"state": "deleted", "name": name}
+
+    # ── Status ────────────────────────────────────────────────────────────────
+
+    def _status(self) -> dict:
+        self._refresh_reset_state()
+        with self._lock:
+            elapsed_ms = (
+                max(0, _now_ms() - self._record_start_ms)
+                if self._recording else 0
+            )
+            return {
+                "state": "recording" if self._recording else ("playing" if self._playing else "idle"),
+                "recording": self._recording,
+                "playing": self._playing,
+                "buffer_frames": len(self._frames),
+                "record_label": self._record_label if self._recording else "",
+                "record_elapsed_ms": elapsed_ms,
+                "record_hz": self._record_hz,
+                "record_session_id": self._record_session if self._recording else None,
+                "record_action_id": self._record_action_id,
+                "saving": bool(self._record_finalize_threads),
+                "save_workers": len(self._record_finalize_threads),
+                "preparing": (
+                    self._prepare_action_id is not None
+                ),
+                "prepare_operation": self._prepare_operation,
+                "prepare_action_id": self._prepare_action_id,
+                "playback_label": self._playback_label if self._playing else "",
+                "playback_frame": self._playback_frame if self._playing else 0,
+                "playback_error": self._last_playback_error,
+                "override_release_failed": self._override_release_failed,
+                "recordings_dir": str(self._recordings_dir),
+                "joint_data_available": self._latest_joint_positions is not None,
+                "last_recording": dict(self._last_recording) if self._last_recording else None,
+                "needs_reset": self._needs_reset,
+                "reset_pending": self._reset_request_id is not None,
+                "reset_cancel_pending": self._reset_cancelling,
+                "last_reset": dict(self._last_reset) if self._last_reset else None,
+                "acp": _t800_acp_status(),
+            }
+
+    # ── Plugin compatibility ──────────────────────────────────────────────────
+
+    def set_joint_plan(self, joint_plan):
+        """Inject the JointPlanPlugin reference for reset."""
+        self._joint_plan = joint_plan
+
+    def set_reset_controls(self, state, motion_mode) -> None:
+        """Inject motion-state controls used by reset and the recording gate."""
+        self._state = state
+        self._motion_mode = motion_mode
+
+    def set_interrupt_group(self, group: MotionInterruptGroup) -> None:
+        self._interrupt_group = group
+
+    def motion_active(self) -> bool:
+        with self._lock:
+            return (
+                self._recording
+                or self._playing
+                or self._prepare_action_id is not None
+                or self._reset_request_id is not None
+                or self._override_release_failed
+            )
+
+    def interrupt_motion(self) -> dict:
+        """Stop recorder-owned physical output without re-entering the group."""
+        self._prepare_cancel.set()
+        with self._lock:
+            was_recording = self._recording
+        recording_result = self._finalize_recording(
+            stop_reason="motion_interrupt", async_persist=True
+        )
+        playback_result = self._stop_playback()
+        result = dict(playback_result)
+        if was_recording:
+            result["recording_result"] = recording_result
+            if result.get("state") == "idle":
+                result["state"] = "stopped"
+        return result
+
+    def _lower_body_balance_error(self, operation: str) -> dict | None:
+        if self._state is None:
+            return {
+                "error": f"{operation} blocked: motion state is unavailable",
+                "current_motion_state": None,
+            }
+        current, _ = self._state.current_motion()
+        if current == "lower_body_balance":
+            return None
+        return {
+            "error": (
+                f"{operation} requires lower_body_balance "
+                f"(current: {current or 'unknown'}); playback stopped because "
+                "the motion state changed after automatic reset"
+            ),
+            "current_motion_state": current,
+        }
+
+    def _refresh_reset_state(self) -> None:
+        with self._lock:
+            request_id = self._reset_request_id
+            cancelling = self._reset_cancelling
+            if (
+                request_id is not None
+                and self._reset_action_id is not None
+                and self._prepare_action_id == self._reset_action_id
+            ):
+                return
+        joint_plan = getattr(self, "_joint_plan", None)
+        if request_id is None or joint_plan is None:
+            return
+        try:
+            status = joint_plan.dispatch("status", {})
+        except Exception as exc:
+            with self._lock:
+                if self._reset_request_id == request_id:
+                    self._last_reset = {
+                        **dict(self._last_reset or {}),
+                        "status_error": str(exc),
+                    }
+            return
+        if self._reset_status_is_quiescent(
+            request_id, status, joint_plan
+        ):
+            completed_action_id = None
+            completion_status = "completed"
+            completion_result = {
+                "request_id": request_id,
+                "motion_state": "lower_body_balance",
+            }
+            with self._lock:
+                if self._reset_request_id == request_id:
+                    cancelling = self._reset_cancelling
+                    completed_action_id = self._reset_action_id
+                    self._reset_request_id = None
+                    self._reset_action_id = None
+                    self._reset_cancelling = False
+                    if cancelling:
+                        previous = dict(self._last_reset or {})
+                        previous.pop("status_error", None)
+                        self._needs_reset = True
+                        self._last_reset = {
+                            **previous,
+                            "state": "cancelled",
+                            "request_id": request_id,
+                            "action_id": completed_action_id,
+                            "motion_state": "lower_body_balance",
+                        }
+                        completion_status = "cancelled"
+                        completion_result = {
+                            "request_id": request_id,
+                            "reason": previous.get("reason", "motion_interrupt"),
+                            "cancel_result": previous.get("cancel_result"),
+                        }
+                    else:
+                        self._needs_reset = False
+                        self._last_reset = {
+                            "state": "completed",
+                            "request_id": request_id,
+                            "action_id": completed_action_id,
+                            "motion_state": "lower_body_balance",
+                        }
+            if completed_action_id:
+                self._acp_notify(
+                    completed_action_id,
+                    completion_status,
+                    completion_result,
+                    self.PREFIX,
+                )
