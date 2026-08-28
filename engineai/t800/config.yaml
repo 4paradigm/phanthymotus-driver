@@ -78,10 +78,6 @@ plugins:
     enabled: true
   gesture:
     enabled: true
-  arm_swing:
-    enabled: true
-    default_amplitude_deg: 8.0
-    default_frequency_hz: 0.7
   head:
     enabled: true
     step_duration_sec: 0.35
