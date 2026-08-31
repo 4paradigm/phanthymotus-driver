@@ -71,40 +71,52 @@ class QianjiaoDevice:
         self._ros_node = None
         self._ros_pub = None
         self._video_proc = None
+        self._video_thread: threading.Thread | None = None
         self._video_cond = threading.Condition()
         self._video_frame = None
 
     def start_video_proxy(self):
-        if self._video_proc is not None and self._video_proc.poll() is None:
+        if self._video_thread and self._video_thread.is_alive():
             return
-        try:
-            self._video_proc = subprocess.Popen(["ffmpeg", "-loglevel", "fatal", "-rtsp_transport", "tcp", "-fflags", "+discardcorrupt", "-err_detect", "ignore_err", "-i", self.camera_rtsp, "-an", "-vf", "fps=10,scale=1280:-2", "-f", "mjpeg", "-q:v", "6", "pipe:1"], stdout=subprocess.PIPE)
-            threading.Thread(target=self._video_loop, daemon=True, name="qianjiao-video-proxy").start()
-        except Exception as exc:
-            self._last_error = f"video proxy: {exc}"
+        self._video_thread = threading.Thread(target=self._video_loop, daemon=True, name="qianjiao-video-proxy")
+        self._video_thread.start()
 
     def _video_loop(self):
-        buf = bytearray(); stream = self._video_proc.stdout
-        while not self._stop.is_set() and stream:
-            chunk = stream.read(4096)
-            if not chunk: break
-            buf.extend(chunk)
-            while True:
-                start = buf.find(b"\xff\xd8")
-                if start < 0:
-                    if len(buf) > 1:
-                        del buf[:-1]
-                    break
-                end = buf.find(b"\xff\xd9", start + 2)
-                if end < 0:
-                    if start:
-                        del buf[:start]
-                    break
-                frame = bytes(buf[start:end + 2])
-                del buf[:end + 2]
-                with self._video_cond:
-                    self._video_frame = frame
-                    self._video_cond.notify_all()
+        command = ["ffmpeg", "-loglevel", "fatal", "-rtsp_transport", "tcp", "-fflags", "+discardcorrupt", "-err_detect", "ignore_err", "-i", self.camera_rtsp, "-an", "-vf", "fps=10,scale=1280:-2", "-f", "mjpeg", "-q:v", "6", "pipe:1"]
+        while not self._stop.is_set():
+            buf = bytearray()
+            try:
+                self._video_proc = subprocess.Popen(command, stdout=subprocess.PIPE)
+                stream = self._video_proc.stdout
+                while not self._stop.is_set() and stream:
+                    chunk = stream.read(4096)
+                    if not chunk:
+                        break
+                    buf.extend(chunk)
+                    while True:
+                        start = buf.find(b"\xff\xd8")
+                        if start < 0:
+                            if len(buf) > 1:
+                                del buf[:-1]
+                            break
+                        end = buf.find(b"\xff\xd9", start + 2)
+                        if end < 0:
+                            if start:
+                                del buf[:start]
+                            break
+                        frame = bytes(buf[start:end + 2])
+                        del buf[:end + 2]
+                        with self._video_cond:
+                            self._video_frame = frame
+                            self._video_cond.notify_all()
+                if self._video_proc.poll() is None:
+                    self._video_proc.terminate()
+                self._video_proc.wait(timeout=2)
+            except Exception as exc:
+                self._last_error = f"video proxy: {exc}"
+            finally:
+                self._video_proc = None
+            self._stop.wait(1.0)
 
     def get_video_frame(self, timeout=5.0):
         with self._video_cond:
@@ -155,7 +167,12 @@ class QianjiaoDevice:
         if self._status_sock:
             self._status_sock.close()
             self._status_sock = None
-        if self._video_proc: self._video_proc.terminate()
+        if self._video_proc:
+            self._video_proc.terminate()
+            try:
+                self._video_proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self._video_proc.kill()
         if self._ros_node is not None:
             self._ros_node.destroy_node()
             self._ros_node = None
