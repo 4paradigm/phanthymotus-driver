@@ -118,6 +118,9 @@ class NavigationSensorCardContractTest(unittest.TestCase):
             "base_to_sensor_translation_m: [0.28945, 0.0, -0.046825]",
             "base_to_sensor_rotation_rpy_rad: [0.0, 2.8782, 0.0]",
             "device_to_sensor_rotation_matrix: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]",
+            "cloud_packets_per_scan: 2",
+            "cloud_min_range_m: 0.5",
+            "cloud_max_packet_gap_ms: 120",
         ):
             self.assertIn(expected, config)
 
@@ -136,6 +139,8 @@ class NavigationSensorCardContractTest(unittest.TestCase):
             'blockers.append("cloud_stale")',
             'blockers.append("imu_stale")',
             'blockers.append("worker_not_running")',
+            "merge_navigation_clouds(",
+            "min_range_m=self._cloud_min_range_m",
             'subprocess.Popen(',
         ):
             self.assertIn(expected, source)

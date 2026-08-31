@@ -81,7 +81,9 @@ latest-only；合法速度以 m/s 和 rad/s 原样交给 `SportClient.Move`。
 全部协方差。MID360 点云与 IMU 三轴平行，Go2 安装轴已对齐 REP-103，因此
 默认使用单位旋转。按 REP-145，静止且 Z 轴向上的 IMU 应输出 `+g`，这不是坐标翻转。
 原始逐点 `time` 的单位为秒，Driver 将其转为帧内严格递增的 FLOAT64
-绝对纳秒时间戳。隔离 worker、源时钟归一化、fail-closed 就绪检查和两张卡共享生命周期
+绝对纳秒时间戳。Go2 的单条 raw DDS 消息只是近场点占比很高的部分包，因此 Driver
+默认连续聚合两个包，拒绝间隔超过 120 ms 的跨缺口拼接，并过滤 0.5 m 内本体回波后
+再发布一帧导航点云；所有保留点仍携带原始 `ring` 和 `time`。隔离 worker、源时钟归一化、fail-closed 就绪检查和两张卡共享生命周期
 与 G1 导航传感器路径一致。同一 worker 还通过 ROS 2 静态变换广播器发布配置的
 `base_link -> utlidar_lidar` 安装外参。Go2 默认采用[宇树出厂 `radar_joint` 变换](https://github.com/unitreerobotics/unitree_ros/blob/master/robots/go2_description/urdf/go2_description.urdf)
 （`xyz=[0.28945, 0, -0.046825]`，`rpy=[0, 2.8782, 0]`）；外参缺失或非法时

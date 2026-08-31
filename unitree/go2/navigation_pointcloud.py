@@ -178,6 +178,7 @@ def unitree_mid360_to_navigation_cloud(
     fields: list[tuple[str, int, int, int]],
     header_stamp_ns: int,
     rotation_matrix: np.ndarray | None = None,
+    min_range_m: float = 0.0,
 ) -> bytes:
     """Convert Unitree's packed MID360 points to the navigation PCL schema.
 
@@ -190,10 +191,13 @@ def unitree_mid360_to_navigation_cloud(
     point_step = int(point_step)
     row_step = int(row_step)
     header_stamp_ns = int(header_stamp_ns)
+    min_range_m = float(min_range_m)
     if min(height, width, point_step, row_step, header_stamp_ns) < 1:
         raise ValueError(
             "height, width, point_step, row_step and header_stamp_ns must be positive"
         )
+    if not np.isfinite(min_range_m) or min_range_m < 0.0:
+        raise ValueError("min_range_m must be finite and non-negative")
     expected_row_step = width * point_step
     if row_step != expected_row_step:
         raise ValueError(
@@ -243,22 +247,49 @@ def unitree_mid360_to_navigation_cloud(
     absolute_timestamps_ns = np.float64(header_stamp_ns) + np.rint(
         relative_time_seconds.astype(np.float64, copy=False) * 1_000_000_000.0
     )
-    if point_count > 1 and not np.all(np.diff(absolute_timestamps_ns) > 0.0):
-        raise ValueError("MID360 time does not produce increasing timestamps")
 
     rotation = validated_rotation_matrix(rotation_matrix)
     xyz = np.column_stack((view("x"), view("y"), view("z"))).astype(
         np.float32, copy=False
     )
+    keep = np.isfinite(xyz).all(axis=1)
+    if min_range_m > 0.0:
+        keep &= np.linalg.norm(xyz, axis=1) >= min_range_m
+    if not keep.any():
+        return b""
     if not np.array_equal(rotation, np.eye(3)):
         xyz = xyz @ rotation.astype(np.float32).T
 
-    converted = np.zeros(point_count, dtype=_NAVIGATION_DTYPE)
-    converted["x"] = xyz[:, 0]
-    converted["y"] = xyz[:, 1]
-    converted["z"] = xyz[:, 2]
-    converted["intensity"] = view("intensity")
+    absolute_timestamps_ns = absolute_timestamps_ns[keep]
+    order = np.argsort(absolute_timestamps_ns, kind="stable")
+    absolute_timestamps_ns = absolute_timestamps_ns[order].copy()
+    for index in range(1, len(absolute_timestamps_ns)):
+        if absolute_timestamps_ns[index] <= absolute_timestamps_ns[index - 1]:
+            absolute_timestamps_ns[index] = np.nextafter(
+                absolute_timestamps_ns[index - 1], np.inf
+            )
+
+    kept_xyz = xyz[keep][order]
+    converted = np.zeros(len(order), dtype=_NAVIGATION_DTYPE)
+    converted["x"] = kept_xyz[:, 0]
+    converted["y"] = kept_xyz[:, 1]
+    converted["z"] = kept_xyz[:, 2]
+    converted["intensity"] = view("intensity")[keep][order]
     converted["tag"] = 0x10
-    converted["line"] = ring.astype(np.uint8, copy=False)
+    converted["line"] = ring[keep][order].astype(np.uint8, copy=False)
     converted["timestamp"] = absolute_timestamps_ns
     return converted.tobytes(order="C")
+
+
+def merge_navigation_clouds(clouds: list[bytes]) -> bytes:
+    """Merge converted packets into one timestamp-ordered navigation scan."""
+    payload = b"".join(cloud for cloud in clouds if cloud)
+    if not payload:
+        return b""
+    merged = np.frombuffer(payload, dtype=_NAVIGATION_DTYPE).copy()
+    merged = merged[np.argsort(merged["timestamp"], kind="stable")].copy()
+    timestamps = merged["timestamp"]
+    for index in range(1, len(timestamps)):
+        if timestamps[index] <= timestamps[index - 1]:
+            timestamps[index] = np.nextafter(timestamps[index - 1], np.inf)
+    return merged.tobytes(order="C")

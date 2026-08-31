@@ -93,7 +93,11 @@ all covariances. Go2 defaults to the identity rotation because the MID360 cloud
 and IMU axes are parallel and the installed sensor is REP-103 aligned. Per
 REP-145, a stationary upward sensor Z axis reports `+g`; this is not a frame
 inversion. Raw per-point `time` is in seconds and is converted to a strictly
-increasing FLOAT64 absolute nanosecond timestamp. The isolated worker,
+increasing FLOAT64 absolute nanosecond timestamp. Because one Go2 raw DDS
+message is only a partial near-field-heavy packet, the Driver combines two
+consecutive packets, rejects gaps over 120 ms, and removes returns below 0.5 m
+before publishing one navigation scan; `ring` and source `time` remain attached
+to every retained point. The isolated worker,
 source-clock normalization, fail-closed readiness checks, and shared card
 lifecycle match the G1 navigation sensor path. The same worker publishes the
 configured `base_link -> utlidar_lidar` mount through ROS 2's static transform

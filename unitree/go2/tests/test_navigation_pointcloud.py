@@ -14,6 +14,7 @@ from navigation_pointcloud import (
     NAVIGATION_POINT_STEP,
     FLOAT32,
     UINT16,
+    merge_navigation_clouds,
     rotate_covariance9,
     rotate_orientation_xyzw,
     rotate_vector3,
@@ -86,19 +87,61 @@ class Mid360ConversionTest(unittest.TestCase):
         )
         self.assertTrue(np.all(np.diff(points["timestamp"]) > 0.0))
 
-    def test_rejects_non_increasing_relative_seconds(self):
+    def test_sorts_non_increasing_relative_seconds(self):
         data = bytearray(self.make_cloud())
         struct.pack_into("<f", data, UNITREE_POINT_STEP + 24, 0.0001)
-        with self.assertRaisesRegex(ValueError, "increasing timestamps"):
-            unitree_mid360_to_navigation_cloud(
-                data=bytes(data),
-                height=1,
-                width=2,
-                point_step=UNITREE_POINT_STEP,
-                row_step=2 * UNITREE_POINT_STEP,
-                fields=UNITREE_FIELDS,
-                header_stamp_ns=1_000_000_000,
-            )
+        converted = unitree_mid360_to_navigation_cloud(
+            data=bytes(data),
+            height=1,
+            width=2,
+            point_step=UNITREE_POINT_STEP,
+            row_step=2 * UNITREE_POINT_STEP,
+            fields=UNITREE_FIELDS,
+            header_stamp_ns=1_000_000_000,
+        )
+        points = self.decode(converted)
+        np.testing.assert_allclose(points["x"], [-1.0, 1.0])
+        self.assertTrue(np.all(np.diff(points["timestamp"]) > 0.0))
+
+    def test_filters_near_field_and_merges_consecutive_packets(self):
+        data = bytearray(self.make_cloud())
+        struct.pack_into("<fff", data, 0, 0.1, 0.0, 0.0)
+        filtered = unitree_mid360_to_navigation_cloud(
+            data=bytes(data),
+            height=1,
+            width=2,
+            point_step=UNITREE_POINT_STEP,
+            row_step=2 * UNITREE_POINT_STEP,
+            fields=UNITREE_FIELDS,
+            header_stamp_ns=1_000_000_000,
+            min_range_m=0.5,
+        )
+        points = self.decode(filtered)
+        self.assertEqual(len(points), 1)
+        self.assertEqual(points["line"].tolist(), [3])
+
+        first = unitree_mid360_to_navigation_cloud(
+            data=self.make_cloud(),
+            height=1,
+            width=2,
+            point_step=UNITREE_POINT_STEP,
+            row_step=2 * UNITREE_POINT_STEP,
+            fields=UNITREE_FIELDS,
+            header_stamp_ns=1_000_000_000,
+        )
+        second = unitree_mid360_to_navigation_cloud(
+            data=self.make_cloud(),
+            height=1,
+            width=2,
+            point_step=UNITREE_POINT_STEP,
+            row_step=2 * UNITREE_POINT_STEP,
+            fields=UNITREE_FIELDS,
+            header_stamp_ns=1_050_000_000,
+        )
+        merged = self.decode(merge_navigation_clouds([first, second]))
+        self.assertEqual(len(merged), 4)
+        self.assertEqual(merged["line"].tolist(), [0, 0, 3, 3])
+        self.assertTrue(np.all(np.diff(merged["timestamp"]) > 0.0))
 
     def test_rejects_missing_time_field(self):
         with self.assertRaisesRegex(ValueError, "missing MID360 field: time"):

@@ -29,6 +29,7 @@ from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
 from navigation_pointcloud import (
     NAVIGATION_FIELDS,
     NAVIGATION_POINT_STEP,
+    merge_navigation_clouds,
     rotate_covariance9,
     rotate_orientation_xyzw,
     rotate_vector3,
@@ -126,6 +127,16 @@ class _NavigationSensorNode(Node):
                 config.get("sensor_rotation_matrix"),
             )
         )
+        self._cloud_packets_per_scan = int(config.get("cloud_packets_per_scan", 2))
+        self._cloud_min_range_m = float(config.get("cloud_min_range_m", 0.5))
+        cloud_max_packet_gap_ms = float(config.get("cloud_max_packet_gap_ms", 120.0))
+        if self._cloud_packets_per_scan < 1:
+            raise ValueError("cloud_packets_per_scan must be positive")
+        if not math.isfinite(self._cloud_min_range_m) or self._cloud_min_range_m < 0.0:
+            raise ValueError("cloud_min_range_m must be finite and non-negative")
+        if not math.isfinite(cloud_max_packet_gap_ms) or cloud_max_packet_gap_ms <= 0.0:
+            raise ValueError("cloud_max_packet_gap_ms must be finite and positive")
+        self._cloud_max_packet_gap_ns = int(cloud_max_packet_gap_ms * 1_000_000)
 
         # Do not use ``self._clock``: rclpy.node.Node owns that attribute and
         # get_clock() returns it internally.
@@ -171,6 +182,10 @@ class _NavigationSensorNode(Node):
             "cloud_invalid_timestamps": 0,
             "imu_invalid_timestamps": 0,
             "stamp_clamped": 0,
+            "cloud_raw_points": 0,
+            "cloud_environment_points": 0,
+            "cloud_packets_aggregated": 0,
+            "cloud_aggregation_resets": 0,
         }
         self._last_receive_monotonic = {"cloud": 0.0, "imu": 0.0}
 
@@ -188,6 +203,8 @@ class _NavigationSensorNode(Node):
             f"static_tf={self._base_frame}->{self._sensor_frame} "
             f"xyz={self._base_to_sensor_translation} "
             f"rpy={self._base_to_sensor_rpy}, "
+            f"cloud_packets_per_scan={self._cloud_packets_per_scan}, "
+            f"cloud_min_range_m={self._cloud_min_range_m}, "
             f"device_to_sensor_rotation={self._sensor_rotation.reshape(9).tolist()}"
         )
 
@@ -271,6 +288,8 @@ class _NavigationSensorNode(Node):
         self._maybe_publish_status()
 
     def _cloud_loop(self) -> None:
+        pending_packets = []
+        previous_stamp_ns = None
         while not self._stop.is_set():
             try:
                 item = self._cloud_queue.get(timeout=0.5)
@@ -290,6 +309,13 @@ class _NavigationSensorNode(Node):
                 data,
                 is_dense,
             ) = item
+            if pending_packets and (
+                corrected_ns <= previous_stamp_ns
+                or corrected_ns - previous_stamp_ns > self._cloud_max_packet_gap_ns
+            ):
+                pending_packets.clear()
+                self._counters["cloud_aggregation_resets"] += 1
+            previous_stamp_ns = corrected_ns
             try:
                 converted = unitree_mid360_to_navigation_cloud(
                     data=data,
@@ -300,11 +326,30 @@ class _NavigationSensorNode(Node):
                     fields=fields,
                     header_stamp_ns=corrected_ns,
                     rotation_matrix=self._sensor_rotation,
+                    min_range_m=self._cloud_min_range_m,
                 )
+                self._counters["cloud_raw_points"] += height * width
+                self._counters["cloud_environment_points"] += (
+                    len(converted) // NAVIGATION_POINT_STEP
+                )
+                pending_packets.append((corrected_ns, converted, is_dense))
+                if len(pending_packets) < self._cloud_packets_per_scan:
+                    continue
+
+                frame_stamp_ns = pending_packets[0][0]
+                converted = merge_navigation_clouds(
+                    [packet[1] for packet in pending_packets]
+                )
+                is_dense = all(packet[2] for packet in pending_packets)
+                self._counters["cloud_packets_aggregated"] += len(pending_packets)
+                pending_packets.clear()
+                if not converted:
+                    self._counters["cloud_dropped"] += 1
+                    continue
                 out = PointCloud2()
-                self._set_stamp(out.header, corrected_ns, self._sensor_frame)
+                self._set_stamp(out.header, frame_stamp_ns, self._sensor_frame)
                 out.height = 1
-                out.width = height * width
+                out.width = len(converted) // NAVIGATION_POINT_STEP
                 out.fields = [
                     PointField(
                         name=field.name,
@@ -324,6 +369,10 @@ class _NavigationSensorNode(Node):
                 self._cloud_pub.publish(out)
                 self._counters["cloud_published"] += 1
             except (TypeError, ValueError) as exc:
+                if pending_packets:
+                    pending_packets.clear()
+                    self._counters["cloud_aggregation_resets"] += 1
+                previous_stamp_ns = None
                 self._counters["cloud_dropped"] += 1
                 if self._counters["cloud_dropped"] <= 3:
                     self.get_logger().warning(
@@ -452,6 +501,11 @@ class _NavigationSensorNode(Node):
                 "device_to_sensor_rotation_matrix": [
                     float(value) for value in self._sensor_rotation.reshape(9)
                 ],
+                "cloud_processing": {
+                    "packets_per_scan": self._cloud_packets_per_scan,
+                    "min_range_m": self._cloud_min_range_m,
+                    "max_packet_gap_ms": self._cloud_max_packet_gap_ns / 1_000_000,
+                },
             },
             separators=(",", ":"),
         )
