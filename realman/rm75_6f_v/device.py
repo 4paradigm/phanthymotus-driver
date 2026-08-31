@@ -75,6 +75,14 @@ def _bounded_float(value, name, lower, upper):
     return result
 
 
+def _bool_arg(value, name, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    raise ValueError(f"{name} must be a boolean")
+
+
 def _with_completion(schema, actions, timeout=30):
     schema = dict(schema)
     schema["x-completion"] = {"actions": actions, "timeout": timeout}
@@ -662,6 +670,8 @@ class RM75Nodes:
 
 
 class RM75StatePlugin:
+    PREFIX = "realman_state"
+
     def __init__(self, nodes):
         self.nodes = nodes
 
@@ -709,9 +719,12 @@ class RM75StatePlugin:
 
 
 class RM75JointControlPlugin:
+    PREFIX = "realman_joint_control"
+
     ACTIONS = {
         "set": (["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7", "speed", "block", "wait_result", "timeout"], "输入 joint1..joint7 的目标关节角，单位 rad；未输入的关节默认 0"),
         "stopmotion": (["block"], "立即停止机械臂运动"),
+        "clear_joint_error": (["joint_num"], "清除指定关节错误码，joint_num 为 1 到 7"),
     }
 
     def __init__(self, nodes):
@@ -731,6 +744,7 @@ class RM75JointControlPlugin:
             "block": {"type": "boolean", "default": False, "description": "是否使用 rm_driver 阻塞模式"},
             "wait_result": {"type": "boolean", "default": False, "description": "优先等待 movej_result；默认按 /joint_states/状态同步等待完成"},
             "timeout": {"type": "number", "minimum": 0.1, "maximum": 30, "default": 10, "description": "等待结果超时时间，单位秒"},
+            "joint_num": {"type": "integer", "minimum": 1, "maximum": self.nodes.dof, "description": "需要清错的关节编号，范围 1 到 7"},
         })
         return tool(
             "joint_control",
@@ -756,14 +770,16 @@ class RM75JointControlPlugin:
             return self.nodes.start_movej_action(
                 self._joint_targets(args),
                 speed=_bounded_int(args.get("speed", 5), "speed", 1, 30),
-                block=args.get("block", False),
+                block=_bool_arg(args.get("block"), "block"),
                 trajectory_connect=0,
-                wait_result=args.get("wait_result", False),
+                wait_result=_bool_arg(args.get("wait_result"), "wait_result"),
                 timeout=args.get("timeout"),
                 tool_name="joint_control",
             )
         if action in ("stopmotion", "stop"):
-            return self.nodes.publish_stop(block=args.get("block", False))
+            return self.nodes.publish_stop(block=_bool_arg(args.get("block"), "block"))
+        if action == "clear_joint_error":
+            return self.nodes.clear_joint_error(_require(args, "joint_num"))
         return None
 
     def _joint_targets(self, args):

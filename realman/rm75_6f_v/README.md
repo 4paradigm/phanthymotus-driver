@@ -50,7 +50,7 @@ Use `state`, `joint_states`, `joint_error`, and `rm_error` first. The `joint_con
 - HTTP service: `/health` and `/mcp` on port `15718`.
 - MCP resources: `model` returns a simplified URDF for skeleton rendering.
 - MCP sensors: `state`, `joint_states`, `arm_state`, `arm_original_state`, `arm_current_status`, `joint_error`, `rm_error`, plus optional command result streams when matching `rm_ros_interfaces` message types are available. `state` is a request/response snapshot and intentionally has no `topic_out`; use the individual stream tools for topic-backed cards.
-- MCP actuator: `joint_control` supports `set` and `stopmotion`. The `set` action exposes seven numeric inputs, `joint1` through `joint7`, defaults omitted joints to `0.0`, and publishes them as one full 7-DOF `movej` command.
+- MCP actuator: `joint_control` supports `set`, `stopmotion`, and `clear_joint_error`. The `set` action exposes seven numeric inputs, `joint1` through `joint7`, defaults omitted joints to `0.0`, and publishes them as one full 7-DOF `movej` command. `clear_joint_error` publishes the official joint-error-clear command for `joint_num` 1 through 7.
 
 `joint_control` uses explicit `joint1`..`joint7` target values and defaults omitted joints to `0.0`, so it never guesses omitted joints from `/joint_states`. Out-of-limit or non-finite joint values are rejected before any command is published.
 
