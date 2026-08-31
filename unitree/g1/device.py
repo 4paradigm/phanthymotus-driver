@@ -1383,12 +1383,13 @@ class LocoPlugin:
     #   801 走跑运控 (renumbered to 802 on 29-DoF from ai_sport 8.6.x.x)
     #
     # Two separate ways down from 主运控, and they are NOT interchangeable:
-    #   * 706 平衡下蹲、蹲起 — balanced squat, connects only to LOCO_STATES. Squatting
-    #     down and standing back up are the SAME id, i.e. it is a toggle. This is the
-    #     safe pair.
-    #   * 2/3 位控下蹲/落座 — position modes with no balance control, reachable from
-    #     阻尼 and needing 预备 + R1+X to get back up. Standing up this way is the
-    #     unbalanced path and is not used here.
+    #   * 706 平衡下蹲、蹲起 — balanced squat (遥控器 L2+A 蹲站切换). Getting back up
+    #     goes through 阻尼: 遥控说明 § 模式切换 note 1 says L2+A from 蹲姿 requires
+    #     L2+B first, and 蹲姿开机流程 is likewise ① 阻尼 → ⑥ 蹲站切换. So the damp
+    #     hop is part of the documented path, not a failure.
+    #   * 2/3/4 位控下蹲/落座/锁定站立 — position modes with no balance control.
+    #     锁定站立 (L2+UP) then R1+X is the *unbalanced* way to stand and is not
+    #     used here; 躺卧站立 (⑤) and 蹲站切换 (⑥) are the balanced ones.
     _LOCO_STATES     = _SMS.LOCO_STATES       # 500/501/801/802 — upright, balanced
     _LIMP_STATES     = _SMS.LIMP_STATES       # 0/1 — limp, posture is ambiguous
     _POSITION_STATES = {2, 3, 4}              # 位控下蹲/落座/锁定站立 — no balance
@@ -1436,9 +1437,9 @@ class LocoPlugin:
                            "lie2standup=躺起(阻尼/零力矩→主运控), standup2lie=安全躺下(主运控→阻尼), "
                            "damp=阻尼, zero_torque=零力矩, emergency_stop=紧急阻尼(任何状态都接受), "
                            "get_current_mode=查询当前模式+姿态. "
-                           "注意 706(平衡下蹲、蹲起) 只与主运控直连；一旦落到阻尼(1)，"
-                           "平衡蹲姿就回不去了，只能用遥控器恢复。"
-                           "模式不等于姿态：阻尼下躺和蹲是同一个 fsm_id，姿态请看 posture 工具。",
+                           "注意 蹲站切换(L2+A) 回主运控必须先经过阻尼(L2+B)，驱动已自动包含这一步；"
+                           "模式不等于姿态：阻尼下躺和蹲是同一个 fsm_id，"
+                           "所以蹲着用 squat2standup、躺着用 lie2standup，姿态请看 posture 工具。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1635,20 +1636,20 @@ class LocoPlugin:
             elif mode == "squat2standup":
                 if current_fsm in self._LOCO_STATES:
                     return _state({"info": "Robot is already standing"})
-                if current_fsm == self._BALANCED_SQUAT:
-                    # Squat2StandUp() also sets 706 — same toggle. The controller then
-                    # carries the robot back to 主运控 on its own.
-                    steps = [("Squat2StandUp", self._LOCO_STATES, "squat2standup", self._STAND_TIMEOUT)]
+                # 遥控说明 § 模式切换 note 1: after L2+A drops from 主运控 to 蹲姿,
+                # getting back to 主运控 requires L2+B (阻尼) FIRST and then L2+A
+                # again — 706 does not toggle straight back. The documented
+                # 蹲姿开机流程 is the same two steps: ① 阻尼 → ⑥ 蹲站切换.
+                # So always hop through damp, whether we sit at 706 or are already
+                # limp. Damp() from 阻尼 is a no-op and its poll passes immediately.
+                if current_fsm == self._BALANCED_SQUAT or current_fsm in self._LIMP_STATES:
+                    if posture and posture.get("posture") == "lying":
+                        return _state({"error": "Posture reads as lying, not squatting — "
+                                                "use lie2standup (躺卧站立) instead."})
+                    steps = [("Damp", 1, "damp", 10.0),
+                             ("Squat2StandUp", self._LOCO_STATES, "squat2standup",
+                              self._STAND_TIMEOUT)]
                     return self._async_fsm(mode, steps)
-                if current_fsm in self._LIMP_STATES:
-                    pose = posture.get("posture", "unknown")
-                    hint = ("Posture reads as lying — use lie2standup." if pose == "lying"
-                            else "Posture reads as a collapsed squat. The balanced squat (706) "
-                                 "cannot be re-entered from 阻尼; only the unbalanced 位控 path "
-                                 "(预备 → R1+X) leads back up, which this driver will not do "
-                                 "automatically. Recover with the remote control.")
-                    return _state({"error": f"Robot is limp in {_SMS.fsm_name(current_fsm)}, "
-                                            f"not in a balanced squat. {hint}"})
                 return _state({"error": f"Cannot stand up from {_SMS.fsm_name(current_fsm)}"})
 
             elif mode == "lie2standup":
@@ -1658,12 +1659,11 @@ class LocoPlugin:
                     return _state({"error": f"躺起 (702) expects the robot limp on the ground "
                                             f"(FSM 0/1), but it is in {_SMS.fsm_name(current_fsm)}."})
                 if posture and posture.get("posture") == "squat":
-                    return _state({"error": "Posture reads as a folded squat, not lying flat. "
-                                            "Running 躺起 from here may not recover. Use the "
-                                            "remote control, or emergency_stop then reposition."})
-                steps = []
-                if current_fsm == 0:
-                    steps.append(("Damp", 1, "damp", 10.0))
+                    return _state({"error": "Posture reads as a folded squat, not lying flat — "
+                                            "use squat2standup (蹲站切换) instead."})
+                # 躺倒开机流程: ① 阻尼 → ⑤ 躺卧站立. Damp first unconditionally; from
+                # 阻尼 it is a no-op whose poll passes at once.
+                steps = [("Damp", 1, "damp", 10.0)]
                 # Lie2StandUp() sets FSM 702 (躺起) — it does not jump straight to 500.
                 # Wait for 702 to latch, then for the controller to carry it to 主运控.
                 steps.append(("Lie2StandUp", self._LIE_TO_STAND, "lie2standup", self._SQUAT_TIMEOUT))

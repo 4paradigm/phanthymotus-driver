@@ -307,23 +307,33 @@ class TestSquatTargets(unittest.TestCase):
         res = switch(plugin, "standup2squat")
         self.assertIn("info", res)
 
-    def test_squat2standup_from_706_targets_loco(self):
+    def test_squat2standup_from_706_hops_through_damp(self):
+        # 遥控说明 § 模式切换 note 1: L2+A from 蹲姿 needs L2+B (阻尼) first.
         plugin, _ = make_plugin(706)
-        res = switch(plugin, "squat2standup")
-        self.assertEqual(step_targets(res["_steps"], "squat2standup"), set(SMS.LOCO_STATES))
+        steps = switch(plugin, "squat2standup")["_steps"]
+        self.assertEqual([s[2] for s in steps], ["damp", "squat2standup"])
+        self.assertEqual(step_targets(steps, "damp"), {1})
+        self.assertEqual(step_targets(steps, "squat2standup"), set(SMS.LOCO_STATES))
 
-    def test_squat2standup_from_damp_is_refused_with_posture_hint(self):
-        # The exact hardware failure: limp in 阻尼, physically squatting.
+    def test_squat2standup_from_damp_stands_up(self):
+        # 蹲姿开机流程: ① 阻尼 → ⑥ 蹲站切换. Being limp in a squat is recoverable,
+        # so this must NOT be refused.
         plugin, _ = make_plugin(1, posture={"posture": "squat"})
         res = switch(plugin, "squat2standup")
-        self.assertIn("error", res)
-        self.assertIn("706", res["error"])
-        self.assertNotIn("_steps", res, "must not fire a doomed sequence")
+        self.assertNotIn("error", res)
+        self.assertEqual([s[2] for s in res["_steps"]], ["damp", "squat2standup"])
 
-    def test_squat2standup_from_damp_while_lying_points_at_lie2standup(self):
+    def test_squat2standup_from_zero_torque_stands_up(self):
+        plugin, _ = make_plugin(0, posture={"posture": "squat"})
+        res = switch(plugin, "squat2standup")
+        self.assertNotIn("error", res)
+        self.assertEqual(step_targets(res["_steps"], "damp"), {1})
+
+    def test_squat2standup_while_lying_points_at_lie2standup(self):
         plugin, _ = make_plugin(1, posture={"posture": "lying"})
         res = switch(plugin, "squat2standup")
         self.assertIn("lie2standup", res["error"])
+        self.assertNotIn("_steps", res)
 
     def test_squat2standup_idempotent_when_standing(self):
         for fsm in SMS.LOCO_STATES:
@@ -332,9 +342,11 @@ class TestSquatTargets(unittest.TestCase):
 
 
 class TestLieToStand(unittest.TestCase):
-    def test_waits_for_702_then_loco(self):
+    def test_damps_then_waits_for_702_then_loco(self):
+        # 躺倒开机流程: ① 阻尼 → ⑤ 躺卧站立.
         plugin, _ = make_plugin(1, posture={"posture": "lying"})
         steps = switch(plugin, "lie2standup")["_steps"]
+        self.assertEqual([s[2] for s in steps], ["damp", "lie2standup", "start"])
         self.assertEqual(step_targets(steps, "lie2standup"), {702})
         self.assertEqual(step_targets(steps, "start"), set(SMS.LOCO_STATES))
 
@@ -346,7 +358,7 @@ class TestLieToStand(unittest.TestCase):
     def test_refused_when_posture_is_a_squat(self):
         plugin, _ = make_plugin(1, posture={"posture": "squat"})
         res = switch(plugin, "lie2standup")
-        self.assertIn("error", res)
+        self.assertIn("squat2standup", res["error"])
         self.assertNotIn("_steps", res)
 
     def test_refused_from_706(self):
