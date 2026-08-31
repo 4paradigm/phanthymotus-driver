@@ -1,0 +1,12 @@
+name: "潜蛟 2.0 Pro ROV"
+mcp_port: 15719
+ros_namespace: ""
+rov:
+  # The vehicle listens on UDP 14550. Set the vehicle address for udpout mode.
+  target_ip: "192.168.2.1"
+  target_port: 14550
+  source_system: 255
+  source_component: 190
+  heartbeat_timeout: 3.0
+  heartbeat_rate: 1.0
+  mock: false
