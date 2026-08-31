@@ -30,13 +30,13 @@ PYTHONPATH=/mnt/e/第四范式/phanthymotus-driver-main/phanthymotus-driver-main
 Health check:
 
 ```bash
-curl http://localhost:15721/health
+curl http://localhost:15718/health
 ```
 
 List MCP tools:
 
 ```bash
-curl -s http://localhost:15721/mcp \
+curl -s http://localhost:15718/mcp \
   -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
 ```
@@ -47,9 +47,9 @@ Use `state`, `joint_states`, `joint_error`, and `rm_error` first. The `arm_motio
 
 ## Driver surface
 
-- HTTP service: `/health` and `/mcp`.
+- HTTP service: `/health` and `/mcp` on port `15718`.
 - MCP resources: `model` returns a simplified URDF for skeleton rendering.
-- MCP sensors: `state`, `joint_states`, `arm_state`, `arm_original_state`, `arm_current_status`, `joint_error`, `rm_error`, plus optional command result streams when matching `rm_ros_interfaces` message types are available.
+- MCP sensors: `state`, `joint_states`, `arm_state`, `arm_original_state`, `arm_current_status`, `joint_error`, `rm_error`, plus optional command result streams when matching `rm_ros_interfaces` message types are available. `state` is a request/response snapshot and intentionally has no `topic_out`; use the individual stream tools for topic-backed cards.
 - MCP actuator: `arm_motion` supports `movej`, `stopmotion`, and `clear_joint_error`.
 - MCP single-joint actuator: `joint_control` supports `set`, `nudge`, and `stopmotion`. Select `joint1` through `joint7` inside the card; it reads the latest `/joint_states`, replaces only the selected joint target, and publishes a full 7-DOF `movej` command.
 

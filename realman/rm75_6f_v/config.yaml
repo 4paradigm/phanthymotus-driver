@@ -1,4 +1,4 @@
-mcp_port: 15721
+mcp_port: 15718
 ros_namespace: ""
 name: "睿尔曼 RM75-6F-V"
 arm_dof: 7

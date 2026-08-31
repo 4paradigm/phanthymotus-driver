@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
 from pathlib import Path
@@ -28,6 +29,43 @@ ARM_STATUS = {
     13: "force_drag",
     14: "teach",
 }
+
+
+def _require(args, key):
+    if key not in args:
+        raise ValueError(f"missing required argument: {key}")
+    return args[key]
+
+
+def _finite_float(value, name):
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite number") from exc
+    if not math.isfinite(result):
+        raise ValueError(f"{name} must be a finite number")
+    return result
+
+
+def _finite_int(value, name):
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+
+
+def _bounded_int(value, name, lower, upper):
+    result = _finite_int(value, name)
+    if result < lower or result > upper:
+        raise ValueError(f"{name} must be in [{lower}, {upper}]")
+    return result
+
+
+def _bounded_float(value, name, lower, upper):
+    result = _finite_float(value, name)
+    if result < lower or result > upper:
+        raise ValueError(f"{name} must be in [{lower}, {upper}]")
+    return result
 
 
 class RM75Nodes:
@@ -174,11 +212,21 @@ class RM75Nodes:
         return {"state": "requested", "topic": self.topics["arm_state_cmd"]}
 
     def publish_movej(self, joints, speed=20, block=False, trajectory_connect=0, wait_result=False, timeout=None):
+        if not isinstance(joints, (list, tuple)):
+            raise ValueError("joints must be an array of finite numbers")
         if len(joints) != self.dof:
             raise ValueError(f"movej requires exactly {self.dof} joint angles in radians")
-        speed = int(speed)
+        joints = [_finite_float(value, f"joints[{idx}]") for idx, value in enumerate(joints)]
+        speed = _finite_int(speed, "speed")
         if speed < 1 or speed > 100:
             raise ValueError("speed must be in [1, 100]")
+        trajectory_connect = _finite_int(trajectory_connect, "trajectory_connect")
+        if trajectory_connect not in (0, 1):
+            raise ValueError("trajectory_connect must be 0 or 1")
+        if timeout is not None:
+            timeout = _finite_float(timeout, "timeout")
+            if timeout <= 0 or timeout > 30:
+                raise ValueError("timeout must be in (0, 30]")
         preflight = self.preflight_movej(joints)
         if preflight:
             return preflight
@@ -225,7 +273,7 @@ class RM75Nodes:
             else:
                 continue
             if 0 <= target_idx < self.dof:
-                positions[target_idx] = float(item.get("q", 0.0))
+                positions[target_idx] = _finite_float(item.get("q", 0.0), f"current joint{target_idx + 1}")
                 found.add(target_idx)
         if len(found) < self.dof:
             missing = [idx + 1 for idx in range(self.dof) if idx not in found]
@@ -239,9 +287,9 @@ class RM75Nodes:
         current = self.current_joint_positions()
         before = current[joint_index - 1]
         if mode == "absolute":
-            target = float(value)
+            target = _finite_float(value, "target")
         elif mode == "relative":
-            target = before + float(value)
+            target = before + _finite_float(value, "delta")
         else:
             raise ValueError("mode must be 'absolute' or 'relative'")
         current[joint_index - 1] = target
@@ -274,7 +322,7 @@ class RM75Nodes:
         return result
 
     def clear_joint_error(self, joint_num):
-        joint_num = int(joint_num)
+        joint_num = _finite_int(joint_num, "joint_num")
         if joint_num < 1 or joint_num > self.dof:
             raise ValueError(f"joint_num must be in [1, {self.dof}]")
         msg = self._Jointerrclear()
@@ -292,7 +340,10 @@ class RM75Nodes:
             return self.sequences.get(key, 0)
 
     def wait_for_update(self, key, baseline, timeout):
-        deadline = time.monotonic() + float(timeout)
+        timeout = _finite_float(timeout, "timeout")
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        deadline = time.monotonic() + timeout
         with self.condition:
             while self.sequences.get(key, 0) <= baseline:
                 remaining = deadline - time.monotonic()
@@ -313,13 +364,16 @@ class RM75Nodes:
                 return self._reject("joint_state_stale", f"/joint_states is stale ({age:.2f}s)")
         limits = self.safety.get("joint_limits_rad") or []
         for idx, value in enumerate(joints):
+            value = _finite_float(value, f"joints[{idx}]")
             if idx >= len(limits):
                 continue
             lower, upper = limits[idx]
-            if float(value) < float(lower) or float(value) > float(upper):
+            lower = _finite_float(lower, f"joint_limits_rad[{idx}][0]")
+            upper = _finite_float(upper, f"joint_limits_rad[{idx}][1]")
+            if value < lower or value > upper:
                 return self._reject(
                     "joint_limit",
-                    f"joint{idx + 1} target {float(value):.4f} rad is outside [{float(lower):.4f}, {float(upper):.4f}]",
+                    f"joint{idx + 1} target {value:.4f} rad is outside [{lower:.4f}, {upper:.4f}]",
                 )
         if self.safety.get("require_no_errors", True):
             with self.lock:
@@ -406,7 +460,7 @@ class RM75StatePlugin:
 
     def get_tools(self):
         definitions = [
-            tool("state", "sensor", "RM75-6F-V 聚合状态快照"),
+            tool("state", "sensor", "RM75-6F-V 聚合状态快照（request/response，无 topic_out）"),
             tool("refresh_state", "actuator", "请求睿尔曼 rm_driver 发布当前机械臂状态"),
             tool("model", "resource", "RM75-6F-V 简化 URDF 模型，用于卡片系统骨架渲染"),
         ]
@@ -432,6 +486,8 @@ class RM75StatePlugin:
             if name in self.nodes.streams:
                 item = self.nodes.streams[name]
                 return {"state": "running", "topic_out": [{"topic": item["topic"], "format": item["format"]}]}
+            if name == "state":
+                return {"state": "ready", "mode": "snapshot", "topic_out": []}
             return {"state": "ready"}
         if name == "state":
             return self.nodes.snapshot()
@@ -485,7 +541,7 @@ class RM75MotionPlugin:
             return {"state": "idle"}
         if action == "movej":
             return self.nodes.publish_movej(
-                args["joints"],
+                _require(args, "joints"),
                 speed=args.get("speed", 20),
                 block=args.get("block", False),
                 trajectory_connect=args.get("trajectory_connect", 0),
@@ -495,7 +551,7 @@ class RM75MotionPlugin:
         if action in ("stopmotion", "stop"):
             return self.nodes.publish_stop(block=args.get("block", False))
         if action == "clear_joint_error":
-            return self.nodes.clear_joint_error(args["joint_num"])
+            return self.nodes.clear_joint_error(_require(args, "joint_num"))
         return None
 
 
@@ -550,8 +606,8 @@ class RM75JointControlPlugin:
             return self.nodes.move_single_joint(
                 self._joint_index(args),
                 mode="absolute",
-                value=args["target"],
-                speed=args.get("speed", 5),
+                value=_require(args, "target"),
+                speed=_bounded_int(args.get("speed", 5), "speed", 1, 30),
                 block=args.get("block", False),
                 wait_result=args.get("wait_result", False),
                 timeout=args.get("timeout"),
@@ -560,8 +616,8 @@ class RM75JointControlPlugin:
             return self.nodes.move_single_joint(
                 self._joint_index(args),
                 mode="relative",
-                value=args.get("delta", 0.02),
-                speed=args.get("speed", 5),
+                value=_bounded_float(args.get("delta", 0.02), "delta", -0.2, 0.2),
+                speed=_bounded_int(args.get("speed", 5), "speed", 1, 30),
                 block=args.get("block", False),
                 wait_result=args.get("wait_result", False),
                 timeout=args.get("timeout"),
