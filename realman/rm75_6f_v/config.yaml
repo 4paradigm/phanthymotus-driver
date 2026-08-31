@@ -10,6 +10,7 @@ safety:
   max_state_age_seconds: 2.0
   max_result_wait_seconds: 10.0
   joint_target_tolerance_rad: 0.01
+  movej_blend_radius: 0
   joint_limits_rad:
     - [-3.10, 3.10]
     - [-2.35, 2.35]

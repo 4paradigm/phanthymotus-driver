@@ -224,14 +224,16 @@ class RM75Nodes:
         self.arm_state_request_pub.publish(Empty())
         return {"state": "requested", "topic": self.topics["arm_state_cmd"]}
 
-    def publish_movej(self, joints, speed=20, block=False, trajectory_connect=0, wait_result=False, timeout=None):
-        joints, speed, trajectory_connect, timeout = self._normalize_movej_args(joints, speed, trajectory_connect, timeout)
+    def publish_movej(self, joints, speed=20, block=False, trajectory_connect=0, wait_result=False, timeout=None, blend_radius=None):
+        joints, speed, trajectory_connect, timeout, blend_radius = self._normalize_movej_args(
+            joints, speed, trajectory_connect, timeout, blend_radius
+        )
         preflight = self.preflight_movej(joints)
         if preflight:
             return preflight
-        return self._publish_movej_checked(joints, speed, block, trajectory_connect, wait_result, timeout)
+        return self._publish_movej_checked(joints, speed, block, trajectory_connect, wait_result, timeout, blend_radius)
 
-    def _normalize_movej_args(self, joints, speed=20, trajectory_connect=0, timeout=None):
+    def _normalize_movej_args(self, joints, speed=20, trajectory_connect=0, timeout=None, blend_radius=None):
         if not isinstance(joints, (list, tuple)):
             raise ValueError("joints must be an array of finite numbers")
         if len(joints) != self.dof:
@@ -244,26 +246,36 @@ class RM75Nodes:
         if trajectory_connect not in (0, 1):
             raise ValueError("trajectory_connect must be 0 or 1")
         timeout = self._motion_timeout(timeout)
-        return joints, speed, trajectory_connect, timeout
+        if blend_radius is None:
+            blend_radius = self.safety.get("movej_blend_radius", 0)
+        blend_radius = _finite_float(blend_radius, "blend_radius")
+        if blend_radius < 0:
+            raise ValueError("blend_radius must be non-negative")
+        return joints, speed, trajectory_connect, timeout, blend_radius
 
-    def _publish_movej_checked(self, joints, speed, block, trajectory_connect, wait_result, timeout):
+    def _publish_movej_checked(self, joints, speed, block, trajectory_connect, wait_result, timeout, blend_radius):
         baseline = self._sequence("movej_result")
         msg = self._Movej()
         msg.joint = [float(value) for value in joints]
-        msg.speed = speed
-        msg.block = bool(block)
-        msg.trajectory_connect = int(trajectory_connect)
-        msg.dof = self.dof
+        msg.v = int(speed)
+        msg.r = float(blend_radius)
+        if hasattr(msg, "block"):
+            msg.block = bool(block)
+        if hasattr(msg, "trajectory_connect"):
+            msg.trajectory_connect = int(trajectory_connect)
         self.movej_pub.publish(msg)
         result = {
             "state": "published",
             "topic": self.topics["movej_cmd"],
             "result_topic": self.topics.get("movej_result"),
             "joint": msg.joint,
-            "speed": msg.speed,
-            "block": msg.block,
-            "trajectory_connect": msg.trajectory_connect,
-            "dof": msg.dof,
+            "speed": speed,
+            "v": msg.v,
+            "r": msg.r,
+            "blend_radius": msg.r,
+            "block": bool(block),
+            "trajectory_connect": int(trajectory_connect),
+            "dof": self.dof,
         }
         if wait_result:
             update = self.wait_for_update(
@@ -276,8 +288,10 @@ class RM75Nodes:
             result["completion"] = self.wait_for_motion_complete(joints, baseline, timeout)
         return result
 
-    def start_movej_action(self, joints, *, speed=20, block=False, trajectory_connect=0, wait_result=False, timeout=None, tool_name="arm_motion"):
-        joints, speed, trajectory_connect, timeout = self._normalize_movej_args(joints, speed, trajectory_connect, timeout)
+    def start_movej_action(self, joints, *, speed=20, block=False, trajectory_connect=0, wait_result=False, timeout=None, blend_radius=None, tool_name="arm_motion"):
+        joints, speed, trajectory_connect, timeout, blend_radius = self._normalize_movej_args(
+            joints, speed, trajectory_connect, timeout, blend_radius
+        )
         preflight = self.preflight_movej(joints)
         if preflight:
             return preflight
@@ -292,6 +306,7 @@ class RM75Nodes:
                 "trajectory_connect": trajectory_connect,
                 "wait_result": wait_result,
                 "timeout": timeout,
+                "blend_radius": blend_radius,
             },
             daemon=True,
             name=action_id,
@@ -362,6 +377,7 @@ class RM75Nodes:
         else:
             raise ValueError("mode must be 'absolute' or 'relative'")
         timeout = self._motion_timeout(timeout)
+        blend_radius = _finite_float(self.safety.get("movej_blend_radius", 0), "movej_blend_radius")
         current = self.current_joint_positions()
         before = current[joint_index - 1]
         target = value if mode == "absolute" else before + value
@@ -380,6 +396,7 @@ class RM75Nodes:
                 "trajectory_connect": 0,
                 "wait_result": wait_result,
                 "timeout": timeout,
+                "blend_radius": blend_radius,
             },
             daemon=True,
             name=action_id,
@@ -774,6 +791,7 @@ class RM75MotionPlugin:
                 "description": "目标关节角，单位 rad，顺序 joint1..joint7",
             },
             "speed": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20, "description": "速度百分比"},
+            "blend_radius": {"type": "number", "minimum": 0, "default": 0, "description": "MoveJ 混合半径，对应官方消息字段 r，默认 0"},
             "block": {"type": "boolean", "default": False, "description": "是否使用 rm_driver 阻塞模式"},
             "trajectory_connect": {"type": "integer", "enum": [0, 1], "default": 0, "description": "0 立即规划，1 与下一轨迹连接"},
             "wait_result": {"type": "boolean", "default": False, "description": "优先等待 movej_result；默认按 /joint_states/状态同步等待完成"},
@@ -800,6 +818,7 @@ class RM75MotionPlugin:
                 trajectory_connect=args.get("trajectory_connect", 0),
                 wait_result=args.get("wait_result", False),
                 timeout=args.get("timeout"),
+                blend_radius=args.get("blend_radius"),
             )
         if action in ("stopmotion", "stop"):
             return self.nodes.publish_stop(block=args.get("block", False))
