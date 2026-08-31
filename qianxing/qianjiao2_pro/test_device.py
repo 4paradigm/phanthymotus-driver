@@ -20,3 +20,10 @@ def test_range_rejected():
     d = live(); d.dispatch("rov_control", {"action":"arm"})
     with pytest.raises(ValueError): d.dispatch("rov_control", {"action":"move", "pitch":1.1})
     d.stop()
+
+def test_status_packet_parser():
+    import json, struct
+    payload = json.dumps({"depth": 1.25, "temperature": 21}).encode()
+    packet = bytes([3, 0, 0, 0]) + struct.pack("<I", len(payload)) + bytes([1, 0, 0, 0]) + payload
+    assert QianjiaoDevice._parse_status_packet(packet)["depth"] == 1.25
+    assert QianjiaoDevice._parse_status_packet(packet[:10]) is None
