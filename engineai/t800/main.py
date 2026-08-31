@@ -31,6 +31,29 @@ import yaml
 from rclpy.context import Context
 
 
+_REGISTRATION_STATUS_LOCK = threading.Lock()
+_REGISTRATION_STATUS = {
+    "state": "starting",
+    "configured": False,
+    "url": None,
+    "ca_cert": None,
+    "last_error": None,
+    "last_success_at": None,
+    "last_failure_at": None,
+}
+
+
+def _update_registration_status(**updates) -> dict:
+    with _REGISTRATION_STATUS_LOCK:
+        _REGISTRATION_STATUS.update(updates)
+        return dict(_REGISTRATION_STATUS)
+
+
+def _registration_status() -> dict:
+    with _REGISTRATION_STATUS_LOCK:
+        return dict(_REGISTRATION_STATUS)
+
+
 def _load_config() -> dict:
     path = os.environ.get("CONFIG_PATH", str(Path(__file__).parent / "config.yaml"))
     with open(path, encoding="utf-8") as handle:
@@ -103,10 +126,23 @@ class DualDomainROS2:
 
 
 class T800DeviceBundle:
+    _MOTION_OUTPUT_TOOLS = frozenset({
+        "loco", "motion_mode", "dance", "joint_plan", "gesture",
+        "joint_override", "joint_bridge", "virtual_gamepad", "gait",
+        "motion_recorder", "head", "speaker",
+    })
+    _SAFE_WHILE_MOTION_SETTLING = frozenset({
+        "start", "stop", "info", "status", "list", "stop_move",
+        "stop_dance", "stop_gesture", "stop_playback", "cancel",
+        "release", "stop_command", "record_stop",
+    })
+
     def __init__(self, config: dict, namespace: str, ros2: DualDomainROS2):
         from device import (
             DancePlugin,
+            GaitPlugin,
             GesturePlugin,
+            HeadActuatorPlugin,
             JointBridgePlugin,
             JointOverridePlugin,
             JointPlanPlugin,
@@ -116,6 +152,8 @@ class T800DeviceBundle:
             ControlledSpatialPlugin,
             MotionCommandTracePlugin,
             MotionEventsPlugin,
+            MotionInterruptGroup,
+            MotionRecorderPlugin,
             MicPlugin,
             MotionModePlugin,
             MotorPowerPlugin,
@@ -123,9 +161,12 @@ class T800DeviceBundle:
             NativeNodeControlPlugin,
             NativeSdkPlugin,
             SafetyControlPlugin,
+            SpeakerPlugin,
             StatePlugin,
             TtsPlugin,
             VisionPlugin,
+            _t800_acp_preflight,
+            _t800_acp_status,
         )
         from virtual_gamepad import VirtualGamepadPlugin
 
@@ -133,7 +174,17 @@ class T800DeviceBundle:
         self._active_plugins: list = []
         self._startup_errors: dict[str, str] = {}
         self._started = False
+        self._acp_status = _t800_acp_status
+        acp_status = _t800_acp_preflight()
+        if acp_status["state"] == "error":
+            error = acp_status["last_error"]
+            print(
+                f"[bundle] ACP configuration error: {error}",
+                flush=True,
+            )
         plugins = config.get("plugins", {})
+        motion_interrupt_group = MotionInterruptGroup()
+        self._motion_interrupt_group = motion_interrupt_group
 
         motion_events = None
         if plugins.get("motion_events", {}).get("enabled", False):
@@ -158,6 +209,7 @@ class T800DeviceBundle:
             ("led", LedPlugin, (config, namespace, ros2)),
             ("tts", TtsPlugin, (config, namespace, ros2)),
             ("mic", MicPlugin, (config, namespace, ros2)),
+            ("speaker", SpeakerPlugin, (config, namespace, ros2)),
             ("vision", VisionPlugin, (config, namespace, ros2)),
             ("motor_power", MotorPowerPlugin, (config, namespace, ros2)),
             ("native_node_control", NativeNodeControlPlugin, (config, namespace, ros2)),
@@ -175,6 +227,19 @@ class T800DeviceBundle:
             if provider is not None and hasattr(provider, "health_sources"):
                 state.register_health_provider(key, provider.health_sources)
 
+        locomotion = instances.get("locomotion")
+        if locomotion is not None:
+            locomotion.set_interrupt_group(motion_interrupt_group)
+            motion_interrupt_group.register(
+                "locomotion", locomotion.halt, locomotion.motion_active
+            )
+        speaker = instances.get("speaker")
+        if speaker is not None:
+            speaker.set_interrupt_group(motion_interrupt_group)
+            motion_interrupt_group.register(
+                "speaker", speaker.halt, speaker.motion_active
+            )
+
         if plugins.get("dance", {}).get("enabled", True) and "motion_mode" in instances:
             instance = DancePlugin(instances["motion_mode"], state)
             instances["dance"] = instance
@@ -182,9 +247,51 @@ class T800DeviceBundle:
 
         if plugins.get("gesture", {}).get("enabled", True) and "joint_plan" in instances:
             instance = GesturePlugin(instances["joint_plan"])
+            instance.set_interrupt_group(motion_interrupt_group)
+            motion_interrupt_group.register(
+                "gesture", instance.halt, instance.motion_active
+            )
             instances["gesture"] = instance
             self._plugins.append(instance)
 
+        # Gait selector — delegates to the public Native SDK motion-state API.
+        if (
+            plugins.get("gait", {}).get("enabled", False)
+            and "motion_mode" in instances
+        ):
+            instance = GaitPlugin(config, instances["motion_mode"], state)
+            instance.set_interrupt_group(motion_interrupt_group)
+            motion_interrupt_group.register(
+                "gait", instance.halt, instance.motion_active
+            )
+            instances["gait"] = instance
+            self._plugins.append(instance)
+
+        # Motion recorder — record and replay joint trajectories
+        motion_recorder = None
+        if plugins.get("motion_recorder", {}).get("enabled", False):
+            motion_recorder = MotionRecorderPlugin(config, namespace, ros2)
+            instances["motion_recorder"] = motion_recorder
+            self._plugins.append(motion_recorder)
+            if "joint_plan" in instances:
+                motion_recorder.set_joint_plan(instances["joint_plan"])
+            motion_recorder.set_reset_controls(state, instances.get("motion_mode"))
+            motion_recorder.set_interrupt_group(motion_interrupt_group)
+            motion_interrupt_group.register(
+                "motion_recorder",
+                motion_recorder.interrupt_motion,
+                motion_recorder.motion_active,
+            )
+
+        head_config = plugins.get("head", {})
+        if head_config.get("enabled", True) and "joint_plan" in instances:
+            instance = HeadActuatorPlugin(head_config, instances["joint_plan"], state)
+            instance.set_interrupt_group(motion_interrupt_group)
+            motion_interrupt_group.register(
+                "head", instance.halt, instance.motion_active
+            )
+            instances["head"] = instance
+            self._plugins.append(instance)
         virtual_gamepad_config = plugins.get("virtual_gamepad", {})
         if virtual_gamepad_config.get("enabled", False):
             instance = VirtualGamepadPlugin(virtual_gamepad_config, namespace, ros2)
@@ -213,7 +320,11 @@ class T800DeviceBundle:
             instances["safety"].set_controls(
                 [
                     instances[key]
-                    for key in ("locomotion", "joint_override", "joint_bridge", "virtual_gamepad", "gesture")
+                    for key in (
+                        "locomotion", "joint_override", "joint_bridge",
+                        "virtual_gamepad", "gesture", "motion_recorder", "head",
+                        "speaker",
+                    )
                     if key in instances
                 ]
             )
@@ -246,6 +357,18 @@ class T800DeviceBundle:
     def stop_all(self) -> None:
         if not self._started:
             return
+        # Phase 1: stop every physical output before any potentially slow
+        # resource teardown (for example speaker process shutdown).
+        for plugin in self._active_plugins:
+            halt = getattr(plugin, "halt", None)
+            if not callable(halt):
+                continue
+            try:
+                halt()
+            except Exception as exc:
+                print(f"[bundle] {type(plugin).__name__} halt failed: {exc}", flush=True)
+        # Phase 2: release resources in reverse construction order so dependent
+        # plugins are torn down before the services they reference.
         for plugin in reversed(self._active_plugins):
             try:
                 plugin.stop()
@@ -266,11 +389,22 @@ class T800DeviceBundle:
             definitions = plugin.get_tools() if hasattr(plugin, "get_tools") else [plugin.get_tool()]
             configured_tools += len(definitions)
         active_tools = len(self.get_all_tools())
+        acp_status_fn = getattr(
+            self,
+            "_acp_status",
+            lambda: {"state": "ready", "configured": True, "last_error": None},
+        )
+        acp_status = acp_status_fn()
+        registration_status = _registration_status()
         if not self._started:
             state = "starting"
         elif self._startup_errors and not self._active_plugins:
             state = "failed"
         elif self._startup_errors:
+            state = "degraded"
+        elif acp_status.get("state") == "error":
+            state = "degraded"
+        elif registration_status.get("state") == "error":
             state = "degraded"
         else:
             state = "running"
@@ -282,6 +416,8 @@ class T800DeviceBundle:
             "configured_tools": configured_tools,
             "active_tools": active_tools,
             "startup_errors": dict(self._startup_errors),
+            "acp": acp_status,
+            "registration": registration_status,
         }
 
     def dispatch(self, tool_name: str, arguments: dict) -> dict | None:
@@ -298,6 +434,37 @@ class T800DeviceBundle:
                     return result
                 action = args.pop("action", tool_name)
                 args["_tool_name"] = tool_name
+                interrupt_group = getattr(self, "_motion_interrupt_group", None)
+                if (
+                    interrupt_group is not None
+                    and definition["type"] == "actuator"
+                    and tool_name in self._MOTION_OUTPUT_TOOLS
+                ):
+                    interrupt_actions = {
+                        binding.get("action")
+                        for hook_id, binding in definition["inputSchema"]
+                        .get("x-hooks", {}).items()
+                        if hook_id.startswith("on_interrupt")
+                    }
+                    safe_action = (
+                        action in interrupt_actions
+                        or action in self._SAFE_WHILE_MOTION_SETTLING
+                    )
+                    if (
+                        tool_name == "gesture"
+                        and action == "stop"
+                        and bool(args.get("reset_after", False))
+                    ):
+                        safe_action = False
+                    if not safe_action:
+                        blocking_outputs = interrupt_group.blocking_outputs()
+                        if blocking_outputs:
+                            return {
+                                "error": "motion output is active or still settling",
+                                "tool": tool_name,
+                                "action": action,
+                                "blocking_outputs": blocking_outputs,
+                            }
                 try:
                     result = plugin.dispatch(action, args)
                 except Exception as exc:
@@ -453,11 +620,10 @@ def make_handler():
 
 
 def _start_registration(port: int, config: dict) -> None:
-    import ssl
     import time
     import urllib.request
+    from device import _t800_agent_core_transport
 
-    agent_core_url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
     payload = json.dumps({
         "id": "engineai-t800-driver",
         "name": config.get("name", "EngineAI T800 Development Edition"),
@@ -465,21 +631,51 @@ def _start_registration(port: int, config: dict) -> None:
         "transport": "http",
         "category": "driver",
     }).encode()
-    context = ssl.create_default_context()
-    context.check_hostname = False
-    context.verify_mode = ssl.CERT_NONE
-
     def register_loop():
         while True:
+            transport_ready = False
             try:
+                endpoint, context, ca_cert = (
+                    _t800_agent_core_transport("/api/mcp")
+                )
+                transport_ready = True
+                agent_core_url = endpoint.removesuffix("/api/mcp")
+                current_status = _registration_status()
+                status_updates = {
+                    "configured": True,
+                    "url": agent_core_url,
+                    "ca_cert": ca_cert,
+                }
+                if current_status.get("state") != "error":
+                    status_updates.update(
+                        state="starting",
+                        last_error=None,
+                    )
+                _update_registration_status(**status_updates)
                 request = urllib.request.Request(
-                    f"{agent_core_url}/api/mcp", data=payload,
+                    endpoint, data=payload,
                     headers={"Content-Type": "application/json"}, method="POST"
                 )
                 with urllib.request.urlopen(request, timeout=3, context=context):
                     pass
+                _update_registration_status(
+                    state="ready",
+                    configured=True,
+                    url=agent_core_url,
+                    ca_cert=ca_cert,
+                    last_error=None,
+                    last_success_at=time.time(),
+                )
                 time.sleep(30)
             except Exception as exc:
+                _update_registration_status(
+                    state="error",
+                    configured=transport_ready,
+                    url=os.environ.get("AGENT_CORE_URL"),
+                    ca_cert=os.environ.get("AGENT_CORE_CA_CERT"),
+                    last_error=f"registration failed: {exc}",
+                    last_failure_at=time.time(),
+                )
                 print(f"[register] failed: {exc}; retrying in 5s", flush=True)
                 time.sleep(5)
 

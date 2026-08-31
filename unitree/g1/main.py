@@ -107,9 +107,23 @@ class G1DeviceBundle:
             print("[bundle] LedPlugin loaded")
 
         if plugins_cfg.get("loco", {}).get("enabled", False):
-            from device import LocoStatePlugin, LocoPlugin
-            self._plugins.append(LocoStatePlugin(plugins_cfg["loco"], namespace, executor))
-            self._plugins.append(LocoPlugin(plugins_cfg["loco"], namespace, executor, loco_client, slam_client=slam_client, smart_motion=smart_motion))
+            from device import LocoStatePlugin, LocoPlugin, StatePlugin
+            loco_state = LocoStatePlugin(plugins_cfg["loco"], namespace, executor)
+            self._plugins.append(loco_state)
+            # StatePlugin owns the rt/lowstate subscription that posture is derived
+            # from. LocoPlugin needs it to tell lying from squatting once the robot
+            # is limp (FSM 0/1), so build it first when it is enabled and reuse the
+            # same instance rather than opening a second high-rate subscription.
+            posture_source = None
+            if plugins_cfg.get("state", {}).get("enabled", False):
+                state_plugin = StatePlugin(plugins_cfg["state"], namespace, executor)
+                self._plugins.append(state_plugin)
+                posture_source = state_plugin.node
+                print("[bundle] StatePlugin loaded (posture source for LocoPlugin)")
+            self._plugins.append(LocoPlugin(plugins_cfg["loco"], namespace, executor, loco_client,
+                                            slam_client=slam_client, smart_motion=smart_motion,
+                                            state_node=loco_state.node,
+                                            posture_node=posture_source))
             print("[bundle] LocoStatePlugin + LocoPlugin loaded")
 
         if plugins_cfg.get("arm", {}).get("enabled", False):
@@ -124,8 +138,12 @@ class G1DeviceBundle:
 
         if plugins_cfg.get("state", {}).get("enabled", False):
             from device import StatePlugin
-            self._plugins.append(StatePlugin(plugins_cfg["state"], namespace, executor))
-            print("[bundle] StatePlugin loaded")
+            # Already built above when loco is enabled, to hand LocoPlugin its
+            # posture source — a second instance would duplicate the rt/lowstate
+            # subscription and clash on the ROS node name.
+            if not any(isinstance(p, StatePlugin) for p in self._plugins):
+                self._plugins.append(StatePlugin(plugins_cfg["state"], namespace, executor))
+                print("[bundle] StatePlugin loaded")
 
         if plugins_cfg.get("camera", {}).get("enabled", False):
             from device import RealSensePlugin
