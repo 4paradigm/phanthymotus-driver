@@ -23,6 +23,7 @@ def start_registration(port: int) -> None:
         "name": CFG.get("name", "潜蛟 2.0 Pro ROV"),
         "url": f"http://{advertise_host}:{port}/mcp",
         "transport": "http",
+        "category": "driver",
     }).encode()
     def loop():
         while True:
