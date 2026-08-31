@@ -73,9 +73,10 @@ class QianjiaoDevice:
         if not self.mock:
             if mavutil is None:
                 raise RuntimeError("pymavlink is required for live mode")
-            # udp: creates a bidirectional socket and sends to the configured ROV.
+            # udpin binds locally.  ``udp:<remote>`` would incorrectly try to
+            # bind the board's socket to the remote ROV address (192.168.1.101).
             self.link = mavutil.mavlink_connection(
-                f"udp:{self.target_ip}:{self.target_port}",
+                f"udpin:0.0.0.0:{self.target_port}",
                 source_system=int(self.cfg.get("source_system", 255)),
                 source_component=int(self.cfg.get("source_component", 190)),
                 mavlink20=False,
@@ -103,7 +104,10 @@ class QianjiaoDevice:
                 if self.mock:
                     self.link.heartbeat()
                 else:
-                    self.link.mav.heartbeat_send(11, 3, 0, 0, 4)
+                    # mavudp learns the peer address from the first packet.
+                    # Do not attempt sendto(None) before that packet arrives.
+                    if getattr(self.link, "address", None):
+                        self.link.mav.heartbeat_send(11, 3, 0, 0, 4)
                     msg = self.link.recv_match(blocking=False)
                     while msg is not None:
                         if msg.get_type() == "HEARTBEAT":
