@@ -1,4 +1,4 @@
-"""PNPbotics Adam driver — plugin classes.
+"""PNDbotics Adam driver — plugin classes.
 
 Plugins:
   StatePlugin  — DDS rt/lowstate → ROS2 skeleton/IMU/battery
