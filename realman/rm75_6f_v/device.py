@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import threading
 import time
 from pathlib import Path
@@ -48,10 +49,15 @@ def _finite_float(value, name):
 
 
 def _finite_int(value, name):
-    try:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise ValueError(f"{name} must be an integer")
         return int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} must be an integer") from exc
+    raise ValueError(f"{name} must be an integer")
 
 
 def _bounded_int(value, name, lower, upper):
@@ -223,10 +229,7 @@ class RM75Nodes:
         trajectory_connect = _finite_int(trajectory_connect, "trajectory_connect")
         if trajectory_connect not in (0, 1):
             raise ValueError("trajectory_connect must be 0 or 1")
-        if timeout is not None:
-            timeout = _finite_float(timeout, "timeout")
-            if timeout <= 0 or timeout > 30:
-                raise ValueError("timeout must be in (0, 30]")
+        timeout = self._motion_timeout(timeout)
         preflight = self.preflight_movej(joints)
         if preflight:
             return preflight
@@ -252,8 +255,10 @@ class RM75Nodes:
             result["result"] = self.wait_for_update(
                 "movej_result",
                 baseline,
-                timeout if timeout is not None else self.safety.get("max_result_wait_seconds", 10.0),
+                timeout,
             )
+        else:
+            result["completion"] = self.wait_for_motion_complete(joints, baseline, timeout)
         return result
 
     def current_joint_positions(self):
@@ -261,27 +266,26 @@ class RM75Nodes:
         if latest is None:
             raise ValueError("No /joint_states data has been received yet")
         joints = latest.get("data", {}).get("joints", [])
-        positions = [0.0] * self.dof
-        found = set()
+        positions_by_name = {}
         for item in joints:
-            idx = item.get("idx")
-            name = str(item.get("name", ""))
-            if isinstance(idx, int) and 0 <= idx < self.dof:
-                target_idx = idx
-            elif name.startswith("joint") and name[5:].isdigit():
-                target_idx = int(name[5:]) - 1
-            else:
+            name = str(item.get("name", "")).strip().lower()
+            match = re.fullmatch(r"joint([1-9][0-9]*)", name)
+            if not match:
                 continue
-            if 0 <= target_idx < self.dof:
-                positions[target_idx] = _finite_float(item.get("q", 0.0), f"current joint{target_idx + 1}")
-                found.add(target_idx)
-        if len(found) < self.dof:
-            missing = [idx + 1 for idx in range(self.dof) if idx not in found]
-            raise ValueError(f"/joint_states is missing joint positions: {missing}")
+            joint_num = int(match.group(1))
+            if not 1 <= joint_num <= self.dof:
+                continue
+            if name in positions_by_name:
+                raise ValueError(f"/joint_states contains duplicate {name}")
+            positions_by_name[name] = _finite_float(item.get("q", 0.0), f"current {name}")
+        missing = [f"joint{idx}" for idx in range(1, self.dof + 1) if f"joint{idx}" not in positions_by_name]
+        if missing:
+            raise ValueError(f"/joint_states is missing required joint names: {missing}")
+        positions = [positions_by_name[f"joint{idx}"] for idx in range(1, self.dof + 1)]
         return positions
 
     def move_single_joint(self, joint_index, *, mode, value, speed=5, block=False, wait_result=False, timeout=None):
-        joint_index = int(joint_index)
+        joint_index = _finite_int(joint_index, "joint_index")
         if joint_index < 1 or joint_index > self.dof:
             raise ValueError(f"joint_index must be in [1, {self.dof}]")
         current = self.current_joint_positions()
@@ -351,6 +355,44 @@ class RM75Nodes:
                     return {"state": "timeout", "topic": self.topics.get(key)}
                 self.condition.wait(remaining)
             return {"state": "received", **self.values.get(key, {})}
+
+    def wait_for_motion_complete(self, target_joints, baseline, timeout):
+        result = self.wait_for_update("movej_result", baseline, 0.05)
+        if result.get("state") != "timeout":
+            return {"state": "completed", "source": "movej_result", "result": result}
+
+        tolerance = _finite_float(self.safety.get("joint_target_tolerance_rad", 0.01), "joint_target_tolerance_rad")
+        if tolerance <= 0:
+            raise ValueError("joint_target_tolerance_rad must be positive")
+        deadline = time.monotonic() + timeout
+        last_error = None
+        while True:
+            try:
+                current = self.current_joint_positions()
+                max_error = max(abs(current[idx] - target_joints[idx]) for idx in range(self.dof))
+                last_error = max_error
+                if max_error <= tolerance:
+                    return {"state": "completed", "source": "joint_states", "max_error_rad": max_error}
+            except ValueError as exc:
+                last_error = str(exc)
+
+            values = dict(self.values)
+            errors = self._active_errors(values)
+            if errors:
+                return {"state": "error", "source": "error_topics", "errors": errors}
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return {"state": "timeout", "timeout_seconds": timeout, "last_error_rad": last_error}
+            time.sleep(min(0.05, remaining))
+
+    def _motion_timeout(self, timeout):
+        if timeout is None:
+            timeout = self.safety.get("max_result_wait_seconds", 10.0)
+        timeout = _finite_float(timeout, "timeout")
+        if timeout <= 0 or timeout > 30:
+            raise ValueError("timeout must be in (0, 30]")
+        return timeout
 
     def preflight_movej(self, joints):
         now = time.time()
@@ -523,7 +565,7 @@ class RM75MotionPlugin:
             "speed": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20, "description": "速度百分比"},
             "block": {"type": "boolean", "default": False, "description": "是否使用 rm_driver 阻塞模式"},
             "trajectory_connect": {"type": "integer", "enum": [0, 1], "default": 0, "description": "0 立即规划，1 与下一轨迹连接"},
-            "wait_result": {"type": "boolean", "default": False, "description": "是否等待 movej_result 返回"},
+            "wait_result": {"type": "boolean", "default": False, "description": "优先等待 movej_result；默认按 /joint_states/状态同步等待完成"},
             "timeout": {"type": "number", "minimum": 0.1, "maximum": 30, "default": 10, "description": "等待结果超时时间，单位秒"},
             "joint_num": {"type": "integer", "minimum": 1, "maximum": 7, "description": "待清错关节编号，1..7"},
         }))
@@ -585,7 +627,7 @@ class RM75JointControlPlugin:
             },
             "speed": {"type": "integer", "minimum": 1, "maximum": 30, "default": 5, "description": "单关节测试速度百分比，默认 5，最高限制 30"},
             "block": {"type": "boolean", "default": False, "description": "是否使用 rm_driver 阻塞模式"},
-            "wait_result": {"type": "boolean", "default": False, "description": "是否等待 movej_result 返回"},
+            "wait_result": {"type": "boolean", "default": False, "description": "优先等待 movej_result；默认按 /joint_states/状态同步等待完成"},
             "timeout": {"type": "number", "minimum": 0.1, "maximum": 30, "default": 10, "description": "等待结果超时时间，单位秒"},
         }))
 

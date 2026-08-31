@@ -53,4 +53,14 @@ Use `state`, `joint_states`, `joint_error`, and `rm_error` first. The `arm_motio
 - MCP actuator: `arm_motion` supports `movej`, `stopmotion`, and `clear_joint_error`.
 - MCP single-joint actuator: `joint_control` supports `set`, `nudge`, and `stopmotion`. Select `joint1` through `joint7` inside the card; it reads the latest `/joint_states`, replaces only the selected joint target, and publishes a full 7-DOF `movej` command.
 
-`movej` performs a conservative preflight before publishing: recent `/joint_states` required, configured joint limits checked, and active error topics rejected. Set `safety.require_*` fields in `config.yaml` only when deliberately testing around those guards.
+`joint_control` maps positions by the explicit `joint1`..`joint7` names in `/joint_states` instead of trusting message order. Duplicate, missing, or non-finite joint values are rejected before any command is published.
+
+`movej` performs a conservative preflight before publishing: recent `/joint_states` required, configured joint limits checked, and active error topics rejected. MoveJ and single-joint actions are synchronous by default: after publishing, the MCP call waits until `movej_result` arrives, the target is reached within `safety.joint_target_tolerance_rad`, an error appears, or the bounded timeout expires. Set `safety.require_*` fields in `config.yaml` only when deliberately testing around those guards.
+
+The URDF in `resource/rm75_6f_v.urdf` is intentionally simplified for card-system skeleton rendering. Use the vendor description package when an accurate kinematic or visual model is required.
+
+## Infrastructure notes
+
+- `driver.yaml` is required registration/build metadata for Agent Core and does not increase image size.
+- `deploy/service.yml` is required to mount the externally built official `rm_driver` workspace, access device/network resources, and cap container logs; it does not increase image size.
+- `Dockerfile` installs `python3-pip`, `ros-humble-rmw-fastrtps-cpp`, and `requirements.txt` because the selected ROS base image is not guaranteed to include Python package installation support, the configured RMW implementation, or PyYAML for `config.yaml` loading. This intentionally increases the image by those runtime dependencies only.
