@@ -17,10 +17,11 @@ def start_registration(port: int) -> None:
     import urllib.request
     agent = os.environ.get("AGENT_CORE_URL", "https://127.0.0.1:15678").rstrip("/")
     driver_id = CFG.get("driver_id", "qianxing-qianjiao2-pro")
+    advertise_host = os.environ.get("MCP_ADVERTISE_HOST", "192.168.1.20")
     payload = json.dumps({
         "id": driver_id,
         "name": CFG.get("name", "潜蛟 2.0 Pro ROV"),
-        "url": f"http://localhost:{port}/mcp",
+        "url": f"http://{advertise_host}:{port}/mcp",
         "transport": "http",
     }).encode()
     def loop():
