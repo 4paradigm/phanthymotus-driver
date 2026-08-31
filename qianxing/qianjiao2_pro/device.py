@@ -44,7 +44,7 @@ class MockLink:
 class QianjiaoDevice:
     def __init__(self, cfg: dict):
         self.cfg = cfg
-        self.target_ip = str(cfg.get("target_ip", "192.168.2.1"))
+        self.target_ip = str(cfg.get("target_ip", "192.168.1.101"))
         self.target_port = int(cfg.get("target_port", 14550))
         self.timeout = float(cfg.get("heartbeat_timeout", 3.0))
         self.rate = max(0.2, float(cfg.get("heartbeat_rate", 1.0)))
@@ -64,6 +64,8 @@ class QianjiaoDevice:
         self._status_sock: socket.socket | None = None
         self._status_thread: threading.Thread | None = None
         self._rov_status: dict[str, Any] = {}
+        self._rov_status_received_at = 0.0
+        self._rov_status_source: str | None = None
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -125,10 +127,12 @@ class QianjiaoDevice:
             self._status_sock = sock
             while not self._stop.is_set():
                 try:
-                    packet, _peer = sock.recvfrom(65535)
+                    packet, peer = sock.recvfrom(65535)
                     parsed = self._parse_status_packet(packet)
                     if parsed is not None:
                         self._rov_status = parsed
+                        self._rov_status_received_at = time.monotonic()
+                        self._rov_status_source = f"{peer[0]}:{peer[1]}"
                 except socket.timeout:
                     continue
         except Exception as exc:
@@ -176,6 +180,8 @@ class QianjiaoDevice:
             "endpoint": f"{self.target_ip}:{self.target_port}",
             "rov": self._rov_status,
             "status_port": self.status_port,
+            "status_source": self._rov_status_source,
+            "status_age": None if not self._rov_status_received_at else round(time.monotonic() - self._rov_status_received_at, 3),
             "camera": {"ip": self.camera_ip, "rtsp": self.camera_rtsp},
             "last_error": self._last_error,
         }
