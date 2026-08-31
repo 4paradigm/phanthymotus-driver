@@ -252,11 +252,12 @@ class RM75Nodes:
             "dof": msg.dof,
         }
         if wait_result:
-            result["result"] = self.wait_for_update(
+            update = self.wait_for_update(
                 "movej_result",
                 baseline,
                 timeout,
             )
+            result["result"] = self._classify_motion_result(update)
         else:
             result["completion"] = self.wait_for_motion_complete(joints, baseline, timeout)
         return result
@@ -359,7 +360,8 @@ class RM75Nodes:
     def wait_for_motion_complete(self, target_joints, baseline, timeout):
         result = self.wait_for_update("movej_result", baseline, 0.05)
         if result.get("state") != "timeout":
-            return {"state": "completed", "source": "movej_result", "result": result}
+            classified = self._classify_motion_result(result)
+            return {"source": "movej_result", **classified}
 
         tolerance = _finite_float(self.safety.get("joint_target_tolerance_rad", 0.01), "joint_target_tolerance_rad")
         if tolerance <= 0:
@@ -385,6 +387,61 @@ class RM75Nodes:
             if remaining <= 0:
                 return {"state": "timeout", "timeout_seconds": timeout, "last_error_rad": last_error}
             time.sleep(min(0.05, remaining))
+
+    def _classify_motion_result(self, update):
+        if update.get("state") == "timeout":
+            return update
+        data = update.get("data", update)
+        failure = self._motion_result_failure(data)
+        if failure:
+            return {"state": "error", "result": update, **failure}
+        return {"state": "completed", "result": update}
+
+    def _motion_result_failure(self, value):
+        if isinstance(value, dict):
+            success = value.get("success")
+            if isinstance(success, bool) and not success:
+                return {"error": "movej_result reports success=false"}
+
+            for key in ("error", "message", "msg", "reason"):
+                text = value.get(key)
+                if isinstance(text, str) and self._looks_like_failure(text):
+                    return {"error": text, "field": key}
+
+            for key in ("ret", "code", "err", "errno", "err_code", "error_code", "result", "status"):
+                if key not in value:
+                    continue
+                item = value[key]
+                if isinstance(item, bool):
+                    continue
+                if isinstance(item, str):
+                    if self._looks_like_failure(item):
+                        return {"error": item, "field": key}
+                    try:
+                        item = float(item)
+                    except ValueError:
+                        continue
+                if isinstance(item, (int, float)):
+                    if not math.isfinite(float(item)) or abs(float(item)) > 1e-9:
+                        return {"error": f"movej_result {key}={item}", "field": key, "code": item}
+
+            for item in value.values():
+                failure = self._motion_result_failure(item)
+                if failure:
+                    return failure
+        elif isinstance(value, list):
+            for item in value:
+                failure = self._motion_result_failure(item)
+                if failure:
+                    return failure
+        elif isinstance(value, str) and self._looks_like_failure(value):
+            return {"error": value}
+        return None
+
+    @staticmethod
+    def _looks_like_failure(text):
+        lowered = text.strip().lower()
+        return any(token in lowered for token in ("fail", "error", "err", "abort", "reject", "timeout", "失败", "错误", "异常"))
 
     def _motion_timeout(self, timeout):
         if timeout is None:

@@ -64,3 +64,4 @@ The URDF in `resource/rm75_6f_v.urdf` is intentionally simplified for card-syste
 - `driver.yaml` is required registration/build metadata for Agent Core and does not increase image size.
 - `deploy/service.yml` is required to mount the externally built official `rm_driver` workspace, access device/network resources, and cap container logs; it does not increase image size.
 - `Dockerfile` installs `python3-pip`, `ros-humble-rmw-fastrtps-cpp`, and `requirements.txt` because the selected ROS base image is not guaranteed to include Python package installation support, the configured RMW implementation, or PyYAML for `config.yaml` loading. This intentionally increases the image by those runtime dependencies only.
+- `common/vendor_runtime.py` is touched only to escape and cap host-network HTTP request-line logging for all drivers using the shared runtime. This shared safety fix does not increase image size.
