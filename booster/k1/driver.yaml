@@ -1,0 +1,11 @@
+id: booster-k1-driver
+name: Booster K1 Bundle
+category: driver
+hardware_provider: booster
+hardware_model: "k1"
+image_name: booster-k1
+port: 15705
+mcp_url: "http://localhost:15705/mcp"
+description: "Booster K1 — 22DOF 双足人形机器人，IMU/关节/电池/跌倒/里程计感知、相机、行走与上身关节控制、动作/起身/轨迹/音频异步任务"
+build_context_extras:
+  - ../../common

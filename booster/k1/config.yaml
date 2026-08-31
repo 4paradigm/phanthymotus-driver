@@ -1,0 +1,25 @@
+mcp_port: 15705
+ros_namespace: ""   # 留空则自动使用 hostname
+
+plugins:
+  state:
+    enabled: true
+  camera:
+    enabled: true
+  loco:
+    enabled: true
+  upper_body:
+    enabled: true
+  action:
+    enabled: true
+  audio:
+    enabled: true
+  # brain 扩展能力（需要 requirements.txt 装 boosteros[brain]），默认关闭：
+  # 语音识别/对话/音色列表、目标检测——不是每台 K1 都装了 brain 依赖。
+  speech:
+    enabled: false
+  detection:
+    enabled: false
+
+# 未接入的 boosteros 能力（示教管理器 hand_guiding_manager、自动踢球管理器
+# soccer_kick_manager）——RoboCup/示教场景专用，不是核心遥测/控制，先不做成卡片。
