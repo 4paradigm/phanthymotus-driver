@@ -52,7 +52,14 @@ def _rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.
             if method == "__run_fsm_sequence":
                 steps_spec, interval, step_timeout, settle_delay = args
                 completed = []
-                for method_name, target_fsm, step_name in steps_spec:
+                for step in steps_spec:
+                    # step = (method_name, targets, step_name[, timeout])
+                    # `targets` is a single FSM id or an iterable of acceptable ids —
+                    # several transitions settle into one of a few states (e.g. 躺起
+                    # lands on 702 and is then pushed on to 500 by the controller).
+                    method_name, targets, step_name = step[0], step[1], step[2]
+                    this_timeout = step[3] if len(step) > 3 else step_timeout
+                    targets = {targets} if isinstance(targets, int) else set(targets)
                     fn = getattr(loco, method_name)
                     ret = fn()
                     if ret != 0:
@@ -60,20 +67,21 @@ def _rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.
                             "error": f"Step '{step_name}' failed: code={ret}",
                             "step": step_name, "completed": completed}})
                         break  # abort sequence on failure
-                    # Poll FSM until target reached or timeout
+                    # Poll FSM until one of the target states is reached or timeout
                     elapsed = 0.0
                     ok = False
-                    while elapsed < step_timeout:
+                    while elapsed < this_timeout:
                         time.sleep(interval)
                         elapsed += interval
                         code, fsm_id = loco.GetFsmId()
-                        if code == 0 and fsm_id == target_fsm:
+                        if code == 0 and fsm_id in targets:
                             ok = True
                             break
                     if not ok:
                         _, current = loco.GetFsmId()
                         result_queue.put({"result": {
-                            "error": f"Timeout '{step_name}' (expected={target_fsm}, got={current})",
+                            "error": f"Timeout '{step_name}' after {this_timeout:.0f}s "
+                                     f"(expected={sorted(targets)}, got={current})",
                             "step": step_name, "fsm_id": current, "completed": completed}})
                         break  # abort sequence on timeout
                     completed.append(step_name)
@@ -81,8 +89,9 @@ def _rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.
                     time.sleep(settle_delay)
                 else:
                     # Only reached if loop completed without break (all steps succeeded)
+                    _, final = loco.GetFsmId()
                     result_queue.put({"result": {"ret": 0, "steps": completed,
-                                                 "fsm_id": steps_spec[-1][1]}})
+                                                 "fsm_id": final}})
                 continue  # next cmd
 
             fn = getattr(loco, method)
@@ -142,13 +151,16 @@ class RpcProxy:
 
     # ── LocoClient interface ──────────────────────────────────────────────────
 
-    def RunFsmSequence(self, steps: list, interval: float = 1.0, step_timeout: float = 15.0,
+    def RunFsmSequence(self, steps: list, interval: float = 1.0, step_timeout: float = 30.0,
                        settle_delay: float = 2.0):
         """Run FSM sequence entirely in subprocess (no GIL contention).
-        steps = [(method_name, target_fsm_to_poll, step_name), ...]
+        steps = [(method_name, targets, step_name[, timeout]), ...]
+        `targets` is an FSM id or an iterable of acceptable ids; the optional 4th
+        element overrides step_timeout for that step.
         settle_delay = seconds to wait after FSM confirms state change.
         Returns dict with {ret, steps, fsm_id} on success or {error, step} on failure."""
-        outer_timeout = len(steps) * (step_timeout + settle_delay + 5) + 10
+        budget = sum((s[3] if len(s) > 3 else step_timeout) + settle_delay + 5 for s in steps)
+        outer_timeout = budget + 10
         return self._call("__run_fsm_sequence", steps, interval, step_timeout, settle_delay,
                           timeout=outer_timeout)
 
