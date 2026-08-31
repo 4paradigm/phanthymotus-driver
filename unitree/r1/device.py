@@ -341,7 +341,7 @@ class _SpeakerNode(Node):
         self._idx    = 0
         self.state   = "idle"
         self._buf = queue.Queue()
-        self._pending_bytes = 0  # bytes buffered since the last drain start
+        self._pending_bytes = 0  # bytes buffered while no drain thread is running
         self._draining = threading.Event()
         self._drain_thread: threading.Thread | None = None
         self._last_chunk_time = 0.0
@@ -475,7 +475,12 @@ class _SpeakerNode(Node):
             return
 
         self._buf.put(pcm)
-        self._pending_bytes += len(pcm)
+        # 只统计「等待 drain 启动」期间攒下的字节。drain 运行时这些 chunk 是被
+        # 消耗掉的，计入就会让计数器一路涨到整句大小 —— 等 drain 因
+        # EXIT_AFTER_IDLE 自行退出后，下一句的第一个 chunk 就满足了 prefill。
+        # 旧代码读 _buf.qsize() 时天然没有这个问题，因为那是个派生量。
+        if not self._draining.is_set():
+            self._pending_bytes += len(pcm)
         self._last_chunk_time = now
         if self.state == "ready":
             self.state = "playing"
@@ -547,6 +552,9 @@ class _SpeakerNode(Node):
             play_idx += 1
             self._play_merged(merged, play_idx, deadline)
         self._draining.clear()
+        # 清掉 drain 运行期间可能漏进来的计数（_on_chunk 的检查与这里存在竞态），
+        # 保证下一句必须重新攒满 PREFILL_BYTES 才启动。
+        self._pending_bytes = 0
         if self.state == "playing":
             self.state = "ready"
         self.get_logger().info(
