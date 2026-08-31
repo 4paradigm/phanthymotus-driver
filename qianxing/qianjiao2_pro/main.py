@@ -63,6 +63,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     DEVICE.start()
+    DEVICE.start_ros_status()
     port = int(CFG.get("mcp_port", 15719)); server = ThreadingHTTPServer(("", port), Handler)
     start_registration(port)
     def shutdown(*_): DEVICE.stop(); threading.Thread(target=server.shutdown, daemon=True).start()

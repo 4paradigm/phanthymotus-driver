@@ -66,6 +66,22 @@ class QianjiaoDevice:
         self._rov_status: dict[str, Any] = {}
         self._rov_status_received_at = 0.0
         self._rov_status_source: str | None = None
+        self._ros_node = None
+        self._ros_pub = None
+
+    def start_ros_status(self):
+        """Publish vendor UDP status for Agent Core topic renderers."""
+        try:
+            import rclpy
+            from rclpy.node import Node
+            from std_msgs.msg import String
+            if not rclpy.ok():
+                rclpy.init(args=None)
+            self._ros_node = Node("qianjiao2_pro_status")
+            self._ros_pub = self._ros_node.create_publisher(String, "/qianjiao2_pro/status", 10)
+            threading.Thread(target=rclpy.spin, args=(self._ros_node,), daemon=True, name="qianjiao-status-ros").start()
+        except Exception as exc:
+            self._last_error = f"ROS status publisher: {exc}"
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -97,6 +113,9 @@ class QianjiaoDevice:
         if self._status_sock:
             self._status_sock.close()
             self._status_sock = None
+        if self._ros_node is not None:
+            self._ros_node.destroy_node()
+            self._ros_node = None
 
     def _loop(self):
         while not self._stop.is_set():
@@ -137,6 +156,11 @@ class QianjiaoDevice:
                         self._rov_status = parsed
                         self._rov_status_received_at = time.monotonic()
                         self._rov_status_source = f"{peer[0]}:{peer[1]}"
+                        if self._ros_pub is not None:
+                            from std_msgs.msg import String
+                            msg = String()
+                            msg.data = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+                            self._ros_pub.publish(msg)
                 except socket.timeout:
                     continue
         except Exception as exc:
@@ -229,7 +253,7 @@ class QianjiaoDevice:
     def get_tools(self):
         return [
             {"name": "rov_status", "type": "sensor", "description": "潜蛟实时状态：姿态、深度、位置、温度、电池和陀螺仪（UDP 8500，10Hz）", "topic_out": [{"topic": "/qianjiao2_pro/status", "format": "data/json"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["info", "start", "stop"]}}}},
-            {"name": "rov_camera", "type": "sensor", "description": "潜蛟实时视频流（RTSP）", "topic_out": [{"topic": "rtsp://admin:admin@192.168.1.88:8554/stream/0/0", "format": "video/rtsp"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["info"]}}}},
+            {"name": "rov_camera", "type": "sensor", "description": "潜蛟实时视频流（RTSP，需支持 RTSP 的播放器）", "topic_out": [{"topic": "rtsp://admin:admin@192.168.1.88:8554/stream/0/0", "format": "video/rtsp", "external": True}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["info"]}}}},
             {"name": "rov_camera_control", "type": "actuator", "description": "潜蛟相机控制：拍照、媒体列表、下载和补光灯", "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["capture", "medias", "download", "light"]}, "name": {"type": "string"}, "brightness": {"type": "integer", "minimum": 0, "maximum": 100}}, "required": ["action"]}},
             {"name": "rov_control", "type": "actuator", "description": "潜蛟 2.0 Pro 解锁及 6DOF 运动控制", "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["arm", "disarm", "move", "stop"]}, "heave": {"type": "number", "minimum": -1, "maximum": 1}, "pitch": {"type": "number", "minimum": -1, "maximum": 1}, "forward": {"type": "number", "minimum": -1, "maximum": 1}, "yaw": {"type": "number", "minimum": -1, "maximum": 1}, "lateral": {"type": "number", "minimum": -1, "maximum": 1}, "roll": {"type": "number", "minimum": -1, "maximum": 1}}, "required": ["action"]}},
         ]
