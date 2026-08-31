@@ -61,10 +61,33 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._send(200, {"jsonrpc":"2.0","id":rid,"error":{"code":-32000,"message":str(exc)}})
 
+    def do_GET(self):
+        if urlparse(self.path).path != "/video.mjpeg":
+            self._send(404, {})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.end_headers()
+        try:
+            while not DEVICE._stop.is_set():
+                frame = DEVICE.get_video_frame(timeout=2.0)
+                if not frame:
+                    continue
+                self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(frame)).encode() + b"\r\n\r\n" + frame + b"\r\n")
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+
 def main():
     DEVICE.start()
     DEVICE.start_ros_status()
-    port = int(CFG.get("mcp_port", 15719)); server = ThreadingHTTPServer(("", port), Handler)
+    port = int(CFG.get("mcp_port", 15719))
+    advertise_host = os.environ.get("MCP_ADVERTISE_HOST", CFG.get("mcp_advertise_host", "192.168.1.20"))
+    DEVICE.video_url = f"http://{advertise_host}:{port}/video.mjpeg"
+    DEVICE.start_video_proxy()
+    server = ThreadingHTTPServer(("", port), Handler)
     start_registration(port)
     def shutdown(*_): DEVICE.stop(); threading.Thread(target=server.shutdown, daemon=True).start()
     signal.signal(signal.SIGTERM, shutdown); signal.signal(signal.SIGINT, shutdown)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import socket
 import struct
 import threading
@@ -61,6 +62,7 @@ class QianjiaoDevice:
         self.camera_http_base = f"http://{self.camera_ip}:{int(cfg.get('camera_http_port', 80))}"
         self.camera_rtsp = str(cfg.get("camera_rtsp", f"rtsp://admin:admin@{self.camera_ip}:8554/stream/0/0"))
         self.camera_light_path = str(cfg.get("camera_light_path", "/v1/light"))
+        self.video_url = str(cfg.get("video_url", "/video.mjpeg"))
         self._status_sock: socket.socket | None = None
         self._status_thread: threading.Thread | None = None
         self._rov_status: dict[str, Any] = {}
@@ -68,6 +70,46 @@ class QianjiaoDevice:
         self._rov_status_source: str | None = None
         self._ros_node = None
         self._ros_pub = None
+        self._video_proc = None
+        self._video_cond = threading.Condition()
+        self._video_frame = None
+
+    def start_video_proxy(self):
+        if self._video_proc is not None and self._video_proc.poll() is None:
+            return
+        try:
+            self._video_proc = subprocess.Popen(["ffmpeg", "-loglevel", "error", "-rtsp_transport", "tcp", "-i", self.camera_rtsp, "-an", "-vf", "fps=10,scale=1280:-2", "-f", "mjpeg", "-q:v", "6", "pipe:1"], stdout=subprocess.PIPE)
+            threading.Thread(target=self._video_loop, daemon=True, name="qianjiao-video-proxy").start()
+        except Exception as exc:
+            self._last_error = f"video proxy: {exc}"
+
+    def _video_loop(self):
+        buf = bytearray(); stream = self._video_proc.stdout
+        while not self._stop.is_set() and stream:
+            chunk = stream.read(4096)
+            if not chunk: break
+            buf.extend(chunk)
+            while True:
+                start = buf.find(b"\xff\xd8")
+                if start < 0:
+                    if len(buf) > 1:
+                        del buf[:-1]
+                    break
+                end = buf.find(b"\xff\xd9", start + 2)
+                if end < 0:
+                    if start:
+                        del buf[:start]
+                    break
+                frame = bytes(buf[start:end + 2])
+                del buf[:end + 2]
+                with self._video_cond:
+                    self._video_frame = frame
+                    self._video_cond.notify_all()
+
+    def get_video_frame(self, timeout=5.0):
+        with self._video_cond:
+            if self._video_frame is None: self._video_cond.wait(timeout)
+            return self._video_frame
 
     def start_ros_status(self):
         """Publish vendor UDP status for Agent Core topic renderers."""
@@ -113,6 +155,7 @@ class QianjiaoDevice:
         if self._status_sock:
             self._status_sock.close()
             self._status_sock = None
+        if self._video_proc: self._video_proc.terminate()
         if self._ros_node is not None:
             self._ros_node.destroy_node()
             self._ros_node = None
@@ -253,7 +296,7 @@ class QianjiaoDevice:
     def get_tools(self):
         return [
             {"name": "rov_status", "type": "sensor", "description": "潜蛟实时状态：姿态、深度、位置、温度、电池和陀螺仪（UDP 8500，10Hz）", "topic_out": [{"topic": "/qianjiao2_pro/status", "format": "data/json"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["info", "start", "stop"]}}}},
-            {"name": "rov_camera", "type": "sensor", "description": "潜蛟实时视频流（RTSP，需支持 RTSP 的播放器）", "topic_out": [{"topic": "rtsp://admin:admin@192.168.1.88:8554/stream/0/0", "format": "video/rtsp", "external": True}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["info"]}}}},
+            {"name": "rov_camera", "type": "sensor", "description": "潜蛟实时视频流（RTSP 转 MJPEG 代理）", "topic_out": [{"topic": self.video_url, "format": "video/mjpeg"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["info"]}}}},
             {"name": "rov_camera_control", "type": "actuator", "description": "潜蛟相机控制：拍照、媒体列表、下载和补光灯", "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["capture", "medias", "download", "light"]}, "name": {"type": "string"}, "brightness": {"type": "integer", "minimum": 0, "maximum": 100}}, "required": ["action"]}},
             {"name": "rov_control", "type": "actuator", "description": "潜蛟 2.0 Pro 解锁及 6DOF 运动控制", "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["arm", "disarm", "move", "stop"]}, "heave": {"type": "number", "minimum": -1, "maximum": 1}, "pitch": {"type": "number", "minimum": -1, "maximum": 1}, "forward": {"type": "number", "minimum": -1, "maximum": 1}, "yaw": {"type": "number", "minimum": -1, "maximum": 1}, "lateral": {"type": "number", "minimum": -1, "maximum": 1}, "roll": {"type": "number", "minimum": -1, "maximum": 1}}, "required": ["action"]}},
         ]
@@ -265,7 +308,7 @@ class QianjiaoDevice:
             elif action == "stop": self.stop()
             return self.status()
         if tool == "rov_camera":
-            return {"state": "available", "stream_url": self.camera_rtsp}
+            return {"state": "available", "stream_url": self.video_url, "source_rtsp": self.camera_rtsp}
         if tool == "rov_camera_control":
             if action == "capture":
                 return self.camera_request("POST", "/v1/capture")
