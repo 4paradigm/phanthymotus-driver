@@ -22,6 +22,7 @@ Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server t
 | `x-humanoid/tianyi2.0` | Tianyi 2.0 Pro Humanoid | 15707 | 35DOF (wheeled chassis + dual arms + dexterous hands + head + navigation) |
 | `deep_robotics/lynx_m20` | DEEPRobotics Lynx M20 | 15716 | Official ROS 2/Fast DDS interfaces and basic_server TCP/UDP native control, with Standard/Pro capability isolation |
 | `pndbotics/adam` | PNDbotics Adam Humanoid | 15702 | State, locomotion (gRPC), upper body control, dexterous hands, 3D model |
+| `booster/k1` | Booster K1 Humanoid | 15705 | State (IMU/joints/battery/odom/fall-detection + URDF), camera, locomotion, upper-body joint control, actions/get-up (ACP), audio |
 
 ## Quick Start
 
