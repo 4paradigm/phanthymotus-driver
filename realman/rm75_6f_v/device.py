@@ -9,6 +9,7 @@ import re
 import threading
 import time
 from pathlib import Path
+from uuid import uuid4
 
 from common.vendor_runtime import action_schema, jsonable, tool
 
@@ -72,6 +73,12 @@ def _bounded_float(value, name, lower, upper):
     if result < lower or result > upper:
         raise ValueError(f"{name} must be in [{lower}, {upper}]")
     return result
+
+
+def _with_completion(schema, actions, timeout=30):
+    schema = dict(schema)
+    schema["x-completion"] = {"actions": actions, "timeout": timeout}
+    return schema
 
 
 class RM75Nodes:
@@ -218,6 +225,13 @@ class RM75Nodes:
         return {"state": "requested", "topic": self.topics["arm_state_cmd"]}
 
     def publish_movej(self, joints, speed=20, block=False, trajectory_connect=0, wait_result=False, timeout=None):
+        joints, speed, trajectory_connect, timeout = self._normalize_movej_args(joints, speed, trajectory_connect, timeout)
+        preflight = self.preflight_movej(joints)
+        if preflight:
+            return preflight
+        return self._publish_movej_checked(joints, speed, block, trajectory_connect, wait_result, timeout)
+
+    def _normalize_movej_args(self, joints, speed=20, trajectory_connect=0, timeout=None):
         if not isinstance(joints, (list, tuple)):
             raise ValueError("joints must be an array of finite numbers")
         if len(joints) != self.dof:
@@ -230,9 +244,9 @@ class RM75Nodes:
         if trajectory_connect not in (0, 1):
             raise ValueError("trajectory_connect must be 0 or 1")
         timeout = self._motion_timeout(timeout)
-        preflight = self.preflight_movej(joints)
-        if preflight:
-            return preflight
+        return joints, speed, trajectory_connect, timeout
+
+    def _publish_movej_checked(self, joints, speed, block, trajectory_connect, wait_result, timeout):
         baseline = self._sequence("movej_result")
         msg = self._Movej()
         msg.joint = [float(value) for value in joints]
@@ -261,6 +275,28 @@ class RM75Nodes:
         else:
             result["completion"] = self.wait_for_motion_complete(joints, baseline, timeout)
         return result
+
+    def start_movej_action(self, joints, *, speed=20, block=False, trajectory_connect=0, wait_result=False, timeout=None, tool_name="arm_motion"):
+        joints, speed, trajectory_connect, timeout = self._normalize_movej_args(joints, speed, trajectory_connect, timeout)
+        preflight = self.preflight_movej(joints)
+        if preflight:
+            return preflight
+        action_id = f"rm75_movej_{uuid4().hex[:12]}"
+        threading.Thread(
+            target=self._motion_worker,
+            args=(action_id, tool_name, self._publish_movej_checked),
+            kwargs={
+                "joints": joints,
+                "speed": speed,
+                "block": block,
+                "trajectory_connect": trajectory_connect,
+                "wait_result": wait_result,
+                "timeout": timeout,
+            },
+            daemon=True,
+            name=action_id,
+        ).start()
+        return {"state": "moving", "action_id": action_id, "timeout": timeout}
 
     def current_joint_positions(self):
         latest = self._latest("joint_states")
@@ -313,6 +349,98 @@ class RM75Nodes:
             "target_position_rad": target,
         })
         return result
+
+    def start_single_joint_action(self, joint_index, *, mode, value, speed=5, block=False, wait_result=False, timeout=None):
+        joint_index = _finite_int(joint_index, "joint_index")
+        if joint_index < 1 or joint_index > self.dof:
+            raise ValueError(f"joint_index must be in [1, {self.dof}]")
+        speed = _bounded_int(speed, "speed", 1, 30)
+        if mode == "absolute":
+            value = _finite_float(value, "target")
+        elif mode == "relative":
+            value = _bounded_float(value, "delta", -0.2, 0.2)
+        else:
+            raise ValueError("mode must be 'absolute' or 'relative'")
+        timeout = self._motion_timeout(timeout)
+        current = self.current_joint_positions()
+        before = current[joint_index - 1]
+        target = value if mode == "absolute" else before + value
+        current[joint_index - 1] = target
+        preflight = self.preflight_movej(current)
+        if preflight:
+            return preflight
+        action_id = f"rm75_joint_{uuid4().hex[:12]}"
+        threading.Thread(
+            target=self._motion_worker,
+            args=(action_id, "joint_control", self._publish_movej_checked),
+            kwargs={
+                "joints": current,
+                "speed": speed,
+                "block": block,
+                "trajectory_connect": 0,
+                "wait_result": wait_result,
+                "timeout": timeout,
+            },
+            daemon=True,
+            name=action_id,
+        ).start()
+        return {
+            "state": "moving",
+            "action_id": action_id,
+            "timeout": timeout,
+            "controlled_joint": f"joint{joint_index}",
+            "mode": mode,
+            "previous_position_rad": before,
+            "target_position_rad": target,
+        }
+
+    def _motion_worker(self, action_id, tool_name, func, **kwargs):
+        try:
+            result = func(**kwargs)
+            status = self._completion_status(result)
+        except Exception as exc:
+            result = {"state": "error", "error": str(exc)}
+            status = "error"
+        self._acp_notify(action_id, status, result, tool_name)
+
+    @staticmethod
+    def _completion_status(result):
+        if result.get("state") in ("rejected", "error", "timeout"):
+            return "error"
+        for key in ("completion", "result"):
+            item = result.get(key)
+            if isinstance(item, dict) and item.get("state") in ("rejected", "error", "timeout"):
+                return "error"
+        return "completed"
+
+    @staticmethod
+    def _acp_notify(action_id, status, result, tool_name):
+        import os as _os
+        import ssl as _ssl
+        import urllib.request as _urllib
+
+        agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+        ctx = _ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = _ssl.CERT_NONE
+        payload = json.dumps({
+            "action_id": action_id,
+            "status": status,
+            "result": jsonable(result),
+            "tool": tool_name,
+            "ts": time.time(),
+        }, ensure_ascii=False).encode()
+        try:
+            request = _urllib.Request(
+                f"{agent_core_url}/api/acp/complete",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with _urllib.urlopen(request, timeout=5, context=ctx):
+                pass
+        except Exception as exc:
+            print(f"[ACP] callback failed for {action_id}: {exc}", flush=True)
 
     def publish_stop(self, block=False):
         baseline = self._sequence("move_stop_result")
@@ -637,7 +765,7 @@ class RM75MotionPlugin:
         self.nodes = nodes
 
     def get_tool(self):
-        return tool("arm_motion", "actuator", "RM75-6F-V 基础机械臂运动控制", action_schema(self.ACTIONS, {
+        return tool("arm_motion", "actuator", "RM75-6F-V 基础机械臂运动控制", _with_completion(action_schema(self.ACTIONS, {
             "joints": {
                 "type": "array",
                 "items": {"type": "number"},
@@ -651,7 +779,7 @@ class RM75MotionPlugin:
             "wait_result": {"type": "boolean", "default": False, "description": "优先等待 movej_result；默认按 /joint_states/状态同步等待完成"},
             "timeout": {"type": "number", "minimum": 0.1, "maximum": 30, "default": 10, "description": "等待结果超时时间，单位秒"},
             "joint_num": {"type": "integer", "minimum": 1, "maximum": 7, "description": "待清错关节编号，1..7"},
-        }))
+        }), ["movej"], 30))
 
     def start(self):
         pass
@@ -665,7 +793,7 @@ class RM75MotionPlugin:
         if action == "stop":
             return {"state": "idle"}
         if action == "movej":
-            return self.nodes.publish_movej(
+            return self.nodes.start_movej_action(
                 _require(args, "joints"),
                 speed=args.get("speed", 20),
                 block=args.get("block", False),
@@ -691,7 +819,7 @@ class RM75JointControlPlugin:
         self.nodes = nodes
 
     def get_tool(self):
-        return tool("joint_control", "actuator", "RM75-6F-V 单关节控制卡片：选择 joint1..joint7 后执行 set/nudge", action_schema(self.ACTIONS, {
+        return tool("joint_control", "actuator", "RM75-6F-V 单关节控制卡片：选择 joint1..joint7 后执行 set/nudge", _with_completion(action_schema(self.ACTIONS, {
             "joint": {
                 "type": "string",
                 "enum": [f"joint{idx}" for idx in range(1, self.nodes.dof + 1)],
@@ -712,7 +840,7 @@ class RM75JointControlPlugin:
             "block": {"type": "boolean", "default": False, "description": "是否使用 rm_driver 阻塞模式"},
             "wait_result": {"type": "boolean", "default": False, "description": "优先等待 movej_result；默认按 /joint_states/状态同步等待完成"},
             "timeout": {"type": "number", "minimum": 0.1, "maximum": 30, "default": 10, "description": "等待结果超时时间，单位秒"},
-        }))
+        }), ["set", "nudge"], 30))
 
     def start(self):
         pass
@@ -728,21 +856,21 @@ class RM75JointControlPlugin:
         if action == "info":
             return {"state": "ready", "joints": [f"joint{idx}" for idx in range(1, self.nodes.dof + 1)]}
         if action == "set":
-            return self.nodes.move_single_joint(
+            return self.nodes.start_single_joint_action(
                 self._joint_index(args),
                 mode="absolute",
                 value=_require(args, "target"),
-                speed=_bounded_int(args.get("speed", 5), "speed", 1, 30),
+                speed=args.get("speed", 5),
                 block=args.get("block", False),
                 wait_result=args.get("wait_result", False),
                 timeout=args.get("timeout"),
             )
         if action == "nudge":
-            return self.nodes.move_single_joint(
+            return self.nodes.start_single_joint_action(
                 self._joint_index(args),
                 mode="relative",
-                value=_bounded_float(args.get("delta", 0.02), "delta", -0.2, 0.2),
-                speed=_bounded_int(args.get("speed", 5), "speed", 1, 30),
+                value=args.get("delta", 0.02),
+                speed=args.get("speed", 5),
                 block=args.get("block", False),
                 wait_result=args.get("wait_result", False),
                 timeout=args.get("timeout"),
