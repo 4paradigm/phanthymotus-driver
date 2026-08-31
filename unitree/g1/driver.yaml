@@ -6,6 +6,6 @@ hardware_model: "g1"
 image_name: g1
 port: 15701
 mcp_url: "http://localhost:15701/mcp"
-description: "Unitree G1 — 麦克风 + 内置TTS + LED + 运动控制 + 手臂动作 + 状态感知"
+description: "Unitree G1 — 麦克风 + 内置TTS + LED + 运动控制 + 手臂动作 + 状态感知 + 导航 LiDAR/IMU + 自描述 RGB/Depth"
 build_context_extras:
   - ../../common

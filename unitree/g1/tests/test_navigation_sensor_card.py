@@ -208,6 +208,9 @@ class NavigationSensorCardContractTest(unittest.TestCase):
         node._lidar_frame = "livox_frame"
         node._base_to_sensor_translation = translation
         node._base_to_sensor_rpy = rpy
+        node._sensor_rotation = module.validated_rotation_matrix(
+            [1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, -1.0]
+        )
         stamp = object()
         node.get_clock = lambda: types.SimpleNamespace(
             now=lambda: types.SimpleNamespace(to_msg=lambda: stamp)
@@ -238,6 +241,11 @@ class NavigationSensorCardContractTest(unittest.TestCase):
             transform.transform.rotation.w,
         )
         self.assertAlmostEqual(sum(value * value for value in quaternion), 1.0)
+        expected = module.rotate_orientation_xyzw(
+            module._quaternion_from_rpy(*rpy), node._sensor_rotation
+        )
+        for actual, wanted in zip(quaternion, expected):
+            self.assertAlmostEqual(actual, wanted)
 
         for invalid in (
             {},
@@ -294,8 +302,9 @@ class NavigationSensorCardContractTest(unittest.TestCase):
         proc.terminate.assert_called_once_with()
         proc.wait.assert_called_once_with(timeout=5.0)
         self.assertIsNone(plugin._proc)
-        plugin._executor.remove_node.assert_called_once_with(plugin._status_node)
-        plugin._status_node.destroy_node.assert_called_once_with()
+        plugin._executor.remove_node.assert_not_called()
+        plugin._status_node.destroy_node.assert_not_called()
+        plugin._status_node.reset.assert_called_once_with()
 
     def test_either_card_stop_terminates_shared_worker_and_allows_restart(self):
         module = self.load_bridge_module()
@@ -318,6 +327,7 @@ class NavigationSensorCardContractTest(unittest.TestCase):
                         "ready": False,
                         "blockers": ["clock_not_ready"],
                     },
+                    reset=lambda: None,
                 )
                 first = mock.Mock(pid=1001)
                 second = mock.Mock(pid=1002)

@@ -191,8 +191,9 @@ class _NavigationSensorNode(Node):
         translation = transform.transform.translation
         translation.x, translation.y, translation.z = self._base_to_sensor_translation
         rotation = transform.transform.rotation
-        rotation.x, rotation.y, rotation.z, rotation.w = _quaternion_from_rpy(
-            *self._base_to_sensor_rpy
+        rotation.x, rotation.y, rotation.z, rotation.w = rotate_orientation_xyzw(
+            _quaternion_from_rpy(*self._base_to_sensor_rpy),
+            self._sensor_rotation,
         )
         self._static_tf_broadcaster = StaticTransformBroadcaster(self)
         self._static_tf_broadcaster.sendTransform(transform)
@@ -523,6 +524,11 @@ class _NavigationSensorMonitorNode(Node):
             self._last_status = payload
             self._last_status_monotonic = time.monotonic()
 
+    def reset(self) -> None:
+        with self._lock:
+            self._last_status = None
+            self._last_status_monotonic = 0.0
+
     def status(self, worker_running: bool) -> dict:
         with self._lock:
             payload = dict(self._last_status or {})
@@ -626,6 +632,7 @@ class NavigationSensorPlugin:
             raise FileNotFoundError(f"navigation sensor worker missing: {self._worker_path}")
         env = os.environ.copy()
         env["ROS_NAMESPACE"] = self._namespace
+        self._status_node.reset()
         self._proc = subprocess.Popen(
             [sys.executable, str(self._worker_path), self._network_iface],
             cwd=str(self._worker_path.parent),
@@ -656,11 +663,6 @@ class NavigationSensorPlugin:
 
     def stop(self) -> None:
         self._stop_worker()
-        try:
-            self._executor.remove_node(self._status_node)
-            self._status_node.destroy_node()
-        except Exception:
-            pass
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action in {"start", "info"}:

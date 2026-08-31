@@ -1408,7 +1408,6 @@ class LocoPlugin:
         self._control_lock = threading.RLock()
         self._move_timer: threading.Timer | None = None
         self._velocity_proposal_topic = DEFAULT_VELOCITY_PROPOSAL_TOPIC
-        self._velocity_proposal_topic = DEFAULT_VELOCITY_PROPOSAL_TOPIC
         # _LocoStateNode — authoritative fsm_id/fsm_mode from rt/sportmodestate.
         self._state_node = state_node
         # _LowStateNode — joint-derived posture, needed to tell lying from squatting

@@ -21,7 +21,9 @@ Never relabel a manually adjusted matrix as the Unitree factory nominal value.
 The navigation sensor bridge also publishes the factory-nominal static transform
 `base_link -> livox_frame`. It composes the zero-pose URDF waist joints from
 `pelvis` to `torso_link` with `mid360_joint`, matching the `base_link` convention
-used by the navigation card in PhanthyMotus PR 141. It uses reliable,
+used by the navigation card in PhanthyMotus PR 141. The published rotation also
+composes the inverse of `sensor_rotation_matrix`, because cloud and IMU samples
+are expressed in that corrected output frame. It uses reliable,
 transient-local `/tf_static` delivery through ROS 2 `StaticTransformBroadcaster`.
 Replace the configured translation and rotation after per-device calibration;
 do not describe the factory value as a measured extrinsic.
