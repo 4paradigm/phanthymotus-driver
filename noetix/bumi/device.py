@@ -1187,21 +1187,30 @@ class SpeakerPlugin:
             latest["status_error"] = status_error
         return latest
 
-    def _wait_for_reset(self, timeout_s: float = 5.0) -> dict:
-        """Wait for the reset acknowledgement from Bumi's audio agent."""
+    def _wait_for_reset(self, timeout_s: float = 5.0, reinitialized: bool = False) -> dict:
+        """Wait for reset acknowledgement and post-reset agent readiness."""
         deadline = time.monotonic() + timeout_s
         latest = {"work_status": "unknown", "reason": "unknown"}
         status_error = None
+        reset_acknowledged = False
         while time.monotonic() < deadline:
             try:
                 latest = self._read_system_status()
                 status_error = None
-                # The SDK documents CMD_RESET as the status reason emitted
-                # after TO_RESET/restart.  The work status after a reset is
-                # firmware-dependent (READY or SLEEPED), so match the reason.
+                # Bumi briefly reports EXIT + CMD_RESET while restarting.  It
+                # must not be returned as a successful reset: wakeup cannot
+                # work until the agent has published a healthy post-reset
+                # READY/SLEEPED state.
                 if latest["reason"] == "CMD_RESET":
-                    return latest
-                if latest["work_status"] == "EXIT":
+                    reset_acknowledged = True
+                    if latest["work_status"] == "EXIT":
+                        time.sleep(0.1)
+                        continue
+                if (
+                    (reset_acknowledged or reinitialized)
+                    and latest["work_status"] in {"READY", "SLEEPED"}
+                    and latest["reason"] != "ERROR_SLEEPED"
+                ):
                     return latest
             except Exception as exc:
                 status_error = str(exc)
@@ -1209,6 +1218,18 @@ class SpeakerPlugin:
         if status_error:
             latest["status_error"] = status_error
         return latest
+
+    def _reinitialize_media_controller(self) -> str | None:
+        """Rebuild the local SDK DDS session after the agent is restarted."""
+        try:
+            if not bool(self._media_ctrl.init()):
+                return "MediaController.init() returned false"
+        except Exception as exc:
+            return f"MediaController.init() failed: {exc}"
+        # init() establishes the DDS endpoints; allow the first post-reset
+        # status sample to arrive before reading the state below.
+        time.sleep(1.0)
+        return None
 
     def _get_system_error(self) -> dict | None:
         try:
@@ -1374,8 +1395,21 @@ class SpeakerPlugin:
                     }
 
                 self._media_ctrl.restart()
-                status = self._wait_for_reset()
-                if status["reason"] == "CMD_RESET":
+                init_error = self._reinitialize_media_controller()
+                if init_error:
+                    status = self._read_system_status()
+                    result = self._status_error_result(
+                        "reset", status,
+                        recovery="restart the Bumi driver container, then call speaker.wakeup",
+                    )
+                    result["init_error"] = init_error
+                    return result
+
+                status = self._wait_for_reset(timeout_s=8.0, reinitialized=True)
+                if (
+                    status["work_status"] in {"READY", "SLEEPED"}
+                    and status["reason"] != "ERROR_SLEEPED"
+                ):
                     return {
                         "state": "reset",
                         **status,
@@ -1473,12 +1507,17 @@ class SpeakerPlugin:
             }]
             if self._input_topic:
                 topic_in[0]["topic"] = self._input_topic
+            try:
+                system_status = self._read_system_status()
+            except Exception as exc:
+                system_status = {"status_error": str(exc)}
             return {
                 "state": "playing" if self._playing else "idle",
                 "topic_in": topic_in,
                 "received_frames": self._received_frames,
                 "last_audio_time": self._last_audio_time or None,
                 "last_error": self._last_error,
+                "system_status": system_status,
             }
         if action == "get_volume":
             vol = self._media_ctrl.get_volume()
