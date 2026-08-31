@@ -50,9 +50,9 @@ Use `state`, `joint_states`, `joint_error`, and `rm_error` first. The `joint_con
 - HTTP service: `/health` and `/mcp` on port `15718`.
 - MCP resources: `model` returns a simplified URDF for skeleton rendering.
 - MCP sensors: `state`, `joint_states`, `arm_state`, `arm_original_state`, `arm_current_status`, `joint_error`, `rm_error`, plus optional command result streams when matching `rm_ros_interfaces` message types are available. `state` is a request/response snapshot and intentionally has no `topic_out`; use the individual stream tools for topic-backed cards.
-- MCP actuator: `joint_control` supports `set` and `stopmotion`. The `set` action exposes seven numeric inputs, `joint1` through `joint7`, and publishes them as one full 7-DOF `movej` command.
+- MCP actuator: `joint_control` supports `set` and `stopmotion`. The `set` action exposes seven numeric inputs, `joint1` through `joint7`, defaults omitted joints to `0.0`, and publishes them as one full 7-DOF `movej` command.
 
-`joint_control` requires explicit `joint1`..`joint7` target values, so it never guesses omitted joints from `/joint_states`. Missing, out-of-limit, or non-finite joint values are rejected before any command is published.
+`joint_control` uses explicit `joint1`..`joint7` target values and defaults omitted joints to `0.0`, so it never guesses omitted joints from `/joint_states`. Out-of-limit or non-finite joint values are rejected before any command is published.
 
 `movej` performs a conservative preflight before publishing: recent `/joint_states` required, configured joint limits checked, and active error topics rejected. MoveJ populates the RealMan `rm_ros_interfaces/msg/Movej` fields available in the sourced workspace: `joint`, `speed`/`v` for velocity percentage, optional `block`, optional `trajectory_connect`, optional `dof`, and optional `r` for blend radius. Seven-joint control uses the Agent Core completion contract: the MCP call returns an `action_id` immediately, a worker publishes the ROS command, then reports `/api/acp/complete` when `movej_result` arrives, the target is reached within `safety.joint_target_tolerance_rad`, an error appears, or the bounded timeout expires. Set `safety.require_*` fields in `config.yaml` only when deliberately testing around those guards.
 

@@ -710,7 +710,7 @@ class RM75StatePlugin:
 
 class RM75JointControlPlugin:
     ACTIONS = {
-        "set": (["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7", "speed", "block", "wait_result", "timeout"], "输入 joint1..joint7 的完整目标关节角，单位 rad"),
+        "set": (["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7", "speed", "block", "wait_result", "timeout"], "输入 joint1..joint7 的目标关节角，单位 rad；未输入的关节默认 0"),
         "stopmotion": (["block"], "立即停止机械臂运动"),
     }
 
@@ -721,6 +721,7 @@ class RM75JointControlPlugin:
         properties = {
             f"joint{idx}": {
                 "type": "number",
+                "default": 0,
                 "description": f"joint{idx} 目标关节角，单位 rad",
             }
             for idx in range(1, self.nodes.dof + 1)
@@ -734,7 +735,7 @@ class RM75JointControlPlugin:
         return tool(
             "joint_control",
             "actuator",
-            "RM75-6F-V 七关节控制卡片：输入 joint1..joint7 后执行 set",
+            "RM75-6F-V 七关节控制卡片：输入 joint1..joint7 后执行 set，未输入默认 0",
             _with_completion(action_schema(self.ACTIONS, properties), ["set"], 30),
         )
 
@@ -766,7 +767,7 @@ class RM75JointControlPlugin:
         return None
 
     def _joint_targets(self, args):
-        return [_finite_float(_require(args, f"joint{idx}"), f"joint{idx}") for idx in range(1, self.nodes.dof + 1)]
+        return [_finite_float(args.get(f"joint{idx}", 0), f"joint{idx}") for idx in range(1, self.nodes.dof + 1)]
 
 
 def build_plugins(config, namespace, ros2):
